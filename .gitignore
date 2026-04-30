@@ -1,0 +1,19 @@
+/dist/
+/build/
+/bin/
+/metis
+/metis-*
+*.test
+*.out
+.DS_Store
+.idea/
+.vscode/
+coverage.txt
+node_modules/
+*.tgz
+.env
+.env.local
+
+# local dev artifacts (not for public release)
+TEST_REPORT.md
+

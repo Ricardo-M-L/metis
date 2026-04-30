@@ -1,0 +1,32 @@
+{
+  "name": "metis-cli",
+  "version": "0.1.0",
+  "description": "metis — fast, local-first agent CLI (npm wrapper, downloads native binary on install)",
+  "private": true,
+  "bin": {
+    "metis": "./bin/metis"
+  },
+  "scripts": {
+    "postinstall": "node ./scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

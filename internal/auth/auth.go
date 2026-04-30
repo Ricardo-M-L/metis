@@ -1,0 +1,200 @@
+// Package auth manages provider credentials persisted to ~/.metis/auth.json.
+//
+// The file format and 0o600 perm match opencode's auth.json:
+//
+//	{
+//	  "anthropic": {"type": "api", "key": "sk-..."},
+//	  "openai":    {"type": "api", "key": "sk-..."}
+//	}
+//
+// This is a deliberately separate file from config.toml. config.toml is meant
+// to be diffable / shareable; auth.json holds raw secrets and never should be.
+// Keeping them split also lets `metis auth login` rewrite credentials atomically
+// without touching unrelated config.
+package auth
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+)
+
+// home resolves the metis home directory the same way internal/config.Home() does.
+// We deliberately don't import config here — config consults auth.Get() inside
+// ResolveAPIKey, so importing back would form a cycle. Keeping a private copy is
+// fine because the rule (env METIS_HOME wins, else ~/.metis) is short and stable.
+func home() string {
+	if h := os.Getenv("METIS_HOME"); h != "" {
+		return h
+	}
+	hd, _ := os.UserHomeDir()
+	return filepath.Join(hd, ".metis")
+}
+
+// File is the on-disk shape of ~/.metis/auth.json.
+// Keyed by provider id ("anthropic", "openai", "minimax", or any custom id).
+type File map[string]Entry
+
+// Entry is one provider's credential. `Type` is currently always "api"; it's
+// kept as a discriminator so future flows (oauth, instance creds) slot in
+// without a schema migration.
+type Entry struct {
+	Type string `json:"type"`
+	Key  string `json:"key"`
+}
+
+// Path returns the canonical location of auth.json under the metis home.
+func Path() string {
+	return filepath.Join(home(), "auth.json")
+}
+
+// Load reads auth.json. A missing file is NOT an error — it returns an empty
+// map so callers can append-and-save without first checking existence.
+func Load() (File, error) {
+	p := Path()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return File{}, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", p, err)
+	}
+	if len(b) == 0 {
+		return File{}, nil
+	}
+	var f File
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", p, err)
+	}
+	if f == nil {
+		f = File{}
+	}
+	return f, nil
+}
+
+// Save writes auth.json atomically with 0o600 perms.
+// Atomic = write to a sibling temp file then rename, so a crash mid-write
+// can't leave a half-truncated credentials file.
+func Save(f File) error {
+	dir := home()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	// Stable key order so the file diffs cleanly across runs.
+	keys := make([]string, 0, len(f))
+	for k := range f {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	ordered := make(map[string]Entry, len(f))
+	for _, k := range keys {
+		ordered[k] = f[k]
+	}
+	b, err := json.MarshalIndent(ordered, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	final := Path()
+	tmp, err := os.CreateTemp(dir, ".auth.json.*")
+	if err != nil {
+		return fmt.Errorf("tempfile: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }() // best-effort cleanup if rename fails
+
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write tempfile: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod tempfile: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close tempfile: %w", err)
+	}
+	if err := os.Rename(tmpPath, final); err != nil {
+		return fmt.Errorf("rename %s -> %s: %w", tmpPath, final, err)
+	}
+	return nil
+}
+
+// Set stores a provider credential and persists immediately.
+// Empty key/provider both error so callers don't accidentally write blanks.
+func Set(provider, key string) error {
+	if provider == "" {
+		return errors.New("auth: provider required")
+	}
+	if key == "" {
+		return errors.New("auth: key required")
+	}
+	f, err := Load()
+	if err != nil {
+		return err
+	}
+	f[provider] = Entry{Type: "api", Key: key}
+	return Save(f)
+}
+
+// Get returns the api key for a provider. Empty string + nil error if missing
+// — callers fall through to env / config.toml.
+//
+// Compat fallback: when the canonical id ("anthropic" / "openai") has no
+// entry, we check known compat aliases ("minimax" → anthropic transport,
+// "gemini" → openai transport). This recovers users who picked a
+// compat-labeled option in an older wizard build that saved under the
+// label id rather than the transport id.
+func Get(provider string) (string, error) {
+	f, err := Load()
+	if err != nil {
+		return "", err
+	}
+	if e, ok := f[provider]; ok {
+		return e.Key, nil
+	}
+	// Compat aliases — keep the table small, document each one.
+	for _, alias := range compatAliases[provider] {
+		if e, ok := f[alias]; ok {
+			return e.Key, nil
+		}
+	}
+	return "", nil
+}
+
+// compatAliases lists which auth.json ids can serve as a fallback for
+// each canonical transport id. Order matters: first hit wins.
+var compatAliases = map[string][]string{
+	"anthropic": {"minimax"},        // MiniMax is anthropic-wire-compatible
+	"openai":    {"gemini", "groq"}, // Gemini + Groq are OpenAI-wire-compatible
+}
+
+// Remove deletes a provider entry. No-op if it didn't exist.
+func Remove(provider string) error {
+	f, err := Load()
+	if err != nil {
+		return err
+	}
+	if _, ok := f[provider]; !ok {
+		return nil
+	}
+	delete(f, provider)
+	return Save(f)
+}
+
+// List returns provider ids that have credentials, sorted.
+func List() ([]string, error) {
+	f, err := Load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(f))
+	for k := range f {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out, nil
+}

@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+// delphi — npm wrapper. Spawns the native binary downloaded by postinstall.
+"use strict";
+
+const { spawn } = require("node:child_process");
+const path = require("node:path");
+const fs = require("node:fs");
+
+const binDir = path.join(__dirname, "..", "vendor");
+const binName = process.platform === "win32" ? "delphi.exe" : "delphi";
+const binPath = path.join(binDir, binName);
+
+if (!fs.existsSync(binPath)) {
+  console.error(
+    `delphi: native binary missing at ${binPath}\n` +
+    `Run 'npm rebuild delphi-cli' or reinstall the package.`
+  );
+  process.exit(127);
+}
+
+const child = spawn(binPath, process.argv.slice(2), { stdio: "inherit" });
+child.on("exit", (code, signal) => {
+  if (signal) process.kill(process.pid, signal);
+  else process.exit(code ?? 0);
+});
+child.on("error", (err) => {
+  console.error(`delphi: failed to spawn binary: ${err.message}`);
+  process.exit(1);
+});

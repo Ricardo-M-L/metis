@@ -1,0 +1,254 @@
+package slash
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/config"
+)
+
+// Cmd is a callable slash command.
+type Cmd struct {
+	Name        string
+	Aliases    []string
+	Description string
+	Handler    Handler
+}
+
+// Handler executes the command.
+type Handler func(args string) (display string, control Signal)
+
+// Signal tells the REPL what to do.
+type Signal int
+
+const (
+	SignalNone Signal = iota
+	SignalQuit
+	SignalClear
+	SignalCompact
+	SignalReload
+	SignalPlan
+	SignalBypass
+	SignalAuto
+	SignalNew
+	SignalRetry
+	SignalUndo
+	SignalHistory
+	SignalSave
+	SignalBranch
+	SignalStatus
+	SignalLoop
+	SignalTitle
+	SignalTools
+	SignalSessions
+	SignalSession
+	SignalSkills
+	SignalVersion
+)
+
+type Registry struct {
+	cmds  []Cmd
+	index map[string]*Cmd
+}
+
+func NewRegistry() *Registry {
+	return &Registry{index: make(map[string]*Cmd)}
+}
+
+func (r *Registry) Register(c Cmd) {
+	r.cmds = append(r.cmds, c)
+	cp := &r.cmds[len(r.cmds)-1]
+	r.index[c.Name] = cp
+	for _, a := range c.Aliases {
+		r.index[a] = cp
+	}
+}
+
+func (r *Registry) All() []Cmd {
+	out := append([]Cmd(nil), r.cmds...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (r *Registry) Get(name string) (*Cmd, bool) {
+	c, ok := r.index[name]
+	return c, ok
+}
+
+// Parse returns (true, output, signal, args) if input is a slash command,
+// (false, "", SignalNone, "") otherwise. `args` is whatever followed the
+// command name on the input line — the runtime needs it for signals like
+// SignalTitle that carry a payload (`/title my session`).
+func (r *Registry) Parse(input string) (handled bool, display string, sig Signal, args string) {
+	input = strings.TrimSpace(input)
+	if !strings.HasPrefix(input, "/") {
+		return false, "", SignalNone, ""
+	}
+	input = input[1:]
+	name, rest, _ := cut(input, " ")
+	c, ok := r.index[name]
+	if !ok {
+		return true, fmt.Sprintf("unknown: /%s — try /help", name), SignalNone, ""
+	}
+	d, s := c.Handler(rest)
+	return true, d, s, rest
+}
+
+// HelpText renders a column-aligned listing.
+func (r *Registry) HelpText() string {
+	var b strings.Builder
+	all := r.All()
+	maxLen := 0
+	for _, c := range all {
+		if l := len(c.Name); l > maxLen {
+			maxLen = l
+		}
+	}
+	for _, c := range all {
+		fmt.Fprintf(&b, "  /%-*s  %s\n", maxLen, c.Name, c.Description)
+	}
+	return b.String()
+}
+
+func cut(s, sep string) (before, after string, found bool) {
+	i := strings.Index(s, sep)
+	if i < 0 {
+		return s, "", false
+	}
+	return s[:i], s[i+len(sep):], true
+}
+
+// RegisterAll installs the full built-in command set.
+func RegisterAll(r *Registry, cfg *config.Config) {
+	// Core commands
+	r.Register(Cmd{Name: "help", Description: "show this help", Handler: func(_ string) (string, Signal) {
+		return r.HelpText(), SignalNone
+	}})
+	r.Register(Cmd{Name: "quit", Aliases: []string{"q", "exit"}, Description: "exit metis", Handler: func(_ string) (string, Signal) {
+		return "", SignalQuit
+	}})
+
+	// Session commands
+	r.Register(Cmd{Name: "new", Aliases: []string{"reset"}, Description: "start a new session", Handler: func(_ string) (string, Signal) {
+		return "(starting new session...)", SignalNew
+	}})
+	r.Register(Cmd{Name: "clear", Description: "clear conversation history", Handler: func(_ string) (string, Signal) {
+		return "(history cleared)", SignalClear
+	}})
+	r.Register(Cmd{Name: "retry", Description: "retry last assistant response", Handler: func(_ string) (string, Signal) {
+		return "(retrying last response...)", SignalRetry
+	}})
+	r.Register(Cmd{Name: "undo", Aliases: []string{"u"}, Description: "remove last user/assistant exchange (incl. tool calls)", Handler: func(_ string) (string, Signal) {
+		// Empty display — the actual confirmation is printed by the
+		// runtime once it knows whether anything was undone.
+		return "", SignalUndo
+	}})
+	r.Register(Cmd{Name: "history", Aliases: []string{"hist"}, Description: "show conversation history (Esc / q to close)", Handler: func(_ string) (string, Signal) {
+		// Display is empty — the runtime renders the screen directly.
+		return "", SignalHistory
+	}})
+	r.Register(Cmd{Name: "save", Description: "fsync the current session to disk", Handler: func(_ string) (string, Signal) {
+		return "", SignalSave
+	}})
+	r.Register(Cmd{Name: "title", Description: "set session title (e.g. /title refactor sprint)", Handler: func(args string) (string, Signal) {
+		if strings.TrimSpace(args) == "" {
+			return "(title: type `/title <text>` to set; current title is shown in /sessions)", SignalNone
+		}
+		// Display empty so the runtime can confirm with the actual id +
+		// stored title once persistence succeeds.
+		return "", SignalTitle
+	}})
+	r.Register(Cmd{Name: "branch", Aliases: []string{"fork"}, Description: "fork the current session to a new id (preserves history)", Handler: func(_ string) (string, Signal) {
+		return "", SignalBranch
+	}})
+
+	// Mode commands
+	r.Register(Cmd{Name: "plan", Aliases: []string{"p"}, Description: "switch to plan mode (show plan before executing)", Handler: func(_ string) (string, Signal) {
+		return "(plan mode: on — /auto to exit)", SignalPlan
+	}})
+	r.Register(Cmd{Name: "auto", Aliases: []string{"a"}, Description: "auto mode (read-only tools auto-allow)", Handler: func(_ string) (string, Signal) {
+		return "(mode: auto)", SignalAuto
+	}})
+	r.Register(Cmd{Name: "bypass", Aliases: []string{"yolo"}, Description: "bypass mode (no permission prompts)", Handler: func(_ string) (string, Signal) {
+		return "(mode: bypass — WARNING: approves all)", SignalBypass
+	}})
+	r.Register(Cmd{Name: "compact", Description: "force context compaction", Handler: func(_ string) (string, Signal) {
+		return "(compaction triggered)", SignalCompact
+	}})
+
+	// Loop — sugar wrapper over /cron with the "loop:" name prefix so a
+	// user can list / stop their loops without scanning every cron job.
+	// `/loop <every> <prompt>` creates; `/loop list` / `/loop stop <id|all>`
+	// manage. The same persistence + pause/resume guarantees as /cron.
+	r.Register(Cmd{Name: "loop", Description: "autopilot prompts: <every> <prompt> | list | stop <id|all>", Handler: func(args string) (string, Signal) {
+		return handleLoopCommand(cfg, args), SignalNone
+	}})
+
+	// Info commands
+	r.Register(Cmd{Name: "status", Description: "show session info", Handler: func(_ string) (string, Signal) {
+		return "(status: see REPL)", SignalStatus
+	}})
+	r.Register(Cmd{Name: "session", Aliases: []string{"sid"}, Description: "show current session id + title + turn count", Handler: func(_ string) (string, Signal) {
+		return "", SignalSession
+	}})
+	r.Register(Cmd{Name: "sessions", Aliases: []string{"ls"}, Description: "list recent saved sessions", Handler: func(_ string) (string, Signal) {
+		return "", SignalSessions
+	}})
+	r.Register(Cmd{Name: "model", Aliases: []string{"m"}, Description: "show current model", Handler: func(_ string) (string, Signal) {
+		return "model: " + cfg.Provider.Default, SignalNone
+	}})
+
+	// Tools & Skills
+	r.Register(Cmd{Name: "tools", Aliases: []string{"t"}, Description: "list registered tools (Read / Bash / Glob / …)", Handler: func(_ string) (string, Signal) {
+		return "", SignalTools
+	}})
+	r.Register(Cmd{Name: "toolsets", Description: "show available toolsets", Handler: func(_ string) (string, Signal) {
+		return "(toolsets: file, terminal, web, memory, skills, cronjob, delegation, web)", SignalNone
+	}})
+	r.Register(Cmd{Name: "skills", Aliases: []string{"sk"}, Description: "list installed skills under ~/.metis/skills", Handler: func(_ string) (string, Signal) {
+		return "", SignalSkills
+	}})
+	r.Register(Cmd{Name: "memory", Description: "show memory summary", Handler: func(_ string) (string, Signal) {
+		return "(memory: use Memory tool for add/replace/remove/read)", SignalNone
+	}})
+	r.Register(Cmd{Name: "reload", Description: "reload tools and skills", Handler: func(_ string) (string, Signal) {
+		return "(reloading...)", SignalReload
+	}})
+
+	// Cron — list/add/rm/pause/resume scheduled prompts
+	r.Register(Cmd{Name: "cron", Description: "scheduled prompts: list | add <every> <prompt> | rm <id> | pause/resume <id>", Handler: func(args string) (string, Signal) {
+		out, ok := handleCronCommand(cfg, args)
+		if !ok {
+			// Empty / help path stays SignalNone so the runtime just
+			// echoes the usage hint we returned.
+			return out, SignalNone
+		}
+		return out, SignalNone
+	}})
+
+	// Misc
+	r.Register(Cmd{Name: "abort", Description: "abort the current turn", Handler: func(_ string) (string, Signal) {
+		return "(abort: Ctrl+C)", SignalNone
+	}})
+	r.Register(Cmd{Name: "edit", Description: "rewind to before the last reply (alias for /undo)", Handler: func(_ string) (string, Signal) {
+		// True in-place edit of an assistant message would require a
+		// text-overlay screen + a way to re-stream from the rewritten
+		// turn. /undo gets you 90% there: it pops the assistant reply
+		// (and any tool-loop bundle) so your previous prompt is the
+		// next thing to send — you just retype with edits.
+		return "", SignalUndo
+	}})
+	r.Register(Cmd{Name: "submit", Aliases: []string{"s"}, Description: "submit and finalize", Handler: func(_ string) (string, Signal) {
+		return "(submit: use /plan to preview first)", SignalNone
+	}})
+	r.Register(Cmd{Name: "config", Aliases: []string{"cfg"}, Description: "open config in editor", Handler: func(_ string) (string, Signal) {
+		return "(config: ~/.metis/config.toml)", SignalNone
+	}})
+	r.Register(Cmd{Name: "version", Aliases: []string{"v"}, Description: "show metis version", Handler: func(_ string) (string, Signal) {
+		return "", SignalVersion
+	}})
+	r.Register(Cmd{Name: "agents", Description: "show active agents", Handler: func(_ string) (string, Signal) {
+		return "(agents: single agent mode)", SignalNone
+	}})
+}

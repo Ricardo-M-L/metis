@@ -1,0 +1,59 @@
+package builtin
+
+import (
+	"os"
+	"path/filepath"
+
+	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
+)
+
+func Register(r *tools.Registry, cfg *config.Config, gate *permission.Gate) {
+	RegisterWithDirs(r, cfg, gate, cfg.Session.SkillDir, cfg.Session.Dir)
+}
+
+func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Gate, skillDir, memoryDir string) {
+	disabled := make(map[string]bool, len(cfg.Tools.Disabled))
+	for _, n := range cfg.Tools.Disabled {
+		disabled[n] = true
+	}
+	os.MkdirAll(skillDir, 0o755)
+	os.MkdirAll(memoryDir, 0o755)
+
+	// Memory dir for Memory tool
+	memDir := filepath.Join(memoryDir, "..", "memories")
+	os.MkdirAll(memDir, 0o755)
+
+	// NOTE: Skill + Memory are registered in internal/runtime/BuildToolRegistry,
+	// not here:
+	//   - Skill needs a multi-source loader that includes plugin contributions
+	//   - Memory needs a *memory.MemoryManager so writes flow into the same
+	//     store BuildContext reads from (otherwise the LLM's writes never
+	//     appear in the next turn's system prompt — bug audit 2026-04-30).
+	// `metis tools` and the chat REPL both go through BuildToolRegistry
+	// after this Register call, so both tools always show up in the end.
+	all := []tools.Tool{
+		Read{gate: gate},
+		Write{gate: gate},
+		Edit{gate: gate},
+		Bash{gate: gate, settings: cfg.Tools.Bash},
+		LS{gate: gate},
+		Glob{gate: gate},
+		Grep{gate: gate},
+		WebFetch{gate: gate},
+		Git{gate: gate},
+		Search{gate: gate},
+		Todo{gate: gate},
+		TodoRead{gate: gate},
+		AskUser{gate: gate},
+	}
+	_ = skillDir // referenced by BuildToolRegistry, kept here for symmetry
+	_ = memDir   // legacy memory dir; Memory tool now uses MemoryManager directly
+	for _, t := range all {
+		if disabled[t.Name()] {
+			continue
+		}
+		r.Register(t)
+	}
+}
