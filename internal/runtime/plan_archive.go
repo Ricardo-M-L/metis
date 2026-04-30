@@ -24,10 +24,10 @@ func PlansDir() string {
 
 // ArchivedPlan is the on-disk shape of a captured plan-mode run.
 type ArchivedPlan struct {
-	SessionID string           `json:"session"`
-	Timestamp time.Time        `json:"ts"`
-	UserPrompt string          `json:"user_prompt,omitempty"`
-	ToolCalls []agent.ToolCall `json:"tool_calls"`
+	SessionID  string           `json:"session"`
+	Timestamp  time.Time        `json:"ts"`
+	UserPrompt string           `json:"user_prompt,omitempty"`
+	ToolCalls  []agent.ToolCall `json:"tool_calls"`
 }
 
 // plansMu prevents concurrent writes to the plans dir from racing on

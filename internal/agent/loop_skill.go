@@ -10,16 +10,16 @@ import (
 // LoopSkill enables continuous task execution with dynamic pacing.
 // Inspired by OpenClaw's loop skill and Hermes' ScheduleWakeup.
 type LoopSkill struct {
-	enabled    bool
-	interval   time.Duration
-	maxPerHour int
+	enabled     bool
+	interval    time.Duration
+	maxPerHour  int
 	maintenance bool
 
-	mu         sync.RWMutex
-	turnCount  int
-	lastTurn   time.Time
-	startTime  time.Time
-	stopCh     chan struct{}
+	mu        sync.RWMutex
+	turnCount int
+	lastTurn  time.Time
+	startTime time.Time
+	stopCh    chan struct{}
 }
 
 // NewLoopSkill creates a new loop skill.
@@ -80,12 +80,12 @@ func (ls *LoopSkill) Stats() LoopSkillStats {
 		rate = float64(ls.turnCount) / elapsed.Hours()
 	}
 	return LoopSkillStats{
-		Enabled:    ls.enabled,
-		Interval:   ls.interval.String(),
-		TurnCount:  ls.turnCount,
-		RatePerHr:  rate,
-		Uptime:     elapsed.String(),
-		LastTurn:   ls.lastTurn,
+		Enabled:     ls.enabled,
+		Interval:    ls.interval.String(),
+		TurnCount:   ls.turnCount,
+		RatePerHr:   rate,
+		Uptime:      elapsed.String(),
+		LastTurn:    ls.lastTurn,
 		Maintenance: ls.maintenance,
 	}
 }

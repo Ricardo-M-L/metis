@@ -11,11 +11,13 @@ import (
 // any internal package.
 type fakeTool struct{ name string }
 
-func (t fakeTool) Name() string                                              { return t.name }
-func (t fakeTool) Description() string                                       { return "fake" }
-func (t fakeTool) InputSchema() map[string]any                               { return map[string]any{"type": "object"} }
-func (t fakeTool) Concurrency(map[string]any) Concurrency                                  { return ConcurrencySafe }
-func (t fakeTool) CanUse(_ context.Context, _ map[string]any) (Permission, string) { return PermissionAllow, "" }
+func (t fakeTool) Name() string                           { return t.name }
+func (t fakeTool) Description() string                    { return "fake" }
+func (t fakeTool) InputSchema() map[string]any            { return map[string]any{"type": "object"} }
+func (t fakeTool) Concurrency(map[string]any) Concurrency { return ConcurrencySafe }
+func (t fakeTool) CanUse(_ context.Context, _ map[string]any) (Permission, string) {
+	return PermissionAllow, ""
+}
 func (t fakeTool) Execute(_ context.Context, _ map[string]any) (*Result, error) {
 	return &Result{Output: "ok"}, nil
 }

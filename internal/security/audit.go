@@ -76,7 +76,7 @@ func Run(cfg *config.Config, reg *tools.Registry) *Report {
 var requiredDenyPatterns = []string{
 	"rm -rf /",
 	"dd of=/dev",
-	":(){",  // classic fork bomb prefix
+	":(){", // classic fork bomb prefix
 }
 
 func checkBashDenylist(cfg *config.Config, r *Report) {

@@ -70,7 +70,7 @@ func renderInputLine(m *Model) string {
 
 // renderSpinnerStatus builds the streaming-state line:
 //
-//	* Verb sub (12s · ↓ 3.1k tokens · thought for 1s)
+//   - Verb sub (12s · ↓ 3.1k tokens · thought for 1s)
 //
 // All bracketed parts are conditional. The leading "Verb" is shimmered
 // from 3s onward so quick replies don't flicker the dimming animation.

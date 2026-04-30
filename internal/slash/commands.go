@@ -11,9 +11,9 @@ import (
 // Cmd is a callable slash command.
 type Cmd struct {
 	Name        string
-	Aliases    []string
+	Aliases     []string
 	Description string
-	Handler    Handler
+	Handler     Handler
 }
 
 // Handler executes the command.

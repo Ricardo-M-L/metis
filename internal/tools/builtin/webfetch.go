@@ -26,12 +26,13 @@ func (WebFetch) InputSchema() map[string]any {
 		"type":     "object",
 		"required": []string{"url"},
 		"properties": map[string]any{
-			"url":         map[string]any{"type": "string"},
-			"max_bytes":   map[string]any{"type": "integer"},
-			"timeout_ms":  map[string]any{"type": "integer"},
+			"url":        map[string]any{"type": "string"},
+			"max_bytes":  map[string]any{"type": "integer"},
+			"timeout_ms": map[string]any{"type": "integer"},
 		},
 	}
 }
+
 // WebFetch is concurrency-safe: claude-code, openclaude, and hermes all
 // classify their equivalents (WebFetchTool / web_extract) as parallel-OK.
 // Different URLs typically hit different domains, the Go http client

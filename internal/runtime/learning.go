@@ -30,10 +30,10 @@ import (
 type LearnedRecord struct {
 	Timestamp  time.Time `json:"ts"`
 	SessionID  string    `json:"sid"`
-	Prompt     string    `json:"prompt"`     // first ~200 chars of user prompt
-	ToolUsed   []string  `json:"tools"`      // distinct tool names called
-	FilesTouch []string  `json:"files"`      // basenames edited / written
-	Duration   string    `json:"dur"`        // e.g. "1m 32s"
+	Prompt     string    `json:"prompt"` // first ~200 chars of user prompt
+	ToolUsed   []string  `json:"tools"`  // distinct tool names called
+	FilesTouch []string  `json:"files"`  // basenames edited / written
+	Duration   string    `json:"dur"`    // e.g. "1m 32s"
 	Tokens     int       `json:"tokens"`
 	HadErrors  bool      `json:"had_errors"` // any tool error
 	Recap      string    `json:"recap"`      // structural recap line

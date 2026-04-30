@@ -14,12 +14,16 @@ type stubTool struct {
 	schema map[string]any
 }
 
-func (s stubTool) Name() string                                                          { return s.name }
-func (s stubTool) Description() string                                                    { return "stub" }
-func (s stubTool) InputSchema() map[string]any                                            { return s.schema }
-func (s stubTool) Concurrency(map[string]any) tools.Concurrency                                         { return tools.ConcurrencySafe }
-func (s stubTool) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) { return tools.PermissionAllow, "" }
-func (s stubTool) Execute(_ context.Context, _ map[string]any) (*tools.Result, error)    { return &tools.Result{}, nil }
+func (s stubTool) Name() string                                 { return s.name }
+func (s stubTool) Description() string                          { return "stub" }
+func (s stubTool) InputSchema() map[string]any                  { return s.schema }
+func (s stubTool) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (s stubTool) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
+	return tools.PermissionAllow, ""
+}
+func (s stubTool) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
+	return &tools.Result{}, nil
+}
 
 // --- helpers ---------------------------------------------------------------
 

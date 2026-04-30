@@ -23,16 +23,16 @@ func errIsEOF(err error) bool { return errors.Is(err, io.EOF) }
 
 // Config holds compaction thresholds.
 type Config struct {
-	Threshold   float64 // fraction of context window (e.g. 0.85)
-	ProtectFirst int     // always keep first N messages
-	ProtectLast  int     // always keep last N messages
-	MaxSummaryTokens int // max tokens in a summary turn
+	Threshold        float64 // fraction of context window (e.g. 0.85)
+	ProtectFirst     int     // always keep first N messages
+	ProtectLast      int     // always keep last N messages
+	MaxSummaryTokens int     // max tokens in a summary turn
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultCompactionConfig() Config {
 	return Config{
-		Threshold:       0.85,
+		Threshold:        0.85,
 		ProtectFirst:     1, // system message
 		ProtectLast:      5, // recent turns
 		MaxSummaryTokens: 512,

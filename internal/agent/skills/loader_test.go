@@ -120,8 +120,8 @@ type stubPlugin struct {
 	skills []Skill
 }
 
-func (s stubPlugin) Name() string     { return s.name }
-func (s stubPlugin) Skills() []Skill  { return s.skills }
+func (s stubPlugin) Name() string    { return s.name }
+func (s stubPlugin) Skills() []Skill { return s.skills }
 
 func TestLoader_CacheUntilInvalidate(t *testing.T) {
 	user := t.TempDir()

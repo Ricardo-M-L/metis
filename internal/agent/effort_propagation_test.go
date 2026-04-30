@@ -19,10 +19,12 @@ type captureProvider struct {
 	lastReq llm.Request
 }
 
-func (p *captureProvider) Name() string             { return "capture" }
-func (p *captureProvider) MaxContextTokens() int    { return 200_000 }
+func (p *captureProvider) Name() string          { return "capture" }
+func (p *captureProvider) MaxContextTokens() int { return 200_000 }
 func (p *captureProvider) Complete(ctx context.Context, req llm.Request) (*llm.Response, error) {
-	p.mu.Lock(); p.lastReq = req; p.mu.Unlock()
+	p.mu.Lock()
+	p.lastReq = req
+	p.mu.Unlock()
 	return &llm.Response{StopReason: "end_turn"}, nil
 }
 func (p *captureProvider) Stream(ctx context.Context, req llm.Request) (llm.StreamReader, error) {
@@ -33,7 +35,8 @@ func (p *captureProvider) Stream(ctx context.Context, req llm.Request) (llm.Stre
 }
 
 func (p *captureProvider) snapshot() llm.Request {
-	p.mu.Lock(); defer p.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.lastReq
 }
 
@@ -63,7 +66,8 @@ func TestLoopRun_PropagatesEffortToProviderRequest(t *testing.T) {
 		t.Fatalf("Run err: %v", err)
 	}
 	close(out)
-	for range out { /* drain */ }
+	for range out { /* drain */
+	}
 
 	got := p.snapshot()
 	if got.Effort != llm.EffortHigh {
@@ -88,7 +92,8 @@ func TestLoopRun_FastModeForcesLowEffortAndCapsMaxTokens(t *testing.T) {
 		t.Fatalf("Run err: %v", err)
 	}
 	close(out)
-	for range out { /* drain */ }
+	for range out { /* drain */
+	}
 
 	got := p.snapshot()
 	if got.Effort != llm.EffortLow {
@@ -118,7 +123,8 @@ func TestLoopRun_NoEffortNoFastSendsDefault(t *testing.T) {
 		t.Fatalf("Run err: %v", err)
 	}
 	close(out)
-	for range out { /* drain */ }
+	for range out { /* drain */
+	}
 
 	got := p.snapshot()
 	if got.Effort != llm.EffortDefault {

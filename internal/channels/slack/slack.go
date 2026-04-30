@@ -32,8 +32,8 @@ func New(token, defaultChannel string) *Adapter {
 	}
 }
 
-func (a *Adapter) Name() string       { return "slack" }
-func (a *Adapter) Configured() bool   { return a.Token != "" }
+func (a *Adapter) Name() string     { return "slack" }
+func (a *Adapter) Configured() bool { return a.Token != "" }
 
 func (a *Adapter) Send(ctx context.Context, target string, msg channels.Message) error {
 	if target == "" {

@@ -19,8 +19,8 @@ type fakeProvider struct {
 	streamErr error
 }
 
-func (p *fakeProvider) Name() string                                   { return p.name }
-func (p *fakeProvider) MaxContextTokens() int                          { return p.maxCtx }
+func (p *fakeProvider) Name() string          { return p.name }
+func (p *fakeProvider) MaxContextTokens() int { return p.maxCtx }
 func (p *fakeProvider) Complete(_ context.Context, req Request) (*Response, error) {
 	p.gotReq = req
 	return &Response{StopReason: "end_turn"}, nil
@@ -35,8 +35,8 @@ func (p *fakeProvider) Stream(_ context.Context, req Request) (StreamReader, err
 
 type eofStream struct{}
 
-func (eofStream) Close() error                    { return nil }
-func (eofStream) Recv() (StreamEvent, error)      { return StreamEvent{}, io.EOF }
+func (eofStream) Close() error               { return nil }
+func (eofStream) Recv() (StreamEvent, error) { return StreamEvent{}, io.EOF }
 
 func TestProviderInterface_PluginCompiles(t *testing.T) {
 	// Static check — failing to compile is the canary for an SDK break.

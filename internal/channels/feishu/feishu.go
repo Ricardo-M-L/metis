@@ -76,8 +76,9 @@ func (a *Adapter) Send(ctx context.Context, _ string, msg channels.Message) erro
 }
 
 // feishuSign matches the algorithm from feishu's official docs:
-//   string_to_sign = f"{timestamp}\n{secret}"
-//   sign = base64(hmac_sha256(key=string_to_sign, msg=""))
+//
+//	string_to_sign = f"{timestamp}\n{secret}"
+//	sign = base64(hmac_sha256(key=string_to_sign, msg=""))
 func feishuSign(ts int64, secret string) string {
 	key := strconv.FormatInt(ts, 10) + "\n" + secret
 	mac := hmac.New(sha256.New, []byte(key))

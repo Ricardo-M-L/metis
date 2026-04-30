@@ -13,11 +13,11 @@ import (
 type Mode string
 
 const (
-	ModeAsk        Mode = "ask"        // prompt for every non-allowlisted action
-	ModeAuto       Mode = "auto"       // auto-allow read-only & allowlisted; ask for the rest
-	ModeBypass     Mode = "bypass"     // approve everything (dangerous; opt-in)
-	ModePlan       Mode = "plan"       // read-only mode; no edits or shell writes
-	ModeDeny       Mode = "deny"       // refuse everything that asks
+	ModeAsk    Mode = "ask"    // prompt for every non-allowlisted action
+	ModeAuto   Mode = "auto"   // auto-allow read-only & allowlisted; ask for the rest
+	ModeBypass Mode = "bypass" // approve everything (dangerous; opt-in)
+	ModePlan   Mode = "plan"   // read-only mode; no edits or shell writes
+	ModeDeny   Mode = "deny"   // refuse everything that asks
 )
 
 // Decision is the final verdict for a tool call.
@@ -31,10 +31,10 @@ const (
 
 // Rule is a single declarative entry: tool + optional content matcher + verb.
 type Rule struct {
-	Tool    string // e.g. "Bash", "Edit", "*" for any
-	Match   string // optional substring of stringified input
-	Verb    Decision
-	Source  string // for diagnostics: "cli", "project", "user", ...
+	Tool   string // e.g. "Bash", "Edit", "*" for any
+	Match  string // optional substring of stringified input
+	Verb   Decision
+	Source string // for diagnostics: "cli", "project", "user", ...
 }
 
 // Gate combines a Mode and a stack of Rule sources.

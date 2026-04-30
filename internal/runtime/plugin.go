@@ -50,7 +50,7 @@ func (p *Plugin) SkillsList() []skills.Skill { return p.Skills }
 // alias for pkg/skill.Skill — and the loader wants the alias.
 type pluginSkillAdapter struct{ p *Plugin }
 
-func (a pluginSkillAdapter) Name() string         { return a.p.Manifest.Name }
+func (a pluginSkillAdapter) Name() string           { return a.p.Manifest.Name }
 func (a pluginSkillAdapter) Skills() []skills.Skill { return a.p.Skills }
 
 // PluginRegistry holds the set of active plugins. Built once at startup

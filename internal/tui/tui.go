@@ -98,8 +98,8 @@ type Model struct {
 	// the input can show `[Image #1]` (claude-code style) while the
 	// submit pipeline still resolves to the cached file path.
 	// Reset after submit; never persisted across turns.
-	imagePaste    map[int]string // N -> /path/to/cached.png
-	imageCounter  int            // 1-based; matches the visible #N
+	imagePaste   map[int]string // N -> /path/to/cached.png
+	imageCounter int            // 1-based; matches the visible #N
 
 	// input is the chat-surface multi-line editor. textarea (instead of
 	// textinput) lets the user paste multi-line code and split prompts
@@ -132,11 +132,11 @@ type Model struct {
 	// palette (`showPalette`) so a user can hit `/` mid-history-search
 	// without us having to multiplex two filter strings into one.
 	// Loaded lazily on first open from ~/.metis/history.jsonl.
-	showHistory   bool
-	histAll       []string // newest-first dedup'd input strings
-	histFilter    string
-	histCursor    int
-	histMatched   []string // subset of histAll that fuzzy-matches histFilter
+	showHistory bool
+	histAll     []string // newest-first dedup'd input strings
+	histFilter  string
+	histCursor  int
+	histMatched []string // subset of histAll that fuzzy-matches histFilter
 
 	// @-mention dropdown state. Tracked separately from the slash
 	// palette so an in-progress `@xxx` filter doesn't fight the slash
@@ -144,10 +144,10 @@ type Model struct {
 	// key by `updateAtMention()` (called from the textarea-update
 	// codepath), so we don't have to drive it from a dedicated key
 	// handler — it just appears when the cursor is in an `@xxx` token.
-	atActive   bool
-	atFilter   string
-	atCursor   int      // selected row in atMatched (0-based)
-	atMatched  []string // current fuzzy-matched file paths
+	atActive  bool
+	atFilter  string
+	atCursor  int      // selected row in atMatched (0-based)
+	atMatched []string // current fuzzy-matched file paths
 
 	permActive   bool
 	permQuestion string

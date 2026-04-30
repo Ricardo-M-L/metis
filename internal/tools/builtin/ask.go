@@ -16,11 +16,11 @@ func (AskUser) Description() string {
 }
 func (AskUser) InputSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type":     "object",
 		"required": []string{"question"},
 		"properties": map[string]any{
-			"question":  map[string]any{"type": "string"},
-			"options":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"question":       map[string]any{"type": "string"},
+			"options":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"allow_freeform": map[string]any{"type": "boolean"},
 		},
 	}

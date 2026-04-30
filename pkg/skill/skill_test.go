@@ -16,7 +16,7 @@ type fakeSource struct {
 	want *Skill
 }
 
-func (f *fakeSource) Name() string                         { return f.name }
+func (f *fakeSource) Name() string { return f.name }
 func (f *fakeSource) Fetch(_ context.Context, _ string) (*Skill, error) {
 	clone := *f.want
 	clone.Source = f.name

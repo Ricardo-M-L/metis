@@ -94,10 +94,10 @@ func TestUndo_OnAssistantOnlyHistoryIsNoop(t *testing.T) {
 
 func TestLastPlainUserIndex_IgnoresToolResultUserMessages(t *testing.T) {
 	msgs := []llm.Message{
-		userText("hi"),                       // index 0 — real user msg
-		assistantText("..."),                 // 1
-		toolUseBlock("c1", "Read"),           // 2 — assistant tool_use
-		toolResultBlock("c1", "..."),         // 3 — user-role tool_result
+		userText("hi"),               // index 0 — real user msg
+		assistantText("..."),         // 1
+		toolUseBlock("c1", "Read"),   // 2 — assistant tool_use
+		toolResultBlock("c1", "..."), // 3 — user-role tool_result
 	}
 	idx := LastPlainUserIndex(msgs)
 	if idx != 0 {

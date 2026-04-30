@@ -33,16 +33,16 @@ import (
 // — useful for `metis tools` listing where we just want to advertise
 // the capability without running it. The chat REPL always sets it.
 type ToolRegistryOptions struct {
-	Cfg              *config.Config
-	Gate             *permission.Gate
-	Provider         llm.Provider
-	Model            string
-	System           string
-	ChannelRegistry  *channels.Registry
-	DefaultPlatform  string
-	CronService      *agent.CronService
-	PluginSources    []skills.PluginSkillSource
-	MemoryManager    *memory.MemoryManager
+	Cfg             *config.Config
+	Gate            *permission.Gate
+	Provider        llm.Provider
+	Model           string
+	System          string
+	ChannelRegistry *channels.Registry
+	DefaultPlatform string
+	CronService     *agent.CronService
+	PluginSources   []skills.PluginSkillSource
+	MemoryManager   *memory.MemoryManager
 }
 
 // BuildToolRegistry constructs the per-session tools.Registry, registers

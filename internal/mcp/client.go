@@ -91,9 +91,9 @@ type Notification struct {
 
 // Tool describes an MCP tool available on the server.
 type Tool struct {
-	Name        string                  `json:"name"`
-	Description string                  `json:"description"`
-	InputSchema map[string]interface{}   `json:"inputSchema"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	InputSchema map[string]interface{} `json:"inputSchema"`
 }
 
 // ListToolsResult is the result of tools/list.
@@ -183,12 +183,12 @@ func (c *Client) Close() error {
 // send issues a JSON-RPC request and waits for its response.
 //
 // Three things this guards against (each one was a real bug):
-//   1. id collision when two callers hit the same nanosecond — we use a
-//      monotonic counter, not time.UnixNano().
-//   2. stdin write failure being swallowed — if the subprocess died, we
-//      surface the write error immediately instead of waiting for ctx.
-//   3. pending[id] leaking when ctx is cancelled or HTTP returns directly
-//      — every exit path through this function deletes the entry.
+//  1. id collision when two callers hit the same nanosecond — we use a
+//     monotonic counter, not time.UnixNano().
+//  2. stdin write failure being swallowed — if the subprocess died, we
+//     surface the write error immediately instead of waiting for ctx.
+//  3. pending[id] leaking when ctx is cancelled or HTTP returns directly
+//     — every exit path through this function deletes the entry.
 func (c *Client) send(ctx context.Context, method string, params interface{}) (*JSONRPCResponse, error) {
 	raw, err := json.Marshal(params)
 	if err != nil {

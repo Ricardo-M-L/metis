@@ -25,18 +25,18 @@ import (
 )
 
 type REPL struct {
-	Loop       *agent.Loop
-	Gate       *permission.Gate
-	Slash      *slash.Registry
-	Session    *session.Store
-	SessionID  string
-	Styles     *Styles
-	Markdown   *glamour.TermRenderer
+	Loop        *agent.Loop
+	Gate        *permission.Gate
+	Slash       *slash.Registry
+	Session     *session.Store
+	SessionID   string
+	Styles      *Styles
+	Markdown    *glamour.TermRenderer
 	UseMarkdown bool
 	ShowTokens  bool
-	model     string
-	skillDir  string
-	cmds     *REPLCommandRegistry
+	model       string
+	skillDir    string
+	cmds        *REPLCommandRegistry
 	totalTokens tokenTracker
 
 	stdin io.Reader
@@ -62,7 +62,7 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 	}
 	return &REPL{
 		Loop:        loop,
-		Gate:       gate,
+		Gate:        gate,
 		Slash:       sl,
 		Session:     st,
 		SessionID:   sid,
@@ -70,9 +70,9 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 		Markdown:    md,
 		UseMarkdown: useMarkdown,
 		ShowTokens:  showTokens,
-		model:      model,
-		skillDir:   skillDir,
-		cmds:       BuildREPLCommands(),
+		model:       model,
+		skillDir:    skillDir,
+		cmds:        BuildREPLCommands(),
 		stdin:       os.Stdin,
 		out:         os.Stdout,
 	}, nil
@@ -128,7 +128,7 @@ func (r *REPL) Run(ctx context.Context) error {
 		// Built-in REPL command? (parsed before LLM)
 		if cmd := r.parseREPLCommand(text); cmd != nil {
 			name, args := r.extractCommandName(text)
-		_ = name // used for future command logging
+			_ = name // used for future command logging
 			output := cmd.Handler(r, args)
 			if output != "" {
 				fmt.Fprintln(r.out, output)
@@ -331,7 +331,7 @@ func (r *REPL) printBanner() {
 	fmt.Fprint(r.out, infoStyle.Render("  ·  "))
 	fmt.Fprint(r.out, hintStyle.Render("mode: "), statusStyle.Render(string(r.Gate.Mode())))
 	fmt.Fprintln(r.out)
-	fmt.Fprintln(r.out, infoStyle.Render(padding+"(type ") + hintStyle.Render("help") + infoStyle.Render(" for commands, ") + hintStyle.Render("/quit") + infoStyle.Render(" to exit)"))
+	fmt.Fprintln(r.out, infoStyle.Render(padding+"(type ")+hintStyle.Render("help")+infoStyle.Render(" for commands, ")+hintStyle.Render("/quit")+infoStyle.Render(" to exit)"))
 	fmt.Fprintln(r.out)
 }
 
@@ -591,4 +591,3 @@ func lipglossWidth(_ io.Writer) int {
 	}
 	return w
 }
-

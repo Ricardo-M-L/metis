@@ -91,9 +91,9 @@ func TestSummarizeToolResult_PerTool(t *testing.T) {
 // mixed, identical (no-op).
 func TestCountEditDiff(t *testing.T) {
 	cases := []struct {
-		name           string
-		old, new       string
-		wantA, wantR   int
+		name         string
+		old, new     string
+		wantA, wantR int
 	}{
 		{"identical", "a\nb\n", "a\nb\n", 0, 0},
 		{"pure add", "a\n", "a\nb\nc\n", 2, 0},

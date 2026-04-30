@@ -41,7 +41,7 @@ const (
 	EventContextCompacted // auto-compaction just ran (also emits as EventInfo today)
 
 	// Rate limit / provider feedback.
-	EventRateLimitHit // 429 / 529 from provider, retrying
+	EventRateLimitHit  // 429 / 529 from provider, retrying
 	EventModelFallback // primary model rejected, switched to fallback
 
 	// Channel / IM events — for users routing chat through Slack/etc.
@@ -92,10 +92,10 @@ type Event struct {
 	TextDelta string
 
 	// Tool events
-	ToolUseID   string
-	ToolName    string
-	ToolInput   map[string]any
-	ToolResult  *ToolResult
+	ToolUseID  string
+	ToolName   string
+	ToolInput  map[string]any
+	ToolResult *ToolResult
 
 	// ToolCall captures the tool a Plan Mode loop wants to call.
 	// When Kind == EventPlan, ToolCalls is non-empty.
@@ -119,16 +119,16 @@ type Event struct {
 
 // ToolCall represents a tool the model wants to invoke.
 type ToolCall struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
+	ID    string         `json:"id"`
+	Name  string         `json:"name"`
 	Input map[string]any `json:"input"`
 }
 
 // ToolResult wraps a tool execution result for streaming.
 type ToolResult struct {
-	Output  string         `json:"output"`
-	IsError bool          `json:"is_error"`
-	Display string         `json:"display,omitempty"`
+	Output  string `json:"output"`
+	IsError bool   `json:"is_error"`
+	Display string `json:"display,omitempty"`
 }
 
 type PermissionDecision int

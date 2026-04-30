@@ -84,10 +84,12 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 // without re-emitting all rows.
 type TodoRead struct{ gate *permission.Gate }
 
-func (TodoRead) Name() string                                              { return "TodoRead" }
-func (TodoRead) Description() string                                       { return "List all tasks in the current session's task list." }
-func (TodoRead) Concurrency(map[string]any) tools.Concurrency                            { return tools.ConcurrencySafe }
-func (TodoRead) InputSchema() map[string]any                               { return map[string]any{"type": "object", "properties": map[string]any{}} }
+func (TodoRead) Name() string                                 { return "TodoRead" }
+func (TodoRead) Description() string                          { return "List all tasks in the current session's task list." }
+func (TodoRead) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (TodoRead) InputSchema() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
 func (t TodoRead) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	return tools.PermissionAllow, "read-only"
 }
@@ -112,4 +114,3 @@ func (TodoRead) Execute(_ context.Context, _ map[string]any) (*tools.Result, err
 	}
 	return &tools.Result{Output: strings.TrimRight(b.String(), "\n")}, nil
 }
-

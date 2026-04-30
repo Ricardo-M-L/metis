@@ -7,10 +7,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ricardo/metis/internal/config"
-	"github.com/ricardo/metis/internal/llm"
-	"github.com/ricardo/metis/internal/permission"
-	"github.com/ricardo/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // stubProvider is a minimal Provider for BuildAgentLoop tests.

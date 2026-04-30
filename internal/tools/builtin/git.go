@@ -14,16 +14,16 @@ import (
 // Git wraps common git operations as tools.
 type Git struct{ gate *permission.Gate }
 
-func (Git) Name() string { return "Git" }
+func (Git) Name() string        { return "Git" }
 func (Git) Description() string { return "Run a git command. Wrapper around common git operations." }
 func (Git) InputSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type":     "object",
 		"required": []string{"args"},
 		"properties": map[string]any{
-			"args":    map[string]any{"type": "string", "description": "git arguments (e.g. 'status', 'log --oneline -5')"},
-			"cwd":     map[string]any{"type": "string", "description": "working directory"},
-			"env":     map[string]any{"type": "object", "description": "extra env vars"},
+			"args": map[string]any{"type": "string", "description": "git arguments (e.g. 'status', 'log --oneline -5')"},
+			"cwd":  map[string]any{"type": "string", "description": "working directory"},
+			"env":  map[string]any{"type": "object", "description": "extra env vars"},
 		},
 	}
 }

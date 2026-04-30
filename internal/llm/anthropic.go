@@ -17,11 +17,11 @@ import (
 // We hand-roll the HTTP layer to keep the dependency footprint minimal
 // and to control SSE parsing precisely.
 type Anthropic struct {
-	APIKey     string
-	BaseURL    string
-	Model      string
-	MaxTokens  int
-	Beta       string
+	APIKey    string
+	BaseURL   string
+	Model     string
+	MaxTokens int
+	Beta      string
 	// ContextWindow, when > 0, overrides the model-prefix lookup in
 	// MaxContextTokens(). Lets users on Anthropic-compatible third-party
 	// gateways (MiniMax, OpenRouter, ...) declare the real window so
@@ -113,15 +113,15 @@ type anthropicThinking struct {
 }
 
 type anthropicReq struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	System      string             `json:"system,omitempty"`
-	Messages    []anthropicMessage `json:"messages"`
-	Tools       []anthropicTool    `json:"tools,omitempty"`
-	Temperature *float64           `json:"temperature,omitempty"`
-	Thinking    *anthropicThinking `json:"thinking,omitempty"`
-	Stream      bool               `json:"stream,omitempty"`
-	StopSequences []string         `json:"stop_sequences,omitempty"`
+	Model         string             `json:"model"`
+	MaxTokens     int                `json:"max_tokens"`
+	System        string             `json:"system,omitempty"`
+	Messages      []anthropicMessage `json:"messages"`
+	Tools         []anthropicTool    `json:"tools,omitempty"`
+	Temperature   *float64           `json:"temperature,omitempty"`
+	Thinking      *anthropicThinking `json:"thinking,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	StopSequences []string           `json:"stop_sequences,omitempty"`
 }
 
 type anthropicResp struct {
@@ -361,12 +361,12 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 		}
 
 		var env struct {
-			Type  string          `json:"type"`
-			Index int             `json:"index"`
-			Delta json.RawMessage `json:"delta"`
+			Type         string          `json:"type"`
+			Index        int             `json:"index"`
+			Delta        json.RawMessage `json:"delta"`
 			ContentBlock json.RawMessage `json:"content_block"`
-			Message json.RawMessage `json:"message"`
-			Usage struct {
+			Message      json.RawMessage `json:"message"`
+			Usage        struct {
 				InputTokens  int `json:"input_tokens"`
 				OutputTokens int `json:"output_tokens"`
 			} `json:"usage"`

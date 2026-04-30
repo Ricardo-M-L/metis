@@ -79,9 +79,9 @@ func (g *Gemini) MaxContextTokens() int {
 // --- request shapes ---
 
 type gemPart struct {
-	Text             string             `json:"text,omitempty"`
-	FunctionCall     *gemFunctionCall   `json:"functionCall,omitempty"`
-	FunctionResponse *gemFunctionResp   `json:"functionResponse,omitempty"`
+	Text             string           `json:"text,omitempty"`
+	FunctionCall     *gemFunctionCall `json:"functionCall,omitempty"`
+	FunctionResponse *gemFunctionResp `json:"functionResponse,omitempty"`
 }
 
 type gemFunctionCall struct {

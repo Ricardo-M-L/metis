@@ -1,9 +1,9 @@
 // Package config loads metis's TOML configuration with cascading precedence:
-//   1. CLI flags (highest)
-//   2. Project-local: $PWD/.metis/config.toml
-//   3. User: $METIS_HOME/config.toml or ~/.metis/config.toml
-//   4. Legacy: ~/.config/metis/config.toml (auto-migrated on first run)
-//   5. Defaults (lowest)
+//  1. CLI flags (highest)
+//  2. Project-local: $PWD/.metis/config.toml
+//  3. User: $METIS_HOME/config.toml or ~/.metis/config.toml
+//  4. Legacy: ~/.config/metis/config.toml (auto-migrated on first run)
+//  5. Defaults (lowest)
 //
 // Inspired by Claude Code's settings precedence and Hermes' provider overlays.
 // Layout under ~/.metis/ deliberately matches Claude Code's ~/.claude/ —
@@ -36,13 +36,13 @@ type Config struct {
 // Each subsection only has *_env fields — the actual tokens / webhook URLs
 // stay in environment variables to keep config.toml diffable.
 type Channels struct {
-	DefaultPlatform string             `toml:"default_platform"` // used when channel arg has no "<platform>:" prefix
-	Slack           SlackChannel       `toml:"slack"`
-	Telegram        TelegramChannel    `toml:"telegram"`
-	Discord         DiscordChannel     `toml:"discord"`
-	Dingtalk        DingtalkChannel    `toml:"dingtalk"`
-	Feishu          FeishuChannel      `toml:"feishu"`
-	Wechat          WechatChannel      `toml:"wechat"`
+	DefaultPlatform string          `toml:"default_platform"` // used when channel arg has no "<platform>:" prefix
+	Slack           SlackChannel    `toml:"slack"`
+	Telegram        TelegramChannel `toml:"telegram"`
+	Discord         DiscordChannel  `toml:"discord"`
+	Dingtalk        DingtalkChannel `toml:"dingtalk"`
+	Feishu          FeishuChannel   `toml:"feishu"`
+	Wechat          WechatChannel   `toml:"wechat"`
 }
 
 type SlackChannel struct {
@@ -111,11 +111,11 @@ type ProviderSet struct {
 // `?key=...` query param is NOT supported because our retries would
 // log the key on a 4xx.
 type ProviderGemini struct {
-	APIKeyEnv   string  `toml:"api_key_env"`
-	APIKey      string  `toml:"api_key"`
-	BaseURL     string  `toml:"base_url"`
-	Model       string  `toml:"model"`
-	MaxTokens   int     `toml:"max_tokens"`
+	APIKeyEnv string `toml:"api_key_env"`
+	APIKey    string `toml:"api_key"`
+	BaseURL   string `toml:"base_url"`
+	Model     string `toml:"model"`
+	MaxTokens int    `toml:"max_tokens"`
 	// ContextWindow overrides the model-prefix lookup used for
 	// auto-compaction. Set when the served model's name doesn't match
 	// a known prefix or its window differs from the upstream default.
@@ -125,11 +125,11 @@ type ProviderGemini struct {
 }
 
 type ProviderAnthropic struct {
-	APIKeyEnv     string  `toml:"api_key_env"`
-	APIKey        string  `toml:"api_key"` // direct (discouraged; prefer env)
-	BaseURL       string  `toml:"base_url"`
-	Model         string  `toml:"model"`
-	MaxTokens     int     `toml:"max_tokens"`
+	APIKeyEnv string `toml:"api_key_env"`
+	APIKey    string `toml:"api_key"` // direct (discouraged; prefer env)
+	BaseURL   string `toml:"base_url"`
+	Model     string `toml:"model"`
+	MaxTokens int    `toml:"max_tokens"`
 	// ContextWindow overrides the model-prefix lookup used for
 	// auto-compaction. Required for Anthropic-compatible third-party
 	// gateways (MiniMax, OpenRouter, ...) where the served model
@@ -142,11 +142,11 @@ type ProviderAnthropic struct {
 }
 
 type ProviderOpenAI struct {
-	APIKeyEnv   string  `toml:"api_key_env"`
-	APIKey      string  `toml:"api_key"`
-	BaseURL     string  `toml:"base_url"`
-	Model       string  `toml:"model"`
-	MaxTokens   int     `toml:"max_tokens"`
+	APIKeyEnv string `toml:"api_key_env"`
+	APIKey    string `toml:"api_key"`
+	BaseURL   string `toml:"base_url"`
+	Model     string `toml:"model"`
+	MaxTokens int    `toml:"max_tokens"`
 	// ContextWindow overrides the model-prefix lookup. See ProviderAnthropic.
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
@@ -154,12 +154,12 @@ type ProviderOpenAI struct {
 }
 
 type ProviderRaw struct {
-	Transport   string  `toml:"transport"` // anthropic_messages | openai_chat
-	APIKeyEnv   string  `toml:"api_key_env"`
-	BaseURL     string  `toml:"base_url"`
-	Model       string  `toml:"model"`
-	MaxTokens   int     `toml:"max_tokens"`
-	TimeoutSecs int     `toml:"timeout_seconds"`
+	Transport   string `toml:"transport"` // anthropic_messages | openai_chat
+	APIKeyEnv   string `toml:"api_key_env"`
+	BaseURL     string `toml:"base_url"`
+	Model       string `toml:"model"`
+	MaxTokens   int    `toml:"max_tokens"`
+	TimeoutSecs int    `toml:"timeout_seconds"`
 }
 
 type Permission struct {
@@ -174,11 +174,11 @@ type Rule struct {
 }
 
 type UI struct {
-	Theme        string         `toml:"theme"`
-	Markdown     bool           `toml:"markdown"`
-	ShowTokens   bool           `toml:"show_tokens"`
-	ShowToolJSON bool           `toml:"show_tool_json"`
-	Performance  UIPerformance  `toml:"performance"`
+	Theme        string        `toml:"theme"`
+	Markdown     bool          `toml:"markdown"`
+	ShowTokens   bool          `toml:"show_tokens"`
+	ShowToolJSON bool          `toml:"show_tool_json"`
+	Performance  UIPerformance `toml:"performance"`
 }
 
 // UIPerformance gathers the tunables that decide how snappy / how

@@ -59,7 +59,7 @@ func (f *fakeMCPServer) Handler() http.Handler {
 			}}
 		case "tools/call":
 			var p struct {
-				Name string `json:"name"`
+				Name string                 `json:"name"`
 				Args map[string]interface{} `json:"arguments"`
 			}
 			_ = json.Unmarshal(req.Params, &p)

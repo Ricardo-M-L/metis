@@ -14,9 +14,9 @@ import (
 
 func TestToAnthropic_EffortHighSetsThinkingBudget(t *testing.T) {
 	req := Request{
-		Model:    "claude-opus-4-7",
-		System:   "you are a tester",
-		Effort:   EffortHigh,
+		Model:  "claude-opus-4-7",
+		System: "you are a tester",
+		Effort: EffortHigh,
 	}
 	body := toAnthropic(req, "claude-opus-4-7", 8192)
 	if body.Thinking == nil {

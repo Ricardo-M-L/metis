@@ -10,11 +10,11 @@ import (
 
 // DailyNote represents a daily session memory entry.
 type DailyNote struct {
-	Date      string `json:"date"`      // YYYY-MM-DD
-	Slug      string `json:"slug"`      // Descriptive slug
+	Date      string `json:"date"` // YYYY-MM-DD
+	Slug      string `json:"slug"` // Descriptive slug
 	SessionID string `json:"session_id"`
-	Source    string `json:"source"`    // Command source (new/reset)
-	Summary   string `json:"summary"`   // Conversation summary
+	Source    string `json:"source"`     // Command source (new/reset)
+	Summary   string `json:"summary"`    // Conversation summary
 	CreatedAt string `json:"created_at"` // RFC3339
 }
 

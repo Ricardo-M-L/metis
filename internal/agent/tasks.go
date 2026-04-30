@@ -18,25 +18,25 @@ import (
 type TaskStatus string
 
 const (
-	TaskPending   TaskStatus = "pending"
-	TaskRunning  TaskStatus = "running"
-	TaskDone     TaskStatus = "done"
-	TaskFailed   TaskStatus = "failed"
-	TaskKilled   TaskStatus = "killed"
+	TaskPending TaskStatus = "pending"
+	TaskRunning TaskStatus = "running"
+	TaskDone    TaskStatus = "done"
+	TaskFailed  TaskStatus = "failed"
+	TaskKilled  TaskStatus = "killed"
 )
 
 // Task is a background task with output streamed to disk.
 type Task struct {
-	ID       string
-	Name     string
-	Status   TaskStatus
-	ExitCode int
+	ID         string
+	Name       string
+	Status     TaskStatus
+	ExitCode   int
 	OutputPath string
-	CreatedAt time.Time
-	StartTime time.Time
-	EndTime  time.Time
-	ctx      context.Context
-	cancel   context.CancelFunc
+	CreatedAt  time.Time
+	StartTime  time.Time
+	EndTime    time.Time
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 type taskRunner struct {
@@ -47,10 +47,10 @@ type taskRunner struct {
 
 // Manager tracks all background tasks.
 type TaskManager struct {
-	mu    sync.RWMutex
-	tasks map[string]*Task
+	mu      sync.RWMutex
+	tasks   map[string]*Task
 	runners map[string]*taskRunner
-	root   string
+	root    string
 }
 
 func NewTaskManager(root string) *TaskManager {
@@ -61,11 +61,11 @@ func NewTaskManager(root string) *TaskManager {
 func (m *TaskManager) Create(name, prompt string) (*Task, error) {
 	id := fmt.Sprintf("t%d", time.Now().UnixNano()%1e12)
 	task := &Task{
-		ID:        id,
-		Name:      name,
-		Status:    TaskPending,
+		ID:         id,
+		Name:       name,
+		Status:     TaskPending,
 		OutputPath: filepath.Join(m.root, id+".txt"),
-		CreatedAt: time.Now(),
+		CreatedAt:  time.Now(),
 	}
 	m.mu.Lock()
 	m.tasks[id] = task
@@ -183,8 +183,8 @@ func (m *TaskManager) SaveState(path string) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	type taskJSON struct {
-		ID    string    `json:"id"`
-		Name  string    `json:"name"`
+		ID     string     `json:"id"`
+		Name   string     `json:"name"`
 		Status TaskStatus `json:"status"`
 	}
 	out := make([]taskJSON, 0, len(m.tasks))

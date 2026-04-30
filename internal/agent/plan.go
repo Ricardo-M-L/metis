@@ -10,9 +10,9 @@ import (
 
 // Plan is the output of a plan-mode turn: text description + tool calls.
 type Plan struct {
-	Text      string      `json:"text"`
+	Text      string     `json:"text"`
 	ToolCalls []ToolCall `json:"-"`
-	Summary   string      `json:"summary"`
+	Summary   string     `json:"summary"`
 }
 
 // Render returns a formatted markdown plan for user review.

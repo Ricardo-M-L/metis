@@ -19,12 +19,18 @@ const (
 
 func (c CommandClass) String() string {
 	switch c {
-	case ClassReadOnly: return "read_only"
-	case ClassFileWrite: return "file_write"
-	case ClassNetwork: return "network"
-	case ClassSystem: return "system"
-	case ClassDangerous: return "dangerous"
-	default: return "unknown"
+	case ClassReadOnly:
+		return "read_only"
+	case ClassFileWrite:
+		return "file_write"
+	case ClassNetwork:
+		return "network"
+	case ClassSystem:
+		return "system"
+	case ClassDangerous:
+		return "dangerous"
+	default:
+		return "unknown"
 	}
 }
 
@@ -60,7 +66,7 @@ func NewBashClassifier() *BashClassifier {
 			"rm": true, "rmdir": true, "dd": true, "mkfs": true,
 			"fdisk": true, "parted": true, "sfdisk": true,
 			":(){:|:&};:": true, // fork bomb
-			"shutdown": true, "reboot": true, "halt": true,
+			"shutdown":    true, "reboot": true, "halt": true,
 			"init": true, "telinit": true,
 			"poweroff": true, "systemctl poweroff": true,
 			"chmod": true, "chown": true,
@@ -97,28 +103,28 @@ func NewBashClassifier() *BashClassifier {
 			"nmap": true, "tcpdump": true, "wireshark": true,
 		},
 		dangerousFlags: []*regexp.Regexp{
-			regexp.MustCompile(`(?i)-\s*rf\s`),                       // rm -rf
-			regexp.MustCompile(`(?i)-\s*r\s`),                        // recursive delete
-			regexp.MustCompile(`(?i)>/dev/sd[a-z]`),                  // write to raw disk
-			regexp.MustCompile(`(?i)dd.*of=/dev/`),                   // dd to raw device
-			regexp.MustCompile(`(?i)--no-preserve`),                  // git clean --no-preserve
+			regexp.MustCompile(`(?i)-\s*rf\s`),      // rm -rf
+			regexp.MustCompile(`(?i)-\s*r\s`),       // recursive delete
+			regexp.MustCompile(`(?i)>/dev/sd[a-z]`), // write to raw disk
+			regexp.MustCompile(`(?i)dd.*of=/dev/`),  // dd to raw device
+			regexp.MustCompile(`(?i)--no-preserve`), // git clean --no-preserve
 			// Permissive chmod only — `chmod 777`, `chmod 0666`, `chmod 776`.
 			// Earlier rule (`chmod\s+[0-7][0-7][0-7][0-7]?`) flagged plain
 			// `chmod 644 README.md` which is harmless.
 			regexp.MustCompile(`(?i)chmod\s+0?(?:777|766|776|666)\b`),
 			regexp.MustCompile(`(?i)git\s+push\s+(?:[^|]+?\s+)?(?:-f|--force(?:-with-lease)?)`), // forced push
-			regexp.MustCompile(`(?i)git\s+(?:reset\s+--hard|clean\s+-fdx)`),                    // discard work
+			regexp.MustCompile(`(?i)git\s+(?:reset\s+--hard|clean\s+-fdx)`),                     // discard work
 			regexp.MustCompile(`(?i)pip\s+install\s+--break-system-packages`),
 			regexp.MustCompile(`(?i)npm\s+publish\s+(?:[^|]+\s+)?--access\s+public`),
 		},
 		destructivePatterns: []*regexp.Regexp{
 			regexp.MustCompile(`(?i)(fork\s*bomb|:.*:.*:.*&)`),
-			regexp.MustCompile(`(?i)>\s*/etc/`),     // writing to /etc
-			regexp.MustCompile(`(?i)>\s*/var/`),     // writing to /var
-			regexp.MustCompile(`(?i)>\s*/usr/`),     // writing to /usr
-			regexp.MustCompile(`(?i)>\s*~/.ssh/`),   // writing to ssh dir
-			regexp.MustCompile(`(?i)>\s*/sys/`),     // writing to /sys
-			regexp.MustCompile(`(?i)>\s*/proc/`),    // writing to /proc
+			regexp.MustCompile(`(?i)>\s*/etc/`),   // writing to /etc
+			regexp.MustCompile(`(?i)>\s*/var/`),   // writing to /var
+			regexp.MustCompile(`(?i)>\s*/usr/`),   // writing to /usr
+			regexp.MustCompile(`(?i)>\s*~/.ssh/`), // writing to ssh dir
+			regexp.MustCompile(`(?i)>\s*/sys/`),   // writing to /sys
+			regexp.MustCompile(`(?i)>\s*/proc/`),  // writing to /proc
 			// Pipe-to-shell: curl … | bash, wget -qO- … | sh, etc.
 			// The leading prefix matches a downloader, the tail covers any pipe
 			// landing in a shell or eval — including chained `tee` / `head`.

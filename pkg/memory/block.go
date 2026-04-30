@@ -22,7 +22,7 @@ package memory
 // labels exist).
 type Block struct {
 	ID        string `json:"id"`
-	Label     string `json:"label"`     // e.g., "user", "system", "working"
+	Label     string `json:"label"` // e.g., "user", "system", "working"
 	Content   string `json:"content"`
 	MaxChars  int    `json:"max_chars"` // soft cap; manager truncates over-long writes
 	CreatedAt string `json:"created_at"`

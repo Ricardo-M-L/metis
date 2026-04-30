@@ -120,9 +120,9 @@ type oaiReq struct {
 }
 
 type oaiChoice struct {
-	Index   int        `json:"index"`
-	Message oaiMessage `json:"message"`
-	FinishReason string `json:"finish_reason"`
+	Index        int        `json:"index"`
+	Message      oaiMessage `json:"message"`
+	FinishReason string     `json:"finish_reason"`
 }
 
 type oaiResp struct {
@@ -151,7 +151,9 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 		out.Temperature = &t
 	}
 	if req.Stream {
-		out.StreamOptions = &struct{ IncludeUsage bool `json:"include_usage"` }{IncludeUsage: true}
+		out.StreamOptions = &struct {
+			IncludeUsage bool `json:"include_usage"`
+		}{IncludeUsage: true}
 	}
 	if req.System != "" {
 		out.Messages = append(out.Messages, oaiMessage{Role: "system", Content: req.System})
@@ -346,13 +348,13 @@ type openAIStream struct {
 	body    io.ReadCloser
 	scanner *bufio.Scanner
 	// per-tool-call accumulator keyed by index
-	calls       map[int]*oaiCallAccum
+	calls        map[int]*oaiCallAccum
 	emittedStart map[int]bool
 	// idToIdx maps a tool_call.id to the synthetic index we picked when the
 	// upstream provider didn't send one. Some OpenAI-compat servers (Groq,
 	// Together) omit the index field on parallel tool calls and the previous
 	// "default to 0" code collapsed every call into calls[0].
-	idToIdx map[string]int
+	idToIdx          map[string]int
 	nextSyntheticIdx int
 	// Some providers (Gemini's OpenAI-compat layer) bundle multiple logical
 	// events into a single SSE chunk (content + finish_reason + usage).
@@ -361,9 +363,9 @@ type openAIStream struct {
 }
 
 type oaiCallAccum struct {
-	ID       string
-	Name     string
-	JSONBuf  strings.Builder
+	ID      string
+	Name    string
+	JSONBuf strings.Builder
 }
 
 func newOpenAIStream(body io.ReadCloser) *openAIStream {

@@ -26,14 +26,14 @@ const SystemPromptFileName = "system.md"
 //
 //  1. base                       — agent identity / tool primer
 //  2. <env>...</env> block       — concrete cwd / HOME / OS so the
-//                                  LLM doesn't hallucinate paths like
-//                                  /home/user/.claude on macOS (real
-//                                  bug report 2026-04-30, MiniMax kept
-//                                  guessing Linux paths)
+//     LLM doesn't hallucinate paths like
+//     /home/user/.claude on macOS (real
+//     bug report 2026-04-30, MiniMax kept
+//     guessing Linux paths)
 //  3. user's system.md addendum  — wins last so "always reply in
-//                                  Chinese" / "use shadcn" etc.
-//                                  override behaviour without losing
-//                                  the core primer
+//     Chinese" / "use shadcn" etc.
+//     override behaviour without losing
+//     the core primer
 //
 // The env block uses claude-code's `<env>...</env>` tag shape so models
 // trained on that surface pattern-match the same way.

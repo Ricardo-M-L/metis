@@ -26,7 +26,7 @@ func NewStore(dir string) *Store {
 
 // Entry is one memory item.
 type Entry struct {
-	Type      string   `json:"type"`   // "fact" | "preference" | "context"
+	Type      string   `json:"type"` // "fact" | "preference" | "context"
 	Key       string   `json:"key"`
 	Value     string   `json:"value"`
 	Source    string   `json:"source,omitempty"` // which tool / turn produced it

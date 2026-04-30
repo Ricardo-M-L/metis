@@ -9,16 +9,16 @@ import (
 // the trigger for filename autocomplete.
 func TestDetectAtMention(t *testing.T) {
 	cases := []struct {
-		in       string
-		want     string
-		wantHit  bool
+		in      string
+		want    string
+		wantHit bool
 	}{
 		{"", "", false},
 		{"hello", "", false},
 		{"hello @", "", true},
 		{"hello @foo", "foo", true},
-		{"hello @foo bar", "", false}, // whitespace ends mention
-		{"@foo", "foo", true},         // start of input
+		{"hello @foo bar", "", false},    // whitespace ends mention
+		{"@foo", "foo", true},            // start of input
 		{"email@example.com", "", false}, // not preceded by space
 		{"@", "", true},
 		{"a@b @c", "c", true}, // last @-token

@@ -17,8 +17,8 @@ type fakeProvider struct {
 	events []llm.StreamEvent
 }
 
-func (p *fakeProvider) Name() string                                                  { return "fake" }
-func (p *fakeProvider) MaxContextTokens() int                                         { return 100000 }
+func (p *fakeProvider) Name() string          { return "fake" }
+func (p *fakeProvider) MaxContextTokens() int { return 100000 }
 func (p *fakeProvider) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
 	return nil, errors.New("not implemented")
 }

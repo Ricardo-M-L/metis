@@ -15,9 +15,9 @@ func TestCronService_CreateListGetRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := &CronJob{
-		Name:    "morning",
-		Prompt:  "say hi",
-		Enabled: true,
+		Name:     "morning",
+		Prompt:   "say hi",
+		Enabled:  true,
 		Schedule: CronSchedule{Kind: "every", EveryMs: 60000},
 	}
 	if err := svc.Create(job); err != nil {

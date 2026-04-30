@@ -11,10 +11,10 @@ import (
 type LoopDetectorKind string
 
 const (
-	LoopGenericRepeat       LoopDetectorKind = "generic_repeat"
-	LoopPollNoProgress      LoopDetectorKind = "known_poll_no_progress"
+	LoopGenericRepeat        LoopDetectorKind = "generic_repeat"
+	LoopPollNoProgress       LoopDetectorKind = "known_poll_no_progress"
 	LoopGlobalCircuitBreaker LoopDetectorKind = "global_circuit_breaker"
-	LoopPingPong            LoopDetectorKind = "ping_pong"
+	LoopPingPong             LoopDetectorKind = "ping_pong"
 )
 
 // LoopDetector monitors tool call patterns and detects repetitive behavior.
@@ -25,15 +25,15 @@ type LoopDetector struct {
 	// Thresholds
 	WarningThreshold  int
 	CriticalThreshold int
-	GlobalThreshold  int
+	GlobalThreshold   int
 
 	// State
-	callCounts    map[string]int        // tool name -> count in current streak
-	toolSeq       []string             // recent tool call sequence
-	globalCount   int                  // total tool calls this session
-	lastProgress  time.Time            // last successful non-tool-use turn
-	pollPatterns  map[string]int       // detected polling patterns
-	pingPongPairs map[string]int       // ping-pong detection pairs
+	callCounts    map[string]int // tool name -> count in current streak
+	toolSeq       []string       // recent tool call sequence
+	globalCount   int            // total tool calls this session
+	lastProgress  time.Time      // last successful non-tool-use turn
+	pollPatterns  map[string]int // detected polling patterns
+	pingPongPairs map[string]int // ping-pong detection pairs
 
 	// Callbacks
 	onWarning  func(kind LoopDetectorKind, count int, msg string)

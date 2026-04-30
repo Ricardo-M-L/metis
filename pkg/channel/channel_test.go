@@ -17,8 +17,8 @@ type fakeAdapter struct {
 	sendErr    error
 }
 
-func (a *fakeAdapter) Name() string       { return a.name }
-func (a *fakeAdapter) Configured() bool   { return a.configured }
+func (a *fakeAdapter) Name() string     { return a.name }
+func (a *fakeAdapter) Configured() bool { return a.configured }
 func (a *fakeAdapter) Send(_ context.Context, target string, m Message) error {
 	a.gotTarget = target
 	a.gotMessage = m

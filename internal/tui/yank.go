@@ -35,9 +35,9 @@ import (
 //
 // Search order (newest first):
 //
-//   1. assistant (the model's final reply — what users want 95% of the time)
-//   2. bash       (`!ls` output — also commonly copied)
-//   3. tool result (e.g. Read or Bash output) — last-resort
+//  1. assistant (the model's final reply — what users want 95% of the time)
+//  2. bash       (`!ls` output — also commonly copied)
+//  3. tool result (e.g. Read or Bash output) — last-resort
 //
 // Skip: thinking trace (transient and dim, rarely worth copying),
 // recap / thought-summary (metadata), error (use Ctrl+S for that).

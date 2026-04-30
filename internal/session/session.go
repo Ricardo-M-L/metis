@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	pubsess "github.com/Ricardo-M-L/metis/pkg/session"
+	"github.com/google/uuid"
 )
 
 // Header records what's needed to resume a session faithfully. Inspired by
@@ -33,8 +33,8 @@ type (
 )
 
 type Entry struct {
-	Type    string      `json:"type"`    // "header" | "message"
-	Header  *Header     `json:"header,omitempty"`
+	Type    string       `json:"type"` // "header" | "message"
+	Header  *Header      `json:"header,omitempty"`
 	Message *llm.Message `json:"message,omitempty"`
 }
 

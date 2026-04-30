@@ -50,9 +50,9 @@ func TestVerify_TamperedHash(t *testing.T) {
 
 func TestParseGitHubRef(t *testing.T) {
 	cases := []struct {
-		in              string
-		owner, repo, n  string
-		err             bool
+		in             string
+		owner, repo, n string
+		err            bool
 	}{
 		{"foo/bar:baz", "foo", "bar", "baz", false},
 		{"a/b:c-d", "a", "b", "c-d", false},

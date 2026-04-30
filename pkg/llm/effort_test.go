@@ -4,10 +4,10 @@ import "testing"
 
 func TestEffort_Valid(t *testing.T) {
 	cases := map[Effort]bool{
-		EffortDefault: true,
-		EffortLow:     true,
-		EffortMedium:  true,
-		EffortHigh:    true,
+		EffortDefault:  true,
+		EffortLow:      true,
+		EffortMedium:   true,
+		EffortHigh:     true,
 		Effort("typo"): false,
 	}
 	for e, want := range cases {
@@ -19,10 +19,10 @@ func TestEffort_Valid(t *testing.T) {
 
 func TestEffort_BudgetTokens(t *testing.T) {
 	cases := map[Effort]int{
-		EffortDefault: 0,
-		EffortLow:     1024,
-		EffortMedium:  4096,
-		EffortHigh:    16384,
+		EffortDefault:     0,
+		EffortLow:         1024,
+		EffortMedium:      4096,
+		EffortHigh:        16384,
 		Effort("garbage"): 0,
 	}
 	for e, want := range cases {

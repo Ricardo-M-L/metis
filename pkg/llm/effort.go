@@ -22,7 +22,7 @@ package llm
 type Effort string
 
 const (
-	EffortDefault Effort = ""       // no override, use model/provider default
+	EffortDefault Effort = "" // no override, use model/provider default
 	EffortLow     Effort = "low"
 	EffortMedium  Effort = "medium"
 	EffortHigh    Effort = "high"

@@ -47,7 +47,7 @@ func NewBlock(label, content string, maxChars int) *Block {
 // CoreMemory manages block-based in-context memory with file persistence.
 // Inspired by Hermes' memory storage pattern with Frozen Snapshot.
 type CoreMemory struct {
-	mu    sync.RWMutex
+	mu     sync.RWMutex
 	blocks []*Block
 
 	// Block size limits by label
@@ -63,17 +63,17 @@ type CoreMemory struct {
 
 // Default limits for each block type.
 var defaultLimits = map[string]int{
-	"user":    2200,  // User preferences
-	"system":  3000,  // System identity
-	"working": 4000,  // Current task context
-	"summary": 1500,  // Summarized context
+	"user":    2200, // User preferences
+	"system":  3000, // System identity
+	"working": 4000, // Current task context
+	"summary": 1500, // Summarized context
 }
 
 // File names for Hermes-style Core Memory persistence.
 const (
-	FileMemMemory = "MEMORY.md"   // user block
-	FileMemUser   = "USER.md"    // user preferences
-	FileMemSystem = "SYSTEM.md"  // system block
+	FileMemMemory  = "MEMORY.md"  // user block
+	FileMemUser    = "USER.md"    // user preferences
+	FileMemSystem  = "SYSTEM.md"  // system block
 	FileMemWorking = "WORKING.md" // working block
 	FileMemSummary = "SUMMARY.md" // summary block
 )
@@ -244,9 +244,9 @@ func (cm *CoreMemory) freshnessLocked() Freshness {
 
 	age := time.Since(oldestTime)
 	return Freshness{
-		Age:       age,
-		IsStale:   age > 24*time.Hour,
-		Status:    "fresh",
+		Age:        age,
+		IsStale:    age > 24*time.Hour,
+		Status:     "fresh",
 		OldestFile: oldestTime.Format(time.RFC3339),
 	}
 }
@@ -443,20 +443,20 @@ type Passage struct {
 // Semantic guide for callers (and the distillation prompt):
 //
 //   - TypeUser       — durable identity / preferences ("user prefers Chinese
-//                      replies", "user is on macOS"). Highest retrieval
-//                      priority; rarely expires.
+//     replies", "user is on macOS"). Highest retrieval
+//     priority; rarely expires.
 //   - TypeFeedback   — corrections and explicit guidance the agent should
-//                      remember ("don't use git push --force", "always
-//                      run tests before committing"). High priority.
+//     remember ("don't use git push --force", "always
+//     run tests before committing"). High priority.
 //   - TypeProject    — current-project context that may go stale ("this
-//                      repo uses Go 1.26", "running on metis branch foo").
-//                      Medium priority; eligible for time-decay.
+//     repo uses Go 1.26", "running on metis branch foo").
+//     Medium priority; eligible for time-decay.
 //   - TypeReference  — pointers to external resources ("docs at /Users/...",
-//                      "K8s cluster info in CLAUDE.md"). Low retrieval
-//                      priority — surfaced when explicitly asked.
+//     "K8s cluster info in CLAUDE.md"). Low retrieval
+//     priority — surfaced when explicitly asked.
 //   - TypeContext    — generic "remember this for now" with no clear
-//                      classification. Default fallback. Lower priority
-//                      than the four above so curated types win.
+//     classification. Default fallback. Lower priority
+//     than the four above so curated types win.
 const (
 	TypeUser      = "user"
 	TypeFeedback  = "feedback"
@@ -766,8 +766,8 @@ type RecallMemory struct {
 	messages []Message
 
 	root     string
-	limit    int        // Max messages before summarization
-	sessions []Session  // Session history for compression points
+	limit    int       // Max messages before summarization
+	sessions []Session // Session history for compression points
 }
 
 // Message represents a conversation message in recall memory.

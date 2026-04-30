@@ -17,8 +17,10 @@ type Search struct {
 	gate *permission.Gate
 }
 
-func (Search) Name() string        { return "Search" }
-func (Search) Description() string { return "Search the web. Set SERPER_API_KEY for structured results, otherwise uses DuckDuckGo HTML." }
+func (Search) Name() string { return "Search" }
+func (Search) Description() string {
+	return "Search the web. Set SERPER_API_KEY for structured results, otherwise uses DuckDuckGo HTML."
+}
 func (Search) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",

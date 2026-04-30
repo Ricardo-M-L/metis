@@ -23,9 +23,9 @@ import (
 // REPLCommand is a built-in command that runs directly in the REPL, not via LLM.
 type REPLCommand struct {
 	Name        string
-	Aliases    []string
+	Aliases     []string
 	Description string
-	Handler    func(r *REPL, args string) string
+	Handler     func(r *REPL, args string) string
 }
 
 type REPLCommandRegistry struct {
@@ -1078,7 +1078,8 @@ func sanitize(name string) string {
 //     turn. claude-code's cost-tracker.ts does
 //     `modelUsage.inputTokens += usage.input_tokens` per API call; the
 //     bottom-right "tokens" total is `sumBy(modelUsage, 'inputTokens')
-//     + sumBy(..., 'outputTokens')`. We mirror that.
+//
+//   - sumBy(..., 'outputTokens')`. We mirror that.
 //
 //   - The number is "API spend" (every billed request adds its full
 //     input_tokens), not "current context window size". Two API calls

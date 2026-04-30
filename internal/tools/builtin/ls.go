@@ -46,7 +46,10 @@ func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	type row struct{ name, kind string; size int64 }
+	type row struct {
+		name, kind string
+		size       int64
+	}
 	var rows []row
 	for _, e := range entries {
 		if !hidden && strings.HasPrefix(e.Name(), ".") {

@@ -43,6 +43,7 @@ func (Bash) InputSchema() map[string]any {
 		},
 	}
 }
+
 // Concurrency for Bash is input-dependent — claude-code's pattern.
 // Read-only commands (`ls`, `cat`, `grep`, `git status`, ...) declare
 // Safe so they can fan out alongside Read/Grep in the parallel batch;
@@ -81,7 +82,7 @@ var readOnlyCommands = map[string]bool{
 	"ps": true, "top": true, "htop": true,
 	"basename": true, "dirname": true, "realpath": true, "readlink": true,
 	"sort": true, "uniq": true, "tr": true, "cut": true, "awk": true,
-	"sed": false, // sed -i mutates; classify as exclusive even for read-only modes
+	"sed":  false, // sed -i mutates; classify as exclusive even for read-only modes
 	"diff": true, "cmp": true,
 	"go":  true, // bare `go` covered below — only safe subcommands
 	"git": true, // ditto — only safe subcommands

@@ -35,9 +35,9 @@ var injectionPatterns = []*regexp.Regexp{
 
 // Role hijack patterns.
 var roleHijackPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)you\s+are\s+now\s+`),                    // "you are now a different AI"
-	regexp.MustCompile(`(?i)pretend\s+you\s+are\s+`),                // "pretend you are"
-	regexp.MustCompile(`(?i)as\s+an\s+(AI|LLM|language\s+model)`),  // "as an AI, ignore..."
+	regexp.MustCompile(`(?i)you\s+are\s+now\s+`),                  // "you are now a different AI"
+	regexp.MustCompile(`(?i)pretend\s+you\s+are\s+`),              // "pretend you are"
+	regexp.MustCompile(`(?i)as\s+an\s+(AI|LLM|language\s+model)`), // "as an AI, ignore..."
 	regexp.MustCompile(`(?i)forget\s+(your|all)\s+(previous|built-in)`),
 }
 
@@ -54,7 +54,7 @@ var credentialPatterns = []*regexp.Regexp{
 var backdoorPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`ssh-rsa\s+[A-Za-z0-9+/]{40,}`), // SSH public key without proper prefix check
 	regexp.MustCompile(`authorized_keys`),
-	regexp.MustCompile(`(?i)(eval|exec|system)\s*\(`),  // Code execution patterns
+	regexp.MustCompile(`(?i)(eval|exec|system)\s*\(`), // Code execution patterns
 }
 
 // Invisible character ranges.

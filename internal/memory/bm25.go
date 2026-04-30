@@ -47,11 +47,11 @@ const (
 // (and the standalone unit tests) don't have to migrate. New callers
 // should prefer `bm25fScore`.
 type BM25Doc struct {
-	id        string
-	tokenSet  map[string]int // combined TF (content + tags merged) — legacy
-	contentTF map[string]int
-	tagsTF    map[string]int
-	length    int // combined length, for legacy bm25Score
+	id         string
+	tokenSet   map[string]int // combined TF (content + tags merged) — legacy
+	contentTF  map[string]int
+	tagsTF     map[string]int
+	length     int // combined length, for legacy bm25Score
 	contentLen int
 	tagsLen    int
 }

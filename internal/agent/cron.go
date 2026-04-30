@@ -29,8 +29,8 @@ var cronParser = cron.NewParser(
 // Kinds:
 //   - "every" — fire repeatedly with EveryMs interval
 //   - "cron"  — robfig/cron/v3 expression (5-field, 6-field with seconds,
-//               or descriptors like "@daily" / "@every 1h30m"); evaluated
-//               in the local timezone unless TZ is set
+//     or descriptors like "@daily" / "@every 1h30m"); evaluated
+//     in the local timezone unless TZ is set
 //   - "at"    — single ISO 8601 timestamp; advances by 24h after firing
 //
 // JitterMs (optional) adds [-jitter, +jitter] uniform noise to NextRun

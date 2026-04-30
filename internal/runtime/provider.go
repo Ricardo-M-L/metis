@@ -24,10 +24,10 @@ type ProviderBuild struct {
 //
 // Built-in transports:
 //   - "anthropic"  → /v1/messages (also covers anthropic-compatible
-//                     gateways like MiniMax via Anthropic.BaseURL)
+//     gateways like MiniMax via Anthropic.BaseURL)
 //   - "openai"     → /v1/chat/completions (Together, Groq, Ollama, ...)
 //   - "gemini"     → /v1beta/models/<model>:streamGenerateContent
-//                     (Google Generative Language API, native protocol)
+//     (Google Generative Language API, native protocol)
 func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBuild, error) {
 	switch name {
 	case "anthropic":

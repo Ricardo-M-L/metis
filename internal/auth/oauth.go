@@ -37,13 +37,13 @@ import (
 // OAuthProvider describes one OAuth 2.0 endpoint set. Add an entry
 // to KnownProviders and `metis auth oauth <name>` will pick it up.
 type OAuthProvider struct {
-	Name         string
-	AuthURL      string   // browser-side auth endpoint
-	TokenURL     string   // server-side token exchange endpoint
-	ClientID     string   // public client id (no secret — PKCE flow)
-	Scopes       []string // OAuth scopes to request
-	UsePKCE      bool     // if true, send PKCE challenge (most modern providers)
-	ExtraParams  map[string]string
+	Name            string
+	AuthURL         string   // browser-side auth endpoint
+	TokenURL        string   // server-side token exchange endpoint
+	ClientID        string   // public client id (no secret — PKCE flow)
+	Scopes          []string // OAuth scopes to request
+	UsePKCE         bool     // if true, send PKCE challenge (most modern providers)
+	ExtraParams     map[string]string
 	HeaderTokenType string // typically "Bearer"
 }
 
