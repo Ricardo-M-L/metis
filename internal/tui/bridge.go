@@ -143,7 +143,21 @@ func startBridge(injectCh chan string) (string, error) {
 	bridgeServer = srv
 	bridgeAddr = addr
 	bridgeMu.Unlock()
-	return addr, nil
+
+	// Don't return until the server is actually responding. Without this,
+	// callers can race the goroutine and the first request comes back EOF
+	// (listener accepted, srv.Serve hadn't installed handlers yet).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client := http.Client{Timeout: 100 * time.Millisecond}
+		resp, err := client.Get("http://" + addr + "/health")
+		if err == nil {
+			resp.Body.Close()
+			return addr, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return addr, fmt.Errorf("bridge did not become ready within 2s")
 }
 
 // stopBridge halts the server. Idempotent — calling when already
