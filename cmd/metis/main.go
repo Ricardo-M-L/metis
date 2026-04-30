@@ -77,6 +77,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdPlugin(ctx, args[1:])
 	case "audit":
 		return cmdAudit()
+	case "update":
+		return cmdUpdate(ctx, args[1:])
 	case "version", "-v", "--version":
 		return cmdVersion(args[1:])
 	case "help", "-h", "--help":
@@ -107,6 +109,7 @@ Usage:
   metis cron <list|add|rm|pause|resume|run|start>  Manage scheduled prompts
   metis auth <login|logout|list>  Manage provider credentials (~/.metis/auth.json)
   metis audit           Print a security audit of the current configuration
+  metis update [--check]  Self-update from the private release (needs METIS_GITHUB_TOKEN)
   metis version [-V]    Print version (-V for build fingerprint)
   metis help            This help
 
@@ -407,6 +410,7 @@ func cmdChat(ctx context.Context, args []string) error {
 		if err := ensureTrusted(); err != nil {
 			return err
 		}
+		maybeNotifyUpdate()
 	}
 	rt, err := setupRuntime(ctx, flags)
 	if err != nil {
