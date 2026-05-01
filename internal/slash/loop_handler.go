@@ -3,6 +3,7 @@ package slash
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -60,12 +61,16 @@ func handleLoopCommand(cfg *config.Config, args string) string {
 	return startLoop(svc, first, rest)
 }
 
+// loopMaxAge mirrors claude-code's 7-day TTL for /loop jobs. Loops outlive
+// the chat session that started them, but they don't outlive the week.
+const loopMaxAge = 7 * 24 * time.Hour
+
 func startLoop(svc *runtime.CronChatService, every, prompt string) string {
-	id, err := svc.Add(every, loopNamePrefix+prompt)
+	id, err := svc.AddLoop(every, loopNamePrefix+prompt, time.Now().Add(loopMaxAge))
 	if err != nil {
 		return "loop: " + err.Error()
 	}
-	return fmt.Sprintf("(started loop %s · every %s)\n  prompt: %q", id, every, prompt)
+	return fmt.Sprintf("(started loop %s · every %s · auto-stops in 7d)\n  prompt: %q", id, every, prompt)
 }
 
 func renderLoopList(svc *runtime.CronChatService) string {

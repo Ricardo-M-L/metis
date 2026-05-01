@@ -47,6 +47,14 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 		Todo{gate: gate},
 		TodoRead{gate: gate},
 		AskUser{gate: gate},
+		NotebookEdit{gate: gate},
+		TaskCreate{gate: gate},
+		TaskGet{gate: gate},
+		TaskList{gate: gate},
+		TaskUpdate{gate: gate},
+		TaskOutput{gate: gate},
+		TaskStop{gate: gate},
+		LSP{gate: gate},
 	}
 	_ = skillDir // referenced by BuildToolRegistry, kept here for symmetry
 	_ = memDir   // legacy memory dir; Memory tool now uses MemoryManager directly

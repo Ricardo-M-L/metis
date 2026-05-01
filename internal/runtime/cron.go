@@ -76,6 +76,22 @@ func (s *CronChatService) RenderList() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// AddLoop is Add + an explicit ExpiresAt deadline. /loop sets a 7-day TTL
+// so accidentally-left-running loops self-cleanup (claude-code parity).
+// expiresAt zero ⇒ no TTL.
+func (s *CronChatService) AddLoop(every, prompt string, expiresAt time.Time) (string, error) {
+	id, err := s.Add(every, prompt)
+	if err != nil {
+		return "", err
+	}
+	if !expiresAt.IsZero() {
+		if err := s.svc.Update(id, func(j *agent.CronJob) { j.ExpiresAt = expiresAt }); err != nil {
+			return id, err
+		}
+	}
+	return id, nil
+}
+
 // Add creates a new repeating cron job. `every` is parsed as time.Duration
 // (e.g. "5m", "1h", "30s"); `prompt` is the user prompt the agent should
 // run on each fire. Empty inputs error so a typo can't write a blank job.

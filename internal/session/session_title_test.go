@@ -143,4 +143,13 @@ func TestBranch_PreservesTitleViaMergedHeader(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Errorf("branch dropped messages; got %d", len(msgs))
 	}
+	if hdr.ForkedFrom == nil {
+		t.Fatalf("branch should record ForkedFrom; got nil")
+	}
+	if hdr.ForkedFrom.SessionID != id {
+		t.Errorf("ForkedFrom.SessionID = %q, want %q", hdr.ForkedFrom.SessionID, id)
+	}
+	if hdr.ForkedFrom.MessageCount != 1 {
+		t.Errorf("ForkedFrom.MessageCount = %d, want 1", hdr.ForkedFrom.MessageCount)
+	}
 }

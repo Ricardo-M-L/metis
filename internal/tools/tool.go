@@ -114,3 +114,26 @@ func (r *Registry) Filter(keep func(string) bool) []Tool {
 	}
 	return out
 }
+
+// Restrict mutates the registry in place to keep only tools whose names
+// appear in `keep`. Tools whose names are not in `keep` are dropped from
+// both the lookup map and the iteration order. Used by the agent-profile
+// loader to apply allowlist + blocklist filtering after the registry is
+// already built. Names not present in the registry are ignored.
+func (r *Registry) Restrict(keep []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	wanted := make(map[string]struct{}, len(keep))
+	for _, n := range keep {
+		wanted[n] = struct{}{}
+	}
+	newOrder := r.order[:0]
+	for _, n := range r.order {
+		if _, ok := wanted[n]; ok {
+			newOrder = append(newOrder, n)
+			continue
+		}
+		delete(r.tools, n)
+	}
+	r.order = newOrder
+}

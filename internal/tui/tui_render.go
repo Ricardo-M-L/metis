@@ -218,6 +218,14 @@ func (m *Model) View() string {
 	s.WriteString(renderStatusBar(m))
 	s.WriteString(renderHints(m))
 
+	// /btw modal — stacks on top of the chrome since we render after it.
+	// lipgloss already wraps it in a bordered box; just append.
+	if overlay := m.renderBtwOverlay(); overlay != "" {
+		s.WriteString("\n")
+		s.WriteString(overlay)
+		s.WriteString("\n")
+	}
+
 	// Reset ANSI styles to prevent stacking
 	s.WriteString("\033[0m")
 

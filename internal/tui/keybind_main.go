@@ -181,6 +181,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEscape:
+		// /btw modal takes priority — dismiss it without disturbing
+		// other state.
+		if m.btwActive {
+			m.dismissBtw()
+			return m, nil
+		}
 		// Vim mode hijack: ESC in INSERT mode goes to NORMAL.
 		if vimModeState == vimInsert {
 			vimModeState = vimNormal

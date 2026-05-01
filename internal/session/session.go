@@ -253,14 +253,26 @@ func (s *Store) Sync(id string) error {
 	return f.Sync()
 }
 
-// Branch creates a new session based on an existing one.
+// Branch creates a new session based on an existing one. The new session
+// inherits the parent's model + system prompt, replays the supplied
+// messages, and records `ForkedFrom` so tooling can reconstruct the
+// lineage. Mirrors claude-code's /branch.
 func (s *Store) Branch(id string, messages []llm.Message) (string, error) {
 	hdr, _, err := s.Load(id)
 	if err != nil {
 		return "", err
 	}
 	newID := s.NewSessionID()
-	if err := s.WriteHeader(newID, hdr.Model, hdr.System); err != nil {
+	newHdr := Header{
+		ID:     newID,
+		Model:  hdr.Model,
+		System: hdr.System,
+		ForkedFrom: &pubsess.ForkRef{
+			SessionID:    id,
+			MessageCount: len(messages),
+		},
+	}
+	if err := s.WriteHeaderFull(newHdr); err != nil {
 		return "", err
 	}
 	for _, m := range messages {

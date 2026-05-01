@@ -168,8 +168,104 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			m.messages = append(m.messages, Message{Role: "info", Content: renderSkillsList(m.skillDir), Timestamp: time.Now()})
 		case slash.SignalVersion:
 			m.messages = append(m.messages, Message{Role: "info", Content: renderVersion(), Timestamp: time.Now()})
+		case slash.SignalAddDir:
+			if m.ext.DirAdd == nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "(/add-dir not wired in this build)", Timestamp: time.Now()})
+			} else if err := m.ext.DirAdd(args, true); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "add-dir: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				m.messages = append(m.messages, Message{Role: "info", Content: "(added: " + args + ")", Timestamp: time.Now()})
+			}
+		case slash.SignalRemoveDir:
+			if m.ext.DirRemove == nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "(/rm-dir not wired in this build)", Timestamp: time.Now()})
+			} else if err := m.ext.DirRemove(args); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "rm-dir: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				m.messages = append(m.messages, Message{Role: "info", Content: "(removed: " + args + ")", Timestamp: time.Now()})
+			}
+		case slash.SignalListDirs:
+			if m.ext.DirList == nil {
+				m.messages = append(m.messages, Message{Role: "info", Content: "(no additional dirs)", Timestamp: time.Now()})
+			} else {
+				dirs := m.ext.DirList()
+				if len(dirs) == 0 {
+					m.messages = append(m.messages, Message{Role: "info", Content: "(no additional dirs — `/add-dir <path>` to add one)", Timestamp: time.Now()})
+				} else {
+					var b strings.Builder
+					b.WriteString("additional dirs:\n")
+					for _, d := range dirs {
+						b.WriteString("  ")
+						b.WriteString(d)
+						b.WriteString("\n")
+					}
+					m.messages = append(m.messages, Message{Role: "info", Content: strings.TrimRight(b.String(), "\n"), Timestamp: time.Now()})
+				}
+			}
+		case slash.SignalCost:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderCost(m), Timestamp: time.Now()})
+		case slash.SignalDiff:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderDiff(), Timestamp: time.Now()})
+		case slash.SignalDoctor:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderDoctor(m), Timestamp: time.Now()})
+		case slash.SignalStats:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderStats(m), Timestamp: time.Now()})
+		case slash.SignalKeybindings:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderKeybindings(), Timestamp: time.Now()})
+		case slash.SignalPermissions:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderPermissions(m), Timestamp: time.Now()})
+		case slash.SignalHooks:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderHooksList(m.cfg), Timestamp: time.Now()})
+		case slash.SignalVim:
+			toggleVimMode()
+			m.messages = append(m.messages, Message{Role: "info", Content: vimModeStatus(), Timestamp: time.Now()})
+		case slash.SignalExport:
+			if m.session == nil || m.sessionID == "" {
+				m.messages = append(m.messages, Message{Role: "error", Content: "(export: no session store)", Timestamp: time.Now()})
+			} else {
+				p, err := exportSessionToFile(m.session, m.sessionID)
+				if err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "export: " + err.Error(), Timestamp: time.Now()})
+				} else {
+					m.messages = append(m.messages, Message{Role: "info", Content: "(exported → " + p + ")", Timestamp: time.Now()})
+				}
+			}
+		case slash.SignalReleaseNotes:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderReleaseNotes(), Timestamp: time.Now()})
+		case slash.SignalTheme:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderTheme(args), Timestamp: time.Now()})
+		case slash.SignalEffort:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderEffort(args), Timestamp: time.Now()})
+		case slash.SignalPRComments:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderPRComments(args), Timestamp: time.Now()})
+		case slash.SignalUpgrade:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderUpgrade(), Timestamp: time.Now()})
+		case slash.SignalContext:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderContext(m), Timestamp: time.Now()})
+		case slash.SignalResume:
+			m.messages = append(m.messages, Message{Role: "info", Content: renderResumeHelp(m), Timestamp: time.Now()})
+		case slash.SignalTag:
+			if m.session == nil || m.sessionID == "" {
+				m.messages = append(m.messages, Message{Role: "error", Content: "(tag: no session store)", Timestamp: time.Now()})
+			} else if err := tagCurrentSession(m.session, m.sessionID, args); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "tag: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				m.messages = append(m.messages, Message{Role: "info", Content: "(tagged: " + args + ")", Timestamp: time.Now()})
+			}
+		case slash.SignalBtw:
+			return m, m.startBtwQuery(args)
+		case slash.SignalBatch:
+			// `/batch <task>` rewrites the prompt to the embedded
+			// research → plan → execute worker contract, then falls
+			// through to the normal user-message path so the agent
+			// loop runs on it. The flag below skips the early return.
+			text = slash.BatchPrompt(args)
 		}
-		return m, nil
+		// All slash commands EXCEPT /batch terminate the turn here. /batch
+		// rewrites `text` above and re-enters the agent path below.
+		if sig != slash.SignalBatch {
+			return m, nil
+		}
 	}
 
 	// User message → run agent

@@ -69,6 +69,23 @@ type permChoice struct {
 // Model
 // ============================================================================
 
+// ExternalHooks lets the cmd/metis layer hand the TUI a few callbacks
+// for features whose state lives in the runtime layer (dirs, sub-agent
+// query, etc.) without forcing internal/tui to import internal/runtime
+// (which would cycle through cfg/llm/etc).
+//
+// Optional — nil callbacks degrade to a friendly "feature unavailable"
+// message rather than panicking.
+type ExternalHooks struct {
+	DirAdd    func(path string, persist bool) error
+	DirRemove func(path string) error
+	DirList   func() []string
+	// BtwAsk fires a single-turn LLM call with no tools and no history
+	// write. Returns the assistant text, or an error. Implementation
+	// expected to share the parent's prompt cache.
+	BtwAsk func(ctx context.Context, question string) (string, error)
+}
+
 type Model struct {
 	ctx       context.Context
 	loop      *agent.Loop
@@ -79,6 +96,7 @@ type Model struct {
 	model     string
 	skillDir  string
 	cmds      *REPLCommandRegistry
+	ext       ExternalHooks
 	// cfg is the loaded ~/.metis/config.toml. The TUI reaches into a
 	// few sub-sections directly (Tools.Bash for !bash-mode shell
 	// settings, Channels for SendMessage routing, etc.). Storing the
@@ -212,6 +230,17 @@ type Model struct {
 
 	eventCh chan agent.Event
 	doneCh  chan error
+
+	// btw modal state — claude-code's "/btw" sidebar question. While
+	// btwActive is true, View() overlays an answer box on top of the
+	// chat surface. The user dismisses with Esc; the main turn (if any)
+	// keeps running underneath. btwLoading shows a spinner while the
+	// side LLM call is in flight.
+	btwActive   bool
+	btwQuestion string
+	btwAnswer   string
+	btwErr      string
+	btwLoading  bool
 }
 
 const ctrlCQuitWindow = 600 * time.Millisecond
@@ -284,9 +313,20 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	}
 }
 
-// RunTUI starts the terminal UI.
-func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, skillDir string, cfg *config.Config, forceBanner bool) error {
+// SetExternalHooks attaches optional callbacks for features whose state
+// lives in the runtime layer (additional dirs, /btw side question, ...).
+// Safe to call before or after RunTUI; nil hooks degrade gracefully.
+func (m *Model) SetExternalHooks(h ExternalHooks) {
+	m.ext = h
+}
+
+// RunTUI starts the terminal UI. If hooks is non-nil it is attached to
+// the underlying Model before the program runs.
+func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, skillDir string, cfg *config.Config, forceBanner bool, hooks ...ExternalHooks) error {
 	m := NewModel(ctx, loop, sl, st, sid, gate, model, skillDir, cfg)
+	if len(hooks) > 0 {
+		m.SetExternalHooks(hooks[0])
+	}
 	if forceBanner {
 		m.firstRender = true
 	}

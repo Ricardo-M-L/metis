@@ -30,6 +30,7 @@ type Config struct {
 	LoopDetection LoopDetection `toml:"loop_detection"`
 	MCP           MCP           `toml:"mcp"`
 	Channels      Channels      `toml:"channels"`
+	Hooks         HooksConfig   `toml:"hooks"`
 }
 
 // Channels groups the chat-platform adapters wired up by SendMessage.
@@ -72,6 +73,35 @@ type FeishuChannel struct {
 type WechatChannel struct {
 	Backend       string `toml:"backend"` // "work" (default; 企业微信群机器人); "public" reserved
 	WebhookURLEnv string `toml:"webhook_url_env"`
+}
+
+// HooksConfig — user-defined lifecycle hooks loaded from config.toml.
+// Mirrors claude-code's settings.json `hooks` model: each lifecycle event
+// gets a list of HookSpec, fired in order at the matching point. The
+// first MVP supports `type = "command"` only — a shell command that
+// receives the event JSON on stdin and (for PreToolUse) can return a
+// modified payload on stdout to short-circuit / rewrite the tool call.
+type HooksConfig struct {
+	PreToolUse        []HookSpec `toml:"pre_tool_use"`
+	PostToolUse       []HookSpec `toml:"post_tool_use"`
+	SessionStart      []HookSpec `toml:"session_start"`
+	SessionEnd        []HookSpec `toml:"session_end"`
+	UserPromptSubmit  []HookSpec `toml:"user_prompt_submit"`
+	Notification      []HookSpec `toml:"notification"`
+	PermissionRequest []HookSpec `toml:"permission_request"`
+	PermissionDenied  []HookSpec `toml:"permission_denied"`
+	CwdChanged        []HookSpec `toml:"cwd_changed"`
+}
+
+// HookSpec is one entry in HooksConfig. Type defaults to "command".
+// Command is the shell command (interpreted by the system shell). If
+// matches the spec only fires when the event's tool name matches `If`
+// (glob, e.g. `Bash` or `Bash(git *)`). Empty If = always.
+type HookSpec struct {
+	Type    string `toml:"type"` // "command"; future: "http" / "agent"
+	Command string `toml:"command"`
+	If      string `toml:"if"`              // optional matcher, e.g. "Bash" or "Bash(git *)"
+	Timeout int    `toml:"timeout_seconds"` // 0 = 30s default
 }
 
 // MCP groups configuration for external Model Context Protocol servers.

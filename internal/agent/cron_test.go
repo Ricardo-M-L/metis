@@ -51,6 +51,39 @@ func TestCronService_CreateListGetRemove(t *testing.T) {
 	}
 }
 
+func TestCronService_ExpiresAtReap(t *testing.T) {
+	dir := t.TempDir()
+	svc, _ := NewCronService(dir)
+
+	live := &CronJob{
+		Prompt:    "live",
+		Enabled:   true,
+		Schedule:  CronSchedule{Kind: "every", EveryMs: 60000},
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	dead := &CronJob{
+		Prompt:    "dead",
+		Enabled:   true,
+		Schedule:  CronSchedule{Kind: "every", EveryMs: 60000},
+		ExpiresAt: time.Now().Add(-time.Minute), // already past
+	}
+	if err := svc.Create(live); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Create(dead); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.reapExpired()
+
+	if _, ok := svc.Get(dead.ID); ok {
+		t.Errorf("expired job should be reaped, but Get still returns it")
+	}
+	if _, ok := svc.Get(live.ID); !ok {
+		t.Errorf("live job should survive reap")
+	}
+}
+
 func TestCronService_PauseResume(t *testing.T) {
 	dir := t.TempDir()
 	svc, _ := NewCronService(dir)

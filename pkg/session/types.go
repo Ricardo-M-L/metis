@@ -25,6 +25,21 @@ type Header struct {
 	Mode        string      `json:"mode,omitempty"`
 	AlwaysAllow []SavedRule `json:"always_allow,omitempty"`
 	Title       string      `json:"title,omitempty"`
+	// ForkedFrom — non-nil when this session was created via /branch. Stores
+	// the parent session ID so a viewer / `metis sessions list` can render
+	// the lineage. Mirrors claude-code's `forkedFrom` metadata; the link is
+	// one-way (child → parent) by design — discovering branches of a parent
+	// session means scanning all sessions, which is fine at metis's scale.
+	ForkedFrom *ForkRef `json:"forked_from,omitempty"`
+}
+
+// ForkRef points back at the parent session of a /branch'd session.
+// MessageCount is the parent's message count at fork time, useful for
+// downstream tooling that wants to highlight where the histories diverge
+// (a branch made early-on vs after dozens of turns).
+type ForkRef struct {
+	SessionID    string `json:"session_id"`
+	MessageCount int    `json:"message_count,omitempty"`
 }
 
 // SavedRule mirrors permission.Rule but lives here to break the import

@@ -63,8 +63,14 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		maxIter = cfg.Session.MaxIterations
 	}
 
+	hookReg := agent.NewHookRegistry()
+	// User-defined lifecycle hooks from config.toml [hooks.*]. Registers
+	// shell-command hooks for PreToolUse / PostToolUse / SessionStart /
+	// SessionEnd. Errors are logged, never fatal.
+	LoadConfigHooks(hookReg, &cfg.Hooks)
+
 	loop := agent.NewLoop(opts.Provider, opts.Registry, opts.Gate,
-		agent.NewHookRegistry(), opts.System, maxIter)
+		hookReg, opts.System, maxIter)
 	loop.Model = opts.Model
 	// "plan" permission mode and Loop.PlanMode are two separate flags
 	// today — gate gates tools to read-only, Loop.PlanMode makes the

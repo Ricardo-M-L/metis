@@ -1132,6 +1132,12 @@ func (t *tokenTracker) Animate() {
 // Total returns what the UI should display right now (smoothed).
 func (t *tokenTracker) Total() int { return t.dispIn + t.dispOut }
 
+// Input / Output expose the raw cumulative counts (not the smoothed
+// display values) so info renderers (/cost, /stats) can compute exact
+// totals without waiting for animation to converge.
+func (t *tokenTracker) Input() int  { return t.in }
+func (t *tokenTracker) Output() int { return t.out }
+
 // Snap forces displayed to actual — used at end of turn so the final
 // number lands exactly on the wire-reported total.
 func (t *tokenTracker) Snap() {

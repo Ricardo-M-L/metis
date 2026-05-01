@@ -144,6 +144,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tick:
 		return m, tickCmd
+
+	case btwAnswerMsg:
+		m.handleBtwAnswer(msg)
+		return m, nil
 	}
 	return m, nil
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	taskstore "github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
@@ -120,6 +121,9 @@ Flags (chat / run):
       --no-markdown     Disable markdown rendering of assistant output
       --no-stream       Don't stream (assemble then print)
       --max-iter <n>    Iteration cap per turn (default 50)
+      --add-dir <path>  Add a directory to the agent's accessible scope (repeatable)
+      --agent <name>    Load an agent profile from ~/.metis/agents/<name>.md
+  -W, --worktree [slug] Spawn in a fresh git worktree (slug optional)
 
 Env:
   ANTHROPIC_API_KEY     Required for Anthropic provider
@@ -132,18 +136,19 @@ Env:
 // --- runtime wiring shared between chat and run ---
 
 type runtime struct {
-	cfg        *config.Config
-	provider   llm.Provider
-	registry   *tools.Registry
-	gate       *permission.Gate
-	store      *session.Store
-	sessionID  string
-	loop       *agent.Loop
-	useMD      bool
-	showTok    bool
-	model      string
-	mcpServers []*mcptools.Server
-	plugins    *rtpkg.PluginRegistry // nil when no plugins installed
+	cfg         *config.Config
+	provider    llm.Provider
+	registry    *tools.Registry
+	gate        *permission.Gate
+	store       *session.Store
+	sessionID   string
+	loop        *agent.Loop
+	useMD       bool
+	showTok     bool
+	model       string
+	mcpServers  []*mcptools.Server
+	plugins     *rtpkg.PluginRegistry // nil when no plugins installed
+	allowedDirs *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
 }
 
 // Cleanup closes any subprocesses or connections owned by the runtime.
@@ -172,6 +177,22 @@ type cliFlags struct {
 	noAuthWizard bool   // skip the first-run wizard (CI / scripted use)
 	effort       string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
 	fast         bool   // collapse one turn: effort=low + halved max_tokens
+	addDirs      stringList
+	agentProfile string // --agent=NAME — load .metis/agents/<name>.md
+	worktree     string // --worktree=slug — spin up git worktree with explicit slug
+	worktreeOn   bool   // -W — spin up worktree with auto slug
+}
+
+// stringList accumulates repeated flag values: --add-dir A --add-dir B → [A,B].
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error {
+	if v == "" {
+		return nil
+	}
+	*s = append(*s, v)
+	return nil
 }
 
 func parseFlags(args []string) (*cliFlags, []string, error) {
@@ -192,6 +213,10 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.noAuthWizard, "no-auth-wizard", false, "skip the first-run auth wizard if no API key is found")
 	f.StringVar(&out.effort, "effort", "", "reasoning intensity: low | medium | high")
 	f.BoolVar(&out.fast, "fast", false, "fast turn: effort=low + halved max_tokens")
+	f.Var(&out.addDirs, "add-dir", "additional directory accessible to tools (repeatable)")
+	f.StringVar(&out.agentProfile, "agent", "", "load agent profile from ~/.metis/agents/<name>.md")
+	f.StringVar(&out.worktree, "worktree", "", "spawn a git worktree for this session (slug)")
+	f.BoolVar(&out.worktreeOn, "W", false, "spawn a git worktree with an auto-generated slug")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -207,6 +232,14 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		fmt.Fprintln(os.Stderr, "metis: loaded config files:", loaded)
 	}
 
+	// Agent profile (--agent=NAME) loads early so its values participate
+	// in flag merging and tool-registry filtering downstream. CLI overrides
+	// always win — profile is "use this default unless I said otherwise".
+	agentProf, err := rtpkg.LoadAgentProfile(flags.agentProfile)
+	if err != nil {
+		return nil, err
+	}
+
 	// Apply flag overrides
 	provName := cfg.Provider.Default
 	if flags.provider != "" {
@@ -216,6 +249,17 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	mode := cfg.Permission.Mode
 	if flags.mode != "" {
 		mode = flags.mode
+	}
+	// Profile-on-CLI merge.
+	mergedModel, mergedMode, mergedEffort, mergedMaxIter :=
+		agentProf.MergeOnto(model, mode, flags.effort, flags.maxIter)
+	model = mergedModel
+	mode = mergedMode
+	if flags.effort == "" {
+		flags.effort = mergedEffort
+	}
+	if flags.maxIter == 0 {
+		flags.maxIter = mergedMaxIter
 	}
 
 	// First-run auth gate: launches the wizard when no key is resolvable
@@ -250,9 +294,25 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.system != "" {
 		system = flags.system
 	}
+	// Agent profile body REPLACES the default system prompt — that's the
+	// whole point of "I am a code reviewer". Skip when profile body is
+	// empty (frontmatter-only profiles still customize tools/model).
+	if agentProf != nil && agentProf.SystemPrompt != "" {
+		system = agentProf.SystemPrompt
+	}
 	// Append user's optional ~/.metis/system.md addendum (claude-code-style
-	// global system prompt). No-op when the file doesn't exist.
-	system = rtpkg.AssembleSystemPrompt(system)
+	// global system prompt). No-op when the file doesn't exist or the
+	// profile asked us to skip it.
+	if agentProf == nil || !agentProf.OmitClaudeMd {
+		system = rtpkg.AssembleSystemPrompt(system)
+	}
+
+	// --add-dir / persisted additional dirs. Done before system prompt
+	// finalization so the LLM sees the list at turn 0.
+	allowedDirs := rtpkg.NewAllowedDirs(flags.addDirs)
+	if extra := allowedDirs.SystemPromptAddendum(); extra != "" {
+		system = system + extra
+	}
 	chReg := rtpkg.BuildChannelRegistry(&cfg.Channels)
 	// Cron service is shared between the scheduler goroutine (started
 	// elsewhere) and the ScheduleWakeup tool we register below — they
@@ -301,6 +361,17 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	mcpServers, mcpErrs := rtpkg.LaunchAllMCP(ctx, mcpReg, reg)
 	for _, e := range mcpErrs {
 		fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
+	}
+
+	// Agent profile tool filter — applied after MCP tools register so the
+	// profile's allowlist / disallowed_tools cover dynamically-loaded MCP
+	// tools too. No-op when no profile is loaded.
+	if agentProf != nil && (len(agentProf.Tools) > 0 || len(agentProf.DisallowedTools) > 0) {
+		all := make([]string, 0, len(reg.All()))
+		for _, t := range reg.All() {
+			all = append(all, t.Name())
+		}
+		reg.Restrict(agentProf.FilterToolNames(all))
 	}
 
 	// Plugins (MCP-bundle style): each ~/.metis/plugins/<name>/plugin.toml
@@ -360,8 +431,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model,
-		mcpServers: mcpServers,
-		plugins:    pluginReg,
+		mcpServers:  mcpServers,
+		plugins:     pluginReg,
+		allowedDirs: allowedDirs,
 	}
 
 	if flags.resumeID != "" {
@@ -378,6 +450,11 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// TodoRead persist into the right per-session file. Done last so a
 	// resume failure above doesn't leave a stale id in the singleton.
 	rtpkg.SetCurrentSessionID(rt.sessionID)
+	// Same dance for the structured Task* tools (TaskCreate / TaskList /
+	// TaskUpdate / TaskOutput / TaskStop / TaskGet). Lives in the
+	// internal/tasks package (not runtime) to break an otherwise
+	// circular import (tools/builtin → runtime → tools/builtin).
+	taskstore.SetCurrentTaskStore(rt.sessionID)
 
 	// Push UI performance tunables into the TUI package so its per-tick
 	// helpers (tickInterval / eventBufferSize / mouseWheelLines) read
@@ -412,11 +489,37 @@ func cmdChat(ctx context.Context, args []string) error {
 		}
 		maybeNotifyUpdate()
 	}
+
+	// --worktree: spawn a git worktree first so config/CLAUDE.md/etc.
+	// load from the new cwd. The worktree info is stashed in a closure
+	// for cleanup at the end of cmdChat.
+	var worktreeInfo *rtpkg.WorktreeInfo
+	if flags.worktree != "" || flags.worktreeOn {
+		info, err := rtpkg.SpawnWorktree(flags.worktree)
+		if err != nil {
+			return err
+		}
+		if err := os.Chdir(info.Path); err != nil {
+			return fmt.Errorf("chdir to worktree %s: %w", info.Path, err)
+		}
+		worktreeInfo = info
+		fmt.Fprintf(os.Stderr, "(worktree: %s on branch %s)\n", info.Path, info.Branch)
+	}
+
 	rt, err := setupRuntime(ctx, flags)
 	if err != nil {
 		return err
 	}
 	defer rt.Cleanup()
+	defer func() {
+		if worktreeInfo != nil && worktreeInfo.Created {
+			// Default policy: KEEP the worktree on disk so the user can
+			// inspect commits / cherry-pick. Sweep policy in worktree.go
+			// reaps after 30 days. Future: prompt the user; for now,
+			// no-op cleanup mirrors claude-code's "keep" default.
+			_ = worktreeInfo
+		}
+	}()
 	sl := buildSlash(rt)
 
 	useTUI := flags.useTUI
@@ -426,7 +529,13 @@ func cmdChat(ctx context.Context, args []string) error {
 	}
 
 	if useTUI {
-		return tui.RunTUI(ctx, rt.loop, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.cfg.Session.SkillDir, rt.cfg, true) // true = force new session banner
+		hooks := tui.ExternalHooks{
+			DirAdd:    rt.allowedDirs.Add,
+			DirRemove: rt.allowedDirs.Remove,
+			DirList:   rt.allowedDirs.All,
+			BtwAsk:    rt.askSideQuestion,
+		}
+		return tui.RunTUI(ctx, rt.loop, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
 	}
 
 	repl, err := tui.NewREPL(rt.loop, sl, rt.store, rt.sessionID, rt.useMD, rt.showTok, rt.gate, rt.model, rt.cfg.Session.SkillDir)

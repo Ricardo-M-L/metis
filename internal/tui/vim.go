@@ -32,6 +32,31 @@ const (
 // it. metis is single-instance so global state is fine.
 var vimModeState = vimOff
 
+// toggleVimMode flips between off and insert; called by /vim.
+// In NORMAL mode the user already has Esc to leave; the slash
+// command isn't there for runtime mode-switching.
+func toggleVimMode() {
+	if vimModeState == vimOff {
+		vimModeState = vimInsert
+	} else {
+		vimModeState = vimOff
+	}
+}
+
+// vimModeStatus returns a human label for the current state.
+func vimModeStatus() string {
+	switch vimModeState {
+	case vimOff:
+		return "(vim mode: off)"
+	case vimInsert:
+		return "(vim mode: on — press Esc in input to enter NORMAL)"
+	case vimNormal:
+		return "(vim mode: NORMAL — i/a/o to insert)"
+	default:
+		return "(vim mode: " + vimModeState + ")"
+	}
+}
+
 // handleVimNormalKey interprets one keypress while in NORMAL mode.
 // Returns (handled, cmd): handled=true means the key was consumed;
 // false lets the caller fall through (or drop it). Most NORMAL-mode

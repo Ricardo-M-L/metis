@@ -45,6 +45,29 @@ const (
 	SignalSession
 	SignalSkills
 	SignalVersion
+	SignalAddDir
+	SignalRemoveDir
+	SignalListDirs
+	SignalBtw
+	SignalBatch
+	SignalCost
+	SignalDiff
+	SignalDoctor
+	SignalStats
+	SignalKeybindings
+	SignalPermissions
+	SignalHooks
+	SignalVim
+	SignalExport
+	SignalReleaseNotes
+	SignalTheme
+	SignalEffort
+	SignalPRComments
+	SignalUpgrade
+	SignalContext
+	SignalResume
+	SignalRename
+	SignalTag
 )
 
 type Registry struct {
@@ -161,6 +184,105 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	}})
 	r.Register(Cmd{Name: "branch", Aliases: []string{"fork"}, Description: "fork the current session to a new id (preserves history)", Handler: func(_ string) (string, Signal) {
 		return "", SignalBranch
+	}})
+	r.Register(Cmd{Name: "add-dir", Description: "add a directory to the agent's accessible scope (`/add-dir <path>`)", Handler: func(args string) (string, Signal) {
+		args = strings.TrimSpace(args)
+		if args == "" {
+			return "", SignalListDirs
+		}
+		return "", SignalAddDir
+	}})
+	r.Register(Cmd{Name: "rm-dir", Aliases: []string{"remove-dir"}, Description: "remove a directory previously added (`/rm-dir <path>`)", Handler: func(args string) (string, Signal) {
+		if strings.TrimSpace(args) == "" {
+			return "usage: /rm-dir <path>", SignalNone
+		}
+		return "", SignalRemoveDir
+	}})
+	r.Register(Cmd{Name: "btw", Description: "ask a side question without disturbing the main turn (`/btw <question>`)", Handler: func(args string) (string, Signal) {
+		if strings.TrimSpace(args) == "" {
+			return "usage: /btw <question>", SignalNone
+		}
+		return "", SignalBtw
+	}})
+	r.Register(Cmd{Name: "batch", Description: "research → plan → spawn N worktree sub-agents to execute (`/batch <task>`)", Handler: func(args string) (string, Signal) {
+		if strings.TrimSpace(args) == "" {
+			return "usage: /batch <task description>", SignalNone
+		}
+		return "", SignalBatch
+	}})
+
+	// --- info / toggle commands (claude-code parity) ---
+	r.Register(Cmd{Name: "cost", Aliases: []string{"usage"}, Description: "show token usage and estimated cost for the session", Handler: func(_ string) (string, Signal) {
+		return "", SignalCost
+	}})
+	r.Register(Cmd{Name: "diff", Description: "show git diff for the working tree", Handler: func(_ string) (string, Signal) {
+		return "", SignalDiff
+	}})
+	r.Register(Cmd{Name: "doctor", Description: "run a health check (API key, MCP, tools, cwd)", Handler: func(_ string) (string, Signal) {
+		return "", SignalDoctor
+	}})
+	r.Register(Cmd{Name: "stats", Description: "show session statistics (turns, tool calls, tokens)", Handler: func(_ string) (string, Signal) {
+		return "", SignalStats
+	}})
+	r.Register(Cmd{Name: "keybindings", Aliases: []string{"keys"}, Description: "list TUI keybindings", Handler: func(_ string) (string, Signal) {
+		return "", SignalKeybindings
+	}})
+	r.Register(Cmd{Name: "permissions", Aliases: []string{"perms"}, Description: "list active permission rules", Handler: func(_ string) (string, Signal) {
+		return "", SignalPermissions
+	}})
+	r.Register(Cmd{Name: "hooks", Description: "list loaded lifecycle hooks", Handler: func(_ string) (string, Signal) {
+		return "", SignalHooks
+	}})
+	r.Register(Cmd{Name: "vim", Description: "toggle vim-style modal editing for the input box", Handler: func(_ string) (string, Signal) {
+		return "", SignalVim
+	}})
+	r.Register(Cmd{Name: "export", Description: "export the current session as JSONL to stdout (mirrored to ~/.metis/exports/)", Handler: func(_ string) (string, Signal) {
+		return "", SignalExport
+	}})
+	r.Register(Cmd{Name: "release-notes", Aliases: []string{"changelog", "whatsnew"}, Description: "show recent metis release notes", Handler: func(_ string) (string, Signal) {
+		return "", SignalReleaseNotes
+	}})
+	// --- P1: theme / effort / pr_comments / upgrade / context ---
+	r.Register(Cmd{Name: "theme", Description: "cycle TUI color theme (`/theme [dark|light|auto]`)", Handler: func(_ string) (string, Signal) {
+		return "", SignalTheme
+	}})
+	r.Register(Cmd{Name: "effort", Description: "show or set reasoning effort (`/effort [low|medium|high]`)", Handler: func(_ string) (string, Signal) {
+		return "", SignalEffort
+	}})
+	r.Register(Cmd{Name: "pr_comments", Aliases: []string{"prc"}, Description: "fetch PR review comments via gh CLI (`/pr_comments <number>`)", Handler: func(args string) (string, Signal) {
+		if strings.TrimSpace(args) == "" {
+			return "usage: /pr_comments <pr-number>", SignalNone
+		}
+		return "", SignalPRComments
+	}})
+	r.Register(Cmd{Name: "upgrade", Description: "check for a newer metis release (`metis update --check` wrapper)", Handler: func(_ string) (string, Signal) {
+		return "", SignalUpgrade
+	}})
+	r.Register(Cmd{Name: "context", Description: "show context window utilization for the current session", Handler: func(_ string) (string, Signal) {
+		return "", SignalContext
+	}})
+	// --- P2 lightweight wrappers ---
+	r.Register(Cmd{Name: "resume", Description: "show how to resume a session (use `metis chat --resume <id>`)", Handler: func(_ string) (string, Signal) {
+		return "", SignalResume
+	}})
+	r.Register(Cmd{Name: "rename", Description: "rename the current session (alias of /title)", Handler: func(args string) (string, Signal) {
+		args = strings.TrimSpace(args)
+		if args == "" {
+			return "usage: /rename <new title>", SignalNone
+		}
+		return "", SignalTitle // reuse existing title pipeline
+	}})
+	r.Register(Cmd{Name: "tag", Description: "tag the current session with a label (`/tag <label>`)", Handler: func(args string) (string, Signal) {
+		args = strings.TrimSpace(args)
+		if args == "" {
+			return "usage: /tag <label>", SignalNone
+		}
+		return "", SignalTag
+	}})
+	// /usage is just an alias of /cost — claude-code parity. We register
+	// a separate Cmd so /help shows the alias, but route the same signal.
+	r.Register(Cmd{Name: "usage", Description: "alias of /cost", Handler: func(_ string) (string, Signal) {
+		return "", SignalCost
 	}})
 
 	// Mode commands

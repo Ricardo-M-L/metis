@@ -82,6 +82,11 @@ type CronJob struct {
 	LastRun       time.Time    `json:"last_run,omitempty"`
 	NextRun       time.Time    `json:"next_run,omitempty"`
 	RunCount      int          `json:"run_count"`
+	// ExpiresAt — when set, the scheduler skips this job after the deadline
+	// and the next List/persist sweep removes it. /loop sets this to 7 days
+	// out by default so accidentally-left-running loops eventually clean
+	// themselves up (claude-code's behavior).
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
 // SessionMode constants. Use these instead of bare strings when
@@ -403,6 +408,7 @@ func (s *CronService) Start(ctx context.Context, onFire func(*CronJob) error) {
 
 func (s *CronService) schedulerLoop(ctx context.Context, onFire func(*CronJob) error) {
 	for {
+		s.reapExpired()
 		s.mu.RLock()
 		job, next := s.nextJob()
 		s.mu.RUnlock()
@@ -444,6 +450,21 @@ func (s *CronService) Stop() {
 	}
 }
 
+// reapExpired drops jobs whose ExpiresAt has elapsed (from disk + memory).
+// Called from schedulerLoop on each tick; takes the write lock itself so
+// callers must NOT hold any lock when invoking.
+func (s *CronService) reapExpired() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for id, j := range s.jobs {
+		if !j.ExpiresAt.IsZero() && now.After(j.ExpiresAt) {
+			delete(s.jobs, id)
+			_ = os.Remove(s.path(id))
+		}
+	}
+}
+
 // nextJob returns the job with the earliest NextRun time.
 func (s *CronService) nextJob() (*CronJob, time.Time) {
 	var earliest *CronJob
@@ -455,6 +476,9 @@ func (s *CronService) nextJob() (*CronJob, time.Time) {
 			continue
 		}
 		if j.NextRun.IsZero() {
+			continue
+		}
+		if !j.ExpiresAt.IsZero() && now.After(j.ExpiresAt) {
 			continue
 		}
 		if j.NextRun.Before(now) {
