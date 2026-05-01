@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
@@ -167,8 +168,16 @@ func renderPermissions(m *Model) string {
 	}
 	fmt.Fprintf(&b, "  %d rule(s):\n", len(rules))
 	for _, r := range rules {
-		verb := "allow"
-		if r.Verb == 1 {
+		// permission.Decision constants: Ask=0, Allow=1, Deny=2.
+		// Earlier this branch wrote "deny" for r.Verb==1 (which is
+		// actually Allow), so an interactive "Yes always" decision
+		// surfaced as a deny rule in /permissions — the opposite of
+		// what the user just clicked. Use the symbolic constants.
+		verb := "ask"
+		switch r.Verb {
+		case permission.DecisionAllow:
+			verb = "allow"
+		case permission.DecisionDeny:
 			verb = "deny"
 		}
 		match := r.Match

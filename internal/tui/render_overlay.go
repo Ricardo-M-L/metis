@@ -133,6 +133,24 @@ const paletteMaxRows = 8
 
 func renderPalette(m *Model) string {
 	var s strings.Builder
+	// Adaptive description budget: terminal width minus the box chrome
+	// ("  │ ▸ /<name> "), capped at 80 so on ultra-wide screens we
+	// don't render absurdly long descriptions. Falls back to 40 when
+	// width isn't known yet.
+	termW := m.width
+	if termW <= 0 {
+		termW = 80
+	}
+	const namePad = 12 // "/<10-char name> "
+	const chromeW = 8  // "  │ ▸ " + trailing space
+	descBudget := termW - chromeW - namePad - 4
+	if descBudget < 20 {
+		descBudget = 20
+	}
+	if descBudget > 80 {
+		descBudget = 80
+	}
+
 	s.WriteString(styleMuted.Render("  ┌─ slash commands ") + styleMuted.Render("─────────────────────────") + "\n")
 
 	if len(m.palMatched) == 0 {
@@ -170,8 +188,8 @@ func renderPalette(m *Model) string {
 			s.WriteString(styleText.Render(name))
 		}
 		desc := cmd.Description
-		if len(desc) > 40 {
-			desc = desc[:40] + "…"
+		if len(desc) > descBudget {
+			desc = desc[:descBudget-1] + "…"
 		}
 		s.WriteString(styleMuted.Render(desc))
 		s.WriteString("\n")

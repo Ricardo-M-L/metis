@@ -39,7 +39,25 @@ func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.showPalette = false
 		}
 	case tea.KeyRunes:
-		m.palFilter += msg.String()
+		// Only ASCII letters, digits, '-' and '_' belong in a slash
+		// command name. Quietly drop anything else (paste of newlines,
+		// backslashes from terminal mis-mapping, fullwidth glyphs from
+		// IME) so we don't accidentally widen the palette filter into
+		// nonsensical strings.
+		s := msg.String()
+		var clean strings.Builder
+		for _, r := range s {
+			if (r >= 'a' && r <= 'z') ||
+				(r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') ||
+				r == '-' || r == '_' {
+				clean.WriteRune(r)
+			}
+		}
+		if clean.Len() == 0 {
+			return m, nil
+		}
+		m.palFilter += clean.String()
 		m.matchCommands()
 	}
 	return m, nil
@@ -106,25 +124,48 @@ func (m *Model) matchCommands() {
 		m.palMatched = append(m.palMatched, m.cmds.All()...)
 		return
 	}
+	// added[name] tracks which commands have already been queued so an
+	// alias prefix match doesn't double-add the same /help when its
+	// alias 'h' also matches filter 'h' (b2-13 reproducer: typing "/h"
+	// + Tab showed /help twice in the palette). Source-of-truth key is
+	// the canonical command name, since aliases all point to the same
+	// REPLCommand.
+	added := map[string]bool{}
+	queue := func(dst *[]REPLCommand, cmd REPLCommand) {
+		key := strings.ToLower(cmd.Name)
+		if added[key] {
+			return
+		}
+		added[key] = true
+		*dst = append(*dst, cmd)
+	}
 	var prefixHits, containsHits []REPLCommand
 	for _, cmd := range m.cmds.All() {
 		name := strings.ToLower(cmd.Name)
 		switch {
 		case name == filter:
-			m.palMatched = append([]REPLCommand{cmd}, m.palMatched...)
+			if !added[name] {
+				added[name] = true
+				m.palMatched = append([]REPLCommand{cmd}, m.palMatched...)
+			}
 		case strings.HasPrefix(name, filter):
-			prefixHits = append(prefixHits, cmd)
+			queue(&prefixHits, cmd)
 		case strings.Contains(name, filter):
-			containsHits = append(containsHits, cmd)
+			queue(&containsHits, cmd)
 		}
-		// Aliases also count for prefix.
+		// Aliases also count, but only if the canonical name didn't
+		// already match — otherwise we'd double-add.
+		if added[name] {
+			continue
+		}
 		for _, a := range cmd.Aliases {
 			al := strings.ToLower(a)
 			if al == filter {
+				added[name] = true
 				m.palMatched = append([]REPLCommand{cmd}, m.palMatched...)
 				break
 			} else if strings.HasPrefix(al, filter) {
-				prefixHits = append(prefixHits, cmd)
+				queue(&prefixHits, cmd)
 				break
 			}
 		}

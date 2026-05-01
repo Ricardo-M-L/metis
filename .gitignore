@@ -17,3 +17,6 @@ node_modules/
 # local dev artifacts (not for public release)
 TEST_REPORT.md
 
+# personal deploy script for Ricardo's tencent-cloud server (not for public release)
+/install/install-server.sh
+

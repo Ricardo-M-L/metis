@@ -78,6 +78,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdPlugin(ctx, args[1:])
 	case "audit":
 		return cmdAudit()
+	case "diag":
+		return cmdDiag(ctx, args[1:])
 	case "update":
 		return cmdUpdate(ctx, args[1:])
 	case "version", "-v", "--version":
@@ -110,6 +112,7 @@ Usage:
   metis cron <list|add|rm|pause|resume|run|start>  Manage scheduled prompts
   metis auth <login|logout|list>  Manage provider credentials (~/.metis/auth.json)
   metis audit           Print a security audit of the current configuration
+  metis diag [--llm] [--tool-smoke] [--json]  Run a non-interactive health check
   metis update [--check]  Self-update from the private release (needs METIS_GITHUB_TOKEN)
   metis version [-V]    Print version (-V for build fingerprint)
   metis help            This help
@@ -1243,34 +1246,26 @@ func installSkill(name, destDir string) error {
 
 func buildSlash(rt *runtime) *slash.Registry {
 	r := slash.NewRegistry()
-	r.Register(slash.Cmd{Name: "help", Description: "show commands", Handler: func(_ string) (string, slash.Signal) {
-		return r.HelpText(), slash.SignalNone
-	}})
-	r.Register(slash.Cmd{Name: "quit", Aliases: []string{"q", "exit"}, Description: "exit metis", Handler: func(_ string) (string, slash.Signal) {
-		return "", slash.SignalQuit
-	}})
-	r.Register(slash.Cmd{Name: "clear", Description: "clear conversation history", Handler: func(_ string) (string, slash.Signal) {
-		return "", slash.SignalClear
-	}})
-	r.Register(slash.Cmd{Name: "tools", Description: "list available tools", Handler: func(_ string) (string, slash.Signal) {
-		var s string
-		for _, t := range rt.registry.All() {
-			s += fmt.Sprintf("  %-12s  %s\n", t.Name(), t.Description())
-		}
-		return s, slash.SignalNone
-	}})
-	r.Register(slash.Cmd{Name: "model", Description: "show current model", Handler: func(_ string) (string, slash.Signal) {
-		return "model: " + rt.model, slash.SignalNone
-	}})
+	// Use the canonical command set defined in internal/slash/commands.go.
+	// Previously buildSlash hand-registered a 7-cmd stub which was a long-
+	// lived bug: 47 of the 54 commands the TUI submit handler dispatches
+	// off of (cost / doctor / save / btw / batch / diff / stats / vim
+	// / keybindings / permissions / hooks / cron / loop / agents / …)
+	// were silently invisible to the slash registry, making them
+	// unreachable through the slash path and producing the
+	// "unknown: /save — try /help" surface bug seen in VNC v3-08.
+	slash.RegisterAll(r, rt.cfg)
+
+	// /mode — unique to the CLI build, lets the user inspect or set the
+	// permission mode by string. Not in RegisterAll because the signal
+	// path already exposes individual /auto, /bypass, /plan, /ask
+	// togglers; this is the catch-all "show me / set me" form.
 	r.Register(slash.Cmd{Name: "mode", Description: "show or set permission mode (ask|auto|bypass|plan|deny)", Handler: func(arg string) (string, slash.Signal) {
 		if arg == "" {
 			return "mode: " + string(rt.gate.Mode()), slash.SignalNone
 		}
 		rt.gate.SetMode(permission.Mode(arg))
 		return "mode set to " + arg, slash.SignalNone
-	}})
-	r.Register(slash.Cmd{Name: "session", Description: "show current session id", Handler: func(_ string) (string, slash.Signal) {
-		return "session: " + rt.sessionID, slash.SignalNone
 	}})
 	return r
 }

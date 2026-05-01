@@ -6,6 +6,7 @@ package tui
 // read Model state without exporting fields.
 
 import (
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -58,7 +59,21 @@ func (m *Model) renderWelcomeBanner() string {
 		}
 		s.WriteString(valueStyle.Render(sid))
 	}
-	s.WriteString("\n\n")
+	s.WriteString("\n")
+
+	// 3) cwd row — Claude Code's first frame anchors users to their
+	// working directory; without it you can't tell whether a stray
+	// `cd` from the shell put you somewhere unexpected. Truncate the
+	// home prefix to "~" so paths read like the shell's PS1.
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		if home, _ := os.UserHomeDir(); home != "" && strings.HasPrefix(cwd, home) {
+			cwd = "~" + cwd[len(home):]
+		}
+		s.WriteString(labelStyle.Render("  cwd:   "))
+		s.WriteString(valueStyle.Render(cwd))
+		s.WriteString("\n")
+	}
+	s.WriteString("\n")
 
 	// 4) Quick start hint — single muted row, no extra scaffolding.
 	s.WriteString(labelStyle.Render("  Type a message to start  ·  "))

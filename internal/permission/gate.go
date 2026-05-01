@@ -93,9 +93,32 @@ func (g *Gate) PopRules(n int) {
 
 // Check evaluates a tool invocation against the current mode + rules.
 // stringInput is a flattened representation used for substring matching.
+//
+// Precedence:
+//  1. ModePlan and ModeDeny override rules — these are user-safety stances
+//     that must not be defeated by a leftover "Yes always" rule from a
+//     previous turn. Without this, switching from ask → plan still let
+//     Bash through if the user had ever clicked "Yes always" on Bash.
+//  2. Otherwise, rules win (declarative configuration the user set on
+//     purpose).
+//  3. Mode-default fallthrough for the remaining modes.
 func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, string) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	// Hard modes — applied BEFORE rules so leftover allow rules can't
+	// punch a hole through plan/deny.
+	switch g.mode {
+	case ModeDeny:
+		return DecisionDeny, "mode:deny"
+	case ModePlan:
+		switch tool {
+		case "Read", "LS", "Glob", "Grep", "WebFetch":
+			return DecisionAllow, "mode:plan"
+		default:
+			return DecisionDeny, "mode:plan"
+		}
+	}
 
 	// Iterate in reverse — later rules (higher precedence) win.
 	for i := len(g.rules) - 1; i >= 0; i-- {
@@ -112,19 +135,8 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 	switch g.mode {
 	case ModeBypass:
 		return DecisionAllow, "mode:bypass"
-	case ModeDeny:
-		return DecisionDeny, "mode:deny"
-	case ModePlan:
-		// allow only read-only tools by name convention
-		switch tool {
-		case "Read", "LS", "Glob", "Grep", "WebFetch":
-			return DecisionAllow, "mode:plan"
-		default:
-			return DecisionDeny, "mode:plan"
-		}
 	case ModeAuto:
-		// Same allowlist as ModePlan — both are "reads only" stances and
-		// having WebFetch in one but not the other was inconsistent.
+		// Read-only auto-allow; everything else falls through to ask.
 		switch tool {
 		case "Read", "LS", "Glob", "Grep", "WebFetch":
 			return DecisionAllow, "mode:auto"

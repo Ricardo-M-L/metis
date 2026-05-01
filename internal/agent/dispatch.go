@@ -7,6 +7,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
 // toolSpecs builds the per-request `tools[]` array given to the LLM, by
@@ -186,6 +187,15 @@ func (l *Loop) runOne(ctx context.Context, t tools.Tool, blk llm.ContentBlock, o
 			Context: tc, Tool: blk.ToolName, Input: blk.ToolInput,
 			Output: output, IsError: isErr,
 		})
+		// Distinct PostToolUseFailure firing on tool errors so observers
+		// can subscribe to "only failures" without filtering by IsError
+		// inside every PostToolUse handler. Mirrors claude-code's split.
+		if isErr {
+			l.Hooks.EmitPostToolUseFailure(ctx, tc, &pubhook.PostToolUseFailure{
+				Context: tc, Tool: blk.ToolName, Input: blk.ToolInput,
+				Output: output, Error: output, Attempt: 1,
+			})
+		}
 	}
 
 	if err != nil {

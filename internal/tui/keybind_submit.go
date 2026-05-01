@@ -164,6 +164,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			m.messages = append(m.messages, Message{Role: "info", Content: renderSessionsList(m.session, 20), Timestamp: time.Now()})
 		case slash.SignalSession:
 			m.messages = append(m.messages, Message{Role: "info", Content: renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())), Timestamp: time.Now()})
+		case slash.SignalStatus:
+			// Reuse renderCurrentSession — same data the user wants from
+			// /status. Was previously falling through to default which
+			// only showed the placeholder "(status: see REPL)".
+			m.messages = append(m.messages, Message{Role: "info", Content: renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())), Timestamp: time.Now()})
 		case slash.SignalSkills:
 			m.messages = append(m.messages, Message{Role: "info", Content: renderSkillsList(m.skillDir), Timestamp: time.Now()})
 		case slash.SignalVersion:

@@ -181,11 +181,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEscape:
-		// /btw modal takes priority — dismiss it without disturbing
-		// other state.
-		if m.btwActive {
-			m.dismissBtw()
-			return m, nil
+		// Overlay stack takes priority — if any overlay's Update
+		// consumes the Esc, we stop here. Otherwise fall through to
+		// the existing palette / vim / double-tap-clear handlers.
+		if m.overlays.Active() {
+			cmd, consumed := m.overlays.Update(msg)
+			if consumed {
+				return m, cmd
+			}
 		}
 		// Vim mode hijack: ESC in INSERT mode goes to NORMAL.
 		if vimModeState == vimInsert {
@@ -330,11 +333,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// claude-code-style live palette: opens as soon as the user types "/",
-	// filter follows the rest of the buffer, closes when "/" is gone.
-	if strings.HasPrefix(val, "/") {
+	// claude-code-style live palette: opens as soon as the user types
+	// the literal forward slash "/" (U+002F), filter follows the rest
+	// of the buffer, closes when "/" is gone.
+	//
+	// We check rune-by-rune (val[0] == '/') instead of HasPrefix so
+	// that visually similar prefixes — backslash "\\" (U+005C),
+	// fullwidth solidus "／" (U+FF0F), division slash "∕" (U+2215),
+	// fraction slash "⁄" (U+2044) — DON'T trigger the palette. The
+	// user reported on 2026-05-01 that backslash also opened commands;
+	// that turned out to be a vncdotool keysym mis-mapping rather than
+	// a metis bug, but defense-in-depth here makes the contract
+	// explicit: only literal U+002F counts.
+	if len(val) > 0 && val[0] == '/' {
 		m.showPalette = true
-		m.palFilter = strings.TrimPrefix(val, "/")
+		m.palFilter = val[1:]
 		m.matchCommands()
 	} else if m.showPalette {
 		m.showPalette = false

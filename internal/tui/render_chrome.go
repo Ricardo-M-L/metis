@@ -87,8 +87,11 @@ func renderSpinnerStatus(m *Model) string {
 
 	var parts []string
 	parts = append(parts, formatElapsed(elapsed))
-	if total := m.totalTokens.Total(); total > 0 {
-		parts = append(parts, "↓ "+formatTokens(total)+" tokens")
+	// Spinner row reflects the most recent finished turn — same scope as
+	// the bottom-right status bar. Keeping these two numbers in sync
+	// avoids the "spinner says 12k, status bar says 800" confusion.
+	if last := m.totalTokens.LastTotal(); last > 0 {
+		parts = append(parts, "↓ "+formatTokens(last)+" tokens")
 	}
 	if !m.firstStreamAt.IsZero() {
 		thought := m.firstStreamAt.Sub(m.spinnerStartedAt)
@@ -158,13 +161,28 @@ func renderStatusBar(m *Model) string {
 	if addr := bridgeCurrentAddr(); addr != "" {
 		leftParts = append(leftParts, "↹ "+addr)
 	}
+	// (cwd badge intentionally NOT shown in the status bar — the user
+	// already sees it in the welcome banner; duplicating it on every
+	// frame just visually clutters the bottom row.)
 	left := "  " + strings.Join(leftParts, " · ")
 
 	publishBridgeSnapshot(m)
 
+	// Right side: **most recent turn's** tokens (input+output) + context-
+	// window percentage. claude-code's status bar shows the in-flight
+	// context load, NOT the session-cumulative API spend. Earlier metis
+	// summed every call ever — so the counter only ever grew, masking
+	// per-turn cost. Now we show what the most recent API call ate.
+	// /cost still surfaces the session total for billing.
 	var right string
-	if total := m.totalTokens.Total(); total > 0 {
-		right = formatTokens(total) + " tokens"
+	if last := m.totalTokens.LastTotal(); last > 0 {
+		right = formatTokens(last) + " tokens"
+		if m.loop != nil && m.loop.Provider != nil {
+			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
+				pct := last * 100 / cap
+				right = fmt.Sprintf("%s (%d%%)", right, pct)
+			}
+		}
 	}
 
 	w := m.width

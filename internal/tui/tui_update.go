@@ -16,6 +16,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/tui/overlay"
 )
 
 func (m *Model) Init() tea.Cmd {
@@ -145,8 +146,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tick:
 		return m, tickCmd
 
-	case btwAnswerMsg:
-		m.handleBtwAnswer(msg)
+	case overlay.BtwAnswerMsg:
+		// Route the result to whichever BtwOverlay is currently on the
+		// stack. If the user already dismissed it (Esc), Get returns nil
+		// and the answer is silently dropped — same as claude-code's
+		// behavior when the user closes the modal mid-flight.
+		if o := m.overlays.Get("btw"); o != nil {
+			if btw, ok := o.(*overlay.BtwOverlay); ok {
+				btw.Apply(msg)
+			}
+		}
 		return m, nil
 	}
 	return m, nil

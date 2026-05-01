@@ -26,6 +26,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/tui/overlay"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -231,16 +232,12 @@ type Model struct {
 	eventCh chan agent.Event
 	doneCh  chan error
 
-	// btw modal state — claude-code's "/btw" sidebar question. While
-	// btwActive is true, View() overlays an answer box on top of the
-	// chat surface. The user dismisses with Esc; the main turn (if any)
-	// keeps running underneath. btwLoading shows a spinner while the
-	// side LLM call is in flight.
-	btwActive   bool
-	btwQuestion string
-	btwAnswer   string
-	btwErr      string
-	btwLoading  bool
+	// overlays owns every modal/dialog/popup. New overlays land in
+	// internal/tui/overlay/ and Push() onto this stack — see Phase 1
+	// of the TUI sub-model refactor (2026-05-01). Old per-overlay
+	// boolean flags on Model are getting migrated one by one. /btw
+	// is the first migrant.
+	overlays *overlay.Stack
 }
 
 const ctrlCQuitWindow = 600 * time.Millisecond
@@ -295,6 +292,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		startTime:   time.Now(),
 		eventCh:     make(chan agent.Event, eventBufferSize()),
 		doneCh:      make(chan error, 1),
+		overlays:    overlay.New(),
 		showBanner:  true,
 		firstRender: true,
 		input:       ti,

@@ -76,6 +76,11 @@ func (m *Model) View() string {
 		var s strings.Builder
 		s.WriteString(m.renderWelcomeBanner())
 		s.WriteString(renderInputLine(m))
+		// hints (mode indicator) goes IMMEDIATELY below the input box —
+		// claude-code parity: the user's eye is already on the input,
+		// the mode reminder belongs adjacent to it. Status bar (with
+		// tokens / version on the right) is a separate, lower band.
+		s.WriteString(renderHints(m))
 		if m.showPalette {
 			s.WriteString(renderPalette(m))
 		}
@@ -86,7 +91,6 @@ func (m *Model) View() string {
 			s.WriteString(renderAtMention(m))
 		}
 		s.WriteString(renderStatusBar(m))
-		s.WriteString(renderHints(m))
 		s.WriteString("\033[0m")
 		return s.String()
 	}
@@ -203,9 +207,11 @@ func (m *Model) View() string {
 	}
 
 	s.WriteString(renderInputLine(m))
+	// hints (mode indicator) — claude-code parity: glued to the input.
+	s.WriteString(renderHints(m))
 
-	// Slash command palette renders BELOW the input box (claude-code
-	// pattern).
+	// Slash command palette renders BELOW the hints (claude-code
+	// pattern). Palette is suggestion overlay, hints is permanent.
 	if m.showPalette {
 		s.WriteString(renderPalette(m))
 	}
@@ -216,13 +222,13 @@ func (m *Model) View() string {
 	}
 
 	s.WriteString(renderStatusBar(m))
-	s.WriteString(renderHints(m))
 
-	// /btw modal — stacks on top of the chrome since we render after it.
-	// lipgloss already wraps it in a bordered box; just append.
-	if overlay := m.renderBtwOverlay(); overlay != "" {
+	// Overlay stack — every active modal/dialog. Each overlay's View()
+	// already returns a lipgloss-bordered box, so we just append in
+	// stack order. Empty list = no modals visible.
+	for _, ov := range m.overlays.View(m.width, m.height) {
 		s.WriteString("\n")
-		s.WriteString(overlay)
+		s.WriteString(ov)
 		s.WriteString("\n")
 	}
 

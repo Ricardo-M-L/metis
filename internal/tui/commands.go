@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
@@ -90,11 +91,22 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "commit", Description: "git commit (-m 'message')", Handler: cmdGitCommit})
 	r.Register(REPLCommand{Name: "diff", Description: "git diff (--cached for staged)", Handler: cmdGitDiff})
 	r.Register(REPLCommand{Name: "log", Description: "git log (--stat for details, -n <count>)", Handler: cmdGitLog})
-	r.Register(REPLCommand{Name: "branch", Description: "git branch (-a for all, -c <name> to create)", Handler: cmdGitBranch})
+	// Note: Name is "gbr" (git branch). /branch must fall through to
+	// slash.Registry's SignalBranch — fork the current session preserving
+	// history. This was bug §28.18 — VNC b9-04 showed /branch reporting
+	// "git branch: exit status 128: fatal: not a git repository" because
+	// BuildREPLCommands' "branch" entry shadowed the slash-registry fork.
+	r.Register(REPLCommand{Name: "gbr", Description: "git branch (alias for /gbr; '/branch' forks session)", Handler: cmdGitBranch})
 	r.Register(REPLCommand{Name: "checkout", Description: "git checkout <branch>", Handler: cmdGitCheckout})
 	r.Register(REPLCommand{Name: "stash", Description: "git stash (push|pop|list)", Handler: cmdGitStash})
 	r.Register(REPLCommand{Name: "fetch", Description: "git fetch (--all for all remotes)", Handler: cmdGitFetch})
-	r.Register(REPLCommand{Name: "status", Aliases: []string{"st"}, Description: "git status", Handler: cmdGitStatus})
+	// Note: Name is "gst" / "st" (git status), NOT "status".
+	// "/status" must fall through to slash.Registry's SignalStatus
+	// (session info — turn count / model / mode / sessionID) which the
+	// user expects. This was bug §28.13 — VNC r4-20-status.png showed
+	// /status reporting "fatal: not a git repository" because BuildREPL-
+	// Commands' "status" entry shadowed the slash-registry version.
+	r.Register(REPLCommand{Name: "gst", Aliases: []string{"st"}, Description: "git status (alias 'st')", Handler: cmdGitStatus})
 
 	// === Tools ===
 	r.Register(REPLCommand{Name: "tools", Aliases: []string{"t"}, Description: "list available tools", Handler: cmdTools})
@@ -212,23 +224,57 @@ func cmdFiles(r *REPL, args string) string {
 // cmdContext shows current context-window usage. Calculates percent
 // of max-context tokens consumed by current history + system prompt.
 func cmdContext(r *REPL, args string) string {
-	tot := r.totalTokens.Total()
-	// Conservative model defaults — exact value depends on model in
-	// use. Anthropic claude-opus-4-7 = 1M; sonnet = 200k; haiku = 200k.
+	// Use LastIn (the input tokens of the most recent API call) rather
+	// than session-cumulative total. Context-window pressure is about
+	// what was *just* sent to the LLM (system + history + current msg),
+	// NOT API spend across the whole session — the latter conflates two
+	// different concepts and produces nonsensical percentages like 200%.
+	used := r.totalTokens.LastIn()
 	maxCtx := 1_000_000
-	pct := float64(tot) / float64(maxCtx) * 100
-	return fmt.Sprintf("context: %d tokens used / ~%d max ≈ %.1f%%", tot, maxCtx, pct)
+	if r.Loop != nil && r.Loop.Provider != nil {
+		if cap := r.Loop.Provider.MaxContextTokens(); cap > 0 {
+			maxCtx = cap
+		}
+	}
+	pct := float64(used) / float64(maxCtx) * 100
+	return fmt.Sprintf("context: %s tokens in last call / ~%s max ≈ %.1f%%",
+		fmtThousands(used), fmtThousands(maxCtx), pct)
 }
 
 // cmdMemory is a thin wrapper that delegates to the memory tool.
 // Real ops happen via the agent loop's Memory tool — this command
 // just gives the user a "what's in memory?" quick view.
 func cmdMemory(r *REPL, args string) string {
-	arg := strings.TrimSpace(args)
-	if arg == "" {
-		return "memory: read | write <text> | search <query> | clear (delegates to the Memory tool — model decides)"
+	// Show the live memory state — block names + sizes + a brief render.
+	// Earlier this returned only a usage hint, which felt like the
+	// command was broken. The Memory tool (called by the LLM) handles
+	// CRUD; this slash is the read-only "what's in memory right now"
+	// view, equivalent to opening ~/.metis/memories/MEMORY.md by hand.
+	if r.Loop == nil || r.Loop.Memory == nil {
+		return "memory: not initialized (this is a metis bug — please report)"
 	}
-	return "memory: queue this in your next turn — say 'check memory for ...' or 'remember: ...'"
+	core := r.Loop.Memory.Core()
+	if core == nil {
+		return "memory: core block store unavailable"
+	}
+	stats := core.Stats()
+	if len(stats) == 0 {
+		return "memory: no blocks (empty)"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "memory blocks (%d):\n", len(stats))
+	// Stable order: sort block names alphabetically.
+	names := make([]string, 0, len(stats))
+	for k := range stats {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		s := stats[name]
+		fmt.Fprintf(&b, "  %-12s %d / %d chars (%.1f%%)\n", name, s.Used, s.Limit, s.Pct)
+	}
+	b.WriteString("\nuse the Memory tool (action=read|search|add|replace|remove|archive|stats) to read/edit specific blocks")
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // cmdRecap re-emits the most recent turn-end recap line. Useful when
@@ -791,10 +837,23 @@ func cmdSessions(r *REPL, args string) string {
 
 func cmdExport(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
+	var path string
 	if args == "" {
-		return "usage: export [path] — exports current session as JSON"
+		// Default destination: ~/.metis/exports/session-<id>-<unix>.jsonl.
+		// Earlier this returned a usage hint, which felt like the command
+		// was broken — users expect "/export" to actually export. Pass an
+		// explicit path only when you want to override.
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".metis", "exports")
+		_ = os.MkdirAll(dir, 0o755)
+		sid := r.SessionID
+		if sid == "" {
+			sid = "untitled"
+		}
+		path = filepath.Join(dir, fmt.Sprintf("session-%s-%d.jsonl", sid, time.Now().Unix()))
+	} else {
+		path = args
 	}
-	path := args
 	hist := r.Loop.History()
 	data, err := json.MarshalIndent(hist, "", "  ")
 	if err != nil {
@@ -835,7 +894,29 @@ func cmdAllow(r *REPL, args string) string {
 // =============================================================================
 
 func cmdCompact(r *REPL, args string) string {
-	return "(compaction will trigger automatically at next threshold — or use /compact in the session)"
+	// Force a compact NOW, regardless of ShouldCompact threshold. This
+	// was bug §28.20 — earlier this returned only a hint string, while
+	// the slash registry's SignalCompact path also no-op'd. Now we
+	// actually invoke Compactor.Compact on the live history.
+	if r.Loop == nil || r.Loop.Compactor == nil {
+		return "compact: compactor not configured (provider may not support it)"
+	}
+	hist := r.Loop.History()
+	before := len(hist)
+	if before <= 2 {
+		return fmt.Sprintf("compact: nothing to compact (only %d messages)", before)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	compacted, err := r.Loop.Compactor.Compact(ctx, hist)
+	if err != nil {
+		return "compact failed: " + err.Error()
+	}
+	if len(compacted) >= before {
+		return fmt.Sprintf("compact: no reduction (%d → %d messages)", before, len(compacted))
+	}
+	r.Loop.Restore(compacted)
+	return fmt.Sprintf("compact: %d → %d messages (saved %d)", before, len(compacted), before-len(compacted))
 }
 
 func cmdConfig(r *REPL, args string) string {
@@ -933,9 +1014,22 @@ func cmdVersion(r *REPL, args string) string {
 }
 
 func cmdCost(r *REPL, args string) string {
-	tokens := r.totalTokens
-	return fmt.Sprintf("session tokens:\n  input:  %d\n  output: %d\n  total:  %d",
-		tokens.in, tokens.out, tokens.in+tokens.out)
+	// Mirror renderCost (render_info.go) so the REPL fast-path and the
+	// slash.Registry path produce identical output. Earlier this function
+	// returned a stripped-down "session tokens:" line and missed the USD
+	// estimate, which made /cost feel hollow on TUI; now it includes the
+	// per-model price guess.
+	in := r.totalTokens.in
+	out := r.totalTokens.out
+	total := in + out
+	priceIn, priceOut := guessPriceUSDPerM(r.Loop.Model)
+	costUSD := float64(in)*priceIn/1_000_000 + float64(out)*priceOut/1_000_000
+	return fmt.Sprintf(
+		"session cost (model: %s)\n  input  tokens: %s\n  output tokens: %s\n  total  tokens: %s\n  est. cost:     $%.4f  (estimate, real billing on provider)",
+		r.Loop.Model,
+		fmtThousands(in), fmtThousands(out), fmtThousands(total),
+		costUSD,
+	)
 }
 
 func cmdUsage(r *REPL, args string) string {
@@ -1098,17 +1192,32 @@ func sanitize(name string) string {
 //
 // Numbers tuned to claude-code's TokenCounter animation.
 type tokenTracker struct {
-	in, out         int
+	in, out         int // session cumulative (every API call += in/out)
+	lastIn, lastOut int // most recent API call only (overwritten each round)
 	dispIn, dispOut int
 }
 
-// add records a per-iteration usage report. Both axes accumulate —
-// matching claude-code's cost-tracker behaviour where each API call's
-// usage is += into the running totals.
+// add records a per-iteration usage report. `in`/`out` accumulate session-
+// wide for /cost; `lastIn`/`lastOut` overwrite each call so the status bar
+// can show "this turn's tokens" — matching claude-code where the bottom-
+// right counter reflects the in-flight context window load (last call's
+// input+output) rather than total API spend.
 func (t *tokenTracker) add(in, out int) {
 	t.in += in
 	t.out += out
+	t.lastIn = in
+	t.lastOut = out
 }
+
+// LastIn / LastOut expose the most recent API call's usage for the
+// status bar. Total() (defined elsewhere in this file) keeps returning
+// the session cumulative for /cost.
+func (t *tokenTracker) LastIn() int  { return t.lastIn }
+func (t *tokenTracker) LastOut() int { return t.lastOut }
+
+// LastTotal is the most recent API call's input+output combined — the
+// number rendered in the status bar's bottom-right.
+func (t *tokenTracker) LastTotal() int { return t.lastIn + t.lastOut }
 
 // Reset zeroes both raw and displayed counters. Called by /clear and /new
 // when the conversation is being thrown away so the displayed total
@@ -1117,6 +1226,8 @@ func (t *tokenTracker) add(in, out int) {
 func (t *tokenTracker) Reset() {
 	t.in = 0
 	t.out = 0
+	t.lastIn = 0
+	t.lastOut = 0
 	t.dispIn = 0
 	t.dispOut = 0
 }
