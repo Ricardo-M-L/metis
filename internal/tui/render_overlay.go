@@ -195,7 +195,14 @@ func renderPalette(m *Model) string {
 		} else {
 			s.WriteString(styleText.Render(name))
 		}
+		// Phase D: when the command opens an interactive widget, swap
+		// the static description for a "→ widget hint" so the user
+		// knows pressing Enter launches a UI rather than dumping text.
+		// Mirrors claude-code's hover hints.
 		desc := cmd.Description
+		if hint := widgetHint(cmd.Name); hint != "" {
+			desc = hint
+		}
 		if len(desc) > descBudget {
 			desc = desc[:descBudget-1] + "…"
 		}
