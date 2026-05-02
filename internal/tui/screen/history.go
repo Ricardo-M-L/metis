@@ -4,41 +4,93 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/tui/list"
 )
 
 // HistoryScreen renders the agent's transcript as a scrollable, role-colored
 // page. Triggered by /history; dismissed by Esc / q / Ctrl-C.
 //
 // The screen is read-only: it never edits the transcript or sends messages.
-// Implementation note: we render the entire history into a string once at
-// open time and feed it to a viewport. That keeps Update cheap (just
-// scrolling) and lets re-opens with the same history avoid the rebuild cost
-// — but if the conversation gets really long (>~5k messages) this should
-// switch to lazy rendering. Today the cap is small enough that eager wins.
+//
+// Implementation note: we wrap each Message into a historyItem and feed
+// the slice to the same internal/tui/list package the chat surface uses,
+// so HistoryScreen gets virtualization for free — long sessions
+// (thousands of messages) only render the visible window each frame.
+// Per-item rendering is cached by width so resize is the only path that
+// actually re-runs renderUserMessage / renderAssistantMessage.
 type HistoryScreen struct {
-	vp       viewport.Model
-	rendered string
-	done     bool
+	l    *list.List
+	done bool
 	// Header label printed above the scroll region. Caller can override
 	// before opening (e.g. with the session id).
 	Title string
 }
 
+// historyItem wraps an llm.Message into list.Item for the virtualized
+// list. Each item caches its rendered string by width so spinner ticks
+// (which hit Render multiple times via List.AtBottom + Render +
+// TotalLineCount) stay cheap.
+type historyItem struct {
+	msg          llm.Message
+	cachedWidth  int
+	cachedOutput string
+}
+
+// emptyItem renders a placeholder when the transcript is empty.
+type emptyItem struct{}
+
+func (e *emptyItem) Render(width int) string {
+	return histDim.Render("(history is empty — start chatting)")
+}
+
+func (i *historyItem) Render(width int) string {
+	if i.cachedWidth == width && i.cachedOutput != "" {
+		return i.cachedOutput
+	}
+	var b strings.Builder
+	switch i.msg.Role {
+	case llm.RoleUser:
+		renderUserMessage(&b, i.msg, width)
+	case llm.RoleAssistant:
+		renderAssistantMessage(&b, i.msg, width)
+	default:
+		// system / tool roles — render minimally.
+		b.WriteString(histRoleTool.Render("▸ " + string(i.msg.Role)))
+		b.WriteString("\n")
+	}
+	i.cachedWidth = width
+	// Trim trailing newlines so list's height calculation doesn't
+	// double-count blank rows; list inserts gap rows between items
+	// itself when SetGap > 0.
+	i.cachedOutput = strings.TrimRight(b.String(), "\n")
+	return i.cachedOutput
+}
+
 // NewHistoryScreen builds a screen ready to View(). messages is the snapshot
 // to render; mutating it after construction has no effect.
 func NewHistoryScreen(messages []llm.Message, width, height int) *HistoryScreen {
-	body := renderHistory(messages, width)
-	vp := viewport.New(width, contentHeight(height))
-	vp.SetContent(body)
+	l := list.NewList()
+	l.SetSize(width, contentHeight(height))
+	// Single-row gap between turns — same visual rhythm the previous
+	// renderHistory produced via "\n" separators.
+	l.SetGap(1)
+
+	if len(messages) == 0 {
+		l.SetItems(&emptyItem{})
+	} else {
+		items := make([]list.Item, len(messages))
+		for i := range messages {
+			items[i] = &historyItem{msg: messages[i]}
+		}
+		l.SetItems(items...)
+	}
 	return &HistoryScreen{
-		vp:       vp,
-		rendered: body,
-		Title:    "session history",
+		l:     l,
+		Title: "session history",
 	}
 }
 
@@ -54,14 +106,9 @@ func contentHeight(h int) int {
 func (s *HistoryScreen) Init() tea.Cmd { return nil }
 
 func (s *HistoryScreen) Resize(width, height int) {
-	s.vp.Width = width
-	s.vp.Height = contentHeight(height)
-	// Re-wrap so long lines fit the new width.
-	// Re-rendering on every resize is acceptable — the user only resizes
-	// occasionally and the alternative (cached + measured) isn't worth it.
-	if s.rendered != "" {
-		s.vp.SetContent(s.rendered)
-	}
+	s.l.SetSize(width, contentHeight(height))
+	// historyItem's per-width cache invalidates implicitly: the next
+	// Render(width) call sees a fresh width and re-runs renderXxxMessage.
 }
 
 func (s *HistoryScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
@@ -74,16 +121,51 @@ func (s *HistoryScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		case tea.KeyEsc, tea.KeyCtrlC:
 			s.done = true
 			return s, nil
+		case tea.KeyUp:
+			s.l.ScrollBy(-1)
+			return s, nil
+		case tea.KeyDown:
+			s.l.ScrollBy(1)
+			return s, nil
+		case tea.KeyPgUp:
+			s.l.ScrollBy(-s.l.Height() / 2)
+			return s, nil
+		case tea.KeyPgDown:
+			s.l.ScrollBy(s.l.Height() / 2)
+			return s, nil
+		case tea.KeyHome:
+			s.l.ScrollToTop()
+			return s, nil
+		case tea.KeyEnd:
+			s.l.ScrollToBottom()
+			return s, nil
 		}
+		// vim-style and 'q' to quit. Single-char route through String()
+		// instead of Type since these are KeyRunes, not named keys.
 		switch m.String() {
 		case "q":
 			s.done = true
 			return s, nil
+		case "k":
+			s.l.ScrollBy(-1)
+		case "j":
+			s.l.ScrollBy(1)
+		case "g":
+			s.l.ScrollToTop()
+		case "G":
+			s.l.ScrollToBottom()
+		}
+	case tea.MouseMsg:
+		// bubbles/viewport.Update used to handle wheel events for us;
+		// list has no Update(tea.Msg) so we route wheel manually.
+		switch m.Button {
+		case tea.MouseButtonWheelUp:
+			s.l.ScrollBy(-1)
+		case tea.MouseButtonWheelDown:
+			s.l.ScrollBy(1)
 		}
 	}
-	var cmd tea.Cmd
-	s.vp, cmd = s.vp.Update(msg)
-	return s, cmd
+	return s, nil
 }
 
 func (s *HistoryScreen) Done() bool { return s.done }
@@ -105,9 +187,9 @@ func (s *HistoryScreen) View() string {
 	var b strings.Builder
 	b.WriteString(histTitleStyle.Render("📜 " + s.Title))
 	b.WriteString("\n")
-	b.WriteString(s.vp.View())
+	b.WriteString(s.l.Render())
 	b.WriteString("\n")
-	b.WriteString(histDim.Render("↑/↓/PgUp/PgDn to scroll · Esc / q to close"))
+	b.WriteString(histDim.Render("↑/↓ k/j PgUp/PgDn Home/End g/G to scroll · Esc / q to close"))
 	return b.String()
 }
 
@@ -119,9 +201,10 @@ func RenderHistoryBody(messages []llm.Message, width int) string {
 	return renderHistory(messages, width)
 }
 
-// renderHistory turns a transcript into the static body text fed to the
-// viewport. Output is line-oriented (no relative positioning) so viewport
-// scrolling stays predictable.
+// renderHistory turns a transcript into a static body string. Used by the
+// non-TUI fallback (RenderHistoryBody) where we don't have a list/screen
+// to drive virtualized render. The HistoryScreen path goes through
+// historyItem.Render directly and skips this function.
 //
 // Format per turn:
 //

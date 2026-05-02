@@ -157,22 +157,40 @@ func (l *List) AtBottom() bool {
 	}
 
 	// Calculate the height from offsetIdx to the end.
+	//
+	// Bug history (metis fix): crush's original implementation
+	// short-circuited with `if totalHeight > l.height { break }`, but
+	// the `totalHeight > height` test ignored offsetLine. After
+	// ScrollToBottom — which sets offsetLine = lastOffsetItem's
+	// lineOffset, possibly several rows worth — the loop would
+	// (correctly) detect that the items from offsetIdx onward sum to
+	// more than height, but (incorrectly) ignore that offsetLine of
+	// those rows are already scrolled out of view. Result: AtBottom
+	// reported false right after ScrollToBottom, breaking auto-scroll.
+	//
+	// Fix: compare `totalHeight - offsetLine` against height, both for
+	// the early-break test and the final return. This matches the
+	// post-loop formula in crush's original code, just applied at
+	// every iteration so we still get the early-exit performance win.
 	var totalHeight int
 	atBottom := true
 	for idx := l.offsetIdx; idx < len(l.items); idx++ {
-		if totalHeight > l.height {
-			// No need to calculate further, we're already past the viewport height
-			atBottom = false
-			break
-		}
 		item := l.getItem(idx)
 		itemHeight := item.height
 		if l.gap > 0 && idx > l.offsetIdx {
 			itemHeight += l.gap
 		}
 		totalHeight += itemHeight
+		if totalHeight-l.offsetLine > l.height {
+			// Items beyond what the viewport can hold — not at bottom.
+			atBottom = false
+			break
+		}
 	}
 	if atBottom {
+		// Loop fell through without ever exceeding the viewport. The
+		// final answer reduces to "did the visible items fit?"; same
+		// formula as the loop check, just stated explicitly.
 		atBottom = totalHeight-l.offsetLine <= l.height
 	}
 

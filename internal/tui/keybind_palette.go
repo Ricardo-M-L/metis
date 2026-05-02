@@ -17,13 +17,19 @@ func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.palFilter = ""
 		m.input.Reset()
 	case tea.KeyUp:
-		if m.palCursor > 0 {
-			m.palCursor--
+		// claude-code parity: ↑ at the top wraps to the bottom (and Tab
+		// already wraps below). Long /help-style lists are dramatically
+		// faster to navigate when wrapping; the previous "stop at edge"
+		// behavior forced the user to scroll all the way back through
+		// 50+ entries to reach a near-bottom command they overshot.
+		if n := len(m.palMatched); n > 0 {
+			m.palCursor = (m.palCursor - 1 + n) % n
 			m.syncBufferToCursor()
 		}
 	case tea.KeyDown:
-		if m.palCursor < len(m.palMatched)-1 {
-			m.palCursor++
+		// ↓ at the bottom wraps to the top — symmetric with KeyUp.
+		if n := len(m.palMatched); n > 0 {
+			m.palCursor = (m.palCursor + 1) % n
 			m.syncBufferToCursor()
 		}
 	case tea.KeyTab:
@@ -120,6 +126,14 @@ func (m *Model) matchCommands() {
 	m.palMatched = nil
 	m.palCursor = 0
 	filter := strings.ToLower(m.palFilter)
+	// Strip args before matching: when the user types "/eff high",
+	// palFilter is "eff high" but the command name to match is "eff"
+	// — anything past the first space is the args payload, not part
+	// of the name. Without this trim the palette goes empty as soon
+	// as the user hits space, breaking auto-promote on submit.
+	if idx := strings.IndexByte(filter, ' '); idx >= 0 {
+		filter = filter[:idx]
+	}
 	if filter == "" {
 		m.palMatched = append(m.palMatched, m.cmds.All()...)
 		return

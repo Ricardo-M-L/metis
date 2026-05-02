@@ -28,13 +28,16 @@ func TestVisualDump(t *testing.T) {
 	// Banner separator
 	dump("\n────────────── METIS UI PREVIEW ──────────────\n")
 
-	// Welcome banner with new ASCII logo
+	// Welcome banner — was an ASCII block logo before commit 345a087
+	// (the `█▀` for S and `█▀▀` for E rendered as Γ/C in some fonts and
+	// the user saw "MCTIS"). Today render_welcome.go uses a stylized
+	// title; we reproduce the same look here for the dump preview
+	// without calling renderWelcomeBanner directly (that needs a full
+	// Model with model/gate/sessionID set up).
 	dump("\n")
-	for _, line := range metisAsciiLogo {
-		dump(lipgloss.NewStyle().Foreground(lipgloss.Color("#64b5f6")).Render(line))
-		dump("\n")
-	}
-	dump(lipgloss.NewStyle().Foreground(lipgloss.Color("#a0a0a0")).Render("  Metis · local-first agent CLI"))
+	dump(lipgloss.NewStyle().Foreground(lipgloss.Color("#64b5f6")).Bold(true).Render("  ✻ metis"))
+	dump("\n")
+	dump(lipgloss.NewStyle().Foreground(lipgloss.Color("#a0a0a0")).Italic(true).Render("  local-first agent CLI · cunning intelligence"))
 	dump("\n\n")
 
 	// User input (was "› ", now "❯ ")

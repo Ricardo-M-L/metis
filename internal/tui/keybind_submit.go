@@ -44,6 +44,31 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		})
 		return m, nil
 	}
+	// claude-code parity: when the palette is open with at least one
+	// match, treat Enter as "select the highlighted candidate then
+	// submit". Without this, typing /effo + Enter dispatches a literal
+	// /effo, which fails as "unknown: /effo — try /help" — even though
+	// the palette below the input is showing /effort highlighted.
+	// Only auto-promote when the typed name is NOT itself a registered
+	// command (so /help typed verbatim still goes to /help, even if the
+	// cursor happened to land on /history).
+	if m.showPalette && len(m.palMatched) > 0 && strings.HasPrefix(text, "/") {
+		typedName, restArgs, hasArgs := cut(text[1:], " ")
+		exactREPL := m.cmds.Get(typedName) != nil
+		_, exactSlash := m.slash.Get(typedName)
+		if !exactREPL && !exactSlash {
+			cursor := m.palCursor
+			if cursor < 0 || cursor >= len(m.palMatched) {
+				cursor = 0
+			}
+			promoted := "/" + m.palMatched[cursor].Name
+			if hasArgs {
+				promoted += " " + restArgs
+			}
+			text = promoted
+		}
+	}
+
 	m.input.Reset()
 	m.showPalette = false
 	m.palFilter = ""
