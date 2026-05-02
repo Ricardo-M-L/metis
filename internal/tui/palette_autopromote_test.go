@@ -133,8 +133,30 @@ func TestPalette_EnterDoesNotPromoteExactMatch(t *testing.T) {
 		}
 		output = strings.ToLower(b.String())
 	}
-	if !strings.Contains(output, "metis commands") && !strings.Contains(output, "/quit") {
+	// Phase C2: /help now opens the tabbed HelpScreen. Look for any
+	// of: tab labels, shortcut headings, or known command names that
+	// would appear in either /help or /history's overlay.
+	helpMarkers := []string{"general", "commands", "shortcuts", "metis commands"}
+	historyMarkers := []string{"session history"}
+	helpMatched := false
+	for _, m := range helpMarkers {
+		if strings.Contains(output, m) {
+			helpMatched = true
+			break
+		}
+	}
+	historyMatched := false
+	for _, m := range historyMarkers {
+		if strings.Contains(output, m) {
+			historyMatched = true
+			break
+		}
+	}
+	if !helpMatched {
 		t.Errorf("exact-match /help should win over palette cursor; got: %+v", messageContents(m))
+	}
+	if historyMatched {
+		t.Errorf("autopromote regression: /history overlay opened instead of /help")
 	}
 }
 

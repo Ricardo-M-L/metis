@@ -146,6 +146,17 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Phase C2: `/help` opens the tabbed widget (general / commands
+		// / custom-commands). Mirrors claude-code's tabbed help modal
+		// (images #7-9 in the user TUI feedback). Pre-empt the REPL
+		// path so cmdHelp's flat list never renders.
+		if name == "help" || name == "h" || name == "?" {
+			h := screen.NewHelpScreen(versionLabel(), m.buildHelpTabs())
+			h.Resize(m.width, m.height)
+			m.activeScreen = h
+			return m, nil
+		}
+
 		if cmd := m.cmds.Get(name); cmd != nil {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
