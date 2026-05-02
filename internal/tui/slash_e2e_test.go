@@ -50,7 +50,7 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		{"/doctor", []string{"Metis Doctor", "config", "git"}, "repl"},
 		{"/vim", []string{"vim mode:"}, "repl"},
 		{"/theme", []string{"theme:"}, "repl"},
-		{"/effort", []string{"Reasoning Effort", "current"}, "repl"},
+		{"/effort", []string{"Speed", "Intelligence", "▲"}, "widget"}, // Phase C1: opens slider widget
 		{"/effort high", []string{"effort: high"}, "repl"},
 		{"/context", []string{"Context Window", "in last call", "tokens"}, "repl"},
 		{"/export", []string{"exported", "messages to"}, "repl"},

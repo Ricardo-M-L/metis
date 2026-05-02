@@ -48,6 +48,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.activeScreen, cmd = m.activeScreen.Update(msg)
 		if m.activeScreen.Done() {
+			// Phase C widgets that "report a result" on dismissal
+			// are caught here. Type-assert + apply before clearing
+			// the activeScreen reference. Each new widget that needs
+			// to commit user-chosen state adds a case here.
+			m.applyScreenResult(m.activeScreen)
 			m.activeScreen = nil
 		}
 		return m, cmd

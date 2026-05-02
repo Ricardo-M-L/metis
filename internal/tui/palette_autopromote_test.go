@@ -47,18 +47,24 @@ func TestPalette_EnterAutopromotesIncompleteSlash(t *testing.T) {
 			t.Fatalf("autopromote regression: got unknown error: %q", msg.Content)
 		}
 	}
-	// Look for evidence that /effort actually ran. The /effort handler
-	// renders something containing the word "effort" or "Reasoning".
-	found := false
-	for _, msg := range m.messages {
-		if strings.Contains(strings.ToLower(msg.Content), "effort") ||
-			strings.Contains(msg.Content, "Reasoning") {
-			found = true
-			break
+	// Phase C1: /effort (bare) opens the slider widget (EffortScreen)
+	// instead of inlining a "Reasoning Effort" box. Look in either
+	// place — widget view or message log — for evidence the right
+	// command ran.
+	var output string
+	if m.activeScreen != nil {
+		output = m.activeScreen.View()
+	} else {
+		var b strings.Builder
+		for _, msg := range m.messages {
+			b.WriteString(msg.Content + "\n")
 		}
+		output = b.String()
 	}
-	if !found {
-		t.Errorf("expected /effort handler output in message log; got: %+v", messageContents(m))
+	if !strings.Contains(output, "Speed") && !strings.Contains(output, "Intelligence") &&
+		!strings.Contains(strings.ToLower(output), "effort") &&
+		!strings.Contains(output, "Reasoning") {
+		t.Errorf("expected /effort widget or output in message log; got: %+v", messageContents(m))
 	}
 }
 

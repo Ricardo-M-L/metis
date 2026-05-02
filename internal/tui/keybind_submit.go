@@ -134,6 +134,18 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	if strings.HasPrefix(text, "/") {
 		cmdText := text[1:]
 		name, args, _ := cut(cmdText, " ")
+
+		// Phase C1: bare `/effort` opens the slider widget BEFORE the
+		// REPL command lookup runs cmdEffort (which would inline a
+		// renderInfoBox). Explicit `/effort high` falls through to the
+		// REPL path so scripted usage stays the same.
+		if name == "effort" && strings.TrimSpace(args) == "" {
+			eff := screen.NewEffortScreen(string(m.loop.Effort))
+			eff.Resize(m.width, m.height)
+			m.activeScreen = eff
+			return m, nil
+		}
+
 		if cmd := m.cmds.Get(name); cmd != nil {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
@@ -313,9 +325,18 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// not browseable. Phase C4 will replace with a cycle widget.
 			m.messages = append(m.messages, Message{Role: "info", Content: renderTheme(args), Timestamp: time.Now()})
 		case slash.SignalEffort:
-			// /effort stays inline for now — Phase C1 will replace with
-			// the slider widget.
-			m.messages = append(m.messages, Message{Role: "info", Content: renderEffort(args), Timestamp: time.Now()})
+			// Phase C1: bare `/effort` opens the interactive slider
+			// widget (claude-code parity, see image #6 in user's TUI
+			// feedback). Explicit form `/effort high` stays inline so
+			// scripted / palette-autocomplete usage still works without
+			// hijacking the screen.
+			if strings.TrimSpace(args) == "" {
+				eff := screen.NewEffortScreen(string(m.loop.Effort))
+				eff.Resize(m.width, m.height)
+				m.activeScreen = eff
+			} else {
+				m.messages = append(m.messages, Message{Role: "info", Content: renderEffort(args), Timestamp: time.Now()})
+			}
 		case slash.SignalPRComments:
 			m.openBodyScreen("/pr_comments", renderPRComments(args))
 		case slash.SignalUpgrade:
