@@ -79,18 +79,29 @@ func renderInfoBox(title string, rows []infoRow) string {
 func renderCost(m *Model) string {
 	in := m.totalTokens.Input()
 	out := m.totalTokens.Output()
+	cc := m.totalTokens.CacheCreate()
+	cr := m.totalTokens.CacheRead()
 	total := in + out
 	// Heuristic per-1M token prices (USD). Roughly today's anthropic/oai
 	// public list pricing — close enough for an in-chat estimate. Real
 	// billing happens on the provider side regardless.
 	priceIn, priceOut := guessPriceUSDPerM(m.model)
 	costUSD := float64(in)*priceIn/1_000_000 + float64(out)*priceOut/1_000_000
-	return renderInfoBox("Session Cost · "+m.model, []infoRow{
+	rows := []infoRow{
 		{Key: "input tokens", Value: fmtThousands(in)},
 		{Key: "output tokens", Value: fmtThousands(out)},
 		{Key: "total tokens", Value: fmtThousands(total)},
-		{Key: "est. cost", Value: fmt.Sprintf("$%.4f", costUSD), Hint: "real billing on provider"},
-	})
+	}
+	// Only surface cache rows when cache was actually used — keeps
+	// /cost lean for non-Anthropic providers and short sessions.
+	if cc > 0 || cr > 0 {
+		rows = append(rows,
+			infoRow{Key: "cache_create", Value: fmtThousands(cc), Hint: "tokens written to prompt cache"},
+			infoRow{Key: "cache_read", Value: fmtThousands(cr), Hint: "tokens served from prompt cache"},
+		)
+	}
+	rows = append(rows, infoRow{Key: "est. cost", Value: fmt.Sprintf("$%.4f", costUSD), Hint: "real billing on provider"})
+	return renderInfoBox("Session Cost · "+m.model, rows)
 }
 
 func guessPriceUSDPerM(model string) (in, out float64) {

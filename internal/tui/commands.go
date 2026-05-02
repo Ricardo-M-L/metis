@@ -136,6 +136,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Info ===
 	r.Register(REPLCommand{Name: "version", Aliases: []string{"v", "--version"}, Description: "show version", Handler: cmdVersion})
 	r.Register(REPLCommand{Name: "cost", Description: "show token usage for current session", Handler: cmdCost})
+	r.Register(REPLCommand{Name: "tokens", Description: "show last API call's raw token breakdown (input/output/cache)", Handler: cmdTokens})
 	r.Register(REPLCommand{Name: "usage", Description: "show API rate limit info", Handler: cmdUsage})
 	r.Register(REPLCommand{Name: "debug", Description: "show debug info (session, model, messages, compact)", Handler: cmdDebug})
 
@@ -1039,6 +1040,34 @@ func cmdUsage(r *REPL, args string) string {
 	return "(rate limit info: depends on your API provider — check your provider dashboard)"
 }
 
+// cmdTokens surfaces the most recent API call's raw token breakdown +
+// the session cumulative breakdown. The user reported the bottom-right
+// percentage looking inflated and asked "is this counting wrong?";
+// this command lets them see EXACTLY what the provider returned for
+// each field, so they can disambiguate "metis math bug" from "provider
+// reported it that way" from "long history naturally inflates input".
+//
+// Layout matches /cost so the two read consistently.
+func cmdTokens(r *REPL, args string) string {
+	t := &r.totalTokens
+	rows := []infoRow{
+		{Key: "── most recent API call ──", Value: ""},
+		{Key: "input_tokens", Value: fmtThousands(t.LastIn()), Hint: "fresh tokens this round"},
+		{Key: "output_tokens", Value: fmtThousands(t.LastOut()), Hint: "tokens the model produced"},
+		{Key: "cache_creation", Value: fmtThousands(t.LastCacheCreate()), Hint: "tokens written to prompt cache"},
+		{Key: "cache_read", Value: fmtThousands(t.LastCacheRead()), Hint: "tokens served from prompt cache"},
+		{Key: "── derived ──", Value: ""},
+		{Key: "per-turn cost", Value: fmtThousands(t.LastTotal()), Hint: "input + output (spinner row)"},
+		{Key: "context load", Value: fmtThousands(t.ContextUsage()), Hint: "input + cache_create + cache_read (bottom-right)"},
+		{Key: "── session cumulative ──", Value: ""},
+		{Key: "input total", Value: fmtThousands(t.Input())},
+		{Key: "output total", Value: fmtThousands(t.Output())},
+		{Key: "cache_create total", Value: fmtThousands(t.CacheCreate())},
+		{Key: "cache_read total", Value: fmtThousands(t.CacheRead())},
+	}
+	return renderInfoBox("Token Breakdown", rows)
+}
+
 func cmdDebug(r *REPL, args string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("  session:  %s\n", r.SessionID))
@@ -1192,10 +1221,11 @@ func sanitize(name string) string {
 //
 // `dispIn/dispOut` are smoothed values for animation.
 type tokenTracker struct {
-	in, out                                          int // session cumulative
-	lastIn, lastOut                                  int // most recent API call (per-turn cost)
-	lastCacheCreate, lastCacheRead                   int // most recent API call (cache portion of input)
-	dispIn, dispOut                                  int
+	in, out                            int // session cumulative input/output
+	cacheCreate, cacheRead             int // session cumulative cache (for /cost transparency)
+	lastIn, lastOut                    int // most recent API call (per-turn cost)
+	lastCacheCreate, lastCacheRead     int // most recent API call (cache portion of input)
+	dispIn, dispOut                    int
 }
 
 // add records a per-iteration usage report. `in`/`out` accumulate
@@ -1206,17 +1236,29 @@ type tokenTracker struct {
 func (t *tokenTracker) add(in, out, cacheCreate, cacheRead int) {
 	t.in += in
 	t.out += out
+	t.cacheCreate += cacheCreate
+	t.cacheRead += cacheRead
 	t.lastIn = in
 	t.lastOut = out
 	t.lastCacheCreate = cacheCreate
 	t.lastCacheRead = cacheRead
 }
 
-// LastIn / LastOut expose the most recent API call's billable usage.
-// Used by /cost-style displays that want to call out the most recent
-// round-trip's spend.
-func (t *tokenTracker) LastIn() int  { return t.lastIn }
-func (t *tokenTracker) LastOut() int { return t.lastOut }
+// LastIn / LastOut / LastCacheCreate / LastCacheRead expose the most
+// recent API call's raw usage breakdown. /tokens uses these to surface
+// the exact provider numbers so a confused user can see whether the
+// bottom-right counter's percentage is genuine context-window load or
+// a parsing bug.
+func (t *tokenTracker) LastIn() int          { return t.lastIn }
+func (t *tokenTracker) LastOut() int         { return t.lastOut }
+func (t *tokenTracker) LastCacheCreate() int { return t.lastCacheCreate }
+func (t *tokenTracker) LastCacheRead() int   { return t.lastCacheRead }
+
+// CacheCreate / CacheRead expose the session-cumulative cache totals
+// (parallel to Input() / Output() for non-cache fields). /cost uses
+// these to call out how much of the spend was prompt-cache vs fresh.
+func (t *tokenTracker) CacheCreate() int { return t.cacheCreate }
+func (t *tokenTracker) CacheRead() int   { return t.cacheRead }
 
 // LastTotal is the most recent API call's input+output combined — the
 // per-turn cost. Spinner row uses this to surface what the just-finished
@@ -1239,6 +1281,8 @@ func (t *tokenTracker) ContextUsage() int {
 func (t *tokenTracker) Reset() {
 	t.in = 0
 	t.out = 0
+	t.cacheCreate = 0
+	t.cacheRead = 0
 	t.lastIn = 0
 	t.lastOut = 0
 	t.lastCacheCreate = 0
