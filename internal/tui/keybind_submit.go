@@ -15,6 +15,45 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
+// openBodyScreen wraps screen.NewBodyScreen with a Resize so tests
+// (which never receive a real tea.WindowSizeMsg) and the cold-open
+// path both render with the right dimensions on the first frame. Real
+// runs get a fresh Resize on the next WindowSizeMsg anyway, so this
+// is purely a "don't render at width=0,height=0 the first frame" guard.
+func (m *Model) openBodyScreen(command, body string) {
+	s := screen.NewBodyScreen(command, body)
+	s.Resize(m.width, m.height)
+	m.activeScreen = s
+}
+
+// modalCommands is the set of REPLCommand names whose output should
+// open as a full-window modal overlay (BodyScreen) rather than appending
+// inline into the chat scroll. Information-dense commands benefit from
+// the dedicated screen (scroll, Esc to dismiss); short-status commands
+// like /title or /save still append inline. Mirrors claude-code's
+// pattern of "modal for browseable content, inline for confirmations".
+var modalCommands = map[string]bool{
+	"help":        true,
+	"cost":        true,
+	"tokens":      true,
+	"doctor":      true,
+	"context":     true,
+	"stats":       true,
+	"keybindings": true,
+	"permissions": true,
+	"hooks":       true,
+	"tools":       true,
+	"toolsets":    true,
+	"skills":      true,
+	"version":     true,
+	"env":         true,
+	"agents":      true,
+	"files":       true,
+	"memory":      true,
+	"mcp":         true,
+	"sessions":    true,
+}
+
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
@@ -108,7 +147,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 			output := cmd.Handler(m.asREPL(), args)
 			if output != "" {
-				m.messages = append(m.messages, Message{Role: "info", Content: output, Timestamp: time.Now()})
+				if modalCommands[cmd.Name] {
+					// Information-dense commands open as a full-window
+					// modal overlay (claude-code parity) instead of
+					// inlining into the chat scroll. Esc/q to dismiss.
+					m.openBodyScreen("/"+cmd.Name, output)
+				} else {
+					m.messages = append(m.messages, Message{Role: "info", Content: output, Timestamp: time.Now()})
+				}
 			}
 			return m, nil
 		}
@@ -184,20 +230,20 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(session synced to disk)", Timestamp: time.Now()})
 			}
 		case slash.SignalTools:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderToolsList(m.loop), Timestamp: time.Now()})
+			m.openBodyScreen("/tools", renderToolsList(m.loop))
 		case slash.SignalSessions:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderSessionsList(m.session, 20), Timestamp: time.Now()})
+			m.openBodyScreen("/sessions", renderSessionsList(m.session, 20))
 		case slash.SignalSession:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())), Timestamp: time.Now()})
+			m.openBodyScreen("/session", renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())))
 		case slash.SignalStatus:
 			// Reuse renderCurrentSession — same data the user wants from
 			// /status. Was previously falling through to default which
 			// only showed the placeholder "(status: see REPL)".
-			m.messages = append(m.messages, Message{Role: "info", Content: renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())), Timestamp: time.Now()})
+			m.openBodyScreen("/status", renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())))
 		case slash.SignalSkills:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderSkillsList(m.skillDir), Timestamp: time.Now()})
+			m.openBodyScreen("/skills", renderSkillsList(m.skillDir))
 		case slash.SignalVersion:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderVersion(), Timestamp: time.Now()})
+			m.openBodyScreen("/version", renderVersion())
 		case slash.SignalAddDir:
 			if m.ext.DirAdd == nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "(/add-dir not wired in this build)", Timestamp: time.Now()})
@@ -233,19 +279,19 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				}
 			}
 		case slash.SignalCost:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderCost(m), Timestamp: time.Now()})
+			m.openBodyScreen("/cost", renderCost(m))
 		case slash.SignalDiff:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderDiff(), Timestamp: time.Now()})
+			m.openBodyScreen("/diff", renderDiff())
 		case slash.SignalDoctor:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderDoctor(m), Timestamp: time.Now()})
+			m.openBodyScreen("/doctor", renderDoctor(m))
 		case slash.SignalStats:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderStats(m), Timestamp: time.Now()})
+			m.openBodyScreen("/stats", renderStats(m))
 		case slash.SignalKeybindings:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderKeybindings(), Timestamp: time.Now()})
+			m.openBodyScreen("/keybindings", renderKeybindings())
 		case slash.SignalPermissions:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderPermissions(m), Timestamp: time.Now()})
+			m.openBodyScreen("/permissions", renderPermissions(m))
 		case slash.SignalHooks:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderHooksList(m.cfg), Timestamp: time.Now()})
+			m.openBodyScreen("/hooks", renderHooksList(m.cfg))
 		case slash.SignalVim:
 			toggleVimMode()
 			m.messages = append(m.messages, Message{Role: "info", Content: vimModeStatus(), Timestamp: time.Now()})
@@ -261,19 +307,23 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				}
 			}
 		case slash.SignalReleaseNotes:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderReleaseNotes(), Timestamp: time.Now()})
+			m.openBodyScreen("/release-notes", renderReleaseNotes())
 		case slash.SignalTheme:
+			// /theme stays inline for now — short toggle confirmation,
+			// not browseable. Phase C4 will replace with a cycle widget.
 			m.messages = append(m.messages, Message{Role: "info", Content: renderTheme(args), Timestamp: time.Now()})
 		case slash.SignalEffort:
+			// /effort stays inline for now — Phase C1 will replace with
+			// the slider widget.
 			m.messages = append(m.messages, Message{Role: "info", Content: renderEffort(args), Timestamp: time.Now()})
 		case slash.SignalPRComments:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderPRComments(args), Timestamp: time.Now()})
+			m.openBodyScreen("/pr_comments", renderPRComments(args))
 		case slash.SignalUpgrade:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderUpgrade(), Timestamp: time.Now()})
+			m.openBodyScreen("/upgrade", renderUpgrade())
 		case slash.SignalContext:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderContext(m), Timestamp: time.Now()})
+			m.openBodyScreen("/context", renderContext(m))
 		case slash.SignalResume:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderResumeHelp(m), Timestamp: time.Now()})
+			m.openBodyScreen("/resume", renderResumeHelp(m))
 		case slash.SignalTag:
 			if m.session == nil || m.sessionID == "" {
 				m.messages = append(m.messages, Message{Role: "error", Content: "(tag: no session store)", Timestamp: time.Now()})

@@ -76,13 +76,22 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 			m.input.SetValue(tc.input)
 			pressEnter(t, m)
 
-			if len(m.messages) <= before {
-				t.Fatalf("submitting %q did not append any message (owner=%s)", tc.input, tc.owner)
+			// Phase A migration: many of these commands now open a
+			// BodyScreen modal overlay instead of inlining into the
+			// chat. Look in either place for the expected substring
+			// so this test stays valid across the migration.
+			var output string
+			switch {
+			case m.activeScreen != nil:
+				output = m.activeScreen.View()
+			case len(m.messages) > before:
+				output = m.messages[len(m.messages)-1].Content
+			default:
+				t.Fatalf("submitting %q produced neither a screen overlay nor a chat message (owner=%s)", tc.input, tc.owner)
 			}
-			last := m.messages[len(m.messages)-1].Content
 			for _, sub := range tc.wantSubs {
-				if !strings.Contains(last, sub) {
-					t.Errorf("output for %q missing %q\n----full output----\n%s\n----", tc.input, sub, last)
+				if !strings.Contains(output, sub) {
+					t.Errorf("output for %q missing %q\n----full output----\n%s\n----", tc.input, sub, output)
 				}
 			}
 		})

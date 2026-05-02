@@ -114,17 +114,20 @@ func TestPalette_EnterDoesNotPromoteExactMatch(t *testing.T) {
 	}
 	pressEnter(t, m)
 
-	// Output should clearly belong to /help, not /history. /help
-	// renders the giant command listing; /history opens an overlay.
-	helpFound := false
-	for _, msg := range m.messages {
-		c := strings.ToLower(msg.Content)
-		if strings.Contains(c, "metis commands") || strings.Contains(c, "/quit") {
-			helpFound = true
-			break
+	// Phase A migration: /help now opens a BodyScreen modal overlay
+	// instead of inlining the giant command listing. Look there first;
+	// fall back to messages for any future regression.
+	var output string
+	if m.activeScreen != nil {
+		output = strings.ToLower(m.activeScreen.View())
+	} else {
+		var b strings.Builder
+		for _, msg := range m.messages {
+			b.WriteString(msg.Content + "\n")
 		}
+		output = strings.ToLower(b.String())
 	}
-	if !helpFound {
+	if !strings.Contains(output, "metis commands") && !strings.Contains(output, "/quit") {
 		t.Errorf("exact-match /help should win over palette cursor; got: %+v", messageContents(m))
 	}
 }
