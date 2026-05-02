@@ -275,18 +275,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// While a turn is in flight the input is read-only — only allow
-	// navigation/selection so the user can still copy from the
-	// previously typed line.
-	if m.turnActive {
-		switch msg.Type {
-		case tea.KeyLeft, tea.KeyRight, tea.KeyHome, tea.KeyEnd:
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			return m, cmd
-		}
-		return m, nil
-	}
+	// While a turn is in flight, let the user keep typing the next prompt
+	// — claude-code parity. Submit (Enter) is still blocked by
+	// handleSubmit's `if m.turnActive` guard which surfaces a
+	// "(turn still running ...)" hint instead of double-spawning a turn.
+	// The previous "drop every key except ←→Home/End" behavior was
+	// user-hostile: a 2-minute generation locked the keyboard so the
+	// user couldn't queue follow-up prompts or even fix typos in the
+	// current input.
 
 	// All other keys go to bubbles/textinput.
 	var cmd tea.Cmd
