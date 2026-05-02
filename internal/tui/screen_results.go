@@ -48,5 +48,18 @@ func (m *Model) applyScreenResult(s screen.Screen) {
 			Content:   "effort: " + applied,
 			Timestamp: time.Now(),
 		})
+
+	case *screen.ModelScreen:
+		applied := w.Applied()
+		if applied == "" {
+			return // user cancelled
+		}
+		m.model = applied
+		m.loop.Model = applied
+		m.messages = append(m.messages, Message{
+			Role:      "success",
+			Content:   "model: " + applied,
+			Timestamp: time.Now(),
+		})
 	}
 }

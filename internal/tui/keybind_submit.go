@@ -157,6 +157,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Phase C3: bare `/model` (alias `/m`) opens the picker widget.
+		// Explicit `/model claude-opus-4-7` falls through to cmdModel
+		// for scripted usage / palette autocomplete.
+		if (name == "model" || name == "m") && strings.TrimSpace(args) == "" {
+			mp := screen.NewModelScreen(m.model, builtinModelChoices)
+			mp.Resize(m.width, m.height)
+			m.activeScreen = mp
+			return m, nil
+		}
+
 		if cmd := m.cmds.Get(name); cmd != nil {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
