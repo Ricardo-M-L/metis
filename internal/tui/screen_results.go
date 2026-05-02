@@ -61,5 +61,18 @@ func (m *Model) applyScreenResult(s screen.Screen) {
 			Content:   "model: " + applied,
 			Timestamp: time.Now(),
 		})
+
+	case *screen.ThemeScreen:
+		applied := w.Applied()
+		if applied == "" {
+			return // user cancelled
+		}
+		if name := SwitchTheme(applied); name != "" {
+			m.messages = append(m.messages, Message{
+				Role:      "success",
+				Content:   "theme: " + name,
+				Timestamp: time.Now(),
+			})
+		}
 	}
 }

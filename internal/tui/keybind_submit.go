@@ -167,6 +167,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Phase C4: bare `/theme` opens the cycle widget with live
+		// swatches. Explicit `/theme dark` falls through to cmdTheme
+		// for direct selection.
+		if name == "theme" && strings.TrimSpace(args) == "" {
+			tp := screen.NewThemeScreen(currentTheme.Name, buildThemeChoices())
+			tp.Resize(m.width, m.height)
+			m.activeScreen = tp
+			return m, nil
+		}
+
 		if cmd := m.cmds.Get(name); cmd != nil {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit

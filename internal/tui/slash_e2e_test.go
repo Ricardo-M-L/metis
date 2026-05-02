@@ -49,7 +49,7 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		{"/usage", []string{"rate limit"}, "repl"},
 		{"/doctor", []string{"Metis Doctor", "config", "git"}, "repl"},
 		{"/vim", []string{"vim mode:"}, "repl"},
-		{"/theme", []string{"theme:"}, "repl"},
+		{"/theme", []string{"Theme", "◀", "▶"}, "widget"}, // Phase C4: opens cycle widget
 		{"/effort", []string{"Speed", "Intelligence", "▲"}, "widget"}, // Phase C1: opens slider widget
 		{"/effort high", []string{"effort: high"}, "repl"},
 		{"/context", []string{"Context Window", "in last call", "tokens"}, "repl"},
