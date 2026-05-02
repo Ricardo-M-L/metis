@@ -58,8 +58,8 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		// Slash-owned (added in 2026-05-01 audit) --------------------------
 		{"/keybindings", []string{"Keybindings", "Ctrl-C", "Esc"}, "slash"},
 		{"/keys", []string{"Ctrl-C"}, "slash"}, // alias
-		{"/permissions", []string{"permission mode"}, "slash"},
-		{"/perms", []string{"permission mode"}, "slash"}, // alias
+		{"/permissions", []string{"Mode", "Rules", "◀", "▶"}, "widget"},     // Phase C5: opens editor
+		{"/perms", []string{"Mode", "Rules", "◀", "▶"}, "widget"},          // Phase C5: same widget
 		{"/hooks", []string{"hooks"}, "slash"},
 		{"/stats", []string{"Session Stats", "user turns", "tool calls"}, "slash"},
 		{"/release-notes", []string{"metis"}, "slash"},

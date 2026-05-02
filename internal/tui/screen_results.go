@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -74,5 +75,20 @@ func (m *Model) applyScreenResult(s screen.Screen) {
 				Timestamp: time.Now(),
 			})
 		}
+
+	case *screen.PermissionsScreen:
+		applied := w.Applied()
+		if applied == "" {
+			return // user cancelled
+		}
+		if applied == string(m.gate.Mode()) {
+			return // no change
+		}
+		m.gate.SetMode(permission.Mode(applied))
+		m.messages = append(m.messages, Message{
+			Role:      "success",
+			Content:   "permission mode: " + applied,
+			Timestamp: time.Now(),
+		})
 	}
 }

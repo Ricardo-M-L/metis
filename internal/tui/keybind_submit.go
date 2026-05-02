@@ -177,6 +177,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Phase C5: `/permissions` (alias `/perms`) opens the
+		// interactive editor — mode cycle + read-only rules list.
+		if name == "permissions" || name == "perms" {
+			ps := screen.NewPermissionsScreen(string(m.gate.Mode()), m.permRulesSnapshot())
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
+			return m, nil
+		}
+
 		if cmd := m.cmds.Get(name); cmd != nil {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
@@ -332,7 +341,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalKeybindings:
 			m.openBodyScreen("/keybindings", renderKeybindings())
 		case slash.SignalPermissions:
-			m.openBodyScreen("/permissions", renderPermissions(m))
+			// Phase C5: interactive PermissionsScreen with mode cycle.
+			ps := screen.NewPermissionsScreen(string(m.gate.Mode()), m.permRulesSnapshot())
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
 		case slash.SignalHooks:
 			m.openBodyScreen("/hooks", renderHooksList(m.cfg))
 		case slash.SignalVim:
