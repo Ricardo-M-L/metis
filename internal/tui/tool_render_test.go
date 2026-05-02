@@ -117,6 +117,31 @@ func TestCountEditDiff(t *testing.T) {
 	}
 }
 
+// TestFormatElapsed covers the spinner-row elapsed clock. Sub-second
+// renders as ms, single-digit seconds as `X.Ys`, two-digit seconds as
+// `Xs`, then the same Mm Ss / Hh Mm brackets that formatTurnDuration
+// uses. The user reported the spinner reading e.g. `120s` instead of
+// `2m 0s` for long turns — this regression-tests the M/H switchover.
+func TestFormatElapsed(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{500 * time.Millisecond, "500ms"},
+		{3 * time.Second, "3.0s"},
+		{45 * time.Second, "45s"},
+		{90 * time.Second, "1m 30s"},
+		{120 * time.Second, "2m 0s"},
+		{55 * time.Minute, "55m 0s"},
+		{2*time.Hour + 15*time.Minute, "2h 15m"},
+	}
+	for _, c := range cases {
+		if got := formatElapsed(c.d); got != c.want {
+			t.Errorf("formatElapsed(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
 // TestFormatTurnDuration covers the three brackets in the turn-end
 // summary phrasing: under a minute, under an hour, longer.
 func TestFormatTurnDuration(t *testing.T) {

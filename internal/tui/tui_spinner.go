@@ -280,13 +280,19 @@ func shimmerStyle(elapsed time.Duration) lipgloss.Style {
 
 // formatElapsed prints a wall-clock-friendly duration that ticks visibly
 // even sub-second. "0s" looks frozen; "120ms"/"0.5s"/"3s" looks alive.
+// Past one minute the spinner switches to claude-code's "Mm Ss" form so
+// long-running turns don't read as a runaway 3-digit second count.
 func formatElapsed(d time.Duration) string {
 	switch {
 	case d < time.Second:
 		return fmt.Sprintf("%dms", d.Milliseconds())
 	case d < 10*time.Second:
 		return fmt.Sprintf("%.1fs", d.Seconds())
-	default:
+	case d < time.Minute:
 		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm %ds", int(d.Minutes()), int(d.Seconds())%60)
+	default:
+		return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 }

@@ -54,7 +54,7 @@ func TestAnimateOne_NeverGoesBackwards(t *testing.T) {
 
 func TestTokenTracker_SnapAlignsDisplayed(t *testing.T) {
 	tt := tokenTracker{}
-	tt.add(150, 30)
+	tt.add(150, 30, 0, 0)
 	tt.Animate() // partial
 	if tt.Total() == 180 {
 		// In some boundary edges the partial step may already equal
@@ -71,7 +71,7 @@ func TestTokenTracker_SnapAlignsDisplayed(t *testing.T) {
 func TestTokenTracker_AnimateConverges(t *testing.T) {
 	// After enough ticks, displayed must reach actual.
 	tt := tokenTracker{}
-	tt.add(1000, 0)
+	tt.add(1000, 0, 0, 0)
 	for i := 0; i < 200 && tt.Total() < 1000; i++ {
 		tt.Animate()
 	}
@@ -87,17 +87,17 @@ func TestTokenTracker_AnimateConverges(t *testing.T) {
 // real API bill, not the current history size.
 func TestTokenTracker_AccumulatesAcrossIterations(t *testing.T) {
 	tt := tokenTracker{}
-	tt.add(1000, 50)
+	tt.add(1000, 50, 0, 0)
 	tt.Snap()
 	if tt.Total() != 1050 {
 		t.Fatalf("first iter total = %d, want 1050", tt.Total())
 	}
-	tt.add(1000, 30)
+	tt.add(1000, 30, 0, 0)
 	tt.Snap()
 	if tt.Total() != 2080 {
 		t.Fatalf("after 2nd iter total = %d, want 2080 (sum on both axes)", tt.Total())
 	}
-	tt.add(1500, 20)
+	tt.add(1500, 20, 0, 0)
 	tt.Snap()
 	if tt.Total() != 3600 {
 		t.Errorf("after 3rd iter total = %d, want 3600 (in=3500, out=100)", tt.Total())
@@ -109,7 +109,7 @@ func TestTokenTracker_AccumulatesAcrossIterations(t *testing.T) {
 // from the discarded history.
 func TestTokenTracker_ResetClearsAll(t *testing.T) {
 	tt := tokenTracker{}
-	tt.add(2000, 500)
+	tt.add(2000, 500, 0, 0)
 	tt.Snap()
 	if tt.Total() == 0 {
 		t.Fatal("precondition: tracker should have non-zero total before Reset")

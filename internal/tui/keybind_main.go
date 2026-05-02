@@ -238,24 +238,24 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPgUp:
-		m.viewport.ScrollUp(m.viewport.Height / 2)
+		m.chatList.ScrollBy(-m.chatList.Height() / 2)
 		return m, nil
 
 	case tea.KeyPgDown:
-		m.viewport.ScrollDown(m.viewport.Height / 2)
+		m.chatList.ScrollBy(m.chatList.Height() / 2)
 		return m, nil
 
 	case tea.KeyHome:
 		// Ctrl+Home / Home — jump to top of transcript. Bubble's
 		// textarea also binds Home but only when the input has content;
-		// when empty (the common scroll-back case) we route to viewport.
+		// when empty (the common scroll-back case) we route to chatList.
 		if strings.TrimSpace(m.input.Value()) == "" {
-			m.viewport.GotoTop()
+			m.chatList.ScrollToTop()
 			return m, nil
 		}
 	case tea.KeyEnd:
 		if strings.TrimSpace(m.input.Value()) == "" {
-			m.viewport.GotoBottom()
+			m.chatList.ScrollToBottom()
 			return m, nil
 		}
 	}

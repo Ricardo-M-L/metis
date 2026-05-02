@@ -22,6 +22,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
 type REPL struct {
@@ -205,6 +206,11 @@ func (r *REPL) Run(ctx context.Context) error {
 				fmt.Fprintln(r.out, renderSkillsList(r.skillDir))
 			case slash.SignalVersion:
 				fmt.Fprintln(r.out, renderVersion())
+			case slash.SignalKeybindings:
+				// Bubbletea TUI also handles this signal
+				// (internal/tui/keybind_submit.go); the readline REPL
+				// was missing the case so /keybindings looked silent.
+				fmt.Fprintln(r.out, renderKeybindings())
 			}
 			continue
 		}
@@ -326,7 +332,10 @@ func (r *REPL) printBanner() {
 	padding := strings.Repeat(" ", max(0, half))
 
 	fmt.Fprint(r.out, infoStyle.Render(padding))
-	fmt.Fprint(r.out, infoStyle.Render("v0.1.0-dev"), infoStyle.Render("  ·  "))
+	// Banner version mirrors `metis version` — same source so the two never
+	// drift. version.Version is build-time injected via -ldflags by the
+	// Makefile (falls back to the committed VERSION file).
+	fmt.Fprint(r.out, infoStyle.Render("v"+version.Version), infoStyle.Render("  ·  "))
 	fmt.Fprint(r.out, hintStyle.Render("model: "), statusStyle.Render(r.model))
 	fmt.Fprint(r.out, infoStyle.Render("  ·  "))
 	fmt.Fprint(r.out, hintStyle.Render("mode: "), statusStyle.Render(string(r.Gate.Mode())))
@@ -465,7 +474,7 @@ func (r *REPL) runTurn(ctx context.Context) error {
 			r.flushTextBeforeTool(turnStartedText)
 			turnStartedText = false
 		case agent.EventTokens:
-			r.totalTokens.add(ev.InputTokens, ev.OutputTokens)
+			r.totalTokens.add(ev.InputTokens, ev.OutputTokens, ev.CacheCreationInputTokens, ev.CacheReadInputTokens)
 			if r.ShowTokens {
 				fmt.Fprintln(r.out, r.Styles.Tokens.Render(
 					fmt.Sprintf("    [tokens in=%d out=%d]", ev.InputTokens, ev.OutputTokens),

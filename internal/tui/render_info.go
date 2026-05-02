@@ -15,10 +15,66 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
+
+// infoRow is one line in an info-box. Empty Key = full-width free text,
+// otherwise rendered as `key: value` with keys right-padded so the
+// values left-align in a column.
+type infoRow struct {
+	Key   string
+	Value string
+	// Hint is an optional muted suffix appended after Value with " · "
+	// — used for inline help like `/effort high · deep, slower`.
+	Hint string
+}
+
+// renderInfoBox draws a rounded box with a colored title bar above a
+// key/value table. Used by the P0 status commands (/effort, /context,
+// /cost, /model, /memory, /version, /status) so they all read with the
+// same shape — claude-code's slash commands have this consistency too.
+//
+// Width is auto-derived from the longest key+value pair; caller doesn't
+// need to count columns. Empty `Key` rows get rendered as a single
+// muted line (good for footnotes / commands hint).
+func renderInfoBox(title string, rows []infoRow) string {
+	keyW := 0
+	for _, r := range rows {
+		if w := lipgloss.Width(r.Key); w > keyW {
+			keyW = w
+		}
+	}
+	var body strings.Builder
+	for i, r := range rows {
+		if i > 0 {
+			body.WriteString("\n")
+		}
+		switch {
+		case r.Key == "" && r.Value == "":
+			// blank spacer — keep the row but render as nothing
+		case r.Key == "":
+			body.WriteString(styleMuted.Render(r.Value))
+		default:
+			pad := keyW - lipgloss.Width(r.Key)
+			body.WriteString(styleMuted.Render(r.Key+":") + strings.Repeat(" ", pad+1))
+			body.WriteString(styleText.Render(r.Value))
+			if r.Hint != "" {
+				body.WriteString(styleMuted.Render("  · " + r.Hint))
+			}
+		}
+	}
+	titleLine := styleAccent.Bold(true).Render(title)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#8be9fd")).
+		Padding(0, 1).
+		Render(titleLine + "\n" + body.String())
+	return box
+}
 
 func renderCost(m *Model) string {
 	in := m.totalTokens.Input()
@@ -29,13 +85,12 @@ func renderCost(m *Model) string {
 	// billing happens on the provider side regardless.
 	priceIn, priceOut := guessPriceUSDPerM(m.model)
 	costUSD := float64(in)*priceIn/1_000_000 + float64(out)*priceOut/1_000_000
-	var b strings.Builder
-	fmt.Fprintf(&b, "session cost (model: %s)\n", m.model)
-	fmt.Fprintf(&b, "  input  tokens: %s\n", fmtThousands(in))
-	fmt.Fprintf(&b, "  output tokens: %s\n", fmtThousands(out))
-	fmt.Fprintf(&b, "  total  tokens: %s\n", fmtThousands(total))
-	fmt.Fprintf(&b, "  est. cost:     $%.4f  (estimate, real billing on provider)", costUSD)
-	return b.String()
+	return renderInfoBox("Session Cost · "+m.model, []infoRow{
+		{Key: "input tokens", Value: fmtThousands(in)},
+		{Key: "output tokens", Value: fmtThousands(out)},
+		{Key: "total tokens", Value: fmtThousands(total)},
+		{Key: "est. cost", Value: fmt.Sprintf("$%.4f", costUSD), Hint: "real billing on provider"},
+	})
 }
 
 func guessPriceUSDPerM(model string) (in, out float64) {
@@ -75,37 +130,36 @@ func renderDiff() string {
 }
 
 func renderDoctor(m *Model) string {
-	var b strings.Builder
-	b.WriteString("metis doctor\n")
-	b.WriteString(fmt.Sprintf("  version:   %s\n", version.Version))
-	b.WriteString(fmt.Sprintf("  go:        %s\n", runtime.Version()))
-	b.WriteString(fmt.Sprintf("  os/arch:   %s/%s\n", runtime.GOOS, runtime.GOARCH))
 	cwd, _ := os.Getwd()
-	b.WriteString(fmt.Sprintf("  cwd:       %s\n", cwd))
-	b.WriteString(fmt.Sprintf("  metis dir: %s\n", config.Home()))
-	b.WriteString(fmt.Sprintf("  model:     %s\n", m.model))
-	b.WriteString(fmt.Sprintf("  mode:      %s\n", string(m.gate.Mode())))
-	// Provider key sniff — check common envs without exposing the value.
+	rows := []infoRow{
+		{Key: "version", Value: version.Version},
+		{Key: "go", Value: runtime.Version()},
+		{Key: "os/arch", Value: runtime.GOOS + "/" + runtime.GOARCH},
+		{Key: "cwd", Value: cwd},
+		{Key: "metis dir", Value: config.Home()},
+		{Key: "model", Value: m.model},
+		{Key: "mode", Value: string(m.gate.Mode())},
+		{Key: "tools", Value: fmt.Sprintf("%d registered", len(m.loop.Registry.All()))},
+	}
+	memDir := filepath.Join(config.Home(), "memories")
+	mems := "missing"
+	if entries, err := os.ReadDir(memDir); err == nil {
+		mems = fmt.Sprintf("%d files", len(entries))
+	}
+	rows = append(rows, infoRow{Key: "memory", Value: memDir, Hint: mems})
+	rows = append(rows, infoRow{Key: "", Value: ""})
+	rows = append(rows, infoRow{Key: "", Value: "API keys (envs sniffed without exposing values):"})
 	keys := []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "METIS_GITHUB_TOKEN", "GITHUB_TOKEN"}
-	b.WriteString("  api keys:\n")
 	for _, k := range keys {
 		state := "(unset)"
 		if v := os.Getenv(k); v != "" {
-			state = fmt.Sprintf("(set, len=%d)", len(v))
+			state = fmt.Sprintf("set · len=%d", len(v))
 		}
-		b.WriteString(fmt.Sprintf("    %-22s %s\n", k+":", state))
+		rows = append(rows, infoRow{Key: "  " + k, Value: state})
 	}
-	// Tool count.
-	b.WriteString(fmt.Sprintf("  tools:     %d registered\n", len(m.loop.Registry.All())))
-	// Memory dir presence.
-	memDir := filepath.Join(config.Home(), "memories")
-	mems := "(missing)"
-	if entries, err := os.ReadDir(memDir); err == nil {
-		mems = fmt.Sprintf("(%d files)", len(entries))
-	}
-	b.WriteString(fmt.Sprintf("  memory:    %s %s\n", memDir, mems))
-	b.WriteString("  status:    ✓ basic checks passed")
-	return b.String()
+	rows = append(rows, infoRow{Key: "", Value: ""})
+	rows = append(rows, infoRow{Key: "", Value: "✓ basic checks passed"})
+	return renderInfoBox("Metis Doctor", rows)
 }
 
 func renderStats(m *Model) string {
@@ -118,20 +172,19 @@ func renderStats(m *Model) string {
 	toolCalls := len(m.toolEvents)
 	in := m.totalTokens.Input()
 	out := m.totalTokens.Output()
-	var b strings.Builder
-	b.WriteString("session stats\n")
-	fmt.Fprintf(&b, "  session id:   %s\n", m.sessionID)
-	fmt.Fprintf(&b, "  user turns:   %d\n", turns)
-	fmt.Fprintf(&b, "  tool calls:   %d\n", toolCalls)
-	fmt.Fprintf(&b, "  input tokens:  %s\n", fmtThousands(in))
-	fmt.Fprintf(&b, "  output tokens: %s\n", fmtThousands(out))
-	fmt.Fprintf(&b, "  loop iters:   %d\n", m.loop.MaxIters)
-	fmt.Fprintf(&b, "  history msgs: %d", len(m.loop.History()))
-	return b.String()
+	return renderInfoBox("Session Stats", []infoRow{
+		{Key: "session id", Value: m.sessionID},
+		{Key: "user turns", Value: fmt.Sprintf("%d", turns)},
+		{Key: "tool calls", Value: fmt.Sprintf("%d", toolCalls)},
+		{Key: "input tokens", Value: fmtThousands(in)},
+		{Key: "output tokens", Value: fmtThousands(out)},
+		{Key: "loop iters", Value: fmt.Sprintf("%d", m.loop.MaxIters)},
+		{Key: "history msgs", Value: fmt.Sprintf("%d", len(m.loop.History()))},
+	})
 }
 
 func renderKeybindings() string {
-	rows := []struct{ key, desc string }{
+	pairs := []struct{ key, desc string }{
 		{"Ctrl-C", "exit (idle) / cancel turn (active)"},
 		{"Ctrl-D", "quit"},
 		{"Ctrl-L", "show available models"},
@@ -150,23 +203,25 @@ func renderKeybindings() string {
 		{"Esc", "dismiss palette / modal / pending state"},
 		{"Esc Esc", "clear input completely"},
 	}
-	var b strings.Builder
-	b.WriteString("TUI keybindings\n")
-	for _, r := range rows {
-		fmt.Fprintf(&b, "  %-18s  %s\n", r.key, r.desc)
+	rows := make([]infoRow, 0, len(pairs))
+	for _, p := range pairs {
+		rows = append(rows, infoRow{Key: p.key, Value: p.desc})
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return renderInfoBox("TUI Keybindings", rows)
 }
 
 func renderPermissions(m *Model) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "permission mode: %s\n", string(m.gate.Mode()))
+	rows := []infoRow{
+		{Key: "permission mode", Value: string(m.gate.Mode())},
+	}
 	rules := m.gate.Snapshot()
 	if len(rules) == 0 {
-		b.WriteString("  (no explicit rules — falling back to mode default)")
-		return strings.TrimRight(b.String(), "\n")
+		rows = append(rows, infoRow{Key: "", Value: ""})
+		rows = append(rows, infoRow{Key: "", Value: "no explicit rules — falling back to mode default"})
+		return renderInfoBox("Permissions", rows)
 	}
-	fmt.Fprintf(&b, "  %d rule(s):\n", len(rules))
+	rows = append(rows, infoRow{Key: "rule count", Value: fmt.Sprintf("%d", len(rules))})
+	rows = append(rows, infoRow{Key: "", Value: ""})
 	for _, r := range rules {
 		// permission.Decision constants: Ask=0, Allow=1, Deny=2.
 		// Earlier this branch wrote "deny" for r.Verb==1 (which is
@@ -188,9 +243,13 @@ func renderPermissions(m *Model) string {
 		if src == "" {
 			src = "—"
 		}
-		fmt.Fprintf(&b, "    %-6s  %-12s  %-30s  (%s)\n", verb, r.Tool, match, src)
+		rows = append(rows, infoRow{
+			Key:   fmt.Sprintf("%s %s", verb, r.Tool),
+			Value: match,
+			Hint:  src,
+		})
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return renderInfoBox("Permissions", rows)
 }
 
 // renderHooksList — best-effort hook inventory based on what the runtime
@@ -198,11 +257,8 @@ func renderPermissions(m *Model) string {
 // this leans on counts + the user's configured hook spec from
 // config.toml [hooks.*]. Good enough for a sanity check.
 func renderHooksList(cfg *config.Config) string {
-	var b strings.Builder
-	b.WriteString("loaded hooks (config.toml [hooks.*]):\n")
 	if cfg == nil {
-		b.WriteString("  (no config loaded)")
-		return b.String()
+		return renderInfoBox("Hooks", []infoRow{{Key: "", Value: "no config loaded"}})
 	}
 	type group struct {
 		name  string
@@ -214,13 +270,15 @@ func renderHooksList(cfg *config.Config) string {
 		{"SessionStart", cfg.Hooks.SessionStart},
 		{"SessionEnd", cfg.Hooks.SessionEnd},
 	}
+	rows := make([]infoRow, 0, 16)
 	any := false
 	for _, g := range groups {
 		if len(g.specs) == 0 {
 			continue
 		}
 		any = true
-		fmt.Fprintf(&b, "  %s:\n", g.name)
+		rows = append(rows, infoRow{Key: "", Value: ""})
+		rows = append(rows, infoRow{Key: "", Value: g.name})
 		for i, s := range g.specs {
 			t := s.Type
 			if t == "" {
@@ -231,17 +289,20 @@ func renderHooksList(cfg *config.Config) string {
 				ifs = "*"
 			}
 			cmd := s.Command
-			if len(cmd) > 60 {
-				cmd = cmd[:57] + "..."
+			if len(cmd) > 50 {
+				cmd = cmd[:47] + "..."
 			}
-			fmt.Fprintf(&b, "    [%d] type=%s if=%q\n        %s\n", i, t, ifs, cmd)
+			rows = append(rows, infoRow{
+				Key:   fmt.Sprintf("  [%d] %s", i, t),
+				Value: cmd,
+				Hint:  "if=" + ifs,
+			})
 		}
 	}
 	if !any {
-		b.WriteString("  (no user hooks declared in config.toml)")
-		return b.String()
+		return renderInfoBox("Hooks", []infoRow{{Key: "", Value: "no user hooks declared in config.toml"}})
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return renderInfoBox("Hooks · config.toml [hooks.*]", rows)
 }
 
 // renderReleaseNotes reads CHANGELOG.md from a few candidate locations

@@ -107,11 +107,16 @@ type Event struct {
 	PermissionReason string
 	PermissionReply  chan PermissionDecision // buffered, size 1
 
-	// Token + info
-	InputTokens  int
-	OutputTokens int
-	StopReason   string
-	Info         string
+	// Token + info. CacheCreationInputTokens / CacheReadInputTokens
+	// mirror Anthropic's prompt-caching usage and let the TUI compute
+	// claude-code-style context-window load (input + cache, no output)
+	// rather than the per-turn cost-only number.
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
+	StopReason               string
+	Info                     string
 
 	// Error
 	Err error

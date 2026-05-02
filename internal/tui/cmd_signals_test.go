@@ -28,8 +28,8 @@ func TestRenderToolsList_ShowsBuiltins(t *testing.T) {
 	builtin.Register(reg, &config.Config{}, gate)
 	loop := agent.NewLoop(nil, reg, gate, nil, "sys", 5)
 	got := renderToolsList(loop)
-	if !strings.Contains(got, "tools registered") {
-		t.Errorf("tools listing missing header line: %s", got)
+	if !strings.Contains(got, "Tools · ") || !strings.Contains(got, "registered") {
+		t.Errorf("tools listing missing box header (Tools · N registered): %s", got)
 	}
 	if !strings.Contains(got, "Read") {
 		t.Errorf("Read tool should appear in builtin listing: %s", got)
@@ -90,7 +90,7 @@ func TestRenderSkillsList_NoUserDirStillShowsBundled(t *testing.T) {
 	// no longer a "no skills" state — it just means "no user-overridden
 	// skills". The listing should still render bundled.
 	got := renderSkillsList("")
-	if !strings.Contains(got, "skills available") {
+	if !strings.Contains(got, "Skills · ") {
 		t.Errorf("empty user-dir should still list bundled skills; got %q", got)
 	}
 	if !strings.Contains(got, "code-review") {
@@ -102,7 +102,7 @@ func TestRenderSkillsList_UserDirAddedToBundled(t *testing.T) {
 	dir := t.TempDir()
 	// Empty user dir: just bundled.
 	got := renderSkillsList(dir)
-	if !strings.Contains(got, "skills available") {
+	if !strings.Contains(got, "Skills · ") {
 		t.Errorf("expected bundled skills; got %q", got)
 	}
 }

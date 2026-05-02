@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
+	"github.com/Ricardo-M-L/metis/internal/tui/list"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -215,7 +215,8 @@ func newBtwTestModel(t *testing.T, ask func(context.Context, string) (string, er
 	ti := textarea.New()
 	ti.SetWidth(80)
 	ti.Focus()
-	vp := viewport.New(78, 20)
+	cl := list.NewList()
+	cl.SetSize(78, 20)
 
 	// Real slash registry — we want the actual SignalBtw routing.
 	slashReg := slash.NewRegistry()
@@ -228,7 +229,7 @@ func newBtwTestModel(t *testing.T, ask func(context.Context, string) (string, er
 		cmds:      BuildREPLCommands(),
 		startTime: time.Now(),
 		input:     ti,
-		viewport:  vp,
+		chatList:  cl,
 		overlays:  overlay.New(),
 		width:     90,
 		height:    30,

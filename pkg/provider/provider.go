@@ -95,26 +95,36 @@ type Request struct {
 // StreamEvent is one chunk emitted while streaming a response.
 // Type is one of: "text_delta", "tool_use_start", "tool_input_delta",
 // "tool_use_stop", "message_stop", "error".
+//
+// CacheCreationInputTokens / CacheReadInputTokens mirror Anthropic's
+// prompt-caching usage fields. Providers without prompt caching leave
+// them at 0; consumers that compute "context-window load" (status bar
+// percentage) must add them to InputTokens — this is what claude-code's
+// statusline does (used = input + cache_creation + cache_read).
 type StreamEvent struct {
-	Type         string
-	TextDelta    string
-	ToolUseID    string
-	ToolName     string
-	InputDelta   string // partial JSON for tool input
-	StopReason   string
-	InputTokens  int
-	OutputTokens int
-	Err          error
+	Type                     string
+	TextDelta                string
+	ToolUseID                string
+	ToolName                 string
+	InputDelta               string // partial JSON for tool input
+	StopReason               string
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
+	Err                      error
 }
 
 // Response is the final aggregated result of a (possibly streamed)
 // completion. StopReason is one of: "end_turn" / "tool_use" /
 // "max_tokens" / "stop_sequence".
 type Response struct {
-	Content      []ContentBlock
-	StopReason   string
-	InputTokens  int
-	OutputTokens int
+	Content                  []ContentBlock
+	StopReason               string
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
 }
 
 // Provider is the abstraction every LLM backend implements. Stream emits

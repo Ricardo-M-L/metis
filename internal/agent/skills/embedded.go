@@ -32,6 +32,9 @@ func bundledLayer() Layer {
 				if d.IsDir() {
 					return nil
 				}
+				if isJunkFilename(filepath.Base(path)) {
+					return nil
+				}
 				if strings.ToLower(filepath.Ext(path)) != ".md" {
 					return nil
 				}

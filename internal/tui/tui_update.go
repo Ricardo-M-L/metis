@@ -75,8 +75,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if vpWidth < 40 {
 			vpWidth = msg.Width
 		}
-		m.viewport.Width = vpWidth
-		m.viewport.Height = vpHeight
+		m.chatList.SetSize(vpWidth, vpHeight)
 		// Compute textarea width consistent with renderInputLine's
 		// box width math — subtract 8 from terminal width to land on
 		// the inner content area. Capped at 100-4 so wide terminals
@@ -89,19 +88,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			w = 20
 		}
 		m.input.SetWidth(w)
+		// Width is part of every messageKey, so a resize means every
+		// existing entry is keyed under the old width. Drop them so the
+		// map doesn't accumulate stale entries across resizes — running
+		// counters survive on purpose (hit-rate stays comparable).
+		m.renderCache.InvalidateAll()
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
 	case tea.MouseMsg:
-		// Mouse wheel → viewport scroll. The viewport's own Update
-		// reads bubbletea's MouseMsg and adjusts YOffset — we just
-		// have to hand it the message. Without this dispatch the
-		// MouseWheelEnabled flag is a no-op because nothing forwards
-		// mouse events into the viewport.
-		var cmd tea.Cmd
-		m.viewport, cmd = m.viewport.Update(msg)
-		return m, cmd
+		// Mouse wheel → chatList scroll. The previous bubbles/viewport
+		// path forwarded MouseMsg to viewport.Update which read bubbletea's
+		// wheel events and adjusted YOffset. With our virtualized list
+		// we drive ScrollBy directly off the wheel button — list.go has
+		// no Update(tea.Msg) interface (it's pure model, no Cmd plumbing).
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.chatList.ScrollBy(-m.chatList.MouseWheelDelta())
+		case tea.MouseButtonWheelDown:
+			m.chatList.ScrollBy(m.chatList.MouseWheelDelta())
+		}
+		return m, nil
 
 	case spinnerTick:
 		// Spinner glyph index is now time-gated (renderSpinnerStatus
@@ -109,6 +117,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// touch m.spinnerFrame here. The tick still drives the
 		// token-counter animation + event drain below.
 		m.totalTokens.Animate()
+
+		// Permission prompt auto-deny: if the user hasn't answered within
+		// permissionTimeout, decide for them so the agent loop unblocks.
+		// Without this, leaving the TUI on a prompt overnight (or while
+		// a remote viewer is closed) leaves the LLM waiting on a buffered
+		// channel send — observable as a stuck spinner with no progress.
+		if m.permActive && !m.permStartedAt.IsZero() &&
+			time.Since(m.permStartedAt) >= permissionTimeout {
+			m.executePermission("n")
+		}
 
 		// Drain any agent events that landed since the last tick. The
 		// previous code only popped one event per tick, which made bursty

@@ -246,6 +246,19 @@ type UIPerformance struct {
 	// shimmer is disabled. Set true for accessibility (vestibular
 	// disorders, screen-reader workflows) or just to save battery.
 	ReducedMotion bool `toml:"reduced_motion"`
+
+	// SlowRenderMs — any single renderMessage / renderToolEvent call
+	// taking longer than this emits a "slow render" Debug log. Mirrors
+	// claude-code's render-to-screen.ts "Slow render: …ms" line. Only
+	// observed when METIS_LOG_LEVEL=debug; default 8 (~half a 25fps
+	// frame budget).
+	SlowRenderMs int `toml:"slow_render_ms"`
+
+	// StatsLogEvery — every Nth View() invocation, the render cache
+	// dumps cumulative hits/miss/hit_rate/avg_render_ms at Debug level.
+	// claude-code uses LOG_EVERY=20 in render-to-screen.ts; we default
+	// to 100 since metis ticks per spinner frame regardless of activity.
+	StatsLogEvery int `toml:"stats_log_every"`
 }
 
 type Session struct {
@@ -356,6 +369,8 @@ func defaults() *Config {
 				EventBufferSize: 256,
 				MouseWheelLines: 1,
 				ReducedMotion:   false,
+				SlowRenderMs:    8,
+				StatsLogEvery:   100,
 			},
 		},
 		Session: Session{

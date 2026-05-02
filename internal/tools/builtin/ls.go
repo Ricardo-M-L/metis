@@ -17,15 +17,21 @@ type LS struct{ gate *permission.Gate }
 
 func (LS) Name() string { return "LS" }
 func (LS) Description() string {
-	return "List directory entries. Use absolute path. Skips dot-dirs unless include_hidden=true."
+	return "List directory entries. Pass an absolute path (e.g. /Users/me/proj); relative paths are resolved against the current working directory. Skips dot-dirs unless include_hidden=true."
 }
 func (LS) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"path"},
 		"properties": map[string]any{
-			"path":           map[string]any{"type": "string"},
-			"include_hidden": map[string]any{"type": "boolean"},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Absolute path to list. Relative paths are resolved against the current working directory. Use \".\" for cwd.",
+			},
+			"include_hidden": map[string]any{
+				"type":        "boolean",
+				"description": "If true, include dot-files and dot-directories. Defaults to false.",
+			},
 		},
 	}
 }
@@ -37,8 +43,21 @@ func (l LS) CanUse(_ context.Context, in map[string]any) (tools.Permission, stri
 
 func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	path, _ := in["path"].(string)
-	if path == "" || !filepath.IsAbs(path) {
-		return nil, errors.New("absolute path required")
+	if path == "" {
+		return nil, errors.New("path required (use \".\" for current directory)")
+	}
+	// Resolve relative paths against cwd. Earlier this hard-failed with
+	// "absolute path required", which forced the LLM into a retry loop
+	// any time it produced something like "src/" — observed in the
+	// 2026-05-02 cross-CLI audit where MiniMax called LS three times
+	// before falling back to bash. Resolving here is safer and lets the
+	// permission gate decide whether the resulting absolute path is OK.
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("invalid path %q: %w", path, err)
+		}
+		path = abs
 	}
 	hidden, _ := in["include_hidden"].(bool)
 

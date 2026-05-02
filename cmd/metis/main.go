@@ -468,6 +468,8 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		EventBufferSize: cfg.UI.Performance.EventBufferSize,
 		MouseWheelLines: cfg.UI.Performance.MouseWheelLines,
 		ReducedMotion:   cfg.UI.Performance.ReducedMotion,
+		SlowRenderMs:    cfg.UI.Performance.SlowRenderMs,
+		StatsLogEvery:   cfg.UI.Performance.StatsLogEvery,
 	})
 	return rt, nil
 }

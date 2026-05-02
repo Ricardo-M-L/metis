@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -30,18 +29,11 @@ func renderToolsList(loop *agent.Loop) string {
 	if len(tools) == 0 {
 		return "(no tools registered)"
 	}
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%d tools registered:\n", len(tools)))
-	maxName := 0
+	rows := make([]infoRow, 0, len(tools))
 	for _, t := range tools {
-		if l := len(t.Name()); l > maxName {
-			maxName = l
-		}
+		rows = append(rows, infoRow{Key: t.Name(), Value: t.Description()})
 	}
-	for _, t := range tools {
-		fmt.Fprintf(&b, "  %-*s  %s\n", maxName, t.Name(), t.Description())
-	}
-	return strings.TrimRight(b.String(), "\n")
+	return renderInfoBox(fmt.Sprintf("Tools · %d registered", len(tools)), rows)
 }
 
 // renderSessionsList lists recent sessions with title (when set) — title-first
@@ -58,19 +50,22 @@ func renderSessionsList(store *session.Store, limit int) string {
 		return "sessions: " + err.Error()
 	}
 	if len(entries) == 0 {
-		return "(no sessions yet)"
+		return renderInfoBox("Sessions", []infoRow{{Key: "", Value: "no sessions yet"}})
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "recent sessions (%d):\n", len(entries))
+	rows := make([]infoRow, 0, len(entries))
 	for _, e := range entries {
 		ts := e.CreatedAt.Local().Format("2006-01-02 15:04")
-		if e.Title != "" {
-			fmt.Fprintf(&b, "  %s  %s  %s — %s\n", ts, shortID(e.ID), e.Model, e.Title)
-		} else {
-			fmt.Fprintf(&b, "  %s  %s  %s\n", ts, shortID(e.ID), e.Model)
+		label := e.Title
+		if label == "" {
+			label = e.Model
 		}
+		rows = append(rows, infoRow{
+			Key:   shortID(e.ID),
+			Value: label,
+			Hint:  ts,
+		})
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return renderInfoBox(fmt.Sprintf("Recent Sessions · %d", len(entries)), rows)
 }
 
 // renderCurrentSession describes the currently-active session: id, title,
@@ -79,30 +74,32 @@ func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Lo
 	if sessionID == "" {
 		return "(no active session)"
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "id:    %s\n", sessionID)
+	rows := []infoRow{{Key: "id", Value: sessionID}}
 	if store != nil {
 		if hdr, _, err := store.LoadHeader(sessionID); err == nil && hdr != nil {
 			if hdr.Title != "" {
-				fmt.Fprintf(&b, "title: %s\n", hdr.Title)
+				rows = append(rows, infoRow{Key: "title", Value: hdr.Title})
 			}
 			if !hdr.CreatedAt.IsZero() {
-				fmt.Fprintf(&b, "since: %s\n", hdr.CreatedAt.Local().Format(time.RFC3339))
+				rows = append(rows, infoRow{Key: "since", Value: hdr.CreatedAt.Local().Format(time.RFC3339)})
 			}
 		}
 	}
 	if model != "" {
-		fmt.Fprintf(&b, "model: %s\n", model)
+		rows = append(rows, infoRow{Key: "model", Value: model})
 	}
 	if mode != "" {
-		fmt.Fprintf(&b, "mode:  %s\n", mode)
+		rows = append(rows, infoRow{Key: "mode", Value: mode})
 	}
 	if loop != nil {
 		hist := loop.History()
-		fmt.Fprintf(&b, "turns: %d  (messages: %d)\n",
-			transcript.CountTurns(hist), len(hist))
+		rows = append(rows, infoRow{
+			Key:   "turns",
+			Value: fmt.Sprintf("%d", transcript.CountTurns(hist)),
+			Hint:  fmt.Sprintf("%d messages", len(hist)),
+		})
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return renderInfoBox("Session", rows)
 }
 
 // renderSkillsList aggregates every layer of the skill loader (bundled +
@@ -117,12 +114,11 @@ func renderSkillsList(skillDir string) string {
 	if len(list) == 0 {
 		return "(no skills available — bundled set should always be present; check the binary)"
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d skills available:\n", len(list))
+	rows := make([]infoRow, 0, len(list))
 	for _, sk := range list {
-		fmt.Fprintf(&b, "  %-22s  %s\n", sk.Name, sk.Description)
+		rows = append(rows, infoRow{Key: sk.Name, Value: sk.Description})
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return renderInfoBox(fmt.Sprintf("Skills · %d available", len(list)), rows)
 }
 
 // renderVersion is one-line: matches `metis version` default form so muscle

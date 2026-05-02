@@ -150,19 +150,21 @@ func BuildREPLCommands() *REPLCommandRegistry {
 // =============================================================================
 
 func cmdHelp(r *REPL, args string) string {
-	var b strings.Builder
-	b.WriteString("metis commands:\n\n")
 	seen := make(map[string]bool)
+	rows := make([]infoRow, 0, 64)
 	for _, c := range r.cmds.All() {
 		if seen[c.Name] {
 			continue
 		}
 		seen[c.Name] = true
-		b.WriteString(fmt.Sprintf("  %-14s  %s\n", c.Name, c.Description))
+		rows = append(rows, infoRow{Key: "/" + c.Name, Value: c.Description})
 	}
-	b.WriteString("\nTip: git/diff/commit/log/branch/checkout — git shortcuts\n      skill install <name> — install a skill\n      mcp list — list MCP servers\n")
-	b.WriteString("\nOr type anything else to chat with the LLM.\n")
-	return b.String()
+	rows = append(rows, infoRow{Key: "", Value: ""})
+	rows = append(rows, infoRow{Key: "", Value: "git/diff/commit/log/branch/checkout — git shortcuts"})
+	rows = append(rows, infoRow{Key: "", Value: "skill install <name> — install a skill"})
+	rows = append(rows, infoRow{Key: "", Value: "mcp list — list MCP servers"})
+	rows = append(rows, infoRow{Key: "", Value: "Or type anything else to chat with the LLM."})
+	return renderInfoBox("Metis Commands", rows)
 }
 
 func cmdQuit(r *REPL, args string) string {
@@ -237,8 +239,16 @@ func cmdContext(r *REPL, args string) string {
 		}
 	}
 	pct := float64(used) / float64(maxCtx) * 100
-	return fmt.Sprintf("context: %s tokens in last call / ~%s max ≈ %.1f%%",
-		fmtThousands(used), fmtThousands(maxCtx), pct)
+	rows := []infoRow{
+		{Key: "in last call", Value: fmtThousands(used) + " tokens"},
+		{Key: "max", Value: "~" + fmtThousands(maxCtx) + " tokens"},
+		{Key: "utilization", Value: fmt.Sprintf("%.1f%%", pct)},
+	}
+	if pct >= 75 {
+		rows = append(rows, infoRow{Key: "", Value: ""})
+		rows = append(rows, infoRow{Key: "", Value: "context pressure high — /compact to reclaim"})
+	}
+	return renderInfoBox("Context Window", rows)
 }
 
 // cmdMemory is a thin wrapper that delegates to the memory tool.
@@ -259,22 +269,30 @@ func cmdMemory(r *REPL, args string) string {
 	}
 	stats := core.Stats()
 	if len(stats) == 0 {
-		return "memory: no blocks (empty)"
+		return renderInfoBox("Memory", []infoRow{
+			{Key: "", Value: "no blocks (empty)"},
+			{Key: "", Value: ""},
+			{Key: "", Value: "Memory tool: action=read|search|add|replace|remove|archive|stats"},
+		})
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "memory blocks (%d):\n", len(stats))
 	// Stable order: sort block names alphabetically.
 	names := make([]string, 0, len(stats))
 	for k := range stats {
 		names = append(names, k)
 	}
 	sort.Strings(names)
+	rows := make([]infoRow, 0, len(stats)+3)
 	for _, name := range names {
 		s := stats[name]
-		fmt.Fprintf(&b, "  %-12s %d / %d chars (%.1f%%)\n", name, s.Used, s.Limit, s.Pct)
+		rows = append(rows, infoRow{
+			Key:   name,
+			Value: fmt.Sprintf("%d / %d chars", s.Used, s.Limit),
+			Hint:  fmt.Sprintf("%.1f%%", s.Pct),
+		})
 	}
-	b.WriteString("\nuse the Memory tool (action=read|search|add|replace|remove|archive|stats) to read/edit specific blocks")
-	return strings.TrimRight(b.String(), "\n")
+	rows = append(rows, infoRow{Key: "", Value: ""})
+	rows = append(rows, infoRow{Key: "", Value: "Memory tool: action=read|search|add|replace|remove|archive|stats"})
+	return renderInfoBox(fmt.Sprintf("Memory · %d block(s)", len(stats)), rows)
 }
 
 // cmdRecap re-emits the most recent turn-end recap line. Useful when
@@ -482,16 +500,27 @@ func cmdTheme(r *REPL, args string) string {
 }
 
 // cmdEffort sets the reasoning intensity dial used for subsequent turns.
-// Empty arg → show current state; "off" / "default" → clear the override
-// and let the provider/model defaults apply.
+// Empty arg → show current state in a box with the option list; non-empty
+// arg → apply the new setting and confirm with a one-liner.
+//
+// The box layout was added after the user noted slash output read as
+// flat plain text next to claude-code's bordered panels — the readback
+// path now matches /context, /cost, /memory, /status formatting.
 func cmdEffort(r *REPL, args string) string {
 	arg := strings.ToLower(strings.TrimSpace(args))
 	if arg == "" {
 		cur := string(r.Loop.Effort)
 		if cur == "" {
-			cur = "(default — provider decides)"
+			cur = "default (provider decides)"
 		}
-		return "effort: " + cur + " — use: effort low|medium|high|off"
+		return renderInfoBox("Reasoning Effort", []infoRow{
+			{Key: "current", Value: cur},
+			{Key: "", Value: ""},
+			{Key: "/effort low", Value: "small thinking budget, faster"},
+			{Key: "/effort medium", Value: "balanced"},
+			{Key: "/effort high", Value: "deep reasoning, slower & costlier"},
+			{Key: "/effort off", Value: "clear override (use provider default)"},
+		})
 	}
 	if arg == "off" || arg == "default" || arg == "none" {
 		r.Loop.Effort = llm.EffortDefault
@@ -952,57 +981,34 @@ func cwd() string {
 }
 
 func cmdDoctor(r *REPL, args string) string {
-	var b strings.Builder
-	b.WriteString("metis doctor\n\n")
-
-	// Config file
-	cfgPath := filepath.Join(config.Home(), "config.toml")
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		b.WriteString("  [MISSING] config: " + cfgPath + "\n")
-	} else {
-		b.WriteString("  [OK]      config: " + cfgPath + "\n")
+	check := func(path, label string) infoRow {
+		if _, err := os.Stat(path); err == nil {
+			return infoRow{Key: label, Value: path, Hint: "ok"}
+		}
+		return infoRow{Key: label, Value: path, Hint: "missing"}
 	}
-
-	// Skills dir
-	skDir := filepath.Join(config.Home(), "skills")
-	if _, err := os.Stat(skDir); os.IsNotExist(err) {
-		b.WriteString("  [WARN]    skills dir: " + skDir + " (not created)\n")
-	} else {
-		b.WriteString("  [OK]      skills dir: " + skDir + "\n")
+	rows := []infoRow{
+		check(filepath.Join(config.Home(), "config.toml"), "config"),
+		check(filepath.Join(config.Home(), "skills"), "skills dir"),
+		check(filepath.Join(config.Home(), "sessions"), "session dir"),
 	}
-
-	// Session dir
-	sesDir := filepath.Join(config.Home(), "sessions")
-	if _, err := os.Stat(sesDir); os.IsNotExist(err) {
-		b.WriteString("  [WARN]    session dir: " + sesDir + " (not created)\n")
-	} else {
-		b.WriteString("  [OK]      session dir: " + sesDir + "\n")
-	}
-
-	// API key
-	apiKeys := []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"}
-	for _, k := range apiKeys {
+	for _, k := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"} {
 		if v := os.Getenv(k); v != "" {
-			b.WriteString("  [OK]      " + k + ": set (" + v[:4] + "...)\n")
+			rows = append(rows, infoRow{Key: k, Value: "set", Hint: v[:4] + "…"})
 		}
 	}
-
-	// Git
-	if _, err := exec.LookPath("git"); err != nil {
-		b.WriteString("  [WARN]    git: not found\n")
-	} else {
-		b.WriteString("  [OK]      git: found\n")
+	gitHint := "not found"
+	if _, err := exec.LookPath("git"); err == nil {
+		gitHint = "ok"
 	}
-
-	// Go
-	if _, err := exec.LookPath("go"); err != nil {
-		b.WriteString("  [WARN]    go: not found\n")
-	} else {
-		b.WriteString("  [OK]      go: found\n")
+	rows = append(rows, infoRow{Key: "git", Value: gitHint})
+	goHint := "not found"
+	if _, err := exec.LookPath("go"); err == nil {
+		goHint = "ok"
 	}
-
-	b.WriteString("\n  Binary:   " + os.Args[0] + "\n")
-	return b.String()
+	rows = append(rows, infoRow{Key: "go", Value: goHint})
+	rows = append(rows, infoRow{Key: "binary", Value: os.Args[0]})
+	return renderInfoBox("Metis Doctor", rows)
 }
 
 // =============================================================================
@@ -1015,21 +1021,18 @@ func cmdVersion(r *REPL, args string) string {
 
 func cmdCost(r *REPL, args string) string {
 	// Mirror renderCost (render_info.go) so the REPL fast-path and the
-	// slash.Registry path produce identical output. Earlier this function
-	// returned a stripped-down "session tokens:" line and missed the USD
-	// estimate, which made /cost feel hollow on TUI; now it includes the
-	// per-model price guess.
+	// slash.Registry path produce identical output.
 	in := r.totalTokens.in
 	out := r.totalTokens.out
 	total := in + out
 	priceIn, priceOut := guessPriceUSDPerM(r.Loop.Model)
 	costUSD := float64(in)*priceIn/1_000_000 + float64(out)*priceOut/1_000_000
-	return fmt.Sprintf(
-		"session cost (model: %s)\n  input  tokens: %s\n  output tokens: %s\n  total  tokens: %s\n  est. cost:     $%.4f  (estimate, real billing on provider)",
-		r.Loop.Model,
-		fmtThousands(in), fmtThousands(out), fmtThousands(total),
-		costUSD,
-	)
+	return renderInfoBox("Session Cost · "+r.Loop.Model, []infoRow{
+		{Key: "input tokens", Value: fmtThousands(in)},
+		{Key: "output tokens", Value: fmtThousands(out)},
+		{Key: "total tokens", Value: fmtThousands(total)},
+		{Key: "est. cost", Value: fmt.Sprintf("$%.4f", costUSD), Hint: "real billing on provider"},
+	})
 }
 
 func cmdUsage(r *REPL, args string) string {
@@ -1163,61 +1166,71 @@ func sanitize(name string) string {
 	}, name)
 }
 
-// tokenTracker tracks session-cumulative token consumption with a
-// smoothed display value so the counter doesn't jump in big chunks.
+// tokenTracker tracks token usage with two distinct concepts:
 //
-// Semantics (matches claude-code's StatusLine):
+//   - Session cumulative (in / out) — for `/cost` billing summaries.
+//     Every API call adds to these; they only grow.
 //
-//   - Both `in` and `out` accumulate across every iteration of every
-//     turn. claude-code's cost-tracker.ts does
-//     `modelUsage.inputTokens += usage.input_tokens` per API call; the
-//     bottom-right "tokens" total is `sumBy(modelUsage, 'inputTokens')
+//   - Most-recent API call (lastIn / lastOut / lastCacheCreate /
+//     lastCacheRead) — overwritten on every API call. Two distinct
+//     status displays read from these:
 //
-//   - sumBy(..., 'outputTokens')`. We mirror that.
+//       (a) Spinner row "↓ 38123 tokens"  →  LastTotal() == lastIn + lastOut
+//           This is the per-turn cost: what the most recent round trip
+//           actually consumed (input + output).
 //
-//   - The number is "API spend" (every billed request adds its full
-//     input_tokens), not "current context window size". Two API calls
-//     that each send 1k of history → counter shows ~2k, even though
-//     the live history is still 1k. That's the right model: the user
-//     wants to see what they've consumed, and a single big tool turn
-//     can quietly cost 5x what the visible history implies.
+//       (b) Bottom-right status bar "38123 tokens (19%)"  →  ContextUsage()
+//           This is the context-window load: lastIn + lastCacheCreate
+//           + lastCacheRead. Mirrors claude-code's statusline formula
+//           (input-side only, including prompt-cache contribution; see
+//           https://code.claude.com/docs/en/statusline.md). Output is
+//           NOT included — it isn't part of the in-flight context.
 //
-// `dispIn/dispOut` are the smoothed numbers actually rendered. Animate()
-// is called on each spinner tick to nudge displayed toward truth via a
-// piecewise step:
+// The two numbers diverge in two ways:
+//   - ContextUsage adds cache (CC parity); LastTotal does not.
+//   - LastTotal adds output; ContextUsage does not.
 //
-//	gap < 70   → +3 per tick (tiny gaps feel ticky)
-//	gap < 200  → +12% per tick (mid-range eases out)
-//	gap >= 200 → +50 per tick (catches big bursts without lag)
-//
-// Numbers tuned to claude-code's TokenCounter animation.
+// `dispIn/dispOut` are smoothed values for animation.
 type tokenTracker struct {
-	in, out         int // session cumulative (every API call += in/out)
-	lastIn, lastOut int // most recent API call only (overwritten each round)
-	dispIn, dispOut int
+	in, out                                          int // session cumulative
+	lastIn, lastOut                                  int // most recent API call (per-turn cost)
+	lastCacheCreate, lastCacheRead                   int // most recent API call (cache portion of input)
+	dispIn, dispOut                                  int
 }
 
-// add records a per-iteration usage report. `in`/`out` accumulate session-
-// wide for /cost; `lastIn`/`lastOut` overwrite each call so the status bar
-// can show "this turn's tokens" — matching claude-code where the bottom-
-// right counter reflects the in-flight context window load (last call's
-// input+output) rather than total API spend.
-func (t *tokenTracker) add(in, out int) {
+// add records a per-iteration usage report. `in`/`out` accumulate
+// session-wide for /cost; the `last*` fields overwrite each call so the
+// status bar reflects only the most recent round-trip. Cache fields are
+// 0 for providers without prompt caching (Gemini / OpenAI / non-cached
+// Anthropic requests).
+func (t *tokenTracker) add(in, out, cacheCreate, cacheRead int) {
 	t.in += in
 	t.out += out
 	t.lastIn = in
 	t.lastOut = out
+	t.lastCacheCreate = cacheCreate
+	t.lastCacheRead = cacheRead
 }
 
-// LastIn / LastOut expose the most recent API call's usage for the
-// status bar. Total() (defined elsewhere in this file) keeps returning
-// the session cumulative for /cost.
+// LastIn / LastOut expose the most recent API call's billable usage.
+// Used by /cost-style displays that want to call out the most recent
+// round-trip's spend.
 func (t *tokenTracker) LastIn() int  { return t.lastIn }
 func (t *tokenTracker) LastOut() int { return t.lastOut }
 
 // LastTotal is the most recent API call's input+output combined — the
-// number rendered in the status bar's bottom-right.
+// per-turn cost. Spinner row uses this to surface what the just-finished
+// round trip consumed.
 func (t *tokenTracker) LastTotal() int { return t.lastIn + t.lastOut }
+
+// ContextUsage is the most recent API call's input-side total including
+// prompt-cache tokens. Mirrors claude-code's statusline `used_percentage`
+// numerator (input + cache_creation + cache_read). Bottom-right status
+// bar uses this to show context-window load — distinct from per-turn
+// cost (which still includes output).
+func (t *tokenTracker) ContextUsage() int {
+	return t.lastIn + t.lastCacheCreate + t.lastCacheRead
+}
 
 // Reset zeroes both raw and displayed counters. Called by /clear and /new
 // when the conversation is being thrown away so the displayed total
@@ -1228,6 +1241,8 @@ func (t *tokenTracker) Reset() {
 	t.out = 0
 	t.lastIn = 0
 	t.lastOut = 0
+	t.lastCacheCreate = 0
+	t.lastCacheRead = 0
 	t.dispIn = 0
 	t.dispOut = 0
 }

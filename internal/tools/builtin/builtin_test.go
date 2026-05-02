@@ -359,11 +359,29 @@ func TestLS_IncludeHidden(t *testing.T) {
 	}
 }
 
-func TestLS_RelativePathRejected(t *testing.T) {
+// TestLS_RelativePathResolvesToCwd locks in the 2026-05-02 change that
+// stopped LS from hard-failing on relative paths. Earlier behavior forced
+// LLMs into a retry loop ("absolute path required") any time they
+// produced "." or "src/"; now LS resolves through filepath.Abs and lets
+// the permission gate decide whether the resulting absolute path is OK.
+func TestLS_RelativePathResolvesToCwd(t *testing.T) {
 	l := LS{gate: bypassGate()}
-	_, err := l.Execute(context.Background(), map[string]any{"path": "."})
+	res, err := l.Execute(context.Background(), map[string]any{"path": "."})
+	if err != nil {
+		t.Fatalf("relative path should resolve to cwd, got error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected a result for cwd listing")
+	}
+}
+
+// TestLS_EmptyPathRejected makes sure we still surface a clear error
+// when the LLM omits the parameter entirely.
+func TestLS_EmptyPathRejected(t *testing.T) {
+	l := LS{gate: bypassGate()}
+	_, err := l.Execute(context.Background(), map[string]any{"path": ""})
 	if err == nil {
-		t.Fatal("expected error for relative path")
+		t.Fatal("expected error for empty path")
 	}
 }
 

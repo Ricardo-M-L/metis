@@ -15,10 +15,11 @@ package tui
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -26,6 +27,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/tui/list"
 	"github.com/Ricardo-M-L/metis/internal/tui/overlay"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
@@ -35,6 +37,13 @@ import (
 // ============================================================================
 
 type Message struct {
+	// ID is process-stable for the lifetime of a TUI session. Filled in
+	// by m.nextID() at the point we append to m.messages, used for
+	// future cross-feature references (multi-pane navigation, click-to-
+	// expand, etc.). NOT a cache key — renderCache keys on (role,
+	// content, width) so the (×N) error-dedupe content rewrite path
+	// invalidates correctly without ID help.
+	ID        string
 	Role      string
 	Content   string
 	ToolName  string
@@ -52,6 +61,10 @@ type SubAgentInfo struct {
 }
 
 type ToolEvent struct {
+	// ID is process-stable; filled at EventToolStart and preserved
+	// across the start→result mutation. Same role as Message.ID:
+	// future cross-feature linking, not a cache key.
+	ID        string
 	Kind      string
 	ToolName  string
 	Input     map[string]any
@@ -125,9 +138,13 @@ type Model struct {
 	// across rows with Alt+Enter / Ctrl+J. Enter still submits — handleKey
 	// intercepts KeyEnter before it reaches textarea.
 	input textarea.Model
-	// viewport scrolls the message log. PgUp/PgDn and the mouse wheel
-	// both work out of the box.
-	viewport      viewport.Model
+	// chatList is a virtualized list (internal/tui/list) that renders
+	// only the items intersecting the current viewport. Replaces the
+	// previous bubbles/viewport.Model, which paid O(N) string-cat per
+	// frame for the full transcript — see metis-tranquil-lemon.md
+	// "C方案" rationale: 1200-item realistic-session benchmarks went
+	// from 5.6 MB allocs/frame (viewport) to ~150 KB (list).
+	chatList      *list.List
 	turnActive    bool
 	streamingText string
 
@@ -178,6 +195,12 @@ type Model struct {
 	// EventPermissionRequest. We send exactly one decision through it
 	// to unblock the tool dispatcher.
 	permReply chan agent.PermissionDecision
+	// permStartedAt is the wall clock when the prompt appeared. The
+	// spinner tick uses it to drive the visible countdown and to
+	// auto-deny once permissionTimeout elapses — protects against the
+	// "user walked away from VNC, agent stuck for hours on a Yes/No"
+	// failure mode the user hit during cross-CLI testing.
+	permStartedAt time.Time
 
 	width, height int
 	startTime     time.Time
@@ -218,12 +241,6 @@ type Model struct {
 	// active turn, so the second press within ctrlCQuitWindow exits.
 	lastCtrlC time.Time
 
-	// lastViewportLen tracks how many "cells" of content we last gave
-	// the viewport. When it grows we auto-GotoBottom so new messages
-	// are visible; when the user scrolled up to read history we avoid
-	// yanking them back down on every redraw.
-	lastViewportLen int
-
 	// activeScreen is a full-window overlay (e.g. /history). When
 	// non-nil, the chat surface is hidden and key events are forwarded
 	// to the screen until it reports Done().
@@ -238,6 +255,60 @@ type Model struct {
 	// boolean flags on Model are getting migrated one by one. /btw
 	// is the first migrant.
 	overlays *overlay.Stack
+
+	// renderCache memoizes per-message / per-tool-event render output
+	// so the View() loop pays glamour cost once per item instead of
+	// every spinner tick. WindowSizeMsg invalidates the whole cache;
+	// streaming/thinking text is rendered outside the timeline path
+	// and never enters the cache. See render_cache.go.
+	renderCache *renderCache
+
+	// msgSeq is the monotonic counter behind nextID(). Plain int64
+	// (not atomic.Int64 type) on purpose: existing tests copy *Model
+	// by value (btw_e2e_test.go) and the new atomic types embed
+	// sync/atomic.noCopy which would trip `go vet`. The field is
+	// still accessed exclusively via atomic.AddInt64 so concurrent
+	// pre-render writers (future tea.Cmd path) stay race-free.
+	msgSeq int64
+}
+
+// nextID returns a process-stable identifier for a new Message or
+// ToolEvent. Format is "<sessionID>-m<seq>" so debug logs can be
+// correlated to a session without an external uuid dependency. The
+// counter is cleared on every NewModel — IDs are not persisted; if
+// the user reloads the session, the rebuilt timeline gets fresh IDs.
+func (m *Model) nextID() string {
+	return fmt.Sprintf("%s-m%d", m.sessionID, atomic.AddInt64(&m.msgSeq, 1))
+}
+
+// ensureIDs lazily assigns IDs to any Message or ToolEvent that
+// reached m.messages / m.toolEvents without one. We do it on the
+// View() critical path rather than at every append site because the
+// codebase has ~70 distinct append points (keybind_submit alone has
+// 50+) — threading m.nextID() through each one is mechanical
+// boilerplate that adds friction to every new slash command. Lazy
+// fill is safe because:
+//   - cache keys don't include ID, so a per-frame backfill creates
+//     no cache invalidation churn
+//   - the only consumers of Message.ID / ToolEvent.ID today are
+//     post-View features (cross-pane reference, SSE-reconnect match),
+//     all of which run after View() has touched the slice
+//   - linear scan of an append-only slice is < 1µs at 100 entries,
+//     dwarfed by the glamour render cost the cache is meant to skip
+//
+// Existing IDs are preserved so the (×N) error-dedupe path keeps the
+// same identifier across content rewrites.
+func (m *Model) ensureIDs() {
+	for i := range m.messages {
+		if m.messages[i].ID == "" {
+			m.messages[i].ID = m.nextID()
+		}
+	}
+	for i := range m.toolEvents {
+		if m.toolEvents[i].ID == "" {
+			m.toolEvents[i].ID = m.nextID()
+		}
+	}
 }
 
 const ctrlCQuitWindow = 600 * time.Millisecond
@@ -269,14 +340,23 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		return "  "
 	})
 
-	vp := viewport.New(80, 20) // dimensions get fixed up on first WindowSizeMsg
-	vp.MouseWheelEnabled = true
+	// chatList replaces bubbles/viewport.Model for the chat surface.
+	// Width/Height get sized on the first WindowSizeMsg; default 80×20
+	// keeps test code that constructs a Model literal usable.
+	cl := list.NewList()
+	cl.SetSize(80, 20)
+	cl.SetGap(0) // assistant/user message renderers already include trailing newlines
 	// Wheel step is config-tunable now (default 1 = pixel-precise).
 	// A trackpad fires many wheel events per gesture; with the bubbletea
 	// default of 3 the transcript jumps too far per detent. Users who
 	// want browser-like jumpy scroll can set
 	// `[ui.performance].mouse_wheel_lines = 3` or env METIS_MOUSE_WHEEL_LINES=3.
-	vp.MouseWheelDelta = mouseWheelLines()
+	cl.SetMouseWheelDelta(mouseWheelLines())
+
+	// Render cache picks up SlowRenderMs / StatsLogEvery from the
+	// active perf config; both fall back to the cache's own defaults
+	// when the snapshot is zero (tests / fresh installs without TOML).
+	pc := perfConfig()
 
 	return &Model{
 		ctx:         ctx,
@@ -293,10 +373,11 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		eventCh:     make(chan agent.Event, eventBufferSize()),
 		doneCh:      make(chan error, 1),
 		overlays:    overlay.New(),
+		renderCache: newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
 		showBanner:  true,
 		firstRender: true,
 		input:       ti,
-		viewport:    vp,
+		chatList:    cl,
 		// 4-level permission ask, matching claude-code's pattern:
 		//   y — allow this once
 		//   a — allow always (whitelist this tool for the session)

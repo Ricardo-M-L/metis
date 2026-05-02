@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
+	"github.com/Ricardo-M-L/metis/internal/tui/list"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -45,23 +45,23 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		owner    string // "repl" / "slash" — for documentation only
 	}{
 		// REPL-owned (pre-existing) ----------------------------------------
-		{"/cost", []string{"session cost", "input", "output", "est. cost"}, "repl"},
+		{"/cost", []string{"Session Cost", "input tokens", "output tokens", "est. cost"}, "repl"},
 		{"/usage", []string{"rate limit"}, "repl"},
-		{"/doctor", []string{"metis doctor"}, "repl"},
+		{"/doctor", []string{"Metis Doctor", "config", "git"}, "repl"},
 		{"/vim", []string{"vim mode:"}, "repl"},
 		{"/theme", []string{"theme:"}, "repl"},
-		{"/effort", []string{"effort:"}, "repl"},
+		{"/effort", []string{"Reasoning Effort", "current"}, "repl"},
 		{"/effort high", []string{"effort: high"}, "repl"},
-		{"/context", []string{"context:", "tokens"}, "repl"},
+		{"/context", []string{"Context Window", "in last call", "tokens"}, "repl"},
 		{"/export", []string{"exported", "messages to"}, "repl"},
 
 		// Slash-owned (added in 2026-05-01 audit) --------------------------
-		{"/keybindings", []string{"keybindings", "Ctrl-C", "Esc"}, "slash"},
+		{"/keybindings", []string{"Keybindings", "Ctrl-C", "Esc"}, "slash"},
 		{"/keys", []string{"Ctrl-C"}, "slash"}, // alias
 		{"/permissions", []string{"permission mode"}, "slash"},
 		{"/perms", []string{"permission mode"}, "slash"}, // alias
 		{"/hooks", []string{"hooks"}, "slash"},
-		{"/stats", []string{"session stats", "user turns", "tool calls"}, "slash"},
+		{"/stats", []string{"Session Stats", "user turns", "tool calls"}, "slash"},
 		{"/release-notes", []string{"metis"}, "slash"},
 		{"/changelog", []string{"metis"}, "slash"},
 		{"/resume", []string{"--resume"}, "slash"},
@@ -286,7 +286,8 @@ func newSlashTestModel(t *testing.T) *Model {
 	ti := textarea.New()
 	ti.SetWidth(80)
 	ti.Focus()
-	vp := viewport.New(78, 20)
+	cl := list.NewList()
+	cl.SetSize(78, 20)
 
 	slashReg := slash.NewRegistry()
 	slash.RegisterAll(slashReg, nil)
@@ -298,7 +299,7 @@ func newSlashTestModel(t *testing.T) *Model {
 		cmds:        BuildREPLCommands(),
 		startTime:   time.Now(),
 		input:       ti,
-		viewport:    vp,
+		chatList:    cl,
 		overlays:    overlay.New(),
 		width:       100,
 		height:      40,

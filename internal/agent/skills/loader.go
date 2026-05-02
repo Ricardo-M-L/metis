@@ -192,11 +192,15 @@ func dirLayer(name string, priority int, dir string) Layer {
 				if e.IsDir() {
 					continue
 				}
-				ext := strings.ToLower(filepath.Ext(e.Name()))
+				name := e.Name()
+				if isJunkFilename(name) {
+					continue
+				}
+				ext := strings.ToLower(filepath.Ext(name))
 				if ext != ".md" && ext != ".markdown" && ext != ".json" {
 					continue
 				}
-				sk, err := Load(filepath.Join(dir, e.Name()))
+				sk, err := Load(filepath.Join(dir, name))
 				if err != nil || sk == nil {
 					continue
 				}

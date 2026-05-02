@@ -12,7 +12,10 @@ import (
 // usageTotals holds the input / output token tallies a streaming response
 // emits across multiple message_delta events. Kept package-private; the
 // final tally is forwarded to callers as an Event{Kind: EventTokens}.
-type usageTotals struct{ in, out int }
+type usageTotals struct {
+	in, out                  int
+	cacheCreate, cacheRead   int
+}
 
 // consumeStream reads StreamEvents from the LLM stream, emits text and tool
 // events on `out`, and returns the assembled assistant message blocks plus
@@ -65,6 +68,14 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		switch ev.Type {
 		case "message_start":
 			usage.in = ev.InputTokens
+			// Cache fields land at message_start on Anthropic native; some
+			// gateways only emit them in message_delta. Capture either way.
+			if ev.CacheCreationInputTokens > 0 {
+				usage.cacheCreate = ev.CacheCreationInputTokens
+			}
+			if ev.CacheReadInputTokens > 0 {
+				usage.cacheRead = ev.CacheReadInputTokens
+			}
 		case "text_delta":
 			curText += ev.TextDelta
 			emit(ctx, out, Event{Kind: EventTextDelta, TextDelta: ev.TextDelta})
@@ -94,6 +105,12 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// output-only number.
 			if usage.in == 0 && ev.InputTokens > 0 {
 				usage.in = ev.InputTokens
+			}
+			if ev.CacheCreationInputTokens > 0 {
+				usage.cacheCreate = ev.CacheCreationInputTokens
+			}
+			if ev.CacheReadInputTokens > 0 {
+				usage.cacheRead = ev.CacheReadInputTokens
 			}
 		case "message_stop":
 			flushText()

@@ -46,6 +46,9 @@ func (s *Store) List() ([]Skill, error) {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
+		if isJunkFilename(e.Name()) {
+			continue
+		}
 		b, err := os.ReadFile(filepath.Join(s.Root, e.Name()))
 		if err != nil {
 			continue

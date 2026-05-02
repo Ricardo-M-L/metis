@@ -23,6 +23,10 @@ type PerfConfig struct {
 	EventBufferSize int
 	MouseWheelLines int
 	ReducedMotion   bool
+	// SlowRenderMs / StatsLogEvery feed render_cache.go's instrument.
+	// 0 means "use the package default" (8 ms / 100 frames).
+	SlowRenderMs  int
+	StatsLogEvery int
 }
 
 var (

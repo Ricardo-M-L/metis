@@ -51,8 +51,16 @@ func (m *Model) timeline() []timelineItem {
 // View is the bubbletea-required render entry point. It composes the
 // per-feature renderers (welcome banner, transcript, overlays,
 // status bar) into the final string. Pure presentation: no mutation
-// outside the viewport content cache + lastViewportLen.
+// outside the viewport content cache + lastViewportLen + lazy-filled
+// Message/ToolEvent IDs.
 func (m *Model) View() string {
+	// RecordView fires on every View() invocation regardless of which
+	// branch returns. defer ensures the early-return paths (copyMode,
+	// activeScreen, empty timeline) still tick the counter so the
+	// periodic stats log measures real frame frequency, not just main-
+	// path frequency.
+	defer m.renderCache.RecordView()
+
 	// Copy mode: alt-screen is exited so the user can mouse-select
 	// from native scrollback. Return empty so we don't re-paint over
 	// their selection.
@@ -97,6 +105,12 @@ func (m *Model) View() string {
 
 	var s strings.Builder
 
+	// Lazy-fill IDs for any Message / ToolEvent that reached the slices
+	// without one. Cheap (linear scan, < 1µs at 100 entries) and
+	// invisible to the cache layer: cache keys ignore ID. See
+	// (m *Model).ensureIDs in tui.go for the why.
+	m.ensureIDs()
+
 	// Brand watermark — every-frame model + mode reminder. The brand
 	// itself ("metis") gets the accent color so the eye lands on it
 	// the way claude-code's "✻ claude-code" sits at the top of every
@@ -111,88 +125,90 @@ func (m *Model) View() string {
 	s.WriteString(styleMuted.Render("  ────────────────────────────────────────────"))
 	s.WriteString("\n")
 
-	// Build the scrollable content as a chronologically-interleaved
-	// timeline of messages and tool events. claude-code renders
-	// strictly by timestamp; this matches that.
-	var scroll strings.Builder
+	// Build the chat surface via the virtualized list package. Items
+	// are constructed every frame from the chronological merge of
+	// m.messages + m.toolEvents (see chat_items.go::buildChatItems);
+	// the list package only renders items intersecting the visible
+	// window, dropping per-frame alloc from ~5.6 MB (full transcript
+	// concat) to ~150 KB at 1200-item scale.
 	w := m.width
 	if w <= 0 {
 		w = 80
 	}
-	for _, item := range m.timeline() {
-		if item.msg != nil {
-			scroll.WriteString(renderMessage(*item.msg, w))
-		} else if item.te != nil {
-			scroll.WriteString(renderToolEvent(*item.te, m.expandToolOutputs))
-		}
-	}
-	// Live-streaming extended-thinking trace, rendered above the
-	// in-flight reply in dim italic so the user sees the model's
-	// reasoning as it arrives instead of an opaque spinner.
-	if m.thinkingText != "" {
-		scroll.WriteString(styleMuted.Render("  " + glyphAsterisk + " "))
-		thinkStyle := styleMuted.Italic(true)
-		thinkLines := strings.Split(m.thinkingText, "\n")
-		if len(thinkLines) > 0 {
-			scroll.WriteString(thinkStyle.Render(thinkLines[0]))
-			for _, ln := range thinkLines[1:] {
-				scroll.WriteString("\n  ")
-				scroll.WriteString(thinkStyle.Render(ln))
-			}
-		}
-		scroll.WriteString("\n\n")
-	}
-	if m.streamingText != "" {
-		scroll.WriteString(styleAsst.Render("  " + glyphBullet + " "))
-		streamLines := strings.Split(m.streamingText, "\n")
-		if len(streamLines) > 0 {
-			scroll.WriteString(styleText.Render(streamLines[0]))
-			for _, ln := range streamLines[1:] {
-				scroll.WriteString("\n  ")
-				scroll.WriteString(styleText.Render(ln))
-			}
-		}
-		scroll.WriteString("\n\n")
-	}
-	content := scroll.String()
 
-	// Dynamic viewport height — size to actual content (capped at
-	// terminal-minus-chrome) so a fresh chat with 2 messages doesn't
-	// pad with blank rows pushing the input box to the terminal
-	// bottom.
-	contentLines := strings.Count(content, "\n")
+	// Auto-scroll: snapshot AtBottom BEFORE swapping items so newly-
+	// arrived content while the user was at the bottom auto-follows.
+	// SetItemsKeepScroll preserves offsetIdx/offsetLine so a user
+	// PgUp'd into history stays put across spinner ticks.
+	wasAtBottom := m.chatList.AtBottom()
+	m.chatList.SetItemsKeepScroll(m.buildChatItems()...)
+
+	// Dynamic chat-surface height — size to actual content height
+	// (capped at terminal-minus-chrome) so a fresh chat with 2
+	// messages doesn't pad with blank rows pushing the input box to
+	// the terminal bottom. Must run AFTER SetItems so TotalLineCount
+	// reflects the just-installed items, not the previous frame's.
 	maxVpHeight := m.height - 10
 	if maxVpHeight < 5 {
 		maxVpHeight = 5
 	}
-	desiredVp := contentLines + 1
+	totalLines := m.chatList.TotalLineCount()
+	desiredVp := totalLines
 	if desiredVp > maxVpHeight {
 		desiredVp = maxVpHeight
 	}
 	if desiredVp < 1 {
 		desiredVp = 1
 	}
-	m.viewport.Height = desiredVp
-	// Smart auto-scroll — only follow new content to the bottom when
-	// the user was already at the bottom. If they PgUp'd to read
-	// older context, leave the viewport alone.
-	wasAtBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(content)
-	if l := len(content); l > m.lastViewportLen {
-		if wasAtBottom {
-			m.viewport.GotoBottom()
-		}
-		m.lastViewportLen = l
+	m.chatList.SetSize(w-2, desiredVp) // -2 for the scrollbar gutter
+	if wasAtBottom {
+		m.chatList.ScrollToBottom()
 	}
-	// Render viewport with a vertical scrollbar gutter on the right
-	// edge — claude-code shows a thin bar so the user can see where
-	// they are in the transcript.
-	vpView := m.viewport.View()
-	if m.viewport.Height > 0 && m.viewport.TotalLineCount() > m.viewport.Height {
-		vpView = renderScrollbar(vpView, &m.viewport)
+
+	// Render the visible window only. ListView is < 5 KB even for
+	// 1200-item sessions because virtualization caps output at
+	// `desiredVp` lines.
+	listView := m.chatList.Render()
+	if m.chatList.Height() > 0 && m.chatList.TotalLineCount() > m.chatList.Height() {
+		listView = renderScrollbar(listView, m.chatList)
 	}
-	s.WriteString(vpView)
+	s.WriteString(listView)
 	s.WriteString("\n")
+
+	// Live-streaming extended-thinking + assistant text rendered in
+	// the "stream tail" — distinct from the chat list because their
+	// content mutates every spinner tick and would invalidate the
+	// list's cache keys repeatedly. They live BELOW the list so the
+	// user sees: [history items] / [stream-in-progress] / [chrome].
+	var tail strings.Builder
+	if m.thinkingText != "" {
+		tail.WriteString(styleMuted.Render("  " + glyphAsterisk + " "))
+		thinkStyle := styleMuted.Italic(true)
+		thinkLines := strings.Split(m.thinkingText, "\n")
+		if len(thinkLines) > 0 {
+			tail.WriteString(thinkStyle.Render(thinkLines[0]))
+			for _, ln := range thinkLines[1:] {
+				tail.WriteString("\n  ")
+				tail.WriteString(thinkStyle.Render(ln))
+			}
+		}
+		tail.WriteString("\n\n")
+	}
+	if m.streamingText != "" {
+		tail.WriteString(styleAsst.Render("  " + glyphBullet + " "))
+		streamLines := strings.Split(m.streamingText, "\n")
+		if len(streamLines) > 0 {
+			tail.WriteString(styleText.Render(streamLines[0]))
+			for _, ln := range streamLines[1:] {
+				tail.WriteString("\n  ")
+				tail.WriteString(styleText.Render(ln))
+			}
+		}
+		tail.WriteString("\n\n")
+	}
+	if tail.Len() > 0 {
+		s.WriteString(tail.String())
+	}
 
 	// Spinner — mirrors claude-code's `* Verb (Xs · ↓ N.Nk tokens · thought
 	// for Ys)` parts pattern.

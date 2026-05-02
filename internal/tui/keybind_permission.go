@@ -23,6 +23,17 @@ const modeCycleStartupGrace = 800 * time.Millisecond
 // when the terminal sends both KeyShiftTab and a paired escape.
 const modeCycleDebounce = 200 * time.Millisecond
 
+// permissionTimeout is the wall-clock window the user has to answer a
+// Yes/Always/No/Cancel prompt. After this elapses, executePermission is
+// invoked with "n" — the safest default when the operator isn't around.
+//
+// Sized to be long enough that a returning user almost always still has
+// the prompt waiting, but short enough that an automated/headless run
+// cannot stall an agent indefinitely. Cross-CLI testing exposed the
+// "VNC viewer left running, agent stuck for >6 minutes on a single
+// permission prompt" failure mode this guards against.
+const permissionTimeout = 60 * time.Second
+
 func (m *Model) handlePermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyLeft, tea.KeyUp:

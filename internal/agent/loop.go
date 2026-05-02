@@ -243,7 +243,13 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return err
 		}
 		if usage != nil {
-			emit(ctx, out, Event{Kind: EventTokens, InputTokens: usage.in, OutputTokens: usage.out})
+			emit(ctx, out, Event{
+				Kind:                     EventTokens,
+				InputTokens:              usage.in,
+				OutputTokens:             usage.out,
+				CacheCreationInputTokens: usage.cacheCreate,
+				CacheReadInputTokens:     usage.cacheRead,
+			})
 		}
 
 		l.mu.Lock()

@@ -132,8 +132,10 @@ type anthropicResp struct {
 	StopReason string             `json:"stop_reason"`
 	Model      string             `json:"model"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	} `json:"usage"`
 }
 
@@ -193,9 +195,11 @@ func toAnthropic(req Request, model string, maxTokens int) anthropicReq {
 
 func fromAnthropic(resp anthropicResp) *Response {
 	out := &Response{
-		StopReason:   resp.StopReason,
-		InputTokens:  resp.Usage.InputTokens,
-		OutputTokens: resp.Usage.OutputTokens,
+		StopReason:               resp.StopReason,
+		InputTokens:              resp.Usage.InputTokens,
+		OutputTokens:             resp.Usage.OutputTokens,
+		CacheCreationInputTokens: resp.Usage.CacheCreationInputTokens,
+		CacheReadInputTokens:     resp.Usage.CacheReadInputTokens,
 	}
 	for _, c := range resp.Content {
 		switch c.Type {
@@ -367,8 +371,10 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			ContentBlock json.RawMessage `json:"content_block"`
 			Message      json.RawMessage `json:"message"`
 			Usage        struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &env); err != nil {
@@ -380,12 +386,20 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			// usage info available; emit empty event with token counts
 			var msg struct {
 				Usage struct {
-					InputTokens  int `json:"input_tokens"`
-					OutputTokens int `json:"output_tokens"`
+					InputTokens              int `json:"input_tokens"`
+					OutputTokens             int `json:"output_tokens"`
+					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 				} `json:"usage"`
 			}
 			_ = json.Unmarshal(env.Message, &msg)
-			return StreamEvent{Type: "message_start", InputTokens: msg.Usage.InputTokens, OutputTokens: msg.Usage.OutputTokens}, nil
+			return StreamEvent{
+				Type:                     "message_start",
+				InputTokens:              msg.Usage.InputTokens,
+				OutputTokens:             msg.Usage.OutputTokens,
+				CacheCreationInputTokens: msg.Usage.CacheCreationInputTokens,
+				CacheReadInputTokens:     msg.Usage.CacheReadInputTokens,
+			}, nil
 		case "content_block_start":
 			var cb struct {
 				Type  string         `json:"type"`
@@ -449,10 +463,12 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			// downstream tracker doesn't end up with `in == 0` on those
 			// providers and the bottom-right counter actually moves.
 			return StreamEvent{
-				Type:         "message_delta",
-				StopReason:   d.StopReason,
-				InputTokens:  env.Usage.InputTokens,
-				OutputTokens: env.Usage.OutputTokens,
+				Type:                     "message_delta",
+				StopReason:               d.StopReason,
+				InputTokens:              env.Usage.InputTokens,
+				OutputTokens:             env.Usage.OutputTokens,
+				CacheCreationInputTokens: env.Usage.CacheCreationInputTokens,
+				CacheReadInputTokens:     env.Usage.CacheReadInputTokens,
 			}, nil
 		case "message_stop":
 			return StreamEvent{Type: "message_stop"}, io.EOF

@@ -168,18 +168,28 @@ func renderStatusBar(m *Model) string {
 
 	publishBridgeSnapshot(m)
 
-	// Right side: **most recent turn's** tokens (input+output) + context-
-	// window percentage. claude-code's status bar shows the in-flight
-	// context load, NOT the session-cumulative API spend. Earlier metis
-	// summed every call ever — so the counter only ever grew, masking
-	// per-turn cost. Now we show what the most recent API call ate.
-	// /cost still surfaces the session total for billing.
+	// Right side: **context-window load** for the most recent API call
+	// — input + cache (no output), as a percentage of the model's max
+	// context. Mirrors claude-code's statusline `used_percentage`
+	// (https://code.claude.com/docs/en/statusline.md): numerator is
+	// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`,
+	// denominator is `context_window_size`.
+	//
+	// Distinct from the spinner row's "↓ N tokens" (LastTotal — input+
+	// output, per-turn cost) and from /cost (session-cumulative billing).
+	// Three different numbers serving three different questions:
+	//   spinner    → "what did the just-finished turn cost?"
+	//   right side → "how full is my context window?"
+	//   /cost      → "what have I billed this session?"
+	//
+	// Raw integer (not k-abbreviated) so the user sees every increment;
+	// matches claude-code's statusline rendering.
 	var right string
-	if last := m.totalTokens.LastTotal(); last > 0 {
-		right = formatTokens(last) + " tokens"
+	if used := m.totalTokens.ContextUsage(); used > 0 {
+		right = formatTokensRaw(used) + " tokens"
 		if m.loop != nil && m.loop.Provider != nil {
 			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
-				pct := last * 100 / cap
+				pct := used * 100 / cap
 				right = fmt.Sprintf("%s (%d%%)", right, pct)
 			}
 		}
@@ -286,7 +296,11 @@ func effortGlyph(e llm.Effort) string {
 	return ""
 }
 
-// formatTokens prints token counts the way claude-code does:
+// formatTokens prints abbreviated token counts (k/M suffix) — used by
+// the spinner row where horizontal space is tight and per-turn precision
+// isn't required ("↓ 38k tokens" mid-turn is fine; the user is watching
+// the spinner anyway).
+//
 // 0–999 → "847", 1000–9999 → "3.1k", 10000+ → "12k", ≥1M → "1.2M".
 func formatTokens(n int) string {
 	switch {
@@ -299,6 +313,14 @@ func formatTokens(n int) string {
 	default:
 		return fmt.Sprintf("%.1fM", float64(n)/1000000)
 	}
+}
+
+// formatTokensRaw prints the exact integer count (no abbreviation). Used
+// by the bottom-right status bar where the user wants to see every
+// token tick — matches claude-code's statusline rendering, which shows
+// the raw number rather than rounding to "k".
+func formatTokensRaw(n int) string {
+	return fmt.Sprintf("%d", n)
 }
 
 // modeIcon picks a vim-style mode glyph + color (claude-code's status bar

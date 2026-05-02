@@ -16,16 +16,25 @@ type Glob struct{ gate *permission.Gate }
 
 func (Glob) Name() string { return "Glob" }
 func (Glob) Description() string {
-	return "Find files matching a doublestar glob pattern (e.g. **/*.go). Returns file paths sorted by modification time, newest first."
+	return "Find files matching a doublestar glob pattern. Examples: \"**/*.go\" (all .go files recursively), \"src/**/*.ts\" (TS files under src), \"*.md\" (top-level markdown). Returns paths sorted by modification time, newest first."
 }
 func (Glob) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"pattern"},
 		"properties": map[string]any{
-			"pattern": map[string]any{"type": "string"},
-			"root":    map[string]any{"type": "string", "description": "directory to search from (defaults to cwd)"},
-			"limit":   map[string]any{"type": "integer"},
+			"pattern": map[string]any{
+				"type":        "string",
+				"description": "Doublestar glob, e.g. \"**/*.go\" or \"src/**/*.ts\". Use \"**/*\" to match every file under root.",
+			},
+			"root": map[string]any{
+				"type":        "string",
+				"description": "Directory to search from. Defaults to cwd.",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"description": "Maximum number of paths to return. Defaults to 500.",
+			},
 		},
 	}
 }

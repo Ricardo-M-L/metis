@@ -8,33 +8,35 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Ricardo-M-L/metis/internal/tui/list"
 )
 
 // renderScrollbar overlays a vertical scrollbar on the right edge of
-// the viewport view. Track is dim, thumb is bright. claude-code shows
+// the chat list view. Track is dim, thumb is bright. claude-code shows
 // a visible bar with a multi-cell thumb proportional to viewport
 // coverage — we mirror that so very long transcripts produce a short
 // thumb (lots to scroll) and short transcripts a tall one.
 //
-// Implementation: split viewport lines, append the appropriate glyph
-// to each. Lines past viewport.Height are left untouched. Caller has
+// Implementation: split list lines, append the appropriate glyph
+// to each. Lines past l.Height() are left untouched. Caller has
 // reserved width for us via the WindowSizeMsg handler.
-func renderScrollbar(view string, vp *viewport.Model) string {
+func renderScrollbar(view string, l *list.List) string {
 	lines := strings.Split(view, "\n")
 	if len(lines) == 0 {
 		return view
 	}
-	height := vp.Height
+	height := l.Height()
 	if height <= 0 {
 		return view
 	}
 	// Thumb height proportional to visible/total ratio, min 1, max
 	// height. Without this every scrollbar shows a 1-cell thumb
 	// regardless of context size — looks like a stuck dot.
-	total := vp.TotalLineCount()
+	total := l.TotalLineCount()
 	thumbH := height
 	if total > 0 {
 		thumbH = int(float64(height) * float64(height) / float64(total))
@@ -45,7 +47,7 @@ func renderScrollbar(view string, vp *viewport.Model) string {
 	if thumbH > height {
 		thumbH = height
 	}
-	pct := vp.ScrollPercent()
+	pct := l.ScrollPercent()
 	thumbStart := int(pct * float64(height-thumbH))
 	if thumbStart < 0 {
 		thumbStart = 0
@@ -61,15 +63,21 @@ func renderScrollbar(view string, vp *viewport.Model) string {
 	// require an extra column reservation in the layout math.
 	track := styleMuted.Render("│")
 	thumb := styleAccent.Render("█")
+	// Pad each line out to the list's reserved width before
+	// appending the gutter glyph; otherwise short lines (e.g. blank
+	// or partial paragraphs) would push the scrollbar inward and the
+	// bar wouldn't form a straight column on the right edge.
+	vpWidth := l.Width()
 	for i := 0; i < len(lines) && i < height; i++ {
 		glyph := track
 		if i >= thumbStart && i < thumbStart+thumbH {
 			glyph = thumb
 		}
-		// Single-space gutter then glyph — keeps content from
-		// touching the bar. Caller reserved width=msg.Width-2 so
-		// this always lands inside the terminal.
-		lines[i] = lines[i] + " " + glyph
+		pad := vpWidth - lipgloss.Width(lines[i])
+		if pad < 0 {
+			pad = 0
+		}
+		lines[i] = lines[i] + strings.Repeat(" ", pad) + " " + glyph
 	}
 	return strings.Join(lines, "\n")
 }
@@ -372,5 +380,15 @@ func renderPermission(m *Model) string {
 	s.WriteString("\n")
 	s.WriteString(styleMuted.Render("  ↑↓ select · enter confirm · y/a/n/c shortcuts · esc deny"))
 	s.WriteString("\n")
+	// Auto-deny countdown — gives the user a clear visual that the
+	// prompt won't wait forever, and provides closure when the operator
+	// is away from the terminal.
+	if !m.permStartedAt.IsZero() {
+		remaining := permissionTimeout - time.Since(m.permStartedAt)
+		if remaining > 0 {
+			s.WriteString(styleMuted.Render(fmt.Sprintf("  auto-deny in %ds", int(remaining.Seconds()))))
+			s.WriteString("\n")
+		}
+	}
 	return s.String()
 }

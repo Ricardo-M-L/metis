@@ -88,6 +88,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		}
 	case agent.EventPermissionRequest:
 		m.permActive = true
+		m.permStartedAt = time.Now()
 		m.permTool = ev.ToolName
 		m.permArgs = toolArgsPreview(ev.ToolName, ev.PermissionInput)
 		// claude-code surface: "Bash wants to run `rm -rf /tmp/foo`"
@@ -101,7 +102,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		m.permCursor = 0
 		m.permReply = ev.PermissionReply
 	case agent.EventTokens:
-		m.totalTokens.add(ev.InputTokens, ev.OutputTokens)
+		m.totalTokens.add(ev.InputTokens, ev.OutputTokens, ev.CacheCreationInputTokens, ev.CacheReadInputTokens)
 	case agent.EventTurnEnd:
 		// keep toolEvents for display
 	case agent.EventError:
