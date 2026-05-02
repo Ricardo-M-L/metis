@@ -28,6 +28,8 @@ var (
 	styleAsst     lipgloss.Style
 	styleToolName lipgloss.Style
 	styleErr      lipgloss.Style
+	styleSuccess  lipgloss.Style // green ✓ for success role
+	styleWarn     lipgloss.Style // orange ⚠ for warning role
 	styleSelected lipgloss.Style
 )
 
@@ -54,6 +56,8 @@ func initStyles() {
 	styleAsst = lipgloss.NewStyle().Foreground(accentGreen)
 	styleToolName = lipgloss.NewStyle().Foreground(accentOrange).Bold(true)
 	styleErr = lipgloss.NewStyle().Foreground(accentRed).Bold(true)
+	styleSuccess = lipgloss.NewStyle().Foreground(accentGreen).Bold(true)
+	styleWarn = lipgloss.NewStyle().Foreground(accentOrange).Bold(true)
 	styleSelected = lipgloss.NewStyle().Foreground(accentBlue).Bold(true).Background(bgSecondary)
 }
 

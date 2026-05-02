@@ -102,6 +102,18 @@ func renderMessage(msg Message, width int) string {
 		// code does the same: error in red, suggestion below.
 		s.WriteString(styleDim.Render("    → " + msg.Content))
 		s.WriteString("\n")
+	case "success":
+		// Phase B: ✓ glyph in green for celebratory confirmations
+		// (saved, exported, branched, undid). Distinct from neutral
+		// "info" — the user wants visible feedback that an action
+		// landed, not just another grey line in the scroll.
+		s.WriteString(styleSuccess.Render("  ✓ " + msg.Content))
+		s.WriteString("\n")
+	case "warning":
+		// ⚠ in yellow for soft warnings (no session store, deprecated
+		// usage). Visible without screaming like "error".
+		s.WriteString(styleWarn.Render("  ⚠ " + msg.Content))
+		s.WriteString("\n")
 	case "bash", "bash-error":
 		// `!ls` mode output. First line ($ <cmd>) gets accent so the
 		// user can spot their own shell invocation against the dim
@@ -125,7 +137,11 @@ func renderMessage(msg Message, width int) string {
 			s.WriteString("\n")
 		}
 	case "info":
-		s.WriteString(styleMuted.Render("  " + msg.Content))
+		// Phase B: subtle "·" prefix gives info messages a consistent
+		// left edge with the other roles (✗ for error, ✓ for success,
+		// ⚠ for warning). Without the prefix the eye lost the column
+		// and info messages floated awkwardly.
+		s.WriteString(styleMuted.Render("  · " + msg.Content))
 		s.WriteString("\n")
 	}
 	return s.String()

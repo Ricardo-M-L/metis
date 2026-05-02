@@ -193,7 +193,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				// message, plus any tool events tied to that turn.
 				m.messages = trimVisibleMessagesToLastUser(m.messages)
 				m.toolEvents = nil
-				m.messages = append(m.messages, Message{Role: "info", Content: "(undid last turn)", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn)", Timestamp: time.Now()})
 			} else {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to undo)", Timestamp: time.Now()})
 			}
@@ -206,28 +206,28 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			if title == "" {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(title: type `/title <text>` to set)", Timestamp: time.Now()})
 			} else if m.session == nil || m.sessionID == "" {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(title: no session store available)", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "warning", Content: "(title: no session store available)", Timestamp: time.Now()})
 			} else if err := m.session.SetTitle(m.sessionID, title); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "title: " + err.Error(), Timestamp: time.Now()})
 			} else {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(title set: " + title + ")", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "success", Content: "(title set: " + title + ")", Timestamp: time.Now()})
 			}
 		case slash.SignalBranch:
 			if m.session == nil || m.sessionID == "" {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(branch: no session store)", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "warning", Content: "(branch: no session store)", Timestamp: time.Now()})
 			} else if newID, err := m.session.Branch(m.sessionID, m.loop.History()); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "branch: " + err.Error(), Timestamp: time.Now()})
 			} else {
 				m.sessionID = newID
-				m.messages = append(m.messages, Message{Role: "info", Content: "(branched → " + newID + ")", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "success", Content: "(branched → " + newID + ")", Timestamp: time.Now()})
 			}
 		case slash.SignalSave:
 			if m.session == nil || m.sessionID == "" {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(save: no session store)", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "warning", Content: "(save: no session store)", Timestamp: time.Now()})
 			} else if err := m.session.Sync(m.sessionID); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "save: " + err.Error(), Timestamp: time.Now()})
 			} else {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(session synced to disk)", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "success", Content: "(session synced to disk)", Timestamp: time.Now()})
 			}
 		case slash.SignalTools:
 			m.openBodyScreen("/tools", renderToolsList(m.loop))
@@ -250,7 +250,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			} else if err := m.ext.DirAdd(args, true); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "add-dir: " + err.Error(), Timestamp: time.Now()})
 			} else {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(added: " + args + ")", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "success", Content: "(added: " + args + ")", Timestamp: time.Now()})
 			}
 		case slash.SignalRemoveDir:
 			if m.ext.DirRemove == nil {
@@ -258,7 +258,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			} else if err := m.ext.DirRemove(args); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "rm-dir: " + err.Error(), Timestamp: time.Now()})
 			} else {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(removed: " + args + ")", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "success", Content: "(removed: " + args + ")", Timestamp: time.Now()})
 			}
 		case slash.SignalListDirs:
 			if m.ext.DirList == nil {
@@ -303,7 +303,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				if err != nil {
 					m.messages = append(m.messages, Message{Role: "error", Content: "export: " + err.Error(), Timestamp: time.Now()})
 				} else {
-					m.messages = append(m.messages, Message{Role: "info", Content: "(exported → " + p + ")", Timestamp: time.Now()})
+					m.messages = append(m.messages, Message{Role: "success", Content: "(exported → " + p + ")", Timestamp: time.Now()})
 				}
 			}
 		case slash.SignalReleaseNotes:
@@ -330,7 +330,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			} else if err := tagCurrentSession(m.session, m.sessionID, args); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "tag: " + err.Error(), Timestamp: time.Now()})
 			} else {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(tagged: " + args + ")", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "success", Content: "(tagged: " + args + ")", Timestamp: time.Now()})
 			}
 		case slash.SignalBtw:
 			return m, m.startBtwQuery(args)
