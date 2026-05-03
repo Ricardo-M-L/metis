@@ -29,20 +29,38 @@ func TestBanner_VersionFromPackage(t *testing.T) {
 	saved := version.Version
 	t.Cleanup(func() { version.Version = saved })
 
-	cases := []string{"0.1.1", "9.9.9-rc1", "2.0.0", "dev-snapshot"}
-	for _, want := range cases {
-		t.Run(want, func(t *testing.T) {
-			version.Version = want
+	// Test both bare numerics ("0.1.1") and pre-prefixed ("v0.1.1-...")
+	// since `git describe` emits the latter while the bare VERSION file
+	// has the former. Banner must render exactly one "v" prefix in both
+	// cases (no "vv0.1.1" double-v regression).
+	cases := []struct {
+		input, wantSubstr string
+	}{
+		{"0.1.1", "v0.1.1"},
+		{"9.9.9-rc1", "v9.9.9-rc1"},
+		{"2.0.0", "v2.0.0"},
+		{"dev-snapshot", "vdev-snapshot"},
+		// Pre-prefixed inputs (git describe output) — must NOT double-v.
+		{"v0.1.1-20-g0c8969d", "v0.1.1-20-g0c8969d"},
+		{"v0.1.1", "v0.1.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			version.Version = tc.input
 			var buf bytes.Buffer
 			r := minimalREPL(&buf, "claude-opus-4-7")
 			r.printBanner()
 			out := stripANSI(buf.String())
-			if !strings.Contains(out, "v"+want) {
-				t.Errorf("banner missing %q; got:\n%s", "v"+want, out)
+			if !strings.Contains(out, tc.wantSubstr) {
+				t.Errorf("banner missing %q; got:\n%s", tc.wantSubstr, out)
+			}
+			// Hard-block double-v regression.
+			if strings.Contains(out, "vv") {
+				t.Errorf("banner double-v regression: %q\n%s", tc.input, out)
 			}
 			// Anti-regression: the old hardcoded literal must never appear
 			// (unless the active Version literally equals "0.1.0-dev").
-			if want != "0.1.0-dev" && strings.Contains(out, "v0.1.0-dev") {
+			if tc.input != "0.1.0-dev" && strings.Contains(out, "v0.1.0-dev") {
 				t.Errorf("banner still contains old hardcoded literal v0.1.0-dev:\n%s", out)
 			}
 		})

@@ -63,13 +63,13 @@ func (m *Model) renderWelcomeBanner() string {
 
 	// 3) cwd row — Claude Code's first frame anchors users to their
 	// working directory; without it you can't tell whether a stray
-	// `cd` from the shell put you somewhere unexpected. Truncate the
-	// home prefix to "~" so paths read like the shell's PS1.
+	// `cd` from the shell put you somewhere unexpected. Show the full
+	// absolute path on its own line (claude-code style — no "cwd:"
+	// label, no ~-truncation). The plain absolute path matches
+	// claude-code v2.1.126's banner exactly and reads more honestly
+	// than "~" which can hide multi-account / SSH / sudo confusion.
 	if cwd, err := os.Getwd(); err == nil && cwd != "" {
-		if home, _ := os.UserHomeDir(); home != "" && strings.HasPrefix(cwd, home) {
-			cwd = "~" + cwd[len(home):]
-		}
-		s.WriteString(labelStyle.Render("  cwd:   "))
+		s.WriteString("  ")
 		s.WriteString(valueStyle.Render(cwd))
 		s.WriteString("\n")
 	}

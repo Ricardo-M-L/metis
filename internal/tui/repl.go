@@ -335,7 +335,16 @@ func (r *REPL) printBanner() {
 	// Banner version mirrors `metis version` — same source so the two never
 	// drift. version.Version is build-time injected via -ldflags by the
 	// Makefile (falls back to the committed VERSION file).
-	fmt.Fprint(r.out, infoStyle.Render("v"+version.Version), infoStyle.Render("  ·  "))
+	// version.Version comes from -ldflags injection (Makefile). Makefile
+	// uses `git describe --tags --always --dirty` which already prefixes
+	// with "v" when the tag includes one (e.g. "v0.1.1-20-g0c8969d");
+	// fallback paths use the bare VERSION file content (e.g. "0.1.1").
+	// Add "v" only when missing so we don't render "vv0.1.1-...".
+	verLabel := version.Version
+	if !strings.HasPrefix(verLabel, "v") {
+		verLabel = "v" + verLabel
+	}
+	fmt.Fprint(r.out, infoStyle.Render(verLabel), infoStyle.Render("  ·  "))
 	fmt.Fprint(r.out, hintStyle.Render("model: "), statusStyle.Render(r.model))
 	fmt.Fprint(r.out, infoStyle.Render("  ·  "))
 	fmt.Fprint(r.out, hintStyle.Render("mode: "), statusStyle.Render(string(r.Gate.Mode())))
