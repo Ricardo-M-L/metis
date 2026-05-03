@@ -88,17 +88,33 @@ func renderSpinnerStatus(m *Model) string {
 
 	var parts []string
 	parts = append(parts, formatElapsed(elapsed))
-	// Spinner row breaks input vs output explicitly:
-	//   ↑ 90k · ↓ 5k tokens
-	// Reason: a single combined "↓ 95k" was confusing next to the
-	// bottom-right "168k" — the user reported it looking like the
-	// per-step cost exceeded the session total. Splitting input from
-	// output makes the relationship to bottom-right (which only includes
-	// input + cache) obvious: the spinner's ↑ matches the bottom-right's
-	// numerator (modulo cache); ↓ is purely additional model output.
-	if in, out := m.totalTokens.LastIn(), m.totalTokens.LastOut(); in > 0 || out > 0 {
-		parts = append(parts, fmt.Sprintf("↑ %s · ↓ %s tokens",
-			formatTokens(in), formatTokens(out)))
+	// Spinner row shows ONE direction at a time, switching by phase
+	// (claude-code style — user feedback images #17-19):
+	//   ↑ N tokens — uploading / waiting for first stream chunk
+	//   ↓ N tokens — currently receiving stream deltas (text or thinking)
+	// The arrow flips back to ↑ at the start of each iteration (after
+	// a tool call when the next API call's prompt is being sent).
+	//
+	// Heuristic: streamingText / thinkingText empty AND firstStreamAt
+	// not yet set this turn → upload phase, show ↑ with last input.
+	// Otherwise → receiving, show ↓ with the larger of (lastOut, est
+	// from current streamingText length) so the count visibly grows
+	// during streaming rather than freezing on the previous round's
+	// final value.
+	receiving := !m.firstStreamAt.IsZero() && (m.streamingText != "" || m.thinkingText != "")
+	if receiving {
+		// Live estimate: chars/4 ≈ tokens (rough). Beats waiting for
+		// EventTokens to fire at end of stream, which leaves the
+		// counter visibly stuck mid-stream.
+		out := m.totalTokens.LastOut()
+		if est := (len(m.streamingText) + len(m.thinkingText)) / 4; est > out {
+			out = est
+		}
+		if out > 0 {
+			parts = append(parts, fmt.Sprintf("↓ %s tokens", formatTokens(out)))
+		}
+	} else if in := m.totalTokens.LastIn(); in > 0 {
+		parts = append(parts, fmt.Sprintf("↑ %s tokens", formatTokens(in)))
 	}
 	if !m.firstStreamAt.IsZero() {
 		thought := m.firstStreamAt.Sub(m.spinnerStartedAt)

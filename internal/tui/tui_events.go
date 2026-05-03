@@ -43,6 +43,11 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
 			m.streamingText = ""
 		}
+		// Reset firstStreamAt so the spinner row's directional arrow
+		// flips back to ↑ for the next iteration's upload phase
+		// (claude-code parity — user feedback images #17-19 showed the
+		// arrow toggling ↑ → ↓ → ↑ across tool boundaries).
+		m.firstStreamAt = time.Time{}
 		m.toolEvents = append(m.toolEvents, ToolEvent{Kind: "start", ToolName: ev.ToolName, Input: ev.ToolInput, StartTime: time.Now()})
 		m.spinnerVerb = toolVerb(ev.ToolName)
 		m.spinnerSub = toolArgsPreview(ev.ToolName, ev.ToolInput)

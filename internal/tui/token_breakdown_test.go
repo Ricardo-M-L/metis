@@ -81,30 +81,27 @@ func TestRenderCost_HidesCacheWhenZero(t *testing.T) {
 	}
 }
 
-// TestSpinnerRow_SplitsInputOutput — spinner row was previously
-// "↓ 95k tokens" which conflated input + output and caused the user to
-// confuse it with the bottom-right (input + cache) number. New form:
-// "↑ 90k · ↓ 5k tokens" makes the relationship explicit.
-func TestSpinnerRow_SplitsInputOutput(t *testing.T) {
+// TestSpinnerRow_PhasedArrow — superseded by TestSpinner_* (spinner_phase_test.go).
+// The spinner used to show both ↑ and ↓ at once; claude-code's pattern
+// (user feedback images #17-19) is single-arrow phase-based. This test
+// now just confirms the upload phase shows ↑ with the input value.
+func TestSpinnerRow_PhasedArrow(t *testing.T) {
 	m := minimalModel(200000)
 	m.totalTokens.add(90000, 5000, 0, 0)
 	m.spinnerActive = true
 	m.spinnerStartedAt = m.startTime
 	m.spinnerVerb = "thinking"
+	// Default: firstStreamAt is zero → upload phase → ↑ with input.
 
 	out := stripANSI(renderSpinnerStatus(m))
 	if !strings.Contains(out, "↑") {
-		t.Errorf("spinner row should contain ↑ glyph for input; got:\n%s", out)
+		t.Errorf("upload phase should show ↑; got:\n%s", out)
 	}
-	if !strings.Contains(out, "↓") {
-		t.Errorf("spinner row should contain ↓ glyph for output; got:\n%s", out)
+	if strings.Contains(out, "↓") {
+		t.Errorf("upload phase should NOT show ↓ (phased single-arrow); got:\n%s", out)
 	}
-	// Look for the values (formatTokens still abbreviates here).
 	if !strings.Contains(out, "90k") {
-		t.Errorf("spinner row should show input value 90k; got:\n%s", out)
-	}
-	if !strings.Contains(out, "5.0k") && !strings.Contains(out, "5k") {
-		t.Errorf("spinner row should show output value (~5k); got:\n%s", out)
+		t.Errorf("upload phase should show input value 90k; got:\n%s", out)
 	}
 }
 
