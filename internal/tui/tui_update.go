@@ -52,8 +52,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// are caught here. Type-assert + apply before clearing
 			// the activeScreen reference. Each new widget that needs
 			// to commit user-chosen state adds a case here.
-			m.applyScreenResult(m.activeScreen)
+			//
+			// applyScreenResult may return its own Cmd (e.g. /help
+			// dispatching the picked command) — batch with the screen
+			// Update's Cmd so neither is dropped.
+			extraCmd := m.applyScreenResult(m.activeScreen)
 			m.activeScreen = nil
+			if extraCmd != nil {
+				if cmd != nil {
+					return m, tea.Batch(cmd, extraCmd)
+				}
+				return m, extraCmd
+			}
 		}
 		return m, cmd
 	}

@@ -95,10 +95,10 @@ func TestHelpScreen_BodyCappedAtMax(t *testing.T) {
 	if got := s.bodyHeight(); got > helpMaxBody {
 		t.Errorf("bodyHeight() on huge terminal = %d, want <= %d", got, helpMaxBody)
 	}
-	// Verify scroll is meaningful: maxScroll should be > 0 even with
-	// the giant terminal.
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
-	if s.scroll != 1 {
-		t.Errorf("KeyDown should advance scroll on capped body; got %d", s.scroll)
+	// Verify scroll is meaningful: jump cursor to end forces scroll
+	// past 0 (otherwise the cap had no effect).
+	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	if s.scroll == 0 {
+		t.Errorf("End on capped body should advance scroll; got 0")
 	}
 }

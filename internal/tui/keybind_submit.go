@@ -186,6 +186,30 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Phase C+: list-style commands open the generic PickerScreen
+		// (cursor + Enter to pick). Pre-empt the BodyScreen path so
+		// the user can select + invoke instead of just reading a list.
+		switch name {
+		case "sessions":
+			items := m.sessionsPickerItems(20)
+			ps := screen.NewPickerScreen("/sessions", pickerSubtitle("recent sessions", len(items)), items)
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
+			return m, nil
+		case "skills":
+			items := m.skillsPickerItems()
+			ps := screen.NewPickerScreen("/skills", pickerSubtitle("skills loaded", len(items)), items)
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
+			return m, nil
+		case "tools":
+			items := m.toolsPickerItems()
+			ps := screen.NewPickerScreen("/tools", pickerSubtitle("tools registered", len(items)), items)
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
+			return m, nil
+		}
+
 		if cmd := m.cmds.Get(name); cmd != nil {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
@@ -282,9 +306,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.messages = append(m.messages, Message{Role: "success", Content: "(session synced to disk)", Timestamp: time.Now()})
 			}
 		case slash.SignalTools:
-			m.openBodyScreen("/tools", renderToolsList(m.loop))
+			items := m.toolsPickerItems()
+			ps := screen.NewPickerScreen("/tools", pickerSubtitle("tools registered", len(items)), items)
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
 		case slash.SignalSessions:
-			m.openBodyScreen("/sessions", renderSessionsList(m.session, 20))
+			items := m.sessionsPickerItems(20)
+			ps := screen.NewPickerScreen("/sessions", pickerSubtitle("recent sessions", len(items)), items)
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
 		case slash.SignalSession:
 			m.openBodyScreen("/session", renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())))
 		case slash.SignalStatus:
@@ -293,7 +323,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// only showed the placeholder "(status: see REPL)".
 			m.openBodyScreen("/status", renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())))
 		case slash.SignalSkills:
-			m.openBodyScreen("/skills", renderSkillsList(m.skillDir))
+			items := m.skillsPickerItems()
+			ps := screen.NewPickerScreen("/skills", pickerSubtitle("skills loaded", len(items)), items)
+			ps.Resize(m.width, m.height)
+			m.activeScreen = ps
 		case slash.SignalVersion:
 			m.openBodyScreen("/version", renderVersion())
 		case slash.SignalAddDir:

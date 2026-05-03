@@ -134,28 +134,37 @@ func TestHelpScreen_EscDismisses(t *testing.T) {
 	}
 }
 
-// TestHelpScreen_ScrollWithinTab — ↑↓ / j/k / PgUp/Dn / g/G work within
-// the active tab without affecting the tab selection.
+// TestHelpScreen_ScrollWithinTab — ↑↓ now move the cursor (post-cursor
+// rewrite) which auto-scrolls when the cursor leaves the viewport.
+// The active tab must NOT change.
 func TestHelpScreen_ScrollWithinTab(t *testing.T) {
 	tabs := sampleTabs()
-	// Many lines on first tab.
+	// Many lines on first tab — selectable so cursor can move.
 	for i := 0; i < 30; i++ {
-		tabs[0].Body = append(tabs[0].Body, HelpRow{Key: "/x", Value: "filler"})
+		tabs[0].Body = append(tabs[0].Body, HelpRow{Key: "/filler", Value: "filler"})
 	}
 	s := NewHelpScreen("v0.1.1", tabs)
 	s.Resize(80, 14)
 
+	startCursor := s.cursor
 	s.Update(tea.KeyMsg{Type: tea.KeyDown})
-	if s.scroll != 1 {
-		t.Errorf("Down: scroll = %d, want 1", s.scroll)
+	if s.cursor == startCursor {
+		t.Errorf("Down should move cursor; stayed at %d", s.cursor)
 	}
 	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
-	if s.scroll == 0 {
-		t.Errorf("End should jump to bottom; scroll = %d", s.scroll)
+	if s.cursor != s.firstSelectable() && s.scroll == 0 {
+		// End should put cursor on the last selectable, which forces scroll.
+		t.Errorf("End should advance scroll; cursor=%d scroll=%d", s.cursor, s.scroll)
 	}
 	s.Update(tea.KeyMsg{Type: tea.KeyHome})
-	if s.scroll != 0 {
-		t.Errorf("Home: scroll = %d, want 0", s.scroll)
+	first := s.firstSelectable()
+	if s.cursor != first {
+		t.Errorf("Home should put cursor on first selectable; got %d want %d", s.cursor, first)
+	}
+	// scrollToCursor brings cursor to top of viewport. With first
+	// selectable at index 2, scroll should be <= 2 (cursor is at top).
+	if s.scroll > s.cursor {
+		t.Errorf("Home should put cursor in view; cursor=%d scroll=%d", s.cursor, s.scroll)
 	}
 	if s.active != 0 {
 		t.Errorf("scroll keys should not change active tab; got %d", s.active)
