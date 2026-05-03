@@ -153,6 +153,16 @@ type Model struct {
 	spinnerStartedAt time.Time
 	spinnerVerb      string
 	spinnerSub       string
+	// spinnerPhase mirrors claude-code's SpinnerMode (sourcemap
+	// restored-src/src/components/Spinner/SpinnerAnimationRow.tsx
+	// lines 235-265). Drives the directional arrow:
+	//   "requesting" → ↑   (uploading prompt / waiting for first byte)
+	//   "thinking"   → ↓   (extended-thinking deltas streaming back)
+	//   "responding" → ↓   (text deltas streaming back)
+	//   "tool"       → ↓   (tool call in flight)
+	// State transitions happen in handleAgentEvent; the renderer in
+	// render_chrome.go switches arrow + count source on this field.
+	spinnerPhase string
 	// firstStreamAt records when the first text-delta of the current
 	// turn arrived. (firstStreamAt - spinnerStartedAt) is the wall-time
 	// the model spent before producing visible output, surfaced as
@@ -334,6 +344,17 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	ti.SetHeight(1)
 	ti.MaxHeight = 5
 	ti.ShowLineNumbers = false
+	// Disable virtual cursor — bubbles/v2 textarea paints the cursor by
+	// SGR-inverting the char under it (cursor.go View() always calls
+	// .Reverse(true) when not blinked-off), which produces a green/cyan
+	// block on the first placeholder character. claude-code uses the
+	// terminal's native cursor; matching that means turning off the
+	// inverse paint entirely. SetVirtualCursor(false) puts the cursor
+	// in CursorHide mode → cursor.View renders only TextStyle (no
+	// reverse), so the placeholder's first char blends with the rest of
+	// the dim grey placeholder text. The terminal's own cursor remains
+	// at the correct row/col via tea.View bookkeeping.
+	ti.SetVirtualCursor(false)
 	// SetPromptFunc lets textarea handle the per-line prompt itself —
 	// "> " on the first row, "  " on continuation rows. Doing this in
 	// textarea (instead of post-processing its View() output) avoids

@@ -22,6 +22,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// firstStreamAt because thinking precedes the actual reply
 		// and the "thought for Xs" timer keys off real text.
 		m.thinkingText += ev.TextDelta
+		m.spinnerPhase = "thinking" // arrow → ↓
 	case agent.EventTextDelta:
 		if m.firstStreamAt.IsZero() {
 			m.firstStreamAt = time.Now()
@@ -34,6 +35,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			m.thinkingText = ""
 		}
 		m.streamingText += ev.TextDelta
+		m.spinnerPhase = "responding" // arrow → ↓
 	case agent.EventToolStart:
 		if m.thinkingText != "" {
 			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
@@ -43,11 +45,13 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
 			m.streamingText = ""
 		}
-		// Reset firstStreamAt so the spinner row's directional arrow
-		// flips back to ↑ for the next iteration's upload phase
-		// (claude-code parity — user feedback images #17-19 showed the
-		// arrow toggling ↑ → ↓ → ↑ across tool boundaries).
+		// Reset firstStreamAt + flip spinner phase to "tool" (renders ↓
+		// for tool-input/use/responding/thinking per claude-code's
+		// SpinnerAnimationRow.tsx mode switch). When the tool finishes
+		// and the next API call starts, EventToolResult will flip back
+		// to "requesting" (↑).
 		m.firstStreamAt = time.Time{}
+		m.spinnerPhase = "tool"
 		m.toolEvents = append(m.toolEvents, ToolEvent{Kind: "start", ToolName: ev.ToolName, Input: ev.ToolInput, StartTime: time.Now()})
 		m.spinnerVerb = toolVerb(ev.ToolName)
 		m.spinnerSub = toolArgsPreview(ev.ToolName, ev.ToolInput)
@@ -80,6 +84,10 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		}
 		m.spinnerVerb = pickSpinnerVerb()
 		m.spinnerSub = ""
+		// Tool finished → the agent is about to send another API
+		// request with the tool result. Flip back to "requesting"
+		// (↑) until the next stream byte arrives.
+		m.spinnerPhase = "requesting"
 		// Sub-agent done — remove the matching SubAgentInfo. Match
 		// by tool-use ID so multiple concurrent sub-agents work.
 		if ev.ToolName == "Agent" {

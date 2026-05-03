@@ -95,13 +95,20 @@ func renderSpinnerStatus(m *Model) string {
 	// The arrow flips back to ↑ at the start of each iteration (after
 	// a tool call when the next API call's prompt is being sent).
 	//
-	// Heuristic: streamingText / thinkingText empty AND firstStreamAt
-	// not yet set this turn → upload phase, show ↑ with last input.
-	// Otherwise → receiving, show ↓ with the larger of (lastOut, est
-	// from current streamingText length) so the count visibly grows
-	// during streaming rather than freezing on the previous round's
-	// final value.
-	receiving := !m.firstStreamAt.IsZero() && (m.streamingText != "" || m.thinkingText != "")
+	// Source of truth: explicit spinnerPhase, set in handleAgentEvent
+	// (mirrors claude-code's SpinnerMode enum from
+	// SpinnerAnimationRow.tsx). When unset (legacy callers / tests
+	// that don't drive events) fall back to the firstStreamAt + buffer
+	// heuristic so historical behavior holds.
+	var receiving bool
+	switch m.spinnerPhase {
+	case "thinking", "responding", "tool", "tool-input", "tool-use":
+		receiving = true
+	case "requesting":
+		receiving = false
+	default:
+		receiving = !m.firstStreamAt.IsZero() && (m.streamingText != "" || m.thinkingText != "")
+	}
 	if receiving {
 		// Live estimate: chars/4 ≈ tokens (rough). Beats waiting for
 		// EventTokens to fire at end of stream, which leaves the
