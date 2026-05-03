@@ -13,21 +13,21 @@ import (
 //
 // Layout:
 //
-//   [/skills · code-review]
+//	[/skills · code-review]
 //
-//   Description
-//     review staged diff for bugs, style, security
+//	Description
+//	  review staged diff for bugs, style, security
 //
-//   When to use
-//     after `git add`, before `git commit`
+//	When to use
+//	  after `git add`, before `git commit`
 //
-//   Allowed tools
-//     Read · Edit · Bash · Git
+//	Allowed tools
+//	  Read · Edit · Bash · Git
 //
-//   Body
-//     ┃ <full prompt body, scrollable>
+//	Body
+//	  ┃ <full prompt body, scrollable>
 //
-//   ↑/↓ scroll · Esc back
+//	↑/↓ scroll · Esc back
 //
 // Caller builds DetailSection list (key/value rows + a free-form Body)
 // from the picked resource. Sections render top-to-bottom in order.

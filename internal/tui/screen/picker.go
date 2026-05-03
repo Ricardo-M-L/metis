@@ -23,13 +23,13 @@ type PickerItem struct {
 //
 // Layout:
 //
-//   [/sessions]  20 saved sessions
+//	[/sessions]  20 saved sessions
 //
-//     2026-05-02T13:03  · model=MiniMax-M2.7    abcd1234
-//   ▸ 2026-05-02T13:00  · model=claude-opus-4-7 efgh5678   ← cursor
-//     2026-05-02T12:55  · model=MiniMax-M2.7    ijkl9012
+//	  2026-05-02T13:03  · model=MiniMax-M2.7    abcd1234
+//	▸ 2026-05-02T13:00  · model=claude-opus-4-7 efgh5678   ← cursor
+//	  2026-05-02T12:55  · model=MiniMax-M2.7    ijkl9012
 //
-//   ↑/↓ select  ·  Enter pick  ·  Esc close
+//	↑/↓ select  ·  Enter pick  ·  Esc close
 //
 // Wraparound nav (claude-code parity), auto-scroll-to-cursor, ↑N/↓N
 // overflow indicators.

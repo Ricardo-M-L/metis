@@ -13,8 +13,8 @@ import (
 // emits across multiple message_delta events. Kept package-private; the
 // final tally is forwarded to callers as an Event{Kind: EventTokens}.
 type usageTotals struct {
-	in, out                  int
-	cacheCreate, cacheRead   int
+	in, out                int
+	cacheCreate, cacheRead int
 }
 
 // consumeStream reads StreamEvents from the LLM stream, emits text and tool

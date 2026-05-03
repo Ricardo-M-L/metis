@@ -98,9 +98,9 @@ func TestHelpCursor_EnterOnNonSelectableLeavesEmpty(t *testing.T) {
 func TestHelpCursor_TabSwitchResetsCursor(t *testing.T) {
 	s := NewHelpScreen("v1", cursorTabs())
 	s.Resize(80, 30)
-	s.switchTab(1) // commands, cursor=2
+	s.switchTab(1)                               // commands, cursor=2
 	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // cursor=3 (/clear)
-	s.switchTab(0) // general — no selectable
+	s.switchTab(0)                               // general — no selectable
 	if s.cursor != 0 {
 		t.Errorf("after switch back to general (no selectable), cursor should reset to 0; got %d", s.cursor)
 	}

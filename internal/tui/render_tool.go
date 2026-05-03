@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	udiff "github.com/aymanbagabas/go-udiff"
 	"charm.land/lipgloss/v2"
+	udiff "github.com/aymanbagabas/go-udiff"
 )
 
 // renderToolEvent prints one tool call. Leader row repeats whether

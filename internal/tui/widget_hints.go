@@ -5,11 +5,11 @@ package tui
 // non-empty replaces the registered Description so the user sees what
 // will happen when they press Enter:
 //
-//   /effort       → "→ slider: off / low / medium / high"
-//   /help         → "→ tabs: general / commands / custom-commands"
-//   /model        → "→ picker: choose model from curated list"
-//   /theme        → "→ cycle: dark / light / dark-daltonized"
-//   /permissions  → "→ editor: cycle mode + view rules"
+//	/effort       → "→ slider: off / low / medium / high"
+//	/help         → "→ tabs: general / commands / custom-commands"
+//	/model        → "→ picker: choose model from curated list"
+//	/theme        → "→ cycle: dark / light / dark-daltonized"
+//	/permissions  → "→ editor: cycle mode + view rules"
 //
 // Empty return means "use the registered Description" — the default
 // behavior for non-widget commands.

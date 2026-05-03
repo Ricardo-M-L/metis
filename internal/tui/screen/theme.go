@@ -19,13 +19,13 @@ type ThemeChoice struct {
 
 // ThemeScreen is the /theme cycle widget. Layout:
 //
-//   [/theme]
+//	[/theme]
 //
-//   Theme:  ◀  dark-daltonized  ▶
+//	Theme:  ◀  dark-daltonized  ▶
 //
-//             ▮▮ ▮▮ ▮▮ ▮▮ ▮▮ ▮▮     ← live swatches
+//	          ▮▮ ▮▮ ▮▮ ▮▮ ▮▮ ▮▮     ← live swatches
 //
-//   ←/→ to cycle  ·  Enter to apply  ·  Esc to cancel
+//	←/→ to cycle  ·  Enter to apply  ·  Esc to cancel
 type ThemeScreen struct {
 	choices []ThemeChoice
 	cursor  int

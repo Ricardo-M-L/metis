@@ -309,11 +309,11 @@ type diagAcc struct {
 	current string
 }
 
-func newDiag() *diagAcc                      { return &diagAcc{current: "general"} }
-func (d *diagAcc) section(name string)       { d.current = name }
-func (d *diagAcc) ok(name, detail string)    { d.add(name, "ok", detail) }
-func (d *diagAcc) warn(name, detail string)  { d.add(name, "warn", detail) }
-func (d *diagAcc) fail(name, detail string)  { d.add(name, "fail", detail) }
+func newDiag() *diagAcc                     { return &diagAcc{current: "general"} }
+func (d *diagAcc) section(name string)      { d.current = name }
+func (d *diagAcc) ok(name, detail string)   { d.add(name, "ok", detail) }
+func (d *diagAcc) warn(name, detail string) { d.add(name, "warn", detail) }
+func (d *diagAcc) fail(name, detail string) { d.add(name, "fail", detail) }
 func (d *diagAcc) add(name, status, detail string) {
 	d.rows = append(d.rows, diagRow{Section: d.current, Name: name, Status: status, Detail: detail})
 }

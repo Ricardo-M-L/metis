@@ -31,13 +31,13 @@ type InfoRow struct {
 // rendering with virtualized list); InfoScreen takes pre-shaped rows
 // and renders them itself, no list package needed.
 type InfoScreen struct {
-	command  string   // e.g. "/cost" — shows in the header stripe
-	title    string   // e.g. "Session Cost · MiniMax-M2.7" — body title
-	rows     []InfoRow
-	scroll   int      // line offset
-	width    int
-	height   int
-	done     bool
+	command string // e.g. "/cost" — shows in the header stripe
+	title   string // e.g. "Session Cost · MiniMax-M2.7" — body title
+	rows    []InfoRow
+	scroll  int // line offset
+	width   int
+	height  int
+	done    bool
 }
 
 // NewInfoScreen builds the screen ready to View(). The command argument

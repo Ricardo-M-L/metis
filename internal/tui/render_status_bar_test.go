@@ -19,8 +19,8 @@ type fakeContextProvider struct {
 	maxCtx int
 }
 
-func (p *fakeContextProvider) Name() string                  { return "fake" }
-func (p *fakeContextProvider) MaxContextTokens() int         { return p.maxCtx }
+func (p *fakeContextProvider) Name() string          { return "fake" }
+func (p *fakeContextProvider) MaxContextTokens() int { return p.maxCtx }
 func (p *fakeContextProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
 	return nil, errors.New("not implemented")
 }
@@ -129,9 +129,9 @@ func TestStatusBar_PercentMatchesCC(t *testing.T) {
 		input, output, cacheCreate, cacheRead, maxCtx int
 		wantPct                                       string
 	}{
-		{1000, 0, 0, 0, 100000, "(1%)"},     // 1000 / 100000
-		{50000, 0, 0, 0, 200000, "(25%)"},   // 50000 / 200000
-		{180000, 0, 0, 0, 200000, "(90%)"},  // 180000 / 200000
+		{1000, 0, 0, 0, 100000, "(1%)"},        // 1000 / 100000
+		{50000, 0, 0, 0, 200000, "(25%)"},      // 50000 / 200000
+		{180000, 0, 0, 0, 200000, "(90%)"},     // 180000 / 200000
 		{500, 9999, 0, 99500, 200000, "(50%)"}, // 100000 / 200000 — output excluded, cache included
 	}
 	for _, tc := range cases {

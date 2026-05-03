@@ -40,8 +40,8 @@ func TestEffortScreen_InitialCursor(t *testing.T) {
 		{"low", 1},
 		{"medium", 2},
 		{"high", 3},
-		{"unknown", 2}, // fallback to medium
-		{"", 2},        // also fallback to medium
+		{"unknown", 2},  // fallback to medium
+		{"", 2},         // also fallback to medium
 		{"  HIGH  ", 3}, // case + whitespace tolerant
 	}
 	for _, tc := range cases {

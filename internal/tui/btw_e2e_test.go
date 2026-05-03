@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/textarea"
-	"github.com/Ricardo-M-L/metis/internal/tui/list"
 	tea "charm.land/bubbletea/v2"
+	"github.com/Ricardo-M-L/metis/internal/tui/list"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/slash"

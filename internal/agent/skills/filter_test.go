@@ -29,13 +29,13 @@ func TestIsJunkFilename(t *testing.T) {
 		{"api-design.md", false},
 		{"git-bisect.md", false},
 		{"installed.json", false},
-		{"_underscore.md", false},     // leading single underscore is fine
-		{".dotfile.md", false},        // leading dot alone is fine (don't over-filter)
-		{"foo._bar.md", false},        // `._` only at prefix counts
-		{"weird~name.md", false},      // `~` only at prefix counts
-		{"DS_Store", false},           // missing leading dot
-		{"my.DS_Store.md", false},     // contains but isn't equal
-		{"", false},                   // empty handled by callers
+		{"_underscore.md", false}, // leading single underscore is fine
+		{".dotfile.md", false},    // leading dot alone is fine (don't over-filter)
+		{"foo._bar.md", false},    // `._` only at prefix counts
+		{"weird~name.md", false},  // `~` only at prefix counts
+		{"DS_Store", false},       // missing leading dot
+		{"my.DS_Store.md", false}, // contains but isn't equal
+		{"", false},               // empty handled by callers
 	}
 	for _, tc := range cases {
 		got := isJunkFilename(tc.name)
@@ -68,11 +68,11 @@ body
 
 	// Five junk files that previously polluted the bundle
 	junk := []string{
-		"._real-one.md",      // resource fork mirroring a real file
-		"._ghost.md",         // resource fork with no real counterpart
-		"~scratch.md",        // editor backup
-		"._installed.json",   // resource fork on installed-skill JSON
-		".DS_Store",          // Finder metadata
+		"._real-one.md",    // resource fork mirroring a real file
+		"._ghost.md",       // resource fork with no real counterpart
+		"~scratch.md",      // editor backup
+		"._installed.json", // resource fork on installed-skill JSON
+		".DS_Store",        // Finder metadata
 	}
 	for _, n := range junk {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte("garbage"), 0o644); err != nil {

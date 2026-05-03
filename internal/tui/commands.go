@@ -1272,16 +1272,17 @@ func sanitize(name string) string {
 //     lastCacheRead) — overwritten on every API call. Two distinct
 //     status displays read from these:
 //
-//       (a) Spinner row "↓ 38123 tokens"  →  LastTotal() == lastIn + lastOut
-//           This is the per-turn cost: what the most recent round trip
-//           actually consumed (input + output).
+//     (a) Spinner row "↓ 38123 tokens"  →  LastTotal() == lastIn + lastOut
+//     This is the per-turn cost: what the most recent round trip
+//     actually consumed (input + output).
 //
-//       (b) Bottom-right status bar "38123 tokens (19%)"  →  ContextUsage()
-//           This is the context-window load: lastIn + lastCacheCreate
-//           + lastCacheRead. Mirrors claude-code's statusline formula
-//           (input-side only, including prompt-cache contribution; see
-//           https://code.claude.com/docs/en/statusline.md). Output is
-//           NOT included — it isn't part of the in-flight context.
+//     (b) Bottom-right status bar "38123 tokens (19%)"  →  ContextUsage()
+//     This is the context-window load: lastIn + lastCacheCreate
+//
+//   - lastCacheRead. Mirrors claude-code's statusline formula
+//     (input-side only, including prompt-cache contribution; see
+//     https://code.claude.com/docs/en/statusline.md). Output is
+//     NOT included — it isn't part of the in-flight context.
 //
 // The two numbers diverge in two ways:
 //   - ContextUsage adds cache (CC parity); LastTotal does not.
@@ -1289,11 +1290,11 @@ func sanitize(name string) string {
 //
 // `dispIn/dispOut` are smoothed values for animation.
 type tokenTracker struct {
-	in, out                            int // session cumulative input/output
-	cacheCreate, cacheRead             int // session cumulative cache (for /cost transparency)
-	lastIn, lastOut                    int // most recent API call (per-turn cost)
-	lastCacheCreate, lastCacheRead     int // most recent API call (cache portion of input)
-	dispIn, dispOut                    int
+	in, out                        int // session cumulative input/output
+	cacheCreate, cacheRead         int // session cumulative cache (for /cost transparency)
+	lastIn, lastOut                int // most recent API call (per-turn cost)
+	lastCacheCreate, lastCacheRead int // most recent API call (cache portion of input)
+	dispIn, dispOut                int
 }
 
 // add records a per-iteration usage report. `in`/`out` accumulate

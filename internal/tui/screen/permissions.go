@@ -23,23 +23,23 @@ type PermRule struct {
 //
 // Layout:
 //
-//   [/permissions]
+//	[/permissions]
 //
-//     Mode:  ◀  auto  ▶          (interactive — Enter to apply mode)
+//	  Mode:  ◀  auto  ▶          (interactive — Enter to apply mode)
 //
-//     Rules (3):                   (read-only — use /allow to add)
-//       allow  Bash      session
-//       allow  Read      ~/.metis/config.toml
-//       deny   WebFetch  session
+//	  Rules (3):                   (read-only — use /allow to add)
+//	    allow  Bash      session
+//	    allow  Read      ~/.metis/config.toml
+//	    deny   WebFetch  session
 //
-//     ←/→ change mode  ·  Enter apply mode  ·  Esc close
+//	  ←/→ change mode  ·  Enter apply mode  ·  Esc close
 type PermissionsScreen struct {
 	modes       []string
 	modeCursor  int
 	initialMode string
 
-	rules        []PermRule
-	rulesScroll  int
+	rules       []PermRule
+	rulesScroll int
 
 	width   int
 	height  int

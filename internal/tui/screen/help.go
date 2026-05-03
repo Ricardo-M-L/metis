@@ -41,15 +41,15 @@ func (r HelpRow) isSelectable() bool {
 // (▸ marker) over command rows, Enter dispatches the highlighted
 // command via Selected().
 //
-//   [/help]
+//	[/help]
 //
-//   metis vX.Y.Z   [general]   commands   custom-commands     (tabs row)
+//	metis vX.Y.Z   [general]   commands   custom-commands     (tabs row)
 //
-//     /agents     list sub-agents currently in flight (Agent tool)
-//   ▸ /commit     git commit (-m 'message')                      ← cursor
-//     /compact    force context compaction now
+//	  /agents     list sub-agents currently in flight (Agent tool)
+//	▸ /commit     git commit (-m 'message')                      ← cursor
+//	  /compact    force context compaction now
 //
-//   ← / →  switch tab  ·  ↑/↓ select  ·  Enter run  ·  Esc close
+//	← / →  switch tab  ·  ↑/↓ select  ·  Enter run  ·  Esc close
 type HelpScreen struct {
 	version string
 	tabs    []HelpTab

@@ -21,13 +21,13 @@ import (
 // (outer header stripe + inner box) looks intentional rather than
 // accidental — comparable to claude-code's modals.
 type BodyScreen struct {
-	command  string
-	body     string   // pre-rendered, may contain ANSI styles
-	lines    []string // split for scrolling
-	scroll   int
-	width    int
-	height   int
-	done     bool
+	command string
+	body    string   // pre-rendered, may contain ANSI styles
+	lines   []string // split for scrolling
+	scroll  int
+	width   int
+	height  int
+	done    bool
 }
 
 // NewBodyScreen builds a BodyScreen ready to View(). command is the

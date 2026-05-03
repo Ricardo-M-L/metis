@@ -49,7 +49,7 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		{"/usage", []string{"rate limit"}, "repl"},
 		{"/doctor", []string{"Metis Doctor", "config", "git"}, "repl"},
 		{"/vim", []string{"vim mode:"}, "repl"},
-		{"/theme", []string{"Theme", "◀", "▶"}, "widget"}, // Phase C4: opens cycle widget
+		{"/theme", []string{"Theme", "◀", "▶"}, "widget"},             // Phase C4: opens cycle widget
 		{"/effort", []string{"Speed", "Intelligence", "▲"}, "widget"}, // Phase C1: opens slider widget
 		{"/effort high", []string{"effort: high"}, "repl"},
 		{"/context", []string{"Context Window", "in last call", "tokens"}, "repl"},
@@ -57,9 +57,9 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 
 		// Slash-owned (added in 2026-05-01 audit) --------------------------
 		{"/keybindings", []string{"Keybindings", "Ctrl-C", "Esc"}, "slash"},
-		{"/keys", []string{"Ctrl-C"}, "slash"}, // alias
-		{"/permissions", []string{"Mode", "Rules", "◀", "▶"}, "widget"},     // Phase C5: opens editor
-		{"/perms", []string{"Mode", "Rules", "◀", "▶"}, "widget"},          // Phase C5: same widget
+		{"/keys", []string{"Ctrl-C"}, "slash"},                          // alias
+		{"/permissions", []string{"Mode", "Rules", "◀", "▶"}, "widget"}, // Phase C5: opens editor
+		{"/perms", []string{"Mode", "Rules", "◀", "▶"}, "widget"},       // Phase C5: same widget
 		{"/hooks", []string{"hooks"}, "slash"},
 		{"/stats", []string{"Session Stats", "user turns", "tool calls"}, "slash"},
 		{"/release-notes", []string{"metis"}, "slash"},

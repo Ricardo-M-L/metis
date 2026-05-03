@@ -19,17 +19,17 @@ type ModelChoice struct {
 // ModelScreen is the /model arrow-nav picker mirroring claude-code's
 // model selector. Layout:
 //
-//   [/model]
+//	[/model]
 //
-//     Pick a model — current: claude-opus-4-7
+//	  Pick a model — current: claude-opus-4-7
 //
-//     ▸ claude-opus-4-7        most capable, best for hard tasks  · anthropic
-//       claude-sonnet-4-6      fast + smart, balanced              · anthropic
-//       claude-haiku-4-5       cheapest, instant                   · anthropic
-//       MiniMax-M2.7           open-weight, 192k context           · minimax
-//       ...
+//	  ▸ claude-opus-4-7        most capable, best for hard tasks  · anthropic
+//	    claude-sonnet-4-6      fast + smart, balanced              · anthropic
+//	    claude-haiku-4-5       cheapest, instant                   · anthropic
+//	    MiniMax-M2.7           open-weight, 192k context           · minimax
+//	    ...
 //
-//     ↑/↓ to choose  ·  Enter to apply  ·  Esc to cancel
+//	  ↑/↓ to choose  ·  Enter to apply  ·  Esc to cancel
 type ModelScreen struct {
 	choices []ModelChoice
 	current string // existing model — highlighted as starting cursor
