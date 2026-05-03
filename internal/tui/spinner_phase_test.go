@@ -75,14 +75,63 @@ func TestSpinner_ReceivePhaseUsesLiveEstimate(t *testing.T) {
 	}
 }
 
+// TestSpinner_PhaseEnumOverridesHeuristic — when spinnerPhase is set
+// explicitly (the post-Task#62 path driven by handleAgentEvent), the
+// renderer must trust the enum and ignore the firstStreamAt + buffer
+// heuristic. Mirrors claude-code's SpinnerAnimationRow.tsx mode switch:
+//
+//	"requesting"                              → ↑
+//	"thinking" / "responding" / "tool" / *    → ↓
+//
+// Without this guard a thinking-only response (no text deltas yet,
+// streamingText="") would fall through the heuristic to ↑ even though
+// CC clearly shows ↓ during extended-thinking streams.
+func TestSpinner_PhaseEnumOverridesHeuristic(t *testing.T) {
+	cases := []struct {
+		phase     string
+		wantArrow string
+	}{
+		{"requesting", "↑"},
+		{"thinking", "↓"},
+		{"responding", "↓"},
+		{"tool", "↓"},
+		{"tool-input", "↓"},
+		{"tool-use", "↓"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.phase, func(t *testing.T) {
+			m := minimalModel(200000)
+			m.spinnerActive = true
+			m.spinnerStartedAt = m.startTime
+			m.spinnerVerb = "thinking"
+			m.spinnerPhase = tc.phase
+			// Both lastIn and lastOut present so each branch has
+			// something to print — verifies arrow choice, not value.
+			m.totalTokens.add(8200, 1500, 0, 0)
+
+			out := stripANSI(renderSpinnerStatus(m))
+			if !strings.Contains(out, tc.wantArrow) {
+				t.Errorf("phase=%q: want arrow %q in output; got:\n%s", tc.phase, tc.wantArrow, out)
+			}
+			otherArrow := "↑"
+			if tc.wantArrow == "↑" {
+				otherArrow = "↓"
+			}
+			if strings.Contains(out, otherArrow) {
+				t.Errorf("phase=%q: unwanted arrow %q in output; got:\n%s", tc.phase, otherArrow, out)
+			}
+		})
+	}
+}
+
 // TestSpinner_NeverShowsBothArrows — the user-visible regression:
 // previously metis showed "↑ N · ↓ M tokens" simultaneously which
 // looked nothing like claude-code. Make sure no code path shows both.
 func TestSpinner_NeverShowsBothArrows(t *testing.T) {
 	cases := []struct {
-		name           string
-		setReceiving   bool
-		streamingText  string
+		name            string
+		setReceiving    bool
+		streamingText   string
 		lastIn, lastOut int
 	}{
 		{"upload, both counts present", false, "", 5000, 100},
