@@ -66,11 +66,20 @@ func (s *HelpScreen) Resize(width, height int) {
 func (s *HelpScreen) Done() bool { return s.done }
 
 // bodyHeight reserves rows for header (1) + tabs row (1) + spacer (1)
-// + footer hint (2) ≈ 5.
+// + footer hint (2) ≈ 5. Capped at maxBodyHeight so the modal feels
+// modal-sized even on huge terminals — claude-code's help doesn't
+// stretch to fill the whole screen, and capping here gives the user a
+// reason to actually scroll (without the cap, content fits the
+// viewport on any reasonable terminal and ↑↓ silently no-op).
+const helpMaxBody = 18
+
 func (s *HelpScreen) bodyHeight() int {
 	h := s.height - 5
 	if h < 3 {
 		h = 3
+	}
+	if h > helpMaxBody {
+		h = helpMaxBody
 	}
 	return h
 }
@@ -222,21 +231,41 @@ func (s *HelpScreen) View() string {
 	if end > len(body) {
 		end = len(body)
 	}
-	for i := s.scroll; i < end; i++ {
+	// "↑ N more above" indicator when scroll > 0. Same idea as
+	// claude-code's image #9 ("↑ /claude-api"): tells the user there's
+	// content above the viewport. Replaces the first body row when
+	// shown so we don't lose render budget.
+	visible := body[s.scroll:end]
+	if s.scroll > 0 && len(visible) > 0 {
+		visible[0] = helpMuted.Render("↑ " + itoa(s.scroll) + " more above")
+	}
+	if end < len(body) && len(visible) > 0 {
+		// "↓ N more below" replaces the last visible row when content
+		// overflows past the viewport. Mirrors claude-code's "↓ /agents".
+		visible[len(visible)-1] = helpMuted.Render("↓ " + itoa(len(body)-end) + " more below")
+	}
+	for _, line := range visible {
 		out.WriteString("  ")
-		out.WriteString(body[i])
+		out.WriteString(line)
 		out.WriteString("\n")
 	}
-	for i := end - s.scroll; i < bh; i++ {
+	for i := len(visible); i < bh; i++ {
 		out.WriteString("\n")
 	}
 
-	// Footer hint.
-	hint := "← / →  switch tab  ·  ↑/↓  scroll  ·  Esc to close"
-	if len(s.tabs) <= 1 {
-		hint = "↑/↓  scroll  ·  Esc to close"
+	// Footer hint adapts to actual capabilities so it doesn't promise
+	// scroll when content fits in the viewport.
+	canScroll := len(body) > bh
+	canSwitchTab := len(s.tabs) > 1
+	parts := []string{}
+	if canSwitchTab {
+		parts = append(parts, "← / →  switch tab")
 	}
-	out.WriteString(helpMuted.Render("  " + hint))
+	if canScroll {
+		parts = append(parts, "↑/↓  scroll")
+	}
+	parts = append(parts, "Esc to close")
+	out.WriteString(helpMuted.Render("  " + strings.Join(parts, "  ·  ")))
 
 	return out.String()
 }
