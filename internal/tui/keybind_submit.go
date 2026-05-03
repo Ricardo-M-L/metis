@@ -52,6 +52,7 @@ var modalCommands = map[string]bool{
 	"memory":      true,
 	"mcp":         true,
 	"sessions":    true,
+	"statusline":  true,
 }
 
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {

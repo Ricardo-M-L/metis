@@ -140,24 +140,19 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 				})
 			}
 		case "/skills":
-			// Show the picked skill's full prompt body via Skill tool
-			// hint — for now surface a confirmation pointing at /skill
-			// install or /skill describe (TODO: detail screen).
-			m.messages = append(m.messages, Message{
-				Role:      "info",
-				Content:   "skill: " + picked + " — use the Skill tool to invoke",
-				Timestamp: time.Now(),
-			})
+			// Open DetailScreen with full prompt body, allowed tools,
+			// when_to_use, and version metadata.
+			if ds := m.skillDetailScreen(picked); ds != nil {
+				ds.Resize(m.width, m.height)
+				m.activeScreen = ds
+			}
 		case "/tools":
-			// Surface the tool name + a hint that tool dispatch is
-			// LLM-driven (the user can't directly invoke a tool —
-			// tools fire when the agent decides to). The picker still
-			// works as a "browse + remind myself what's available" UX.
-			m.messages = append(m.messages, Message{
-				Role:      "info",
-				Content:   "tool: " + picked + " — invoked by the agent on demand, not directly",
-				Timestamp: time.Now(),
-			})
+			// Open DetailScreen with description + JSON schema so the
+			// user can see what arguments the tool takes.
+			if ds := m.toolDetailScreen(picked); ds != nil {
+				ds.Resize(m.width, m.height)
+				m.activeScreen = ds
+			}
 		}
 	}
 	return nil

@@ -135,6 +135,10 @@ func BuildREPLCommands() *REPLCommandRegistry {
 
 	// === Info ===
 	r.Register(REPLCommand{Name: "version", Aliases: []string{"v", "--version"}, Description: "show version", Handler: cmdVersion})
+	r.Register(REPLCommand{Name: "login", Description: "set up provider credentials (delegates to metis auth login)", Handler: cmdLogin})
+	r.Register(REPLCommand{Name: "logout", Description: "remove a stored provider credential", Handler: cmdLogout})
+	r.Register(REPLCommand{Name: "init", Description: "scaffold a CLAUDE.md for this repo (claude-code parity)", Handler: cmdInit})
+	r.Register(REPLCommand{Name: "statusline", Description: "show + customize the bottom status line", Handler: cmdStatusLine})
 	r.Register(REPLCommand{Name: "cost", Description: "show token usage for current session", Handler: cmdCost})
 	r.Register(REPLCommand{Name: "tokens", Description: "show last API call's raw token breakdown (input/output/cache)", Handler: cmdTokens})
 	r.Register(REPLCommand{Name: "usage", Description: "show API rate limit info", Handler: cmdUsage})
@@ -1018,6 +1022,70 @@ func cmdDoctor(r *REPL, args string) string {
 
 func cmdVersion(r *REPL, args string) string {
 	return renderVersion()
+}
+
+// cmdLogin / cmdLogout — slash entries that delegate to the top-level
+// `metis auth` family. The auth wizard runs its own bubbletea program
+// which can't safely re-enter the chat surface's program, so we surface
+// a clear "exit + run from shell" hint rather than crash. Adding these
+// slashes lets users discover credential setup from inside chat (CC
+// parity — they have /login and /logout in the slash registry too).
+func cmdLogin(r *REPL, args string) string {
+	provider := strings.TrimSpace(args)
+	if provider == "" {
+		return "login: exit chat (Ctrl-D or /quit) and run `metis auth login`\n" +
+			"  · interactive wizard picks provider + stores key in ~/.metis/auth.json\n" +
+			"  · or one-shot: `metis auth login <provider>` (anthropic | openai | gemini)"
+	}
+	return "login: exit chat and run `metis auth login " + provider + "`\n" +
+		"  · sets the credential for " + provider + " then resume metis"
+}
+
+func cmdLogout(r *REPL, args string) string {
+	provider := strings.TrimSpace(args)
+	if provider == "" {
+		return "logout: exit chat and run `metis auth logout <provider>`\n" +
+			"  · removes that provider's stored key from ~/.metis/auth.json\n" +
+			"  · use `metis auth list` first to see what's stored"
+	}
+	return "logout: exit chat and run `metis auth logout " + provider + "`"
+}
+
+// cmdInit scaffolds a CLAUDE.md in cwd for this project. Cross-tool
+// convention (claude-code, Cursor, Aider all read it). Use --force to
+// overwrite. Detects project type from sentinel files (go.mod /
+// package.json / Cargo.toml / pyproject.toml) and pre-fills build /
+// test commands. The user is expected to fill in the conventions
+// section by hand.
+func cmdInit(r *REPL, args string) string {
+	output, _ := runInitCommand(args)
+	return output
+}
+
+// cmdStatusLine documents the current status-line layout and points at
+// the config knobs that customize it. Full customization (preset
+// layouts, custom format strings) is a separate refactor — for now
+// this is the discoverability hook so users can find the configuration
+// surface from inside chat (CC parity for /statusline as a discovery
+// command, even if the editing UX is config-file rather than TUI).
+func cmdStatusLine(r *REPL, args string) string {
+	return renderInfoBox("Status Line", []infoRow{
+		{Key: "current layout", Value: "elapsed · effort · mode · subagents · tokens"},
+		{Key: "", Value: ""},
+		{Key: "Customize via:", Value: ""},
+		{Key: "  ~/.metis/config.toml", Value: "[ui] section — set theme + statusline knobs"},
+		{Key: "  METIS_THEME env", Value: "override theme without editing the file"},
+		{Key: "", Value: ""},
+		{Key: "Available pieces:", Value: ""},
+		{Key: "  elapsed", Value: "wall-clock for the current turn"},
+		{Key: "  effort", Value: "reasoning effort glyph (low/med/high/off)"},
+		{Key: "  mode", Value: "permission mode (auto/ask/bypass/plan/deny)"},
+		{Key: "  subagents", Value: "active Agent tool sub-agent pills"},
+		{Key: "  tokens", Value: "context-window load + percent (right-aligned)"},
+		{Key: "  spinner", Value: "↑in / ↓out per-turn breakdown"},
+		{Key: "", Value: ""},
+		{Key: "", Value: "Full preset picker (/statusline cycle) — coming in a future release."},
+	})
 }
 
 func cmdCost(r *REPL, args string) string {

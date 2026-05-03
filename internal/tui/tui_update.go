@@ -53,11 +53,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the activeScreen reference. Each new widget that needs
 			// to commit user-chosen state adds a case here.
 			//
-			// applyScreenResult may return its own Cmd (e.g. /help
-			// dispatching the picked command) — batch with the screen
-			// Update's Cmd so neither is dropped.
-			extraCmd := m.applyScreenResult(m.activeScreen)
-			m.activeScreen = nil
+			// applyScreenResult may set m.activeScreen to a NEW screen
+			// (PickerScreen → DetailScreen drill-down). Snapshot the
+			// done screen first, run apply, then only clear if apply
+			// didn't replace it.
+			doneScreen := m.activeScreen
+			extraCmd := m.applyScreenResult(doneScreen)
+			if m.activeScreen == doneScreen {
+				// apply didn't open a follow-up — clear as usual.
+				m.activeScreen = nil
+			}
 			if extraCmd != nil {
 				if cmd != nil {
 					return m, tea.Batch(cmd, extraCmd)
