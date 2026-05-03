@@ -117,6 +117,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 
 	// === MCP ===
 	r.Register(REPLCommand{Name: "mcp", Description: "MCP ops: list | add <name> <cmd> | remove <name> | start <name>", Handler: cmdMCP})
+	r.Register(REPLCommand{Name: "cu", Description: "computer-use (metis-cu) ops: enable | disable | status", Handler: cmdCU})
 
 	// === Session ===
 	r.Register(REPLCommand{Name: "session", Aliases: []string{"sid"}, Description: "show current session id", Handler: cmdSession})
@@ -456,7 +457,12 @@ func cmdVoice(r *REPL, args string) string {
 		}
 		return "voice: " + text
 	}
-	return "voice: unknown arg " + args
+	// Echoing back arbitrary user text into the warning ("unknown arg
+	// 这个命令怎么使用") was confusing — the user thought `/voice` couldn't
+	// answer free-form questions. Show the actual usage instead. claude-
+	// code's voice command is a pure toggle; metis exposes start/stop
+	// as well, hence the extra hint.
+	return "voice: usage — /voice (toggle) | /voice start | /voice stop"
 }
 
 // cmdVim toggles modal-input ("vim") mode. NORMAL intercepts hjkl /

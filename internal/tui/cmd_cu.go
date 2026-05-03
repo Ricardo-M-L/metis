@@ -1,0 +1,154 @@
+package tui
+
+// /cu — one-line computer-use (metis-cu) management. Thin wrapper
+// around /mcp that hardcodes the name ("computer-use"), the binary
+// ("metis-cu"), and an in-session LaunchMCPServer so the tools are
+// visible on the next turn instead of waiting for a metis restart.
+//
+// Why a dedicated command instead of just "/mcp add computer-use metis-cu":
+//   - typo-proof: name + command are fixed by spec, eliminating the
+//     "I added it as `cu` but Anthropic's prompts expect `computer-use`"
+//     class of mistake.
+//   - one-step: `/mcp add` requires a follow-up `/mcp start` to
+//     hot-load tools; `/cu enable` does both.
+//   - sanity check: warns when metis-cu binary isn't in PATH so users
+//     learn before the first tool call fails.
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/runtime"
+)
+
+// cuServerName is the MCP-side name we hardcode. It mirrors Anthropic's
+// `mcp__computer-use__*` namespace exactly so prompts and traces written
+// for Claude Code's built-in computer-use server are interoperable.
+const cuServerName = "computer-use"
+
+// cuBinaryName is the binary metis-cu installs as. `make install` from
+// the metis-cu repo writes this to ~/go/bin/metis-cu (and
+// ~/.local/bin/metis-cu via copy).
+const cuBinaryName = "metis-cu"
+
+func cmdCU(r *REPL, args string) string {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return cuStatus()
+	}
+	parts := strings.Fields(args)
+	switch parts[0] {
+	case "enable", "on":
+		return cuEnable(r)
+	case "disable", "off":
+		return cuDisable()
+	case "status":
+		return cuStatus()
+	}
+	return "cu: unknown '" + parts[0] + "'. usage: cu enable | cu disable | cu status"
+}
+
+// cuEnable writes the metis-cu entry to mcp.toml, then hot-loads the
+// server into the live registry so tools are visible immediately.
+// Idempotent: re-running while enabled produces a "(replaced...)" line
+// rather than an error so the user can re-enable without first
+// disabling.
+func cuEnable(r *REPL) string {
+	binPath, lookErr := exec.LookPath(cuBinaryName)
+	if lookErr != nil {
+		return fmt.Sprintf("cu: %s not in PATH — install via: cd metis-cu && make install\n  (or: go install github.com/Ricardo-M-L/metis-cu@latest)", cuBinaryName)
+	}
+
+	reg, err := runtime.LoadMCP()
+	if err != nil {
+		return "cu: load mcp.toml: " + err.Error()
+	}
+	existed := runtime.FindMCPServer(reg, cuServerName) != nil
+	if err := runtime.AddMCPServer(reg, cuServerName, cuBinaryName, nil); err != nil {
+		return "cu: add: " + err.Error()
+	}
+	// AddMCPServer leaves Disabled at its prior value; force enabled
+	// so re-running `/cu enable` after `/cu disable` actually flips
+	// it back on rather than silently leaving it off.
+	if e := runtime.FindMCPServer(reg, cuServerName); e != nil {
+		e.Disabled = false
+	}
+	if err := runtime.SaveMCP(reg); err != nil {
+		return "cu: save: " + err.Error()
+	}
+
+	// Hot-load into the live registry so tools are usable this turn.
+	// Use the same 30s timeout as /mcp start; metis-cu spawns
+	// near-instantly so this is a generous upper bound.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if r != nil && r.Loop != nil && r.Loop.Registry != nil {
+		srv, err := runtime.LaunchMCPServer(ctx, reg, cuServerName, r.Loop.Registry)
+		if err != nil {
+			// Persistence already succeeded — the next metis start
+			// will spawn it. Surface the live-load error so the user
+			// knows tools won't appear until restart.
+			return fmt.Sprintf("cu: enabled in mcp.toml but live-load failed: %v\n  (tools will appear on next metis start)", err)
+		}
+		toolCount := 0
+		if srv != nil {
+			toolCount = len(srv.Tools())
+		}
+		verb := "enabled"
+		if existed {
+			verb = "re-enabled"
+		}
+		return fmt.Sprintf("cu: %s — %s (%d tools); binary=%s",
+			verb, cuServerName, toolCount, binPath)
+	}
+	// REPL not fully wired (test harness or boot path); persistence
+	// only — restart picks it up.
+	verb := "enabled"
+	if existed {
+		verb = "re-enabled"
+	}
+	return fmt.Sprintf("cu: %s in mcp.toml; binary=%s\n  (restart metis to load tools)",
+		verb, binPath)
+}
+
+func cuDisable() string {
+	reg, err := runtime.LoadMCP()
+	if err != nil {
+		return "cu: load mcp.toml: " + err.Error()
+	}
+	if !runtime.RemoveMCPServer(reg, cuServerName) {
+		return "cu: not enabled (no `" + cuServerName + "` entry in mcp.toml)"
+	}
+	if err := runtime.SaveMCP(reg); err != nil {
+		return "cu: save: " + err.Error()
+	}
+	return "cu: disabled — tools remain in this session until restart"
+}
+
+// cuStatus returns a one-line state summary plus the binary path when
+// resolvable. Designed for the bare `/cu` (no args) form where the user
+// is asking "what's the situation?" without committing to a change.
+func cuStatus() string {
+	binPath, lookErr := exec.LookPath(cuBinaryName)
+	binState := binPath
+	if lookErr != nil {
+		binState = "not found in PATH"
+	}
+	reg, err := runtime.LoadMCP()
+	if err != nil {
+		return "cu: load mcp.toml: " + err.Error()
+	}
+	entry := runtime.FindMCPServer(reg, cuServerName)
+	switch {
+	case entry == nil:
+		return fmt.Sprintf("cu: not enabled. binary: %s\n  run `/cu enable` to register + hot-load", binState)
+	case entry.Disabled:
+		return fmt.Sprintf("cu: disabled (in mcp.toml). binary: %s", binState)
+	default:
+		return fmt.Sprintf("cu: enabled. binary: %s; mcp.toml entry uses command=%q",
+			binState, entry.Command)
+	}
+}
