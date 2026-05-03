@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
 )
@@ -149,10 +149,12 @@ func (m authModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
+		// v2: KeyPressMsg replaces KeyMsg's struct/.Type pattern; match
+		// by .String() — handles named keys ("esc", "enter") + ASCII.
 		// Ctrl-C / Esc bail out of the wizard from any step.
-		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
+		switch msg.String() {
+		case "esc", "ctrl+c":
 			m.cancelled = true
 			return m, tea.Quit
 		}
@@ -169,17 +171,17 @@ func (m authModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m authModel) updatePickProvider(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyUp:
+func (m authModel) updatePickProvider(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up":
 		if m.cursor > 0 {
 			m.cursor--
 		}
-	case tea.KeyDown:
+	case "down":
 		if m.cursor < len(m.providers)-1 {
 			m.cursor++
 		}
-	case tea.KeyEnter:
+	case "enter":
 		m.chosen = m.providers[m.cursor]
 		if m.chosen.id == "custom" {
 			m.customID.Focus()
@@ -194,8 +196,8 @@ func (m authModel) updatePickProvider(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m authModel) updateCustomID(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.Type == tea.KeyEnter {
+func (m authModel) updateCustomID(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "enter" {
 		id := strings.TrimSpace(m.customID.Value())
 		if id == "" {
 			return m, nil
@@ -216,8 +218,8 @@ func (m authModel) updateCustomID(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m authModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.Type == tea.KeyEnter {
+func (m authModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "enter" {
 		key := strings.TrimSpace(m.keyInput.Value())
 		if key == "" {
 			return m, nil
@@ -248,7 +250,11 @@ var (
 	authError    = lipgloss.NewStyle().Foreground(lipgloss.Color("#e57373")).Bold(true)
 )
 
-func (m authModel) View() string {
+func (m authModel) View() tea.View {
+	// v2: View returns a tea.View struct, not a string. NewView wraps
+	// the rendered content; AltScreen / MouseMode etc are declarative
+	// fields on the View — auth wizard runs in inline mode (no alt
+	// screen) so we don't set those.
 	var b strings.Builder
 
 	b.WriteString(authTitle.Render("Metis · sign in") + "\n")
@@ -295,7 +301,7 @@ func (m authModel) View() string {
 			b.WriteString(authMuted.Render("Continuing to chat…") + "\n")
 		}
 	}
-	return b.String()
+	return tea.NewView(b.String())
 }
 
 // AuthResult is what RunAuthWizard returns on success.

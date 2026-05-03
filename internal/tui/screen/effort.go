@@ -3,8 +3,8 @@ package screen
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // EffortScreen is an interactive horizontal slider for /effort, mirroring
@@ -79,44 +79,33 @@ func (s *EffortScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		// v2: collapsed both switches into one .String() match.
+		switch m.String() {
+		case "esc", "ctrl+c", "q":
 			// Cancel: leave applied empty, parent won't change effort.
 			s.done = true
 			return s, nil
-		case tea.KeyEnter:
+		case "enter":
 			s.applied = s.levels[s.cursor]
 			s.done = true
 			return s, nil
-		case tea.KeyLeft:
+		case "left", "h":
 			if s.cursor > 0 {
 				s.cursor--
 			}
 			return s, nil
-		case tea.KeyRight:
+		case "right", "l":
 			if s.cursor < len(s.levels)-1 {
 				s.cursor++
 			}
 			return s, nil
-		case tea.KeyHome:
+		case "home":
 			s.cursor = 0
 			return s, nil
-		case tea.KeyEnd:
+		case "end":
 			s.cursor = len(s.levels) - 1
 			return s, nil
-		}
-		switch m.String() {
-		case "h":
-			if s.cursor > 0 {
-				s.cursor--
-			}
-		case "l":
-			if s.cursor < len(s.levels)-1 {
-				s.cursor++
-			}
-		case "q":
-			s.done = true
 		}
 	}
 	return s, nil

@@ -7,16 +7,20 @@ package tui
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEscape:
+	// v2: KeyMsg is interface; switch on .String() and treat any
+	// single-rune press as the "typed character" branch (replaces v1
+	// case tea.KeyRunes).
+	keyName := msg.String()
+	switch keyName {
+	case "esc":
 		m.showPalette = false
 		m.palFilter = ""
 		m.input.Reset()
-	case tea.KeyUp:
+	case "up":
 		// claude-code parity: ↑ at the top wraps to the bottom (and Tab
 		// already wraps below). Long /help-style lists are dramatically
 		// faster to navigate when wrapping; the previous "stop at edge"
@@ -26,31 +30,37 @@ func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.palCursor = (m.palCursor - 1 + n) % n
 			m.syncBufferToCursor()
 		}
-	case tea.KeyDown:
+	case "down":
 		// ↓ at the bottom wraps to the top — symmetric with KeyUp.
 		if n := len(m.palMatched); n > 0 {
 			m.palCursor = (m.palCursor + 1) % n
 			m.syncBufferToCursor()
 		}
-	case tea.KeyTab:
+	case "tab":
 		if len(m.palMatched) > 0 {
 			m.palCursor = (m.palCursor + 1) % len(m.palMatched)
 			m.syncBufferToCursor()
 		}
-	case tea.KeyBackspace:
+	case "backspace":
 		if len(m.palFilter) > 0 {
 			m.palFilter = m.palFilter[:len(m.palFilter)-1]
 			m.matchCommands()
 		} else {
 			m.showPalette = false
 		}
-	case tea.KeyRunes:
+	default:
+		// Treat any single-rune press as a typed character. v1's
+		// `case tea.KeyRunes` is gone; printable runes arrive as
+		// String() == "x" for letters/digits/etc.
+		if len([]rune(keyName)) != 1 {
+			return m, nil
+		}
 		// Only ASCII letters, digits, '-' and '_' belong in a slash
 		// command name. Quietly drop anything else (paste of newlines,
 		// backslashes from terminal mis-mapping, fullwidth glyphs from
 		// IME) so we don't accidentally widen the palette filter into
 		// nonsensical strings.
-		s := msg.String()
+		s := keyName
 		var clean strings.Builder
 		for _, r := range s {
 			if (r >= 'a' && r <= 'z') ||

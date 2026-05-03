@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -114,20 +114,49 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// counters survive on purpose (hit-rate stays comparable).
 		m.renderCache.InvalidateAll()
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
+		// v2: KeyMsg is interface; KeyPressMsg is the concrete event
+		// type for press (vs KeyReleaseMsg). handleKey takes tea.KeyMsg
+		// which both implement, so passing through is fine.
 		return m.handleKey(msg)
 
-	case tea.MouseMsg:
-		// Mouse wheel → chatList scroll. The previous bubbles/viewport
-		// path forwarded MouseMsg to viewport.Update which read bubbletea's
-		// wheel events and adjusted YOffset. With our virtualized list
-		// we drive ScrollBy directly off the wheel button — list.go has
-		// no Update(tea.Msg) interface (it's pure model, no Cmd plumbing).
+	case tea.MouseWheelMsg:
+		// v2 split MouseMsg into Click/Release/Wheel/Motion subtypes.
+		// Wheel arrives as MouseWheelMsg with direction in .Button,
+		// renamed from MouseButtonWheelUp/Down to MouseWheelUp/Down.
+		//
+		// Optional wheel quantization (claude-code SCROLL_QUANTUM):
+		// when ScrollQuantum > 0, accumulate the wheel direction into
+		// m.wheelAccum and only call list.ScrollBy when |accum| >= Q.
+		// A trackpad emits dozens of wheel events per gesture, but
+		// only the cumulative scroll matters visually. Quantization
+		// reduces list-level churn for free; the user still feels
+		// "smooth" because the underlying terminal scroll is line-
+		// granular regardless.
+		var dir int
 		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			m.chatList.ScrollBy(-m.chatList.MouseWheelDelta())
-		case tea.MouseButtonWheelDown:
-			m.chatList.ScrollBy(m.chatList.MouseWheelDelta())
+		case tea.MouseWheelUp:
+			dir = -m.chatList.MouseWheelDelta()
+		case tea.MouseWheelDown:
+			dir = m.chatList.MouseWheelDelta()
+		default:
+			return m, nil
+		}
+		q := perfConfig().ScrollQuantum
+		if q <= 0 {
+			m.chatList.ScrollBy(dir)
+			return m, nil
+		}
+		// Reset accumulator on direction reversal so a flick-up after
+		// a scroll-down doesn't have to walk back through the buffered
+		// down-direction delta.
+		if (dir < 0) != (m.wheelAccum < 0) {
+			m.wheelAccum = 0
+		}
+		m.wheelAccum += dir
+		if m.wheelAccum <= -q || m.wheelAccum >= q {
+			m.chatList.ScrollBy(m.wheelAccum)
+			m.wheelAccum = 0
 		}
 		return m, nil
 

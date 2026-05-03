@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -23,8 +23,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// other key fall through to the main input handler so the user keeps
 	// typing into inputBuffer naturally. claude-code does the same.
 	if m.showPalette {
-		switch msg.Type {
-		case tea.KeyUp, tea.KeyDown, tea.KeyTab, tea.KeyEscape:
+		// v2: KeyMsg is interface, .Type gone. Match by .String().
+		switch msg.String() {
+		case "up", "down", "tab", "esc":
 			return m.handlePaletteKey(msg)
 		}
 		// fall through for typed characters / Enter / Backspace
@@ -42,21 +43,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// `@filt` and the dropdown narrows live. Tab / Enter accept the
 	// highlighted match; Esc dismisses.
 	if m.atActive && len(m.atMatched) > 0 {
-		switch msg.Type {
-		case tea.KeyUp:
+		switch msg.String() {
+		case "up":
 			if m.atCursor > 0 {
 				m.atCursor--
 			}
 			return m, nil
-		case tea.KeyDown:
+		case "down":
 			if m.atCursor < len(m.atMatched)-1 {
 				m.atCursor++
 			}
 			return m, nil
-		case tea.KeyTab:
+		case "tab":
 			m.acceptAtMention()
 			return m, nil
-		case tea.KeyEscape:
+		case "esc":
 			m.atActive = false
 			return m, nil
 			// Enter is intentionally NOT consumed — user typing prompt
@@ -68,8 +69,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Special keys we handle ourselves (Ctrl-C, Enter, Shift+Tab, etc.).
 	// Anything not matched falls through to bubbles/textinput.
-	switch msg.Type {
-	case tea.KeyCtrlC:
+	//
+	// v2: KeyMsg is an interface; switch on .String() with named keys
+	// like "ctrl+c", "alt+enter", "pgup". This subsumes both the v1
+	// `switch msg.Type` and per-case Alt-modifier checks (msg.Alt is
+	// gone; alt-modified keys arrive as e.g. "alt+enter" directly).
+	switch msg.String() {
+	case "ctrl+c":
 		// Single-press exit when idle (no turn running). The user
 		// flagged the previous double-tap-to-exit as "still won't
 		// quit" — once you're at a quiet prompt with no active LLM
@@ -99,34 +105,34 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		})
 		return m, nil
 
-	case tea.KeyCtrlD:
+	case "ctrl+d":
 		return m, tea.Quit
 
-	case tea.KeyCtrlL:
+	case "ctrl+l":
 		m.messages = append(m.messages, Message{Role: "info", Content: "models: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5 — use /model <name> to switch", Timestamp: time.Now()})
 		return m, nil
 
-	case tea.KeyCtrlP:
+	case "ctrl+p":
 		return m.handleSessionPick()
 
-	case tea.KeyCtrlT:
+	case "ctrl+t":
 		// Toggle the task panel — claude-code's Ctrl+T affordance.
 		m.showTaskPanel = !m.showTaskPanel
 		return m, nil
 
-	case tea.KeyCtrlS:
+	case "ctrl+s":
 		// Toggle copy mode — exit alt-screen briefly so user can
 		// mouse-select-and-copy chat content from native scrollback.
 		return m.toggleCopyMode()
 
-	case tea.KeyCtrlR:
+	case "ctrl+r":
 		// Bash-style history search. Lazy-loads ~/.metis/history.jsonl
 		// on first open. While the overlay is up, all keys route to
 		// handleHistoryKey above so they don't leak into the editor.
 		m.openHistorySearch()
 		return m, nil
 
-	case tea.KeyCtrlY:
+	case "ctrl+y":
 		// Yank the last assistant reply to the system clipboard via
 		// OSC 52. Vim's `y` muscle memory for "copy this." Useful in
 		// alt-screen mode where rubber-band selection is unreliable
@@ -138,7 +144,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		})
 		return m, nil
 
-	case tea.KeyCtrlV:
+	case "ctrl+v":
 		// Read the system clipboard. Image content is saved to
 		// ~/.metis/cache/ and shown as `[Image #N]` (claude-code's
 		// pasted-image placeholder); the actual path is resolved at
@@ -166,7 +172,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.KeyCtrlO:
+	case "ctrl+o":
 		// Toggle global "expand truncated output" — claude-code's ctrl+o.
 		m.expandToolOutputs = !m.expandToolOutputs
 		state := "off"
@@ -180,7 +186,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		})
 		return m, nil
 
-	case tea.KeyEscape:
+	case "esc":
 		// Overlay stack takes priority — if any overlay's Update
 		// consumes the Esc, we stop here. Otherwise fall through to
 		// the existing palette / vim / double-tap-clear handlers.
@@ -214,38 +220,39 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.KeyEnter:
+	case "alt+enter":
 		// Alt+Enter inserts a literal newline so the user can compose
-		// multi-line prompts. Plain Enter submits.
-		if msg.Alt {
-			m.input.InsertRune('\n')
-			return m, nil
-		}
+		// multi-line prompts. v2: alt-modified keys arrive as
+		// "alt+enter" directly via String() (msg.Alt field is gone).
+		m.input.InsertRune('\n')
+		return m, nil
+
+	case "enter":
 		return m.handleSubmit()
 
-	case tea.KeyCtrlJ:
+	case "ctrl+j":
 		// Ctrl+J — alternate "newline" keybind for terminals that don't
 		// distinguish Alt+Enter from plain Enter.
 		m.input.InsertRune('\n')
 		return m, nil
 
-	case tea.KeyTab:
+	case "tab":
 		m.doAutocomplete()
 		return m, nil
 
-	case tea.KeyShiftTab:
+	case "shift+tab":
 		m.cyclePermissionMode()
 		return m, nil
 
-	case tea.KeyPgUp:
+	case "pgup":
 		m.chatList.ScrollBy(-m.chatList.Height() / 2)
 		return m, nil
 
-	case tea.KeyPgDown:
+	case "pgdown":
 		m.chatList.ScrollBy(m.chatList.Height() / 2)
 		return m, nil
 
-	case tea.KeyHome:
+	case "home":
 		// Ctrl+Home / Home — jump to top of transcript. Bubble's
 		// textarea also binds Home but only when the input has content;
 		// when empty (the common scroll-back case) we route to chatList.
@@ -253,7 +260,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.chatList.ScrollToTop()
 			return m, nil
 		}
-	case tea.KeyEnd:
+	case "end":
 		if strings.TrimSpace(m.input.Value()) == "" {
 			m.chatList.ScrollToBottom()
 			return m, nil

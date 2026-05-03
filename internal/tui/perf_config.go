@@ -27,6 +27,19 @@ type PerfConfig struct {
 	// 0 means "use the package default" (8 ms / 100 frames).
 	SlowRenderMs  int
 	StatsLogEvery int
+	// MaxMountedItems caps how many chat items the virtualized list
+	// physically holds. claude-code uses 300 to bound fiber alloc /
+	// per-frame work regardless of session length. 0 = unbounded
+	// (existing behavior). When the cap is hit, oldest messages stop
+	// being fed to the list — the chat surface still has them in
+	// m.messages, they just don't render.
+	MaxMountedItems int
+	// ScrollQuantum quantizes mouse-wheel events: only every N lines'
+	// worth of accumulated wheel delta triggers a list.ScrollBy call,
+	// reducing the per-frame churn from a trackpad spamming wheel
+	// events. claude-code uses SCROLL_QUANTUM=40. 0 = no quantization
+	// (every wheel event scrolls; existing behavior).
+	ScrollQuantum int
 }
 
 var (

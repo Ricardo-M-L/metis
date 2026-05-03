@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -84,7 +84,7 @@ func TestHistoryScreen_EscClosesAndSetsDone(t *testing.T) {
 	if s.Done() {
 		t.Fatal("Done should be false right after open")
 	}
-	updated, _ := s.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := s.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	if !updated.Done() {
 		t.Error("Esc should set Done=true")
 	}
@@ -92,7 +92,7 @@ func TestHistoryScreen_EscClosesAndSetsDone(t *testing.T) {
 
 func TestHistoryScreen_QClosesAndSetsDone(t *testing.T) {
 	s := NewHistoryScreen([]llm.Message{userMsg("x")}, 80, 24)
-	updated, _ := s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	updated, _ := s.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
 	if !updated.Done() {
 		t.Error("'q' should set Done=true")
 	}

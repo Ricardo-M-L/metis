@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -72,11 +74,15 @@ func TestRenderCurrentSession_WithLoopShowsTurns(t *testing.T) {
 	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAuto), nil, "sys", 5)
 	loop.AppendUser("u1")
 	loop.AppendUser("u2")
-	got := renderCurrentSession(store, id, loop, "claude-opus-4-7", "auto")
+	// v2: lipgloss styles each label/value separately, so a literal
+	// "turns: 2" substring no longer exists — the label "turns:" and
+	// the value "2" each get their own ANSI sequence wrapper. Strip
+	// styles before substring search to keep the assertion meaningful.
+	got := ansi.Strip(renderCurrentSession(store, id, loop, "claude-opus-4-7", "auto"))
 	if !strings.Contains(got, "session-current") {
 		t.Errorf("session id missing: %s", got)
 	}
-	if !strings.Contains(got, "turns: 2") {
+	if !strings.Contains(got, "turns:") || !strings.Contains(got, "2") {
 		t.Errorf("turn count missing: %s", got)
 	}
 	if !strings.Contains(got, "auto") {

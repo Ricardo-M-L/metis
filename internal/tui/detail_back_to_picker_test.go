@@ -3,7 +3,7 @@ package tui
 import (
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
@@ -20,7 +20,7 @@ func TestDetailScreen_EscReturnsToParentPicker(t *testing.T) {
 		t.Fatalf("/skills should open PickerScreen; got %T", m.activeScreen)
 	}
 	// Drill into a detail.
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	ds, ok := m.activeScreen.(*screen.DetailScreen)
 	if !ok {
 		t.Fatalf("Enter should open DetailScreen; got %T", m.activeScreen)
@@ -30,7 +30,7 @@ func TestDetailScreen_EscReturnsToParentPicker(t *testing.T) {
 	}
 
 	// Esc on detail — should re-dispatch /skills, NOT clear to chat.
-	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	if _, ok := m.activeScreen.(*screen.PickerScreen); !ok {
 		t.Errorf("after Esc on DetailScreen, should return to PickerScreen; got %T", m.activeScreen)
 	}
@@ -48,7 +48,7 @@ func TestDetailScreen_NoParentEscToChat(t *testing.T) {
 	ds.Resize(m.width, m.height)
 	m.activeScreen = ds
 
-	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	if m.activeScreen != nil {
 		t.Errorf("parentless DetailScreen Esc should clear to chat; got %T", m.activeScreen)
 	}

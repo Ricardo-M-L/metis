@@ -3,8 +3,8 @@ package screen
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // PickerItem is one entry in the PickerScreen list. Key is the value
@@ -112,80 +112,60 @@ func (s *PickerScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		switch m.String() {
+		case "esc", "ctrl+c", "q":
 			s.done = true
 			return s, nil
-		case tea.KeyEnter:
+		case "enter":
 			if s.cursor >= 0 && s.cursor < len(s.items) {
 				s.selected = s.items[s.cursor].Key
 			}
 			s.done = true
 			return s, nil
-		case tea.KeyUp:
+		case "up", "k":
 			if n := len(s.items); n > 0 {
 				s.cursor = (s.cursor - 1 + n) % n
 			}
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyDown:
+		case "down", "j":
 			if n := len(s.items); n > 0 {
 				s.cursor = (s.cursor + 1) % n
 			}
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyPgUp:
+		case "pgup":
 			s.cursor -= s.bodyHeight() / 2
 			if s.cursor < 0 {
 				s.cursor = 0
 			}
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyPgDown:
+		case "pgdown":
 			s.cursor += s.bodyHeight() / 2
 			if s.cursor >= len(s.items) {
 				s.cursor = len(s.items) - 1
 			}
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyHome:
+		case "home", "g":
 			s.cursor = 0
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyEnd:
+		case "end", "G":
 			s.cursor = len(s.items) - 1
 			s.scrollToCursor()
 			return s, nil
 		}
-		switch m.String() {
-		case "q":
-			s.done = true
-		case "j":
-			if n := len(s.items); n > 0 {
-				s.cursor = (s.cursor + 1) % n
-			}
-			s.scrollToCursor()
-		case "k":
-			if n := len(s.items); n > 0 {
-				s.cursor = (s.cursor - 1 + n) % n
-			}
-			s.scrollToCursor()
-		case "g":
-			s.cursor = 0
-			s.scrollToCursor()
-		case "G":
-			s.cursor = len(s.items) - 1
-			s.scrollToCursor()
-		}
-	case tea.MouseMsg:
+	case tea.MouseWheelMsg:
 		switch m.Button {
-		case tea.MouseButtonWheelUp:
+		case tea.MouseWheelUp:
 			if n := len(s.items); n > 0 {
 				s.cursor = (s.cursor - 1 + n) % n
 			}
 			s.scrollToCursor()
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			if n := len(s.items); n > 0 {
 				s.cursor = (s.cursor + 1) % n
 			}

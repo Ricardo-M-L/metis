@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
@@ -86,7 +86,7 @@ func TestE2E_PgUpScrollsChatList(t *testing.T) {
 		t.Fatal("setup: chat list should start at bottom")
 	}
 
-	drive(t, m, tea.KeyMsg{Type: tea.KeyPgUp})
+	drive(t, m, tea.KeyPressMsg{Code: tea.KeyPgUp})
 	if m.chatList.AtBottom() {
 		t.Error("after PgUp, chat list should not be at bottom")
 	}
@@ -99,7 +99,7 @@ func TestE2E_PgDnReturnsToBottom(t *testing.T) {
 
 	// Repeatedly PgDn should eventually hit bottom.
 	for i := 0; i < 50; i++ {
-		drive(t, m, tea.KeyMsg{Type: tea.KeyPgDown})
+		drive(t, m, tea.KeyPressMsg{Code: tea.KeyPgDown})
 		if m.chatList.AtBottom() {
 			return // success
 		}
@@ -113,7 +113,7 @@ func TestE2E_HomeAndEnd(t *testing.T) {
 	m.chatList.ScrollToBottom()
 
 	// Home: goes to top
-	drive(t, m, tea.KeyMsg{Type: tea.KeyHome})
+	drive(t, m, tea.KeyPressMsg{Code: tea.KeyHome})
 	if m.chatList.AtBottom() {
 		t.Error("after Home, should not be at bottom")
 	}
@@ -121,7 +121,7 @@ func TestE2E_HomeAndEnd(t *testing.T) {
 	// for 50 items in a 20-row viewport, top != bottom.
 
 	// End: goes to bottom
-	drive(t, m, tea.KeyMsg{Type: tea.KeyEnd})
+	drive(t, m, tea.KeyPressMsg{Code: tea.KeyEnd})
 	if !m.chatList.AtBottom() {
 		t.Error("after End, should be at bottom")
 	}
@@ -135,7 +135,7 @@ func TestE2E_HomeBlockedWhenInputHasContent(t *testing.T) {
 	m.chatList.ScrollToBottom()
 	m.input.SetValue("typing...")
 
-	drive(t, m, tea.KeyMsg{Type: tea.KeyHome})
+	drive(t, m, tea.KeyPressMsg{Code: tea.KeyHome})
 	if !m.chatList.AtBottom() {
 		t.Error("Home with non-empty input should not move chat list")
 	}
@@ -146,7 +146,7 @@ func TestE2E_MouseWheelUpScrolls(t *testing.T) {
 	_ = m.View()
 	m.chatList.ScrollToBottom()
 
-	drive(t, m, tea.MouseMsg{Button: tea.MouseButtonWheelUp, Type: tea.MouseLeft})
+	drive(t, m, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
 	if m.chatList.AtBottom() {
 		t.Error("WheelUp from bottom should scroll up")
 	}
@@ -161,7 +161,7 @@ func TestE2E_StreamingAppearsAfterChatList(t *testing.T) {
 	m := newE2EModel(t, 80, 30, 5)
 	m.streamingText = "STREAMING_TOKEN_MARKER"
 
-	out := m.View()
+	out := m.View().Content
 
 	streamPos := strings.Index(out, "STREAMING_TOKEN_MARKER")
 	if streamPos < 0 {
@@ -187,7 +187,7 @@ func TestE2E_ThinkingAppearsAfterChatList(t *testing.T) {
 	m := newE2EModel(t, 80, 30, 5)
 	m.thinkingText = "THINKING_TRACE_MARKER"
 
-	out := m.View()
+	out := m.View().Content
 
 	thinkPos := strings.Index(out, "THINKING_TRACE_MARKER")
 	if thinkPos < 0 {
@@ -282,7 +282,7 @@ func TestE2E_ScrollbarPresentWhenContentExceedsViewport(t *testing.T) {
 	// Scrollbar must render.
 	m := newE2EModel(t, 80, 30, 50)
 	_ = m.View()
-	out := m.View() // second frame so cache primes
+	out := m.View().Content // second frame so cache primes
 
 	if !strings.ContainsRune(out, '│') && !strings.ContainsRune(out, '█') {
 		t.Error("scrollbar (track │ or thumb █) missing when content exceeds viewport")

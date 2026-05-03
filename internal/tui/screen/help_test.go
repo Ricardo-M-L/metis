@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func sampleTabs() []HelpTab {
@@ -60,19 +60,19 @@ func TestHelpScreen_RightCyclesTab(t *testing.T) {
 	if s.active != 0 {
 		t.Fatalf("initial active = %d, want 0", s.active)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRight})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	if s.active != 1 {
 		t.Errorf("Right: active = %d, want 1 (commands)", s.active)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRight})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	if s.active != 2 {
 		t.Errorf("Right: active = %d, want 2 (custom-commands)", s.active)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // already at end
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // already at end
 	if s.active != 2 {
 		t.Errorf("Right at right-edge should clamp; got %d", s.active)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	if s.active != 1 {
 		t.Errorf("Left: active = %d, want 1", s.active)
 	}
@@ -85,12 +85,12 @@ func TestHelpScreen_TabAlsoCycles(t *testing.T) {
 	s := NewHelpScreen("v0.1.1", sampleTabs())
 	s.Resize(80, 30)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyTab})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	if s.active != 1 {
 		t.Errorf("Tab: active = %d, want 1", s.active)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyTab})
-	s.Update(tea.KeyMsg{Type: tea.KeyTab}) // 1->2->0 (wrap)
+	s.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyTab}) // 1->2->0 (wrap)
 	if s.active != 0 {
 		t.Errorf("Tab wrap: active = %d, want 0", s.active)
 	}
@@ -107,11 +107,11 @@ func TestHelpScreen_TabSwitchResetsScroll(t *testing.T) {
 	s := NewHelpScreen("v0.1.1", tabs)
 	s.Resize(80, 14)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 	if s.scroll == 0 {
 		t.Fatalf("precondition: End should set scroll > 0")
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRight})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	if s.scroll != 0 {
 		t.Errorf("tab switch should reset scroll to 0; got %d", s.scroll)
 	}
@@ -119,10 +119,10 @@ func TestHelpScreen_TabSwitchResetsScroll(t *testing.T) {
 
 // TestHelpScreen_EscDismisses — Esc / q / Ctrl-C all close the screen.
 func TestHelpScreen_EscDismisses(t *testing.T) {
-	cases := []tea.KeyMsg{
-		{Type: tea.KeyEsc},
-		{Type: tea.KeyRunes, Runes: []rune{'q'}},
-		{Type: tea.KeyCtrlC},
+	cases := []tea.KeyPressMsg{
+		{Code: tea.KeyEsc},
+		{Code: 'q'},
+		{Code: 'c', Mod: tea.ModCtrl},
 	}
 	for _, key := range cases {
 		s := NewHelpScreen("v0.1.1", sampleTabs())
@@ -147,16 +147,16 @@ func TestHelpScreen_ScrollWithinTab(t *testing.T) {
 	s.Resize(80, 14)
 
 	startCursor := s.cursor
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.cursor == startCursor {
 		t.Errorf("Down should move cursor; stayed at %d", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 	if s.cursor != s.firstSelectable() && s.scroll == 0 {
 		// End should put cursor on the last selectable, which forces scroll.
 		t.Errorf("End should advance scroll; cursor=%d scroll=%d", s.cursor, s.scroll)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyHome})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyHome})
 	first := s.firstSelectable()
 	if s.cursor != first {
 		t.Errorf("Home should put cursor on first selectable; got %d want %d", s.cursor, first)

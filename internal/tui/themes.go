@@ -14,9 +14,10 @@ package tui
 // we cover the common cases and leave the rest as follow-up.
 
 import (
+	"image/color"
 	"os"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // Theme bundles all the chat-surface colors. Every renderer reads from
@@ -27,27 +28,27 @@ type Theme struct {
 	Name string
 
 	// Backgrounds
-	BgSecondary lipgloss.Color // panel highlight
+	BgSecondary color.Color // panel highlight
 
 	// Text tiers (4 layers of tonality)
-	TextPrimary   lipgloss.Color // body text
-	TextSecondary lipgloss.Color // dimmed metadata
-	TextMuted     lipgloss.Color // labels, separators, gutters
+	TextPrimary   color.Color // body text
+	TextSecondary color.Color // dimmed metadata
+	TextMuted     color.Color // labels, separators, gutters
 
 	// Accents
-	AccentBlue   lipgloss.Color // primary (links, selection)
-	AccentGreen  lipgloss.Color // assistant, success
-	AccentOrange lipgloss.Color // tool, warning
-	AccentRed    lipgloss.Color // error, deny
-	AccentCyan   lipgloss.Color // user input
+	AccentBlue   color.Color // primary (links, selection)
+	AccentGreen  color.Color // assistant, success
+	AccentOrange color.Color // tool, warning
+	AccentRed    color.Color // error, deny
+	AccentCyan   color.Color // user input
 
 	// Diff bg/fg pairs (separately tuned because the bg+fg combo needs
 	// to stay legible — picking these by hand beats deriving from the
 	// accent colors).
-	DiffAddBg lipgloss.Color
-	DiffAddFg lipgloss.Color
-	DiffDelBg lipgloss.Color
-	DiffDelFg lipgloss.Color
+	DiffAddBg color.Color
+	DiffAddFg color.Color
+	DiffDelBg color.Color
+	DiffDelFg color.Color
 }
 
 // darkTheme is metis's default — what every previous release shipped.
@@ -55,19 +56,19 @@ type Theme struct {
 // WezTerm dark variants).
 var darkTheme = Theme{
 	Name:          "dark",
-	BgSecondary:   "#16213e",
-	TextPrimary:   "#e8e8e8",
-	TextSecondary: "#a0a0a0",
-	TextMuted:     "#606060",
-	AccentBlue:    "#64b5f6",
-	AccentGreen:   "#81c784",
-	AccentOrange:  "#ffb74d",
-	AccentRed:     "#e57373",
-	AccentCyan:    "#4dd0e1",
-	DiffAddBg:     "#1e3a1e",
-	DiffAddFg:     "#a3e8a3",
-	DiffDelBg:     "#3a1e1e",
-	DiffDelFg:     "#e8a3a3",
+	BgSecondary:   lipgloss.Color("#16213e"),
+	TextPrimary:   lipgloss.Color("#e8e8e8"),
+	TextSecondary: lipgloss.Color("#a0a0a0"),
+	TextMuted:     lipgloss.Color("#606060"),
+	AccentBlue:    lipgloss.Color("#64b5f6"),
+	AccentGreen:   lipgloss.Color("#81c784"),
+	AccentOrange:  lipgloss.Color("#ffb74d"),
+	AccentRed:     lipgloss.Color("#e57373"),
+	AccentCyan:    lipgloss.Color("#4dd0e1"),
+	DiffAddBg:     lipgloss.Color("#1e3a1e"),
+	DiffAddFg:     lipgloss.Color("#a3e8a3"),
+	DiffDelBg:     lipgloss.Color("#3a1e1e"),
+	DiffDelFg:     lipgloss.Color("#e8a3a3"),
 }
 
 // lightTheme inverts the tonality for light terminals — primary text
@@ -75,19 +76,19 @@ var darkTheme = Theme{
 // contrast against a white background.
 var lightTheme = Theme{
 	Name:          "light",
-	BgSecondary:   "#e6e6f0",
-	TextPrimary:   "#1a1a1a",
-	TextSecondary: "#555555",
-	TextMuted:     "#909090",
-	AccentBlue:    "#1976d2",
-	AccentGreen:   "#388e3c",
-	AccentOrange:  "#e65100",
-	AccentRed:     "#c62828",
-	AccentCyan:    "#0097a7",
-	DiffAddBg:     "#d4f0d4",
-	DiffAddFg:     "#1b5e20",
-	DiffDelBg:     "#f5d0d0",
-	DiffDelFg:     "#b71c1c",
+	BgSecondary:   lipgloss.Color("#e6e6f0"),
+	TextPrimary:   lipgloss.Color("#1a1a1a"),
+	TextSecondary: lipgloss.Color("#555555"),
+	TextMuted:     lipgloss.Color("#909090"),
+	AccentBlue:    lipgloss.Color("#1976d2"),
+	AccentGreen:   lipgloss.Color("#388e3c"),
+	AccentOrange:  lipgloss.Color("#e65100"),
+	AccentRed:     lipgloss.Color("#c62828"),
+	AccentCyan:    lipgloss.Color("#0097a7"),
+	DiffAddBg:     lipgloss.Color("#d4f0d4"),
+	DiffAddFg:     lipgloss.Color("#1b5e20"),
+	DiffDelBg:     lipgloss.Color("#f5d0d0"),
+	DiffDelFg:     lipgloss.Color("#b71c1c"),
 }
 
 // darkDaltonizedTheme replaces the green/red diff signals with
@@ -96,19 +97,19 @@ var lightTheme = Theme{
 // Other accents remain similar to the dark theme.
 var darkDaltonizedTheme = Theme{
 	Name:          "dark-daltonized",
-	BgSecondary:   "#16213e",
-	TextPrimary:   "#e8e8e8",
-	TextSecondary: "#a0a0a0",
-	TextMuted:     "#606060",
-	AccentBlue:    "#64b5f6",
-	AccentGreen:   "#4dd0e1", // cyan stand-in for assistant/success
-	AccentOrange:  "#ffb74d",
-	AccentRed:     "#e91e63", // magenta stand-in for error
-	AccentCyan:    "#80deea",
-	DiffAddBg:     "#1a3a3e",
-	DiffAddFg:     "#80deea",
-	DiffDelBg:     "#3a1a2e",
-	DiffDelFg:     "#f48fb1",
+	BgSecondary:   lipgloss.Color("#16213e"),
+	TextPrimary:   lipgloss.Color("#e8e8e8"),
+	TextSecondary: lipgloss.Color("#a0a0a0"),
+	TextMuted:     lipgloss.Color("#606060"),
+	AccentBlue:    lipgloss.Color("#64b5f6"),
+	AccentGreen:   lipgloss.Color("#4dd0e1"), // cyan stand-in for assistant/success
+	AccentOrange:  lipgloss.Color("#ffb74d"),
+	AccentRed:     lipgloss.Color("#e91e63"), // magenta stand-in for error
+	AccentCyan:    lipgloss.Color("#80deea"),
+	DiffAddBg:     lipgloss.Color("#1a3a3e"),
+	DiffAddFg:     lipgloss.Color("#80deea"),
+	DiffDelBg:     lipgloss.Color("#3a1a2e"),
+	DiffDelFg:     lipgloss.Color("#f48fb1"),
 }
 
 var allThemes = map[string]*Theme{

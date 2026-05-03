@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // makeLongTab returns a tab with `n` rows so we can exercise overflow.
@@ -75,7 +75,7 @@ func TestHelpScreen_OverflowIndicators(t *testing.T) {
 
 	// Scroll to end: only "↑ N above" — no more "below" since all
 	// remaining content fits.
-	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 	out = stripANSIEffort(s.View())
 	if !strings.Contains(out, "more above") {
 		t.Errorf("at end, should show 'more above'; got:\n%s", out)
@@ -97,7 +97,7 @@ func TestHelpScreen_BodyCappedAtMax(t *testing.T) {
 	}
 	// Verify scroll is meaningful: jump cursor to end forces scroll
 	// past 0 (otherwise the cap had no effect).
-	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 	if s.scroll == 0 {
 		t.Errorf("End on capped body should advance scroll; got 0")
 	}

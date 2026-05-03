@@ -5,19 +5,25 @@ package tui
 // get re-init'd by initStyles() each time the theme changes. Adding a
 // new theme = adding a Theme to themes.go; no per-callsite plumbing.
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"image/color"
+
+	"charm.land/lipgloss/v2"
+)
 
 var (
 	// Color shortcuts — populated by initStyles() from currentTheme.
-	bgSecondary   lipgloss.Color
-	textPrimary   lipgloss.Color
-	textSecondary lipgloss.Color
-	textMuted     lipgloss.Color
-	accentBlue    lipgloss.Color
-	accentGreen   lipgloss.Color
-	accentOrange  lipgloss.Color
-	accentRed     lipgloss.Color
-	accentCyan    lipgloss.Color
+	// v2: lipgloss.Color became a function; the equivalent type is
+	// image/color.Color.
+	bgSecondary   color.Color
+	textPrimary   color.Color
+	textSecondary color.Color
+	textMuted     color.Color
+	accentBlue    color.Color
+	accentGreen   color.Color
+	accentOrange  color.Color
+	accentRed     color.Color
+	accentCyan    color.Color
 
 	// Pre-built styles. Renderers call these directly.
 	styleText     lipgloss.Style

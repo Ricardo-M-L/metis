@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 // timelineItem is a chronologically-orderable wrapper around either a
@@ -50,10 +52,13 @@ func (m *Model) timeline() []timelineItem {
 
 // View is the bubbletea-required render entry point. It composes the
 // per-feature renderers (welcome banner, transcript, overlays,
-// status bar) into the final string. Pure presentation: no mutation
-// outside the viewport content cache + lastViewportLen + lazy-filled
-// Message/ToolEvent IDs.
-func (m *Model) View() string {
+// status bar) into the final tea.View struct.
+//
+// v2: View returns tea.View (not string). AltScreen + MouseMode are
+// declared here as View fields rather than program options — that's
+// the bubbletea v2 model where the View describes its own terminal
+// requirements each frame.
+func (m *Model) View() tea.View {
 	// RecordView fires on every View() invocation regardless of which
 	// branch returns. defer ensures the early-return paths (copyMode,
 	// activeScreen, empty timeline) still tick the counter so the
@@ -61,17 +66,31 @@ func (m *Model) View() string {
 	// path frequency.
 	defer m.renderCache.RecordView()
 
+	// chatView wraps a content string with the metis-standard view
+	// flags: AltScreen on (full-screen TUI), CellMotion mouse so wheel
+	// + clicks reach Update(). The exception is copyMode below which
+	// returns AltScreen=false to let users mouse-select scrollback.
+	chatView := func(content string) tea.View {
+		v := tea.NewView(content)
+		v.AltScreen = true
+		v.MouseMode = tea.MouseModeCellMotion
+		return v
+	}
+
 	// Copy mode: alt-screen is exited so the user can mouse-select
-	// from native scrollback. Return empty so we don't re-paint over
-	// their selection.
+	// from native scrollback. Return empty + AltScreen=false so the
+	// terminal drops back to the inline buffer for selection.
 	if m.copyMode {
-		return ""
+		v := tea.NewView("")
+		v.AltScreen = false
+		return v
 	}
 	// Active full-window overlay short-circuits everything else. The
 	// chat surface state is preserved so closing the screen returns
-	// the user to their exact scroll position.
+	// the user to their exact scroll position. Screen interface still
+	// uses View() string (not v2 tea.View) — wrap its output here.
 	if m.activeScreen != nil {
-		return m.activeScreen.View()
+		return chatView(m.activeScreen.View())
 	}
 
 	// Empty transcript → welcome banner (plus chrome so the user can
@@ -100,7 +119,7 @@ func (m *Model) View() string {
 		}
 		s.WriteString(renderStatusBar(m))
 		s.WriteString("\033[0m")
-		return s.String()
+		return chatView(s.String())
 	}
 
 	var s strings.Builder
@@ -251,5 +270,5 @@ func (m *Model) View() string {
 	// Reset ANSI styles to prevent stacking
 	s.WriteString("\033[0m")
 
-	return s.String()
+	return chatView(s.String())
 }

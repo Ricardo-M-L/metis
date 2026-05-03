@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 )
@@ -167,5 +167,5 @@ func TestCtrlC_DoubleTapDuringTurnQuits(t *testing.T) {
 // teaKeyCtrlC is the bubbletea key message for Ctrl-C; defined as a helper
 // to keep the test cases readable without a bubbletea import dance.
 func teaKeyCtrlC() tea.KeyMsg {
-	return tea.KeyMsg{Type: tea.KeyCtrlC}
+	return tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}
 }

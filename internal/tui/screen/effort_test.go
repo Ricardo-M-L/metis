@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestEffortScreen_RendersAllLevels — every level must appear in the
@@ -58,35 +58,35 @@ func TestEffortScreen_LeftRightNav(t *testing.T) {
 	s := NewEffortScreen("medium") // cursor=2
 	s.Resize(80, 20)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyRight})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	if s.cursor != 3 {
 		t.Errorf("KeyRight from medium: %d, want 3 (high)", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // already at end → clamp
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // already at end → clamp
 	if s.cursor != 3 {
 		t.Errorf("KeyRight at right edge should clamp: %d, want 3", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	if s.cursor != 2 {
 		t.Errorf("KeyLeft from high: %d, want 2", s.cursor)
 	}
 
 	// vim binds.
-	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	s.Update(tea.KeyPressMsg{Code: 'h', Text: "h"})
 	if s.cursor != 1 {
 		t.Errorf("h from medium: %d, want 1", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	s.Update(tea.KeyPressMsg{Code: 'l', Text: "l"})
 	if s.cursor != 2 {
 		t.Errorf("l from low: %d, want 2", s.cursor)
 	}
 
 	// Home/End jump.
-	s.Update(tea.KeyMsg{Type: tea.KeyHome})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyHome})
 	if s.cursor != 0 {
 		t.Errorf("Home: %d, want 0", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 	if s.cursor != 3 {
 		t.Errorf("End: %d, want 3", s.cursor)
 	}
@@ -97,8 +97,8 @@ func TestEffortScreen_LeftRightNav(t *testing.T) {
 func TestEffortScreen_EnterApplies(t *testing.T) {
 	s := NewEffortScreen("low") // cursor=1
 	s.Resize(80, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // → medium
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // → medium
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if !s.Done() {
 		t.Errorf("Enter should mark Done()")
@@ -113,8 +113,8 @@ func TestEffortScreen_EnterApplies(t *testing.T) {
 func TestEffortScreen_EscCancels(t *testing.T) {
 	s := NewEffortScreen("low")
 	s.Resize(80, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // visually moves but uncommitted
-	s.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // visually moves but uncommitted
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if !s.Done() {
 		t.Errorf("Esc should mark Done()")

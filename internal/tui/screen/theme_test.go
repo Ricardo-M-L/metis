@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func sampleThemes() []ThemeChoice {
@@ -58,11 +58,11 @@ func TestThemeScreen_ArrowCyclesWraparound(t *testing.T) {
 	s := NewThemeScreen("dark", sampleThemes()) // cursor=0
 	s.Resize(80, 20)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyLeft}) // wrap to last
+	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // wrap to last
 	if s.cursor != 2 {
 		t.Errorf("Left at index 0 should wrap to last (2); got %d", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // wrap back to 0
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // wrap back to 0
 	if s.cursor != 0 {
 		t.Errorf("Right at last should wrap to 0; got %d", s.cursor)
 	}
@@ -73,8 +73,8 @@ func TestThemeScreen_ArrowCyclesWraparound(t *testing.T) {
 func TestThemeScreen_EnterApplies(t *testing.T) {
 	s := NewThemeScreen("dark", sampleThemes())
 	s.Resize(80, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // → light
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // → light
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if !s.Done() {
 		t.Errorf("Enter should mark Done()")
@@ -88,8 +88,8 @@ func TestThemeScreen_EnterApplies(t *testing.T) {
 func TestThemeScreen_EscCancels(t *testing.T) {
 	s := NewThemeScreen("dark", sampleThemes())
 	s.Resize(80, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyRight})
-	s.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if !s.Done() {
 		t.Errorf("Esc should mark Done()")

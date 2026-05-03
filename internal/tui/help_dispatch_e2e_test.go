@@ -3,7 +3,7 @@ package tui
 import (
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
@@ -22,7 +22,7 @@ func TestHelpDispatch_EnterRunsPickedCommand(t *testing.T) {
 		t.Fatalf("expected HelpScreen; got %T", m.activeScreen)
 	}
 	// Switch to commands tab where rows are selectable.
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	// Cursor lands on first selectable. Press Enter to fire it.
 	pressEnter(t, m)
 
@@ -45,9 +45,9 @@ func TestHelpDispatch_EscNoDispatch(t *testing.T) {
 	pressEnter(t, m)
 	beforeMsgs := len(m.messages)
 
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if m.activeScreen != nil {
 		t.Errorf("Esc should clear activeScreen")

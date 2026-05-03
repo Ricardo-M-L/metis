@@ -3,8 +3,8 @@ package screen
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // DetailScreen is a generic "single resource detail view" overlay used
@@ -121,56 +121,41 @@ func (s *DetailScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		switch m.String() {
+		case "esc", "ctrl+c", "q":
 			s.done = true
 			return s, nil
-		case tea.KeyUp:
+		case "up", "k":
 			s.scroll--
 			s.clampScroll()
 			return s, nil
-		case tea.KeyDown:
+		case "down", "j":
 			s.scroll++
 			s.clampScroll()
 			return s, nil
-		case tea.KeyPgUp:
+		case "pgup":
 			s.scroll -= s.bodyHeight() / 2
 			s.clampScroll()
 			return s, nil
-		case tea.KeyPgDown:
+		case "pgdown":
 			s.scroll += s.bodyHeight() / 2
 			s.clampScroll()
 			return s, nil
-		case tea.KeyHome:
+		case "home", "g":
 			s.scroll = 0
 			return s, nil
-		case tea.KeyEnd:
+		case "end", "G":
 			s.scroll = s.totalLines()
 			s.clampScroll()
 			return s, nil
 		}
-		switch m.String() {
-		case "q":
-			s.done = true
-		case "j":
-			s.scroll++
-			s.clampScroll()
-		case "k":
-			s.scroll--
-			s.clampScroll()
-		case "g":
-			s.scroll = 0
-		case "G":
-			s.scroll = s.totalLines()
-			s.clampScroll()
-		}
-	case tea.MouseMsg:
+	case tea.MouseWheelMsg:
 		switch m.Button {
-		case tea.MouseButtonWheelUp:
+		case tea.MouseWheelUp:
 			s.scroll--
 			s.clampScroll()
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			s.scroll++
 			s.clampScroll()
 		}

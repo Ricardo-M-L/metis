@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestTurnActive_AcceptsTyping — pre-fix: handleKey gated all keys
@@ -20,7 +20,7 @@ func TestTurnActive_AcceptsTyping(t *testing.T) {
 	// Send a few keystrokes — the user typing the next prompt while
 	// the model is still streaming the current one.
 	for _, r := range "hello" {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 
 	got := m.input.Value()
@@ -35,7 +35,7 @@ func TestTurnActive_AcceptsTyping(t *testing.T) {
 func TestTurnActive_BlocksSubmit(t *testing.T) {
 	m := newSlashTestModel(t)
 	for _, r := range "hello" {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	m.turnActive = true
 	beforeMsgs := len(m.messages)
@@ -66,11 +66,11 @@ func TestTurnActive_BlocksSubmit(t *testing.T) {
 func TestTurnActive_AcceptsBackspace(t *testing.T) {
 	m := newSlashTestModel(t)
 	for _, r := range "helloo" {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	m.turnActive = true
 
-	m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
 
 	if m.input.Value() != "hello" {
 		t.Errorf("backspace should work mid-turn; input.Value() = %q, want %q",
@@ -104,7 +104,7 @@ func TestTurnActive_MouseWheelScrolls(t *testing.T) {
 	m.turnActive = true
 	// Send wheel-up — this used to silently no-op when turnActive (per
 	// the user's bug report). Post-fix: scrolls.
-	m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
 
 	if m.chatList.AtBottom() {
 		t.Errorf("MouseWheelUp during turnActive should leave AtBottom() = false; still at bottom")

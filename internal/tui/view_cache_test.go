@@ -320,3 +320,23 @@ func BenchmarkView_RealisticUserSession_NoCache(b *testing.B) {
 		_ = m.View()
 	}
 }
+
+// BenchmarkView_RealisticUserSession_MaxMounted300 measures the
+// claude-code-style MAX_MOUNTED_ITEMS=300 hard cap. The chatList
+// silently drops the oldest items when its size exceeds the cap, so
+// for a 1200-item timeline ~75% of items never enter the list each
+// frame. The list's internal walks (AtBottom / TotalLineCount /
+// Render / VisibleItemIndices) drop from O(timeline) to O(cap),
+// which is the win this benchmark surfaces.
+func BenchmarkView_RealisticUserSession_MaxMounted300(b *testing.B) {
+	m := newCachedScrollModel(80, 30)
+	m.chatList.SetMaxMounted(300)
+	populateRealisticUserSession(m)
+	_ = m.View() // warm
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = m.View()
+	}
+}

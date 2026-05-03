@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
@@ -170,7 +170,7 @@ func TestSkillsPicker_EnterOpensDetailScreen(t *testing.T) {
 		t.Fatalf("/skills should open PickerScreen; got %T", m.activeScreen)
 	}
 	// Press Enter on the cursor (first skill).
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	// activeScreen now should be DetailScreen.
 	if _, ok := m.activeScreen.(*screen.DetailScreen); !ok {
@@ -198,7 +198,7 @@ func TestToolsPicker_EnterOpensDetailScreen(t *testing.T) {
 	if len(items) == 0 {
 		t.Skip("test fixture has empty tools registry; skipping drill-down assertion")
 	}
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if _, ok := m.activeScreen.(*screen.DetailScreen); !ok {
 		t.Errorf("after Enter on tool, activeScreen should be DetailScreen; got %T", m.activeScreen)
 	}

@@ -3,8 +3,8 @@ package screen
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // PermRule is one rule entry in the /permissions widget. Caller (tui pkg)
@@ -106,58 +106,41 @@ func (s *PermissionsScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		// v2: collapsed two switches into one .String() match.
+		switch m.String() {
+		case "esc", "ctrl+c", "q":
 			s.done = true
 			return s, nil
-		case tea.KeyEnter:
+		case "enter":
 			s.applied = s.modes[s.modeCursor]
 			s.done = true
 			return s, nil
-		case tea.KeyLeft:
+		case "left", "h":
 			if n := len(s.modes); n > 0 {
 				s.modeCursor = (s.modeCursor - 1 + n) % n
 			}
 			return s, nil
-		case tea.KeyRight:
+		case "right", "l":
 			if n := len(s.modes); n > 0 {
 				s.modeCursor = (s.modeCursor + 1) % n
 			}
 			return s, nil
-		case tea.KeyUp:
+		case "up", "k":
 			s.rulesScroll--
 			s.clampScroll()
 			return s, nil
-		case tea.KeyDown:
+		case "down", "j":
 			s.rulesScroll++
 			s.clampScroll()
 			return s, nil
 		}
-		switch m.String() {
-		case "h":
-			if n := len(s.modes); n > 0 {
-				s.modeCursor = (s.modeCursor - 1 + n) % n
-			}
-		case "l":
-			if n := len(s.modes); n > 0 {
-				s.modeCursor = (s.modeCursor + 1) % n
-			}
-		case "j":
-			s.rulesScroll++
-			s.clampScroll()
-		case "k":
-			s.rulesScroll--
-			s.clampScroll()
-		case "q":
-			s.done = true
-		}
-	case tea.MouseMsg:
+	case tea.MouseWheelMsg:
 		switch m.Button {
-		case tea.MouseButtonWheelUp:
+		case tea.MouseWheelUp:
 			s.rulesScroll--
 			s.clampScroll()
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			s.rulesScroll++
 			s.clampScroll()
 		}

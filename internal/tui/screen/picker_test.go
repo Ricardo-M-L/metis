@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func samplePickerItems() []PickerItem {
@@ -53,11 +53,11 @@ func TestPickerScreen_CursorWraps(t *testing.T) {
 	s := NewPickerScreen("/sessions", "", samplePickerItems()) // cursor=0
 	s.Resize(100, 20)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyUp}) // wrap to last (2)
+	s.Update(tea.KeyPressMsg{Code: tea.KeyUp}) // wrap to last (2)
 	if s.cursor != 2 {
 		t.Errorf("Up at 0 should wrap to 2; got %d", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}) // wrap to 0
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // wrap to 0
 	if s.cursor != 0 {
 		t.Errorf("Down at 2 should wrap to 0; got %d", s.cursor)
 	}
@@ -68,8 +68,8 @@ func TestPickerScreen_CursorWraps(t *testing.T) {
 func TestPickerScreen_EnterReturnsKey(t *testing.T) {
 	s := NewPickerScreen("/sessions", "", samplePickerItems())
 	s.Resize(100, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}) // → session-2
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // → session-2
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if !s.Done() {
 		t.Errorf("Enter should mark Done()")
@@ -83,8 +83,8 @@ func TestPickerScreen_EnterReturnsKey(t *testing.T) {
 func TestPickerScreen_EscCancels(t *testing.T) {
 	s := NewPickerScreen("/sessions", "", samplePickerItems())
 	s.Resize(100, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
-	s.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if !s.Done() {
 		t.Errorf("Esc should mark Done()")

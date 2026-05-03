@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
@@ -64,8 +64,8 @@ func TestEffortWidget_ApplyUpdatesLoop(t *testing.T) {
 	// Cursor starts on whatever m.loop.Effort was at construction time
 	// — for newSlashTestModel that's empty, which falls back to medium.
 	// Move right to "high" then Enter.
-	m.Update(tea.KeyMsg{Type: tea.KeyRight}) // → high
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // → high
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if m.activeScreen != nil {
 		t.Errorf("Enter should dismiss the EffortScreen; activeScreen still: %T", m.activeScreen)
@@ -95,9 +95,9 @@ func TestEffortWidget_EscPreservesLoop(t *testing.T) {
 	pressEnter(t, m)
 
 	// Move cursor visually but cancel.
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if m.activeScreen != nil {
 		t.Errorf("Esc should dismiss EffortScreen")

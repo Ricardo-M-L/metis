@@ -17,7 +17,7 @@ package tui
 // without the keymap complexity.
 
 import (
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 const (
@@ -74,19 +74,19 @@ func (m *Model) handleVimNormalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "a":
 		// append: cursor right then INSERT
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		vimModeState = vimInsert
 		return true, cmd
 	case "A":
 		// append-end-of-line: KeyEnd then INSERT
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 		vimModeState = vimInsert
 		return true, cmd
 	case "I":
 		// insert-start-of-line: KeyHome then INSERT
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyHome})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyHome})
 		vimModeState = vimInsert
 		return true, cmd
 	case "o":
@@ -95,7 +95,7 @@ func (m *Model) handleVimNormalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		// here; we craft the keystrokes so the user lands on a fresh
 		// row in INSERT mode.
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 		m.input.InsertRune('\n')
 		vimModeState = vimInsert
 		return true, cmd
@@ -103,27 +103,27 @@ func (m *Model) handleVimNormalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	// Movement
 	case "h":
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyLeft})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 		return true, cmd
 	case "j":
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		return true, cmd
 	case "k":
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyUp})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 		return true, cmd
 	case "l":
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		return true, cmd
 	case "0":
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyHome})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyHome})
 		return true, cmd
 	case "$":
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 		return true, cmd
 
 	// Edit ops
@@ -131,12 +131,12 @@ func (m *Model) handleVimNormalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		// delete char under cursor — bubbles textarea KeyDelete
 		// removes the rune at cursor (forward delete).
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyDelete})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyDelete})
 		return true, cmd
 	case "X":
 		// X — delete char before cursor (vim convention)
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m.input, cmd = m.input.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
 		return true, cmd
 	}
 	// Unhandled NORMAL-mode keys (q, w, e, b, dd, yy, p, etc.) — drop

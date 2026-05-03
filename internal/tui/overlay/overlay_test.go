@@ -3,7 +3,7 @@ package overlay
 import (
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // fakeOverlay is a minimal Overlay impl driven by exported fields so
@@ -100,7 +100,7 @@ func TestStack_UpdateRoutesToTop(t *testing.T) {
 	b := &fakeOverlay{name: "b", active: true, consume: true}
 	s.Push(a)
 	s.Push(b)
-	_, consumed := s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	_, consumed := s.Update(tea.KeyPressMsg{Code: 'k', Text: "k"})
 	if !consumed {
 		t.Errorf("top consume=true should propagate")
 	}
@@ -114,7 +114,7 @@ func TestStack_UpdateRoutesToTop(t *testing.T) {
 
 func TestStack_UpdateNoOpWhenEmpty(t *testing.T) {
 	s := New()
-	_, consumed := s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	_, consumed := s.Update(tea.KeyPressMsg{Code: 'k', Text: "k"})
 	if consumed {
 		t.Errorf("empty stack should not consume")
 	}

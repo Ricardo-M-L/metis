@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func sampleRules() []PermRule {
@@ -79,11 +79,11 @@ func TestPermissionsScreen_ModeCyclesWraparound(t *testing.T) {
 	s := NewPermissionsScreen("ask", nil) // cursor=0
 	s.Resize(100, 20)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyLeft}) // wrap to 4 (deny)
+	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // wrap to 4 (deny)
 	if s.modeCursor != 4 {
 		t.Errorf("Left at 0 should wrap to 4; got %d", s.modeCursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // wrap back to 0
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // wrap back to 0
 	if s.modeCursor != 0 {
 		t.Errorf("Right at 4 should wrap to 0; got %d", s.modeCursor)
 	}
@@ -100,7 +100,7 @@ func TestPermissionsScreen_RuleListScrollsIndependently(t *testing.T) {
 	s.Resize(100, 14)
 
 	startMode := s.modeCursor
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.modeCursor != startMode {
 		t.Errorf("KeyDown changed mode cursor from %d to %d", startMode, s.modeCursor)
 	}
@@ -113,8 +113,8 @@ func TestPermissionsScreen_RuleListScrollsIndependently(t *testing.T) {
 func TestPermissionsScreen_EnterApplies(t *testing.T) {
 	s := NewPermissionsScreen("auto", nil)
 	s.Resize(100, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyRight}) // → bypass
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // → bypass
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if !s.Done() {
 		t.Errorf("Enter should mark Done()")
@@ -128,8 +128,8 @@ func TestPermissionsScreen_EnterApplies(t *testing.T) {
 func TestPermissionsScreen_EscCancels(t *testing.T) {
 	s := NewPermissionsScreen("auto", nil)
 	s.Resize(100, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyRight})
-	s.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if !s.Done() {
 		t.Errorf("Esc should mark Done()")

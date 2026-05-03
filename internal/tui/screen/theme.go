@@ -3,8 +3,8 @@ package screen
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ThemeChoice is one entry in the /theme picker. Caller (tui pkg) maps
@@ -67,39 +67,28 @@ func (s *ThemeScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		// v2: collapsed two switches into one .String() match.
+		switch m.String() {
+		case "esc", "ctrl+c", "q":
 			s.done = true
 			return s, nil
-		case tea.KeyEnter:
+		case "enter":
 			if s.cursor >= 0 && s.cursor < len(s.choices) {
 				s.applied = s.choices[s.cursor].Name
 			}
 			s.done = true
 			return s, nil
-		case tea.KeyLeft:
+		case "left", "h":
 			if n := len(s.choices); n > 0 {
 				s.cursor = (s.cursor - 1 + n) % n
 			}
 			return s, nil
-		case tea.KeyRight:
+		case "right", "l":
 			if n := len(s.choices); n > 0 {
 				s.cursor = (s.cursor + 1) % n
 			}
 			return s, nil
-		}
-		switch m.String() {
-		case "h":
-			if n := len(s.choices); n > 0 {
-				s.cursor = (s.cursor - 1 + n) % n
-			}
-		case "l":
-			if n := len(s.choices); n > 0 {
-				s.cursor = (s.cursor + 1) % n
-			}
-		case "q":
-			s.done = true
 		}
 	}
 	return s, nil

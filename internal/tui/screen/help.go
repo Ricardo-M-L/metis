@@ -3,8 +3,8 @@ package screen
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // HelpTab is one tab in the /help screen. The caller (the tui package)
@@ -206,17 +206,34 @@ func (s *HelpScreen) switchTab(newActive int) {
 	s.scrollToCursor()
 }
 
+// endCursor walks the current tab backwards and parks the cursor on the
+// last selectable row. Shared between End key + 'G' vim binding.
+func (s *HelpScreen) endCursor() {
+	t := s.currentTab()
+	if t == nil {
+		return
+	}
+	for i := len(t.Body) - 1; i >= 0; i-- {
+		if t.Body[i].isSelectable() {
+			s.cursor = i
+			break
+		}
+	}
+}
+
 func (s *HelpScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	switch m := msg.(type) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		// v2: collapsed both .Type and .String() switches into one
+		// .String() match. Handles named keys + ASCII identically.
+		switch m.String() {
+		case "esc", "ctrl+c":
 			s.done = true
 			return s, nil
-		case tea.KeyEnter:
+		case "enter":
 			// Dispatch the cursor's command. selected stays empty if
 			// the cursor sits on a non-selectable row (eg. /general
 			// tab where everything is heading + free-form).
@@ -228,26 +245,26 @@ func (s *HelpScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			}
 			s.done = true
 			return s, nil
-		case tea.KeyLeft:
+		case "left", "h":
 			s.switchTab(s.active - 1)
 			return s, nil
-		case tea.KeyRight:
+		case "right", "l":
 			s.switchTab(s.active + 1)
 			return s, nil
-		case tea.KeyTab:
+		case "tab":
 			if len(s.tabs) > 0 {
 				s.switchTab((s.active + 1) % len(s.tabs))
 			}
 			return s, nil
-		case tea.KeyUp:
+		case "up", "k":
 			s.cursor = s.prevSelectable(s.cursor - 1)
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyDown:
+		case "down", "j":
 			s.cursor = s.nextSelectable(s.cursor + 1)
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyPgUp:
+		case "pgup":
 			// Page up: jump cursor by ~half a page worth of selectable rows.
 			for i := 0; i < s.bodyHeight()/2; i++ {
 				next := s.prevSelectable(s.cursor - 1)
@@ -258,7 +275,7 @@ func (s *HelpScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			}
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyPgDown:
+		case "pgdown":
 			for i := 0; i < s.bodyHeight()/2; i++ {
 				next := s.nextSelectable(s.cursor + 1)
 				if next == s.cursor {
@@ -268,58 +285,24 @@ func (s *HelpScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			}
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyHome:
+		case "home", "g":
 			s.cursor = s.firstSelectable()
 			s.scrollToCursor()
 			return s, nil
-		case tea.KeyEnd:
-			// Walk forward until the last selectable row.
-			t := s.currentTab()
-			if t != nil {
-				for i := len(t.Body) - 1; i >= 0; i-- {
-					if t.Body[i].isSelectable() {
-						s.cursor = i
-						break
-					}
-				}
-			}
+		case "end", "G":
+			s.endCursor()
 			s.scrollToCursor()
 			return s, nil
-		}
-		switch m.String() {
 		case "q":
 			s.done = true
-		case "h":
-			s.switchTab(s.active - 1)
-		case "l":
-			s.switchTab(s.active + 1)
-		case "j":
-			s.cursor = s.nextSelectable(s.cursor + 1)
-			s.scrollToCursor()
-		case "k":
-			s.cursor = s.prevSelectable(s.cursor - 1)
-			s.scrollToCursor()
-		case "g":
-			s.cursor = s.firstSelectable()
-			s.scrollToCursor()
-		case "G":
-			t := s.currentTab()
-			if t != nil {
-				for i := len(t.Body) - 1; i >= 0; i-- {
-					if t.Body[i].isSelectable() {
-						s.cursor = i
-						break
-					}
-				}
-			}
-			s.scrollToCursor()
+			return s, nil
 		}
-	case tea.MouseMsg:
+	case tea.MouseWheelMsg:
 		switch m.Button {
-		case tea.MouseButtonWheelUp:
+		case tea.MouseWheelUp:
 			s.cursor = s.prevSelectable(s.cursor - 1)
 			s.scrollToCursor()
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			s.cursor = s.nextSelectable(s.cursor + 1)
 			s.scrollToCursor()
 		}

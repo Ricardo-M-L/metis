@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // TestRenderTodoSnapshot verifies the inline task-list body that's
@@ -47,13 +49,17 @@ func TestRenderTodoSnapshot(t *testing.T) {
 		t.Error("expected □ for pending task")
 	}
 	// Each task content should appear (not stripped by accident).
+	// v2: lipgloss strike-through wraps content with per-run ANSI
+	// codes, so a literal substring no longer exists. Compare against
+	// the ANSI-stripped form instead.
+	plain := ansi.Strip(got)
 	for _, content := range []string{
 		"Bump event channel buffers 64 → 256",
 		"Stream the compaction call",
 		"Add Google Gemini provider",
 		"Write release notes",
 	} {
-		if !strings.Contains(got, content) {
+		if !strings.Contains(plain, content) {
 			t.Errorf("task content missing: %q", content)
 		}
 	}

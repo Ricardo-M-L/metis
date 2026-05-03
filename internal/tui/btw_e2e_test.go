@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
+	"charm.land/bubbles/v2/textarea"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/slash"
@@ -66,7 +66,7 @@ func TestBtwOverlay_E2E_FullFlow(t *testing.T) {
 	}
 
 	// --- step 5: View should show the loading state --------------------------
-	view := m.View()
+	view := m.View().Content
 	if !strings.Contains(view, "/btw") {
 		t.Errorf("View missing /btw title:\n%s", view)
 	}
@@ -101,7 +101,7 @@ func TestBtwOverlay_E2E_FullFlow(t *testing.T) {
 	m = updatedModel.(*Model)
 
 	// --- step 7: View should now show the answer ----------------------------
-	view = m.View()
+	view = m.View().Content
 	if !strings.Contains(view, mockAnswer) {
 		t.Errorf("after answer delivery, View missing answer text:\n%s", view)
 	}
@@ -110,7 +110,7 @@ func TestBtwOverlay_E2E_FullFlow(t *testing.T) {
 	}
 
 	// --- step 8: Esc dismisses ----------------------------------------------
-	updatedModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updatedModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m = updatedModel.(*Model)
 
 	if m.overlays.Active() {
@@ -118,7 +118,7 @@ func TestBtwOverlay_E2E_FullFlow(t *testing.T) {
 	}
 
 	// --- step 9: View should no longer render the modal ----------------------
-	view = m.View()
+	view = m.View().Content
 	if strings.Contains(view, "/btw — side question") {
 		t.Errorf("after Esc, modal title should be gone:\n%s", view)
 	}
@@ -143,7 +143,7 @@ func TestBtwOverlay_E2E_ErrorPath(t *testing.T) {
 	updatedModel, _ := m.Update(overlay.BtwAnswerMsg{Err: errors.New("api_error: rate limited")})
 	m = updatedModel.(*Model)
 
-	view := m.View()
+	view := m.View().Content
 	if !strings.Contains(view, "error") {
 		t.Errorf("View should mention 'error':\n%s", view)
 	}
@@ -166,7 +166,7 @@ func TestBtwOverlay_E2E_NoBackendShowsImmediateError(t *testing.T) {
 		t.Fatalf("overlay should push even when no backend is wired")
 	}
 
-	view := m.View()
+	view := m.View().Content
 	if !strings.Contains(view, "not wired") {
 		t.Errorf("View should explain absent backend:\n%s", view)
 	}
@@ -193,7 +193,7 @@ func TestBtwOverlay_E2E_DuplicateInvocationReplaces(t *testing.T) {
 	}
 
 	// The overlay should reflect the SECOND question, not the first.
-	view := m.View()
+	view := m.View().Content
 	if !strings.Contains(view, "second question") {
 		t.Errorf("View should show second question:\n%s", view)
 	}
@@ -256,7 +256,7 @@ func newBtwTestModel(t *testing.T, ask func(context.Context, string) (string, er
 // invoke it manually to drive async work like the OnPush LLM call.
 func pressEnter(t *testing.T, m *Model) tea.Cmd {
 	t.Helper()
-	updatedModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updatedModel, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	got := updatedModel.(*Model)
 	*m = *got
 	return cmd

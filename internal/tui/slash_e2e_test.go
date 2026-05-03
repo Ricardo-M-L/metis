@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
+	"charm.land/bubbles/v2/textarea"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"

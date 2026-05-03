@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 )
@@ -42,29 +42,29 @@ func TestPermissionAsk_NavigationCycles(t *testing.T) {
 	m.permReply = make(chan agent.PermissionDecision, 1)
 
 	// Right / Down advance.
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyRight})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyRight})
 	if m.permCursor != 1 {
 		t.Errorf("→ should move cursor 0→1, got %d", m.permCursor)
 	}
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyDown})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyDown})
 	if m.permCursor != 2 {
 		t.Errorf("↓ should move cursor 1→2, got %d", m.permCursor)
 	}
 
 	// Left / Up retreat.
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyLeft})
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyUp})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyLeft})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyUp})
 	if m.permCursor != 0 {
 		t.Errorf("after ←↑ cursor should be 0, got %d", m.permCursor)
 	}
 
 	// Cursor clamps at boundaries (no wrap-around).
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyUp})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyUp})
 	if m.permCursor != 0 {
 		t.Errorf("↑ at top should clamp at 0, got %d", m.permCursor)
 	}
 	m.permCursor = len(m.permChoices) - 1
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyDown})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyDown})
 	if m.permCursor != len(m.permChoices)-1 {
 		t.Errorf("↓ at bottom should clamp, got %d", m.permCursor)
 	}
@@ -83,7 +83,7 @@ func TestPermissionAsk_EnterSendsDecision(t *testing.T) {
 	m.permReply = reply
 	m.permCursor = 0 // "Yes"
 
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	select {
 	case d := <-reply:
@@ -106,7 +106,7 @@ func TestPermissionAsk_EscDeniesAndDismisses(t *testing.T) {
 	m.permReply = reply
 	m.permCursor = 0
 
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyEscape})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyEscape})
 
 	select {
 	case d := <-reply:
@@ -132,7 +132,7 @@ func TestPermissionAsk_AlwaysAllowAddsRule(t *testing.T) {
 	m.permReply = reply
 	m.permCursor = 1
 
-	m.handlePermKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m.handlePermKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	select {
 	case d := <-reply:
@@ -175,7 +175,7 @@ func TestHistorySearch_FilterNarrows(t *testing.T) {
 
 	// Type "git" rune by rune.
 	for _, r := range "git" {
-		m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.handleHistoryKey(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	if m.histFilter != "git" {
 		t.Errorf("histFilter = %q", m.histFilter)
@@ -185,7 +185,7 @@ func TestHistorySearch_FilterNarrows(t *testing.T) {
 	}
 
 	// Backspace narrows back.
-	m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	m.handleHistoryKey(tea.KeyPressMsg{Code: tea.KeyBackspace})
 	if m.histFilter != "gi" {
 		t.Errorf("after backspace filter = %q", m.histFilter)
 	}
@@ -198,7 +198,7 @@ func TestHistorySearch_EnterCopiesToInput(t *testing.T) {
 	m.showHistory = true
 	m.histCursor = 1
 
-	m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m.handleHistoryKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if m.input.Value() != "second" {
 		t.Errorf("Enter should copy selection to input, got %q", m.input.Value())
@@ -215,7 +215,7 @@ func TestHistorySearch_EscCancels(t *testing.T) {
 	m.showHistory = true
 	m.input.SetValue("user-typed")
 
-	m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyEscape})
+	m.handleHistoryKey(tea.KeyPressMsg{Code: tea.KeyEscape})
 
 	if m.showHistory {
 		t.Errorf("Esc should close history overlay")
@@ -232,15 +232,15 @@ func TestHistorySearch_NavigationClamps(t *testing.T) {
 	m.histCursor = 0
 
 	// Up at top should stay at 0 (claude-code parity, no wrap).
-	m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyUp})
+	m.handleHistoryKey(tea.KeyPressMsg{Code: tea.KeyUp})
 	if m.histCursor != 0 {
 		t.Errorf("↑ at top should clamp at 0, got %d", m.histCursor)
 	}
 
 	// Down moves through, clamps at end.
-	m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyDown})
-	m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyDown})
-	m.handleHistoryKey(tea.KeyMsg{Type: tea.KeyDown}) // beyond end
+	m.handleHistoryKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.handleHistoryKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.handleHistoryKey(tea.KeyPressMsg{Code: tea.KeyDown}) // beyond end
 	if m.histCursor != len(m.histMatched)-1 {
 		t.Errorf("↓ should clamp at len-1=%d, got %d", len(m.histMatched)-1, m.histCursor)
 	}
@@ -290,7 +290,7 @@ func TestPalette_TabCyclesAndSyncsBuffer(t *testing.T) {
 
 	m.palCursor = 0
 	first := m.palMatched[0].Name
-	m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyTab})
+	m.handlePaletteKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	if m.palCursor != 1 {
 		t.Errorf("Tab should move cursor 0→1, got %d", m.palCursor)
 	}
@@ -300,7 +300,7 @@ func TestPalette_TabCyclesAndSyncsBuffer(t *testing.T) {
 	}
 
 	// Arrow keys also navigate.
-	m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyUp})
+	m.handlePaletteKey(tea.KeyPressMsg{Code: tea.KeyUp})
 	if m.palCursor != 0 {
 		t.Errorf("↑ should move 1→0, got %d", m.palCursor)
 	}
@@ -315,7 +315,7 @@ func TestPalette_EscClosesAndResetsInput(t *testing.T) {
 	m.showPalette = true
 	m.palFilter = "something"
 
-	m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyEscape})
+	m.handlePaletteKey(tea.KeyPressMsg{Code: tea.KeyEscape})
 
 	if m.showPalette {
 		t.Errorf("Esc should close palette")
@@ -330,7 +330,7 @@ func TestPalette_BackspaceOnEmptyFilterCloses(t *testing.T) {
 	m.showPalette = true
 	m.palFilter = ""
 
-	m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	m.handlePaletteKey(tea.KeyPressMsg{Code: tea.KeyBackspace})
 
 	if m.showPalette {
 		t.Errorf("Backspace on empty filter should close palette (the user is deleting the leading '/')")

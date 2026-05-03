@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestBtwOverlay_LifecycleHappyPath(t *testing.T) {
@@ -73,7 +73,7 @@ func TestBtwOverlay_NoBackendShowsImmediateError(t *testing.T) {
 
 func TestBtwOverlay_EscDismisses(t *testing.T) {
 	o := NewBtwOverlay(context.Background(), "q", func(context.Context, string) (string, error) { return "", nil })
-	_, _, consumed := o.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	_, _, consumed := o.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	if !consumed {
 		t.Errorf("Esc should be consumed")
 	}
@@ -87,7 +87,7 @@ func TestBtwOverlay_EscDismisses(t *testing.T) {
 
 func TestBtwOverlay_NonEscDoesNotConsume(t *testing.T) {
 	o := NewBtwOverlay(context.Background(), "q", func(context.Context, string) (string, error) { return "", nil })
-	_, _, consumed := o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	_, _, consumed := o.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	if consumed {
 		t.Errorf("regular keys should pass through to input box")
 	}

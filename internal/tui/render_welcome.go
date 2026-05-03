@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // renderWelcomeBanner paints the fresh-session greeting. The earlier

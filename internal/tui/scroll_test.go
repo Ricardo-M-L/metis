@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/lipgloss/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
@@ -32,7 +32,7 @@ func TestLongContent_ChatListClampsAndScrolls(t *testing.T) {
 		})
 	}
 	// Render once — View() does the dynamic resize + chatList.SetItemsKeepScroll.
-	out := m.View()
+	out := m.View().Content
 	if out == "" {
 		t.Fatal("View() returned empty for non-empty transcript")
 	}

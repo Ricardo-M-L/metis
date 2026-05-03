@@ -15,7 +15,7 @@ package tui
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 )
@@ -94,37 +94,49 @@ func (m *Model) rebuildHistoryMatches() {
 //	Backspace → trim filter.
 //	any rune  → append to filter.
 func (m *Model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEscape, tea.KeyCtrlC:
+	// v2: tea.KeyMsg is interface, .Type / .Runes gone. Match by String()
+	// for named keys; fall through to "type a character into the filter"
+	// when the press is a printable rune (String() == single rune) or
+	// the literal "space" name.
+	s := msg.String()
+	switch s {
+	case "esc", "ctrl+c":
 		m.closeHistorySearch()
 		return m, nil
-	case tea.KeyUp:
+	case "up":
 		if m.histCursor > 0 {
 			m.histCursor--
 		}
 		return m, nil
-	case tea.KeyDown:
+	case "down":
 		if m.histCursor < len(m.histMatched)-1 {
 			m.histCursor++
 		}
 		return m, nil
-	case tea.KeyEnter:
+	case "enter":
 		if m.histCursor < len(m.histMatched) {
 			m.input.SetValue(m.histMatched[m.histCursor])
 			m.input.CursorEnd()
 		}
 		m.closeHistorySearch()
 		return m, nil
-	case tea.KeyBackspace:
+	case "backspace":
 		if len(m.histFilter) > 0 {
 			m.histFilter = m.histFilter[:len(m.histFilter)-1]
 			m.rebuildHistoryMatches()
 		}
 		return m, nil
-	case tea.KeyRunes, tea.KeySpace:
-		m.histFilter += string(msg.Runes)
+	case "space":
+		m.histFilter += " "
 		m.rebuildHistoryMatches()
 		return m, nil
+	}
+	// Typed printable rune — String() returns the character itself.
+	// Single-rune length filter avoids picking up multi-key sequences
+	// like "ctrl+x" that we haven't explicitly named above.
+	if len([]rune(s)) == 1 {
+		m.histFilter += s
+		m.rebuildHistoryMatches()
 	}
 	return m, nil
 }

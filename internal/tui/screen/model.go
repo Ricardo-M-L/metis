@@ -3,8 +3,8 @@ package screen
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ModelChoice is one entry in the /model picker. Caller (tui pkg) supplies
@@ -71,57 +71,42 @@ func (s *ModelScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		// v2: collapsed two switches into one .String() match.
+		switch m.String() {
+		case "esc", "ctrl+c", "q":
 			s.done = true
 			return s, nil
-		case tea.KeyEnter:
+		case "enter":
 			if s.cursor >= 0 && s.cursor < len(s.choices) {
 				s.applied = s.choices[s.cursor].ID
 			}
 			s.done = true
 			return s, nil
-		case tea.KeyUp:
+		case "up", "k":
 			if n := len(s.choices); n > 0 {
 				s.cursor = (s.cursor - 1 + n) % n
 			}
 			return s, nil
-		case tea.KeyDown:
+		case "down", "j":
 			if n := len(s.choices); n > 0 {
 				s.cursor = (s.cursor + 1) % n
 			}
 			return s, nil
-		case tea.KeyHome:
+		case "home", "g":
 			s.cursor = 0
 			return s, nil
-		case tea.KeyEnd:
+		case "end", "G":
 			s.cursor = len(s.choices) - 1
 			return s, nil
 		}
-		switch m.String() {
-		case "q":
-			s.done = true
-		case "k":
-			if n := len(s.choices); n > 0 {
-				s.cursor = (s.cursor - 1 + n) % n
-			}
-		case "j":
-			if n := len(s.choices); n > 0 {
-				s.cursor = (s.cursor + 1) % n
-			}
-		case "g":
-			s.cursor = 0
-		case "G":
-			s.cursor = len(s.choices) - 1
-		}
-	case tea.MouseMsg:
+	case tea.MouseWheelMsg:
 		switch m.Button {
-		case tea.MouseButtonWheelUp:
+		case tea.MouseWheelUp:
 			if n := len(s.choices); n > 0 {
 				s.cursor = (s.cursor - 1 + n) % n
 			}
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			if n := len(s.choices); n > 0 {
 				s.cursor = (s.cursor + 1) % n
 			}

@@ -470,6 +470,8 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		ReducedMotion:   cfg.UI.Performance.ReducedMotion,
 		SlowRenderMs:    cfg.UI.Performance.SlowRenderMs,
 		StatsLogEvery:   cfg.UI.Performance.StatsLogEvery,
+		MaxMountedItems: cfg.UI.Performance.MaxMountedItems,
+		ScrollQuantum:   cfg.UI.Performance.ScrollQuantum,
 	})
 	return rt, nil
 }

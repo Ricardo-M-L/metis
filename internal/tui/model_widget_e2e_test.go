@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
@@ -63,9 +63,9 @@ func TestModelWidget_ApplyUpdatesModel(t *testing.T) {
 	// Cursor starts wherever m.model matches; for newSlashTestModel
 	// it's "claude-sonnet-4-6" which is index 1 in builtinModelChoices.
 	// Move down twice to MiniMax.
-	m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if m.activeScreen != nil {
 		t.Errorf("Enter should dismiss picker; activeScreen still %T", m.activeScreen)

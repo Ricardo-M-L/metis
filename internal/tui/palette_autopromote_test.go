@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestPalette_EnterAutopromotesIncompleteSlash — claude-code parity.
@@ -23,7 +23,7 @@ func TestPalette_EnterAutopromotesIncompleteSlash(t *testing.T) {
 	// Type "/effo" — palette opens on the leading "/" and matchCommands
 	// runs after each keystroke (handlePaletteKey path).
 	for _, r := range "/effo" {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 
 	if !m.showPalette {
@@ -74,7 +74,7 @@ func TestPalette_EnterAutopromotesIncompleteSlash(t *testing.T) {
 func TestPalette_EnterPreservesArgs(t *testing.T) {
 	m := newSlashTestModel(t)
 	for _, r := range "/eff high" {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	pressEnter(t, m)
 
@@ -105,7 +105,7 @@ func TestPalette_EnterPreservesArgs(t *testing.T) {
 func TestPalette_EnterDoesNotPromoteExactMatch(t *testing.T) {
 	m := newSlashTestModel(t)
 	for _, r := range "/help" {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	if !m.showPalette {
 		t.Fatalf("palette should be open after /help")

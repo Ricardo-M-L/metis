@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
@@ -61,9 +61,9 @@ func TestThemeWidget_ApplyChangesTheme(t *testing.T) {
 	pressEnter(t, m)
 
 	// Cursor on dark; press Right twice to reach dark-daltonized.
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	// SwitchTheme should have run; currentTheme name must have changed.
 	if currentTheme.Name == "dark" {
@@ -95,8 +95,8 @@ func TestThemeWidget_EscPreservesTheme(t *testing.T) {
 	m.input.SetValue("/theme")
 	pressEnter(t, m)
 
-	m.Update(tea.KeyMsg{Type: tea.KeyRight}) // visually moves
-	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // visually moves
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if currentTheme.Name != "dark" {
 		t.Errorf("Esc should not change theme; currentTheme = %q", currentTheme.Name)

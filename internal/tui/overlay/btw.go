@@ -4,8 +4,8 @@ import (
 	"context"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // BtwOverlay implements the /btw side-question modal as an Overlay.
@@ -61,7 +61,9 @@ func (b *BtwOverlay) Active() bool { return !b.closed }
 // support for long answers; we'll add that when an answer actually
 // overflows the viewport.)
 func (b *BtwOverlay) Update(msg tea.KeyMsg) (Overlay, tea.Cmd, bool) {
-	if msg.Type == tea.KeyEsc {
+	// v2: tea.KeyMsg is an interface (fmt.Stringer + Key()); compare
+	// via String() since the .Type field is gone.
+	if msg.String() == "esc" {
 		b.closed = true
 		return b, nil, true
 	}

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
@@ -116,52 +116,37 @@ func (s *HistoryScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.Resize(m.Width, m.Height)
 		return s, nil
-	case tea.KeyMsg:
-		switch m.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
+	case tea.KeyPressMsg:
+		// v2: KeyMsg is interface; KeyPressMsg concrete. Match by
+		// .String() — covers named keys ("esc", "pgup") and ASCII alike.
+		switch m.String() {
+		case "esc", "ctrl+c", "q":
 			s.done = true
 			return s, nil
-		case tea.KeyUp:
+		case "up", "k":
 			s.l.ScrollBy(-1)
 			return s, nil
-		case tea.KeyDown:
+		case "down", "j":
 			s.l.ScrollBy(1)
 			return s, nil
-		case tea.KeyPgUp:
+		case "pgup":
 			s.l.ScrollBy(-s.l.Height() / 2)
 			return s, nil
-		case tea.KeyPgDown:
+		case "pgdown":
 			s.l.ScrollBy(s.l.Height() / 2)
 			return s, nil
-		case tea.KeyHome:
+		case "home", "g":
 			s.l.ScrollToTop()
 			return s, nil
-		case tea.KeyEnd:
+		case "end", "G":
 			s.l.ScrollToBottom()
 			return s, nil
 		}
-		// vim-style and 'q' to quit. Single-char route through String()
-		// instead of Type since these are KeyRunes, not named keys.
-		switch m.String() {
-		case "q":
-			s.done = true
-			return s, nil
-		case "k":
-			s.l.ScrollBy(-1)
-		case "j":
-			s.l.ScrollBy(1)
-		case "g":
-			s.l.ScrollToTop()
-		case "G":
-			s.l.ScrollToBottom()
-		}
-	case tea.MouseMsg:
-		// bubbles/viewport.Update used to handle wheel events for us;
-		// list has no Update(tea.Msg) so we route wheel manually.
+	case tea.MouseWheelMsg:
 		switch m.Button {
-		case tea.MouseButtonWheelUp:
+		case tea.MouseWheelUp:
 			s.l.ScrollBy(-1)
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			s.l.ScrollBy(1)
 		}
 	}

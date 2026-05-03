@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestWidgetHint_AllPhaseCWidgetsCovered — Phase C ports five widgets
@@ -44,7 +44,7 @@ func TestWidgetHint_NonWidgetCommandsReturnEmpty(t *testing.T) {
 func TestPalette_RendersWidgetHint(t *testing.T) {
 	m := newSlashTestModel(t)
 	for _, r := range "/eff" {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	if !m.showPalette {
 		t.Fatalf("palette did not open on /eff")

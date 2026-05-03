@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
@@ -34,9 +34,9 @@ func TestPermissionsWidget_ApplyChangesMode(t *testing.T) {
 	pressEnter(t, m)
 
 	// Cursor on auto (index 1). Right twice → plan (index 3).
-	m.Update(tea.KeyMsg{Type: tea.KeyRight}) // bypass
-	m.Update(tea.KeyMsg{Type: tea.KeyRight}) // plan
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // bypass
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // plan
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if m.gate.Mode() != permission.ModePlan {
 		t.Errorf("expected mode = plan after apply; got %q", m.gate.Mode())
@@ -62,9 +62,9 @@ func TestPermissionsWidget_EscPreservesMode(t *testing.T) {
 	m.input.SetValue("/permissions")
 	pressEnter(t, m)
 
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if m.gate.Mode() != permission.ModeAsk {
 		t.Errorf("Esc should preserve mode = ask; got %q", m.gate.Mode())

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func sampleChoices() []ModelChoice {
@@ -62,11 +62,11 @@ func TestModelScreen_ArrowNavWrapsAround(t *testing.T) {
 	s := NewModelScreen("gpt-4o", sampleChoices()) // cursor=3 (last)
 	s.Resize(100, 20)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}) // wrap to 0
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // wrap to 0
 	if s.cursor != 0 {
 		t.Errorf("Down at last entry should wrap to 0; got %d", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyUp}) // wrap to 3
+	s.Update(tea.KeyPressMsg{Code: tea.KeyUp}) // wrap to 3
 	if s.cursor != 3 {
 		t.Errorf("Up at first entry should wrap to last (3); got %d", s.cursor)
 	}
@@ -77,9 +77,9 @@ func TestModelScreen_ArrowNavWrapsAround(t *testing.T) {
 func TestModelScreen_EnterApplies(t *testing.T) {
 	s := NewModelScreen("claude-opus-4-7", sampleChoices()) // cursor=0
 	s.Resize(100, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}) // → 1
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}) // → 2 (MiniMax)
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // → 1
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // → 2 (MiniMax)
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if !s.Done() {
 		t.Errorf("Enter should mark Done()")
@@ -93,8 +93,8 @@ func TestModelScreen_EnterApplies(t *testing.T) {
 func TestModelScreen_EscCancels(t *testing.T) {
 	s := NewModelScreen("claude-opus-4-7", sampleChoices())
 	s.Resize(100, 20)
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
-	s.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if !s.Done() {
 		t.Errorf("Esc should mark Done()")

@@ -17,8 +17,8 @@ import (
 	"os"
 	"path/filepath"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ensureTrusted prompts the user to confirm the cwd before launching
@@ -65,42 +65,35 @@ type trustModel struct {
 func (trustModel) Init() tea.Cmd { return nil }
 
 func (m *trustModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// v2: KeyMsg is interface; switch on .String() for both named keys
+	// and printable runes (replaces v1 .Type and .KeyRunes paths).
 	if k, ok := msg.(tea.KeyMsg); ok {
-		switch k.Type {
-		case tea.KeyUp, tea.KeyShiftTab:
+		switch k.String() {
+		case "up", "shift+tab":
 			if m.cursor > 0 {
 				m.cursor--
 			}
-		case tea.KeyDown, tea.KeyTab:
+		case "down", "tab":
 			if m.cursor < len(m.choices)-1 {
 				m.cursor++
 			}
-		case tea.KeyEnter:
+		case "enter":
 			m.confirmed = m.cursor == 0
 			return m, tea.Quit
-		case tea.KeyEsc, tea.KeyCtrlC:
+		case "esc", "ctrl+c":
 			m.cancelled = true
 			return m, tea.Quit
-		case tea.KeyRunes:
-			// Single-key shortcuts that match the menu numbers.
-			switch k.String() {
-			case "1":
-				m.confirmed = true
-				return m, tea.Quit
-			case "2":
-				return m, tea.Quit
-			case "y", "Y":
-				m.confirmed = true
-				return m, tea.Quit
-			case "n", "N":
-				return m, tea.Quit
-			}
+		case "1", "y", "Y":
+			m.confirmed = true
+			return m, tea.Quit
+		case "2", "n", "N":
+			return m, tea.Quit
 		}
 	}
 	return m, nil
 }
 
-func (m *trustModel) View() string {
+func (m *trustModel) View() tea.View {
 	var (
 		header   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffd54f")).Bold(true)
 		path     = lipgloss.NewStyle().Bold(true)
@@ -142,7 +135,7 @@ func (m *trustModel) View() string {
 	b = append(b, "")
 	b = append(b, muted.Render("↑↓ select · Enter to confirm · Esc to cancel"))
 	b = append(b, "")
-	return joinLines(b)
+	return tea.NewView(joinLines(b))
 }
 
 // joinLines is a tiny helper that avoids the strings import (the rest

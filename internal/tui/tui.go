@@ -19,8 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -270,6 +270,14 @@ type Model struct {
 	// still accessed exclusively via atomic.AddInt64 so concurrent
 	// pre-render writers (future tea.Cmd path) stay race-free.
 	msgSeq int64
+
+	// wheelAccum accumulates mouse-wheel deltas between forwarded
+	// list.ScrollBy calls when ScrollQuantum > 0. A trackpad emits
+	// dozens of wheel events per gesture; quantizing into N-line
+	// chunks (claude-code SCROLL_QUANTUM=40 inspiration) reduces
+	// per-frame churn at the chat-list level. Sign tracks direction
+	// (negative = up, positive = down).
+	wheelAccum int
 }
 
 // nextID returns a process-stable identifier for a new Message or
@@ -331,10 +339,13 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	// textarea (instead of post-processing its View() output) avoids
 	// collisions with textarea's internal height/cursor accounting,
 	// which otherwise rendered the typed `/` on row 2 instead of row 1.
-	ti.SetPromptFunc(2, func(lineIdx int) string {
+	// v2: textarea's prompt-func signature changed from
+	// `func(lineIdx int) string` to `func(textarea.PromptInfo) string`
+	// where PromptInfo bundles LineNumber + Focused.
+	ti.SetPromptFunc(2, func(info textarea.PromptInfo) string {
 		// claude-code uses ">" (ASCII greater-than) — flatter look that
 		// fits the no-border input style.
-		if lineIdx == 0 {
+		if info.LineNumber == 0 {
 			return "> "
 		}
 		return "  "
@@ -352,6 +363,14 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	// want browser-like jumpy scroll can set
 	// `[ui.performance].mouse_wheel_lines = 3` or env METIS_MOUSE_WHEEL_LINES=3.
 	cl.SetMouseWheelDelta(mouseWheelLines())
+	// claude-code-style hard cap on physically mounted items. Default
+	// 0 (unbounded) preserves existing behavior; set
+	// `[ui.performance].max_mounted_items = 300` to enable. Older
+	// messages still live in m.messages — they just don't reach the
+	// chatList until the user scrolls back into them (future work).
+	if mm := perfConfig().MaxMountedItems; mm > 0 {
+		cl.SetMaxMounted(mm)
+	}
 
 	// Render cache picks up SlowRenderMs / StatsLogEvery from the
 	// active perf config; both fall back to the cache's own defaults
@@ -409,14 +428,11 @@ func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *sessi
 	if forceBanner {
 		m.firstRender = true
 	}
+	// v2: WithAltScreen / WithMouseCellMotion options are gone — those
+	// terminal modes are now declared per-frame in View() via
+	// tea.View.AltScreen and tea.View.MouseMode. See tui_render.go.
 	p := tea.NewProgram(m,
 		tea.WithContext(ctx),
-		tea.WithAltScreen(),
-		// Enable mouse wheel events so scrolling the viewport works
-		// without keyboard shortcuts. Cell-motion mode is the lighter
-		// of the two — only sends events on click/wheel, not on hover,
-		// so it doesn't drown the terminal in motion packets.
-		tea.WithMouseCellMotion(),
 	)
 	_, err := p.Run()
 	return err

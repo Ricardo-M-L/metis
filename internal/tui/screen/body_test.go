@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestBodyScreen_RendersHeaderAndBody — sanity: the modal envelope
@@ -33,9 +33,9 @@ func TestBodyScreen_EscDismisses(t *testing.T) {
 		name string
 		key  tea.KeyMsg
 	}{
-		{"Esc", tea.KeyMsg{Type: tea.KeyEsc}},
-		{"q", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}}},
-		{"Ctrl-C", tea.KeyMsg{Type: tea.KeyCtrlC}},
+		{"Esc", tea.KeyPressMsg{Code: tea.KeyEsc}},
+		{"q", tea.KeyPressMsg{Code: 'q', Text: "q"}},
+		{"Ctrl-C", tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,56 +67,56 @@ func TestBodyScreen_Scrolls(t *testing.T) {
 	}
 
 	// ↓ once → scroll = 1
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.scroll != 1 {
 		t.Errorf("KeyDown: scroll = %d, want 1", s.scroll)
 	}
 
 	// PgDn → scroll += bodyHeight/2 = 5 → 6
-	s.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
 	if s.scroll != 6 {
 		t.Errorf("PgDn: scroll = %d, want 6", s.scroll)
 	}
 
 	// End → clamped to maxScroll = len(lines) - bodyHeight.
 	// 50 lines + trailing newline → 51 split entries → 41.
-	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 	if s.scroll != 41 {
 		t.Errorf("End: scroll = %d, want 41 (clamped)", s.scroll)
 	}
 
 	// Home → 0
-	s.Update(tea.KeyMsg{Type: tea.KeyHome})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyHome})
 	if s.scroll != 0 {
 		t.Errorf("Home: scroll = %d, want 0", s.scroll)
 	}
 
 	// j → 1
-	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	s.Update(tea.KeyPressMsg{Code: 'j', Text: "j"})
 	if s.scroll != 1 {
 		t.Errorf("j: scroll = %d, want 1", s.scroll)
 	}
 
 	// k → 0
-	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	s.Update(tea.KeyPressMsg{Code: 'k', Text: "k"})
 	if s.scroll != 0 {
 		t.Errorf("k: scroll = %d, want 0", s.scroll)
 	}
 
 	// G → maxScroll (= 41 with trailing newline)
-	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	s.Update(tea.KeyPressMsg{Code: 'G', Text: "G"})
 	if s.scroll != 41 {
 		t.Errorf("G: scroll = %d, want 41", s.scroll)
 	}
 
 	// g → 0
-	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	s.Update(tea.KeyPressMsg{Code: 'g', Text: "g"})
 	if s.scroll != 0 {
 		t.Errorf("g: scroll = %d, want 0", s.scroll)
 	}
 
 	// Mouse wheel down → 1
-	s.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	s.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
 	if s.scroll != 1 {
 		t.Errorf("WheelDown: scroll = %d, want 1", s.scroll)
 	}

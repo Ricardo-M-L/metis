@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func sampleDetailSections() []DetailSection {
@@ -38,10 +38,10 @@ func TestDetailScreen_RendersSections(t *testing.T) {
 
 // TestDetailScreen_EscDismisses — Esc / q / Ctrl-C all set Done().
 func TestDetailScreen_EscDismisses(t *testing.T) {
-	cases := []tea.KeyMsg{
-		{Type: tea.KeyEsc},
-		{Type: tea.KeyCtrlC},
-		{Type: tea.KeyRunes, Runes: []rune{'q'}},
+	cases := []tea.KeyPressMsg{
+		{Code: tea.KeyEsc},
+		{Code: 'c', Mod: tea.ModCtrl},
+		{Code: 'q', Text: "q"},
 	}
 	for _, key := range cases {
 		s := NewDetailScreen("/x", "y", sampleDetailSections())
@@ -66,11 +66,11 @@ func TestDetailScreen_Scrolls(t *testing.T) {
 	if s.scroll != 0 {
 		t.Fatalf("initial scroll=%d, want 0", s.scroll)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
 	if s.scroll == 0 {
 		t.Errorf("End should advance scroll")
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyHome})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyHome})
 	if s.scroll != 0 {
 		t.Errorf("Home should reset scroll")
 	}

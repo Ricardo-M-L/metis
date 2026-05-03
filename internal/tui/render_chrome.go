@@ -6,11 +6,12 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -331,7 +332,10 @@ func formatTokensRaw(n int) string {
 
 // modeIcon picks a vim-style mode glyph + color (claude-code's status bar
 // style). Each mode gets a glyph that telegraphs its semantics.
-func modeIcon(mode string) (glyph string, color lipgloss.Color) {
+//
+// v2: lipgloss.Color became a function returning color.Color, so the
+// return type is now image/color.Color.
+func modeIcon(mode string) (glyph string, c color.Color) {
 	switch mode {
 	case "auto":
 		return "▶▶", lipgloss.Color("#64b5f6")

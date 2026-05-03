@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func cursorTabs() []HelpTab {
@@ -53,11 +53,11 @@ func TestHelpCursor_DownSkipsNonSelectable(t *testing.T) {
 	s.Resize(80, 30)
 	s.switchTab(1) // cursor now on /agents (idx 2)
 
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.cursor != 3 {
 		t.Errorf("Down from /agents should jump to /clear (3); got %d", s.cursor)
 	}
-	s.Update(tea.KeyMsg{Type: tea.KeyDown})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.cursor != 4 {
 		t.Errorf("Down from /clear should jump to /cost (4); got %d", s.cursor)
 	}
@@ -69,9 +69,9 @@ func TestHelpCursor_EnterSelectsCommand(t *testing.T) {
 	s := NewHelpScreen("v1", cursorTabs())
 	s.Resize(80, 30)
 	s.switchTab(1)
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}) // /clear
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // /clear
 
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if !s.Done() {
 		t.Errorf("Enter should mark Done()")
 	}
@@ -87,7 +87,7 @@ func TestHelpCursor_EnterOnNonSelectableLeavesEmpty(t *testing.T) {
 	s := NewHelpScreen("v1", cursorTabs())
 	s.Resize(80, 30)
 	// Stay on tab 0 (no selectable rows). cursor=0 (first row, Heading).
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if got := s.Selected(); got != "" {
 		t.Errorf("Selected() on non-selectable should be empty; got %q", got)
 	}
@@ -99,7 +99,7 @@ func TestHelpCursor_TabSwitchResetsCursor(t *testing.T) {
 	s := NewHelpScreen("v1", cursorTabs())
 	s.Resize(80, 30)
 	s.switchTab(1) // commands, cursor=2
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}) // cursor=3 (/clear)
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // cursor=3 (/clear)
 	s.switchTab(0) // general — no selectable
 	if s.cursor != 0 {
 		t.Errorf("after switch back to general (no selectable), cursor should reset to 0; got %d", s.cursor)

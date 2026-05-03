@@ -9,8 +9,8 @@
 package tui
 
 import (
-	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/glamour/v2"
+	"charm.land/lipgloss/v2"
 )
 
 type Styles struct {
@@ -58,7 +58,7 @@ func MarkdownRenderer(width int) (*glamour.TermRenderer, error) {
 		width = 120
 	}
 	return glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
+		glamour.WithEnvironmentConfig(),
 		glamour.WithWordWrap(width),
 	)
 }

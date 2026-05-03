@@ -259,6 +259,21 @@ type UIPerformance struct {
 	// claude-code uses LOG_EVERY=20 in render-to-screen.ts; we default
 	// to 100 since metis ticks per spinner frame regardless of activity.
 	StatsLogEvery int `toml:"stats_log_every"`
+
+	// MaxMountedItems caps how many chat items the virtualized list
+	// physically holds. claude-code's MAX_MOUNTED_ITEMS=300 hard limit:
+	// regardless of how many messages a session has, fiber alloc /
+	// per-frame work stays bounded. 0 = unbounded (default,
+	// preserves existing behavior). Set to 300 for claude-code parity
+	// when long sessions start eating memory.
+	MaxMountedItems int `toml:"max_mounted_items"`
+
+	// ScrollQuantum quantizes mouse-wheel events: only every N lines'
+	// worth of accumulated wheel delta triggers a list.ScrollBy call.
+	// claude-code uses SCROLL_QUANTUM=40. 0 = no quantization
+	// (every wheel event scrolls; existing behavior). Helpful for
+	// trackpad users who emit dozens of events per gesture.
+	ScrollQuantum int `toml:"scroll_quantum"`
 }
 
 type Session struct {

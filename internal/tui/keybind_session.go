@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func (m *Model) handleSessionPick() (tea.Model, tea.Cmd) {
@@ -43,10 +43,15 @@ func (m *Model) handleSessionPick() (tea.Model, tea.Cmd) {
 // select and copy chat content. Entering: print the current transcript
 // to stdout (visible in scrollback) then exit alt-screen. Exiting:
 // re-enter alt-screen, the chat redraws fresh.
+//
+// v2: tea.EnterAltScreen / tea.ExitAltScreen Cmds are gone. Alt-screen
+// state is declared via tea.View.AltScreen each frame; View() reads
+// m.copyMode and returns AltScreen=false when set, so toggling the
+// flag is sufficient — the next View() call reflects the change.
 func (m *Model) toggleCopyMode() (tea.Model, tea.Cmd) {
 	if m.copyMode {
 		m.copyMode = false
-		return m, tea.EnterAltScreen
+		return m, nil
 	}
 	m.copyMode = true
 	// Dump a plain transcript so the user has SOMETHING to select
@@ -54,7 +59,7 @@ func (m *Model) toggleCopyMode() (tea.Model, tea.Cmd) {
 	// shows nothing related to metis. Strip ANSI for clean copy.
 	fmt.Println(m.buildPlainTranscript())
 	fmt.Println("[copy mode — Ctrl+S to return to chat]")
-	return m, tea.ExitAltScreen
+	return m, nil
 }
 
 // buildPlainTranscript renders messages + tool events as a single

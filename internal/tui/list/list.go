@@ -56,6 +56,17 @@ type List struct {
 	// Defaults to 1 (pixel-precise) — matches viewport.Model's tunable.
 	mouseWheelDelta int
 
+	// maxMounted caps how many items the list physically holds.
+	// claude-code's MAX_MOUNTED_ITEMS=300 hard limit pattern: no
+	// matter how many messages a session accumulates, fiber alloc /
+	// per-frame work stays bounded. 0 = unbounded (default).
+	//
+	// When SetItems / AppendItems / SetItemsKeepScroll receives more
+	// items than maxMounted, the list silently drops the OLDEST
+	// items (front of slice) — chat surface model: newest content
+	// is always relevant, oldest scrolls off naturally.
+	maxMounted int
+
 	// AtBottom cache: stable for any sequence of repeated AtBottom() calls
 	// that don't mutate items / offset / size. Crush re-walks O(visible)
 	// per AtBottom; metis hits AtBottom ~7 times per frame from
@@ -239,6 +250,59 @@ func (l *List) SetMouseWheelDelta(n int) {
 		n = 1
 	}
 	l.mouseWheelDelta = n
+}
+
+// MaxMounted returns the hard cap on physically mounted items. 0
+// means unbounded.
+func (l *List) MaxMounted() int { return l.maxMounted }
+
+// SetMaxMounted sets the hard cap. claude-code uses 300; metis
+// defaults to 0 (off) so existing tests and code paths see no
+// behavior change. The chat surface opts in via
+// list.SetMaxMounted(perfConfig().MaxMountedItems).
+//
+// When set, all subsequent SetItems / AppendItems / SetItemsKeepScroll
+// calls drop oldest items beyond the cap. Negative values clamp to 0
+// (treated as "no cap").
+func (l *List) SetMaxMounted(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if l.maxMounted != n {
+		l.invalidateAtBottomCache()
+	}
+	l.maxMounted = n
+	// Apply immediately to existing items so the next render reflects
+	// the cap without waiting for a setItems call.
+	l.applyMaxMounted()
+}
+
+// applyMaxMounted truncates l.items from the front to satisfy the
+// cap. Adjusts offsetIdx + selectedIdx to track the same logical item
+// after the truncation (so a user PgUp'd to the top doesn't suddenly
+// see different content).
+func (l *List) applyMaxMounted() {
+	if l.maxMounted <= 0 || len(l.items) <= l.maxMounted {
+		return
+	}
+	dropped := len(l.items) - l.maxMounted
+	l.items = l.items[dropped:]
+	// Migrate offsetIdx — if the user was looking at a now-dropped
+	// item, snap to the top. Otherwise shift index by the drop count.
+	if l.offsetIdx < dropped {
+		l.offsetIdx = 0
+		l.offsetLine = 0
+	} else {
+		l.offsetIdx -= dropped
+	}
+	if l.selectedIdx != -1 {
+		if l.selectedIdx < dropped {
+			l.selectedIdx = -1
+		} else {
+			l.selectedIdx -= dropped
+		}
+	}
+	l.invalidateAtBottomCache()
 }
 
 // ScrollPercent returns 0.0 when at top, 1.0 at bottom — used by the
@@ -550,12 +614,16 @@ func (l *List) setItems(resetScroll bool, items ...Item) {
 		l.offsetLine = 0
 	}
 	l.invalidateAtBottomCache()
+	// Enforce max-mounted cap after every Set; oldest items get
+	// dropped from the front. Stays a no-op when maxMounted is 0.
+	l.applyMaxMounted()
 }
 
 // AppendItems appends items to the list.
 func (l *List) AppendItems(items ...Item) {
 	l.items = append(l.items, items...)
 	l.invalidateAtBottomCache()
+	l.applyMaxMounted()
 }
 
 // RemoveItem removes the item at the given index from the list.

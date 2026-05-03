@@ -12,7 +12,7 @@
 // clean (tui imports screen, never the reverse).
 package screen
 
-import tea "github.com/charmbracelet/bubbletea"
+import tea "charm.land/bubbletea/v2"
 
 // Screen is the contract every overlay implements. The parent Model holds a
 // concrete value and forwards Update/View calls until Done() returns true.

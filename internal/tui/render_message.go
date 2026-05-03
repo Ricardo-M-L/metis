@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/charmbracelet/glamour"
+	"charm.land/glamour/v2"
 )
 
 // renderMessage prints a single transcript row. Spacing convention:
@@ -172,7 +172,7 @@ func getMarkdownRenderer(width int) *glamour.TermRenderer {
 		wrap = 120
 	}
 	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
+		glamour.WithEnvironmentConfig(),
 		glamour.WithWordWrap(wrap),
 	)
 	if err != nil {

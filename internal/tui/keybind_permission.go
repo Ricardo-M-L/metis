@@ -7,7 +7,7 @@ package tui
 import (
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -35,19 +35,19 @@ const modeCycleDebounce = 200 * time.Millisecond
 const permissionTimeout = 60 * time.Second
 
 func (m *Model) handlePermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyLeft, tea.KeyUp:
+	switch msg.String() {
+	case "left", "up":
 		if m.permCursor > 0 {
 			m.permCursor--
 		}
-	case tea.KeyRight, tea.KeyDown:
+	case "right", "down":
 		if m.permCursor < len(m.permChoices)-1 {
 			m.permCursor++
 		}
-	case tea.KeyEnter, tea.KeySpace:
+	case "enter", "space":
 		choice := m.permChoices[m.permCursor]
 		m.executePermission(choice.Key)
-	case tea.KeyEscape:
+	case "esc":
 		m.permActive = false
 		m.executePermission("n")
 	}
