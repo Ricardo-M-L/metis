@@ -229,7 +229,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					// inlining into the chat scroll. Esc/q to dismiss.
 					m.openBodyScreen("/"+cmd.Name, output)
 				} else {
-					m.messages = append(m.messages, Message{Role: "info", Content: output, Timestamp: time.Now()})
+					m.messages = append(m.messages, Message{Role: classifyREPLOutput(output), Content: output, Timestamp: time.Now()})
 				}
 			}
 			return m, nil
