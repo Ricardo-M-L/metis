@@ -39,11 +39,56 @@ const SystemPromptFileName = "system.md"
 // trained on that surface pattern-match the same way.
 func AssembleSystemPrompt(base string) string {
 	out := base + "\n\n" + buildEnvBlock()
+	// Project context — a CLAUDE.md / AGENTS.md / METIS.md at cwd is
+	// the cross-tool convention (Claude Code, Cursor, Aider all read
+	// it). We honor it so `/init` actually has the effect users expect.
+	// Loaded BEFORE the user's ~/.metis/system.md addendum so the
+	// addendum (per-user preferences) wins on conflict.
+	if proj := loadProjectContext(); proj != "" {
+		out += "\n\n" + proj
+	}
 	addendum := loadSystemPromptAddendum()
 	if addendum != "" {
 		out += "\n\n" + addendum
 	}
 	return out
+}
+
+// loadProjectContext checks cwd for any of the conventional project-
+// context filenames and returns the first hit's body wrapped in a
+// labeled block. Search order matches the de-facto priority across
+// LLM-CLI tools: CLAUDE.md is most common (claude-code), AGENTS.md
+// is the OpenAI/codex convention, METIS.md is metis-specific.
+//
+// `.metis/CLAUDE.md` is also checked so users who want the file out
+// of the repo root can stash it under .metis/.
+func loadProjectContext() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	candidates := []string{
+		"CLAUDE.md",
+		"AGENTS.md",
+		"METIS.md",
+		filepath.Join(".metis", "CLAUDE.md"),
+		filepath.Join(".claude", "CLAUDE.md"),
+	}
+	for _, name := range candidates {
+		path := filepath.Join(cwd, name)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		body := strings.TrimSpace(string(b))
+		if body == "" {
+			continue
+		}
+		// Wrap in a labeled block so the LLM knows where this content
+		// came from (helps it cite "per CLAUDE.md..." in answers).
+		return "<project_context source=\"" + name + "\">\n" + body + "\n</project_context>"
+	}
+	return ""
 }
 
 // buildEnvBlock collects the runtime facts the LLM should see verbatim

@@ -38,19 +38,34 @@ type DetailSection struct {
 
 // DetailScreen is the read-only detail viewer.
 type DetailScreen struct {
-	command  string // header stripe label, e.g. "/skills"
-	subtitle string // resource name, e.g. "code-review"
-	sections []DetailSection
-	scroll   int
-	width    int
-	height   int
-	done     bool
+	command       string // header stripe label, e.g. "/skills"
+	subtitle      string // resource name, e.g. "code-review"
+	sections      []DetailSection
+	scroll        int
+	width         int
+	height        int
+	done          bool
+	parentCommand string // slash name (no "/") that opened this detail; Esc re-opens it
 }
 
 // NewDetailScreen builds the detail overlay.
 func NewDetailScreen(command, subtitle string, sections []DetailSection) *DetailScreen {
 	return &DetailScreen{command: command, subtitle: subtitle, sections: sections}
 }
+
+// WithParent records the slash command (without "/") that opened this
+// detail, so Esc returns to that picker rather than chat. Mirrors
+// claude-code's stack semantics. Returns the screen for chaining.
+func (s *DetailScreen) WithParent(parent string) *DetailScreen {
+	s.parentCommand = parent
+	return s
+}
+
+// ParentCommand returns the slash command name (without "/") the user
+// invoked to open this detail. The tui-level apply step reads this on
+// Done() to re-dispatch the parent picker. Empty when the detail
+// wasn't opened from a picker — Esc then falls back to chat.
+func (s *DetailScreen) ParentCommand() string { return s.parentCommand }
 
 func (s *DetailScreen) Init() tea.Cmd { return nil }
 

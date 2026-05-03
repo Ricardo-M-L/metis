@@ -70,7 +70,7 @@ func (m *Model) skillDetailScreen(name string) *screen.DetailScreen {
 				Lines:   strings.Split(sk.Prompt, "\n"),
 			})
 		}
-		return screen.NewDetailScreen("/skills", name, sections)
+		return screen.NewDetailScreen("/skills", name, sections).WithParent("skills")
 	}
 	return nil
 }
@@ -105,7 +105,7 @@ func (m *Model) toolDetailScreen(name string) *screen.DetailScreen {
 				"This screen is a reference — you can't run the tool from here.",
 			},
 		})
-		return screen.NewDetailScreen("/tools", name, sections)
+		return screen.NewDetailScreen("/tools", name, sections).WithParent("tools")
 	}
 	return nil
 }

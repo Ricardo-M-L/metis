@@ -107,6 +107,17 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		_, cmd := m.handleSubmit()
 		return cmd
 
+	case *screen.DetailScreen:
+		// Esc on a detail screen — if the detail was opened from a
+		// picker, re-dispatch the parent so the user lands back on the
+		// list rather than chat. Otherwise no-op (Esc → chat).
+		// Mirrors claude-code's stack semantics ("back to list").
+		if parent := w.ParentCommand(); parent != "" {
+			m.input.SetValue("/" + parent)
+			_, cmd := m.handleSubmit()
+			return cmd
+		}
+
 	case *screen.PickerScreen:
 		// PickerScreen serves multiple list-style commands; route on
 		// the `command` field the picker was opened with.
