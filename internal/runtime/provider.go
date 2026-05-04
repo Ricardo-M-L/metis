@@ -2,11 +2,30 @@ package runtime
 
 import (
 	"fmt"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
+
+// isAnthropicOrigin reports whether baseURL points at the real
+// Anthropic API (or empty, which falls back to the default Anthropic
+// endpoint). Used to gate the anti_distillation startup warning so
+// users on real Anthropic don't see a false-positive nag.
+func isAnthropicOrigin(baseURL string) bool {
+	if baseURL == "" {
+		return true // empty → NewAnthropic defaults to api.anthropic.com
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "api.anthropic.com" || strings.HasSuffix(host, ".anthropic.com")
+}
 
 // ProviderBuild is the result of constructing an LLM provider client.
 // `Model` is the resolved model id (after applying flag overrides + cfg
@@ -48,6 +67,26 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			cfg.Provider.Anthropic.AnthropicBeta,
 		)
 		prov.ContextWindow = cfg.Provider.Anthropic.ContextWindow
+		prov.AntiDistillation = cfg.Provider.Anthropic.AntiDistillation
+		prov.ClientSideDecoys = cfg.Provider.Anthropic.ClientSideDecoys
+		// If the user enabled anti_distillation but is talking to a
+		// non-Anthropic gateway, the opt-in is a no-op (the gateway's
+		// backend doesn't implement the server-side countermeasure).
+		// Warn loudly so they don't think it's protecting them — and
+		// suggest the client_side_decoys alternative which DOES work
+		// against third-party traffic recorders without polluting
+		// the model's prompt.
+		if prov.AntiDistillation && !isAnthropicOrigin(cfg.Provider.Anthropic.BaseURL) {
+			fmt.Fprintf(os.Stderr,
+				"warning: [provider.anthropic] anti_distillation = true but base_url=%q is not the real Anthropic API. The flag is sent on the wire but the gateway's backend (MiniMax / OpenRouter / etc.) ignores it. No actual anti-distillation occurs. For third-party gateways, set client_side_decoys = true instead — that adds a non-standard top-level field with fake tool defs that pollute traffic recordings WITHOUT affecting model output.\n",
+				cfg.Provider.Anthropic.BaseURL)
+		}
+		// Warm up TCP+TLS to the API origin in parallel with the rest
+		// of init (slash registry build, hooks load, etc.). Saves
+		// 100-300ms on the first message — the user perceives this as
+		// "instant first reply" instead of "spinner sits there before
+		// the first token arrives".
+		Preconnect(cfg.Provider.Anthropic.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
 	case "openai":
 		key, err := cfg.ResolveAPIKey("openai")
@@ -67,6 +106,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			cfg.Provider.OpenAI.Temperature,
 		)
 		prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
+		Preconnect(cfg.Provider.OpenAI.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
 	case "gemini", "google":
 		// Accept "google" as an alias since users sometimes type the
@@ -88,6 +128,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			cfg.Provider.Gemini.Temperature,
 		)
 		prov.ContextWindow = cfg.Provider.Gemini.ContextWindow
+		Preconnect(cfg.Provider.Gemini.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
 	}
 	return nil, fmt.Errorf("provider %q not supported in this build (try 'anthropic', 'openai', or 'gemini')", name)

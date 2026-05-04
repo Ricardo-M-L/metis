@@ -410,3 +410,255 @@ func TestEffectiveInputCap_DefaultsSafely(t *testing.T) {
 func istr(n int) string {
 	return itoa(n)
 }
+
+// errSummarizer fails every Stream call. Lets us drive the circuit
+// breaker without hitting a real provider.
+type errSummarizer struct{ err error }
+
+func (e *errSummarizer) Name() string          { return "err-fake" }
+func (e *errSummarizer) MaxContextTokens() int { return 100000 }
+func (e *errSummarizer) Stream(_ context.Context, _ llm.Request) (llm.StreamReader, error) {
+	return nil, e.err
+}
+func (e *errSummarizer) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
+	return nil, e.err
+}
+
+// TestCompactor_CircuitBreaker_TripsAfter3Failures — the breaker exists
+// to short-circuit the runaway-compaction pattern claude-code reported
+// (1279 sessions stuck in 50+ failed-compact loops, max 3272 attempts).
+// After 3 consecutive failed Compact() calls, ShouldCompact must return
+// false even when the input is well over the threshold.
+func TestCompactor_CircuitBreaker_TripsAfter3Failures(t *testing.T) {
+	p := &errSummarizer{err: errors.New("simulated upstream failure")}
+	c := newCompactorFor(p)
+
+	// Build a conversation big enough that ShouldCompact would normally
+	// trigger every iteration.
+	msgs := []llm.Message{msg(llm.RoleUser, "system seed")}
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs, msg(llm.RoleUser, strings.Repeat("x", 600)))
+		msgs = append(msgs, msg(llm.RoleAssistant, strings.Repeat("y", 600)))
+	}
+	if !c.ShouldCompact(msgs) {
+		t.Fatalf("precondition: convo should trigger compaction before circuit trips")
+	}
+
+	for i := 1; i <= MaxConsecutiveCompactFailures; i++ {
+		_, err := c.Compact(context.Background(), msgs)
+		if err == nil {
+			t.Fatalf("attempt %d: expected error from failing summarizer", i)
+		}
+	}
+	if !c.CircuitTripped() {
+		t.Errorf("after %d failures CircuitTripped()=true expected", MaxConsecutiveCompactFailures)
+	}
+	if c.ShouldCompact(msgs) {
+		t.Errorf("ShouldCompact must return false once breaker is open, even on oversized input")
+	}
+}
+
+// TestCompactor_CircuitBreaker_SuccessResetsCounter — a single successful
+// compaction must clear the failure counter so transient errors don't
+// permanently lock out compaction. Mirrors claude-code's reset-on-success
+// semantics.
+func TestCompactor_CircuitBreaker_SuccessResetsCounter(t *testing.T) {
+	good := &fakeSummarizer{}
+	c := newCompactorFor(good)
+
+	// Pre-arm the counter to one-below-trip so the next failure would
+	// trip it. We mutate the field directly (test-only access via same
+	// package) rather than driving 2 fake failures.
+	c.consecutiveFailures = MaxConsecutiveCompactFailures - 1
+
+	msgs := []llm.Message{msg(llm.RoleUser, "seed")}
+	for i := 0; i < 8; i++ {
+		msgs = append(msgs, msg(llm.RoleUser, strings.Repeat("x", 600)))
+		msgs = append(msgs, msg(llm.RoleAssistant, strings.Repeat("y", 600)))
+	}
+	out, err := c.Compact(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("good summarizer returned error: %v", err)
+	}
+	if len(out) >= len(msgs) {
+		t.Fatalf("compaction did not progress; got %d, want < %d", len(out), len(msgs))
+	}
+	if c.consecutiveFailures != 0 {
+		t.Errorf("success path must zero consecutiveFailures; got %d", c.consecutiveFailures)
+	}
+	if c.CircuitTripped() {
+		t.Errorf("circuit must NOT be tripped after a successful compaction")
+	}
+}
+
+// TestCompactor_CircuitBreaker_ResetCircuitReopens — /clear and Loop.Reset
+// both must re-enable compaction. Without this the user has no recovery
+// path once the breaker trips.
+func TestCompactor_CircuitBreaker_ResetCircuitReopens(t *testing.T) {
+	c := &Compactor{}
+	c.consecutiveFailures = MaxConsecutiveCompactFailures
+	if !c.CircuitTripped() {
+		t.Fatalf("precondition: setup should leave breaker tripped")
+	}
+	c.ResetCircuit()
+	if c.CircuitTripped() {
+		t.Errorf("ResetCircuit() did not clear the breaker state")
+	}
+}
+
+// --- Snip (Task #67) ----------------------------------------------------
+
+// TestSnip_TruncatesOversizedToolResult — the core contract: tool_result
+// blocks longer than SnipMaxToolResultChars get the head + a truthful
+// "[snipped: N chars omitted]" tail. Smaller blocks pass through
+// untouched.
+func TestSnip_TruncatesOversizedToolResult(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	// Build a long tool_result and a short one. ProtectFirst=1,
+	// ProtectLast=3; we need both blocks to land in the snippable middle.
+	long := strings.Repeat("a", 5000)
+	short := "short result"
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "system seed"),
+		toolUseMsg("t1", "Bash"),
+		toolResultMsg("t1", long),
+		toolUseMsg("t2", "Read"),
+		toolResultMsg("t2", short),
+		msg(llm.RoleUser, "tail-1"),
+		msg(llm.RoleAssistant, "tail-2"),
+		msg(llm.RoleUser, "tail-3"),
+	}
+	out := c.Snip(msgs)
+
+	if len(out) != len(msgs) {
+		t.Fatalf("Snip must not change message count; got %d, want %d", len(out), len(msgs))
+	}
+	// The long tool_result should be truncated.
+	gotLong := out[2].Content[0].ToolResult
+	if len(gotLong) >= 5000 {
+		t.Errorf("long tool_result was not truncated; len=%d", len(gotLong))
+	}
+	if !strings.HasPrefix(gotLong, strings.Repeat("a", c.SnipMaxToolResultChars)) {
+		t.Errorf("truncated result must keep the head; got prefix %q", gotLong[:50])
+	}
+	if !strings.Contains(gotLong, "[snipped:") {
+		t.Errorf("truncated result must carry the snip marker; got %q", gotLong[len(gotLong)-100:])
+	}
+	// The short tool_result should be untouched.
+	if out[4].Content[0].ToolResult != short {
+		t.Errorf("short result was modified: %q", out[4].Content[0].ToolResult)
+	}
+}
+
+// TestSnip_DoesNotTouchProtectedTail — the recent ProtectLast messages
+// must stay byte-identical so the agent's most-recent reasoning isn't
+// disrupted mid-thought.
+func TestSnip_DoesNotTouchProtectedTail(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	long := strings.Repeat("z", 5000)
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		toolUseMsg("t1", "Bash"),
+		toolResultMsg("t1", long), // in middle, snippable
+		// ProtectLast = 3 → last 3 are kept intact:
+		toolUseMsg("t2", "Bash"),
+		toolResultMsg("t2", long), // protected
+		msg(llm.RoleAssistant, "final answer"),
+	}
+	out := c.Snip(msgs)
+
+	// out[2] is in the snippable region — should be truncated.
+	if len(out[2].Content[0].ToolResult) >= 5000 {
+		t.Errorf("middle tool_result should be snipped; len=%d", len(out[2].Content[0].ToolResult))
+	}
+	// out[4] is in the protected tail — must be byte-equal to original.
+	if out[4].Content[0].ToolResult != long {
+		t.Errorf("protected-tail tool_result was mutated; got len=%d, want %d", len(out[4].Content[0].ToolResult), len(long))
+	}
+}
+
+// TestSnip_NoOpWhenAllShort — when nothing exceeds the cap, Snip
+// returns equivalent content (no spurious mutations).
+func TestSnip_NoOpWhenAllShort(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		toolUseMsg("t1", "Read"),
+		toolResultMsg("t1", "tiny"),
+		msg(llm.RoleUser, "tail"),
+		msg(llm.RoleAssistant, "ok"),
+		msg(llm.RoleUser, "ok"),
+	}
+	out := c.Snip(msgs)
+	if out[2].Content[0].ToolResult != "tiny" {
+		t.Errorf("Snip should not modify under-cap results; got %q", out[2].Content[0].ToolResult)
+	}
+}
+
+// TestSnip_DoesNotShareSlicesWithCaller — Snip mutates a local copy so
+// callers that still hold the input slice don't see the truncation.
+// Without this, concurrent History() snapshots would observe a
+// half-snipped state.
+func TestSnip_DoesNotShareSlicesWithCaller(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	long := strings.Repeat("w", 5000)
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		toolUseMsg("t1", "Bash"),
+		toolResultMsg("t1", long),
+		msg(llm.RoleUser, "tail-1"),
+		msg(llm.RoleAssistant, "tail-2"),
+		msg(llm.RoleUser, "tail-3"),
+	}
+	originalLen := len(msgs[2].Content[0].ToolResult)
+	_ = c.Snip(msgs)
+	if len(msgs[2].Content[0].ToolResult) != originalLen {
+		t.Errorf("input slice was mutated in place; original len %d → now %d", originalLen, len(msgs[2].Content[0].ToolResult))
+	}
+}
+
+// TestShouldSnip_ThresholdGate — Snip fires earlier than full compact.
+// With Threshold=0.85 and SnipThreshold=0.70 (defaults), a 75%-full
+// context should ShouldSnip but not ShouldCompact.
+func TestShouldSnip_ThresholdGate(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	// effectiveInputCap = 1000 - 0 = 1000 (MaxOutputTokens=0 in helper).
+	// Need ~75% = ~750 tokens. estimateTokens charges 4/msg + 8/block + chars/4.
+	// 750 tokens ≈ 3000 chars in a single text message.
+	msgs := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 3000))}
+	if !c.ShouldSnip(msgs) {
+		t.Errorf("ShouldSnip should fire at ~75%%; estimateTokens=%d, cap=%d, snipThresh=%v",
+			estimateTokens(msgs), c.effectiveInputCap(), c.SnipThreshold)
+	}
+	if c.ShouldCompact(msgs) {
+		t.Errorf("ShouldCompact should NOT fire at ~75%% (Threshold=0.85)")
+	}
+}
+
+// TestShouldSnip_DisabledWhenThresholdZero — caller-supplied
+// SnipThreshold=0 means "snip disabled"; never returns true.
+func TestShouldSnip_DisabledWhenThresholdZero(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	c.SnipThreshold = 0
+	huge := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 100000))}
+	if c.ShouldSnip(huge) {
+		t.Errorf("ShouldSnip must respect zero-threshold (disabled) sentinel")
+	}
+}
+
+// TestCompactor_CircuitBreaker_NoOpDoesNotCount — Compact() returning
+// "messages, nil" because the convo is too small (or already empty) is
+// not a failure. Without this guard, an idle session would burn through
+// the breaker budget before any real attempt.
+func TestCompactor_CircuitBreaker_NoOpDoesNotCount(t *testing.T) {
+	p := &fakeSummarizer{}
+	c := newCompactorFor(p)
+	tiny := []llm.Message{msg(llm.RoleUser, "hi")}
+
+	for i := 0; i < 5; i++ {
+		_, _ = c.Compact(context.Background(), tiny)
+	}
+	if c.consecutiveFailures != 0 {
+		t.Errorf("no-op short-circuit (too-small convo) must not count toward breaker; got %d", c.consecutiveFailures)
+	}
+}

@@ -77,11 +77,22 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// previous reply got swallowed." Show a hint, leave the input
 	// alone so the user doesn't lose their prompt to a stray Enter.
 	if m.turnActive {
+		// Steering (Task #78): mid-turn user input is no longer dropped
+		// — it gets queued on the agent loop and folded into the next
+		// iteration's user message after the in-flight tool returns.
+		// claude-code parity. The textarea is reset so the user sees
+		// the steer was accepted.
+		raw := strings.TrimSpace(m.input.Value())
+		if raw == "" {
+			return m, nil
+		}
+		m.loop.SteerInject(raw)
 		m.messages = append(m.messages, Message{
 			Role:      "info",
-			Content:   "(turn still running — wait for it to finish, or Ctrl-C to interrupt)",
+			Content:   "(steered: " + raw + ")",
 			Timestamp: time.Now(),
 		})
+		m.input.Reset()
 		return m, nil
 	}
 	// claude-code parity: when the palette is open with at least one
@@ -438,10 +449,21 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// through to the normal user-message path so the agent
 			// loop runs on it. The flag below skips the early return.
 			text = slash.BatchPrompt(args)
+		case slash.SignalCustomPrompt:
+			// User-authored slash command (~/.metis/commands/*.md):
+			// the handler already substituted $ARGUMENTS / $1.. and
+			// returned the resolved prompt body in `display`. Treat
+			// it like /batch — re-enter the agent path with the
+			// rewritten text, no separate echo of the template.
+			if display != "" {
+				text = display
+				display = ""
+			}
 		}
-		// All slash commands EXCEPT /batch terminate the turn here. /batch
-		// rewrites `text` above and re-enters the agent path below.
-		if sig != slash.SignalBatch {
+		// Slash commands that produced a regular reply terminate here.
+		// /batch and /custom-prompt rewrite `text` above and re-enter
+		// the agent path below; everything else returns.
+		if sig != slash.SignalBatch && sig != slash.SignalCustomPrompt {
 			return m, nil
 		}
 	}
@@ -466,6 +488,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.firstStreamAt = time.Time{}
 	m.spinnerVerb = pickSpinnerVerb()
 	m.spinnerSub = ""
+	// Initial phase: prompt is being sent, no bytes received yet → ↑.
+	// EventThinkingDelta / EventTextDelta / EventToolStart will flip
+	// this once the first byte arrives.
+	m.spinnerPhase = "requesting"
 	m.showBanner = false // Hide banner after first message
 
 	go m.runTurnAsync()

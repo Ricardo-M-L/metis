@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +82,27 @@ type Loop struct {
 	// to 0 to disable (e.g. tests, cron-fire isolated mode where
 	// per-turn distillation noise dominates the actual work).
 	DistillEvery int
+
+	// LazyToolThreshold gates the lazy-MCP-schema feature: when the
+	// total tool count exceeds this number, mcp__* tools' schemas are
+	// stripped from the upfront tools list and a synthetic ToolSearch
+	// meta-tool is exposed. The model fetches schemas on demand. 0 →
+	// LazyToolThresholdDefault (20). Negative → disabled.
+	LazyToolThreshold int
+
+	// steerBuf accumulates mid-turn user input (the "steering" feature
+	// from claude-code: user can type while the agent is mid-loop, and
+	// the new instruction is prepended to the next iteration's user
+	// message instead of waiting for the turn to fully end). Drained
+	// at iteration boundary in iterate(). Lock via mu to coordinate
+	// with the chat surface goroutine that calls SteerInject.
+	steerBuf []string
+
+	// compactCircuitNoticeSent gates the "auto-compaction disabled"
+	// info event in compaction_check.go to one emission per tripped
+	// state. Reset to false whenever a Compact() call succeeds, so a
+	// later failure run can re-emit the notice.
+	compactCircuitNoticeSent bool
 }
 
 func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegistry, system string, maxIter int) *Loop {
@@ -111,6 +133,43 @@ func (l *Loop) AppendUser(text string) {
 	})
 }
 
+// SteerInject queues user text to be folded into the next iteration's
+// user message. Called from the TUI when the user types mid-turn (the
+// chat input stays unlocked while the agent is running, claude-code
+// parity). Multiple calls accumulate; all queued steers are joined
+// with "\n" at the iteration boundary.
+//
+// Empty / whitespace input is dropped. Safe to call from any goroutine.
+func (l *Loop) SteerInject(text string) {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.steerBuf = append(l.steerBuf, t)
+}
+
+// drainSteer returns the joined steer buffer and clears it. Called by
+// the loop at iteration boundary (after the previous tool result, before
+// the next provider request).
+func (l *Loop) drainSteer() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.steerBuf) == 0 {
+		return ""
+	}
+	joined := strings.Join(l.steerBuf, "\n")
+	l.steerBuf = nil
+	return joined
+}
+
+// SteerInjectDrainForTest is a test-only export of drainSteer so the
+// TUI test (different package) can verify the steer round-trip without
+// us widening the package API for production code. Behaviorally
+// identical to drainSteer.
+func (l *Loop) SteerInjectDrainForTest() string { return l.drainSteer() }
+
 // History returns a snapshot.
 func (l *Loop) History() []llm.Message {
 	l.mu.Lock()
@@ -125,6 +184,10 @@ func (l *Loop) Reset() {
 	l.Messages = nil
 	l.turnIdx = 0
 	l.iterIdx = 0
+	l.compactCircuitNoticeSent = false
+	if l.Compactor != nil {
+		l.Compactor.ResetCircuit()
+	}
 }
 
 // Restore replaces the conversation history with the supplied messages.
@@ -295,6 +358,20 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			stopReason = "error"
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
+		}
+		// Steering (Task #78): if the user typed mid-turn while tools
+		// were running, fold their text into the user message that
+		// carries the tool_results. The agent sees both pieces in one
+		// turn and can adjust course on the next iteration.
+		// claude-code surfaces this as "steering"; the user typing
+		// "actually use Edit not Write" mid-loop hits the next API
+		// call without waiting for a clean turn boundary.
+		if steer := l.drainSteer(); steer != "" {
+			results = append(results, llm.ContentBlock{
+				Type: "text",
+				Text: "[user steer mid-turn] " + steer,
+			})
+			emit(ctx, out, Event{Kind: EventInfo, Info: "steered: " + steer})
 		}
 		l.mu.Lock()
 		l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})

@@ -37,6 +37,32 @@ type Rule struct {
 	Source string // for diagnostics: "cli", "project", "user", ...
 }
 
+// YoloVerdict is the 3-state output of a YOLO classifier (claude-code's
+// utils/permissions/yoloClassifier.ts). The classifier inspects the
+// proposed tool call and returns:
+//   - YoloAllow: looks safe in context — proceed silently
+//   - YoloSoftDeny: ambiguous — fall back to ASK (user prompt)
+//   - YoloHardDeny: clearly destructive or out-of-scope — block hard
+//
+// Only consulted when the gate's mode is ModeBypass; users who opted
+// into "approve everything" still want a sanity-check escape hatch.
+type YoloVerdict int
+
+const (
+	YoloAllow YoloVerdict = iota
+	YoloSoftDeny
+	YoloHardDeny
+)
+
+// YoloClassifier inspects a tool invocation and returns a verdict.
+// The runtime injects an LLM-backed implementation; tests can wire a
+// pure-Go stub. Returning an error short-circuits to YoloAllow (fail
+// open — classifier outage shouldn't block a user who already opted
+// into bypass mode).
+type YoloClassifier interface {
+	Classify(ctx context.Context, tool, stringInput string) (YoloVerdict, string, error)
+}
+
 // Gate combines a Mode and a stack of Rule sources.
 type Gate struct {
 	mu    sync.RWMutex
@@ -44,10 +70,22 @@ type Gate struct {
 	rules []Rule
 	// remembered "ask once, apply forever this session"
 	memoAllow map[string]bool
+
+	// classifier optionally inspects bypass-mode calls. nil = no
+	// extra classification; bypass mode short-circuits to allow.
+	classifier YoloClassifier
 }
 
 func New(mode Mode) *Gate {
 	return &Gate{mode: mode, memoAllow: make(map[string]bool)}
+}
+
+// SetClassifier installs (or removes, on nil) a YoloClassifier.
+// Thread-safe; callable mid-session via /yolo on or similar.
+func (g *Gate) SetClassifier(c YoloClassifier) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.classifier = c
 }
 
 func (g *Gate) Mode() Mode {
@@ -134,6 +172,21 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 
 	switch g.mode {
 	case ModeBypass:
+		// YOLO classifier (claude-code parity, Task #74): give the
+		// classifier a chance to soft- or hard-deny even though the
+		// user opted into bypass. Fail-open on classifier error so
+		// an LLM outage doesn't lock out the user.
+		if g.classifier != nil {
+			v, src, err := g.classifier.Classify(context.Background(), tool, stringInput)
+			if err == nil {
+				switch v {
+				case YoloHardDeny:
+					return DecisionDeny, "yolo:hard_deny:" + src
+				case YoloSoftDeny:
+					return DecisionAsk, "yolo:soft_deny:" + src
+				}
+			}
+		}
 		return DecisionAllow, "mode:bypass"
 	case ModeAuto:
 		// Read-only auto-allow; everything else falls through to ask.

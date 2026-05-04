@@ -169,6 +169,53 @@ type ProviderAnthropic struct {
 	TimeoutSecs   int     `toml:"timeout_seconds"`
 	AnthropicBeta string  `toml:"anthropic_beta"`
 	Temperature   float64 `toml:"temperature"`
+	// AntiDistillation sends the top-level opt-in field
+	// `anti_distillation: ["fake_tools"]` on every request — exact
+	// wire-format parity with claude-code's services/api/claude.ts:312.
+	//
+	// IMPORTANT — this flag is a SERVER-SIDE opt-in. The Anthropic
+	// backend reads it and applies its own response-stream
+	// countermeasures. The metis client does NOT inject anything
+	// into the tools[] array (that would just give the model
+	// fake tools to misuse, which is the opposite of what we want).
+	//
+	// Practical implication: only meaningful when base_url points at
+	// the REAL Anthropic API (api.anthropic.com or an Anthropic-
+	// operated alias). Third-party gateways (yunwu.ai, OpenRouter,
+	// MiniMax, Together, Groq, ...) silently ignore the unknown
+	// field — enabling this against them is a no-op. The runtime
+	// emits a stderr warning at startup if the flag is set and
+	// base_url isn't a recognized Anthropic origin, so the user
+	// isn't quietly fooled into thinking it's protecting them.
+	//
+	// Default off. Preset for users who DO talk to real Anthropic
+	// and want the wire-format opt-in available without code changes.
+	AntiDistillation bool `toml:"anti_distillation"`
+
+	// ClientSideDecoys is a separate, third-party-gateway-friendly
+	// anti-distillation mechanism. When true, every request body
+	// gets a non-standard top-level field (`_decoy_tools_v2_archive`)
+	// containing several plausible-looking fake tool definitions.
+	//
+	// Why this differs from AntiDistillation:
+	//   - AntiDistillation is the CC opt-in that asks the Anthropic
+	//     SERVER to inject countermeasures. Useless against MiniMax /
+	//     yunwu / OpenRouter etc. because their backends don't
+	//     implement the server-side mechanism.
+	//   - ClientSideDecoys is pure-client. Adversaries who record
+	//     HTTP traffic to train a competing model see the decoys in
+	//     the captured bytes; the model itself NEVER sees them
+	//     because the field is at the wire level, not in tools[],
+	//     system, or messages.
+	//
+	// Key correctness property: the decoys cannot affect model output
+	// — that's the "non-standard field" trick. Any well-behaved API
+	// (and every Anthropic-compat gateway tested so far) silently
+	// ignores unknown top-level fields. A schema-strict gateway
+	// could reject the request; in that rare case, turn this off.
+	//
+	// Default off. Independent of AntiDistillation; both can be on.
+	ClientSideDecoys bool `toml:"client_side_decoys"`
 }
 
 type ProviderOpenAI struct {
@@ -209,6 +256,25 @@ type UI struct {
 	ShowTokens   bool          `toml:"show_tokens"`
 	ShowToolJSON bool          `toml:"show_tool_json"`
 	Performance  UIPerformance `toml:"performance"`
+	// StreamlinedOutput enables the CC-style "distillation-resistant"
+	// output mode for `metis run` (non-interactive). Mirrors
+	// claude-code's utils/streamlinedTransform.ts behavior:
+	//
+	//   - thinking content omitted entirely
+	//   - tool calls collapsed into cumulative summaries between text
+	//     messages ("searched 3 patterns, read 2 files, ran 1 command")
+	//   - per-tool detailed input/output suppressed
+	//
+	// The point: protect against someone batch-running metis to
+	// harvest rich agent traces (full reasoning + tool args/outputs)
+	// for training a competing model. Keeps the user's actual answer
+	// (text content) intact so the output is still usable.
+	//
+	// Default off — most users want the full trace for debugging /
+	// observability. Turn on for scripted / CI / batch jobs whose
+	// output stream might be observed. Per-invocation override via
+	// `--streamlined` CLI flag.
+	StreamlinedOutput bool `toml:"streamlined_output"`
 }
 
 // UIPerformance gathers the tunables that decide how snappy / how

@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -23,19 +25,73 @@ func errIsEOF(err error) bool { return errors.Is(err, io.EOF) }
 
 // Config holds compaction thresholds.
 type Config struct {
-	Threshold        float64 // fraction of context window (e.g. 0.85)
+	Threshold        float64 // fraction of context window for full Compact (e.g. 0.85)
 	ProtectFirst     int     // always keep first N messages
 	ProtectLast      int     // always keep last N messages
 	MaxSummaryTokens int     // max tokens in a summary turn
+
+	// SnipThreshold is the lighter-weight threshold for tool-result
+	// truncation (Snip). Triggered BEFORE Compact so a context that's
+	// merely heavy with tool dumps gets cleaned up cheaply (no LLM
+	// call) instead of going straight to summarization. Mirrors
+	// claude-code's snip → microcompact → autocompact tiering. Set to
+	// 0 to disable snip entirely.
+	SnipThreshold float64
+
+	// SnipMaxToolResultChars caps each tool_result block's char length
+	// during a Snip pass. Anything longer is truncated with a
+	// "[snipped: NNN chars]" marker. The model still sees the
+	// tool_use_id linkage and the result's first chunk, which is
+	// usually enough to remember "I called grep on X and it found
+	// stuff". Default 800 chars (~200 tokens) covers the common case
+	// where the agent already extracted what it needed.
+	SnipMaxToolResultChars int
+
+	// MicrocompactDir is where Microcompact writes off-loaded tool
+	// output. Empty disables microcompact entirely. Default
+	// "~/.metis/cache/<sessionID>" via runtime config wiring.
+	MicrocompactDir string
+
+	// MicrocompactMinChars is the per-block size threshold above
+	// which Microcompact offloads to disk (vs Snip's smaller cap).
+	// Microcompact preserves recoverability — the model can ask
+	// the runtime to read the cached file via Read tool — whereas
+	// Snip is permanently lossy. So we set a higher threshold
+	// (default 4000) to reserve disk-write overhead for genuinely
+	// large outputs that future iterations might need verbatim.
+	MicrocompactMinChars int
+
+	// CollapseThreshold is the threshold for context-collapse: a
+	// mid-conversation summary that folds messages [ProtectFirst+1 ..
+	// ProtectFirst+CollapseFoldWindow] into a single boundary turn.
+	// Differs from full Compact in that it preserves the LATEST
+	// messages too (Compact keeps both ends; Collapse only folds the
+	// "old middle"). Set to 0 to disable collapse.
+	CollapseThreshold float64
+
+	// CollapseFoldWindow is the number of messages from the start
+	// (after ProtectFirst) that get folded into a summary when
+	// Collapse triggers. Default 10 — folds early-conversation
+	// context into a single summary, leaving recent + initial
+	// messages intact.
+	CollapseFoldWindow int
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultCompactionConfig() Config {
 	return Config{
-		Threshold:        0.85,
-		ProtectFirst:     1, // system message
-		ProtectLast:      5, // recent turns
-		MaxSummaryTokens: 512,
+		Threshold:              0.85,
+		ProtectFirst:           1, // system message
+		ProtectLast:            5, // recent turns
+		MaxSummaryTokens:       512,
+		SnipThreshold:          0.70, // ~15% earlier than full compact
+		SnipMaxToolResultChars: 800,
+		MicrocompactMinChars:   4000, // disk-cache only genuinely big results
+		CollapseThreshold:      0.78, // between snip(0.70) and compact(0.85)
+		CollapseFoldWindow:     10,
+		// MicrocompactDir is intentionally empty here — runtime sets it
+		// per-session in setupRuntime so the cache lands under
+		// ~/.metis/cache/<sessionID>/.
 	}
 }
 
@@ -61,7 +117,24 @@ type Compactor struct {
 	MaxContextTokens int
 	MaxOutputTokens  int
 	Provider         llm.Provider
+
+	// consecutiveFailures counts back-to-back Compact() failures (either
+	// summarizer error or no-progress: cut adjustment swallowed the
+	// middle). Reset to zero on a successful compaction. Used by the
+	// circuit breaker — see MaxConsecutiveCompactFailures.
+	//
+	// Why we need this: claude-code observed 1279 sessions stuck in
+	// compact-fail loops (max 3272 attempts in one session) wasting 250K
+	// API calls/day globally. Without a circuit, a model that can't
+	// produce a usable summary (rate-limited, OOM, gateway proxy
+	// stripping responses) keeps re-trying every iteration.
+	consecutiveFailures int
 }
+
+// MaxConsecutiveCompactFailures is the count after which the compactor
+// refuses to attempt further compactions until the loop is reset. Matches
+// claude-code's MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3.
+const MaxConsecutiveCompactFailures = 3
 
 func NewCompactor(cfg Config, model string, maxCtx int, p llm.Provider) *Compactor {
 	if cfg.Threshold == 0 {
@@ -81,10 +154,269 @@ func (c *Compactor) effectiveInputCap() int {
 	return cap
 }
 
-// ShouldCompact returns true when compaction should be triggered.
+// ShouldCompact returns true when full summarization compaction should
+// be triggered. Returns false when the circuit breaker has tripped (too
+// many recent failures); callers must call ResetCircuit() — typically
+// from /clear or /compact-reset — to re-enable.
 func (c *Compactor) ShouldCompact(messages []llm.Message) bool {
+	if c.consecutiveFailures >= MaxConsecutiveCompactFailures {
+		return false
+	}
 	rough := estimateTokens(messages)
 	return float64(rough) >= float64(c.effectiveInputCap())*c.Threshold
+}
+
+// ShouldSnip returns true when the cheap tool-result truncation pass
+// should run. Triggers earlier than ShouldCompact so a tool-heavy
+// session gets the dirt-cheap (no-LLM-call) cleanup BEFORE the
+// expensive summarizer fires. Returns false if SnipThreshold is 0
+// (snip disabled) or if the cheaper threshold isn't crossed yet.
+func (c *Compactor) ShouldSnip(messages []llm.Message) bool {
+	if c.SnipThreshold <= 0 {
+		return false
+	}
+	rough := estimateTokens(messages)
+	return float64(rough) >= float64(c.effectiveInputCap())*c.SnipThreshold
+}
+
+// ShouldCollapse reports whether the mid-conversation summary should
+// run. Triggers between snip and full compact: lighter than full
+// (only summarizes the EARLY middle, not most of the conversation),
+// heavier than snip (involves an LLM call).
+func (c *Compactor) ShouldCollapse(messages []llm.Message) bool {
+	if c.consecutiveFailures >= MaxConsecutiveCompactFailures {
+		return false
+	}
+	if c.CollapseThreshold <= 0 || c.CollapseFoldWindow <= 0 {
+		return false
+	}
+	// Need ProtectFirst kept + at least CollapseFoldWindow to fold +
+	// at least 1 message kept after the fold (otherwise the result is
+	// just keepFirst + boundary, which is what full Compact does).
+	if len(messages) < c.ProtectFirst+c.CollapseFoldWindow+1 {
+		return false
+	}
+	rough := estimateTokens(messages)
+	return float64(rough) >= float64(c.effectiveInputCap())*c.CollapseThreshold
+}
+
+// CollapseMiddle replaces messages [ProtectFirst : ProtectFirst+
+// CollapseFoldWindow] with a single summary boundary message, then
+// keeps everything from ProtectFirst+CollapseFoldWindow onward intact.
+//
+// Differs from Compact: Compact summarizes most of the conversation
+// (everything except ProtectFirst + ProtectLast). Collapse only folds
+// the EARLY middle — useful when the user has been on a long single
+// thread and the early back-and-forth is no longer load-bearing but
+// the full RECENT history still matters for in-flight reasoning.
+//
+// Falls back to no-op if tool-pair safety can't be maintained at the
+// fold boundary (the kept tail must not start with an orphaned
+// tool_result whose tool_use lives in the folded region).
+func (c *Compactor) CollapseMiddle(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
+	if c.CircuitTripped() {
+		return messages, nil
+	}
+	if c.CollapseFoldWindow <= 0 {
+		return messages, nil
+	}
+	if len(messages) < c.ProtectFirst+c.CollapseFoldWindow+1 {
+		return messages, nil
+	}
+	end := c.ProtectFirst + c.CollapseFoldWindow
+	end = adjustCutForToolPairs(messages, end)
+	if end <= c.ProtectFirst {
+		c.recordCompactResult(false, nil)
+		return messages, nil
+	}
+	keepFirst := messages[:c.ProtectFirst]
+	middle := messages[c.ProtectFirst:end]
+	keepLater := messages[end:]
+
+	summary, err := c.summarize(ctx, middle)
+	if err != nil {
+		c.recordCompactResult(false, err)
+		return nil, err
+	}
+	boundary := llm.Message{
+		Role: llm.RoleAssistant,
+		Content: []llm.ContentBlock{{
+			Type: "text",
+			Text: "[Early conversation collapsed: " + summary + "]",
+		}},
+	}
+	out := make([]llm.Message, 0, c.ProtectFirst+2+len(keepLater))
+	out = append(out, keepFirst...)
+	out = append(out, boundary)
+	if len(keepLater) > 0 && keepLater[0].Role == llm.RoleAssistant {
+		out = append(out, llm.Message{
+			Role: llm.RoleUser,
+			Content: []llm.ContentBlock{{
+				Type: "text",
+				Text: "(continuing from the collapsed early context above)",
+			}},
+		})
+	}
+	out = append(out, keepLater...)
+	c.recordCompactResult(true, nil)
+	return out, nil
+}
+
+// ShouldMicrocompact reports whether the disk-cache pass should run.
+// Triggers in the same window as Snip but only fires when the disk
+// cache is configured (MicrocompactDir non-empty). Caller invokes
+// AFTER Snip — Snip handles the cheap cases; Microcompact catches
+// the still-too-large blocks that snipping shouldn't touch (because
+// the model might want them recovered later).
+func (c *Compactor) ShouldMicrocompact(messages []llm.Message) bool {
+	if c.MicrocompactDir == "" || c.MicrocompactMinChars <= 0 {
+		return false
+	}
+	if c.SnipThreshold <= 0 {
+		return false
+	}
+	rough := estimateTokens(messages)
+	return float64(rough) >= float64(c.effectiveInputCap())*c.SnipThreshold
+}
+
+// Microcompact off-loads oversized tool_result blocks (>= MicrocompactMinChars)
+// to disk under MicrocompactDir/<tool_use_id>.txt. The inline content
+// is replaced with a stub:
+//
+//	[output cached at PATH — N bytes; use Read tool with this exact path
+//	 to recover full content]
+//
+// The model can re-fetch any cached output by calling Read on the
+// path, which keeps Microcompact lossless from the model's POV (vs
+// Snip which is permanently lossy). The protected tail is left intact.
+func (c *Compactor) Microcompact(messages []llm.Message) []llm.Message {
+	if c.MicrocompactDir == "" || c.MicrocompactMinChars <= 0 {
+		return messages
+	}
+	cut := len(messages) - c.ProtectLast
+	if cut <= c.ProtectFirst {
+		return messages
+	}
+	if err := os.MkdirAll(c.MicrocompactDir, 0o700); err != nil {
+		return messages // can't write cache → skip silently
+	}
+	out := make([]llm.Message, len(messages))
+	copy(out, messages)
+	for i := c.ProtectFirst; i < cut; i++ {
+		newContent := make([]llm.ContentBlock, len(out[i].Content))
+		copy(newContent, out[i].Content)
+		mutated := false
+		for bi := range newContent {
+			b := &newContent[bi]
+			if b.Type != "tool_result" {
+				continue
+			}
+			if len(b.ToolResult) < c.MicrocompactMinChars {
+				continue
+			}
+			id := b.ToolUseID
+			if id == "" {
+				id = fmt.Sprintf("anon_%d_%d", i, bi) // shouldn't happen but be defensive
+			}
+			path := filepath.Join(c.MicrocompactDir, id+".txt")
+			if err := os.WriteFile(path, []byte(b.ToolResult), 0o600); err != nil {
+				continue
+			}
+			b.ToolResult = fmt.Sprintf(
+				"[output cached at %s — %d bytes; use Read tool with this exact path to recover full content]",
+				path, len(b.ToolResult),
+			)
+			mutated = true
+		}
+		if mutated {
+			out[i].Content = newContent
+		}
+	}
+	return out
+}
+
+// Snip truncates oversized tool_result blocks in messages older than
+// the protected tail. Cheap, lossy, and reversible-from-disk: the
+// session.jsonl on disk still has the full output, only the in-memory
+// transcript sent to the LLM is shrunk. Mirrors claude-code's "snip"
+// tier from services/compact/.
+//
+// Why we keep the FIRST 200 chars and the marker (rather than dropping
+// content entirely): the model often needs to know WHICH file/grep
+// matched to plan the next step, but rarely needs to re-read the full
+// dump. 200 chars is enough for the usual "found 14 matches in foo.go,
+// bar.go, ..." preamble — and the [snipped: N chars] marker tells the
+// model the truth so it doesn't hallucinate "all results visible".
+//
+// The protected tail (ProtectLast messages) is left intact: the agent
+// often needs to re-read its most recent tool result to decide what to
+// do next. Snip only touches older tool_results that have already
+// served their purpose.
+func (c *Compactor) Snip(messages []llm.Message) []llm.Message {
+	if c.SnipMaxToolResultChars <= 0 {
+		return messages
+	}
+	cut := len(messages) - c.ProtectLast
+	if cut <= c.ProtectFirst {
+		return messages // tail covers everything; nothing safe to snip
+	}
+	out := make([]llm.Message, len(messages))
+	copy(out, messages)
+
+	// Walk only the snippable region. Mutate via a per-message Content
+	// rebuild so the protected slices in the original `messages` aren't
+	// shared (callers may still hold references).
+	for i := c.ProtectFirst; i < cut; i++ {
+		newContent := make([]llm.ContentBlock, len(out[i].Content))
+		copy(newContent, out[i].Content)
+		mutated := false
+		for bi := range newContent {
+			b := &newContent[bi]
+			if b.Type != "tool_result" {
+				continue
+			}
+			if len(b.ToolResult) <= c.SnipMaxToolResultChars {
+				continue
+			}
+			// Keep the first chunk (typically a "Found N matches" or
+			// command-output preamble) plus a truthful marker so the
+			// model knows content was dropped.
+			head := b.ToolResult[:c.SnipMaxToolResultChars]
+			omitted := len(b.ToolResult) - c.SnipMaxToolResultChars
+			b.ToolResult = head + fmt.Sprintf("\n[snipped: %d chars omitted]", omitted)
+			mutated = true
+		}
+		if mutated {
+			out[i].Content = newContent
+		}
+	}
+	return out
+}
+
+// CircuitTripped reports whether the breaker has opened. Callers (the
+// Loop's compaction-check + the TUI status bar) use this to surface a
+// "compaction disabled — N failures" notice instead of silently letting
+// the context grow.
+func (c *Compactor) CircuitTripped() bool {
+	return c.consecutiveFailures >= MaxConsecutiveCompactFailures
+}
+
+// ResetCircuit zeroes the failure counter so the next ShouldCompact +
+// Compact attempt is allowed. Wire this up to /clear and to any
+// explicit "retry compaction" command.
+func (c *Compactor) ResetCircuit() {
+	c.consecutiveFailures = 0
+}
+
+// recordCompactResult updates the failure counter. Called from Compact()
+// just before returning so both error and no-progress outcomes are
+// counted uniformly.
+func (c *Compactor) recordCompactResult(progressed bool, err error) {
+	if err == nil && progressed {
+		c.consecutiveFailures = 0
+		return
+	}
+	c.consecutiveFailures++
 }
 
 // Compact summarizes old messages into boundary turns.
@@ -95,6 +427,13 @@ func (c *Compactor) ShouldCompact(messages []llm.Message) bool {
 // (and vice versa). The cut point is adjusted so kept messages never start
 // with an orphaned tool_result whose tool_use lives in the summarized middle.
 func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
+	// Circuit-breaker short-circuit: if the breaker is open, refuse to
+	// even try. Caller should have already checked ShouldCompact, but
+	// tryRecoverOverflow bypasses ShouldCompact, so we must guard here
+	// too. The "no-op return" path doesn't count as a failure.
+	if c.CircuitTripped() {
+		return messages, nil
+	}
 	if len(messages) <= c.ProtectFirst+c.ProtectLast+2 {
 		return messages, nil // nothing to compact
 	}
@@ -103,6 +442,9 @@ func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.
 	cut = adjustCutForToolPairs(messages, cut)
 	if cut <= c.ProtectFirst {
 		// Tool-pair adjustment swallowed the middle; skip compaction.
+		// Counts as a failure for the circuit because the conversation
+		// shape is preventing progress — repeated calls won't help.
+		c.recordCompactResult(false, nil)
 		return messages, nil
 	}
 
@@ -112,6 +454,7 @@ func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.
 
 	summary, err := c.summarize(ctx, middle)
 	if err != nil {
+		c.recordCompactResult(false, err)
 		return nil, err
 	}
 
@@ -151,6 +494,7 @@ func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.
 		})
 	}
 	out = append(out, keepLast...)
+	c.recordCompactResult(true, nil)
 	return out, nil
 }
 

@@ -213,8 +213,25 @@ func splitOnAny(s string, seps []string) []string {
 }
 func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
 	cmd, _ := in["command"].(string)
+	// CC-style adversarial-input checks (Task #73): IFS injection,
+	// /proc/environ exfil, zero-width unicode spoofing, etc. These
+	// run BEFORE the user-permission gate because no permission level
+	// (even bypass) should let an obviously-adversarial command run —
+	// the model has been jailbroken or got prompt-injected upstream.
+	if r := CheckCommand(cmd); !r.Allow {
+		return tools.PermissionDeny, "bash-security rule #" + itoa(r.RuleID) + ": " + r.Reason
+	}
 	d, src := b.gate.Check(context.Background(), "Bash", cmd)
 	return mapDecision(d), src
+}
+
+// itoa is a tiny no-import-strconv helper for the bash-security rule
+// IDs (always 1..23, single or double digit).
+func itoa(n int) string {
+	if n < 10 {
+		return string(rune('0' + n))
+	}
+	return string(rune('0'+n/10)) + string(rune('0'+n%10))
 }
 
 func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {

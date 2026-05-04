@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 // SystemPromptFileName is the filename Metis looks for under ~/.metis/
@@ -38,12 +39,21 @@ const SystemPromptFileName = "system.md"
 // The env block uses claude-code's `<env>...</env>` tag shape so models
 // trained on that surface pattern-match the same way.
 func AssembleSystemPrompt(base string) string {
-	out := base + "\n\n" + buildEnvBlock()
-	// Project context — a CLAUDE.md / AGENTS.md / METIS.md at cwd is
-	// the cross-tool convention (Claude Code, Cursor, Aider all read
-	// it). We honor it so `/init` actually has the effect users expect.
-	// Loaded BEFORE the user's ~/.metis/system.md addendum so the
-	// addendum (per-user preferences) wins on conflict.
+	// Layout (top → bottom):
+	//
+	//   base
+	//   <<<__METIS_CACHE_BOUNDARY__>>>     ← split point for prompt cache
+	//   <env>...</env>                     ← cwd, hostname, today's date
+	//   <project_context>...</               ← CLAUDE.md / AGENTS.md / METIS.md
+	//   <user-addendum>                      ← ~/.metis/system.md
+	//
+	// Why split here: `base` is the agent identity + tool primer — it's
+	// stable across sessions, users, and time. Everything below the
+	// boundary changes per-call (cwd from `cd elsewhere`, today's date,
+	// project file edits). The Anthropic provider's buildSystemBlocks
+	// reads this marker and emits `[static (cache_control), dynamic]`
+	// so the static prefix gets ~10% billing on cache hit.
+	out := base + "\n\n" + llm.SystemPromptCacheBoundary + "\n\n" + buildEnvBlock()
 	if proj := loadProjectContext(); proj != "" {
 		out += "\n\n" + proj
 	}

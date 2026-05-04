@@ -12,6 +12,11 @@ import (
 
 // toolSpecs builds the per-request `tools[]` array given to the LLM, by
 // asking each registered tool for its name + description + input schema.
+//
+// When LazyToolThreshold is set and exceeded, mcp__-prefixed tools have
+// their schemas stripped and a synthetic ToolSearch tool is appended.
+// Saves ~10K+ tokens per iteration for MCP-heavy sessions; see
+// lazy_tools.go for the trade-off discussion.
 func (l *Loop) toolSpecs() []llm.ToolSpec {
 	all := l.Registry.All()
 	out := make([]llm.ToolSpec, 0, len(all))
@@ -20,7 +25,11 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 			Name: t.Name(), Description: t.Description(), InputSchema: t.InputSchema(),
 		})
 	}
-	return out
+	threshold := l.LazyToolThreshold
+	if threshold == 0 {
+		threshold = LazyToolThresholdDefault
+	}
+	return applyLazySchema(out, threshold)
 }
 
 // executeBatch runs every tool_use in toolUses, returning the matching
@@ -45,6 +54,19 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	}
 	var safeJobs, queueJobs, exclJobs []job
 	for i, b := range toolUses {
+		// Synthetic ToolSearch (lazy-MCP-schema feature, Task #72) is
+		// not in the Registry — handle it inline by looking up the
+		// requested name's schema and returning it as the tool_result.
+		// The model parses the JSON on the next iteration and uses it
+		// to construct a real call.
+		if b.ToolName == "ToolSearch" {
+			results[i] = handleToolSearch(l, b)
+			emit(ctx, out, Event{
+				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+				ToolResult: &ToolResult{Output: results[i].ToolResult, IsError: results[i].IsError},
+			})
+			continue
+		}
 		t, ok := l.Registry.Get(b.ToolName)
 		if !ok {
 			results[i] = llm.ContentBlock{

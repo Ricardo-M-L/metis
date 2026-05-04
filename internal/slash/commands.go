@@ -68,6 +68,12 @@ const (
 	SignalResume
 	SignalRename
 	SignalTag
+	// SignalCustomPrompt: handler returns a prompt body that the TUI
+	// should treat as the next user message. Used by user-authored
+	// slash commands loaded from ~/.metis/commands/*.md (and the
+	// project-local .metis/commands/). Mirrors claude-code's
+	// `~/.claude/commands/` mechanism.
+	SignalCustomPrompt
 )
 
 type Registry struct {

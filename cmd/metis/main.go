@@ -70,6 +70,10 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdSkills(args[1:])
 	case "acp":
 		return cmdACP(ctx, args[1:])
+	case "daemon":
+		return cmdDaemon(ctx, args[1:])
+	case "coordinator":
+		return cmdCoordinator(ctx, args[1:])
 	case "cron":
 		return cmdCron(ctx, args[1:])
 	case "auth":
@@ -173,6 +177,7 @@ type cliFlags struct {
 	mode         string
 	noMarkdown   bool
 	noStream     bool
+	streamlined  bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
 	maxIter      int
 	system       string
 	resumeID     string
@@ -209,6 +214,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.StringVar(&out.mode, "mode", "", "permission mode")
 	f.BoolVar(&out.noMarkdown, "no-markdown", false, "disable markdown rendering")
 	f.BoolVar(&out.noStream, "no-stream", false, "disable streaming")
+	f.BoolVar(&out.streamlined, "streamlined", false, "distillation-resistant output: drop thinking, collapse tool calls into cumulative summaries (per-call override of [ui] streamlined_output)")
 	f.IntVar(&out.maxIter, "max-iter", 0, "max tool iterations per turn")
 	f.StringVar(&out.system, "system", "", "override system prompt")
 	f.StringVar(&out.resumeID, "resume", "", "resume session id")
@@ -482,8 +488,18 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 // --- subcommands ---
 
 func cmdChat(ctx context.Context, args []string) error {
+	// Early input capture (Task #76): start grabbing stdin RIGHT NOW so
+	// keystrokes typed during the cold-start window (config load,
+	// runtime build, slash registry, etc.) don't echo to a phantom
+	// prompt before bubbletea takes over. Stop() is called just before
+	// RunTUI, and the buffered bytes are forwarded to bubbletea via
+	// SetEarlyInputReader. No-op when stdin isn't a TTY.
+	earlyIn := rtpkg.NewEarlyInput()
 	flags, _, err := parseFlags(args)
 	if err != nil {
+		if earlyIn != nil {
+			earlyIn.Stop()
+		}
 		return err
 	}
 	// Trust-this-folder safety check — claude-code's first-run dance.
@@ -491,6 +507,13 @@ func cmdChat(ctx context.Context, args []string) error {
 	// when METIS_NO_TRUST_PROMPT=1. Persists answer to
 	// ~/.metis/trusted-dirs.json so it asks once per directory.
 	if term.IsTerminal(int(os.Stdin.Fd())) {
+		// Trust prompt reads stdin too — restore terminal mode FIRST
+		// so the bufio.Scanner inside ensureTrusted sees normal line
+		// input, not raw bytes. The buffer (if any) is preserved for
+		// the bubbletea hand-off below.
+		if earlyIn != nil {
+			earlyIn.Stop()
+		}
 		if err := ensureTrusted(); err != nil {
 			return err
 		}
@@ -542,7 +565,18 @@ func cmdChat(ctx context.Context, args []string) error {
 			DirList:   rt.allowedDirs.All,
 			BtwAsk:    rt.askSideQuestion,
 		}
+		// Hand the early-input buffer to bubbletea. If the trust prompt
+		// already consumed it (Stop() was called above), Reader()
+		// returns os.Stdin directly — no double-read of the same fd.
+		if earlyIn != nil {
+			earlyIn.Stop() // idempotent — safe even if trust prompt called it
+			tui.SetEarlyInputReader(earlyIn.Reader())
+		}
 		return tui.RunTUI(ctx, rt.loop, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
+	}
+	// Non-TUI path: just stop the capture so terminal mode is restored.
+	if earlyIn != nil {
+		earlyIn.Stop()
 	}
 
 	repl, err := tui.NewREPL(rt.loop, sl, rt.store, rt.sessionID, rt.useMD, rt.showTok, rt.gate, rt.model, rt.cfg.Session.SkillDir)
@@ -580,14 +614,49 @@ func cmdRun(ctx context.Context, args []string) error {
 	done := make(chan error, 1)
 	go func() { done <- rt.loop.Run(ctx, events); close(events) }()
 
+	// Streamlined output mode (Task #86, CC parity mechanism 4).
+	// Activated via [ui] streamlined_output toml OR --streamlined CLI flag.
+	// When on:
+	//   - thinking deltas → dropped entirely
+	//   - per-tool [tool] X stderr lines → suppressed; counts accumulated
+	//   - text deltas → flush accumulated tool summary to stderr first,
+	//     then reset counter (CC pattern)
+	//   - tool errors → still surfaced (errors are signal, not noise)
+	//   - LoopDone → flush any remaining unflushed counts
+	streamlined := flags.streamlined || rt.cfg.UI.StreamlinedOutput
+	var accum rtpkg.StreamlinedAccumulator
+	flushAccum := func() {
+		if !streamlined || accum.Empty() {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "[%s]\n", accum.Summary())
+		accum.Reset()
+	}
+
 	for ev := range events {
 		switch ev.Kind {
 		case agent.EventTextDelta:
+			if streamlined {
+				flushAccum()
+			}
 			fmt.Print(ev.TextDelta)
+		case agent.EventThinkingDelta:
+			if streamlined {
+				continue // distillation gold — drop entirely
+			}
+			// (Default path keeps no per-thinking-delta surfacing in
+			// run mode either, but explicit no-op here documents the
+			// streamlined contract.)
 		case agent.EventToolStart:
+			if streamlined {
+				accum.AccumulateTool(ev.ToolName)
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "\n[tool] %s\n", ev.ToolName)
 		case agent.EventToolResult:
 			if ev.ToolResult != nil && ev.ToolResult.IsError {
+				// Errors always surface — both modes need them so
+				// scripts can detect failure.
 				fmt.Fprintf(os.Stderr, "[tool error] %s\n", truncStderr(ev.ToolResult.Output, 300))
 			}
 		case agent.EventPermissionRequest:
@@ -600,9 +669,15 @@ func cmdRun(ctx context.Context, args []string) error {
 				SessionID: rt.sessionID,
 				ToolCalls: ev.ToolCalls,
 			})
-			fmt.Fprintf(os.Stderr, "\n[plan] %d tool call(s) — archived to ~/.metis/plans/\n", len(ev.ToolCalls))
-			for _, tc := range ev.ToolCalls {
-				fmt.Fprintf(os.Stderr, "  → %s(%v)\n", tc.Name, tc.Input)
+			if streamlined {
+				// Don't dump per-tool args in streamlined mode; just
+				// the count — the archived file has the details.
+				fmt.Fprintf(os.Stderr, "\n[plan] %d tool call(s) — archived to ~/.metis/plans/\n", len(ev.ToolCalls))
+			} else {
+				fmt.Fprintf(os.Stderr, "\n[plan] %d tool call(s) — archived to ~/.metis/plans/\n", len(ev.ToolCalls))
+				for _, tc := range ev.ToolCalls {
+					fmt.Fprintf(os.Stderr, "  → %s(%v)\n", tc.Name, tc.Input)
+				}
 			}
 		case agent.EventInfo:
 			// Surface auto-compaction notices ("context compacted: M → N
@@ -615,6 +690,9 @@ func cmdRun(ctx context.Context, args []string) error {
 				fmt.Fprintf(os.Stderr, "[info] %s\n", ev.Info)
 			}
 		case agent.EventLoopDone:
+			if streamlined {
+				flushAccum() // emit any trailing tool counts
+			}
 			fmt.Println()
 		case agent.EventError:
 			return ev.Err
@@ -1271,6 +1349,13 @@ func buildSlash(rt *runtime) *slash.Registry {
 		rt.gate.SetMode(permission.Mode(arg))
 		return "mode set to " + arg, slash.SignalNone
 	}})
+	// User-authored commands from ~/.metis/commands/*.md and
+	// <cwd>/.metis/commands/*.md. Loaded LAST so a user .md can't
+	// shadow a built-in (LoadCustomCommands refuses to register on
+	// name collision). Errors are silent — a missing dir is the
+	// common case. The returned name list is logged for
+	// observability (`metis doctor` surfaces it).
+	_ = slash.LoadCustomCommands(r, config.Home())
 	return r
 }
 

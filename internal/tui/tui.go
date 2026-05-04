@@ -16,6 +16,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync/atomic"
 	"time"
 
@@ -449,12 +450,30 @@ func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *sessi
 	if forceBanner {
 		m.firstRender = true
 	}
+	// Hand the early-input capture (started by cmdChat in main.go before
+	// model construction) to bubbletea: any keys typed during the cold
+	// start window get prepended to the live input stream so they're
+	// not lost. Falls through to os.Stdin when no early-input was set.
+	opts := []tea.ProgramOption{tea.WithContext(ctx)}
+	if reader := earlyInputReader; reader != nil {
+		opts = append(opts, tea.WithInput(reader))
+	}
 	// v2: WithAltScreen / WithMouseCellMotion options are gone — those
 	// terminal modes are now declared per-frame in View() via
 	// tea.View.AltScreen and tea.View.MouseMode. See tui_render.go.
-	p := tea.NewProgram(m,
-		tea.WithContext(ctx),
-	)
+	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
 	return err
 }
+
+// earlyInputReader is set by SetEarlyInputReader from main.go before
+// RunTUI starts. Package-level so the wiring stays simple — the
+// alternative is plumbing it through RunTUI's already-long signature.
+// Reset to nil after RunTUI consumes it (so subsequent runs don't see
+// stale buffered bytes).
+var earlyInputReader io.Reader
+
+// SetEarlyInputReader hands a pre-populated input reader to the next
+// RunTUI call. main.go calls this with runtime.EarlyInput.Reader()
+// after the EarlyInput's Stop() has restored terminal mode.
+func SetEarlyInputReader(r io.Reader) { earlyInputReader = r }
