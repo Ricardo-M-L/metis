@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -28,6 +29,29 @@ type Anthropic struct {
 	// auto-compaction triggers at the right threshold.
 	ContextWindow int
 	httpClient    *http.Client
+
+	// AntiDistillation, when true, adds the top-level opt-in field
+	// `anti_distillation: ["fake_tools"]` to every outgoing request.
+	// Exact wire-format parity with claude-code's
+	// services/api/claude.ts:312 — server-side opt-in, NOT a
+	// client-side decoy injection.
+	//
+	// Only effective when BaseURL points at the real Anthropic API.
+	// Third-party gateways (yunwu.ai, MiniMax, OpenRouter, Together,
+	// Groq, ...) ignore the unknown field. Off by default; the
+	// runtime emits a stderr warning if the flag is set against a
+	// non-Anthropic BaseURL so users don't get a false sense of
+	// protection.
+	AntiDistillation bool
+
+	// ClientSideDecoys, when true, attaches `_decoy_tools_v2_archive`
+	// (a non-standard top-level field) to every outgoing request.
+	// Field carries plausible-looking fake tool definitions; well-
+	// behaved API consumers ignore unknown fields, so the model
+	// never sees them — but anyone recording the HTTP traffic to
+	// train a competing model gets the decoys mixed into their
+	// dataset. Independent of AntiDistillation; both can be on.
+	ClientSideDecoys bool
 }
 
 func NewAnthropic(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, beta string) *Anthropic {
@@ -99,10 +123,31 @@ type anthropicContent struct {
 	IsError   bool           `json:"is_error,omitempty"`
 }
 
+// anthropicCacheControl marks a tool / system block as a prompt-cache
+// breakpoint. Anthropic spec: "ephemeral" gives ~5min TTL; everything
+// BEFORE this marker (including the marker itself) is cached together.
+// Up to 4 cache_control markers per request. A request hitting a cached
+// prefix bills cache_read_input_tokens at ~10% of normal input cost.
+type anthropicCacheControl struct {
+	Type string `json:"type"` // "ephemeral"
+}
+
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  map[string]any         `json:"input_schema"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+// anthropicSystemBlock is the array-form system prompt. Each block can
+// carry its own cache_control, which lets us cache the static
+// description text while keeping per-turn dynamic facts (cwd, date)
+// outside the cache so a `cd otherproj` between calls still gets the
+// correct env block.
+type anthropicSystemBlock struct {
+	Type         string                 `json:"type"` // always "text"
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 // anthropicThinking is Anthropic's extended-thinking config block.
@@ -113,15 +158,49 @@ type anthropicThinking struct {
 }
 
 type anthropicReq struct {
-	Model         string             `json:"model"`
-	MaxTokens     int                `json:"max_tokens"`
-	System        string             `json:"system,omitempty"`
-	Messages      []anthropicMessage `json:"messages"`
-	Tools         []anthropicTool    `json:"tools,omitempty"`
-	Temperature   *float64           `json:"temperature,omitempty"`
-	Thinking      *anthropicThinking `json:"thinking,omitempty"`
-	Stream        bool               `json:"stream,omitempty"`
-	StopSequences []string           `json:"stop_sequences,omitempty"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	// System is sent as []anthropicSystemBlock when prompt caching is
+	// active so the static prefix can carry cache_control. The Anthropic
+	// API accepts either string or array; we always emit array form
+	// (single block when no cache split needed) — gateways that don't
+	// understand prompt caching just see plain text in block[0].Text.
+	System        []anthropicSystemBlock `json:"system,omitempty"`
+	Messages      []anthropicMessage     `json:"messages"`
+	Tools         []anthropicTool        `json:"tools,omitempty"`
+	Temperature   *float64               `json:"temperature,omitempty"`
+	Thinking      *anthropicThinking     `json:"thinking,omitempty"`
+	Stream        bool                   `json:"stream,omitempty"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	// AntiDistillation: top-level opt-in field matching claude-code's
+	// services/api/claude.ts:312 — `result.anti_distillation = ['fake_tools']`.
+	// This is a SERVER-SIDE opt-in: the Anthropic backend reads the
+	// flag and injects countermeasures into the response stream
+	// itself. The client does NOT inject anything into tools[] — that
+	// would just give the model fake tools to (mis)call, which is the
+	// opposite of what we want.
+	//
+	// Only meaningful against the real Anthropic endpoint; gateways
+	// like yunwu.ai / OpenRouter / MiniMax will silently ignore the
+	// field. CC additionally gates this behind
+	// `CLAUDE_CODE_ENTRYPOINT === "cli"` + Statsig — i.e. only the 1P
+	// CLI emits it. metis exposes it as an opt-in toml flag.
+	AntiDistillation []string `json:"anti_distillation,omitempty"`
+
+	// DecoyToolsArchive is the client-side anti-distillation channel
+	// (independent of the CC server-side opt-in above). Non-standard
+	// JSON tag chosen so the field is dropped by every conforming
+	// API consumer — including the model that ultimately renders the
+	// prompt. Adversaries recording the HTTP traffic see the decoys
+	// in the bytes; the model never does.
+	//
+	// Wire shape mirrors `tools[]` so a naive grep / regex training
+	// pipeline picks up the noise. The intentional duplication of
+	// `name`/`description`/`input_schema` keys is what makes the
+	// channel useful; a stricter "structured-extraction" pipeline
+	// might still filter it, but raw-token / next-token-prediction
+	// training pipelines will absorb the decoys as real signal.
+	DecoyToolsArchive []anthropicTool `json:"_decoy_tools_v2_archive,omitempty"`
 }
 
 type anthropicResp struct {
@@ -142,6 +221,19 @@ type anthropicResp struct {
 // --- conversion helpers ---
 
 func toAnthropic(req Request, model string, maxTokens int) anthropicReq {
+	return toAnthropicWithFlags(req, model, maxTokens, false, false)
+}
+
+// toAnthropicWithFlags is the full-arity converter used by the Anthropic
+// client. The flag-less wrapper above keeps existing callers / tests
+// untouched.
+//   - antiDistill toggles the CC server-side opt-in (top-level
+//     `anti_distillation: ["fake_tools"]`).
+//   - clientDecoys toggles the metis client-side decoy archive
+//     (top-level `_decoy_tools_v2_archive` with fake tool defs).
+//
+// The two flags are independent — both can be on, both can be off.
+func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill, clientDecoys bool) anthropicReq {
 	// MaxTokens precedence: per-request override > provider default.
 	// The override path is what /fast uses to halve budget without
 	// touching the underlying client config.
@@ -152,7 +244,7 @@ func toAnthropic(req Request, model string, maxTokens int) anthropicReq {
 	out := anthropicReq{
 		Model:         model,
 		MaxTokens:     mt,
-		System:        req.System,
+		System:        buildSystemBlocks(req.System),
 		Stream:        req.Stream,
 		StopSequences: req.StopSequences,
 	}
@@ -172,6 +264,35 @@ func toAnthropic(req Request, model string, maxTokens int) anthropicReq {
 			Name: t.Name, Description: t.Description, InputSchema: t.InputSchema,
 		})
 	}
+	// Anti-distillation: send the ["fake_tools"] opt-in as a top-level
+	// request field — exact wire-format parity with claude-code's
+	// services/api/claude.ts:312. The Anthropic backend interprets
+	// the flag and applies its own countermeasures; the client side
+	// does NOT touch the tools[] array. Non-Anthropic gateways will
+	// silently ignore the field (omitempty drops it when false).
+	if antiDistill {
+		out.AntiDistillation = []string{"fake_tools"}
+	}
+	// Client-side decoys: stuff the wire-only `_decoy_tools_v2_archive`
+	// field with fake tool defs. The model never sees this — it's a
+	// non-standard top-level field that every API silently drops
+	// before constructing the prompt. But anyone capturing HTTP
+	// traffic to train a competing model gets the decoys in their
+	// dataset. See anthropic_client_decoys.go for the shape.
+	if clientDecoys {
+		out.DecoyToolsArchive = clientSideDecoyTools()
+	}
+	// Mark the LAST tool with cache_control. Anthropic semantics: a
+	// cache_control marker is a "cache breakpoint" — everything BEFORE
+	// it (including the marker block itself) gets cached together. So
+	// marking the last tool caches the ENTIRE tools array (typically the
+	// largest token block in any agent request — 5–10K tokens for a
+	// 30-tool registry). The static system prefix is also under this
+	// breakpoint via the buildSystemBlocks split below. claude-code's
+	// `services/api/claude.ts:buildSystemPromptBlocks` does the same.
+	if n := len(out.Tools); n > 0 {
+		out.Tools[n-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+	}
 	for _, m := range req.Messages {
 		am := anthropicMessage{Role: string(m.Role)}
 		for _, c := range m.Content {
@@ -189,6 +310,67 @@ func toAnthropic(req Request, model string, maxTokens int) anthropicReq {
 			}
 		}
 		out.Messages = append(out.Messages, am)
+	}
+	return out
+}
+
+// SystemPromptCacheBoundary splits the system prompt into a static
+// (cacheable) prefix and a dynamic suffix. Callers that assemble the
+// system string (runtime/system_prompt.go) place this literal between
+// the stable agent identity / tool primer and the per-call dynamic
+// facts (cwd, today's date, project context, user addendum). When this
+// marker is absent the entire prompt goes into one block with
+// cache_control — still valid (caches everything) but every dynamic
+// change invalidates the cache.
+//
+// Mirrors claude-code's __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ in
+// constants/prompts.ts. The exact bytes don't matter, only that it's a
+// unique never-occurring-in-real-text sentinel — keep it ASCII so it
+// can't be partially consumed by ansi/grapheme processing.
+const SystemPromptCacheBoundary = "<<<__METIS_CACHE_BOUNDARY__>>>"
+
+// buildSystemBlocks produces the array-form system field. Splitting
+// rules:
+//   - empty input → nil (omitempty drops the field, same as before)
+//   - boundary present → [static (with cache_control), dynamic (no cache_control)]
+//   - no boundary → [single block with cache_control on it] so callers
+//     that don't yet emit the boundary still get tools+system cached
+//     together as one breakpoint.
+//
+// We never emit more than 2 system blocks because Anthropic limits to 4
+// cache breakpoints total (1 = last tool, 1 = static system, 1 = last
+// user message in the future, 1 = spare).
+func buildSystemBlocks(sys string) []anthropicSystemBlock {
+	if sys == "" {
+		return nil
+	}
+	idx := strings.Index(sys, SystemPromptCacheBoundary)
+	if idx < 0 {
+		return []anthropicSystemBlock{{
+			Type: "text",
+			Text: sys,
+			// No cache_control here: the last-tool marker already creates
+			// a breakpoint covering tools+system together. Adding a
+			// second marker on a single-block system would burn a
+			// breakpoint slot for zero additional benefit.
+		}}
+	}
+	static := strings.TrimRight(sys[:idx], "\n ")
+	dynamic := strings.TrimLeft(sys[idx+len(SystemPromptCacheBoundary):], "\n ")
+	out := []anthropicSystemBlock{}
+	if static != "" {
+		out = append(out, anthropicSystemBlock{
+			Type:         "text",
+			Text:         static,
+			CacheControl: &anthropicCacheControl{Type: "ephemeral"},
+		})
+	}
+	if dynamic != "" {
+		out = append(out, anthropicSystemBlock{
+			Type: "text",
+			Text: dynamic,
+			// No cache_control: this is the per-call dynamic suffix.
+		})
 	}
 	return out
 }
@@ -220,39 +402,51 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 	if a.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set ANTHROPIC_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
-	body := toAnthropic(req, a.Model, a.MaxTokens)
+	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys)
 	body.Stream = false
 
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
+	var ar anthropicResp
+	doOnce := func(b anthropicReq) error {
+		buf, err := json.Marshal(b)
+		if err != nil {
+			return err
+		}
+		return retryWithBackoff(ctx, 3, 0, func() error {
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL+"/v1/messages", bytes.NewReader(buf))
+			if err != nil {
+				return err
+			}
+			a.setHeaders(httpReq)
+			resp, err := a.httpClient.Do(httpReq)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			rb, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode >= 400 {
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, truncate(string(rb), 500))
+				if isRetryableStatus(resp.StatusCode) {
+					return &RetryableError{Err: httpErr}
+				}
+				return httpErr
+			}
+			if err := json.Unmarshal(rb, &ar); err != nil {
+				return fmt.Errorf("decode anthropic response: %w", err)
+			}
+			return nil
+		})
 	}
 
-	var ar anthropicResp
-	err = retryWithBackoff(ctx, 3, 0, func() error {
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL+"/v1/messages", bytes.NewReader(buf))
-		if err != nil {
-			return err
-		}
-		a.setHeaders(httpReq)
-		resp, err := a.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		rb, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
-			}
-			return httpErr
-		}
-		if err := json.Unmarshal(rb, &ar); err != nil {
-			return fmt.Errorf("decode anthropic response: %w", err)
-		}
-		return nil
-	})
+	err := doOnce(body)
+	for attempt := 1; err != nil && isInvalidToolArgsError(err) && attempt <= 2; attempt++ {
+		// MiniMax-style gateway reject — model emitted unparseable
+		// JSON for tool arguments. Add an increasingly forceful
+		// system reminder and retry. Second retry uses a stronger
+		// reminder; we cap at 2 attempts so a persistently broken
+		// path doesn't loop forever.
+		debugRetryArgs(attempt, "Complete")
+		err = doOnce(withToolArgsReminder(body))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -263,42 +457,66 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 	if a.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set ANTHROPIC_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
-	body := toAnthropic(req, a.Model, a.MaxTokens)
+	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys)
 	body.Stream = true
-
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
 
 	// Retry the initial request (DNS / 429 / 5xx). Once we have a streaming
 	// body we don't retry — partial SSE consumption can't be re-played.
 	var resp *http.Response
-	err = retryWithBackoff(ctx, 3, 0, func() error {
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL+"/v1/messages", bytes.NewReader(buf))
+	openOnce := func(b anthropicReq) error {
+		buf, err := json.Marshal(b)
 		if err != nil {
 			return err
 		}
-		a.setHeaders(httpReq)
-		resp, err = a.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode >= 400 {
-			rb, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+		return retryWithBackoff(ctx, 3, 0, func() error {
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL+"/v1/messages", bytes.NewReader(buf))
+			if err != nil {
+				return err
 			}
-			return httpErr
-		}
-		return nil
-	})
+			a.setHeaders(httpReq)
+			resp, err = a.httpClient.Do(httpReq)
+			if err != nil {
+				return err
+			}
+			if resp.StatusCode >= 400 {
+				rb, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, truncate(string(rb), 500))
+				if isRetryableStatus(resp.StatusCode) {
+					return &RetryableError{Err: httpErr}
+				}
+				return httpErr
+			}
+			return nil
+		})
+	}
+
+	err := openOnce(body)
+	for attempt := 1; err != nil && isInvalidToolArgsError(err) && attempt <= 2; attempt++ {
+		// MiniMax-style gateway reject (e.g. error code 2013, "invalid
+		// function arguments json string") — the upstream model emitted
+		// unparseable JSON for `arguments` on a tool call (most common
+		// for tools with no required fields). Add a system reminder
+		// and retry. Some models need >1 retry before the empty-args
+		// code path stops firing; cap at 2 so persistent failures
+		// don't loop forever.
+		debugRetryArgs(attempt, "Stream")
+		err = openOnce(withToolArgsReminder(body))
+	}
 	if err != nil {
 		return nil, err
 	}
 	return newAnthropicStream(resp.Body), nil
+}
+
+// debugRetryArgs emits a one-line stderr breadcrumb on each
+// args-fixup retry. Gated on METIS_DEBUG=1 so production paths stay
+// quiet but operators chasing a flaky tool-call setup can see retry
+// activity without rebuilding.
+func debugRetryArgs(attempt int, where string) {
+	if os.Getenv("METIS_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "metis: %s: retry %d after invalid-tool-args 400 (adding system reminder)\n", where, attempt)
+	}
 }
 
 // isRetryableStatus picks the HTTP status codes that can plausibly be retried.
@@ -311,6 +529,54 @@ func isRetryableStatus(code int) bool {
 		return true
 	}
 	return false
+}
+
+// isInvalidToolArgsError detects the MiniMax-style upstream error that
+// fires when the served model emits unparseable JSON for a tool call's
+// `arguments` field. Observed verbatim against
+// https://api.minimaxi.com/anthropic with MiniMax-M2.7:
+//
+//	anthropic 400: {"type":"error","error":{"type":"invalid_request_error",
+//	  "message":"invalid params, invalid function arguments json string,
+//	  tool_call_id: ... (2013)"}}
+//
+// The (2013) is MiniMax's internal error code; the "json string"
+// wording is the load-bearing signal because it distinguishes this
+// case from generic malformed-request 400s. We match on the literal
+// substring so the detection is independent of any particular error
+// envelope shape — Anthropic native, OpenAI-compat, and MiniMax all
+// surface the message text in the response body which we already
+// embed verbatim into the returned error.
+func isInvalidToolArgsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "invalid function arguments")
+}
+
+// withToolArgsReminder returns a copy of body with an extra system
+// block reminding the model to emit valid non-empty JSON for tool
+// arguments. Used as a one-shot fixup after isInvalidToolArgsError
+// hits — the reminder shifts the model off whatever empty-args code
+// path produced the unparseable output on the first try. Idempotent:
+// safe to call on a body that already carries the reminder (we still
+// append; redundant blocks don't change behavior). The original body
+// is not mutated so subsequent retries can also call this.
+func withToolArgsReminder(body anthropicReq) anthropicReq {
+	out := body
+	// Copy the System slice so appending doesn't alias the caller's.
+	if len(body.System) > 0 {
+		out.System = append([]anthropicSystemBlock(nil), body.System...)
+	}
+	out.System = append(out.System, anthropicSystemBlock{
+		Type: "text",
+		Text: "When invoking tools, the `arguments` object MUST be valid non-empty JSON. " +
+			"For tools whose schema requires the field `_`, pass `\"_\": \"\"`. " +
+			"For tools with no required fields, pass `{}` literally. " +
+			"Never emit `null`, an empty string, or unquoted JSON for tool arguments.",
+	})
+	return out
 }
 
 func (a *Anthropic) setHeaders(r *http.Request) {
