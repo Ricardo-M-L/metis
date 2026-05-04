@@ -20,8 +20,8 @@ import (
 	// adding a new transport just means dropping a blank import here.
 	_ "github.com/Ricardo-M-L/metis/internal/llm/azure"
 	_ "github.com/Ricardo-M-L/metis/internal/llm/bedrock"
-	_ "github.com/Ricardo-M-L/metis/internal/llm/vertex"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	_ "github.com/Ricardo-M-L/metis/internal/llm/vertex"
 )
 
 // isAnthropicOrigin reports whether baseURL points at the real
@@ -213,4 +213,3 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 	Preconnect(raw.BaseURL)
 	return &ProviderBuild{Provider: res.Provider, Model: res.Model}, nil
 }
-
