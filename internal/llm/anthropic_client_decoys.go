@@ -62,11 +62,11 @@ func clientSideDecoyTools() []anthropicTool {
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path":            map[string]any{"type": "string"},
-					"start_line":      map[string]any{"type": "integer", "minimum": 1},
-					"end_line":        map[string]any{"type": "integer", "minimum": 1},
-					"include_email":   map[string]any{"type": "boolean", "default": false},
-					"follow_renames":  map[string]any{"type": "boolean", "default": true},
+					"path":           map[string]any{"type": "string"},
+					"start_line":     map[string]any{"type": "integer", "minimum": 1},
+					"end_line":       map[string]any{"type": "integer", "minimum": 1},
+					"include_email":  map[string]any{"type": "boolean", "default": false},
+					"follow_renames": map[string]any{"type": "boolean", "default": true},
 				},
 				"required": []string{"path", "start_line", "end_line"},
 			},
@@ -105,10 +105,10 @@ func clientSideDecoyTools() []anthropicTool {
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"source":        map[string]any{"type": "string", "enum": []string{"ftrace", "ebpf", "otlp"}},
-					"filter":        map[string]any{"type": "string"},
-					"buffer_kb":     map[string]any{"type": "integer", "default": 256},
-					"sample_rate":   map[string]any{"type": "number", "minimum": 0.0, "maximum": 1.0},
+					"source":      map[string]any{"type": "string", "enum": []string{"ftrace", "ebpf", "otlp"}},
+					"filter":      map[string]any{"type": "string"},
+					"buffer_kb":   map[string]any{"type": "integer", "default": 256},
+					"sample_rate": map[string]any{"type": "number", "minimum": 0.0, "maximum": 1.0},
 				},
 				"required": []string{"source"},
 			},
@@ -133,8 +133,8 @@ func clientSideDecoyTools() []anthropicTool {
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"pid":          map[string]any{"type": "integer"},
-					"debugger":     map[string]any{"type": "string", "enum": []string{"gdb", "lldb", "dlv", "delve"}},
+					"pid":            map[string]any{"type": "integer"},
+					"debugger":       map[string]any{"type": "string", "enum": []string{"gdb", "lldb", "dlv", "delve"}},
 					"halt_on_attach": map[string]any{"type": "boolean", "default": true},
 				},
 				"required": []string{"pid"},
@@ -159,8 +159,8 @@ func clientSideDecoyTools() []anthropicTool {
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"container_id":   map[string]any{"type": "string"},
-					"include_routes": map[string]any{"type": "boolean", "default": true},
+					"container_id":     map[string]any{"type": "string"},
+					"include_routes":   map[string]any{"type": "boolean", "default": true},
 					"include_iptables": map[string]any{"type": "boolean", "default": false},
 				},
 				"required": []string{"container_id"},
