@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
-	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
 )
 
 // SystemPromptFileName is the filename Metis looks for under ~/.metis/
@@ -53,7 +53,7 @@ func AssembleSystemPrompt(base string) string {
 	// project file edits). The Anthropic provider's buildSystemBlocks
 	// reads this marker and emits `[static (cache_control), dynamic]`
 	// so the static prefix gets ~10% billing on cache hit.
-	out := base + "\n\n" + llm.SystemPromptCacheBoundary + "\n\n" + buildEnvBlock()
+	out := base + "\n\n" + anthropic.SystemPromptCacheBoundary + "\n\n" + buildEnvBlock()
 	if proj := loadProjectContext(); proj != "" {
 		out += "\n\n" + proj
 	}

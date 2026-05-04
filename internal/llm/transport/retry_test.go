@@ -1,4 +1,4 @@
-package llm
+package transport
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 func TestRetry_StopsAfterFirstSuccess(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var calls int
-		err := retryWithBackoff(context.Background(), 3, 10*time.Millisecond, func() error {
+		err := RetryWithBackoff(context.Background(), 3, 10*time.Millisecond, func() error {
 			calls++
 			return nil
 		})
@@ -28,7 +28,7 @@ func TestRetry_StopsAfterFirstSuccess(t *testing.T) {
 func TestRetry_RetriesUntilSuccess(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var calls int
-		err := retryWithBackoff(context.Background(), 3, 10*time.Millisecond, func() error {
+		err := RetryWithBackoff(context.Background(), 3, 10*time.Millisecond, func() error {
 			calls++
 			if calls < 3 {
 				return &RetryableError{Err: errors.New("rate limit")}
@@ -47,7 +47,7 @@ func TestRetry_RetriesUntilSuccess(t *testing.T) {
 func TestRetry_GivesUpAfterAttemptsExhausted(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var calls int
-		err := retryWithBackoff(context.Background(), 2, 10*time.Millisecond, func() error {
+		err := RetryWithBackoff(context.Background(), 2, 10*time.Millisecond, func() error {
 			calls++
 			return &RetryableError{Err: errors.New("rate limit")}
 		})
@@ -63,7 +63,7 @@ func TestRetry_GivesUpAfterAttemptsExhausted(t *testing.T) {
 func TestRetry_NonRetryableErrorBypassesLoop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var calls int
-		err := retryWithBackoff(context.Background(), 3, 10*time.Millisecond, func() error {
+		err := RetryWithBackoff(context.Background(), 3, 10*time.Millisecond, func() error {
 			calls++
 			return errors.New("anthropic 401: invalid api key")
 		})
@@ -80,7 +80,7 @@ func TestRetry_StatusCodeHeuristic(t *testing.T) {
 	for _, code := range []int{429, 502, 503, 504, 529} {
 		synctest.Test(t, func(t *testing.T) {
 			var calls int
-			retryWithBackoff(context.Background(), 2, 5*time.Millisecond, func() error {
+			RetryWithBackoff(context.Background(), 2, 5*time.Millisecond, func() error {
 				calls++
 				return fmt.Errorf("provider %d: overloaded", code)
 			})
@@ -99,7 +99,7 @@ func TestRetry_CtxCancelStopsImmediately(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 			cancel()
 		}()
-		err := retryWithBackoff(ctx, 10, 200*time.Millisecond, func() error {
+		err := RetryWithBackoff(ctx, 10, 200*time.Millisecond, func() error {
 			calls++
 			return &RetryableError{Err: errors.New("rate limit")}
 		})
@@ -115,7 +115,7 @@ func TestRetry_CtxCancelStopsImmediately(t *testing.T) {
 func TestRetry_InvalidStatusNotRetried(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var calls int
-		retryWithBackoff(context.Background(), 3, 5*time.Millisecond, func() error {
+		RetryWithBackoff(context.Background(), 3, 5*time.Millisecond, func() error {
 			calls++
 			return fmt.Errorf("openai 400: bad request")
 		})

@@ -1,4 +1,4 @@
-package llm
+package anthropic
 
 // Unit tests for the MiniMax-style "invalid function arguments json
 // string" 400 retry path (anthropic.go's isInvalidToolArgsError +

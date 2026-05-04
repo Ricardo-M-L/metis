@@ -1,4 +1,10 @@
-package llm
+// Package anthropic implements the Anthropic Messages API transport
+// (api.anthropic.com/v1/messages and Anthropic-format gateways like
+// MiniMax / OpenRouter / yunwu). Used directly when configured as
+// transport=anthropic_messages, and consumed by the vertex/bedrock
+// subpackages which run the same wire format over different
+// transports.
+package anthropic
 
 import (
 	"bufio"
@@ -12,6 +18,36 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+// Local type aliases keep the in-file diff small — the bulk of this
+// file uses bare `Request`/`Response`/etc. and would be noisy if every
+// reference grew a `provider.` qualifier.
+type (
+	Request      = provider.Request
+	Response     = provider.Response
+	StreamReader = provider.StreamReader
+	StreamEvent  = provider.StreamEvent
+	Message      = provider.Message
+	ContentBlock = provider.ContentBlock
+	ToolSpec     = provider.ToolSpec
+	Effort       = pubLLM.Effort
+)
+
+const (
+	RoleSystem    = provider.RoleSystem
+	RoleUser      = provider.RoleUser
+	RoleAssistant = provider.RoleAssistant
+	RoleTool      = provider.RoleTool
+
+	EffortDefault = pubLLM.EffortDefault
+	EffortLow     = pubLLM.EffortLow
+	EffortMedium  = pubLLM.EffortMedium
+	EffortHigh    = pubLLM.EffortHigh
 )
 
 // Anthropic implements Provider against the Messages API.
@@ -54,7 +90,7 @@ type Anthropic struct {
 	ClientSideDecoys bool
 }
 
-func NewAnthropic(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, beta string) *Anthropic {
+func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, beta string) *Anthropic {
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
@@ -411,7 +447,7 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 		if err != nil {
 			return err
 		}
-		return retryWithBackoff(ctx, 3, 0, func() error {
+		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
 			httpReq, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL+"/v1/messages", bytes.NewReader(buf))
 			if err != nil {
 				return err
@@ -424,9 +460,9 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 			defer resp.Body.Close()
 			rb, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode >= 400 {
-				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, truncate(string(rb), 500))
-				if isRetryableStatus(resp.StatusCode) {
-					return &RetryableError{Err: httpErr}
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+				if transport.IsRetryableStatus(resp.StatusCode) {
+					return &transport.RetryableError{Err: httpErr}
 				}
 				return httpErr
 			}
@@ -468,7 +504,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 		if err != nil {
 			return err
 		}
-		return retryWithBackoff(ctx, 3, 0, func() error {
+		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
 			httpReq, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL+"/v1/messages", bytes.NewReader(buf))
 			if err != nil {
 				return err
@@ -481,9 +517,9 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 			if resp.StatusCode >= 400 {
 				rb, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
-				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, truncate(string(rb), 500))
-				if isRetryableStatus(resp.StatusCode) {
-					return &RetryableError{Err: httpErr}
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+				if transport.IsRetryableStatus(resp.StatusCode) {
+					return &transport.RetryableError{Err: httpErr}
 				}
 				return httpErr
 			}
@@ -517,18 +553,6 @@ func debugRetryArgs(attempt int, where string) {
 	if os.Getenv("METIS_DEBUG") == "1" {
 		fmt.Fprintf(os.Stderr, "metis: %s: retry %d after invalid-tool-args 400 (adding system reminder)\n", where, attempt)
 	}
-}
-
-// isRetryableStatus picks the HTTP status codes that can plausibly be retried.
-// 429 (rate limit), 503 (overloaded), 529 (Anthropic-specific overloaded),
-// 502/504 (gateway hiccup). We deliberately exclude 500 — it can mean the
-// request itself is malformed.
-func isRetryableStatus(code int) bool {
-	switch code {
-	case 429, 502, 503, 504, 529:
-		return true
-	}
-	return false
 }
 
 // isInvalidToolArgsError detects the MiniMax-style upstream error that
@@ -746,11 +770,4 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 		return StreamEvent{Type: "error", Err: err}, err
 	}
 	return StreamEvent{Type: "message_stop"}, io.EOF
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

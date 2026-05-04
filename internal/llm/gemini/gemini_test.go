@@ -1,4 +1,4 @@
-package llm
+package gemini
 
 import (
 	"context"
@@ -54,7 +54,7 @@ func TestGemini_StreamText(t *testing.T) {
 	srv := httptest.NewServer(fake.handler(t))
 	defer srv.Close()
 
-	g := NewGemini("test-key", srv.URL, "gemini-2.5-pro", 0, 5*time.Second, 0)
+	g := New("test-key", srv.URL, "gemini-2.5-pro", 0, 5*time.Second, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	stream, err := g.Stream(ctx, Request{
@@ -121,7 +121,7 @@ func TestGemini_StreamToolCall(t *testing.T) {
 	srv := httptest.NewServer(fake.handler(t))
 	defer srv.Close()
 
-	g := NewGemini("k", srv.URL, "gemini-2.5-flash", 0, 5*time.Second, 0)
+	g := New("k", srv.URL, "gemini-2.5-flash", 0, 5*time.Second, 0)
 	stream, err := g.Stream(context.Background(), Request{
 		Messages: []Message{{Role: RoleUser, Content: []ContentBlock{{Type: "text", Text: "weather?"}}}},
 	})
@@ -169,7 +169,7 @@ func TestGemini_RequestBodyShape(t *testing.T) {
 	srv := httptest.NewServer(fake.handler(t))
 	defer srv.Close()
 
-	g := NewGemini("k", srv.URL, "gemini-2.5-pro", 0, 5*time.Second, 0)
+	g := New("k", srv.URL, "gemini-2.5-pro", 0, 5*time.Second, 0)
 	stream, err := g.Stream(context.Background(), Request{
 		System: "you are helpful",
 		Messages: []Message{

@@ -1,4 +1,4 @@
-package llm
+package azure
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 )
 
 // TestAzure_URL_DeploymentRouting checks that Complete posts to the
@@ -19,8 +21,8 @@ func TestAzure_URL_DeploymentRouting(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotURL = r.URL.String()
 		gotAuth = r.Header.Get("api-key")
-		_ = json.NewEncoder(w).Encode(oaiResp{
-			Choices: []oaiChoice{{Message: oaiMessage{Role: "assistant", Content: "ok"}, FinishReason: "stop"}},
+		_ = json.NewEncoder(w).Encode(openai.Resp{
+			Choices: []openai.Choice{{Message: openai.WireMessage{Role: "assistant", Content: "ok"}, FinishReason: "stop"}},
 		})
 	}))
 	defer srv.Close()
@@ -50,8 +52,8 @@ func TestAzure_AuthMode_AAD_UsesBearer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAPIKey = r.Header.Get("api-key")
 		gotBearer = r.Header.Get("Authorization")
-		_ = json.NewEncoder(w).Encode(oaiResp{
-			Choices: []oaiChoice{{Message: oaiMessage{Role: "assistant", Content: "ok"}, FinishReason: "stop"}},
+		_ = json.NewEncoder(w).Encode(openai.Resp{
+			Choices: []openai.Choice{{Message: openai.WireMessage{Role: "assistant", Content: "ok"}, FinishReason: "stop"}},
 		})
 	}))
 	defer srv.Close()

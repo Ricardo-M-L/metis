@@ -1,4 +1,8 @@
-package llm
+// Package gemini implements Google's Generative Language API
+// (generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent).
+// Distinct from Vertex AI's Anthropic-on-Google offering — this is
+// Google's own native protocol with its own message + tool schema.
+package gemini
 
 import (
 	"bufio"
@@ -12,6 +16,33 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+type (
+	Request      = provider.Request
+	Response     = provider.Response
+	StreamReader = provider.StreamReader
+	StreamEvent  = provider.StreamEvent
+	Message      = provider.Message
+	ContentBlock = provider.ContentBlock
+	ToolSpec     = provider.ToolSpec
+	Effort       = pubLLM.Effort
+)
+
+const (
+	RoleSystem    = provider.RoleSystem
+	RoleUser      = provider.RoleUser
+	RoleAssistant = provider.RoleAssistant
+	RoleTool      = provider.RoleTool
+
+	EffortDefault = pubLLM.EffortDefault
+	EffortLow     = pubLLM.EffortLow
+	EffortMedium  = pubLLM.EffortMedium
+	EffortHigh    = pubLLM.EffortHigh
 )
 
 var dbgGemini = os.Getenv("METIS_DEBUG_GEMINI") == "1"
@@ -36,7 +67,7 @@ type Gemini struct {
 	httpClient    *http.Client
 }
 
-func NewGemini(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, temperature float64) *Gemini {
+func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, temperature float64) *Gemini {
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com"
 	}
@@ -240,7 +271,7 @@ func (g *Gemini) Complete(ctx context.Context, req Request) (*Response, error) {
 		return nil, err
 	}
 	var chunk gemRespChunk
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", g.endpoint(false), bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -253,9 +284,9 @@ func (g *Gemini) Complete(ctx context.Context, req Request) (*Response, error) {
 		defer resp.Body.Close()
 		rb, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
@@ -280,7 +311,7 @@ func (g *Gemini) Stream(ctx context.Context, req Request) (StreamReader, error) 
 		fmt.Fprintf(os.Stderr, "[gemini] POST %s\n%s\n", g.endpoint(true), buf)
 	}
 	var resp *http.Response
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", g.endpoint(true), bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -294,9 +325,9 @@ func (g *Gemini) Stream(ctx context.Context, req Request) (StreamReader, error) 
 		if resp.StatusCode >= 400 {
 			rb, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}

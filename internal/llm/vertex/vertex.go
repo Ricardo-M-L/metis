@@ -1,4 +1,4 @@
-package llm
+package vertex
 
 // Vertex AI provider — Anthropic Claude served via Google Cloud's
 // Vertex AI Model Garden. Wire format is Anthropic's Messages API
@@ -20,12 +20,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
+	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+type (
+	Request      = provider.Request
+	Response     = provider.Response
+	StreamReader = provider.StreamReader
+	Message      = provider.Message
+	ContentBlock = provider.ContentBlock
+)
+
+const (
+	RoleSystem    = provider.RoleSystem
+	RoleUser      = provider.RoleUser
+	RoleAssistant = provider.RoleAssistant
+	RoleTool      = provider.RoleTool
 )
 
 // Vertex implements the Anthropic-on-Vertex transport. ServiceAccount
@@ -105,7 +124,7 @@ func (v *Vertex) endpoint(streaming bool) string {
 // We can't reuse anthropicReq directly (no omitempty on Model) so we
 // re-serialize via map.
 func vertexBody(req Request, maxTokens int) (map[string]any, error) {
-	a := toAnthropic(req, "", maxTokens) // model="" so it's set to "" in struct; we strip below
+	a := anthropic.ToRequest(req, "", maxTokens) // model="" so it's set to "" in struct; we strip below
 	buf, err := json.Marshal(a)
 	if err != nil {
 		return nil, err
@@ -140,8 +159,8 @@ func (v *Vertex) Complete(ctx context.Context, req Request) (*Response, error) {
 		return nil, err
 	}
 
-	var ar anthropicResp
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	var ar anthropic.Resp
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", v.endpoint(false), bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -156,9 +175,9 @@ func (v *Vertex) Complete(ctx context.Context, req Request) (*Response, error) {
 		defer resp.Body.Close()
 		rb, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("vertex %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("vertex %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
@@ -167,7 +186,7 @@ func (v *Vertex) Complete(ctx context.Context, req Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fromAnthropic(ar), nil
+	return anthropic.FromResponse(ar), nil
 }
 
 func (v *Vertex) Stream(ctx context.Context, req Request) (StreamReader, error) {
@@ -182,7 +201,7 @@ func (v *Vertex) Stream(ctx context.Context, req Request) (StreamReader, error) 
 	}
 
 	var resp *http.Response
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", v.endpoint(true), bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -197,9 +216,9 @@ func (v *Vertex) Stream(ctx context.Context, req Request) (StreamReader, error) 
 		if resp.StatusCode >= 400 {
 			rb, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			httpErr := fmt.Errorf("vertex %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("vertex %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
@@ -211,7 +230,7 @@ func (v *Vertex) Stream(ctx context.Context, req Request) (StreamReader, error) 
 	// SSE format on Vertex matches direct Anthropic, so the existing
 	// stream parser works as-is. The model id (carried via URL) means
 	// nothing in the SSE events beyond echoing in usage stats.
-	return newAnthropicStream(resp.Body), nil
+	return anthropic.NewStream(resp.Body), nil
 }
 
 // AsAnthropicCompat exposes the Vertex provider's response unmarshal

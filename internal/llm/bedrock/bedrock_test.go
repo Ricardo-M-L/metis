@@ -1,4 +1,4 @@
-package llm
+package bedrock
 
 import (
 	"context"
@@ -259,4 +259,21 @@ func TestBedrock_Stream_UsesSyntheticPath(t *testing.T) {
 	if len(saw) != len(want) {
 		t.Errorf("saw events %v, want %v", saw, want)
 	}
+}
+
+// rewriteHostTransport redirects every Request to a fixed target host
+// — used to mock cloud endpoints whose URLs are baked into the
+// provider code without running a fake DNS server. Duplicated from
+// vertex_test.go since each subpackage's tests are isolated; the
+// 5-line copy is cheaper than exporting a test-only helper.
+type rewriteHostTransport struct {
+	base   http.RoundTripper
+	target string
+}
+
+func (t *rewriteHostTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	parsedTarget, _ := r.URL.Parse(t.target)
+	r.URL.Scheme = parsedTarget.Scheme
+	r.URL.Host = parsedTarget.Host
+	return t.base.RoundTrip(r)
 }

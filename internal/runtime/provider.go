@@ -9,6 +9,12 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
+	"github.com/Ricardo-M-L/metis/internal/llm/azure"
+	"github.com/Ricardo-M-L/metis/internal/llm/bedrock"
+	"github.com/Ricardo-M-L/metis/internal/llm/gemini"
+	"github.com/Ricardo-M-L/metis/internal/llm/openai"
+	"github.com/Ricardo-M-L/metis/internal/llm/vertex"
 )
 
 // isAnthropicOrigin reports whether baseURL points at the real
@@ -58,7 +64,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		if model == "" {
 			model = cfg.Provider.Anthropic.Model
 		}
-		prov := llm.NewAnthropic(
+		prov := anthropic.New(
 			key,
 			cfg.Provider.Anthropic.BaseURL,
 			model,
@@ -97,7 +103,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		if model == "" {
 			model = cfg.Provider.OpenAI.Model
 		}
-		prov := llm.NewOpenAI(
+		prov := openai.New(
 			key,
 			cfg.Provider.OpenAI.BaseURL,
 			model,
@@ -119,7 +125,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		if model == "" {
 			model = cfg.Provider.Gemini.Model
 		}
-		prov := llm.NewGemini(
+		prov := gemini.New(
 			key,
 			cfg.Provider.Gemini.BaseURL,
 			model,
@@ -178,22 +184,22 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		// first call, which is recoverable; vs picking openai_chat as
 		// the default would silently break the historically common
 		// anthropic-compat use case.
-		prov := llm.NewAnthropic(key, raw.BaseURL, model, maxTokens, timeout, "")
+		prov := anthropic.New(key, raw.BaseURL, model, maxTokens, timeout, "")
 		Preconnect(raw.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
 	case "openai_chat", "openai":
-		prov := llm.NewOpenAI(key, raw.BaseURL, model, maxTokens, timeout, 0)
+		prov := openai.New(key, raw.BaseURL, model, maxTokens, timeout, 0)
 		Preconnect(raw.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
 	case "gemini_native", "gemini":
-		prov := llm.NewGemini(key, raw.BaseURL, model, maxTokens, timeout, 0)
+		prov := gemini.New(key, raw.BaseURL, model, maxTokens, timeout, 0)
 		Preconnect(raw.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
 	case "azure_openai", "azure":
 		// Azure routes by deployment, not model. base_url = the
 		// resource subdomain (or full URL); model = deployment name;
 		// api_version = the required Azure version string.
-		prov := llm.NewAzure(key, raw.BaseURL, raw.Model, raw.APIVersion, raw.Model, maxTokens, timeout)
+		prov := azure.NewAzure(key, raw.BaseURL, raw.Model, raw.APIVersion, raw.Model, maxTokens, timeout)
 		prov.ContextWindow = raw.ContextWindow
 		Preconnect(raw.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
@@ -210,7 +216,7 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		if region == "" {
 			region = raw.BaseURL // legacy: people may put region in base_url
 		}
-		prov, err := llm.NewVertex(raw.ServiceAccountFile, raw.Project, region, model, maxTokens, timeout)
+		prov, err := vertex.NewVertex(raw.ServiceAccountFile, raw.Project, region, model, maxTokens, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", id, err)
 		}
@@ -232,7 +238,7 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		if region == "" {
 			region = raw.BaseURL
 		}
-		prov, err := llm.NewBedrock(key, secret, sessionTok, region, model, maxTokens, timeout)
+		prov, err := bedrock.NewBedrock(key, secret, sessionTok, region, model, maxTokens, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", id, err)
 		}

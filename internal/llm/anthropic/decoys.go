@@ -20,7 +20,7 @@
 //     dominate any single training sample's "tools" section.
 //   - No real tool names — collisions with actual metis tools would
 //     defeat both honest debugging and decoy plausibility.
-package llm
+package anthropic
 
 // clientSideDecoyTools returns the canned set of decoy tool definitions
 // for the wire-only field. Static (not random) so the same metis

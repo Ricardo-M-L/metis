@@ -1,4 +1,4 @@
-package llm
+package bedrock
 
 // AWS Bedrock Runtime — Anthropic Claude served on AWS. Uses the same
 // Anthropic Messages API body but with `anthropic_version` set to the
@@ -23,12 +23,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
+	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+type (
+	Request      = provider.Request
+	Response     = provider.Response
+	StreamReader = provider.StreamReader
+	StreamEvent  = provider.StreamEvent
+	ContentBlock = provider.ContentBlock
+	Message      = provider.Message
+)
+
+const (
+	RoleSystem    = provider.RoleSystem
+	RoleUser      = provider.RoleUser
+	RoleAssistant = provider.RoleAssistant
+	RoleTool      = provider.RoleTool
 )
 
 // Bedrock implements the Anthropic-on-Bedrock transport.
@@ -116,7 +136,7 @@ func (b *Bedrock) invokeURL(streaming bool) string {
 // dropped (Bedrock routes by URL) and anthropic_version set to
 // Bedrock's required value. Same approach as Vertex.
 func bedrockBody(req Request, maxTokens int) (map[string]any, error) {
-	a := toAnthropic(req, "", maxTokens)
+	a := anthropic.ToRequest(req, "", maxTokens)
 	buf, err := json.Marshal(a)
 	if err != nil {
 		return nil, err
@@ -156,8 +176,8 @@ func (b *Bedrock) Complete(ctx context.Context, req Request) (*Response, error) 
 		return nil, err
 	}
 
-	var ar anthropicResp
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	var ar anthropic.Resp
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := b.signedRequest(ctx, b.invokeURL(false), buf)
 		if err != nil {
 			return err
@@ -169,9 +189,9 @@ func (b *Bedrock) Complete(ctx context.Context, req Request) (*Response, error) 
 		defer resp.Body.Close()
 		rb, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("bedrock %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("bedrock %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
@@ -180,7 +200,7 @@ func (b *Bedrock) Complete(ctx context.Context, req Request) (*Response, error) 
 	if err != nil {
 		return nil, err
 	}
-	return fromAnthropic(ar), nil
+	return anthropic.FromResponse(ar), nil
 }
 
 // Stream uses the synchronous endpoint and synthesizes a one-event

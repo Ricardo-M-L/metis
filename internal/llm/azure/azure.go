@@ -1,4 +1,4 @@
-package llm
+package azure
 
 // Azure OpenAI Service. Same wire format as OpenAI but:
 //
@@ -26,6 +26,25 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/openai"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+type (
+	Request      = provider.Request
+	Response     = provider.Response
+	StreamReader = provider.StreamReader
+	Message      = provider.Message
+	ContentBlock = provider.ContentBlock
+)
+
+const (
+	RoleSystem    = provider.RoleSystem
+	RoleUser      = provider.RoleUser
+	RoleAssistant = provider.RoleAssistant
+	RoleTool      = provider.RoleTool
 )
 
 // Azure speaks Azure OpenAI's deployment-routed flavor of the OpenAI
@@ -133,7 +152,7 @@ func (a *Azure) Complete(ctx context.Context, req Request) (*Response, error) {
 	if err := a.preflight(); err != nil {
 		return nil, err
 	}
-	body := toOpenAI(req, a.Model, a.MaxTokens)
+	body := openai.ToRequest(req, a.Model, a.MaxTokens)
 	body.Stream = false
 
 	buf, err := json.Marshal(body)
@@ -141,8 +160,8 @@ func (a *Azure) Complete(ctx context.Context, req Request) (*Response, error) {
 		return nil, err
 	}
 
-	var or oaiResp
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	var or openai.Resp
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", a.chatURL(), bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -155,9 +174,9 @@ func (a *Azure) Complete(ctx context.Context, req Request) (*Response, error) {
 		defer resp.Body.Close()
 		rb, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("azure %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("azure %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
@@ -169,14 +188,14 @@ func (a *Azure) Complete(ctx context.Context, req Request) (*Response, error) {
 	if len(or.Choices) == 0 {
 		return nil, errors.New("azure: empty choices")
 	}
-	return fromOpenAIChoice(or.Choices[0], or.Usage), nil
+	return openai.FromChoice(or.Choices[0], or.Usage), nil
 }
 
 func (a *Azure) Stream(ctx context.Context, req Request) (StreamReader, error) {
 	if err := a.preflight(); err != nil {
 		return nil, err
 	}
-	body := toOpenAI(req, a.Model, a.MaxTokens)
+	body := openai.ToRequest(req, a.Model, a.MaxTokens)
 	body.Stream = true
 
 	buf, err := json.Marshal(body)
@@ -185,7 +204,7 @@ func (a *Azure) Stream(ctx context.Context, req Request) (StreamReader, error) {
 	}
 
 	var resp *http.Response
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", a.chatURL(), bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -198,9 +217,9 @@ func (a *Azure) Stream(ctx context.Context, req Request) (StreamReader, error) {
 		if resp.StatusCode >= 400 {
 			rb, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			httpErr := fmt.Errorf("azure %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("azure %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
@@ -209,5 +228,5 @@ func (a *Azure) Stream(ctx context.Context, req Request) (StreamReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newOpenAIStream(resp.Body), nil
+	return openai.NewStream(resp.Body), nil
 }

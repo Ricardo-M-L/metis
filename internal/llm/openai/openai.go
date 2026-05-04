@@ -1,4 +1,9 @@
-package llm
+// Package openai implements the OpenAI Chat Completions API
+// (api.openai.com/v1/chat/completions and OpenAI-compatible gateways:
+// DeepSeek, Together, Groq, Cerebras, MiniMax /v1, Ollama …). Used
+// directly when transport=openai_chat, and consumed by the azure
+// subpackage which runs the same wire format with deployment-routed URLs.
+package openai
 
 import (
 	"bufio"
@@ -12,6 +17,33 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+type (
+	Request      = provider.Request
+	Response     = provider.Response
+	StreamReader = provider.StreamReader
+	StreamEvent  = provider.StreamEvent
+	Message      = provider.Message
+	ContentBlock = provider.ContentBlock
+	ToolSpec     = provider.ToolSpec
+	Effort       = pubLLM.Effort
+)
+
+const (
+	RoleSystem    = provider.RoleSystem
+	RoleUser      = provider.RoleUser
+	RoleAssistant = provider.RoleAssistant
+	RoleTool      = provider.RoleTool
+
+	EffortDefault = pubLLM.EffortDefault
+	EffortLow     = pubLLM.EffortLow
+	EffortMedium  = pubLLM.EffortMedium
+	EffortHigh    = pubLLM.EffortHigh
 )
 
 var dbgOpenAI = os.Getenv("METIS_DEBUG_OPENAI") == "1"
@@ -33,7 +65,7 @@ type OpenAI struct {
 	httpClient    *http.Client
 }
 
-func NewOpenAI(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, temperature float64) *OpenAI {
+func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, temperature float64) *OpenAI {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
@@ -267,7 +299,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 	}
 
 	var or oaiResp
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -280,9 +312,9 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 		defer resp.Body.Close()
 		rb, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
@@ -310,7 +342,7 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 	}
 
 	var resp *http.Response
-	err = retryWithBackoff(ctx, 3, 0, func() error {
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
 		if err != nil {
 			return err
@@ -323,9 +355,9 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 		if resp.StatusCode >= 400 {
 			rb, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, truncate(string(rb), 500))
-			if isRetryableStatus(resp.StatusCode) {
-				return &RetryableError{Err: httpErr}
+			httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: httpErr}
 			}
 			return httpErr
 		}
