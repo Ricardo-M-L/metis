@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 	"io"
 	"net/http"
 	"net/url"
@@ -36,7 +37,7 @@ type Bedrock struct {
 	Model     string // e.g. "anthropic.claude-sonnet-4-5-20250514-v1:0" — Bedrock model ARN/id
 	MaxTokens int
 
-	creds      AWSCreds
+	creds      cloud.AWSCreds
 	httpClient *http.Client
 
 	ContextWindow int
@@ -85,7 +86,7 @@ func NewBedrock(accessKey, secretKey, sessionToken, region, model string, maxTok
 		Region:    region,
 		Model:     model,
 		MaxTokens: maxTokens,
-		creds: AWSCreds{
+		creds: cloud.AWSCreds{
 			AccessKeyID:     accessKey,
 			SecretAccessKey: secretKey,
 			SessionToken:    sessionToken,
@@ -139,7 +140,7 @@ func (b *Bedrock) signedRequest(ctx context.Context, urlStr string, payload []by
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
-	if err := SignV4(httpReq, payload, b.creds, b.Region, "bedrock", time.Now()); err != nil {
+	if err := cloud.SignV4(httpReq, payload, b.creds, b.Region, "bedrock", time.Now()); err != nil {
 		return nil, err
 	}
 	return httpReq, nil

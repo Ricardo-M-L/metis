@@ -2,7 +2,11 @@ package llm
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,7 +14,32 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 )
+
+// genTestKey is duplicated from internal/llm/cloud/gcp_test.go for
+// the transient state where vertex still lives in package llm but
+// uses cloud's ServiceAccountKey. Phase 2 moves vertex to its own
+// subpackage and this duplicate goes away.
+func genTestKey(t *testing.T) (*rsa.PrivateKey, *cloud.ServiceAccountKey) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	return priv, &cloud.ServiceAccountKey{
+		Type:        "service_account",
+		ClientEmail: "test-sa@example.iam.gserviceaccount.com",
+		PrivateKey:  string(pemBytes),
+		TokenURI:    "https://oauth2.googleapis.com/token",
+	}
+}
 
 // writeTestSAFile dumps a generated service-account JSON to a temp
 // file, returns its path. Lets us exercise the file-loading code path

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 )
 
 // TestSignV4_AuthorizationHeaderShape spot-checks the canonical
@@ -18,10 +20,10 @@ import (
 // covered by TestBedrock_E2E_RoundTrip below.
 func TestSignV4_AuthorizationHeaderShape(t *testing.T) {
 	r, _ := http.NewRequest("POST", "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke", nil)
-	creds := AWSCreds{AccessKeyID: "AKIATEST123", SecretAccessKey: "secret"}
+	creds := cloud.AWSCreds{AccessKeyID: "AKIATEST123", SecretAccessKey: "secret"}
 	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
 
-	if err := SignV4(r, []byte(`{}`), creds, "us-east-1", "bedrock", now); err != nil {
+	if err := cloud.SignV4(r, []byte(`{}`), creds, "us-east-1", "bedrock", now); err != nil {
 		t.Fatalf("SignV4: %v", err)
 	}
 
@@ -45,12 +47,12 @@ func TestSignV4_AuthorizationHeaderShape(t *testing.T) {
 
 func TestSignV4_AddsSecurityToken_WhenSessionToken(t *testing.T) {
 	r, _ := http.NewRequest("POST", "https://x.amazonaws.com/", nil)
-	creds := AWSCreds{
+	creds := cloud.AWSCreds{
 		AccessKeyID:     "AKIA",
 		SecretAccessKey: "s",
 		SessionToken:    "FQoGZXIvYXdzEAa...",
 	}
-	if err := SignV4(r, nil, creds, "us-east-1", "bedrock", time.Now()); err != nil {
+	if err := cloud.SignV4(r, nil, creds, "us-east-1", "bedrock", time.Now()); err != nil {
 		t.Fatalf("SignV4: %v", err)
 	}
 	if r.Header.Get("X-Amz-Security-Token") != "FQoGZXIvYXdzEAa..." {
@@ -60,7 +62,7 @@ func TestSignV4_AddsSecurityToken_WhenSessionToken(t *testing.T) {
 
 func TestSignV4_RejectsEmptyCreds(t *testing.T) {
 	r, _ := http.NewRequest("POST", "https://x.amazonaws.com/", nil)
-	err := SignV4(r, nil, AWSCreds{}, "us-east-1", "bedrock", time.Now())
+	err := cloud.SignV4(r, nil, cloud.AWSCreds{}, "us-east-1", "bedrock", time.Now())
 	if err == nil {
 		t.Fatal("expected error for empty creds")
 	}

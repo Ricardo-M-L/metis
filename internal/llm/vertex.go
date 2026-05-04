@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 	"io"
 	"net/http"
 	"os"
@@ -36,7 +37,7 @@ type Vertex struct {
 	Model       string
 	MaxTokens   int
 	httpClient  *http.Client
-	tokenSource *GCPTokenSource
+	tokenSource *cloud.GCPTokenSource
 
 	// ContextWindow override, same shape as the other providers.
 	ContextWindow int
@@ -67,7 +68,7 @@ func NewVertex(serviceAccountPath, project, region, model string, maxTokens int,
 	if err != nil {
 		return nil, fmt.Errorf("vertex: read service-account file %q: %w", serviceAccountPath, err)
 	}
-	key, err := LoadServiceAccount(data)
+	key, err := cloud.LoadServiceAccount(data)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +79,7 @@ func NewVertex(serviceAccountPath, project, region, model string, maxTokens int,
 		Model:       model,
 		MaxTokens:   maxTokens,
 		httpClient:  &http.Client{Timeout: timeout},
-		tokenSource: NewGCPTokenSource(key, ""),
+		tokenSource: cloud.NewGCPTokenSource(key, ""),
 	}, nil
 }
 

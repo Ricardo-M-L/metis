@@ -1,4 +1,9 @@
-package llm
+// Package cloud holds cross-provider auth + signing helpers — AWS
+// SigV4 (used by Bedrock) and GCP service-account → OAuth2 (used by
+// Vertex AI). Lives in its own package so future cloud-auth providers
+// (Cloudflare AI Gateway, Azure AAD device flow, …) can reuse the
+// signer without pulling in any provider-specific code.
+package cloud
 
 // Hand-rolled AWS Signature Version 4 signer. Just enough for Bedrock
 // Runtime's POST /model/{id}/invoke[-with-response-stream] — no

@@ -1,4 +1,4 @@
-package llm
+package cloud
 
 // Hand-rolled GCP service-account → OAuth2 access token flow. Mirrors
 // what google.golang.org/x/oauth2/google.JWTConfigFromJSON does, but
@@ -201,7 +201,7 @@ func (s *GCPTokenSource) Token(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("gcp token endpoint %d: %s", resp.StatusCode, truncate(string(body), 500))
+		return "", fmt.Errorf("gcp token endpoint %d: %s", resp.StatusCode, truncateForLog(string(body), 500))
 	}
 
 	var tr struct {
@@ -213,10 +213,23 @@ func (s *GCPTokenSource) Token(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("gcp token: decode response: %w", err)
 	}
 	if tr.AccessToken == "" {
-		return "", fmt.Errorf("gcp token: empty access_token in response: %s", truncate(string(body), 200))
+		return "", fmt.Errorf("gcp token: empty access_token in response: %s", truncateForLog(string(body), 200))
 	}
 
 	s.cached = tr.AccessToken
 	s.expiresAt = now.Add(time.Duration(tr.ExpiresIn) * time.Second)
 	return s.cached, nil
+}
+
+// truncateForLog clamps an error/response snippet so we never log
+// multi-MB GCP error pages verbatim. Duplicated locally rather than
+// pulled from internal/llm to avoid an upward import (cloud is meant
+// to be importable by every provider; if cloud needed something from
+// internal/llm root, internal/llm root would in turn need to import
+// cloud through providers, creating a cycle).
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...(truncated)"
 }
