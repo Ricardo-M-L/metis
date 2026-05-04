@@ -77,15 +77,64 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// previous reply got swallowed." Show a hint, leave the input
 	// alone so the user doesn't lose their prompt to a stray Enter.
 	if m.turnActive {
-		// Steering (Task #78): mid-turn user input is no longer dropped
-		// — it gets queued on the agent loop and folded into the next
-		// iteration's user message after the in-flight tool returns.
-		// claude-code parity. The textarea is reset so the user sees
-		// the steer was accepted.
+		// Steering (Task #78) + slash-during-steer (Task #87): mid-turn
+		// input is queued onto the agent loop and folded into the next
+		// iteration's user message. Slash classification:
+		//
+		//   - Destructive (/clear /new /quit /compact /undo /retry …)
+		//     refuse with hint — these would invalidate the running
+		//     turn or expect to BE the start of a turn.
+		//   - Custom prompt (~/.metis/commands/<name>.md):
+		//     resolve the template, SteerInject the resolved TEXT
+		//     (not the literal "/intro Chinese" string).
+		//   - Anything else (plain text, /cost, /tools, unknown slash):
+		//     SteerInject the literal text. Safe-info commands like
+		//     /cost don't open their overlay mid-turn in this MVP —
+		//     the model just sees them as text in the next iteration.
+		//     Fixing that requires running the signal-overlay path
+		//     without re-entering runTurnAsync, which is a separate
+		//     refactor.
 		raw := strings.TrimSpace(m.input.Value())
 		if raw == "" {
 			return m, nil
 		}
+
+		if strings.HasPrefix(raw, "/") && m.slash != nil {
+			handled, display, sig, _ := m.slash.Parse(raw)
+			if handled {
+				switch slash.ClassifyMidTurn(sig) {
+				case slash.MidTurnDestructive:
+					name, _, _ := strings.Cut(raw[1:], " ")
+					m.messages = append(m.messages, Message{
+						Role:      "info",
+						Content:   "(can't /" + name + " mid-turn — press Esc to cancel the running turn first)",
+						Timestamp: time.Now(),
+					})
+					m.input.Reset()
+					return m, nil
+				case slash.MidTurnCustom:
+					// Custom command's handler already templated the
+					// prompt into `display`. Steer THAT, not the
+					// literal `/intro Chinese` text.
+					if display == "" {
+						return m, nil
+					}
+					m.loop.SteerInject(display)
+					m.messages = append(m.messages, Message{
+						Role:      "info",
+						Content:   "(steered via " + slashName(raw) + ": " + display + ")",
+						Timestamp: time.Now(),
+					})
+					m.input.Reset()
+					return m, nil
+				}
+				// MidTurnSafe falls through to the literal-steer path
+				// below — same as plain text. Future work: route safe
+				// signals through their overlay handlers without re-
+				// entering runTurnAsync.
+			}
+		}
+
 		m.loop.SteerInject(raw)
 		m.messages = append(m.messages, Message{
 			Role:      "info",
@@ -499,4 +548,19 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// otherwise the "thinking" frame and elapsed timer freeze at 0s and the
 	// UI looks dead until the LLM replies.
 	return m, tickCmd
+}
+
+// slashName extracts the leading "/<name>" prefix from a raw input
+// line for use in user-facing log messages. "/intro Chinese" → "/intro".
+// Empty / non-slash input → empty string. Helper for Task #87
+// mid-turn slash dispatch.
+func slashName(raw string) string {
+	if !strings.HasPrefix(raw, "/") {
+		return ""
+	}
+	rest := raw[1:]
+	if i := strings.IndexAny(rest, " \t"); i >= 0 {
+		return "/" + rest[:i]
+	}
+	return "/" + rest
 }

@@ -254,13 +254,9 @@ func (c *Client) loadFromDisk() (Catalog, error) {
 }
 
 // TransportHint maps the catalog's `npm` field to one of metis's
-// internal transport names. Every metis-supported transport here has
-// a corresponding case in runtime/provider.go's BuildProvider.
-//
-// The hint is best-effort: providers whose npm package metis hasn't
-// implemented yet (e.g. @ai-sdk/amazon-bedrock) return "unsupported"
-// so the caller can render a friendly "supported in opencode but not
-// metis yet" message.
+// internal transport names. Every transport name here has a
+// corresponding case in runtime/provider.go's BuildProvider — keep
+// the two in sync.
 func TransportHint(npm string) string {
 	switch npm {
 	case "@ai-sdk/anthropic":
@@ -269,6 +265,12 @@ func TransportHint(npm string) string {
 		return "openai_chat"
 	case "@ai-sdk/google":
 		return "gemini_native"
+	case "@ai-sdk/azure":
+		return "azure_openai"
+	case "@ai-sdk/google-vertex", "@ai-sdk/google-vertex/anthropic":
+		return "vertex_anthropic"
+	case "@ai-sdk/amazon-bedrock":
+		return "bedrock_anthropic"
 	default:
 		return "unsupported"
 	}

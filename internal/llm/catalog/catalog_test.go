@@ -199,14 +199,16 @@ func TestRefresh_ForcesNetwork(t *testing.T) {
 // table — keep it in sync.
 func TestTransportHint(t *testing.T) {
 	cases := map[string]string{
-		"@ai-sdk/anthropic":           "anthropic_messages",
-		"@ai-sdk/openai":              "openai_chat",
-		"@ai-sdk/openai-compatible":   "openai_chat",
-		"@ai-sdk/google":              "gemini_native",
-		"@ai-sdk/amazon-bedrock":      "unsupported",
-		"@ai-sdk/azure":               "unsupported",
-		"@openrouter/ai-sdk-provider": "unsupported",
-		"":                            "unsupported",
+		"@ai-sdk/anthropic":               "anthropic_messages",
+		"@ai-sdk/openai":                  "openai_chat",
+		"@ai-sdk/openai-compatible":       "openai_chat",
+		"@ai-sdk/google":                  "gemini_native",
+		"@ai-sdk/azure":                   "azure_openai",
+		"@ai-sdk/google-vertex":           "vertex_anthropic",
+		"@ai-sdk/google-vertex/anthropic": "vertex_anthropic",
+		"@ai-sdk/amazon-bedrock":          "bedrock_anthropic",
+		"@openrouter/ai-sdk-provider":     "unsupported",
+		"":                                "unsupported",
 	}
 	for npm, want := range cases {
 		got := TransportHint(npm)

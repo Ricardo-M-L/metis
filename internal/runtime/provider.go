@@ -189,7 +189,62 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		prov := llm.NewGemini(key, raw.BaseURL, model, maxTokens, timeout, 0)
 		Preconnect(raw.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
+	case "azure_openai", "azure":
+		// Azure routes by deployment, not model. base_url = the
+		// resource subdomain (or full URL); model = deployment name;
+		// api_version = the required Azure version string.
+		prov := llm.NewAzure(key, raw.BaseURL, raw.Model, raw.APIVersion, raw.Model, maxTokens, timeout)
+		prov.ContextWindow = raw.ContextWindow
+		Preconnect(raw.BaseURL)
+		return &ProviderBuild{Provider: prov, Model: model}, nil
+	case "vertex_anthropic", "vertex":
+		// Vertex needs a GCP service-account JSON file path + project
+		// + region. The model id goes through normally.
+		if raw.ServiceAccountFile == "" {
+			return nil, fmt.Errorf("provider %q: vertex transport requires service_account_file", id)
+		}
+		if raw.Project == "" {
+			return nil, fmt.Errorf("provider %q: vertex transport requires project", id)
+		}
+		region := raw.Region
+		if region == "" {
+			region = raw.BaseURL // legacy: people may put region in base_url
+		}
+		prov, err := llm.NewVertex(raw.ServiceAccountFile, raw.Project, region, model, maxTokens, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", id, err)
+		}
+		prov.ContextWindow = raw.ContextWindow
+		return &ProviderBuild{Provider: prov, Model: model}, nil
+	case "bedrock_anthropic", "bedrock":
+		// Bedrock: api_key_env → AWS_ACCESS_KEY_ID (or env fallback);
+		// secret_key_env → AWS_SECRET_ACCESS_KEY; session_token_env
+		// for STS-issued creds; region in base_url or AWS_REGION env.
+		secret := ""
+		if raw.SecretKeyEnv != "" {
+			secret = osGetenv(raw.SecretKeyEnv)
+		}
+		sessionTok := ""
+		if raw.SessionTokenEnv != "" {
+			sessionTok = osGetenv(raw.SessionTokenEnv)
+		}
+		region := raw.Region
+		if region == "" {
+			region = raw.BaseURL
+		}
+		prov, err := llm.NewBedrock(key, secret, sessionTok, region, model, maxTokens, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", id, err)
+		}
+		prov.ContextWindow = raw.ContextWindow
+		return &ProviderBuild{Provider: prov, Model: model}, nil
 	default:
-		return nil, fmt.Errorf("provider %q: unknown transport %q (want anthropic_messages | openai_chat | gemini_native)", id, raw.Transport)
+		return nil, fmt.Errorf("provider %q: unknown transport %q (want anthropic_messages | openai_chat | gemini_native | azure_openai | vertex_anthropic | bedrock_anthropic)", id, raw.Transport)
 	}
 }
+
+// osGetenv is a thin wrapper around os.Getenv kept here so the
+// imports section doesn't need to change every time we add a new
+// cloud-auth field. (We could just inline os.Getenv calls — kept
+// the helper for symmetry.)
+func osGetenv(name string) string { return os.Getenv(name) }

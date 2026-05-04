@@ -231,12 +231,46 @@ type ProviderOpenAI struct {
 }
 
 type ProviderRaw struct {
-	Transport   string `toml:"transport"` // anthropic_messages | openai_chat
+	// Transport picks the wire format. Recognized values:
+	//   anthropic_messages | openai_chat | gemini_native     (HTTP+API key)
+	//   azure_openai      | vertex_anthropic | bedrock_anthropic  (cloud auth)
+	Transport   string `toml:"transport"`
 	APIKeyEnv   string `toml:"api_key_env"`
 	BaseURL     string `toml:"base_url"`
 	Model       string `toml:"model"`
 	MaxTokens   int    `toml:"max_tokens"`
 	TimeoutSecs int    `toml:"timeout_seconds"`
+
+	// ContextWindow override. Required for cloud-auth providers
+	// (Azure / Vertex / Bedrock) where the metis side can't infer
+	// from the model name (Azure uses deployment names; Bedrock model
+	// ids look like "anthropic.claude-…-v1:0").
+	ContextWindow int `toml:"context_window"`
+
+	// Cloud-auth profile fields. Only consumed by the matching
+	// transport — leaving any of these empty for non-cloud profiles
+	// is fine.
+
+	// Azure (azure_openai): the API version query string Azure
+	// requires on every request (e.g. "2024-08-01-preview"). The
+	// resource subdomain goes in BaseURL; the deployment name goes
+	// in Model.
+	APIVersion string `toml:"api_version"`
+
+	// AWS Bedrock (bedrock_anthropic): the region and the
+	// secret-half-credentials. Access key id flows through APIKeyEnv;
+	// secret access key flows through SecretKeyEnv; optional STS
+	// session token flows through SessionTokenEnv. Region is in
+	// BaseURL because Bedrock has no customer-controllable URL.
+	SecretKeyEnv    string `toml:"secret_key_env"`
+	SessionTokenEnv string `toml:"session_token_env"`
+
+	// GCP Vertex (vertex_anthropic): the path to the service-account
+	// JSON key file and the GCP project + region. Region goes in
+	// BaseURL; project is here.
+	ServiceAccountFile string `toml:"service_account_file"`
+	Project            string `toml:"project"`
+	Region             string `toml:"region"`
 }
 
 type Permission struct {

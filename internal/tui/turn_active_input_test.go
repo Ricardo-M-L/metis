@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
 // TestTurnActive_AcceptsTyping — pre-fix: handleKey gated all keys
@@ -118,5 +120,95 @@ func TestTurnActive_MouseWheelScrolls(t *testing.T) {
 
 	if m.chatList.AtBottom() {
 		t.Errorf("MouseWheelUp during turnActive should leave AtBottom() = false; still at bottom")
+	}
+}
+
+// TestTurnActive_DestructiveSlashRefused — Task #87. /clear typed
+// mid-turn must refuse with the "press Esc to cancel" hint. Without
+// this guard the literal text "/clear" would just go into steerBuf,
+// confusing the user who clearly wanted to actually clear.
+func TestTurnActive_DestructiveSlashRefused(t *testing.T) {
+	m := newSlashTestModel(t)
+	// Set turnActive BEFORE typing /clear — otherwise the live-fire
+	// shortcut at keybind_main.go (which now respects turnActive)
+	// would still fire during typing in the test, since the test
+	// hasn't yet set the flag. Real-world usage: user starts a turn
+	// (turnActive=true), then types /clear; the typing must not
+	// trigger the shortcut.
+	m.turnActive = true
+	for _, r := range "/clear" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	beforeMsgs := len(m.messages)
+
+	pressEnter(t, m)
+
+	// Look for the refusal hint.
+	found := false
+	for i := beforeMsgs; i < len(m.messages); i++ {
+		if strings.Contains(m.messages[i].Content, "can't /clear mid-turn") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("destructive /clear mid-turn must surface refusal hint; messages[%d:]=%+v", beforeMsgs, m.messages[beforeMsgs:])
+	}
+	// Must NOT have been steered.
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Errorf("destructive slash must NOT reach steerBuf; got %q", got)
+	}
+}
+
+// TestTurnActive_CustomSlashResolvesAndSteers — Task #87. A custom
+// command typed mid-turn should resolve its template and SteerInject
+// the resolved TEXT, not the literal "/intro Chinese" string.
+func TestTurnActive_CustomSlashResolvesAndSteers(t *testing.T) {
+	m := newSlashTestModel(t)
+	// Inject a custom command into the registry directly (mimics what
+	// LoadCustomCommands does at startup).
+	m.slash.Register(slash.Cmd{
+		Name:        "intro",
+		Description: "test custom",
+		Handler: func(args string) (string, slash.Signal) {
+			return "Briefly introduce yourself in " + args + " in one sentence.", slash.SignalCustomPrompt
+		},
+	})
+	m.turnActive = true
+	for _, r := range "/intro Chinese" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+
+	pressEnter(t, m)
+
+	// SteerBuf should hold the RESOLVED template, not the literal "/intro Chinese".
+	steered := m.loop.SteerInjectDrainForTest()
+	if !strings.Contains(steered, "Briefly introduce yourself in Chinese") {
+		t.Errorf("custom slash should steer resolved template; got %q", steered)
+	}
+	if strings.Contains(steered, "/intro") {
+		t.Errorf("steered text must be RESOLVED template, not literal slash; got %q", steered)
+	}
+}
+
+// TestTurnActive_UnknownSlashFallsThroughToSteer — unknown /<command>
+// goes through the steer path as literal text. This is the safe
+// default — user might be typing actual chat content that happens to
+// start with a slash.
+func TestTurnActive_UnknownSlashFallsThroughToSteer(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	for _, r := range "/notarealcommand" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+
+	pressEnter(t, m)
+
+	steered := m.loop.SteerInjectDrainForTest()
+	// The slash registry's Parse returns "unknown: /<name>" for
+	// unrecognized commands with handled=true, sig=SignalNone. That
+	// counts as MidTurnSafe → falls through to literal SteerInject.
+	if steered != "/notarealcommand" {
+		t.Errorf("unknown slash should fall through to literal steer; got %q", steered)
 	}
 }
