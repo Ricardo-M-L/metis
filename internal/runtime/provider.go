@@ -131,5 +131,65 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		Preconnect(cfg.Provider.Gemini.BaseURL)
 		return &ProviderBuild{Provider: prov, Model: model}, nil
 	}
-	return nil, fmt.Errorf("provider %q not supported in this build (try 'anthropic', 'openai', or 'gemini')", name)
+	// Custom provider profiles. Users define unlimited entries under
+	// [provider.custom.<id>] in config.toml, picking a transport
+	// (anthropic_messages | openai_chat | gemini_native) per profile.
+	// This is what lets the same upstream service (e.g. MiniMax) be
+	// configured twice with different wire formats — useful when the
+	// vendor exposes both an Anthropic-compatible and OpenAI-compatible
+	// endpoint and one of them has a bug the other doesn't.
+	if raw, ok := cfg.Provider.Custom[name]; ok {
+		return buildCustomProvider(cfg, name, raw, modelOverride)
+	}
+	known := []string{"anthropic", "openai", "gemini"}
+	for k := range cfg.Provider.Custom {
+		known = append(known, k)
+	}
+	return nil, fmt.Errorf("provider %q not configured. Known profiles: %s", name, strings.Join(known, ", "))
+}
+
+// buildCustomProvider routes a custom-profile entry through the
+// transport its `transport` field names. Defaults match the per-
+// transport profile's defaults (so a barebones [provider.custom.foo]
+// with just transport+base_url+api_key_env+model works).
+func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, modelOverride string) (*ProviderBuild, error) {
+	key, err := cfg.ResolveAPIKey(id)
+	if err != nil {
+		return nil, err
+	}
+	model := modelOverride
+	if model == "" {
+		model = raw.Model
+	}
+	timeout := time.Duration(raw.TimeoutSecs) * time.Second
+	if raw.TimeoutSecs == 0 {
+		timeout = 120 * time.Second
+	}
+	maxTokens := raw.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 8192
+	}
+	switch raw.Transport {
+	case "anthropic_messages", "anthropic", "":
+		// Empty transport defaults to anthropic_messages — the most
+		// common case for "I'm pointing at an Anthropic-format gateway"
+		// (MiniMax, OpenRouter, yunwu, …). Errors users hit if their
+		// gateway is actually OpenAI-format will surface as 4xx on the
+		// first call, which is recoverable; vs picking openai_chat as
+		// the default would silently break the historically common
+		// anthropic-compat use case.
+		prov := llm.NewAnthropic(key, raw.BaseURL, model, maxTokens, timeout, "")
+		Preconnect(raw.BaseURL)
+		return &ProviderBuild{Provider: prov, Model: model}, nil
+	case "openai_chat", "openai":
+		prov := llm.NewOpenAI(key, raw.BaseURL, model, maxTokens, timeout, 0)
+		Preconnect(raw.BaseURL)
+		return &ProviderBuild{Provider: prov, Model: model}, nil
+	case "gemini_native", "gemini":
+		prov := llm.NewGemini(key, raw.BaseURL, model, maxTokens, timeout, 0)
+		Preconnect(raw.BaseURL)
+		return &ProviderBuild{Provider: prov, Model: model}, nil
+	default:
+		return nil, fmt.Errorf("provider %q: unknown transport %q (want anthropic_messages | openai_chat | gemini_native)", id, raw.Transport)
+	}
 }

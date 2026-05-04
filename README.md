@@ -146,6 +146,33 @@ model = "gpt-4o"
 api_key_env = "GEMINI_API_KEY"
 model = "gemini-2.5-pro"
 
+# Custom profiles — unlimited, each names its own transport so the same
+# upstream service can be configured under multiple wire formats. Useful
+# when a vendor exposes both Anthropic-compatible and OpenAI-compatible
+# endpoints (MiniMax, OpenRouter, GLM, …).
+[provider.custom.minimax-openai]
+transport   = "openai_chat"            # anthropic_messages | openai_chat | gemini_native
+api_key_env = "MINIMAX_API_KEY"
+base_url    = "https://api.minimaxi.com/v1"
+model       = "MiniMax-M2.7"
+context_window = 192000
+
+[provider.custom.deepseek]
+transport   = "openai_chat"
+api_key_env = "DEEPSEEK_API_KEY"
+base_url    = "https://api.deepseek.com"
+model       = "deepseek-chat"
+context_window = 1000000
+
+# Switch profiles at run time:
+#   metis -p minimax-openai chat
+#   metis -p deepseek run "..."
+
+# Don't know the right base_url / model name / env var? Run:
+#   metis models                      # list 117 providers from models.dev
+#   metis models deepseek             # all DeepSeek models + cost + context
+#   metis models deepseek deepseek-chat  # ready-to-paste config snippet
+
 [permission]
 mode = "auto"
 [[permission.allow]]

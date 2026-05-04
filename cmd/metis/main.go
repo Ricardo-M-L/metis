@@ -64,6 +64,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdConfig(args[1:])
 	case "tools":
 		return cmdTools()
+	case "models":
+		return cmdModels(ctx, args[1:])
 	case "sessions":
 		return cmdSessions(args[1:])
 	case "skills":
@@ -107,6 +109,9 @@ Usage:
   metis config show     Print effective config + which files were read
   metis config init     Write a starter config to ~/.metis/config.toml
   metis tools           List available tools
+  metis models          List LLM providers + models from models.dev catalog
+  metis models <p>      Show one provider's models + capabilities + cost
+  metis models <p> <m>  Deep-dive on a model + generate config.toml snippet
   metis sessions list   List recent saved sessions
   metis sessions export <id>      Print a session's JSONL to stdout
   metis sessions import [--id ID] Read JSONL from stdin and create a new session
