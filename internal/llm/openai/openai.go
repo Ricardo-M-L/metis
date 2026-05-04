@@ -132,6 +132,26 @@ type oaiMessage struct {
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 	Name       string        `json:"name,omitempty"`
+
+	// ReasoningContent is Moonshot/Kimi's "thinking" extension to the
+	// OpenAI Chat Completions wire format. When `kimi-k2-thinking-*`
+	// is in play, Moonshot's API REQUIRES that any assistant message
+	// containing tool_calls also carry a reasoning_content field —
+	// otherwise the next turn 400s with
+	// "thinking is enabled but reasoning_content is missing in
+	// assistant tool call message at index N".
+	//
+	// Pointer type so nil omits the JSON key entirely; an empty
+	// string emits `"reasoning_content": ""`. We only set non-nil on
+	// assistant tool-call messages — that's the only path Moonshot
+	// validates, and other OpenAI-compatible providers ignore unknown
+	// keys so it doesn't break OpenAI / DeepSeek / Together / Groq.
+	//
+	// Future: extend the Anthropic + OpenAI stream parsers to capture
+	// thinking_delta / reasoning_content_delta as a "thinking"
+	// ContentBlock type, then this field would round-trip the model's
+	// actual chain of thought instead of an empty string. Tracked.
+	ReasoningContent *string `json:"reasoning_content,omitempty"`
 }
 
 type oaiReq struct {
@@ -235,6 +255,18 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 				}
 			}
 			am.Content = text.String()
+			// Moonshot/Kimi thinking-tier models reject assistant
+			// tool-call messages that lack reasoning_content. Set it
+			// to empty (the field is required-present, not required-
+			// non-empty) so the next turn doesn't 400. Other
+			// OpenAI-compatible providers ignore the field. Once we
+			// add a "thinking" ContentBlock type and capture model
+			// reasoning incoming, this can carry the actual chain of
+			// thought back to the model on the next round-trip.
+			if len(am.ToolCalls) > 0 {
+				empty := ""
+				am.ReasoningContent = &empty
+			}
 			out.Messages = append(out.Messages, am)
 		}
 	}
