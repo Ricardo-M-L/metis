@@ -356,6 +356,28 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	// the dim grey placeholder text. The terminal's own cursor remains
 	// at the correct row/col via tea.View bookkeeping.
 	ti.SetVirtualCursor(false)
+	// Strip the cursor-line background highlight ONLY. bubbles/v2
+	// textarea's default CursorLine style is `Background(ANSI 0)` in
+	// dark terminals (textarea.go:400) which iTerm2 renders as a deep-
+	// blue band. We can't replace CursorLine with an empty style: the
+	// placeholder render path (placeholderView, textarea.go:1530-1533)
+	// uses CursorLine as the line wrapper for the FIRST placeholder
+	// row, so a fully-empty CursorLine breaks placeholder layout (the
+	// width-padding `gap` falls through unstyled and bubbletea v2's
+	// renderer treats the unstyled trailing whitespace as a separate
+	// line region — that's why the prior naïve override produced a
+	// duplicate placeholder strip below the input).
+	//
+	// UnsetBackground keeps Inline/Foreground/etc but drops the
+	// background color so the row blends with the surrounding chrome.
+	{
+		ts := ti.Styles()
+		ts.Focused.CursorLine = ts.Focused.CursorLine.UnsetBackground()
+		ts.Focused.CursorLineNumber = ts.Focused.CursorLineNumber.UnsetBackground()
+		ts.Blurred.CursorLine = ts.Blurred.CursorLine.UnsetBackground()
+		ts.Blurred.CursorLineNumber = ts.Blurred.CursorLineNumber.UnsetBackground()
+		ti.SetStyles(ts)
+	}
 	// SetPromptFunc lets textarea handle the per-line prompt itself —
 	// "> " on the first row, "  " on continuation rows. Doing this in
 	// textarea (instead of post-processing its View() output) avoids
@@ -450,17 +472,31 @@ func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *sessi
 	if forceBanner {
 		m.firstRender = true
 	}
-	// Hand the early-input capture (started by cmdChat in main.go before
-	// model construction) to bubbletea: any keys typed during the cold
-	// start window get prepended to the live input stream so they're
-	// not lost. Falls through to os.Stdin when no early-input was set.
+	// Early-input forwarding via tea.WithInput is currently disabled.
+	// bubbletea v2.0.6 (alpha) does not switch the terminal into raw
+	// mode when a custom io.Reader is supplied via WithInput — it
+	// only does that for its default stdin path. With a custom reader
+	// the terminal stays canonical/echo, so typed characters are
+	// echoed straight to the cursor by the terminal itself instead
+	// of reaching textarea, and bubbletea sees nothing until Enter.
+	// We therefore drop the cold-start keystroke buffer; the worst
+	// case is the user loses ≤100 ms of pre-typed input. Live typing
+	// after bubbletea starts is unaffected. Re-enable when v2 either
+	// raw-modes custom readers or exposes a separate early-input API.
 	opts := []tea.ProgramOption{tea.WithContext(ctx)}
-	if reader := earlyInputReader; reader != nil {
-		opts = append(opts, tea.WithInput(reader))
-	}
+	_ = earlyInputReader
 	// v2: WithAltScreen / WithMouseCellMotion options are gone — those
 	// terminal modes are now declared per-frame in View() via
 	// tea.View.AltScreen and tea.View.MouseMode. See tui_render.go.
+	//
+	// Snapshot termios BEFORE bubbletea takes over so the deferred
+	// resetTerminal can restore exactly the state the shell was in.
+	// bubbletea v2.0.6's Quit cleanup occasionally misses kitty-
+	// keyboard disable, leaving Ctrl+C echoing as ^[[99;5u in the
+	// shell — the deferred reset is the bullet-proof fallback.
+	saved := snapshotTerminal()
+	defer resetTerminal(saved)
+
 	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
 	return err

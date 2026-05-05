@@ -67,13 +67,20 @@ func (m *Model) View() tea.View {
 	defer m.renderCache.RecordView()
 
 	// chatView wraps a content string with the metis-standard view
-	// flags: AltScreen on (full-screen TUI), CellMotion mouse so wheel
-	// + clicks reach Update(). The exception is copyMode below which
-	// returns AltScreen=false to let users mouse-select scrollback.
+	// flags. AltScreen on for the full-screen TUI surface; mouse mode
+	// stays None because bubbletea v2.0.6 (alpha) does not reliably
+	// consume the SGR mouse reports the terminal sends back when
+	// CellMotion is enabled — under drag/hover the raw `^[[<0;col;rowM`
+	// sequences leak onto the screen, garbling the input box and
+	// pushing the prompt onto a new line. Losing wheel scroll inside
+	// the TUI is a much smaller regression than a broken prompt; users
+	// can still PgUp/PgDown via keys, and copyMode below already
+	// handles "let me mouse-select scrollback" by exiting AltScreen.
+	// Re-enable when bubbletea v2 ships a stable mouse pipeline.
 	chatView := func(content string) tea.View {
 		v := tea.NewView(content)
 		v.AltScreen = true
-		v.MouseMode = tea.MouseModeCellMotion
+		v.MouseMode = tea.MouseModeNone
 		return v
 	}
 
