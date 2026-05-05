@@ -155,11 +155,16 @@ body`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "**code-review**") {
-		t.Errorf("missing skill listing: %s", out)
+	// CR-B: output is XML now. Each skill becomes a <skill>...</skill>
+	// element wrapped in <available_skills>.
+	if !strings.Contains(out, "<available_skills>") {
+		t.Errorf("missing XML wrapper: %s", out)
 	}
-	if !strings.Contains(out, "use when: PR opened") {
-		t.Errorf("when_to_use hint missing: %s", out)
+	if !strings.Contains(out, "<name>code-review</name>") {
+		t.Errorf("missing <name>code-review</name>: %s", out)
+	}
+	if !strings.Contains(out, "<when_to_use>PR opened</when_to_use>") {
+		t.Errorf("when_to_use tag missing: %s", out)
 	}
 }
 

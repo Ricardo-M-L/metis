@@ -46,6 +46,41 @@ type Skill struct {
 	// skill on its own without the user having to /skill X.
 	WhenToUse string `json:"when_to_use,omitempty" yaml:"when_to_use,omitempty"`
 
+	// DontUseWhen is the negative selector — "do NOT pick this skill
+	// when ...". Mirrors claude-code's three-section frontmatter shape
+	// (description / when_to_use / dont_use_when). Empirically the LLM
+	// confuses similarly-named skills (e.g. "git-rebase" vs
+	// "git-cherry-pick") more often than it picks none — telling it
+	// when NOT to use a skill is higher-signal than another positive
+	// description.
+	DontUseWhen string `json:"dont_use_when,omitempty" yaml:"dont_use_when,omitempty"`
+
+	// UserOnly marks a skill that the LLM is NOT allowed to invoke on
+	// its own — only a user-typed `/skill X` triggers it. Right for
+	// destructive / out-of-band operations the model shouldn't reach
+	// for spontaneously: `git-rewrite-history`, `prod-deploy`, etc.
+	// Mirrors claude-code's user-invocable concept (negated: there
+	// the flag means "model can pick on its own"; here we use the
+	// inverse so the safe default is LLM-pickable).
+	UserOnly bool `json:"user_only,omitempty" yaml:"user_only,omitempty"`
+
+	// ActivateOn restricts when this skill appears in the system
+	// prompt to working dirs whose path matches one of these patterns.
+	// Empty list = always active (legacy behaviour).
+	//
+	// Patterns are doublestar globs evaluated against the absolute
+	// cwd path. Examples:
+	//   - "**/frontend/**"     — only when cwd is somewhere under a
+	//                            "frontend" directory
+	//   - "**/*.go-project"    — only when cwd ends in .go-project
+	//   - "/Users/*/work/**"   — under any user's work tree
+	//
+	// Mirrors claude-code's conditional skill activation
+	// (loadSkillsDir.ts: `activateConditionalSkillsForPaths`). The
+	// LLM doesn't see frontend skills in a backend repo, which both
+	// saves tokens and prevents wrong-skill picks.
+	ActivateOn []string `json:"activate_on,omitempty" yaml:"activate_on,omitempty"`
+
 	// ModelOverride pins a specific model id for this skill (e.g. force
 	// claude-opus for a code-review skill even if the session is using a
 	// faster model). Empty = use the session model.
@@ -64,7 +99,58 @@ type Skill struct {
 	// Source records where this skill came from ("local", a github URL,
 	// a custom registry id) so `metis skills info` can show provenance.
 	Source string `json:"source,omitempty" yaml:"source,omitempty"`
+
+	// Prerequisites declares what the host environment must provide for
+	// this skill to be usable. Loader checks these at registration time
+	// and surfaces missing items via Skill.Available() — the LLM sees
+	// "skill X unavailable: needs `kubectl`" instead of failing during
+	// the actual tool call. Mirrors hermes-agent's frontmatter
+	// `prerequisites.commands` / `required_environment_variables`
+	// (optional-skills/*/SKILL.md).
+	Prerequisites *Prerequisites `json:"prerequisites,omitempty" yaml:"prerequisites,omitempty"`
+
+	// TrustLevel records the loader's posture toward this skill's
+	// content. Set by the loader when registering, NOT authoritative
+	// from the manifest itself (a community skill claiming "builtin"
+	// trust must not be honoured). One of:
+	//   "builtin"   — shipped in the metis repo (highest)
+	//   "trusted"   — installed from an allowlisted source
+	//   "community" — third-party, not vetted (lowest; UI shows warning)
+	//   "user"      — written by the local user (under ~/.metis/skills/)
+	//   "project"   — local to this repo (under .metis/skills/)
+	// Mirrors hermes-agent's tools/skills_hub.py:trust_level_for().
+	TrustLevel string `json:"trust_level,omitempty" yaml:"trust_level,omitempty"`
 }
+
+// Prerequisites describes what the host must provide for a skill to be
+// usable. Both fields are optional; nil/empty means "no requirements".
+//
+// Wire example:
+//
+//	prerequisites:
+//	  commands: [kubectl, helm]
+//	  env_vars: [KUBECONFIG]
+//	  files:    [~/.kube/config]
+//
+// Loader resolves these at register time:
+//   - commands — looks up via PATH (exec.LookPath)
+//   - env_vars — checks os.Getenv(name) != ""
+//   - files    — checks os.Stat(name) exists
+type Prerequisites struct {
+	Commands []string `json:"commands,omitempty" yaml:"commands,omitempty"`
+	EnvVars  []string `json:"env_vars,omitempty"  yaml:"env_vars,omitempty"`
+	Files    []string `json:"files,omitempty"    yaml:"files,omitempty"`
+}
+
+// Trust level constants. String form is what gets serialized so manifests
+// stay human-readable.
+const (
+	TrustBuiltin   = "builtin"
+	TrustTrusted   = "trusted"
+	TrustUser      = "user"
+	TrustProject   = "project"
+	TrustCommunity = "community"
+)
 
 // Source fetches a skill manifest by name. Local filesystem is one such
 // implementation; remote registries (GitHub, https URLs, internal package

@@ -34,11 +34,13 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
-const defaultSystem = `You are metis, a fast, local-first agent CLI.
-You assist with software engineering tasks. You have access to tools that
-let you read/write files, search the codebase, run shell commands, and
-fetch URLs. Prefer concrete actions over speculation. Be terse. When you
-finish a task, summarize in one sentence.`
+// defaultSystem is the embedded base system prompt. The actual text
+// lives in internal/runtime/prompts/base.md so it diffs as plain
+// markdown and can be edited without recompiling string literals.
+// This package-level var is kept for backward-compat with the
+// pre-embed call sites; new code should call rtpkg.DefaultBasePrompt()
+// directly.
+var defaultSystem = rtpkg.DefaultBasePrompt()
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -347,12 +349,23 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// tool maintained its own ~/.metis/memories/*.md fork, never reaching
 	// BuildContext (the 2026-04-30 audit disconnect bug).
 	memoryMgr := rtpkg.BuildMemoryManager(cfg)
+	// MinimalSystem is the trimmed prompt the Agent tool's sub-agents
+	// run with — base + env, no <project_context>, no addendum. The
+	// parent loop's full assembled `system` already saw those, so a
+	// sub-agent inheriting them would just re-pay the tokens for
+	// information it doesn't need at its narrower scope. Mirrors
+	// openclaw's "minimal mode" sub-agent prompt.
+	minimalSystem := rtpkg.AssembleSystemPromptWithOptions(
+		rtpkg.DefaultBasePrompt(),
+		rtpkg.AssembleOptions{Minimal: true},
+	)
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
 		Cfg:             cfg,
 		Gate:            gate,
 		Provider:        prov,
 		Model:           model,
 		System:          system,
+		MinimalSystem:   minimalSystem,
 		ChannelRegistry: chReg,
 		DefaultPlatform: cfg.Channels.DefaultPlatform,
 		CronService:     cronSvc,
@@ -1206,10 +1219,31 @@ func cmdSkills(args []string) error {
 	case "list":
 		return listBuiltInSkills()
 	case "install":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: metis skills install <name> | <owner>/<repo>:<name>")
+		// `metis skills install [--optional] <name>` — when --optional
+		// is set the manifest lands in ~/.metis/optional-skills/
+		// instead of ~/.metis/skills/, marking it as TrustTrusted in
+		// the loader (between bundled and user). Mirrors hermes'
+		// `hermes skills install --source official`.
+		optional := false
+		ref := ""
+		for _, a := range args[1:] {
+			switch a {
+			case "--optional", "-o":
+				optional = true
+			default:
+				if ref == "" {
+					ref = a
+				}
+			}
 		}
-		return installSkillUnified(args[1], cfg.Session.SkillDir)
+		if ref == "" {
+			return fmt.Errorf("usage: metis skills install [--optional] <name> | <owner>/<repo>:<name>")
+		}
+		dir := cfg.Session.SkillDir
+		if optional {
+			dir = filepath.Join(filepath.Dir(cfg.Session.SkillDir), "optional-skills")
+		}
+		return installSkillUnified(ref, dir)
 	case "info":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: metis skills info <name>")

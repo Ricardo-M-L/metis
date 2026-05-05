@@ -80,7 +80,7 @@ body
 		}
 	}
 
-	layer := dirLayer("test", 1, dir)
+	layer := dirLayer("test", 1, dir, "")
 	skills, err := layer.Scan()
 	if err != nil {
 		t.Fatalf("scan: %v", err)

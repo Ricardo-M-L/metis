@@ -149,14 +149,15 @@ type anthropicMessage struct {
 }
 
 type anthropicContent struct {
-	Type      string         `json:"type"`
-	Text      string         `json:"text,omitempty"`
-	ID        string         `json:"id,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Input     map[string]any `json:"input,omitempty"`
-	ToolUseID string         `json:"tool_use_id,omitempty"`
-	Content   any            `json:"content,omitempty"` // string or []block in tool_result
-	IsError   bool           `json:"is_error,omitempty"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text,omitempty"`
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+	Input        map[string]any         `json:"input,omitempty"`
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`
+	Content      any                    `json:"content,omitempty"` // string or []block in tool_result
+	IsError      bool                   `json:"is_error,omitempty"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 // anthropicCacheControl marks a tool / system block as a prompt-cache
@@ -347,23 +348,105 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 		}
 		out.Messages = append(out.Messages, am)
 	}
+	// Last user message cache (CC-B): mark the LAST content block of
+	// the LAST user message with cache_control. The next turn's
+	// request will hit cache for everything UP TO this point, so a
+	// short follow-up question only re-bills the new user text. The
+	// API allows up to 4 cache_control markers — we now use:
+	//
+	//   1. last tool                  (above)
+	//   2. system static prefix       (buildSystemBlocks)
+	//   3. system addendum            (buildSystemBlocks, optional)
+	//   4. last user message          (here)
+	//
+	// claude-code's services/api/claude.ts has the same structure.
+	// Tool-using turns specifically benefit because the long
+	// tool_result blocks become part of the cached prefix on the
+	// follow-up.
+	if n := len(out.Messages); n > 0 {
+		// Walk backwards to the last "user" message — this skips an
+		// in-flight assistant turn (rare but possible mid-stream).
+		for i := n - 1; i >= 0; i-- {
+			if out.Messages[i].Role != "user" {
+				continue
+			}
+			cn := len(out.Messages[i].Content)
+			if cn == 0 {
+				break
+			}
+			out.Messages[i].Content[cn-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+			break
+		}
+	}
 	return out
 }
 
-// SystemPromptCacheBoundary splits the system prompt into a static
-// (cacheable) prefix and a dynamic suffix. Callers that assemble the
-// system string (runtime/system_prompt.go) place this literal between
-// the stable agent identity / tool primer and the per-call dynamic
-// facts (cwd, today's date, project context, user addendum). When this
-// marker is absent the entire prompt goes into one block with
-// cache_control — still valid (caches everything) but every dynamic
-// change invalidates the cache.
+// SystemSection is the typed section form of the system prompt — a
+// shadow of runtime.SystemPromptSection (this package can't import
+// runtime). New callers pass []SystemSection to BuildSystemBlocksFromSections
+// instead of relying on boundary-marker parsing in buildSystemBlocks.
+//
+// Cache=true emits cache_control on this section's block. Volatile=true
+// overrides Cache and forces no-cache (used by sections that change
+// every call — current token budget, streaming-status injection).
+type SystemSection struct {
+	Name     string
+	Body     string
+	Cache    bool
+	Volatile bool
+}
+
+// BuildSystemBlocksFromSections is the typed-section construction
+// path. Up to 4 cache_control markers in the result; Anthropic's
+// total per-request budget is also 4, but the last-tool + last-user-
+// message markers eat 2, so this function caps system-side at 2.
+func BuildSystemBlocksFromSections(secs []SystemSection) []anthropicSystemBlock {
+	out := make([]anthropicSystemBlock, 0, len(secs))
+	cacheUsed := 0
+	const maxSystemCache = 2
+	for _, s := range secs {
+		if s.Body == "" {
+			continue
+		}
+		blk := anthropicSystemBlock{Type: "text", Text: s.Body}
+		wantCache := s.Cache && !s.Volatile && cacheUsed < maxSystemCache
+		if wantCache {
+			blk.CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+			cacheUsed++
+		}
+		out = append(out, blk)
+	}
+	return out
+}
+
+// SystemPromptCacheBoundary marks the split between the static
+// (cacheable) base prefix and the dynamic middle (env + project_context).
 //
 // Mirrors claude-code's __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ in
 // constants/prompts.ts. The exact bytes don't matter, only that it's a
 // unique never-occurring-in-real-text sentinel — keep it ASCII so it
 // can't be partially consumed by ansi/grapheme processing.
 const SystemPromptCacheBoundary = "<<<__METIS_CACHE_BOUNDARY__>>>"
+
+// SystemPromptCacheBoundary2 marks the split between the dynamic
+// middle and the second cacheable section (user addendum). Together
+// with the first boundary, the system prompt is divided into 3
+// sections:
+//
+//	[base                ] ← cached (slot 1)
+//	[env + project_ctx   ] ← dynamic, no cache
+//	[user addendum       ] ← cached (slot 2)
+//
+// Why two cache slots: the user addendum (~/.metis/system.md) is
+// user-level state that's stable across cwd changes, so caching it
+// separately survives `cd otherproj` even though the project_context
+// in the middle invalidates. Anthropic's 4-breakpoint budget covers:
+// last tool (1) + base (2) + addendum (3) + spare for last_user_msg.
+//
+// When this boundary is absent the addendum (if any) stays in the
+// dynamic middle — backwards-compatible with assemblers that don't
+// emit the second marker yet.
+const SystemPromptCacheBoundary2 = "<<<__METIS_CACHE_BOUNDARY_2__>>>"
 
 // buildSystemBlocks produces the array-form system field. Splitting
 // rules:
@@ -392,7 +475,7 @@ func buildSystemBlocks(sys string) []anthropicSystemBlock {
 		}}
 	}
 	static := strings.TrimRight(sys[:idx], "\n ")
-	dynamic := strings.TrimLeft(sys[idx+len(SystemPromptCacheBoundary):], "\n ")
+	rest := strings.TrimLeft(sys[idx+len(SystemPromptCacheBoundary):], "\n ")
 	out := []anthropicSystemBlock{}
 	if static != "" {
 		out = append(out, anthropicSystemBlock{
@@ -401,11 +484,29 @@ func buildSystemBlocks(sys string) []anthropicSystemBlock {
 			CacheControl: &anthropicCacheControl{Type: "ephemeral"},
 		})
 	}
-	if dynamic != "" {
+	// Check for boundary 2 — splits the rest into [dynamic, addendum].
+	if idx2 := strings.Index(rest, SystemPromptCacheBoundary2); idx2 >= 0 {
+		dynamic := strings.TrimRight(rest[:idx2], "\n ")
+		addendum := strings.TrimLeft(rest[idx2+len(SystemPromptCacheBoundary2):], "\n ")
+		if dynamic != "" {
+			out = append(out, anthropicSystemBlock{
+				Type: "text",
+				Text: dynamic,
+				// No cache_control: env + project_context vary per call.
+			})
+		}
+		if addendum != "" {
+			out = append(out, anthropicSystemBlock{
+				Type:         "text",
+				Text:         addendum,
+				CacheControl: &anthropicCacheControl{Type: "ephemeral"},
+			})
+		}
+	} else if rest != "" {
+		// Single dynamic block — boundary 2 absent.
 		out = append(out, anthropicSystemBlock{
 			Type: "text",
-			Text: dynamic,
-			// No cache_control: this is the per-call dynamic suffix.
+			Text: rest,
 		})
 	}
 	return out

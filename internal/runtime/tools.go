@@ -38,6 +38,7 @@ type ToolRegistryOptions struct {
 	Provider        llm.Provider
 	Model           string
 	System          string
+	MinimalSystem   string // optional; sub-agents use this to skip parent's project_context + addendum
 	ChannelRegistry *channels.Registry
 	DefaultPlatform string
 	CronService     *agent.CronService
@@ -56,7 +57,7 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	builtin.Register(reg, opts.Cfg, opts.Gate)
 	// Agent tool: needs the provider + registry references that
 	// builtin.Register doesn't see.
-	reg.Register(builtin.NewAgent(opts.Gate, opts.Provider, reg, opts.Model, opts.System))
+	reg.Register(builtin.NewAgentWithMinimal(opts.Gate, opts.Provider, reg, opts.Model, opts.System, opts.MinimalSystem))
 	// SendMessage tool: lit only when at least one channel adapter is
 	// configured. We always register it though — its description will
 	// just say "no channels available" until one is wired.
@@ -89,6 +90,17 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 // visible. Two-phase wiring exists because plugin loading needs reg to
 // already exist (MCP-server plugins register their tools into it),
 // chicken-and-egg with making the Skill tool's loader plugin-aware.
+//
+// Layers wired (in priority order):
+//
+//	bundled (in-binary)        — TrustBuiltin
+//	optional (~/.metis/optional-skills)  — TrustTrusted, official-but-not-default
+//	user (~/.metis/skills)     — TrustUser
+//	project (./.metis/skills)  — TrustProject
+//	plugin (LoadPlugins)       — TrustCommunity
+//
+// The optional dir is always passed (sibling to userDir); the loader
+// silently skips it when the directory is missing.
 func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) {
 	userDir := opts.Cfg.Session.SkillDir
 	// Project layer is the first existing `.metis/skills/` walking up
@@ -101,7 +113,11 @@ func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) {
 			projectDir = candidate
 		}
 	}
-	loader := skills.NewLoader(userDir, projectDir, opts.PluginSources)
+	// Optional dir is sibling to userDir — by convention
+	// ~/.metis/optional-skills. `metis skills install --optional <name>`
+	// drops manifests here.
+	optionalDir := filepath.Join(filepath.Dir(userDir), "optional-skills")
+	loader := skills.NewLoaderWithOptional(userDir, projectDir, optionalDir, opts.PluginSources)
 	// Replace, not Register — the second phase (after LoadPlugins) needs
 	// to overwrite the first phase's plugin-less Skill tool without
 	// panicking on duplicate registration.

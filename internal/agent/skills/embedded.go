@@ -5,6 +5,8 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
+
+	pubskill "github.com/Ricardo-M-L/metis/pkg/skill"
 )
 
 // bundledFS holds the SKILL.md files Metis ships built-in. Embedded at
@@ -23,6 +25,7 @@ func bundledLayer() Layer {
 	return Layer{
 		Name:     "bundled",
 		Priority: 0,
+		Trust:    pubskill.TrustBuiltin,
 		Scan: func() ([]Skill, error) {
 			var out []Skill
 			err := fs.WalkDir(bundledFS, "builtin", func(path string, d fs.DirEntry, err error) error {

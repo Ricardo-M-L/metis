@@ -32,13 +32,27 @@ type Agent struct {
 	provider llm.Provider
 	registry *tools.Registry
 	model    string
-	system   string
+	system        string
+	minimalSystem string // optional; preferred for sub-agent loops to save tokens
 }
 
 // NewAgent constructs the Agent tool. Caller wires it into the registry
 // after builtin.Register so the runtime's provider/model are available.
+//
+// `system` is the full assembled prompt the parent loop runs with;
+// kept as a fallback for callers that don't compute a minimal variant.
+// New code should use NewAgentWithMinimal so sub-agents skip the
+// parent's <project_context> + ~/.metis/system.md addendum and save
+// the per-sub-agent tokens those sections would have eaten.
 func NewAgent(gate *permission.Gate, prov llm.Provider, reg *tools.Registry, model, system string) Agent {
 	return Agent{gate: gate, provider: prov, registry: reg, model: model, system: system}
+}
+
+// NewAgentWithMinimal is the option-bearing variant. minimalSystem is
+// what sub-agents see (mirrors openclaw's "minimal mode" sub-agent
+// prompt). When empty, sub-agents fall back to `system`.
+func NewAgentWithMinimal(gate *permission.Gate, prov llm.Provider, reg *tools.Registry, model, system, minimalSystem string) Agent {
+	return Agent{gate: gate, provider: prov, registry: reg, model: model, system: system, minimalSystem: minimalSystem}
 }
 
 func (Agent) Name() string { return "Agent" }
@@ -85,7 +99,11 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	maxIter := intArg(in, "max_iter", 10)
-	sub := agent.NewLoop(a.provider, a.registry, a.gate, agent.NewHookRegistry(), a.system, maxIter)
+	subSystem := a.system
+	if a.minimalSystem != "" {
+		subSystem = a.minimalSystem
+	}
+	sub := agent.NewLoop(a.provider, a.registry, a.gate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
 	sub.AppendUser(prompt)
 

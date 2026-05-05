@@ -230,8 +230,10 @@ func TestToAnthropic_JSONHasCacheControl_SystemAndLastTool(t *testing.T) {
 	}
 	body := string(raw)
 	cacheMarkerCount := strings.Count(body, `"cache_control":{"type":"ephemeral"}`)
-	if cacheMarkerCount != 2 {
-		t.Fatalf("expected exactly 2 cache_control markers (static system + last tool); got %d in:\n%s",
+	// 3 markers expected post CC-B: static system + last tool + last user message.
+	// (Not 4 yet because the test fixture has no addendum / boundary 2.)
+	if cacheMarkerCount != 3 {
+		t.Fatalf("expected exactly 3 cache_control markers (static system + last tool + last user msg); got %d in:\n%s",
 			cacheMarkerCount, body)
 	}
 	// System must serialize as an array of blocks (not bare string).
@@ -272,8 +274,10 @@ func TestToAnthropic_JSONHasCacheControl_NoBoundary(t *testing.T) {
 	raw, _ := json.Marshal(toAnthropic(req, "x", 100))
 	body := string(raw)
 	cacheMarkerCount := strings.Count(body, `"cache_control":{"type":"ephemeral"}`)
-	if cacheMarkerCount != 1 {
-		t.Errorf("no-boundary path must emit exactly 1 cache_control (on last tool); got %d in:\n%s",
+	// 2 markers expected post CC-B: last tool + last user message.
+	// System (no boundary) is a single uncached block.
+	if cacheMarkerCount != 2 {
+		t.Errorf("no-boundary path must emit exactly 2 cache_control (last tool + last user msg); got %d in:\n%s",
 			cacheMarkerCount, body)
 	}
 }

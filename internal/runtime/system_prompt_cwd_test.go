@@ -63,23 +63,44 @@ func TestLoadProjectContext_FallsBackToMETIS(t *testing.T) {
 	}
 }
 
-// TestLoadProjectContext_HiddenDirVariants — .metis/CLAUDE.md and
-// .claude/CLAUDE.md as alternative locations.
+// TestLoadProjectContext_HiddenDirVariants — .metis/CLAUDE.md as
+// metis-specific hidden location.
+//
+// History: .claude/CLAUDE.md was previously also a candidate, but
+// reading it caused metis to advertise the user's claude-code global
+// instructions as metis project instructions (2026-05-05 confusion
+// bug — running metis at /Users/ricardo, the LLM saw
+// ~/.claude/CLAUDE.md and reported "your project instructions live
+// in .claude/CLAUDE.md"). metis no longer reads .claude/.
 func TestLoadProjectContext_HiddenDirVariants(t *testing.T) {
-	for _, dir := range []string{".metis", ".claude"} {
-		t.Run(dir, func(t *testing.T) {
-			tmp := t.TempDir()
-			_ = os.MkdirAll(filepath.Join(tmp, dir), 0o755)
-			_ = os.WriteFile(filepath.Join(tmp, dir, "CLAUDE.md"), []byte("# hidden body "+dir), 0o644)
-			orig, _ := os.Getwd()
-			t.Cleanup(func() { _ = os.Chdir(orig) })
-			_ = os.Chdir(tmp)
+	tmp := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(tmp, ".metis"), 0o755)
+	_ = os.WriteFile(filepath.Join(tmp, ".metis", "CLAUDE.md"), []byte("# hidden body .metis"), 0o644)
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	_ = os.Chdir(tmp)
 
-			got := loadProjectContext()
-			if !strings.Contains(got, "hidden body "+dir) {
-				t.Errorf("%s/CLAUDE.md should load; got %q", dir, got)
-			}
-		})
+	got := loadProjectContext()
+	if !strings.Contains(got, "hidden body .metis") {
+		t.Errorf(".metis/CLAUDE.md should load; got %q", got)
+	}
+}
+
+// TestLoadProjectContext_IgnoresClaudeDir — .claude/CLAUDE.md must NOT
+// be loaded by metis; it's claude-code's territory.
+func TestLoadProjectContext_IgnoresClaudeDir(t *testing.T) {
+	tmp := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(tmp, ".claude"), 0o755)
+	_ = os.WriteFile(filepath.Join(tmp, ".claude", "CLAUDE.md"), []byte("# claude-code body"), 0o644)
+	// Mark this as a fake git root so loadProjectContext stops here
+	// and doesn't walk up into the user's real CLAUDE.md.
+	_ = os.MkdirAll(filepath.Join(tmp, ".git"), 0o755)
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	_ = os.Chdir(tmp)
+
+	if got := loadProjectContext(); got != "" {
+		t.Errorf("metis must NOT load .claude/CLAUDE.md; got %q", got)
 	}
 }
 
