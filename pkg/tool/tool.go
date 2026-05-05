@@ -93,3 +93,116 @@ type Tool interface {
 	CanUse(ctx context.Context, input map[string]any) (Permission, string)
 	Execute(ctx context.Context, input map[string]any) (*Result, error)
 }
+
+// InterruptBehavior controls what happens when the user submits a new
+// message while a tool is mid-execution. Mirrors claude-code's Tool.ts:416.
+//
+//   - InterruptCancel: stop the tool and discard its result. Right for
+//     pure-read tools (Read, Grep, WebFetch) where a half-finished
+//     answer is just wasted bytes.
+//   - InterruptBlock: keep running; the new user message waits in the
+//     queue. Right for tools whose half-state is worse than full state
+//     (Bash running `make install`, an in-flight Edit that already
+//     wrote bytes).
+type InterruptBehavior int
+
+const (
+	InterruptCancel InterruptBehavior = iota
+	InterruptBlock
+)
+
+// ReadOnlyAware lets a tool self-report per-input whether the call has
+// no observable side effects. The runtime reads this when deciding
+// whether a tool_result block can be Snipped (lossy truncation in
+// context compaction) safely — read outputs can lose detail, write
+// outputs can't because future turns may need the full diff.
+//
+// Default when not implemented: false (conservative).
+type ReadOnlyAware interface {
+	IsReadOnly(input map[string]any) bool
+}
+
+// Destructive lets a tool self-report per-input whether the call is
+// irreversible (rm, DROP, send-message, overwrite-file). The TUI uses
+// this to color the ASK prompt; the gate uses it to upgrade ASK to
+// stricter confirmation.
+//
+// Default when not implemented: false.
+type Destructive interface {
+	IsDestructive(input map[string]any) bool
+}
+
+// RequiresUserInteractive lets a tool declare it MUST get human
+// involvement to function — e.g. AskUser, an OAuth-flow trigger. Mode
+// bypass cannot satisfy these, since "user wants to skip prompts" is
+// orthogonal to "tool needs the user to type something". Mirrors
+// Tool.ts:435 requiresUserInteraction.
+type RequiresUserInteractive interface {
+	RequiresUserInteraction() bool
+}
+
+// BypassImmuneAware lets a tool declare per-input that its Deny/Ask
+// decision must NOT be upgraded to Allow by mode=bypass. Used for
+// safety-check paths (.git/config, .ssh/, ~/.bashrc) that should
+// always prompt regardless of bypass posture. Returns reason for UI.
+//
+// Mirrors claude-code's safetyCheck flow in permissions.ts:1144-1152
+// and 1252-1260.
+type BypassImmuneAware interface {
+	IsBypassImmune(input map[string]any) (immune bool, reason string)
+}
+
+// Interruptible lets a tool override the default InterruptCancel.
+// Most tools don't need this — `Bash`, long-running task tools that
+// hold real-world side effects override it.
+type Interruptible interface {
+	InterruptBehavior() InterruptBehavior
+}
+
+// IsReadOnly returns whether t reports the input as read-only.
+// Default false (assume side effects) when t does not implement
+// ReadOnlyAware.
+func IsReadOnly(t Tool, input map[string]any) bool {
+	if r, ok := t.(ReadOnlyAware); ok {
+		return r.IsReadOnly(input)
+	}
+	return false
+}
+
+// IsDestructive returns whether t reports the input as irreversible.
+// Default false.
+func IsDestructive(t Tool, input map[string]any) bool {
+	if d, ok := t.(Destructive); ok {
+		return d.IsDestructive(input)
+	}
+	return false
+}
+
+// RequiresUserInteraction returns whether t needs human input.
+// Default false.
+func RequiresUserInteraction(t Tool) bool {
+	if r, ok := t.(RequiresUserInteractive); ok {
+		return r.RequiresUserInteraction()
+	}
+	return false
+}
+
+// IsBypassImmune returns whether t's CanUse decision on the given
+// input should resist mode=bypass override.
+//
+// Default (false, "") — bypass mode can override.
+func IsBypassImmune(t Tool, input map[string]any) (bool, string) {
+	if b, ok := t.(BypassImmuneAware); ok {
+		return b.IsBypassImmune(input)
+	}
+	return false, ""
+}
+
+// GetInterruptBehavior returns t's interrupt policy. Default is
+// InterruptCancel.
+func GetInterruptBehavior(t Tool) InterruptBehavior {
+	if i, ok := t.(Interruptible); ok {
+		return i.InterruptBehavior()
+	}
+	return InterruptCancel
+}

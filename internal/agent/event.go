@@ -107,6 +107,14 @@ type Event struct {
 	PermissionReason string
 	PermissionReply  chan PermissionDecision // buffered, size 1
 
+	// PermissionPending is the count of additional ASK requests in the
+	// SAME tool batch that are still queued behind this one. Lets the
+	// TUI render "1 of 4 pending approvals" instead of one prompt at a
+	// time. Mirrors claude-code's batched-ask UX.
+	//
+	// Zero means this is the only / last pending ASK in the batch.
+	PermissionPending int
+
 	// Token + info. CacheCreationInputTokens / CacheReadInputTokens
 	// mirror Anthropic's prompt-caching usage and let the TUI compute
 	// claude-code-style context-window load (input + cache, no output)

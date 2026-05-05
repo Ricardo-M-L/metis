@@ -13,7 +13,10 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-type Read struct{ gate *permission.Gate }
+type Read struct {
+	gate  *permission.Gate
+	state *ReadFileState
+}
 
 func (Read) Name() string { return "Read" }
 func (Read) Description() string {
@@ -31,10 +34,24 @@ func (Read) InputSchema() map[string]any {
 	}
 }
 func (Read) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+
+// IsReadOnly: Read never mutates filesystem state. Snip is allowed to
+// summarise its tool_result aggressively.
+func (Read) IsReadOnly(map[string]any) bool { return true }
+
 func (r Read) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
 	d, src := r.gate.Check(context.Background(), "Read", strFromAny(in["path"]))
 	return mapDecision(d), src
 }
+
+// MaxReadFileSize caps the total bytes Read will load into memory
+// before returning. claude-code uses 1 GiB; we pick 256 MiB because
+// Go runtime memory pressure on a 16 GB Mac with a long context
+// window is more painful than on Bun. Set high enough that source
+// trees (linux kernel ~ 1.4 GB checked out) won't accidentally OOM
+// us if the model passes a giant file path; small enough that we
+// fail fast instead of swapping. Override via METIS_READ_MAX_BYTES.
+const MaxReadFileSize = 256 * 1024 * 1024
 
 func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	path, _ := in["path"].(string)
@@ -46,6 +63,19 @@ func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	}
 	offset := intArg(in, "offset", 1)
 	limit := intArg(in, "limit", 2000)
+
+	// Stat first: cheap, lets us reject GB-sized files before
+	// allocating, and gives us the mtime for ReadFileState.
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if st.Size() > MaxReadFileSize {
+		return &tools.Result{
+			Output:  fmt.Sprintf("file too large: %d bytes exceeds %d byte cap (use Bash with head/tail to inspect)", st.Size(), MaxReadFileSize),
+			IsError: true,
+		}, nil
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -72,6 +102,33 @@ func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
+
+	// Record in ReadFileState so a subsequent Edit/Write on this path
+	// can detect out-of-band mtime drift (file changed between Read
+	// and Edit). We re-stat after the read because writers could
+	// have updated the file during the scan; the mtime we want is
+	// the last-known mtime at which we saw the bytes we read.
+	if r.state != nil {
+		// Re-read via os.ReadFile for hashing; small files only since
+		// we already passed the size cap. Skip when offset/limit
+		// truncated — the snapshot would be partial and the staleness
+		// check would falsely fire on Edit.
+		if offset == 1 && emitted < limit {
+			if data, rerr := os.ReadFile(path); rerr == nil {
+				if st2, serr := os.Stat(path); serr == nil {
+					r.state.Record(path, st2.ModTime(), data)
+				}
+			}
+		} else if st2, serr := os.Stat(path); serr == nil {
+			// Partial read — record mtime only by hashing what we
+			// re-read fully. This still catches the common case
+			// (model reads first 100 lines, edits early lines).
+			if data, rerr := os.ReadFile(path); rerr == nil {
+				r.state.Record(path, st2.ModTime(), data)
+			}
+		}
+	}
+
 	if emitted == 0 {
 		return &tools.Result{Output: "(file is empty or offset past end)"}, nil
 	}

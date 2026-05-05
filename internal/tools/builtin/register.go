@@ -13,6 +13,19 @@ func Register(r *tools.Registry, cfg *config.Config, gate *permission.Gate) {
 	RegisterWithDirs(r, cfg, gate, cfg.Session.SkillDir, cfg.Session.Dir)
 }
 
+// sessionReadState is a package-level pointer so the same store is
+// shared across Read/Write/Edit registrations within one session.
+// Re-initialised on every RegisterWithDirs call (one per session
+// boot), so concurrent test sessions get fresh state.
+//
+// Exposed via SessionReadState() for runtime code (e.g. /clear) that
+// needs to reset it independently of re-registering the tools.
+var sessionReadState *ReadFileState
+
+// SessionReadState returns the active session's ReadFileState. May be
+// nil before the first RegisterWithDirs call.
+func SessionReadState() *ReadFileState { return sessionReadState }
+
 func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Gate, skillDir, memoryDir string) {
 	disabled := make(map[string]bool, len(cfg.Tools.Disabled))
 	for _, n := range cfg.Tools.Disabled {
@@ -25,6 +38,10 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 	memDir := filepath.Join(memoryDir, "..", "memories")
 	os.MkdirAll(memDir, 0o755)
 
+	// Per-session ReadFileState shared by Read/Write/Edit so
+	// stale-write detection works across them.
+	sessionReadState = NewReadFileState()
+
 	// NOTE: Skill + Memory are registered in internal/runtime/BuildToolRegistry,
 	// not here:
 	//   - Skill needs a multi-source loader that includes plugin contributions
@@ -34,9 +51,9 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 	// `metis tools` and the chat REPL both go through BuildToolRegistry
 	// after this Register call, so both tools always show up in the end.
 	all := []tools.Tool{
-		Read{gate: gate},
-		Write{gate: gate},
-		Edit{gate: gate},
+		Read{gate: gate, state: sessionReadState},
+		Write{gate: gate, state: sessionReadState},
+		Edit{gate: gate, state: sessionReadState},
 		Bash{gate: gate, settings: cfg.Tools.Bash},
 		LS{gate: gate},
 		Glob{gate: gate},

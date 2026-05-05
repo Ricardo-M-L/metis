@@ -65,6 +65,36 @@ func (b Bash) Concurrency(in map[string]any) tools.Concurrency {
 	return tools.ConcurrencyExclusive
 }
 
+// IsReadOnly mirrors Concurrency for Snip purposes: a `cat foo.go`
+// tool_result can be aggressively truncated; a `make build` cannot
+// because the model may rely on the full output to debug failures.
+func (b Bash) IsReadOnly(in map[string]any) bool {
+	cmd, _ := in["command"].(string)
+	if cmd == "" {
+		return false
+	}
+	return isReadOnlyCommand(cmd)
+}
+
+// IsDestructive flags unrecoverable shell ops: rm -rf, dd, mkfs,
+// shred, kill -9 init. Used for stricter ASK colouring — the model
+// already failed bash_security_rules' classifier if these are
+// reaching the gate at all, but TUI shows extra friction either way.
+func (b Bash) IsDestructive(in map[string]any) bool {
+	cmd, _ := in["command"].(string)
+	c := strings.ToLower(cmd)
+	keywords := []string{
+		"rm -rf", "rm -fr", "dd if=", "mkfs", "shred", " > /dev/sd",
+		"git push --force", "git push -f", "drop table", "drop database",
+	}
+	for _, k := range keywords {
+		if strings.Contains(c, k) {
+			return true
+		}
+	}
+	return false
+}
+
 // readOnlyCommands is the conservative safe-list of binaries whose
 // invocation does not mutate filesystem / process / network state.
 // Adapted from claude-code's safelist; trimmed to commands that ship

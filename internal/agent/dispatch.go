@@ -13,12 +13,17 @@ import (
 // toolSpecs builds the per-request `tools[]` array given to the LLM, by
 // asking each registered tool for its name + description + input schema.
 //
+// Tools are emitted in cache-stable order via Registry.SortedForCache():
+// built-ins sorted by name first, then MCP tools sorted by name. This
+// keeps the Anthropic prompt-cache breakpoint placed after the last
+// built-in valid across MCP server churn — claude-code's tools.ts:354-366.
+//
 // When LazyToolThreshold is set and exceeded, mcp__-prefixed tools have
 // their schemas stripped and a synthetic ToolSearch tool is appended.
 // Saves ~10K+ tokens per iteration for MCP-heavy sessions; see
 // lazy_tools.go for the trade-off discussion.
 func (l *Loop) toolSpecs() []llm.ToolSpec {
-	all := l.Registry.All()
+	all := l.Registry.SortedForCache()
 	out := make([]llm.ToolSpec, 0, len(all))
 	for _, t := range all {
 		out = append(out, llm.ToolSpec{
@@ -33,32 +38,44 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 }
 
 // executeBatch runs every tool_use in toolUses, returning the matching
-// tool_result blocks. Concurrency tiers:
+// tool_result blocks. Three phases:
 //
-//	Safe       — fan out in parallel, no constraints
-//	Queue      — FIFO among themselves, runs *concurrently with* the
-//	             safe parallel fanout (a single-slot worker pool)
-//	Exclusive  — serialize AFTER the safe + queue work completes
+//	Phase 0  — per-tool pre-checks: PreToolUse hook + permission CanUse.
+//	            Tools whose CanUse returns ASK get queued for batch
+//	            confirmation rather than prompting one-at-a-time.
+//	Phase 0b — batch ASK confirmation. Each EventPermissionRequest
+//	            carries PermissionPending = remaining-asks-in-batch so
+//	            the TUI can render "1 of N" rather than the user
+//	            facing N independent prompts.
+//	Phase 1+ — execute survivors by concurrency tier:
+//	             Safe      — fan out in parallel
+//	             Queue     — FIFO concurrent with safe fanout
+//	             Exclusive — serialized after safe+queue
 //
 // The phased pattern preserves the "writes happen after reads in the
 // same turn" invariant without per-tool dependency analysis. Queue is
-// the new tier — useful for rate-limited APIs (WebFetch, an MCP server
+// metis-original: useful for rate-limited APIs (WebFetch, an MCP server
 // pinned to one connection) that don't need full exclusivity but
 // shouldn't run in parallel with each other.
 func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, out chan<- Event, tc HookContext) ([]llm.ContentBlock, error) {
 	results := make([]llm.ContentBlock, len(toolUses))
 	type job struct {
-		idx int
-		blk llm.ContentBlock
-		t   tools.Tool
+		idx   int
+		blk   llm.ContentBlock
+		t     tools.Tool
+		early *llm.ContentBlock // set when pre-check decided result
+		ready bool              // true once pre-checks all pass
 	}
-	var safeJobs, queueJobs, exclJobs []job
+	jobs := make([]*job, len(toolUses))
+
+	// Phase 0a: per-tool pre-checks. ToolSearch and unknown tools are
+	// resolved inline (no permission flow needed). Others run their
+	// PreToolUse hook + CanUse here so we know which ones need ASK
+	// before launching any goroutine.
+	asks := make([]*job, 0)
 	for i, b := range toolUses {
 		// Synthetic ToolSearch (lazy-MCP-schema feature, Task #72) is
-		// not in the Registry — handle it inline by looking up the
-		// requested name's schema and returning it as the tool_result.
-		// The model parses the JSON on the next iteration and uses it
-		// to construct a real call.
+		// not in the Registry — handle it inline.
 		if b.ToolName == "ToolSearch" {
 			results[i] = handleToolSearch(l, b)
 			emit(ctx, out, Event{
@@ -79,11 +96,81 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			})
 			continue
 		}
-		j := job{idx: i, blk: b, t: t}
-		// Input-dependent concurrency: Bash (and similar) decides
-		// based on its argv whether the call is read-only. Tools that
-		// don't care just ignore the argument.
-		switch t.Concurrency(b.ToolInput) {
+
+		j := &job{idx: i, blk: b, t: t}
+		jobs[i] = j
+
+		emit(ctx, out, Event{
+			Kind: EventToolStart, ToolUseID: b.ToolUseID,
+			ToolName: b.ToolName, ToolInput: b.ToolInput,
+		})
+
+		// PreToolUse hook can short-circuit (Output) or rewrite input.
+		if l.Hooks != nil {
+			mod := l.Hooks.EmitPreToolUse(ctx, tc, &PreToolUseHook{
+				Context: tc, Tool: b.ToolName, Input: b.ToolInput,
+			})
+			if mod != nil {
+				if mod.Output != nil {
+					blkOut := llm.ContentBlock{
+						Type: "tool_result", ToolUseID: b.ToolUseID,
+						ToolResult: mod.Output.Content, IsError: mod.Output.IsError,
+					}
+					emit(ctx, out, Event{
+						Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+						ToolResult: &ToolResult{Output: mod.Output.Content, IsError: mod.Output.IsError},
+					})
+					j.early = &blkOut
+					continue
+				}
+				if mod.ModifiedInput != nil {
+					j.blk.ToolInput = mod.ModifiedInput
+				}
+			}
+		}
+
+		// Permission decision.
+		perm, _ := t.CanUse(ctx, j.blk.ToolInput)
+		if perm == tools.PermissionDeny {
+			blkOut := llm.ContentBlock{
+				Type: "tool_result", ToolUseID: b.ToolUseID,
+				ToolResult: "denied by permission policy", IsError: true,
+			}
+			emit(ctx, out, Event{
+				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+				ToolResult: &ToolResult{Output: "denied", IsError: true},
+			})
+			j.early = &blkOut
+			continue
+		}
+		if perm == tools.PermissionAsk {
+			asks = append(asks, j)
+			continue
+		}
+		j.ready = true
+	}
+
+	// Phase 0b: ASK in batch. Each event reports PermissionPending so
+	// the TUI knows "you have N more decisions queued behind this one"
+	// — the model emitted them as a batch and we keep them grouped
+	// rather than letting Execute interleave between asks.
+	for ai, j := range asks {
+		remaining := len(asks) - ai - 1
+		ar := l.askPermissionPending(ctx, j.blk, out, remaining)
+		if !ar.proceed {
+			j.early = ar.earlyReturn
+			continue
+		}
+		j.ready = true
+	}
+
+	// Phase 1: classify ready jobs by concurrency tier and execute.
+	var safeJobs, queueJobs, exclJobs []*job
+	for _, j := range jobs {
+		if j == nil || j.early != nil || !j.ready {
+			continue
+		}
+		switch j.t.Concurrency(j.blk.ToolInput) {
 		case tools.ConcurrencySafe:
 			safeJobs = append(safeJobs, j)
 		case tools.ConcurrencyQueue:
@@ -98,9 +185,9 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	var mu sync.Mutex
 	for _, j := range safeJobs {
 		wg.Add(1)
-		go func(j job) {
+		go func(j *job) {
 			defer wg.Done()
-			blk := l.runOne(ctx, j.t, j.blk, out, tc)
+			blk := l.runExecute(ctx, j.t, j.blk, out, tc)
 			mu.Lock()
 			results[j.idx] = blk
 			mu.Unlock()
@@ -108,15 +195,15 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	}
 
 	// Phase 1b (concurrent with 1a): drain the queue jobs FIFO from a
-	// single goroutine. This means queue tools run alongside the safe
-	// fanout but never concurrently with each other — the right shape
-	// for rate-limited remote APIs.
+	// single goroutine. Queue tools run alongside the safe fanout but
+	// never concurrently with each other — the right shape for rate-
+	// limited remote APIs.
 	if len(queueJobs) > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for _, j := range queueJobs {
-				blk := l.runOne(ctx, j.t, j.blk, out, tc)
+				blk := l.runExecute(ctx, j.t, j.blk, out, tc)
 				mu.Lock()
 				results[j.idx] = blk
 				mu.Unlock()
@@ -127,72 +214,47 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 
 	// Phase 2: serialize exclusive tools. Order preserved by insertion.
 	for _, j := range exclJobs {
-		results[j.idx] = l.runOne(ctx, j.t, j.blk, out, tc)
+		results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc)
+	}
+
+	// Fill in early-decided results (hook short-circuit / deny / ask-
+	// denied) from their job entries.
+	for i, j := range jobs {
+		if j == nil {
+			continue
+		}
+		if j.early != nil {
+			results[i] = *j.early
+		}
 	}
 	return results, nil
 }
 
-// runOne executes a single tool_use block end-to-end: PreToolUse hook →
-// permission check (with optional ask flow) → tool.Execute → PostToolUse
-// hook → emit result event. Returns the matching tool_result block.
+// runExecute runs the post-permission portion of a single tool_use:
+// tool.Execute → PostToolUse hook → emit ToolResult event. It assumes
+// PreToolUse + permission have already passed in executeBatch's
+// pre-decision phase.
 //
-// All early-return paths (deny / ask-deny / hook-intercept) produce a
-// well-formed tool_result block so the LLM always sees a consistent
-// response shape per tool_use it emitted.
-func (l *Loop) runOne(ctx context.Context, t tools.Tool, blk llm.ContentBlock, out chan<- Event, tc HookContext) llm.ContentBlock {
-	emit(ctx, out, Event{
-		Kind: EventToolStart, ToolUseID: blk.ToolUseID,
-		ToolName: blk.ToolName, ToolInput: blk.ToolInput,
-	})
-
-	// PreToolUse hook — can short-circuit (Output) or rewrite input.
-	if l.Hooks != nil {
-		mod := l.Hooks.EmitPreToolUse(ctx, tc, &PreToolUseHook{
-			Context: tc, Tool: blk.ToolName, Input: blk.ToolInput,
-		})
-		if mod != nil {
-			if mod.Output != nil {
-				b := llm.ContentBlock{
-					Type: "tool_result", ToolUseID: blk.ToolUseID,
-					ToolResult: mod.Output.Content, IsError: mod.Output.IsError,
-				}
-				emit(ctx, out, Event{
-					Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
-					ToolResult: &ToolResult{Output: mod.Output.Content, IsError: mod.Output.IsError},
-				})
-				return b
-			}
-			if mod.ModifiedInput != nil {
-				blk.ToolInput = mod.ModifiedInput
-			}
-		}
-	}
-
-	// Permission check.
-	perm, _ := t.CanUse(ctx, blk.ToolInput)
-	if perm == tools.PermissionDeny {
-		b := llm.ContentBlock{
-			Type: "tool_result", ToolUseID: blk.ToolUseID,
-			ToolResult: "denied by permission policy", IsError: true,
-		}
-		emit(ctx, out, Event{
-			Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
-			ToolResult: &ToolResult{Output: "denied", IsError: true},
-		})
-		return b
-	}
-	if perm == tools.PermissionAsk {
-		ar := l.askPermission(ctx, blk, out)
-		if !ar.proceed {
-			return *ar.earlyReturn
-		}
-	}
-
+// Returns the matching tool_result block. All error paths produce a
+// well-formed block so the LLM never sees a missing tool_result.
+func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBlock, out chan<- Event, tc HookContext) llm.ContentBlock {
 	// Tag ctx with the parent's event out-channel so sub-tools (Agent)
-	// can forward intermediate events for live UI updates. Without
-	// this, the user sees the Agent pill spin for minutes with no
-	// progress until the sub-loop returns final text.
+	// can forward intermediate events for live UI updates.
 	toolCtx := WithEventOut(ctx, out)
+
+	// Honor InterruptBlock: tools that declare InterruptBlock want to
+	// finish their current invocation even if the parent ctx gets
+	// cancelled mid-call (Bash running `make install`, Edit mid-write,
+	// SendMessage mid-flight). Detach the cancel signal — values from
+	// ctx still flow through.
+	//
+	// Caveat: a malicious / runaway InterruptBlock tool could ignore
+	// shutdown forever. Mitigation lives at the layer that issues the
+	// cancel: the TUI's double-Ctrl+C path can hard-kill via the loop
+	// owner. This detach only protects against the FIRST Ctrl+C.
+	if tools.GetInterruptBehavior(t) == tools.InterruptBlock {
+		toolCtx = context.WithoutCancel(toolCtx)
+	}
 	res, err := t.Execute(toolCtx, blk.ToolInput)
 	if l.Detector != nil {
 		l.Detector.Record(blk.ToolName, blk.ToolInput)

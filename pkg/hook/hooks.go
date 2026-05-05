@@ -201,25 +201,64 @@ type (
 	CwdChangedHandler         func(context.Context, Context, *CwdChanged)
 )
 
+// asyncBit is the per-handler async flag stored alongside the handler.
+// When true, the registry calls the handler in a goroutine (fire-and-
+// forget) and moves on without waiting. When false (default), the
+// handler runs inline.
+//
+// Async is only meaningful for handlers whose return value the registry
+// doesn't consume — PostToolUse, SessionEnd, TurnEnd, LoopEnd,
+// PostToolUseFailure, Notification, PermissionDenied. PreToolUse
+// modifies the call so it MUST stay sync. Same for ALL Setup-style
+// handlers whose side effects must happen before the next phase
+// starts.
+type postToolEntry struct {
+	h     PostToolUseHandler
+	async bool
+}
+type sessionEndEntry struct {
+	h     SessionEndHandler
+	async bool
+}
+type turnEndEntry struct {
+	h     TurnEndHandler
+	async bool
+}
+type postToolFailEntry struct {
+	h     PostToolUseFailureHandler
+	async bool
+}
+type notificationEntry struct {
+	h     NotificationHandler
+	async bool
+}
+type permDeniedEntry struct {
+	h     PermissionDeniedHandler
+	async bool
+}
+
 // Registry holds registered hooks, grouped by event type. Thread-safe.
-// Hooks fire synchronously in registration order so a plugin can rely on
-// observing the call before downstream observers do.
+// Pre-action hooks (PreToolUse, PermissionRequest, SessionStart) fire
+// synchronously in registration order — their return values gate later
+// stages. Post-action hooks (PostToolUse, etc.) accept an async flag
+// at registration; async ones run in a goroutine to keep the dispatch
+// hot path uncapped by slow webhook handlers.
 type Registry struct {
 	mu         sync.RWMutex
 	preTool    []PreToolUseHandler
-	postTool   []PostToolUseHandler
+	postTool   []postToolEntry
 	session    []SessionStartHandler
-	sessionEnd []SessionEndHandler
+	sessionEnd []sessionEndEntry
 	turnStart  []TurnStartHandler
-	turnEnd    []TurnEndHandler
+	turnEnd    []turnEndEntry
 	loopEnd    []LoopEndHandler
 	errorHook  []ErrorHandler
 	// 2026-05-01 additions
 	userPrompt    []UserPromptSubmitHandler
-	notification  []NotificationHandler
+	notification  []notificationEntry
 	permRequest   []PermissionRequestHandler
-	permDenied    []PermissionDeniedHandler
-	postToolFail  []PostToolUseFailureHandler
+	permDenied    []permDeniedEntry
+	postToolFail  []postToolFailEntry
 	setup         []SetupHandler
 	subagentStart []SubagentStartHandler
 	subagentStop  []SubagentStopHandler
@@ -233,37 +272,62 @@ func NewRegistry() *Registry { return &Registry{} }
 // switch — so that adding a future handler type doesn't break old plugins
 // using `Register(any...)`.
 func (r *Registry) Register(handler any) {
+	r.register(handler, false)
+}
+
+// RegisterAsync is the same as Register but flags the handler so the
+// registry runs it in a goroutine instead of inline. Only meaningful
+// for post-action hooks (PostToolUse, SessionEnd, TurnEnd, …) whose
+// return value the registry doesn't consume. Pre-action hooks
+// (PreToolUse, PermissionRequest, SessionStart, TurnStart, Setup)
+// silently ignore the flag — they MUST stay synchronous.
+//
+// Async hooks lose ordering guarantees and may continue to run after
+// the session ends. They're appropriate for: telemetry to remote
+// services, slow webhooks (Slack, PagerDuty), heavy logging.
+//
+// Mirrors claude-code's `async: true` hook setting in settings.json.
+func (r *Registry) RegisterAsync(handler any) {
+	r.register(handler, true)
+}
+
+// register is the shared implementation. If async is true and the
+// handler is one of the post-action types, the entry is stored with
+// async=true.
+func (r *Registry) register(handler any, async bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch h := handler.(type) {
 	case PreToolUseHandler:
+		// Sync only — async flag is ignored (it would race with the
+		// dispatch path that consumes the return value).
 		r.preTool = append(r.preTool, h)
 	case PostToolUseHandler:
-		r.postTool = append(r.postTool, h)
+		r.postTool = append(r.postTool, postToolEntry{h: h, async: async})
 	case SessionStartHandler:
-		r.session = append(r.session, h)
+		r.session = append(r.session, h) // sync — gates startup
 	case SessionEndHandler:
-		r.sessionEnd = append(r.sessionEnd, h)
+		r.sessionEnd = append(r.sessionEnd, sessionEndEntry{h: h, async: async})
 	case TurnStartHandler:
-		r.turnStart = append(r.turnStart, h)
+		r.turnStart = append(r.turnStart, h) // sync — gates the turn
 	case TurnEndHandler:
-		r.turnEnd = append(r.turnEnd, h)
+		r.turnEnd = append(r.turnEnd, turnEndEntry{h: h, async: async})
 	case LoopEndHandler:
-		r.loopEnd = append(r.loopEnd, h)
+		r.loopEnd = append(r.loopEnd, h) // typically sync — exit observers
 	case ErrorHandler:
-		r.errorHook = append(r.errorHook, h)
+		r.errorHook = append(r.errorHook, h) // sync — diagnostic
 	case UserPromptSubmitHandler:
-		r.userPrompt = append(r.userPrompt, h)
+		r.userPrompt = append(r.userPrompt, h) // sync — gate on prompt
 	case NotificationHandler:
-		r.notification = append(r.notification, h)
+		r.notification = append(r.notification, notificationEntry{h: h, async: async})
 	case PermissionRequestHandler:
-		r.permRequest = append(r.permRequest, h)
+		r.permRequest = append(r.permRequest, h) // sync — must gate
 	case PermissionDeniedHandler:
-		r.permDenied = append(r.permDenied, h)
+		r.permDenied = append(r.permDenied, permDeniedEntry{h: h, async: async})
 	case PostToolUseFailureHandler:
-		r.postToolFail = append(r.postToolFail, h)
+		r.postToolFail = append(r.postToolFail, postToolFailEntry{h: h, async: async})
 	case SetupHandler:
-		r.setup = append(r.setup, h)
+		r.setup = append(r.setup, h) // sync — must gate setup
 	case SubagentStartHandler:
 		r.subagentStart = append(r.subagentStart, h)
 	case SubagentStopHandler:
@@ -287,13 +351,18 @@ func (r *Registry) EmitPreToolUse(ctx context.Context, tc Context, in *PreToolUs
 	return nil
 }
 
-// EmitPostToolUse fans out to all PostToolUse handlers.
+// EmitPostToolUse fans out to all PostToolUse handlers. Sync handlers
+// run inline; async ones spawn a goroutine and detach.
 func (r *Registry) EmitPostToolUse(ctx context.Context, tc Context, in *PostToolUse) {
 	r.mu.RLock()
 	handlers := r.postTool
 	r.mu.RUnlock()
-	for _, h := range handlers {
-		h(ctx, tc, in)
+	for _, e := range handlers {
+		if e.async {
+			go e.h(ctx, tc, in)
+		} else {
+			e.h(ctx, tc, in)
+		}
 	}
 }
 
@@ -310,8 +379,12 @@ func (r *Registry) EmitSessionEnd(ctx context.Context, tc Context, msgCount int,
 	r.mu.RLock()
 	handlers := r.sessionEnd
 	r.mu.RUnlock()
-	for _, h := range handlers {
-		h(ctx, tc, msgCount, stopReason)
+	for _, e := range handlers {
+		if e.async {
+			go e.h(ctx, tc, msgCount, stopReason)
+		} else {
+			e.h(ctx, tc, msgCount, stopReason)
+		}
 	}
 }
 
@@ -328,8 +401,12 @@ func (r *Registry) EmitTurnEnd(ctx context.Context, tc Context, turn int) {
 	r.mu.RLock()
 	handlers := r.turnEnd
 	r.mu.RUnlock()
-	for _, h := range handlers {
-		h(ctx, tc, turn)
+	for _, e := range handlers {
+		if e.async {
+			go e.h(ctx, tc, turn)
+		} else {
+			e.h(ctx, tc, turn)
+		}
 	}
 }
 
@@ -369,8 +446,12 @@ func (r *Registry) EmitNotification(ctx context.Context, tc Context, n *Notifica
 	r.mu.RLock()
 	handlers := r.notification
 	r.mu.RUnlock()
-	for _, h := range handlers {
-		h(ctx, tc, n)
+	for _, e := range handlers {
+		if e.async {
+			go e.h(ctx, tc, n)
+		} else {
+			e.h(ctx, tc, n)
+		}
 	}
 }
 
@@ -391,8 +472,12 @@ func (r *Registry) EmitPermissionDenied(ctx context.Context, tc Context, p *Perm
 	r.mu.RLock()
 	handlers := r.permDenied
 	r.mu.RUnlock()
-	for _, h := range handlers {
-		h(ctx, tc, p)
+	for _, e := range handlers {
+		if e.async {
+			go e.h(ctx, tc, p)
+		} else {
+			e.h(ctx, tc, p)
+		}
 	}
 }
 
@@ -400,8 +485,12 @@ func (r *Registry) EmitPostToolUseFailure(ctx context.Context, tc Context, p *Po
 	r.mu.RLock()
 	handlers := r.postToolFail
 	r.mu.RUnlock()
-	for _, h := range handlers {
-		h(ctx, tc, p)
+	for _, e := range handlers {
+		if e.async {
+			go e.h(ctx, tc, p)
+		} else {
+			e.h(ctx, tc, p)
+		}
 	}
 }
 

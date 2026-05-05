@@ -10,6 +10,8 @@ package tools
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
@@ -19,10 +21,11 @@ import (
 // keep using `tools.Tool`, `tools.PermissionAllow` etc. — these aliases
 // are the same types, just reachable from this package.
 type (
-	Permission  = pubtool.Permission
-	Concurrency = pubtool.Concurrency
-	Result      = pubtool.Result
-	Tool        = pubtool.Tool
+	Permission        = pubtool.Permission
+	Concurrency       = pubtool.Concurrency
+	Result            = pubtool.Result
+	Tool              = pubtool.Tool
+	InterruptBehavior = pubtool.InterruptBehavior
 )
 
 const (
@@ -32,6 +35,19 @@ const (
 	ConcurrencySafe      = pubtool.ConcurrencySafe
 	ConcurrencyExclusive = pubtool.ConcurrencyExclusive
 	ConcurrencyQueue     = pubtool.ConcurrencyQueue
+	InterruptCancel      = pubtool.InterruptCancel
+	InterruptBlock       = pubtool.InterruptBlock
+)
+
+// Re-exports for the optional capability helpers in pkg/tool. Existing
+// callers can stay on `tools.IsReadOnly(t, in)` etc. without importing
+// pkg/tool directly.
+var (
+	IsReadOnly              = pubtool.IsReadOnly
+	IsDestructive           = pubtool.IsDestructive
+	RequiresUserInteraction = pubtool.RequiresUserInteraction
+	IsBypassImmune          = pubtool.IsBypassImmune
+	GetInterruptBehavior    = pubtool.GetInterruptBehavior
 )
 
 // Registry holds all tools available to the current session.
@@ -113,6 +129,41 @@ func (r *Registry) Filter(keep func(string) bool) []Tool {
 		}
 	}
 	return out
+}
+
+// SortedForCache returns tools as: [built-ins sorted by name] then [MCP
+// tools sorted by name]. The order is stable across MCP server churn so
+// the Anthropic prompt cache breakpoint placed after the built-in
+// prefix stays valid.
+//
+// Why this matters: Anthropic caches the request prefix; if the tools
+// list changes shape (an MCP tool sorts between two built-ins, or the
+// MCP set grows / shrinks across sessions), every cache entry past the
+// shape change is invalidated. By keeping built-ins as a contiguous
+// alphabetically-sorted prefix and MCP as a contiguous suffix, only
+// the MCP region varies — the breakpoint after the last built-in still
+// hits cache for the system+tools prefix.
+//
+// Mirrors claude-code's assembleToolPool() in tools.ts:345-367.
+//
+// MCP tools are identified by the `mcp__` prefix that
+// internal/tools/mcp/server.go applies to every imported MCP tool.
+func (r *Registry) SortedForCache() []Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	builtins := make([]Tool, 0, len(r.order))
+	mcps := make([]Tool, 0, len(r.order))
+	for _, name := range r.order {
+		t := r.tools[name]
+		if strings.HasPrefix(name, "mcp__") {
+			mcps = append(mcps, t)
+		} else {
+			builtins = append(builtins, t)
+		}
+	}
+	sort.Slice(builtins, func(i, j int) bool { return builtins[i].Name() < builtins[j].Name() })
+	sort.Slice(mcps, func(i, j int) bool { return mcps[i].Name() < mcps[j].Name() })
+	return append(builtins, mcps...)
 }
 
 // Restrict mutates the registry in place to keep only tools whose names

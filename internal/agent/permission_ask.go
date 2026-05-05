@@ -26,13 +26,25 @@ type askResult struct {
 // independently testable. The runtime caller uses an EventPermissionRequest
 // reply channel to deliver the user's decision.
 func (l *Loop) askPermission(ctx context.Context, blk llm.ContentBlock, out chan<- Event) askResult {
+	return l.askPermissionPending(ctx, blk, out, 0)
+}
+
+// askPermissionPending is the same as askPermission but sets
+// PermissionPending on the outgoing event so the TUI can render
+// "1 of N pending approvals". Used by executeBatch's batched ASK
+// phase. pending is the number of additional ASKs still queued
+// behind this one in the same batch.
+func (l *Loop) askPermissionPending(ctx context.Context, blk llm.ContentBlock, out chan<- Event, pending int) askResult {
 	reply := make(chan PermissionDecision, 1)
 	emit(ctx, out, Event{
-		Kind:            EventPermissionRequest,
-		ToolUseID:       blk.ToolUseID,
-		PermissionTool:  blk.ToolName,
-		PermissionInput: blk.ToolInput,
-		PermissionReply: reply,
+		Kind:              EventPermissionRequest,
+		ToolUseID:         blk.ToolUseID,
+		ToolName:          blk.ToolName,
+		ToolInput:         blk.ToolInput,
+		PermissionTool:    blk.ToolName,
+		PermissionInput:   blk.ToolInput,
+		PermissionReply:   reply,
+		PermissionPending: pending,
 	})
 
 	var decision PermissionDecision
