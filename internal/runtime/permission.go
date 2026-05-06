@@ -33,5 +33,12 @@ func BuildPermissionGate(cfg *config.Config, mode string) *permission.Gate {
 			Verb: permission.DecisionDeny, Source: "config:deny",
 		})
 	}
+	// F16: load persistent "Yes always" approvals from
+	// ~/.metis/persistent-permissions.jsonl. They land below
+	// the config rules so config:deny wins on conflict (a user
+	// shouldn't be able to escape an explicit policy by
+	// approving once mid-session). Errors are silent — missing /
+	// corrupt file just means "no persisted approvals".
+	_ = gate.LoadInto(permission.Default(config.Home()))
 	return gate
 }

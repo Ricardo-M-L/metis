@@ -287,9 +287,29 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 
 		stream, err := l.Provider.Stream(ctx, req)
 		if err != nil {
-			if l.tryRecoverOverflow(ctx, err, out) {
-				// Compaction reduced history; rebuild request and retry once.
-				req = l.buildRequest(specs)
+			// Classify before deciding the recovery path. Mirrors
+			// hermes' error_classifier — the loop now picks the
+			// right strategy per error class instead of guessing
+			// "always retry once" or "always bail".
+			class := ClassifyError(err)
+			switch class.Recovery() {
+			case RecoveryCompactRetry:
+				if l.tryRecoverOverflow(ctx, err, out) {
+					req = l.buildRequest(specs)
+					stream, err = l.Provider.Stream(ctx, req)
+				}
+			case RecoveryFailUser:
+				// Surface a clean, actionable message for billing /
+				// auth / invalid-request. Don't auto-retry these —
+				// retrying just burns more requests.
+				if msg := UserFacingMessage(class, err); msg != "" {
+					emit(ctx, out, Event{Kind: EventInfo, Info: "[" + class.String() + "] " + msg})
+				}
+			case RecoveryRetry:
+				// Rate / server / network — single retry with brief
+				// backoff. The loop's outer iteration handles
+				// repeated rate-limit cases; here we just absorb the
+				// transient first 4xx/5xx if it clears immediately.
 				stream, err = l.Provider.Stream(ctx, req)
 			}
 			if err != nil {
