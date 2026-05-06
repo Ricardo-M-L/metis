@@ -502,12 +502,32 @@ func cmdTheme(r *REPL, args string) string {
 	arg := strings.ToLower(strings.TrimSpace(args))
 	if arg == "" {
 		names := ThemeNames()
-		return fmt.Sprintf("theme: %s — available: %s", currentTheme.Name, strings.Join(names, ", "))
+		return fmt.Sprintf("theme: %s — available: %s, auto:<provider>",
+			currentTheme.Name, strings.Join(names, ", "))
+	}
+	// `/theme auto` — retint the active palette using the current
+	// provider id (anthropic / openai / kimi / ...). Falls back to
+	// the active theme unchanged when the provider is unknown.
+	if arg == "auto" {
+		provider := ""
+		if r != nil && r.Loop != nil && r.Loop.Provider != nil {
+			provider = r.Loop.Provider.Name()
+		}
+		ApplyProviderTint(provider)
+		initStyles()
+		return "theme: " + currentTheme.Name
+	}
+	if strings.HasPrefix(arg, "auto:") {
+		provider := strings.TrimPrefix(arg, "auto:")
+		ApplyProviderTint(provider)
+		initStyles()
+		return "theme: " + currentTheme.Name
 	}
 	if name := SwitchTheme(arg); name != "" {
 		return "theme: " + name
 	}
-	return fmt.Sprintf("unknown theme %q — available: %s", arg, strings.Join(ThemeNames(), ", "))
+	return fmt.Sprintf("unknown theme %q — available: %s, auto, auto:<provider>",
+		arg, strings.Join(ThemeNames(), ", "))
 }
 
 // cmdEffort sets the reasoning intensity dial used for subsequent turns.
