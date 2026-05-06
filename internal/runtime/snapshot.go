@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -105,8 +106,14 @@ func snapshotPath(sessionID string) (string, error) {
 	if sessionID == "" {
 		return "", fmt.Errorf("session id required")
 	}
-	// Forbid path-traversing slugs — we control the input but defense
-	// in depth costs nothing here.
+	// Defense in depth against path-traversing session ids. metis
+	// today generates UUID-shaped sids, but this function is exported
+	// — callers (plugins, future imports) can pass anything. Reject
+	// rather than join+sanitize because a "fixed" path is silent and
+	// hides the bug; an error surfaces it.
+	if strings.ContainsAny(sessionID, `/\`) || strings.Contains(sessionID, "..") {
+		return "", fmt.Errorf("invalid session id %q (contains path separator or ..)", sessionID)
+	}
 	return filepath.Join(dir, sessionID+".json"), nil
 }
 

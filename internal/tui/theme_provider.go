@@ -86,6 +86,11 @@ func ThemeForProvider(providerID string) *Theme {
 // This MUTATES currentTheme — call it after the user explicitly opts
 // in, never as a side effect of routine renders. Callers must call
 // initStyles() afterward to pick up the new accents.
+//
+// THREAD SAFETY: must be called from the main bubbletea Update
+// goroutine. View() reads currentTheme without locking, so calling
+// this from a tea.Cmd background goroutine would race with the
+// renderer.
 func ApplyProviderTint(providerID string) {
 	tinted := ThemeForProvider(providerID)
 	if tinted == currentTheme {

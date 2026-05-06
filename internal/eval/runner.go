@@ -38,6 +38,17 @@ func (rn *Runner) Run(ctx context.Context, s Scenario) RunResult {
 	if bin == "" {
 		bin = "metis"
 	}
+	// Probe the binary up front. exec.Command with a missing binary
+	// surfaces a generic "exec: not found" only after Run() goes
+	// through the full subprocess setup; LookPath gives us a precise
+	// error that names the binary and explains the lookup failure
+	// (PATH issue vs. permission vs. typo).
+	if _, err := exec.LookPath(bin); err != nil {
+		return RunResult{
+			ScenarioID: s.ID,
+			Err:        fmt.Errorf("metis binary %q not found: %w", bin, err),
+		}
+	}
 	timeout := s.Timeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second

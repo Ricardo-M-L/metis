@@ -158,6 +158,39 @@ func TestLooksCrashed_StaleEvenIfPidExists(t *testing.T) {
 	}
 }
 
+func TestSnapshotPath_RejectsTraversal(t *testing.T) {
+	withTempMetisHome(t)
+	bad := []string{
+		"../etc",
+		`..\windows`,
+		"a/b",
+		`c\d`,
+		"x/../../y",
+		"..",
+		"foo/../bar",
+	}
+	for _, sid := range bad {
+		if _, err := SaveSnapshot(Snapshot{SessionID: sid}); err == nil {
+			t.Errorf("SaveSnapshot(%q) should reject path-traversing id", sid)
+		}
+	}
+}
+
+func TestSnapshotPath_AcceptsCleanIDs(t *testing.T) {
+	withTempMetisHome(t)
+	good := []string{
+		"abc123",
+		"01HFG3K8M9R7B0V2N3P4Q5T6X7", // ULID-shaped
+		"sess-2026-05-06-abc",
+		"x.y.z", // dots OK as long as not ".."
+	}
+	for _, sid := range good {
+		if _, err := SaveSnapshot(Snapshot{SessionID: sid}); err != nil {
+			t.Errorf("SaveSnapshot(%q) should accept clean id; got %v", sid, err)
+		}
+	}
+}
+
 func TestProcessExists_Self(t *testing.T) {
 	if !processExists(os.Getpid()) {
 		t.Error("processExists must return true for our own pid")

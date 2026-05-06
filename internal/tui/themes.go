@@ -132,6 +132,10 @@ var currentTheme = func() *Theme {
 // SwitchTheme swaps the active theme by name and re-initializes the
 // derived style vars. /theme command in commands.go calls this.
 // Returns the resolved theme name (or empty string if name unknown).
+//
+// THREAD SAFETY: must be called from the main bubbletea Update
+// goroutine. View() reads currentTheme + the styleX vars without
+// locking, so a tea.Cmd background call would race the renderer.
 func SwitchTheme(name string) string {
 	t, ok := allThemes[name]
 	if !ok {
