@@ -96,20 +96,43 @@ func (rn *Runner) Run(ctx context.Context, s Scenario) RunResult {
 	return res
 }
 
-// toolCallPattern matches the runtime log line metis emits when a tool
-// fires in non-interactive mode. The format is stable and deliberate
-// for the eval runner.
-var toolCallPattern = regexp.MustCompile(`(?m)^.*\btool\s*[=:]\s*"?([A-Za-z][A-Za-z0-9_-]*)"?`)
+// toolCallPatterns are the runtime log line shapes scrapeToolCalls
+// recognises as "metis just invoked tool X." Multiple shapes because
+// metis (non-interactive) prints `[tool] Read`, generic agent loops
+// print `tool=Read`, and structured loggers might print `tool: "Read"`.
+//
+// First pattern is metis's own format — verified empirically against
+// `metis run` output (see commit ac93234 follow-up where the original
+// single-regex version missed every metis tool call). Subsequent
+// patterns cover other tools so this package is reusable for evaluating
+// non-metis agents that read the same scenario format.
+var toolCallPatterns = []*regexp.Regexp{
+	// metis non-interactive: a row like `[tool] Read` or `[tool]  Bash`.
+	regexp.MustCompile(`(?m)^\s*\[tool\]\s+([A-Za-z][A-Za-z0-9_-]*)`),
+	// Generic key=value / key:value structured logs: `tool=Read`,
+	// `tool: "Bash"`, `tool: Glob path=...`. The literal "tool" must
+	// be followed by `=` or `:` to avoid matching prose like "the
+	// tool name was X".
+	regexp.MustCompile(`(?m)^.*\btool\s*[=:]\s*"?([A-Za-z][A-Za-z0-9_-]*)"?`),
+}
 
 // scrapeToolCalls pulls tool names out of metis's stderr log. Returns
 // in invocation order with no dedup — a scenario can assert
 // used_tool: Read even if Read fired three times.
+//
+// Multi-pattern dispatch: scan with each pattern in turn, accumulating
+// matches. If a single line matches multiple patterns we'd double-
+// count, but the patterns are exclusive in practice (`[tool] X` has no
+// `=` or `:` after "tool", so it can't satisfy the second regex). A
+// future caller adding ambiguous formats should switch to per-line
+// dispatch (try patterns in order, use the first hit per line).
 func scrapeToolCalls(stderr string) []string {
-	matches := toolCallPattern.FindAllStringSubmatch(stderr, -1)
-	out := make([]string, 0, len(matches))
-	for _, m := range matches {
-		if len(m) > 1 && m[1] != "" {
-			out = append(out, m[1])
+	var out []string
+	for _, pat := range toolCallPatterns {
+		for _, m := range pat.FindAllStringSubmatch(stderr, -1) {
+			if len(m) > 1 && m[1] != "" {
+				out = append(out, m[1])
+			}
 		}
 	}
 	return out

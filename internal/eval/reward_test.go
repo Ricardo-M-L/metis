@@ -123,7 +123,7 @@ func TestReport_EmptyIsZero(t *testing.T) {
 	}
 }
 
-func TestScrapeToolCalls(t *testing.T) {
+func TestScrapeToolCalls_GenericKeyValueFormat(t *testing.T) {
 	stderr := `2026-05-06T13:00:00Z level=info tool=Read path=/tmp/foo
 2026-05-06T13:00:01Z level=info  tool=Glob pattern="*.go"
 2026-05-06T13:00:02Z some random log without a tool name
@@ -137,6 +137,48 @@ func TestScrapeToolCalls(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("[%d] expected %s; got %s", i, want[i], got[i])
 		}
+	}
+}
+
+// TestScrapeToolCalls_MetisBracketFormat — verified empirically:
+// `metis run` (non-interactive) emits one stderr line per tool call
+// shaped `[tool] ToolName`. The original single-regex version missed
+// these entirely, so eval scenarios with `used_tool` assertions
+// silently scored zero. This guards the regression.
+func TestScrapeToolCalls_MetisBracketFormat(t *testing.T) {
+	stderr := `[tool] Read
+[tool] Glob
+[tool]  Bash
+some unrelated line
+[tool] Read`
+	got := scrapeToolCalls(stderr)
+	want := []string{"Read", "Glob", "Bash", "Read"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v; got %v", want, got)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("[%d] expected %s; got %s", i, want[i], got[i])
+		}
+	}
+}
+
+// TestScrapeToolCalls_MixedFormatsCoexist — a scenario runner driving
+// two different agent CLIs in one batch (or one agent that logs in
+// both shapes during transition) should pick up both.
+func TestScrapeToolCalls_MixedFormatsCoexist(t *testing.T) {
+	stderr := `[tool] Read
+2026-05-06T13:00:00Z level=info tool=Glob pattern="**/*.go"`
+	got := scrapeToolCalls(stderr)
+	// Both patterns hit; order = pattern order (bracket first, then
+	// key=value), not file order. Scenario assertions only check
+	// "did this tool name appear", so order across patterns is fine.
+	if len(got) != 2 {
+		t.Fatalf("expected 2 tool calls across two formats; got %v", got)
+	}
+	gotSet := map[string]bool{got[0]: true, got[1]: true}
+	if !gotSet["Read"] || !gotSet["Glob"] {
+		t.Errorf("expected both Read and Glob; got %v", got)
 	}
 }
 
