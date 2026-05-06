@@ -192,6 +192,16 @@ type Model struct {
 	histCursor  int
 	histMatched []string // subset of histAll that fuzzy-matches histFilter
 
+	// Direct ↑/↓ history navigation (T7) — separate from the Ctrl+R
+	// overlay above. When the input is empty or its content was last
+	// loaded from history, ↑ walks back through histAll one entry at
+	// a time and ↓ walks forward. histDirectIdx == -1 means "not
+	// navigating yet"; ≥ 0 indexes into histAll. histDirectDraft is
+	// the user's in-progress text saved when nav started, restored
+	// when ↓ walks past index 0.
+	histDirectIdx   int
+	histDirectDraft string
+
 	// @-mention dropdown state. Tracked separately from the slash
 	// palette so an in-progress `@xxx` filter doesn't fight the slash
 	// palette's `palFilter` for the same buffer. Recomputed on every
@@ -459,6 +469,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 			{Label: "No", Key: "n"},
 			{Label: "Cancel turn", Key: "c"},
 		},
+		histDirectIdx: -1, // not navigating yet — first ↑ jumps to histAll[0]
 	}
 	if pendingUpdateNotice != "" {
 		// Surface the update notice as the first info row so the user

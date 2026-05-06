@@ -339,6 +339,27 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Direct history navigation (T7): when the input is empty or its
+	// content was loaded from history, ↑/↓ walks through prior prompts
+	// instead of moving the textarea cursor between rows. Saves a
+	// Ctrl+R round-trip for the common "what did I type last" case.
+	switch msg.String() {
+	case "up":
+		if m.directHistoryEligible() && m.directHistoryUp() {
+			return m, nil
+		}
+	case "down":
+		if m.histDirectIdx >= 0 && m.directHistoryDown() {
+			return m, nil
+		}
+	}
+
+	// Any other key during nav-mode means the user is editing — exit
+	// nav so the next ↑ starts fresh from the (just-mutated) draft.
+	if m.histDirectIdx >= 0 {
+		m.resetDirectHistoryNav()
+	}
+
 	// While a turn is in flight, let the user keep typing the next prompt
 	// — claude-code parity. Submit (Enter) is still blocked by
 	// handleSubmit's `if m.turnActive` guard which surfaces a
