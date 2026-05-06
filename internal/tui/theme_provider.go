@@ -70,7 +70,15 @@ func ThemeForProvider(providerID string) *Theme {
 		return currentTheme
 	}
 	clone := *currentTheme
-	clone.Name = currentTheme.Name + "+" + strings.ToLower(providerID)
+	// Strip any prior "+provider" suffix so repeated calls don't
+	// accumulate names like "dark+anthropic+openai+kimi" — each call
+	// should produce a fresh "<base>+<newProvider>" regardless of
+	// how many times the user has switched.
+	baseName := currentTheme.Name
+	if idx := strings.Index(baseName, "+"); idx >= 0 {
+		baseName = baseName[:idx]
+	}
+	clone.Name = baseName + "+" + strings.ToLower(providerID)
 	clone.AccentBlue = lipgloss.Color(tint)
 	// Keep AccentCyan tinted too — the user-input marker reads cyan in
 	// dark theme; matching it to the provider tint keeps the input

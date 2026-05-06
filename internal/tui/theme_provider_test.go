@@ -76,6 +76,41 @@ func TestThemeForProvider_UnknownReturnsSamePointer(t *testing.T) {
 	}
 }
 
+func TestApplyProviderTint_NameDoesNotAccumulate(t *testing.T) {
+	// Snapshot original to restore at end.
+	originalName := currentTheme.Name
+	t.Cleanup(func() {
+		base := strings.SplitN(originalName, "+", 2)[0]
+		SwitchTheme(base)
+	})
+
+	// Force a known starting point.
+	SwitchTheme("dark")
+	if currentTheme.Name != "dark" {
+		t.Fatalf("setup: starting name should be 'dark'; got %q", currentTheme.Name)
+	}
+
+	ApplyProviderTint("anthropic")
+	if currentTheme.Name != "dark+anthropic" {
+		t.Errorf("first apply: expected dark+anthropic; got %q", currentTheme.Name)
+	}
+
+	// Crucial check: a second apply should NOT produce
+	// "dark+anthropic+openai" — the prior +anthropic suffix must
+	// be stripped before re-tinting.
+	ApplyProviderTint("openai")
+	if currentTheme.Name != "dark+openai" {
+		t.Errorf("second apply: name should not accumulate, expected dark+openai; got %q",
+			currentTheme.Name)
+	}
+
+	// Third apply should also stay clean.
+	ApplyProviderTint("gemini")
+	if currentTheme.Name != "dark+gemini" {
+		t.Errorf("third apply: expected dark+gemini; got %q", currentTheme.Name)
+	}
+}
+
 func TestThemeForProvider_DoesNotMutateGlobal(t *testing.T) {
 	beforeName := currentTheme.Name
 	beforeAccent := currentTheme.AccentBlue
