@@ -51,6 +51,11 @@ func (s *BodyScreen) Resize(width, height int) {
 
 func (s *BodyScreen) Done() bool { return s.done }
 
+// Command returns the slash command this body was opened for
+// (e.g. "/cost"). Used by the parent's apply step to label the
+// dismissal trace ("(/cost dialog dismissed)").
+func (s *BodyScreen) Command() string { return s.command }
+
 // bodyHeight reserves rows for the chrome (header stripe + spacer +
 // footer hint + spacer ≈ 4).
 func (s *BodyScreen) bodyHeight() int {

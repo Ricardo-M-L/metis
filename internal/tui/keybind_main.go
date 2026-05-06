@@ -34,6 +34,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// History-search overlay claims ALL keys while open — typing
 	// narrows the filter, ↑↓ selects, Enter copies into input, Esc
 	// cancels. We don't fall through to the editor while it's up.
+	if m.showSearch {
+		// Transcript-search overlay (Ctrl+F). Esc closes; Enter jumps
+		// to the current hit; Ctrl+N/P walk hits; chars filter.
+		if kp, ok := msg.(tea.KeyPressMsg); ok {
+			cmd, _ := m.handleSearchKey(kp)
+			return m, cmd
+		}
+	}
 	if m.showHistory {
 		return m.handleHistoryKey(msg)
 	}
@@ -132,6 +140,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openHistorySearch()
 		return m, nil
 
+	case "ctrl+f":
+		// In-transcript full-text search (F10). Distinct from Ctrl+R
+		// (cross-session prompt history). Opens a small overlay
+		// above the input with /query/ + n/p navigation. Esc closes.
+		m.openTranscriptSearch()
+		return m, nil
+
 	case "ctrl+y":
 		// Yank the last assistant reply to the system clipboard via
 		// OSC 52. Vim's `y` muscle memory for "copy this." Useful in
@@ -139,6 +154,18 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// (mouse cell motion intercepts drag events). Falls back to
 		// writing ~/.metis/clipboard.txt for terminals without OSC 52.
 		status := m.yankLastAssistant()
+		m.messages = append(m.messages, Message{
+			Role: "info", Content: status, Timestamp: time.Now(),
+		})
+		return m, nil
+
+	case "ctrl+shift+y":
+		// Yank the FULL transcript (every user/assistant/bash row) to
+		// the clipboard. Useful when the user wants to dump a whole
+		// session into a bug report, blog post, or PR description.
+		// Filtered: thinking traces, info rows, status / metadata
+		// stay out of the export so it reads as a conversation.
+		status := m.yankFullTranscript()
 		m.messages = append(m.messages, Message{
 			Role: "info", Content: status, Timestamp: time.Now(),
 		})
@@ -166,6 +193,23 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.imageCounter++
 				m.imagePaste[m.imageCounter] = path
 				m.input.InsertString(fmt.Sprintf("[Image #%d] ", m.imageCounter))
+				// F19: surface a tiny info row so the user sees the
+				// image was actually cached + where. Without this
+				// the only feedback is the [Image #N] placeholder
+				// in the editor, which doesn't tell the user the
+				// MB-size dump on their disk.
+				kb := len(content.Data) / 1024
+				m.messages = append(m.messages, Message{
+					Role:      "info",
+					Content:   fmt.Sprintf("(image #%d cached: %s, %d KiB)", m.imageCounter, path, kb),
+					Timestamp: time.Now(),
+				})
+			} else {
+				m.messages = append(m.messages, Message{
+					Role:      "error",
+					Content:   fmt.Sprintf("paste failed: %v", err),
+					Timestamp: time.Now(),
+				})
 			}
 		} else if content.Mime == "text/plain" {
 			m.input.InsertString(string(content.Data))
@@ -179,11 +223,24 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.expandToolOutputs {
 			state = "on"
 		}
-		m.messages = append(m.messages, Message{
-			Role:      "info",
-			Content:   "expand tool output: " + state,
-			Timestamp: time.Now(),
-		})
+		newContent := "expand tool output: " + state
+		// REPLACE the trailing info message instead of appending a new
+		// one when the previous message is also an `expand tool
+		// output: …` toggle. Otherwise rapid ctrl+O presses pile up
+		// "off / on / off / on / off" rows in the transcript.
+		// Feedback 2026-05-05.
+		if n := len(m.messages); n > 0 &&
+			m.messages[n-1].Role == "info" &&
+			strings.HasPrefix(m.messages[n-1].Content, "expand tool output:") {
+			m.messages[n-1].Content = newContent
+			m.messages[n-1].Timestamp = time.Now()
+		} else {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   newContent,
+				Timestamp: time.Now(),
+			})
+		}
 		return m, nil
 
 	case "esc":

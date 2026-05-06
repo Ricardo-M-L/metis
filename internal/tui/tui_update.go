@@ -261,6 +261,13 @@ func (m *Model) finalizeTurn(err error) {
 				Timestamp: time.Now(),
 			})
 		}
+		// OSC9 desktop notification on long turns. Threshold gates
+		// out quick replies (<30s) where the user is still watching
+		// the screen and a banner would be noise. Mirrors claude-
+		// code's notification queue minimum-duration heuristic.
+		if d := time.Since(m.spinnerStartedAt); d >= NotifyMinDuration {
+			Notify("metis", fmt.Sprintf("turn finished in %s", formatTurnDuration(d)))
+		}
 	}
 	// Structural recap below the thought-summary, when this turn did
 	// enough work to be worth summarizing (≥2 tool calls).

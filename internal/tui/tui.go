@@ -179,6 +179,13 @@ type Model struct {
 	// palette (`showPalette`) so a user can hit `/` mid-history-search
 	// without us having to multiplex two filter strings into one.
 	// Loaded lazily on first open from ~/.metis/history.jsonl.
+	// transcript search (F10, Ctrl+F): full-text find within current
+	// session's messages. Distinct from showHistory which searches
+	// past prompts across all sessions.
+	showSearch  bool
+	searchQuery string
+	searchHits  []int // message indices matching searchQuery
+	searchCur   int   // current index into searchHits
 	showHistory bool
 	histAll     []string // newest-first dedup'd input strings
 	histFilter  string
@@ -421,7 +428,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	// when the snapshot is zero (tests / fresh installs without TOML).
 	pc := perfConfig()
 
-	return &Model{
+	mdl := &Model{
 		ctx:         ctx,
 		loop:        loop,
 		gate:        gate,
@@ -453,6 +460,18 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 			{Label: "Cancel turn", Key: "c"},
 		},
 	}
+	if pendingUpdateNotice != "" {
+		// Surface the update notice as the first info row so the user
+		// sees it inside alt-screen rather than having it swallowed
+		// when bubbletea swaps buffers.
+		mdl.messages = append(mdl.messages, Message{
+			Role:      "info",
+			Content:   "[update] " + pendingUpdateNotice,
+			Timestamp: time.Now(),
+		})
+		pendingUpdateNotice = ""
+	}
+	return mdl
 }
 
 // SetExternalHooks attaches optional callbacks for features whose state
@@ -513,3 +532,16 @@ var earlyInputReader io.Reader
 // RunTUI call. main.go calls this with runtime.EarlyInput.Reader()
 // after the EarlyInput's Stop() has restored terminal mode.
 func SetEarlyInputReader(r io.Reader) { earlyInputReader = r }
+
+// pendingUpdateNotice is set by SetPendingUpdateNotice from main.go's
+// maybeNotifyUpdate when a newer release is detected. Stashed here as
+// package-level state because writing the notice to stderr direct
+// gets swallowed when bubbletea swaps to alt-screen — instead the
+// next NewModel pulls it and surfaces an info row inside the chat
+// transcript so the user sees the "metis vX.Y.Z available" hint.
+var pendingUpdateNotice string
+
+// SetPendingUpdateNotice queues an update-available notice to be
+// shown as the first info row in the next TUI session. Cleared on
+// consumption.
+func SetPendingUpdateNotice(notice string) { pendingUpdateNotice = notice }

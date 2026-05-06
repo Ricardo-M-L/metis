@@ -68,19 +68,55 @@ func (m *Model) View() tea.View {
 
 	// chatView wraps a content string with the metis-standard view
 	// flags. AltScreen on for the full-screen TUI surface; mouse mode
-	// stays None because bubbletea v2.0.6 (alpha) does not reliably
-	// consume the SGR mouse reports the terminal sends back when
-	// CellMotion is enabled — under drag/hover the raw `^[[<0;col;rowM`
-	// sequences leak onto the screen, garbling the input box and
-	// pushing the prompt onto a new line. Losing wheel scroll inside
-	// the TUI is a much smaller regression than a broken prompt; users
-	// can still PgUp/PgDown via keys, and copyMode below already
-	// handles "let me mouse-select scrollback" by exiting AltScreen.
-	// Re-enable when bubbletea v2 ships a stable mouse pipeline.
+	// is CellMotion (button-event tracking — clicks + wheel + drag-
+	// while-button-pressed, NO hover). bubbletea v2.0.6 reliably
+	// consumes the wheel/click reports at this level; the leakage
+	// problem we hit earlier was specifically AllMotion (drag/hover
+	// reports leaking as `^[[<0;col;rowM` text). Without CellMotion
+	// the user's trackpad scroll inside the TUI does nothing —
+	// feedback 2026-05-05.
+	//
+	// Copy mode below still works: it returns AltScreen=false, which
+	// drops the terminal back to its native buffer where the user
+	// can mouse-select scrollback as before.
 	chatView := func(content string) tea.View {
 		v := tea.NewView(content)
 		v.AltScreen = true
-		v.MouseMode = tea.MouseModeNone
+		v.MouseMode = tea.MouseModeCellMotion
+		return v
+	}
+	// attachCursor sets v.Cursor based on the textarea's current
+	// position. Caller passes the absolute Y row at which
+	// renderInputLine BEGAN writing; the rest is computed against
+	// the textarea's internal cursor (which knows its own column).
+	//
+	// Returns the v unchanged when the input shouldn't show a cursor
+	// (overlay / copy mode / permission prompt has the keyboard).
+	//
+	// Mirrors claude-code: native terminal cursor at the textarea
+	// position rather than a fake inverse-block character.
+	attachCursor := func(v tea.View, inputStartRow int) tea.View {
+		if m.activeScreen != nil || m.copyMode || m.permActive || m.showHistory {
+			return v
+		}
+		cur := m.input.Cursor()
+		if cur == nil {
+			return v
+		}
+		// renderInputLine layout (see render_chrome.go:renderInputLine):
+		//   "\n"               ← 1 line gap
+		//   divider "  ────…"  ← 1 line
+		//   body[0]            ← textarea row 0 lands here
+		//   body[1..n]
+		//   divider
+		//   "\n"
+		// So absolute textarea body Y = inputStartRow + 2.
+		cur.Position.Y += inputStartRow + 2
+		// renderInputLine prefixes each body line with "  " (2 spaces).
+		cur.Position.X += 2
+		cur.Shape = tea.CursorBlock
+		cur.Blink = true
+		v.Cursor = cur
 		return v
 	}
 
@@ -109,6 +145,7 @@ func (m *Model) View() tea.View {
 		m.showBanner = false
 		var s strings.Builder
 		s.WriteString(m.renderWelcomeBanner())
+		inputStartRow := strings.Count(s.String(), "\n")
 		s.WriteString(renderInputLine(m))
 		// hints (mode indicator) goes IMMEDIATELY below the input box —
 		// claude-code parity: the user's eye is already on the input,
@@ -126,7 +163,7 @@ func (m *Model) View() tea.View {
 		}
 		s.WriteString(renderStatusBar(m))
 		s.WriteString("\033[0m")
-		return chatView(s.String())
+		return attachCursor(chatView(s.String()), inputStartRow)
 	}
 
 	var s strings.Builder
@@ -194,10 +231,15 @@ func (m *Model) View() tea.View {
 	// Render the visible window only. ListView is < 5 KB even for
 	// 1200-item sessions because virtualization caps output at
 	// `desiredVp` lines.
+	//
+	// Scrollbar is intentionally OFF: user feedback 2026-05-05 said
+	// the deep-blue `█` thumb was visually loud. claude-code doesn't
+	// paint a scrollbar either; it relies on the terminal's own
+	// scrollback (Ctrl+S copy mode here exits alt-screen so users
+	// who want to scroll back to history can mouse-select). If we
+	// re-enable the gutter later, it should be one of `│┃▎` in dim
+	// rather than a full block in accent colour.
 	listView := m.chatList.Render()
-	if m.chatList.Height() > 0 && m.chatList.TotalLineCount() > m.chatList.Height() {
-		listView = renderScrollbar(listView, m.chatList)
-	}
 	s.WriteString(listView)
 	s.WriteString("\n")
 
@@ -248,6 +290,7 @@ func (m *Model) View() tea.View {
 		s.WriteString(renderPermission(m))
 	}
 
+	inputStartRow := strings.Count(s.String(), "\n")
 	s.WriteString(renderInputLine(m))
 	// hints (mode indicator) — claude-code parity: glued to the input.
 	s.WriteString(renderHints(m))
@@ -256,6 +299,9 @@ func (m *Model) View() tea.View {
 	// pattern). Palette is suggestion overlay, hints is permanent.
 	if m.showPalette {
 		s.WriteString(renderPalette(m))
+	}
+	if m.showSearch {
+		s.WriteString(renderTranscriptSearch(m))
 	}
 
 	// Task panel — Ctrl+T opens a bordered list of todos.
@@ -277,5 +323,5 @@ func (m *Model) View() tea.View {
 	// Reset ANSI styles to prevent stacking
 	s.WriteString("\033[0m")
 
-	return chatView(s.String())
+	return attachCursor(chatView(s.String()), inputStartRow)
 }

@@ -28,7 +28,12 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 	case *screen.EffortScreen:
 		applied := w.Applied()
 		if applied == "" {
-			return nil // user cancelled
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(effort dialog dismissed)",
+				Timestamp: time.Now(),
+			})
+			return nil
 		}
 		// Map widget label → llm.Effort. "off" maps to EffortDefault
 		// so the next request lets the provider decide.
@@ -56,6 +61,11 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 	case *screen.ModelScreen:
 		applied := w.Applied()
 		if applied == "" {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(model dialog dismissed)",
+				Timestamp: time.Now(),
+			})
 			return nil
 		}
 		m.model = applied
@@ -69,6 +79,11 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 	case *screen.ThemeScreen:
 		applied := w.Applied()
 		if applied == "" {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(theme dialog dismissed)",
+				Timestamp: time.Now(),
+			})
 			return nil
 		}
 		if name := SwitchTheme(applied); name != "" {
@@ -82,9 +97,19 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 	case *screen.PermissionsScreen:
 		applied := w.Applied()
 		if applied == "" {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(permissions dialog dismissed)",
+				Timestamp: time.Now(),
+			})
 			return nil
 		}
 		if applied == string(m.gate.Mode()) {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(permissions dialog dismissed — no change)",
+				Timestamp: time.Now(),
+			})
 			return nil
 		}
 		m.gate.SetMode(permission.Mode(applied))
@@ -101,7 +126,12 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		// /advisor + Enter runs it).
 		picked := w.Selected()
 		if picked == "" {
-			return nil // Esc / cancelled / cursor on non-selectable row
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(help dialog dismissed)",
+				Timestamp: time.Now(),
+			})
+			return nil
 		}
 		m.input.SetValue("/" + picked)
 		_, cmd := m.handleSubmit()
@@ -118,11 +148,27 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			return cmd
 		}
 
+	case *screen.BodyScreen:
+		// Body screens (/diff, /cost, /context, /version, /doctor, …)
+		// are pure-display modals — no committed result. The trace
+		// just confirms the user closed it. claude-code shows
+		// "Diff dialog dismissed" / "Cost dialog dismissed" etc.
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   "(" + w.Command() + " dialog dismissed)",
+			Timestamp: time.Now(),
+		})
+
 	case *screen.PickerScreen:
 		// PickerScreen serves multiple list-style commands; route on
 		// the `command` field the picker was opened with.
 		picked := w.Selected()
 		if picked == "" {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(" + w.Command() + " dialog dismissed)",
+				Timestamp: time.Now(),
+			})
 			return nil
 		}
 		switch w.Command() {

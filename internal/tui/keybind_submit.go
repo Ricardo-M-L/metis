@@ -120,9 +120,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 					m.loop.SteerInject(display)
+					// user-steer (not info) so the steered prompt is
+					// visible in the same lane as a normal user message.
 					m.messages = append(m.messages, Message{
-						Role:      "info",
-						Content:   "(steered via " + slashName(raw) + ": " + display + ")",
+						Role:      "user-steer",
+						Content:   display,
 						Timestamp: time.Now(),
 					})
 					m.input.Reset()
@@ -136,9 +138,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		}
 
 		m.loop.SteerInject(raw)
+		// Render mid-turn input as user-steer (visible) rather than
+		// muted info — feedback 2026-05-05: a steered query rendered
+		// with styleMuted blends into the surrounding turn output and
+		// the user "doesn't see their query was received". user-steer
+		// uses the regular user prompt colour with a steer arrow to
+		// stay distinct from a fresh-turn user prompt.
 		m.messages = append(m.messages, Message{
-			Role:      "info",
-			Content:   "(steered: " + raw + ")",
+			Role:      "user-steer",
+			Content:   raw,
 			Timestamp: time.Now(),
 		})
 		m.input.Reset()

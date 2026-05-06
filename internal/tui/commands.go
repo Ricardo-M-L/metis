@@ -1313,10 +1313,22 @@ func (t *tokenTracker) add(in, out, cacheCreate, cacheRead int) {
 	t.out += out
 	t.cacheCreate += cacheCreate
 	t.cacheRead += cacheRead
-	t.lastIn = in
-	t.lastOut = out
-	t.lastCacheCreate = cacheCreate
-	t.lastCacheRead = cacheRead
+	// Last-* trackers represent "the most recent API call that
+	// REPORTED usage" — don't overwrite them when an event carries
+	// a zero. Mid-turn the agent emits multiple EventTokenUpdate
+	// events, some of which (tool_result echo, streaming
+	// summary-only) report 0 input usage; if we let those overwrite
+	// last* the bottom-right context bar blanks out mid-turn.
+	// Feedback 2026-05-05: "right-side token count disappears
+	// during a tool run".
+	if in > 0 || cacheCreate > 0 || cacheRead > 0 {
+		t.lastIn = in
+		t.lastCacheCreate = cacheCreate
+		t.lastCacheRead = cacheRead
+	}
+	if out > 0 {
+		t.lastOut = out
+	}
 }
 
 // LastIn / LastOut / LastCacheCreate / LastCacheRead expose the most

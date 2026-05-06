@@ -104,3 +104,47 @@ func osc52Status() string {
 // timestamp + session id to the fallback file so users have a
 // natural log of yanks. Keeping the import for that.
 var _ = time.Now
+
+// yankFullTranscript copies the entire chat transcript (user + assistant
+// + bash output) to the system clipboard via OSC 52. Mirrors claude-
+// code's transcript-export workflow — when a user wants to paste a
+// whole session into a bug report or doc, Ctrl+Shift+Y is much faster
+// than scrolling + drag-selecting in copy mode.
+//
+// Filters out spinner / status / dim metadata so the export reads
+// like a conversation, not a TUI dump. Returns a one-line confirmation
+// for the transcript ("copied X chars across N turns").
+func (m *Model) yankFullTranscript() string {
+	if len(m.messages) == 0 {
+		return "(nothing to copy yet)"
+	}
+	var b []byte
+	turns := 0
+	for _, msg := range m.messages {
+		switch msg.Role {
+		case "user":
+			b = append(b, "USER: "...)
+			b = append(b, msg.Content...)
+			b = append(b, '\n', '\n')
+			turns++
+		case "user-steer":
+			b = append(b, "USER (mid-turn): "...)
+			b = append(b, msg.Content...)
+			b = append(b, '\n', '\n')
+		case "assistant":
+			b = append(b, "ASSISTANT: "...)
+			b = append(b, msg.Content...)
+			b = append(b, '\n', '\n')
+		case "bash":
+			b = append(b, "$ "...)
+			b = append(b, msg.Content...)
+			b = append(b, '\n', '\n')
+		}
+	}
+	if len(b) == 0 {
+		return "(nothing to copy yet)"
+	}
+	writeClipboard(string(b))
+	return fmt.Sprintf("(copied transcript — %d chars across %d turn(s) via %s)",
+		len(b), turns, osc52Status())
+}
