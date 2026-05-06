@@ -277,15 +277,17 @@ func TestE2E_AutoScrollDoesNotYankScrolledUpUser(t *testing.T) {
 	}
 }
 
+// TestE2E_ScrollbarPresentWhenContentExceedsViewport — historical name.
+// Scrollbar was DISABLED on 2026-05-05 (feedback: deep-blue thumb was
+// visually loud). The list still renders, just without the right-edge
+// gutter. Test now asserts the OPPOSITE: those glyphs must NOT appear.
 func TestE2E_ScrollbarPresentWhenContentExceedsViewport(t *testing.T) {
-	// 50 messages × ~5 lines each = 250 lines. Viewport is 20.
-	// Scrollbar must render.
 	m := newE2EModel(t, 80, 30, 50)
 	_ = m.View()
-	out := m.View().Content // second frame so cache primes
+	out := m.View().Content
 
-	if !strings.ContainsRune(out, '│') && !strings.ContainsRune(out, '█') {
-		t.Error("scrollbar (track │ or thumb █) missing when content exceeds viewport")
+	if strings.ContainsRune(out, '█') {
+		t.Error("scrollbar thumb █ must not render — disabled per 2026-05-05 feedback")
 	}
 }
 

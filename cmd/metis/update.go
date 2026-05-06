@@ -15,19 +15,28 @@ import (
 )
 
 // maybeNotifyUpdate runs at TUI/REPL startup. It throttles to one network
-// call per 24h and only prints a one-line notice — never auto-installs.
+// call per 24h and only returns a one-line notice — never auto-installs.
 // Errors are swallowed silently; this should never block the user.
-func maybeNotifyUpdate() {
+//
+// Returns the formatted notice string (empty when up-to-date or check
+// errored). Caller is responsible for surfacing the notice. For TUI we
+// stash it via tui.SetPendingUpdateNotice so it lands as an info row
+// inside alt-screen — writing to stderr direct gets eaten when
+// bubbletea swaps to the alternate buffer.
+func maybeNotifyUpdate() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	tag := update.MaybeCheck(ctx, config.Home(), version.Version)
 	if tag == "" {
-		return
+		return ""
 	}
-	fmt.Fprintf(os.Stderr,
-		"\033[33m[update]\033[0m metis %s available (current: %s) — run `metis update` to install\n",
-		strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"))
 	update.MarkNotified(config.Home(), tag)
+	notice := fmt.Sprintf("metis %s available (current: %s) — run `metis update` to install",
+		strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"))
+	// Also write to stderr for non-TUI callers (metis run / scripted).
+	// The TUI path overwrites this with an in-app info row anyway.
+	fmt.Fprintf(os.Stderr, "\033[33m[update]\033[0m %s\n", notice)
+	return notice
 }
 
 func cmdUpdate(ctx context.Context, args []string) error {

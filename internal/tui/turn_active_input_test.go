@@ -47,18 +47,21 @@ func TestTurnActive_SubmitSteers(t *testing.T) {
 
 	pressEnter(t, m)
 
-	// Look for a "(steered: ...)" info line and verify the underlying
-	// loop's steer buffer holds the text.
+	// Look for the user-steer message verifying the underlying loop's
+	// steer buffer holds the text. Mid-turn input now lands as a
+	// `Role: "user-steer"` Message (visible in the same lane as a
+	// fresh user prompt — feedback 2026-05-05 said the prior muted
+	// info-style row was invisible against the rest of the turn).
 	found := false
 	for i := beforeMsgs; i < len(m.messages); i++ {
-		if strings.Contains(m.messages[i].Content, "steered:") &&
+		if m.messages[i].Role == "user-steer" &&
 			strings.Contains(m.messages[i].Content, "use Edit not Write") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("Enter mid-turn should emit a (steered: ...) info line; got messages[%d:]=%+v",
+		t.Errorf("Enter mid-turn should emit a user-steer message; got messages[%d:]=%+v",
 			beforeMsgs, m.messages[beforeMsgs:])
 	}
 	// Input must be cleared so the user sees the steer was accepted

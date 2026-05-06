@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -38,7 +39,10 @@ func TestHelpDispatch_EnterRunsPickedCommand(t *testing.T) {
 }
 
 // TestHelpDispatch_EscNoDispatch — Esc on /help dismisses without
-// firing any command.
+// dispatching a command. As of 2026-05-05 the dismiss writes a
+// trace info ("(help dialog dismissed)") so the user sees their
+// action landed; the test now asserts that trace appears AND no
+// command was fired.
 func TestHelpDispatch_EscNoDispatch(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.input.SetValue("/help")
@@ -52,9 +56,17 @@ func TestHelpDispatch_EscNoDispatch(t *testing.T) {
 	if m.activeScreen != nil {
 		t.Errorf("Esc should clear activeScreen")
 	}
-	// Esc shouldn't have produced a confirmation message.
-	if len(m.messages) > beforeMsgs {
-		t.Errorf("Esc should not append messages; before=%d after=%d", beforeMsgs, len(m.messages))
+	// Exactly one new info row — the dismiss trace. More than one would
+	// suggest a command was also fired.
+	added := len(m.messages) - beforeMsgs
+	if added != 1 {
+		t.Errorf("Esc should add exactly the dismiss-trace info row; before=%d after=%d", beforeMsgs, len(m.messages))
+	}
+	if added == 1 {
+		last := m.messages[len(m.messages)-1]
+		if last.Role != "info" || !strings.Contains(last.Content, "dismissed") {
+			t.Errorf("expected info row with `dismissed`; got role=%q content=%q", last.Role, last.Content)
+		}
 	}
 }
 

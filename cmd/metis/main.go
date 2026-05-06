@@ -535,7 +535,9 @@ func cmdChat(ctx context.Context, args []string) error {
 		if err := ensureTrusted(); err != nil {
 			return err
 		}
-		maybeNotifyUpdate()
+		if notice := maybeNotifyUpdate(); notice != "" {
+			tui.SetPendingUpdateNotice(notice)
+		}
 	}
 
 	// --worktree: spawn a git worktree first so config/CLAUDE.md/etc.
@@ -1202,8 +1204,56 @@ func cmdSessions(args []string) error {
 		}
 		fmt.Println(newID)
 		return nil
+	case "branch":
+		// `metis sessions branch <id> [--keep N]` — fork an existing
+		// session at message N (default: copy entire history). Mirrors
+		// claude-code's /branch but exposed as a CLI subcommand for
+		// scripting. New session id printed to stdout.
+		if len(args) < 2 {
+			return errors.New("usage: metis sessions branch <id> [--keep N]")
+		}
+		srcID := args[1]
+		keepN := 0 // 0 = full clone
+		for i := 2; i < len(args); i++ {
+			if args[i] == "--keep" && i+1 < len(args) {
+				if n, ok := atoiSafe(args[i+1]); ok {
+					keepN = n
+				}
+				i++
+			}
+		}
+		_, msgs, err := store.Load(srcID)
+		if err != nil {
+			return fmt.Errorf("branch: load %s: %w", srcID, err)
+		}
+		clone := msgs
+		if keepN > 0 && keepN < len(msgs) {
+			clone = msgs[:keepN]
+		}
+		newID, err := store.Branch(srcID, clone)
+		if err != nil {
+			return err
+		}
+		fmt.Println(newID)
+		return nil
 	}
 	return fmt.Errorf("sessions: unknown subcommand %q", sub)
+}
+
+// atoiSafe parses an int without pulling strconv across the file's
+// existing imports; returns (0, false) on any error.
+func atoiSafe(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
 }
 
 func cmdSkills(args []string) error {
