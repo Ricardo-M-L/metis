@@ -25,6 +25,8 @@ func cmdEval(ctx context.Context, args []string) error {
 	out := fs.String("out", "", "write JSONL results to this file (in addition to console summary)")
 	tag := fs.String("tag", "", "only run scenarios with this tag (smoke, regression, ...)")
 	binary := fs.String("binary", "", "path to metis binary (default: this process)")
+	provider := fs.String("provider", "", "override provider for scenarios (forwarded as -p to metis run)")
+	model := fs.String("model", "", "override model for scenarios (forwarded as -m to metis run)")
 	verbose := fs.Bool("verbose", false, "stream subprocess stderr live")
 	grace := fs.Duration("grace", 5*time.Second, "extra time on top of each scenario's timeout")
 	if err := fs.Parse(args); err != nil {
@@ -61,6 +63,18 @@ func cmdEval(ctx context.Context, args []string) error {
 	rn := &eval.Runner{
 		MetisBinary: bin,
 		GlobalGrace: *grace,
+	}
+	// --provider / --model forward as `-p X` / `-m Y` to each
+	// `metis run` subprocess. Use case: default provider has a known
+	// quirk for tool-calling scenarios (e.g. minimax empty-args bug
+	// in project_minimax_function_calling_bug.md), so the user runs
+	// `metis eval --provider deepseek` to swap to a known-good route
+	// for the eval batch without changing global config.
+	if *provider != "" {
+		rn.ExtraArgs = append(rn.ExtraArgs, "-p", *provider)
+	}
+	if *model != "" {
+		rn.ExtraArgs = append(rn.ExtraArgs, "-m", *model)
 	}
 	if *verbose {
 		rn.StreamLogs = os.Stderr
@@ -156,6 +170,8 @@ Flags:
   --tag TAG       only scenarios with this tag (smoke, regression, ...)
   --out PATH      write JSONL results to PATH (in addition to console summary)
   --binary BIN    metis binary to test (default: this process's executable)
+  --provider P    forward as -p P to each metis run (override provider)
+  --model M       forward as -m M to each metis run (override model)
   --verbose       stream subprocess stderr live + show assertion breakdown
   --grace D       extra time on top of each scenario's timeout (default: 5s)
 

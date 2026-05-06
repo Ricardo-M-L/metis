@@ -193,7 +193,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.imageCounter++
 				m.imagePaste[m.imageCounter] = path
 				m.input.InsertString(fmt.Sprintf("[Image #%d] ", m.imageCounter))
-				// F19: surface a tiny info row so the user sees the
+				// Surface a tiny info row so the user sees the
 				// image was actually cached + where. Without this
 				// the only feedback is the [Image #N] placeholder
 				// in the editor, which doesn't tell the user the

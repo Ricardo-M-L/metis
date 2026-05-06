@@ -77,7 +77,7 @@ func renderInfoBox(title string, rows []infoRow) string {
 }
 
 func renderCost(m *Model) string {
-	// F17: richer /cost — break input/output by category + show
+	// Richer /cost — break input/output by category + show
 	// price-per-Mtok column + cache savings + per-class subtotals.
 	// Mirrors claude-code's /cost which surfaces every dimension a
 	// user would ask about (raw tokens, cost share, cache hit rate).

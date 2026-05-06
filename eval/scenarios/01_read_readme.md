@@ -12,7 +12,7 @@ metis 仓库根目录下有 README.md。
 读一下当前目录的 README.md，用一句话告诉我这是什么项目。
 
 # Reward
-- contains_all: ["metis"] weight=1
-- contains_any: ["agent", "CLI", "Go"] weight=1
+- contains_any: ["metis", "Metis", "MetIs", "METIS"] weight=1
+- contains_any: ["agent", "Agent", "CLI", "Go", "go", "工具", "命令行"] weight=1
 - used_tool: Read weight=2
 - length: 10..400 weight=0.5

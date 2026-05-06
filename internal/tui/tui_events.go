@@ -70,7 +70,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			})
 		}
 	case agent.EventToolArgsDelta:
-		// T12: kimi-cli-style streaming tool args. The LLM is typing
+		// kimi-cli-style streaming tool args. The LLM is typing
 		// the JSON for an in-flight tool; surface it on the spinner
 		// subline so the user sees "Read · /tmp/foo..." appear
 		// character-by-character instead of a long silent pause.
