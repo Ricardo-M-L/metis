@@ -88,6 +88,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdAudit()
 	case "diag":
 		return cmdDiag(ctx, args[1:])
+	case "eval":
+		return cmdEval(ctx, args[1:])
 	case "update":
 		return cmdUpdate(ctx, args[1:])
 	case "version", "-v", "--version":
@@ -124,6 +126,7 @@ Usage:
   metis auth <login|logout|list>  Manage provider credentials (~/.metis/auth.json)
   metis audit           Print a security audit of the current configuration
   metis diag [--llm] [--tool-smoke] [--json]  Run a non-interactive health check
+  metis eval [--dir DIR] [--tag T] [--out P]  Run the markdown scenario pack
   metis update [--check]  Self-update from the private release (needs METIS_GITHUB_TOKEN)
   metis version [-V]    Print version (-V for build fingerprint)
   metis help            This help
