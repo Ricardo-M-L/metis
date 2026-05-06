@@ -143,6 +143,15 @@ func renderMessage(msg Message, width int) string {
 		// and info messages floated awkwardly.
 		s.WriteString(styleMuted.Render("  · " + msg.Content))
 		s.WriteString("\n")
+	case "user-steer":
+		// Mid-turn user input that was injected via SteerInject (the
+		// user typed something while the previous turn was still
+		// running). Visually the same lane as a fresh user prompt so
+		// the user sees their query land — but with a steer arrow to
+		// distinguish it from a turn-starting prompt.
+		s.WriteString("\n")
+		s.WriteString(styleUser.Render("  ↳ " + msg.Content))
+		s.WriteString("\n")
 	}
 	return s.String()
 }

@@ -168,9 +168,34 @@ func summarizeToolResult(te ToolEvent) string {
 			return dur
 		}
 		return fmt.Sprintf("%s · %s", dur, truncate(first, 60))
-	case "Glob", "Grep":
+	case "Glob":
+		if strings.HasPrefix(strings.TrimSpace(te.Output), "(no matches)") {
+			return fmt.Sprintf("%s · No files matched", dur)
+		}
 		n := lineCount(te.Output)
-		return fmt.Sprintf("%s · %d matches", dur, n)
+		word := "files"
+		if n == 1 {
+			word = "file"
+		}
+		return fmt.Sprintf("%s · Found %d %s", dur, n, word)
+	case "Grep":
+		out := strings.TrimSpace(te.Output)
+		if strings.HasPrefix(out, "(no matches)") {
+			return fmt.Sprintf("%s · No matches", dur)
+		}
+		// Strip optional pagination footer ("[truncated at N matches…]")
+		// before counting so the user sees the actual match count, not
+		// match-count + footer line.
+		body := out
+		if idx := strings.LastIndex(body, "\n[truncated"); idx >= 0 {
+			body = body[:idx]
+		}
+		n := lineCount(body)
+		word := "matches"
+		if n == 1 {
+			word = "match"
+		}
+		return fmt.Sprintf("%s · %d %s", dur, n, word)
 	default:
 		out := strings.TrimSpace(te.Output)
 		if out == "" {

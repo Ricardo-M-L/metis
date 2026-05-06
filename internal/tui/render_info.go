@@ -77,30 +77,66 @@ func renderInfoBox(title string, rows []infoRow) string {
 }
 
 func renderCost(m *Model) string {
+	// F17: richer /cost — break input/output by category + show
+	// price-per-Mtok column + cache savings + per-class subtotals.
+	// Mirrors claude-code's /cost which surfaces every dimension a
+	// user would ask about (raw tokens, cost share, cache hit rate).
 	in := m.totalTokens.Input()
 	out := m.totalTokens.Output()
 	cc := m.totalTokens.CacheCreate()
 	cr := m.totalTokens.CacheRead()
 	total := in + out
-	// Heuristic per-1M token prices (USD). Roughly today's anthropic/oai
-	// public list pricing — close enough for an in-chat estimate. Real
-	// billing happens on the provider side regardless.
 	priceIn, priceOut := guessPriceUSDPerM(m.model)
-	costUSD := float64(in)*priceIn/1_000_000 + float64(out)*priceOut/1_000_000
+	// Anthropic's cache pricing: cache_create ≈ 1.25× input, cache_read
+	// ≈ 0.10× input. Heuristic — treat as "input" for non-Anthropic.
+	cacheCreatePrice := priceIn * 1.25
+	cacheReadPrice := priceIn * 0.10
+
+	costInput := float64(in) * priceIn / 1_000_000
+	costOutput := float64(out) * priceOut / 1_000_000
+	costCacheCreate := float64(cc) * cacheCreatePrice / 1_000_000
+	costCacheRead := float64(cr) * cacheReadPrice / 1_000_000
+	costTotal := costInput + costOutput + costCacheCreate + costCacheRead
+
+	// Cache savings: cost we WOULD have paid if cache_read tokens
+	// had been re-billed at full input rate. The difference is the
+	// concrete dollar value the prompt cache saved this session.
+	savings := float64(cr)*priceIn/1_000_000 - costCacheRead
+
 	rows := []infoRow{
-		{Key: "input tokens", Value: fmtThousands(in)},
-		{Key: "output tokens", Value: fmtThousands(out)},
+		{Key: "model", Value: m.model, Hint: fmt.Sprintf("$%.2f / $%.2f per 1M (in / out)", priceIn, priceOut)},
+		{Key: "", Value: ""},
+		{Key: "input tokens", Value: fmtThousands(in), Hint: fmt.Sprintf("$%.4f", costInput)},
+		{Key: "output tokens", Value: fmtThousands(out), Hint: fmt.Sprintf("$%.4f", costOutput)},
 		{Key: "total tokens", Value: fmtThousands(total)},
 	}
-	// Only surface cache rows when cache was actually used — keeps
-	// /cost lean for non-Anthropic providers and short sessions.
 	if cc > 0 || cr > 0 {
 		rows = append(rows,
-			infoRow{Key: "cache_create", Value: fmtThousands(cc), Hint: "tokens written to prompt cache"},
-			infoRow{Key: "cache_read", Value: fmtThousands(cr), Hint: "tokens served from prompt cache"},
+			infoRow{Key: "", Value: ""},
+			infoRow{Key: "cache_create", Value: fmtThousands(cc), Hint: fmt.Sprintf("$%.4f (write)", costCacheCreate)},
+			infoRow{Key: "cache_read", Value: fmtThousands(cr), Hint: fmt.Sprintf("$%.4f (10%% of input)", costCacheRead)},
 		)
+		if cr > 0 && savings > 0 {
+			rows = append(rows, infoRow{
+				Key: "cache savings", Value: fmt.Sprintf("$%.4f", savings),
+				Hint: "vs no-cache cost on the same reads",
+			})
+		}
+		// Cache hit rate = cache_read / (cache_read + input). High
+		// rate = lots of stable prefix; low = mostly fresh content.
+		if cr+in > 0 {
+			rate := float64(cr) * 100 / float64(cr+in)
+			rows = append(rows, infoRow{
+				Key: "cache hit rate", Value: fmt.Sprintf("%.1f%%", rate),
+				Hint: "cache_read / (cache_read + input)",
+			})
+		}
 	}
-	rows = append(rows, infoRow{Key: "est. cost", Value: fmt.Sprintf("$%.4f", costUSD), Hint: "real billing on provider"})
+	rows = append(rows,
+		infoRow{Key: "", Value: ""},
+		infoRow{Key: "est. cost", Value: fmt.Sprintf("$%.4f", costTotal),
+			Hint: "real billing on provider — heuristic per-Mtok prices"},
+	)
 	return renderInfoBox("Session Cost · "+m.model, rows)
 }
 
@@ -505,20 +541,198 @@ func renderUpgrade() string {
 	return body
 }
 
-// renderContext computes a rough context-window utilization for the
-// session: tokens-so-far / model-context-window. Exact numbers come
-// from the provider on stream-end; this is best-effort using the
-// model's MaxContextTokens.
+// renderContext is the rich `/context` view (claude-code parity).
+// Layout (mirrors claude-code's Context Usage screen):
+//
+//	Context Usage
+//	⛁ ⛁ ⛁ ⛀ ⛶ ⛶ … ⛶  ← 200-cell grid (20 × 10), each cell = cap/200 tokens
+//	                  Model name (window cap)
+//	                  Provider · model id
+//	                  USED / CAP tokens (PCT%)
+//
+//	                  Estimated usage by category
+//	                  ⛁ System prompt: N tokens (X%)
+//	                  ⛁ System tools:  N tokens (X%)
+//	                  ⛁ Skills:        N tokens (X%)
+//	                  ⛁ Messages:      N tokens (X%)
+//	                  ⛶ Free space:    N (Y%)
+//
+// Per-category numbers are best-effort estimates — the provider's
+// usage event reports a single combined `input_tokens`, not a
+// breakdown. We approximate from byte counts (chars/4) on the
+// assembled system / tool-spec / message bodies.
 func renderContext(m *Model) string {
-	used := m.totalTokens.Input() + m.totalTokens.Output()
-	cap := m.loop.Provider.MaxContextTokens()
+	const (
+		cellsW   = 20
+		cellsH   = 10
+		cellsTot = cellsW * cellsH
+
+		usedGlyph = "⛁"
+		freeGlyph = "⛶"
+	)
+
+	cap := 0
+	if m.loop != nil && m.loop.Provider != nil {
+		cap = m.loop.Provider.MaxContextTokens()
+	}
+	used := m.totalTokens.ContextUsage()
+	if used == 0 {
+		// Fallback to session-cumulative for the very first turn
+		// before usage events land. Same logic as the bottom-right
+		// status bar.
+		used = m.totalTokens.in + m.totalTokens.cacheCreate + m.totalTokens.cacheRead
+	}
+
+	// Per-category estimates (chars/4 ≈ tokens, the same heuristic
+	// the agent loop uses internally). Totals don't always sum to
+	// `used` exactly — the provider counts cache_read + cache_create
+	// separately and the LLM tokenizer differs from our chars/4 — but
+	// the breakdown remains useful for "where is my context going".
+	systemEst := 0
+	toolsEst := 0
+	skillsEst := 0
+	msgsEst := 0
+	if m.loop != nil {
+		systemEst = roughTokens(m.loop.System)
+		// Tools schema: every tool's name + description + serialized
+		// JSON schema. Approximate by summing description bytes —
+		// schema marshalling is too heavy for a status command.
+		if reg := m.loop.Registry; reg != nil {
+			for _, t := range reg.SortedForCache() {
+				toolsEst += roughTokens(t.Name())
+				toolsEst += roughTokens(t.Description())
+				// Per claude-code's calibration, schema bodies in JSON
+				// add ~30% overhead on top of description bytes.
+				toolsEst += roughTokens(t.Description()) * 30 / 100
+			}
+		}
+		// Messages: total of every content block in the running
+		// history. estimateTokens isn't exported from the agent
+		// package; replicate via roughTokens on flattened content.
+		for _, msg := range m.loop.History() {
+			for _, c := range msg.Content {
+				msgsEst += roughTokens(c.Text)
+				msgsEst += roughTokens(c.ToolResult)
+			}
+		}
+	}
+	// Skills are part of the system prompt's project_context section
+	// in metis but are interesting on their own — peel an estimate
+	// off the system prompt for display.
+	if m.loop != nil && strings.Contains(m.loop.System, "<available_skills>") {
+		if start := strings.Index(m.loop.System, "<available_skills>"); start >= 0 {
+			if end := strings.Index(m.loop.System[start:], "</available_skills>"); end >= 0 {
+				skillsEst = roughTokens(m.loop.System[start : start+end+len("</available_skills>")])
+				// Don't double-count: the same bytes are in systemEst.
+				if skillsEst > systemEst {
+					skillsEst = systemEst
+				}
+			}
+		}
+	}
+
+	// Build the 20×10 grid. Each cell is filled when the cumulative
+	// token count up to that cell index is ≤ used. claude-code
+	// distinguishes system / tools / messages with different colours;
+	// metis uses a single accent colour to keep the renderer light.
+	cellSize := 1
+	if cap > 0 {
+		cellSize = cap / cellsTot
+		if cellSize < 1 {
+			cellSize = 1
+		}
+	}
+	usedCells := used / cellSize
+	if usedCells > cellsTot {
+		usedCells = cellsTot
+	}
+
+	usedStyle := lipgloss.NewStyle().Foreground(currentTheme.AccentBlue)
+	freeStyle := lipgloss.NewStyle().Foreground(textMuted)
+
+	// Right-side annotations: line index → annotation text.
+	annotations := make([]string, cellsH)
+	annotations[0] = m.model
+	if cap > 0 {
+		annotations[1] = fmt.Sprintf("%s window", fmtThousands(cap))
+	}
 	pct := 0
 	if cap > 0 {
-		pct = int(float64(used) / float64(cap) * 100)
+		pct = used * 100 / cap
 	}
-	bar := renderBar(pct, 30)
-	return fmt.Sprintf("context: %s / %s tokens  (%d%% of %s window)\n  %s",
-		fmtThousands(used), fmtThousands(cap), pct, m.model, bar)
+	annotations[2] = fmt.Sprintf("%s/%s tokens (%d%%)", fmtThousands(used), fmtThousands(cap), pct)
+
+	// Categories rendered on rows 4-9 (rows 0-3 are headline).
+	annotations[4] = "Estimated usage by category"
+	cats := []struct {
+		label string
+		toks  int
+	}{
+		{"System prompt", systemEst},
+		{"System tools", toolsEst},
+		{"Skills", skillsEst},
+		{"Messages", msgsEst},
+	}
+	for i, c := range cats {
+		row := 5 + i
+		if row >= cellsH {
+			break
+		}
+		catPct := 0
+		if cap > 0 {
+			catPct = c.toks * 1000 / cap // ‰ for finer-grained display
+		}
+		annotations[row] = fmt.Sprintf("%s %s: %s tokens (%d.%d%%)",
+			usedGlyph, c.label, fmtThousands(c.toks), catPct/10, catPct%10)
+	}
+	if cellsH > 9 {
+		free := cap - used
+		if free < 0 {
+			free = 0
+		}
+		freePct := 100 - pct
+		annotations[9] = fmt.Sprintf("%s Free space: %s (%d%%)",
+			freeGlyph, fmtThousands(free), freePct)
+	}
+
+	var s strings.Builder
+	s.WriteString(styleAccent.Render("Context Usage") + "\n")
+	cell := 0
+	for r := 0; r < cellsH; r++ {
+		var row strings.Builder
+		for c := 0; c < cellsW; c++ {
+			if cell < usedCells {
+				row.WriteString(usedStyle.Render(usedGlyph))
+			} else {
+				row.WriteString(freeStyle.Render(freeGlyph))
+			}
+			row.WriteString(" ")
+			cell++
+		}
+		ann := annotations[r]
+		s.WriteString("  ")
+		s.WriteString(row.String())
+		if ann != "" {
+			s.WriteString("  ")
+			s.WriteString(styleDim.Render(ann))
+		}
+		s.WriteString("\n")
+	}
+	return s.String()
+}
+
+// roughTokens approximates a string's token count via the chars/4
+// heuristic the agent's compactor uses. Faster than building a
+// real tokenizer and "good enough" for a status display.
+func roughTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := len(s) / 4
+	if n == 0 {
+		n = 1
+	}
+	return n
 }
 
 func renderResumeHelp(m *Model) string {

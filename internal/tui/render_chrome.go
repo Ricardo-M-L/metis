@@ -191,6 +191,20 @@ func renderStatusBar(m *Model) string {
 	if addr := bridgeCurrentAddr(); addr != "" {
 		leftParts = append(leftParts, "↹ "+addr)
 	}
+	// Git branch (claude-code parity): shown when cwd is a repo so the
+	// user sees at a glance which branch their edits will land on.
+	// Cached via internal/tui/footer_indicators.go's per-frame snapshot;
+	// no shell-out per frame.
+	if branch := cachedGitBranch(); branch != "" {
+		leftParts = append(leftParts, "⎇ "+branch)
+	}
+	// Short session id — handy when /sessions list is open and the user
+	// wants to confirm "this is the one I'm in". Six chars is a
+	// claude-code style: long enough to be unique, short enough to not
+	// dominate the status line.
+	if sid := m.sessionID; len(sid) >= 6 {
+		leftParts = append(leftParts, "❉ "+sid[:6])
+	}
 	// (cwd badge intentionally NOT shown in the status bar — the user
 	// already sees it in the welcome banner; duplicating it on every
 	// frame just visually clutters the bottom row.)
@@ -215,13 +229,31 @@ func renderStatusBar(m *Model) string {
 	// Raw integer (not k-abbreviated) so the user sees every increment;
 	// matches claude-code's statusline rendering.
 	var right string
-	if used := m.totalTokens.ContextUsage(); used > 0 {
+	used := m.totalTokens.ContextUsage()
+	if used == 0 {
+		// Fallback when the most-recent-API-call counters are still
+		// zero (very first turn before the first usage event lands).
+		// Use session-cumulative input as a placeholder so the right
+		// side isn't completely blank during the cold-start window.
+		// Feedback 2026-05-05: "the token count sometimes doesn't
+		// show during running". Better to show an approximate
+		// (cumulative-so-far) than to flicker from blank → number.
+		used = m.totalTokens.in + m.totalTokens.cacheCreate + m.totalTokens.cacheRead
+	}
+	if used > 0 {
 		right = formatTokensRaw(used) + " tokens"
 		if m.loop != nil && m.loop.Provider != nil {
 			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
 				pct := used * 100 / cap
 				right = fmt.Sprintf("%s (%d%%)", right, pct)
 			}
+		}
+		// Cost estimate (claude-code's statusline shows a $ figure).
+		// Best-effort: catalog price × tokens. Skipped silently when
+		// catalog has no entry for this model id, so unknown / custom
+		// providers don't show a misleading $0.00.
+		if cost := estimateCost(m); cost > 0 {
+			right = fmt.Sprintf("$%.4f · %s", cost, right)
 		}
 	}
 

@@ -104,9 +104,20 @@ func toolArgsPreview(name string, input map[string]any) string {
 	}
 	var preview string
 	switch name {
-	case "Read", "Write", "Glob", "Edit":
+	case "Read", "Write", "Edit":
 		if v, ok := input["path"].(string); ok {
 			preview = basename(v)
+		}
+	case "Glob":
+		// Glob's args are (pattern, root, limit, max_depth) — not path.
+		// Without this case the leader row showed `glob …` with no
+		// pattern, hiding what the model was searching for. Format
+		// "<pattern>" or "<root>:<pattern>" so the user sees both.
+		if pat, ok := input["pattern"].(string); ok && pat != "" {
+			preview = pat
+			if root, _ := input["root"].(string); root != "" && root != "." {
+				preview = root + ":" + pat
+			}
 		}
 	case "Bash":
 		if v, ok := input["command"].(string); ok {
@@ -119,6 +130,9 @@ func toolArgsPreview(name string, input map[string]any) string {
 	case "Grep":
 		if v, ok := input["pattern"].(string); ok {
 			preview = v
+			if root, _ := input["root"].(string); root != "" && root != "." {
+				preview = root + ":" + v
+			}
 		}
 	case "WebFetch":
 		if v, ok := input["url"].(string); ok {

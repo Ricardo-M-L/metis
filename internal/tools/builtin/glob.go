@@ -4,12 +4,76 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+)
+
+// heavySkipDirs are directories Glob refuses to descend into. Beyond
+// the original .git / node_modules / vendor / .venv, the 2026-05-05
+// 41-second incident showed Glob walking the user's entire home tree
+// (Library, Caches, Documents, ...) when the model launched it from
+// $HOME — adding the macOS-system + heavy-cache + per-user-tooling
+// dirs cuts the cold-start path enumeration from minutes to seconds.
+//
+// Bash's `find -prune` rule of thumb: skip dirs whose contents are
+// uninteresting to a code-search but expensive to enumerate.
+var heavySkipDirs = map[string]struct{}{
+	// VCS / package metadata
+	".git": {}, ".svn": {}, ".hg": {}, ".jj": {}, ".sl": {},
+	"node_modules": {}, "vendor": {}, ".venv": {}, "venv": {},
+	"target":     {}, // Rust / Java
+	".gradle":    {},
+	".cargo":     {},
+	".rustup":    {},
+	".cache":     {},
+	".m2":        {}, // Maven
+	".npm":       {},
+	".yarn":      {},
+	".pnpm-store": {},
+	".bun":       {},
+
+	// macOS / Apple ecosystem
+	"Library":          {},
+	"Applications":     {},
+	".Trash":           {},
+	".CFUserTextEncoding": {},
+	".docker":          {},
+	".vscode-server":   {},
+	".cursor":          {},
+
+	// Build / runtime artifacts
+	"dist":         {},
+	"build":        {},
+	"out":          {},
+	"target_debug": {},
+	"__pycache__":  {},
+	".pytest_cache": {},
+	".mypy_cache":  {},
+	".ruff_cache":  {},
+	".tox":         {},
+	"coverage":     {},
+
+	// Heavy generated / vendored content
+	"DerivedData":  {}, // Xcode
+}
+
+// defaultGlobMaxDepth caps walk depth when the model didn't pass
+// max_depth and root is one of the user's home directories. Without
+// this cap, the model launching glob "**/*.toml" at $HOME walks
+// every cached file from every tool ever run — minutes of latency
+// for results the model never reads.
+//
+// 8 deep is enough for any reasonable code repo; 32 is the looser
+// cap for arbitrary roots (still finite enough to abort cleanly on
+// pathological symlink loops).
+const (
+	defaultGlobMaxDepthHome  = 8
+	defaultGlobMaxDepthOther = 32
 )
 
 type Glob struct{ gate *permission.Gate }
@@ -35,6 +99,10 @@ func (Glob) InputSchema() map[string]any {
 				"type":        "integer",
 				"description": "Maximum number of paths to return. Defaults to 500.",
 			},
+			"max_depth": map[string]any{
+				"type":        "integer",
+				"description": "Max directory depth to descend (relative to root). Defaults to 8 when root is the user's home dir, 32 elsewhere. Pass 0 for unlimited (slow on huge trees).",
+			},
 		},
 	}
 }
@@ -55,6 +123,31 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	}
 	limit := intArg(in, "limit", 500)
 
+	// Resolve absolute root for depth calculation. WalkDir uses the
+	// caller's relative path internally, but depth is measured against
+	// the effective starting directory, so we compute prefixLen on the
+	// cleaned absolute path.
+	rootAbs, _ := filepath.Abs(root)
+	rootClean := filepath.Clean(rootAbs)
+
+	// Default max_depth: 8 when starting at the user's home dir
+	// (covers any reasonable repo without enumerating Library/),
+	// 32 when starting elsewhere. Pass max_depth=0 to disable the cap.
+	home, _ := os.UserHomeDir()
+	defaultDepth := defaultGlobMaxDepthOther
+	if home != "" && rootClean == filepath.Clean(home) {
+		defaultDepth = defaultGlobMaxDepthHome
+	}
+	maxDepth := -1 // -1 = use default; 0 = unlimited; >0 = explicit cap
+	if v, ok := in["max_depth"]; ok {
+		if n, nok := numberInt(v); nok {
+			maxDepth = n
+		}
+	}
+	if maxDepth < 0 {
+		maxDepth = defaultDepth
+	}
+
 	type hit struct {
 		path string
 		mod  int64
@@ -67,9 +160,32 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 		}
 		if d.IsDir() {
 			name := d.Name()
-			// skip the usual heavyweight dirs
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".venv" {
+			// Heavy skip-list: VCS internals, language package caches,
+			// macOS Library tree, build outputs. Materially shortens
+			// the cold-start glob from $HOME — see heavySkipDirs.
+			if _, skip := heavySkipDirs[name]; skip {
 				return filepath.SkipDir
+			}
+			// Hidden dirs other than the explicit ones above are
+			// kept walkable (.config, .vscode-config, ...) so user
+			// search isn't surprised by missing dotfiles.
+			//
+			// Depth cap (when set): count separators between the
+			// root and the current path. The root itself is depth 0.
+			if maxDepth > 0 {
+				abs, aerr := filepath.Abs(path)
+				if aerr == nil {
+					rel, rerr := filepath.Rel(rootClean, filepath.Clean(abs))
+					if rerr == nil {
+						depth := 0
+						if rel != "." {
+							depth = strings.Count(rel, string(filepath.Separator)) + 1
+						}
+						if depth >= maxDepth {
+							return filepath.SkipDir
+						}
+					}
+				}
 			}
 			return nil
 		}
