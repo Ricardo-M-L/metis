@@ -202,6 +202,12 @@ type Model struct {
 	histDirectIdx   int
 	histDirectDraft string
 
+	// Streaming tool args buffer (T12). Each EventToolArgsDelta
+	// appends here; previewStreamingArgs() shapes it into a spinner
+	// subline. Reset on every EventToolResult so consecutive tools
+	// don't bleed into each other. Capped at 4KB to bound memory.
+	toolArgsStream []byte
+
 	// @-mention dropdown state. Tracked separately from the slash
 	// palette so an in-progress `@xxx` filter doesn't fight the slash
 	// palette's `palFilter` for the same buffer. Recomputed on every
@@ -469,7 +475,8 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 			{Label: "No", Key: "n"},
 			{Label: "Cancel turn", Key: "c"},
 		},
-		histDirectIdx: -1, // not navigating yet — first ↑ jumps to histAll[0]
+		histDirectIdx:  -1, // not navigating yet — first ↑ jumps to histAll[0]
+		toolArgsStream: make([]byte, 0, 256),
 	}
 	if pendingUpdateNotice != "" {
 		// Surface the update notice as the first info row so the user

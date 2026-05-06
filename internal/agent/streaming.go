@@ -91,6 +91,19 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			curJSON = ""
 		case "tool_input_delta":
 			curJSON += ev.InputDelta
+			// Forward the partial JSON chunk to the UI so the user sees
+			// tool args appear as they're generated — kimi-cli's
+			// streamingjson behavior, claude-code parity. ToolUseID lets
+			// the UI route the delta to the right in-flight row when
+			// multiple tools are spawning in parallel.
+			if curTool != nil {
+				emit(ctx, out, Event{
+					Kind:      EventToolArgsDelta,
+					ToolUseID: curTool.ToolUseID,
+					ToolName:  curTool.ToolName,
+					TextDelta: ev.InputDelta,
+				})
+			}
 		case "tool_use_stop":
 			flushTool()
 		case "message_delta":

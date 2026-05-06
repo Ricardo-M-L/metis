@@ -69,7 +69,27 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 				Status: "running",
 			})
 		}
+	case agent.EventToolArgsDelta:
+		// T12: kimi-cli-style streaming tool args. The LLM is typing
+		// the JSON for an in-flight tool; surface it on the spinner
+		// subline so the user sees "Read · /tmp/foo..." appear
+		// character-by-character instead of a long silent pause.
+		// The full args still arrive via tool_use_stop → EventToolStart
+		// where ToolInput is the parsed map, so this only affects
+		// the LIVE spinner — the persisted ToolEvent uses the parsed
+		// version. Truncate aggressively to keep the spinner row
+		// readable on narrow terminals.
+		m.toolArgsStream = append(m.toolArgsStream, []byte(ev.TextDelta)...)
+		// Cap the live preview at 4KB so a runaway args string
+		// doesn't balloon memory between tool_use_stop calls. Real
+		// tool args are almost never this large.
+		if len(m.toolArgsStream) > 4096 {
+			m.toolArgsStream = m.toolArgsStream[:4096]
+		}
+		m.spinnerSub = previewStreamingArgs(ev.ToolName, m.toolArgsStream)
 	case agent.EventToolResult:
+		// Reset streaming-args buffer so the next tool starts clean.
+		m.toolArgsStream = m.toolArgsStream[:0]
 		if ev.ToolResult == nil {
 			return
 		}

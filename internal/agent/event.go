@@ -58,6 +58,14 @@ const (
 	// the final answer style. Without this branch the deltas were
 	// silently dropped and "thought for Xs" had no body to back it.
 	EventThinkingDelta
+
+	// Streaming tool args — emitted as the LLM types tool input JSON
+	// character-by-character. Lets the UI render "Read · /tmp/foo.go..."
+	// as args arrive instead of waiting for tool_use_stop. The TextDelta
+	// field carries the raw partial JSON (cumulative or chunk — see
+	// streaming.go's emit path; metis emits chunks). Inspired by
+	// kimi-cli's streamingjson tool args parser.
+	EventToolArgsDelta
 )
 
 // eventOutKey carries the parent loop's event channel down to tools
