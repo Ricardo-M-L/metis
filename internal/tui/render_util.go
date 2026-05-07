@@ -35,8 +35,19 @@ var escapeLeakPatterns = []*regexp.Regexp{
 	// (the parser ate `]1` together). So we accept ANY leading digit
 	// run before `;rgb:` rather than enumerating 10/11 specifically.
 	regexp.MustCompile(`\]?\d+;rgb:[0-9a-fA-F/]+(?:\x1b\\|\\)?`),
-	// OSC color-reset: 110/111/112 with empty body (just terminator).
-	regexp.MustCompile(`\]?(?:110|111|112)(?:\x1b\\|\\)?`),
+	// OSC color-reset: 110/111/112. The numeric body is preceded by
+	// either `]` (the OSC introducer made it through) or — when the
+	// parser ate the introducer — by `\x1b` (the ESC byte itself).
+	// Anchoring to one of these prefixes prevents the pattern from
+	// devouring plain user input like "111" / "1110" / phone-number-
+	// style digit runs (image+video user report 2026-05-07: typing
+	// "1" five times oscillated between 1 and 11 because every third
+	// keystroke produced "111", which this pattern silently scrubbed
+	// when the prefix was optional). We also require a real terminator
+	// (`\x1b\\` proper, or the lone `\` fallback we've seen leak)
+	// so a bare "110" — completely valid digit run in user input —
+	// is left alone.
+	regexp.MustCompile(`(?:\]|\x1b)(?:110|111|112)(?:\x1b\\|\\)`),
 	// SGR mouse event body: <button;col;row[Mm]
 	regexp.MustCompile(`<\d+;\d+;\d+[Mm]`),
 	// DEC private mode set/reset: [?2004h, [?25l, [?1006h ...

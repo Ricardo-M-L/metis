@@ -41,6 +41,22 @@ func TestScrubEscapeLeaks(t *testing.T) {
 		{"number sentence", `type 10 sheets`, "type 10 sheets"},
 		{"version-like dotted", `my version is 1.10;abc`, "my version is 1.10;abc"},
 		{"timestamps", `at 12:34:56`, "at 12:34:56"},
+
+		// Regression — user video 2026-05-07 21:18: typing "1" five
+		// times oscillated between "1" and "11" because the OSC color-
+		// reset pattern `\]?(?:110|111|112)(?:\x1b\\|\\)?` was matching
+		// bare digit runs (both anchor and terminator were optional).
+		// Plain digit runs must pass through unchanged now.
+		{"bare 110", "110", "110"},
+		{"bare 111", "111", "111"},
+		{"bare 112", "112", "112"},
+		{"phone-style digits", "call 11122223333", "call 11122223333"},
+		{"110 in sentence", "the 110th run", "the 110th run"},
+
+		// Real OSC 110-style leaks (with anchor + terminator) still get
+		// scrubbed.
+		{"OSC 111 with bracket and ST", "]111\x1b\\", ""},
+		{"OSC 110 with ESC anchor and ST", "\x1b110\x1b\\", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

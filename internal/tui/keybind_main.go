@@ -343,13 +343,30 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// content was loaded from history, ↑/↓ walks through prior prompts
 	// instead of moving the textarea cursor between rows. Saves a
 	// Ctrl+R round-trip for the common "what did I type last" case.
+	//
+	// Single-line non-empty input (the user typed but hasn't wrapped to
+	// a second visual row): ↑ = CursorStart, ↓ = CursorEnd. The default
+	// textarea behaviour was a no-op there (no row above / below to
+	// land on), which read as "arrows are broken" — image+video user
+	// report 2026-05-07: "输入向上箭头他还是不能跳到这个输入框最开始
+	// 的地方". macOS text-field convention is Cmd+↑/↓ for jump-to-edge,
+	// but with no Cmd modifier reaching the TUI we surface the same
+	// behaviour on plain ↑/↓ for this single-row case.
 	switch msg.String() {
 	case "up":
 		if m.directHistoryEligible() && m.directHistoryUp() {
 			return m, nil
 		}
+		if m.input.LineCount() <= 1 && m.input.Value() != "" {
+			m.input.CursorStart()
+			return m, nil
+		}
 	case "down":
 		if m.histDirectIdx >= 0 && m.directHistoryDown() {
+			return m, nil
+		}
+		if m.input.LineCount() <= 1 && m.input.Value() != "" {
+			m.input.CursorEnd()
 			return m, nil
 		}
 	}

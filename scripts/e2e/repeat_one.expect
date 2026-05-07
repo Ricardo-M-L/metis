@@ -1,0 +1,72 @@
+#!/usr/bin/env expect -f
+# repeat_one.expect — drive a real metis chat session via PTY and
+# verify that pressing "1" five times leaves "11111" in the input box.
+#
+# Reproduces the user video 2026-05-07 21:18 bug ("typing 1 five times
+# oscillated between 1 and 11"). Used as both manual smoke and the
+# starting point of an e2e harness.
+#
+# Usage:
+#   ./scripts/e2e/repeat_one.expect [path-to-metis]
+# Defaults to metis on PATH.
+
+set metis [lindex $argv 0]
+if {$metis eq ""} { set metis "metis" }
+
+# stty rows/cols set on the spawned tty so metis sizes its viewport
+# the same way it would in iTerm/Terminal.
+set env(LINES) 30
+set env(COLUMNS) 120
+
+# Talk to metis without starting a real LLM turn — we only care
+# about the input box behaviour.
+spawn $metis chat
+set timeout 15
+
+# Wait for the input prompt to appear. metis decorates the placeholder
+# with SGR escapes so the literal "type a message" might be split by
+# ANSI bytes — we match on a fragment ("a message" or "/commands")
+# either of which is on the input row, and fall back to "metis ·" in
+# the brand line.
+expect {
+    -re {a message|commands|metis} { }
+    timeout {
+        puts "FAIL: metis didn't reach a recognisable chat prompt within 15s"
+        puts "Last buffer ~"
+        puts [string range $expect_out(buffer) end-400 end]
+        exit 1
+    }
+}
+
+# Send five "1"s with a tiny delay so any per-event guard has time
+# to settle. Real users press at 50-150 ms intervals.
+for {set i 0} {$i < 5} {incr i} {
+    send -- "1"
+    after 80
+}
+
+# Slurp pending output so the screen has stabilised.
+after 500
+
+# Now snapshot the input row by sending Ctrl+A (textarea jump-to-start
+# is on the standard keymap) and reading what's between divider rows.
+# We can't read the screen buffer directly via expect; the easiest
+# verification is to send Enter and observe the echoed prompt in the
+# transcript — but Enter would fire a turn. Instead: send Ctrl+C twice
+# to quit, and the alt-screen leaves; the buffer dump (which expect
+# captured) will contain "11111" if the input was correct.
+send -- "\x03\x03"
+
+expect eof
+
+# expect_out(buffer) is the full PTY output. We grep it for "11111" —
+# it must show up at least once (textarea redraws the input as it
+# grows). If the bug is back, the buffer has only "1" or "11".
+if {[regexp {11111} $expect_out(buffer)]} {
+    puts "PASS: input grew to 11111 across five keypresses"
+    exit 0
+} else {
+    puts "FAIL: input never reached 11111. Last buffer ~"
+    puts [string range $expect_out(buffer) end-200 end]
+    exit 1
+}
