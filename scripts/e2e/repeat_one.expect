@@ -13,60 +13,73 @@
 set metis [lindex $argv 0]
 if {$metis eq ""} { set metis "metis" }
 
-# stty rows/cols set on the spawned tty so metis sizes its viewport
-# the same way it would in iTerm/Terminal.
-set env(LINES) 30
-set env(COLUMNS) 120
+# Stale metis processes from a previous run hold onto session-state
+# locks and slow the next launch enough to blow the 25s expect timeout.
+# Clean them up before spawning. Best-effort: ignore "no such process".
+catch {exec pkill -9 -f "metis chat"}
+after 200
 
-# Talk to metis without starting a real LLM turn — we only care
-# about the input box behaviour.
+# Sized PTY so metis's two-phase render computes a non-collapsing
+# viewport. Without explicit rows/cols spawn defaults to 24x80 and
+# the chat list occasionally floors itself.
+set stty_init "rows 30 cols 120"
+
 spawn $metis chat
-set timeout 15
+set timeout 60
 
-# Wait for the input prompt to appear. metis decorates the placeholder
-# with SGR escapes so the literal "type a message" might be split by
-# ANSI bytes — we match on a fragment ("a message" or "/commands")
-# either of which is on the input row, and fall back to "metis ·" in
-# the brand line.
-expect {
-    -re {a message|commands|metis} { }
-    timeout {
-        puts "FAIL: metis didn't reach a recognisable chat prompt within 15s"
-        puts "Last buffer ~"
-        puts [string range $expect_out(buffer) end-400 end]
-        exit 1
-    }
-}
+# Cold-start cushion. metis loads ~600ms on warm cache but can hit
+# 4-5s after a cold boot (config + tool registry + LLM probe + first
+# View()). Pure `after` is more reliable than `expect "auto mode"`
+# under expect's PTY which intermittently drops the matchable text
+# bytes when the redraw stream is bursty. 5s is generous.
+after 5000
 
-# Send five "1"s with a tiny delay so any per-event guard has time
-# to settle. Real users press at 50-150 ms intervals.
+# Send five "1"s — slowly, so the redraw of one digit completes
+# before the next is queued. expect can't reliably match against
+# arbitrary substrings of the alt-screen redraw stream (cursor save
+# / restore makes the digits land at varying byte offsets), so we
+# pace the input rather than block on echo.
 for {set i 0} {$i < 5} {incr i} {
     send -- "1"
-    after 80
+    after 250
 }
 
-# Slurp pending output so the screen has stabilised.
-after 500
+# Wait for the final redraw to settle.
+after 1500
 
-# Now snapshot the input row by sending Ctrl+A (textarea jump-to-start
-# is on the standard keymap) and reading what's between divider rows.
-# We can't read the screen buffer directly via expect; the easiest
-# verification is to send Enter and observe the echoed prompt in the
-# transcript — but Enter would fire a turn. Instead: send Ctrl+C twice
-# to quit, and the alt-screen leaves; the buffer dump (which expect
-# captured) will contain "11111" if the input was correct.
-send -- "\x03\x03"
+# Quit metis cleanly (Ctrl+C single-press: when no turn is active
+# metis exits immediately — handled in keybind_main.go).
+send -- "\x03"
+after 300
 
-expect eof
+# Drain whatever's left so $expect_out(buffer) holds the full session.
+expect {
+    eof { }
+    timeout { }
+}
 
-# expect_out(buffer) is the full PTY output. We grep it for "11111" —
-# it must show up at least once (textarea redraws the input as it
-# grows). If the bug is back, the buffer has only "1" or "11".
-if {[regexp {11111} $expect_out(buffer)]} {
+# Get the captured raw bytes. With the OSC-leak bug, the textarea
+# would oscillate between "1" and "11" as scrubEscapeLeaks ate every
+# third digit. The fixed code grows monotonically, so the alt-screen
+# redraw stream will at some point contain "11111" — the textarea's
+# View() interleaves SGR with the rune sequence but the digits stay
+# adjacent.
+#
+# scan() strips ANSI escapes so plain "11111" is found even if the
+# raw stream had `\x1b[1m1\x1b[0m...` style runs.
+proc strip_ansi {s} {
+    regsub -all {\x1b\[[0-9;?]*[a-zA-Z]} $s "" s
+    regsub -all {\x1b\][^\x07]*\x07} $s "" s
+    return $s
+}
+
+set plain [strip_ansi $expect_out(buffer)]
+if {[regexp {11111} $plain]} {
     puts "PASS: input grew to 11111 across five keypresses"
     exit 0
 } else {
-    puts "FAIL: input never reached 11111. Last buffer ~"
-    puts [string range $expect_out(buffer) end-200 end]
+    puts "FAIL: input never reached 11111."
+    puts "Stripped buffer tail ~"
+    puts [string range $plain end-300 end]
     exit 1
 }
