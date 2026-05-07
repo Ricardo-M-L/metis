@@ -126,25 +126,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// \x1b[200~ … \x1b[201~ and bubbletea v2 reports it as a
 		// single PasteMsg (instead of streaming each char as a
 		// KeyPressMsg). Without this case the content is silently
-		// dropped, which is the "metis 页面不能粘贴文字" bug
-		// reported 2026-05-07.
+		// dropped (image #20 user report 2026-05-07: "输入框用
+		// command+v 粘贴不进去").
 		//
 		// Skip during permission prompt / copy mode / overlays — the
 		// keyboard is owned by something other than the textarea then,
 		// and pasting into a permission dialog is meaningless.
+		// (turnActive is NOT a guard: users routinely queue the next
+		// prompt while the agent is mid-stream.)
 		if m.permActive || m.copyMode || m.activeScreen != nil {
-			return m, nil
-		}
-		// During an active turn the input is also disabled (Enter is
-		// intercepted upstream); skip paste too so we don't queue
-		// content that the next turn will then accidentally include.
-		if m.turnActive {
+			pasteDebug("blocked: perm=%v copy=%v screen=%v len=%d",
+				m.permActive, m.copyMode, m.activeScreen != nil, len(msg.Content))
 			return m, nil
 		}
 		text := msg.Content
 		if text == "" {
+			pasteDebug("empty PasteMsg")
 			return m, nil
 		}
+		pasteDebug("ok: %d bytes", len(text))
 		// Big paste guardrail: terminal-emulator paste of a 50KB log
 		// file would shove tens of thousands of chars into the
 		// textarea and freeze its rendering. Cap at 100KB; anything
@@ -285,17 +285,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if plain == "" {
 			return m, nil
 		}
+		// Silent copy — same reasoning as copySelectionAndReport: the
+		// "(copied N chars · OSC 52 → Apple_Terminal) <preview>" info
+		// rows polluted the transcript when the user did a flurry of
+		// cmd+C / row-clicks (image #20 2026-05-07). The clipboard +
+		// fallback file still receive the payload.
 		writeClipboard(plain)
-		preview := plain
-		if len(preview) > 60 {
-			preview = preview[:60] + "…"
-		}
-		preview = strings.ReplaceAll(preview, "\n", " ⏎ ")
-		m.messages = append(m.messages, Message{
-			Role:      "info",
-			Content:   fmt.Sprintf("(copied %d chars · %s) %s", len(plain), osc52Status(), preview),
-			Timestamp: time.Now(),
-		})
 		return m, nil
 
 	case tea.MouseWheelMsg:

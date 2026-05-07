@@ -11,7 +11,8 @@ package tui
 // owns the keyboard; (c) clicks on header / chrome are no-ops.
 
 import (
-	"strings"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -41,11 +42,14 @@ func makeChatTestModel(t *testing.T) *Model {
 }
 
 // TestClickCopy_ChatRowYanksToClipboard — a complete left button
-// down→up sequence on a chat row must append an "(copied N chars …)"
-// info row. Single-click row-copy is deferred to MouseReleaseMsg now
-// (was on MouseClickMsg) so drag-to-select can win priority — see
-// tui_update.go's three-way release branch.
+// down→up sequence on a chat row must write to the clipboard fallback
+// file. Used to also assert an "(copied N chars …)" info row, but
+// those rows polluted the transcript (image #20 user report
+// 2026-05-07: a flurry of cmd+C left ten of those grey rows behind),
+// so copy is now silent. We assert via the fallback file because
+// the OSC 52 escape goes to stdout which the test harness can't see.
 func TestClickCopy_ChatRowYanksToClipboard(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
 	m := makeChatTestModel(t)
 	preCount := len(m.messages)
 
@@ -53,16 +57,18 @@ func TestClickCopy_ChatRowYanksToClipboard(t *testing.T) {
 	m.Update(tea.MouseClickMsg{X: 5, Y: 2, Button: tea.MouseLeft})
 	m.Update(tea.MouseReleaseMsg{X: 5, Y: 2, Button: tea.MouseLeft})
 
-	if len(m.messages) <= preCount {
-		t.Fatalf("expected an info row appended; messages went %d → %d",
-			preCount, len(m.messages))
+	// Silent copy: messages count must NOT change.
+	if len(m.messages) != preCount {
+		t.Errorf("copy should be silent; messages went %d → %d (last=%q)",
+			preCount, len(m.messages), m.messages[len(m.messages)-1].Content)
 	}
-	last := m.messages[len(m.messages)-1]
-	if last.Role != "info" {
-		t.Errorf("appended row should be role=info; got %q", last.Role)
+	// Clipboard fallback file should be populated.
+	body, err := os.ReadFile(filepath.Join(os.Getenv("METIS_HOME"), "clipboard.txt"))
+	if err != nil {
+		t.Fatalf("clipboard fallback file missing: %v", err)
 	}
-	if !strings.Contains(last.Content, "copied") {
-		t.Errorf("info content should mention 'copied'; got %q", last.Content)
+	if len(body) == 0 {
+		t.Errorf("clipboard fallback should hold the copied row; got empty")
 	}
 }
 

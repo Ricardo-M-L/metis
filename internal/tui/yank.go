@@ -55,11 +55,17 @@ func (m *Model) yankLastAssistant() string {
 }
 
 // copySelectionAndReport pulls the chat list's current text selection
-// (set by mouse drag / double-click / triple-click), pushes it to the
-// system clipboard, and appends an info row with byte count + preview.
-// No-op when nothing is selected. Mirrors yankLastAssistant's report
-// format so users see consistent feedback regardless of which copy
-// path fired.
+// (set by mouse drag / double-click / triple-click) and pushes it to
+// the system clipboard. SILENT — no info row appended.
+//
+// Why silent: the previous version logged "(copied N chars · OSC 52
+// → Apple_Terminal) <preview>" into the transcript, which polluted
+// the chat (image #20 2026-05-07: ten of these grey rows after the
+// user's cmd+C session). Claude Code's parity is also silent — copy
+// is a low-ceremony action, the model output is the message, the
+// clipboard is the side effect. If the user wants confirmation they
+// can paste somewhere; the OSC 52 escape + ~/.metis/clipboard.txt
+// fallback both still fire.
 func (m *Model) copySelectionAndReport() {
 	text := m.chatList.SelectedText()
 	text = trimTrailingNewlines(text)
@@ -67,16 +73,6 @@ func (m *Model) copySelectionAndReport() {
 		return
 	}
 	writeClipboard(text)
-	preview := text
-	if len(preview) > 60 {
-		preview = preview[:60] + "…"
-	}
-	preview = formatPreviewForLog(preview)
-	m.messages = append(m.messages, Message{
-		Role:      "info",
-		Content:   fmt.Sprintf("(copied %d chars · %s) %s", len(text), osc52Status(), preview),
-		Timestamp: time.Now(),
-	})
 }
 
 // trimTrailingNewlines strips trailing "\n" characters added by
