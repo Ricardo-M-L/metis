@@ -9,6 +9,8 @@ import (
 	"sync"
 
 	"charm.land/glamour/v2"
+	"charm.land/glamour/v2/ansi"
+	"charm.land/glamour/v2/styles"
 )
 
 // renderMessage prints a single transcript row. Spacing convention:
@@ -181,7 +183,7 @@ func getMarkdownRenderer(width int) *glamour.TermRenderer {
 		wrap = 120
 	}
 	r, err := glamour.NewTermRenderer(
-		glamour.WithEnvironmentConfig(),
+		glamour.WithStyles(metisCodeBlockStyle()),
 		glamour.WithWordWrap(wrap),
 	)
 	if err != nil {
@@ -190,6 +192,40 @@ func getMarkdownRenderer(width int) *glamour.TermRenderer {
 	mdRenderer = r
 	mdRendererForWidth = width
 	return r
+}
+
+// metisCodeBlockStyle returns glamour's stock dark style with all
+// red-ish chroma colours scrubbed.
+//
+// glamour's default dark theme paints:
+//   - chroma.Error.BackgroundColor = #F05B5B — hot-pink fill on every
+//     token the lexer can't classify. ASCII box-drawing chars
+//     (┌─┐│└┘├┤┬┴┼) used in directory trees + architecture diagrams
+//     fall here, so users see whole walls of red over clean diagram
+//     art (images #13 + #14 2026-05-07).
+//   - chroma.GenericDeleted.Color = #FD5B5B — leaks onto regular `-`
+//     lines in non-diff blocks (markdown bullets inside code fences).
+//   - chroma.Operator / KeywordNamespace / KeywordReserved /
+//     NameBuiltin / CommentPreproc — all set to red/pink/orange
+//     shades that compound the visual chaos when the lexer mis-
+//     tokenises ASCII art.
+//
+// We zero-out every offending token. Other dark-theme colours
+// preserved — strings, regular keywords, numbers, comments stay
+// readable; only the bath-of-red goes away.
+func metisCodeBlockStyle() ansi.StyleConfig {
+	cfg := styles.DarkStyleConfig
+	chroma := *cfg.CodeBlock.Chroma
+	zero := ansi.StylePrimitive{}
+	chroma.Error = zero
+	chroma.GenericDeleted = zero
+	chroma.Operator = zero
+	chroma.KeywordNamespace = zero
+	chroma.KeywordReserved = zero
+	chroma.NameBuiltin = zero
+	chroma.CommentPreproc = zero
+	cfg.CodeBlock.Chroma = &chroma
+	return cfg
 }
 
 // renderAssistantBody pretty-prints the assistant text with markdown

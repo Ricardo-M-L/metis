@@ -48,10 +48,30 @@ type MouseClickable interface {
 	HandleMouseClick(btn ansi.MouseButton, x, y int) bool
 }
 
+// NoSelectable is an opt-out marker. Items returning IsNoSelect() == true
+// are excluded from text selection: drag-select skips them, double / triple-
+// click ignores them, SelectedText() returns nothing for that row, and
+// applySelectionToLine renders the row plain (no highlight even if the
+// drag spanned across it). Use for separators, spinners, role headers,
+// timestamps, ephemeral status lines — anything the user wouldn't want
+// to copy-paste into another tool.
+//
+// Mirrors Claude Code's `noSelect` cell attribute (cell.ts:30) without
+// requiring a per-cell flag — metis selects at item granularity, which
+// is coarser but maps cleanly onto our row model where chrome and chat
+// content already live in different items.
+type NoSelectable interface {
+	IsNoSelect() bool
+}
+
 // SpacerItem is a spacer item that adds vertical space in the list.
 type SpacerItem struct {
 	Height int
 }
+
+// IsNoSelect implements NoSelectable for SpacerItem — pure-whitespace
+// rows have nothing meaningful to copy.
+func (s *SpacerItem) IsNoSelect() bool { return true }
 
 // NewSpacerItem creates a new [SpacerItem] with the specified height.
 func NewSpacerItem(height int) *SpacerItem {

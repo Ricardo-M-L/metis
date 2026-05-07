@@ -189,3 +189,44 @@ func TestDispatch_ExclusiveRunsAfterAll(t *testing.T) {
 		t.Errorf("Excl1 should start last; order=%v", order)
 	}
 }
+
+// TestShortToolDesc — first paragraph wins, falls back to single-line,
+// hard cap at 200 chars. Mirrors Crush's CRUSH_SHORT_TOOL_DESCRIPTIONS
+// behaviour: a tool's full doc may be useful for `metis tools` listing
+// but the LLM only needs enough to pick the tool.
+func TestShortToolDesc(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"single line", "Read a file.", "Read a file."},
+		{
+			"paragraph break",
+			"Read a file from disk.\n\nThis tool returns numbered lines.\n\nWhen the file is binary…",
+			"Read a file from disk.",
+		},
+		{
+			"single newline only",
+			"Run a shell command.\nOutput is captured and truncated.",
+			"Run a shell command.",
+		},
+		{
+			"hard cap fallback",
+			"" +
+				"This is one giant runaway sentence with no breaks at all that just goes on " +
+				"and on past two hundred characters so the boundary search finds neither a " +
+				"paragraph nor a newline before the cap, forcing the truncate path to fire.",
+			"This is one giant runaway sentence with no breaks at all that just goes on and on past two hundred characters so the boundary search finds neither a paragraph nor a newline before the cap, forcing the…",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shortToolDesc(tc.in)
+			if got != tc.want {
+				t.Errorf("shortToolDesc(%q) =\n  got:  %q\n  want: %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

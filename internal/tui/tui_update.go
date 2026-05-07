@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -119,6 +120,183 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// type for press (vs KeyReleaseMsg). handleKey takes tea.KeyMsg
 		// which both implement, so passing through is fine.
 		return m.handleKey(msg)
+
+	case tea.PasteMsg:
+		// Bracketed paste: terminal wraps cmd+V'd content with
+		// \x1b[200~ … \x1b[201~ and bubbletea v2 reports it as a
+		// single PasteMsg (instead of streaming each char as a
+		// KeyPressMsg). Without this case the content is silently
+		// dropped, which is the "metis 页面不能粘贴文字" bug
+		// reported 2026-05-07.
+		//
+		// Skip during permission prompt / copy mode / overlays — the
+		// keyboard is owned by something other than the textarea then,
+		// and pasting into a permission dialog is meaningless.
+		if m.permActive || m.copyMode || m.activeScreen != nil {
+			return m, nil
+		}
+		// During an active turn the input is also disabled (Enter is
+		// intercepted upstream); skip paste too so we don't queue
+		// content that the next turn will then accidentally include.
+		if m.turnActive {
+			return m, nil
+		}
+		text := msg.Content
+		if text == "" {
+			return m, nil
+		}
+		// Big paste guardrail: terminal-emulator paste of a 50KB log
+		// file would shove tens of thousands of chars into the
+		// textarea and freeze its rendering. Cap at 100KB; anything
+		// over gets truncated with a visible info row so the user
+		// sees what happened.
+		const maxPasteBytes = 100 * 1024
+		original := len(text)
+		if original > maxPasteBytes {
+			text = text[:maxPasteBytes]
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   fmt.Sprintf("(paste truncated to %d KiB; original was %d KiB)", maxPasteBytes/1024, original/1024),
+				Timestamp: time.Now(),
+			})
+		}
+		m.input.InsertString(text)
+		// Trigger at-mention completion in case the pasted content
+		// ends with `@partial` — same path as a normal keypress would
+		// take. updateAtMention is idempotent on no-match.
+		m.updateAtMention()
+		return m, nil
+
+	case tea.MouseClickMsg:
+		// Mouse-down event (despite the name "Click", in bubbletea v2
+		// MouseClickMsg fires on button press, not full press+release).
+		// We use it to start a selection or, on double/triple click,
+		// snap to a word / line. The actual copy happens on
+		// MouseReleaseMsg below — that way single-click-no-drag and
+		// drag-to-select share one outbound copy path.
+		if msg.Button != tea.MouseLeft ||
+			m.permActive || m.copyMode || m.activeScreen != nil ||
+			m.showHistory || m.showTaskPanel {
+			return m, nil
+		}
+		localY := msg.Y - chatStartY
+		if localY < 0 || localY >= m.chatList.Height() {
+			return m, nil
+		}
+		// Click-count tracking — same algorithm as crush's chat.go.
+		// Within doubleClickThreshold + clickPosTolerance the counter
+		// climbs; outside, it resets to 1 (start of a new sequence).
+		now := time.Now()
+		if now.Sub(m.lastClickTime) <= doubleClickThreshold &&
+			abs(msg.X-m.lastClickX) <= clickPosTolerance &&
+			abs(msg.Y-m.lastClickY) <= clickPosTolerance {
+			m.clickCount++
+		} else {
+			m.clickCount = 1
+		}
+		m.lastClickTime = now
+		m.lastClickX = msg.X
+		m.lastClickY = msg.Y
+
+		m.chatList.HandleMouseDown(msg.X, localY, m.clickCount)
+		// Double / triple click finalize their selection inside
+		// HandleMouseDown (selectWord / selectLine). Copy on the
+		// spot — the user's intent is unambiguous, no need to wait
+		// for the release.
+		if m.clickCount >= 2 && m.chatList.HasSelection() {
+			m.copySelectionAndReport()
+			// Clear so the next single click doesn't inherit the
+			// triple-click span as a "drag from last selection."
+			// Highlight stays drawn until the next click.
+		}
+		return m, nil
+
+	case tea.MouseMotionMsg:
+		// MouseModeCellMotion delivers motion events ONLY while a
+		// button is held (drag-while-pressed). We treat any drag as
+		// selection-extending; if no anchor is set HandleMouseDrag is
+		// a no-op so spurious motion (e.g. during a click that didn't
+		// land on the chat surface) is harmless.
+		if m.permActive || m.copyMode || m.activeScreen != nil ||
+			m.showHistory || m.showTaskPanel {
+			return m, nil
+		}
+		localY := msg.Y - chatStartY
+		// Don't clamp here — HandleMouseDrag clamps internally to the
+		// visible item range so a drag past the bottom edge doesn't
+		// lose the lower half of the selection.
+		m.chatList.HandleMouseDrag(msg.X, localY)
+		return m, nil
+
+	case tea.MouseReleaseMsg:
+		// Button-up: finalize the selection. Three outcomes:
+		//  1. Drag produced a non-empty selection → copy SelectedText.
+		//  2. Single click with no drag → fall back to "copy whole
+		//     row" (the original click-to-copy behavior).
+		//  3. Click on chrome (header / below list) → no-op.
+		if msg.Button != tea.MouseLeft ||
+			m.permActive || m.copyMode || m.activeScreen != nil ||
+			m.showHistory || m.showTaskPanel {
+			return m, nil
+		}
+		hadDrag := m.chatList.HandleMouseUp()
+		if hadDrag {
+			m.copySelectionAndReport()
+			return m, nil
+		}
+		// No drag → single-click row-copy fallback. Suppress when
+		// a multi-click in flight already copied (clickCount >= 2).
+		if m.clickCount >= 2 {
+			return m, nil
+		}
+		localY := msg.Y - chatStartY
+		if localY < 0 || localY >= m.chatList.Height() {
+			return m, nil
+		}
+		idx, itemY := m.chatList.ItemAtY(localY)
+		if idx < 0 {
+			return m, nil
+		}
+		// OSC 8 hyperlink under the click? Open it in the system
+		// browser instead of copying the row. Mirrors iTerm2 / kitty
+		// "cmd+click on link" behavior, but unmodified — feels natural
+		// in a chat surface where most "interesting" rows have one
+		// canonical link (a URL the assistant shared, a file:// path
+		// from a tool result). The row-copy fallback is one row down
+		// the priority chain so power users still get it.
+		if url := m.chatList.URLAtPoint(idx, itemY, msg.X); url != "" {
+			if err := openURL(url); err == nil {
+				m.messages = append(m.messages, Message{
+					Role:      "info",
+					Content:   fmt.Sprintf("(opened %s)", url),
+					Timestamp: time.Now(),
+				})
+			} else {
+				m.messages = append(m.messages, Message{
+					Role:      "info",
+					Content:   fmt.Sprintf("(could not open %s: %v)", url, err),
+					Timestamp: time.Now(),
+				})
+			}
+			return m, nil
+		}
+		raw := m.chatList.ItemContent(idx)
+		plain := strings.TrimSpace(ansi.Strip(raw))
+		if plain == "" {
+			return m, nil
+		}
+		writeClipboard(plain)
+		preview := plain
+		if len(preview) > 60 {
+			preview = preview[:60] + "…"
+		}
+		preview = strings.ReplaceAll(preview, "\n", " ⏎ ")
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   fmt.Sprintf("(copied %d chars · %s) %s", len(plain), osc52Status(), preview),
+			Timestamp: time.Now(),
+		})
+		return m, nil
 
 	case tea.MouseWheelMsg:
 		// v2 split MouseMsg into Click/Release/Wheel/Motion subtypes.

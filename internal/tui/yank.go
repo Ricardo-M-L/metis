@@ -54,6 +54,60 @@ func (m *Model) yankLastAssistant() string {
 	return "(nothing to copy yet — type a message and let the model reply)"
 }
 
+// copySelectionAndReport pulls the chat list's current text selection
+// (set by mouse drag / double-click / triple-click), pushes it to the
+// system clipboard, and appends an info row with byte count + preview.
+// No-op when nothing is selected. Mirrors yankLastAssistant's report
+// format so users see consistent feedback regardless of which copy
+// path fired.
+func (m *Model) copySelectionAndReport() {
+	text := m.chatList.SelectedText()
+	text = trimTrailingNewlines(text)
+	if text == "" {
+		return
+	}
+	writeClipboard(text)
+	preview := text
+	if len(preview) > 60 {
+		preview = preview[:60] + "…"
+	}
+	preview = formatPreviewForLog(preview)
+	m.messages = append(m.messages, Message{
+		Role:      "info",
+		Content:   fmt.Sprintf("(copied %d chars · %s) %s", len(text), osc52Status(), preview),
+		Timestamp: time.Now(),
+	})
+}
+
+// trimTrailingNewlines strips trailing "\n" characters added by
+// SelectedText's per-line joiner — a triple-click on the last line of
+// an item doesn't include the row's terminating newline as user-
+// visible content, so trimming keeps the clipboard payload tight.
+func trimTrailingNewlines(s string) string {
+	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == ' ') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// formatPreviewForLog replaces newlines with a visible glyph so the
+// info row stays one line in the transcript even when the user copied
+// a multi-line span.
+func formatPreviewForLog(s string) string {
+	if s == "" {
+		return s
+	}
+	out := make([]byte, 0, len(s))
+	for _, r := range s {
+		if r == '\n' {
+			out = append(out, " \xe2\x8f\x8e "...) // " ⏎ "
+			continue
+		}
+		out = append(out, string(r)...)
+	}
+	return string(out)
+}
+
 // writeClipboard emits the OSC 52 sequence to stdout AND writes a
 // fallback file. Best-effort throughout; we never error the chat
 // surface for a clipboard hiccup.

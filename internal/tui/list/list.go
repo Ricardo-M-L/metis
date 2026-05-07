@@ -74,6 +74,12 @@ type List struct {
 	atBottomCacheValid bool
 	atBottomCachedKey  atBottomCacheKey
 	atBottomCachedRes  bool
+
+	// sel holds the live mouse-driven text selection. See selection.go
+	// for the full state machine. Zero value (-1 anchor) = no
+	// selection; Render checks HasSelection() before applying
+	// `\x1b[7m` overlay.
+	sel selectionState
 }
 
 // atBottomCacheKey captures every input that AtBottom's calculation reads.
@@ -99,6 +105,7 @@ func NewList(items ...Item) *List {
 	l.items = items
 	l.selectedIdx = -1
 	l.mouseWheelDelta = 1
+	l.sel = emptySelectionState()
 	return l
 }
 
@@ -328,6 +335,62 @@ func (l *List) ScrollPercent() float64 {
 	return float64(l.offsetIdx) / float64(denom)
 }
 
+// ItemAtY maps a viewport-relative y coordinate (0 = top of the list's
+// rendered area) to the item index it lands on, plus the y offset within
+// that item. Returns -1, -1 when y is outside the visible window or
+// the list is empty.
+//
+// Used by the chat surface's click-to-copy handler in tui_update.go:
+// translates a mouse click on the rendered transcript into the item
+// whose text should be yanked. Mirrors crush's findItemAtY (list.go:621)
+// — same algorithm, different list package.
+func (l *List) ItemAtY(y int) (itemIdx int, itemY int) {
+	if y < 0 || y >= l.height || len(l.items) == 0 {
+		return -1, -1
+	}
+	// Walk visible items: start at offsetIdx, account for offsetLine
+	// hidden above the viewport, advance by item height (+gap) until
+	// we cross y.
+	currentIdx := l.offsetIdx
+	currentLine := -l.offsetLine
+	for currentIdx < len(l.items) && currentLine < l.height {
+		item := l.getItem(currentIdx)
+		itemEndLine := currentLine + item.height
+		if y >= currentLine && y < itemEndLine {
+			return currentIdx, y - currentLine
+		}
+		currentLine = itemEndLine
+		if l.gap > 0 {
+			currentLine += l.gap
+		}
+		currentIdx++
+	}
+	return -1, -1
+}
+
+// ItemContent returns the rendered string of the item at idx, or "" if
+// idx is out of range. Companion to ItemAtY for click-to-copy: caller
+// uses ItemAtY to find the index, then ItemContent to grab the text.
+func (l *List) ItemContent(idx int) string {
+	if idx < 0 || idx >= len(l.items) {
+		return ""
+	}
+	return l.getItem(idx).content
+}
+
+// itemNoSelect reports whether the item at idx has opted out of text
+// selection via the NoSelectable interface. Out-of-range indices return
+// false (no special behavior — selection range checks already gate these).
+func (l *List) itemNoSelect(idx int) bool {
+	if idx < 0 || idx >= len(l.items) {
+		return false
+	}
+	if ns, ok := l.items[idx].(NoSelectable); ok {
+		return ns.IsNoSelect()
+	}
+	return false
+}
+
 // TotalLineCount estimates total content height in lines. Used by the
 // scrollbar gutter to size the thumb proportionally.
 //
@@ -518,14 +581,30 @@ func (l *List) Render() string {
 
 	linesNeeded := l.height
 
+	hasSel := l.HasSelection()
+
 	for linesNeeded > 0 && currentIdx < len(l.items) {
 		item := l.getItem(currentIdx)
 		itemLines := strings.Split(item.content, "\n")
 		itemHeight := len(itemLines)
 
 		if currentOffset >= 0 && currentOffset < itemHeight {
-			// Add visible content lines
-			lines = append(lines, itemLines[currentOffset:]...)
+			// Apply selection overlay (`\x1b[7m … \x1b[27m`) to lines
+			// in this item that fall inside the active selection
+			// range. lineY is the item-local line index, which is what
+			// applySelectionToLine expects — same coordinate system the
+			// HandleMouseDown call originally captured.
+			visible := itemLines[currentOffset:]
+			if hasSel {
+				out := make([]string, len(visible))
+				for i, ln := range visible {
+					itemLineY := currentOffset + i
+					out[i] = l.applySelectionToLine(ln, currentIdx, itemLineY)
+				}
+				lines = append(lines, out...)
+			} else {
+				lines = append(lines, visible...)
+			}
 
 			// Add gap if this is not the absolute last visual element (conceptually gaps are between items)
 			// But in the loop we can just add it and trim later
@@ -554,6 +633,19 @@ func (l *List) Render() string {
 
 	if len(lines) > l.height {
 		lines = lines[:l.height]
+	}
+	// Pad up to l.height with blank rows so the rendered listView
+	// always occupies exactly the height the outer chrome counter
+	// reserved for it. Without this padding, if the user scrolls near
+	// the top of the transcript and the remaining content fits in
+	// fewer lines than l.height, the unfilled rows leave whatever was
+	// previously rendered there in the terminal's alt-screen buffer
+	// untouched. Visual symptom: "上半部分跟着滚, 下半部分一块文字
+	// 卡在那不动" (user video 2026-05-07 16.57). Pad with empty
+	// strings — strings.Join below turns them into bare "\n"s, which
+	// the alt-screen treats as "clear this row to end of line".
+	for len(lines) < l.height {
+		lines = append(lines, "")
 	}
 
 	if l.reverse {

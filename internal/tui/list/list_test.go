@@ -312,3 +312,19 @@ func TestVisibleItemIndices_PartialView(t *testing.T) {
 		t.Errorf("endIdx = %d, expected < 20 (viewport doesn't fit all)", endIdx)
 	}
 }
+
+// TestRender_PadsShortContentToHeight — when the viewport is taller
+// than the content (e.g. user scrolled near the top of a short
+// transcript), Render must emit exactly l.height lines so the alt-
+// screen doesn't keep stale content from a previous frame in the
+// uncovered rows. Bug report 2026-05-07: "下面一块文字卡住不动".
+func TestRender_PadsShortContentToHeight(t *testing.T) {
+	l := NewList(&staticItem{content: "line A"}, &staticItem{content: "line B"})
+	l.SetSize(80, 10) // viewport 10, content only 2 lines
+	out := l.Render()
+	gotLines := strings.Count(out, "\n") + 1
+	if gotLines != 10 {
+		t.Errorf("Render produced %d lines (separators+1); want 10\noutput: %q",
+			gotLines, out)
+	}
+}

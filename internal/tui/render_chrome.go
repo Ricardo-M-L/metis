@@ -22,14 +22,13 @@ import (
 // inside. claude-code parity — the boxed look is too heavy on dark
 // terminals.
 func renderInputLine(m *Model) string {
-	n := m.input.LineCount()
-	if n < 1 {
-		n = 1
-	}
-	if n > 5 {
-		n = 5
-	}
-	m.input.SetHeight(n)
+	// Height is managed by the textarea itself (DynamicHeight=true,
+	// configured in NewModel). It tracks **visual** lines after wrap,
+	// so a long single-line message that wraps into 3 rows reports
+	// Height()=3 and renders as 3 rows here. The outer chrome counter
+	// in tui_render.go reads strings.Count(lower, "\n"), which already
+	// accounts for those wrapped rows because they're emitted as real
+	// "\n"-separated lines in our loop below.
 
 	termW := m.width
 	if termW <= 0 {

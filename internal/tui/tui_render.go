@@ -206,14 +206,86 @@ func (m *Model) View() tea.View {
 	wasAtBottom := m.chatList.AtBottom()
 	m.chatList.SetItemsKeepScroll(m.buildChatItems()...)
 
-	// Dynamic chat-surface height — size to actual content height
-	// (capped at terminal-minus-chrome) so a fresh chat with 2
-	// messages doesn't pad with blank rows pushing the input box to
-	// the terminal bottom. Must run AFTER SetItems so TotalLineCount
-	// reflects the just-installed items, not the previous frame's.
-	maxVpHeight := m.height - 10
-	if maxVpHeight < 5 {
-		maxVpHeight = 5
+	// Two-phase render: build the chrome BELOW the chat list first so
+	// we know exactly how many rows it occupies, then size the chat
+	// viewport to leave room. The previous code reserved a hardcoded
+	// 10 rows, which was wrong when permission prompt / palette /
+	// search / multi-line input pushed chrome past that — alt-screen
+	// silently clipped the bottom (e.g. permission options 3-4 became
+	// invisible, image #2 user report 2026-05-07).
+	//
+	// Phase 1a: tail + spinner + permission (sits ABOVE the input).
+	var upper strings.Builder
+	if m.thinkingText != "" {
+		upper.WriteString(styleMuted.Render("  " + glyphAsterisk + " "))
+		thinkStyle := styleMuted.Italic(true)
+		thinkLines := strings.Split(m.thinkingText, "\n")
+		if len(thinkLines) > 0 {
+			upper.WriteString(thinkStyle.Render(thinkLines[0]))
+			for _, ln := range thinkLines[1:] {
+				upper.WriteString("\n  ")
+				upper.WriteString(thinkStyle.Render(ln))
+			}
+		}
+		upper.WriteString("\n\n")
+	}
+	if m.streamingText != "" {
+		upper.WriteString(styleAsst.Render("  " + glyphBullet + " "))
+		streamLines := strings.Split(m.streamingText, "\n")
+		if len(streamLines) > 0 {
+			upper.WriteString(styleText.Render(streamLines[0]))
+			for _, ln := range streamLines[1:] {
+				upper.WriteString("\n  ")
+				upper.WriteString(styleText.Render(ln))
+			}
+		}
+		upper.WriteString("\n\n")
+	}
+	if m.spinnerActive {
+		upper.WriteString(renderSpinnerStatus(m))
+	}
+	if m.permActive {
+		upper.WriteString(renderPermission(m))
+	}
+
+	// Phase 1b: input + hints + palette/search/taskPanel + statusBar
+	// + overlays. Input renders BEFORE we count chrome height because
+	// renderInputLine sets m.input.SetHeight; counting against a stale
+	// height understates input rows when the user is mid-typing a
+	// multi-line prompt.
+	var lower strings.Builder
+	lower.WriteString(renderInputLine(m))
+	lower.WriteString(renderHints(m))
+	if m.showPalette {
+		lower.WriteString(renderPalette(m))
+	}
+	if m.showSearch {
+		lower.WriteString(renderTranscriptSearch(m))
+	}
+	if m.showTaskPanel {
+		lower.WriteString(renderTaskPanel(m))
+	}
+	lower.WriteString(renderStatusBar(m))
+	for _, ov := range m.overlays.View(m.width, m.height) {
+		lower.WriteString("\n")
+		lower.WriteString(ov)
+		lower.WriteString("\n")
+	}
+
+	// Phase 2: size the chat viewport against the actual chrome height.
+	// chrome occupies upperLines + lowerLines + 1 line for the "\n"
+	// written between listView and upper. headerLines = 2 (brand line
+	// + separator) was already written to s above.
+	const headerLines = 2
+	const listSeparatorLines = 1
+	upperLines := strings.Count(upper.String(), "\n")
+	lowerLines := strings.Count(lower.String(), "\n")
+	maxVpHeight := m.height - headerLines - listSeparatorLines - upperLines - lowerLines
+	if maxVpHeight < 3 {
+		// Floor at 3 so the chat surface never collapses entirely; if
+		// the terminal is genuinely too short, the alt-screen will
+		// still clip something but at least the user sees recent chat.
+		maxVpHeight = 3
 	}
 	totalLines := m.chatList.TotalLineCount()
 	desiredVp := totalLines
@@ -228,97 +300,15 @@ func (m *Model) View() tea.View {
 		m.chatList.ScrollToBottom()
 	}
 
-	// Render the visible window only. ListView is < 5 KB even for
-	// 1200-item sessions because virtualization caps output at
-	// `desiredVp` lines.
-	//
-	// Scrollbar is intentionally OFF: user feedback 2026-05-05 said
-	// the deep-blue `█` thumb was visually loud. claude-code doesn't
-	// paint a scrollbar either; it relies on the terminal's own
-	// scrollback (Ctrl+S copy mode here exits alt-screen so users
-	// who want to scroll back to history can mouse-select). If we
-	// re-enable the gutter later, it should be one of `│┃▎` in dim
-	// rather than a full block in accent colour.
+	// Phase 3: stitch [header][listView][upper][lower] together.
+	// inputStartRow points at the row where renderInputLine begins, so
+	// attachCursor can position the terminal cursor correctly.
 	listView := m.chatList.Render()
 	s.WriteString(listView)
 	s.WriteString("\n")
-
-	// Live-streaming extended-thinking + assistant text rendered in
-	// the "stream tail" — distinct from the chat list because their
-	// content mutates every spinner tick and would invalidate the
-	// list's cache keys repeatedly. They live BELOW the list so the
-	// user sees: [history items] / [stream-in-progress] / [chrome].
-	var tail strings.Builder
-	if m.thinkingText != "" {
-		tail.WriteString(styleMuted.Render("  " + glyphAsterisk + " "))
-		thinkStyle := styleMuted.Italic(true)
-		thinkLines := strings.Split(m.thinkingText, "\n")
-		if len(thinkLines) > 0 {
-			tail.WriteString(thinkStyle.Render(thinkLines[0]))
-			for _, ln := range thinkLines[1:] {
-				tail.WriteString("\n  ")
-				tail.WriteString(thinkStyle.Render(ln))
-			}
-		}
-		tail.WriteString("\n\n")
-	}
-	if m.streamingText != "" {
-		tail.WriteString(styleAsst.Render("  " + glyphBullet + " "))
-		streamLines := strings.Split(m.streamingText, "\n")
-		if len(streamLines) > 0 {
-			tail.WriteString(styleText.Render(streamLines[0]))
-			for _, ln := range streamLines[1:] {
-				tail.WriteString("\n  ")
-				tail.WriteString(styleText.Render(ln))
-			}
-		}
-		tail.WriteString("\n\n")
-	}
-	if tail.Len() > 0 {
-		s.WriteString(tail.String())
-	}
-
-	// Spinner — mirrors claude-code's `* Verb (Xs · ↓ N.Nk tokens · thought
-	// for Ys)` parts pattern.
-	if m.spinnerActive {
-		s.WriteString(renderSpinnerStatus(m))
-	}
-
-	// Permission prompt sits ABOVE the input — modal interrupt the
-	// user must answer before continuing.
-	if m.permActive {
-		s.WriteString(renderPermission(m))
-	}
-
+	s.WriteString(upper.String())
 	inputStartRow := strings.Count(s.String(), "\n")
-	s.WriteString(renderInputLine(m))
-	// hints (mode indicator) — claude-code parity: glued to the input.
-	s.WriteString(renderHints(m))
-
-	// Slash command palette renders BELOW the hints (claude-code
-	// pattern). Palette is suggestion overlay, hints is permanent.
-	if m.showPalette {
-		s.WriteString(renderPalette(m))
-	}
-	if m.showSearch {
-		s.WriteString(renderTranscriptSearch(m))
-	}
-
-	// Task panel — Ctrl+T opens a bordered list of todos.
-	if m.showTaskPanel {
-		s.WriteString(renderTaskPanel(m))
-	}
-
-	s.WriteString(renderStatusBar(m))
-
-	// Overlay stack — every active modal/dialog. Each overlay's View()
-	// already returns a lipgloss-bordered box, so we just append in
-	// stack order. Empty list = no modals visible.
-	for _, ov := range m.overlays.View(m.width, m.height) {
-		s.WriteString("\n")
-		s.WriteString(ov)
-		s.WriteString("\n")
-	}
+	s.WriteString(lower.String())
 
 	// Reset ANSI styles to prevent stacking
 	s.WriteString("\033[0m")

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -27,7 +28,7 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 	out := make([]llm.ToolSpec, 0, len(all))
 	for _, t := range all {
 		out = append(out, llm.ToolSpec{
-			Name: t.Name(), Description: t.Description(), InputSchema: t.InputSchema(),
+			Name: t.Name(), Description: shortToolDesc(t.Description()), InputSchema: t.InputSchema(),
 		})
 	}
 	threshold := l.LazyToolThreshold
@@ -35,6 +36,34 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 		threshold = LazyToolThresholdDefault
 	}
 	return applyLazySchema(out, threshold)
+}
+
+// shortToolDesc trims a tool's full Description() down to the
+// short-form the LLM actually needs: the first paragraph, capped at
+// 200 chars. Borrowed from Crush's CRUSH_SHORT_TOOL_DESCRIPTIONS
+// pattern — a tool's full doc (multi-paragraph spec, examples,
+// edge-case discussion) is great for `metis tools` listing but
+// inflates every turn's input by ~1500 tokens across 22 tools when
+// shipped verbatim. The first paragraph is enough for the model to
+// pick the tool; deeper detail goes through InputSchema's parameter
+// docs (which we keep intact).
+//
+// Boundary order (first hit wins): blank line ("\n\n"), single
+// newline ("\n"), 200-char cap. We prefer paragraph splits over
+// hard caps so we don't sever a half-sentence — only fall back to
+// the cap when the doc is one giant run-on paragraph.
+func shortToolDesc(full string) string {
+	const maxLen = 200
+	if i := strings.Index(full, "\n\n"); i >= 0 && i < maxLen {
+		return strings.TrimSpace(full[:i])
+	}
+	if i := strings.Index(full, "\n"); i >= 0 && i < maxLen {
+		return strings.TrimSpace(full[:i])
+	}
+	if len(full) > maxLen {
+		return strings.TrimSpace(full[:maxLen]) + "…"
+	}
+	return strings.TrimSpace(full)
 }
 
 // executeBatch runs every tool_use in toolUses, returning the matching

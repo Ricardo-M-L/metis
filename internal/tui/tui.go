@@ -312,7 +312,34 @@ type Model struct {
 	// per-frame churn at the chat-list level. Sign tracks direction
 	// (negative = up, positive = down).
 	wheelAccum int
+
+	// Mouse click-count tracking — used to detect double/triple
+	// clicks for word/line selection on the chat surface. Mirrors
+	// crush's chat.go (clickCount + lastClickTime + lastClickX/Y).
+	// Within doubleClickThreshold AND clickPosTolerance the count
+	// increments; otherwise it resets to 1.
+	clickCount    int
+	lastClickTime time.Time
+	lastClickX    int
+	lastClickY    int
 }
+
+// doubleClickThreshold is the maximum gap between two MouseClickMsg
+// events for them to count as a double-click. crush uses 500ms, macOS
+// system-wide default is ~300-500ms. 400ms is the comfortable middle.
+const doubleClickThreshold = 400 * time.Millisecond
+
+// clickPosTolerance is the maximum (x, y) drift between consecutive
+// clicks for them to still register as the same multi-click. 2 cells
+// covers natural finger jitter on a trackpad without being so loose
+// that two-finger taps in different rows count as a double-click.
+const clickPosTolerance = 2
+
+// chatStartY is the row where chatList's rendering begins inside the
+// alt-screen. y=0 is the brand line ("metis · model · mode"); y=1 is
+// the separator; y=2 onward is the list. Used to translate viewport
+// mouse coordinates into list-relative coordinates.
+const chatStartY = 2
 
 // nextID returns a process-stable identifier for a new Message or
 // ToolEvent. Format is "<sessionID>-m<seq>" so debug logs can be
@@ -366,7 +393,16 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	ti.CharLimit = 8192
 	ti.SetWidth(80)
 	ti.SetHeight(1)
-	ti.MaxHeight = 5
+	// Auto-grow on long input. Without DynamicHeight, a 200-char single-
+	// line message squeezes into one row and the visible portion scrolls
+	// horizontally — the user can't see what they typed (image #10
+	// 2026-05-07: "输入框输入一个超一行的就出现这个图里的情景"). Crush
+	// uses the same model: DynamicHeight + Min/MaxHeight, with the
+	// outer chrome layer counting wrapped rows automatically because
+	// renderInputLine reads the post-wrap textarea View().
+	ti.DynamicHeight = true
+	ti.MinHeight = 1
+	ti.MaxHeight = 10
 	ti.ShowLineNumbers = false
 	// Disable virtual cursor — bubbles/v2 textarea paints the cursor by
 	// SGR-inverting the char under it (cursor.go View() always calls
