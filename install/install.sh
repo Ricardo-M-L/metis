@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # metis installer — curl one-liner front-end for the PRIVATE release.
 #
-# Usage:
-#   export METIS_GITHUB_TOKEN=ghp_xxx          # PAT with repo:read on metis
-#   curl -fsSL -H "Authorization: Bearer $METIS_GITHUB_TOKEN" \
-#       https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.sh \
+# Usage (curl one-liner against GitHub Contents API — the API path is
+# more reliable than raw.githubusercontent.com for private repos; we
+# saw the raw host time out where /repos/.../contents/<path> works):
+#
+#   export METIS_GITHUB_TOKEN=ghp_xxx           # PAT, Contents:read on metis
+#   curl -fsSL \
+#       -H "Authorization: Bearer $METIS_GITHUB_TOKEN" \
+#       -H "Accept: application/vnd.github.raw" \
+#       https://api.github.com/repos/Ricardo-M-L/metis/contents/install/install.sh \
 #     | bash
 #
 # Or after cloning:
