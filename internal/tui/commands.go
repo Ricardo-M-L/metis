@@ -841,10 +841,47 @@ func (r *REPL) handleMCPAdd(name, command string, args []string) string {
 	if err := runtime.SaveMCP(reg); err != nil {
 		return "mcp: save: " + err.Error()
 	}
+	// User-confusion guardrail: if the "command" they typed looks like
+	// a URL, they almost certainly meant to register an HTTP MCP server
+	// — but `/mcp add` only knows the stdio path. Without a warning we
+	// silently store `command = "https://..."` and the user wonders why
+	// "no such file or directory" comes back on launch. Same intent as
+	// Claude Code's looksLikeUrl check in addCommand.ts.
+	if hint := looksLikeURLHint(command, name); hint != "" {
+		base := "(replaced MCP server: " + name + ")"
+		if !existed {
+			base = "(added MCP server: " + name + " — run `mcp start " + name + "` to spawn)"
+		}
+		return base + "\n" + hint
+	}
 	if existed {
 		return "(replaced MCP server: " + name + ")"
 	}
 	return "(added MCP server: " + name + " — run `mcp start " + name + "` to spawn)"
+}
+
+// looksLikeURLHint returns a non-empty warning string when `command`
+// looks like a URL that the user probably wanted to register as an
+// HTTP server, not a stdio command. Returns "" when the command is
+// almost certainly a real binary path / npx invocation / etc.
+func looksLikeURLHint(command, name string) string {
+	c := strings.ToLower(command)
+	switch {
+	case strings.HasPrefix(c, "http://"),
+		strings.HasPrefix(c, "https://"),
+		strings.HasSuffix(c, "/sse"),
+		strings.HasSuffix(c, "/mcp"):
+		// fall through
+	default:
+		return ""
+	}
+	return "  warning: command looks like a URL — `/mcp add` only registers stdio servers.\n" +
+		"  for an HTTP MCP server, edit ~/.metis/mcp.toml directly:\n" +
+		"    [[servers]]\n" +
+		"    name = \"" + name + "\"\n" +
+		"    url  = \"" + command + "\"\n" +
+		"    [servers.headers]\n" +
+		"      Authorization = \"Bearer ${YOUR_TOKEN}\""
 }
 
 func (r *REPL) handleMCPRemove(name string) string {

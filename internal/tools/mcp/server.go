@@ -10,6 +10,17 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
+// maxToolDescriptionBytes caps a single MCP tool's description length
+// before it lands in the system prompt. Some servers (notably ones
+// auto-generated from OpenAPI specs — see Claude Code's
+// MAX_MCP_DESCRIPTION_LENGTH = 2048) dump 15-60 KB of endpoint docs
+// into tool.description. Without a cap, three such servers eat the
+// whole context window before the user types a single message.
+//
+// 2048 chars matches CC's chosen p95-tail point: enough for "what does
+// this tool do + when to use" but not for full API references.
+const maxToolDescriptionBytes = 2048
+
 // Server wraps an MCP server as a Metis tool registry entry.
 type Server struct {
 	client *mcp.Client
@@ -91,7 +102,7 @@ func wrapClient(ctx context.Context, name string, client *mcp.Client) (*Server, 
 	for _, t := range mcpTools {
 		tool := &MCPTool{
 			name:        t.Name,
-			description: t.Description,
+			description: truncateDescription(t.Description),
 			inputSchema: t.InputSchema,
 			server:      s,
 		}
@@ -100,10 +111,66 @@ func wrapClient(ctx context.Context, name string, client *mcp.Client) (*Server, 
 	return s, nil
 }
 
+// truncateDescription clamps a tool description to maxToolDescriptionBytes,
+// appending an ellipsis marker so the LLM (and the human reading logs)
+// can tell content was elided rather than just sentence-ending mid-word.
+// Operates on bytes — UTF-8 truncation could land mid-rune, so we walk
+// back to the last valid boundary before appending.
+func truncateDescription(desc string) string {
+	if len(desc) <= maxToolDescriptionBytes {
+		return desc
+	}
+	// Walk back to a UTF-8 boundary. Bytes 0x80-0xBF are continuation
+	// bytes; the start of a multi-byte rune is 0xC0+ or ASCII (<0x80).
+	cut := maxToolDescriptionBytes
+	for cut > 0 && (desc[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return desc[:cut] + "… (truncated)"
+}
+
 // Tools returns all tools from the MCP server.
 func (s *Server) Tools() []tools.Tool {
 	out := make([]tools.Tool, 0, len(s.tools))
 	for _, t := range s.tools {
+		out = append(out, t)
+	}
+	return out
+}
+
+// FilteredTools returns the subset of tools after applying optional
+// allow/deny lists. Empty `enabled` means "allow everything"; empty
+// `disabled` means "deny nothing". Names match against the server-side
+// unqualified tool name (e.g. "screenshot"), so users configure
+// `enabled_tools = ["screenshot", "left_click"]` rather than the longer
+// `mcp__computer-use__screenshot` form they already see in prompts.
+//
+// Lifted from Codex's mcp_servers.<id>.enabled_tools / disabled_tools
+// semantics — Claude Code uses a hardcoded equivalent for IDE servers
+// (ALLOWED_IDE_TOOLS in client.ts:567), and the per-server config form
+// is what makes this useful for arbitrary servers.
+func (s *Server) FilteredTools(enabled, disabled []string) []tools.Tool {
+	if len(enabled) == 0 && len(disabled) == 0 {
+		return s.Tools()
+	}
+	allow := map[string]struct{}{}
+	for _, n := range enabled {
+		allow[n] = struct{}{}
+	}
+	deny := map[string]struct{}{}
+	for _, n := range disabled {
+		deny[n] = struct{}{}
+	}
+	out := make([]tools.Tool, 0, len(s.tools))
+	for name, t := range s.tools {
+		if len(allow) > 0 {
+			if _, ok := allow[name]; !ok {
+				continue
+			}
+		}
+		if _, denied := deny[name]; denied {
+			continue
+		}
 		out = append(out, t)
 	}
 	return out

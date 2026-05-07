@@ -54,6 +54,7 @@ func (m *Model) helpGeneralRows() []screen.HelpRow {
 		{Key: "Ctrl+P", Value: "session picker"},
 		{Key: "Ctrl+V", Value: "paste from clipboard (image/text)"},
 		{Key: "Ctrl+Y", Value: "yank last assistant reply"},
+		{Key: "Mouse click", Value: "copy that chat row to clipboard"},
 		{Key: "Shift+Tab", Value: "cycle permission mode"},
 	}
 }

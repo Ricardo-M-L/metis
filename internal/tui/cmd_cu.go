@@ -66,13 +66,13 @@ func cuEnable(r *REPL) string {
 	if err != nil {
 		return "cu: load mcp.toml: " + err.Error()
 	}
-	existed := runtime.FindMCPServer(reg, cuServerName) != nil
-	if err := runtime.AddMCPServer(reg, cuServerName, cuBinaryName, nil); err != nil {
-		return "cu: add: " + err.Error()
-	}
-	// AddMCPServer leaves Disabled at its prior value; force enabled
-	// so re-running `/cu enable` after `/cu disable` actually flips
-	// it back on rather than silently leaving it off.
+	// Use the dedicated SetReservedComputerUseServer rather than
+	// AddMCPServer — AddMCPServer refuses the reserved name (it's the
+	// guardrail for `/mcp add computer-use ...`). /cu owns this slot.
+	existed := runtime.SetReservedComputerUseServer(reg)
+	// SetReservedComputerUseServer leaves Disabled at its prior value
+	// when replacing; force enabled so re-running `/cu enable` after
+	// `/cu disable` actually flips it back on.
 	if e := runtime.FindMCPServer(reg, cuServerName); e != nil {
 		e.Disabled = false
 	}

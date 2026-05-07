@@ -10,26 +10,92 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrTransportClosed is returned to pending senders when the read loop
 // exits unexpectedly (subprocess crash, EOF, etc).
 var ErrTransportClosed = errors.New("mcp: transport closed")
 
+// Three-layer timeout model — same shape as Claude Code's
+// services/mcp/client.ts uses internally:
+//
+//   - Connect (default 30 s, env MCP_CONNECT_TIMEOUT) — handshake +
+//     initial tools/list. Without this a hung server keeps the user
+//     staring at "starting…" until they Ctrl+C.
+//   - Request (default 60 s, env MCP_REQUEST_TIMEOUT) — bookkeeping
+//     RPCs after handshake (re-listing tools / etc).
+//   - Tool (default 27.8 h ~ effectively infinite, env MCP_TOOL_TIMEOUT)
+//     — `tools/call`. Long because some tools (browser sessions,
+//     long-running data jobs) legitimately run for hours; Claude Code
+//     uses 100,000,000 ms for the same reason.
+//
+// All env vars accept Go duration syntax (e.g. "45s", "5m", "1h"); a
+// bad/empty value falls back to the default rather than panicking.
+const (
+	defaultConnectTimeout = 30 * time.Second
+	defaultRequestTimeout = 60 * time.Second
+	defaultToolTimeout    = 100_000 * time.Second // ~27.8 h
+)
+
+// ConnectTimeout returns the per-server connect+handshake budget.
+func ConnectTimeout() time.Duration {
+	return durationFromEnv("MCP_CONNECT_TIMEOUT", defaultConnectTimeout)
+}
+
+// RequestTimeout returns the per-RPC budget for non-tool calls
+// (tools/list, ping, etc).
+func RequestTimeout() time.Duration {
+	return durationFromEnv("MCP_REQUEST_TIMEOUT", defaultRequestTimeout)
+}
+
+// ToolTimeout returns the per-tools/call budget.
+func ToolTimeout() time.Duration {
+	return durationFromEnv("MCP_TOOL_TIMEOUT", defaultToolTimeout)
+}
+
+func durationFromEnv(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
 // Transport is the underlying communication mechanism.
 type Transport interface {
 	Close() error
 }
+
+// MaxStderrBytes caps how much stderr we keep accumulating from an MCP
+// subprocess. Without a cap, a server stuck in a logspam loop (or a
+// poorly-configured tool dumping a download progress bar) would grow
+// the buffer unbounded — Claude Code hit this in production and
+// settled on 64 MiB as the trade-off (client.ts:982). Anything past
+// the cap is silently discarded; the transport keeps draining the
+// pipe so the kernel's pipe buffer doesn't deadlock the subprocess.
+const MaxStderrBytes = 64 * 1024 * 1024
 
 // StdioTransport launches a local MCP server and communicates over stdin/stdout.
 type StdioTransport struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	// stderrBuf is the bounded ring of stderr bytes the subprocess
+	// emitted. We keep at most MaxStderrBytes — used to surface
+	// real diagnostic output when a handshake / tool call fails
+	// (without it, the user just sees "EOF" with no context).
+	stderrBuf *boundedBuffer
+	stderrWG  sync.WaitGroup
 }
 
 // NewStdioTransport starts an MCP server process and returns a transport over its stdio.
@@ -45,19 +111,93 @@ func NewStdioTransport(ctx context.Context, command string, args ...string) (*St
 		stdin.Close()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		stdin.Close()
+		stdout.Close()
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		stdin.Close()
 		stdout.Close()
+		stderr.Close()
 		return nil, fmt.Errorf("start %s: %w", command, err)
 	}
-	return &StdioTransport{cmd: cmd, stdin: stdin, stdout: stdout}, nil
+	t := &StdioTransport{
+		cmd: cmd, stdin: stdin, stdout: stdout,
+		stderrBuf: newBoundedBuffer(MaxStderrBytes),
+	}
+	// Drain stderr in a goroutine so the kernel pipe buffer never
+	// fills (a full pipe would block the subprocess's next write,
+	// freezing the whole server). The bounded writer silently
+	// drops bytes past the cap.
+	t.stderrWG.Add(1)
+	go func() {
+		defer t.stderrWG.Done()
+		_, _ = io.Copy(t.stderrBuf, stderr)
+	}()
+	return t, nil
 }
 
 func (t *StdioTransport) Close() error {
 	t.stdin.Close()
 	t.stdout.Close()
 	t.cmd.Wait()
+	t.stderrWG.Wait()
 	return nil
+}
+
+// Stderr returns the captured (truncated) stderr output. Callers use
+// this to attach real diagnostic context to handshake / RPC errors —
+// a failed `npx some-mcp` is much easier to debug when "command not
+// found: some-mcp" surfaces alongside the EOF error than when it
+// disappeared into a black hole.
+func (t *StdioTransport) Stderr() string {
+	if t.stderrBuf == nil {
+		return ""
+	}
+	return t.stderrBuf.String()
+}
+
+// boundedBuffer is a ring-style cap on accumulated bytes. Writes past
+// `cap` are dropped silently and `truncated` records how many bytes
+// were lost so the rendered output can show a "…(N bytes elided)"
+// suffix.
+type boundedBuffer struct {
+	mu        sync.Mutex
+	buf       []byte
+	cap       int
+	truncated int
+}
+
+func newBoundedBuffer(cap int) *boundedBuffer {
+	return &boundedBuffer{cap: cap}
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	room := b.cap - len(b.buf)
+	if room <= 0 {
+		b.truncated += len(p)
+		return len(p), nil // pretend success so io.Copy keeps draining
+	}
+	if len(p) > room {
+		b.buf = append(b.buf, p[:room]...)
+		b.truncated += len(p) - room
+		return len(p), nil
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.truncated == 0 {
+		return string(b.buf)
+	}
+	return fmt.Sprintf("%s\n…(%d bytes elided after stderr cap)\n", string(b.buf), b.truncated)
 }
 
 // JSONRPCRequest is a JSON-RPC 2.0 request.
@@ -129,6 +269,12 @@ func NewClient(ctx context.Context, transport Transport) *Client {
 }
 
 // NewStdioClient starts an MCP server subprocess and connects to it.
+//
+// Handshake (the initial tools/list) gets ConnectTimeout regardless of
+// the caller's ctx deadline — this is a tighter budget than the post-
+// connect RequestTimeout. Without an explicit short clock here, a
+// hanging server keeps `/mcp start` blocked the full RequestTimeout
+// or longer (cmd_cu's caller-set 30 s used to be the only stop-gap).
 func NewStdioClient(ctx context.Context, command string, args ...string) (*Client, error) {
 	transport, err := NewStdioTransport(ctx, command, args...)
 	if err != nil {
@@ -136,9 +282,16 @@ func NewStdioClient(ctx context.Context, command string, args ...string) (*Clien
 	}
 	c := NewClient(ctx, transport)
 	go c.readLoop()
-	_, err = c.ListTools(ctx)
-	if err != nil {
+	handshakeCtx, cancel := context.WithTimeout(ctx, ConnectTimeout())
+	defer cancel()
+	if _, err := c.ListTools(handshakeCtx); err != nil {
 		c.Close()
+		// Surface stderr from the subprocess so the user sees the
+		// real reason (not just "EOF" / "timeout"). Bounded by
+		// MaxStderrBytes — see boundedBuffer in NewStdioTransport.
+		if stderr := transport.Stderr(); stderr != "" {
+			return nil, fmt.Errorf("MCP handshake: %w\nserver stderr:\n%s", err, stderr)
+		}
 		return nil, fmt.Errorf("MCP handshake: %w", err)
 	}
 	return c, nil
@@ -167,7 +320,9 @@ func NewHTTPClient(ctx context.Context, endpoint string, optHeaders ...map[strin
 	}
 	c := NewClient(ctx, transport)
 	go c.httpNotificationLoop()
-	if _, err := c.ListTools(ctx); err != nil {
+	handshakeCtx, cancel := context.WithTimeout(ctx, ConnectTimeout())
+	defer cancel()
+	if _, err := c.ListTools(handshakeCtx); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("MCP HTTP handshake: %w", err)
 	}
@@ -324,7 +479,15 @@ func (c *Client) readLoop() {
 }
 
 // ListTools returns all tools available on the MCP server.
+//
+// As with CallTool, a deadline-less ctx gets RequestTimeout() applied
+// so a wedged server doesn't hang `/mcp start` indefinitely.
 func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, RequestTimeout())
+		defer cancel()
+	}
 	resp, err := c.send(ctx, "tools/list", nil)
 	if err != nil {
 		return nil, err
@@ -340,7 +503,17 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 }
 
 // CallTool invokes an MCP tool with the given arguments.
+//
+// If the caller's ctx has no deadline set, ToolTimeout() is applied so
+// a misbehaving tool can't hang the agent loop forever. A caller that
+// wants the long path explicitly (interactive flows, debug sessions)
+// should set its own deadline before calling.
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]interface{}) (json.RawMessage, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, ToolTimeout())
+		defer cancel()
+	}
 	params := map[string]interface{}{
 		"name":      name,
 		"arguments": args,

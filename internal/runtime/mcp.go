@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strings"
 
@@ -55,6 +56,21 @@ type MCPServerEntry struct {
 	URL      string            `toml:"url,omitempty"`     // HTTP endpoint
 	Headers  map[string]string `toml:"headers,omitempty"` // optional HTTP auth
 	Disabled bool              `toml:"disabled"`
+	// EnabledTools and DisabledTools filter the tool list a server
+	// exposes after handshake. Modeled on Codex's mcp_servers.<id>
+	// fields with the same names; the motivation is the same — many
+	// MCP servers (notably metis-cu's 24-tool set) flood prompts with
+	// tools the user never wants in their flow, and disabling individual
+	// tools without a config entry meant editing the server's source.
+	//
+	// Semantics: if EnabledTools is non-empty, ONLY tools whose unqualified
+	// name appears in the list survive. Then DisabledTools is applied as
+	// a deny pass. Names are matched against the server-reported `name`
+	// (e.g. "screenshot"), NOT the qualified `mcp__computer-use__screenshot`
+	// — users shouldn't have to repeat the namespace they already typed
+	// as the entry's `name = ...`.
+	EnabledTools  []string `toml:"enabled_tools,omitempty"`
+	DisabledTools []string `toml:"disabled_tools,omitempty"`
 }
 
 // MCPPath returns the canonical path of mcp.toml under the metis home.
@@ -113,6 +129,15 @@ func SaveMCP(reg *MCPRegistry) error {
 		_ = tmp.Close()
 		return fmt.Errorf("write tempfile: %w", err)
 	}
+	// fsync the data before rename. Without this, a power loss between
+	// rename and the kernel's eventual writeback leaves a zero-length
+	// mcp.toml — every registered MCP server vanishes from the user's
+	// next session. Claude Code's writeMcpjsonFile (config.ts:88-131)
+	// does the same datasync()-then-rename dance for the same reason.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("fsync tempfile: %w", err)
+	}
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("chmod tempfile: %w", err)
@@ -126,8 +151,38 @@ func SaveMCP(reg *MCPRegistry) error {
 	return nil
 }
 
+// ReservedComputerUseName is the MCP server name that mirrors Anthropic's
+// `mcp__computer-use__*` tool namespace. It is treated as a metis built-in
+// — registration of arbitrary commands under this name is REFUSED, matching
+// Claude Code's `isComputerUseMCPServer(name)` reservation in addMcpConfig
+// (config.ts:642-648).
+//
+// The user-facing way to enable the built-in is `/cu enable`, which goes
+// through SetReservedComputerUseServer below — never through AddMCPServer.
+// That asymmetry is deliberate:
+//
+//   - `/mcp add` is the user-typed surface; pretending the slot is free
+//     lets a user accidentally point it at a malicious / unrelated binary,
+//     and the next `/cu enable` would silently replace their config.
+//   - `/cu enable` is metis's own management of the reserved slot, the
+//     same way Claude Code's built-in `mcp__computer-use__*` server is
+//     in-process and not user-replaceable.
+//
+// Codex doesn't reserve any names because it has no built-in computer-use
+// server to protect. metis follows CC because metis-cu *is* metis's
+// built-in (even though it currently lives as an external binary — that's
+// an in-process optimization for later).
+const (
+	ReservedComputerUseName   = "computer-use"
+	ReservedComputerUseBinary = "metis-cu"
+)
+
 // AddMCPServer inserts (or replaces) a server entry. Empty name / command
 // errors so accidental `/mcp add` typos can't write garbage entries.
+//
+// Refuses ReservedComputerUseName outright — the slot is owned by metis's
+// built-in computer-use server (see /cu enable). Same behavior as
+// Claude Code's `addMcpConfig` for `computer-use` and `claude-in-chrome`.
 func AddMCPServer(reg *MCPRegistry, name, command string, args []string) error {
 	if name == "" {
 		return errors.New("mcp: name required")
@@ -137,6 +192,11 @@ func AddMCPServer(reg *MCPRegistry, name, command string, args []string) error {
 	}
 	if reg == nil {
 		return errors.New("mcp: nil registry")
+	}
+	if name == ReservedComputerUseName {
+		return fmt.Errorf("mcp: name %q is reserved for the metis built-in — "+
+			"use `/cu enable` to enable computer-use, or pick a different name",
+			ReservedComputerUseName)
 	}
 	for i, s := range reg.Servers {
 		if s.Name == name {
@@ -150,6 +210,35 @@ func AddMCPServer(reg *MCPRegistry, name, command string, args []string) error {
 		Name: name, Command: command, Args: append([]string(nil), args...),
 	})
 	return nil
+}
+
+// SetReservedComputerUseServer is the internal-only path for /cu enable
+// to write the reserved `computer-use` entry. AddMCPServer refuses this
+// name, so /cu uses this dedicated API. Behaviorally identical to
+// AddMCPServer except (a) skips the reserved-name check, (b) hardcodes
+// the command to ReservedComputerUseBinary so callers can't override —
+// it's "enable the built-in", not "add an arbitrary entry".
+//
+// Returns true if a prior entry was replaced (re-enable case) so the
+// REPL can word the success message accordingly.
+func SetReservedComputerUseServer(reg *MCPRegistry) (replaced bool) {
+	if reg == nil {
+		return false
+	}
+	for i, s := range reg.Servers {
+		if s.Name == ReservedComputerUseName {
+			reg.Servers[i] = MCPServerEntry{
+				Name:    ReservedComputerUseName,
+				Command: ReservedComputerUseBinary,
+			}
+			return true
+		}
+	}
+	reg.Servers = append(reg.Servers, MCPServerEntry{
+		Name:    ReservedComputerUseName,
+		Command: ReservedComputerUseBinary,
+	})
+	return false
 }
 
 // RemoveMCPServer drops a server by name. Returns true if removed, false if
@@ -188,6 +277,14 @@ func FindMCPServer(reg *MCPRegistry, name string) *MCPServerEntry {
 // Returns an error if the entry is missing, disabled, or the subprocess
 // can't be launched. Tool registration is non-fatal per tool — partial
 // success leaves whichever tools loaded.
+//
+// Environment variable expansion: ${VAR} and ${VAR:-default} in command,
+// args, url, and headers are resolved against os.Environ() AT LAUNCH
+// TIME — same as Claude Code's expandEnvVars(). Missing-without-default
+// variables fail the launch with a clear error so a misspelled
+// $GITHUB_TOKEN doesn't silently land an empty string into the
+// Authorization header (which the server then rejects with an opaque
+// 401, hiding the actual root cause).
 func LaunchMCPServer(ctx context.Context, reg *MCPRegistry, name string, registry *tools.Registry) (*mcptools.Server, error) {
 	entry := FindMCPServer(reg, name)
 	if entry == nil {
@@ -196,23 +293,53 @@ func LaunchMCPServer(ctx context.Context, reg *MCPRegistry, name string, registr
 	if entry.Disabled {
 		return nil, fmt.Errorf("mcp: server %q is disabled", name)
 	}
+	expanded, missing := expandEnvVarsInEntry(*entry)
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("mcp: server %q references unset env vars: %s "+
+			"(use ${VAR:-default} for an inline fallback)",
+			name, strings.Join(missing, ", "))
+	}
+	// Windows-on-npx footgun: spawning `npx some-mcp` directly fails
+	// on Windows with "exec: \"npx\": file does not exist" because npx
+	// is a .cmd batch wrapper, not an executable. Surfacing this here
+	// gives a far more useful error than the cryptic ENOENT the OS
+	// would otherwise report. Mirrors Claude Code's parseMcpConfig
+	// warning at config.ts:1351-1369.
+	if goruntime.GOOS == "windows" && expanded.Command != "" {
+		base := expanded.Command
+		// Compare basename so absolute paths like C:\node\npx are caught.
+		if i := strings.LastIndexAny(base, `\/`); i >= 0 {
+			base = base[i+1:]
+		}
+		base = strings.TrimSuffix(strings.ToLower(base), ".exe")
+		if base == "npx" {
+			return nil, fmt.Errorf("mcp: server %q uses `npx` directly on Windows; "+
+				"npx is a .cmd batch wrapper that exec.Command can't launch. "+
+				"Set command = \"cmd\" with args = [\"/c\", \"npx\", ...]",
+				name)
+		}
+	}
 	// Pick transport from whichever field the entry populated. URL
 	// wins when both are set so a user converting an entry from stdio
 	// to HTTP doesn't have to clear Command first.
 	var srv *mcptools.Server
 	var err error
 	switch {
-	case entry.URL != "":
-		srv, err = mcptools.NewHTTPServer(ctx, entry.Name, entry.URL, entry.Headers)
-	case entry.Command != "":
-		srv, err = mcptools.NewServer(ctx, entry.Name, entry.Command, entry.Args...)
+	case expanded.URL != "":
+		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, expanded.Headers)
+	case expanded.Command != "":
+		srv, err = mcptools.NewServer(ctx, expanded.Name, expanded.Command, expanded.Args...)
 	default:
 		return nil, fmt.Errorf("mcp: server %q has neither command nor url", name)
 	}
 	if err != nil {
 		return nil, err
 	}
-	for _, t := range srv.Tools() {
+	// Per-server tool allow/deny lists (Codex parity). Without this,
+	// metis-cu's 24-tool surface lands in EVERY prompt even when the
+	// user only wanted screenshot+click — wasting ~3 KB of tokens
+	// turn after turn.
+	for _, t := range srv.FilteredTools(entry.EnabledTools, entry.DisabledTools) {
 		registry.Register(t)
 	}
 	return srv, nil
