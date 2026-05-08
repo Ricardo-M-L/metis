@@ -213,8 +213,17 @@ func summarizeToolResult(te ToolEvent) string {
 const maxDiffLines = 20
 
 func renderEditDiff(input map[string]any, expanded bool) string {
-	oldS, _ := input["old_string"].(string)
-	newS, _ := input["new_string"].(string)
+	// metis's Edit tool uses `old` / `new` (see internal/tools/builtin/
+	// edit.go's InputSchema). claude-code-style external tools may pass
+	// `old_string` / `new_string`. Read both — the actual Edit-tool
+	// field name takes priority since that's what fires in 99% of
+	// turns; the longer names cover any externally-defined tool.
+	oldS, _ := input["old"].(string)
+	newS, _ := input["new"].(string)
+	if oldS == "" && newS == "" {
+		oldS, _ = input["old_string"].(string)
+		newS, _ = input["new_string"].(string)
+	}
 	if oldS == "" && newS == "" {
 		return ""
 	}
@@ -458,8 +467,13 @@ var tasksCurrentSessionIDFn = func() string {
 }
 
 func countEditDiff(input map[string]any) (added, removed int) {
-	oldS, _ := input["old_string"].(string)
-	newS, _ := input["new_string"].(string)
+	// Same dual-field-name read as renderEditDiff above.
+	oldS, _ := input["old"].(string)
+	newS, _ := input["new"].(string)
+	if oldS == "" && newS == "" {
+		oldS, _ = input["old_string"].(string)
+		newS, _ = input["new_string"].(string)
+	}
 	edits := udiff.Strings(oldS, newS)
 	uout, err := udiff.ToUnifiedDiff("", "", oldS, edits, 0)
 	if err != nil {

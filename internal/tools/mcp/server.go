@@ -180,3 +180,21 @@ func (s *Server) FilteredTools(enabled, disabled []string) []tools.Tool {
 func (s *Server) Close() error {
 	return s.client.Close()
 }
+
+// Name returns the server's logical name (the `mcp__<name>__*` prefix).
+// Used by the prompts auto-registrar to compose slash command names.
+func (s *Server) Name() string { return s.name }
+
+// ListPrompts surfaces the underlying client's prompts/list. Servers
+// without the capability return (nil, nil) so the registrar can treat
+// "no prompts" the same as "this server doesn't speak prompts".
+func (s *Server) ListPrompts(ctx context.Context) ([]mcp.Prompt, error) {
+	return s.client.ListPrompts(ctx)
+}
+
+// GetPrompt resolves a prompt template against `args`. Pass-through to
+// the underlying client; here so /mcp__<server>__<prompt> can render
+// without callers having to reach into the unexported client field.
+func (s *Server) GetPrompt(ctx context.Context, name string, args map[string]string) (*mcp.GetPromptResult, error) {
+	return s.client.GetPrompt(ctx, name, args)
+}

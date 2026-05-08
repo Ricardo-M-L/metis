@@ -119,6 +119,10 @@ func (m *Model) helpCustomCommandsRows() []screen.HelpRow {
 }
 
 // versionLabel returns the version string used in the help screen header.
+// Uses version.Short() so the help-tab title matches the bottom status
+// bar (`current: v0.1.3`). Without this, the linker-supplied tag form
+// `v0.1.3-21-gab7a825-dirty` flowed through with a hand-prepended `v`,
+// rendering as `vv0.1.3-…` (caught by cmp_drive.sh's slash__help).
 func versionLabel() string {
-	return "v" + version.Version
+	return "v" + version.Short()
 }

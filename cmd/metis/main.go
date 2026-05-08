@@ -76,6 +76,14 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdACP(ctx, args[1:])
 	case "daemon":
 		return cmdDaemon(ctx, args[1:])
+	case "ps":
+		return cmdPs(ctx, args[1:])
+	case "logs":
+		return cmdLogs(ctx, args[1:])
+	case "kill":
+		return cmdKill(ctx, args[1:])
+	case "attach":
+		return cmdAttach(ctx, args[1:])
 	case "coordinator":
 		return cmdCoordinator(ctx, args[1:])
 	case "cron":
@@ -191,6 +199,7 @@ type cliFlags struct {
 	maxIter      int
 	system       string
 	resumeID     string
+	cont         bool // -c / --continue: pick up the most recently modified session
 	useTUI       bool
 	noAuthWizard bool   // skip the first-run wizard (CI / scripted use)
 	effort       string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
@@ -199,6 +208,55 @@ type cliFlags struct {
 	agentProfile string // --agent=NAME — load .metis/agents/<name>.md
 	worktree     string // --worktree=slug — spin up git worktree with explicit slug
 	worktreeOn   bool   // -W — spin up worktree with auto slug
+
+	// --debug / -d: write a verbose trace to ~/.metis/debug.log alongside
+	// METIS_DEBUG=1's stderr output. Doesn't change visible behavior; just
+	// captures more for post-mortem.
+	debug bool
+
+	// --bare: skip side-effectful loaders (MCP / plugins / skills / hook
+	// subprocesses). Designed for fastest cold start when the user wants
+	// the chat surface but knows they don't need any of those today —
+	// dropping them shaves ~600ms off boot on a populated config.
+	bare bool
+
+	// --dangerously-skip-permissions: alias of `--mode bypass`. Named to
+	// match Claude Code so an existing user's muscle memory works. Wins
+	// over --mode if both are set (the explicit --mode loses to the
+	// "yes I really mean it" wrapper).
+	dangerouslySkipPerms bool
+
+	// --scope / -s: where mcp / skill / auth subcommands write. Three
+	// values (parity with Claude Code: local | user | project). Today
+	// metis only has one scope (`user` == ~/.metis/), so the flag is
+	// parsed for forward-compat but only `user` is honored — anything
+	// else logs a warning and falls back to user. Will become real in
+	// the Phase E daemon work where per-scope mcp.toml lookup matters.
+	scope string
+
+	// --input-format / --output-format: I/O modes for `metis run`.
+	//   * input-format=json: read JSONL from stdin, one prompt per line
+	//   * output-format=json | stream-json: emit structured events instead
+	//     of the human-readable transcript (json = single object at end;
+	//     stream-json = NDJSON during the turn)
+	// Mirrors Claude Code's `--output-format json|stream-json`.
+	inputFormat  string
+	outputFormat string
+
+	// Phase E #46-#48 — small ergonomic flags. None of these change
+	// runtime behaviour drastically; they're either UI hints (a session
+	// name shown in /sessions) or sugar over existing surfaces (a /batch
+	// shortcut, a tmux launcher).
+	sessionName string // --name <text>: human-friendly session label
+	agentTeams  bool   // --agent-teams: alias for /batch entry path
+	tmuxOn      bool   // --tmux: when starting a worktree, wrap the session in tmux
+
+	// pickResume is set when the user typed bare `-r` / `--resume` with
+	// no UUID argument — claude-code parity: that gesture means "show
+	// me the recent sessions and let me pick one". setupRuntime opens
+	// the picker before chat starts and writes the chosen id back into
+	// resumeID. Mutually exclusive with explicit `--resume <id>`.
+	pickResume bool
 }
 
 // stringList accumulates repeated flag values: --add-dir A --add-dir B → [A,B].
@@ -217,6 +275,12 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f := flag.NewFlagSet("metis", flag.ContinueOnError)
 	f.SetOutput(os.Stderr)
 	out := &cliFlags{}
+	// Pre-scan: bare `-r` / `--resume` (no UUID) is claude-code's
+	// "show the picker" gesture. Detect it BEFORE Go's flag parser
+	// runs — otherwise StringVar treats the next token (a flag like
+	// `-c` or end-of-args) as the value and we get a confusing
+	// "missing value" error or the wrong id captured.
+	args = liftBareResume(args, &out.pickResume)
 	f.StringVar(&out.model, "model", "", "model id")
 	f.StringVar(&out.model, "m", "", "model id (shorthand)")
 	f.StringVar(&out.provider, "provider", "", "provider id")
@@ -228,6 +292,16 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.IntVar(&out.maxIter, "max-iter", 0, "max tool iterations per turn")
 	f.StringVar(&out.system, "system", "", "override system prompt")
 	f.StringVar(&out.resumeID, "resume", "", "resume session id")
+	// `-r` short alias for --resume. Claude Code accepts both; metis used
+	// to error with `flag provided but not defined: -r` (user video bug
+	// 2026-05-07 21:14). Mapping the short flag onto the same var means a
+	// stale alias doesn't drift away from the long form.
+	f.StringVar(&out.resumeID, "r", "", "resume session id (short for --resume)")
+	// `-c` / --continue: pick the most recently modified session in the
+	// store. Resolution happens in setupRuntime once we have a Store
+	// handle; the flag here just records intent.
+	f.BoolVar(&out.cont, "continue", false, "resume the most recently modified session")
+	f.BoolVar(&out.cont, "c", false, "resume the most recently modified session (short for --continue)")
 	f.BoolVar(&out.useTUI, "tui", false, "use the TUI (default when stdout is a TTY)")
 	f.BoolVar(&out.noAuthWizard, "no-auth-wizard", false, "skip the first-run auth wizard if no API key is found")
 	f.StringVar(&out.effort, "effort", "", "reasoning intensity: low | medium | high")
@@ -236,6 +310,38 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.StringVar(&out.agentProfile, "agent", "", "load agent profile from ~/.metis/agents/<name>.md")
 	f.StringVar(&out.worktree, "worktree", "", "spawn a git worktree for this session (slug)")
 	f.BoolVar(&out.worktreeOn, "W", false, "spawn a git worktree with an auto-generated slug")
+	// Phase B parity flags. `--debug`/`-d` writes a verbose trace to
+	// ~/.metis/debug.log on top of the existing METIS_DEBUG=1 stderr
+	// path, so leaving the flag on doesn't pollute interactive output.
+	f.BoolVar(&out.debug, "debug", false, "write verbose trace to ~/.metis/debug.log")
+	f.BoolVar(&out.debug, "d", false, "write verbose trace to ~/.metis/debug.log (short for --debug)")
+	// --bare: skip MCP / plugins / hooks / skills loading. Sometimes the
+	// fastest cold start is the right answer (CI, throwaway smoke).
+	f.BoolVar(&out.bare, "bare", false, "skip MCP and plugin loaders (fastest cold start)")
+	// --dangerously-skip-permissions: friendly alias of `--mode bypass`.
+	// Named to match Claude Code so muscle memory works.
+	f.BoolVar(&out.dangerouslySkipPerms, "dangerously-skip-permissions", false,
+		"equivalent to --mode bypass (no permission prompts; use with care)")
+	// --scope / -s: forward-compat for the per-scope mcp.toml / skills/
+	// layout that lands with the daemon work. Today only `user` is
+	// honored; anything else logs a warning at startup. Plumbed here
+	// (rather than scattered across mcp/skills/auth subcommands) so all
+	// future scope-aware code reads from one cliFlags field.
+	f.StringVar(&out.scope, "scope", "", "config scope: local | user | project (default user)")
+	f.StringVar(&out.scope, "s", "", "config scope: local | user | project (short for --scope)")
+	// --input-format / --output-format: machine-readable I/O for `metis
+	// run`. Defaults stay human-readable for interactive runs.
+	f.StringVar(&out.inputFormat, "input-format", "",
+		"`metis run` input mode: json (NDJSON prompts on stdin)")
+	f.StringVar(&out.outputFormat, "output-format", "",
+		"`metis run` output mode: json | stream-json")
+	// Phase E #46-#48
+	f.StringVar(&out.sessionName, "name", "",
+		"human-friendly session label (shows in /sessions; persisted via SetTitle)")
+	f.BoolVar(&out.agentTeams, "agent-teams", false,
+		"start in agent-teams mode (a /batch shortcut surface)")
+	f.BoolVar(&out.tmuxOn, "tmux", false,
+		"when starting in a worktree, also wrap the session in a tmux pane")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -259,6 +365,25 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		return nil, err
 	}
 
+	// Phase B: --debug opens a long-lived debug log. Done early so
+	// every later step's stderr complaint is also captured. The log
+	// duplicates METIS_DEBUG=1 stderr — we don't redirect, just tee.
+	// Caller's responsibility to call Close() through rt.Cleanup.
+	if flags.debug {
+		if err := openDebugLog(); err != nil {
+			fmt.Fprintf(os.Stderr, "metis: --debug: %v\n", err)
+		}
+	}
+
+	// Phase B: --scope advisory. Today only `user` is real — warn the
+	// user when they pass anything else so they know it didn't take.
+	if flags.scope != "" && flags.scope != "user" {
+		fmt.Fprintf(os.Stderr,
+			"metis: --scope=%q ignored (only 'user' is implemented today; "+
+				"per-scope mcp.toml + skills/ lands with the daemon work)\n",
+			flags.scope)
+	}
+
 	// Apply flag overrides
 	provName := cfg.Provider.Default
 	if flags.provider != "" {
@@ -268,6 +393,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	mode := cfg.Permission.Mode
 	if flags.mode != "" {
 		mode = flags.mode
+	}
+	// --dangerously-skip-permissions overrides any other mode. Named to
+	// match Claude Code; a deliberate "I really mean it" wrapper around
+	// `--mode bypass`.
+	if flags.dangerouslySkipPerms {
+		mode = "bypass"
 	}
 	// Profile-on-CLI merge.
 	mergedModel, mergedMode, mergedEffort, mergedMaxIter :=
@@ -382,15 +513,27 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// (mutated by /mcp add) win over [[mcp.servers]] declared in
 	// config.toml. The merge happens via runtime.MergeWithConfig so legacy
 	// config-only setups still work without any user action.
-	mcpReg, mcpLoadErr := rtpkg.LoadMCP()
-	if mcpLoadErr != nil {
-		fmt.Fprintf(os.Stderr, "metis: mcp.toml: %v\n", mcpLoadErr)
+	var mcpReg *rtpkg.MCPRegistry
+	var mcpServers []*mcptools.Server
+	if flags.bare {
+		// --bare skips the MCP launch dance entirely. The user gets
+		// builtins-only — no `mcp__*` tools, no spawned subprocesses,
+		// no per-server merge cost. Still safe to /mcp list / add later;
+		// nothing in this path mutates mcp.toml.
 		mcpReg = &rtpkg.MCPRegistry{}
-	}
-	mcpReg.MergeWithConfig(cfg.MCP.Servers)
-	mcpServers, mcpErrs := rtpkg.LaunchAllMCP(ctx, mcpReg, reg)
-	for _, e := range mcpErrs {
-		fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
+	} else {
+		var mcpLoadErr error
+		mcpReg, mcpLoadErr = rtpkg.LoadMCP()
+		if mcpLoadErr != nil {
+			fmt.Fprintf(os.Stderr, "metis: mcp.toml: %v\n", mcpLoadErr)
+			mcpReg = &rtpkg.MCPRegistry{}
+		}
+		mcpReg.MergeWithConfig(cfg.MCP.Servers)
+		var mcpErrs []error
+		mcpServers, mcpErrs = rtpkg.LaunchAllMCP(ctx, mcpReg, reg)
+		for _, e := range mcpErrs {
+			fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
+		}
 	}
 
 	// Agent profile tool filter — applied after MCP tools register so the
@@ -407,9 +550,13 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Plugins (MCP-bundle style): each ~/.metis/plugins/<name>/plugin.toml
 	// can declare an MCP server + skill files + (advanced) hook subprocesses.
 	// Load failures are surfaced on stderr but don't block startup.
-	pluginReg, pluginErrs := rtpkg.LoadPlugins(ctx, reg)
-	for _, e := range pluginErrs {
-		fmt.Fprintf(os.Stderr, "metis: plugin load: %v\n", e)
+	var pluginReg *rtpkg.PluginRegistry
+	if !flags.bare {
+		var pluginErrs []error
+		pluginReg, pluginErrs = rtpkg.LoadPlugins(ctx, reg)
+		for _, e := range pluginErrs {
+			fmt.Fprintf(os.Stderr, "metis: plugin load: %v\n", e)
+		}
 	}
 	// Re-register the Skill tool now that we know the plugin sources.
 	// First phase happened inside BuildToolRegistry with PluginSources=nil
@@ -466,8 +613,30 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		allowedDirs: allowedDirs,
 	}
 
-	if flags.resumeID != "" {
-		res, err := rtpkg.ApplyResume(store, flags.resumeID, loop, gate, os.Stderr)
+	// Resolve resume target. Order: explicit --resume <id> wins; then
+	// bare `-r` / `--resume` opens an interactive picker over recent
+	// sessions; then --continue picks the most-recent session by
+	// mtime. Empty across all three lands the user on a fresh session.
+	resumeTarget := flags.resumeID
+	if resumeTarget == "" && flags.pickResume {
+		picked, err := runResumePicker(store)
+		if err != nil {
+			return nil, err
+		}
+		resumeTarget = picked
+	}
+	if resumeTarget == "" && flags.cont {
+		entries, listErr := store.List(1)
+		if listErr != nil {
+			fmt.Fprintf(os.Stderr, "metis: --continue: %v (starting fresh)\n", listErr)
+		} else if len(entries) == 0 {
+			fmt.Fprintln(os.Stderr, "metis: --continue: no prior sessions found (starting fresh)")
+		} else {
+			resumeTarget = entries[0].ID
+		}
+	}
+	if resumeTarget != "" {
+		res, err := rtpkg.ApplyResume(store, resumeTarget, loop, gate, os.Stderr)
 		if err != nil {
 			return nil, err
 		}
@@ -475,6 +644,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	} else {
 		rt.sessionID = store.NewSessionID()
 		_ = rtpkg.WriteFreshHeader(store, rt.sessionID, model, system, cfg.Permission.Mode)
+	}
+	// --name <text> persists as the session title. Done after the
+	// fresh-header write so resume → already-existing sessions also
+	// get re-titled via the same path.
+	if flags.sessionName != "" {
+		_ = store.SetTitle(rt.sessionID, flags.sessionName)
 	}
 	// Tell the tasks pkg what session id is current so TodoWrite /
 	// TodoRead persist into the right per-session file. Done last so a
@@ -771,10 +946,16 @@ func cmdVersion(args []string) error {
 
 	hasCommit := version.Commit != "" && version.Commit != "unknown"
 	if !verbose {
+		// Default form mirrors `claude --version` — short semver only.
+		// Full git-describe fingerprint stays available via `-V`. Without
+		// this, `metis version` printed `v0.1.3-21-gab7a825-dirty` while
+		// the bottom status bar correctly showed `current: v0.1.3` —
+		// inconsistency caught by cmp_drive.sh's ui__version_string.
+		short := "v" + version.Short()
 		if hasCommit {
-			fmt.Printf("%s (Metis · %s)\n", version.Version, version.Commit)
+			fmt.Printf("%s (Metis · %s)\n", short, version.Commit)
 		} else {
-			fmt.Printf("%s (Metis)\n", version.Version)
+			fmt.Printf("%s (Metis)\n", short)
 		}
 		return nil
 	}
@@ -1448,6 +1629,18 @@ func buildSlash(rt *runtime) *slash.Registry {
 	// common case. The returned name list is logged for
 	// observability (`metis doctor` surfaces it).
 	_ = slash.LoadCustomCommands(r, config.Home())
+
+	// MCP prompts (Phase D #40). Each launched server is asked for its
+	// prompts/list; capable servers contribute `mcp__<server>__<prompt>`
+	// slash commands here. Done after LoadCustomCommands so a user
+	// .md command sharing the same name still wins (Registry.Register
+	// updates index map, last-write-wins). Probe failures are silent.
+	if rt != nil && len(rt.mcpServers) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		handles := rtpkg.CollectMCPPrompts(ctx, rt.mcpServers)
+		cancel()
+		_ = registerMCPPromptsAsSlash(r, handles)
+	}
 	return r
 }
 

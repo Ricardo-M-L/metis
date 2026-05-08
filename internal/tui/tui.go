@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -252,6 +253,29 @@ type Model struct {
 	// showTaskPanel toggles a Ctrl+T overlay listing the session's
 	// todos with status glyphs.
 	showTaskPanel bool
+	// shellMode flips the next input from "agent prompt" to "literal
+	// bash command". Toggled by Ctrl+X (Phase F #62). The submit
+	// handler reads this flag to decide which pipeline to send to.
+	// Until the submit-side dispatch lands, /shell shows a hint row
+	// so the user can opt in via slash if the keybind isn't bound in
+	// their setup.
+	shellMode bool
+	// queuedPrompts holds plain-text prompts the user typed while a
+	// turn was already in flight. Claude-code's "queued messages"
+	// behavior: Enter on a non-empty input mid-turn pushes onto this
+	// FIFO instead of opening a steered injection. When the turn
+	// ends, finalizeTurn dequeues the head and submits it as the
+	// next user turn. Ctrl+C clears the queue (alongside the
+	// existing turn-cancel). Slash commands keep their existing
+	// mid-turn semantics — only plain text is queued.
+	queuedPrompts []string
+
+	// queuePending is set by finalizeTurn after it loaded a queued
+	// prompt into the input. The next spinner tick (or any Update
+	// pass) calls handleSubmit to actually fire the turn — splitting
+	// that across two updates avoids re-entrant runTurnAsync issues
+	// where finalizeTurn is mid-cleanup.
+	queuePending bool
 	// expandToolOutputs is the global "show full tool output" toggle
 	// (claude-code's ctrl+o). When false (default), Edit diffs cap at
 	// 20 lines, Bash output at 5 lines. When true the user gets the
@@ -572,7 +596,34 @@ func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *sessi
 
 	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
+	// Claude-code-style goodbye hint — print AFTER bubbletea releases
+	// alt-screen so it lands in the user's normal scrollback. Tells
+	// them how to come back to this exact session next time. Skipped
+	// on error (the error itself is the priority message) and when sid
+	// is empty (e.g. the user quit during the auth wizard before any
+	// session was created).
+	if err == nil && sid != "" {
+		printResumeHint(sid)
+	}
 	return err
+}
+
+// printResumeHint surfaces a dim "next time, run this" hint after a
+// clean chat exit. Format mirrors claude-code's quit affordance
+// exactly (user reference image 2026-05-08):
+//
+//	Resume this session with:
+//	metis --resume <full-uuid>
+//
+// Both lines in dim gray (ANSI 2;38;5;245). Full UUID — not the short
+// 12-char prefix — because the user typed it from the terminal and
+// expects to be able to copy-paste verbatim. stderr so piped stdout
+// consumers don't see the human chrome.
+func printResumeHint(sid string) {
+	dim := "\x1b[2;38;5;245m"
+	reset := "\x1b[0m"
+	fmt.Fprintf(os.Stderr, "\n%sResume this session with:%s\n", dim, reset)
+	fmt.Fprintf(os.Stderr, "%smetis --resume %s%s\n", dim, sid, reset)
 }
 
 // earlyInputReader is set by SetEarlyInputReader from main.go before

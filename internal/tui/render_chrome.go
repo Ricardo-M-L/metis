@@ -313,12 +313,15 @@ func renderStatusBar(m *Model) string {
 // background fetcher writes); when absent or equal to current we drop
 // it so we don't print noise like "current: 0.1.0 · latest: 0.1.0".
 func renderVersionLine() string {
-	cur := strings.TrimPrefix(version.Version, "v")
+	cur := version.Short()
 	if cur == "" || cur == "unknown" {
 		return ""
 	}
 	latest := readLatestVersion()
 	latest = strings.TrimPrefix(latest, "v")
+	if i := strings.Index(latest, "-"); i >= 0 {
+		latest = latest[:i]
+	}
 	if latest == "" || latest == cur {
 		return "current: v" + cur
 	}

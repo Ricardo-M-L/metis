@@ -502,6 +502,108 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 	return result.Tools, nil
 }
 
+// Prompt is an MCP-server-advertised prompt template the user can
+// invoke through the chat surface (`/mcp__<server>__<prompt>`).
+// Mirrors Anthropic's prompts/list response shape.
+type Prompt struct {
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	Arguments   []PromptArgument `json:"arguments,omitempty"`
+}
+
+// PromptArgument describes one templated input the server expects when
+// `prompts/get` is called for this prompt. Required arguments without
+// a value cause a slash command to refuse with a usage hint instead of
+// firing an empty server call.
+type PromptArgument struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+}
+
+// ListPromptsResult mirrors `prompts/list` JSON response.
+type ListPromptsResult struct {
+	Prompts []Prompt `json:"prompts"`
+}
+
+// PromptMessage is one element of a server-rendered prompt body.
+// `Role` is "user" or "assistant"; `Content` is a list of typed parts
+// (currently always {type:"text", text:"..."}). Mirrors MCP spec.
+type PromptMessage struct {
+	Role    string             `json:"role"`
+	Content []PromptContentRaw `json:"content"`
+}
+
+// PromptContentRaw stays raw so clients that only need the text body
+// don't pay JSON-decode cost on schema fields they ignore. Helpers
+// (PromptText) extract what we need.
+type PromptContentRaw struct {
+	Type string          `json:"type"`
+	Text string          `json:"text,omitempty"`
+	Data json.RawMessage `json:"-"`
+}
+
+// GetPromptResult is the `prompts/get` response — typically one user
+// message whose Content[0].Text is what the chat surface should send.
+type GetPromptResult struct {
+	Description string          `json:"description,omitempty"`
+	Messages    []PromptMessage `json:"messages"`
+}
+
+// ListPrompts returns the prompts a server advertises. Servers without
+// the prompts capability return method-not-found; we surface that as
+// (nil, nil) so callers (the runtime registrar at startup) can treat
+// "no prompts" identically to "this server doesn't support them".
+func (c *Client) ListPrompts(ctx context.Context) ([]Prompt, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, RequestTimeout())
+		defer cancel()
+	}
+	resp, err := c.send(ctx, "prompts/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		// -32601 == method not found. Normalize to "no prompts".
+		if resp.Error.Code == -32601 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
+	}
+	var result ListPromptsResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, err
+	}
+	return result.Prompts, nil
+}
+
+// GetPrompt resolves a prompt template against `args`. Returns the
+// server-rendered messages — caller picks the body to send.
+func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]string) (*GetPromptResult, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, RequestTimeout())
+		defer cancel()
+	}
+	params := map[string]any{"name": name}
+	if len(args) > 0 {
+		params["arguments"] = args
+	}
+	resp, err := c.send(ctx, "prompts/get", params)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
+	}
+	var result GetPromptResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // CallTool invokes an MCP tool with the given arguments.
 //
 // If the caller's ctx has no deadline set, ToolTimeout() is applied so

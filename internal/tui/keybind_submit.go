@@ -5,6 +5,7 @@ package tui
 // or the slash-signal table; plain user text starts a new turn.
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -137,16 +138,17 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 		}
 
-		m.loop.SteerInject(raw)
-		// Render mid-turn input as user-steer (visible) rather than
-		// muted info — feedback 2026-05-05: a steered query rendered
-		// with styleMuted blends into the surrounding turn output and
-		// the user "doesn't see their query was received". user-steer
-		// uses the regular user prompt colour with a steer arrow to
-		// stay distinct from a fresh-turn user prompt.
+		// Plain text mid-turn: claude-code's queued-messages behavior.
+		// Push to FIFO; finalizeTurn dequeues the head and submits it
+		// as the next user turn. Distinct from steering (mid-turn
+		// injection into the running turn) — that path is now
+		// reserved for slash commands above and the explicit /steer
+		// alias users can still call.
+		m.queuedPrompts = append(m.queuedPrompts, raw)
 		m.messages = append(m.messages, Message{
-			Role:      "user-steer",
-			Content:   raw,
+			Role: "info",
+			Content: fmt.Sprintf("(queued · will run after current turn · queue size %d · Ctrl+C to clear)",
+				len(m.queuedPrompts)),
 			Timestamp: time.Now(),
 		})
 		m.input.Reset()

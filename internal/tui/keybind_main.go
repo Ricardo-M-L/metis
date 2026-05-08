@@ -106,9 +106,20 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.turnCancel()
 			m.turnCancel = nil
 		}
+		// Drop any queued prompts when the user cancels — claude-code
+		// behavior. A user hitting Ctrl+C is saying "stop everything";
+		// silently letting the queue drain after the cancellation
+		// would be surprising. Visible message tells them what we did.
+		queueCleared := len(m.queuedPrompts)
+		m.queuedPrompts = nil
+		m.queuePending = false
+		msg2 := "interrupted · Ctrl-C again to exit"
+		if queueCleared > 0 {
+			msg2 = fmt.Sprintf("interrupted · queue cleared (%d dropped) · Ctrl-C again to exit", queueCleared)
+		}
 		m.messages = append(m.messages, Message{
 			Role:      "info",
-			Content:   "interrupted · Ctrl-C again to exit",
+			Content:   msg2,
 			Timestamp: time.Now(),
 		})
 		return m, nil
@@ -119,6 +130,31 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+l":
 		m.messages = append(m.messages, Message{Role: "info", Content: "models: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5 — use /model <name> to switch", Timestamp: time.Now()})
 		return m, nil
+
+	case "ctrl+x":
+		// Phase F #62 — shell-mode toggle. Flips `m.shellMode`; the
+		// submit handler (keybind_submit.go) checks the flag and, when
+		// on, dispatches the input to bash via the runGitCmd-shaped
+		// helper instead of the agent loop. Idempotent toggle: second
+		// Ctrl+X returns to agent mode.
+		m.shellMode = !m.shellMode
+		state := "off"
+		if m.shellMode {
+			state = "on — next input runs as `bash -c <input>`"
+		}
+		m.messages = append(m.messages, Message{
+			Role: "info", Content: "shell mode: " + state, Timestamp: time.Now(),
+		})
+		return m, nil
+
+	case "ctrl+g":
+		// External editor — Phase D #41. Drops the current input into
+		// a temp file, suspends bubbletea, spawns $EDITOR, then reads
+		// the file back into the textarea on exit. Ergonomics match
+		// Bash's `Ctrl+X Ctrl+E` (we use Ctrl+G because Ctrl+X is
+		// already a pending-action lead-in for vim/copy modes).
+		// $EDITOR resolution mirrors /mcp edit + /skills edit.
+		return m, m.openExternalEditor()
 
 	case "ctrl+p":
 		return m.handleSessionPick()

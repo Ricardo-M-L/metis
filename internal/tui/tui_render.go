@@ -174,19 +174,14 @@ func (m *Model) View() tea.View {
 	// (m *Model).ensureIDs in tui.go for the why.
 	m.ensureIDs()
 
-	// Brand watermark — every-frame model + mode reminder. The brand
-	// itself ("metis") gets the accent color so the eye lands on it
-	// the way claude-code's "✻ claude-code" sits at the top of every
-	// session; the model id and mode follow in dim so they don't
-	// compete with the transcript below.
-	s.WriteString(styleAccent.Render("  metis"))
-	s.WriteString(styleMuted.Render(" · "))
-	s.WriteString(styleDim.Render(m.model))
-	s.WriteString(styleMuted.Render(" · "))
-	s.WriteString(styleDim.Render(string(m.gate.Mode())))
-	s.WriteString("\n")
-	s.WriteString(styleMuted.Render("  ────────────────────────────────────────────"))
-	s.WriteString("\n")
+	// Sticky header banner — Phase-33 redesign (user feedback 2026-05-08).
+	// Same brand strip claude-code keeps pinned at the top of every
+	// session: ✻ metis · model · mode · cwd. Replaces the ad-hoc
+	// "metis · model · mode + ──── separator" so cwd stays visible
+	// during long agent runs (the previous strip dropped cwd as soon
+	// as the welcome banner scrolled off; users couldn't tell which
+	// directory the current turn was operating against).
+	s.WriteString(m.renderHeaderBanner())
 
 	// Build the chat surface via the virtualized list package. Items
 	// are constructed every frame from the chronological merge of
@@ -254,6 +249,13 @@ func (m *Model) View() tea.View {
 	// height understates input rows when the user is mid-typing a
 	// multi-line prompt.
 	var lower strings.Builder
+	// Queue indicator (task #37) — sits ABOVE the input box so the
+	// user sees what's pending before they type the next prompt.
+	// Suppressed when the queue is empty so single-turn flows stay
+	// chrome-free.
+	if pill := renderQueuePill(m); pill != "" {
+		lower.WriteString(pill)
+	}
 	lower.WriteString(renderInputLine(m))
 	lower.WriteString(renderHints(m))
 	if m.showPalette {

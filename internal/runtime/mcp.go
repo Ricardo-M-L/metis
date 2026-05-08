@@ -256,6 +256,26 @@ func RemoveMCPServer(reg *MCPRegistry, name string) bool {
 	return false
 }
 
+// SetMCPDisabled flips the Disabled flag for the named server. Returns
+// (true, prior) when the entry was found, (false, false) when no such
+// server exists. Caller is responsible for SaveMCP. Pulled out of the
+// /mcp enable/disable handlers so the slash code stays declarative —
+// runtime owns the actual mutation rule (idempotent, no-op when already
+// in the requested state).
+func SetMCPDisabled(reg *MCPRegistry, name string, disabled bool) (found bool, prior bool) {
+	if reg == nil {
+		return false, false
+	}
+	for i := range reg.Servers {
+		if reg.Servers[i].Name == name {
+			prior = reg.Servers[i].Disabled
+			reg.Servers[i].Disabled = disabled
+			return true, prior
+		}
+	}
+	return false, false
+}
+
 // FindMCPServer returns the entry by name (or nil if missing). Useful when a
 // caller only needs read access without iterating all entries.
 func FindMCPServer(reg *MCPRegistry, name string) *MCPServerEntry {

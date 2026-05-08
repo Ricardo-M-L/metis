@@ -167,6 +167,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateAtMention()
 		return m, nil
 
+	case externalEditorDoneMsg:
+		// Phase D #41 — Ctrl+G round-trip. Editor exited; merge the
+		// saved buffer back into the textarea (or surface the error).
+		m.applyExternalEditorResult(msg)
+		return m, nil
+
 	case tea.MouseClickMsg:
 		// Mouse-down event (despite the name "Click", in bubbletea v2
 		// MouseClickMsg fires on button press, not full press+release).
@@ -381,6 +387,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.turnActive || m.spinnerActive {
 			return m, tickCmd
 		}
+		// Queue drain — finalizeTurn loaded the next prompt into
+		// m.input and flagged queuePending. We're in a fresh tick now
+		// (turnActive cleared), so it's safe to fire handleSubmit
+		// without re-entering the just-finalized turn.
+		if m.queuePending {
+			m.queuePending = false
+			return m.handleSubmit()
+		}
 		return m, nil
 
 	case tick:
@@ -529,6 +543,24 @@ func (m *Model) finalizeTurn(err error) {
 		if !alreadyShown {
 			m.messages = append(m.messages, Message{Role: "error", Content: formatted, Timestamp: time.Now()})
 		}
+	}
+	// Queued messages — claude-code parity. After the turn finishes,
+	// dequeue the head and submit it as the next user turn. We only
+	// run on success: a turn that errored out leaves the queue intact
+	// so the user can decide whether to retry or wipe it via Ctrl+C.
+	if err == nil && len(m.queuedPrompts) > 0 {
+		next := m.queuedPrompts[0]
+		m.queuedPrompts = m.queuedPrompts[1:]
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   fmt.Sprintf("(dequeued · %d remaining)", len(m.queuedPrompts)),
+			Timestamp: time.Now(),
+		})
+		m.input.SetValue(next)
+		// Defer the actual submit one tick — finalizeTurn is on the
+		// fast path, and submitInput needs a fresh frame to read the
+		// updated input value.
+		m.queuePending = true
 	}
 }
 

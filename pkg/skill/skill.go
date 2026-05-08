@@ -64,6 +64,13 @@ type Skill struct {
 	// inverse so the safe default is LLM-pickable).
 	UserOnly bool `json:"user_only,omitempty" yaml:"user_only,omitempty"`
 
+	// Disabled removes a skill from the system prompt without deleting
+	// the manifest. The user toggles via `/skills disable <name>` /
+	// `/skills enable <name>`. Useful when iterating on an unstable
+	// skill — one keystroke to take it out of the prompt for a turn,
+	// then flip it back on without re-installing.
+	Disabled bool `json:"disabled,omitempty" yaml:"disabled,omitempty"`
+
 	// ActivateOn restricts when this skill appears in the system
 	// prompt to working dirs whose path matches one of these patterns.
 	// Empty list = always active (legacy behaviour).

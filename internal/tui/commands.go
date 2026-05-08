@@ -112,11 +112,11 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "tools", Aliases: []string{"t"}, Description: "list available tools", Handler: cmdTools})
 
 	// === Skills ===
-	r.Register(REPLCommand{Name: "skills", Aliases: []string{"sk"}, Description: "list installed skills", Handler: cmdSkills})
-	r.Register(REPLCommand{Name: "skill", Description: "skill ops: list | install <name> | uninstall <name> | search <query>", Handler: cmdSkill})
+	r.Register(REPLCommand{Name: "skills", Aliases: []string{"sk"}, Description: "skills: list | install | remove | info | edit | enable | disable | create | search (local)", Handler: cmdSkills})
+	r.Register(REPLCommand{Name: "skill", Description: "alias of /skills (singular form; /skill search hits github)", Handler: cmdSkill})
 
 	// === MCP ===
-	r.Register(REPLCommand{Name: "mcp", Description: "MCP ops: list | add <name> <cmd> | remove <name> | start <name>", Handler: cmdMCP})
+	r.Register(REPLCommand{Name: "mcp", Description: "MCP ops: list | add | remove | start | enable | disable | edit | test | logs | reload", Handler: cmdMCP})
 	r.Register(REPLCommand{Name: "cu", Description: "computer-use (metis-cu) ops: enable | disable | status", Handler: cmdCU})
 
 	// === Session ===
@@ -133,6 +133,20 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "config", Aliases: []string{"cfg"}, Description: "open config in $EDITOR", Handler: cmdConfig})
 	r.Register(REPLCommand{Name: "env", Description: "show environment info (OS, arch, CPU, memory)", Handler: cmdEnv})
 	r.Register(REPLCommand{Name: "doctor", Description: "diagnose metis installation", Handler: cmdDoctor})
+
+	// === Phase C: claude-code parity slashes ===
+	r.Register(REPLCommand{Name: "copy", Description: "copy last N assistant replies to clipboard (default 1)", Handler: cmdCopy})
+	r.Register(REPLCommand{Name: "commit-push-pr", Aliases: []string{"cpp"}, Description: "git add -A → commit -m <msg> → push → gh pr create --fill", Handler: cmdCommitPushPR})
+	r.Register(REPLCommand{Name: "insights", Description: "summarize sessions in last N days: /insights [--days=N] (default 7)", Handler: cmdInsights})
+	r.Register(REPLCommand{Name: "output-style", Description: "output verbosity: full | streamlined | minimal", Handler: cmdOutputStyle})
+	r.Register(REPLCommand{Name: "break-cache", Description: "explain how to force a fresh prompt-cache write", Handler: cmdBreakCache})
+	r.Register(REPLCommand{Name: "security-review", Description: "OWASP-flavored review nudge (analog of /review for security)", Handler: cmdSecurityReview})
+	r.Register(REPLCommand{Name: "feedback", Description: "alias of /bug — file a metis issue", Handler: cmdFeedback})
+
+	// === Phase F: discoverability slashes ===
+	r.Register(REPLCommand{Name: "thinkback", Description: "show the most recent assistant turn's extended-thinking trace", Handler: cmdThinkback})
+	r.Register(REPLCommand{Name: "ultraplan", Description: "deep-plan nudge: bumps effort=high and pre-loads the planning frame", Handler: cmdUltraplan})
+	r.Register(REPLCommand{Name: "onboarding", Description: "first-run setup recap (auth, config, /init, talk)", Handler: cmdOnboarding})
 
 	// === Info ===
 	r.Register(REPLCommand{Name: "version", Aliases: []string{"v", "--version"}, Description: "show version", Handler: cmdVersion})
@@ -742,9 +756,10 @@ func cmdTools(r *REPL, args string) string {
 // SKILLS
 // =============================================================================
 
-func cmdSkills(r *REPL, args string) string {
-	return renderSkillsList(r.skillDir)
-}
+// cmdSkills lives in cmd_skills_extra.go (full subcommand dispatcher).
+// /skill (singular) keeps the historical narrow surface: list / install /
+// uninstall / search-on-github. Users typing the plural form get the
+// extended Phase-A surface.
 
 func cmdSkill(r *REPL, args string) string {
 	parts := strings.SplitN(strings.TrimSpace(args), " ", 2)
@@ -804,8 +819,40 @@ func cmdMCP(r *REPL, args string) string {
 			return "usage: mcp start <name>"
 		}
 		return r.handleMCPStart(parts[1])
+	case "enable":
+		if len(parts) < 2 {
+			return "usage: mcp enable <name>"
+		}
+		return r.handleMCPEnable(parts[1])
+	case "disable":
+		if len(parts) < 2 {
+			return "usage: mcp disable <name>"
+		}
+		return r.handleMCPDisable(parts[1])
+	case "edit":
+		// `/mcp edit` (no name) opens mcp.toml whole; `/mcp edit <name>`
+		// pre-validates the name first so a typo doesn't waste the
+		// editor round-trip.
+		var name string
+		if len(parts) >= 2 {
+			name = parts[1]
+		}
+		return r.handleMCPEdit(name)
+	case "test":
+		if len(parts) < 2 {
+			return "usage: mcp test <name>"
+		}
+		return r.handleMCPTest(parts[1])
+	case "logs":
+		if len(parts) < 2 {
+			return "usage: mcp logs <name>"
+		}
+		return r.handleMCPLogs(parts[1])
+	case "reload":
+		return r.handleMCPReload()
 	}
-	return "mcp: unknown '" + sub + "'. usage: mcp list | add <name> <cmd> [args] | remove <name> | start <name>"
+	return "mcp: unknown '" + sub + "'. usage: mcp list | add <name> <cmd> [args] | remove <name> |\n" +
+		"  start <name> | enable <name> | disable <name> | edit [<name>] | test <name> | logs <name> | reload"
 }
 
 func (r *REPL) handleMCPList() string {

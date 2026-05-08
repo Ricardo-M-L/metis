@@ -52,6 +52,13 @@ type REPL struct {
 	// once at end of turn rather than re-rendering line-by-line.
 	streamBuf strings.Builder
 
+	// outputStyle tracks the user's /output-style choice. Used by the
+	// chat surface to decide thinking visibility + tool-row collapsing
+	// (Phase C: state captured here; render-pipeline gating lands with
+	// the streamlined-output refactor in a follow-up). Values: "" /
+	// "full" / "streamlined" / "minimal".
+	outputStyle string
+
 	shouldQuit bool
 }
 

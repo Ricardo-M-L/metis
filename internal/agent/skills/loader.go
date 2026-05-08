@@ -237,6 +237,13 @@ func (l *Loader) List() ([]Skill, error) {
 				l.Logger("skill %q: skipped at cwd %q (no ActivateOn match)", sk.Name, l.Cwd)
 				continue
 			}
+			// Disabled skills stay on disk but are pulled out of the
+			// system prompt. Matches MCPServerEntry.Disabled — same
+			// "iterate without re-installing" affordance.
+			if sk.Disabled {
+				l.Logger("skill %q: skipped (disabled in manifest)", sk.Name)
+				continue
+			}
 			if prev, ok := seen[sk.Name]; ok && prev.layer != layer.Name {
 				l.Logger("skill %q: %s overrides %s", sk.Name, layer.Name, prev.layer)
 			}

@@ -66,13 +66,23 @@ metis config show             # effective config + which files were read
 metis config init             # write starter config to ~/.metis/config.toml
 metis tools                   # list registered tools (built-in + MCP + plugin)
 metis sessions list           # recent saved sessions
+metis skills list             # built-in skills library
+metis skills install <ref>    # install a skill (bundled name or owner/repo:name)
+metis skills info <name>      # show one skill's manifest fields
+metis skills uninstall <name> # remove a skill
+metis ps [--limit N]          # list recent sessions (newest first; pid + size + title)
+metis logs <session-id>       # print a session's transcript (compact role/peek format)
+metis attach <session-id>     # alias of `metis chat -r <id>` (tmux-attach parity)
+metis kill <session-id>       # SIGTERM the metis pid backing this session
+metis daemon [--idle 10m]     # KAIROS-style file-watcher (~/.metis/inbox → outbox)
 metis plugin list             # installed plugins
 metis plugin info <name>      # show one plugin's manifest details
 metis plugin remove <name> [--yes]  # delete a plugin (--yes to actually rm -rf)
 metis cron <list|add|...>     # scheduled-job CRUD (see Scheduling section)
 metis acp [--addr ADDR]       # JSON-RPC server (stdio default; TCP for Zed/etc.)
 metis auth login              # opencode-style provider wizard (writes ~/.metis/auth.json)
-metis version
+metis update [--check]        # self-update from the private GitHub release
+metis version [-V]            # short semver (-V for full build fingerprint)
 ```
 
 ### Flags
@@ -81,26 +91,66 @@ metis version
 |------|------|
 | `-m, --model <id>` | override model |
 | `-p, --provider <id>` | `anthropic` / `openai` / `gemini` / any custom |
-| `--mode <id>` | permission mode |
+| `--mode <id>` | permission mode (`ask` / `auto` / `bypass` / `plan` / `deny`) |
+| `--dangerously-skip-permissions` | alias of `--mode bypass` (named for Claude Code muscle memory) |
+| `-c, --continue` | resume the most recently modified session |
+| `-r, --resume [<id>]` | resume a specific session id; bare `-r` opens an interactive picker |
+| `-d, --debug` | mirror logs into `~/.metis/debug.log` |
+| `--bare` | skip MCP / plugin loaders for fastest cold start |
+| `-s, --scope <local\|user\|project>` | config scope (today only `user` is honored) |
+| `--input-format json` | `metis run`: read NDJSON prompts from stdin |
+| `--output-format json\|stream-json` | `metis run`: emit structured events |
 | `--no-markdown` | disable glamour markdown rendering |
+| `--no-stream` | wait for the full reply before printing |
+| `--streamlined` | thinking dropped, tool calls collapsed into summaries |
 | `--max-iter <n>` | cap tool iterations per turn |
 | `--system <text>` | override system prompt |
-| `--resume <id>` | resume a saved session |
 | `--effort low\|medium\|high` | reasoning intensity (Anthropic thinking, OpenAI reasoning_effort) |
 | `--fast` | one-shot fast turn (effort=low + halved max_tokens) |
+| `--add-dir <path>` | add a directory to the agent's accessible scope (repeatable) |
+| `--agent <name>` | load an agent profile from `~/.metis/agents/<name>.md` |
+| `--worktree <slug>` / `-W` | spin up the session inside a git worktree |
+| `--name <text>` | human-friendly session label (visible in `/sessions`) |
+| `--agent-teams` | start in agent-teams mode (alias for `/batch` entry path) |
+| `--tmux` | when starting in a worktree, also wrap in a tmux pane |
+| `--tui` | force the TUI (default when stdout is a TTY) |
+| `--no-auth-wizard` | skip the first-run auth wizard |
 
 ### Slash commands (in chat)
 
 Session: `/new` `/clear` `/retry` `/undo` `/history` `/save` `/title`
-`/branch` `/sessions`
+`/rename` `/tag` `/branch` `/sessions` `/export`
 
-Mode: `/plan` `/auto` `/bypass` `/compact` `/effort` `/fast`
+Mode: `/plan` `/auto` `/bypass` `/compact` `/effort` `/fast` `/output-style`
 
 Info: `/status` `/session` `/model` `/tools` `/skills` `/memory`
-`/version` `/help`
+`/cost` `/usage` `/tokens` `/context` `/stats` `/keybindings` `/permissions`
+`/hooks` `/doctor` `/version` `/help` `/onboarding`
 
-Tooling: `/loop` `/cron` `/edit` `/agents` `/skill <name>` `/mcp add`
-`/mcp remove` `/mcp start` `/cu enable` `/cu disable`
+Productivity: `/copy [N]` `/share` `/export` `/files` `/recap` `/replay`
+`/insights [--days N]` `/lessons` `/break-cache` `/statusline`
+
+Git / review: `/diff` `/git` `/commit` `/log` `/checkout` `/stash` `/fetch`
+`/review` `/security-review` `/commit-push-pr` `/feedback`
+
+Tooling: `/loop` `/cron` `/edit` `/agents` `/batch` `/btw` `/abort`
+`/voice` `/thinkback` `/ultraplan`
+
+MCP: `/mcp list` `/mcp add <name> <cmd>` `/mcp remove <name>`
+`/mcp enable <name>` `/mcp disable <name>` `/mcp edit [<name>]`
+`/mcp test <name>` `/mcp logs <name>` `/mcp reload` `/mcp start <name>`
+`/cu enable` `/cu disable`
+
+Skills: `/skills list` `/skills install <name>` `/skills remove <name>`
+`/skills info <name>` `/skills edit <name>` `/skills enable <name>`
+`/skills disable <name>` `/skills create <name>` `/skills search <query>`
+
+User-authored: drop `*.md` files under `~/.metis/commands/` or
+`<cwd>/.metis/commands/`. Each becomes `/<filename>`. YAML frontmatter
+sets the description; `$ARGUMENTS` / `$1` / `$2` get substituted.
+
+MCP servers that advertise prompts/list register automatically as
+`/mcp__<server>__<prompt>` slashes.
 
 ### Keybindings (in chat)
 
@@ -113,14 +163,20 @@ Tooling: `/loop` `/cron` `/edit` `/agents` `/skill <name>` `/mcp add`
 | `Ctrl+R` | reverse history search (fuzzy match prior prompts) |
 | `Ctrl+S` | toggle copy mode (exit alt-screen so you can mouse-select the whole transcript) |
 | `Ctrl+Y` | yank last assistant reply to clipboard (OSC 52 + `~/.metis/clipboard.txt` fallback) |
+| `Ctrl+Shift+Y` | yank full transcript (filtered to user/assistant/bash) |
 | `Ctrl+L` | redraw screen |
 | `Ctrl+V` | paste clipboard (text → input, image → `[Image #N]` placeholder) |
+| `Ctrl+G` | open the input draft in `$VISUAL`/`$EDITOR`/`vi`; saves on exit |
+| `Ctrl+X` | toggle shell mode (next input runs as `bash -c <input>`) |
 | `Ctrl+J` | newline (alt to Alt+Enter) |
-| `Ctrl+C` | interrupt running turn / single-tap idle = quit |
+| `Ctrl+C` | interrupt running turn + clear queued prompts / single-tap idle = quit |
 | `Ctrl+D` | quit |
+| `↑` / `↓` (single-line) | jump to start / end of input (also recall history when empty) |
+| `Esc Esc` | clear current input (no submit) |
 | `PgUp` / `PgDn` | scroll transcript |
 | `@filename` | live file-picker dropdown — `↑↓` select, `Tab` accept |
 | `!cmd` | bash mode — runs `cmd` in shell without invoking the LLM |
+| Enter mid-turn | queue input; runs as the next turn after the current one finishes |
 
 ## Configuration
 

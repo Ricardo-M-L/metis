@@ -323,10 +323,31 @@ tui_render.go / render_chrome.go              View + bottom chrome (input,
 render_message.go / render_tool.go            Per-row painters
 render_overlay.go                             Palette / permission /
                                               task panel / scrollbar
-render_welcome.go / figures.go                Welcome banner + glyphs
+render_welcome.go / figures.go                Welcome banner + sticky
+                                              header (✻ metis · model
+                                              · cwd) + ASCII robot icon
+render_queue_pill.go                          "◷ queued × N" indicator
+                                              shown above the input
+                                              when m.queuedPrompts ≠ ∅
 keybind_*.go                                  Per-mode key handlers
                                               (main, palette, permission,
-                                              session, submit)
+                                              session, submit). Plain
+                                              text mid-turn → queue;
+                                              slash mid-turn → existing
+                                              steer/refuse classification
+external_editor.go                            Ctrl+G — tea.ExecProcess
+                                              opens $EDITOR on a temp
+                                              .md file, reads back on
+                                              exit
+cmd_phase_c.go / cmd_phase_f.go               Slash handlers added in
+                                              the claude-code parity
+                                              push (/copy, /commit-push-
+                                              pr, /insights, /thinkback,
+                                              /ultraplan, /onboarding, …)
+cmd_mcp_extra.go / cmd_skills_extra.go        /mcp + /skills subcommand
+                                              dispatchers (enable,
+                                              disable, edit, test, logs,
+                                              reload, info, create, …)
 auth_wizard.go / clipboard.go                 Sub-flows
 spinner / token / perf_config / tick          UI tunables
 error_format.go                               Provider error → readable
@@ -337,6 +358,17 @@ bridge.go                                     Read-only state snapshot
 screen/                                       Full-window overlays
                                               (history, file picker, …)
 ```
+
+The new top-level `metis ps / logs / kill / attach` subcommands live in
+`cmd/metis/cmd_session_ops.go` and read the on-disk session store
+directly. Once the daemon work in #49 grows a Unix socket front, those
+subcommands will route through it; today they fall through to direct
+filesystem reads + signal delivery. The MCP prompt registrar
+(`internal/runtime/mcp_prompts.go` + `cmd/metis/mcp_prompts_bind.go`)
+walks every launched server at startup and registers its
+`prompts/list` entries as `mcp__<server>__<prompt>` slashes; the
+slash binding lives in `cmd/metis/` to avoid an
+`internal/runtime` ↔ `internal/slash` import cycle.
 
 Spinner glyph advance is **time-gated** (120ms steps), not tick-gated —
 otherwise a 40ms tick made the asterisk flicker (claude-code parity).

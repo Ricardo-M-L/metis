@@ -31,47 +31,39 @@ func TestTurnActive_AcceptsTyping(t *testing.T) {
 	}
 }
 
-// TestTurnActive_SubmitSteers — post-Task#78 behavior: pressing Enter
-// while a turn is in flight no longer drops the input or surfaces a
-// "wait for it to finish" hint. Instead, the text is queued on the
-// agent loop as a steering message and gets injected into the next
-// iteration's user message after the in-flight tool returns.
-// Mirrors claude-code's "you can keep typing" UX.
-func TestTurnActive_SubmitSteers(t *testing.T) {
+// TestTurnActive_SubmitQueues — post-task#35 behavior (claude-code
+// parity): pressing Enter while a turn is in flight queues the input
+// onto m.queuedPrompts instead of steer-injecting into the running
+// turn. The queue drains on turn end (finalizeTurn) by loading the
+// head into the input and firing handleSubmit on the next tick.
+//
+// Steering remains available via slash mid-turn handling for users
+// who explicitly want it — only plain text routes through the queue.
+func TestTurnActive_SubmitQueues(t *testing.T) {
 	m := newSlashTestModel(t)
 	for _, r := range "use Edit not Write" {
 		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	m.turnActive = true
-	beforeMsgs := len(m.messages)
 
 	pressEnter(t, m)
 
-	// Look for the user-steer message verifying the underlying loop's
-	// steer buffer holds the text. Mid-turn input now lands as a
-	// `Role: "user-steer"` Message (visible in the same lane as a
-	// fresh user prompt — feedback 2026-05-05 said the prior muted
-	// info-style row was invisible against the rest of the turn).
-	found := false
-	for i := beforeMsgs; i < len(m.messages); i++ {
-		if m.messages[i].Role == "user-steer" &&
-			strings.Contains(m.messages[i].Content, "use Edit not Write") {
-			found = true
-			break
-		}
+	// Verify the queue holds the typed text.
+	if len(m.queuedPrompts) != 1 {
+		t.Fatalf("expected 1 queued prompt; got %d (%v)", len(m.queuedPrompts), m.queuedPrompts)
 	}
-	if !found {
-		t.Errorf("Enter mid-turn should emit a user-steer message; got messages[%d:]=%+v",
-			beforeMsgs, m.messages[beforeMsgs:])
+	if m.queuedPrompts[0] != "use Edit not Write" {
+		t.Errorf("queue head wrong; got %q", m.queuedPrompts[0])
 	}
-	// Input must be cleared so the user sees the steer was accepted
-	// (mirroring normal-submit behavior — input clears on send).
+	// Input must be cleared so the user sees the queue acceptance
+	// (matches normal-submit affordance — input clears on send).
 	if m.input.Value() != "" {
-		t.Errorf("input should be cleared after steer; got %q", m.input.Value())
+		t.Errorf("input should be cleared after queueing; got %q", m.input.Value())
 	}
-	// Drain the loop's steer buffer to confirm the message landed.
-	if got := m.loop.SteerInjectDrainForTest(); got != "use Edit not Write" {
-		t.Errorf("loop steer buffer should hold the text; got %q", got)
+	// The agent loop's steer buffer must NOT have been touched —
+	// queueing is a different pipeline.
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Errorf("steer buffer should be empty; got %q", got)
 	}
 }
 
@@ -198,7 +190,11 @@ func TestTurnActive_CustomSlashResolvesAndSteers(t *testing.T) {
 // goes through the steer path as literal text. This is the safe
 // default — user might be typing actual chat content that happens to
 // start with a slash.
-func TestTurnActive_UnknownSlashFallsThroughToSteer(t *testing.T) {
+func TestTurnActive_UnknownSlashFallsThroughToQueue(t *testing.T) {
+	// Post-task#35: unknown slash (MidTurnSafe → fall-through) lands
+	// in the queue, not the steer buffer. The slash itself isn't a
+	// known command so we treat the literal text as a future user
+	// turn, matching claude-code's "next message" semantics.
 	m := newSlashTestModel(t)
 	m.turnActive = true
 	for _, r := range "/notarealcommand" {
@@ -207,11 +203,10 @@ func TestTurnActive_UnknownSlashFallsThroughToSteer(t *testing.T) {
 
 	pressEnter(t, m)
 
-	steered := m.loop.SteerInjectDrainForTest()
-	// The slash registry's Parse returns "unknown: /<name>" for
-	// unrecognized commands with handled=true, sig=SignalNone. That
-	// counts as MidTurnSafe → falls through to literal SteerInject.
-	if steered != "/notarealcommand" {
-		t.Errorf("unknown slash should fall through to literal steer; got %q", steered)
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Errorf("steer buffer should be empty after queueing; got %q", got)
+	}
+	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0] != "/notarealcommand" {
+		t.Errorf("expected single queued prompt with literal slash; got %v", m.queuedPrompts)
 	}
 }
