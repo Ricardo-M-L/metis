@@ -63,10 +63,18 @@ func OOMWrappedCommand(ctx context.Context, shell, cmdStr string) *exec.Cmd {
 }
 
 // shellQuoteSingle wraps s in single quotes, escaping any embedded
-// single quotes via the standard `'\''` POSIX trick. Used to embed
+// single quotes via the standard close-quote / backslash-quote /
+// open-quote POSIX trick: each interior single quote becomes the
+// 4-character sequence quote backslash quote quote. Used to embed
 // arbitrary user shell commands inside the OOM-wrapper sh -c string.
 //
-// Example: foo'bar baz → 'foo'\''bar baz'
+// Example input  foo<sq>bar baz where <sq> is a literal '
+// Example output 'foo'<sq>'bar baz'
+//
+// Why this comment avoids backtick code spans: gofmt 1.26 (godoc-
+// aware) interprets straight ASCII quotes inside `…` spans as smart-
+// quote candidates and rewrites them to U+201D — which would silently
+// break the literal in the source. Plain prose dodges the rewriter.
 func shellQuoteSingle(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

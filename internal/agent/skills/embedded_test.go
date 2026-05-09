@@ -49,7 +49,7 @@ func TestEmbedded_AllowedToolsKnown(t *testing.T) {
 	known := map[string]bool{
 		"Read": true, "Write": true, "Edit": true, "Bash": true,
 		"LS": true, "Glob": true, "Grep": true, "WebFetch": true,
-		"Git": true, "Search": true, "TodoWrite": true, "TodoRead": true,
+		"Git": true, "WebSearch": true, "TodoWrite": true, "TodoRead": true,
 		"AskUser": true, "Skill": true, "Memory": true,
 		"Agent": true, "SendMessage": true,
 	}

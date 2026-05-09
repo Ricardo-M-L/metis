@@ -153,7 +153,6 @@ func writeClipboard(text string) {
 	}
 }
 
-
 // osc52Status returns a single-word hint about whether the OSC 52
 // escape is likely to land. iTerm2 / kitty / WezTerm / Alacritty /
 // modern Terminal.app all support it; tmux passes through if

@@ -155,7 +155,17 @@ type anthropicContent struct {
 	ToolUseID    string                 `json:"tool_use_id,omitempty"`
 	Content      any                    `json:"content,omitempty"` // string or []block in tool_result
 	IsError      bool                   `json:"is_error,omitempty"`
+	Source       *anthropicImageSource  `json:"source,omitempty"` // type="image" only
 	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+// anthropicImageSource is the inline-base64 image carrier. Anthropic
+// also supports `{"type":"url", "url":...}` but metis only ships
+// pasted-clipboard bytes today, so we always emit the base64 form.
+type anthropicImageSource struct {
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // "image/png" / "image/jpeg" / "image/gif" / "image/webp"
+	Data      string `json:"data"`
 }
 
 // MarshalJSON ensures `tool_use` blocks ALWAYS emit an `input` field,
@@ -381,6 +391,15 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 			case "tool_result":
 				am.Content = append(am.Content, anthropicContent{
 					Type: "tool_result", ToolUseID: c.ToolUseID, Content: c.ToolResult, IsError: c.IsError,
+				})
+			case "image":
+				am.Content = append(am.Content, anthropicContent{
+					Type: "image",
+					Source: &anthropicImageSource{
+						Type:      "base64",
+						MediaType: c.MediaType,
+						Data:      c.Data,
+					},
 				})
 			}
 		}

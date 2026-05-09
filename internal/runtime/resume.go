@@ -44,6 +44,14 @@ func ApplyResume(store *session.Store, sessionID string, loop *agent.Loop,
 	if warnOut == nil {
 		warnOut = os.Stderr
 	}
+	// Pre-flight size check (#43 / openclaude path): refuse to load a
+	// transcript larger than session.DefaultResumeMaxBytes (8 MiB).
+	// Past that point, even a successful resume usually starves the
+	// model's context window and burns tokens; better to /clear or
+	// /branch from an earlier turn. Override via METIS_RESUME_MAX_MB.
+	if err := store.CheckResumeSize(sessionID); err != nil {
+		return nil, err
+	}
 	hdr, msgs, err := store.Load(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("resume %s: %w", sessionID, err)

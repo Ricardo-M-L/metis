@@ -61,7 +61,7 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 		WebFetch{gate: gate},
 		WebBrowse{gate: gate},
 		Git{gate: gate},
-		Search{gate: gate},
+		WebSearch{gate: gate},
 		Todo{gate: gate},
 		TodoRead{gate: gate},
 		AskUser{gate: gate},

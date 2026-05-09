@@ -105,7 +105,7 @@ type ServerInfo struct {
 
 // SlashCommand is one entry in InitializeResult.SlashCommands.
 type SlashCommand struct {
-	Name        string `json:"name"`        // includes leading `/`
+	Name        string `json:"name"` // includes leading `/`
 	Description string `json:"description,omitempty"`
 }
 

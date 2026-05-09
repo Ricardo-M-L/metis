@@ -54,6 +54,12 @@ const MaxEditFileSize = 64 * 1024 * 1024
 // claude-code FILE_UNEXPECTEDLY_MODIFIED_ERROR.
 const FileUnexpectedlyModified = "file unexpectedly modified after last read; re-Read the file before editing"
 
+// FilePartialViewNotEditable is the error a partial-read check
+// returns. The model only saw a slice of the file (offset/limit set)
+// so editing risks overwriting bytes it never observed. Force a full
+// Read first.
+const FilePartialViewNotEditable = "file was Read with offset/limit (partial view); re-Read the full file before editing"
+
 func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	path, _ := in["path"].(string)
 	old, _ := in["old"].(string)
@@ -101,6 +107,12 @@ func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	// here would be a misuse the model corrects on the next turn).
 	if e.state != nil {
 		if entry, ok := e.state.Get(path); ok {
+			if entry.IsPartialView {
+				return &tools.Result{
+					Output:  FilePartialViewNotEditable + ": " + path,
+					IsError: true,
+				}, nil
+			}
 			currentHash := hashBytes(bs)
 			currentMTime := st.ModTime()
 			if currentHash != entry.Hash && !currentMTime.Equal(entry.MTime) {

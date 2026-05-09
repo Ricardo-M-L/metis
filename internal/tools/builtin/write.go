@@ -68,6 +68,12 @@ func (w Write) Execute(_ context.Context, in map[string]any) (*tools.Result, err
 	if st, statErr := os.Stat(path); statErr == nil {
 		if w.state != nil {
 			if entry, ok := w.state.Get(path); ok {
+				if entry.IsPartialView {
+					return &tools.Result{
+						Output:  FilePartialViewNotEditable + ": " + path,
+						IsError: true,
+					}, nil
+				}
 				if data, rerr := os.ReadFile(path); rerr == nil {
 					currentHash := hashBytes(data)
 					if currentHash != entry.Hash && !st.ModTime().Equal(entry.MTime) {

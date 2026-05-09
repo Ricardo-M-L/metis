@@ -61,16 +61,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	if text == "" {
 		return m, nil
 	}
-	// Expand `[Image #N]` placeholders inserted by Ctrl-V back to the
-	// concrete cached path. The chat surface shows the friendly tag
-	// while the underlying agent + downstream tools see the path so
-	// `Read foo.png` and friends still work. Reset the index after
-	// expansion so a fresh turn starts numbering from 1 again.
-	if len(m.imagePaste) > 0 {
-		text = expandPastedImages(text, m.imagePaste)
-		m.imagePaste = nil
-		m.imageCounter = 0
-	}
+	// `[Image #N]` placeholders STAY in the displayed text — the user
+	// pasted those and expects to see them in the transcript. The
+	// real image bytes are split out into ContentBlocks at the
+	// AppendUserBlocks call site below; here we leave the text alone.
 	// Refuse to submit while a turn is in flight. Without this guard
 	// the new submit clears m.streamingText / m.toolEvents and spawns a
 	// second runTurnAsync goroutine that races on doneCh — which the
@@ -533,8 +527,27 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// User message → run agent
-	m.loop.AppendUser(text)
+	// User message → run agent.
+	//
+	// Pasted images path: split text on `[Image #N]` placeholders and
+	// build a multimodal content-block list (text + image_block …).
+	// The agent sees real bytes; the displayed user message keeps the
+	// placeholder text so the transcript looks clean.
+	//
+	// Plain-text path stays cheaper — single text block via AppendUser.
+	if len(m.imagePaste) > 0 {
+		blocks, errs := expandPastedImagesToBlocks(text, m.imagePaste)
+		m.loop.AppendUserBlocks(blocks)
+		for _, e := range errs {
+			m.messages = append(m.messages, Message{
+				Role: "warning", Content: "image: " + e, Timestamp: time.Now(),
+			})
+		}
+		m.imagePaste = nil
+		m.imageCounter = 0
+	} else {
+		m.loop.AppendUser(text)
+	}
 	if m.session != nil && m.sessionID != "" {
 		_ = m.session.AppendMessage(m.sessionID, lastUserMessage(m.loop.History()))
 	}

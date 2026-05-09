@@ -29,8 +29,8 @@ func (WebFetch) IsReadOnly(map[string]any) bool { return true }
 // WebBrowse same rationale as WebFetch.
 func (WebBrowse) IsReadOnly(map[string]any) bool { return true }
 
-// Search is a read-only search across the codebase / docs.
-func (Search) IsReadOnly(map[string]any) bool { return true }
+// WebSearch's IsReadOnly lives in websearch.go alongside the rest of
+// the type's methods.
 
 // TodoRead just lists the in-memory todo list.
 func (TodoRead) IsReadOnly(map[string]any) bool { return true }

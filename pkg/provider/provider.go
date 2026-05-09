@@ -47,7 +47,18 @@ const (
 )
 
 // ContentBlock is the discriminated-union element of a Message.
-// One of Text / ToolUse / ToolResult is populated.
+// One of Text / ToolUse / ToolResult / Image is populated, keyed by Type.
+//
+// Image blocks (Type="image") carry a base64-encoded payload + IANA
+// media type. Provider adapters translate to their wire format:
+//
+//   - Anthropic: {"type":"image", "source":{"type":"base64",
+//     "media_type":<MediaType>, "data":<Data>}}
+//   - OpenAI:    {"type":"image_url",
+//     "image_url":{"url":"data:<MediaType>;base64,<Data>"}}
+//
+// Only attachments uploaded inline are supported here; URL-based image
+// references would need a separate Source field.
 type ContentBlock struct {
 	Type       string         `json:"type"`
 	Text       string         `json:"text,omitempty"`
@@ -56,6 +67,10 @@ type ContentBlock struct {
 	ToolInput  map[string]any `json:"input,omitempty"`
 	ToolResult string         `json:"content,omitempty"`
 	IsError    bool           `json:"is_error,omitempty"`
+
+	// Image-specific (Type="image"):
+	MediaType string `json:"media_type,omitempty"` // e.g., "image/png"
+	Data      string `json:"data,omitempty"`       // base64-encoded bytes
 }
 
 // Message is a single turn in a conversation.

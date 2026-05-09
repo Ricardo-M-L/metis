@@ -143,7 +143,7 @@ func Aggregate(sessionsDir string) (*Stats, error) {
 			d.Messages += row.Messages
 		} else {
 			dayCount[dayKey] = &DayActivity{
-				Date: time.Date(row.Started.Year(), row.Started.Month(), row.Started.Day(), 0, 0, 0, 0, row.Started.Location()),
+				Date:     time.Date(row.Started.Year(), row.Started.Month(), row.Started.Day(), 0, 0, 0, 0, row.Started.Location()),
 				Sessions: 1, Messages: row.Messages,
 			}
 		}
@@ -238,13 +238,13 @@ func Aggregate(sessionsDir string) (*Stats, error) {
 // sessionRowRaw is the in-flight aggregate of one session file
 // before it's split into the various Stats slots.
 type sessionRowRaw struct {
-	ID         string
-	Title      string
-	Model      string
-	Started    time.Time
-	Messages   int
-	tokensIn   int // approximate, see content-char/4 rule
-	tokensOut  int
+	ID        string
+	Title     string
+	Model     string
+	Started   time.Time
+	Messages  int
+	tokensIn  int // approximate, see content-char/4 rule
+	tokensOut int
 }
 
 // readSessionFile parses one session jsonl. Returns nil + nil on a
@@ -264,9 +264,9 @@ func readSessionFile(path string) (*sessionRowRaw, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<22)
 	type entry struct {
-		Type    string         `json:"type"`
+		Type    string          `json:"type"`
 		Header  *pubsess.Header `json:"header,omitempty"`
-		Message *llm.Message   `json:"message,omitempty"`
+		Message *llm.Message    `json:"message,omitempty"`
 	}
 	for sc.Scan() {
 		var e entry

@@ -28,7 +28,7 @@ var ToolProfiles = []ToolProfile{
 		ID:          "coding",
 		Name:        "Coding",
 		Description: "Development tools: all fs tools + terminal",
-		Allowed:     []string{"Read", "Write", "Edit", "Glob", "Grep", "LS", "Bash", "Git", "Search"},
+		Allowed:     []string{"Read", "Write", "Edit", "Glob", "Grep", "LS", "Bash", "Git", "WebSearch"},
 		Default:     true,
 	},
 	{

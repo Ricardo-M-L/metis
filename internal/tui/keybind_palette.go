@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
 func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -196,4 +198,40 @@ func (m *Model) matchCommands() {
 	}
 	m.palMatched = append(m.palMatched, prefixHits...)
 	m.palMatched = append(m.palMatched, containsHits...)
+}
+
+// looksLikeSlashPath returns true when val starts with `/` but the
+// head token (everything up to the first space) is NOT a valid
+// slash-command head. In that case we suppress the slash palette —
+// the user is typing a pasted path or file reference, not a command.
+//
+// Examples:
+//
+//	"/help"              false (real command)
+//	"/model haiku"       false (real command + args)
+//	"/Users/x/foo.go"    true  (path: second `/`)
+//	"/.. is bad"         true  (head ".." contains `.`)
+//	"/foo.bar"           true  (dot in name)
+//
+// The empty-head edge case (just `/`) returns false so the palette
+// opens with the full command list — that's how the user discovers
+// available commands.
+//
+// Delegates to slash.IsCommandShape so both this gate AND the slash
+// registry's Parse() use the same definition of "command-shape".
+// Without this shared rule the two paths could drift — e.g. typing
+// shows the palette but submit emits "unknown" — exactly the bug
+// from image #15.
+func looksLikeSlashPath(val string) bool {
+	if len(val) < 2 || val[0] != '/' {
+		return false
+	}
+	head := val[1:]
+	if idx := strings.IndexByte(head, ' '); idx >= 0 {
+		head = head[:idx]
+	}
+	if head == "" {
+		return false
+	}
+	return !slash.IsCommandShape(head)
 }

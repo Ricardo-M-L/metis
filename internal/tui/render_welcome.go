@@ -26,42 +26,88 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
-// robotIconLines is the 5-row pixel-block robot face. Heavier visual
-// weight than the previous line-art version (user feedback 2026-05-08
-// image #10: "icon too ugly compared to claude-code"). Uses `▄ █ ▀`
-// for the silhouette and `▐ ▌` half-blocks for the body sides — every
-// char in this set renders at a stable 1-cell width across iTerm,
-// Apple_Terminal, Alacritty, and JetBrains Mono. The eyes (`◉`) and
-// mouth (`──`) sit inside the face so the silhouette reads as a robot
-// even in monochrome rendering. Width is fixed at 9 cells so the
-// JoinHorizontal aligns cleanly with the right-column text.
-// robotIconLines (kept var name for diff continuity) is now an Athenian
-// owl silhouette — Metis is the Greek titaness of wisdom & cunning,
-// mother of Athena, whose tetradrachm coin owl is the canonical
-// "wisdom" sigil in Western iconography. The earlier robot face read
-// as generic-bot and didn't tie to the project's name. Width is fixed
-// at 9 cells so JoinHorizontal still aligns with the right column;
-// every char (▄ ▀ █ • ▼ and space) is single-cell across iTerm2,
-// Apple_Terminal, Alacritty, Ghostty, kitty, and Windows Terminal.
-var robotIconLines = []string{
-	"  ▄▀▀▀▄  ",
-	" █ ▀ ▀ █ ",
-	" █ • • █ ",
-	" █  ▼  █ ",
-	"  ▀█▄█▀  ",
-	"   ▀ ▀   ",
+// metisOwlGlyphLines is the hand-crafted Unicode block-art owl —
+// 17 cells wide × 10 rows tall, every char placed deliberately.
+// This is the "spread coat-of-arms" Athenian owl design that the
+// user (2026-05-09 image #18 feedback) called acceptable as a
+// pixel-art rendering. Going finer than this requires either:
+//   - Real PNG via iTerm2 inline image protocol — blocked by
+//     bubbletea v2's ultraviolet renderer truncating large OSC
+//     payloads (would require a fork of the renderer).
+//   - Algorithmic image-to-glyph conversion (chafa) — produces
+//     noisy fragments at 17×8 / 24×14 cell sizes because the
+//     source PNG's gradients/details have no clean mapping.
+//
+// At this glyph density the owl-ness is carried by deliberate
+// silhouette: pointed ear tufts (▟▙), round dome head, V-beak,
+// two-layer spread wings, taloned feet. Eyes (●) are repainted
+// cyan in renderWelcomeBanner for contrast.
+var metisOwlGlyphLines = []string{
+	"    ▟▙     ▟▙    ",
+	"  ▄█▀▀▀▀▀▀▀▀▀█▄  ",
+	" ▐█           █▌ ",
+	" ▐█  ●     ●  █▌ ",
+	" ▐█    ╲ ╱    █▌ ",
+	"  ▀█▄▄▄▄▄▄▄▄▄█▀  ",
+	" ▟██▙▄▄▄▄▄▄▄▟██▙ ",
+	"▐███▌       ▐███▌",
+	" ▀▀▀         ▀▀▀ ",
+	"       ▀ ▀       ",
 }
 
+// Eye-position cyan accent — row + col indices in metisOwlGlyphLines.
+const (
+	owlEyeRow  = 3
+	owlEyeColL = 5
+	owlEyeColR = 11
+)
+
 // renderWelcomeBanner paints the bordered, centered welcome card we
-// show on a fresh session. Same package as the rest of tui so the
-// renderer can read Model state without exporting fields.
+// show on a fresh session — and again as the first scrollable item
+// once the user starts chatting (so the brand strip doesn't suddenly
+// disappear after the first turn). Same package as the rest of tui
+// so the renderer can read Model state without exporting fields.
+//
+// Keeps the trailing "Type a message to start · /help · /quit" hint —
+// the active-chat path uses renderWelcomeBannerNoHint so that
+// already-engaged users aren't told to start typing.
 func (m *Model) renderWelcomeBanner() string {
+	return m.renderWelcomeBannerCard(true)
+}
+
+// renderWelcomeBannerNoHint is the same card without the
+// "Type a message to start" line. Used when the banner appears
+// inside an active chat list (where the hint is stale).
+func (m *Model) renderWelcomeBannerNoHint() string {
+	return m.renderWelcomeBannerCard(false)
+}
+
+func (m *Model) renderWelcomeBannerCard(showHint bool) string {
 	titleStyle := lipgloss.NewStyle().
 		Foreground(accentBlue).
 		Bold(true)
 	labelStyle := lipgloss.NewStyle().Foreground(textMuted)
 	valueStyle := lipgloss.NewStyle().Foreground(textPrimary)
-	iconStyle := lipgloss.NewStyle().Foreground(accentBlue)
+
+	// Owl glyph painted in two passes: silver body + cyan-glowing eyes.
+	silverStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#C0C8D8")).Bold(true)
+	eyeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#00D5E5")).Bold(true)
+
+	owlRows := make([]string, len(metisOwlGlyphLines))
+	for i, raw := range metisOwlGlyphLines {
+		if i == owlEyeRow {
+			rs := []rune(raw)
+			before := silverStyle.Render(string(rs[:owlEyeColL]))
+			eyeL := eyeStyle.Render(string(rs[owlEyeColL]))
+			middle := silverStyle.Render(string(rs[owlEyeColL+1 : owlEyeColR]))
+			eyeR := eyeStyle.Render(string(rs[owlEyeColR]))
+			after := silverStyle.Render(string(rs[owlEyeColR+1:]))
+			owlRows[i] = before + eyeL + middle + eyeR + after
+			continue
+		}
+		owlRows[i] = silverStyle.Render(raw)
+	}
+	icon := strings.Join(owlRows, "\n")
 
 	// Title row carries the version inline (claude-code parity: the
 	// banner is the discoverable surface for "what version am I on?",
@@ -90,8 +136,6 @@ func (m *Model) renderWelcomeBanner() string {
 		valueStyle.Render(prettifyCwd(currentCwd())),
 	)
 
-	icon := iconStyle.Render(strings.Join(robotIconLines, "\n"))
-
 	body := lipgloss.JoinHorizontal(lipgloss.Top, icon, "  ", right)
 
 	// Outline the whole card. Width is tied to the live terminal width
@@ -116,6 +160,9 @@ func (m *Model) renderWelcomeBanner() string {
 		Width(boxWidth).
 		Render(body)
 
+	if !showHint {
+		return box + "\n"
+	}
 	hint := labelStyle.Render("  Type a message to start  ·  ") +
 		titleStyle.Render("/help") +
 		labelStyle.Render(" for commands  ·  ") +
@@ -189,25 +236,16 @@ func currentCwd() string {
 	return wd
 }
 
-// prettifyCwd replaces the user's home dir with `~` for shorter
-// display. claude-code's banner does this and it makes a real
-// difference on macOS where /Users/<long>/Documents/... eats the
-// terminal width.
+// prettifyCwd returns the path verbatim. We used to collapse $HOME
+// to "~" (claude-code parity) but the lone `~` in the welcome card
+// reads as visual noise rather than a path — users couldn't tell at
+// a glance which directory metis was operating from. Returning the
+// absolute path makes the cwd unambiguous.
+//
+// Long paths are kept readable by the call sites: the compact top
+// header truncates from the left with `…`; the welcome card lets
+// lipgloss wrap the path inside the bordered box.
 func prettifyCwd(p string) string {
-	if p == "" {
-		return ""
-	}
-	home, err := os.UserHomeDir()
-	if err == nil && home != "" {
-		// Match exact-home or home-prefix; never mangle a path that
-		// happens to contain $HOME as a substring elsewhere.
-		if p == home {
-			return "~"
-		}
-		if strings.HasPrefix(p, home+string(filepath.Separator)) {
-			return "~" + p[len(home):]
-		}
-	}
 	return p
 }
 

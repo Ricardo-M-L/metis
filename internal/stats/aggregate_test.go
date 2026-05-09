@@ -323,9 +323,9 @@ func TestPct(t *testing.T) {
 
 func TestShorten(t *testing.T) {
 	cases := []struct {
-		in    string
-		max   int
-		want  string
+		in   string
+		max  int
+		want string
 	}{
 		{"abc", 5, "abc"},
 		{"abcdef", 5, "abcd…"},
@@ -341,7 +341,10 @@ func TestShorten(t *testing.T) {
 }
 
 func TestThousands(t *testing.T) {
-	cases := []struct{ n int; want string }{
+	cases := []struct {
+		n    int
+		want string
+	}{
 		{0, "0"},
 		{42, "42"},
 		{999, "999"},

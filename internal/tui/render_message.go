@@ -33,6 +33,18 @@ func renderMessage(msg Message, width int) string {
 		s.WriteString("\n")
 		s.WriteString(styleUser.Render("  " + glyphPrompt + " " + msg.Content))
 		s.WriteString("\n")
+		// Pasted-image attachments: claude-code prints one indented
+		// `└ [Image #N]` row per placeholder underneath the prompt so
+		// the user has a visible "yes, the agent received the image"
+		// confirmation. We pull the tags directly from the rendered
+		// text (placeholders are 1:1 with attachment content blocks
+		// emitted in handleSubmit, so this is accurate even though the
+		// renderer can't see the agent loop's Messages slice).
+		for _, m := range pastedImageTag.FindAllString(msg.Content, -1) {
+			s.WriteString(styleMuted.Render("    " + glyphTreeLeaf + "  "))
+			s.WriteString(styleAccent.Render(m))
+			s.WriteString("\n")
+		}
 	case "assistant":
 		// Assistant reply sits visually beneath the user prompt;
 		// indented bullet + body, trailing blank to separate from

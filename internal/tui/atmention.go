@@ -119,30 +119,42 @@ func detectAtMention(input string) (string, bool) {
 }
 
 // matchAtMention scores files against a filter and returns the top
-// matches up to `atMentionMaxRows`. Empty filter returns the first N
-// from the index. fuzzyMatch handles substring + acronym matching.
+// matches up to `atMentionMaxRows`. Empty filter returns the most-
+// frecent N from the index (falling back to walk order on a fresh
+// repo where no file has been picked yet). fuzzyMatch handles
+// substring + acronym matching; sortByFrecency re-ranks the survivors
+// so files the user picks repeatedly bubble up.
 func matchAtMention(filter string) []string {
 	files := atMentionIndex()
 	if len(files) == 0 {
 		return nil
 	}
 	if filter == "" {
-		// Cap at row limit so we don't return all 5000.
-		if len(files) > atMentionMaxRows {
-			return files[:atMentionMaxRows]
+		ranked := sortByFrecency(files)
+		if len(ranked) > atMentionMaxRows {
+			return ranked[:atMentionMaxRows]
 		}
-		return files
+		return ranked
 	}
+	// Collect up to 5× the row cap as candidates so frecency has room
+	// to re-rank — otherwise a walk-order break at 8 hits would lock
+	// in matches the user has never picked over genuinely-frequent
+	// ones a few rows later in the index.
+	candidateCap := atMentionMaxRows * 5
 	var hits []string
 	for _, f := range files {
 		if fuzzyMatch(f, filter) {
 			hits = append(hits, f)
-			if len(hits) >= atMentionMaxRows {
+			if len(hits) >= candidateCap {
 				break
 			}
 		}
 	}
-	return hits
+	ranked := sortByFrecency(hits)
+	if len(ranked) > atMentionMaxRows {
+		return ranked[:atMentionMaxRows]
+	}
+	return ranked
 }
 
 // updateAtMention re-runs detect+match against the current input and
@@ -179,6 +191,7 @@ func (m *Model) acceptAtMention() {
 		return
 	}
 	choice := m.atMatched[m.atCursor]
+	RecordMentionAccess(choice)
 	m.input.SetValue(applyAtMention(m.input.Value(), choice))
 	m.input.CursorEnd()
 	m.atActive = false

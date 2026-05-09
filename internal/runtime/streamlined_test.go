@@ -100,7 +100,6 @@ func TestCategorizeStreamlined_AllBuckets(t *testing.T) {
 		"WebFetch":     "search",
 		"WebBrowse":    "search",
 		"LSP":          "search",
-		"Search":       "search",
 		"Read":         "read",
 		"LS":           "read",
 		"Write":        "write",

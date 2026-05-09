@@ -315,6 +315,15 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 
+	// Structured (cmd, sub-cmd, flag) tuple blocker — catches
+	// "individually-fine tokens, dangerous together" patterns like
+	// `go test -exec "..."` and `npm install --global`. Hardcoded;
+	// not configurable via permission prompt because the model could
+	// rationalise away "yes please install --global, it's needed".
+	if err := applyBashArgsBlocker(cmd); err != nil {
+		return &tools.Result{Output: err.Error(), IsError: true}, nil
+	}
+
 	// Classify command and flag dangerous operations.
 	class := b.classifierFor().Classify(cmd)
 	if class.Class == ClassDangerous {

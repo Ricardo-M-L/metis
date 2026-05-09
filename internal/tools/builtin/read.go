@@ -105,26 +105,26 @@ func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 
 	// Record in ReadFileState so a subsequent Edit/Write on this path
 	// can detect out-of-band mtime drift (file changed between Read
-	// and Edit). We re-stat after the read because writers could
-	// have updated the file during the scan; the mtime we want is
-	// the last-known mtime at which we saw the bytes we read.
+	// and Edit). We re-stat + re-read after the user-facing scan so
+	// writers that updated the file during the scan are caught — the
+	// mtime/hash we want is the last-known on-disk state, not what we
+	// saw mid-stream.
+	//
+	// The view classifier flags partial reads (offset != 1, or hit the
+	// limit before EOF). Edit/Write refuse on partial-view entries:
+	// the model would otherwise rewrite regions of the file it never
+	// saw and silently lose those bytes. The hash we record is still
+	// over the FULL file — what the LLM saw is partial, but the
+	// staleness check needs whole-file ground truth.
 	if r.state != nil {
-		// Re-read via os.ReadFile for hashing; small files only since
-		// we already passed the size cap. Skip when offset/limit
-		// truncated — the snapshot would be partial and the staleness
-		// check would falsely fire on Edit.
-		if offset == 1 && emitted < limit {
-			if data, rerr := os.ReadFile(path); rerr == nil {
-				if st2, serr := os.Stat(path); serr == nil {
+		if data, rerr := os.ReadFile(path); rerr == nil {
+			if st2, serr := os.Stat(path); serr == nil {
+				partial := offset != 1 || emitted >= limit
+				if partial {
+					r.state.RecordPartial(path, st2.ModTime(), data, offset, limit)
+				} else {
 					r.state.Record(path, st2.ModTime(), data)
 				}
-			}
-		} else if st2, serr := os.Stat(path); serr == nil {
-			// Partial read — record mtime only by hashing what we
-			// re-read fully. This still catches the common case
-			// (model reads first 100 lines, edits early lines).
-			if data, rerr := os.ReadFile(path); rerr == nil {
-				r.state.Record(path, st2.ModTime(), data)
 			}
 		}
 	}

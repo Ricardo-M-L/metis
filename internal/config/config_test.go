@@ -268,3 +268,95 @@ func TestResolveAPIKey_CustomMissingEverywhere(t *testing.T) {
 		t.Error("expected 'missing API key' error when all 3 slots empty")
 	}
 }
+
+// TestLoad_RewritesLegacyDelphiPaths is the regression for the
+// 2026-05-09 bug: users who ran `delphi config init` before the
+// 2026-04-29 rename had `~/.local/share/delphi/sessions` hardcoded
+// in their config.toml. migrateLegacyHome() moves the data but the
+// toml still pointed at the old location, so metis kept reading and
+// writing to the delphi-named XDG path forever. Load() now rewrites
+// the in-memory config back to the canonical ~/.metis path.
+func TestLoad_RewritesLegacyDelphiPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	metisHome := filepath.Join(home, ".metis")
+	t.Setenv("METIS_HOME", metisHome)
+	if err := os.MkdirAll(metisHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	delphiSessions := filepath.Join(home, ".local", "share", "delphi", "sessions")
+	delphiSkills := filepath.Join(home, ".local", "share", "delphi", "skills")
+	tomlContent := "[session]\ndir = \"" + delphiSessions + "\"\nskill_dir = \"" + delphiSkills + "\"\n"
+	if err := os.WriteFile(filepath.Join(metisHome, "config.toml"), []byte(tomlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	wantSessions := filepath.Join(metisHome, "sessions")
+	wantSkills := filepath.Join(metisHome, "skills")
+	if cfg.Session.Dir != wantSessions {
+		t.Errorf("Session.Dir: want %q, got %q", wantSessions, cfg.Session.Dir)
+	}
+	if cfg.Session.SkillDir != wantSkills {
+		t.Errorf("Session.SkillDir: want %q, got %q", wantSkills, cfg.Session.SkillDir)
+	}
+}
+
+// TestLoad_RewritesLegacyMetisXDGPaths covers the original (pre-bug)
+// case: users with `~/.local/share/metis/sessions` from a metis-era
+// XDG install also get migrated.
+func TestLoad_RewritesLegacyMetisXDGPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	metisHome := filepath.Join(home, ".metis")
+	t.Setenv("METIS_HOME", metisHome)
+	if err := os.MkdirAll(metisHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	xdgSessions := filepath.Join(home, ".local", "share", "metis", "sessions")
+	xdgSkills := filepath.Join(home, ".local", "share", "metis", "skills")
+	tomlContent := "[session]\ndir = \"" + xdgSessions + "\"\nskill_dir = \"" + xdgSkills + "\"\n"
+	if err := os.WriteFile(filepath.Join(metisHome, "config.toml"), []byte(tomlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Session.Dir != filepath.Join(metisHome, "sessions") {
+		t.Errorf("Session.Dir: %q", cfg.Session.Dir)
+	}
+}
+
+// TestLoad_KeepsCustomSessionDir — users who deliberately pointed
+// Session.Dir at a non-default path keep it. The legacy rewrite must
+// only fire on EXACT match against a known legacy default.
+func TestLoad_KeepsCustomSessionDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	metisHome := filepath.Join(home, ".metis")
+	t.Setenv("METIS_HOME", metisHome)
+	if err := os.MkdirAll(metisHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	customDir := filepath.Join(home, "my-custom-sessions")
+	tomlContent := "[session]\ndir = \"" + customDir + "\"\n"
+	if err := os.WriteFile(filepath.Join(metisHome, "config.toml"), []byte(tomlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Session.Dir != customDir {
+		t.Errorf("custom Session.Dir should not be rewritten; got %q", cfg.Session.Dir)
+	}
+}

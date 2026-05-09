@@ -502,3 +502,58 @@ func TestToAnthropic_BothFlagsIndependent(t *testing.T) {
 		}
 	}
 }
+
+// TestToAnthropic_ImageContentBlock — pasted-image flow. The user
+// turn carries one text + one image block; the wire-format converter
+// must emit the canonical Anthropic `{"type":"image",
+// "source":{"type":"base64", "media_type":..., "data":...}}` shape.
+// Verifies both the JSON tag layout and the base64 payload survives
+// round-trip without modification.
+func TestToAnthropic_ImageContentBlock(t *testing.T) {
+	req := Request{
+		Messages: []Message{{
+			Role: RoleUser,
+			Content: []ContentBlock{
+				{Type: "text", Text: "What's this?"},
+				{Type: "image", MediaType: "image/png", Data: "iVBORw0KGgoAAAANSUhEUg=="},
+			},
+		}},
+	}
+	out := toAnthropic(req, "claude-sonnet-4", 1024)
+	if len(out.Messages) != 1 {
+		t.Fatalf("message count: %d", len(out.Messages))
+	}
+	m := out.Messages[0]
+	if len(m.Content) != 2 {
+		t.Fatalf("user content blocks: want 2 (text + image), got %d", len(m.Content))
+	}
+	img := m.Content[1]
+	if img.Type != "image" {
+		t.Errorf("Type = %q, want \"image\"", img.Type)
+	}
+	if img.Source == nil {
+		t.Fatalf("image block missing Source")
+	}
+	if img.Source.Type != "base64" {
+		t.Errorf("Source.Type = %q, want \"base64\"", img.Source.Type)
+	}
+	if img.Source.MediaType != "image/png" {
+		t.Errorf("Source.MediaType = %q", img.Source.MediaType)
+	}
+	if img.Source.Data != "iVBORw0KGgoAAAANSUhEUg==" {
+		t.Errorf("Source.Data not preserved: %q", img.Source.Data)
+	}
+
+	// Also verify the JSON shape — we want exactly the keys the
+	// Anthropic API expects.
+	buf, err := json.Marshal(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(buf)
+	for _, want := range []string{`"type":"image"`, `"source":{`, `"media_type":"image/png"`, `"data":"iVBOR`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("JSON missing %q: %s", want, got)
+		}
+	}
+}

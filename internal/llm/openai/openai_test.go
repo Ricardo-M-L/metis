@@ -167,3 +167,63 @@ func TestOpenAIStream_ParallelToolCallsWithoutIndex(t *testing.T) {
 		t.Errorf("call_b accumulated = %q, want {\"b\":2}", got)
 	}
 }
+
+// TestToOpenAI_ImageContentBlock — pasted-image flow. The user turn
+// carries one text + one image block; toOpenAI must emit a
+// content-parts array (not a string) with `{"type":"image_url",
+// "image_url":{"url":"data:image/png;base64,..."}}`. OpenAI / Kimi
+// (Moonshot) / DeepSeek-Chat-V3-vision all parse this shape.
+func TestToOpenAI_ImageContentBlock(t *testing.T) {
+	req := Request{
+		Messages: []Message{{
+			Role: RoleUser,
+			Content: []ContentBlock{
+				{Type: "text", Text: "What's this?"},
+				{Type: "image", MediaType: "image/png", Data: "iVBORw0KGgoAAAANSUhEUg=="},
+			},
+		}},
+	}
+	out := toOpenAI(req, "gpt-4o", 1024)
+	if len(out.Messages) != 1 {
+		t.Fatalf("message count: got %d", len(out.Messages))
+	}
+	m := out.Messages[0]
+	parts, ok := m.Content.([]oaiContentPart)
+	if !ok {
+		t.Fatalf("expected Content to be []oaiContentPart for image-bearing turn; got %T", m.Content)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("want 2 content parts (text + image_url), got %d", len(parts))
+	}
+	if parts[0].Type != "text" || parts[0].Text != "What's this?" {
+		t.Errorf("text part: got %+v", parts[0])
+	}
+	if parts[1].Type != "image_url" {
+		t.Errorf("image part Type: %q", parts[1].Type)
+	}
+	if parts[1].ImageURL == nil {
+		t.Fatal("image part missing ImageURL")
+	}
+	if parts[1].ImageURL.URL != "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" {
+		t.Errorf("data URL not assembled correctly: %q", parts[1].ImageURL.URL)
+	}
+}
+
+// TestToOpenAI_TextOnlyStaysString — backward compat: turns without
+// images keep the historical string-content shape (every provider
+// accepts it; no need to bump every request to the array form).
+func TestToOpenAI_TextOnlyStaysString(t *testing.T) {
+	req := Request{
+		Messages: []Message{{
+			Role:    RoleUser,
+			Content: []ContentBlock{{Type: "text", Text: "hello"}},
+		}},
+	}
+	out := toOpenAI(req, "gpt-4o-mini", 512)
+	if len(out.Messages) != 1 {
+		t.Fatalf("message count")
+	}
+	if str, ok := out.Messages[0].Content.(string); !ok || str != "hello" {
+		t.Errorf("text-only turn should stay as string content; got %T %v", out.Messages[0].Content, out.Messages[0].Content)
+	}
+}

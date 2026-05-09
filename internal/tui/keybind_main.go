@@ -486,7 +486,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// that turned out to be a vncdotool keysym mis-mapping rather than
 	// a metis bug, but defense-in-depth here makes the contract
 	// explicit: only literal U+002F counts.
-	if len(val) > 0 && val[0] == '/' {
+	// Slash-command palette gating. Naive `val[0] == '/'` mis-fires on
+	// pasted absolute paths (`/Users/...`) — the palette pops up "no
+	// match for /Users/..." which is glaring noise. Real slash
+	// commands are `/<name>[ args]` where <name> is alphanum + underscore
+	// only; paths contain at least one more `/` before the first space.
+	// Discriminate on that: head-token (everything before first space)
+	// must NOT contain a second `/` to count as a slash command.
+	if len(val) > 0 && val[0] == '/' && !looksLikeSlashPath(val) {
 		m.showPalette = true
 		m.palFilter = val[1:]
 		m.matchCommands()

@@ -582,16 +582,44 @@ func Load() (*Config, []string, error) {
 	// `metis config init` from the XDG era wrote the old data paths into
 	// config.toml verbatim — so even after migrateLegacyHome() moves the
 	// files, the toml still points at the old location. Rewrite in-memory
-	// when (and only when) the value matches the legacy default exactly;
-	// users who pointed Session.Dir at a custom location keep theirs.
+	// when (and only when) the value matches a known legacy default
+	// exactly; users who pointed Session.Dir at a custom location keep
+	// theirs.
+	//
+	// Two legacy defaults are recognised:
+	//
+	//   1. ~/.local/share/metis/   — XDG-style under the new project name
+	//   2. ~/.local/share/delphi/  — XDG-style under the OLD project name
+	//                                (Metis was called "Delphi" before the
+	//                                2026-04-29 rename; users who ran
+	//                                `delphi config init` back then have
+	//                                this hardcoded in their config.toml)
+	//
+	// Without case (2) a long-time user's session/skill data ended up
+	// living at a delphi-named path forever — the rename migration never
+	// triggered because ~/.metis/ was non-empty (post-rename installs
+	// populate it). Bug audit 2026-05-09.
 	if home, err := os.UserHomeDir(); err == nil {
-		oldSessions := filepath.Join(home, ".local", "share", "metis", "sessions")
-		oldSkills := filepath.Join(home, ".local", "share", "metis", "skills")
-		if cfg.Session.Dir == oldSessions {
-			cfg.Session.Dir = filepath.Join(Home(), "sessions")
+		legacyDirs := []struct {
+			oldSessions string
+			oldSkills   string
+		}{
+			{
+				oldSessions: filepath.Join(home, ".local", "share", "metis", "sessions"),
+				oldSkills:   filepath.Join(home, ".local", "share", "metis", "skills"),
+			},
+			{
+				oldSessions: filepath.Join(home, ".local", "share", "delphi", "sessions"),
+				oldSkills:   filepath.Join(home, ".local", "share", "delphi", "skills"),
+			},
 		}
-		if cfg.Session.SkillDir == oldSkills {
-			cfg.Session.SkillDir = filepath.Join(Home(), "skills")
+		for _, ld := range legacyDirs {
+			if cfg.Session.Dir == ld.oldSessions {
+				cfg.Session.Dir = filepath.Join(Home(), "sessions")
+			}
+			if cfg.Session.SkillDir == ld.oldSkills {
+				cfg.Session.SkillDir = filepath.Join(Home(), "skills")
+			}
 		}
 	}
 	return cfg, loaded, nil

@@ -180,6 +180,22 @@ func (l *Loop) AppendUser(text string) {
 	})
 }
 
+// AppendUserBlocks adds a user message composed of arbitrary content
+// blocks — used by the TUI to attach pasted images alongside text.
+// Empty blocks input is ignored (avoids polluting the message log
+// with no-op user turns).
+func (l *Loop) AppendUserBlocks(blocks []llm.ContentBlock) {
+	if len(blocks) == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.Messages = append(l.Messages, llm.Message{
+		Role:    llm.RoleUser,
+		Content: blocks,
+	})
+}
+
 // SteerInject queues user text to be folded into the next iteration's
 // user message. Called from the TUI when the user types mid-turn (the
 // chat input stays unlocked while the agent is running, claude-code

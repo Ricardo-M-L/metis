@@ -83,3 +83,76 @@ func TestParse_UnknownCommand(t *testing.T) {
 		t.Error("unknown command should produce a help hint")
 	}
 }
+
+// TestParse_PastedPathFallsThrough — bug audit 2026-05-10 (image #15).
+// Pasted absolute paths (`/Users/...`, `/var/log/...`) start with `/`
+// but are NOT slash commands. Parse must return handled=false so the
+// caller can route them to the agent as plain prompt text. Without
+// this, the user pasting a path sees a glaring "unknown: /Users/...
+// — try /help" instead of the agent doing what they asked.
+func TestParse_PastedPathFallsThrough(t *testing.T) {
+	r := newRegistryWithBuiltins(t)
+	cases := []string{
+		"/Users/ricardo/Documents/foo",
+		"/var/log/syslog",
+		"/etc/passwd",
+		"/tmp/x.txt",
+		"/foo.bar baz",              // dotted name + args
+		"/Users/x/path with spaces", // path + later text
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			handled, display, sig, _ := r.Parse(in)
+			if handled {
+				t.Errorf("path-like input %q should NOT be handled as slash; display=%q", in, display)
+			}
+			if display != "" {
+				t.Errorf("path-like input should produce no display text; got %q", display)
+			}
+			if sig != SignalNone {
+				t.Errorf("path-like input should produce SignalNone; got %v", sig)
+			}
+		})
+	}
+}
+
+// TestParse_RealCommandsStillWork — regression guard so the path-detection
+// doesn't break legitimate slash commands.
+func TestParse_RealCommandsStillWork(t *testing.T) {
+	r := newRegistryWithBuiltins(t)
+	cases := []string{"/help", "/title my session", "/save", "/branch abc"}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			handled, _, _, _ := r.Parse(in)
+			if !handled {
+				t.Errorf("real command %q should be handled", in)
+			}
+		})
+	}
+}
+
+func TestIsCommandShape(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"help", true},
+		{"model", true},
+		{"cmd-with-dash", true},
+		{"cmd_with_underscore", true},
+		{"abc123", true},
+
+		{"", false},
+		{"Users/ricardo", false}, // contains /
+		{"foo.bar", false},       // contains .
+		{"foo bar", false},       // contains space
+		{"foo@host", false},      // contains @
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := IsCommandShape(tc.in); got != tc.want {
+				t.Errorf("IsCommandShape(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}

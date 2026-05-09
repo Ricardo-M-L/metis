@@ -14,17 +14,22 @@ import (
 // internal/version/version_test.go when shortSemver got promoted into
 // the version package.
 
-func TestPrettifyCwd_ExpandsHome(t *testing.T) {
+// TestPrettifyCwd_ReturnsAbsolutePath — user-facing change 2026-05-09:
+// the `~` substitution was making the home cwd visually invisible in
+// the welcome card (just a single tilde glyph). prettifyCwd now
+// returns the path verbatim so the user can always see exactly which
+// directory metis is operating from.
+func TestPrettifyCwd_ReturnsAbsolutePath(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Skip("UserHomeDir failed; can't test prettifier")
+		t.Skip("UserHomeDir failed")
 	}
 	cases := []struct {
 		in   string
 		want string
 	}{
-		{home, "~"},
-		{filepath.Join(home, "code", "metis"), "~" + string(filepath.Separator) + filepath.Join("code", "metis")},
+		{home, home},
+		{filepath.Join(home, "code", "metis"), filepath.Join(home, "code", "metis")},
 		{"/tmp", "/tmp"},
 		{"", ""},
 	}

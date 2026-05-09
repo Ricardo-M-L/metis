@@ -82,10 +82,34 @@ func (i *toolEventItem) Render(width int) string {
 	return rendered
 }
 
+// staticItem is a list.Item whose render is precomputed once per
+// buildChatItems call. Used for the welcome banner that we want to
+// scroll naturally with the transcript instead of disappearing the
+// moment the user types their first message.
+//
+// Width is intentionally ignored — the welcome banner sizes itself
+// against m.width at build time, and the list package re-builds items
+// when width changes (terminal resize triggers View() → buildChatItems).
+type staticItem struct {
+	rendered string
+}
+
+func (s *staticItem) Render(width int) string {
+	_ = width
+	return s.rendered
+}
+
 // buildChatItems composes a chronologically-ordered []list.Item from the
 // Model's messages and toolEvents. Same merge logic as `m.timeline()`
 // (sort by Timestamp / StartTime, stable order on ties), but produces
 // list-compatible items so the chat list can virtualize the render.
+//
+// The welcome banner is prepended as the first item so the brand strip
+// (ASCII bot + version + model + cwd) stays at the top of the
+// transcript and scrolls with the conversation, instead of being
+// replaced by the compact top-of-screen header strip the moment the
+// first message arrives. Mirrors claude-code's "banner is the first
+// thing in the chat history" pattern (user feedback 2026-05-09).
 //
 // Streaming text (m.streamingText / m.thinkingText) is intentionally
 // NOT included — those are rendered by View() in a separate "stream
@@ -93,7 +117,8 @@ func (i *toolEventItem) Render(width int) string {
 // invalidating the cached items above them in the transcript.
 func (m *Model) buildChatItems() []list.Item {
 	merged := m.timeline()
-	out := make([]list.Item, 0, len(merged))
+	out := make([]list.Item, 0, len(merged)+1)
+	out = append(out, &staticItem{rendered: m.renderWelcomeBannerNoHint()})
 	for _, it := range merged {
 		switch {
 		case it.msg != nil:

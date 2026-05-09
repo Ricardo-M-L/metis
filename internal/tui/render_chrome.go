@@ -34,11 +34,14 @@ func renderInputLine(m *Model) string {
 	if termW <= 0 {
 		termW = 80
 	}
-	const maxInputWidth = 100
+	// Input width = terminal - 4 (2 left padding, 2 right padding/cursor
+	// breathing room). No max-cap: the previous 100-char ceiling caused
+	// premature wrap on wide terminals when the user pasted CJK + paths
+	// (each CJK glyph is 2 cells, so a 50-char Chinese line already
+	// blows the cap). Wide terminals SHOULD fill, otherwise the user's
+	// pasted content wraps in awkward places (image #10 bug 2026-05-09).
+	// 20-cell floor keeps a sub-30-col terminal usable.
 	textareaW := termW - 4
-	if textareaW > maxInputWidth {
-		textareaW = maxInputWidth
-	}
 	if textareaW < 20 {
 		textareaW = 20
 	}

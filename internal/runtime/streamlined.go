@@ -40,7 +40,6 @@ var streamlinedTools = map[string]string{
 	"WebFetch":  "search",
 	"WebBrowse": "search",
 	"LSP":       "search",
-	"Search":    "search",
 	// read bucket
 	"Read": "read",
 	"LS":   "read",

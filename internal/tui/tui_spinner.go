@@ -87,7 +87,7 @@ var toolVerbs = map[string]string{
 	"Read": "reading", "Write": "writing", "Glob": "finding",
 	"Grep": "searching", "LS": "listing", "Bash": "executing",
 	"WebFetch": "fetching", "MCP": "calling", "Edit": "editing",
-	"Git": "git", "Search": "searching", "TodoWrite": "tracking",
+	"Git": "git", "WebSearch": "searching", "TodoWrite": "tracking",
 }
 
 func toolVerb(name string) string {

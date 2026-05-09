@@ -109,6 +109,13 @@ func (r *Registry) Get(name string) (*Cmd, bool) {
 // (false, "", SignalNone, "") otherwise. `args` is whatever followed the
 // command name on the input line — the runtime needs it for signals like
 // SignalTitle that carry a payload (`/title my session`).
+//
+// "Looks like a slash command" is more than `startsWith("/")` — pasted
+// absolute paths (`/Users/...`, `/var/log/...`) start with `/` but are
+// NOT commands, and surfacing "unknown: /Users/... — try /help" turns
+// the user's prompt into noise. We discriminate via IsCommandShape on
+// the head token; non-command shapes fall through to the agent as
+// plain prompt text. Bug audit 2026-05-10 (image #15).
 func (r *Registry) Parse(input string) (handled bool, display string, sig Signal, args string) {
 	input = strings.TrimSpace(input)
 	if !strings.HasPrefix(input, "/") {
@@ -116,12 +123,40 @@ func (r *Registry) Parse(input string) (handled bool, display string, sig Signal
 	}
 	input = input[1:]
 	name, rest, _ := cut(input, " ")
+	if !IsCommandShape(name) {
+		// Path-like or otherwise non-command — let the caller treat
+		// the original input as plain text.
+		return false, "", SignalNone, ""
+	}
 	c, ok := r.index[name]
 	if !ok {
 		return true, fmt.Sprintf("unknown: /%s — try /help", name), SignalNone, ""
 	}
 	d, s := c.Handler(rest)
 	return true, d, s, rest
+}
+
+// IsCommandShape reports whether name is a valid slash-command head:
+// 1+ chars from [A-Za-z0-9_-]. Empty name is rejected (a bare "/"
+// triggers the palette via a different code path, not Parse).
+//
+// Used by Parse + the TUI palette gate to keep the "is this a real
+// slash command?" rule in one place.
+func IsCommandShape(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // HelpText renders a column-aligned listing.

@@ -127,8 +127,13 @@ type oaiToolCall struct {
 }
 
 type oaiMessage struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
+	Role string `json:"role"`
+	// Content is `any` because OpenAI accepts EITHER a string (plain
+	// text — the historical 99% of metis traffic) OR a content-parts
+	// array `[{"type":"text",...},{"type":"image_url",...}]` for
+	// multimodal user turns. Marshalling distinguishes via the
+	// underlying type.
+	Content    any           `json:"content,omitempty"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 	Name       string        `json:"name,omitempty"`
@@ -152,6 +157,21 @@ type oaiMessage struct {
 	// ContentBlock type, then this field would round-trip the model's
 	// actual chain of thought instead of an empty string. Tracked.
 	ReasoningContent *string `json:"reasoning_content,omitempty"`
+}
+
+// oaiContentPart is one element of a multimodal user-message Content
+// array. Type is "text" or "image_url". OpenAI / DeepSeek / Moonshot
+// (Kimi) all accept this shape; vision-incapable models will simply
+// 400 — metis surfaces that as a turn-level error rather than
+// silently dropping pasted images.
+type oaiContentPart struct {
+	Type     string       `json:"type"`
+	Text     string       `json:"text,omitempty"`
+	ImageURL *oaiImageURL `json:"image_url,omitempty"`
+}
+
+type oaiImageURL struct {
+	URL string `json:"url"`
 }
 
 type oaiReq struct {
@@ -213,10 +233,17 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 	for _, m := range req.Messages {
 		switch m.Role {
 		case RoleUser:
-			// User message can contain text + tool_results (we represent tool_results
-			// as separate role="tool" messages in OpenAI dialect).
+			// User message can contain text + tool_results + images.
+			// tool_results split off into role="tool" messages (OpenAI
+			// dialect). text + images compose into the user message
+			// itself — when images are present we emit a content-parts
+			// array so OpenAI / DeepSeek / Kimi vision models can see
+			// them; when there are NO images we keep the historical
+			// string-content shape (cheaper to parse, every provider
+			// accepts it).
 			var text strings.Builder
 			var toolMsgs []oaiMessage
+			var images []oaiContentPart
 			for _, c := range m.Content {
 				switch c.Type {
 				case "text":
@@ -228,12 +255,26 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 					toolMsgs = append(toolMsgs, oaiMessage{
 						Role: "tool", ToolCallID: c.ToolUseID, Content: c.ToolResult,
 					})
+				case "image":
+					images = append(images, oaiContentPart{
+						Type: "image_url",
+						ImageURL: &oaiImageURL{
+							URL: "data:" + c.MediaType + ";base64," + c.Data,
+						},
+					})
 				}
 			}
 			// IMPORTANT: tool messages must come BEFORE the next user text in OpenAI's
 			// turn-taking model. We emit tool messages first, then any user text.
 			out.Messages = append(out.Messages, toolMsgs...)
-			if text.Len() > 0 {
+			if len(images) > 0 {
+				parts := make([]oaiContentPart, 0, 1+len(images))
+				if text.Len() > 0 {
+					parts = append(parts, oaiContentPart{Type: "text", Text: text.String()})
+				}
+				parts = append(parts, images...)
+				out.Messages = append(out.Messages, oaiMessage{Role: "user", Content: parts})
+			} else if text.Len() > 0 {
 				out.Messages = append(out.Messages, oaiMessage{Role: "user", Content: text.String()})
 			}
 		case RoleAssistant:
@@ -290,8 +331,11 @@ func fromOpenAIChoice(c oaiChoice, usage struct {
 		InputTokens:  usage.PromptTokens,
 		OutputTokens: usage.CompletionTokens,
 	}
-	if c.Message.Content != "" {
-		out.Content = append(out.Content, ContentBlock{Type: "text", Text: c.Message.Content})
+	// oaiMessage.Content is `any` (request side may be string OR
+	// content-parts array for multimodal user turns). The response
+	// side always carries a string, so assert and skip on mismatch.
+	if str, ok := c.Message.Content.(string); ok && str != "" {
+		out.Content = append(out.Content, ContentBlock{Type: "text", Text: str})
 	}
 	for _, tc := range c.Message.ToolCalls {
 		var input map[string]any
@@ -523,8 +567,12 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 		// Each chunk may contain multiple of these — enqueue all, return first.
 		if len(env.Choices) > 0 {
 			ch := env.Choices[0]
-			if ch.Delta.Content != "" {
-				s.pending = append(s.pending, StreamEvent{Type: "text_delta", TextDelta: ch.Delta.Content})
+			// Stream delta content is always a string in OpenAI SSE
+			// (assistants never stream images). Type-assert to string;
+			// ignore non-string values (defensive — a vendor extension
+			// could ship structured deltas).
+			if str, ok := ch.Delta.Content.(string); ok && str != "" {
+				s.pending = append(s.pending, StreamEvent{Type: "text_delta", TextDelta: str})
 			}
 			for _, tc := range ch.Delta.ToolCalls {
 				idx := s.resolveToolCallIdx(tc)
