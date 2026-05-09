@@ -192,6 +192,43 @@ func TestDumpTransport_BodyPreserved(t *testing.T) {
 	}
 }
 
+// TestDumpTransport_RedactsBodyTokens locks in the security.Redact
+// integration: when the model exchange body contains a real-shaped
+// secret (Anthropic key, GitHub PAT, OAuth access_token field), the
+// dump file must NOT contain the secret value. Surrounding JSON
+// structure must survive so the file is still valid JSONL.
+func TestDumpTransport_RedactsBodyTokens(t *testing.T) {
+	path := setupDumpTest(t)
+	stub := &stubRT{}
+	rt := WrapRoundTripper(stub, "p", nil)
+
+	// Realistic-shape secrets the model could see / send.
+	pat := "ghp_" + strings.Repeat("a", 36)
+	body := `{"system":"you have key sk-` + "ant-api03-" + strings.Repeat("X", 93) + `AA","tools":[{"input":{"token":"` + pat + `"}}],"access_token":"oauth-secret-12345"}`
+	req, _ := http.NewRequestWithContext(context.Background(), "POST", "https://x/y", bytes.NewReader([]byte(body)))
+	if _, err := rt.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	entries := drainDumpFile(t, path, 2)
+	for _, e := range entries {
+		if e.Type != "request" {
+			continue
+		}
+		raw := string(e.Body)
+		if strings.Contains(raw, pat) {
+			t.Errorf("GitHub PAT leaked into dump: %s", raw)
+		}
+		if strings.Contains(raw, "oauth-secret-12345") {
+			t.Errorf("OAuth access_token leaked into dump: %s", raw)
+		}
+		// "[REDACTED]" should appear at least twice (once for the
+		// token, once for the access_token JSON value).
+		if strings.Count(raw, "[REDACTED]") < 2 {
+			t.Errorf("expected ≥ 2 [REDACTED] markers, got body: %s", raw)
+		}
+	}
+}
+
 func TestDumpTransport_SSEParsing(t *testing.T) {
 	path := setupDumpTest(t)
 	sseBody := strings.Join([]string{

@@ -38,6 +38,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/security"
 )
 
 // dumpTransport is the RoundTripper that writes the JSONL.
@@ -270,24 +272,29 @@ func redactHeaders(h http.Header) map[string]any {
 }
 
 // jsonOrRaw returns the body as parsed JSON (so jq users get a
-// pretty AST) or as a string fallback when parsing fails.
+// pretty AST) or as a string fallback when parsing fails. Always
+// runs security.Redact first so secret-bearing fields (Authorization
+// bearer tokens, OAuth access_token, GitHub PATs, etc.) never land
+// on disk in the clear. Redact preserves JSON structure — it only
+// rewrites string values and the surrounding bytes survive intact,
+// so json.Valid still answers true on the redacted form.
 func jsonOrRaw(b []byte) json.RawMessage {
 	if len(b) == 0 {
 		return nil
 	}
-	// Validate JSON cheaply — Decoder.Decode is faster than
-	// Unmarshal for this purpose.
-	if json.Valid(b) {
-		return json.RawMessage(b)
+	red := security.Redact(string(b))
+	if json.Valid([]byte(red)) {
+		return json.RawMessage(red)
 	}
-	// Wrap as a quoted string so the line is still valid JSONL.
-	encoded, _ := json.Marshal(string(b))
+	encoded, _ := json.Marshal(red)
 	return json.RawMessage(encoded)
 }
 
 // sseChunksToJSON parses an SSE byte stream into [{event:..., data:...}]
 // for replay-friendly storage. Errors during parse fall back to the
-// raw bytes wrapped in a string.
+// raw bytes wrapped in a string. Each `data:` payload is run through
+// security.Redact so SSE-streamed bearer tokens (rare but possible —
+// some providers echo OAuth state in error events) don't leak to disk.
 func sseChunksToJSON(raw []byte) json.RawMessage {
 	type chunk struct {
 		Event string          `json:"event,omitempty"`
@@ -308,13 +315,17 @@ func sseChunksToJSON(raw []byte) json.RawMessage {
 		if len(data) == 0 && event == "" {
 			continue
 		}
+		// Redact before deciding json.Valid — Redact preserves JSON
+		// structure (only string values get rewritten), so the
+		// validity check still answers correctly.
+		dataS := security.Redact(string(data))
 		// `data: [DONE]` is OpenAI's stream terminator — store as a
 		// string, not JSON, since [DONE] isn't valid JSON.
 		var raw json.RawMessage
-		if json.Valid(data) {
-			raw = json.RawMessage(data)
+		if json.Valid([]byte(dataS)) {
+			raw = json.RawMessage(dataS)
 		} else {
-			s, _ := json.Marshal(string(data))
+			s, _ := json.Marshal(dataS)
 			raw = json.RawMessage(s)
 		}
 		chunks = append(chunks, chunk{Event: event, Data: raw})
