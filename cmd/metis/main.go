@@ -210,19 +210,20 @@ Env:
 // --- runtime wiring shared between chat and run ---
 
 type runtime struct {
-	cfg         *config.Config
-	provider    llm.Provider
-	registry    *tools.Registry
-	gate        *permission.Gate
-	store       *session.Store
-	sessionID   string
-	loop        *agent.Loop
-	useMD       bool
-	showTok     bool
-	model       string
-	mcpServers  []*mcptools.Server
-	plugins     *rtpkg.PluginRegistry // nil when no plugins installed
-	allowedDirs *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
+	cfg               *config.Config
+	provider          llm.Provider
+	registry          *tools.Registry
+	gate              *permission.Gate
+	store             *session.Store
+	sessionID         string
+	sessionPointerCwd string // cwd used to key the crash-recovery pointer; empty if write failed at boot
+	loop              *agent.Loop
+	useMD             bool
+	showTok           bool
+	model             string
+	mcpServers        []*mcptools.Server
+	plugins           *rtpkg.PluginRegistry // nil when no plugins installed
+	allowedDirs       *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
 }
 
 // Cleanup closes any subprocesses or connections owned by the runtime.
@@ -235,6 +236,13 @@ func (r *runtime) Cleanup() {
 	if r.plugins != nil {
 		_ = r.plugins.Close()
 		r.plugins = nil
+	}
+	// Clear the crash-recovery pointer on clean shutdown — its
+	// continued presence would re-prompt "found a recent session" on
+	// next startup. Only crashes / kill -9 leave the pointer behind.
+	if r.sessionPointerCwd != "" {
+		_ = session.ClearPointer(r.sessionPointerCwd)
+		r.sessionPointerCwd = ""
 	}
 }
 
@@ -750,6 +758,21 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// internal/tasks package (not runtime) to break an otherwise
 	// circular import (tools/builtin → runtime → tools/builtin).
 	taskstore.SetCurrentTaskStore(rt.sessionID)
+	// Crash-recovery pointer (#27 / claude-code-sourcemap bridgePointer):
+	// write a per-cwd pointer file ~/.metis/session-pointers/<sha8(cwd)>.json
+	// so a future startup can detect "you had a session live N minutes ago,
+	// resume it?" Best-effort throughout — a write/heartbeat failure must
+	// never crash the agent, so errors are intentionally swallowed.
+	if cwd, err := os.Getwd(); err == nil {
+		_ = session.WritePointer(rt.sessionID, cwd)
+		// Heartbeat goroutine bumps mtime every HeartbeatInterval until
+		// the parent ctx is cancelled (signal.NotifyContext catches
+		// SIGINT/SIGTERM). Only crashes / kill -9 leave the pointer
+		// behind for the next startup to detect — graceful shutdown
+		// goes through runtime.Cleanup → session.ClearPointer.
+		session.StartHeartbeat(ctx, rt.sessionID, cwd)
+		rt.sessionPointerCwd = cwd
+	}
 
 	// Push UI performance tunables into the TUI package so its per-tick
 	// helpers (tickInterval / eventBufferSize / mouseWheelLines) read
