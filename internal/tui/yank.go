@@ -107,15 +107,38 @@ func formatPreviewForLog(s string) string {
 // writeClipboard emits the OSC 52 sequence to stdout AND writes a
 // fallback file. Best-effort throughout; we never error the chat
 // surface for a clipboard hiccup.
+//
+// Terminator + tmux handling matches claude-code-sourcemap's
+// `restored-src/src/ink/termio/osc.ts::setClipboard`:
+//
+//   - Pick BEL (`\x07`) by default, ST (`\x1b\\`) for Kitty (which
+//     silently drops BEL-terminated OSCs).
+//   - When inside tmux ($TMUX set) or screen ($STY set), wrap the
+//     OSC 52 in a DCS passthrough envelope `\x1bPtmux;\x1b<inner>\x1b\\`
+//     and DOUBLE every ESC byte inside the payload — tmux's DCS
+//     parser uses ESC as a delimiter so a literal ESC in the inner
+//     payload would terminate the wrapper early and corrupt downstream
+//     bytes. opencode's simpler version skipped this step and silently
+//     truncated payloads containing ESC.
 func writeClipboard(text string) {
 	if text == "" {
 		return
 	}
 	enc := base64.StdEncoding.EncodeToString([]byte(text))
-	// `\x1b]52;c;<b64>\x07` — `c` selects the regular clipboard
-	// register (vs primary `p`). BEL (\x07) terminator is more
-	// portable than ST (\x9c / \x1b\\).
-	fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\x07", enc)
+
+	// Build the bare OSC 52. `c` selects the regular clipboard
+	// register (vs primary `p`).
+	terminator := "\x07"
+	if PreferSTTerminator() {
+		terminator = "\x1b\\"
+	}
+	bare := "\x1b]52;c;" + enc + terminator
+
+	// wrapForMultiplexer (notify.go) handles tmux DCS passthrough +
+	// ESC doubling + screen DCS — same envelope OSC 9;4 progress
+	// uses, kept in one place.
+	fmt.Fprint(os.Stdout, wrapForMultiplexer(bare))
+
 	// Fallback file: lets the user `cat ~/.metis/clipboard.txt | pbcopy`
 	// when the terminal eats OSC 52. Truncated to 64 KiB so a runaway
 	// paste doesn't fill disk.
@@ -129,6 +152,7 @@ func writeClipboard(text string) {
 		_ = os.WriteFile(path, []byte(body), 0o600)
 	}
 }
+
 
 // osc52Status returns a single-word hint about whether the OSC 52
 // escape is likely to land. iTerm2 / kitty / WezTerm / Alacritty /
