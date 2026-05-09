@@ -82,6 +82,9 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// Agent tool: needs the provider + registry references that
 	// builtin.Register doesn't see.
 	reg.Register(builtin.NewAgentWithMinimal(opts.Gate, opts.Provider, reg, opts.Model, opts.System, opts.MinimalSystem))
+	// Fork tool: same wiring as Agent, different semantics — child
+	// inherits parent history+system instead of starting cold.
+	reg.Register(builtin.NewFork(opts.Gate, opts.Provider, reg))
 	// SendMessage tool: lit only when at least one channel adapter is
 	// configured. We always register it though — its description will
 	// just say "no channels available" until one is wired.

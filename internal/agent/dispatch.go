@@ -305,6 +305,17 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// Tag ctx with the parent's event out-channel so sub-tools (Agent)
 	// can forward intermediate events for live UI updates.
 	toolCtx := WithEventOut(ctx, out)
+	// And the parent's conversation snapshot so the Fork tool can
+	// spawn a child loop that inherits parent history+system. Pure
+	// read pattern — Fork copies what it needs and never mutates back.
+	l.mu.RLock()
+	snap := ParentSnapshot{
+		Messages: l.Messages,
+		System:   l.System,
+		Model:    l.Model,
+	}
+	l.mu.RUnlock()
+	toolCtx = WithParentSnapshot(toolCtx, snap)
 
 	// Honor InterruptBlock: tools that declare InterruptBlock want to
 	// finish their current invocation even if the parent ctx gets

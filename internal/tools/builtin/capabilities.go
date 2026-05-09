@@ -92,6 +92,10 @@ func (Git) IsReadOnly(map[string]any) bool { return false }
 // needs verbatim later.
 func (Agent) IsReadOnly(map[string]any) bool { return false }
 
+// Fork is the warm-start variant of Agent — same caveat applies:
+// can't statically know what the child did, so not read-only.
+func (Fork) IsReadOnly(map[string]any) bool { return false }
+
 // --- interaction-required ----------------------------------------------
 
 // AskUser exists specifically to wait for human input. Even mode

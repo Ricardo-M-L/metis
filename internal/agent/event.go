@@ -1,6 +1,10 @@
 package agent
 
-import "context"
+import (
+	"context"
+
+	"github.com/Ricardo-M-L/metis/internal/llm"
+)
 
 // EventKind enumerates the event types emitted by the agent loop.
 //
@@ -88,6 +92,47 @@ func WithEventOut(ctx context.Context, ch chan<- Event) context.Context {
 func EventOutFromContext(ctx context.Context) chan<- Event {
 	if v, ok := ctx.Value(eventOutKey{}).(chan<- Event); ok {
 		return v
+	}
+	return nil
+}
+
+// parentSnapshotKey carries a copy of the parent loop's conversation
+// state down to tools so a "fork" tool can spawn a child loop that
+// inherits the full context. Without this snapshot, a sub-agent
+// starts cold (empty history, fresh system prompt — no shared state),
+// which is fine for crush-style agentic_fetch but wrong for the
+// claude-code "fork to continue this work" pattern.
+type parentSnapshotKey struct{}
+
+// ParentSnapshot is what Fork sees about its parent. Cloned at
+// dispatch time so a tool that takes ages to run can't observe a
+// later-mutated parent message slice (the parent can keep going
+// with subsequent turns while Fork is still processing).
+type ParentSnapshot struct {
+	Messages []llm.Message
+	System   string
+	Model    string
+}
+
+// WithParentSnapshot tags ctx with a defensive copy of the parent
+// loop's history+system+model. Called by dispatch.go right before
+// every tool.Execute so any tool that needs parent context can
+// pull it from the context key.
+func WithParentSnapshot(ctx context.Context, snap ParentSnapshot) context.Context {
+	// Defensive copy of the messages slice — tools can't mutate the
+	// parent's live history through this snapshot.
+	cp := make([]llm.Message, len(snap.Messages))
+	copy(cp, snap.Messages)
+	snap.Messages = cp
+	return context.WithValue(ctx, parentSnapshotKey{}, snap)
+}
+
+// ParentSnapshotFromContext returns the parent loop snapshot when
+// dispatch attached one, or nil otherwise. Tools called outside a
+// loop (e.g. from CLI testing) get nil and must handle it.
+func ParentSnapshotFromContext(ctx context.Context) *ParentSnapshot {
+	if v, ok := ctx.Value(parentSnapshotKey{}).(ParentSnapshot); ok {
+		return &v
 	}
 	return nil
 }
