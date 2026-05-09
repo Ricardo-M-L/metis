@@ -537,6 +537,75 @@ func TestWebFetch_RejectsNonHTTP(t *testing.T) {
 	}
 }
 
+// TestWebFetch_BlocksMetadataIP locks in the SSRF guard end-to-end.
+// Without the dialer wrap a malicious / model-controlled URL pointing
+// at 169.254.169.254 (EC2 / GCE metadata) could exfiltrate IAM creds.
+// The default WebFetch http.Client must wire security.GuardedDialContext
+// so the dialer refuses before any TCP connect.
+//
+// We pass nil w.http so Execute builds the default client (the guarded
+// one). Tests that pass their own w.http skip the guard, which is the
+// whole reason TestWebFetch_HappyPath above needs httptest server +
+// loopback (loopback is allowed).
+func TestWebFetch_BlocksMetadataIP(t *testing.T) {
+	wf := WebFetch{gate: bypassGate()} // http nil → guarded default
+	res, err := wf.Execute(context.Background(), map[string]any{
+		"url":        "http://169.254.169.254/latest/meta-data/",
+		"timeout_ms": 2000,
+	})
+	if err != nil {
+		t.Fatalf("guard should surface as IsError result, not raw error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected IsError, got: %+v", res)
+	}
+	if !strings.Contains(res.Output, "ssrf") && !strings.Contains(res.Output, "blocked") {
+		t.Errorf("expected ssrf/blocked in output, got: %q", res.Output)
+	}
+	// 169.254.169.254 should appear in the message so the user knows
+	// what was rejected.
+	if !strings.Contains(res.Output, "169.254.169.254") {
+		t.Errorf("expected resolved IP in error message, got: %q", res.Output)
+	}
+}
+
+func TestWebFetch_BlocksRFC1918(t *testing.T) {
+	wf := WebFetch{gate: bypassGate()}
+	res, err := wf.Execute(context.Background(), map[string]any{
+		"url":        "http://10.0.0.5:8080/admin",
+		"timeout_ms": 2000,
+	})
+	if err != nil {
+		t.Fatalf("expected IsError result, not raw error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected IsError, got: %+v", res)
+	}
+}
+
+func TestWebFetch_AllowsLoopback(t *testing.T) {
+	// Loopback is the explicit allow-case — local dev servers + hook
+	// receivers MUST keep working. Use httptest's default loopback
+	// listener and verify the guarded dialer doesn't reject it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("loopback ok"))
+	}))
+	defer srv.Close()
+
+	wf := WebFetch{gate: bypassGate()} // http nil → guarded default
+	res, err := wf.Execute(context.Background(), map[string]any{"url": srv.URL})
+	if err != nil {
+		t.Fatalf("loopback must work through guard: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("loopback should not be blocked: %+v", res)
+	}
+	if !strings.Contains(res.Output, "loopback ok") {
+		t.Errorf("body missing: %q", res.Output)
+	}
+}
+
 func TestWebFetch_Truncates(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(strings.Repeat("X", 5000)))

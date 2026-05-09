@@ -3,12 +3,14 @@ package builtin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -56,7 +58,17 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 
 	client := w.http
 	if client == nil {
-		client = &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
+		// Default client wires the SSRF guard into the dialer (see
+		// internal/security/ssrf.go) so model-controlled URLs can't
+		// reach RFC1918 / link-local / cloud-metadata IPs. Loopback
+		// (127.0.0.0/8, ::1) stays allowed for local dev. Tests that
+		// pass their own w.http skip the guard intentionally.
+		client = &http.Client{
+			Timeout: time.Duration(timeoutMs) * time.Millisecond,
+			Transport: &http.Transport{
+				DialContext: security.GuardedDialContext,
+			},
+		}
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
@@ -68,6 +80,17 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	req.Header.Set("User-Agent", "metis/0.1 (+local)")
 	resp, err := client.Do(req)
 	if err != nil {
+		// Clean up the SSRF block message — the wrapped DNSError /
+		// net.OpError makes it noisy. errors.Is unwraps to ErrBlocked.
+		if errors.Is(err, security.ErrBlocked) {
+			var be *security.BlockedError
+			if errors.As(err, &be) {
+				return &tools.Result{
+					Output:  fmt.Sprintf("WebFetch blocked: %s", be.Error()),
+					IsError: true,
+				}, nil
+			}
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
