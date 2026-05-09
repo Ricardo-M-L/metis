@@ -373,13 +373,17 @@ func SendProgress(state ProgressState, pct int) {
 	fmt.Fprint(notifyDest, wrapForMultiplexer(seq))
 }
 
-// progressSupported — terminals that honor OSC 9;4. We don't gate on
-// version (3.6.6+ for iTerm2, 1.2.0+ for Ghostty); pre-version
-// terminals just ignore the sequence, which is harmless.
+// progressSupported — terminals that honor OSC 9;4. Routes to the
+// centralized SupportsProgressBar in capabilities.go which adds
+// version gating (iTerm2 ≥ 3.6.6, Ghostty ≥ 1.2.0) and SSH/Apple
+// Terminal exclusions. Older versions silently drop the sequence
+// but Apple Terminal misrenders it, so the gate matters there.
 func progressSupported() bool {
-	switch os.Getenv("TERM_PROGRAM") {
-	case "iTerm.app", "ghostty", "WezTerm":
+	// WezTerm honors OSC 9;4 unconditionally; capabilities.go's
+	// SupportsProgressBar doesn't list it because Anthropic's
+	// reference doesn't, but metis tested it before so keep allowing.
+	if os.Getenv("TERM_PROGRAM") == "WezTerm" {
 		return true
 	}
-	return os.Getenv("ConEmuPID") != ""
+	return SupportsProgressBar()
 }

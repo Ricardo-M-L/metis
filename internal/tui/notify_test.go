@@ -417,8 +417,12 @@ func TestSendProgress_NoOpOnUnsupportedTerminal(t *testing.T) {
 }
 
 func TestSendProgress_RunningEmitsCorrectShape(t *testing.T) {
+	if !IsTerminal() {
+		t.Skip("not a TTY")
+	}
 	clearTerminalEnv(t)
 	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("TERM_PROGRAM_VERSION", "3.6.6")
 	buf := captureNotify(t)
 
 	SendProgress(ProgressRunning, 42)
@@ -430,8 +434,12 @@ func TestSendProgress_RunningEmitsCorrectShape(t *testing.T) {
 }
 
 func TestSendProgress_ClearEmpty(t *testing.T) {
+	if !IsTerminal() {
+		t.Skip("not a TTY")
+	}
 	clearTerminalEnv(t)
 	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("TERM_PROGRAM_VERSION", "3.6.6")
 	buf := captureNotify(t)
 
 	SendProgress(ProgressClear, 0)
@@ -442,8 +450,12 @@ func TestSendProgress_ClearEmpty(t *testing.T) {
 }
 
 func TestSendProgress_ClampsPctToRange(t *testing.T) {
+	if !IsTerminal() {
+		t.Skip("not a TTY")
+	}
 	clearTerminalEnv(t)
 	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("TERM_PROGRAM_VERSION", "3.6.6")
 	buf := captureNotify(t)
 
 	SendProgress(ProgressRunning, 250) // out-of-range, should clamp to 100
@@ -454,8 +466,12 @@ func TestSendProgress_ClampsPctToRange(t *testing.T) {
 }
 
 func TestSendProgress_IndeterminateNoPct(t *testing.T) {
+	if !IsTerminal() {
+		t.Skip("not a TTY")
+	}
 	clearTerminalEnv(t)
 	t.Setenv("TERM_PROGRAM", "ghostty")
+	t.Setenv("TERM_PROGRAM_VERSION", "1.2.0")
 	buf := captureNotify(t)
 
 	SendProgress(ProgressIndeterminate, 0)
