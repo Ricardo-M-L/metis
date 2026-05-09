@@ -6,7 +6,6 @@
 package openai
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -18,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
@@ -409,8 +409,8 @@ func (o *OpenAI) setHeaders(r *http.Request) {
 // --- SSE stream ---
 
 type openAIStream struct {
-	body    io.ReadCloser
-	scanner *bufio.Scanner
+	body io.ReadCloser
+	sse  *sse.Reader
 	// per-tool-call accumulator keyed by index
 	calls        map[int]*oaiCallAccum
 	emittedStart map[int]bool
@@ -433,11 +433,9 @@ type oaiCallAccum struct {
 }
 
 func newOpenAIStream(body io.ReadCloser) *openAIStream {
-	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	return &openAIStream{
 		body:         body,
-		scanner:      sc,
+		sse:          sse.NewReader(body),
 		calls:        make(map[int]*oaiCallAccum),
 		emittedStart: make(map[int]bool),
 		idToIdx:      make(map[string]int),
@@ -482,15 +480,15 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 		}
 		return ev, nil
 	}
-	for s.scanner.Scan() {
-		line := s.scanner.Text()
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
+	for {
+		frame, err := s.sse.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return StreamEvent{Type: "message_stop"}, io.EOF
+			}
+			return StreamEvent{Type: "error", Err: err}, err
 		}
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimPrefix(line, "data: ")
+		payload := frame.Data
 		if dbgOpenAI {
 			fmt.Fprintf(os.Stderr, "[oai] raw=%s\n", payload)
 		}
@@ -574,11 +572,8 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 		if len(s.pending) > 0 {
 			return s.popPending()
 		}
+		// Frame had no usable content (e.g. heartbeat) — keep reading.
 	}
-	if err := s.scanner.Err(); err != nil {
-		return StreamEvent{Type: "error", Err: err}, err
-	}
-	return StreamEvent{Type: "message_stop"}, io.EOF
 }
 
 func (s *openAIStream) popPending() (StreamEvent, error) {

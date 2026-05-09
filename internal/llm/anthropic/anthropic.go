@@ -7,7 +7,6 @@
 package anthropic
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -19,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
@@ -723,8 +723,8 @@ func (a *Anthropic) setHeaders(r *http.Request) {
 // --- SSE stream ---
 
 type anthropicStream struct {
-	body    io.ReadCloser
-	scanner *bufio.Scanner
+	body io.ReadCloser
+	sse  *sse.Reader
 	// transient state for tool_use blocks (we accumulate input_json_delta)
 	currentBlocks map[int]*streamBlock
 }
@@ -737,11 +737,9 @@ type streamBlock struct {
 }
 
 func newAnthropicStream(body io.ReadCloser) *anthropicStream {
-	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	return &anthropicStream{
 		body:          body,
-		scanner:       sc,
+		sse:           sse.NewReader(body),
 		currentBlocks: make(map[int]*streamBlock),
 	}
 }
@@ -749,16 +747,16 @@ func newAnthropicStream(body io.ReadCloser) *anthropicStream {
 func (s *anthropicStream) Close() error { return s.body.Close() }
 
 func (s *anthropicStream) Recv() (StreamEvent, error) {
-	for s.scanner.Scan() {
-		line := s.scanner.Text()
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
+	for {
+		frame, err := s.sse.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return StreamEvent{Type: "message_stop"}, io.EOF
+			}
+			return StreamEvent{Type: "error", Err: err}, err
 		}
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimPrefix(line, "data: ")
-		if payload == "[DONE]" {
+		// Anthropic's `[DONE]` sentinel ends the stream cleanly.
+		if frame.Data == "[DONE]" {
 			return StreamEvent{Type: "message_stop"}, io.EOF
 		}
 
@@ -775,7 +773,7 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			} `json:"usage"`
 		}
-		if err := json.Unmarshal([]byte(payload), &env); err != nil {
+		if err := json.Unmarshal([]byte(frame.Data), &env); err != nil {
 			continue
 		}
 
@@ -871,11 +869,8 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 		case "message_stop":
 			return StreamEvent{Type: "message_stop"}, io.EOF
 		case "error":
-			return StreamEvent{Type: "error", Err: errors.New(string(payload))}, nil
+			return StreamEvent{Type: "error", Err: errors.New(frame.Data)}, nil
 		}
+		// Unknown event type — keep reading.
 	}
-	if err := s.scanner.Err(); err != nil {
-		return StreamEvent{Type: "error", Err: err}, err
-	}
-	return StreamEvent{Type: "message_stop"}, io.EOF
 }

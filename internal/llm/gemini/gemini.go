@@ -5,7 +5,6 @@
 package gemini
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
@@ -395,8 +395,8 @@ func mapGeminiStopReason(r string) string {
 // --- streaming SSE reader ---
 
 type geminiStream struct {
-	body    io.ReadCloser
-	scanner *bufio.Scanner
+	body io.ReadCloser
+	sse  *sse.Reader
 	// idCounter generates synthetic tool_use ids since Gemini's
 	// functionCall has no id field. Each tool_use_start emits a fresh
 	// "gem_<n>" so multiple parallel calls in one chunk don't collide.
@@ -411,9 +411,7 @@ type geminiStream struct {
 }
 
 func newGeminiStream(body io.ReadCloser) *geminiStream {
-	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	return &geminiStream{body: body, scanner: sc}
+	return &geminiStream{body: body, sse: sse.NewReader(body)}
 }
 
 func (s *geminiStream) Close() error { return s.body.Close() }
@@ -427,12 +425,21 @@ func (s *geminiStream) Recv() (StreamEvent, error) {
 	if s.done {
 		return StreamEvent{}, io.EOF
 	}
-	for s.scanner.Scan() {
-		line := s.scanner.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	for {
+		frame, err := s.sse.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// Clean stream end without explicit message_stop —
+				// emit one and flip `done` so further Recv returns EOF.
+				s.done = true
+				return StreamEvent{Type: "message_stop"}, nil
+			}
+			return StreamEvent{}, err
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		// sse.Reader already trims spec-mandated single leading space;
+		// some Gemini gateways add extra spaces around the JSON, so
+		// be generous when checking for empty.
+		payload := strings.TrimSpace(frame.Data)
 		if payload == "" {
 			continue
 		}
@@ -447,15 +454,6 @@ func (s *geminiStream) Recv() (StreamEvent, error) {
 			return ev, nil
 		}
 	}
-	if err := s.scanner.Err(); err != nil {
-		if errors.Is(err, io.EOF) {
-			return StreamEvent{}, io.EOF
-		}
-		return StreamEvent{}, err
-	}
-	// scanner finished without error — clean stream end.
-	s.done = true
-	return StreamEvent{Type: "message_stop"}, nil
 }
 
 // queueChunk fans one Gemini SSE chunk out into the linear StreamEvent
