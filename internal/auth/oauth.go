@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -45,6 +46,14 @@ type OAuthProvider struct {
 	UsePKCE         bool     // if true, send PKCE challenge (most modern providers)
 	ExtraParams     map[string]string
 	HeaderTokenType string // typically "Bearer"
+
+	// ManualRedirectURL — if set, enables "manual paste" mode for
+	// non-browser environments (SSH, headless, locked-down corp). When
+	// the user passes --manual the auth URL is built with this as the
+	// redirect_uri instead of localhost; the provider then displays the
+	// auth code on a static page and the user pastes it back to the
+	// terminal. Mirrors claude-code-sourcemap's MANUAL_REDIRECT_URL.
+	ManualRedirectURL string
 }
 
 // KnownProviders ships ready-to-use configs for common providers.
@@ -59,6 +68,36 @@ var KnownProviders = map[string]OAuthProvider{
 		UsePKCE:         true,
 		HeaderTokenType: "Bearer",
 	},
+	// Anthropic Console — the standard developer OAuth path. Endpoints
+	// + CLIENT_ID transcribed verbatim from claude-code-sourcemap
+	// `restored-src/src/constants/oauth.ts:86-99`. The CONSOLE_*
+	// pair (vs CLAUDE_AI_*) is the API-user path; claude.ai
+	// subscribers can override via the `anthropic-claudeai` provider
+	// below.
+	"anthropic": {
+		Name:              "anthropic",
+		AuthURL:           "https://platform.claude.com/oauth/authorize",
+		TokenURL:          "https://platform.claude.com/v1/oauth/token",
+		ClientID:          "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		Scopes:            []string{"org:create_api_key", "user:profile", "user:inference"},
+		UsePKCE:           true,
+		HeaderTokenType:   "Bearer",
+		ManualRedirectURL: "https://platform.claude.com/oauth/code/callback",
+	},
+	// Anthropic Claude.ai — for users who pay through claude.ai (Pro /
+	// Max / Teams). Different authorize URL but same token endpoint
+	// + CLIENT_ID. Adds the inference-bearing scope so the returned
+	// token can call /v1/messages directly.
+	"anthropic-claudeai": {
+		Name:              "anthropic-claudeai",
+		AuthURL:           "https://claude.com/cai/oauth/authorize",
+		TokenURL:          "https://platform.claude.com/v1/oauth/token",
+		ClientID:          "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		Scopes:            []string{"user:inference"},
+		UsePKCE:           true,
+		HeaderTokenType:   "Bearer",
+		ManualRedirectURL: "https://platform.claude.com/oauth/code/callback",
+	},
 	// gitlab / slack / discord can be added by users via the
 	// override file — kept out of defaults to avoid a giant table
 	// that few users will touch.
@@ -71,34 +110,116 @@ var KnownProviders = map[string]OAuthProvider{
 //
 // Returns the access token (also persisted) so callers that want to
 // use it immediately don't need a second auth.Get() round-trip.
+//
+// Equivalent to OAuthLoginOpts(provider, OAuthOptions{}). For manual
+// (non-browser) flows, paste-from-stdin, or programmatic paste-via-
+// hook, use OAuthLoginOpts directly.
 func OAuthLogin(provider string) (string, error) {
+	tok, err := OAuthLoginOpts(provider, OAuthOptions{})
+	if err != nil {
+		return "", err
+	}
+	return tok.AccessToken, nil
+}
+
+// OAuthOptions tunes the OAuth flow. All fields are optional — the
+// zero value matches the original "open browser, listen on localhost"
+// flow that OAuthLogin has always done.
+type OAuthOptions struct {
+	// Manual disables the localhost callback listener. Instead, the
+	// auth URL is built with the provider's ManualRedirectURL (which
+	// the provider then displays the auth code on a static page) and
+	// the caller is responsible for getting the code from the user
+	// and feeding it back via PasteCode. Default: false.
+	//
+	// Required when running under SSH / no-browser environments where
+	// localhost isn't reachable from the machine actually running the
+	// browser. Mirrors claude-code-sourcemap's "manual flow" from
+	// services/oauth/index.ts.
+	Manual bool
+
+	// PasteCode supplies the auth code in Manual mode. Called after
+	// the auth URL has been displayed to the user. Returning a non-nil
+	// error aborts the flow. If nil under Manual=true, OAuthLoginOpts
+	// reads a single line from os.Stdin (interactive default).
+	PasteCode func(authURL string) (string, error)
+
+	// AuthURLHandler — when set, called instead of openBrowser for
+	// the localhost / automatic flow. Lets a UI layer (TUI / SDK
+	// control protocol) own the "show this URL" affordance instead
+	// of metis spawning `open`/`xdg-open`. nil → default openBrowser.
+	AuthURLHandler func(authURL string) error
+}
+
+// Token bundles every credential field a modern OAuth response gives
+// us. Existing callers using just access_token (via OAuthLogin) keep
+// working unchanged — only OAuthLoginOpts callers see the rest.
+type Token struct {
+	AccessToken  string    `json:"access_token"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"` // zero when provider didn't supply expires_in
+	Scope        string    `json:"scope,omitempty"`
+	TokenType    string    `json:"token_type,omitempty"` // typically "Bearer"
+}
+
+// IsExpired reports whether ExpiresAt has passed (with a 60-second
+// safety margin so callers don't race the actual cliff).
+func (t *Token) IsExpired() bool {
+	if t.ExpiresAt.IsZero() {
+		return false
+	}
+	return time.Now().Add(60 * time.Second).After(t.ExpiresAt)
+}
+
+// OAuthLoginOpts is the full-featured login entry point. See
+// OAuthOptions for the knobs. On success the token is persisted to
+// auth.json (access_token only, for compat with the existing reader)
+// AND the rich Token is returned so callers can stash refresh_token
+// + expires_at separately if they want.
+//
+// Future work (not in this commit): persist the rich Token alongside
+// auth.json so subsequent runs can refresh transparently.
+func OAuthLoginOpts(provider string, opts OAuthOptions) (*Token, error) {
 	p, ok := KnownProviders[provider]
 	if !ok {
-		return "", fmt.Errorf("unknown provider %q (known: %s)",
+		return nil, fmt.Errorf("unknown provider %q (known: %s)",
 			provider, strings.Join(knownNames(), ", "))
 	}
+	if opts.Manual && p.ManualRedirectURL == "" {
+		return nil, fmt.Errorf("provider %q has no ManualRedirectURL — manual mode unsupported", provider)
+	}
+
 	verifier, challenge := makePKCE()
 	state, err := randomState()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	// 1. Find a free localhost port for the callback.
+	if opts.Manual {
+		return runOAuthManual(p, verifier, challenge, state, opts)
+	}
+	return runOAuthAutomatic(p, verifier, challenge, state, opts)
+}
+
+// runOAuthAutomatic — the original "browser + localhost listener"
+// flow, factored out so OAuthLoginOpts can dispatch to it cleanly.
+func runOAuthAutomatic(p OAuthProvider, verifier, challenge, state string, opts OAuthOptions) (*Token, error) {
 	listener, err := pickCallbackPort()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer listener.Close()
 	redirectURI := "http://" + listener.Addr().String() + "/callback"
 
-	// 2. Build auth URL and open browser.
-	authURL := buildAuthURL(p, redirectURI, state, challenge)
-	if err := openBrowser(authURL); err != nil {
-		// Browser open failed — print URL for manual paste.
+	authURL := buildAuthURL(p, redirectURI, state, challenge, false)
+	if opts.AuthURLHandler != nil {
+		if err := opts.AuthURLHandler(authURL); err != nil {
+			return nil, fmt.Errorf("oauth: AuthURLHandler: %w", err)
+		}
+	} else if err := openBrowser(authURL); err != nil {
 		fmt.Printf("Open this URL to authorize:\n  %s\n", authURL)
 	}
 
-	// 3. Wait for callback.
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 	srv := newCallbackServer(state, codeCh, errCh)
@@ -108,25 +229,68 @@ func OAuthLogin(provider string) (string, error) {
 	var code string
 	select {
 	case code = <-codeCh:
-		// got it
 	case e := <-errCh:
-		return "", e
+		return nil, e
 	case <-time.After(2 * time.Minute):
-		return "", fmt.Errorf("oauth: user did not authorize within 2 minutes")
+		return nil, fmt.Errorf("oauth: user did not authorize within 2 minutes")
 	}
 
-	// 4. Exchange code for token.
-	token, err := exchangeCodeForToken(p, code, redirectURI, verifier)
+	tok, err := exchangeCodeForTokenFull(p, code, redirectURI, verifier)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	if err := Set(p.Name, tok.AccessToken); err != nil {
+		return nil, fmt.Errorf("token saved-to-auth: %w", err)
+	}
+	return tok, nil
+}
+
+// runOAuthManual — paste-the-code flow for non-browser environments.
+// The auth URL uses ManualRedirectURL so the provider displays the
+// code on a static page; we read it from stdin (or the caller's
+// PasteCode hook).
+func runOAuthManual(p OAuthProvider, verifier, challenge, state string, opts OAuthOptions) (*Token, error) {
+	authURL := buildAuthURL(p, p.ManualRedirectURL, state, challenge, true)
+	if opts.AuthURLHandler != nil {
+		if err := opts.AuthURLHandler(authURL); err != nil {
+			return nil, fmt.Errorf("oauth: AuthURLHandler: %w", err)
+		}
+	} else {
+		fmt.Printf("Open this URL in any browser, then paste the code shown:\n\n  %s\n\n", authURL)
 	}
 
-	// 5. Persist via existing auth.Set so the rest of metis sees the
-	// token under the provider's name.
-	if err := Set(provider, token); err != nil {
-		return "", fmt.Errorf("token saved-to-auth: %w", err)
+	var code string
+	if opts.PasteCode != nil {
+		c, err := opts.PasteCode(authURL)
+		if err != nil {
+			return nil, err
+		}
+		code = strings.TrimSpace(c)
+	} else {
+		code = strings.TrimSpace(readLineStdin("Paste authorization code: "))
 	}
-	return token, nil
+	if code == "" {
+		return nil, fmt.Errorf("oauth: no authorization code provided")
+	}
+	// Some manual-flow servers (Anthropic) display the code in
+	// "<code>#<state>" form so the user can verify the state matches.
+	// Strip the trailing #state if present.
+	if i := strings.Index(code, "#"); i > 0 {
+		gotState := code[i+1:]
+		code = code[:i]
+		if gotState != "" && gotState != state {
+			return nil, fmt.Errorf("oauth: state mismatch in pasted code (expected %q, got %q)", state, gotState)
+		}
+	}
+
+	tok, err := exchangeCodeForTokenFull(p, code, p.ManualRedirectURL, verifier)
+	if err != nil {
+		return nil, err
+	}
+	if err := Set(p.Name, tok.AccessToken); err != nil {
+		return nil, fmt.Errorf("token saved-to-auth: %w", err)
+	}
+	return tok, nil
 }
 
 func knownNames() []string {
@@ -141,9 +305,16 @@ func makePKCE() (verifier, challenge string) {
 	b := make([]byte, 64)
 	_, _ = rand.Read(b)
 	verifier = base64.RawURLEncoding.EncodeToString(b)
-	sum := sha256.Sum256([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
+	_, challenge = makePKCETestSeam(verifier)
 	return
+}
+
+// makePKCETestSeam derives the S256 challenge from a known verifier.
+// Exposed so tests can verify determinism — same verifier in must
+// give same challenge out, no matter how many times we call.
+func makePKCETestSeam(verifier string) (string, string) {
+	sum := sha256.Sum256([]byte(verifier))
+	return verifier, base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func randomState() (string, error) {
@@ -164,7 +335,7 @@ func pickCallbackPort() (net.Listener, error) {
 	return nil, fmt.Errorf("no free port in 7700-7719")
 }
 
-func buildAuthURL(p OAuthProvider, redirectURI, state, challenge string) string {
+func buildAuthURL(p OAuthProvider, redirectURI, state, challenge string, isManual bool) string {
 	q := url.Values{}
 	q.Set("client_id", p.ClientID)
 	q.Set("redirect_uri", redirectURI)
@@ -177,6 +348,15 @@ func buildAuthURL(p OAuthProvider, redirectURI, state, challenge string) string 
 		q.Set("code_challenge", challenge)
 		q.Set("code_challenge_method", "S256")
 	}
+	// Anthropic's manual flow uses `code=true` to signal "show the
+	// auth code on a static page instead of redirecting" (see
+	// claude-code-sourcemap restored-src/src/services/oauth/client.ts:72).
+	// Harmless for providers that ignore it; only Anthropic acts on it
+	// today, but the field is generic enough to leave on for any
+	// provider that chooses to honour it.
+	if isManual {
+		q.Set("code", "true")
+	}
 	for k, v := range p.ExtraParams {
 		q.Set(k, v)
 	}
@@ -185,6 +365,16 @@ func buildAuthURL(p OAuthProvider, redirectURI, state, challenge string) string 
 		sep = "&"
 	}
 	return p.AuthURL + sep + q.Encode()
+}
+
+// readLineStdin prints a prompt and reads one line of user input.
+// Defined as a var so tests can stub it. ReadLine includes the
+// terminating newline, so we trim.
+var readLineStdin = func(prompt string) string {
+	fmt.Print(prompt)
+	var s string
+	_, _ = fmt.Scanln(&s)
+	return s
 }
 
 func newCallbackServer(state string, codeCh chan<- string, errCh chan<- error) *http.Server {
@@ -219,7 +409,18 @@ func newCallbackServer(state string, codeCh chan<- string, errCh chan<- error) *
 	return &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 }
 
+// exchangeCodeForToken returns just the access_token for back-compat.
+// New callers should use exchangeCodeForTokenFull which preserves
+// refresh_token + expires_in for proper rotation support later.
 func exchangeCodeForToken(p OAuthProvider, code, redirectURI, verifier string) (string, error) {
+	tok, err := exchangeCodeForTokenFull(p, code, redirectURI, verifier)
+	if err != nil {
+		return "", err
+	}
+	return tok.AccessToken, nil
+}
+
+func exchangeCodeForTokenFull(p OAuthProvider, code, redirectURI, verifier string) (*Token, error) {
 	form := url.Values{}
 	form.Set("client_id", p.ClientID)
 	form.Set("code", code)
@@ -231,32 +432,54 @@ func exchangeCodeForToken(p OAuthProvider, code, redirectURI, verifier string) (
 
 	req, err := http.NewRequest("POST", p.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("token endpoint %d", resp.StatusCode)
+		return nil, fmt.Errorf("token endpoint %d", resp.StatusCode)
 	}
 	var raw map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		// Some providers (GitHub) return form-encoded — try that.
-		// Already consumed body; bail.
-		return "", fmt.Errorf("token endpoint: bad response: %w", err)
+		return nil, fmt.Errorf("token endpoint: bad response: %w", err)
 	}
-	if t, ok := raw["access_token"].(string); ok && t != "" {
-		return t, nil
+	access, _ := raw["access_token"].(string)
+	if access == "" {
+		if e, ok := raw["error"].(string); ok {
+			return nil, fmt.Errorf("token endpoint: %s", e)
+		}
+		return nil, fmt.Errorf("token endpoint: no access_token in response")
 	}
-	if e, ok := raw["error"].(string); ok {
-		return "", fmt.Errorf("token endpoint: %s", e)
+	tok := &Token{AccessToken: access}
+	if v, ok := raw["refresh_token"].(string); ok {
+		tok.RefreshToken = v
 	}
-	return "", fmt.Errorf("token endpoint: no access_token in response")
+	if v, ok := raw["scope"].(string); ok {
+		tok.Scope = v
+	}
+	if v, ok := raw["token_type"].(string); ok {
+		tok.TokenType = v
+	}
+	// expires_in is in seconds; convert to absolute time so callers
+	// don't have to re-compute against the token-receipt timestamp.
+	switch v := raw["expires_in"].(type) {
+	case float64:
+		if v > 0 {
+			tok.ExpiresAt = time.Now().Add(time.Duration(v) * time.Second)
+		}
+	case string:
+		// Some PHP-backed IdPs send expires_in as a string.
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			tok.ExpiresAt = time.Now().Add(time.Duration(n) * time.Second)
+		}
+	}
+	return tok, nil
 }
 
 // openBrowser launches the user's default browser to the given URL.

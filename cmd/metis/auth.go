@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"golang.org/x/term"
 
@@ -47,11 +48,16 @@ func cmdAuth(ctx context.Context, args []string) error {
 // the provider's auth URL, exchanges the code for a token, and
 // persists to auth.json — same store the rest of metis already
 // reads from.
+//
+// Pass --manual to switch to paste-the-code mode for non-browser
+// environments (SSH, headless, locked-down corp). The auth URL is
+// printed to stderr and the user pastes the resulting code back
+// to stdin. Mirrors claude-code-sourcemap's manual flow path.
 func cmdAuthOAuth(args []string) error {
 	if len(args) == 0 {
 		fmt.Println("metis auth oauth — browser-based OAuth login")
 		fmt.Println()
-		fmt.Println("Usage: metis auth oauth <provider>")
+		fmt.Println("Usage: metis auth oauth [--manual] <provider>")
 		fmt.Println()
 		fmt.Print("Known providers: ")
 		first := true
@@ -63,17 +69,49 @@ func cmdAuthOAuth(args []string) error {
 			first = false
 		}
 		fmt.Println()
+		fmt.Println()
+		fmt.Println("Flags:")
+		fmt.Println("  --manual    Paste-the-code flow for SSH / no-browser envs.")
+		fmt.Println("              Auth URL printed to stderr; user pastes the")
+		fmt.Println("              displayed code back to stdin. Required when the")
+		fmt.Println("              browser runs on a different host than metis.")
 		return nil
 	}
-	provider := args[0]
-	fmt.Printf("Starting OAuth flow for %s — browser will open shortly...\n", provider)
-	token, err := auth.OAuthLogin(provider)
+	manual := false
+	provider := ""
+	for _, a := range args {
+		switch a {
+		case "--manual", "-m":
+			manual = true
+		default:
+			if provider == "" {
+				provider = a
+			}
+		}
+	}
+	if provider == "" {
+		return fmt.Errorf("oauth: provider name required")
+	}
+	if manual {
+		fmt.Printf("Starting OAuth flow for %s — manual paste mode...\n", provider)
+	} else {
+		fmt.Printf("Starting OAuth flow for %s — browser will open shortly...\n", provider)
+	}
+	tok, err := auth.OAuthLoginOpts(provider, auth.OAuthOptions{Manual: manual})
 	if err != nil {
 		return fmt.Errorf("oauth: %w", err)
 	}
-	fmt.Printf("✓ %s authorized — token saved to auth.json (length=%d)\n", provider, len(token))
+	suffix := ""
+	if !tok.ExpiresAt.IsZero() {
+		suffix = fmt.Sprintf(", expires_in=%s", tok.ExpiresAt.Sub(timeNow()).Round(time.Second))
+	}
+	fmt.Printf("✓ %s authorized — token saved to auth.json (length=%d%s)\n",
+		provider, len(tok.AccessToken), suffix)
 	return nil
 }
+
+// timeNow is a var to let tests freeze the clock in expires_in math.
+var timeNow = time.Now
 
 func printAuthUsage() {
 	fmt.Println(`metis auth — manage provider credentials in ~/.metis/auth.json
