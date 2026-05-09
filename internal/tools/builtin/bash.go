@@ -390,7 +390,12 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	if shell == "" {
 		shell = "/bin/bash"
 	}
-	exe := exec.CommandContext(cctx, shell, "-c", cmdStr)
+	// jobs.OOMWrappedCommand: on Linux wraps in sh -c that bumps
+	// /proc/self/oom_score_adj to 1000 so the kernel always picks the
+	// bash subprocess (and not metis itself) when memory is tight.
+	// On macOS/Windows it's a plain `shell -c cmdStr` (no /proc here).
+	// See internal/jobs/oom_linux.go.
+	exe := jobs.OOMWrappedCommand(cctx, shell, cmdStr)
 	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
 	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
 	exe.Env = childEnv
@@ -542,7 +547,8 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	if shell == "" {
 		shell = "/bin/bash"
 	}
-	exe := exec.CommandContext(bgCtx, shell, "-c", cmdStr)
+	// Linux OOM-score wrapping (see jobs.OOMWrappedCommand).
+	exe := jobs.OOMWrappedCommand(bgCtx, shell, cmdStr)
 	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
 	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
 	exe.Env = childEnv
