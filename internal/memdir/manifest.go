@@ -12,18 +12,18 @@ import (
 //
 // Format:
 //
-//   <root>: 5 memories (3 user, 1 feedback, 1 reference)
+//	<root>: 5 memories (3 user, 1 feedback, 1 reference)
 //
-//   ## user (3)
-//   - user_role.md — Backend lead at goalfy, focused on metis CLI
-//   - user_timezone.md — Lives in UTC+8, prefers Chinese for chat
-//   - user_editor.md — Uses neovim
+//	## user (3)
+//	- user_role.md — Backend lead at goalfy, focused on metis CLI
+//	- user_timezone.md — Lives in UTC+8, prefers Chinese for chat
+//	- user_editor.md — Uses neovim
 //
-//   ## feedback (1)
-//   - feedback_chinese_only.md — All chat replies in Chinese; code stays English
+//	## feedback (1)
+//	- feedback_chinese_only.md — All chat replies in Chinese; code stays English
 //
-//   ## reference (1)
-//   - reference_oa_databases.md — OA Postgres connection info per env
+//	## reference (1)
+//	- reference_oa_databases.md — OA Postgres connection info per env
 //
 // Files with parse errors land in a "## errors" section at the bottom
 // so the extractor agent can fix them. Files without a Type land in

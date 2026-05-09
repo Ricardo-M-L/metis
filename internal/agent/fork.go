@@ -259,7 +259,7 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 	msgs := make([]llm.Message, 0, len(p.Cache.PrefixMessages)+8)
 	msgs = append(msgs, p.Cache.PrefixMessages...)
 	msgs = append(msgs, llm.Message{
-		Role: llm.RoleUser,
+		Role:    llm.RoleUser,
 		Content: []llm.ContentBlock{{Type: "text", Text: p.Prompt}},
 	})
 

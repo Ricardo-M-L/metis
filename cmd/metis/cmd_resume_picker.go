@@ -27,12 +27,12 @@ import (
 // that's NOT followed by a value. Sets *pick=true when it removes one.
 // Multi-form input is handled:
 //
-//   metis -r            → bare → pick=true
-//   metis -r -c         → bare → pick=true (next arg is another flag)
-//   metis -r abc-123    → has value → left intact for flag.Parse
-//   metis --resume xyz  → has value → left intact
-//   metis --resume      → bare → pick=true
-//   metis --resume=xyz  → has value (=-form) → left intact
+//	metis -r            → bare → pick=true
+//	metis -r -c         → bare → pick=true (next arg is another flag)
+//	metis -r abc-123    → has value → left intact for flag.Parse
+//	metis --resume xyz  → has value → left intact
+//	metis --resume      → bare → pick=true
+//	metis --resume=xyz  → has value (=-form) → left intact
 func liftBareResume(args []string, pick *bool) []string {
 	out := make([]string, 0, len(args))
 	i := 0

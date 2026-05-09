@@ -173,10 +173,10 @@ func WriteJSONL(w io.Writer, rep Report) error {
 		"avg_score":  rep.AvgScore(),
 		"total":      len(rep.Scores),
 		"passed":     countPassed(rep),
-		"started":   rep.Started.Format(time.RFC3339),
-		"finished":  rep.Finished.Format(time.RFC3339),
+		"started":    rep.Started.Format(time.RFC3339),
+		"finished":   rep.Finished.Format(time.RFC3339),
 		"duration_s": rep.Finished.Sub(rep.Started).Seconds(),
-		"binary":    rep.MetisBinary,
+		"binary":     rep.MetisBinary,
 	}
 	return enc.Encode(summary)
 }
@@ -193,10 +193,10 @@ func countPassed(rep Report) int {
 
 func scoreLine(s Score) map[string]any {
 	out := map[string]any{
-		"type":     "score",
-		"id":       s.ScenarioID,
-		"total":    s.Total,
-		"passed":   s.Passed,
+		"type":        "score",
+		"id":          s.ScenarioID,
+		"total":       s.Total,
+		"passed":      s.Passed,
 		"duration_ms": s.Duration.Milliseconds(),
 	}
 	if s.Err != nil {

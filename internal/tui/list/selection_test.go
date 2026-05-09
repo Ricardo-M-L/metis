@@ -182,9 +182,9 @@ func TestSelection_DragBelowViewportAutoScrolls(t *testing.T) {
 
 // TestSelection_NoSelectItemSkipped — drag that spans across a noSelect
 // row (e.g. the timestamp separator between two chat turns) should:
-//   1. include the surrounding selectable rows in the clipboard,
-//   2. NOT include the noSelect row's content,
-//   3. NOT highlight the noSelect row visually.
+//  1. include the surrounding selectable rows in the clipboard,
+//  2. NOT include the noSelect row's content,
+//  3. NOT highlight the noSelect row visually.
 func TestSelection_NoSelectItemSkipped(t *testing.T) {
 	l := NewList(
 		&staticItem{content: "first row"},

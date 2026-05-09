@@ -215,10 +215,10 @@ func TestDetectBlockedSleepPattern(t *testing.T) {
 		{"sleep 30", true},
 		{"sleep 5 && echo done", true},
 		{"sleep 5; echo done", true},
-		{"sleep 1", false},                 // sub-2s allowed
-		{"sleep 0.5", false},                // float allowed (regex matches integer only)
-		{"echo a | sleep 5", false},         // in pipeline → allowed
-		{"(sleep 5; echo b)", false},        // in subshell → allowed
+		{"sleep 1", false},                        // sub-2s allowed
+		{"sleep 0.5", false},                      // float allowed (regex matches integer only)
+		{"echo a | sleep 5", false},               // in pipeline → allowed
+		{"(sleep 5; echo b)", false},              // in subshell → allowed
 		{"for i in 1 2; do sleep 5; done", false}, // in for-loop → allowed
 		{"echo no-sleep-here", false},
 	}

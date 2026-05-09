@@ -10,11 +10,11 @@ import "testing"
 
 func TestShortenSemver(t *testing.T) {
 	cases := map[string]string{
-		"0.1.3":                   "0.1.3",
-		"v0.1.3":                  "0.1.3",
-		"0.1.3-21-gab7a825":       "0.1.3",
+		"0.1.3":                    "0.1.3",
+		"v0.1.3":                   "0.1.3",
+		"0.1.3-21-gab7a825":        "0.1.3",
 		"v0.1.3-21-gab7a825-dirty": "0.1.3",
-		"":                        "",
+		"":                         "",
 	}
 	for in, want := range cases {
 		if got := shortenSemver(in); got != want {

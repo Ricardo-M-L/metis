@@ -615,11 +615,11 @@ func wordBoundsAtCol(plain string, col int) (start, end int) {
 	// First pass: collect runes with their starting column. We need
 	// random access so we can step back from a wide-char tail.
 	type runeAt struct {
-		r        rune
-		col      int
-		w        int
-		class    charClass
-		isTrail  bool // synthesized: trailing half of width-2 rune
+		r       rune
+		col     int
+		w       int
+		class   charClass
+		isTrail bool // synthesized: trailing half of width-2 rune
 	}
 	cells := make([]runeAt, 0, len(plain))
 	curCol := 0

@@ -27,14 +27,14 @@ import (
 func makeBigToolResultMsgs(bytes int) []llm.Message {
 	long := strings.Repeat("X", bytes)
 	return []llm.Message{
-		msg(llm.RoleUser, "seed"),                  // ProtectFirst=1 → kept
-		toolUseMsg("t1", "Bash"),                   // snippable middle
-		toolResultMsg("t1", long),                  // snippable middle — TARGET
-		toolUseMsg("t2", "Read"),                   // snippable middle
-		toolResultMsg("t2", "small ok"),            // snippable middle (passes)
-		msg(llm.RoleUser, "tail-1"),                // ProtectLast=3 → kept
-		msg(llm.RoleAssistant, "tail-2"),           // ProtectLast=3 → kept
-		msg(llm.RoleUser, "tail-3"),                // ProtectLast=3 → kept
+		msg(llm.RoleUser, "seed"),        // ProtectFirst=1 → kept
+		toolUseMsg("t1", "Bash"),         // snippable middle
+		toolResultMsg("t1", long),        // snippable middle — TARGET
+		toolUseMsg("t2", "Read"),         // snippable middle
+		toolResultMsg("t2", "small ok"),  // snippable middle (passes)
+		msg(llm.RoleUser, "tail-1"),      // ProtectLast=3 → kept
+		msg(llm.RoleAssistant, "tail-2"), // ProtectLast=3 → kept
+		msg(llm.RoleUser, "tail-3"),      // ProtectLast=3 → kept
 	}
 }
 

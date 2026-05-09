@@ -43,7 +43,7 @@ const queryOSC11Timeout = 200 * time.Millisecond
 // caller should keep its existing default. Light/dark is decided by
 // luminance using the standard ITU-R BT.601 weights:
 //
-//   Y = 0.299·R + 0.587·G + 0.114·B
+//	Y = 0.299·R + 0.587·G + 0.114·B
 //
 // > 0.5 of full-scale → light; ≤ 0.5 → dark.
 func DetectTerminalBackground() (isLight bool, ok bool) {
@@ -146,7 +146,7 @@ func readWithTimeout(f *os.File, dur time.Duration, maxBytes int) ([]byte, error
 // parseOSC11Response extracts (r, g, b) as 16-bit values normalized
 // to [0,1] from a response of the form:
 //
-//   ESC ] 11 ; rgb:RRRR/GGGG/BBBB BEL
+//	ESC ] 11 ; rgb:RRRR/GGGG/BBBB BEL
 //
 // xterm sometimes uses 4 hex digits per channel (16-bit), sometimes
 // 2 (8-bit). We accept both.

@@ -25,10 +25,10 @@ import (
 // has a Tool to look up by name.
 type haltyTool struct{}
 
-func (haltyTool) Name() string                                    { return "Bash" }
-func (haltyTool) Description() string                             { return "test bash" }
-func (haltyTool) InputSchema() map[string]any                     { return map[string]any{"type": "object"} }
-func (haltyTool) Concurrency(map[string]any) pubtool.Concurrency  { return pubtool.ConcurrencySafe }
+func (haltyTool) Name() string                                   { return "Bash" }
+func (haltyTool) Description() string                            { return "test bash" }
+func (haltyTool) InputSchema() map[string]any                    { return map[string]any{"type": "object"} }
+func (haltyTool) Concurrency(map[string]any) pubtool.Concurrency { return pubtool.ConcurrencySafe }
 func (haltyTool) CanUse(context.Context, map[string]any) (pubtool.Permission, string) {
 	return pubtool.PermissionAllow, "ok"
 }

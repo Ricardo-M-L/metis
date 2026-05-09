@@ -241,4 +241,3 @@ func waitFor(t *testing.T, max time.Duration, cond func() bool) {
 	}
 	t.Fatalf("waitFor: condition never met within %s", max)
 }
-

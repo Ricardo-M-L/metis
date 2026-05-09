@@ -13,7 +13,7 @@ import (
 
 func TestRenderEditDiff_EmitsRedAndGreenSGR(t *testing.T) {
 	input := map[string]any{
-		"path":       "/tmp/example.go",
+		"path": "/tmp/example.go",
 		// metis Edit tool's actual field names — `old`/`new`. The
 		// renderer accepts `old_string`/`new_string` too as a
 		// fallback for claude-code-style external tools, but the

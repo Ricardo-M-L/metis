@@ -82,12 +82,12 @@ func RenderBasePrompt(vars BasePromptVars) string {
 //
 //   - PromptFull    base + env + project_context + addendum (default)
 //   - PromptMedium  base + env + project_context (no addendum) — use
-//                   for coordinator workers that should respect the
-//                   project's CLAUDE.md but don't need the user's
-//                   personal preferences (~/.metis/system.md).
+//     for coordinator workers that should respect the
+//     project's CLAUDE.md but don't need the user's
+//     personal preferences (~/.metis/system.md).
 //   - PromptMinimal base + env only — use for narrow sub-agents whose
-//                   task is small enough that broader context just
-//                   wastes tokens.
+//     task is small enough that broader context just
+//     wastes tokens.
 type PromptMode int
 
 const (
@@ -321,8 +321,8 @@ var projectContextCandidates = []string{
 // first hit; 2026-05-09 changed to multi-file aggregation so a
 // monorepo like:
 //
-//   repo/CLAUDE.md                  ← repo-wide conventions
-//   repo/services/foo/AGENTS.md     ← service-specific overrides
+//	repo/CLAUDE.md                  ← repo-wide conventions
+//	repo/services/foo/AGENTS.md     ← service-specific overrides
 //
 // can both inform the model when cwd=repo/services/foo. Mirrors
 // hermes-agent's `subdirectory_hints` accumulator and claude-code's
@@ -459,8 +459,8 @@ func scanForInjection(body, path string) string {
 func detectInjectionPatterns(body string) []string {
 	low := strings.ToLower(body)
 	type pat struct {
-		name      string
-		needles   []string // any-of within a single name
+		name    string
+		needles []string // any-of within a single name
 	}
 	patterns := []pat{
 		{"ignore-instructions", []string{

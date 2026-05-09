@@ -37,18 +37,18 @@ import (
 //	130 SIGINT (Ctrl+C). UNIX convention; we don't redefine it.
 //	143 SIGTERM. Same.
 const (
-	OK             = 0
-	General        = 1
-	Usage          = 2
-	Auth           = 3
-	Quota          = 4
-	Timeout        = 5
-	Network        = 6
-	Permission     = 7
-	IO             = 8
-	ContentFilter  = 10
-	SIGINT         = 130
-	SIGTERM        = 143
+	OK            = 0
+	General       = 1
+	Usage         = 2
+	Auth          = 3
+	Quota         = 4
+	Timeout       = 5
+	Network       = 6
+	Permission    = 7
+	IO            = 8
+	ContentFilter = 10
+	SIGINT        = 130
+	SIGTERM       = 143
 )
 
 // Classify maps an error to one of the codes above. Best-effort —

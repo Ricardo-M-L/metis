@@ -3,13 +3,13 @@
 //
 // Design (mirrors hermes-agent's checkpoint_manager.py + minimal):
 //
-//   • Per-session shadow repo at ~/.metis/checkpoints/<session-id>/
-//   • Each Edit/Write/Bash that mutates files triggers Snap()
-//   • Snap copies tracked files into the shadow tree, commits with
+//   - Per-session shadow repo at ~/.metis/checkpoints/<session-id>/
+//   - Each Edit/Write/Bash that mutates files triggers Snap()
+//   - Snap copies tracked files into the shadow tree, commits with
 //     metadata: {tool_name, args_hash, time, message}
-//   • Restore(N) checks out the Nth-most-recent commit's tree back
+//   - Restore(N) checks out the Nth-most-recent commit's tree back
 //     into the working dir
-//   • List() returns the recent commit log for the /rollback picker
+//   - List() returns the recent commit log for the /rollback picker
 //
 // Why a shadow repo instead of mutating the user's real .git: many
 // metis sessions run inside a project that's already a git repo,
@@ -18,9 +18,9 @@
 // haven't pushed). Shadow repo is a sibling, isolated.
 //
 // Limitations:
-//   • only tracks the current cwd subtree (not the whole repo)
-//   • binary blobs > 1 MiB are skipped (don't bloat the shadow)
-//   • doesn't track deletions of files NOT yet snapped
+//   - only tracks the current cwd subtree (not the whole repo)
+//   - binary blobs > 1 MiB are skipped (don't bloat the shadow)
+//   - doesn't track deletions of files NOT yet snapped
 package checkpoint
 
 import (

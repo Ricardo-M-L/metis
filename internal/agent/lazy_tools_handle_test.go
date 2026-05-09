@@ -28,9 +28,9 @@ type fakeMCPTool struct {
 	schema      map[string]any
 }
 
-func (f fakeMCPTool) Name() string                                 { return f.name }
-func (f fakeMCPTool) Description() string                          { return f.description }
-func (f fakeMCPTool) InputSchema() map[string]any                  { return f.schema }
+func (f fakeMCPTool) Name() string                                   { return f.name }
+func (f fakeMCPTool) Description() string                            { return f.description }
+func (f fakeMCPTool) InputSchema() map[string]any                    { return f.schema }
 func (f fakeMCPTool) Concurrency(map[string]any) pubtool.Concurrency { return pubtool.ConcurrencySafe }
 func (f fakeMCPTool) CanUse(context.Context, map[string]any) (pubtool.Permission, string) {
 	return pubtool.PermissionAllow, "test"

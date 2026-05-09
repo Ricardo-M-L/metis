@@ -34,9 +34,9 @@ type SessionIDFn func() string
 // loggingTransport(dumpTransport(http.DefaultTransport)). Used by
 // every provider's New() to install the debug stack uniformly.
 //
-//   timeout    — maps to http.Client.Timeout (per-request total).
-//   provider   — short tag included in every log line and dump entry
-//                ("anthropic", "openai", "gemini", ...).
+//	timeout    — maps to http.Client.Timeout (per-request total).
+//	provider   — short tag included in every log line and dump entry
+//	             ("anthropic", "openai", "gemini", ...).
 //
 // The active session id is resolved at request time via the
 // process-global GlobalSessionID. Callers don't pass it because

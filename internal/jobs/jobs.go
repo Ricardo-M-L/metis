@@ -71,8 +71,8 @@ func (s Status) String() string {
 // through Registry methods that take the lock.
 type Job struct {
 	ID          string
-	Command     string    // raw shell line as the model wrote it
-	Description string    // ≤80-char one-liner derived from Command, for JobList
+	Command     string // raw shell line as the model wrote it
+	Description string // ≤80-char one-liner derived from Command, for JobList
 	Status      Status
 	StartTime   time.Time
 	EndTime     time.Time // zero until terminal

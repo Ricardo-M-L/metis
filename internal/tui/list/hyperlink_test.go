@@ -5,11 +5,11 @@ import "testing"
 // TestScanOSC8AtCol covers the shape of OSC 8 hyperlink escape we emit
 // from figures.go::osc8Link — `\x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\`.
 // The scanner must:
-//   1. return "" when col falls outside any link region
-//   2. return the URL when col is within the visible TEXT
-//   3. handle SGR runs in the middle (so styled hyperlinks work)
-//   4. accept BEL (`\x07`) as the OSC terminator (some emitters use it)
-//   5. handle multiple hyperlinks on one line
+//  1. return "" when col falls outside any link region
+//  2. return the URL when col is within the visible TEXT
+//  3. handle SGR runs in the middle (so styled hyperlinks work)
+//  4. accept BEL (`\x07`) as the OSC terminator (some emitters use it)
+//  5. handle multiple hyperlinks on one line
 func TestScanOSC8AtCol(t *testing.T) {
 	cases := []struct {
 		name string

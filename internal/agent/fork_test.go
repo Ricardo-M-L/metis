@@ -161,7 +161,7 @@ func TestRunForkedAgent_DenyByCanUseTool(t *testing.T) {
 	}
 	reg := newRegistryWith(t, forkFakeTool{name: "fake_write", desc: "fake"})
 	res, err := RunForkedAgent(context.Background(), ForkedAgentParams{
-		Cache: CacheSafeParams{Provider: prov, Model: "test"},
+		Cache:  CacheSafeParams{Provider: prov, Model: "test"},
 		Prompt: "go",
 		CanUseTool: func(_ context.Context, name string, _ map[string]any) (bool, string) {
 			if name == "fake_write" {
@@ -268,8 +268,8 @@ func TestRunForkedAgent_ProviderError(t *testing.T) {
 
 type errProvider struct{ err error }
 
-func (p *errProvider) Name() string                    { return "err" }
-func (p *errProvider) MaxContextTokens() int           { return 1 }
+func (p *errProvider) Name() string          { return "err" }
+func (p *errProvider) MaxContextTokens() int { return 1 }
 func (p *errProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
 	return nil, p.err
 }

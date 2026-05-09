@@ -66,7 +66,7 @@ func (Memory) IsReadOnly(map[string]any) bool { return false }
 
 // NotebookEdit modifies a Jupyter notebook cell. Same as Edit —
 // mutating + destructive (overwrites cell content).
-func (NotebookEdit) IsReadOnly(map[string]any) bool   { return false }
+func (NotebookEdit) IsReadOnly(map[string]any) bool    { return false }
 func (NotebookEdit) IsDestructive(map[string]any) bool { return true }
 
 // --- destructive (irreversible) ----------------------------------------

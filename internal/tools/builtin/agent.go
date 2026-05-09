@@ -28,10 +28,10 @@ const maxAgentDepth = 3
 // gate. It cannot satisfy interactive permission prompts on its own, so when
 // the gate returns Ask the call is denied.
 type Agent struct {
-	gate     *permission.Gate
-	provider llm.Provider
-	registry *tools.Registry
-	model    string
+	gate          *permission.Gate
+	provider      llm.Provider
+	registry      *tools.Registry
+	model         string
 	system        string
 	minimalSystem string // optional; preferred for sub-agent loops to save tokens
 }

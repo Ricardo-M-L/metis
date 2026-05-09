@@ -17,14 +17,14 @@ func TestSafetyCheck_BypassImmuneOnSensitivePaths(t *testing.T) {
 		path string
 		want Decision
 	}{
-		{"Edit", "/Users/x/proj/normal.go", DecisionAllow},          // bypass passes
-		{"Edit", "/Users/x/proj/.git/config", DecisionAsk},          // bypass-immune
+		{"Edit", "/Users/x/proj/normal.go", DecisionAllow},           // bypass passes
+		{"Edit", "/Users/x/proj/.git/config", DecisionAsk},           // bypass-immune
 		{"Edit", "/Users/x/proj/.git/hooks/pre-commit", DecisionAsk}, // immune
-		{"Write", "/Users/x/.ssh/authorized_keys", DecisionAsk},     // immune
-		{"Write", "/Users/x/.bashrc", DecisionAsk},                  // immune
-		{"Bash", "echo foo > ~/.zshrc", DecisionAsk},                // immune
-		{"Bash", "ls /Users/x/proj", DecisionAllow},                 // bypass ok
-		{"Read", "/Users/x/.bashrc", DecisionAllow},                 // Read isn't file-touching
+		{"Write", "/Users/x/.ssh/authorized_keys", DecisionAsk},      // immune
+		{"Write", "/Users/x/.bashrc", DecisionAsk},                   // immune
+		{"Bash", "echo foo > ~/.zshrc", DecisionAsk},                 // immune
+		{"Bash", "ls /Users/x/proj", DecisionAllow},                  // bypass ok
+		{"Read", "/Users/x/.bashrc", DecisionAllow},                  // Read isn't file-touching
 	}
 	for _, tc := range cases {
 		g := New(ModeBypass)

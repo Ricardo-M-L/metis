@@ -26,40 +26,40 @@ var heavySkipDirs = map[string]struct{}{
 	// VCS / package metadata
 	".git": {}, ".svn": {}, ".hg": {}, ".jj": {}, ".sl": {},
 	"node_modules": {}, "vendor": {}, ".venv": {}, "venv": {},
-	"target":     {}, // Rust / Java
-	".gradle":    {},
-	".cargo":     {},
-	".rustup":    {},
-	".cache":     {},
-	".m2":        {}, // Maven
-	".npm":       {},
-	".yarn":      {},
+	"target":      {}, // Rust / Java
+	".gradle":     {},
+	".cargo":      {},
+	".rustup":     {},
+	".cache":      {},
+	".m2":         {}, // Maven
+	".npm":        {},
+	".yarn":       {},
 	".pnpm-store": {},
-	".bun":       {},
+	".bun":        {},
 
 	// macOS / Apple ecosystem
-	"Library":          {},
-	"Applications":     {},
-	".Trash":           {},
+	"Library":             {},
+	"Applications":        {},
+	".Trash":              {},
 	".CFUserTextEncoding": {},
-	".docker":          {},
-	".vscode-server":   {},
-	".cursor":          {},
+	".docker":             {},
+	".vscode-server":      {},
+	".cursor":             {},
 
 	// Build / runtime artifacts
-	"dist":         {},
-	"build":        {},
-	"out":          {},
-	"target_debug": {},
-	"__pycache__":  {},
+	"dist":          {},
+	"build":         {},
+	"out":           {},
+	"target_debug":  {},
+	"__pycache__":   {},
 	".pytest_cache": {},
-	".mypy_cache":  {},
-	".ruff_cache":  {},
-	".tox":         {},
-	"coverage":     {},
+	".mypy_cache":   {},
+	".ruff_cache":   {},
+	".tox":          {},
+	"coverage":      {},
 
 	// Heavy generated / vendored content
-	"DerivedData":  {}, // Xcode
+	"DerivedData": {}, // Xcode
 }
 
 // defaultGlobMaxDepth caps walk depth when the model didn't pass

@@ -16,8 +16,8 @@ import (
 // `git rev-parse` on each tick. Stale cache is fine — the user feels
 // no difference if the branch in the status bar lags by 5 seconds.
 var (
-	gitBranchMu       sync.Mutex
-	gitBranchCached   string
+	gitBranchMu        sync.Mutex
+	gitBranchCached    string
 	gitBranchCheckedAt time.Time
 )
 
@@ -49,7 +49,9 @@ func cachedGitBranch() string {
 // rather than show a fake $0.0000.
 //
 // Calculation:
-//   input tokens × input_price_per_mtok / 1e6
+//
+//	input tokens × input_price_per_mtok / 1e6
+//
 // + output tokens × output_price_per_mtok / 1e6
 // + cache_read tokens × cache_read_price_per_mtok / 1e6
 // + cache_create tokens × cache_create_price_per_mtok / 1e6

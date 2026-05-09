@@ -11,7 +11,7 @@ import (
 
 // IndexEntry is a single bullet in MEMORY.md. Format:
 //
-//	- [Title](file.md) — short hook
+//   - [Title](file.md) — short hook
 //
 // Title and Hook are optional descriptive parts. File is the relative
 // filename (within memdir root). Lines that don't conform to the

@@ -26,16 +26,16 @@ import (
 // model responses, so a hostile assistant could craft a URL that does
 // something nasty when "opened." Mitigations:
 //
-//   1. We never pass the URL through a shell. Each platform launcher
-//      gets the URL as a single argument, so quoting tricks (`;rm -rf`,
-//      backticks, $()) don't work.
-//   2. Reject anything that doesn't look like a URL or local path.
-//      `file://` paths and `http(s)://` are allowed; everything else is
-//      blocked. (We deliberately allow `file://` because tool results
-//      often link local files.)
-//   3. The user has to single-left-click on the link in the chat to
-//      trigger this — they have a clear UI affordance, and a stray
-//      open of a malicious URL only gets one shot.
+//  1. We never pass the URL through a shell. Each platform launcher
+//     gets the URL as a single argument, so quoting tricks (`;rm -rf`,
+//     backticks, $()) don't work.
+//  2. Reject anything that doesn't look like a URL or local path.
+//     `file://` paths and `http(s)://` are allowed; everything else is
+//     blocked. (We deliberately allow `file://` because tool results
+//     often link local files.)
+//  3. The user has to single-left-click on the link in the chat to
+//     trigger this — they have a clear UI affordance, and a stray
+//     open of a malicious URL only gets one shot.
 func openURL(url string) error {
 	if !isAllowedURL(url) {
 		return fmt.Errorf("scheme not permitted")

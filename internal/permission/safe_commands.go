@@ -77,20 +77,20 @@ var safeBashFirstTokens = map[string]bool{
 // token. Anything not in this set falls back to the normal prompt
 // (which is fine — `git push` / `commit` SHOULD ask).
 var safeGitSubcommands = map[string]bool{
-	"status":   true,
-	"log":      true,
-	"diff":     true,
-	"show":     true,
-	"blame":    true,
-	"branch":   true, // `git branch` lists; `git branch -D foo` is dangerous but the leading-tokens rule catches that via `-D` being non-allowlisted? No — see special-case below.
-	"remote":   true, // `git remote` lists; `git remote add` is mutating but uncommon enough we accept the false-positive risk
-	"config":   true, // `git config --get foo`; `git config --global ...` writes — we filter on `--global`/`--system` below
-	"describe": true,
+	"status":    true,
+	"log":       true,
+	"diff":      true,
+	"show":      true,
+	"blame":     true,
+	"branch":    true, // `git branch` lists; `git branch -D foo` is dangerous but the leading-tokens rule catches that via `-D` being non-allowlisted? No — see special-case below.
+	"remote":    true, // `git remote` lists; `git remote add` is mutating but uncommon enough we accept the false-positive risk
+	"config":    true, // `git config --get foo`; `git config --global ...` writes — we filter on `--global`/`--system` below
+	"describe":  true,
 	"rev-parse": true,
-	"ls-files": true,
-	"ls-tree":  true,
-	"reflog":   true,
-	"tag":      true, // `git tag` lists; `git tag -d foo` deletes — we filter on `-d`/`-D` below
+	"ls-files":  true,
+	"ls-tree":   true,
+	"reflog":    true,
+	"tag":       true, // `git tag` lists; `git tag -d foo` deletes — we filter on `-d`/`-D` below
 }
 
 // gitDangerousFlags are flags that, when present anywhere after `git

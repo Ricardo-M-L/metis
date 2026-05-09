@@ -215,7 +215,7 @@ func TestParseEnableToolSearch(t *testing.T) {
 		// auto:0 / auto:100 → boundary aliases for true / false
 		{"auto:0", LazyModeAlways, 0},
 		{"auto:100", LazyModeStandard, 0},
-		{"auto:-5", LazyModeAlways, 0},  // negative folds to "always"
+		{"auto:-5", LazyModeAlways, 0},    // negative folds to "always"
 		{"auto:200", LazyModeStandard, 0}, // over-100 folds to "never"
 
 		// boolean truthy → always

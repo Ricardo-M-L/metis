@@ -105,7 +105,7 @@ func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 			currentMTime := st.ModTime()
 			if currentHash != entry.Hash && !currentMTime.Equal(entry.MTime) {
 				return &tools.Result{
-					Output: FileUnexpectedlyModified + ": " + path,
+					Output:  FileUnexpectedlyModified + ": " + path,
 					IsError: true,
 				}, nil
 			}
