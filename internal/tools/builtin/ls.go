@@ -90,6 +90,15 @@ func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 		}
 		return rows[i].name < rows[j].name
 	})
+	// Out-of-worktree cap: when cwd has no .git ancestor, clamp the
+	// row count so `ls /` or `ls $HOME` doesn't dump 1k+ entries.
+	// Inside a worktree we trust the user picked a project dir and
+	// return everything. See scope.go.
+	truncated := 0
+	if _, items := walkBudget(path); items > 0 && len(rows) > items {
+		truncated = len(rows) - items
+		rows = rows[:items]
+	}
 	var b strings.Builder
 	for _, r := range rows {
 		if r.kind == "dir" {
@@ -97,6 +106,9 @@ func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 		} else {
 			fmt.Fprintf(&b, "%s  (%s)\n", r.name, bytesString(int(r.size)))
 		}
+	}
+	if truncated > 0 {
+		fmt.Fprintf(&b, "[truncated — %d more entries; pass an in-repo path or be more specific]\n", truncated)
 	}
 	if b.Len() == 0 {
 		return &tools.Result{Output: "(empty)"}, nil

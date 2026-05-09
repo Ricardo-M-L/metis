@@ -84,6 +84,13 @@ func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	totalSeen := 0 // every match (skipped + rendered) — used to detect truncation
 	limitHit := false
 
+	// Out-of-worktree depth clamp: same rationale as Glob (scope.go).
+	// When the cwd is not inside a git work tree, cap walk depth so a
+	// stray Grep("foo") from $HOME doesn't enumerate every cached file.
+	rootAbs, _ := filepath.Abs(root)
+	rootClean := filepath.Clean(rootAbs)
+	walkDepthCap, _ := walkBudget(rootClean)
+
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -92,6 +99,18 @@ func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 			n := d.Name()
 			if n == ".git" || n == "node_modules" || n == "vendor" || n == ".venv" {
 				return filepath.SkipDir
+			}
+			if walkDepthCap > 0 {
+				abs, aerr := filepath.Abs(path)
+				if aerr == nil {
+					rel, rerr := filepath.Rel(rootClean, filepath.Clean(abs))
+					if rerr == nil && rel != "." {
+						depth := strings.Count(rel, string(filepath.Separator)) + 1
+						if depth >= walkDepthCap {
+							return filepath.SkipDir
+						}
+					}
+				}
 			}
 			return nil
 		}

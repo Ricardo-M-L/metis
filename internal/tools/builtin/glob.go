@@ -133,10 +133,23 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	// Default max_depth: 8 when starting at the user's home dir
 	// (covers any reasonable repo without enumerating Library/),
 	// 32 when starting elsewhere. Pass max_depth=0 to disable the cap.
+	//
+	// Additional clamp: when rootClean is NOT inside a git work tree,
+	// drop to walkBudget()'s tighter cap (4 / 200) — the agent has
+	// no signal of project boundary, so don't let the LLM accidentally
+	// fan out across unrelated dirs. See scope.go.
 	home, _ := os.UserHomeDir()
 	defaultDepth := defaultGlobMaxDepthOther
 	if home != "" && rootClean == filepath.Clean(home) {
 		defaultDepth = defaultGlobMaxDepthHome
+	}
+	if d, items := walkBudget(rootClean); d > 0 {
+		if d < defaultDepth {
+			defaultDepth = d
+		}
+		if items > 0 && items < limit {
+			limit = items
+		}
 	}
 	maxDepth := -1 // -1 = use default; 0 = unlimited; >0 = explicit cap
 	if v, ok := in["max_depth"]; ok {
