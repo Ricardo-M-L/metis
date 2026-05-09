@@ -200,6 +200,10 @@ type PermissionReplyParams struct {
 func (sn *session) handle(req *Request) {
 	ctx := context.Background()
 	switch req.Method {
+	case "initialize":
+		var p InitializeParams
+		decodeParams(req.Params, &p)
+		sn.handleInitialize(req.ID, p)
 	case "prompt":
 		var p PromptParams
 		decodeParams(req.Params, &p)
@@ -220,6 +224,98 @@ func (sn *session) handle(req *Request) {
 			Message: fmt.Sprintf("method not found: %s", req.Method),
 		}})
 	}
+}
+
+// handleInitialize replies to the client's initialization request
+// with our protocol version, server info, and per-external-tool
+// accept/reject decisions. Mirrors kimi-agent-sdk's
+// session.go::Initialize semantics: we accept tools whose names
+// don't collide with registered builtins, reject the rest with a
+// short reason.
+func (sn *session) handleInitialize(id any, p InitializeParams) {
+	// Major-version mismatch is a hard reject — clients on a future
+	// major can't safely speak to us. Same-major / older-minor is
+	// fine; we always advertise our own version in the reply.
+	if p.ProtocolVersion != "" {
+		want, got := majorOf(ProtocolVersion), majorOf(p.ProtocolVersion)
+		if want != "" && got != "" && want != got {
+			sn.write(Response{JSONRPC: "2.0", ID: id, Error: &ResponseError{
+				Code:    -32000,
+				Message: fmt.Sprintf("protocol_version mismatch: server=%s client=%s", ProtocolVersion, p.ProtocolVersion),
+			}})
+			return
+		}
+	}
+
+	// Per-external-tool decision pass. Reject names that already
+	// exist as built-in metis tools (the server's tools take
+	// precedence — clients should pick a different name). Otherwise
+	// accept; the actual relay-to-client wiring is a follow-up.
+	var decisions []ExternalToolDecision
+	if sn.server != nil && sn.server.Loop != nil && sn.server.Loop.Registry != nil {
+		for _, t := range p.ExternalTools {
+			d := ExternalToolDecision{Name: t.Name, Accepted: true}
+			if existing, _ := sn.server.Loop.Registry.Get(t.Name); existing != nil {
+				d.Accepted = false
+				d.Reason = "duplicates a built-in tool of the same name"
+			}
+			decisions = append(decisions, d)
+		}
+	} else {
+		for _, t := range p.ExternalTools {
+			decisions = append(decisions, ExternalToolDecision{Name: t.Name, Accepted: true})
+		}
+	}
+
+	res := InitializeResult{
+		ProtocolVersion: ProtocolVersion,
+		Server: ServerInfo{
+			Name:    "metis",
+			Version: serverVersion,
+		},
+		SlashCommands: defaultSlashCommands(),
+		ExternalTools: decisions,
+	}
+	sn.write(Response{JSONRPC: "2.0", ID: id, Result: res})
+}
+
+// serverVersion is set by main at startup so InitializeResult
+// reports the same version users see in `metis --version`. Plain
+// var (not const) so cmd/metis/main.go can populate it.
+var serverVersion = "dev"
+
+// SetServerVersion lets cmd/metis/main.go push the build's version
+// string into the ACP layer so InitializeResult.Server.Version
+// matches what `metis --version` prints. Idempotent.
+func SetServerVersion(v string) { serverVersion = v }
+
+// defaultSlashCommands returns the canonical list of `/`-commands
+// metis exposes. Hard-coded for now; future work can pull this
+// from the slash registry so plugin-added commands also surface to
+// ACP clients.
+func defaultSlashCommands() []SlashCommand {
+	return []SlashCommand{
+		{Name: "/help", Description: "Show available commands"},
+		{Name: "/new", Description: "Start a new session"},
+		{Name: "/clear", Description: "Clear the current session"},
+		{Name: "/resume", Description: "Resume a previous session"},
+		{Name: "/model", Description: "Show or switch the active model"},
+		{Name: "/cost", Description: "Show token + cost stats for the session"},
+		{Name: "/compact", Description: "Compact the conversation"},
+		{Name: "/save", Description: "Save the session"},
+		{Name: "/quit", Description: "Exit metis"},
+	}
+}
+
+// majorOf returns the part before the first '.' in a "MAJOR.MINOR"
+// version string, or the whole string when no dot is present.
+func majorOf(v string) string {
+	for i := 0; i < len(v); i++ {
+		if v[i] == '.' {
+			return v[:i]
+		}
+	}
+	return v
 }
 
 func decodeParams(raw map[string]json.RawMessage, out any) {
