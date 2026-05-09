@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -75,6 +76,17 @@ type Loop struct {
 	turnIdx  int
 	iterIdx  int
 
+	// haltSignal carries a "stop after this iteration" signal raised
+	// by a PreToolUse hook returning Halt=true (claude-code parity:
+	// subprocess hooks signal halt via JSON `{"decision":"halt"}`
+	// or exit code 49). The reason is surfaced as the turn's stop
+	// reason so the user / transcript reads the halt provenance,
+	// not a generic "stopped".
+	//
+	// Cleared at the start of each Run.
+	haltRequested bool
+	haltReason    string
+
 	// DistillEvery controls auto-distillation cadence. Every N
 	// successful turns, the loop fires a background LLM call that
 	// extracts durable facts from the latest user/assistant
@@ -83,12 +95,25 @@ type Loop struct {
 	// per-turn distillation noise dominates the actual work).
 	DistillEvery int
 
-	// LazyToolThreshold gates the lazy-MCP-schema feature: when the
-	// total tool count exceeds this number, mcp__* tools' schemas are
-	// stripped from the upfront tools list and a synthetic ToolSearch
-	// meta-tool is exposed. The model fetches schemas on demand. 0 →
-	// LazyToolThresholdDefault (20). Negative → disabled.
-	LazyToolThreshold int
+	// ContextWindow is the model's input cap, fed in by BuildAgentLoop
+	// from the provider's MaxContextTokens. Used as the denominator
+	// for the auto-mode lazy-tool trigger (see lazy_tools.go). 0 means
+	// "unknown" — the auto path silently disables and full schemas
+	// are sent. The mode itself comes from the ENABLE_TOOL_SEARCH env
+	// var; this field is just the budget input.
+	ContextWindow int
+
+	// JobNotify is the receive end of the jobs.Registry notification
+	// channel. The Run loop drains it at every iteration boundary and
+	// appends a `<job_notification>` system-reminder user message so
+	// the model knows its background commands finished. nil means the
+	// job pool isn't wired (sub-agents, headless tests).
+	JobNotify <-chan jobs.Notification
+
+	// Jobs is the same registry that produced JobNotify, exposed so
+	// the TUI can render a "⚙ N jobs" status bar chip without
+	// reaching into the runtime layer. Optional — nil hides the chip.
+	Jobs *jobs.Registry
 
 	// steerBuf accumulates mid-turn user input (the "steering" feature
 	// from claude-code: user can type while the agent is mid-loop, and
@@ -103,6 +128,28 @@ type Loop struct {
 	// state. Reset to false whenever a Compact() call succeeds, so a
 	// later failure run can re-emit the notice.
 	compactCircuitNoticeSent bool
+
+	// AutoMemory controls the openclaude-style "extract memorable
+	// facts at turn boundaries" behaviour. Off by default — opting
+	// in costs an extra LLM call every AutoMemoryEvery turns.
+	AutoMemory bool
+	// AutoMemoryEvery overrides the default 10-turn cadence (legacy v1
+	// path; ignored by the v2 LoopEnd-driven extractor).
+	AutoMemoryEvery int
+	// lastAutoMemoryTurn dedupes within a single Run when compaction
+	// re-enters Run for the same logical turn boundary (legacy v1).
+	lastAutoMemoryTurn int
+
+	// autoMemExtractor is the v2 extractor lazily constructed when
+	// AutoMemory is enabled and the LoopEnd hook fires. Nil when
+	// auto-memory is off.
+	autoMemExtractor *AutoMemoryExtractor
+
+	// CacheStats accumulates a per-turn ring of cache_create / cache_read
+	// metrics + the input fingerprint, so MetisInfo can surface "your
+	// last turn invalidated the cache because <field> changed".
+	// Allocated lazily — nil disables tracking gracefully.
+	CacheStats *CacheStatsRing
 }
 
 func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegistry, system string, maxIter int) *Loop {
@@ -177,6 +224,23 @@ func (l *Loop) History() []llm.Message {
 	return transcript.Snapshot(l.Messages)
 }
 
+// haltTurn marks the current Run for halt-after-current-iteration. The
+// signal is checked after executeBatch (where PreToolUse hooks fire)
+// and after the steer drain — so a hook can deny the offending tool
+// (Output) AND halt the rest of the turn (Halt=true) in one decision.
+//
+// Concurrency: dispatch.go is single-goroutine inside its Phase 0a
+// loop; the Run goroutine is the only consumer. Plain field assign
+// is fine.
+func (l *Loop) haltTurn(reason string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.haltRequested = true
+	if reason != "" && l.haltReason == "" {
+		l.haltReason = reason
+	}
+}
+
 // Reset clears the conversation.
 func (l *Loop) Reset() {
 	l.mu.Lock()
@@ -220,14 +284,27 @@ func (l *Loop) Restore(messages []llm.Message) {
 // turnIdx so loop-detection / hooks see a coherent timeline. Compaction
 // state is also preserved.
 func (l *Loop) UndoLastTurn() bool {
+	_, ok := l.UndoLastTurnWithPrefill()
+	return ok
+}
+
+// UndoLastTurnWithPrefill is the prefill-aware variant added 2026-05-09:
+// returns the user-typed text for the turn that just got popped so the
+// TUI can preload it into the input box. Mirrors kimi-cli's `/undo`
+// behaviour (`Reload(prefill_text=...)`).
+//
+// Empty `prefill` means "nothing to prefill" — either the undo failed
+// (ok=false) or the popped turn was synthetic (no user-typed text;
+// happens when /retry is undone, etc.).
+func (l *Loop) UndoLastTurnWithPrefill() (prefill string, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	out, ok := transcript.Undo(l.Messages)
-	if !ok {
-		return false
+	out, p, success := transcript.UndoWithPrefill(l.Messages)
+	if !success {
+		return "", false
 	}
 	l.Messages = out
-	return true
+	return p, true
 }
 
 // CountTurns returns how many user prompts have been delivered so far.
@@ -259,6 +336,14 @@ func (l *Loop) IterIdx() int {
 //  8. Append assistant + tool_results, emit TurnEnd
 //  9. Loop-detect / max-iter / grace-call checks
 func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
+	// Clear any halt signal carried over from a prior turn — Run is the
+	// boundary between user prompts, and a halt request only governs
+	// the turn that raised it.
+	l.mu.Lock()
+	l.haltRequested = false
+	l.haltReason = ""
+	l.mu.Unlock()
+
 	tc := HookContext{Model: l.Model, Turn: l.turnIdx}
 	l.Hooks.EmitSessionStart(ctx, tc, l.System, l.Model)
 
@@ -282,6 +367,13 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		l.Hooks.EmitTurnStart(ctx, tc, curIter)
 
 		l.maybeCompact(ctx, out)
+
+		// Drain any background-bash job notifications since the last
+		// iteration and synthesize <job_notification> user messages.
+		// The model sees these as system-reminders telling it which
+		// jobs finished (and whether to BashOutput-read the result),
+		// matching claude-code's <task_notification> envelope.
+		l.injectJobNotifications(out)
 
 		req := l.buildRequest(specs)
 
@@ -379,6 +471,42 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
+		// Sliding-window signature loop detection (crush parity).
+		// Feed (toolUses, results) into the detector so it can pair
+		// each call with its result and SHA-256 the batch. Triggers
+		// ShouldAbort below (post-steer) when the model has been
+		// running the identical call+result combination repeatedly —
+		// the 2026-05-08 video bug, where 1h 18m of `cd path && git
+		// rebase --continue` retries never got cut off.
+		if l.Detector != nil {
+			l.Detector.RecordStep(toolUses, results)
+		}
+
+		// Hook-driven halt: if any PreToolUse hook in this batch
+		// returned Halt=true, stop the turn after delivering tool
+		// results. The hook may have ALSO denied the offending tool
+		// via Output (handled inline in dispatch.go); honoring both
+		// in the same iteration means the model sees what was
+		// rejected and the loop ends cleanly without another API
+		// call. claude-code subprocess hooks signal halt via JSON
+		// `{"decision":"halt"}` or exit code 49.
+		l.mu.RLock()
+		halt := l.haltRequested
+		hreason := l.haltReason
+		l.mu.RUnlock()
+		if halt {
+			if hreason == "" {
+				hreason = "halted by hook"
+			}
+			l.mu.Lock()
+			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
+			l.mu.Unlock()
+			stopReason = "halted_by_hook"
+			l.Hooks.EmitLoopEnd(ctx, tc, "halted_by_hook")
+			emit(ctx, out, Event{Kind: EventInfo, Info: "halt: " + hreason})
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "halted_by_hook"})
+			return nil
+		}
 		// Steering (Task #78): if the user typed mid-turn while tools
 		// were running, fold their text into the user message that
 		// carries the tool_results. The agent sees both pieces in one
@@ -404,7 +532,17 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// Loop detector: abort when repetitive patterns exceed thresholds.
 		if l.Detector != nil && l.Detector.ShouldAbort() {
 			stats := l.Detector.Stats()
-			msg := fmt.Sprintf("loop detector aborted: %d total tool calls", stats.GlobalCount)
+			reason := l.Detector.AbortReason()
+			var msg string
+			switch reason {
+			case LoopSignatureRepeat:
+				// More actionable than "X total tool calls" — tells the
+				// user the agent kept running the same call+result combo.
+				msg = fmt.Sprintf("loop detector aborted: same tool call+result repeated within window of %d steps",
+					l.Detector.SignatureWindowSize)
+			default:
+				msg = fmt.Sprintf("loop detector aborted: %d total tool calls", stats.GlobalCount)
+			}
 			stopReason = "loop_detected"
 			l.Hooks.EmitLoopEnd(ctx, tc, "loop_detected")
 			emit(ctx, out, Event{Kind: EventInfo, Info: msg})

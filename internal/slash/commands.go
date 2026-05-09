@@ -337,8 +337,8 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "skills", Aliases: []string{"sk"}, Description: "list installed skills under ~/.metis/skills", Handler: func(_ string) (string, Signal) {
 		return "", SignalSkills
 	}})
-	r.Register(Cmd{Name: "memory", Description: "show memory summary", Handler: func(_ string) (string, Signal) {
-		return "(memory: use Memory tool for add/replace/remove/read)", SignalNone
+	r.Register(Cmd{Name: "memory", Description: "auto-memory: list | show <file> | rm <file> | path", Handler: func(args string) (string, Signal) {
+		return handleMemoryCommand(args), SignalNone
 	}})
 	r.Register(Cmd{Name: "reload", Description: "reload tools and skills", Handler: func(_ string) (string, Signal) {
 		return "(reloading...)", SignalReload

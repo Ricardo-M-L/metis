@@ -168,8 +168,21 @@ func (r *REPL) Run(ctx context.Context) error {
 				r.Loop.Reset()
 				fmt.Fprintln(r.out, r.Styles.Hint.Render("(starting new session...)"))
 			case slash.SignalUndo:
-				if ok := r.Loop.UndoLastTurn(); ok {
-					fmt.Fprintln(r.out, r.Styles.Hint.Render("(undid last turn — type a new prompt to continue)"))
+				// Plain REPL mode has no rich-input prefill — show the
+				// undone user text as a hint so the user can copy-paste
+				// + edit if they want to retry. Matches kimi-cli's
+				// non-TUI fallback for /undo prefill.
+				if prefill, ok := r.Loop.UndoLastTurnWithPrefill(); ok {
+					if prefill != "" {
+						p := strings.ReplaceAll(prefill, "\n", " ")
+						if len(p) > 80 {
+							p = p[:79] + "…"
+						}
+						hint := "(undid last turn — to retry, repeat: " + p + ")"
+						fmt.Fprintln(r.out, r.Styles.Hint.Render(hint))
+					} else {
+						fmt.Fprintln(r.out, r.Styles.Hint.Render("(undid last turn — type a new prompt to continue)"))
+					}
 				} else {
 					fmt.Fprintln(r.out, r.Styles.Hint.Render("(nothing to undo)"))
 				}

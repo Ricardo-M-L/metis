@@ -369,6 +369,15 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 
 	switch g.mode {
 	case ModeBypass:
+		// Pre-filter: DangerousPatterns hard-blacklist runs BEFORE
+		// the LLM classifier. These shapes ("rm -rf /", "fork bomb",
+		// "kill -9 -1", etc.) have no defensible reason for an agent
+		// to ever propose them; we fail-CLOSED here even in bypass
+		// mode — claude-code-sourcemap and openclaude both do the
+		// same. See dangerous_patterns.go for the full list.
+		if hit := CheckDangerousPattern(stringInput); hit != nil {
+			return g.applyBreaker(DecisionDeny, "yolo:dangerous_pattern:"+hit.Reason, breakerActive)
+		}
 		// YOLO classifier (claude-code parity): give the classifier a
 		// chance to soft- or hard-deny even though the user opted into
 		// bypass.
@@ -418,6 +427,18 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		case "Read", "LS", "Glob", "Grep", "WebFetch":
 			g.recordAllow()
 			return DecisionAllow, "mode:auto"
+		case "Bash":
+			// Read-only command allowlist (crush-style safe commands).
+			// `git status` / `ls` / `pwd` / etc. clear the prompt instead
+			// of pestering the user every turn. The allowlist explicitly
+			// rejects shell metacharacters, sudo, and mutating git flags;
+			// the dangerous-classifier in classify.go and the path-touch
+			// safety net above still run — this is the *first* yes, not
+			// the only yes. See safe_commands.go for the full rule set.
+			if IsSafeReadOnlyBash(stringInput) {
+				g.recordAllow()
+				return DecisionAllow, "mode:auto:safe_command"
+			}
 		}
 	}
 	return DecisionAsk, "default"

@@ -97,7 +97,7 @@ func NewVertex(serviceAccountPath, project, region, model string, maxTokens int,
 		Region:      region,
 		Model:       model,
 		MaxTokens:   maxTokens,
-		httpClient:  &http.Client{Timeout: timeout},
+		httpClient:  transport.NewHTTPClient(timeout, "vertex"),
 		tokenSource: cloud.NewGCPTokenSource(key, ""),
 	}, nil
 }

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -48,7 +49,22 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"tool_name":       in.Tool,
 				"tool_input":      in.Input,
 			}
-			out, err := runHookCommand(ctx, spec, payload)
+			out, code, err := runHookCommandWithCode(ctx, spec, payload)
+			// Claude-code parity: exit code 49 means "halt the turn",
+			// regardless of stdout. A user can `exit 49` from a one-line
+			// shell hook without bothering to emit JSON. Honor it
+			// whether or not stdout has additional structure.
+			if code == 49 {
+				mod := parsePreToolUseResponse(out)
+				if mod == nil {
+					mod = &pubhook.ModifiedPreToolUse{}
+				}
+				mod.Halt = true
+				if mod.HaltReason == "" {
+					mod.HaltReason = "halted by hook (exit 49)"
+				}
+				return mod
+			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "hook PreToolUse %s: %v\n", spec.Command, err)
 				return nil
@@ -316,6 +332,15 @@ func cwdOrEmpty() string {
 // user can `echo "..." >&2` from their hook for debug output without
 // polluting the JSON return channel.
 func runHookCommand(ctx context.Context, spec config.HookSpec, payload map[string]any) ([]byte, error) {
+	out, _, err := runHookCommandWithCode(ctx, spec, payload)
+	return out, err
+}
+
+// runHookCommandWithCode is runHookCommand plus an exit-code channel.
+// Used by the PreToolUse path to catch the claude-code "exit 49 =
+// halt" convention (a hook script can `exit 49` without bothering to
+// emit JSON, and we still treat it as a turn-halt signal).
+func runHookCommandWithCode(ctx context.Context, spec config.HookSpec, payload map[string]any) ([]byte, int, error) {
 	timeout := time.Duration(spec.Timeout) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -325,7 +350,7 @@ func runHookCommand(ctx context.Context, spec config.HookSpec, payload map[strin
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	cmd := exec.CommandContext(cctx, "sh", "-c", spec.Command) //nolint:gosec — user-configured by design
 	cmd.Stdin = strings.NewReader(string(body))
@@ -334,20 +359,48 @@ func runHookCommand(ctx context.Context, spec config.HookSpec, payload map[strin
 		"METIS_HOOK_EVENT="+payload["hook_event_name"].(string),
 	)
 	out, err := cmd.Output()
+	exitCode := 0
 	if err != nil {
-		return out, err
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			exitCode = ee.ExitCode()
+			// Exit codes 49 and the documented "block tool" 2 are
+			// signals, not failures — strip the err so callers
+			// process them as data.
+			if exitCode == 49 || exitCode == 2 {
+				return out, exitCode, nil
+			}
+		}
 	}
-	return out, nil
+	return out, exitCode, err
 }
 
-// parsePreToolUseResponse expects the hook to return either an empty body
-// (proceed unchanged) or a JSON document like:
+// parsePreToolUseResponse parses a PreToolUse subprocess hook's stdout.
+// Three accepted shapes (in order of precedence):
 //
-//	{
-//	  "decision": "allow" | "deny",
-//	  "reason": "...",
-//	  "modified_input": {...}
-//	}
+//  1. **Claude-code envelope** (preferred for cross-CLI compat):
+//
+//     {"hookSpecificOutput": {
+//     "hookEventName": "PreToolUse",
+//     "permissionDecision": "allow"|"deny"|"ask",
+//     "permissionDecisionReason": "...",
+//     "modifiedInput": {...}
+//     }}
+//
+//  2. **metis-flat form** (older config.toml hooks already on disk):
+//
+//     {"decision": "allow"|"deny"|"halt",
+//     "reason": "...",
+//     "modified_input": {...},
+//     "halt": true}
+//
+//  3. **empty body** → proceed unchanged.
+//
+// `decision: "halt"` (or `halt: true` flag) signals the agent loop to
+// stop the entire turn after the current tool batch — claude-code
+// parity for "veto chain" hooks. The exit-code-49 convention is
+// handled at the caller (runHookCommand returns the exit code so we
+// can flip the same signal there).
 //
 // Unknown / malformed JSON is treated as "proceed unchanged" so a
 // misbehaving hook doesn't accidentally block the agent.
@@ -356,41 +409,79 @@ func parsePreToolUseResponse(out []byte) *pubhook.ModifiedPreToolUse {
 	if len(strings.TrimSpace(string(out))) == 0 {
 		return nil
 	}
-	var v struct {
+	// Claude-code envelope first — the field is a discriminator the
+	// flat form can't accidentally collide with.
+	var envelope struct {
+		HookSpecificOutput *struct {
+			HookEventName            string         `json:"hookEventName"`
+			PermissionDecision       string         `json:"permissionDecision"`
+			PermissionDecisionReason string         `json:"permissionDecisionReason"`
+			ModifiedInput            map[string]any `json:"modifiedInput"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal(out, &envelope); err == nil && envelope.HookSpecificOutput != nil {
+		hso := envelope.HookSpecificOutput
+		return preToolFromDecision(hso.PermissionDecision, hso.PermissionDecisionReason, hso.ModifiedInput, false)
+	}
+	// Fall through to the flat form.
+	var flat struct {
 		Decision      string         `json:"decision"`
 		Reason        string         `json:"reason"`
 		ModifiedInput map[string]any `json:"modified_input"`
+		Halt          bool           `json:"halt"`
 	}
-	if err := json.Unmarshal(out, &v); err != nil {
+	if err := json.Unmarshal(out, &flat); err != nil {
 		return nil
 	}
-	switch v.Decision {
-	case "deny":
-		reason := v.Reason
-		if reason == "" {
-			reason = "denied by hook"
-		}
-		return &pubhook.ModifiedPreToolUse{
-			Output: &pubhook.Output{Content: reason, IsError: true},
-		}
-	case "allow":
-		// Hook explicitly allowed — claude-code semantics: short-circuit
-		// the permission system. We don't have a "force allow" channel
-		// in our PreToolUse return today, so honor it as "no change"
-		// (the upstream gate decides). Kept as an explicit case so
-		// when we add force-allow it slots in here.
-		_ = reason
-	}
-	if v.ModifiedInput != nil {
-		return &pubhook.ModifiedPreToolUse{ModifiedInput: v.ModifiedInput}
-	}
-	return nil
+	return preToolFromDecision(flat.Decision, flat.Reason, flat.ModifiedInput, flat.Halt)
 }
 
-// reason is a no-op symbol referenced above to keep the Allow case
-// readable without the linter complaining about unused locals when the
-// codebase eventually gets a proper "force allow" plumbing.
-var reason any
+// preToolFromDecision is the shared decision-to-ModifiedPreToolUse
+// translator used by both the claude-code envelope and the flat form.
+// Centralizes the "halt overrides allow", "deny becomes Output IsError"
+// rules so both shapes behave identically.
+func preToolFromDecision(decision, reason string, modifiedInput map[string]any, haltFlag bool) *pubhook.ModifiedPreToolUse {
+	mod := &pubhook.ModifiedPreToolUse{}
+	switch strings.ToLower(decision) {
+	case "deny":
+		r := reason
+		if r == "" {
+			r = "denied by hook"
+		}
+		mod.Output = &pubhook.Output{Content: r, IsError: true}
+	case "halt":
+		// Halt is a stronger deny: deny the tool AND stop the turn.
+		// We synthesize a tool_result so the model has context for
+		// why the turn ended (otherwise the transcript shows a
+		// dangling tool_use with no matching result).
+		r := reason
+		if r == "" {
+			r = "halted by hook"
+		}
+		mod.Output = &pubhook.Output{Content: r, IsError: true}
+		mod.Halt = true
+		mod.HaltReason = r
+	case "allow":
+		// Explicit allow: claude-code's "skip the gate". metis doesn't
+		// yet have a force-allow channel; treat as "proceed normally"
+		// so the gate still runs. When we add force-allow it slots in
+		// here.
+	}
+	if haltFlag && !mod.Halt {
+		mod.Halt = true
+		mod.HaltReason = reason
+		if mod.HaltReason == "" {
+			mod.HaltReason = "halted by hook"
+		}
+	}
+	if modifiedInput != nil {
+		mod.ModifiedInput = modifiedInput
+	}
+	if mod.Output == nil && mod.ModifiedInput == nil && !mod.Halt {
+		return nil // nothing to change
+	}
+	return mod
+}
 
 // trimBOM strips a leading UTF-8 BOM that scripts written on Windows
 // sometimes emit. Without this, json.Unmarshal silently fails on the

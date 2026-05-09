@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -19,10 +20,23 @@ import (
 // keeps the Anthropic prompt-cache breakpoint placed after the last
 // built-in valid across MCP server churn — claude-code's tools.ts:354-366.
 //
-// When LazyToolThreshold is set and exceeded, mcp__-prefixed tools have
-// their schemas stripped and a synthetic ToolSearch tool is appended.
-// Saves ~10K+ tokens per iteration for MCP-heavy sessions; see
-// lazy_tools.go for the trade-off discussion.
+// When lazy mode fires, mcp__-prefixed tools have their schemas
+// stripped and a synthetic ToolSearch tool is appended. Saves
+// ~10K+ tokens per iteration for MCP-heavy sessions; see lazy_tools.go
+// for the trade-off discussion and the env-var match table.
+//
+// Mode comes from ENABLE_TOOL_SEARCH (read fresh each call so users
+// can `export` to flip behavior without restarting metis — same as
+// openclaude). Three branches:
+//
+//   - Standard → no rewrite, full schemas always sent.
+//   - Always   → strip every mcp__* schema unconditionally.
+//   - Auto     → strip only when the deferred MCP token estimate
+//     exceeds `ContextWindow * percentage / 100`.
+//
+// Auto without a known ContextWindow falls back to "standard" rather
+// than guessing — better to send slightly more schema than to make
+// the wrong stripping decision and break a tool call.
 func (l *Loop) toolSpecs() []llm.ToolSpec {
 	all := l.Registry.SortedForCache()
 	out := make([]llm.ToolSpec, 0, len(all))
@@ -31,11 +45,19 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 			Name: t.Name(), Description: shortToolDesc(t.Description()), InputSchema: t.InputSchema(),
 		})
 	}
-	threshold := l.LazyToolThreshold
-	if threshold == 0 {
-		threshold = LazyToolThresholdDefault
+	mode, pct := parseEnableToolSearch(os.Getenv("ENABLE_TOOL_SEARCH"))
+	switch mode {
+	case LazyModeStandard:
+		return out
+	case LazyModeAlways:
+		return stripAndAppendToolSearch(out)
+	case LazyModeAuto:
+		if l.ContextWindow <= 0 {
+			return out
+		}
+		return applyLazySchemaByTokens(out, l.ContextWindow, pct)
 	}
-	return applyLazySchema(out, threshold)
+	return out
 }
 
 // shortToolDesc trims a tool's full Description() down to the
@@ -134,12 +156,25 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			ToolName: b.ToolName, ToolInput: b.ToolInput,
 		})
 
-		// PreToolUse hook can short-circuit (Output) or rewrite input.
+		// PreToolUse hook can short-circuit (Output), rewrite input
+		// (ModifiedInput), or halt the entire turn (Halt). Halt is
+		// claude-code parity: subprocess hook returns
+		// `{"decision":"halt"}` or exits with code 49, telling the
+		// agent loop to stop after the current tool batch — useful
+		// for "veto chain" hooks (the model wandered into a forbidden
+		// path; abort the turn rather than just denying one tool).
 		if l.Hooks != nil {
 			mod := l.Hooks.EmitPreToolUse(ctx, tc, &PreToolUseHook{
 				Context: tc, Tool: b.ToolName, Input: b.ToolInput,
 			})
 			if mod != nil {
+				if mod.Halt {
+					reason := mod.HaltReason
+					if reason == "" {
+						reason = "halted by PreToolUse hook"
+					}
+					l.haltTurn(reason)
+				}
 				if mod.Output != nil {
 					blkOut := llm.ContentBlock{
 						Type: "tool_result", ToolUseID: b.ToolUseID,

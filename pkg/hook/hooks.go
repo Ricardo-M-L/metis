@@ -72,10 +72,20 @@ type PreToolUse struct {
 // ModifiedPreToolUse is what a PreToolUse handler returns.
 //   - Output non-nil → skip execution and use this as the tool's result.
 //   - ModifiedInput non-nil → run the tool with new arguments.
-//   - both nil → no change, proceed normally.
+//   - Halt true → stop the entire current turn after the tool batch
+//     (claude-code parity: subprocess hooks signal halt via JSON
+//     `{"decision":"halt"}` or process exit code 49). Output is
+//     respected first (the model sees the tool_result block) and
+//     then the loop short-circuits before issuing the next API call.
+//   - all zero → no change, proceed normally.
 type ModifiedPreToolUse struct {
 	Output        *Output
 	ModifiedInput map[string]any
+	Halt          bool
+	// HaltReason explains why the turn is being halted, surfaced via
+	// the loop's stop reason channel. Optional — defaults to
+	// "halted by PreToolUse hook" when blank.
+	HaltReason string
 }
 
 // Output is what a PreToolUse hook returns to short-circuit execution.

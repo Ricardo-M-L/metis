@@ -101,7 +101,7 @@ func NewAzure(apiKey, resource, deployment, apiVersion, model string, maxTokens 
 		APIVersion: apiVersion,
 		Model:      model,
 		MaxTokens:  maxTokens,
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: transport.NewHTTPClient(timeout, "azure"),
 	}
 }
 

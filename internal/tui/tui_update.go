@@ -18,6 +18,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/tui/overlay"
+	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
 func (m *Model) Init() tea.Cmd {
@@ -119,6 +120,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// v2: KeyMsg is interface; KeyPressMsg is the concrete event
 		// type for press (vs KeyReleaseMsg). handleKey takes tea.KeyMsg
 		// which both implement, so passing through is fine.
+		// Mark interaction so SendNotification's 6s recent-key guard
+		// suppresses banners while the user is actively typing.
+		MarkUserInteraction()
 		return m.handleKey(msg)
 
 	case tea.PasteMsg:
@@ -448,14 +452,40 @@ func (m *Model) finalizeTurn(err error) {
 				Timestamp: time.Now(),
 			})
 		}
-		// OSC9 desktop notification on long turns. Threshold gates
-		// out quick replies (<30s) where the user is still watching
-		// the screen and a banner would be noise. Mirrors claude-
-		// code's notification queue minimum-duration heuristic.
+		// Desktop notification on long turns. Channel matrix
+		// (notify.go) picks the right OSC sequence per terminal.
+		// Threshold gates out quick replies (<30s) where the user
+		// is still watching the screen and a banner would be noise.
+		// Mirrors claude-code's notification queue minimum-duration
+		// heuristic + recent-interaction guard.
 		if d := time.Since(m.spinnerStartedAt); d >= NotifyMinDuration {
-			Notify("metis", fmt.Sprintf("turn finished in %s", formatTurnDuration(d)))
+			msg := fmt.Sprintf("turn finished in %s", formatTurnDuration(d))
+			SendNotification("metis", msg)
+			// Fire the user's [[hooks.notification]] chain so
+			// they can shell out to terminal-notifier / ntfy /
+			// whatever for a richer macOS-native banner. Best-
+			// effort: nil-check both Loop and Hooks so headless
+			// tests that build a bare Model don't blow up.
+			if m.loop != nil && m.loop.Hooks != nil {
+				m.loop.Hooks.EmitNotification(
+					context.Background(),
+					pubhook.Context{Model: m.loop.Model},
+					&pubhook.Notification{
+						Level:   "info",
+						Message: msg,
+					},
+				)
+			}
 		}
 	}
+	// Clear the OSC 9;4 progress bar from keybind_submit.go regardless
+	// of duration / error — leaving it stuck would mislead a glance at
+	// the dock. Indicate failure with the Error variant first so the
+	// dock briefly shows red before clearing.
+	if err != nil {
+		SendProgress(ProgressError, 0)
+	}
+	SendProgress(ProgressClear, 0)
 	// Structural recap below the thought-summary, when this turn did
 	// enough work to be worth summarizing (≥2 tool calls).
 	recap := ""

@@ -4,21 +4,41 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+// AutoBackgroundThreshold — wall-clock duration after which a still-
+// running foreground Bash gets promoted to a background job. The
+// foreground turn unblocks; the command keeps executing and the model
+// can poll via JobOutput / get a job_notification when it finishes.
+//
+// Mirrors claude-code's ASSISTANT_BLOCKING_BUDGET_MS (15s on their
+// side). 60s on metis is the user-chosen middle ground: long enough
+// that npm-install / go-test sized commands still complete in the
+// foreground, short enough that runaway loops don't lock the agent.
+var AutoBackgroundThreshold = 60 * time.Second
 
 type Bash struct {
 	gate       *permission.Gate
 	settings   config.ToolBashSettings
 	classifier *BashClassifier
+
+	// Jobs is the process-wide background job pool. nil disables the
+	// auto-background path entirely (foreground commands still run,
+	// they just hit the existing timeout instead of being adopted).
+	// Populated by RegisterWithJobs from runtime/agent_loop.go.
+	Jobs *jobs.Registry
 }
 
 func (b *Bash) classifierFor() *BashClassifier {
@@ -40,6 +60,12 @@ func (Bash) InputSchema() map[string]any {
 			"command":     map[string]any{"type": "string", "description": "shell command to execute"},
 			"description": map[string]any{"type": "string", "description": "5-10 word summary of what this does"},
 			"timeout_ms":  map[string]any{"type": "integer", "description": "override the default timeout"},
+			"run_in_background": map[string]any{
+				"type": "boolean",
+				"description": "Set to true to run the command in the background. " +
+					"You'll get a job ID immediately; use BashOutput to read its output and BashKill to stop it. " +
+					"Useful for dev servers, watchers, long builds. Sleep commands cannot be auto-backgrounded.",
+			},
 		},
 	}
 }
@@ -304,50 +330,290 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		}, nil
 	}
 
+	// Reject bare-sleep patterns that would just sit around blocking
+	// the foreground turn for nothing useful. Mirrors claude-code's
+	// detectBlockedSleepPattern (BashTool.tsx:322): standalone `sleep
+	// N` (N≥2) and `sleep N && check` are both pointless — the model
+	// is essentially polling, which a real signal (file watch, MCP
+	// event, or background-task notification) would handle better.
+	// Sub-2s sleeps and sleeps inside pipelines / subshells are fine.
+	if blocked := detectBlockedSleepPattern(cmd); blocked != "" {
+		return &tools.Result{
+			Output: fmt.Sprintf(
+				"[blocked sleep pattern] %s\n\n"+
+					"Bare `sleep N` (N ≥ 2 seconds) is rejected as a polling primitive — "+
+					"if you need to wait for something specific, watch a file or "+
+					"use run_in_background and BashOutput to poll the job's progress. "+
+					"For deliberate pacing under 2 seconds, use `sleep 0.5` etc.",
+				blocked,
+			),
+			IsError: true,
+		}, nil
+	}
+
+	wantBackground := false
+	if v, ok := in["run_in_background"].(bool); ok {
+		wantBackground = v
+	}
+
+	// Explicit run_in_background=true: skip the foreground race and
+	// hand the command straight to the job pool. We still build the
+	// *exec.Cmd here (so the env / sandbox policy is applied
+	// uniformly) — Spawn just adopts what we built.
+	if wantBackground {
+		return b.executeBackground(ctx, cmd)
+	}
+
+	return b.executeForegroundWithBgFallback(ctx, cmd, timeout)
+}
+
+// executeForegroundWithBgFallback runs cmd in the foreground but with
+// a 60s race: if the command outlives AutoBackgroundThreshold, it's
+// promoted to a background job (cmd keeps running, output keeps
+// growing) and the model gets a "moved to background" reply with a
+// job ID. Otherwise this is the existing pre-2026-05-09 behavior:
+// capped buffer, hit timeout, return.
+func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string, timeout time.Duration) (*tools.Result, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	// NOTE: cancel is intentionally NOT deferred at function-exit when
+	// the command gets promoted to a background job — Adopt takes
+	// ownership of cancel so JobKill can use it. Promotion path
+	// rebinds `cancel = func(){}` so the deferred runs, no-op.
+	canceled := false
+	defer func() {
+		if !canceled {
+			cancel()
+		}
+	}()
 
 	shell := b.settings.Shell
 	if shell == "" {
 		shell = "/bin/bash"
 	}
-	exe := exec.CommandContext(cctx, shell, "-c", cmd)
-	// Soft sandbox: filter sensitive env (API keys, tokens) and apply
-	// network policy. Pass-through if dangerously_inherit_env is set.
+	exe := exec.CommandContext(cctx, shell, "-c", cmdStr)
 	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
 	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
 	exe.Env = childEnv
+	// Put the bash leader + its children in their own process group so
+	// kill-on-promote (Adopt path) tree-kills cleanly. Effectively a
+	// no-op when the cmd never gets adopted — but cheap enough to do
+	// universally rather than guess at adoption time.
+	jobs.ApplyProcessGroup(exe)
+
 	var buf bytes.Buffer
 	maxBytes := b.settings.MaxOutputBytes
 	if maxBytes <= 0 {
 		maxBytes = 1 << 20
 	}
-	w := &cappedWriter{w: &buf, max: maxBytes}
-	exe.Stdout = w
-	exe.Stderr = w
+	cappedBuf := &cappedWriter{w: &buf, max: maxBytes}
 
-	err := exe.Run()
-	out := buf.String()
-	if w.truncated {
-		out += "\n\n... [output truncated at " + bytesString(maxBytes) + "] ..."
+	// If the job pool is wired up, also tee output to disk so we can
+	// adopt the cmd into a Job without losing anything. If the pool
+	// isn't wired (e.g. very early init / tests), we skip the disk
+	// half and the auto-bg promotion path becomes a no-op.
+	var diskOut *jobs.DiskOutput
+	canPromote := b.Jobs != nil && AutoBackgroundThreshold > 0 && AutoBackgroundThreshold < timeout
+	if canPromote {
+		var err error
+		diskOut, _, err = b.Jobs.NewDiskOutput()
+		if err != nil {
+			// Disk write failure shouldn't break Bash entirely — fall
+			// back to no-promotion mode. The foreground path still
+			// works exactly as before.
+			canPromote = false
+			diskOut = nil
+		}
 	}
 
-	res := &tools.Result{Output: out}
-	if cctx.Err() == context.DeadlineExceeded {
-		res.Output = out + "\n\n[command exceeded timeout " + timeout.String() + "]"
-		res.IsError = true
-		return res, nil
+	if canPromote {
+		exe.Stdout = io.MultiWriter(cappedBuf, diskOut.Writer())
+		exe.Stderr = io.MultiWriter(cappedBuf, diskOut.Writer())
+	} else {
+		exe.Stdout = cappedBuf
+		exe.Stderr = cappedBuf
 	}
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			res.Output = out + "\n\n[exit status " + intStr(ee.ExitCode()) + "]"
-			res.IsError = true
-			return res, nil
+
+	if err := exe.Start(); err != nil {
+		if diskOut != nil {
+			b.Jobs.CleanupOrphan(diskOut)
 		}
 		return nil, err
 	}
-	return res, nil
+	startedAt := time.Now()
+
+	// Race the wait against the auto-bg threshold timer. A select
+	// with two channels is the textbook pattern; we just have to
+	// drain the goroutine on the timer-wins branch (the cmd is still
+	// running on the other side).
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- exe.Wait() }()
+
+	var bgTimer <-chan time.Time
+	if canPromote {
+		t := time.NewTimer(AutoBackgroundThreshold)
+		defer t.Stop()
+		bgTimer = t.C
+	}
+
+	select {
+	case err := <-waitCh:
+		// Foreground completion (the common case). Tear down disk
+		// half and return the buffer.
+		if diskOut != nil {
+			b.Jobs.CleanupOrphan(diskOut)
+		}
+		out := buf.String()
+		if cappedBuf.truncated {
+			out += "\n\n... [output truncated at " + bytesString(maxBytes) + "] ..."
+		}
+		res := &tools.Result{Output: out}
+		if cctx.Err() == context.DeadlineExceeded {
+			res.Output = out + "\n\n[command exceeded timeout " + timeout.String() + "]"
+			res.IsError = true
+			return res, nil
+		}
+		if err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				res.Output = out + "\n\n[exit status " + intStr(ee.ExitCode()) + "]"
+				res.IsError = true
+				return res, nil
+			}
+			return nil, err
+		}
+		return res, nil
+
+	case <-bgTimer:
+		// 60s elapsed and command is still running. Promote to job.
+		// We hand cancel ownership to Adopt so JobKill can escalate
+		// to SIGKILL via context cancel; rebind our own var so the
+		// function-exit defer is a no-op.
+		jb, err := b.Jobs.Adopt(jobs.AdoptArgs{
+			Command:     cmdStr,
+			Description: "",
+			Cmd:         exe,
+			Cancel:      cancel,
+			Output:      diskOut,
+			StartTime:   startedAt,
+		})
+		if err != nil {
+			// Adoption failed — let the cmd finish in the foreground
+			// after all. Drain the wait we already started.
+			err2 := <-waitCh
+			out := buf.String()
+			res := &tools.Result{Output: out, IsError: err2 != nil}
+			return res, nil
+		}
+		canceled = true // Adopt owns the cancel now
+		preview := buf.String()
+		if cappedBuf.truncated {
+			preview += "\n... [output truncated at " + bytesString(maxBytes) + "] ..."
+		}
+		msg := fmt.Sprintf(
+			"[command moved to background after %s — still running, job_id=%s]\n"+
+				"Use BashOutput {job_id: %q} to read more output, BashKill {job_id: %q} to stop.\n"+
+				"Output captured in foreground (%d bytes):\n%s",
+			AutoBackgroundThreshold, jb.ID, jb.ID, jb.ID, len(buf.Bytes()), preview,
+		)
+		// IsError=false: this is a normal flow, not an error. The
+		// model should treat the job_id as the way forward.
+		return &tools.Result{Output: msg}, nil
+	}
+}
+
+// executeBackground starts cmd directly in the job pool — the
+// foreground reply is just "running with job_id=X" and the model
+// uses BashOutput / BashKill to interact further. Used for the
+// explicit run_in_background=true path.
+func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Result, error) {
+	if b.Jobs == nil {
+		return &tools.Result{
+			Output:  "[run_in_background] not available: jobs registry not wired (build error?)",
+			IsError: true,
+		}, nil
+	}
+	// Fresh context — background jobs don't share the Execute ctx
+	// (which gets canceled when the foreground turn ends). The job
+	// outlives the turn intentionally.
+	bgCtx, cancel := context.WithCancel(context.Background())
+	_ = ctx // intentionally not used; see comment above
+
+	shell := b.settings.Shell
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	exe := exec.CommandContext(bgCtx, shell, "-c", cmdStr)
+	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
+	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
+	exe.Env = childEnv
+	jobs.ApplyProcessGroup(exe)
+
+	jb, err := b.Jobs.Spawn(jobs.SpawnArgs{
+		Command: cmdStr,
+		Cmd:     exe,
+		Cancel:  cancel,
+	})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &tools.Result{
+		Output: fmt.Sprintf(
+			"[command running in background, job_id=%s]\n"+
+				"Use BashOutput {job_id: %q} to read its output, BashKill {job_id: %q} to stop.\n"+
+				"You'll receive a <job_notification> when the command exits.",
+			jb.ID, jb.ID, jb.ID,
+		),
+	}, nil
+}
+
+// blockedSleepRE matches a leading `sleep N` segment (N integer ≥ 1)
+// at the start of a command. We deliberately don't treat float sleeps
+// (sleep 0.5) the same way — those are legitimate pacing patterns.
+var blockedSleepRE = regexp.MustCompile(`^\s*sleep\s+(\d+)\s*(.*)$`)
+
+// detectBlockedSleepPattern returns a non-empty diagnostic when cmd
+// is a bare `sleep N` (N ≥ 2) or `sleep N && rest` / `sleep N; rest`
+// pattern. Returns "" when the sleep is fine to execute (sub-2s, in a
+// pipeline, in a subshell, in a script).
+//
+// Why we reject these specifically: they're the model's "polling
+// pattern" — a sign it's waiting for something it should be watching
+// instead. Catching the polite cases (`sleep 30 && check_status`) at
+// the tool boundary forces a redirect to the job-notification or
+// file-watch path, which is more responsive AND doesn't burn the
+// foreground turn.
+func detectBlockedSleepPattern(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	// Inside a pipeline / subshell / heredoc / for-loop, sleep is
+	// fine — those are real scripts, not idle polls.
+	if strings.ContainsAny(cmd, "|()<>") {
+		return ""
+	}
+	if strings.Contains(cmd, "for ") || strings.Contains(cmd, "while ") {
+		return ""
+	}
+	m := blockedSleepRE.FindStringSubmatch(cmd)
+	if m == nil {
+		return ""
+	}
+	secs := 0
+	for _, c := range m[1] {
+		secs = secs*10 + int(c-'0')
+	}
+	if secs < 2 {
+		return ""
+	}
+	rest := strings.TrimSpace(m[2])
+	if rest == "" {
+		return fmt.Sprintf("standalone `sleep %d`", secs)
+	}
+	// `sleep N && check` or `sleep N; check` — also rejected.
+	if strings.HasPrefix(rest, "&&") || strings.HasPrefix(rest, ";") {
+		return fmt.Sprintf("`sleep %d` followed by chained command", secs)
+	}
+	// e.g. `sleep 5 anything-else` (rare); reject to be safe.
+	return fmt.Sprintf("`sleep %d` with trailing args", secs)
 }
 
 type cappedWriter struct {

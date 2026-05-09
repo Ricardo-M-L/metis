@@ -26,6 +26,81 @@ func toolResultBlock(id, output string) llm.Message {
 	}}
 }
 
+func TestUndoWithPrefill_ReturnsLastUserText(t *testing.T) {
+	msgs := []llm.Message{
+		userText("first prompt"),
+		assistantText("first reply"),
+		userText("second prompt that I want to edit"),
+		assistantText("second reply"),
+	}
+	out, prefill, ok := UndoWithPrefill(msgs)
+	if !ok {
+		t.Fatal("UndoWithPrefill should ok=true when there's a turn to undo")
+	}
+	if prefill != "second prompt that I want to edit" {
+		t.Errorf("prefill = %q; want second prompt verbatim", prefill)
+	}
+	if len(out) != 2 {
+		t.Errorf("len(out) = %d; want 2 (only first turn left)", len(out))
+	}
+}
+
+func TestUndoWithPrefill_NotokOnEmpty(t *testing.T) {
+	out, prefill, ok := UndoWithPrefill(nil)
+	if ok {
+		t.Error("UndoWithPrefill on empty msgs should ok=false")
+	}
+	if prefill != "" {
+		t.Errorf("prefill on no-op should be empty; got %q", prefill)
+	}
+	if out != nil {
+		t.Errorf("out on no-op should be nil; got %+v", out)
+	}
+}
+
+func TestUndoWithPrefill_LastBlockOfMultiBlockUserMsg(t *testing.T) {
+	// A user message with two text blocks (e.g. a system context block
+	// prepended ahead of the user's actual question). We return the
+	// LAST text block — that's what the user typed.
+	msgs := []llm.Message{
+		{
+			Role: llm.RoleUser,
+			Content: []llm.ContentBlock{
+				{Type: "text", Text: "[context: today is Tuesday]"},
+				{Type: "text", Text: "what should I work on?"},
+			},
+		},
+		assistantText("Reply A"),
+	}
+	_, prefill, ok := UndoWithPrefill(msgs)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if prefill != "what should I work on?" {
+		t.Errorf("prefill = %q; want last text block only", prefill)
+	}
+}
+
+func TestUndoWithPrefill_SkipsToolResultUserMessages(t *testing.T) {
+	// Tool-result user messages must NOT be returned as prefill.
+	msgs := []llm.Message{
+		userText("real user prompt"),
+		toolUseBlock("1", "Bash"),
+		toolResultBlock("1", "tool output"),
+		assistantText("done"),
+	}
+	out, prefill, ok := UndoWithPrefill(msgs)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if prefill != "real user prompt" {
+		t.Errorf("prefill = %q; want plain-user prompt only", prefill)
+	}
+	if len(out) != 0 {
+		t.Errorf("out = %+v; want empty (everything popped)", out)
+	}
+}
+
 func TestUndo_PopsTheLastTurn(t *testing.T) {
 	msgs := []llm.Message{
 		userText("first prompt"),

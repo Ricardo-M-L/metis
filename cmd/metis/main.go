@@ -21,7 +21,10 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/channels"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/exitcode"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
@@ -32,6 +35,7 @@ import (
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tui"
 	"github.com/Ricardo-M-L/metis/internal/version"
+	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
 // defaultSystem is the embedded base system prompt. The actual text
@@ -45,11 +49,19 @@ var defaultSystem = rtpkg.DefaultBasePrompt()
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	// Wait for in-flight LLM transport dump-prompts goroutines before
+	// process exit so the JSONL file isn't missing the response side
+	// of fast `metis run` invocations. METIS_DUMP_PROMPTS off → no-op
+	// (no goroutines to wait on). 2026-05-09 fix.
+	defer transport.FlushDumps()
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
 		if !errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, "metis:", err)
 		}
-		os.Exit(1)
+		// FlushDumps must run before os.Exit (deferred funcs are
+		// skipped on os.Exit). Call directly here too.
+		transport.FlushDumps()
+		os.Exit(exitcode.Classify(err))
 	}
 }
 
@@ -106,9 +118,46 @@ func dispatch(ctx context.Context, args []string) error {
 		printUsage()
 		return nil
 	default:
-		// No subcommand: treat as inline prompt for `run`
+		// No subcommand. The default fallback is to treat args as an
+		// inline prompt for `run` (so `metis "explain X"` works as a
+		// one-shot). But the claude-code "open chat with intent"
+		// gestures — bare `-r` / `--resume` / `-c` / `--continue`,
+		// optionally followed by a session id — must route to chat
+		// instead, otherwise a user typing `metis -r` to open the
+		// session picker hits "run: prompt is required" because
+		// cmdRun's parseFlags strips the flags and finds no prompt.
+		// This was the 2026-05-08 user video bug.
+		if hasInteractiveIntentFlag(args) {
+			return cmdChat(ctx, args)
+		}
 		return cmdRun(ctx, args)
 	}
+}
+
+// hasInteractiveIntentFlag reports whether args contain any of the
+// flags that mean "open the chat TUI with this state primed":
+// -r / --resume (with or without a value), -c / --continue. A user
+// typing one of these without an explicit `chat` subcommand wants
+// chat, not run.
+//
+// We keep this narrow on purpose. A general "all flags, no prompt =
+// chat" heuristic would mis-route `metis -m gpt-4 "what is 2+2"` —
+// scanning for flag-vs-value boundaries to disambiguate is fragile.
+// The specific pain point the user hit is the resume gesture, so we
+// only special-case that family.
+func hasInteractiveIntentFlag(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-r", "--resume", "-c", "--continue":
+			return true
+		}
+		// `--resume=xyz` / `--continue=true` forms (uncommon but legal
+		// for Go's flag package) — match by prefix.
+		if strings.HasPrefix(a, "--resume=") || strings.HasPrefix(a, "--continue=") {
+			return true
+		}
+	}
+	return false
 }
 
 func printUsage() {
@@ -243,6 +292,12 @@ type cliFlags struct {
 	inputFormat  string
 	outputFormat string
 
+	// --auto-memory: turn on extractMemories v2 (Claude Code parity).
+	// Off by default — opt-in keeps the per-turn LLM-call cost
+	// predictable. Also accept METIS_AUTO_MEMORY=1 as env fallback so
+	// users can persist via shell init without typing the flag.
+	autoMemory bool
+
 	// Phase E #46-#48 — small ergonomic flags. None of these change
 	// runtime behaviour drastically; they're either UI hints (a session
 	// name shown in /sessions) or sugar over existing surfaces (a /batch
@@ -342,6 +397,9 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 		"start in agent-teams mode (a /batch shortcut surface)")
 	f.BoolVar(&out.tmuxOn, "tmux", false,
 		"when starting in a worktree, also wrap the session in a tmux pane")
+	// Auto-memory v2 — extractMemories on LoopEnd via forked agent.
+	f.BoolVar(&out.autoMemory, "auto-memory", false,
+		"enable auto-memory extraction on every turn boundary (writes to ~/.metis/memory/<topic>.md)")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -349,7 +407,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 }
 
 func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
-	cfg, loaded, err := config.Load()
+	cfg, loaded, snap, err := config.LoadWithSnapshot()
 	if err != nil {
 		return nil, err
 	}
@@ -493,6 +551,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		rtpkg.DefaultBasePrompt(),
 		rtpkg.AssembleOptions{Minimal: true},
 	)
+	// Background-bash job pool. One per process so all chat / run /
+	// agent paths share the same `bg_<id>.out` filesystem layout +
+	// `<job_notification>` sink. Created here so BuildToolRegistry
+	// can wire it into Bash + register BashList/BashOutput/BashKill.
+	jobsPool := jobs.NewRegistry("")
+
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
 		Cfg:             cfg,
 		Gate:            gate,
@@ -504,6 +568,8 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		DefaultPlatform: cfg.Channels.DefaultPlatform,
 		CronService:     cronSvc,
 		MemoryManager:   memoryMgr,
+		Jobs:            jobsPool,
+		ConfigSnapshot:  snap,
 	})
 
 	// MCP servers — launch each enabled stdio server, register its tools as
@@ -586,6 +652,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Provider: prov, Registry: reg, Gate: gate,
 		System: system, Model: model, MaxIter: maxIter,
 		MemoryManager: memoryMgr,
+		Jobs:          jobsPool,
 	})
 
 	// Apply --effort / --fast flag overrides. Effort goes through the
@@ -602,6 +669,25 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	}
 	if flags.fast {
 		loop.Fast = true
+	}
+
+	// Auto-memory v2: opt-in via --auto-memory or METIS_AUTO_MEMORY=1.
+	// Wires the extractor to LoopEnd; extractor itself is best-effort
+	// and never blocks the turn.
+	if flags.autoMemory || os.Getenv("METIS_AUTO_MEMORY") == "1" {
+		loop.AutoMemory = true
+		ext, err := agent.NewAutoMemoryExtractor(loop, "")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "metis: auto-memory init: %v (disabled)\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "metis: auto-memory enabled (memdir: %s)\n", ext.MemdirRoot())
+			loop.Hooks.Register(pubhook.LoopEndHandler(func(ctx context.Context, _ pubhook.Context, stopReason string) {
+				if os.Getenv("METIS_AUTO_MEMORY_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "[auto-memory] LoopEnd stop=%s — invoking extractor\n", stopReason)
+				}
+				ext.OnLoopEnd(ctx, stopReason)
+			}))
+		}
 	}
 
 	rt := &runtime{
@@ -655,6 +741,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// TodoRead persist into the right per-session file. Done last so a
 	// resume failure above doesn't leave a stale id in the singleton.
 	rtpkg.SetCurrentSessionID(rt.sessionID)
+	// Wire the same id into the LLM transport layer so dump-prompts
+	// (METIS_DUMP_PROMPTS=1) lands in dump-prompts/<sid>.jsonl
+	// instead of dump-prompts/default.jsonl.
+	transport.SetSessionID(rt.sessionID)
 	// Same dance for the structured Task* tools (TaskCreate / TaskList /
 	// TaskUpdate / TaskOutput / TaskStop / TaskGet). Lives in the
 	// internal/tasks package (not runtime) to break an otherwise
@@ -896,7 +986,32 @@ func cmdRun(ctx context.Context, args []string) error {
 			return ev.Err
 		}
 	}
-	return <-done
+	err = <-done
+
+	// Wait for any in-flight auto-memory forks (extractMemories) to
+	// finish before exiting — without this, `metis run` returns the
+	// instant EventLoopDone fires, but the LoopEnd hook spawned a
+	// goroutine that would die mid-Complete. 45s cap covers the long
+	// tail: 2-4 turn extractions on slower providers (MiniMax thinking
+	// path took 14-15s in real testing); shorter caps were truncating
+	// mid-fork.
+	if flags.autoMemory || os.Getenv("METIS_AUTO_MEMORY") == "1" {
+		waitForkInflight(45 * time.Second)
+	}
+	return err
+}
+
+// waitForkInflight blocks until agent.ForkInflight() returns 0 or the
+// timeout elapses. Polled with a tight cadence — extractor forks are
+// I/O-bound (LLM round-trip), so we don't burn CPU here.
+func waitForkInflight(maxWait time.Duration) {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if agent.ForkInflight() == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func cmdACP(ctx context.Context, args []string) error {
@@ -1300,6 +1415,9 @@ func cmdConfig(args []string) error {
 		fmt.Printf("ui.markdown = %v\n", cfg.UI.Markdown)
 		fmt.Printf("loop_detection.enabled = %v\n", cfg.LoopDetection.Enabled)
 		fmt.Printf("loop_detection.global = %d\n", cfg.LoopDetection.Global)
+		fmt.Printf("loop_detection.signature_window = %d\n", cfg.LoopDetection.SignatureWindow)
+		fmt.Printf("loop_detection.signature_max_repeats = %d\n", cfg.LoopDetection.SignatureMaxRepeats)
+		fmt.Printf("tools.enable_tool_search = %q (env)\n", os.Getenv("ENABLE_TOOL_SEARCH"))
 		return nil
 	case "init":
 		return writeStarterConfig()
@@ -1332,6 +1450,10 @@ func cmdTools() error {
 	// Memory tool — same pattern, point at the real on-disk store so
 	// `/tools` listing reflects it.
 	reg.Register(builtin.NewMemory(gate, rtpkg.BuildMemoryManager(cfg)))
+	// MetisInfo — read-only introspection. Listed so users know the
+	// capability exists; live wiring (skills loader / jobs registry /
+	// snapshot) only happens in setupRuntime / chat sessions.
+	reg.Register(builtin.NewMetisInfo(gate, cfg, nil, nil, reg))
 	for _, t := range reg.All() {
 		fmt.Printf("%-15s  %s\n", t.Name(), t.Description())
 	}

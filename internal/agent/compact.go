@@ -378,6 +378,16 @@ func (c *Compactor) Snip(messages []llm.Message) []llm.Message {
 			if len(b.ToolResult) <= c.SnipMaxToolResultChars {
 				continue
 			}
+			// Idempotency guard: a tool_result that ALREADY carries a
+			// "[snipped: N chars omitted]" marker has already passed
+			// through Snip on a prior turn — re-snipping it would just
+			// nibble the marker tail off (the bug caught on
+			// 2026-05-08 by TestSnipE2E_RepeatedSnipIsIdempotent:
+			// 1500 → 230 → 228 → 226 …). Skip when the marker is
+			// present.
+			if strings.Contains(b.ToolResult, "[snipped:") {
+				continue
+			}
 			// Keep the first chunk (typically a "Found N matches" or
 			// command-output preamble) plus a truthful marker so the
 			// model knows content was dropped.

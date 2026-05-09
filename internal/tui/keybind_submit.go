@@ -145,10 +145,21 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// reserved for slash commands above and the explicit /steer
 		// alias users can still call.
 		m.queuedPrompts = append(m.queuedPrompts, raw)
+		// Include a peek of the user's text so the chatList notice is
+		// self-explanatory when the user later scrolls back. The sticky
+		// queue pill above the input was removed (it anchored to the
+		// bottom and didn't follow scroll); this notice is the only
+		// in-stream record of what was queued, so the peek matters.
+		peek := strings.TrimSpace(raw)
+		const maxPeek = 80
+		if rs := []rune(peek); len(rs) > maxPeek {
+			peek = string(rs[:maxPeek-1]) + "…"
+		}
+		notice := fmt.Sprintf("(queued × %d · Ctrl+C to clear): %s",
+			len(m.queuedPrompts), peek)
 		m.messages = append(m.messages, Message{
-			Role: "info",
-			Content: fmt.Sprintf("(queued · will run after current turn · queue size %d · Ctrl+C to clear)",
-				len(m.queuedPrompts)),
+			Role:      "info",
+			Content:   notice,
 			Timestamp: time.Now(),
 		})
 		m.input.Reset()
@@ -286,10 +297,8 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if cmd.Name == "clear" {
-				m.loop.Reset()
-				m.messages = nil
-				m.toolEvents = nil
-				m.totalTokens.Reset()
+				// Consolidated path — see internal/tui/reload.go.
+				m.Reload(ReloadOpts{})
 				return m, nil
 			}
 			output := cmd.Handler(m.asREPL(), args)
@@ -317,30 +326,27 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalQuit:
 			return m, tea.Quit
 		case slash.SignalClear:
-			m.loop.Reset()
-			m.messages = nil
-			m.toolEvents = nil
-			m.totalTokens.Reset()
+			m.Reload(ReloadOpts{})
 		case slash.SignalNew:
-			// Save daily note before starting new session
-			if m.loop.Memory != nil {
-				summary := m.summarizeHistory()
-				_ = m.loop.Memory.SaveDailyNote(m.sessionID, "new", summary)
-			}
-			m.loop.Reset()
-			m.messages = nil
-			m.toolEvents = nil
-			m.totalTokens.Reset()
-			m.firstRender = true // Show banner again for new session
-			m.showBanner = true
+			m.Reload(ReloadOpts{
+				SaveDailyNote: true,
+				ResetReason:   "new",
+				ShowBanner:    true,
+			})
 		case slash.SignalUndo:
-			if ok := m.loop.UndoLastTurn(); ok {
-				// Trim the visible log to mirror the loop history:
-				// drop everything after (and including) the last user
-				// message, plus any tool events tied to that turn.
+			// Prefill behaviour: pop the last turn AND drop the user's
+			// original text into the input box so they can edit-and-resend
+			// instead of retyping. Mirrors kimi-cli's /undo UX. Empty
+			// prefill (synthetic turn) preserves the input box untouched.
+			if prefill, ok := m.loop.UndoLastTurnWithPrefill(); ok {
 				m.messages = trimVisibleMessagesToLastUser(m.messages)
 				m.toolEvents = nil
-				m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn)", Timestamp: time.Now()})
+				if prefill != "" {
+					m.input.SetValue(prefill)
+					m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn — original text in input)", Timestamp: time.Now()})
+				} else {
+					m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn)", Timestamp: time.Now()})
+				}
 			} else {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to undo)", Timestamp: time.Now()})
 			}
@@ -544,6 +550,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.spinnerActive = true
 	m.spinnerFrame = 0
 	m.spinnerStartedAt = time.Now()
+	// OSC 9;4 indeterminate progress — terminals that support it
+	// (iTerm2 / Ghostty / WezTerm) light up the dock icon with a
+	// barber-pole "working" indicator. Cleared on turn end.
+	SendProgress(ProgressIndeterminate, 0)
 	m.firstStreamAt = time.Time{}
 	m.spinnerVerb = pickSpinnerVerb()
 	m.spinnerSub = ""

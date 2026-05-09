@@ -430,6 +430,22 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 				}
 				return nil, err
 			}
+			// Realpath-dedup state for this layer's scan: keep one
+			// canonical → first-seen-name mapping so a symlink farm
+			// (`~/.metis/skills/{foo,bar,baz}.md` all pointing at the
+			// same target) emits the skill exactly once. Mirrors
+			// openclaude's bundled-skills realpath dedup. Without this,
+			// the loader's name-based dedup later kicks in and would
+			// log spurious "X overrides X" warnings.
+			seen := make(map[string]bool, len(ents))
+			markSeen := func(path string) bool {
+				canon := canonicalPath(path)
+				if seen[canon] {
+					return true
+				}
+				seen[canon] = true
+				return false
+			}
 			var out []Skill
 			for _, e := range ents {
 				entryName := e.Name()
@@ -440,7 +456,7 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 					// Tree layout: scan the subtree for category/<name>/SKILL.md
 					// and category/<name>/<anything>.md. Cap depth at 3 so a
 					// stray symlink can't walk us into infinity.
-					subSkills := scanSkillSubtree(filepath.Join(dir, entryName), 3)
+					subSkills := scanSkillSubtreeDedup(filepath.Join(dir, entryName), 3, seen)
 					out = append(out, subSkills...)
 					continue
 				}
@@ -449,7 +465,11 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 				if ext != ".md" && ext != ".markdown" && ext != ".json" {
 					continue
 				}
-				sk, err := Load(filepath.Join(dir, entryName))
+				path := filepath.Join(dir, entryName)
+				if markSeen(path) {
+					continue
+				}
+				sk, err := Load(path)
 				if err != nil || sk == nil {
 					continue
 				}
@@ -460,6 +480,21 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 	}
 }
 
+// canonicalPath returns filepath.EvalSymlinks(path) when it succeeds,
+// or the original path. Used as the dedup key inside dirLayer/Scan.
+// We never error out — a broken symlink falls through as "unique"
+// path and the duplicate skill name (if any) is caught by the
+// loader's name-based dedup downstream.
+func canonicalPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	return path
+}
+
 // scanSkillSubtree walks `root` looking for skill manifests up to
 // `maxDepth` levels deep. Recognised manifests:
 //   - <root>/<name>/SKILL.md       (preferred; hermes layout)
@@ -468,13 +503,32 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 //
 // Skills inside a category dir inherit the category from the
 // directory name when the manifest doesn't set one explicitly.
+//
+// Backwards-compat shim: callers that don't care about realpath
+// dedup keep working. The dedup-aware variant is used by dirLayer.
 func scanSkillSubtree(root string, maxDepth int) []Skill {
+	return scanSkillSubtreeDedup(root, maxDepth, map[string]bool{})
+}
+
+// scanSkillSubtreeDedup is scanSkillSubtree with a caller-supplied
+// realpath-seen map so dirLayer's flat + tree paths share one dedup
+// pool. Without this, a symlink in the flat layout pointing to a
+// SKILL.md inside a category dir would emit twice.
+func scanSkillSubtreeDedup(root string, maxDepth int, seen map[string]bool) []Skill {
 	if maxDepth < 0 {
 		return nil
 	}
 	ents, err := os.ReadDir(root)
 	if err != nil {
 		return nil
+	}
+	markSeen := func(path string) bool {
+		canon := canonicalPath(path)
+		if seen[canon] {
+			return true
+		}
+		seen[canon] = true
+		return false
 	}
 	var out []Skill
 	categoryFromDir := filepath.Base(root)
@@ -490,6 +544,11 @@ func scanSkillSubtree(root string, maxDepth int) []Skill {
 			loaded := false
 			for _, c := range candidates {
 				p := filepath.Join(full, c)
+				if markSeen(p) {
+					// Already loaded via another path (symlink).
+					loaded = true
+					break
+				}
 				if sk, err := Load(p); err == nil && sk != nil {
 					if sk.Category == "" {
 						sk.Category = categoryFromDir
@@ -501,12 +560,15 @@ func scanSkillSubtree(root string, maxDepth int) []Skill {
 			}
 			if !loaded {
 				// Recurse one more level (e.g. category/sub-category/skill/SKILL.md).
-				out = append(out, scanSkillSubtree(full, maxDepth-1)...)
+				out = append(out, scanSkillSubtreeDedup(full, maxDepth-1, seen)...)
 			}
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(name))
 		if ext != ".md" && ext != ".markdown" && ext != ".json" {
+			continue
+		}
+		if markSeen(full) {
 			continue
 		}
 		if sk, err := Load(full); err == nil && sk != nil {

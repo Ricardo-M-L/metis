@@ -5,6 +5,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -28,6 +29,14 @@ type AgentLoopOptions struct {
 	// letting the Memory tool write through the same store the Loop
 	// reads via BuildContext (fixes the 2026-04-30 disconnect bug).
 	MemoryManager *memory.MemoryManager
+
+	// Jobs is the background-bash pool shared between Bash auto-bg
+	// promotion and the Loop.injectJobNotifications drainer. nil
+	// disables the entire job-pool feature on this Loop (sub-agents,
+	// headless tests). Same instance flows into BuildToolRegistry so
+	// BashList / BashOutput / BashKill see the same jobs the Loop's
+	// notification path drains.
+	Jobs *jobs.Registry
 }
 
 // BuildMemoryManager constructs a MemoryManager rooted under the
@@ -91,6 +100,23 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		loop.Memory = mm
 	}
 
+	// Lazy MCP tool schemas (ToolSearch). Mode is read from the
+	// ENABLE_TOOL_SEARCH env var inside agent/dispatch.go on every
+	// call — we just need to feed Loop.ContextWindow so the auto
+	// mode has a budget to compare against. 0 here means the
+	// provider didn't publish a window; auto mode silently no-ops
+	// in that case.
+	loop.ContextWindow = opts.Provider.MaxContextTokens()
+
+	// Wire jobs.Registry → Loop.JobNotify so the Run loop drains
+	// completed bash jobs and injects <job_notification> messages.
+	// Loop.Jobs gets the same pointer so the TUI status bar can
+	// render a "⚙ N jobs" chip without crossing the runtime layer.
+	if opts.Jobs != nil {
+		loop.JobNotify = opts.Jobs.Notify()
+		loop.Jobs = opts.Jobs
+	}
+
 	// Auto-compaction. Threshold from cfg, fallback to package default.
 	compactCfg := agent.DefaultCompactionConfig()
 	if cfg.Session.AutoCompactThreshold > 0 {
@@ -105,10 +131,27 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// only triggers at 163k input — but the API rejects at 128k.
 	loop.Compactor.MaxOutputTokens = providerMaxTokens(cfg)
 
-	// Loop detector — only wire when explicitly enabled. Without a
-	// detector the loop runs unbounded; the global iteration cap on
-	// agent.Loop is the only safety net.
-	if cfg.LoopDetection.Enabled {
+	// Tier the compactor's per-block thresholds to the active provider's
+	// effective input cap. openclaude's `compressToolHistory.ts` insight:
+	// a 16k window can't afford the same "keep 800 chars per old
+	// tool_result" budget that a 200k window happily absorbs. metis's
+	// default config used to apply the 800-char cap regardless of
+	// window, which made small-window OpenAI-compat providers
+	// (DeepSeek-V2 16k, Ollama defaults) thrash on long sessions.
+	// Apply the tier AFTER MaxOutputTokens is set so the effective cap
+	// is correct.
+	loop.Compactor.ApplyWindowTier(opts.Provider.MaxContextTokens() - providerMaxTokens(cfg))
+
+	// Loop detector — wired by default (post-2026-05-08). The earlier
+	// opt-in design left the user's only safety net at MaxIters=50,
+	// which a runaway turn could plausibly reach in well under an hour
+	// while looking like normal work; the live video showed 1h 18m of
+	// repeated `cd … && git rebase --continue` retries with no halt.
+	// Now the detector is always on with crush-parity signature
+	// thresholds (10-step window, ≥5 same-signature steps trip).
+	// `[loop_detection].disabled = true` in config.toml turns it off
+	// for users who explicitly want unbounded loops.
+	if !cfg.LoopDetection.Disabled {
 		det := agent.NewLoopDetector()
 		if cfg.LoopDetection.Warning > 0 {
 			det.WarningThreshold = cfg.LoopDetection.Warning
@@ -118,6 +161,12 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		}
 		if cfg.LoopDetection.Global > 0 {
 			det.GlobalThreshold = cfg.LoopDetection.Global
+		}
+		if cfg.LoopDetection.SignatureWindow > 0 {
+			det.SignatureWindowSize = cfg.LoopDetection.SignatureWindow
+		}
+		if cfg.LoopDetection.SignatureMaxRepeats > 0 {
+			det.SignatureMaxRepeats = cfg.LoopDetection.SignatureMaxRepeats
 		}
 		loop.Detector = det
 	}

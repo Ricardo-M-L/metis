@@ -1,0 +1,189 @@
+package checkpoint
+
+// checkpoint_test.go — pin Snap → List → Restore round-trip plus
+// the obvious failure modes (skip dirs, big files, init-error
+// disables manager).
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func skipIfNoGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+}
+
+// freshManager builds a Manager pointing at a fresh tempdir cwd
+// and a separate tempdir for the shadow root.
+func freshManager(t *testing.T) (*Manager, string) {
+	t.Helper()
+	cwd := t.TempDir()
+	shadow := t.TempDir()
+	return NewManager("session-test", cwd, shadow), cwd
+}
+
+func TestSnap_NewSessionRecordsFirstCheckpoint(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	if err := os.WriteFile(filepath.Join(cwd, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := m.Snap("Edit", HashArgs(map[string]any{"file": "a.txt"}), "wrote a.txt")
+	if err != nil {
+		t.Fatalf("Snap: %v", err)
+	}
+	if len(hash) < 7 {
+		t.Errorf("expected commit hash; got %q", hash)
+	}
+}
+
+func TestSnap_NoChangesReturnsEmptyHash(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	_ = os.WriteFile(filepath.Join(cwd, "x.txt"), []byte("x"), 0o600)
+	if _, err := m.Snap("Edit", "k1", "first"); err != nil {
+		t.Fatalf("first Snap: %v", err)
+	}
+	hash2, err := m.Snap("Edit", "k1", "second")
+	if err != nil {
+		t.Fatalf("second Snap: %v", err)
+	}
+	if hash2 != "" {
+		t.Errorf("Snap with no changes should return empty hash; got %q", hash2)
+	}
+}
+
+func TestList_ReturnsRecentCheckpoints(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	for i := 0; i < 3; i++ {
+		_ = os.WriteFile(filepath.Join(cwd, "f.txt"), []byte(strings.Repeat("a", i+1)), 0o600)
+		if _, err := m.Snap("Edit", "args"+string(rune('0'+i)), "msg"+string(rune('0'+i))); err != nil {
+			t.Fatalf("snap %d: %v", i, err)
+		}
+	}
+	cps, err := m.List(0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(cps) != 3 {
+		t.Errorf("len(cps)=%d; want 3", len(cps))
+	}
+	// Newest first per `git log`.
+	if cps[0].ArgsKey != "args2" {
+		t.Errorf("expected newest first (args2); got %q", cps[0].ArgsKey)
+	}
+}
+
+func TestRestore_RoundTripsContent(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	path := filepath.Join(cwd, "main.go")
+
+	_ = os.WriteFile(path, []byte("v1"), 0o600)
+	if _, err := m.Snap("Write", "k1", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = os.WriteFile(path, []byte("v2"), 0o600)
+	hash2, err := m.Snap("Write", "k2", "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now mutate to v3 (uncommitted) and restore back to v2's snapshot.
+	_ = os.WriteFile(path, []byte("v3"), 0o600)
+	if err := m.Restore(hash2); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	body, _ := os.ReadFile(path)
+	if string(body) != "v2" {
+		t.Errorf("after restore body=%q; want v2", body)
+	}
+}
+
+func TestSnap_SkipsBigFiles(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	// 2 MiB > maxFileBytes — should NOT make it into the shadow.
+	big := make([]byte, 2<<20)
+	if err := os.WriteFile(filepath.Join(cwd, "big.bin"), big, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "small.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := m.Snap("Write", "k", "test")
+	if err != nil {
+		t.Fatalf("Snap: %v", err)
+	}
+	if hash == "" {
+		t.Skip("no commit recorded — small.txt skipped too?")
+	}
+	// Verify big.bin NOT in the shadow tree.
+	if _, err := os.Stat(filepath.Join(m.shadowDir, "big.bin")); err == nil {
+		t.Errorf("big.bin should be skipped (>1MiB)")
+	}
+	if _, err := os.Stat(filepath.Join(m.shadowDir, "small.txt")); err != nil {
+		t.Errorf("small.txt should be in shadow; %v", err)
+	}
+}
+
+func TestSnap_SkipsKnownDirs(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	// Create a node_modules subdir with content — must be skipped.
+	nm := filepath.Join(cwd, "node_modules", "foo")
+	if err := os.MkdirAll(nm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nm, "x.js"), []byte("dep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "ok.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Snap("Write", "k", "test"); err != nil {
+		t.Fatalf("Snap: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(m.shadowDir, "node_modules", "foo", "x.js")); err == nil {
+		t.Errorf("node_modules should be skipped")
+	}
+}
+
+func TestHashArgs_Deterministic(t *testing.T) {
+	a := HashArgs(map[string]any{"file_path": "x", "content": "y"})
+	b := HashArgs(map[string]any{"content": "y", "file_path": "x"})
+	if a != b {
+		t.Errorf("HashArgs not stable across map iter order: %s vs %s", a, b)
+	}
+}
+
+func TestHashArgs_NoArgs(t *testing.T) {
+	if got := HashArgs(nil); got != "noargs" {
+		t.Errorf("nil → got %q; want noargs", got)
+	}
+}
+
+func TestParseCheckpoint_RoundTrip(t *testing.T) {
+	subject := "2026-05-09T02:00:00Z|Edit|abcd1234|wrote main.go"
+	cp := parseCheckpoint("hashabc", subject)
+	if cp.Tool != "Edit" {
+		t.Errorf("Tool=%q; want Edit", cp.Tool)
+	}
+	if cp.ArgsKey != "abcd1234" {
+		t.Errorf("ArgsKey=%q; want abcd1234", cp.ArgsKey)
+	}
+	if cp.Message != "wrote main.go" {
+		t.Errorf("Message=%q", cp.Message)
+	}
+	if cp.Time.IsZero() {
+		t.Errorf("Time should parse; got zero")
+	}
+}

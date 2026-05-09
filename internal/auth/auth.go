@@ -55,6 +55,13 @@ func Path() string {
 // map so callers can append-and-save without first checking existence.
 func Load() (File, error) {
 	p := Path()
+	// Permission hygiene: auth.json holds API keys. minimax-cli's
+	// `auth/credentials.ts` does the same check — if the file is
+	// world- or group-readable, warn the user and tighten it back to
+	// 0600 before reading. We don't refuse to load (that would brick
+	// users mid-session over a permission glitch), just self-heal +
+	// stderr warning. See `assertSecurePerms` below for the rule.
+	assertSecurePerms(p)
 	b, err := os.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -73,6 +80,34 @@ func Load() (File, error) {
 		f = File{}
 	}
 	return f, nil
+}
+
+// assertSecurePerms checks that the auth.json file at `p` is readable
+// only by the owner. If group/other has any access bits set, we emit
+// a one-line warning to stderr and chmod the file back to 0600. No-op
+// when the file doesn't exist (Load handles that path itself).
+//
+// Skipped on Windows: NTFS perm bits don't translate to the Unix mask,
+// and the equivalent check would have to inspect ACLs — separate
+// codepath, file an issue if you actually run metis on Windows with
+// auth.json.
+var assertSecurePerms = assertSecurePermsUnix
+
+func assertSecurePermsUnix(p string) {
+	st, err := os.Stat(p)
+	if err != nil {
+		return
+	}
+	mode := st.Mode().Perm()
+	const ownerOnly = 0o600
+	if mode&^ownerOnly == 0 {
+		return // already tight enough
+	}
+	fmt.Fprintf(os.Stderr,
+		"metis: %s has loose perms %#o; tightening to 0600\n", p, mode)
+	if err := os.Chmod(p, ownerOnly); err != nil {
+		fmt.Fprintf(os.Stderr, "metis: chmod %s: %v\n", p, err)
+	}
 }
 
 // Save writes auth.json atomically with 0o600 perms.

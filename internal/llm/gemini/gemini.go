@@ -83,7 +83,7 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 		Model:       model,
 		MaxTokens:   maxTokens,
 		Temperature: temperature,
-		httpClient:  &http.Client{Timeout: timeout},
+		httpClient:  transport.NewHTTPClient(timeout, "gemini"),
 	}
 }
 

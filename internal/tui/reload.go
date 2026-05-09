@@ -1,0 +1,84 @@
+package tui
+
+// reload.go — single state-reset hub for /clear, /new, /reset, and
+// any future "rebuild the session in place" signal. Mirrors
+// kimi-cli's Reload exception pattern: instead of every command's
+// handler duplicating a 4-line reset triplet, they all call Reload
+// with the right policy flags.
+//
+// Why a struct of flags instead of distinct methods: the next time
+// we add a "wipe X but not Y" reset (e.g. /undo prefill keeps the
+// input populated; /branch saves daily note first; /fork preserves
+// banner) we can extend ReloadOpts without adding a new method or
+// duplicating reset logic. claude-code's `Reload({reason, prefill})`
+// shape served the same goal.
+
+import (
+	"time"
+)
+
+// ReloadOpts controls what state Model.Reload should clear or keep.
+// Zero value means "clear everything that's reset-worthy" (the
+// /clear default). Use OptKeepBanner / OptSaveDailyNote / OptPrefill
+// to customise.
+type ReloadOpts struct {
+	// SaveDailyNote — if true and a memory manager is wired, capture
+	// the current history into a daily-note before resetting. Only
+	// /new uses this; /clear is a "discard, don't archive" command.
+	SaveDailyNote bool
+	// ResetReason — recorded in the daily note title so the
+	// archive distinguishes /new from auto-cleared sessions.
+	ResetReason string
+	// ShowBanner — when true, restore the welcome banner state so
+	// the TUI redraws it on next render. /new sets this; /clear
+	// (which the user types repeatedly) doesn't, to avoid banner
+	// flash mid-conversation.
+	ShowBanner bool
+	// Prefill — text to drop into the input box after reset. Used
+	// by /undo to pre-populate with the popped user text. Empty =
+	// leave input untouched.
+	Prefill string
+	// PreserveInput — when true, don't clear the textarea. /undo
+	// uses Prefill (which sets new content); other resets implicitly
+	// clear input.
+	PreserveInput bool
+}
+
+// Reload performs the consolidated reset. Returns nothing — call
+// sites that have a tea.Cmd to forward (rare) keep their own return
+// path.
+//
+// Order matters: save-daily-note happens BEFORE loop.Reset() because
+// summarizeHistory reads from the loop's history.
+func (m *Model) Reload(opts ReloadOpts) {
+	if opts.SaveDailyNote && m.loop != nil && m.loop.Memory != nil {
+		summary := m.summarizeHistory()
+		reason := opts.ResetReason
+		if reason == "" {
+			reason = "reload"
+		}
+		_ = m.loop.Memory.SaveDailyNote(m.sessionID, reason, summary)
+	}
+	if m.loop != nil {
+		m.loop.Reset()
+	}
+	m.messages = nil
+	m.toolEvents = nil
+	m.totalTokens.Reset()
+	if !opts.PreserveInput {
+		m.input.Reset()
+	}
+	if opts.Prefill != "" {
+		m.input.SetValue(opts.Prefill)
+	}
+	if opts.ShowBanner {
+		m.firstRender = true
+		m.showBanner = true
+	}
+}
+
+// ReloadEcho appends a one-line confirmation to the message stream.
+// Helper kept here so the same banner format covers every reset path.
+func (m *Model) ReloadEcho(msg string) {
+	m.messages = append(m.messages, Message{Role: "success", Content: msg, Timestamp: time.Now()})
+}

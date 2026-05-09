@@ -215,10 +215,17 @@ context_window = 192000
 
 [provider.custom.deepseek]
 transport   = "openai_chat"
-api_key_env = "DEEPSEEK_API_KEY"
-base_url    = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"        # 1st preference: env var
+# api_key   = "sk-..."                  # 3rd preference: inline (lowest, after auth.json)
+base_url    = "https://api.deepseek.com/v1"
 model       = "deepseek-chat"
 context_window = 1000000
+
+# Auth chain for both built-in (anthropic/openai/gemini) and custom
+# providers — first non-empty wins:
+#   1. env var named in api_key_env
+#   2. ~/.metis/auth.json entry (`metis auth login <name>`)
+#   3. inline api_key field in this block
 
 # Switch profiles at run time:
 #   metis -p minimax-openai chat
@@ -252,11 +259,103 @@ reduced_motion = false        # accessibility: 500ms tick + no shimmer
 auto_compact_threshold = 0.85   # fraction of context window
 max_iterations = 50
 
+[tools]
+# ToolSearch lazy MCP schema is controlled by the ENABLE_TOOL_SEARCH
+# env var (matches openclaude's `tst-auto`):
+#
+#   (unset)     → auto, fires when MCP schemas exceed 10% of context window
+#   auto        → same as unset
+#   auto:N      → auto, fires at N% (1..99)
+#   auto:0      → always lazy (alias for "true")
+#   auto:100    → never lazy (alias for "false")
+#   true        → always strip mcp__* schemas
+#   false       → never strip
+#
+# Examples:
+#   ENABLE_TOOL_SEARCH=auto:5  metis chat   # fire 2× sooner than default
+#   ENABLE_TOOL_SEARCH=true    metis chat   # always strip (smallest prompt)
+#   ENABLE_TOOL_SEARCH=false   metis chat   # always full schemas (debug)
+
 [tools.bash]
 timeout_seconds = 120
 max_output_bytes = 1048576
 denylist = ["rm -rf /", "shutdown"]
+
+[loop_detection]
+# On by default since 2026-05-08. Set `disabled = true` to opt out.
+# Sliding-window signature detector (crush-parity): SHA-256 over
+# (tool_name, JSON(input), result) for each step's batch; if any
+# signature appears past `signature_max_repeats` times within
+# `signature_window` steps the loop aborts.
+signature_window      = 10  # steps to keep in the sliding window
+signature_max_repeats = 5   # same-signature count that trips the abort
+warning               = 10  # legacy per-tool consecutive-call warning
+critical              = 20  # legacy per-tool consecutive-call critical
+global                = 80  # absolute ceiling on tool calls per Run
 ```
+
+### Background bash + job pool
+
+Long-running shell commands have two paths:
+
+- **Auto-background**: any foreground `Bash` that runs longer than
+  60 seconds gets promoted to a background job. The process keeps
+  running; the model gets a `job_id` reply and the conversation
+  continues. When the job finishes, the next iteration's prompt
+  carries a `<job_notification>` system-reminder.
+- **Explicit background**: pass `run_in_background: true` to `Bash`
+  (e.g. dev servers, watchers, multi-minute builds). Same pool, same
+  notification envelope.
+
+Three tools work the pool:
+
+| Tool | Purpose |
+|---|---|
+| `BashList` | JSON snapshot of all jobs (id, status, command, elapsed, exit_code) |
+| `BashOutput` | Read a job's captured stdout/stderr; `tail_max` caps return size (default 50 KiB) |
+| `BashKill` | SIGTERM + 2s grace + SIGKILL escalation |
+
+Output is captured to `~/.metis/jobs/<id>.out` (mode 0600). The TUI
+status bar shows `⚙ N jobs` while jobs are alive.
+
+Sleep blacklist: `sleep N` (N ≥ 2s) standalone or `sleep N && rest`
+are rejected — they're polling primitives that shouldn't burn the
+foreground turn. Sub-2s pacing, pipeline / subshell / loop sleeps
+are fine.
+
+### Desktop notifications (5-channel matrix)
+
+When a turn runs longer than 30 seconds and you haven't pressed a key
+in the last 6, metis pops a desktop notification so you can switch back
+in. The channel is auto-detected from `$TERM_PROGRAM` and other env
+markers, or you can force one:
+
+```sh
+METIS_NOTIFY_CHANNEL=auto             # default — pick by terminal
+METIS_NOTIFY_CHANNEL=iterm2           # OSC 9 (iTerm2 / WezTerm / Alacritty)
+METIS_NOTIFY_CHANNEL=iterm2_with_bell # OSC 9 + raw BEL on top
+METIS_NOTIFY_CHANNEL=kitty            # OSC 99 3-step protocol
+METIS_NOTIFY_CHANNEL=ghostty          # OSC 777;notify;<title>;<body>
+METIS_NOTIFY_CHANNEL=bell             # raw \x07 only (Apple Terminal w/ audible bell off)
+METIS_NOTIFY_CHANNEL=off              # disable entirely
+```
+
+Auto rules:
+- `iTerm.app` / `WezTerm` / `Alacritty` → iTerm2 (OSC 9)
+- `ghostty` → Ghostty (OSC 777)
+- `KITTY_WINDOW_ID` set → kitty (OSC 99 with title / body / focus)
+- `Apple_Terminal` → only emits BEL when the active profile has
+  audible bell off (visual-bell-only) — otherwise stays silent so we
+  don't spam the user's speakers
+- nothing recognized → off
+
+Inside tmux / GNU screen, OSC sequences are wrapped in DCS passthrough
+so they reach the outer terminal (requires `set -g allow-passthrough on`
+in `.tmux.conf`). Raw BEL is intentionally never wrapped — it preserves
+tmux's bell-action window flag.
+
+iTerm2 / Ghostty / WezTerm also get a dock-icon progress bar (OSC 9;4)
+that lights up while the turn is running and clears on completion.
 
 ## Built-in tools
 

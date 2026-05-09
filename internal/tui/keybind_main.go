@@ -469,10 +469,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if val == "/clear" || val == "/reset" {
-			m.loop.Reset()
-			m.messages = nil
-			m.toolEvents = nil
-			m.input.Reset()
+			m.Reload(ReloadOpts{})
 			return m, cmd
 		}
 	}

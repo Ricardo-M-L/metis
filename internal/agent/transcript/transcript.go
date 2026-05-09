@@ -31,6 +31,29 @@ func Undo(msgs []llm.Message) ([]llm.Message, bool) {
 	return out, true
 }
 
+// UndoWithPrefill is like Undo but ALSO returns the text the user
+// typed in that last turn. The caller (TUI) uses it as prefill_text
+// for the input box so the user can edit-then-resend instead of
+// retyping from scratch — mirrors kimi-cli's `/undo` UX.
+//
+// prefill is empty when ok is false. Plain-text user messages can
+// have multiple text blocks (rare but valid: e.g. a Skill prepended
+// a context block before the user typed their question); we return
+// only the LAST text block, which is what the user typed.
+func UndoWithPrefill(msgs []llm.Message) (out []llm.Message, prefill string, ok bool) {
+	idx := LastPlainUserIndex(msgs)
+	if idx < 0 {
+		return msgs, "", false
+	}
+	for _, c := range msgs[idx].Content {
+		if c.Type == "text" && c.Text != "" {
+			prefill = c.Text
+		}
+	}
+	out = append([]llm.Message(nil), msgs[:idx]...)
+	return out, prefill, true
+}
+
 // LastPlainUserIndex returns the slice index of the most recent user message
 // that contains plain text (vs. a synthetic tool_result-only user message).
 // Returns -1 if no such message exists.

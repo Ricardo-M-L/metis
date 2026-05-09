@@ -85,8 +85,27 @@ func renderSpinnerStatus(m *Model) string {
 	frameIdx := int(elapsed.Milliseconds()/spinnerStepMs) % len(spinnerFrames)
 	frame := spinnerFrames[frameIdx]
 
+	// elapsedDisplay decides which clock the user sees. Default is the
+	// turn clock (since spinnerStartedAt). When a tool is in flight
+	// (spinnerSub non-empty), switch to the **tool's own** start time
+	// so a long-running bash like `git rebase` reads as
+	// `Bash · executing · git rebase (12s …)` instead of
+	// `Bash · executing · git rebase (1h 18m …)` — that latter form
+	// (the 2026-05-08 video bug) misleads the user into thinking a
+	// trivial `cd` ran for an hour, when in fact the turn had been
+	// looping for an hour and the tool itself just started.
+	elapsedDisplay := elapsed
+	if m.spinnerSub != "" {
+		for i := len(m.toolEvents) - 1; i >= 0; i-- {
+			if m.toolEvents[i].Kind == "start" {
+				elapsedDisplay = time.Since(m.toolEvents[i].StartTime)
+				break
+			}
+		}
+	}
+
 	var parts []string
-	parts = append(parts, formatElapsed(elapsed))
+	parts = append(parts, formatElapsed(elapsedDisplay))
 	// Spinner row shows ONE direction at a time, switching by phase
 	// (claude-code style — user feedback images #17-19):
 	//   ↑ N tokens — uploading / waiting for first stream chunk
@@ -180,6 +199,19 @@ func renderStatusBar(m *Model) string {
 	}
 	if n := tasksRunningCount(m.sessionID); n > 0 {
 		leftParts = append(leftParts, fmt.Sprintf("☰ %d todos", n))
+	}
+	// Background bash job pool — auto-promoted long-runners and
+	// explicit run_in_background commands. Chip lights up when
+	// any job is still alive so the user knows there's work
+	// happening "off-screen" they can BashList / BashOutput.
+	if n := bashJobsRunningCount(m); n > 0 {
+		leftParts = append(leftParts, fmt.Sprintf("⚙ %d jobs", n))
+	}
+	if n := len(m.queuedPrompts); n > 0 {
+		// Compact queue chip in the status bar (the sticky pill above
+		// the input was removed). Always visible regardless of scroll
+		// position, complements the in-stream "(queued × N …)" notice.
+		leftParts = append(leftParts, fmt.Sprintf("◷ %d queued", n))
 	}
 	for _, sa := range m.subAgents {
 		leftParts = append(leftParts, "◇ "+sa.Name)

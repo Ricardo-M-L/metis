@@ -119,12 +119,22 @@ type MCPServer struct {
 }
 
 // LoopDetection configures the agent loop detector.
-// Defaults are tuned for typical coding sessions; raise thresholds for long-running jobs.
+// Defaults are tuned for typical coding sessions; raise thresholds for
+// long-running jobs. The detector is on by default (post-2026-05-08);
+// set `disabled = true` in `[loop_detection]` to turn it off entirely.
+//
+// `Enabled` is retained as a no-op alias for backward compatibility —
+// older configs that explicitly set `enabled = true` keep working
+// without surprise behavior changes; setting it to false does NOT
+// disable the detector (use `disabled = true` for that).
 type LoopDetection struct {
-	Enabled  bool `toml:"enabled"`
-	Warning  int  `toml:"warning"`  // per-tool consecutive call count
-	Critical int  `toml:"critical"` // per-tool consecutive call count
-	Global   int  `toml:"global"`   // total tool calls in a single Run before abort
+	Enabled             bool `toml:"enabled"`               // legacy / no-op (always-on by default now)
+	Disabled            bool `toml:"disabled"`              // set true to turn the detector off
+	Warning             int  `toml:"warning"`               // per-tool consecutive call count
+	Critical            int  `toml:"critical"`              // per-tool consecutive call count
+	Global              int  `toml:"global"`                // total tool calls in a single Run before abort
+	SignatureWindow     int  `toml:"signature_window"`      // sliding-window size in steps; default 10
+	SignatureMaxRepeats int  `toml:"signature_max_repeats"` // same-signature count to trip; default 5
 }
 
 type ProviderSet struct {
@@ -234,8 +244,18 @@ type ProviderRaw struct {
 	// Transport picks the wire format. Recognized values:
 	//   anthropic_messages | openai_chat | gemini_native     (HTTP+API key)
 	//   azure_openai      | vertex_anthropic | bedrock_anthropic  (cloud auth)
-	Transport   string `toml:"transport"`
-	APIKeyEnv   string `toml:"api_key_env"`
+	Transport string `toml:"transport"`
+	APIKeyEnv string `toml:"api_key_env"`
+	// APIKey — inline credential, lowest-priority fallback (after
+	// env + auth.json). Discouraged for shared / committed configs
+	// since it puts the secret in plaintext in config.toml. Useful
+	// for one-off / personal setups where rotating an env var or
+	// running `metis auth login` is friction. Mirrors the inline
+	// path the built-in providers (anthropic / openai / gemini) have
+	// always had — added 2026-05-09 to close the gap that made
+	// `[provider.custom.<id>] api_key = "..."` silently drop the
+	// secret in TOML parsing.
+	APIKey      string `toml:"api_key"`
 	BaseURL     string `toml:"base_url"`
 	Model       string `toml:"model"`
 	MaxTokens   int    `toml:"max_tokens"`
@@ -386,6 +406,19 @@ type Session struct {
 type Tools struct {
 	Disabled []string         `toml:"disabled"`
 	Bash     ToolBashSettings `toml:"bash"`
+
+	// Lazy MCP tool schemas (ToolSearch) are controlled exclusively
+	// by the ENABLE_TOOL_SEARCH environment variable. See
+	// internal/agent/lazy_tools.go for the parse table:
+	//
+	//   (unset)     → auto, fires at 10% of context window
+	//   "auto:N"    → auto, fires at N%
+	//   "true"      → always lazy
+	//   "false"     → never lazy
+	//
+	// We deliberately don't expose this in TOML — the env-var path
+	// matches openclaude's `tst-auto` knob and keeps the matrix of
+	// "lazy yes/no, threshold, override" in one place per process.
 }
 
 type ToolBashSettings struct {
@@ -508,10 +541,14 @@ func defaults() *Config {
 			},
 		},
 		LoopDetection: LoopDetection{
-			Enabled:  true,
-			Warning:  10,
-			Critical: 20,
-			Global:   60,
+			// Enabled is no-op now (always-on by default); kept true so
+			// the field reads truthy in `metis config show`.
+			Enabled:             true,
+			Warning:             10,
+			Critical:            20,
+			Global:              80,
+			SignatureWindow:     10,
+			SignatureMaxRepeats: 5,
 		},
 	}
 }
@@ -697,6 +734,11 @@ func dirHasFiles(path string) bool {
 // to re-run the wizard. auth.json is the preferred place for hand-managed keys
 // (0o600, opencode-style). config.toml api_key is kept for backward compat — new
 // users should never need to write it.
+//
+// Applies uniformly to anthropic / openai / gemini built-ins AND to
+// [provider.custom.<id>] profiles. Pre-2026-05-09 the custom branch only
+// honored env + auth.json — the inline `api_key` TOML field parsed but was
+// dead code; users who wrote it got "missing API key" anyway.
 func (c *Config) ResolveAPIKey(provider string) (string, error) {
 	switch provider {
 	case "anthropic":
@@ -758,6 +800,14 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 		}
 		if k, _ := auth.Get(provider); k != "" {
 			return k, nil
+		}
+		// Inline `api_key = "..."` in [provider.custom.<id>]. Same final
+		// fallback as the anthropic / openai / gemini cases above. Pre
+		// 2026-05-09 the field didn't exist on ProviderRaw at all —
+		// users who wrote the key in their custom block had it silently
+		// dropped at TOML parse time and got "missing API key" later.
+		if raw.APIKey != "" {
+			return raw.APIKey, nil
 		}
 	}
 	return "", fmt.Errorf("missing API key for provider %q", provider)

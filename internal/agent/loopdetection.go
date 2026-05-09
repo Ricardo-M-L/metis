@@ -3,8 +3,15 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // LoopDetectorKind classifies the type of loop detected.
@@ -15,25 +22,48 @@ const (
 	LoopPollNoProgress       LoopDetectorKind = "known_poll_no_progress"
 	LoopGlobalCircuitBreaker LoopDetectorKind = "global_circuit_breaker"
 	LoopPingPong             LoopDetectorKind = "ping_pong"
+	// LoopSignatureRepeat is the crush-style detection: SHA-256 over
+	// (toolName, JSON(input), result) for each step's tool batch, with
+	// a sliding window. When the same signature appears more than
+	// `SignatureMaxRepeats` times within the window the agent is
+	// stuck in a real loop (same call → same result, repeated). This
+	// catches the 2026-05-08 video bug where the model spent 1h 18m
+	// retrying `cd … && git rebase --continue` on an unresolved
+	// conflict because the prior detector kinds (counts by tool name
+	// only) didn't trigger soon enough.
+	LoopSignatureRepeat LoopDetectorKind = "signature_repeat"
 )
 
 // LoopDetector monitors tool call patterns and detects repetitive behavior.
-// Inspired by OpenClaw's tool-loop-detection.ts.
+// Inspired by OpenClaw's tool-loop-detection.ts and crush's
+// loop_detection.go (sliding-window SHA-256 signatures).
 type LoopDetector struct {
 	mu sync.RWMutex
 
-	// Thresholds
+	// Thresholds for the count-based heuristics.
 	WarningThreshold  int
 	CriticalThreshold int
 	GlobalThreshold   int
 
+	// Sliding-window signature detection (crush parity). Window is
+	// the last N steps; if any signature shows up more than MaxRepeats
+	// times within the window, ShouldAbort flips to true.
+	//
+	// Why two parameters instead of one ratio: a 4/10 threshold lets
+	// transient retries through (legitimate "fetch failed → retry once
+	// → ok" patterns) but catches the dead-loop case decisively.
+	SignatureWindowSize int
+	SignatureMaxRepeats int
+
 	// State
-	callCounts    map[string]int // tool name -> count in current streak
-	toolSeq       []string       // recent tool call sequence
-	globalCount   int            // total tool calls this session
-	lastProgress  time.Time      // last successful non-tool-use turn
-	pollPatterns  map[string]int // detected polling patterns
-	pingPongPairs map[string]int // ping-pong detection pairs
+	callCounts       map[string]int // tool name -> count in current streak
+	toolSeq          []string       // recent tool call sequence
+	globalCount      int            // total tool calls this session
+	lastProgress     time.Time      // last successful non-tool-use turn
+	pollPatterns     map[string]int // detected polling patterns
+	pingPongPairs    map[string]int // ping-pong detection pairs
+	signatureWindow  []string       // sliding window of step signatures
+	signatureTripped bool           // sticky flag once the window threshold fired
 
 	// Callbacks
 	onWarning  func(kind LoopDetectorKind, count int, msg string)
@@ -41,17 +71,26 @@ type LoopDetector struct {
 }
 
 // NewLoopDetector creates a new loop detector with default thresholds.
+//
+// Signature window: 10 steps / 5 repeats matches crush's defaults
+// (`internal/agent/loop_detection.go:11-13`). 5 repetitions in a 10-step
+// window means at least half the recent steps are byte-for-byte the
+// same call+result — that's a real loop, not flaky retries.
 func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
 		WarningThreshold:  10,
 		CriticalThreshold: 20,
-		GlobalThreshold:   30,
+		GlobalThreshold:   80,
 
-		callCounts:    make(map[string]int),
-		toolSeq:       make([]string, 0, 100),
-		pollPatterns:  make(map[string]int),
-		pingPongPairs: make(map[string]int),
-		lastProgress:  time.Now(),
+		SignatureWindowSize: 10,
+		SignatureMaxRepeats: 5,
+
+		callCounts:      make(map[string]int),
+		toolSeq:         make([]string, 0, 100),
+		pollPatterns:    make(map[string]int),
+		pingPongPairs:   make(map[string]int),
+		signatureWindow: make([]string, 0, 10),
+		lastProgress:    time.Now(),
 	}
 }
 
@@ -142,17 +181,152 @@ func (d *LoopDetector) RecordProgress() {
 }
 
 // resetCounts resets per-turn counters after a successful turn.
+//
+// signatureWindow + signatureTripped intentionally NOT reset: a
+// model that ended one turn with `tool_use` then stops in the next
+// turn shouldn't be punished, but a model that produces a textual
+// summary as a fake "progress" turn and then re-enters the same loop
+// must still trip. globalCount is also preserved so the GlobalThreshold
+// circuit breaker spans the whole session.
 func (d *LoopDetector) resetCounts() {
 	d.callCounts = make(map[string]int)
 	d.pollPatterns = make(map[string]int)
 	d.pingPongPairs = make(map[string]int)
 }
 
+// RecordStep ingests a completed step (tool batch + matching results)
+// and updates the sliding-window signature detector. Pairs each
+// `tool_use` ContentBlock with its matching `tool_result` (by
+// ToolUseID) and folds them into a SHA-256 signature; identical
+// signatures appearing > SignatureMaxRepeats times within the window
+// flip ShouldAbort to true.
+//
+// Signature design choice (mirroring crush): include result body, not
+// just the call. That way a model that retries a failing command
+// gets a different signature on each call — only when the call AND
+// the failure mode are byte-identical does it count as a repeat.
+// Pure-retry-with-progress (e.g., reading a file that someone is
+// still writing) doesn't false-trip.
+func (d *LoopDetector) RecordStep(toolUses, results []provider.ContentBlock) {
+	sig := stepSignature(toolUses, results)
+	if sig == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.signatureWindow = append(d.signatureWindow, sig)
+	if len(d.signatureWindow) > d.SignatureWindowSize {
+		d.signatureWindow = d.signatureWindow[len(d.signatureWindow)-d.SignatureWindowSize:]
+	}
+
+	// Crush requires the window to fill before detecting; we don't,
+	// because the user's loops the safety net most needs to catch
+	// (cd … && git rebase --continue retries) reach the repeat
+	// threshold long before 10 distinct steps accumulate. Whatever
+	// fits in the window is fair game.
+	counts := make(map[string]int, len(d.signatureWindow))
+	for _, s := range d.signatureWindow {
+		counts[s]++
+		if counts[s] > d.SignatureMaxRepeats {
+			d.signatureTripped = true
+			if d.onCritical != nil {
+				msg := "signature loop detected: same tool call + result repeated " +
+					itoa(counts[s]) + " times in window of " +
+					itoa(d.SignatureWindowSize)
+				d.onCritical(LoopSignatureRepeat, counts[s], msg)
+			}
+			return
+		}
+	}
+}
+
 // ShouldAbort returns true if loops have been detected and user hasn't overridden.
 func (d *LoopDetector) ShouldAbort() bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	if d.signatureTripped {
+		return true
+	}
 	return d.globalCount >= d.GlobalThreshold
+}
+
+// AbortReason returns a short kind tag for whichever rule fired.
+// Empty string when ShouldAbort would currently return false.
+func (d *LoopDetector) AbortReason() LoopDetectorKind {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.signatureTripped {
+		return LoopSignatureRepeat
+	}
+	if d.globalCount >= d.GlobalThreshold {
+		return LoopGlobalCircuitBreaker
+	}
+	return ""
+}
+
+// stepSignature pairs tool_use blocks with tool_result blocks (by
+// ToolUseID) and returns the hex-encoded SHA-256 of their
+// stable-marshalled concatenation. Returns "" when there are no tool
+// calls in the step (text-only assistant turns can't loop).
+func stepSignature(toolUses, results []provider.ContentBlock) string {
+	calls := filterByType(toolUses, "tool_use")
+	if len(calls) == 0 {
+		return ""
+	}
+	resultByID := make(map[string]string, len(results))
+	for _, r := range results {
+		if r.Type == "tool_result" {
+			resultByID[r.ToolUseID] = r.ToolResult
+		}
+	}
+	h := sha256.New()
+	for _, c := range calls {
+		io.WriteString(h, c.ToolName)
+		_, _ = h.Write([]byte{0})
+		io.WriteString(h, stableJSON(c.ToolInput))
+		_, _ = h.Write([]byte{0})
+		io.WriteString(h, resultByID[c.ToolUseID])
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func filterByType(blocks []provider.ContentBlock, t string) []provider.ContentBlock {
+	out := make([]provider.ContentBlock, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Type == t {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// stableJSON marshals m with sorted keys so two equivalent inputs
+// always produce the same signature. Falls back to "" on error;
+// callers treat empty-input as "no signature contribution".
+func stableJSON(m map[string]any) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	type pair struct {
+		K string
+		V any
+	}
+	pairs := make([]pair, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, pair{k, m[k]})
+	}
+	b, err := json.Marshal(pairs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // Stats returns current loop detection statistics.

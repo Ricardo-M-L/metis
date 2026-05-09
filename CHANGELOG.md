@@ -7,6 +7,355 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added — Bash auto-background + job pool (claude-code parity, 60s threshold)
+
+- New `internal/jobs/` package: a process-wide pool tracking
+  background bash commands. Each job has a `bg_<8hex>` ID, a status
+  state machine (running/completed/failed/killed), disk-backed
+  stdout/stderr at `~/.metis/jobs/<id>.out`, and a notification
+  channel that the agent loop drains at iteration boundaries.
+- `Bash` tool gains `run_in_background: bool` input. When true, the
+  command spawns into the pool immediately and the model gets a
+  `job_id` reply. Output keeps growing on disk; the model uses
+  `BashOutput` to read it.
+- 60-second auto-background timer for foreground bash commands. If a
+  command outlives `AutoBackgroundThreshold = 60s`, the cmd is
+  promoted into the pool (via `jobs.Registry.Adopt` — the process
+  keeps running; nothing restarts) and the model gets a
+  "moved to background" reply with the `job_id`. Mirrors claude-
+  code's `ASSISTANT_BLOCKING_BUDGET_MS` pattern (15s on their side;
+  60s here per user choice — npm-install / go-test sized commands
+  shouldn't be misfired).
+- Sleep blacklist: bare `sleep N` (N ≥ 2 seconds) and
+  `sleep N && rest` are rejected at the tool boundary with a
+  diagnostic. Sub-2s pacing, sleeps inside pipelines / subshells /
+  loops are allowed. Mirrors claude-code's
+  `detectBlockedSleepPattern`.
+- 3 new model-facing tools wired by `AttachJobsRegistry`:
+  - `BashList` — JSON snapshot of the pool (id, status, command,
+    started, elapsed, exit_code on terminal jobs)
+  - `BashOutput` — reads the on-disk capture of a job, with
+    head-truncation for large logs (`tail_max` parameter, default
+    50 KiB)
+  - `BashKill` — SIGTERM with 2s grace, SIGKILL via context-cancel
+- `<job_notification>` envelope: at every Run iteration boundary the
+  loop drains the pool's notification channel and synthesizes a
+  user-message system-reminder summarizing finished jobs. Mirrors
+  claude-code's `<task_notification>` envelope. Multiple jobs that
+  finish in the same window collapse into one message.
+- TUI status bar: `⚙ N jobs` chip lights up while the pool has any
+  job in StatusRunning, sourced via `m.loop.Jobs.List()`.
+- 18 new tests:
+  - `internal/jobs/jobs_test.go` (10): happy-path spawn, notification
+    envelope, failed exit, kill state, unknown-id error, terminal
+    no-op, stable list order, output truncation, multi-line desc
+    folding, ID format
+  - `internal/tools/builtin/bash_jobs_test.go` (8 + 10 sub-cases):
+    each tool's required-input / unknown-id / happy path, plus the
+    sleep blacklist matrix (10 cases covering bare / chained /
+    pipeline / subshell / loop / sub-2s).
+- Wiring: `cmd/metis/main.go` builds one `jobs.Registry` per process
+  and threads it through `BuildToolRegistry` (for the three reader
+  tools) AND `BuildAgentLoop` (for the notification drainer).
+  Sub-agents and headless tests pass nil → feature gracefully
+  disables.
+
+NOT done in this round (deferred):
+- `Ctrl+B` manual-promote keybinding. Cross-goroutine signal
+  plumbing is non-trivial and the 60s auto-timer covers most cases;
+  filed as follow-up.
+
+### Fixed — `[provider.custom.<id>] api_key = "..."` was silently dropped
+
+- `internal/config/config.go::ProviderRaw` was missing the `APIKey`
+  field entirely (only `APIKeyEnv` existed). TOML parsers silently drop
+  unknown keys, so users who put an inline `api_key = "..."` in their
+  custom-provider block got "missing API key for provider X" later
+  with no hint that the field they wrote wasn't being read. Built-in
+  providers (anthropic / openai / gemini) had the inline path forever
+  and the docstring claimed it was a 3-tier chain "applied uniformly"
+  — only custom was the gap.
+- Added `APIKey string \`toml:"api_key"\`` to `ProviderRaw` and the
+  matching final-fallback branch in `ResolveAPIKey`. Order is
+  unchanged: env (api_key_env) → ~/.metis/auth.json → inline api_key.
+- Discovered while wiring DeepSeek (2026-05-09): inline key written
+  in config.toml didn't take, only auth.json worked.
+- Added 4 unit tests covering the custom-provider chain
+  (env / inline-only / auth-beats-inline / all-empty error). README
+  updated to document the 3-tier chain explicitly with a commented
+  inline example next to api_key_env.
+
+### Added — Desktop notification channel matrix (claude-code parity)
+
+- Replaced the single OSC 9 emitter with a 5-channel matrix mirroring
+  claude-code's services/notifier.ts + ink/useTerminalNotification.ts:
+  iTerm2 / iTerm2+Bell / Kitty / Ghostty / raw BEL. Auto-detected
+  from `$TERM_PROGRAM` + `$KITTY_WINDOW_ID` + `$ALACRITTY_LOG`, or
+  forced via `METIS_NOTIFY_CHANNEL` env var.
+- Apple Terminal users now get BEL only when their profile's audible
+  bell is off (visual-bell mode). The probe shells out to osascript
+  + `defaults read com.apple.Terminal "Window Settings"` and parses
+  the named profile's `Bell` field. Any failure is conservative —
+  notification suppressed, never an unexpected ding.
+- New OSC 9;4 progress bar: spinner start emits indeterminate state,
+  turn-end emits clear (or error → clear on failure). iTerm2 / Ghostty
+  / WezTerm / ConEmu light up the dock icon while the turn runs.
+- 6-second recent-interaction guard: keypresses inside the chat surface
+  call `tui.MarkUserInteraction()`, and `SendNotification` skips
+  emission while the user is actively typing. Fix: `lastInteractionAt`
+  initializes to zero (treated as "never") instead of `time.Now()` —
+  the latter silently swallowed every notification fired in the first
+  6 seconds of process lifetime, including probes/tests.
+- Notification hooks: when the turn-end banner fires, `Loop.Hooks`
+  also receives an `EmitNotification` event so users can wire their
+  own `[[hooks.notification]]` shell command (e.g. terminal-notifier
+  for richer macOS banners).
+- tmux / GNU screen DCS passthrough wrapping for all OSC sequences.
+  Raw BEL is intentionally NOT wrapped so tmux's bell-action window
+  flag still fires.
+- Manual tmux case `notify_channel_smoke` (NOT in default CASES list,
+  costs one >30s LLM turn) verifies real-process emission lands in
+  stderr correctly under tmux.
+- 28 new unit tests in `internal/tui/notify_test.go` + 6 in
+  `notify_apple_test.go`: SelectChannel match table, per-channel OSC
+  shape, tmux DCS wrap (BEL exception), recent-interaction guard
+  including the zero-value regression, escapeOSCText, SendProgress,
+  scanBellInBlock parser.
+
+### Changed — ToolSearch lazy mode is now driven by ENABLE_TOOL_SEARCH
+
+- Replaced the old `tools.lazy_threshold` / count-based trigger
+  with openclaude's full `tst-auto` env-var matrix
+  (`src/utils/toolSearch.ts:49,172-198`). The lazy-mode decision
+  is now read fresh from `ENABLE_TOOL_SEARCH` every dispatch turn,
+  so users can `export` to flip behavior without restarting.
+- Match table (lower-cased + trimmed):
+  - unset / `auto` → auto, fires at 10% of context window
+  - `auto:N` → auto at N% (1..99)
+  - `auto:0` → always lazy (alias for `true`)
+  - `auto:100` → never lazy (alias for `false`)
+  - `true` / `1` / `yes` / `on` → always lazy
+  - `false` / `0` / `no` / `off` → never lazy
+- Why scales-with-window beats fixed counts: a 16k-window model
+  chokes on 6k of MCP schemas (37% of budget) but a 200k-window
+  model wouldn't notice (3%). One static threshold can't satisfy
+  both; a percentage tracks the model's actual budget.
+- Removed: `Tools.LazyThreshold` + `Tools.LazyTokenPercentage`
+  TOML knobs, `Loop.LazyToolThreshold` + `Loop.LazyTokenPercentage`
+  Go fields, and the legacy `applyLazySchema(specs, threshold)`
+  count-based function. `Loop.ContextWindow` stays — it's the
+  budget input for auto mode.
+- New: `internal/agent/lazy_tools.go::parseEnableToolSearch` +
+  `LazyMode` (Standard / Auto / Always) tri-state mirroring
+  openclaude's `ToolSearchMode`.
+- `metis config show` now prints `tools.enable_tool_search` (the
+  current env value) instead of two TOML fields.
+- 22 new test cases in `parseEnableToolSearch` covering every row
+  of the match table. 8 dispatch-level tests in
+  `dispatch_lazy_precedence_test.go` covering env=true/false,
+  custom percentages, auto:0 ≡ true, auto:100 ≡ false, and
+  unknown-ContextWindow conservative no-strip.
+
+### Fixed — `Snip` was not idempotent (caught by 2026-05-08 e2e test)
+
+- `internal/agent/compact.go::Snip` would re-truncate a tool_result
+  that already carried a `[snipped: N chars omitted]` marker — every
+  subsequent call ate ~2 more chars off the marker. Discovered by
+  `TestSnipE2E_RepeatedSnipIsIdempotent` while validating the new
+  tier-aware activation. Added a fast-path: if the marker is already
+  present, skip the block. The "slow rot" was small in practice (a
+  few chars per Snip cycle) but matters now that small-window tiers
+  re-Snip more often.
+
+### Added — Compaction tier e2e activation tests
+
+- `internal/agent/compact_tier_e2e_test.go` — 4 tests that confirm
+  the tier knob actually changes the LLM-facing message slice (not
+  just an internal field). Same input through 16k vs 200k tiers
+  produces different output sizes; 16k tier truncates a 1500-char
+  tool_result to 200+marker; 200k tier passes it through untouched;
+  repeated Snip is idempotent (the regression test that found the
+  bug above).
+- `internal/runtime/agent_loop_tier_test.go` — 5 integration tests
+  that confirm `BuildAgentLoop` real wiring: a stub provider with
+  `MaxContextTokens()=N` produces a Compactor whose
+  `SnipMaxToolResultChars` and `SnipThreshold` match the expected
+  tier; including the boundary case where `max_tokens` shrinks the
+  effective input cap below the next tier boundary.
+
+### Added — Hook three-state decisioning + claude-code parity (PR-D)
+
+- `pkg/hook/hooks.go::ModifiedPreToolUse` gains `Halt bool` and
+  `HaltReason string` so a PreToolUse hook can reject the current
+  tool AND stop the whole turn in one decision (claude-code's "veto
+  chain" pattern).
+- `internal/runtime/config_hooks.go::parsePreToolUseResponse` now
+  accepts THREE stdout shapes from a subprocess hook, in order of
+  precedence:
+  - claude-code envelope: `{"hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny"|"allow",
+    "permissionDecisionReason": "...",
+    "modifiedInput": {...}}}`
+  - metis flat: `{"decision":"deny|allow|halt", "reason":"...",
+    "modified_input":{...}, "halt":true}`
+  - empty body → no-op (misbehaving hook can't accidentally
+    block the agent)
+- `runHookCommandWithCode` exposes the subprocess exit code; **exit
+  49** is treated as halt (a user can `exit 49` from a one-liner
+  without emitting JSON) and **exit 2** as block-tool. Wraps the
+  legacy `runHookCommand` so existing call sites are unchanged.
+- `internal/agent/loop.go` carries the halt signal through the
+  loop: new `haltRequested`/`haltReason` fields, `haltTurn(reason)`
+  setter (first-reason-wins, blank-doesn't-overwrite), `Run` clears
+  state at entry, the main loop emits a final tool_result message
+  and `EventLoopDone{StopReason: "halted_by_hook"}` after the
+  current batch.
+- 18 new tests: 12 parser-unit (envelope vs flat vs malformed vs
+  empty), 3 subprocess-end-to-end (`exit 49` / `decision: halt` /
+  envelope), 3 loop state.
+- **Net effect**: a user's claude-code `~/.claude/settings.json`
+  PreToolUse hooks now drop into metis's `~/.metis/config.toml`
+  `[[hooks.pre_tool_use]]` blocks unchanged. Halt-via-exit-49
+  scripts work identically.
+
+### Added — `[tools] lazy_threshold` config knob
+
+- `internal/config/config.go::Tools.LazyThreshold` (TOML key
+  `[tools] lazy_threshold = N`) is now configurable. metis already
+  shipped a working ToolSearch lazy-MCP-schema implementation
+  (`internal/agent/lazy_tools.go` + `dispatch.go`) but the threshold
+  was hardcoded to 20; users can now tune it (set 0 for default,
+  negative to disable, any positive value to override).
+- 7 new tests in `internal/agent/lazy_tools_handle_test.go`
+  covering the inline `handleToolSearch` resolver: known-tool schema
+  return, missing-name error, unknown-tool error, tool_use_id
+  preservation across three ID formats, ToolSearch entry appended
+  last (not inserted middle, so the cache breakpoint stays placed).
+- Config test coverage for `lazy_threshold` parse and 0-default.
+- README documents the knob with rationale.
+
+### Added — borrowed from crush / openclaude / minimax-cli (PR-A + PR-B + PR-C)
+
+- **`mode:auto` safe-bash allowlist** (`internal/permission/safe_commands.go`):
+  read-only commands (`ls`, `cat`, `pwd`, `whoami`, `id`, `uname`,
+  `git status / log / diff / blame / show`, `ps`, `df`, etc.) clear
+  the permission prompt under `mode:auto` instead of pestering the
+  user every turn. Shell metacharacters (`&&`, `||`, `;`, `|`, `>`,
+  `` ` ``, `$(`), `sudo` / `doas` / `su`, and mutating git flags
+  (`-D`, `--delete`, `--global`, `--system`, `-f`, `--force`) all
+  still bounce to the prompt. Inspired by crush's
+  `internal/agent/tools/safe.go`.
+- **Agent-marker env vars**
+  (`internal/tools/builtin/bash_env.go::filterEnv`): every bash
+  invocation now sees `AGENT=metis`, `AI_AGENT=metis`, and
+  `METIS=1`. Mirrors crush's `internal/shell/shell.go:90-95` so
+  user dotfiles / Makefiles can detect "I'm running under an
+  agent, suppress interactive prompts" via `[[ -n "$AGENT" ]]`.
+- **`auth.json` permission self-heal** (`internal/auth/auth.go::Load`):
+  on every load we check the file's perm bits; anything looser
+  than 0600 triggers a single stderr warning and an in-place
+  chmod back to 0600. Inspired by minimax-cli's
+  `auth/credentials.ts`. Skipped on Windows (NTFS uses ACLs).
+- **Exit-code classification** (`internal/exitcode/`): new package
+  with `Classify(err) int`. `cmd/metis/main.go::main` now exits
+  with the classified code instead of a blanket 1, so wrappers can
+  switch on `$?`. Codes (stable, do-not-renumber): OK=0, General=1,
+  Usage=2, Auth=3, Quota=4, Timeout=5, Network=6, Permission=7,
+  IO=8, ContentFilter=10, plus the standard SIGINT=130 / SIGTERM=143.
+  Three matching layers: typed (`errors.As` / `errors.Is`) →
+  network typed (`*net.DNSError`, `*net.OpError`) → string
+  heuristic (HTTP status, "rate limit", "no such host", …).
+- **MiniMax business-code hints**
+  (`internal/llm/anthropic/minimax_codes.go`): the bare
+  `(NNNN)` suffix MiniMax appends to error messages now resolves
+  to a friendly hint (`1028` → "quota: insufficient credits — top
+  up at minimaxi.com/account", `2061` → "Speech requires Plus,
+  Video requires Max", etc). Wrapped so `errors.Is` chains still
+  work; the hint embeds classifier-friendly keywords
+  ("rate limit", "content_filter") so the new exitcode layer
+  above auto-classifies them.
+- **Compaction window tiering** (`internal/agent/compact_tier.go`):
+  the existing Snip layer's per-block char cap and trigger
+  threshold are now selected from a 7-bucket table keyed on the
+  active provider's effective input cap (16k / 32k / 64k / 128k /
+  200k / 500k+). DeepSeek-V2 16k users get 200-char snip caps and
+  0.60 fill-fraction triggers; Anthropic 200k users keep the
+  defaults loose (3000 / 0.80). `ApplyWindowTier` is called once
+  at Loop construction in `runtime/agent_loop.go::BuildAgentLoop`
+  right after `MaxOutputTokens` is set. Inspired by openclaude's
+  `compressToolHistory.ts` 7-tier structure.
+
+### Added — sliding-window signature loop detection (crush parity)
+
+- `LoopDetector.RecordStep(toolUses, results)` folds each step's tool
+  batch into a SHA-256 of `(toolName \x00 stableJSON(input) \x00 result)`
+  triples and tracks them in a sliding window. When any one signature
+  appears more than `SignatureMaxRepeats` times within
+  `SignatureWindowSize` steps, `ShouldAbort` flips to true and the
+  agent loop emits `loop_detected` (per-stop reason) with a message
+  identifying signature-loop vs the older count-based circuit breaker.
+- Defaults match crush's `internal/agent/loop_detection.go`: window
+  10, repeats 5. Tunable via `[loop_detection].signature_window` and
+  `[loop_detection].signature_max_repeats` in `~/.metis/config.toml`.
+- Loop detector is now **on by default** — the previous opt-in via
+  `[loop_detection].enabled = true` is replaced by an opt-out flag
+  `[loop_detection].disabled = true`. Reason: a 2026-05-08 live
+  session showed the agent retrying `cd … && git rebase --continue`
+  for 1h 18m with no halt because the user hadn't enabled the
+  detector and `MaxIters = 50` quietly hadn't triggered. The legacy
+  `enabled = true` config field is kept as a no-op so older
+  `config.toml` files don't surprise users.
+- `GlobalThreshold` default raised 60 → 80 to leave more headroom for
+  legitimate long sessions; the signature detector is the first line
+  of defense now (catches dead loops earlier; the global counter is
+  the unconditional ceiling).
+- 9 new tests in `internal/agent/loop_signature_test.go` cover:
+  basic trip on identical-call repetition, distinct inputs not
+  tripping, progressive output (growing log tails) ignored, text-only
+  steps not poisoning the window, sliding correctly under mixed
+  signatures, surviving textual recaps between retries (the user's
+  exact loop pattern), stable signature ordering across map keys,
+  abort-reason priority (signature beats global), and message format.
+
+### Fixed — bare `metis -r` now opens the picker
+
+- `metis -r` (no UUID arg, no `chat` subcommand) used to print
+  `metis: run: prompt is required` and exit. The dispatch default
+  fallback in `cmd/metis/main.go` routed any unrecognized first arg
+  to `cmdRun`, which stripped the `-r` flag and then complained
+  there was no prompt. The bare-resume picker only ran inside the
+  `chat` flag-parser so the dispatch never gave it a chance.
+- New `hasInteractiveIntentFlag` checks for `-r` / `--resume` /
+  `-c` / `--continue` (and the `--resume=xyz` long form) anywhere in
+  args, and routes to chat instead of run. Tested in
+  `cmd/metis/dispatch_test.go` and end-to-end in
+  `scripts/e2e/tmux_drive.sh::bare_resume_opens_picker`.
+
+### Fixed — caught by 2026-05-08 video session
+
+- The "queued × N: <peek>" indicator above the input box was sticky
+  bottom chrome, so when the user wheel-scrolled the chat list to look
+  at history the pill stayed pinned at the bottom. Removed the sticky
+  pill entirely; the in-stream `(queued × N · Ctrl+C to clear): <peek>`
+  notice (now embedding the user's prompt text) scrolls with the
+  message stream, and a compact `◷ N queued` chip in the status bar
+  keeps the count visible regardless of scroll position. Files:
+  `internal/tui/tui_render.go` (drop pill call), `keybind_submit.go`
+  (notice + peek), `render_chrome.go` (status-bar chip),
+  `queue_scroll_test.go` (regression suite).
+- The spinner's elapsed clock (`executing · cd "/Users/ricardo/…"
+  (1h 18m · ↓ 93 tokens)`) was always sourced from
+  `m.spinnerStartedAt`, which is the **whole-turn** clock. While a tool
+  was in flight the user reasonably read `1h 18m` as "this cd command
+  has been running for 1h 18m", but it was the turn that had been
+  looping for an hour and the cd just started. `renderSpinnerStatus`
+  now switches to the **tool-local** start time (most recent
+  `Kind: "start"` entry in `m.toolEvents`) whenever `spinnerSub` is
+  non-empty. After the tool finishes the display falls back to the
+  turn clock, so an idle "thinking" stretch is still honest about how
+  long the model has been deliberating.
+
 ### Added — resume-hint + bare `-r` picker
 
 - After every clean exit (`/quit`, `Ctrl+D`, `Ctrl+C` at idle), metis

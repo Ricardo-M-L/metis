@@ -8,6 +8,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/channels"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -44,6 +45,23 @@ type ToolRegistryOptions struct {
 	CronService     *agent.CronService
 	PluginSources   []skills.PluginSkillSource
 	MemoryManager   *memory.MemoryManager
+
+	// Jobs is the process-wide background-bash pool shared with
+	// agent.Loop. When non-nil:
+	//   - Bash auto-promotes long-running commands to the pool at 60s
+	//   - new BashList / BashOutput / BashKill tools become callable
+	//   - completed jobs publish notifications the agent loop drains
+	//
+	// nil disables the entire job-pool feature gracefully (Bash falls
+	// back to its pre-2026-05-09 foreground-only behavior).
+	Jobs *jobs.Registry
+
+	// ConfigSnapshot is the {path,mtime,size} fingerprint captured at
+	// session bootstrap so MetisInfo's [config_staleness] section can
+	// detect "the user edited config.toml since metis launched".
+	// Optional: nil hides the section without breaking other
+	// introspection sections.
+	ConfigSnapshot *config.Snapshot
 }
 
 // BuildToolRegistry constructs the per-session tools.Registry, registers
@@ -55,6 +73,12 @@ type ToolRegistryOptions struct {
 func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	reg := tools.NewRegistry()
 	builtin.Register(reg, opts.Cfg, opts.Gate)
+	// Wire jobs.Registry into Bash + register the three job-pool
+	// tools. Done as a post-step so builtin.Register can stay
+	// dependency-free (jobs is a leaf package the runtime owns).
+	if opts.Jobs != nil {
+		builtin.AttachJobsRegistry(reg, opts.Jobs, opts.Gate)
+	}
 	// Agent tool: needs the provider + registry references that
 	// builtin.Register doesn't see.
 	reg.Register(builtin.NewAgentWithMinimal(opts.Gate, opts.Provider, reg, opts.Model, opts.System, opts.MinimalSystem))
@@ -73,13 +97,18 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// again after LoadPlugins. We register early (with PluginSources
 	// nil) so even calls that skip RegisterSkillTool still get the 22
 	// bundled skills exposed to the LLM.
-	RegisterSkillTool(reg, opts)
+	loader := RegisterSkillTool(reg, opts)
 	// Memory tool: writes flow through MemoryManager.Core() so they
 	// land in the same store BuildContext reads. Without a manager
 	// (e.g. `metis tools` informational listing), the tool registers
 	// with nil and Execute returns a clear error so the capability
 	// shows up in /tools but isn't usable.
 	reg.Register(builtin.NewMemory(opts.Gate, opts.MemoryManager))
+	// MetisInfo tool: LLM-facing introspection. Reads the same
+	// references this function already has, so it sees changes that
+	// happen later (e.g. /reload toggling an MCP server's Disabled
+	// bit). Mirrors crush's crush_info — distinct from /doctor.
+	reg.Register(builtin.NewMetisInfo(opts.Gate, opts.Cfg, opts.Jobs, loader, reg).WithSnapshot(opts.ConfigSnapshot))
 	return reg
 }
 
@@ -101,7 +130,12 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 //
 // The optional dir is always passed (sibling to userDir); the loader
 // silently skips it when the directory is missing.
-func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) {
+//
+// Returns the constructed loader so callers (BuildToolRegistry) can
+// hand it to other tools that need to read the live skill list
+// (MetisInfo). The loader is hot — Invalidate-aware — so passing the
+// same instance everywhere keeps the introspection view honest.
+func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) *skills.Loader {
 	userDir := opts.Cfg.Session.SkillDir
 	// Project layer is the first existing `.metis/skills/` walking up
 	// from CWD. We resolve at construct time; the loader doesn't watch
@@ -122,4 +156,5 @@ func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) {
 	// to overwrite the first phase's plugin-less Skill tool without
 	// panicking on duplicate registration.
 	reg.Replace(builtin.NewSkill(opts.Gate, loader, userDir))
+	return loader
 }

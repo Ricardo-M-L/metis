@@ -101,14 +101,12 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 		maxTokens = 8192
 	}
 	return &Anthropic{
-		APIKey:    apiKey,
-		BaseURL:   strings.TrimRight(baseURL, "/"),
-		Model:     model,
-		MaxTokens: maxTokens,
-		Beta:      beta,
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
+		APIKey:     apiKey,
+		BaseURL:    strings.TrimRight(baseURL, "/"),
+		Model:      model,
+		MaxTokens:  maxTokens,
+		Beta:       beta,
+		httpClient: transport.NewHTTPClient(timeout, "anthropic"),
 	}
 }
 
@@ -618,7 +616,16 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 			if resp.StatusCode >= 400 {
 				rb, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
-				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+				bodyStr := string(rb)
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(bodyStr, 500))
+				// MiniMax-shim hints: when the upstream is MiniMax's
+				// `/anthropic` endpoint, the body almost always carries a
+				// `(NNNN)` business code. Translate the well-known ones to
+				// actionable hints so the user sees "quota: insufficient
+				// credits" instead of "anthropic 400: ...(1028)". The
+				// original error is still wrapped, so `errors.Is` checks
+				// still work.
+				httpErr = wrapWithMinimaxHint(httpErr, bodyStr)
 				if transport.IsRetryableStatus(resp.StatusCode) {
 					return &transport.RetryableError{Err: httpErr}
 				}

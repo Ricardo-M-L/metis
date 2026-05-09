@@ -111,7 +111,7 @@ func NewBedrock(accessKey, secretKey, sessionToken, region, model string, maxTok
 			SecretAccessKey: secretKey,
 			SessionToken:    sessionToken,
 		},
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: transport.NewHTTPClient(timeout, "bedrock"),
 	}, nil
 }
 

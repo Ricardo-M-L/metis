@@ -23,14 +23,21 @@ import (
 // TestF22_OSC9_FiresOnLongTurn — spinnerStartedAt back-dated to
 // NotifyMinDuration+1s; finalizeTurn(nil) must emit `\x1b]9;...`
 // to the captured writer.
+//
+// Forces METIS_NOTIFY_CHANNEL=iterm2 because auto-detection now reads
+// $TERM_PROGRAM (often empty in CI). Bypasses the 6s recent-interaction
+// guard via resetInteractionForTest. Otherwise newE2EModel's setup
+// would mark interaction within the window and SendNotification would
+// (correctly) suppress.
 func TestF22_OSC9_FiresOnLongTurn(t *testing.T) {
+	t.Setenv("METIS_NOTIFY_CHANNEL", "iterm2")
+	resetInteractionForTest(t)
+
 	var buf bytes.Buffer
 	SetNotifyDest(&buf)
 	defer SetNotifyDest(nil)
 
 	m := newE2EModel(t, 120, 30, 0)
-	// Backdate so finalizeTurn sees a turn longer than the
-	// notification threshold.
 	m.spinnerStartedAt = time.Now().Add(-(NotifyMinDuration + time.Second))
 	m.finalizeTurn(nil)
 
@@ -47,6 +54,9 @@ func TestF22_OSC9_FiresOnLongTurn(t *testing.T) {
 // must NOT trigger a notification (otherwise every keystroke spams
 // the notification center).
 func TestF22_OSC9_DoesNotFireOnQuickTurn(t *testing.T) {
+	t.Setenv("METIS_NOTIFY_CHANNEL", "iterm2")
+	resetInteractionForTest(t)
+
 	var buf bytes.Buffer
 	SetNotifyDest(&buf)
 	defer SetNotifyDest(nil)
@@ -56,9 +66,24 @@ func TestF22_OSC9_DoesNotFireOnQuickTurn(t *testing.T) {
 	m.finalizeTurn(nil)
 
 	got := buf.String()
-	if strings.Contains(got, "\x1b]9;") {
-		t.Errorf("OSC9 must NOT fire on quick turn; got %q", got)
+	// The progress-clear sequence \x1b]9;4;0;\a fires on every
+	// finalizeTurn (regardless of duration) — that's expected and
+	// must NOT count as a "notification fired." We only fail if the
+	// notification body shape (\x1b]9;\n\n<title>: <body>) appears.
+	if strings.Contains(got, "metis: turn finished") {
+		t.Errorf("OSC9 notification must NOT fire on quick turn; got %q", got)
 	}
+}
+
+// resetInteractionForTest drives lastInteractionAt back past the 6s
+// guard so SendNotification doesn't suppress the test's emission.
+// Without this, anything that runs MarkUserInteraction (in setup or
+// real Update fixtures) within the last 6 seconds would silence the test.
+func resetInteractionForTest(t *testing.T) {
+	t.Helper()
+	lastInteractionMu.Lock()
+	defer lastInteractionMu.Unlock()
+	lastInteractionAt = time.Now().Add(-(RecentInteractionThreshold + time.Second))
 }
 
 // TestF8_MouseWheel_ScrollsTranscript — feeding MouseWheelDown into

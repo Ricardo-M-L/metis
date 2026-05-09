@@ -7,9 +7,12 @@ import (
 	"testing"
 )
 
-// TestLoadProjectContext_PrioritizesClaudeMD — when multiple
-// conventional files exist, CLAUDE.md wins (most common across tools).
-func TestLoadProjectContext_PrioritizesClaudeMD(t *testing.T) {
+// TestLoadProjectContext_LoadsBothWhenBothExist — 2026-05-09 change
+// (#9 SUMMARY): when CLAUDE.md AND AGENTS.md coexist in the same dir,
+// the loader emits BOTH so a hand-written AGENTS.md doesn't silently
+// shadow CLAUDE.md (or vice-versa). Order-within-dir is the
+// projectContextCandidates list (CLAUDE.md first, AGENTS.md second).
+func TestLoadProjectContext_LoadsBothWhenBothExist(t *testing.T) {
 	tmp := t.TempDir()
 	if err := os.WriteFile(filepath.Join(tmp, "CLAUDE.md"), []byte("# claude content"), 0o644); err != nil {
 		t.Fatal(err)
@@ -24,10 +27,17 @@ func TestLoadProjectContext_PrioritizesClaudeMD(t *testing.T) {
 
 	got := loadProjectContext()
 	if !strings.Contains(got, "claude content") {
-		t.Errorf("CLAUDE.md should win; got %q", got)
+		t.Errorf("CLAUDE.md body missing; got %q", got)
 	}
-	if strings.Contains(got, "agents content") {
-		t.Errorf("AGENTS.md should not be loaded when CLAUDE.md exists; got %q", got)
+	if !strings.Contains(got, "agents content") {
+		t.Errorf("AGENTS.md body missing; got %q", got)
+	}
+	// CLAUDE.md is first in projectContextCandidates so it must
+	// appear before AGENTS.md in the rendered output.
+	idxC := strings.Index(got, "claude content")
+	idxA := strings.Index(got, "agents content")
+	if idxC > idxA {
+		t.Errorf("CLAUDE.md should precede AGENTS.md in output; got C@%d A@%d", idxC, idxA)
 	}
 	if !strings.Contains(got, "<project_context") {
 		t.Errorf("output should be wrapped in <project_context> tag; got %q", got)

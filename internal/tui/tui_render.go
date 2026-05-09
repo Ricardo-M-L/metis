@@ -249,13 +249,13 @@ func (m *Model) View() tea.View {
 	// height understates input rows when the user is mid-typing a
 	// multi-line prompt.
 	var lower strings.Builder
-	// Queue indicator (task #37) — sits ABOVE the input box so the
-	// user sees what's pending before they type the next prompt.
-	// Suppressed when the queue is empty so single-turn flows stay
-	// chrome-free.
-	if pill := renderQueuePill(m); pill != "" {
-		lower.WriteString(pill)
-	}
+	// Queue indication: previously a sticky pill above the input box,
+	// but that anchored to the bottom and didn't follow the chat list
+	// when the user scrolled. Now the enqueue notice goes through
+	// chatList (see keybind_submit.go ~L147 — info-role message added
+	// alongside the queuedPrompts append), and a compact `◷ N queued`
+	// chip sits in the status bar so the count is always visible
+	// without blocking the message stream.
 	lower.WriteString(renderInputLine(m))
 	lower.WriteString(renderHints(m))
 	if m.showPalette {

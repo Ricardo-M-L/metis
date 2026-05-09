@@ -87,9 +87,14 @@ func TestBuildAgentLoop_FallsBackToCfgMaxIter(t *testing.T) {
 	}
 }
 
+// TestBuildAgentLoop_DetectorOffWhenDisabled — post-2026-05-08 the
+// detector is on by default; the explicit kill switch is now
+// `LoopDetection.Disabled = true`. The legacy `Enabled = false` is a
+// no-op for backward compat (older configs that never opted in stay
+// safe rather than silently losing the safety net).
 func TestBuildAgentLoop_DetectorOffWhenDisabled(t *testing.T) {
 	cfg := defaultLoopCfg(t)
-	cfg.LoopDetection.Enabled = false
+	cfg.LoopDetection.Disabled = true
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 100_000},
 		Registry: tools.NewRegistry(),
@@ -97,7 +102,29 @@ func TestBuildAgentLoop_DetectorOffWhenDisabled(t *testing.T) {
 		MaxIter:  10,
 	})
 	if loop.Detector != nil {
-		t.Error("Detector should remain nil when LoopDetection.Enabled=false")
+		t.Error("Detector should remain nil when LoopDetection.Disabled=true")
+	}
+}
+
+// TestBuildAgentLoop_DetectorOnByDefault — the safety net runs without
+// any opt-in. Pin this so an accidental config refactor doesn't quietly
+// turn the detector back into opt-in (which is what burned the user
+// in the 2026-05-08 1h 18m hang).
+func TestBuildAgentLoop_DetectorOnByDefault(t *testing.T) {
+	cfg := defaultLoopCfg(t)
+	// Note: cfg.LoopDetection left zero — no Enabled flag, no Disabled flag.
+	loop := BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider: &stubProvider{maxCtx: 100_000},
+		Registry: tools.NewRegistry(),
+		Gate:     permission.New(permission.ModeAuto),
+		MaxIter:  10,
+	})
+	if loop.Detector == nil {
+		t.Fatal("Detector should be wired by default — config left at zero values")
+	}
+	if loop.Detector.SignatureWindowSize != 10 || loop.Detector.SignatureMaxRepeats != 5 {
+		t.Errorf("default signature thresholds wrong: window=%d repeats=%d",
+			loop.Detector.SignatureWindowSize, loop.Detector.SignatureMaxRepeats)
 	}
 }
 

@@ -118,13 +118,34 @@ var allThemes = map[string]*Theme{
 	"dark-daltonized": &darkDaltonizedTheme,
 }
 
-// currentTheme is the active palette. Resolved at init from
-// METIS_THEME (env) with darkTheme as fallback. Callers reference
-// it indirectly via the styleX vars in tui.go which get re-init'd
-// on /theme switch via initStyles().
+// currentTheme is the active palette. Resolved at init from this
+// precedence (highest wins):
+//
+//  1. METIS_THEME env var       — explicit user pick
+//  2. OSC 11 background probe   — auto-detect light vs dark terminal
+//  3. darkTheme                 — safe fallback
+//
+// The OSC 11 probe (added 2026-05-09 / SUMMARY #31) sends a
+// 9-byte query to /dev/tty and waits ≤200ms; non-responding
+// contexts fall through silently. Mirrors opencode's terminal-aware
+// theme switch.
+//
+// Callers reference currentTheme indirectly via the styleX vars in
+// tui.go which get re-init'd on /theme switch via initStyles().
 var currentTheme = func() *Theme {
 	if t, ok := allThemes[os.Getenv("METIS_THEME")]; ok {
 		return t
+	}
+	// Skip the probe in headless / CI / non-interactive contexts —
+	// no TTY, no answer, but the 200ms wait still adds startup
+	// latency we can avoid. NO_COLOR is also a strong "user has
+	// non-default expectations" signal where probing is rude.
+	if os.Getenv("CI") == "" && os.Getenv("NO_COLOR") == "" {
+		if isLight, ok := DetectTerminalBackground(); ok && isLight {
+			if t, ok := allThemes["light"]; ok {
+				return t
+			}
+		}
 	}
 	return &darkTheme
 }()
