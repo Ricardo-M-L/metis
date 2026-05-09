@@ -1464,6 +1464,9 @@ func cmdTools() error {
 	// Show the Agent tool for completeness even though Execute will error
 	// without a real provider — this is just an informational listing.
 	reg.Register(builtin.NewAgent(gate, nil, reg, "", ""))
+	// Fork (warm-start sub-agent) — same informational-listing path.
+	// Real wiring lives in runtime.tools.go for live sessions.
+	reg.Register(builtin.NewFork(gate, nil, reg))
 	// Same for SendMessage — its real wiring lives in setupRuntime, but
 	// we want it visible in `metis tools` so users know the capability
 	// exists without firing up a chat session.
