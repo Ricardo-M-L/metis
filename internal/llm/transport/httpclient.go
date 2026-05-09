@@ -34,19 +34,46 @@ type SessionIDFn func() string
 // loggingTransport(dumpTransport(http.DefaultTransport)). Used by
 // every provider's New() to install the debug stack uniformly.
 //
-//	timeout    — maps to http.Client.Timeout (per-request total).
+//	timeout    — maps to Transport.ResponseHeaderTimeout (max wait for
+//	             the FIRST response byte). Body streaming has no
+//	             timeout: long thinking + tool-use streams legitimately
+//	             take 5-10 minutes on MiniMax-M2.7 with a large
+//	             40K-token context; chopping at the http.Client.Timeout
+//	             (whole-request) level cancels mid-stream and yields
+//	             "request canceled (Client.Timeout or context
+//	             cancellation while reading body)".
 //	provider   — short tag included in every log line and dump entry
 //	             ("anthropic", "openai", "gemini", ...).
+//
+// Per-request *cancellation* is up to callers via context.WithTimeout
+// or context.WithDeadline. metis does pass a ctx down through every
+// stream/complete path, so a hung connection still surfaces — but
+// only when the caller decides, not because the HTTP client guessed
+// at a deadline that's too short for the actual workload.
 //
 // The active session id is resolved at request time via the
 // process-global GlobalSessionID. Callers don't pass it because
 // providers are constructed before `runtime` knows the session id
 // (resume vs new branches both decide later).
 func NewHTTPClient(timeout time.Duration, provider string) *http.Client {
-	rt := WrapRoundTripper(http.DefaultTransport, provider, GlobalSessionID)
+	// Clone DefaultTransport so we can set ResponseHeaderTimeout
+	// without mutating the global. Falls back to a fresh Transport
+	// on the (impossible in practice) cast failure.
+	base, ok := http.DefaultTransport.(*http.Transport)
+	var inner http.RoundTripper
+	if ok {
+		clone := base.Clone()
+		clone.ResponseHeaderTimeout = timeout
+		inner = clone
+	} else {
+		inner = &http.Transport{ResponseHeaderTimeout: timeout}
+	}
+	rt := WrapRoundTripper(inner, provider, GlobalSessionID)
 	return &http.Client{
 		Transport: rt,
-		Timeout:   timeout,
+		// Timeout: 0 — explicit. Whole-request timeout would chop
+		// streaming responses; ResponseHeaderTimeout above covers the
+		// "server is dead" case for the only deadline-sensitive phase.
 	}
 }
 
