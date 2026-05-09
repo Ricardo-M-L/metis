@@ -452,24 +452,27 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 				if isJunkFilename(entryName) {
 					continue
 				}
-				if e.IsDir() {
-					// Tree layout: scan the subtree for category/<name>/SKILL.md
-					// and category/<name>/<anything>.md. Cap depth at 3 so a
-					// stray symlink can't walk us into infinity.
-					subSkills := scanSkillSubtreeDedup(filepath.Join(dir, entryName), 3, seen)
+				full := filepath.Join(dir, entryName)
+				// Symlink-aware dir detection: ReadDir's IsDir() returns
+				// false for a symlink even when its target is a dir, so
+				// `~/.metis/skills/team → /opt/team-skills` would be
+				// silently skipped by the old IsDir-only branch. Stat()
+				// follows the link and reveals the target kind. Mirrors
+				// charlievieth/fastwalk's Follow:true semantics — same
+				// behaviour, no new dependency.
+				if isDirOrSymlinkToDir(e, full) {
+					subSkills := scanSkillSubtreeDedup(full, 3, seen)
 					out = append(out, subSkills...)
 					continue
 				}
-				// Flat layout: top-level *.md / *.json
 				ext := strings.ToLower(filepath.Ext(entryName))
 				if ext != ".md" && ext != ".markdown" && ext != ".json" {
 					continue
 				}
-				path := filepath.Join(dir, entryName)
-				if markSeen(path) {
+				if markSeen(full) {
 					continue
 				}
-				sk, err := Load(path)
+				sk, err := Load(full)
 				if err != nil || sk == nil {
 					continue
 				}
@@ -478,6 +481,28 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 			return out, nil
 		},
 	}
+}
+
+// isDirOrSymlinkToDir reports whether `e` is a directory or a
+// symlink whose target is a directory. ReadDir's DirEntry.IsDir()
+// returns false for symlinks, even when they point at directories,
+// so callers that want to recurse into "team-shared skills" symlinks
+// need this extra step.
+//
+// Stat follows the symlink chain; on a broken link it errors out and
+// we return false (broken link → not a recursable dir).
+func isDirOrSymlinkToDir(e os.DirEntry, full string) bool {
+	if e.IsDir() {
+		return true
+	}
+	if e.Type()&os.ModeSymlink == 0 {
+		return false
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
 }
 
 // canonicalPath returns filepath.EvalSymlinks(path) when it succeeds,
@@ -538,7 +563,7 @@ func scanSkillSubtreeDedup(root string, maxDepth int, seen map[string]bool) []Sk
 			continue
 		}
 		full := filepath.Join(root, name)
-		if e.IsDir() {
+		if isDirOrSymlinkToDir(e, full) {
 			// Look for SKILL.md inside this skill dir.
 			candidates := []string{"SKILL.md", "skill.md", name + ".md"}
 			loaded := false
