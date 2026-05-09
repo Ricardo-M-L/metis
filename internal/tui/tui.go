@@ -278,9 +278,18 @@ type Model struct {
 	queuePending bool
 	// expandToolOutputs is the global "show full tool output" toggle
 	// (claude-code's ctrl+o). When false (default), Edit diffs cap at
-	// 20 lines, Bash output at 5 lines. When true the user gets the
-	// full content.
+	// 20 lines, Bash output at 5 lines, and extended-thinking blocks
+	// fold to a one-line preview. When true the user gets every byte.
 	expandToolOutputs bool
+
+	// stickyBottom controls auto-follow during streaming. true (the
+	// default) means new content auto-scrolls into view; user wheel-up
+	// or PgUp flips it false; explicit ScrollToBottom / Ctrl+End / new
+	// turn submission resets it true. Mirrors claude-code's
+	// useVirtualScroll.isSticky semantics — survives transient scroll-
+	// past-bottom noise during fast streaming so the bottom keeps
+	// following the cursor instead of locking on a stale frame.
+	stickyBottom bool
 
 	// lastModeCycle gates Shift+Tab handling against terminal startup
 	// bursts that would otherwise cycle modes 3-5 times before the
@@ -505,25 +514,26 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	pc := perfConfig()
 
 	mdl := &Model{
-		ctx:         ctx,
-		loop:        loop,
-		gate:        gate,
-		slash:       sl,
-		session:     st,
-		sessionID:   sid,
-		model:       model,
-		skillDir:    skillDir,
-		cfg:         cfg,
-		cmds:        BuildREPLCommands(),
-		startTime:   time.Now(),
-		eventCh:     make(chan agent.Event, eventBufferSize()),
-		doneCh:      make(chan error, 1),
-		overlays:    overlay.New(),
-		renderCache: newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
-		showBanner:  true,
-		firstRender: true,
-		input:       ti,
-		chatList:    cl,
+		ctx:          ctx,
+		loop:         loop,
+		gate:         gate,
+		slash:        sl,
+		session:      st,
+		sessionID:    sid,
+		model:        model,
+		skillDir:     skillDir,
+		cfg:          cfg,
+		cmds:         BuildREPLCommands(),
+		startTime:    time.Now(),
+		eventCh:      make(chan agent.Event, eventBufferSize()),
+		doneCh:       make(chan error, 1),
+		overlays:     overlay.New(),
+		renderCache:  newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
+		showBanner:   true,
+		firstRender:  true,
+		input:        ti,
+		chatList:     cl,
+		stickyBottom: true,
 		// 4-level permission ask, matching claude-code's pattern:
 		//   y — allow this once
 		//   a — allow always (whitelist this tool for the session)

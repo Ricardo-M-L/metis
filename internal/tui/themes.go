@@ -55,11 +55,17 @@ type Theme struct {
 // Tuned for dark terminals (iTerm2, default macOS Terminal.app dark,
 // WezTerm dark variants).
 var darkTheme = Theme{
-	Name:          "dark",
-	BgSecondary:   lipgloss.Color("#16213e"),
-	TextPrimary:   lipgloss.Color("#e8e8e8"),
+	Name:        "dark",
+	BgSecondary: lipgloss.Color("#16213e"),
+	TextPrimary: lipgloss.Color("#e8e8e8"),
+	// Two-tier muted ladder. Earlier metis had Muted at #606060 which
+	// rendered near-invisible on most dark terminals — image #19/#20
+	// user report. Bumped to #787878 (≈ claude-code's "inactive" tier
+	// at #999) so "+N more lines" / "(ctrl+o to expand)" hints stay
+	// legible without competing with primary text. Secondary stays
+	// at #a0a0a0 for "dim but informational" rows (tool summary line).
 	TextSecondary: lipgloss.Color("#a0a0a0"),
-	TextMuted:     lipgloss.Color("#606060"),
+	TextMuted:     lipgloss.Color("#787878"),
 	AccentBlue:    lipgloss.Color("#64b5f6"),
 	AccentGreen:   lipgloss.Color("#81c784"),
 	AccentOrange:  lipgloss.Color("#ffb74d"),
@@ -100,7 +106,7 @@ var darkDaltonizedTheme = Theme{
 	BgSecondary:   lipgloss.Color("#16213e"),
 	TextPrimary:   lipgloss.Color("#e8e8e8"),
 	TextSecondary: lipgloss.Color("#a0a0a0"),
-	TextMuted:     lipgloss.Color("#606060"),
+	TextMuted:     lipgloss.Color("#787878"),
 	AccentBlue:    lipgloss.Color("#64b5f6"),
 	AccentGreen:   lipgloss.Color("#4dd0e1"), // cyan stand-in for assistant/success
 	AccentOrange:  lipgloss.Color("#ffb74d"),

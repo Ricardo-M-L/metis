@@ -80,6 +80,7 @@ func (m *Model) handleSearchKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 			// ScrollToItem helper would be ideal; until then, snap
 			// to bottom for forward search and let the user find it.
 			_ = idx
+			m.stickyBottom = true
 			m.chatList.ScrollToBottom()
 		}
 		m.closeTranscriptSearch()

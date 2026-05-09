@@ -23,7 +23,14 @@ import (
 // width is the available render width — passed through so the
 // assistant-body markdown renderer can word-wrap at the right column
 // instead of the raw terminal width.
-func renderMessage(msg Message, width int) string {
+// renderMessage prints a single transcript row. expand=true means the
+// caller wants verbose rendering — extended thinking unfolded, otherwise
+// thinking collapses to a one-liner so the chat surface isn't drowned
+// in dim italic. Mirrors claude-code's
+// AssistantThinkingMessage shouldShowFullThinking gate (controlled by
+// transcript-mode + verbose flag there; metis reuses Ctrl+O's
+// expandToolOutputs toggle for both tool output and thinking).
+func renderMessage(msg Message, width int, expand bool) string {
 	var s strings.Builder
 	switch msg.Role {
 	case "user":
@@ -68,22 +75,40 @@ func renderMessage(msg Message, width int) string {
 		}
 		s.WriteString("\n\n")
 	case "thinking":
-		// Extended-thinking trace — claude-code shows it dim/italic
-		// with ✻ glyph. Keeps the user informed about model
-		// reasoning without competing with the final answer style.
-		// Continuation lines indent under the glyph for the same
-		// reason as the assistant body.
-		s.WriteString(styleMuted.Render("  " + glyphAsterisk + " "))
-		thinkStyle := styleMuted.Italic(true)
-		thinkLines := strings.Split(msg.Content, "\n")
-		if len(thinkLines) > 0 {
-			s.WriteString(thinkStyle.Render(thinkLines[0]))
-			for _, ln := range thinkLines[1:] {
-				s.WriteString("\n  ")
-				s.WriteString(thinkStyle.Render(ln))
+		// Extended-thinking trace. By default we collapse to a single
+		// dim italic line so the transcript stays readable; the user
+		// can press Ctrl+O to unfold all thinking + tool output at
+		// once (claude-code's verbose flow). Without this gate, a
+		// chatty model floods the screen with grey italic that
+		// visually competes with the actual reply (image #17 user
+		// feedback 2026-05-10).
+		// Glyph in cyan accent (matches the `thought-summary` row's
+		// styleAccent below at line ~111 — visual consistency between
+		// streaming "thinking" and turn-end "Tinkered for Xs"). Body
+		// text in styleDim (#a0a0a0) instead of styleMuted (#606060)
+		// because claude-code's AssistantThinkingMessage uses
+		// `dimColor` (ANSI Faint, ~50% of fg) rather than fixed
+		// ultra-grey — readable on dark themes, doesn't disappear.
+		s.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
+		thinkStyle := styleDim.Italic(true)
+		if !expand {
+			// Folded view — first line preview only, plus a hint.
+			first := firstThinkingLine(msg.Content)
+			s.WriteString(thinkStyle.Render(first))
+			s.WriteString(styleMuted.Render("  "))
+			s.WriteString(styleMuted.Render("(ctrl+o to expand)"))
+			s.WriteString("\n")
+		} else {
+			thinkLines := strings.Split(msg.Content, "\n")
+			if len(thinkLines) > 0 {
+				s.WriteString(thinkStyle.Render(thinkLines[0]))
+				for _, ln := range thinkLines[1:] {
+					s.WriteString("\n  ")
+					s.WriteString(thinkStyle.Render(ln))
+				}
 			}
+			s.WriteString("\n")
 		}
-		s.WriteString("\n")
 	case "thought-summary":
 		// "✻ Cogitated for 1m 32s" — render the glyph in the accent
 		// color (it's a category marker, like claude-code's flower
@@ -279,4 +304,20 @@ func looksLikeMarkdown(s string) bool {
 		}
 	}
 	return false
+}
+
+// firstThinkingLine returns a single-line preview suitable for the
+// folded thinking view: the first non-empty line of content, capped
+// at 80 visible runes with an ellipsis suffix. Empty input yields
+// "Thinking…" so the user sees SOMETHING (the glyph alone is too easy
+// to miss in a long transcript).
+func firstThinkingLine(content string) string {
+	for _, ln := range strings.Split(content, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		return truncateRunes(ln, 80)
+	}
+	return "Thinking…"
 }

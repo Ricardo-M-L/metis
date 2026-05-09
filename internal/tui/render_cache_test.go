@@ -42,12 +42,12 @@ func TestRenderCache_HitMiss(t *testing.T) {
 	c := newRenderCache(8, 100)
 	m := Message{Role: "user", Content: "hi"}
 
-	if _, ok := c.GetMessage(m, 80); ok {
+	if _, ok := c.GetMessage(m, 80, false); ok {
 		t.Fatal("first Get on empty cache should miss")
 	}
-	c.PutMessage(m, 80, "rendered hi")
+	c.PutMessage(m, 80, false, "rendered hi")
 
-	s, ok := c.GetMessage(m, 80)
+	s, ok := c.GetMessage(m, 80, false)
 	if !ok || s != "rendered hi" {
 		t.Fatalf("after Put, Get should return the stored value: got %q ok=%v", s, ok)
 	}
@@ -62,16 +62,16 @@ func TestRenderCache_WidthDifferentKey(t *testing.T) {
 	c := newRenderCache(8, 100)
 	m := Message{Role: "assistant", Content: "body text"}
 
-	c.PutMessage(m, 80, "rendered@80")
-	c.PutMessage(m, 81, "rendered@81")
+	c.PutMessage(m, 80, false, "rendered@80")
+	c.PutMessage(m, 81, false, "rendered@81")
 
-	if s, _ := c.GetMessage(m, 80); s != "rendered@80" {
+	if s, _ := c.GetMessage(m, 80, false); s != "rendered@80" {
 		t.Errorf("width 80: got %q want rendered@80", s)
 	}
-	if s, _ := c.GetMessage(m, 81); s != "rendered@81" {
+	if s, _ := c.GetMessage(m, 81, false); s != "rendered@81" {
 		t.Errorf("width 81: got %q want rendered@81", s)
 	}
-	if _, ok := c.GetMessage(m, 100); ok {
+	if _, ok := c.GetMessage(m, 100, false); ok {
 		t.Error("width 100 was never put — expected miss")
 	}
 }
@@ -79,12 +79,12 @@ func TestRenderCache_WidthDifferentKey(t *testing.T) {
 func TestRenderCache_ContentChangeMisses(t *testing.T) {
 	c := newRenderCache(8, 100)
 	base := Message{Role: "error", Content: "API Error: foo"}
-	c.PutMessage(base, 80, "rendered base")
+	c.PutMessage(base, 80, false, "rendered base")
 
 	// Simulate the dedupe (×N) path that mutates m.messages[i].Content
 	// in place — same role + same width but different content must miss.
 	deduped := Message{Role: "error", Content: "API Error: foo (×2)"}
-	if _, ok := c.GetMessage(deduped, 80); ok {
+	if _, ok := c.GetMessage(deduped, 80, false); ok {
 		t.Error("post-dedupe content should miss")
 	}
 }
@@ -161,11 +161,11 @@ func TestRenderCache_IsErrorTogglesMiss(t *testing.T) {
 
 func TestRenderCache_InvalidateAll(t *testing.T) {
 	c := newRenderCache(8, 100)
-	c.PutMessage(Message{Role: "user", Content: "x"}, 80, "v1")
+	c.PutMessage(Message{Role: "user", Content: "x"}, 80, false, "v1")
 	c.PutTool(ToolEvent{Kind: "result", ToolName: "Read", Output: "y"}, false, 80, "v2")
 
 	// Run Get once before invalidate so we have hit/miss baselines.
-	c.GetMessage(Message{Role: "user", Content: "x"}, 80)
+	c.GetMessage(Message{Role: "user", Content: "x"}, 80, false)
 	hitsBefore, _, _ := c.Stats()
 	if hitsBefore == 0 {
 		t.Fatal("expected at least one hit before invalidate")
@@ -173,7 +173,7 @@ func TestRenderCache_InvalidateAll(t *testing.T) {
 
 	c.InvalidateAll()
 
-	if _, ok := c.GetMessage(Message{Role: "user", Content: "x"}, 80); ok {
+	if _, ok := c.GetMessage(Message{Role: "user", Content: "x"}, 80, false); ok {
 		t.Error("message map should be empty after InvalidateAll")
 	}
 	if _, ok := c.GetTool(ToolEvent{Kind: "result", ToolName: "Read", Output: "y"}, false, 80); ok {

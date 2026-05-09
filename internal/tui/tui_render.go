@@ -194,10 +194,26 @@ func (m *Model) View() tea.View {
 		w = 80
 	}
 
-	// Auto-scroll: snapshot AtBottom BEFORE swapping items so newly-
-	// arrived content while the user was at the bottom auto-follows.
-	// SetItemsKeepScroll preserves offsetIdx/offsetLine so a user
-	// PgUp'd into history stays put across spinner ticks.
+	// Auto-scroll combines a sticky-bottom *flag* (m.stickyBottom) with
+	// a pre-rebuild AtBottom() snapshot. claude-code's useVirtualScroll
+	// mixes the same two signals: an isSticky boolean carried across
+	// frames AND the live list position. Sampling BEFORE the rebuild
+	// means we're reading the user's last-observed state, not the
+	// transient position the rebuild leaves us in.
+	//
+	// Why both:
+	//   - Flag alone fails when external code (or tests) calls
+	//     ScrollToTop directly without going through our key handler:
+	//     the flag stays true and the next tick yanks the user back.
+	//   - Snapshot alone fails during fast streaming — each tick
+	//     appends lines so the natural list position is "almost at
+	//     bottom but not quite", AtBottom() returns false, and the
+	//     stream piles up off-screen even though the user is following.
+	//
+	// Combined: snap iff the user appears at-bottom AND hasn't
+	// gestured away. wheel-up/PgUp/Home flip the flag false; submit
+	// and ScrollToBottom flip it true. (See keybind_main.go +
+	// tui_update.go for flag-flip points.)
 	wasAtBottom := m.chatList.AtBottom()
 	m.chatList.SetItemsKeepScroll(m.buildChatItems()...)
 
@@ -212,17 +228,32 @@ func (m *Model) View() tea.View {
 	// Phase 1a: tail + spinner + permission (sits ABOVE the input).
 	var upper strings.Builder
 	if m.thinkingText != "" {
-		upper.WriteString(styleMuted.Render("  " + glyphAsterisk + " "))
-		thinkStyle := styleMuted.Italic(true)
-		thinkLines := strings.Split(m.thinkingText, "\n")
-		if len(thinkLines) > 0 {
-			upper.WriteString(thinkStyle.Render(thinkLines[0]))
-			for _, ln := range thinkLines[1:] {
-				upper.WriteString("\n  ")
-				upper.WriteString(thinkStyle.Render(ln))
+		// Streaming thinking marker keeps parity with the historical
+		// thinking row in render_message.go: cyan accent glyph + dim
+		// italic body. Earlier this was muted #606060 which read as
+		// "broken / disabled" on dark terminals (image #19/#20 user
+		// feedback 2026-05-10).
+		upper.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
+		thinkStyle := styleDim.Italic(true)
+		// Stream-time thinking respects the same expand toggle as the
+		// historical thinking blocks rendered through render_message.go
+		// — folded by default to keep the chat surface readable while
+		// the model thinks aloud.
+		if !m.expandToolOutputs {
+			upper.WriteString(thinkStyle.Render(firstThinkingLine(m.thinkingText)))
+			upper.WriteString(styleMuted.Render("  (ctrl+o to expand)"))
+			upper.WriteString("\n\n")
+		} else {
+			thinkLines := strings.Split(m.thinkingText, "\n")
+			if len(thinkLines) > 0 {
+				upper.WriteString(thinkStyle.Render(thinkLines[0]))
+				for _, ln := range thinkLines[1:] {
+					upper.WriteString("\n  ")
+					upper.WriteString(thinkStyle.Render(ln))
+				}
 			}
+			upper.WriteString("\n\n")
 		}
-		upper.WriteString("\n\n")
 	}
 	if m.streamingText != "" {
 		upper.WriteString(styleAsst.Render("  " + glyphBullet + " "))
@@ -298,7 +329,7 @@ func (m *Model) View() tea.View {
 		desiredVp = 1
 	}
 	m.chatList.SetSize(w-2, desiredVp) // -2 for the scrollbar gutter
-	if wasAtBottom {
+	if m.stickyBottom && wasAtBottom {
 		m.chatList.ScrollToBottom()
 	}
 

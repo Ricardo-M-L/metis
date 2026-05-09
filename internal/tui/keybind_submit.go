@@ -188,6 +188,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.showPalette = false
 	m.palFilter = ""
 
+	// Submitting a new prompt re-anchors the viewport to the live
+	// tail. claude-code parity: typing into the editor and hitting
+	// Enter is the canonical "I'm caught up, follow the stream" gesture.
+	m.stickyBottom = true
+
 	// Bash mode: `!ls -la` runs the rest of the line as a shell command
 	// without going through the LLM. Saves tokens for trivial things
 	// (ls, pwd, cat, ...) and is also useful for shell debugging while

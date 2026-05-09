@@ -338,11 +338,22 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "pgup":
+		// User scrolled away from the live tail — claude-code's
+		// useVirtualScroll flips isSticky false on every wheel-up /
+		// PgUp. Once unstuck, View() stops auto-snapping to bottom on
+		// the next streaming tick so the user can read older history.
+		m.stickyBottom = false
 		m.chatList.ScrollBy(-m.chatList.Height() / 2)
 		return m, nil
 
 	case "pgdown":
 		m.chatList.ScrollBy(m.chatList.Height() / 2)
+		// Re-stick if PgDn carried us back to the bottom. Same gesture
+		// as wheel-down hitting the floor — the user signalled "I'm
+		// caught up, follow the stream again."
+		if m.chatList.AtBottom() {
+			m.stickyBottom = true
+		}
 		return m, nil
 
 	case "home":
@@ -350,11 +361,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// textarea also binds Home but only when the input has content;
 		// when empty (the common scroll-back case) we route to chatList.
 		if strings.TrimSpace(m.input.Value()) == "" {
+			m.stickyBottom = false
 			m.chatList.ScrollToTop()
 			return m, nil
 		}
 	case "end":
 		if strings.TrimSpace(m.input.Value()) == "" {
+			m.stickyBottom = true
 			m.chatList.ScrollToBottom()
 			return m, nil
 		}

@@ -41,13 +41,13 @@ func TestVisualDump(t *testing.T) {
 	dump("\n\n")
 
 	// User input (was "› ", now "❯ ")
-	dump(renderMessage(Message{Role: "user", Content: "fix the bug in compaction trigger"}, 80))
+	dump(renderMessage(Message{Role: "user", Content: "fix the bug in compaction trigger"}, 80, false))
 
 	// Assistant text — plain
-	dump(renderMessage(Message{Role: "assistant", Content: "Looking at the compaction trigger logic in agent/compact.go."}, 80))
+	dump(renderMessage(Message{Role: "assistant", Content: "Looking at the compaction trigger logic in agent/compact.go."}, 80, false))
 
 	// Assistant text — markdown (code fence + bold + list)
-	dump(renderMessage(Message{Role: "assistant", Content: "Here's the **fix**:\n\n```go\nif usage > threshold {\n    if err := Compact(); err != nil {\n        return err\n    }\n}\n```\n\nKey changes:\n- Wrapped the call in error check\n- Added a *log.Info* trace before compaction"}, 80))
+	dump(renderMessage(Message{Role: "assistant", Content: "Here's the **fix**:\n\n```go\nif usage > threshold {\n    if err := Compact(); err != nil {\n        return err\n    }\n}\n```\n\nKey changes:\n- Wrapped the call in error check\n- Added a *log.Info* trace before compaction"}, 80, false))
 
 	// Read — in-flight
 	dump(renderToolEvent(ToolEvent{
@@ -127,7 +127,7 @@ func TestVisualDump(t *testing.T) {
 	dump(renderMessage(Message{
 		Role:    "thought-summary",
 		Content: fmt.Sprintf("%s for %s", "Cogitated", formatTurnDuration(78*time.Second)),
-	}, 80))
+	}, 80, false))
 
 	// Recap (structural, derived from the turn's tool events)
 	mockEvents := []ToolEvent{
@@ -137,14 +137,14 @@ func TestVisualDump(t *testing.T) {
 		{Kind: "result", ToolName: "Bash", Input: map[string]any{"command": "go test ./internal/agent/"}},
 	}
 	if recap := buildTurnRecap(mockEvents); recap != "" {
-		dump(renderMessage(Message{Role: "recap", Content: recap}, 80))
+		dump(renderMessage(Message{Role: "recap", Content: recap}, 80, false))
 	}
 
 	// Compaction banner
 	dump(renderMessage(Message{
 		Role:    "compaction",
 		Content: "context compacted: 47 → 12 messages",
-	}, 80))
+	}, 80, false))
 
 	// Final ANSI reset so the user's prompt color isn't stuck
 	dump("\033[0m")

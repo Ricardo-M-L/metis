@@ -49,15 +49,19 @@ import (
 // optimizing.
 const cacheHashThreshold = 4096
 
-// messageKey identifies a cached renderMessage(msg, width) output.
+// messageKey identifies a cached renderMessage(msg, width, expand)
+// output.
 //
-// Only role + content + width are consulted: renderMessage doesn't read
-// any other field of Message (Timestamp / ToolName / ToolError don't
-// affect the rendered glyph for the roles we cache here).
+// Only role + content + width + expand are consulted: renderMessage
+// doesn't read any other field of Message (Timestamp / ToolName /
+// ToolError don't affect the rendered glyph for the roles we cache
+// here). The expand bit invalidates the cache when Ctrl+O toggles —
+// folded vs. unfolded thinking renders different output.
 type messageKey struct {
 	role     string
 	contentK string // raw content if short, "h:len:xxh3hex" if long
 	width    int
+	expand   bool
 }
 
 // toolKey identifies a cached renderToolEvent(te, expand) output.
@@ -147,11 +151,11 @@ func contentCacheKey(content string) string {
 // miss, never record" so View() falls back to recomputing every frame
 // (the pre-cache behavior). No production code path produces a nil
 // renderCache — NewModel always populates it.
-func (c *renderCache) GetMessage(m Message, width int) (string, bool) {
+func (c *renderCache) GetMessage(m Message, width int, expand bool) (string, bool) {
 	if c == nil {
 		return "", false
 	}
-	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width}
+	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand}
 	c.mu.RLock()
 	s, ok := c.msg[k]
 	c.mu.RUnlock()
@@ -167,11 +171,11 @@ func (c *renderCache) GetMessage(m Message, width int) (string, bool) {
 // for measuring the render cost via RecordRender — keeping that out of
 // Put() means callers that already have the rendered string (e.g. tests)
 // don't pay for fake telemetry.
-func (c *renderCache) PutMessage(m Message, width int, rendered string) {
+func (c *renderCache) PutMessage(m Message, width int, expand bool, rendered string) {
 	if c == nil {
 		return
 	}
-	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width}
+	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand}
 	c.mu.Lock()
 	c.msg[k] = rendered
 	c.mu.Unlock()

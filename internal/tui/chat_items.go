@@ -29,24 +29,29 @@ import (
 // the next View() rebuild creates a fresh messageItem reflecting the
 // updated Message anyway).
 type messageItem struct {
-	msg   Message
-	cache *renderCache
+	msg    Message
+	expand bool
+	cache  *renderCache
 }
 
 // Render implements list.Item. Cache-aware: hit returns the stored
 // string verbatim; miss runs renderMessage, instruments cost via
 // RecordRender (slow-render log + rolling avg), then stores the result.
+//
+// expand is captured at item-construction time (in buildChatItems) and
+// keys into the cache via PutMessage/GetMessage — so toggling Ctrl+O
+// invalidates cached folded thinking blocks and forces a re-render.
 func (i *messageItem) Render(width int) string {
 	if i.cache != nil {
-		if cached, ok := i.cache.GetMessage(i.msg, width); ok {
+		if cached, ok := i.cache.GetMessage(i.msg, width, i.expand); ok {
 			return cached
 		}
 	}
 	t0 := time.Now()
-	rendered := renderMessage(i.msg, width)
+	rendered := renderMessage(i.msg, width, i.expand)
 	if i.cache != nil {
 		i.cache.RecordRender(i.msg.Role, len(i.msg.Content), time.Since(t0))
-		i.cache.PutMessage(i.msg, width, rendered)
+		i.cache.PutMessage(i.msg, width, i.expand, rendered)
 	}
 	return rendered
 }
@@ -122,7 +127,7 @@ func (m *Model) buildChatItems() []list.Item {
 	for _, it := range merged {
 		switch {
 		case it.msg != nil:
-			out = append(out, &messageItem{msg: *it.msg, cache: m.renderCache})
+			out = append(out, &messageItem{msg: *it.msg, expand: m.expandToolOutputs, cache: m.renderCache})
 		case it.te != nil:
 			out = append(out, &toolEventItem{te: *it.te, expand: m.expandToolOutputs, cache: m.renderCache})
 		}

@@ -40,9 +40,21 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// effect reads similar; metis goes one further and just lowercases
 	// at the render boundary because the user reported uppercase looks
 	// "loud" against the soft-tone TUI palette.
+	// Leader color follows claude-code's ToolUseLoader pattern: in-flight
+	// rows use the accent (blue/orange) "tool starting" color; completed
+	// rows pop bright **green** (success) or **red** (error) so the
+	// transcript at-a-glance shows you which calls succeeded. Earlier
+	// metis released with completed rows muted to #606060 grey, which
+	// the user reported as "too washed out" vs claude-code in the same
+	// terminal — this fix swaps the muted-once-finished branch for
+	// success/error so the bullet carries actual semantic color.
 	leaderColor := styleAccent
 	if te.Kind != "start" {
-		leaderColor = styleMuted
+		if te.IsError {
+			leaderColor = styleErr
+		} else {
+			leaderColor = styleSuccess
+		}
 	}
 	s.WriteString(leaderColor.Render("  " + glyphBullet + " "))
 	s.WriteString(styleToolName.Render(displayToolName(te.ToolName)))
@@ -77,7 +89,12 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// muted grey. The user flagged that too much of the screen renders
 	// as low-contrast grey vs claude-code, and this row is one of the
 	// most-read lines in the transcript.
-	s.WriteString(styleMuted.Render("    " + glyphTreeLeaf + "  "))
+	// Connector glyph stays subdued (it's structural, not informational)
+	// but at #a0a0a0 (styleDim), not #606060 (styleMuted) — the latter
+	// vanishes against most dark-theme backgrounds. claude-code uses
+	// `dimColor` (ANSI Faint) for the same role, which renders ~50% of
+	// the active foreground rather than a fixed ultra-grey.
+	s.WriteString(styleDim.Render("    " + glyphTreeLeaf + "  "))
 	if te.IsError {
 		s.WriteString(styleErr.Render("✗ "))
 	} else {

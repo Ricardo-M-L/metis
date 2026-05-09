@@ -200,13 +200,14 @@ func newScrollTestModel(termW, termH int) *Model {
 	cl.SetSize(termW-2, termH-10)
 	cl.SetMouseWheelDelta(1)
 	return &Model{
-		gate:        permission.New(permission.ModeAuto),
-		startTime:   time.Now(),
-		input:       ti,
-		chatList:    cl,
-		width:       termW,
-		height:      termH,
-		firstRender: false,
-		showBanner:  false,
+		gate:         permission.New(permission.ModeAuto),
+		startTime:    time.Now(),
+		input:        ti,
+		chatList:     cl,
+		width:        termW,
+		height:       termH,
+		firstRender:  false,
+		showBanner:   false,
+		stickyBottom: true,
 	}
 }

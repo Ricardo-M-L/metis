@@ -320,6 +320,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Button {
 		case tea.MouseWheelUp:
 			dir = -m.chatList.MouseWheelDelta()
+			// Wheel-up = "I want to read history" — break sticky-bottom
+			// so streaming output won't yank the viewport back down on
+			// the next tick. claude-code parity (isSticky → false).
+			m.stickyBottom = false
 		case tea.MouseWheelDown:
 			dir = m.chatList.MouseWheelDelta()
 		default:
@@ -328,6 +332,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		q := perfConfig().ScrollQuantum
 		if q <= 0 {
 			m.chatList.ScrollBy(dir)
+			// Re-stick if a wheel-down landed us at the floor.
+			if msg.Button == tea.MouseWheelDown && m.chatList.AtBottom() {
+				m.stickyBottom = true
+			}
 			return m, nil
 		}
 		// Reset accumulator on direction reversal so a flick-up after
@@ -340,6 +348,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.wheelAccum <= -q || m.wheelAccum >= q {
 			m.chatList.ScrollBy(m.wheelAccum)
 			m.wheelAccum = 0
+			if msg.Button == tea.MouseWheelDown && m.chatList.AtBottom() {
+				m.stickyBottom = true
+			}
 		}
 		return m, nil
 

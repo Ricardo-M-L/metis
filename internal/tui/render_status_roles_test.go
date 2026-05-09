@@ -12,7 +12,7 @@ import (
 // landed" feedback distinct from neutral info messages.
 func TestRender_SuccessRoleAddsCheckGlyph(t *testing.T) {
 	msg := Message{Role: "success", Content: "session synced to disk", Timestamp: time.Now()}
-	out := stripANSI(renderMessage(msg, 80))
+	out := stripANSI(renderMessage(msg, 80, false))
 	if !strings.Contains(out, "✓") {
 		t.Errorf("success role should render with ✓ glyph; got: %q", out)
 	}
@@ -25,7 +25,7 @@ func TestRender_SuccessRoleAddsCheckGlyph(t *testing.T) {
 // orange for soft warnings (no session store, deprecated usage).
 func TestRender_WarningRoleAddsWarnGlyph(t *testing.T) {
 	msg := Message{Role: "warning", Content: "no session store available", Timestamp: time.Now()}
-	out := stripANSI(renderMessage(msg, 80))
+	out := stripANSI(renderMessage(msg, 80, false))
 	if !strings.Contains(out, "⚠") {
 		t.Errorf("warning role should render with ⚠ glyph; got: %q", out)
 	}
@@ -37,7 +37,7 @@ func TestRender_WarningRoleAddsWarnGlyph(t *testing.T) {
 // glyph-prefixed neighbors.
 func TestRender_InfoRoleAddsBulletGlyph(t *testing.T) {
 	msg := Message{Role: "info", Content: "history cleared", Timestamp: time.Now()}
-	out := stripANSI(renderMessage(msg, 80))
+	out := stripANSI(renderMessage(msg, 80, false))
 	if !strings.Contains(out, "·") {
 		t.Errorf("info role should render with · prefix; got: %q", out)
 	}
@@ -47,7 +47,7 @@ func TestRender_InfoRoleAddsBulletGlyph(t *testing.T) {
 // error rendering must not change.
 func TestRender_ErrorRoleStillHasXGlyph(t *testing.T) {
 	msg := Message{Role: "error", Content: "failed to write", Timestamp: time.Now()}
-	out := stripANSI(renderMessage(msg, 80))
+	out := stripANSI(renderMessage(msg, 80, false))
 	if !strings.Contains(out, "✗") {
 		t.Errorf("error role should keep ✗ glyph; got: %q", out)
 	}
@@ -65,7 +65,7 @@ func TestRender_AllStatusRolesDistinguishable(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for role, want := range prefixes {
-		out := stripANSI(renderMessage(Message{Role: role, Content: "hello", Timestamp: time.Now()}, 80))
+		out := stripANSI(renderMessage(Message{Role: role, Content: "hello", Timestamp: time.Now()}, 80, false))
 		if !strings.Contains(out, want) {
 			t.Errorf("role=%q missing prefix %q; got: %q", role, want, out)
 		}
