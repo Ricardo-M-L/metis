@@ -1,9 +1,12 @@
 package builtin
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,6 +114,74 @@ func TestWalkBudget_InWorktreeReturnsZeroes(t *testing.T) {
 func TestInsideGitWorktree_EmptyDirReturnsFalse(t *testing.T) {
 	if insideGitWorktree("") {
 		t.Errorf("empty dir should not be reported as inside a worktree")
+	}
+}
+
+// TestLS_TruncatesOutsideWorktree is an end-to-end check: drop 300
+// files into a non-git tempdir and confirm LS.Execute trims the
+// listing + appends the [truncated …] footer the agent sees.
+// Mirrors the real out-of-worktree fan-out scenario from the
+// 2026-05-05 incident.
+func TestLS_TruncatesOutsideWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	resetScopeCache(t)
+	dir := t.TempDir()
+	for i := 0; i < 300; i++ {
+		f := filepath.Join(dir, fmt.Sprintf("f_%03d.txt", i))
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l := LS{gate: bypassGate()}
+	res, err := l.Execute(context.Background(), map[string]any{"path": dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Output, "truncated") {
+		t.Errorf("expected truncation footer in non-worktree output; got first 500 bytes: %q", res.Output[:min(len(res.Output), 500)])
+	}
+	// Count how many file rows actually rendered — should be ≤ 200
+	// (walkBudget's outside-worktree cap), not the full 300.
+	rows := strings.Count(res.Output, "f_")
+	if rows > 200 {
+		t.Errorf("expected ≤ 200 rows under non-worktree clamp, got %d", rows)
+	}
+	if rows == 0 {
+		t.Errorf("expected some rows, got zero — clamp too aggressive?")
+	}
+}
+
+// TestLS_NoTruncationInsideWorktree confirms the clamp is gated on
+// the no-git-repo signal: same 300 files in a `git init`-ed dir
+// should render in full.
+func TestLS_NoTruncationInsideWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	resetScopeCache(t)
+	dir := t.TempDir()
+	if err := exec.Command("git", "-C", dir, "init", "--quiet").Run(); err != nil {
+		t.Skip("git init failed")
+	}
+	for i := 0; i < 300; i++ {
+		f := filepath.Join(dir, fmt.Sprintf("f_%03d.txt", i))
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l := LS{gate: bypassGate()}
+	res, err := l.Execute(context.Background(), map[string]any{"path": dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Output, "truncated") {
+		t.Errorf("expected NO truncation inside worktree; got truncated footer")
+	}
+	rows := strings.Count(res.Output, "f_")
+	if rows < 300 {
+		t.Errorf("expected all 300 rows inside worktree, got %d", rows)
 	}
 }
 
