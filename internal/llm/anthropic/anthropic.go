@@ -158,6 +158,46 @@ type anthropicContent struct {
 	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
+// MarshalJSON ensures `tool_use` blocks ALWAYS emit an `input` field,
+// falling back to `{}` when the model produced no parameters.
+//
+// Why: real Anthropic accepts a missing `input` field on round-trip,
+// but MiniMax's anthropic-compat endpoint and several other shims
+// strictly require `input` to be present — they 400 with code (2013)
+// `invalid function arguments json string` on the NEXT request that
+// echoes the offending tool_use back. The default `omitempty` on
+// `map[string]any{}` causes Go to drop the field entirely, so even
+// after the user's retry-with-reminder shifts the model off the
+// empty-args path, the previous turn's empty tool_use is still in
+// the messages array and keeps tripping the 2013 reject.
+//
+// This MarshalJSON intercepts the tool_use case and emits a literal
+// `{}` so subsequent requests round-trip cleanly. Other content types
+// (text / tool_result) are passed through to the default marshaler.
+func (c anthropicContent) MarshalJSON() ([]byte, error) {
+	if c.Type != "tool_use" {
+		type alias anthropicContent
+		return json.Marshal(alias(c))
+	}
+	// Tool-use shape with mandatory (non-omitempty) input. We
+	// reconstruct only the fields a tool_use block actually carries —
+	// text / tool_use_id / content / is_error don't apply.
+	type toolUseShape struct {
+		Type         string                 `json:"type"`
+		ID           string                 `json:"id,omitempty"`
+		Name         string                 `json:"name,omitempty"`
+		Input        map[string]any         `json:"input"` // NO omitempty
+		CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+	}
+	in := c.Input
+	if in == nil {
+		in = map[string]any{}
+	}
+	return json.Marshal(toolUseShape{
+		Type: c.Type, ID: c.ID, Name: c.Name, Input: in, CacheControl: c.CacheControl,
+	})
+}
+
 // anthropicCacheControl marks a tool / system block as a prompt-cache
 // breakpoint. Anthropic spec: "ephemeral" gives ~5min TTL; everything
 // BEFORE this marker (including the marker itself) is cached together.
