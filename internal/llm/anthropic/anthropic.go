@@ -774,6 +774,17 @@ type streamBlock struct {
 	ToolUseID string
 	ToolName  string
 	JSONBuf   strings.Builder
+
+	// Prefill captures the model's `input` field carried in
+	// content_block_start. Anthropic protocol allows the model to send
+	// the entire arguments object inline at block-start with NO
+	// subsequent input_json_delta events ("prefill mode"). We keep it
+	// separate from JSONBuf to handle the prefill+delta hybrid case
+	// safely: when deltas arrive after a prefill, JSONBuf wins (the
+	// deltas are the streaming form of the same data and will be
+	// complete on their own); when no delta ever arrives, Prefill is
+	// used at content_block_stop.
+	Prefill string
 }
 
 func newAnthropicStream(body io.ReadCloser) *anthropicStream {
@@ -844,7 +855,17 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 				Input map[string]any `json:"input"`
 			}
 			_ = json.Unmarshal(env.ContentBlock, &cb)
-			s.currentBlocks[env.Index] = &streamBlock{Type: cb.Type, ToolUseID: cb.ID, ToolName: cb.Name}
+			blk := &streamBlock{Type: cb.Type, ToolUseID: cb.ID, ToolName: cb.Name}
+			// Capture prefill: if the model sent the whole arguments
+			// object inline at block-start (instead of via deltas), we
+			// stash it in Prefill. content_block_stop falls back to
+			// Prefill when no input_json_delta arrived.
+			if cb.Type == "tool_use" && len(cb.Input) > 0 {
+				if b, err := json.Marshal(cb.Input); err == nil {
+					blk.Prefill = string(b)
+				}
+			}
+			s.currentBlocks[env.Index] = blk
 			if cb.Type == "tool_use" {
 				return StreamEvent{Type: "tool_use_start", ToolUseID: cb.ID, ToolName: cb.Name}, nil
 			}
@@ -880,7 +901,19 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 		case "content_block_stop":
 			blk := s.currentBlocks[env.Index]
 			if blk != nil && blk.Type == "tool_use" {
-				ev := StreamEvent{Type: "tool_use_stop", ToolUseID: blk.ToolUseID, InputDelta: blk.JSONBuf.String()}
+				// Pick the best-available source for the tool's JSON
+				// arguments at this stop: deltas if any arrived (the
+				// streaming form), else the prefill captured at
+				// content_block_start. If both are empty (the model
+				// emitted no input at all — legal for zero-arg tools
+				// like MetisInfo with all-optional schema), the
+				// downstream agent will marshal as `{}` thanks to the
+				// MarshalJSON fix on anthropicContent.
+				input := blk.JSONBuf.String()
+				if input == "" {
+					input = blk.Prefill
+				}
+				ev := StreamEvent{Type: "tool_use_stop", ToolUseID: blk.ToolUseID, InputDelta: input}
 				delete(s.currentBlocks, env.Index)
 				return ev, nil
 			}
