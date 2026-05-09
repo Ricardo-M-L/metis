@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>metis stats — generated {{.GeneratedAt.Format "2006-01-02 15:04:05"}}</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --bar: linear-gradient(90deg, #1f6feb, #58a6ff);
+    --heat-low: #0a2036;
+    --heat-high: #58a6ff;
+  }
+  * { box-sizing: border-box }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+    margin: 0; padding: 24px; max-width: 1100px; margin: 0 auto;
+  }
+  header { padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 24px }
+  h1 { margin: 0; font-size: 22px; color: var(--accent) }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 6px }
+  section {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 16px; margin-bottom: 16px;
+  }
+  h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600 }
+  .grid-summary {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+  }
+  .stat { padding: 12px; background: var(--bg); border-radius: 4px; border: 1px solid var(--border) }
+  .stat .num { font-size: 22px; font-weight: 600; color: var(--accent) }
+  .stat .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px }
+  .bar-row { display: flex; align-items: center; margin: 4px 0; font-size: 13px; gap: 8px }
+  .bar-row .label { width: 90px; color: var(--muted); font-variant-numeric: tabular-nums }
+  .bar-row .bar { flex: 1; height: 18px; background: var(--bg); border-radius: 3px; overflow: hidden }
+  .bar-row .bar > div { height: 100%; background: var(--bar); transition: width .3s }
+  .bar-row .val { width: 60px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums }
+  table { width: 100%; border-collapse: collapse; font-size: 13px }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border) }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px }
+  tr:last-child td { border-bottom: none }
+  td.num { text-align: right; font-variant-numeric: tabular-nums }
+  .heatmap { display: grid; grid-template-columns: 24px repeat(24, 1fr); gap: 1px; font-size: 10px }
+  .heatmap .col-label { color: var(--muted); text-align: center; padding: 2px 0 }
+  .heatmap .row-label { color: var(--muted); padding: 2px 0; text-align: right }
+  .heatmap .cell { aspect-ratio: 1; min-height: 16px; border-radius: 2px }
+  footer { color: var(--muted); font-size: 11px; text-align: center; margin-top: 24px }
+  .empty { color: var(--muted); font-style: italic; padding: 12px 0 }
+</style>
+</head>
+<body>
+<header>
+  <h1>metis · usage stats</h1>
+  <div class="sub">
+    Generated {{.GeneratedAt.Format "2006-01-02 15:04"}}
+    {{if not .Total.OldestSessionDate.IsZero}}
+      · Range {{.Total.OldestSessionDate.Format "2006-01-02"}} → {{.Total.NewestSessionDate.Format "2006-01-02"}}
+    {{end}}
+  </div>
+</header>
+
+<section>
+  <h2>Summary</h2>
+  <div class="grid-summary">
+    <div class="stat"><div class="num">{{.Total.Sessions}}</div><div class="lbl">Sessions</div></div>
+    <div class="stat"><div class="num">{{.Total.Messages}}</div><div class="lbl">Messages</div></div>
+    <div class="stat"><div class="num">{{.Total.ActiveDays}}</div><div class="lbl">Active days</div></div>
+    <div class="stat"><div class="num">{{thousands .Total.ApproxTokensIn}}</div><div class="lbl">~Input tokens</div></div>
+    <div class="stat"><div class="num">{{thousands .Total.ApproxTokensOut}}</div><div class="lbl">~Output tokens</div></div>
+  </div>
+</section>
+
+{{if .ByModel}}
+<section>
+  <h2>By model</h2>
+  {{range .ByModel}}
+    <div class="bar-row">
+      <span class="label" title="{{.Model}}">{{shorten .Model 14}}</span>
+      <div class="bar"><div style="width:{{pct .Sessions $.Total.Sessions}}%"></div></div>
+      <span class="val">{{.Sessions}}</span>
+    </div>
+  {{end}}
+</section>
+{{end}}
+
+<section>
+  <h2>Activity by day-of-week</h2>
+  {{range .ByDayOfWeek}}
+    <div class="bar-row">
+      <span class="label">{{.Day}}</span>
+      <div class="bar"><div style="width:{{pct .Sessions $.Total.Sessions}}%"></div></div>
+      <span class="val">{{.Sessions}}</span>
+    </div>
+  {{end}}
+</section>
+
+<section>
+  <h2>Activity by hour-of-day</h2>
+  {{range .ByHour}}
+    <div class="bar-row">
+      <span class="label">{{printf "%02d:00" .Hour}}</span>
+      <div class="bar"><div style="width:{{pct .Sessions $.Total.Sessions}}%"></div></div>
+      <span class="val">{{.Sessions}}</span>
+    </div>
+  {{end}}
+</section>
+
+<section>
+  <h2>Hour × Day-of-week heatmap</h2>
+  <div class="heatmap">
+    <div></div>
+    {{range $h := iter 24}}<div class="col-label">{{printf "%02d" $h}}</div>{{end}}
+    {{range $d, $row := .HourDowMatrix}}
+      <div class="row-label">{{dowShort $d}}</div>
+      {{range $h, $v := $row}}
+        <div class="cell" style="background-color:{{heatColor $v $.HeatmapMax}}" title="{{dowShort $d}} {{printf "%02d:00" $h}} — {{$v}} sessions"></div>
+      {{end}}
+    {{end}}
+  </div>
+</section>
+
+{{if .RecentSessions}}
+<section>
+  <h2>Recent sessions ({{len .RecentSessions}})</h2>
+  <table>
+    <thead>
+      <tr><th>Started</th><th>Model</th><th>Title / ID</th><th class="num">Msgs</th></tr>
+    </thead>
+    <tbody>
+      {{range .RecentSessions}}
+        <tr>
+          <td>{{.Started.Format "2006-01-02 15:04"}}</td>
+          <td>{{shorten .Model 22}}</td>
+          <td>{{if .Title}}{{shorten .Title 40}}{{else}}<span style="color:var(--muted)">{{shorten .ID 8}}</span>{{end}}</td>
+          <td class="num">{{.Messages}}</td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}
+
+{{if .RecentDays}}
+<section>
+  <h2>Last 30 days</h2>
+  {{range .RecentDays}}
+    <div class="bar-row">
+      <span class="label">{{.Date.Format "01-02 Mon"}}</span>
+      <div class="bar"><div style="width:{{pct .Sessions $.RecentDaysMax}}%"></div></div>
+      <span class="val">{{.Sessions}}</span>
+    </div>
+  {{end}}
+</section>
+{{end}}
+
+<footer>
+  metis · {{.Total.Sessions}} sessions analysed · regenerate with <code>metis stats</code>
+</footer>
+</body>
+</html>

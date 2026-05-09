@@ -82,6 +82,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdModels(ctx, args[1:])
 	case "sessions":
 		return cmdSessions(args[1:])
+	case "stats":
+		return cmdStats(ctx, args[1:])
 	case "skills":
 		return cmdSkills(args[1:])
 	case "acp":
@@ -1057,6 +1059,9 @@ func cmdACP(ctx context.Context, args []string) error {
 		return err
 	}
 	defer rt.Cleanup()
+	// Tell the ACP layer what version to advertise in InitializeResult
+	// so clients see the same version as `metis --version`.
+	acp.SetServerVersion(version.Version)
 	srv := acp.NewServer(rt.loop, addr)
 	if err := srv.Listen(); err != nil {
 		return err
