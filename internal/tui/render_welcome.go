@@ -52,7 +52,6 @@ var metisOwlGlyphLines = []string{
 	" ▟██▙▄▄▄▄▄▄▄▟██▙ ",
 	"▐███▌       ▐███▌",
 	" ▀▀▀         ▀▀▀ ",
-	"       ▀ ▀       ",
 }
 
 // Eye-position cyan accent — row + col indices in metisOwlGlyphLines.
