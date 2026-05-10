@@ -16,7 +16,17 @@ import (
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.permActive {
-		return m.handlePermKey(msg)
+		// Permission prompt consumes ONLY navigation/decision keys
+		// (arrows, enter/space, esc). Any other key falls through to
+		// the main dispatch below so the user can keep composing the
+		// next message while the permission popup waits for an answer
+		// — image #18 user feedback. claude-code/crush/opencode all
+		// block the editor entirely here; metis is intentionally more
+		// permissive because the user reported the lock as a friction
+		// point during heavy multi-tool turns.
+		if model, cmd, handled := m.handlePermKey(msg); handled {
+			return model, cmd
+		}
 	}
 	// Palette is a hovering suggestion layer rather than a modal dialog —
 	// it intercepts only navigation keys (Up/Down/Tab/Esc) and lets every

@@ -34,24 +34,45 @@ const modeCycleDebounce = 200 * time.Millisecond
 // permission prompt" failure mode this guards against.
 const permissionTimeout = 60 * time.Second
 
-func (m *Model) handlePermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// handlePermKey processes a key while the permission prompt is up.
+//
+// Returns handled=true ONLY when the key is part of the prompt's
+// vocabulary (arrow navigation, enter/space confirm, esc deny). Every
+// other key returns handled=false so the caller can forward it to the
+// input editor — that's the user-feedback fix for image #18, where a
+// permission prompt was locking the textarea entirely until the user
+// answered. Now the user can keep composing the next prompt while a
+// permission popup waits for a decision; only the keys that would
+// ambiguously target both the prompt and the editor are intercepted.
+//
+// claude-code, crush, and opencode all block the editor entirely when
+// their permission prompts are visible — metis diverges here because
+// the user explicitly asked for "type while waiting" behavior. The
+// risk (accidental enter-as-confirm-vs-submit) is mitigated by NOT
+// listing letter shortcuts (y/n/a/c) as intercepted: the user can
+// freely type "your code" without granting permission.
+func (m *Model) handlePermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 	switch msg.String() {
 	case "left", "up":
 		if m.permCursor > 0 {
 			m.permCursor--
 		}
+		return m, nil, true
 	case "right", "down":
 		if m.permCursor < len(m.permChoices)-1 {
 			m.permCursor++
 		}
+		return m, nil, true
 	case "enter", "space":
 		choice := m.permChoices[m.permCursor]
 		m.executePermission(choice.Key)
+		return m, nil, true
 	case "esc":
 		m.permActive = false
 		m.executePermission("n")
+		return m, nil, true
 	}
-	return m, nil
+	return m, nil, false
 }
 
 // executePermission sends the user's decision through the reply

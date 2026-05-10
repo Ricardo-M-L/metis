@@ -144,6 +144,51 @@ func TestPermissionAsk_AlwaysAllowAddsRule(t *testing.T) {
 	}
 }
 
+// TestPermissionAsk_TypingFallsThroughToInput — image #18 fix. While
+// the permission prompt is up, hitting an ordinary key like 'h' must
+// still insert into the textarea so the user can compose their next
+// message without first answering the prompt. handlePermKey returns
+// handled=false for non-decision keys; handleKey then falls through
+// to the normal m.input.Update path.
+//
+// Diverges from claude-code/crush/opencode (which all freeze the
+// textarea entirely during a permission prompt) — see the comment on
+// handlePermKey for why metis is intentionally more permissive.
+func TestPermissionAsk_TypingFallsThroughToInput(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.permActive = true
+	m.permChoices = []permChoice{{Label: "Yes", Key: "y"}, {Label: "No", Key: "n"}}
+	m.permCursor = 0
+	m.permReply = make(chan agent.PermissionDecision, 1)
+
+	// Non-decision key — should NOT be intercepted.
+	_, _, handled := m.handlePermKey(tea.KeyPressMsg{Code: 'h', Text: "h"})
+	if handled {
+		t.Errorf("handlePermKey should not intercept letter 'h' (got handled=true)")
+	}
+
+	// Drive the same key through the top-level handler — input should accept it.
+	before := m.input.Value()
+	m.handleKey(tea.KeyPressMsg{Code: 'h', Text: "h"})
+	after := m.input.Value()
+	if after == before {
+		t.Errorf("input.Value() unchanged after typing 'h' under permission prompt: %q", after)
+	}
+	if !strings.Contains(after, "h") {
+		t.Errorf("expected 'h' inserted into input, got %q", after)
+	}
+
+	// Permission state must remain active — the keystroke didn't answer.
+	if !m.permActive {
+		t.Errorf("typing must not dismiss the permission prompt")
+	}
+	select {
+	case d := <-m.permReply:
+		t.Errorf("typing 'h' should not send any decision; got %v", d)
+	default:
+	}
+}
+
 // ============================================================================
 // 2. History search (Ctrl-R overlay)
 // ============================================================================
