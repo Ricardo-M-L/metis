@@ -30,15 +30,16 @@ var ParseEffort = pubLLM.ParseEffort
 
 // Wire-format type aliases. Existing call sites use these unchanged.
 type (
-	Role         = pubprov.Role
-	ContentBlock = pubprov.ContentBlock
-	Message      = pubprov.Message
-	ToolSpec     = pubprov.ToolSpec
-	Request      = pubprov.Request
-	Response     = pubprov.Response
-	StreamEvent  = pubprov.StreamEvent
-	Provider     = pubprov.Provider
-	StreamReader = pubprov.StreamReader
+	Role          = pubprov.Role
+	ContentBlock  = pubprov.ContentBlock
+	Message       = pubprov.Message
+	ToolSpec      = pubprov.ToolSpec
+	Request       = pubprov.Request
+	SystemSection = pubprov.SystemSection
+	Response      = pubprov.Response
+	StreamEvent   = pubprov.StreamEvent
+	Provider      = pubprov.Provider
+	StreamReader  = pubprov.StreamReader
 )
 
 // Role constants. pkg/provider declares the canonical values.

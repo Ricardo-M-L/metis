@@ -530,8 +530,16 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Append user's optional ~/.metis/system.md addendum (claude-code-style
 	// global system prompt). No-op when the file doesn't exist or the
 	// profile asked us to skip it.
+	// Build BOTH the string form (for legacy / non-Anthropic providers
+	// that don't read SystemSections) AND the typed-section form (so
+	// the Anthropic provider can emit per-section cache_control). The
+	// two are kept in sync — the string is just the sectioned form
+	// joined with boundary markers, so a provider walking either one
+	// sees identical content.
+	var systemSections []rtpkg.SystemPromptSection
 	if agentProf == nil || !agentProf.OmitClaudeMd {
-		system = rtpkg.AssembleSystemPrompt(system)
+		systemSections = rtpkg.AssembleSystemPromptSections(system, rtpkg.AssembleOptions{})
+		system = rtpkg.RenderSections(systemSections)
 	}
 
 	// --add-dir / persisted additional dirs. Done before system prompt
@@ -539,6 +547,16 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	allowedDirs := rtpkg.NewAllowedDirs(flags.addDirs)
 	if extra := allowedDirs.SystemPromptAddendum(); extra != "" {
 		system = system + extra
+		// Allowed-dirs is stable per-session (set once at boot, doesn't
+		// drift), so cache it as its own section. Volatile=false +
+		// Cache=true → Anthropic gets a 4th breakpoint candidate; if
+		// the budget runs out, BuildSystemBlocksFromSections silently
+		// drops it from the cache list (still emitted, just uncached).
+		systemSections = append(systemSections, rtpkg.SystemPromptSection{
+			Name:  "allowed_dirs",
+			Body:  extra,
+			Cache: true,
+		})
 	}
 	chReg := rtpkg.BuildChannelRegistry(&cfg.Channels)
 	// Cron service is shared between the scheduler goroutine (started
@@ -650,6 +668,8 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Load failures are surfaced on stderr but don't block startup.
 	var pluginReg *rtpkg.PluginRegistry
 	if !flags.bare {
+		// EnsureBundledPlugins already ran inside setupRuntime so the
+		// extracted plugin tree is on disk by the time we get here.
 		var pluginErrs []error
 		pluginReg, pluginErrs = rtpkg.LoadPlugins(ctx, reg)
 		for _, e := range pluginErrs {
@@ -682,7 +702,8 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	loop := rtpkg.BuildAgentLoop(cfg, rtpkg.AgentLoopOptions{
 		Provider: prov, Registry: reg, Gate: gate,
-		System: system, Model: model, MaxIter: maxIter,
+		System: system, SystemSections: systemSections,
+		Model: model, MaxIter: maxIter,
 		MemoryManager: memoryMgr,
 		Jobs:          jobsPool,
 		Monitors:      monitorReg,

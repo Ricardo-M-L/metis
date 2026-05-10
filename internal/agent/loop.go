@@ -38,9 +38,16 @@ type Loop struct {
 	Gate       *permission.Gate
 	Hooks      *HookRegistry
 	System     string
-	Model      string
-	MaxIters   int
-	GraceCalls int
+	// SystemSections is the typed-section form of the system prompt.
+	// When non-empty, buildRequest passes it through llm.Request so the
+	// Anthropic provider can emit per-section cache_control. Memory
+	// context is appended as its own Volatile=true section so memory
+	// updates don't invalidate the addendum cache. nil → fall back to
+	// the System string + boundary-marker parsing path.
+	SystemSections []llm.SystemSection
+	Model          string
+	MaxIters       int
+	GraceCalls     int
 
 	// Memory provides persistent memory for system prompt injection.
 	// When set, BuildContext() is called to inject memory into each request.
@@ -596,22 +603,48 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 
 // buildRequest assembles the per-iteration LLM Request under l.mu so the
 // snapshot of Messages and System+Memory composition is consistent.
+//
+// SystemSections wiring: when l.SystemSections is populated (the new
+// path from runtime.AssembleSystemPromptSections), we emit memory
+// context as its OWN section flagged Volatile=true. That lets the
+// Anthropic provider keep base + addendum cached even when memory
+// updates per turn — without sectioning, a single memory write would
+// invalidate every cache breakpoint downstream of it.
 func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	system := l.System
+	var sections []llm.SystemSection
+	var memBody string
 	if l.Memory != nil {
-		if memCtx := l.Memory.BuildContext(); memCtx != "" {
-			system = system + "\n\n" + memCtx
+		memBody = l.Memory.BuildContext()
+	}
+	if len(l.SystemSections) > 0 {
+		sections = make([]llm.SystemSection, 0, len(l.SystemSections)+1)
+		sections = append(sections, l.SystemSections...)
+		if memBody != "" {
+			sections = append(sections, llm.SystemSection{
+				Name:     "memory",
+				Body:     memBody,
+				Cache:    false,
+				Volatile: true,
+			})
 		}
+	} else if memBody != "" {
+		// Legacy (string-only) path: append memory the old way so the
+		// boundary-marker parser still produces [base (cached), rest].
+		// Cache for `rest` is lost (memory is in there), but at least
+		// the base prefix still hits.
+		system = system + "\n\n" + memBody
 	}
 	req := llm.Request{
-		Model:    l.Model,
-		System:   system,
-		Messages: append([]llm.Message(nil), l.Messages...),
-		Tools:    specs,
-		Stream:   true,
-		Effort:   l.Effort,
+		Model:          l.Model,
+		System:         system,
+		SystemSections: sections,
+		Messages:       append([]llm.Message(nil), l.Messages...),
+		Tools:          specs,
+		Stream:         true,
+		Effort:         l.Effort,
 	}
 	// Fast mode is a pure request-time override. We don't mutate
 	// l.Effort because the user's persistent /effort preference

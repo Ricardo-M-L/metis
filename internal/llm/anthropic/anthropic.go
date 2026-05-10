@@ -329,7 +329,7 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 	out := anthropicReq{
 		Model:         model,
 		MaxTokens:     mt,
-		System:        buildSystemBlocks(req.System),
+		System:        chooseSystemBlocks(req),
 		Stream:        req.Stream,
 		StopSequences: req.StopSequences,
 	}
@@ -463,6 +463,30 @@ type SystemSection struct {
 	Body     string
 	Cache    bool
 	Volatile bool
+}
+
+// chooseSystemBlocks routes to the typed-sections path when the
+// caller populated req.SystemSections, falling back to the legacy
+// boundary-marker string parser otherwise.
+//
+// The typed path wins because it preserves the Volatile flag —
+// flattening to text + re-parsing markers can't tell "this is dynamic,
+// never cache" from "this happens to be uncached today". Memory
+// context relies on Volatile=true so a memory update doesn't
+// invalidate the addendum cache (the bug the user hit:
+// every turn writes a memory entry → addendum cache thrashes →
+// no caching benefit at all).
+func chooseSystemBlocks(req Request) []anthropicSystemBlock {
+	if len(req.SystemSections) > 0 {
+		secs := make([]SystemSection, 0, len(req.SystemSections))
+		for _, s := range req.SystemSections {
+			secs = append(secs, SystemSection{
+				Name: s.Name, Body: s.Body, Cache: s.Cache, Volatile: s.Volatile,
+			})
+		}
+		return BuildSystemBlocksFromSections(secs)
+	}
+	return buildSystemBlocks(req.System)
 }
 
 // BuildSystemBlocksFromSections is the typed-section construction

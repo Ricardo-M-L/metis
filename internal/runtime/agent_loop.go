@@ -20,8 +20,16 @@ type AgentLoopOptions struct {
 	Registry *tools.Registry
 	Gate     *permission.Gate
 	System   string
-	Model    string
-	MaxIter  int
+	// SystemSections is the typed-section form of System. When
+	// non-empty, BuildAgentLoop attaches it to the Loop so per-iteration
+	// requests can carry per-section cache_control hints to the
+	// Anthropic provider. Memory becomes its own Volatile section at
+	// request-build time (see Loop.buildRequest), so memory updates
+	// don't invalidate the addendum cache. nil → legacy boundary-marker
+	// path on the System string.
+	SystemSections []SystemPromptSection
+	Model          string
+	MaxIter        int
 	// MemoryManager is optional. When nil, BuildAgentLoop constructs
 	// one at the default location (`<sessionDir>/memory`) — keeps
 	// existing call-sites working. main.go now constructs it earlier
@@ -87,6 +95,9 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	loop := agent.NewLoop(opts.Provider, opts.Registry, opts.Gate,
 		hookReg, opts.System, maxIter)
 	loop.Model = opts.Model
+	if len(opts.SystemSections) > 0 {
+		loop.SystemSections = toLLMSections(opts.SystemSections)
+	}
 	// "plan" permission mode and Loop.PlanMode are two separate flags
 	// today — gate gates tools to read-only, Loop.PlanMode makes the
 	// loop emit EventPlan (collect tool calls) instead of executing.
@@ -196,6 +207,22 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 // exposed, partly because per-call overrides (Loop.Fast halves it on
 // the wire) make a fixed accessor misleading. Reading from cfg here is
 // the next-best thing: same source the Provider constructor used at
+// toLLMSections converts the runtime-side SystemPromptSection slice
+// to the llm package's wire-shaped SystemSection slice. The two types
+// are intentionally separate — runtime knows about scanning/loading
+// (project_context paths, addendum file), llm knows about wire-format
+// (cache_control, anthropic block shape) — so they don't import each
+// other. This shim is the boundary translator.
+func toLLMSections(in []SystemPromptSection) []llm.SystemSection {
+	out := make([]llm.SystemSection, 0, len(in))
+	for _, s := range in {
+		out = append(out, llm.SystemSection{
+			Name: s.Name, Body: s.Body, Cache: s.Cache, Volatile: s.Volatile,
+		})
+	}
+	return out
+}
+
 // boot time.
 func providerMaxTokens(cfg *config.Config) int {
 	switch cfg.Provider.Default {

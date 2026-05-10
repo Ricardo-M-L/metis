@@ -96,15 +96,43 @@ type ToolSpec struct {
 // intensity dial (Anthropic thinking budget / OpenAI reasoning_effort);
 // the canonical type lives in pkg/llm.
 type Request struct {
-	Model         string
-	System        string
-	Messages      []Message
-	Tools         []ToolSpec
-	MaxTokens     int
-	Temperature   float64
-	Stream        bool
-	StopSequences []string
-	Effort        llm.Effort
+	Model    string
+	System   string
+	Messages []Message
+	Tools    []ToolSpec
+	// SystemSections is the typed-section form of System. When non-nil,
+	// providers that support per-section caching (Anthropic) prefer
+	// this over System and emit cache_control independently per
+	// section. Memory context, env block, and project_context can each
+	// have their own caching posture so a memory update doesn't blow
+	// away the cache for the (otherwise stable) addendum and base
+	// prefix.
+	//
+	// When nil, providers fall back to parsing System for the legacy
+	// boundary markers (SystemPromptCacheBoundary). Sections kept as a
+	// dedicated field rather than re-parsed because string round-trip
+	// loses the Volatile flag — once flattened to text we can't tell
+	// "this is dynamic, never cache" from "this happens to look
+	// non-cacheable today".
+	SystemSections []SystemSection
+	MaxTokens      int
+	Temperature    float64
+	Stream         bool
+	StopSequences  []string
+	Effort         llm.Effort
+}
+
+// SystemSection mirrors anthropic.SystemSection at the public-API
+// boundary so callers can pass typed sections without importing the
+// concrete provider package. Cache=true asks the provider to mark
+// this section's block with cache_control (subject to the provider's
+// per-request breakpoint budget); Volatile=true overrides Cache and
+// forces no-cache, used by sections that change every call.
+type SystemSection struct {
+	Name     string
+	Body     string
+	Cache    bool
+	Volatile bool
 }
 
 // StreamEvent is one chunk emitted while streaming a response.
