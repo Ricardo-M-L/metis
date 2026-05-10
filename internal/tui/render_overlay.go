@@ -82,14 +82,17 @@ func renderScrollbar(view string, l *list.List) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderTaskPanel draws the Ctrl+T todo overlay. Status icons match
-// claude-code's task UI:
+// renderTaskPanel draws the Ctrl+T todo overlay. Status icons + colors
+// match claude-code's TaskListV2.tsx getTaskIcon (the same mapping
+// used by renderTaskItems for the in-stream TodoWrite body):
 //
-//	▢  pending
-//	◐  in_progress
-//	▣  completed
+//	◻  pending      (default text)
+//	◼  in_progress  (orange — claude-code's "claude" theme token)
+//	✔  completed    (green, with strikethrough on the title)
 //
 // Empty session reads "(no todos yet)". Long titles get truncated.
+// Earlier metis used ▢/◐/▣ which were close but not pixel-identical
+// with claude-code's icons in side-by-side terminals.
 func renderTaskPanel(m *Model) string {
 	tasks := tasksFullList(m.sessionID)
 	var s strings.Builder
@@ -102,30 +105,36 @@ func renderTaskPanel(m *Model) string {
 		s.WriteString("\n")
 		return s.String()
 	}
+	strike := lipgloss.NewStyle().Foreground(textSecondary).Strikethrough(true)
 	for _, t := range tasks {
 		var icon string
-		var col lipgloss.Style
+		var iconStyle lipgloss.Style
+		var titleStyle lipgloss.Style
 		switch t.Status {
 		case "pending":
-			icon = "▢"
-			col = styleMuted
+			icon = glyphTaskPending
+			iconStyle = lipgloss.NewStyle().Foreground(textSecondary)
+			titleStyle = styleText
 		case "in_progress":
-			icon = "◐"
-			col = styleAccent
+			icon = glyphTaskInProgress
+			iconStyle = lipgloss.NewStyle().Foreground(accentOrange)
+			titleStyle = lipgloss.NewStyle().Foreground(textPrimary).Bold(true)
 		case "completed":
-			icon = "▣"
-			col = lipgloss.NewStyle().Foreground(accentGreen)
+			icon = glyphTaskCompleted
+			iconStyle = lipgloss.NewStyle().Foreground(accentGreen)
+			titleStyle = strike
 		default:
 			icon = "?"
-			col = styleMuted
+			iconStyle = styleMuted
+			titleStyle = styleText
 		}
 		s.WriteString(styleMuted.Render("  │ "))
-		s.WriteString(col.Render(icon + " "))
+		s.WriteString(iconStyle.Render(icon + " "))
 		content := t.Content
 		if len(content) > 40 {
 			content = content[:39] + "…"
 		}
-		s.WriteString(styleText.Render(content))
+		s.WriteString(titleStyle.Render(content))
 		s.WriteString("\n")
 	}
 	s.WriteString(styleMuted.Render("  └" + strings.Repeat("─", 44)))

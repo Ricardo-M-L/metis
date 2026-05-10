@@ -4,21 +4,21 @@ import (
 	"strings"
 	"testing"
 
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
 
-// TestRenderTodoSnapshot verifies the inline task-list body that's
-// emitted as a TodoWrite tool result body. claude-code's image #57
-// shows: tree leaf on the first row, ✓ glyph + strikethrough for
-// completed, ▪ + bold for in_progress, □ + dim for pending. We don't
-// assert exact ANSI bytes (those drift with theme tweaks); we assert
-// the structural pieces a user would notice.
+// TestRenderTodoSnapshot verifies the inline task-list body emitted as
+// a TodoWrite tool result. Mirrors claude-code's TaskListV2.tsx
+// getTaskIcon mapping: tree-leaf connector on row 1, ◻/◼/✔ status
+// glyphs (figures package's squareSmall / squareSmallFilled / tick),
+// strikethrough on completed titles. We assert structural pieces +
+// the ANSI bytes for color (orange = AccentOrange for in_progress,
+// green = AccentGreen for completed) since a regression to all-blue
+// or wrong glyphs is the regression image #1 surfaced.
 func TestRenderTodoSnapshot(t *testing.T) {
 	old := tasksRuntimeSessionID
 	defer func() { tasksRuntimeSessionID = old }()
-
-	// Override session id resolver + the disk-read fn to feed fake
-	// tasks without touching ~/.metis/tasks.
 	tasksRuntimeSessionID = func() string { return "test-sid" }
 
 	got := renderTodoSnapshotWith([]TaskItem{
@@ -28,30 +28,57 @@ func TestRenderTodoSnapshot(t *testing.T) {
 		{ID: "4", Status: "pending", Content: "Write release notes"},
 	})
 
-	// Tree leaf only on first row.
-	if !strings.Contains(got, glyphTreeLeaf) {
-		t.Errorf("expected tree-leaf glyph (%q) on first row; got:\n%s", glyphTreeLeaf, got)
+	// Tree leaf only on first row — the rest indent without the connector.
+	if c := strings.Count(got, glyphTreeLeaf); c != 1 {
+		t.Errorf("tree leaf should appear exactly once; got %d times in:\n%s", c, got)
 	}
-	if strings.Count(got, glyphTreeLeaf) != 1 {
-		t.Errorf("tree leaf should appear exactly once; got %d times in:\n%s",
-			strings.Count(got, glyphTreeLeaf), got)
+
+	// claude-code-matched glyphs (figures package). Don't accept the
+	// pre-fix ▪/✓/□ — those were close but visibly different in
+	// side-by-side terminals (image #1 user feedback 2026-05-10).
+	for _, want := range []struct{ glyph, role string }{
+		{glyphTaskCompleted, "completed (✔)"},
+		{glyphTaskInProgress, "in_progress (◼)"},
+		{glyphTaskPending, "pending (◻)"},
+	} {
+		if !strings.Contains(got, want.glyph) {
+			t.Errorf("expected %s glyph %q in:\n%s", want.role, want.glyph, got)
+		}
 	}
-	// Completed-row glyph + strike content present.
-	if !strings.Contains(got, "✓") {
-		t.Error("expected ✓ for completed tasks")
+	// Regression bait: the OLD glyphs must NOT appear. If a refactor
+	// reintroduces them, this catches it.
+	for _, oldGlyph := range []string{"▪", "□", "✓"} {
+		if strings.Contains(got, oldGlyph) {
+			t.Errorf("legacy glyph %q leaked through; should be claude-code-matched glyph", oldGlyph)
+		}
 	}
-	// In-progress glyph.
-	if !strings.Contains(got, "▪") {
-		t.Error("expected ▪ for in_progress task")
+
+	// Strikethrough on completed lines — lipgloss v2 combines color +
+	// strike into one SGR (e.g. "\x1b[38;2;R;G;B;9m"), so we look for
+	// ";9m" rather than the standalone "\x1b[9m". Without strike,
+	// completed/pending look identical and the user can't scan for
+	// what's done.
+	if !strings.Contains(got, ";9m") {
+		t.Errorf("expected SGR 9 (strikethrough) on completed rows; not found in:\n%q", got)
 	}
-	// Pending glyph.
-	if !strings.Contains(got, "□") {
-		t.Error("expected □ for pending task")
+
+	// Color contract: in_progress glyph in orange (AccentOrange) and
+	// completed glyph in green (AccentGreen). We don't pin the exact
+	// hex (theme might switch) but we assert the bytes for the CURRENT
+	// theme appear, which is enough to catch "all blue" or "all muted"
+	// regressions like the one image #1 surfaced.
+	wantOrange := lipgloss.NewStyle().Foreground(accentOrange).Render(glyphTaskInProgress)
+	wantGreen := lipgloss.NewStyle().Foreground(accentGreen).Render(glyphTaskCompleted)
+	if !strings.Contains(got, wantOrange[:strings.Index(wantOrange, glyphTaskInProgress)]) {
+		t.Errorf("in_progress glyph should be styled in AccentOrange; not found in:\n%q", got)
 	}
-	// Each task content should appear (not stripped by accident).
-	// v2: lipgloss strike-through wraps content with per-run ANSI
-	// codes, so a literal substring no longer exists. Compare against
-	// the ANSI-stripped form instead.
+	if !strings.Contains(got, wantGreen[:strings.Index(wantGreen, glyphTaskCompleted)]) {
+		t.Errorf("completed glyph should be styled in AccentGreen; not found in:\n%q", got)
+	}
+
+	// Each task title must survive (no accidental strip from the
+	// strikethrough wrapping). lipgloss splits per-run ANSI so we
+	// strip codes before substring search.
 	plain := ansi.Strip(got)
 	for _, content := range []string{
 		"Bump event channel buffers 64 → 256",

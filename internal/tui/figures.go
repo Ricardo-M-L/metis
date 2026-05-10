@@ -22,6 +22,16 @@ const (
 	glyphAsterisk = "✻" // turn-end thought summary, system events
 	glyphRecap    = "※" // reserved: future recap memo line
 	glyphPrompt   = "❯" // user input mark
+
+	// Todo / task list status icons — match claude-code's
+	// constants/figures.ts via the `figures` npm package on Unix:
+	// squareSmall = ◻ (U+25FB), squareSmallFilled = ◼ (U+25FC),
+	// tick = ✔ (U+2714). Earlier metis used ▪/✓/□ which were close
+	// but not pixel-identical with claude-code in side-by-side
+	// terminals (image #1 user feedback 2026-05-10).
+	glyphTaskPending    = "◻"
+	glyphTaskInProgress = "◼"
+	glyphTaskCompleted  = "✔"
 )
 
 // reducedMotionEnabled is captured once at startup. METIS_REDUCED_MOTION=1

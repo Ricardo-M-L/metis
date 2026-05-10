@@ -167,11 +167,27 @@ func tasksFullList(sessionID string) []TaskItem {
 	if err != nil {
 		return nil
 	}
-	var items []TaskItem
-	if err := json.Unmarshal(data, &items); err != nil {
-		return nil
+	// On-disk shape from internal/tasks::TaskList is an object:
+	//   { "session": "...", "items": [ {id, content, status, …} ] }
+	// Earlier this function decoded into a bare []TaskItem, which
+	// silently failed json.Unmarshal and returned nil — that's why
+	// the Ctrl+T panel and TodoWrite tool-result body both rendered
+	// "no todos yet" even when ~/.metis/tasks/<sid>.json had real
+	// rows in it (image #1 user feedback 2026-05-10, found via tmux
+	// smoke test of TodoWrite render).
+	var envelope struct {
+		Items []TaskItem `json:"items"`
 	}
-	return items
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		// Fall back to the bare-array shape so a hand-edited file or
+		// a hypothetical legacy tasks store still loads.
+		var bare []TaskItem
+		if err2 := json.Unmarshal(data, &bare); err2 != nil {
+			return nil
+		}
+		return bare
+	}
+	return envelope.Items
 }
 
 // tasksRunningCount returns how many todos in this session are

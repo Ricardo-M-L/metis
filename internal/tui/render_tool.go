@@ -433,11 +433,26 @@ func renderTodoSnapshot() string {
 // renderTaskItems is the pure presentation half of the snapshot — takes
 // a slice of TaskItem, returns the formatted body. Split out so the
 // test path can inject items without going through disk IO.
+//
+// Color/glyph mapping mirrors claude-code's TaskListV2.tsx getTaskIcon:
+//
+//	pending     → ◻ (squareSmall) + default text color
+//	in_progress → ◼ (squareSmallFilled) + AccentOrange (claude-code's
+//	              "claude" theme token #d77757)
+//	completed   → ✔ (tick) + AccentGreen + strikethrough on the title
+//
+// Earlier metis painted all three glyphs in styleAccent (blue), which
+// failed the at-a-glance "what's done / what's running" scan (image #1
+// user comparison 2026-05-10).
 func renderTaskItems(items []TaskItem) string {
 	var s strings.Builder
-	strike := lipgloss.NewStyle().Foreground(textMuted).Strikethrough(true)
+	strike := lipgloss.NewStyle().Foreground(textSecondary).Strikethrough(true)
 	current := lipgloss.NewStyle().Foreground(textPrimary).Bold(true)
 	pending := lipgloss.NewStyle().Foreground(textSecondary)
+
+	completedGlyph := lipgloss.NewStyle().Foreground(accentGreen)
+	inProgressGlyph := lipgloss.NewStyle().Foreground(accentOrange)
+	pendingGlyph := lipgloss.NewStyle().Foreground(textSecondary)
 
 	for i, it := range items {
 		// First row gets the L-leaf connector, subsequent rows just
@@ -447,20 +462,24 @@ func renderTaskItems(items []TaskItem) string {
 			prefix = "    " + glyphTreeLeaf + "  "
 		}
 		var glyph string
+		var glyphStyle lipgloss.Style
 		var styled string
 		switch it.Status {
 		case "completed":
-			glyph = "✓"
+			glyph = glyphTaskCompleted
+			glyphStyle = completedGlyph
 			styled = strike.Render(it.Content)
 		case "in_progress":
-			glyph = "▪"
+			glyph = glyphTaskInProgress
+			glyphStyle = inProgressGlyph
 			styled = current.Render(it.Content)
 		default: // pending or unknown
-			glyph = "□"
+			glyph = glyphTaskPending
+			glyphStyle = pendingGlyph
 			styled = pending.Render(it.Content)
 		}
 		s.WriteString(styleMuted.Render(prefix))
-		s.WriteString(styleAccent.Render(glyph + " "))
+		s.WriteString(glyphStyle.Render(glyph + " "))
 		s.WriteString(styled)
 		s.WriteString("\n")
 	}
