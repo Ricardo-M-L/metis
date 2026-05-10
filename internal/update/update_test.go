@@ -1,6 +1,11 @@
 package update
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func TestIsNewer(t *testing.T) {
 	cases := []struct {
@@ -48,5 +53,60 @@ func TestRepoOverride(t *testing.T) {
 	t.Setenv("METIS_REPO", "foo/bar")
 	if Repo() != "foo/bar" {
 		t.Errorf("override repo wrong: %q", Repo())
+	}
+}
+
+// TestWriteLatestVersionFile_HappyPath asserts the helper actually
+// writes the file the TUI's renderVersionLine reads. Image #2/#3
+// regression: the chrome row "current: vX · latest: vY" only lights
+// up if this file exists, so a silently-skipped write equals a silent
+// missing-feature complaint.
+func TestWriteLatestVersionFile_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	writeLatestVersionFile(dir, "v0.1.5")
+	got, err := os.ReadFile(filepath.Join(dir, latestVersionFile))
+	if err != nil {
+		t.Fatalf("expected file written; ReadFile: %v", err)
+	}
+	if string(got) != "v0.1.5\n" {
+		t.Errorf("file contents = %q, want %q", got, "v0.1.5\n")
+	}
+}
+
+func TestWriteLatestVersionFile_SilentOnEmptyArgs(t *testing.T) {
+	dir := t.TempDir()
+	// Empty home and empty tag both must no-op without panic. The TUI
+	// reader treats a missing file as "no latest known", so a silent
+	// skip is the correct contract for these inputs.
+	writeLatestVersionFile("", "v0.1.5")
+	writeLatestVersionFile(dir, "")
+	if _, err := os.Stat(filepath.Join(dir, latestVersionFile)); !os.IsNotExist(err) {
+		t.Errorf("file should NOT exist after empty-tag call; got err=%v", err)
+	}
+}
+
+// TestMaybeCheck_WritesLatestVersionFromCache locks in the throttle-
+// window code path: even when MaybeCheck doesn't hit the network this
+// startup (24h throttle), it must refresh the latest_version hint
+// from the cached state file so the chrome row keeps showing
+// "latest" across throttle windows.
+func TestMaybeCheck_WritesLatestVersionFromCache(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("METIS_GITHUB_TOKEN", "fake-token-for-throttle-path")
+	// Pre-populate state so MaybeCheck takes the throttle-cache branch.
+	saveState(statePath(dir), checkState{
+		LastCheck: time.Now().Add(-time.Hour), // within minInterval (24h)
+		LatestTag: "v0.2.0",
+		// Mark this tag as already-notified so we don't try to surface it.
+		LastTagSeen: "v0.2.0",
+	})
+	_ = MaybeCheck(nil, dir, "0.2.0") // ctx unused on cache path
+
+	got, err := os.ReadFile(filepath.Join(dir, latestVersionFile))
+	if err != nil {
+		t.Fatalf("expected latest_version written from cache; ReadFile: %v", err)
+	}
+	if string(got) != "v0.2.0\n" {
+		t.Errorf("cached-write contents = %q, want %q", got, "v0.2.0\n")
 	}
 }

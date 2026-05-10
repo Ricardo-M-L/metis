@@ -27,6 +27,25 @@ type checkState struct {
 
 func statePath(home string) string { return filepath.Join(home, stateFile) }
 
+// latestVersionFile is the simple one-line cache the TUI's chrome row
+// reads to render "current: X · latest: Y". Lives next to the JSON
+// state because the TUI doesn't import internal/update — keeping the
+// path side-by-side avoids cross-cutting it through another package.
+const latestVersionFile = "latest_version"
+
+// writeLatestVersionFile mirrors a successful release fetch into a
+// plain-text file the TUI reads (renderVersionLine in
+// internal/tui/render_chrome.go::readLatestVersion). Best-effort: a
+// write failure is silent because the JSON state file is the
+// authoritative cache; this file is purely a render-side hint.
+func writeLatestVersionFile(home, tag string) {
+	if home == "" || tag == "" {
+		return
+	}
+	_ = os.MkdirAll(home, 0o755)
+	_ = os.WriteFile(filepath.Join(home, latestVersionFile), []byte(tag+"\n"), 0o644)
+}
+
 func loadState(path string) checkState {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -73,6 +92,12 @@ func MaybeCheck(ctx context.Context, configHome, currentVersion string) string {
 	sp := statePath(configHome)
 	st := loadState(sp)
 	if !st.LastCheck.IsZero() && time.Since(st.LastCheck) < minInterval {
+		// Within throttle window — refresh the TUI hint file from cache
+		// so the chrome row keeps showing "latest" even when we don't
+		// hit the network this startup. Without this, users who delete
+		// ~/.metis/latest_version (or upgrade past it) lose the hint
+		// for up to 24h until the next throttle expiry.
+		writeLatestVersionFile(configHome, st.LatestTag)
 		// Within throttle window — but if we already saw a newer tag and
 		// haven't notified the user about *this* version yet, surface it.
 		if st.LatestTag != "" && IsNewer(currentVersion, st.LatestTag) && st.LastTagSeen != st.LatestTag {
@@ -91,6 +116,11 @@ func MaybeCheck(ctx context.Context, configHome, currentVersion string) string {
 	st.LastCheck = time.Now()
 	st.LatestTag = r.TagName
 	saveState(sp, st)
+	// Mirror the freshly-seen tag into ~/.metis/latest_version so the
+	// TUI's chrome row picks it up on its next render. Without this the
+	// "current: X · latest: Y" hint never lights up even after a
+	// successful network check (image #2/#3 user feedback 2026-05-10).
+	writeLatestVersionFile(configHome, r.TagName)
 
 	if IsNewer(currentVersion, r.TagName) {
 		return r.TagName
