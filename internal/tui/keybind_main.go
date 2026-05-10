@@ -8,6 +8,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -100,7 +101,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// call, Ctrl-C should behave like the standard CLI shortcut
 		// and just leave. The input may contain garbage from OSC
 		// leaks; we don't care, we exit either way.
+		//
+		// Same hard-exit safety net as the mid-turn second-press
+		// path: if bubbletea's clean shutdown doesn't return within
+		// 800ms (e.g. an MCP child still alive on its socket),
+		// os.Exit so the user doesn't have to `pkill metis`.
 		if !m.turnActive {
+			go func() {
+				time.Sleep(800 * time.Millisecond)
+				os.Exit(0)
+			}()
 			return m, tea.Quit
 		}
 		// During an active turn, Ctrl-C cancels the turn (so the
@@ -109,6 +119,31 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// practice but the right escape hatch when cancellation
 		// itself hangs.
 		if !m.lastCtrlC.IsZero() && time.Since(m.lastCtrlC) < ctrlCQuitWindow {
+			// Defense in depth — bubbletea's clean shutdown sometimes
+			// blocks behind a wedged in-flight goroutine (LLM stream
+			// stuck in a kernel read, MCP child process not honouring
+			// SIGTERM, etc.). User reported needing to `pkill metis` to
+			// recover (image #2 follow-up 2026-05-10). Belt-and-braces
+			// here:
+			//   1. Cancel the turn context one more time (idempotent
+			//      if already cancelled). This is the polite path —
+			//      pending network reads return ctx.Canceled and their
+			//      goroutines exit.
+			//   2. Schedule a hard os.Exit(0) deadline of 800ms. If
+			//      the polite path hasn't killed the process by then,
+			//      something is stuck below user-space — exit anyway
+			//      so the user gets their shell back without `pkill`.
+			//      800ms because tea.Quit + alt-screen restore + defer
+			//      cleanup typically takes <200ms; 800ms gives 4× safety
+			//      margin while still feeling instant to the user.
+			if m.turnCancel != nil {
+				m.turnCancel()
+				m.turnCancel = nil
+			}
+			go func() {
+				time.Sleep(800 * time.Millisecond)
+				os.Exit(0)
+			}()
 			return m, tea.Quit
 		}
 		m.lastCtrlC = time.Now()
