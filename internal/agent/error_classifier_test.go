@@ -14,6 +14,13 @@ func TestClassifyError(t *testing.T) {
 		{"nil", nil, ErrUnknown},
 		{"context overflow anthropic", errors.New("prompt is too long: 250000 tokens > 200000"), ErrContextOverflow},
 		{"context overflow minimax", errors.New("server returned error: code 2013"), ErrContextOverflow},
+		// MiniMax user-facing format from image #9 (2026-05-10):
+		// "invalid params, request entity too large (2013) (invalid_request_error)".
+		// Used to be misclassified as ErrInvalidRequest because the
+		// substring matchers expected "code 2013" not "(2013)".
+		{"context overflow minimax user-facing", errors.New("invalid params, request entity too large (2013) (invalid_request_error)"), ErrContextOverflow},
+		{"context overflow request entity too large", errors.New("API Error: request entity too large"), ErrContextOverflow},
+		{"context overflow stripped paren 2013", errors.New("status: 400, code: 2013) something"), ErrContextOverflow},
 		{"context overflow openai", errors.New("context_length_exceeded: please reduce the length"), ErrContextOverflow},
 		{"rate limit 429", errors.New("HTTP 429: Too Many Requests"), ErrRateLimit},
 		{"rate limit phrasing", errors.New("rate limit reached, please wait"), ErrRateLimit},

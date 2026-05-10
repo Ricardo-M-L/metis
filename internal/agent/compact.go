@@ -136,6 +136,31 @@ type Compactor struct {
 // claude-code's MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3.
 const MaxConsecutiveCompactFailures = 3
 
+// PostCompactTokenBudget is the soft target for the assembled-message
+// estimate AFTER Compact returns. When the post-compact estimate
+// exceeds this, the boundary-cap pass walks tail tool_results and
+// truncates them to PostCompactMaxToolResultChars to free room.
+//
+// Mirrors claude-code's POST_COMPACT_TOKEN_BUDGET = 50_000 — the
+// thinking is that summarization should leave room for the next 1-2
+// turns of new tool calls before triggering ANOTHER compaction. If
+// the post-compact state already eats the budget, we'd ping-pong:
+// compact → fail-overflow → recover → compact → fail again.
+//
+// Calibrated for MiniMax (192k context, 64k max_tokens → 128k input
+// cap). 50k of post-compact baseline leaves 78k for the next 2-3
+// turns. For Anthropic's 200k window the same constant is generous,
+// not tight.
+const PostCompactTokenBudget = 50_000
+
+// PostCompactMaxToolResultChars caps each retained tail tool_result.
+// 5000 chars ≈ 1250 tokens — tracks claude-code's
+// POST_COMPACT_MAX_TOKENS_PER_FILE = 5_000. The model still sees the
+// summary + first 5K of each tool's output (enough for "what was the
+// result of grep X" style continuity) but a 50MB grep dump can't
+// re-overflow the next request.
+const PostCompactMaxToolResultChars = 5_000
+
 func NewCompactor(cfg Config, model string, maxCtx int, p llm.Provider) *Compactor {
 	if cfg.Threshold == 0 {
 		cfg = DefaultCompactionConfig()
@@ -403,6 +428,101 @@ func (c *Compactor) Snip(messages []llm.Message) []llm.Message {
 	return out
 }
 
+// EnforcePostCompactBudget walks every tool_result in messages and
+// truncates anything longer than PostCompactMaxToolResultChars to
+// that cap. Returns the same slice when nothing was over the cap.
+//
+// Different from Snip/SnipAll in two ways:
+//  1. It uses the POST-COMPACT cap (5000 chars), not the
+//     turn-time SnipMaxToolResultChars cap (typically 800).
+//  2. It runs AFTER Compact's summarization, so the marker text
+//     is "[truncated post-compact]" not "[snipped]" — the latter
+//     would collide with Snip's idempotency guard and leave
+//     tail dumps untouched on later snip passes.
+//
+// The cap matters for the post-compact request budget: even after
+// 9-message compact, a single 10MB tail tool_result re-bloats the
+// request and re-triggers MiniMax 2013. claude-code solves this
+// with a per-attachment budget; metis takes the simpler approach
+// of capping every retained tool_result at the same hard limit.
+func (c *Compactor) EnforcePostCompactBudget(messages []llm.Message) []llm.Message {
+	out := make([]llm.Message, len(messages))
+	copy(out, messages)
+	mutatedAny := false
+	for i := range out {
+		newContent := make([]llm.ContentBlock, len(out[i].Content))
+		copy(newContent, out[i].Content)
+		mutatedRow := false
+		for bi := range newContent {
+			b := &newContent[bi]
+			if b.Type != "tool_result" {
+				continue
+			}
+			if len(b.ToolResult) <= PostCompactMaxToolResultChars {
+				continue
+			}
+			if strings.Contains(b.ToolResult, "[truncated post-compact:") {
+				continue
+			}
+			head := b.ToolResult[:PostCompactMaxToolResultChars]
+			omitted := len(b.ToolResult) - PostCompactMaxToolResultChars
+			b.ToolResult = head + fmt.Sprintf("\n[truncated post-compact: %d chars omitted]", omitted)
+			mutatedRow = true
+		}
+		if mutatedRow {
+			out[i].Content = newContent
+			mutatedAny = true
+		}
+	}
+	if !mutatedAny {
+		return messages
+	}
+	return out
+}
+
+// SnipAll is Snip without the protected-tail exemption. Used by
+// tryRecoverOverflow as a last resort: when the request already
+// bounced with overflow, the protected-tail invariant doesn't matter
+// (the model isn't going to read those tool_results next turn — the
+// turn won't even leave the wire). Snipping the tail too can rescue
+// requests where the OOM was caused by a tail tool dump that ordinary
+// Snip would have spared.
+//
+// Same idempotency guard as Snip — already-snipped blocks aren't
+// re-snipped.
+func (c *Compactor) SnipAll(messages []llm.Message) []llm.Message {
+	if c.SnipMaxToolResultChars <= 0 {
+		return messages
+	}
+	out := make([]llm.Message, len(messages))
+	copy(out, messages)
+	for i := c.ProtectFirst; i < len(out); i++ {
+		newContent := make([]llm.ContentBlock, len(out[i].Content))
+		copy(newContent, out[i].Content)
+		mutated := false
+		for bi := range newContent {
+			b := &newContent[bi]
+			if b.Type != "tool_result" {
+				continue
+			}
+			if len(b.ToolResult) <= c.SnipMaxToolResultChars {
+				continue
+			}
+			if strings.Contains(b.ToolResult, "[snipped:") {
+				continue
+			}
+			head := b.ToolResult[:c.SnipMaxToolResultChars]
+			omitted := len(b.ToolResult) - c.SnipMaxToolResultChars
+			b.ToolResult = head + fmt.Sprintf("\n[snipped: %d chars omitted]", omitted)
+			mutated = true
+		}
+		if mutated {
+			out[i].Content = newContent
+		}
+	}
+	return out
+}
+
 // CircuitTripped reports whether the breaker has opened. Callers (the
 // Loop's compaction-check + the TUI status bar) use this to surface a
 // "compaction disabled — N failures" notice instead of silently letting
@@ -488,13 +608,23 @@ func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.
 		}},
 	}
 
-	out := make([]llm.Message, 0, c.ProtectFirst+2+len(keepLast))
+	out := make([]llm.Message, 0, c.ProtectFirst+3+len(keepLast))
 	out = append(out, keepFirst...)
 	out = append(out, boundary)
-	if len(keepLast) > 0 && keepLast[0].Role == llm.RoleAssistant {
-		// Two consecutive assistant messages would be rejected; insert
-		// a placeholder user ack between them. Cheap and never
-		// surfaces in the UI (this is API plumbing).
+	// Post-compact attachment: surface the file paths the agent
+	// touched in the SUMMARIZED middle. The summary text often loses
+	// concrete paths ("worked on the auth module"); this hint gives
+	// the model an explicit list so the next turn can Read the right
+	// files without probing. Built from the FULL pre-compact slice so
+	// even paths that were summarized away still register. Empty-zero
+	// is "no Read/Edit/Write happened in scope" — common for
+	// conversation-only sessions, skip the synthetic block then.
+	if att := BuildPostCompactAttachment(messages); len(att.Content) > 0 {
+		out = append(out, att)
+	} else if len(keepLast) > 0 && keepLast[0].Role == llm.RoleAssistant {
+		// No attachment to bridge with — but we still need a user ack
+		// when keepLast starts with assistant, since two consecutive
+		// assistant messages would be rejected by Anthropic / MiniMax.
 		out = append(out, llm.Message{
 			Role: llm.RoleUser,
 			Content: []llm.ContentBlock{{

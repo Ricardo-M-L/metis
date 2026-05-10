@@ -132,16 +132,30 @@ func ClassifyError(err error) ErrorClass {
 	}
 
 	// Context overflow — Anthropic's "prompt is too long",
-	// MiniMax error code 2013, OpenAI's "exceeds context length",
-	// catch-all "too many tokens".
+	// MiniMax error code 2013 (multiple wire formats), OpenAI's
+	// "exceeds context length", catch-all "too many tokens".
+	//
+	// MiniMax/Anthropic-compat surfaces the 2013 code in any of:
+	//   • {"code":2013, ...}
+	//   • "code 2013"  (legacy gateway prose)
+	//   • "(2013)"      (the user-facing one we hit 2026-05-10:
+	//     "invalid params, request entity too large (2013)")
+	//   • "2013)"       (stripped paren prefix)
+	// And the message text itself is "request entity too large" —
+	// crucial because compaction CAN'T fix some 2013s (e.g. payload
+	// > MiniMax's body byte cap), but the recovery path should at
+	// least try once before bubbling up.
 	if strings.Contains(msg, "prompt is too long") ||
 		strings.Contains(msg, "exceeds context length") ||
 		strings.Contains(msg, "context_length_exceeded") ||
 		strings.Contains(msg, "context window") ||
 		strings.Contains(msg, "exceeds limit") ||
 		strings.Contains(msg, "too many tokens") ||
+		strings.Contains(msg, "request entity too large") ||
 		strings.Contains(msg, "code 2013") ||
-		strings.Contains(msg, "\"code\":2013") {
+		strings.Contains(msg, "\"code\":2013") ||
+		strings.Contains(msg, "(2013)") ||
+		strings.Contains(msg, "2013)") {
 		return ErrContextOverflow
 	}
 

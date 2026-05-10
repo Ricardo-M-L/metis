@@ -577,6 +577,84 @@ func TestSnip_DoesNotTouchProtectedTail(t *testing.T) {
 	}
 }
 
+// TestEnforcePostCompactBudget_CapsAllToolResults — every retained
+// tool_result, including the protected tail and including any
+// already-snipped-with-the-turn-time-cap blocks, gets clamped at
+// PostCompactMaxToolResultChars (5000). This is what stops a single
+// 50MB grep tail from re-overflowing the very next request after
+// compaction completes.
+func TestEnforcePostCompactBudget_CapsAllToolResults(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	huge := strings.Repeat("y", 50_000) // 10× the cap
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		toolUseMsg("t1", "Grep"),
+		toolResultMsg("t1", huge),
+		toolUseMsg("t2", "Bash"),
+		toolResultMsg("t2", huge),
+		msg(llm.RoleAssistant, "ok"),
+	}
+	out := c.EnforcePostCompactBudget(msgs)
+	for i, m := range out {
+		for _, b := range m.Content {
+			if b.Type != "tool_result" {
+				continue
+			}
+			// 5000 head + ~50 marker chars = ~5050 cap total
+			if len(b.ToolResult) > PostCompactMaxToolResultChars+200 {
+				t.Errorf("msg[%d] tool_result not clamped: len=%d", i, len(b.ToolResult))
+			}
+			if !strings.Contains(b.ToolResult, "[truncated post-compact:") {
+				t.Errorf("msg[%d] tool_result missing post-compact marker", i)
+			}
+		}
+	}
+}
+
+func TestEnforcePostCompactBudget_NoOpWhenAllUnderCap(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	short := strings.Repeat("z", 500)
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		toolUseMsg("t1", "Grep"),
+		toolResultMsg("t1", short),
+		msg(llm.RoleAssistant, "ok"),
+	}
+	out := c.EnforcePostCompactBudget(msgs)
+	// No mutations expected — should return the same backing slice.
+	if !sameSlice(out, msgs) {
+		t.Errorf("EnforcePostCompactBudget should return the input slice when nothing was over the cap")
+	}
+}
+
+// TestSnipAll_AlsoSnipsProtectedTail — SnipAll is the recovery-path
+// variant that ignores ProtectLast. The protected-tail invariant
+// only matters for in-flight conversations; once a request has
+// already bounced with overflow, preserving the tail's recoverability
+// is meaningless (the model will never see those tool_results
+// anyway), and snipping them is what rescues us from a single huge
+// tail tool dump.
+func TestSnipAll_AlsoSnipsProtectedTail(t *testing.T) {
+	c := newCompactorFor(&fakeSummarizer{})
+	long := strings.Repeat("z", 5000)
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		toolUseMsg("t1", "Bash"),
+		toolResultMsg("t1", long), // middle
+		toolUseMsg("t2", "Bash"),
+		toolResultMsg("t2", long), // protected by ProtectLast
+		msg(llm.RoleAssistant, "final"),
+	}
+	out := c.SnipAll(msgs)
+	// Both middle AND tail tool_results should be snipped.
+	if len(out[2].Content[0].ToolResult) >= 5000 {
+		t.Errorf("middle tool_result not snipped; len=%d", len(out[2].Content[0].ToolResult))
+	}
+	if len(out[4].Content[0].ToolResult) >= 5000 {
+		t.Errorf("tail tool_result should ALSO be snipped by SnipAll; len=%d", len(out[4].Content[0].ToolResult))
+	}
+}
+
 // TestSnip_NoOpWhenAllShort — when nothing exceeds the cap, Snip
 // returns equivalent content (no spurious mutations).
 func TestSnip_NoOpWhenAllShort(t *testing.T) {

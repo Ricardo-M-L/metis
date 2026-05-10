@@ -74,6 +74,17 @@ type CacheSafeParams struct {
 // Returns nil if loop is nil or has no Provider — both are configuration
 // bugs the caller should detect, but we don't panic to keep the auto-
 // memory codepath best-effort.
+//
+// Prefix is auto-snipped before being copied: tool_results in the
+// parent's history get capped at PostCompactMaxToolResultChars when
+// the parent estimate is over forkPrefixSnipThreshold. Without this,
+// a long-running parent session forks against ITS full history,
+// which routinely overflows MiniMax's wire cap (the user's
+// 2026-05-08 report — Fork sub-agent hits 400/2013 mid-extraction).
+// The compactor's snip pass uses different markers ("[snipped:")
+// than the post-compact pass ("[truncated post-compact:"), so the
+// idempotency guards in both Compactor.Snip and EnforcePostCompactBudget
+// leave the fork's snipped slices alone on subsequent passes.
 func SnapshotForFork(loop *Loop) *CacheSafeParams {
 	if loop == nil || loop.Provider == nil {
 		return nil
@@ -89,6 +100,16 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 	model := loop.Model
 	effort := loop.Effort
 	loop.mu.RUnlock()
+
+	// Pre-emptive prefix snip — applies the post-compact budget cap
+	// to every tool_result in the prefix so the fork doesn't inherit
+	// a 5MB grep dump from the parent. Idempotent (already-capped
+	// blocks are skipped via the marker check inside
+	// EnforcePostCompactBudget). Cheap when the prefix is small.
+	if loop.Compactor != nil {
+		prefix = loop.Compactor.EnforcePostCompactBudget(prefix)
+	}
+
 	return &CacheSafeParams{
 		System:         system,
 		ToolSpecs:      loop.toolSpecs(), // already cache-stable order
@@ -294,6 +315,24 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 			MaxTokens: p.MaxTokens,
 		}
 		resp, err := p.Cache.Provider.Complete(ctx, req)
+		if err != nil && ClassifyError(err) == ErrContextOverflow {
+			// Sub-agent's request bounced with overflow (typically
+			// MiniMax's "request entity too large (2013)" — see
+			// error_classifier.go). Snip every tool_result in the
+			// in-flight messages to the post-compact cap and retry
+			// once. Fork has no Compactor of its own, so we go directly
+			// to the cheaper byte-cap pass — full LLM-summarization
+			// would defeat the fork's "background, no extra LLM cost"
+			// invariant.
+			snipped := snipForkMessages(msgs)
+			req.Messages = snipped
+			resp, err = p.Cache.Provider.Complete(ctx, req)
+			if err == nil {
+				// Persist the trimmed view so subsequent turns don't
+				// rebuild the bloated request.
+				msgs = snipped
+			}
+		}
 		if err != nil {
 			result.NewMessages = sliceFrom(msgs, prefixLen)
 			result.StopReason = "error"
@@ -439,6 +478,48 @@ func decInflight() {
 	inflightMu.Lock()
 	inflight--
 	inflightMu.Unlock()
+}
+
+// snipForkMessages caps every tool_result in the fork's in-flight
+// message slice at PostCompactMaxToolResultChars. Same contract as
+// Compactor.EnforcePostCompactBudget but operates without a Compactor
+// instance — fork can't borrow the parent's because the parent might
+// be mid-iteration. Returns the input slice unchanged when no
+// tool_result needed clamping.
+func snipForkMessages(messages []llm.Message) []llm.Message {
+	out := make([]llm.Message, len(messages))
+	copy(out, messages)
+	mutated := false
+	for i := range out {
+		newContent := make([]llm.ContentBlock, len(out[i].Content))
+		copy(newContent, out[i].Content)
+		rowChanged := false
+		for bi := range newContent {
+			b := &newContent[bi]
+			if b.Type != "tool_result" {
+				continue
+			}
+			if len(b.ToolResult) <= PostCompactMaxToolResultChars {
+				continue
+			}
+			if strings.Contains(b.ToolResult, "[truncated post-compact:") ||
+				strings.Contains(b.ToolResult, "[snipped:") {
+				continue
+			}
+			head := b.ToolResult[:PostCompactMaxToolResultChars]
+			omitted := len(b.ToolResult) - PostCompactMaxToolResultChars
+			b.ToolResult = head + fmt.Sprintf("\n[truncated post-compact: %d chars omitted]", omitted)
+			rowChanged = true
+		}
+		if rowChanged {
+			out[i].Content = newContent
+			mutated = true
+		}
+	}
+	if !mutated {
+		return messages
+	}
+	return out
 }
 
 // RunForkedAgentInstrumented wraps RunForkedAgent with the inflight
