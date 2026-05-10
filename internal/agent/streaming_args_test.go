@@ -97,3 +97,114 @@ func TestConsumeStream_NoArgsDeltaWithoutToolStart(t *testing.T) {
 		}
 	}
 }
+
+// TestConsumeStream_PersistsThinkingBlock — thinking_delta accumulates
+// into a ContentBlock{Type:"thinking"} on the assistant message so it
+// survives the session jsonl round-trip (and shows up after /resume).
+// Earlier metis treated thinking as transient TUI-only — flushed
+// blocks had no thinking, the user lost the reasoning trace on resume.
+//
+// The flushed blocks must be ordered [thinking, text] for the chunk
+// where thinking precedes text — Anthropic's wire format expects this
+// chronology and the TUI render reads sequentially.
+func TestConsumeStream_PersistsThinkingBlock(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "thinking_delta", TextDelta: "let me check "},
+		{Type: "thinking_delta", TextDelta: "the file structure"},
+		{Type: "text_delta", TextDelta: "Here's the answer."},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	// Drain so the goroutine doesn't block.
+	for range out {
+	}
+	<-done
+
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks (thinking + text); got %d (%+v)", len(blocks), blocks)
+	}
+	if blocks[0].Type != "thinking" {
+		t.Errorf("blocks[0].Type = %q, want \"thinking\"", blocks[0].Type)
+	}
+	if blocks[0].Text != "let me check the file structure" {
+		t.Errorf("blocks[0].Text = %q, want concatenated thinking", blocks[0].Text)
+	}
+	if blocks[1].Type != "text" || blocks[1].Text != "Here's the answer." {
+		t.Errorf("blocks[1] = %+v, want {text, \"Here's the answer.\"}", blocks[1])
+	}
+}
+
+// TestConsumeStream_ThinkingFlushedBeforeTool — thinking that resolves
+// into a tool call must persist BEFORE the tool_use block in the
+// assembled message. Mirrors Anthropic's chronology and lets the user
+// re-read the reasoning that produced each tool call after /resume.
+func TestConsumeStream_ThinkingFlushedBeforeTool(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "thinking_delta", TextDelta: "I should grep for"},
+		{Type: "thinking_delta", TextDelta: " TODO comments"},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "Grep"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `{"pattern":"TODO"}`},
+		{Type: "tool_use_stop", ToolUseID: "t1"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks (thinking + tool_use); got %d (%+v)", len(blocks), blocks)
+	}
+	if blocks[0].Type != "thinking" || blocks[0].Text != "I should grep for TODO comments" {
+		t.Errorf("blocks[0] = %+v, want {thinking, ...}", blocks[0])
+	}
+	if blocks[1].Type != "tool_use" || blocks[1].ToolName != "Grep" {
+		t.Errorf("blocks[1] = %+v, want {tool_use, Grep}", blocks[1])
+	}
+}
+
+// TestConsumeStream_ThinkingDeltaStillEmitted — accumulating into the
+// persisted block must not break the live-stream EventThinkingDelta
+// surface. The TUI's spinner row depends on per-delta events.
+func TestConsumeStream_ThinkingDeltaStillEmitted(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "thinking_delta", TextDelta: "hmm"},
+		{Type: "thinking_delta", TextDelta: " ok"},
+		{Type: "text_delta", TextDelta: "answer"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	go func() {
+		_, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+	}()
+	var thinkingDeltas []string
+	for ev := range out {
+		if ev.Kind == EventThinkingDelta {
+			thinkingDeltas = append(thinkingDeltas, ev.TextDelta)
+		}
+	}
+	if len(thinkingDeltas) != 2 {
+		t.Errorf("expected 2 EventThinkingDelta; got %d (%v)", len(thinkingDeltas), thinkingDeltas)
+	}
+}

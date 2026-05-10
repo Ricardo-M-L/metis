@@ -280,6 +280,7 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 		case RoleAssistant:
 			am := oaiMessage{Role: "assistant"}
 			var text strings.Builder
+			var thinking strings.Builder
 			for _, c := range m.Content {
 				switch c.Type {
 				case "text":
@@ -293,20 +294,29 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 					tc.Function.Name = c.ToolName
 					tc.Function.Arguments = string(argsJSON)
 					am.ToolCalls = append(am.ToolCalls, tc)
+				case "thinking":
+					// Captured reasoning trace from a prior turn. Keep
+					// it for the reasoning_content field below; do NOT
+					// emit it as plain text or it'll show up in the
+					// next response. DeepSeek/GLM ignore unknown
+					// fields, so this is safe across providers.
+					if thinking.Len() > 0 {
+						thinking.WriteByte('\n')
+					}
+					thinking.WriteString(c.Text)
 				}
 			}
 			am.Content = text.String()
 			// Moonshot/Kimi thinking-tier models reject assistant
-			// tool-call messages that lack reasoning_content. Set it
-			// to empty (the field is required-present, not required-
-			// non-empty) so the next turn doesn't 400. Other
-			// OpenAI-compatible providers ignore the field. Once we
-			// add a "thinking" ContentBlock type and capture model
-			// reasoning incoming, this can carry the actual chain of
-			// thought back to the model on the next round-trip.
-			if len(am.ToolCalls) > 0 {
-				empty := ""
-				am.ReasoningContent = &empty
+			// tool-call messages that lack reasoning_content. Either
+			// pass through the actual reasoning we captured (preferred
+			// — the model gets a faithful round-trip) or fall back to
+			// an empty string (field is required-present, not
+			// required-non-empty). Other OpenAI-compatible providers
+			// ignore the field.
+			if len(am.ToolCalls) > 0 || thinking.Len() > 0 {
+				rc := thinking.String()
+				am.ReasoningContent = &rc
 			}
 			out.Messages = append(out.Messages, am)
 		}

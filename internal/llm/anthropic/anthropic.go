@@ -401,6 +401,18 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 						Data:      c.Data,
 					},
 				})
+			case "thinking":
+				// Intentionally dropped on send. Anthropic's
+				// extended-thinking wire format requires the original
+				// `signature` field on round-trip — without it the API
+				// returns 400. metis currently captures the thinking
+				// text via streaming but discards signature deltas (see
+				// line 912 "signature_delta" — currently dropped), so
+				// we can't re-emit a faithful thinking block yet.
+				// Persisting the text in session jsonl + showing it in
+				// the TUI is the user-visible win; signature plumbing
+				// can come as a follow-up when extended-thinking gets
+				// flipped on by default.
 			}
 		}
 		out.Messages = append(out.Messages, am)

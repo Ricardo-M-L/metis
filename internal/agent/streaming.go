@@ -26,17 +26,40 @@ type usageTotals struct {
 // longest-running phase of a turn.
 func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<- Event) ([]llm.ContentBlock, string, *usageTotals, error) {
 	var (
-		blocks   []llm.ContentBlock
-		curText  string
-		curTool  *llm.ContentBlock
-		curJSON  string
-		stopReas string
-		usage    usageTotals
+		blocks      []llm.ContentBlock
+		curText     string
+		curThinking string
+		curTool     *llm.ContentBlock
+		curJSON     string
+		stopReas    string
+		usage       usageTotals
 	)
 	flushText := func() {
 		if curText != "" {
 			blocks = append(blocks, llm.ContentBlock{Type: "text", Text: curText})
 			curText = ""
+		}
+	}
+	// flushThinking persists the accumulated reasoning trace as a
+	// ContentBlock on the assistant message. Earlier metis treated
+	// thinking as a transient TUI-only trace (the flushed message had
+	// no thinking blocks, so session jsonl + resume lost the reasoning
+	// entirely). Mirrors crush's ReasoningContent and openclaude's
+	// Anthropic ThinkingBlock — keep the trace alongside text/tool_use
+	// so the user can re-read it after a /resume and so providers that
+	// REQUIRE the thinking block to be re-sent (Anthropic with
+	// extended-thinking enabled) get a faithful round-trip.
+	//
+	// Provider adapters that DON'T accept thinking blocks (DeepSeek,
+	// GLM, MiniMax) strip them on the send path — see
+	// internal/llm/openai/openai.go's request builder.
+	flushThinking := func() {
+		if curThinking != "" {
+			// Thinking sits BEFORE the text/tool blocks it produced —
+			// matches Anthropic's wire-format ordering and reads
+			// chronologically when persisted.
+			blocks = append(blocks, llm.ContentBlock{Type: "thinking", Text: curThinking})
+			curThinking = ""
 		}
 	}
 	flushTool := func() {
@@ -58,6 +81,7 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 	for {
 		ev, err := s.Recv()
 		if errors.Is(err, io.EOF) {
+			flushThinking()
 			flushText()
 			flushTool()
 			return blocks, stopReas, &usage, nil
@@ -77,15 +101,25 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 				usage.cacheRead = ev.CacheReadInputTokens
 			}
 		case "text_delta":
+			// Reasoning ends as soon as the assistant starts emitting
+			// text — flush it as a block now so the order in `blocks`
+			// is [thinking, text, ...] which is the order the model
+			// produced + what Anthropic's wire format expects.
+			flushThinking()
 			curText += ev.TextDelta
 			emit(ctx, out, Event{Kind: EventTextDelta, TextDelta: ev.TextDelta})
 		case "thinking_delta":
-			// Surface model reasoning to the UI without folding it into
-			// the assembled assistant blocks — thinking is a transient
-			// trace, not part of the persisted message that downstream
-			// turns will see.
+			// Accumulate AND surface to the UI. The accumulator feeds
+			// the persisted ContentBlock{Type:"thinking"} flushed by
+			// flushThinking; the event keeps the live spinner-row
+			// "(thinking…)" preview working.
+			curThinking += ev.TextDelta
 			emit(ctx, out, Event{Kind: EventThinkingDelta, TextDelta: ev.TextDelta})
 		case "tool_use_start":
+			// Same chronology argument as text_delta — a tool call
+			// means reasoning has resolved into an action; persist
+			// the trace before the tool block.
+			flushThinking()
 			flushText()
 			curTool = &llm.ContentBlock{Type: "tool_use", ToolUseID: ev.ToolUseID, ToolName: ev.ToolName}
 			curJSON = ""
@@ -126,6 +160,7 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 				usage.cacheRead = ev.CacheReadInputTokens
 			}
 		case "message_stop":
+			flushThinking()
 			flushText()
 			flushTool()
 			return blocks, stopReas, &usage, nil
