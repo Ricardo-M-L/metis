@@ -36,13 +36,44 @@ func TestIsNewer(t *testing.T) {
 func TestTokenEnvFallback(t *testing.T) {
 	t.Setenv("METIS_GITHUB_TOKEN", "")
 	t.Setenv("GITHUB_TOKEN", "fallback")
+	resetGhTokenCache()
 	if Token() != "fallback" {
 		t.Errorf("expected fallback, got %q", Token())
 	}
 	t.Setenv("METIS_GITHUB_TOKEN", "primary")
+	resetGhTokenCache()
 	if Token() != "primary" {
 		t.Errorf("expected primary, got %q", Token())
 	}
+}
+
+// TestTokenGhFallback locks the gh-CLI fallback path: when neither
+// env var is set, Token() shells out to `gh auth token`. We can't
+// assume gh is logged in on every CI runner, so the assertion is
+// conditional — when gh is absent / unauthenticated the result is
+// "" (which is the legitimate "no token available" state).
+func TestTokenGhFallback(t *testing.T) {
+	t.Setenv("METIS_GITHUB_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	resetGhTokenCache()
+	got := Token()
+	// On a CI machine without gh, this is "". On a dev machine with
+	// `gh auth login` already done, it's a real token. Either is fine
+	// — what matters is the function doesn't panic and the lookup
+	// terminates within the 2s ghAuthToken timeout.
+	if got != "" && len(got) < 20 {
+		t.Errorf("gh token suspiciously short: %q (len=%d)", got, len(got))
+	}
+}
+
+// resetGhTokenCache clears the per-process memoization between
+// subtests. Without this, ghAuthToken would remember the value from
+// the first call and skip the env-var override the second test
+// sets up. Test-only — not exported.
+func resetGhTokenCache() {
+	ghAuthTokenCached = ""
+	ghAuthTokenLookedUp = false
+	ghAuthTokenLookupErr = nil
 }
 
 func TestRepoOverride(t *testing.T) {

@@ -5,6 +5,7 @@ package update
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
@@ -38,11 +40,65 @@ func Repo() string {
 }
 
 // Token returns the PAT to authenticate against GitHub, or "" if none set.
+//
+// Resolution order (first non-empty wins):
+//  1. METIS_GITHUB_TOKEN env var (explicit, scoped to metis)
+//  2. GITHUB_TOKEN env var (CI / shared)
+//  3. `gh auth token` shell command (gh CLI's keyring) — zero-config
+//     when the user is already logged into gh, which covers most
+//     dev machines. We deliberately do NOT call this from any tight
+//     loop; ghAuthToken caches per-process so the spawn cost is paid
+//     at most once per metis run.
+//
+// Without #3, the version-check + self-update silently no-op'd on
+// every machine where the user hadn't manually exported a PAT —
+// "current: vX" showed but "latest: vY" never lit up because
+// MaybeCheck bailed at the empty-token guard. (User report
+// 2026-05-10: "metis 打开会不会显示当前版本和最新版本" — answer was
+// "yes in code, no in practice because no token".)
 func Token() string {
 	if v := strings.TrimSpace(os.Getenv("METIS_GITHUB_TOKEN")); v != "" {
 		return v
 	}
-	return strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	if v := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); v != "" {
+		return v
+	}
+	return ghAuthToken()
+}
+
+// ghAuthTokenCache memoizes the result of `gh auth token` so a hot
+// startup doesn't shell-out repeatedly. We accept that the cache is
+// stale across process lifetime — token rotation is rare, and a
+// stale token just falls back to "current only" gracefully on next
+// MaybeCheck.
+var (
+	ghAuthTokenCached    string
+	ghAuthTokenLookedUp  bool
+	ghAuthTokenLookupErr error
+)
+
+// ghAuthToken returns the gh CLI's stored token, or "" if gh isn't
+// installed / not logged in / the keyring lookup failed. Failures
+// are silent — this is a zero-config best-effort path; bubbling
+// errors here would just spam stderr on machines that legitimately
+// don't use gh.
+func ghAuthToken() string {
+	if ghAuthTokenLookedUp {
+		return ghAuthTokenCached
+	}
+	ghAuthTokenLookedUp = true
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		ghAuthTokenLookupErr = err
+		return ""
+	}
+	ghAuthTokenCached = strings.TrimSpace(out.String())
+	return ghAuthTokenCached
 }
 
 // ErrNoToken is returned when no PAT is configured.
