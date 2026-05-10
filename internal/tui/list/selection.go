@@ -430,7 +430,101 @@ func (l *List) applySelectionToLine(line string, itemIdx, lineY int) string {
 	before := ansi.Cut(line, 0, lo)
 	mid := ansi.Cut(line, lo, hi)
 	after := ansi.Cut(line, hi, lineWidth)
-	return before + selectionBgOpen + mid + selectionBgClose + after
+	return before + selectionBgOpen + reinjectSelectionBg(mid) + selectionBgClose + after
+}
+
+// reinjectSelectionBg keeps the selection's solid grey background
+// applied across every cell of the mid-segment, even when the
+// underlying content emits its own SGR resets.
+//
+// Without this fix, lipgloss-styled chat items render as a sequence
+// of `\x1b[<style>m...\x1b[0m` chunks. Wrapping the whole mid with a
+// single `\x1b[48;5;238m...\x1b[49m` envelope LOOKS right in code but
+// the inner `\x1b[0m` resets ALSO clear the bg attribute mid-stream,
+// so only the cells before the first reset show the grey. The user
+// sees fragmented "checkerboard" highlighting instead of a uniform
+// selection band (the 2026-05-10 image #2 user report).
+//
+// Strategy: walk the bytes and re-emit selectionBgOpen after every
+// CSI-m sequence that includes a `0` (reset all) or `49` (bg reset)
+// parameter. Compound forms like `\x1b[0;1;31m` also strip bg, so
+// they trigger the reinjection too.
+//
+// We deliberately do NOT touch the caller-supplied prefix/suffix
+// envelope — selectionBgOpen sits OUTSIDE this function's input and
+// selectionBgClose runs after, so callers don't double-wrap.
+func reinjectSelectionBg(mid string) string {
+	if mid == "" {
+		return mid
+	}
+	var b strings.Builder
+	b.Grow(len(mid) + 16)
+	i := 0
+	for i < len(mid) {
+		// Look for the next CSI ("\x1b[").
+		idx := strings.Index(mid[i:], "\x1b[")
+		if idx < 0 {
+			b.WriteString(mid[i:])
+			break
+		}
+		b.WriteString(mid[i : i+idx])
+		csiStart := i + idx
+		// Find the final byte of the CSI (anything in 0x40-0x7E).
+		j := csiStart + 2
+		for j < len(mid) {
+			c := mid[j]
+			if c >= 0x40 && c <= 0x7E {
+				break
+			}
+			j++
+		}
+		if j >= len(mid) {
+			b.WriteString(mid[csiStart:])
+			break
+		}
+		csi := mid[csiStart : j+1]
+		b.WriteString(csi)
+		// CSI-m sequence with reset/bg-reset semantics → re-arm bg.
+		// Final byte 'm' identifies the SGR family; param body is
+		// between "[" and "m". Empty body == "[m" == reset all.
+		if mid[j] == 'm' && csiKillsSelectionBg(csi) {
+			b.WriteString(selectionBgOpen)
+		}
+		i = j + 1
+	}
+	return b.String()
+}
+
+// csiKillsSelectionBg reports whether an SGR sequence (CSI ... m)
+// would clear the selection's background attribute. The sequence is
+// the exact byte slice including the leading "\x1b[" and trailing
+// "m". Cases that kill bg:
+//   - "\x1b[m"            bare CSI = reset all
+//   - "\x1b[0m"           explicit reset all
+//   - "\x1b[49m"          reset bg only
+//   - "\x1b[0;...m"       compound starting with 0
+//   - "\x1b[...;0m"       compound ending with 0
+//   - "\x1b[...;49;...m"  any param == 49
+//
+// Anything else (e.g. "\x1b[31m" pure fg-red, "\x1b[1m" bold) leaves
+// bg alone and we don't reinject — keeps the fast path lean for
+// typical syntax-highlighted lines.
+func csiKillsSelectionBg(csi string) bool {
+	// Strip "\x1b[" prefix and "m" suffix → just the param body.
+	if len(csi) < 3 {
+		return false
+	}
+	body := csi[2 : len(csi)-1]
+	if body == "" || body == "0" {
+		return true // bare or explicit reset
+	}
+	for _, p := range strings.Split(body, ";") {
+		switch strings.TrimSpace(p) {
+		case "0", "49":
+			return true
+		}
+	}
+	return false
 }
 
 // selectWord snaps the selection to the word-grapheme boundaries
