@@ -581,6 +581,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// the stack: tools with no Monitor wiring just skip the tool, the
 	// loop's drain is a no-op.
 	monitorReg := agent.NewMonitorRegistry(0)
+	// Cancel every tail-watcher goroutine on chat exit so a long-lived
+	// parent process doesn't accumulate readers across restarts. The
+	// underlying jobs themselves keep running (they outlive the turn
+	// intentionally — same as bash run_in_background); only the file-
+	// scan goroutines unwind here.
+	defer monitorReg.StopAll()
 
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
 		Cfg:             cfg,
