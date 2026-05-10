@@ -240,8 +240,10 @@ func (m *Model) View() tea.View {
 		// — folded by default to keep the chat surface readable while
 		// the model thinks aloud.
 		if !m.expandToolOutputs {
-			upper.WriteString(thinkStyle.Render(firstThinkingLine(m.thinkingText)))
-			upper.WriteString(styleMuted.Render("  (ctrl+o to expand)"))
+			upper.WriteString(thinkStyle.Render(firstThinkingLine(m.thinkingText, m.width)))
+			if thinkingHintFits(m.width) {
+				upper.WriteString(styleMuted.Render("  (ctrl+o to expand)"))
+			}
 			upper.WriteString("\n\n")
 		} else {
 			thinkLines := strings.Split(m.thinkingText, "\n")

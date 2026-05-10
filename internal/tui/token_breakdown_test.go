@@ -31,6 +31,30 @@ func TestTokenTracker_SessionCacheCumulative(t *testing.T) {
 	}
 }
 
+// TestTokenTracker_CacheHitRate — the headline "is caching working?"
+// metric. claude-code parity (tengu_compact.cacheHitRate). Anchored
+// at total cacheable input (read + create + fresh), so a session
+// with no cache participation reports 0% rather than NaN.
+func TestTokenTracker_CacheHitRate(t *testing.T) {
+	var tt tokenTracker
+	// 8000 read + 1000 create + 1000 fresh = 10000 cacheable; rate = 0.8
+	tt.add(1000, 200, 1000, 8000)
+	if got := tt.CacheHitRate(); got < 0.79 || got > 0.81 {
+		t.Errorf("CacheHitRate = %.4f, want ~0.80", got)
+	}
+	// Zero activity → 0, not NaN.
+	var empty tokenTracker
+	if got := empty.CacheHitRate(); got != 0 {
+		t.Errorf("empty CacheHitRate = %v, want 0", got)
+	}
+	// Pure-cache session (all reads, no fresh input) → 1.0.
+	var pure tokenTracker
+	pure.add(0, 100, 0, 5000)
+	if got := pure.CacheHitRate(); got != 1.0 {
+		t.Errorf("pure-cache CacheHitRate = %v, want 1.0", got)
+	}
+}
+
 // TestTokenTracker_ResetClearsSessionCache — /clear must zero session
 // cumulative cache too, otherwise /cost would carry forward a stale
 // pre-clear cache total.

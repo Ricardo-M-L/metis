@@ -1203,15 +1203,27 @@ func cmdCost(r *REPL, args string) string {
 	// slash.Registry path produce identical output.
 	in := r.totalTokens.in
 	out := r.totalTokens.out
+	cacheCreate := r.totalTokens.CacheCreate()
+	cacheRead := r.totalTokens.CacheRead()
 	total := in + out
 	priceIn, priceOut := guessPriceUSDPerM(r.Loop.Model)
+	// Cache reads bill at 10% of fresh input on Anthropic; cache_create
+	// at 125%. Estimate the savings: (read × 0.9 × priceIn) is how much
+	// cheaper this session was versus paying full input rate. Useful
+	// to show users "your /memory + addendum sectioning earned you $X".
 	costUSD := float64(in)*priceIn/1_000_000 + float64(out)*priceOut/1_000_000
-	return renderInfoBox("Session Cost · "+r.Loop.Model, []infoRow{
+	cacheSavingsUSD := float64(cacheRead) * 0.9 * priceIn / 1_000_000
+	rows := []infoRow{
 		{Key: "input tokens", Value: fmtThousands(in)},
 		{Key: "output tokens", Value: fmtThousands(out)},
+		{Key: "cache_read", Value: fmtThousands(cacheRead), Hint: "served from prompt cache"},
+		{Key: "cache_create", Value: fmtThousands(cacheCreate), Hint: "written to prompt cache"},
 		{Key: "total tokens", Value: fmtThousands(total)},
+		{Key: "cache hit rate", Value: fmt.Sprintf("%.1f%%", r.totalTokens.CacheHitRate()*100)},
 		{Key: "est. cost", Value: fmt.Sprintf("$%.4f", costUSD), Hint: "real billing on provider"},
-	})
+		{Key: "est. cache savings", Value: fmt.Sprintf("$%.4f", cacheSavingsUSD), Hint: "vs. paying full input rate for cache_read"},
+	}
+	return renderInfoBox("Session Cost · "+r.Loop.Model, rows)
 }
 
 func cmdUsage(r *REPL, args string) string {
@@ -1242,6 +1254,7 @@ func cmdTokens(r *REPL, args string) string {
 		{Key: "output total", Value: fmtThousands(t.Output())},
 		{Key: "cache_create total", Value: fmtThousands(t.CacheCreate())},
 		{Key: "cache_read total", Value: fmtThousands(t.CacheRead())},
+		{Key: "cache hit rate", Value: fmt.Sprintf("%.1f%%", t.CacheHitRate()*100), Hint: "cache_read / (read+create+input)"},
 	}
 	return renderInfoBox("Token Breakdown", rows)
 }
@@ -1450,6 +1463,25 @@ func (t *tokenTracker) LastCacheRead() int   { return t.lastCacheRead }
 // these to call out how much of the spend was prompt-cache vs fresh.
 func (t *tokenTracker) CacheCreate() int { return t.cacheCreate }
 func (t *tokenTracker) CacheRead() int   { return t.cacheRead }
+
+// CacheHitRate is the fraction of input tokens served from prompt
+// cache: cacheRead / (cacheRead + cacheCreate + in). Range [0, 1];
+// returns 0 when there's no cache activity at all (avoids
+// 0/0 = NaN). Mirrors claude-code's tengu_compact.cacheHitRate
+// metric — it's the single number that tells you "is my caching
+// actually working?".
+//
+// Anchor at total cacheable input (everything that COULD have been
+// cached) instead of input alone, so a request with no cache
+// participation reads as 0.0 rather than blowing past 1.0 when input
+// is tiny.
+func (t *tokenTracker) CacheHitRate() float64 {
+	denom := t.cacheRead + t.cacheCreate + t.in
+	if denom == 0 {
+		return 0
+	}
+	return float64(t.cacheRead) / float64(denom)
+}
 
 // LastTotal is the most recent API call's input+output combined — the
 // per-turn cost. Spinner row uses this to surface what the just-finished

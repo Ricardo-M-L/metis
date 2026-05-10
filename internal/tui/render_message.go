@@ -92,11 +92,15 @@ func renderMessage(msg Message, width int, expand bool) string {
 		s.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
 		thinkStyle := styleDim.Italic(true)
 		if !expand {
-			// Folded view — first line preview only, plus a hint.
-			first := firstThinkingLine(msg.Content)
+			// Folded view — first line preview only, plus a hint when
+			// the row has room. Width-aware so the hint never wraps
+			// onto a second row over the next chat item (image #7/#8).
+			first := firstThinkingLine(msg.Content, width)
 			s.WriteString(thinkStyle.Render(first))
-			s.WriteString(styleMuted.Render("  "))
-			s.WriteString(styleMuted.Render("(ctrl+o to expand)"))
+			if thinkingHintFits(width) {
+				s.WriteString(styleMuted.Render("  "))
+				s.WriteString(styleMuted.Render("(ctrl+o to expand)"))
+			}
 			s.WriteString("\n")
 		} else {
 			thinkLines := strings.Split(msg.Content, "\n")
@@ -308,16 +312,71 @@ func looksLikeMarkdown(s string) bool {
 
 // firstThinkingLine returns a single-line preview suitable for the
 // folded thinking view: the first non-empty line of content, capped
-// at 80 visible runes with an ellipsis suffix. Empty input yields
-// "Thinking…" so the user sees SOMETHING (the glyph alone is too easy
-// to miss in a long transcript).
-func firstThinkingLine(content string) string {
+// so that the rendered row "  ✻ <text>  (ctrl+o to expand)" fits in
+// `width` columns without wrapping. Empty input yields "Thinking…"
+// so the user sees SOMETHING (the glyph alone is too easy to miss
+// in a long transcript).
+//
+// width<=0 falls back to the historical 80-col cap (covers tests
+// and the rare cold-render path before WindowSizeMsg arrives).
+//
+// Reflow note: claude-code's wrap-text re-measures every frame
+// against the current terminal columns. metis caches by width in
+// renderCache, so we just need the budget here to track the live
+// width. Without this, shrinking the terminal left the hint
+// floating over content (user reports image #7/#8 2026-05-10).
+func firstThinkingLine(content string, width int) string {
+	const (
+		leftMargin = 4  // "  ✻ "
+		hintWidth  = 20 // "  (ctrl+o to expand)"
+		minBody    = 12 // anything narrower → drop the hint and use full width
+	)
+	// Budget is in terminal CELLS (not runes), so CJK content gets
+	// the same one-row guarantee as ASCII. Without this, "用户问的是..."
+	// at 60 cols would land at 60+ cells and wrap, even though the
+	// rune count fit.
+	budget := width - leftMargin - hintWidth
+	switch {
+	case width <= 0:
+		// Cold-render path (tests, pre-WindowSizeMsg). Stay rune-based
+		// so the legacy 80-rune contract holds.
+		for _, ln := range strings.Split(content, "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" {
+				continue
+			}
+			return truncateRunes(ln, 80)
+		}
+		return "Thinking…"
+	case budget < minBody:
+		// Narrow terminal: hint won't fit; use full width minus a safety col.
+		budget = width - leftMargin - 1
+		if budget < minBody {
+			budget = minBody
+		}
+	}
 	for _, ln := range strings.Split(content, "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
 			continue
 		}
-		return truncateRunes(ln, 80)
+		return truncateCells(ln, budget)
 	}
 	return "Thinking…"
+}
+
+// thinkingHintFits reports whether the "(ctrl+o to expand)" suffix
+// fits next to a folded thinking preview at the given width. Callers
+// drop the hint when this is false; otherwise it would wrap onto a
+// new row and orphan over the content (image #7/#8 user reports).
+func thinkingHintFits(width int) bool {
+	const (
+		leftMargin = 4
+		hintWidth  = 20
+		minBody    = 12
+	)
+	if width <= 0 {
+		return true // historical default, used by tests
+	}
+	return width-leftMargin-hintWidth >= minBody
 }

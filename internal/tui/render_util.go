@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
 )
 
 // escapeLeakPatterns matches the partial escape sequences we've seen
@@ -182,6 +185,34 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(rs[:max-1]) + "…"
+}
+
+// truncateCells truncates s so its rendered terminal-cell width is
+// at most maxCells, accounting for east-asian doublewidth characters
+// and emoji. The returned string ends with "…" when truncation
+// happened (the ellipsis itself takes 1 cell, so the visible body is
+// at most maxCells-1 cells from the original input). This is what
+// you want for "fit one row exactly"; truncateRunes counts code
+// points and overshoots by 2× on CJK content.
+func truncateCells(s string, maxCells int) string {
+	if maxCells <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(s) <= maxCells {
+		return s
+	}
+	out := make([]rune, 0, len(s))
+	used := 0
+	budget := maxCells - 1 // reserve 1 cell for the ellipsis
+	for _, r := range s {
+		w := runewidth.RuneWidth(r)
+		if used+w > budget {
+			break
+		}
+		out = append(out, r)
+		used += w
+	}
+	return string(out) + "…"
 }
 
 // fuzzyMatch is the legacy palette filter — kept for backward compat
