@@ -145,7 +145,41 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		text := msg.Content
 		if text == "" {
-			pasteDebug("empty PasteMsg")
+			// Cmd+V / Ctrl+V with an IMAGE on the clipboard: macOS &
+			// Linux terminals send the bracketed-paste wrapper with
+			// empty body because the clipboard payload isn't text.
+			// Earlier metis silently dropped the event; the user would
+			// hit Cmd+V on a screenshot, see nothing happen, and
+			// re-report image-paste as broken — even though the
+			// Ctrl+V-bound branch DOES handle images. Mirror that
+			// branch here so Cmd+V works the same.
+			pasteDebug("empty PasteMsg — probing image clipboard")
+			ctx, cancel := context.WithTimeout(m.ctx, 2*time.Second)
+			defer cancel()
+			content, _ := readClipboard(ctx)
+			if content != nil && (content.Mime == "image/png" || content.Mime == "image/jpeg" || content.Mime == "image/png-base64") {
+				path, err := saveClipboardImage(content.Data, content.Mime)
+				if err == nil {
+					if m.imagePaste == nil {
+						m.imagePaste = map[int]string{}
+					}
+					m.imageCounter++
+					m.imagePaste[m.imageCounter] = path
+					m.input.InsertString(fmt.Sprintf("[Image #%d] ", m.imageCounter))
+					kb := len(content.Data) / 1024
+					m.messages = append(m.messages, Message{
+						Role:      "info",
+						Content:   fmt.Sprintf("(image #%d cached: %s, %d KiB)", m.imageCounter, path, kb),
+						Timestamp: time.Now(),
+					})
+				} else {
+					m.messages = append(m.messages, Message{
+						Role:      "error",
+						Content:   fmt.Sprintf("paste failed: %v", err),
+						Timestamp: time.Now(),
+					})
+				}
+			}
 			return m, nil
 		}
 		pasteDebug("ok: %d bytes", len(text))
