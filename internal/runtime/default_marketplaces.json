@@ -1,0 +1,20 @@
+{
+  "anthropic-agent-skills": {
+    "source": {
+      "source": "github",
+      "repo": "anthropics/skills"
+    }
+  },
+  "claude-plugins-official": {
+    "source": {
+      "source": "github",
+      "repo": "anthropics/claude-plugins-official"
+    }
+  },
+  "claude-plugins-community": {
+    "source": {
+      "source": "github",
+      "repo": "anthropics/claude-plugins-community"
+    }
+  }
+}

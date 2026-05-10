@@ -35,6 +35,18 @@ func cmdPlugin(ctx context.Context, args []string) error {
 			return errors.New("usage: metis plugin info <name>")
 		}
 		return cmdPluginInfo(ctx, rest[0])
+	case "marketplace", "mp":
+		return cmdPluginMarketplace(ctx, rest)
+	case "search":
+		if len(rest) == 0 {
+			return errors.New("usage: metis plugin search <query>")
+		}
+		return cmdPluginSearch(ctx, strings.Join(rest, " "))
+	case "install":
+		if len(rest) == 0 {
+			return errors.New("usage: metis plugin install <plugin>[@<marketplace>]")
+		}
+		return cmdPluginInstall(ctx, rest[0])
 	case "remove", "rm":
 		if len(rest) == 0 {
 			return errors.New("usage: metis plugin remove <name> [--yes]")
@@ -60,27 +72,42 @@ func cmdPlugin(ctx context.Context, args []string) error {
 		printPluginUsage()
 		return nil
 	}
-	return fmt.Errorf("plugin: unknown subcommand %q (use: list | info <name> | remove <name>)", sub)
+	return fmt.Errorf("plugin: unknown subcommand %q (use: list | info | marketplace | search | install | remove)", sub)
 }
 
 func printPluginUsage() {
-	fmt.Println(`metis plugin — manage MCP-bundle plugins under ~/.metis/plugins/
+	fmt.Println(`metis plugin — manage plugins + plugin marketplaces
 
 Usage:
-  metis plugin list             List installed plugins (manifest-only scan)
-  metis plugin info <name>      Show one plugin's manifest details
-  metis plugin remove <name> [--yes]
-                                Delete a plugin directory (--yes / -y to actually delete)
+  metis plugin list                            List installed plugins
+  metis plugin info <name>                     Show one plugin's manifest
+  metis plugin search <query>                  Search across all marketplaces
+  metis plugin install <plugin>[@<marketplace>]
+                                               Clone marketplace if needed, copy plugin to ~/.metis/plugins/
+  metis plugin remove <name> [--yes]           Delete an installed plugin
+  metis plugin marketplace list                List registered marketplaces
+  metis plugin marketplace add <name> github:<owner>/<repo>
+                                               Register a new marketplace source
+  metis plugin marketplace remove <name>       Unregister a marketplace
 
-To install: drop a plugin directory under ~/.metis/plugins/<name>/ with a
-plugin.toml manifest. See pkg/plugin/manifest.go for the schema. The
-runtime auto-loads plugins on next startup; tools register as
-plugin__<name>__<tool>.`)
+Bundled marketplaces (auto-registered, override by adding a user entry):
+  anthropic-agent-skills      → github:anthropics/skills
+  claude-plugins-official     → github:anthropics/claude-plugins-official
+  claude-plugins-community    → github:anthropics/claude-plugins-community
+
+Set METIS_NO_BUNDLED_PLUGINS=1 to ignore the bundled defaults.`)
 }
 
 // cmdPluginList prints every installed plugin's name + version + status,
 // without spawning anything. Loader-spawn happens at chat startup.
 func cmdPluginList(ctx context.Context) error {
+	// Trigger first-run install so a fresh `metis plugin list` reflects
+	// the bundled set instead of "(no plugins installed)". Idempotent
+	// after the initial extract; honours METIS_NO_BUNDLED_PLUGINS=1.
+	installed, _ := rtpkg.EnsureBundledPlugins()
+	for _, name := range installed {
+		fmt.Fprintf(os.Stderr, "\033[2m[metis] installed bundled plugin: %s\033[0m\n", name)
+	}
 	dir := rtpkg.PluginsDir()
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -93,6 +120,12 @@ func cmdPluginList(ctx context.Context) error {
 	count := 0
 	for _, e := range ents {
 		if !e.IsDir() {
+			continue
+		}
+		// `marketplaces/` is a sibling tree (cloned marketplace repos),
+		// not a plugin. Skip it so `plugin list` doesn't try to read a
+		// nonexistent plugin.toml at its root.
+		if e.Name() == "marketplaces" {
 			continue
 		}
 		manifestPath := filepath.Join(dir, e.Name(), "plugin.toml")
