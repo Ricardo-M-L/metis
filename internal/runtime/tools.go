@@ -56,6 +56,12 @@ type ToolRegistryOptions struct {
 	// back to its pre-2026-05-09 foreground-only behavior).
 	Jobs *jobs.Registry
 
+	// Monitors is the per-line pattern-match registry shared with
+	// agent.Loop. When non-nil AND Jobs is non-nil, the Monitor tool
+	// becomes callable. nil disables Monitor; the model still has
+	// Bash run_in_background as the polling fallback.
+	Monitors *agent.MonitorRegistry
+
 	// ConfigSnapshot is the {path,mtime,size} fingerprint captured at
 	// session bootstrap so MetisInfo's [config_staleness] section can
 	// detect "the user edited config.toml since metis launched".
@@ -78,6 +84,9 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// dependency-free (jobs is a leaf package the runtime owns).
 	if opts.Jobs != nil {
 		builtin.AttachJobsRegistry(reg, opts.Jobs, opts.Gate)
+		if opts.Monitors != nil {
+			builtin.AttachMonitorRegistry(reg, opts.Jobs, opts.Monitors, opts.Gate, opts.Cfg.Tools.Bash)
+		}
 	}
 	// Agent tool: needs the provider + registry references that
 	// builtin.Register doesn't see.

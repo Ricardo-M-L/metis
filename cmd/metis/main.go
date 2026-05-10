@@ -575,6 +575,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// `<job_notification>` sink. Created here so BuildToolRegistry
 	// can wire it into Bash + register BashList/BashOutput/BashKill.
 	jobsPool := jobs.NewRegistry("")
+	// Monitor registry — per-line pattern watcher that complements the
+	// jobs pool. Lives next to jobsPool because a Monitor watch is
+	// always anchored to a job ID returned by Spawn. nil-safe across
+	// the stack: tools with no Monitor wiring just skip the tool, the
+	// loop's drain is a no-op.
+	monitorReg := agent.NewMonitorRegistry(0)
 
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
 		Cfg:             cfg,
@@ -588,6 +594,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		CronService:     cronSvc,
 		MemoryManager:   memoryMgr,
 		Jobs:            jobsPool,
+		Monitors:        monitorReg,
 		ConfigSnapshot:  snap,
 	})
 
@@ -672,6 +679,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		System: system, Model: model, MaxIter: maxIter,
 		MemoryManager: memoryMgr,
 		Jobs:          jobsPool,
+		Monitors:      monitorReg,
 	})
 
 	// Apply --effort / --fast flag overrides. Effort goes through the

@@ -115,6 +115,14 @@ type Loop struct {
 	// reaching into the runtime layer. Optional — nil hides the chip.
 	Jobs *jobs.Registry
 
+	// Monitors is the per-line pattern-match registry. The Monitor
+	// tool registers a Watch on a freshly-spawned background job and
+	// the loop drains MonitorEvents at every iteration boundary,
+	// injecting `<monitor_event>` system-reminder user messages so
+	// the model sees pattern matches in time to react. nil disables
+	// the Monitor tool path entirely.
+	Monitors *MonitorRegistry
+
 	// steerBuf accumulates mid-turn user input (the "steering" feature
 	// from claude-code: user can type while the agent is mid-loop, and
 	// the new instruction is prepended to the next iteration's user
@@ -390,6 +398,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// jobs finished (and whether to BashOutput-read the result),
 		// matching claude-code's <task_notification> envelope.
 		l.injectJobNotifications(out)
+		// Same pattern for Monitor pattern-matches — pulls every
+		// MonitorEvent buffered since last iter and injects them as
+		// <monitor_event> system-reminders. Cheap when no Monitor is
+		// active (nil registry → instant return).
+		l.injectMonitorEvents(out)
 
 		req := l.buildRequest(specs)
 

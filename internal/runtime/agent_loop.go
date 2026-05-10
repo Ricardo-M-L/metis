@@ -37,6 +37,12 @@ type AgentLoopOptions struct {
 	// BashList / BashOutput / BashKill see the same jobs the Loop's
 	// notification path drains.
 	Jobs *jobs.Registry
+
+	// Monitors is the per-line pattern-match registry shared with the
+	// Monitor tool. nil disables Monitor on this Loop. When non-nil,
+	// Loop.injectMonitorEvents drains it at every iteration boundary
+	// and pushes <monitor_event> system-reminder messages.
+	Monitors *agent.MonitorRegistry
 }
 
 // BuildMemoryManager constructs a MemoryManager rooted under the
@@ -115,6 +121,13 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	if opts.Jobs != nil {
 		loop.JobNotify = opts.Jobs.Notify()
 		loop.Jobs = opts.Jobs
+	}
+	// Monitor pattern-watch registry — same lifecycle as Jobs (one per
+	// process, drained at iteration boundaries). Wired here so a
+	// caller that opted out of Jobs but somehow set Monitors gets a
+	// silent no-op rather than a confusing dangling registry.
+	if opts.Monitors != nil && opts.Jobs != nil {
+		loop.Monitors = opts.Monitors
 	}
 
 	// Auto-compaction. Threshold from cfg, fallback to package default.
