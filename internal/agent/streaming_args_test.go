@@ -208,3 +208,100 @@ func TestConsumeStream_ThinkingDeltaStillEmitted(t *testing.T) {
 		t.Errorf("expected 2 EventThinkingDelta; got %d (%v)", len(thinkingDeltas), thinkingDeltas)
 	}
 }
+
+// TestConsumeStream_ToolUseStopResyncsLostBytes — defends against the
+// MiniMax char-loss bug surfaced 2026-05-10: a single tool_input_delta
+// chunk dropped between provider and agent (the user's actual report
+// was "internal/jobs/jobs.go" arriving at the tool as "l/jobs/jobs.go"
+// — the prefix `interna` lost between two deltas).
+//
+// The provider also ships the FULL accumulated args string via
+// tool_use_stop.InputDelta as authoritative resync. Without the fix
+// the agent trusts only its incrementally-built curJSON; with the fix
+// it prefers ev.InputDelta when at least as long, recovering the
+// dropped bytes silently.
+func TestConsumeStream_ToolUseStopResyncsLostBytes(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "Read"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `{"path":"`},
+		// Simulate the LOST middle delta: provider's authoritative
+		// stop-event still has "interna", but the per-delta path is
+		// missing it.
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `l/jobs/jobs.go"}`},
+		{Type: "tool_use_stop", ToolUseID: "t1", InputDelta: `{"path":"internal/jobs/jobs.go"}`},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	// Find the tool_use block — it's the last one (after any thinking/text).
+	var toolBlock *llm.ContentBlock
+	for i := range blocks {
+		if blocks[i].Type == "tool_use" {
+			toolBlock = &blocks[i]
+		}
+	}
+	if toolBlock == nil {
+		t.Fatalf("no tool_use block produced; blocks=%+v", blocks)
+	}
+	path, ok := toolBlock.ToolInput["path"].(string)
+	if !ok {
+		t.Fatalf("ToolInput.path not a string: %+v", toolBlock.ToolInput)
+	}
+	if path != "internal/jobs/jobs.go" {
+		t.Errorf("path = %q, want %q (resync should recover from lost middle delta)",
+			path, "internal/jobs/jobs.go")
+	}
+}
+
+// TestConsumeStream_ToolUseStopShorterKeepsCurJSON — defensive: if
+// the provider sends a shorter InputDelta on stop than we accumulated,
+// we DON'T trim. That'd be the inverse bug (provider lost bytes, we
+// have them all). curJSON wins.
+func TestConsumeStream_ToolUseStopShorterKeepsCurJSON(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "Read"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `{"path":"internal/jobs/jobs.go"}`},
+		// Provider's stop-event truncated (hypothetical); agent
+		// should keep the longer per-delta accumulation.
+		{Type: "tool_use_stop", ToolUseID: "t1", InputDelta: `{"path":"l"}`},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	var toolBlock *llm.ContentBlock
+	for i := range blocks {
+		if blocks[i].Type == "tool_use" {
+			toolBlock = &blocks[i]
+		}
+	}
+	if toolBlock == nil {
+		t.Fatalf("no tool_use block; blocks=%+v", blocks)
+	}
+	if path, _ := toolBlock.ToolInput["path"].(string); path != "internal/jobs/jobs.go" {
+		t.Errorf("path = %q, want %q (longer curJSON wins)", path, "internal/jobs/jobs.go")
+	}
+}

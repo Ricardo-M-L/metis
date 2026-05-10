@@ -139,6 +139,24 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 				})
 			}
 		case "tool_use_stop":
+			// Provider-side authoritative resync: both anthropic.go and
+			// openai.go also accumulate the args server-side and ship
+			// the full string via tool_use_stop.InputDelta. If our per-
+			// delta accumulation lost bytes (e.g. a single SSE chunk
+			// dropped on a flaky connection — surfaced as the MiniMax
+			// "internal/jobs/jobs.go → l/jobs/jobs.go" path corruption,
+			// where `interna` was eaten between deltas), the provider's
+			// full string is the source of truth. Prefer it whenever
+			// it's at least as long as what we built up.
+			//
+			// Strict-equal length is the typical case (no loss). Longer
+			// = our accumulator dropped bytes; we resync. Shorter is
+			// surprising (would mean the provider undercounted) — we
+			// keep curJSON in that case so we don't accidentally trim
+			// real data.
+			if ev.InputDelta != "" && len(ev.InputDelta) >= len(curJSON) {
+				curJSON = ev.InputDelta
+			}
 			flushTool()
 		case "message_delta":
 			if ev.StopReason != "" {
