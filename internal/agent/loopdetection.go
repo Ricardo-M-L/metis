@@ -76,11 +76,21 @@ type LoopDetector struct {
 // (`internal/agent/loop_detection.go:11-13`). 5 repetitions in a 10-step
 // window means at least half the recent steps are byte-for-byte the
 // same call+result — that's a real loop, not flaky retries.
+//
+// GlobalThreshold raised 2026-05-10: a real "write tests for every file
+// in this dir" task routinely needs 100-200 reads + writes + edits in a
+// single Run. The previous 80-call cap killed legitimate work mid-flight
+// (user report image #2: "edited 22 files, 31 reads, then loop detector
+// aborted: 80 total tool calls"). 250 keeps the per-tool repeat (20),
+// signature-window (5×10), and ping-pong detectors as the actual loop
+// guards; the global cap exists only to bound runaway sessions, not to
+// limit deliberate multi-file work. Override via `[loop_detection].global`
+// in config.toml if you need a tighter (or looser) bound.
 func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
 		WarningThreshold:  10,
 		CriticalThreshold: 20,
-		GlobalThreshold:   80,
+		GlobalThreshold:   250,
 
 		SignatureWindowSize: 10,
 		SignatureMaxRepeats: 5,
