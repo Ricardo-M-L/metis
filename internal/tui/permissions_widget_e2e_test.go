@@ -29,12 +29,12 @@ func TestPermissionsWidget_SlashOpensEditor(t *testing.T) {
 // commits to gate.SetMode.
 func TestPermissionsWidget_ApplyChangesMode(t *testing.T) {
 	m := newSlashTestModel(t)
-	m.gate.SetMode(permission.ModeAuto)
+	m.gate.SetMode(permission.ModeAcceptEdits)
 	m.input.SetValue("/permissions")
 	pressEnter(t, m)
 
-	// Cursor on auto (index 1). Right twice → plan (index 3).
-	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // bypass
+	// Cursor seeded at acceptEdits (index 1). Right once → plan (index 2).
+	// Order: ask → acceptEdits → plan → bypass → deny.
 	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // plan
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 

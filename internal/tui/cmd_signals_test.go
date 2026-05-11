@@ -24,7 +24,7 @@ func TestRenderToolsList_NilLoopFallsBack(t *testing.T) {
 
 func TestRenderToolsList_ShowsBuiltins(t *testing.T) {
 	reg := tools.NewRegistry()
-	gate := permission.New(permission.ModeAuto)
+	gate := permission.New(permission.ModeAcceptEdits)
 	// Register builtin set so the listing has real content. We feed in
 	// a zero-value config — builtin defaults are tolerant of unset fields.
 	builtin.Register(reg, &config.Config{}, gate)
@@ -71,7 +71,7 @@ func TestRenderCurrentSession_WithLoopShowsTurns(t *testing.T) {
 	store, _ := session.NewStore(dir)
 	id := "session-current"
 	_ = store.WriteHeader(id, "m", "")
-	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAuto), nil, "sys", 5)
+	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.AppendUser("u1")
 	loop.AppendUser("u2")
 	// v2: lipgloss styles each label/value separately, so a literal

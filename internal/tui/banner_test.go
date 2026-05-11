@@ -14,7 +14,7 @@ import (
 // Everything else is left zero — printBanner doesn't touch it.
 func minimalREPL(out *bytes.Buffer, model string) *REPL {
 	return &REPL{
-		Gate:   permission.New(permission.ModeAuto),
+		Gate:   permission.New(permission.ModeAcceptEdits),
 		Styles: NewStyles(),
 		model:  model,
 		out:    out,
@@ -98,8 +98,9 @@ func TestBanner_IncludesModelAndMode(t *testing.T) {
 	if !strings.Contains(out, "test-model-xyz") {
 		t.Errorf("banner missing model name; got:\n%s", out)
 	}
-	if !strings.Contains(out, "auto") {
-		t.Errorf("banner missing permission mode 'auto'; got:\n%s", out)
+	// minimalREPL test fixture seeds gate with ModeAcceptEdits.
+	if !strings.Contains(out, "acceptEdits") {
+		t.Errorf("banner missing permission mode 'acceptEdits'; got:\n%s", out)
 	}
 	if !strings.Contains(out, "Metis") {
 		t.Errorf("banner missing brand name; got:\n%s", out)

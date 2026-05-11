@@ -11,7 +11,7 @@ import (
 
 func TestBuildToolRegistry_RegistersBuiltinsAndAgentAndSendMessage(t *testing.T) {
 	cfg := &config.Config{}
-	gate := permission.New(permission.ModeAuto)
+	gate := permission.New(permission.ModeAcceptEdits)
 	chReg := channels.NewRegistry()
 
 	reg := BuildToolRegistry(ToolRegistryOptions{
@@ -50,7 +50,7 @@ func TestBuildToolRegistry_AgentToolHasModelAndSystem(t *testing.T) {
 	// we passed — it shows up in the registry but we only check Name/Desc
 	// here (its internals are tested in the agent pkg).
 	cfg := &config.Config{}
-	gate := permission.New(permission.ModeAuto)
+	gate := permission.New(permission.ModeAcceptEdits)
 	chReg := channels.NewRegistry()
 
 	reg := BuildToolRegistry(ToolRegistryOptions{

@@ -18,15 +18,15 @@ func sampleRules() []PermRule {
 // TestPermissionsScreen_RendersModeAndRules — both panels appear in the
 // view with the active mode highlighted and rules listed below.
 func TestPermissionsScreen_RendersModeAndRules(t *testing.T) {
-	s := NewPermissionsScreen("auto", sampleRules())
+	s := NewPermissionsScreen("acceptEdits", sampleRules())
 	s.Resize(100, 20)
 	out := stripANSIEffort(s.View())
 
 	if !strings.Contains(out, "Mode") {
 		t.Errorf("missing Mode label:\n%s", out)
 	}
-	if !strings.Contains(out, "auto") {
-		t.Errorf("active mode 'auto' missing:\n%s", out)
+	if !strings.Contains(out, "acceptEdits") {
+		t.Errorf("active mode 'acceptEdits' missing:\n%s", out)
 	}
 	for _, r := range sampleRules() {
 		if !strings.Contains(out, r.Match) {
@@ -41,7 +41,7 @@ func TestPermissionsScreen_RendersModeAndRules(t *testing.T) {
 // TestPermissionsScreen_EmptyRulesShowsHint — when no rules, an italic
 // hint replaces the (empty) list.
 func TestPermissionsScreen_EmptyRulesShowsHint(t *testing.T) {
-	s := NewPermissionsScreen("auto", nil)
+	s := NewPermissionsScreen("acceptEdits", nil)
 	s.Resize(100, 20)
 	out := stripANSIEffort(s.View())
 
@@ -55,16 +55,19 @@ func TestPermissionsScreen_EmptyRulesShowsHint(t *testing.T) {
 
 // TestPermissionsScreen_InitialModeCursor — cursor seeded by `currentMode`.
 func TestPermissionsScreen_InitialModeCursor(t *testing.T) {
+	// Cursor seeded by currentMode. Order follows the Shift+Tab cycle
+	// (keybind_permission.go::cyclePermissionMode) — kept in sync with
+	// the widget's `modes` slice.
 	cases := []struct {
 		current string
 		want    int
 	}{
 		{"ask", 0},
-		{"auto", 1},
-		{"bypass", 2},
-		{"plan", 3},
+		{"acceptEdits", 1},
+		{"plan", 2},
+		{"bypass", 3},
 		{"deny", 4},
-		{"unknown", 1}, // fallback to auto
+		{"unknown", 0}, // fallback to ask
 	}
 	for _, tc := range cases {
 		s := NewPermissionsScreen(tc.current, nil)
@@ -96,7 +99,7 @@ func TestPermissionsScreen_RuleListScrollsIndependently(t *testing.T) {
 	for i := range rules {
 		rules[i] = PermRule{Verb: "allow", Match: "Tool", Source: "session"}
 	}
-	s := NewPermissionsScreen("auto", rules)
+	s := NewPermissionsScreen("acceptEdits", rules)
 	s.Resize(100, 14)
 
 	startMode := s.modeCursor
@@ -111,22 +114,23 @@ func TestPermissionsScreen_RuleListScrollsIndependently(t *testing.T) {
 
 // TestPermissionsScreen_EnterApplies — Enter sets Applied() to mode name.
 func TestPermissionsScreen_EnterApplies(t *testing.T) {
-	s := NewPermissionsScreen("auto", nil)
+	// Start at "acceptEdits" (index 1). Right → index 2 = "plan".
+	s := NewPermissionsScreen("acceptEdits", nil)
 	s.Resize(100, 20)
-	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // → bypass
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // → plan
 	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if !s.Done() {
 		t.Errorf("Enter should mark Done()")
 	}
-	if got := s.Applied(); got != "bypass" {
-		t.Errorf("Applied() = %q, want %q", got, "bypass")
+	if got := s.Applied(); got != "plan" {
+		t.Errorf("Applied() = %q, want %q", got, "plan")
 	}
 }
 
 // TestPermissionsScreen_EscCancels — Esc dismisses without committing.
 func TestPermissionsScreen_EscCancels(t *testing.T) {
-	s := NewPermissionsScreen("auto", nil)
+	s := NewPermissionsScreen("acceptEdits", nil)
 	s.Resize(100, 20)
 	s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	s.Update(tea.KeyPressMsg{Code: tea.KeyEsc})

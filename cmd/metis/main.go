@@ -490,6 +490,25 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.dangerouslySkipPerms {
 		mode = "bypass"
 	}
+	// 2026-05-11: ModeAuto removed. Reject both CLI flag and config
+	// values to surface the change loud and clear — silent fallback
+	// would just shift the user's confusion to "why is metis behaving
+	// differently than before". Includes the migration hint inline so
+	// the user knows what to switch to.
+	if mode == "auto" {
+		return nil, errors.New("permission mode \"auto\" has been removed.\n" +
+			"It collided with claude-code's `auto` (LLM-classifier, ant-only)\n" +
+			"and was confusing every user comparing the two.\n" +
+			"\n" +
+			"Pick one of:\n" +
+			"  ask          — prompt for every non-allowlisted action (claude-code default)\n" +
+			"  acceptEdits  — auto-allow Edit/Write/NotebookEdit, ask for Bash\n" +
+			"  plan         — read-only mode, no writes or shell\n" +
+			"  bypass       — approve everything (use --dangerously-skip-permissions)\n" +
+			"  deny         — refuse everything\n" +
+			"\n" +
+			"Edit ~/.metis/config.toml `mode = ...` or run with `--mode acceptEdits`.")
+	}
 	// Profile-on-CLI merge.
 	mergedModel, mergedMode, mergedEffort, mergedMaxIter :=
 		agentProf.MergeOnto(model, mode, flags.effort, flags.maxIter)

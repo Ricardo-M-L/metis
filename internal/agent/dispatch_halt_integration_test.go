@@ -58,7 +58,7 @@ func TestDispatch_HaltFromHookFlipsLoopFlag(t *testing.T) {
 	l := &Loop{
 		Provider: &captureProvider{},
 		Registry: reg,
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		Hooks:    hooks,
 		Model:    "test-model",
 		System:   "test",
@@ -113,7 +113,7 @@ func TestDispatch_NoHaltWhenHookOnlyDenies(t *testing.T) {
 	l := &Loop{
 		Provider: &captureProvider{},
 		Registry: reg,
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		Hooks:    hooks,
 		Model:    "test-model",
 		System:   "test",
@@ -137,7 +137,7 @@ func TestDispatch_NoHaltWhenHookOnlyDenies(t *testing.T) {
 // the entire session permanently halted.
 func TestRun_ResetsHaltOnEntry(t *testing.T) {
 	l := NewLoop(&captureProvider{}, tools.NewRegistry(),
-		permission.New(permission.ModeAuto), nil, "sys", 1)
+		permission.New(permission.ModeAcceptEdits), nil, "sys", 1)
 	l.haltTurn("from previous turn")
 	if !l.haltRequested {
 		t.Fatal("setup: haltRequested should be true before Run")

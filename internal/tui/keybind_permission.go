@@ -115,7 +115,14 @@ func (m *Model) cyclePermissionMode() {
 	}
 	m.lastModeCycle = now
 
-	modes := []string{"ask", "auto", "bypass", "plan", "deny"}
+	// Shift+Tab cycle. Aligned with claude-code's getNextPermissionMode
+	// (utils/permissions/getNextPermissionMode.ts:39) since 2026-05-11:
+	// metis's old `auto` mode (read-only auto-allow) collided with
+	// claude-code's ant-only `auto` (LLM-classifier) — confusing
+	// naming, distinct semantics. Removed to avoid the trap. Users who
+	// want "auto-allow writes but ask for shell" pick acceptEdits;
+	// users who want "auto-allow everything" pick bypass.
+	modes := []string{"ask", "acceptEdits", "plan", "bypass", "deny"}
 	current := string(m.gate.Mode())
 	nextIdx := 0
 	for i, mode := range modes {

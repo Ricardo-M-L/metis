@@ -14,7 +14,7 @@ import (
 
 func TestHaltTurn_RaisesSignal(t *testing.T) {
 	l := NewLoop(&captureProvider{}, tools.NewRegistry(),
-		permission.New(permission.ModeAuto), nil, "sys", 5)
+		permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	if l.haltRequested {
 		t.Fatal("fresh loop should have no halt request")
 	}
@@ -32,7 +32,7 @@ func TestHaltTurn_RaisesSignal(t *testing.T) {
 // surfaced to the user. Subsequent halt() calls must NOT clobber it.
 func TestHaltTurn_FirstReasonWins(t *testing.T) {
 	l := NewLoop(&captureProvider{}, tools.NewRegistry(),
-		permission.New(permission.ModeAuto), nil, "sys", 5)
+		permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	l.haltTurn("first reason")
 	l.haltTurn("second reason")
 	if l.haltReason != "first reason" {
@@ -45,7 +45,7 @@ func TestHaltTurn_FirstReasonWins(t *testing.T) {
 // one. Otherwise a later "no-detail halt" would silently win.
 func TestHaltTurn_BlankReasonDoesNotOverwrite(t *testing.T) {
 	l := NewLoop(&captureProvider{}, tools.NewRegistry(),
-		permission.New(permission.ModeAuto), nil, "sys", 5)
+		permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	l.haltTurn("real reason")
 	l.haltTurn("")
 	if l.haltReason != "real reason" {

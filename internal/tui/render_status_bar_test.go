@@ -31,7 +31,7 @@ func (p *fakeContextProvider) Stream(context.Context, llm.Request) (llm.StreamRe
 // minimalModel builds the smallest *Model that renderStatusBar needs.
 // Width is set wide enough that left + right + gap fit comfortably.
 func minimalModel(maxCtx int) *Model {
-	gate := permission.New(permission.ModeAuto)
+	gate := permission.New(permission.ModeAcceptEdits)
 	loop := agent.NewLoop(&fakeContextProvider{maxCtx: maxCtx}, tools.NewRegistry(), gate, nil, "test", 5)
 	return &Model{
 		gate:  gate,

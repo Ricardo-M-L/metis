@@ -65,7 +65,7 @@ func TestApplyResume_RestoresMessagesAndMode(t *testing.T) {
 
 func TestApplyResume_MissingSessionErrors(t *testing.T) {
 	store := newResumeStore(t)
-	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAuto), nil, "sys", 5)
+	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	gate := permission.New(permission.ModeAsk)
 	if _, err := ApplyResume(store, "does-not-exist", loop, gate, nil); err == nil {
 		t.Error("ApplyResume for missing session should error")

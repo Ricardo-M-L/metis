@@ -46,7 +46,7 @@ func newE2EModel(t *testing.T, termW, termH, numMessages int) *Model {
 	cl.SetSize(termW-2, termH-10)
 	cl.SetMouseWheelDelta(1)
 	m := &Model{
-		gate:         permission.New(permission.ModeAuto),
+		gate:         permission.New(permission.ModeAcceptEdits),
 		startTime:    time.Now(),
 		input:        ti,
 		chatList:     cl,

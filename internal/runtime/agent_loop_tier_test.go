@@ -28,7 +28,7 @@ func TestBuildAgentLoop_TierFor200kWindow(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 200_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	if loop.Compactor == nil {
@@ -47,7 +47,7 @@ func TestBuildAgentLoop_TierFor16kWindow(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 16_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	if got := loop.Compactor.SnipMaxToolResultChars; got != 200 {
@@ -63,7 +63,7 @@ func TestBuildAgentLoop_TierFor64kWindow(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 64_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	// 64k tier values match the historical default (800/0.70) — this
@@ -85,7 +85,7 @@ func TestBuildAgentLoop_TierFor500kWindow(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 500_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	if got := loop.Compactor.SnipMaxToolResultChars; got != 6000 {
@@ -118,7 +118,7 @@ func TestBuildAgentLoop_TierMaxOutputTokensEffect(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 32_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	// effective cap = 32_000 - 20_000 = 12_000 → tier-16k → 200/0.60.

@@ -63,7 +63,7 @@ func runREPLWithInput(t *testing.T, input string) string {
 	t.Helper()
 
 	var stdout bytes.Buffer
-	gate := permission.New(permission.ModeAuto)
+	gate := permission.New(permission.ModeAcceptEdits)
 	loop := agent.NewLoop(nil /*provider*/, tools.NewRegistry(), gate, nil, "test", 5)
 	sl := slash.NewRegistry()
 	slash.RegisterAll(sl, &config.Config{})

@@ -224,7 +224,7 @@ func newBtwTestModel(t *testing.T, ask func(context.Context, string) (string, er
 
 	m := &Model{
 		ctx:       context.Background(),
-		gate:      permission.New(permission.ModeAuto),
+		gate:      permission.New(permission.ModeAcceptEdits),
 		slash:     slashReg,
 		cmds:      BuildREPLCommands(),
 		startTime: time.Now(),

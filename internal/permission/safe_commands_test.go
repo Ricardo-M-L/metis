@@ -1,9 +1,6 @@
 package permission
 
-import (
-	"context"
-	"testing"
-)
+import "testing"
 
 func TestIsSafeReadOnlyBash_PositiveCases(t *testing.T) {
 	cases := []string{
@@ -111,52 +108,11 @@ func TestIsSafeReadOnlyBash_NegativeCases(t *testing.T) {
 	}
 }
 
-// TestGate_ModeAuto_SafeBashAutoAllowed pins the integration: under
-// mode:auto, a `Bash` tool call with a read-only command must hit
-// DecisionAllow without an Ask round-trip. This is the core promise:
-// the user no longer sees a permission dialog every time the agent
-// runs `git status` while exploring.
-func TestGate_ModeAuto_SafeBashAutoAllowed(t *testing.T) {
-	g := New(ModeAuto)
-	dec, src := g.Check(context.Background(), "Bash", "git status")
-	if dec != DecisionAllow {
-		t.Fatalf("git status under mode:auto should be Allow; got %v (%s)", dec, src)
-	}
-	if src != "mode:auto:safe_command" {
-		t.Errorf("decision source should mark safe_command path; got %q", src)
-	}
-}
-
-// TestGate_ModeAuto_DangerousBashStillAsks — the inverse: a destructive
-// command in auto-mode still routes to Ask (so the user has to OK it).
-// Without this the safeCommands shortcut would be a security
-// regression.
-func TestGate_ModeAuto_DangerousBashStillAsks(t *testing.T) {
-	g := New(ModeAuto)
-	dec, _ := g.Check(context.Background(), "Bash", "rm -rf /tmp/anything")
-	if dec != DecisionAsk {
-		t.Errorf("rm -rf should still go to Ask under mode:auto; got %v", dec)
-	}
-}
-
-// TestGate_ModeAuto_GitPushStillAsks — `git push` is not on the safe
-// list because pushing is a side-effecting network op. Pin so a
-// future refactor doesn't accidentally auto-allow it.
-func TestGate_ModeAuto_GitPushStillAsks(t *testing.T) {
-	g := New(ModeAuto)
-	dec, _ := g.Check(context.Background(), "Bash", "git push origin main")
-	if dec != DecisionAsk {
-		t.Errorf("git push should still ask; got %v", dec)
-	}
-}
-
-// TestGate_ModeAuto_ChainAlwaysAsks — even a chain that *starts* with
-// a safe command must ask, because what comes after the `&&` is
-// unbounded.
-func TestGate_ModeAuto_ChainAlwaysAsks(t *testing.T) {
-	g := New(ModeAuto)
-	dec, _ := g.Check(context.Background(), "Bash", "git status && curl http://evil")
-	if dec != DecisionAsk {
-		t.Errorf("safe-prefix chain should still ask; got %v", dec)
-	}
-}
+// Removed 2026-05-11 along with ModeAuto. The integration tests
+// (TestGate_ModeAuto_SafeBashAutoAllowed / DangerousBashStillAsks /
+// GitPushStillAsks / ChainAlwaysAsks) covered the old mode:auto
+// safe-bash auto-allow path, which no longer exists — acceptEdits
+// asks for ALL bash, matching claude-code parity. IsSafeReadOnlyBash
+// itself is still exercised by the unit-level tests above and remains
+// public for future opt-in rule consumers (e.g. a saved "always allow
+// git status" rule via the allow list).

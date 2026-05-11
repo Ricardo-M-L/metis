@@ -13,7 +13,7 @@ import (
 // debouncer; full TUI wiring isn't needed.
 func makeModelForGateTest() *Model {
 	return &Model{
-		gate:      permission.New(permission.ModeAuto),
+		gate:      permission.New(permission.ModeAcceptEdits),
 		startTime: time.Now().Add(-time.Hour), // far past startup grace
 	}
 }
@@ -51,14 +51,17 @@ func TestCyclePermissionMode_StartupGraceSwallowsBurst(t *testing.T) {
 	// alt-screen init — this used to surface as five "mode: …" lines
 	// before the user touched the keyboard.
 	m := &Model{
-		gate:      permission.New(permission.ModeAuto),
+		gate:      permission.New(permission.ModeAcceptEdits),
 		startTime: time.Now(), // brand new
 	}
 	for i := 0; i < 6; i++ {
 		m.cyclePermissionMode()
 	}
-	if got := string(m.gate.Mode()); got != "auto" {
-		t.Errorf("startup burst should be ignored; mode = %q, want auto", got)
+	// New (2026-05-11) cycle: ask → acceptEdits → plan → bypass → deny.
+	// During startup grace, ANY cycle should be no-op, so the mode
+	// stays at whatever it was when we constructed the gate.
+	if got := string(m.gate.Mode()); got != "acceptEdits" {
+		t.Errorf("startup burst should be ignored; mode = %q, want acceptEdits", got)
 	}
 	if len(m.messages) != 0 {
 		t.Errorf("startup burst should not append messages; got %d", len(m.messages))
@@ -67,12 +70,12 @@ func TestCyclePermissionMode_StartupGraceSwallowsBurst(t *testing.T) {
 
 func TestCyclePermissionMode_DebouncesRapidPresses(t *testing.T) {
 	m := makeModelForGateTest()
-	m.cyclePermissionMode() // 1st: auto → bypass
+	m.cyclePermissionMode() // 1st: acceptEdits → plan
 	m.cyclePermissionMode() // 2nd: rapid follow-up should be ignored
 	m.cyclePermissionMode()
 
-	if got := string(m.gate.Mode()); got != "bypass" {
-		t.Errorf("after debounced rapid presses, mode = %q, want bypass", got)
+	if got := string(m.gate.Mode()); got != "plan" {
+		t.Errorf("after debounced rapid presses, mode = %q, want plan", got)
 	}
 	// Mode switches now show in the footer instead of polluting the
 	// chat transcript — chat history must stay empty on Shift+Tab spam.
@@ -83,13 +86,13 @@ func TestCyclePermissionMode_DebouncesRapidPresses(t *testing.T) {
 
 func TestCyclePermissionMode_AllowsCycleAfterDebounceWindow(t *testing.T) {
 	m := makeModelForGateTest()
-	m.cyclePermissionMode() // auto → bypass
+	m.cyclePermissionMode() // acceptEdits → plan
 	// Pretend the debounce window has elapsed.
 	m.lastModeCycle = time.Now().Add(-modeCycleDebounce - 10*time.Millisecond)
-	m.cyclePermissionMode() // bypass → plan
+	m.cyclePermissionMode() // plan → bypass
 
-	if got := string(m.gate.Mode()); got != "plan" {
-		t.Errorf("after debounce window, mode = %q, want plan", got)
+	if got := string(m.gate.Mode()); got != "bypass" {
+		t.Errorf("after debounce window, mode = %q, want bypass", got)
 	}
 }
 

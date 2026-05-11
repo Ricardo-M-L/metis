@@ -15,11 +15,19 @@ type Mode string
 
 const (
 	ModeAsk         Mode = "ask"         // prompt for every non-allowlisted action
-	ModeAuto        Mode = "auto"        // auto-allow read-only & allowlisted; ask for the rest
 	ModeAcceptEdits Mode = "acceptEdits" // auto-allow reads + project-local writes; ask for shell
 	ModeBypass      Mode = "bypass"      // approve everything (dangerous; opt-in)
 	ModePlan        Mode = "plan"        // read-only mode; no edits or shell writes
 	ModeDeny        Mode = "deny"        // refuse everything that asks
+
+	// Removed 2026-05-11: ModeAcceptEdits. Old semantics were "auto-allow
+	// read-only + safe bash, ask for writes" — a midpoint between
+	// ModeAsk and ModeAcceptEdits. The name collided with claude-code's
+	// ant-only `auto` (which is an LLM-classifier mode and means
+	// something entirely different), confusing every user who tried to
+	// compare the two. Users who want "auto-allow file edits, ask for
+	// shell" should pick ModeAcceptEdits — that matches claude-code's
+	// public `acceptEdits` exactly.
 )
 
 // Decision is the final verdict for a tool call.
@@ -420,25 +428,6 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 			// so we trust this layer.
 			g.recordAllow()
 			return DecisionAllow, "mode:acceptEdits"
-		}
-	case ModeAuto:
-		// Read-only auto-allow; everything else falls through to ask.
-		switch tool {
-		case "Read", "LS", "Glob", "Grep", "WebFetch":
-			g.recordAllow()
-			return DecisionAllow, "mode:auto"
-		case "Bash":
-			// Read-only command allowlist (crush-style safe commands).
-			// `git status` / `ls` / `pwd` / etc. clear the prompt instead
-			// of pestering the user every turn. The allowlist explicitly
-			// rejects shell metacharacters, sudo, and mutating git flags;
-			// the dangerous-classifier in classify.go and the path-touch
-			// safety net above still run — this is the *first* yes, not
-			// the only yes. See safe_commands.go for the full rule set.
-			if IsSafeReadOnlyBash(stringInput) {
-				g.recordAllow()
-				return DecisionAllow, "mode:auto:safe_command"
-			}
 		}
 	}
 	return DecisionAsk, "default"

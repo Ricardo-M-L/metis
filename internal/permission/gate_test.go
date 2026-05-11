@@ -44,7 +44,7 @@ func TestGate_PlanAllowsReadOnly(t *testing.T) {
 }
 
 func TestGate_AutoAllowsReadOnly(t *testing.T) {
-	g := New(ModeAuto)
+	g := New(ModeAcceptEdits)
 	if d, _ := g.Check(context.Background(), "Read", ""); d != DecisionAllow {
 		t.Errorf("auto should auto-allow Read, got %v", d)
 	}
@@ -53,10 +53,10 @@ func TestGate_AutoAllowsReadOnly(t *testing.T) {
 	}
 }
 
-// Regression: ModeAuto and ModePlan must agree on the read-only allowlist.
+// Regression: ModeAcceptEdits and ModePlan must agree on the read-only allowlist.
 // Previously WebFetch was allowed in plan but missing from auto.
 func TestGate_AutoAllowsWebFetchSameAsPlan(t *testing.T) {
-	for _, mode := range []Mode{ModeAuto, ModePlan} {
+	for _, mode := range []Mode{ModeAcceptEdits, ModePlan} {
 		g := New(mode)
 		if d, _ := g.Check(context.Background(), "WebFetch", "https://example.com"); d != DecisionAllow {
 			t.Errorf("%s should allow WebFetch (got %v)", mode, d)

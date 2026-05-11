@@ -73,7 +73,7 @@ func TestYolo_FailOpenOnError(t *testing.T) {
 func TestYolo_NotConsultedOutsideBypass(t *testing.T) {
 	called := false
 	noisy := &stubClassifier{verdict: YoloHardDeny}
-	for _, mode := range []Mode{ModeAsk, ModeAuto, ModePlan} {
+	for _, mode := range []Mode{ModeAsk, ModeAcceptEdits, ModePlan} {
 		g := New(mode)
 		// Wrap to detect any call.
 		wrapper := &countingClassifier{inner: noisy, hits: &called}

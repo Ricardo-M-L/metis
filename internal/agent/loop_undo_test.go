@@ -15,7 +15,7 @@ import (
 
 func newLoopForUndoTest() *Loop {
 	return NewLoop(&captureProvider{}, tools.NewRegistry(),
-		permission.New(permission.ModeAuto), nil, "sys", 5)
+		permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 }
 
 // TestLoop_RestoreReplacesHistory locks in the cron scheduler's

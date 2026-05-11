@@ -306,7 +306,7 @@ func newSlashTestModel(t *testing.T) *Model {
 
 	m := &Model{
 		ctx:         context.Background(),
-		gate:        permission.New(permission.ModeAuto),
+		gate:        permission.New(permission.ModeAcceptEdits),
 		slash:       slashReg,
 		cmds:        BuildREPLCommands(),
 		startTime:   time.Now(),
@@ -317,7 +317,7 @@ func newSlashTestModel(t *testing.T) *Model {
 		height:      40,
 		firstRender: false,
 		showBanner:  false,
-		loop:        agent.NewLoop(fakeProvider{}, tools.NewRegistry(), permission.New(permission.ModeAuto), nil, "sys", 10),
+		loop:        agent.NewLoop(fakeProvider{}, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 10),
 		model:       "claude-sonnet-4-6",
 		cfg:         &config.Config{},
 	}

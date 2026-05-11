@@ -52,7 +52,7 @@ func TestBuildAgentLoop_AppliesAllSubsystems(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 200_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		System:   "you are a tester",
 		Model:    "claude-test",
 		MaxIter:  50,
@@ -80,7 +80,7 @@ func TestBuildAgentLoop_FallsBackToCfgMaxIter(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 100_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 	})
 	if loop.MaxIters != 77 {
 		t.Errorf("MaxIters = %d, want 77 (cfg fallback)", loop.MaxIters)
@@ -98,7 +98,7 @@ func TestBuildAgentLoop_DetectorOffWhenDisabled(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 100_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	if loop.Detector != nil {
@@ -116,7 +116,7 @@ func TestBuildAgentLoop_DetectorOnByDefault(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 100_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	if loop.Detector == nil {
@@ -136,7 +136,7 @@ func TestBuildAgentLoop_HonorsDetectorThresholds(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 100_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	if loop.Detector == nil {
@@ -158,7 +158,7 @@ func TestBuildAgentLoop_MemoryDirIsUnderSessionDir(t *testing.T) {
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 100_000},
 		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAuto),
+		Gate:     permission.New(permission.ModeAcceptEdits),
 		MaxIter:  10,
 	})
 	// Just confirm the memory manager exists; we don't introspect its

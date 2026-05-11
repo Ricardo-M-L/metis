@@ -57,7 +57,7 @@ func (s *captureStream) Recv() (llm.StreamEvent, error) {
 
 func TestLoopRun_PropagatesEffortToProviderRequest(t *testing.T) {
 	p := &captureProvider{}
-	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAuto), nil, "sys", 5)
+	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.Effort = llm.EffortHigh
 	loop.AppendUser("ping")
 
@@ -82,7 +82,7 @@ func TestLoopRun_PropagatesEffortToProviderRequest(t *testing.T) {
 
 func TestLoopRun_FastModeForcesLowEffortAndCapsMaxTokens(t *testing.T) {
 	p := &captureProvider{}
-	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAuto), nil, "sys", 5)
+	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.Effort = llm.EffortHigh // user's persistent preference
 	loop.Fast = true
 	loop.AppendUser("ping")
@@ -115,7 +115,7 @@ func TestLoopRun_FastModeForcesLowEffortAndCapsMaxTokens(t *testing.T) {
 
 func TestLoopRun_NoEffortNoFastSendsDefault(t *testing.T) {
 	p := &captureProvider{}
-	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAuto), nil, "sys", 5)
+	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.AppendUser("ping")
 
 	out := make(chan Event, 16)

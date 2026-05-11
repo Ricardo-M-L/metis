@@ -114,7 +114,7 @@ Exit codes: 0 ok / 1 hard fail / 2 flag error`)
 	// --- tool registry -----------------------------------------------------
 	d.section("tools")
 	reg := tools.NewRegistry()
-	gate := permission.New(permission.ModeAuto)
+	gate := permission.New(permission.ModeAcceptEdits)
 	if cfg != nil {
 		builtin.Register(reg, cfg, gate)
 	} else {

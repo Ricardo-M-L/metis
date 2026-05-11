@@ -429,8 +429,8 @@ func formatTokensRaw(n int) string {
 // return type is now image/color.Color.
 func modeIcon(mode string) (glyph string, c color.Color) {
 	switch mode {
-	case "auto":
-		return "▶▶", lipgloss.Color("#64b5f6")
+	case "acceptEdits":
+		return "▶▶", lipgloss.Color("#64b5f6") // matches claude-code's ⏵⏵ autoAccept color family
 	case "bypass":
 		return "⏩", lipgloss.Color("#ffb74d")
 	case "plan":

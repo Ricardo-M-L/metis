@@ -50,8 +50,11 @@ type PermissionsScreen struct {
 // NewPermissionsScreen builds the widget. `currentMode` is the active
 // permission mode; rules is a snapshot of the gate's rules.
 func NewPermissionsScreen(currentMode string, rules []PermRule) *PermissionsScreen {
-	modes := []string{"ask", "auto", "bypass", "plan", "deny"}
-	cur := 1 // auto default
+	// Order matches keybind_permission.go::cyclePermissionMode (the
+	// Shift+Tab cycler) — kept in sync after the 2026-05-11 removal
+	// of `auto` mode.
+	modes := []string{"ask", "acceptEdits", "plan", "bypass", "deny"}
+	cur := 0 // ask default
 	for i, m := range modes {
 		if m == currentMode {
 			cur = i
