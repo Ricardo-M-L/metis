@@ -52,7 +52,10 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		{"/theme", []string{"Theme", "◀", "▶"}, "widget"},             // Phase C4: opens cycle widget
 		{"/effort", []string{"Speed", "Intelligence", "▲"}, "widget"}, // Phase C1: opens slider widget
 		{"/effort high", []string{"effort: high"}, "repl"},
-		{"/context", []string{"Context Window", "in last call", "tokens"}, "repl"},
+		// /context was un-shadowed from the old REPLCommand on 2026-05-11 —
+		// the slash-signal path now wins, producing the grid + breakdown.
+		// Expectation updated to match the new "Context Usage" headline.
+		{"/context", []string{"Context Usage", "window", "tokens"}, "slash"},
 		{"/export", []string{"exported", "messages to"}, "repl"},
 
 		// Slash-owned (added in 2026-05-01 audit) --------------------------

@@ -16,7 +16,11 @@ func TestModalDispatch_REPLCommand(t *testing.T) {
 		"cost",
 		"tokens",
 		"doctor",
-		"context",
+		// "context" intentionally removed from this list 2026-05-11 —
+		// /context now renders inline as a chat message (claude-code
+		// parity, user image #1) so the user can scroll past instead
+		// of pressing Esc. Inline coverage is in
+		// TestContextRendersInline below.
 		"env",
 		"version",
 	}
@@ -82,5 +86,30 @@ func TestModalDispatch_BodyScreenContent(t *testing.T) {
 	}
 	if !strings.Contains(view, "Esc") {
 		t.Errorf("BodyScreen view should contain 'Esc to close' hint; got:\n%s", view)
+	}
+}
+
+// TestContextRendersInline — /context renders inline as a chat-style
+// info message, not as a modal overlay. Lock the claude-code-parity
+// behavior added 2026-05-11.
+func TestContextRendersInline(t *testing.T) {
+	m := newSlashTestModel(t)
+	before := len(m.messages)
+	m.input.SetValue("/context")
+	pressEnter(t, m)
+
+	if m.activeScreen != nil {
+		t.Errorf("/context should NOT open a screen overlay; got activeScreen=%T", m.activeScreen)
+	}
+	if len(m.messages) <= before {
+		t.Errorf("/context should append at least one inline message; before=%d after=%d", before, len(m.messages))
+	}
+	// Spot-check the rendered content carries the headline.
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "info" {
+		t.Errorf("/context output should be an info-role message; got role=%q", last.Role)
+	}
+	if !strings.Contains(last.Content, "Context Usage") {
+		t.Errorf("/context output should contain 'Context Usage' header; got: %q", last.Content)
 	}
 }

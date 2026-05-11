@@ -75,7 +75,14 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Productivity / inspection ===
 	r.Register(REPLCommand{Name: "agents", Description: "list sub-agents currently in flight (Agent tool)", Handler: cmdAgents})
 	r.Register(REPLCommand{Name: "files", Description: "show workspace file index (used by @-mention)", Handler: cmdFiles})
-	r.Register(REPLCommand{Name: "context", Description: "show context-window usage: tokens / max / percentage", Handler: cmdContext})
+	// `/context` deliberately NOT registered as a REPLCommand any more
+	// (claude-code parity, 2026-05-11): the slash-signal path
+	// (SignalContext → renderContext) produces a much richer grid +
+	// per-category breakdown + MCP Loaded/Available split. REPLCommands
+	// take precedence over slash signals (slash_e2e_test.go:35), so
+	// keeping cmdContext registered would shadow the new renderer.
+	// cmdContext itself stays in this file so a future caller that
+	// wants a one-line context summary can still reach it.
 	r.Register(REPLCommand{Name: "memory", Description: "memory ops: read | write | search | clear", Handler: cmdMemory})
 	r.Register(REPLCommand{Name: "recap", Description: "show structural recap of the just-finished turn", Handler: cmdRecap})
 	r.Register(REPLCommand{Name: "replay", Description: "re-run the last turn with the same prompt (no edits)", Handler: cmdReplay})

@@ -8,6 +8,7 @@ package tui
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -718,7 +719,231 @@ func renderContext(m *Model) string {
 		}
 		s.WriteString("\n")
 	}
+	// Per-category drill-downs (claude-code parity, 2026-05-11 user
+	// request, image #1). The grid above gives the bird's-eye; the
+	// blocks below give the "what individual tools / files am I
+	// paying for" breakdown. Each block is its own header + tree so
+	// long sessions can scroll to the section they care about.
+	s.WriteString("\n")
+	s.WriteString(renderContextMCPBlock(m))
+	s.WriteString(renderContextMemoryBlock(m))
+	s.WriteString(renderContextSkillsBlock(m))
 	return s.String()
+}
+
+// renderContextMCPBlock builds the "MCP tools · /mcp (loaded on-demand)"
+// section: per-tool token cost for tools whose full schema is currently
+// in the prompt, plus a names-only "Available" list for the rest.
+//
+// "Loaded" = the schema is being sent on the next turn (P6 discovered
+// set OR LazyMode=standard OR the auto threshold didn't fire). We
+// derive this by calling Loop.ToolSpecsSnapshot() and comparing each
+// mcp__ entry's schema shape against the lazy placeholder. The
+// placeholder has additionalProperties=true + a fixed description; a
+// real schema doesn't.
+func renderContextMCPBlock(m *Model) string {
+	if m == nil || m.loop == nil || m.loop.Registry == nil {
+		return ""
+	}
+	specs := m.loop.ToolSpecsSnapshot()
+	type entry struct {
+		name string
+		toks int
+	}
+	var loaded []entry
+	loadedByName := make(map[string]bool, 8)
+	for _, sp := range specs {
+		if !strings.HasPrefix(sp.Name, "mcp__") {
+			continue
+		}
+		if isLazyPlaceholderSchema(sp.InputSchema) {
+			continue
+		}
+		toks := roughTokens(sp.Name) + roughTokens(sp.Description)
+		// Schema bytes add ~30% on top of description per claude-code's
+		// calibration — same heuristic the grid uses.
+		toks += roughTokens(sp.Description) * 30 / 100
+		loaded = append(loaded, entry{name: sp.Name, toks: toks})
+		loadedByName[sp.Name] = true
+	}
+	// Collect "Available" = mcp__ tools registered but NOT loaded.
+	var available []string
+	for _, t := range m.loop.Registry.SortedForCache() {
+		n := t.Name()
+		if !strings.HasPrefix(n, "mcp__") {
+			continue
+		}
+		if loadedByName[n] {
+			continue
+		}
+		available = append(available, n)
+	}
+	if len(loaded) == 0 && len(available) == 0 {
+		return ""
+	}
+	sort.SliceStable(loaded, func(i, j int) bool { return loaded[i].name < loaded[j].name })
+	sort.Strings(available)
+
+	var b strings.Builder
+	b.WriteString(styleAccent.Render("MCP tools · /mcp (loaded on-demand)") + "\n\n")
+	if len(loaded) > 0 {
+		b.WriteString(styleDim.Render("Loaded") + "\n")
+		for i, e := range loaded {
+			prefix := "├ "
+			if i == len(loaded)-1 {
+				prefix = "└ "
+			}
+			b.WriteString("  " + styleDim.Render(prefix) +
+				e.name + styleDim.Render(fmt.Sprintf(": %s tokens", fmtThousands(e.toks))) + "\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(available) > 0 {
+		b.WriteString(styleDim.Render("Available") + "\n")
+		for i, n := range available {
+			prefix := "├ "
+			if i == len(available)-1 {
+				prefix = "└ "
+			}
+			b.WriteString("  " + styleDim.Render(prefix) + n + "\n")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderContextMemoryBlock surfaces the user's memory files (under
+// ~/.metis/memory/) with per-file token cost. Walks the directory each
+// time the user runs /context — files are small (a few KB at most)
+// and the user only runs /context occasionally, so the IO cost is
+// negligible vs cluttering Model with cached state.
+func renderContextMemoryBlock(m *Model) string {
+	memDir := filepath.Join(config.Home(), "memory")
+	entries, err := os.ReadDir(memDir)
+	if err != nil {
+		return "" // no memory dir → omit the section entirely
+	}
+	type memEntry struct {
+		path string
+		toks int
+	}
+	var items []memEntry
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		p := filepath.Join(memDir, e.Name())
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		items = append(items, memEntry{
+			path: filepath.Join("memory", e.Name()), // relative for display
+			toks: roughTokens(string(raw)),
+		})
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].path < items[j].path })
+	var b strings.Builder
+	b.WriteString(styleAccent.Render("Memory files · /memory") + "\n")
+	for i, e := range items {
+		prefix := "├ "
+		if i == len(items)-1 {
+			prefix = "└ "
+		}
+		b.WriteString("  " + styleDim.Render(prefix) + e.path +
+			styleDim.Render(fmt.Sprintf(": %s tokens", fmtThousands(e.toks))) + "\n")
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// renderContextSkillsBlock surfaces the loaded skills. Walks the
+// configured skillDir for per-skill manifests; falls back to listing
+// names if manifests can't be read. Skill files are typically tiny
+// (just a manifest + a few prompt lines), so the per-skill token
+// number isn't dramatic — but the LIST is what most users want to
+// see when they ask "what skills are active right now".
+func renderContextSkillsBlock(m *Model) string {
+	if m == nil || m.skillDir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(m.skillDir)
+	if err != nil {
+		return ""
+	}
+	type skillEntry struct {
+		name string
+		toks int
+	}
+	var items []skillEntry
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		full := filepath.Join(m.skillDir, name)
+		st, err := os.Stat(full)
+		if err != nil || !st.IsDir() {
+			// .json manifests are also skills — capture as a name + size pair.
+			if !st.IsDir() && strings.HasSuffix(name, ".json") {
+				raw, _ := os.ReadFile(full)
+				items = append(items, skillEntry{
+					name: strings.TrimSuffix(name, ".json"),
+					toks: roughTokens(string(raw)),
+				})
+			}
+			continue
+		}
+		// Directory skill — sum sizes of .md / SKILL.md children.
+		toks := 0
+		_ = filepath.WalkDir(full, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() {
+				return nil
+			}
+			if !strings.HasSuffix(d.Name(), ".md") && !strings.HasSuffix(d.Name(), ".json") {
+				return nil
+			}
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				return nil
+			}
+			toks += roughTokens(string(raw))
+			return nil
+		})
+		items = append(items, skillEntry{name: name, toks: toks})
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].toks > items[j].toks })
+	var b strings.Builder
+	b.WriteString(styleAccent.Render("Skills · /skills") + "\n")
+	for i, e := range items {
+		prefix := "├ "
+		if i == len(items)-1 {
+			prefix = "└ "
+		}
+		b.WriteString("  " + styleDim.Render(prefix) + e.name +
+			styleDim.Render(fmt.Sprintf(": %s tokens", fmtThousands(e.toks))) + "\n")
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// isLazyPlaceholderSchema returns true for the shape that
+// stripAndAppendToolSearch leaves behind for deferred tools. Two
+// signals must BOTH match (lone additionalProperties=true could be a
+// real schema with no fixed fields).
+func isLazyPlaceholderSchema(s map[string]any) bool {
+	if s == nil {
+		return false
+	}
+	ap, _ := s["additionalProperties"].(bool)
+	desc, _ := s["description"].(string)
+	return ap && strings.Contains(desc, "deferred")
 }
 
 // roughTokens approximates a string's token count via the chars/4

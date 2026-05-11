@@ -645,8 +645,15 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			mcpReg = &rtpkg.MCPRegistry{}
 		}
 		mcpReg.MergeWithConfig(cfg.MCP.Servers)
+		// Lazy MCP startup (P7, kimi-cli `defer_mcp_tool_loading` parity):
+		// auto mode (default) registers stub tools from
+		// ~/.metis/mcp-cache/<server>.json without spawning the
+		// subprocess. First tool invocation triggers spawn. Mode is
+		// controlled by METIS_LAZY_MCP (auto|always|never); see
+		// runtime/mcp_cache.go::ParseLazyMCPMode for the matrix.
+		lazyMode := rtpkg.ParseLazyMCPMode(os.Getenv("METIS_LAZY_MCP"))
 		var mcpErrs []error
-		mcpServers, mcpErrs = rtpkg.LaunchAllMCP(ctx, mcpReg, reg)
+		mcpServers, mcpErrs = rtpkg.LaunchAllMCPLazy(ctx, mcpReg, reg, lazyMode)
 		for _, e := range mcpErrs {
 			fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
 		}

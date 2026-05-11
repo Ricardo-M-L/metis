@@ -38,7 +38,12 @@ var modalCommands = map[string]bool{
 	"cost":        true,
 	"tokens":      true,
 	"doctor":      true,
-	"context":     true,
+	// "context" intentionally NOT modal — claude-code parity (2026-05-11
+	// user request, image #1): /context renders inline as a chat-style
+	// info message so it stays in the transcript and the user doesn't
+	// need to press Esc to return to typing. The renderer
+	// (render_info.go::renderContext) is grid-shaped but fits inline
+	// fine; long output is just scrolled past like any other long reply.
 	"stats":       true,
 	"keybindings": true,
 	"permissions": true,
@@ -494,7 +499,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalUpgrade:
 			m.openBodyScreen("/upgrade", renderUpgrade())
 		case slash.SignalContext:
-			m.openBodyScreen("/context", renderContext(m))
+			// Inline render (claude-code parity, 2026-05-11). Append
+			// as an info-role message so it lives in the chat scroll
+			// and the user doesn't need Esc to dismiss. Long output
+			// flows like any other multi-line reply.
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   renderContext(m),
+				Timestamp: time.Now(),
+			})
 		case slash.SignalResume:
 			m.openBodyScreen("/resume", renderResumeHelp(m))
 		case slash.SignalTag:

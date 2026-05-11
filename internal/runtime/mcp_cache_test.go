@@ -1,0 +1,256 @@
+package runtime
+
+// mcp_cache_test.go — locks the on-disk schema cache + lazy-launch
+// behavior added in P7. Coverage focuses on the cache key (fingerprint
+// stability + invalidation) and the load/save round-trip; the lazy
+// server's spawn-on-first-call semantics are exercised in
+// mcp_lazy_test.go where we can mock the spawn closure cleanly.
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/mcp"
+)
+
+// setMetisHome redirects config.Home() to a temp dir for the duration
+// of one test. Returns a cleanup that restores the prior value.
+// Matches the pattern other runtime tests use; pulled into a helper
+// here so test bodies stay readable.
+func setMetisHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("METIS_HOME", dir)
+	// config.Home() reads $METIS_HOME — confirm the redirection works
+	// before we hand the dir out, so a regression in Home() shows up
+	// as a setup failure rather than mysterious cache misses.
+	got := config.Home()
+	if got != dir {
+		t.Fatalf("config.Home() = %q, want %q (METIS_HOME redirection broken)", got, dir)
+	}
+	return dir
+}
+
+// TestFingerprintEntry_StableForIdenticalInput — the same inputs MUST
+// produce the same fingerprint across calls, otherwise the cache
+// flaps on every restart. Map iteration order is the usual source of
+// drift; we sort keys explicitly in FingerprintEntry to defuse it.
+func TestFingerprintEntry_StableForIdenticalInput(t *testing.T) {
+	e := MCPServerEntry{
+		Name:    "test",
+		Command: "/usr/bin/python",
+		Args:    []string{"-m", "mcp_server"},
+		Headers: map[string]string{"X-Token": "abc", "X-User": "metis"},
+	}
+	a := FingerprintEntry(e)
+	for i := 0; i < 50; i++ {
+		if got := FingerprintEntry(e); got != a {
+			t.Fatalf("fingerprint flapped on call %d: %q vs first %q", i, got, a)
+		}
+	}
+	if !strings.HasPrefix(a, "sha256:") {
+		t.Errorf("fingerprint should be sha256: prefixed; got %q", a)
+	}
+}
+
+// TestFingerprintEntry_ChangesOnAnyField — every input axis the
+// fingerprint covers (command / args / url / headers) MUST change the
+// result. If a field is silently ignored, edits to mcp.toml wouldn't
+// invalidate the cache and the user would silently keep using stale
+// schemas.
+func TestFingerprintEntry_ChangesOnAnyField(t *testing.T) {
+	base := MCPServerEntry{
+		Command: "a", Args: []string{"x"}, URL: "u",
+		Headers: map[string]string{"h": "1"},
+	}
+	baseFP := FingerprintEntry(base)
+	mutants := []struct {
+		label string
+		mut   func(*MCPServerEntry)
+	}{
+		{"command", func(e *MCPServerEntry) { e.Command = "b" }},
+		{"args", func(e *MCPServerEntry) { e.Args = []string{"y"} }},
+		{"args-additional", func(e *MCPServerEntry) { e.Args = []string{"x", "extra"} }},
+		{"url", func(e *MCPServerEntry) { e.URL = "v" }},
+		{"header-value", func(e *MCPServerEntry) { e.Headers = map[string]string{"h": "2"} }},
+		{"header-key", func(e *MCPServerEntry) { e.Headers = map[string]string{"j": "1"} }},
+		{"header-extra", func(e *MCPServerEntry) { e.Headers = map[string]string{"h": "1", "k": "2"} }},
+	}
+	for _, m := range mutants {
+		t.Run(m.label, func(t *testing.T) {
+			cpy := base
+			m.mut(&cpy)
+			if got := FingerprintEntry(cpy); got == baseFP {
+				t.Errorf("%s mutation did not change fingerprint", m.label)
+			}
+		})
+	}
+}
+
+// TestFingerprintEntry_NameNotIncluded — a rename in mcp.toml shouldn't
+// invalidate the cache if the launch identity (command/args/url/headers)
+// is unchanged. The file name on disk handles the rename dimension.
+func TestFingerprintEntry_NameNotIncluded(t *testing.T) {
+	a := MCPServerEntry{Name: "old", Command: "c"}
+	b := MCPServerEntry{Name: "new", Command: "c"}
+	if FingerprintEntry(a) != FingerprintEntry(b) {
+		t.Errorf("rename shouldn't change fingerprint")
+	}
+}
+
+// TestLoadMCPCache_MissingFileReturnsNil — the "no cache yet" case
+// (every server on first run). Callers treat (nil, nil) as the
+// signal to spawn-and-cache; an error would force them to handle
+// "is this just a missing file vs a real read error" everywhere.
+func TestLoadMCPCache_MissingFileReturnsNil(t *testing.T) {
+	setMetisHome(t)
+	got, err := LoadMCPCache("never-existed")
+	if err != nil {
+		t.Errorf("missing cache should return nil, nil; got err=%v", err)
+	}
+	if got != nil {
+		t.Errorf("missing cache should return nil cache; got %+v", got)
+	}
+}
+
+// TestLoadMCPCache_MalformedJSONErrors — corrupted cache must surface
+// as an error so the eager-spawn path is taken instead of silently
+// downgrading to "no cache".
+func TestLoadMCPCache_MalformedJSONErrors(t *testing.T) {
+	dir := setMetisHome(t)
+	cacheDir := filepath.Join(dir, "mcp-cache")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "broken.json"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadMCPCache("broken")
+	if err == nil {
+		t.Errorf("malformed cache should error; got nil")
+	}
+}
+
+// TestSaveLoadMCPCache_RoundTrip — write + read returns the same
+// data. Tests both the JSON shape stays stable and the file
+// permissions / location are correct.
+func TestSaveLoadMCPCache_RoundTrip(t *testing.T) {
+	setMetisHome(t)
+	want := &MCPCache{
+		Fingerprint: "sha256:test",
+		Tools: []CachedTool{
+			{Name: "alpha", Description: "first", InputSchema: map[string]any{"type": "object"}},
+			{Name: "beta", Description: "second", InputSchema: map[string]any{"type": "object", "x": 1.0}},
+		},
+	}
+	if err := SaveMCPCache("svr", want); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if want.CachedAt == "" {
+		t.Errorf("SaveMCPCache should populate CachedAt; got empty")
+	}
+	got, err := LoadMCPCache("svr")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("load returned nil after save")
+	}
+	if got.Fingerprint != want.Fingerprint {
+		t.Errorf("fingerprint round-trip: got %q want %q", got.Fingerprint, want.Fingerprint)
+	}
+	if len(got.Tools) != len(want.Tools) {
+		t.Fatalf("tools count: got %d want %d", len(got.Tools), len(want.Tools))
+	}
+	for i, w := range want.Tools {
+		if got.Tools[i].Name != w.Name {
+			t.Errorf("tool[%d].Name: got %q want %q", i, got.Tools[i].Name, w.Name)
+		}
+		// JSON round-trip turns numbers into float64; compare via
+		// marshal/unmarshal to dodge int/float drift.
+		wj, _ := json.Marshal(w.InputSchema)
+		gj, _ := json.Marshal(got.Tools[i].InputSchema)
+		if string(wj) != string(gj) {
+			t.Errorf("tool[%d].InputSchema: got %s want %s", i, gj, wj)
+		}
+	}
+}
+
+// TestSaveMCPCache_FilePerms — cache files contain command lines and
+// tool params that may reveal sensitive paths. Match SaveMCP's
+// stance: 0o600.
+func TestSaveMCPCache_FilePerms(t *testing.T) {
+	setMetisHome(t)
+	if err := SaveMCPCache("perm", &MCPCache{Fingerprint: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(MCPCachePath("perm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o600 {
+		t.Errorf("cache perms: got %#o want 0o600", mode)
+	}
+}
+
+// TestCachedToolsToMCPTools_RoundTrip — the converters are how the
+// cache shape and the live mcp.Tool shape stay in sync. A regression
+// here would manifest as "model can't see schemas it just fetched"
+// or "cache fingerprint mismatch on every save" — easier to catch
+// here than at integration time.
+func TestCachedToolsToMCPTools_RoundTrip(t *testing.T) {
+	original := []mcp.Tool{
+		{Name: "a", Description: "d1", InputSchema: map[string]any{"t": "object"}},
+		{Name: "b", Description: "d2", InputSchema: map[string]any{"t": "object", "n": 2.0}},
+	}
+	cached := MCPToolsToCached(original)
+	back := CachedToolsToMCPTools(cached)
+	if len(back) != len(original) {
+		t.Fatalf("len: got %d want %d", len(back), len(original))
+	}
+	for i := range original {
+		if back[i].Name != original[i].Name {
+			t.Errorf("Name[%d]", i)
+		}
+		oj, _ := json.Marshal(original[i].InputSchema)
+		bj, _ := json.Marshal(back[i].InputSchema)
+		if string(oj) != string(bj) {
+			t.Errorf("InputSchema[%d]: got %s want %s", i, bj, oj)
+		}
+	}
+}
+
+// TestParseLazyMCPMode — the env-var matrix. Locks the documented
+// aliases ("true"/"yes"/"1") so a refactor of ParseLazyMCPMode can't
+// silently change which strings switch to "always".
+func TestParseLazyMCPMode(t *testing.T) {
+	cases := []struct {
+		in   string
+		want LazyMCPMode
+	}{
+		{"", LazyMCPModeAuto},
+		{"auto", LazyMCPModeAuto},
+		{"AUTO", LazyMCPModeAuto},
+		{" auto ", LazyMCPModeAuto},
+		{"unknown", LazyMCPModeAuto},
+		{"always", LazyMCPModeAlways},
+		{"ALWAYS", LazyMCPModeAlways},
+		{"true", LazyMCPModeAlways},
+		{"yes", LazyMCPModeAlways},
+		{"1", LazyMCPModeAlways},
+		{"never", LazyMCPModeNever},
+		{"false", LazyMCPModeNever},
+		{"no", LazyMCPModeNever},
+		{"0", LazyMCPModeNever},
+		{"off", LazyMCPModeNever},
+	}
+	for _, c := range cases {
+		if got := ParseLazyMCPMode(c.in); got != c.want {
+			t.Errorf("ParseLazyMCPMode(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}

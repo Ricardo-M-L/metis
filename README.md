@@ -286,6 +286,19 @@ max_iterations = 50
 # Examples:
 #   ENABLE_TOOL_SEARCH=auto:5  metis chat   # opt into auto + 5% threshold
 #   ENABLE_TOOL_SEARCH=false   metis chat   # always full schemas (debug)
+#
+# MCP server process startup is ALSO lazy by default (P7,
+# kimi-cli `defer_mcp_tool_loading` parity). Cached schemas live in
+# ~/.metis/mcp-cache/<server>.json so the subprocess only spawns when
+# the model invokes a tool. Controlled by METIS_LAZY_MCP env var:
+#
+#   (unset) / auto → use cache when fingerprint matches; spawn-and-cache on miss
+#   always         → never spawn at startup, even without cache (most aggressive)
+#   never          → eager spawn for every entry (legacy behavior)
+#
+# The cache fingerprint covers (command, args, url, headers) so any
+# edit to mcp.toml that changes the launch identity auto-invalidates
+# the cache. Run `rm -rf ~/.metis/mcp-cache` to flush everything.
 
 [tools.bash]
 timeout_seconds = 120

@@ -37,6 +37,17 @@ import (
 // Auto without a known ContextWindow falls back to "standard" rather
 // than guessing — better to send slightly more schema than to make
 // the wrong stripping decision and break a tool call.
+
+// ToolSpecsSnapshot returns the exact []ToolSpec that would be sent on
+// the next turn, given current LazyMode + discovered-tools state.
+// Exposed for the TUI's /context surface (render_info.go::renderContext)
+// so the "Loaded / Available" MCP split reflects the actual prompt
+// rather than re-implementing the strip logic. Pure read — no state
+// mutation; safe to call from any goroutine.
+func (l *Loop) ToolSpecsSnapshot() []llm.ToolSpec {
+	return l.toolSpecs()
+}
+
 func (l *Loop) toolSpecs() []llm.ToolSpec {
 	all := l.Registry.SortedForCache()
 	out := make([]llm.ToolSpec, 0, len(all))

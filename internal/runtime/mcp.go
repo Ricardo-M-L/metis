@@ -19,10 +19,12 @@ import (
 	goruntime "runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
@@ -393,6 +395,211 @@ func LaunchAllMCP(ctx context.Context, reg *MCPRegistry, registry *tools.Registr
 		ok = append(ok, srv)
 	}
 	return ok, errs
+}
+
+// LaunchAllMCPLazy is the kimi-cli-style lazy variant of LaunchAllMCP.
+// Mode selection (default auto):
+//
+//	auto   — for each enabled entry: if ~/.metis/mcp-cache/<name>.json
+//	         exists AND its fingerprint matches the current entry,
+//	         register stub tools from cache and DO NOT spawn. Otherwise
+//	         spawn eagerly (so subsequent runs benefit from the cache).
+//	always — register from cache when available; if no cache, still
+//	         defer (no spawn) — first tool call triggers spawn-and-cache.
+//	         Most aggressive; new servers stay unspawned until used.
+//	never  — eager spawn for every entry, ignore the cache. Equivalent
+//	         to legacy LaunchAllMCP. Use to debug cache-driven issues.
+//
+// Result shape matches LaunchAllMCP: ok []*Server is everything
+// registered (whether spawned or deferred); errs []error collects the
+// per-server failures so setupRuntime can warn-but-keep-going.
+func LaunchAllMCPLazy(ctx context.Context, reg *MCPRegistry, registry *tools.Registry, mode LazyMCPMode) ([]*mcptools.Server, []error) {
+	if reg == nil {
+		return nil, nil
+	}
+	if mode == LazyMCPModeNever {
+		return LaunchAllMCP(ctx, reg, registry)
+	}
+	var ok []*mcptools.Server
+	var errs []error
+	for _, entry := range reg.Servers {
+		if entry.Disabled {
+			continue
+		}
+		if entry.Command == "" && entry.URL == "" {
+			continue
+		}
+		srv, err := launchOneMCPLazy(ctx, entry, registry, mode)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if srv != nil {
+			ok = append(ok, srv)
+		}
+	}
+	return ok, errs
+}
+
+// launchOneMCPLazy is the per-entry dispatch path used by
+// LaunchAllMCPLazy. Loads the cache, decides between deferred /
+// eager spawn, registers tools, returns the resulting Server.
+func launchOneMCPLazy(ctx context.Context, entry MCPServerEntry, registry *tools.Registry, mode LazyMCPMode) (*mcptools.Server, error) {
+	// Step 1: env-var expansion happens up-front so the fingerprint
+	// reflects the actual launch identity (the same way an eager
+	// LaunchMCPServer would see it).
+	expanded, missing := expandEnvVarsInEntry(entry)
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("mcp: server %q references unset env vars: %s "+
+			"(use ${VAR:-default} for an inline fallback)",
+			entry.Name, strings.Join(missing, ", "))
+	}
+
+	wantFP := FingerprintEntry(expanded)
+	cache, _ := LoadMCPCache(entry.Name) // LoadMCPCache returns (nil, nil) on missing — fine
+
+	// Cache hit? Register stub tools + defer spawn.
+	if cache != nil && cache.Fingerprint == wantFP && len(cache.Tools) > 0 {
+		srv := buildLazyServer(expanded, entry, cache.Tools)
+		for _, t := range srv.FilteredTools(entry.EnabledTools, entry.DisabledTools) {
+			registry.Register(t)
+		}
+		return srv, nil
+	}
+
+	// Cache miss / fingerprint stale / empty cache.
+	if mode == LazyMCPModeAlways {
+		// Caller explicitly opted into "never spawn at startup, even
+		// without cache". Register a server with NO tools — the model
+		// can't invoke anything until the cache exists, but the entry
+		// is recognized so /mcp surface lists it. The first manual
+		// `/mcp reload` (or the next session's startup) will repair.
+		srv := buildLazyServer(expanded, entry, nil)
+		// No tools to register here — registry stays empty for this
+		// server. Surface a warning to the caller.
+		return srv, fmt.Errorf("mcp: server %q has no cache and METIS_LAZY_MCP=always — "+
+			"run `/mcp reload %s` after first use to populate the cache",
+			entry.Name, entry.Name)
+	}
+
+	// Auto mode + cache miss → spawn eagerly so we have something to
+	// register THIS session, AND seed the cache for next time. This is
+	// the "first-run" cost: identical to legacy LaunchAllMCP for new
+	// servers, but cheaper for every subsequent run.
+	srv, err := LaunchMCPServer(ctx, &MCPRegistry{Servers: []MCPServerEntry{entry}}, entry.Name, registry)
+	if err != nil {
+		return nil, err
+	}
+	// Persist the freshly-handshaked tool list for next time.
+	saveCacheFromServer(srv, expanded)
+	return srv, nil
+}
+
+// buildLazyServer composes the deferred-spawn closure that
+// mcptools.NewLazyServer needs. The closure captures the entry's
+// already-expanded fields plus the transport pick (HTTP vs stdio) so
+// the first Execute fires the same code path an eager launch would
+// have used at startup.
+func buildLazyServer(expanded, original MCPServerEntry, cachedTools []CachedTool) *mcptools.Server {
+	spawn := func(ctx context.Context) (*mcp.Client, error) {
+		switch {
+		case expanded.URL != "":
+			return mcp.NewHTTPClient(ctx, expanded.URL, expanded.Headers)
+		case expanded.Command != "":
+			return mcp.NewStdioClient(ctx, expanded.Command, expanded.Args...)
+		default:
+			return nil, fmt.Errorf("mcp: server %q has neither command nor url", expanded.Name)
+		}
+	}
+	tools := CachedToolsToMCPTools(cachedTools)
+	srv := mcptools.NewLazyServer(expanded.Name, tools, func(ctx context.Context) (*mcp.Client, error) {
+		client, err := spawn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// Refresh the cache opportunistically — the model just paid
+		// the spawn round-trip; we may as well capture any tool-list
+		// drift so the next run's cache is current.
+		go func() {
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			freshTools, err := client.ListTools(refreshCtx)
+			if err != nil {
+				return // best-effort; old cache is still better than no cache
+			}
+			cache := &MCPCache{
+				Fingerprint: FingerprintEntry(expanded),
+				Tools:       MCPToolsToCached(freshTools),
+			}
+			_ = SaveMCPCache(original.Name, cache)
+		}()
+		return client, nil
+	})
+	return srv
+}
+
+// saveCacheFromServer reads the just-spawned server's already-listed
+// tools and writes them to disk. Called by the cache-miss path in
+// launchOneMCPLazy so the next session can skip the spawn round-trip.
+//
+// Tools come from Server.Tools() which returns the per-tool wrappers;
+// we have to walk back to (name, description, schema) for the cache
+// shape. We use the truncated description that's already been applied
+// during wrapClient — that's intentional, because the eager-launch
+// path uses truncated descriptions in its prompts too, so the cache
+// matches what the eager path would produce.
+func saveCacheFromServer(srv *mcptools.Server, expanded MCPServerEntry) {
+	if srv == nil {
+		return
+	}
+	var cached []CachedTool
+	for _, t := range srv.Tools() {
+		name, desc, schema := splitToolMeta(t)
+		// Walk back the "mcp__<server>__" prefix that MCPTool.Name()
+		// adds, so the cache stores the raw upstream tool name. The
+		// "[MCP] " prefix is added by Description() at serve time,
+		// not stored — drop it back out for consistency with how the
+		// eager-spawn path lists tools.
+		raw := stripMCPNamePrefix(name, expanded.Name)
+		rawDesc := strings.TrimPrefix(desc, "[MCP] ")
+		cached = append(cached, CachedTool{
+			Name:        raw,
+			Description: rawDesc,
+			InputSchema: schema,
+		})
+	}
+	c := &MCPCache{
+		Fingerprint: FingerprintEntry(expanded),
+		Tools:       cached,
+	}
+	_ = SaveMCPCache(expanded.Name, c)
+}
+
+// splitToolMeta extracts a registered Tool's (name, description,
+// schema) without reaching into the unexported mcptools.MCPTool
+// fields. The Tool interface already exposes these three accessors;
+// we just call them.
+func splitToolMeta(t toolsTool) (string, string, map[string]any) {
+	return t.Name(), t.Description(), t.InputSchema()
+}
+
+// toolsTool is the local alias for tools.Tool's read-only subset used
+// by the cache-snapshot path. Kept un-imported so this file doesn't
+// rely on the tools package's full Tool surface (Concurrency, CanUse,
+// Execute) when it only needs the trio of metadata accessors.
+type toolsTool interface {
+	Name() string
+	Description() string
+	InputSchema() map[string]any
+}
+
+// stripMCPNamePrefix returns the raw tool name without the
+// "mcp__<server>__" wrapper that MCPTool.Name() adds. Pulled out so
+// the cache-snapshot path doesn't need to know the exact concatenation
+// rule.
+func stripMCPNamePrefix(full, serverName string) string {
+	prefix := "mcp__" + serverName + "__"
+	return strings.TrimPrefix(full, prefix)
 }
 
 // MergeWithConfig folds entries declared in config.toml's [[mcp.servers]]
