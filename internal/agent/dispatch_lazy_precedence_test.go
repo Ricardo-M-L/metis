@@ -100,11 +100,11 @@ func TestDispatchToolSpecs_EnvTrueIgnoresUnknownWindow(t *testing.T) {
 	}
 }
 
-// TestDispatchToolSpecs_AutoFiresOnSmallWindow — the new default:
-// ENABLE_TOOL_SEARCH unset → auto-10%. Fat MCP schema on 16k window
-// (>10% of budget) trips the strip.
+// TestDispatchToolSpecs_AutoFiresOnSmallWindow — auto-10% (opt-in via
+// explicit "auto" — empty default is now "always" since 2026-05-11).
+// Fat MCP schema on 16k window (>10% of budget) trips the strip.
 func TestDispatchToolSpecs_AutoFiresOnSmallWindow(t *testing.T) {
-	t.Setenv("ENABLE_TOOL_SEARCH", "")
+	t.Setenv("ENABLE_TOOL_SEARCH", "auto")
 	reg := tools.NewRegistry()
 	// 4500-byte schema padding ≈ 1800 est tokens → > 10% of 16k = 1.6k.
 	reg.Register(&fatTool{name: "mcp__playwright", schemaPad: 4500})
@@ -116,9 +116,9 @@ func TestDispatchToolSpecs_AutoFiresOnSmallWindow(t *testing.T) {
 
 // TestDispatchToolSpecs_AutoSkipsOnBigWindow — same MCP load on a
 // 200k-window model is well under 10%. Pins the "scales with the
-// model" promise of auto mode.
+// model" promise of auto mode (opted into via explicit "auto").
 func TestDispatchToolSpecs_AutoSkipsOnBigWindow(t *testing.T) {
-	t.Setenv("ENABLE_TOOL_SEARCH", "")
+	t.Setenv("ENABLE_TOOL_SEARCH", "auto")
 	reg := tools.NewRegistry()
 	reg.Register(&fatTool{name: "mcp__playwright", schemaPad: 4500})
 	l := &Loop{Registry: reg, ContextWindow: 200_000}
@@ -191,7 +191,7 @@ func TestDispatchToolSpecs_Auto100EqualsFalse(t *testing.T) {
 // "no rewrite" over "guess" because a wrong strip breaks tool calls
 // while a missed strip just costs tokens. Pin that contract.
 func TestDispatchToolSpecs_AutoUnknownWindowIsConservative(t *testing.T) {
-	t.Setenv("ENABLE_TOOL_SEARCH", "")
+	t.Setenv("ENABLE_TOOL_SEARCH", "auto")
 	reg := tools.NewRegistry()
 	reg.Register(&fatTool{name: "mcp__a", schemaPad: 50_000})
 	l := &Loop{Registry: reg, ContextWindow: 0}

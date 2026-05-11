@@ -165,6 +165,19 @@ type Loop struct {
 	// last turn invalidated the cache because <field> changed".
 	// Allocated lazily — nil disables tracking gracefully.
 	CacheStats *CacheStatsRing
+
+	// discoveredMCP — names of MCP tools whose schemas the model has
+	// already fetched via ToolSearch in this session. While lazy mode
+	// is on we usually strip mcp__* schemas, but for tools in this set
+	// we leave the schema intact: the model already burned the round-
+	// trip on it, and re-stripping after compaction would force a
+	// second round-trip (cf. openclaude src/utils/toolSearch.ts:545,
+	// which scans message history for `tool_reference` blocks for the
+	// same reason). Rebuilt lazily from message history on first read
+	// via ensureDiscoveredHydrated — survives compaction so long as
+	// the prior ToolSearch tool_result is still in l.Messages.
+	discoveredMCP         map[string]bool
+	discoveredMCPHydrated bool
 }
 
 func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegistry, system string, maxIter int) *Loop {

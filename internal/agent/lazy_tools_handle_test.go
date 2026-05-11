@@ -50,8 +50,10 @@ func newLoopWithTool(t *testing.T, name string, schema map[string]any) *Loop {
 	return &Loop{Registry: reg}
 }
 
-// TestHandleToolSearch_ReturnsSchemaForKnownTool — the happy path:
-// model asks for `mcp__foo__bar`, we return its full schema.
+// TestHandleToolSearch_ReturnsSchemaForKnownTool — happy path via the
+// legacy `{name}` form, which is internally aliased to `select:name`.
+// Asserts the new {matches:[...]} envelope, with one entry containing
+// the tool's full schema.
 func TestHandleToolSearch_ReturnsSchemaForKnownTool(t *testing.T) {
 	wantSchema := map[string]any{
 		"type": "object",
@@ -80,11 +82,19 @@ func TestHandleToolSearch_ReturnsSchemaForKnownTool(t *testing.T) {
 	if err := json.Unmarshal([]byte(got.ToolResult), &parsed); err != nil {
 		t.Fatalf("result not valid JSON: %v\nbody: %s", err, got.ToolResult)
 	}
-	if parsed["name"] != "mcp__foo__bar" {
-		t.Errorf("name field wrong: %v", parsed["name"])
+	matches, ok := parsed["matches"].([]any)
+	if !ok {
+		t.Fatalf("expected matches array; got %T (%+v)", parsed["matches"], parsed)
 	}
-	if _, ok := parsed["input_schema"].(map[string]any); !ok {
-		t.Errorf("input_schema should be an object; got %T", parsed["input_schema"])
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly 1 match for single-tool select; got %d", len(matches))
+	}
+	first, _ := matches[0].(map[string]any)
+	if first["name"] != "mcp__foo__bar" {
+		t.Errorf("name field wrong: %v", first["name"])
+	}
+	if _, ok := first["input_schema"].(map[string]any); !ok {
+		t.Errorf("input_schema should be an object; got %T", first["input_schema"])
 	}
 }
 

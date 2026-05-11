@@ -56,10 +56,19 @@ func TestStripAndAppendToolSearch_StripsMCPSchemas(t *testing.T) {
 	if out[5].Name != "ToolSearch" {
 		t.Errorf("expected ToolSearch as last entry; got %q", out[5].Name)
 	}
-	for _, s := range specs {
-		if !strings.Contains(out[5].Description, s.Name) {
-			t.Errorf("ToolSearch description missing tool name %q", s.Name)
-		}
+	// Post-refactor (P2): the description should NOT dump per-tool
+	// names — deferred names appear in the stripped tool entries
+	// themselves. The description carries query syntax help only.
+	if strings.Contains(out[5].Description, "mcp__fs__read") {
+		t.Errorf("ToolSearch description should not list tool names verbatim (P2 trim); got: %s", out[5].Description)
+	}
+	if !strings.Contains(out[5].Description, "select:") {
+		t.Errorf("ToolSearch description should explain the select: syntax; got: %s", out[5].Description)
+	}
+	// Deferred count must appear so the model knows how many tools are
+	// behind the search.
+	if !strings.Contains(out[5].Description, "3") {
+		t.Errorf("ToolSearch description should mention the deferred count (3); got: %s", out[5].Description)
 	}
 }
 
@@ -200,8 +209,10 @@ func TestParseEnableToolSearch(t *testing.T) {
 		wantMode LazyMode
 		wantPct  int
 	}{
-		// default + explicit auto
-		{"", LazyModeAuto, 10},
+		// default → always (claude-code "tst" parity). Empty env var
+		// triggers the always-defer path; explicit "auto" opts into
+		// the budget-based behavior.
+		{"", LazyModeAlways, 0},
 		{"auto", LazyModeAuto, 10},
 		{"AUTO", LazyModeAuto, 10}, // case-insensitive
 		{" auto ", LazyModeAuto, 10},

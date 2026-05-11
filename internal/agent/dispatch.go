@@ -46,16 +46,22 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 		})
 	}
 	mode, pct := parseEnableToolSearch(os.Getenv("ENABLE_TOOL_SEARCH"))
+	// preserve = MCP tools whose schemas the model has already fetched
+	// in this session (P6, cross-compaction stability). Those keep
+	// their schemas even when we're stripping the rest, so a post-
+	// compaction turn doesn't force a redundant ToolSearch call for a
+	// tool the model already used.
+	preserve := l.snapshotDiscoveredMCP()
 	switch mode {
 	case LazyModeStandard:
 		return out
 	case LazyModeAlways:
-		return stripAndAppendToolSearch(out)
+		return stripAndAppendToolSearchWithPreserve(out, preserve)
 	case LazyModeAuto:
 		if l.ContextWindow <= 0 {
 			return out
 		}
-		return applyLazySchemaByTokens(out, l.ContextWindow, pct)
+		return applyLazySchemaByTokensWithPreserve(out, l.ContextWindow, pct, preserve)
 	}
 	return out
 }

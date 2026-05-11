@@ -261,19 +261,30 @@ max_iterations = 50
 
 [tools]
 # ToolSearch lazy MCP schema is controlled by the ENABLE_TOOL_SEARCH
-# env var (matches openclaude's `tst-auto`):
+# env var. Defaults match claude-code's `tst` (always-defer); set
+# explicit "auto" to opt into openclaude's `tst-auto` budget mode.
 #
-#   (unset)     → auto, fires when MCP schemas exceed 10% of context window
-#   auto        → same as unset
+#   (unset)     → always strip mcp__* schemas (default since 2026-05-11)
+#   true        → same as unset
+#   auto        → fires when MCP schemas exceed 10% of context window
 #   auto:N      → auto, fires at N% (1..99)
 #   auto:0      → always lazy (alias for "true")
 #   auto:100    → never lazy (alias for "false")
-#   true        → always strip mcp__* schemas
-#   false       → never strip
+#   false       → never strip (debug — sends full schemas every turn)
+#
+# Once stripped, the model calls the synthetic ToolSearch meta-tool
+# to fetch a schema on demand. ToolSearch accepts:
+#   {"query": "select:n1,n2"} — exact multi-fetch (returns schemas)
+#   {"query": "screenshot"}   — keyword search (returns names+descs)
+#   {"query": "+slack send"}  — required term (+) + ranking terms
+#
+# Schemas previously fetched in this session are remembered and kept
+# intact across compaction so the model doesn't re-pay the lookup
+# round-trip — cross-compaction stability mirrors openclaude's
+# tool_reference scanning. See internal/agent/lazy_tools_discovered.go.
 #
 # Examples:
-#   ENABLE_TOOL_SEARCH=auto:5  metis chat   # fire 2× sooner than default
-#   ENABLE_TOOL_SEARCH=true    metis chat   # always strip (smallest prompt)
+#   ENABLE_TOOL_SEARCH=auto:5  metis chat   # opt into auto + 5% threshold
 #   ENABLE_TOOL_SEARCH=false   metis chat   # always full schemas (debug)
 
 [tools.bash]
