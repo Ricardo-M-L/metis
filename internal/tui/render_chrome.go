@@ -430,32 +430,53 @@ func formatTokensRaw(n int) string {
 func modeIcon(mode string) (glyph string, c color.Color) {
 	switch mode {
 	case "acceptEdits":
-		return "▶▶", lipgloss.Color("#64b5f6") // matches claude-code's ⏵⏵ autoAccept color family
+		return "⏵⏵", lipgloss.Color("#64b5f6") // claude-code's autoAccept (PermissionMode.ts:62)
 	case "bypass":
-		return "⏩", lipgloss.Color("#ffb74d")
+		// claude-code's bypassPermissions uses ⏵⏵ in the `error` color
+		// family (PermissionMode.ts:69) — same glyph as acceptEdits but
+		// red to telegraph "this one is dangerous". Matches the source
+		// exactly now that we removed the old ⏩ stand-in.
+		return "⏵⏵", lipgloss.Color("#e57373")
 	case "plan":
 		return "⏸ ", lipgloss.Color("#81c784")
 	case "deny":
 		return "⏹ ", lipgloss.Color("#e57373")
 	case "ask":
-		return "▶ ", lipgloss.Color("#a0a0a0")
+		// Match claude-code's `default` mode (PermissionMode.ts:48):
+		// symbol = '' (empty). The most conservative mode renders
+		// without a badge so its presence doesn't visually compete with
+		// the more permissive modes the user explicitly cycled into.
+		return "", lipgloss.Color("#a0a0a0")
 	}
-	return "▶ ", lipgloss.Color("#a0a0a0")
+	return "", lipgloss.Color("#a0a0a0")
 }
 
 // renderHints draws the bottom-of-screen mode indicator.
+//
+// For `ask` mode (default) we omit the bold "ask mode" badge entirely
+// and show only a dim "shift+tab to cycle" hint — matches claude-code's
+// PermissionMode.ts:45-51 where `default` carries an empty symbol so
+// the most conservative state renders without visual emphasis.
+// Other modes keep the badge: the user explicitly cycled into them, so
+// telegraphing "you're not in default anymore" is the right call.
 func renderHints(m *Model) string {
 	if m.permActive {
 		return ""
 	}
 	mode := string(m.gate.Mode())
 	glyph, col := modeIcon(mode)
-	modeStyle := lipgloss.NewStyle().Foreground(col).Bold(true)
 
 	var s strings.Builder
 	s.WriteString("  ")
-	s.WriteString(modeStyle.Render(glyph + " " + mode + " mode"))
-	s.WriteString(styleMuted.Render(" on (shift+tab to cycle)"))
+	if glyph == "" {
+		// `ask` mode — quiet. Just the discovery hint so the user
+		// knows Shift+Tab is available, no badge.
+		s.WriteString(styleMuted.Render("shift+tab to cycle modes"))
+	} else {
+		modeStyle := lipgloss.NewStyle().Foreground(col).Bold(true)
+		s.WriteString(modeStyle.Render(glyph + " " + mode + " mode"))
+		s.WriteString(styleMuted.Render(" on (shift+tab to cycle)"))
+	}
 	if m.showPalette {
 		s.WriteString(styleMuted.Render(" · ↑↓/Tab to navigate · Esc to close"))
 	}
