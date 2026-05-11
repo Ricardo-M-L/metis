@@ -320,6 +320,14 @@ type cliFlags struct {
 	agentTeams  bool   // --agent-teams: alias for /batch entry path
 	tmuxOn      bool   // --tmux: when starting a worktree, wrap the session in tmux
 
+	// --cache / --cache-ttl: enable the on-disk response cache for
+	// `metis run` (CACHE-D, 2026-05-11). Hits skip the API entirely
+	// when the same (model, provider, system, prompt) tuple was
+	// previously answered without using any tools. Tool-use turns are
+	// never cached (would lie about world state on replay).
+	runCache    bool
+	runCacheTTL string // duration string, e.g. "1h" / "24h" / "off"
+
 	// pickResume is set when the user typed bare `-r` / `--resume` with
 	// no UUID argument — claude-code parity: that gesture means "show
 	// me the recent sessions and let me pick one". setupRuntime opens
@@ -414,6 +422,11 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	// Auto-memory v2 — extractMemories on LoopEnd via forked agent.
 	f.BoolVar(&out.autoMemory, "auto-memory", false,
 		"enable auto-memory extraction on every turn boundary (writes to ~/.metis/memory/<topic>.md)")
+	// CACHE-D: response cache for `metis run` (off by default).
+	f.BoolVar(&out.runCache, "cache", false,
+		"enable on-disk response cache for `metis run` (CI/cron use). Tool-use turns are never cached.")
+	f.StringVar(&out.runCacheTTL, "cache-ttl", "",
+		"response-cache TTL for `metis run` (e.g. 1h, 30m, 24h, or 'off'). Default 1h.")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -964,6 +977,24 @@ func cmdRun(ctx context.Context, args []string) error {
 		return err
 	}
 	defer rt.Cleanup()
+
+	// CACHE-D: response cache lookup BEFORE we touch the API. Hit →
+	// print cached text and return early; saves the full round-trip
+	// (and the dollars). Tool-use turns are never cached so cache
+	// hits are always safe to replay verbatim.
+	var cacheKey string
+	cacheTTL := rtpkg.ParseRunCacheTTL(flags.runCacheTTL)
+	if flags.runCache || os.Getenv("METIS_RUN_CACHE") == "1" {
+		cacheKey = rtpkg.RunCacheKey(rt.model, rt.cfg.Provider.Default, rt.loop.System, prompt)
+		if hit, _ := rtpkg.LookupRunCache(cacheKey); hit != nil {
+			fmt.Print(hit.Response)
+			fmt.Println()
+			fmt.Fprintf(os.Stderr, "[cache] hit — served from ~/.metis/run-cache (%s ago, saved API call)\n",
+				time.Since(hit.CreatedAt).Round(time.Second))
+			return nil
+		}
+	}
+
 	rt.loop.AppendUser(prompt)
 	if rt.store != nil && rt.sessionID != "" {
 		_ = rt.store.AppendMessage(rt.sessionID, llm.Message{
@@ -997,6 +1028,14 @@ func cmdRun(ctx context.Context, args []string) error {
 		accum.Reset()
 	}
 
+	// CACHE-D: accumulate the final assistant text + track whether any
+	// tool was used. Save to cache only when (a) cacheKey is set
+	// (user opted in) AND (b) the turn ran without any tool_use
+	// blocks (tool-using turns observe the world; cached replays
+	// would lie about that observation).
+	var cacheTextBuf strings.Builder
+	usedToolsThisRun := false
+
 	for ev := range events {
 		switch ev.Kind {
 		case agent.EventTextDelta:
@@ -1004,6 +1043,9 @@ func cmdRun(ctx context.Context, args []string) error {
 				flushAccum()
 			}
 			fmt.Print(ev.TextDelta)
+			if cacheKey != "" {
+				cacheTextBuf.WriteString(ev.TextDelta)
+			}
 		case agent.EventThinkingDelta:
 			if streamlined {
 				continue // distillation gold — drop entirely
@@ -1012,6 +1054,7 @@ func cmdRun(ctx context.Context, args []string) error {
 			// run mode either, but explicit no-op here documents the
 			// streamlined contract.)
 		case agent.EventToolStart:
+			usedToolsThisRun = true
 			if streamlined {
 				accum.AccumulateTool(ev.ToolName)
 				continue
@@ -1063,6 +1106,30 @@ func cmdRun(ctx context.Context, args []string) error {
 		}
 	}
 	err = <-done
+
+	// CACHE-D: save the response IFF user opted in AND no tools ran.
+	// Tool-using turns are excluded by design — replaying them from
+	// cache would re-emit observations of a world that may have
+	// changed since. Errors during save go to stderr but don't break
+	// the run (cache is best-effort).
+	if cacheKey != "" && err == nil && !usedToolsThisRun && cacheTextBuf.Len() > 0 {
+		ttlSecs := int(cacheTTL.Seconds())
+		entry := &rtpkg.RunCacheEntry{
+			PromptHash: cacheKey,
+			Model:      rt.model,
+			Prompt:     prompt,
+			Response:   cacheTextBuf.String(),
+			TTLSeconds: ttlSecs,
+			UsedTools:  false,
+		}
+		if saveErr := rtpkg.SaveRunCache(entry); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "[cache] save warning: %v\n", saveErr)
+		}
+	} else if cacheKey != "" && usedToolsThisRun {
+		// Surface why we didn't cache — saves the user from wondering
+		// "I asked for --cache, why no cache file?"
+		fmt.Fprintf(os.Stderr, "[cache] not cached (turn used tools — replay would lie about world state)\n")
+	}
 
 	// Wait for any in-flight auto-memory forks (extractMemories) to
 	// finish before exiting — without this, `metis run` returns the

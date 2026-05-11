@@ -1490,6 +1490,19 @@ func (t *tokenTracker) CacheHitRate() float64 {
 	return float64(t.cacheRead) / float64(denom)
 }
 
+// LastCacheHitRate is the most-recent-turn cache hit fraction.
+// Same formula as CacheHitRate but anchored on lastIn / lastCacheCreate
+// / lastCacheRead. Used by /context to display the current turn's
+// hit rate alongside the session average so the user can see when a
+// big tool_result just busted their cache prefix.
+func (t *tokenTracker) LastCacheHitRate() float64 {
+	denom := t.lastCacheRead + t.lastCacheCreate + t.lastIn
+	if denom == 0 {
+		return 0
+	}
+	return float64(t.lastCacheRead) / float64(denom)
+}
+
 // LastTotal is the most recent API call's input+output combined — the
 // per-turn cost. Spinner row uses this to surface what the just-finished
 // round trip consumed.

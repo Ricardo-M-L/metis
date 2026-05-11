@@ -725,10 +725,101 @@ func renderContext(m *Model) string {
 	// paying for" breakdown. Each block is its own header + tree so
 	// long sessions can scroll to the section they care about.
 	s.WriteString("\n")
+	s.WriteString(renderContextCacheBlock(m))
 	s.WriteString(renderContextMCPBlock(m))
 	s.WriteString(renderContextMemoryBlock(m))
 	s.WriteString(renderContextSkillsBlock(m))
 	return s.String()
+}
+
+// renderContextCacheBlock surfaces prompt-cache effectiveness for the
+// provider's last turn and the session as a whole. The data comes from
+// usage events the provider reports (cache_read_input_tokens /
+// cache_creation_input_tokens) — already tracked by tokenTracker but
+// previously visible only via /cost.
+//
+// The user's actual ask (2026-05-11): "I can't see whether my cache is
+// hitting or not, please surface it in /context." For MiniMax via the
+// /anthropic endpoint, real metis sessions hit 80-94% on stable turns
+// and drop sharply when a fat tool_result (e.g. screenshot PNG) busts
+// the prefix — both states should be visible at a glance.
+//
+// Block omitted entirely when there's been no cache activity (cache
+// totals all zero); avoids a "Cache: 0 tokens" noise row in fresh
+// sessions before the first API call.
+func renderContextCacheBlock(m *Model) string {
+	if m == nil {
+		return ""
+	}
+	lastRead := m.totalTokens.LastCacheRead()
+	lastCreate := m.totalTokens.LastCacheCreate()
+	lastIn := m.totalTokens.LastIn()
+	sessRead := m.totalTokens.CacheRead()
+	sessCreate := m.totalTokens.CacheCreate()
+	sessIn := m.totalTokens.Input()
+	if lastRead == 0 && lastCreate == 0 && sessRead == 0 && sessCreate == 0 {
+		return ""
+	}
+	lastRate := m.totalTokens.LastCacheHitRate()
+	sessRate := m.totalTokens.CacheHitRate()
+
+	var b strings.Builder
+	b.WriteString(styleAccent.Render("Cache · prompt-prefix reuse") + "\n")
+
+	// This-turn row. Hit-rate emoji-free: a colon-delimited triplet
+	// (read / create / fresh) reads cleanly in a transcript that's
+	// also being grepped or copy-pasted out.
+	lastTotal := lastRead + lastCreate + lastIn
+	b.WriteString("  " + styleDim.Render("├ this turn:    ") +
+		fmt.Sprintf("%s read · %s create · %s fresh   %s",
+			fmtThousands(lastRead),
+			fmtThousands(lastCreate),
+			fmtThousands(lastIn),
+			styleDim.Render(fmt.Sprintf("hit %.0f%% of %s", lastRate*100, fmtThousands(lastTotal)))) + "\n")
+
+	// Session-cumulative row. The number that tells the user "is
+	// caching saving me money across this whole conversation?" —
+	// distinct from the per-turn signal which fluctuates with each
+	// tool result.
+	sessTotal := sessRead + sessCreate + sessIn
+	b.WriteString("  " + styleDim.Render("└ session avg:  ") +
+		fmt.Sprintf("%s read · %s create · %s fresh   %s",
+			fmtThousands(sessRead),
+			fmtThousands(sessCreate),
+			fmtThousands(sessIn),
+			styleDim.Render(fmt.Sprintf("hit %.0f%% of %s", sessRate*100, fmtThousands(sessTotal)))) + "\n")
+
+	// Optional cost-savings hint when the provider catalog publishes
+	// a cache_read price. cached tokens cost 10% of fresh (Anthropic
+	// + MiniMax pricing) so the savings ≈ cache_read × 90% × input
+	// price. Skip the line entirely when we don't know the price —
+	// better silent than misleading.
+	if m.loop != nil && m.loop.Provider != nil {
+		savings := cacheSavingsForSession(m, sessRead)
+		if savings > 0 {
+			b.WriteString("  " + styleDim.Render(fmt.Sprintf("  saved ~$%.4f vs. uncached prefix this session", savings)) + "\n")
+		}
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// cacheSavingsForSession estimates the dollar savings the user got
+// from prompt cache this session. Uses the provider catalog price if
+// it knows the current model; returns 0 when pricing is unknown so
+// the renderer can suppress the line rather than show a misleading $0.
+//
+// Formula: cached tokens billed at ~10% of input price; savings is the
+// 90% delta. Matches the heuristic in render_info.go::renderCost.
+func cacheSavingsForSession(m *Model, cacheRead int) float64 {
+	if cacheRead == 0 || m == nil || m.model == "" {
+		return 0
+	}
+	priceIn, _ := guessPriceUSDPerM(m.model)
+	if priceIn <= 0 {
+		return 0
+	}
+	return float64(cacheRead) * priceIn * 0.9 / 1_000_000
 }
 
 // renderContextMCPBlock builds the "MCP tools · /mcp (loaded on-demand)"

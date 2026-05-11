@@ -177,14 +177,29 @@ func AssembleSystemPromptSections(base string, opts AssembleOptions) []SystemPro
 		secs = append(secs, SystemPromptSection{Name: "base", Body: base, Cache: true})
 	}
 	// Provider/extension overlays — OC-A. Inserted between base and
-	// env so they're cached alongside base when their bodies are
-	// stable (provider name doesn't change mid-session).
+	// the static-per-project sections so they're cached alongside base
+	// when their bodies are stable (provider name doesn't change
+	// mid-session).
 	for _, ov := range opts.Overlays {
 		secs = append(secs, ov)
 	}
-	if !opts.SkipEnv {
-		secs = append(secs, SystemPromptSection{Name: "env", Body: buildEnvBlock(), Cache: false, Volatile: true})
-	}
+	// IMPORTANT: ordering policy (2026-05-11, CACHE-C).
+	// All sections whose contents are stable across requests come
+	// FIRST so they share a byte-stable cache prefix:
+	//   base → overlays → project_context → addendum
+	// then volatile env LAST. This matters for both providers:
+	//   - Anthropic: lets the cache_control marker on the last static
+	//     section (addendum or project_context) cache everything up
+	//     to that point.
+	//   - OpenAI / DeepSeek / Kimi / MiniMax-OpenAI-mode: implicit
+	//     prefix matching only credits the longest byte-stable prefix;
+	//     moving env to the front truncates that prefix on every
+	//     date/branch change. With env last, only the env block itself
+	//     is uncacheable, and the entire base + project body still
+	//     hits cache.
+	// Prior layout (base → overlays → env → project_context → addendum)
+	// was wrong: env's volatility nuked everything after it on
+	// implicit-caching providers.
 	if mode != PromptMinimal {
 		if proj := loadProjectContext(); proj != "" {
 			secs = append(secs, SystemPromptSection{Name: "project_context", Body: proj, Cache: false})
@@ -194,6 +209,10 @@ func AssembleSystemPromptSections(base string, opts AssembleOptions) []SystemPro
 		if addendum := loadSystemPromptAddendum(); addendum != "" {
 			secs = append(secs, SystemPromptSection{Name: "addendum", Body: addendum, Cache: true})
 		}
+	}
+	// Env LAST — see comment above.
+	if !opts.SkipEnv {
+		secs = append(secs, SystemPromptSection{Name: "env", Body: buildEnvBlock(), Cache: false, Volatile: true})
 	}
 	return secs
 }

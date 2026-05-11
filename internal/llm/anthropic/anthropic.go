@@ -433,18 +433,41 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 	// tool_result blocks become part of the cached prefix on the
 	// follow-up.
 	if n := len(out.Messages); n > 0 {
-		// Walk backwards to the last "user" message — this skips an
-		// in-flight assistant turn (rare but possible mid-stream).
+		// Walk backwards to find the last TWO user messages so we can
+		// place rolling cache checkpoints: the last user message is
+		// the "leading edge" marker (next turn caches up through this
+		// point); the second-to-last user message is the "trailing
+		// anchor" so a long conversation's earlier history stays in
+		// cache even after a couple of new turns.
+		//
+		// Cache breakpoint budget: tools, system, last-user, prior-user
+		// = exactly 4. Matches Anthropic's hard cap (last 4 markers
+		// retained; older ones silently dropped). claude-code's
+		// services/api/claude.ts:buildCachePoints applies the same
+		// dual-anchor scheme.
+		lastUser, prevUser := -1, -1
 		for i := n - 1; i >= 0; i-- {
 			if out.Messages[i].Role != "user" {
 				continue
 			}
-			cn := len(out.Messages[i].Content)
-			if cn == 0 {
-				break
+			if lastUser < 0 {
+				lastUser = i
+				continue
 			}
-			out.Messages[i].Content[cn-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+			prevUser = i
 			break
+		}
+		if lastUser >= 0 {
+			cn := len(out.Messages[lastUser].Content)
+			if cn > 0 {
+				out.Messages[lastUser].Content[cn-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+			}
+		}
+		if prevUser >= 0 {
+			cn := len(out.Messages[prevUser].Content)
+			if cn > 0 {
+				out.Messages[prevUser].Content[cn-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+			}
 		}
 	}
 	return out
