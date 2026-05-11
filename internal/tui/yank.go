@@ -19,10 +19,13 @@ package tui
 // pipe through `pbcopy` themselves.
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -126,8 +129,10 @@ func writeClipboard(text string) {
 	}
 	enc := base64.StdEncoding.EncodeToString([]byte(text))
 
-	// Build the bare OSC 52. `c` selects the regular clipboard
-	// register (vs primary `p`).
+	// Path 1 — OSC 52 escape sequence. Works in iTerm2, kitty, WezTerm,
+	// Alacritty, and tmux with `set-clipboard on`. Critically does NOT
+	// work in macOS Terminal.app (the user's 2026-05-11 image #3 report:
+	// "command+c 没成功") — that's why we ALSO run path 2.
 	terminator := "\x07"
 	if PreferSTTerminator() {
 		terminator = "\x1b\\"
@@ -139,9 +144,17 @@ func writeClipboard(text string) {
 	// uses, kept in one place.
 	fmt.Fprint(os.Stdout, wrapForMultiplexer(bare))
 
-	// Fallback file: lets the user `cat ~/.metis/clipboard.txt | pbcopy`
-	// when the terminal eats OSC 52. Truncated to 64 KiB so a runaway
-	// paste doesn't fill disk.
+	// Path 2 — Native OS clipboard tool (pbcopy / xclip / wl-copy /
+	// clip.exe). Bypasses OSC 52 entirely so the user's clipboard
+	// gets the payload regardless of terminal capabilities. Best-
+	// effort: missing tool / sandbox / locked clipboard all fall
+	// through silently. Both paths run; whichever one lands first
+	// wins (subsequent identical writes are idempotent).
+	writeClipboardNative(text)
+
+	// Path 3 — Fallback file: lets the user `cat ~/.metis/clipboard.txt
+	// | pbcopy` when both paths above are blocked (rare). Truncated
+	// to 64 KiB so a runaway paste doesn't fill disk.
 	if home := config.Home(); home != "" {
 		path := filepath.Join(home, "clipboard.txt")
 		const maxFallback = 64 * 1024
@@ -151,6 +164,61 @@ func writeClipboard(text string) {
 		}
 		_ = os.WriteFile(path, []byte(body), 0o600)
 	}
+}
+
+// writeClipboardNative shells out to the OS clipboard tool to put
+// text directly into the system clipboard, bypassing the terminal.
+// Mirrors readClipboard's strategy in clipboard.go but in the
+// write direction.
+//
+// Per-OS:
+//   - macOS:   pbcopy (always present)
+//   - Linux:   wl-copy (Wayland) → xclip → xsel
+//   - Windows: clip.exe
+//
+// Each invocation is capped at 1.5s so a hung clipboard daemon
+// can't block the chat surface. nil tools just return; the OSC 52
+// + fallback file paths still ran.
+func writeClipboardNative(text string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	switch runtime.GOOS {
+	case "darwin":
+		runClipWrite(ctx, text, "pbcopy")
+	case "linux":
+		// Try Wayland first (newer distros), then X11 fallbacks.
+		if runClipWrite(ctx, text, "wl-copy") {
+			return
+		}
+		if runClipWrite(ctx, text, "xclip", "-selection", "clipboard") {
+			return
+		}
+		runClipWrite(ctx, text, "xsel", "--clipboard", "--input")
+	case "windows":
+		runClipWrite(ctx, text, "clip.exe")
+	}
+}
+
+// runClipWrite spawns `name args...` and pipes text into stdin.
+// Returns true when the tool was found and the write succeeded —
+// caller uses the return only to decide whether to try a fallback.
+// Missing tool / spawn error / non-zero exit all return false
+// without surfacing the error (best-effort path).
+func runClipWrite(ctx context.Context, text, name string, args ...string) bool {
+	if _, err := exec.LookPath(name); err != nil {
+		return false
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return false
+	}
+	if err := cmd.Start(); err != nil {
+		return false
+	}
+	_, _ = stdin.Write([]byte(text))
+	_ = stdin.Close()
+	return cmd.Wait() == nil
 }
 
 // osc52Status returns a single-word hint about whether the OSC 52
