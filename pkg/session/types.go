@@ -31,6 +31,21 @@ type Header struct {
 	// one-way (child → parent) by design — discovering branches of a parent
 	// session means scanning all sessions, which is fine at metis's scale.
 	ForkedFrom *ForkRef `json:"forked_from,omitempty"`
+
+	// SubAgentOf — non-empty when this JSONL is a sub-agent's transcript
+	// rather than a top-level chat session (G.4, 2026-05-12). Holds the
+	// parent agent's session ID so `metis sessions list` can group
+	// sub-agents under their spawner. Empty for ordinary sessions.
+	// Distinct from ForkedFrom which is for /branch (full history copy);
+	// SubAgentOf is for live sub-agent persistence so `/agents resume`
+	// can rebuild a paused sub-agent.
+	SubAgentOf string `json:"sub_agent_of,omitempty"`
+
+	// TeammateName — when this transcript was a named teammate, the
+	// name passed to Agent({name: "..."}). Empty for anonymous spawns.
+	// Used by `/agents resume` UI to show "resume alice?" instead of
+	// raw agent_id, and by SubAgentList to label history entries.
+	TeammateName string `json:"teammate_name,omitempty"`
 }
 
 // ForkRef points back at the parent session of a /branch'd session.

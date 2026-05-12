@@ -111,6 +111,17 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	if opts.Jobs != nil {
 		agentTool = agentTool.WithJobsPool(opts.Jobs)
 	}
+	// G.4 (2026-05-12) — wire on-disk transcript persistence so
+	// sub-agents can be resumed via `/agents resume <id>` or the
+	// `resume_from` schema field. CurrentSessionID() is set by
+	// setupRuntime before this builder runs in the chat REPL path;
+	// `metis tools` listing leaves it empty, which falls back to the
+	// in-memory-only path (resume_from will refuse with a clear error).
+	if opts.Cfg != nil && opts.Cfg.Session.Dir != "" {
+		if parentID := CurrentSessionID(); parentID != "" {
+			agentTool = agentTool.WithSessionPersistence(opts.Cfg.Session.Dir, parentID)
+		}
+	}
 	reg.Register(agentTool)
 	// SubAgent reader tools (G.1, 2026-05-12) — SubAgentList /
 	// SubAgentOutput / SubAgentStop. Mirrors AttachJobsRegistry for

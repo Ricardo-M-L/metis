@@ -151,6 +151,12 @@ func mergeHeader(dst *Header, src *Header) {
 	if len(src.AlwaysAllow) > 0 {
 		dst.AlwaysAllow = src.AlwaysAllow
 	}
+	if src.SubAgentOf != "" {
+		dst.SubAgentOf = src.SubAgentOf
+	}
+	if src.TeammateName != "" {
+		dst.TeammateName = src.TeammateName
+	}
 }
 
 // ListEntry re-export — same alias pattern.

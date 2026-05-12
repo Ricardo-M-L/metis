@@ -100,6 +100,15 @@ type Agent struct {
 	system         string
 	minimalSystem  string // optional; preferred for sub-agent loops to save tokens
 	defaultTimeout time.Duration
+	// sessionDir is the on-disk directory where sub-agent transcripts
+	// are persisted for `/agents resume` + the `resume_from` schema
+	// field (G.4, 2026-05-12). Empty = persistence disabled — used by
+	// tests and the `metis tools` informational listing path.
+	sessionDir string
+	// parentSessionID stamps the SubAgentOf field on each sub-agent
+	// transcript header so `metis sessions list` can group sub-agents
+	// under their spawner. Empty = stand-alone.
+	parentSessionID string
 }
 
 // NewAgent constructs the Agent tool. Caller wires it into the registry
@@ -152,6 +161,20 @@ func (a Agent) WithJobsPool(p *jobs.Registry) Agent {
 	return a
 }
 
+// WithSessionPersistence wires the on-disk transcript directory +
+// parent session id used by sub-agent resume (G.4). Sub-agents
+// without persistence (empty sessionDir) run in-memory only; the
+// `resume_from` schema field returns an IsError on those.
+//
+// The runtime sets these automatically in BuildToolRegistry from
+// cfg.Session.Dir and the live session ID; tests pass "" for both
+// to keep their isolation against the user's real ~/.metis/.
+func (a Agent) WithSessionPersistence(sessionDir, parentID string) Agent {
+	a.sessionDir = sessionDir
+	a.parentSessionID = parentID
+	return a
+}
+
 func (Agent) Name() string { return "Agent" }
 func (Agent) Description() string {
 	return "Run a sub-agent on a focused task. Returns the sub-agent's final text. Sub-agent shares the same tools and permissions but runs in an isolated message history."
@@ -189,6 +212,10 @@ func (Agent) InputSchema() map[string]any {
 			"name": map[string]any{
 				"type":        "string",
 				"description": "Optional name to register this sub-agent in the team roster as. Named teammates show up in /agents list and can be addressed by MessageTeammate({to: name, body: ...}) from other sub-agents. Must start with a letter; only [a-zA-Z0-9._-] allowed; max 32 chars. Two teammates with the same name cannot co-exist.",
+			},
+			"resume_from": map[string]any{
+				"type":        "string",
+				"description": "Resume a previously-paused sub-agent by its agent_id (e.g. \"agt-d3a91b07\"). The on-disk transcript is replayed and a fresh sub-loop continues from the last turn. The `prompt` field is used as a follow-up turn appended to the recovered history. Use with care: a sub-agent that's still alive somewhere else WILL cause undefined behavior — resume only after the original sub-agent's run has fully ended (SubAgentList shows it gone, or you killed it via SubAgentStop).",
 			},
 		},
 	}
@@ -254,6 +281,30 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 
+	// G.4 (2026-05-12) — `resume_from` field for sub-agent resume.
+	// Load the on-disk snapshot now so we can fail fast (file not
+	// found / corrupted) before consuming a Roster slot. The loaded
+	// snapshot's AgentID becomes the new teammate's AgentID so the
+	// transcript file is appended to, not overwritten.
+	resumeFrom, _ := in["resume_from"].(string)
+	var resumedSnapshot *agent.SubAgentSnapshot
+	if resumeFrom != "" {
+		if a.sessionDir == "" {
+			return &tools.Result{
+				Output:  "resume_from requires session persistence to be wired; this code path (likely a test or `metis tools` listing) has no session dir.",
+				IsError: true,
+			}, nil
+		}
+		snap, err := agent.LoadSubAgentSnapshot(a.sessionDir, resumeFrom)
+		if err != nil {
+			return &tools.Result{
+				Output:  fmt.Sprintf("resume_from=%s failed: %v", resumeFrom, err),
+				IsError: true,
+			}, nil
+		}
+		resumedSnapshot = snap
+	}
+
 	// G.0 cap — refuse before constructing the sub-loop so the API
 	// burn stays bounded. The cap reads from the Roster's Capacity
 	// (set at runtime construction from config.Agents.MaxConcurrentSubAgents).
@@ -262,9 +313,22 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	runInBackground, _ := in["run_in_background"].(bool)
 	var teammate *agent.Teammate
 	if a.roster != nil {
+		// G.4 — resumed sub-agents keep their original AgentID so the
+		// transcript file path is stable across resume cycles.
+		agentID := anonAgentID()
+		if resumedSnapshot != nil && resumedSnapshot.Header.ID != "" {
+			agentID = resumedSnapshot.Header.ID
+		}
+		// Resumed teammate likewise inherits its prior name if there
+		// was one (so /agents resume alice → "alice" comes back as a
+		// teammate, not _anon-...).
+		effectiveName := nameArg
+		if resumedSnapshot != nil && resumedSnapshot.Header.TeammateName != "" && effectiveName == "" {
+			effectiveName = resumedSnapshot.Header.TeammateName
+		}
 		teammate = &agent.Teammate{
-			Name:       nameArg, // empty → Roster auto-assigns _anon-<hex>
-			AgentID:    anonAgentID(),
+			Name:       effectiveName, // empty → Roster auto-assigns _anon-<hex>
+			AgentID:    agentID,
 			Background: runInBackground,
 		}
 		if err := a.roster.Register(teammate); err != nil {
@@ -305,6 +369,13 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	}
 	sub := agent.NewLoop(a.provider, a.registry, a.gate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
+	// G.4 — restore prior conversation history BEFORE appending the
+	// new prompt. This way the resumed sub-agent sees the recovered
+	// turns followed by the caller's follow-up message, which the
+	// model should treat as "given what we already discussed, do X".
+	if resumedSnapshot != nil && len(resumedSnapshot.Messages) > 0 {
+		sub.Restore(resumedSnapshot.Messages)
+	}
 	sub.AppendUser(prompt)
 	// G.3 — wire the teammate's Mailbox to the sub-loop's PeerInbox so
 	// the agent.Loop drains it at iter boundaries and injects
@@ -313,6 +384,45 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// is the right behavior for headless unit tests.
 	if teammate != nil {
 		sub.PeerInbox = teammate.Mailbox
+	}
+
+	// G.4 — open a transcript writer if persistence is wired. Foreground
+	// & background paths both append to it via the event-forwarding
+	// loop (see persistNewMessages below). Close is deferred in the
+	// foreground path; the background goroutine handles its own close.
+	//
+	// persistedOnDisk tracks how many messages from sub.History() we've
+	// already written. The event loop bumps it on every EventTurnEnd
+	// so each new turn's tail gets appended exactly once. For fresh
+	// sub-agents this starts at 0 (header-only on disk); for resumed
+	// sub-agents it starts at len(snapshot.Messages) — the count of
+	// historic messages we just rewrote — so the new user prompt
+	// (which sub.AppendUser already added to sub.Messages) DOES get
+	// flushed when the first turn ends.
+	var transcript *agent.SubAgentTranscript
+	persistedOnDisk := 0
+	if a.sessionDir != "" && teammate != nil {
+		hdr := agent.NewSubAgentHeader(
+			teammate.AgentID,
+			a.model,
+			a.parentSessionID,
+			teammate.Name,
+			subCwd,
+			string(a.gate.Mode()),
+		)
+		t, err := agent.NewSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
+		if err == nil {
+			transcript = t
+			// On resume, rewrite the recovered messages immediately so
+			// the file isn't a stub-with-header-only if the sub-agent
+			// errors before producing new output.
+			if resumedSnapshot != nil {
+				for _, m := range resumedSnapshot.Messages {
+					_ = transcript.AppendMessage(m)
+				}
+				persistedOnDisk = len(resumedSnapshot.Messages)
+			}
+		}
 	}
 
 	// G.0 timeout — wall-clock cap. Caller-provided `timeout_seconds`
@@ -357,9 +467,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	if runInBackground {
-		return a.executeBackground(sub, childCtx, cancel, parentOut, teammate, timeout)
+		return a.executeBackground(sub, childCtx, cancel, parentOut, teammate, timeout, transcript, persistedOnDisk)
 	}
-	return a.executeForeground(sub, childCtx, cancel, parentOut, teammate, timeout)
+	return a.executeForeground(sub, childCtx, cancel, parentOut, teammate, timeout, transcript, persistedOnDisk)
 }
 
 // resolveIsolation handles the `isolation` + `cwd` schema fields
@@ -431,8 +541,11 @@ func (a Agent) executeForeground(
 	parentOut chan<- agent.Event,
 	teammate *agent.Teammate,
 	timeout time.Duration,
+	transcript *agent.SubAgentTranscript,
+	persistedOnDisk int,
 ) (*tools.Result, error) {
 	defer cancel()
+	defer transcript.Close()
 
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
@@ -443,6 +556,12 @@ func (a Agent) executeForeground(
 
 	var output strings.Builder
 	stopReason := ""
+	// G.4 — persistedMsgCount tracks how many of sub.Messages we've
+	// already written to disk. Caller seeds the initial value (0 for
+	// fresh sub-agents, len(snapshot.Messages) for resumed ones).
+	// Bumped on each EventTurnEnd so each turn's new messages get
+	// appended exactly once.
+	persistedMsgCount := persistedOnDisk
 	for ev := range events {
 		forwardSubAgentEvent(parentOut, ev)
 		switch ev.Kind {
@@ -451,12 +570,16 @@ func (a Agent) executeForeground(
 			if teammate != nil {
 				teammate.AppendText(ev.TextDelta)
 			}
+		case agent.EventTurnEnd:
+			persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 		case agent.EventPermissionRequest:
 			ev.PermissionReply <- agent.PermissionDecisionDeny
 		case agent.EventLoopDone:
 			stopReason = ev.StopReason
+			persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 		case agent.EventError:
 			if ev.Err != nil {
+				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 				return wrapTimeoutErr(ev.Err, timeout), nil
 			}
 		}
@@ -473,6 +596,20 @@ func (a Agent) executeForeground(
 		teammate.Finish(agent.StatusCompleted, out, nil, stopReason)
 	}
 	return &tools.Result{Output: out}, nil
+}
+
+// persistNewMessages appends any sub.History() entries past idx to
+// the transcript and returns the new count. nil transcript → no-op.
+// On write failure we don't fail the run — persistence is advisory.
+func persistNewMessages(t *agent.SubAgentTranscript, sub *agent.Loop, idx int) int {
+	if t == nil {
+		return idx
+	}
+	hist := sub.History()
+	for i := idx; i < len(hist); i++ {
+		_ = t.AppendMessage(hist[i])
+	}
+	return len(hist)
 }
 
 // executeBackground (G.1, 2026-05-12) returns immediately with a
@@ -492,16 +629,19 @@ func (a Agent) executeBackground(
 	parentOut chan<- agent.Event,
 	teammate *agent.Teammate,
 	timeout time.Duration,
+	transcript *agent.SubAgentTranscript,
+	persistedOnDisk int,
 ) (*tools.Result, error) {
 	if teammate == nil {
 		// No Roster wired — graceful fallback to foreground so callers
 		// that opt into run_in_background on a Roster-less embedding
 		// still get a useful result (just synchronously).
-		return a.executeForeground(sub, childCtx, cancel, parentOut, nil, timeout)
+		return a.executeForeground(sub, childCtx, cancel, parentOut, nil, timeout, transcript, persistedOnDisk)
 	}
 
 	go func() {
 		defer cancel()
+		defer transcript.Close()
 		defer func() {
 			if a.roster != nil {
 				a.roster.Unregister(teammate.Name)
@@ -524,17 +664,22 @@ func (a Agent) executeBackground(
 		}()
 
 		stopReason := ""
+		persistedMsgCount := persistedOnDisk
 		for ev := range events {
 			forwardSubAgentEvent(parentOut, ev)
 			switch ev.Kind {
 			case agent.EventTextDelta:
 				teammate.AppendText(ev.TextDelta)
+			case agent.EventTurnEnd:
+				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 			case agent.EventPermissionRequest:
 				ev.PermissionReply <- agent.PermissionDecisionDeny
 			case agent.EventLoopDone:
 				stopReason = ev.StopReason
+				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 			case agent.EventError:
 				if ev.Err != nil {
+					persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 					status := agent.StatusFailed
 					hint := stopReason
 					if errors.Is(ev.Err, context.DeadlineExceeded) && timeout > 0 {
