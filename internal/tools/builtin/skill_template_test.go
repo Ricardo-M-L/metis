@@ -1,0 +1,142 @@
+package builtin
+
+// skill_template_test.go — end-to-end coverage for the SKILL.md template-
+// var + inline-shell expansion path borrowed from claude-code. Pins:
+//   - ${METIS_SKILL_DIR} resolves to the skill's own directory
+//   - ${CLAUDE_SKILL_DIR} alias works (paste-compat with claude-code)
+//   - ${METIS_SESSION_ID} resolves when WithSessionIDFn is wired
+//   - !`cmd` inline-shell runs only when trust ≥ user
+//   - community-trust skill does NOT execute inline shell
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+)
+
+func writeSkill(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name+".md")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestSkillInvoke_TemplateAndShellExpansion_UserTrust(t *testing.T) {
+	dir := t.TempDir()
+	// `user` trust → inline shell allowed.
+	writeSkill(t, dir, "dirinfo", `---
+name: dirinfo
+description: smoke skill
+---
+
+dir=${METIS_SKILL_DIR}
+session=${METIS_SESSION_ID}
+date=!`+"`"+`date -u +%Y`+"`"+`
+`)
+	loader := skillsloader.NewLoader(dir, "", nil)
+	gate := permission.New(permission.ModeBypass)
+	tool := NewSkill(gate, loader, dir).WithSessionIDFn(func() string { return "session-abc" })
+
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"action": "invoke", "name": "dirinfo",
+	})
+	if err != nil || res == nil || res.IsError {
+		t.Fatalf("invoke failed: err=%v res=%+v", err, res)
+	}
+	out := res.Output
+	if !strings.Contains(out, "dir="+dir) {
+		t.Errorf("METIS_SKILL_DIR not substituted; got:\n%s", out)
+	}
+	if !strings.Contains(out, "session=session-abc") {
+		t.Errorf("METIS_SESSION_ID not substituted; got:\n%s", out)
+	}
+	if !strings.Contains(out, "date=20") {
+		t.Errorf("inline shell didn't run (expected `date -u +%%Y` output starting with 20XX); got:\n%s", out)
+	}
+	// Variable placeholders must be gone.
+	if strings.Contains(out, "${METIS_SKILL_DIR}") || strings.Contains(out, "${METIS_SESSION_ID}") {
+		t.Errorf("placeholders leaked through; got:\n%s", out)
+	}
+}
+
+func TestSkillInvoke_ClaudeAliasesWork(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "claude-alias", `---
+name: claude-alias
+description: paste from claude-code
+---
+
+dir=${CLAUDE_SKILL_DIR}
+session=${CLAUDE_SESSION_ID}
+`)
+	loader := skillsloader.NewLoader(dir, "", nil)
+	gate := permission.New(permission.ModeBypass)
+	tool := NewSkill(gate, loader, dir).WithSessionIDFn(func() string { return "s-1" })
+
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"action": "invoke", "name": "claude-alias",
+	})
+	if err != nil || res == nil || res.IsError {
+		t.Fatalf("invoke failed: err=%v res=%+v", err, res)
+	}
+	if !strings.Contains(res.Output, "dir="+dir) {
+		t.Errorf("CLAUDE_SKILL_DIR alias not substituted; got:\n%s", res.Output)
+	}
+	if !strings.Contains(res.Output, "session=s-1") {
+		t.Errorf("CLAUDE_SESSION_ID alias not substituted; got:\n%s", res.Output)
+	}
+}
+
+func TestSkillInvoke_CommunityTrustBlocksInlineShell(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "untrusted", `---
+name: untrusted
+description: simulated 3rd-party skill
+trust_level: community
+---
+
+result=!`+"`"+`whoami`+"`"+`
+`)
+	// Lie about the dir's nature: pass it as a "plugin" layer (which
+	// stamps community trust). Easiest is to construct a Loader and
+	// force trust via a custom layer instead — bypass NewLoader so we
+	// can pin the community posture.
+	loader := &skillsloader.Loader{
+		Layers: []skillsloader.Layer{
+			{
+				Name: "fake-community", Priority: 99, Trust: "community",
+				Scan: func() ([]skillsloader.Skill, error) {
+					sk, err := skillsloader.Load(filepath.Join(dir, "untrusted.md"))
+					if err != nil {
+						return nil, err
+					}
+					return []skillsloader.Skill{*sk}, nil
+				},
+			},
+		},
+		Logger: func(string, ...any) {},
+		Cwd:    "",
+	}
+	loader.Invalidate()
+
+	gate := permission.New(permission.ModeBypass)
+	tool := NewSkill(gate, loader, dir)
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"action": "invoke", "name": "untrusted",
+	})
+	if err != nil || res == nil || res.IsError {
+		t.Fatalf("invoke failed: err=%v res=%+v", err, res)
+	}
+	// Inline shell must NOT have run — the literal !`whoami` token
+	// should still be in the output.
+	if !strings.Contains(res.Output, "!`whoami`") {
+		t.Errorf("community-trust skill SHOULD NOT execute inline shell; got:\n%s", res.Output)
+	}
+}

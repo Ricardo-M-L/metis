@@ -31,6 +31,12 @@ type Skill struct {
 	// write back to bundled / project / plugin / mcp layers).
 	userDir string
 	gate    *permission.Gate
+	// sessionIDFn returns the current chat session id used to expand
+	// ${METIS_SESSION_ID} / ${CLAUDE_SESSION_ID} in the skill prompt
+	// body. Nil = always empty (placeholder left intact). Wired by
+	// the runtime so internal/tools/builtin doesn't take a back-
+	// dependency on internal/runtime.
+	sessionIDFn func() string
 }
 
 // NewSkill is the runtime constructor. The loader is built by the caller
@@ -39,6 +45,14 @@ type Skill struct {
 // surface a clear error rather than panicking).
 func NewSkill(gate *permission.Gate, loader *skillsloader.Loader, userDir string) Skill {
 	return Skill{loader: loader, userDir: userDir, gate: gate}
+}
+
+// WithSessionIDFn returns a copy of the Skill tool wired with a
+// session-id getter. Used by runtime.BuildToolRegistry to plumb
+// CurrentSessionID without creating an import cycle.
+func (s Skill) WithSessionIDFn(fn func() string) Skill {
+	s.sessionIDFn = fn
+	return s
 }
 
 func (Skill) Name() string { return "Skill" }
@@ -69,7 +83,7 @@ func (s Skill) CanUse(_ context.Context, in map[string]any) (tools.Permission, s
 	return tools.PermissionAllow, "skill lookup"
 }
 
-func (s Skill) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (s Skill) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	if s.loader == nil {
 		return &tools.Result{
 			Output:  "Skill: loader not initialized (this is a metis bug — please report)",
@@ -85,7 +99,7 @@ func (s Skill) Execute(_ context.Context, in map[string]any) (*tools.Result, err
 	case "get":
 		return s.getSkill(name)
 	case "invoke":
-		return s.invokeSkill(name)
+		return s.invokeSkill(ctx, name)
 	}
 	return &tools.Result{
 		Output:  "unknown action: " + action + " (use: list | get | invoke)",
@@ -135,7 +149,7 @@ func (s Skill) getSkill(name string) (*tools.Result, error) {
 	return &tools.Result{Output: string(out)}, nil
 }
 
-func (s Skill) invokeSkill(name string) (*tools.Result, error) {
+func (s Skill) invokeSkill(ctx context.Context, name string) (*tools.Result, error) {
 	if name == "" {
 		return &tools.Result{Output: "Skill invoke: name required", IsError: true}, nil
 	}
@@ -167,8 +181,29 @@ func (s Skill) invokeSkill(name string) (*tools.Result, error) {
 
 	var b strings.Builder
 	if sk.Prompt != "" {
+		// Template-variable expansion (${METIS_SKILL_DIR} /
+		// ${METIS_SESSION_ID} + claude-code aliases) so a skill author
+		// can reference their own dir and the session id from inside
+		// the prompt body. Mirrors claude-code's loadSkillsDir.ts
+		// substitution step. Empty values leave the placeholder
+		// intact — claude-code parity.
+		var skillDir, sessionID string
+		if sk.LocalPath != "" {
+			skillDir = filepath.Dir(sk.LocalPath)
+		}
+		if s.sessionIDFn != nil {
+			sessionID = s.sessionIDFn()
+		}
+		body := skillsloader.ExpandTemplateVars(sk.Prompt, skillDir, sessionID)
+		// Inline-shell expansion (!`cmd` and ```! blocks) — gated by
+		// the loader-stamped TrustLevel so a community / MCP-source
+		// skill can't smuggle shell into the prompt. Mirrors
+		// claude-code's MCP-skill carve-out in executeShellCommandsInPrompt.
+		if skillsloader.ShouldRunInlineShell(sk.TrustLevel) {
+			body = skillsloader.ExpandInlineShell(ctx, body, skillDir)
+		}
 		fmt.Fprintf(&b, "## Skill: %s\n\n", sk.Name)
-		b.WriteString(sk.Prompt)
+		b.WriteString(body)
 		b.WriteByte('\n')
 	}
 	if len(sk.AllowedTools) > 0 {

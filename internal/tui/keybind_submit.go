@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -553,8 +554,23 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// placeholder text so the transcript looks clean.
 	//
 	// Plain-text path stays cheaper — single text block via AppendUser.
+	//
+	// Subdirectory hints: when the user @-mentions a path BELOW cwd,
+	// collect per-directory CLAUDE.md / AGENTS.md / METIS.md along
+	// the descent and prepend them to the LLM-facing text (not the
+	// transcript). Pairs with loadProjectContext's UP-walk so a
+	// monorepo's nested per-service conventions surface even when
+	// cwd sits at the repo root. Mirrors claude-code's
+	// getMemoryFilesForNestedDirectory attachment path — keeps the
+	// system prompt cache warm by living on the user message side.
+	llmText := text
+	if cwd, err := os.Getwd(); err == nil {
+		if hints := runtime.CollectSubdirHints(text, cwd, nil); hints != "" {
+			llmText = hints + "\n\n" + text
+		}
+	}
 	if len(m.imagePaste) > 0 {
-		blocks, errs := expandPastedImagesToBlocks(text, m.imagePaste)
+		blocks, errs := expandPastedImagesToBlocks(llmText, m.imagePaste)
 		m.loop.AppendUserBlocks(blocks)
 		for _, e := range errs {
 			m.messages = append(m.messages, Message{
@@ -564,7 +580,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		m.imagePaste = nil
 		m.imageCounter = 0
 	} else {
-		m.loop.AppendUser(text)
+		m.loop.AppendUser(llmText)
 	}
 	if m.session != nil && m.sessionID != "" {
 		_ = m.session.AppendMessage(m.sessionID, lastUserMessage(m.loop.History()))

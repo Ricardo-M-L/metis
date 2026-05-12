@@ -127,6 +127,15 @@ type Skill struct {
 	//   "project"   — local to this repo (under .metis/skills/)
 	// Mirrors hermes-agent's tools/skills_hub.py:trust_level_for().
 	TrustLevel string `json:"trust_level,omitempty" yaml:"trust_level,omitempty"`
+
+	// LocalPath is the absolute filesystem path of the SKILL.md /
+	// <name>.md file the loader read this skill from. NOT serialised
+	// — purely a runtime annotation so template-var expansion in the
+	// prompt body can resolve `${METIS_SKILL_DIR}` to the skill's
+	// own directory (mirrors claude-code's CLAUDE_SKILL_DIR).
+	// Empty for bundled / plugin / mcp / wire-format skills that
+	// don't have an on-disk path.
+	LocalPath string `json:"-" yaml:"-"`
 }
 
 // Prerequisites describes what the host must provide for a skill to be

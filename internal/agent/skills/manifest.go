@@ -27,13 +27,26 @@ func Load(path string) (*Skill, error) {
 		return nil, fmt.Errorf("skills: read %s: %w", path, err)
 	}
 	defaultName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	var sk *Skill
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".md", ".markdown":
-		return parseMarkdown(b, defaultName)
+		sk, err = parseMarkdown(b, defaultName)
 	case ".json":
-		return parseJSON(b)
+		sk, err = parseJSON(b)
+	default:
+		return nil, fmt.Errorf("skills: %s: unsupported extension (use .md or .json)", path)
 	}
-	return nil, fmt.Errorf("skills: %s: unsupported extension (use .md or .json)", path)
+	if err != nil {
+		return nil, err
+	}
+	// Stamp the on-disk location so prompt-body template vars
+	// (`${METIS_SKILL_DIR}`) can resolve at invoke time.
+	if abs, absErr := filepath.Abs(path); absErr == nil {
+		sk.LocalPath = abs
+	} else {
+		sk.LocalPath = path
+	}
+	return sk, nil
 }
 
 // parseMarkdown splits a SKILL.md file into (YAML frontmatter, markdown

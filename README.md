@@ -506,6 +506,35 @@ Cross-cutting:
 - Panic recovery + ctx-aware drain on sub-agent abort so a buggy
   child can't pin the parent turn
 
+## Subdirectory hints + SKILL.md inline shell (claude-code parity)
+
+Two narrow-but-high-leverage features from claude-code's prompt layer:
+
+- **Subdirectory hints (down-walk attachment)** — when a user message
+  `@`-mentions a path below cwd, metis collects per-directory
+  `CLAUDE.md` / `AGENTS.md` / `METIS.md` along the descent and
+  prepends them as a `<subdirectory_hints>` block on the LLM-facing
+  user message (the transcript stays clean). Pairs with the existing
+  up-walk in `loadProjectContext` so a monorepo's nested
+  service-level conventions surface even when cwd sits at the repo
+  root. **Attachment path, not system-prompt mutation** — keeps the
+  Anthropic prompt cache warm. Implementation:
+  `internal/runtime/subdir_hints.go`; wired in TUI submit + `metis run`.
+
+- **SKILL.md template vars + inline shell** — when the Skill tool
+  invokes a skill, the body is expanded with
+  `${METIS_SKILL_DIR}` / `${METIS_SESSION_ID}` (and their
+  `${CLAUDE_*}` aliases for paste-compat with claude-code), then any
+  `` !`cmd` `` (single-line) or ```` ```! ```` (fenced multi-line)
+  blocks are executed and replaced with their stdout. Bounded per
+  invocation: **10s timeout, 8 KiB stdout cap, `[shell error: …]`
+  sentinel on failure**. Trust gate: only skills at
+  `builtin` / `trusted` / `user` / `project` trust can run inline
+  shell — `community` / mcp-source skills get the raw text (claude-
+  code parity, prevents third-party manifests from smuggling shell
+  at invoke time). Implementation:
+  `internal/agent/skills/{expand,inline_shell}.go`.
+
 ## Channels (chat-platform adapters)
 
 `internal/channels/*` ships adapters for **DingTalk, Discord, Feishu,

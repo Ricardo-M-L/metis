@@ -1086,7 +1086,18 @@ func cmdRun(ctx context.Context, args []string) error {
 		}
 	}
 
-	rt.loop.AppendUser(prompt)
+	// Subdirectory hints (mirrors TUI submit path): when the prompt
+	// @-mentions a path below cwd, gather per-dir CLAUDE.md /
+	// AGENTS.md / METIS.md along the descent and prepend them to the
+	// LLM-facing message. Preserve the transcript-stored prompt as the
+	// raw text so session JSONL / history.jsonl stay clean.
+	llmPrompt := prompt
+	if cwd, err := os.Getwd(); err == nil {
+		if hints := rtpkg.CollectSubdirHints(prompt, cwd, nil); hints != "" {
+			llmPrompt = hints + "\n\n" + prompt
+		}
+	}
+	rt.loop.AppendUser(llmPrompt)
 	if rt.store != nil && rt.sessionID != "" {
 		_ = rt.store.AppendMessage(rt.sessionID, llm.Message{
 			Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: prompt}},

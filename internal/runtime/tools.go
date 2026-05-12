@@ -210,6 +210,9 @@ func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) *skills.Lo
 	// Replace, not Register — the second phase (after LoadPlugins) needs
 	// to overwrite the first phase's plugin-less Skill tool without
 	// panicking on duplicate registration.
-	reg.Replace(builtin.NewSkill(opts.Gate, loader, userDir))
+	// WithSessionIDFn plumbs CurrentSessionID into the Skill tool so
+	// ${METIS_SESSION_ID} / ${CLAUDE_SESSION_ID} can expand in skill
+	// prompt bodies without builtin needing to import runtime.
+	reg.Replace(builtin.NewSkill(opts.Gate, loader, userDir).WithSessionIDFn(CurrentSessionID))
 	return loader
 }
