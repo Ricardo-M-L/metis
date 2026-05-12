@@ -22,10 +22,12 @@ import (
 	"testing"
 )
 
-func TestBuiltinProfileNames_All6Present(t *testing.T) {
+func TestBuiltinProfileNames_All7Present(t *testing.T) {
 	t.Parallel()
 	got := BuiltinProfileNames()
+	// 7 total: 6 from G.7 + coordinator from G.8 (2026-05-12).
 	want := []string{
+		"coordinator",
 		"explore",
 		"general",
 		"go-reviewer",

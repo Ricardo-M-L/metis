@@ -325,6 +325,12 @@ type cliFlags struct {
 	agentTeams  bool   // --agent-teams: alias for /batch entry path
 	tmuxOn      bool   // --tmux: when starting a worktree, wrap the session in tmux
 
+	// coordinator — Phase G.8 (2026-05-12). Flips the main loop into
+	// team-lead mode: tool palette narrows to orchestration tools and
+	// the system prompt overlays an explicit "plan, dispatch,
+	// synthesize" prompt. Equivalent to METIS_COORDINATOR_MODE=1.
+	coordinator bool
+
 	// --cache / --cache-ttl: enable the on-disk response cache for
 	// `metis run` (CACHE-D, 2026-05-11). Hits skip the API entirely
 	// when the same (model, provider, system, prompt) tuple was
@@ -420,6 +426,8 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	// Phase E #46-#48
 	f.StringVar(&out.sessionName, "name", "",
 		"human-friendly session label (shows in /sessions; persisted via SetTitle)")
+	f.BoolVar(&out.coordinator, "coordinator", false,
+		"team-lead mode: narrow tool palette to orchestration tools (Agent / Fork / SendMessage / SubAgent* / Read / Grep / ...) and overlay a coordinator system prompt. Equivalent to setting METIS_COORDINATOR_MODE=1.")
 	f.BoolVar(&out.agentTeams, "agent-teams", false,
 		"start in agent-teams mode (a /batch shortcut surface)")
 	f.BoolVar(&out.tmuxOn, "tmux", false,
@@ -573,9 +581,27 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// two are kept in sync — the string is just the sectioned form
 	// joined with boundary markers, so a provider walking either one
 	// sees identical content.
+	// G.8 (2026-05-12) — flip CoordinatorMode early so the assembled
+	// system prompt picks up the coordinator overlay AND the tool
+	// registry filter applies during BuildToolRegistry below. Env
+	// `METIS_COORDINATOR_MODE=1` is checked by IsCoordinatorMode()
+	// directly; the CLI flag routes through SetCoordinatorMode so
+	// downstream callers see one consistent answer.
+	if flags.coordinator {
+		rtpkg.SetCoordinatorMode(true)
+	}
+
 	var systemSections []rtpkg.SystemPromptSection
 	if agentProf == nil || !agentProf.OmitClaudeMd {
-		systemSections = rtpkg.AssembleSystemPromptSections(system, rtpkg.AssembleOptions{})
+		assembleOpts := rtpkg.AssembleOptions{}
+		// Inject the coordinator overlay between `base` and the
+		// project-context sections so it shares the cached prefix.
+		// CoordinatorOverlay() returns a zero-value section (Name=="")
+		// when the mode is off — caller skips the append in that case.
+		if ov := rtpkg.CoordinatorOverlay(); ov.Name != "" {
+			assembleOpts.Overlays = append(assembleOpts.Overlays, ov)
+		}
+		systemSections = rtpkg.AssembleSystemPromptSections(system, assembleOpts)
 		system = rtpkg.RenderSections(systemSections)
 	}
 
@@ -667,6 +693,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		ConfigSnapshot:  snap,
 		Roster:          subAgentRoster,
 	})
+
+	// G.8 — coordinator mode replaces every non-whitelisted tool
+	// with a stub that errors when invoked. The user sees the names
+	// in /tools but the model can't accidentally Edit/Write/Bash; the
+	// system prompt overlay above tells it to dispatch sub-agents.
+	rtpkg.FilterRegistryInPlace(reg)
 
 	// MCP servers — launch each enabled stdio server, register its tools as
 	// `mcp__<name>__<tool>`. Failures are non-fatal: warn and continue.
@@ -1736,6 +1768,11 @@ func cmdTools() error {
 	// capability exists; live wiring (skills loader / jobs registry /
 	// snapshot) only happens in setupRuntime / chat sessions.
 	reg.Register(builtin.NewMetisInfo(gate, cfg, nil, nil, reg))
+	// G.8 — if the user is previewing tool availability under
+	// METIS_COORDINATOR_MODE=1, apply the same filter the chat REPL
+	// would. Stubs replace mutation tools so the listing shows the
+	// "disabled in coordinator mode" hint instead of the real desc.
+	rtpkg.FilterRegistryInPlace(reg)
 	for _, t := range reg.All() {
 		fmt.Printf("%-15s  %s\n", t.Name(), t.Description())
 	}
