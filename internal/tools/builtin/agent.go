@@ -222,6 +222,16 @@ func (Agent) InputSchema() map[string]any {
 				"enum":        []string{"ask", "auto", "bypass", "plan", "deny"},
 				"description": "Override the permission mode for this sub-agent's gate. The parent's gate is unchanged; the sub-agent gets a clone with its own mode + a fresh denial-streak counter. Useful for letting an explore-agent run with `auto` while the parent stays in `ask`. Omit to inherit the parent's current mode.",
 			},
+			"allowed_tools": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Optional allowlist of tool names the sub-agent may invoke. Combined as INTERSECTION with the agent profile's `tools` filter when both are set, so the sub-agent always sees the strictest result. Empty / omitted = inherit (no per-invocation restriction).",
+			},
+			"disallowed_tools": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Optional blocklist applied AFTER the allowed_tools intersection. Combined as UNION with the profile's `disallowed_tools` when both are set, so denying a tool at the call site never gets quietly re-enabled by the profile.",
+			},
 		},
 	}
 }
@@ -401,7 +411,21 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		subGate.SetMode(permission.Mode(pm))
 	}
 
-	sub := agent.NewLoop(a.provider, a.registry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
+	// G.14 (2026-05-12) — per-invocation tool filter. The schema
+	// fields `allowed_tools` (allowlist) and `disallowed_tools`
+	// (blocklist) narrow the sub-agent's view of the registry
+	// without affecting the parent's view. Empty filters = inherit
+	// the full parent registry. Filter applies BEFORE the sub-loop
+	// is constructed so the sub-agent never sees a tool it
+	// shouldn't even try to call.
+	allowedTools := stringSliceArg(in, "allowed_tools")
+	disallowedTools := stringSliceArg(in, "disallowed_tools")
+	subRegistry := a.registry
+	if len(allowedTools) > 0 || len(disallowedTools) > 0 {
+		subRegistry = filterRegistry(a.registry, allowedTools, disallowedTools)
+	}
+
+	sub := agent.NewLoop(a.provider, subRegistry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
 	// G.4 — restore prior conversation history BEFORE appending the
 	// new prompt. This way the resumed sub-agent sees the recovered
