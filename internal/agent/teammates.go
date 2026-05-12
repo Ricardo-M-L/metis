@@ -130,6 +130,23 @@ type Teammate struct {
 	StopHint string // user-facing reason ("timeout 600s", "user kill", "max_iter exhausted")
 }
 
+// IsNamed reports whether this teammate was explicitly named at
+// spawn time (G.11, 2026-05-12). Anonymous spawns get an auto-
+// generated `_anon-<hex>` prefix that's hidden from the default
+// /agents listing — IsNamed lets `/agents list` filter cleanly
+// without exposing the prefix as a stringly-typed contract.
+//
+// Equivalent to `!t.Anonymous`, but using a method makes call-
+// sites self-documenting and gives us room to layer in more
+// promotion rules later (e.g. "named iff started_at > runtime_boot
+// AND name didn't start with `_`"). For now: simple negation.
+func (t *Teammate) IsNamed() bool {
+	if t == nil {
+		return false
+	}
+	return !t.Anonymous
+}
+
 // AppendText is the streaming-text accumulator. Called by the
 // sub-agent's event-forwarding goroutine on every EventTextDelta;
 // SubAgentOutput reads what's been accumulated so far via Snapshot().
@@ -174,6 +191,10 @@ type TeammateSnapshot struct {
 	ExitErr    error
 	StopHint   string
 }
+
+// IsNamed mirrors Teammate.IsNamed on the snapshot view so /agents
+// list can filter without re-grabbing the live mutex.
+func (s TeammateSnapshot) IsNamed() bool { return !s.Anonymous }
 
 // Snapshot returns a thread-safe copy of the Teammate's mutable state.
 // SubAgentOutput uses this to read the running buffer + status atomically.

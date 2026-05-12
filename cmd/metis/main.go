@@ -235,6 +235,12 @@ type runtime struct {
 	// to the slash registry so /dream status can read phase + last-
 	// run stats. nil when --auto-memory isn't set.
 	autoMemExtractor *agent.AutoMemoryExtractor
+
+	// subAgentRoster is the cross-session Roster every spawned
+	// sub-agent registers in (G.0/G.3). Stashed on the runtime so
+	// the /agents slash command can render the live state instead
+	// of the placeholder hint (G.17, 2026-05-12).
+	subAgentRoster *agent.Roster
 }
 
 // Cleanup closes any subprocesses or connections owned by the runtime.
@@ -855,6 +861,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		plugins:          pluginReg,
 		allowedDirs:      allowedDirs,
 		autoMemExtractor: pendingExtractor,
+		subAgentRoster:   subAgentRoster,
 	}
 
 	// Resolve resume target. Order: explicit --resume <id> wins; then
@@ -2070,6 +2077,14 @@ func buildSlash(rt *runtime) *slash.Registry {
 	r.Register(slash.Cmd{Name: "dream", Description: "DreamTask status — current phase, last run files & duration", Handler: func(arg string) (string, slash.Signal) {
 		return formatDreamStatus(rt.autoMemExtractor, arg), slash.SignalNone
 	}})
+	// /agents — multi-agent roster surface (G.11 + G.17, 2026-05-12).
+	// Replaces the placeholder cmd registered in RegisterAll above
+	// (Registry.Register's last-write-wins on the index map). Reads
+	// the live Roster on rt, supports `list / kill / status`
+	// subcommands.
+	r.Register(slash.Cmd{Name: "agents", Description: "list / kill / status sub-agents (Agent tool teammates)", Handler: func(arg string) (string, slash.Signal) {
+		return formatAgentsCommand(rt.subAgentRoster, arg), slash.SignalNone
+	}})
 	// User-authored commands from ~/.metis/commands/*.md and
 	// <cwd>/.metis/commands/*.md. Loaded LAST so a user .md can't
 	// shadow a built-in (LoadCustomCommands refuses to register on
@@ -2090,6 +2105,147 @@ func buildSlash(rt *runtime) *slash.Registry {
 		_ = registerMCPPromptsAsSlash(r, handles)
 	}
 	return r
+}
+
+// formatAgentsCommand renders the /agents slash output (G.11 + G.17,
+// 2026-05-12). Supports:
+//
+//	/agents              → equivalent to /agents list
+//	/agents list         → roster snapshot grouped by named vs anon
+//	/agents list all     → include anonymous teammates too
+//	/agents status <name|id>  → detail for one teammate
+//	/agents kill <name|id>    → terminate one teammate
+//
+// `resume <id>` is reserved for the Agent tool's resume_from path —
+// at slash-command time we don't have provider/registry handles to
+// spawn a fresh sub-loop, so /agents resume returns a hint pointing
+// the user to `Agent({ resume_from: "agt-..." })` in chat. Future
+// G.x can wire the full inline spawn.
+func formatAgentsCommand(roster *agent.Roster, arg string) string {
+	if roster == nil {
+		return "(agents: no Roster wired — sub-agent registry unavailable in this build)"
+	}
+	parts := strings.Fields(arg)
+	sub := ""
+	if len(parts) > 0 {
+		sub = strings.ToLower(parts[0])
+	}
+	switch sub {
+	case "", "list", "ls":
+		showAll := len(parts) > 1 && strings.EqualFold(parts[1], "all")
+		return renderAgentsList(roster, showAll)
+	case "status", "show":
+		if len(parts) < 2 {
+			return "(agents status: usage: /agents status <name|agent_id>)"
+		}
+		return renderAgentsStatus(roster, parts[1])
+	case "kill", "stop":
+		if len(parts) < 2 {
+			return "(agents kill: usage: /agents kill <name|agent_id>)"
+		}
+		return renderAgentsKill(roster, parts[1])
+	case "resume":
+		if len(parts) < 2 {
+			return "(agents resume: usage: /agents resume <agent_id>)"
+		}
+		return fmt.Sprintf(
+			"(agents resume: type into chat — `Agent({ resume_from: %q, prompt: \"continue\" })`. The resume_from path needs a live provider, which the slash handler doesn't hold.)",
+			parts[1],
+		)
+	default:
+		return fmt.Sprintf("(agents: unknown subcommand %q — try: list | status <id> | kill <id> | resume <id>)", sub)
+	}
+}
+
+// renderAgentsList shows the roster table. `showAll` includes the
+// anonymous spawns; default hides them (claude-code parity — anons
+// clutter the view, named teammates are the user-relevant rows).
+func renderAgentsList(roster *agent.Roster, showAll bool) string {
+	snaps := roster.List()
+	if len(snaps) == 0 {
+		return "(agents: roster empty — spawn one with Agent({prompt: ...}))"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "agents (in flight + recent) — %d total\n", len(snaps))
+	hiddenAnon := 0
+	for _, s := range snaps {
+		if !s.IsNamed() && !showAll {
+			hiddenAnon++
+			continue
+		}
+		tag := s.Name
+		if !s.IsNamed() {
+			tag = "(anon)"
+		}
+		bg := ""
+		if s.Background {
+			bg = " bg"
+		}
+		fmt.Fprintf(&b, "  %s  %-20s  %-9s  %s%s\n",
+			s.AgentID, tag, s.Status, time.Since(s.Started).Truncate(time.Second), bg)
+	}
+	if hiddenAnon > 0 && !showAll {
+		fmt.Fprintf(&b, "  ... %d anonymous teammate(s) hidden — use `/agents list all` to show\n", hiddenAnon)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderAgentsStatus shows one teammate's full state. `id` matches
+// by name first, then by AgentID — same resolution rule
+// MessageTeammate uses, so the user can paste either handle.
+func renderAgentsStatus(roster *agent.Roster, id string) string {
+	tm, ok := roster.Lookup(id)
+	if !ok {
+		tm, ok = roster.LookupByAgentID(id)
+	}
+	if !ok {
+		return fmt.Sprintf("(agents status: no teammate with name=%q or agent_id=%q)", id, id)
+	}
+	s := tm.Snapshot()
+	var b strings.Builder
+	fmt.Fprintf(&b, "agent_id     : %s\n", s.AgentID)
+	fmt.Fprintf(&b, "name         : %s (named=%t)\n", s.Name, s.IsNamed())
+	fmt.Fprintf(&b, "status       : %s\n", s.Status)
+	fmt.Fprintf(&b, "background   : %t\n", s.Background)
+	fmt.Fprintf(&b, "started      : %s ago\n", time.Since(s.Started).Truncate(time.Second))
+	if !s.EndTime.IsZero() {
+		fmt.Fprintf(&b, "ended        : %s ago (ran %s)\n",
+			time.Since(s.EndTime).Truncate(time.Second),
+			s.EndTime.Sub(s.Started).Truncate(time.Second),
+		)
+	}
+	if s.StopHint != "" {
+		fmt.Fprintf(&b, "stop_hint    : %s\n", s.StopHint)
+	}
+	if s.ExitErr != nil {
+		fmt.Fprintf(&b, "exit_err     : %v\n", s.ExitErr)
+	}
+	if s.Output != "" {
+		preview := s.Output
+		if len(preview) > 600 {
+			preview = preview[:600] + "..."
+		}
+		fmt.Fprintf(&b, "output (head):\n%s\n", preview)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderAgentsKill resolves the target and calls its Cancel func.
+// Returns a user-readable confirmation; the actual sub-loop cleanup
+// happens in the goroutine watching ctx.Done().
+func renderAgentsKill(roster *agent.Roster, id string) string {
+	tm, ok := roster.Lookup(id)
+	if !ok {
+		tm, ok = roster.LookupByAgentID(id)
+	}
+	if !ok {
+		return fmt.Sprintf("(agents kill: no teammate with name=%q or agent_id=%q)", id, id)
+	}
+	if tm.Cancel == nil {
+		return fmt.Sprintf("(agents kill: teammate %s has no cancel func — already finished)", tm.AgentID)
+	}
+	tm.Cancel()
+	return fmt.Sprintf("(agents: cancelled %s — will transition to killed shortly)", tm.AgentID)
 }
 
 // formatDreamStatus renders /dream output (G.5, 2026-05-12). When
