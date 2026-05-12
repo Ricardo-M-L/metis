@@ -28,6 +28,39 @@ func anonAgentID() string {
 	return "agt-" + hex.EncodeToString(b[:])
 }
 
+// validateTeammateName enforces the G.3 naming rules:
+//   - Empty string is fine (caller wants anonymous, Roster auto-assigns).
+//   - Must start with a letter so it can't be confused with the
+//     `_anon-<hex>` namespace the Roster reserves for anonymous spawns.
+//   - Only [a-zA-Z0-9._-] allowed — what slugSegmentRE accepts in the
+//     worktree package, kept in lockstep so a teammate name can
+//     double as a worktree slug if a future caller wants that.
+//   - Max 32 chars — short enough to fit in /agents list output
+//     comfortably; claude-code's roster picks a similar bound.
+func validateTeammateName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if len(name) > 32 {
+		return fmt.Errorf("teammate name %q exceeds 32 chars", name)
+	}
+	first := name[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
+		return fmt.Errorf("teammate name %q must start with a letter (anonymous slot is reserved for `_anon-<hex>`)", name)
+	}
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		ok := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == '-'
+		if !ok {
+			return fmt.Errorf("teammate name %q contains invalid char %q (allowed: letters, digits, . _ -)", name, c)
+		}
+	}
+	return nil
+}
+
 // agentDepthKey carries the nested-agent count through context so a
 // sub-agent that itself spawns sub-agents can be capped before runaway
 // recursion runs the user's bill into the floor.
@@ -153,6 +186,10 @@ func (Agent) InputSchema() map[string]any {
 				"type":        "string",
 				"description": "Absolute path to run the sub-agent in. Overrides the parent's working directory for all filesystem and shell operations within this sub-agent. Mutually exclusive with `isolation: \"worktree\"`.",
 			},
+			"name": map[string]any{
+				"type":        "string",
+				"description": "Optional name to register this sub-agent in the team roster as. Named teammates show up in /agents list and can be addressed by MessageTeammate({to: name, body: ...}) from other sub-agents. Must start with a letter; only [a-zA-Z0-9._-] allowed; max 32 chars. Two teammates with the same name cannot co-exist.",
+			},
 		},
 	}
 }
@@ -206,6 +243,17 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		return &tools.Result{Output: isoErr.Error(), IsError: true}, nil
 	}
 
+	// G.3 (2026-05-12) — `name` field for named teammates. Validated
+	// before any roster work so a bad name fails fast without
+	// polluting the cap. The check is intentionally strict (letter
+	// prefix + ascii subset) to make names safe to print in /agents
+	// list and to avoid colliding with the `_anon-<hex>` namespace
+	// the Roster reserves for anonymous spawns.
+	nameArg, _ := in["name"].(string)
+	if err := validateTeammateName(nameArg); err != nil {
+		return &tools.Result{Output: err.Error(), IsError: true}, nil
+	}
+
 	// G.0 cap — refuse before constructing the sub-loop so the API
 	// burn stays bounded. The cap reads from the Roster's Capacity
 	// (set at runtime construction from config.Agents.MaxConcurrentSubAgents).
@@ -215,6 +263,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	var teammate *agent.Teammate
 	if a.roster != nil {
 		teammate = &agent.Teammate{
+			Name:       nameArg, // empty → Roster auto-assigns _anon-<hex>
 			AgentID:    anonAgentID(),
 			Background: runInBackground,
 		}
@@ -225,6 +274,15 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 					Output: fmt.Sprintf(
 						"sub-agent capacity exceeded (%d/%d in flight). Wait for a teammate to finish or raise config.Agents.MaxConcurrentSubAgents.",
 						a.roster.Count(), cap,
+					),
+					IsError: true,
+				}, nil
+			}
+			if errors.Is(err, agent.ErrNameInUse) {
+				return &tools.Result{
+					Output: fmt.Sprintf(
+						"teammate name %q is already in use by another live sub-agent. Pick a different name or wait for the other to finish.",
+						nameArg,
 					),
 					IsError: true,
 				}, nil
@@ -248,6 +306,14 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	sub := agent.NewLoop(a.provider, a.registry, a.gate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
 	sub.AppendUser(prompt)
+	// G.3 — wire the teammate's Mailbox to the sub-loop's PeerInbox so
+	// the agent.Loop drains it at iter boundaries and injects
+	// <peer_message> system-reminders. nil Mailbox (no Roster wired)
+	// leaves PeerInbox nil — peer messaging silently disabled, which
+	// is the right behavior for headless unit tests.
+	if teammate != nil {
+		sub.PeerInbox = teammate.Mailbox
+	}
 
 	// G.0 timeout — wall-clock cap. Caller-provided `timeout_seconds`
 	// wins; else config default; 0 disables.

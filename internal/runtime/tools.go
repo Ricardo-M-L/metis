@@ -118,6 +118,10 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// "no sub-agents" instead of panicking).
 	if opts.Roster != nil {
 		builtin.AttachSubAgentTools(reg, opts.Gate, opts.Roster)
+		// MessageTeammate (G.3) — peer-to-peer messaging tool.
+		// Lives next to the SubAgent* family because it shares the
+		// same Roster dependency.
+		reg.Register(builtin.NewMessageTeammate(opts.Gate, opts.Roster))
 	}
 	// Fork tool: same wiring as Agent, different semantics — child
 	// inherits parent history+system instead of starting cold.

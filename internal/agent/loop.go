@@ -33,11 +33,11 @@ import (
 //   - compaction_check.go maybeCompact
 //   - plan_emit.go        emitPlan
 type Loop struct {
-	Provider   llm.Provider
-	Registry   *tools.Registry
-	Gate       *permission.Gate
-	Hooks      *HookRegistry
-	System     string
+	Provider llm.Provider
+	Registry *tools.Registry
+	Gate     *permission.Gate
+	Hooks    *HookRegistry
+	System   string
 	// SystemSections is the typed-section form of the system prompt.
 	// When non-empty, buildRequest passes it through llm.Request so the
 	// Anthropic provider can emit per-section cache_control. Memory
@@ -121,6 +121,14 @@ type Loop struct {
 	// the TUI can render a "⚙ N jobs" status bar chip without
 	// reaching into the runtime layer. Optional — nil hides the chip.
 	Jobs *jobs.Registry
+
+	// PeerInbox is the receive end of this sub-agent's Mailbox in the
+	// shared Roster (G.3, 2026-05-12). When set, Run drains it at
+	// each iteration boundary and injects a <peer_message>
+	// system-reminder so the model sees what other teammates told it
+	// since the last turn. nil for the top-level user loop (which
+	// has no Roster entry) and for headless tests.
+	PeerInbox <-chan PeerMessage
 
 	// Monitors is the per-line pattern-match registry. The Monitor
 	// tool registers a Watch on a freshly-spawned background job and
@@ -418,6 +426,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// jobs finished (and whether to BashOutput-read the result),
 		// matching claude-code's <task_notification> envelope.
 		l.injectJobNotifications(out)
+		l.injectPeerMessages(out)
 		// Same pattern for Monitor pattern-matches — pulls every
 		// MonitorEvent buffered since last iter and injects them as
 		// <monitor_event> system-reminders. Cheap when no Monitor is

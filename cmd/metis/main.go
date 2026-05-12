@@ -1691,8 +1691,10 @@ func cmdTools() error {
 	// SubAgent reader tools (G.1, 2026-05-12) — listing them so the user
 	// sees the full background-sub-agent surface area, even though
 	// Execute will refuse (no Roster wired in this code path).
+	// G.3 adds MessageTeammate to the same family for peer messaging.
 	tmpRoster := agent.NewRoster(0)
 	builtin.AttachSubAgentTools(reg, gate, tmpRoster)
+	reg.Register(builtin.NewMessageTeammate(gate, tmpRoster))
 	// Same for SendMessage — its real wiring lives in setupRuntime, but
 	// we want it visible in `metis tools` so users know the capability
 	// exists without firing up a chat session.
