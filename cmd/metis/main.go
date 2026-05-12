@@ -638,6 +638,14 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// scan goroutines unwind here.
 	defer monitorReg.StopAll()
 
+	// Sub-agent Roster — process-wide registry that backs G.0's
+	// concurrency cap and (later) G.3 named teammates / G.16 UI
+	// observability. Capacity reads from config.Agents (default 5).
+	// Cancel everyone on chat exit so orphan sub-agents don't keep
+	// burning tokens after the parent shell goes away.
+	subAgentRoster := agent.NewRoster(cfg.Agents.MaxConcurrentSubAgents)
+	defer subAgentRoster.CancelAll()
+
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
 		Cfg:             cfg,
 		Gate:            gate,
@@ -652,6 +660,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Jobs:            jobsPool,
 		Monitors:        monitorReg,
 		ConfigSnapshot:  snap,
+		Roster:          subAgentRoster,
 	})
 
 	// MCP servers — launch each enabled stdio server, register its tools as
@@ -1582,6 +1591,9 @@ func cmdConfig(args []string) error {
 		fmt.Printf("loop_detection.global = %d\n", cfg.LoopDetection.Global)
 		fmt.Printf("loop_detection.signature_window = %d\n", cfg.LoopDetection.SignatureWindow)
 		fmt.Printf("loop_detection.signature_max_repeats = %d\n", cfg.LoopDetection.SignatureMaxRepeats)
+		fmt.Printf("agents.max_concurrent_subagents = %d\n", cfg.Agents.MaxConcurrentSubAgents)
+		fmt.Printf("agents.default_timeout_seconds = %d\n", cfg.Agents.DefaultTimeoutSeconds)
+		fmt.Printf("agents.cleanup_orphan_worktrees = %v\n", cfg.Agents.CleanupOrphanWorktrees)
 		fmt.Printf("tools.enable_tool_search = %q (env)\n", os.Getenv("ENABLE_TOOL_SEARCH"))
 		return nil
 	case "init":

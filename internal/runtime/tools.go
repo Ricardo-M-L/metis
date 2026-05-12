@@ -3,6 +3,7 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
@@ -68,6 +69,13 @@ type ToolRegistryOptions struct {
 	// Optional: nil hides the section without breaking other
 	// introspection sections.
 	ConfigSnapshot *config.Snapshot
+
+	// Roster is the cross-session sub-agent registry that backs the
+	// G.0 concurrency cap and (later) G.3 named teammates / G.16 UI
+	// observability. Threaded into Agent + Fork tools at registry
+	// build time. When nil, Agent/Fork run uncapped and untracked —
+	// fine for tests but not production.
+	Roster *agent.Roster
 }
 
 // BuildToolRegistry constructs the per-session tools.Registry, registers
@@ -89,8 +97,16 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 		}
 	}
 	// Agent tool: needs the provider + registry references that
-	// builtin.Register doesn't see.
-	reg.Register(builtin.NewAgentWithMinimal(opts.Gate, opts.Provider, reg, opts.Model, opts.System, opts.MinimalSystem))
+	// builtin.Register doesn't see. Roster + DefaultTimeout wire in
+	// G.0's concurrency cap + wall-clock budget.
+	agentTool := builtin.NewAgentWithMinimal(opts.Gate, opts.Provider, reg, opts.Model, opts.System, opts.MinimalSystem)
+	if opts.Roster != nil {
+		agentTool = agentTool.WithRoster(opts.Roster)
+	}
+	if opts.Cfg != nil && opts.Cfg.Agents.DefaultTimeoutSeconds > 0 {
+		agentTool = agentTool.WithDefaultTimeout(time.Duration(opts.Cfg.Agents.DefaultTimeoutSeconds) * time.Second)
+	}
+	reg.Register(agentTool)
 	// Fork tool: same wiring as Agent, different semantics — child
 	// inherits parent history+system instead of starting cold.
 	reg.Register(builtin.NewFork(opts.Gate, opts.Provider, reg))

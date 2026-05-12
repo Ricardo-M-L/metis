@@ -28,9 +28,33 @@ type Config struct {
 	Session       Session       `toml:"session"`
 	Tools         Tools         `toml:"tools"`
 	LoopDetection LoopDetection `toml:"loop_detection"`
+	Agents        Agents        `toml:"agents"`
 	MCP           MCP           `toml:"mcp"`
 	Channels      Channels      `toml:"channels"`
 	Hooks         HooksConfig   `toml:"hooks"`
+}
+
+// Agents governs sub-agent (Agent / Fork tool) execution limits. Added
+// 2026-05-12 alongside the multi-agent expansion (Phase G of the
+// claude-code-parity plan). The fields are the cross-cutting safety
+// net: concurrency cap, wall-clock timeout, and worktree GC policy.
+// All three apply to every sub-agent invocation regardless of
+// `run_in_background`, `isolation`, or `name`.
+type Agents struct {
+	// MaxConcurrentSubAgents caps live sub-agents in the Roster.
+	// Exceeding it returns an IsError tool result without spawning.
+	// 0 falls back to the default (5).
+	MaxConcurrentSubAgents int `toml:"max_concurrent_subagents"`
+
+	// DefaultTimeoutSeconds bounds a sub-agent's wall-clock duration
+	// when its tool call did not pass `timeout_seconds`. 0 falls back
+	// to the default (600 = 10 min).
+	DefaultTimeoutSeconds int `toml:"default_timeout_seconds"`
+
+	// CleanupOrphanWorktrees governs whether a worktree spawned via
+	// `isolation:"worktree"` is force-removed when its parent context
+	// is cancelled. Default true.
+	CleanupOrphanWorktrees bool `toml:"cleanup_orphan_worktrees"`
 }
 
 // Channels groups the chat-platform adapters wired up by SendMessage.
@@ -549,6 +573,11 @@ func defaults() *Config {
 			Global:              80,
 			SignatureWindow:     10,
 			SignatureMaxRepeats: 5,
+		},
+		Agents: Agents{
+			MaxConcurrentSubAgents: 5,
+			DefaultTimeoutSeconds:  600,
+			CleanupOrphanWorktrees: true,
 		},
 	}
 }
