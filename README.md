@@ -94,7 +94,7 @@ metis version [-V]            # short semver (-V for full build fingerprint)
 | `--mode <id>` | permission mode (`ask` / `auto` / `bypass` / `plan` / `deny`) |
 | `--dangerously-skip-permissions` | alias of `--mode bypass` (named for Claude Code muscle memory) |
 | `-c, --continue` | resume the most recently modified session |
-| `-r, --resume [<id>]` | resume a specific session id; bare `-r` opens an interactive picker |
+| `-r, --resume [<id>]` | resume a session by full UUID OR any unambiguous prefix (e.g. the 12-char id the picker prints). Bare `-r` opens the picker; ambiguous prefix errors with the candidate list |
 | `-d, --debug` | mirror logs into `~/.metis/debug.log` |
 | `--bare` | skip MCP / plugin loaders for fastest cold start |
 | `-s, --scope <local\|user\|project>` | config scope (today only `user` is honored) |
