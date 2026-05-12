@@ -1,24 +1,34 @@
 package main
 
-// cmd_resume_picker.go — `metis -r` / `metis --resume` with no UUID
-// argument should open an interactive picker over recent sessions
-// (claude-code parity, user reference image 2026-05-08). This file
-// holds (a) the args pre-scanner that detects the bare-flag gesture
-// without confusing Go's `flag` package, and (b) the stdin-driven
-// numeric picker.
+// cmd_resume_picker.go — `metis -r` / bare `--resume` opens a small
+// bubbletea picker over recent sessions. Mirrors claude-code's
+// `ResumeConversation` / `LogSelector`: arrow-key navigation, full
+// session id + title shown per row, Enter to select, Esc/q to abort.
 //
-// Picker is intentionally non-TUI: it's a one-shot question before
-// the bubbletea program runs. A full bubbletea picker would mean
-// starting + tearing down two programs in sequence, and the
-// terminal-restore footwork that currently lives in tui.RunTUI
-// doesn't compose cleanly with that. A printf + Scan is plenty.
+// History note: the picker used to be a printf+Scan numbered prompt
+// (cmd_resume_picker.go @ 6f1a05a). That had two problems the user
+// reported on 2026-05-13:
+//
+//   1. Session ids were truncated to 12 chars for display, so users
+//      copying the displayed id into `--resume <id>` got ENOENT.
+//   2. Numbered input is fiddly for >10 sessions and feels dated next
+//      to claude-code's arrow-key UX.
+//
+// Both problems are fixed by going TUI: the full UUID is rendered
+// inline (no truncation surprise), and the user picks by moving a
+// cursor. The TUI program is short-lived — it runs to completion
+// before the main chat surface boots, same lifecycle as trust.go's
+// safety prompt.
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
@@ -58,12 +68,16 @@ func liftBareResume(args []string, pick *bool) []string {
 	return out
 }
 
-// runResumePicker prints a numbered list of recent sessions to stderr
-// and reads the user's choice from stdin. Returns the chosen session
-// id on success; empty string + nil if the user typed `q` / `0` /
-// blank to bail out and start a fresh session.
+// runResumePicker opens a bubbletea selector over recent sessions and
+// returns the full session id the user chose. Empty string + nil
+// means "user cancelled — start a fresh session" (Esc / q / Enter on
+// an empty list).
+//
+// Errors are reserved for store/IO failures; everything user-driven
+// (cancel, no sessions, bad terminal) returns ("", nil) and the
+// caller falls through to a fresh chat.
 func runResumePicker(store *session.Store) (string, error) {
-	const limit = 20
+	const limit = 200
 	entries, err := store.List(limit)
 	if err != nil {
 		return "", fmt.Errorf("list sessions: %w", err)
@@ -72,31 +86,219 @@ func runResumePicker(store *session.Store) (string, error) {
 		fmt.Fprintln(os.Stderr, "(no prior sessions — starting fresh)")
 		return "", nil
 	}
-	dim := "\x1b[2;38;5;245m"
-	bold := "\x1b[1m"
-	reset := "\x1b[0m"
-	fmt.Fprintf(os.Stderr, "%sResume which session?%s\n\n", bold, reset)
+
+	m := &resumePickerModel{entries: entries, viewSize: 15}
+	// Output to stderr so a piped stdin/stdout caller (CI, eval harness)
+	// still sees the picker chrome instead of mixing it into structured
+	// output. Same trick trust.go uses.
+	prog := tea.NewProgram(m, tea.WithOutput(os.Stderr))
+	if _, err := prog.Run(); err != nil {
+		// Terminal too dumb to host bubbletea (no PTY, tests). Fall
+		// back to the legacy numbered prompt so the path still works.
+		return runResumePickerFallback(store, entries)
+	}
+	if m.cancelled || m.cursor < 0 {
+		fmt.Fprintln(os.Stderr, "(starting fresh)")
+		return "", nil
+	}
+	return m.entries[m.cursor].ID, nil
+}
+
+// resumePickerModel renders a vertical list of session rows with a
+// movable cursor. The viewport (`viewSize` rows wide) auto-scrolls to
+// keep the cursor visible, so a list of 200 sessions degrades to "scroll
+// nicely" rather than "renders past the terminal bottom".
+type resumePickerModel struct {
+	entries   []session.ListEntry
+	cursor    int
+	offset    int  // first visible row
+	viewSize  int  // rows shown at once
+	width     int  // last-known terminal width (for row truncation)
+	cancelled bool
+}
+
+func (resumePickerModel) Init() tea.Cmd { return nil }
+
+func (m *resumePickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		// Leave 6 rows for chrome (header + footer + padding). Always
+		// keep at least 5 visible rows so the picker stays usable in
+		// very short windows.
+		avail := msg.Height - 6
+		if avail < 5 {
+			avail = 5
+		}
+		if avail < m.viewSize {
+			m.viewSize = avail
+		}
+		m.clampScroll()
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "up", "k", "shift+tab":
+			if m.cursor > 0 {
+				m.cursor--
+				m.clampScroll()
+			}
+		case "down", "j", "tab":
+			if m.cursor < len(m.entries)-1 {
+				m.cursor++
+				m.clampScroll()
+			}
+		case "pgup", "ctrl+u":
+			m.cursor -= m.viewSize
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			m.clampScroll()
+		case "pgdown", "ctrl+d":
+			m.cursor += m.viewSize
+			if m.cursor >= len(m.entries) {
+				m.cursor = len(m.entries) - 1
+			}
+			m.clampScroll()
+		case "home", "g":
+			m.cursor = 0
+			m.clampScroll()
+		case "end", "G":
+			m.cursor = len(m.entries) - 1
+			m.clampScroll()
+		case "enter":
+			return m, tea.Quit
+		case "esc", "q", "ctrl+c":
+			m.cancelled = true
+			return m, tea.Quit
+		default:
+			// Number shortcut (claude-code parity): 1-9 jump to row N
+			// within the current viewport AND select. Two-digit input
+			// not supported — for that, scroll then Enter.
+			if n, err := strconv.Atoi(msg.String()); err == nil && n >= 1 && n <= 9 {
+				idx := m.offset + n - 1
+				if idx < len(m.entries) {
+					m.cursor = idx
+					return m, tea.Quit
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
+// clampScroll keeps `m.offset` aligned so the cursor is always visible.
+// Called after any cursor move OR window-size change.
+func (m *resumePickerModel) clampScroll() {
+	if m.cursor < m.offset {
+		m.offset = m.cursor
+	}
+	if m.cursor >= m.offset+m.viewSize {
+		m.offset = m.cursor - m.viewSize + 1
+	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
+}
+
+func (m *resumePickerModel) View() tea.View {
+	var (
+		header   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffd54f")).Bold(true)
+		cursor   = lipgloss.NewStyle().Foreground(lipgloss.Color("#82aaff")).Bold(true)
+		selected = lipgloss.NewStyle().Foreground(lipgloss.Color("#82aaff")).Bold(true)
+		idCol    = lipgloss.NewStyle().Foreground(lipgloss.Color("#c792ea"))
+		titleCol = lipgloss.NewStyle()
+		muted    = lipgloss.NewStyle().Foreground(lipgloss.Color("#90a4ae"))
+		dim      = lipgloss.NewStyle().Foreground(lipgloss.Color("#5c6370"))
+	)
+
+	var b []string
+	b = append(b, "")
+	b = append(b, header.Render(fmt.Sprintf("Resume session  (%d of %d)", m.cursor+1, len(m.entries))))
+	b = append(b, dim.Render("  ─────────────────────────────────────────────────────────"))
+
+	end := m.offset + m.viewSize
+	if end > len(m.entries) {
+		end = len(m.entries)
+	}
+	for i := m.offset; i < end; i++ {
+		e := m.entries[i]
+		title := e.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		date := e.CreatedAt.Format("2006-01-02 15:04")
+		// Compose the row. Format:
+		//   ❯ <full-uuid>  <date>  <title>
+		// Truncate the title rather than the id so the user can always
+		// copy/paste the full id from the row they have under the
+		// cursor.
+		row := fmt.Sprintf("%s  %s  %s", idCol.Render(e.ID), muted.Render(date), titleCol.Render(title))
+		if i == m.cursor {
+			b = append(b, cursor.Render("❯ ")+selected.Render(stripStyles(row)))
+		} else {
+			b = append(b, "  "+row)
+		}
+	}
+	if m.offset > 0 {
+		b = append(b, dim.Render(fmt.Sprintf("  ↑ %d more above", m.offset)))
+	}
+	if end < len(m.entries) {
+		b = append(b, dim.Render(fmt.Sprintf("  ↓ %d more below", len(m.entries)-end)))
+	}
+	b = append(b, "")
+	b = append(b, muted.Render("  ↑↓/jk · PgUp/PgDn · g/G · 1-9 quick-pick · Enter resume · Esc cancel"))
+	b = append(b, "")
+	return tea.NewView(strings.Join(b, "\n"))
+}
+
+// stripStyles strips lipgloss escape sequences from a pre-styled row so
+// the row can be re-rendered under the selected style without nested
+// escapes (which lipgloss handles, but the nested form sometimes drops
+// trailing styles). Cheap regex-free strip — the ANSI form is fixed.
+func stripStyles(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			// Skip until the final letter of the ANSI sequence.
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				i = j
+			}
+			continue
+		}
+		out = append(out, s[i])
+	}
+	return string(out)
+}
+
+// runResumePickerFallback is the legacy printf+Scan path used when
+// bubbletea can't start (no PTY, harness/CI without a tty). Same
+// behaviour the picker had before 2026-05-13: numbered list,
+// `enter the number` prompt. Kept tight: 8 rows max so the
+// fallback stays terse.
+func runResumePickerFallback(store *session.Store, entries []session.ListEntry) (string, error) {
+	const limit = 8
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	fmt.Fprintln(os.Stderr, "Resume which session?")
 	for i, e := range entries {
 		title := e.Title
 		if title == "" {
 			title = "(untitled)"
 		}
-		fmt.Fprintf(os.Stderr, "  %s%2d.%s %-12s  %s%s · %s%s\n",
-			bold, i+1, reset,
-			short12(e.ID),
-			dim, e.CreatedAt.Format("2006-01-02 15:04"), title, reset)
+		fmt.Fprintf(os.Stderr, "  %2d. %s  %s  %s\n",
+			i+1, e.ID, e.CreatedAt.Format("2006-01-02 15:04"), title)
 	}
-	fmt.Fprintf(os.Stderr, "\n%sPick number (or `q` / Enter for fresh):%s ", bold, reset)
-	r := bufio.NewReader(os.Stdin)
-	line, err := r.ReadString('\n')
-	if err != nil {
-		// EOF / closed stdin — start fresh rather than blocking.
-		fmt.Fprintln(os.Stderr, "")
+	fmt.Fprint(os.Stderr, "Pick number (or `q` / Enter for fresh): ")
+	var line string
+	if _, err := fmt.Fscanln(os.Stdin, &line); err != nil {
 		return "", nil
 	}
 	line = strings.TrimSpace(line)
 	if line == "" || line == "q" || line == "Q" || line == "0" {
-		fmt.Fprintln(os.Stderr, "(starting fresh)")
 		return "", nil
 	}
 	n, err := strconv.Atoi(line)
@@ -104,17 +306,19 @@ func runResumePicker(store *session.Store) (string, error) {
 		fmt.Fprintf(os.Stderr, "(invalid choice %q — starting fresh)\n", line)
 		return "", nil
 	}
-	chosen := entries[n-1].ID
-	fmt.Fprintf(os.Stderr, "%s→ resuming %s%s\n", dim, short12(chosen), reset)
-	return chosen, nil
+	return entries[n-1].ID, nil
 }
 
-// short12 truncates a UUID to its first 12 characters for display.
-// 12 is enough to disambiguate any two sessions you'd be looking at
-// in `metis ps`. Pulled out so callers don't repeat the slice math.
+// short12 is preserved as an exported helper for callers that still
+// want a compact representation (logs, status bar). Picker rows no
+// longer use it.
 func short12(id string) string {
 	if len(id) > 12 {
 		return id[:12]
 	}
 	return id
 }
+
+// Compile-time sanity that time.Time stays imported (we use it via
+// session.ListEntry.CreatedAt above).
+var _ = time.Time{}
