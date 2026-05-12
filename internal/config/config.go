@@ -554,7 +554,21 @@ func defaults() *Config {
 		Tools: Tools{
 			Bash: ToolBashSettings{
 				TimeoutSeconds: 120,
-				MaxOutputBytes: 1 << 20, // 1 MiB
+				// 32 KiB — matches claude-code's BASH_MAX_OUTPUT_DEFAULT
+				// (30k chars, see opensource-contributions/
+				// claude-code-sourcemap utils/shell/outputLimits.ts).
+				// The previous 1 MiB cap let a single `make build` /
+				// `git log` / verbose Cargo output drop ~250k tokens
+				// into history forever; users hit "second turn already
+				// 50k tokens" as a result. The cap can be raised per-
+				// project via `[tools.bash] max_output_bytes = N` in
+				// config.toml — the data we DO want to keep is usually
+				// near the start (compile errors) or end (final
+				// status), and Bash's truncation marker tells the model
+				// when output got clipped so it can re-run with a
+				// narrower filter (head, tail, grep) instead of
+				// silently losing context.
+				MaxOutputBytes: 32 * 1024,
 				Shell:          shellDefault(),
 				// Baseline floor — three classic destructive idioms that
 				// the security audit (internal/security) flags as required.

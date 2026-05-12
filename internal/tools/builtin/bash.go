@@ -427,7 +427,12 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	var buf bytes.Buffer
 	maxBytes := b.settings.MaxOutputBytes
 	if maxBytes <= 0 {
-		maxBytes = 1 << 20
+		// In-process default — matches the config default
+		// (config.go::DefaultConfig).
+		// Keep these two in sync. Smaller than the previous 1 MiB so
+		// a single chatty Bash call doesn't poison history with 250k
+		// tokens of build log.
+		maxBytes = 32 * 1024
 	}
 	cappedBuf := &cappedWriter{w: &buf, max: maxBytes}
 
