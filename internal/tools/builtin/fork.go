@@ -118,7 +118,14 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	}
 
 	maxIter := intArg(in, "max_iter", 20)
-	sub := agent.NewLoop(f.provider, f.registry, f.gate, agent.NewHookRegistry(), snap.System, maxIter)
+	// G.13 (2026-05-12) — Fork is the warm-context spawn path.
+	// Prepend the fork preamble so the child knows it can see the
+	// parent's full history above and shouldn't re-explore.
+	subSystem := agent.BuildSubPrompt(agent.SubPromptInputs{
+		Mode: agent.SubPromptFork,
+		Base: snap.System,
+	})
+	sub := agent.NewLoop(f.provider, f.registry, f.gate, agent.NewHookRegistry(), subSystem, maxIter)
 	if snap.Model != "" {
 		sub.Model = snap.Model
 	}

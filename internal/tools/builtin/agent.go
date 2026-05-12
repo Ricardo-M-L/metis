@@ -368,10 +368,27 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 
 	// Sub-loop construction is identical in both paths.
 	maxIter := intArg(in, "max_iter", 10)
-	subSystem := a.system
-	if a.minimalSystem != "" {
-		subSystem = a.minimalSystem
+	// G.13 (2026-05-12) — pick the right sub-agent prompt template.
+	// Named teammates get extra peer-messaging guidance; anonymous
+	// spawns get the focused-task posture. Both prepend the role
+	// preamble to whatever the parent's minimalSystem already had.
+	subPromptMode := agent.SubPromptAgent
+	teammateName := ""
+	if teammate != nil {
+		teammateName = teammate.Name
+		if !teammate.Anonymous {
+			subPromptMode = agent.SubPromptTeammate
+		}
 	}
+	base := a.system
+	if a.minimalSystem != "" {
+		base = a.minimalSystem
+	}
+	subSystem := agent.BuildSubPrompt(agent.SubPromptInputs{
+		Mode:         subPromptMode,
+		Base:         base,
+		TeammateName: teammateName,
+	})
 
 	// G.9 (2026-05-12) — give the sub-agent its OWN gate so a
 	// child's permission-mode flip doesn't leak back into the parent
