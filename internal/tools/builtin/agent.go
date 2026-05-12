@@ -217,6 +217,11 @@ func (Agent) InputSchema() map[string]any {
 				"type":        "string",
 				"description": "Resume a previously-paused sub-agent by its agent_id (e.g. \"agt-d3a91b07\"). The on-disk transcript is replayed and a fresh sub-loop continues from the last turn. The `prompt` field is used as a follow-up turn appended to the recovered history. Use with care: a sub-agent that's still alive somewhere else WILL cause undefined behavior — resume only after the original sub-agent's run has fully ended (SubAgentList shows it gone, or you killed it via SubAgentStop).",
 			},
+			"permission_mode": map[string]any{
+				"type":        "string",
+				"enum":        []string{"ask", "auto", "bypass", "plan", "deny"},
+				"description": "Override the permission mode for this sub-agent's gate. The parent's gate is unchanged; the sub-agent gets a clone with its own mode + a fresh denial-streak counter. Useful for letting an explore-agent run with `auto` while the parent stays in `ask`. Omit to inherit the parent's current mode.",
+			},
 		},
 	}
 }
@@ -367,7 +372,19 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	if a.minimalSystem != "" {
 		subSystem = a.minimalSystem
 	}
-	sub := agent.NewLoop(a.provider, a.registry, a.gate, agent.NewHookRegistry(), subSystem, maxIter)
+
+	// G.9 (2026-05-12) — give the sub-agent its OWN gate so a
+	// child's permission-mode flip doesn't leak back into the parent
+	// (and so the sub-agent's denial-streak counter doesn't bleed
+	// into the parent's circuit breaker). The clone shares rules +
+	// classifier — the snapshot is mode + rules at spawn time.
+	// Profile-driven mode comes via the schema field `permission_mode`.
+	subGate := a.gate.Clone()
+	if pm, _ := in["permission_mode"].(string); pm != "" {
+		subGate.SetMode(permission.Mode(pm))
+	}
+
+	sub := agent.NewLoop(a.provider, a.registry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
 	// G.4 — restore prior conversation history BEFORE appending the
 	// new prompt. This way the resumed sub-agent sees the recovered
@@ -408,7 +425,10 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			a.parentSessionID,
 			teammate.Name,
 			subCwd,
-			string(a.gate.Mode()),
+			// G.9 — record the sub-agent's effective mode (post
+			// permission_mode override), not the parent's, so
+			// `/agents resume` rebuilds the same posture.
+			string(subGate.Mode()),
 		)
 		t, err := agent.NewSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
 		if err == nil {

@@ -276,6 +276,38 @@ func (g *Gate) Mode() Mode {
 	return g.mode
 }
 
+// Clone returns a fresh Gate carrying a SNAPSHOT of this gate's
+// state — mode, rules, denial limits, classifier — but with its own
+// mutex. Used by sub-agents (G.9, 2026-05-12) so a child loop can
+// temporarily flip into `auto` while the parent stays `ask`, without
+// the change leaking back into the parent's gate or contending on
+// the parent's lock. The clone's memoAllow / denial counters are
+// FRESH — each sub-agent starts with a clean "ask once, remember
+// for the session" memo, and its denial streak doesn't bleed into
+// the parent's circuit breaker state.
+//
+// The classifier is shared (pointer) — it's a stateless inspector,
+// so cloning is unnecessary.
+//
+// Mirrors claude-code's PermissionGate.fork() pattern.
+func (g *Gate) Clone() *Gate {
+	if g == nil {
+		return nil
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	rulesCopy := make([]Rule, len(g.rules))
+	copy(rulesCopy, g.rules)
+	return &Gate{
+		mode:         g.mode,
+		rules:        rulesCopy,
+		memoAllow:    make(map[string]bool),
+		classifier:   g.classifier,
+		denialLimits: g.denialLimits,
+		// Counters + breakers start fresh by design.
+	}
+}
+
 func (g *Gate) SetMode(m Mode) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
