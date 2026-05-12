@@ -246,7 +246,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	}
 
 	// Phase 1: classify ready jobs by concurrency tier and execute.
-	var safeJobs, queueJobs, exclJobs []*job
+	var safeJobs, queueJobs, exclJobs, bgJobs []*job
 	for _, j := range jobs {
 		if j == nil || j.early != nil || !j.ready {
 			continue
@@ -256,6 +256,8 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			safeJobs = append(safeJobs, j)
 		case tools.ConcurrencyQueue:
 			queueJobs = append(queueJobs, j)
+		case tools.ConcurrencyBackground:
+			bgJobs = append(bgJobs, j)
 		default:
 			exclJobs = append(exclJobs, j)
 		}
@@ -291,6 +293,33 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			}
 		}()
 	}
+
+	// Phase 1c (G.1, 2026-05-12): fire-and-forget background tools.
+	// Tools that declare ConcurrencyBackground (e.g. `Agent` when
+	// `run_in_background:true`) get their Execute() invoked in a
+	// detached goroutine; the dispatcher synthesizes a placeholder
+	// tool_result immediately so the model can keep streaming without
+	// waiting for completion.
+	//
+	// The Tool itself is responsible for returning a fast handshake
+	// result (job_id) inside its goroutine and posting the final
+	// outcome through the jobs.Registry notification channel — same
+	// pattern Bash uses for run_in_background commands. We don't
+	// touch results[] here because the Tool already wrote a synchronous
+	// handshake result; see internal/tools/builtin/agent.go::Execute
+	// for the background branch.
+	//
+	// Why not just include in safeJobs: a background tool's Execute is
+	// "instant" (it spawns + returns), but its concurrency semantics
+	// are distinct from safe — running 5 background sub-agents IS a
+	// legitimate parallel side effect that the model is explicitly
+	// asking for. Keeping them in their own tier makes the dispatch
+	// graph readable and lets future scheduling policy hook in here
+	// (e.g., rate-limiting background spawns).
+	for _, j := range bgJobs {
+		results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc)
+	}
+
 	wg.Wait()
 
 	// Phase 2: serialize exclusive tools. Order preserved by insertion.

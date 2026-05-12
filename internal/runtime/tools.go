@@ -98,7 +98,9 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	}
 	// Agent tool: needs the provider + registry references that
 	// builtin.Register doesn't see. Roster + DefaultTimeout wire in
-	// G.0's concurrency cap + wall-clock budget.
+	// G.0's concurrency cap + wall-clock budget. JobsPool wires
+	// G.1's run_in_background path through the bash job pool's
+	// notification channel.
 	agentTool := builtin.NewAgentWithMinimal(opts.Gate, opts.Provider, reg, opts.Model, opts.System, opts.MinimalSystem)
 	if opts.Roster != nil {
 		agentTool = agentTool.WithRoster(opts.Roster)
@@ -106,7 +108,17 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	if opts.Cfg != nil && opts.Cfg.Agents.DefaultTimeoutSeconds > 0 {
 		agentTool = agentTool.WithDefaultTimeout(time.Duration(opts.Cfg.Agents.DefaultTimeoutSeconds) * time.Second)
 	}
+	if opts.Jobs != nil {
+		agentTool = agentTool.WithJobsPool(opts.Jobs)
+	}
 	reg.Register(agentTool)
+	// SubAgent reader tools (G.1, 2026-05-12) — SubAgentList /
+	// SubAgentOutput / SubAgentStop. Mirrors AttachJobsRegistry for
+	// bash. Roster nil → graceful no-op (tools register but report
+	// "no sub-agents" instead of panicking).
+	if opts.Roster != nil {
+		builtin.AttachSubAgentTools(reg, opts.Gate, opts.Roster)
+	}
 	// Fork tool: same wiring as Agent, different semantics — child
 	// inherits parent history+system instead of starting cold.
 	reg.Register(builtin.NewFork(opts.Gate, opts.Provider, reg))

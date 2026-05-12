@@ -1687,6 +1687,11 @@ func cmdTools() error {
 	// Fork (warm-start sub-agent) — same informational-listing path.
 	// Real wiring lives in runtime.tools.go for live sessions.
 	reg.Register(builtin.NewFork(gate, nil, reg))
+	// SubAgent reader tools (G.1, 2026-05-12) — listing them so the user
+	// sees the full background-sub-agent surface area, even though
+	// Execute will refuse (no Roster wired in this code path).
+	tmpRoster := agent.NewRoster(0)
+	builtin.AttachSubAgentTools(reg, gate, tmpRoster)
 	// Same for SendMessage — its real wiring lives in setupRuntime, but
 	// we want it visible in `metis tools` so users know the capability
 	// exists without firing up a chat session.

@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,22 +48,65 @@ type PeerMessage struct {
 	Sent time.Time
 }
 
+// TeammateStatus is the lifecycle stage of a sub-agent.
+// Monotonic except Killed which can come from any non-terminal state.
+type TeammateStatus int
+
+const (
+	// StatusRunning — sub-loop active, output growing.
+	StatusRunning TeammateStatus = iota
+	// StatusCompleted — sub-loop ended cleanly (end_turn / no_tool_calls).
+	StatusCompleted
+	// StatusFailed — sub-loop errored (timeout, panic, provider error).
+	StatusFailed
+	// StatusKilled — SubAgentStop or Roster.CancelAll terminated it.
+	StatusKilled
+)
+
+func (s TeammateStatus) String() string {
+	switch s {
+	case StatusRunning:
+		return "running"
+	case StatusCompleted:
+		return "completed"
+	case StatusFailed:
+		return "failed"
+	case StatusKilled:
+		return "killed"
+	}
+	return "unknown"
+}
+
 // Teammate is one live sub-agent's roster entry.
+//
+// Output is the running text-delta accumulator for SubAgentOutput. It
+// grows as the sub-loop streams text and freezes when Status leaves
+// Running. Kept in-memory because sub-agent output is small relative
+// to bash (no `tail -f /var/log` style firehose) and the simpler model
+// makes the SubAgentOutput tool a synchronous read instead of disk I/O.
 type Teammate struct {
+	mu sync.RWMutex // guards Status / Output / Result / EndTime / ExitErr
+
 	// Name is what callers pass via `Agent({name: ...})`. Anonymous
 	// sub-agents get an auto-generated `_anon-<8hex>` prefix so the
 	// Roster doesn't need a second path.
 	Name string
 
-	// AgentID — when the sub-agent runs in the background it's the
-	// jobs.Job id; foreground sub-agents carry a session-local id so
-	// /agents can address them.
+	// AgentID — short hex (`agt-<8hex>`) that the model uses to address
+	// this sub-agent via SubAgentOutput / SubAgentStop. Returned as
+	// part of the run_in_background handshake tool_result.
 	AgentID string
 
 	// Anonymous flags auto-generated names so UI can hide them from
 	// the roster view (`/agents list`) by default — claude-code
 	// shows only named teammates by default too.
 	Anonymous bool
+
+	// Background true means this sub-agent was spawned with
+	// `run_in_background:true`. UI uses this to decide whether to
+	// auto-block the parent on its completion (foreground) or render
+	// a non-blocking pill (background).
+	Background bool
 
 	Started time.Time
 
@@ -74,6 +118,81 @@ type Teammate struct {
 	// Cancel terminates the sub-agent's context. Called by /agents kill
 	// and by the Roster when parent ctx is cancelled.
 	Cancel func()
+
+	// Status / Output / Result / EndTime / ExitErr — set by the
+	// sub-loop's runner goroutine; read via Snapshot() under the mutex
+	// so SubAgentOutput / SubAgentList never race the streaming writer.
+	Status   TeammateStatus
+	Output   strings.Builder
+	Result   string // final text on Completed, last partial on Killed/Failed
+	EndTime  time.Time
+	ExitErr  error
+	StopHint string // user-facing reason ("timeout 600s", "user kill", "max_iter exhausted")
+}
+
+// AppendText is the streaming-text accumulator. Called by the
+// sub-agent's event-forwarding goroutine on every EventTextDelta;
+// SubAgentOutput reads what's been accumulated so far via Snapshot().
+func (t *Teammate) AppendText(s string) {
+	if s == "" {
+		return
+	}
+	t.mu.Lock()
+	t.Output.WriteString(s)
+	t.mu.Unlock()
+}
+
+// Finish atomically transitions Status to a terminal state and
+// captures the final result. Safe to call once per Teammate; the
+// runner goroutine is responsible for not double-firing.
+func (t *Teammate) Finish(status TeammateStatus, result string, exitErr error, hint string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.Status != StatusRunning {
+		return // monotonic — first finish wins
+	}
+	t.Status = status
+	t.Result = result
+	t.ExitErr = exitErr
+	t.StopHint = hint
+	t.EndTime = time.Now()
+}
+
+// TeammateSnapshot is the read-only view returned by Teammate.Snapshot()
+// + Roster.List(). Detaches caller from the mutex so the reader can't
+// accidentally race the runner.
+type TeammateSnapshot struct {
+	Name       string
+	AgentID    string
+	Anonymous  bool
+	Background bool
+	Started    time.Time
+	Status     TeammateStatus
+	Output     string
+	Result     string
+	EndTime    time.Time
+	ExitErr    error
+	StopHint   string
+}
+
+// Snapshot returns a thread-safe copy of the Teammate's mutable state.
+// SubAgentOutput uses this to read the running buffer + status atomically.
+func (t *Teammate) Snapshot() TeammateSnapshot {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return TeammateSnapshot{
+		Name:       t.Name,
+		AgentID:    t.AgentID,
+		Anonymous:  t.Anonymous,
+		Background: t.Background,
+		Started:    t.Started,
+		Status:     t.Status,
+		Output:     t.Output.String(),
+		Result:     t.Result,
+		EndTime:    t.EndTime,
+		ExitErr:    t.ExitErr,
+		StopHint:   t.StopHint,
+	}
 }
 
 // Roster is the live-sub-agent registry. Thread-safe.
@@ -170,6 +289,22 @@ func (r *Roster) Lookup(name string) (*Teammate, bool) {
 	defer r.mu.RUnlock()
 	t, ok := r.teammates[name]
 	return t, ok
+}
+
+// LookupByAgentID finds a teammate by their AgentID (the `agt-<8hex>`
+// handle returned to the model in run_in_background's tool_result).
+// Used by SubAgentOutput / SubAgentStop which receive the agent_id
+// rather than the name. Linear scan because the typical Roster size
+// is < 10 — a separate index isn't worth the maintenance.
+func (r *Roster) LookupByAgentID(id string) (*Teammate, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, t := range r.teammates {
+		if t.AgentID == id {
+			return t, true
+		}
+	}
+	return nil, false
 }
 
 // List returns a snapshot of all teammates sorted by Started (oldest

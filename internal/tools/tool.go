@@ -29,14 +29,15 @@ type (
 )
 
 const (
-	PermissionAsk        = pubtool.PermissionAsk
-	PermissionAllow      = pubtool.PermissionAllow
-	PermissionDeny       = pubtool.PermissionDeny
-	ConcurrencySafe      = pubtool.ConcurrencySafe
-	ConcurrencyExclusive = pubtool.ConcurrencyExclusive
-	ConcurrencyQueue     = pubtool.ConcurrencyQueue
-	InterruptCancel      = pubtool.InterruptCancel
-	InterruptBlock       = pubtool.InterruptBlock
+	PermissionAsk         = pubtool.PermissionAsk
+	PermissionAllow       = pubtool.PermissionAllow
+	PermissionDeny        = pubtool.PermissionDeny
+	ConcurrencySafe       = pubtool.ConcurrencySafe
+	ConcurrencyExclusive  = pubtool.ConcurrencyExclusive
+	ConcurrencyQueue      = pubtool.ConcurrencyQueue
+	ConcurrencyBackground = pubtool.ConcurrencyBackground
+	InterruptCancel       = pubtool.InterruptCancel
+	InterruptBlock        = pubtool.InterruptBlock
 )
 
 // Re-exports for the optional capability helpers in pkg/tool. Existing

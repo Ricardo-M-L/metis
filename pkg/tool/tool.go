@@ -53,12 +53,20 @@ const (
 //     to the network" use Safe and let HTTP retry handle throttling.
 //   - ConcurrencyExclusive: write/exec — serialize within the batch
 //     AFTER the safe + queue work completes. Bash/Edit/Write live here.
+//   - ConcurrencyBackground: fire-and-forget — the dispatcher records a
+//     job_id and returns immediately while the actual work runs in a
+//     goroutine backed by jobs.Registry. Mirrors claude-code's
+//     `run_in_background: true` semantics on AgentTool. Concrete fits:
+//     `Agent({run_in_background: true})` so the parent loop can spawn
+//     N sub-agents and keep working; long-running shell commands that
+//     would otherwise block a turn. Added 2026-05-12 (Phase G.1).
 type Concurrency int
 
 const (
 	ConcurrencySafe Concurrency = iota
 	ConcurrencyExclusive
 	ConcurrencyQueue
+	ConcurrencyBackground
 )
 
 // Result is what a tool returns to the agent loop.
