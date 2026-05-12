@@ -231,6 +231,10 @@ type runtime struct {
 	mcpServers        []*mcptools.Server
 	plugins           *rtpkg.PluginRegistry // nil when no plugins installed
 	allowedDirs       *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
+	// autoMemExtractor is the live G.5 DreamTask handle. Surfaced
+	// to the slash registry so /dream status can read phase + last-
+	// run stats. nil when --auto-memory isn't set.
+	autoMemExtractor *agent.AutoMemoryExtractor
 }
 
 // Cleanup closes any subprocesses or connections owned by the runtime.
@@ -774,6 +778,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		loop.Fast = true
 	}
 
+	// G.5 — stash the auto-memory extractor on this var so the
+	// `rt` struct below can pick it up for /dream status. Declared
+	// outside the if-block so the unconditional rt assignment
+	// compiles in either branch.
+	var pendingExtractor *agent.AutoMemoryExtractor
+
 	// Auto-memory v2: opt-in via --auto-memory or METIS_AUTO_MEMORY=1.
 	// Wires the extractor to LoopEnd; extractor itself is best-effort
 	// and never blocks the turn.
@@ -784,12 +794,24 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			fmt.Fprintf(os.Stderr, "metis: auto-memory init: %v (disabled)\n", err)
 		} else {
 			fmt.Fprintf(os.Stderr, "metis: auto-memory enabled (memdir: %s)\n", ext.MemdirRoot())
+			// G.5 (2026-05-12) — DreamTask completion channel.
+			// Buffered so the extractor never blocks on its
+			// notify-send if the model is still mid-turn; size 8
+			// is generous (a 5-minute auto-memory session rarely
+			// fires more than 1-2 forks).
+			dreamCh := make(chan agent.DreamNotification, 8)
+			loop.DreamNotify = dreamCh
+			ext.SetDreamNotify(dreamCh)
 			loop.Hooks.Register(pubhook.LoopEndHandler(func(ctx context.Context, _ pubhook.Context, stopReason string) {
 				if os.Getenv("METIS_AUTO_MEMORY_DEBUG") == "1" {
 					fmt.Fprintf(os.Stderr, "[auto-memory] LoopEnd stop=%s — invoking extractor\n", stopReason)
 				}
 				ext.OnLoopEnd(ctx, stopReason)
 			}))
+			// Stash on the runtime so the `/dream` slash command
+			// can read live phase + last-run stats. Wired below
+			// after the `rt` struct is constructed.
+			pendingExtractor = ext
 		}
 	}
 
@@ -797,9 +819,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model,
-		mcpServers:  mcpServers,
-		plugins:     pluginReg,
-		allowedDirs: allowedDirs,
+		mcpServers:       mcpServers,
+		plugins:          pluginReg,
+		allowedDirs:      allowedDirs,
+		autoMemExtractor: pendingExtractor,
 	}
 
 	// Resolve resume target. Order: explicit --resume <id> wins; then
@@ -2003,6 +2026,13 @@ func buildSlash(rt *runtime) *slash.Registry {
 		rt.gate.SetMode(permission.Mode(arg))
 		return "mode set to " + arg, slash.SignalNone
 	}})
+	// /dream — DreamTask (auto-memory) status (G.5, 2026-05-12).
+	// Reads the live extractor's phase + last-run stats. Off-mode
+	// when --auto-memory wasn't set: returns a hint about enabling
+	// it instead of failing silently.
+	r.Register(slash.Cmd{Name: "dream", Description: "DreamTask status — current phase, last run files & duration", Handler: func(arg string) (string, slash.Signal) {
+		return formatDreamStatus(rt.autoMemExtractor, arg), slash.SignalNone
+	}})
 	// User-authored commands from ~/.metis/commands/*.md and
 	// <cwd>/.metis/commands/*.md. Loaded LAST so a user .md can't
 	// shadow a built-in (LoadCustomCommands refuses to register on
@@ -2023,6 +2053,41 @@ func buildSlash(rt *runtime) *slash.Registry {
 		_ = registerMCPPromptsAsSlash(r, handles)
 	}
 	return r
+}
+
+// formatDreamStatus renders /dream output (G.5, 2026-05-12). When
+// the extractor is nil, returns a hint about enabling auto-memory.
+// `arg` is the slash command's trailing text — only "status" (or
+// empty) is supported today; other tokens get a usage hint so
+// future subcommands have an obvious extension point.
+func formatDreamStatus(ext *agent.AutoMemoryExtractor, arg string) string {
+	sub := strings.TrimSpace(strings.ToLower(arg))
+	if sub != "" && sub != "status" {
+		return "(dream: unknown subcommand — usage: /dream [status])"
+	}
+	if ext == nil {
+		return "(dream: auto-memory not enabled — run metis with --auto-memory or set METIS_AUTO_MEMORY=1)"
+	}
+	st := ext.Stats()
+	var b strings.Builder
+	fmt.Fprintf(&b, "DreamTask status\n")
+	fmt.Fprintf(&b, "  phase            : %s\n", st.Phase)
+	fmt.Fprintf(&b, "  total runs       : %d\n", st.TotalExtractions)
+	fmt.Fprintf(&b, "  in flight        : %t\n", st.InProgress)
+	fmt.Fprintf(&b, "  trailing pending : %t\n", st.Pending)
+	if !st.LastFiredAt.IsZero() {
+		fmt.Fprintf(&b, "  last fired       : %s ago\n", time.Since(st.LastFiredAt).Truncate(time.Second))
+	}
+	if st.LastDuration > 0 {
+		fmt.Fprintf(&b, "  last duration    : %s\n", st.LastDuration.Truncate(time.Millisecond))
+	}
+	if len(st.LastFilesTouched) > 0 {
+		fmt.Fprintf(&b, "  last files       : %s\n", strings.Join(st.LastFilesTouched, ", "))
+	} else if st.TotalExtractions > 0 {
+		fmt.Fprintf(&b, "  last files       : (none — scan complete, nothing new)\n")
+	}
+	fmt.Fprintf(&b, "  memdir           : %s\n", ext.MemdirRoot())
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func writeStarterConfig() error {

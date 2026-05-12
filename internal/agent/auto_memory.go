@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,33 @@ const AutoMemoryMinInterval = 60 * time.Second
 // openclaude — well-behaved extractions complete in 2-4 (read manifest
 // → optionally Read existing files → Edit/Write 1+ files → done).
 const MaxExtractorTurns = 5
+
+// DreamPhase mirrors claude-code's DreamTask.ts state model (G.5,
+// 2026-05-12). The extractor walks through these phases on every fork
+// so /dream status can show "currently scanning conversation" vs
+// "writing 3 memory files" without the user having to grep
+// debug.log. Values are stable for tooling.
+type DreamPhase string
+
+const (
+	DreamPhaseIdle       DreamPhase = "idle"
+	DreamPhaseStarting   DreamPhase = "starting"
+	DreamPhaseExtracting DreamPhase = "extracting"
+	DreamPhaseWriting    DreamPhase = "writing"
+	DreamPhaseDone       DreamPhase = "done"
+)
+
+// DreamNotification is delivered on Loop.DreamNotify when a
+// background extraction completes. The Loop drains the channel at
+// iteration boundaries (mirrors job_notify.go) and synthesizes a
+// <memory_consolidation_done> system-reminder for the model.
+type DreamNotification struct {
+	Phase        DreamPhase
+	FilesTouched []string
+	Duration     time.Duration
+	SessionCount int
+	Err          error
+}
 
 // AutoMemoryExtractor is the long-lived helper attached to a Loop. It
 // owns the cursor + in-flight + pending state that openclaude calls
@@ -95,6 +123,30 @@ type AutoMemoryExtractor struct {
 	// memdirRoot caches the resolved memdir path so we don't hit
 	// os.UserHomeDir per invocation.
 	memdirRoot string
+
+	// Phase is the current DreamTask state (G.5). Tracked alongside
+	// the legacy inProgress bool so existing call sites stay
+	// unchanged while /dream status can read the finer-grained
+	// state. Idle when no fork is active.
+	phase DreamPhase
+
+	// lastFilesTouched lists which memory files were modified by the
+	// most recent fork (computed by diffing memdir contents before vs
+	// after). Snapshotted into ExtractorStats so /dream can show
+	// "wrote feedback_chinese_replies.md, project_release_freeze.md".
+	lastFilesTouched []string
+
+	// lastDuration is the wall-clock duration of the most recent
+	// extraction (start of runOnce → end). Used by /dream status to
+	// help the user judge if extractions are blowing past expected
+	// budgets.
+	lastDuration time.Duration
+
+	// dreamNotify is the optional outbound channel. When non-nil the
+	// extractor posts a DreamNotification on every completed fork
+	// (success or failure), so the parent Loop can inject a
+	// <memory_consolidation_done> system-reminder on its next iter.
+	dreamNotify chan<- DreamNotification
 }
 
 // NewAutoMemoryExtractor wires an extractor to a loop. memdirRoot
@@ -124,6 +176,16 @@ func NewAutoMemoryExtractor(loop *Loop, memdirRoot string) (*AutoMemoryExtractor
 // to. Exposed for the /memory slash command + tests.
 func (e *AutoMemoryExtractor) MemdirRoot() string { return e.memdirRoot }
 
+// SetDreamNotify wires the outbound notification channel. The Loop
+// owns the channel and drains it on iteration boundaries.
+// Idempotent — passing nil disables notifications without disturbing
+// in-flight work. (G.5, 2026-05-12)
+func (e *AutoMemoryExtractor) SetDreamNotify(ch chan<- DreamNotification) {
+	e.mu.Lock()
+	e.dreamNotify = ch
+	e.mu.Unlock()
+}
+
 // Stats returns a point-in-time snapshot of extractor state.
 type ExtractorStats struct {
 	LastProcessedIdx int
@@ -131,17 +193,34 @@ type ExtractorStats struct {
 	InProgress       bool
 	Pending          bool
 	LastFiredAt      time.Time
+	// G.5 — DreamTask state model.
+	Phase            DreamPhase
+	LastFilesTouched []string
+	LastDuration     time.Duration
 }
 
 func (e *AutoMemoryExtractor) Stats() ExtractorStats {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	phase := e.phase
+	if phase == "" {
+		phase = DreamPhaseIdle
+	}
+	// Copy slice so callers can't race with a future runOnce mutating
+	// e.lastFilesTouched while they format their /dream output.
+	var ft []string
+	if len(e.lastFilesTouched) > 0 {
+		ft = append(ft, e.lastFilesTouched...)
+	}
 	return ExtractorStats{
 		LastProcessedIdx: e.lastProcessedIdx,
 		TotalExtractions: e.totalExtractions,
 		InProgress:       e.inProgress,
 		Pending:          e.pending,
 		LastFiredAt:      e.lastFiredAt,
+		Phase:            phase,
+		LastFilesTouched: ft,
+		LastDuration:     e.lastDuration,
 	}
 }
 
@@ -217,13 +296,57 @@ func (e *AutoMemoryExtractor) OnLoopEnd(ctx context.Context, stop string) {
 // build the prompt + manifest, call RunForkedAgentInstrumented,
 // regenerate MEMORY.md from the post-fork directory, then service any
 // pending trailing run.
+//
+// G.5 (2026-05-12) — tracks DreamTask phase transitions
+// (starting → extracting → writing → done) and posts a
+// DreamNotification on the Loop's outbound channel so the model
+// gets a <memory_consolidation_done> reminder on the next iter.
 func (e *AutoMemoryExtractor) runOnce(parentCtx context.Context) {
+	startedAt := time.Now()
+	// G.5 phase tracking — set "starting" up-front so /dream status
+	// shows activity even before the fork actually launches.
+	e.setPhase(DreamPhaseStarting)
+
+	// Snapshot the memdir's pre-state so we can diff it against the
+	// post-state and surface which files the fork actually touched.
+	// Use Background — the scan is filesystem-only and ms-fast, and
+	// we don't want parentCtx cancellation to leave us with a
+	// half-computed diff that wrongly attributes files as "touched".
+	pre, _ := snapshotMemdirNames(context.Background(), e.memdirRoot)
+
+	var runErr error
 	defer func() {
+		duration := time.Since(startedAt)
+		post, _ := snapshotMemdirNames(context.Background(), e.memdirRoot)
+		touched := diffMemdirNames(pre, post)
+
 		e.mu.Lock()
 		e.inProgress = false
+		e.phase = DreamPhaseDone
+		e.lastDuration = duration
+		e.lastFilesTouched = touched
 		shouldTrail := e.pending
 		e.pending = false
+		notifyCh := e.dreamNotify
+		sessionCount := e.totalExtractions
 		e.mu.Unlock()
+
+		// Best-effort notify — drop on full channel rather than
+		// block the runOnce defer chain. Mirrors the bash job pool
+		// notification pattern (jobs.Registry).
+		if notifyCh != nil {
+			select {
+			case notifyCh <- DreamNotification{
+				Phase:        DreamPhaseDone,
+				FilesTouched: append([]string(nil), touched...),
+				Duration:     duration,
+				SessionCount: sessionCount,
+				Err:          runErr,
+			}:
+			default:
+			}
+		}
+
 		if shouldTrail {
 			// Queue a trailing run on a fresh background ctx so a
 			// cancelled parent doesn't take the trailing extraction
@@ -240,6 +363,7 @@ func (e *AutoMemoryExtractor) runOnce(parentCtx context.Context) {
 
 	snap := SnapshotForFork(e.loop)
 	if snap == nil {
+		runErr = fmt.Errorf("snapshot returned nil")
 		return
 	}
 
@@ -250,6 +374,10 @@ func (e *AutoMemoryExtractor) runOnce(parentCtx context.Context) {
 
 	gate := CreateAutoMemCanUseTool(e.memdirRoot, e.loop.Registry)
 
+	// G.5 — flip to "extracting" once we actually invoke the fork.
+	// The fork itself can take 10-60s on slow providers; /dream
+	// status shows this phase for most of that wall-clock budget.
+	e.setPhase(DreamPhaseExtracting)
 	res, err := RunForkedAgent(ctx, ForkedAgentParams{
 		Cache:      *snap,
 		Prompt:     prompt,
@@ -274,9 +402,13 @@ func (e *AutoMemoryExtractor) runOnce(parentCtx context.Context) {
 		// Best-effort: we don't surface to the user. Extractor errors
 		// (network, provider 4xx, gate-denial-then-stuck) are logged
 		// to debug.log via the loop's existing transport logger.
+		runErr = err
 		return
 	}
 
+	// G.5 — "writing" phase covers the cursor bump + index
+	// regeneration that finalises the fork's output to disk.
+	e.setPhase(DreamPhaseWriting)
 	e.mu.Lock()
 	e.totalExtractions++
 	e.advanceCursorLocked()
@@ -297,6 +429,61 @@ func (e *AutoMemoryExtractor) runOnce(parentCtx context.Context) {
 	// growthbook stack), so we rely on the SubagentStop hook the fork
 	// already emitted to surface usage.
 	_ = res
+}
+
+// setPhase atomically transitions the DreamTask phase. Used as a
+// helper inside runOnce so we can sprinkle phase markers without
+// touching e.mu directly at every transition site.
+func (e *AutoMemoryExtractor) setPhase(p DreamPhase) {
+	e.mu.Lock()
+	e.phase = p
+	e.mu.Unlock()
+}
+
+// snapshotMemdirNames returns the set of `.md` basenames under root
+// at the time of the call. Used by runOnce to compute which files
+// the fork touched (created / modified). Filenames only — we don't
+// keep mtimes because the diff cares about presence, and Edit can
+// rewrite a file with identical content.
+func snapshotMemdirNames(ctx context.Context, root string) (map[string]struct{}, error) {
+	files, err := memdir.ScanMemoryFiles(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		out[filepath.Base(f.Path)] = struct{}{}
+	}
+	return out, nil
+}
+
+// diffMemdirNames returns the basenames of every file that's either
+// in `post` but not `pre` (newly written) or in `pre` but not `post`
+// (deleted). Sorted for stable rendering in /dream status output.
+func diffMemdirNames(pre, post map[string]struct{}) []string {
+	if pre == nil && post == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for k := range pre {
+		if _, ok := post[k]; !ok {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range post {
+		if _, ok := pre[k]; !ok {
+			seen[k] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // advanceCursorLocked moves lastProcessedIdx to the current

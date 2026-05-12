@@ -130,6 +130,16 @@ type Loop struct {
 	// has no Roster entry) and for headless tests.
 	PeerInbox <-chan PeerMessage
 
+	// DreamNotify is the receive end of the auto-memory extractor's
+	// completion channel (G.5, 2026-05-12). When the extractor's
+	// background fork finishes, it posts a DreamNotification here
+	// and the Run loop drains it on the next iteration boundary,
+	// synthesizing a <memory_consolidation_done> system-reminder so
+	// the model knows recent insights have been persisted. nil means
+	// auto-memory isn't wired (the common case for sub-agents and
+	// `metis run` one-shots).
+	DreamNotify <-chan DreamNotification
+
 	// Monitors is the per-line pattern-match registry. The Monitor
 	// tool registers a Watch on a freshly-spawned background job and
 	// the loop drains MonitorEvents at every iteration boundary,
@@ -427,6 +437,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// matching claude-code's <task_notification> envelope.
 		l.injectJobNotifications(out)
 		l.injectPeerMessages(out)
+		l.injectDreamNotifications(out)
 		// Same pattern for Monitor pattern-matches — pulls every
 		// MonitorEvent buffered since last iter and injects them as
 		// <monitor_event> system-reminders. Cheap when no Monitor is
