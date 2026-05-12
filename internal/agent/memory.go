@@ -274,6 +274,160 @@ func sortEntriesNewestFirst(entries []Entry) {
 	}
 }
 
+// snapshotsDir returns the on-disk path where named snapshots live.
+// Picked under the Store's primary write directory so each snapshot
+// is co-located with the memory it captures. For scoped stores it's
+// scopes[0]; for legacy stores it's Root.
+func (s *Store) snapshotsDir() string {
+	w := s.writeDir()
+	if w == "" {
+		return ""
+	}
+	return filepath.Join(w, "snapshots")
+}
+
+// Snapshot freezes the current memory state under `name` so it can
+// be Restored later — even from a new sub-agent run with no prior
+// state. Mirrors claude-code's agentMemorySnapshot pattern from
+// agent_profile.ts. Captures all type/jsonl files (fact, preference,
+// context) from the WRITE scope (scopes[0] in scoped mode, Root
+// otherwise). G.6 cascade scopes are NOT snapshotted — those layers
+// are typically the user's stable global memory and don't need to
+// be frozen with each per-task snapshot.
+//
+// Empty name returns an error. Snapshot overwrite is allowed
+// (rerunning the same `--memory-snapshot foo` call just refreshes
+// the saved state).
+func (s *Store) Snapshot(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return os.ErrInvalid
+	}
+	if !validSnapshotName(name) {
+		return os.ErrInvalid
+	}
+	src := s.writeDir()
+	if src == "" {
+		return os.ErrInvalid
+	}
+	dst := filepath.Join(s.snapshotsDir(), name)
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	for _, t := range []string{"fact", "preference", "context"} {
+		file := t + ".jsonl"
+		srcPath := filepath.Join(src, file)
+		dstPath := filepath.Join(dst, file)
+		raw, err := os.ReadFile(srcPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Source doesn't have this type yet — ignore; the
+				// snapshot for this type is just absent.
+				continue
+			}
+			return err
+		}
+		if err := os.WriteFile(dstPath, raw, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RestoreSnapshot replays the contents of a previously-Snapshotted
+// memory state into the Store's write directory. Existing entries
+// are preserved — Restore APPENDS the snapshotted entries rather
+// than wiping, so calling RestoreSnapshot on a populated store
+// produces a strict superset.
+//
+// Returns os.ErrNotExist when `name` has no on-disk snapshot.
+func (s *Store) RestoreSnapshot(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return os.ErrInvalid
+	}
+	srcDir := filepath.Join(s.snapshotsDir(), name)
+	if _, err := os.Stat(srcDir); err != nil {
+		return err
+	}
+	dst := s.writeDir()
+	if dst == "" {
+		return os.ErrInvalid
+	}
+	for _, t := range []string{"fact", "preference", "context"} {
+		file := t + ".jsonl"
+		srcPath := filepath.Join(srcDir, file)
+		raw, err := os.ReadFile(srcPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		dstPath := filepath.Join(dst, file)
+		f, err := os.OpenFile(dstPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(raw); err != nil {
+			f.Close()
+			return err
+		}
+		f.Close()
+	}
+	return nil
+}
+
+// ListSnapshots returns the names of every snapshot under the
+// Store's snapshot directory. Empty slice when no snapshots have
+// been taken yet. Used by /memory snapshots and tests.
+func (s *Store) ListSnapshots() ([]string, error) {
+	dir := s.snapshotsDir()
+	if dir == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		out = append(out, e.Name())
+	}
+	return out, nil
+}
+
+// validSnapshotName lets letters / digits / dash / underscore /
+// period through. Snapshots end up as directories so we reject
+// path separators, spaces, and leading dots to keep the filesystem
+// honest.
+func validSnapshotName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	if name[0] == '.' {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-' || r == '_' || r == '.':
+			// ok
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // loadFile decodes a single JSONL file. `scopeLabel` is stamped onto
 // every returned Entry's Scope field so scoped Query results can
 // render the source. Empty scopeLabel leaves Entry.Scope as "" (the

@@ -54,6 +54,24 @@ You are a code reviewer.`
 	}
 }
 
+// TestParseAgentProfile_MemorySnapshot — G.10 (2026-05-12) profile
+// frontmatter field. Profile picks up which named snapshot to
+// restore before the first turn.
+func TestParseAgentProfile_MemorySnapshot(t *testing.T) {
+	src := `---
+name: researcher
+memory_snapshot: research-cluster
+---
+You are a researcher.`
+	prof, err := parseAgentProfile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prof.MemorySnapshot != "research-cluster" {
+		t.Errorf("MemorySnapshot = %q, want research-cluster", prof.MemorySnapshot)
+	}
+}
+
 func TestParseAgentProfile_NoFrontmatter(t *testing.T) {
 	src := "Just a body, no frontmatter."
 	prof, err := parseAgentProfile(src)

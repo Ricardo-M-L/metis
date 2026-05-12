@@ -54,6 +54,14 @@ type AgentProfile struct {
 	Skills          []string // extra skills to load
 	OmitClaudeMd    bool     // skip ~/.metis/system.md addendum
 	SystemPrompt    string   // markdown body
+	// MemorySnapshot — G.10 (2026-05-12). When set, the agent.Store
+	// associated with this run RestoreSnapshot(name)'s the named
+	// snapshot before the first turn so the sub-agent picks up
+	// where a prior run of the same profile left off. The snapshot
+	// is taken with Store.Snapshot(name) by a separate flow
+	// (typically the user typing /memory snapshot <name> after a
+	// productive sub-agent session). Empty = no restore.
+	MemorySnapshot string
 }
 
 // LoadAgentProfile resolves NAME to a markdown file and parses it.
@@ -195,6 +203,8 @@ func applyFrontmatter(fm string, prof *AgentProfile) error {
 			prof.Skills = splitList(val)
 		case "omit_claude_md", "omitclaudemd":
 			prof.OmitClaudeMd = strings.EqualFold(val, "true") || val == "1"
+		case "memory_snapshot", "memorysnapshot":
+			prof.MemorySnapshot = val
 		}
 	}
 	return nil
