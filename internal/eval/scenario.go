@@ -229,6 +229,20 @@ func parseAssertions(body string) ([]Assertion, error) {
 			}
 			a.LengthMin = lo
 			a.LengthMax = hi
+		case "max_input_tokens":
+			a.Type = AssertMaxInputTokens
+			n, err := strconv.Atoi(strings.TrimSpace(rest))
+			if err != nil || n <= 0 {
+				return nil, fmt.Errorf("max_input_tokens %q must be a positive integer", rest)
+			}
+			a.MaxTokens = n
+		case "max_output_tokens":
+			a.Type = AssertMaxOutputTokens
+			n, err := strconv.Atoi(strings.TrimSpace(rest))
+			if err != nil || n <= 0 {
+				return nil, fmt.Errorf("max_output_tokens %q must be a positive integer", rest)
+			}
+			a.MaxTokens = n
 		default:
 			// Unknown key — skip silently so future scenarios with
 			// new keys don't break old metis builds.

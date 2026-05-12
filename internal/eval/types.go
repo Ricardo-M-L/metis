@@ -42,6 +42,10 @@ type Assertion struct {
 	// LengthMin / LengthMax: response character bounds (inclusive).
 	LengthMin int
 	LengthMax int
+
+	// MaxTokens: ceiling for token-budget assertions. The assertion
+	// type decides whether this caps input or output spend.
+	MaxTokens int
 }
 
 // AssertionType is the kind of rule. Add new ones in reward.go's
@@ -55,6 +59,14 @@ const (
 	AssertUsedTool    AssertionType = "used_tool"
 	AssertRegex       AssertionType = "regex"
 	AssertLength      AssertionType = "length"
+
+	// Token-budget assertions — fail the scenario when the run spent
+	// more than allowed. Useful for prompt-engineering regression tests
+	// where the goal is "answer this in under N tokens of context".
+	// The threshold uses TotalBilledInput (fresh + cache_read + cache_create)
+	// so cache-friendly answers register as wins.
+	AssertMaxInputTokens  AssertionType = "max_input_tokens"
+	AssertMaxOutputTokens AssertionType = "max_output_tokens"
 )
 
 // RunResult is what the runner captures from one `metis run` invocation.
@@ -65,6 +77,33 @@ type RunResult struct {
 	Duration   time.Duration // wall time
 	Err        error         // non-nil if the subprocess failed or timed out
 	ExitCode   int
+
+	// Token spend, scraped from the `[metrics] tokens.in=… tokens.out=…
+	// tokens.cache_read=… tokens.cache_create=…` line metis emits on
+	// LoopDone (see cmd/metis/main.go::cmdRun). Zero values mean the
+	// line was missing — older metis binaries or a crashed run.
+	Tokens TokenStats
+}
+
+// TokenStats is the per-run token spend breakdown reported by metis run.
+//
+// Anthropic / OpenAI / MiniMax all separate cache_read from fresh input
+// because cache hits are billed at a lower rate. Eval reports preserve
+// that split so a scenario optimisation that increases cache hits looks
+// like a cost win — folding everything into one "input tokens" number
+// would hide the improvement.
+type TokenStats struct {
+	Input          int // fresh (uncached) input tokens
+	Output         int // assistant generation
+	CacheReadInput int // input tokens served from prompt cache (billed cheaper)
+	CacheCreate    int // input tokens written to prompt cache this turn
+}
+
+// TotalBilledInput returns the conventional "input tokens" total: fresh
+// input + cache_create + cache_read. Useful for one-number summaries but
+// the breakdown is what tells you whether a scenario is cache-friendly.
+func (t TokenStats) TotalBilledInput() int {
+	return t.Input + t.CacheReadInput + t.CacheCreate
 }
 
 // Score is the reward outcome for one scenario.
@@ -74,6 +113,7 @@ type Score struct {
 	Passed     bool          // Total >= PassThreshold
 	Breakdown  []AssertScore // per-assertion detail
 	Duration   time.Duration // copied from RunResult for the report
+	Tokens     TokenStats    // copied from RunResult for the report
 	Err        error         // copied for the report
 }
 

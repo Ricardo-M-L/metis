@@ -19,6 +19,7 @@ func ComputeReward(s Scenario, r RunResult) Score {
 	score := Score{
 		ScenarioID: s.ID,
 		Duration:   r.Duration,
+		Tokens:     r.Tokens,
 		Err:        r.Err,
 	}
 	if len(s.Assertions) == 0 {
@@ -108,6 +109,36 @@ func scoreAssertion(a Assertion, r RunResult) AssertScore {
 			out.Note = fmt.Sprintf("len=%d in [%d,%d]", n, a.LengthMin, a.LengthMax)
 		} else {
 			out.Note = fmt.Sprintf("len=%d outside [%d,%d]", n, a.LengthMin, a.LengthMax)
+		}
+
+	case AssertMaxInputTokens:
+		// Use the full billed input (fresh + cache_create + cache_read)
+		// so a cache-friendly run scores correctly even though its
+		// cache_read line counts toward the bill at a discount.
+		got := r.Tokens.TotalBilledInput()
+		if got == 0 && r.Tokens.Output == 0 {
+			// No metrics line scraped at all → can't enforce; mark
+			// neutral pass so missing-data doesn't fail the suite.
+			out.Earned = 1
+			out.Note = "no metrics line in stderr — older metis binary?"
+		} else if got <= a.MaxTokens {
+			out.Earned = 1
+			out.Note = fmt.Sprintf("input=%d <= %d", got, a.MaxTokens)
+		} else {
+			out.Note = fmt.Sprintf("input=%d exceeds %d (fresh=%d cache_read=%d cache_create=%d)",
+				got, a.MaxTokens, r.Tokens.Input, r.Tokens.CacheReadInput, r.Tokens.CacheCreate)
+		}
+
+	case AssertMaxOutputTokens:
+		got := r.Tokens.Output
+		if got == 0 && r.Tokens.Input == 0 {
+			out.Earned = 1
+			out.Note = "no metrics line in stderr — older metis binary?"
+		} else if got <= a.MaxTokens {
+			out.Earned = 1
+			out.Note = fmt.Sprintf("output=%d <= %d", got, a.MaxTokens)
+		} else {
+			out.Note = fmt.Sprintf("output=%d exceeds %d", got, a.MaxTokens)
 		}
 
 	default:

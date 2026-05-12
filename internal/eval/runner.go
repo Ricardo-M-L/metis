@@ -83,6 +83,7 @@ func (rn *Runner) Run(ctx context.Context, s Scenario) RunResult {
 		ScenarioID: s.ID,
 		Response:   strings.TrimSpace(stdout.String()),
 		ToolCalls:  scrapeToolCalls(stderr.String()),
+		Tokens:     scrapeMetrics(stderr.String()),
 		Duration:   dur,
 		ExitCode:   cmd.ProcessState.ExitCode(),
 	}
@@ -114,6 +115,49 @@ var toolCallPatterns = []*regexp.Regexp{
 	// be followed by `=` or `:` to avoid matching prose like "the
 	// tool name was X".
 	regexp.MustCompile(`(?m)^.*\btool\s*[=:]\s*"?([A-Za-z][A-Za-z0-9_-]*)"?`),
+}
+
+// metricsLineRE matches the `[metrics] tokens.in=N tokens.out=N
+// tokens.cache_read=N tokens.cache_create=N duration_ms=N` line metis
+// emits on LoopDone. Field order matches main.go's printf; the regex
+// is forgiving of the duration_ms suffix being missing (older binaries).
+var metricsLineRE = regexp.MustCompile(
+	`(?m)^\[metrics\]\s+tokens\.in=(\d+)\s+tokens\.out=(\d+)\s+tokens\.cache_read=(\d+)\s+tokens\.cache_create=(\d+)`,
+)
+
+// scrapeMetrics pulls the per-run token spend out of stderr. Returns a
+// zero TokenStats when the line is missing — older metis binaries
+// don't emit it, and the eval report just shows 0s in that case
+// (graceful degrade, no error).
+func scrapeMetrics(stderr string) TokenStats {
+	m := metricsLineRE.FindStringSubmatch(stderr)
+	if m == nil {
+		return TokenStats{}
+	}
+	var ts TokenStats
+	ts.Input = atoiSafe(m[1])
+	ts.Output = atoiSafe(m[2])
+	ts.CacheReadInput = atoiSafe(m[3])
+	ts.CacheCreate = atoiSafe(m[4])
+	return ts
+}
+
+// atoiSafe is strconv.Atoi but never errors — used by scrapeMetrics
+// where the regex already guarantees `[0-9]+`. Out-of-range overflows
+// are clamped to 0 (a token count that doesn't fit in int has bigger
+// problems than this).
+func atoiSafe(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+		if n < 0 { // overflow guard
+			return 0
+		}
+	}
+	return n
 }
 
 // scrapeToolCalls pulls tool names out of metis's stderr log. Returns
@@ -198,6 +242,14 @@ func scoreLine(s Score) map[string]any {
 		"total":       s.Total,
 		"passed":      s.Passed,
 		"duration_ms": s.Duration.Milliseconds(),
+	}
+	// Token spend — flat keys to keep jq queries simple.
+	if s.Tokens != (TokenStats{}) {
+		out["tokens_in"] = s.Tokens.Input
+		out["tokens_out"] = s.Tokens.Output
+		out["tokens_cache_read"] = s.Tokens.CacheReadInput
+		out["tokens_cache_create"] = s.Tokens.CacheCreate
+		out["tokens_total_billed_input"] = s.Tokens.TotalBilledInput()
 	}
 	if s.Err != nil {
 		out["error"] = s.Err.Error()

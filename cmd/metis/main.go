@@ -1138,6 +1138,16 @@ func cmdRun(ctx context.Context, args []string) error {
 	var cacheTextBuf strings.Builder
 	usedToolsThisRun := false
 
+	// Token totals — summed across every API call this run made.
+	// Emitted as a single `[metrics]` line at LoopDone so the eval
+	// harness can scrape token spend per scenario without parsing
+	// streaming token deltas. Mirrors claude-code's /cost output:
+	// cache_read and cache_create are reported separately so a
+	// 60k-token cache hit looks cheap, not the same line item as
+	// 60k tokens of fresh input.
+	var totIn, totOut, totCacheRead, totCacheCreate int
+
+	runStart := time.Now()
 	for ev := range events {
 		switch ev.Kind {
 		case agent.EventTextDelta:
@@ -1198,11 +1208,23 @@ func cmdRun(ctx context.Context, args []string) error {
 			if ev.Info != "" {
 				fmt.Fprintf(os.Stderr, "[info] %s\n", ev.Info)
 			}
+		case agent.EventTokens:
+			totIn += ev.InputTokens
+			totOut += ev.OutputTokens
+			totCacheRead += ev.CacheReadInputTokens
+			totCacheCreate += ev.CacheCreationInputTokens
 		case agent.EventLoopDone:
 			if streamlined {
 				flushAccum() // emit any trailing tool counts
 			}
 			fmt.Println()
+			// Token + duration metrics on stderr — picked up by the
+			// eval runner (internal/eval/runner.go::scrapeMetrics) and
+			// useful for scripts that want to log spend per call. One
+			// line, key=value, parseable without JSON.
+			fmt.Fprintf(os.Stderr,
+				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d duration_ms=%d\n",
+				totIn, totOut, totCacheRead, totCacheCreate, time.Since(runStart).Milliseconds())
 		case agent.EventError:
 			return ev.Err
 		}

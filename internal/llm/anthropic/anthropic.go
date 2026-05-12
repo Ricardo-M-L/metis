@@ -113,25 +113,44 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 // MaxContextTokens returns the effective context window for compaction.
 // Precedence: explicit ContextWindow override > model-prefix lookup.
 //
-// For MiniMax-M* (Anthropic-compatible gateway) we default to 192k —
-// MiniMax M2 publishes a 192k window, but their API's effective request
-// budget is lower, so a too-large default lets requests overflow before
-// compaction fires (the user hit "context window exceeds limit (2013)"
-// at runtime). Set [provider.anthropic].context_window in config.toml
-// if your gateway has a tighter cap.
+// Per-prefix figures track the public model card. Right column is the
+// vendor-published window:
+//
+//	claude-opus-*           200,000  (claude.ai docs)
+//	claude-sonnet-*         200,000  (or 1,000,000 with `[1m]` suffix /
+//	                                  CONTEXT_1M beta — handled by callers)
+//	claude-haiku-*          200,000
+//	MiniMax-M*  /  minimax-* 200,000 (api.minimaxi.com publishes 200k for
+//	                                  M2 / M2.7; up from 192k on M1)
+//	GLM-*                   128,000  (zhipuai bigmodel.cn)
+//	deepseek-*              128,000  (api.deepseek.com)
+//	kimi-*  /  moonshot-*   200,000  (moonshot.cn; k2 advertises 256k)
+//	(unknown)               200,000  (safe default)
+//
+// Override via `[provider.<name>].context_window` in config.toml when a
+// hosting gateway caps tighter (some MiniMax compat layers serve a 64k
+// slice; some Anthropic-compat proxies route through smaller models).
+// claude-code and hermes both pull these numbers from a model catalog —
+// metis used to hardcode 192k for MiniMax based on M1's smaller window,
+// which made every M2.7 chat read 4% higher than vendor-published math.
 func (a *Anthropic) MaxContextTokens() int {
 	if a.ContextWindow > 0 {
 		return a.ContextWindow
 	}
 	switch {
-	case strings.HasPrefix(a.Model, "claude-opus"):
-		return 200000
-	case strings.HasPrefix(a.Model, "claude-sonnet"):
-		return 200000
-	case strings.HasPrefix(a.Model, "claude-haiku"):
+	case strings.HasPrefix(a.Model, "claude-opus"),
+		strings.HasPrefix(a.Model, "claude-sonnet"),
+		strings.HasPrefix(a.Model, "claude-haiku"):
 		return 200000
 	case strings.HasPrefix(a.Model, "MiniMax"), strings.HasPrefix(a.Model, "minimax"):
-		return 192000
+		return 200000
+	case strings.HasPrefix(a.Model, "GLM"), strings.HasPrefix(a.Model, "glm"):
+		return 128000
+	case strings.HasPrefix(a.Model, "deepseek"), strings.HasPrefix(a.Model, "DeepSeek"):
+		return 128000
+	case strings.HasPrefix(a.Model, "kimi"), strings.HasPrefix(a.Model, "Kimi"),
+		strings.HasPrefix(a.Model, "moonshot"), strings.HasPrefix(a.Model, "Moonshot"):
+		return 200000
 	default:
 		return 200000 // safe default for unknown Anthropic-compatible models
 	}

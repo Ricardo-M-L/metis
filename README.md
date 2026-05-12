@@ -535,6 +535,70 @@ Two narrow-but-high-leverage features from claude-code's prompt layer:
   at invoke time). Implementation:
   `internal/agent/skills/{expand,inline_shell}.go`.
 
+## Eval (deterministic LLM scoring)
+
+`metis eval` runs a markdown scenario pack against a metis binary and
+scores each scenario's output via deterministic assertions. Inspired
+by Atropos / Terminal-Bench-2 / openclaw qa-lab — same shape: a folder
+of `.md` files, one scenario each, with a YAML header + `# Prompt` +
+`# Reward` sections.
+
+```sh
+metis eval                                # run every scenario under eval/scenarios
+metis eval --tag smoke                    # filter by header tag
+metis eval --dir ./my_scenarios           # custom scenario directory
+metis eval --out results.jsonl            # write per-scenario JSONL + summary
+metis eval --binary ./build/metis         # test another binary
+metis eval --provider deepseek            # override [provider.default]
+metis eval --verbose                      # show every assertion's note
+```
+
+A scenario file:
+
+```markdown
+---
+id: count_files
+description: Count .go files under ./internal
+tags: [smoke]
+timeout_seconds: 30
+---
+
+# Prompt
+Count the .go files in this project. Reply with just the integer.
+
+# Reward
+contains_all: ["internal"]              weight=1.0
+used_tool: Grep                         weight=0.5
+regex: \d+                              weight=0.3
+max_input_tokens: 8000                  weight=0.5
+max_output_tokens: 200                  weight=0.3
+```
+
+Assertion types supported by `# Reward`:
+
+| Keyword | Pass when |
+|---|---|
+| `contains_all: [a, b]` | every token is in the response |
+| `contains_any: [a, b]` | at least one token is in the response |
+| `not_contains: [a]` | none of the tokens appear |
+| `used_tool: Name` | the tool got called at least once |
+| `regex: PATTERN` | the response matches a Go regexp |
+| `length: 10..200` | response length in `[min, max]` chars |
+| `max_input_tokens: N` | `tokens.in + cache_read + cache_create ≤ N` |
+| `max_output_tokens: N` | `tokens.out ≤ N` |
+
+Token-budget assertions read the `[metrics] tokens.in=… tokens.out=…
+tokens.cache_read=… tokens.cache_create=…` line metis prints on
+LoopDone — useful for catching prompt-engineering regressions where a
+refactor accidentally bloats per-call spend. When the metrics line is
+missing (older binary), the assertion passes neutrally so the suite
+doesn't fail on noise.
+
+The JSONL output (`--out`) emits one `{type: "score", id, total, passed,
+tokens_in, tokens_out, …}` line per scenario plus a final
+`{type: "summary", pass_rate, avg_score, …}` — pipe through `jq` for
+custom rollups.
+
 ## Channels (chat-platform adapters)
 
 `internal/channels/*` ships adapters for **DingTalk, Discord, Feishu,
