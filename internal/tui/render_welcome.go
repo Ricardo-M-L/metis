@@ -27,38 +27,41 @@ import (
 )
 
 // metisOwlGlyphLines is the hand-crafted Unicode block-art owl —
-// 17 cells wide × 10 rows tall, every char placed deliberately.
-// This is the "spread coat-of-arms" Athenian owl design that the
-// user (2026-05-09 image #18 feedback) called acceptable as a
-// pixel-art rendering. Going finer than this requires either:
+// 13 cells wide × 8 rows tall, every char placed deliberately.
+// Reproportioned 2026-05-11 (image #3 user feedback): the previous
+// 17×9 layout dominated the welcome card vertically; the user asked
+// for "整体比例小点" — same silhouette, scaled down ~40%, so the
+// sigil reads as a wordmark anchor rather than a hero illustration.
+//
+// At this glyph density the owl-ness is carried by deliberate
+// silhouette: pointed ear tufts (▟▙), round dome head, V-beak,
+// spread wings, taloned feet. Eyes (●) are repainted cyan in
+// renderWelcomeBanner for contrast.
+//
+// Going finer than this requires either:
 //   - Real PNG via iTerm2 inline image protocol — blocked by
 //     bubbletea v2's ultraviolet renderer truncating large OSC
 //     payloads (would require a fork of the renderer).
 //   - Algorithmic image-to-glyph conversion (chafa) — produces
 //     noisy fragments at 17×8 / 24×14 cell sizes because the
 //     source PNG's gradients/details have no clean mapping.
-//
-// At this glyph density the owl-ness is carried by deliberate
-// silhouette: pointed ear tufts (▟▙), round dome head, V-beak,
-// two-layer spread wings, taloned feet. Eyes (●) are repainted
-// cyan in renderWelcomeBanner for contrast.
 var metisOwlGlyphLines = []string{
-	"    ▟▙     ▟▙    ",
-	"  ▄█▀▀▀▀▀▀▀▀▀█▄  ",
-	" ▐█           █▌ ",
-	" ▐█  ●     ●  █▌ ",
-	" ▐█    ╲ ╱    █▌ ",
-	"  ▀█▄▄▄▄▄▄▄▄▄█▀  ",
-	" ▟██▙▄▄▄▄▄▄▄▟██▙ ",
-	"▐███▌       ▐███▌",
-	" ▀▀▀         ▀▀▀ ",
+	"  ▟▙     ▟▙  ",
+	" ▄█▀▀▀▀▀▀▀█▄ ",
+	"▐█  ●   ●  █▌",
+	"▐█   ╲ ╱   █▌",
+	" ▀█▄▄▄▄▄▄▄█▀ ",
+	"▟██▙▄▄▄▄▄▟██▙",
+	"▐██▌     ▐██▌",
+	" ▀▀       ▀▀ ",
 }
 
 // Eye-position cyan accent — row + col indices in metisOwlGlyphLines.
+// Updated 2026-05-11 with the scaled-down 13×8 layout.
 const (
-	owlEyeRow  = 3
-	owlEyeColL = 5
-	owlEyeColR = 11
+	owlEyeRow  = 2
+	owlEyeColL = 4
+	owlEyeColR = 8
 )
 
 // renderWelcomeBanner paints the bordered, centered welcome card we
