@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
 )
 
 // anonAgentID returns the AgentID string we stamp on each Roster
@@ -142,6 +144,15 @@ func (Agent) InputSchema() map[string]any {
 				"type":        "boolean",
 				"description": "Set to true to spawn the sub-agent in the background and return a job_id immediately so the parent can continue working. Poll progress via SubAgentOutput / SubAgentList, terminate via SubAgentStop. Mirrors claude-code's AgentTool semantics. Default false (foreground).",
 			},
+			"isolation": map[string]any{
+				"type":        "string",
+				"enum":        []string{"worktree"},
+				"description": "Spawn this sub-agent in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). Mutually exclusive with `cwd`. Refuses when parent is already inside a worktree (no nesting).",
+			},
+			"cwd": map[string]any{
+				"type":        "string",
+				"description": "Absolute path to run the sub-agent in. Overrides the parent's working directory for all filesystem and shell operations within this sub-agent. Mutually exclusive with `isolation: \"worktree\"`.",
+			},
 		},
 	}
 }
@@ -181,6 +192,18 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			Output:  fmt.Sprintf("agent nesting limit (%d) exceeded", maxAgentDepth),
 			IsError: true,
 		}, nil
+	}
+
+	// G.2 — resolve per-invocation isolation/cwd BEFORE registering
+	// the teammate so we can refuse the spawn without polluting the
+	// Roster on bad inputs. Returns the effective cwd to thread
+	// through the sub-loop ctx + an optional worktree info we'll
+	// clean up on exit.
+	isolation, _ := in["isolation"].(string)
+	cwdArg, _ := in["cwd"].(string)
+	subCwd, worktreeInfo, isoErr := a.resolveIsolation(isolation, cwdArg)
+	if isoErr != nil {
+		return &tools.Result{Output: isoErr.Error(), IsError: true}, nil
 	}
 
 	// G.0 cap — refuse before constructing the sub-loop so the API
@@ -234,11 +257,14 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		timeout = a.defaultTimeout
 	}
 
-	// Build the sub-agent ctx with depth + (optional) timeout. For the
-	// background path the goroutine owns the cancel func and keeps the
-	// ctx alive past Execute's return — context.WithCancel doesn't
-	// leak when the deferred goroutine runs cancel on its own exit.
-	childCtx, cancel := context.WithCancel(context.WithValue(ctx, agentDepthKey{}, depth+1))
+	// Build the sub-agent ctx with depth + cwd + (optional) timeout.
+	// For the background path the goroutine owns the cancel func and
+	// keeps the ctx alive past Execute's return — context.WithCancel
+	// doesn't leak when the deferred goroutine runs cancel on its
+	// own exit. G.2: subCwd stamps the effective working directory
+	// onto the ctx so cwd-aware tools (Bash) inherit it.
+	baseCtx := agent.WithCwd(context.WithValue(ctx, agentDepthKey{}, depth+1), subCwd)
+	childCtx, cancel := context.WithCancel(baseCtx)
 	if timeout > 0 {
 		childCtx, cancel = context.WithTimeout(childCtx, timeout)
 	}
@@ -248,10 +274,84 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 
 	parentOut := agent.EventOutFromContext(ctx)
 
+	// G.2 — wrap cancel so the worktree cleanup happens on every
+	// exit path (parent ctx cancel, sub-agent natural end, panic in
+	// the background goroutine). Foreground path runs cleanup via
+	// `defer cancel()` in executeForeground; background path runs it
+	// in the goroutine's defer chain.
+	if worktreeInfo != nil {
+		origCancel := cancel
+		cancel = func() {
+			origCancel()
+			_ = worktreepkg.Cleanup(worktreeInfo)
+		}
+		if teammate != nil {
+			teammate.Cancel = cancel
+		}
+	}
+
 	if runInBackground {
 		return a.executeBackground(sub, childCtx, cancel, parentOut, teammate, timeout)
 	}
 	return a.executeForeground(sub, childCtx, cancel, parentOut, teammate, timeout)
+}
+
+// resolveIsolation handles the `isolation` + `cwd` schema fields
+// (G.2, 2026-05-12). Returns the effective sub-agent cwd, an optional
+// worktree info struct to clean up on exit, or a user-actionable
+// error.
+//
+// Validation rules (mutually-exclusive + nesting-safe + absolute-path):
+//
+//  1. `isolation` and `cwd` cannot both be set — the model has to
+//     pick one mode, otherwise we'd silently prefer one over the
+//     other and surprise the caller.
+//  2. `isolation` only accepts "worktree" today; any other value is
+//     rejected with a clear hint (claude-code's schema lists
+//     "remote" too but that's CCR-only / ant-only, intentionally
+//     dropped from Phase G).
+//  3. Worktrees refuse to nest — if the parent process is itself
+//     inside a worktree, we error out instead of cascading
+//     branches that no one can clean up.
+//  4. `cwd` MUST be absolute. Relative paths would resolve against
+//     whatever cwd happens to be live at sub-loop start, which is
+//     racy when N teammates spawn in parallel.
+func (a Agent) resolveIsolation(isolation, cwdArg string) (string, *worktreepkg.Info, error) {
+	if isolation != "" && cwdArg != "" {
+		return "", nil, errors.New("`isolation` and `cwd` are mutually exclusive — pick one")
+	}
+	if isolation != "" && isolation != "worktree" {
+		return "", nil, fmt.Errorf("isolation=%q not supported; only \"worktree\" is recognized", isolation)
+	}
+	if cwdArg != "" {
+		if !strings.HasPrefix(cwdArg, "/") {
+			return "", nil, fmt.Errorf("cwd=%q must be an absolute path", cwdArg)
+		}
+		if fi, err := os.Stat(cwdArg); err != nil {
+			return "", nil, fmt.Errorf("cwd=%q: %w", cwdArg, err)
+		} else if !fi.IsDir() {
+			return "", nil, fmt.Errorf("cwd=%q is not a directory", cwdArg)
+		}
+		return cwdArg, nil, nil
+	}
+	if isolation == "worktree" {
+		// Refuse nesting — `metis -W feat1` already put us inside a
+		// worktree; an Agent({isolation:"worktree"}) here would
+		// create a worktree-of-a-worktree which neither git nor our
+		// cleanup story handles cleanly.
+		cwd, err := os.Getwd()
+		if err == nil && worktreepkg.InsideWorktree(cwd) {
+			return "", nil, fmt.Errorf("refusing to nest worktree: parent process is already inside a worktree at %s", cwd)
+		}
+		info, err := worktreepkg.Spawn("") // auto-slug
+		if err != nil {
+			return "", nil, fmt.Errorf("worktree spawn: %w", err)
+		}
+		return info.Path, info, nil
+	}
+	// No isolation requested → inherit parent cwd (return "" so the
+	// context key is left unset; tools fall back to os.Getwd()).
+	return "", nil, nil
 }
 
 // executeForeground is the pre-G.1 behavior: spawn sub-loop in a

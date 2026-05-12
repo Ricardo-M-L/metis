@@ -96,6 +96,38 @@ func EventOutFromContext(ctx context.Context) chan<- Event {
 	return nil
 }
 
+// cwdKey carries a per-sub-agent effective working directory through
+// context (Phase G.2, 2026-05-12). The Agent tool stamps this when
+// the caller passes `cwd:"<abs path>"` or `isolation:"worktree"`;
+// tools that care about cwd (Bash sets cmd.Dir from it; future
+// Glob/LS could resolve relative roots against it) read it via
+// CwdFromContext.
+//
+// Tools that don't read it default to the process-wide os.Getwd(),
+// which is the parent agent's cwd — matching pre-G.2 behavior so
+// existing tools don't accidentally change semantics.
+type cwdKey struct{}
+
+// WithCwd tags ctx with the effective working directory for a
+// sub-agent. Empty string is treated as "no override" so callers
+// don't need to special-case it.
+func WithCwd(ctx context.Context, dir string) context.Context {
+	if dir == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, cwdKey{}, dir)
+}
+
+// CwdFromContext returns the effective cwd for the current sub-agent,
+// or "" when none is attached. Tools that respect cwd (Bash) treat
+// "" as "use os.Getwd()".
+func CwdFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(cwdKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // parentSnapshotKey carries a copy of the parent loop's conversation
 // state down to tools so a "fork" tool can spawn a child loop that
 // inherits the full context. Without this snapshot, a sub-agent

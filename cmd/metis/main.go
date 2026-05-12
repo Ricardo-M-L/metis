@@ -35,6 +35,7 @@ import (
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tui"
 	"github.com/Ricardo-M-L/metis/internal/version"
+	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
@@ -928,9 +929,9 @@ func cmdChat(ctx context.Context, args []string) error {
 	// --worktree: spawn a git worktree first so config/CLAUDE.md/etc.
 	// load from the new cwd. The worktree info is stashed in a closure
 	// for cleanup at the end of cmdChat.
-	var worktreeInfo *rtpkg.WorktreeInfo
+	var worktreeInfo *worktreepkg.Info
 	if flags.worktree != "" || flags.worktreeOn {
-		info, err := rtpkg.SpawnWorktree(flags.worktree)
+		info, err := worktreepkg.Spawn(flags.worktree)
 		if err != nil {
 			return err
 		}

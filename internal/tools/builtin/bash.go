@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -408,6 +409,15 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
 	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
 	exe.Env = childEnv
+	// G.2 (2026-05-12): when a sub-agent was spawned with `cwd:"..."`
+	// or `isolation:"worktree"`, the Agent tool stamps the effective
+	// cwd into context. Bash threads it through to exec.Cmd.Dir so the
+	// child process inherits the sub-agent's working directory rather
+	// than the parent metis's cwd. No-op for parent-agent calls
+	// (CwdFromContext returns "" when no override is set).
+	if cwd := agent.CwdFromContext(ctx); cwd != "" {
+		exe.Dir = cwd
+	}
 	// Put the bash leader + its children in their own process group so
 	// kill-on-promote (Adopt path) tree-kills cleanly. Effectively a
 	// no-op when the cmd never gets adopted — but cheap enough to do
@@ -561,6 +571,12 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
 	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
 	exe.Env = childEnv
+	// G.2 — read effective cwd from the ORIGINAL ctx (not bgCtx,
+	// which is fresh). The sub-agent ctx the Agent tool stamped lives
+	// on the upstream chain; bgCtx is just for cancellation lifetime.
+	if cwd := agent.CwdFromContext(ctx); cwd != "" {
+		exe.Dir = cwd
+	}
 	jobs.ApplyProcessGroup(exe)
 
 	jb, err := b.Jobs.Spawn(jobs.SpawnArgs{
