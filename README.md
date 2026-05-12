@@ -399,7 +399,12 @@ that lights up while the turn is running and clears on completion.
 | `Skill` | safe | invoke a registered skill |
 | `Ask` | safe | mid-turn user clarification |
 | `TodoWrite` | exclusive | task list, persisted per-session |
-| `Agent` | queue | spawn sub-agent with isolated history |
+| `Agent` | queue / background | spawn sub-agent — supports `name`, `isolation:"worktree"`, `cwd`, `run_in_background`, `permission_mode`, `allowed_tools`, `disallowed_tools`, `resume_from`, `timeout_seconds` |
+| `Fork` | queue | warm-context sub-agent (inherits parent's full history) |
+| `MessageTeammate` | safe | peer-to-peer messaging to a named sub-agent's mailbox |
+| `SubAgentList` | safe | enumerate active + recent sub-agents |
+| `SubAgentOutput` | safe | read a sub-agent's running output buffer |
+| `SubAgentStop` | exclusive | terminate a running sub-agent |
 | `SendMessage` | safe | send to a registered channel (Telegram, Slack, …) |
 | `ScheduleWakeup` | safe | LLM self-pacing — schedule a future re-entry with a prompt |
 
@@ -439,6 +444,67 @@ Inside chat the LLM has the `ScheduleWakeup` tool — it can decide on its
 own when to re-enter (e.g. "check if the build is done in 5 min"). The
 wakeup persists as a one-shot cron job, so `metis cron list` shows what
 the agent has scheduled itself.
+
+## Multi-agent (Phase G — claude-code parity)
+
+Metis runs multiple sub-agents concurrently with peer messaging,
+named teammates, per-task isolation, and resumable state. Eighteen
+features land under Phase G of the parity plan; the headline surface:
+
+```sh
+# Spawn a focused, isolated sub-agent
+Agent({prompt: "summarize internal/agent/loop.go", name: "alice"})
+
+# Background sub-agent — parent keeps working while it runs
+Agent({prompt: "...", run_in_background: true})
+
+# Per-invocation worktree isolation
+Agent({prompt: "...", isolation: "worktree"})
+
+# Per-invocation permission mode override (parent stays in ask)
+Agent({prompt: "...", permission_mode: "bypass"})
+
+# Per-invocation tool narrowing (intersection with profile filter)
+Agent({prompt: "...", allowed_tools: ["Read", "Grep"]})
+
+# Resume a paused sub-agent from its on-disk transcript
+Agent({prompt: "continue", resume_from: "agt-d3a91b07"})
+
+# Team-lead mode: the main loop becomes an orchestrator
+METIS_COORDINATOR_MODE=1 metis chat
+# or: metis --coordinator chat
+```
+
+Six bundled agent profiles ship via `//go:embed`:
+`explore` / `plan` / `verify` / `general` (generic) and
+`go-reviewer` / `mcp-debugger` (metis-specific). User overrides at
+`~/.metis/agents/<name>.md` always win. A seventh `coordinator.md`
+backs `--coordinator`.
+
+Slash surface:
+
+- `/agents list [all]` — roster snapshot, anonymous teammates
+  hidden by default
+- `/agents status <name|id>` — full state for one teammate
+- `/agents kill <name|id>` — cancel a running teammate
+- `/agents resume <id>` — hint pointing at `Agent({resume_from})`
+- `/dream [status]` — DreamTask (auto-memory) phase + last run stats
+
+Cross-cutting:
+
+- Concurrency cap (`config.Agents.MaxConcurrentSubAgents`, default 5)
+- Timeout budget (`config.Agents.DefaultTimeoutSeconds`, default 600s)
+  with per-invocation override via `timeout_seconds`
+- Sub-agent transcripts persisted to
+  `<session-dir>/subagents/<agent_id>.jsonl` for `resume_from`
+- 3-layer memory scoping (user / project / local) with priority
+  cascade — same pattern as `internal/config/searchPaths`
+- Per-agent `permission.Gate.Clone()` so a child's mode flip can't
+  leak back to the parent
+- DreamTask phase model (idle/starting/extracting/writing/done)
+  with `<memory_consolidation_done>` notifications back to the LLM
+- Panic recovery + ctx-aware drain on sub-agent abort so a buggy
+  child can't pin the parent turn
 
 ## Channels (chat-platform adapters)
 

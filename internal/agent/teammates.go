@@ -48,6 +48,46 @@ type PeerMessage struct {
 	Sent time.Time
 }
 
+// TeammateKind tags a sub-agent by orchestration shape (G.12,
+// 2026-05-12). The four kinds map onto the lifecycle distinctions
+// claude-code's task-router makes:
+//
+//   - KindAnon: anonymous one-shot Agent({prompt}) — no Roster name
+//   - KindNamed: named teammate Agent({name, prompt}) addressable by
+//     other teammates via MessageTeammate
+//   - KindWorkflow: a hosted multi-step workflow run (placeholder
+//     for future LocalWorkflowTask wiring; today it's a future-
+//     proof enum value, not actively used)
+//   - KindMcpMonitor: long-lived MCP-server monitor sub-agent
+//     (placeholder for future MonitorMcpTask wiring)
+//
+// Today only KindAnon and KindNamed have concrete spawn paths in
+// the Agent tool. The other two are reserved so when those features
+// land, the existing `/agents list` + SubAgent* tools can group by
+// kind without re-shaping the API.
+type TeammateKind int
+
+const (
+	KindAnon       TeammateKind = iota // anonymous Agent({prompt})
+	KindNamed                          // named Agent({name, prompt})
+	KindWorkflow                       // future: hosted workflow run
+	KindMcpMonitor                     // future: long-lived MCP monitor
+)
+
+func (k TeammateKind) String() string {
+	switch k {
+	case KindAnon:
+		return "anon"
+	case KindNamed:
+		return "named"
+	case KindWorkflow:
+		return "workflow"
+	case KindMcpMonitor:
+		return "mcp_monitor"
+	}
+	return "unknown"
+}
+
 // TeammateStatus is the lifecycle stage of a sub-agent.
 // Monotonic except Killed which can come from any non-terminal state.
 type TeammateStatus int
@@ -214,6 +254,61 @@ func (t *Teammate) Snapshot() TeammateSnapshot {
 		ExitErr:    t.ExitErr,
 		StopHint:   t.StopHint,
 	}
+}
+
+// Kind returns the orchestration tag for this teammate (G.12,
+// 2026-05-12). Derived: named teammates → KindNamed; anonymous →
+// KindAnon. Future workflows / MCP monitors set the field
+// explicitly when spawning. nil-safe (returns KindAnon).
+func (t *Teammate) Kind() TeammateKind {
+	if t == nil {
+		return KindAnon
+	}
+	if !t.Anonymous {
+		return KindNamed
+	}
+	return KindAnon
+}
+
+// RosterSummary is the at-a-glance state of the live Roster — for
+// status bar chips, /agents one-line, and observability hooks
+// (G.16, 2026-05-12). Cheaper than List() when callers just need
+// counts.
+type RosterSummary struct {
+	// Total active teammates across all kinds.
+	Total int
+	// Named is the count of teammates with a model-chosen name (not
+	// auto-anonymized). What the user typically thinks of as "the
+	// teammates."
+	Named int
+	// Anonymous count. Hidden from /agents list by default.
+	Anonymous int
+	// Background count — sub-agents spawned with run_in_background:
+	// true. Subset of Total.
+	Background int
+}
+
+// Summary returns a snapshot of teammate counts grouped by shape.
+// Cheap read-lock; safe to call from the status-bar render path.
+func (r *Roster) Summary() RosterSummary {
+	if r == nil {
+		return RosterSummary{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := RosterSummary{}
+	for _, t := range r.teammates {
+		out.Total++
+		if t.Anonymous {
+			out.Anonymous++
+		} else {
+			out.Named++
+		}
+		if t.Background {
+			out.Background++
+		}
+	}
+	return out
 }
 
 // Roster is the live-sub-agent registry. Thread-safe.
