@@ -57,8 +57,17 @@ type AgentProfile struct {
 }
 
 // LoadAgentProfile resolves NAME to a markdown file and parses it.
-// Search order: project (.metis/agents/<name>.md) → user (~/.metis/agents/<name>.md).
+//
+// Search order (G.7, 2026-05-12):
+//
+//  1. ./.metis/agents/<name>.md           — project override
+//  2. ~/.metis/agents/<name>.md           — user override
+//  3. //go:embed builtin_profiles/<name>.md — bundled default
+//
 // Returns nil profile + nil err when name is empty (no flag passed).
+// User-written files always win over bundled — the bundled set is
+// just a fallback so `metis --agent=explore` works on a fresh
+// install without any user setup.
 func LoadAgentProfile(name string) (*AgentProfile, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -88,7 +97,16 @@ func LoadAgentProfile(name string) (*AgentProfile, error) {
 		}
 		return prof, nil
 	}
-	return nil, fmt.Errorf("agent profile %q not found (looked in %s)", name, strings.Join(candidates, ", "))
+	// Fallback to bundled (G.7). Not finding a user file is the
+	// common case — most users only customize a couple of profiles
+	// and rely on the bundled set for the rest.
+	if prof, err := LoadBuiltinProfile(name); err == nil {
+		return prof, nil
+	} else if !errors.Is(err, ErrBuiltinProfileNotFound) {
+		// Bundled profile exists but parse failed — surface that.
+		return nil, err
+	}
+	return nil, fmt.Errorf("agent profile %q not found (looked in %s, then bundled)", name, strings.Join(candidates, ", "))
 }
 
 func validAgentName(s string) bool {
