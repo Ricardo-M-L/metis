@@ -43,6 +43,7 @@ func (m *Model) helpGeneralRows() []screen.HelpRow {
 		{Heading: "Navigation"},
 		{Key: "Ctrl+R", Value: "history search overlay"},
 		{Key: "Ctrl+T", Value: "toggle task panel"},
+		{Key: "Ctrl+B", Value: "background current turn (output suppressed; notify on done)"},
 		{Key: "Ctrl+O", Value: "toggle expanded tool output"},
 		{Key: "Ctrl+L", Value: "show available models"},
 		{Key: "PgUp/PgDn", Value: "scroll viewport"},

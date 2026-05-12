@@ -153,6 +153,19 @@ func renderSpinnerStatus(m *Model) string {
 
 	var s strings.Builder
 	s.WriteString("\n")
+	// Phase F Ctrl+B (2026-05-12) — backgrounded turn shrinks to a
+	// one-line chip showing only the spinner + "(background Xs)".
+	// We still want the spinner glyph + elapsed clock so the user
+	// can confirm the turn is alive; everything else (verb / args
+	// preview / token chip) hides until the turn is foregrounded
+	// again or finalizeTurn fires.
+	if m.turnBackgrounded {
+		bgElapsed := time.Since(m.backgroundedAt).Truncate(time.Second)
+		s.WriteString(styleAccent.Render("  " + frame + " "))
+		s.WriteString(styleDim.Render(fmt.Sprintf("background %s · Ctrl+B to foreground · Ctrl+C cancels", bgElapsed)))
+		s.WriteString("\n")
+		return s.String()
+	}
 	s.WriteString(styleAccent.Render("  " + frame + " "))
 	if m.spinnerSub != "" {
 		s.WriteString(toolUseFlashStyle(elapsed).Render(m.spinnerVerb))

@@ -161,6 +161,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "logout", Description: "remove a stored provider credential", Handler: cmdLogout})
 	r.Register(REPLCommand{Name: "init", Description: "scaffold a CLAUDE.md for this repo (claude-code parity)", Handler: cmdInit})
 	r.Register(REPLCommand{Name: "statusline", Description: "show + customize the bottom status line", Handler: cmdStatusLine})
+	r.Register(REPLCommand{Name: "bg", Description: "background-turn status (alias for Ctrl+B mid-turn)", Handler: cmdBg})
 	r.Register(REPLCommand{Name: "cost", Description: "show token usage for current session", Handler: cmdCost})
 	r.Register(REPLCommand{Name: "tokens", Description: "show last API call's raw token breakdown (input/output/cache)", Handler: cmdTokens})
 	r.Register(REPLCommand{Name: "usage", Description: "show API rate limit info", Handler: cmdUsage})
@@ -220,6 +221,19 @@ func cmdModel(r *REPL, args string) string {
 
 // cmdShare starts or stops the localhost HTTP+SSE bridge so an
 // external client (IDE extension, browser, mobile companion) can
+// cmdBg is the slash-command sibling of Ctrl+B (Phase F,
+// 2026-05-12). The actual toggle lives on Model and runs from
+// keybind_main.go because it needs Model state; the REPL handler
+// can't reach into the active Model.Update loop. But users still
+// want a discoverable surface — `/bg` answers "what does this do
+// and when do I press it" so they don't have to grep keybinds.
+func cmdBg(r *REPL, args string) string {
+	return "background-turn: press Ctrl+B while a turn is running to suppress its " +
+		"streaming output and free the input box. The turn keeps running; you'll be " +
+		"notified when it finishes (desktop notification + [bg] prefix on the flushed " +
+		"reply). Press Ctrl+B again to foreground. Ctrl+C still cancels."
+}
+
 // cmdAgents lists sub-agents currently dispatched via the Agent tool.
 // Empty when no Agent tool calls are in flight (the common case).
 func cmdAgents(r *REPL, args string) string {

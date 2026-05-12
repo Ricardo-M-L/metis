@@ -469,6 +469,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // the thought-summary + recap rows, log the turn for /lessons, and
 // persist the tail to disk.
 func (m *Model) finalizeTurn(err error) {
+	// Phase F Ctrl+B (2026-05-12) — capture whether the turn was
+	// running in background mode BEFORE we reset the flag below, so
+	// the notification + result-banner logic can force-fire even on
+	// short turns (the user backgrounded explicitly, threshold gate
+	// off).
+	wasBackgrounded := m.turnBackgrounded
+	m.turnBackgrounded = false
+	m.backgroundedAt = time.Time{}
 	m.turnActive = false
 	m.spinnerActive = false
 	// Snap displayed-token counter to truth so the final number doesn't
@@ -481,7 +489,16 @@ func (m *Model) finalizeTurn(err error) {
 		m.thinkingText = ""
 	}
 	if m.streamingText != "" {
-		m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
+		// Phase F Ctrl+B (2026-05-12) — when the flushed reply came
+		// in while backgrounded, prefix with a chip so the user can
+		// distinguish "this scrolled past while I was looking away"
+		// from a normal foreground reply. Content is identical
+		// otherwise — the prefix is just a visual cue.
+		content := m.streamingText
+		if wasBackgrounded {
+			content = "[bg] " + content
+		}
+		m.messages = append(m.messages, Message{Role: "assistant", Content: content, Timestamp: time.Now()})
 		m.streamingText = ""
 	}
 	// Append claude-code-style turn-end thought summary
@@ -503,8 +520,16 @@ func (m *Model) finalizeTurn(err error) {
 		// is still watching the screen and a banner would be noise.
 		// Mirrors claude-code's notification queue minimum-duration
 		// heuristic + recent-interaction guard.
-		if d := time.Since(m.spinnerStartedAt); d >= NotifyMinDuration {
+		//
+		// Phase F Ctrl+B (2026-05-12) — bypass the threshold when
+		// the user explicitly backgrounded the turn. They asked
+		// not to look at the screen, so we notify regardless of
+		// duration.
+		if d := time.Since(m.spinnerStartedAt); d >= NotifyMinDuration || wasBackgrounded {
 			msg := fmt.Sprintf("turn finished in %s", formatTurnDuration(d))
+			if wasBackgrounded {
+				msg = "backgrounded " + msg
+			}
 			SendNotification("metis", msg)
 			// Fire the user's [[hooks.notification]] chain so
 			// they can shell out to terminal-notifier / ntfy /

@@ -270,6 +270,21 @@ type Model struct {
 	// mid-turn semantics — only plain text is queued.
 	queuedPrompts []string
 
+	// turnBackgrounded — Phase F Ctrl+B (2026-05-12). When the user
+	// presses Ctrl+B mid-turn, the active turn keeps running but its
+	// streaming output stops mirroring into the visible chat. The
+	// streamingText buffer still accumulates so finalizeTurn can
+	// flush the full reply once the turn ends; the spinner shrinks
+	// to a small "background" status chip. Ctrl+B again
+	// foregrounds. finalizeTurn force-fires a desktop notification
+	// on backgrounded turns regardless of the 30s gate (the whole
+	// reason the user backgrounded was to look away).
+	turnBackgrounded bool
+	// backgroundedAt tracks when the current turn was backgrounded
+	// so the status chip can render "bg 12s" without re-purposing
+	// the spinner-start timestamp.
+	backgroundedAt time.Time
+
 	// queuePending is set by finalizeTurn after it loaded a queued
 	// prompt into the input. The next spinner tick (or any Update
 	// pass) calls handleSubmit to actually fire the turn — splitting

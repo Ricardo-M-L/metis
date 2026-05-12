@@ -257,7 +257,11 @@ func (m *Model) View() tea.View {
 			upper.WriteString("\n\n")
 		}
 	}
-	if m.streamingText != "" {
+	// Phase F (2026-05-12) — Ctrl+B suppresses the live streaming
+	// render. The streamingText buffer still grows behind the scenes
+	// so finalizeTurn can flush the full reply atomically when the
+	// turn ends; we just don't paint it to the chat surface.
+	if m.streamingText != "" && !m.turnBackgrounded {
 		upper.WriteString(styleAsst.Render("  " + glyphBullet + " "))
 		streamLines := strings.Split(m.streamingText, "\n")
 		if len(streamLines) > 0 {

@@ -192,6 +192,49 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		})
 		return m, nil
 
+	case "ctrl+b":
+		// Phase F (2026-05-12) — background the current turn.
+		// Toggle: pressing again foregrounds. Only valid mid-turn;
+		// at idle it's a no-op with an info hint so the user learns
+		// what the binding does without confusion. While
+		// backgrounded:
+		//   - the turn KEEPS running (no ctx cancel)
+		//   - streaming text + thinking stop mirroring to visible chat
+		//     (still accumulates so finalizeTurn flushes the full reply
+		//     atomically when the turn ends)
+		//   - the spinner shrinks to a one-line "bg Xs" status chip
+		//   - any newly-typed prompts queue via the existing
+		//     queuedPrompts FIFO and auto-dispatch when the bg turn ends
+		// finalizeTurn fires a desktop notification on bg-turn end
+		// regardless of duration (the user backgrounded explicitly,
+		// they want to know).
+		if !m.turnActive {
+			m.messages = append(m.messages, Message{
+				Role: "info",
+				Content: "Ctrl+B backgrounds the current turn — press while a turn is running, " +
+					"then keep typing or look away. You'll be notified when it finishes.",
+				Timestamp: time.Now(),
+			})
+			return m, nil
+		}
+		m.turnBackgrounded = !m.turnBackgrounded
+		if m.turnBackgrounded {
+			m.backgroundedAt = time.Now()
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "✻ turn moved to background — output suppressed until done · Ctrl+B to foreground · Ctrl+C cancels",
+				Timestamp: time.Now(),
+			})
+		} else {
+			m.backgroundedAt = time.Time{}
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "✻ turn back in foreground — streaming output resumes",
+				Timestamp: time.Now(),
+			})
+		}
+		return m, nil
+
 	case "ctrl+g":
 		// External editor — Phase D #41. Drops the current input into
 		// a temp file, suspends bubbletea, spawns $EDITOR, then reads
