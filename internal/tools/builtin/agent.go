@@ -604,9 +604,26 @@ func (a Agent) executeForeground(
 	timeout time.Duration,
 	transcript *agent.SubAgentTranscript,
 	persistedOnDisk int,
-) (*tools.Result, error) {
+) (resultRet *tools.Result, errRet error) {
 	defer cancel()
 	defer transcript.Close()
+	// G.15 (2026-05-12) — panic recovery for the foreground path.
+	// The background path already handles this; the foreground was
+	// silently bubbling a panic up to the dispatcher (which would
+	// abort the parent turn). Convert to IsError so the parent can
+	// see the failure and decide whether to retry.
+	defer func() {
+		if r := recover(); r != nil {
+			resultRet = &tools.Result{
+				Output:  fmt.Sprintf("sub-agent panic (recovered): %v", r),
+				IsError: true,
+			}
+			errRet = nil
+			if teammate != nil {
+				teammate.Finish(agent.StatusFailed, "", fmt.Errorf("panic: %v", r), "panic")
+			}
+		}
+	}()
 
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
@@ -623,25 +640,49 @@ func (a Agent) executeForeground(
 	// Bumped on each EventTurnEnd so each turn's new messages get
 	// appended exactly once.
 	persistedMsgCount := persistedOnDisk
-	for ev := range events {
-		forwardSubAgentEvent(parentOut, ev)
-		switch ev.Kind {
-		case agent.EventTextDelta:
-			output.WriteString(ev.TextDelta)
+	// G.15 (2026-05-12) — select on childCtx.Done() so a parent
+	// cancellation tears the drain down even if the sub-loop's
+	// event channel deadlocks. Without this guard, a buggy sub-loop
+	// could pin the parent turn indefinitely.
+drainLoop:
+	for {
+		select {
+		case <-childCtx.Done():
+			persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
+			err := childCtx.Err()
 			if teammate != nil {
-				teammate.AppendText(ev.TextDelta)
+				status := agent.StatusKilled
+				hint := "cancelled"
+				if errors.Is(err, context.DeadlineExceeded) && timeout > 0 {
+					status = agent.StatusFailed
+					hint = fmt.Sprintf("timeout %s", timeout)
+				}
+				teammate.Finish(status, strings.TrimSpace(output.String()), err, hint)
 			}
-		case agent.EventTurnEnd:
-			persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
-		case agent.EventPermissionRequest:
-			ev.PermissionReply <- agent.PermissionDecisionDeny
-		case agent.EventLoopDone:
-			stopReason = ev.StopReason
-			persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
-		case agent.EventError:
-			if ev.Err != nil {
+			return wrapTimeoutErr(err, timeout), nil
+		case ev, ok := <-events:
+			if !ok {
+				break drainLoop
+			}
+			forwardSubAgentEvent(parentOut, ev)
+			switch ev.Kind {
+			case agent.EventTextDelta:
+				output.WriteString(ev.TextDelta)
+				if teammate != nil {
+					teammate.AppendText(ev.TextDelta)
+				}
+			case agent.EventTurnEnd:
 				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
-				return wrapTimeoutErr(ev.Err, timeout), nil
+			case agent.EventPermissionRequest:
+				ev.PermissionReply <- agent.PermissionDecisionDeny
+			case agent.EventLoopDone:
+				stopReason = ev.StopReason
+				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
+			case agent.EventError:
+				if ev.Err != nil {
+					persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
+					return wrapTimeoutErr(ev.Err, timeout), nil
+				}
 			}
 		}
 	}
