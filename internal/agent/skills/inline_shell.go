@@ -115,6 +115,15 @@ func runInlineShell(ctx context.Context, cmd, cwd string) string {
 	if cwd != "" {
 		c.Dir = cwd
 	}
+	// WaitDelay (Go 1.20+) bounds the post-cancel wait when a shell
+	// child outlives its parent and keeps pipe FDs open (Linux
+	// reparents `sleep` to init after the shell is killed; c.Wait
+	// would otherwise hang forever waiting on the pipe). With
+	// WaitDelay set, Wait force-closes pipes and returns. macOS
+	// shells happen to propagate the kill, so this only manifests
+	// on Linux CI runners — TestExpandInlineShell_TimeoutBounded
+	// failed there pre-2026-05-13.
+	c.WaitDelay = 2 * time.Second
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
