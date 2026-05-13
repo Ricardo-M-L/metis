@@ -25,11 +25,30 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+// waitForTeammate polls Roster.Lookup until the named teammate
+// registers (background spawns register on a goroutine; the test
+// would otherwise race) or the deadline elapses. Returns false
+// when the timeout fires so the caller can produce a useful
+// assertion message instead of an obscure "Lookup returned !ok".
+func waitForTeammate(roster *agent.Roster, name string, d time.Duration) (*agent.Teammate, bool) {
+	deadline := time.Now().Add(d)
+	for {
+		if tm, ok := roster.Lookup(name); ok {
+			return tm, true
+		}
+		if time.Now().After(deadline) {
+			return nil, false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
 
 // TestAgentExecute_NamedTeammateRegisters — happy path: pass `name`,
 // teammate appears in Roster under that name, Anonymous=false.
@@ -52,9 +71,12 @@ func TestAgentExecute_NamedTeammateRegisters(t *testing.T) {
 		t.Fatalf("named spawn should succeed; got IsError: %s", res.Output)
 	}
 
-	tm, ok := roster.Lookup("alice")
+	// Background spawn registers asynchronously — Execute returns as
+	// soon as the goroutine is launched, before Roster.Register has
+	// run. Poll up to 2s so the test isn't racy under load.
+	tm, ok := waitForTeammate(roster, "alice", 2*time.Second)
 	if !ok {
-		t.Fatalf("Lookup(\"alice\") should find the teammate")
+		t.Fatalf("Lookup(\"alice\") should find the teammate within 2s")
 	}
 	if tm.Anonymous {
 		t.Errorf("named teammate must have Anonymous=false; got true")
