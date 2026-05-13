@@ -18,15 +18,38 @@ type Write struct {
 
 func (Write) Name() string { return "Write" }
 func (Write) Description() string {
-	return "Write content to a file (creates or overwrites). Always use absolute paths. Caller MUST have read the file first if it already exists, otherwise Write refuses on existing files."
+	return `Create a new file, or completely overwrite an existing one, with the exact ` + "`content`" + ` provided. Write replaces the file's entire contents — nothing is merged or appended.
+
+Prefer Edit over Write whenever the file already exists. Use Write only when:
+  - The file is genuinely new (and the directory exists, or you don't mind ` + "`mkdir -p`" + ` semantics).
+  - You're doing a wholesale rewrite where >50% of the file changes.
+  - Writing a generated artifact (e.g. JSON config, formatted output) where preserving any pre-existing content is wrong.
+
+Hard requirements (Write will refuse otherwise):
+  - ` + "`path`" + ` MUST be absolute.
+  - If the file already exists, you MUST have Read it in this session, and it must not have changed on disk since that Read. This prevents silently clobbering edits made by the user, another agent, or another tool in the same turn.
+
+What NOT to Write:
+  - Documentation files (README, CHANGELOG, *.md) unless the user explicitly asked. Don't volunteer documentation as a "nice extra."
+  - Files with emojis unless the user explicitly requested them.
+  - Files that exist solely to summarize the conversation ("notes.md", "plan.md"). Use the conversation itself; the user can scroll up.
+  - Comments explaining what just-written code does in obvious ways. Trust well-named identifiers.
+
+Write is irreversible. The user's permission mode decides whether confirmation is needed.`
 }
 func (Write) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"path", "content"},
 		"properties": map[string]any{
-			"path":    map[string]any{"type": "string"},
-			"content": map[string]any{"type": "string"},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Absolute path. If the file exists, caller must have Read it this session (state tracker enforces this).",
+			},
+			"content": map[string]any{
+				"type":        "string",
+				"description": "The full new file contents. Include a trailing newline. No partial writes — what you pass replaces the whole file.",
+			},
 		},
 	}
 }

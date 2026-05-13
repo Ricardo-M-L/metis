@@ -51,21 +51,50 @@ func (b *Bash) classifierFor() *BashClassifier {
 
 func (Bash) Name() string { return "Bash" }
 func (Bash) Description() string {
-	return "Execute a shell command. Output is captured (stdout+stderr merged) and truncated to a configurable byte cap. Long-running commands hit a timeout."
+	return `Execute a shell command in the user's environment. stdout+stderr merge into one stream, truncated at a byte cap. cwd persists between calls in the same turn; shell state (env vars, aliases) does NOT — use absolute paths and re-export vars if needed.
+
+Use Bash for:
+  - Operations no other tool covers: git (status/diff/log/commit), package managers (go, npm, pip, cargo), test runners, build commands, system queries (uname, df, ps), curl one-offs.
+  - Chained logic where a dedicated tool would need multiple round-trips (e.g. "run tests, then if green, commit").
+
+Do NOT use Bash for these — use the dedicated tool, which gives the user a cleaner audit trail and better truncation:
+  - Reading files       → use Read (not cat/head/tail/less)
+  - Editing files       → use Edit (not sed -i / awk -i / ed)
+  - Creating files      → use Write (not 'echo > foo' / 'cat <<EOF')
+  - Finding files       → use Glob (not find -name)
+  - Searching text      → use Grep (not grep -r / rg)
+  - Talking to the user → just output text (not echo / printf)
+
+Quoting and safety:
+  - Quote paths with spaces: cd "/Users/x/My Folder", not cd /Users/x/My Folder.
+  - Never prepend 'cd <current-dir>' to a git command — git already works on cwd, and the combo triggers a permission prompt.
+  - Never pass --no-verify, --no-gpg-sign, --force-with-lease without explicit user consent; never 'git push --force' to main/master.
+  - Never 'rm -rf' or pipe to /dev/sd*; never run a command whose effect you can't reverse without asking first.
+
+Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and can poll via BashOutput or stop via BashKill. Note: 'sleep N' is detected and auto-rejected from background mode — pick a real command.
+
+Always pass description: a 5-10 word phrase like "run tests" or "git status before commit". It's shown in the audit trail and helps the user see why each shell call exists.`
 }
 func (Bash) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
-		"required": []string{"command"},
+		"required": []string{"command", "description"},
 		"properties": map[string]any{
-			"command":     map[string]any{"type": "string", "description": "shell command to execute"},
-			"description": map[string]any{"type": "string", "description": "5-10 word summary of what this does"},
-			"timeout_ms":  map[string]any{"type": "integer", "description": "override the default timeout"},
+			"command": map[string]any{
+				"type":        "string",
+				"description": "The shell command. Quote any path containing spaces. Use absolute paths since shell env does not persist across calls.",
+			},
+			"description": map[string]any{
+				"type":        "string",
+				"description": "5-10 word summary in active voice, e.g. 'Run gofmt on changed Go files'. NOT 'Running...' or 'This will...'. Required.",
+			},
+			"timeout_ms": map[string]any{
+				"type":        "integer",
+				"description": "Override the default timeout (ms). Max 600000 (10 min). For anything longer, use run_in_background.",
+			},
 			"run_in_background": map[string]any{
-				"type": "boolean",
-				"description": "Set to true to run the command in the background. " +
-					"You'll get a job ID immediately; use BashOutput to read its output and BashKill to stop it. " +
-					"Useful for dev servers, watchers, long builds. Sleep commands cannot be auto-backgrounded.",
+				"type":        "boolean",
+				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately; read output with BashOutput, terminate with BashKill. 'sleep N' is auto-rejected — pick a real command.",
 			},
 		},
 	}

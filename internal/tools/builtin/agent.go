@@ -177,7 +177,33 @@ func (a Agent) WithSessionPersistence(sessionDir, parentID string) Agent {
 
 func (Agent) Name() string { return "Agent" }
 func (Agent) Description() string {
-	return "Run a sub-agent on a focused task. Returns the sub-agent's final text. Sub-agent shares the same tools and permissions but runs in an isolated message history."
+	return `Spawn a sub-agent to handle a self-contained, focused task. The sub-agent gets its own message history (no shared context with the parent), the same tool set, and a fresh permission gate cloned from yours. It returns a single final text answer.
+
+Use Agent for:
+  - Deep codebase surveys: "find every place we instantiate a Logger and explain the constructor patterns" — the sub-agent can fan out 10+ Grep/Read calls without bloating your context.
+  - Multi-file refactor scouting: "list every Go file that imports the old package path" before you start editing.
+  - Comparative analysis: "diff how the auth flow works in package A vs package B."
+  - Independent verification: "run the test suite and report which tests failed and the smallest reproducing change."
+
+Do NOT use Agent for:
+  - Lookups you can do in one or two tool calls: a single Grep, a single Read — just do it inline. Forking has overhead (new context window, new system prompt) that costs more than the search.
+  - Conversational tasks: explaining something to the user, formatting an answer, deciding what to do next. The model is you; don't fork to think.
+  - Tightly-coupled multi-step work where each step depends on the previous one. Sub-agents can't ask the parent questions; if the work needs back-and-forth, do it inline.
+
+Briefing the sub-agent matters more than briefing yourself:
+  - State the goal in one sentence, then provide what you already know and what you've ruled out. The sub-agent starts cold — no memory of this conversation.
+  - For lookups, hand over the exact pattern or path. For investigations, hand over the question (prescribed steps become dead weight if the premise is wrong).
+  - If you need a short response, say so: "report in under 200 words." Without a cap, sub-agents tend to over-explain.
+  - Don't ask the sub-agent to make load-bearing decisions for you. Have it gather evidence; you synthesize.
+
+Naming and isolation:
+  - Pass ` + "`name`" + ` to register a named teammate that shows up in /agents and can be addressed via MessageTeammate. Use for long-running parallel workers ("explorer", "verifier"). Same-name collisions are rejected.
+  - Pass ` + "`isolation: \"worktree\"`" + ` to give the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a worktree (no nesting).
+  - Pass ` + "`cwd`" + ` to run the sub-agent in a specific directory (mutually exclusive with ` + "`isolation`" + `).
+  - Pass ` + "`run_in_background: true`" + ` to fire-and-forget — returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
+  - Pass ` + "`permission_mode`" + ` to override the gate just for this sub-agent (e.g. let an explorer run with "auto" while the parent stays "ask").
+
+Sub-agents inherit ~/.metis/agents/<name>.md or the bundled profile (explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator) when ` + "`name`" + ` matches. Otherwise they use a minimal default system prompt.`
 }
 func (Agent) InputSchema() map[string]any {
 	return map[string]any{

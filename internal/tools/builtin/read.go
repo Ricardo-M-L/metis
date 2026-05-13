@@ -20,16 +20,43 @@ type Read struct {
 
 func (Read) Name() string { return "Read" }
 func (Read) Description() string {
-	return "Read a file from the local filesystem. Returns lines with 1-indexed line numbers."
+	return `Read a file from the local filesystem. The output is the file content prefixed with 1-indexed line numbers in ` + "`cat -n`" + ` format: 6-digit line number + tab + content. By default, returns up to 2000 lines starting from the top.
+
+Always use Read for file contents — NOT Bash with cat/head/tail/less/more. Read gives the user a structured audit row, deduplicates against the session state tracker, and lets Edit/Write verify the file hasn't drifted on disk before mutating it.
+
+When to slice with offset/limit instead of the default:
+  - You already know the rough line range (e.g. from a Grep hit at line 482).
+  - The file is over a few thousand lines and you only need a specific section.
+
+When NOT to use Read:
+  - Finding files by name pattern → use Glob (e.g. ` + "`**/*.go`" + `).
+  - Searching for text across files → use Grep.
+  - Re-reading a file you just edited in this turn — the state tracker already knows the current content; another Read is wasted tokens.
+  - Reading binary files (images, compiled binaries). Read will return raw bytes which the model can't interpret.
+
+Hard requirements:
+  - ` + "`path`" + ` MUST be absolute. Relative paths are rejected.
+  - File size cap is 256 MiB; oversized files return an error directing you to ` + "`Bash head/tail`" + ` for a peek.
+
+After Read, the path is "read" for the session: subsequent Edit/Write on that path will work, AND will be refused if the file changed on disk between Read and Edit/Write. If you want to edit a partial-view file (offset != 1 or hit the limit), Read it again fully first — otherwise Edit refuses to mutate regions you never saw.`
 }
 func (Read) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"path"},
 		"properties": map[string]any{
-			"path":   map[string]any{"type": "string", "description": "absolute path to read"},
-			"offset": map[string]any{"type": "integer", "description": "1-indexed line to start at"},
-			"limit":  map[string]any{"type": "integer", "description": "max lines to return"},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Absolute path to the file. Relative paths are rejected.",
+			},
+			"offset": map[string]any{
+				"type":        "integer",
+				"description": "1-indexed starting line. Use when you know the rough region of interest (e.g. from a Grep hit). Default 1 (start of file).",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"description": "Maximum lines to return. Default 2000. Increase for big files only when you genuinely need the extra range; remember context is precious.",
+			},
 		},
 	}
 }
