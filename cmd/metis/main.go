@@ -706,6 +706,21 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// system prompt overlay above tells it to dispatch sub-agents.
 	rtpkg.FilterRegistryInPlace(reg)
 
+	// Wire the gate's IsReadOnly resolver to the live registry now
+	// that tool registration is finalised. Under ModeAcceptEdits,
+	// any tool the registry knows as read-only (SubAgentOutput,
+	// BashOutput, TaskOutput, Skill, LSP, MetisInfo, ToolSearch,
+	// the file readers, etc.) auto-allows instead of asking. 2026-
+	// 05-13 fix for the "acceptEdits still prompts for
+	// SubAgentOutput" report.
+	gate.SetReadOnlyHook(func(name string) bool {
+		t, ok := reg.Get(name)
+		if !ok {
+			return false
+		}
+		return tools.IsReadOnly(t, nil)
+	})
+
 	// MCP servers — launch each enabled stdio server, register its tools as
 	// `mcp__<name>__<tool>`. Failures are non-fatal: warn and continue.
 	//

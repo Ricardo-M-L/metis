@@ -40,6 +40,20 @@ func (TaskGet) IsReadOnly(map[string]any) bool    { return true }
 func (TaskList) IsReadOnly(map[string]any) bool   { return true }
 func (TaskOutput) IsReadOnly(map[string]any) bool { return true }
 
+// SubAgentList / SubAgentOutput inspect the in-process Roster + the
+// sub-agent transcript on disk respectively — no mutation, no I/O the
+// parent needs to roll back. Mirrors TaskList/TaskOutput which
+// claude-code also marks isReadOnly=true. (SubAgentStop kills a
+// running sub-agent and is NOT read-only.)
+func (SubAgentList) IsReadOnly(map[string]any) bool   { return true }
+func (SubAgentOutput) IsReadOnly(map[string]any) bool { return true }
+
+// BashList / BashOutput are the same shape: enumerate the bash-job
+// pool / tail a background command's tee. Read-only. (BashKill is
+// the destructive counterpart and is NOT marked here.)
+func (BashList) IsReadOnly(map[string]any) bool   { return true }
+func (BashOutput) IsReadOnly(map[string]any) bool { return true }
+
 // LSP queries language-server diagnostics — read-only.
 func (LSP) IsReadOnly(map[string]any) bool { return true }
 

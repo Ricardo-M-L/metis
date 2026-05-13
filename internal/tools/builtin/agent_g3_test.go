@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -50,11 +51,54 @@ func waitForTeammate(roster *agent.Roster, name string, d time.Duration) (*agent
 	}
 }
 
+// blockingProvider returns an llm.Provider whose Stream() never sends
+// a message_stop event — the sub-loop sees only a text_delta and then
+// the stream stays open until ctx is cancelled. Used by background-
+// spawn tests that need to observe the teammate's Roster entry mid-
+// flight: the default helloProvider finishes in microseconds, so the
+// background goroutine Unregisters before Lookup runs and the test
+// becomes racy.
+//
+// The blocking happens inside Recv(): it returns the first event,
+// then blocks on ctx.Done() forever (or until Roster.CancelAll fires).
+type blockingFakeProvider struct{}
+
+func (blockingFakeProvider) Name() string          { return "blocking-fake" }
+func (blockingFakeProvider) MaxContextTokens() int { return 100_000 }
+func (blockingFakeProvider) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
+	return nil, nil
+}
+func (blockingFakeProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamReader, error) {
+	return &blockingStream{ctx: ctx}, nil
+}
+
+type blockingStream struct {
+	ctx  context.Context
+	sent bool
+}
+
+func (s *blockingStream) Recv() (llm.StreamEvent, error) {
+	if !s.sent {
+		s.sent = true
+		return llm.StreamEvent{Type: "text_delta", TextDelta: "live"}, nil
+	}
+	<-s.ctx.Done()
+	return llm.StreamEvent{}, s.ctx.Err()
+}
+func (s *blockingStream) Close() error { return nil }
+
 // TestAgentExecute_NamedTeammateRegisters — happy path: pass `name`,
 // teammate appears in Roster under that name, Anonymous=false.
 func TestAgentExecute_NamedTeammateRegisters(t *testing.T) {
 	roster := agent.NewRoster(0)
-	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system").
+	// blockingFakeProvider keeps the sub-loop alive (Recv blocks
+	// after the first text_delta) so the background goroutine can't
+	// Unregister before Lookup runs. The default helloProvider
+	// finishes in microseconds — Execute returns, the sub-loop
+	// goroutine completes, defer Unregister fires, and Lookup races
+	// to see an empty Roster. With a blocking provider the teammate
+	// stays registered until roster.CancelAll fires in the cleanup.
+	tool := NewAgent(permission.New(permission.ModeBypass), blockingFakeProvider{}, tools.NewRegistry(), "model", "system").
 		WithRoster(roster)
 
 	// Use run_in_background so the registration stays observable

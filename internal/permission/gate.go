@@ -181,6 +181,22 @@ type Gate struct {
 	// calling the classifier for 30 minutes — otherwise every tool
 	// call burns a doomed retry. Mirrors CLASSIFIER_FAIL_CLOSED_*.
 	classifierFailUntil time.Time
+
+	// readOnlyHook lets ModeAcceptEdits auto-allow ANY tool the
+	// runtime tags as read-only — instead of relying on the
+	// hardcoded "Read/LS/Glob/Grep/WebFetch + Edit/Write/NotebookEdit"
+	// allowlist, which silently broke for tools added later
+	// (SubAgentOutput, BashOutput, TaskOutput, Skill, ToolSearch,
+	// LSP, MetisInfo, …). The runtime wires this up after the tool
+	// registry is built; nil means "fall back to the hardcoded
+	// allowlist", which keeps tests and headless paths working.
+	//
+	// 2026-05-13 fix for the "acceptEdits still prompts for
+	// SubAgentOutput" report: claude-code lets each tool declare
+	// isReadOnly() and threads that through the permission decision;
+	// metis grew the IsReadOnly capability but the gate never read
+	// it.
+	readOnlyHook func(toolName string) bool
 }
 
 func New(mode Mode) *Gate {
@@ -189,6 +205,42 @@ func New(mode Mode) *Gate {
 		memoAllow:    make(map[string]bool),
 		denialLimits: DefaultDenialLimits,
 	}
+}
+
+// SetReadOnlyHook installs the runtime's "is tool X read-only?"
+// resolver. Called once after the tool registry is built; nil clears
+// the hook back to the legacy hardcoded-allowlist behaviour.
+//
+// Resolution rule: a hook returning true makes ModeAcceptEdits
+// auto-allow the call regardless of the tool name. The hardcoded
+// allowlist still runs as a fallback when the hook returns false
+// (or is nil), so existing tests that don't wire a registry keep
+// working.
+func (g *Gate) SetReadOnlyHook(fn func(toolName string) bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.readOnlyHook = fn
+}
+
+// callReadOnlyHookLocked invokes the runtime "is tool X read-only?"
+// resolver and returns its verdict, or false when no hook is wired.
+// Caller MUST already hold g.mu (Lock or RLock) — Check is the only
+// caller and it Lock()s on entry. We deliberately don't grab another
+// RLock here: sync.RWMutex is non-reentrant, and the previous
+// implementation deadlocked when Check held Lock and tried to RLock
+// itself (2026-05-13 test-suite hang).
+func (g *Gate) callReadOnlyHookLocked(tool string) bool {
+	fn := g.readOnlyHook
+	if fn == nil {
+		return false
+	}
+	// The hook is user code (registry lookup in the live runtime).
+	// Drop the lock for the call so the hook is free to do its own
+	// locking without re-entering ours, then take it back. Check's
+	// `defer g.mu.Unlock()` keeps the contract.
+	g.mu.Unlock()
+	defer g.mu.Lock()
+	return fn(tool)
 }
 
 // SetDenialLimits overrides the default denial-tracking thresholds.
@@ -448,6 +500,26 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		// still falls through to ASK so commands aren't auto-run.
 		// This sits between Auto (asks for any write) and Bypass
 		// (allows anything). claude-code's acceptEdits.
+
+		// Registry-driven path (preferred): any tool the runtime
+		// tags as IsReadOnly is auto-allowed. Covers
+		// SubAgentOutput / BashOutput / TaskOutput / Skill / LSP /
+		// MetisInfo / ToolSearch / etc. without needing to keep
+		// the hardcoded list in sync. Bash is input-aware
+		// (IsReadOnly only true for `cat foo` / `git status`-style
+		// calls), so a `Bash {cmd: "rm -rf"}` still falls through
+		// to ASK because its IsReadOnly returns false for that
+		// input — which we can't see from the gate. Restrict the
+		// registry-driven path to non-Bash tools to keep that
+		// safety in place; Bash always asks under acceptEdits.
+		if tool != "Bash" && g.callReadOnlyHookLocked(tool) {
+			g.recordAllow()
+			return DecisionAllow, "mode:acceptEdits:readonly"
+		}
+
+		// Legacy hardcoded allowlist — kept as a fallback for tests
+		// and headless paths that build a Gate without wiring the
+		// registry hook. New tools should rely on the hook above.
 		switch tool {
 		case "Read", "LS", "Glob", "Grep", "WebFetch":
 			g.recordAllow()

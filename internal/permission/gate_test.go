@@ -106,6 +106,75 @@ func TestGate_SnapshotReturnsRulesCopy(t *testing.T) {
 	}
 }
 
+// TestGate_AcceptEdits_HookAllowsRegistryReadOnly — 2026-05-13
+// regression: ModeAcceptEdits used to prompt for ANY tool outside its
+// hardcoded "Read/LS/Glob/Grep/WebFetch + Edit/Write/NotebookEdit"
+// list (user-visible bug: SubAgentOutput / BashOutput / TaskOutput /
+// Skill / LSP / MetisInfo all asked even though they're read-only).
+// Fix routes the decision through Gate.SetReadOnlyHook(registry-
+// lookup); this test pins that the hook path auto-allows.
+func TestGate_AcceptEdits_HookAllowsRegistryReadOnly(t *testing.T) {
+	g := New(ModeAcceptEdits)
+
+	// Hook decides which names are read-only.
+	g.SetReadOnlyHook(func(name string) bool {
+		switch name {
+		case "SubAgentOutput", "BashOutput", "TaskOutput", "Skill", "LSP", "MetisInfo":
+			return true
+		}
+		return false
+	})
+
+	// Each of these must auto-allow with the new acceptEdits:readonly source.
+	for _, tool := range []string{"SubAgentOutput", "BashOutput", "TaskOutput", "Skill", "LSP", "MetisInfo"} {
+		d, src := g.Check(context.Background(), tool, "")
+		if d != DecisionAllow {
+			t.Errorf("acceptEdits should auto-allow read-only %s; got %v (%s)", tool, d, src)
+		}
+		if src != "mode:acceptEdits:readonly" {
+			t.Errorf("expected mode:acceptEdits:readonly source for %s; got %s", tool, src)
+		}
+	}
+
+	// Tools NOT marked read-only must still ASK (Agent spawns a sub-loop —
+	// the hook should return false for it, and we never auto-allow without
+	// the user weighing in).
+	for _, tool := range []string{"Agent", "SubAgentStop", "BashKill"} {
+		if d, _ := g.Check(context.Background(), tool, ""); d != DecisionAsk {
+			t.Errorf("acceptEdits should ASK for non-read-only %s; got %v", tool, d)
+		}
+	}
+}
+
+// TestGate_AcceptEdits_BashAlwaysAsksDespiteHook — Bash is input-aware
+// (IsReadOnly returns true for `cat foo` and false for `rm -rf`). The
+// gate can't see the input, so it MUST keep asking for Bash under
+// acceptEdits even if the hook would return true at name granularity.
+// Otherwise a poorly-coded hook could silently auto-run destructive
+// shell commands.
+func TestGate_AcceptEdits_BashAlwaysAsksDespiteHook(t *testing.T) {
+	g := New(ModeAcceptEdits)
+	g.SetReadOnlyHook(func(name string) bool { return name == "Bash" })
+	if d, _ := g.Check(context.Background(), "Bash", "rm -rf /"); d != DecisionAsk {
+		t.Errorf("Bash must always ASK under acceptEdits regardless of readOnlyHook; got %v", d)
+	}
+}
+
+// TestGate_AcceptEdits_NoHookFallsBackToHardcoded — when no hook is
+// wired (tests / headless paths), the legacy hardcoded allowlist
+// still kicks in.
+func TestGate_AcceptEdits_NoHookFallsBackToHardcoded(t *testing.T) {
+	g := New(ModeAcceptEdits)
+	// Read still allowed by the legacy switch.
+	if d, _ := g.Check(context.Background(), "Read", ""); d != DecisionAllow {
+		t.Errorf("Read should still auto-allow via legacy switch when hook is nil")
+	}
+	// SubAgentOutput falls through to default ASK without a hook.
+	if d, _ := g.Check(context.Background(), "SubAgentOutput", ""); d != DecisionAsk {
+		t.Errorf("SubAgentOutput should ASK without a hook")
+	}
+}
+
 func TestGate_RememberAcrossCalls(t *testing.T) {
 	g := New(ModeAsk)
 	if g.Remembered("Bash", "git status") {
