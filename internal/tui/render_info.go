@@ -159,22 +159,82 @@ func guessPriceUSDPerM(model string) (in, out float64) {
 	}
 }
 
-func renderDiff() string {
+func renderDiff(m *Model) string {
+	var b strings.Builder
+
+	// Section 1: session-scoped touched-files report.
+	//
+	// claude-code's /diff threads through their FileHistorySnapshot
+	// chain; crush uses filetracker.Service. metis derives the list
+	// from Loop.Messages on demand (no extra storage). Surfacing it
+	// here gives the user the "what did THIS session touch" answer
+	// that `git diff` can't — git mixes pre-session uncommitted
+	// edits with agent edits, and misses files that were already
+	// committed earlier this session.
+	if m != nil && m.loop != nil {
+		if touched := m.loop.TouchedFiles(); len(touched) > 0 {
+			b.WriteString("Session activity (Read / Edit / Write):\n")
+			for _, tf := range touched {
+				marker := "  "
+				switch {
+				case tf.Writes > 0 && tf.Edits == 0:
+					marker = "✨"
+				case tf.Edits > 0:
+					marker = "✏ "
+				default:
+					marker = "📖"
+				}
+				fmt.Fprintf(&b, "  %s %s", marker, tf.Path)
+				counts := []string{}
+				if tf.Reads > 0 {
+					counts = append(counts, fmt.Sprintf("R×%d", tf.Reads))
+				}
+				if tf.Edits > 0 {
+					counts = append(counts, fmt.Sprintf("E×%d", tf.Edits))
+				}
+				if tf.Writes > 0 {
+					counts = append(counts, fmt.Sprintf("W×%d", tf.Writes))
+				}
+				if len(counts) > 0 {
+					fmt.Fprintf(&b, "  (%s)", strings.Join(counts, ", "))
+				}
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	// Section 2: working-tree git diff. May not overlap with the
+	// session list above: a file the agent Edit'd and then
+	// committed in-session shows in section 1 but not here; a file
+	// the user (not the agent) touched outside metis shows here but
+	// not in section 1. The two views are complementary, not
+	// redundant.
 	cmd := exec.Command("git", "diff", "--stat", "HEAD")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Fall back to plain diff if HEAD doesn't exist (fresh repo).
 		cmd = exec.Command("git", "diff", "--stat")
 		out, err = cmd.CombinedOutput()
 		if err != nil {
-			return "diff: " + err.Error() + "\n" + string(out)
+			b.WriteString("git diff: ")
+			b.WriteString(err.Error())
+			b.WriteString("\n")
+			b.Write(out)
+			return b.String()
 		}
 	}
 	body := strings.TrimSpace(string(out))
 	if body == "" {
-		return "(working tree clean)"
+		b.WriteString("git diff --stat HEAD: (working tree clean)\n")
+		if b.Len() > 0 {
+			b.WriteString("(session activity above shows files this run touched even if already committed)\n")
+		}
+		return b.String()
 	}
-	return "git diff --stat:\n" + body + "\n\n(use `git diff` outside metis for full patch)"
+	b.WriteString("git diff --stat HEAD:\n")
+	b.WriteString(body)
+	b.WriteString("\n\n(use `git diff` outside metis for full patch)")
+	return b.String()
 }
 
 func renderDoctor(m *Model) string {

@@ -448,7 +448,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalCost:
 			m.openBodyScreen("/cost", renderCost(m))
 		case slash.SignalDiff:
-			m.openBodyScreen("/diff", renderDiff())
+			m.openBodyScreen("/diff", renderDiff(m))
 		case slash.SignalDoctor:
 			m.openBodyScreen("/doctor", renderDoctor(m))
 		case slash.SignalStats:
