@@ -24,9 +24,11 @@ package skills
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os/exec"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	pubskill "github.com/Ricardo-M-L/metis/pkg/skill"
@@ -115,15 +117,36 @@ func runInlineShell(ctx context.Context, cmd, cwd string) string {
 	if cwd != "" {
 		c.Dir = cwd
 	}
-	// WaitDelay (Go 1.20+) bounds the post-cancel wait when a shell
-	// child outlives its parent and keeps pipe FDs open (Linux
-	// reparents `sleep` to init after the shell is killed; c.Wait
-	// would otherwise hang forever waiting on the pipe). With
-	// WaitDelay set, Wait force-closes pipes and returns. macOS
-	// shells happen to propagate the kill, so this only manifests
-	// on Linux CI runners — TestExpandInlineShell_TimeoutBounded
-	// failed there pre-2026-05-13.
-	c.WaitDelay = 2 * time.Second
+	// Linux gotcha: when ctx fires, exec.CommandContext sends SIGKILL
+	// to `sh`, but `sh -c "sleep 30"`'s sleep grandchild is reparented
+	// to init and keeps the inherited stdout pipe FD open — so c.Wait
+	// blocks forever on the pipe read. macOS shells happen to
+	// propagate the kill, masking the issue (the only CI failure
+	// surface). Fix is two-layered:
+	//   1. Setpgid puts the shell + all its descendants in a fresh
+	//      process group, and Cancel overrides the default SIGKILL
+	//      target with a group-wide kill (`syscall.Kill(-pid, ...)`).
+	//      That dispatches the kill to `sleep` too, so the pipe
+	//      writer closes promptly and Wait returns.
+	//   2. WaitDelay=500ms is a belt-and-braces: if anything in the
+	//      group survives Setpgid (unlikely), the I/O goroutines
+	//      still force-close after 500ms.
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error {
+		if c.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-c.Process.Pid, syscall.SIGKILL); err != nil {
+			// Falls back to the default behaviour (single-pid kill)
+			// when group kill is unsupported on the platform.
+			if errors.Is(err, syscall.ESRCH) {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+	c.WaitDelay = 500 * time.Millisecond
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
