@@ -186,7 +186,7 @@ Usage:
   metis skills list     List built-in skills library
   metis skills install <name>  Install a built-in skill
   metis acp [--addr ADDR]  Run as Agent Client Protocol server (default: stdio)
-  metis cron <list|add|rm|pause|resume|run|start>  Manage scheduled prompts
+  metis cron <list|add|rm|pause|resume|run|start|audit>  Manage scheduled prompts
   metis auth <login|logout|list>  Manage provider credentials (~/.metis/auth.json)
   metis audit           Print a security audit of the current configuration
   metis diag [--llm] [--tool-smoke] [--json]  Run a non-interactive health check
@@ -1389,7 +1389,7 @@ func cmdAudit() error {
 
 func cmdCron(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: metis cron <list|add|rm|pause|resume|run|start>")
+		return errors.New("usage: metis cron <list|add|rm|pause|resume|run|start|audit>")
 	}
 	cfg, _, err := config.Load()
 	if err != nil {
@@ -1440,8 +1440,59 @@ func cmdCron(ctx context.Context, args []string) error {
 		return cmdCronRun(ctx, svc, rest)
 	case "start":
 		return cmdCronStart(ctx, svc)
+	case "audit":
+		return cmdCronAudit(svc, rest)
 	}
 	return fmt.Errorf("cron: unknown subcommand %q", sub)
+}
+
+// cmdCronAudit lists or prints transcripts for a silent cron job's
+// fires. Two forms:
+//
+//	metis cron audit <id>            → list every fire (newest first)
+//	metis cron audit <id> latest     → print the latest fire's transcript
+//	metis cron audit <id> <file>     → print one specific fire by name
+//
+// `latest` is the common interactive case ("what did my silent
+// health-check find on its last run?"); the explicit filename form is
+// for scripts that want to walk a particular range.
+func cmdCronAudit(svc *agent.CronService, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: metis cron audit <id> [latest|<filename>]")
+	}
+	jobID := args[0]
+	dir, ok := svc.AuditPath(jobID)
+	if !ok {
+		return fmt.Errorf("cron audit: no audit log for %q (job may not be silent, or it hasn't fired yet)", jobID)
+	}
+	names, err := svc.ListAuditFires(jobID)
+	if err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		fmt.Println("(no fires recorded yet)")
+		return nil
+	}
+	// Plain list mode.
+	if len(args) == 1 {
+		fmt.Printf("Audit fires for %s (newest first):\n", jobID)
+		for _, n := range names {
+			fmt.Printf("  %s\n", n)
+		}
+		fmt.Printf("\nView one: metis cron audit %s latest    OR    metis cron audit %s <filename>\n", jobID, jobID)
+		return nil
+	}
+	target := args[1]
+	if target == "latest" {
+		target = names[0]
+	}
+	path := filepath.Join(dir, target)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	fmt.Print(string(data))
+	return nil
 }
 
 func cmdCronAdd(svc *agent.CronService, args []string) error {
@@ -1461,6 +1512,8 @@ func cmdCronAdd(svc *agent.CronService, args []string) error {
 	fs.StringVar(&mode, "mode", "isolated", "session mode: isolated | persistent | main")
 	fs.StringVar(&sessionRef, "session", "", "session ref for mode=main (default \"main\")")
 	fs.StringVar(&disabled, "disable-tools", "", "comma-separated tools to deny while this job runs (e.g. WebFetch,Agent)")
+	var silent bool
+	fs.BoolVar(&silent, "silent", false, "fire without printing to chat — transcripts land in ~/.metis/cron/audit/<id>/ for `cron audit <id>` to inspect")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1475,6 +1528,7 @@ func cmdCronAdd(svc *agent.CronService, args []string) error {
 		Repeat:      repeat,
 		SessionMode: mode,
 		SessionRef:  sessionRef,
+		Silent:      silent,
 	}
 	if disabled != "" {
 		for _, t := range strings.Split(disabled, ",") {
@@ -1594,6 +1648,34 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	}
 	rt.loop.AppendUser(job.Prompt)
 
+	// Silent-fire audit channel — opened once per fire when Silent is
+	// set. All event handling below mirrors a copy to this writer; the
+	// stdout/stderr renderers also branch on `silent` so the user's
+	// chat surface doesn't fill with cron noise. Mirrors hermes
+	// SILENT_MARKER but with a per-fire transcript instead of a single
+	// rolling log.
+	var auditW *agent.AuditWriter
+	if job.Silent {
+		root := rt.cfg.Session.Dir // best-effort — falls back below if empty
+		if root == "" {
+			root = filepath.Join(os.Getenv("HOME"), ".metis")
+		}
+		// cron service uses ~/.metis/cron as root; audit logs live
+		// alongside the job files under cron/audit/<id>/
+		cronRoot := filepath.Join(filepath.Dir(root), "cron")
+		if w, err := agent.OpenAuditLog(cronRoot, job.ID); err == nil {
+			auditW = w
+			auditW.Append(agent.AuditEntry{Kind: "start", Text: job.Name})
+			defer func() {
+				_ = auditW.Close()
+			}()
+		} else {
+			// Audit failure shouldn't block the fire — log to stderr
+			// once and continue.
+			fmt.Fprintf(os.Stderr, "[cron %s] audit open failed: %v (continuing without)\n", job.ID, err)
+		}
+	}
+
 	// 2. Apply per-job tool blacklist (Hermes pattern). Each name in
 	//    DisabledTools gets a temporary deny rule appended to the gate;
 	//    we capture the rule count so we can pop them after the fire.
@@ -1626,18 +1708,48 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	for ev := range events {
 		switch ev.Kind {
 		case agent.EventTextDelta:
-			fmt.Print(ev.TextDelta)
+			if !job.Silent {
+				fmt.Print(ev.TextDelta)
+			}
+			if auditW != nil {
+				auditW.Append(agent.AuditEntry{Kind: "text", Text: ev.TextDelta})
+			}
 		case agent.EventToolStart:
-			fmt.Fprintf(os.Stderr, "\n[cron %s] [tool] %s\n", job.ID, ev.ToolName)
+			if !job.Silent {
+				fmt.Fprintf(os.Stderr, "\n[cron %s] [tool] %s\n", job.ID, ev.ToolName)
+			}
+			if auditW != nil {
+				auditW.Append(agent.AuditEntry{Kind: "tool_start", Tool: ev.ToolName})
+			}
+		case agent.EventToolResult:
+			if auditW != nil && ev.ToolResult != nil {
+				auditW.Append(agent.AuditEntry{
+					Kind: "tool_result", Text: ev.ToolResult.Output, IsError: ev.ToolResult.IsError,
+				})
+			}
 		case agent.EventInfo:
-			if ev.Info != "" {
+			if ev.Info == "" {
+				continue
+			}
+			if !job.Silent {
 				fmt.Fprintf(os.Stderr, "[cron %s] [info] %s\n", job.ID, ev.Info)
+			}
+			if auditW != nil {
+				auditW.Append(agent.AuditEntry{Kind: "info", Text: ev.Info})
 			}
 		case agent.EventPermissionRequest:
 			ev.PermissionReply <- agent.PermissionDecisionDeny
 		case agent.EventLoopDone:
-			fmt.Println()
+			if !job.Silent {
+				fmt.Println()
+			}
+			if auditW != nil {
+				auditW.Append(agent.AuditEntry{Kind: "loop_done"})
+			}
 		case agent.EventError:
+			if auditW != nil {
+				auditW.Append(agent.AuditEntry{Kind: "error", Text: ev.Err.Error(), IsError: true})
+			}
 			return ev.Err
 		}
 	}

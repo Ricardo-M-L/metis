@@ -426,12 +426,18 @@ metis cron add --at "2026-05-01T09:00:00Z" --prompt "release reminder" --repeat 
 # limit which tools cron can use (Hermes-style blacklist)
 metis cron add --every 1h --prompt "scan for new bugs" --disable-tools "Agent,WebFetch"
 
+# silent — fire without printing to chat, transcript lands in audit log
+# (hermes SILENT_MARKER pattern: "I want to know it ran, not be spammed")
+metis cron add --every 10m --silent --prompt "ping internal /healthz, log failures"
+metis cron audit <id>          # list silent fires for a job (newest first)
+metis cron audit <id> latest   # print the most recent transcript
+
 metis cron list
 metis cron pause <id>
 metis cron resume <id>
 metis cron rm <id>
-metis cron run <id>           # fire immediately, ignore schedule
-metis cron start              # foreground daemon (Ctrl+C to stop)
+metis cron run <id>            # fire immediately, ignore schedule
+metis cron start               # foreground daemon (Ctrl+C to stop)
 ```
 
 `SessionMode` choices:
@@ -443,7 +449,10 @@ metis cron start              # foreground daemon (Ctrl+C to stop)
 Inside chat the LLM has the `ScheduleWakeup` tool — it can decide on its
 own when to re-enter (e.g. "check if the build is done in 5 min"). The
 wakeup persists as a one-shot cron job, so `metis cron list` shows what
-the agent has scheduled itself.
+the agent has scheduled itself. The status bar shows a `↻ wake 18m`
+chip when a wakeup is pending; a `◐ cron silent N/24h` badge counts
+silent-cron fires in the last 24h so a stuck health-check is visible
+at a glance.
 
 ## Multi-agent (Phase G — claude-code parity)
 

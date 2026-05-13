@@ -232,6 +232,18 @@ func renderStatusBar(m *Model) string {
 	for _, sa := range m.subAgents {
 		leftParts = append(leftParts, "◇ "+sa.Name)
 	}
+	// Cron wakeups + silent fires (2026-05-13). The wakeup chip
+	// makes ScheduleWakeup self-documenting — without it the user
+	// has no UI hint that the agent set itself a future trigger.
+	// The silent-fires badge mirrors hermes' SILENT_MARKER: silent
+	// jobs land in audit logs, badge counts last-24h fires so the
+	// user notices when a counter sticks at zero (= broken job).
+	if chip := wakeupChip(); chip != "" {
+		leftParts = append(leftParts, chip)
+	}
+	if chip := silentFiresChip(); chip != "" {
+		leftParts = append(leftParts, chip)
+	}
 	if voiceActive() {
 		leftParts = append(leftParts, "● rec")
 	}

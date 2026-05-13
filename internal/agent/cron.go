@@ -87,6 +87,18 @@ type CronJob struct {
 	// out by default so accidentally-left-running loops eventually clean
 	// themselves up (claude-code's behavior).
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
+
+	// Silent suppresses the per-fire chat / streaming surface and routes
+	// the transcript to <root>/audit/<id>/<rfc3339>.jsonl instead. The
+	// status bar still shows a "[cron N fired]" badge so the user knows
+	// the job ran. Mirrors hermes-agent's SILENT_MARKER pattern: "I want
+	// to know it happened, but don't interrupt me every time".
+	//
+	// Use for low-signal-per-fire jobs (every-5min health check, hourly
+	// log scan) where 99% of fires have nothing interesting to surface
+	// and the user will check audit logs when something looks off.
+	// Loud (non-silent) is the default — silent is opt-in.
+	Silent bool `json:"silent,omitempty"`
 }
 
 // SessionMode constants. Use these instead of bare strings when
