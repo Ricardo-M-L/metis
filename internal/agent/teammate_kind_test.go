@@ -19,10 +19,10 @@ import (
 func TestTeammateKind_String(t *testing.T) {
 	t.Parallel()
 	cases := map[TeammateKind]string{
-		KindAnon:       "anon",
-		KindNamed:      "named",
-		KindWorkflow:   "workflow",
-		KindMcpMonitor: "mcp_monitor",
+		KindAnon:          "anon",
+		KindNamed:         "named",
+		KindWorkflow:      "workflow",
+		KindMcpMonitor:    "mcp_monitor",
 		TeammateKind(999): "unknown",
 	}
 	for k, want := range cases {

@@ -17,7 +17,7 @@ func TestExtractAtMentionPaths(t *testing.T) {
 		{"hello world", nil},
 		{"check @cmd/main.go please", []string{"cmd/main.go"}},
 		{"@a.go and @b.go", []string{"a.go", "b.go"}},
-		{"look at @cmd/main.go.", []string{"cmd/main.go"}},                  // trailing dot trimmed
+		{"look at @cmd/main.go.", []string{"cmd/main.go"}},                          // trailing dot trimmed
 		{"see @services/foo,@services/bar", []string{"services/foo,@services/bar"}}, // no space → one token
 		{"email like a@b.com is NOT a mention", nil},
 		{"\n@root.md", []string{"root.md"}},

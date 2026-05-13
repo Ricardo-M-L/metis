@@ -244,4 +244,3 @@ func mustNotExist(t *testing.T, path string) {
 		t.Errorf("unexpected stat error: %v", err)
 	}
 }
-

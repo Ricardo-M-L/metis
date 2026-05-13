@@ -52,9 +52,9 @@ type SubAgentSnapshot struct {
 // internal/session.Entry. Kept private here so the file format
 // stays opaque to callers — they only see SubAgentSnapshot.
 type subagentEntry struct {
-	Type    string         `json:"type"` // "header" | "message"
+	Type    string          `json:"type"` // "header" | "message"
 	Header  *pubsess.Header `json:"header,omitempty"`
-	Message *llm.Message   `json:"message,omitempty"`
+	Message *llm.Message    `json:"message,omitempty"`
 }
 
 // SubAgentTranscript is the per-sub-agent writer. Owns an open file

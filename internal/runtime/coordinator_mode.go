@@ -140,22 +140,22 @@ determines the team's output — not how much code the lead writes.`
 // teammate-level concern). Users who legitimately need a tool back
 // can add it via METIS_COORDINATOR_EXTRA_TOOLS.
 var coordinatorAllowedTools = map[string]struct{}{
-	"Agent":            {},
-	"Fork":             {},
-	"SendMessage":      {},
-	"MessageTeammate":  {},
-	"ScheduleWakeup":   {},
-	"SubAgentList":     {},
-	"SubAgentOutput":   {},
-	"SubAgentStop":     {},
-	"Read":             {},
-	"Grep":             {},
-	"Glob":             {},
-	"LS":               {},
-	"MetisInfo":        {},
-	"WebFetch":         {},
-	"WebSearch":        {},
-	"Memory":           {},
+	"Agent":           {},
+	"Fork":            {},
+	"SendMessage":     {},
+	"MessageTeammate": {},
+	"ScheduleWakeup":  {},
+	"SubAgentList":    {},
+	"SubAgentOutput":  {},
+	"SubAgentStop":    {},
+	"Read":            {},
+	"Grep":            {},
+	"Glob":            {},
+	"LS":              {},
+	"MetisInfo":       {},
+	"WebFetch":        {},
+	"WebSearch":       {},
+	"Memory":          {},
 }
 
 // CoordinatorToolFilter returns the set of tool names that should

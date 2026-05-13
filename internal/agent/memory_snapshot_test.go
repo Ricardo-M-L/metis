@@ -110,9 +110,9 @@ func TestStore_SnapshotInvalidNames(t *testing.T) {
 	t.Parallel()
 	s := NewStore(t.TempDir())
 	cases := []string{
-		"",          // empty
-		".hidden",   // starts with dot
-		"path/sep",  // contains /
+		"",           // empty
+		".hidden",    // starts with dot
+		"path/sep",   // contains /
 		"with space", // contains space
 	}
 	for _, name := range cases {

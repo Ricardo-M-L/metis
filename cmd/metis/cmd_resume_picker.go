@@ -111,9 +111,9 @@ func runResumePicker(store *session.Store) (string, error) {
 type resumePickerModel struct {
 	entries   []session.ListEntry
 	cursor    int
-	offset    int  // first visible row
-	viewSize  int  // rows shown at once
-	width     int  // last-known terminal width (for row truncation)
+	offset    int // first visible row
+	viewSize  int // rows shown at once
+	width     int // last-known terminal width (for row truncation)
 	cancelled bool
 }
 

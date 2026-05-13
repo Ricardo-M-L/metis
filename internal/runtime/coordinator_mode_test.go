@@ -187,10 +187,10 @@ func short(s string) string {
 // testTool is a minimal Tool implementation for registry tests.
 type testTool struct{ name string }
 
-func (t testTool) Name() string                                      { return t.name }
-func (t testTool) Description() string                               { return "test tool " + t.name }
-func (t testTool) InputSchema() map[string]any                       { return map[string]any{"type": "object"} }
-func (t testTool) Concurrency(map[string]any) tools.Concurrency      { return tools.ConcurrencyExclusive }
+func (t testTool) Name() string                                 { return t.name }
+func (t testTool) Description() string                          { return "test tool " + t.name }
+func (t testTool) InputSchema() map[string]any                  { return map[string]any{"type": "object"} }
+func (t testTool) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencyExclusive }
 func (t testTool) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	return tools.PermissionAllow, ""
 }

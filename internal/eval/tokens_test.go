@@ -131,14 +131,14 @@ func TestComputeReward_MaxTokens_NeutralWhenNoMetricsLine(t *testing.T) {
 
 func TestAtoiSafe_ParsesPositiveIntegers(t *testing.T) {
 	cases := map[string]int{
-		"0":          0,
-		"1":          1,
-		"123":        123,
-		"99999":      99999,
-		"":           0, // empty → 0
-		"abc":        0, // non-digit → 0
-		"12abc":      0, // contains non-digit → 0
-		"-5":         0, // negatives not supported (token counts are non-negative)
+		"0":     0,
+		"1":     1,
+		"123":   123,
+		"99999": 99999,
+		"":      0, // empty → 0
+		"abc":   0, // non-digit → 0
+		"12abc": 0, // contains non-digit → 0
+		"-5":    0, // negatives not supported (token counts are non-negative)
 	}
 	for in, want := range cases {
 		if got := atoiSafe(in); got != want {

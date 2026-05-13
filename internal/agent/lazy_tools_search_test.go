@@ -220,7 +220,7 @@ func TestHandleToolSearch_KeywordMaxResults(t *testing.T) {
 // returning them here would be noise.
 func TestHandleToolSearch_KeywordExcludesNonMCP(t *testing.T) {
 	reg := tools.NewRegistry()
-	reg.Register(mcpFake("Read", "read a file"))            // not mcp__
+	reg.Register(mcpFake("Read", "read a file"))             // not mcp__
 	reg.Register(mcpFake("mcp__fs__read", "read remote fs")) // is mcp__
 	l := &Loop{Registry: reg}
 	parsed, isErr := invokeSearch(t, l, map[string]any{"query": "read"})
@@ -268,9 +268,9 @@ func TestSplitQueryTerms_ParsesRequiredAndOptional(t *testing.T) {
 		{"+slack send", []string{"slack"}, []string{"send"}},
 		{"+slack +chat send", []string{"slack", "chat"}, []string{"send"}},
 		{"  +screenshot  ", []string{"screenshot"}, nil},
-		{"+ +slack", []string{"slack"}, nil},           // lone '+' dropped
-		{"SCREENSHOT", nil, []string{"screenshot"}},   // case-insensitive
-		{"slack slack", nil, []string{"slack"}},       // de-duped
+		{"+ +slack", []string{"slack"}, nil},        // lone '+' dropped
+		{"SCREENSHOT", nil, []string{"screenshot"}}, // case-insensitive
+		{"slack slack", nil, []string{"slack"}},     // de-duped
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {

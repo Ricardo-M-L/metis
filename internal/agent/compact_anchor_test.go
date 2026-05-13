@@ -24,12 +24,12 @@ import (
 
 func TestLastUserTextBefore_FindsTextMessage(t *testing.T) {
 	msgs := []llm.Message{
-		msg(llm.RoleUser, "你好"),            // 0
-		msg(llm.RoleAssistant, "hi"),         // 1
-		msg(llm.RoleUser, "real task"),       // 2 ← should win
-		msg(llm.RoleAssistant, "ok"),         // 3
-		toolUseMsg("u1", "Bash"),             // 4
-		toolResultMsg("u1", "output"),        // 5
+		msg(llm.RoleUser, "你好"),        // 0
+		msg(llm.RoleAssistant, "hi"),   // 1
+		msg(llm.RoleUser, "real task"), // 2 ← should win
+		msg(llm.RoleAssistant, "ok"),   // 3
+		toolUseMsg("u1", "Bash"),       // 4
+		toolResultMsg("u1", "output"),  // 5
 	}
 	got := lastUserTextBefore(msgs, len(msgs))
 	if got != 2 {
@@ -40,10 +40,10 @@ func TestLastUserTextBefore_FindsTextMessage(t *testing.T) {
 func TestLastUserTextBefore_IgnoresToolResults(t *testing.T) {
 	// tool_results are user-role but should NOT anchor the active task.
 	msgs := []llm.Message{
-		msg(llm.RoleUser, "real task"),       // 0
-		msg(llm.RoleAssistant, "ok"),         // 1
-		toolUseMsg("u1", "Bash"),             // 2
-		toolResultMsg("u1", "out"),           // 3 — user-role, but tool_result only
+		msg(llm.RoleUser, "real task"), // 0
+		msg(llm.RoleAssistant, "ok"),   // 1
+		toolUseMsg("u1", "Bash"),       // 2
+		toolResultMsg("u1", "out"),     // 3 — user-role, but tool_result only
 	}
 	got := lastUserTextBefore(msgs, len(msgs))
 	if got != 0 {

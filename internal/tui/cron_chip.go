@@ -32,10 +32,10 @@ import (
 const cronChipCacheTTL = 5 * time.Second
 
 var (
-	cronChipMu              sync.Mutex
-	cronChipCheckedAt       time.Time
-	cronChipWakeup          string // "next wake: 18m" or ""
-	cronChipSilentFires24h  int    // count of audit-log files in last 24h
+	cronChipMu             sync.Mutex
+	cronChipCheckedAt      time.Time
+	cronChipWakeup         string // "next wake: 18m" or ""
+	cronChipSilentFires24h int    // count of audit-log files in last 24h
 )
 
 // wakeupChip returns the formatted pending-wakeup chip text, or ""
@@ -105,12 +105,12 @@ func metisCronDir() string {
 // doesn't import internal/agent (which would create an import cycle —
 // agent's loop pulls in tui-adjacent types).
 type cronJobOnDisk struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Enabled  bool   `json:"enabled"`
-	Paused   bool   `json:"paused"`
-	Silent   bool   `json:"silent,omitempty"`
-	NextRun  time.Time `json:"next_run,omitempty"`
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	Enabled bool      `json:"enabled"`
+	Paused  bool      `json:"paused"`
+	Silent  bool      `json:"silent,omitempty"`
+	NextRun time.Time `json:"next_run,omitempty"`
 }
 
 // scanNextWakeup walks every cron job and returns "next wake: <dur>"

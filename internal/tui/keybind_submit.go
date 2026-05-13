@@ -35,10 +35,10 @@ func (m *Model) openBodyScreen(command, body string) {
 // like /title or /save still append inline. Mirrors claude-code's
 // pattern of "modal for browseable content, inline for confirmations".
 var modalCommands = map[string]bool{
-	"help":        true,
-	"cost":        true,
-	"tokens":      true,
-	"doctor":      true,
+	"help":   true,
+	"cost":   true,
+	"tokens": true,
+	"doctor": true,
 	// "context" intentionally NOT modal — claude-code parity (2026-05-11
 	// user request, image #1): /context renders inline as a chat-style
 	// info message so it stays in the transcript and the user doesn't
