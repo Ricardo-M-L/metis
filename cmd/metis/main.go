@@ -568,7 +568,14 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// adapter assembly happens inside BuildToolRegistry's caller; we pass
 	// it the configured registry so SendMessage can advertise the right
 	// platforms.
-	system := defaultSystem
+	// Render the base prompt fresh per boot so it carries the resolved
+	// model name AND the provider-specific hint fragment. The package-
+	// level defaultSystem var is the no-vars fallback used by tests and
+	// the worktree path below where we don't yet know the provider.
+	system := rtpkg.RenderBasePrompt(rtpkg.BasePromptVars{
+		Model:        model,
+		ProviderHint: rtpkg.ProviderHintFor(provName, model),
+	})
 	if flags.system != "" {
 		system = flags.system
 	}
@@ -605,6 +612,14 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		// CoordinatorOverlay() returns a zero-value section (Name=="")
 		// when the mode is off — caller skips the append in that case.
 		if ov := rtpkg.CoordinatorOverlay(); ov.Name != "" {
+			assembleOpts.Overlays = append(assembleOpts.Overlays, ov)
+		}
+		// Plan-mode overlay: when `--mode plan` is active, append a
+		// short fragment explaining the read-only workflow so the
+		// model doesn't waste turns hitting permission denials. The
+		// permission gate already enforces read-only at the tool
+		// layer; this just tells the model NOT to try mutating tools.
+		if ov := rtpkg.PlanOverlay(mode == string(permission.ModePlan)); ov.Name != "" {
 			assembleOpts.Overlays = append(assembleOpts.Overlays, ov)
 		}
 		systemSections = rtpkg.AssembleSystemPromptSections(system, assembleOpts)
