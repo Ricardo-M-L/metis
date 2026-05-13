@@ -910,6 +910,14 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Monitors:      monitorReg,
 	})
 
+	// METIS_SIMPLE / --simple → use the curated short tool descriptions
+	// matched 1:1 with the simple-mode system prompt: short prompt +
+	// short tool docs reach the LLM as one consistent "small surface"
+	// boot.
+	if rtpkg.IsSimpleMode() {
+		loop.ShortToolDescriptions = true
+	}
+
 	// Apply --effort / --fast flag overrides. Effort goes through the
 	// canonical pkg/llm parser so "low"/"l"/"fast" all normalize to the
 	// same EffortLow value; an unknown string falls back to default and

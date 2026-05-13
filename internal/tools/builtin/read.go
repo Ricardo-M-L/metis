@@ -19,6 +19,14 @@ type Read struct {
 }
 
 func (Read) Name() string { return "Read" }
+
+// ShortDescription — see Bash.ShortDescription for the rationale.
+// Pins the absolute-path + Read-not-cat habit so sub-agents that
+// inherited a Read-only tool palette still know to use this over Bash.
+func (Read) ShortDescription() string {
+	return "Read a file from the local filesystem. Returns 1-indexed line-numbered content (default 2000 lines from top). Always use Read NOT cat/head/tail. Path must be absolute. After Read, Edit/Write can mutate the file in the same session."
+}
+
 func (Read) Description() string {
 	return `Read a file from the local filesystem. The output is the file content prefixed with 1-indexed line numbers in ` + "`cat -n`" + ` format: 6-digit line number + tab + content. By default, returns up to 2000 lines starting from the top.
 

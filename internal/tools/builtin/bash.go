@@ -50,6 +50,16 @@ func (b *Bash) classifierFor() *BashClassifier {
 }
 
 func (Bash) Name() string { return "Bash" }
+// ShortDescription is the curated 1-2 sentence form shipped to
+// sub-agents and METIS_SIMPLE boots in lieu of the full multi-section
+// Description(). Hand-tuned to fit ~250 chars while still naming the
+// two biggest tool-selection footguns (cat→Read, find→Glob) so the
+// model gets at least one tool-redirect hint even when the full
+// `# Tool selection` table from base.md is skipped.
+func (Bash) ShortDescription() string {
+	return `Execute a shell command. stdout+stderr merge, truncated at a byte cap; cwd persists across calls in a turn, env vars do NOT. Prefer dedicated tools where possible (Read NOT cat, Glob NOT find, Grep NOT grep -r, Edit NOT sed). Pass run_in_background=true for dev servers, watchers, long builds.`
+}
+
 func (Bash) Description() string {
 	return `Execute a shell command in the user's environment. stdout+stderr merge into one stream, truncated at a byte cap. cwd persists between calls in the same turn; shell state (env vars, aliases) does NOT — use absolute paths and re-export vars if needed.
 

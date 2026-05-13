@@ -17,6 +17,14 @@ type Write struct {
 }
 
 func (Write) Name() string { return "Write" }
+
+// ShortDescription — see Bash.ShortDescription for the rationale.
+// Repeats the most-common mistake (using Write where Edit would do)
+// inline so the model gets the nudge without the full base prompt.
+func (Write) ShortDescription() string {
+	return "Create new file or overwrite an existing one with the exact `content`. Prefer Edit for existing files; Write loses original content. Path must be absolute. If file exists, you must have Read it this session. Don't write README/docs unless asked."
+}
+
 func (Write) Description() string {
 	return `Create a new file, or completely overwrite an existing one, with the exact ` + "`content`" + ` provided. Write replaces the file's entire contents — nothing is merged or appended.
 

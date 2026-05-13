@@ -176,6 +176,15 @@ func (a Agent) WithSessionPersistence(sessionDir, parentID string) Agent {
 }
 
 func (Agent) Name() string { return "Agent" }
+
+// ShortDescription — see Bash.ShortDescription for the rationale.
+// Agents calling Agents (recursive fork) is rare and discouraged, so
+// the short form omits naming/isolation detail in favor of the
+// when-vs-when-NOT heuristic.
+func (Agent) ShortDescription() string {
+	return "Spawn a sub-agent on a focused task — its own context window, same tools, isolated history. Use for deep code surveys, multi-file scouting, comparative analysis. Don't use for single-Grep lookups or conversation; fork has setup overhead. Brief with goal + context + ruled-out approaches + length cap."
+}
+
 func (Agent) Description() string {
 	return `Spawn a sub-agent to handle a self-contained, focused task. The sub-agent gets its own message history (no shared context with the parent), the same tool set, and a fresh permission gate cloned from yours. It returns a single final text answer.
 
@@ -453,6 +462,11 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 
 	sub := agent.NewLoop(a.provider, subRegistry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
+	// Sub-agents get the curated short-form tool descriptions: they
+	// already inherit a tight tool palette + a profile-supplied system
+	// prompt, so the main-loop's full multi-paragraph tool docs are
+	// pure noise. Phase C.1 / 2026-05-14.
+	sub.ShortToolDescriptions = true
 	// G.4 — restore prior conversation history BEFORE appending the
 	// new prompt. This way the resumed sub-agent sees the recovered
 	// turns followed by the caller's follow-up message, which the

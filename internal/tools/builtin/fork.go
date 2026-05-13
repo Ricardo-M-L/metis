@@ -129,6 +129,11 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	if snap.Model != "" {
 		sub.Model = snap.Model
 	}
+	// Forks also get short-form tool descriptions — they inherit the
+	// parent's snap.System (already heavy with conversation context)
+	// and don't need the parent's full tool prompts repeated. Phase
+	// C.1 / 2026-05-14.
+	sub.ShortToolDescriptions = true
 	// Restore copies the slice defensively; any further mutation in
 	// the parent doesn't affect the child's view.
 	sub.Restore(snap.Messages)

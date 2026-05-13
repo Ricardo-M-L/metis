@@ -102,6 +102,37 @@ type Tool interface {
 	Execute(ctx context.Context, input map[string]any) (*Result, error)
 }
 
+// ShortDescriptor is an optional interface tools can implement to
+// provide a curated short-form description distinct from Description().
+// Used by the dispatch layer when assembling the per-turn tool list
+// for sub-agents or simple-mode boots, where the full multi-paragraph
+// guidance is wasted tokens.
+//
+// Pattern is opt-in: a tool that doesn't implement this falls back to
+// the dispatch layer's automatic first-paragraph truncation. Tools
+// with non-trivial Description() bodies (Bash, Edit, Write, Read,
+// Agent) implement it; trivial tools (Glob, LS) don't bother — their
+// Description() is already short.
+//
+// Mirrors claude-code's getSimplePrompt() pattern per tool
+// (restored-src/src/tools/BashTool/prompt.ts:275).
+type ShortDescriptor interface {
+	ShortDescription() string
+}
+
+// DescriptionFor returns the description string a Tool would expose at
+// the LLM boundary given a "use short form" hint. Falls back to
+// Description() when the tool doesn't implement ShortDescriptor — the
+// caller (dispatch.go) is responsible for any further truncation.
+func DescriptionFor(t Tool, short bool) string {
+	if short {
+		if sd, ok := t.(ShortDescriptor); ok {
+			return sd.ShortDescription()
+		}
+	}
+	return t.Description()
+}
+
 // InterruptBehavior controls what happens when the user submits a new
 // message while a tool is mid-execution. Mirrors claude-code's Tool.ts:416.
 //

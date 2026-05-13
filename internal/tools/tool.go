@@ -49,7 +49,12 @@ var (
 	RequiresUserInteraction = pubtool.RequiresUserInteraction
 	IsBypassImmune          = pubtool.IsBypassImmune
 	GetInterruptBehavior    = pubtool.GetInterruptBehavior
+	DescriptionFor          = pubtool.DescriptionFor
 )
+
+// ShortDescriptor — see pkg/tool for the rationale. Re-exported here
+// for callers that already import internal/tools.
+type ShortDescriptor = pubtool.ShortDescriptor
 
 // Registry holds all tools available to the current session.
 // Built-in tools register at init() time; plugins can be added later.

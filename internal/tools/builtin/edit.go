@@ -17,6 +17,15 @@ type Edit struct {
 }
 
 func (Edit) Name() string { return "Edit" }
+
+// ShortDescription — see Bash.ShortDescription for the rationale.
+// Pins the must-know failure modes (Read-first, exact-match, indent
+// preservation, uniqueness) without spelling out the full strategy
+// section.
+func (Edit) ShortDescription() string {
+	return "Replace `old` with `new` in file at `path`. Literal find-and-replace; preserve exact indentation (tabs vs spaces) from prior Read. Must Read the file this session; `old` must be unique (or pass `all: true`); `old` must differ from `new`; path absolute."
+}
+
 func (Edit) Description() string {
 	return `Replace exactly the string ` + "`old`" + ` with ` + "`new`" + ` in the file at ` + "`path`" + `. This is a literal find-and-replace, not a regex — every byte (including indentation, tabs vs spaces, trailing whitespace, and newlines) must match.
 

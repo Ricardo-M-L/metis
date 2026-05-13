@@ -56,6 +56,16 @@ type Loop struct {
 	// PlanMode: collect tool calls but do NOT execute; emit as EventPlan.
 	PlanMode bool
 
+	// ShortToolDescriptions tells the dispatch layer to consult
+	// tools.ShortDescriptor for each tool's spec instead of the full
+	// Description() body. Set by sub-agent setup or by METIS_SIMPLE=1
+	// boot. When true, dispatch picks tool.ShortDescription() if the
+	// tool implements it; otherwise falls back to the existing
+	// first-paragraph truncation. Verbatim sub-agent prompts shrink
+	// 8-15% per turn on a 5-core-tool registry without changing
+	// behavior on the main loop.
+	ShortToolDescriptions bool
+
 	// Compactor handles automatic context window compaction. nil = disabled.
 	Compactor *Compactor
 

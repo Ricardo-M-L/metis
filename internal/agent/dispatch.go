@@ -52,8 +52,9 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 	all := l.Registry.SortedForCache()
 	out := make([]llm.ToolSpec, 0, len(all))
 	for _, t := range all {
+		desc := descriptionForTool(t, l.ShortToolDescriptions)
 		out = append(out, llm.ToolSpec{
-			Name: t.Name(), Description: shortToolDesc(t.Description()), InputSchema: t.InputSchema(),
+			Name: t.Name(), Description: desc, InputSchema: t.InputSchema(),
 		})
 	}
 	mode, pct := parseEnableToolSearch(os.Getenv("ENABLE_TOOL_SEARCH"))
@@ -75,6 +76,32 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 		return applyLazySchemaByTokensWithPreserve(out, l.ContextWindow, pct, preserve)
 	}
 	return out
+}
+
+// descriptionForTool picks the right description for a tool given the
+// current loop's "short tool descriptions" hint:
+//
+//   - short && tool implements tools.ShortDescriptor → use that
+//     verbatim. Tools opt in by defining ShortDescription() on their
+//     receiver; metis's core 5 (Bash/Edit/Write/Read/Agent) do.
+//   - short && tool does NOT implement it → fall back to first-
+//     paragraph truncation of Description() (same as legacy behavior).
+//   - !short → first-paragraph truncation of Description(), preserving
+//     the pre-Phase-C behavior for main-loop boots.
+//
+// The hand-curated ShortDescription is preferred over arbitrary
+// first-paragraph truncation because (a) it can omit the "context-
+// pulling" preamble paragraphs that exist for human readers but
+// confuse the LLM, and (b) it can squeeze a "what / when / NOT" hint
+// trio into the 200-char budget that automatic truncation would only
+// catch the "what" of.
+func descriptionForTool(t tools.Tool, short bool) string {
+	if short {
+		if sd, ok := t.(tools.ShortDescriptor); ok {
+			return sd.ShortDescription()
+		}
+	}
+	return shortToolDesc(t.Description())
 }
 
 // shortToolDesc trims a tool's full Description() down to the
@@ -418,8 +445,23 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
 		ToolResult: &ToolResult{Output: res.Output, IsError: res.IsError},
 	})
+
+	// Anti-pattern nudge: when the model uses Bash for something a
+	// dedicated tool would do better (cat → Read, find → Glob, etc.),
+	// append a one-line <system-reminder> to the tool_result. The
+	// command still ran (no refusal); the nudge teaches the model to
+	// pick the right tool next turn. See bash_redirects.go for the
+	// detector logic.
+	resultBody := res.Output
+	if blk.ToolName == "Bash" && !res.IsError {
+		if cmd, _ := blk.ToolInput["command"].(string); cmd != "" {
+			if hint := bashRedirect(cmd); hint != "" {
+				resultBody = resultBody + wrapAsSystemReminder(hint)
+			}
+		}
+	}
 	return llm.ContentBlock{
 		Type: "tool_result", ToolUseID: blk.ToolUseID,
-		ToolResult: res.Output, IsError: res.IsError,
+		ToolResult: resultBody, IsError: res.IsError,
 	}
 }
