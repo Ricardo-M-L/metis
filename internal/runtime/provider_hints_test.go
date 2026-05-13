@@ -64,7 +64,7 @@ func TestRenderBasePrompt_EmbedsProviderHint(t *testing.T) {
 	if !strings.Contains(out, "MiniMax-M2.7") {
 		t.Errorf("rendered prompt missing model name; got:\n%s", out)
 	}
-	if !strings.Contains(out, "Empty-args tool_use") {
+	if !strings.Contains(out, "empty input arguments") {
 		t.Errorf("rendered prompt missing minimax-specific quirk; got:\n%s", out)
 	}
 }
