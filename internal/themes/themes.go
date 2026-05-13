@@ -1,4 +1,4 @@
-package tui
+package themes
 
 // themes.go centralizes the chat-surface color palette behind a Theme
 // struct so the rest of the renderer never names a #hex literal. Three
@@ -18,6 +18,8 @@ import (
 	"os"
 
 	"charm.land/lipgloss/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/term"
 )
 
 // Theme bundles all the chat-surface colors. Every renderer reads from
@@ -147,7 +149,7 @@ var currentTheme = func() *Theme {
 	// latency we can avoid. NO_COLOR is also a strong "user has
 	// non-default expectations" signal where probing is rude.
 	if os.Getenv("CI") == "" && os.Getenv("NO_COLOR") == "" {
-		if isLight, ok := DetectTerminalBackground(); ok && isLight {
+		if isLight, ok := term.DetectTerminalBackground(); ok && isLight {
 			if t, ok := allThemes["light"]; ok {
 				return t
 			}
@@ -156,9 +158,34 @@ var currentTheme = func() *Theme {
 	return &darkTheme
 }()
 
-// SwitchTheme swaps the active theme by name and re-initializes the
-// derived style vars. /theme command in commands.go calls this.
-// Returns the resolved theme name (or empty string if name unknown).
+// Current returns the active palette pointer. Callers that need to
+// read a theme field (renderers, tests) should always go through this
+// rather than caching the pointer, since /theme switches the underlying
+// var. Pointer-stability across reads is NOT guaranteed.
+func Current() *Theme { return currentTheme }
+
+// onSwitch is invoked after every successful SwitchTheme /
+// ApplyProviderTint so consumers (notably tui's tui_styles.go) can
+// rebuild derived lipgloss.Style vars bound to the previous palette.
+// Nil-safe: nothing fires until tui registers via OnSwitch().
+var onSwitch func()
+
+// OnSwitch registers a callback to fire after every successful theme
+// change. Single-slot — last writer wins. tui_styles.go::init() owns
+// this slot in the canonical wiring; tests that swap callbacks must
+// restore the previous one.
+func OnSwitch(fn func()) { onSwitch = fn }
+
+func fireSwitch() {
+	if onSwitch != nil {
+		onSwitch()
+	}
+}
+
+// SwitchTheme swaps the active theme by name and re-fires the
+// registered OnSwitch callback. /theme command in commands.go calls
+// this. Returns the resolved theme name (or empty string if name
+// unknown).
 //
 // THREAD SAFETY: must be called from the main bubbletea Update
 // goroutine. View() reads currentTheme + the styleX vars without
@@ -169,7 +196,7 @@ func SwitchTheme(name string) string {
 		return ""
 	}
 	currentTheme = t
-	initStyles()
+	fireSwitch()
 	return t.Name
 }
 

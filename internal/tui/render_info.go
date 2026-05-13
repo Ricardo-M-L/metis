@@ -20,6 +20,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
@@ -726,7 +727,7 @@ func renderContext(m *Model) string {
 		usedCells = cellsTot
 	}
 
-	usedStyle := lipgloss.NewStyle().Foreground(currentTheme.AccentBlue)
+	usedStyle := lipgloss.NewStyle().Foreground(themes.Current().AccentBlue)
 	freeStyle := lipgloss.NewStyle().Foreground(textMuted)
 
 	// Right-side annotations: line index → annotation text.

@@ -313,10 +313,24 @@ to each.
 ### `internal/tui` — bubbletea TUI
 
 Single `Model` struct, but rendering and key handling are split across
-~50 files for focus:
+~50 files for focus. Three concerns that were previously package-local
+now live in dedicated sibling packages so non-TUI consumers (cmd/metis,
+internal/runtime) can import them without dragging in bubbletea:
+
+- `internal/term`  — terminal capability detection (`DetectTerminal`,
+  `SupportsHyperlink/ProgressBar`, `PreferSTTerminator`), OSC 11
+  background probe, OSC 8 `Hyperlink`, and tmux/screen DCS
+  `WrapForMultiplexer` passthrough
+- `internal/notify` — OSC 9/9;4/99/777 desktop notification matrix +
+  per-channel emitters, OSC 9;4 progress bar (`SendProgress`),
+  user-interaction recency guard
+- `internal/themes` — palette + `Current()` getter + `SwitchTheme` /
+  `ApplyProviderTint`; tui registers `themes.OnSwitch(initStyles)` in
+  `tui_styles.go::init()` so derived lipgloss styles rebuild on switch
 
 ```
-tui.go / tui_styles.go / themes.go            Model + style palette
+tui.go / tui_styles.go                        Model + style palette
+                                              (themes.OnSwitch hook)
 tui_update.go / tui_events.go                 Update loop + agent.Event drain
 tui_render.go / render_chrome.go              View + bottom chrome (input,
                                               spinner, status bar, hints)

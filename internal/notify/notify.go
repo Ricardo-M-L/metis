@@ -1,4 +1,4 @@
-package tui
+package notify
 
 // notify.go — desktop notifications via terminal escape codes.
 //
@@ -38,6 +38,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/term"
 )
 
 // Channel is the notification dispatch target.
@@ -80,6 +82,15 @@ func MarkUserInteraction() {
 	lastInteractionMu.Lock()
 	defer lastInteractionMu.Unlock()
 	lastInteractionAt = time.Now()
+}
+
+// ResetInteractionForTest back-dates the recent-interaction marker so
+// SendNotification's 6s guard doesn't suppress test emissions. Use
+// only from tests — calling this in prod would defeat the suppression.
+func ResetInteractionForTest() {
+	lastInteractionMu.Lock()
+	defer lastInteractionMu.Unlock()
+	lastInteractionAt = time.Now().Add(-(RecentInteractionThreshold + time.Second))
 }
 
 func hasRecentInteraction() bool {
@@ -275,21 +286,12 @@ func emitBell(w io.Writer) {
 	fmt.Fprint(w, "\x07")
 }
 
-// wrapForMultiplexer wraps an OSC sequence in tmux/screen DCS
-// passthrough so it reaches the outer terminal. Inner ESCs must be
-// doubled inside tmux DCS. tmux requires `set -g allow-passthrough on`
-// in .tmux.conf for this to work; without it, tmux silently drops the
-// whole DCS — same observable result as raw OSC (no notification).
+// wrapForMultiplexer is a thin alias for term.WrapForMultiplexer kept
+// so call-sites and tests in this package don't pile on `term.` noise.
+// All the actual logic (tmux DCS passthrough, ESC doubling, screen
+// envelope) lives in internal/term/multiplexer.go.
 func wrapForMultiplexer(seq string) string {
-	if os.Getenv("TMUX") != "" {
-		escaped := strings.ReplaceAll(seq, "\x1b", "\x1b\x1b")
-		return "\x1bPtmux;" + escaped + "\x1b\\"
-	}
-	if os.Getenv("STY") != "" {
-		// GNU screen — simpler DCS form, no ESC doubling.
-		return "\x1bP" + seq + "\x1b\\"
-	}
-	return seq
+	return term.WrapForMultiplexer(seq)
 }
 
 // generateKittyID returns a small random int. Kitty uses this to group
@@ -385,5 +387,5 @@ func progressSupported() bool {
 	if os.Getenv("TERM_PROGRAM") == "WezTerm" {
 		return true
 	}
-	return SupportsProgressBar()
+	return term.SupportsProgressBar()
 }

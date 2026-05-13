@@ -1,4 +1,4 @@
-package tui
+package term
 
 // osc11.go — OSC 11 ("dynamic colors") query for the terminal's
 // current background color. Used at startup to pick a sensible

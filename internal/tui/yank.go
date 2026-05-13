@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/term"
 )
 
 // yankLastAssistant grabs the most recent "assistant" / "thinking"
@@ -134,7 +135,7 @@ func writeClipboard(text string) {
 	// work in macOS Terminal.app (the user's 2026-05-11 image #3 report:
 	// "command+c 没成功") — that's why we ALSO run path 2.
 	terminator := "\x07"
-	if PreferSTTerminator() {
+	if term.PreferSTTerminator() {
 		terminator = "\x1b\\"
 	}
 	bare := "\x1b]52;c;" + enc + terminator
@@ -142,7 +143,7 @@ func writeClipboard(text string) {
 	// wrapForMultiplexer (notify.go) handles tmux DCS passthrough +
 	// ESC doubling + screen DCS — same envelope OSC 9;4 progress
 	// uses, kept in one place.
-	fmt.Fprint(os.Stdout, wrapForMultiplexer(bare))
+	fmt.Fprint(os.Stdout, term.WrapForMultiplexer(bare))
 
 	// Path 2 — Native OS clipboard tool (pbcopy / xclip / wl-copy /
 	// clip.exe). Bypasses OSC 52 entirely so the user's clipboard

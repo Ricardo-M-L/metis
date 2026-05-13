@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/themes"
 )
 
 // TestDetectAtMention covers @-token detection at end of input —
@@ -133,33 +135,33 @@ func TestApplyMask(t *testing.T) {
 }
 
 // TestSwitchTheme verifies the theme system roundtrip — invalid
-// names get rejected, valid names update currentTheme.
+// names get rejected, valid names update the active theme.
 func TestSwitchTheme(t *testing.T) {
-	original := currentTheme.Name
-	defer SwitchTheme(original) // restore after test
+	original := themes.Current().Name
+	defer themes.SwitchTheme(original) // restore after test
 
-	if got := SwitchTheme("light"); got != "light" {
+	if got := themes.SwitchTheme("light"); got != "light" {
 		t.Errorf("SwitchTheme(light) = %q, want light", got)
 	}
-	if currentTheme.Name != "light" {
-		t.Errorf("currentTheme not updated, got %q", currentTheme.Name)
+	if themes.Current().Name != "light" {
+		t.Errorf("active theme not updated, got %q", themes.Current().Name)
 	}
 
-	if got := SwitchTheme("not-a-theme"); got != "" {
+	if got := themes.SwitchTheme("not-a-theme"); got != "" {
 		t.Errorf("SwitchTheme(invalid) should return empty, got %q", got)
 	}
-	if currentTheme.Name != "light" {
-		t.Errorf("invalid switch should leave currentTheme alone, got %q", currentTheme.Name)
+	if themes.Current().Name != "light" {
+		t.Errorf("invalid switch should leave active theme alone, got %q", themes.Current().Name)
 	}
 
-	if got := SwitchTheme("dark-daltonized"); got != "dark-daltonized" {
+	if got := themes.SwitchTheme("dark-daltonized"); got != "dark-daltonized" {
 		t.Errorf("SwitchTheme(daltonized) = %q", got)
 	}
 }
 
 // TestThemeNames returns all 3 known themes.
 func TestThemeNames(t *testing.T) {
-	names := ThemeNames()
+	names := themes.ThemeNames()
 	if len(names) != 3 {
 		t.Errorf("expected 3 themes, got %d: %v", len(names), names)
 	}

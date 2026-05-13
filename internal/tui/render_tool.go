@@ -17,6 +17,8 @@ import (
 
 	"charm.land/lipgloss/v2"
 	udiff "github.com/aymanbagabas/go-udiff"
+
+	"github.com/Ricardo-M-L/metis/internal/themes"
 )
 
 // renderToolEvent prints one tool call. Leader row repeats whether
@@ -253,10 +255,10 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 		return ""
 	}
 
-	addBgOnly := lipgloss.NewStyle().Background(currentTheme.DiffAddBg)
-	delBgOnly := lipgloss.NewStyle().Background(currentTheme.DiffDelBg)
-	addStrong := lipgloss.NewStyle().Background(currentTheme.DiffAddBg).Foreground(currentTheme.DiffAddFg).Bold(true)
-	delStrong := lipgloss.NewStyle().Background(currentTheme.DiffDelBg).Foreground(currentTheme.DiffDelFg).Bold(true)
+	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
+	delBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffDelBg)
+	addStrong := lipgloss.NewStyle().Background(themes.Current().DiffAddBg).Foreground(themes.Current().DiffAddFg).Bold(true)
+	delStrong := lipgloss.NewStyle().Background(themes.Current().DiffDelBg).Foreground(themes.Current().DiffDelFg).Bold(true)
 	gutterStyle := lipgloss.NewStyle().Foreground(textMuted)
 	filename := pickLanguageFromInput(input)
 
@@ -353,7 +355,7 @@ func renderWritePreview(input map[string]any, expanded bool) string {
 	if c == "" {
 		return ""
 	}
-	addBgOnly := lipgloss.NewStyle().Background(currentTheme.DiffAddBg)
+	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
 	gutterStyle := lipgloss.NewStyle().Foreground(textMuted)
 	filename := pickLanguageFromInput(input)
 

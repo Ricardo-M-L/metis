@@ -1,6 +1,6 @@
 //go:build !darwin
 
-package tui
+package notify
 
 // Stub for non-darwin builds. Apple Terminal only exists on macOS, so
 // the probe always reports "bell on" → notification suppressed. The

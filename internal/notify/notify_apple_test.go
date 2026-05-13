@@ -1,6 +1,6 @@
 //go:build darwin
 
-package tui
+package notify
 
 // notify_apple_test.go — exercises the Apple Terminal Bell probe
 // without spinning up Terminal.app. Drives scanBellInBlock with

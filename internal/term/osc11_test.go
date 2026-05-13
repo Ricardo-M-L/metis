@@ -1,4 +1,4 @@
-package tui
+package term
 
 // osc11_test.go — pin parseOSC11Response across the variants real
 // terminals emit. DetectTerminalBackground itself is harness-tested

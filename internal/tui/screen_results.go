@@ -7,6 +7,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -86,7 +87,7 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			})
 			return nil
 		}
-		if name := SwitchTheme(applied); name != "" {
+		if name := themes.SwitchTheme(applied); name != "" {
 			m.messages = append(m.messages, Message{
 				Role:      "success",
 				Content:   "theme: " + name,

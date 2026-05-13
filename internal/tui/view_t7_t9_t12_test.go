@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/themes"
 )
 
 // view_t7_t9_t12_test.go — view-level integration tests for the three
@@ -118,13 +119,13 @@ func TestT7_PrintableKeyExitsNavMode(t *testing.T) {
 // brand color in AccentBlue. Restored at test end so we don't leak
 // state across tests.
 func TestT9_ThemeAutoForOpenAI_RetintsAccent(t *testing.T) {
-	originalName := currentTheme.Name
-	originalAccent := currentTheme.AccentBlue
+	originalName := themes.Current().Name
+	originalAccent := themes.Current().AccentBlue
 	t.Cleanup(func() {
 		// Restore by re-running SwitchTheme on the original base
 		// name (strips any "+provider" suffix).
 		base := strings.SplitN(originalName, "+", 2)[0]
-		SwitchTheme(base)
+		themes.SwitchTheme(base)
 	})
 
 	r := &REPL{}
@@ -133,33 +134,33 @@ func TestT9_ThemeAutoForOpenAI_RetintsAccent(t *testing.T) {
 	if !strings.Contains(got, "openai") {
 		t.Errorf("cmdTheme(auto:openai) should report new theme name; got %q", got)
 	}
-	if !strings.Contains(currentTheme.Name, "openai") {
-		t.Errorf("currentTheme.Name should reflect provider tint; got %q", currentTheme.Name)
+	if !strings.Contains(themes.Current().Name, "openai") {
+		t.Errorf("currentTheme.Name should reflect provider tint; got %q", themes.Current().Name)
 	}
-	if currentTheme.AccentBlue == originalAccent {
+	if themes.Current().AccentBlue == originalAccent {
 		t.Error("AccentBlue should change after auto:openai retint")
 	}
 }
 
 // TestT9_ThemeAutoUnknownProvider_NoMutation — auto:notarealprovider
-// should leave currentTheme unchanged (ApplyProviderTint returns
+// should leave the active theme unchanged (ApplyProviderTint returns
 // early when the provider id is unknown).
 func TestT9_ThemeAutoUnknownProvider_NoMutation(t *testing.T) {
-	originalName := currentTheme.Name
-	originalAccent := currentTheme.AccentBlue
+	originalName := themes.Current().Name
+	originalAccent := themes.Current().AccentBlue
 	t.Cleanup(func() {
 		base := strings.SplitN(originalName, "+", 2)[0]
-		SwitchTheme(base)
+		themes.SwitchTheme(base)
 	})
 
 	r := &REPL{}
 	cmdTheme(r, "auto:not-a-real-provider")
 
-	if currentTheme.Name != originalName {
+	if themes.Current().Name != originalName {
 		t.Errorf("unknown provider should leave theme name alone; before=%q after=%q",
-			originalName, currentTheme.Name)
+			originalName, themes.Current().Name)
 	}
-	if currentTheme.AccentBlue != originalAccent {
+	if themes.Current().AccentBlue != originalAccent {
 		t.Error("unknown provider should leave AccentBlue alone")
 	}
 }

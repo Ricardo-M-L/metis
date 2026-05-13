@@ -1,4 +1,4 @@
-package tui
+package term
 
 // osc_progress.go — OSC 8 hyperlink emitter (companion to OSC 9;4
 // progress in notify.go::SendProgress; the progress side already

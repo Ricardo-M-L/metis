@@ -1,6 +1,6 @@
 //go:build darwin
 
-package tui
+package notify
 
 // notify_apple.go — probe Apple Terminal's audible-bell setting so
 // SendNotification can decide whether BEL is safe to emit (silent

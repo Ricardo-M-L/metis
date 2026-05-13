@@ -6,6 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -27,8 +28,8 @@ func TestThemeWidget_BareSlashOpensCycle(t *testing.T) {
 		t.Errorf("ThemeScreen view missing label; got:\n%s", view)
 	}
 	// The current theme name (default 'dark') must show.
-	if !strings.Contains(view, currentTheme.Name) {
-		t.Errorf("ThemeScreen view missing current theme name (%s):\n%s", currentTheme.Name, view)
+	if !strings.Contains(view, themes.Current().Name) {
+		t.Errorf("ThemeScreen view missing current theme name (%s):\n%s", themes.Current().Name, view)
 	}
 }
 
@@ -48,13 +49,13 @@ func TestThemeWidget_ExplicitArgStaysInline(t *testing.T) {
 // active theme via SwitchTheme.
 func TestThemeWidget_ApplyChangesTheme(t *testing.T) {
 	// Snapshot starting theme so we can restore.
-	startTheme := currentTheme.Name
+	startTheme := themes.Current().Name
 	t.Cleanup(func() {
-		SwitchTheme(startTheme)
+		themes.SwitchTheme(startTheme)
 	})
 
 	// Force a known starting theme.
-	SwitchTheme("dark")
+	themes.SwitchTheme("dark")
 
 	m := newSlashTestModel(t)
 	m.input.SetValue("/theme")
@@ -66,7 +67,7 @@ func TestThemeWidget_ApplyChangesTheme(t *testing.T) {
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	// SwitchTheme should have run; currentTheme name must have changed.
-	if currentTheme.Name == "dark" {
+	if themes.Current().Name == "dark" {
 		t.Errorf("expected theme to have changed from 'dark'; still 'dark'")
 	}
 	// Confirmation appended as success role.
@@ -85,11 +86,11 @@ func TestThemeWidget_ApplyChangesTheme(t *testing.T) {
 // TestThemeWidget_EscPreservesTheme — Esc dismisses without changing
 // the active theme.
 func TestThemeWidget_EscPreservesTheme(t *testing.T) {
-	startTheme := currentTheme.Name
+	startTheme := themes.Current().Name
 	t.Cleanup(func() {
-		SwitchTheme(startTheme)
+		themes.SwitchTheme(startTheme)
 	})
-	SwitchTheme("dark")
+	themes.SwitchTheme("dark")
 
 	m := newSlashTestModel(t)
 	m.input.SetValue("/theme")
@@ -98,7 +99,7 @@ func TestThemeWidget_EscPreservesTheme(t *testing.T) {
 	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // visually moves
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
-	if currentTheme.Name != "dark" {
-		t.Errorf("Esc should not change theme; currentTheme = %q", currentTheme.Name)
+	if themes.Current().Name != "dark" {
+		t.Errorf("Esc should not change theme; currentTheme = %q", themes.Current().Name)
 	}
 }

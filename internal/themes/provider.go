@@ -1,4 +1,4 @@
-package tui
+package themes
 
 // theme_provider.go — per-provider color tinting (T9). Inspired by
 // crush internal/ui/styles/themes.go ThemeForProvider(): instead of
@@ -105,6 +105,7 @@ func ApplyProviderTint(providerID string) {
 		return // unknown provider — leave the theme alone
 	}
 	currentTheme = tinted
+	fireSwitch()
 }
 
 // KnownProviderTints returns the provider ids this file knows about,

@@ -1,4 +1,4 @@
-package tui
+package term
 
 // capabilities.go — terminal capability detection. Single source of
 // truth for "does this terminal support feature X" used by OSC 52

@@ -19,6 +19,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/themes"
 )
 
 // REPLCommand is a built-in command that runs directly in the REPL, not via LLM.
@@ -536,9 +537,9 @@ func cmdVim(r *REPL, args string) string {
 func cmdTheme(r *REPL, args string) string {
 	arg := strings.ToLower(strings.TrimSpace(args))
 	if arg == "" {
-		names := ThemeNames()
+		names := themes.ThemeNames()
 		return fmt.Sprintf("theme: %s — available: %s, auto:<provider>",
-			currentTheme.Name, strings.Join(names, ", "))
+			themes.Current().Name, strings.Join(names, ", "))
 	}
 	// `/theme auto` — retint the active palette using the current
 	// provider id (anthropic / openai / kimi / ...). Falls back to
@@ -548,21 +549,19 @@ func cmdTheme(r *REPL, args string) string {
 		if r != nil && r.Loop != nil && r.Loop.Provider != nil {
 			provider = r.Loop.Provider.Name()
 		}
-		ApplyProviderTint(provider)
-		initStyles()
-		return "theme: " + currentTheme.Name
+		themes.ApplyProviderTint(provider)
+		return "theme: " + themes.Current().Name
 	}
 	if strings.HasPrefix(arg, "auto:") {
 		provider := strings.TrimPrefix(arg, "auto:")
-		ApplyProviderTint(provider)
-		initStyles()
-		return "theme: " + currentTheme.Name
+		themes.ApplyProviderTint(provider)
+		return "theme: " + themes.Current().Name
 	}
-	if name := SwitchTheme(arg); name != "" {
+	if name := themes.SwitchTheme(arg); name != "" {
 		return "theme: " + name
 	}
 	return fmt.Sprintf("unknown theme %q — available: %s, auto, auto:<provider>",
-		arg, strings.Join(ThemeNames(), ", "))
+		arg, strings.Join(themes.ThemeNames(), ", "))
 }
 
 // cmdEffort sets the reasoning intensity dial used for subsequent turns.

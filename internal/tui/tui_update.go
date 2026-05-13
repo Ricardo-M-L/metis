@@ -16,6 +16,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/tui/overlay"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
@@ -122,7 +123,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// which both implement, so passing through is fine.
 		// Mark interaction so SendNotification's 6s recent-key guard
 		// suppresses banners while the user is actively typing.
-		MarkUserInteraction()
+		notify.MarkUserInteraction()
 		return m.handleKey(msg)
 
 	case tea.PasteMsg:
@@ -525,12 +526,12 @@ func (m *Model) finalizeTurn(err error) {
 		// the user explicitly backgrounded the turn. They asked
 		// not to look at the screen, so we notify regardless of
 		// duration.
-		if d := time.Since(m.spinnerStartedAt); d >= NotifyMinDuration || wasBackgrounded {
+		if d := time.Since(m.spinnerStartedAt); d >= notify.NotifyMinDuration || wasBackgrounded {
 			msg := fmt.Sprintf("turn finished in %s", formatTurnDuration(d))
 			if wasBackgrounded {
 				msg = "backgrounded " + msg
 			}
-			SendNotification("metis", msg)
+			notify.SendNotification("metis", msg)
 			// Fire the user's [[hooks.notification]] chain so
 			// they can shell out to terminal-notifier / ntfy /
 			// whatever for a richer macOS-native banner. Best-
@@ -553,9 +554,9 @@ func (m *Model) finalizeTurn(err error) {
 	// the dock. Indicate failure with the Error variant first so the
 	// dock briefly shows red before clearing.
 	if err != nil {
-		SendProgress(ProgressError, 0)
+		notify.SendProgress(notify.ProgressError, 0)
 	}
-	SendProgress(ProgressClear, 0)
+	notify.SendProgress(notify.ProgressClear, 0)
 	// Structural recap below the thought-summary, when this turn did
 	// enough work to be worth summarizing (≥2 tool calls).
 	recap := ""

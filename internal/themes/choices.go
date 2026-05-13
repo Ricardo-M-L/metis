@@ -1,4 +1,4 @@
-package tui
+package themes
 
 import "github.com/Ricardo-M-L/metis/internal/tui/screen"
 
@@ -38,11 +38,11 @@ var themeSwatchHex = map[string][]string{
 	},
 }
 
-// buildThemeChoices snapshots each registered theme into a ThemeChoice
+// BuildThemeChoices snapshots each registered theme into a ThemeChoice
 // for the /theme picker widget. Swatches are sampled from
 // themeSwatchHex so the user previews the actual colors before
 // committing.
-func buildThemeChoices() []screen.ThemeChoice {
+func BuildThemeChoices() []screen.ThemeChoice {
 	out := make([]screen.ThemeChoice, 0, len(allThemes))
 	for _, name := range ThemeNames() {
 		t := allThemes[name]

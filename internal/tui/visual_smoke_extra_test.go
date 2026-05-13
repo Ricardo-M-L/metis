@@ -7,6 +7,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/notify"
 )
 
 // visual_smoke_extra_test.go — squeezes the last three "needs real
@@ -34,11 +36,11 @@ func TestF22_OSC9_FiresOnLongTurn(t *testing.T) {
 	resetInteractionForTest(t)
 
 	var buf bytes.Buffer
-	SetNotifyDest(&buf)
-	defer SetNotifyDest(nil)
+	notify.SetNotifyDest(&buf)
+	defer notify.SetNotifyDest(nil)
 
 	m := newE2EModel(t, 120, 30, 0)
-	m.spinnerStartedAt = time.Now().Add(-(NotifyMinDuration + time.Second))
+	m.spinnerStartedAt = time.Now().Add(-(notify.NotifyMinDuration + time.Second))
 	m.finalizeTurn(nil)
 
 	got := buf.String()
@@ -58,8 +60,8 @@ func TestF22_OSC9_DoesNotFireOnQuickTurn(t *testing.T) {
 	resetInteractionForTest(t)
 
 	var buf bytes.Buffer
-	SetNotifyDest(&buf)
-	defer SetNotifyDest(nil)
+	notify.SetNotifyDest(&buf)
+	defer notify.SetNotifyDest(nil)
 
 	m := newE2EModel(t, 120, 30, 0)
 	m.spinnerStartedAt = time.Now().Add(-2 * time.Second) // well under threshold
@@ -81,9 +83,7 @@ func TestF22_OSC9_DoesNotFireOnQuickTurn(t *testing.T) {
 // real Update fixtures) within the last 6 seconds would silence the test.
 func resetInteractionForTest(t *testing.T) {
 	t.Helper()
-	lastInteractionMu.Lock()
-	defer lastInteractionMu.Unlock()
-	lastInteractionAt = time.Now().Add(-(RecentInteractionThreshold + time.Second))
+	notify.ResetInteractionForTest()
 }
 
 // TestF8_MouseWheel_ScrollsTranscript — feeding MouseWheelDown into

@@ -1,4 +1,4 @@
-package tui
+package notify
 
 // notify_test.go — pins the channel-matrix selection rules and the
 // per-channel OSC sequence shapes. Each terminal speaks a slightly
@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/term"
 )
 
 // captureNotify swaps the notify dest to a fresh buffer for the test
@@ -39,12 +41,13 @@ func stubInteractionPast(t *testing.T) {
 // developer machine leaks $TERM_PROGRAM into auto-mode tests.
 func clearTerminalEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv("TERM_PROGRAM", "")
-	t.Setenv("KITTY_WINDOW_ID", "")
-	t.Setenv("ALACRITTY_LOG", "")
-	t.Setenv("TMUX", "")
-	t.Setenv("STY", "")
-	t.Setenv("ConEmuPID", "")
+	for _, k := range []string{
+		"TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LC_TERMINAL",
+		"KITTY_WINDOW_ID", "ALACRITTY_LOG", "WT_SESSION", "ConEmuPID",
+		"ConEmuANSI", "TMUX", "STY", "SSH_CONNECTION", "SSH_TTY", "TERM",
+	} {
+		t.Setenv(k, "")
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -417,7 +420,7 @@ func TestSendProgress_NoOpOnUnsupportedTerminal(t *testing.T) {
 }
 
 func TestSendProgress_RunningEmitsCorrectShape(t *testing.T) {
-	if !IsTerminal() {
+	if !term.IsTerminal() {
 		t.Skip("not a TTY")
 	}
 	clearTerminalEnv(t)
@@ -434,7 +437,7 @@ func TestSendProgress_RunningEmitsCorrectShape(t *testing.T) {
 }
 
 func TestSendProgress_ClearEmpty(t *testing.T) {
-	if !IsTerminal() {
+	if !term.IsTerminal() {
 		t.Skip("not a TTY")
 	}
 	clearTerminalEnv(t)
@@ -450,7 +453,7 @@ func TestSendProgress_ClearEmpty(t *testing.T) {
 }
 
 func TestSendProgress_ClampsPctToRange(t *testing.T) {
-	if !IsTerminal() {
+	if !term.IsTerminal() {
 		t.Skip("not a TTY")
 	}
 	clearTerminalEnv(t)
@@ -466,7 +469,7 @@ func TestSendProgress_ClampsPctToRange(t *testing.T) {
 }
 
 func TestSendProgress_IndeterminateNoPct(t *testing.T) {
-	if !IsTerminal() {
+	if !term.IsTerminal() {
 		t.Skip("not a TTY")
 	}
 	clearTerminalEnv(t)

@@ -1,14 +1,18 @@
 package tui
 
 // tui_styles.go — color palette + derived lipgloss styles. Concrete
-// colors live on currentTheme (themes.go); the styleXxx vars below
-// get re-init'd by initStyles() each time the theme changes. Adding a
-// new theme = adding a Theme to themes.go; no per-callsite plumbing.
+// colors live on the active *themes.Theme (internal/themes); the
+// styleXxx vars below get re-init'd by initStyles() each time the
+// theme changes via the themes.OnSwitch callback registered in init().
+// Adding a new theme = adding a Theme in internal/themes; no
+// per-callsite plumbing here.
 
 import (
 	"image/color"
 
 	"charm.land/lipgloss/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/themes"
 )
 
 var (
@@ -40,10 +44,10 @@ var (
 )
 
 // initStyles binds the package-level style vars to whatever
-// currentTheme points at. Called once during package init and again
-// on every /theme switch.
+// themes.Current() points at. Called once during package init and
+// again on every /theme switch via the themes.OnSwitch hook.
 func initStyles() {
-	t := currentTheme
+	t := themes.Current()
 	bgSecondary = t.BgSecondary
 	textPrimary = t.TextPrimary
 	textSecondary = t.TextSecondary
@@ -68,5 +72,6 @@ func initStyles() {
 }
 
 func init() {
+	themes.OnSwitch(initStyles)
 	initStyles()
 }

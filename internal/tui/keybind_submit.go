@@ -12,8 +12,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -258,7 +260,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// swatches. Explicit `/theme dark` falls through to cmdTheme
 		// for direct selection.
 		if name == "theme" && strings.TrimSpace(args) == "" {
-			tp := screen.NewThemeScreen(currentTheme.Name, buildThemeChoices())
+			tp := screen.NewThemeScreen(themes.Current().Name, themes.BuildThemeChoices())
 			tp.Resize(m.width, m.height)
 			m.activeScreen = tp
 			return m, nil
@@ -600,7 +602,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// OSC 9;4 indeterminate progress — terminals that support it
 	// (iTerm2 / Ghostty / WezTerm) light up the dock icon with a
 	// barber-pole "working" indicator. Cleared on turn end.
-	SendProgress(ProgressIndeterminate, 0)
+	notify.SendProgress(notify.ProgressIndeterminate, 0)
 	m.firstStreamAt = time.Time{}
 	m.spinnerVerb = pickSpinnerVerb()
 	m.spinnerSub = ""
