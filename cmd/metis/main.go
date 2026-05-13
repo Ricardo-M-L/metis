@@ -351,6 +351,19 @@ type cliFlags struct {
 	// the picker before chat starts and writes the chosen id back into
 	// resumeID. Mutually exclusive with explicit `--resume <id>`.
 	pickResume bool
+
+	// --prompt-dump: render the assembled system prompt (with overlays,
+	// project context, addendum, env, provider hint, all section flags
+	// applied) and print to stdout, then exit. No LLM call is made.
+	// Useful for measuring token cost, debugging prompt drift, and
+	// verifying conditional sections fire in the right configuration.
+	dumpPrompt bool
+
+	// --simple / METIS_SIMPLE=1: replace the full base prompt + tool
+	// description bundle with a one-sentence stub + cwd + date. Mirror
+	// of claude-code's CLAUDE_CODE_SIMPLE. Ideal for short `metis run`
+	// commands and CI scripts where the heavy guidance is wasted.
+	simpleMode bool
 }
 
 // stringList accumulates repeated flag values: --add-dir A --add-dir B → [A,B].
@@ -446,6 +459,10 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 		"enable on-disk response cache for `metis run` (CI/cron use). Tool-use turns are never cached.")
 	f.StringVar(&out.runCacheTTL, "cache-ttl", "",
 		"response-cache TTL for `metis run` (e.g. 1h, 30m, 24h, or 'off'). Default 1h.")
+	f.BoolVar(&out.dumpPrompt, "prompt-dump", false,
+		"print the assembled system prompt to stdout and exit (no LLM call)")
+	f.BoolVar(&out.simpleMode, "simple", false,
+		"use a one-sentence system prompt (skip the heavy base prompt + redirects + skills + reversibility sections). Equivalent to METIS_SIMPLE=1.")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -568,14 +585,28 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// adapter assembly happens inside BuildToolRegistry's caller; we pass
 	// it the configured registry so SendMessage can advertise the right
 	// platforms.
-	// Render the base prompt fresh per boot so it carries the resolved
-	// model name AND the provider-specific hint fragment. The package-
-	// level defaultSystem var is the no-vars fallback used by tests and
-	// the worktree path below where we don't yet know the provider.
-	system := rtpkg.RenderBasePrompt(rtpkg.BasePromptVars{
-		Model:        model,
-		ProviderHint: rtpkg.ProviderHintFor(provName, model),
-	})
+	// Translate --simple → METIS_SIMPLE=1 so the single env-var probe
+	// in runtime.IsSimpleMode() is the only signal downstream code
+	// needs to read. Both flag and env paths converge to the same
+	// behavior.
+	if flags.simpleMode {
+		os.Setenv("METIS_SIMPLE", "1")
+	}
+
+	// Render the base prompt fresh per boot. SimpleBasePrompt is the
+	// one-line escape hatch (CI / scripted use); RenderBasePrompt is
+	// the full assembly with provider-specific hint. The decision is
+	// re-evaluated per boot, not cached, so a parent process can flip
+	// METIS_SIMPLE between calls.
+	var system string
+	if rtpkg.IsSimpleMode() {
+		system = rtpkg.SimpleBasePrompt(model)
+	} else {
+		system = rtpkg.RenderBasePrompt(rtpkg.BasePromptVars{
+			Model:        model,
+			ProviderHint: rtpkg.ProviderHintFor(provName, model),
+		})
+	}
 	if flags.system != "" {
 		system = flags.system
 	}
@@ -642,6 +673,18 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			Cache: true,
 		})
 	}
+
+	// --prompt-dump: short-circuit before any LLM / channel / cron
+	// wiring. We've already done provider resolution, mode resolution,
+	// overlay assembly, allowed_dirs — i.e. exactly what would be sent
+	// to the model on turn 0. Print to stdout and exit 0; nothing
+	// downstream gets initialised. Per-section markers (=== N: Name
+	// [cache?] ===) so a token-counter can split + budget per section.
+	if flags.dumpPrompt {
+		printPromptDump(systemSections, system)
+		os.Exit(0)
+	}
+
 	chReg := rtpkg.BuildChannelRegistry(&cfg.Channels)
 	// Cron service is shared between the scheduler goroutine (started
 	// elsewhere) and the ScheduleWakeup tool we register below — they
@@ -2526,6 +2569,47 @@ max_output_bytes = 1048576
 	}
 	fmt.Println("wrote", path)
 	return nil
+}
+
+// printPromptDump writes the assembled system prompt to stdout with
+// per-section markers + a footer summary. Used by --prompt-dump for
+// token accounting and prompt regressions. Each section header includes
+// (cache=Y/N volatile=Y/N) so the user can see what's cacheable across
+// turns vs what re-renders.
+func printPromptDump(sections []rtpkg.SystemPromptSection, rendered string) {
+	if len(sections) == 0 {
+		fmt.Println("# Assembled system prompt (no typed sections — legacy string path)")
+		fmt.Println()
+		fmt.Println(rendered)
+		fmt.Printf("\n--- summary ---\nrendered: %d chars\n", len(rendered))
+		return
+	}
+	fmt.Println("# Assembled system prompt")
+	fmt.Println()
+	var totalChars, cacheableChars int
+	for i, s := range sections {
+		cacheTag := "no-cache"
+		if s.Cache {
+			cacheTag = "cache"
+		}
+		volTag := ""
+		if s.Volatile {
+			volTag = " volatile"
+		}
+		fmt.Printf("=== %d. %s (%s%s · %d chars) ===\n", i+1, s.Name, cacheTag, volTag, len(s.Body))
+		fmt.Println(s.Body)
+		fmt.Println()
+		totalChars += len(s.Body)
+		if s.Cache {
+			cacheableChars += len(s.Body)
+		}
+	}
+	fmt.Println("--- summary ---")
+	fmt.Printf("sections:  %d\n", len(sections))
+	fmt.Printf("chars:     %d total, %d cacheable (%d non-cacheable)\n",
+		totalChars, cacheableChars, totalChars-cacheableChars)
+	fmt.Printf("rendered:  %d chars (joined)\n", len(rendered))
+	fmt.Printf("est tokens: ~%d (rough chars/4)\n", len(rendered)/4)
 }
 
 func joinSpaces(args []string) string {

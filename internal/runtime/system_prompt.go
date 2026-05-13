@@ -23,17 +23,17 @@ import (
 const SystemPromptFileName = "system.md"
 
 // basePromptTPL is the embedded base prompt template. Lives in
-// prompts/base.md.tpl so the prompt text is editable without
+// prompts/base.md so the prompt text is editable without
 // recompiling inline string constants. text/template syntax —
 // variables: .Model, .ProviderHint (mirror crush's .md.tpl pattern).
 //
-//go:embed prompts/base.md.tpl
+//go:embed prompts/base.md
 var basePromptTPL string
 
-// BasePromptVars is the template context for base.md.tpl. Empty
+// BasePromptVars is the template context for base.md. Empty
 // fields render as their `{{if .X}}...{{end}}` blocks would suggest:
 // missing → silent. Add new fields here and their `{{ .Foo }}`
-// reference in base.md.tpl together.
+// reference in base.md together.
 type BasePromptVars struct {
 	Model        string // e.g. "claude-opus-4-7" — surfaced as "powered by ..."
 	ProviderHint string // optional provider-specific guidance (Claude→XML, OpenAI→JSON)
@@ -62,7 +62,37 @@ func DefaultBasePrompt() string {
 	return RenderBasePrompt(BasePromptVars{})
 }
 
-// RenderBasePrompt expands base.md.tpl with the given variables. On
+// SimpleBasePrompt returns a one-sentence system prompt + cwd + date.
+// Used when METIS_SIMPLE=1 / --simple is active. Mirrors claude-code's
+// CLAUDE_CODE_SIMPLE escape hatch: skip the heavy guidance bundle when
+// the user is running a short, scripted task that doesn't need it
+// (CI prompts, cron loops, one-shot `metis run`).
+//
+// The user message + tool schemas still carry their own context; this
+// just drops the ~5K-char base prompt to a single line.
+func SimpleBasePrompt(model string) string {
+	cwd, _ := os.Getwd()
+	if model == "" {
+		model = "an LLM"
+	}
+	return fmt.Sprintf("You are metis, a fast local-first agent CLI powered by %s. CWD: %s. Date: %s.",
+		model, cwd, time.Now().Format("2006-01-02"))
+}
+
+// IsSimpleMode returns true when the user opted into the simple-prompt
+// escape hatch via the METIS_SIMPLE env var. The CLI flag `--simple`
+// in cmd/metis sets this env at boot so both paths produce the same
+// result and downstream code only has one signal to read.
+func IsSimpleMode() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("METIS_SIMPLE")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// RenderBasePrompt expands base.md with the given variables. On
 // any template error (programmer slip), returns the raw template
 // text — better to ship un-rendered than to crash chat boot.
 func RenderBasePrompt(vars BasePromptVars) string {

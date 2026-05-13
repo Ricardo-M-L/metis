@@ -1,7 +1,7 @@
 package runtime
 
 // provider_hints.go — short, provider-specific guidance appended at the
-// tail of base.md.tpl via {{.ProviderHint}}. The goal is NOT to lecture
+// tail of base.md via {{.ProviderHint}}. The goal is NOT to lecture
 // the model about its own architecture; it's to forward the small
 // number of model-family quirks that affect tool behavior in metis.
 //
