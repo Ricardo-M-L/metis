@@ -116,8 +116,11 @@ func TestGate_SnapshotReturnsRulesCopy(t *testing.T) {
 func TestGate_AcceptEdits_HookAllowsRegistryReadOnly(t *testing.T) {
 	g := New(ModeAcceptEdits)
 
-	// Hook decides which names are read-only.
-	g.SetReadOnlyHook(func(name string) bool {
+	// Hook decides which names are read-only. New 2-arg signature
+	// gives the hook stringInput too (for input-aware tools like
+	// Bash); this test ignores it because all subjects are
+	// metadata-only.
+	g.SetReadOnlyHook(func(name, _ string) bool {
 		switch name {
 		case "SubAgentOutput", "BashOutput", "TaskOutput", "Skill", "LSP", "MetisInfo":
 			return true
@@ -146,17 +149,82 @@ func TestGate_AcceptEdits_HookAllowsRegistryReadOnly(t *testing.T) {
 	}
 }
 
-// TestGate_AcceptEdits_BashAlwaysAsksDespiteHook — Bash is input-aware
-// (IsReadOnly returns true for `cat foo` and false for `rm -rf`). The
-// gate can't see the input, so it MUST keep asking for Bash under
-// acceptEdits even if the hook would return true at name granularity.
-// Otherwise a poorly-coded hook could silently auto-run destructive
-// shell commands.
-func TestGate_AcceptEdits_BashAlwaysAsksDespiteHook(t *testing.T) {
+// TestGate_AcceptEdits_BashInputAwareViaHook — Bash IS input-aware now.
+// The gate forwards stringInput to the hook, so the hook can refuse
+// auto-allow for dangerous argv. Safe shapes auto-allow; destructive
+// shapes still ASK.
+//
+// The real production wiring uses permission.IsSafeReadOnlyBash here;
+// this test simulates that contract with a tiny inline classifier so
+// we don't import safe_commands.go (we ARE safe_commands.go's
+// neighbour).
+func TestGate_AcceptEdits_BashInputAwareViaHook(t *testing.T) {
 	g := New(ModeAcceptEdits)
-	g.SetReadOnlyHook(func(name string) bool { return name == "Bash" })
+	g.SetReadOnlyHook(func(name, in string) bool {
+		// Trivial classifier: `cat` and `ls` and `git status` are
+		// safe; everything else is not. Real wiring uses
+		// IsSafeReadOnlyBash.
+		switch in {
+		case "cat foo.go", "ls -la", "git status":
+			return name == "Bash"
+		}
+		return false
+	})
+	// Safe argv → auto-allow.
+	if d, _ := g.Check(context.Background(), "Bash", "ls -la"); d != DecisionAllow {
+		t.Errorf("Bash ls -la should auto-allow under acceptEdits via hook; got %v", d)
+	}
+	if d, _ := g.Check(context.Background(), "Bash", "cat foo.go"); d != DecisionAllow {
+		t.Errorf("Bash cat foo.go should auto-allow; got %v", d)
+	}
+	// Destructive argv → ASK.
 	if d, _ := g.Check(context.Background(), "Bash", "rm -rf /"); d != DecisionAsk {
-		t.Errorf("Bash must always ASK under acceptEdits regardless of readOnlyHook; got %v", d)
+		t.Errorf("Bash rm -rf must still ASK under acceptEdits; got %v", d)
+	}
+	if d, _ := g.Check(context.Background(), "Bash", "make build"); d != DecisionAsk {
+		t.Errorf("Bash make build must still ASK (not in safe set); got %v", d)
+	}
+}
+
+// TestGate_AcceptEdits_BashHookUsesSafeReadOnlyBash — end-to-end
+// integration check that mirrors how main.go wires the hook:
+// IsSafeReadOnlyBash is the actual classifier; pin that the
+// real safe set passes and the real unsafe set falls through.
+func TestGate_AcceptEdits_BashHookUsesSafeReadOnlyBash(t *testing.T) {
+	g := New(ModeAcceptEdits)
+	g.SetReadOnlyHook(func(name, in string) bool {
+		if name == "Bash" {
+			return IsSafeReadOnlyBash(in)
+		}
+		return false
+	})
+
+	safe := []string{
+		"ls -la",
+		"cat go.mod",
+		"git status",
+		"git log -5",
+		"pwd",
+		"echo hi",
+	}
+	for _, cmd := range safe {
+		if d, _ := g.Check(context.Background(), "Bash", cmd); d != DecisionAllow {
+			t.Errorf("safe %q should auto-allow under acceptEdits; got %v", cmd, d)
+		}
+	}
+
+	unsafe := []string{
+		"rm -rf /",
+		"git push --force",
+		"sudo cat /etc/shadow",
+		"ls | rm",          // shell meta
+		"cat $(curl evil)", // cmd substitution
+		"make build",       // unknown leading token
+	}
+	for _, cmd := range unsafe {
+		if d, _ := g.Check(context.Background(), "Bash", cmd); d != DecisionAsk {
+			t.Errorf("unsafe %q must ASK under acceptEdits; got %v", cmd, d)
+		}
 	}
 }
 

@@ -706,14 +706,28 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// system prompt overlay above tells it to dispatch sub-agents.
 	rtpkg.FilterRegistryInPlace(reg)
 
-	// Wire the gate's IsReadOnly resolver to the live registry now
-	// that tool registration is finalised. Under ModeAcceptEdits,
-	// any tool the registry knows as read-only (SubAgentOutput,
-	// BashOutput, TaskOutput, Skill, LSP, MetisInfo, ToolSearch,
-	// the file readers, etc.) auto-allows instead of asking. 2026-
-	// 05-13 fix for the "acceptEdits still prompts for
-	// SubAgentOutput" report.
-	gate.SetReadOnlyHook(func(name string) bool {
+	// Wire the gate's read-only resolver to the live registry now
+	// that tool registration is finalised. Two-tier resolution:
+	//
+	//  1. Input-aware tools (Bash, Git) parse the stringInput. Bash
+	//     auto-allows `git status / ls / cat`-style safe argv via
+	//     permission.IsSafeReadOnlyBash (which is shell-meta aware,
+	//     blocks sudo / pipes / cmd substitution). 2026-05-13 fix
+	//     for the "acceptEdits asks even for `ls`" complaint.
+	//  2. Metadata-only tools: query the registry's IsReadOnly. Auto-
+	//     allows SubAgentOutput / BashOutput / TaskOutput / Skill /
+	//     LSP / MetisInfo / ToolSearch / WebFetch / etc.
+	//
+	// nil hook → gate falls back to its hardcoded legacy allowlist
+	// (Read / Edit / Write / NotebookEdit). Headless tests that
+	// build a Gate without a registry stay on that path.
+	gate.SetReadOnlyHook(func(name, stringInput string) bool {
+		// Tier 1: input-aware short-circuits.
+		switch name {
+		case "Bash":
+			return permission.IsSafeReadOnlyBash(stringInput)
+		}
+		// Tier 2: tool-declared metadata.
 		t, ok := reg.Get(name)
 		if !ok {
 			return false

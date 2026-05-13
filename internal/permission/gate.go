@@ -191,12 +191,18 @@ type Gate struct {
 	// registry is built; nil means "fall back to the hardcoded
 	// allowlist", which keeps tests and headless paths working.
 	//
+	// Signature takes BOTH the tool name AND the serialized input —
+	// for input-aware tools (Bash, Git) the hook needs the actual
+	// argv to decide ("cat foo" auto-allows; "rm -rf" doesn't).
+	// Tools with no input-sensitive read/write distinction can
+	// ignore the stringInput argument.
+	//
 	// 2026-05-13 fix for the "acceptEdits still prompts for
 	// SubAgentOutput" report: claude-code lets each tool declare
 	// isReadOnly() and threads that through the permission decision;
 	// metis grew the IsReadOnly capability but the gate never read
 	// it.
-	readOnlyHook func(toolName string) bool
+	readOnlyHook func(toolName, stringInput string) bool
 }
 
 func New(mode Mode) *Gate {
@@ -212,11 +218,14 @@ func New(mode Mode) *Gate {
 // the hook back to the legacy hardcoded-allowlist behaviour.
 //
 // Resolution rule: a hook returning true makes ModeAcceptEdits
-// auto-allow the call regardless of the tool name. The hardcoded
-// allowlist still runs as a fallback when the hook returns false
-// (or is nil), so existing tests that don't wire a registry keep
-// working.
-func (g *Gate) SetReadOnlyHook(fn func(toolName string) bool) {
+// auto-allow the call. The hardcoded allowlist still runs as a
+// fallback when the hook returns false (or is nil), so existing
+// tests that don't wire a registry keep working.
+//
+// The hook receives the SAME stringInput Check was given (Bash → cmd,
+// Git → args, Edit → path, etc.) so input-aware tools can refuse
+// auto-allow for dangerous invocations.
+func (g *Gate) SetReadOnlyHook(fn func(toolName, stringInput string) bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.readOnlyHook = fn
@@ -229,7 +238,7 @@ func (g *Gate) SetReadOnlyHook(fn func(toolName string) bool) {
 // RLock here: sync.RWMutex is non-reentrant, and the previous
 // implementation deadlocked when Check held Lock and tried to RLock
 // itself (2026-05-13 test-suite hang).
-func (g *Gate) callReadOnlyHookLocked(tool string) bool {
+func (g *Gate) callReadOnlyHookLocked(tool, stringInput string) bool {
 	fn := g.readOnlyHook
 	if fn == nil {
 		return false
@@ -240,7 +249,7 @@ func (g *Gate) callReadOnlyHookLocked(tool string) bool {
 	// `defer g.mu.Unlock()` keeps the contract.
 	g.mu.Unlock()
 	defer g.mu.Lock()
-	return fn(tool)
+	return fn(tool, stringInput)
 }
 
 // SetDenialLimits overrides the default denial-tracking thresholds.
@@ -501,18 +510,19 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		// This sits between Auto (asks for any write) and Bypass
 		// (allows anything). claude-code's acceptEdits.
 
-		// Registry-driven path (preferred): any tool the runtime
-		// tags as IsReadOnly is auto-allowed. Covers
-		// SubAgentOutput / BashOutput / TaskOutput / Skill / LSP /
-		// MetisInfo / ToolSearch / etc. without needing to keep
-		// the hardcoded list in sync. Bash is input-aware
-		// (IsReadOnly only true for `cat foo` / `git status`-style
-		// calls), so a `Bash {cmd: "rm -rf"}` still falls through
-		// to ASK because its IsReadOnly returns false for that
-		// input — which we can't see from the gate. Restrict the
-		// registry-driven path to non-Bash tools to keep that
-		// safety in place; Bash always asks under acceptEdits.
-		if tool != "Bash" && g.callReadOnlyHookLocked(tool) {
+		// Registry-driven path (preferred): the runtime hook receives
+		// (tool, stringInput) and answers "auto-allow this call?".
+		// For metadata-only tools (SubAgentOutput / BashOutput /
+		// TaskOutput / Skill / LSP / MetisInfo / ToolSearch / etc.)
+		// the hook reads tool.IsReadOnly and returns true.
+		//
+		// For input-aware tools (Bash, Git) the hook parses the
+		// stringInput — `Bash {cmd: "git status"}` auto-allows via
+		// permission.IsSafeReadOnlyBash; `Bash {cmd: "rm -rf"}`
+		// returns false and falls through to ASK. No hardcoded
+		// Bash-skip needed here — the safety lives in the hook
+		// implementation, which is closer to the policy it enforces.
+		if g.callReadOnlyHookLocked(tool, stringInput) {
 			g.recordAllow()
 			return DecisionAllow, "mode:acceptEdits:readonly"
 		}
