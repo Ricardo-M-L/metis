@@ -128,15 +128,30 @@ func TestCompact_ProducesBoundaryWithSummary(t *testing.T) {
 	if p.calls != 1 {
 		t.Errorf("expected 1 summarize call, got %d", p.calls)
 	}
-	// Expect: 1 (first) + 1 (boundary asst) + 1 (synthetic user ack —
-	// keepLast[0] is assistant) + 3 (last) = 6.
+	// Layout: 1 sys + 12 mid (alternating user/asst, last is asst @ msgs[12])
+	// + 3 recent asst (msgs[13..15]) = 16 total.
+	//
+	// keepLast (msgs[13:16]) is purely assistant → 2026-05-13 anchor
+	// fix detects "no user-text in keepLast" and pulls cut back to
+	// the last user-text msg (msgs[11] = "old user 5"). Post-compact
+	// keepLast becomes msgs[11:16] = 5 messages (1 user + 4 asst).
+	//
+	// Expect: 1 keepFirst + 1 boundary + 5 keepLast = 7.
+	//
+	// (Old behavior was 6 — keepFirst + boundary + synthetic-user-ack +
+	// 3 keepLast — because the pre-2026-05-13 slicer didn't preserve
+	// the active user prompt and the boundary asst → keepLast asst
+	// run required a synthetic ack to maintain user/asst alternation.
+	// New behavior is better: real user prompt survives verbatim,
+	// alternation is natural (boundary asst → keepLast user), no
+	// synthetic ack needed.)
 	//
 	// Boundary is RoleAssistant (not RoleSystem) — bug #10 2026-04-30:
 	// MiniMax + strict Anthropic reject mid-array system role with
 	// error 2013, so the boundary is rendered narratively as if the
 	// assistant said "I summarized our earlier conversation."
-	if len(out) != 6 {
-		t.Fatalf("expected 6 messages after compact, got %d", len(out))
+	if len(out) != 7 {
+		t.Fatalf("expected 7 messages after compact (anchor preserves user-text), got %d", len(out))
 	}
 	if out[1].Role != llm.RoleAssistant {
 		t.Errorf("boundary should be assistant role (mid-array system rejected by APIs), got %q", out[1].Role)
@@ -144,10 +159,13 @@ func TestCompact_ProducesBoundaryWithSummary(t *testing.T) {
 	if len(out[1].Content) == 0 || !strings.Contains(out[1].Content[0].Text, "MOCK_SUMMARY") {
 		t.Errorf("boundary missing summary, got: %v", out[1].Content)
 	}
-	// out[2] must be the synthetic user ack since out[1] (boundary)
-	// is asst and keepLast[0] is also asst — strict alternation.
+	// out[2] is keepLast[0] = msgs[11] = "old user 5" (USER role).
+	// Alternation is natural — no synthetic ack required.
 	if out[2].Role != llm.RoleUser {
-		t.Errorf("synthetic user ack expected at out[2] (boundary asst → keepLast asst), got %q", out[2].Role)
+		t.Errorf("keepLast[0] (anchor-preserved user-text) expected at out[2], got role=%q", out[2].Role)
+	}
+	if len(out[2].Content) == 0 || !strings.Contains(out[2].Content[0].Text, "old user 5") {
+		t.Errorf("out[2] should be the active-task anchor msgs[11]; got %v", out[2].Content)
 	}
 }
 
@@ -251,7 +269,8 @@ func TestCompact_NoOpWhenAdjustmentSwallowsMiddle(t *testing.T) {
 func TestCompact_KeepLastSliceCorrect(t *testing.T) {
 	// Regression: original code used messages[ProtectLast:] which is wrong when
 	// len != 2*ProtectLast. Build a 12-message conversation; verify ProtectLast=5
-	// keeps exactly the last 5 messages (not 7).
+	// keeps last 5 messages (natural slicing, since keepLast already has user-text
+	// — every msg is user-text — the 2026-05-13 anchor fix is a no-op here).
 	p := &fakeSummarizer{}
 	cfg := DefaultCompactionConfig()
 	cfg.ProtectFirst = 1
@@ -266,7 +285,15 @@ func TestCompact_KeepLastSliceCorrect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// keepFirst (1) + boundary (1) + keepLast (5) = 7
+	// Layout: 1 sys + 11 user. cut = 12-5 = 7. keepLast = msgs[7:12] = 5
+	// user-text msgs ("msg 6" through "msg 10"). Anchor fix detects
+	// keepLast already has user-text and skips intervention.
+	//
+	// keepFirst (1) + boundary asst (1) + synthetic user ack (1 —
+	// keepLast[0] is RoleUser, so no ack needed actually).
+	//
+	// Wait: boundary is asst, keepLast[0]=user → alternation natural,
+	// no synthetic ack. Total = 1 + 1 + 5 = 7.
 	if len(out) != 7 {
 		t.Fatalf("expected 7 messages, got %d", len(out))
 	}

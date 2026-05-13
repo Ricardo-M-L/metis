@@ -570,6 +570,38 @@ func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.
 
 	cut := len(messages) - c.ProtectLast
 	cut = adjustCutForToolPairs(messages, cut)
+
+	// Active-task anchor (2026-05-13 bugfix):
+	//
+	// ProtectFirst=1 keeps msgs[0] — almost always a greeting like
+	// "你好" / "hi". ProtectLast=5 typically captures recent tool-result
+	// + assistant cycles. The user's ACTUAL question — the one driving
+	// the current turn — can land in the middle and get folded into the
+	// assistant-role summary boundary. The model then scans the
+	// post-compact slice, sees only ONE user-text message (the
+	// greeting), and answers THAT instead of the active task.
+	//
+	// Real transcript that surfaced this (compaction inside a "compare
+	// token consumption" turn):
+	//   ...
+	//   Conversation compacted (context compacted: 31 → 8 messages)
+	//   ...
+	//   The user just said "你好" (hello in Chinese). They previously
+	//   had a task about comparing token consumption... 你好！
+	//
+	// Narrow fix: only pull cut earlier when the *natural* keepLast
+	// has NO user-text message at all (purely tool cycles or assistant
+	// chatter). In that pathological case, walk back to find the most
+	// recent user-text message and pull cut earlier so that message
+	// lands in keepLast verbatim. When keepLast already has a real
+	// user prompt, no intervention — the existing slicing is fine.
+	if !sliceHasUserText(messages[cut:]) {
+		if anchor := lastUserTextBefore(messages, cut); anchor >= 0 && anchor < cut {
+			cut = anchor
+			cut = adjustCutForToolPairs(messages, cut)
+		}
+	}
+
 	if cut <= c.ProtectFirst {
 		// Tool-pair adjustment swallowed the middle; skip compaction.
 		// Counts as a failure for the circuit because the conversation
@@ -656,6 +688,56 @@ func messageHasToolResult(m llm.Message) bool {
 		}
 	}
 	return false
+}
+
+// sliceHasUserText reports whether at least one message in `slice` is
+// USER-role AND carries a non-empty text block (not just tool_result
+// echoes). Used by Compact's anchor logic to decide whether the natural
+// keepLast already contains a user prompt — if so, no anchor pull
+// needed.
+func sliceHasUserText(slice []llm.Message) bool {
+	for _, m := range slice {
+		if m.Role != llm.RoleUser {
+			continue
+		}
+		for _, b := range m.Content {
+			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// lastUserTextBefore finds the index of the most recent USER-role
+// message whose content has at least one text block, scanning
+// backwards from `before` (exclusive). Returns -1 when no such
+// message exists.
+//
+// "User text" specifically excludes user messages that are pure
+// tool_result echoes — those aren't initiated by the human and
+// would not anchor the model's "current task" reasoning.
+//
+// Used by Compact to ensure the user's active prompt survives the
+// summarize-middle pass instead of getting folded into the
+// assistant-role boundary (where the model reads it as "history",
+// not "active task").
+func lastUserTextBefore(messages []llm.Message, before int) int {
+	if before > len(messages) {
+		before = len(messages)
+	}
+	for i := before - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Role != llm.RoleUser {
+			continue
+		}
+		for _, b := range m.Content {
+			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func (c *Compactor) summarize(ctx context.Context, messages []llm.Message) (string, error) {
