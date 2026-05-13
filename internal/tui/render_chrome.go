@@ -299,6 +299,24 @@ func renderStatusBar(m *Model) string {
 		// (cumulative-so-far) than to flicker from blank → number.
 		used = m.totalTokens.in + m.totalTokens.cacheCreate + m.totalTokens.cacheRead
 	}
+	// History-bytes floor: take the larger of (API-reported context
+	// usage, on-disk history estimate). Without this, a provider that
+	// under-reports cache_read_input_tokens (some Anthropic-compat
+	// gateways — MiniMax does this inconsistently) makes the
+	// displayed number SWING DOWN between turns, which looks like
+	// "context shrank" to users expecting monotone growth.
+	//
+	// estimateTokens counts every serialized byte in Loop.Messages so
+	// it only drops when real compaction fires — and compaction ALSO
+	// emits a "[info] context snipped: ~N → ~M tokens" event, so a
+	// drop without that event is the signal of a provider bug, not a
+	// metis-side context change. User reported:
+	//   "第3轮 5w token, 第4轮 3w, 还降低了" — this fixes that.
+	if m.loop != nil {
+		if est := m.loop.EstimateContextTokens(); est > used {
+			used = est
+		}
+	}
 	if used > 0 {
 		right = formatTokensRaw(used) + " tokens"
 		if m.loop != nil && m.loop.Provider != nil {

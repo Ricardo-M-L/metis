@@ -286,6 +286,24 @@ func (l *Loop) History() []llm.Message {
 	return transcript.Snapshot(l.Messages)
 }
 
+// EstimateContextTokens returns a rough byte-derived estimate of the
+// current Messages history's token cost. Used as a STABLE floor for
+// the status bar so providers that under-report cache hits (some
+// Anthropic-compat gateways do) don't make the displayed
+// context-usage number swing down between turns. The status bar
+// renders `max(provider-reported, this estimate)` — number stays
+// monotone until real compaction (Snip/Microcompact/Compact) fires
+// and emits a visible "[info] context snipped: …" event.
+//
+// Same estimator the compaction tier-1 path already uses
+// (compaction_check.go::maybeCompact); exposing it on the public
+// surface so the TUI doesn't have to duplicate the estimator.
+func (l *Loop) EstimateContextTokens() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return estimateTokens(l.Messages)
+}
+
 // haltTurn marks the current Run for halt-after-current-iteration. The
 // signal is checked after executeBatch (where PreToolUse hooks fire)
 // and after the steer drain — so a hook can deny the offending tool
