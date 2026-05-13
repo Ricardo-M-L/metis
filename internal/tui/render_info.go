@@ -162,54 +162,61 @@ func guessPriceUSDPerM(model string) (in, out float64) {
 func renderDiff(m *Model) string {
 	var b strings.Builder
 
-	// Section 1: session-scoped touched-files report.
-	//
-	// claude-code's /diff threads through their FileHistorySnapshot
-	// chain; crush uses filetracker.Service. metis derives the list
-	// from Loop.Messages on demand (no extra storage). Surfacing it
-	// here gives the user the "what did THIS session touch" answer
-	// that `git diff` can't — git mixes pre-session uncommitted
-	// edits with agent edits, and misses files that were already
-	// committed earlier this session.
+	// Section 1: per-turn diff report — mirrors claude-code's
+	// useTurnDiffs.ts. Each user-prompt opens a new "turn"; every
+	// Edit / Write / NotebookEdit inside the turn aggregates into
+	// per-file +N/-M counts derived from the same go-udiff
+	// generator the per-call preview uses. Newest turn first.
 	if m != nil && m.loop != nil {
-		if touched := m.loop.TouchedFiles(); len(touched) > 0 {
-			b.WriteString("Session activity (Read / Edit / Write):\n")
-			for _, tf := range touched {
-				marker := "  "
-				switch {
-				case tf.Writes > 0 && tf.Edits == 0:
-					marker = "✨"
-				case tf.Edits > 0:
-					marker = "✏ "
-				default:
-					marker = "📖"
+		if turns := m.loop.TurnDiffs(); len(turns) > 0 {
+			totalA, totalR, totalFiles := 0, 0, 0
+			fileSet := map[string]struct{}{}
+			for _, tn := range turns {
+				totalA += tn.TotalLinesAdded
+				totalR += tn.TotalLinesRemoved
+				for path := range tn.Files {
+					fileSet[path] = struct{}{}
 				}
-				fmt.Fprintf(&b, "  %s %s", marker, tf.Path)
-				counts := []string{}
-				if tf.Reads > 0 {
-					counts = append(counts, fmt.Sprintf("R×%d", tf.Reads))
+			}
+			totalFiles = len(fileSet)
+			fmt.Fprintf(&b, "Session edits across %d turn(s) · %d file(s) · ",
+				len(turns), totalFiles)
+			fmt.Fprintf(&b, "+%d -%d lines\n\n", totalA, totalR)
+
+			for _, tn := range turns {
+				fmt.Fprintf(&b, "Turn %d", tn.Index)
+				if tn.UserPromptPreview != "" {
+					fmt.Fprintf(&b, "  · %q", tn.UserPromptPreview)
 				}
-				if tf.Edits > 0 {
-					counts = append(counts, fmt.Sprintf("E×%d", tf.Edits))
+				fmt.Fprintf(&b, "  (%d file(s), +%d -%d)\n",
+					tn.FilesChanged, tn.TotalLinesAdded, tn.TotalLinesRemoved)
+
+				paths := make([]string, 0, len(tn.Files))
+				for p := range tn.Files {
+					paths = append(paths, p)
 				}
-				if tf.Writes > 0 {
-					counts = append(counts, fmt.Sprintf("W×%d", tf.Writes))
-				}
-				if len(counts) > 0 {
-					fmt.Fprintf(&b, "  (%s)", strings.Join(counts, ", "))
+				sortStrings(paths)
+				for _, p := range paths {
+					f := tn.Files[p]
+					marker := "  ✏ "
+					if f.IsNewFile {
+						marker = "  ✨"
+					}
+					fmt.Fprintf(&b, "  %s %s  +%d -%d", marker, f.Path,
+						f.LinesAdded, f.LinesRemoved)
+					if f.EditCount > 1 {
+						fmt.Fprintf(&b, "  (%d edits)", f.EditCount)
+					}
+					b.WriteString("\n")
 				}
 				b.WriteString("\n")
 			}
-			b.WriteString("\n")
 		}
 	}
 
-	// Section 2: working-tree git diff. May not overlap with the
-	// session list above: a file the agent Edit'd and then
-	// committed in-session shows in section 1 but not here; a file
-	// the user (not the agent) touched outside metis shows here but
-	// not in section 1. The two views are complementary, not
-	// redundant.
+	// Section 2: working-tree git diff. Complementary view: shows
+	// uncommitted state regardless of which turn produced it AND
+	// any non-agent edits.
 	cmd := exec.Command("git", "diff", "--stat", "HEAD")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -225,16 +232,27 @@ func renderDiff(m *Model) string {
 	}
 	body := strings.TrimSpace(string(out))
 	if body == "" {
-		b.WriteString("git diff --stat HEAD: (working tree clean)\n")
-		if b.Len() > 0 {
-			b.WriteString("(session activity above shows files this run touched even if already committed)\n")
+		if b.Len() == 0 {
+			return "(no agent edits this session, working tree clean)"
 		}
+		b.WriteString("git diff --stat HEAD: (working tree clean)\n")
 		return b.String()
 	}
 	b.WriteString("git diff --stat HEAD:\n")
 	b.WriteString(body)
 	b.WriteString("\n\n(use `git diff` outside metis for full patch)")
 	return b.String()
+}
+
+// sortStrings is a tiny local sort.Strings to avoid widening the
+// import set in render_info.go (most other render_* funcs don't
+// need sort).
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
 }
 
 func renderDoctor(m *Model) string {
