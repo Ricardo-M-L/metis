@@ -593,22 +593,34 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		os.Setenv("METIS_SIMPLE", "1")
 	}
 
-	// Render the base prompt fresh per boot. SimpleBasePrompt is the
-	// one-line escape hatch (CI / scripted use); RenderBasePrompt is
-	// the full assembly with provider-specific hint. The decision is
-	// re-evaluated per boot, not cached, so a parent process can flip
-	// METIS_SIMPLE between calls.
-	var system string
-	if rtpkg.IsSimpleMode() {
-		system = rtpkg.SimpleBasePrompt(model)
-	} else {
-		system = rtpkg.RenderBasePrompt(rtpkg.BasePromptVars{
-			Model:        model,
-			ProviderHint: rtpkg.ProviderHintFor(provName, model),
-		})
+	// promptCtx captures the runtime signals each prompt section
+	// inspects to decide whether to fire. Populated once here so the
+	// dump-prompt path, the simple-mode path, and the regular path all
+	// share the same source of truth.
+	promptCtx := rtpkg.PromptCtx{
+		Model:        model,
+		ProviderName: provName,
+		EnabledTools: nil, // filled in below once registry exists; nil = legacy "assume Bash"
+		HasSkills:    rtpkg.HasInstalledSkills(),
+		IsSubAgent:   false,
+		Mode:         mode,
 	}
-	if flags.system != "" {
+
+	// Render the base prompt fresh per boot. Three paths:
+	//   1. --system flag overrides entirely (user-supplied prompt).
+	//   2. METIS_SIMPLE=1 / --simple → one-sentence stub for CI use.
+	//   3. Default → section registry assembled with promptCtx.
+	var system string
+	switch {
+	case flags.system != "":
 		system = flags.system
+	case rtpkg.IsSimpleMode():
+		system = rtpkg.SimpleBasePrompt(model)
+	default:
+		system = rtpkg.AssembleBaseString(promptCtx)
+		if hint := rtpkg.ProviderHintFor(provName, model); hint != "" {
+			system = system + "\n\n" + hint
+		}
 	}
 	// Agent profile body REPLACES the default system prompt — that's the
 	// whole point of "I am a code reviewer". Skip when profile body is
@@ -653,7 +665,18 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		if ov := rtpkg.PlanOverlay(mode == string(permission.ModePlan)); ov.Name != "" {
 			assembleOpts.Overlays = append(assembleOpts.Overlays, ov)
 		}
-		systemSections = rtpkg.AssembleSystemPromptSections(system, assembleOpts)
+		// Two assembly paths:
+		//   - Default: per-section registry (identity/privacy/style/...).
+		//     Each section is independently cacheable + sub-agents /
+		//     Bash-less profiles skip irrelevant sections.
+		//   - --simple / --system override / explicit user prompt:
+		//     wrap `system` as one "base" section to preserve the
+		//     caller's intent (don't fragment a user-supplied prompt).
+		if flags.system != "" || rtpkg.IsSimpleMode() {
+			systemSections = rtpkg.AssembleSystemPromptSections(system, assembleOpts)
+		} else {
+			systemSections = rtpkg.AssembleSystemPromptSectionsCtx(promptCtx, assembleOpts)
+		}
 		system = rtpkg.RenderSections(systemSections)
 	}
 

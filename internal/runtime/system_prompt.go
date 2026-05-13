@@ -92,19 +92,53 @@ func IsSimpleMode() bool {
 	return false
 }
 
-// RenderBasePrompt expands base.md with the given variables. On
-// any template error (programmer slip), returns the raw template
-// text — better to ship un-rendered than to crash chat boot.
+// RenderBasePrompt expands the base prompt with the given variables.
+// Now backed by the per-section registry (sections.go) instead of the
+// monolithic base.md template — the section path produces the same
+// final text but lets sub-agents / Bash-less tool sets skip
+// irrelevant sections.
+//
+// The legacy basePromptTPL is still embedded for the rare fallback
+// when assembly fails; current code paths never hit that branch.
+//
+// The {{.ProviderHint}} suffix is preserved as a trailing block when
+// vars.ProviderHint is non-empty — callers that want it as a separate
+// cacheable section should call AssembleBaseSections directly and
+// append a ProviderHint section themselves.
 func RenderBasePrompt(vars BasePromptVars) string {
-	tpl, err := parsedBaseTPL()
+	ctx := PromptCtx{
+		Model: vars.Model,
+		// HasSkills defaults to true here so the section fires for
+		// the legacy "render-everything" call path. Callers that
+		// want context-aware behavior should use AssembleBaseSections
+		// with a properly-populated PromptCtx directly.
+		HasSkills: true,
+	}
+	base := AssembleBaseString(ctx)
+	if vars.ProviderHint != "" {
+		return strings.TrimSpace(base) + "\n\n" + strings.TrimSpace(vars.ProviderHint)
+	}
+	return strings.TrimSpace(base)
+}
+
+// renderInlineTemplate runs an arbitrary template string through the
+// same engine RenderBasePrompt uses. Helper for the per-section
+// registry (sections.go) — each section body may contain its own
+// {{.Var}} markers and we parse them on demand rather than embedding
+// the whole file twice.
+//
+// Returns an error so the caller can fall back to the un-expanded body
+// instead of silently emitting garbage.
+func renderInlineTemplate(body string, vars BasePromptVars) (string, error) {
+	tpl, err := template.New("section").Parse(body)
 	if err != nil {
-		return strings.TrimSpace(basePromptTPL)
+		return "", err
 	}
 	var buf bytes.Buffer
 	if err := tpl.Execute(&buf, vars); err != nil {
-		return strings.TrimSpace(basePromptTPL)
+		return "", err
 	}
-	return strings.TrimSpace(buf.String())
+	return buf.String(), nil
 }
 
 // PromptMode picks one of three pre-set scopes for AssembleSystemPrompt.
@@ -185,6 +219,63 @@ type SystemPromptSection struct {
 	Body     string
 	Cache    bool // emit cache_control at the end of this section's block
 	Volatile bool // explicitly DISABLE cache even if Cache is true (wins over Cache)
+}
+
+// AssembleSystemPromptSectionsCtx is the section-aware constructor.
+// Unlike AssembleSystemPromptSections (which wraps a pre-rendered
+// `base string` as one giant section), this calls the per-section
+// registry from sections.go so each base sub-section keeps its own
+// cache flag and the assembler can skip irrelevant sections per ctx.
+//
+// Output ordering:
+//
+//	identity / privacy / style / tool_redirects / working_efficiently
+//	/ skills / reversibility   (all Cache=true, conditionally fired)
+//	provider_hint              (Cache=true, when ctx.ProviderName set)
+//	overlays                   (caller-supplied; CoordinatorOverlay,
+//	                            PlanOverlay, etc.)
+//	project_context            (Cache=false; cwd-dependent)
+//	addendum                   (Cache=true; user-level)
+//	env                        (Cache=false, Volatile=true)
+//
+// Same cache-ordering rules as AssembleSystemPromptSections — see the
+// CACHE-C comment there.
+//
+// Callers in main.go should prefer this; AssembleSystemPromptSections
+// is kept for backward compat with tests + agent-profile paths that
+// already compose their own base string.
+func AssembleSystemPromptSectionsCtx(ctx PromptCtx, opts AssembleOptions) []SystemPromptSection {
+	mode := opts.resolvedMode()
+	secs := AssembleBaseSections(ctx)
+
+	// Provider hint as its own cached section (so a provider switch
+	// at runtime doesn't bust the upstream base cache, and so the
+	// hint is visually distinct in --prompt-dump output).
+	if hint := ProviderHintFor(ctx.ProviderName, ctx.Model); hint != "" {
+		secs = append(secs, SystemPromptSection{
+			Name:  "provider_hint",
+			Body:  hint,
+			Cache: true,
+		})
+	}
+
+	for _, ov := range opts.Overlays {
+		secs = append(secs, ov)
+	}
+	if mode != PromptMinimal {
+		if proj := loadProjectContext(); proj != "" {
+			secs = append(secs, SystemPromptSection{Name: "project_context", Body: proj, Cache: false})
+		}
+	}
+	if mode == PromptFull {
+		if addendum := loadSystemPromptAddendum(); addendum != "" {
+			secs = append(secs, SystemPromptSection{Name: "addendum", Body: addendum, Cache: true})
+		}
+	}
+	if !opts.SkipEnv {
+		secs = append(secs, SystemPromptSection{Name: "env", Body: buildEnvBlock(), Cache: false, Volatile: true})
+	}
+	return secs
 }
 
 // AssembleSystemPromptSections is the array-form constructor. Returns
