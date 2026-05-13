@@ -460,6 +460,16 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 			}
 		}
 	}
+	// Skill-manifest nudge: when Read returns a SKILL.md, append a
+	// reminder that the body is a procedure to follow (not a doc to
+	// summarise). See skill_redirects.go for the detector.
+	if blk.ToolName == "Read" && !res.IsError {
+		if path, _ := blk.ToolInput["path"].(string); path != "" {
+			if hint := skillReadHint(path, res.Output); hint != "" {
+				resultBody = resultBody + wrapAsSystemReminder(hint)
+			}
+		}
+	}
 	return llm.ContentBlock{
 		Type: "tool_result", ToolUseID: blk.ToolUseID,
 		ToolResult: resultBody, IsError: res.IsError,

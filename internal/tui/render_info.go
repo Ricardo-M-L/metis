@@ -299,7 +299,7 @@ func renderStats(m *Model) string {
 	toolCalls := len(m.toolEvents)
 	in := m.totalTokens.Input()
 	out := m.totalTokens.Output()
-	return renderInfoBox("Session Stats", []infoRow{
+	rows := []infoRow{
 		{Key: "session id", Value: m.sessionID},
 		{Key: "user turns", Value: fmt.Sprintf("%d", turns)},
 		{Key: "tool calls", Value: fmt.Sprintf("%d", toolCalls)},
@@ -307,7 +307,34 @@ func renderStats(m *Model) string {
 		{Key: "output tokens", Value: fmtThousands(out)},
 		{Key: "loop iters", Value: fmt.Sprintf("%d", m.loop.MaxIters)},
 		{Key: "history msgs", Value: fmt.Sprintf("%d", len(m.loop.History()))},
-	})
+	}
+	// System prompt + cache breakdown — useful when debugging "why
+	// did first turn cost X tokens?" / "did the cache flag stick?".
+	// SystemSections is the typed form (per-section Cache flags);
+	// fall back to the flat string when sections aren't set.
+	if len(m.loop.SystemSections) > 0 {
+		total, cacheable, volatileChars := 0, 0, 0
+		for _, s := range m.loop.SystemSections {
+			n := len(s.Body)
+			total += n
+			switch {
+			case s.Volatile:
+				volatileChars += n
+			case s.Cache:
+				cacheable += n
+			}
+		}
+		rows = append(rows, infoRow{Key: "", Value: ""})
+		rows = append(rows, infoRow{Key: "system sections", Value: fmt.Sprintf("%d", len(m.loop.SystemSections))})
+		rows = append(rows, infoRow{Key: "system chars", Value: fmtThousands(total)})
+		rows = append(rows, infoRow{Key: "  cacheable", Value: fmtThousands(cacheable)})
+		rows = append(rows, infoRow{Key: "  volatile (no-cache)", Value: fmtThousands(volatileChars)})
+	} else if m.loop.System != "" {
+		rows = append(rows, infoRow{Key: "", Value: ""})
+		rows = append(rows, infoRow{Key: "system chars", Value: fmtThousands(len(m.loop.System))})
+		rows = append(rows, infoRow{Key: "system sections", Value: "(flat / no cache flags)"})
+	}
+	return renderInfoBox("Session Stats", rows)
 }
 
 func renderKeybindings() string {
