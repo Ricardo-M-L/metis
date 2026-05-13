@@ -403,10 +403,72 @@ wire), so tool-heavy turns are no longer invisible to the threshold
 check. The summary itself is generated via a streaming LLM call (same
 provider) so the user sees progress, not a frozen UI.
 
+Threshold math: `compact_fires_when estimateTokens(history) >= threshold *
+effectiveInputCap`, where `effectiveInputCap = MaxContextTokens -
+min(MaxOutputTokens, MaxReservedForSummary)`. `MaxReservedForSummary` is
+fixed at **20_000** (mirrors claude-code `services/compact/autoCompact.ts`'s
+p99.99 compact-summary observation) so a generous `max_tokens`
+config (e.g. 64000) doesn't prematurely shrink the denominator. Without
+that cap, `max_tokens=64000` on a 200k window made the effective cap
+136k and auto-compact fired at ~54% of real window; with it, the cap
+is 180k and compact fires at ~77% — close to claude-code's ~84%.
+Legacy behavior (subtract full `MaxOutputTokens`) is available via
+`METIS_COMPACT_RESERVE_FULL_MAX_TOKENS=1` env.
+
 The cut point honors **tool-pair safety**: the kept tail is walked back
 until it doesn't start with an orphan `tool_result` whose `tool_use`
 lives in the discarded middle (Anthropic rejects orphaned pairs with
-422).
+422). It also walks back to anchor the most recent user-text message
+(skipping `tool_result` user-role messages) so the model's "active
+task" never gets folded into the summary boundary while a stale
+earlier text message survives — see `lastUserTextBefore` in
+`compact.go`.
+
+**Summary prompt (5 sections)**. The summarizer LLM receives a fixed
+markdown structure — Current State / Files & Changes / Technical
+Context / Strategy & Approach / Exact Next Steps — instead of a free-
+form "summarize concisely" instruction (mirrors crush's template). On
+every compact AFTER the first, when `IterativeSummary=true` (default)
+and a `LastSummary` body is present (either stashed on the Compactor
+or extracted from a prior boundary message in the middle), the LLM is
+asked to UPDATE the prior summary with the new messages instead of
+re-summarizing from scratch (mirrors hermes-agent's
+`context_compressor.py` 2026-04 iterative mode). Priority on conflict
+between prior summary and new content: Active Task > Completed Actions
+> Resolved Questions.
+
+**Protected tool whitelist**. Snip / SnipAll / Microcompact skip
+`tool_result` blocks whose originating `tool_use` is in
+`Config.ProtectedTools` (default `memory_query`, `memory_recall`,
+`skill_help`, `Read`) — the model commonly re-cites these verbatim
+in later turns and a stale "[snipped: N chars]" marker would silently
+break recall (mirrors opencode's `PRUNE_PROTECTED_TOOLS = ["skill"]`).
+
+**Secrets redaction**. With `RedactSecrets=true` (default) the
+summarizer sees each summarized message text passed through a regex
+pass that replaces likely API keys / tokens / passwords with
+`[REDACTED]` BEFORE the LLM call. Idempotent; cheap. Matters because
+summary boundaries persist to disk (session JSONL) — a leaked key
+would otherwise bake into every future turn's prompt
+(mirrors hermes-agent's `_SECRET_PATTERNS`).
+
+**Summary retry + non-stream fallback**. `summarize()` retries the
+streaming request up to `MaxSummaryRetries` (default 2) with jittered
+backoff. If all streaming attempts fail (gateway proxies dropping SSE
+mid-stream is the canonical MiniMax 2013 failure mode), one final
+`Provider.Complete()` non-streaming attempt runs before bubbling the
+error to the circuit breaker. Same prompt content; just the transport
+swaps. Empty streamed output is treated as a soft failure so the
+retry loop has something to react to.
+
+**Token estimation regimes** (`estimateStringTokens`). Adaptive per
+content type — plain English / ASCII bills at chars / 4; mostly-CJK
+strings (≥50% Han / Hiragana / Katakana / Hangul) bill at 1 token per
+char (real provider tokenizer behaviour for CJK glyphs); JSON-heavy
+strings (≥20% braces / quotes / colons / commas) bill at chars / 2.5.
+Mirrors claude-code's `tokenEstimation.ts` file-type heuristic so
+i18n-heavy or JSON-payload-heavy turns aren't invisible to the
+threshold check.
 
 ## Scheduling & continuous execution
 

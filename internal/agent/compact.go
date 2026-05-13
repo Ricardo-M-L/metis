@@ -11,9 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -75,6 +79,57 @@ type Config struct {
 	// context into a single summary, leaving recent + initial
 	// messages intact.
 	CollapseFoldWindow int
+
+	// ProtectedTools is the set of tool names whose `tool_result`
+	// blocks Snip / SnipAll / Microcompact must NOT mutate. Mirrors
+	// opencode's PRUNE_PROTECTED_TOOLS and goalfymax's
+	// FRAMEWORK_RESERVED_ARGS — for tools whose output is itself a
+	// summary or a long-term reference the model later cites
+	// verbatim (memory recall, skill help, file reads the model is
+	// actively planning around), Snip-style "[snipped: N chars]"
+	// markers would silently erase the very evidence the model is
+	// supposed to anchor on. Match is case-insensitive on tool name.
+	// Empty disables the whitelist (legacy behaviour).
+	ProtectedTools []string
+
+	// RedactSecrets, when true, runs each summarized message
+	// through a regex pass that replaces likely API keys / tokens /
+	// passwords with `[REDACTED]` BEFORE the text is shipped to the
+	// summarizer LLM. Two reasons:
+	//
+	//  1. Summary boundaries get persisted to disk (session JSONL)
+	//     and replayed across reloads — leaking a key once would
+	//     bake it into every future turn's prompt.
+	//  2. Mirrors hermes-agent's `_SECRET_PATTERNS` scrub: the
+	//     summarizer otherwise has zero reason to know the
+	//     concrete key, it just needs to know "auth was set up".
+	//
+	// Default true; turn off only in tests or when caller has
+	// already redacted upstream.
+	RedactSecrets bool
+
+	// IterativeSummary, when true, makes Compact reuse the previous
+	// summary string (stored on Compactor.LastSummary) as the seed
+	// for the next summarize() call: the LLM is asked to UPDATE the
+	// prior summary with the new middle messages rather than
+	// re-summarize the whole history. Mirrors hermes-agent's
+	// context_compressor.py iterative mode (Active Task >
+	// Completed Actions > Resolved Questions priority).
+	//
+	// Default true. Turn off only when you specifically want a
+	// fresh take each Compact (debugging summarizer drift).
+	IterativeSummary bool
+
+	// MaxSummaryRetries is the number of additional streaming
+	// summarize() attempts after the first one fails. Each retry
+	// uses jittered backoff (50..200ms × attempt). After all
+	// streaming retries are exhausted, one last attempt is made
+	// via Provider.Complete() (non-streaming) before bubbling the
+	// error up to recordCompactResult.
+	//
+	// Default 2 → up to 3 streaming attempts + 1 non-streaming.
+	// Set to 0 to keep legacy "fail on first error" behaviour.
+	MaxSummaryRetries int
 }
 
 // DefaultConfig returns sensible defaults.
@@ -92,6 +147,19 @@ func DefaultCompactionConfig() Config {
 		// MicrocompactDir is intentionally empty here — runtime sets it
 		// per-session in setupRuntime so the cache lands under
 		// ~/.metis/cache/<sessionID>/.
+
+		// Protect long-term reference tools from Snip/Microcompact's
+		// "[snipped: N chars]" rewrite. memory_query / memory_recall:
+		// the model uses these for cross-session recall and frequently
+		// re-cites the exact strings later. skill_help: typically a
+		// short instruction sheet, shouldn't be dropped. Read: the
+		// model is often actively planning around the read body, and
+		// a stale "[snipped]" marker would force a redundant re-read
+		// of the same file on the next iteration.
+		ProtectedTools:    []string{"memory_query", "memory_recall", "skill_help", "Read"},
+		RedactSecrets:     true,
+		IterativeSummary:  true,
+		MaxSummaryRetries: 2,
 	}
 }
 
@@ -129,6 +197,18 @@ type Compactor struct {
 	// produce a usable summary (rate-limited, OOM, gateway proxy
 	// stripping responses) keeps re-trying every iteration.
 	consecutiveFailures int
+
+	// LastSummary holds the body of the most recent successful
+	// boundary summary (without the "[Earlier conversation
+	// summarized: ... ]" wrapper). When IterativeSummary=true the
+	// next Compact() call feeds this back to the summarizer as a
+	// seed so the LLM merges new middle messages into the running
+	// narrative instead of re-summarizing from scratch (mirrors
+	// hermes-agent context_compressor.py 2026-04 iterative mode).
+	//
+	// Cleared by ResetCircuit (which fires on /clear). Survives
+	// across Compact calls within a session.
+	LastSummary string
 }
 
 // MaxConsecutiveCompactFailures is the count after which the compactor
@@ -168,11 +248,33 @@ func NewCompactor(cfg Config, model string, maxCtx int, p llm.Provider) *Compact
 	return &Compactor{Config: cfg, Model: model, MaxContextTokens: maxCtx, Provider: p}
 }
 
+// MaxReservedForSummary caps how many tokens metis reserves for
+// the assistant's reply when computing effectiveInputCap. Pre-2026-
+// 05-13 metis subtracted the FULL configured max_tokens from the
+// context window — for users with max_tokens=64000, that ate 32%
+// of a 200k window before compaction math even started, and
+// auto-compact fired at ~54% of real window. claude-code caps
+// the reservation at 20k (based on their p99.99 compact-summary
+// output observation: services/compact/autoCompact.ts:30 → 20_000)
+// because the typical reply is far smaller than the configured max.
+//
+// Mirror that here. Users wanting the legacy behavior (no compact
+// before 0.85*(window-max_tokens)) can set
+// `METIS_COMPACT_RESERVE_FULL_MAX_TOKENS=1` in env.
+const MaxReservedForSummary = 20_000
+
 // effectiveInputCap returns the input-only budget the threshold should
-// be applied against. Equal to MaxContextTokens when MaxOutputTokens
-// is 0 (legacy / test path).
+// be applied against. By default reserves min(MaxOutputTokens, 20k)
+// for the assistant reply — the 20k cap stops a generous
+// max_tokens config from prematurely shrinking the compactor's
+// denominator. Equal to MaxContextTokens when MaxOutputTokens is 0
+// (legacy / test path).
 func (c *Compactor) effectiveInputCap() int {
-	cap := c.MaxContextTokens - c.MaxOutputTokens
+	reserved := c.MaxOutputTokens
+	if reserved > MaxReservedForSummary && os.Getenv("METIS_COMPACT_RESERVE_FULL_MAX_TOKENS") != "1" {
+		reserved = MaxReservedForSummary
+	}
+	cap := c.MaxContextTokens - reserved
 	if cap <= 0 {
 		return c.MaxContextTokens
 	}
@@ -258,7 +360,11 @@ func (c *Compactor) CollapseMiddle(ctx context.Context, messages []llm.Message) 
 	middle := messages[c.ProtectFirst:end]
 	keepLater := messages[end:]
 
-	summary, err := c.summarize(ctx, middle)
+	// Collapse runs cold (no priorSummary seed) by design: it folds
+	// EARLY-conversation context, not the running narrative, so an
+	// iterative merge with c.LastSummary (which describes the
+	// recent middle) would conflate two different scopes.
+	summary, err := c.summarize(ctx, middle, "")
 	if err != nil {
 		c.recordCompactResult(false, err)
 		return nil, err
@@ -325,6 +431,8 @@ func (c *Compactor) Microcompact(messages []llm.Message) []llm.Message {
 	if err := os.MkdirAll(c.MicrocompactDir, 0o700); err != nil {
 		return messages // can't write cache → skip silently
 	}
+	idToName := toolNameByID(messages)
+	protected := protectedSet(c.ProtectedTools)
 	out := make([]llm.Message, len(messages))
 	copy(out, messages)
 	for i := c.ProtectFirst; i < cut; i++ {
@@ -337,6 +445,15 @@ func (c *Compactor) Microcompact(messages []llm.Message) []llm.Message {
 				continue
 			}
 			if len(b.ToolResult) < c.MicrocompactMinChars {
+				continue
+			}
+			// Microcompact swaps the inline content for a "[output
+			// cached at PATH]" stub — recoverable via Read, but only
+			// if the model thinks to re-fetch it. For protected
+			// tools (memory recall etc) the model usually doesn't
+			// re-Read; the value is anchored in the next turn's
+			// reasoning. Skip them.
+			if isProtectedToolResult(b.ToolUseID, idToName, protected) {
 				continue
 			}
 			id := b.ToolUseID
@@ -385,6 +502,8 @@ func (c *Compactor) Snip(messages []llm.Message) []llm.Message {
 	if cut <= c.ProtectFirst {
 		return messages // tail covers everything; nothing safe to snip
 	}
+	idToName := toolNameByID(messages)
+	protected := protectedSet(c.ProtectedTools)
 	out := make([]llm.Message, len(messages))
 	copy(out, messages)
 
@@ -411,6 +530,14 @@ func (c *Compactor) Snip(messages []llm.Message) []llm.Message {
 			// 1500 → 230 → 228 → 226 …). Skip when the marker is
 			// present.
 			if strings.Contains(b.ToolResult, "[snipped:") {
+				continue
+			}
+			// Protected-tool whitelist: tool_results from tools like
+			// memory_query / skill_help / Read are evidence the model
+			// later cites; replacing them with "[snipped: N chars]"
+			// silently breaks recall. Look up the matching tool_use
+			// name by ID and skip when it's in ProtectedTools.
+			if isProtectedToolResult(b.ToolUseID, idToName, protected) {
 				continue
 			}
 			// Keep the first chunk (typically a "Found N matches" or
@@ -494,6 +621,8 @@ func (c *Compactor) SnipAll(messages []llm.Message) []llm.Message {
 	if c.SnipMaxToolResultChars <= 0 {
 		return messages
 	}
+	idToName := toolNameByID(messages)
+	protected := protectedSet(c.ProtectedTools)
 	out := make([]llm.Message, len(messages))
 	copy(out, messages)
 	for i := c.ProtectFirst; i < len(out); i++ {
@@ -509,6 +638,16 @@ func (c *Compactor) SnipAll(messages []llm.Message) []llm.Message {
 				continue
 			}
 			if strings.Contains(b.ToolResult, "[snipped:") {
+				continue
+			}
+			// SnipAll runs as a last-ditch overflow rescue, so it's
+			// MORE aggressive than Snip (touches the protected tail
+			// too). It still respects ProtectedTools though — losing
+			// a memory_query result during a panic rescue causes
+			// permanent recall failure even if the bounce was
+			// resolved, so the protection is structural not
+			// performance.
+			if isProtectedToolResult(b.ToolUseID, idToName, protected) {
 				continue
 			}
 			head := b.ToolResult[:c.SnipMaxToolResultChars]
@@ -533,9 +672,12 @@ func (c *Compactor) CircuitTripped() bool {
 
 // ResetCircuit zeroes the failure counter so the next ShouldCompact +
 // Compact attempt is allowed. Wire this up to /clear and to any
-// explicit "retry compaction" command.
+// explicit "retry compaction" command. Also drops LastSummary so the
+// next compaction starts cold rather than merging into a summary that
+// the user just explicitly asked to throw away.
 func (c *Compactor) ResetCircuit() {
 	c.consecutiveFailures = 0
+	c.LastSummary = ""
 }
 
 // recordCompactResult updates the failure counter. Called from Compact()
@@ -614,11 +756,26 @@ func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.
 	middle := messages[c.ProtectFirst:cut]
 	keepLast := messages[cut:]
 
-	summary, err := c.summarize(ctx, middle)
+	// Iterative mode: when middle[0] is the boundary message from a
+	// PREVIOUS Compact (recognized by "[Earlier conversation
+	// summarized: ... ]"), peel it off and seed summarize() with its
+	// body so the LLM updates the running narrative instead of
+	// re-summarizing from scratch. Falls through to non-iterative
+	// when no prior summary exists in middle (first-time compact).
+	priorSummary := c.LastSummary
+	if len(middle) > 0 {
+		if body, ok := extractPriorSummary(middle[0]); ok {
+			priorSummary = body
+			middle = middle[1:]
+		}
+	}
+
+	summary, err := c.summarize(ctx, middle, priorSummary)
 	if err != nil {
 		c.recordCompactResult(false, err)
 		return nil, err
 	}
+	c.LastSummary = summary
 
 	// Boundary messages must use user / assistant role — Anthropic and
 	// most compat gateways (notably MiniMax) reject `system` role
@@ -690,6 +847,55 @@ func messageHasToolResult(m llm.Message) bool {
 	return false
 }
 
+// toolNameByID builds an index from tool_use_id → tool name across all
+// messages. Used by Snip / SnipAll / Microcompact to look up a
+// tool_result's originating tool (the `tool_result` block itself only
+// carries the ID; the name lives on the matching `tool_use` block).
+// Returns empty map when no tool_use blocks are present.
+func toolNameByID(messages []llm.Message) map[string]string {
+	out := make(map[string]string)
+	for _, m := range messages {
+		for _, b := range m.Content {
+			if b.Type == "tool_use" && b.ToolUseID != "" && b.ToolName != "" {
+				out[b.ToolUseID] = b.ToolName
+			}
+		}
+	}
+	return out
+}
+
+// protectedSet builds a case-insensitive set from the configured
+// ProtectedTools slice. Centralizing the casefold so the caller can
+// pass tool names verbatim in config (`Read`, `memory_query`) without
+// worrying about how a particular provider's adapter normalizes them.
+func protectedSet(names []string) map[string]struct{} {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		out[strings.ToLower(n)] = struct{}{}
+	}
+	return out
+}
+
+// isProtectedToolResult reports whether the tool_result identified by
+// `id` came from a tool in the protected set. Returns false when the
+// set is empty (legacy / disabled) or the matching tool_use isn't
+// found (defensive: protecting a stranded tool_result by name we
+// can't resolve would silently un-snip random blocks).
+func isProtectedToolResult(id string, idToName map[string]string, protected map[string]struct{}) bool {
+	if len(protected) == 0 || id == "" {
+		return false
+	}
+	name, ok := idToName[id]
+	if !ok {
+		return false
+	}
+	_, prot := protected[strings.ToLower(name)]
+	return prot
+}
+
 // sliceHasUserText reports whether at least one message in `slice` is
 // USER-role AND carries a non-empty text block (not just tool_result
 // echoes). Used by Compact's anchor logic to decide whether the natural
@@ -740,33 +946,240 @@ func lastUserTextBefore(messages []llm.Message, before int) int {
 	return -1
 }
 
-func (c *Compactor) summarize(ctx context.Context, messages []llm.Message) (string, error) {
-	// Build a summary prompt
+// SummarySystemPromptInitial is the system instruction the summarizer
+// LLM sees on a FRESH compact (no prior summary to merge). The 5-section
+// structure mirrors crush's internal/agent/templates/summary.md and is
+// strong enough to survive across providers (Anthropic / GLM / Kimi /
+// DeepSeek all handle markdown sections well; raw "summarize concisely"
+// without structure tends to collapse to a single paragraph the model
+// then mis-reads as "small talk recap").
+const SummarySystemPromptInitial = `You are summarizing an agent conversation so it can be folded into a context-window boundary. The summary is the ONLY context the agent will have for what happened before this point — be specific, not glossy.
+
+Output the summary as concise Markdown with these five sections in order. Omit a section only if it is genuinely empty.
+
+## Current State
+- Exact user request (verbatim if short, paraphrased if long, but include the actual ask)
+- What's done / in progress / blocked
+- What remains, with concrete next-step granularity
+
+## Files & Changes
+- Files written/edited (path + one-line purpose)
+- Files read for context (path + why)
+- Key code locations the agent is anchored on (file:line)
+
+## Technical Context
+- Architecture / pattern decisions and the reason
+- Libraries, commands, environment details that worked or failed (exact form)
+- Constants, IDs, paths, error messages worth preserving
+
+## Strategy & Approach
+- Overall approach and why it was chosen
+- Known gotchas, assumptions, blockers
+- Branches considered and rejected (so the agent doesn't re-explore)
+
+## Exact Next Steps
+- Numbered, imperative, concrete (e.g. "Add JWT middleware to src/middleware/auth.js:15")
+- Include exact commands or test invocations the agent should run
+
+Tone: briefing a teammate who just walked in cold. No emojis. No filler. No "the user wanted to know about X" framing — write what the actual answer was. Err on too much specificity rather than too little.`
+
+// SummarySystemPromptMerge is the system instruction used when a prior
+// summary already exists (iterative mode, hermes-agent style). The LLM
+// is asked to UPDATE the existing summary with new middle messages
+// rather than re-summarize from scratch. Priority on conflict:
+//
+//	Active Task > Completed Actions > Resolved Questions.
+const SummarySystemPromptMerge = `You are UPDATING an existing conversation summary with new messages that have happened since the last summary. The previous summary will be shown to you; treat it as authoritative for everything that came before, and integrate the new messages into the same five-section structure.
+
+Output the updated summary as concise Markdown using these sections:
+
+## Current State
+## Files & Changes
+## Technical Context
+## Strategy & Approach
+## Exact Next Steps
+
+Rules:
+1. Promote items that have changed status (e.g. an Exact Next Step that's now Done moves to Current State as "completed: ...")
+2. When new messages contradict the prior summary, the new messages win
+3. When prior summary and new messages are about different things, KEEP BOTH — do not drop prior content just to make room
+4. Drop trivia that has been clearly superseded; keep concrete file paths, IDs, error messages, exact commands
+5. Priority on conflict: Active Task > Completed Actions > Resolved Questions
+
+Tone: briefing a teammate cold. No emojis. No filler.`
+
+// secretPatterns is the redaction regex set applied to message text
+// before it's shipped to the summarizer. Order matters: longer / more
+// specific patterns first so a generic "token: xxx" doesn't pre-empt
+// "github_pat_xxx". Conservative — false positives are cheap (the
+// summary just reads "[REDACTED]" instead of the real value); false
+// negatives are not (a real key bakes into every future turn).
+var secretPatterns = []*regexp.Regexp{
+	// Anthropic / OpenAI / Stripe style: sk-... 24+ chars
+	regexp.MustCompile(`sk[-_][A-Za-z0-9_\-]{20,}`),
+	// GitHub PAT / fine-grained / OAuth
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{20,}`),
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
+	// AWS access key ID
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	// JWT-ish triple-segment base64url
+	regexp.MustCompile(`eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+`),
+	// Generic "key: VALUE" / "token: VALUE" with hex/base64 value (≥16)
+	regexp.MustCompile(`(?i)(api[_\-]?key|access[_\-]?token|secret[_\-]?key|password|bearer)\s*[:=]\s*['"]?([A-Za-z0-9_\-+/=]{16,})['"]?`),
+}
+
+// redactSecrets returns s with likely API keys / tokens / passwords
+// replaced by `[REDACTED]`. Defensive; cheap to run. Idempotent — a
+// string that's already had [REDACTED] inserted produces the same
+// output.
+func redactSecrets(s string) string {
+	if s == "" {
+		return s
+	}
+	for i, re := range secretPatterns {
+		// The final pattern has two capture groups (key + value); keep
+		// the key name in the output so the model still sees "api_key:
+		// [REDACTED]" rather than just "[REDACTED]" floating alone.
+		if i == len(secretPatterns)-1 {
+			s = re.ReplaceAllString(s, "${1}: [REDACTED]")
+		} else {
+			s = re.ReplaceAllString(s, "[REDACTED]")
+		}
+	}
+	return s
+}
+
+// summarize is the streaming-with-retry-with-non-stream-fallback path
+// used by Compact. Returns a single string (the summary body); the
+// caller wraps it in the boundary message.
+//
+// When IterativeSummary=true AND priorSummary != "", the LLM is asked
+// to update the prior summary with the new middle messages; otherwise
+// it summarizes from scratch with the 5-section template.
+//
+// Redaction (RedactSecrets=true) runs on each per-message text body
+// just before it joins the prompt. Long messages are NOT individually
+// length-capped here — the broader compaction tiering already snipped
+// or microcompacted oversized tool_results before Compact called us.
+//
+// Retry policy: streaming attempts 1..(1+MaxSummaryRetries) with
+// jittered backoff between them, then ONE non-streaming Complete()
+// attempt as a last resort. The non-stream fallback exists because
+// the most common streaming failure mode metis sees is "SSE channel
+// drops mid-summary" (gateway proxies, MiniMax 2013-on-stream); a
+// plain Complete request reliably gets through when the same prompt
+// would have failed streaming.
+func (c *Compactor) summarize(ctx context.Context, messages []llm.Message, priorSummary string) (string, error) {
+	useIterative := c.IterativeSummary && strings.TrimSpace(priorSummary) != ""
+
+	system := SummarySystemPromptInitial
+	if useIterative {
+		system = SummarySystemPromptMerge
+	}
+
 	var b strings.Builder
-	b.WriteString("Summarize the following conversation concisely (max ")
-	b.WriteString(fmt.Sprintf("%d words", c.MaxSummaryTokens/2))
-	b.WriteString("). Focus on: key decisions, facts, and any pending tasks.\n\n")
+	if useIterative {
+		b.WriteString("Previous summary (authoritative for everything before the new messages):\n\n")
+		b.WriteString(maybeRedact(priorSummary, c.RedactSecrets))
+		b.WriteString("\n\n---\n\nNew messages since that summary:\n\n")
+	} else {
+		b.WriteString("Conversation transcript to summarize:\n\n")
+	}
 	for _, m := range messages {
 		role := strings.ToUpper(string(m.Role))
-		for _, c := range m.Content {
-			if c.Type == "text" && c.Text != "" {
-				b.WriteString(role + ": " + c.Text + "\n")
+		for _, blk := range m.Content {
+			switch blk.Type {
+			case "text":
+				if blk.Text == "" {
+					continue
+				}
+				b.WriteString(role + ": " + maybeRedact(blk.Text, c.RedactSecrets) + "\n")
+			case "tool_use":
+				b.WriteString(role + " tool_use(" + blk.ToolName + ")\n")
+			case "tool_result":
+				// Include a TRIMMED tool_result peek (first 400 chars)
+				// — the summarizer needs to know what the tools
+				// returned to write a useful Files & Changes section,
+				// but doesn't need the full 5KB. Snip / microcompact
+				// already shortened older results; this peek is
+				// belt-and-braces for any that slipped through.
+				peek := blk.ToolResult
+				if len(peek) > 400 {
+					peek = peek[:400] + "...[truncated for summary]"
+				}
+				if peek != "" {
+					b.WriteString(role + " tool_result: " + maybeRedact(peek, c.RedactSecrets) + "\n")
+				}
 			}
 		}
 	}
-	b.WriteString("\nSummary:")
+	if useIterative {
+		b.WriteString("\nUpdated summary:")
+	} else {
+		b.WriteString("\nSummary:")
+	}
+
 	req := llm.Request{
 		Model:     c.Model,
-		System:    "You summarize conversations concisely.",
+		System:    system,
 		Messages:  []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: b.String()}}}},
 		MaxTokens: c.MaxSummaryTokens,
 	}
-	// Stream the summary so the request profile matches the rest of the
-	// turn loop (no synchronous Complete pause that the user feels as
-	// "stuck"). The caller still ends up with a single string — we just
-	// concat the deltas. If the provider's streaming path errors out we
-	// don't fall back to Complete: rare enough, and a single Complete
-	// call would re-introduce the very behaviour we're trying to remove.
+
+	maxRetries := c.MaxSummaryRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Jittered backoff: 50..200ms × attempt. Cheap by
+			// design — we're not waiting on rate limits, just
+			// giving a flaky gateway a moment to recover.
+			d := time.Duration(50+rand.Intn(150)) * time.Millisecond * time.Duration(attempt)
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		out, err := c.summarizeOnce(ctx, req)
+		if err == nil && strings.TrimSpace(out) != "" {
+			return out, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+
+	// Final fallback: non-streaming Complete(). This handles the
+	// common "streaming drops half-way but a one-shot request would
+	// succeed" pattern observed against MiniMax + flaky reverse
+	// proxies.
+	resp, err := c.Provider.Complete(ctx, req)
+	if err != nil {
+		if lastErr != nil {
+			return "", fmt.Errorf("summarize: stream+complete both failed: stream=%w complete=%v", lastErr, err)
+		}
+		return "", err
+	}
+	for _, blk := range resp.Content {
+		if blk.Type == "text" && strings.TrimSpace(blk.Text) != "" {
+			return strings.TrimSpace(blk.Text), nil
+		}
+	}
+	if lastErr != nil {
+		return "", fmt.Errorf("summarize: empty fallback response (prior stream err: %v)", lastErr)
+	}
+	return "", errors.New("summarize: empty response from both stream and Complete fallback")
+}
+
+// summarizeOnce runs a single streaming attempt against the provider
+// and returns either a non-empty trimmed summary or an error. Empty
+// streamed output is treated as a soft failure so the retry loop has
+// something to react to.
+func (c *Compactor) summarizeOnce(ctx context.Context, req llm.Request) (string, error) {
 	stream, err := c.Provider.Stream(ctx, req)
 	if err != nil {
 		return "", err
@@ -795,13 +1208,61 @@ func (c *Compactor) summarize(ctx context.Context, messages []llm.Message) (stri
 	return strings.TrimSpace(out.String()), nil
 }
 
-// estimateTokens is a rough token estimator (4 chars ≈ 1 token for English).
+// maybeRedact applies redactSecrets only when the gate is on.
+// Splitting this out keeps the per-message loop readable and lets
+// tests pin the redaction-OFF path without rebuilding the regex set.
+func maybeRedact(s string, on bool) string {
+	if !on {
+		return s
+	}
+	return redactSecrets(s)
+}
+
+// extractPriorSummary returns (body, true) when m is the boundary
+// summary message produced by a previous Compact (recognized by the
+// "[Earlier conversation summarized: ... ]" wrapper). Used by Compact
+// to peel off the prior summary BEFORE passing the new middle to
+// summarize() — so the LLM doesn't see "Earlier conversation
+// summarized: [body]" as a regular message in addition to receiving
+// body via the iterative seed.
+func extractPriorSummary(m llm.Message) (string, bool) {
+	if m.Role != llm.RoleAssistant {
+		return "", false
+	}
+	for _, b := range m.Content {
+		if b.Type != "text" {
+			continue
+		}
+		const prefix = "[Earlier conversation summarized: "
+		const suffix = "]"
+		t := b.Text
+		if !strings.HasPrefix(t, prefix) || !strings.HasSuffix(t, suffix) {
+			continue
+		}
+		body := strings.TrimSuffix(strings.TrimPrefix(t, prefix), suffix)
+		return body, true
+	}
+	return "", false
+}
+
+// estimateTokens is a rough token estimator.
 //
 // Counts everything that gets serialized to the wire: text bodies, tool_use
 // inputs (the JSON arg blob), and tool_result content. Earlier the estimator
 // only summed Text — which left tool-heavy turns invisible to ShouldCompact
 // and let the budget overflow before compaction fired. The user hit
 // "context window exceeds limit (2013)" because of this gap.
+//
+// Adaptive per-string ratio (file-aware + CJK-aware, mirrors
+// claude-code's tokenEstimation.ts file-type heuristic):
+//
+//   - Plain English / mostly ASCII text:   chars / 4   (~ 4 chars per token)
+//   - Mostly CJK (中文 / 日本 / 한글):       chars / 1   (1 token per char)
+//   - JSON-heavy (>=20% braces/quotes):    chars / 2.5 (denser)
+//
+// Single-pass scanner per string so the per-block hot path stays cheap.
+// All ratios round to integers — sub-token-per-char fractions are below
+// the noise floor for context-window thresholds.
 func estimateTokens(messages []llm.Message) int {
 	total := 0
 	for _, m := range messages {
@@ -809,8 +1270,10 @@ func estimateTokens(messages []llm.Message) int {
 		for _, c := range m.Content {
 			// Per-block JSON envelope: {"type":"...",...} ~ 8 tokens.
 			total += 8
-			total += len(c.Text) / 4
-			total += len(c.ToolResult) / 4
+			total += estimateStringTokens(c.Text)
+			total += estimateStringTokens(c.ToolResult)
+			// ToolName / ToolUseID are short identifiers; ASCII
+			// chars/4 is fine.
 			total += len(c.ToolName) / 4
 			total += len(c.ToolUseID) / 4
 			// Tool input — count the keys + naive value lengths.
@@ -821,6 +1284,50 @@ func estimateTokens(messages []llm.Message) int {
 		}
 	}
 	return total
+}
+
+// estimateStringTokens returns a content-aware token estimate for a
+// single string. Splits into three regimes:
+//
+//	CJK-dominant (≥50% CJK runes):    1 token per char
+//	JSON-dominant (≥20% {}",: chars): 1 token per ~2.5 chars
+//	default ASCII-ish text:           1 token per 4 chars
+//
+// Returns 0 for empty input. Cost is O(len(s)) one-pass — counts
+// the three regime indicators in the same loop instead of three
+// separate scans.
+func estimateStringTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	var cjk, json, total int
+	for _, r := range s {
+		total++
+		switch {
+		case unicode.Is(unicode.Han, r), unicode.Is(unicode.Hiragana, r),
+			unicode.Is(unicode.Katakana, r), unicode.Is(unicode.Hangul, r):
+			cjk++
+		case r == '{', r == '}', r == '[', r == ']', r == '"', r == ':', r == ',':
+			json++
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	// CJK wins first — CJK + JSON braces around them (e.g. an i18n
+	// translation file) should still bill CJK rates because CJK is
+	// where the token density is.
+	if cjk*2 >= total {
+		// 1 token per char. byte-length / rune-count is irrelevant
+		// here; provider tokenizers bill per CJK glyph.
+		return cjk + (total-cjk)/4
+	}
+	if json*5 >= total {
+		// 2.5 chars/token → multiply by 2 / divide by 5 keeps it
+		// integer-only without floating-point.
+		return (total * 2) / 5
+	}
+	return total / 4
 }
 
 // approxValueLen returns a rough byte-length for a JSON value without
