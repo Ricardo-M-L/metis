@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -154,6 +156,22 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		loop.Memory = opts.MemoryManager
 	} else if mm := BuildMemoryManager(cfg); mm != nil {
 		loop.Memory = mm
+	}
+
+	// Per-turn auto retrieval (METIS_AUTO_RETRIEVE=K). Off by default;
+	// users opt in via env. Bound the value: invalid / negative / >50
+	// silently clamp to a safe range so a typo doesn't pull 1000
+	// passages into every system prompt.
+	if v := os.Getenv("METIS_AUTO_RETRIEVE"); v != "" {
+		if k, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && k > 0 {
+			if k > 50 {
+				k = 50
+			}
+			loop.AutoRetrieveK = k
+			if os.Getenv("METIS_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "metis: auto-retrieve enabled (top-%d archival passages per turn)\n", k)
+			}
+		}
 	}
 
 	// Lazy MCP tool schemas (ToolSearch). Mode is read from the

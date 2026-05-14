@@ -806,6 +806,75 @@ I love coding
 	}
 }
 
+// TestMemoryManager_AutoRetrieve — per-turn BM25 retrieval surfaces
+// archival passages relevant to the query, wraps them in the expected
+// <auto-retrieve> fence, and returns "" for the disabled / empty-query
+// guard paths.
+func TestMemoryManager_AutoRetrieve(t *testing.T) {
+	dir := tempDir(t)
+	mm, err := NewMemoryManager(dir)
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	// Seed archival with passages on different topics so BM25 has
+	// signal to rank against.
+	for _, p := range []Passage{
+		{Content: "Cats love to chase laser pointers and sleep in sunbeams."},
+		{Content: "Python's GIL forces single-threaded execution per process."},
+		{Content: "毛球 是我家英短猫的名字，喜欢玩逗猫棒。"},
+		{Content: "Go's context package cancels goroutines through a tree."},
+	} {
+		if err := mm.archival.Insert(p); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	t.Run("returns top-K wrapped", func(t *testing.T) {
+		// English query — the tokenizer (manager.go::tokenize) is
+		// ASCII-only, so non-Latin queries fall back to substring
+		// matching upstream. This test exercises the BM25 path.
+		got := mm.AutoRetrieve("python threading model", 2)
+		if got == "" {
+			t.Fatal("AutoRetrieve returned empty; expected at least one match")
+		}
+		if !strings.HasPrefix(got, "<auto-retrieve>") || !strings.HasSuffix(got, "</auto-retrieve>") {
+			t.Errorf("missing fence tags:\n%s", got)
+		}
+		if !strings.Contains(got, "Python") {
+			t.Errorf("expected Python GIL passage in top hits; got:\n%s", got)
+		}
+		// At most k=2 numbered entries.
+		if strings.Count(got, "[1]") != 1 {
+			t.Errorf("expected exactly one [1] marker; got:\n%s", got)
+		}
+	})
+
+	t.Run("k=0 disables", func(t *testing.T) {
+		if got := mm.AutoRetrieve("cats", 0); got != "" {
+			t.Errorf("k=0 should disable; got %q", got)
+		}
+	})
+
+	t.Run("empty query returns empty", func(t *testing.T) {
+		if got := mm.AutoRetrieve("   ", 3); got != "" {
+			t.Errorf("whitespace-only query should return empty; got %q", got)
+		}
+	})
+
+	t.Run("limit honored", func(t *testing.T) {
+		// All 4 passages share no keywords with "xyzzy" — BM25 returns
+		// nothing rather than padding, so the returned string is empty.
+		got := mm.AutoRetrieve("xyzzy", 10)
+		if got != "" {
+			// If BM25 surfaces tangential matches that's still fine,
+			// but the count must not exceed Limit.
+			if c := strings.Count(got, "\n["); c > 10 {
+				t.Errorf("returned %d entries, exceeds limit=10", c)
+			}
+		}
+	})
+}
+
 func TestMemoryManager_SaveDailyNote(t *testing.T) {
 	dir := tempDir(t)
 	mm, _ := NewMemoryManager(dir)

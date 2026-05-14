@@ -53,6 +53,17 @@ type Loop struct {
 	// When set, BuildContext() is called to inject memory into each request.
 	Memory *memory.MemoryManager
 
+	// AutoRetrieveK > 0 enables per-turn BM25 retrieval from archival
+	// memory: buildRequest looks up the most recent user message, ranks
+	// archival passages by relevance, and appends the top-K as their
+	// own <auto-retrieve> system section. Mirrors claude-code's
+	// findRelevantMemories pattern, minus the LLM-ranking sub-call
+	// (we use local BM25 — cheap, deterministic, no extra spend).
+	//
+	// 0 = disabled (default). Typical opt-in is METIS_AUTO_RETRIEVE=5
+	// via runtime.BuildAgentLoop's env override.
+	AutoRetrieveK int
+
 	// PlanMode: collect tool calls but do NOT execute; emit as EventPlan.
 	PlanMode bool
 
@@ -760,8 +771,16 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 	if l.Memory != nil {
 		memBody = l.Memory.BuildContext()
 	}
+	// Per-turn auto retrieval: BM25 the latest user message against
+	// archival and append the top-K passages as their own section.
+	// Off by default (AutoRetrieveK == 0); typically toggled via
+	// METIS_AUTO_RETRIEVE=K at runtime.BuildAgentLoop wiring time.
+	var retrieveBody string
+	if l.Memory != nil && l.AutoRetrieveK > 0 {
+		retrieveBody = l.Memory.AutoRetrieve(lastUserTextLocked(l.Messages), l.AutoRetrieveK)
+	}
 	if len(l.SystemSections) > 0 {
-		sections = make([]llm.SystemSection, 0, len(l.SystemSections)+1)
+		sections = make([]llm.SystemSection, 0, len(l.SystemSections)+2)
 		sections = append(sections, l.SystemSections...)
 		if memBody != "" {
 			sections = append(sections, llm.SystemSection{
@@ -771,12 +790,24 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 				Volatile: true,
 			})
 		}
-	} else if memBody != "" {
-		// Legacy (string-only) path: append memory the old way so the
-		// boundary-marker parser still produces [base (cached), rest].
-		// Cache for `rest` is lost (memory is in there), but at least
-		// the base prefix still hits.
-		system = system + "\n\n" + memBody
+		if retrieveBody != "" {
+			sections = append(sections, llm.SystemSection{
+				Name:     "auto-retrieve",
+				Body:     retrieveBody,
+				Cache:    false,
+				Volatile: true,
+			})
+		}
+	} else if memBody != "" || retrieveBody != "" {
+		// Legacy (string-only) path: append both bodies the old way so
+		// the boundary-marker parser still produces [base (cached),
+		// rest]. Cache for `rest` is lost but the base prefix still hits.
+		if memBody != "" {
+			system = system + "\n\n" + memBody
+		}
+		if retrieveBody != "" {
+			system = system + "\n\n" + retrieveBody
+		}
 	}
 	req := llm.Request{
 		Model:          l.Model,
@@ -859,6 +890,27 @@ func (l *Loop) lastExchange() (userMsg, asstMsg string) {
 		}
 	}
 	return
+}
+
+// lastUserTextLocked returns the most recent user-role message text.
+// Caller must already hold l.mu — used by buildRequest which holds
+// the lock for the whole request-assembly window. Tool_result content
+// blocks are skipped: a turn that injected tool results as the user
+// "message" doesn't represent a fresh user query, and querying
+// archival with raw tool output would dilute relevance.
+func lastUserTextLocked(messages []llm.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Role != llm.RoleUser {
+			continue
+		}
+		t := textOf(m)
+		if t == "" {
+			continue
+		}
+		return t
+	}
+	return ""
 }
 
 // textOf concatenates all text-type ContentBlocks in a message,

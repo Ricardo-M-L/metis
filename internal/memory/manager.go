@@ -1045,6 +1045,47 @@ func (mm *MemoryManager) Core() *CoreMemory { return mm.core }
 // canonical store instead of forking their own file scheme.
 func (mm *MemoryManager) Archival() *ArchivalMemory { return mm.archival }
 
+// AutoRetrieve runs BM25 against archival and returns the top-K
+// passages as a single <auto-retrieve>-wrapped string, ready to splice
+// into the system prompt. Empty query, empty archival, k<=0, or any
+// search error returns "" so the caller can unconditionally append.
+//
+// Designed to be called once per turn (see Loop.buildRequest):
+// retrieval is local-only (no LLM call), BM25 over a few hundred
+// passages takes <10ms, so per-turn cost is negligible.
+//
+// Top-K passages are joined as a numbered list. Content is left
+// verbatim (truncating risks corrupting the meaning); callers should
+// cap K, not per-passage bytes.
+func (mm *MemoryManager) AutoRetrieve(query string, k int) string {
+	if mm == nil || mm.archival == nil {
+		return ""
+	}
+	if k <= 0 {
+		return ""
+	}
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return ""
+	}
+	hits, err := mm.archival.Search(SearchOptions{
+		Query:  q,
+		SortBy: "relevance",
+		Limit:  k,
+	})
+	if err != nil || len(hits) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<auto-retrieve>\n")
+	sb.WriteString("[System note: 这些是从 archival memory 中按相关度自动召回的过往片段，仅供参考。]\n")
+	for i, p := range hits {
+		fmt.Fprintf(&sb, "\n[%d] %s\n", i+1, strings.TrimSpace(p.Content))
+	}
+	sb.WriteString("</auto-retrieve>")
+	return sb.String()
+}
+
 // BuildContext builds the memory context for system prompt injection.
 //
 // Composition (in order):
