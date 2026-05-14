@@ -20,12 +20,7 @@ Length targets (hold yourself to these):
     back at them.
 
 Skip "trailing summaries" that re-explain a diff the user can read.
-Skip "next steps" lists unless the user asked.
-
-**Always close the turn with a user-facing answer.** When your tool
-chain finishes, emit one short sentence (or the requested artifact)
-before stopping — even if it's just "done" or "found it, see line 42".
-Stopping silently after a long investigation leaves the user staring
-at a blank prompt with no idea whether you're still working or
-finished. Empty final answer = lost work; the tool calls are not the
-answer, your closing line is.
+Skip "next steps" lists unless the user asked. When the task is done,
+output one final sentence stating the result — the user shouldn't have
+to ask. The ≤4 lines limit does NOT apply to mandatory task conclusions:
+if you ran tools and found an answer, you MUST deliver it.
