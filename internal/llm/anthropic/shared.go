@@ -46,8 +46,14 @@ func ToRequest(req Request, model string, maxTokens int) Req {
 // ToRequestWithFlags is the variant that respects per-provider
 // anti-distillation toggles. Vertex/Bedrock don't currently use the
 // distillation flags but we expose the function symmetrically.
+//
+// Vertex/Bedrock paths never hit the MiniMax `/anthropic` gateway, so
+// the schema-placeholder injection is hard-coded off here. Direct
+// Anthropic provider callers go through anthropic.go's Complete/Stream
+// which compute the flag from a.BaseURL — that's where MiniMax detection
+// actually matters.
 func ToRequestWithFlags(req Request, model string, maxTokens int, antiDistill, clientDecoys bool) Req {
-	return toAnthropicWithFlags(req, model, maxTokens, antiDistill, clientDecoys)
+	return toAnthropicWithFlags(req, model, maxTokens, antiDistill, clientDecoys, false)
 }
 
 // FromResponse converts Anthropic's response envelope into the

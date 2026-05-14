@@ -297,7 +297,7 @@ func TestToAnthropic_AntiDistillationOptInIsTopLevelField(t *testing.T) {
 			{Name: "Bash", Description: "run shell", InputSchema: map[string]any{}},
 		},
 	}
-	out := toAnthropicWithFlags(req, "test-model", 1024, true, false)
+	out := toAnthropicWithFlags(req, "test-model", 1024, true, false, false)
 
 	// Top-level field set to exactly ["fake_tools"] — matches CC bytes.
 	if len(out.AntiDistillation) != 1 || out.AntiDistillation[0] != "fake_tools" {
@@ -329,7 +329,7 @@ func TestToAnthropic_AntiDistillationOff(t *testing.T) {
 			{Name: "Read", Description: "read file", InputSchema: map[string]any{}},
 		},
 	}
-	out := toAnthropicWithFlags(req, "test-model", 1024, false, false)
+	out := toAnthropicWithFlags(req, "test-model", 1024, false, false, false)
 	if out.AntiDistillation != nil {
 		t.Errorf("flag off → AntiDistillation must be nil so omitempty drops the JSON field; got %+v", out.AntiDistillation)
 	}
@@ -348,13 +348,13 @@ func TestToAnthropic_AntiDistillationJSONWireFormat(t *testing.T) {
 		Tools:    []ToolSpec{{Name: "Read", Description: "r", InputSchema: map[string]any{}}},
 		Messages: []Message{{Role: RoleUser, Content: []ContentBlock{{Type: "text", Text: "hi"}}}},
 	}
-	on := toAnthropicWithFlags(req, "m", 100, true, false)
+	on := toAnthropicWithFlags(req, "m", 100, true, false, false)
 	rawOn, _ := json.Marshal(on)
 	if !strings.Contains(string(rawOn), `"anti_distillation":["fake_tools"]`) {
 		t.Errorf("on-path JSON missing anti_distillation field; got:\n%s", rawOn)
 	}
 
-	off := toAnthropicWithFlags(req, "m", 100, false, false)
+	off := toAnthropicWithFlags(req, "m", 100, false, false, false)
 	rawOff, _ := json.Marshal(off)
 	if strings.Contains(string(rawOff), "anti_distillation") {
 		t.Errorf("off-path JSON should NOT contain anti_distillation; got:\n%s", rawOff)
@@ -377,8 +377,8 @@ func TestToAnthropic_ClientSideDecoys_FieldOnWireToolsArrayUntouched(t *testing.
 			{Name: "Bash", Description: "run shell", InputSchema: map[string]any{"type": "object"}},
 		},
 	}
-	off := toAnthropicWithFlags(req, "m", 100, false, false)
-	on := toAnthropicWithFlags(req, "m", 100, false, true)
+	off := toAnthropicWithFlags(req, "m", 100, false, false, false)
+	on := toAnthropicWithFlags(req, "m", 100, false, true, false)
 
 	// Real tools[] must be identical between off/on (model sees only this).
 	if len(on.Tools) != len(off.Tools) {
@@ -419,7 +419,7 @@ func TestToAnthropic_ClientSideDecoys_JSONWireField(t *testing.T) {
 		System: "x",
 		Tools:  []ToolSpec{{Name: "Read", Description: "r", InputSchema: map[string]any{}}},
 	}
-	on := toAnthropicWithFlags(req, "m", 100, false, true)
+	on := toAnthropicWithFlags(req, "m", 100, false, true, false)
 	rawOn, _ := json.Marshal(on)
 	if !strings.Contains(string(rawOn), `"_decoy_tools_v2_archive":[`) {
 		t.Errorf("decoy archive field missing on wire; got:\n%s", rawOn)
@@ -429,7 +429,7 @@ func TestToAnthropic_ClientSideDecoys_JSONWireField(t *testing.T) {
 		t.Errorf("expected at least one known decoy name in wire; got:\n%s", rawOn)
 	}
 
-	off := toAnthropicWithFlags(req, "m", 100, false, false)
+	off := toAnthropicWithFlags(req, "m", 100, false, false, false)
 	rawOff, _ := json.Marshal(off)
 	if strings.Contains(string(rawOff), "_decoy_tools_v2_archive") {
 		t.Errorf("off-path JSON must NOT contain the field; got:\n%s", rawOff)
@@ -449,7 +449,7 @@ func TestToAnthropic_ClientSideDecoys_SystemAndCacheUntouched(t *testing.T) {
 			{Name: "Bash", Description: "b", InputSchema: map[string]any{}},
 		},
 	}
-	on := toAnthropicWithFlags(req, "m", 100, false, true)
+	on := toAnthropicWithFlags(req, "m", 100, false, true, false)
 	// System still split into 2 blocks with cache_control on the static prefix.
 	if len(on.System) != 2 {
 		t.Fatalf("system must still split into 2 blocks; got %d", len(on.System))
@@ -493,7 +493,7 @@ func TestToAnthropic_BothFlagsIndependent(t *testing.T) {
 		{true, true, true, true},
 	}
 	for _, tc := range cases {
-		out := toAnthropicWithFlags(req, "m", 100, tc.antiDistill, tc.clientDecoys)
+		out := toAnthropicWithFlags(req, "m", 100, tc.antiDistill, tc.clientDecoys, false)
 		hasAD := len(out.AntiDistillation) > 0
 		hasDecoy := len(out.DecoyToolsArchive) > 0
 		if hasAD != tc.wantAntiDistill || hasDecoy != tc.wantDecoyField {

@@ -325,7 +325,7 @@ type anthropicResp struct {
 // --- conversion helpers ---
 
 func toAnthropic(req Request, model string, maxTokens int) anthropicReq {
-	return toAnthropicWithFlags(req, model, maxTokens, false, false)
+	return toAnthropicWithFlags(req, model, maxTokens, false, false, false)
 }
 
 // toAnthropicWithFlags is the full-arity converter used by the Anthropic
@@ -337,7 +337,7 @@ func toAnthropic(req Request, model string, maxTokens int) anthropicReq {
 //     (top-level `_decoy_tools_v2_archive` with fake tool defs).
 //
 // The two flags are independent — both can be on, both can be off.
-func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill, clientDecoys bool) anthropicReq {
+func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill, clientDecoys, placeholderEmpty bool) anthropicReq {
 	// MaxTokens precedence: per-request override > provider default.
 	// The override path is what /fast uses to halve budget without
 	// touching the underlying client config.
@@ -364,8 +364,12 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 		out.Thinking = &anthropicThinking{Type: "enabled", BudgetTokens: budget}
 	}
 	for _, t := range req.Tools {
+		schema := t.InputSchema
+		if placeholderEmpty {
+			schema = withSchemaPlaceholder(schema)
+		}
 		out.Tools = append(out.Tools, anthropicTool{
-			Name: t.Name, Description: t.Description, InputSchema: t.InputSchema,
+			Name: t.Name, Description: t.Description, InputSchema: schema,
 		})
 	}
 	// Anti-distillation: send the ["fake_tools"] opt-in as a top-level
@@ -674,7 +678,7 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 	if a.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set ANTHROPIC_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
-	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys)
+	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys, needsEmptySchemaPlaceholder(a.BaseURL))
 	body.Stream = false
 
 	var ar anthropicResp
@@ -729,7 +733,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 	if a.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set ANTHROPIC_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
-	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys)
+	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys, needsEmptySchemaPlaceholder(a.BaseURL))
 	body.Stream = true
 
 	// Retry the initial request (DNS / 429 / 5xx). Once we have a streaming
@@ -846,6 +850,89 @@ func withToolArgsReminder(body anthropicReq) anthropicReq {
 			"Never emit `null`, an empty string, or unquoted JSON for tool arguments.",
 	})
 	return out
+}
+
+// emptySchemaPlaceholderField is the name of the synthetic string field
+// metis injects into tool schemas that would otherwise have no required
+// fields. See needsEmptySchemaPlaceholder + withSchemaPlaceholder.
+const emptySchemaPlaceholderField = "_"
+
+// needsEmptySchemaPlaceholder reports whether the upstream identified by
+// baseURL is known to reject empty `arguments` JSON on tool calls. Only
+// MiniMax `/anthropic` (error code 2013) is confirmed today; matched by
+// hostname so future-rollout MiniMax subdomains still hit the path.
+//
+// Match is case-insensitive and substring-based — the user's config can
+// carry either `api.minimaxi.com` or `https://api.minimaxi.com/anthropic`.
+func needsEmptySchemaPlaceholder(baseURL string) bool {
+	return strings.Contains(strings.ToLower(baseURL), "minimaxi.com")
+}
+
+// withSchemaPlaceholder returns a shallow clone of `schema` with a
+// synthetic `_` string field injected into `properties` and marked as
+// `required` when the original schema has no required fields.
+//
+// Why: MiniMax's `/anthropic` gateway has a known bug (error code 2013,
+// "invalid function arguments json string") where a tool call with
+// empty `arguments` (`{}`, `null`, or `""`) fails strict reverse-
+// serialization validation. Schemas with no required fields invite
+// the model to emit exactly that. Injecting a single required
+// placeholder forces the model to produce `{"_":""}` instead, which
+// the gateway accepts. The receiving tool's Execute() reads named
+// fields by type-assertion and silently ignores unknown keys, so the
+// `_` field is functionally inert.
+//
+// Non-mutating: clones the input map so the caller's schema (which
+// may be the tool's own InputSchema(), shared across calls) is safe.
+// No-op when `required` is already non-empty — those schemas already
+// guarantee the model emits at least one named field.
+func withSchemaPlaceholder(schema map[string]any) map[string]any {
+	if schema == nil {
+		return map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				emptySchemaPlaceholderField: emptySchemaPlaceholderProperty(),
+			},
+			"required": []any{emptySchemaPlaceholderField},
+		}
+	}
+	if hasRequired(schema["required"]) {
+		return schema
+	}
+	out := make(map[string]any, len(schema)+1)
+	for k, v := range schema {
+		out[k] = v
+	}
+	props, _ := out["properties"].(map[string]any)
+	newProps := make(map[string]any, len(props)+1)
+	for k, v := range props {
+		newProps[k] = v
+	}
+	newProps[emptySchemaPlaceholderField] = emptySchemaPlaceholderProperty()
+	out["properties"] = newProps
+	out["required"] = []any{emptySchemaPlaceholderField}
+	return out
+}
+
+// hasRequired returns true when a schema's `required` value holds at
+// least one entry. Tolerant of the two JSON shapes the field can take
+// in Go: []any (decoded from JSON literals) or []string (constructed
+// in Go code via map[string]any{"required": []string{...}}).
+func hasRequired(v any) bool {
+	switch r := v.(type) {
+	case []any:
+		return len(r) > 0
+	case []string:
+		return len(r) > 0
+	}
+	return false
+}
+
+func emptySchemaPlaceholderProperty() map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": "(metis placeholder — pass empty string. MiniMax gateway needs ≥1 field in tool arguments.)",
+	}
 }
 
 func (a *Anthropic) setHeaders(r *http.Request) {
