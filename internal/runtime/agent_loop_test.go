@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -175,4 +176,87 @@ func dirExists(path string) (bool, error) {
 	// dependency.
 	_ = path
 	return false, nil
+}
+
+// TestResolveMemoryRoot_PrefersProjectDir — when ./.metis/memory exists
+// in the process cwd, BuildMemoryManager must pick that path over the
+// user-global session dir. Mirrors the project-vs-user precedent
+// already used for agent profiles (LoadAgentProfile).
+func TestResolveMemoryRoot_PrefersProjectDir(t *testing.T) {
+	// Chdir into a fresh tmp dir + create .metis/memory under it.
+	projectDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectDir, ".metis", "memory"), 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	cfg := defaultLoopCfg(t)
+	root := resolveMemoryRoot(cfg)
+
+	wantAbs, _ := filepath.Abs(filepath.Join(projectDir, ".metis", "memory"))
+	// Resolve macOS /private/var symlink quirk on tmp dirs.
+	gotResolved, _ := filepath.EvalSymlinks(root)
+	wantResolved, _ := filepath.EvalSymlinks(wantAbs)
+	if gotResolved != wantResolved {
+		t.Errorf("project-scoped root mismatch:\n  got:  %s\n  want: %s", gotResolved, wantResolved)
+	}
+}
+
+// TestResolveMemoryRoot_FallsBackToSessionDir — without ./.metis/memory
+// in cwd, the root must be <cfg.Session.Dir>/memory. Guards against
+// accidentally picking up a stray .metis dir from a parent directory
+// (we deliberately don't walk up).
+func TestResolveMemoryRoot_FallsBackToSessionDir(t *testing.T) {
+	cleanCwd := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(cleanCwd); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	cfg := defaultLoopCfg(t)
+	got := resolveMemoryRoot(cfg)
+	want := filepath.Join(cfg.Session.Dir, "memory")
+	if got != want {
+		t.Errorf("fallback root mismatch:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+// TestBuildMemoryManager_ProjectScopeWritesLocally — full integration:
+// create .metis/memory in tmp, run BuildMemoryManager, write a USER
+// block, confirm the file lands under the project dir (not session dir).
+func TestBuildMemoryManager_ProjectScopeWritesLocally(t *testing.T) {
+	projectDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectDir, ".metis", "memory"), 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	cfg := defaultLoopCfg(t)
+	mm := BuildMemoryManager(cfg)
+	if mm == nil {
+		t.Fatal("BuildMemoryManager returned nil")
+	}
+	if err := mm.Core().UpdateBlock("user", "在项目本地的 memory"); err != nil {
+		t.Fatalf("UpdateBlock: %v", err)
+	}
+
+	// File should land in the project's .metis/memory/core.d, not under cfg.Session.Dir.
+	// The "user" block persists to MEMORY.md (see labelToFilename in memory pkg).
+	projectFile := filepath.Join(projectDir, ".metis", "memory", "core.d", "MEMORY.md")
+	if _, err := os.Stat(projectFile); err != nil {
+		t.Errorf("expected MEMORY.md under project scope at %s: %v", projectFile, err)
+	}
+	sessionFile := filepath.Join(cfg.Session.Dir, "memory", "core.d", "MEMORY.md")
+	if _, err := os.Stat(sessionFile); err == nil {
+		t.Errorf("user-global file %s should NOT exist when project scope is active", sessionFile)
+	}
 }

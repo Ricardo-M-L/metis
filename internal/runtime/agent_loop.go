@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -53,23 +55,60 @@ type AgentLoopOptions struct {
 	Monitors *agent.MonitorRegistry
 }
 
-// BuildMemoryManager constructs a MemoryManager rooted under the
-// session dir. Returns nil on error so callers don't have to thread
-// errors through the bootstrap (memory failure is non-fatal — chat
-// works without persistent recall).
+// BuildMemoryManager constructs a MemoryManager. Returns nil on error
+// so callers don't have to thread errors through the bootstrap (memory
+// failure is non-fatal — chat works without persistent recall).
+//
+// Scope resolution (2026-05-15):
+//
+//  1. If `./.metis/memory/` exists in the process cwd, that directory
+//     is the root. This is "project-scoped" memory — running metis
+//     inside a project keeps its notes local instead of polluting the
+//     user-global store. Mirrors the existing precedent for project
+//     agent profiles (./.metis/agents/ wins over ~/.metis/agents/).
+//  2. Otherwise fall back to `<cfg.Session.Dir>/memory`, the
+//     user-global root used historically.
+//
+// Opt-in by design: users have to `mkdir -p .metis/memory` themselves
+// to switch a project to local memory. The detection is presence-only,
+// not "walk up looking for a .metis/ marker" — keeps the rule simple
+// and predictable (no surprise inheritance from a parent directory).
 //
 // Idempotent: calling twice with the same cfg returns two managers
 // pointing at the same on-disk store, both operating on the same
-// files via their internal mutexes. main.go uses one instance only;
-// the second-use case is just `metis tools` listing where we want
-// the Memory capability to advertise even without state.
+// files via their internal mutexes.
 func BuildMemoryManager(cfg *config.Config) *memory.MemoryManager {
-	memRoot := filepath.Join(cfg.Session.Dir, "memory")
+	memRoot := resolveMemoryRoot(cfg)
 	mm, err := memory.NewMemoryManager(memRoot)
 	if err != nil {
 		return nil
 	}
 	return mm
+}
+
+// resolveMemoryRoot picks the memory root path per the scope rules
+// documented on BuildMemoryManager. Exported only via that wrapper;
+// callers shouldn't need to know which root won.
+//
+// Logs the chosen root to stderr when METIS_DEBUG=1 so users can
+// verify cwd-scoped memory took effect without grepping the file
+// system.
+func resolveMemoryRoot(cfg *config.Config) string {
+	const projectDir = ".metis/memory"
+	if st, err := os.Stat(projectDir); err == nil && st.IsDir() {
+		abs, err := filepath.Abs(projectDir)
+		if err == nil {
+			if os.Getenv("METIS_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "metis: memory root = %s (project-scoped)\n", abs)
+			}
+			return abs
+		}
+	}
+	root := filepath.Join(cfg.Session.Dir, "memory")
+	if os.Getenv("METIS_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "metis: memory root = %s (user-global)\n", root)
+	}
+	return root
 }
 
 // BuildAgentLoop constructs the agent.Loop with memory, compactor, and
