@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/fun"
 )
 
 // Cmd is a callable slash command.
@@ -283,6 +284,14 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "release-notes", Aliases: []string{"changelog", "whatsnew"}, Description: "show recent metis release notes", Handler: func(_ string) (string, Signal) {
 		return "", SignalReleaseNotes
 	}})
+
+	// --- /fun — opt-in user-delight commands (music / pet / break).
+	// All side effects (mpv spawn, state files) live in internal/fun;
+	// this handler is a thin string dispatcher returning display text.
+	r.Register(Cmd{Name: "fun", Description: "opt-in delight commands (`/fun lofi`, `/fun music status`, etc.)", Handler: func(args string) (string, Signal) {
+		return fun.Dispatch(args), SignalNone
+	}})
+
 	// --- P1: theme / effort / pr_comments / upgrade / context ---
 	r.Register(Cmd{Name: "theme", Description: "cycle TUI color theme (`/theme [dark|light|auto]`)", Handler: func(_ string) (string, Signal) {
 		return "", SignalTheme
