@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -32,16 +33,30 @@ import (
 
 // WebBrowse renders a URL via headless chromium and returns extracted
 // page text. Subject to the same permission gate as WebFetch.
-type WebBrowse struct{ tools.BaseTool; gate *permission.Gate }
+//
+// IsEnabled is self-aware (2026-05-15): WebBrowse hides itself when no
+// chromium-family binary is on disk. Reason — without a real browser
+// WebBrowse can only fall back to plain HTTP fetch, which is exactly
+// what WebFetch already does; exposing two tools with identical
+// behavior just bloats the model's decision matrix. The fallback path
+// below stays as defensive code (binary uninstalled mid-session) but
+// is no longer a primary advertised feature.
+type WebBrowse struct{ gate *permission.Gate }
 
 func NewWebBrowse(gate *permission.Gate) WebBrowse { return WebBrowse{gate: gate} }
 
 func (WebBrowse) Name() string { return "WebBrowse" }
 
+// IsEnabled gates WebBrowse on the presence of a headless-capable
+// chromium binary. Computed once per process via sync.Once so the
+// 6+ exec.LookPath / os.Stat probes in pickChromiumBinary don't run
+// per registration check. Mirrors claude-code's WebBrowserTool gate
+// (tools.ts:217 — `...(WebBrowserTool ? [WebBrowserTool] : [])`).
+func (WebBrowse) IsEnabled() bool { return cachedChromiumBinary() != "" }
+
 func (WebBrowse) Description() string {
 	return "Render a URL via headless chromium and return the extracted page text. " +
-		"Use for JS-heavy sites where WebFetch returns empty content (SPAs, infinite-scroll, etc). " +
-		"Falls back to plain HTTP fetch when no headless browser is installed."
+		"Use for JS-heavy sites where WebFetch returns empty content (SPAs, infinite-scroll, etc)."
 }
 
 func (WebBrowse) InputSchema() map[string]any {
@@ -141,6 +156,12 @@ func (WebBrowse) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 // pickChromiumBinary returns the absolute path to the first installed
 // chromium-family browser. Empty string when none found — caller must
 // handle the fallback path.
+//
+// This is the uncached implementation used at Execute time (the user
+// might install / uninstall chromium between sessions, and the
+// per-call cost — 6 LookPath + 2 Stat — is negligible compared to
+// the chromium spawn itself). The IsEnabled hot path uses
+// cachedChromiumBinary instead so registry-time filtering is O(1).
 func pickChromiumBinary() string {
 	candidates := []string{
 		"chromium",
@@ -163,6 +184,25 @@ func pickChromiumBinary() string {
 		return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 	}
 	return ""
+}
+
+// chromiumBinaryCache memoizes the first pickChromiumBinary call so
+// IsEnabled doesn't pay the probe cost on every registration check.
+// Bound for life-of-process; a user installing chromium mid-session
+// would need to restart metis to see WebBrowse appear — acceptable
+// trade for not stat'ing 8 paths per filter pass.
+var (
+	chromiumOnce   sync.Once
+	chromiumCached string
+)
+
+// cachedChromiumBinary is the IsEnabled-friendly accessor. Computed
+// once per process from pickChromiumBinary.
+func cachedChromiumBinary() string {
+	chromiumOnce.Do(func() {
+		chromiumCached = pickChromiumBinary()
+	})
+	return chromiumCached
 }
 
 // plainFetch is the fallback when no headless browser is available.
