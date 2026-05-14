@@ -142,6 +142,14 @@ type Teammate struct {
 	// shows only named teammates by default too.
 	Anonymous bool
 
+	// StrictName tells Roster.Register to REJECT (with ErrNameInUse)
+	// instead of auto-suffixing on a name collision. Used by slash
+	// commands that resume by exact name (`/agents resume alice` must
+	// land on the SAME alice, not spawn a fresh alice-2 silently).
+	// Default false → most spawn paths auto-suffix and stay
+	// resilient to model-picked collisions.
+	StrictName bool
+
 	// Background true means this sub-agent was spawned with
 	// `run_in_background:true`. UI uses this to decide whether to
 	// auto-block the parent on its completion (foreground) or render
@@ -315,16 +323,37 @@ func (r *Roster) Summary() RosterSummary {
 type Roster struct {
 	mu        sync.RWMutex
 	teammates map[string]*Teammate
-	capacity  int
+	capNamed  int
+	capAnon   int
 }
 
-// NewRoster creates a Roster with the given concurrency cap.
-// capacity <= 0 disables the cap (effectively unlimited). The default
-// for production is config.Agents.MaxConcurrentSubAgents (5).
-func NewRoster(capacity int) *Roster {
+// NewRoster creates a Roster with split caps for named teammates and
+// anonymous sub-agents. Either <= 0 disables that side's cap.
+// Production defaults are config.Agents.MaxConcurrentNamed (20) +
+// MaxConcurrentAnon (40).
+//
+// Two caps instead of one: named teammates are "team roster slots"
+// (addressable, persistent, shown in /agents list) while anonymous
+// sub-agents are "research helpers" (one-shot, hidden from list).
+// Mixing them in one pool meant 5 anon explorations filled the budget
+// and locked out the next named reviewer spawn — exactly the wrong
+// incentive. Split caps let the model spawn explore helpers freely
+// without starving the named teammate pool.
+//
+// Backwards-compat: pre-2026-05-14 callers used `NewRoster(cap)` for
+// a combined cap. Single-int callers route through the variadic
+// shim below — first arg is `capNamed`, optional second is `capAnon`.
+// One-arg form `NewRoster(N)` mirrors the old semantics: both pools
+// get N (or unlimited when N == 0).
+func NewRoster(capNamed int, capAnon ...int) *Roster {
+	anon := capNamed
+	if len(capAnon) > 0 {
+		anon = capAnon[0]
+	}
 	return &Roster{
 		teammates: make(map[string]*Teammate),
-		capacity:  capacity,
+		capNamed:  capNamed,
+		capAnon:   anon,
 	}
 }
 
@@ -339,27 +368,75 @@ var ErrCapacityExceeded = errors.New("sub-agent capacity exceeded")
 var ErrNameInUse = errors.New("teammate name already in use")
 
 // Register places t in the Roster. Returns ErrCapacityExceeded when
-// the capacity cap is hit; ErrNameInUse when t.Name is already taken.
-// If t.Name is empty, an anonymous name is auto-generated and t.Name
-// is overwritten in place.
+// the capacity cap is hit. If t.Name is empty an anonymous name is
+// auto-generated and t.Name overwritten in place.
+//
+// Name-collision policy (mirrors claude-code spawnMultiAgent.ts:267):
+// when t.Name conflicts with a live teammate, Register auto-suffixes
+// with -2, -3, ... up to 99 and overwrites t.Name in place. Callers
+// that want STRICT rejection on conflict should set t.StrictName
+// before calling — that path still returns ErrNameInUse.
+//
+// Rationale: the model picks names semantically ("reviewer",
+// "explorer"); making it reason about uniqueness is wasted reasoning.
+// Auto-suffix follows the principle that names are display labels,
+// not identity. ErrNameInUse stays for the rare caller that needs
+// exact-match semantics (e.g., a slash command resuming a specific
+// named teammate by name — auto-suffix there would silently spawn a
+// new agent instead of resuming, which is wrong).
 func (r *Roster) Register(t *Teammate) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.capacity > 0 && len(r.teammates) >= r.capacity {
-		return ErrCapacityExceeded
-	}
-
+	// Determine the kind FIRST so the cap check below picks the
+	// right side. Empty-name → anon; explicit non-empty name → named
+	// (unless caller already set Anonymous=true for some custom flow).
 	if t.Name == "" {
 		t.Name = anonName()
 		t.Anonymous = true
 	}
+
+	// Cap check by kind. Two pools, two budgets.
+	var inKind int
+	for _, existing := range r.teammates {
+		if existing.Anonymous == t.Anonymous {
+			inKind++
+		}
+	}
+	var cap int
+	if t.Anonymous {
+		cap = r.capAnon
+	} else {
+		cap = r.capNamed
+	}
+	if cap > 0 && inKind >= cap {
+		return ErrCapacityExceeded
+	}
 	if _, ok := r.teammates[t.Name]; ok {
-		if t.Anonymous {
+		switch {
+		case t.Anonymous:
 			// Vanishingly rare 64-bit collision; regenerate once.
 			t.Name = anonName()
-		} else {
+		case t.StrictName:
 			return fmt.Errorf("%w: %q", ErrNameInUse, t.Name)
+		default:
+			// Auto-suffix: alice → alice-2 → alice-3 → ... → alice-99.
+			// 99 is generous; if a single Roster has 99 collisions on
+			// the same base name the user has bigger problems than
+			// naming.
+			base := t.Name
+			found := false
+			for i := 2; i <= 99; i++ {
+				candidate := fmt.Sprintf("%s-%d", base, i)
+				if _, taken := r.teammates[candidate]; !taken {
+					t.Name = candidate
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: %q (99 suffixes exhausted)", ErrNameInUse, base)
+			}
 		}
 	}
 	if t.Mailbox == nil {
@@ -390,11 +467,32 @@ func (r *Roster) Count() int {
 	return len(r.teammates)
 }
 
-// Capacity returns the configured cap (0 = unlimited).
+// Capacity returns the COMBINED cap (named + anon) for backward
+// compat with callers / docs that talk about a single number.
+// 0 here can only happen if both sides are unlimited.
 func (r *Roster) Capacity() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.capacity
+	if r.capNamed <= 0 && r.capAnon <= 0 {
+		return 0
+	}
+	return r.capNamed + r.capAnon
+}
+
+// CapacityNamed returns the configured cap on named teammates.
+// 0 = unlimited.
+func (r *Roster) CapacityNamed() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.capNamed
+}
+
+// CapacityAnon returns the configured cap on anonymous sub-agents.
+// 0 = unlimited.
+func (r *Roster) CapacityAnon() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.capAnon
 }
 
 // Lookup returns the named teammate, if any. The (Teammate, ok)

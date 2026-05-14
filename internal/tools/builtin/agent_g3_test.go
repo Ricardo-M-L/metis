@@ -169,9 +169,12 @@ func TestAgentExecute_NameValidation(t *testing.T) {
 	}
 }
 
-// TestAgentExecute_DuplicateNameRejected — same name twice while the
-// first is live → IsError with a specific message.
-func TestAgentExecute_DuplicateNameRejected(t *testing.T) {
+// TestAgentExecute_DuplicateNameAutoSuffixed — same name twice while
+// the first is live auto-suffixes to `<base>-2` since 2026-05-14
+// (mirrors claude-code spawnMultiAgent.ts:267). Strict rejection
+// stays available via Teammate.StrictName for callers like
+// /agents resume that need exact-match semantics.
+func TestAgentExecute_DuplicateNameAutoSuffixed(t *testing.T) {
 	roster := agent.NewRoster(0)
 	tool := NewAgent(permission.New(permission.ModeBypass), slowProvider(2_000_000_000), tools.NewRegistry(), "model", "system").
 		WithRoster(roster)
@@ -186,19 +189,24 @@ func TestAgentExecute_DuplicateNameRejected(t *testing.T) {
 		t.Fatalf("first spawn err: %v", err)
 	}
 
-	// Second spawn with same name must reject.
+	// Second spawn with same name auto-suffixes — no error, no IsError.
 	res, err := tool.Execute(context.Background(), map[string]any{
-		"prompt": "x",
-		"name":   "carol",
+		"prompt":            "x",
+		"name":              "carol",
+		"run_in_background": true,
 	})
 	if err != nil {
 		t.Fatalf("second spawn err: %v", err)
 	}
-	if !res.IsError {
-		t.Fatalf("duplicate name must be IsError; got %+v", res)
+	if res.IsError {
+		t.Fatalf("duplicate name should auto-suffix, not error; got %+v", res)
 	}
-	if !strings.Contains(res.Output, "already in use") {
-		t.Errorf("dup-name error should say 'already in use'; got %q", res.Output)
+	// The roster should now have BOTH carol and carol-2 alive.
+	if _, ok := roster.Lookup("carol"); !ok {
+		t.Errorf("carol should still be registered")
+	}
+	if _, ok := roster.Lookup("carol-2"); !ok {
+		t.Errorf("carol-2 should have been auto-assigned and registered")
 	}
 	roster.CancelAll()
 }

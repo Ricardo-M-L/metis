@@ -82,7 +82,7 @@ func TestAgentTool_NestingLimitEnforced(t *testing.T) {
 	tool := NewAgent(gate, helloProvider(), reg, "model", "system")
 
 	// Pre-load context with a depth at the limit.
-	ctx := context.WithValue(context.Background(), agentDepthKey{}, maxAgentDepth)
+	ctx := context.WithValue(context.Background(), agentDepthKey{}, defaultMaxAgentDepth)
 	res, err := tool.Execute(ctx, map[string]any{"prompt": "boom"})
 	if err != nil {
 		t.Fatal(err)

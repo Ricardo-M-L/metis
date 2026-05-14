@@ -41,10 +41,37 @@ type Config struct {
 // All three apply to every sub-agent invocation regardless of
 // `run_in_background`, `isolation`, or `name`.
 type Agents struct {
-	// MaxConcurrentSubAgents caps live sub-agents in the Roster.
-	// Exceeding it returns an IsError tool result without spawning.
-	// 0 falls back to the default (5).
+	// MaxConcurrentSubAgents is the LEGACY combined cap. Kept for
+	// backward compat with existing config.toml files. When set and
+	// the new MaxConcurrentNamed / MaxConcurrentAnon are zero, the
+	// total is split 1/3 named + 2/3 anonymous (rounded). When the
+	// new fields are explicitly set, this field is ignored. 0 →
+	// fall back to the new defaults.
 	MaxConcurrentSubAgents int `toml:"max_concurrent_subagents"`
+
+	// MaxConcurrentNamed caps named teammates in the Roster ("organ
+	// chart" agents — addressable by name via MessageTeammate). 0 →
+	// default 20. The named pool is intentionally smaller than anon
+	// because each named slot represents a persistent "role" that
+	// stays in /agents list; the anon pool is the spawn-and-forget
+	// research helper pool.
+	MaxConcurrentNamed int `toml:"max_concurrent_named"`
+
+	// MaxConcurrentAnon caps anonymous sub-agents (one-shot
+	// `Agent({prompt})` invocations without a name). 0 → default 40.
+	MaxConcurrentAnon int `toml:"max_concurrent_anon"`
+
+	// MaxAgentDepth caps how deep Agent() spawns can nest. 0 →
+	// default 3 (main → child → grandchild → great-grandchild
+	// refused). Pre-2026-05-14 this was a hard-coded const in
+	// internal/tools/builtin/agent.go.
+	MaxAgentDepth int `toml:"max_agent_depth"`
+
+	// MaxForkDepth caps how deep Fork() spawns can nest. Lower than
+	// MaxAgentDepth because Fork carries the parent's conversation
+	// history forward, so each level doubles context size. 0 →
+	// default 2.
+	MaxForkDepth int `toml:"max_fork_depth"`
 
 	// DefaultTimeoutSeconds bounds a sub-agent's wall-clock duration
 	// when its tool call did not pass `timeout_seconds`. 0 falls back
@@ -589,7 +616,16 @@ func defaults() *Config {
 			SignatureMaxRepeats: 5,
 		},
 		Agents: Agents{
-			MaxConcurrentSubAgents: 5,
+			// MaxConcurrentSubAgents kept for backward compat. New
+			// callers should read MaxConcurrentNamed + MaxConcurrentAnon.
+			// 0 here means "use the new split fields"; we explicitly
+			// keep it 0 so a freshly-defaulted Config doesn't accidentally
+			// override the more generous split caps.
+			MaxConcurrentSubAgents: 0,
+			MaxConcurrentNamed:     20,
+			MaxConcurrentAnon:      40,
+			MaxAgentDepth:          3,
+			MaxForkDepth:           2,
 			DefaultTimeoutSeconds:  600,
 			CleanupOrphanWorktrees: true,
 		},

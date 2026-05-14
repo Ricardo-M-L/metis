@@ -112,7 +112,7 @@ func TestFork_NestingLimitEnforced(t *testing.T) {
 		Messages: []llm.Message{{Role: "user", Content: []llm.ContentBlock{{Type: "text", Text: "x"}}}},
 	})
 	// Pretend we're already at max depth.
-	ctx = context.WithValue(ctx, forkDepthKey{}, maxForkDepth)
+	ctx = context.WithValue(ctx, forkDepthKey{}, defaultMaxForkDepth)
 	res, err := tool.Execute(ctx, map[string]any{"directive": "x"})
 	if err != nil {
 		t.Fatal(err)

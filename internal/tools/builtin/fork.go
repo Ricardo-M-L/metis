@@ -43,6 +43,19 @@ type Fork struct {
 	gate     *permission.Gate
 	provider llm.Provider
 	registry *tools.Registry
+
+	// MaxDepth overrides the default fork-nesting cap. 0 → use
+	// defaultMaxForkDepth. Wired from config.Agents.MaxForkDepth at
+	// runtime. Lower than Agent's depth because Fork carries the
+	// parent's full conversation forward, doubling context per level.
+	MaxDepth int
+}
+
+func (f Fork) effectiveMaxDepth() int {
+	if f.MaxDepth > 0 {
+		return f.MaxDepth
+	}
+	return defaultMaxForkDepth
 }
 
 // NewFork constructs the tool. provider+registry must be non-nil at
@@ -84,7 +97,7 @@ func (f Fork) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 // can ladder Fork→Fork→Fork until the budget cliff.
 type forkDepthKey struct{}
 
-const maxForkDepth = 2
+const defaultMaxForkDepth = 2
 
 func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	directive, _ := in["directive"].(string)
@@ -96,9 +109,9 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	}
 
 	depth, _ := ctx.Value(forkDepthKey{}).(int)
-	if depth >= maxForkDepth {
+	if cap := f.effectiveMaxDepth(); depth >= cap {
 		return &tools.Result{
-			Output:  fmt.Sprintf("fork nesting limit (%d) exceeded — flatten the work into the current turn", maxForkDepth),
+			Output:  fmt.Sprintf("fork nesting limit (%d) exceeded — flatten the work into the current turn, or raise [agents].max_fork_depth in ~/.metis/config.toml", cap),
 			IsError: true,
 		}, nil
 	}

@@ -34,14 +34,17 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-// TestAgentTool_CapacityCapEnforced — Roster with capacity 1, pre-fill
-// it manually with one teammate, then try to launch a real sub-agent
-// via the tool. Must return IsError with "capacity exceeded".
+// TestAgentTool_CapacityCapEnforced — Roster with anonymous cap 1,
+// pre-fill it with one anonymous teammate, then try to launch a real
+// (anonymous) sub-agent via the tool. Must return IsError with
+// "capacity exceeded" matching the anon-kind error text since
+// 2026-05-14 (post Roster cap split).
 func TestAgentTool_CapacityCapEnforced(t *testing.T) {
-	roster := agent.NewRoster(1)
-	// Occupy the only slot — register a synthetic teammate so the
-	// Agent tool's slot is already taken when it tries to register.
-	if err := roster.Register(&agent.Teammate{Name: "_held"}); err != nil {
+	roster := agent.NewRoster(0, 1) // named unlimited, anon cap=1
+	// Occupy the only anon slot — set Anonymous=true so the preload
+	// counts against the anon side, matching what the Agent tool
+	// will be registering below (empty name → anon).
+	if err := roster.Register(&agent.Teammate{Anonymous: true}); err != nil {
 		t.Fatalf("preload Register failed: %v", err)
 	}
 
@@ -61,6 +64,9 @@ func TestAgentTool_CapacityCapEnforced(t *testing.T) {
 	}
 	if !strings.Contains(res.Output, "1/1") {
 		t.Errorf("cap message should show the in-flight/total counts so the operator sees the actual budget; got %q", res.Output)
+	}
+	if !strings.Contains(res.Output, "anonymous") {
+		t.Errorf("split-cap error should label which kind exceeded; got %q", res.Output)
 	}
 	// Roster count must still be 1 — the rejected attempt didn't
 	// leave a dangling entry.

@@ -66,7 +66,12 @@ func validateTeammateName(name string) error {
 // recursion runs the user's bill into the floor.
 type agentDepthKey struct{}
 
-const maxAgentDepth = 3
+// defaultMaxAgentDepth is the fallback when neither the Agent struct's
+// per-instance MaxDepth nor config.Agents.MaxAgentDepth was set. Kept
+// at 3 so existing tests / minimal embeddings keep the historical
+// behavior. Configurable via `~/.metis/config.toml` `[agents]
+// max_agent_depth = N` since 2026-05-14.
+const defaultMaxAgentDepth = 3
 
 // Agent is a tool that runs a focused subtask in a fresh agent loop.
 // Inspired by Claude Code's LocalAgentTask: spawn an isolated message
@@ -109,6 +114,23 @@ type Agent struct {
 	// transcript header so `metis sessions list` can group sub-agents
 	// under their spawner. Empty = stand-alone.
 	parentSessionID string
+
+	// MaxDepth overrides the default nesting cap. 0 → use
+	// defaultMaxAgentDepth. Set from config.Agents.MaxAgentDepth at
+	// runtime construction. Exposed as a field (not a const) so
+	// 2026-05-14+ users can raise the cap via toml without recompiling
+	// — the original 3 was hand-picked early on and turns out to be
+	// tight for legitimate "main → plan → explore → verify" chains.
+	MaxDepth int
+}
+
+// effectiveMaxDepth returns the cap to enforce — instance override
+// when set, else the package default.
+func (a Agent) effectiveMaxDepth() int {
+	if a.MaxDepth > 0 {
+		return a.MaxDepth
+	}
+	return defaultMaxAgentDepth
 }
 
 // NewAgent constructs the Agent tool. Caller wires it into the registry
@@ -301,9 +323,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		return nil, errors.New("Agent tool not fully wired (missing provider/registry)")
 	}
 	depth, _ := ctx.Value(agentDepthKey{}).(int)
-	if depth >= maxAgentDepth {
+	if cap := a.effectiveMaxDepth(); depth >= cap {
 		return &tools.Result{
-			Output:  fmt.Sprintf("agent nesting limit (%d) exceeded", maxAgentDepth),
+			Output:  fmt.Sprintf("agent nesting limit (%d) exceeded — raise [agents].max_agent_depth in ~/.metis/config.toml if this is legitimate", cap),
 			IsError: true,
 		}, nil
 	}
@@ -383,11 +405,24 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}
 		if err := a.roster.Register(teammate); err != nil {
 			if errors.Is(err, agent.ErrCapacityExceeded) {
-				cap := a.roster.Capacity()
+				// Split pools: the error came from whichever pool
+				// matches this teammate's kind. Report THAT pool's
+				// numbers, not the total — the user can spawn the
+				// other kind freely.
+				summary := a.roster.Summary()
+				var inPool, capPool int
+				var kindLabel, kindKnob, envKnob string
+				if teammate.Anonymous {
+					inPool, capPool = summary.Anonymous, a.roster.CapacityAnon()
+					kindLabel, kindKnob, envKnob = "anonymous sub-agent", "max_concurrent_anon", "METIS_MAX_SUBAGENTS_ANON"
+				} else {
+					inPool, capPool = summary.Named, a.roster.CapacityNamed()
+					kindLabel, kindKnob, envKnob = "named teammate", "max_concurrent_named", "METIS_MAX_SUBAGENTS_NAMED"
+				}
 				return &tools.Result{
 					Output: fmt.Sprintf(
-						"sub-agent capacity exceeded (%d/%d in flight). Wait for a teammate to finish or raise config.Agents.MaxConcurrentSubAgents.",
-						a.roster.Count(), cap,
+						"%s capacity exceeded (%d/%d in flight). Wait for one to finish, raise [agents].%s in ~/.metis/config.toml, or export %s=N for an immediate per-session override.",
+						kindLabel, inPool, capPool, kindKnob, envKnob,
 					),
 					IsError: true,
 				}, nil

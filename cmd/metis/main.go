@@ -757,11 +757,19 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	defer monitorReg.StopAll()
 
 	// Sub-agent Roster — process-wide registry that backs G.0's
-	// concurrency cap and (later) G.3 named teammates / G.16 UI
-	// observability. Capacity reads from config.Agents (default 5).
+	// concurrency cap and G.3 named teammates / G.16 UI observability.
+	// Capacity reads from config.Agents (split named/anon since
+	// 2026-05-14) with env override on top. Precedence:
+	//   METIS_MAX_SUBAGENTS_NAMED / _ANON   (highest, per-kind)
+	//   METIS_MAX_SUBAGENTS                 (combined, split 1:2)
+	//   config.Agents.MaxConcurrentNamed / _Anon
+	//   legacy config.Agents.MaxConcurrentSubAgents (split 1:2)
+	//   defaults (20 named / 40 anon)
+	//
 	// Cancel everyone on chat exit so orphan sub-agents don't keep
 	// burning tokens after the parent shell goes away.
-	subAgentRoster := agent.NewRoster(cfg.Agents.MaxConcurrentSubAgents)
+	capNamed, capAnon := resolveRosterCaps(cfg)
+	subAgentRoster := agent.NewRoster(capNamed, capAnon)
 	defer subAgentRoster.CancelAll()
 
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
@@ -1917,7 +1925,16 @@ func cmdConfig(args []string) error {
 		fmt.Printf("loop_detection.global = %d\n", cfg.LoopDetection.Global)
 		fmt.Printf("loop_detection.signature_window = %d\n", cfg.LoopDetection.SignatureWindow)
 		fmt.Printf("loop_detection.signature_max_repeats = %d\n", cfg.LoopDetection.SignatureMaxRepeats)
-		fmt.Printf("agents.max_concurrent_subagents = %d\n", cfg.Agents.MaxConcurrentSubAgents)
+		fmt.Printf("agents.max_concurrent_subagents = %d (legacy combined; 0 = use split fields below)\n", cfg.Agents.MaxConcurrentSubAgents)
+		fmt.Printf("agents.max_concurrent_named = %d\n", cfg.Agents.MaxConcurrentNamed)
+		fmt.Printf("agents.max_concurrent_anon = %d\n", cfg.Agents.MaxConcurrentAnon)
+		fmt.Printf("agents.max_agent_depth = %d\n", cfg.Agents.MaxAgentDepth)
+		fmt.Printf("agents.max_fork_depth = %d\n", cfg.Agents.MaxForkDepth)
+		// Show the effective resolved caps so users see what the
+		// Roster actually got (env + legacy + split fields applied).
+		if effNamed, effAnon := resolveRosterCaps(cfg); effNamed != cfg.Agents.MaxConcurrentNamed || effAnon != cfg.Agents.MaxConcurrentAnon {
+			fmt.Printf("agents.effective_caps = named=%d anon=%d (after env override / legacy split)\n", effNamed, effAnon)
+		}
 		fmt.Printf("agents.default_timeout_seconds = %d\n", cfg.Agents.DefaultTimeoutSeconds)
 		fmt.Printf("agents.cleanup_orphan_worktrees = %v\n", cfg.Agents.CleanupOrphanWorktrees)
 		fmt.Printf("tools.enable_tool_search = %q (env)\n", os.Getenv("ENABLE_TOOL_SEARCH"))
@@ -2017,7 +2034,7 @@ func cmdTools() error {
 	// sees the full background-sub-agent surface area, even though
 	// Execute will refuse (no Roster wired in this code path).
 	// G.3 adds MessageTeammate to the same family for peer messaging.
-	tmpRoster := agent.NewRoster(0)
+	tmpRoster := agent.NewRoster(0, 0)
 	builtin.AttachSubAgentTools(reg, gate, tmpRoster)
 	reg.Register(builtin.NewMessageTeammate(gate, tmpRoster))
 	// Same for SendMessage — its real wiring lives in setupRuntime, but

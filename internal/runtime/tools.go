@@ -108,6 +108,9 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	if opts.Cfg != nil && opts.Cfg.Agents.DefaultTimeoutSeconds > 0 {
 		agentTool = agentTool.WithDefaultTimeout(time.Duration(opts.Cfg.Agents.DefaultTimeoutSeconds) * time.Second)
 	}
+	if opts.Cfg != nil && opts.Cfg.Agents.MaxAgentDepth > 0 {
+		agentTool.MaxDepth = opts.Cfg.Agents.MaxAgentDepth
+	}
 	if opts.Jobs != nil {
 		agentTool = agentTool.WithJobsPool(opts.Jobs)
 	}
@@ -136,7 +139,11 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	}
 	// Fork tool: same wiring as Agent, different semantics — child
 	// inherits parent history+system instead of starting cold.
-	reg.Register(builtin.NewFork(opts.Gate, opts.Provider, reg))
+	forkTool := builtin.NewFork(opts.Gate, opts.Provider, reg)
+	if opts.Cfg != nil && opts.Cfg.Agents.MaxForkDepth > 0 {
+		forkTool.MaxDepth = opts.Cfg.Agents.MaxForkDepth
+	}
+	reg.Register(forkTool)
 	// SendMessage tool: lit only when at least one channel adapter is
 	// configured. We always register it though — its description will
 	// just say "no channels available" until one is wired.

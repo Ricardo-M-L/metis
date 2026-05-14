@@ -51,17 +51,43 @@ func TestRoster_CapacityZeroUnlimited(t *testing.T) {
 	}
 }
 
-// TestRoster_DuplicateNamedRejected — named teammates with the same
-// name must collide. Anonymous teammates regenerate on (vanishingly
-// rare) collision.
-func TestRoster_DuplicateNamedRejected(t *testing.T) {
+// TestRoster_DuplicateNamedAutoSuffixed — default behavior (2026-05-14):
+// duplicate name gets auto-suffixed (alice → alice-2) instead of
+// returning ErrNameInUse. Mirrors claude-code spawnMultiAgent.ts:267.
+// The strict-rejection path is covered separately by
+// TestRoster_DuplicateNamedRejectedWithStrictName below.
+func TestRoster_DuplicateNamedAutoSuffixed(t *testing.T) {
 	r := NewRoster(0)
 	if err := r.Register(&Teammate{Name: "alice"}); err != nil {
 		t.Fatalf("first alice should succeed; got %v", err)
 	}
-	err := r.Register(&Teammate{Name: "alice"})
+	tm2 := &Teammate{Name: "alice"}
+	if err := r.Register(tm2); err != nil {
+		t.Errorf("duplicate name should auto-suffix, not error; got %v", err)
+	}
+	if tm2.Name != "alice-2" {
+		t.Errorf("second alice should be renamed to alice-2; got %q", tm2.Name)
+	}
+	tm3 := &Teammate{Name: "alice"}
+	if err := r.Register(tm3); err != nil {
+		t.Errorf("third alice should auto-suffix; got %v", err)
+	}
+	if tm3.Name != "alice-3" {
+		t.Errorf("third alice should be renamed to alice-3; got %q", tm3.Name)
+	}
+}
+
+// TestRoster_DuplicateNamedRejectedWithStrictName — opt-in strict
+// mode for callers (slash command resume) that need exact-match
+// semantics.
+func TestRoster_DuplicateNamedRejectedWithStrictName(t *testing.T) {
+	r := NewRoster(0)
+	if err := r.Register(&Teammate{Name: "alice"}); err != nil {
+		t.Fatalf("first alice should succeed; got %v", err)
+	}
+	err := r.Register(&Teammate{Name: "alice", StrictName: true})
 	if !errors.Is(err, ErrNameInUse) {
-		t.Errorf("duplicate name should return ErrNameInUse; got %v", err)
+		t.Errorf("duplicate name with StrictName=true should return ErrNameInUse; got %v", err)
 	}
 }
 
