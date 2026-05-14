@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -375,6 +376,15 @@ type cliFlags struct {
 	// internal/tools.ExpandToolPatterns for the grammar.
 	tools         string // --tools "Read,Edit,Bash" (allowlist, comma/space separated)
 	disallowTools string // --disallow-tools "WebFetch,mcp__office-word"
+
+	// --metrics-log <path>: append one JSONL line per turn to <path>.
+	// Each line carries the turn number, per-turn token usage (split
+	// in / out / cache_read / cache_create), tool call + error counts,
+	// duration_ms, stop_reason, and how many nudges / rescues fired in
+	// that turn. Designed for offline scrape — feeds the eval runner
+	// and ad-hoc spend analysis without forcing the user to parse
+	// stderr `[metrics]` lines or hook into the event stream.
+	metricsLog string
 }
 
 // stringList accumulates repeated flag values: --add-dir A --add-dir B → [A,B].
@@ -481,6 +491,8 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 		"allowlist: only expose these tools to the model (e.g. \"Read,Edit,Bash\"). Empty = use config + all registered tools.")
 	f.StringVar(&out.disallowTools, "disallow-tools", "",
 		"blocklist: hide these tools from the model. Supports MCP server prefix: \"mcp__office-word\" mutes the whole server; \"mcp__\" mutes all MCP tools.")
+	f.StringVar(&out.metricsLog, "metrics-log", "",
+		"append per-turn JSONL metrics to <path> (turn_number, tokens.{in,out,cache_read,cache_create}, tool_calls, tool_errors, duration_ms, stop_reason, nudges_fired, rescue_fired)")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -1309,6 +1321,59 @@ func cmdRun(ctx context.Context, args []string) error {
 	// 60k tokens of fresh input.
 	var totIn, totOut, totCacheRead, totCacheCreate int
 
+	// --metrics-log: open append-only JSONL sink for per-turn metrics.
+	// One line per round-trip (EventTurnEnd or final EventLoopDone).
+	// Created lazily so that a typo'd path errors loudly before the
+	// LLM call burns any tokens.
+	var metricsLogFile *os.File
+	if flags.metricsLog != "" {
+		f, ferr := os.OpenFile(flags.metricsLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if ferr != nil {
+			return fmt.Errorf("--metrics-log: %w", ferr)
+		}
+		metricsLogFile = f
+		defer metricsLogFile.Close()
+	}
+
+	// Per-turn metrics state. Reset on every EventTurnEnd; flushed
+	// on EventTurnEnd (mid-loop) and EventLoopDone (final).
+	turnNumber := 1
+	turnStart := time.Now()
+	var turnIn, turnOut, turnCacheRead, turnCacheCreate int
+	var turnToolCalls, turnToolErrors int
+	var turnNudges, turnRescues int
+
+	emitMetrics := func(stopReason string) {
+		if metricsLogFile == nil {
+			return
+		}
+		rec := map[string]any{
+			"turn_number": turnNumber,
+			"tokens": map[string]any{
+				"in":           turnIn,
+				"out":          turnOut,
+				"cache_read":   turnCacheRead,
+				"cache_create": turnCacheCreate,
+			},
+			"tool_calls":   turnToolCalls,
+			"tool_errors":  turnToolErrors,
+			"duration_ms":  time.Since(turnStart).Milliseconds(),
+			"stop_reason":  stopReason,
+			"nudges_fired": turnNudges,
+			"rescue_fired": turnRescues,
+		}
+		if b, jerr := json.Marshal(rec); jerr == nil {
+			_, _ = metricsLogFile.Write(append(b, '\n'))
+		}
+	}
+	resetTurn := func() {
+		turnNumber++
+		turnStart = time.Now()
+		turnIn, turnOut, turnCacheRead, turnCacheCreate = 0, 0, 0, 0
+		turnToolCalls, turnToolErrors = 0, 0
+		turnNudges, turnRescues = 0, 0
+	}
+
 	runStart := time.Now()
 	for ev := range events {
 		switch ev.Kind {
@@ -1329,6 +1394,7 @@ func cmdRun(ctx context.Context, args []string) error {
 			// streamlined contract.)
 		case agent.EventToolStart:
 			usedToolsThisRun = true
+			turnToolCalls++
 			if streamlined {
 				accum.AccumulateTool(ev.ToolName)
 				continue
@@ -1336,6 +1402,7 @@ func cmdRun(ctx context.Context, args []string) error {
 			fmt.Fprintf(os.Stderr, "\n[tool] %s\n", ev.ToolName)
 		case agent.EventToolResult:
 			if ev.ToolResult != nil && ev.ToolResult.IsError {
+				turnToolErrors++
 				// Errors always surface — both modes need them so
 				// scripts can detect failure.
 				fmt.Fprintf(os.Stderr, "[tool error] %s\n", truncStderr(ev.ToolResult.Output, 300))
@@ -1368,6 +1435,15 @@ func cmdRun(ctx context.Context, args []string) error {
 			// EventInfo separately; this branch is the metis-run /
 			// metis-cron-run / non-interactive path.
 			if ev.Info != "" {
+				// Per-turn nudge / rescue counters for --metrics-log.
+				// Pattern-match the same strings the loop emits — see
+				// internal/agent/iter_nudge.go and empty_stop_rescue.go.
+				if strings.Contains(ev.Info, "iter nudge") {
+					turnNudges++
+				}
+				if strings.Contains(ev.Info, "rescue") {
+					turnRescues++
+				}
 				fmt.Fprintf(os.Stderr, "[info] %s\n", ev.Info)
 			}
 		case agent.EventTokens:
@@ -1375,11 +1451,30 @@ func cmdRun(ctx context.Context, args []string) error {
 			totOut += ev.OutputTokens
 			totCacheRead += ev.CacheReadInputTokens
 			totCacheCreate += ev.CacheCreationInputTokens
+			turnIn += ev.InputTokens
+			turnOut += ev.OutputTokens
+			turnCacheRead += ev.CacheReadInputTokens
+			turnCacheCreate += ev.CacheCreationInputTokens
+		case agent.EventTurnEnd:
+			// Mid-loop turn boundary: flush the current turn's metrics
+			// line (stop_reason=tool_use is implicit since EventTurnEnd
+			// only fires after a tool-use round) then reset.
+			emitMetrics("tool_use")
+			resetTurn()
 		case agent.EventLoopDone:
 			if streamlined {
 				flushAccum() // emit any trailing tool counts
 			}
 			fmt.Println()
+			// Per-turn JSONL flush for --metrics-log. StopReason on the
+			// final turn comes from the loop ("end_turn", "no_tool_calls",
+			// "diminishing_returns", "halted_by_hook", etc.); falls back
+			// to "done" when the provider didn't supply one.
+			finalStop := ev.StopReason
+			if finalStop == "" {
+				finalStop = "done"
+			}
+			emitMetrics(finalStop)
 			// Token + duration metrics on stderr — picked up by the
 			// eval runner (internal/eval/runner.go::scrapeMetrics) and
 			// useful for scripts that want to log spend per call. One
