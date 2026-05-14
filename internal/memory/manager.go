@@ -349,31 +349,55 @@ func (cm *CoreMemory) Save() error {
 
 // parseMemoryFile extracts content from Hermes-style memory file.
 // Format: Header lines, then §-separated entries.
+// parseMemoryFile is the inverse of renderBlockHermes — strips
+// the Hermes-style decoration (two ═══ separator lines + the
+// "LABEL [pct% — used/max chars]" header line in between) and
+// returns only the user-supplied content.
+//
+// 2026-05-15 fix: prior implementation tried to use `§` as a separator,
+// but renderBlockHermes never emits `§` — `strings.Split(data, "§")`
+// returned a single non-empty part with the whole file body, so the
+// `len(content) == 0` fallback (the only branch that actually strips
+// `═` lines) was dead code. Effect: the entire on-disk file
+// (decoration + header + content) was read back as `block.Content`,
+// then the next add wrote a NEW header in front of it, growing the
+// file linearly with each Memory.add call AND causing the model to
+// either see garbage or, more commonly, see nothing because the
+// Frozen Snapshot froze a corrupt render.
+//
+// Current impl drops ANY decoration line wherever it appears
+// (not just the first three lines), so files corrupted by the
+// old buggy parser self-heal on the next Save: the next
+// UpdateBlock call sees a clean Content + writes a single clean
+// header to disk.
 func parseMemoryFile(data, label string) string {
-	// Find the § separator (Hermes format: entries separated by §)
-	parts := strings.Split(data, "§")
+	upperLabel := strings.ToUpper(strings.TrimSpace(label))
 	var content []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			content = append(content, p)
+	for _, line := range strings.Split(data, "\n") {
+		trimmed := strings.TrimSpace(line)
+		// Drop the ═══ separator decoration (any line containing the
+		// box-drawing rune is decoration — content shouldn't have it).
+		if strings.ContainsRune(trimmed, '═') {
+			continue
 		}
-	}
-	// If no § found, use raw content after stripping header lines
-	if len(content) == 0 {
-		lines := strings.Split(data, "\n")
-		for _, line := range lines {
-			// Skip header lines (between ═══ lines)
-			if strings.Contains(line, "═") {
-				continue
-			}
-			line = strings.TrimSpace(line)
-			if line != "" {
-				content = append(content, line)
-			}
+		// Drop "LABEL [pct% — used/max chars]" header lines emitted
+		// by renderBlockHermes. Pattern: starts with the uppercased
+		// block label + " [". We compare against the file's expected
+		// label (passed in) so renaming a block (e.g. user → memory)
+		// won't accidentally strip content that legitimately starts
+		// with a different label name.
+		if upperLabel != "" && strings.HasPrefix(trimmed, upperLabel+" [") {
+			continue
 		}
+		// Preserve original line spacing — only drop fully blank lines
+		// that surround the (now-removed) header block. Internal blank
+		// lines inside content stay.
+		if trimmed == "" && len(content) == 0 {
+			continue
+		}
+		content = append(content, line)
 	}
-	return strings.Join(content, "\n")
+	return strings.TrimRight(strings.Join(content, "\n"), "\n\r\t ")
 }
 
 // renderBlockHermes renders a block in Hermes MEMORY.md style.
