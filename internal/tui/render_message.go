@@ -204,34 +204,60 @@ func renderMessage(msg Message, width int, expand bool) string {
 // is expensive (loads styles, parses templates) and the renderer is
 // stateless once built. Recreate when terminal width changes more than
 // 8 cols since glamour's word-wrap is baked at construction time.
+//
+// Two flavours are cached separately, keyed by `wide`:
+//   - narrow (wide=false, cap 120): prose-friendly wrap for plain
+//     paragraphs / bullet lists — matches claude-code's reading column.
+//   - wide   (wide=true,  no cap):  full terminal width for messages
+//     that contain markdown tables. glamour sizes the lipgloss table
+//     to WordWrap (see ansi/blockstack.go:Width), so capping at 120
+//     squashed 6+ column CJK comparison tables into multi-line "half
+//     tables". Tables get the full terminal width; prose still wraps
+//     because glamour wraps each paragraph at WordWrap regardless.
 var (
-	mdRendererMu       sync.Mutex
-	mdRenderer         *glamour.TermRenderer
-	mdRendererForWidth int
+	mdRendererMu             sync.Mutex
+	mdRendererNarrow         *glamour.TermRenderer
+	mdRendererNarrowForWidth int
+	mdRendererWide           *glamour.TermRenderer
+	mdRendererWideForWidth   int
 )
 
-func getMarkdownRenderer(width int) *glamour.TermRenderer {
+func getMarkdownRenderer(width int, wide bool) *glamour.TermRenderer {
 	mdRendererMu.Lock()
 	defer mdRendererMu.Unlock()
-	if mdRenderer != nil && abs(width-mdRendererForWidth) < 8 {
-		return mdRenderer
+
+	cached := mdRendererNarrow
+	cachedWidth := mdRendererNarrowForWidth
+	if wide {
+		cached = mdRendererWide
+		cachedWidth = mdRendererWideForWidth
 	}
+	if cached != nil && abs(width-cachedWidth) < 8 {
+		return cached
+	}
+
 	wrap := width
 	if wrap < 40 {
 		wrap = 40
 	}
-	if wrap > 120 {
+	if !wide && wrap > 120 {
 		wrap = 120
 	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStyles(metisCodeBlockStyle()),
 		glamour.WithWordWrap(wrap),
+		glamour.WithTableWrap(true),
 	)
 	if err != nil {
 		return nil
 	}
-	mdRenderer = r
-	mdRendererForWidth = width
+	if wide {
+		mdRendererWide = r
+		mdRendererWideForWidth = width
+	} else {
+		mdRendererNarrow = r
+		mdRendererNarrowForWidth = width
+	}
 	return r
 }
 
@@ -282,7 +308,7 @@ func renderAssistantBody(content string, width int) string {
 	if !looksLikeMarkdown(content) {
 		return styleAsst.Render(content)
 	}
-	r := getMarkdownRenderer(width - 4)
+	r := getMarkdownRenderer(width-4, containsMarkdownTable(content))
 	if r == nil {
 		return styleAsst.Render(content)
 	}
@@ -291,6 +317,28 @@ func renderAssistantBody(content string, width int) string {
 		return styleAsst.Render(content)
 	}
 	return strings.TrimSpace(out)
+}
+
+// containsMarkdownTable looks for a GFM-style table header — a row with
+// at least one pipe followed on the next line by a separator row using
+// dashes (`---` / `:---:` etc). Cheap textual scan, no parser. Used to
+// route wide-table messages to the no-cap markdown renderer.
+func containsMarkdownTable(s string) bool {
+	lines := strings.Split(s, "\n")
+	for i := 0; i < len(lines)-1; i++ {
+		if !strings.Contains(lines[i], "|") {
+			continue
+		}
+		sep := strings.TrimSpace(lines[i+1])
+		if sep == "" || !strings.Contains(sep, "|") {
+			continue
+		}
+		body := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(sep, "|", ""), ":", ""), " ", "")
+		if len(body) >= 3 && strings.Trim(body, "-") == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // looksLikeMarkdown is a cheap heuristic that skips glamour for plain
