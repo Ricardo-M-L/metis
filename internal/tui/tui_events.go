@@ -102,7 +102,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 				break
 			}
 		}
-		m.spinnerVerb = pickSpinnerVerb()
+		m.spinnerVerb = chooseSpinnerVerb(m.sessionID)
 		m.spinnerSub = ""
 		// Tool finished → the agent is about to send another API
 		// request with the tool result. Flip back to "requesting"
@@ -137,6 +137,18 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 	case agent.EventTokens:
 		m.totalTokens.add(ev.InputTokens, ev.OutputTokens, ev.CacheCreationInputTokens, ev.CacheReadInputTokens)
 	case agent.EventTurnEnd:
+		// Flush any in-flight thinking/streaming text before the turn
+		// closes so the final reply appears in the transcript. Without
+		// this, a no-tool response leaves streamingText orphaned in
+		// Model state and the user sees nothing.
+		if m.thinkingText != "" {
+			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
+			m.thinkingText = ""
+		}
+		if m.streamingText != "" {
+			m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
+			m.streamingText = ""
+		}
 		// keep toolEvents for display
 	case agent.EventError:
 		// Flush any in-flight thinking/streaming text before painting

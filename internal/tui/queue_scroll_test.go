@@ -1,24 +1,23 @@
 package tui
 
-// queue_scroll_test.go — pins the post-2026-05-08 fix for the
-// "queued × N" sticky-pill bug.
+// queue_scroll_test.go — pins the queue-display contract.
 //
-// Old behavior: a sticky pill above the input showed `queued × N: …`
-// and never moved when the user scrolled. The pill was fixed-bottom
-// chrome (rendered in the `lower` builder of tui_render.go), so wheel
-// scrolling the chat list left the pill anchored.
+// History:
+//  - Pre-2026-05-08: a sticky pill above the input showed `queued × N: …`
+//    and never moved when the user scrolled (fixed-bottom chrome).
+//  - 2026-05-08: pill replaced by an in-stream `(queued × N …): peek`
+//    info-role Message that scrolled with the chat.
+//  - 2026-05-14: in-stream notice removed to match claude-code's
+//    CoordinatorAgentStatus model — the only surface for queue state
+//    is the status-bar `◷ N queued` chip. Adding a row per enqueue
+//    cluttered scroll-back (user feedback w/ screenshot).
 //
-// New behavior:
-//  1. The enqueue notice is a regular info-role message in m.messages
-//     (and therefore in the chatList) so it scrolls with the stream.
-//  2. The notice content includes a peek of the user's prompt so a
-//     scroll-back reader sees what was queued, not just the count.
-//  3. The status bar carries a compact `◷ N queued` chip — always
-//     visible regardless of scroll, but doesn't block the message
-//     stream.
-//  4. The sticky pill above the input is gone; renderQueuePill itself
-//     still exists for backward-compat (kept under a separate test)
-//     but is no longer wired into the View pipeline.
+// Current contract:
+//  1. Enqueue adds NOTHING to m.messages (no chat-history row).
+//  2. m.queuedPrompts grows by one.
+//  3. The status bar `◷ N queued` chip surfaces the count (always
+//     visible regardless of scroll).
+//  4. The sticky pill above the input is gone.
 
 import (
 	"strings"
@@ -28,67 +27,55 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// TestEnqueueNotice_IncludesUserPromptPeek pins behavior #2: the
-// in-stream notice carries the first ~80 runes of what the user typed,
-// so scrolling back to it later is informative.
-func TestEnqueueNotice_IncludesUserPromptPeek(t *testing.T) {
+// TestEnqueue_AddsNoChatRow pins behavior #1: enqueue must NOT push
+// a chat-history Message. Only m.queuedPrompts grows. (The old
+// in-stream `(queued × N …): peek` row was deleted 2026-05-14 — user
+// flagged it as scroll-back clutter.)
+func TestEnqueue_AddsNoChatRow(t *testing.T) {
 	m := newSlashTestModel(t)
+	priorMsgCount := len(m.messages)
+
 	prompt := "为什么cd执行了这么久还没好"
 	for _, r := range prompt {
 		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	m.turnActive = true
-
 	pressEnter(t, m)
 
 	if len(m.queuedPrompts) != 1 {
 		t.Fatalf("expected 1 queued prompt; got %d", len(m.queuedPrompts))
 	}
-	// Walk messages in reverse to find the latest info-role notice.
-	var notice string
-	for i := len(m.messages) - 1; i >= 0; i-- {
-		if m.messages[i].Role == "info" {
-			notice = m.messages[i].Content
-			break
-		}
+	if got := len(m.messages); got != priorMsgCount {
+		t.Errorf("enqueue must not add chat-history Messages; len(messages) went %d → %d", priorMsgCount, got)
 	}
-	if notice == "" {
-		t.Fatalf("expected an info-role notice in m.messages after enqueue; got none")
-	}
-	if !strings.Contains(notice, "queued × 1") {
-		t.Errorf("notice should mention queue count; got %q", notice)
-	}
-	if !strings.Contains(notice, prompt) {
-		t.Errorf("notice should embed the user's prompt peek %q; got %q", prompt, notice)
+	// Sanity: status bar chip still surfaces the count.
+	m.width = 120
+	bar := renderStatusBar(m)
+	if !strings.Contains(bar, "◷ 1 queued") {
+		t.Errorf("status bar must carry `◷ 1 queued` chip after enqueue; got:\n%s", bar)
 	}
 }
 
-// TestEnqueueNotice_LongPromptTruncated guards the rune-counted
-// truncation so a CJK paste doesn't slice mid-codepoint and the line
-// stays a sensible length.
-func TestEnqueueNotice_LongPromptTruncated(t *testing.T) {
+// TestEnqueue_LongPromptDoesNotPolluteChat — long CJK pastes used to
+// produce a long info-row peek. After 2026-05-14 they should produce
+// zero chat rows; the queued text is only retrieved at next-turn
+// submission time.
+func TestEnqueue_LongPromptDoesNotPolluteChat(t *testing.T) {
 	m := newSlashTestModel(t)
-	long := strings.Repeat("中文测试", 40) // 160 runes — well past the 80-rune cap
+	priorMsgCount := len(m.messages)
+
+	long := strings.Repeat("中文测试", 40)
 	for _, r := range long {
 		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	m.turnActive = true
 	pressEnter(t, m)
 
-	var notice string
-	for i := len(m.messages) - 1; i >= 0; i-- {
-		if m.messages[i].Role == "info" {
-			notice = m.messages[i].Content
-			break
-		}
+	if got := len(m.messages); got != priorMsgCount {
+		t.Errorf("long prompt enqueue must not add chat rows; len(messages) went %d → %d", priorMsgCount, got)
 	}
-	if !strings.HasSuffix(notice, "…") {
-		t.Errorf("long prompt should be truncated with …; got %q", notice)
-	}
-	// The notice should not contain the entire 160-rune prompt; cap is
-	// 80 runes for the peek itself plus a small fixed prefix.
-	if rs := []rune(notice); len(rs) > 160 {
-		t.Errorf("notice grew unexpectedly long (%d runes): %q", len(rs), notice)
+	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0] != long {
+		t.Errorf("queued prompt should preserve the full prompt verbatim; got %q", m.queuedPrompts)
 	}
 }
 

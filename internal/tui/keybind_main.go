@@ -317,17 +317,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.imageCounter++
 				m.imagePaste[m.imageCounter] = path
 				m.input.InsertString(fmt.Sprintf("[Image #%d] ", m.imageCounter))
-				// Surface a tiny info row so the user sees the
-				// image was actually cached + where. Without this
-				// the only feedback is the [Image #N] placeholder
-				// in the editor, which doesn't tell the user the
-				// MB-size dump on their disk.
-				kb := len(content.Data) / 1024
-				m.messages = append(m.messages, Message{
-					Role:      "info",
-					Content:   fmt.Sprintf("(image #%d cached: %s, %d KiB)", m.imageCounter, path, kb),
-					Timestamp: time.Now(),
-				})
+				// Match claude-code: the [Image #N] chip in the input
+				// editor is the only on-screen artifact. The path/size
+				// info that used to land in chat history was redundant
+				// (the side table m.imagePaste records the path for
+				// submit-time resolution via expandPastedImages); kept
+				// adding a gray row per paste that the user flagged
+				// as noise.
 			} else {
 				m.messages = append(m.messages, Message{
 					Role:      "error",

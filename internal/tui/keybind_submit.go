@@ -5,7 +5,6 @@ package tui
 // or the slash-signal table; plain user text starts a new turn.
 
 import (
-	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -147,23 +146,12 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// reserved for slash commands above and the explicit /steer
 		// alias users can still call.
 		m.queuedPrompts = append(m.queuedPrompts, raw)
-		// Include a peek of the user's text so the chatList notice is
-		// self-explanatory when the user later scrolls back. The sticky
-		// queue pill above the input was removed (it anchored to the
-		// bottom and didn't follow scroll); this notice is the only
-		// in-stream record of what was queued, so the peek matters.
-		peek := strings.TrimSpace(raw)
-		const maxPeek = 80
-		if rs := []rune(peek); len(rs) > maxPeek {
-			peek = string(rs[:maxPeek-1]) + "…"
-		}
-		notice := fmt.Sprintf("(queued × %d · Ctrl+C to clear): %s",
-			len(m.queuedPrompts), peek)
-		m.messages = append(m.messages, Message{
-			Role:      "info",
-			Content:   notice,
-			Timestamp: time.Now(),
-		})
+		// Match claude-code: the queued-message count lives only in
+		// the status bar `◷ N queued` chip (render_chrome.go). The
+		// in-stream notice row was redundant — every queue add added
+		// another scroll-back line, which the user flagged as clutter.
+		// (claude-code carries the same model via CoordinatorAgentStatus
+		// `· N queued` suffix on the spinner line.)
 		m.input.Reset()
 		return m, nil
 	}
@@ -604,7 +592,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// barber-pole "working" indicator. Cleared on turn end.
 	notify.SendProgress(notify.ProgressIndeterminate, 0)
 	m.firstStreamAt = time.Time{}
-	m.spinnerVerb = pickSpinnerVerb()
+	m.spinnerVerb = chooseSpinnerVerb(m.sessionID)
 	m.spinnerSub = ""
 	// Initial phase: prompt is being sent, no bytes received yet → ↑.
 	// EventThinkingDelta / EventTextDelta / EventToolStart will flip

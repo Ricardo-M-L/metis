@@ -190,6 +190,37 @@ func tasksFullList(sessionID string) []TaskItem {
 	return envelope.Items
 }
 
+// currentInProgressTodoContent returns the Content of the first
+// in_progress todo for this session, or "" when no in-progress todo
+// exists. Mirrors claude-code Spinner.tsx:169 — `currentTodo.activeForm
+// ?? currentTodo.subject ?? randomVerb` — so the spinner reads
+// "Implementing OAuth refresh…" instead of a static "exploring…" once
+// the model has set a TodoWrite task in_progress. Caching lives in
+// tasksFullList (which itself reads the JSON every call — tiny file,
+// not hot enough to need its own cache).
+func currentInProgressTodoContent(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	for _, t := range tasksFullList(sessionID) {
+		if t.Status == "in_progress" {
+			return t.Content
+		}
+	}
+	return ""
+}
+
+// chooseSpinnerVerb is the metis equivalent of claude-code's
+// `currentTodo?.activeForm ?? randomVerb` fallback chain. When a
+// TodoWrite todo is in_progress, return its content; otherwise return
+// a fresh random gerund from pickSpinnerVerb.
+func chooseSpinnerVerb(sessionID string) string {
+	if v := currentInProgressTodoContent(sessionID); v != "" {
+		return v
+	}
+	return pickSpinnerVerb()
+}
+
 // tasksRunningCount returns how many todos in this session are
 // currently in_progress or pending. Reads ~/.metis/tasks/<sid>.json
 // (the same file metis's TodoWrite tool persists). Cached 2s so
