@@ -25,6 +25,12 @@ type Req = oaiReq
 // alias in anthropic/shared.go.
 type WireMessage = oaiMessage
 
+// Usage exposes the response-side usage envelope (prompt/completion
+// tokens plus the three cached-token wire shapes — see oaiUsage doc
+// in openai.go for details). Azure decodes its response into Resp
+// (alias of oaiResp) and Resp.Usage is this type.
+type Usage = oaiUsage
+
 // ToRequest builds the OpenAI-format chat completion body from the
 // provider-neutral Request shape.
 func ToRequest(req Request, model string, maxTokens int) Req {
@@ -33,13 +39,11 @@ func ToRequest(req Request, model string, maxTokens int) Req {
 
 // FromChoice converts one OpenAI Choice + Usage into the provider-
 // neutral Response. Azure uses this on Choices[0] of its decoded
-// body. The anonymous struct shape matches what fromOpenAIChoice
-// expects — kept the explicit JSON tags so callers can pass the
-// usage block parsed straight off the wire.
-func FromChoice(c Choice, usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-}) *Response {
+// body. Usage carries cached-token fields when the upstream reports
+// a prefix-cache hit (OpenAI `prompt_tokens_details.cached_tokens`,
+// DeepSeek `prompt_cache_hit_tokens`, Kimi `cached_tokens`); the
+// returned Response.CacheReadInputTokens picks the first non-zero.
+func FromChoice(c Choice, usage Usage) *Response {
 	return fromOpenAIChoice(c, usage)
 }
 

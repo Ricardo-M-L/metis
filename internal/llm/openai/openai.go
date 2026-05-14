@@ -197,12 +197,58 @@ type oaiChoice struct {
 	FinishReason string     `json:"finish_reason"`
 }
 
+// oaiUsage captures the three wire shapes for cached-prefix tokens
+// seen on OpenAI-compatible providers:
+//
+//   - OpenAI / GLM / Zhipu / Gemini-compat:
+//     `prompt_tokens_details.cached_tokens` (nested)
+//   - DeepSeek:
+//     `prompt_cache_hit_tokens` (flat, sibling of prompt_tokens)
+//   - Kimi (Moonshot) and some misc:
+//     `cached_tokens` (flat)
+//
+// The provider keeps reading whichever field its upstream chose to
+// emit; cacheReadTokens() picks the first non-zero value as the
+// canonical "cached input tokens this turn" number, which then maps
+// to StreamEvent.CacheReadInputTokens / Response.CacheReadInputTokens
+// (the same field Anthropic's cache_read_input_tokens lands in).
+//
+// OpenAI-style providers don't expose a separate cache_creation
+// metric — they bill all prompt_tokens, and "cached" just means
+// "served from prefix cache, charged at a discount". So we leave
+// CacheCreationInputTokens at zero on this path.
+type oaiUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+	PromptCacheHitTokens int `json:"prompt_cache_hit_tokens,omitempty"`
+	CachedTokens         int `json:"cached_tokens,omitempty"`
+}
+
+// cacheReadTokens returns the cached-prefix token count, normalising
+// across the three wire shapes (OpenAI nested, DeepSeek flat,
+// Kimi flat). First non-zero wins. Returns 0 when none of the three
+// upstreams reported a cache hit — that's also the correct value
+// for "cold prompt, nothing cached yet" or "tiny prompt under the
+// cache threshold (OpenAI requires ≥1024 tokens, DeepSeek ≥64)".
+func cacheReadTokens(u oaiUsage) int {
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
+		return u.PromptTokensDetails.CachedTokens
+	}
+	if u.PromptCacheHitTokens > 0 {
+		return u.PromptCacheHitTokens
+	}
+	if u.CachedTokens > 0 {
+		return u.CachedTokens
+	}
+	return 0
+}
+
 type oaiResp struct {
 	Choices []oaiChoice `json:"choices"`
-	Usage   struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage   oaiUsage    `json:"usage"`
 }
 
 // --- conversion ---
@@ -332,14 +378,12 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 	return out
 }
 
-func fromOpenAIChoice(c oaiChoice, usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-}) *Response {
+func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
 	out := &Response{
-		StopReason:   mapOAIStop(c.FinishReason),
-		InputTokens:  usage.PromptTokens,
-		OutputTokens: usage.CompletionTokens,
+		StopReason:           mapOAIStop(c.FinishReason),
+		InputTokens:          usage.PromptTokens,
+		OutputTokens:         usage.CompletionTokens,
+		CacheReadInputTokens: cacheReadTokens(usage),
 	}
 	// oaiMessage.Content is `any` (request side may be string OR
 	// content-parts array for multimodal user turns). The response
@@ -564,10 +608,7 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 				Delta        oaiMessage `json:"delta"`
 				FinishReason string     `json:"finish_reason"`
 			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-			} `json:"usage"`
+			Usage *oaiUsage `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &env); err != nil {
 			continue
@@ -618,13 +659,24 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 				if env.Usage != nil {
 					ev.InputTokens = env.Usage.PromptTokens
 					ev.OutputTokens = env.Usage.CompletionTokens
+					ev.CacheReadInputTokens = cacheReadTokens(*env.Usage)
 				}
 				s.pending = append(s.pending, ev)
 			} else if env.Usage != nil {
-				s.pending = append(s.pending, StreamEvent{Type: "message_delta", InputTokens: env.Usage.PromptTokens, OutputTokens: env.Usage.CompletionTokens})
+				s.pending = append(s.pending, StreamEvent{
+					Type:                 "message_delta",
+					InputTokens:          env.Usage.PromptTokens,
+					OutputTokens:         env.Usage.CompletionTokens,
+					CacheReadInputTokens: cacheReadTokens(*env.Usage),
+				})
 			}
 		} else if env.Usage != nil {
-			s.pending = append(s.pending, StreamEvent{Type: "message_delta", InputTokens: env.Usage.PromptTokens, OutputTokens: env.Usage.CompletionTokens})
+			s.pending = append(s.pending, StreamEvent{
+				Type:                 "message_delta",
+				InputTokens:          env.Usage.PromptTokens,
+				OutputTokens:         env.Usage.CompletionTokens,
+				CacheReadInputTokens: cacheReadTokens(*env.Usage),
+			})
 		}
 
 		if len(s.pending) > 0 {
