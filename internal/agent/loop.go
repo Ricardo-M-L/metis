@@ -448,6 +448,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 
 	specs := l.toolSpecs()
 	graceUsed := 0
+	emptyStopRescued := false // see empty_stop_rescue.go — at most one rescue per turn
+	finalSummaryRescued := false
+	nudgeFired := make([]bool, len(iterNudges)) // see iter_nudge.go
 
 	for {
 		l.mu.Lock()
@@ -471,6 +474,23 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// <monitor_event> system-reminders. Cheap when no Monitor is
 		// active (nil registry → instant return).
 		l.injectMonitorEvents(out)
+
+		// Soft iter-budget nudges at 50% / 75% / 90% — see
+		// iter_nudge.go. Fire at most one per threshold per turn so
+		// the model gets a heads-up before the hard cap kicks in.
+		if idx, body := shouldFireNudge(curIter, l.MaxIters, nudgeFired); body != "" {
+			nudgeFired[idx] = true
+			l.mu.Lock()
+			l.Messages = append(l.Messages, llm.Message{
+				Role:    llm.RoleUser,
+				Content: []llm.ContentBlock{{Type: "text", Text: body}},
+			})
+			l.mu.Unlock()
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("(iter nudge %d%% — model asked to pace itself)", int(iterNudges[idx].pct*100)),
+			})
+		}
 
 		req := l.buildRequest(specs)
 
@@ -529,6 +549,28 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		l.mu.Unlock()
 
 		if stop != "tool_use" {
+			// Bug B rescue: model declared end_turn but emitted no
+			// user-facing text. See empty_stop_rescue.go for why this
+			// happens and the 2026-05-14 session that motivated it.
+			// One nudge per turn — if the rescue iteration ALSO emits
+			// empty text, accept the stop (something upstream is broken
+			// and looping costs tokens for no value).
+			if !emptyStopRescued && !hasUserFacingText(assistant) {
+				emptyStopRescued = true
+				nudge := llm.Message{
+					Role:    llm.RoleUser,
+					Content: []llm.ContentBlock{{Type: "text", Text: emptyStopRescueMessage}},
+				}
+				l.mu.Lock()
+				l.Messages = append(l.Messages, nudge)
+				l.mu.Unlock()
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: "(empty-final-answer rescue: nudging model to summarize)",
+				})
+				continue
+			}
+
 			stopReason = stop
 			// Reset per-tool counters so the next user turn starts clean —
 			// otherwise `Read x5 → end_turn → Read x5` looks like 10 consecutive Reads.
@@ -647,15 +689,33 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return nil
 		}
 
-		// Budget check with grace call.
+		// Budget check with grace call + final-summary rescue.
+		// Order matters: grace first (one extra iter for "I'm
+		// almost done"), then final summary rescue (one MORE iter
+		// where we explicitly tell the model to write the answer
+		// now instead of starting new work), then real abort.
 		if curIter >= l.MaxIters {
 			if graceUsed < l.GraceCalls {
 				graceUsed++
 				continue
 			}
+			if !finalSummaryRescued {
+				finalSummaryRescued = true
+				l.mu.Lock()
+				l.Messages = append(l.Messages, llm.Message{
+					Role:    llm.RoleUser,
+					Content: []llm.ContentBlock{{Type: "text", Text: finalSummaryRescueMessage}},
+				})
+				l.mu.Unlock()
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: fmt.Sprintf("(iter cap reached at %d — one rescue iteration for final summary)", l.MaxIters),
+				})
+				continue
+			}
 			stopReason = "max_iterations"
 			l.Hooks.EmitLoopEnd(ctx, tc, "max_iterations")
-			emit(ctx, out, Event{Kind: EventInfo, Info: fmt.Sprintf("budget exhausted (%d iters, 1 grace used)", l.MaxIters)})
+			emit(ctx, out, Event{Kind: EventInfo, Info: fmt.Sprintf("budget exhausted (%d iters, %d grace + 1 final-summary rescue used)", l.MaxIters, l.GraceCalls)})
 			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "max_iterations"})
 			return nil
 		}

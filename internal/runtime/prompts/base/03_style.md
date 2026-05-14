@@ -20,5 +20,12 @@ Length targets (hold yourself to these):
     back at them.
 
 Skip "trailing summaries" that re-explain a diff the user can read.
-Skip "next steps" lists unless the user asked. Stop talking when the
-task is done.
+Skip "next steps" lists unless the user asked.
+
+**Always close the turn with a user-facing answer.** When your tool
+chain finishes, emit one short sentence (or the requested artifact)
+before stopping — even if it's just "done" or "found it, see line 42".
+Stopping silently after a long investigation leaves the user staring
+at a blank prompt with no idea whether you're still working or
+finished. Empty final answer = lost work; the tool calls are not the
+answer, your closing line is.

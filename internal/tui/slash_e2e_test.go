@@ -231,17 +231,29 @@ func TestSlashE2E_BatchRewritesPrompt(t *testing.T) {
 	// fakeProvider may have already appended an assistant turn; walk the
 	// history backwards and grab the latest "user" message — that's the
 	// one /batch rewrote.
+	//
+	// Skip <system-reminder> messages: the empty-stop rescue
+	// (internal/agent/empty_stop_rescue.go) injects one of these when
+	// the fake provider returns end_turn with no text. That's the
+	// real production behaviour; we just want the /batch-rewritten
+	// prompt, which lives one user message earlier.
 	hist := m.loop.History()
 	body := ""
 	for i := len(hist) - 1; i >= 0; i-- {
-		if string(hist[i].Role) == "user" {
-			for _, c := range hist[i].Content {
-				if c.Type == "text" {
-					body += c.Text
-				}
-			}
-			break
+		if string(hist[i].Role) != "user" {
+			continue
 		}
+		candidate := ""
+		for _, c := range hist[i].Content {
+			if c.Type == "text" {
+				candidate += c.Text
+			}
+		}
+		if strings.HasPrefix(strings.TrimSpace(candidate), "<system-reminder>") {
+			continue
+		}
+		body = candidate
+		break
 	}
 	if body == "" {
 		t.Fatalf("/batch should append a user message; history=%+v", hist)
