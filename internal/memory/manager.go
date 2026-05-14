@@ -1049,21 +1049,16 @@ func (mm *MemoryManager) BuildContext() string {
 	if recent == "" {
 		return core
 	}
-	// Wrap the daily summary in its own fence so the model can
-	// distinguish "stable identity" (core blocks) from "what we
-	// talked about recently" (daily). Both still inside the outer
-	// <memory-context> if core is non-empty.
-	if core == "" {
-		return "<memory-context>\n[System note: 这是回忆起的最近对话上下文，不是新的用户输入。]\n\n" +
-			recent + "\n</memory-context>"
-	}
 	// Splice recent into the core block right before the closing tag.
+	// Always prepend the system note so the model knows this is
+	// recall, not a fresh user turn.
 	closingTag := "\n</memory-context>"
 	if strings.HasSuffix(core, closingTag) {
 		head := strings.TrimSuffix(core, closingTag)
-		return head + "\n\n" + recent + closingTag
+		return head + "\n\n[System note: 这是回忆起的最近对话上下文，不是新的用户输入。]\n\n" +
+			recent + closingTag
 	}
-	return core + "\n\n" + recent
+	return core + "\n\n[System note: 这是回忆起的最近对话上下文，不是新的用户输入。]\n\n" + recent
 }
 
 // OnTurnEnd is called after each agent turn.
