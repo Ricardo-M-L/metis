@@ -82,7 +82,7 @@ func dispatch(ctx context.Context, args []string) error {
 	case "projects":
 		return cmdProjects(args[1:])
 	case "tools":
-		return cmdTools()
+		return cmdTools(args[1:])
 	case "models":
 		return cmdModels(ctx, args[1:])
 	case "sessions":
@@ -364,6 +364,17 @@ type cliFlags struct {
 	// of claude-code's CLAUDE_CODE_SIMPLE. Ideal for short `metis run`
 	// commands and CI scripts where the heavy guidance is wasted.
 	simpleMode bool
+
+	// --tools / --disallow-tools — session-scoped tool-pool override
+	// (2026-05-14). Applied AFTER MCP + plugin tools register, so
+	// dynamically-loaded MCP tools are also subject to the filter.
+	// CLI allowlist OVERRIDES config Allowed (so `--tools Read` truly
+	// gives only Read regardless of config). CLI disallowlist UNIONS
+	// with config Disallowed (CLI cannot loosen config restrictions).
+	// Patterns support MCP server-prefix matching — see
+	// internal/tools.ExpandToolPatterns for the grammar.
+	tools         string // --tools "Read,Edit,Bash" (allowlist, comma/space separated)
+	disallowTools string // --disallow-tools "WebFetch,mcp__office-word"
 }
 
 // stringList accumulates repeated flag values: --add-dir A --add-dir B → [A,B].
@@ -463,6 +474,13 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 		"print the assembled system prompt to stdout and exit (no LLM call)")
 	f.BoolVar(&out.simpleMode, "simple", false,
 		"use a one-sentence system prompt (skip the heavy base prompt + redirects + skills + reversibility sections). Equivalent to METIS_SIMPLE=1.")
+	// --tools / --disallow-tools: session-scoped tool-pool override.
+	// Both accept comma- OR space-separated lists; disallow also accepts
+	// MCP server prefix (e.g. "mcp__office-word" mutes that whole server).
+	f.StringVar(&out.tools, "tools", "",
+		"allowlist: only expose these tools to the model (e.g. \"Read,Edit,Bash\"). Empty = use config + all registered tools.")
+	f.StringVar(&out.disallowTools, "disallow-tools", "",
+		"blocklist: hide these tools from the model. Supports MCP server prefix: \"mcp__office-word\" mutes the whole server; \"mcp__\" mutes all MCP tools.")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -897,6 +915,24 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			PluginSources: pluginReg.SkillSources(),
 		})
 	}
+
+	// Global tool visibility filter (2026-05-14) — applied AFTER MCP +
+	// plugins register so dynamically-loaded mcp__* / plugin tools are
+	// also subject to it. Merge rules:
+	//
+	//   allow  = flags.tools  if non-empty, else cfg.Tools.Allowed
+	//   deny   = cfg.Tools.Disallowed ∪ flags.disallowTools
+	//
+	// The CLI flag REPLACES the config allowlist (so `--tools Read`
+	// truly limits to Read regardless of config), but UNIONS into the
+	// config blocklist — CLI can tighten, never loosen.
+	allowVis := tools.SplitCSV(flags.tools)
+	if len(allowVis) == 0 {
+		allowVis = cfg.Tools.Allowed
+	}
+	denyVis := append([]string(nil), cfg.Tools.Disallowed...)
+	denyVis = append(denyVis, tools.SplitCSV(flags.disallowTools)...)
+	tools.ApplyToolVisibility(reg, allowVis, denyVis)
 
 	// Session store
 	store, err := session.NewStore(cfg.Session.Dir)
@@ -2016,7 +2052,18 @@ func cmdConfigSchema(args []string) error {
 	return nil
 }
 
-func cmdTools() error {
+func cmdTools(args []string) error {
+	// Honor --tools / --disallow-tools on the listing path too so the
+	// user can preview exactly what the model would see under those
+	// filters without launching a full chat session.
+	fs := flag.NewFlagSet("metis tools", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var allowFlag, denyFlag string
+	fs.StringVar(&allowFlag, "tools", "", "allowlist (comma/space-separated) — same grammar as `metis chat --tools`")
+	fs.StringVar(&denyFlag, "disallow-tools", "", "blocklist (supports MCP server prefix) — same grammar as `metis chat --disallow-tools`")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	cfg, _, err := config.Load()
 	if err != nil {
 		return err
@@ -2060,6 +2107,17 @@ func cmdTools() error {
 	// would. Stubs replace mutation tools so the listing shows the
 	// "disabled in coordinator mode" hint instead of the real desc.
 	rtpkg.FilterRegistryInPlace(reg)
+
+	// Mirror setupRuntime's visibility merge so `metis tools --tools X
+	// --disallow-tools Y` previews the exact pool a chat would expose.
+	allowVis := tools.SplitCSV(allowFlag)
+	if len(allowVis) == 0 {
+		allowVis = cfg.Tools.Allowed
+	}
+	denyVis := append([]string(nil), cfg.Tools.Disallowed...)
+	denyVis = append(denyVis, tools.SplitCSV(denyFlag)...)
+	tools.ApplyToolVisibility(reg, allowVis, denyVis)
+
 	for _, t := range reg.All() {
 		fmt.Printf("%-15s  %s\n", t.Name(), t.Description())
 	}

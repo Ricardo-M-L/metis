@@ -115,6 +115,29 @@ metis version [-V]            # short semver (-V for full build fingerprint)
 | `--tmux` | when starting in a worktree, also wrap in a tmux pane |
 | `--tui` | force the TUI (default when stdout is a TTY) |
 | `--no-auth-wizard` | skip the first-run auth wizard |
+| `--tools <list>` | allowlist (CSV or space-separated): only expose these tools to the model. Empty = use config + all registered tools. |
+| `--disallow-tools <list>` | blocklist (CSV/space): hide these tools from the model. Supports MCP server prefix — `mcp__office-word` mutes the whole server; `mcp__` mutes every MCP tool. |
+
+### Tool-pool filtering
+
+`metis chat --tools "Read,Edit,Bash"` — only those three are visible to the model this session. Useful for sandboxed audits or constrained sub-agents.
+
+`metis chat --disallow-tools "mcp__office-word,WebFetch"` — every other tool stays available; the `office-word` MCP server's 54 tools and `WebFetch` are stripped before reaching the prompt. Saves substantial cache tokens.
+
+Persistent equivalents live in `~/.metis/config.toml`:
+
+```toml
+[tools]
+allowed    = ["Read", "Edit", "Bash"]            # session inherits unless --tools overrides
+disallowed = ["mcp__office-word", "WebFetch"]    # CLI --disallow-tools is unioned in
+```
+
+Pattern grammar (allow + disallow):
+- `Bash` — exact tool name
+- `mcp__office-word` — every tool registered as `mcp__office-word__*` (the whole MCP server)
+- `mcp__` or `mcp__*` — every MCP tool, all servers
+
+CLI `--tools` REPLACES `cfg.Tools.Allowed` if set. CLI `--disallow-tools` UNIONS with `cfg.Tools.Disallowed` (CLI can tighten, never loosen).
 
 ### Slash commands (in chat)
 

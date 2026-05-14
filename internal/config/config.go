@@ -455,8 +455,35 @@ type Session struct {
 }
 
 type Tools struct {
-	Disabled []string         `toml:"disabled"`
-	Bash     ToolBashSettings `toml:"bash"`
+	// Disabled is the legacy early-stage blocklist applied before any
+	// tool gets registered into the per-session Registry. Affects
+	// `metis tools` listing and MetisInfo introspection output.
+	// Kept for backward compat with config files predating Allowed /
+	// Disallowed.
+	Disabled []string `toml:"disabled"`
+
+	// Allowed is the post-registration allowlist applied after MCP +
+	// plugin tools load. Empty = inherit (no filter). When non-empty,
+	// only tool names matching one of these patterns survive in the
+	// pool the model sees. Supports the MCP server-prefix grammar
+	// described on Disallowed.
+	Allowed []string `toml:"allowed"`
+
+	// Disallowed is the post-registration blocklist. Applied after
+	// Allowed. Pattern grammar (handled by
+	// internal/tools.ExpandToolPatterns):
+	//
+	//   "Bash"             — exact tool name
+	//   "mcp__office-word" — every tool whose name starts with
+	//                        "mcp__office-word__" (the whole server)
+	//   "mcp__" / "mcp__*" — every MCP tool, all servers
+	//
+	// Mirrors claude-code's filterToolsByDenyRules
+	// (restored-src/src/tools.ts:262) prefix semantics so users moving
+	// off claude-code can copy their deny rules verbatim.
+	Disallowed []string `toml:"disallowed"`
+
+	Bash ToolBashSettings `toml:"bash"`
 
 	// Lazy MCP tool schemas (ToolSearch) are controlled exclusively
 	// by the ENABLE_TOOL_SEARCH environment variable. See
