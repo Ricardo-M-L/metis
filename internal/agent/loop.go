@@ -451,6 +451,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	emptyStopRescued := false // see empty_stop_rescue.go — at most one rescue per turn
 	finalSummaryRescued := false
 	nudgeFired := make([]bool, len(iterNudges)) // see iter_nudge.go
+	progress := newProgressDetector()           // see progress_detector.go
 
 	for {
 		l.mu.Lock()
@@ -619,6 +620,25 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// rebase --continue` retries never got cut off.
 		if l.Detector != nil {
 			l.Detector.RecordStep(toolUses, results)
+		}
+
+		// Diminishing-returns detector: pair tool_uses with results
+		// and count an iter as "low-progress" when the non-error
+		// output bytes sum below a small threshold. After 3 such
+		// iters AND we've already past the 75% nudge (i.e. budget
+		// is tight AND the model isn't producing useful info), abort
+		// early with an informative event. See progress_detector.go
+		// for the bytes-as-token-proxy rationale.
+		progress.RecordIter(toolUses, results)
+		if progress.IsDiminishing() && len(nudgeFired) >= 2 && nudgeFired[1] {
+			stopReason = "diminishing_returns"
+			l.Hooks.EmitLoopEnd(ctx, tc, "diminishing_returns")
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("aborted on diminishing returns: %d consecutive iters with <%d bytes of useful tool output past 75%% budget", progress.ConsecutiveLow(), progressLowBytesThreshold),
+			})
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "diminishing_returns"})
+			return nil
 		}
 
 		// Hook-driven halt: if any PreToolUse hook in this batch
