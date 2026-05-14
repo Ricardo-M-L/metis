@@ -34,6 +34,7 @@ import (
 // reference so it can persist the wakeup; that pointer is wired in by
 // Register() at startup, scoped to the same session as the agent loop.
 type ScheduleWakeup struct {
+	tools.BaseTool
 	gate    *permission.Gate
 	service *agent.CronService
 }

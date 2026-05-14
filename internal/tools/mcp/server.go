@@ -56,10 +56,11 @@ type Server struct {
 }
 
 type MCPTool struct {
-	name        string
-	description string
-	inputSchema map[string]any
-	server      *Server
+	tools.BaseTool // default IsEnabled() = true; MCP tools are always exposed once their server is registered
+	name           string
+	description    string
+	inputSchema    map[string]any
+	server         *Server
 }
 
 func (t *MCPTool) Name() string        { return "mcp__" + t.server.name + "__" + t.name }

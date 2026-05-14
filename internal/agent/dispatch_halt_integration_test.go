@@ -166,3 +166,5 @@ func TestRun_ResetsHaltOnEntry(t *testing.T) {
 		t.Errorf("haltReason should also be cleared; got %q", l.haltReason)
 	}
 }
+
+func (haltyTool) IsEnabled() bool { return true }

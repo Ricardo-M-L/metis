@@ -329,3 +329,5 @@ func (s stubTool) CanUse(_ context.Context, _ map[string]any) (tools.Permission,
 func (s stubTool) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
 	return &tools.Result{Output: ""}, nil
 }
+
+func (stubTool) IsEnabled() bool { return true }

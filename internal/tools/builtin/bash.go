@@ -31,6 +31,7 @@ import (
 var AutoBackgroundThreshold = 60 * time.Second
 
 type Bash struct {
+	tools.BaseTool
 	gate       *permission.Gate
 	settings   config.ToolBashSettings
 	classifier *BashClassifier

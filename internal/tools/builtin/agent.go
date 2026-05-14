@@ -96,6 +96,7 @@ const defaultMaxAgentDepth = 3
 // nil, `run_in_background` requests gracefully fall back to the
 // foreground path so existing tests + minimal embeddings still work.
 type Agent struct {
+	tools.BaseTool
 	gate           *permission.Gate
 	provider       llm.Provider
 	registry       *tools.Registry

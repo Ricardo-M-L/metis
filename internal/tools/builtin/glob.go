@@ -76,7 +76,7 @@ const (
 	defaultGlobMaxDepthOther = 32
 )
 
-type Glob struct{ gate *permission.Gate }
+type Glob struct{ tools.BaseTool; gate *permission.Gate }
 
 func (Glob) Name() string { return "Glob" }
 func (Glob) Description() string {

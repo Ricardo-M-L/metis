@@ -31,6 +31,7 @@ import (
 // the tool resolves the name via Roster.Lookup and pushes a
 // PeerMessage onto the recipient's Mailbox.
 type MessageTeammate struct {
+	tools.BaseTool
 	gate   *permission.Gate
 	roster *agent.Roster
 }

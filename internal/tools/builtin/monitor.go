@@ -36,6 +36,7 @@ import (
 // pre-checks the command string against the user's allow/deny rules)
 // and the agent.MonitorRegistry that the loop drains.
 type Monitor struct {
+	tools.BaseTool
 	Jobs     *jobs.Registry
 	Watches  *agent.MonitorRegistry
 	gate     *permission.Gate

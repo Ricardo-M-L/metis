@@ -32,7 +32,7 @@ import (
 
 // WebBrowse renders a URL via headless chromium and returns extracted
 // page text. Subject to the same permission gate as WebFetch.
-type WebBrowse struct{ gate *permission.Gate }
+type WebBrowse struct{ tools.BaseTool; gate *permission.Gate }
 
 func NewWebBrowse(gate *permission.Gate) WebBrowse { return WebBrowse{gate: gate} }
 

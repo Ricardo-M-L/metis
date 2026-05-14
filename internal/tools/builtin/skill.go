@@ -25,6 +25,7 @@ import (
 
 // Skill exposes list/get/invoke over the multi-source skill loader.
 type Skill struct {
+	tools.BaseTool
 	loader *skillsloader.Loader
 	// userDir is preserved so `invoke` can still bump the per-skill `Uses`
 	// counter on disk for skills that came from the user layer (we don't

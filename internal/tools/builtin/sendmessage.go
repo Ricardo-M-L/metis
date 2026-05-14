@@ -15,6 +15,7 @@ import (
 // e.g. "slack:#general" or "telegram:@chatid". Implementations are in
 // internal/channels/<platform>/.
 type SendMessage struct {
+	tools.BaseTool
 	gate            *permission.Gate
 	registry        *channels.Registry
 	defaultPlatform string

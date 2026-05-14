@@ -14,6 +14,7 @@ import (
 )
 
 type Read struct {
+	tools.BaseTool
 	gate  *permission.Gate
 	state *ReadFileState
 }

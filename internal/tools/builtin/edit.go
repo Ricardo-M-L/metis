@@ -12,6 +12,7 @@ import (
 )
 
 type Edit struct {
+	tools.BaseTool
 	gate  *permission.Gate
 	state *ReadFileState
 }

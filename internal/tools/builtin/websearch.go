@@ -42,6 +42,7 @@ import (
 // works without any API key via DuckDuckGo's lite HTML view; upgrades
 // to Serper.dev's structured Google API when SERPER_API_KEY is set.
 type WebSearch struct {
+	tools.BaseTool
 	gate *permission.Gate
 }
 

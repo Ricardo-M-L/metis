@@ -28,7 +28,30 @@ import (
 // Only Go is fully supported (uses `gopls` CLI subcommand). For other
 // languages we return a clear "no LSP backend available" rather than
 // pretending. Users can install gopls if needed.
+//
+// LSP intentionally does NOT embed tools.BaseTool — it implements its
+// own IsEnabled() that checks whether `gopls` is on PATH. When gopls
+// is missing the tool is hidden from the model entirely so it never
+// gets a tool call it can only fail. This is the "tool self-decides
+// based on environment" pattern claude-code uses for tools like
+// WebBrowser (depends on chromium binary).
 type LSP struct{ gate *permission.Gate }
+
+// IsEnabled reports whether the LSP tool can actually function in
+// this environment. Today that means: gopls is on PATH. Other
+// languages would extend this — e.g. add pyright / tsserver checks
+// once their handlers land. Called once at registration; the
+// exec.LookPath cost (one stat call) is negligible.
+//
+// Rationale for self-disable rather than degrade-and-error: a tool
+// that 100% errors on every input is noise in the model's tool
+// palette. Hiding it (IsEnabled=false → reg.Restrict filters out)
+// is cleaner — model doesn't see it, model doesn't try it. Mirrors
+// claude-code's Tool.isEnabled (Tool.ts:403).
+func (LSP) IsEnabled() bool {
+	_, err := exec.LookPath("gopls")
+	return err == nil
+}
 
 func (LSP) Name() string { return "LSP" }
 func (LSP) Description() string {

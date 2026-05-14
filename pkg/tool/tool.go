@@ -100,7 +100,44 @@ type Tool interface {
 	Concurrency(input map[string]any) Concurrency
 	CanUse(ctx context.Context, input map[string]any) (Permission, string)
 	Execute(ctx context.Context, input map[string]any) (*Result, error)
+
+	// IsEnabled reports whether the tool is currently available in the
+	// running environment. Returning false hides the tool from the
+	// model entirely — the registry filters it out before assembling
+	// the tools[] list, so it never appears in the prompt and the
+	// model can't try to call it. Called once at registration time.
+	//
+	// Most tools should embed BaseTool to inherit the default
+	// "always enabled" implementation. Override only when the tool
+	// has a real environment dependency it can detect itself
+	// (e.g. LSP checking gopls on PATH).
+	//
+	// Mirrors claude-code's Tool.isEnabled (Tool.ts:403) — moves the
+	// "is this tool present in this environment?" decision from a
+	// centralized if-chain in register.go to the tool itself, so the
+	// knowledge of what each tool depends on lives with the tool.
+	IsEnabled() bool
 }
+
+// BaseTool provides the default IsEnabled() = true implementation as
+// a zero-size embeddable. Tools that have no environment-specific
+// availability check should embed it:
+//
+//	type Read struct {
+//	    BaseTool       // inherits IsEnabled() = true for free
+//	    gate  *permission.Gate
+//	    state *ReadFileState
+//	}
+//
+// Embedding adds no memory overhead (BaseTool is empty) and removes
+// 35+ otherwise-identical `func (Read) IsEnabled() bool { return true }`
+// stubs across builtin/. Tools with real availability checks (LSP) just
+// don't embed BaseTool and write their own IsEnabled().
+type BaseTool struct{}
+
+// IsEnabled returns true — the default for tools without any
+// environment-specific availability check.
+func (BaseTool) IsEnabled() bool { return true }
 
 // ShortDescriptor is an optional interface tools can implement to
 // provide a curated short-form description distinct from Description().

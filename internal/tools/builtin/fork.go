@@ -40,6 +40,7 @@ import (
 // pulled from the dispatch-time ParentSnapshot — no other plumbing
 // needed since dispatch.go attaches it for every tool call.
 type Fork struct {
+	tools.BaseTool
 	gate     *permission.Gate
 	provider llm.Provider
 	registry *tools.Registry

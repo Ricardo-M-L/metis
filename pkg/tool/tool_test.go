@@ -8,8 +8,12 @@ import (
 // fakeTool is a minimal implementation used only to assert that pkg/tool
 // satisfies what an external plugin author would need: implementing the
 // public interface compiles and behaves predictably without referencing
-// any internal package.
-type fakeTool struct{ name string }
+// any internal package. Embeds BaseTool to inherit the default
+// IsEnabled() = true — same pattern external plugin authors should use.
+type fakeTool struct {
+	BaseTool
+	name string
+}
 
 func (t fakeTool) Name() string                           { return t.name }
 func (t fakeTool) Description() string                    { return "fake" }

@@ -15,7 +15,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-type Grep struct{ gate *permission.Gate }
+type Grep struct{ tools.BaseTool; gate *permission.Gate }
 
 func (Grep) Name() string { return "Grep" }
 func (Grep) Description() string {

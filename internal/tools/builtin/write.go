@@ -12,6 +12,7 @@ import (
 )
 
 type Write struct {
+	tools.BaseTool
 	gate  *permission.Gate
 	state *ReadFileState
 }

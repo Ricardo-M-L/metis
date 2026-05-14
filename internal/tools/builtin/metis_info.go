@@ -39,6 +39,7 @@ import (
 // READ-ONLY from this tool's perspective: Execute snapshots state
 // per-call, never mutates.
 type MetisInfo struct {
+	tools.BaseTool
 	gate   *permission.Gate
 	cfg    *config.Config
 	pool   *jobs.Registry

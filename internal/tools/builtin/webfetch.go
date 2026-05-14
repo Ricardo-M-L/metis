@@ -15,6 +15,7 @@ import (
 )
 
 type WebFetch struct {
+	tools.BaseTool
 	gate *permission.Gate
 	http *http.Client
 }

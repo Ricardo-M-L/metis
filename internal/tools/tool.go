@@ -25,6 +25,7 @@ type (
 	Concurrency       = pubtool.Concurrency
 	Result            = pubtool.Result
 	Tool              = pubtool.Tool
+	BaseTool          = pubtool.BaseTool
 	InterruptBehavior = pubtool.InterruptBehavior
 )
 

@@ -56,3 +56,7 @@ func TestDescriptionForTool_ShortHitsImplementer(t *testing.T) {
 		t.Errorf("with short=false, should not use ShortDescription; got:\n%s", got)
 	}
 }
+
+func (fakeToolNoShort) IsEnabled() bool { return true }
+
+func (fakeToolWithShort) IsEnabled() bool { return true }

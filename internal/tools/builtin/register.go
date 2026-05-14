@@ -80,6 +80,14 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 		if disabled[t.Name()] {
 			continue
 		}
+		// Self-aware availability check (claude-code Tool.isEnabled
+		// parity): a tool that knows it can't run in this environment
+		// (LSP w/o gopls, hypothetical WebBrowse w/o chromium) returns
+		// false and is filtered out before the model ever sees it. Most
+		// tools embed tools.BaseTool which returns true unconditionally.
+		if !t.IsEnabled() {
+			continue
+		}
 		r.Register(t)
 	}
 }

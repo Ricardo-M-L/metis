@@ -8,7 +8,11 @@ import (
 )
 
 // fakeTool is the smallest possible Tool for registry tests.
-type fakeTool struct{ name string }
+// Embeds BaseTool to inherit the default IsEnabled() = true.
+type fakeTool struct {
+	BaseTool
+	name string
+}
 
 func (f fakeTool) Name() string                { return f.name }
 func (f fakeTool) Description() string         { return "" }

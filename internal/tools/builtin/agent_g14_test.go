@@ -25,8 +25,11 @@ import (
 
 // stubTool implements tools.Tool with a configurable name. Used to
 // populate a parent registry so we can inspect what the filter
-// keeps.
-type stubTool struct{ name string }
+// keeps. Embeds BaseTool to inherit default IsEnabled() = true.
+type stubTool struct {
+	tools.BaseTool
+	name string
+}
 
 func (s stubTool) Name() string                                 { return s.name }
 func (s stubTool) Description() string                          { return "stub " + s.name }

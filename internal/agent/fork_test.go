@@ -400,3 +400,5 @@ func TestForkInflight_Counter(t *testing.T) {
 		t.Errorf("inflight should rebalance: before=%d after=%d", before, after)
 	}
 }
+
+func (forkFakeTool) IsEnabled() bool { return true }

@@ -189,3 +189,5 @@ func TestApplyLazySchema_AppendsToolSearchEntry(t *testing.T) {
 		t.Errorf("built-ins shifted: %q %q", out[0].Name, out[1].Name)
 	}
 }
+
+func (fakeMCPTool) IsEnabled() bool { return true }

@@ -200,3 +200,5 @@ func (t testTool) Execute(_ context.Context, _ map[string]any) (*tools.Result, e
 
 // silence unused import linter
 var _ = permission.ModeBypass
+
+func (testTool) IsEnabled() bool { return true }

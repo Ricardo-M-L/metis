@@ -37,6 +37,7 @@ import (
 // alice to do" with "yep alice finished, here's the result" without
 // having to remember an agent_id verbatim.
 type SubAgentList struct {
+	tools.BaseTool
 	gate   *permission.Gate
 	roster *agent.Roster
 }
@@ -110,6 +111,7 @@ func (s SubAgentList) Execute(_ context.Context, _ map[string]any) (*tools.Resul
 // terminal status if the sub-agent has finished. Safe to call mid-
 // run; the read is a snapshot, doesn't block the sub-agent.
 type SubAgentOutput struct {
+	tools.BaseTool
 	gate   *permission.Gate
 	roster *agent.Roster
 }
@@ -184,6 +186,7 @@ func (s SubAgentOutput) Execute(_ context.Context, in map[string]any) (*tools.Re
 // and finishes its accumulated output snapshot for one last
 // SubAgentOutput read.
 type SubAgentStop struct {
+	tools.BaseTool
 	gate   *permission.Gate
 	roster *agent.Roster
 }

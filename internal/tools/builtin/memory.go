@@ -32,6 +32,7 @@ import (
 // The pointer is wired in by `runtime.BuildToolRegistry` after
 // `MemoryManager` is constructed in `runtime.BuildAgentLoop`.
 type Memory struct {
+	tools.BaseTool
 	gate *permission.Gate
 	mm   *memory.MemoryManager
 }

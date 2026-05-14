@@ -199,3 +199,5 @@ func TestDispatchToolSpecs_AutoUnknownWindowIsConservative(t *testing.T) {
 		t.Errorf("auto mode with unknown ContextWindow must NOT strip")
 	}
 }
+
+func (*fatTool) IsEnabled() bool { return true }

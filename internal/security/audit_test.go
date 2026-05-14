@@ -152,3 +152,5 @@ func findingHasCode(r *Report, code string) bool {
 	}
 	return false
 }
+
+func (stubTool) IsEnabled() bool { return true }

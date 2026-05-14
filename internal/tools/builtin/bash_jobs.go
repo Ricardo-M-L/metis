@@ -64,6 +64,7 @@ func AttachJobsRegistry(reg *tools.Registry, pool *jobs.Registry, gate *permissi
 // or to decide whether to wait vs spawn another. Empty input schema
 // because there's nothing to filter on yet.
 type BashList struct {
+	tools.BaseTool
 	gate *permission.Gate
 	pool *jobs.Registry
 }
@@ -139,6 +140,7 @@ func (l BashList) Execute(_ context.Context, _ map[string]any) (*tools.Result, e
 // The job doesn't have to be done; reading mid-run is supported and
 // returns whatever's been written so far.
 type BashOutput struct {
+	tools.BaseTool
 	gate *permission.Gate
 	pool *jobs.Registry
 }
@@ -219,6 +221,7 @@ func (o BashOutput) Execute(_ context.Context, in map[string]any) (*tools.Result
 // to "killed" asynchronously. Calling on an already-terminal job is a
 // silent no-op.
 type BashKill struct {
+	tools.BaseTool
 	gate *permission.Gate
 	pool *jobs.Registry
 }

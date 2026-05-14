@@ -230,3 +230,5 @@ func TestShortToolDesc(t *testing.T) {
 		})
 	}
 }
+
+func (*fakeTool) IsEnabled() bool { return true }

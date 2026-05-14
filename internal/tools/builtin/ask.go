@@ -8,7 +8,7 @@ import (
 )
 
 // AskUser asks the user a question and returns the answer.
-type AskUser struct{ gate *permission.Gate }
+type AskUser struct{ tools.BaseTool; gate *permission.Gate }
 
 func (AskUser) Name() string { return "AskUser" }
 func (AskUser) Description() string {
