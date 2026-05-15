@@ -86,6 +86,66 @@ func TestSummarizeToolResult_PerTool(t *testing.T) {
 	}
 }
 
+// TestSummarizeToolResult_ReadError — error-path Read must NOT report
+// "(N lines)" since the Output is the error message, not file content.
+// Pre-fix: a stat error rendered as "Read foo.go (1 lines)" which read
+// like a tiny successful read; post-fix it's "Read foo.go — failed".
+// Image bug 2026-05-15.
+func TestSummarizeToolResult_ReadError(t *testing.T) {
+	te := ToolEvent{
+		ToolName: "Read",
+		Input:    map[string]any{"path": "/tmp/missing.go"},
+		Output:   "stat /tmp/missing.go: no such file or directory",
+		IsError:  true,
+		Duration: 0,
+	}
+	got := summarizeToolResult(te)
+	if strings.Contains(got, "lines)") {
+		t.Errorf("error summary should NOT claim a line count; got %q", got)
+	}
+	if !strings.Contains(got, "missing.go") {
+		t.Errorf("error summary should still surface basename; got %q", got)
+	}
+	if !strings.Contains(got, "failed") {
+		t.Errorf("error summary should say 'failed'; got %q", got)
+	}
+}
+
+// TestTruncateMiddle_PreservesBothEnds — for path-bearing error lines
+// the basename at the END is what tells the user what failed; the
+// pre-fix tail-cut form hid it. Middle truncation keeps both ends
+// visible. Image bug 2026-05-15. Uses the same 120-rune cap that
+// renderErrorBody passes in production.
+func TestTruncateMiddle_PreservesBothEnds(t *testing.T) {
+	long := "stat /Users/foo/Documents/公司学习文件/opensource-contributions/claude-code-sourcemap/restored-src/src/coordinator/index.ts/loop.go: no such file or directory"
+	got := truncateMiddle(long, 120)
+	if len([]rune(got)) > 121 {
+		t.Errorf("output too long: %d runes (target ≤120)", len([]rune(got)))
+	}
+	if !strings.HasPrefix(got, "stat ") {
+		t.Errorf("head not preserved: %q", got)
+	}
+	// The basename `loop.go` and the syscall error tail must survive.
+	if !strings.Contains(got, "loop.go") {
+		t.Errorf("basename loop.go lost in truncation: %q", got)
+	}
+	if !strings.Contains(got, "no such file") {
+		t.Errorf("error tail lost in truncation: %q", got)
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("middle ellipsis missing: %q", got)
+	}
+}
+
+// TestTruncateMiddle_ShortLeavesUntouched — strings shorter than
+// maxRunes pass through unchanged. Guards against silly off-by-ones.
+func TestTruncateMiddle_ShortLeavesUntouched(t *testing.T) {
+	in := "stat /tmp/x: no such file"
+	if got := truncateMiddle(in, 120); got != in {
+		t.Errorf("short input mutated:\n  in:  %q\n  out: %q", in, got)
+	}
+}
+
 // TestCountEditDiff verifies our line-count math against go-udiff for
 // the kinds of inputs Edit tool typically gets — pure-add, pure-remove,
 // mixed, identical (no-op).

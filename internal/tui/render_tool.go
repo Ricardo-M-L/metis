@@ -133,6 +133,14 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 // renderErrorBody is the error-path counterpart to renderToolOutputPreview:
 // same 5-line cap with truncation tail, but rendered in error red so the
 // failure mode is visually unmistakable.
+//
+// Long lines use MIDDLE truncation (`head … tail`) instead of left
+// truncation. Errors like `stat /Users/.../foo/bar/index.ts/loop.go:
+// no such file or directory` carry information at BOTH ends — the
+// verb ("stat") at the front, the offending basename ("loop.go") and
+// the system error tail at the back. Left-truncate hid the basename,
+// confusingly making the error look unrelated to the read it came
+// from. Image bug 2026-05-15.
 func renderErrorBody(out string, expanded bool) string {
 	out = strings.TrimRight(out, "\n")
 	if out == "" {
@@ -147,7 +155,7 @@ func renderErrorBody(out string, expanded bool) string {
 	}
 	var s strings.Builder
 	for _, ln := range show {
-		s.WriteString(errStyle.Render("       " + truncateRunes(ln, 120)))
+		s.WriteString(errStyle.Render("       " + truncateMiddle(ln, 120)))
 		s.WriteString("\n")
 	}
 	if !expanded && len(lines) > maxPreview {
@@ -157,6 +165,36 @@ func renderErrorBody(out string, expanded bool) string {
 	return s.String()
 }
 
+// truncateMiddle keeps the first and last segments of s when the rune
+// count exceeds maxRunes, joining them with " … ". Bias is slightly
+// toward the tail (sysprefix verbs are short — `stat ` / `open ` /
+// `lstat ` — the meaningful content is at the back). For
+//
+//	stat /a/very/long/path/that/exceeds/the/cap/loop.go: no such file
+//
+// at maxRunes=60 you get
+//
+//	stat /a/very/long/path … cap/loop.go: no such file
+//
+// instead of the left-truncated form which hid `loop.go`.
+func truncateMiddle(s string, maxRunes int) string {
+	rs := []rune(s)
+	if len(rs) <= maxRunes {
+		return s
+	}
+	const sep = " … "
+	keep := maxRunes - len(sep)
+	if keep < 4 {
+		// Too tight to do middle-truncate gracefully — fall back to
+		// the original tail-cut form.
+		return string(rs[:maxRunes-1]) + "…"
+	}
+	// 40% to head, 60% to tail (favor the more diagnostic end).
+	head := keep * 2 / 5
+	tail := keep - head
+	return string(rs[:head]) + sep + string(rs[len(rs)-tail:])
+}
+
 // summarizeToolResult crafts the per-tool one-line description that
 // follows the ⎿ checkmark. Format is `<elapsed> · <tool-specific phrase>`.
 func summarizeToolResult(te ToolEvent) string {
@@ -164,6 +202,16 @@ func summarizeToolResult(te ToolEvent) string {
 	switch te.ToolName {
 	case "Read":
 		path := stringField(te.Input, "path", "file_path")
+		// Error-path: te.Output is the error message (e.g. a stat
+		// "no such file" line), so lineCount(Output) reports "(1 lines)"
+		// which reads as a tiny successful read. Surface the failure
+		// explicitly instead — image bug 2026-05-15.
+		if te.IsError {
+			if path != "" {
+				return fmt.Sprintf("%s · Read %s — failed", dur, basename(path))
+			}
+			return fmt.Sprintf("%s · Read failed", dur)
+		}
 		n := lineCount(te.Output)
 		if path != "" {
 			return fmt.Sprintf("%s · Read %s (%d lines)", dur, basename(path), n)
