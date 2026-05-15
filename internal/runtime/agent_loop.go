@@ -174,6 +174,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		}
 	}
 
+
 	// Lazy MCP tool schemas (ToolSearch). Mode is read from the
 	// ENABLE_TOOL_SEARCH env var inside agent/dispatch.go on every
 	// call — we just need to feed Loop.ContextWindow so the auto
@@ -222,6 +223,25 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// Apply the tier AFTER MaxOutputTokens is set so the effective cap
 	// is correct.
 	loop.Compactor.ApplyWindowTier(opts.Provider.MaxContextTokens() - providerMaxTokens(cfg))
+
+	// Microcompact cache dir (2026-05-15 wire-up). The Compactor.Microcompact
+	// path was implemented + tested but never reachable in production
+	// because MicrocompactDir defaulted to "" (which ShouldMicrocompact
+	// uses as the kill switch). Now: default-on, lands under
+	// <session.dir>/microcompact-cache. env METIS_MICROCOMPACT=0 disables
+	// it (useful if the user is on a network-mount Session.Dir where
+	// per-iteration disk writes are expensive).
+	//
+	// Why default-on: the path is lossless from the model's POV
+	// (cached content recoverable via Read on the stub-printed path),
+	// and only fires for genuinely large tool_results past the snip
+	// threshold. The cost is small — a few KB writes per turn at most.
+	if os.Getenv("METIS_MICROCOMPACT") != "0" && cfg.Session.Dir != "" {
+		loop.Compactor.MicrocompactDir = filepath.Join(cfg.Session.Dir, "microcompact-cache")
+		if os.Getenv("METIS_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "metis: microcompact cache dir = %s\n", loop.Compactor.MicrocompactDir)
+		}
+	}
 
 	// Loop detector — wired by default (post-2026-05-08). The earlier
 	// opt-in design left the user's only safety net at MaxIters=50,

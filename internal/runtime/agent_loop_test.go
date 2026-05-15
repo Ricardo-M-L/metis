@@ -226,6 +226,51 @@ func TestResolveMemoryRoot_FallsBackToSessionDir(t *testing.T) {
 	}
 }
 
+// TestBuildAgentLoop_WiresMicrocompactDir — the Compactor.Microcompact
+// path was dead code before 2026-05-15 because MicrocompactDir was
+// empty, which is the kill switch. BuildAgentLoop now defaults the
+// dir to <session.dir>/microcompact-cache.
+func TestBuildAgentLoop_WiresMicrocompactDir(t *testing.T) {
+	// Save and clear the env var in case the user has it set.
+	oldEnv := os.Getenv("METIS_MICROCOMPACT")
+	_ = os.Unsetenv("METIS_MICROCOMPACT")
+	t.Cleanup(func() { _ = os.Setenv("METIS_MICROCOMPACT", oldEnv) })
+
+	cfg := defaultLoopCfg(t)
+	loop := BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider: &stubProvider{maxCtx: 200_000},
+		Registry: tools.NewRegistry(),
+		Gate:     permission.New(permission.ModeAcceptEdits),
+		MaxIter:  10,
+	})
+	if loop.Compactor == nil {
+		t.Fatal("compactor not wired")
+	}
+	want := filepath.Join(cfg.Session.Dir, "microcompact-cache")
+	if loop.Compactor.MicrocompactDir != want {
+		t.Errorf("MicrocompactDir = %q, want %q", loop.Compactor.MicrocompactDir, want)
+	}
+}
+
+// TestBuildAgentLoop_MicrocompactDisabledByEnv — METIS_MICROCOMPACT=0
+// must clear the dir back to "" so ShouldMicrocompact short-circuits.
+func TestBuildAgentLoop_MicrocompactDisabledByEnv(t *testing.T) {
+	oldEnv := os.Getenv("METIS_MICROCOMPACT")
+	_ = os.Setenv("METIS_MICROCOMPACT", "0")
+	t.Cleanup(func() { _ = os.Setenv("METIS_MICROCOMPACT", oldEnv) })
+
+	cfg := defaultLoopCfg(t)
+	loop := BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider: &stubProvider{maxCtx: 200_000},
+		Registry: tools.NewRegistry(),
+		Gate:     permission.New(permission.ModeAcceptEdits),
+		MaxIter:  10,
+	})
+	if loop.Compactor.MicrocompactDir != "" {
+		t.Errorf("MicrocompactDir = %q, want empty (METIS_MICROCOMPACT=0)", loop.Compactor.MicrocompactDir)
+	}
+}
+
 // TestBuildMemoryManager_ProjectScopeWritesLocally — full integration:
 // create .metis/memory in tmp, run BuildMemoryManager, write a USER
 // block, confirm the file lands under the project dir (not session dir).
