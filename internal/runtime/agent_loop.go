@@ -174,6 +174,18 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		}
 	}
 
+	// AutoRetrieve LLM rerank (METIS_AUTO_RETRIEVE_RERANK=1). When on,
+	// the BM25 top K*3 candidates are passed to the active provider for
+	// final ranking down to top K. Off by default — rerank costs ~1
+	// extra Complete() call per turn (~500ms-2s). Has no effect when
+	// AutoRetrieveK == 0.
+	if v := os.Getenv("METIS_AUTO_RETRIEVE_RERANK"); v == "1" || strings.EqualFold(v, "true") {
+		loop.AutoRetrieveRerank = true
+		if os.Getenv("METIS_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "metis: auto-retrieve LLM rerank enabled (BM25 top K*3 → LLM picks top K)\n")
+		}
+	}
+
 
 	// Lazy MCP tool schemas (ToolSearch). Mode is read from the
 	// ENABLE_TOOL_SEARCH env var inside agent/dispatch.go on every

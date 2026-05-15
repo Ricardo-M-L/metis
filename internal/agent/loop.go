@@ -64,6 +64,18 @@ type Loop struct {
 	// via runtime.BuildAgentLoop's env override.
 	AutoRetrieveK int
 
+	// AutoRetrieveRerank, when true, fetches BM25 top K*3 candidates
+	// then asks the active provider to LLM-rerank them down to top-K.
+	// More accurate than raw BM25 (the ranker is an actual language
+	// model that understands "the user asked about X, this passage
+	// is about a different X") at the cost of one extra Complete()
+	// call per turn (~500ms-2s). Falls back to BM25 ordering on
+	// timeout / parse error / empty provider — never blocks the loop.
+	//
+	// false = disabled (default). Opt-in via METIS_AUTO_RETRIEVE_RERANK=1.
+	// Has no effect when AutoRetrieveK == 0.
+	AutoRetrieveRerank bool
+
 	// PlanMode: collect tool calls but do NOT execute; emit as EventPlan.
 	PlanMode bool
 
@@ -815,9 +827,21 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 	// archival and append the top-K passages as their own section.
 	// Off by default (AutoRetrieveK == 0); typically toggled via
 	// METIS_AUTO_RETRIEVE=K at runtime.BuildAgentLoop wiring time.
+	//
+	// AutoRetrieveRerank, when on, fetches BM25 top K*3 candidates and
+	// asks the provider to LLM-rerank them down to the final K — more
+	// accurate than raw BM25 score, costs one Complete() call per turn.
+	// Falls back to BM25 ordering on any failure.
 	var retrieveBody string
 	if l.Memory != nil && l.AutoRetrieveK > 0 {
-		retrieveBody = l.Memory.AutoRetrieve(lastUserTextLocked(l.Messages), l.AutoRetrieveK)
+		query := lastUserTextLocked(l.Messages)
+		if l.AutoRetrieveRerank && l.Provider != nil {
+			candidates := l.Memory.AutoRetrieveCandidates(query, l.AutoRetrieveK*3)
+			picked := rerankAutoRetrieve(context.Background(), l.Provider, query, candidates, l.AutoRetrieveK)
+			retrieveBody = memory.FormatRetrieveSection(picked)
+		} else {
+			retrieveBody = l.Memory.AutoRetrieve(query, l.AutoRetrieveK)
+		}
 	}
 	if len(l.SystemSections) > 0 {
 		sections = make([]llm.SystemSection, 0, len(l.SystemSections)+2)

@@ -1121,28 +1121,54 @@ func (mm *MemoryManager) Archival() *ArchivalMemory { return mm.archival }
 // verbatim (truncating risks corrupting the meaning); callers should
 // cap K, not per-passage bytes.
 func (mm *MemoryManager) AutoRetrieve(query string, k int) string {
+	hits := mm.AutoRetrieveCandidates(query, k)
+	return FormatRetrieveSection(hits)
+}
+
+// AutoRetrieveCandidates is the raw-passage variant of AutoRetrieve:
+// returns the BM25 top-N as []Passage so callers (e.g. the agent
+// loop's optional LLM rerank path) can post-process before formatting.
+//
+// Returns nil — not an error — when archival is empty / disabled /
+// query is whitespace, mirroring AutoRetrieve's "fail soft" contract.
+// Caller can unconditionally pass the result to FormatRetrieveSection.
+func (mm *MemoryManager) AutoRetrieveCandidates(query string, k int) []Passage {
 	if mm == nil || mm.archival == nil {
-		return ""
+		return nil
 	}
 	if k <= 0 {
-		return ""
+		return nil
 	}
 	q := strings.TrimSpace(query)
 	if q == "" {
-		return ""
+		return nil
 	}
 	hits, err := mm.archival.Search(SearchOptions{
 		Query:  q,
 		SortBy: "relevance",
 		Limit:  k,
 	})
-	if err != nil || len(hits) == 0 {
+	if err != nil {
+		return nil
+	}
+	return hits
+}
+
+// FormatRetrieveSection wraps a passage list in the same
+// <auto-retrieve>-fenced block that AutoRetrieve emits. Exposed so
+// LLM-reranked / externally-filtered candidate lists can produce the
+// same on-wire shape without duplicating the formatting code.
+//
+// nil / empty input returns "" so the caller can unconditionally
+// concatenate the result without an extra branch.
+func FormatRetrieveSection(passages []Passage) string {
+	if len(passages) == 0 {
 		return ""
 	}
 	var sb strings.Builder
 	sb.WriteString("<auto-retrieve>\n")
 	sb.WriteString("[System note: 这些是从 archival memory 中按相关度自动召回的过往片段，仅供参考。]\n")
-	for i, p := range hits {
+	for i, p := range passages {
 		fmt.Fprintf(&sb, "\n[%d] %s\n", i+1, strings.TrimSpace(p.Content))
 	}
 	sb.WriteString("</auto-retrieve>")
