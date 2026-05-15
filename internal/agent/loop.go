@@ -758,12 +758,19 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			var msg string
 			switch reason {
 			case LoopSignatureRepeat:
-				// More actionable than "X total tool calls" — tells the
-				// user the agent kept running the same call+result combo.
+				// The genuine loop signal: same tool call+result combo
+				// fired N+ times in the recent window. Far more
+				// actionable than a raw call count.
 				msg = fmt.Sprintf("loop detector aborted: same tool call+result repeated within window of %d steps",
 					l.Detector.SignatureWindowSize)
+			case LoopGlobalCircuitBreaker:
+				// Only reachable when user opted in to the runaway
+				// backstop via [loop_detection].global > 0. Default
+				// config disables this branch entirely.
+				msg = fmt.Sprintf("loop detector aborted: opt-in runaway cap of %d total tool calls reached",
+					l.Detector.GlobalThreshold)
 			default:
-				msg = fmt.Sprintf("loop detector aborted: %d total tool calls", stats.GlobalCount)
+				msg = fmt.Sprintf("loop detector aborted (reason=%s, count=%d)", reason, stats.GlobalCount)
 			}
 			stopReason = "loop_detected"
 			l.Hooks.EmitLoopEnd(ctx, tc, "loop_detected")

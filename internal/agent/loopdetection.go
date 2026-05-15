@@ -77,20 +77,19 @@ type LoopDetector struct {
 // window means at least half the recent steps are byte-for-byte the
 // same call+result — that's a real loop, not flaky retries.
 //
-// GlobalThreshold raised 2026-05-10: a real "write tests for every file
-// in this dir" task routinely needs 100-200 reads + writes + edits in a
-// single Run. The previous 80-call cap killed legitimate work mid-flight
-// (user report image #2: "edited 22 files, 31 reads, then loop detector
-// aborted: 80 total tool calls"). 250 keeps the per-tool repeat (20),
-// signature-window (5×10), and ping-pong detectors as the actual loop
-// guards; the global cap exists only to bound runaway sessions, not to
-// limit deliberate multi-file work. Override via `[loop_detection].global`
-// in config.toml if you need a tighter (or looser) bound.
+// GlobalThreshold defaults to 0 (disabled, 2026-05-15 refactor). Earlier
+// versions defaulted to 80, then 250 — both killed legitimate long-running
+// multi-agent workflows mid-flight. The signature-window detector and
+// the diminishing-returns detector (progress_detector.go, which mirrors
+// claude-code's tokenBudget.ts:59-63) provide the real loop guards;
+// counting raw tool invocations isn't a meaningful loop signal once
+// SubAgentList/SubAgentOutput polling enters the mix. Users who want
+// an opt-in runaway cap can set [loop_detection].global = N.
 func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
 		WarningThreshold:  10,
 		CriticalThreshold: 20,
-		GlobalThreshold:   250,
+		GlobalThreshold:   0, // 0 = disabled; rely on signature-window + progress detector
 
 		SignatureWindowSize: 10,
 		SignatureMaxRepeats: 5,
@@ -172,8 +171,14 @@ func (d *LoopDetector) checkPingPong(toolName string) {
 	}
 }
 
-// checkGlobalBreaker checks total call count.
+// checkGlobalBreaker checks total call count. Only emits the
+// onCritical callback when GlobalThreshold is explicitly > 0
+// (opt-in runaway backstop). See ShouldAbort comment for the
+// 2026-05-15 design rationale.
 func (d *LoopDetector) checkGlobalBreaker() {
+	if d.GlobalThreshold <= 0 {
+		return
+	}
 	if d.globalCount >= d.GlobalThreshold {
 		if d.onCritical != nil {
 			msg := "global circuit breaker: " + itoa(d.globalCount) + " total tool calls"
@@ -251,14 +256,33 @@ func (d *LoopDetector) RecordStep(toolUses, results []provider.ContentBlock) {
 	}
 }
 
-// ShouldAbort returns true if loops have been detected and user hasn't overridden.
+// ShouldAbort returns true if a real loop pattern has been detected.
+//
+// 2026-05-15 design refactor (option C): the "X total tool calls"
+// abort path was REMOVED — count-based caps killed legitimate long
+// multi-agent workflows (8-parallel-explore + SubAgentList polling
+// routinely racks up 80+ calls of useful work; the 40-minute audit
+// test caught this at call 81). claude-code intentionally has no
+// tool-call-count cap; it relies on token-delta diminishing returns
+// (tokenBudget.ts:59-63) which metis already mirrors in
+// internal/agent/progress_detector.go. SignatureWindow keeps catching
+// the genuine "same call+same result, 5× in 10 steps" patterns that
+// indicate a real wedge.
+//
+// GlobalThreshold is retained as an OPTIONAL runaway backstop: when
+// > 0, it still triggers abort. Users who want a hard ceiling can
+// set [loop_detection].global = N. Default is 0 (disabled) so the
+// loop runs as long as it's making progress.
 func (d *LoopDetector) ShouldAbort() bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if d.signatureTripped {
 		return true
 	}
-	return d.globalCount >= d.GlobalThreshold
+	if d.GlobalThreshold > 0 && d.globalCount >= d.GlobalThreshold {
+		return true
+	}
+	return false
 }
 
 // AbortReason returns a short kind tag for whichever rule fired.
@@ -269,7 +293,7 @@ func (d *LoopDetector) AbortReason() LoopDetectorKind {
 	if d.signatureTripped {
 		return LoopSignatureRepeat
 	}
-	if d.globalCount >= d.GlobalThreshold {
+	if d.GlobalThreshold > 0 && d.globalCount >= d.GlobalThreshold {
 		return LoopGlobalCircuitBreaker
 	}
 	return ""

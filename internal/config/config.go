@@ -640,10 +640,21 @@ func defaults() *Config {
 		LoopDetection: LoopDetection{
 			// Enabled is no-op now (always-on by default); kept true so
 			// the field reads truthy in `metis config show`.
-			Enabled:             true,
-			Warning:             10,
+			Enabled: true,
+			Warning: 10,
+			// 2026-05-15 refactor (option C): Global default = 0 means
+			// "disabled" — no hard cap on total tool calls per session.
+			// The signature-window detector (5 reps / 10 steps) catches
+			// genuine wedge loops; the diminishing-returns detector in
+			// progress_detector.go catches silent no-progress runs.
+			// Counting raw tool invocations was a misleading proxy:
+			// SubAgentList/SubAgentOutput polling in multi-agent workflows
+			// trips count-based caps even when every iter brings new info.
+			// claude-code itself has no equivalent count cap (it relies on
+			// tokenBudget.ts diminishing-returns logic that we mirror).
+			// Set [loop_detection].global = N to opt into a runaway cap.
 			Critical:            20,
-			Global:              80,
+			Global:              0,
 			SignatureWindow:     10,
 			SignatureMaxRepeats: 5,
 		},

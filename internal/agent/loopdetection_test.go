@@ -163,3 +163,53 @@ func TestLoopDetector_NilCallbacksDoNotPanic(t *testing.T) {
 	d.Record("X", nil)
 	// no panic = pass
 }
+
+// TestLoopDetector_DefaultGlobalThresholdDisabled — pins the 2026-05-15
+// refactor C: NewLoopDetector() now defaults GlobalThreshold to 0 so
+// the loop is bounded only by the signature-window detector + the
+// progress_detector's diminishing-returns check, NOT a raw tool-call
+// count. The 40-minute multi-agent audit task previously died at call
+// 81 mid-Phase-2 because the count cap fired before progress_detector
+// got a chance.
+func TestLoopDetector_DefaultGlobalThresholdDisabled(t *testing.T) {
+	d := NewLoopDetector()
+	if d.GlobalThreshold != 0 {
+		t.Fatalf("NewLoopDetector default GlobalThreshold = %d, want 0", d.GlobalThreshold)
+	}
+
+	// 10_000 unique tool calls (no signature repeats) must NOT abort
+	// when the count cap is disabled. Earlier code would have aborted
+	// at call 80, then 250, then 500.
+	for i := 0; i < 10000; i++ {
+		// Each call uses a distinct tool name so callCounts never
+		// reaches CriticalThreshold and signatureWindow never
+		// matches itself (signature looks at result too — none set
+		// here so all signatures are empty / skipped).
+		d.Record("Tool"+itoa(i), map[string]any{})
+	}
+	if d.ShouldAbort() {
+		t.Errorf("ShouldAbort=true after 10000 distinct calls with Global disabled; the count cap was supposed to be off")
+	}
+	if d.AbortReason() != "" {
+		t.Errorf("AbortReason = %q, want empty (no rule fired)", d.AbortReason())
+	}
+}
+
+// TestLoopDetector_GlobalOptInStillWorks — when a user explicitly sets
+// GlobalThreshold > 0 they get the old runaway-backstop behavior.
+// Belt-and-suspenders use case: long batch jobs that want a "kill at
+// N tool calls" emergency stop.
+func TestLoopDetector_GlobalOptInStillWorks(t *testing.T) {
+	d := NewLoopDetector()
+	d.GlobalThreshold = 7 // explicit opt-in
+
+	for i := 0; i < 7; i++ {
+		d.Record("Tool"+itoa(i), map[string]any{})
+	}
+	if !d.ShouldAbort() {
+		t.Fatal("explicit GlobalThreshold=7 should abort at call 7")
+	}
+	if d.AbortReason() != LoopGlobalCircuitBreaker {
+		t.Errorf("AbortReason = %q, want %q", d.AbortReason(), LoopGlobalCircuitBreaker)
+	}
+}

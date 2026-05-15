@@ -20,8 +20,8 @@ func TestDefaults(t *testing.T) {
 	if !cfg.LoopDetection.Enabled {
 		t.Error("LoopDetection should default to enabled")
 	}
-	if cfg.LoopDetection.Global != 80 {
-		t.Errorf("LoopDetection.Global default = %d, want 80", cfg.LoopDetection.Global)
+	if cfg.LoopDetection.Global != 0 {
+		t.Errorf("LoopDetection.Global default = %d, want 0 (disabled — 2026-05-15 refactor C; rely on signature-window + progress detector)", cfg.LoopDetection.Global)
 	}
 	if cfg.LoopDetection.SignatureWindow != 10 {
 		t.Errorf("LoopDetection.SignatureWindow default = %d, want 10", cfg.LoopDetection.SignatureWindow)
