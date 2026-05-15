@@ -292,6 +292,22 @@ func metisCodeBlockStyle() ansi.StyleConfig {
 	chroma.NameBuiltin = zero
 	chroma.CommentPreproc = zero
 	cfg.CodeBlock.Chroma = &chroma
+
+	// Force ASCII table separators. glamour DarkStyleConfig leaves
+	// CenterSeparator/ColumnSeparator/RowSeparator nil, so lipgloss
+	// falls back to NormalBorder which uses `─ │ ┼` — all East Asian
+	// "Ambiguous" width chars. lipgloss sizes columns using narrow=1,
+	// but on CN/JP/KR locale terminals each renders as 2 cells, so the
+	// separator row visibly doubles in width and overflows the line.
+	// Effect: tables look like "half tables" (image #1 user feedback
+	// 2026-05-15). ASCII `- | +` are 1 cell in every locale so the
+	// table never overflows the column allocation lipgloss computed.
+	dash := "-"
+	pipe := "|"
+	plus := "+"
+	cfg.Table.RowSeparator = &dash
+	cfg.Table.ColumnSeparator = &pipe
+	cfg.Table.CenterSeparator = &plus
 	return cfg
 }
 
