@@ -324,15 +324,58 @@ func renderAssistantBody(content string, width int) string {
 	if !looksLikeMarkdown(content) {
 		return styleAsst.Render(content)
 	}
-	r := getMarkdownRenderer(width-4, containsMarkdownTable(content))
-	if r == nil {
-		return styleAsst.Render(content)
+
+	// Fast path: no table in the message, render the whole thing
+	// through glamour as before.
+	segs, hasTable := splitMarkdownTables(content)
+	if !hasTable {
+		r := getMarkdownRenderer(width-4, false)
+		if r == nil {
+			return styleAsst.Render(content)
+		}
+		out, err := r.Render(content)
+		if err != nil {
+			return styleAsst.Render(content)
+		}
+		return strings.TrimSpace(out)
 	}
-	out, err := r.Render(content)
-	if err != nil {
-		return styleAsst.Render(content)
+
+	// Mixed path: prose segments through glamour, tables through our
+	// own lipgloss-based renderer with full ASCII frame + header band.
+	// glamour gets the narrow (prose-friendly 120 cap) renderer here
+	// because the table is rendered separately and won't be squashed.
+	r := getMarkdownRenderer(width-4, false)
+	tableWidth := width - 4
+	if tableWidth < 20 {
+		tableWidth = 20
 	}
-	return strings.TrimSpace(out)
+
+	var sb strings.Builder
+	for i, seg := range segs {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		switch seg.kind {
+		case segText:
+			body := strings.TrimSpace(seg.text)
+			if body == "" {
+				continue
+			}
+			if r == nil {
+				sb.WriteString(styleAsst.Render(body))
+				continue
+			}
+			out, err := r.Render(body)
+			if err != nil {
+				sb.WriteString(styleAsst.Render(body))
+				continue
+			}
+			sb.WriteString(strings.TrimSpace(out))
+		case segTable:
+			sb.WriteString(renderMetisTable(seg.headers, seg.rows, tableWidth))
+		}
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 // containsMarkdownTable looks for a GFM-style table header — a row with
@@ -371,7 +414,10 @@ func looksLikeMarkdown(s string) bool {
 			return true
 		}
 	}
-	return false
+	// Short GFM tables can miss every marker above ("| a | b |\n|---|---|")
+	// — detect them explicitly so the table renderer still kicks in for
+	// terse 2-column comparisons. Cheap textual scan, no parse cost.
+	return containsMarkdownTable(s)
 }
 
 // firstThinkingLine returns a single-line preview suitable for the

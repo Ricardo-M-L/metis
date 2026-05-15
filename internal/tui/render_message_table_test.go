@@ -97,16 +97,105 @@ func TestWideTableNotSquashed(t *testing.T) {
 	if maxLineNarrow <= 120 {
 		t.Fatalf("widest rendered line is %d cols — table still being squashed under the old 120 cap.\noutput:\n%s", maxLineNarrow, out)
 	}
-	// On East-Asian locale terminals (CN/JP/KR), ambiguous-width chars
-	// like ─│┼ render as 2 cells. metisCodeBlockStyle forces ASCII
-	// separators (- | +) which are always 1 cell, so the rendered
-	// table must fit inside a 200-col terminal in both locales.
-	if maxLineEA > 200 {
-		t.Fatalf("widest rendered line on EA locale is %d cols — overflows 200-col terminal, table will wrap ugly on CN/JP terminals.\n%s",
-			maxLineEA, strings.Join(perLine, "\n"))
+	// Primary assertion: in the user's actual terminal (macOS Terminal /
+	// iTerm / VSCode integrated terminal with default en_US locale,
+	// ambiguous-width = 1), the rendered table must fit inside the
+	// 200-col window. This matches what lipgloss uses internally so
+	// the column math stays consistent end-to-end.
+	if maxLineNarrow > 200 {
+		t.Fatalf("widest rendered line is %d narrow-cols — overflows 200-col terminal:\n%s",
+			maxLineNarrow, strings.Join(perLine, "\n"))
 	}
-	t.Logf("widest line: narrow=%d cols, EA=%d cols (terminal = 200 cols)\n%s",
+	// On a true CJK-locale terminal where ambiguous chars render as 2
+	// cells (rare on macOS, common only on legacy CN/JP terminals),
+	// the same table will visibly double. We don't gate the test on
+	// that case — it would require flipping back to ASCIIBorder which
+	// loses the Claude-Code look. Just log it for visibility.
+	t.Logf("widest line: narrow=%d cols, EA=%d cols (terminal = 200 cols; narrow is what macOS shows)\n%s",
 		maxLineNarrow, maxLineEA, strings.Join(perLine, "\n"))
+}
+
+// TestTableHasFullFrame verifies that the lipgloss-rendered table has
+// a full Unicode box-drawing outer frame (top + bottom + left + right)
+// and a header band visually distinct from body rows — matching Claude
+// Code's look (image #5 user feedback 2026-05-15).
+// TestTableCellInlineMarkdown asserts that `code` spans, **bold** and
+// *italic* inside a table cell are rendered as ANSI rather than as
+// literal `*`/backtick characters (image #6 user feedback).
+func TestTableCellInlineMarkdown(t *testing.T) {
+	mdRendererMu.Lock()
+	mdRendererNarrow = nil
+	mdRendererWide = nil
+	mdRendererMu.Unlock()
+
+	content := "| feature | impl |\n|---|---|\n| **bold** label | `Fork()` 调用 |\n"
+	out := renderAssistantBody(content, 120)
+	plain := stripANSI(out)
+
+	// Literal markdown markers must be gone from the visible output.
+	if strings.Contains(plain, "**") {
+		t.Fatalf("cell still contains literal `**` after inline render:\n%s", plain)
+	}
+	if strings.Contains(plain, "`Fork()`") {
+		t.Fatalf("cell still contains literal backtick-wrapped code span:\n%s", plain)
+	}
+	// SGR for bold (1m) must be present from `**bold**`.
+	if !strings.Contains(out, "\x1b[1") {
+		t.Fatalf("expected bold SGR in output, got:\n%s", out)
+	}
+	// `Fork()` is a function call → classifyCodeSpan picks the orange
+	// Dracula colour (255,184,108).
+	if !strings.Contains(out, "38;2;255;184;108") {
+		t.Fatalf("expected function-call code-span orange SGR in output, got:\n%s", out)
+	}
+}
+
+func TestTableHasFullFrame(t *testing.T) {
+	mdRendererMu.Lock()
+	mdRendererNarrow = nil
+	mdRendererWide = nil
+	mdRendererMu.Unlock()
+
+	content := `| 维度 | A | B |
+|------|---|---|
+| 行1 | x | y |
+| 行2 | a | b |
+`
+	out := renderAssistantBody(content, 100)
+	plain := stripANSI(out)
+
+	// Top frame must use ┌ and ┐ corners with ─ across.
+	// Bottom frame must use └ and ┘ corners with ─ across.
+	lines := strings.Split(strings.TrimSpace(plain), "\n")
+	if len(lines) < 5 {
+		t.Fatalf("expected at least 5 lines for a framed table, got %d:\n%s", len(lines), plain)
+	}
+	top := strings.TrimSpace(lines[0])
+	bot := strings.TrimSpace(lines[len(lines)-1])
+	if !strings.HasPrefix(top, "┌") || !strings.HasSuffix(top, "┐") {
+		t.Fatalf("first line is not a Unicode top frame: %q", top)
+	}
+	if !strings.HasPrefix(bot, "└") || !strings.HasSuffix(bot, "┘") {
+		t.Fatalf("last line is not a Unicode bottom frame: %q", bot)
+	}
+
+	// Header band: the rendered output (with ANSI) must contain the
+	// header background SGR sequence we set in renderMetisTable
+	// (Background #3a3a3a → 48;2;58;58;58).
+	if !strings.Contains(out, "48;2;58;58;58") {
+		t.Fatalf("expected header background SGR (48;2;58;58;58) in rendered output, got:\n%s", out)
+	}
+
+	// Body rows must use │ vertical separators.
+	bodyRows := 0
+	for _, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), "│") && strings.Count(ln, "│") >= 3 {
+			bodyRows++
+		}
+	}
+	if bodyRows < 3 { // header + 2 body rows = at least 3
+		t.Fatalf("expected at least 3 │-piped rows (header + body), got %d:\n%s", bodyRows, plain)
+	}
 }
 
 func formatLine(narrow, ea int, ln string) string {
