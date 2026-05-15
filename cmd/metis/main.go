@@ -1479,9 +1479,22 @@ func cmdRun(ctx context.Context, args []string) error {
 			// eval runner (internal/eval/runner.go::scrapeMetrics) and
 			// useful for scripts that want to log spend per call. One
 			// line, key=value, parseable without JSON.
+			// cache_hit reports the share of total INPUT tokens served from
+			// the provider's prompt cache. Total input = tokens.in (the
+			// non-cache portion the model actually re-encoded) + cache_read
+			// + cache_create. Without this derived field, the raw line
+			// invites the trap of computing `cache_read / tokens.in` and
+			// getting >100% — the numerator and denominator don't share
+			// a base in Anthropic's usage semantics (`input_tokens` already
+			// excludes the cached portion). See 2026-05-15 user report.
+			totalInput := totIn + totCacheRead + totCacheCreate
+			hitPct := 0.0
+			if totalInput > 0 {
+				hitPct = float64(totCacheRead) / float64(totalInput) * 100
+			}
 			fmt.Fprintf(os.Stderr,
-				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d duration_ms=%d\n",
-				totIn, totOut, totCacheRead, totCacheCreate, time.Since(runStart).Milliseconds())
+				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d cache_hit=%.1f%% duration_ms=%d\n",
+				totIn, totOut, totCacheRead, totCacheCreate, hitPct, time.Since(runStart).Milliseconds())
 		case agent.EventError:
 			return ev.Err
 		}
