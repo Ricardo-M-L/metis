@@ -342,6 +342,17 @@ func (l *Loop) haltTurn(reason string) {
 	}
 }
 
+// SetPlanMode satisfies the PlanController interface so builtin tools
+// (EnterPlanMode / ExitPlanMode) can flip plan mode mid-conversation
+// without importing the full Loop type. Mutex-protected because the
+// loop reads PlanMode at iteration boundaries while tools execute on
+// the same goroutine as the loop but write to shared state.
+func (l *Loop) SetPlanMode(on bool) {
+	l.mu.Lock()
+	l.PlanMode = on
+	l.mu.Unlock()
+}
+
 // Reset clears the conversation.
 func (l *Loop) Reset() {
 	l.mu.Lock()
@@ -608,8 +619,37 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return nil
 		}
 
-		// Plan Mode: collect and emit, don't execute.
+		// Plan Mode: collect and emit, don't execute — EXCEPT the
+		// ExitPlanMode tool itself, which must run so the model can
+		// surface the plan body and flip the loop back to normal
+		// execution. Mixing ExitPlanMode with other tools in one
+		// batch isn't supported: the rest gets emitted as the plan,
+		// only the exit tool actually runs.
 		if l.PlanMode {
+			exitTools, otherTools := splitExitPlanModeTools(toolUses)
+			if len(exitTools) > 0 {
+				results, err := l.executeBatch(ctx, exitTools, out, tc)
+				if err != nil {
+					stopReason = "error"
+					emit(ctx, out, Event{Kind: EventError, Err: err})
+					return err
+				}
+				l.mu.Lock()
+				l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
+				l.mu.Unlock()
+				// If ExitPlanMode flipped PlanMode off, fall through to
+				// next iteration and let any other batched tools run
+				// normally. If PlanMode is still on (defensive — should
+				// not happen), still emit the rest as the plan.
+				if l.PlanMode && len(otherTools) > 0 {
+					l.emitPlan(ctx, otherTools, out)
+					return nil
+				}
+				l.Hooks.EmitTurnEnd(ctx, tc, l.turnIdx)
+				emit(ctx, out, Event{Kind: EventTurnEnd})
+				l.turnIdx++
+				continue
+			}
 			stopReason = "plan_mode"
 			l.emitPlan(ctx, toolUses, out)
 			return nil
@@ -887,6 +927,21 @@ func (l *Loop) lastExchange() (userMsg, asstMsg string) {
 		if m.Role == llm.RoleUser && asstMsg != "" {
 			userMsg = textOf(m)
 			return
+		}
+	}
+	return
+}
+
+// splitExitPlanModeTools partitions a tool_use batch into the
+// ExitPlanMode entries vs everything else. Used by the plan-mode gate
+// to whitelist the exit tool while still collecting (not executing)
+// any other tools the model batched alongside it.
+func splitExitPlanModeTools(blocks []llm.ContentBlock) (exit, other []llm.ContentBlock) {
+	for _, b := range blocks {
+		if b.ToolName == "ExitPlanMode" {
+			exit = append(exit, b)
+		} else {
+			other = append(other, b)
 		}
 	}
 	return

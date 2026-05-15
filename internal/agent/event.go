@@ -169,6 +169,42 @@ func ParentSnapshotFromContext(ctx context.Context) *ParentSnapshot {
 	return nil
 }
 
+// PlanController exposes mid-conversation plan-mode toggles to tools.
+// The Loop is the concrete implementation; this interface is the
+// surface tools see via context so internal/tools/builtin doesn't
+// need to know about the full Loop type to flip the flag.
+//
+// claude-code parity: model can call EnterPlanMode mid-turn to
+// declare "I'm planning now, don't make changes", then ExitPlanMode
+// with a markdown plan body for user approval before executing.
+type PlanController interface {
+	SetPlanMode(on bool)
+}
+
+// planControllerKey carries the active loop's PlanController down to
+// builtin tools (EnterPlanMode / ExitPlanMode) via dispatch context.
+type planControllerKey struct{}
+
+// WithPlanController tags ctx with the loop's PlanController. Called
+// by dispatch.go right before tool.Execute so the plan-mode tools can
+// flip the flag without importing agent.Loop directly.
+func WithPlanController(ctx context.Context, c PlanController) context.Context {
+	if c == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, planControllerKey{}, c)
+}
+
+// PlanControllerFromContext returns the active controller, or nil
+// when the tool is invoked outside a Loop. Tools must handle nil
+// gracefully (degrade to no-op + diagnostic message).
+func PlanControllerFromContext(ctx context.Context) PlanController {
+	if v, ok := ctx.Value(planControllerKey{}).(PlanController); ok {
+		return v
+	}
+	return nil
+}
+
 // Event is the discriminated union streamed from Loop.Run.
 type Event struct {
 	Kind EventKind

@@ -389,6 +389,11 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	}
 	l.mu.RUnlock()
 	toolCtx = WithParentSnapshot(toolCtx, snap)
+	// Plan-mode controller: lets EnterPlanMode / ExitPlanMode flip
+	// loop.PlanMode mid-turn. Empty interface check is unnecessary —
+	// *Loop always satisfies PlanController. Tools that don't care
+	// (most of them) simply never pull this key from context.
+	toolCtx = WithPlanController(toolCtx, l)
 
 	// Honor InterruptBlock: tools that declare InterruptBlock want to
 	// finish their current invocation even if the parent ctx gets

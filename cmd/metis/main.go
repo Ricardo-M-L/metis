@@ -2197,6 +2197,10 @@ func cmdTools(args []string) error {
 	// capability exists; live wiring (skills loader / jobs registry /
 	// snapshot) only happens in setupRuntime / chat sessions.
 	reg.Register(builtin.NewMetisInfo(gate, cfg, nil, nil, reg))
+	// EnterPlanMode / ExitPlanMode — list for `metis tools` parity
+	// with the chat REPL registration above.
+	reg.Register(builtin.NewEnterPlanMode())
+	reg.Register(builtin.NewExitPlanMode())
 	// G.8 — if the user is previewing tool availability under
 	// METIS_COORDINATOR_MODE=1, apply the same filter the chat REPL
 	// would. Stubs replace mutation tools so the listing shows the
