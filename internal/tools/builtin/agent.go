@@ -66,6 +66,41 @@ func validateTeammateName(name string) error {
 // recursion runs the user's bill into the floor.
 type agentDepthKey struct{}
 
+// AgentProfileSpec is what an Agent.profileLoader returns. Decoupled
+// from internal/runtime.AgentProfile to avoid the import cycle
+// (runtime imports builtin, so builtin cannot import runtime). The
+// runtime layer wires a thin adapter that translates its full profile
+// struct into this shape. Only the fields the Agent tool consumes
+// per-invocation are surfaced here; permission/effort/etc. continue
+// to be set at boot via the --agent flag.
+type AgentProfileSpec struct {
+	Name            string
+	SystemPrompt    string
+	InitialPrompt   string
+	Tools           []string // allowlist; nil = inherit
+	DisallowedTools []string // blocklist
+}
+
+// AgentProfileLoader resolves a subagent_type slug to a profile spec.
+// Returning (nil, nil) means "no profile found by this name" — Execute
+// surfaces that as IsError so the model can recover (typo, missing
+// install). Errors are reserved for parse/IO failures.
+type AgentProfileLoader func(name string) (*AgentProfileSpec, error)
+
+// bundledProfileSlugs is the back-compat fallback set: when the
+// model passes `name` (no `subagent_type`) and the name matches one of
+// these, we treat it as if subagent_type was set. Kept in sync with
+// internal/runtime/builtin_profiles/*.md.
+var bundledProfileSlugs = map[string]struct{}{
+	"coordinator":  {},
+	"explore":      {},
+	"general":      {},
+	"go-reviewer":  {},
+	"mcp-debugger": {},
+	"plan":         {},
+	"verify":       {},
+}
+
 // defaultMaxAgentDepth is the fallback when neither the Agent struct's
 // per-instance MaxDepth nor config.Agents.MaxAgentDepth was set. Kept
 // at 3 so existing tests / minimal embeddings keep the historical
@@ -123,6 +158,14 @@ type Agent struct {
 	// — the original 3 was hand-picked early on and turns out to be
 	// tight for legitimate "main → plan → explore → verify" chains.
 	MaxDepth int
+
+	// profileLoader resolves `subagent_type` at invocation time.
+	// nil → schema field is accepted but produces an IsError with a
+	// hint that profile lookup wasn't wired. Set via WithProfileLoader
+	// from the runtime layer (Q1 / 2026-05-15 — separates the
+	// "team identity" role from the "which profile to apply" role
+	// that name was silently overloading.)
+	profileLoader AgentProfileLoader
 }
 
 // effectiveMaxDepth returns the cap to enforce — instance override
@@ -198,6 +241,16 @@ func (a Agent) WithSessionPersistence(sessionDir, parentID string) Agent {
 	return a
 }
 
+// WithProfileLoader wires the function used to resolve the
+// `subagent_type` schema field. Builder-style so headless callers
+// (tests, `metis tools` listing) can skip it — passing
+// `subagent_type` without a loader wired produces a clear IsError
+// rather than silently using the parent's system prompt.
+func (a Agent) WithProfileLoader(loader AgentProfileLoader) Agent {
+	a.profileLoader = loader
+	return a
+}
+
 func (Agent) Name() string { return "Agent" }
 
 // ShortDescription — see Bash.ShortDescription for the rationale.
@@ -205,11 +258,11 @@ func (Agent) Name() string { return "Agent" }
 // the short form omits naming/isolation detail in favor of the
 // when-vs-when-NOT heuristic.
 func (Agent) ShortDescription() string {
-	return "Spawn a sub-agent on a focused task — its own context window, same tools, isolated history. Use for deep code surveys, multi-file scouting, comparative analysis. Don't use for single-Grep lookups or conversation; fork has setup overhead. Brief with goal + context + ruled-out approaches + length cap."
+	return "Spawn a COLD sub-agent (fresh history, same tools) for self-contained work — code surveys, multi-file scouting, comparative analysis. Pass `subagent_type` to pick a profile (explore/plan/verify/...). For warm spawns that need this conversation's context, use Fork instead. Don't use for single-Grep lookups; spawn has setup overhead."
 }
 
 func (Agent) Description() string {
-	return `Spawn a sub-agent to handle a self-contained, focused task. The sub-agent gets its own message history (no shared context with the parent), the same tool set, and a fresh permission gate cloned from yours. It returns a single final text answer.
+	return `Spawn a COLD sub-agent — a fresh agent loop with its own message history (no shared context with the parent), the same tool set, and a fresh permission gate cloned from yours. Returns a single final text answer. Use this for self-contained, isolated work. (For sub-tasks that need the parent's full conversation history — "based on everything we've discussed, draft X" — use Fork instead, which inherits the parent's context.)
 
 Use Agent for:
   - Deep codebase surveys: "find every place we instantiate a Logger and explain the constructor patterns" — the sub-agent can fan out 10+ Grep/Read calls without bloating your context.
@@ -221,6 +274,7 @@ Do NOT use Agent for:
   - Lookups you can do in one or two tool calls: a single Grep, a single Read — just do it inline. Forking has overhead (new context window, new system prompt) that costs more than the search.
   - Conversational tasks: explaining something to the user, formatting an answer, deciding what to do next. The model is you; don't fork to think.
   - Tightly-coupled multi-step work where each step depends on the previous one. Sub-agents can't ask the parent questions; if the work needs back-and-forth, do it inline.
+  - Tasks that depend on the conversation so far — use Fork (warm spawn). Agent is cold.
 
 Briefing the sub-agent matters more than briefing yourself:
   - State the goal in one sentence, then provide what you already know and what you've ruled out. The sub-agent starts cold — no memory of this conversation.
@@ -228,14 +282,17 @@ Briefing the sub-agent matters more than briefing yourself:
   - If you need a short response, say so: "report in under 200 words." Without a cap, sub-agents tend to over-explain.
   - Don't ask the sub-agent to make load-bearing decisions for you. Have it gather evidence; you synthesize.
 
-Naming and isolation:
-  - Pass ` + "`name`" + ` to register a named teammate that shows up in /agents and can be addressed via MessageTeammate. Use for long-running parallel workers ("explorer", "verifier"). Same-name collisions are rejected.
-  - Pass ` + "`isolation: \"worktree\"`" + ` to give the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a worktree (no nesting).
-  - Pass ` + "`cwd`" + ` to run the sub-agent in a specific directory (mutually exclusive with ` + "`isolation`" + `).
-  - Pass ` + "`run_in_background: true`" + ` to fire-and-forget — returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
-  - Pass ` + "`permission_mode`" + ` to override the gate just for this sub-agent (e.g. let an explorer run with "auto" while the parent stays "ask").
+` + "`name`" + ` vs ` + "`subagent_type`" + ` (Q1, 2026-05-15 — the two roles are now separate):
+  - ` + "`subagent_type`" + ` selects the PROFILE/ROLE — its system prompt, default tool allowlist, default model. Bundled: explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator. User-defined profiles in ~/.metis/agents/<slug>.md or ./.metis/agents/<slug>.md take precedence over bundled. Omit to inherit the parent's prompt.
+  - ` + "`name`" + ` is the TEAM IDENTITY only — what /agents and MessageTeammate use to address this worker ("alice", "verifier"). Same-name collisions auto-suffix (alice → alice-2 → alice-3 → ...).
+  - Back-compat: if you pass ` + "`name=\"explore\"`" + ` without ` + "`subagent_type`" + `, it's still treated as ` + "`subagent_type=\"explore\"`" + `. Explicit subagent_type is preferred — name should be a label like "alice", not a role like "explore".
 
-Sub-agents inherit ~/.metis/agents/<name>.md or the bundled profile (explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator) when ` + "`name`" + ` matches. Otherwise they use a minimal default system prompt.`
+Other knobs:
+  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a worktree (no nesting).
+  - ` + "`cwd`" + ` runs the sub-agent in a specific directory (mutually exclusive with ` + "`isolation`" + `).
+  - ` + "`run_in_background: true`" + ` → returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
+  - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. let an explorer run with "auto" while the parent stays "ask").
+  - ` + "`allowed_tools`" + ` / ` + "`disallowed_tools`" + ` narrow the sub-agent's tool view; combine with the profile's filters as INTERSECTION (allow) + UNION (deny).`
 }
 func (Agent) InputSchema() map[string]any {
 	return map[string]any{
@@ -269,7 +326,11 @@ func (Agent) InputSchema() map[string]any {
 			},
 			"name": map[string]any{
 				"type":        "string",
-				"description": "Optional name to register this sub-agent in the team roster as. Named teammates show up in /agents list and can be addressed by MessageTeammate({to: name, body: ...}) from other sub-agents. Must start with a letter; only [a-zA-Z0-9._-] allowed; max 32 chars. Two teammates with the same name cannot co-exist.",
+				"description": "Optional team identity for this sub-agent. Named teammates show up in /agents list and can be addressed by MessageTeammate({to: name, body: ...}) from other sub-agents. Must start with a letter; only [a-zA-Z0-9._-] allowed; max 32 chars. Same-name collisions auto-suffix (alice → alice-2 → alice-3 ...). NOTE: `name` is the LABEL; use `subagent_type` to pick the profile/role.",
+			},
+			"subagent_type": map[string]any{
+				"type":        "string",
+				"description": "Optional profile slug that determines the sub-agent's role + system prompt. Bundled profiles: explore (read-only code search), plan (architect/planning), verify (test runner), general (catch-all), go-reviewer (Go-specific code review), mcp-debugger (MCP issues), coordinator (delegator). User-defined profiles in ~/.metis/agents/<name>.md or ./.metis/agents/<name>.md take precedence over bundled. When omitted, the sub-agent inherits the parent's system prompt. When `name` is set without `subagent_type`, a name matching a known profile slug is treated as the subagent_type for back-compat — explicit `subagent_type` is preferred.",
 			},
 			"resume_from": map[string]any{
 				"type":        "string",
@@ -461,14 +522,68 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			subPromptMode = agent.SubPromptTeammate
 		}
 	}
+
+	// Q1 (2026-05-15) — resolve `subagent_type` for per-invocation
+	// profile selection. Back-compat: if subagent_type is empty but
+	// `name` happens to match a bundled profile slug (explore, plan,
+	// verify, ...), treat it as the subagent_type so the historical
+	// docstring claim ("name auto-selects a profile") still holds for
+	// callers that learned it from the old description. Explicit
+	// subagent_type is preferred and always wins.
+	subagentType, _ := in["subagent_type"].(string)
+	subagentType = strings.TrimSpace(subagentType)
+	if subagentType == "" {
+		if _, isBundled := bundledProfileSlugs[nameArg]; isBundled {
+			subagentType = nameArg
+		}
+	}
+	var profile *AgentProfileSpec
+	if subagentType != "" {
+		if a.profileLoader == nil {
+			return &tools.Result{
+				Output:  fmt.Sprintf("subagent_type=%q requires profile loading, which isn't wired in this build (likely a headless test path).", subagentType),
+				IsError: true,
+			}, nil
+		}
+		p, err := a.profileLoader(subagentType)
+		if err != nil {
+			return &tools.Result{
+				Output:  fmt.Sprintf("subagent_type=%q failed: %v", subagentType, err),
+				IsError: true,
+			}, nil
+		}
+		if p == nil {
+			return &tools.Result{
+				Output:  fmt.Sprintf("subagent_type=%q: no such profile (looked in ./.metis/agents, ~/.metis/agents, and the bundled set: explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator)", subagentType),
+				IsError: true,
+			}, nil
+		}
+		profile = p
+	}
+
 	base := a.system
 	if a.minimalSystem != "" {
 		base = a.minimalSystem
 	}
+	// 2026-05-15 fix — profile body goes into ProfileSystemPrompt,
+	// NOT replacing base. Pre-fix the profile fully replaced base,
+	// which dropped the parent's <env> section (Working directory,
+	// Today's date, Git branch). Sub-agents then had no idea what
+	// cwd they were in and either guessed wrong absolute paths
+	// (/internal/..., /home/user/code/..., /workspace/...) or used
+	// relative paths that the path-strict Read tool rejected. The
+	// 200-iter long-Wall test showed 110+ such errors. Keeping base
+	// preserves env; ProfileSystemPrompt adds the role-specific
+	// guidance after it.
+	profileBody := ""
+	if profile != nil {
+		profileBody = profile.SystemPrompt
+	}
 	subSystem := agent.BuildSubPrompt(agent.SubPromptInputs{
-		Mode:         subPromptMode,
-		Base:         base,
-		TeammateName: teammateName,
+		Mode:                subPromptMode,
+		Base:                base,
+		TeammateName:        teammateName,
+		ProfileSystemPrompt: profileBody,
 	})
 
 	// G.9 (2026-05-12) — give the sub-agent its OWN gate so a
@@ -489,8 +604,19 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// the full parent registry. Filter applies BEFORE the sub-loop
 	// is constructed so the sub-agent never sees a tool it
 	// shouldn't even try to call.
+	//
+	// Q1 (2026-05-15) — when subagent_type resolves to a profile with
+	// its own tool restrictions, we intersect them with the schema
+	// filters so per-invocation NEVER quietly re-enables a tool the
+	// profile blocked. Profile allowlist + schema allowlist =
+	// intersection (strictest). Profile blocklist + schema blocklist
+	// = union.
 	allowedTools := stringSliceArg(in, "allowed_tools")
 	disallowedTools := stringSliceArg(in, "disallowed_tools")
+	if profile != nil {
+		allowedTools = intersectAllow(profile.Tools, allowedTools)
+		disallowedTools = unionStrings(profile.DisallowedTools, disallowedTools)
+	}
 	subRegistry := a.registry
 	if len(allowedTools) > 0 || len(disallowedTools) > 0 {
 		subRegistry = filterRegistry(a.registry, allowedTools, disallowedTools)
@@ -510,7 +636,15 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	if resumedSnapshot != nil && len(resumedSnapshot.Messages) > 0 {
 		sub.Restore(resumedSnapshot.Messages)
 	}
-	sub.AppendUser(prompt)
+	// Q1 (2026-05-15) — profile-supplied initial_prompt gets prepended
+	// to the caller's prompt (matches the --agent CLI flag's
+	// behavior). Mirrors claude-code's Task tool where the profile's
+	// `initial_prompt` block frames the directive.
+	effectivePrompt := prompt
+	if profile != nil && profile.InitialPrompt != "" {
+		effectivePrompt = profile.InitialPrompt + "\n\n" + prompt
+	}
+	sub.AppendUser(effectivePrompt)
 	// G.3 — wire the teammate's Mailbox to the sub-loop's PeerInbox so
 	// the agent.Loop drains it at iter boundaries and injects
 	// <peer_message> system-reminders. nil Mailbox (no Roster wired)
@@ -902,16 +1036,27 @@ func (a Agent) executeBackground(
 // parent's UI channel for live progress rendering. Shared by both
 // foreground and background paths so the UX is identical regardless
 // of how the sub-agent was spawned.
+//
+// Fix 1 (2026-05-15) — TextDelta NOT forwarded. The earlier code
+// forwarded sub-agent text deltas to the parent's main UI lane
+// unprefixed, which interleaved them with the parent's own streaming
+// text and corrupted the display (the tmux long-task test showed
+// "**统计结果** 该目录下共有 **126** 个" sliced into the middle of
+// the parent's reply). The sub-agent's final text shows up
+// downstream anyway: it becomes the Agent tool's tool_result body,
+// which the parent UI renders as a normal result block. Live deltas
+// would need a separate UI lane (claude-code's "Backgrounded agent"
+// chip) to be useful; until that lane exists, dropping the delta is
+// the right call. Tool starts/results still forward so the parent
+// can see "sub: Read", "sub: Grep" in flight.
 func forwardSubAgentEvent(parentOut chan<- agent.Event, ev agent.Event) {
 	if parentOut == nil {
 		return
 	}
 	switch ev.Kind {
-	case agent.EventToolStart, agent.EventToolResult, agent.EventTextDelta:
+	case agent.EventToolStart, agent.EventToolResult:
 		forwarded := ev
-		if ev.Kind == agent.EventToolStart || ev.Kind == agent.EventToolResult {
-			forwarded.ToolName = "sub: " + ev.ToolName
-		}
+		forwarded.ToolName = "sub: " + ev.ToolName
 		select {
 		case parentOut <- forwarded:
 		default:

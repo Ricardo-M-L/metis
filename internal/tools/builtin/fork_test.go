@@ -122,6 +122,82 @@ func TestFork_NestingLimitEnforced(t *testing.T) {
 	}
 }
 
+// TestFork_DefaultCapIsOne (2026-05-15) pins the new default. Fork from
+// the top level (depth=0) is allowed; nested Fork from depth=1 must be
+// rejected without an explicit config override. Matches CC's
+// FORK_BOILERPLATE_TAG rule which forbids Fork-inside-Fork entirely.
+func TestFork_DefaultCapIsOne(t *testing.T) {
+	if defaultMaxForkDepth != 1 {
+		t.Fatalf("default cap = %d, want 1 (the new default)", defaultMaxForkDepth)
+	}
+	tool := NewFork(permission.New(permission.ModeBypass), helloForkProvider(), tools.NewRegistry())
+	parentSnap := agent.ParentSnapshot{
+		System: "s", Model: "m",
+		Messages: []llm.Message{{Role: "user", Content: []llm.ContentBlock{{Type: "text", Text: "x"}}}},
+	}
+
+	t.Run("top-level fork allowed (depth=0)", func(t *testing.T) {
+		ctx := agent.WithParentSnapshot(context.Background(), parentSnap)
+		// No forkDepthKey set → ctx.Value returns nil → depth = 0
+		res, err := tool.Execute(ctx, map[string]any{"directive": "do x"})
+		if err != nil {
+			t.Fatalf("top-level fork should NOT error: %v", err)
+		}
+		if res.IsError {
+			t.Errorf("top-level fork should succeed; got error: %s", res.Output)
+		}
+	})
+
+	t.Run("nested fork rejected (depth=1)", func(t *testing.T) {
+		ctx := agent.WithParentSnapshot(context.Background(), parentSnap)
+		// Simulate: we are inside a fork child; depth = 1.
+		ctx = context.WithValue(ctx, forkDepthKey{}, 1)
+		res, err := tool.Execute(ctx, map[string]any{"directive": "nested fork"})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if !res.IsError {
+			t.Error("nested fork (depth=1) MUST be rejected under new default cap=1")
+		}
+		if !strings.Contains(res.Output, "nesting limit") {
+			t.Errorf("error message should mention nesting limit; got: %s", res.Output)
+		}
+		if !strings.Contains(res.Output, "max_fork_depth") {
+			t.Errorf("error should suggest config override; got: %s", res.Output)
+		}
+	})
+}
+
+// TestFork_ConfigOverrideRaisesCap — users who want fork-in-fork can set
+// [agents].max_fork_depth = 2 in config. With the override, depth=1 is
+// permitted and only depth=2 hits the wall.
+func TestFork_ConfigOverrideRaisesCap(t *testing.T) {
+	// Construct a Fork with MaxDepth=2 (simulates config.Agents.MaxForkDepth=2).
+	tool := NewFork(permission.New(permission.ModeBypass), helloForkProvider(), tools.NewRegistry())
+	tool.MaxDepth = 2
+
+	parentSnap := agent.ParentSnapshot{
+		System: "s", Model: "m",
+		Messages: []llm.Message{{Role: "user", Content: []llm.ContentBlock{{Type: "text", Text: "x"}}}},
+	}
+
+	// depth=1 should now be allowed (it wasn't under default cap=1).
+	ctx := agent.WithParentSnapshot(context.Background(), parentSnap)
+	ctx = context.WithValue(ctx, forkDepthKey{}, 1)
+	res, _ := tool.Execute(ctx, map[string]any{"directive": "ok"})
+	if res.IsError {
+		t.Errorf("with cap=2, depth=1 should pass; got error: %s", res.Output)
+	}
+
+	// depth=2 still rejected.
+	ctx = agent.WithParentSnapshot(context.Background(), parentSnap)
+	ctx = context.WithValue(ctx, forkDepthKey{}, 2)
+	res, _ = tool.Execute(ctx, map[string]any{"directive": "deep"})
+	if !res.IsError {
+		t.Errorf("with cap=2, depth=2 should fail; got: %+v", res)
+	}
+}
+
 func TestFork_Schema(t *testing.T) {
 	tool := Fork{}
 	schema := tool.InputSchema()

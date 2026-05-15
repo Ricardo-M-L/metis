@@ -69,8 +69,13 @@ type Agents struct {
 
 	// MaxForkDepth caps how deep Fork() spawns can nest. Lower than
 	// MaxAgentDepth because Fork carries the parent's conversation
-	// history forward, so each level doubles context size. 0 →
-	// default 2.
+	// history forward, so each level doubles context size AND
+	// breaks prompt-cache reuse (level-2 fork's prefix differs from
+	// the cached main prefix). 0 → default 1.
+	//
+	// 2026-05-15: lowered default 2 → 1 to match claude-code's
+	// stricter rule (CC rejects Fork-in-Fork outright). Users who
+	// genuinely need a fork tree set this to 2+ explicitly.
 	MaxForkDepth int `toml:"max_fork_depth"`
 
 	// DefaultTimeoutSeconds bounds a sub-agent's wall-clock duration
@@ -652,7 +657,7 @@ func defaults() *Config {
 			MaxConcurrentNamed:     20,
 			MaxConcurrentAnon:      40,
 			MaxAgentDepth:          3,
-			MaxForkDepth:           2,
+			MaxForkDepth:           1,
 			DefaultTimeoutSeconds:  600,
 			CleanupOrphanWorktrees: true,
 		},

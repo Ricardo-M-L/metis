@@ -118,6 +118,66 @@ func filterRegistry(src *tools.Registry, allow, deny []string) *tools.Registry {
 	return dst
 }
 
+// intersectAllow combines two allowlists with intersection semantics:
+// only names present in BOTH lists survive. Either list being empty
+// is treated as "no restriction from this side" — the other list
+// passes through unchanged. Q1 (2026-05-15) uses this to combine the
+// profile's allowed_tools with the per-invocation allowed_tools so
+// the sub-agent always sees the strictest result.
+func intersectAllow(a, b []string) []string {
+	switch {
+	case len(a) == 0 && len(b) == 0:
+		return nil
+	case len(a) == 0:
+		return append([]string(nil), b...)
+	case len(b) == 0:
+		return append([]string(nil), a...)
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, n := range a {
+		set[n] = struct{}{}
+	}
+	out := make([]string, 0, len(b))
+	seen := make(map[string]struct{}, len(b))
+	for _, n := range b {
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		if _, ok := set[n]; ok {
+			out = append(out, n)
+			seen[n] = struct{}{}
+		}
+	}
+	return out
+}
+
+// unionStrings concatenates two slices, deduplicating. Q1 (2026-05-15)
+// uses this to combine the profile's disallowed_tools with the
+// per-invocation disallowed_tools — a blocked tool stays blocked no
+// matter which side asked for it.
+func unionStrings(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, n := range a {
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	for _, n := range b {
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
+}
+
 func bytesString(n int) string {
 	switch {
 	case n >= 1<<30:

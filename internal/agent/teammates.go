@@ -320,12 +320,34 @@ func (r *Roster) Summary() RosterSummary {
 }
 
 // Roster is the live-sub-agent registry. Thread-safe.
+//
+// Fix 2 (2026-05-15) — `recentlyFinished` LRU buffer. Pre-fix,
+// Unregister hard-deleted the teammate the instant the sub-agent's
+// loop returned. A parent that called Agent(run_in_background:true)
+// and then polled SubAgentOutput would hit "no sub-agent with
+// agent_id=..." for any sub-agent that finished between two polls,
+// losing its output. The buffer keeps the last RosterFinishedKeep
+// finished teammates around so polling parents can still read them.
+// LRU bound keeps memory bounded across long sessions.
 type Roster struct {
 	mu        sync.RWMutex
 	teammates map[string]*Teammate
-	capNamed  int
-	capAnon   int
+	// recentlyFinished is the keep-around list of teammates whose
+	// sub-loop has exited but whose Output/Status the parent may
+	// still want to read. Append-only with size cap; oldest evicted
+	// when over RosterFinishedKeep. Stored separately from teammates
+	// so cap-counted Count() / Summary() report only live work.
+	recentlyFinished []*Teammate
+	capNamed         int
+	capAnon          int
 }
+
+// RosterFinishedKeep is the max number of finished teammates the
+// Roster preserves for SubAgentOutput / SubAgentList polling. 50 is
+// generous enough to survive a 5-parallel-spawn-poll cycle ~10 times
+// (covering most coordinator patterns) without unbounded memory
+// growth.
+const RosterFinishedKeep = 50
 
 // NewRoster creates a Roster with split caps for named teammates and
 // anonymous sub-agents. Either <= 0 disables that side's cap.
@@ -449,13 +471,25 @@ func (r *Roster) Register(t *Teammate) error {
 	return nil
 }
 
-// Unregister removes a teammate by name. Safe to call even when the
-// name isn't present (e.g., a Register that returned an error leaves
-// no entry, but the caller still defers Unregister).
+// Unregister moves a teammate from the live map to recentlyFinished
+// (Fix 2 / 2026-05-15). Safe to call even when the name isn't
+// present (a Register that returned an error leaves no entry, but
+// the caller still defers Unregister). The teammate stays
+// discoverable via LookupByAgentID and shows up in List() until
+// evicted from the LRU.
 func (r *Roster) Unregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	t, ok := r.teammates[name]
+	if !ok {
+		return
+	}
 	delete(r.teammates, name)
+	r.recentlyFinished = append(r.recentlyFinished, t)
+	// LRU evict: drop the oldest entries when over cap.
+	if over := len(r.recentlyFinished) - RosterFinishedKeep; over > 0 {
+		r.recentlyFinished = r.recentlyFinished[over:]
+	}
 }
 
 // Count returns the number of currently-registered teammates.
@@ -510,10 +544,21 @@ func (r *Roster) Lookup(name string) (*Teammate, bool) {
 // Used by SubAgentOutput / SubAgentStop which receive the agent_id
 // rather than the name. Linear scan because the typical Roster size
 // is < 10 — a separate index isn't worth the maintenance.
+//
+// Fix 2 (2026-05-15) — also scans recentlyFinished so a parent that
+// polls just after a sub-agent completes still finds it. Live
+// teammates are checked first since cap-bounded recentlyFinished
+// could in theory contain a stale entry with the same agent_id
+// (e.g., resume from snapshot); the live entry always wins.
 func (r *Roster) LookupByAgentID(id string) (*Teammate, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, t := range r.teammates {
+		if t.AgentID == id {
+			return t, true
+		}
+	}
+	for _, t := range r.recentlyFinished {
 		if t.AgentID == id {
 			return t, true
 		}
@@ -524,11 +569,19 @@ func (r *Roster) LookupByAgentID(id string) (*Teammate, bool) {
 // List returns a snapshot of all teammates sorted by Started (oldest
 // first). Snapshot copies the pointers — callers MUST treat the
 // returned Teammates as read-only.
+//
+// Fix 2 (2026-05-15) — recentlyFinished teammates are included so
+// SubAgentList shows them with their Completed/Failed/Killed status
+// instead of disappearing the moment they finish. Live teammates
+// first (their Status is still Running), then finished.
 func (r *Roster) List() []*Teammate {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]*Teammate, 0, len(r.teammates))
+	out := make([]*Teammate, 0, len(r.teammates)+len(r.recentlyFinished))
 	for _, t := range r.teammates {
+		out = append(out, t)
+	}
+	for _, t := range r.recentlyFinished {
 		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool {

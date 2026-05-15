@@ -134,14 +134,23 @@ func TestSubAgentList_ShowsRunningAndCompleted(t *testing.T) {
 	// Give them a moment to finish (helloProvider is synchronous-ish).
 	waitForRosterCount(t, roster, 0, 5*time.Second)
 
-	// List should report 0 in flight; the Roster GC'd completed entries
-	// when the runner goroutine called Unregister.
+	// Fix 2 (2026-05-15) — Unregister now moves entries into
+	// recentlyFinished rather than hard-deleting them, so a parent
+	// polling SubAgentList just after the sub-agent's loop exited
+	// still sees the final status. List must therefore show both
+	// completed sub-agents instead of reporting "no sub-agents in
+	// flight" (pre-fix behavior).
 	res, err := listTool.Execute(context.Background(), map[string]any{})
 	if err != nil {
 		t.Fatalf("SubAgentList err: %v", err)
 	}
-	if !strings.Contains(res.Output, "no sub-agents in flight") {
-		t.Errorf("after both sub-agents finished + unregistered, list should be empty; got %q", res.Output)
+	if !strings.Contains(res.Output, "status=completed") {
+		t.Errorf("Fix 2: finished sub-agents must remain visible in SubAgentList; got %q", res.Output)
+	}
+	// Live count must still be 0 — finished entries don't occupy
+	// Roster capacity slots.
+	if c := roster.Count(); c != 0 {
+		t.Errorf("Roster.Count() = %d, want 0 (finished doesn't count toward cap)", c)
 	}
 }
 

@@ -3,6 +3,7 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -125,6 +126,33 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 			agentTool = agentTool.WithSessionPersistence(opts.Cfg.Session.Dir, parentID)
 		}
 	}
+	// Q1 (2026-05-15) — wire the per-invocation profile resolver so
+	// the schema field `subagent_type` actually does something. The
+	// adapter translates runtime.AgentProfile → builtin.AgentProfileSpec
+	// without exposing the full struct (which lives in this package
+	// and would create an import cycle if builtin pulled it in).
+	agentTool = agentTool.WithProfileLoader(func(name string) (*builtin.AgentProfileSpec, error) {
+		prof, err := LoadAgentProfile(name)
+		if err != nil {
+			// "not found" sentinel surface as (nil, nil) — Execute
+			// emits a user-actionable error from there. Real errors
+			// (parse failure, IO problem) propagate as-is.
+			if strings.Contains(err.Error(), "not found") {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if prof == nil {
+			return nil, nil
+		}
+		return &builtin.AgentProfileSpec{
+			Name:            prof.Name,
+			SystemPrompt:    prof.SystemPrompt,
+			InitialPrompt:   prof.InitialPrompt,
+			Tools:           prof.Tools,
+			DisallowedTools: prof.DisallowedTools,
+		}, nil
+	})
 	reg.Register(agentTool)
 	// SubAgent reader tools (G.1, 2026-05-12) — SubAgentList /
 	// SubAgentOutput / SubAgentStop. Mirrors AttachJobsRegistry for
