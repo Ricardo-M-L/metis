@@ -15,6 +15,7 @@ package tui
 // renderCache so glamour cost is paid once per content change.
 
 import (
+	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
@@ -104,6 +105,76 @@ func (s *staticItem) Render(width int) string {
 	return s.rendered
 }
 
+// inProgressThinkingItem renders the live thinking summary for the
+// current turn at the tail of the chat list, so it scrolls with the
+// transcript instead of staying pinned above the input (image #12 user
+// feedback 2026-05-15: the thinking summary visually matched the
+// historical thinking rows in the transcript but didn't follow the
+// mouse wheel, causing it to "stick" on screen as the user scrolled).
+// Not cached — content updates on every spinner tick.
+type inProgressThinkingItem struct {
+	text   string
+	expand bool
+	width  int // captured for thinkingHintFits gate; safe to ignore Render arg
+}
+
+func (it *inProgressThinkingItem) Render(width int) string {
+	if it.text == "" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
+	thinkStyle := styleDim.Italic(true)
+	if !it.expand {
+		sb.WriteString(thinkStyle.Render(firstThinkingLine(it.text, width)))
+		if thinkingHintFits(width) {
+			sb.WriteString(styleMuted.Render("  (ctrl+o to expand)"))
+		}
+		sb.WriteString("\n")
+		return sb.String()
+	}
+	lines := strings.Split(it.text, "\n")
+	if len(lines) > 0 {
+		sb.WriteString(thinkStyle.Render(lines[0]))
+		for _, ln := range lines[1:] {
+			sb.WriteString("\n  ")
+			sb.WriteString(thinkStyle.Render(ln))
+		}
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+// inProgressStreamingItem renders the partial assistant reply for the
+// current turn at the tail of the chat list. Same rationale as
+// inProgressThinkingItem — keeps the visible streaming text aligned
+// with transcript scroll. Suppressed when the turn has been
+// backgrounded (Ctrl+B): the bytes still accumulate, we just don't
+// paint them until finalizeTurn flushes.
+type inProgressStreamingItem struct {
+	text         string
+	backgrounded bool
+}
+
+func (it *inProgressStreamingItem) Render(width int) string {
+	_ = width
+	if it.text == "" || it.backgrounded {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(styleAsst.Render("  " + glyphBullet + " "))
+	lines := strings.Split(it.text, "\n")
+	if len(lines) > 0 {
+		sb.WriteString(styleText.Render(lines[0]))
+		for _, ln := range lines[1:] {
+			sb.WriteString("\n  ")
+			sb.WriteString(styleText.Render(ln))
+		}
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
 // buildChatItems composes a chronologically-ordered []list.Item from the
 // Model's messages and toolEvents. Same merge logic as `m.timeline()`
 // (sort by Timestamp / StartTime, stable order on ties), but produces
@@ -116,13 +187,16 @@ func (s *staticItem) Render(width int) string {
 // first message arrives. Mirrors claude-code's "banner is the first
 // thing in the chat history" pattern (user feedback 2026-05-09).
 //
-// Streaming text (m.streamingText / m.thinkingText) is intentionally
-// NOT included — those are rendered by View() in a separate "stream
-// tail" section so they can update every spinner tick without
-// invalidating the cached items above them in the transcript.
+// Streaming text (m.streamingText / m.thinkingText) is appended at the
+// tail as live in-progress items so they scroll WITH the transcript
+// rather than sticking above the input (image #12 user feedback). The
+// items live outside the renderCache because their content updates
+// every spinner tick; the rest of the list (historical messages +
+// tool events) still hits the cache normally — only the tail is
+// re-rendered per frame.
 func (m *Model) buildChatItems() []list.Item {
 	merged := m.timeline()
-	out := make([]list.Item, 0, len(merged)+1)
+	out := make([]list.Item, 0, len(merged)+3)
 	out = append(out, &staticItem{rendered: m.renderWelcomeBannerNoHint()})
 	for _, it := range merged {
 		switch {
@@ -131,6 +205,19 @@ func (m *Model) buildChatItems() []list.Item {
 		case it.te != nil:
 			out = append(out, &toolEventItem{te: *it.te, expand: m.expandToolOutputs, cache: m.renderCache})
 		}
+	}
+	if m.thinkingText != "" {
+		out = append(out, &inProgressThinkingItem{
+			text:   m.thinkingText,
+			expand: m.expandToolOutputs,
+			width:  m.width,
+		})
+	}
+	if m.streamingText != "" {
+		out = append(out, &inProgressStreamingItem{
+			text:         m.streamingText,
+			backgrounded: m.turnBackgrounded,
+		})
 	}
 	return out
 }

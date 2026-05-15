@@ -225,54 +225,15 @@ func (m *Model) View() tea.View {
 	// silently clipped the bottom (e.g. permission options 3-4 became
 	// invisible, image #2 user report 2026-05-07).
 	//
-	// Phase 1a: tail + spinner + permission (sits ABOVE the input).
+	// Phase 1a: spinner + permission live ABOVE the input. The live
+	// thinking summary and streaming reply USED to live here too, but
+	// that made them stick on screen while the user scrolled the
+	// transcript even though they visually matched historical
+	// thinking/assistant rows (image #12 user feedback 2026-05-15).
+	// They've been moved into buildChatItems as inProgressThinkingItem
+	// and inProgressStreamingItem so the chat list virtualizes them
+	// together with the rest of the transcript.
 	var upper strings.Builder
-	if m.thinkingText != "" {
-		// Streaming thinking marker keeps parity with the historical
-		// thinking row in render_message.go: cyan accent glyph + dim
-		// italic body. Earlier this was muted #606060 which read as
-		// "broken / disabled" on dark terminals (image #19/#20 user
-		// feedback 2026-05-10).
-		upper.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
-		thinkStyle := styleDim.Italic(true)
-		// Stream-time thinking respects the same expand toggle as the
-		// historical thinking blocks rendered through render_message.go
-		// — folded by default to keep the chat surface readable while
-		// the model thinks aloud.
-		if !m.expandToolOutputs {
-			upper.WriteString(thinkStyle.Render(firstThinkingLine(m.thinkingText, m.width)))
-			if thinkingHintFits(m.width) {
-				upper.WriteString(styleMuted.Render("  (ctrl+o to expand)"))
-			}
-			upper.WriteString("\n\n")
-		} else {
-			thinkLines := strings.Split(m.thinkingText, "\n")
-			if len(thinkLines) > 0 {
-				upper.WriteString(thinkStyle.Render(thinkLines[0]))
-				for _, ln := range thinkLines[1:] {
-					upper.WriteString("\n  ")
-					upper.WriteString(thinkStyle.Render(ln))
-				}
-			}
-			upper.WriteString("\n\n")
-		}
-	}
-	// Phase F (2026-05-12) — Ctrl+B suppresses the live streaming
-	// render. The streamingText buffer still grows behind the scenes
-	// so finalizeTurn can flush the full reply atomically when the
-	// turn ends; we just don't paint it to the chat surface.
-	if m.streamingText != "" && !m.turnBackgrounded {
-		upper.WriteString(styleAsst.Render("  " + glyphBullet + " "))
-		streamLines := strings.Split(m.streamingText, "\n")
-		if len(streamLines) > 0 {
-			upper.WriteString(styleText.Render(streamLines[0]))
-			for _, ln := range streamLines[1:] {
-				upper.WriteString("\n  ")
-				upper.WriteString(styleText.Render(ln))
-			}
-		}
-		upper.WriteString("\n\n")
-	}
 	if m.spinnerActive {
 		upper.WriteString(renderSpinnerStatus(m))
 	}
