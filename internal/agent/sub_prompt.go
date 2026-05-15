@@ -85,6 +85,17 @@ func BuildSubPrompt(in SubPromptInputs) string {
 	if in.ProfileSystemPrompt != "" {
 		parts = append(parts, in.ProfileSystemPrompt)
 	}
+	// 2026-05-15 prompt-cache optimization: variable teammate name
+	// goes LAST, so the first ~25k bytes (header + base + profile)
+	// stay byte-identical across siblings spawned in the same wave.
+	// Pre-fix the name was embedded in the header's first line, which
+	// busted the cache prefix for every named sibling — 8 P-teammates
+	// in the audit task each re-paid the full system prompt.
+	// Anonymous sub-agents and forks have empty TeammateName so they
+	// never hit this path; only the SubPromptTeammate variant adds it.
+	if in.TeammateName != "" {
+		parts = append(parts, "Teammate identity: "+in.TeammateName+".")
+	}
 	return strings.Join(parts, "\n\n")
 }
 
@@ -104,12 +115,15 @@ func subPromptHeader(in SubPromptInputs) string {
 		return `You are a focused sub-agent. The parent agent delegated a single sub-task; complete it autonomously and return the result. You DO NOT see the parent's prior conversation — work from only what's in this fresh message history. If the task is ambiguous, pick the most plausible interpretation and proceed; surface the ambiguity in one trailing line, but don't ask back. Your final reply IS the report the parent will paste into its context, so write it that way (no "I'll start by..." or "let me know if you need more").`
 
 	case SubPromptTeammate:
-		who := "this teammate"
-		if in.TeammateName != "" {
-			who = in.TeammateName
-		}
-		return `You are ` + who + `, a named sub-agent in a multi-agent workflow. You DO NOT see the parent's prior conversation — work from only what's in this fresh message history. ` +
-			`You can RECEIVE messages from other teammates as ` + "`<peer_message>`" + ` system-reminders between turns, and SEND messages to them via the MessageTeammate tool. Coordinate when it helps, but don't chat — every peer message costs the team a turn. Complete your focused task and return the result; the parent agent will synthesize across teammates.`
+		// Header is intentionally name-independent so 8 P-teammate
+		// siblings share the byte-identical prefix that prompt
+		// caches need. The actual teammate name is appended as a
+		// trailing "Teammate identity: <name>." line by
+		// BuildSubPrompt — short enough that the cache miss tail
+		// is negligible. Pre-fix this template inlined the name
+		// here, which broke cache reuse across sibling teammates.
+		return `You are a named sub-agent in a multi-agent workflow. You DO NOT see the parent's prior conversation — work from only what's in this fresh message history. ` +
+			`You can RECEIVE messages from other teammates as ` + "`<peer_message>`" + ` system-reminders between turns, and SEND messages to them via the MessageTeammate tool. Coordinate when it helps, but don't chat — every peer message costs the team a turn. Complete your focused task and return the result; the parent agent will synthesize across teammates. Your specific identity is given at the end of this prompt.`
 
 	default:
 		return ""

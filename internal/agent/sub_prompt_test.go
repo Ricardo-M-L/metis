@@ -69,15 +69,64 @@ func TestBuildSubPrompt_TeammateNamed(t *testing.T) {
 	}
 }
 
-func TestBuildSubPrompt_TeammateAnonymousFallsBack(t *testing.T) {
+func TestBuildSubPrompt_TeammateAnonymousNoTrailer(t *testing.T) {
 	t.Parallel()
+	// 2026-05-15 prompt-cache fix: TeammateName is now appended as
+	// a trailing "Teammate identity: <name>." line outside the
+	// header (so the header byte-prefix stays identical across
+	// siblings spawned in the same wave). When name is empty the
+	// trailer is omitted entirely. The header itself must still
+	// produce a valid teammate-mode prompt — peer-messaging
+	// guidance is preserved, just without an identity stamp.
 	out := BuildSubPrompt(SubPromptInputs{
 		Mode: SubPromptTeammate,
 		Base: "BASE",
 		// No TeammateName.
 	})
-	if !strings.Contains(out, "this teammate") {
-		t.Errorf("missing name should use 'this teammate' fallback; got %q", short(out))
+	if strings.Contains(out, "Teammate identity:") {
+		t.Errorf("anonymous teammate must NOT get an identity trailer; got %q", short(out))
+	}
+	if !strings.Contains(out, "peer_message") {
+		t.Errorf("teammate header should still mention peer_message; got %q", short(out))
+	}
+	if !strings.Contains(out, "MessageTeammate") {
+		t.Errorf("teammate header should still mention MessageTeammate; got %q", short(out))
+	}
+}
+
+func TestBuildSubPrompt_TeammateNamePlacedAtEndForCacheReuse(t *testing.T) {
+	t.Parallel()
+	// Pin the cache-reuse invariant: two siblings with the SAME
+	// profile/mode but DIFFERENT names must share a long byte-
+	// identical prefix (everything up to "Teammate identity:").
+	// Pre-fix the name was inlined in the header's first sentence,
+	// busting the prefix at character ~13.
+	a := BuildSubPrompt(SubPromptInputs{
+		Mode:         SubPromptTeammate,
+		Base:         "SHARED-BASE-CONTENT-25K-EQUIVALENT",
+		TeammateName: "P1",
+	})
+	b := BuildSubPrompt(SubPromptInputs{
+		Mode:         SubPromptTeammate,
+		Base:         "SHARED-BASE-CONTENT-25K-EQUIVALENT",
+		TeammateName: "P2",
+	})
+
+	// Find the longest common prefix.
+	common := 0
+	for common < len(a) && common < len(b) && a[common] == b[common] {
+		common++
+	}
+	// Both prompts include the full header + base. Names diverge
+	// only in the trailing identity line. Common prefix MUST cover
+	// the base content (>= len of "SHARED-BASE-CONTENT-25K-EQUIVALENT").
+	if common < len("SHARED-BASE-CONTENT-25K-EQUIVALENT") {
+		t.Errorf("common prefix = %d bytes, want >= base length (cache-reuse invariant broken). a[:200]=%q b[:200]=%q",
+			common, short(a), short(b))
+	}
+	// Sanity: both should still mention their own name somewhere.
+	if !strings.Contains(a, "P1") || !strings.Contains(b, "P2") {
+		t.Errorf("names lost: a contains P1=%v, b contains P2=%v", strings.Contains(a, "P1"), strings.Contains(b, "P2"))
 	}
 }
 
