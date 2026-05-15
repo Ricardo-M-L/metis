@@ -725,25 +725,88 @@ func (am *ArchivalMemory) Search(opts SearchOptions) ([]Passage, error) {
 	return results, nil
 }
 
-// tokenize splits text into lowercase words, removing punctuation.
+// tokenize splits text into BM25 tokens. Mixed-script aware (2026-05-15):
+//
+//   - ASCII letters/digits accumulate into whole words (3+ chars). The
+//     length floor matches the original behavior; "go" and "ai" still
+//     get dropped to keep IDF stable on a corpus that historically
+//     never indexed 2-letter Latin tokens.
+//
+//   - CJK runes (Han / Kana / Hangul) emit BOTH unigrams AND bigrams.
+//     Bigrams give precision (a "我喜欢" doc shares "我喜" + "喜欢"
+//     bigrams with the query "我喜欢喵咪") while unigrams ensure recall
+//     when query and doc only share single chars (query "猫" still hits
+//     doc "宠物猫"). BM25's IDF naturally damps the very common chars
+//     (的/是/了) so unigram noise stays bounded.
+//
+//   - Everything else (whitespace, punctuation including CJK
+//     punctuation U+3000-U+303F) just flushes the active buffers.
+//
+// Pre-fix: ASCII-only ([a-z0-9]+ with len>2). Chinese / Japanese /
+// Korean queries returned zero tokens so BM25 produced an empty
+// hit list — AutoRetrieve effectively disabled for non-Latin users.
 func tokenize(text string) []string {
 	text = strings.ToLower(text)
 	var words []string
-	var current strings.Builder
+	var ascii strings.Builder
+	var cjk []rune
+
+	flushAscii := func() {
+		if ascii.Len() > 2 {
+			words = append(words, ascii.String())
+		}
+		ascii.Reset()
+	}
+	flushCJK := func() {
+		// Single CJK char → unigram only (no bigram possible).
+		// Multiple → emit each as unigram + each adjacent pair as bigram.
+		for _, r := range cjk {
+			words = append(words, string(r))
+		}
+		for i := 0; i+1 < len(cjk); i++ {
+			words = append(words, string(cjk[i:i+2]))
+		}
+		cjk = cjk[:0]
+	}
+
 	for _, r := range text {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
-			current.WriteRune(r)
-		} else {
-			if current.Len() > 2 { // Skip short words
-				words = append(words, current.String())
-			}
-			current.Reset()
+		switch {
+		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+			flushCJK()
+			ascii.WriteRune(r)
+		case isCJKRune(r):
+			flushAscii()
+			cjk = append(cjk, r)
+		default:
+			flushAscii()
+			flushCJK()
 		}
 	}
-	if current.Len() > 2 {
-		words = append(words, current.String())
-	}
+	flushAscii()
+	flushCJK()
 	return words
+}
+
+// isCJKRune classifies r as a CJK ideograph or kana / hangul syllable.
+// Punctuation in U+3000-U+303F (the CJK Symbols block — `「」、。`)
+// is intentionally excluded: punctuation is a delimiter, not signal,
+// and indexing it as a token would inflate IDF for noise.
+func isCJKRune(r rune) bool {
+	switch {
+	case r >= 0x4E00 && r <= 0x9FFF: // CJK Unified Ideographs (most Han chars)
+		return true
+	case r >= 0x3400 && r <= 0x4DBF: // CJK Extension A
+		return true
+	case r >= 0x20000 && r <= 0x2A6DF: // CJK Extension B (rare ideographs)
+		return true
+	case r >= 0x3040 && r <= 0x309F: // Hiragana
+		return true
+	case r >= 0x30A0 && r <= 0x30FF: // Katakana
+		return true
+	case r >= 0xAC00 && r <= 0xD7AF: // Hangul Syllables
+		return true
+	}
+	return false
 }
 
 // parsePassageLine parses a JSON line into a Passage.

@@ -24,14 +24,15 @@ import (
 )
 
 type (
-	Request      = provider.Request
-	Response     = provider.Response
-	StreamReader = provider.StreamReader
-	StreamEvent  = provider.StreamEvent
-	Message      = provider.Message
-	ContentBlock = provider.ContentBlock
-	ToolSpec     = provider.ToolSpec
-	Effort       = pubLLM.Effort
+	Request       = provider.Request
+	Response      = provider.Response
+	StreamReader  = provider.StreamReader
+	StreamEvent   = provider.StreamEvent
+	Message       = provider.Message
+	ContentBlock  = provider.ContentBlock
+	ToolSpec      = provider.ToolSpec
+	SystemSection = provider.SystemSection
+	Effort        = pubLLM.Effort
 )
 
 const (
@@ -253,6 +254,32 @@ type oaiResp struct {
 
 // --- conversion ---
 
+// flattenSystem joins req.SystemSections (each with their own body)
+// into a single string for the OpenAI-dialect system message. When
+// SystemSections is empty falls back to req.System unchanged.
+//
+// Sections are joined with `\n\n` so block-level structure (like
+// fenced <memory-context> or <auto-retrieve> tags) survives. Section
+// names aren't injected as headers — the body text already carries
+// any markers the model needs (e.g. "[System note: ...]" prepended
+// inside AutoRetrieve / BuildContext).
+func flattenSystem(req Request) string {
+	if len(req.SystemSections) == 0 {
+		return req.System
+	}
+	var sb strings.Builder
+	for i, s := range req.SystemSections {
+		if s.Body == "" {
+			continue
+		}
+		if i > 0 && sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(s.Body)
+	}
+	return sb.String()
+}
+
 func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 	mt := maxTokens
 	if req.MaxTokens > 0 {
@@ -273,8 +300,27 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 			IncludeUsage bool `json:"include_usage"`
 		}{IncludeUsage: true}
 	}
-	if req.System != "" {
-		out.Messages = append(out.Messages, oaiMessage{Role: "system", Content: req.System})
+	// System prompt: prefer SystemSections when populated (the path the
+	// agent loop uses once it has memory + auto-retrieve to inject),
+	// fall back to req.System otherwise.
+	//
+	// Pre-fix (2026-05-15): only req.System was read. The agent's
+	// buildRequest writes memory / auto-retrieve into SystemSections
+	// when they're non-empty, so DeepSeek / Kimi / MiniMax / GLM —
+	// every OpenAI-dialect provider — silently dropped both
+	// subsystems. AutoRetrieve appeared to work (debug log said
+	// "enabled") but the model never saw the retrieved passages,
+	// because the sections never reached the wire.
+	//
+	// Anthropic provider has dedicated section serialization with
+	// per-section cache_control; OpenAI dialect has no equivalent so
+	// we just join all section bodies into the single system message
+	// with `\n\n` separators. Cache benefit is lost (DeepSeek's
+	// prompt cache is prefix-only; volatile sections at the end will
+	// invalidate downstream cache anyway), but at least the content
+	// reaches the model.
+	if sys := flattenSystem(req); sys != "" {
+		out.Messages = append(out.Messages, oaiMessage{Role: "system", Content: sys})
 	}
 	for _, m := range req.Messages {
 		switch m.Role {
