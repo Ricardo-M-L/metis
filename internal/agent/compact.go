@@ -130,6 +130,27 @@ type Config struct {
 	// Default 2 → up to 3 streaming attempts + 1 non-streaming.
 	// Set to 0 to keep legacy "fail on first error" behaviour.
 	MaxSummaryRetries int
+
+	// IdleMaxSeconds — wall-clock seconds since the last microcompact
+	// (or Loop start) after which maybeCompact force-runs a Microcompact
+	// pass regardless of whether SnipThreshold is crossed. Mirrors
+	// claude-code's services/compact/timeBasedMCConfig.ts (which kicks
+	// in roughly at the 60-min provider-cache TTL boundary, on the
+	// theory that tool_results older than the cache TTL are no longer
+	// helping the cache and shouldn't keep wasting wire bytes). Off
+	// when 0 — token-only triggering. Default 3600 (1h).
+	IdleMaxSeconds int
+
+	// KeepRecentToolResults — number of most-recent tool_result blocks
+	// (anywhere in the eligible Microcompact range, not just the trailing
+	// ProtectLast messages) that must NOT be offloaded. Complements
+	// ProtectLast: if the trailing 5 messages happen to be short
+	// user/assistant chatter ("继续", "ok"), the previous batch of
+	// tool_results would otherwise get evicted to disk even though
+	// they're still the most recent evidence the model is working
+	// against. Mirrors CC's services/compact/microCompact.ts keepRecent
+	// (default 5). Set 0 to disable — only ProtectLast applies then.
+	KeepRecentToolResults int
 }
 
 // DefaultConfig returns sensible defaults.
@@ -160,6 +181,8 @@ func DefaultCompactionConfig() Config {
 		RedactSecrets:     true,
 		IterativeSummary:  true,
 		MaxSummaryRetries: 2,
+		IdleMaxSeconds:        3600, // 1h — mirrors CC's timeBasedMC cache-TTL window
+		KeepRecentToolResults: 5,    // mirrors CC microCompact keepRecent=5
 	}
 }
 
@@ -410,6 +433,46 @@ func (c *Compactor) ShouldMicrocompact(messages []llm.Message) bool {
 	return float64(rough) >= float64(c.effectiveInputCap())*c.SnipThreshold
 }
 
+// toolResultPos locates a single tool_result block by (message index,
+// content block index). Used as a map key by Microcompact's CC-mode
+// keepRecent guard.
+type toolResultPos struct {
+	msgIdx, blockIdx int
+}
+
+// recentToolResultsToKeep walks the eligible range [ProtectFirst, cut)
+// and returns the positions of the c.KeepRecentToolResults most recent
+// tool_result blocks. The returned map is nil (empty lookup) when the
+// guard is disabled (KeepRecentToolResults <= 0) — callers don't need
+// to nil-check, missing key just returns the zero value.
+//
+// Walks both axes: the i index AND the bi index within Content matter
+// because a single user-role message can contain multiple tool_results
+// (parallel tool execution), and "most recent" should respect block
+// order within that message.
+func (c *Compactor) recentToolResultsToKeep(messages []llm.Message, cut int) map[toolResultPos]bool {
+	if c.KeepRecentToolResults <= 0 {
+		return nil
+	}
+	var positions []toolResultPos
+	for i := c.ProtectFirst; i < cut; i++ {
+		for bi, b := range messages[i].Content {
+			if b.Type == "tool_result" {
+				positions = append(positions, toolResultPos{i, bi})
+			}
+		}
+	}
+	start := len(positions) - c.KeepRecentToolResults
+	if start < 0 {
+		start = 0
+	}
+	keep := make(map[toolResultPos]bool, len(positions)-start)
+	for _, p := range positions[start:] {
+		keep[p] = true
+	}
+	return keep
+}
+
 // Microcompact off-loads oversized tool_result blocks (>= MicrocompactMinChars)
 // to disk under MicrocompactDir/<tool_use_id>.txt. The inline content
 // is replaced with a stub:
@@ -433,6 +496,13 @@ func (c *Compactor) Microcompact(messages []llm.Message) []llm.Message {
 	}
 	idToName := toolNameByID(messages)
 	protected := protectedSet(c.ProtectedTools)
+	// 2026-05-15 CC-mode: mirror microCompact.ts keepRecent=5. In addition
+	// to the trailing ProtectLast messages, never offload the N most
+	// recent tool_result blocks in the eligible range. Without this, the
+	// "model just made 5 Bash calls then user said '继续'" pattern would
+	// silently evict all 5 results because the trailing 5 messages are
+	// short user/assistant chatter.
+	recentKeep := c.recentToolResultsToKeep(messages, cut)
 	out := make([]llm.Message, len(messages))
 	copy(out, messages)
 	for i := c.ProtectFirst; i < cut; i++ {
@@ -454,6 +524,11 @@ func (c *Compactor) Microcompact(messages []llm.Message) []llm.Message {
 			// re-Read; the value is anchored in the next turn's
 			// reasoning. Skip them.
 			if isProtectedToolResult(b.ToolUseID, idToName, protected) {
+				continue
+			}
+			// CC keepRecent guard — the most-recent N tool_results are
+			// the model's working evidence, not cold history.
+			if recentKeep[toolResultPos{i, bi}] {
 				continue
 			}
 			id := b.ToolUseID

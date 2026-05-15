@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -42,6 +43,31 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 			})
 		}
 	}
+	// Tier 1.5 — Time-based Microcompact: when more than IdleMaxSeconds
+	// have passed since the previous Microcompact pass, force a fresh
+	// one even if SnipThreshold isn't crossed. Models the boundary at
+	// which the provider's prompt cache has probably aged out the older
+	// tool_result blocks (CC's services/compact/timeBasedMC uses 60min
+	// for the same reason). Without this, a long-idle conversation that
+	// later resumes pays full re-send of multi-MB tool_results that the
+	// cache has already evicted. Off when IdleMaxSeconds <= 0.
+	if l.Compactor.IdleMaxSeconds > 0 && l.Compactor.MicrocompactDir != "" {
+		idle := time.Since(l.lastTimeBasedMicrocompactAt)
+		if idle > time.Duration(l.Compactor.IdleMaxSeconds)*time.Second {
+			beforeBytes := estimateTokens(l.Messages)
+			offloaded := l.Compactor.Microcompact(l.Messages)
+			afterBytes := estimateTokens(offloaded)
+			if afterBytes < beforeBytes {
+				l.Messages = offloaded
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: fmt.Sprintf("context microcompacted (time-based, idle %.0fs): ~%d → ~%d tokens", idle.Seconds(), beforeBytes, afterBytes),
+				})
+			}
+			l.lastTimeBasedMicrocompactAt = time.Now()
+		}
+	}
+
 	// Tier 2 — Microcompact: off-load still-large tool_result blocks
 	// to disk. Lossless from the model's POV — it can Read the cached
 	// path to recover. Runs in same threshold window as Snip.
@@ -55,6 +81,9 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 				Kind: EventInfo,
 				Info: fmt.Sprintf("context microcompacted: ~%d → ~%d tokens (cached to disk, recoverable via Read)", beforeBytes, afterBytes),
 			})
+			// Threshold-driven Microcompact also resets the time-based
+			// window — no need to fire again immediately.
+			l.lastTimeBasedMicrocompactAt = time.Now()
 		}
 	}
 

@@ -19,6 +19,7 @@ func TestMicrocompact_OffloadsLargeBlocks(t *testing.T) {
 	cfg.ProtectLast = 2
 	cfg.MicrocompactDir = dir
 	cfg.MicrocompactMinChars = 100
+	cfg.KeepRecentToolResults = 0 // isolate the size-based offload path
 	c := NewCompactor(cfg, "test", 1000, &fakeSummarizer{})
 
 	bigPayload := strings.Repeat("A", 500)
@@ -79,6 +80,7 @@ func TestMicrocompact_RespectsProtectedTail(t *testing.T) {
 	cfg.ProtectLast = 2
 	cfg.MicrocompactDir = dir
 	cfg.MicrocompactMinChars = 100
+	cfg.KeepRecentToolResults = 0 // isolate the ProtectLast-only path
 	c := NewCompactor(cfg, "test", 1000, &fakeSummarizer{})
 
 	big := strings.Repeat("Y", 500)

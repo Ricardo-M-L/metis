@@ -195,6 +195,16 @@ type Loop struct {
 	// later failure run can re-emit the notice.
 	compactCircuitNoticeSent bool
 
+	// lastTimeBasedMicrocompactAt is the wall-clock of the most recent
+	// Microcompact pass (whether triggered by SnipThreshold or by the
+	// IdleMaxSeconds time-based path). maybeCompact reads it to decide
+	// whether to force a fresh Microcompact when the conversation has
+	// been "idle" longer than the cache TTL — mirrors CC's
+	// timeBasedMC. Initialised to Loop creation time in NewLoop so the
+	// first IdleMaxSeconds-second window starts from there, not from
+	// time.Time{} (which would trip on every call).
+	lastTimeBasedMicrocompactAt time.Time
+
 	// AutoMemory controls the openclaude-style "extract memorable
 	// facts at turn boundaries" behaviour. Off by default — opting
 	// in costs an extra LLM call every AutoMemoryEvery turns.
@@ -239,13 +249,14 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 		maxIter = 50
 	}
 	return &Loop{
-		Provider:   p,
-		Registry:   r,
-		Gate:       g,
-		Hooks:      h,
-		System:     system,
-		MaxIters:   maxIter,
-		GraceCalls: 1,
+		Provider:                    p,
+		Registry:                    r,
+		Gate:                        g,
+		Hooks:                       h,
+		System:                      system,
+		MaxIters:                    maxIter,
+		GraceCalls:                  1,
+		lastTimeBasedMicrocompactAt: time.Now(),
 	}
 }
 
