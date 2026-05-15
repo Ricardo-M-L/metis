@@ -20,6 +20,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	ltable "charm.land/lipgloss/v2/table"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // segmentKind tags a markdown chunk as either prose (goes to glamour)
@@ -194,6 +195,18 @@ func renderMetisTable(headers []string, rows [][]string, width int) string {
 		renderedRows[i] = rr
 	}
 
+	// Shrink to content width when content fits within the terminal —
+	// image #11 user feedback: a 3-column table with short cells was
+	// stretching to fill the whole 200-col window, which looked airy
+	// and empty. Estimate the natural width (longest cell per column +
+	// padding + column dividers + outer frame) and use min(natural,
+	// terminal). When natural > terminal, keep the terminal cap so
+	// lipgloss wraps cells instead of overflowing.
+	useWidth := width
+	if nat := naturalTableWidth(renderedHeaders, renderedRows); nat > 0 && nat < useWidth {
+		useWidth = nat
+	}
+
 	// NormalBorder gives the ─│┼┌┐└┘├┤┬┴ box-drawing glyphs that match
 	// image #5 (Claude Code's table look). lipgloss internally measures
 	// width with ansi.StringWidth (ambiguous-width = 1), which matches
@@ -233,7 +246,7 @@ func renderMetisTable(headers []string, rows [][]string, width int) string {
 		BorderHeader(true).
 		BorderColumn(true).
 		BorderRow(true).
-		Width(width).
+		Width(useWidth).
 		Wrap(true).
 		Headers(renderedHeaders...).
 		Rows(renderedRows...).
@@ -350,4 +363,47 @@ func indexDoubleStar(runes []rune, from int) int {
 		}
 	}
 	return -1
+}
+
+// naturalTableWidth estimates the width a content-sized table would
+// occupy if lipgloss let cells take their longest single-line content.
+// Layout we mirror:
+//
+//	│ <pad> longest-cell-of-col-0 <pad> │ ... │ <pad> longest-cell-of-col-N <pad> │
+//
+// Each cell contributes its widest line plus 2 cells of padding (the
+// `Padding(0, 1)` in headerStyle/cellStyle), and each column boundary
+// plus the outer left+right frame contributes one cell of vertical
+// border. ansi.StringWidth strips SGR codes before counting so the
+// already-coloured inline-code badges don't inflate the estimate.
+func naturalTableWidth(headers []string, rows [][]string) int {
+	cols := len(headers)
+	if cols == 0 {
+		return 0
+	}
+	colMax := make([]int, cols)
+	consider := func(j int, cell string) {
+		if j < 0 || j >= cols {
+			return
+		}
+		for _, line := range strings.Split(cell, "\n") {
+			if w := ansi.StringWidth(line); w > colMax[j] {
+				colMax[j] = w
+			}
+		}
+	}
+	for j, h := range headers {
+		consider(j, h)
+	}
+	for _, row := range rows {
+		for j, cell := range row {
+			consider(j, cell)
+		}
+	}
+	total := 0
+	for _, w := range colMax {
+		total += w + 2 // 2 padding cells per column (1 left + 1 right)
+	}
+	total += cols + 1 // (cols-1) column separators + 1 left frame + 1 right frame
+	return total
 }
