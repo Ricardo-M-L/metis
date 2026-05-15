@@ -1,18 +1,19 @@
 ---
 id: 03_count_files
-description: agent 用 Glob 数 .go 文件数量
+description: Agent uses Glob to count .go files in a directory
 tags: smoke, glob, count
 timeout_seconds: 60
 ---
 
 # Setup
-metis 仓库 internal/eval/ 下有 4 个 .go 源文件 + 测试文件。
+internal/eval/ currently contains 4 source files (reward.go, runner.go,
+scenario.go, types.go) plus 3 test files, for 7 .go files total.
 
 # Prompt
-internal/eval/ 目录下有几个 .go 文件？回答时给出总数（包括测试文件）。
+How many .go files are in the internal/eval/ directory? Give the total count (including test files).
 
 # Reward
 - regex: \b\d+\b weight=2
 - used_tool: Glob weight=1
-- not_contains: ["error", "无法"] weight=0.5
+- not_contains: ["error", "I cannot"] weight=0.5
 - length: 5..400 weight=0.3

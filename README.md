@@ -66,6 +66,8 @@ metis config show             # effective config + which files were read
 metis config init             # write starter config to ~/.metis/config.toml
 metis tools                   # list registered tools (built-in + MCP + plugin)
 metis sessions list           # recent saved sessions
+metis sessions export <id>    # dump a session's JSONL to stdout
+metis sessions import         # import JSONL from stdin (optional --id)
 metis skills list             # built-in skills library
 metis skills install <ref>    # install a skill (bundled name or owner/repo:name)
 metis skills info <name>      # show one skill's manifest fields
@@ -81,6 +83,9 @@ metis plugin remove <name> [--yes]  # delete a plugin (--yes to actually rm -rf)
 metis cron <list|add|...>     # scheduled-job CRUD (see Scheduling section)
 metis acp [--addr ADDR]       # JSON-RPC server (stdio default; TCP for Zed/etc.)
 metis auth login              # opencode-style provider wizard (writes ~/.metis/auth.json)
+metis audit                   # security audit of the current configuration
+metis diag [--llm] [--tool-smoke] [--json]   # non-interactive health check
+metis eval [--dir D] [--tag T] [--out P]     # run the markdown scenario pack
 metis update [--check]        # self-update from the private GitHub release
 metis version [-V]            # short semver (-V for full build fingerprint)
 ```
@@ -418,10 +423,14 @@ that lights up while the turn is running and clears on completion.
 | `Bash` | input-dep | classified per command — `ls`/`grep` safe, `rm`/`git push` exclusive |
 | `Edit` | exclusive | unique-match enforced, structured diff render |
 | `Write` | exclusive | absolute paths only |
+| `NotebookEdit` | exclusive | edit a single cell in a `.ipynb` notebook |
+| `LSP` | safe | symbol/diagnostic lookups via gopls when available |
 | `Memory` | exclusive | persistent memory CRUD |
 | `Skill` | safe | invoke a registered skill |
 | `Ask` | safe | mid-turn user clarification |
-| `TodoWrite` | exclusive | task list, persisted per-session |
+| `TodoWrite` / `TodoRead` | exclusive / safe | task list, persisted per-session |
+| `BashList` / `BashOutput` / `BashKill` | safe | inspect / read / terminate background bash jobs |
+| `EnterPlanMode` / `ExitPlanMode` | exclusive | enter/leave plan mode mid-turn (claude-code parity) |
 | `Agent` | queue / background | spawn sub-agent — supports `name`, `isolation:"worktree"`, `cwd`, `run_in_background`, `permission_mode`, `allowed_tools`, `disallowed_tools`, `resume_from`, `timeout_seconds` |
 | `Fork` | queue | warm-context sub-agent (inherits parent's full history) |
 | `MessageTeammate` | safe | peer-to-peer messaging to a named sub-agent's mailbox |
@@ -634,7 +643,7 @@ custom rollups.
 ## Channels (chat-platform adapters)
 
 `internal/channels/*` ships adapters for **DingTalk, Discord, Feishu,
-iMessage, Mattermost, Signal, Slack, Telegram, WeChat, WhatsApp**.
+iMessage, Mattermost, Signal, Slack, Telegram, WeChat**.
 Configured via `[channels.<name>]` in config; `SendMessage` tool routes to
 them. Use cases: ops automations, scheduled cron-driven reports.
 
@@ -761,19 +770,21 @@ pkg/                      public SDK (provider, tool, hook, channel,
                           skill, memory, session, plugin, llm.Effort)
 internal/llm/             Anthropic / OpenAI / Gemini stream parsers
 internal/tools/           Tool interface + registry
-internal/tools/builtin/   16 first-party tools
+internal/tools/builtin/   first-party tools (Read/Write/Edit/Bash/Glob/
+                          Grep/LS/Git/WebFetch/WebSearch/WebBrowse/
+                          NotebookEdit/Todo/Ask/LSP/Task* + plan-mode)
 internal/permission/      Cascading rule gate + 5 modes
 internal/agent/           Loop, dispatch, streaming, compaction,
                           hooks, plan, skills, cron, loop-detection
 internal/agent/skills/    SKILL.md loader (5 layers: bundled / user /
-                          project / plugin / mcp), 22 bundled skills
+                          project / plugin / mcp), 23 bundled skills
 internal/mcp/             stdio + Streamable HTTP/SSE clients
-internal/channels/        11 chat-platform adapters
+internal/channels/        9 chat-platform adapters
 internal/memory/          Core/Archival/Recall + daily notes + freshness
 internal/session/         JSONL persistence, branch + snapshot
 internal/runtime/         composer helpers (provider, channels, mcp,
                           plugin, system_prompt, plan_archive, …)
-internal/tui/             bubbletea TUI (split into ~50 files)
+internal/tui/             bubbletea TUI (~76 files)
 install/                  curl + npm installer wrappers
 ```
 

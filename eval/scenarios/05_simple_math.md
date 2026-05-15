@@ -1,15 +1,15 @@
 ---
 id: 05_simple_math
-description: 不用工具的纯推理 — 算个简单数学题
+description: Pure reasoning, no tools — a simple arithmetic question
 tags: smoke, no_tools, basic
 timeout_seconds: 30
 ---
 
 # Setup
-（无）
+(none)
 
 # Prompt
-17 × 23 等于多少？只回答数字，不要解释。
+What is 17 × 23? Answer with just the number, no explanation.
 
 # Reward
 - contains_all: ["391"] weight=2
