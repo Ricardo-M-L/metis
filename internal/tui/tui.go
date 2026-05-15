@@ -155,6 +155,21 @@ type Model struct {
 	spinnerStartedAt time.Time
 	spinnerVerb      string
 	spinnerSub       string
+	// spinnerOverride pins the spinner verb to a fixed label that wins
+	// over spinnerVerb / spinnerSub while non-empty. Used when the loop
+	// is in an LLM-driven compaction phase (Collapse / Compact) so the
+	// user sees "Compacting conversation (collapse)..." instead of the
+	// thinking verb that would otherwise show during a 5-30s summarize
+	// call — that was the "input area looks frozen" user report
+	// (2026-05-15 screenshot #3). Cleared on EventContextCompacted.
+	spinnerOverride string
+
+	// spinnerCompactionBytes is the cumulative byte count of the
+	// in-flight summarize stream, updated by EventCompactionProgress.
+	// Renders next to the override label as "(N tokens streamed)" so
+	// the user sees the summarize call is making progress rather than
+	// just a frozen elapsed timer. Reset on EventContextCompacted.
+	spinnerCompactionBytes int
 	// spinnerPhase mirrors claude-code's SpinnerMode (sourcemap
 	// restored-src/src/components/Spinner/SpinnerAnimationRow.tsx
 	// lines 235-265). Drives the directional arrow:

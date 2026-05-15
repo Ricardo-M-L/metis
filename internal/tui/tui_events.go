@@ -151,6 +151,14 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		}
 		// keep toolEvents for display
 	case agent.EventError:
+		// Compaction may have been the thing that errored — clear the
+		// terminal-tab progress indicator before painting the error so
+		// the user doesn't see a stuck indeterminate spinner.
+		if m.spinnerOverride != "" {
+			SetTerminalProgress(ProgressClear)
+			m.spinnerOverride = ""
+			m.spinnerCompactionBytes = 0
+		}
 		// Flush any in-flight thinking/streaming text before painting
 		// the error so the partial reply isn't silently dropped. This
 		// is the "current turn errored and now I can't see what was
@@ -194,6 +202,36 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 				m.messages = append(m.messages, Message{Role: "error-hint", Content: errHint, Timestamp: time.Now()})
 			}
 		}
+	case agent.EventCompactionStart:
+		// LLM-driven compaction tier (Collapse or Compact) is about to
+		// call summarize. Pin the spinner label so the user sees what's
+		// happening during the otherwise silent 5-30s window. Mirrors
+		// claude-code REPL.tsx:2504 setSpinnerMessage('Compacting…').
+		tier := ev.Info
+		if tier == "" {
+			tier = "compact"
+		}
+		m.spinnerOverride = "Compacting conversation (" + tier + ")"
+		m.spinnerCompactionBytes = 0
+		// OSC 9;4 indeterminate — terminals that support it (iTerm2
+		// 3.6.6+, Ghostty 1.2.0+, ConEmu) render a progress indicator
+		// on the tab/taskbar so the user has a visual cue even when
+		// the in-pane spinner is scrolled off-screen.
+		SetTerminalProgress(ProgressIndeterminate)
+	case agent.EventCompactionProgress:
+		// summarize stream is feeding bytes — bump the counter (kept
+		// in state for potential future use, e.g. debug overlay) but
+		// no longer rendered in the spinner row (user feedback: the
+		// terminal-tab indicator is enough; the inline token count
+		// was noise).
+		m.spinnerCompactionBytes = ev.InputTokens
+	case agent.EventContextCompacted:
+		// Either tier finished (success or failure) — release the
+		// override so the normal thinking verb returns on the next
+		// turn or tool call.
+		m.spinnerOverride = ""
+		m.spinnerCompactionBytes = 0
+		SetTerminalProgress(ProgressClear)
 	case agent.EventInfo:
 		// Sniff for compaction events — emit them with a distinctive
 		// ✻ banner so the user sees "your context just got compressed"

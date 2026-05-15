@@ -44,6 +44,23 @@ const (
 	EventContextWarn      // crossed soft threshold (e.g., 70%)
 	EventContextCompacted // auto-compaction just ran (also emits as EventInfo today)
 
+	// EventCompactionStart marks the start of an LLM-driven compaction
+	// tier (Collapse or Compact). The TUI swaps the spinner label to
+	// "Compacting conversation (TIER)..." so the user knows the apparent
+	// freeze is a summarization call and not a hang. Info field carries
+	// the tier name. Mirrors claude-code's onCompactProgress event
+	// (REPL.tsx:2497, case 'compact_start').
+	EventCompactionStart
+
+	// EventCompactionProgress carries the cumulative output-bytes count
+	// from the summarize stream so the TUI can show "Compacting
+	// conversation (12K tokens streamed)" — the token counter that lets
+	// the user see the summarize call is still alive. InputTokens field
+	// piggy-backs the cumulative *byte* count (we don't have a real
+	// tokenizer in the loop; bytes/4 is the standard estimate). Mirrors
+	// CC's responseLengthRef-driven spinner token counter.
+	EventCompactionProgress
+
 	// Rate limit / provider feedback.
 	EventRateLimitHit  // 429 / 529 from provider, retrying
 	EventModelFallback // primary model rejected, switched to fallback

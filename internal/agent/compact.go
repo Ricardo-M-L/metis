@@ -1260,6 +1260,20 @@ func (c *Compactor) summarizeOnce(ctx context.Context, req llm.Request) (string,
 		return "", err
 	}
 	defer stream.Close()
+	// Progress fan-out — when maybeCompact stamped a forwarder onto ctx
+	// (via WithEventOut), every text_delta we receive bumps the byte
+	// counter and emits an EventCompactionProgress. The TUI uses this
+	// to render "Compacting conversation (12K tokens streamed)" so a
+	// long summarize doesn't look like a freeze. Mirrors CC's
+	// responseLengthRef-driven spinner counter. nil channel → silent
+	// (the pre-2026-05-15 behaviour, and what tests get).
+	progressCh := EventOutFromContext(ctx)
+	// Don't emit on every single delta — a streaming summarize can fire
+	// hundreds of tiny chunks/s. throttleEvery limits emission to one
+	// event per ~256 bytes (≈64 tokens), which gives a visibly-moving
+	// counter without flooding the UI message bus.
+	const throttleEvery = 256
+	var nextEmit int
 	var out strings.Builder
 	for {
 		ev, err := stream.Recv()
@@ -1272,6 +1286,16 @@ func (c *Compactor) summarizeOnce(ctx context.Context, req llm.Request) (string,
 		switch ev.Type {
 		case "text_delta":
 			out.WriteString(ev.TextDelta)
+			if progressCh != nil && out.Len() >= nextEmit {
+				select {
+				case progressCh <- Event{Kind: EventCompactionProgress, InputTokens: out.Len()}:
+				default:
+					// Drop on full channel — the next delta's emit will
+					// catch up. Better than blocking summarize on a slow
+					// UI consumer.
+				}
+				nextEmit = out.Len() + throttleEvery
+			}
 		case "message_stop":
 			return strings.TrimSpace(out.String()), nil
 		case "error":

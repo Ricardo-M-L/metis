@@ -1427,6 +1427,23 @@ func cmdRun(ctx context.Context, args []string) error {
 					fmt.Fprintf(os.Stderr, "  → %s(%v)\n", tc.Name, tc.Input)
 				}
 			}
+		case agent.EventCompactionStart:
+			// Same purpose as the TUI's spinner-override: tell the
+			// caller "we're entering a 5-30s LLM summarize" so a long
+			// pause doesn't look like a hang in run/cron-run mode.
+			tier := ev.Info
+			if tier == "" {
+				tier = "compact"
+			}
+			fmt.Fprintf(os.Stderr, "[compact] starting %s — summarizing history\n", tier)
+			// OSC 9;4 indeterminate — picks up iTerm2 tab / Ghostty tab
+			// progress indicator even when stderr scrolls past the
+			// "[compact]" line. No-op when stdout isn't a TTY (piped
+			// run output won't pollute downstream consumers).
+			tui.SetTerminalProgress(tui.ProgressIndeterminate)
+		case agent.EventContextCompacted:
+			fmt.Fprintf(os.Stderr, "[compact] %s done\n", ev.Info)
+			tui.SetTerminalProgress(tui.ProgressClear)
 		case agent.EventInfo:
 			// Surface auto-compaction notices ("context compacted: M → N
 			// messages"), loop-detector aborts, and similar non-error
@@ -1996,6 +2013,24 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 				auditW.Append(agent.AuditEntry{
 					Kind: "tool_result", Text: ev.ToolResult.Output, IsError: ev.ToolResult.IsError,
 				})
+			}
+		case agent.EventCompactionStart:
+			tier := ev.Info
+			if tier == "" {
+				tier = "compact"
+			}
+			if !job.Silent {
+				fmt.Fprintf(os.Stderr, "[cron %s] [compact] starting %s\n", job.ID, tier)
+			}
+			if auditW != nil {
+				auditW.Append(agent.AuditEntry{Kind: "info", Text: "compact start: " + tier})
+			}
+		case agent.EventContextCompacted:
+			if !job.Silent {
+				fmt.Fprintf(os.Stderr, "[cron %s] [compact] %s done\n", job.ID, ev.Info)
+			}
+			if auditW != nil {
+				auditW.Append(agent.AuditEntry{Kind: "info", Text: "compact done: " + ev.Info})
 			}
 		case agent.EventInfo:
 			if ev.Info == "" {

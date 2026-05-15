@@ -167,10 +167,21 @@ func renderSpinnerStatus(m *Model) string {
 		return s.String()
 	}
 	s.WriteString(styleAccent.Render("  " + frame + " "))
-	if m.spinnerSub != "" {
+	switch {
+	case m.spinnerOverride != "":
+		// Compaction (or any other long-running blocking phase) — the
+		// override label wins over the verb so the user sees what's
+		// actually happening, not a generic thinking verb. Token
+		// counter intentionally omitted: the OSC 9;4 indeterminate
+		// indicator on the terminal tab (set in tui_events.go on
+		// EventCompactionStart) is the primary visual cue; an inline
+		// token counter on top of that is redundant (user feedback
+		// 2026-05-15).
+		s.WriteString(shimmerStyle(elapsed).Render(m.spinnerOverride))
+	case m.spinnerSub != "":
 		s.WriteString(toolUseFlashStyle(elapsed).Render(m.spinnerVerb))
 		s.WriteString(styleDim.Render(" · " + truncate(m.spinnerSub, 35)))
-	} else {
+	default:
 		s.WriteString(shimmerStyle(elapsed).Render(m.spinnerVerb))
 	}
 	if len(parts) > 0 {

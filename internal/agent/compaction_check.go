@@ -100,7 +100,17 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	// counter and decides accordingly.
 	if l.Compactor.ShouldCollapse(l.Messages) {
 		before := len(l.Messages)
-		collapsed, err := l.Compactor.CollapseMiddle(ctx, l.Messages)
+		// Tell the UI we're entering an LLM-driven phase so it can swap
+		// the spinner label. Without this the TUI shows "Thinking..." for
+		// 5-30s while summarize streams, which looks like a hang — see
+		// 2026-05-15 user report (screenshot #3, "input area frozen").
+		emit(ctx, out, Event{Kind: EventCompactionStart, Info: "collapse"})
+		// Stamp the forwarder onto ctx so summarizeOnce can stream
+		// EventCompactionProgress (cumulative byte counter) into the
+		// same channel for the TUI's "(N tokens streamed)" suffix.
+		collapseCtx := WithEventOut(ctx, out)
+		collapsed, err := l.Compactor.CollapseMiddle(collapseCtx, l.Messages)
+		emit(ctx, out, Event{Kind: EventContextCompacted, Info: "collapse"})
 		if err != nil {
 			return // skip Compact attempt — see comment above
 		}
@@ -126,7 +136,10 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 		return
 	}
 	before := len(l.Messages)
-	compacted, err := l.Compactor.Compact(ctx, l.Messages)
+	emit(ctx, out, Event{Kind: EventCompactionStart, Info: "compact"})
+	compactCtx := WithEventOut(ctx, out)
+	compacted, err := l.Compactor.Compact(compactCtx, l.Messages)
+	emit(ctx, out, Event{Kind: EventContextCompacted, Info: "compact"})
 	if err != nil || len(compacted) >= before {
 		return
 	}
