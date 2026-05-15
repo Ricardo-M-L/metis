@@ -584,6 +584,12 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		})
 		pendingUpdateNotice = ""
 	}
+	// Hydrate the chat surface from loop.Messages on resumed sessions
+	// (2026-05-15 fix). ApplyResume restores loop.Messages but never
+	// touches m.messages — without this call, `metis --resume <id>`
+	// opens a blank chat even though the LLM has full context.
+	// No-op for fresh sessions (loop.Messages is empty).
+	mdl.hydrateFromLoopHistory()
 	return mdl
 }
 
