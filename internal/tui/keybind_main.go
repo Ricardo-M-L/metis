@@ -105,10 +105,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Same hard-exit safety net as the mid-turn second-press
 		// path: if bubbletea's clean shutdown doesn't return within
 		// 800ms (e.g. an MCP child still alive on its socket),
-		// os.Exit so the user doesn't have to `pkill metis`.
+		// os.Exit so the user doesn't have to `pkill metis`. Run
+		// resetTerminal first so mouse-tracking / kitty-keyboard
+		// sequences are disabled before the process disappears —
+		// otherwise the next mouse motion in the shell echoes raw
+		// `<col;row;buttonM` SGR reports (image bug 2026-05-15).
 		if !m.turnActive {
+			savedTermios := m.savedTermios
 			go func() {
 				time.Sleep(800 * time.Millisecond)
+				resetTerminal(savedTermios)
 				os.Exit(0)
 			}()
 			return m, tea.Quit
@@ -136,12 +142,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			//      800ms because tea.Quit + alt-screen restore + defer
 			//      cleanup typically takes <200ms; 800ms gives 4× safety
 			//      margin while still feeling instant to the user.
+			//      Critically: resetTerminal runs before os.Exit so
+			//      mouse-tracking / alt-screen / kitty-keyboard
+			//      sequences are flushed; otherwise the next mouse
+			//      motion in the shell echoes raw SGR mouse reports
+			//      because os.Exit skips RunTUI's deferred resetTerminal.
 			if m.turnCancel != nil {
 				m.turnCancel()
 				m.turnCancel = nil
 			}
+			savedTermios := m.savedTermios
 			go func() {
 				time.Sleep(800 * time.Millisecond)
+				resetTerminal(savedTermios)
 				os.Exit(0)
 			}()
 			return m, tea.Quit

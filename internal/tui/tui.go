@@ -323,6 +323,16 @@ type Model struct {
 	// active turn, so the second press within ctrlCQuitWindow exits.
 	lastCtrlC time.Time
 
+	// savedTermios is the snapshot of the user's terminal state taken
+	// at RunTUI startup, made available to handleKey's hard-exit
+	// fallback (the 800ms os.Exit timer skips RunTUI's deferred
+	// resetTerminal). Without this, mouse-tracking sequences like
+	// `\x1b[?1006h` stayed enabled after a Ctrl+C×2 hard exit and
+	// every subsequent mouse motion / wheel / click in the user's
+	// shell got echoed as raw `<col;row;buttonM` text — image
+	// 2026-05-15.
+	savedTermios *termSavedState
+
 	// activeScreen is a full-window overlay (e.g. /history). When
 	// non-nil, the chat surface is hidden and key events are forwarded
 	// to the screen until it reports Done().
@@ -616,7 +626,14 @@ func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *sessi
 	// bubbletea v2.0.6's Quit cleanup occasionally misses kitty-
 	// keyboard disable, leaving Ctrl+C echoing as ^[[99;5u in the
 	// shell — the deferred reset is the bullet-proof fallback.
+	//
+	// ALSO stamp it onto the Model so handleKey's hard-exit timer
+	// (the goroutine that fires os.Exit after 800ms when the polite
+	// tea.Quit shutdown stalls) can run the same reset before the
+	// process disappears. Without that, mouse-tracking sequences
+	// stay enabled in the user's shell after Ctrl+C×2 hard exit.
 	saved := snapshotTerminal()
+	m.savedTermios = saved
 	defer resetTerminal(saved)
 
 	p := tea.NewProgram(m, opts...)

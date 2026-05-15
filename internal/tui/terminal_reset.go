@@ -6,6 +6,13 @@ import (
 	"golang.org/x/term"
 )
 
+// termSavedState is an opaque alias for the saved termios snapshot.
+// Aliased so that other files in the package (Model in tui.go,
+// hard-exit path in keybind_main.go) can carry a pointer to it
+// without each importing golang.org/x/term — the import stays
+// confined here and in tui.go's RunTUI.
+type termSavedState = term.State
+
 // resetTerminal sends the full set of "go back to a sane terminal"
 // escape sequences plus a termios sane-restore. Mirrors what `reset(1)`
 // does for the modes a TUI typically toggles. We call this as a defer
