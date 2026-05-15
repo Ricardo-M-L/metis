@@ -102,11 +102,20 @@ var bundledProfileSlugs = map[string]struct{}{
 }
 
 // defaultMaxAgentDepth is the fallback when neither the Agent struct's
-// per-instance MaxDepth nor config.Agents.MaxAgentDepth was set. Kept
-// at 3 so existing tests / minimal embeddings keep the historical
-// behavior. Configurable via `~/.metis/config.toml` `[agents]
-// max_agent_depth = N` since 2026-05-14.
-const defaultMaxAgentDepth = 3
+// per-instance MaxDepth nor config.Agents.MaxAgentDepth was set.
+//
+// 2026-05-16: lowered 3 → 1 to align with claude-code's architectural
+// constraint that sub-agents must not spawn further sub-agents
+// (Subagent 范式 hard constraint, "子智能体不能再生成其他子智能体").
+// Users who want recursive task decomposition (main → plan → explore
+// → 子探索, depth ≥ 2) raise `[agents].max_agent_depth` in
+// ~/.metis/config.toml — the per-instance Agent.MaxDepth override
+// still works for embedders.
+//
+// Why default 1 and not 0: depth 0 would mean "no sub-agents at all";
+// 1 means "the main agent can spawn workers, but those workers stay
+// flat" — the CC posture.
+const defaultMaxAgentDepth = 1
 
 // Agent is a tool that runs a focused subtask in a fresh agent loop.
 // Inspired by Claude Code's LocalAgentTask: spawn an isolated message

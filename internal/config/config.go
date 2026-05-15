@@ -62,9 +62,13 @@ type Agents struct {
 	MaxConcurrentAnon int `toml:"max_concurrent_anon"`
 
 	// MaxAgentDepth caps how deep Agent() spawns can nest. 0 →
-	// default 3 (main → child → grandchild → great-grandchild
-	// refused). Pre-2026-05-14 this was a hard-coded const in
-	// internal/tools/builtin/agent.go.
+	// default 1 (sub-agents may NOT spawn further sub-agents;
+	// the main agent can spawn workers but they stay flat).
+	//
+	// 2026-05-16: lowered default 3 → 1 to align with claude-code's
+	// architectural constraint ("子智能体不能再生成其他子智能体").
+	// Users who want recursive decomposition (main → plan → explore
+	// → 子探索) raise this explicitly.
 	MaxAgentDepth int `toml:"max_agent_depth"`
 
 	// MaxForkDepth caps how deep Fork() spawns can nest. Lower than
@@ -667,7 +671,7 @@ func defaults() *Config {
 			MaxConcurrentSubAgents: 0,
 			MaxConcurrentNamed:     20,
 			MaxConcurrentAnon:      40,
-			MaxAgentDepth:          3,
+			MaxAgentDepth:          1, // CC-aligned: sub-agents may not spawn sub-agents
 			MaxForkDepth:           1,
 			DefaultTimeoutSeconds:  600,
 			CleanupOrphanWorktrees: true,
