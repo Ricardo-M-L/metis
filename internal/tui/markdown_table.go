@@ -215,22 +215,24 @@ func renderMetisTable(headers []string, rows [][]string, width int) string {
 	// card" detached from the body. Using the default fg keeps the
 	// frame the same brightness as the cell text, which is what makes
 	// image #5 (Claude Code) feel like one cohesive box.
-	// BorderHeader(false): when BorderHeader=true, lipgloss draws
-	// ├──┼──┤ between the header row and the body. Combined with the
-	// top frame, that visually packages the header into its own little
-	// box, giving the "floating shadow card" feel reported in image #9.
-	// Turning it off lets the header sit flush against the body —
-	// they're separated purely by the grey header band (#3a3a3a) the
-	// way image #5 (Claude Code) does it.
+	// Full grid: ┌┐└┘ corners, │ on every column boundary, ─ on every
+	// row boundary including the header divider. Image #10 user
+	// feedback called the previous "frame + header band only" look
+	// not 完善 / not a "real" table — and confirmed that the apparent
+	// shadow under the header in image #9 wasn't from BorderHeader
+	// being on, it was from body rows lacking horizontal dividers so
+	// the header sat alone above an unframed blob. With both
+	// BorderHeader and BorderRow on, every cell is enclosed, no row
+	// stands out, no shadow.
 	t := ltable.New().
 		Border(lipgloss.NormalBorder()).
 		BorderTop(true).
 		BorderBottom(true).
 		BorderLeft(true).
 		BorderRight(true).
-		BorderHeader(false).
+		BorderHeader(true).
 		BorderColumn(true).
-		BorderRow(false).
+		BorderRow(true).
 		Width(width).
 		Wrap(true).
 		Headers(renderedHeaders...).
