@@ -159,7 +159,13 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	depth, _ := ctx.Value(forkDepthKey{}).(int)
 	if cap := f.effectiveMaxDepth(); depth >= cap {
 		return &tools.Result{
-			Output:  fmt.Sprintf("fork nesting limit (%d) exceeded — flatten the work into the current turn, or raise [agents].max_fork_depth in ~/.metis/config.toml", cap),
+			Output: fmt.Sprintf(
+				"fork nesting limit (%d) exceeded — Fork-in-fork rewrites the prompt prefix and exponentially decays the cache benefit. Alternatives: "+
+					"(1) flatten the work into the current turn; "+
+					"(2) call Agent({prompt: \"...\"}) for a cold sub-agent — loses parent history continuity but works at any depth; "+
+					"(3) raise [agents].max_fork_depth in ~/.metis/config.toml if fork-in-fork is genuinely needed.",
+				cap,
+			),
 			IsError: true,
 		}, nil
 	}

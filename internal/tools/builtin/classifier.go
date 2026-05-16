@@ -103,8 +103,14 @@ func NewBashClassifier() *BashClassifier {
 			"nmap": true, "tcpdump": true, "wireshark": true,
 		},
 		dangerousFlags: []*regexp.Regexp{
-			regexp.MustCompile(`(?i)-\s*rf\s`),      // rm -rf
-			regexp.MustCompile(`(?i)-\s*r\s`),       // recursive delete
+			regexp.MustCompile(`(?i)-\s*rf\s`), // rm -rf
+			// `-r` flag is only dangerous when paired with rm/rmdir.
+			// Earlier rule `(?i)-\s*r\s` matched `grep -r`, `ls -r`,
+			// `docker logs -r`, and `tar -r` — all harmless. The
+			// 2026-05-16 v3 longrun report flagged this as a real
+			// false-positive blocker. Bind to the rm command so only
+			// genuine recursive-delete spellings are caught.
+			regexp.MustCompile(`(?i)\b(rm|rmdir)\s+(?:[^|;&]*\s+)?-\s*r\b`),
 			regexp.MustCompile(`(?i)>/dev/sd[a-z]`), // write to raw disk
 			regexp.MustCompile(`(?i)dd.*of=/dev/`),  // dd to raw device
 			regexp.MustCompile(`(?i)--no-preserve`), // git clean --no-preserve
@@ -118,7 +124,20 @@ func NewBashClassifier() *BashClassifier {
 			regexp.MustCompile(`(?i)npm\s+publish\s+(?:[^|]+\s+)?--access\s+public`),
 		},
 		destructivePatterns: []*regexp.Regexp{
-			regexp.MustCompile(`(?i)(fork\s*bomb|:.*:.*:.*&)`),
+			// Fork-bomb detection. Earlier rule `(?i)(fork\s*bomb|:.*:.*:.*&)`
+			// produced false positives in two ways:
+			//   1. `fork\s*bomb` matched any prose containing "fork bomb"
+			//      (with `\s*` allowing zero whitespace, even "forkbomb"
+			//      appearing inside arbitrary strings).
+			//   2. `:.*:.*:.*&` matched any string with 3 colons and an
+			//      ampersand — common in `:foo:bar:baz&` substrings.
+			// The 2026-05-16 v3 longrun blocked an `echo "Fork: 1 call"`
+			// metadata line on this. Tighten to the canonical recursive
+			// shell-function shape `:(){...}` which is the actual fork
+			// bomb syntax — `:()` defines a recursive function named `:`
+			// and `{...}` opens its body. Prose can't accidentally hit
+			// this shape.
+			regexp.MustCompile(`:\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:\s*&[^}]*\}`),
 			regexp.MustCompile(`(?i)>\s*/etc/`),   // writing to /etc
 			regexp.MustCompile(`(?i)>\s*/var/`),   // writing to /var
 			regexp.MustCompile(`(?i)>\s*/usr/`),   // writing to /usr
