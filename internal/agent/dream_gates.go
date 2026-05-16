@@ -28,12 +28,18 @@ import (
 	"time"
 )
 
-// DefaultDreamIntervalHours is the floor on time between dreams. 6 h
-// matches a single working half-day for metis's typical single-user
-// local workflow; claude-code uses 24 h because it serves bursty
-// multi-day project rhythms via cloud sessions. Override per host via
-// METIS_DREAM_INTERVAL_HOURS.
-const DefaultDreamIntervalHours = 6.0
+// DefaultDreamIntervalHours is the floor on time between dreams. 12 h
+// (raised from the original 6 h on 2026-05-16). The thinking:
+//   - 6 h on a heavy-use day fires the LLM fork 2-4 times, which
+//     accumulates token cost AND rewrites the prompt cache 2-4 times.
+//   - 12 h fires at most twice on the busiest day, once on a normal
+//     day, and zero times when the 3-session gate doesn't accumulate.
+//   - claude-code uses 24 h because it serves multi-day cloud
+//     workflows; metis is a single-user local CLI where users want
+//     "today's facts" reflected by tomorrow morning, not in three
+//     days. 12 h is the middle.
+// Override per host via METIS_DREAM_INTERVAL_HOURS — set 0 to disable.
+const DefaultDreamIntervalHours = 12.0
 
 // DefaultDreamMinSessions is the minimum number of *distinct* session
 // files that must have been touched since the last successful dream.
