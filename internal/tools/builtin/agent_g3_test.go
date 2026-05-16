@@ -360,3 +360,65 @@ func TestMessageTeammate_RequiredFields(t *testing.T) {
 		}
 	}
 }
+
+// TestMessageTeammate_ToFinishedTeammate_HintsAge — when the recipient
+// recently exited (sub-loop ran Roster.Unregister), MessageTeammate
+// must NOT return the generic "maybe never existed" error. Instead it
+// reports the elapsed time since EndTime so the model knows to stop
+// retrying and either spawn a fresh teammate or pick a different peer.
+// Locks the P0-D1 fix landed against the 2026-05-16 longrun's 12
+// "no teammate with name=qa" loops.
+func TestMessageTeammate_ToFinishedTeammate_HintsAge(t *testing.T) {
+	roster := agent.NewRoster(0)
+	target := &agent.Teammate{Name: "qa", AgentID: "agt-deadbeef"}
+	target.Mailbox = make(chan agent.PeerMessage, 16)
+	if err := roster.Register(target); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	target.Finish(agent.StatusCompleted, "done", nil, "")
+	roster.Unregister("qa")
+
+	tool := NewMessageTeammate(permission.New(permission.ModeBypass), roster)
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"to":   "qa",
+		"body": "are you there?",
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected IsError")
+	}
+	if !strings.Contains(res.Output, "qa") {
+		t.Errorf("error must echo the recipient name; got %q", res.Output)
+	}
+	if !strings.Contains(res.Output, "finished") {
+		t.Errorf("error must carry the 'finished' signal so the model knows the recipient exited; got %q", res.Output)
+	}
+	if !strings.Contains(res.Output, "no longer reachable") {
+		t.Errorf("error must spell out unreachability; got %q", res.Output)
+	}
+	if strings.Contains(res.Output, "may have finished and been evicted") {
+		t.Errorf("recently-finished hit must NOT fall through to the generic 'never existed' branch; got %q", res.Output)
+	}
+}
+
+// TestMessageTeammate_ToFullyEvictedTeammate_StillGenericError — once
+// the teammate falls out of the recentlyFinished LRU, the error
+// degrades cleanly to the original "maybe never existed" shape. This
+// is the documented degradation path; the test exists so a future
+// refactor doesn't silently dead-end model UX for evicted entries.
+func TestMessageTeammate_ToFullyEvictedTeammate_StillGenericError(t *testing.T) {
+	roster := agent.NewRoster(0)
+	tool := NewMessageTeammate(permission.New(permission.ModeBypass), roster)
+	res, _ := tool.Execute(context.Background(), map[string]any{
+		"to":   "never-existed",
+		"body": "x",
+	})
+	if !res.IsError {
+		t.Fatalf("expected IsError")
+	}
+	if !strings.Contains(res.Output, "no teammate with name=never-existed") {
+		t.Errorf("evicted/never-existed path must still produce the explicit 'no teammate with name=' error; got %q", res.Output)
+	}
+}

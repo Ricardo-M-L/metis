@@ -83,6 +83,24 @@ func (m MessageTeammate) CanUse(_ context.Context, in map[string]any) (tools.Per
 // command) can distinguish "queue full" from "no such teammate".
 var ErrMailboxFull = errors.New("teammate mailbox full")
 
+// humanDuration formats elapsed wall-clock time for the
+// "finished N ago" message in a way the model parses cleanly:
+// seconds for <1m, minutes for <1h, hours for <1d, days otherwise.
+// time.Duration.String() emits "35.123456789s" which has too much
+// noise for the error path.
+func humanDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
 func (m MessageTeammate) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	if m.roster == nil {
 		return &tools.Result{Output: "MessageTeammate unavailable: no Roster wired in this session", IsError: true}, nil
@@ -104,9 +122,24 @@ func (m MessageTeammate) Execute(_ context.Context, in map[string]any) (*tools.R
 		t, ok = m.roster.LookupByAgentID(to)
 	}
 	if !ok {
+		// Last resort: check recentlyFinished by name. Production
+		// signal that the recipient *did* exist but exited recently
+		// is much more actionable than "maybe never existed" — the
+		// 2026-05-16 longrun produced 12 messages addressed to qa/ui
+		// after those teammates SubAgentStopped, and the model kept
+		// retrying because it had no way to know they were gone.
+		if finished, since, found := m.roster.LookupRecentlyFinished(to); found {
+			return &tools.Result{
+				Output: fmt.Sprintf(
+					"%q finished %s ago and is no longer reachable. Use SubAgentList to see active teammates, or Agent({name: %q, ...}) to spawn a fresh one.",
+					finished.Name, humanDuration(since), to,
+				),
+				IsError: true,
+			}, nil
+		}
 		return &tools.Result{
 			Output: fmt.Sprintf(
-				"no teammate with name=%s (or agent_id=%s) — it may have finished, or never existed. Use SubAgentList to see active teammates.",
+				"no teammate with name=%s (or agent_id=%s) — it may have finished and been evicted from the recently-finished buffer, or never existed. Use SubAgentList to see active teammates.",
 				to, to,
 			),
 			IsError: true,

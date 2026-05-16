@@ -545,6 +545,35 @@ func (r *Roster) Lookup(name string) (*Teammate, bool) {
 	return t, ok
 }
 
+// LookupRecentlyFinished scans the recentlyFinished LRU for a teammate
+// by name. Returns the teammate, the elapsed time since it finished,
+// and ok=true when found. Used by MessageTeammate so that a "name not
+// found" error can carry the timing context ("qa finished 35s ago")
+// instead of the generic-"maybe never existed" shape — the 2026-05-16
+// longrun produced 12 such errors when teammates exited and the model
+// kept trying to message them; with the timestamp the model knows to
+// stop retrying.
+//
+// Only matches by Name. Callers searching by AgentID should use
+// LookupByAgentID which already scans both pools.
+func (r *Roster) LookupRecentlyFinished(name string) (*Teammate, time.Duration, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, t := range r.recentlyFinished {
+		if t.Name != name {
+			continue
+		}
+		t.mu.RLock()
+		end := t.EndTime
+		t.mu.RUnlock()
+		if end.IsZero() {
+			return t, 0, true
+		}
+		return t, time.Since(end), true
+	}
+	return nil, 0, false
+}
+
 // LookupByAgentID finds a teammate by their AgentID (the `agt-<8hex>`
 // handle returned to the model in run_in_background's tool_result).
 // Used by SubAgentOutput / SubAgentStop which receive the agent_id
