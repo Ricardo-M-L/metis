@@ -52,7 +52,7 @@ func TestMicrocompact_KeepRecentToolResults_ProtectsLastN(t *testing.T) {
 		toolResultMsg("t3", body), // idx 6 — KEEP (most-recent in-range, KeepRecentToolResults=1)
 		toolUseMsg("t4", "Bash"),
 		toolResultMsg("t4", body), // idx 8 — in ProtectLast tail
-		msg(llm.RoleUser, "继续"),  // idx 9 — in ProtectLast tail
+		msg(llm.RoleUser, "继续"),   // idx 9 — in ProtectLast tail
 	}
 
 	out := c.Microcompact(messages)

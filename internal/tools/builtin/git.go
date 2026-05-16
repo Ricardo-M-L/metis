@@ -12,7 +12,10 @@ import (
 )
 
 // Git wraps common git operations as tools.
-type Git struct{ tools.BaseTool; gate *permission.Gate }
+type Git struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (Git) Name() string        { return "Git" }
 func (Git) Description() string { return "Run a git command. Wrapper around common git operations." }

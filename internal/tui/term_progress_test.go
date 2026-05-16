@@ -7,20 +7,20 @@ import (
 
 func TestSemverGte(t *testing.T) {
 	cases := []struct {
-		ver   string
+		ver     string
 		a, b, c int
-		want  bool
+		want    bool
 	}{
-		{"3.6.10", 3, 6, 6, true},   // iTerm2 actual user case
-		{"3.6.6", 3, 6, 6, true},    // exact boundary
-		{"3.6.5", 3, 6, 6, false},   // below boundary
-		{"4.0.0", 3, 6, 6, true},    // higher major
-		{"3.7.0", 3, 6, 6, true},    // higher minor
-		{"1.2.0", 1, 2, 0, true},    // Ghostty boundary
-		{"1.1.99", 1, 2, 0, false},  // Ghostty below
-		{"3.6.10-beta", 3, 6, 6, true}, // pre-release suffix stripped
-		{"3.6", 3, 6, 0, true},      // missing patch treated as 0
-		{"", 3, 6, 6, false},        // empty fails
+		{"3.6.10", 3, 6, 6, true},         // iTerm2 actual user case
+		{"3.6.6", 3, 6, 6, true},          // exact boundary
+		{"3.6.5", 3, 6, 6, false},         // below boundary
+		{"4.0.0", 3, 6, 6, true},          // higher major
+		{"3.7.0", 3, 6, 6, true},          // higher minor
+		{"1.2.0", 1, 2, 0, true},          // Ghostty boundary
+		{"1.1.99", 1, 2, 0, false},        // Ghostty below
+		{"3.6.10-beta", 3, 6, 6, true},    // pre-release suffix stripped
+		{"3.6", 3, 6, 0, true},            // missing patch treated as 0
+		{"", 3, 6, 6, false},              // empty fails
 		{"not.a.version", 3, 6, 6, false}, // unparseable fails
 	}
 	for _, c := range cases {

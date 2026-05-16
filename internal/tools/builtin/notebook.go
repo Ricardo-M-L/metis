@@ -24,7 +24,10 @@ import (
 //
 // We only touch top-level fields the JSON schema requires; everything
 // else (metadata, outputs, execution_count) is preserved as-is.
-type NotebookEdit struct{ tools.BaseTool; gate *permission.Gate }
+type NotebookEdit struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (NotebookEdit) Name() string { return "NotebookEdit" }
 func (NotebookEdit) Description() string {

@@ -94,4 +94,3 @@ func TestRoster_AutoSuffix_99Exhaustion(t *testing.T) {
 		t.Errorf("error should mention the exhaustion; got %v", err)
 	}
 }
-

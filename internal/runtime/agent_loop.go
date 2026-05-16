@@ -186,7 +186,6 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		}
 	}
 
-
 	// Lazy MCP tool schemas (ToolSearch). Mode is read from the
 	// ENABLE_TOOL_SEARCH env var inside agent/dispatch.go on every
 	// call — we just need to feed Loop.ContextWindow so the auto

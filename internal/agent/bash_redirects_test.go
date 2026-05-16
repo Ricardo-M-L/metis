@@ -41,15 +41,15 @@ func TestBashRedirect_QuietOnLegitShellUse(t *testing.T) {
 		"git status",
 		"go test ./...",
 		"npm install",
-		"cat foo.txt | wc -l",       // pipe → real shell needed
-		"cat a b c",                  // concat, can't use Read
-		"find . -type d",             // not a name pattern
-		"grep foo",                   // local file grep, not -r
-		"echo hello",                 // explicit shell intent
-		"sed 's/x/y/' foo > bar",     // streaming, not in-place
-		"cat foo; echo done",         // compound
-		"cat <<EOF\nx\nEOF",          // heredoc
-		"ls && cat foo",              // chained
+		"cat foo.txt | wc -l",    // pipe → real shell needed
+		"cat a b c",              // concat, can't use Read
+		"find . -type d",         // not a name pattern
+		"grep foo",               // local file grep, not -r
+		"echo hello",             // explicit shell intent
+		"sed 's/x/y/' foo > bar", // streaming, not in-place
+		"cat foo; echo done",     // compound
+		"cat <<EOF\nx\nEOF",      // heredoc
+		"ls && cat foo",          // chained
 	}
 	for _, cmd := range quiet {
 		t.Run(cmd, func(t *testing.T) {

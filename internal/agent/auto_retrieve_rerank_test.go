@@ -15,10 +15,10 @@ import (
 // fakeRerankProvider lets us stub the Complete() reply and verify
 // rerankAutoRetrieve calls Complete with the right shape.
 type fakeRerankProvider struct {
-	reply       string
-	err         error
-	gotRequest  *llm.Request
-	maxCtx      int
+	reply      string
+	err        error
+	gotRequest *llm.Request
+	maxCtx     int
 }
 
 func (p *fakeRerankProvider) Name() string          { return "fake-rerank" }

@@ -105,11 +105,11 @@ func TestExitPlanMode_RejectsEmptyPlan(t *testing.T) {
 	ctx := agent.WithPlanController(context.Background(), ctrl)
 	tool := NewExitPlanMode()
 	cases := []map[string]any{
-		{},                       // missing
-		{"plan": ""},             // empty
-		{"plan": "   \n\t  "},    // whitespace only
-		{"plan": nil},            // explicit nil
-		{"plan": 42},             // wrong type — string assert fails, falls through to empty
+		{},                    // missing
+		{"plan": ""},          // empty
+		{"plan": "   \n\t  "}, // whitespace only
+		{"plan": nil},         // explicit nil
+		{"plan": 42},          // wrong type — string assert fails, falls through to empty
 	}
 	for i, in := range cases {
 		_, err := tool.Execute(ctx, in)

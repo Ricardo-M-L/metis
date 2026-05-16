@@ -14,10 +14,12 @@ type fakeToolNoShort struct {
 	fullDesc string
 }
 
-func (f fakeToolNoShort) Name() string                                    { return f.name }
-func (f fakeToolNoShort) Description() string                             { return f.fullDesc }
-func (f fakeToolNoShort) InputSchema() map[string]any                     { return map[string]any{"type": "object"} }
-func (f fakeToolNoShort) Concurrency(_ map[string]any) tools.Concurrency  { return tools.ConcurrencyExclusive }
+func (f fakeToolNoShort) Name() string                { return f.name }
+func (f fakeToolNoShort) Description() string         { return f.fullDesc }
+func (f fakeToolNoShort) InputSchema() map[string]any { return map[string]any{"type": "object"} }
+func (f fakeToolNoShort) Concurrency(_ map[string]any) tools.Concurrency {
+	return tools.ConcurrencyExclusive
+}
 func (f fakeToolNoShort) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	return tools.PermissionAllow, ""
 }

@@ -177,10 +177,10 @@ func DefaultCompactionConfig() Config {
 		// model is often actively planning around the read body, and
 		// a stale "[snipped]" marker would force a redundant re-read
 		// of the same file on the next iteration.
-		ProtectedTools:    []string{"memory_query", "memory_recall", "skill_help", "Read"},
-		RedactSecrets:     true,
-		IterativeSummary:  true,
-		MaxSummaryRetries: 2,
+		ProtectedTools:        []string{"memory_query", "memory_recall", "skill_help", "Read"},
+		RedactSecrets:         true,
+		IterativeSummary:      true,
+		MaxSummaryRetries:     2,
 		IdleMaxSeconds:        3600, // 1h — mirrors CC's timeBasedMC cache-TTL window
 		KeepRecentToolResults: 5,    // mirrors CC microCompact keepRecent=5
 	}

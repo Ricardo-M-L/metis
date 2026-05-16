@@ -13,7 +13,10 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-type LS struct{ tools.BaseTool; gate *permission.Gate }
+type LS struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (LS) Name() string { return "LS" }
 func (LS) Description() string {

@@ -20,7 +20,10 @@ import (
 // also try matching by exact `content` — the LLM often re-emits the
 // same content with a new status to mark progress. Neither match →
 // new task appended.
-type Todo struct{ tools.BaseTool; gate *permission.Gate }
+type Todo struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (Todo) Name() string { return "TodoWrite" }
 func (Todo) Description() string {
@@ -82,7 +85,10 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 // TodoRead lists every task in the current session's list. Pairs with
 // TodoWrite — gives the LLM a way to see what's already in flight
 // without re-emitting all rows.
-type TodoRead struct{ tools.BaseTool; gate *permission.Gate }
+type TodoRead struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (TodoRead) Name() string                                 { return "TodoRead" }
 func (TodoRead) Description() string                          { return "List all tasks in the current session's task list." }

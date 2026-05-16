@@ -122,7 +122,7 @@ func TestLoop_TimeBasedMicrocompact_DisabledWhenIdleSecondsZero(t *testing.T) {
 	cfg.MicrocompactMinChars = 4000
 	cfg.MicrocompactDir = t.TempDir()
 	cfg.KeepRecentToolResults = 0 // disable CC keepRecent guard — this test only cares about the time-based fire path
-	cfg.IdleMaxSeconds = 0 // disabled
+	cfg.IdleMaxSeconds = 0        // disabled
 	cfg.SnipThreshold = 0.99
 	cfg.CollapseThreshold = 0
 	cfg.Threshold = 0.99

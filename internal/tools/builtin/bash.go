@@ -51,6 +51,7 @@ func (b *Bash) classifierFor() *BashClassifier {
 }
 
 func (Bash) Name() string { return "Bash" }
+
 // ShortDescription is the curated 1-2 sentence form shipped to
 // sub-agents and METIS_SIMPLE boots in lieu of the full multi-section
 // Description(). Hand-tuned to fit ~250 chars while still naming the

@@ -114,7 +114,7 @@ func TestPathIsSkillManifest_RequiresSkillsSegment(t *testing.T) {
 		{"/x/.metis/skills/foo.md", true},
 		{"/x/foo.md", false},
 		{"/x/foo.txt", false},
-		{"/x/skills.md", false},     // file named skills.md, not under dir
+		{"/x/skills.md", false},        // file named skills.md, not under dir
 		{"/x/no-skills/foo.md", false}, // no exact /skills/ segment
 		{"", false},
 	}

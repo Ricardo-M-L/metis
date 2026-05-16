@@ -230,7 +230,10 @@ func FilterRegistryInPlace(reg *tools.Registry) {
 // coordinatorBlockedTool implements tools.Tool but errors on every
 // Execute. The CanUse return value is Deny so the gate never even
 // asks the user.
-type coordinatorBlockedTool struct{ tools.BaseTool; name string }
+type coordinatorBlockedTool struct {
+	tools.BaseTool
+	name string
+}
 
 func (t coordinatorBlockedTool) Name() string { return t.name }
 func (t coordinatorBlockedTool) Description() string {

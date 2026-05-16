@@ -99,7 +99,7 @@ func TestResolveRosterCaps_NonNumericEnvIgnored(t *testing.T) {
 
 func TestSplitOneToTwo_Rounding(t *testing.T) {
 	cases := []struct {
-		total       int
+		total        int
 		wantN, wantA int
 	}{
 		{0, 0, 0}, // unlimited propagates

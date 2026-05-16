@@ -66,13 +66,13 @@ func TestComposeProviderHint_AtomsAppearWhenFlagsSet(t *testing.T) {
 	}
 	got := composeProviderHint(c)
 	atoms := []string{
-		"Test",                       // header
-		"Anthropic-compatible",       // anthropic shape
-		"empty input arguments",      // empty-args bug
-		"dedicated thinking blocks",  // thinking
-		"≥200K",                      // long context
-		"Chinese or English",         // bilingual
-		"over-explain by default",    // verbose
+		"Test",                      // header
+		"Anthropic-compatible",      // anthropic shape
+		"empty input arguments",     // empty-args bug
+		"dedicated thinking blocks", // thinking
+		"≥200K",                     // long context
+		"Chinese or English",        // bilingual
+		"over-explain by default",   // verbose
 	}
 	for _, a := range atoms {
 		if !strings.Contains(got, a) {

@@ -7,9 +7,9 @@ import (
 
 func TestProviderHintFor_DispatchesByProvider(t *testing.T) {
 	cases := []struct {
-		name       string
-		provider   string
-		model      string
+		name        string
+		provider    string
+		model       string
 		mustContain string
 	}{
 		{"anthropic", "anthropic", "claude-opus-4-7", "Anthropic"},

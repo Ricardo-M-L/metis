@@ -30,7 +30,10 @@ func currentStoreOrErr() (*taskstore.TaskStore, error) {
 
 // --- TaskCreate ---
 
-type TaskCreate struct{ tools.BaseTool; gate *permission.Gate }
+type TaskCreate struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (TaskCreate) Name() string { return "TaskCreate" }
 func (TaskCreate) Description() string {
@@ -74,7 +77,10 @@ func (t TaskCreate) Execute(_ context.Context, in map[string]any) (*tools.Result
 
 // --- TaskGet ---
 
-type TaskGet struct{ tools.BaseTool; gate *permission.Gate }
+type TaskGet struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (TaskGet) Name() string { return "TaskGet" }
 func (TaskGet) Description() string {
@@ -132,7 +138,10 @@ func (t TaskGet) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 
 // --- TaskList ---
 
-type TaskList struct{ tools.BaseTool; gate *permission.Gate }
+type TaskList struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (TaskList) Name() string { return "TaskList" }
 func (TaskList) Description() string {
@@ -179,7 +188,10 @@ func (t TaskList) Execute(_ context.Context, in map[string]any) (*tools.Result, 
 
 // --- TaskUpdate ---
 
-type TaskUpdate struct{ tools.BaseTool; gate *permission.Gate }
+type TaskUpdate struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (TaskUpdate) Name() string { return "TaskUpdate" }
 func (TaskUpdate) Description() string {
@@ -240,7 +252,10 @@ func (t TaskUpdate) Execute(_ context.Context, in map[string]any) (*tools.Result
 
 // --- TaskOutput ---
 
-type TaskOutput struct{ tools.BaseTool; gate *permission.Gate }
+type TaskOutput struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (TaskOutput) Name() string { return "TaskOutput" }
 func (TaskOutput) Description() string {
@@ -279,7 +294,10 @@ func (t TaskOutput) Execute(_ context.Context, in map[string]any) (*tools.Result
 
 // --- TaskStop ---
 
-type TaskStop struct{ tools.BaseTool; gate *permission.Gate }
+type TaskStop struct {
+	tools.BaseTool
+	gate *permission.Gate
+}
 
 func (TaskStop) Name() string { return "TaskStop" }
 func (TaskStop) Description() string {
