@@ -210,10 +210,14 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		loop.Monitors = opts.Monitors
 	}
 
-	// Auto-compaction. Threshold from cfg, fallback to package default.
+	// Auto-compaction. Threshold + MinimumTokens from cfg, fallback to
+	// package default for either when unset.
 	compactCfg := agent.DefaultCompactionConfig()
 	if cfg.Session.AutoCompactThreshold > 0 {
 		compactCfg.Threshold = cfg.Session.AutoCompactThreshold
+	}
+	if cfg.Session.AutoCompactMinimumTokens > 0 {
+		compactCfg.MinimumTokens = cfg.Session.AutoCompactMinimumTokens
 	}
 	loop.Compactor = agent.NewCompactor(compactCfg, opts.Model,
 		opts.Provider.MaxContextTokens(), opts.Provider)

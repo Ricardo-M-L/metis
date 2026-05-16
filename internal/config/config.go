@@ -460,7 +460,14 @@ type Session struct {
 	Dir                  string  `toml:"dir"`
 	SkillDir             string  `toml:"skill_dir"`
 	AutoCompactThreshold float64 `toml:"auto_compact_threshold"`
-	MaxIterations        int     `toml:"max_iterations"`
+	// AutoCompactMinimumTokens is the DeepSeek-TUI-style absolute floor:
+	// full Compact will NOT fire when estimated context is below this
+	// many tokens, even if AutoCompactThreshold is crossed. Protects
+	// prefix-cache anchors on small/fresh sessions from churn. Default
+	// 50_000 — wired into Compactor.MinimumTokens at session start.
+	// Set 0 to opt out (legacy percent-only triggering).
+	AutoCompactMinimumTokens int `toml:"auto_compact_minimum_tokens"`
+	MaxIterations            int `toml:"max_iterations"`
 }
 
 type Tools struct {
@@ -609,10 +616,22 @@ func defaults() *Config {
 			},
 		},
 		Session: Session{
-			Dir:                  filepath.Join(dh, "sessions"),
-			SkillDir:             filepath.Join(dh, "skills"),
-			AutoCompactThreshold: 0.85,
-			MaxIterations:        100,
+			Dir:      filepath.Join(dh, "sessions"),
+			SkillDir: filepath.Join(dh, "skills"),
+			// 0.95 (up from 0.85 on 2026-05-16): the per-turn peak
+			// against a 1M-context provider sat under cap*0.85 in the
+			// longrun stress test, so compaction never fired. Pushing
+			// the gate later means the prompt cache survives much
+			// longer between rewrites; the LLM transport overflow
+			// auto-retry catches the rare overshoot.
+			AutoCompactThreshold: 0.95,
+			// 50K absolute floor (DeepSeek-TUI MINIMUM_AUTO_COMPACTION_TOKENS
+			// idea, scaled down from their 500K to fit metis's broader
+			// provider mix). On 1M-context this barely matters; on
+			// 128K it prevents Compact from triggering on a fresh
+			// session just because max_tokens is configured large.
+			AutoCompactMinimumTokens: 50_000,
+			MaxIterations:            100,
 		},
 		Tools: Tools{
 			Bash: ToolBashSettings{

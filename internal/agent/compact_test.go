@@ -767,3 +767,58 @@ func TestCompactor_CircuitBreaker_NoOpDoesNotCount(t *testing.T) {
 		t.Errorf("no-op short-circuit (too-small convo) must not count toward breaker; got %d", c.consecutiveFailures)
 	}
 }
+
+// TestShouldCompact_MinimumTokensFloor_Guards — proves the
+// DeepSeek-TUI-style absolute floor refuses to fire on a small
+// session even when the percentage threshold is technically crossed.
+//
+// Without this guard, an aggressive Threshold (0.95) on a tiny
+// max-context configuration (1000 in test) would still rewrite
+// prompt-cache anchors over what is effectively a few-turn convo —
+// the user-visible symptom is "metis runs Compact 3 times in the
+// first 10 turns and the cache hit rate craters." With the floor,
+// Compact waits until there's actually enough material to summarize.
+func TestShouldCompact_MinimumTokensFloor_Guards(t *testing.T) {
+	p := &fakeSummarizer{}
+	c := NewCompactor(Config{Threshold: 0.5, MinimumTokens: 10_000}, "m", 200, p)
+
+	// 800 chars → ~200 tokens. Above the percent threshold
+	// (200*0.5=100) but FAR below MinimumTokens=10000. Must NOT
+	// trigger Compact — the floor wins.
+	convo := []llm.Message{msg(llm.RoleUser, "x")}
+	for i := 0; i < 4; i++ {
+		convo = append(convo, msg(llm.RoleUser, "y"))
+	}
+	if c.ShouldCompact(convo) {
+		t.Errorf("MinimumTokens=10000 should suppress Compact when estimated tokens are well below floor; convo estimate=%d", estimateTokens(convo))
+	}
+}
+
+// TestShouldCompact_MinimumTokensZero_LegacyBehaviour — opt-out path.
+// MinimumTokens=0 returns metis to pre-2026-05-16 percent-only
+// triggering, which is what the existing unit-test suite relies on.
+func TestShouldCompact_MinimumTokensZero_LegacyBehaviour(t *testing.T) {
+	p := &fakeSummarizer{}
+	c := NewCompactor(Config{Threshold: 0.5, MinimumTokens: 0}, "m", 200, p)
+
+	long := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 800))} // ~250 tokens
+	if !c.ShouldCompact(long) {
+		t.Errorf("MinimumTokens=0 (disabled) must let percent threshold fire; estimate=%d, threshold=%d", estimateTokens(long), int(float64(200)*0.5))
+	}
+}
+
+// TestDefaultCompactionConfig_KeepsMinimumTokensZero — package-level
+// default must stay 0 so unit tests using DefaultCompactionConfig()
+// see legacy percent-only behaviour. The 50_000 floor is opt-in via
+// runtime wiring (cfg.Session.AutoCompactMinimumTokens). Documents
+// the deliberate split — without this test someone might "tidy up"
+// the default to 50_000 and silently break a dozen existing tests.
+func TestDefaultCompactionConfig_KeepsMinimumTokensZero(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	if cfg.MinimumTokens != 0 {
+		t.Errorf("DefaultCompactionConfig().MinimumTokens = %d, want 0 (package-level stays disabled; runtime/agent_loop.go injects production value from cfg.Session.AutoCompactMinimumTokens)", cfg.MinimumTokens)
+	}
+	if cfg.Threshold != 0.95 {
+		t.Errorf("DefaultCompactionConfig().Threshold = %v, want 0.95 (raised from 0.85 on 2026-05-16)", cfg.Threshold)
+	}
+}

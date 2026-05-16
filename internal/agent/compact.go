@@ -151,19 +151,44 @@ type Config struct {
 	// against. Mirrors CC's services/compact/microCompact.ts keepRecent
 	// (default 5). Set 0 to disable — only ProtectLast applies then.
 	KeepRecentToolResults int
+
+	// MinimumTokens — absolute lower bound (in estimated tokens). Full
+	// Compact will NOT fire below this even if the percentage threshold
+	// is crossed. Mirrors DeepSeek-TUI's MINIMUM_AUTO_COMPACTION_TOKENS
+	// floor (compaction.rs:29): on a 1M-window provider the 0.95 trigger
+	// is 950K, which is great, but on a fresh session you don't want
+	// metis rewriting prefix-cache anchors over a 60K-token convo just
+	// because the user's max_tokens config is low. Set 0 to disable —
+	// pre-2026-05-16 behaviour (percent-only). The DefaultCompactionConfig
+	// keeps 0 for backwards compatibility with unit tests; production
+	// wiring (runtime/agent_loop.go) injects the value from
+	// Session.AutoCompactMinimumTokens (toml `auto_compact_minimum_tokens`,
+	// default 50_000).
+	MinimumTokens int
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultCompactionConfig() Config {
 	return Config{
-		Threshold:              0.85,
+		// 0.95 (up from 0.85 on 2026-05-16): the 2026-05-16 longrun
+		// against DeepSeek-V4-Pro (1M context) hit 1.3M tokens per
+		// turn before the 0.85 trigger would have fired, because the
+		// per-turn peak still sat under cap*0.85 = 850K. Raising the
+		// gate to 0.95 means compaction now fires at ~950K — close
+		// enough to the cap that the LLM-side recovery (transport
+		// overflow auto-retry) catches the rare overshoot, and the
+		// prompt cache survives much longer between rewrites. On
+		// smaller windows (128K), 0.95 = 121.6K, which is roughly
+		// what the old 0.85 default (108K) gave anyway minus the
+		// per-request output reservation.
+		Threshold:              0.95,
 		ProtectFirst:           1, // system message
 		ProtectLast:            5, // recent turns
 		MaxSummaryTokens:       512,
-		SnipThreshold:          0.70, // ~15% earlier than full compact
+		SnipThreshold:          0.70, // cheap tool-result trim, kept earlier than Compact
 		SnipMaxToolResultChars: 800,
 		MicrocompactMinChars:   4000, // disk-cache only genuinely big results
-		CollapseThreshold:      0.78, // between snip(0.70) and compact(0.85)
+		CollapseThreshold:      0.78, // between snip(0.70) and compact(0.95)
 		CollapseFoldWindow:     10,
 		// MicrocompactDir is intentionally empty here — runtime sets it
 		// per-session in setupRuntime so the cache lands under
@@ -308,11 +333,19 @@ func (c *Compactor) effectiveInputCap() int {
 // be triggered. Returns false when the circuit breaker has tripped (too
 // many recent failures); callers must call ResetCircuit() — typically
 // from /clear or /compact-reset — to re-enable.
+//
+// Also returns false when the estimated token count is below
+// MinimumTokens — DeepSeek-TUI-style absolute floor that prevents
+// rewriting prefix-cache anchors over a small session just because the
+// user-configured max_tokens is low. MinimumTokens=0 disables this guard.
 func (c *Compactor) ShouldCompact(messages []llm.Message) bool {
 	if c.consecutiveFailures >= MaxConsecutiveCompactFailures {
 		return false
 	}
 	rough := estimateTokens(messages)
+	if c.MinimumTokens > 0 && rough < c.MinimumTokens {
+		return false
+	}
 	return float64(rough) >= float64(c.effectiveInputCap())*c.Threshold
 }
 
