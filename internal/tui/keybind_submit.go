@@ -364,6 +364,25 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			hs := screen.NewHistoryScreen(m.loop.History(), m.width, m.height)
 			hs.Title = "session history (" + m.sessionID + ")"
 			m.activeScreen = hs
+		case slash.SignalThinkingDisplay:
+			// /thinking [show|hide|auto] — flip the transcript-mode
+			// preference for reasoning rows. Args are pre-validated
+			// to one of the three accepted values by the slash handler.
+			arg := strings.TrimSpace(strings.ToLower(args))
+			m.thinkingDisplay = arg
+			// Invalidate the per-row render cache: the change flips
+			// the "collapse / hide / show" branch in buildChatItems,
+			// so previously-cached frames must be re-rendered. Pre-
+			// invalidation the user sees stale folded rows even after
+			// /thinking show until they scroll.
+			if m.renderCache != nil {
+				m.renderCache.InvalidateAll()
+			}
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "thinking display: " + arg,
+				Timestamp: time.Now(),
+			})
 		case slash.SignalTitle:
 			title := strings.TrimSpace(args)
 			if title == "" {

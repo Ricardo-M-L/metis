@@ -23,6 +23,22 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// and the "thought for Xs" timer keys off real text.
 		m.thinkingText += ev.TextDelta
 		m.spinnerPhase = "thinking" // arrow → ↓
+	case agent.EventRedactedThinking:
+		// Safety classifier replaced a chunk of reasoning with opaque
+		// cipher text. Flush any in-flight plaintext thinking first
+		// so the transcript shows chronological [thinking, redacted,
+		// thinking?, …] ordering. We persist the cipher text in
+		// Content so resume → toAnthropic round-trip can echo it back
+		// (the data plane is wired in commit 1; this is the UI side).
+		if m.thinkingText != "" {
+			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
+			m.thinkingText = ""
+		}
+		m.messages = append(m.messages, Message{
+			Role:      "redacted_thinking",
+			Content:   ev.TextDelta, // base64 cipher text, never user-visible
+			Timestamp: time.Now(),
+		})
 	case agent.EventTextDelta:
 		if m.firstStreamAt.IsZero() {
 			m.firstStreamAt = time.Now()

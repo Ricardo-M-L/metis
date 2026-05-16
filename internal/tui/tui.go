@@ -320,6 +320,18 @@ type Model struct {
 	// fold to a one-line preview. When true the user gets every byte.
 	expandToolOutputs bool
 
+	// thinkingDisplay controls how Message{Role:"thinking"} +
+	// Message{Role:"redacted_thinking"} render in the transcript.
+	// Three values, set via /thinking slash command:
+	//   "auto"   (default) — collapsed thinking with ctrl+o to expand,
+	//                        🔒 placeholder for redacted blocks
+	//   "show"   — always expanded, never collapse
+	//   "hide"   — skip ALL thinking/redacted_thinking rows entirely
+	// Mirrors the spirit of CC's Ctrl+O transcript mode but exposed
+	// as an explicit user preference so the user picks how chatty
+	// the trace should be on EVERY turn, not per-press.
+	thinkingDisplay string
+
 	// stickyBottom controls auto-follow during streaming. true (the
 	// default) means new content auto-scrolls into view; user wheel-up
 	// or PgUp flips it false; explicit ScrollToBottom / Ctrl+End / new
@@ -624,6 +636,12 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	// opens a blank chat even though the LLM has full context.
 	// No-op for fresh sessions (loop.Messages is empty).
 	mdl.hydrateFromLoopHistory()
+	// Default thinking display mode = "auto" (collapsed with
+	// ctrl+o-to-expand for normal thinking, 🔒 placeholder for
+	// redacted). User flips it via /thinking show / hide / auto.
+	if mdl.thinkingDisplay == "" {
+		mdl.thinkingDisplay = "auto"
+	}
 	return mdl
 }
 

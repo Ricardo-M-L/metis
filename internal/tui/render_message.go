@@ -113,6 +113,22 @@ func renderMessage(msg Message, width int, expand bool) string {
 			}
 			s.WriteString("\n")
 		}
+	case "redacted_thinking":
+		// Anthropic safety classifier replaced this reasoning chunk
+		// with opaque cipher text. The cipher text is in msg.Content
+		// but MUST NOT be displayed — it's only kept so the next turn
+		// can echo it back to Anthropic for decryption. Render a
+		// distinct placeholder so the user knows redaction happened
+		// without ever seeing the encrypted bytes. No ctrl+o expand
+		// path: there's no plaintext to expand into.
+		//
+		// Glyph uses the lock emoji + accent colour so the row stands
+		// out from normal thinking, mirroring CC's redacted-thinking
+		// affordance (CC shows "🔒 [encrypted reasoning]" in the same
+		// transcript position).
+		s.WriteString(styleAccent.Render("  🔒 "))
+		s.WriteString(styleDim.Italic(true).Render("[thinking redacted by Anthropic safety classifier — encrypted, model can still use it next turn]"))
+		s.WriteString("\n")
 	case "thought-summary":
 		// "✻ Cogitated for 1m 32s" — render the glyph in the accent
 		// color (it's a category marker, like claude-code's flower

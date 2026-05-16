@@ -198,18 +198,31 @@ func (m *Model) buildChatItems() []list.Item {
 	merged := m.timeline()
 	out := make([]list.Item, 0, len(merged)+3)
 	out = append(out, &staticItem{rendered: m.renderWelcomeBannerNoHint()})
+	// thinkingDisplay = "hide" drops every reasoning row from the
+	// transcript and from the live-streaming preview. "show" forces
+	// expanded view regardless of ctrl+o state. "auto" (default) keeps
+	// the old collapsed-by-default-with-ctrl+o behaviour.
+	hideThinking := m.thinkingDisplay == "hide"
+	forceExpandThinking := m.thinkingDisplay == "show"
 	for _, it := range merged {
 		switch {
 		case it.msg != nil:
-			out = append(out, &messageItem{msg: *it.msg, expand: m.expandToolOutputs, cache: m.renderCache})
+			if hideThinking && (it.msg.Role == "thinking" || it.msg.Role == "redacted_thinking") {
+				continue
+			}
+			expand := m.expandToolOutputs
+			if forceExpandThinking && it.msg.Role == "thinking" {
+				expand = true
+			}
+			out = append(out, &messageItem{msg: *it.msg, expand: expand, cache: m.renderCache})
 		case it.te != nil:
 			out = append(out, &toolEventItem{te: *it.te, expand: m.expandToolOutputs, cache: m.renderCache})
 		}
 	}
-	if m.thinkingText != "" {
+	if m.thinkingText != "" && !hideThinking {
 		out = append(out, &inProgressThinkingItem{
 			text:   m.thinkingText,
-			expand: m.expandToolOutputs,
+			expand: m.expandToolOutputs || forceExpandThinking,
 			width:  m.width,
 		})
 	}

@@ -75,6 +75,13 @@ const (
 	// project-local .metis/commands/). Mirrors claude-code's
 	// `~/.claude/commands/` mechanism.
 	SignalCustomPrompt
+	// SignalThinkingDisplay carries the user's transcript-mode
+	// preference for reasoning blocks. Args = "show" / "hide" /
+	// "auto" — TUI's m.thinkingDisplay gets set to this verbatim.
+	// Distinct signal (rather than reusing SignalCustomPrompt) so the
+	// TUI can route to the Model field directly without queuing the
+	// args as a user message.
+	SignalThinkingDisplay
 )
 
 type Registry struct {
@@ -216,6 +223,24 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "save", Description: "fsync the current session to disk", Handler: func(_ string) (string, Signal) {
 		return "", SignalSave
 	}})
+	r.Register(Cmd{
+		Name:        "thinking",
+		Description: "control how extended-thinking blocks render: /thinking [show|hide|auto]",
+		Handler: func(args string) (string, Signal) {
+			arg := strings.TrimSpace(strings.ToLower(args))
+			switch arg {
+			case "":
+				return "usage: /thinking [show|hide|auto]\n" +
+					"  show — always render thinking fully expanded\n" +
+					"  hide — drop all thinking + redacted_thinking rows\n" +
+					"  auto — collapsed with ctrl+o to expand (default)", SignalNone
+			case "show", "hide", "auto":
+				return "", SignalThinkingDisplay
+			default:
+				return "unknown mode: " + arg + " (expected show|hide|auto)", SignalNone
+			}
+		},
+	})
 	r.Register(Cmd{Name: "title", Description: "set session title (e.g. /title refactor sprint)", Handler: func(args string) (string, Signal) {
 		if strings.TrimSpace(args) == "" {
 			return "(title: type `/title <text>` to set; current title is shown in /sessions)", SignalNone
