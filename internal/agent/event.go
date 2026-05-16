@@ -80,6 +80,16 @@ const (
 	// silently dropped and "thought for Xs" had no body to back it.
 	EventThinkingDelta
 
+	// Redacted thinking — Anthropic's safety classifier replaced a
+	// chunk of the model's reasoning with opaque cipher text. There's
+	// no plaintext to display; the TUI shows a "🔒 redacted" placeholder
+	// and the persisted ContentBlock carries the encrypted Data field
+	// so subsequent turns can echo it back unchanged for decryption.
+	// TextDelta carries the base64 cipher text (used by the TUI for
+	// downstream Message{Role:"redacted_thinking"} accumulation, not
+	// for rendering — the cipher text is never user-visible).
+	EventRedactedThinking
+
 	// Streaming tool args — emitted as the LLM types tool input JSON
 	// character-by-character. Lets the UI render "Read · /tmp/foo.go..."
 	// as args arrive instead of waiting for tool_use_stop. The TextDelta

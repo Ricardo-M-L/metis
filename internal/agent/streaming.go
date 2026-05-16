@@ -115,6 +115,21 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// "(thinking…)" preview working.
 			curThinking += ev.TextDelta
 			emit(ctx, out, Event{Kind: EventThinkingDelta, TextDelta: ev.TextDelta})
+		case "redacted_thinking":
+			// Anthropic's safety classifier replaced a chunk of the
+			// model's reasoning with opaque cipher text. We can't
+			// display the plaintext (we don't have it), but we MUST
+			// persist the encrypted payload so the next turn can echo
+			// it back — extended-thinking continuity depends on the
+			// model decrypting + reusing this on subsequent turns.
+			// Flush any in-flight plaintext thinking first to keep
+			// chronological ordering [thinking, redacted_thinking, ...].
+			flushThinking()
+			blocks = append(blocks, llm.ContentBlock{
+				Type: "redacted_thinking",
+				Data: ev.TextDelta, // base64 cipher text
+			})
+			emit(ctx, out, Event{Kind: EventRedactedThinking, TextDelta: ev.TextDelta})
 		case "tool_use_start":
 			// Same chronology argument as text_delta — a tool call
 			// means reasoning has resolved into an action; persist

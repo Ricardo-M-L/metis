@@ -176,6 +176,12 @@ type anthropicContent struct {
 	IsError      bool                   `json:"is_error,omitempty"`
 	Source       *anthropicImageSource  `json:"source,omitempty"` // type="image" only
 	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+	// Data is the encrypted payload for atomic content blocks like
+	// `redacted_thinking`. Anthropic requires the original cipher text
+	// to be echoed back unchanged on multi-turn round-trips so the
+	// model can decrypt + reuse the redacted reasoning — dropping it
+	// (or re-encrypting) breaks extended-thinking continuity.
+	Data string `json:"data,omitempty"`
 }
 
 // anthropicImageSource is the inline-base64 image carrier. Anthropic
@@ -436,6 +442,22 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 				// the TUI is the user-visible win; signature plumbing
 				// can come as a follow-up when extended-thinking gets
 				// flipped on by default.
+			case "redacted_thinking":
+				// Unlike normal thinking, redacted_thinking carries its
+				// own opaque cipher text — there's no signature to
+				// reconstruct, just the encrypted payload Anthropic
+				// gave us at receive time. Echo it back verbatim so the
+				// model can decrypt + reuse the redacted reasoning on
+				// continuation turns. If c.Data is empty (persisted
+				// session predating this code path, or a corrupted
+				// round-trip), skip the block rather than send an
+				// empty data field which Anthropic rejects with 400.
+				if c.Data != "" {
+					am.Content = append(am.Content, anthropicContent{
+						Type: "redacted_thinking",
+						Data: c.Data,
+					})
+				}
 			}
 		}
 		out.Messages = append(out.Messages, am)
@@ -1077,6 +1099,15 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 				ID    string         `json:"id"`
 				Name  string         `json:"name"`
 				Input map[string]any `json:"input"`
+				// Data carries the encrypted payload for atomic
+				// content blocks like `redacted_thinking` —
+				// Anthropic ships the full encrypted contents in the
+				// content_block_start envelope (no deltas follow,
+				// since the cipher text is opaque). Plumb it through
+				// to a dedicated StreamEvent so the consumer can
+				// persist + render an opaque "🔒 redacted" placeholder
+				// without ever seeing plaintext.
+				Data string `json:"data"`
 			}
 			_ = json.Unmarshal(env.ContentBlock, &cb)
 			blk := &streamBlock{Type: cb.Type, ToolUseID: cb.ID, ToolName: cb.Name}
@@ -1092,6 +1123,12 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			s.currentBlocks[env.Index] = blk
 			if cb.Type == "tool_use" {
 				return StreamEvent{Type: "tool_use_start", ToolUseID: cb.ID, ToolName: cb.Name}, nil
+			}
+			// Atomic redacted_thinking — emit the encrypted payload
+			// directly. No deltas will follow; content_block_stop
+			// will just clear our block tracker.
+			if cb.Type == "redacted_thinking" {
+				return StreamEvent{Type: "redacted_thinking", TextDelta: cb.Data}, nil
 			}
 			continue
 		case "content_block_delta":
