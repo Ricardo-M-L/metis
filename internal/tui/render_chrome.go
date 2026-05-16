@@ -434,8 +434,7 @@ func renderStatusBar(m *Model) string {
 		right = formatTokensRaw(used) + " tokens"
 		if m.loop != nil && m.loop.Provider != nil {
 			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
-				pct := used * 100 / cap
-				right = fmt.Sprintf("%s (%d%%)", right, pct)
+				right = fmt.Sprintf("%s (%s)", right, formatContextPct(used, cap))
 			}
 		}
 		// Cost estimate (claude-code's statusline shows a $ figure).

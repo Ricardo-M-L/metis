@@ -135,8 +135,16 @@ func toolArgsPreview(name string, input map[string]any) string {
 		}
 	case "Bash":
 		if v, ok := input["command"].(string); ok {
-			if len(v) > 45 {
-				preview = v[:42] + "…"
+			// Rune-based slice — `v[:42]` sliced through Chinese
+			// command arguments (e.g. paths under
+			// "/公司学习文件/...") at byte 42, which often lands
+			// mid-codepoint and emits invalid UTF-8 followed by a
+			// stray "…". The terminal renders that as a grey
+			// corruption box. See truncate() doc + 2026-05-16
+			// image #14 repro.
+			rs := []rune(v)
+			if len(rs) > 45 {
+				preview = string(rs[:42]) + "…"
 			} else {
 				preview = v
 			}
@@ -170,11 +178,50 @@ func basename(path string) string {
 	return path
 }
 
+// truncate clips s to at most max RUNES (not bytes) so a multi-byte
+// UTF-8 character (Chinese, emoji) isn't sliced mid-codepoint. The
+// old byte-based form produced invalid UTF-8 fragments that the
+// terminal rendered as garbled boxes plus broken ANSI follow-on —
+// the 2026-05-16 user repro (image #14, `bash(ls -la .../公司学习...)`
+// showed grey corruption right at the multi-byte cut point).
+//
+// Quick-path: when the byte length is already ≤ max the runes count
+// can't exceed it either, so we skip the rune walk entirely. The
+// rare "ASCII slightly longer than max" case still allocates a rune
+// slice, but that's fine — these strings are short (preview lines,
+// tool-args headers).
+// formatContextPct renders the right-side status-bar percentage with a
+// 99%+ ceiling. Reasons we clamp instead of showing the raw value:
+//   - `used` is the larger of API-reported tokens and
+//     EstimateContextTokens() (chars/4). The latter over-counts CJK
+//     because a 3-byte UTF-8 char doesn't equal one token. The
+//     2026-05-16 user repro showed 207k/200k = 107% on a session
+//     that wasn't actually past the API cap.
+//   - Anything past 99% is the same actionable signal ("compact soon
+//     or risk a 4xx"); the specific number above that is noise.
+//   - >100% looks like a bug to users — they reasonably expect the
+//     API to reject any request over the cap, so a 107% display
+//     erodes trust in every other metric we show.
+func formatContextPct(used, cap int) string {
+	if cap <= 0 {
+		return ""
+	}
+	pct := used * 100 / cap
+	if pct > 99 {
+		return "99%+"
+	}
+	return fmt.Sprintf("%d%%", pct)
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max-1] + "…"
+	rs := []rune(s)
+	if len(rs) <= max {
+		return s
+	}
+	return string(rs[:max-1]) + "…"
 }
 
 // truncateRunes is like truncate but counts runes so multi-byte
