@@ -122,7 +122,7 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 			s.WriteString(renderTodoSnapshot())
 		default:
 			if te.Output != "" {
-				s.WriteString(renderToolOutputPreview(te.Output, expanded))
+				s.WriteString(renderToolOutputPreview(te.ToolName, te.Output, expanded))
 			}
 		}
 	}
@@ -430,7 +430,22 @@ func renderWritePreview(input map[string]any, expanded bool) string {
 // renderToolOutputPreview shows the first ~5 lines of any tool output
 // that doesn't have a custom renderer (Bash, Grep, WebFetch, …). Long
 // runs get a `… +N more lines (ctrl+O to expand)` tail.
-func renderToolOutputPreview(out string, expanded bool) string {
+//
+// Color strategy mirrors claude-code (image #23 user feedback 2026-05-16):
+//
+//   - **Code / match content** renders at the terminal's default
+//     foreground (no dim). The actual *information* the user is here
+//     to read.
+//   - **Coordinate prefixes** — Read's `<lineno>\t` gutter, Grep's
+//     `<path>:<line>:` prefix — get the styleDim (#a0a0a0) treatment.
+//     Eye picks "where" out of "what" without the whole block fading
+//     into a grey wash.
+//
+// Pre-fix every preview row was styleDim-wrapped end-to-end, which
+// users reported as visually exhausting against a dark terminal: the
+// content blurred into the chrome and you had to squint to find the
+// match you ran the command for.
+func renderToolOutputPreview(toolName, out string, expanded bool) string {
 	out = strings.TrimRight(out, "\n")
 	if out == "" {
 		return ""
@@ -443,11 +458,8 @@ func renderToolOutputPreview(out string, expanded bool) string {
 	}
 	var s strings.Builder
 	for _, ln := range show {
-		// Tool output body lines are content the user wants to read
-		// (Bash output, Grep matches, WebFetch headers). Muted grey
-		// made them slip past the eye on dark themes; styleDim keeps
-		// them subordinate to the assistant body without disappearing.
-		s.WriteString(styleDim.Render("       " + truncateRunes(ln, 120)))
+		s.WriteString("       ")
+		s.WriteString(formatToolPreviewLine(toolName, truncateRunes(ln, 120)))
 		s.WriteString("\n")
 	}
 	if !expanded && len(lines) > maxPreview {
@@ -455,6 +467,50 @@ func renderToolOutputPreview(out string, expanded bool) string {
 		s.WriteString("\n")
 	}
 	return s.String()
+}
+
+// formatToolPreviewLine applies per-tool prefix-dimming so the
+// coordinate frame (line numbers / paths) renders dim while the
+// payload renders at default fg. Tools we don't recognise fall
+// through to default-fg for the whole line — safer than blanket-
+// dimming, which is exactly the regression image #23 flagged.
+func formatToolPreviewLine(toolName, ln string) string {
+	switch toolName {
+	case "Read":
+		// cat -n format from Read tool: leading spaces + digits + tab + content.
+		// Split on the FIRST tab — that's the gutter/content boundary
+		// the Read tool itself emits (see internal/tools/builtin/read.go
+		// "6-digit line number + tab + content"). When the format doesn't
+		// match (e.g. a Read of a binary file fell through to a different
+		// path), fall back to whole-line default-fg.
+		if i := strings.IndexByte(ln, '\t'); i > 0 {
+			return styleDim.Render(ln[:i+1]) + ln[i+1:]
+		}
+		return ln
+	case "Grep", "Glob":
+		// path:line:content (Grep) or just `path` (Glob). For Grep,
+		// dim everything up to and including the second ':' separator;
+		// the actual match content past that point gets default fg.
+		// Glob has no inline content, so the whole line is "where" and
+		// can stay dim.
+		if toolName == "Glob" {
+			return styleDim.Render(ln)
+		}
+		// Grep: find SECOND ':' to skip the line-number too.
+		if i := strings.IndexByte(ln, ':'); i > 0 {
+			if j := strings.IndexByte(ln[i+1:], ':'); j > 0 {
+				cut := i + 1 + j + 1
+				return styleDim.Render(ln[:cut]) + ln[cut:]
+			}
+			// Only one colon found (path:something) — dim the prefix.
+			return styleDim.Render(ln[:i+1]) + ln[i+1:]
+		}
+		return ln
+	default:
+		// Bash output, WebFetch body, etc. — payload-only, no gutter
+		// to dim. Default fg surfaces the content cleanly.
+		return ln
+	}
 }
 
 // renderTodoSnapshot is the body for a TodoWrite tool result — every
