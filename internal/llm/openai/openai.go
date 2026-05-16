@@ -466,36 +466,64 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
-	body := toOpenAI(req, o.Model, o.MaxTokens)
-	body.Stream = false
-
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
 
 	var or oaiResp
-	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
+	// lastBody holds the most recent 4xx response body so the
+	// post-loop overflow recovery can inspect it without a second
+	// round-trip. Mirrors CC's withRetry.ts pattern where the retry
+	// context carries the failing response forward.
+	var lastBody string
+
+	doOnce := func(maxTokens int) error {
+		body := toOpenAI(req, o.Model, maxTokens)
+		body.Stream = false
+		buf, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		o.setHeaders(httpReq)
-		resp, err := o.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		rb, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
-			if transport.IsRetryableStatus(resp.StatusCode) {
-				return &transport.RetryableError{Err: httpErr}
+		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
+			if err != nil {
+				return err
 			}
-			return httpErr
+			o.setHeaders(httpReq)
+			resp, err := o.httpClient.Do(httpReq)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			rb, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode >= 400 {
+				lastBody = string(rb)
+				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
+				if transport.IsRetryableStatus(resp.StatusCode) {
+					return &transport.RetryableError{Err: httpErr}
+				}
+				return httpErr
+			}
+			return json.Unmarshal(rb, &or)
+		})
+	}
+
+	err := doOnce(o.MaxTokens)
+	if err != nil {
+		// CC-aligned auto-recovery for 400 context overflow: parse the
+		// input/cap figures out of the failing body, reduce max_tokens
+		// to whatever room remains, and retry once. If even the floor
+		// completion budget won't fit, wrap the error with the Fork→Agent
+		// hint so the model knows to cold-spawn instead.
+		if in, cap, ok := transport.ParseContextOverflow(lastBody); ok {
+			if adjusted, retryOK := transport.ComputeAdjustedMaxTokens(in, cap); retryOK {
+				if dbgOpenAI {
+					fmt.Fprintf(os.Stderr, "[openai] context overflow %d/%d — retrying with max_tokens=%d\n", in, cap, adjusted)
+				}
+				lastBody = ""
+				err = doOnce(adjusted)
+			} else {
+				err = fmt.Errorf("%w\n\n%s", err, transport.BuildOverflowHint(in, cap))
+			}
 		}
-		return json.Unmarshal(rb, &or)
-	})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -509,36 +537,55 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
-	body := toOpenAI(req, o.Model, o.MaxTokens)
-	body.Stream = true
-
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
 
 	var resp *http.Response
-	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
+	var lastBody string
+
+	openOnce := func(maxTokens int) error {
+		body := toOpenAI(req, o.Model, maxTokens)
+		body.Stream = true
+		buf, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		o.setHeaders(httpReq)
-		resp, err = o.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode >= 400 {
-			rb, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
-			if transport.IsRetryableStatus(resp.StatusCode) {
-				return &transport.RetryableError{Err: httpErr}
+		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
+			if err != nil {
+				return err
 			}
-			return httpErr
+			o.setHeaders(httpReq)
+			resp, err = o.httpClient.Do(httpReq)
+			if err != nil {
+				return err
+			}
+			if resp.StatusCode >= 400 {
+				rb, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				lastBody = string(rb)
+				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
+				if transport.IsRetryableStatus(resp.StatusCode) {
+					return &transport.RetryableError{Err: httpErr}
+				}
+				return httpErr
+			}
+			return nil
+		})
+	}
+
+	err := openOnce(o.MaxTokens)
+	if err != nil {
+		if in, cap, ok := transport.ParseContextOverflow(lastBody); ok {
+			if adjusted, retryOK := transport.ComputeAdjustedMaxTokens(in, cap); retryOK {
+				if dbgOpenAI {
+					fmt.Fprintf(os.Stderr, "[openai stream] context overflow %d/%d — retrying with max_tokens=%d\n", in, cap, adjusted)
+				}
+				lastBody = ""
+				err = openOnce(adjusted)
+			} else {
+				err = fmt.Errorf("%w\n\n%s", err, transport.BuildOverflowHint(in, cap))
+			}
 		}
-		return nil
-	})
+	}
 	if err != nil {
 		return nil, err
 	}

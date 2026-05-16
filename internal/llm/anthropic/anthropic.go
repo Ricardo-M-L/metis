@@ -682,6 +682,10 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 	body.Stream = false
 
 	var ar anthropicResp
+	// lastBody captures the most recent 4xx response body so the
+	// post-loop context-overflow recovery can inspect it without an
+	// extra round-trip. Mirrors CC's withRetry.ts pattern.
+	var lastBody string
 	doOnce := func(b anthropicReq) error {
 		buf, err := json.Marshal(b)
 		if err != nil {
@@ -700,7 +704,8 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 			defer resp.Body.Close()
 			rb, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode >= 400 {
-				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+				lastBody = string(rb)
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
 				if transport.IsRetryableStatus(resp.StatusCode) {
 					return &transport.RetryableError{Err: httpErr}
 				}
@@ -721,7 +726,24 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 		// reminder; we cap at 2 attempts so a persistently broken
 		// path doesn't loop forever.
 		debugRetryArgs(attempt, "Complete")
+		lastBody = ""
 		err = doOnce(withToolArgsReminder(body))
+	}
+	if err != nil {
+		// CC-aligned overflow recovery: parse input/cap from the 4xx
+		// body, drop max_tokens to whatever room remains, retry once.
+		// Floor-guarded: if the retry budget would be below
+		// FloorOutputTokens, surface the Fork→Agent hint instead.
+		if in, cap, ok := transport.ParseContextOverflow(lastBody); ok {
+			if adjusted, retryOK := transport.ComputeAdjustedMaxTokens(in, cap); retryOK {
+				adjustedBody := body
+				adjustedBody.MaxTokens = adjusted
+				lastBody = ""
+				err = doOnce(adjustedBody)
+			} else {
+				err = fmt.Errorf("%w\n\n%s", err, transport.BuildOverflowHint(in, cap))
+			}
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -739,6 +761,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 	// Retry the initial request (DNS / 429 / 5xx). Once we have a streaming
 	// body we don't retry — partial SSE consumption can't be re-played.
 	var resp *http.Response
+	var lastBody string
 	openOnce := func(b anthropicReq) error {
 		buf, err := json.Marshal(b)
 		if err != nil {
@@ -758,6 +781,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 				rb, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				bodyStr := string(rb)
+				lastBody = bodyStr
 				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(bodyStr, 500))
 				// MiniMax-shim hints: when the upstream is MiniMax's
 				// `/anthropic` endpoint, the body almost always carries a
@@ -786,7 +810,23 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 		// code path stops firing; cap at 2 so persistent failures
 		// don't loop forever.
 		debugRetryArgs(attempt, "Stream")
+		lastBody = ""
 		err = openOnce(withToolArgsReminder(body))
+	}
+	if err != nil {
+		// CC-aligned context-overflow recovery (stream path): same as
+		// Complete — parse, drop max_tokens, retry once, fall back to
+		// surfacing the Fork→Agent hint if even the floor doesn't fit.
+		if in, cap, ok := transport.ParseContextOverflow(lastBody); ok {
+			if adjusted, retryOK := transport.ComputeAdjustedMaxTokens(in, cap); retryOK {
+				adjustedBody := body
+				adjustedBody.MaxTokens = adjusted
+				lastBody = ""
+				err = openOnce(adjustedBody)
+			} else {
+				err = fmt.Errorf("%w\n\n%s", err, transport.BuildOverflowHint(in, cap))
+			}
+		}
 	}
 	if err != nil {
 		return nil, err
