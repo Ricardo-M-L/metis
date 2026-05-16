@@ -106,6 +106,16 @@ func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	if err != nil {
 		return nil, err
 	}
+	if st.IsDir() {
+		// Symmetric with LS's regular-file rescue: a model that
+		// passes a directory path to Read gets a confusing
+		// "is a directory" syscall error and tends to re-call
+		// Read with the same path. Steer to LS instead.
+		return &tools.Result{
+			Output:  fmt.Sprintf("%s is a directory, not a file. Use LS to list its entries, then Read individual files.", path),
+			IsError: true,
+		}, nil
+	}
 	if st.Size() > MaxReadFileSize {
 		return &tools.Result{
 			Output:  fmt.Sprintf("file too large: %d bytes exceeds %d byte cap (use Bash with head/tail to inspect)", st.Size(), MaxReadFileSize),

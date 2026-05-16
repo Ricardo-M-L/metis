@@ -392,10 +392,12 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		return &tools.Result{
 			Output: fmt.Sprintf(
 				"[blocked sleep pattern] %s\n\n"+
-					"Bare `sleep N` (N ≥ 2 seconds) is rejected as a polling primitive — "+
-					"if you need to wait for something specific, watch a file or "+
-					"use run_in_background and BashOutput to poll the job's progress. "+
-					"For deliberate pacing under 2 seconds, use `sleep 0.5` etc.",
+					"Bare `sleep N` (N ≥ 2 seconds) is rejected as a polling primitive. "+
+					"Better alternatives: "+
+					"(1) use the Monitor tool to watch a file/log for a specific pattern — "+
+					"its event arrives the moment the condition fires, not on a polling tick; "+
+					"(2) for a long-running command, pass run_in_background=true and check progress via BashOutput; "+
+					"(3) for deliberate sub-second pacing, `sleep 0.5` etc. is allowed.",
 				blocked,
 			),
 			IsError: true,

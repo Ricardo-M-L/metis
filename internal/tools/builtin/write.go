@@ -98,6 +98,17 @@ func (w Write) Execute(_ context.Context, in map[string]any) (*tools.Result, err
 	// a different content/mtime than what's there now, refuse so the
 	// model re-Reads first.
 	if st, statErr := os.Stat(path); statErr == nil {
+		if st.IsDir() {
+			// Same Crush-style guard as Read/Edit: trying to Write
+			// to a directory path is almost always "model meant
+			// path/file.ext" — call it out instead of letting the
+			// underlying os.WriteFile fail with a less actionable
+			// syscall message.
+			return &tools.Result{
+				Output:  fmt.Sprintf("%s is a directory, not a file. Write needs an absolute file path; pick a filename inside the directory.", path),
+				IsError: true,
+			}, nil
+		}
 		if w.state != nil {
 			if entry, ok := w.state.Get(path); ok {
 				if entry.IsPartialView {

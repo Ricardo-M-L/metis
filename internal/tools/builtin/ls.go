@@ -66,6 +66,18 @@ func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 
 	entries, err := os.ReadDir(path)
 	if err != nil {
+		// Crush-style typed-error rescue: when path is a regular
+		// file the syscall message is just "not a directory" and the
+		// model loops re-trying LS. Stat once so we can hand back
+		// the Read-tool pointer instead. The 2026-05-16 longrun hit
+		// this 4×: model called LS on .go files. Each retry cost
+		// ~10K tokens of reasoning before it switched tools.
+		if st, statErr := os.Stat(path); statErr == nil && !st.IsDir() {
+			return &tools.Result{
+				Output:  fmt.Sprintf("%s is a regular file, not a directory. Use Read to view its contents, or pass the parent directory to LS.", path),
+				IsError: true,
+			}, nil
+		}
 		return nil, err
 	}
 	type row struct {

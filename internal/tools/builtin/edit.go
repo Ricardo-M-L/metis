@@ -115,6 +115,12 @@ func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	if err != nil {
 		return nil, err
 	}
+	if st.IsDir() {
+		return &tools.Result{
+			Output:  fmt.Sprintf("%s is a directory, not a file. Edit operates on file contents — use LS to list entries, Read to view a specific file, then Edit it.", path),
+			IsError: true,
+		}, nil
+	}
 	if st.Size() > MaxEditFileSize {
 		return &tools.Result{
 			Output:  fmt.Sprintf("file too large: %d bytes exceeds %d byte edit cap", st.Size(), MaxEditFileSize),
