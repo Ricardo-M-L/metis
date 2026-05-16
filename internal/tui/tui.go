@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -109,10 +110,18 @@ type Model struct {
 	slash     *slash.Registry
 	session   *session.Store
 	sessionID string
-	model     string
-	skillDir  string
-	cmds      *REPLCommandRegistry
-	ext       ExternalHooks
+	// sessionTitle is the human-friendly label set via /rename or /title
+	// (persisted in the session header by session.Store.SetTitle).
+	// Used to drive the terminal window title (bubbletea's
+	// tea.View.WindowTitle) and the exit-time resume hint. Initialized
+	// from the session header at NewModel time so a resumed session's
+	// previously-set title takes effect on first frame; updated in
+	// keybind_submit.go's SignalTitle handler when the user renames.
+	sessionTitle string
+	model        string
+	skillDir     string
+	cmds         *REPLCommandRegistry
+	ext          ExternalHooks
 	// cfg is the loaded ~/.metis/config.toml. The TUI reaches into a
 	// few sub-sections directly (Tools.Bash for !bash-mode shell
 	// settings, Channels for SendMessage routing, etc.). Storing the
@@ -158,17 +167,16 @@ type Model struct {
 	// spinnerOverride pins the spinner verb to a fixed label that wins
 	// over spinnerVerb / spinnerSub while non-empty. Used when the loop
 	// is in an LLM-driven compaction phase (Collapse / Compact) so the
-	// user sees "Compacting conversation (collapse)..." instead of the
-	// thinking verb that would otherwise show during a 5-30s summarize
-	// call — that was the "input area looks frozen" user report
-	// (2026-05-15 screenshot #3). Cleared on EventContextCompacted.
+	// user sees "Compacting conversation..." instead of the thinking
+	// verb that would otherwise show during a 5-30s summarize call —
+	// that was the "input area looks frozen" user report (2026-05-15
+	// screenshot #3). Cleared on EventContextCompacted.
 	spinnerOverride string
 
 	// spinnerCompactionBytes is the cumulative byte count of the
 	// in-flight summarize stream, updated by EventCompactionProgress.
-	// Renders next to the override label as "(N tokens streamed)" so
-	// the user sees the summarize call is making progress rather than
-	// just a frozen elapsed timer. Reset on EventContextCompacted.
+	// Feeds the progress bar + % rendered under the compaction spinner
+	// row (claude-code image #19 layout). Reset on EventContextCompacted.
 	spinnerCompactionBytes int
 	// spinnerPhase mirrors claude-code's SpinnerMode (sourcemap
 	// restored-src/src/components/Spinner/SpinnerAnimationRow.tsx
@@ -588,6 +596,17 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		histDirectIdx:  -1, // not navigating yet — first ↑ jumps to histAll[0]
 		toolArgsStream: make([]byte, 0, 256),
 	}
+	// Hydrate sessionTitle from the on-disk header so a resumed session
+	// (e.g. metis --resume <id> where the previous run had run /rename
+	// "foo") shows "foo" in the terminal tab on first frame, not just
+	// after the next /rename. Best-effort: nil store / nil header / read
+	// error are all soft fails — leave sessionTitle empty so View()
+	// falls back to the plain "metis" window title.
+	if st != nil && sid != "" {
+		if hdr, _, err := st.LoadHeader(sid); err == nil && hdr != nil {
+			mdl.sessionTitle = hdr.Title
+		}
+	}
 	if pendingUpdateNotice != "" {
 		// Surface the update notice as the first info row so the user
 		// sees it inside alt-screen rather than having it swallowed
@@ -666,27 +685,48 @@ func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *sessi
 	// is empty (e.g. the user quit during the auth wizard before any
 	// session was created).
 	if err == nil && sid != "" {
-		printResumeHint(sid)
+		printResumeHint(m.session, sid)
 	}
 	return err
 }
 
 // printResumeHint surfaces a dim "next time, run this" hint after a
 // clean chat exit. Format mirrors claude-code's quit affordance
-// exactly (user reference image 2026-05-08):
+// (user reference image 2026-05-08) but adapted for metis's
+// UUID-only --resume contract:
 //
-//	Resume this session with:
-//	metis --resume <full-uuid>
+//	Resume "<title>":               ← only when /rename has been used
+//	  metis --resume <full-uuid>
 //
-// Both lines in dim gray (ANSI 2;38;5;245). Full UUID — not the short
-// 12-char prefix — because the user typed it from the terminal and
-// expects to be able to copy-paste verbatim. stderr so piped stdout
-// consumers don't see the human chrome.
-func printResumeHint(sid string) {
+//	Resume this session with:       ← fallback when title is empty
+//	  metis --resume <full-uuid>
+//
+// We can't put the title on the command line the way claude-code does
+// (`claude --resume "foo"`) because metis's resume requires the
+// canonical UUID by design — see internal/runtime/resume.go for the
+// rationale (prefix/title resolution was tried and reverted). Instead
+// we surface the title in the lead line so the user sees a friendly
+// label and the command line stays copy-pasteable verbatim.
+//
+// Both lines in dim gray (ANSI 2;38;5;245). stderr so piped stdout
+// consumers don't see the human chrome. store may be nil (e.g. quit
+// during auth wizard before session boot completes); in that case we
+// silently skip the title lookup and fall back to the plain hint.
+func printResumeHint(store *session.Store, sid string) {
 	dim := "\x1b[2;38;5;245m"
 	reset := "\x1b[0m"
-	fmt.Fprintf(os.Stderr, "\n%sResume this session with:%s\n", dim, reset)
-	fmt.Fprintf(os.Stderr, "%smetis --resume %s%s\n", dim, sid, reset)
+	title := ""
+	if store != nil {
+		if hdr, _, err := store.LoadHeader(sid); err == nil && hdr != nil {
+			title = strings.TrimSpace(hdr.Title)
+		}
+	}
+	if title != "" {
+		fmt.Fprintf(os.Stderr, "\n%sResume %q:%s\n", dim, title, reset)
+	} else {
+		fmt.Fprintf(os.Stderr, "\n%sResume this session with:%s\n", dim, reset)
+	}
+	fmt.Fprintf(os.Stderr, "%s  metis --resume %s%s\n", dim, sid, reset)
 }
 
 // earlyInputReader is set by SetEarlyInputReader from main.go before

@@ -1545,12 +1545,13 @@ func cmdRun(ctx context.Context, args []string) error {
 	// Wait for any in-flight auto-memory forks (extractMemories) to
 	// finish before exiting — without this, `metis run` returns the
 	// instant EventLoopDone fires, but the LoopEnd hook spawned a
-	// goroutine that would die mid-Complete. 45s cap covers the long
-	// tail: 2-4 turn extractions on slower providers (MiniMax thinking
-	// path took 14-15s in real testing); shorter caps were truncating
-	// mid-fork.
+	// goroutine that would die mid-Complete. 120s cap covers the long
+	// tail: Phase B added SkillSynth + 4-phase prompt, pushing dream
+	// duration from ~10s to 30-60s on slow providers; the prior 45s
+	// cap was truncating mid-fork and leaving stale PID bodies in the
+	// dream lock (which then blocked future dreams via the time gate).
 	if flags.autoMemory || os.Getenv("METIS_AUTO_MEMORY") == "1" {
-		waitForkInflight(45 * time.Second)
+		waitForkInflight(120 * time.Second)
 	}
 	return err
 }

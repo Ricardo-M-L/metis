@@ -168,10 +168,16 @@ func renderMetisTable(headers []string, rows [][]string, width int) string {
 	if width < 20 {
 		width = 20
 	}
+	// Header row: bold white text only, no Background fill. The earlier
+	// #3a3a3a header band read as a "gray shadow" against the dark
+	// terminal background (image #17 user feedback 2026-05-15) — every
+	// other row was transparent and the header sat in a coloured
+	// rectangle that looked detached from the body. Plain bold + a
+	// slightly brighter foreground keeps the visual separation without
+	// the shaded panel.
 	headerStyle := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#e0e0e0")).
-		Background(lipgloss.Color("#3a3a3a")).
+		Foreground(lipgloss.Color("#ffffff")).
 		Padding(0, 1)
 	// Body cells: DO NOT set Foreground. The cells already contain
 	// ANSI from renderInlineMD (red code spans, bold/italic), and a

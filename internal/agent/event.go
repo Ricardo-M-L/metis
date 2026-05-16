@@ -87,6 +87,29 @@ const (
 	// streaming.go's emit path; metis emits chunks). Inspired by
 	// kimi-cli's streamingjson tool args parser.
 	EventToolArgsDelta
+
+	// Dreaming lifecycle (Phase C, 2026-05-16) — main-channel events
+	// for the auto-memory consolidation workflow so the TUI can swap
+	// the spinner verb to "Dreaming...", render a progress pill, and
+	// post a `✻ context dreamed` inline summary at completion.
+	//
+	// Distinct from the older DreamNotification channel: that channel
+	// feeds a system-reminder back to the LLM (so the model knows
+	// memory was just refreshed); these events feed the TUI.
+	//
+	//   EventDreamingStart    — fork is about to run; spinner override
+	//                           "Dreaming..." pins. Info = trigger
+	//                           reason ("scheduled"/"manual").
+	//   EventDreamingProgress — incremental phase update. Info encodes
+	//                           "<phase> <key>=<value>" tags the TUI
+	//                           parses for the status pill (sessions
+	//                           reviewed, files written, etc).
+	//   EventDreamingEnd      — fork completed. Info carries the inline
+	//                           summary tail (e.g. "+2 memories, +1 skill").
+	//                           Cleared spinner; appended one-line message.
+	EventDreamingStart
+	EventDreamingProgress
+	EventDreamingEnd
 )
 
 // eventOutKey carries the parent loop's event channel down to tools
@@ -105,8 +128,14 @@ func WithEventOut(ctx context.Context, ch chan<- Event) context.Context {
 }
 
 // EventOutFromContext returns the parent forwarder channel, or nil
-// when none is attached (e.g., tools called outside the loop).
+// when none is attached (e.g., tools called outside the loop). Nil
+// ctx is treated the same as "no channel attached" — callers that
+// pass context.Background() or genuinely nil ctx get nil back rather
+// than a panic on the Value dereference.
 func EventOutFromContext(ctx context.Context) chan<- Event {
+	if ctx == nil {
+		return nil
+	}
 	if v, ok := ctx.Value(eventOutKey{}).(chan<- Event); ok {
 		return v
 	}

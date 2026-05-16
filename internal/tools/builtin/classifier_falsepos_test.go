@@ -57,7 +57,7 @@ func TestClassifier_ForkBombShellSyntax_StillDangerous(t *testing.T) {
 	c := NewBashClassifier()
 	for _, cmd := range []string{
 		":(){:|:&};:",
-		":() { :|:& }; :",                      // pretty-printed
+		":() { :|:& }; :",                       // pretty-printed
 		"bash -c ':(){ :|:& };:'",               // wrapped
 		"echo 'safe' && :(){ : | : & };: # bad", // chained
 	} {
@@ -78,7 +78,7 @@ func TestClassifier_ForkProseNotDangerous(t *testing.T) {
 	for _, cmd := range []string{
 		`echo "=== METIS V3 METADATA: Fork: 1 call ==="`,
 		`echo "fork: 1 success, 4 nesting cap"`,
-		`echo "Pattern: a:b:c & d"`,         // 3 colons + ampersand
+		`echo "Pattern: a:b:c & d"`,          // 3 colons + ampersand
 		`grep "process: cpu: mem: io &" log`, // accidental shape
 		`echo "Used Agent({prompt}) instead of Fork"`,
 	} {

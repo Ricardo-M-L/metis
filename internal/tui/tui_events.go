@@ -207,11 +207,12 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// call summarize. Pin the spinner label so the user sees what's
 		// happening during the otherwise silent 5-30s window. Mirrors
 		// claude-code REPL.tsx:2504 setSpinnerMessage('Compacting…').
-		tier := ev.Info
-		if tier == "" {
-			tier = "compact"
-		}
-		m.spinnerOverride = "Compacting conversation (" + tier + ")"
+		//
+		// Label intentionally drops the tier suffix to match claude-code's
+		// image-#19 wording "Compacting conversation..." verbatim — the
+		// tier (collapse vs compact) is internal bookkeeping the user
+		// doesn't need exposed in the spinner row.
+		m.spinnerOverride = "Compacting conversation..."
 		m.spinnerCompactionBytes = 0
 		// OSC 9;4 indeterminate — terminals that support it (iTerm2
 		// 3.6.6+, Ghostty 1.2.0+, ConEmu) render a progress indicator
@@ -250,5 +251,47 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			ToolCalls: ev.ToolCalls,
 		})
 		m.messages = append(m.messages, Message{Role: "info", Content: fmt.Sprintf("(plan archived to ~/.metis/plans · %d tool calls)", len(ev.ToolCalls)), Timestamp: time.Now()})
+	case agent.EventDreamingStart:
+		// Phase C — dreaming subagent is about to run. Pin the spinner
+		// verb to "Dreaming..." so the user sees what's happening
+		// during the otherwise-silent 10-30 s background run. Mirrors
+		// the compaction-display pattern (image #19) verbatim — same
+		// chrome, different verb, different summary.
+		m.spinnerOverride = "Dreaming..."
+		m.spinnerCompactionBytes = 0
+		// OSC 9;4 indeterminate progress on the terminal tab — works
+		// even when the spinner row is scrolled off-screen.
+		SetTerminalProgress(ProgressIndeterminate)
+	case agent.EventDreamingProgress:
+		// Reserved for finer-grained progress (phase tags, file counts).
+		// Today the extractor emits Start/End only; Progress is wired
+		// up-front so a future iteration can populate it without
+		// changing the TUI surface.
+		m.spinnerCompactionBytes = ev.InputTokens
+	case agent.EventDreamingEnd:
+		// Phase C — fork completed. Clear override, drop the tab
+		// indicator, and surface the one-line summary inline. The
+		// extractor's Info field carries "+N memories, +M skills" or
+		// "failed: <reason>".
+		m.spinnerOverride = ""
+		m.spinnerCompactionBytes = 0
+		SetTerminalProgress(ProgressClear)
+		role := "info"
+		content := "context dreamed: " + ev.Info
+		if strings.HasPrefix(ev.Info, "failed:") {
+			role = "error"
+		} else if ev.Info == "no changes" {
+			// Drop the message entirely — the user doesn't need a
+			// notification that "nothing was worth saving". Mirrors
+			// the autocompact silent path when collapse decides
+			// there's nothing to fold.
+			return
+		} else {
+			// Reuse the compaction role so the renderer reaches for the
+			// distinctive ✻ banner instead of dim-grey info styling.
+			role = "compaction"
+			content = "context dreamed: " + ev.Info
+		}
+		m.messages = append(m.messages, Message{Role: role, Content: content, Timestamp: time.Now()})
 	}
 }

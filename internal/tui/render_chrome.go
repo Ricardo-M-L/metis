@@ -193,6 +193,108 @@ func renderSpinnerStatus(m *Model) string {
 		s.WriteString(styleMuted.Render(")"))
 	}
 	s.WriteString("\n")
+	// Compaction extras — match claude-code's image #19 layout: spinner
+	// row + progress bar with % + sub-line announcing the auto-window
+	// threshold and the configure command. Only emitted when the
+	// override label indicates we're in a compaction phase.
+	if strings.HasPrefix(m.spinnerOverride, "Compacting conversation") {
+		s.WriteString(renderCompactionExtras(m))
+	}
+	// Dreaming extras (Phase C 2026-05-16) — parallel chrome under
+	// the spinner during auto-memory consolidation. We don't have a
+	// reliable byte target the way compaction does (the summarize
+	// stream's length is unknown), so we skip the progress bar and
+	// just emit a single sub-line announcing what's happening + the
+	// configure entry point.
+	if strings.HasPrefix(m.spinnerOverride, "Dreaming") {
+		s.WriteString(renderDreamingExtras(m))
+	}
+	return s.String()
+}
+
+// renderDreamingExtras draws the single sub-row that sits under the
+// spinner during auto-memory consolidation:
+//
+//	└ Consolidating recent sessions · /dream status to inspect
+//
+// Mirrors the compaction-extras layout (image #19) for visual
+// continuity, but omits the progress bar — dreaming has no stream
+// length we can map to a percentage, and a sweeping/indeterminate bar
+// would lie about progress more than it would help.
+func renderDreamingExtras(m *Model) string {
+	_ = m // reserved for future per-fork progress info (sessions touched)
+	var s strings.Builder
+	s.WriteString("  ")
+	s.WriteString(styleDim.Render("└ Consolidating recent sessions · /dream status to inspect"))
+	s.WriteString("\n")
+	return s.String()
+}
+
+// renderCompactionExtras draws the two rows that sit under the spinner
+// during LLM-driven compaction:
+//
+//	▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱ 42%
+//	└ Compacting at auto window (170k tokens) · /autocompact to configure
+//
+// The progress is a saturating estimate based on summarize-stream bytes
+// (we don't know the final summary length until done); it caps at 95%
+// so the user never sees "100%" while the call is still mid-flight. On
+// EventContextCompacted the override clears and these rows disappear
+// with it. Layout mirrors claude-code's compaction display (image #19
+// user feedback 2026-05-15).
+func renderCompactionExtras(m *Model) string {
+	// 8000-byte heuristic target: summaries usually land between 4-12KB,
+	// so bytes/80 puts a typical run at 50–95% by the time it finishes.
+	pct := m.spinnerCompactionBytes / 80
+	if pct > 95 {
+		pct = 95
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	const barWidth = 22
+	filled := pct * barWidth / 100
+	if filled > barWidth {
+		filled = barWidth
+	}
+	var bar strings.Builder
+	for i := 0; i < filled; i++ {
+		bar.WriteString("▰")
+	}
+	for i := filled; i < barWidth; i++ {
+		bar.WriteString("▱")
+	}
+
+	// Auto-window threshold = Compactor.Threshold (default 0.85) ×
+	// MaxContextTokens. Falls back to 85% of provider cap if the
+	// Compactor isn't reachable (e.g. legacy callers / tests).
+	autoWindow := 0
+	if m.loop != nil {
+		if m.loop.Compactor != nil && m.loop.Compactor.MaxContextTokens > 0 {
+			thr := m.loop.Compactor.Threshold
+			if thr <= 0 {
+				thr = 0.85
+			}
+			autoWindow = int(float64(m.loop.Compactor.MaxContextTokens) * thr)
+		} else if m.loop.Provider != nil {
+			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
+				autoWindow = int(float64(cap) * 0.85)
+			}
+		}
+	}
+
+	var s strings.Builder
+	s.WriteString("  ")
+	s.WriteString(styleAccent.Render(bar.String()))
+	s.WriteString(styleDim.Render(fmt.Sprintf(" %d%%", pct)))
+	s.WriteString("\n")
+	s.WriteString("  ")
+	if autoWindow > 0 {
+		s.WriteString(styleDim.Render(fmt.Sprintf("└ Compacting at auto window (%s tokens) · /autocompact to configure", formatTokens(autoWindow))))
+	} else {
+		s.WriteString(styleDim.Render("└ Compacting at auto window · /autocompact to configure"))
+	}
+	s.WriteString("\n")
 	return s.String()
 }
 

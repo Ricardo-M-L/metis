@@ -47,6 +47,12 @@ func CreateAutoMemCanUseTool(memoryDir string, reg *tools.Registry) CanUseToolFn
 			return canUseBashReadOnly(ctx, reg, toolName, input)
 		case "Edit", "Write", "MultiEdit":
 			return canUseEditOrWrite(memoryDir, input)
+		case "SkillSynth":
+			// Phase B (2026-05-16) — the dreaming fork's exclusive write
+			// path to ~/.metis/skills/<name>.md. The tool itself
+			// validates name shape + frontmatter scope, so we only need
+			// to authorise the call here, not re-validate inputs.
+			return true, ""
 		}
 		// Default deny — keeps the fork safely scoped no matter what
 		// future tools land in the registry.

@@ -219,5 +219,17 @@ func (m *Model) buildChatItems() []list.Item {
 			backgrounded: m.turnBackgrounded,
 		})
 	}
+	// Spinner status (`* scaffolding (5.5s · ↑ 95k tokens)`) used to
+	// live in the `upper` chrome block, but it visually matches the
+	// asterisked rows already inside the transcript and the user
+	// reported it as "stuck" when scrolling (image #16 feedback). We
+	// snapshot the spinner string at this frame's buildChatItems call
+	// so it appears at the tail of the chat list and scrolls together
+	// with the thinking/streaming items. Permission prompt and active
+	// screen overlays stay in `upper` because they require keyboard
+	// focus and must remain on screen.
+	if m.spinnerActive {
+		out = append(out, &staticItem{rendered: renderSpinnerStatus(m)})
+	}
 	return out
 }

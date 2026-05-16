@@ -23,6 +23,23 @@ func newTestExtractor(t *testing.T, prov llm.Provider, root string) (*Loop, *Aut
 		t.Fatalf("NewAutoMemoryExtractor: %v", err)
 	}
 	loop.autoMemExtractor = ext
+
+	// Phase A test-isolation: point the dream gate at a temp sessions
+	// dir populated with enough mock JSONLs to clear gate 3. Without
+	// this, tests would either (a) leak the user's real
+	// ~/.metis/sessions state and intermittently fail when it's empty,
+	// or (b) wedge behind the gate because t.TempDir() has no sessions.
+	sessDir := filepath.Join(t.TempDir(), "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	for _, n := range []string{"s1", "s2", "s3", "s4"} {
+		p := filepath.Join(sessDir, n+".jsonl")
+		if err := os.WriteFile(p, []byte(`{"kind":"header"}`+"\n"), 0o644); err != nil {
+			t.Fatalf("write mock session: %v", err)
+		}
+	}
+	ext.SetSessionsDir(sessDir)
 	return loop, ext
 }
 
@@ -96,6 +113,11 @@ func TestAutoMemoryExtractor_RateLimitsRapidLoopEnds(t *testing.T) {
 		},
 	}
 	_, ext := newTestExtractor(t, prov, t.TempDir())
+	// Disk-backed dream gate is now the cross-process throttle; this
+	// test isolates the in-memory MinInterval+Pending machinery, so we
+	// bypass the gate (otherwise the second call would never reach the
+	// in-memory rate limit — it'd bail at "too-soon").
+	ext.setDreamGateBypass(true)
 
 	ext.OnLoopEnd(context.Background(), "end_turn")
 	waitFor(t, time.Second, func() bool { return ext.Stats().TotalExtractions == 1 })
@@ -115,6 +137,10 @@ func TestAutoMemoryExtractor_StashesPendingDuringInProgress(t *testing.T) {
 	// blocking provider blocks first Complete forever.
 	bp := &blockingProvider{release: make(chan struct{})}
 	_, ext := newTestExtractor(t, bp, t.TempDir())
+	// Bypass the disk gate so this test exercises the in-memory
+	// in-progress / pending trailing-run machinery (see sibling
+	// rate-limit test for the same reasoning).
+	ext.setDreamGateBypass(true)
 	ext.OnLoopEnd(context.Background(), "end_turn")
 	// Wait until the goroutine entered the fork.
 	waitFor(t, time.Second, func() bool { return ext.Stats().InProgress })
@@ -194,7 +220,7 @@ func TestAutoMemoryExtractor_RegeneratesIndex(t *testing.T) {
 }
 
 func TestBuildExtractorPrompt_IncludesManifest(t *testing.T) {
-	got := buildExtractorPrompt("/tmp/x", "## existing\n- one\n")
+	got := buildExtractorPrompt("/tmp/x", "## existing\n- one\n", nil)
 	if !strings.Contains(got, "/tmp/x") {
 		t.Errorf("prompt missing root: %q", got)
 	}

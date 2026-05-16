@@ -179,11 +179,15 @@ func TestTableHasFullFrame(t *testing.T) {
 		t.Fatalf("last line is not a Unicode bottom frame: %q", bot)
 	}
 
-	// Header band: the rendered output (with ANSI) must contain the
-	// header background SGR sequence we set in renderMetisTable
-	// (Background #3a3a3a → 48;2;58;58;58).
-	if !strings.Contains(out, "48;2;58;58;58") {
-		t.Fatalf("expected header background SGR (48;2;58;58;58) in rendered output, got:\n%s", out)
+	// Header row: bold (no background — image #17 user feedback). The
+	// only way to spot the header in the rendered output is the
+	// bold SGR `\x1b[1` followed by white foreground 255;255;255 around
+	// the header cell content.
+	if !strings.Contains(out, "\x1b[1") {
+		t.Fatalf("expected bold SGR for header row, got:\n%s", out)
+	}
+	if !strings.Contains(out, "38;2;255;255;255") {
+		t.Fatalf("expected white header fg SGR (38;2;255;255;255), got:\n%s", out)
 	}
 
 	// Body rows must use │ vertical separators.

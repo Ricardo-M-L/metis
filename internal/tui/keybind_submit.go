@@ -297,6 +297,21 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			output := cmd.Handler(m.asREPL(), args)
+			// Sync m.sessionTitle from disk after REPL commands that
+			// mutate the session header. cmdRename (registered in
+			// commands.go as `rename` with alias `title`) calls
+			// session.Store.SetTitle through the asREPL() proxy — that
+			// path never touches the Model, so without this re-read the
+			// terminal-tab WindowTitle stays at its launch-time value
+			// even though the session JSONL header has the new title
+			// (image #14 user feedback). Best-effort: header read errors
+			// are silently ignored.
+			if (cmd.Name == "rename" || cmd.Name == "title") &&
+				m.session != nil && m.sessionID != "" {
+				if hdr, _, err := m.session.LoadHeader(m.sessionID); err == nil && hdr != nil {
+					m.sessionTitle = strings.TrimSpace(hdr.Title)
+				}
+			}
 			if output != "" {
 				if modalCommands[cmd.Name] {
 					// Information-dense commands open as a full-window
@@ -358,6 +373,13 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			} else if err := m.session.SetTitle(m.sessionID, title); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "title: " + err.Error(), Timestamp: time.Now()})
 			} else {
+				// Update Model cache so View() emits the new
+				// tea.View.WindowTitle (bubbletea v2 diffs lastView and
+				// auto-emits the OSC 0 escape when the value changes —
+				// see cursed_renderer.go:372). Without this assignment
+				// /rename only persists to disk; the terminal tab keeps
+				// the old name until next launch.
+				m.sessionTitle = title
 				m.messages = append(m.messages, Message{Role: "success", Content: "(title set: " + title + ")", Timestamp: time.Now()})
 			}
 		case slash.SignalBranch:

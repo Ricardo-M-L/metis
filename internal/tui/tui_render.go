@@ -83,6 +83,18 @@ func (m *Model) View() tea.View {
 		v := tea.NewView(content)
 		v.AltScreen = true
 		v.MouseMode = tea.MouseModeCellMotion
+		// Drive the terminal window/tab title via bubbletea v2's
+		// built-in support (tea.View.WindowTitle → ansi.SetWindowTitle
+		// OSC 0). The renderer auto-diffs against the previous frame
+		// and only emits the escape when the value changes
+		// (cursed_renderer.go:372), and clears the title to "" on
+		// alt-screen exit (cursed_renderer.go:189-191). Plain "metis"
+		// as the baseline so a fresh session still gets a useful tab
+		// name; "metis · <title>" once the user has renamed.
+		v.WindowTitle = "metis"
+		if m.sessionTitle != "" {
+			v.WindowTitle = "metis · " + m.sessionTitle
+		}
 		return v
 	}
 	// attachCursor sets v.Cursor based on the textarea's current
@@ -225,18 +237,16 @@ func (m *Model) View() tea.View {
 	// silently clipped the bottom (e.g. permission options 3-4 became
 	// invisible, image #2 user report 2026-05-07).
 	//
-	// Phase 1a: spinner + permission live ABOVE the input. The live
-	// thinking summary and streaming reply USED to live here too, but
-	// that made them stick on screen while the user scrolled the
-	// transcript even though they visually matched historical
-	// thinking/assistant rows (image #12 user feedback 2026-05-15).
-	// They've been moved into buildChatItems as inProgressThinkingItem
-	// and inProgressStreamingItem so the chat list virtualizes them
-	// together with the rest of the transcript.
+	// Phase 1a: permission prompt lives ABOVE the input — it owns the
+	// keyboard while it's up, so sticking it on screen is required
+	// (you can't scroll away from a decision the agent is waiting on).
+	// Everything else that USED to live here — the streaming reply,
+	// the thinking summary, the spinner status row — has been moved
+	// into buildChatItems so the chat list virtualizes them together
+	// with the rest of the transcript (image #12 + #16 user feedback
+	// 2026-05-15: they visually matched transcript rows but stuck on
+	// screen as the user scrolled).
 	var upper strings.Builder
-	if m.spinnerActive {
-		upper.WriteString(renderSpinnerStatus(m))
-	}
 	if m.permActive {
 		upper.WriteString(renderPermission(m))
 	}
