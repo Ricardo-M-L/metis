@@ -113,6 +113,21 @@ func (m MessageTeammate) Execute(_ context.Context, in map[string]any) (*tools.R
 		}, nil
 	}
 
+	// 2026-05-16: hard refuse anonymous sub-agents at the type level.
+	// Anonymous teammates have Mailbox == nil (set in Roster.Register)
+	// to enforce claude-code's Sub-Agent paradigm constraint that
+	// sub-agents must not communicate. Pre-fix the refusal lived in
+	// the tool description text — a determined model could still try.
+	if t.Mailbox == nil {
+		return &tools.Result{
+			Output: fmt.Sprintf(
+				"%q is an anonymous sub-agent — anonymous sub-agents cannot receive peer messages by design (Sub-Agent paradigm: isolation only). Use Agent({name: \"...\"}) to spawn a named teammate if you need bidirectional communication.",
+				t.Name,
+			),
+			IsError: true,
+		}, nil
+	}
+
 	// Sender identity — currently best-effort. The root loop shows as
 	// "main"; sub-agent senders would need a ctx-stamped identity we
 	// haven't wired yet (TODO: when G.x adds sender-from-ctx, plumb it

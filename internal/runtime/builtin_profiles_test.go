@@ -22,10 +22,13 @@ import (
 	"testing"
 )
 
-func TestBuiltinProfileNames_All7Present(t *testing.T) {
+func TestBuiltinProfileNames_All8Present(t *testing.T) {
 	t.Parallel()
 	got := BuiltinProfileNames()
-	// 7 total: 6 from G.7 + coordinator from G.8 (2026-05-12).
+	// 8 total: 6 from G.7 + coordinator from G.8 (2026-05-12) +
+	// teammate from 2026-05-16 (Team-paradigm-aware profile that
+	// bundles MessageTeammate + Task* + base tools so a coordinated
+	// team member doesn't have to guess "do I have peer messaging?").
 	want := []string{
 		"coordinator",
 		"explore",
@@ -33,6 +36,7 @@ func TestBuiltinProfileNames_All7Present(t *testing.T) {
 		"go-reviewer",
 		"mcp-debugger",
 		"plan",
+		"teammate",
 		"verify",
 	}
 	if len(got) != len(want) {

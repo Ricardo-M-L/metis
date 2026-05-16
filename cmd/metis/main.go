@@ -2570,6 +2570,20 @@ func buildSlash(rt *runtime) *slash.Registry {
 	r.Register(slash.Cmd{Name: "agents", Description: "list / kill / status sub-agents (Agent tool teammates)", Handler: func(arg string) (string, slash.Signal) {
 		return formatAgentsCommand(rt.subAgentRoster, arg), slash.SignalNone
 	}})
+	// /teammate — direct user → named teammate channel (2026-05-16).
+	// claude-code 架构图 image 5: "你也可以直接与单个团队成员交互,
+	// 不必事事都通过主 Agent 进行沟通". metis pre-fix had no way for
+	// the user to talk to a specific teammate — every input went to
+	// the main agent. This command pushes a PeerMessage with From="user"
+	// directly into the named teammate's Mailbox so it sees the request
+	// on its next turn boundary as a <peer_message> reminder.
+	r.Register(slash.Cmd{
+		Name:        "teammate",
+		Description: "send a message directly to a named teammate: /teammate <name> <message>",
+		Handler: func(arg string) (string, slash.Signal) {
+			return runTeammateMessage(rt.subAgentRoster, arg), slash.SignalNone
+		},
+	})
 	// User-authored commands from ~/.metis/commands/*.md and
 	// <cwd>/.metis/commands/*.md. Loaded LAST so a user .md can't
 	// shadow a built-in (LoadCustomCommands refuses to register on
@@ -2606,6 +2620,41 @@ func buildSlash(rt *runtime) *slash.Registry {
 // spawn a fresh sub-loop, so /agents resume returns a hint pointing
 // the user to `Agent({ resume_from: "agt-..." })` in chat. Future
 // G.x can wire the full inline spawn.
+// runTeammateMessage parses `/teammate <name> <body>` and pushes a
+// PeerMessage to the recipient's Mailbox. Returns user-facing status
+// (success or failure reason) for the slash output. Mirrors the
+// MessageTeammate tool's logic but addressed from the user (not
+// another sub-agent), so the From field is "user" and the recipient
+// renders the message as a <peer_message from="user"> reminder on its
+// next turn — the model can then choose to reply via MessageTeammate
+// or just act.
+func runTeammateMessage(roster *agent.Roster, arg string) string {
+	if roster == nil {
+		return "no roster wired (running outside a chat session?)"
+	}
+	parts := strings.SplitN(strings.TrimSpace(arg), " ", 2)
+	if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "usage: /teammate <name> <message>\nexample: /teammate alice can you check the auth flow once you finish the schema work?"
+	}
+	to, body := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	t, ok := roster.Lookup(to)
+	if !ok {
+		t, ok = roster.LookupByAgentID(to)
+	}
+	if !ok {
+		return fmt.Sprintf("no teammate with name=%s — use /agents list to see active named teammates", to)
+	}
+	if t.Mailbox == nil {
+		return fmt.Sprintf("%q is an anonymous sub-agent and cannot receive peer messages (Sub-Agent paradigm: isolation only)", t.Name)
+	}
+	select {
+	case t.Mailbox <- agent.PeerMessage{From: "user", Body: body, Sent: time.Now()}:
+		return fmt.Sprintf("message delivered to %s (agent_id=%s) — it will see this on its next turn boundary", t.Name, t.AgentID)
+	default:
+		return fmt.Sprintf("teammate mailbox full (%s has 16 messages queued) — wait for its next turn and retry", t.Name)
+	}
+}
+
 func formatAgentsCommand(roster *agent.Roster, arg string) string {
 	if roster == nil {
 		return "(agents: no Roster wired — sub-agent registry unavailable in this build)"

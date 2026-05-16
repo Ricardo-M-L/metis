@@ -461,7 +461,13 @@ func (r *Roster) Register(t *Teammate) error {
 			}
 		}
 	}
-	if t.Mailbox == nil {
+	// 2026-05-16: Only named teammates get a Mailbox. Anonymous
+	// sub-agents are part of the Sub-Agent paradigm (claude-code 架构图
+	// image 3 "硬性约束: 子智能体不能相互通信") — denying them a
+	// mailbox at type level beats the previous description-only refusal
+	// in MessageTeammate, which a clever model could try to bypass.
+	// MessageTeammate's Execute now sees nil Mailbox and rejects.
+	if !t.Anonymous && t.Mailbox == nil {
 		t.Mailbox = make(chan PeerMessage, 16)
 	}
 	if t.Started.IsZero() {

@@ -292,7 +292,7 @@ Briefing the sub-agent matters more than briefing yourself:
   - Don't ask the sub-agent to make load-bearing decisions for you. Have it gather evidence; you synthesize.
 
 ` + "`name`" + ` vs ` + "`subagent_type`" + ` (Q1, 2026-05-15 — the two roles are now separate):
-  - ` + "`subagent_type`" + ` selects the PROFILE/ROLE — its system prompt, default tool allowlist, default model. Bundled: explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator. User-defined profiles in ~/.metis/agents/<slug>.md or ./.metis/agents/<slug>.md take precedence over bundled. Omit to inherit the parent's prompt.
+  - ` + "`subagent_type`" + ` selects the PROFILE/ROLE — its system prompt, default tool allowlist, default model. Bundled: explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator, teammate. User-defined profiles in ~/.metis/agents/<slug>.md or ./.metis/agents/<slug>.md take precedence over bundled. Omit to inherit the parent's prompt.
   - ` + "`name`" + ` is the TEAM IDENTITY only — what /agents and MessageTeammate use to address this worker ("alice", "verifier"). Same-name collisions auto-suffix (alice → alice-2 → alice-3 → ...).
   - Back-compat: if you pass ` + "`name=\"explore\"`" + ` without ` + "`subagent_type`" + `, it's still treated as ` + "`subagent_type=\"explore\"`" + `. Explicit subagent_type is preferred — name should be a label like "alice", not a role like "explore".
 
@@ -339,7 +339,7 @@ func (Agent) InputSchema() map[string]any {
 			},
 			"subagent_type": map[string]any{
 				"type":        "string",
-				"description": "Optional profile slug that determines the sub-agent's role + system prompt. Bundled profiles: explore (read-only code search), plan (architect/planning), verify (test runner), general (catch-all), go-reviewer (Go-specific code review), mcp-debugger (MCP issues), coordinator (delegator). User-defined profiles in ~/.metis/agents/<name>.md or ./.metis/agents/<name>.md take precedence over bundled. When omitted, the sub-agent inherits the parent's system prompt. When `name` is set without `subagent_type`, a name matching a known profile slug is treated as the subagent_type for back-compat — explicit `subagent_type` is preferred.",
+				"description": "Optional profile slug that determines the sub-agent's role + system prompt. Bundled profiles: explore (read-only code search), plan (architect/planning), verify (test runner), general (catch-all), go-reviewer (Go-specific code review), mcp-debugger (MCP issues), coordinator (delegator), teammate (long-running team member with peer-message + shared-task-list coordination — pick this when you spawn multiple named workers that need to talk to each other). User-defined profiles in ~/.metis/agents/<name>.md or ./.metis/agents/<name>.md take precedence over bundled. When omitted, the sub-agent inherits the parent's system prompt. When `name` is set without `subagent_type`, a name matching a known profile slug is treated as the subagent_type for back-compat — explicit `subagent_type` is preferred.",
 			},
 			"resume_from": map[string]any{
 				"type":        "string",
