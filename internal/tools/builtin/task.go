@@ -247,8 +247,94 @@ func (t TaskUpdate) Execute(_ context.Context, in map[string]any) (*tools.Result
 	if err != nil {
 		return nil, err
 	}
-	return &tools.Result{Output: fmt.Sprintf("Updated task #%s status", tk.ID)}, nil
+	out := fmt.Sprintf("Updated task #%s status", tk.ID)
+	if nudge := verifierNudge(store, patch.Status); nudge != "" {
+		out += "\n\n" + nudge
+	}
+	return &tools.Result{Output: out}, nil
 }
+
+// verifierNudge returns a non-empty message when the just-completed
+// task pushes the session over the "3+ completed, 0 verify steps"
+// threshold. The nudge lands inside the TaskUpdate tool result so
+// the LLM observes it on the same turn it claimed completion —
+// stronger than any system-prompt suggestion because tool results
+// are read on every loop iteration.
+//
+// Mirrors claude-code-sourcemap TaskUpdateTool.ts:333-348 (the
+// "verification nudge needed" path). The whole point of putting
+// this in tool-return-land instead of system-prompt-land is that
+// the model under load tends to ignore advisory prose, but cannot
+// skip a tool result line.
+//
+// Heuristic for "verify step" detection:
+//   - task subject contains "verify" / "test" / "review" /
+//     "vet" / "lint" / "audit" (case-insensitive), OR
+//   - task owner is "verify" / "verifier" / "reviewer".
+//
+// Returns "" when:
+//   - the patch didn't transition status to completed (other
+//     edits don't trip the nudge), or
+//   - <3 completed tasks total (small lists are noisy), or
+//   - at least one task already counts as a verify step.
+func verifierNudge(store *taskstore.TaskStore, status *taskstore.TaskStatus) string {
+	if status == nil || *status != taskstore.TaskCompleted {
+		return ""
+	}
+	all := store.List(false)
+	completed := 0
+	hasVerifyStep := false
+	for _, tk := range all {
+		if isVerifyTask(tk) {
+			hasVerifyStep = true
+		}
+		if tk.Status == taskstore.TaskCompleted {
+			completed++
+		}
+	}
+	if completed < 3 || hasVerifyStep {
+		return ""
+	}
+	return "NUDGE: you just closed task #" + idOf(all, status) +
+		" and the session now has " + intStr(completed) +
+		" completed tasks with no verify/test/review step among them.\n" +
+		"Per the dispatch contract: before claiming this work done, spawn\n" +
+		"`Agent({subagent_type: \"verify\", prompt: \"<what to check>\"})`\n" +
+		"and wait for its `VERDICT: PASS/FAIL/PARTIAL` line. Your own\n" +
+		"\"looks good\" / \"build succeeded\" notes do NOT substitute —\n" +
+		"only the verifier issues a verdict on completion."
+}
+
+// isVerifyTask runs the keyword heuristic over a task's metadata to
+// decide whether it counts as a verification step for nudge
+// purposes. Cheap; called per task on every TaskUpdate so we lean
+// substring rather than tokenizing.
+func isVerifyTask(tk *taskstore.Task) bool {
+	subj := strings.ToLower(tk.Subject)
+	for _, kw := range []string{"verify", "test", "review", "vet", "lint", "audit"} {
+		if strings.Contains(subj, kw) {
+			return true
+		}
+	}
+	owner := strings.ToLower(tk.Owner)
+	return owner == "verify" || owner == "verifier" || owner == "reviewer"
+}
+
+// idOf is best-effort — the nudge references the last completed
+// task. We don't have the actual changed-task id wired through
+// (TaskStore.Update returns the patched task but verifierNudge runs
+// after the message is built), so we scan for the most-recent
+// completed entry. Cheap on small lists; the nudge text degrades
+// gracefully if List is empty.
+func idOf(all []*taskstore.Task, _ *taskstore.TaskStatus) string {
+	for i := len(all) - 1; i >= 0; i-- {
+		if all[i].Status == taskstore.TaskCompleted {
+			return all[i].ID
+		}
+	}
+	return "?"
+}
+
 
 // --- TaskOutput ---
 

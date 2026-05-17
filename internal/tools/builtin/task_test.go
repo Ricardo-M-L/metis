@@ -310,3 +310,133 @@ func TestTaskTools_FullPlanExecuteFlow(t *testing.T) {
 		}
 	}
 }
+
+// --- verifierNudge ---
+
+// TestTaskUpdate_VerifierNudge_Fires — when the 3rd implementation
+// task completes with no verify step among the closed tasks, the
+// TaskUpdate result MUST carry the NUDGE: line so the model sees
+// it on the same loop iteration.
+func TestTaskUpdate_VerifierNudge_Fires(t *testing.T) {
+	setupTaskTestEnv(t)
+	create := TaskCreate{gate: permission.New(permission.ModeBypass)}
+	for _, subj := range []string{"build parser", "build emitter", "build CLI"} {
+		_, err := create.Execute(context.Background(), map[string]any{
+			"subject": subj, "activeForm": subj,
+		})
+		if err != nil {
+			t.Fatalf("Create %q: %v", subj, err)
+		}
+	}
+	upd := TaskUpdate{gate: permission.New(permission.ModeBypass)}
+	for _, id := range []string{"1", "2", "3"} {
+		res, err := upd.Execute(context.Background(), map[string]any{
+			"taskId": id, "status": "completed",
+		})
+		if err != nil {
+			t.Fatalf("Update %s: %v", id, err)
+		}
+		if id == "3" {
+			if !strings.Contains(res.Output, "NUDGE:") {
+				t.Errorf("3rd completion should fire nudge; got: %q", res.Output)
+			}
+			if !strings.Contains(res.Output, "subagent_type: \"verify\"") {
+				t.Errorf("nudge should name the verify subagent_type; got: %q", res.Output)
+			}
+			if !strings.Contains(res.Output, "VERDICT:") {
+				t.Errorf("nudge should reference the verifier's VERDICT contract; got: %q", res.Output)
+			}
+		}
+	}
+}
+
+// TestTaskUpdate_VerifierNudge_SuppressedByVerifyTask — when one of
+// the tracked tasks is itself a verify step (subject contains
+// "verify"/"test"/"review"/etc.), the nudge stays silent: the
+// model has already planned the verification, no point nagging.
+func TestTaskUpdate_VerifierNudge_SuppressedByVerifyTask(t *testing.T) {
+	setupTaskTestEnv(t)
+	create := TaskCreate{gate: permission.New(permission.ModeBypass)}
+	subjects := []string{"build parser", "build emitter", "run test suite + verify"}
+	for _, s := range subjects {
+		if _, err := create.Execute(context.Background(), map[string]any{
+			"subject": s, "activeForm": s,
+		}); err != nil {
+			t.Fatalf("Create %q: %v", s, err)
+		}
+	}
+	upd := TaskUpdate{gate: permission.New(permission.ModeBypass)}
+	for _, id := range []string{"1", "2", "3"} {
+		res, err := upd.Execute(context.Background(), map[string]any{
+			"taskId": id, "status": "completed",
+		})
+		if err != nil {
+			t.Fatalf("Update %s: %v", id, err)
+		}
+		if strings.Contains(res.Output, "NUDGE:") {
+			t.Errorf("nudge should be silent when a verify task is tracked; got: %q", res.Output)
+		}
+	}
+}
+
+// TestTaskUpdate_VerifierNudge_QuietUnderThreshold — closing fewer
+// than 3 tasks should never fire the nudge. Cheap small task lists
+// are noise if every completion drags a NUDGE block.
+func TestTaskUpdate_VerifierNudge_QuietUnderThreshold(t *testing.T) {
+	setupTaskTestEnv(t)
+	create := TaskCreate{gate: permission.New(permission.ModeBypass)}
+	for _, s := range []string{"step a", "step b"} {
+		if _, err := create.Execute(context.Background(), map[string]any{
+			"subject": s, "activeForm": s,
+		}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	upd := TaskUpdate{gate: permission.New(permission.ModeBypass)}
+	for _, id := range []string{"1", "2"} {
+		res, err := upd.Execute(context.Background(), map[string]any{
+			"taskId": id, "status": "completed",
+		})
+		if err != nil {
+			t.Fatalf("Update %s: %v", id, err)
+		}
+		if strings.Contains(res.Output, "NUDGE:") {
+			t.Errorf("under-threshold completion should not nudge; got: %q", res.Output)
+		}
+	}
+}
+
+// TestTaskUpdate_VerifierNudge_OnlyFiresOnCompletion — patches that
+// change subject/owner without flipping status to completed must
+// not trip the heuristic.
+func TestTaskUpdate_VerifierNudge_OnlyFiresOnCompletion(t *testing.T) {
+	setupTaskTestEnv(t)
+	create := TaskCreate{gate: permission.New(permission.ModeBypass)}
+	for _, s := range []string{"a", "b", "c"} {
+		if _, err := create.Execute(context.Background(), map[string]any{
+			"subject": s, "activeForm": s,
+		}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	upd := TaskUpdate{gate: permission.New(permission.ModeBypass)}
+	// Mark 1 and 2 completed so the threshold *would* be met if we
+	// completed task 3. Instead, just rename task 3's subject.
+	for _, id := range []string{"1", "2"} {
+		_, err := upd.Execute(context.Background(), map[string]any{
+			"taskId": id, "status": "completed",
+		})
+		if err != nil {
+			t.Fatalf("Update %s: %v", id, err)
+		}
+	}
+	res, err := upd.Execute(context.Background(), map[string]any{
+		"taskId": "3", "subject": "renamed-only",
+	})
+	if err != nil {
+		t.Fatalf("Update 3: %v", err)
+	}
+	if strings.Contains(res.Output, "NUDGE:") {
+		t.Errorf("non-completion patch should not nudge; got: %q", res.Output)
+	}
+}
