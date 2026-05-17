@@ -253,6 +253,73 @@ func (c *Client) loadFromDisk() (Catalog, error) {
 	return cat, nil
 }
 
+// LookupContextWindowByModelID scans the in-memory catalog for any
+// provider that publishes a model with the given id and returns its
+// Limit.Context. ok=false when the cache hasn't been populated yet
+// (nobody called Get) or no provider lists this model.
+//
+// Synchronous + read-only — safe to call from provider.MaxContextTokens
+// hot paths. Never makes a network request; callers that need
+// fresh data must call Get explicitly before this.
+//
+// Model IDs in models.dev are globally unique enough that scanning
+// without a provider hint is fine (e.g. "deepseek-v4-pro" only
+// appears under the deepseek provider). The first hit wins; the only
+// realistic collision shape is a self-hosted re-publish of a hosted
+// model under a different provider name, which would carry the same
+// window anyway.
+func (c *Client) LookupContextWindowByModelID(modelID string) (int, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || modelID == "" {
+		return 0, false
+	}
+	for _, p := range c.cached {
+		if m, ok := p.Models[modelID]; ok && m.Limit.Context > 0 {
+			return m.Limit.Context, true
+		}
+	}
+	return 0, false
+}
+
+// defaultClient + defaultOnce wire a package-level singleton so the
+// provider.MaxContextTokens fast path can call catalog without each
+// provider package threading a *Client through its constructor. The
+// background warm-up fires on first Default() call; if it succeeds
+// LookupContextWindowByModelID starts answering with real numbers
+// within a few hundred ms of process start. If it fails (offline,
+// DNS hiccup), the lookup stays empty and providers fall through to
+// their hardcoded prefix tables — that's why hardcoded stays as the
+// belt to catalog's braces.
+var (
+	defaultClient *Client
+	defaultOnce   sync.Once
+)
+
+// Default returns the process-wide catalog client, kicking off a
+// background fetch on first call. Reuses the standard cache location
+// (~/.metis/cache/models.json). Returns nil if HOME is unset (CI
+// path); callers must nil-check.
+func Default() *Client {
+	defaultOnce.Do(func() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		defaultClient = NewClient(filepath.Join(home, ".metis"))
+		// Background warm-up. 8-second context cap so a hanging
+		// upstream doesn't leak a goroutine for hours; the eventual
+		// fetch failure is silent — callers see ok=false and fall
+		// through to the prefix table, which is fine.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			_, _ = defaultClient.Get(ctx)
+		}()
+	})
+	return defaultClient
+}
+
 // TransportHint maps the catalog's `npm` field to one of metis's
 // internal transport names. Every transport name here has a
 // corresponding case in runtime/provider.go's BuildProvider — keep

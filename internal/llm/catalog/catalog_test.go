@@ -241,3 +241,67 @@ func TestPersist_AtomicRename(t *testing.T) {
 		t.Error("cache content lost minimax key")
 	}
 }
+
+// TestLookupContextWindowByModelID_HitAfterFetch — after a successful
+// Get(), the synchronous lookup answers with the published window for
+// any model in the fixture. This is the path provider.MaxContextTokens
+// calls from its hot path without taking a network round-trip.
+func TestLookupContextWindowByModelID_HitAfterFetch(t *testing.T) {
+	srv := newServer(t, fixture)
+	defer srv.Close()
+	c := newClientFor(t, srv.URL)
+
+	// Warm the cache.
+	if _, err := c.Get(context.Background()); err != nil {
+		t.Fatalf("warm Get: %v", err)
+	}
+
+	// MiniMax model id → its published 192000 window.
+	if got, ok := c.LookupContextWindowByModelID("MiniMax-M2.7"); !ok || got != 192000 {
+		t.Errorf("MiniMax-M2.7: got (%d, %v), want (192000, true)", got, ok)
+	}
+	// DeepSeek model id → 65536 (the fixture's DeepSeek chat entry).
+	if got, ok := c.LookupContextWindowByModelID("deepseek-chat"); !ok || got != 65536 {
+		t.Errorf("deepseek-chat: got (%d, %v), want (65536, true)", got, ok)
+	}
+}
+
+// TestLookupContextWindowByModelID_MissBeforeFetch — without a prior
+// Get(), the in-memory cache is nil and lookup must return ok=false
+// rather than panic or block. This is the cold-start path where the
+// background warm-up hasn't completed yet — provider falls back to
+// its hardcoded prefix table, which is the documented contract.
+func TestLookupContextWindowByModelID_MissBeforeFetch(t *testing.T) {
+	c := newClientFor(t, "http://invalid")
+	if got, ok := c.LookupContextWindowByModelID("anything"); ok || got != 0 {
+		t.Errorf("cold cache: got (%d, %v), want (0, false)", got, ok)
+	}
+}
+
+// TestLookupContextWindowByModelID_MissOnUnknownModel — populated
+// cache, but the model id isn't in any provider. Must still cleanly
+// return ok=false so the provider falls through to prefix / *k
+// suffix parsing.
+func TestLookupContextWindowByModelID_MissOnUnknownModel(t *testing.T) {
+	srv := newServer(t, fixture)
+	defer srv.Close()
+	c := newClientFor(t, srv.URL)
+	_, _ = c.Get(context.Background())
+	if got, ok := c.LookupContextWindowByModelID("never-published-anywhere"); ok || got != 0 {
+		t.Errorf("unknown model: got (%d, %v), want (0, false)", got, ok)
+	}
+}
+
+// TestLookupContextWindowByModelID_EmptyIDIsNotABlankWildcard —
+// passing "" must NOT match the first provider's first model (would
+// cause silent wrong-context-window when a misconfigured provider
+// reports an empty Model name on streaming responses).
+func TestLookupContextWindowByModelID_EmptyIDIsNotABlankWildcard(t *testing.T) {
+	srv := newServer(t, fixture)
+	defer srv.Close()
+	c := newClientFor(t, srv.URL)
+	_, _ = c.Get(context.Background())
+	if got, ok := c.LookupContextWindowByModelID(""); ok {
+		t.Errorf("empty id should miss; got (%d, %v)", got, ok)
+	}
+}
