@@ -179,6 +179,30 @@ func TestMetisInfo_ModelSection(t *testing.T) {
 	}
 }
 
+func TestMetisInfo_CatalogSection_LoadedShape(t *testing.T) {
+	// When the catalog singleton has loaded (the common run-time
+	// path), the [catalog] section must surface at least: loaded
+	// flag, provider/model counts, and the cache file path. We
+	// don't pin specific counts — models.dev grows over time —
+	// only that the keys exist so the LLM can parse them. Test
+	// runs in the same package as other tests that touch the
+	// singleton so by the time this runs, Default() has likely
+	// fired; we just verify the rendered shape is sane.
+	tool := NewMetisInfo(nil, nil, nil, nil, nil)
+	res, _ := tool.Execute(context.Background(), map[string]any{"section": "catalog"})
+	// Catalog section appears iff catalog.Default() returned non-nil;
+	// when it did, the loaded-flag line is mandatory. If singleton
+	// was nil-pinned by an earlier METIS_CATALOG_DISABLE, the section
+	// vanishes entirely — both shapes are acceptable.
+	if strings.Contains(res.Output, "[catalog]") {
+		for _, want := range []string{"loaded =", "cache_path ="} {
+			if !strings.Contains(res.Output, want) {
+				t.Errorf("[catalog] section missing key %q\n---\n%s", want, res.Output)
+			}
+		}
+	}
+}
+
 func TestMetisInfo_ModelSection_NilProviderHidden(t *testing.T) {
 	// `metis tools` listing path constructs MetisInfo without a live
 	// provider. The [model] section must vanish rather than render as

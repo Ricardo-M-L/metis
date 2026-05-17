@@ -10,6 +10,8 @@ package main
 //   metis models                 list providers (id, name, transport-hint, model count)
 //   metis models <provider>      list that provider's models with context window + cost
 //   metis models <provider> <id> deep-dive on one model (capabilities + cost breakdown)
+//   metis models status          cache freshness + coverage; debug "is catalog warm?"
+//   metis models status <id>     same, plus every catalog row matching <id>
 //   metis models --refresh       force a network refresh of the cache
 
 import (
@@ -48,6 +50,13 @@ func cmdModels(ctx context.Context, args []string) error {
 		}
 	}
 
+	// `status` subcommand handles its own catalog load — it must work
+	// when the catalog itself is broken (network down + empty cache),
+	// which is exactly the case `status` exists to surface.
+	if len(rest) >= 1 && rest[0] == "status" {
+		return printCatalogStatus(ctx, client, rest[1:])
+	}
+
 	cat, err := client.Get(ctx)
 	if err != nil {
 		return fmt.Errorf("models: %w", err)
@@ -61,8 +70,66 @@ func cmdModels(ctx context.Context, args []string) error {
 	case 2:
 		return printModelDetail(cat, rest[0], rest[1])
 	default:
-		return fmt.Errorf("usage: metis models [<provider> [<model>]] [--refresh]")
+		return fmt.Errorf("usage: metis models [<provider> [<model>]] [--refresh] | metis models status [<model-id>]")
 	}
+}
+
+// printCatalogStatus dumps cache freshness + coverage, optionally
+// followed by every catalog row matching a model id. Built so the
+// user can answer "is my GLM-5.1 reading coming from catalog or a
+// hardcoded fallback?" without grepping ~/.metis/cache/models.json
+// or reading code.
+//
+// Uses Stat() (no I/O) rather than Get() so it works even when the
+// network is down + cache is empty — which is exactly when the user
+// needs to know.
+func printCatalogStatus(ctx context.Context, client *catalog.Client, args []string) error {
+	// Best-effort load so Stat sees in-memory state. Ignore errors —
+	// Stat will surface empty/loaded=false if the load failed.
+	loadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, _ = client.Get(loadCtx)
+
+	st := client.Stat()
+	fmt.Printf("Cache path     : %s\n", st.CachePath)
+	if st.CacheBytes > 0 {
+		fmt.Printf("Cache size     : %d bytes\n", st.CacheBytes)
+	}
+	if !st.CacheModTime.IsZero() {
+		age := time.Since(st.CacheModTime)
+		fmt.Printf("Cache mtime    : %s (%s ago)\n",
+			st.CacheModTime.Format(time.RFC3339),
+			age.Round(time.Minute))
+	} else {
+		fmt.Println("Cache mtime    : (no on-disk cache yet — try `metis models --refresh`)")
+	}
+	fmt.Printf("In-memory      : loaded=%v providers=%d models=%d\n",
+		st.InMemory, st.ProviderCount, st.ModelCount)
+	fmt.Printf("Source URL     : %s\n", catalog.DefaultURL)
+	fmt.Printf("Default TTL    : %s\n", catalog.DefaultTTL)
+
+	if len(args) == 0 {
+		return nil
+	}
+	if len(args) > 1 {
+		return fmt.Errorf("usage: metis models status [<model-id>]")
+	}
+	modelID := args[0]
+	hits := client.LookupModel(modelID)
+	fmt.Println()
+	if len(hits) == 0 {
+		fmt.Printf("Lookup %q: no matches. metis will fall back to suffix/prefix tables.\n", modelID)
+		fmt.Println("  (Try `metis models --refresh` if you expect this model to be in models.dev.)")
+		return nil
+	}
+	fmt.Printf("Lookup %q: %d catalog row(s)\n", modelID, len(hits))
+	for _, h := range hits {
+		fmt.Printf("  %s/%s — context=%d output=%d tool=%v reasoning=%v\n",
+			h.ProviderID, h.Model.ID,
+			h.Model.Limit.Context, h.Model.Limit.Output,
+			h.Model.ToolCall, h.Model.Reasoning)
+	}
+	return nil
 }
 
 func printProviderList(cat catalog.Catalog) error {

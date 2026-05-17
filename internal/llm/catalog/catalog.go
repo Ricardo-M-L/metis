@@ -282,6 +282,73 @@ func (c *Client) LookupContextWindowByModelID(modelID string) (int, bool) {
 	return 0, false
 }
 
+// Stat is a point-in-time snapshot of the catalog's freshness +
+// coverage, surfaced via MetisInfo's [catalog] section + the
+// `metis models status` CLI. Lets the model self-check "did catalog
+// warm-up succeed yet?" without forcing the synchronous Get() path.
+type Stat struct {
+	CachePath       string    // ~/.metis/cache/models.json (empty if no disk cache resolved)
+	CacheBytes      int64     // size on disk; 0 if missing
+	CacheModTime    time.Time // mtime; zero if missing
+	InMemory        bool      // true once Default()'s warm-up populated c.cached
+	LoadedAt        time.Time // when the in-memory copy was loaded; zero if still empty
+	ProviderCount   int       // providers in the loaded snapshot
+	ModelCount      int       // total model entries across all providers
+}
+
+// Stat returns a freshness + coverage snapshot. Read-only; safe to
+// call from any goroutine, never makes a network request.
+func (c *Client) Stat() Stat {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := Stat{
+		CachePath: c.CachePath,
+		LoadedAt:  c.loadedT,
+		InMemory:  c.cached != nil,
+	}
+	if fi, err := os.Stat(c.CachePath); err == nil {
+		out.CacheBytes = fi.Size()
+		out.CacheModTime = fi.ModTime()
+	}
+	if c.cached != nil {
+		out.ProviderCount = len(c.cached)
+		for _, p := range c.cached {
+			out.ModelCount += len(p.Models)
+		}
+	}
+	return out
+}
+
+// ModelLocation pairs a provider id with the matching model entry so
+// callers can answer "where in the catalog does model X live, and
+// what does it claim about itself?". Used by `metis models status
+// <model-id>` to surface every catalog row matching the user's id.
+type ModelLocation struct {
+	ProviderID string
+	Model      Model
+}
+
+// LookupModel returns every catalog entry for the given model id —
+// multiple hits happen when the same model is re-published under a
+// regional / proxy provider (e.g. a model appearing under both
+// `zai` and `zhipuai`). Returns nil if nothing matches OR if the
+// in-memory catalog hasn't loaded yet.
+func (c *Client) LookupModel(modelID string) []ModelLocation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || modelID == "" {
+		return nil
+	}
+	var hits []ModelLocation
+	for pid, p := range c.cached {
+		if m, ok := p.Models[modelID]; ok {
+			m.ID = modelID
+			hits = append(hits, ModelLocation{ProviderID: pid, Model: m})
+		}
+	}
+	return hits
+}
+
 // defaultClient + defaultOnce wire a package-level singleton so the
 // provider.MaxContextTokens fast path can call catalog without each
 // provider package threading a *Client through its constructor. The

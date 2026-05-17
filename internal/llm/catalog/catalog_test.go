@@ -305,3 +305,75 @@ func TestLookupContextWindowByModelID_EmptyIDIsNotABlankWildcard(t *testing.T) {
 		t.Errorf("empty id should miss; got (%d, %v)", got, ok)
 	}
 }
+
+// TestStat_AfterFetch — Stat() reports populated in-memory state
+// plus on-disk cache stat. Pins the contract MetisInfo + `metis
+// models status` rely on for surface tier-of-truth.
+func TestStat_AfterFetch(t *testing.T) {
+	srv := newServer(t, fixture)
+	defer srv.Close()
+	c := newClientFor(t, srv.URL)
+	if _, err := c.Get(context.Background()); err != nil {
+		t.Fatalf("warm Get: %v", err)
+	}
+
+	st := c.Stat()
+	if !st.InMemory {
+		t.Errorf("Stat.InMemory should be true after Get; got false")
+	}
+	if st.ProviderCount != 2 {
+		t.Errorf("Stat.ProviderCount = %d; want 2 (fixture has minimax + deepseek)", st.ProviderCount)
+	}
+	if st.ModelCount != 2 {
+		t.Errorf("Stat.ModelCount = %d; want 2 (1 minimax + 1 deepseek)", st.ModelCount)
+	}
+	if st.CacheBytes == 0 {
+		t.Errorf("Stat.CacheBytes should reflect persisted cache size; got 0")
+	}
+	if st.CacheModTime.IsZero() {
+		t.Errorf("Stat.CacheModTime should be set after persist; got zero")
+	}
+}
+
+// TestStat_BeforeFetch — never-loaded client reports empty Stat
+// rather than panicking. This is the cold-start path MetisInfo
+// hits when the background warm-up hasn't completed yet.
+func TestStat_BeforeFetch(t *testing.T) {
+	c := newClientFor(t, "http://invalid")
+	st := c.Stat()
+	if st.InMemory {
+		t.Errorf("cold client: InMemory should be false; got true")
+	}
+	if st.ProviderCount != 0 || st.ModelCount != 0 {
+		t.Errorf("cold client counts should be zero; got providers=%d models=%d", st.ProviderCount, st.ModelCount)
+	}
+}
+
+// TestLookupModel_MultiProviderHit — when the same model id is
+// published under multiple providers (mirror / re-publish path),
+// LookupModel must return all of them. Single-hit case is covered
+// by the existing LookupContextWindowByModelID test family.
+func TestLookupModel_AllHits(t *testing.T) {
+	srv := newServer(t, fixture)
+	defer srv.Close()
+	c := newClientFor(t, srv.URL)
+	_, _ = c.Get(context.Background())
+
+	hits := c.LookupModel("MiniMax-M2.7")
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit for MiniMax-M2.7; got %d", len(hits))
+	}
+	if hits[0].ProviderID != "minimax" {
+		t.Errorf("hit provider = %q; want minimax", hits[0].ProviderID)
+	}
+	if hits[0].Model.Limit.Context != 192000 {
+		t.Errorf("hit context = %d; want 192000", hits[0].Model.Limit.Context)
+	}
+
+	if got := c.LookupModel("never-published"); got != nil {
+		t.Errorf("unknown id should return nil; got %+v", got)
+	}
+	if got := c.LookupModel(""); got != nil {
+		t.Errorf("empty id should return nil; got %+v", got)
+	}
+}

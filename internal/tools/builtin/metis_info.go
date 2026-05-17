@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -89,7 +91,7 @@ func (m MetisInfo) WithModel(p llm.Provider, modelID string) MetisInfo {
 
 func (MetisInfo) Name() string { return "MetisInfo" }
 func (MetisInfo) Description() string {
-	return "Introspection: dump effective config, active model + context window, providers, MCP servers, skills, hooks, permission mode, registered tools, and live background jobs as INI sections. Call when debugging \"why isn't tool X / skill Y / MCP Z working?\" or \"what's my effective context limit on this model?\"."
+	return "Introspection: dump effective config, active model + context window, catalog freshness, providers, MCP servers, skills, hooks, permission mode, registered tools, and live background jobs as INI sections. Call when debugging \"why isn't tool X / skill Y / MCP Z working?\", \"what's my effective context limit on this model?\", or \"is my context window coming from catalog or a hardcoded fallback?\"."
 }
 
 func (MetisInfo) InputSchema() map[string]any {
@@ -98,7 +100,7 @@ func (MetisInfo) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"section": map[string]any{
 				"type":        "string",
-				"description": "Optional section filter — one of: model, providers, mcp, skills, tools, hooks, permission, jobs, options. Omit to dump everything.",
+				"description": "Optional section filter — one of: model, catalog, providers, mcp, skills, tools, hooks, permission, jobs, options. Omit to dump everything.",
 			},
 		},
 	}
@@ -112,7 +114,7 @@ func (m MetisInfo) CanUse(_ context.Context, _ map[string]any) (tools.Permission
 	return tools.PermissionAllow, "metis-info: read-only introspection, always allowed"
 }
 
-func (m MetisInfo) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (m MetisInfo) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	section, _ := in["section"].(string)
 	section = strings.ToLower(strings.TrimSpace(section))
 
@@ -124,6 +126,9 @@ func (m MetisInfo) Execute(_ context.Context, in map[string]any) (*tools.Result,
 	}
 	if want("model") {
 		m.writeModel(&b)
+	}
+	if want("catalog") {
+		m.writeCatalog(ctx, &b)
 	}
 	if want("providers") {
 		m.writeProviders(&b)
@@ -206,6 +211,84 @@ func (m MetisInfo) writeModel(b *strings.Builder) {
 		fmt.Fprintf(b, "id = %s\n", m.model)
 	}
 	fmt.Fprintf(b, "context_window = %d\n", m.provider.MaxContextTokens())
+	fmt.Fprintln(b)
+}
+
+// writeCatalog surfaces models.dev catalog freshness + coverage so
+// the LLM can self-diagnose "did metis fall back to the prefix table
+// because catalog has me, or because I'm not in catalog at all?".
+// Pairs with [model]: if catalog reports the current model with a
+// window equal to model.context_window, the active value came from
+// catalog (tier 2); if catalog reports a different value, an
+// override or the prefix table is in play.
+//
+// Skipped when the catalog singleton wasn't constructed (HOME unset
+// or METIS_CATALOG_DISABLE=1 path) so chat in CI env stays quiet.
+func (m MetisInfo) writeCatalog(ctx context.Context, b *strings.Builder) {
+	cli := catalog.Default()
+	if cli == nil {
+		return
+	}
+	// Block briefly waiting for the warm-up. Without this, calling
+	// MetisInfo immediately after metis chat startup hits a race:
+	// Default() spawns the warm-up goroutine then returns, the
+	// Stat()/Lookup() reads run microseconds later and see nil
+	// cached. With a 2s deadline the synchronous Get() either
+	// completes the fetch (cold cache + network OK) or piggybacks
+	// on the warm-up goroutine's lock — either way LookupModel/Stat
+	// downstream observe populated state. If 2s isn't enough (very
+	// slow network) we still render the section, just with
+	// loaded=false, so the user sees the in-flight state.
+	loadCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, _ = cli.Get(loadCtx)
+	// Read order matters: the warm-up goroutine moves cached from
+	// nil → populated exactly once. If we call Stat() first and
+	// LookupModel() second, a race window opens where Stat reports
+	// loaded=false but the immediately-following LookupModel sees
+	// populated cache. Swapping the order — LookupModel first,
+	// Stat second — guarantees Stat observes at least as much state
+	// as LookupModel saw, so a non-empty hits list is never paired
+	// with loaded=false.
+	var hits []catalog.ModelLocation
+	if m.model != "" {
+		hits = cli.LookupModel(m.model)
+	}
+	st := cli.Stat()
+	fmt.Fprintln(b, "[catalog]")
+	if st.InMemory {
+		fmt.Fprintln(b, "loaded = true")
+		fmt.Fprintf(b, "providers = %d\n", st.ProviderCount)
+		fmt.Fprintf(b, "models = %d\n", st.ModelCount)
+	} else {
+		// Warm-up still in flight or failed silently. Telling the
+		// model "loaded = false" lets it understand why a catalog
+		// lookup for its own id won't have answered yet.
+		fmt.Fprintln(b, "loaded = false")
+	}
+	if !st.CacheModTime.IsZero() {
+		fmt.Fprintf(b, "cache_path = %s\n", st.CachePath)
+		fmt.Fprintf(b, "cache_bytes = %d\n", st.CacheBytes)
+		fmt.Fprintf(b, "cache_age_minutes = %d\n", int(time.Since(st.CacheModTime).Minutes()))
+	}
+	// Cross-check the active model against catalog. The whole point of
+	// surfacing this is to make tier-of-truth visible: if catalog
+	// reports a different window than [model] shows, an override is
+	// silently winning and the user probably wants to know.
+	if m.model != "" {
+		if len(hits) == 0 {
+			fmt.Fprintf(b, "active_model_in_catalog = false\n")
+		} else {
+			fmt.Fprintf(b, "active_model_in_catalog = true\n")
+			// One row per provider hit so the model can see which
+			// re-publish path (zai vs zhipuai vs deepseek vs ...) is
+			// providing the number, and what each one claims.
+			for _, h := range hits {
+				fmt.Fprintf(b, "catalog_hit = %s/%s, context=%d, output=%d\n",
+					h.ProviderID, h.Model.ID, h.Model.Limit.Context, h.Model.Limit.Output)
+			}
+		}
+	}
 	fmt.Fprintln(b)
 }
 
