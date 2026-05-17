@@ -50,7 +50,13 @@ var iterNudges = []iterNudgeThreshold{
 		body: "You're at 90% of your iteration budget. Pick the single most " +
 			"important remaining task and finish it now. Then write " +
 			"the final answer for the user — even a one-line summary " +
-			"is better than running out of budget mid-investigation.",
+			"is better than running out of budget mid-investigation.\n\n" +
+			"If substantial work still remains, your better option is to " +
+			"dispatch it: `Agent({subagent_type: \"plan\", prompt: \"<the " +
+			"remaining work in one paragraph>\"})` returns a fresh iter " +
+			"budget AND a stepped plan you can hand to implementer agents. " +
+			"Single-threading the last 10% guarantees the failure mode " +
+			"where you stop mid-task with nothing checked in — fan out instead.",
 	},
 }
 

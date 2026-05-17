@@ -816,7 +816,22 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			}
 			stopReason = "max_iterations"
 			l.Hooks.EmitLoopEnd(ctx, tc, "max_iterations")
-			emit(ctx, out, Event{Kind: EventInfo, Info: fmt.Sprintf("budget exhausted (%d iters, %d grace + 1 final-summary rescue used)", l.MaxIters, l.GraceCalls)})
+			// User-facing exhaustion note. The "next time" suggestion
+			// points at the dispatch contract — without it users keep
+			// running the same single-threaded prompt and hitting the
+			// same cap. Fan-out is the only real escape on this size
+			// of task.
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf(
+					"budget exhausted (%d iters, %d grace + 1 final-summary rescue used). "+
+						"Next time for tasks this size: open with `Agent({subagent_type: \"plan\", "+
+						"prompt: \"...\"})` to get a stepped breakdown, then fan out implementer "+
+						"agents and a `verify` agent — each subagent gets its own iter budget so "+
+						"the main thread doesn't run out mid-work.",
+					l.MaxIters, l.GraceCalls,
+				),
+			})
 			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "max_iterations"})
 			return nil
 		}
