@@ -239,6 +239,12 @@ type Loop struct {
 	// the prior ToolSearch tool_result is still in l.Messages.
 	discoveredMCP         map[string]bool
 	discoveredMCPHydrated bool
+
+	// contract enforces the dispatch contract at the loop level —
+	// see contract.go. Per-loop state (counters reset on Loop.Reset);
+	// gates mid-turn reminder + end-of-turn block when the model has
+	// done substantial work without spawning a verify subagent.
+	contract contractTracker
 }
 
 func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegistry, system string, maxIter int) *Loop {
@@ -384,6 +390,7 @@ func (l *Loop) Reset() {
 	l.turnIdx = 0
 	l.iterIdx = 0
 	l.compactCircuitNoticeSent = false
+	l.contract.reset()
 	if l.Compactor != nil {
 		l.Compactor.ResetCircuit()
 	}
@@ -617,6 +624,35 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				continue
 			}
 
+			// Dispatch-contract end-of-turn gate. See contract.go for
+			// the trigger logic; runs after the empty-stop rescue so
+			// the two don't race on the same turn. When the gate fires,
+			// inject the reminder as a user message and continue the
+			// loop instead of ending — the model gets another turn to
+			// either spawn the verifier or write OVERRIDE CONTRACT:.
+			if body := l.contract.shouldGateEnd(assistantText(assistant)); body != "" {
+				l.mu.Lock()
+				l.Messages = append(l.Messages, llm.Message{
+					Role:    llm.RoleUser,
+					Content: []llm.ContentBlock{{Type: "text", Text: body}},
+				})
+				l.mu.Unlock()
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: "(contract gate: forced re-entry to spawn verify; model can override by writing OVERRIDE CONTRACT: <reason>)",
+				})
+				continue
+			}
+			// Override was used — log it once before releasing so the
+			// user sees the audit trail in the event stream rather
+			// than a silent release.
+			if l.contract.wasOverridden(assistantText(assistant)) && l.contract.thresholdMet() && !l.contract.verifyDispatched {
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: "(contract override: model explicitly bypassed the verify gate)",
+				})
+			}
+
 			stopReason = stop
 			// Reset per-tool counters so the next user turn starts clean —
 			// otherwise `Read x5 → end_turn → Read x5` looks like 10 consecutive Reads.
@@ -635,6 +671,26 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		}
 
 		toolUses := filterToolUses(assistant)
+		// Dispatch-contract observation + mid-turn reminder. Count
+		// the batch the model just emitted (Write/Edit/MultiEdit/
+		// Agent), and if the threshold just crossed without a verify
+		// dispatch, inject a one-time heads-up reminder so the model
+		// can plan the verify step before it tries to end. The
+		// reminder appears as a user message in the next iteration's
+		// request — the model sees it on the very next turn.
+		l.contract.observeToolUses(toolUses)
+		if body := l.contract.shouldFireMidTurnReminder(); body != "" {
+			l.mu.Lock()
+			l.Messages = append(l.Messages, llm.Message{
+				Role:    llm.RoleUser,
+				Content: []llm.ContentBlock{{Type: "text", Text: body}},
+			})
+			l.mu.Unlock()
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: "(contract reminder: substantial work in flight — plan for a verify subagent before claiming done)",
+			})
+		}
 		if len(toolUses) == 0 {
 			stopReason = "no_tool_calls"
 			l.Hooks.EmitLoopEnd(ctx, tc, "no_tool_calls")
