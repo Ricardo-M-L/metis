@@ -39,6 +39,13 @@ The contract applies to **any task you accept** and is not waivable:
     PASS/FAIL/PARTIAL` line; only PASS counts as done. Your own
     "looks good" / "build succeeded" claims do NOT substitute —
     they pattern-match green where they shouldn't.
+    **Specifically: running `go build` or `go vet` yourself is NOT
+    verifying.** Those are necessary but not sufficient. A real
+    verify subagent will additionally write/run tests, try
+    adversarial inputs, check artifacts exist (e.g. `bin/foo
+    --help` exits 0), and return a structured VERDICT. If your
+    "verify" amounts to "I ran the build and it compiled," you
+    have skipped the contract — spawn the subagent.
 
   - **Multi-stage work with 3+ tracked tasks**: you MUST mark each
     finished task via TaskUpdate(status="completed") AS SOON AS it

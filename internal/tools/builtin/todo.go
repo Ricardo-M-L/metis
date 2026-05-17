@@ -79,7 +79,73 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 		icon = "◐"
 	}
 	prioIcon := map[string]string{"high": "🔴", "medium": "🟡", "low": "🟢"}[saved.Priority]
-	return &tools.Result{Output: fmt.Sprintf("%s %s [%s] %s", icon, prioIcon, saved.ID, saved.Content)}, nil
+	out := fmt.Sprintf("%s %s [%s] %s", icon, prioIcon, saved.ID, saved.Content)
+	if nudge := todoVerifierNudge(saved.Status); nudge != "" {
+		out += "\n\n" + nudge
+	}
+	return &tools.Result{Output: out}, nil
+}
+
+// todoVerifierNudge mirrors the TaskUpdate nudge in task.go but reads
+// the lightweight `tasks` (TodoWrite) store instead of the structured
+// TaskStore. The first claude-code-go-port test run (2026-05-17)
+// showed the model preferring TodoWrite over TaskCreate, which
+// completely bypassed the original TaskUpdate nudge — model finished
+// Phase 1 (19 Go files, 2503 LOC, build/vet pass) and STOPPED there,
+// because it interpreted "verify" as "I ran go build" rather than
+// "spawn the verify subagent". Putting the nudge here closes the
+// loop: whichever task store the model uses, hitting 3+ completed
+// with no verify step triggers the same advisory text in the tool
+// result.
+//
+// Heuristic for "verify step": item content contains
+// verify/test/review/vet/lint/audit (case-insensitive). Cheaper
+// than the TaskStore version since `tasks.Item` has no separate
+// owner field.
+func todoVerifierNudge(justSetStatus string) string {
+	if justSetStatus != "completed" {
+		return ""
+	}
+	tl, err := tasks.Load(tasks.CurrentSessionID())
+	if err != nil || tl == nil {
+		return ""
+	}
+	completed := 0
+	hasVerify := false
+	for _, it := range tl.Items {
+		if isVerifyTodoContent(it.Content) {
+			hasVerify = true
+		}
+		if it.Status == "completed" {
+			completed++
+		}
+	}
+	if completed < 3 || hasVerify {
+		return ""
+	}
+	return "NUDGE: you just closed a third TodoWrite item and none of the\n" +
+		"tracked items is a verify/test/review step. Per the dispatch\n" +
+		"contract: before claiming this work done, spawn a real verifier:\n" +
+		"`Agent({subagent_type: \"verify\", prompt: \"<what to check + the\n" +
+		"VERDICT line you expect back>\"})`. Running `go build` yourself\n" +
+		"is NOT verifying — only the verify subagent issues a VERDICT.\n" +
+		"Your own \"build succeeded\" / \"looks good\" notes do NOT count.\n" +
+		"If you skip this and stop here, the user gets a project with\n" +
+		"zero tests, no git history, and no built binary — which is\n" +
+		"exactly the failure mode the contract exists to prevent."
+}
+
+// isVerifyTodoContent — substring scan for verify-related keywords in
+// a TodoWrite item's free-text content. Symmetric with task.go's
+// isVerifyTask but operates on Content rather than Subject+Owner.
+func isVerifyTodoContent(content string) bool {
+	lc := strings.ToLower(content)
+	for _, kw := range []string{"verify", "test", "review", "vet", "lint", "audit"} {
+		if strings.Contains(lc, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // TodoRead lists every task in the current session's list. Pairs with
