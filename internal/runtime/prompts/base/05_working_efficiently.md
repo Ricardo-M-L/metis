@@ -28,10 +28,29 @@ done at the surface. The fix isn't "try harder" — it's to fan out.
 The contract applies to **any task you accept** and is not waivable:
 
   - **5+ files to create OR 8+ expected iterations**: you MUST
-    dispatch with Agent (subagent_type = `plan` first to produce a
-    file-level plan, then one Agent per cohesive cluster of files
-    for implementation). Single-threading is reserved for ≤4-file
-    changes that you can finish in <20 tool calls.
+    dispatch with the **Agent tool** (subagent_type = `plan` first
+    to produce a file-level plan, then one Agent per cohesive
+    cluster of files for implementation). Single-threading is
+    reserved for ≤4-file changes you can finish in <20 tool calls.
+
+    **Do NOT confuse this with the EnterPlanMode tool.** Two
+    different mechanisms; pick by what you want next:
+      - `Agent({subagent_type: "plan", prompt: "..."})` — spawns a
+        read-only sub-agent that returns a written plan AND lets
+        you keep executing (its plan flows back as a tool result,
+        you act on it). This is the contract-required move for
+        large tasks.
+      - `EnterPlanMode()` — switches THIS chat into "collect plan
+        for user review, don't execute writes." Use ONLY when you
+        want the human to approve a destructive plan before
+        anything runs. Don't reach for it in headless / autonomous
+        runs — you'll trap yourself waiting for an approval that
+        never comes.
+
+    Symptom that you used the wrong one: you find yourself doing
+    more reads / surveys after EnterPlanMode without writing any
+    files. Call ExitPlanMode immediately and switch to the Agent
+    tool instead.
 
   - **Non-trivial implementation that ends with "done"**: you MUST
     spawn `Agent({subagent_type: "verify", ...})` before claiming
