@@ -17,6 +17,7 @@ package tui
 //     without dominating the screen.
 
 import (
+	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,43 +27,82 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
-// metisOwlGlyphLines is the hand-crafted Unicode block-art owl —
-// 13 cells wide × 8 rows tall, every char placed deliberately.
-// Reproportioned 2026-05-11 (image #3 user feedback): the previous
-// 17×9 layout dominated the welcome card vertically; the user asked
-// for "整体比例小点" — same silhouette, scaled down ~40%, so the
-// sigil reads as a wordmark anchor rather than a hero illustration.
+// metisOwlGlyphLines is the metis owl banner — an 18-char × 7-row
+// Braille (U+2800-U+28FF) bitmap derived from the user's reference
+// image (#29). Generated via tools/img2braille:
 //
-// At this glyph density the owl-ness is carried by deliberate
-// silhouette: pointed ear tufts (▟▙), round dome head, V-beak,
-// spread wings, taloned feet. Eyes (●) are repainted cyan in
-// renderWelcomeBanner for contrast.
+//	go run ./tools/img2braille \
+//	    -in owl.png -w 18 -h 7 -threshold 110 \
+//	    -crop 540,140,910,800 -quoted
 //
-// Going finer than this requires either:
-//   - Real PNG via iTerm2 inline image protocol — blocked by
-//     bubbletea v2's ultraviolet renderer truncating large OSC
-//     payloads (would require a fork of the renderer).
-//   - Algorithmic image-to-glyph conversion (chafa) — produces
-//     noisy fragments at 17×8 / 24×14 cell sizes because the
-//     source PNG's gradients/details have no clean mapping.
+// Each Braille char carries 8 dot positions (2×4) — virtual resolution
+// at this banner size is 36×28 pixels. Compact 2.6:1 aspect ratio
+// (2026-05-16 user pick after iterating 24×14 → 18×10 → 30×7 →
+// settling on this size as "稍宽,特征最清晰"): the silhouette stays
+// legible, the wing spread is recognizable, and the banner only eats
+// 7 rows so the first chat turn lands above the fold on a standard
+// terminal. Hermes-agent's caduceus is 15-row-tall for comparison —
+// metis goes half as tall to keep the welcome card from dominating
+// first impressions the way hermes's does.
 var metisOwlGlyphLines = []string{
-	"  ▟▙     ▟▙  ",
-	" ▄█▀▀▀▀▀▀▀█▄ ",
-	"▐█  ●   ●  █▌",
-	"▐█   ╲ ╱   █▌",
-	" ▀█▄▄▄▄▄▄▄█▀ ",
-	"▟██▙▄▄▄▄▄▟██▙",
-	"▐██▌     ▐██▌",
-	" ▀▀       ▀▀ ",
+	"⠀⠀⢳⣦⣤⣖⡋⠩⡽⠯⡏⢙⣓⣤⣤⣞⠀⠀",
+	"⠀⠀⢈⡍⣁⢙⡛⠷⡖⢠⠾⢛⡛⣈⣩⡁⠀⠀",
+	"⠀⠀⠈⣇⠁⣠⣅⠀⣈⣈⡀⣨⣥⠘⢹⠃⠀⠀",
+	"⣤⢤⣤⣬⡓⠲⠖⠊⠘⡏⠙⠒⠷⢚⣧⣤⡤⣤",
+	"⠿⡷⢜⠓⠭⠹⠏⢻⣦⣴⣟⠻⢫⠭⠲⡫⢼⡿",
+	"⠀⠈⡱⢫⠟⠞⢀⠩⠛⠟⠌⡀⠰⠙⠝⢯⡁⠀",
+	"⠀⠀⠀⠤⠐⠀⣈⢅⢈⡃⣀⣅⠀⠔⠐⠤⠀⠀",
 }
 
-// Eye-position cyan accent — row + col indices in metisOwlGlyphLines.
-// Updated 2026-05-11 with the scaled-down 13×8 layout.
-const (
-	owlEyeRow  = 2
-	owlEyeColL = 4
-	owlEyeColR = 8
-)
+// Eye-row index — the row that holds the owl's eye ring. The
+// renderer paints this row in cyan (#00D5E5) to echo the "glowing
+// iris" detail in image #29. In the 18×7 layout the eye ring sits
+// at row 2 (forehead → eye band → cheek), right above the wing-
+// spread midline at row 3.
+const owlEyeRow = 2
+
+// owlRowColor returns the foreground color for row i of the owl
+// banner — colors picked by anatomical part, not a linear silver
+// gradient, so the banner reads as a real owl rather than a
+// monochrome silhouette.
+//
+// Palette borrows from both Athena's mythological iconography
+// (owl, olive branch, golden helmet) and image #29's metallic
+// silver-with-cyan-accent aesthetic. Mapping for the 18×7 layout:
+//
+//	0  ear tufts + crown   #F2D27A  warm amber-gold (raptor highlights)
+//	1  brow / forehead     #E0E8F0  ice silver
+//	2  eye band            #00D5E5  cyan iris (Athena's "lit" gaze)
+//	3  wing-spread bar     #B8C4DC  silver-blue (midline outline)
+//	4  wing feathers       #8090B8  steel-blue
+//	5  wing tips           #5C6F8E  dim steel
+//	6  talons + olive      #88A056  olive green (Athena's olive branch)
+//
+// Saturated colors are reserved for the visual "anchor" rows
+// (ear tufts, eyes, olive branch) — the surrounding silver/
+// steel-blue stays close to neutral so the highlights pop without
+// the whole banner reading as a clown wash. Bumped saturation on
+// the amber/cyan/olive versus prior passes to defeat the "all
+// looks white" perception users got when half the rows used pale
+// tints that 256-color terminals quantized to bright_white.
+func owlRowColor(i int) color.Color {
+	switch i {
+	case 0:
+		return lipgloss.Color("#F2D27A") // amber-gold ear tufts + crown
+	case 1:
+		return lipgloss.Color("#E0E8F0") // ice-silver brow
+	case owlEyeRow:
+		return lipgloss.Color("#00D5E5") // cyan iris
+	case 3:
+		return lipgloss.Color("#B8C4DC") // silver-blue wing-spread bar
+	case 4:
+		return lipgloss.Color("#8090B8") // steel-blue wing feathers
+	case 5:
+		return lipgloss.Color("#5C6F8E") // dim steel wing tips
+	default:
+		return lipgloss.Color("#88A056") // olive-green talons + branch
+	}
+}
 
 // renderWelcomeBanner paints the bordered, centered welcome card we
 // show on a fresh session — and again as the first scrollable item
@@ -91,23 +131,21 @@ func (m *Model) renderWelcomeBannerCard(showHint bool) string {
 	labelStyle := lipgloss.NewStyle().Foreground(textMuted)
 	valueStyle := lipgloss.NewStyle().Foreground(textPrimary)
 
-	// Owl glyph painted in two passes: silver body + cyan-glowing eyes.
-	silverStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#C0C8D8")).Bold(true)
-	eyeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#00D5E5")).Bold(true)
+	// Owl glyph painted in per-row color tiers — matches the silver-
+	// with-cyan-accent aesthetic of image #29. Hermes uses the same
+	// trick on its caduceus banner (per-row Rich [#hex] markup):
+	// dividing the silhouette into bands gives a "lit from above"
+	// feel that's much more visually rich than a single-color paint
+	// at the same character cost. Band mapping lives in owlRowColor
+	// next to the glyph data so the palette + layout stay in sync.
+	rowStyles := make([]lipgloss.Style, len(metisOwlGlyphLines))
+	for i := range rowStyles {
+		rowStyles[i] = lipgloss.NewStyle().Foreground(owlRowColor(i)).Bold(true)
+	}
 
 	owlRows := make([]string, len(metisOwlGlyphLines))
 	for i, raw := range metisOwlGlyphLines {
-		if i == owlEyeRow {
-			rs := []rune(raw)
-			before := silverStyle.Render(string(rs[:owlEyeColL]))
-			eyeL := eyeStyle.Render(string(rs[owlEyeColL]))
-			middle := silverStyle.Render(string(rs[owlEyeColL+1 : owlEyeColR]))
-			eyeR := eyeStyle.Render(string(rs[owlEyeColR]))
-			after := silverStyle.Render(string(rs[owlEyeColR+1:]))
-			owlRows[i] = before + eyeL + middle + eyeR + after
-			continue
-		}
-		owlRows[i] = silverStyle.Render(raw)
+		owlRows[i] = rowStyles[i].Render(raw)
 	}
 	icon := strings.Join(owlRows, "\n")
 
@@ -128,7 +166,7 @@ func (m *Model) renderWelcomeBannerCard(showHint bool) string {
 		"",
 		lipgloss.JoinHorizontal(lipgloss.Left,
 			labelStyle.Render("model: "),
-			valueStyle.Render(m.model),
+			valueStyle.Render(effectiveModelID(m)),
 			labelStyle.Render("  ·  mode: "),
 			valueStyle.Render(string(m.gate.Mode())),
 		),
@@ -207,7 +245,7 @@ func (m *Model) renderHeaderBanner() string {
 	row := titleStyle.Render("✻ metis") +
 		dimStyle.Render(" v"+version.Short()) +
 		dimStyle.Render(" · ") +
-		valueStyle.Render(m.model)
+		valueStyle.Render(effectiveModelID(m))
 	if mode != "" {
 		row += dimStyle.Render(" · ") + valueStyle.Render(mode)
 	}
@@ -256,4 +294,28 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// effectiveModelID returns the model id the running Provider actually
+// sends on the wire — the trustworthy source for the banner / status
+// bar. Falls back to m.model (the user-picked string) only when no
+// Provider is bound yet (cold-start before agent loop wiring).
+//
+// Why this exists: m.model is set by NewModel + /model handlers and
+// can drift from Provider.ModelID() when the user changes the model
+// string mid-session WITHOUT a Provider rebuild — e.g. picking
+// "deepseek-v4-pro" from /model while the live Provider is still the
+// MiniMax-Anthropic gateway (user screenshot 35, 2026-05-17). Reading
+// from the Provider closes that gap: the banner shows what's actually
+// running, even when the user's intent and the wire state disagree.
+func effectiveModelID(m *Model) string {
+	if m != nil && m.loop != nil && m.loop.Provider != nil {
+		if id := m.loop.Provider.ModelID(); id != "" {
+			return id
+		}
+	}
+	if m != nil {
+		return m.model
+	}
+	return ""
 }

@@ -91,6 +91,15 @@ func (m *Model) buildPlainTranscript() string {
 			b.WriteString(fmt.Sprintf("  ⎿ %s\n", summarizeToolResult(te)))
 		}
 	}
+	// Surface the in-progress input box content so Ctrl+S copy mode
+	// covers the blue-frame area too (user screenshot 34, 2026-05-16:
+	// "蓝色框起来的输入框的内容不能复制, 鼠标选中文字没显示选中的阴影").
+	// Without this the alt-screen exit drops a transcript but the
+	// user's draft prompt is invisible in scrollback — they'd have to
+	// re-type or Alt+Y to grab it via clipboard.
+	if v := m.input.Value(); v != "" {
+		b.WriteString("\n> " + v + "\n")
+	}
 	return b.String()
 }
 
@@ -99,15 +108,17 @@ func (m *Model) buildPlainTranscript() string {
 // fields without each one duplicating the bridge.
 func (m *Model) asREPL() *REPL {
 	return &REPL{
-		Loop:        m.loop,
-		Gate:        m.gate,
-		Slash:       m.slash,
-		Session:     m.session,
-		SessionID:   m.sessionID,
-		model:       m.model,
-		skillDir:    m.skillDir,
-		cmds:        m.cmds,
-		totalTokens: m.totalTokens,
+		Loop:         m.loop,
+		Gate:         m.gate,
+		Slash:        m.slash,
+		Session:      m.session,
+		SessionID:    m.sessionID,
+		model:        m.model,
+		providerName: m.providerName,
+		cfg:          m.cfg,
+		skillDir:     m.skillDir,
+		cmds:         m.cmds,
+		totalTokens:  m.totalTokens,
 	}
 }
 

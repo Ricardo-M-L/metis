@@ -69,13 +69,35 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			})
 			return nil
 		}
-		m.model = applied
-		m.loop.Model = applied
+		// Look up the picker entry to get the provider profile name;
+		// without it switchModel would just bump the model field on the
+		// current provider, which is wrong for cross-vendor jumps
+		// (deepseek → MiniMax requires a different transport + base URL).
+		newProvName := ""
+		for _, c := range builtinModelChoices {
+			if c.ID == applied {
+				newProvName = c.Provider
+				break
+			}
+		}
+		switchErr := m.switchModel(applied, newProvName)
+		// Success row fires unconditionally — switchModel always updates
+		// m.model + m.loop.Model up front, even when the Provider
+		// rebuild itself can't run (missing profile in cfg, no API key,
+		// etc.). A separate warning row surfaces the rebuild failure so
+		// the user knows the Provider stayed on the old transport.
 		m.messages = append(m.messages, Message{
 			Role:      "success",
-			Content:   "model: " + applied,
+			Content:   "model: " + applied + "  ·  provider: " + m.providerName,
 			Timestamp: time.Now(),
 		})
+		if switchErr != nil {
+			m.messages = append(m.messages, Message{
+				Role:      "warning",
+				Content:   "model name updated, but Provider rebuild failed: " + switchErr.Error(),
+				Timestamp: time.Now(),
+			})
+		}
 
 	case *screen.ThemeScreen:
 		applied := w.Applied()

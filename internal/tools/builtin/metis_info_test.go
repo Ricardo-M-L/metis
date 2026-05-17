@@ -27,6 +27,7 @@ type stubProvider struct {
 
 func (s *stubProvider) Name() string          { return s.name }
 func (s *stubProvider) MaxContextTokens() int { return s.window }
+func (s *stubProvider) ModelID() string       { return "" }
 func (s *stubProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
 	panic("stubProvider.Complete not used in this test")
 }

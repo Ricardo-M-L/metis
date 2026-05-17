@@ -229,6 +229,7 @@ type runtime struct {
 	useMD             bool
 	showTok           bool
 	model             string
+	providerName      string // resolved provider profile name (cfg.Provider.Default OR --provider). Threaded to the TUI so mid-session /model switches know which profile to rebuild against.
 	mcpServers        []*mcptools.Server
 	plugins           *rtpkg.PluginRegistry // nil when no plugins installed
 	allowedDirs       *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
@@ -1030,7 +1031,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	rt := &runtime{
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, useMD: cfg.UI.Markdown && !flags.noMarkdown,
-		showTok: cfg.UI.ShowTokens, model: model,
+		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
 		mcpServers:       mcpServers,
 		plugins:          pluginReg,
 		allowedDirs:      allowedDirs,
@@ -1214,7 +1215,7 @@ func cmdChat(ctx context.Context, args []string) error {
 			earlyIn.Stop() // idempotent — safe even if trust prompt called it
 			tui.SetEarlyInputReader(earlyIn.Reader())
 		}
-		return tui.RunTUI(ctx, rt.loop, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
+		return tui.RunTUI(ctx, rt.loop, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.providerName, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
 	}
 	// Non-TUI path: just stop the capture so terminal mode is restored.
 	if earlyIn != nil {

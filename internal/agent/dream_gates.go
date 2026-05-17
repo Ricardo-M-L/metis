@@ -38,6 +38,7 @@ import (
 //     workflows; metis is a single-user local CLI where users want
 //     "today's facts" reflected by tomorrow morning, not in three
 //     days. 12 h is the middle.
+//
 // Override per host via METIS_DREAM_INTERVAL_HOURS — set 0 to disable.
 const DefaultDreamIntervalHours = 12.0
 

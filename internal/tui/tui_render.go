@@ -83,6 +83,13 @@ func (m *Model) View() tea.View {
 		v := tea.NewView(content)
 		v.AltScreen = true
 		v.MouseMode = tea.MouseModeCellMotion
+		// Enable xterm focus reporting (DECSET 1004 — `\x1b[?1004h`)
+		// so bubbletea v2 dispatches FocusMsg / BlurMsg when the
+		// terminal tab gains/loses focus. tui_update.go handles
+		// FocusMsg by snapping the chat list back to the bottom,
+		// matching claude-code's "switch back to this tab → see the
+		// latest" behaviour (user screenshot 37, 2026-05-17).
+		v.ReportFocus = true
 		// Drive the terminal window/tab title via bubbletea v2's
 		// built-in support (tea.View.WindowTitle → ansi.SetWindowTitle
 		// OSC 0). The renderer auto-diffs against the previous frame

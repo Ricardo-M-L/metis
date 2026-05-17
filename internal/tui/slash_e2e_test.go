@@ -285,6 +285,7 @@ func (fakeProvider) Stream(_ context.Context, _ provider.Request) (provider.Stre
 	return &fakeStream{}, nil
 }
 func (fakeProvider) MaxContextTokens() int { return 200_000 }
+func (fakeProvider) ModelID() string       { return "" }
 
 // fakeStream emits a single message_stop event then EOF so the agent
 // loop's consumeStream sees a clean turn-ended signal.

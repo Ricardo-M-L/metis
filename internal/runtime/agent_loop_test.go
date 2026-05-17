@@ -23,6 +23,7 @@ type stubProvider struct {
 
 func (p *stubProvider) Name() string          { return "stub" }
 func (p *stubProvider) MaxContextTokens() int { p.mu.Lock(); defer p.mu.Unlock(); return p.maxCtx }
+func (p *stubProvider) ModelID() string       { return "" }
 func (p *stubProvider) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
 	return &llm.Response{}, nil
 }

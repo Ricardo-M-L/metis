@@ -36,9 +36,16 @@ type REPL struct {
 	UseMarkdown bool
 	ShowTokens  bool
 	model       string
-	skillDir    string
-	cmds        *REPLCommandRegistry
-	totalTokens tokenTracker
+	// providerName tracks which provider profile the running Loop.Provider
+	// was built against — required for cmdModel to call rtpkg.BuildProvider
+	// on the right profile when the user does /model <id> mid-session.
+	// Empty for legacy callers that didn't thread it through; switchModel
+	// then falls back to cfg.Provider.Default.
+	providerName string
+	cfg          *config.Config
+	skillDir     string
+	cmds         *REPLCommandRegistry
+	totalTokens  tokenTracker
 
 	stdin io.Reader
 	out   io.Writer

@@ -89,6 +89,9 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 
 func (g *Gemini) Name() string { return "gemini" }
 
+// ModelID returns the wire-level model id this provider sends.
+func (g *Gemini) ModelID() string { return g.Model }
+
 // MaxContextTokens — Gemini 2.5 line ships with a 1M-token window for
 // pro / flash; older models cap at 32k or 128k. Pick by model prefix
 // so the compactor uses the right denominator.

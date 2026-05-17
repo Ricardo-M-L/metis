@@ -13,10 +13,10 @@ import (
 func TestTruncate_NeverEmitsInvalidUTF8(t *testing.T) {
 	cases := []string{
 		"ls -la /Users/ricardo/Documents/公司学习文件/我自己的agent的cli/metis/internal/tools/builtin",
-		strings.Repeat("公", 100),                                                            // pure CJK
-		"prefix-" + strings.Repeat("a", 30) + "中文",                                          // mixed at boundary
-		"emoji 🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒",                                                  // 4-byte UTF-8 (emoji)
-		"短",   // shorter than max
+		strings.Repeat("公", 100),                   // pure CJK
+		"prefix-" + strings.Repeat("a", 30) + "中文", // mixed at boundary
+		"emoji 🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒", // 4-byte UTF-8 (emoji)
+		"短",  // shorter than max
 		"hi", // pure ASCII shorter than max
 	}
 	for _, s := range cases {
@@ -96,14 +96,14 @@ func TestFormatContextPct_ClampsAbove99(t *testing.T) {
 		{0, 200000, "0%"},
 		{40000, 200000, "20%"},
 		{99000, 200000, "49%"},
-		{198000, 200000, "99%"},                  // exact boundary — still numeric
-		{198001, 200000, "99%"},                  // 99.0005% → integer 99
-		{199500, 200000, "99%"},                  // 99.75% → integer 99
-		{200000, 200000, "99%+"},                 // exactly cap — clamp signals "at limit"
-		{207139, 200000, "99%+"},                 // the actual user-repro number
-		{500000, 200000, "99%+"},                 // wildly over (defensive)
-		{120000, 128000, "93%"},                  // DeepSeek 128K window normal case
-		{145000, 128000, "99%+"},                 // DeepSeek over-cap
+		{198000, 200000, "99%"},  // exact boundary — still numeric
+		{198001, 200000, "99%"},  // 99.0005% → integer 99
+		{199500, 200000, "99%"},  // 99.75% → integer 99
+		{200000, 200000, "99%+"}, // exactly cap — clamp signals "at limit"
+		{207139, 200000, "99%+"}, // the actual user-repro number
+		{500000, 200000, "99%+"}, // wildly over (defensive)
+		{120000, 128000, "93%"},  // DeepSeek 128K window normal case
+		{145000, 128000, "99%+"}, // DeepSeek over-cap
 	}
 	for _, c := range cases {
 		got := formatContextPct(c.used, c.cap)

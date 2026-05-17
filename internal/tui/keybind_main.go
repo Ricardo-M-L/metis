@@ -417,6 +417,32 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.InsertRune('\n')
 		return m, nil
 
+	case "alt+y":
+		// Yank the current input box content to the system clipboard.
+		// Complements Ctrl+Y (yank last assistant reply). Addresses
+		// user screenshot 34 / 2026-05-16: "蓝色框起来的输入框的内容不
+		// 能复制, 鼠标选中文字没显示选中的阴影" — bubbletea's mouse
+		// cell-motion mode eats drag events so terminal-native
+		// selection can't reach the input region. A one-keystroke
+		// "copy whatever I'm typing" gives them the same outcome
+		// without disabling mouse capture or switching modes.
+		v := m.input.Value()
+		if v == "" {
+			m.messages = append(m.messages, Message{
+				Role: "info", Content: "(input box is empty — nothing to copy)",
+				Timestamp: time.Now(),
+			})
+			return m, nil
+		}
+		writeClipboard(v)
+		m.messages = append(m.messages, Message{
+			Role: "info",
+			Content: fmt.Sprintf("(copied %d chars from input — %s)",
+				len(v), osc52Status()),
+			Timestamp: time.Now(),
+		})
+		return m, nil
+
 	case "enter":
 		return m.handleSubmit()
 
@@ -498,6 +524,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 的地方". macOS text-field convention is Cmd+↑/↓ for jump-to-edge,
 	// but with no Cmd modifier reaching the TUI we surface the same
 	// behaviour on plain ↑/↓ for this single-row case.
+	//
+	// Once the cursor IS at col 0 (line 0), ↑ then hands off to
+	// directHistoryUp via the expanded directHistoryEligible — the
+	// second-press history load matches claude-code behaviour. User
+	// report 2026-05-16 (screenshot 32): "把光标放到最开始的位置然
+	// 后按向上 向下箭头就能切换这个会话的历史 query, claude code 可以".
 	switch msg.String() {
 	case "up":
 		if m.directHistoryEligible() && m.directHistoryUp() {

@@ -241,6 +241,7 @@ type blockingProvider struct {
 
 func (p *blockingProvider) Name() string          { return "blocking" }
 func (p *blockingProvider) MaxContextTokens() int { return 200_000 }
+func (p *blockingProvider) ModelID() string       { return "" }
 func (p *blockingProvider) Complete(ctx context.Context, req llm.Request) (*llm.Response, error) {
 	p.calls++
 	select {

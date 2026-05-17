@@ -65,6 +65,7 @@ type blockingFakeProvider struct{}
 
 func (blockingFakeProvider) Name() string          { return "blocking-fake" }
 func (blockingFakeProvider) MaxContextTokens() int { return 100_000 }
+func (blockingFakeProvider) ModelID() string       { return "" }
 func (blockingFakeProvider) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
 	return nil, nil
 }

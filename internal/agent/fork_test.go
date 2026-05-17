@@ -24,6 +24,7 @@ type scriptedProvider struct {
 
 func (p *scriptedProvider) Name() string          { return "scripted" }
 func (p *scriptedProvider) MaxContextTokens() int { return 200_000 }
+func (p *scriptedProvider) ModelID() string { return "" }
 func (p *scriptedProvider) Complete(_ context.Context, req llm.Request) (*llm.Response, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -270,6 +271,7 @@ type errProvider struct{ err error }
 
 func (p *errProvider) Name() string          { return "err" }
 func (p *errProvider) MaxContextTokens() int { return 1 }
+func (p *errProvider) ModelID() string { return "" }
 func (p *errProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
 	return nil, p.err
 }

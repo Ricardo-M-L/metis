@@ -85,24 +85,19 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	s.WriteString("\n")
 
 	// Result row: ⎿ Xms ✓/✗ summary
-	// The leaf glyph stays muted (it's just a connector), but the
-	// summary itself ("0.5s · Read foo.py (350 lines)") is information
-	// dense — show it in the dim-but-readable secondary tone instead of
-	// muted grey. The user flagged that too much of the screen renders
-	// as low-contrast grey vs claude-code, and this row is one of the
-	// most-read lines in the transcript.
-	// Connector glyph stays subdued (it's structural, not informational)
-	// but at #a0a0a0 (styleDim), not #606060 (styleMuted) — the latter
-	// vanishes against most dark-theme backgrounds. claude-code uses
-	// `dimColor` (ANSI Faint) for the same role, which renders ~50% of
-	// the active foreground rather than a fixed ultra-grey.
+	//
+	// The leaf glyph + ✓/✗ stay structurally subdued (dim / accent), but
+	// the summary text itself ("0.5s · Read foo.py (350 lines)") now
+	// renders at default fg — user screenshot 36 / 2026-05-17 flagged
+	// the dim grey as too low-contrast. This is the most-scanned line
+	// per tool call and it's informational, not chrome.
 	s.WriteString(styleDim.Render("    " + glyphTreeLeaf + "  "))
 	if te.IsError {
 		s.WriteString(styleErr.Render("✗ "))
 	} else {
 		s.WriteString(styleAccent.Render("✓ "))
 	}
-	s.WriteString(styleDim.Render(summarizeToolResult(te)))
+	s.WriteString(summarizeToolResult(te))
 	s.WriteString("\n")
 
 	// Body: structured diff for Edit/Write, task-list for TodoWrite,
@@ -491,10 +486,11 @@ func formatToolPreviewLine(toolName, ln string) string {
 		// path:line:content (Grep) or just `path` (Glob). For Grep,
 		// dim everything up to and including the second ':' separator;
 		// the actual match content past that point gets default fg.
-		// Glob has no inline content, so the whole line is "where" and
-		// can stay dim.
+		// Glob has no inline content, so the whole line IS the answer
+		// — render at default fg, not dim (user screenshot 36 /
+		// 2026-05-17 flagged glob result paths as too grey to read).
 		if toolName == "Glob" {
-			return styleDim.Render(ln)
+			return ln
 		}
 		// Grep: find SECOND ':' to skip the line-number too.
 		if i := strings.IndexByte(ln, ':'); i > 0 {

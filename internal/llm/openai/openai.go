@@ -110,6 +110,10 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 // almost certainly under-counts rather than over-counts. Over-counting
 // would let compaction fire late and risk a 4xx; under-counting just
 // compacts sooner than strictly necessary.
+// ModelID returns the wire-level model id this provider sends, for
+// trustworthy status-bar display.
+func (o *OpenAI) ModelID() string { return o.Model }
+
 func (o *OpenAI) MaxContextTokens() int {
 	// Tier 1 — explicit user override.
 	if o.ContextWindow > 0 {

@@ -176,6 +176,7 @@ type hangingProvider struct{}
 
 func (p *hangingProvider) Name() string          { return "hanging" }
 func (p *hangingProvider) MaxContextTokens() int { return 100000 }
+func (p *hangingProvider) ModelID() string       { return "" }
 func (p *hangingProvider) Complete(ctx context.Context, _ llm.Request) (*llm.Response, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()

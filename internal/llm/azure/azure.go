@@ -107,6 +107,9 @@ func NewAzure(apiKey, resource, deployment, apiVersion, model string, maxTokens 
 
 func (a *Azure) Name() string { return "azure" }
 
+// ModelID returns the wire-level model id this provider sends.
+func (a *Azure) ModelID() string { return a.Model }
+
 // MaxContextTokens returns the configured override or 0 (caller falls
 // back to the model-prefix lookup, which is unlikely to match Azure
 // deployment names — set context_window in config.toml for accuracy).

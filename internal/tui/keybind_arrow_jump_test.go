@@ -34,6 +34,8 @@ func pressKey(t *testing.T, m *Model, code string) {
 		key = tea.Key{Code: tea.KeyHome}
 	case "end":
 		key = tea.Key{Code: tea.KeyEnd}
+	case "alt+y":
+		key = tea.Key{Code: 'y', Mod: tea.ModAlt}
 	default:
 		t.Fatalf("pressKey: unknown code %q", code)
 	}
@@ -100,6 +102,67 @@ func TestArrowJump_EmptyInputStillTriggersHistory(t *testing.T) {
 	}
 	if m.histDirectIdx != 0 {
 		t.Errorf("histDirectIdx should be 0 after first ↑; got %d", m.histDirectIdx)
+	}
+}
+
+// TestArrowJump_SingleLineUpAtCol0LoadsHistory — second ↑ press, when
+// the cursor is already at column 0 of a non-empty input, must hand
+// off to direct-history nav (claude-code parity, 2026-05-16 user
+// screenshot 32). Otherwise the keystroke is wasted: CursorStart is a
+// no-op at col 0 and textarea LineUp has no row above to land on.
+func TestArrowJump_SingleLineUpAtCol0LoadsHistory(t *testing.T) {
+	m := newE2EModel(t, 120, 30, 0)
+	m.input.Focus()
+	m.histDirectIdx = -1
+	m.histAll = []string{"older1", "older2"} // skip filesystem load
+	m.input.SetValue("draft text")
+	m.input.CursorStart() // cursor at (line=0, col=0)
+
+	if got := m.input.Column(); got != 0 {
+		t.Fatalf("precondition: cursor should be at col 0; got %d", got)
+	}
+
+	pressKey(t, m, "up")
+
+	if got := m.input.Value(); got != "older1" {
+		t.Errorf("↑ at col 0 with non-empty input should load history[0] (%q); got %q",
+			"older1", got)
+	}
+	if m.histDirectIdx != 0 {
+		t.Errorf("histDirectIdx should be 0 after history load; got %d", m.histDirectIdx)
+	}
+	if m.histDirectDraft != "draft text" {
+		t.Errorf("draft should be stashed for ↓ restore; got %q", m.histDirectDraft)
+	}
+}
+
+// TestArrowJump_MultiLineUpAtOriginLoadsHistory — multi-line input,
+// cursor at (line=0, col=0), ↑ should load history rather than fall
+// through to a no-op textarea LineUp. Same fix as the single-line case;
+// the multi-line path used to silently swallow the keystroke.
+func TestArrowJump_MultiLineUpAtOriginLoadsHistory(t *testing.T) {
+	m := newE2EModel(t, 120, 30, 0)
+	m.input.Focus()
+	m.histDirectIdx = -1
+	m.histAll = []string{"older-prompt"}
+	m.input.SetValue("first\nsecond")
+	// Move all the way to start: row 0, col 0.
+	m.input.CursorStart()
+	for m.input.Line() > 0 {
+		m.input.CursorUp()
+	}
+
+	if got := m.input.Line(); got != 0 {
+		t.Fatalf("precondition: line should be 0; got %d", got)
+	}
+	if got := m.input.Column(); got != 0 {
+		t.Fatalf("precondition: column should be 0; got %d", got)
+	}
+
+	pressKey(t, m, "up")
+
+	if got := m.input.Value(); got != "older-prompt" {
+		t.Errorf("↑ at (0,0) of multi-line input should load history; got %q", got)
 	}
 }
 

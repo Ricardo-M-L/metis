@@ -37,6 +37,7 @@ type streamingProvider struct {
 
 func (s *streamingProvider) Name() string          { return "streaming-test" }
 func (s *streamingProvider) MaxContextTokens() int { return 100_000 }
+func (s *streamingProvider) ModelID() string { return "" }
 func (s *streamingProvider) Stream(_ context.Context, req llm.Request) (llm.StreamReader, error) {
 	s.calls++
 	s.system = req.System
@@ -68,6 +69,7 @@ type flakyProvider struct {
 
 func (f *flakyProvider) Name() string          { return "flaky" }
 func (f *flakyProvider) MaxContextTokens() int { return 100_000 }
+func (f *flakyProvider) ModelID() string { return "" }
 func (f *flakyProvider) Stream(_ context.Context, _ llm.Request) (llm.StreamReader, error) {
 	f.calls++
 	if f.calls <= f.failsBeforeOK {
@@ -102,6 +104,7 @@ type alwaysFailStreamProvider struct {
 
 func (a *alwaysFailStreamProvider) Name() string          { return "always-fail-stream" }
 func (a *alwaysFailStreamProvider) MaxContextTokens() int { return 100_000 }
+func (a *alwaysFailStreamProvider) ModelID() string { return "" }
 func (a *alwaysFailStreamProvider) Stream(_ context.Context, _ llm.Request) (llm.StreamReader, error) {
 	a.streamCalls++
 	return nil, errors.New("alwaysFailStreamProvider: SSE broken")

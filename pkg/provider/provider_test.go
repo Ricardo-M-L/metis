@@ -20,6 +20,7 @@ type fakeProvider struct {
 }
 
 func (p *fakeProvider) Name() string          { return p.name }
+func (p *fakeProvider) ModelID() string       { return "" }
 func (p *fakeProvider) MaxContextTokens() int { return p.maxCtx }
 func (p *fakeProvider) Complete(_ context.Context, req Request) (*Response, error) {
 	p.gotReq = req

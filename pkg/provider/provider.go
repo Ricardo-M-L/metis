@@ -176,11 +176,23 @@ type Response struct {
 // MaxContextTokens returns the context window size for the current
 // model — used by the agent loop's compactor to decide when to trigger
 // context summarization.
+//
+// ModelID returns the actual model identifier the Provider sends on
+// the wire — i.e. the value that lands in the request's `model` field.
+// Distinct from any higher-level "what model did the user pick" string
+// the TUI tracks separately: the provider's wire value is what actually
+// executes, so it's the trustworthy source for the status bar (user
+// screenshot 35 / 2026-05-17 surfaced a desync where the top bar showed
+// "deepseek-v4-pro" but the running Anthropic-transport provider kept
+// sending "minimax-m2.7"). Method named ModelID rather than Model so it
+// doesn't collide with the existing exported `Model string` struct
+// field on every concrete provider implementation.
 type Provider interface {
 	Name() string
 	Complete(ctx context.Context, req Request) (*Response, error)
 	Stream(ctx context.Context, req Request) (StreamReader, error)
 	MaxContextTokens() int
+	ModelID() string
 }
 
 // StreamReader is a typed iterator over StreamEvents. Close releases

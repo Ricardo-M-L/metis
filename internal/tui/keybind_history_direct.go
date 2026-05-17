@@ -17,31 +17,57 @@ import (
 
 // directHistoryEligible reports whether ↑/↓ should be intercepted as
 // history navigation rather than passed through to the textarea (where
-// they'd move the cursor between rows). Two cases qualify:
+// they'd move the cursor between rows). Three cases qualify:
 //
 //  1. Input is empty.
 //  2. Input was last set by direct-history nav (user hasn't typed since
 //     loading a previous prompt) — detected by histDirectIdx ≥ 0.
+//  3. Cursor is at the very start of the input (line 0, column 0) —
+//     claude-code parity. User flow: Home → ↑ loads previous prompt.
+//     Required for the "把光标放到最开始的位置然后按向上箭头切换历史"
+//     workflow (2026-05-16 user report, screenshot 32). Without this,
+//     a non-empty single- or multi-line input swallowed the ↑ entirely
+//     even after Home, because the cursor was already at col 0 so
+//     CursorStart was a no-op and textarea LineUp had no row above to
+//     land on.
 //
-// A multi-line input that the user is actively editing (histDirectIdx
-// == -1, value != "") falls through so ↑ moves the cursor as usual.
+// A multi-line input that the user is actively editing on a later row
+// (or anywhere past column 0 of row 0) still falls through, so ↑
+// continues to move the cursor between rows / jumps to col 0 as before.
 func (m *Model) directHistoryEligible() bool {
 	if m.histDirectIdx >= 0 {
 		return true
 	}
-	return m.input.Value() == ""
+	if m.input.Value() == "" {
+		return true
+	}
+	return m.input.Line() == 0 && m.input.Column() == 0
 }
 
 // loadDirectHistory lazy-loads ~/.metis/history.jsonl into m.histAll on
 // first use. Same backing data as the Ctrl+R overlay, so opening that
 // overlay later sees identical entries (no double-load).
+//
+// Scope: filtered to the current session (m.sessionID) — user
+// expectation 2026-05-16 "向上向下箭头出来的是当前会话的吧不会出来
+// 别的会话的吧". Cross-session prompts are still reachable via the
+// Ctrl+R fuzzy-search overlay, which has its own load path.
+//
+// Fallback: when m.sessionID is empty (REPL-fallback mode or auth-
+// wizard exit before a session was bound), don't filter — otherwise
+// histAll would be empty and ↑ would be a silent no-op even though
+// the user does have prior prompts on disk.
 func (m *Model) loadDirectHistory() {
 	if m.histAll != nil {
 		return
 	}
 	entries, _ := runtime.LoadRecentHistory(500)
+	filterToSession := m.sessionID != ""
 	seen := map[string]bool{}
 	for _, e := range entries {
+		if filterToSession && e.SessionID != m.sessionID {
+			continue
+		}
 		if seen[e.Input] {
 			continue
 		}

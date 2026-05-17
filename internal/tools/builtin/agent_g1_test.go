@@ -309,6 +309,7 @@ type delayedProvider struct {
 
 func (p *delayedProvider) Name() string          { return "delayed" }
 func (p *delayedProvider) MaxContextTokens() int { return 100000 }
+func (p *delayedProvider) ModelID() string       { return "" }
 func (p *delayedProvider) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
 	return nil, nil
 }

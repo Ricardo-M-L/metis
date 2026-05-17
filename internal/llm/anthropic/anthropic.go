@@ -135,6 +135,10 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 // claude-code and hermes both pull these numbers from a model catalog —
 // metis used to hardcode 192k for MiniMax based on M1's smaller window,
 // which made every M2.7 chat read 4% higher than vendor-published math.
+// ModelID returns the wire-level model id this provider sends, for
+// trustworthy status-bar display.
+func (a *Anthropic) ModelID() string { return a.Model }
+
 func (a *Anthropic) MaxContextTokens() int {
 	// Tier 1 — explicit user override (~/.metis/config.toml).
 	if a.ContextWindow > 0 {

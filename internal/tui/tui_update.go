@@ -126,6 +126,34 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		notify.MarkUserInteraction()
 		return m.handleKey(msg)
 
+	case tea.FocusMsg:
+		// Terminal regained focus (user switched back to this tab /
+		// window). Snap the chat list to the bottom + re-arm
+		// stickyBottom so subsequent streaming output stays glued to
+		// the latest message — matches claude-code's "switch back, see
+		// the newest" behaviour (user screenshot 37, 2026-05-17:
+		// claude code 回到当前会话最底层展示, metis 却不会).
+		//
+		// Guards:
+		//   - copy mode: alt-screen is off, native scrollback is in
+		//     use; forcing ScrollToBottom would fight the user.
+		//   - permission prompt / activeScreen / overlays: chat list
+		//     is not the focus target so a re-snap is just noise.
+		if !m.copyMode && !m.permActive && m.activeScreen == nil &&
+			!m.showHistory && !m.showTaskPanel {
+			m.chatList.ScrollToBottom()
+			m.stickyBottom = true
+		}
+		return m, nil
+
+	case tea.BlurMsg:
+		// Lost focus — no state change needed. We don't want to drop
+		// stickyBottom here: the user might pop back in seconds and
+		// expect to see the latest content (the focus-in branch above
+		// re-snaps regardless). Keeping this case explicit so a future
+		// reader doesn't think Blur was forgotten.
+		return m, nil
+
 	case tea.PasteMsg:
 		// Bracketed paste: terminal wraps cmd+V'd content with
 		// \x1b[200~ … \x1b[201~ and bubbletea v2 reports it as a

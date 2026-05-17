@@ -23,6 +23,7 @@ type fakeRerankProvider struct {
 
 func (p *fakeRerankProvider) Name() string          { return "fake-rerank" }
 func (p *fakeRerankProvider) MaxContextTokens() int { return p.maxCtx }
+func (p *fakeRerankProvider) ModelID() string       { return "" }
 func (p *fakeRerankProvider) Complete(_ context.Context, req llm.Request) (*llm.Response, error) {
 	p.gotRequest = &req
 	if p.err != nil {

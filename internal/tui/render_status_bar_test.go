@@ -21,6 +21,7 @@ type fakeContextProvider struct {
 
 func (p *fakeContextProvider) Name() string          { return "fake" }
 func (p *fakeContextProvider) MaxContextTokens() int { return p.maxCtx }
+func (p *fakeContextProvider) ModelID() string       { return "" }
 func (p *fakeContextProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
 	return nil, errors.New("not implemented")
 }

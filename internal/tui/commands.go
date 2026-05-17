@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -138,6 +139,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 
 	// === System ===
 	r.Register(REPLCommand{Name: "compact", Description: "force context compaction now", Handler: cmdCompact})
+	r.Register(REPLCommand{Name: "ctx", Description: "show compaction state: cap, threshold, current tokens, trigger distance", Handler: cmdCtx})
 	r.Register(REPLCommand{Name: "config", Aliases: []string{"cfg"}, Description: "open config in $EDITOR", Handler: cmdConfig})
 	r.Register(REPLCommand{Name: "env", Description: "show environment info (OS, arch, CPU, memory)", Handler: cmdEnv})
 	r.Register(REPLCommand{Name: "doctor", Description: "diagnose metis installation", Handler: cmdDoctor})
@@ -215,9 +217,81 @@ func cmdModel(r *REPL, args string) string {
 	if args == "" {
 		return "model: " + r.model
 	}
-	r.model = args
-	r.Loop.Model = args
-	return "model set to: " + args
+	// Full provider rebuild — keeps loop.Provider, loop.ContextWindow,
+	// and loop.Compactor's effective cap in sync with the new selection.
+	// The old code only updated the string fields, which silently broke
+	// /model when the new model lived behind a different provider profile
+	// (user screenshot 35, 2026-05-17). switchREPLModel falls back to a
+	// string-only update when no cfg / profile is available (tests, plain
+	// REPL), so existing surfaces stay green.
+	err := switchREPLModel(r, args)
+	out := "model set to: " + r.model
+	if r.providerName != "" {
+		out += "  ·  provider: " + r.providerName
+	}
+	if err != nil {
+		out += "\n(warning: Provider rebuild failed — " + err.Error() + ")"
+	}
+	return out
+}
+
+// switchREPLModel runs the same Provider rebuild Model.switchModel does,
+// but from the REPL-side surface where we have r.Loop / r.cfg /
+// r.providerName instead of *Model. Same semantics: rebuild Provider,
+// swap into loop, refresh Compactor's window math, update tracked
+// model + provider name. Returns an error string suitable for surfacing
+// in the chat transcript.
+func switchREPLModel(r *REPL, newModel string) error {
+	if r == nil || r.Loop == nil {
+		return fmt.Errorf("repl not fully wired (loop missing)")
+	}
+	// String-side update first — guarantees the chrome shows the new
+	// id even if the Provider rebuild below can't run (tests with
+	// stubbed cfg, REPL fallback without a real profile, etc.).
+	r.model = newModel
+	r.Loop.Model = newModel
+	if r.cfg == nil {
+		return nil // string-only swap (test path)
+	}
+	// Look up the requested model in the picker list — if it's there we
+	// pick up the canonical provider profile for it. Otherwise stay on
+	// the current profile.
+	newProvName := ""
+	for _, c := range builtinModelChoices {
+		if c.ID == newModel {
+			newProvName = c.Provider
+			break
+		}
+	}
+	if newProvName == "" {
+		newProvName = r.providerName
+	}
+	if newProvName == "" {
+		newProvName = r.cfg.Provider.Default
+	}
+	if newProvName == "" {
+		return nil // no profile to rebuild against
+	}
+	pb, err := runtime.BuildProvider(r.cfg, newProvName, newModel)
+	if err != nil {
+		return fmt.Errorf("BuildProvider(%s, %s): %w", newProvName, newModel, err)
+	}
+	r.Loop.Provider = pb.Provider
+	r.Loop.Model = pb.Model
+	r.Loop.ContextWindow = pb.Provider.MaxContextTokens()
+	r.model = pb.Model
+	r.providerName = newProvName
+	if r.Loop.Compactor != nil {
+		oldCfg := r.Loop.Compactor.Config
+		oldMaxOut := r.Loop.Compactor.MaxOutputTokens
+		r.Loop.Compactor = agent.NewCompactor(oldCfg, pb.Model,
+			pb.Provider.MaxContextTokens(), pb.Provider)
+		r.Loop.Compactor.MaxOutputTokens = oldMaxOut
+		r.Loop.Compactor.ApplyWindowTier(
+			pb.Provider.MaxContextTokens() - oldMaxOut,
+		)
+	}
+	return nil
 }
 
 // cmdShare starts or stops the localhost HTTP+SSE bridge so an

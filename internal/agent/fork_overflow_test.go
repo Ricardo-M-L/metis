@@ -31,6 +31,7 @@ type flakyOverflowProvider struct {
 
 func (p *flakyOverflowProvider) Name() string          { return "flaky" }
 func (p *flakyOverflowProvider) MaxContextTokens() int { return 200_000 }
+func (p *flakyOverflowProvider) ModelID() string { return "" }
 func (p *flakyOverflowProvider) Complete(_ context.Context, req llm.Request) (*llm.Response, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

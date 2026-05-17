@@ -119,6 +119,13 @@ type Model struct {
 	// keybind_submit.go's SignalTitle handler when the user renames.
 	sessionTitle string
 	model        string
+	// providerName tracks the provider profile the running Loop.Provider
+	// was built from (cfg.Provider.Default at startup, or whichever
+	// profile the user picked via /model). Required for mid-session
+	// model switches to know which profile to rebuild against —
+	// switchModel calls rtpkg.BuildProvider(m.cfg, providerName, model)
+	// when the user changes models within the same profile.
+	providerName string
 	skillDir     string
 	cmds         *REPLCommandRegistry
 	ext          ExternalHooks
@@ -479,7 +486,7 @@ const ctrlCQuitWindow = 600 * time.Millisecond
 // Constructor + entry point
 // ============================================================================
 
-func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, skillDir string, cfg *config.Config) *Model {
+func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config) *Model {
 	ti := textarea.New()
 	ti.Placeholder = "type a message · /commands · alt+enter newline"
 	ti.Focus()
@@ -581,6 +588,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		session:      st,
 		sessionID:    sid,
 		model:        model,
+		providerName: providerName,
 		skillDir:     skillDir,
 		cfg:          cfg,
 		cmds:         BuildREPLCommands(),
@@ -654,8 +662,8 @@ func (m *Model) SetExternalHooks(h ExternalHooks) {
 
 // RunTUI starts the terminal UI. If hooks is non-nil it is attached to
 // the underlying Model before the program runs.
-func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, skillDir string, cfg *config.Config, forceBanner bool, hooks ...ExternalHooks) error {
-	m := NewModel(ctx, loop, sl, st, sid, gate, model, skillDir, cfg)
+func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config, forceBanner bool, hooks ...ExternalHooks) error {
+	m := NewModel(ctx, loop, sl, st, sid, gate, model, providerName, skillDir, cfg)
 	if len(hooks) > 0 {
 		m.SetExternalHooks(hooks[0])
 	}
