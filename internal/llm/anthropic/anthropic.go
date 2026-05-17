@@ -123,7 +123,8 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 //	claude-haiku-*          200,000
 //	MiniMax-M*  /  minimax-* 200,000 (api.minimaxi.com publishes 200k for
 //	                                  M2 / M2.7; up from 192k on M1)
-//	GLM-*                   128,000  (zhipuai bigmodel.cn)
+//	GLM-{4-Plus,4-flash,4.5}  128,000  (zhipuai bigmodel.cn)
+//	GLM-{4.6,4.7,5.x}         200,000  (window doubled on 4.6, held since)
 //	deepseek-*              128,000  (api.deepseek.com)
 //	kimi-*  /  moonshot-*   200,000  (moonshot.cn; k2 advertises 256k)
 //	(unknown)               200,000  (safe default)
@@ -160,6 +161,10 @@ func (a *Anthropic) MaxContextTokens() int {
 		strings.HasPrefix(a.Model, "claude-haiku"):
 		return 200000
 	case strings.HasPrefix(a.Model, "MiniMax"), strings.HasPrefix(a.Model, "minimax"):
+		return 200000
+	case strings.HasPrefix(a.Model, "glm-5"), strings.HasPrefix(a.Model, "GLM-5"),
+		strings.HasPrefix(a.Model, "glm-4.7"), strings.HasPrefix(a.Model, "GLM-4.7"),
+		strings.HasPrefix(a.Model, "glm-4.6"), strings.HasPrefix(a.Model, "GLM-4.6"):
 		return 200000
 	case strings.HasPrefix(a.Model, "GLM"), strings.HasPrefix(a.Model, "glm"):
 		return 128000

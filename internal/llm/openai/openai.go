@@ -175,7 +175,16 @@ func (o *OpenAI) MaxContextTokens() int {
 		// generic moonshot prefix only fires on the bare family name.
 		return 200_000
 
-	// GLM / Zhipu
+	// GLM / Zhipu — Zhipu bumped the window family-by-family. 4.0
+	// through 4.5 stayed at 128k; 4.6 doubled to 200k; 4.7 / Flash
+	// hold that; 5.x ships at 200k. Order matters: more-specific
+	// versions match before the GLM-4 catch-all so a 4.6 / 4.7 id
+	// doesn't fall into the legacy 128k bucket.
+	case strings.HasPrefix(o.Model, "glm-5"), strings.HasPrefix(o.Model, "GLM-5"):
+		return 200_000
+	case strings.HasPrefix(o.Model, "glm-4.7"), strings.HasPrefix(o.Model, "GLM-4.7"),
+		strings.HasPrefix(o.Model, "glm-4.6"), strings.HasPrefix(o.Model, "GLM-4.6"):
+		return 200_000
 	case strings.HasPrefix(o.Model, "glm-4-plus"), strings.HasPrefix(o.Model, "GLM-4-Plus"):
 		return 128_000
 	case strings.HasPrefix(o.Model, "glm-4"), strings.HasPrefix(o.Model, "GLM-4"):

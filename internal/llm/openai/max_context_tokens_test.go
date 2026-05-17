@@ -51,10 +51,16 @@ func TestMaxContextTokens_VendorPublishedDefaults(t *testing.T) {
 		{"moonshot-v1-128k", 128_000}, // tier 4 suffix parsing
 		{"moonshot-v1-32k", 32_000},   // tier 4 suffix parsing
 
-		// GLM
+		// GLM — Zhipu kept 128K on 4.0-4.5, doubled to 200K on 4.6/4.7/5.x.
 		{"glm-4-plus", 128_000},
 		{"GLM-4-Plus", 128_000},
 		{"glm-4-flash", 128_000},
+		{"glm-4.5", 128_000},
+		{"glm-4.6", 200_000},   // 2025 bump (per z.ai docs)
+		{"glm-4.7", 200_000},   // 2026 release; Flash same window
+		{"glm-4.7-flash", 200_000},
+		{"glm-5.1", 200_000},   // 2026-04-07 release; docs.bigmodel.cn confirms 200K
+		{"GLM-5.1", 200_000},
 
 		// MiniMax via openai_chat (rare but valid)
 		{"MiniMax-M2.7", 200_000},

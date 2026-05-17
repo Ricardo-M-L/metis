@@ -31,9 +31,12 @@ func TestMaxContextTokens_VendorPublishedDefaults(t *testing.T) {
 		{"MiniMax-M2.7", 200000},
 		{"MiniMax-M2", 200000},
 		{"minimax-text-01", 200000},
-		// GLM via zhipuai
+		// GLM via zhipuai — 4.0-4.5 at 128K, 4.6/4.7/5.x at 200K
 		{"GLM-4-Plus", 128000},
 		{"glm-4-flash", 128000},
+		{"glm-4.6", 200000},
+		{"glm-4.7", 200000},
+		{"glm-5.1", 200000},
 		// DeepSeek
 		{"deepseek-chat", 128000},
 		{"DeepSeek-V3", 128000},
