@@ -274,6 +274,12 @@ func (m *Model) View() tea.View {
 	}
 	if m.showTaskPanel {
 		lower.WriteString(renderTaskPanel(m))
+	} else {
+		// Sticky live todo strip — always-on compact view of the
+		// model's current focus + lookahead, when the Ctrl+T overlay
+		// isn't already showing the full list. Empty when the session
+		// has no todos. Image #1 user request 2026-05-17.
+		lower.WriteString(renderStickyTaskStrip(m))
 	}
 	lower.WriteString(renderStatusBar(m))
 	for _, ov := range m.overlays.View(m.width, m.height) {
