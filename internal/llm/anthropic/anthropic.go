@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
@@ -134,9 +135,25 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 // metis used to hardcode 192k for MiniMax based on M1's smaller window,
 // which made every M2.7 chat read 4% higher than vendor-published math.
 func (a *Anthropic) MaxContextTokens() int {
+	// Tier 1 — explicit user override (~/.metis/config.toml).
 	if a.ContextWindow > 0 {
 		return a.ContextWindow
 	}
+	// Tier 2 — models.dev catalog. Background-warmed singleton; nil-safe
+	// for CI env without HOME, miss-safe before the fetch completes.
+	if cli := catalog.Default(); cli != nil {
+		if w, ok := cli.LookupContextWindowByModelID(a.Model); ok {
+			return w
+		}
+	}
+	// Tier 3 — `-Nk` / `-Nm` suffix. Must run BEFORE the prefix table:
+	// `moonshot-v1-128k` would otherwise be captured by the generic
+	// `kimi/moonshot → 200000` prefix and silently lose its 128k cap.
+	// Vendor suffix is more specific than family prefix, so it wins.
+	if w, ok := transport.ParseModelWindowSuffix(a.Model); ok {
+		return w
+	}
+	// Tier 4 — hardcoded vendor prefix table.
 	switch {
 	case strings.HasPrefix(a.Model, "claude-opus"),
 		strings.HasPrefix(a.Model, "claude-sonnet"),
@@ -146,14 +163,15 @@ func (a *Anthropic) MaxContextTokens() int {
 		return 200000
 	case strings.HasPrefix(a.Model, "GLM"), strings.HasPrefix(a.Model, "glm"):
 		return 128000
+	case strings.HasPrefix(a.Model, "deepseek-v4"), strings.HasPrefix(a.Model, "DeepSeek-V4"):
+		return 1_000_000
 	case strings.HasPrefix(a.Model, "deepseek"), strings.HasPrefix(a.Model, "DeepSeek"):
 		return 128000
 	case strings.HasPrefix(a.Model, "kimi"), strings.HasPrefix(a.Model, "Kimi"),
 		strings.HasPrefix(a.Model, "moonshot"), strings.HasPrefix(a.Model, "Moonshot"):
 		return 200000
-	default:
-		return 200000 // safe default for unknown Anthropic-compatible models
 	}
+	return 200000 // safe default for unknown Anthropic-compatible models
 }
 
 func (a *Anthropic) Name() string { return "anthropic" }

@@ -15,6 +15,10 @@ package anthropic
 import "testing"
 
 func TestMaxContextTokens_VendorPublishedDefaults(t *testing.T) {
+	// Disable models.dev catalog so tests pin only the hardcoded
+	// prefix + suffix tier behaviour. With catalog enabled the
+	// background warm-up races in and overrides these fixtures.
+	t.Setenv("METIS_CATALOG_DISABLE", "1")
 	cases := []struct {
 		model string
 		want  int
@@ -33,9 +37,14 @@ func TestMaxContextTokens_VendorPublishedDefaults(t *testing.T) {
 		// DeepSeek
 		{"deepseek-chat", 128000},
 		{"DeepSeek-V3", 128000},
-		// Kimi / Moonshot
+		// DeepSeek V4 — newly added 1M support (2026-05-16)
+		{"deepseek-v4-pro", 1_000_000},
+		{"DeepSeek-V4-Pro", 1_000_000},
+		// Kimi / Moonshot — bare prefix → 200K, `-Nk` suffix → that
+		// specific window
 		{"kimi-k2-instruct", 200000},
-		{"moonshot-v1-128k", 200000},
+		{"moonshot-v1-128k", 128_000}, // suffix tier wins over prefix
+		{"moonshot-v1-32k", 32_000},   // suffix tier wins over prefix
 		// Unknown — falls through to 200k safe default
 		{"some-future-model", 200000},
 	}
@@ -54,6 +63,7 @@ func TestMaxContextTokens_ExplicitOverrideWins(t *testing.T) {
 	// `[provider.X].context_window` config override must be respected
 	// over the prefix table; otherwise users tune their config and
 	// still see the wrong denominator.
+	t.Setenv("METIS_CATALOG_DISABLE", "1")
 	a := &Anthropic{Model: "MiniMax-M2.7", ContextWindow: 64000}
 	if got := a.MaxContextTokens(); got != 64000 {
 		t.Errorf("explicit ContextWindow override should win; got %d, want 64000", got)

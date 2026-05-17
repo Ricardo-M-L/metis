@@ -299,9 +299,18 @@ var (
 // Default returns the process-wide catalog client, kicking off a
 // background fetch on first call. Reuses the standard cache location
 // (~/.metis/cache/models.json). Returns nil if HOME is unset (CI
-// path); callers must nil-check.
+// path) or METIS_CATALOG_DISABLE=1 is set in env (test path).
+// Callers must nil-check.
 func Default() *Client {
 	defaultOnce.Do(func() {
+		// Test escape hatch — provider unit tests want to exercise
+		// the prefix / suffix tiers in MaxContextTokens without the
+		// background fetch racing in and overriding their fixtures.
+		// Setting METIS_CATALOG_DISABLE=1 keeps the singleton nil so
+		// the provider's nil-check falls through to the next tier.
+		if os.Getenv("METIS_CATALOG_DISABLE") == "1" {
+			return
+		}
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return

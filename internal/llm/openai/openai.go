@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
@@ -86,22 +87,138 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 	}
 }
 
+// MaxContextTokens resolves the active model's context window through
+// a 4-tier fallback chain. Each tier is more vendor-specific than the
+// last so the cheap-and-correct path wins:
+//
+//  1. User override — `[provider.<name>].context_window = N` in
+//     ~/.metis/config.toml. Highest priority because a self-hosted
+//     gateway or capped account might serve a smaller slice than the
+//     public model card claims.
+//  2. models.dev catalog — synchronous read of the in-memory cache
+//     populated by the background warm-up (catalog.Default()). Covers
+//     117 providers' published windows; updates as new models ship.
+//  3. Hardcoded prefix table — vendor-published numbers for the
+//     models metis users actually run today. Belt to catalog's braces
+//     so a cold start / offline session still picks the right window
+//     within microseconds.
+//  4. `-Nk` / `-Nm` suffix parsing — DeepSeek-TUI convention. Lets a
+//     brand-new variant (or a self-host fork) signal its window in
+//     the model id when nothing else knows about it yet.
+//
+// All tiers fall through to 128_000 — a safe modern default that
+// almost certainly under-counts rather than over-counts. Over-counting
+// would let compaction fire late and risk a 4xx; under-counting just
+// compacts sooner than strictly necessary.
 func (o *OpenAI) MaxContextTokens() int {
+	// Tier 1 — explicit user override.
 	if o.ContextWindow > 0 {
 		return o.ContextWindow
 	}
-	switch {
-	case strings.HasPrefix(o.Model, "gpt-4o"):
-		return 128000
-	case strings.HasPrefix(o.Model, "gpt-4-turbo"):
-		return 128000
-	case strings.HasPrefix(o.Model, "gpt-4"):
-		return 128000 // gpt-4-32k
-	case strings.HasPrefix(o.Model, "gpt-3.5-turbo"):
-		return 16385
-	default:
-		return 128000 // safe default
+
+	// Tier 2 — models.dev catalog. nil-safe (Default() returns nil
+	// when HOME is unset, e.g. CI minimal env) and miss-safe (returns
+	// false until the background fetch completes).
+	if cli := catalog.Default(); cli != nil {
+		if w, ok := cli.LookupContextWindowByModelID(o.Model); ok {
+			return w
+		}
 	}
+
+	// Tier 3 — `-Nk` / `-Nm` suffix. Runs BEFORE the prefix table so
+	// a vendor variant like "moonshot-v1-32k" gets its declared 32K
+	// instead of being captured by the generic "moonshot" prefix and
+	// served the wrong (default 200K) window. The suffix is always
+	// more specific than the family prefix when both match.
+	if w, ok := transport.ParseModelWindowSuffix(o.Model); ok {
+		return w
+	}
+
+	// Tier 4 — hardcoded vendor family table. Ordered most-specific
+	// first so "deepseek-v4-pro" matches the v4 row instead of the
+	// generic deepseek row. The numbers here track vendor-published
+	// model cards as of 2026-05-16; bump them when a vendor publishes
+	// a new card AND catalog hasn't picked it up yet.
+	switch {
+	// OpenAI native
+	case strings.HasPrefix(o.Model, "o1"), strings.HasPrefix(o.Model, "o3"):
+		return 200_000 // o-series reasoning models
+	case strings.HasPrefix(o.Model, "gpt-4o"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "gpt-4-turbo"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "gpt-4-32k"):
+		return 32_768
+	case strings.HasPrefix(o.Model, "gpt-4"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "gpt-3.5-turbo-16k"):
+		return 16_385
+	case strings.HasPrefix(o.Model, "gpt-3.5-turbo"):
+		return 16_385
+
+	// DeepSeek
+	case strings.HasPrefix(o.Model, "deepseek-v4"), strings.HasPrefix(o.Model, "DeepSeek-V4"):
+		return 1_000_000 // v4-pro 1M
+	case strings.HasPrefix(o.Model, "deepseek-v3"), strings.HasPrefix(o.Model, "DeepSeek-V3"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "deepseek"), strings.HasPrefix(o.Model, "DeepSeek"):
+		return 128_000 // deepseek-chat / deepseek-coder default
+
+	// Kimi / Moonshot (Singapore + global)
+	case strings.HasPrefix(o.Model, "kimi-k2"), strings.HasPrefix(o.Model, "Kimi-K2"):
+		return 200_000
+	case strings.HasPrefix(o.Model, "kimi"), strings.HasPrefix(o.Model, "Kimi"):
+		return 200_000
+	case strings.HasPrefix(o.Model, "moonshot"), strings.HasPrefix(o.Model, "Moonshot"):
+		// Variants with `-Nk` suffix (e.g. moonshot-v1-32k) get
+		// caught by tier 3 before reaching this row — so this
+		// generic moonshot prefix only fires on the bare family name.
+		return 200_000
+
+	// GLM / Zhipu
+	case strings.HasPrefix(o.Model, "glm-4-plus"), strings.HasPrefix(o.Model, "GLM-4-Plus"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "glm-4"), strings.HasPrefix(o.Model, "GLM-4"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "glm"), strings.HasPrefix(o.Model, "GLM"):
+		return 128_000
+
+	// MiniMax (rare on openai_chat transport but possible via custom shim)
+	case strings.HasPrefix(o.Model, "MiniMax"), strings.HasPrefix(o.Model, "minimax"):
+		return 200_000
+
+	// Qwen / Aliyun DashScope
+	case strings.HasPrefix(o.Model, "qwen3-235b"), strings.HasPrefix(o.Model, "Qwen3-235B"):
+		return 256_000
+	case strings.HasPrefix(o.Model, "qwen2.5"), strings.HasPrefix(o.Model, "Qwen2.5"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "qwen"), strings.HasPrefix(o.Model, "Qwen"):
+		return 128_000
+
+	// Mistral
+	case strings.HasPrefix(o.Model, "mistral-large"), strings.HasPrefix(o.Model, "Mistral-Large"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "codestral"):
+		return 256_000
+	case strings.HasPrefix(o.Model, "mistral-medium"), strings.HasPrefix(o.Model, "Mistral-Medium"):
+		return 32_000
+	case strings.HasPrefix(o.Model, "mistral-small"), strings.HasPrefix(o.Model, "Mistral-Small"):
+		return 32_000
+	case strings.HasPrefix(o.Model, "mistral"), strings.HasPrefix(o.Model, "Mistral"):
+		return 32_000
+
+	// Llama (typically self-hosted via Ollama / Together / Groq)
+	case strings.HasPrefix(o.Model, "llama-3.3"), strings.HasPrefix(o.Model, "Llama-3.3"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "llama-3.1"), strings.HasPrefix(o.Model, "Llama-3.1"):
+		return 128_000
+	case strings.HasPrefix(o.Model, "llama-3"), strings.HasPrefix(o.Model, "Llama-3"):
+		return 8_192
+	case strings.HasPrefix(o.Model, "llama-4"), strings.HasPrefix(o.Model, "Llama-4"):
+		return 10_000_000 // Scout/Maverick announced 10M
+	}
+
+	return 128_000 // ultimate safe default
 }
 
 func (o *OpenAI) Name() string { return "openai" }
