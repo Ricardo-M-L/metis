@@ -25,6 +25,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -50,6 +51,15 @@ type MetisInfo struct {
 	// 4-arg constructor still works). 2026-05-09 addition mirrors
 	// crush's ConfigStore.ConfigStaleness().
 	snap *config.Snapshot
+	// provider + model populate the [model] section so the LLM can
+	// self-introspect "which backend am I running on, and what's my
+	// effective context window?". Both nil/empty hides the section
+	// (e.g. `metis tools` listing path doesn't have a live provider).
+	// Added 2026-05-17 after observing DeepSeek-V4 thought it had
+	// 200k when metis had already bumped its internal cap to 1M —
+	// the model couldn't see the bump without an introspection path.
+	provider llm.Provider
+	model    string
 }
 
 // NewMetisInfo wires up the introspection tool. Pass nil for any
@@ -67,9 +77,19 @@ func (m MetisInfo) WithSnapshot(snap *config.Snapshot) MetisInfo {
 	return m
 }
 
+// WithModel returns a copy of MetisInfo carrying the active provider
+// + model id so the [model] section can render the effective context
+// window. Builder-style for the same reason as WithSnapshot: keeps
+// the legacy 5-arg NewMetisInfo signature stable.
+func (m MetisInfo) WithModel(p llm.Provider, modelID string) MetisInfo {
+	m.provider = p
+	m.model = modelID
+	return m
+}
+
 func (MetisInfo) Name() string { return "MetisInfo" }
 func (MetisInfo) Description() string {
-	return "Introspection: dump effective config, providers, MCP servers, skills, hooks, permission mode, registered tools, and live background jobs as INI sections. Call when debugging \"why isn't tool X / skill Y / MCP Z working?\"."
+	return "Introspection: dump effective config, active model + context window, providers, MCP servers, skills, hooks, permission mode, registered tools, and live background jobs as INI sections. Call when debugging \"why isn't tool X / skill Y / MCP Z working?\" or \"what's my effective context limit on this model?\"."
 }
 
 func (MetisInfo) InputSchema() map[string]any {
@@ -78,7 +98,7 @@ func (MetisInfo) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"section": map[string]any{
 				"type":        "string",
-				"description": "Optional section filter — one of: providers, mcp, skills, tools, hooks, permission, jobs, options. Omit to dump everything.",
+				"description": "Optional section filter — one of: model, providers, mcp, skills, tools, hooks, permission, jobs, options. Omit to dump everything.",
 			},
 		},
 	}
@@ -101,6 +121,9 @@ func (m MetisInfo) Execute(_ context.Context, in map[string]any) (*tools.Result,
 
 	if want("config") {
 		m.writeConfigStaleness(&b)
+	}
+	if want("model") {
+		m.writeModel(&b)
 	}
 	if want("providers") {
 		m.writeProviders(&b)
@@ -162,6 +185,27 @@ func (m MetisInfo) writeConfigStaleness(b *strings.Builder) {
 		sort.Strings(paths)
 		fmt.Fprintf(b, "errors = %s\n", strings.Join(paths, ", "))
 	}
+	fmt.Fprintln(b)
+}
+
+// writeModel reports the active backend the LLM is talking through:
+// transport adapter name, model id, and the effective context window
+// after the 4-tier resolution in MaxContextTokens (override → catalog
+// → suffix → prefix). Lets the model self-answer "do I really have a
+// 1M window on DeepSeek-V4-Pro, or did metis fall back to 128k?".
+//
+// Skipped entirely when provider is nil (e.g. the `metis tools`
+// informational listing path doesn't construct one).
+func (m MetisInfo) writeModel(b *strings.Builder) {
+	if m.provider == nil {
+		return
+	}
+	fmt.Fprintln(b, "[model]")
+	fmt.Fprintf(b, "transport = %s\n", m.provider.Name())
+	if m.model != "" {
+		fmt.Fprintf(b, "id = %s\n", m.model)
+	}
+	fmt.Fprintf(b, "context_window = %d\n", m.provider.MaxContextTokens())
 	fmt.Fprintln(b)
 }
 

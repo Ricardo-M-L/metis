@@ -12,9 +12,27 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+// stubProvider satisfies the bare minimum of llm.Provider needed by
+// the [model] section — Name() and MaxContextTokens(). Complete /
+// Stream panic if called; the introspection path never hits them.
+type stubProvider struct {
+	name   string
+	window int
+}
+
+func (s *stubProvider) Name() string          { return s.name }
+func (s *stubProvider) MaxContextTokens() int { return s.window }
+func (s *stubProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	panic("stubProvider.Complete not used in this test")
+}
+func (s *stubProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	panic("stubProvider.Stream not used in this test")
+}
 
 func newTestCfg() *config.Config {
 	return &config.Config{
@@ -134,6 +152,41 @@ func TestMetisInfo_NilReferences(t *testing.T) {
 	}
 	if !strings.Contains(res.Output, "(unavailable)") {
 		t.Errorf("expected unavailable marker; got %q", res.Output)
+	}
+}
+
+func TestMetisInfo_ModelSection(t *testing.T) {
+	// The model section is the LLM's self-introspection path: lets a
+	// DeepSeek-V4 instance verify metis really gave it a 1M window
+	// (not the old 200k fallback). Pin the exact output shape so the
+	// model's parser doesn't break silently if we ever reword the INI.
+	tool := NewMetisInfo(nil, nil, nil, nil, nil).
+		WithModel(&stubProvider{name: "openai", window: 1_000_000}, "deepseek-v4-pro")
+
+	res, err := tool.Execute(context.Background(), map[string]any{"section": "model"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for _, want := range []string{
+		"[model]",
+		"transport = openai",
+		"id = deepseek-v4-pro",
+		"context_window = 1000000",
+	} {
+		if !strings.Contains(res.Output, want) {
+			t.Errorf("model section missing %q\n---\n%s", want, res.Output)
+		}
+	}
+}
+
+func TestMetisInfo_ModelSection_NilProviderHidden(t *testing.T) {
+	// `metis tools` listing path constructs MetisInfo without a live
+	// provider. The [model] section must vanish rather than render as
+	// "(unavailable)" — saves model tokens on every full dump.
+	tool := NewMetisInfo(nil, nil, nil, nil, nil)
+	res, _ := tool.Execute(context.Background(), map[string]any{"section": "model"})
+	if strings.Contains(res.Output, "[model]") {
+		t.Errorf("expected [model] section to be hidden when provider is nil; got %q", res.Output)
 	}
 }
 

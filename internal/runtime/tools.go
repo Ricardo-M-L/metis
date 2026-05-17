@@ -198,7 +198,9 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// references this function already has, so it sees changes that
 	// happen later (e.g. /reload toggling an MCP server's Disabled
 	// bit). Mirrors crush's crush_info — distinct from /doctor.
-	reg.Register(builtin.NewMetisInfo(opts.Gate, opts.Cfg, opts.Jobs, loader, reg).WithSnapshot(opts.ConfigSnapshot))
+	reg.Register(builtin.NewMetisInfo(opts.Gate, opts.Cfg, opts.Jobs, loader, reg).
+		WithSnapshot(opts.ConfigSnapshot).
+		WithModel(opts.Provider, opts.Model))
 	// EnterPlanMode / ExitPlanMode (P0 fix 2026-05-15): claude-code
 	// parity tools so the model can drop into plan mode mid-turn.
 	// Required because batch_prompt.go references ExitPlanMode by
