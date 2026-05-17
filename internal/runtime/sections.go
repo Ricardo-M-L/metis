@@ -189,6 +189,28 @@ func ReversibilitySection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
+// InteractionModesSection — case → mechanism table for when to ask
+// the user vs. when to act autonomously. Added 2026-05-17 after the
+// claude-code-sourcemap comparison surfaced that metis had no
+// guidance for picking AskUser vs EnterPlanMode vs permission-gate
+// vs "just act"; the model defaulted to "always act" (sometimes
+// missing user buy-in on big decisions) or "always ask" (friction
+// the user opted out of by running an agent).
+//
+// Skipped for sub-agents because they don't have a user channel:
+// the parent owns user interaction, the sub-agent only talks back
+// to the parent. Mirrors ReversibilitySection's exclusion logic.
+func InteractionModesSection(ctx PromptCtx) SystemPromptSection {
+	if ctx.IsSubAgent {
+		return SystemPromptSection{}
+	}
+	return SystemPromptSection{
+		Name:  "interaction_modes",
+		Body:  readSection("08_interaction_modes.md"),
+		Cache: true,
+	}
+}
+
 // DefaultSectionGetters is the canonical, ordered list of base
 // section getters. Assembler iterates this in order; each getter
 // decides whether to include its content based on PromptCtx.
@@ -206,5 +228,6 @@ func DefaultSectionGetters() []SectionGetter {
 		WorkingEfficientlySection,
 		SkillsSection,
 		ReversibilitySection,
+		InteractionModesSection,
 	}
 }

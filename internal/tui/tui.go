@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -266,6 +267,29 @@ type Model struct {
 	// "user walked away from VNC, agent stuck for hours on a Yes/No"
 	// failure mode the user hit during cross-CLI testing.
 	permStartedAt time.Time
+
+	// AskUser prompt state — set when the model dispatches the AskUser
+	// tool. While askUserActive is true, the prompt blocks the
+	// keyboard for selection (1-9 / arrows / Enter / Esc / Tab to
+	// freeform). askUserReply is the buffered (size-1) channel the
+	// tool's Execute is blocked on; sending the chosen string unblocks
+	// it. Mirrors permission-prompt state shape so the renderers /
+	// handlers stay parallel.
+	askUserActive   bool
+	askUserQuestion string
+	askUserOptions  []string
+	// askUserAllowFreeform: when true, an extra "type your own answer"
+	// row appears below the numbered options. Tab moves focus into the
+	// text input; Enter submits the typed answer. When false, only
+	// numbered selection is possible.
+	askUserAllowFreeform bool
+	askUserCursor        int // selected option index (0-based)
+	// askUserFreeformOn — focus is on the freeform input rather than
+	// the option list. Tab toggles this when allowFreeform is true.
+	askUserFreeformOn bool
+	askUserInput      textinput.Model
+	askUserReply      chan string
+	askUserStartedAt  time.Time
 
 	width, height int
 	startTime     time.Time

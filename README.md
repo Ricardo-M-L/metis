@@ -427,7 +427,7 @@ that lights up while the turn is running and clears on completion.
 | `LSP` | safe | symbol/diagnostic lookups via gopls when available |
 | `Memory` | exclusive | persistent memory CRUD |
 | `Skill` | safe | invoke a registered skill |
-| `Ask` | safe | mid-turn user clarification |
+| `AskUser` | exclusive | blocking 3-5 option menu — model surfaces a question, TUI renders numbered choices + optional freeform input, tool returns chosen answer |
 | `TodoWrite` / `TodoRead` | exclusive / safe | task list, persisted per-session |
 | `BashList` / `BashOutput` / `BashKill` | safe | inspect / read / terminate background bash jobs |
 | `EnterPlanMode` / `ExitPlanMode` | exclusive | enter/leave plan mode mid-turn (claude-code parity) |

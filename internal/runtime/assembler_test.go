@@ -11,12 +11,13 @@ func TestAssembleBaseSections_MainAgentFiresAll(t *testing.T) {
 		EnabledTools: map[string]bool{"Bash": true},
 		HasSkills:    true,
 	})
-	if len(got) != 7 {
-		t.Errorf("main agent with all conditions met should produce 7 sections, got %d", len(got))
+	if len(got) != 8 {
+		t.Errorf("main agent with all conditions met should produce 8 sections, got %d", len(got))
 	}
 	wantOrder := []string{
 		"identity", "privacy", "style", "tool_redirects",
 		"working_efficiently", "skills", "reversibility",
+		"interaction_modes",
 	}
 	for i, sec := range got {
 		if sec.Name != wantOrder[i] {

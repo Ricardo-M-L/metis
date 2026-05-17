@@ -115,7 +115,7 @@ func (m *Model) View() tea.View {
 	// Mirrors claude-code: native terminal cursor at the textarea
 	// position rather than a fake inverse-block character.
 	attachCursor := func(v tea.View, inputStartRow int) tea.View {
-		if m.activeScreen != nil || m.copyMode || m.permActive || m.showHistory {
+		if m.activeScreen != nil || m.copyMode || m.permActive || m.askUserActive || m.showHistory {
 			return v
 		}
 		cur := m.input.Cursor()
@@ -256,6 +256,9 @@ func (m *Model) View() tea.View {
 	var upper strings.Builder
 	if m.permActive {
 		upper.WriteString(renderPermission(m))
+	}
+	if m.askUserActive {
+		upper.WriteString(renderAskUser(m))
 	}
 
 	// Phase 1b: input + hints + palette/search/taskPanel + statusBar

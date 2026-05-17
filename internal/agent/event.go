@@ -120,6 +120,20 @@ const (
 	EventDreamingStart
 	EventDreamingProgress
 	EventDreamingEnd
+
+	// EventAskUser — the model dispatched the AskUser tool and is
+	// blocking on a user response. The TUI renders a question prompt
+	// with the model's labeled options (and optional freeform input)
+	// then writes the chosen answer back through AskUserReply so the
+	// tool can return a structured result. Mirrors claude-code's
+	// AskUserQuestion tool flow: tool blocks → UI surfaces options →
+	// user picks → tool unblocks with the choice as its tool result.
+	//
+	// Headless callers (metis run / sub-agents / scheduled jobs) see
+	// EventAskUser and route it to a fallback handler that returns
+	// "non-interactive" so the model gets a structured error instead
+	// of an indefinite hang.
+	EventAskUser
 )
 
 // eventOutKey carries the parent loop's event channel down to tools
@@ -291,6 +305,16 @@ type Event struct {
 	//
 	// Zero means this is the only / last pending ASK in the batch.
 	PermissionPending int
+
+	// AskUser events: model called the AskUser tool. Consumer (TUI)
+	// renders the prompt + options and writes the chosen answer back
+	// to AskUserReply. Empty AllowFreeform means the user is restricted
+	// to the supplied options; true means they may type a custom
+	// answer instead.
+	AskUserQuestion     string
+	AskUserOptions      []string
+	AskUserAllowFreeform bool
+	AskUserReply        chan string // buffered, size 1
 
 	// Token + info. CacheCreationInputTokens / CacheReadInputTokens
 	// mirror Anthropic's prompt-caching usage and let the TUI compute

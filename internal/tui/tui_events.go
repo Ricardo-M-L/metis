@@ -150,6 +150,20 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		}
 		m.permCursor = 0
 		m.permReply = ev.PermissionReply
+	case agent.EventAskUser:
+		m.askUserActive = true
+		m.askUserStartedAt = time.Now()
+		m.askUserQuestion = ev.AskUserQuestion
+		m.askUserOptions = append([]string(nil), ev.AskUserOptions...)
+		m.askUserAllowFreeform = ev.AskUserAllowFreeform
+		m.askUserCursor = 0
+		// Default focus on the option list when options exist; jump to
+		// freeform when the model gave us no options (the tool forces
+		// allowFreeform true in that case to keep the user from being
+		// stranded with nothing to click).
+		m.askUserFreeformOn = len(m.askUserOptions) == 0 && m.askUserAllowFreeform
+		m.askUserReply = ev.AskUserReply
+		m.askUserInput = newAskUserInput()
 	case agent.EventTokens:
 		m.totalTokens.add(ev.InputTokens, ev.OutputTokens, ev.CacheCreationInputTokens, ev.CacheReadInputTokens)
 	case agent.EventTurnEnd:

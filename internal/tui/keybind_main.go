@@ -29,6 +29,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return model, cmd
 		}
 	}
+	if m.askUserActive {
+		// AskUser prompt — same partial-intercept policy as
+		// permission. Navigation / selection / dismiss keys (arrows,
+		// enter, 1-9, esc, tab) and the freeform input's keystrokes
+		// are consumed here; everything else falls through so the user
+		// can still compose the next message in the background.
+		if model, cmd, handled := m.handleAskUserKey(msg); handled {
+			return model, cmd
+		}
+	}
 	// Palette is a hovering suggestion layer rather than a modal dialog —
 	// it intercepts only navigation keys (Up/Down/Tab/Esc) and lets every
 	// other key fall through to the main input handler so the user keeps

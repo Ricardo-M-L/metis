@@ -37,7 +37,22 @@ func NewEnterPlanMode() EnterPlanMode { return EnterPlanMode{} }
 func (EnterPlanMode) Name() string { return "EnterPlanMode" }
 
 func (EnterPlanMode) Description() string {
-	return "Switch the agent into plan mode. After this call, the next batch of tool calls will be SHOWN to the user as a plan instead of executed — use this when the user asked for a proposal before action, or when the task is risky enough that a dry-run review is warranted. Call ExitPlanMode with the final plan markdown to surface it for approval and resume normal execution."
+	return "Switch the agent into plan mode. After this call, the next " +
+		"batch of tool calls will be SHOWN to the user as a plan " +
+		"instead of executed — use this when the user asked for a " +
+		"proposal before action, or when the task is risky enough that " +
+		"a dry-run review is warranted. Call ExitPlanMode with the " +
+		"final plan markdown to surface it for approval and resume " +
+		"normal execution.\n\n" +
+		"Caveat: in metis, ExitPlanMode surfaces the plan for review and " +
+		"then resumes execution on the next turn — the user must " +
+		"actively interrupt (Ctrl+C) to halt. It is NOT a blocking " +
+		"approval gate. Headless / scheduled runs see the plan in the " +
+		"event stream but cannot pause for human input. Do NOT rely on " +
+		"this tool for true 'wait for user to click approve' semantics. " +
+		"For multi-choice clarification (pick one of N options), use " +
+		"`AskUser` instead — that's the right tool when you actually " +
+		"need a response back."
 }
 
 func (EnterPlanMode) InputSchema() map[string]any {
@@ -94,7 +109,19 @@ func NewExitPlanMode() ExitPlanMode { return ExitPlanMode{} }
 func (ExitPlanMode) Name() string { return "ExitPlanMode" }
 
 func (ExitPlanMode) Description() string {
-	return "Leave plan mode and surface the final plan to the user. Required argument `plan` is the markdown body of your proposed work — bullet points, file paths, exact commands, expected outcomes. After this call, normal tool execution resumes; the user can interrupt (Ctrl+C) if the plan needs revision."
+	return "Leave plan mode and surface the final plan to the user. " +
+		"Required argument `plan` is the markdown body of your " +
+		"proposed work — bullet points, file paths, exact commands, " +
+		"expected outcomes. After this call, normal tool execution " +
+		"resumes; the user can interrupt (Ctrl+C) if the plan needs " +
+		"revision.\n\n" +
+		"Important: this is the right tool when you want to PROPOSE " +
+		"a multi-step plan and continue (the user reads it, the next " +
+		"turn starts executing). It is NOT the right tool when you " +
+		"need a structured pick-one-of-N answer — use `AskUser` for " +
+		"that. The two tools cover different cases: ExitPlanMode says " +
+		"'here is what I'm about to do, speak up if wrong'; AskUser " +
+		"says 'pick one of these options, I'll wait.'"
 }
 
 func (ExitPlanMode) InputSchema() map[string]any {

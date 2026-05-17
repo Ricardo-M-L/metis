@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"charm.land/glamour/v2"
@@ -506,6 +507,15 @@ func (r *REPL) runTurn(ctx context.Context) error {
 		case agent.EventPermissionRequest:
 			decision := r.askPermission(ev)
 			ev.PermissionReply <- decision
+		case agent.EventAskUser:
+			// Plain-REPL fallback for the AskUser tool: render question
+			// + numbered options, read one line. Empty input = dismiss
+			// (the tool surfaces that as IsError so the model can
+			// fallback). Non-interactive stdin returns dismiss too.
+			answer := r.askUser(ev)
+			if ev.AskUserReply != nil {
+				ev.AskUserReply <- answer
+			}
 		case agent.EventTurnEnd:
 			r.flushTextBeforeTool(turnStartedText)
 			turnStartedText = false
@@ -559,6 +569,52 @@ func (r *REPL) flushTextBeforeTool(turnStartedText bool) {
 		fmt.Fprintln(r.out)
 	}
 	r.streamBuf.Reset()
+}
+
+// askUser is the readline-REPL counterpart of the TUI's AskUser
+// prompt. Renders the question + numbered options, reads one line of
+// input, and resolves numbers to option strings ("2" → options[1]).
+// Anything else is returned verbatim so the user can type a freeform
+// answer when the tool was dispatched with allow_freeform.
+//
+// Empty input (or EOF) returns "" → ask.go treats that as "user
+// dismissed" and surfaces an IsError result.
+func (r *REPL) askUser(ev agent.Event) string {
+	var b strings.Builder
+	b.WriteString("askuser: ")
+	b.WriteString(ev.AskUserQuestion)
+	if len(ev.AskUserOptions) > 0 {
+		b.WriteString("\n")
+		for i, opt := range ev.AskUserOptions {
+			b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, opt))
+		}
+		b.WriteString("pick 1-")
+		b.WriteString(fmt.Sprintf("%d", len(ev.AskUserOptions)))
+		if ev.AskUserAllowFreeform {
+			b.WriteString(" (or type your own answer)")
+		}
+	} else if ev.AskUserAllowFreeform {
+		b.WriteString("\n(type your answer)")
+	}
+	fmt.Fprintln(r.out)
+	fmt.Fprintln(r.out, r.Styles.PermissionBox.Render(b.String()))
+	in := bufio.NewReader(r.stdin)
+	fmt.Fprint(r.out, r.Styles.UserPrompt.Render("? "))
+	line, err := in.ReadString('\n')
+	if err != nil {
+		return ""
+	}
+	answer := strings.TrimSpace(line)
+	if answer == "" {
+		return ""
+	}
+	// Numeric shortcut → option lookup. A bare digit that maps to a
+	// valid option returns the option string; otherwise the input is
+	// passed through as-is (so "3rd choice please" stays verbatim).
+	if n, perr := strconv.Atoi(answer); perr == nil && n >= 1 && n <= len(ev.AskUserOptions) {
+		return ev.AskUserOptions[n-1]
+	}
+	return answer
 }
 
 func (r *REPL) askPermission(ev agent.Event) agent.PermissionDecision {

@@ -82,6 +82,7 @@ func TestDefaultSectionGetters_Ordered(t *testing.T) {
 	wantNames := []string{
 		"identity", "privacy", "style", "tool_redirects",
 		"working_efficiently", "skills", "reversibility",
+		"interaction_modes",
 	}
 	if len(getters) != len(wantNames) {
 		t.Fatalf("expected %d getters, got %d", len(wantNames), len(getters))

@@ -1411,6 +1411,16 @@ func cmdRun(ctx context.Context, args []string) error {
 		case agent.EventPermissionRequest:
 			ev.PermissionReply <- agent.PermissionDecisionDeny
 			fmt.Fprintf(os.Stderr, "[permission] denied (non-interactive); use chat for interactive prompts\n")
+		case agent.EventAskUser:
+			// Headless / metis run path: there's no user to answer the
+			// model's question. Send an empty string back to dismiss
+			// the prompt — the AskUser tool surfaces that as an
+			// IsError result so the model can fall back to a default
+			// rather than hang waiting for input that will never come.
+			if ev.AskUserReply != nil {
+				ev.AskUserReply <- ""
+			}
+			fmt.Fprintf(os.Stderr, "[askuser] dismissed (non-interactive); use chat for interactive prompts\n")
 		case agent.EventPlan:
 			// Plan mode: archive + print a structured summary so the
 			// non-interactive caller can pipe the result.
@@ -2046,6 +2056,13 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 			}
 		case agent.EventPermissionRequest:
 			ev.PermissionReply <- agent.PermissionDecisionDeny
+		case agent.EventAskUser:
+			// Cron-run path: no operator on the other end. Drain with
+			// empty answer so the tool surfaces a structured error and
+			// the loop keeps moving instead of hanging on input.
+			if ev.AskUserReply != nil {
+				ev.AskUserReply <- ""
+			}
 		case agent.EventLoopDone:
 			if !job.Silent {
 				fmt.Println()
