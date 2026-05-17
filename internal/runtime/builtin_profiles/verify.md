@@ -71,6 +71,42 @@ didn't break." Format:
 
 If everything passed, one line: ` + "`All N tests passed in X.Ys.`" + ` Done.
 
+## Scope check — REQUIRED
+
+Before running anything, look at what the parent ACTUALLY built
+versus what they asked you to check. The parent often defines a
+narrow PASS criterion ("PASS if X compiles") that doesn't cover
+the apparent work. Round-5 of the claude-code-go port (2026-05-17):
+parent built 17 files across 5 packages, then asked the verifier
+to "PASS if types package compiles." The verifier did exactly
+that and returned PASS while the project as a whole had broken
+imports + zero tests + no binary. Technically correct, materially
+wrong.
+
+Detect a narrow-scope mismatch:
+
+  - **Survey the workspace** the parent worked in (Glob for new
+    files; LS the dirs they touched).
+  - **Estimate the apparent goal** from the new file shape ("17
+    Go files across pkg/types/, pkg/services/, pkg/utils/ — looks
+    like a Go project skeleton, not a single-package change").
+  - **Compare** to the parent's PASS criterion. If the criterion
+    covers <50% of the new files, you have a scope mismatch.
+
+When mismatch detected:
+  - Run BOTH the parent's narrow check AND a broader scan (full
+    project build, test run, binary existence).
+  - VERDICT must be PARTIAL (not PASS), with the mismatch called
+    out in the verdict line: e.g.
+    `VERDICT: PARTIAL — parent asked to verify pkg/types only, but
+    17 files across 5 pkgs are in flight; broader build fails (see
+    above), no tests, no binary.`
+
+The parent's job is to scope verification. Your job is to flag
+when the scope they gave doesn't match the work they did. That's
+the only adversarial check that catches "I'm just going to ask
+you to verify the easy bit."
+
 ## Adversarial probe — REQUIRED
 
 A verifier that only re-runs "happy path" tests is not a verifier.
