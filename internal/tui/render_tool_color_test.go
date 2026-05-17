@@ -5,6 +5,42 @@ import (
 	"testing"
 )
 
+// TestToolCallHeader_ArgsDefaultFg — the args preview inside the
+// `glob(...)` parens (and equivalent for every tool) renders at default
+// fg, not styleMuted. User screenshot 38 / 2026-05-18 flagged the
+// path inside `glob(**/.metis/**/*.toml)` as still grey after the
+// screenshot 36 pass — the args are the information the user came to
+// read; only the brackets stay muted as structural chrome.
+func TestToolCallHeader_ArgsDefaultFg(t *testing.T) {
+	te := ToolEvent{
+		Kind:     "start",
+		ToolName: "Glob",
+		Input:    map[string]any{"pattern": "**/.metis/**/*.toml"},
+	}
+	out := renderToolEvent(te, false)
+
+	// The muted dim grey style we use for chrome (textMuted #606060).
+	const mutedSGR = "38;2;96;96;96"
+	args := toolArgsPreview(te.ToolName, te.Input)
+	if args == "" {
+		t.Skip("no args preview for this fixture — test premise invalid")
+	}
+	// Locate the args text and confirm the byte directly before it
+	// closes any muted wrapper (so the args aren't inside one).
+	idx := strings.Index(out, args)
+	if idx < 0 {
+		t.Fatalf("args %q missing from output:\n%s", args, out)
+	}
+	before := out[:idx]
+	if last := strings.LastIndex(before, mutedSGR); last >= 0 {
+		tail := before[last:]
+		if !strings.Contains(tail, "\x1b[m") && !strings.Contains(tail, "\x1b[0m") {
+			t.Errorf("args %q appears inside an unclosed muted wrapper at byte %d; got:\n%s",
+				args, last, out)
+		}
+	}
+}
+
 // TestToolResultHeader_SummaryDefaultFg — the "✓ 0s · Read X (N lines)"
 // summary text after the ✓/✗ glyph must render at default fg, not
 // styleDim. User screenshot 36 / 2026-05-17 flagged the prior dim

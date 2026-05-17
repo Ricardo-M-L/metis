@@ -61,6 +61,12 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	s.WriteString(leaderColor.Render("  " + glyphBullet + " "))
 	s.WriteString(styleToolName.Render(displayToolName(te.ToolName)))
 	if args := toolArgsPreview(te.ToolName, te.Input); args != "" {
+		// Brackets are pure structural chrome — stay muted. The args
+		// payload inside them is what the user came to read (path /
+		// query / URL), so it renders at default fg (user screenshot
+		// 38, 2026-05-18: "glob(**/.metis/**/*.toml) 蓝色框画出来的
+		// 为啥还是灰色"). Same rule that lifted the result-summary
+		// line to default fg in screenshot 36.
 		s.WriteString(styleMuted.Render("("))
 		// WebFetch: wrap the truncated URL display with OSC 8 so
 		// terminals that support it (iTerm2, WezTerm, Alacritty,
@@ -68,12 +74,12 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		// terminals see the same text and just no-op the escape.
 		if te.ToolName == "WebFetch" {
 			if url, ok := te.Input["url"].(string); ok && url != "" {
-				s.WriteString(osc8Link(styleMuted.Render(args), url))
+				s.WriteString(osc8Link(args, url))
 			} else {
-				s.WriteString(styleMuted.Render(args))
+				s.WriteString(args)
 			}
 		} else {
-			s.WriteString(styleMuted.Render(args))
+			s.WriteString(args)
 		}
 		s.WriteString(styleMuted.Render(")"))
 	}
