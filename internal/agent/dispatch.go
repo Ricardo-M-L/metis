@@ -238,15 +238,30 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		}
 
 		// Permission decision.
-		perm, _ := t.CanUse(ctx, j.blk.ToolInput)
+		//
+		// The reason string from CanUse used to be discarded with `_`,
+		// which meant a deny showed up as opaque "denied" everywhere:
+		// the model saw "denied by permission policy" (which doesn't
+		// say WHY) and the TUI / non-interactive log saw bare "denied"
+		// (which doesn't even hint where to look). Caught during the
+		// 2026-05-18 bench6 review — 1–3 mystery denies per run that
+		// no one could debug without source-diving. Surface the reason
+		// in BOTH outbound channels so future denies are debuggable.
+		perm, reason := t.CanUse(ctx, j.blk.ToolInput)
 		if perm == tools.PermissionDeny {
+			modelMsg := "denied by permission policy"
+			tuiMsg := "denied"
+			if reason != "" {
+				modelMsg = "denied by permission policy: " + reason
+				tuiMsg = "denied: " + reason
+			}
 			blkOut := llm.ContentBlock{
 				Type: "tool_result", ToolUseID: b.ToolUseID,
-				ToolResult: "denied by permission policy", IsError: true,
+				ToolResult: modelMsg, IsError: true,
 			}
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
-				ToolResult: &ToolResult{Output: "denied", IsError: true},
+				ToolResult: &ToolResult{Output: tuiMsg, IsError: true},
 			})
 			j.early = &blkOut
 			continue

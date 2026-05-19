@@ -94,9 +94,22 @@ func (p *progressDetector) RecordIter(toolUses []llm.ContentBlock, results []llm
 		// Skip mutating tools — see comment above. Writes /
 		// edits / shell mutations are valuable even when their
 		// echo output is short.
+		//
+		// Bash is added here (2026-05-19) after the bench6 iter6
+		// false-positive: a successful `go test ./...` prints just
+		// "ok    pkg    0.123s" (~25 bytes) per package. Three
+		// consecutive green test runs past the 75% nudge → all
+		// below the threshold → diminishing-returns aborted the
+		// run RIGHT AFTER the model said "All tests pass. Now run
+		// with -race -cover as requested." We mistook the green
+		// finish-line for a stuck spin. Any Bash that reached this
+		// branch already passed the IsError=true skip above, so it
+		// exited 0 — that's the strongest possible progress signal
+		// (the model actually got something to work), regardless of
+		// how chatty its stdout was.
 		if i < len(toolUses) {
 			switch toolUses[i].ToolName {
-			case "Write", "Edit", "MultiEdit", "NotebookEdit":
+			case "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash":
 				usefulBytes += progressLowBytesThreshold // count as full credit
 				continue
 			}

@@ -378,11 +378,26 @@ func ruleShellRCWrite(cmd string) SecurityRuleResult {
 // unrecoverable disk wipes. `> /dev/null` is fine and common, so we
 // explicitly allow that special case while denying all other /dev
 // writes. Also covers dd's of= argv form.
+//
+// 2026-05-19 fix: \S+ used to greedily capture trailing shell
+// punctuation, so `> /dev/null;` extracted "null;" — which doesn't
+// match the `dev == "null"` allowlist case and false-positive denied
+// the wholly common `cmd > /dev/null;`. The strippable trailers are
+// shell terminators / operators that always end a redirect target:
+// `; & | ) > <` (and CRLF, which can land in here via heredocs).
 func ruleDeviceFileWrite(cmd string) SecurityRuleResult {
 	// Pattern A: `>` or `>>` redirect to /dev/<thing>.
-	reRedirect := regexp.MustCompile(`>\s*/dev/(\S+)`)
 	// Pattern B: dd-style of=/dev/<thing>.
-	reOfArg := regexp.MustCompile(`\bof=/dev/(\S+)`)
+	//
+	// The capture group stops at whitespace OR shell separators
+	// (; & | ) < >). The earlier `\S+` was too greedy: it ate
+	// `null;` in `cmd > /dev/null;` and `null|grep` in
+	// `cmd 2>/dev/null|grep` — both false-positive denied. The
+	// stricter charclass below was added 2026-05-19 after the
+	// bench-iter6 deepseek run surfaced the bug via the new
+	// deny-reason logging.
+	reRedirect := regexp.MustCompile(`>\s*/dev/([^\s;|&)<>]+)`)
+	reOfArg := regexp.MustCompile(`\bof=/dev/([^\s;|&)<>]+)`)
 
 	allMatches := append([][]string(nil), reRedirect.FindAllStringSubmatch(cmd, -1)...)
 	allMatches = append(allMatches, reOfArg.FindAllStringSubmatch(cmd, -1)...)

@@ -20,6 +20,14 @@ func TestCheckCommand_AllowsBenignCommands(t *testing.T) {
 		"curl https://example.com",
 		`echo "hash: $(date +%s)"`, // command sub in plain echo is fine
 		"ps aux | grep nginx",
+		// /dev/null with trailing shell punctuation — rule #29
+		// `\S+` regex used to greedy-capture the ';' and false-positive
+		// reject. Caught on 2026-05-19 bench-iter6 deepseek run.
+		"echo hi > /dev/null;",
+		"command > /dev/null; another_command",
+		"go test ./... > /dev/null 2>&1",
+		"foo 2>/dev/null|grep bar",
+		"echo done > /dev/null && echo more",
 	}
 	for _, cmd := range benign {
 		t.Run(cmd, func(t *testing.T) {

@@ -83,6 +83,37 @@ func TestProgressDetector_WritesGetFullCredit(t *testing.T) {
 	}
 }
 
+// TestProgressDetector_SuccessfulBashGetsFullCredit pins the 2026-05-19
+// bench6 iter6 fix: a successful `go test ./...` emits only "ok pkg
+// 0.123s" (~25 chars) per package, well under the threshold. The model
+// running 3 successful test commands in a row past the 75% nudge used
+// to trip diminishing-returns and abort — RIGHT after saying "All tests
+// pass." Successful Bash (IsError=false) now gets full credit, same as
+// Write/Edit.
+func TestProgressDetector_SuccessfulBashGetsFullCredit(t *testing.T) {
+	p := newProgressDetector()
+	for i := 0; i < 5; i++ {
+		p.RecordIter(uses("Bash", 1), resultsOf([]string{"ok\tcalc\t0.123s\n"}, nil))
+	}
+	if p.IsDiminishing() {
+		t.Errorf("successful Bash with short output should not trip; consecutive=%d", p.ConsecutiveLow())
+	}
+}
+
+// TestProgressDetector_FailedBashStillCountsLow — counterpart safety:
+// a Bash that errored out (IsError=true) IS low-progress, just like
+// any other errored result. Don't accidentally credit failed test runs
+// via the new Bash branch.
+func TestProgressDetector_FailedBashStillCountsLow(t *testing.T) {
+	p := newProgressDetector()
+	for i := 0; i < 3; i++ {
+		p.RecordIter(uses("Bash", 1), resultsOf([]string{"--- FAIL: TestX\nFAIL\n"}, []bool{true}))
+	}
+	if !p.IsDiminishing() {
+		t.Errorf("3 failed Bash iters should still trip diminishing-returns; consecutive=%d", p.ConsecutiveLow())
+	}
+}
+
 func TestProgressDetector_EmptyResultsCountAsLow(t *testing.T) {
 	// Model emitted tool_use blocks but executeBatch returned
 	// nothing (e.g. all tools failed pre-execution). That's not
