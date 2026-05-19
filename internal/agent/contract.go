@@ -55,6 +55,17 @@ type contractTracker struct {
 	verifyDispatched bool // true iff one Agent call had subagent_type=verify
 	reminderFired    bool // true iff the mid-turn reminder has already fired
 	gateAttempts     int  // number of times end-of-turn gate held the loop
+
+	// Phase B (2026-05-19): track the verify subagent's VERDICT line
+	// so the end gate can refuse release on FAIL/PARTIAL/MISSING.
+	// Caught on bench-iter10 where the model dispatched verify, got
+	// back a FAIL verdict on parser tests, and end_turn'd anyway —
+	// the pre-fix shouldGateEnd only checked "did you dispatch?",
+	// not "did the verdict actually pass?". Empty string = no verify
+	// result observed yet; "MISSING" = verify ran but didn't emit
+	// the mandated VERDICT line; others are the literal verdict.
+	lastVerifyVerdict   string
+	verdictGateAttempts int // separate from gateAttempts so the verdict-gate budget doesn't share with the dispatch-gate budget
 }
 
 // observeToolUses tallies the batch the model just emitted. Counted
@@ -73,6 +84,63 @@ func (ct *contractTracker) observeToolUses(toolUses []llm.ContentBlock) {
 			}
 		}
 	}
+}
+
+// observeToolResults pairs the just-completed tool_results with
+// their originating toolUses, extracts the VERDICT line from any
+// verify-subagent result, and stashes it on the tracker for the
+// end-gate to consult. Phase B (2026-05-19) — see lastVerifyVerdict
+// field comment for the bench-iter10 case this catches.
+//
+// VERDICT extraction:
+//   - Match the LAST `VERDICT: PASS|FAIL|PARTIAL` line in the body
+//     (subagent profile mandates it on its own line at the end).
+//   - If verify dispatched but body contains no VERDICT line, record
+//     "MISSING" so the gate can hold for the same reason ("verify
+//     didn't follow protocol → not safe to release").
+//   - Only set when subagent_type was exactly "verify"; other
+//     subagent types are out of scope for this gate.
+func (ct *contractTracker) observeToolResults(toolUses, results []llm.ContentBlock) {
+	for i, tu := range toolUses {
+		if tu.Type != "tool_use" || tu.ToolName != "Agent" {
+			continue
+		}
+		st, _ := tu.ToolInput["subagent_type"].(string)
+		if st != contractVerifySubagentID {
+			continue
+		}
+		if i >= len(results) {
+			continue
+		}
+		body := results[i].ToolResult
+		ct.lastVerifyVerdict = extractVerdict(body)
+	}
+}
+
+// extractVerdict scans subagent body for the mandated VERDICT line.
+// Returns "PASS", "FAIL", "PARTIAL", or "MISSING" (no VERDICT line
+// found). The match is case-sensitive on "VERDICT:" per profile;
+// the verdict word itself is also case-sensitive — the profile
+// specifies upper-case and the verifier subagent must honor it.
+//
+// Takes the LAST match in case the subagent paraphrased earlier
+// (the truthful verdict is always the final summary line).
+func extractVerdict(body string) string {
+	const marker = "VERDICT:"
+	lastIdx := strings.LastIndex(body, marker)
+	if lastIdx < 0 {
+		return "MISSING"
+	}
+	tail := body[lastIdx+len(marker):]
+	// Trim leading whitespace; the verdict word is the first
+	// non-whitespace token after "VERDICT:".
+	tail = strings.TrimLeft(tail, " \t")
+	for _, want := range []string{"PASS", "FAIL", "PARTIAL"} {
+		if strings.HasPrefix(tail, want) {
+			return want
+		}
+	}
+	return "MISSING"
 }
 
 // contractDisabled returns true when METIS_CONTRACT_DISABLE=1 is
@@ -138,13 +206,56 @@ func (ct *contractTracker) shouldGateEnd(assistantText string) string {
 	if contractDisabled() {
 		return ""
 	}
-	if !ct.thresholdMet() || ct.verifyDispatched {
+	if !ct.thresholdMet() {
+		return ""
+	}
+	// Override applies to BOTH the dispatch-gate (no verify yet) and
+	// the verdict-gate (verify ran but didn't pass) — it's an escape
+	// hatch for the whole contract.
+	if strings.Contains(assistantText, contractOverridePhrase) {
+		return ""
+	}
+
+	// Phase B: verdict gate. If verify was dispatched and we observed
+	// a verdict, only PASS releases. FAIL / PARTIAL / MISSING all
+	// hold — model must address findings and re-verify. Separate
+	// attempt budget so a model that keeps getting FAIL doesn't burn
+	// its dispatch-gate budget too.
+	if ct.verifyDispatched && ct.lastVerifyVerdict != "" && ct.lastVerifyVerdict != "PASS" {
+		if ct.verdictGateAttempts >= contractMaxGateAttempts {
+			return ""
+		}
+		ct.verdictGateAttempts++
+		return fmt.Sprintf(
+			"<system-reminder>\n"+
+				"VERDICT GATE — HALT (attempt %d of %d). Your verify "+
+				"subagent returned VERDICT: %s. Per the contract, end "+
+				"is not allowed until VERDICT: PASS. Pick one:\n\n"+
+				"  (a) Address the verifier's findings (read its report, "+
+				"fix the failing tests / missing pieces), then RE-DISPATCH "+
+				"Agent({subagent_type: \"verify\", ...}) and wait for PASS.\n\n"+
+				"  (b) Override by writing this exact phrase as a line in "+
+				"your next reply:\n"+
+				"          %s <one-line reason why a non-PASS verdict is OK here>\n"+
+				"      (Logged for audit. Genuine cases: the verifier was "+
+				"wrong about the scope, or PARTIAL is the intended end "+
+				"state for this task. Don't override just because fixing "+
+				"is hard.)\n\n"+
+				"After attempt %d/%d, the loop releases with a warning so "+
+				"we don't burn tokens infinitely.\n"+
+				"</system-reminder>",
+			ct.verdictGateAttempts, contractMaxGateAttempts,
+			ct.lastVerifyVerdict,
+			contractOverridePhrase,
+			ct.verdictGateAttempts, contractMaxGateAttempts,
+		)
+	}
+
+	// Original dispatch gate: verify never dispatched.
+	if ct.verifyDispatched {
 		return ""
 	}
 	if ct.gateAttempts >= contractMaxGateAttempts {
-		return ""
-	}
-	if strings.Contains(assistantText, contractOverridePhrase) {
 		return ""
 	}
 	ct.gateAttempts++

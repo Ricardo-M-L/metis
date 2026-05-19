@@ -353,6 +353,51 @@ func TestStuckDetector_GreenBuildResetsBothCounters(t *testing.T) {
 	}
 }
 
+// TestStuckDetector_DeniedBashDoesNotResetCounter — Phase C-mini v5
+// (iter9 bug fix): a DENIED Bash (rule #23 etc.) returns IsError=true
+// with body "denied: ..." — NO "--- FAIL:" marker. The pre-fix detector
+// treated "no FAIL marker" as green build and reset the noGreenCount,
+// which let model loops with interleaved denies escape detection. After
+// the fix, IsError=true counts as failure regardless of marker.
+func TestStuckDetector_DeniedBashDoesNotResetCounter(t *testing.T) {
+	s := &stuckDetector{}
+	// 3 same-test failures.
+	runFailTurn(t, s, "TestA")
+	runFailTurn(t, s, "TestA")
+	runFailTurn(t, s, "TestA")
+	if s.noGreenCount != 3 {
+		t.Fatalf("setup: noGreenCount=%d, want 3", s.noGreenCount)
+	}
+	// Now a denied Bash (mimics the iter9 rule #23 trip).
+	deniedResult := llm.ContentBlock{
+		Type:       "tool_result",
+		ToolUseID:  "b-bad",
+		ToolResult: "denied by permission policy: bash-security rule #23: newline inside an unclosed quoted region — multi-line smuggling",
+		IsError:    true,
+	}
+	s.AfterTurn(
+		[]llm.ContentBlock{bashOf("badcmd")},
+		[]llm.ContentBlock{deniedResult},
+	)
+	// Both counters must persist (not reset to 0). And the
+	// noGreenCount must have INCREMENTED since denied still counts
+	// as a failed Bash turn.
+	if s.noGreenCount != 4 {
+		t.Errorf("noGreenCount after deny should be 4, got %d (deny may have wrongly reset)", s.noGreenCount)
+	}
+	if s.sigCount == 0 {
+		t.Error("sigCount must persist after deny; got 0 (deny wrongly reset)")
+	}
+	// And 4 more failures → noGreenCount=8 → trips broad detector.
+	runFailTurn(t, s, "TestA")
+	runFailTurn(t, s, "TestA")
+	runFailTurn(t, s, "TestA")
+	out := runFailTurn(t, s, "TestA")
+	if out != stuckResetNeeded {
+		t.Errorf("after 8 effective fails (with deny in middle): want stuckResetNeeded, got %v (noGreenCount=%d)", out, s.noGreenCount)
+	}
+}
+
 func TestBashRan(t *testing.T) {
 	cases := []struct {
 		name     string

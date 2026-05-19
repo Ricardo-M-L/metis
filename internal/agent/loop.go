@@ -896,6 +896,13 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			l.Detector.RecordStep(toolUses, results)
 		}
 
+		// Phase B verdict tracking: scan results for verify-subagent
+		// VERDICT lines so the end-of-turn gate can refuse release on
+		// non-PASS verdicts. Must run AFTER executeBatch (need result
+		// bodies) and BEFORE the next iteration's shouldGateEnd check.
+		// See contract.go::observeToolResults for the extraction logic.
+		l.contract.observeToolResults(toolUses, results)
+
 		// Diminishing-returns detector: pair tool_uses with results
 		// and count an iter as "low-progress" when the non-error
 		// output bytes sum below a small threshold. After 3 such

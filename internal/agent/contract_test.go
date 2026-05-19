@@ -247,3 +247,153 @@ func TestContract_GateEnd_RespectsEnvFromConstFn(t *testing.T) {
 		t.Errorf("contractDisabled should be true when env=1")
 	}
 }
+
+// ----- Phase B verdict-gate tests (2026-05-19) -----
+
+// makeToolResult builds a tool_result block to pair with a tool_use.
+func makeToolResult(body string) llm.ContentBlock {
+	return llm.ContentBlock{Type: "tool_result", ToolResult: body}
+}
+
+func TestExtractVerdict_AllShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"pass at end", "did some work\nVERDICT: PASS\n", "PASS"},
+		{"fail at end", "found bugs\nVERDICT: FAIL — 2 tests failed\n", "FAIL"},
+		{"partial at end", "covered half\nVERDICT: PARTIAL — only ran unit tests\n", "PARTIAL"},
+		{"no verdict line", "subagent forgot to summarize", "MISSING"},
+		{"verdict mid-body, then pass at end", "VERDICT: FAIL\nactually wait, fixed it\nVERDICT: PASS\n", "PASS"},
+		{"unknown verdict word", "VERDICT: UNCLEAR\n", "MISSING"},
+		{"verdict with tab", "VERDICT:\tPASS\n", "PASS"},
+		{"empty body", "", "MISSING"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := extractVerdict(c.body); got != c.want {
+				t.Errorf("extractVerdict(%q) = %q, want %q", c.body, got, c.want)
+			}
+		})
+	}
+}
+
+func TestObserveToolResults_SetsVerdictFromVerifyOnly(t *testing.T) {
+	var ct contractTracker
+	uses := []llm.ContentBlock{
+		makeToolUse("Agent", map[string]any{"subagent_type": "plan"}), // not verify
+		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
+	}
+	results := []llm.ContentBlock{
+		makeToolResult("plan report\nVERDICT: PASS\n"), // verdict in non-verify result must be ignored
+		makeToolResult("verify report\nVERDICT: FAIL — broken\n"),
+	}
+	ct.observeToolResults(uses, results)
+	if ct.lastVerifyVerdict != "FAIL" {
+		t.Errorf("lastVerifyVerdict = %q, want FAIL (verify only)", ct.lastVerifyVerdict)
+	}
+}
+
+func TestGateEnd_VerdictGate_FailHolds(t *testing.T) {
+	var ct contractTracker
+	// Threshold via writes + verify dispatched.
+	for i := 0; i < contractWriteThreshold; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	}
+	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{verifyUse})
+	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
+		makeToolResult("findings\nVERDICT: FAIL — 3 tests failed\n"),
+	})
+	body := ct.shouldGateEnd("done")
+	if body == "" {
+		t.Fatal("FAIL verdict must hold the end gate; got empty")
+	}
+	if !strings.Contains(body, "VERDICT GATE") || !strings.Contains(body, "FAIL") {
+		t.Errorf("gate message should mention VERDICT GATE + the verdict; got: %q", body)
+	}
+}
+
+func TestGateEnd_VerdictGate_PartialHolds(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < contractWriteThreshold; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	}
+	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{verifyUse})
+	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
+		makeToolResult("VERDICT: PARTIAL — only ran half the tests\n"),
+	})
+	if body := ct.shouldGateEnd("done"); body == "" {
+		t.Error("PARTIAL verdict must hold the end gate")
+	}
+}
+
+func TestGateEnd_VerdictGate_MissingHolds(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < contractWriteThreshold; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	}
+	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{verifyUse})
+	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
+		makeToolResult("did some checks but forgot the verdict line"),
+	})
+	if body := ct.shouldGateEnd("done"); body == "" {
+		t.Error("MISSING verdict must hold the end gate (verifier broke protocol)")
+	}
+}
+
+func TestGateEnd_VerdictGate_PassReleases(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < contractWriteThreshold; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	}
+	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{verifyUse})
+	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
+		makeToolResult("all good\nVERDICT: PASS\n"),
+	})
+	if body := ct.shouldGateEnd("done"); body != "" {
+		t.Errorf("PASS verdict should release; got: %q", body)
+	}
+}
+
+func TestGateEnd_VerdictGate_OverrideReleases(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < contractWriteThreshold; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	}
+	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{verifyUse})
+	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
+		makeToolResult("VERDICT: FAIL — test was wrong, not the code\n"),
+	})
+	override := "OVERRIDE CONTRACT: verifier mis-scoped, test expects old API"
+	if body := ct.shouldGateEnd(override); body != "" {
+		t.Errorf("OVERRIDE CONTRACT phrase must release even on FAIL verdict; got: %q", body)
+	}
+}
+
+func TestGateEnd_VerdictGate_CapsAtTwoAttempts(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < contractWriteThreshold; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	}
+	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{verifyUse})
+	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
+		makeToolResult("VERDICT: FAIL\n"),
+	})
+	// First two end-tries must hold.
+	for i := 1; i <= contractMaxGateAttempts; i++ {
+		if body := ct.shouldGateEnd("done"); body == "" {
+			t.Errorf("attempt %d should hold", i)
+		}
+	}
+	// Third attempt releases (cap exhausted, don't burn tokens).
+	if body := ct.shouldGateEnd("done"); body != "" {
+		t.Errorf("after %d attempts the verdict gate must release; got: %q", contractMaxGateAttempts, body)
+	}
+}

@@ -137,13 +137,36 @@ func (s *stuckDetector) AfterTurn(toolUses, results []llm.ContentBlock) stuckOut
 		return stuckNone
 	}
 	sig := extractFailureSignature(results)
-	if sig == "" {
-		// Bash ran with no failure marker — green build. Reset
-		// BOTH counters; the model just demonstrated progress.
+
+	// 2026-05-19 fix (iter9): a turn is "green" only when (a) no
+	// result is IsError AND (b) we couldn't find a FAIL signature.
+	// Previously the absence of a FAIL signature alone counted as
+	// green — which meant DENIED Bash calls (body "denied: rule #N:
+	// ..." with IsError=true but no "--- FAIL:" marker) were
+	// resetting both counters. In iter9 the model had 8 same-test
+	// failures interleaved with rule #23 denies; the denies kept
+	// resetting noGreenCount and the detector never fired.
+	hasErrResult := false
+	for _, r := range results {
+		if r.Type == "tool_result" && r.IsError {
+			hasErrResult = true
+			break
+		}
+	}
+	if sig == "" && !hasErrResult {
+		// Truly green: no errors AND no FAIL markers. Model
+		// demonstrated real progress, reset both counters.
 		s.lastSig = ""
 		s.sigCount = 0
 		s.noGreenCount = 0
 		return stuckNone
+	}
+	// Some kind of failure. If we couldn't extract a structured
+	// signature (deny, generic Bash error, etc.) use a placeholder
+	// so the sig-pattern still tracks "this is the Nth failure" —
+	// just won't be as specific.
+	if sig == "" {
+		sig = "BASH_ERROR"
 	}
 
 	// Pattern 1: same-signature counter.
