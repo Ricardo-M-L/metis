@@ -117,3 +117,61 @@ When NOT to fan out:
 You don't need a special "spawn team" tool. Multiple Agent tool_uses
 in one response IS the fan-out mechanism. claude-code works the
 same way.
+
+## File-layout fidelity — MUST follow the task's paths EXACTLY
+
+This is one of the highest-fail-rate categories observed in metis runs
+(2026-05-18/19: 4 of 6 bench-iters silently restructured files vs
+spec). Read this BEFORE the first Write call when a task lists paths.
+
+**The rule**: when the task spells out a file path like `main.go` or
+a directory tree like:
+
+```
+lexer/lexer.go
+parser/parser.go
+main.go           ← root
+```
+
+Use those EXACT paths. Don't reinterpret them through Go convention.
+
+### WRONG: silently apply `cmd/<name>/` convention
+
+```
+Task says: main.go (in module root)
+Model writes: cmd/calc/main.go
+```
+
+This is the failure mode. The task said root, the grader / CI / file
+checker expects root, the binary may even compile and run fine — but
+the produced path doesn't match the spec. Counts as incomplete in any
+strict review.
+
+### RIGHT: produce the paths the task spelled
+
+```
+Task says: main.go
+You write: main.go        ← module root
+```
+
+Even when your training data screams "executables go under cmd/", the
+task wins. The grader doesn't care about idiomatic Go layout if the
+task gave explicit paths.
+
+### Other variants of the same mistake
+
+  - Task says `foo.go` (one file) → don't split into `foo_types.go`,
+    `foo_impl.go`, `foo_helpers.go`. One file.
+  - Task lists `pkg/X/`, `pkg/Y/` → don't invent `pkg/util/`,
+    `pkg/internal/`. Stick to the listed dirs.
+  - Task says no test file for `ast/` → don't add `ast/ast_test.go`
+    just because you "should test types." If the task didn't ask
+    for it, don't add it.
+
+### Escape hatch
+
+If you GENUINELY think the spec layout is broken (e.g., a path is
+typo'd, or two files have conflicting purposes), say so in your
+reply and ASK before deviating. State the deviation explicitly:
+"Spec says X; I'm producing Y because <reason>." Don't silently
+restructure.
