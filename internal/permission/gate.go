@@ -203,6 +203,20 @@ type Gate struct {
 	// metis grew the IsReadOnly capability but the gate never read
 	// it.
 	readOnlyHook func(toolName, stringInput string) bool
+
+	// onModeChange — fired AFTER SetMode commits the new mode. Used by
+	// the runtime to keep dependent state in sync (most importantly:
+	// Loop.PlanMode must match Gate.Mode==ModePlan, otherwise users
+	// who Shift+Tab into plan get every tool call denied without the
+	// loop ever short-circuiting to emit a plan. 2026-05-18 fix for
+	// the "plan mode deny-storm" report — see commit message for the
+	// full failure mode + root cause analysis.)
+	//
+	// nil = no listener (default; tests + headless paths that don't
+	// build a Loop are happy). Single listener by design — only the
+	// runtime owns this side-channel; if more consumers ever need to
+	// observe mode changes, layer a fan-out on top.
+	onModeChange func(Mode)
 }
 
 func New(mode Mode) *Gate {
@@ -229,6 +243,18 @@ func (g *Gate) SetReadOnlyHook(fn func(toolName, stringInput string) bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.readOnlyHook = fn
+}
+
+// IsReadOnly is a public, lock-managing wrapper around the runtime's
+// readOnlyHook. Returns false when no hook is wired (test paths).
+// Used by callers outside the permission package (notably the agent
+// Loop) to partition tool batches in plan mode: read-only ones still
+// execute (so the model can read code while planning); side-effect
+// ones get collected as a plan for user review.
+func (g *Gate) IsReadOnly(tool, stringInput string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.callReadOnlyHookLocked(tool, stringInput)
 }
 
 // callReadOnlyHookLocked invokes the runtime "is tool X read-only?"
@@ -371,8 +397,26 @@ func (g *Gate) Clone() *Gate {
 
 func (g *Gate) SetMode(m Mode) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.mode = m
+	listener := g.onModeChange
+	g.mu.Unlock()
+	// Fire AFTER releasing the lock so the listener is free to call
+	// back into Gate (or any other locked subsystem) without deadlock.
+	if listener != nil {
+		listener(m)
+	}
+}
+
+// SetModeChangeListener wires a callback that fires every time SetMode
+// is invoked, regardless of whether the mode actually changed (cheaper
+// to fire than to diff, and listeners can no-op idempotently). Used by
+// the runtime to sync Loop.PlanMode with Gate.Mode==ModePlan.
+//
+// Replaces any prior listener; pass nil to clear.
+func (g *Gate) SetModeChangeListener(fn func(Mode)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.onModeChange = fn
 }
 
 // AppendRules adds rules to the bottom of the stack (lowest precedence).
@@ -429,10 +473,57 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		g.recordDenial()
 		return DecisionDeny, "mode:deny"
 	case ModePlan:
+		// Plan-mode allowlist policy (2026-05-18 expanded):
+		//
+		// The original allowlist (Read/LS/Glob/Grep/WebFetch) was way
+		// too narrow — every other tool got DENY, which created two
+		// failure modes:
+		//   (a) Loop and Gate go out of sync: Shift+Tab into plan
+		//       only flipped Gate.Mode but left Loop.PlanMode=false,
+		//       so the loop never short-circuited to emitPlan. Every
+		//       tool the model emitted hit Gate and got denied,
+		//       trapping it in a deny-storm.
+		//   (b) Even with Loop.PlanMode=true, the model couldn't use
+		//       AskUser to ask the human, couldn't ExitPlanMode to
+		//       leave, couldn't TodoWrite to plan, couldn't query
+		//       MetisInfo to introspect. plan mode became "blanket
+		//       deny with five exceptions" — not actually plannable.
+		//
+		// New policy (in order):
+		//   1. Plan-mode meta tools always pass (EnterPlanMode is a
+		//      no-op when already in plan; ExitPlanMode is the only
+		//      way out — denying it would be a trap).
+		//   2. The runtime's readOnlyHook decides any tool with no
+		//      side effects (queries the registry's IsReadOnly). This
+		//      auto-covers AskUser / MetisInfo / Todo* / SubAgent* /
+		//      BashOutput / TaskOutput / Skill / LSP / WebFetch / etc.
+		//      — same hook ModeAcceptEdits already uses.
+		//   3. Fallback legacy allowlist for the headless / test paths
+		//      where no hook is wired.
+		switch tool {
+		case "EnterPlanMode", "ExitPlanMode":
+			g.recordAllow()
+			return DecisionAllow, "mode:plan:meta"
+		case "AskUser":
+			// AskUser is the model's only structured channel to ask
+			// the human a question. Denying it in plan mode strands
+			// the model: it can't propose a plan, can't ask for
+			// clarification, just stares at a wall of denies. We
+			// deliberately don't mark AskUser as IsReadOnly (it has
+			// a side effect — the user's answer flows back into the
+			// turn) so acceptEdits doesn't silently bypass it, but
+			// plan mode explicitly whitelists it.
+			g.recordAllow()
+			return DecisionAllow, "mode:plan:askuser"
+		}
+		if g.callReadOnlyHookLocked(tool, stringInput) {
+			g.recordAllow()
+			return DecisionAllow, "mode:plan:readonly"
+		}
 		switch tool {
 		case "Read", "LS", "Glob", "Grep", "WebFetch":
 			g.recordAllow()
-			return DecisionAllow, "mode:plan"
+			return DecisionAllow, "mode:plan:fallback"
 		default:
 			g.recordDenial()
 			return DecisionDeny, "mode:plan"
@@ -504,6 +595,27 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		}
 		g.recordAllow()
 		return DecisionAllow, "mode:bypass"
+	case ModeAsk:
+		// Auto-allow read-only operations even in ask mode — without
+		// this, the user has to confirm every Read / Grep / Glob, which
+		// is enormous friction for legitimate exploration and matches
+		// what claude-code does in its "default" mode (read-only tools
+		// have implicit allowlist via isReadOnly). The "ask" semantic
+		// is "ask for anything that could change state", not "ask for
+		// literally every tool". Writes / Bash / Edit / Memory.add etc.
+		// still fall through to DecisionAsk (the default at the bottom).
+		// 2026-05-18 fix: pre this, `metis run --mode ask 'read X'` in
+		// headless mode auto-denied the Read, surprising users.
+		if g.callReadOnlyHookLocked(tool, stringInput) {
+			g.recordAllow()
+			return DecisionAllow, "mode:ask:readonly"
+		}
+		// Hardcoded fallback for test paths without a hook.
+		switch tool {
+		case "Read", "LS", "Glob", "Grep", "WebFetch":
+			g.recordAllow()
+			return DecisionAllow, "mode:ask:readonly_fallback"
+		}
 	case ModeAcceptEdits:
 		// Auto-allow read-only AND project-local writes/edits. Bash
 		// still falls through to ASK so commands aren't auto-run.

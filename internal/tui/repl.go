@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
@@ -67,7 +68,44 @@ type REPL struct {
 	// "full" / "streamlined" / "minimal".
 	outputStyle string
 
+	// TUI-only bridges: slash handlers run in the REPL layer but a few
+	// genuinely need access to TUI-side state (sub-agent roster) or
+	// surfaces (the input textarea). asREPL() fills these closures with
+	// live Model pointers; the plain readline-REPL leaves them nil so
+	// the handlers fall back to a graceful "(not available in headless
+	// REPL)" message instead of crashing. Closures rather than direct
+	// pointers because internal/tui/repl.go must not import textarea
+	// for the plain-readline path (no terminal in CI / pipes).
+	//
+	// SubAgentSnapshot returns the current sub-agent roster (Agent tool
+	// spawns). Consumed by cmdAgents to print "◇ name [status]" rows.
+	SubAgentSnapshot func() []SubAgentInfo
+	// InsertInput appends text to the input textarea. Consumed by
+	// cmdReview / cmdSecurityReview to pre-populate a review prompt
+	// so the user can edit + Enter to submit — instead of the prior
+	// "go prompt the model with this string" stub.
+	InsertInput func(text string)
+	// BgTurnSnapshot returns whether a turn is currently mid-stream
+	// + the elapsed time since it started. Empty struct when idle.
+	// Consumed by cmdBg to print the live state.
+	BgTurnSnapshot func() BgTurnState
+	// BypassCache flips a Loop flag that makes the next request skip
+	// the prompt-cache breakpoint write. Consumed by cmdBreakCache.
+	BypassCache func()
+
 	shouldQuit bool
+}
+
+// BgTurnState is the snapshot returned by BgTurnSnapshot for cmdBg.
+// IsActive=false means no turn is running; the other fields are zero.
+type BgTurnState struct {
+	IsActive  bool
+	StartTime time.Time
+	Model     string
+	// QueuedCount is the number of prompts queued up behind the active
+	// turn (Phase F: user can keep typing while a turn runs; they
+	// land in m.queuedPrompts).
+	QueuedCount int
 }
 
 func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, useMarkdown, showTokens bool, gate *permission.Gate, model, skillDir string) (*REPL, error) {

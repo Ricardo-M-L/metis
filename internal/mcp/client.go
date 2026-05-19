@@ -38,6 +38,15 @@ var ErrTransportClosed = errors.New("mcp: transport closed")
 // All env vars accept Go duration syntax (e.g. "45s", "5m", "1h"); a
 // bad/empty value falls back to the default rather than panicking.
 const (
+	// 30s budget. Tried 10s on 2026-05-18 morning to fail-fast on
+	// slow `npx` cold starts; reverted same day because real-world
+	// stdio servers (firecrawl-mcp + playwright-mcp under user's
+	// config) consistently took >10s for npm boot + browser-binary
+	// check even on warm cache. The 10s value made every prompt
+	// re-spawn → re-timeout, spamming "MCP handshake: context
+	// deadline exceeded" into the chat after each user turn (image
+	// #7 / user report 2026-05-18 noon). 30s is the safe default;
+	// raise via MCP_CONNECT_TIMEOUT=Xs for truly cold caches.
 	defaultConnectTimeout = 30 * time.Second
 	defaultRequestTimeout = 60 * time.Second
 	defaultToolTimeout    = 100_000 * time.Second // ~27.8 h
@@ -101,7 +110,18 @@ type StdioTransport struct {
 // NewStdioTransport starts an MCP server process and returns a transport over its stdio.
 // Pipes are released on every error path so a failed Start doesn't leak fds.
 func NewStdioTransport(ctx context.Context, command string, args ...string) (*StdioTransport, error) {
+	return NewStdioTransportWithEnv(ctx, command, nil, args...)
+}
+
+// NewStdioTransportWithEnv is the env-aware variant. `extraEnv` entries
+// are appended onto os.Environ() so the spawned subprocess inherits the
+// metis process env plus the caller-supplied KEY=VAL overrides. nil/empty
+// `extraEnv` matches NewStdioTransport's behavior exactly.
+func NewStdioTransportWithEnv(ctx context.Context, command string, extraEnv []string, args ...string) (*StdioTransport, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdin pipe: %w", err)
@@ -276,7 +296,14 @@ func NewClient(ctx context.Context, transport Transport) *Client {
 // hanging server keeps `/mcp start` blocked the full RequestTimeout
 // or longer (cmd_cu's caller-set 30 s used to be the only stop-gap).
 func NewStdioClient(ctx context.Context, command string, args ...string) (*Client, error) {
-	transport, err := NewStdioTransport(ctx, command, args...)
+	return NewStdioClientWithEnv(ctx, command, nil, args...)
+}
+
+// NewStdioClientWithEnv is the env-aware variant of NewStdioClient. The
+// `extraEnv` entries (KEY=VAL strings) are appended onto os.Environ()
+// for the spawned subprocess.
+func NewStdioClientWithEnv(ctx context.Context, command string, extraEnv []string, args ...string) (*Client, error) {
+	transport, err := NewStdioTransportWithEnv(ctx, command, extraEnv, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -85,29 +85,27 @@ func TestStatusBar_OutputExcluded(t *testing.T) {
 	}
 }
 
-// TestStatusBar_CacheIncluded — second pillar of plan A: prompt-cache
-// tokens MUST be added to the input side. A session that hits the
-// prompt cache hard would otherwise show a deceptively small bottom-
-// right number while the live context is huge.
+// TestStatusBar_CacheCreateIncluded_ReadExcluded — 2026-05-18 contract
+// change: cache_creation IS still added to the numerator (those are
+// real fresh tokens this turn), but cache_read is NOT (provider may
+// over-report it; the byte-estimate floor in render_chrome.go picks
+// up the actual conversation weight). See ContextUsage() in
+// commands.go for the rationale.
 //
-// Setup: 500 input (only the new uncached delta) + 1000 cache_create
-// + 30000 cache_read + 200 output. Expected: 31500 (16%). NOT 500
-// (which would be ignoring cache) and NOT 31700 (which would be
-// including output).
-func TestStatusBar_CacheIncluded(t *testing.T) {
+// Setup: 500 input + 1000 cache_create + 30000 cache_read + 200 output.
+// Expected raw API numerator: 1500. Display floors with byte estimate,
+// which for minimalModel's tiny stub history is < 1500, so 1500 wins.
+func TestStatusBar_CacheCreateIncluded_ReadExcluded(t *testing.T) {
 	m := minimalModel(200000)
 	m.totalTokens.add(500, 200, 1000, 30000)
 
 	bar := stripANSI(renderStatusBar(m))
-	want := "31500 tokens"
+	want := "1500 tokens"
 	if !strings.Contains(bar, want) {
-		t.Errorf("status bar missing %q (input + cache, plan A); got:\n%s", want, bar)
+		t.Errorf("status bar missing %q (input + cache_creation, cache_read excluded); got:\n%s", want, bar)
 	}
-	if strings.Contains(bar, "500 tokens") && !strings.Contains(bar, "31500 tokens") {
-		t.Errorf("status bar showing only raw input (500), cache not added:\n%s", bar)
-	}
-	if !strings.Contains(bar, "(15%)") {
-		t.Errorf("status bar percentage should be 15%% (31500/200000); got:\n%s", bar)
+	if strings.Contains(bar, "31500 tokens") {
+		t.Errorf("status bar should NOT include cache_read (provider over-reports it); got:\n%s", bar)
 	}
 }
 
@@ -121,24 +119,34 @@ func TestStatusBar_NoTokensYet(t *testing.T) {
 	}
 }
 
-// TestStatusBar_PercentMatchesCC — pin the % calculation formula. CC
-// docs: used_percentage = (input + cache_creation + cache_read) / context_window_size.
-// We verify metis uses the same denominator (Provider.MaxContextTokens())
-// and the same numerator (ContextUsage()).
-func TestStatusBar_PercentMatchesCC(t *testing.T) {
+// TestStatusBar_PercentFormula — pin the % calculation formula post-
+// 2026-05-18: numerator = input + cache_creation (cache_read deliberately
+// excluded to neutralize MiniMax-style over-reporting; see ContextUsage
+// comment). Denominator = Provider.MaxContextTokens(). Output excluded.
+func TestStatusBar_PercentFormula(t *testing.T) {
 	cases := []struct {
 		input, output, cacheCreate, cacheRead, maxCtx int
 		wantPct                                       string
 	}{
-		{1000, 0, 0, 0, 100000, "(1%)"},        // 1000 / 100000
-		{50000, 0, 0, 0, 200000, "(25%)"},      // 50000 / 200000
-		{180000, 0, 0, 0, 200000, "(90%)"},     // 180000 / 200000
-		{500, 9999, 0, 99500, 200000, "(50%)"}, // 100000 / 200000 — output excluded, cache included
+		{1000, 0, 0, 0, 100000, "(1%)"},     // 1000 / 100000
+		{50000, 0, 0, 0, 200000, "(25%)"},   // 50000 / 200000
+		{180000, 0, 0, 0, 200000, "(90%)"},  // 180000 / 200000
+		{500, 9999, 0, 99500, 200000, ""},   // cache_read inflated; numerator stays 500 (well under 1%) — see ImmuneToOverreportedCacheRead test
+		{500, 0, 9500, 0, 200000, "(5%)"},   // cache_creation IS counted: 10000 / 200000
 	}
 	for _, tc := range cases {
 		m := minimalModel(tc.maxCtx)
 		m.totalTokens.add(tc.input, tc.output, tc.cacheCreate, tc.cacheRead)
 		bar := stripANSI(renderStatusBar(m))
+		if tc.wantPct == "" {
+			// Don't assert a specific percentage; just verify cache_read
+			// is NOT inflating the display past ~1%.
+			if strings.Contains(bar, "(50%)") || strings.Contains(bar, "(49%)") {
+				t.Errorf("case input=%d cacheRead=%d should NOT show inflated %% from cache_read; got:\n%s",
+					tc.input, tc.cacheRead, bar)
+			}
+			continue
+		}
 		if !strings.Contains(bar, tc.wantPct) {
 			t.Errorf("input=%d output=%d cacheCreate=%d cacheRead=%d maxCtx=%d: want %s in bar; got:\n%s",
 				tc.input, tc.output, tc.cacheCreate, tc.cacheRead, tc.maxCtx, tc.wantPct, bar)

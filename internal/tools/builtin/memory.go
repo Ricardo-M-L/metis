@@ -96,8 +96,24 @@ func (m Memory) InputSchema() map[string]any {
 	}
 }
 
-func (Memory) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
-	return tools.PermissionAllow, "memory operations"
+func (m Memory) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	// Memory writes (add/replace/remove) mutate the system prompt for
+	// every following turn — a real side effect. Route through the
+	// gate so plan mode correctly blocks them and ask mode prompts.
+	// Pre-fix this always returned PermissionAllow, which made
+	// `/mode plan` silently let the model rewrite memory blocks — the
+	// 2026-05-18 plan-mode audit caught this.
+	//
+	// Read-only actions (search/recall/list) currently go through the
+	// same Ask path in acceptEdits because Memory.IsReadOnly hardcodes
+	// false; a future refactor can make IsReadOnly input-aware to
+	// auto-allow those. The conservative default here is correct.
+	if m.gate == nil {
+		return tools.PermissionAllow, "memory operations (no gate)"
+	}
+	action, _ := in["action"].(string)
+	d, _ := m.gate.Check(ctx, "Memory", action)
+	return mapDecision(d), "memory:" + action
 }
 
 func (m Memory) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {

@@ -2,13 +2,20 @@ package builtin
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -97,12 +104,153 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
-	out := string(body)
+	truncatedSuffix := ""
 	if len(body) >= maxBytes {
-		out += "\n\n[truncated at " + bytesString(maxBytes) + "]"
+		truncatedSuffix = "\n\n[truncated at " + bytesString(maxBytes) + "]"
 	}
+
+	// Binary-content守门 (2026-05-18, user image #9 bug).
+	// Pre-fix: any body went straight through `string(body)`, which
+	// turned a 250KB PNG response into 250KB of UTF-8 garbage that
+	// burned ~164k context tokens (caught in the wild — image_paste
+	// of a model output URL). Now Content-Type drives the dispatch:
+	//
+	//   image/*  video/*  audio/*  application/octet-stream
+	//     → write to ~/.metis/tool-results/webfetch-<ts>-<rand>.<ext>
+	//       return a one-line "saved to X" pointer; model can Read it
+	//       if its provider supports vision.
+	//   anything else with no Content-Type but the body is not valid
+	//     UTF-8 → same "binary, suppressed" path (defensive layer per
+	//     crush's pattern).
+	//   text/* / application/json / fallback → original string-body
+	//     return path (unchanged).
+	ct := resp.Header.Get("Content-Type")
+	mediaType, _, _ := mime.ParseMediaType(ct)
+	mediaType = strings.ToLower(mediaType)
+
+	isBinary := strings.HasPrefix(mediaType, "image/") ||
+		strings.HasPrefix(mediaType, "video/") ||
+		strings.HasPrefix(mediaType, "audio/") ||
+		mediaType == "application/octet-stream" ||
+		mediaType == "application/pdf"
+	// Final defense: no/wrong Content-Type but body not UTF-8 → treat
+	// as binary too. Stops mislabeled image servers from leaking bytes
+	// to the prompt.
+	if !isBinary && mediaType == "" && len(body) > 0 && !utf8.Valid(body) {
+		isBinary = true
+	}
+
+	if isBinary {
+		savedPath, saveErr := saveBinaryResponse(body, mediaType, url)
+		hintMime := mediaType
+		if hintMime == "" {
+			hintMime = "application/octet-stream"
+		}
+		if saveErr != nil {
+			// Save failed (disk full / perms). Don't poison the prompt
+			// with raw bytes — surface the error cleanly.
+			return &tools.Result{
+				Output: fmt.Sprintf("HTTP %s\n[binary content (%s, %s) suppressed — failed to save: %v]",
+					resp.Status, hintMime, bytesString(len(body)), saveErr),
+				IsError: true,
+			}, nil
+		}
+		summary := fmt.Sprintf(
+			"HTTP %s\n[binary content (%s, %s) saved to %s]\n"+
+				"Use the Read tool with this absolute path to view the file. "+
+				"If the model has vision capability and this is an image, "+
+				"Read will surface it as an image block; otherwise it will be "+
+				"reported as binary.",
+			resp.Status, hintMime, bytesString(len(body)), savedPath,
+		)
+		return &tools.Result{
+			Output:  summary + truncatedSuffix,
+			IsError: resp.StatusCode >= 400,
+		}, nil
+	}
+
+	out := string(body)
 	return &tools.Result{
-		Output:  "HTTP " + resp.Status + "\n" + out,
+		Output:  "HTTP " + resp.Status + "\n" + out + truncatedSuffix,
 		IsError: resp.StatusCode >= 400,
 	}, nil
+}
+
+// saveBinaryResponse writes a non-text WebFetch body to
+// ~/.metis/tool-results/webfetch-<ts>-<rand>.<ext>. Extension is
+// picked from the media type (image/png → .png) with a URL-suffix
+// fallback when the server forgot the Content-Type. Returns the
+// absolute path or an OS error.
+//
+// Mirrors claude-code's persistBinaryContent pattern: never inline
+// binary into prompt, always hand the model a file path it can later
+// Read at its discretion.
+func saveBinaryResponse(body []byte, mediaType, srcURL string) (string, error) {
+	dir := filepath.Join(config.Home(), "tool-results")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	var nonce [4]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	ts := time.Now().Format("20060102-150405")
+	ext := extensionForBinary(mediaType, srcURL)
+	name := fmt.Sprintf("webfetch-%s-%s%s", ts, hex.EncodeToString(nonce[:]), ext)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// preferredExtensions overrides mime.ExtensionsByType for the cases
+// where the stdlib returns a non-canonical extension. Go's mime db
+// for image/jpeg returns `.jpe` first (alphabetical); humans expect
+// `.jpg`. Same for image/svg+xml (stdlib has no entry on macOS).
+var preferredExtensions = map[string]string{
+	"image/jpeg":      ".jpg",
+	"image/svg+xml":   ".svg",
+	"image/x-icon":    ".ico",
+	"audio/mpeg":      ".mp3",
+	"video/quicktime": ".mov",
+	"text/markdown":   ".md",
+	"application/zip": ".zip",
+}
+
+// extensionForBinary picks a file extension for the saved binary.
+// Priority:
+//  1. preferredExtensions map (curated common cases)
+//  2. mime.ExtensionsByType (Go stdlib mapping)
+//  3. URL path suffix (last `.xxx` segment, when reasonable)
+//  4. `.bin` fallback
+func extensionForBinary(mediaType, srcURL string) string {
+	if mediaType != "" {
+		if ext, ok := preferredExtensions[mediaType]; ok {
+			return ext
+		}
+		if exts, err := mime.ExtensionsByType(mediaType); err == nil && len(exts) > 0 {
+			// Prefer the shortest / most common (".jpg" over ".jpeg" etc).
+			best := exts[0]
+			for _, e := range exts {
+				if len(e) < len(best) {
+					best = e
+				}
+			}
+			return best
+		}
+	}
+	// URL-suffix fallback: take the last `.xxx` segment whose
+	// position is close to the end of the URL (within ~10 chars of
+	// EOF), then strip any query/fragment.
+	if idx := strings.LastIndex(srcURL, "."); idx >= 0 && len(srcURL)-idx <= 10 {
+		suffix := srcURL[idx:]
+		if q := strings.IndexAny(suffix, "?#&"); q >= 0 {
+			suffix = suffix[:q]
+		}
+		if len(suffix) >= 2 && len(suffix) <= 6 {
+			return strings.ToLower(suffix)
+		}
+	}
+	return ".bin"
 }

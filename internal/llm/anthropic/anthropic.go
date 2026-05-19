@@ -139,6 +139,31 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 // trustworthy status-bar display.
 func (a *Anthropic) ModelID() string { return a.Model }
 
+// SupportsVision reports whether the configured Anthropic model
+// accepts image content blocks. All Claude 3+ family models do; the
+// legacy claude-2.x line did not. We err on the side of allow
+// (return true) for any model id starting with "claude-3" /
+// "claude-4" / "claude-opus" / "claude-sonnet" / "claude-haiku" —
+// covers every Anthropic vision model since Claude 3 launch.
+//
+// Custom-base-URL providers (MiniMax anthropic-compat layer, etc.)
+// that don't support vision configure themselves as a custom
+// transport and DON'T inherit from this struct, so they correctly
+// land in the "no SupportsVision method → ProviderSupportsVision
+// returns false" path.
+func (a *Anthropic) SupportsVision() bool {
+	m := strings.ToLower(a.Model)
+	switch {
+	case strings.HasPrefix(m, "claude-3"),
+		strings.HasPrefix(m, "claude-4"),
+		strings.HasPrefix(m, "claude-opus"),
+		strings.HasPrefix(m, "claude-sonnet"),
+		strings.HasPrefix(m, "claude-haiku"):
+		return true
+	}
+	return false
+}
+
 func (a *Anthropic) MaxContextTokens() int {
 	// Tier 1 — explicit user override (~/.metis/config.toml).
 	if a.ContextWindow > 0 {

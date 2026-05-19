@@ -282,15 +282,19 @@ func cmdOutputStyle(r *REPL, args string) string {
 	return "output-style: unknown '" + arg + "' — use: full | streamlined | minimal"
 }
 
-// cmdBreakCache documents how to force a fresh cache write. We don't
-// reach into the provider's cache_control headers from a slash command
-// (that's a Phase F provider-layer change); instead we tell the user
-// the actual mechanics today: /compact, /clear, or restart with --bare.
+// cmdBreakCache arms a one-shot flag on the agent loop so the next
+// request injects a fresh nonce into the system prompt — that shifts
+// the prompt prefix and forces the provider to write a new cache entry
+// instead of reusing the prior one. The flag is consumed at buildRequest
+// time, so it only affects the very next turn.
 //
-// The benefit of the slash even in this read-only form is discovery —
-// the user types /break-cache expecting something, and gets a precise
-// recipe rather than an error.
+// Falls back to the documentation panel when the bridge closure is nil
+// (headless readline REPL has no Model to reach into).
 func cmdBreakCache(r *REPL, args string) string {
+	if r != nil && r.BypassCache != nil {
+		r.BypassCache()
+		return "(cache bypass armed — next request will write a fresh cache entry)"
+	}
 	return renderInfoBox("Cache Refresh", []infoRow{
 		{Key: "", Value: "metis sends `cache_control: ephemeral` on every"},
 		{Key: "", Value: "request that supports it. To force a fresh cache write:"},
@@ -298,8 +302,6 @@ func cmdBreakCache(r *REPL, args string) string {
 		{Key: "/compact", Value: "summarize history → new cache prefix"},
 		{Key: "/clear", Value: "drop history entirely → fresh cache from turn 0"},
 		{Key: "metis chat --bare", Value: "skip MCP/plugins; smaller prompt → different prefix"},
-		{Key: "", Value: ""},
-		{Key: "", Value: "Phase F adds an explicit `next request bypasses cache` toggle."},
 	})
 }
 
@@ -312,10 +314,12 @@ func cmdSecurityReview(r *REPL, args string) string {
 	if target == "" {
 		target = "the staged changes (git diff --cached)"
 	}
-	return "security-review: prompt the model with: 'review " + target + " for security issues. " +
-		"Check for: SQL injection, command injection, XSS, path traversal, hardcoded secrets, " +
-		"insecure deserialization, weak crypto, race conditions, OWASP top 10 in general. " +
-		"Cite exact lines.'"
+	prompt := buildReviewPrompt(target, true)
+	if r != nil && r.InsertInput != nil {
+		r.InsertInput(prompt)
+		return "security-review: prompt loaded into input — review, then press Enter to send"
+	}
+	return "security-review: paste this into the prompt to start —\n\n" + prompt
 }
 
 // cmdFeedback is /bug under a more discoverable name. Same body —

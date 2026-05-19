@@ -107,7 +107,7 @@ func (m *Model) buildPlainTranscript() string {
 // so slash-handlers (cmdHelp, cmdGitStatus, etc.) can read shared
 // fields without each one duplicating the bridge.
 func (m *Model) asREPL() *REPL {
-	return &REPL{
+	r := &REPL{
 		Loop:         m.loop,
 		Gate:         m.gate,
 		Slash:        m.slash,
@@ -120,6 +120,37 @@ func (m *Model) asREPL() *REPL {
 		cmds:         m.cmds,
 		totalTokens:  m.totalTokens,
 	}
+	// Live-state closures so slash handlers can read TUI-only data
+	// (sub-agent roster, bg-turn state) and write to TUI-only surfaces
+	// (the input textarea) without REPL having to import textarea or
+	// hold a Model pointer. The headless readline REPL leaves these
+	// nil and the handlers gracefully fall back.
+	r.SubAgentSnapshot = func() []SubAgentInfo {
+		// Copy so the caller can't mutate the live slice.
+		out := make([]SubAgentInfo, len(m.subAgents))
+		copy(out, m.subAgents)
+		return out
+	}
+	r.InsertInput = func(text string) {
+		m.input.InsertString(text)
+	}
+	r.BgTurnSnapshot = func() BgTurnState {
+		if !m.turnActive {
+			return BgTurnState{}
+		}
+		return BgTurnState{
+			IsActive:    true,
+			StartTime:   m.spinnerStartedAt,
+			Model:       m.model,
+			QueuedCount: len(m.queuedPrompts),
+		}
+	}
+	r.BypassCache = func() {
+		if m.loop != nil {
+			m.loop.BypassNextCache = true
+		}
+	}
+	return r
 }
 
 // summarizeHistory extracts a text summary from conversation history

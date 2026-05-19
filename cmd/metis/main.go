@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -70,6 +71,24 @@ func main() {
 func dispatch(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return cmdChat(ctx, args)
+	}
+	// Subcommand-can-be-anywhere: 2026-05-18 fix for the
+	// `metis -p X -m Y run --mode ask 'prompt'` failure mode. Users
+	// (and Anthropic's docs) sometimes put global flags before the
+	// subcommand verb. Before this hoist, the switch below saw
+	// args[0]="-p" → fell through to `default:` → cmdRun(args) →
+	// parseFlags() consumed -p/-m, then stopped at "run" (a
+	// non-flag), so `run --mode ask 'prompt'` got joined back into
+	// the model's prompt and the `--mode` override was silently
+	// ignored (gate stayed in config-default mode). Now we sniff for
+	// a known verb anywhere in args[0..2] and hoist it forward so the
+	// switch dispatches correctly.
+	if idx, found := findEarlySubcommand(args, 16); found {
+		hoisted := make([]string, 0, len(args))
+		hoisted = append(hoisted, args[idx])
+		hoisted = append(hoisted, args[:idx]...)
+		hoisted = append(hoisted, args[idx+1:]...)
+		args = hoisted
 	}
 	switch args[0] {
 	case "chat":
@@ -140,6 +159,64 @@ func dispatch(ctx context.Context, args []string) error {
 		}
 		return cmdRun(ctx, args)
 	}
+}
+
+// findEarlySubcommand scans the first `lookahead` args for a known
+// metis verb (chat / run / config / etc.) preceded only by global
+// flags + their values. Returns its index if found so the dispatcher
+// can hoist it to args[0]. Limited window so a stray "run" inside a
+// long inline prompt doesn't get hoisted by accident.
+//
+// The set must stay in sync with the switch in dispatch(); keep it
+// small (only the verbs users actually combine with leading globals).
+func findEarlySubcommand(args []string, lookahead int) (int, bool) {
+	verbs := map[string]bool{
+		"chat": true, "run": true, "config": true, "tools": true,
+		"models": true, "sessions": true, "stats": true, "skills": true,
+		"acp": true, "daemon": true, "ps": true, "logs": true,
+		"kill": true, "attach": true, "coordinator": true, "cron": true,
+		"auth": true, "plugin": true, "plugins": true, "audit": true,
+		"diag": true, "eval": true, "update": true, "version": true,
+		"dirs": true, "projects": true, "help": true,
+	}
+	if lookahead > len(args) {
+		lookahead = len(args)
+	}
+	// args[0] is already handled by the switch; we look at args[1..lookahead).
+	for i := 1; i < lookahead; i++ {
+		if verbs[args[i]] {
+			// Sanity: prior tokens must look like flags or flag values
+			// (no positional arg that would be a prompt fragment).
+			ok := true
+			for j := 0; j < i; j++ {
+				if !looksLikeFlagOrValue(args, j) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// looksLikeFlagOrValue reports whether args[j] is plausibly a flag
+// or the value of a flag (i.e., not the start of a prompt fragment).
+// "-p" / "--mode" / "minimax" (when preceded by "-p") qualify; bare
+// strings like "explain this code" do not.
+func looksLikeFlagOrValue(args []string, j int) bool {
+	tok := args[j]
+	if strings.HasPrefix(tok, "-") {
+		return true
+	}
+	// Value of a flag — previous token must be a flag.
+	if j == 0 {
+		return false
+	}
+	prev := args[j-1]
+	return strings.HasPrefix(prev, "-")
 }
 
 // hasInteractiveIntentFlag reports whether args contain any of the
@@ -230,8 +307,19 @@ type runtime struct {
 	showTok           bool
 	model             string
 	providerName      string // resolved provider profile name (cfg.Provider.Default OR --provider). Threaded to the TUI so mid-session /model switches know which profile to rebuild against.
-	mcpServers        []*mcptools.Server
-	plugins           *rtpkg.PluginRegistry // nil when no plugins installed
+	// mcpServers collects handles to live MCP server subprocesses for
+	// Cleanup. Written from the background-launch goroutine kicked off
+	// in setupRuntime when phase-2 async MCP is enabled, hence the
+	// mutex. The slice is also read by /mcp prompts (CollectMCPPrompts).
+	mcpServers   []*mcptools.Server
+	mcpServersMu sync.Mutex
+	// mcpLauncherDone closes when the background MCP launcher finishes
+	// (or right away when --bare). Cleanup waits on it so we never tear
+	// down the parent process while a handshake goroutine is still
+	// mid-spawn — the resulting "broken pipe / killed" warnings to
+	// stderr are noisy and obscure the real shutdown cause.
+	mcpLauncherDone <-chan struct{}
+	plugins         *rtpkg.PluginRegistry // nil when no plugins installed
 	allowedDirs       *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
 	// autoMemExtractor is the live G.5 DreamTask handle. Surfaced
 	// to the slash registry so /dream status can read phase + last-
@@ -248,10 +336,30 @@ type runtime struct {
 // Cleanup closes any subprocesses or connections owned by the runtime.
 // Safe to call multiple times.
 func (r *runtime) Cleanup() {
+	// Wait briefly for the background MCP launcher so we close handles
+	// that DID come online. After the grace cap we move on — orphan
+	// handshake goroutines get reaped on process exit anyway, and a
+	// non-interactive `metis run` shouldn't pay a 10 s tail just to
+	// wait for an MCP server we never used.
+	//
+	// Grace cap: 1 s. The MCP handshake itself has its own 10 s timeout
+	// (MCP_CONNECT_TIMEOUT, defaultConnectTimeout in internal/mcp), so
+	// in practice goroutines have already unwound by the time we get
+	// here on a normal exit; the 1 s mostly covers a launch that's
+	// still in the npm-resolve phase.
+	if r.mcpLauncherDone != nil {
+		select {
+		case <-r.mcpLauncherDone:
+		case <-time.After(1 * time.Second):
+		}
+		r.mcpLauncherDone = nil
+	}
+	r.mcpServersMu.Lock()
 	for _, s := range r.mcpServers {
 		_ = s.Close()
 	}
 	r.mcpServers = nil
+	r.mcpServersMu.Unlock()
 	if r.plugins != nil {
 		_ = r.plugins.Close()
 		r.plugins = nil
@@ -862,14 +970,24 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// (mutated by /mcp add) win over [[mcp.servers]] declared in
 	// config.toml. The merge happens via runtime.MergeWithConfig so legacy
 	// config-only setups still work without any user action.
+	//
+	// Phase 2 (2026-05-18) — launch runs in a BACKGROUND GOROUTINE so the
+	// chat UI starts immediately. Each server's tools register into the
+	// shared (mutex-protected) registry as soon as its handshake completes.
+	// claude-code uses the same shape — `getMcpToolsCommandsAndResources`
+	// streams per-server `onConnectionAttempt` callbacks rather than
+	// blocking the prompt session on a sum-of-handshakes wall clock.
+	// Cleanup waits on `mcpLauncherDone` so we never tear down the
+	// parent process while a goroutine is mid-handshake.
 	var mcpReg *rtpkg.MCPRegistry
-	var mcpServers []*mcptools.Server
+	mcpLauncherDoneCh := make(chan struct{})
 	if flags.bare {
 		// --bare skips the MCP launch dance entirely. The user gets
 		// builtins-only — no `mcp__*` tools, no spawned subprocesses,
 		// no per-server merge cost. Still safe to /mcp list / add later;
 		// nothing in this path mutates mcp.toml.
 		mcpReg = &rtpkg.MCPRegistry{}
+		close(mcpLauncherDoneCh) // no work — Cleanup's <-recv is instant
 	} else {
 		var mcpLoadErr error
 		mcpReg, mcpLoadErr = rtpkg.LoadMCP()
@@ -878,18 +996,6 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			mcpReg = &rtpkg.MCPRegistry{}
 		}
 		mcpReg.MergeWithConfig(cfg.MCP.Servers)
-		// Lazy MCP startup (P7, kimi-cli `defer_mcp_tool_loading` parity):
-		// auto mode (default) registers stub tools from
-		// ~/.metis/mcp-cache/<server>.json without spawning the
-		// subprocess. First tool invocation triggers spawn. Mode is
-		// controlled by METIS_LAZY_MCP (auto|always|never); see
-		// runtime/mcp_cache.go::ParseLazyMCPMode for the matrix.
-		lazyMode := rtpkg.ParseLazyMCPMode(os.Getenv("METIS_LAZY_MCP"))
-		var mcpErrs []error
-		mcpServers, mcpErrs = rtpkg.LaunchAllMCPLazy(ctx, mcpReg, reg, lazyMode)
-		for _, e := range mcpErrs {
-			fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
-		}
 	}
 
 	// Agent profile tool filter — applied after MCP tools register so the
@@ -991,6 +1097,23 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		loop.Fast = true
 	}
 
+	// Gate→Loop mode bridge — 2026-05-18 fix for the plan-mode deny
+	// storm. Two state variables (Gate.Mode and Loop.PlanMode) used
+	// to be independently mutable, so flipping Gate.Mode=plan via
+	// Shift+Tab or `/mode plan` left Loop.PlanMode=false and the loop
+	// went on dispatching tools straight into a wall of denies. Now:
+	// Gate is the single source of truth; SetMode fires this listener
+	// which pushes the matching plan-mode flag onto Loop. Both
+	// directions (model-initiated EnterPlanMode and user-initiated
+	// Shift+Tab) converge on the same code path.
+	gate.SetModeChangeListener(func(m permission.Mode) {
+		loop.SetPlanMode(m == permission.ModePlan)
+	})
+	// Apply once at boot so a session started in plan mode (via
+	// `metis --mode plan` or `[permissions] mode = "plan"` in config)
+	// has Loop.PlanMode aligned before the first user turn.
+	loop.SetPlanMode(gate.Mode() == permission.ModePlan)
+
 	// G.5 — stash the auto-memory extractor on this var so the
 	// `rt` struct below can pick it up for /dream status. Declared
 	// outside the if-block so the unconditional rt assignment
@@ -1032,11 +1155,52 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
-		mcpServers:       mcpServers,
+		mcpLauncherDone:  mcpLauncherDoneCh,
 		plugins:          pluginReg,
 		allowedDirs:      allowedDirs,
 		autoMemExtractor: pendingExtractor,
 		subAgentRoster:   subAgentRoster,
+	}
+
+	// Phase 2 MCP launch — kicked off only after `rt` is fully built so
+	// the goroutine can reach into rt.mcpServers / rt.mcpServersMu. Bare
+	// mode already closed the done-channel above; this is the !flags.bare
+	// arm. Lazy mode selection mirrors the legacy synchronous path.
+	if !flags.bare {
+		lazyMode := rtpkg.ParseLazyMCPMode(os.Getenv("METIS_LAZY_MCP"))
+		go func(reg *tools.Registry, mcpReg *rtpkg.MCPRegistry, mode rtpkg.LazyMCPMode) {
+			defer close(mcpLauncherDoneCh)
+			servers, errs := rtpkg.LaunchAllMCPLazy(ctx, mcpReg, reg, mode)
+			// 2026-05-18: under TUI mode, stderr leaks into the
+			// alt-screen and corrupts the chat (user report: "每次
+			// 问完一句话 metis 就自动出现 MCP handshake: context
+			// deadline exceeded"). MCP launch is async + best-effort;
+			// the user discovers failures via /mcp list and the
+			// debug log. Stderr is reserved for non-TUI runs (bare
+			// mode, headless invocations) where it's the only output
+			// channel.
+			for _, e := range errs {
+				if debugLogFile != nil {
+					fmt.Fprintf(debugLogFile, "metis: MCP launch: %v\n", e)
+				}
+			}
+			rt.mcpServersMu.Lock()
+			rt.mcpServers = append(rt.mcpServers, servers...)
+			rt.mcpServersMu.Unlock()
+		}(reg, mcpReg, lazyMode)
+	} else {
+		// Bare / non-TUI mode — stderr is fine, the user expects it.
+		go func(reg *tools.Registry, mcpReg *rtpkg.MCPRegistry) {
+			defer close(mcpLauncherDoneCh)
+			lazyMode := rtpkg.ParseLazyMCPMode(os.Getenv("METIS_LAZY_MCP"))
+			servers, errs := rtpkg.LaunchAllMCPLazy(ctx, mcpReg, reg, lazyMode)
+			for _, e := range errs {
+				fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
+			}
+			rt.mcpServersMu.Lock()
+			rt.mcpServers = append(rt.mcpServers, servers...)
+			rt.mcpServersMu.Unlock()
+		}(reg, mcpReg)
 	}
 
 	// Resolve resume target. Order: explicit --resume <id> wins; then
@@ -1376,6 +1540,21 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 
 	runStart := time.Now()
+	// Phase A — honest exit code: track loop-end aborts that the
+	// previous `return err` branch was silently treating as success
+	// because Loop.Run() returns nil on every non-error abort path
+	// (diminishing_returns, max_iterations, loop_detected). Capture
+	// the StopReason from the final EventLoopDone, plus the most
+	// recent EventInfo text (which carries the abort's user-facing
+	// detail — see e.g. iter_cap "budget exhausted (N iters...)" at
+	// internal/agent/loop.go:1036 or diminishing-returns at :907).
+	// At end of cmdRun, if no real error fired AND the stop reason
+	// was one of the incomplete-triggers, return *IncompleteError so
+	// shell wrappers see exit code 11 instead of 0. The 4-round
+	// 2026-05-18 benchmark caught the bug: mini-interpreter task
+	// failed `go test` but `metis run … && echo ok` printed "ok".
+	var lastInfoText string
+	var incompleteReason, incompleteDetail string
 	for ev := range events {
 		switch ev.Kind {
 		case agent.EventTextDelta:
@@ -1472,6 +1651,12 @@ func cmdRun(ctx context.Context, args []string) error {
 				if strings.Contains(ev.Info, "rescue") {
 					turnRescues++
 				}
+				// Stash for incomplete-detail capture (see EventLoopDone
+				// branch below). The loop's abort paths emit a verbose
+				// EventInfo IMMEDIATELY before EventLoopDone, so the
+				// final value of lastInfoText at EventLoopDone time is
+				// the abort's user-facing explanation.
+				lastInfoText = ev.Info
 				fmt.Fprintf(os.Stderr, "[info] %s\n", ev.Info)
 			}
 		case agent.EventTokens:
@@ -1501,6 +1686,21 @@ func cmdRun(ctx context.Context, args []string) error {
 			finalStop := ev.StopReason
 			if finalStop == "" {
 				finalStop = "done"
+			}
+			// Phase A — incomplete classification. These three abort
+			// reasons mean the loop stopped before the model confirmed
+			// the task was done; pre-fix the wrapper saw exit 0 here.
+			// "halted_by_hook" is NOT in this list because hooks are
+			// user/operator-installed and a halt is intentional, not
+			// a failure signal. "plan_mode" is also a deliberate stop,
+			// not an abort. Keep this switch explicit (not a default
+			// branch) — silently flagging unknown reasons as incomplete
+			// would block legitimate provider-side stop reasons we
+			// haven't enumerated yet.
+			switch finalStop {
+			case "diminishing_returns", "max_iterations", "loop_detected", "stuck_after_reset":
+				incompleteReason = finalStop
+				incompleteDetail = lastInfoText
 			}
 			emitMetrics(finalStop)
 			// Token + duration metrics on stderr — picked up by the
@@ -1563,6 +1763,19 @@ func cmdRun(ctx context.Context, args []string) error {
 	// dream lock (which then blocked future dreams via the time gate).
 	if flags.autoMemory || os.Getenv("METIS_AUTO_MEMORY") == "1" {
 		waitForkInflight(120 * time.Second)
+	}
+	// Phase A — surface incomplete aborts to wrapper scripts via the
+	// process exit code. Only overrides the success path: if a real
+	// error already fired (err != nil from the goroutine), keep that
+	// one — it carries more diagnostic info than the bare incomplete
+	// reason. Stderr lines use a stable "[metis] TASK INCOMPLETE"
+	// marker so CI greps can match without parsing the detail.
+	if err == nil && incompleteReason != "" {
+		fmt.Fprintf(os.Stderr, "\n[metis] TASK INCOMPLETE — reason: %s\n", incompleteReason)
+		if incompleteDetail != "" {
+			fmt.Fprintf(os.Stderr, "[metis] detail: %s\n", incompleteDetail)
+		}
+		return &exitcode.IncompleteError{Reason: incompleteReason, Detail: incompleteDetail}
 	}
 	return err
 }
@@ -2265,9 +2478,11 @@ func cmdTools(args []string) error {
 	// snapshot) only happens in setupRuntime / chat sessions.
 	reg.Register(builtin.NewMetisInfo(gate, cfg, nil, nil, reg))
 	// EnterPlanMode / ExitPlanMode — list for `metis tools` parity
-	// with the chat REPL registration above.
-	reg.Register(builtin.NewEnterPlanMode())
-	reg.Register(builtin.NewExitPlanMode())
+	// with the chat REPL registration above. Production wiring passes
+	// the gate so plan-mode entry/exit also flips Gate.Mode (the
+	// listener bridges Gate→Loop).
+	reg.Register(builtin.NewEnterPlanModeWithGate(gate))
+	reg.Register(builtin.NewExitPlanModeWithGate(gate))
 	// G.8 — if the user is previewing tool availability under
 	// METIS_COORDINATOR_MODE=1, apply the same filter the chat REPL
 	// would. Stubs replace mutation tools so the listing shows the
@@ -2616,11 +2831,19 @@ func buildSlash(rt *runtime) *slash.Registry {
 	// slash commands here. Done after LoadCustomCommands so a user
 	// .md command sharing the same name still wins (Registry.Register
 	// updates index map, last-write-wins). Probe failures are silent.
-	if rt != nil && len(rt.mcpServers) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-		handles := rtpkg.CollectMCPPrompts(ctx, rt.mcpServers)
-		cancel()
-		_ = registerMCPPromptsAsSlash(r, handles)
+	if rt != nil {
+		// Snapshot under the mutex — the background launcher may still be
+		// appending. Captures whatever's online at this moment; servers
+		// still launching just miss this round's prompt registration.
+		rt.mcpServersMu.Lock()
+		snapshot := append([]*mcptools.Server(nil), rt.mcpServers...)
+		rt.mcpServersMu.Unlock()
+		if len(snapshot) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			handles := rtpkg.CollectMCPPrompts(ctx, snapshot)
+			cancel()
+			_ = registerMCPPromptsAsSlash(r, handles)
+		}
 	}
 	return r
 }

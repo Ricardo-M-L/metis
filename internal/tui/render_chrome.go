@@ -17,6 +17,71 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
+// renderSubAgentChip formats one sub-agent as a compact status-bar
+// pill. claude-code's Task framework renders a row per running task
+// with the latest tool name + an elapsed-seconds timer; metis stays
+// single-row by squeezing the same fields into one chip.
+//
+// Format (longest first; each segment elided when its data is missing):
+//
+//	◇ alice · Read · 23s · 7t   (running)
+//	✓ alice · 47s · 12t         (completed, lingers for subAgentLingerDuration)
+//	✗ alice · 3s                (failed, lingers)
+//
+// LastTool is omitted in the terminal-state forms because it's stale
+// the moment Status flipped. Length cap kept loose — the status bar
+// wraps when chips overflow.
+func renderSubAgentChip(sa SubAgentInfo) string {
+	glyph := "◇"
+	includeLastTool := true
+	switch sa.Status {
+	case "completed":
+		glyph = "✓"
+		includeLastTool = false
+	case "failed":
+		glyph = "✗"
+		includeLastTool = false
+	}
+	parts := []string{glyph + " " + sa.Name}
+	if includeLastTool && sa.LastTool != "" {
+		parts = append(parts, sa.LastTool)
+	}
+	if !sa.StartedAt.IsZero() {
+		// For finished pills, freeze elapsed at FinishedAt so the
+		// chip's last reading is the actual run duration rather than
+		// "23s, 24s, 25s..." ticking on after completion.
+		end := time.Now()
+		if !sa.FinishedAt.IsZero() {
+			end = sa.FinishedAt
+		}
+		elapsed := end.Sub(sa.StartedAt)
+		parts = append(parts, formatSubAgentElapsed(elapsed))
+	}
+	if sa.ToolsCount > 0 {
+		parts = append(parts, fmt.Sprintf("%dt", sa.ToolsCount))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// formatSubAgentElapsed picks a compact unit:
+//
+//	<60s → 23s
+//	<60m → 4m
+//	else  → 2h
+//
+// Doesn't try to be precise — the chip is a "still alive" signal,
+// not a stopwatch.
+func formatSubAgentElapsed(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+}
+
 // renderInputLine paints the textarea + dividers. Flat style (no
 // rounded border): a horizontal rule above and below, "  > " prompt
 // inside. claude-code parity — the boxed look is too heavy on dark
@@ -51,7 +116,14 @@ func renderInputLine(m *Model) string {
 	body := m.input.View()
 	body = strings.TrimRight(body, "\n")
 
-	dividerW := termW - 2
+	// dividerW leaves a 1-cell gap on the right so the total visual width
+	// is termW - 1, not termW. Many terminals (Terminal.app, iTerm2 default
+	// "wrap at right margin", Wezterm) auto-wrap when the cursor advances
+	// past the last column, which silently consumed an extra row per
+	// divider — the visible symptom was the bottom divider clipped off
+	// the screen (image #41 user feedback 2026-05-18: "之前双横线框只剩一条").
+	// 2 leading + dividerW chars + 1 trailing gap = termW - 1 total.
+	dividerW := termW - 3
 	if dividerW < 20 {
 		dividerW = 20
 	}
@@ -343,7 +415,7 @@ func renderStatusBar(m *Model) string {
 		leftParts = append(leftParts, fmt.Sprintf("◷ %d queued", n))
 	}
 	for _, sa := range m.subAgents {
-		leftParts = append(leftParts, "◇ "+sa.Name)
+		leftParts = append(leftParts, renderSubAgentChip(sa))
 	}
 	// Cron wakeups + silent fires (2026-05-13). The wakeup chip
 	// makes ScheduleWakeup self-documenting — without it the user

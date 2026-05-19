@@ -107,7 +107,14 @@ func (t *MCPTool) Execute(ctx context.Context, in map[string]any) (*tools.Result
 // NewServer connects to a stdio MCP server (subprocess) and returns a
 // Server with its tools registered as Metis tools.
 func NewServer(ctx context.Context, name, command string, args ...string) (*Server, error) {
-	client, err := mcp.NewStdioClient(ctx, command, args...)
+	return NewServerWithEnv(ctx, name, command, nil, args...)
+}
+
+// NewServerWithEnv is the env-aware variant. `extraEnv` (KEY=VAL strings)
+// is appended onto os.Environ() for the spawned subprocess so values
+// like `FIRECRAWL_API_KEY = "fc-..."` from mcp.toml reach the server.
+func NewServerWithEnv(ctx context.Context, name, command string, extraEnv []string, args ...string) (*Server, error) {
+	client, err := mcp.NewStdioClientWithEnv(ctx, command, extraEnv, args...)
 	if err != nil {
 		return nil, fmt.Errorf("MCP server %q: %w", name, err)
 	}

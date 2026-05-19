@@ -144,6 +144,106 @@ func TestAddMCPServer_ReservedNameRefused(t *testing.T) {
 	}
 }
 
+// TestAddMCPServerWithEnv_StoresAndCopies — env supplied to the with-env
+// variant is preserved on the entry and the original map is detached
+// (mutating the caller's map can't bleed into the stored entry).
+func TestAddMCPServerWithEnv_StoresAndCopies(t *testing.T) {
+	reg := &MCPRegistry{}
+	src := map[string]string{"FIRECRAWL_API_KEY": "fc-abc", "OTHER": "v"}
+	if err := AddMCPServerWithEnv(reg, "fc", "node", []string{"server.js"}, src); err != nil {
+		t.Fatalf("AddMCPServerWithEnv: %v", err)
+	}
+	got := FindMCPServer(reg, "fc")
+	if got == nil {
+		t.Fatalf("entry not inserted")
+	}
+	if got.Env["FIRECRAWL_API_KEY"] != "fc-abc" {
+		t.Errorf("env not preserved; got %v", got.Env)
+	}
+	// Mutate caller map → stored entry must not see it.
+	src["FIRECRAWL_API_KEY"] = "tampered"
+	if got.Env["FIRECRAWL_API_KEY"] != "fc-abc" {
+		t.Errorf("AddMCPServerWithEnv should copy env; got %v", got.Env)
+	}
+}
+
+// TestAddMCPServer_NilEnvLeavesFieldNil — plain AddMCPServer (no env)
+// shouldn't allocate an empty Env map; TOML serialization should skip
+// the key entirely thanks to `omitempty`.
+func TestAddMCPServer_NilEnvLeavesFieldNil(t *testing.T) {
+	reg := &MCPRegistry{}
+	if err := AddMCPServer(reg, "plain", "cmd", nil); err != nil {
+		t.Fatal(err)
+	}
+	got := FindMCPServer(reg, "plain")
+	if got == nil {
+		t.Fatalf("entry missing")
+	}
+	if got.Env != nil {
+		t.Errorf("Env should be nil for no-env add; got %v", got.Env)
+	}
+}
+
+// TestExpandEnvVarsInEntry_EnvFieldExpands — values in the Env field
+// get the same ${VAR} treatment as command/args/headers.
+func TestExpandEnvVarsInEntry_EnvFieldExpands(t *testing.T) {
+	t.Setenv("METIS_TEST_FCKEY", "fc-123")
+	entry := MCPServerEntry{
+		Name:    "fc",
+		Command: "node",
+		Env:     map[string]string{"FIRECRAWL_API_KEY": "${METIS_TEST_FCKEY}"},
+	}
+	expanded, missing := expandEnvVarsInEntry(entry)
+	if expanded.Env["FIRECRAWL_API_KEY"] != "fc-123" {
+		t.Errorf("env value not expanded; got %v", expanded.Env)
+	}
+	if len(missing) != 0 {
+		t.Errorf("nothing should be missing; got %v", missing)
+	}
+}
+
+// TestExpandEnvVarsInEntry_EnvFieldMissingReported — a missing var in
+// Env surfaces in the missing slice so launch can refuse with a clear
+// error, same as missing vars in headers/args.
+func TestExpandEnvVarsInEntry_EnvFieldMissingReported(t *testing.T) {
+	entry := MCPServerEntry{
+		Name:    "fc",
+		Command: "node",
+		Env:     map[string]string{"FIRECRAWL_API_KEY": "${METIS_NEVER_SET_FCKEY}"},
+	}
+	_, missing := expandEnvVarsInEntry(entry)
+	if len(missing) != 1 || missing[0] != "METIS_NEVER_SET_FCKEY" {
+		t.Errorf("missing var should be reported; got %v", missing)
+	}
+}
+
+// TestEnvSliceFromMap_StableOrder — the slice for exec.Cmd.Env must be
+// sorted so test assertions and stderr-capture in diagnostics don't
+// flap across runs.
+func TestEnvSliceFromMap_StableOrder(t *testing.T) {
+	out := envSliceFromMap(map[string]string{"B": "2", "A": "1", "C": "3"})
+	want := []string{"A=1", "B=2", "C=3"}
+	if len(out) != len(want) {
+		t.Fatalf("len=%d want %d", len(out), len(want))
+	}
+	for i, w := range want {
+		if out[i] != w {
+			t.Errorf("[%d]=%q want %q", i, out[i], w)
+		}
+	}
+}
+
+// TestEnvSliceFromMap_EmptyNil — nil/empty input returns nil so the
+// caller's "if len(extraEnv) > 0" guard skips cleanly.
+func TestEnvSliceFromMap_EmptyNil(t *testing.T) {
+	if out := envSliceFromMap(nil); out != nil {
+		t.Errorf("nil input should yield nil; got %v", out)
+	}
+	if out := envSliceFromMap(map[string]string{}); out != nil {
+		t.Errorf("empty input should yield nil; got %v", out)
+	}
+}
+
 // TestSetReservedComputerUseServer_RoundTrip — /cu enable's path. First
 // call inserts (replaced=false); second call returns replaced=true and
 // the entry's command stays pinned to the canonical binary regardless

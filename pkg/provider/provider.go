@@ -201,3 +201,29 @@ type StreamReader interface {
 	io.Closer
 	Recv() (StreamEvent, error) // returns io.EOF at end
 }
+
+// VisionSupporter is an optional interface a Provider may implement
+// to declare whether the active model accepts `image` content blocks.
+// Callers that build user messages with image attachments should
+// type-assert against this and silently strip image blocks (or surface
+// a friendly notice) when the assertion fails or returns false.
+//
+// Optional rather than required so external embedders implementing
+// only the core Provider interface don't break on upgrade. A provider
+// that doesn't implement this is treated as "vision capability
+// unknown" — callers should err on the side of NOT sending images,
+// to avoid the silent API 400 (Anthropic) / cryptic "invalid request"
+// (MiniMax) that text-only models produce when handed an image block.
+type VisionSupporter interface {
+	SupportsVision() bool
+}
+
+// ProviderSupportsVision is the call-site shortcut: type-asserts the
+// optional interface and returns false when not implemented. Keeps
+// every call site from re-writing the same type-assert dance.
+func ProviderSupportsVision(p Provider) bool {
+	if v, ok := p.(VisionSupporter); ok {
+		return v.SupportsVision()
+	}
+	return false
+}

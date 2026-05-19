@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -30,9 +31,26 @@ import (
 // succeeds, the next iteration's tool batch is intercepted (collected
 // and emitted as EventPlan instead of executed) so the model has to
 // surface its proposed actions before they happen.
-type EnterPlanMode struct{ tools.BaseTool }
+type EnterPlanMode struct {
+	tools.BaseTool
+	// gate, when non-nil, lets EnterPlanMode flip Gate.Mode in addition
+	// to Loop.PlanMode. The listener wired in main.go bridges Gate→Loop
+	// so the loop's PlanMode short-circuit fires correctly. Pre-fix
+	// (2026-05-18 audit), EnterPlanMode only set Loop.PlanMode, leaving
+	// Gate.Mode untouched — that worked for "model is in plan" but the
+	// status bar showed the old mode and ExitPlanMode couldn't restore
+	// the user's prior posture. Nil = test path (legacy direct
+	// SetPlanMode fallback still works).
+	gate *permission.Gate
+}
 
 func NewEnterPlanMode() EnterPlanMode { return EnterPlanMode{} }
+
+// NewEnterPlanModeWithGate is the production wiring — pass the live
+// Gate so EnterPlanMode flips it (and the listener propagates to Loop).
+func NewEnterPlanModeWithGate(g *permission.Gate) EnterPlanMode {
+	return EnterPlanMode{gate: g}
+}
 
 func (EnterPlanMode) Name() string { return "EnterPlanMode" }
 
@@ -76,7 +94,7 @@ func (EnterPlanMode) CanUse(_ context.Context, _ map[string]any) (tools.Permissi
 	return tools.PermissionAllow, ""
 }
 
-func (EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Result, error) {
+func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Result, error) {
 	ctrl := agent.PlanControllerFromContext(ctx)
 	if ctrl == nil {
 		// Should not happen in normal Loop dispatch — the controller
@@ -87,6 +105,26 @@ func (EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Resu
 			IsError: true,
 		}, nil
 	}
+	// Production path: flip the gate. The listener wired in main.go
+	// will sync Loop.PlanMode automatically. We also snapshot the
+	// pre-plan mode onto the controller so ExitPlanMode can restore
+	// the user's prior posture (without this, Exit would leave Gate
+	// stuck in plan and the next turn would re-trigger deny-storm
+	// for every write tool).
+	if e.gate != nil {
+		prev := e.gate.Mode()
+		if prev != permission.ModePlan {
+			ctrl.SetPrePlanMode(string(prev))
+		}
+		e.gate.SetMode(permission.ModePlan)
+		return &tools.Result{
+			Output: "Plan mode active. Tool calls from your next turn will be collected as a plan for user review instead of executed. When ready, call ExitPlanMode with a `plan` argument containing the markdown plan body.",
+		}, nil
+	}
+	// Fallback path for test harnesses that build a Loop without a
+	// Gate. Flip Loop.PlanMode directly; user sees "model thinks it's
+	// in plan but gate still allows writes" which is a known test
+	// limitation — production always wires the gate.
 	ctrl.SetPlanMode(true)
 	return &tools.Result{
 		Output: "Plan mode active. Tool calls from your next turn will be collected as a plan for user review instead of executed. When ready, call ExitPlanMode with a `plan` argument containing the markdown plan body.",
@@ -102,9 +140,19 @@ func (EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Resu
 // metis surfaces the plan and lets normal execution resume on the
 // next turn. The user can Ctrl+C to halt if the plan looks wrong —
 // matches the existing metis interrupt UX.
-type ExitPlanMode struct{ tools.BaseTool }
+type ExitPlanMode struct {
+	tools.BaseTool
+	gate *permission.Gate // optional; production wires via NewExitPlanModeWithGate
+}
 
 func NewExitPlanMode() ExitPlanMode { return ExitPlanMode{} }
+
+// NewExitPlanModeWithGate is the production wiring — pass the live
+// Gate so ExitPlanMode restores Gate.Mode (and the listener propagates
+// to Loop).
+func NewExitPlanModeWithGate(g *permission.Gate) ExitPlanMode {
+	return ExitPlanMode{gate: g}
+}
 
 func (ExitPlanMode) Name() string { return "ExitPlanMode" }
 
@@ -145,7 +193,7 @@ func (ExitPlanMode) CanUse(_ context.Context, _ map[string]any) (tools.Permissio
 	return tools.PermissionAllow, ""
 }
 
-func (ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	plan, _ := in["plan"].(string)
 	plan = strings.TrimSpace(plan)
 	if plan == "" {
@@ -158,17 +206,30 @@ func (ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Resu
 			IsError: true,
 		}, nil
 	}
-	// Emit the plan body as an info event so the TUI / CLI can render
-	// it for user review. Using EventInfo (rather than extending the
-	// existing EventPlan schema which carries ToolCalls) keeps the
-	// change small and leaves the EventPlan handler untouched for the
-	// `--mode plan` path that uses EventPlan with tool_use blocks.
 	if out := agent.EventOutFromContext(ctx); out != nil {
 		out <- agent.Event{
 			Kind: agent.EventInfo,
 			Info: "[plan proposal]\n" + plan,
 		}
 	}
+	// Production path: restore the user's pre-plan posture via the
+	// gate (listener propagates to Loop.PlanMode). Fall back to
+	// ModeAsk when no prePlanMode was captured (e.g., model called
+	// ExitPlanMode without a matching EnterPlanMode, or the loop
+	// restarted mid-plan). ModeAsk is the safest default: any write
+	// will prompt rather than silently auto-execute or get denied.
+	if e.gate != nil {
+		restore := permission.Mode(ctrl.PrePlanMode())
+		if restore == "" || restore == permission.ModePlan {
+			restore = permission.ModeAsk
+		}
+		e.gate.SetMode(restore)
+		ctrl.SetPrePlanMode("") // consume the snapshot
+		return &tools.Result{
+			Output: "Plan surfaced for user review. Plan mode disabled — subsequent tool calls will execute normally. If the user objects, they will interrupt; otherwise continue with the plan.",
+		}, nil
+	}
+	// Fallback path for test harnesses without a Gate.
 	ctrl.SetPlanMode(false)
 	return &tools.Result{
 		Output: "Plan surfaced for user review. Plan mode disabled — subsequent tool calls will execute normally. If the user objects, they will interrupt; otherwise continue with the plan.",

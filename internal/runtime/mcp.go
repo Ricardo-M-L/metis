@@ -19,6 +19,7 @@ import (
 	goruntime "runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -57,6 +58,12 @@ type MCPServerEntry struct {
 	Args     []string          `toml:"args,omitempty"`
 	URL      string            `toml:"url,omitempty"`     // HTTP endpoint
 	Headers  map[string]string `toml:"headers,omitempty"` // optional HTTP auth
+	// Env injects extra environment variables into a stdio subprocess
+	// (no effect for url-transport servers). Values are env-expanded the
+	// same way command/args/url are — so `FIRECRAWL_API_KEY = "${FC_KEY}"`
+	// works. Wired via `/mcp add --env KEY=VAL` and the user can also
+	// hand-edit `[servers.env]` inline tables in mcp.toml.
+	Env      map[string]string `toml:"env,omitempty"`
 	Disabled bool              `toml:"disabled"`
 	// EnabledTools and DisabledTools filter the tool list a server
 	// exposes after handshake. Modeled on Codex's mcp_servers.<id>
@@ -186,6 +193,15 @@ const (
 // built-in computer-use server (see /cu enable). Same behavior as
 // Claude Code's `addMcpConfig` for `computer-use` and `claude-in-chrome`.
 func AddMCPServer(reg *MCPRegistry, name, command string, args []string) error {
+	return AddMCPServerWithEnv(reg, name, command, args, nil)
+}
+
+// AddMCPServerWithEnv is the env-aware variant of AddMCPServer. Pass nil
+// `env` for parity with the simpler form. Env values are written verbatim
+// (NOT expanded) so users can keep `${SOMETHING}` placeholders in mcp.toml
+// for shell-resolved secrets — the expansion happens at LaunchMCPServer
+// time via expandEnvVarsInEntry.
+func AddMCPServerWithEnv(reg *MCPRegistry, name, command string, args []string, env map[string]string) error {
 	if name == "" {
 		return errors.New("mcp: name required")
 	}
@@ -200,16 +216,27 @@ func AddMCPServer(reg *MCPRegistry, name, command string, args []string) error {
 			"use `/cu enable` to enable computer-use, or pick a different name",
 			ReservedComputerUseName)
 	}
+	var envCopy map[string]string
+	if len(env) > 0 {
+		envCopy = make(map[string]string, len(env))
+		for k, v := range env {
+			envCopy[k] = v
+		}
+	}
 	for i, s := range reg.Servers {
 		if s.Name == name {
 			reg.Servers[i] = MCPServerEntry{
-				Name: name, Command: command, Args: append([]string(nil), args...),
+				Name: name, Command: command,
+				Args: append([]string(nil), args...),
+				Env:  envCopy,
 			}
 			return nil
 		}
 	}
 	reg.Servers = append(reg.Servers, MCPServerEntry{
-		Name: name, Command: command, Args: append([]string(nil), args...),
+		Name: name, Command: command,
+		Args: append([]string(nil), args...),
+		Env:  envCopy,
 	})
 	return nil
 }
@@ -350,7 +377,7 @@ func LaunchMCPServer(ctx context.Context, reg *MCPRegistry, name string, registr
 	case expanded.URL != "":
 		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, expanded.Headers)
 	case expanded.Command != "":
-		srv, err = mcptools.NewServer(ctx, expanded.Name, expanded.Command, expanded.Args...)
+		srv, err = mcptools.NewServerWithEnv(ctx, expanded.Name, expanded.Command, envSliceFromMap(expanded.Env), expanded.Args...)
 	default:
 		return nil, fmt.Errorf("mcp: server %q has neither command nor url", name)
 	}
@@ -371,28 +398,57 @@ func LaunchMCPServer(ctx context.Context, reg *MCPRegistry, name string, registr
 // Servers that came up. Errors on individual servers are appended to the
 // returned []error so callers can warn but keep going (mirrors the existing
 // behavior in cmd/metis/main.go's setupRuntime).
+//
+// Launches run CONCURRENTLY. Before 2026-05-18 this was a sequential for
+// loop — wall-clock for N servers was sum(handshake_i) which made cold-
+// start brutal when even one stdio server was slow (an `npx -y …` cache
+// miss + a real-API-key firecrawl-mcp could each pin the full 30s
+// ConnectTimeout). claude-code uses `pMap` + `Promise.allSettled` for
+// the same reason; goroutines + WaitGroup is the Go-native equivalent.
+// Wall-clock is now max(handshake_i), capped by ConnectTimeout.
+//
+// tools.Registry.Register is mutex-protected (see tool.go), so we can
+// safely Register from each launching goroutine without coordination.
+// Result-collection still happens under a mutex so the returned slices
+// have stable ordering matching reg.Servers.
 func LaunchAllMCP(ctx context.Context, reg *MCPRegistry, registry *tools.Registry) ([]*mcptools.Server, []error) {
 	if reg == nil {
 		return nil, nil
 	}
+	type launchResult struct {
+		idx int
+		srv *mcptools.Server
+		err error
+	}
+	results := make([]launchResult, 0, len(reg.Servers))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i, s := range reg.Servers {
+		if s.Disabled || (s.Command == "" && s.URL == "") {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, name string) {
+			defer wg.Done()
+			srv, err := LaunchMCPServer(ctx, reg, name, registry)
+			mu.Lock()
+			results = append(results, launchResult{idx: idx, srv: srv, err: err})
+			mu.Unlock()
+		}(i, s.Name)
+	}
+	wg.Wait()
+	// Sort by original registry index so a later run of the same registry
+	// produces the same ordering — important for the diag/log output the
+	// user reads when something's wrong.
+	sort.Slice(results, func(i, j int) bool { return results[i].idx < results[j].idx })
 	var ok []*mcptools.Server
 	var errs []error
-	for _, s := range reg.Servers {
-		// Skip disabled entries or entries with neither transport
-		// set. The launch helper itself handles "command vs url"
-		// branching; here we only filter unusable rows.
-		if s.Disabled {
+	for _, r := range results {
+		if r.err != nil {
+			errs = append(errs, r.err)
 			continue
 		}
-		if s.Command == "" && s.URL == "" {
-			continue
-		}
-		srv, err := LaunchMCPServer(ctx, reg, s.Name, registry)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		ok = append(ok, srv)
+		ok = append(ok, r.srv)
 	}
 	return ok, errs
 }
@@ -420,22 +476,41 @@ func LaunchAllMCPLazy(ctx context.Context, reg *MCPRegistry, registry *tools.Reg
 	if mode == LazyMCPModeNever {
 		return LaunchAllMCP(ctx, reg, registry)
 	}
+	// Parallel launch — same rationale as LaunchAllMCP above. Cache-hit
+	// entries are near-instant (no subprocess), but cache-miss entries
+	// still pay the eager spawn cost and serializing those is exactly
+	// the user-visible regression we just fixed.
+	type launchResult struct {
+		idx int
+		srv *mcptools.Server
+		err error
+	}
+	results := make([]launchResult, 0, len(reg.Servers))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i, entry := range reg.Servers {
+		if entry.Disabled || (entry.Command == "" && entry.URL == "") {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, e MCPServerEntry) {
+			defer wg.Done()
+			srv, err := launchOneMCPLazy(ctx, e, registry, mode)
+			mu.Lock()
+			results = append(results, launchResult{idx: idx, srv: srv, err: err})
+			mu.Unlock()
+		}(i, entry)
+	}
+	wg.Wait()
+	sort.Slice(results, func(i, j int) bool { return results[i].idx < results[j].idx })
 	var ok []*mcptools.Server
 	var errs []error
-	for _, entry := range reg.Servers {
-		if entry.Disabled {
-			continue
+	for _, r := range results {
+		if r.err != nil {
+			errs = append(errs, r.err)
 		}
-		if entry.Command == "" && entry.URL == "" {
-			continue
-		}
-		srv, err := launchOneMCPLazy(ctx, entry, registry, mode)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if srv != nil {
-			ok = append(ok, srv)
+		if r.srv != nil {
+			ok = append(ok, r.srv)
 		}
 	}
 	return ok, errs
@@ -506,7 +581,7 @@ func buildLazyServer(expanded, original MCPServerEntry, cachedTools []CachedTool
 		case expanded.URL != "":
 			return mcp.NewHTTPClient(ctx, expanded.URL, expanded.Headers)
 		case expanded.Command != "":
-			return mcp.NewStdioClient(ctx, expanded.Command, expanded.Args...)
+			return mcp.NewStdioClientWithEnv(ctx, expanded.Command, envSliceFromMap(expanded.Env), expanded.Args...)
 		default:
 			return nil, fmt.Errorf("mcp: server %q has neither command nor url", expanded.Name)
 		}

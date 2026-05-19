@@ -34,6 +34,10 @@ import (
 //	7   PERMISSION — filesystem permission, incl. EACCES
 //	8   IO — disk full, read-only fs, broken pipe
 //	10  CONTENT_FILTER — provider refused on safety grounds
+//	11  INCOMPLETE — loop aborted before the task was confirmed done
+//	    (budget exhausted / diminishing returns / repetitive-loop
+//	    detector). The model returned NO error, but the run shouldn't
+//	    be treated as success. See IncompleteError below.
 //	130 SIGINT (Ctrl+C). UNIX convention; we don't redefine it.
 //	143 SIGTERM. Same.
 const (
@@ -47,9 +51,36 @@ const (
 	Permission    = 7
 	IO            = 8
 	ContentFilter = 10
+	Incomplete    = 11
 	SIGINT        = 130
 	SIGTERM       = 143
 )
+
+// IncompleteError signals a loop that exited a non-success abort path
+// (the model didn't error, but the agent stopped before confirming the
+// task was done — e.g., budget exhausted, repetitive-loop detector
+// tripped, diminishing-returns abort). Carries a machine-readable
+// Reason (matches loop.go's stopReason strings) and a human-readable
+// Detail (the same text the agent emitted as EventInfo at abort).
+//
+// Treating this as a distinct exit code (11) lets CI scripts tell
+// "agent stopped early" apart from "agent errored" (general/1) and
+// "agent succeeded" (0). Prior behavior was to swallow these aborts
+// as exit 0, which fooled scripts into thinking the task was done.
+type IncompleteError struct {
+	Reason string // machine-readable, e.g. "diminishing_returns", "max_iterations", "loop_detected"
+	Detail string // human-readable; usually the abort's EventInfo text
+}
+
+func (e *IncompleteError) Error() string {
+	if e == nil {
+		return "incomplete: <nil>"
+	}
+	if e.Detail != "" {
+		return "incomplete (" + e.Reason + "): " + e.Detail
+	}
+	return "incomplete: " + e.Reason
+}
 
 // Classify maps an error to one of the codes above. Best-effort —
 // nothing here is authoritative; callers who already KNOW the class
@@ -61,6 +92,15 @@ const (
 func Classify(err error) int {
 	if err == nil {
 		return OK
+	}
+
+	// Typed IncompleteError takes precedence — the agent layer
+	// constructs this directly when a loop abort path was hit, so we
+	// must respect it before any string heuristics that might also
+	// match its message text.
+	var ie *IncompleteError
+	if errors.As(err, &ie) {
+		return Incomplete
 	}
 
 	// Cancellation propagated from signal.NotifyContext.

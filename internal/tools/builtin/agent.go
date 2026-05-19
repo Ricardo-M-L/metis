@@ -279,6 +279,24 @@ Use Agent for:
   - Comparative analysis: "diff how the auth flow works in package A vs package B."
   - Independent verification: "run the test suite and report which tests failed and the smallest reproducing change."
 
+PARALLEL FAN-OUT (important — this is HOW you scale, not WHEN to ask):
+When you have N independent sub-problems, emit N Agent tool_uses IN
+THE SAME ASSISTANT TURN. metis's dispatcher launches them
+concurrently (Background tier when run_in_background:true,
+otherwise the exclusive queue still avoids re-paying network setup
+per call). Sweet spot is 3–8 parallel agents; cap is 20 named + 40
+anonymous. Example shapes:
+  - Surveying 5 libraries → 5 explore agents in one turn, NOT 5
+    sequential turns.
+  - Implementing 4 independent file clusters → 4 general agents in
+    one turn (after a plan agent returned the cluster list).
+  - Comparing 3 approaches → 3 explore agents in one turn, then you
+    synthesize from their 3 returns.
+Do NOT fan out when sub-tasks share state (output of A feeds into
+B) or when each target is <2 tool calls (inline is cheaper).
+There is no special "spawn_team" tool — multiple Agent tool_use
+blocks in one response IS the fan-out mechanism.
+
 Do NOT use Agent for:
   - Lookups you can do in one or two tool calls: a single Grep, a single Read — just do it inline. Forking has overhead (new context window, new system prompt) that costs more than the search.
   - Conversational tasks: explaining something to the user, formatting an answer, deciding what to do next. The model is you; don't fork to think.
@@ -437,6 +455,29 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 				Output:  "resume_from requires session persistence to be wired; this code path (likely a test or `metis tools` listing) has no session dir.",
 				IsError: true,
 			}, nil
+		}
+		// Mi2 (2026-05-18) — refuse if the source agent_id is still
+		// LIVE. Two parallel sub-loops sharing the same AgentID would
+		// race on the transcript file and produce undefined behavior.
+		// Roster.LookupByAgentID scans live first, then recentlyFinished;
+		// liveness check separates the two by also reading the live map
+		// directly. (recentlyFinished hits are safe — the original
+		// runner has exited.)
+		if a.roster != nil {
+			if existing, ok := a.roster.LookupByAgentID(resumeFrom); ok {
+				snap := existing.Snapshot()
+				if snap.Status == agent.StatusRunning {
+					return &tools.Result{
+						Output: fmt.Sprintf(
+							"resume_from=%s refused: sub-agent is still RUNNING (name=%s, started=%s). "+
+								"Stop it first with SubAgentStop({agent_id: %q}) and wait for it to finish, "+
+								"then re-issue the resume.",
+							resumeFrom, snap.Name, snap.Started.Format("15:04:05"), resumeFrom,
+						),
+						IsError: true,
+					}, nil
+				}
+			}
 		}
 		snap, err := agent.LoadSubAgentSnapshot(a.sessionDir, resumeFrom)
 		if err != nil {
@@ -729,6 +770,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	parentOut := agent.EventOutFromContext(ctx)
+	parentToolUseID := agent.ParentToolUseIDFromContext(ctx)
 
 	// G.2 — wrap cancel so the worktree cleanup happens on every
 	// exit path (parent ctx cancel, sub-agent natural end, panic in
@@ -747,9 +789,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	if runInBackground {
-		return a.executeBackground(sub, childCtx, cancel, parentOut, teammate, timeout, transcript, persistedOnDisk)
+		return a.executeBackground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
 	}
-	return a.executeForeground(sub, childCtx, cancel, parentOut, teammate, timeout, transcript, persistedOnDisk)
+	return a.executeForeground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
 }
 
 // resolveIsolation handles the `isolation` + `cwd` schema fields
@@ -819,6 +861,7 @@ func (a Agent) executeForeground(
 	childCtx context.Context,
 	cancel context.CancelFunc,
 	parentOut chan<- agent.Event,
+	parentToolUseID string,
 	teammate *agent.Teammate,
 	timeout time.Duration,
 	transcript *agent.SubAgentTranscript,
@@ -883,7 +926,7 @@ drainLoop:
 			if !ok {
 				break drainLoop
 			}
-			forwardSubAgentEvent(parentOut, ev)
+			forwardSubAgentEvent(parentOut, parentToolUseID, ev)
 			switch ev.Kind {
 			case agent.EventTextDelta:
 				output.WriteString(ev.TextDelta)
@@ -948,6 +991,7 @@ func (a Agent) executeBackground(
 	childCtx context.Context,
 	cancel context.CancelFunc,
 	parentOut chan<- agent.Event,
+	parentToolUseID string,
 	teammate *agent.Teammate,
 	timeout time.Duration,
 	transcript *agent.SubAgentTranscript,
@@ -957,7 +1001,7 @@ func (a Agent) executeBackground(
 		// No Roster wired — graceful fallback to foreground so callers
 		// that opt into run_in_background on a Roster-less embedding
 		// still get a useful result (just synchronously).
-		return a.executeForeground(sub, childCtx, cancel, parentOut, nil, timeout, transcript, persistedOnDisk)
+		return a.executeForeground(sub, childCtx, cancel, parentOut, parentToolUseID, nil, timeout, transcript, persistedOnDisk)
 	}
 
 	go func() {
@@ -987,7 +1031,7 @@ func (a Agent) executeBackground(
 		stopReason := ""
 		persistedMsgCount := persistedOnDisk
 		for ev := range events {
-			forwardSubAgentEvent(parentOut, ev)
+			forwardSubAgentEvent(parentOut, parentToolUseID, ev)
 			switch ev.Kind {
 			case agent.EventTextDelta:
 				teammate.AppendText(ev.TextDelta)
@@ -1058,7 +1102,7 @@ func (a Agent) executeBackground(
 // chip) to be useful; until that lane exists, dropping the delta is
 // the right call. Tool starts/results still forward so the parent
 // can see "sub: Read", "sub: Grep" in flight.
-func forwardSubAgentEvent(parentOut chan<- agent.Event, ev agent.Event) {
+func forwardSubAgentEvent(parentOut chan<- agent.Event, parentToolUseID string, ev agent.Event) {
 	if parentOut == nil {
 		return
 	}
@@ -1066,6 +1110,11 @@ func forwardSubAgentEvent(parentOut chan<- agent.Event, ev agent.Event) {
 	case agent.EventToolStart, agent.EventToolResult:
 		forwarded := ev
 		forwarded.ToolName = "sub: " + ev.ToolName
+		// Stamp the parent's Agent tool_use_id so the TUI can
+		// attribute child progress to the right SubAgentInfo pill —
+		// crucial when N sub-agents run in parallel and each
+		// generates its own "sub: Read" / "sub: Bash" stream.
+		forwarded.SubAgentParentID = parentToolUseID
 		select {
 		case parentOut <- forwarded:
 		default:

@@ -424,6 +424,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// token-counter animation + event drain below.
 		m.totalTokens.Animate()
 
+		// Mi3 (2026-05-18) — prune sub-agent pills whose terminal
+		// ✓/✗ tail has been on screen long enough. handleAgentEvent
+		// now stamps FinishedAt instead of yanking the pill the
+		// instant the result lands, so the user can read the final
+		// state. After subAgentLingerDuration we drop it from the
+		// chip row.
+		if len(m.subAgents) > 0 {
+			cutoff := time.Now().Add(-subAgentLingerDuration)
+			kept := m.subAgents[:0]
+			for _, sa := range m.subAgents {
+				if !sa.FinishedAt.IsZero() && sa.FinishedAt.Before(cutoff) {
+					continue
+				}
+				kept = append(kept, sa)
+			}
+			m.subAgents = kept
+		}
+
 		// Permission prompt auto-deny: if the user hasn't answered within
 		// permissionTimeout, decide for them so the agent loop unblocks.
 		// Without this, leaving the TUI on a prompt overnight (or while

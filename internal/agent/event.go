@@ -188,6 +188,36 @@ func WithCwd(ctx context.Context, dir string) context.Context {
 	return context.WithValue(ctx, cwdKey{}, dir)
 }
 
+// parentToolUseIDKey carries the parent's Agent tool_use_id down to
+// the Agent tool itself, so its sub-event forwarder can stamp each
+// forwarded child event with the parent's id. The TUI uses this to
+// attribute "sub: Read", "sub: Bash" progress events to the right
+// SubAgentInfo entry when multiple sub-agents are in flight.
+//
+// Without this, sub-event progress would have to be assigned by
+// process of elimination — wrong as soon as two sub-agents run in
+// parallel.
+type parentToolUseIDKey struct{}
+
+// WithParentToolUseID stamps ctx with the parent tool_use_id. dispatch.go
+// calls this in runExecute right before tool.Execute. Tools that don't
+// read it (Bash, Read, Edit, ...) are unaffected.
+func WithParentToolUseID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, parentToolUseIDKey{}, id)
+}
+
+// ParentToolUseIDFromContext returns the parent's tool_use_id when set,
+// or "" otherwise. Used by the Agent tool's sub-event forwarder.
+func ParentToolUseIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(parentToolUseIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // CwdFromContext returns the effective cwd for the current sub-agent,
 // or "" when none is attached. Tools that respect cwd (Bash) treat
 // "" as "use os.Getwd()".
@@ -249,6 +279,15 @@ func ParentSnapshotFromContext(ctx context.Context) *ParentSnapshot {
 // with a markdown plan body for user approval before executing.
 type PlanController interface {
 	SetPlanMode(on bool)
+	// PrePlanMode / SetPrePlanMode let the plan-mode meta-tools
+	// remember the user's previous gate mode across the plan window
+	// so ExitPlanMode can restore it. Empty string means "no snapshot
+	// captured" — ExitPlanMode then picks a safe default (ModeAsk).
+	// Pre-fix (2026-05-18), exiting plan left Gate.Mode stuck at
+	// "plan" because nothing restored it, which re-triggered the
+	// deny-storm on the next turn.
+	PrePlanMode() string
+	SetPrePlanMode(mode string)
 }
 
 // planControllerKey carries the active loop's PlanController down to
@@ -329,6 +368,16 @@ type Event struct {
 
 	// Error
 	Err error
+
+	// SubAgentParentID is set on EventToolStart / EventToolResult
+	// events that were FORWARDED from a sub-agent's loop. The value is
+	// the parent's Agent tool_use_id (the one the TUI registered when
+	// SubAgentInfo first appeared), so consumers can attribute child
+	// tool activity to the right pill when multiple sub-agents run in
+	// parallel.
+	//
+	// Empty means "this event came from the main loop, not a sub-agent."
+	SubAgentParentID string
 }
 
 // ToolCall represents a tool the model wants to invoke.

@@ -55,13 +55,39 @@ type Message struct {
 	Timestamp time.Time
 }
 
-// SubAgentInfo is one in-flight sub-agent. Used for status-bar pill
-// visualization; rendered as "◇ Name". Populated by handleAgentEvent
-// when an Agent tool call fires.
+// subAgentLingerDuration is how long a finished sub-agent's pill
+// stays on screen after its Status flips to completed/failed. Long
+// enough for a glance ("did it succeed?") but short enough that a
+// burst of N quick spawns doesn't pile up dead pills in the chip
+// row. 2s mirrors claude-code's Task pill tail.
+const subAgentLingerDuration = 2 * time.Second
+
+// SubAgentInfo is one in-flight (or recently finished) sub-agent.
+// Used for status-bar pill visualization; rendered as
+// "◇ Name · LastTool · 23s · 7t" while running, "✓ Name · 47s · 12t"
+// for ~2s after completion, "✗ Name" for ~2s after failure.
+// Populated by handleAgentEvent when an Agent tool call fires;
+// ToolsCount and LastTool are bumped by forwarded sub-agent
+// EventToolStart events (matched on SubAgentParentID); Status flips
+// + FinishedAt stamps on the EventToolResult for the Agent itself.
 type SubAgentInfo struct {
-	ID     string
-	Name   string
-	Status string // running | completed | failed
+	ID        string
+	Name      string
+	Status    string // running | completed | failed
+	StartedAt time.Time
+	// FinishedAt is non-zero once the sub-agent's tool_result has
+	// arrived. The TUI's spinner-tick pruner removes the pill ~2s
+	// after this, so users see a brief ✓/✗ tail before it vanishes.
+	FinishedAt time.Time
+	// ToolsCount is the number of EventToolStart events forwarded
+	// from this sub-agent's own loop. Mirrors claude-code's Task
+	// pill which shows "N tools" mid-flight so the user can tell a
+	// stuck sub-agent from a busy one.
+	ToolsCount int
+	// LastTool is the name of the most recent tool the sub-agent
+	// started (without the "sub: " prefix). Empty until the first
+	// child tool fires.
+	LastTool string
 }
 
 type ToolEvent struct {

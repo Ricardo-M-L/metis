@@ -77,3 +77,43 @@ load reaches for the shortest path, which is "just keep editing in
 main." The shortest path produces 35-minute single-threaded runs
 that stop mid-Phase 4 with no tests, no commits, no binary. The
 contract above is the guardrail.
+
+## Fan-out in one turn: emit N Agents in the same response
+
+When you've identified multiple **independent** sub-problems (each
+self-contained, no order dependency between them), emit ONE Agent
+tool_use per sub-problem **in the same assistant turn**. metis's
+dispatcher sees the batch and launches them in parallel — N
+sub-agents instead of N sequential round-trips.
+
+Concrete shapes:
+  - **Survey N libraries / N folders / N services**: one
+    `Agent({subagent_type:"explore", prompt:"survey X"})` per target,
+    all in the same turn. 5 targets → 5 explore agents → wall-time
+    of the slowest one, not the sum.
+  - **Compare A vs B vs C**: one Agent per item, then synthesize
+    their results yourself in the next turn.
+  - **Implement N independent file clusters**: after `plan` returns
+    the cluster list, emit one
+    `Agent({subagent_type:"general", prompt:"implement cluster X"})`
+    per cluster in the same turn.
+  - **Verify multiple invariants**: one
+    `Agent({subagent_type:"verify", prompt:"check Y"})` per invariant.
+
+How many is too many? Default Roster cap is 20 named + 40 anonymous
+slots. In practice batches of **3–8 sub-agents** are the sweet spot
+— enough to feel parallel, few enough that you can synthesize their
+returns without losing thread. Don't fan out to 30 if 5 cluster-of-6
+groupings would do.
+
+When NOT to fan out:
+  - The sub-problems share state (one's output is another's input)
+    → sequential, not parallel.
+  - The task is small enough that overhead dominates (<3 targets,
+    each <2 tool calls) → inline.
+  - You're unsure of the cluster boundary → ask `plan` first, get
+    its breakdown, THEN fan out implementers.
+
+You don't need a special "spawn team" tool. Multiple Agent tool_uses
+in one response IS the fan-out mechanism. claude-code works the
+same way.

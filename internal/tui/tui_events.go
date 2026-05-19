@@ -80,10 +80,25 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 				name = truncate(strings.TrimSpace(p), 24)
 			}
 			m.subAgents = append(m.subAgents, SubAgentInfo{
-				ID:     ev.ToolUseID,
-				Name:   name,
-				Status: "running",
+				ID:        ev.ToolUseID,
+				Name:      name,
+				Status:    "running",
+				StartedAt: time.Now(),
 			})
+		} else if ev.SubAgentParentID != "" {
+			// Forwarded child tool start — attribute to the right
+			// pill so the user sees per-sub-agent progress when N
+			// sub-agents run in parallel. The "sub: " prefix is
+			// stamped by forwardSubAgentEvent; strip it for the
+			// per-pill LastTool label so the chip stays compact.
+			for i := range m.subAgents {
+				if m.subAgents[i].ID != ev.SubAgentParentID {
+					continue
+				}
+				m.subAgents[i].ToolsCount++
+				m.subAgents[i].LastTool = strings.TrimPrefix(ev.ToolName, "sub: ")
+				break
+			}
 		}
 	case agent.EventToolArgsDelta:
 		// kimi-cli-style streaming tool args. The LLM is typing
@@ -124,16 +139,26 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// request with the tool result. Flip back to "requesting"
 		// (↑) until the next stream byte arrives.
 		m.spinnerPhase = "requesting"
-		// Sub-agent done — remove the matching SubAgentInfo. Match
-		// by tool-use ID so multiple concurrent sub-agents work.
+		// Sub-agent done — Mi3 (2026-05-18): instead of yanking the
+		// pill immediately, flip Status to completed/failed and stamp
+		// FinishedAt so the spinner-tick pruner can keep showing the
+		// terminal state for ~2s. Gives the user a glimpse of the
+		// final outcome (✓ or ✗) before the chip vanishes — pre-fix
+		// the pill blinked away the instant the result landed, so
+		// success and failure were visually identical.
 		if ev.ToolName == "Agent" {
-			out := m.subAgents[:0]
-			for _, sa := range m.subAgents {
-				if sa.ID != ev.ToolUseID {
-					out = append(out, sa)
+			for i := range m.subAgents {
+				if m.subAgents[i].ID != ev.ToolUseID {
+					continue
 				}
+				if ev.ToolResult != nil && ev.ToolResult.IsError {
+					m.subAgents[i].Status = "failed"
+				} else {
+					m.subAgents[i].Status = "completed"
+				}
+				m.subAgents[i].FinishedAt = time.Now()
+				break
 			}
-			m.subAgents = out
 		}
 	case agent.EventPermissionRequest:
 		m.permActive = true
@@ -274,13 +299,37 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		}
 		m.messages = append(m.messages, Message{Role: role, Content: ev.Info, Timestamp: time.Now()})
 	case agent.EventPlan:
-		// Plan-mode result: archive to ~/.metis/plans/ + show inline.
+		// Plan-mode result: archive to ~/.metis/plans/ + render the
+		// full proposal inline so the user can actually review what
+		// the model intends to do (the pre-2026-05-18 version only
+		// printed "N tool calls" with no detail, which made plan
+		// mode unusable — users couldn't see what they were approving).
 		_ = runtime.ArchivePlan(runtime.ArchivedPlan{
 			SessionID: m.sessionID,
 			Timestamp: time.Now(),
 			ToolCalls: ev.ToolCalls,
 		})
-		m.messages = append(m.messages, Message{Role: "info", Content: fmt.Sprintf("(plan archived to ~/.metis/plans · %d tool calls)", len(ev.ToolCalls)), Timestamp: time.Now()})
+		callsWord := "tool call"
+		if len(ev.ToolCalls) != 1 {
+			callsWord = "tool calls"
+		}
+		m.messages = append(m.messages, Message{Role: "info", Content: fmt.Sprintf("(plan archived to ~/.metis/plans · %d %s)", len(ev.ToolCalls), callsWord), Timestamp: time.Now()})
+		// Per-tool detail row — name + truncated args preview.
+		for i, tc := range ev.ToolCalls {
+			args := toolArgsPreview(tc.Name, tc.Input)
+			line := fmt.Sprintf("  %d. %s", i+1, tc.Name)
+			if args != "" {
+				line += " · " + truncate(args, 100)
+			}
+			m.messages = append(m.messages, Message{Role: "info", Content: line, Timestamp: time.Now()})
+		}
+		// Closing hint — without a yes/no overlay, the user needs to
+		// know how to actually run these tools.
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   "(plan-mode hint: Shift+Tab to leave plan mode, then re-prompt to execute · or edit your request to refine the plan)",
+			Timestamp: time.Now(),
+		})
 	case agent.EventDreamingStart:
 		// Phase C — dreaming subagent is about to run. Pin the spinner
 		// verb to "Dreaming..." so the user sees what's happening

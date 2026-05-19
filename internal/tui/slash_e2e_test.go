@@ -46,7 +46,7 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 	}{
 		// REPL-owned (pre-existing) ----------------------------------------
 		{"/cost", []string{"Session Cost", "input tokens", "output tokens", "est. cost"}, "repl"},
-		{"/usage", []string{"rate limit"}, "repl"},
+		{"/usage", []string{"Usage", "provider", "dashboard", "session totals"}, "repl"},
 		{"/doctor", []string{"Metis Doctor", "config", "git"}, "repl"},
 		{"/vim", []string{"vim mode:"}, "repl"},
 		{"/theme", []string{"Theme", "◀", "▶"}, "widget"},             // Phase C4: opens cycle widget

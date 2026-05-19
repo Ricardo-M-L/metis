@@ -21,6 +21,7 @@ package runtime
 import (
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -111,5 +112,33 @@ func expandEnvVarsInEntry(e MCPServerEntry) (expanded MCPServerEntry, missing []
 			addMissing(m)
 		}
 	}
+	if len(e.Env) > 0 {
+		expanded.Env = make(map[string]string, len(e.Env))
+		for k, ev := range e.Env {
+			v, m := expandEnvVarsInString(ev)
+			expanded.Env[k] = v
+			addMissing(m)
+		}
+	}
 	return expanded, missing
+}
+
+// envSliceFromMap renders {"K":"V","A":"B"} as ["A=B","K=V"] sorted by
+// key so test assertions and debug dumps stay stable across runs.
+// Returns nil for an empty/nil map so callers can pass it straight to
+// exec.Cmd.Env-aware helpers without an extra nil check.
+func envSliceFromMap(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+m[k])
+	}
+	return out
 }

@@ -232,3 +232,55 @@ func TestShortToolDesc(t *testing.T) {
 }
 
 func (*fakeTool) IsEnabled() bool { return true }
+
+// TestDispatch_ExclusiveSkippedWhenCtxCancelled covers the 2026-05-18
+// M2 fix: when the parent ctx dies between the safe/queue phase and
+// the exclusive phase, the dispatcher must NOT call the exclusive
+// tool's Execute (wasted work + N redundant ctx.Canceled errors).
+// Instead it synthesizes one cancellation tool_result so the batch
+// stays API-valid and the model sees one clear "interrupted" signal.
+func TestDispatch_ExclusiveSkippedWhenCtxCancelled(t *testing.T) {
+	t.Parallel()
+	executed := &atomic.Int64{}
+	reg := tools.NewRegistry()
+	reg.Register(&fakeTool{
+		name: "ExclA", conc: tools.ConcurrencyExclusive,
+		starts: executed, hold: 0,
+	})
+	reg.Register(&fakeTool{
+		name: "ExclB", conc: tools.ConcurrencyExclusive,
+		starts: executed, hold: 0,
+	})
+
+	loop := &Loop{Registry: reg}
+	uses := []llm.ContentBlock{
+		{Type: "tool_use", ToolUseID: "a", ToolName: "ExclA"},
+		{Type: "tool_use", ToolUseID: "b", ToolName: "ExclB"},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // dead-on-arrival
+
+	out := make(chan Event, 32)
+	results, err := loop.executeBatch(ctx, uses, out, HookContext{})
+	if err != nil {
+		t.Fatalf("executeBatch err: %v", err)
+	}
+	if got := executed.Load(); got != 0 {
+		t.Errorf("expected zero Execute calls on cancelled ctx; got %d", got)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected one tool_result per tool_use; got %d", len(results))
+	}
+	for i, r := range results {
+		if r.Type != "tool_result" {
+			t.Errorf("result[%d] type=%q want tool_result", i, r.Type)
+		}
+		if !r.IsError {
+			t.Errorf("result[%d] should be IsError=true (cancellation)", i)
+		}
+		if r.ToolUseID == "" {
+			t.Errorf("result[%d] missing ToolUseID — orphans the parent tool_use", i)
+		}
+	}
+}

@@ -350,8 +350,30 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	wg.Wait()
 
 	// Phase 2: serialize exclusive tools. Order preserved by insertion.
-	for _, j := range exclJobs {
-		results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc)
+	//
+	// Ctx-cancel short-circuit (2026-05-18): if the parent ctx already
+	// died (user Ctrl+C between safe-fanout and exclusives, or a
+	// background spawn raced the cancel), skip the remaining
+	// exclusives and synthesize a cancellation tool_result so the
+	// batch stays API-valid. Without this, each exclusive's Execute
+	// runs and returns its own ctx.Canceled — wasted work, plus the
+	// model sees N identical generic-cancel errors instead of one
+	// clear "batch interrupted" signal.
+	if err := ctx.Err(); err != nil {
+		for _, j := range exclJobs {
+			emit(ctx, out, Event{
+				Kind: EventToolResult, ToolUseID: j.blk.ToolUseID, ToolName: j.blk.ToolName,
+				ToolResult: &ToolResult{Output: "skipped: turn interrupted before this tool ran", IsError: true},
+			})
+			results[j.idx] = llm.ContentBlock{
+				Type: "tool_result", ToolUseID: j.blk.ToolUseID,
+				ToolResult: "skipped: turn interrupted before this tool ran (" + err.Error() + ")", IsError: true,
+			}
+		}
+	} else {
+		for _, j := range exclJobs {
+			results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc)
+		}
 	}
 
 	// Fill in early-decided results (hook short-circuit / deny / ask-
@@ -394,6 +416,11 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// *Loop always satisfies PlanController. Tools that don't care
 	// (most of them) simply never pull this key from context.
 	toolCtx = WithPlanController(toolCtx, l)
+	// Parent tool_use_id: only consumed by the Agent tool's sub-event
+	// forwarder, which stamps it on each forwarded child event so the
+	// TUI can attribute progress to the right SubAgentInfo pill when
+	// multiple sub-agents run in parallel. Other tools ignore it.
+	toolCtx = WithParentToolUseID(toolCtx, blk.ToolUseID)
 
 	// Honor InterruptBlock: tools that declare InterruptBlock want to
 	// finish their current invocation even if the parent ctx gets

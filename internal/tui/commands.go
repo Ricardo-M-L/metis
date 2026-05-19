@@ -21,6 +21,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/themes"
+	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
 // REPLCommand is a built-in command that runs directly in the REPL, not via LLM.
@@ -295,27 +296,51 @@ func switchREPLModel(r *REPL, newModel string) error {
 }
 
 // cmdShare starts or stops the localhost HTTP+SSE bridge so an
-// external client (IDE extension, browser, mobile companion) can
-// cmdBg is the slash-command sibling of Ctrl+B (Phase F,
-// 2026-05-12). The actual toggle lives on Model and runs from
-// keybind_main.go because it needs Model state; the REPL handler
-// can't reach into the active Model.Update loop. But users still
-// want a discoverable surface — `/bg` answers "what does this do
-// and when do I press it" so they don't have to grep keybinds.
+// cmdBg reports the live background-turn state via the TUI bridge.
+// Falls back to a static hint when invoked outside the TUI (no
+// BgTurnSnapshot closure wired). Phase F slash sibling of Ctrl+B —
+// the keybind toggles, this command observes.
 func cmdBg(r *REPL, args string) string {
-	return "background-turn: press Ctrl+B while a turn is running to suppress its " +
-		"streaming output and free the input box. The turn keeps running; you'll be " +
-		"notified when it finishes (desktop notification + [bg] prefix on the flushed " +
-		"reply). Press Ctrl+B again to foreground. Ctrl+C still cancels."
+	hint := "(Ctrl+B mid-turn: suppress streaming output + free the input. Press again to foreground.)"
+	if r == nil || r.BgTurnSnapshot == nil {
+		return "bg: no live turn state (headless REPL)\n  " + hint
+	}
+	st := r.BgTurnSnapshot()
+	if !st.IsActive {
+		return "bg: no turn running\n  " + hint
+	}
+	elapsed := time.Since(st.StartTime).Round(time.Second)
+	out := fmt.Sprintf("bg: turn ACTIVE · %s elapsed · model=%s", elapsed, st.Model)
+	if st.QueuedCount > 0 {
+		out += fmt.Sprintf(" · %d prompt(s) queued", st.QueuedCount)
+	}
+	return out + "\n  " + hint
 }
 
 // cmdAgents lists sub-agents currently dispatched via the Agent tool.
-// Empty when no Agent tool calls are in flight (the common case).
+// Reads the live roster through r.SubAgentSnapshot (closure filled by
+// Model.asREPL); falls back to the original hint when invoked outside
+// the TUI surface.
 func cmdAgents(r *REPL, args string) string {
-	// SubAgents lives on Model, not REPL. The REPL handler returns
-	// a string only — for richer rendering the chat surface would
-	// hook in directly. v1: just echo a hint.
-	return "agents: spawn via the Agent tool — list shown as ◇ pills in the status bar"
+	if r == nil || r.SubAgentSnapshot == nil {
+		return "agents: sub-agent roster not available (headless REPL).\n" +
+			"  Spawn via the Agent tool — list shown as ◇ pills in the status bar."
+	}
+	roster := r.SubAgentSnapshot()
+	if len(roster) == 0 {
+		return "agents: (no sub-agents in flight)\n" +
+			"  Spawn via the Agent tool; ◇ pills appear in the status bar while they run."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "agents: %d sub-agent(s)\n", len(roster))
+	for _, a := range roster {
+		status := a.Status
+		if status == "" {
+			status = "running"
+		}
+		fmt.Fprintf(&b, "  ◇ %s  [%s]  id=%s\n", a.Name, status, a.ID)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // cmdFiles dumps the @-mention file index so the user can verify
@@ -459,17 +484,146 @@ func cmdIDE(r *REPL, args string) string {
 // cmdReview emits a system-prompt-style nudge asking the model to
 // review staged changes. The actual review happens in the next turn
 // via Bash + LLM analysis.
+//
+// Refactored 2026-05-18: instead of returning a string telling the user
+// to type the prompt themselves, build the full review prompt and stuff
+// it into the input textarea via r.InsertInput. The user just hits
+// Enter to submit. Falls back to the legacy "go prompt the model with…"
+// string when invoked from a headless REPL with no input bridge.
 func cmdReview(r *REPL, args string) string {
 	target := strings.TrimSpace(args)
 	if target == "" {
 		target = "staged changes (git diff --cached)"
 	}
-	return "review: prompt the model with: 'review " + target + " for bugs, style, security'"
+	prompt := buildReviewPrompt(target, false)
+	if r != nil && r.InsertInput != nil {
+		r.InsertInput(prompt)
+		return "review: prompt loaded into input — review, then press Enter to send"
+	}
+	return "review: paste this into the prompt to start —\n\n" + prompt
 }
 
-// cmdBug opens / collects info for a metis bug report.
+// buildReviewPrompt is the shared prompt body used by /review and
+// /security-review. Pulled out so the prompt itself can be unit-tested
+// without driving the TUI input path.
+func buildReviewPrompt(target string, security bool) string {
+	var b strings.Builder
+	if security {
+		fmt.Fprintf(&b, "Perform an OWASP-flavored security review of %s.\n\n", target)
+		b.WriteString("Look for:\n")
+		b.WriteString("- Input validation / injection (SQL, command, path, XSS)\n")
+		b.WriteString("- AuthN/AuthZ gaps (missing checks, broken role enforcement)\n")
+		b.WriteString("- Secret handling (logged credentials, hard-coded keys)\n")
+		b.WriteString("- Race conditions / TOCTOU on auth + permission paths\n")
+		b.WriteString("- Crypto misuse (weak random, IV reuse, broken cipher modes)\n")
+		b.WriteString("- Dependency vulns (look at go.mod / package.json for known-bad versions)\n\n")
+	} else {
+		fmt.Fprintf(&b, "Review %s.\n\n", target)
+		b.WriteString("Look for:\n")
+		b.WriteString("- Bugs / incorrect behavior\n")
+		b.WriteString("- Style + idiom mismatches with surrounding code\n")
+		b.WriteString("- Missed edge cases or error paths\n")
+		b.WriteString("- Performance footguns (allocation in hot paths, N+1, …)\n\n")
+	}
+	b.WriteString("Use the existing tools (Bash for git/grep, Read for code) to gather context. ")
+	b.WriteString("Report VERDICT (PASS / NEEDS WORK / FAIL) + a bulleted list of findings with file:line refs.")
+	return b.String()
+}
+
+// cmdBug composes a GitHub-issue-ready bug report template — version,
+// active model, mode, OS/arch, plus the last few user/assistant turns —
+// and copies it to the system clipboard (OSC 52 + ~/.metis/clipboard.txt
+// fallback). Used to just print a URL hint; now you can paste straight
+// into a new issue.
+//
+// Free-form complaint can be supplied as args: `/bug agent freezes
+// after long Edit`. Body gets prepended to the report.
 func cmdBug(r *REPL, args string) string {
-	return "bug: file at https://github.com/Ricardo-M-L/metis/issues — include `metis version` + recent transcript"
+	var b strings.Builder
+	b.WriteString("## Description\n\n")
+	if args = strings.TrimSpace(args); args != "" {
+		b.WriteString(args + "\n")
+	} else {
+		b.WriteString("<replace with what went wrong + steps to reproduce>\n")
+	}
+	b.WriteString("\n## Environment\n\n")
+	fmt.Fprintf(&b, "- metis version: %s\n", version.Short())
+	if r != nil && r.Loop != nil {
+		fmt.Fprintf(&b, "- model: %s\n", r.Loop.Model)
+		if r.Loop.Provider != nil {
+			fmt.Fprintf(&b, "- provider model id (wire): %s\n", r.Loop.Provider.ModelID())
+			fmt.Fprintf(&b, "- context window: %d tokens\n", r.Loop.Provider.MaxContextTokens())
+		}
+	}
+	if r != nil && r.Gate != nil {
+		fmt.Fprintf(&b, "- permission mode: %s\n", r.Gate.Mode())
+	}
+	fmt.Fprintf(&b, "- platform: %s/%s\n", goruntime.GOOS, goruntime.GOARCH)
+	fmt.Fprintf(&b, "- go: %s\n", goruntime.Version())
+
+	if r != nil && r.Loop != nil {
+		hist := r.Loop.History()
+		// Last 4 user/assistant turns (in pairs) — gives the model
+		// just enough context to repro without flooding the issue with
+		// the entire session.
+		const maxTurns = 4
+		picked := pickTrailingTurns(hist, maxTurns)
+		if len(picked) > 0 {
+			b.WriteString("\n## Recent transcript\n\n")
+			for _, m := range picked {
+				role := string(m.Role)
+				body := llmMessageText(m)
+				if len(body) > 600 {
+					body = body[:600] + "…"
+				}
+				fmt.Fprintf(&b, "**%s**: %s\n\n", role, body)
+			}
+		}
+	}
+	b.WriteString("\n---\n_Generated by /bug — review before submitting._\n")
+
+	report := b.String()
+	writeClipboard(report)
+	return fmt.Sprintf("bug: report copied to clipboard (%d chars · %s)\n"+
+		"  paste into: https://github.com/Ricardo-M-L/metis/issues/new",
+		len(report), osc52Status())
+}
+
+// pickTrailingTurns returns the last maxTurns user/assistant messages
+// from hist in original order. Skips tool_result-only messages (they
+// don't carry user-readable narrative; the surrounding assistant
+// text already mentions the tool name).
+func pickTrailingTurns(hist []llm.Message, maxTurns int) []llm.Message {
+	picked := make([]llm.Message, 0, maxTurns)
+	for i := len(hist) - 1; i >= 0 && len(picked) < maxTurns; i-- {
+		if hist[i].Role != llm.RoleUser && hist[i].Role != llm.RoleAssistant {
+			continue
+		}
+		if llmMessageText(hist[i]) == "" {
+			continue
+		}
+		picked = append([]llm.Message{hist[i]}, picked...)
+	}
+	return picked
+}
+
+// llmMessageText extracts a plain text representation of a Message
+// regardless of whether the Content is a string (plain) or a slice of
+// ContentBlock (assistant turns w/ tool_use). Tool blocks are skipped.
+func llmMessageText(m llm.Message) string {
+	if len(m.Content) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range m.Content {
+		if c.Type == "text" && c.Text != "" {
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(c.Text)
+		}
+	}
+	return b.String()
 }
 
 // cmdRename writes a new title onto the current session. Persists
@@ -898,11 +1052,16 @@ func cmdMCP(r *REPL, args string) string {
 	case "list", "ls":
 		return r.handleMCPList()
 	case "add":
-		// Usage: mcp add <name> <command> [args...]
-		if len(parts) < 3 {
-			return "usage: mcp add <name> <command> [args...]"
+		// Usage: mcp add [--env KEY=VAL ...] <name> <command> [args...]
+		// --env may repeat. Stops parsing flags at the first non-flag arg.
+		env, rest, perr := parseMCPAddFlags(parts[1:])
+		if perr != nil {
+			return "mcp: " + perr.Error()
 		}
-		return r.handleMCPAdd(parts[1], parts[2], parts[3:])
+		if len(rest) < 2 {
+			return "usage: mcp add [--env KEY=VAL ...] <name> <command> [args...]"
+		}
+		return r.handleMCPAdd(rest[0], rest[1], rest[2:], env)
 	case "remove", "rm":
 		if len(parts) < 2 {
 			return "usage: mcp remove <name>"
@@ -970,13 +1129,49 @@ func (r *REPL) handleMCPList() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (r *REPL) handleMCPAdd(name, command string, args []string) string {
+// parseMCPAddFlags consumes leading `--env KEY=VAL` flags (repeatable)
+// and returns the parsed env map plus the remaining positional args.
+// `--env=KEY=VAL` is accepted as the equals-glued shorthand. An empty
+// value is allowed (drops the var); an empty KEY is rejected.
+func parseMCPAddFlags(tokens []string) (map[string]string, []string, error) {
+	env := map[string]string{}
+	i := 0
+	for i < len(tokens) {
+		t := tokens[i]
+		switch {
+		case t == "--env":
+			if i+1 >= len(tokens) {
+				return nil, nil, fmt.Errorf("--env needs a KEY=VAL argument")
+			}
+			kv := tokens[i+1]
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k == "" {
+				return nil, nil, fmt.Errorf("--env value must be KEY=VAL, got %q", kv)
+			}
+			env[k] = v
+			i += 2
+		case strings.HasPrefix(t, "--env="):
+			kv := strings.TrimPrefix(t, "--env=")
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k == "" {
+				return nil, nil, fmt.Errorf("--env value must be KEY=VAL, got %q", kv)
+			}
+			env[k] = v
+			i++
+		default:
+			return env, tokens[i:], nil
+		}
+	}
+	return env, nil, nil
+}
+
+func (r *REPL) handleMCPAdd(name, command string, args []string, env map[string]string) string {
 	reg, err := runtime.LoadMCP()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
 	existed := runtime.FindMCPServer(reg, name) != nil
-	if err := runtime.AddMCPServer(reg, name, command, args); err != nil {
+	if err := runtime.AddMCPServerWithEnv(reg, name, command, args, env); err != nil {
 		return "mcp: " + err.Error()
 	}
 	if err := runtime.SaveMCP(reg); err != nil {
@@ -1320,8 +1515,43 @@ func cmdCost(r *REPL, args string) string {
 	return renderInfoBox("Session Cost · "+r.Loop.Model, rows)
 }
 
+// cmdUsage surfaces what we can know without provider-specific quota
+// endpoints: current session totals (already tracked in r.totalTokens)
+// and the dashboard URL for the active provider so the user can jump
+// to authoritative numbers in one click.
+//
+// Dashboards are hand-mapped by provider name — there is no portable
+// "rate limit endpoint" across Anthropic/DeepSeek/Kimi/MiniMax/GLM
+// today, so this is the honest answer.
 func cmdUsage(r *REPL, args string) string {
-	return "(rate limit info: depends on your API provider — check your provider dashboard)"
+	dashboards := map[string]string{
+		"anthropic": "https://console.anthropic.com/settings/usage",
+		"openai":    "https://platform.openai.com/usage",
+		"deepseek":  "https://platform.deepseek.com/usage",
+		"kimi":      "https://platform.moonshot.cn/console/info",
+		"minimax":   "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+		"glm":       "https://open.bigmodel.cn/usercenter/resourcepack",
+		"zhipu":     "https://open.bigmodel.cn/usercenter/resourcepack",
+	}
+	t := &r.totalTokens
+	rows := []infoRow{
+		{Key: "provider", Value: r.providerName},
+		{Key: "model", Value: r.model},
+	}
+	if url, ok := dashboards[strings.ToLower(r.providerName)]; ok {
+		rows = append(rows, infoRow{Key: "dashboard", Value: url, Hint: "open for live rate-limit + quota"})
+	} else {
+		rows = append(rows, infoRow{Key: "dashboard", Value: "(unknown — check your provider's console)"})
+	}
+	rows = append(rows,
+		infoRow{Key: "── session totals ──", Value: ""},
+		infoRow{Key: "input", Value: fmtThousands(t.Input())},
+		infoRow{Key: "output", Value: fmtThousands(t.Output())},
+		infoRow{Key: "cache_create", Value: fmtThousands(t.CacheCreate())},
+		infoRow{Key: "cache_read", Value: fmtThousands(t.CacheRead())},
+		infoRow{Key: "cache hit rate", Value: fmt.Sprintf("%.1f%%", t.CacheHitRate()*100)},
+	)
+	return renderInfoBox("Usage", rows)
 }
 
 // cmdTokens surfaces the most recent API call's raw token breakdown +
@@ -1596,12 +1826,32 @@ func (t *tokenTracker) LastCacheHitRate() float64 {
 func (t *tokenTracker) LastTotal() int { return t.lastIn + t.lastOut }
 
 // ContextUsage is the most recent API call's input-side total including
-// prompt-cache tokens. Mirrors claude-code's statusline `used_percentage`
-// numerator (input + cache_creation + cache_read). Bottom-right status
-// bar uses this to show context-window load — distinct from per-turn
-// cost (which still includes output).
+// prompt-cache tokens. Bottom-right status bar uses this to show
+// context-window load — distinct from per-turn cost (which still
+// includes output).
+//
+// 2026-05-18 — REMOVED lastCacheRead from the sum. Some Anthropic-
+// compatible gateways (MiniMax's anthropic endpoint caught in the
+// wild on user image #8) over-report cache_read by recounting the
+// full system+memory+tools cached chunk on EVERY turn instead of
+// reporting the actual hit-this-call bytes. Result: a 2k-token chat
+// reported 301682 tokens / 99%+ context load on a 192k window,
+// alarming the user and triggering compact prompts when nothing was
+// actually full.
+//
+// Lower bound is now `input + cache_creation` (genuine fresh-this-
+// turn tokens). The render layer in render_chrome.go takes
+// max(ContextUsage(), EstimateContextTokens()) so the displayed
+// number still reflects the real conversation size for cache-hit-
+// only turns where lastIn would otherwise be ~0.
+//
+// Trade-off: when a provider DOES accurately report cache_read (the
+// Anthropic-native path does), we now technically under-report —
+// but the byte-estimate floor recovers the right magnitude for
+// every long session, and the >100%-from-cache-bug failure mode is
+// the more user-hostile of the two.
 func (t *tokenTracker) ContextUsage() int {
-	return t.lastIn + t.lastCacheCreate + t.lastCacheRead
+	return t.lastIn + t.lastCacheCreate
 }
 
 // Reset zeroes both raw and displayed counters. Called by /clear and /new

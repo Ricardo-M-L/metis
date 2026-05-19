@@ -113,3 +113,59 @@ func TestClassify_TypedBeatsHeuristic(t *testing.T) {
 		t.Errorf("typed perm error wrapped with 403 prefix should be Permission; got %d", got)
 	}
 }
+
+// TestIncompleteError_Classify — the agent layer constructs an
+// *IncompleteError when a loop abort path (max_iterations,
+// diminishing_returns, loop_detected) fires. Classify must map any
+// of these onto the Incomplete exit code (11), regardless of the
+// detail text — which may contain heuristic-matching tokens like
+// "rate limit" or "deadline" since the model's last activity could
+// have been waiting on those before the abort tripped. The typed
+// branch fires before the string layer to prevent that misroute.
+func TestIncompleteError_Classify(t *testing.T) {
+	cases := []struct {
+		name string
+		err  *IncompleteError
+	}{
+		{"diminishing_returns", &IncompleteError{Reason: "diminishing_returns", Detail: "3 iters past 75% budget with <256 bytes useful output"}},
+		{"max_iterations", &IncompleteError{Reason: "max_iterations", Detail: "budget exhausted (50 iters, 3 grace used)"}},
+		{"loop_detected", &IncompleteError{Reason: "loop_detected", Detail: "same tool call+result repeated within window"}},
+		// Bare detail with heuristic-matchable tokens — typed branch
+		// must still win, NOT route to Quota/Timeout.
+		{"detail_with_rate_limit_text", &IncompleteError{Reason: "diminishing_returns", Detail: "model was retrying after 429 rate limit when abort fired"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Classify(c.err); got != Incomplete {
+				t.Errorf("Classify(%v) = %d, want %d (Incomplete)", c.err, got, Incomplete)
+			}
+		})
+	}
+}
+
+// TestIncompleteError_Wrapped — must work through fmt.Errorf("%w")
+// wrapping so the cmdRun layer can decorate the error with context
+// before returning it.
+func TestIncompleteError_Wrapped(t *testing.T) {
+	ie := &IncompleteError{Reason: "max_iterations", Detail: "50 iters"}
+	wrapped := fmt.Errorf("run aborted: %w", ie)
+	if got := Classify(wrapped); got != Incomplete {
+		t.Errorf("wrapped IncompleteError = %d, want %d", got, Incomplete)
+	}
+	// And errors.As round-trips.
+	var unwrapped *IncompleteError
+	if !errors.As(wrapped, &unwrapped) {
+		t.Fatal("errors.As did not unwrap IncompleteError")
+	}
+	if unwrapped.Reason != "max_iterations" {
+		t.Errorf("unwrapped reason = %q, want max_iterations", unwrapped.Reason)
+	}
+}
+
+// TestIncompleteError_NilSafe — defensive: Error() on a nil receiver
+// must not panic. cmdRun shouldn't ever return a nil pointer of this
+// type, but defensive Error() implementations are cheap.
+func TestIncompleteError_NilSafe(t *testing.T) {
+	var ie *IncompleteError
+	_ = ie.Error() // must not panic
+}

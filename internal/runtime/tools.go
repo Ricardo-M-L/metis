@@ -206,8 +206,8 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// Required because batch_prompt.go references ExitPlanMode by
 	// name; without these registered, that prompt instructed the
 	// model to call a non-existent tool.
-	reg.Register(builtin.NewEnterPlanMode())
-	reg.Register(builtin.NewExitPlanMode())
+	reg.Register(builtin.NewEnterPlanModeWithGate(opts.Gate))
+	reg.Register(builtin.NewExitPlanModeWithGate(opts.Gate))
 	return reg
 }
 

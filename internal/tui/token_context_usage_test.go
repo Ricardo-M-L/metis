@@ -18,19 +18,25 @@ func TestTokenTracker_ContextUsage_NoCache(t *testing.T) {
 	}
 }
 
-// TestTokenTracker_ContextUsage_WithCache — with prompt caching the
-// numerator must add cache_creation_input_tokens + cache_read_input_tokens
-// to input_tokens, just like claude-code does. Without this, a session
-// that hits prompt cache hard would show a low context-load number even
-// though the live context is huge.
+// TestTokenTracker_ContextUsage_WithCache — 2026-05-18 contract change:
+// cache_read is NO LONGER included in ContextUsage because some
+// Anthropic-compatible gateways (MiniMax caught in the wild, user
+// image #8) over-report cache_read by reposting the full cached
+// chunk size each turn instead of the hit-this-call bytes. Result
+// was 99%+ context-load alarms on a barely-used 192k window.
+//
+// Numerator is now input + cache_creation (genuine fresh-this-turn
+// tokens). The render layer floors the displayed number with
+// EstimateContextTokens() so cache-hit-only turns still show
+// realistic context size from the local message-bytes count.
 func TestTokenTracker_ContextUsage_WithCache(t *testing.T) {
 	var tt tokenTracker
 	// Realistic Anthropic shape: small input_tokens (only the new
 	// uncached delta), big cache_read (the bulk of the context).
 	tt.add(500, 200, 1000, 30000)
-	want := 500 + 1000 + 30000
+	want := 500 + 1000 // cache_read intentionally excluded
 	if got := tt.ContextUsage(); got != want {
-		t.Errorf("ContextUsage with cache = %d, want %d (input + cache_create + cache_read)", got, want)
+		t.Errorf("ContextUsage = %d, want %d (input + cache_create, cache_read excluded post-2026-05-18)", got, want)
 	}
 	// LastTotal stays per-turn (input + output, NO cache).
 	if got := tt.LastTotal(); got != 700 {
@@ -40,20 +46,36 @@ func TestTokenTracker_ContextUsage_WithCache(t *testing.T) {
 
 // TestTokenTracker_ContextUsage_OverwrittenEachCall — successive add()
 // calls overwrite (not accumulate) the per-call counters; ContextUsage
-// reflects only the latest call, just like the claude-code statusline.
+// reflects only the latest call.
 func TestTokenTracker_ContextUsage_OverwrittenEachCall(t *testing.T) {
 	var tt tokenTracker
 	tt.add(10000, 100, 0, 5000)
-	if got := tt.ContextUsage(); got != 15000 {
-		t.Fatalf("after first call: %d, want 15000", got)
+	if got := tt.ContextUsage(); got != 10000 {
+		t.Fatalf("after first call: %d, want 10000 (input only, cache_read excluded)", got)
 	}
 	tt.add(20000, 200, 1000, 8000)
-	if got := tt.ContextUsage(); got != 29000 {
-		t.Errorf("after second call ContextUsage should reflect ONLY 2nd call (20000+1000+8000=29000), got %d", got)
+	if got := tt.ContextUsage(); got != 21000 {
+		t.Errorf("after second call ContextUsage should reflect ONLY 2nd call (20000+1000=21000), got %d", got)
 	}
 	// Session cumulative still grows.
 	if tt.in != 30000 {
 		t.Errorf("session cumulative input should be 30000, got %d", tt.in)
+	}
+}
+
+// TestTokenTracker_ContextUsage_ImmuneToOverreportedCacheRead pins the
+// 2026-05-18 fix: a buggy upstream (MiniMax anthropic-compat layer
+// observed on user image #8) over-reports cache_read on every turn.
+// Pre-fix the right-side status-bar showed 301682 tokens (99%+) on a
+// barely-used 192k window. Post-fix the inflated cache_read is
+// IGNORED so ContextUsage stays grounded to reality.
+func TestTokenTracker_ContextUsage_ImmuneToOverreportedCacheRead(t *testing.T) {
+	var tt tokenTracker
+	// Provider claims absurd cache_read; input + cache_creation are
+	// realistic.
+	tt.add(2_000, 500, 500, 300_000)
+	if got := tt.ContextUsage(); got != 2_500 {
+		t.Errorf("ContextUsage with inflated cache_read = %d, want 2500 (cache_read excluded)", got)
 	}
 }
 

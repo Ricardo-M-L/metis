@@ -145,10 +145,25 @@ func loadAndPrepImage(path string) (llm.ContentBlock, error) {
 		return llm.ContentBlock{}, err
 	}
 
+	// P1 (2026-05-18) — final base64 size cap. preprocessImage's JPEG
+	// q=80 fallback is "empirically reliable at <5 MiB" but not
+	// guaranteed (a pathological 1568×1568 high-entropy PNG can
+	// survive resize and still exceed the API ceiling). A clean
+	// pre-flight reject beats an opaque "request too large" 422 four
+	// network round-trips later. Mirrors claude-code's
+	// API_IMAGE_MAX_BASE64_SIZE pre-flight check.
+	encoded := base64.StdEncoding.EncodeToString(out)
+	if len(encoded) > imageMaxBase64 {
+		return llm.ContentBlock{}, fmt.Errorf(
+			"image too large after compression (%d KiB base64 > %d KiB max) — please resize and re-paste",
+			len(encoded)/1024, imageMaxBase64/1024,
+		)
+	}
+
 	return llm.ContentBlock{
 		Type:      "image",
 		MediaType: outMime,
-		Data:      base64.StdEncoding.EncodeToString(out),
+		Data:      encoded,
 	}, nil
 }
 

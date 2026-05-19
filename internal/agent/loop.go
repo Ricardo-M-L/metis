@@ -79,6 +79,14 @@ type Loop struct {
 	// PlanMode: collect tool calls but do NOT execute; emit as EventPlan.
 	PlanMode bool
 
+	// prePlanMode snapshots the gate mode that was active right before
+	// EnterPlanMode flipped the gate to "plan". ExitPlanMode reads this
+	// to restore the user's prior posture rather than leaving Gate
+	// stuck in plan (which would re-trigger the deny-storm on the next
+	// turn — the bug the 2026-05-18 audit caught). Empty string = no
+	// snapshot captured.
+	prePlanMode string
+
 	// ShortToolDescriptions tells the dispatch layer to consult
 	// tools.ShortDescriptor for each tool's spec instead of the full
 	// Description() body. Set by sub-agent setup or by METIS_SIMPLE=1
@@ -110,6 +118,13 @@ type Loop struct {
 	// Useful for "I just need a quick answer" rather than spinning up
 	// deep deliberation on a one-line clarification.
 	Fast bool
+
+	// BypassNextCache, when true, makes buildRequest append a unique
+	// nonce to the system prompt for the next request, guaranteeing a
+	// cache miss + fresh breakpoint write. Auto-clears after read so
+	// subsequent turns resume normal cache reuse. Set via the TUI
+	// /break-cache slash command.
+	BypassNextCache bool
 
 	mu       sync.RWMutex
 	Messages []llm.Message
@@ -382,6 +397,22 @@ func (l *Loop) SetPlanMode(on bool) {
 	l.mu.Unlock()
 }
 
+// PrePlanMode / SetPrePlanMode implement the PlanController surface
+// for EnterPlanMode/ExitPlanMode to round-trip the user's prior gate
+// posture across the plan window. See the prePlanMode field doc for
+// the design rationale.
+func (l *Loop) PrePlanMode() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.prePlanMode
+}
+
+func (l *Loop) SetPrePlanMode(mode string) {
+	l.mu.Lock()
+	l.prePlanMode = mode
+	l.mu.Unlock()
+}
+
 // Reset clears the conversation.
 func (l *Loop) Reset() {
 	l.mu.Lock()
@@ -403,13 +434,19 @@ func (l *Loop) Reset() {
 // Used by the cron scheduler to switch between per-job histories under
 // SessionMode "persistent" / "main" without throwing away progress made
 // in earlier firings.
+//
+// Orphan-repair runs on the incoming slice so old sessions written
+// before the Run-defer guard don't immediately 400 on the first
+// resumed turn. RepairOrphanedToolUses is idempotent — a clean
+// history passes through unchanged.
 func (l *Loop) Restore(messages []llm.Message) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if messages == nil {
 		l.Messages = nil
 	} else {
-		l.Messages = append([]llm.Message(nil), messages...)
+		clone := append([]llm.Message(nil), messages...)
+		l.Messages = RepairOrphanedToolUses(clone)
 	}
 	l.turnIdx = 0
 	l.iterIdx = 0
@@ -490,8 +527,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	l.Hooks.EmitSessionStart(ctx, tc, l.System, l.Model)
 
 	// Deferred SessionEnd ensures hook is called on all exit paths.
+	// Orphan-repair runs FIRST so persistTail / sessions resume see a
+	// fully-paired history regardless of how Run exited (ctx cancel
+	// mid-tool-batch, panic in a tool above runExecute's recovery
+	// layer, hook halt before tool_results landed). Session 8cfc076b
+	// (2026-05-17) caught the bug in the wild: a foreground Agent
+	// tool_use was persisted with no matching tool_result, which would
+	// then 400 on resume.
 	var stopReason string
 	defer func() {
+		l.repairOrphansInPlace()
 		l.mu.RLock()
 		msgCount := len(l.Messages)
 		l.mu.RUnlock()
@@ -504,6 +549,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	finalSummaryRescued := false
 	nudgeFired := make([]bool, len(iterNudges)) // see iter_nudge.go
 	progress := newProgressDetector()           // see progress_detector.go
+	stuckDet := &stuckDetector{}                // see stuck_detector.go — Phase C-mini
 
 	for {
 		l.mu.Lock()
@@ -601,6 +647,28 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
 		l.mu.Unlock()
 
+		// Provider stop-reason defense (2026-05-18, session 8cfc076b).
+		// MiniMax / some OpenAI-compatible gateways report
+		// `finish_reason: "stop"` (mapped to "end_turn") on a chunk
+		// that ALSO carried tool_calls, instead of the correct
+		// "tool_calls" → "tool_use" mapping. Without this heal, the
+		// loop hits the `stop != "tool_use"` branch below, emits
+		// LoopDone, and the assistant's tool_use blocks become
+		// orphans — orphan_repair.go then has to synthesize stub
+		// tool_results, the model never sees the real output.
+		//
+		// Rule: if assistant content contains tool_use blocks, the
+		// only correct stop reason is "tool_use" — anything else is
+		// a provider misreport. Override and continue into
+		// executeBatch so the tools actually run.
+		if stop != "tool_use" && containsToolUseBlock(assistant) {
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("(provider reported stop_reason=%q while emitting tool_use blocks — treating as tool_use)", stop),
+			})
+			stop = "tool_use"
+		}
+
 		if stop != "tool_use" {
 			// Bug B rescue: model declared end_turn but emitted no
 			// user-facing text. See empty_stop_rescue.go for why this
@@ -674,18 +742,28 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// Dispatch-contract observation + mid-turn reminder. Count
 		// the batch the model just emitted (Write/Edit/MultiEdit/
 		// Agent), and if the threshold just crossed without a verify
-		// dispatch, inject a one-time heads-up reminder so the model
+		// dispatch, queue a one-time heads-up reminder so the model
 		// can plan the verify step before it tries to end. The
-		// reminder appears as a user message in the next iteration's
-		// request — the model sees it on the very next turn.
+		// reminder appears as an extra text block alongside the
+		// tool_results in the SAME user message the executeBatch
+		// loop will produce — see the `pendingContractReminder`
+		// drain below.
+		//
+		// 2026-05-18 — pre-fix this appended a separate user-text
+		// message BEFORE executeBatch ran, which sat between the
+		// assistant message (containing tool_use blocks) and the
+		// follow-up user message (carrying tool_results). Anthropic
+		// tolerates the gap; OpenAI / DeepSeek / Kimi reject with
+		// "An assistant message with 'tool_calls' must be followed
+		// by tool messages" (caught in the wild on a fan-out test
+		// that emitted 3+ Agent calls). Folding the reminder into
+		// the same user message via append-text-block keeps the
+		// tool_calls→tool_results adjacency the OpenAI dialect
+		// requires.
 		l.contract.observeToolUses(toolUses)
+		pendingContractReminder := ""
 		if body := l.contract.shouldFireMidTurnReminder(); body != "" {
-			l.mu.Lock()
-			l.Messages = append(l.Messages, llm.Message{
-				Role:    llm.RoleUser,
-				Content: []llm.ContentBlock{{Type: "text", Text: body}},
-			})
-			l.mu.Unlock()
+			pendingContractReminder = body
 			emit(ctx, out, Event{
 				Kind: EventInfo,
 				Info: "(contract reminder: substantial work in flight — plan for a verify subagent before claiming done)",
@@ -698,16 +776,72 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return nil
 		}
 
-		// Plan Mode: collect and emit, don't execute — EXCEPT the
-		// ExitPlanMode tool itself, which must run so the model can
-		// surface the plan body and flip the loop back to normal
-		// execution. Mixing ExitPlanMode with other tools in one
-		// batch isn't supported: the rest gets emitted as the plan,
-		// only the exit tool actually runs.
+		// "Mid-turn enter" — model decided to enter plan mode AND
+		// batched other tools in the same turn. Without this guard,
+		// EnterPlanMode would flip Loop.PlanMode mid-dispatch but
+		// the sibling tools would still hit executeBatch first. Treat
+		// the whole batch as plan content: run EnterPlanMode (it
+		// flips PlanMode synchronously), then fall through to the
+		// l.PlanMode branch below which will emitPlan the rest.
+		if !l.PlanMode && containsEnterPlanMode(toolUses) {
+			enterTools, otherTools := splitEnterPlanModeTools(toolUses)
+			results, err := l.executeBatch(ctx, enterTools, out, tc)
+			if err != nil {
+				stopReason = "error"
+				emit(ctx, out, Event{Kind: EventError, Err: err})
+				return err
+			}
+			l.mu.Lock()
+			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
+			l.mu.Unlock()
+			// PlanMode should now be true (EnterPlanMode just flipped
+			// it). If for any reason it isn't (defensive — controller
+			// detached?), fall through and let normal dispatch run.
+			if l.PlanMode && len(otherTools) > 0 {
+				stopReason = "plan_mode"
+				l.emitPlan(ctx, otherTools, out)
+				return nil
+			}
+			// EnterPlanMode + nothing else → just continue to next
+			// turn so the model can plan with no real tools to undo.
+			if len(otherTools) == 0 {
+				l.Hooks.EmitTurnEnd(ctx, tc, l.turnIdx)
+				emit(ctx, out, Event{Kind: EventTurnEnd})
+				l.turnIdx++
+				continue
+			}
+			// Defensive fall-through: PlanMode didn't stick, dispatch
+			// the rest normally (better to run than to drop silently).
+			toolUses = otherTools
+		}
+
+		// Plan Mode: split the batch three ways:
+		//   - ExitPlanMode → execute (the model's only way to leave plan)
+		//   - read-only tools → execute (the model needs to read code
+		//     while planning; collecting them defeats the point of plan
+		//     mode for any non-trivial task)
+		//   - side-effect tools → collect as plan for user review
+		//
+		// Pre-fix (2026-05-18), plan mode collected ALL non-Exit tools,
+		// including Read / LS / Glob / Grep / MetisInfo, which made it
+		// impossible for the model to actually plan against current state.
+		// User would say "look at /tmp/foo and propose changes" and the
+		// "plan" would just be `Read(/tmp/foo)` — useless. The gate's
+		// readOnlyHook already knows which tools are side-effect-free
+		// (it's the same hook ModeAcceptEdits uses); plan mode now
+		// consults it to partition correctly.
 		if l.PlanMode {
-			exitTools, otherTools := splitExitPlanModeTools(toolUses)
-			if len(exitTools) > 0 {
-				results, err := l.executeBatch(ctx, exitTools, out, tc)
+			exitTools, nonExit := splitExitPlanModeTools(toolUses)
+			readTools, writeTools := splitReadOnlyTools(nonExit, l.Gate)
+
+			// 1. ExitPlanMode + read-only tools both execute. ExitPlanMode
+			//    going first means a subsequent Read in the same batch
+			//    runs in post-plan mode (correct behavior — Exit just
+			//    restored the user's prior posture).
+			runTools := append([]llm.ContentBlock(nil), exitTools...)
+			runTools = append(runTools, readTools...)
+			if len(runTools) > 0 {
+				results, err := l.executeBatch(ctx, runTools, out, tc)
 				if err != nil {
 					stopReason = "error"
 					emit(ctx, out, Event{Kind: EventError, Err: err})
@@ -716,19 +850,29 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				l.mu.Lock()
 				l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
 				l.mu.Unlock()
-				// If ExitPlanMode flipped PlanMode off, fall through to
-				// next iteration and let any other batched tools run
-				// normally. If PlanMode is still on (defensive — should
-				// not happen), still emit the rest as the plan.
-				if l.PlanMode && len(otherTools) > 0 {
-					l.emitPlan(ctx, otherTools, out)
-					return nil
-				}
+			}
+
+			// 2. Side-effect tools get collected as the plan. If the
+			//    batch is read-only with no writes AND ExitPlanMode ran
+			//    (so we're no longer in plan), continue the next turn
+			//    normally so the model can use those reads to plan.
+			if len(writeTools) > 0 && l.PlanMode {
+				stopReason = "plan_mode"
+				l.emitPlan(ctx, writeTools, out)
+				return nil
+			}
+
+			// 3. No writes (or ExitPlanMode flipped us out of plan) →
+			//    let the turn continue so the model can proceed.
+			if len(runTools) > 0 {
 				l.Hooks.EmitTurnEnd(ctx, tc, l.turnIdx)
 				emit(ctx, out, Event{Kind: EventTurnEnd})
 				l.turnIdx++
 				continue
 			}
+
+			// 4. All tools were write-class (nothing executed) — emit
+			//    the plan and end the turn.
 			stopReason = "plan_mode"
 			l.emitPlan(ctx, toolUses, out)
 			return nil
@@ -771,6 +915,34 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return nil
 		}
 
+		// Stuck-edit detector (Phase C-mini): catches the bench6 mini-
+		// interpreter failure mode — same file edited N turns in a row
+		// with the same test failing. LoopDetector's signature-based
+		// check misses this because each Edit has different content
+		// (different SHA). Diminishing-returns DOES catch it but only
+		// past 75% budget; by then 3-4M tokens are gone. This detector
+		// fires on a tighter signal so we can either nudge the model
+		// out (first trip → reset reminder) or abort honestly (second
+		// trip → stuck_after_reset, mapped to Incomplete exit code
+		// by cmdRun's Phase A switch).
+		switch stuckDet.AfterTurn(toolUses, results) {
+		case stuckResetNeeded:
+			pendingContractReminder = stuckResetReminderText
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("stuck-loop detected (reset #%d of %d): test failures not converging; injecting reset reminder", stuckDet.resetsFired, stuckMaxResets),
+			})
+		case stuckAbort:
+			stopReason = "stuck_after_reset"
+			l.Hooks.EmitLoopEnd(ctx, tc, "stuck_after_reset")
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("stuck-loop detected after %d reset reminders; aborting to surface the loop instead of burning more tokens", stuckMaxResets),
+			})
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "stuck_after_reset"})
+			return nil
+		}
+
 		// Hook-driven halt: if any PreToolUse hook in this batch
 		// returned Halt=true, stop the turn after delivering tool
 		// results. The hook may have ALSO denied the offending tool
@@ -786,6 +958,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		if halt {
 			if hreason == "" {
 				hreason = "halted by hook"
+			}
+			// Fold contract reminder if pending — keeps adjacency for
+			// OpenAI-dialect providers even on the halt exit path.
+			if pendingContractReminder != "" {
+				results = append(results, llm.ContentBlock{
+					Type: "text",
+					Text: pendingContractReminder,
+				})
+				pendingContractReminder = ""
 			}
 			l.mu.Lock()
 			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
@@ -809,6 +990,17 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				Text: "[user steer mid-turn] " + steer,
 			})
 			emit(ctx, out, Event{Kind: EventInfo, Info: "steered: " + steer})
+		}
+		// Contract reminder fold-in (2026-05-18) — see the queue site
+		// above for full rationale. Pre-fix this lived as a separate
+		// user message before executeBatch; that broke OpenAI's
+		// strict tool_calls→tool_results adjacency.
+		if pendingContractReminder != "" {
+			results = append(results, llm.ContentBlock{
+				Type: "text",
+				Text: pendingContractReminder,
+			})
+			pendingContractReminder = ""
 		}
 		l.mu.Lock()
 		l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
@@ -962,6 +1154,25 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 			system = system + "\n\n" + retrieveBody
 		}
 	}
+	// BypassNextCache: when /break-cache is invoked, the next request
+	// gets a fresh nonce appended to the system prompt so the prefix
+	// differs from the previous run, guaranteeing a cache miss + fresh
+	// breakpoint write. Cleared after we read it so subsequent
+	// requests resume normal cache reuse.
+	if l.BypassNextCache {
+		nonce := fmt.Sprintf("\n\n<cache-refresh nonce=%d>", time.Now().UnixNano())
+		if len(sections) > 0 {
+			// Tag the last section so the nonce sits AFTER any cached
+			// boundary marker; cached sections stay cached, the volatile
+			// tail invalidates as intended.
+			sections = append(sections, llm.SystemSection{
+				Name: "cache-refresh", Body: nonce, Cache: false, Volatile: true,
+			})
+		} else {
+			system = system + nonce
+		}
+		l.BypassNextCache = false
+	}
 	req := llm.Request{
 		Model:          l.Model,
 		System:         system,
@@ -1058,6 +1269,102 @@ func splitExitPlanModeTools(blocks []llm.ContentBlock) (exit, other []llm.Conten
 		}
 	}
 	return
+}
+
+// containsToolUseBlock reports whether the assistant content includes
+// at least one tool_use block. Used as the stop-reason heal trigger:
+// providers occasionally report "stop" / "end_turn" on a chunk that
+// also carried tool_calls (session 8cfc076b, MiniMax m2.7 caught in
+// the wild), which would orphan the tool_uses if accepted at face
+// value. The presence of any tool_use forces the loop into
+// executeBatch regardless of the reported stop reason.
+func containsToolUseBlock(blocks []llm.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == "tool_use" {
+			return true
+		}
+	}
+	return false
+}
+
+// containsEnterPlanMode reports whether the batch the model just emitted
+// includes EnterPlanMode. Used by the loop to upgrade a "not yet in plan
+// mode" turn into plan-collection mid-flight: if the model decided to
+// enter plan AND batched real tool calls in the same turn, we want
+// those calls collected as the plan, NOT executed first.
+//
+// Without this check, the model's [EnterPlanMode, Write] batch would
+// have EnterPlanMode flip Loop.PlanMode → true mid-dispatch, but the
+// Write that ran before it (or alongside it in the same executeBatch)
+// would already have hit the filesystem. The fix is to short-circuit
+// at the dispatch boundary: if the batch contains EnterPlanMode, treat
+// the whole batch as plan-mode (run the EnterPlanMode tool, then collect
+// the rest as plan content, then return).
+func containsEnterPlanMode(blocks []llm.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.ToolName == "EnterPlanMode" {
+			return true
+		}
+	}
+	return false
+}
+
+// splitEnterPlanModeTools partitions a batch into EnterPlanMode entries
+// vs everything else — symmetric to splitExitPlanModeTools.
+func splitEnterPlanModeTools(blocks []llm.ContentBlock) (enter, other []llm.ContentBlock) {
+	for _, b := range blocks {
+		if b.ToolName == "EnterPlanMode" {
+			enter = append(enter, b)
+		} else {
+			other = append(other, b)
+		}
+	}
+	return
+}
+
+// splitReadOnlyTools partitions a batch into read-only tools (safe to
+// execute even in plan mode) vs side-effect tools (collected as plan
+// for user review). Uses the gate's readOnlyHook for the decision —
+// same source of truth ModeAcceptEdits uses for auto-allow. A nil
+// gate treats nothing as read-only (caller falls back to old
+// "collect everything" behavior).
+//
+// 2026-05-18: introduced so plan mode no longer collects Read / LS /
+// Grep — those have no side effect and the model needs them to plan
+// against current code. See the plan-mode block in Loop.Run for the
+// full rationale.
+func splitReadOnlyTools(blocks []llm.ContentBlock, gate readOnlyChecker) (readOnly, sideEffect []llm.ContentBlock) {
+	for _, b := range blocks {
+		if gate != nil && gate.IsReadOnly(b.ToolName, stringifyToolInput(b.ToolInput)) {
+			readOnly = append(readOnly, b)
+		} else {
+			sideEffect = append(sideEffect, b)
+		}
+	}
+	return
+}
+
+// readOnlyChecker is the narrow interface splitReadOnlyTools needs
+// from a Gate. Defining it locally avoids a hard dep on permission.Gate
+// at the test boundary and lets us swap a stub in unit tests.
+type readOnlyChecker interface {
+	IsReadOnly(tool, stringInput string) bool
+}
+
+// stringifyToolInput renders the model's tool input into the same
+// string form the gate's readOnlyHook receives elsewhere (Bash's cmd,
+// Edit's path, etc.). Falls back to JSON when no canonical key is
+// known so the hook can still inspect structure if it wants to.
+func stringifyToolInput(in map[string]any) string {
+	if in == nil {
+		return ""
+	}
+	for _, key := range []string{"command", "path", "file_path", "query", "url"} {
+		if v, ok := in[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // lastUserTextLocked returns the most recent user-role message text.

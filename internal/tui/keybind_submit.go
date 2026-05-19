@@ -5,18 +5,38 @@ package tui
 // or the slash-signal table; plain user text starts a new turn.
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
+	pubprov "github.com/Ricardo-M-L/metis/pkg/provider"
 )
+
+// splitOffImageBlocks returns (count of image blocks dropped, blocks
+// without them). Used by the vision-capability gate when the active
+// provider can't accept image content. The text-only remainder still
+// goes to the model so the question/context survives.
+func splitOffImageBlocks(blocks []llm.ContentBlock) (int, []llm.ContentBlock) {
+	out := make([]llm.ContentBlock, 0, len(blocks))
+	stripped := 0
+	for _, b := range blocks {
+		if b.Type == "image" {
+			stripped++
+			continue
+		}
+		out = append(out, b)
+	}
+	return stripped, out
+}
 
 // openBodyScreen wraps screen.NewBodyScreen with a Resize so tests
 // (which never receive a real tea.WindowSizeMsg) and the cold-open
@@ -127,6 +147,19 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					m.messages = append(m.messages, Message{
 						Role:      "user-steer",
 						Content:   display,
+						Timestamp: time.Now(),
+					})
+					// Mi1 (2026-05-18) — make the steer-vs-queue
+					// asymmetry visible. Plain text mid-turn QUEUES
+					// (runs as next turn); custom slash commands
+					// STEER (fold into running turn). The previous
+					// silent steer surprised users who expected
+					// queue semantics across the board. Cheap one-
+					// line note solves the WTF without changing the
+					// documented dispatch contract.
+					m.messages = append(m.messages, Message{
+						Role:      "info",
+						Content:   "(steered into current turn · plain text would have queued — press Esc first to queue this instead)",
 						Timestamp: time.Now(),
 					})
 					m.input.Reset()
@@ -600,8 +633,56 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			llmText = hints + "\n\n" + text
 		}
 	}
-	if len(m.imagePaste) > 0 {
-		blocks, errs := expandPastedImagesToBlocks(llmText, m.imagePaste)
+	// P3 (2026-05-18) — `@/path/to/image.png` text-reference expansion.
+	// Scans llmText for image-extension @-mentions, loads each via the
+	// shared image preprocessor, and pulls them into the same blocks
+	// stream the clipboard path uses. Runs BEFORE the paste branch so
+	// a single message can mix pasted + referenced images.
+	atCwd, _ := os.Getwd()
+	llmTextRewritten, atFileBlocks, atFileErrs := expandAtFileImageBlocks(llmText, atCwd)
+	for _, e := range atFileErrs {
+		m.messages = append(m.messages, Message{
+			Role: "warning", Content: "image: " + e, Timestamp: time.Now(),
+		})
+	}
+
+	if len(m.imagePaste) > 0 || len(atFileBlocks) > 0 {
+		var blocks []llm.ContentBlock
+		var errs []string
+		if len(m.imagePaste) > 0 {
+			pasted, pErrs := expandPastedImagesToBlocks(llmTextRewritten, m.imagePaste)
+			blocks = append(blocks, pasted...)
+			errs = append(errs, pErrs...)
+		} else {
+			// Only @-file path active — text comes through as one block,
+			// images appended after.
+			if llmTextRewritten != "" {
+				blocks = append(blocks, llm.ContentBlock{Type: "text", Text: llmTextRewritten})
+			}
+		}
+		blocks = append(blocks, atFileBlocks...)
+
+		// P2 (2026-05-18) — vision capability gate. If the active
+		// provider doesn't advertise vision support, strip image
+		// blocks and warn ONCE rather than send a request the model
+		// will reject with a cryptic 400. crush parity:
+		// filterFileParts() drops non-text on non-vision providers
+		// silently. We're slightly louder: a one-line warning so the
+		// user knows the image didn't reach the model.
+		if m.loop != nil && m.loop.Provider != nil && !pubprov.ProviderSupportsVision(m.loop.Provider) {
+			stripped, kept := splitOffImageBlocks(blocks)
+			if stripped > 0 {
+				m.messages = append(m.messages, Message{
+					Role: "warning",
+					Content: fmt.Sprintf(
+						"image: %d block(s) dropped — current model (%s) doesn't accept vision input. Switch to a vision-capable model (e.g. claude-sonnet, gpt-4o) and re-paste.",
+						stripped, m.loop.Model,
+					),
+					Timestamp: time.Now(),
+				})
+				blocks = kept
+			}
+		}
 		m.loop.AppendUserBlocks(blocks)
 		for _, e := range errs {
 			m.messages = append(m.messages, Message{
@@ -611,7 +692,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		m.imagePaste = nil
 		m.imageCounter = 0
 	} else {
-		m.loop.AppendUser(llmText)
+		m.loop.AppendUser(llmTextRewritten)
 	}
 	if m.session != nil && m.sessionID != "" {
 		_ = m.session.AppendMessage(m.sessionID, lastUserMessage(m.loop.History()))

@@ -27,10 +27,13 @@ import (
 // stubPlanController is a minimal PlanController for tests — we just
 // want to observe the bool state without bringing up a real Loop.
 type stubPlanController struct {
-	on bool
+	on  bool
+	pre string
 }
 
-func (s *stubPlanController) SetPlanMode(v bool) { s.on = v }
+func (s *stubPlanController) SetPlanMode(v bool)      { s.on = v }
+func (s *stubPlanController) PrePlanMode() string     { return s.pre }
+func (s *stubPlanController) SetPrePlanMode(m string) { s.pre = m }
 
 func TestEnterPlanMode_FlipsControllerOn(t *testing.T) {
 	t.Parallel()

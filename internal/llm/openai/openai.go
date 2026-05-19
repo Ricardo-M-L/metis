@@ -114,6 +114,33 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 // trustworthy status-bar display.
 func (o *OpenAI) ModelID() string { return o.Model }
 
+// SupportsVision reports whether the configured OpenAI model accepts
+// image_url content parts. Vision-capable lineage: gpt-4-vision-*,
+// gpt-4-turbo*, gpt-4o*, gpt-5*, o3*, o4*. Compat-base-URL providers
+// (DeepSeek, Kimi, GLM, MiniMax openai-mode) overwhelmingly DON'T
+// support vision and use model ids that won't match the prefixes
+// below — those correctly fall through to false.
+//
+// We're conservative on purpose: a false negative (model COULD do
+// vision, gate says no) just costs a re-paste in a vision model. A
+// false positive (text-only model gets image bytes) burns the entire
+// turn on a cryptic API rejection.
+func (o *OpenAI) SupportsVision() bool {
+	m := strings.ToLower(o.Model)
+	switch {
+	case strings.HasPrefix(m, "gpt-4o"),
+		strings.HasPrefix(m, "gpt-5"),
+		strings.HasPrefix(m, "gpt-4.1"),
+		strings.HasPrefix(m, "gpt-4-vision"),
+		strings.HasPrefix(m, "gpt-4-turbo"),
+		strings.HasPrefix(m, "o3"),
+		strings.HasPrefix(m, "o4"),
+		strings.HasPrefix(m, "chatgpt-4o"):
+		return true
+	}
+	return false
+}
+
 func (o *OpenAI) MaxContextTokens() int {
 	// Tier 1 — explicit user override.
 	if o.ContextWindow > 0 {

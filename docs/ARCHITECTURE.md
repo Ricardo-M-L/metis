@@ -157,6 +157,7 @@ the agent doesn't re-ask the same question in the session.
 | File | Responsibility |
 |------|----------------|
 | `loop.go` | Lifecycle (NewLoop / AppendUser / History / Reset / Undo) + main `for` driver |
+| `orphan_repair.go` | `RepairOrphanedToolUses` — synthesizes a stub `tool_result` for any assistant `tool_use` that lacks a downstream pair. Fired from `Run`'s defer (every exit path) and `Restore` (replay path) so persisted history is always API-valid. |
 | `streaming.go` | `consumeStream` — drains `StreamReader`, assembles assistant blocks |
 | `dispatch.go` | `executeBatch` — three-phase Safe-parallel + Queue-FIFO + Exclusive-serial |
 | `permission_ask.go` | mid-turn permission prompt with reply channel |
