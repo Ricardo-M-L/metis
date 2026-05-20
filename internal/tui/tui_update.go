@@ -526,6 +526,11 @@ func (m *Model) finalizeTurn(err error) {
 	m.backgroundedAt = time.Time{}
 	m.turnActive = false
 	m.spinnerActive = false
+	// Turn complete — clear the per-turn cancel func now that we're
+	// on the main thread. Previously runTurnAsync did this from
+	// inside the goroutine, which raced against handleSubmit on the
+	// next turn's setup. See runTurnAsync's header comment.
+	m.turnCancel = nil
 	// Snap displayed-token counter to truth so the final number doesn't
 	// take an extra second to converge after the spinner stops ticking.
 	m.totalTokens.Snap()
@@ -726,22 +731,50 @@ func (m *Model) persistTail() {
 	}
 }
 
-func (m *Model) runTurnAsync() {
-	// Wrap m.ctx in a cancellable child so Ctrl-C can interrupt this turn
-	// without taking down the whole session.
-	turnCtx, cancel := context.WithCancel(m.ctx)
-	m.turnCancel = cancel
-	defer func() {
-		cancel()
-		m.turnCancel = nil
-	}()
-
+// runTurnAsync runs one agent turn in a goroutine. It is a FREE
+// FUNCTION (not a method) — all Model state it needs is passed in
+// by value at the call site. This rules out the data race fixed on
+// 2026-05-20:
+//
+//   pre-fix (method on *Model):
+//     - goroutine read m.ctx, wrote m.turnCancel, read m.loop, used
+//       m.eventCh and m.doneCh — all while the main bubbletea
+//       Update goroutine could legitimately mutate those same
+//       fields (test pressEnter ran Update which queued another
+//       handleSubmit BEFORE the previous turn's runTurnAsync had
+//       drained). go test -race caught it in
+//       TestChatSubmit_RuneByRuneSubmission /
+//       TestChatSubmit_RuneByRuneMultibyte /
+//       TestSlashE2E_BatchRewritesPrompt.
+//
+//   post-fix (free function):
+//     - caller snapshots m.ctx → derives turnCtx, stores cancel
+//       into m.turnCancel BEFORE the `go` statement (single
+//       writer on main thread)
+//     - caller snapshots m.loop, m.eventCh, m.doneCh
+//     - goroutine touches no Model state — only the passed-in
+//       values + the events channel forwarding loop
+//     - turnCancel cleanup moves to finalizeTurn (main thread,
+//       reached via doneCh handler) so we never write to Model
+//       state from inside the goroutine
+//
+// The eventCh / doneCh channels themselves are concurrent-safe
+// (Go's channel semantics) so writing to them from the goroutine
+// is fine — what we removed was the m.field READS that the race
+// detector flagged.
+func runTurnAsync(
+	turnCtx context.Context,
+	cancel context.CancelFunc,
+	loop *agent.Loop,
+	eventCh chan<- agent.Event,
+	doneCh chan<- error,
+) {
+	defer cancel()
 	events := make(chan agent.Event, eventBufferSize())
 	done := make(chan error, 1)
-	go func() { done <- m.loop.Run(turnCtx, events); close(events) }()
+	go func() { done <- loop.Run(turnCtx, events); close(events) }()
 	for ev := range events {
-		m.eventCh <- ev
+		eventCh <- ev
 	}
-	err := <-done
-	m.doneCh <- err
+	doneCh <- <-done
 }

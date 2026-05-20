@@ -5,6 +5,7 @@ package tui
 // or the slash-signal table; plain user text starts a new turn.
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -722,7 +723,13 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.spinnerPhase = "requesting"
 	m.showBanner = false // Hide banner after first message
 
-	go m.runTurnAsync()
+	// Snapshot what runTurnAsync needs BEFORE the `go` — see the
+	// comment on runTurnAsync for why. m.turnCancel must be written
+	// on this (main) thread, not from inside the goroutine; cleared
+	// in finalizeTurn when doneCh fires.
+	turnCtx, cancel := context.WithCancel(m.ctx)
+	m.turnCancel = cancel
+	go runTurnAsync(turnCtx, cancel, m.loop, m.eventCh, m.doneCh)
 	// Critical: must return tickCmd here so spinnerTick events start flowing,
 	// otherwise the "thinking" frame and elapsed timer freeze at 0s and the
 	// UI looks dead until the LLM replies.
