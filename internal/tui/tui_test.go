@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -156,7 +157,17 @@ func TestCtrlC_DuringTurnArmsQuitTimer(t *testing.T) {
 // TestCtrlC_DoubleTapDuringTurnQuits: second Ctrl-C within the window
 // (during the same active turn) should exit — the escape hatch when
 // the cancellation path itself is wedged.
+//
+// exitFunc is package-init-overridden to a no-op + counter by
+// exit_hook_test.go's init(), so the 800 ms-scheduled hard-exit
+// goroutine that this path spawns can fire harmlessly during the
+// test suite. This test asserts both that handleKey returns a Quit
+// cmd AND that the goroutine actually fires (counter increments
+// within 2 s) — pre-fix the goroutine called the real os.Exit when
+// it fired, killing the whole `go test ./internal/tui/...` binary.
 func TestCtrlC_DoubleTapDuringTurnQuits(t *testing.T) {
+	startCount := atomic.LoadInt64(&exitTestCallCount)
+
 	m := makeModelForGateTest()
 	m.turnActive = true
 	m.lastCtrlC = time.Now() // armed by a previous Ctrl-C
@@ -165,6 +176,18 @@ func TestCtrlC_DoubleTapDuringTurnQuits(t *testing.T) {
 	if cmd == nil {
 		t.Error("double-tap Ctrl-C during turn should return tea.Quit")
 	}
+
+	// Poll for the hard-exit goroutine to fire (sleep 800 ms then
+	// call exitFunc). 2 s budget = 800 ms sleep + race-detector
+	// overhead + comfort margin.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&exitTestCallCount) > startCount {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("hard-exit goroutine never fired within 2 s — pre-fix bug would have called real os.Exit instead")
 }
 
 // teaKeyCtrlC is the bubbletea key message for Ctrl-C; defined as a helper

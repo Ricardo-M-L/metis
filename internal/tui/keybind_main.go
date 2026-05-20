@@ -15,6 +15,16 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+// exitFunc is the process-termination hook used by the Ctrl-C double-
+// tap belt-and-braces path. Default is os.Exit, but tests override it
+// to a no-op so the 800 ms-scheduled goroutine doesn't kill the test
+// binary mid-suite. Caught 2026-05-20: TestCtrlC_DoubleTapDuringTurnQuits
+// triggered the path, the goroutine fired ~800 ms later during a
+// downstream test, and os.Exit(0) marked the whole `go test
+// ./internal/tui/...` run as FAIL despite every individual test
+// passing.
+var exitFunc = os.Exit
+
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.permActive {
 		// Permission prompt consumes ONLY navigation/decision keys
@@ -125,7 +135,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			go func() {
 				time.Sleep(800 * time.Millisecond)
 				resetTerminal(savedTermios)
-				os.Exit(0)
+				exitFunc(0)
 			}()
 			return m, tea.Quit
 		}
@@ -165,7 +175,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			go func() {
 				time.Sleep(800 * time.Millisecond)
 				resetTerminal(savedTermios)
-				os.Exit(0)
+				exitFunc(0)
 			}()
 			return m, tea.Quit
 		}
