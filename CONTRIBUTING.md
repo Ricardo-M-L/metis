@@ -8,21 +8,50 @@ A Chinese version is available at [CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)
 ## Project layout
 
 ```
-cmd/metis/         CLI entry, subcommand dispatch, flag wiring
-internal/agent/    The message → tool → message loop
-internal/tools/    Tool registry + 16 built-in tools (Bash, Read, Edit, ...)
-internal/llm/      Provider clients (Anthropic, OpenAI, Gemini, custom)
-internal/memory/   Multi-tier memory (Core / Archival / Recall + Daily)
-internal/runtime/  Bootstrap glue: build provider, build registry, build loop
-internal/tui/      bubbletea chat surface (50+ files, single Model)
-internal/permission/  Allow / Deny / Ask gating
-acp/               Agent Client Protocol JSON-RPC server
-pkg/               Stable public API (tool, memory, plugin, skill)
-docs/              Architecture + design notes
+cmd/metis/                 CLI entry + one file per subcommand
+                           (auth/diag/plugin/stats/trust/…)
+internal/agent/            the message → tool → message loop (Loop +
+                           dispatch + detectors + verdict gate +
+                           contract + orphan repair)
+internal/agent/skills/     SKILL.md loader + 23 bundled skills
+internal/agent/transcript/ per-run transcript persistence
+internal/tools/            Tool interface + registry
+internal/tools/builtin/    ~30 first-party tools (Read/Write/Edit/Glob/
+                           Grep/LS/Git/WebFetch/WebSearch/WebBrowse/
+                           NotebookEdit/Todo/Ask/LSP/Agent/Fork/Task*/
+                           plan-mode/Skill/Memory/MetisInfo/Monitor/
+                           ScheduleWakeup/MessageTeammate/SendMessage)
+internal/tools/builtin/bash/  Bash family (Bash + List/Output/Kill
+                              jobs + classifier + 30+ security rules)
+internal/llm/              provider clients (Anthropic, OpenAI, Gemini,
+                           Azure, Bedrock, Vertex, Cloud, custom)
+internal/llm/transport/    shared HTTP client + retry/dump/log/overflow
+internal/memory/           multi-tier memory (Core / Archival / Recall + Daily)
+internal/runtime/          bootstrap glue: build provider, build registry,
+                           build loop
+internal/runtime/mcp/      MCP registry + cache + prompts collector
+internal/tui/              bubbletea chat surface (~83 files, single Model)
+internal/tui/screen/       full-screen overlays (help/history/…)
+internal/slash/            slash-command registry + handlers
+internal/permission/       5-mode cascading gate (allow/deny/ask/auto/bypass)
+internal/exitcode/         typed errors → shell exit codes
+internal/jobs/             background process pool for the Bash family
+internal/channels/         9 chat-platform adapters (Slack/DingTalk/…)
+internal/mcp/              stdio + Streamable HTTP/SSE clients (SDK shape)
+acp/                       Agent Client Protocol JSON-RPC server
+pkg/                       stable public API (tool, memory, plugin,
+                           skill, hook, channel, provider, session, llm)
+docs/                      architecture + design notes
 ```
 
 Anything under `internal/` is implementation detail. Anything under `pkg/` is a
 contract — break it only with a deprecation cycle.
+
+Several internal packages carry a `README.md` documenting their
+file-naming convention and "where to find X" pointers — start there
+when navigating a cluttered package (`internal/tui/`, `internal/agent/`,
+`internal/tools/builtin/`, `internal/runtime/`, `internal/llm/transport/`,
+`internal/slash/`, `internal/agent/skills/`).
 
 ## Building & testing
 

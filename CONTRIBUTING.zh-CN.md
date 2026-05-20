@@ -7,20 +7,47 @@ English version: [CONTRIBUTING.md](CONTRIBUTING.md)。
 ## 项目结构
 
 ```
-cmd/metis/         CLI 入口、子命令分发、flag 绑定
-internal/agent/    消息 → 工具 → 消息 主循环
-internal/tools/    工具注册表 + 16 个内置工具（Bash、Read、Edit……）
-internal/llm/      Provider 客户端（Anthropic / OpenAI / Gemini / 自定义）
-internal/memory/   多层记忆（Core / Archival / Recall + Daily）
-internal/runtime/  装配胶水：构建 provider、注册工具、装配 loop
-internal/tui/      bubbletea 聊天界面（50+ 文件，单 Model）
-internal/permission/  Allow / Deny / Ask 权限网关
-acp/               Agent Client Protocol JSON-RPC 服务端
-pkg/               稳定公开 API（tool、memory、plugin、skill）
-docs/              架构与设计文档
+cmd/metis/                 CLI 入口 + 每个子命令一个文件
+                           (auth/diag/plugin/stats/trust/…)
+internal/agent/            消息 → 工具 → 消息 主循环（Loop +
+                           dispatch + detectors + verdict gate +
+                           contract + orphan repair）
+internal/agent/skills/     SKILL.md 加载器 + 23 个内置 skill
+internal/agent/transcript/ 单次 run 的 transcript 持久化
+internal/tools/            Tool 接口 + 注册表
+internal/tools/builtin/    ~30 个第一方工具（Read/Write/Edit/Glob/
+                           Grep/LS/Git/WebFetch/WebSearch/WebBrowse/
+                           NotebookEdit/Todo/Ask/LSP/Agent/Fork/Task*/
+                           plan-mode/Skill/Memory/MetisInfo/Monitor/
+                           ScheduleWakeup/MessageTeammate/SendMessage）
+internal/tools/builtin/bash/  Bash 工具家族（Bash + List/Output/Kill
+                              job 工具 + classifier + 30+ 安全规则）
+internal/llm/              Provider 客户端（Anthropic / OpenAI / Gemini /
+                           Azure / Bedrock / Vertex / Cloud / 自定义）
+internal/llm/transport/    共享 HTTP 客户端 + retry/dump/log/overflow
+internal/memory/           多层记忆（Core / Archival / Recall + Daily）
+internal/runtime/          装配胶水：构建 provider、注册工具、装配 loop
+internal/runtime/mcp/      MCP 注册表 + 缓存 + prompts 收集器
+internal/tui/              bubbletea 聊天界面（~83 个文件，单 Model）
+internal/tui/screen/       全屏 overlay（help/history/…）
+internal/slash/            slash 命令注册表 + handler
+internal/permission/       5 模式级联权限网关（allow/deny/ask/auto/bypass）
+internal/exitcode/         typed 错误 → shell 退出码
+internal/jobs/             Bash 家族的后台进程池
+internal/channels/         9 个聊天平台 adapter（Slack/DingTalk/…）
+internal/mcp/              stdio + Streamable HTTP/SSE 客户端（SDK 形态）
+acp/                       Agent Client Protocol JSON-RPC 服务端
+pkg/                       稳定公开 API（tool、memory、plugin、skill、
+                           hook、channel、provider、session、llm）
+docs/                      架构与设计文档
 ```
 
 `internal/` 下都是实现细节；`pkg/` 下是稳定契约——除非走废弃流程，否则不要破坏。
+
+若干 internal 包下有 `README.md` 说明文件命名约定 + "X 在哪里找" 指引——
+进入大目录前先看那个 README 节省时间（`internal/tui/`、`internal/agent/`、
+`internal/tools/builtin/`、`internal/runtime/`、`internal/llm/transport/`、
+`internal/slash/`、`internal/agent/skills/`）。
 
 ## 构建与测试
 
