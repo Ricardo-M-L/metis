@@ -28,6 +28,17 @@ func TestCheckCommand_AllowsBenignCommands(t *testing.T) {
 		"go test ./... > /dev/null 2>&1",
 		"foo 2>/dev/null|grep bar",
 		"echo done > /dev/null && echo more",
+		// Heredoc carve-out for rule #23 (2026-05-20). iter9/10/11
+		// model used `cat <<EOF` style to inject multi-line JSON;
+		// pre-fix scanner saw `"key"` as opening double-quote and
+		// then trip the next \n. Heredoc content is opaque to bash
+		// re-parsing so we now short-circuit Allow on a `<<DELIM`
+		// start token.
+		"cat <<EOF\n{\"key\": \"val\"}\nEOF",
+		"cat <<-EOF\n\tindented heredoc\n\tEOF",
+		"cat <<'EOF'\n'literal-quotes-inside'\nEOF",
+		"cat <<\"EOF\"\n\"another-quoted-delim\"\nEOF",
+		"curl -d @body.json https://api.example.com",
 	}
 	for _, cmd := range benign {
 		t.Run(cmd, func(t *testing.T) {

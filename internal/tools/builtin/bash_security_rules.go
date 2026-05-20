@@ -254,8 +254,24 @@ func ruleCommentQuoteDesync(cmd string) SecurityRuleResult {
 // smuggle multi-line payloads past a single-line input field. Bash
 // happily executes them, but the user prompt UI typically only shows
 // the first line.
+//
+// Heredoc carve-out (2026-05-20): commands containing a `<<DELIM` or
+// `<<-DELIM` (optionally quoted: `<<'EOF'` / `<<"EOF"`) heredoc start
+// declare their multi-line content explicitly — that's the OPPOSITE
+// of "smuggling past a single-line UI". Bash itself recognises the
+// region as opaque payload, not subject to quote re-parsing, so any
+// `'` or `"` inside doesn't toggle real quote state. The pre-fix
+// scanner didn't know that and false-positive denied legitimate
+// `cat <<EOF { "key": "val" } EOF` patterns across iter9/10/11.
+// Detect the heredoc start and short-circuit Allow; other rules
+// (RemoteExecPipe, DangerousVariables, etc.) still run earlier in
+// allSecurityChecks and would catch real attacks dressed up in
+// heredoc wrapper.
 func ruleQuotedNewlineExfil(cmd string) SecurityRuleResult {
 	if !strings.Contains(cmd, "\n") {
+		return SecurityRuleResult{Allow: true}
+	}
+	if hereDocStartRe.MatchString(cmd) {
 		return SecurityRuleResult{Allow: true}
 	}
 	inSingle, inDouble := false, false
@@ -277,6 +293,18 @@ func ruleQuotedNewlineExfil(cmd string) SecurityRuleResult {
 	}
 	return SecurityRuleResult{Allow: true}
 }
+
+// hereDocStartRe matches a bash heredoc start token:
+//   `<<EOF`           — basic
+//   `<<-EOF`          — leading-tab strip variant
+//   `<<'EOF'` / `<<"EOF"` — quoted delimiter (no parameter expansion)
+//   `<<MARKER123_x`   — any identifier delimiter
+// The DELIM token is `[A-Za-z_][A-Za-z0-9_]*`. We don't try to find
+// the closing delimiter (that would require multi-line scanning); the
+// mere presence of `<<DELIM` is enough to declare "this command has
+// an explicit multi-line content region, the quote-newline check
+// doesn't apply".
+var hereDocStartRe = regexp.MustCompile(`<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?`)
 
 // 24: UNC_PATH — Windows UNC paths (\\server\share, \\?\, \\.\) are
 // SMB exfil vectors; an LLM convinced to "back up to network share"
