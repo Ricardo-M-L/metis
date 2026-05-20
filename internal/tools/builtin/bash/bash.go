@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 import (
 	"bytes"
@@ -83,7 +83,7 @@ Quoting and safety:
   - Never pass --no-verify, --no-gpg-sign, --force-with-lease without explicit user consent; never 'git push --force' to main/master.
   - Never 'rm -rf' or pipe to /dev/sd*; never run a command whose effect you can't reverse without asking first.
 
-Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and can poll via BashOutput or stop via BashKill. Note: 'sleep N' is detected and auto-rejected from background mode — pick a real command.
+Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and can poll via Output or stop via Kill. Note: 'sleep N' is detected and auto-rejected from background mode — pick a real command.
 
 Always pass description: a 5-10 word phrase like "run tests" or "git status before commit". It's shown in the audit trail and helps the user see why each shell call exists.`
 }
@@ -106,7 +106,7 @@ func (Bash) InputSchema() map[string]any {
 			},
 			"run_in_background": map[string]any{
 				"type":        "boolean",
-				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately; read output with BashOutput, terminate with BashKill. 'sleep N' is auto-rejected — pick a real command.",
+				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately; read output with Output, terminate with Kill. 'sleep N' is auto-rejected — pick a real command.",
 			},
 		},
 	}
@@ -396,7 +396,7 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 					"Better alternatives: "+
 					"(1) use the Monitor tool to watch a file/log for a specific pattern — "+
 					"its event arrives the moment the condition fires, not on a polling tick; "+
-					"(2) for a long-running command, pass run_in_background=true and check progress via BashOutput; "+
+					"(2) for a long-running command, pass run_in_background=true and check progress via Output; "+
 					"(3) for deliberate sub-second pacing, `sleep 0.5` etc. is allowed.",
 				blocked,
 			),
@@ -449,8 +449,8 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	// On macOS/Windows it's a plain `shell -c cmdStr` (no /proc here).
 	// See internal/jobs/oom_linux.go.
 	exe := jobs.OOMWrappedCommand(cctx, shell, cmdStr)
-	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
-	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
+	childEnv := FilterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
+	childEnv = ApplyNetworkPolicy(childEnv, b.settings.Sandbox)
 	exe.Env = childEnv
 	// G.2 (2026-05-12): when a sub-agent was spawned with `cwd:"..."`
 	// or `isolation:"worktree"`, the Agent tool stamps the effective
@@ -583,7 +583,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		}
 		msg := fmt.Sprintf(
 			"[command moved to background after %s — still running, job_id=%s]\n"+
-				"Use BashOutput {job_id: %q} to read more output, BashKill {job_id: %q} to stop.\n"+
+				"Use Output {job_id: %q} to read more output, Kill {job_id: %q} to stop.\n"+
 				"Output captured in foreground (%d bytes):\n%s",
 			AutoBackgroundThreshold, jb.ID, jb.ID, jb.ID, len(buf.Bytes()), preview,
 		)
@@ -595,7 +595,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 
 // executeBackground starts cmd directly in the job pool — the
 // foreground reply is just "running with job_id=X" and the model
-// uses BashOutput / BashKill to interact further. Used for the
+// uses Output / Kill to interact further. Used for the
 // explicit run_in_background=true path.
 func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Result, error) {
 	if b.Jobs == nil {
@@ -616,8 +616,8 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	}
 	// Linux OOM-score wrapping (see jobs.OOMWrappedCommand).
 	exe := jobs.OOMWrappedCommand(bgCtx, shell, cmdStr)
-	childEnv := filterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
-	childEnv = applyBashNetworkPolicy(childEnv, b.settings.Sandbox)
+	childEnv := FilterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
+	childEnv = ApplyNetworkPolicy(childEnv, b.settings.Sandbox)
 	exe.Env = childEnv
 	// G.2 — read effective cwd from the ORIGINAL ctx (not bgCtx,
 	// which is fresh). The sub-agent ctx the Agent tool stamped lives
@@ -639,7 +639,7 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	return &tools.Result{
 		Output: fmt.Sprintf(
 			"[command running in background, job_id=%s]\n"+
-				"Use BashOutput {job_id: %q} to read its output, BashKill {job_id: %q} to stop.\n"+
+				"Use Output {job_id: %q} to read its output, Kill {job_id: %q} to stop.\n"+
 				"You'll receive a <job_notification> when the command exits.",
 			jb.ID, jb.ID, jb.ID,
 		),

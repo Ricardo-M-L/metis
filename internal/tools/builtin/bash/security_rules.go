@@ -9,7 +9,7 @@
 // them before execution; any DENY returns "blocked" to the model with
 // a reason it can rephrase around. A future YOLO classifier (Task #74)
 // could downgrade DENY → "ask user" for ambiguous cases.
-package builtin
+package bash
 
 import (
 	"regexp"

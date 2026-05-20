@@ -1,7 +1,7 @@
-package builtin
+package bash
 
-// bash_jobs_test.go — pin the three job-pool tools (BashList /
-// BashOutput / BashKill) against a real jobs.Registry. Each test
+// bash_jobs_test.go — pin the three job-pool tools (List /
+// Output / Kill) against a real jobs.Registry. Each test
 // runs against a TempDir-rooted registry so on-disk job logs don't
 // leak across tests.
 
@@ -47,7 +47,7 @@ func spawnSleepyJob(t *testing.T, r *jobs.Registry, label string) *jobs.Job {
 
 func TestBashList_Empty(t *testing.T) {
 	pool, gate := jobPoolFixture(t)
-	tool := BashList{gate: gate, pool: pool}
+	tool := List{gate: gate, pool: pool}
 	res, err := tool.Execute(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestBashList_RunningJobAppears(t *testing.T) {
 	j := spawnSleepyJob(t, pool, "test-running")
 	defer pool.Stop(j.ID, 0)
 
-	tool := BashList{gate: gate, pool: pool}
+	tool := List{gate: gate, pool: pool}
 	res, err := tool.Execute(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestBashList_TerminalJobIncludesExitCode(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	tool := BashList{gate: gate, pool: pool}
+	tool := List{gate: gate, pool: pool}
 	res, err := tool.Execute(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestBashList_TerminalJobIncludesExitCode(t *testing.T) {
 
 func TestBashOutput_RequiresJobID(t *testing.T) {
 	pool, gate := jobPoolFixture(t)
-	tool := BashOutput{gate: gate, pool: pool}
+	tool := Output{gate: gate, pool: pool}
 	if _, err := tool.Execute(context.Background(), map[string]any{}); err == nil {
 		t.Error("expected error on missing job_id")
 	}
@@ -124,7 +124,7 @@ func TestBashOutput_RequiresJobID(t *testing.T) {
 
 func TestBashOutput_UnknownIDReturnsError(t *testing.T) {
 	pool, gate := jobPoolFixture(t)
-	tool := BashOutput{gate: gate, pool: pool}
+	tool := Output{gate: gate, pool: pool}
 	res, err := tool.Execute(context.Background(), map[string]any{"job_id": "bg_doesnotexist"})
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestBashOutput_ReadsRunningJob(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	tool := BashOutput{gate: gate, pool: pool}
+	tool := Output{gate: gate, pool: pool}
 	res, err := tool.Execute(context.Background(), map[string]any{"job_id": j.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -172,13 +172,13 @@ func TestBashKill_StopsRunningJob(t *testing.T) {
 	pool, gate := jobPoolFixture(t)
 	j := spawnSleepyJob(t, pool, "to-be-killed")
 
-	tool := BashKill{gate: gate, pool: pool}
+	tool := Kill{gate: gate, pool: pool}
 	res, err := tool.Execute(context.Background(), map[string]any{"job_id": j.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.IsError {
-		t.Errorf("BashKill on a live job shouldn't IsError; got %q", res.Output)
+		t.Errorf("Kill on a live job shouldn't IsError; got %q", res.Output)
 	}
 	// Verify the job actually transitions to Killed.
 	deadline := time.Now().Add(3 * time.Second)
@@ -188,12 +188,12 @@ func TestBashKill_StopsRunningJob(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("BashKill didn't transition job to StatusKilled within 3s")
+	t.Fatal("Kill didn't transition job to StatusKilled within 3s")
 }
 
 func TestBashKill_UnknownIDIsError(t *testing.T) {
 	pool, gate := jobPoolFixture(t)
-	tool := BashKill{gate: gate, pool: pool}
+	tool := Kill{gate: gate, pool: pool}
 	res, err := tool.Execute(context.Background(), map[string]any{"job_id": "bg_nope"})
 	if err != nil {
 		t.Fatal(err)

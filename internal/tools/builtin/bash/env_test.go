@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 import (
 	"strings"
@@ -19,7 +19,7 @@ func TestFilterEnv_StripsAPIKeys(t *testing.T) {
 		"USER_PASSWORD=hunter2",
 		"MY_OAUTH_BEARER=tok",
 	}
-	got := filterEnv(in, false)
+	got := FilterEnv(in, false)
 	for _, kv := range got {
 		for _, banned := range []string{"API_KEY", "TOKEN", "SECRET", "PASSWORD", "METIS_", "OAUTH"} {
 			if strings.Contains(strings.ToUpper(kv), banned) {
@@ -43,7 +43,7 @@ func TestFilterEnv_StripsAPIKeys(t *testing.T) {
 
 func TestFilterEnv_DangerouslyInherit(t *testing.T) {
 	in := []string{"MINIMAX_API_KEY=secret"}
-	got := filterEnv(in, true)
+	got := FilterEnv(in, true)
 	// Even under dangerouslyInherit=true the AGENT/AI_AGENT/METIS
 	// markers are appended (they're informational, not gating).
 	if !containsKV(got, "MINIMAX_API_KEY=secret") {
@@ -61,7 +61,7 @@ func TestFilterEnv_DangerouslyInherit(t *testing.T) {
 // so dotfiles and Makefiles can detect "I'm being run by an agent"
 // and skip interactive prompts (`gh auth login`'s pager, etc).
 func TestFilterEnv_AlwaysSetsAgentMarkers(t *testing.T) {
-	got := filterEnv([]string{"PATH=/usr/bin"}, false)
+	got := FilterEnv([]string{"PATH=/usr/bin"}, false)
 	for _, want := range []string{"AGENT=metis", "AI_AGENT=metis", "METIS=1"} {
 		if !containsKV(got, want) {
 			t.Errorf("expected marker %q in output; got %v", want, got)
@@ -75,7 +75,7 @@ func TestFilterEnv_AlwaysSetsAgentMarkers(t *testing.T) {
 // from a previous tool to mislead our own dotfile rules.
 func TestFilterEnv_AgentMarkerOverridesUserSet(t *testing.T) {
 	in := []string{"PATH=/usr/bin", "AGENT=other", "AI_AGENT=other"}
-	got := filterEnv(in, false)
+	got := FilterEnv(in, false)
 	if !containsKV(got, "AGENT=metis") {
 		t.Errorf("AGENT should be forced to metis; got %v", got)
 	}

@@ -1,7 +1,7 @@
-package builtin
+package bash
 
 // bash_jobs.go — three model-facing tools that pair with the Bash
-// auto-background path: BashList / BashOutput / BashKill. Mirrors
+// auto-background path: List / Output / Kill. Mirrors
 // claude-code's TaskList / TaskOutput / TaskStop tooling, scoped to
 // the bash job pool (we kept the agent-task tools — TaskOutput in
 // task.go etc. — separate to avoid confusion with the per-session
@@ -27,7 +27,7 @@ import (
 )
 
 // AttachJobsRegistry wires a jobs.Registry into the existing Bash
-// entry in reg and registers BashList / BashOutput / BashKill. Idempotent
+// entry in reg and registers List / Output / Kill. Idempotent
 // — calling twice rebinds the registry on Bash and re-registers the
 // three reader tools. Safe to call after builtin.Register.
 //
@@ -50,43 +50,43 @@ func AttachJobsRegistry(reg *tools.Registry, pool *jobs.Registry, gate *permissi
 			reg.Replace(b)
 		}
 	}
-	reg.Replace(BashList{gate: gate, pool: pool})
-	reg.Replace(BashOutput{gate: gate, pool: pool})
-	reg.Replace(BashKill{gate: gate, pool: pool})
+	reg.Replace(List{gate: gate, pool: pool})
+	reg.Replace(Output{gate: gate, pool: pool})
+	reg.Replace(Kill{gate: gate, pool: pool})
 }
 
 // ───────────────────────────────────────────────────────────────────
-// BashList — "what background jobs are currently in flight?"
+// List — "what background jobs are currently in flight?"
 // ───────────────────────────────────────────────────────────────────
 
-// BashList returns a JSON-serialized snapshot of the job pool. The
-// model uses this to find a job_id to feed into BashOutput / BashKill,
+// List returns a JSON-serialized snapshot of the job pool. The
+// model uses this to find a job_id to feed into Output / Kill,
 // or to decide whether to wait vs spawn another. Empty input schema
 // because there's nothing to filter on yet.
-type BashList struct {
+type List struct {
 	tools.BaseTool
 	gate *permission.Gate
 	pool *jobs.Registry
 }
 
-func (BashList) Name() string { return "BashList" }
-func (BashList) Description() string {
+func (List) Name() string { return "BashList" }
+func (List) Description() string {
 	return "List all background bash jobs (auto-promoted commands and explicit run_in_background). " +
 		"Returns id, status, command preview, started time, elapsed, exit code (terminal only). " +
 		"Empty list when no jobs are alive or have run this session."
 }
-func (BashList) InputSchema() map[string]any {
+func (List) InputSchema() map[string]any {
 	return map[string]any{
 		"type":       "object",
 		"properties": map[string]any{},
 	}
 }
-func (BashList) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
-func (l BashList) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
-	d, src := l.gate.Check(context.Background(), "BashList", "")
+func (List) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (l List) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
+	d, src := l.gate.Check(context.Background(), "List", "")
 	return mapDecision(d), src
 }
-func (l BashList) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
+func (l List) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
 	if l.pool == nil {
 		return &tools.Result{Output: "[]"}, nil
 	}
@@ -129,29 +129,29 @@ func (l BashList) Execute(_ context.Context, _ map[string]any) (*tools.Result, e
 }
 
 // ───────────────────────────────────────────────────────────────────
-// BashOutput — read a job's stdout/stderr capture from disk.
+// Output — read a job's stdout/stderr capture from disk.
 // ───────────────────────────────────────────────────────────────────
 
-// BashOutput returns the captured output of a background job. tail_max
+// Output returns the captured output of a background job. tail_max
 // caps the number of bytes returned (default 50 KiB) — large logs are
 // truncated from the head with a `[truncated head — file XX MiB]`
 // marker so the model knows it's seeing the most recent activity.
 //
 // The job doesn't have to be done; reading mid-run is supported and
 // returns whatever's been written so far.
-type BashOutput struct {
+type Output struct {
 	tools.BaseTool
 	gate *permission.Gate
 	pool *jobs.Registry
 }
 
-func (BashOutput) Name() string { return "BashOutput" }
-func (BashOutput) Description() string {
+func (Output) Name() string { return "BashOutput" }
+func (Output) Description() string {
 	return "Read the captured stdout/stderr of a background bash job. " +
 		"Works on running and terminal jobs. " +
 		"Use tail_max to cap returned bytes (default 50000); large logs are truncated from the head."
 }
-func (BashOutput) InputSchema() map[string]any {
+func (Output) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"job_id"},
@@ -167,14 +167,14 @@ func (BashOutput) InputSchema() map[string]any {
 		},
 	}
 }
-func (BashOutput) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
-func (o BashOutput) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
-	d, src := o.gate.Check(context.Background(), "BashOutput", "")
+func (Output) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (o Output) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
+	d, src := o.gate.Check(context.Background(), "Output", "")
 	return mapDecision(d), src
 }
-func (o BashOutput) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (o Output) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	if o.pool == nil {
-		return &tools.Result{Output: "[BashOutput unavailable: jobs registry not wired]", IsError: true}, nil
+		return &tools.Result{Output: "[Output unavailable: jobs registry not wired]", IsError: true}, nil
 	}
 	id, _ := in["job_id"].(string)
 	if id == "" {
@@ -183,7 +183,7 @@ func (o BashOutput) Execute(_ context.Context, in map[string]any) (*tools.Result
 	j := o.pool.Get(id)
 	if j == nil {
 		return &tools.Result{
-			Output:  fmt.Sprintf("[no such job %q — call BashList to see live jobs]", id),
+			Output:  fmt.Sprintf("[no such job %q — call List to see live jobs]", id),
 			IsError: true,
 		}, nil
 	}
@@ -213,25 +213,25 @@ func (o BashOutput) Execute(_ context.Context, in map[string]any) (*tools.Result
 }
 
 // ───────────────────────────────────────────────────────────────────
-// BashKill — terminate a background job.
+// Kill — terminate a background job.
 // ───────────────────────────────────────────────────────────────────
 
-// BashKill sends SIGTERM (then SIGKILL after a 2s grace) to the
+// Kill sends SIGTERM (then SIGKILL after a 2s grace) to the
 // process behind a job. Returns immediately; the job state will move
 // to "killed" asynchronously. Calling on an already-terminal job is a
 // silent no-op.
-type BashKill struct {
+type Kill struct {
 	tools.BaseTool
 	gate *permission.Gate
 	pool *jobs.Registry
 }
 
-func (BashKill) Name() string { return "BashKill" }
-func (BashKill) Description() string {
+func (Kill) Name() string { return "BashKill" }
+func (Kill) Description() string {
 	return "Stop a running background bash job. SIGTERM first, SIGKILL after 2s grace. " +
 		"No-op on jobs that already exited."
 }
-func (BashKill) InputSchema() map[string]any {
+func (Kill) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"job_id"},
@@ -240,14 +240,14 @@ func (BashKill) InputSchema() map[string]any {
 		},
 	}
 }
-func (BashKill) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
-func (k BashKill) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
-	d, src := k.gate.Check(context.Background(), "BashKill", "")
+func (Kill) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (k Kill) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
+	d, src := k.gate.Check(context.Background(), "Kill", "")
 	return mapDecision(d), src
 }
-func (k BashKill) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (k Kill) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	if k.pool == nil {
-		return &tools.Result{Output: "[BashKill unavailable: jobs registry not wired]", IsError: true}, nil
+		return &tools.Result{Output: "[Kill unavailable: jobs registry not wired]", IsError: true}, nil
 	}
 	id, _ := in["job_id"].(string)
 	if id == "" {

@@ -3,7 +3,7 @@ package builtin
 // subagent_jobs.go — model-facing reader tools for the sub-agent pool.
 // SubAgentList / SubAgentOutput / SubAgentStop pair with the Agent tool's
 // `run_in_background:true` handshake (G.1, 2026-05-12), the same way
-// BashList / BashOutput / BashKill pair with Bash run_in_background.
+// bash.List / bash.Output / bash.Kill pair with Bash run_in_background.
 //
 // Layered on top of agent.Roster: the Roster is a single source of
 // truth for live sub-agents (named teammates AND anonymous
@@ -12,7 +12,7 @@ package builtin
 //
 // Mirrors claude-code's TaskList / TaskOutput / TaskStop tools but
 // scoped to sub-agents only (the bash job pool keeps its own
-// BashList/BashOutput/BashKill — having one set of tools per
+// bash.List/bash.Output/bash.Kill — having one set of tools per
 // pool keeps the model's tool-pool list discoverable).
 
 import (

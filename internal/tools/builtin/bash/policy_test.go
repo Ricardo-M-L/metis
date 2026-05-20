@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 import (
 	"strings"
@@ -55,7 +55,7 @@ func TestApplyBashPolicy_NormalizesSubcommand(t *testing.T) {
 func TestApplyBashNetworkPolicy_BlockInjectsProxy(t *testing.T) {
 	in := []string{"PATH=/usr/bin", "HOME=/x"}
 	p := config.SandboxBashSettings{Network: "block"}
-	got := applyBashNetworkPolicy(in, p)
+	got := ApplyNetworkPolicy(in, p)
 	hasProxy := false
 	for _, kv := range got {
 		if strings.HasPrefix(kv, "HTTP_PROXY=http://localhost:0") {
@@ -70,7 +70,7 @@ func TestApplyBashNetworkPolicy_BlockInjectsProxy(t *testing.T) {
 func TestApplyBashNetworkPolicy_DangerouslyAllowSkipsBlock(t *testing.T) {
 	in := []string{"PATH=/usr/bin"}
 	p := config.SandboxBashSettings{Network: "block", DangerouslyAllowNetwork: true}
-	got := applyBashNetworkPolicy(in, p)
+	got := ApplyNetworkPolicy(in, p)
 	for _, kv := range got {
 		if strings.HasPrefix(kv, "HTTP_PROXY=") {
 			t.Errorf("dangerously_allow_network should not inject proxy; got %v", got)
@@ -81,7 +81,7 @@ func TestApplyBashNetworkPolicy_DangerouslyAllowSkipsBlock(t *testing.T) {
 func TestApplyBashNetworkPolicy_DefaultPassthrough(t *testing.T) {
 	in := []string{"PATH=/usr/bin", "HTTP_PROXY=http://corp:8080"}
 	p := config.SandboxBashSettings{Network: "default"}
-	got := applyBashNetworkPolicy(in, p)
+	got := ApplyNetworkPolicy(in, p)
 	if len(got) != len(in) {
 		t.Errorf("default mode should not add/remove env: %v", got)
 	}

@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 // bash_args_blocker.go — structured (cmd, sub-command, flag) tuple
 // matcher for "this looks safe but actually escapes the sandbox".

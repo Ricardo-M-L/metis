@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 import (
 	"errors"
@@ -26,7 +26,7 @@ func applyBashPolicy(cmd string, p config.SandboxBashSettings) error {
 	if len(parts) == 0 {
 		return errors.New("empty command")
 	}
-	cmdName := normalizeCommand(parts[0])
+	cmdName := NormalizeCommand(parts[0])
 
 	for _, d := range p.Deny {
 		if d == "" {
@@ -58,14 +58,14 @@ func applyBashPolicy(cmd string, p config.SandboxBashSettings) error {
 	return nil
 }
 
-// applyBashNetworkPolicy mutates a child process env slice based on the
+// ApplyNetworkPolicy mutates a child process env slice based on the
 // network setting. Only the `block` mode does anything — it injects bogus
 // proxy values that make outbound curl/wget connections fail fast.
 //
 // This is NOT a real network sandbox; it's a "make casual exfiltration painful"
 // guardrail. A determined adversary can clear HTTP_PROXY in their own command.
 // For real isolation, use OS-level tools (Docker, unshare) outside Metis.
-func applyBashNetworkPolicy(env []string, p config.SandboxBashSettings) []string {
+func ApplyNetworkPolicy(env []string, p config.SandboxBashSettings) []string {
 	if p.DangerouslyAllowNetwork {
 		return env
 	}

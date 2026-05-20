@@ -14,6 +14,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -75,7 +76,7 @@ func TestMetisInfo_FullDump(t *testing.T) {
 	cfg := newTestCfg()
 	pool := jobs.NewRegistry(t.TempDir())
 	reg := tools.NewRegistry()
-	reg.Register(Bash{})
+	reg.Register(bash.Bash{})
 	tool := NewMetisInfo(gate, cfg, pool, nil, reg)
 
 	res, err := tool.Execute(context.Background(), nil)

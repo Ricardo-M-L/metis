@@ -3,7 +3,7 @@ package builtin
 // monitor.go — Monitor tool. Spawns a background command (same path as
 // `Bash --run_in_background=true`) AND attaches a per-line pattern
 // watcher; matches push <monitor_event> system-reminders into the next
-// model turn so the agent reacts without having to poll BashOutput.
+// model turn so the agent reacts without having to poll bash.Output.
 //
 // Pattern parity:
 //   - claude-code's Monitor tool — single-script "tell me each time
@@ -28,6 +28,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -160,8 +161,8 @@ func (m Monitor) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 		shell = "/bin/bash"
 	}
 	exe := jobs.OOMWrappedCommand(bgCtx, shell, cmd)
-	exe.Env = filterEnv(os.Environ(), m.settings.Sandbox.DangerouslyInheritEnv)
-	exe.Env = applyBashNetworkPolicy(exe.Env, m.settings.Sandbox)
+	exe.Env = bash.FilterEnv(os.Environ(), m.settings.Sandbox.DangerouslyInheritEnv)
+	exe.Env = bash.ApplyNetworkPolicy(exe.Env, m.settings.Sandbox)
 	jobs.ApplyProcessGroup(exe)
 
 	jb, err := m.Jobs.Spawn(jobs.SpawnArgs{
@@ -181,7 +182,7 @@ func (m Monitor) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 		Output: fmt.Sprintf(
 			"[monitor active, job_id=%s, %d pattern(s)] watching: %s\n"+
 				"Each matching line becomes a <monitor_event> on your next turn.\n"+
-				"Use BashOutput {job_id: %q} to read context, BashKill {job_id: %q} to stop.",
+				"Use bash.Output {job_id: %q} to read context, bash.Kill {job_id: %q} to stop.",
 			jb.ID, len(patterns), desc, jb.ID, jb.ID,
 		),
 	}, nil

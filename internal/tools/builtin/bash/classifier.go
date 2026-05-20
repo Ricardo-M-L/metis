@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 import (
 	"regexp"
@@ -161,11 +161,11 @@ type ClassifierHook func(cmd string) *Classification
 // non-nil result it overrides the rule-based classification.
 var Hook ClassifierHook
 
-// normalizeCommand strips a trailing variant suffix from a base command.
+// NormalizeCommand strips a trailing variant suffix from a base command.
 // Example: "mkfs.ext4" → "mkfs", "systemctl.bin" → "systemctl". The base
 // word always wins so dangerousCmds/systemCmds lookups don't miss
 // distribution-specific spellings.
-func normalizeCommand(cmd string) string {
+func NormalizeCommand(cmd string) string {
 	if i := strings.IndexByte(cmd, '.'); i > 0 {
 		return cmd[:i]
 	}
@@ -191,7 +191,7 @@ func (c *BashClassifier) Classify(cmd string) Classification {
 	}
 
 	rawCommand := parts[0]
-	command := normalizeCommand(rawCommand)
+	command := NormalizeCommand(rawCommand)
 	args := parts[1:]
 
 	// Check dangerous flags/patterns first

@@ -6,6 +6,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -54,7 +55,7 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 		Read{gate: gate, state: sessionReadState},
 		Write{gate: gate, state: sessionReadState},
 		Edit{gate: gate, state: sessionReadState},
-		Bash{gate: gate, settings: cfg.Tools.Bash},
+		bash.New(gate, cfg.Tools.Bash),
 		LS{gate: gate},
 		Glob{gate: gate},
 		Grep{gate: gate},

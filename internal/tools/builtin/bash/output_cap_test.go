@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 // bash_output_cap_test.go — pins the default Bash output byte cap.
 //

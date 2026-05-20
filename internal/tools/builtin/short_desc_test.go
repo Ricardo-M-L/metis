@@ -3,6 +3,8 @@ package builtin
 import (
 	"strings"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
 
 // shortDescriptor is the optional interface — the real definition
@@ -19,7 +21,7 @@ func TestCoreTools_HaveShortDescription(t *testing.T) {
 		name string
 		tool shortDescriptor
 	}{
-		{"Bash", Bash{}},
+		{"Bash", bash.Bash{}},
 		{"Edit", Edit{}},
 		{"Write", Write{}},
 		{"Read", Read{}},
@@ -46,7 +48,7 @@ func TestCoreTools_HaveShortDescription(t *testing.T) {
 // the full `# Tool selection` table in base.md still get nudged away
 // from cat/find when Bash is the wrong choice.
 func TestBash_ShortDescription_HasRedirectHint(t *testing.T) {
-	short := Bash{}.ShortDescription()
+	short := bash.Bash{}.ShortDescription()
 	if !strings.Contains(strings.ToLower(short), "read") {
 		t.Errorf("Bash short desc should mention Read as a redirect; got:\n%s", short)
 	}

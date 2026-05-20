@@ -1,6 +1,8 @@
 package builtin
 
-import "github.com/Ricardo-M-L/metis/internal/tools"
+import (
+	"github.com/Ricardo-M-L/metis/internal/tools"
+)
 
 // This file collects the optional capability methods (IsReadOnly,
 // IsDestructive, RequiresUserInteraction, InterruptBehavior) for the
@@ -48,11 +50,9 @@ func (TaskOutput) IsReadOnly(map[string]any) bool { return true }
 func (SubAgentList) IsReadOnly(map[string]any) bool   { return true }
 func (SubAgentOutput) IsReadOnly(map[string]any) bool { return true }
 
-// BashList / BashOutput are the same shape: enumerate the bash-job
-// pool / tail a background command's tee. Read-only. (BashKill is
+// bash.List / bash.Output are the same shape: enumerate the bash-job
+// pool / tail a background command's tee. Read-only. (bash.Kill is
 // the destructive counterpart and is NOT marked here.)
-func (BashList) IsReadOnly(map[string]any) bool   { return true }
-func (BashOutput) IsReadOnly(map[string]any) bool { return true }
 
 // LSP queries language-server diagnostics — read-only.
 func (LSP) IsReadOnly(map[string]any) bool { return true }
@@ -123,7 +123,6 @@ func (AskUser) RequiresUserInteraction() bool { return true }
 // Bash defaults to InterruptBlock: a half-finished `make install`
 // is worse than a fully-finished one. The user asks for cancel via
 // ^C^C double-tap if they really mean it.
-func (Bash) InterruptBehavior() tools.InterruptBehavior { return tools.InterruptBlock }
 
 // SendMessage is unrecallable; if it's already in-flight to the
 // channel adapter, we can't yank it back. Block for completion so

@@ -1,4 +1,4 @@
-package builtin
+package bash
 
 import (
 	"strings"
@@ -53,7 +53,7 @@ var blockedEnvPrefixes = []string{
 	"OPENROUTER_",
 }
 
-// filterEnv returns environ with any sensitive variable stripped.
+// FilterEnv returns environ with any sensitive variable stripped.
 // Pass-through if dangerouslyInherit is true.
 //
 // Always-set markers: every spawned bash receives `AGENT=metis`,
@@ -63,7 +63,7 @@ var blockedEnvPrefixes = []string{
 // interactive prompts (`gh auth login`'s pager, `git commit`'s editor,
 // `npm`'s spinner, etc.). Without these markers, agents that exec
 // long-running tools blocked at "press any key" prompts.
-func filterEnv(environ []string, dangerouslyInherit bool) []string {
+func FilterEnv(environ []string, dangerouslyInherit bool) []string {
 	out := make([]string, 0, len(environ)+3)
 	if dangerouslyInherit {
 		out = append(out, environ...)

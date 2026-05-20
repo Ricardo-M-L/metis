@@ -16,6 +16,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
 
 // ToolRegistryOptions bundles inputs BuildToolRegistry needs from the
@@ -92,7 +93,7 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// tools. Done as a post-step so builtin.Register can stay
 	// dependency-free (jobs is a leaf package the runtime owns).
 	if opts.Jobs != nil {
-		builtin.AttachJobsRegistry(reg, opts.Jobs, opts.Gate)
+		bash.AttachJobsRegistry(reg, opts.Jobs, opts.Gate)
 		if opts.Monitors != nil {
 			builtin.AttachMonitorRegistry(reg, opts.Jobs, opts.Monitors, opts.Gate, opts.Cfg.Tools.Bash)
 		}
