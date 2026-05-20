@@ -765,28 +765,49 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Cross-project
 positioning lives in [`../COMPARISON.md`](../COMPARISON.md).
 
 ```
-cmd/metis/                main, auth, plugin, trust subcommands
-pkg/                      public SDK (provider, tool, hook, channel,
-                          skill, memory, session, plugin, llm.Effort)
-internal/llm/             Anthropic / OpenAI / Gemini stream parsers
-internal/tools/           Tool interface + registry
-internal/tools/builtin/   first-party tools (Read/Write/Edit/Bash/Glob/
-                          Grep/LS/Git/WebFetch/WebSearch/WebBrowse/
-                          NotebookEdit/Todo/Ask/LSP/Task* + plan-mode)
-internal/permission/      Cascading rule gate + 5 modes
-internal/agent/           Loop, dispatch, streaming, compaction,
-                          hooks, plan, skills, cron, loop-detection
-internal/agent/skills/    SKILL.md loader (5 layers: bundled / user /
-                          project / plugin / mcp), 23 bundled skills
-internal/mcp/             stdio + Streamable HTTP/SSE clients
-internal/channels/        9 chat-platform adapters
-internal/memory/          Core/Archival/Recall + daily notes + freshness
-internal/session/         JSONL persistence, branch + snapshot
-internal/runtime/         composer helpers (provider, channels, mcp,
-                          plugin, system_prompt, plan_archive, …)
-internal/tui/             bubbletea TUI (~76 files)
-install/                  curl + npm installer wrappers
+cmd/metis/                       main + per-CLI-subcommand files
+                                 (auth/diag/dirs/plugin/stats/trust/…)
+pkg/                             public SDK (provider, tool, hook,
+                                 channel, skill, memory, session,
+                                 plugin, llm.Effort)
+internal/llm/                    Anthropic / OpenAI / Gemini stream parsers
+internal/llm/transport/          shared HTTP client + retry / dump / log
+internal/tools/                  Tool interface + registry
+internal/tools/builtin/          first-party tools (Read/Write/Edit/Glob/
+                                 Grep/LS/Git/WebFetch/WebSearch/WebBrowse/
+                                 NotebookEdit/Todo/Ask/LSP/Task* + plan-mode)
+internal/tools/builtin/bash/     Bash tool family (Bash + List/Output/Kill
+                                 jobs + classifier + security rules)
+internal/permission/             cascading rule gate + 5 modes
+internal/agent/                  Loop, dispatch, streaming, compaction,
+                                 hooks, plan, cron, loop-detection,
+                                 verdict gate, stuck/progress detectors,
+                                 orphan-tool-use repair
+internal/agent/skills/           SKILL.md loader (5 layers: bundled /
+                                 user / project / plugin / mcp), 23
+                                 bundled skills
+internal/agent/transcript/       per-run transcript persistence
+internal/mcp/                    stdio + Streamable HTTP/SSE clients
+internal/channels/               9 chat-platform adapters
+internal/memory/                 Core/Archival/Recall + daily notes
+internal/session/                JSONL persistence, branch + snapshot
+internal/runtime/                composer helpers (provider, channels,
+                                 plugin, system_prompt, plan_archive, …)
+internal/runtime/mcp/            MCP registry + cache + prompts collector
+internal/slash/                  slash-command registry + handlers
+internal/tui/                    bubbletea TUI (~83 files)
+internal/tui/screen/             full-screen overlays (help/history/…)
+internal/exitcode/               typed errors → shell exit codes
+                                 (incl. IncompleteError → 11)
+internal/jobs/                   background process pool (job-aware Bash)
+install/                         curl + npm installer wrappers
 ```
+
+Several internal packages carry a `README.md` documenting their
+file-naming convention and "where to find X" pointers — see
+`internal/tui/`, `internal/agent/`, `internal/tools/builtin/`,
+`internal/runtime/`, `internal/llm/transport/`, `internal/slash/`,
+and `internal/agent/skills/`.
 
 ## License
 
