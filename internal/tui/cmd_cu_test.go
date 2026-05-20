@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 )
 
 // withTempCuEnv routes ~/.metis at a t.TempDir() and stages a fake
@@ -70,7 +70,7 @@ func TestCU_EnableThenStatus(t *testing.T) {
 	}
 
 	// Verify mcp.toml on disk.
-	mcpPath := rtpkg.MCPPath()
+	mcpPath := mcp.Path()
 	data, err := os.ReadFile(mcpPath)
 	if err != nil {
 		t.Fatalf("read mcp.toml: %v", err)
@@ -122,7 +122,7 @@ func TestCU_EnableNoBinary(t *testing.T) {
 		t.Errorf("enable without binary should mention 'not in PATH'; got: %q", out)
 	}
 	// Must NOT have written mcp.toml.
-	if _, err := os.Stat(rtpkg.MCPPath()); err == nil {
+	if _, err := os.Stat(mcp.Path()); err == nil {
 		t.Errorf("enable without binary must not write mcp.toml")
 	}
 }

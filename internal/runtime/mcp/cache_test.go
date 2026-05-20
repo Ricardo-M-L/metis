@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 // mcp_cache_test.go — locks the on-disk schema cache + lazy-launch
 // behavior added in P7. Coverage focuses on the cache key (fingerprint
@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
-	"github.com/Ricardo-M-L/metis/internal/mcp"
+	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 )
 
 // setMetisHome redirects config.Home() to a temp dir for the duration
@@ -40,7 +40,7 @@ func setMetisHome(t *testing.T) string {
 // flaps on every restart. Map iteration order is the usual source of
 // drift; we sort keys explicitly in FingerprintEntry to defuse it.
 func TestFingerprintEntry_StableForIdenticalInput(t *testing.T) {
-	e := MCPServerEntry{
+	e := ServerEntry{
 		Name:    "test",
 		Command: "/usr/bin/python",
 		Args:    []string{"-m", "mcp_server"},
@@ -63,22 +63,22 @@ func TestFingerprintEntry_StableForIdenticalInput(t *testing.T) {
 // invalidate the cache and the user would silently keep using stale
 // schemas.
 func TestFingerprintEntry_ChangesOnAnyField(t *testing.T) {
-	base := MCPServerEntry{
+	base := ServerEntry{
 		Command: "a", Args: []string{"x"}, URL: "u",
 		Headers: map[string]string{"h": "1"},
 	}
 	baseFP := FingerprintEntry(base)
 	mutants := []struct {
 		label string
-		mut   func(*MCPServerEntry)
+		mut   func(*ServerEntry)
 	}{
-		{"command", func(e *MCPServerEntry) { e.Command = "b" }},
-		{"args", func(e *MCPServerEntry) { e.Args = []string{"y"} }},
-		{"args-additional", func(e *MCPServerEntry) { e.Args = []string{"x", "extra"} }},
-		{"url", func(e *MCPServerEntry) { e.URL = "v" }},
-		{"header-value", func(e *MCPServerEntry) { e.Headers = map[string]string{"h": "2"} }},
-		{"header-key", func(e *MCPServerEntry) { e.Headers = map[string]string{"j": "1"} }},
-		{"header-extra", func(e *MCPServerEntry) { e.Headers = map[string]string{"h": "1", "k": "2"} }},
+		{"command", func(e *ServerEntry) { e.Command = "b" }},
+		{"args", func(e *ServerEntry) { e.Args = []string{"y"} }},
+		{"args-additional", func(e *ServerEntry) { e.Args = []string{"x", "extra"} }},
+		{"url", func(e *ServerEntry) { e.URL = "v" }},
+		{"header-value", func(e *ServerEntry) { e.Headers = map[string]string{"h": "2"} }},
+		{"header-key", func(e *ServerEntry) { e.Headers = map[string]string{"j": "1"} }},
+		{"header-extra", func(e *ServerEntry) { e.Headers = map[string]string{"h": "1", "k": "2"} }},
 	}
 	for _, m := range mutants {
 		t.Run(m.label, func(t *testing.T) {
@@ -95,8 +95,8 @@ func TestFingerprintEntry_ChangesOnAnyField(t *testing.T) {
 // invalidate the cache if the launch identity (command/args/url/headers)
 // is unchanged. The file name on disk handles the rename dimension.
 func TestFingerprintEntry_NameNotIncluded(t *testing.T) {
-	a := MCPServerEntry{Name: "old", Command: "c"}
-	b := MCPServerEntry{Name: "new", Command: "c"}
+	a := ServerEntry{Name: "old", Command: "c"}
+	b := ServerEntry{Name: "new", Command: "c"}
 	if FingerprintEntry(a) != FingerprintEntry(b) {
 		t.Errorf("rename shouldn't change fingerprint")
 	}
@@ -108,7 +108,7 @@ func TestFingerprintEntry_NameNotIncluded(t *testing.T) {
 // "is this just a missing file vs a real read error" everywhere.
 func TestLoadMCPCache_MissingFileReturnsNil(t *testing.T) {
 	setMetisHome(t)
-	got, err := LoadMCPCache("never-existed")
+	got, err := LoadCache("never-existed")
 	if err != nil {
 		t.Errorf("missing cache should return nil, nil; got err=%v", err)
 	}
@@ -129,7 +129,7 @@ func TestLoadMCPCache_MalformedJSONErrors(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cacheDir, "broken.json"), []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadMCPCache("broken")
+	_, err := LoadCache("broken")
 	if err == nil {
 		t.Errorf("malformed cache should error; got nil")
 	}
@@ -140,20 +140,20 @@ func TestLoadMCPCache_MalformedJSONErrors(t *testing.T) {
 // permissions / location are correct.
 func TestSaveLoadMCPCache_RoundTrip(t *testing.T) {
 	setMetisHome(t)
-	want := &MCPCache{
+	want := &Cache{
 		Fingerprint: "sha256:test",
 		Tools: []CachedTool{
 			{Name: "alpha", Description: "first", InputSchema: map[string]any{"type": "object"}},
 			{Name: "beta", Description: "second", InputSchema: map[string]any{"type": "object", "x": 1.0}},
 		},
 	}
-	if err := SaveMCPCache("svr", want); err != nil {
+	if err := SaveCache("svr", want); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if want.CachedAt == "" {
-		t.Errorf("SaveMCPCache should populate CachedAt; got empty")
+		t.Errorf("SaveCache should populate CachedAt; got empty")
 	}
-	got, err := LoadMCPCache("svr")
+	got, err := LoadCache("svr")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -181,14 +181,14 @@ func TestSaveLoadMCPCache_RoundTrip(t *testing.T) {
 }
 
 // TestSaveMCPCache_FilePerms — cache files contain command lines and
-// tool params that may reveal sensitive paths. Match SaveMCP's
+// tool params that may reveal sensitive paths. Match Save's
 // stance: 0o600.
 func TestSaveMCPCache_FilePerms(t *testing.T) {
 	setMetisHome(t)
-	if err := SaveMCPCache("perm", &MCPCache{Fingerprint: "x"}); err != nil {
+	if err := SaveCache("perm", &Cache{Fingerprint: "x"}); err != nil {
 		t.Fatal(err)
 	}
-	st, err := os.Stat(MCPCachePath("perm"))
+	st, err := os.Stat(CachePath("perm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestSaveMCPCache_FilePerms(t *testing.T) {
 // or "cache fingerprint mismatch on every save" — easier to catch
 // here than at integration time.
 func TestCachedToolsToMCPTools_RoundTrip(t *testing.T) {
-	original := []mcp.Tool{
+	original := []mcpsdk.Tool{
 		{Name: "a", Description: "d1", InputSchema: map[string]any{"t": "object"}},
 		{Name: "b", Description: "d2", InputSchema: map[string]any{"t": "object", "n": 2.0}},
 	}
@@ -225,12 +225,12 @@ func TestCachedToolsToMCPTools_RoundTrip(t *testing.T) {
 }
 
 // TestParseLazyMCPMode — the env-var matrix. Locks the documented
-// aliases ("true"/"yes"/"1") so a refactor of ParseLazyMCPMode can't
+// aliases ("true"/"yes"/"1") so a refactor of ParseLazyMode can't
 // silently change which strings switch to "always".
 func TestParseLazyMCPMode(t *testing.T) {
 	cases := []struct {
 		in   string
-		want LazyMCPMode
+		want LazyMode
 	}{
 		{"", LazyMCPModeAuto},
 		{"auto", LazyMCPModeAuto},
@@ -249,8 +249,8 @@ func TestParseLazyMCPMode(t *testing.T) {
 		{"off", LazyMCPModeNever},
 	}
 	for _, c := range cases {
-		if got := ParseLazyMCPMode(c.in); got != c.want {
-			t.Errorf("ParseLazyMCPMode(%q) = %d, want %d", c.in, got, c.want)
+		if got := ParseLazyMode(c.in); got != c.want {
+			t.Errorf("ParseLazyMode(%q) = %d, want %d", c.in, got, c.want)
 		}
 	}
 }

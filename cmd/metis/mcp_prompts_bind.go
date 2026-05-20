@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
@@ -21,7 +21,7 @@ import (
 //
 // Returns the registered slash names so the caller can log "loaded N
 // MCP prompts" at startup if it wants to.
-func registerMCPPromptsAsSlash(r *slash.Registry, handles []rtpkg.MCPPromptHandle) []string {
+func registerMCPPromptsAsSlash(r *slash.Registry, handles []mcp.PromptHandle) []string {
 	if r == nil {
 		return nil
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -1109,7 +1110,7 @@ func cmdMCP(r *REPL, args string) string {
 }
 
 func (r *REPL) handleMCPList() string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
@@ -1117,7 +1118,7 @@ func (r *REPL) handleMCPList() string {
 		return "(no MCP servers — try `mcp add <name> <command>`)"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d MCP server(s) registered (in %s):\n", len(reg.Servers), runtime.MCPPath())
+	fmt.Fprintf(&b, "%d MCP server(s) registered (in %s):\n", len(reg.Servers), mcp.Path())
 	for _, s := range reg.Servers {
 		state := "enabled"
 		if s.Disabled {
@@ -1166,15 +1167,15 @@ func parseMCPAddFlags(tokens []string) (map[string]string, []string, error) {
 }
 
 func (r *REPL) handleMCPAdd(name, command string, args []string, env map[string]string) string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
-	existed := runtime.FindMCPServer(reg, name) != nil
-	if err := runtime.AddMCPServerWithEnv(reg, name, command, args, env); err != nil {
+	existed := mcp.FindServer(reg, name) != nil
+	if err := mcp.AddServerWithEnv(reg, name, command, args, env); err != nil {
 		return "mcp: " + err.Error()
 	}
-	if err := runtime.SaveMCP(reg); err != nil {
+	if err := mcp.Save(reg); err != nil {
 		return "mcp: save: " + err.Error()
 	}
 	// User-confusion guardrail: if the "command" they typed looks like
@@ -1221,14 +1222,14 @@ func looksLikeURLHint(command, name string) string {
 }
 
 func (r *REPL) handleMCPRemove(name string) string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
-	if !runtime.RemoveMCPServer(reg, name) {
+	if !mcp.RemoveServer(reg, name) {
 		return "(no MCP server named: " + name + ")"
 	}
-	if err := runtime.SaveMCP(reg); err != nil {
+	if err := mcp.Save(reg); err != nil {
 		return "mcp: save: " + err.Error()
 	}
 	return "(removed MCP server: " + name + ")"
@@ -1242,13 +1243,13 @@ func (r *REPL) handleMCPRemove(name string) string {
 // struct that owns mcp child processes. For now, the OS reaps subprocesses
 // on metis exit.
 func (r *REPL) handleMCPStart(name string) string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	srv, err := runtime.LaunchMCPServer(ctx, reg, name, r.Loop.Registry)
+	srv, err := mcp.LaunchServer(ctx, reg, name, r.Loop.Registry)
 	if err != nil {
 		return "mcp start: " + err.Error()
 	}

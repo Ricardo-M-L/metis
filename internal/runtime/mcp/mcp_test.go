@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 import (
 	"os"
@@ -8,7 +8,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 )
 
-// withTempHome scopes any MCPPath() reads/writes to a fresh temp dir.
+// withTempHome scopes any Path() reads/writes to a fresh temp dir.
 func withTempHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -18,9 +18,9 @@ func withTempHome(t *testing.T) string {
 
 func TestLoadMCP_MissingFileReturnsEmpty(t *testing.T) {
 	withTempHome(t)
-	r, err := LoadMCP()
+	r, err := Load()
 	if err != nil {
-		t.Fatalf("LoadMCP missing should not error: %v", err)
+		t.Fatalf("Load missing should not error: %v", err)
 	}
 	if len(r.Servers) != 0 {
 		t.Errorf("missing file should yield empty servers; got %d", len(r.Servers))
@@ -29,16 +29,16 @@ func TestLoadMCP_MissingFileReturnsEmpty(t *testing.T) {
 
 func TestAddSaveLoadRoundTrip(t *testing.T) {
 	withTempHome(t)
-	r := &MCPRegistry{}
-	if err := AddMCPServer(r, "fs", "mcp-fs", []string{"--root", "/tmp"}); err != nil {
-		t.Fatalf("AddMCPServer: %v", err)
+	r := &Registry{}
+	if err := AddServer(r, "fs", "mcp-fs", []string{"--root", "/tmp"}); err != nil {
+		t.Fatalf("AddServer: %v", err)
 	}
-	if err := SaveMCP(r); err != nil {
-		t.Fatalf("SaveMCP: %v", err)
+	if err := Save(r); err != nil {
+		t.Fatalf("Save: %v", err)
 	}
-	got, err := LoadMCP()
+	got, err := Load()
 	if err != nil {
-		t.Fatalf("LoadMCP: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
 	if len(got.Servers) != 1 {
 		t.Fatalf("len = %d, want 1", len(got.Servers))
@@ -54,10 +54,10 @@ func TestAddSaveLoadRoundTrip(t *testing.T) {
 
 func TestSaveMCP_FilePerm0600(t *testing.T) {
 	withTempHome(t)
-	if err := SaveMCP(&MCPRegistry{}); err != nil {
-		t.Fatalf("SaveMCP: %v", err)
+	if err := Save(&Registry{}); err != nil {
+		t.Fatalf("Save: %v", err)
 	}
-	st, err := os.Stat(MCPPath())
+	st, err := os.Stat(Path())
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
@@ -67,19 +67,19 @@ func TestSaveMCP_FilePerm0600(t *testing.T) {
 }
 
 func TestAdd_RejectsEmpty(t *testing.T) {
-	r := &MCPRegistry{}
-	if err := AddMCPServer(r, "", "x", nil); err == nil {
+	r := &Registry{}
+	if err := AddServer(r, "", "x", nil); err == nil {
 		t.Error("empty name should error")
 	}
-	if err := AddMCPServer(r, "x", "", nil); err == nil {
+	if err := AddServer(r, "x", "", nil); err == nil {
 		t.Error("empty command should error")
 	}
 }
 
 func TestAdd_ReplacesExisting(t *testing.T) {
-	r := &MCPRegistry{}
-	_ = AddMCPServer(r, "fs", "old-bin", []string{"--v1"})
-	_ = AddMCPServer(r, "fs", "new-bin", []string{"--v2"})
+	r := &Registry{}
+	_ = AddServer(r, "fs", "old-bin", []string{"--v1"})
+	_ = AddServer(r, "fs", "new-bin", []string{"--v2"})
 	if len(r.Servers) != 1 {
 		t.Fatalf("re-add should replace; len = %d", len(r.Servers))
 	}
@@ -89,35 +89,35 @@ func TestAdd_ReplacesExisting(t *testing.T) {
 }
 
 func TestRemoveMCPServer(t *testing.T) {
-	r := &MCPRegistry{}
-	_ = AddMCPServer(r, "a", "x", nil)
-	_ = AddMCPServer(r, "b", "y", nil)
+	r := &Registry{}
+	_ = AddServer(r, "a", "x", nil)
+	_ = AddServer(r, "b", "y", nil)
 
-	if !RemoveMCPServer(r, "a") {
+	if !RemoveServer(r, "a") {
 		t.Error("Remove existing should return true")
 	}
 	if len(r.Servers) != 1 || r.Servers[0].Name != "b" {
 		t.Errorf("after remove, expected only 'b'; got %+v", r.Servers)
 	}
-	if RemoveMCPServer(r, "missing") {
+	if RemoveServer(r, "missing") {
 		t.Error("Remove of non-existent should return false")
 	}
 }
 
 func TestFindMCPServer(t *testing.T) {
-	r := &MCPRegistry{}
-	_ = AddMCPServer(r, "fs", "mcp-fs", nil)
-	if got := FindMCPServer(r, "fs"); got == nil || got.Name != "fs" {
+	r := &Registry{}
+	_ = AddServer(r, "fs", "mcp-fs", nil)
+	if got := FindServer(r, "fs"); got == nil || got.Name != "fs" {
 		t.Errorf("Find existing failed: %+v", got)
 	}
-	if got := FindMCPServer(r, "missing"); got != nil {
+	if got := FindServer(r, "missing"); got != nil {
 		t.Errorf("Find missing should return nil; got %+v", got)
 	}
 }
 
 func TestMergeWithConfig_DoesNotClobberMCPToml(t *testing.T) {
-	r := &MCPRegistry{}
-	_ = AddMCPServer(r, "fs", "user-bin", []string{"--user"})
+	r := &Registry{}
+	_ = AddServer(r, "fs", "user-bin", []string{"--user"})
 
 	cfgServers := []config.MCPServer{
 		{Name: "fs", Command: "config-bin", Args: []string{"--config"}},
@@ -126,12 +126,12 @@ func TestMergeWithConfig_DoesNotClobberMCPToml(t *testing.T) {
 	r.MergeWithConfig(cfgServers)
 
 	// fs should still point at user-bin (mcp.toml wins)
-	fs := FindMCPServer(r, "fs")
+	fs := FindServer(r, "fs")
 	if fs == nil || fs.Command != "user-bin" {
 		t.Errorf("config clobbered runtime entry; got %+v", fs)
 	}
 	// browser was new — should be appended
-	br := FindMCPServer(r, "browser")
+	br := FindServer(r, "browser")
 	if br == nil || br.Command != "browser-bin" {
 		t.Errorf("config-only entry not merged; got %+v", br)
 	}
@@ -140,7 +140,7 @@ func TestMergeWithConfig_DoesNotClobberMCPToml(t *testing.T) {
 func TestSavePath(t *testing.T) {
 	dir := withTempHome(t)
 	want := filepath.Join(dir, "mcp.toml")
-	if got := MCPPath(); got != want {
-		t.Errorf("MCPPath = %q, want %q", got, want)
+	if got := Path(); got != want {
+		t.Errorf("Path = %q, want %q", got, want)
 	}
 }

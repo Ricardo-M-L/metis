@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 // mcp_env.go — environment variable expansion for MCP server entries.
 //
@@ -70,9 +70,9 @@ func expandEnvVarsInString(s string) (expanded string, missing []string) {
 
 // expandEnvVarsInEntry returns a copy of the entry with ${VAR} expanded
 // in command, args, url, and headers. The original entry is NOT mutated
-// — env-baked values stay out of mcp.toml on the next SaveMCP. Missing
+// — env-baked values stay out of mcp.toml on the next Save. Missing
 // variables collect deduped across all fields.
-func expandEnvVarsInEntry(e MCPServerEntry) (expanded MCPServerEntry, missing []string) {
+func expandEnvVarsInEntry(e ServerEntry) (expanded ServerEntry, missing []string) {
 	seen := map[string]struct{}{}
 	addMissing := func(vars []string) {
 		for _, v := range vars {
@@ -82,7 +82,7 @@ func expandEnvVarsInEntry(e MCPServerEntry) (expanded MCPServerEntry, missing []
 			}
 		}
 	}
-	expanded = MCPServerEntry{
+	expanded = ServerEntry{
 		Name:     e.Name,
 		Disabled: e.Disabled,
 	}

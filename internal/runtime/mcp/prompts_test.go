@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 // Phase-D #40 tests — exercise the pure-string helpers (description
 // formatting, arg name flattening). The actual collector talks to a
@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Ricardo-M-L/metis/internal/mcp"
+	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 )
 
 func TestArgNames_FlagsOptional(t *testing.T) {
-	args := []mcp.PromptArgument{
+	args := []mcpsdk.PromptArgument{
 		{Name: "repo", Required: true},
 		{Name: "limit", Required: false},
 	}
@@ -30,7 +30,7 @@ func TestArgNames_FlagsOptional(t *testing.T) {
 }
 
 func TestPromptDescription_DefaultWhenEmpty(t *testing.T) {
-	h := &MCPPromptHandle{
+	h := &PromptHandle{
 		SlashName:  "mcp__github__pr_summary",
 		ServerName: "github",
 		PromptName: "pr_summary",
@@ -42,7 +42,7 @@ func TestPromptDescription_DefaultWhenEmpty(t *testing.T) {
 }
 
 func TestPromptDescription_WithArgsListed(t *testing.T) {
-	h := &MCPPromptHandle{
+	h := &PromptHandle{
 		SlashName:   "mcp__github__pr_summary",
 		ServerName:  "github",
 		PromptName:  "pr_summary",

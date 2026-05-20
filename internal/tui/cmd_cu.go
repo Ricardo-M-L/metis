@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 )
 
 // cuServerName is the MCP-side name we hardcode. It mirrors Anthropic's
@@ -62,21 +62,21 @@ func cuEnable(r *REPL) string {
 		return fmt.Sprintf("cu: %s not in PATH — install via: cd metis-cu && make install\n  (or: go install github.com/Ricardo-M-L/metis-cu@latest)", cuBinaryName)
 	}
 
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "cu: load mcp.toml: " + err.Error()
 	}
 	// Use the dedicated SetReservedComputerUseServer rather than
 	// AddMCPServer — AddMCPServer refuses the reserved name (it's the
 	// guardrail for `/mcp add computer-use ...`). /cu owns this slot.
-	existed := runtime.SetReservedComputerUseServer(reg)
+	existed := mcp.SetReservedComputerUseServer(reg)
 	// SetReservedComputerUseServer leaves Disabled at its prior value
 	// when replacing; force enabled so re-running `/cu enable` after
 	// `/cu disable` actually flips it back on.
-	if e := runtime.FindMCPServer(reg, cuServerName); e != nil {
+	if e := mcp.FindServer(reg, cuServerName); e != nil {
 		e.Disabled = false
 	}
-	if err := runtime.SaveMCP(reg); err != nil {
+	if err := mcp.Save(reg); err != nil {
 		return "cu: save: " + err.Error()
 	}
 
@@ -86,7 +86,7 @@ func cuEnable(r *REPL) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if r != nil && r.Loop != nil && r.Loop.Registry != nil {
-		srv, err := runtime.LaunchMCPServer(ctx, reg, cuServerName, r.Loop.Registry)
+		srv, err := mcp.LaunchServer(ctx, reg, cuServerName, r.Loop.Registry)
 		if err != nil {
 			// Persistence already succeeded — the next metis start
 			// will spawn it. Surface the live-load error so the user
@@ -115,14 +115,14 @@ func cuEnable(r *REPL) string {
 }
 
 func cuDisable() string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "cu: load mcp.toml: " + err.Error()
 	}
-	if !runtime.RemoveMCPServer(reg, cuServerName) {
+	if !mcp.RemoveServer(reg, cuServerName) {
 		return "cu: not enabled (no `" + cuServerName + "` entry in mcp.toml)"
 	}
-	if err := runtime.SaveMCP(reg); err != nil {
+	if err := mcp.Save(reg); err != nil {
 		return "cu: save: " + err.Error()
 	}
 	return "cu: disabled — tools remain in this session until restart"
@@ -137,11 +137,11 @@ func cuStatus() string {
 	if lookErr != nil {
 		binState = "not found in PATH"
 	}
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "cu: load mcp.toml: " + err.Error()
 	}
-	entry := runtime.FindMCPServer(reg, cuServerName)
+	entry := mcp.FindServer(reg, cuServerName)
 	switch {
 	case entry == nil:
 		return fmt.Sprintf("cu: not enabled. binary: %s\n  run `/cu enable` to register + hot-load", binState)

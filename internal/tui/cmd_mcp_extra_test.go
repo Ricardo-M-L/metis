@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 )
 
 // withTempMcpHome reroutes config.Home() at a fresh tmpdir so each test
@@ -32,12 +32,12 @@ func withTempMcpHome(t *testing.T) string {
 // disable/edit/reload paths have something to mutate.
 func seedMCP(t *testing.T, name, command string, disabled bool) {
 	t.Helper()
-	reg := &rtpkg.MCPRegistry{
-		Servers: []rtpkg.MCPServerEntry{{
+	reg := &mcp.Registry{
+		Servers: []mcp.ServerEntry{{
 			Name: name, Command: command, Disabled: disabled,
 		}},
 	}
-	if err := rtpkg.SaveMCP(reg); err != nil {
+	if err := mcp.Save(reg); err != nil {
 		t.Fatalf("seed mcp.toml: %v", err)
 	}
 }
@@ -54,11 +54,11 @@ func TestMCP_EnableDisable_RoundTrip(t *testing.T) {
 	}
 
 	// Verify on-disk
-	reg, err := rtpkg.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		t.Fatalf("load mcp.toml: %v", err)
 	}
-	entry := rtpkg.FindMCPServer(reg, "echo-server")
+	entry := mcp.FindServer(reg, "echo-server")
 	if entry == nil || entry.Disabled {
 		t.Fatalf("expected enabled entry on disk; got: %#v", entry)
 	}
@@ -74,8 +74,8 @@ func TestMCP_EnableDisable_RoundTrip(t *testing.T) {
 	if !strings.Contains(out, "disabled MCP server") {
 		t.Fatalf("disable should confirm; got: %q", out)
 	}
-	reg, _ = rtpkg.LoadMCP()
-	if !rtpkg.FindMCPServer(reg, "echo-server").Disabled {
+	reg, _ = mcp.Load()
+	if !mcp.FindServer(reg, "echo-server").Disabled {
 		t.Fatalf("expected disabled=true on disk")
 	}
 }
@@ -92,11 +92,11 @@ func TestMCP_EnableUnknown(t *testing.T) {
 func TestMCP_Reload_CountsState(t *testing.T) {
 	withTempMcpHome(t)
 	// Two entries — one enabled, one disabled.
-	reg := &rtpkg.MCPRegistry{Servers: []rtpkg.MCPServerEntry{
+	reg := &mcp.Registry{Servers: []mcp.ServerEntry{
 		{Name: "live", Command: "/bin/cat"},
 		{Name: "dead", Command: "/bin/cat", Disabled: true},
 	}}
-	if err := rtpkg.SaveMCP(reg); err != nil {
+	if err := mcp.Save(reg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	r := (*REPL)(nil)

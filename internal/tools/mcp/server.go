@@ -164,7 +164,7 @@ func wrapClient(ctx context.Context, name string, client *mcp.Client) (*Server, 
 //
 //	name        — the server's logical name (mcp__<name>__* prefix).
 //	cachedTools — tool list to register up-front (typically loaded
-//	              from ~/.metis/mcp-cache/<name>.json via runtime.LoadMCPCache).
+//	              from ~/.metis/mcp-cache/<name>.json via mcp.LoadCache).
 //	spawn       — closure that creates the live mcp.Client when invoked.
 //	              Encapsulates "stdio vs HTTP", env-var expansion, etc.
 //	              Runs exactly once across all concurrent Execute callers

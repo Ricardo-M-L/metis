@@ -28,6 +28,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
@@ -979,21 +980,21 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// blocking the prompt session on a sum-of-handshakes wall clock.
 	// Cleanup waits on `mcpLauncherDone` so we never tear down the
 	// parent process while a goroutine is mid-handshake.
-	var mcpReg *rtpkg.MCPRegistry
+	var mcpReg *mcp.Registry
 	mcpLauncherDoneCh := make(chan struct{})
 	if flags.bare {
 		// --bare skips the MCP launch dance entirely. The user gets
 		// builtins-only — no `mcp__*` tools, no spawned subprocesses,
 		// no per-server merge cost. Still safe to /mcp list / add later;
 		// nothing in this path mutates mcp.toml.
-		mcpReg = &rtpkg.MCPRegistry{}
+		mcpReg = &mcp.Registry{}
 		close(mcpLauncherDoneCh) // no work — Cleanup's <-recv is instant
 	} else {
 		var mcpLoadErr error
-		mcpReg, mcpLoadErr = rtpkg.LoadMCP()
+		mcpReg, mcpLoadErr = mcp.Load()
 		if mcpLoadErr != nil {
 			fmt.Fprintf(os.Stderr, "metis: mcp.toml: %v\n", mcpLoadErr)
-			mcpReg = &rtpkg.MCPRegistry{}
+			mcpReg = &mcp.Registry{}
 		}
 		mcpReg.MergeWithConfig(cfg.MCP.Servers)
 	}
@@ -1167,10 +1168,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// mode already closed the done-channel above; this is the !flags.bare
 	// arm. Lazy mode selection mirrors the legacy synchronous path.
 	if !flags.bare {
-		lazyMode := rtpkg.ParseLazyMCPMode(os.Getenv("METIS_LAZY_MCP"))
-		go func(reg *tools.Registry, mcpReg *rtpkg.MCPRegistry, mode rtpkg.LazyMCPMode) {
+		lazyMode := mcp.ParseLazyMode(os.Getenv("METIS_LAZY_MCP"))
+		go func(reg *tools.Registry, mcpReg *mcp.Registry, mode mcp.LazyMode) {
 			defer close(mcpLauncherDoneCh)
-			servers, errs := rtpkg.LaunchAllMCPLazy(ctx, mcpReg, reg, mode)
+			servers, errs := mcp.LaunchAllLazy(ctx, mcpReg, reg, mode)
 			// 2026-05-18: under TUI mode, stderr leaks into the
 			// alt-screen and corrupts the chat (user report: "每次
 			// 问完一句话 metis 就自动出现 MCP handshake: context
@@ -1190,10 +1191,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		}(reg, mcpReg, lazyMode)
 	} else {
 		// Bare / non-TUI mode — stderr is fine, the user expects it.
-		go func(reg *tools.Registry, mcpReg *rtpkg.MCPRegistry) {
+		go func(reg *tools.Registry, mcpReg *mcp.Registry) {
 			defer close(mcpLauncherDoneCh)
-			lazyMode := rtpkg.ParseLazyMCPMode(os.Getenv("METIS_LAZY_MCP"))
-			servers, errs := rtpkg.LaunchAllMCPLazy(ctx, mcpReg, reg, lazyMode)
+			lazyMode := mcp.ParseLazyMode(os.Getenv("METIS_LAZY_MCP"))
+			servers, errs := mcp.LaunchAllLazy(ctx, mcpReg, reg, lazyMode)
 			for _, e := range errs {
 				fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
 			}
@@ -2840,7 +2841,7 @@ func buildSlash(rt *runtime) *slash.Registry {
 		rt.mcpServersMu.Unlock()
 		if len(snapshot) > 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-			handles := rtpkg.CollectMCPPrompts(ctx, snapshot)
+			handles := mcp.CollectPrompts(ctx, snapshot)
 			cancel()
 			_ = registerMCPPromptsAsSlash(r, handles)
 		}

@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 import (
 	"strings"
@@ -68,7 +68,7 @@ func TestExpandEnvVarsInEntry_AllFields(t *testing.T) {
 	t.Setenv("METIS_HOST", "https://api.example.com")
 	t.Setenv("METIS_TOKEN", "secret")
 
-	in := MCPServerEntry{
+	in := ServerEntry{
 		Name:    "test",
 		Command: "${METIS_BIN_PATH}",
 		Args:    []string{"${METIS_ARG}", "--port", "8080"},
@@ -102,7 +102,7 @@ func TestExpandEnvVarsInEntry_AllFields(t *testing.T) {
 // TestExpandEnvVarsInEntry_MissingDeduped — a single missing var
 // referenced from multiple fields shows up exactly once.
 func TestExpandEnvVarsInEntry_MissingDeduped(t *testing.T) {
-	in := MCPServerEntry{
+	in := ServerEntry{
 		Command: "${METIS_GHOST}",
 		Args:    []string{"${METIS_GHOST}"},
 		Headers: map[string]string{"X": "${METIS_GHOST}"},
@@ -120,7 +120,7 @@ func TestExpandEnvVarsInEntry_MissingDeduped(t *testing.T) {
 // addMcpConfig behavior; Codex doesn't reserve names but it also has no
 // built-in computer-use server to protect.
 func TestAddMCPServer_ReservedNameRefused(t *testing.T) {
-	reg := &MCPRegistry{}
+	reg := &Registry{}
 	cases := []string{
 		"/usr/bin/something-else",
 		"metis-cu",       // even the canonical binary must go through /cu
@@ -128,7 +128,7 @@ func TestAddMCPServer_ReservedNameRefused(t *testing.T) {
 		"npx",
 	}
 	for _, command := range cases {
-		err := AddMCPServer(reg, "computer-use", command, nil)
+		err := AddServer(reg, "computer-use", command, nil)
 		if err == nil {
 			t.Errorf("`/mcp add computer-use %s` should be refused", command)
 			continue
@@ -148,12 +148,12 @@ func TestAddMCPServer_ReservedNameRefused(t *testing.T) {
 // variant is preserved on the entry and the original map is detached
 // (mutating the caller's map can't bleed into the stored entry).
 func TestAddMCPServerWithEnv_StoresAndCopies(t *testing.T) {
-	reg := &MCPRegistry{}
+	reg := &Registry{}
 	src := map[string]string{"FIRECRAWL_API_KEY": "fc-abc", "OTHER": "v"}
-	if err := AddMCPServerWithEnv(reg, "fc", "node", []string{"server.js"}, src); err != nil {
-		t.Fatalf("AddMCPServerWithEnv: %v", err)
+	if err := AddServerWithEnv(reg, "fc", "node", []string{"server.js"}, src); err != nil {
+		t.Fatalf("AddServerWithEnv: %v", err)
 	}
-	got := FindMCPServer(reg, "fc")
+	got := FindServer(reg, "fc")
 	if got == nil {
 		t.Fatalf("entry not inserted")
 	}
@@ -163,19 +163,19 @@ func TestAddMCPServerWithEnv_StoresAndCopies(t *testing.T) {
 	// Mutate caller map → stored entry must not see it.
 	src["FIRECRAWL_API_KEY"] = "tampered"
 	if got.Env["FIRECRAWL_API_KEY"] != "fc-abc" {
-		t.Errorf("AddMCPServerWithEnv should copy env; got %v", got.Env)
+		t.Errorf("AddServerWithEnv should copy env; got %v", got.Env)
 	}
 }
 
-// TestAddMCPServer_NilEnvLeavesFieldNil — plain AddMCPServer (no env)
+// TestAddMCPServer_NilEnvLeavesFieldNil — plain AddServer (no env)
 // shouldn't allocate an empty Env map; TOML serialization should skip
 // the key entirely thanks to `omitempty`.
 func TestAddMCPServer_NilEnvLeavesFieldNil(t *testing.T) {
-	reg := &MCPRegistry{}
-	if err := AddMCPServer(reg, "plain", "cmd", nil); err != nil {
+	reg := &Registry{}
+	if err := AddServer(reg, "plain", "cmd", nil); err != nil {
 		t.Fatal(err)
 	}
-	got := FindMCPServer(reg, "plain")
+	got := FindServer(reg, "plain")
 	if got == nil {
 		t.Fatalf("entry missing")
 	}
@@ -188,7 +188,7 @@ func TestAddMCPServer_NilEnvLeavesFieldNil(t *testing.T) {
 // get the same ${VAR} treatment as command/args/headers.
 func TestExpandEnvVarsInEntry_EnvFieldExpands(t *testing.T) {
 	t.Setenv("METIS_TEST_FCKEY", "fc-123")
-	entry := MCPServerEntry{
+	entry := ServerEntry{
 		Name:    "fc",
 		Command: "node",
 		Env:     map[string]string{"FIRECRAWL_API_KEY": "${METIS_TEST_FCKEY}"},
@@ -206,7 +206,7 @@ func TestExpandEnvVarsInEntry_EnvFieldExpands(t *testing.T) {
 // Env surfaces in the missing slice so launch can refuse with a clear
 // error, same as missing vars in headers/args.
 func TestExpandEnvVarsInEntry_EnvFieldMissingReported(t *testing.T) {
-	entry := MCPServerEntry{
+	entry := ServerEntry{
 		Name:    "fc",
 		Command: "node",
 		Env:     map[string]string{"FIRECRAWL_API_KEY": "${METIS_NEVER_SET_FCKEY}"},
@@ -249,11 +249,11 @@ func TestEnvSliceFromMap_EmptyNil(t *testing.T) {
 // the entry's command stays pinned to the canonical binary regardless
 // of what was there before.
 func TestSetReservedComputerUseServer_RoundTrip(t *testing.T) {
-	reg := &MCPRegistry{}
+	reg := &Registry{}
 	if replaced := SetReservedComputerUseServer(reg); replaced {
 		t.Errorf("first call should report replaced=false on empty registry")
 	}
-	if got := FindMCPServer(reg, ReservedComputerUseName); got == nil {
+	if got := FindServer(reg, ReservedComputerUseName); got == nil {
 		t.Fatalf("entry not inserted")
 	} else if got.Command != ReservedComputerUseBinary {
 		t.Errorf("command should be pinned to %q; got %q",

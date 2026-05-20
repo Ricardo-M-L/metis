@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 // mcp_prompts.go — Phase D #40. Walks every launched MCP server,
 // asks it for its prompts (prompts/list, optional capability), and
@@ -6,7 +6,7 @@ package runtime
 // caller registers with the slash.Registry.
 //
 // Why a registrar separate from launch:
-//   - launch sequencing already loops over LaunchAllMCP; adding
+//   - launch sequencing already loops over LaunchAll; adding
 //     prompts/list there would slow startup for the (today common)
 //     case of zero-prompts servers.
 //   - the slash registry is owned by the chat surface, not the
@@ -23,15 +23,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Ricardo-M-L/metis/internal/mcp"
+	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
 
-// MCPPromptHandle is the value the chat surface acts on when the user
+// PromptHandle is the value the chat surface acts on when the user
 // types `/mcp__<server>__<prompt> arg1 arg2 ...`. It carries enough
 // state to call GetPrompt without re-walking the registry. The chat
 // surface (or any other dispatcher) renders Description in `/help`.
-type MCPPromptHandle struct {
+type PromptHandle struct {
 	SlashName   string // e.g. "mcp__github__pr_summary"
 	ServerName  string // raw server logical name
 	PromptName  string // server-side name
@@ -43,7 +43,7 @@ type MCPPromptHandle struct {
 // Resolve calls prompts/get on the server and returns the rendered
 // body the user message should carry. Maps positional argv into the
 // argument list declared by the server.
-func (h *MCPPromptHandle) Resolve(ctx context.Context, argv []string) (string, error) {
+func (h *PromptHandle) Resolve(ctx context.Context, argv []string) (string, error) {
 	if h.server == nil {
 		return "", fmt.Errorf("mcp prompt %q: server reference lost", h.SlashName)
 	}
@@ -80,13 +80,13 @@ func (h *MCPPromptHandle) Resolve(ctx context.Context, argv []string) (string, e
 	return strings.TrimSpace(b.String()), nil
 }
 
-// CollectMCPPrompts probes each server for its prompts and returns
+// CollectPrompts probes each server for its prompts and returns
 // the discovered handles. Per-server failure (missing capability,
 // transient error) only logs to stderr — we never let one bad server
 // block the rest. Caller passes the live []*Server slice from
-// LaunchAllMCP / LaunchMCPServer.
-func CollectMCPPrompts(ctx context.Context, servers []*mcptools.Server) []MCPPromptHandle {
-	var out []MCPPromptHandle
+// LaunchAll / LaunchServer.
+func CollectPrompts(ctx context.Context, servers []*mcptools.Server) []PromptHandle {
+	var out []PromptHandle
 	for _, srv := range servers {
 		if srv == nil {
 			continue
@@ -102,7 +102,7 @@ func CollectMCPPrompts(ctx context.Context, servers []*mcptools.Server) []MCPPro
 			continue
 		}
 		for _, p := range prompts {
-			out = append(out, MCPPromptHandle{
+			out = append(out, PromptHandle{
 				SlashName:   "mcp__" + srv.Name() + "__" + p.Name,
 				ServerName:  srv.Name(),
 				PromptName:  p.Name,
@@ -118,7 +118,7 @@ func CollectMCPPrompts(ctx context.Context, servers []*mcptools.Server) []MCPPro
 // PromptDescription returns the help-line text for a slash registration.
 // Pulled out of the registrar so the (cmd/metis-side) binder doesn't
 // need to duplicate the formatting rule.
-func (h *MCPPromptHandle) PromptDescription() string {
+func (h *PromptHandle) PromptDescription() string {
 	desc := h.Description
 	if desc == "" {
 		desc = "(MCP prompt from " + h.ServerName + ")"
@@ -132,7 +132,7 @@ func (h *MCPPromptHandle) PromptDescription() string {
 // argNames flattens PromptArgument list into "name" or "name*" (the
 // asterisk marks optional). Stable ordering: the server returns them
 // in declaration order; we preserve that for the slash help string.
-func argNames(args []mcp.PromptArgument) []string {
+func argNames(args []mcpsdk.PromptArgument) []string {
 	out := make([]string, 0, len(args))
 	for _, a := range args {
 		if a.Required {

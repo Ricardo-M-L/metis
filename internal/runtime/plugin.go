@@ -13,6 +13,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	pubplugin "github.com/Ricardo-M-L/metis/pkg/plugin"
@@ -160,16 +161,16 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 		// parent process — applied only to the child via os/exec.
 		// (mcptools.NewServer uses os/exec.CommandContext; child env
 		// inheritance is handled there. For now we splice into a
-		// MCPServerEntry-like spec.)
-		entry := MCPServerEntry{
+		// mcp.ServerEntry-like spec.)
+		entry := mcp.ServerEntry{
 			Name:    "plugin:" + m.Name,
 			Command: m.MCPServer.Command,
 			Args:    append([]string(nil), m.MCPServer.Args...),
 		}
 		// Reuse single-server launch path so all our existing MCP
 		// observability (errors, namespacing) applies.
-		fakeReg := &MCPRegistry{Servers: []MCPServerEntry{entry}}
-		srv, err := LaunchMCPServer(ctx, fakeReg, entry.Name, registry)
+		fakeReg := &mcp.Registry{Servers: []mcp.ServerEntry{entry}}
+		srv, err := mcp.LaunchServer(ctx, fakeReg, entry.Name, registry)
 		if err != nil {
 			return nil, fmt.Errorf("mcp_server: %w", err)
 		}

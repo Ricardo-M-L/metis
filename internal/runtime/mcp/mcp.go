@@ -8,7 +8,7 @@
 // (too low-level for command dispatch) but also doesn't belong in any one
 // domain package (it spans several). Splitting it out keeps cmd/metis/
 // minimal and gives slash commands a clean call site.
-package runtime
+package mcp
 
 import (
 	"context"
@@ -25,22 +25,22 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
-	"github.com/Ricardo-M-L/metis/internal/mcp"
+	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
 
-// MCPRegistry is the on-disk schema for ~/.metis/mcp.toml.
+// Registry is the on-disk schema for ~/.metis/mcp.toml.
 //
 // Why a separate file from config.toml: MCP servers churn — users `/mcp add`
 // and `/mcp remove` from the chat surface — and we'd rather not rewrite the
 // whole config.toml every time. Splitting into its own file also keeps
 // secrets/paths/argv out of the otherwise-shareable config.toml.
-type MCPRegistry struct {
-	Servers []MCPServerEntry `toml:"servers"`
+type Registry struct {
+	Servers []ServerEntry `toml:"servers"`
 }
 
-// MCPServerEntry mirrors config.MCPServer but lives in this package so the
+// ServerEntry mirrors config.MCPServer but lives in this package so the
 // runtime layer doesn't reach into config to mutate slices. A cross-walk
 // helper (FromConfigServers / ToConfigServers) covers the conversion.
 //
@@ -50,9 +50,9 @@ type MCPRegistry struct {
 //   - http  (Streamable HTTP / SSE): set URL, optional Headers, leave
 //     Command empty
 //
-// LaunchMCPServer auto-detects from whichever pair is populated, so
+// LaunchServer auto-detects from whichever pair is populated, so
 // existing stdio-only registries continue to load unchanged.
-type MCPServerEntry struct {
+type ServerEntry struct {
 	Name     string            `toml:"name"`
 	Command  string            `toml:"command,omitempty"`
 	Args     []string          `toml:"args,omitempty"`
@@ -82,35 +82,35 @@ type MCPServerEntry struct {
 	DisabledTools []string `toml:"disabled_tools,omitempty"`
 }
 
-// MCPPath returns the canonical path of mcp.toml under the metis home.
-func MCPPath() string {
+// Path returns the canonical path of mcp.toml under the metis home.
+func Path() string {
 	return filepath.Join(config.Home(), "mcp.toml")
 }
 
-// LoadMCP reads the registry. A missing file is NOT an error — returns an
+// Load reads the registry. A missing file is NOT an error — returns an
 // empty registry so callers can append-and-save without first checking.
-func LoadMCP() (*MCPRegistry, error) {
-	p := MCPPath()
+func Load() (*Registry, error) {
+	p := Path()
 	if _, err := os.Stat(p); err != nil {
 		if os.IsNotExist(err) {
-			return &MCPRegistry{}, nil
+			return &Registry{}, nil
 		}
 		return nil, err
 	}
-	var r MCPRegistry
+	var r Registry
 	if _, err := toml.DecodeFile(p, &r); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", p, err)
 	}
 	return &r, nil
 }
 
-// SaveMCP writes the registry atomically (tempfile + rename) at 0o600.
+// Save writes the registry atomically (tempfile + rename) at 0o600.
 // MCP entries can carry sensitive arg payloads (API keys passed via env or
 // argv to the spawned subprocess), so the file inherits auth.json-style
 // perms even though it's mostly plaintext config.
-func SaveMCP(reg *MCPRegistry) error {
+func Save(reg *Registry) error {
 	if reg == nil {
-		reg = &MCPRegistry{}
+		reg = &Registry{}
 	}
 	dir := config.Home()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -127,7 +127,7 @@ func SaveMCP(reg *MCPRegistry) error {
 	if err := enc.Encode(reg); err != nil {
 		return fmt.Errorf("encode mcp.toml: %w", err)
 	}
-	final := MCPPath()
+	final := Path()
 	tmp, err := os.CreateTemp(dir, ".mcp.toml.*")
 	if err != nil {
 		return fmt.Errorf("tempfile: %w", err)
@@ -167,7 +167,7 @@ func SaveMCP(reg *MCPRegistry) error {
 // (config.ts:642-648).
 //
 // The user-facing way to enable the built-in is `/cu enable`, which goes
-// through SetReservedComputerUseServer below — never through AddMCPServer.
+// through SetReservedComputerUseServer below — never through AddServer.
 // That asymmetry is deliberate:
 //
 //   - `/mcp add` is the user-typed surface; pretending the slot is free
@@ -186,22 +186,22 @@ const (
 	ReservedComputerUseBinary = "metis-cu"
 )
 
-// AddMCPServer inserts (or replaces) a server entry. Empty name / command
+// AddServer inserts (or replaces) a server entry. Empty name / command
 // errors so accidental `/mcp add` typos can't write garbage entries.
 //
 // Refuses ReservedComputerUseName outright — the slot is owned by metis's
 // built-in computer-use server (see /cu enable). Same behavior as
 // Claude Code's `addMcpConfig` for `computer-use` and `claude-in-chrome`.
-func AddMCPServer(reg *MCPRegistry, name, command string, args []string) error {
-	return AddMCPServerWithEnv(reg, name, command, args, nil)
+func AddServer(reg *Registry, name, command string, args []string) error {
+	return AddServerWithEnv(reg, name, command, args, nil)
 }
 
-// AddMCPServerWithEnv is the env-aware variant of AddMCPServer. Pass nil
+// AddServerWithEnv is the env-aware variant of AddServer. Pass nil
 // `env` for parity with the simpler form. Env values are written verbatim
 // (NOT expanded) so users can keep `${SOMETHING}` placeholders in mcp.toml
-// for shell-resolved secrets — the expansion happens at LaunchMCPServer
+// for shell-resolved secrets — the expansion happens at LaunchServer
 // time via expandEnvVarsInEntry.
-func AddMCPServerWithEnv(reg *MCPRegistry, name, command string, args []string, env map[string]string) error {
+func AddServerWithEnv(reg *Registry, name, command string, args []string, env map[string]string) error {
 	if name == "" {
 		return errors.New("mcp: name required")
 	}
@@ -225,7 +225,7 @@ func AddMCPServerWithEnv(reg *MCPRegistry, name, command string, args []string, 
 	}
 	for i, s := range reg.Servers {
 		if s.Name == name {
-			reg.Servers[i] = MCPServerEntry{
+			reg.Servers[i] = ServerEntry{
 				Name: name, Command: command,
 				Args: append([]string(nil), args...),
 				Env:  envCopy,
@@ -233,7 +233,7 @@ func AddMCPServerWithEnv(reg *MCPRegistry, name, command string, args []string, 
 			return nil
 		}
 	}
-	reg.Servers = append(reg.Servers, MCPServerEntry{
+	reg.Servers = append(reg.Servers, ServerEntry{
 		Name: name, Command: command,
 		Args: append([]string(nil), args...),
 		Env:  envCopy,
@@ -242,37 +242,37 @@ func AddMCPServerWithEnv(reg *MCPRegistry, name, command string, args []string, 
 }
 
 // SetReservedComputerUseServer is the internal-only path for /cu enable
-// to write the reserved `computer-use` entry. AddMCPServer refuses this
+// to write the reserved `computer-use` entry. AddServer refuses this
 // name, so /cu uses this dedicated API. Behaviorally identical to
-// AddMCPServer except (a) skips the reserved-name check, (b) hardcodes
+// AddServer except (a) skips the reserved-name check, (b) hardcodes
 // the command to ReservedComputerUseBinary so callers can't override —
 // it's "enable the built-in", not "add an arbitrary entry".
 //
 // Returns true if a prior entry was replaced (re-enable case) so the
 // REPL can word the success message accordingly.
-func SetReservedComputerUseServer(reg *MCPRegistry) (replaced bool) {
+func SetReservedComputerUseServer(reg *Registry) (replaced bool) {
 	if reg == nil {
 		return false
 	}
 	for i, s := range reg.Servers {
 		if s.Name == ReservedComputerUseName {
-			reg.Servers[i] = MCPServerEntry{
+			reg.Servers[i] = ServerEntry{
 				Name:    ReservedComputerUseName,
 				Command: ReservedComputerUseBinary,
 			}
 			return true
 		}
 	}
-	reg.Servers = append(reg.Servers, MCPServerEntry{
+	reg.Servers = append(reg.Servers, ServerEntry{
 		Name:    ReservedComputerUseName,
 		Command: ReservedComputerUseBinary,
 	})
 	return false
 }
 
-// RemoveMCPServer drops a server by name. Returns true if removed, false if
+// RemoveServer drops a server by name. Returns true if removed, false if
 // no entry by that name existed.
-func RemoveMCPServer(reg *MCPRegistry, name string) bool {
+func RemoveServer(reg *Registry, name string) bool {
 	if reg == nil {
 		return false
 	}
@@ -285,13 +285,13 @@ func RemoveMCPServer(reg *MCPRegistry, name string) bool {
 	return false
 }
 
-// SetMCPDisabled flips the Disabled flag for the named server. Returns
+// SetDisabled flips the Disabled flag for the named server. Returns
 // (true, prior) when the entry was found, (false, false) when no such
-// server exists. Caller is responsible for SaveMCP. Pulled out of the
+// server exists. Caller is responsible for Save. Pulled out of the
 // /mcp enable/disable handlers so the slash code stays declarative —
 // runtime owns the actual mutation rule (idempotent, no-op when already
 // in the requested state).
-func SetMCPDisabled(reg *MCPRegistry, name string, disabled bool) (found bool, prior bool) {
+func SetDisabled(reg *Registry, name string, disabled bool) (found bool, prior bool) {
 	if reg == nil {
 		return false, false
 	}
@@ -305,9 +305,9 @@ func SetMCPDisabled(reg *MCPRegistry, name string, disabled bool) (found bool, p
 	return false, false
 }
 
-// FindMCPServer returns the entry by name (or nil if missing). Useful when a
+// FindServer returns the entry by name (or nil if missing). Useful when a
 // caller only needs read access without iterating all entries.
-func FindMCPServer(reg *MCPRegistry, name string) *MCPServerEntry {
+func FindServer(reg *Registry, name string) *ServerEntry {
 	if reg == nil {
 		return nil
 	}
@@ -319,7 +319,7 @@ func FindMCPServer(reg *MCPRegistry, name string) *MCPServerEntry {
 	return nil
 }
 
-// LaunchMCPServer spawns a single MCP server subprocess and registers its
+// LaunchServer spawns a single MCP server subprocess and registers its
 // exposed tools onto the supplied tools.Registry. Returns the live Server so
 // the caller can Close() it later (e.g. on shutdown / `/mcp stop`).
 //
@@ -334,8 +334,8 @@ func FindMCPServer(reg *MCPRegistry, name string) *MCPServerEntry {
 // $GITHUB_TOKEN doesn't silently land an empty string into the
 // Authorization header (which the server then rejects with an opaque
 // 401, hiding the actual root cause).
-func LaunchMCPServer(ctx context.Context, reg *MCPRegistry, name string, registry *tools.Registry) (*mcptools.Server, error) {
-	entry := FindMCPServer(reg, name)
+func LaunchServer(ctx context.Context, reg *Registry, name string, registry *tools.Registry) (*mcptools.Server, error) {
+	entry := FindServer(reg, name)
 	if entry == nil {
 		return nil, fmt.Errorf("mcp: no server named %q", name)
 	}
@@ -394,7 +394,7 @@ func LaunchMCPServer(ctx context.Context, reg *MCPRegistry, name string, registr
 	return srv, nil
 }
 
-// LaunchAllMCP starts every enabled server in the registry and returns the
+// LaunchAll starts every enabled server in the registry and returns the
 // Servers that came up. Errors on individual servers are appended to the
 // returned []error so callers can warn but keep going (mirrors the existing
 // behavior in cmd/metis/main.go's setupRuntime).
@@ -411,7 +411,7 @@ func LaunchMCPServer(ctx context.Context, reg *MCPRegistry, name string, registr
 // safely Register from each launching goroutine without coordination.
 // Result-collection still happens under a mutex so the returned slices
 // have stable ordering matching reg.Servers.
-func LaunchAllMCP(ctx context.Context, reg *MCPRegistry, registry *tools.Registry) ([]*mcptools.Server, []error) {
+func LaunchAll(ctx context.Context, reg *Registry, registry *tools.Registry) ([]*mcptools.Server, []error) {
 	if reg == nil {
 		return nil, nil
 	}
@@ -430,7 +430,7 @@ func LaunchAllMCP(ctx context.Context, reg *MCPRegistry, registry *tools.Registr
 		wg.Add(1)
 		go func(idx int, name string) {
 			defer wg.Done()
-			srv, err := LaunchMCPServer(ctx, reg, name, registry)
+			srv, err := LaunchServer(ctx, reg, name, registry)
 			mu.Lock()
 			results = append(results, launchResult{idx: idx, srv: srv, err: err})
 			mu.Unlock()
@@ -453,7 +453,7 @@ func LaunchAllMCP(ctx context.Context, reg *MCPRegistry, registry *tools.Registr
 	return ok, errs
 }
 
-// LaunchAllMCPLazy is the kimi-cli-style lazy variant of LaunchAllMCP.
+// LaunchAllLazy is the kimi-cli-style lazy variant of LaunchAll.
 // Mode selection (default auto):
 //
 //	auto   — for each enabled entry: if ~/.metis/mcp-cache/<name>.json
@@ -464,19 +464,19 @@ func LaunchAllMCP(ctx context.Context, reg *MCPRegistry, registry *tools.Registr
 //	         defer (no spawn) — first tool call triggers spawn-and-cache.
 //	         Most aggressive; new servers stay unspawned until used.
 //	never  — eager spawn for every entry, ignore the cache. Equivalent
-//	         to legacy LaunchAllMCP. Use to debug cache-driven issues.
+//	         to legacy LaunchAll. Use to debug cache-driven issues.
 //
-// Result shape matches LaunchAllMCP: ok []*Server is everything
+// Result shape matches LaunchAll: ok []*Server is everything
 // registered (whether spawned or deferred); errs []error collects the
 // per-server failures so setupRuntime can warn-but-keep-going.
-func LaunchAllMCPLazy(ctx context.Context, reg *MCPRegistry, registry *tools.Registry, mode LazyMCPMode) ([]*mcptools.Server, []error) {
+func LaunchAllLazy(ctx context.Context, reg *Registry, registry *tools.Registry, mode LazyMode) ([]*mcptools.Server, []error) {
 	if reg == nil {
 		return nil, nil
 	}
 	if mode == LazyMCPModeNever {
-		return LaunchAllMCP(ctx, reg, registry)
+		return LaunchAll(ctx, reg, registry)
 	}
-	// Parallel launch — same rationale as LaunchAllMCP above. Cache-hit
+	// Parallel launch — same rationale as LaunchAll above. Cache-hit
 	// entries are near-instant (no subprocess), but cache-miss entries
 	// still pay the eager spawn cost and serializing those is exactly
 	// the user-visible regression we just fixed.
@@ -493,7 +493,7 @@ func LaunchAllMCPLazy(ctx context.Context, reg *MCPRegistry, registry *tools.Reg
 			continue
 		}
 		wg.Add(1)
-		go func(idx int, e MCPServerEntry) {
+		go func(idx int, e ServerEntry) {
 			defer wg.Done()
 			srv, err := launchOneMCPLazy(ctx, e, registry, mode)
 			mu.Lock()
@@ -517,12 +517,12 @@ func LaunchAllMCPLazy(ctx context.Context, reg *MCPRegistry, registry *tools.Reg
 }
 
 // launchOneMCPLazy is the per-entry dispatch path used by
-// LaunchAllMCPLazy. Loads the cache, decides between deferred /
+// LaunchAllLazy. Loads the cache, decides between deferred /
 // eager spawn, registers tools, returns the resulting Server.
-func launchOneMCPLazy(ctx context.Context, entry MCPServerEntry, registry *tools.Registry, mode LazyMCPMode) (*mcptools.Server, error) {
+func launchOneMCPLazy(ctx context.Context, entry ServerEntry, registry *tools.Registry, mode LazyMode) (*mcptools.Server, error) {
 	// Step 1: env-var expansion happens up-front so the fingerprint
 	// reflects the actual launch identity (the same way an eager
-	// LaunchMCPServer would see it).
+	// LaunchServer would see it).
 	expanded, missing := expandEnvVarsInEntry(entry)
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("mcp: server %q references unset env vars: %s "+
@@ -531,7 +531,7 @@ func launchOneMCPLazy(ctx context.Context, entry MCPServerEntry, registry *tools
 	}
 
 	wantFP := FingerprintEntry(expanded)
-	cache, _ := LoadMCPCache(entry.Name) // LoadMCPCache returns (nil, nil) on missing — fine
+	cache, _ := LoadCache(entry.Name) // LoadCache returns (nil, nil) on missing — fine
 
 	// Cache hit? Register stub tools + defer spawn.
 	if cache != nil && cache.Fingerprint == wantFP && len(cache.Tools) > 0 {
@@ -559,9 +559,9 @@ func launchOneMCPLazy(ctx context.Context, entry MCPServerEntry, registry *tools
 
 	// Auto mode + cache miss → spawn eagerly so we have something to
 	// register THIS session, AND seed the cache for next time. This is
-	// the "first-run" cost: identical to legacy LaunchAllMCP for new
+	// the "first-run" cost: identical to legacy LaunchAll for new
 	// servers, but cheaper for every subsequent run.
-	srv, err := LaunchMCPServer(ctx, &MCPRegistry{Servers: []MCPServerEntry{entry}}, entry.Name, registry)
+	srv, err := LaunchServer(ctx, &Registry{Servers: []ServerEntry{entry}}, entry.Name, registry)
 	if err != nil {
 		return nil, err
 	}
@@ -575,19 +575,19 @@ func launchOneMCPLazy(ctx context.Context, entry MCPServerEntry, registry *tools
 // already-expanded fields plus the transport pick (HTTP vs stdio) so
 // the first Execute fires the same code path an eager launch would
 // have used at startup.
-func buildLazyServer(expanded, original MCPServerEntry, cachedTools []CachedTool) *mcptools.Server {
-	spawn := func(ctx context.Context) (*mcp.Client, error) {
+func buildLazyServer(expanded, original ServerEntry, cachedTools []CachedTool) *mcptools.Server {
+	spawn := func(ctx context.Context) (*mcpsdk.Client, error) {
 		switch {
 		case expanded.URL != "":
-			return mcp.NewHTTPClient(ctx, expanded.URL, expanded.Headers)
+			return mcpsdk.NewHTTPClient(ctx, expanded.URL, expanded.Headers)
 		case expanded.Command != "":
-			return mcp.NewStdioClientWithEnv(ctx, expanded.Command, envSliceFromMap(expanded.Env), expanded.Args...)
+			return mcpsdk.NewStdioClientWithEnv(ctx, expanded.Command, envSliceFromMap(expanded.Env), expanded.Args...)
 		default:
 			return nil, fmt.Errorf("mcp: server %q has neither command nor url", expanded.Name)
 		}
 	}
 	tools := CachedToolsToMCPTools(cachedTools)
-	srv := mcptools.NewLazyServer(expanded.Name, tools, func(ctx context.Context) (*mcp.Client, error) {
+	srv := mcptools.NewLazyServer(expanded.Name, tools, func(ctx context.Context) (*mcpsdk.Client, error) {
 		client, err := spawn(ctx)
 		if err != nil {
 			return nil, err
@@ -602,11 +602,11 @@ func buildLazyServer(expanded, original MCPServerEntry, cachedTools []CachedTool
 			if err != nil {
 				return // best-effort; old cache is still better than no cache
 			}
-			cache := &MCPCache{
+			cache := &Cache{
 				Fingerprint: FingerprintEntry(expanded),
 				Tools:       MCPToolsToCached(freshTools),
 			}
-			_ = SaveMCPCache(original.Name, cache)
+			_ = SaveCache(original.Name, cache)
 		}()
 		return client, nil
 	})
@@ -623,7 +623,7 @@ func buildLazyServer(expanded, original MCPServerEntry, cachedTools []CachedTool
 // during wrapClient — that's intentional, because the eager-launch
 // path uses truncated descriptions in its prompts too, so the cache
 // matches what the eager path would produce.
-func saveCacheFromServer(srv *mcptools.Server, expanded MCPServerEntry) {
+func saveCacheFromServer(srv *mcptools.Server, expanded ServerEntry) {
 	if srv == nil {
 		return
 	}
@@ -643,11 +643,11 @@ func saveCacheFromServer(srv *mcptools.Server, expanded MCPServerEntry) {
 			InputSchema: schema,
 		})
 	}
-	c := &MCPCache{
+	c := &Cache{
 		Fingerprint: FingerprintEntry(expanded),
 		Tools:       cached,
 	}
-	_ = SaveMCPCache(expanded.Name, c)
+	_ = SaveCache(expanded.Name, c)
 }
 
 // splitToolMeta extracts a registered Tool's (name, description,
@@ -680,15 +680,15 @@ func stripMCPNamePrefix(full, serverName string) string {
 // MergeWithConfig folds entries declared in config.toml's [[mcp.servers]]
 // into the runtime registry. Config-declared entries don't overwrite ones
 // already in mcp.toml — the user's runtime additions always win.
-func (r *MCPRegistry) MergeWithConfig(cfgServers []config.MCPServer) {
+func (r *Registry) MergeWithConfig(cfgServers []config.MCPServer) {
 	for _, s := range cfgServers {
 		if s.Name == "" {
 			continue
 		}
-		if FindMCPServer(r, s.Name) != nil {
+		if FindServer(r, s.Name) != nil {
 			continue
 		}
-		r.Servers = append(r.Servers, MCPServerEntry{
+		r.Servers = append(r.Servers, ServerEntry{
 			Name: s.Name, Command: s.Command,
 			Args: append([]string(nil), s.Args...), Disabled: s.Disabled,
 		})

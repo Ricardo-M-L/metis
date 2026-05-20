@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 // End-to-end integration test exercising the full metis ↔ metis-cu
 // path: spawn the metis-cu binary as a stdio MCP subprocess via
@@ -21,7 +21,7 @@ import (
 )
 
 // TestE2E_MetisCU_Roundtrip — spawn → list tools → call cursor_position.
-// Uses NewServer directly (rather than LaunchMCPServer) because we
+// Uses NewServer directly (rather than LaunchServer) because we
 // don't need to graft into a tools.Registry — just verify the wire is
 // real on both ends.
 func TestE2E_MetisCU_Roundtrip(t *testing.T) {

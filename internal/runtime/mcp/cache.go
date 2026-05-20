@@ -1,4 +1,4 @@
-package runtime
+package mcp
 
 // mcp_cache.go — persisted MCP tool-schema cache under ~/.metis/mcp-cache/.
 //
@@ -36,7 +36,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
-	"github.com/Ricardo-M-L/metis/internal/mcp"
+	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 )
 
 // CachedTool mirrors mcp.Tool with JSON tags chosen to match the
@@ -48,27 +48,27 @@ type CachedTool struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-// MCPCache is the on-disk envelope. Loose fields (cached_at, version)
+// Cache is the on-disk envelope. Loose fields (cached_at, version)
 // are informational — the load path only uses Fingerprint + Tools.
-type MCPCache struct {
+type Cache struct {
 	Fingerprint string       `json:"fingerprint"`
 	CachedAt    string       `json:"cached_at"`
 	Tools       []CachedTool `json:"tools"`
 }
 
-// MCPCacheDir returns the canonical cache directory under metis home.
+// CacheDir returns the canonical cache directory under metis home.
 // Sibling of mcp.toml so a single `rm -rf ~/.metis/mcp-cache` flushes
 // every server's stale schemas without touching the registry.
-func MCPCacheDir() string {
+func CacheDir() string {
 	return filepath.Join(config.Home(), "mcp-cache")
 }
 
-// MCPCachePath returns the full path for one server's cache file.
+// CachePath returns the full path for one server's cache file.
 // File name is the literal server name; mcp.toml constrains the legal
 // charset (no `/` etc.) since the same string lands in `mcp__<name>__*`
 // tool prefixes the LLM sees.
-func MCPCachePath(serverName string) string {
-	return filepath.Join(MCPCacheDir(), serverName+".json")
+func CachePath(serverName string) string {
+	return filepath.Join(CacheDir(), serverName+".json")
 }
 
 // FingerprintEntry computes a SHA-256 over the entry's launch identity.
@@ -80,7 +80,7 @@ func MCPCachePath(serverName string) string {
 // Header values are sorted by key before hashing so map-iteration
 // nondeterminism doesn't produce different fingerprints for identical
 // configs (this would flap the cache on every restart).
-func FingerprintEntry(e MCPServerEntry) string {
+func FingerprintEntry(e ServerEntry) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "cmd:%s\n", e.Command)
 	for _, a := range e.Args {
@@ -98,12 +98,12 @@ func FingerprintEntry(e MCPServerEntry) string {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
-// LoadMCPCache reads the cache for one server. Returns (nil, nil) on
+// LoadCache reads the cache for one server. Returns (nil, nil) on
 // missing-file — callers should treat that as "no cache, spawn fresh"
 // rather than a hard error. Malformed JSON is a hard error so we
 // don't silently downgrade to no-cache when something has gone wrong.
-func LoadMCPCache(serverName string) (*MCPCache, error) {
-	p := MCPCachePath(serverName)
+func LoadCache(serverName string) (*Cache, error) {
+	p := CachePath(serverName)
 	raw, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -111,24 +111,24 @@ func LoadMCPCache(serverName string) (*MCPCache, error) {
 		}
 		return nil, fmt.Errorf("read %s: %w", p, err)
 	}
-	var c MCPCache
+	var c Cache
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", p, err)
 	}
 	return &c, nil
 }
 
-// SaveMCPCache writes (or overwrites) the cache for one server.
+// SaveCache writes (or overwrites) the cache for one server.
 // Atomic via tempfile + rename so a partial write can't strand
 // callers with a half-parsed cache (json.Unmarshal would reject and
 // we'd respawn — annoying but recoverable). Same security stance as
-// SaveMCP: 0o600 because cached schemas may reflect tool params that
+// Save: 0o600 because cached schemas may reflect tool params that
 // reference paths or argv shapes worth keeping out of broad reads.
-func SaveMCPCache(serverName string, c *MCPCache) error {
+func SaveCache(serverName string, c *Cache) error {
 	if c == nil {
 		return fmt.Errorf("mcp_cache: nil cache for %q", serverName)
 	}
-	dir := MCPCacheDir()
+	dir := CacheDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
@@ -139,7 +139,7 @@ func SaveMCPCache(serverName string, c *MCPCache) error {
 	if err != nil {
 		return fmt.Errorf("encode cache for %q: %w", serverName, err)
 	}
-	final := MCPCachePath(serverName)
+	final := CachePath(serverName)
 	tmp, err := os.CreateTemp(dir, "."+serverName+".*.json")
 	if err != nil {
 		return fmt.Errorf("tempfile: %w", err)
@@ -171,10 +171,10 @@ func SaveMCPCache(serverName string, c *MCPCache) error {
 // what the existing wrapClient code already knows how to register.
 // Lets the lazy launch path reuse the same per-tool registration
 // rather than duplicating the wrapper logic.
-func CachedToolsToMCPTools(in []CachedTool) []mcp.Tool {
-	out := make([]mcp.Tool, len(in))
+func CachedToolsToMCPTools(in []CachedTool) []mcpsdk.Tool {
+	out := make([]mcpsdk.Tool, len(in))
 	for i, t := range in {
-		out[i] = mcp.Tool{
+		out[i] = mcpsdk.Tool{
 			Name:        t.Name,
 			Description: t.Description,
 			InputSchema: t.InputSchema,
@@ -184,8 +184,8 @@ func CachedToolsToMCPTools(in []CachedTool) []mcp.Tool {
 }
 
 // MCPToolsToCached is the inverse: snapshot a freshly-fetched tool
-// list into the cache shape so SaveMCPCache can persist it.
-func MCPToolsToCached(in []mcp.Tool) []CachedTool {
+// list into the cache shape so SaveCache can persist it.
+func MCPToolsToCached(in []mcpsdk.Tool) []CachedTool {
 	out := make([]CachedTool, len(in))
 	for i, t := range in {
 		out[i] = CachedTool{
@@ -197,7 +197,7 @@ func MCPToolsToCached(in []mcp.Tool) []CachedTool {
 	return out
 }
 
-// LazyMCPMode is the user-facing knob for METIS_LAZY_MCP.
+// LazyMode is the user-facing knob for METIS_LAZY_MCP.
 // Mirrors the LazyMode tri-state from lazy_tools.go for consistency:
 //
 //	(unset) / "auto" → use cache when valid, spawn-and-cache on miss
@@ -205,18 +205,18 @@ func MCPToolsToCached(in []mcp.Tool) []CachedTool {
 //	                    (servers without one are deferred until first
 //	                    tool call — same as auto but more aggressive)
 //	"never"          → eager spawn at startup (legacy behavior)
-type LazyMCPMode int
+type LazyMode int
 
 const (
-	LazyMCPModeAuto LazyMCPMode = iota
+	LazyMCPModeAuto LazyMode = iota
 	LazyMCPModeAlways
 	LazyMCPModeNever
 )
 
-// ParseLazyMCPMode resolves the METIS_LAZY_MCP env value. Trimmed +
+// ParseLazyMode resolves the METIS_LAZY_MCP env value. Trimmed +
 // lowercased; unknown values fall back to Auto rather than erroring,
 // so a typo doesn't break startup.
-func ParseLazyMCPMode(value string) LazyMCPMode {
+func ParseLazyMode(value string) LazyMode {
 	v := strings.ToLower(strings.TrimSpace(value))
 	switch v {
 	case "always", "true", "1", "yes":

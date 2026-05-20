@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -33,11 +33,11 @@ func (r *REPL) handleMCPDisable(name string) string {
 }
 
 func (r *REPL) setMCPState(name string, disabled bool) string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
-	found, prior := runtime.SetMCPDisabled(reg, name, disabled)
+	found, prior := mcp.SetDisabled(reg, name, disabled)
 	if !found {
 		return "(no MCP server named: " + name + ")"
 	}
@@ -48,7 +48,7 @@ func (r *REPL) setMCPState(name string, disabled bool) string {
 		}
 		return "(MCP server " + name + " already " + state + ")"
 	}
-	if err := runtime.SaveMCP(reg); err != nil {
+	if err := mcp.Save(reg); err != nil {
 		return "mcp: save: " + err.Error()
 	}
 	if disabled {
@@ -63,14 +63,14 @@ func (r *REPL) setMCPState(name string, disabled bool) string {
 // re-load the file to surface obvious decode errors before they bite at
 // next launch. Honors $VISUAL → $EDITOR → vi as the resolver chain.
 func (r *REPL) handleMCPEdit(name string) string {
-	path := runtime.MCPPath()
+	path := mcp.Path()
 	// Pre-flight: confirm the named server is real BEFORE launching the
 	// editor. Saves a round-trip when the user typo'd the name.
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
-	if name != "" && runtime.FindMCPServer(reg, name) == nil {
+	if name != "" && mcp.FindServer(reg, name) == nil {
 		return "(no MCP server named: " + name + " — `/mcp list` to see what's registered)"
 	}
 	editor := pickEditor()
@@ -84,7 +84,7 @@ func (r *REPL) handleMCPEdit(name string) string {
 	// Re-load to validate the user's edit. Don't re-launch live servers
 	// — that would surprise mid-turn. /mcp reload is the explicit path
 	// for that.
-	if _, err := runtime.LoadMCP(); err != nil {
+	if _, err := mcp.Load(); err != nil {
 		return "mcp edit: file saved but parse failed — fix it before `/mcp reload`:\n  " + err.Error()
 	}
 	return "(mcp.toml saved · run `/mcp reload` to apply)"
@@ -96,11 +96,11 @@ func (r *REPL) handleMCPEdit(name string) string {
 // tools state. We don't graft the tools onto r.Loop.Registry — this is
 // a probe, not a launch.
 func (r *REPL) handleMCPTest(name string) string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
-	entry := runtime.FindMCPServer(reg, name)
+	entry := mcp.FindServer(reg, name)
 	if entry == nil {
 		return "(no MCP server named: " + name + ")"
 	}
@@ -112,13 +112,13 @@ func (r *REPL) handleMCPTest(name string) string {
 	// the chat surface.
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	// Use a throwaway tools.Registry; runtime.LaunchMCPServer registers
+	// Use a throwaway tools.Registry; mcp.LaunchServer registers
 	// onto whatever we pass, but we want the count, not the side effect.
 	// The simpler `srv, err := mcptools.NewServer(...)` would skip env
 	// expansion + the URL/stdio branching, so route through LaunchMCPServer
 	// with a discard registry.
 	probe := tools.NewRegistry()
-	srv, err := runtime.LaunchMCPServer(ctx, reg, name, probe)
+	srv, err := mcp.LaunchServer(ctx, reg, name, probe)
 	if err != nil {
 		return "mcp test: " + err.Error()
 	}
@@ -141,14 +141,14 @@ func (r *REPL) handleMCPTest(name string) string {
 // command is a structured dead-end rather than a confidently-empty
 // answer.
 func (r *REPL) handleMCPLogs(name string) string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
-	if entry := runtime.FindMCPServer(reg, name); entry == nil {
+	if entry := mcp.FindServer(reg, name); entry == nil {
 		return "(no MCP server named: " + name + ")"
 	}
-	logDir := filepath.Join(filepath.Dir(runtime.MCPPath()), "mcp-logs")
+	logDir := filepath.Join(filepath.Dir(mcp.Path()), "mcp-logs")
 	logPath := filepath.Join(logDir, name+".log")
 	if data, err := os.ReadFile(logPath); err == nil {
 		// Tail the last ~80 lines so a long-running server doesn't
@@ -173,7 +173,7 @@ func (r *REPL) handleMCPLogs(name string) string {
 // metis (apply). Reload is honest about that today; once the daemon is
 // in place it'll grow real hot-swap semantics.
 func (r *REPL) handleMCPReload() string {
-	reg, err := runtime.LoadMCP()
+	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp reload: " + err.Error()
 	}
