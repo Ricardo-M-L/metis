@@ -375,11 +375,11 @@ screen/                                       Full-window overlays
 ```
 
 The new top-level `metis ps / logs / kill / attach` subcommands live in
-`cmd/metis/cmd_session_ops.go` and read the on-disk session store
+`cmd/metis/session_ops.go` and read the on-disk session store
 directly. Once the daemon work in #49 grows a Unix socket front, those
 subcommands will route through it; today they fall through to direct
 filesystem reads + signal delivery. The MCP prompt registrar
-(`internal/runtime/mcp_prompts.go` + `cmd/metis/mcp_prompts_bind.go`)
+(`internal/runtime/mcp/prompts.go` + `cmd/metis/mcp_prompts_bind.go`)
 walks every launched server at startup and registers its
 `prompts/list` entries as `mcp__<server>__<prompt>` slashes; the
 slash binding lives in `cmd/metis/` to avoid an
@@ -612,7 +612,7 @@ Loader (`internal/runtime/plugin.go`):
 
 1. Scan `~/.metis/plugins/*/plugin.toml`
 2. Validate schema; reject if `name` doesn't match dir
-3. `[mcp_server]` → reuse `internal/runtime/mcp.go`'s LaunchAllMCP path,
+3. `[mcp_server]` → reuse `internal/runtime/mcp/mcp.go`'s `LaunchAll` path,
    tools register as `plugin__<name>__<tool>`
 4. `skills` array → register at the plugin layer of the skill loader,
    namespace `<plugin>:<skill>`
