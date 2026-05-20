@@ -99,7 +99,7 @@ func TestBashList_TerminalJobIncludesExitCode(t *testing.T) {
 	// Wait for the wait-goroutine to record the terminal state.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if pool.Get(j.ID).Status == jobs.StatusFailed {
+		if snap, ok := pool.Snapshot(j.ID); ok && snap.Status == jobs.StatusFailed {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -147,7 +147,7 @@ func TestBashOutput_ReadsRunningJob(t *testing.T) {
 	// Wait for completion so the on-disk file is fully flushed.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if pool.Get(j.ID).Status == jobs.StatusCompleted {
+		if snap, ok := pool.Snapshot(j.ID); ok && snap.Status == jobs.StatusCompleted {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -183,7 +183,7 @@ func TestBashKill_StopsRunningJob(t *testing.T) {
 	// Verify the job actually transitions to Killed.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if pool.Get(j.ID).Status == jobs.StatusKilled {
+		if snap, ok := pool.Snapshot(j.ID); ok && snap.Status == jobs.StatusKilled {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

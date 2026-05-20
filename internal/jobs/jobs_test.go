@@ -36,13 +36,20 @@ func spawnEcho(t *testing.T, r *Registry, msg string) *Job {
 
 // waitForStatus polls the registry until the job leaves StatusRunning
 // or the test deadline trips. Eliminates flaky time.Sleep waits.
+//
+// Uses Snapshot (not Get) so the Status field read is taken under
+// r.mu — the spawn goroutine concurrently writes Status / EndTime /
+// ExitCode from inside waitAndComplete and would race against a
+// naked `r.Get(id).Status` read. The returned *Job is a fresh value
+// copy; callers that need to inspect the LIVE handles (cmd/cancel/
+// output) must still go through Get + lock discipline.
 func waitForStatus(t *testing.T, r *Registry, id string, want Status, timeout time.Duration) *Job {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		j := r.Get(id)
-		if j != nil && j.Status == want {
-			return j
+		snap, ok := r.Snapshot(id)
+		if ok && snap.Status == want {
+			return &snap
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -162,9 +169,14 @@ func TestStop_TerminalStateIsKilled(t *testing.T) {
 		t.Fatal("kill notification never fired")
 	}
 	// Wait for the process to fully exit so our cleanup is real.
+	// Use Snapshot + CleanedUp (both take r.mu) instead of naked
+	// r.Get(id).cmd reads — the spawn goroutine concurrently nils
+	// cmd/cancel/output in waitAndComplete and the race detector
+	// (correctly) caught the unlocked field access.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if got := r.Get(j.ID); got.Status == StatusKilled && got.cmd == nil {
+		snap, ok := r.Snapshot(j.ID)
+		if ok && snap.Status == StatusKilled && r.CleanedUp(j.ID) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

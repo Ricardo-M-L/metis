@@ -406,10 +406,62 @@ func (r *Registry) List() []*Job {
 }
 
 // Get returns the Job with the given ID, or nil if unknown.
+//
+// CAUTION: the returned pointer is to the SAME Job that the spawn
+// goroutine mutates as the process state changes. Reading Status /
+// ExitCode / EndTime through this pointer outside r.mu is a data
+// race. Use Snapshot(id) for safe field reads from a caller that
+// doesn't hold the lock.
 func (r *Registry) Get(id string) *Job {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.jobs[id]
+}
+
+// Snapshot returns a value copy of the Job's public, mutable fields
+// (Status / EndTime / ExitCode + the immutable identifiers) taken
+// under r.mu. The internal handles (cmd / cancel / output) are
+// intentionally NOT copied — callers outside this package shouldn't
+// touch them anyway.
+//
+// Use this instead of `Get(id).Status` when you need to read job
+// state without going through r.mu yourself. Pre-fix waitForStatus
+// in tests did the unsafe pointer-then-read pattern, which the
+// race detector caught against the spawn goroutine's writes
+// (jobs.go:353 waitAndComplete). Bug had latent production
+// equivalents in any caller doing `r.Get(id).Status` outside lock.
+func (r *Registry) Snapshot(id string) (Job, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	j, ok := r.jobs[id]
+	if !ok || j == nil {
+		return Job{}, false
+	}
+	return Job{
+		ID:          j.ID,
+		Command:     j.Command,
+		Description: j.Description,
+		Status:      j.Status,
+		StartTime:   j.StartTime,
+		EndTime:     j.EndTime,
+		ExitCode:    j.ExitCode,
+		OutputPath:  j.OutputPath,
+	}, true
+}
+
+// CleanedUp reports whether the job's internal handles (cmd / cancel /
+// output) have been released — i.e. waitAndComplete finished its
+// cleanup branch. Read under r.mu to stay race-free against the spawn
+// goroutine's nilling writes. Use this instead of `r.Get(id).cmd ==
+// nil` from tests / external code.
+func (r *Registry) CleanedUp(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	j, ok := r.jobs[id]
+	if !ok || j == nil {
+		return false
+	}
+	return j.cmd == nil && j.cancel == nil && j.output == nil
 }
 
 // Stop terminates a job using a two-stage tree-kill: SIGTERM the
