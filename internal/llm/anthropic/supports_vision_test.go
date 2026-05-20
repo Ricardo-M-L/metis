@@ -18,7 +18,14 @@ func TestSupportsVision(t *testing.T) {
 		{"claude-2.1", false},
 		{"claude-2", false},
 		{"claude-instant-1.2", false},
-		{"minimax-m2.7", false}, // wrong family — guarded
+		// MiniMax routes its vision-capable flagship through the
+		// api.minimaxi.com/anthropic-compat layer — user confirms the
+		// endpoint accepts image content blocks. Allow `minimax-m*` and
+		// the explicit `minimax-vl*` variant.
+		{"minimax-m2.7", true},
+		{"minimax-m2", true},
+		{"minimax-vl-01", true},
+		// Non-MiniMax non-Claude families don't use this transport.
 		{"deepseek-v4-pro", false},
 		{"", false},
 	}

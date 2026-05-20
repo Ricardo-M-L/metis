@@ -128,6 +128,7 @@ func (o *OpenAI) ModelID() string { return o.Model }
 func (o *OpenAI) SupportsVision() bool {
 	m := strings.ToLower(o.Model)
 	switch {
+	// OpenAI native lineage.
 	case strings.HasPrefix(m, "gpt-4o"),
 		strings.HasPrefix(m, "gpt-5"),
 		strings.HasPrefix(m, "gpt-4.1"),
@@ -136,6 +137,21 @@ func (o *OpenAI) SupportsVision() bool {
 		strings.HasPrefix(m, "o3"),
 		strings.HasPrefix(m, "o4"),
 		strings.HasPrefix(m, "chatgpt-4o"):
+		return true
+	// Chinese OSS families whose new flagships ship with native vision and
+	// route through the OpenAI-chat shape. Includes both text-flagship names
+	// (deepseek-v4, kimi-k2, glm-5) that user confirms support image_url and
+	// explicit *-vl / *-vision variants.
+	case strings.HasPrefix(m, "deepseek-v4"),
+		strings.HasPrefix(m, "deepseek-vl"),
+		strings.HasPrefix(m, "kimi-k2"),
+		strings.HasPrefix(m, "kimi-latest"),
+		strings.HasPrefix(m, "kimi-vl"),
+		strings.HasPrefix(m, "moonshot-v1-vision"),
+		strings.HasPrefix(m, "glm-5"),
+		strings.HasPrefix(m, "glm-4v"),
+		strings.HasPrefix(m, "qwen-vl"),
+		strings.HasPrefix(m, "qwen2.5-vl"):
 		return true
 	}
 	return false

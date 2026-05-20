@@ -22,10 +22,24 @@ func TestSupportsVision(t *testing.T) {
 		{"gpt-3.5-turbo", false},
 		{"gpt-4", false},  // bare gpt-4 was text-only on launch
 		{"text-davinci-003", false},
-		// Compat-base-URL providers using OpenAI struct
-		{"deepseek-v4-pro", false},
-		{"kimi-k2.6", false},
-		{"glm-5.1", false},
+		// Chinese-OSS vision flagships routed via openai_chat (user-confirmed).
+		{"deepseek-v4-pro", true},
+		{"deepseek-vl-7b", true},
+		{"kimi-k2.6", true},
+		{"kimi-latest", true},
+		{"kimi-vl-thinking", true},
+		{"moonshot-v1-vision-preview", true},
+		{"glm-5.1", true},
+		{"glm-4v-plus", true},
+		{"glm-4v-flash", true},
+		{"qwen-vl-max", true},
+		{"qwen2.5-vl-72b", true},
+		// Pre-vision lineage should stay false.
+		{"deepseek-v3", false},
+		{"deepseek-chat", false},
+		{"kimi-k1.5", false},
+		{"glm-4-flash", false},
+		// minimax-m* routes via the anthropic transport, not openai — keep false here.
 		{"minimax-m2.7", false},
 		{"", false},
 	}

@@ -158,7 +158,12 @@ func (a *Anthropic) SupportsVision() bool {
 		strings.HasPrefix(m, "claude-4"),
 		strings.HasPrefix(m, "claude-opus"),
 		strings.HasPrefix(m, "claude-sonnet"),
-		strings.HasPrefix(m, "claude-haiku"):
+		strings.HasPrefix(m, "claude-haiku"),
+		// MiniMax via the api.minimaxi.com/anthropic-compat layer. User
+		// confirms minimax-m2.x accepts image content blocks through this
+		// endpoint despite the model not matching the Claude lineage.
+		strings.HasPrefix(m, "minimax-m"),
+		strings.HasPrefix(m, "minimax-vl"):
 		return true
 	}
 	return false
