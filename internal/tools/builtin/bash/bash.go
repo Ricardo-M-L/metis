@@ -71,6 +71,7 @@ Use Bash for:
 
 Do NOT use Bash for these — use the dedicated tool, which gives the user a cleaner audit trail and better truncation:
   - Reading files       → use Read (not cat/head/tail/less)
+  - Listing directories → use LS (not ls -la). LS gives structured output and rejects file paths cleanly.
   - Editing files       → use Edit (not sed -i / awk -i / ed)
   - Creating files      → use Write (not 'echo > foo' / 'cat <<EOF')
   - Finding files       → use Glob (not find -name)
@@ -664,12 +665,21 @@ var blockedSleepRE = regexp.MustCompile(`^\s*sleep\s+(\d+)\s*(.*)$`)
 // foreground turn.
 func detectBlockedSleepPattern(cmd string) string {
 	cmd = strings.TrimSpace(cmd)
-	// Inside a pipeline / subshell / heredoc / for-loop, sleep is
-	// fine — those are real scripts, not idle polls.
-	if strings.ContainsAny(cmd, "|()<>") {
+	// for / while loop with embedded sleep is a real script
+	// (polling with structure), not the bare-sleep anti-pattern.
+	if strings.Contains(cmd, "for ") || strings.Contains(cmd, "while ") {
 		return ""
 	}
-	if strings.Contains(cmd, "for ") || strings.Contains(cmd, "while ") {
+	// Sleep INSIDE a subshell or heredoc is allowed (real script).
+	// We check by looking at the FIRST non-whitespace token: only
+	// reject when `sleep` IS the leading command. Previous version
+	// rejected via ContainsAny(cmd, "|()<>") which over-matched —
+	// `sleep 60 && find ... | wc -l` got passed because the `|`
+	// belonged to the *trailing* find pipeline, not the leading
+	// sleep (image #50 session 5d9a38e5 repro 2026-05-21). The
+	// post-chain pipeline doesn't change the fact that the model
+	// is polling on `sleep N &&`.
+	if strings.HasPrefix(cmd, "(") || strings.HasPrefix(cmd, "{") {
 		return ""
 	}
 	m := blockedSleepRE.FindStringSubmatch(cmd)
@@ -687,9 +697,18 @@ func detectBlockedSleepPattern(cmd string) string {
 	if rest == "" {
 		return fmt.Sprintf("standalone `sleep %d`", secs)
 	}
-	// `sleep N && check` or `sleep N; check` — also rejected.
-	if strings.HasPrefix(rest, "&&") || strings.HasPrefix(rest, ";") {
+	// `sleep N && check` / `sleep N; check` — explicit chain. The
+	// chained tail can have anything (pipelines, redirects); the
+	// rejection is about the LEADING sleep, not the tail.
+	if strings.HasPrefix(rest, "&&") || strings.HasPrefix(rest, ";") || strings.HasPrefix(rest, "||") {
 		return fmt.Sprintf("`sleep %d` followed by chained command", secs)
+	}
+	// `sleep 5 | something` — also a polling-then-pipe pattern. The
+	// `|` immediately after sleep is the same anti-pattern (model
+	// waits then processes); we reject so the model picks a real
+	// signal instead.
+	if strings.HasPrefix(rest, "|") {
+		return fmt.Sprintf("`sleep %d` piped into another command", secs)
 	}
 	// e.g. `sleep 5 anything-else` (rare); reject to be safe.
 	return fmt.Sprintf("`sleep %d` with trailing args", secs)

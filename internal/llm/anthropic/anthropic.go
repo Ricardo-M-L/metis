@@ -475,8 +475,35 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 					Type: "tool_use", ID: c.ToolUseID, Name: c.ToolName, Input: c.ToolInput,
 				})
 			case "tool_result":
+				// Vision-aware tools (ViewImage etc.) populate
+				// ToolResultBlocks with a [{text}, {image}, ...]
+				// shape. Anthropic accepts this natively for
+				// tool_result, so the model sees the image inside
+				// the same turn as the textual tool output. Empty
+				// blocks → fall back to the string ToolResult that
+				// every other tool produces.
+				var trContent any
+				if len(c.ToolResultBlocks) > 0 {
+					sub := make([]anthropicContent, 0, len(c.ToolResultBlocks))
+					for _, b := range c.ToolResultBlocks {
+						switch b.Type {
+						case "text":
+							sub = append(sub, anthropicContent{Type: "text", Text: b.Text})
+						case "image":
+							sub = append(sub, anthropicContent{
+								Type: "image",
+								Source: &anthropicImageSource{
+									Type: "base64", MediaType: b.MediaType, Data: b.Data,
+								},
+							})
+						}
+					}
+					trContent = sub
+				} else {
+					trContent = c.ToolResult
+				}
 				am.Content = append(am.Content, anthropicContent{
-					Type: "tool_result", ToolUseID: c.ToolUseID, Content: c.ToolResult, IsError: c.IsError,
+					Type: "tool_result", ToolUseID: c.ToolUseID, Content: trContent, IsError: c.IsError,
 				})
 			case "image":
 				am.Content = append(am.Content, anthropicContent{

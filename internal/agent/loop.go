@@ -267,7 +267,14 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 		h = NewHookRegistry()
 	}
 	if maxIter <= 0 {
-		maxIter = 50
+		// 2026-05-21: bumped 50 → 150. Top-level turns for large
+		// tasks (project rewrite, multi-file refactor, "explore the
+		// whole codebase") routinely exceeded 50 iter and got
+		// truncated. claude-code's forkSubagent runs at 200; we set
+		// the parent at 150 so it caps below maxBudget while still
+		// giving non-trivial tasks room. Override via CLI
+		// `--max-iter` or per-call max_iter on Agent/Fork.
+		maxIter = 150
 	}
 	return &Loop{
 		Provider:                    p,
@@ -281,13 +288,26 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 	}
 }
 
-// AppendUser adds a user message.
+// AppendUser adds a user message. When the text contains a
+// "rewrite/port/migrate" intent and the loop hasn't yet entered
+// plan mode, a `<system-reminder>` block is PREPENDED to the user's
+// content listing the required Plan→Ask sequence (see plan_trigger.go
+// for the rationale + trigger list). This backs up the prompt-level
+// guidance in 08_interaction_modes.md with a model-independent
+// runtime intercept.
 func (l *Loop) AppendUser(text string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	content := []llm.ContentBlock{{Type: "text", Text: text}}
+	if shouldInjectPlanTrigger(text, detectPlanModeEntered(l.Messages)) {
+		content = []llm.ContentBlock{
+			{Type: "text", Text: planTriggerReminder},
+			{Type: "text", Text: text},
+		}
+	}
 	l.Messages = append(l.Messages, llm.Message{
 		Role:    llm.RoleUser,
-		Content: []llm.ContentBlock{{Type: "text", Text: text}},
+		Content: content,
 	})
 }
 
@@ -295,12 +315,29 @@ func (l *Loop) AppendUser(text string) {
 // blocks — used by the TUI to attach pasted images alongside text.
 // Empty blocks input is ignored (avoids polluting the message log
 // with no-op user turns).
+//
+// Same plan-trigger detection as AppendUser. We scan the text blocks
+// (skipping image blocks) for a trigger phrase. When matched, the
+// system-reminder block is PREPENDED to whatever the caller passed.
 func (l *Loop) AppendUserBlocks(blocks []llm.ContentBlock) {
 	if len(blocks) == 0 {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Concatenate text-only blocks for trigger detection.
+	var textBuf strings.Builder
+	for _, b := range blocks {
+		if b.Type == "text" {
+			if textBuf.Len() > 0 {
+				textBuf.WriteByte(' ')
+			}
+			textBuf.WriteString(b.Text)
+		}
+	}
+	if shouldInjectPlanTrigger(textBuf.String(), detectPlanModeEntered(l.Messages)) {
+		blocks = append([]llm.ContentBlock{{Type: "text", Text: planTriggerReminder}}, blocks...)
+	}
 	l.Messages = append(l.Messages, llm.Message{
 		Role:    llm.RoleUser,
 		Content: blocks,

@@ -30,7 +30,19 @@ import (
 	"time"
 )
 
-const statusLineRefresh = 5 * time.Second
+// statusLineRefresh is how often the status-line script re-runs.
+// Mutable so config.UI.StatusLineRefresh() can override at startup
+// via SetStatusLineRefresh (2026-05-22).
+var statusLineRefresh = 5 * time.Second
+
+// SetStatusLineRefresh overrides the status-line refresh tick.
+// Called once at startup from cmd/metis/main.go.
+func SetStatusLineRefresh(d time.Duration) {
+	if d > 0 {
+		statusLineRefresh = d
+	}
+}
+
 const statusLineExecTimeout = 1 * time.Second
 
 var (

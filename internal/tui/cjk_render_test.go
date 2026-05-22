@@ -69,6 +69,13 @@ func TestTruncate_ASCIIUnchangedShortCase(t *testing.T) {
 // rendering pipeline: the Bash tool with a CJK command argument
 // produces a clean preview string with no invalid bytes. This is the
 // direct reproduction of the user's image #14 bug.
+//
+// 2026-05-20 update (user-requested full-path preview): the rune cap
+// rose from 45 to toolArgsPreviewMaxRunes=200, so this normal-length
+// CJK path now renders in full. The CRITICAL invariant the test
+// still pins is valid UTF-8 (no mid-codepoint rune-slice corruption).
+// Truncation behavior at the new boundary is verified in
+// TestToolArgsPreview_TruncatesAt200 below.
 func TestToolArgsPreview_Bash_CJKPath(t *testing.T) {
 	input := map[string]any{
 		"command": "ls -la /Users/ricardo/Documents/公司学习文件/我自己的agent的cli/metis",
@@ -77,8 +84,56 @@ func TestToolArgsPreview_Bash_CJKPath(t *testing.T) {
 	if !utf8.ValidString(got) {
 		t.Errorf("toolArgsPreview emitted invalid UTF-8 (the image #14 corruption): %q", got)
 	}
+	// Short-enough path (<200 runes) renders in full — no ellipsis.
+	if strings.HasSuffix(got, "…") {
+		t.Errorf("path under 200 runes should render in full; unexpected truncation: %q", got)
+	}
+}
+
+// TestToolArgsPreview_TruncatesAt200 — confirms the rune-aware cap
+// still kicks in for pathological inputs (Bash heredoc that's
+// thousands of chars). Truncation must end at a rune boundary, not
+// mid-codepoint, and end with the literal "…".
+func TestToolArgsPreview_TruncatesAt200(t *testing.T) {
+	huge := strings.Repeat("a公b司c学", 50) // 6 runes × 50 = 300 runes
+	input := map[string]any{"command": huge}
+	got := toolArgsPreview("Bash", input)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncation produced invalid UTF-8: %q", got)
+	}
 	if !strings.HasSuffix(got, "…") {
-		t.Errorf("long path should be truncated with …; got %q", got)
+		t.Errorf("300-rune input should end with …; got %q", got)
+	}
+	rs := []rune(got)
+	if len(rs) != toolArgsPreviewMaxRunes {
+		t.Errorf("truncated length = %d runes, want %d", len(rs), toolArgsPreviewMaxRunes)
+	}
+}
+
+// TestToolArgsPreview_ReadShowsFullPath — pre-fix Read previews used
+// basename(path), losing directory context. User reported the loss
+// made it impossible to tell which file in a nested project the
+// agent touched. The absolute path now renders verbatim.
+func TestToolArgsPreview_ReadShowsFullPath(t *testing.T) {
+	abs := "/Users/ricardo/Documents/公司学习文件/我自己的agent的cli/metis/internal/tui/render_util.go"
+	input := map[string]any{"path": abs}
+	got := toolArgsPreview("Read", input)
+	if got != abs {
+		t.Errorf("Read preview lost path detail: got %q, want %q", got, abs)
+	}
+}
+
+// TestToolArgsPreview_RelativePathResolved — relative paths should be
+// promoted to absolute via filepath.Abs so the user can copy-paste
+// without guessing the agent's cwd.
+func TestToolArgsPreview_RelativePathResolved(t *testing.T) {
+	input := map[string]any{"path": "render_util.go"}
+	got := toolArgsPreview("Read", input)
+	if !strings.HasPrefix(got, "/") {
+		t.Errorf("relative path should be resolved to absolute (leading /); got %q", got)
+	}
+	if !strings.HasSuffix(got, "/render_util.go") {
+		t.Errorf("resolved path should preserve the file name; got %q", got)
 	}
 }
 

@@ -68,7 +68,15 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// to "requesting" (↑).
 		m.firstStreamAt = time.Time{}
 		m.spinnerPhase = "tool"
-		m.toolEvents = append(m.toolEvents, ToolEvent{Kind: "start", ToolName: ev.ToolName, Input: ev.ToolInput, StartTime: time.Now()})
+		// Stamp ev.ToolUseID into ToolEvent.ID so the matching loop
+		// in EventToolResult can pair Result→Start by ID instead of
+		// by ToolName. Pre-2026-05-21 the match was ToolName-only,
+		// which silently mis-paired parallel same-name calls:
+		// 5 concurrent "sub: Read" Starts followed by 5 Results in
+		// any order matched against the LATEST Start each time, so
+		// Duration ended up ~0ms regardless of real wall time
+		// (image #48 repro: 200+ file Reads all showing "0ms").
+		m.toolEvents = append(m.toolEvents, ToolEvent{ID: ev.ToolUseID, Kind: "start", ToolName: ev.ToolName, Input: ev.ToolInput, StartTime: time.Now()})
 		m.spinnerVerb = toolVerb(ev.ToolName)
 		m.spinnerSub = toolArgsPreview(ev.ToolName, ev.ToolInput)
 		// Sub-agent visualization: when the Agent tool fires, push
@@ -124,13 +132,42 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		if ev.ToolResult == nil {
 			return
 		}
+		// Match Result→Start by ToolUseID (2026-05-21 fix). Falling
+		// back to ToolName when ID is empty preserves the old code
+		// path for any legacy event source that doesn't propagate
+		// the id — but every current producer (dispatch.go +
+		// forwardSubAgentEvent) preserves ToolUseID through the
+		// shallow event copy, so the ID path should always hit.
+		// Without this, parallel same-name sub-agent calls all
+		// mis-paired against the latest Start → Duration ≈ 0ms
+		// (image #48 repro 200+ Reads showing 0ms).
+		matched := false
 		for i := len(m.toolEvents) - 1; i >= 0; i-- {
-			if m.toolEvents[i].ToolName == ev.ToolName && m.toolEvents[i].Kind == "start" {
+			if m.toolEvents[i].Kind != "start" {
+				continue
+			}
+			if ev.ToolUseID != "" && m.toolEvents[i].ID == ev.ToolUseID {
 				m.toolEvents[i].Kind = "result"
 				m.toolEvents[i].Output = ev.ToolResult.Output
 				m.toolEvents[i].IsError = ev.ToolResult.IsError
 				m.toolEvents[i].Duration = time.Since(m.toolEvents[i].StartTime)
+				matched = true
 				break
+			}
+		}
+		if !matched {
+			// Legacy fallback: match by ToolName + Kind. Only fires
+			// for events without ToolUseID (none in current code,
+			// but keeps test fixtures + older session replays
+			// compatible).
+			for i := len(m.toolEvents) - 1; i >= 0; i-- {
+				if m.toolEvents[i].ToolName == ev.ToolName && m.toolEvents[i].Kind == "start" {
+					m.toolEvents[i].Kind = "result"
+					m.toolEvents[i].Output = ev.ToolResult.Output
+					m.toolEvents[i].IsError = ev.ToolResult.IsError
+					m.toolEvents[i].Duration = time.Since(m.toolEvents[i].StartTime)
+					break
+				}
 			}
 		}
 		m.spinnerVerb = chooseSpinnerVerb(m.sessionID)
@@ -289,13 +326,24 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		m.spinnerCompactionBytes = 0
 		SetTerminalProgress(ProgressClear)
 	case agent.EventInfo:
-		// Sniff for compaction events — emit them with a distinctive
-		// ✻ banner so the user sees "your context just got compressed"
-		// instead of a dim grey info line buried in the transcript.
-		// Without this, post-compaction "amnesia" surprises users.
+		// Sniff for distinctive payload shapes that deserve their own
+		// renderer — "info" Role uses styleMuted which is correct for
+		// short status pings ("expand tool output: on") but wrong for
+		// content the user actually needs to read.
+		//
+		//   - "context compacted:" → role="compaction" (✻ banner)
+		//   - "[plan proposal]\n..." → role="plan-proposal" so the
+		//     full plan markdown renders at default fg via glamour
+		//     instead of being wrapped in styleMuted's washed-out
+		//     grey (image #43 repro 2026-05-21: user couldn't tell
+		//     plan-proposal apart from a routine info row because
+		//     both were rendered the same dim color).
 		role := "info"
-		if strings.HasPrefix(ev.Info, "context compacted:") {
+		switch {
+		case strings.HasPrefix(ev.Info, "context compacted:"):
 			role = "compaction"
+		case strings.HasPrefix(ev.Info, "[plan proposal]"):
+			role = "plan-proposal"
 		}
 		m.messages = append(m.messages, Message{Role: role, Content: ev.Info, Timestamp: time.Now()})
 	case agent.EventPlan:

@@ -64,9 +64,68 @@ func TestRead_OffsetLimit(t *testing.T) {
 
 func TestRead_RelativePathRejected(t *testing.T) {
 	r := Read{gate: bypassGate()}
-	_, err := r.Execute(context.Background(), map[string]any{"path": "relative.txt"})
-	if err == nil {
-		t.Fatal("expected error for relative path")
+	// 2026-05-21: Read switched from `return nil, errors.New(...)`
+	// to soft Result{IsError:true} so the model sees a richer
+	// "did you mean ..." style message instead of a raw Go error.
+	res, err := r.Execute(context.Background(), map[string]any{"path": "relative.txt"})
+	if err != nil {
+		t.Fatalf("relative-path call should return soft Result.IsError, not Go err; got: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected Result.IsError=true for relative path")
+	}
+	if !strings.Contains(res.Output, "absolute") {
+		t.Errorf("relative-path error should mention 'absolute'; got %q", res.Output)
+	}
+}
+
+// TestRead_EmptyPathRichError — image-#? repro 2026-05-21: model
+// looped on the bare "path is required" error. New rich message
+// names the expected shape AND `did you mean` hints for common
+// misuse fields (`file_path`, `command`, `pattern`).
+func TestRead_EmptyPathRichError(t *testing.T) {
+	r := Read{gate: bypassGate()}
+	res, err := r.Execute(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("empty-path call should return soft error; got Go err: %v", err)
+	}
+	if !res.IsError {
+		t.Error("expected Result.IsError=true on missing path")
+	}
+	for _, want := range []string{"`path` field is required", "absolute path", "LS", "Bash", "Glob"} {
+		if !strings.Contains(res.Output, want) {
+			t.Errorf("missing %q in error; got:\n%s", want, res.Output)
+		}
+	}
+}
+
+// TestRead_FilePathFieldHint — the common snake-case slip:
+// model used `file_path` (jsonschema-style) instead of `path`.
+// Should suggest renaming + show the value.
+func TestRead_FilePathFieldHint(t *testing.T) {
+	r := Read{gate: bypassGate()}
+	res, _ := r.Execute(context.Background(), map[string]any{"file_path": "/abs/path/to/file.go"})
+	if !res.IsError {
+		t.Fatal("expected IsError=true")
+	}
+	if !strings.Contains(res.Output, "argument name is `path`") {
+		t.Errorf("expected `path` rename hint; got:\n%s", res.Output)
+	}
+}
+
+// TestRead_CommandFieldRedirectsToBash — model put a shell command
+// in `command` field thinking Read was Bash. Hint should redirect
+// to Bash explicitly.
+func TestRead_CommandFieldRedirectsToBash(t *testing.T) {
+	r := Read{gate: bypassGate()}
+	res, _ := r.Execute(context.Background(), map[string]any{
+		"command": "ls -la /tmp",
+	})
+	if !res.IsError {
+		t.Fatal("expected IsError=true")
+	}
+	if !strings.Contains(res.Output, "Bash") {
+		t.Errorf("expected Bash redirect; got:\n%s", res.Output)
 	}
 }
 
@@ -107,12 +166,20 @@ func TestWrite_HappyPath(t *testing.T) {
 
 func TestWrite_RelativePathRejected(t *testing.T) {
 	w := Write{gate: bypassGate()}
-	_, err := w.Execute(context.Background(), map[string]any{
+	// 2026-05-22: Write switched to soft Result{IsError:true} so
+	// the model gets a redirect hint. No Go-level err anymore.
+	res, err := w.Execute(context.Background(), map[string]any{
 		"path":    "rel.txt",
 		"content": "x",
 	})
-	if err == nil {
-		t.Fatal("expected error for relative path")
+	if err != nil {
+		t.Fatalf("expected soft IsError, not Go err; got: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true for relative path")
+	}
+	if !strings.Contains(res.Output, "absolute") {
+		t.Errorf("error should mention 'absolute'; got %q", res.Output)
 	}
 }
 
@@ -377,12 +444,19 @@ func TestLS_RelativePathResolvesToCwd(t *testing.T) {
 }
 
 // TestLS_EmptyPathRejected makes sure we still surface a clear error
-// when the LLM omits the parameter entirely.
+// when the LLM omits the parameter entirely. 2026-05-22: now soft
+// Result{IsError:true} with a redirect hint, not Go-level err.
 func TestLS_EmptyPathRejected(t *testing.T) {
 	l := LS{gate: bypassGate()}
-	_, err := l.Execute(context.Background(), map[string]any{"path": ""})
-	if err == nil {
-		t.Fatal("expected error for empty path")
+	res, err := l.Execute(context.Background(), map[string]any{"path": ""})
+	if err != nil {
+		t.Fatalf("expected soft IsError, not Go err; got: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true for empty path")
+	}
+	if !strings.Contains(res.Output, "`path` is required") {
+		t.Errorf("error should mention path requirement; got %q", res.Output)
 	}
 }
 

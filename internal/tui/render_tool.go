@@ -13,7 +13,6 @@ package tui
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"charm.land/lipgloss/v2"
 	udiff "github.com/aymanbagabas/go-udiff"
@@ -114,7 +113,17 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 			s.WriteString(renderErrorBody(te.Output, expanded))
 		}
 	} else {
-		switch te.ToolName {
+		// Strip the forwarded-sub-agent "sub: " prefix when routing
+		// to tool-specific renderers. Pre-2026-05-21 the switch
+		// matched exact "Edit" / "Write" / "TodoWrite", so any
+		// "sub: Edit" / "sub: Write" from a child agent fell through
+		// to the bare-Output default and the user saw "wrote
+		// /path/to/file" instead of the red/green diff or content
+		// preview (image #49 repro). The display name above keeps
+		// the "sub: " prefix so the user still sees it came from a
+		// sub-agent; only the renderer dispatch uses the base name.
+		baseName := strings.TrimPrefix(te.ToolName, "sub: ")
+		switch baseName {
 		case "Edit":
 			s.WriteString(renderEditDiff(te.Input, expanded))
 		case "Write":
@@ -199,8 +208,24 @@ func truncateMiddle(s string, maxRunes int) string {
 // summarizeToolResult crafts the per-tool one-line description that
 // follows the ⎿ checkmark. Format is `<elapsed> · <tool-specific phrase>`.
 func summarizeToolResult(te ToolEvent) string {
-	dur := te.Duration.Truncate(time.Millisecond).String()
-	switch te.ToolName {
+	// Use formatElapsed (tui_spinner.go) instead of bare
+	// Duration.String() so a zero-or-sub-millisecond Duration
+	// renders as "0ms" rather than "0s" — image #27 (2026-05-21):
+	// user saw rows alternating "0s · Read foo.py" / "7ms · Read
+	// bar.py" because the upstream Duration was sometimes literally
+	// zero (when the tool finished faster than the millisecond
+	// timer could capture, or the measurement was skipped on a
+	// fast path) and time.Duration.String() formats 0 as "0s".
+	// formatElapsed always picks the unit by magnitude, so 0
+	// becomes "0ms" — same column-shape as the rest.
+	dur := formatElapsed(te.Duration)
+	// Strip "sub: " for the switch dispatch so per-tool summaries
+	// (Read line count, Edit added/removed, Write line count, etc.)
+	// fire for forwarded sub-agent events too. Pre-2026-05-21 a
+	// "sub: Write" fell to the default branch and lost the
+	// "Wrote /file (N lines)" detail. See sibling fix in
+	// renderToolEvent above.
+	switch strings.TrimPrefix(te.ToolName, "sub: ") {
 	case "Read":
 		path := stringField(te.Input, "path", "file_path")
 		// Error-path: te.Output is the error message (e.g. a stat

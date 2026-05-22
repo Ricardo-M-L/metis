@@ -2,7 +2,6 @@ package builtin
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,10 +81,21 @@ func (w Write) Execute(_ context.Context, in map[string]any) (*tools.Result, err
 	path, _ := in["path"].(string)
 	content, _ := in["content"].(string)
 	if path == "" {
-		return nil, errors.New("path is required")
+		// 2026-05-22: unify with Read/Glob/LS error style — soft
+		// Result{IsError:true} + redirect hint instead of bare
+		// errors.New short-circuit. Helps the model recover on
+		// common misuse (passing `file_path` instead of `path`,
+		// passing a `command` field thinking Write is Bash, etc).
+		return &tools.Result{
+			Output:  "Write: `path` field is required (absolute path to a file)." + writeMisuseHint(in),
+			IsError: true,
+		}, nil
 	}
 	if !filepath.IsAbs(path) {
-		return nil, errors.New("path must be absolute")
+		return &tools.Result{
+			Output:  "Write: `path` must be absolute (you passed \"" + truncForReadHint(path, 80) + "\"). Use the full path like /Users/.../project/" + path + ".",
+			IsError: true,
+		}, nil
 	}
 	if len(content) > MaxWriteContentBytes {
 		return &tools.Result{
@@ -151,4 +161,23 @@ func (w Write) Execute(_ context.Context, in map[string]any) (*tools.Result, err
 		}
 	}
 	return &tools.Result{Output: "wrote " + path}, nil
+}
+
+// writeMisuseHint inspects the input bag when `path` is empty and
+// names the right tool / arg for shapes we've seen the model misuse.
+// Mirrors readMisuseHint / globMisuseHint. Common confusions:
+//   - `file_path` (snake-case variant) → rename to `path`
+//   - `command` / `cmd` → wanted Bash
+//   - `pattern` → wanted Glob (file search, not write)
+func writeMisuseHint(in map[string]any) string {
+	if fp, _ := in["file_path"].(string); fp != "" {
+		return "\n\nYou passed `file_path` (\"" + truncForReadHint(fp, 80) + "\"). The argument name is `path`, not `file_path`. Try Write({path: \"" + truncForReadHint(fp, 80) + "\", content: \"...\"})."
+	}
+	if cmd, _ := in["command"].(string); cmd != "" {
+		return "\n\nYou passed a `command` field. That's the Bash tool's input — call Bash if you want to run a shell command. Write is for creating files."
+	}
+	if _, hasContent := in["content"]; !hasContent {
+		return "\n\nDid you also forget `content`? Write needs BOTH `path` (where to write) and `content` (what to write)."
+	}
+	return ""
 }

@@ -21,7 +21,7 @@ func TestRenderQueuePill_EmptyQueueRendersNothing(t *testing.T) {
 func TestRenderQueuePill_ShowsCountAndPeek(t *testing.T) {
 	m := &Model{
 		width:         100,
-		queuedPrompts: []string{"finish writing the integration test", "then format the diff"},
+		queuedPrompts: []queuedItem{{Text: "finish writing the integration test"}, {Text: "then format the diff"}},
 	}
 	got := renderQueuePill(m)
 	if got == "" {
@@ -37,7 +37,7 @@ func TestRenderQueuePill_ShowsCountAndPeek(t *testing.T) {
 
 func TestRenderQueuePill_TruncatesLongPeek(t *testing.T) {
 	long := strings.Repeat("a", 200)
-	m := &Model{width: 80, queuedPrompts: []string{long}}
+	m := &Model{width: 80, queuedPrompts: []queuedItem{{Text: long}}}
 	got := renderQueuePill(m)
 	if !strings.Contains(got, "…") {
 		t.Errorf("expected ellipsis on long peek; got: %q", got)

@@ -69,7 +69,7 @@ func (s SubAgentList) CanUse(_ context.Context, _ map[string]any) (tools.Permiss
 
 func (s SubAgentList) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
 	if s.roster == nil {
-		return &tools.Result{Output: "(no sub-agents — Roster not wired in this session)"}, nil
+		return &tools.Result{Output: "(no sub-agents — Roster wiring missing. This typically happens in headless `metis run` mode or when the loop was constructed without a Roster. Use `metis chat` for interactive sub-agent dispatch.)"}, nil
 	}
 	teammates := s.roster.List()
 	if len(teammates) == 0 {
@@ -151,7 +151,7 @@ func (s SubAgentOutput) CanUse(_ context.Context, _ map[string]any) (tools.Permi
 
 func (s SubAgentOutput) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	if s.roster == nil {
-		return &tools.Result{Output: "(no sub-agents — Roster not wired in this session)", IsError: true}, nil
+		return &tools.Result{Output: "(no sub-agents — Roster wiring missing. This typically happens in headless `metis run` mode or when the loop was constructed without a Roster. Use `metis chat` for interactive sub-agent dispatch.)", IsError: true}, nil
 	}
 	t, err := lookupTeammate(s.roster, in)
 	if err != nil {
@@ -228,7 +228,7 @@ func (s SubAgentStop) CanUse(_ context.Context, _ map[string]any) (tools.Permiss
 
 func (s SubAgentStop) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	if s.roster == nil {
-		return &tools.Result{Output: "(no sub-agents — Roster not wired in this session)", IsError: true}, nil
+		return &tools.Result{Output: "(no sub-agents — Roster wiring missing. This typically happens in headless `metis run` mode or when the loop was constructed without a Roster. Use `metis chat` for interactive sub-agent dispatch.)", IsError: true}, nil
 	}
 	t, err := lookupTeammate(s.roster, in)
 	if err != nil {

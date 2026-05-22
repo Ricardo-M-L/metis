@@ -697,22 +697,33 @@ func (m *Model) finalizeTurn(err error) {
 		}
 	}
 	// Queued messages — claude-code parity. After the turn finishes,
-	// dequeue the head and submit it as the next user turn. We only
-	// run on success: a turn that errored out leaves the queue intact
-	// so the user can decide whether to retry or wipe it via Ctrl+C.
+	// drain the highest-priority batch (priority-aware) and submit
+	// it as the next user turn. Multi-item batches join with blank
+	// lines so the model sees one merged message instead of N
+	// round-trips (claude-code messageQueueManager `dequeueAllMatching`
+	// parity). We only run on success: a turn that errored out
+	// leaves the queue intact so the user can retry or wipe via
+	// Ctrl+C.
 	if err == nil && len(m.queuedPrompts) > 0 {
-		next := m.queuedPrompts[0]
-		m.queuedPrompts = m.queuedPrompts[1:]
-		m.messages = append(m.messages, Message{
-			Role:      "info",
-			Content:   fmt.Sprintf("(dequeued · %d remaining)", len(m.queuedPrompts)),
-			Timestamp: time.Now(),
-		})
-		m.input.SetValue(next)
-		// Defer the actual submit one tick — finalizeTurn is on the
-		// fast path, and submitInput needs a fresh frame to read the
-		// updated input value.
-		m.queuePending = true
+		nextText, batchN := m.drainNextQueuedBatch()
+		if batchN > 0 {
+			var notice string
+			if batchN == 1 {
+				notice = fmt.Sprintf("(dequeued · %d remaining)", len(m.queuedPrompts))
+			} else {
+				notice = fmt.Sprintf("(dequeued ×%d merged · %d remaining)", batchN, len(m.queuedPrompts))
+			}
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   notice,
+				Timestamp: time.Now(),
+			})
+			m.input.SetValue(nextText)
+			// Defer the actual submit one tick — finalizeTurn is on
+			// the fast path, and submitInput needs a fresh frame to
+			// read the updated input value.
+			m.queuePending = true
+		}
 	}
 }
 

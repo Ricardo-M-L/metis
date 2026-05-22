@@ -21,6 +21,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
@@ -123,8 +124,13 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "tools", Aliases: []string{"t"}, Description: "list available tools", Handler: cmdTools})
 
 	// === Skills ===
+	// /skills is the canonical form; the singular /skill alias was
+	// removed on 2026-05-22 (user request — image #51): the duplicate
+	// row cluttered the slash-command autocomplete picker without
+	// adding new functionality. The handler cmdSkill stays in the
+	// codebase as cmdSkills's implementation, just not registered
+	// under its own name.
 	r.Register(REPLCommand{Name: "skills", Aliases: []string{"sk"}, Description: "skills: list | install | remove | info | edit | enable | disable | create | search (local)", Handler: cmdSkills})
-	r.Register(REPLCommand{Name: "skill", Description: "alias of /skills (singular form; /skill search hits github)", Handler: cmdSkill})
 
 	// === MCP ===
 	r.Register(REPLCommand{Name: "mcp", Description: "MCP ops: list | add | remove | start | enable | disable | edit | test | logs | reload", Handler: cmdMCP})
@@ -454,6 +460,15 @@ func cmdReplay(r *REPL, args string) string {
 	for i := len(hist) - 1; i >= 0; i-- {
 		if hist[i].Role == llm.RoleUser && len(hist[i].Content) > 0 {
 			text := hist[i].Content[0].Text
+			// 2026-05-21: if the TUI provides InsertInput, prefill
+			// the input box for one-keystroke re-send. Same UX
+			// upgrade cmdReview got on 2026-05-18. Falls back to
+			// the legacy "copy this" mode for headless runs without
+			// the bridge.
+			if r != nil && r.InsertInput != nil {
+				r.InsertInput(text)
+				return "replay: prompt loaded into input — edit if needed, press Enter to re-send"
+			}
 			return "replay: copy the prompt and re-submit:\n  " + text
 		}
 	}
@@ -461,16 +476,46 @@ func cmdReplay(r *REPL, args string) string {
 }
 
 // cmdTasks reads the TodoRead store for the current session and
-// renders the items inline.
+// renders the items inline — content + status + id, not just the
+// in-flight count. Pre-2026-05-21 this only returned the count
+// (image #35 user complaint: "shows complete but todos below not
+// checked"). Now mirrors the TodoRead tool's output format so the
+// user sees the same picture the model sees.
 func cmdTasks(r *REPL, args string) string {
 	if r.SessionID == "" {
 		return "tasks: no session id"
 	}
-	n := tasksRunningCount(r.SessionID)
-	if n == 0 {
-		return "tasks: no in-progress / pending todos"
+	tl, err := tasks.Load(r.SessionID)
+	if err != nil {
+		return "tasks: " + err.Error()
 	}
-	return fmt.Sprintf("tasks: %d in flight (TodoWrite from agent loop populates this)", n)
+	if tl == nil || len(tl.Items) == 0 {
+		return "tasks: no todos yet — TodoWrite from the agent loop populates this"
+	}
+	// Render rows as `<icon> <content>` — claude-code's TaskListV2
+	// (components/TaskListV2.tsx:303+313) shows icon + subject only,
+	// no id, no status word. The id is an implementation detail of
+	// TodoWrite dedup; users don't need to see it (they don't pass
+	// ids manually).  The status icon already communicates state.
+	var b strings.Builder
+	pending, inProgress, completed := 0, 0, 0
+	for _, it := range tl.Items {
+		icon := "○"
+		switch it.Status {
+		case "completed":
+			icon = "●"
+			completed++
+		case "in_progress":
+			icon = "◐"
+			inProgress++
+		default:
+			pending++
+		}
+		fmt.Fprintf(&b, "%s %s\n", icon, it.Content)
+	}
+	header := fmt.Sprintf("tasks: %d total · %d done · %d in-progress · %d pending\n\n",
+		len(tl.Items), completed, inProgress, pending)
+	return header + strings.TrimRight(b.String(), "\n")
 }
 
 // cmdIDE shows IDE / remote-bridge status so the user knows whether
@@ -1484,7 +1529,7 @@ func cmdStatusLine(r *REPL, args string) string {
 		{Key: "  tokens", Value: "context-window load + percent (right-aligned)"},
 		{Key: "  spinner", Value: "↑in / ↓out per-turn breakdown"},
 		{Key: "", Value: ""},
-		{Key: "", Value: "Full preset picker (/statusline cycle) — coming in a future release."},
+		{Key: "", Value: "Customize via [ui] section in ~/.metis/config.toml."},
 	})
 }
 

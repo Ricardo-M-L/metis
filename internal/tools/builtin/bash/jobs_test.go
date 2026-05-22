@@ -217,10 +217,26 @@ func TestDetectBlockedSleepPattern(t *testing.T) {
 		{"sleep 5; echo done", true},
 		{"sleep 1", false},                        // sub-2s allowed
 		{"sleep 0.5", false},                      // float allowed (regex matches integer only)
-		{"echo a | sleep 5", false},               // in pipeline → allowed
+		{"echo a | sleep 5", false},               // sleep at TAIL of pipe → allowed
 		{"(sleep 5; echo b)", false},              // in subshell → allowed
+		{"{ sleep 5; echo done; }", false},        // brace group → allowed
 		{"for i in 1 2; do sleep 5; done", false}, // in for-loop → allowed
+		{"while true; do sleep 5; done", false},   // in while-loop → allowed
 		{"echo no-sleep-here", false},
+		// 2026-05-21 image #50 / session 5d9a38e5 regression:
+		// `sleep N && find ... 2>/dev/null | wc -l` got PAST the
+		// old blocker because cmd contained `|` `>` and the
+		// pre-fix check `ContainsAny(cmd, "|()<>")` over-matched
+		// the trailing pipe as "in pipeline". The model used this
+		// to poll sub-agent progress 3 times in a row.
+		{`sleep 30 && find /Users/x -name "*.go" 2>/dev/null | wc -l`, true},
+		{`sleep 60 && find /Users/x -name "*.go" 2>/dev/null | wc -l`, true},
+		{`sleep 120 && find /Users/x -name "*.go" 2>/dev/null | wc -l`, true},
+		// `||` chain (rare but possible)
+		{"sleep 30 || echo fallback", true},
+		// `sleep N | rest` (pipe right after sleep, no &&) — also
+		// polling-then-process, reject.
+		{"sleep 30 | xargs echo", true},
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {

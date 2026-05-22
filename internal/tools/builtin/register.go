@@ -61,6 +61,7 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 		Grep{gate: gate},
 		WebFetch{gate: gate},
 		WebBrowse{gate: gate},
+		ViewImage{gate: gate},
 		Git{gate: gate},
 		WebSearch{gate: gate},
 		Todo{gate: gate},
@@ -76,7 +77,6 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 		LSP{gate: gate},
 	}
 	_ = skillDir // referenced by BuildToolRegistry, kept here for symmetry
-	_ = memDir   // legacy memory dir; Memory tool now uses MemoryManager directly
 	for _, t := range all {
 		if disabled[t.Name()] {
 			continue

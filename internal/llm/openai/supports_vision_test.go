@@ -22,8 +22,11 @@ func TestSupportsVision(t *testing.T) {
 		{"gpt-3.5-turbo", false},
 		{"gpt-4", false},  // bare gpt-4 was text-only on launch
 		{"text-davinci-003", false},
-		// Chinese-OSS vision flagships routed via openai_chat (user-confirmed).
-		{"deepseek-v4-pro", true},
+		// Chinese-OSS vision flagships routed via openai_chat. The
+		// list mirrors openai.go::SupportsVision exactly — kept in
+		// sync by hand because there's no source-of-truth registry.
+		// glm-5.1 + minimax-m2.7 (anthropic side) were live-confirmed
+		// 2026-05-20 against /chat/completions with a real PNG.
 		{"deepseek-vl-7b", true},
 		{"kimi-k2.6", true},
 		{"kimi-latest", true},
@@ -34,7 +37,13 @@ func TestSupportsVision(t *testing.T) {
 		{"glm-4v-flash", true},
 		{"qwen-vl-max", true},
 		{"qwen2.5-vl-72b", true},
-		// Pre-vision lineage should stay false.
+		// Pre-vision / text-only lineage should stay false.
+		// 2026-05-20: deepseek-v4-pro moved here after live API
+		// returned 400 "unknown variant image_url" — the model name
+		// suggests vision but DeepSeek's list-models endpoint shows
+		// no vision-capable V4 id yet.
+		{"deepseek-v4-pro", false},
+		{"deepseek-v4-flash", false},
 		{"deepseek-v3", false},
 		{"deepseek-chat", false},
 		{"kimi-k1.5", false},

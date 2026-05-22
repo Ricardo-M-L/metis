@@ -227,7 +227,16 @@ func (m *Manager) copyTree() error {
 		if err != nil {
 			return nil
 		}
-		_ = os.WriteFile(dst, body, 0o600)
+		// 2026-05-22: surface write errors instead of silently
+		// dropping. Earlier this was `_ = os.WriteFile` — a disk-
+		// full / permission failure would leave a half-snapshot
+		// with no signal to the caller. WalkDir already returns
+		// nil on per-entry errors above, so we keep the same
+		// "skip this file" semantics but log the write failure
+		// for visibility.
+		if werr := os.WriteFile(dst, body, 0o600); werr != nil {
+			fmt.Fprintf(os.Stderr, "checkpoint: write %s: %v\n", dst, werr)
+		}
 		return nil
 	})
 }

@@ -341,14 +341,31 @@ type Model struct {
 	// their setup.
 	shellMode bool
 	// queuedPrompts holds plain-text prompts the user typed while a
-	// turn was already in flight. Claude-code's "queued messages"
-	// behavior: Enter on a non-empty input mid-turn pushes onto this
-	// FIFO instead of opening a steered injection. When the turn
-	// ends, finalizeTurn dequeues the head and submits it as the
-	// next user turn. Ctrl+C clears the queue (alongside the
-	// existing turn-cancel). Slash commands keep their existing
-	// mid-turn semantics — only plain text is queued.
-	queuedPrompts []string
+	// turn was already in flight. 2026-05-21 — upgraded from `[]string`
+	// FIFO to `[]queuedItem` carrying Priority + arrival-time. Three
+	// priorities (Now > Next > Later) mirror claude-code's
+	// messageQueueManager; current UI only emits Priority=Next, but
+	// the field is in place so a future `/now <text>` slash command
+	// or background notification subsystem can opt into Now/Later
+	// without a schema migration.
+	//
+	// Drain semantics: finalizeTurn pulls the highest-priority head
+	// and BATCHES all adjacent items of the same priority into a
+	// single user turn (joined with blank lines). This collapses
+	// "follow-up follow-up follow-up" typing patterns into one LLM
+	// round-trip instead of N — direct port of claude-code's
+	// `dequeueAllMatching(targetMode)` batching.
+	//
+	// Ctrl+C clears the queue (alongside the existing turn-cancel).
+	// Slash commands keep their existing mid-turn semantics — only
+	// plain text is queued.
+	queuedPrompts []queuedItem
+
+	// queueClock is a deterministic monotonic counter used to set
+	// QueuedAt on each enqueue. Time-based ordering inside one
+	// priority bucket relies on this rather than wall-clock so tests
+	// stay stable; production runs see a strictly increasing seq.
+	queueClock uint64
 
 	// turnBackgrounded — Phase F Ctrl+B (2026-05-12). When the user
 	// presses Ctrl+B mid-turn, the active turn keeps running but its

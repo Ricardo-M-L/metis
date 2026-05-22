@@ -117,7 +117,7 @@ func (Fork) InputSchema() map[string]any {
 			},
 			"max_iter": map[string]any{
 				"type":        "integer",
-				"description": "Tool-call budget for the forked child (default 20).",
+				"description": "Tool-call budget for the forked child (default 100). Bumped from 20 → 100 on 2026-05-21 alongside Agent.max_iter for parity (fork inherits context but still needs the same headroom as a fresh Agent for non-trivial implementation tasks).",
 			},
 		},
 	}
@@ -184,7 +184,9 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		}, nil
 	}
 
-	maxIter := intArg(in, "max_iter", 20)
+	// Default bumped 20 → 100 on 2026-05-21 (parity with Agent.max_iter).
+	// See agent.go for the full rationale.
+	maxIter := intArg(in, "max_iter", 100)
 	// G.13 (2026-05-12) — Fork is the warm-context spawn path.
 	// Prepend the fork preamble so the child knows it can see the
 	// parent's full history above and shouldn't re-explore.

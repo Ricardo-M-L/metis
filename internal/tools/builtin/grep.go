@@ -56,7 +56,23 @@ const DefaultGrepLimit = 250
 func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	patStr, _ := in["pattern"].(string)
 	if patStr == "" {
-		return nil, errors.New("pattern required")
+		// 2026-05-22: rich error + redirect hint, same approach as
+		// Glob/Read/LS. Common confusions: model passed `query` /
+		// `search` thinking it was the field name, or passed
+		// `command`/`cmd` (wanted Bash), or `path` only (wanted to
+		// see directory listing, should use LS).
+		hint := ""
+		if q, _ := in["query"].(string); q != "" {
+			hint = "\n\nYou passed `query`. The argument name is `pattern`. Try Grep({pattern: \"" + q + "\"})."
+		} else if q, _ := in["search"].(string); q != "" {
+			hint = "\n\nYou passed `search`. The argument name is `pattern`. Try Grep({pattern: \"" + q + "\"})."
+		} else if c, _ := in["command"].(string); c != "" {
+			hint = "\n\nYou passed `command`. That's the Bash tool's input — call Bash if you want to run `grep` directly."
+		}
+		return &tools.Result{
+			Output:  "Grep: `pattern` is required (a regex like \"func.*Error\" or a literal like \"TODO\"). Grep searches text WITHIN files; for filename patterns use Glob, for listing dir use LS." + hint,
+			IsError: true,
+		}, nil
 	}
 	root, _ := in["root"].(string)
 	if root == "" {

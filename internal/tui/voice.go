@@ -38,7 +38,18 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/auth"
 )
 
-const voiceMaxRecord = 30 * time.Second
+// voiceMaxRecord caps /voice recording duration. Mutable so
+// config.UI.VoiceMaxRecord() can override at startup via
+// SetVoiceMaxRecord (2026-05-22).
+var voiceMaxRecord = 30 * time.Second
+
+// SetVoiceMaxRecord overrides the auto-stop window for /voice
+// recording. Called once at startup from cmd/metis/main.go.
+func SetVoiceMaxRecord(d time.Duration) {
+	if d > 0 {
+		voiceMaxRecord = d
+	}
+}
 
 var (
 	voiceMu       sync.Mutex

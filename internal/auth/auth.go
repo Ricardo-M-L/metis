@@ -220,7 +220,9 @@ func Remove(provider string) error {
 	return Save(f)
 }
 
-// List returns provider ids that have credentials, sorted.
+// List returns provider ids that have credentials, sorted. Excludes
+// any namespaced keys (currently the "search:*" search-backend
+// entries) — those are listed via ListSearchKeys.
 func List() ([]string, error) {
 	f, err := Load()
 	if err != nil {
@@ -228,7 +230,99 @@ func List() ([]string, error) {
 	}
 	out := make([]string, 0, len(f))
 	for k := range f {
+		if isNamespacedKey(k) {
+			continue
+		}
 		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// searchKeyPrefix is the namespace inside auth.json for WebSearch
+// backend API keys. Stored under the same flat map as provider
+// credentials (avoids a schema migration) but kept logically
+// separate via the prefix so Get("tavily") can never accidentally
+// pick up a Tavily search key when an LLM provider called "tavily"
+// is added in the future.
+const searchKeyPrefix = "search:"
+
+// isNamespacedKey reports whether a raw auth.json key belongs to a
+// non-LLM-provider namespace (search keys etc.). Used by List() to
+// hide search keys from the provider list and vice-versa.
+func isNamespacedKey(k string) bool {
+	return len(k) > len(searchKeyPrefix) && k[:len(searchKeyPrefix)] == searchKeyPrefix
+}
+
+// GetSearchKey returns the persisted API key for a WebSearch
+// backend, or empty string if not set. Distinct from Get() so it
+// can't accidentally collide with provider credentials (search:tavily
+// vs. tavily-as-llm-provider) and skips the compatAliases lookup
+// which is provider-specific. Empty backend → empty result, never
+// errors on a missing entry; the caller decides whether to fall
+// through to env vars or skip the backend.
+func GetSearchKey(backend string) (string, error) {
+	if backend == "" {
+		return "", nil
+	}
+	f, err := Load()
+	if err != nil {
+		return "", err
+	}
+	if e, ok := f[searchKeyPrefix+backend]; ok {
+		return e.Key, nil
+	}
+	return "", nil
+}
+
+// SetSearchKey persists a WebSearch backend API key. Validates both
+// names so callers can't write `search:` with an empty backend or
+// store an empty key.
+func SetSearchKey(backend, key string) error {
+	if backend == "" {
+		return errors.New("auth: backend required")
+	}
+	if key == "" {
+		return errors.New("auth: key required")
+	}
+	f, err := Load()
+	if err != nil {
+		return err
+	}
+	f[searchKeyPrefix+backend] = Entry{Type: "search", Key: key}
+	return Save(f)
+}
+
+// RemoveSearchKey deletes a backend's stored key. No-op when absent.
+func RemoveSearchKey(backend string) error {
+	if backend == "" {
+		return errors.New("auth: backend required")
+	}
+	f, err := Load()
+	if err != nil {
+		return err
+	}
+	full := searchKeyPrefix + backend
+	if _, ok := f[full]; !ok {
+		return nil
+	}
+	delete(f, full)
+	return Save(f)
+}
+
+// ListSearchKeys returns the names of all WebSearch backends that
+// have a persisted key, sorted. Names exclude the "search:" prefix.
+func ListSearchKeys() ([]string, error) {
+	f, err := Load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0)
+	for k := range f {
+		if !isNamespacedKey(k) {
+			continue
+		}
+		out = append(out, k[len(searchKeyPrefix):])
 	}
 	sort.Strings(out)
 	return out, nil

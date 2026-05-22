@@ -276,6 +276,14 @@ func (m *Model) View() tea.View {
 	// without blocking the message stream.
 	lower.WriteString(renderInputLine(m))
 	lower.WriteString(renderHints(m))
+	// Queued-prompts preview (claude-code PromptInputQueuedCommands
+	// parity, 2026-05-20). Visible only when the user has typed
+	// mid-turn; rendered as faint one-line rows below renderHints so
+	// the user sees their input was captured. Without this band the
+	// only feedback was the status-bar `◷ N queued` chip, which
+	// users (image #1 feedback 2026-05-20) consistently missed —
+	// they thought Enter had silently dropped their message.
+	lower.WriteString(renderQueuedPreview(m))
 	if m.showPalette {
 		lower.WriteString(renderPalette(m))
 	}

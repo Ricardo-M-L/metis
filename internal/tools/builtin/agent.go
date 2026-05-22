@@ -297,6 +297,15 @@ B) or when each target is <2 tool calls (inline is cheaper).
 There is no special "spawn_team" tool — multiple Agent tool_use
 blocks in one response IS the fan-out mechanism.
 
+DECOMPOSITION BOUNDS (5–30 units):
+When decomposing a large task into parallel sub-agents, aim for the
+**5–30 independent units** range. Below 5 the spawn/synthesis
+overhead exceeds the cost of doing it inline; above 30 the
+coordinator can't actually supervise that many — output synthesis
+becomes the bottleneck. Mirrors claude-code's batch.ts. Not a hard
+runtime cap (no rejection at the (N+1)th call), but work outside
+the range usually has a problem worth re-thinking.
+
 Do NOT use Agent for:
   - Lookups you can do in one or two tool calls: a single Grep, a single Read — just do it inline. Forking has overhead (new context window, new system prompt) that costs more than the search.
   - Conversational tasks: explaining something to the user, formatting an answer, deciding what to do next. The model is you; don't fork to think.
@@ -332,7 +341,7 @@ func (Agent) InputSchema() map[string]any {
 			},
 			"max_iter": map[string]any{
 				"type":        "integer",
-				"description": "tool-call budget for the sub-agent (default 10)",
+				"description": "tool-call budget for the sub-agent (default 100). Bumped from 10 → 100 on 2026-05-21 after image #36 repro: impl-* sub-agents kept hitting the 10-turn cap mid-implementation. claude-code's equivalent (forkSubagent.maxTurns) is 200; metis goes 100 as a middle ground that covers typical large file rewrites without unbounded runaway.",
 			},
 			"timeout_seconds": map[string]any{
 				"type":        "integer",
@@ -559,7 +568,16 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	// Sub-loop construction is identical in both paths.
-	maxIter := intArg(in, "max_iter", 10)
+	//
+	// Default bumped 10 → 100 on 2026-05-21. The 10-turn cap was
+	// causing impl-* sub-agents to hit budget mid-implementation
+	// without producing any output (session 13a82094 / image #36:
+	// "impl-tools-read sub-agent hit budget without output. I'll
+	// write all the tool files myself in parallel."). claude-code's
+	// forkSubagent runs at 200 turns; metis picks 100 as a middle
+	// ground — enough for a full file rewrite, still bounded for
+	// runaway protection.
+	maxIter := intArg(in, "max_iter", 100)
 	// G.13 (2026-05-12) — pick the right sub-agent prompt template.
 	// Named teammates get extra peer-messaging guidance; anonymous
 	// spawns get the focused-task posture. Both prepend the role

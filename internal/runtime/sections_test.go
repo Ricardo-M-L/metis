@@ -25,21 +25,29 @@ func TestIdentitySection_NoModelOmitsClause(t *testing.T) {
 	}
 }
 
-func TestToolRedirectsSection_OmittedWhenBashDisabled(t *testing.T) {
-	// EnabledTools nil → legacy "assume all" → section present
-	got := ToolRedirectsSection(PromptCtx{})
-	if got.Name == "" {
+func TestToolRedirectsSection_FiresForBashOrReadOrLS(t *testing.T) {
+	// EnabledTools nil → legacy "assume all" → section present.
+	if got := ToolRedirectsSection(PromptCtx{}); got.Name == "" {
 		t.Error("legacy nil EnabledTools should fire the section")
 	}
-	// EnabledTools set but no Bash → section omitted
-	got2 := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"Read": true, "Grep": true}})
-	if got2.Name != "" {
-		t.Errorf("Bash-less tool set should omit tool_redirects; got Name=%q", got2.Name)
-	}
-	// Bash present → section fires
-	got3 := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"Bash": true}})
-	if got3.Name == "" {
+	// Bash present → fires (always has).
+	if got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"Bash": true}}); got.Name == "" {
 		t.Error("Bash present should fire tool_redirects")
+	}
+	// 2026-05-21 — Read OR LS alone now fires too. The redirects
+	// table includes the directory-vs-file decision rules which
+	// apply without Bash; previously gated only on Bash, which left
+	// LS+Read sub-agents (image #31) without guidance.
+	if got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"Read": true, "Grep": true}}); got.Name == "" {
+		t.Error("Read-only set should still fire tool_redirects (for LS↔Read guidance)")
+	}
+	if got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"LS": true, "Grep": true}}); got.Name == "" {
+		t.Error("LS-only set should fire tool_redirects")
+	}
+	// Truly Bash/Read/LS-less set → section omitted (e.g. a memory-
+	// only sub-agent that only has Memory + MetisInfo).
+	if got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"Grep": true, "Memory": true}}); got.Name != "" {
+		t.Errorf("set with no Bash/Read/LS should omit tool_redirects; got Name=%q", got.Name)
 	}
 }
 
@@ -115,7 +123,11 @@ func TestDefaultSectionGetters_SubAgentConfigShrinksPrompt(t *testing.T) {
 		t.Errorf("sub-agent prompt should have fewer sections than main; full=%v sub=%v", full, sub)
 	}
 	// Specifically these should be gone for sub-agent:
-	mustOmit := []string{"tool_redirects", "working_efficiently", "skills", "reversibility"}
+	// 2026-05-21 — tool_redirects removed from the omit-list because
+	// the LS↔Read directory-vs-file rules in that table apply even
+	// without Bash (image #31 repro). working_efficiently / skills /
+	// reversibility remain main-only.
+	mustOmit := []string{"working_efficiently", "skills", "reversibility"}
 	subSet := map[string]bool{}
 	for _, n := range sub {
 		subSet[n] = true

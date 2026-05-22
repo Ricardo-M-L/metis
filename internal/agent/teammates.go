@@ -349,6 +349,31 @@ type Roster struct {
 // growth.
 const RosterFinishedKeep = 50
 
+// Batch decomposition bounds — guidance constants the model is told
+// to honour when splitting a large task into parallel sub-agent
+// work. NOT enforced at runtime (we don't reject the (N+1)th Agent
+// call); these are the numbers referenced in the system prompt
+// (08_interaction_modes.md "Mandatory plan-then-ask") + Agent tool
+// description so the model self-governs.
+//
+// Mirrors claude-code's `batch.ts` MIN_AGENTS/MAX_AGENTS. The user's
+// position 2026-05-21: "模型拆分几个是自己的事, 但是要有限制" —
+// hard rejection would block legitimate one-off Agent calls; prompt-
+// level bounds let the model think in the right range without
+// arbitrary runtime gates.
+//
+//   - Below MIN: not worth decomposing (the overhead of N small
+//     sub-agents exceeds the cost of doing it inline).
+//   - Above MAX: coordinator can't actually supervise that many in
+//     parallel; output synthesis becomes the bottleneck.
+//
+// Tuned against Roster.capAnon (default 40) so MAX fits in one round
+// of dispatches without filling the pool.
+const (
+	BatchMinUnits = 5
+	BatchMaxUnits = 30
+)
+
 // NewRoster creates a Roster with split caps for named teammates and
 // anonymous sub-agents. Either <= 0 disables that side's cap.
 // Production defaults are config.Agents.MaxConcurrentNamed (20) +

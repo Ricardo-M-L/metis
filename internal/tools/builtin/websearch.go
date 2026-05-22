@@ -1,11 +1,24 @@
 package builtin
 
-// websearch.go — claude-code-style WebSearch tool.
+// websearch.go — multi-backend WebSearch tool.
 //
-// Backend chain (first-match-wins):
+// Backend chain (first-match-wins, ordered by output quality):
 //
-//  1. SERPER_API_KEY set      → google.serper.dev (paid, structured, fast)
-//  2. otherwise               → DuckDuckGo lite HTML scraper (free, zero-config)
+//  1. TAVILY_API_KEY        → tavily.com (1k/mo free tier, richest snippets,
+//                              also returns relevance scores)
+//  2. BRAVE_SEARCH_API_KEY  → api.search.brave.com (2k/mo free, native index)
+//  3. SERPER_API_KEY        → google.serper.dev (paid, Google SERP)
+//  4. (zero-config fallback) → lite.duckduckgo.com HTML scrape
+//
+// UX conventions, mirroring cli-web-search (only open-source project
+// surveyed 2026-05 that surfaces backend identity transparently):
+//
+//   - Every output ends with a "[via <backend>]" footer so the user
+//     and the model both know which tier produced the results.
+//   - When the preferred backend fails (rate-limit, 5xx, parse error),
+//     the footer also lists "fell back from X: <reason>" so the user
+//     can see WHY they're on the DDG floor and act on it (add an
+//     env var, retry later, change query).
 //
 // Tool name is "WebSearch" not "Search" — claude-code's training-set
 // canonical name. Keeping it aligned avoids confusing the LLM about
@@ -34,13 +47,15 @@ import (
 
 	"golang.org/x/net/html"
 
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // WebSearch is the claude-code-named web search tool. Zero-config:
-// works without any API key via DuckDuckGo's lite HTML view; upgrades
-// to Serper.dev's structured Google API when SERPER_API_KEY is set.
+// works without any API key via DuckDuckGo's lite HTML view. Upgrades
+// to richer backends when env vars are present, in the order:
+// TAVILY_API_KEY → BRAVE_SEARCH_API_KEY → SERPER_API_KEY.
 type WebSearch struct {
 	tools.BaseTool
 	gate *permission.Gate
@@ -49,7 +64,11 @@ type WebSearch struct {
 func (WebSearch) Name() string { return "WebSearch" }
 
 func (WebSearch) Description() string {
-	return "Search the web for up-to-date information. Returns titles, snippets, and URLs for the top results. Works without any API key (DuckDuckGo); set SERPER_API_KEY to upgrade to Google search results."
+	return "Search the web for up-to-date information. Returns titles, snippets, and URLs for the top results. " +
+		"Works without any API key (DuckDuckGo fallback). For richer snippets and quotas, set one of: " +
+		"TAVILY_API_KEY (1k/mo free, tavily.com), BRAVE_SEARCH_API_KEY (2k/mo free, brave.com), " +
+		"or SERPER_API_KEY (paid Google SERP). Backends are tried in that priority order; " +
+		"the output footer always reports which backend served the request."
 }
 
 func (WebSearch) InputSchema() map[string]any {
@@ -81,6 +100,62 @@ func (s WebSearch) CanUse(_ context.Context, in map[string]any) (tools.Permissio
 	return mapDecision(d), src
 }
 
+// webSearchBackend is one entry in the priority fallback chain. envVar
+// empty means "no key required" — only DDG today, but the shape leaves
+// room for future zero-config backends (Ollama web search, SearXNG).
+type webSearchBackend struct {
+	name   string // user-facing label: "tavily" / "brave" / "serper" / "ddg"
+	envVar string // env var that gates this backend ("" = always available)
+	search func(ctx context.Context, client *http.Client, query, key string, maxResults int) ([]webSearchResult, error)
+}
+
+// resolveSearchKey returns the API key to use for a backend, picking
+// the highest-precedence source available:
+//
+//  1. Environment variable (b.envVar) — CI / shell-rc / one-shot
+//     overrides win. Matches how every other backend in the chain
+//     reads its key today and keeps CI workflows free of touching
+//     auth.json on the runner.
+//  2. ~/.metis/auth.json under "search:<name>" — the persistent
+//     store written by `metis auth keys put <name> <value>`. 0o600
+//     perms enforced by internal/auth, so this is safer than
+//     stuffing keys in ~/.zshrc where every shell process inherits
+//     them via the global environment.
+//
+// Returns "" when neither source has a value; callers skip the
+// backend silently in that case (it's "not configured", not a
+// failure worth surfacing in the fallback trail).
+func resolveSearchKey(b webSearchBackend) string {
+	if b.envVar == "" {
+		return ""
+	}
+	if v := os.Getenv(b.envVar); v != "" {
+		return v
+	}
+	if v, _ := auth.GetSearchKey(b.name); v != "" {
+		return v
+	}
+	return ""
+}
+
+// webSearchBackends is the ordered fallback chain. Order = quality
+// estimate (Tavily snippets are the longest + score-ranked; Brave is
+// a real index; Serper is paid Google; DDG is the zero-config floor).
+// Edit here to reorder or add backends; the dispatcher walks this
+// slice top-down and uses the first one whose env var is set (or
+// which has no env var requirement).
+//
+// nolint:gochecknoglobals — package-level table is the cleanest way
+// to expose the chain to both Execute() and the diag command, which
+// reports each backend's status. Adding a getter would hide the
+// declarative shape that makes it easy to audit.
+var webSearchBackends = []webSearchBackend{
+	{name: "tavily", envVar: "TAVILY_API_KEY", search: tavilySearch},
+	{name: "brave", envVar: "BRAVE_SEARCH_API_KEY", search: braveSearch},
+	{name: "serper", envVar: "SERPER_API_KEY", search: serperSearch},
+	{name: "ddg", envVar: "", search: ddgSearch},
+}
+
 func (WebSearch) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	query, _ := in["query"].(string)
 	if strings.TrimSpace(query) == "" {
@@ -99,30 +174,157 @@ func (WebSearch) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	if key := os.Getenv("SERPER_API_KEY"); key != "" {
-		out, err := serperSearch(ctx, client, query, key, maxResults)
-		if err == nil {
-			return out, nil
+	// Walk the fallback chain. Keep a record of skipped/failed
+	// backends so the output footer can explain WHY we ended up on
+	// whichever backend succeeded — important when a paid backend
+	// silently rate-limits and the user wonders why snippets got
+	// shorter. cli-web-search shows the same kind of "via X" tag in
+	// its output; we extend it with the fallback reason for parity
+	// with what the user can already see in the metis transcript
+	// (no hidden state).
+	var fallbacks []string
+	for _, b := range webSearchBackends {
+		key := resolveSearchKey(b)
+		if b.envVar != "" && key == "" {
+			// Backend gated on a key and we have neither env nor
+			// persisted auth.json entry — skip silently. No
+			// fallbacks-trail entry because skipping isn't a
+			// failure, it's "not configured".
+			continue
 		}
-		// Serper failed — fall through to DDG so the tool still
-		// produces useful output instead of erroring out the turn.
+		if b.envVar == "" {
+			// Only the DDG path needs rate-limiting (paid APIs
+			// handle it server-side); keep it out of the per-
+			// backend code so adding a new keyed backend doesn't
+			// accidentally trip it.
+			maybeDelaySearch()
+		}
+		results, err := b.search(ctx, client, query, key, maxResults)
+		if err != nil {
+			fallbacks = append(fallbacks, fmt.Sprintf("%s failed: %s", b.name, err.Error()))
+			continue
+		}
+		return &tools.Result{Output: formatSearchResults(query, results, b.name, fallbacks)}, nil
 	}
+	// Should never happen — DDG has no env-var gate, so the loop
+	// always reaches it. If we did fall through, every backend
+	// errored; surface the trail so the user can debug.
+	msg := "WebSearch: every backend failed"
+	if len(fallbacks) > 0 {
+		msg = msg + " — " + strings.Join(fallbacks, "; ")
+	}
+	return &tools.Result{Output: msg, IsError: true}, nil
+}
 
-	maybeDelaySearch()
-	results, err := searchDuckDuckGo(ctx, client, query, maxResults)
-	if err != nil {
-		return &tools.Result{
-			Output:  "WebSearch failed: " + err.Error(),
-			IsError: true,
-		}, nil
+// tavilySearch hits api.tavily.com/search. Snippet quality is the
+// best of the four backends (Tavily fans out across multiple
+// underlying SERPs and re-ranks; each result also carries a `score`
+// field, currently unused but worth keeping in mind if we add
+// re-ranking). Auth: `Authorization: Bearer tvly-...`. Free tier:
+// 1k searches/month, no credit card.
+func tavilySearch(ctx context.Context, client *http.Client, query, key string, maxResults int) ([]webSearchResult, error) {
+	payload := map[string]any{
+		"query":        query,
+		"max_results":  maxResults,
+		"search_depth": "basic", // "advanced" is 2x latency and 2x quota
+		"topic":        "general",
 	}
-	return &tools.Result{Output: formatSearchResults(query, results)}, nil
+	pb, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.tavily.com/search", bytes.NewReader(pb))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out struct {
+		Results []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Content string `json:"content"` // tavily's snippet field
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	results := make([]webSearchResult, 0, len(out.Results))
+	for i, r := range out.Results {
+		if i >= maxResults {
+			break
+		}
+		results = append(results, webSearchResult{
+			Title:    r.Title,
+			Link:     r.URL,
+			Snippet:  r.Content,
+			Position: i + 1,
+		})
+	}
+	return results, nil
+}
+
+// braveSearch hits api.search.brave.com/res/v1/web/search. Brave runs
+// its own crawler so results don't depend on Google. Auth: header
+// `X-Subscription-Token: <key>`. Free tier: 2k queries/month, also
+// no credit card. `count` caps at 20 server-side.
+func braveSearch(ctx context.Context, client *http.Client, query, key string, maxResults int) ([]webSearchResult, error) {
+	count := maxResults
+	if count > 20 {
+		count = 20
+	}
+	u := "https://api.search.brave.com/res/v1/web/search?q=" + url.QueryEscape(query) + "&count=" + fmt.Sprint(count)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Subscription-Token", key)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out struct {
+		Web struct {
+			Results []struct {
+				Title       string `json:"title"`
+				URL         string `json:"url"`
+				Description string `json:"description"` // brave's snippet field
+			} `json:"results"`
+		} `json:"web"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	results := make([]webSearchResult, 0, len(out.Web.Results))
+	for i, r := range out.Web.Results {
+		if i >= maxResults {
+			break
+		}
+		results = append(results, webSearchResult{
+			Title:    r.Title,
+			Link:     r.URL,
+			Snippet:  r.Description,
+			Position: i + 1,
+		})
+	}
+	return results, nil
 }
 
 // serperSearch hits google.serper.dev — paid Google SERP API. Returns
-// up to maxResults organic hits formatted the same way as the DDG
-// backend so the model can't tell them apart.
-func serperSearch(ctx context.Context, client *http.Client, query, key string, maxResults int) (*tools.Result, error) {
+// up to maxResults organic hits.
+func serperSearch(ctx context.Context, client *http.Client, query, key string, maxResults int) ([]webSearchResult, error) {
 	payload := map[string]any{"q": query, "num": maxResults}
 	pb, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://google.serper.dev/search", bytes.NewReader(pb))
@@ -138,7 +340,7 @@ func serperSearch(ctx context.Context, client *http.Client, query, key string, m
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("serper status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var out struct {
 		Organic []struct {
@@ -162,7 +364,14 @@ func serperSearch(ctx context.Context, client *http.Client, query, key string, m
 			Position: i + 1,
 		})
 	}
-	return &tools.Result{Output: formatSearchResults(query, results)}, nil
+	return results, nil
+}
+
+// ddgSearch is the zero-config fallback adapter — wraps the existing
+// searchDuckDuckGo() to match the webSearchBackend.search signature
+// (ignores the key parameter since DDG needs none).
+func ddgSearch(ctx context.Context, client *http.Client, query, _ string, maxResults int) ([]webSearchResult, error) {
+	return searchDuckDuckGo(ctx, client, query, maxResults)
 }
 
 // webSearchResult is the unified shape both backends produce.
@@ -331,23 +540,49 @@ func cleanDDGRedirect(raw string) string {
 	return raw
 }
 
-func formatSearchResults(query string, results []webSearchResult) string {
-	if len(results) == 0 {
-		return "WebSearch \"" + query + "\": no results. Try rephrasing the query."
-	}
+// formatSearchResults renders the SERP for the model and tags the
+// output with the backend that produced it. The `via` tag lets the
+// model decide how much to trust the snippets (DDG snippets cap
+// around 150 chars; Tavily/Brave run 200-400; Serper varies). The
+// `fallbacks` log lists backends we tried before this one — empty
+// when the first-choice backend worked.
+func formatSearchResults(query string, results []webSearchResult, via string, fallbacks []string) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "WebSearch \"%s\" — %d results:\n\n", query, len(results))
-	for _, r := range results {
-		fmt.Fprintf(&sb, "%d. %s\n", r.Position, r.Title)
-		if r.Link != "" {
-			fmt.Fprintf(&sb, "   %s\n", r.Link)
+	if len(results) == 0 {
+		sb.WriteString("WebSearch \"" + query + "\": no results. Try rephrasing the query.")
+	} else {
+		fmt.Fprintf(&sb, "WebSearch \"%s\" — %d results:\n\n", query, len(results))
+		for _, r := range results {
+			fmt.Fprintf(&sb, "%d. %s\n", r.Position, r.Title)
+			if r.Link != "" {
+				fmt.Fprintf(&sb, "   %s\n", r.Link)
+			}
+			if r.Snippet != "" {
+				fmt.Fprintf(&sb, "   %s\n", r.Snippet)
+			}
+			sb.WriteString("\n")
 		}
-		if r.Snippet != "" {
-			fmt.Fprintf(&sb, "   %s\n", r.Snippet)
-		}
-		sb.WriteString("\n")
 	}
-	return strings.TrimRight(sb.String(), "\n")
+	// Footer: always print the backend tag so the model + user know
+	// which tier served the request. cli-web-search shows the same
+	// "Provider: brave" header (see survey 2026-05-20); we put it at
+	// the END instead of the top so the actual results stay above
+	// the visible-area fold on small terminals.
+	sb.WriteString("\n[via " + via)
+	if via == "ddg" {
+		// Floor backend — flag it explicitly so the user has a
+		// clear nudge to set TAVILY_API_KEY / BRAVE_SEARCH_API_KEY.
+		sb.WriteString(" · zero-config; for richer results set TAVILY_API_KEY or BRAVE_SEARCH_API_KEY")
+	}
+	sb.WriteString("]")
+	if len(fallbacks) > 0 {
+		// Surface the failure trail so a paid backend's rate-limit
+		// or transient 5xx isn't invisible. Without this the user
+		// thinks they're on the backend they configured but
+		// silently got dropped to DDG.
+		sb.WriteString("\n[fallback: " + strings.Join(fallbacks, " → ") + "]")
+	}
+	return sb.String()
 }
 
 // Rate limiter: DDG lite rate-limits aggressively when hit faster

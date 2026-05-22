@@ -76,13 +76,30 @@ func (s *Store) AppendMessage(id string, m llm.Message) error {
 }
 
 func (s *Store) append(id string, e Entry) error {
+	// 2026-05-22: switched from json.Encoder to manual Marshal +
+	// single Write to guarantee atomic-per-line append. json.Encoder
+	// usually writes once-per-Encode but it's not contractually
+	// guaranteed; for safety we marshal in memory first so the
+	// underlying file.Write is a single syscall (the kernel either
+	// commits the whole buffer or none of it on a clean signal kill —
+	// torn writes only happen on power loss / kernel panic, which is
+	// out of scope for a user-space CLI).
+	//
+	// Pairs with Load's tolerant trailing-line handling: even if a
+	// torn write does happen, the resume path now drops the bad
+	// trailing line instead of aborting the whole session.
+	b, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
 	f, err := os.OpenFile(s.path(id), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	enc := json.NewEncoder(f)
-	return enc.Encode(e)
+	_, err = f.Write(b)
+	return err
 }
 
 func (s *Store) Load(id string) (*Header, []llm.Message, error) {
@@ -95,10 +112,31 @@ func (s *Store) Load(id string) (*Header, []llm.Message, error) {
 	var msgs []llm.Message
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	// 2026-05-22: tolerate a corrupted trailing line. Pre-fix any
+	// JSON decode error aborted Load and the session was effectively
+	// unrecoverable. Real-world torn-write scenarios (SIGKILL during
+	// write, power loss) almost always corrupt only the LAST
+	// in-flight line, so we buffer the line index and surface the
+	// failure only if a mid-file line is bad (where corruption
+	// implies a real data-integrity problem worth surfacing).
+	lineNum := 0
+	var pendingBadLine string
 	for sc.Scan() {
+		lineNum++
+		// If the previous iteration deferred a bad line as
+		// "might be the last", a successful Scan here proves it
+		// was mid-file — surface that as a hard error.
+		if pendingBadLine != "" {
+			return nil, nil, fmt.Errorf("decode session entry at line %d: %s", lineNum-1, pendingBadLine)
+		}
 		var e Entry
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
-			return nil, nil, fmt.Errorf("decode session entry: %w", err)
+			// Defer the failure. If sc.Scan returns false next
+			// (EOF), this WAS the trailing line — skip it. If
+			// another line follows, this was mid-file corruption
+			// and we abort above.
+			pendingBadLine = err.Error()
+			continue
 		}
 		switch e.Type {
 		case "header":
@@ -118,6 +156,13 @@ func (s *Store) Load(id string) (*Header, []llm.Message, error) {
 	}
 	if err := sc.Err(); err != nil {
 		return nil, nil, err
+	}
+	if pendingBadLine != "" {
+		// Last line was corrupted (likely torn write from a prior
+		// crash). Log to stderr so the user knows, but allow
+		// resume to proceed with the clean prefix.
+		fmt.Fprintf(os.Stderr, "session %s: dropped corrupted trailing line %d (%s); resuming with clean prefix\n",
+			id, lineNum, pendingBadLine)
 	}
 	if hdr == nil {
 		return nil, nil, errors.New("session header missing")

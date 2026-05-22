@@ -3,7 +3,6 @@ package builtin
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -92,10 +91,25 @@ const MaxReadFileSize = 256 * 1024 * 1024
 func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	path, _ := in["path"].(string)
 	if path == "" {
-		return nil, errors.New("path is required")
+		// Richer error than the bare "path is required" — same
+		// lesson as Glob (image #34) and LS, applied here on
+		// 2026-05-21 after a sub-agent looped on this exact terse
+		// message. The hint reads the input bag for misuse fields
+		// (`file_path`, `command`, `pattern`, ...) and points at
+		// the right tool / arg name.
+		hint := readMisuseHint(in)
+		return &tools.Result{
+			Output: "Read: `path` field is required (absolute path to a file, e.g. \"/Users/x/proj/main.go\"). " +
+				"Read takes file contents — for directories use LS, for shell commands use Bash, for name-pattern search use Glob." +
+				hint,
+			IsError: true,
+		}, nil
 	}
 	if !filepath.IsAbs(path) {
-		return nil, errors.New("path must be absolute")
+		return &tools.Result{
+			Output:  "Read: `path` must be absolute (you passed \"" + truncForReadHint(path, 80) + "\"). Prepend the project root or `$HOME` to make it absolute (e.g. cwd-based: /Users/.../yourproject/" + path + ").",
+			IsError: true,
+		}, nil
 	}
 	offset := intArg(in, "offset", 1)
 	limit := intArg(in, "limit", 2000)
@@ -179,4 +193,45 @@ func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 		return &tools.Result{Output: "(file is empty or offset past end)"}, nil
 	}
 	return &tools.Result{Output: b.String()}, nil
+}
+
+// readMisuseHint inspects the input bag when `path` is empty and
+// names the right tool / arg for shapes we've seen the model use
+// by mistake. Mirrors globMisuseHint — appended to the
+// "path is required" error so the next turn lands on the correct
+// tool instead of looping.
+//
+// Common confusions (image #34/#43 sub-agent telemetry):
+//   - `file_path` (snake-case variant) → just suggest renaming to `path`
+//   - `command` / `cmd` → wanted Bash
+//   - `pattern` → wanted Glob
+//   - `query` → wanted Grep
+func readMisuseHint(in map[string]any) string {
+	if fp, _ := in["file_path"].(string); fp != "" {
+		return "\n\nYou passed `file_path` (\"" + truncForReadHint(fp, 80) + "\"). The argument name is `path`, not `file_path`. Try Read({path: \"" + truncForReadHint(fp, 80) + "\"})."
+	}
+	if cmd, _ := in["command"].(string); cmd != "" {
+		return "\n\nYou passed a `command` field (\"" + truncForReadHint(cmd, 80) + "\"). That's the Bash tool's input — call Bash if you want to run a shell command."
+	}
+	if cmd, _ := in["cmd"].(string); cmd != "" {
+		return "\n\nYou passed a `cmd` field. Read takes `path`. Call Bash if you want to run a shell command."
+	}
+	if pat, _ := in["pattern"].(string); pat != "" {
+		return "\n\nYou passed a `pattern` field (\"" + truncForReadHint(pat, 80) + "\"). That's the Glob tool's input — call Glob for name-pattern search."
+	}
+	if q, _ := in["query"].(string); q != "" {
+		return "\n\nYou passed a `query` field (\"" + truncForReadHint(q, 80) + "\"). For text-in-files search use Grep."
+	}
+	return ""
+}
+
+// truncForReadHint shortens a string for embedding in an error
+// message so a 500-char path doesn't blow the result-row layout.
+// Rune-aware to avoid mid-codepoint cuts on CJK paths.
+func truncForReadHint(s string, maxRunes int) string {
+	rs := []rune(s)
+	if len(rs) <= maxRunes {
+		return s
+	}
+	return string(rs[:maxRunes-1]) + "…"
 }

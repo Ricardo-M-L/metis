@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	xansi "github.com/charmbracelet/x/ansi"
+
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
 )
 
@@ -122,18 +124,23 @@ func (it *inProgressThinkingItem) Render(width int) string {
 	if it.text == "" {
 		return ""
 	}
+	// 2026-05-21: aligned with renderMessage::case "thinking" — always
+	// render full. See that case for the rationale (silent-tool-loop
+	// turns produced stacks of one-line collapsed rows; full reasoning
+	// gives the user a real window into the model). `expand` field
+	// kept on the struct for cache-stability + future re-flip.
 	var sb strings.Builder
 	sb.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
 	thinkStyle := styleDim.Italic(true)
-	if !it.expand {
-		sb.WriteString(thinkStyle.Render(firstThinkingLine(it.text, width)))
-		if thinkingHintFits(width) {
-			sb.WriteString(styleMuted.Render("  (ctrl+o to expand)"))
-		}
-		sb.WriteString("\n")
-		return sb.String()
+	// Wrap before line-splitting — same lesson as renderMessage:
+	// streamed thinking arrives as a single long line and would
+	// overflow the right edge if rendered raw.
+	bodyW := width - 4
+	if bodyW < 20 {
+		bodyW = 20
 	}
-	lines := strings.Split(it.text, "\n")
+	wrapped := xansi.Wrap(it.text, bodyW, " /-_.")
+	lines := strings.Split(wrapped, "\n")
 	if len(lines) > 0 {
 		sb.WriteString(thinkStyle.Render(lines[0]))
 		for _, ln := range lines[1:] {

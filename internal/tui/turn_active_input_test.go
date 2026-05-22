@@ -52,8 +52,8 @@ func TestTurnActive_SubmitQueues(t *testing.T) {
 	if len(m.queuedPrompts) != 1 {
 		t.Fatalf("expected 1 queued prompt; got %d (%v)", len(m.queuedPrompts), m.queuedPrompts)
 	}
-	if m.queuedPrompts[0] != "use Edit not Write" {
-		t.Errorf("queue head wrong; got %q", m.queuedPrompts[0])
+	if m.queuedPrompts[0].Text != "use Edit not Write" {
+		t.Errorf("queue head wrong; got %q", m.queuedPrompts[0].Text)
 	}
 	// Input must be cleared so the user sees the queue acceptance
 	// (matches normal-submit affordance — input clears on send).
@@ -206,7 +206,7 @@ func TestTurnActive_UnknownSlashFallsThroughToQueue(t *testing.T) {
 	if got := m.loop.SteerInjectDrainForTest(); got != "" {
 		t.Errorf("steer buffer should be empty after queueing; got %q", got)
 	}
-	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0] != "/notarealcommand" {
+	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0].Text != "/notarealcommand" {
 		t.Errorf("expected single queued prompt with literal slash; got %v", m.queuedPrompts)
 	}
 }

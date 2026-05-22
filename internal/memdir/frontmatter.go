@@ -50,15 +50,33 @@ func (t MemoryType) IsValid() bool {
 // name / description / type are required for a "good" memory;
 // originSessionId is informational (which session first wrote this).
 //
+// Strength + LastAccessed implement Ebbinghaus-style soft expiration
+// (2026-05-20, adapted from rohitg00/agentmemory's consolidation
+// pipeline). The pair lets a periodic sweep prune stale memos
+// without a hard TTL: a memo that keeps getting rewritten/touched
+// stays fresh; one untouched for months decays past the prune
+// threshold and is deleted. Existing files without these fields
+// are treated as "fresh as of file mtime" — see CurrentStrength.
+//
 // Unknown fields are preserved in Extra so the extractor can round-trip
 // frontmatter without losing custom keys (e.g. team-memory's
 // `team: <name>`).
 type Frontmatter struct {
-	Name            string         `yaml:"name"`
-	Description     string         `yaml:"description"`
-	Type            MemoryType     `yaml:"type"`
-	OriginSessionID string         `yaml:"originSessionId,omitempty"`
-	Extra           map[string]any `yaml:",inline"`
+	Name            string  `yaml:"name"`
+	Description     string  `yaml:"description"`
+	Type            MemoryType `yaml:"type"`
+	OriginSessionID string  `yaml:"originSessionId,omitempty"`
+	// Strength is the recorded retention coefficient at LastAccessed,
+	// in (0, 1]. New writes default to 1.0. Subsequent reads compute
+	// the *current* decayed value via CurrentStrength(now); the
+	// persisted number only moves on rewrite. omitempty so existing
+	// memos without the field stay diff-clean.
+	Strength float64 `yaml:"strength,omitempty"`
+	// LastAccessed is RFC 3339; the decay clock starts here. Empty
+	// → "no clock set yet" → CurrentStrength returns the recorded
+	// Strength unchanged (treats legacy files as still fresh).
+	LastAccessed string         `yaml:"last_accessed,omitempty"`
+	Extra        map[string]any `yaml:",inline"`
 }
 
 // Validate checks the three required fields are present. Returns nil

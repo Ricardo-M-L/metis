@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -389,6 +390,28 @@ type UI struct {
 	// output stream might be observed. Per-invocation override via
 	// `--streamlined` CLI flag.
 	StreamlinedOutput bool `toml:"streamlined_output"`
+
+	// PermissionTimeoutSeconds is how long an interactive permission
+	// prompt waits for the user to answer before defaulting to deny.
+	// 0 (default) → 60 seconds, matching the historical hardcoded
+	// constant. Set higher if you frequently AFK during agent runs
+	// and don't want denied permission to abort a long task; set
+	// lower for tighter security review windows.
+	PermissionTimeoutSeconds int `toml:"permission_timeout_seconds"`
+
+	// VoiceMaxRecordSeconds caps how long /voice will record before
+	// auto-stopping and transcribing. 0 (default) → 30 seconds,
+	// matching the historical hardcoded constant. Bump to 120+ if
+	// you dictate longer instructions; lower for quick voice-memo
+	// style usage.
+	VoiceMaxRecordSeconds int `toml:"voice_max_record_seconds"`
+
+	// StatusLineRefreshSeconds is how often the bottom status line
+	// re-runs its script / refreshes its data. 0 (default) → 5
+	// seconds. Lower for snappier git-branch / cron-chip updates;
+	// higher if your status-line script is expensive (CI status
+	// poll, etc).
+	StatusLineRefreshSeconds int `toml:"status_line_refresh_seconds"`
 }
 
 // UIPerformance gathers the tunables that decide how snappy / how
@@ -984,4 +1007,31 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("missing API key for provider %q", provider)
+}
+
+// PermissionTimeout returns the duration (with default fallback) to
+// wait for an interactive permission prompt. See UI.PermissionTimeoutSeconds.
+func (u *UI) PermissionTimeout() time.Duration {
+	if u != nil && u.PermissionTimeoutSeconds > 0 {
+		return time.Duration(u.PermissionTimeoutSeconds) * time.Second
+	}
+	return 60 * time.Second
+}
+
+// VoiceMaxRecord returns the duration (with default fallback) for the
+// /voice auto-stop. See UI.VoiceMaxRecordSeconds.
+func (u *UI) VoiceMaxRecord() time.Duration {
+	if u != nil && u.VoiceMaxRecordSeconds > 0 {
+		return time.Duration(u.VoiceMaxRecordSeconds) * time.Second
+	}
+	return 30 * time.Second
+}
+
+// StatusLineRefresh returns the duration (with default fallback) for
+// the status-line refresh tick. See UI.StatusLineRefreshSeconds.
+func (u *UI) StatusLineRefresh() time.Duration {
+	if u != nil && u.StatusLineRefreshSeconds > 0 {
+		return time.Duration(u.StatusLineRefreshSeconds) * time.Second
+	}
+	return 5 * time.Second
 }

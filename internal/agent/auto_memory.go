@@ -57,10 +57,22 @@ const AutoMemoryEvery = 10
 // loop via Loop.AutoMemoryEvery (interpreted as seconds when v2-mode).
 const AutoMemoryMinInterval = 60 * time.Second
 
-// MaxExtractorTurns caps API round-trips inside the fork. 5 matches
-// openclaude — well-behaved extractions complete in 2-4 (read manifest
-// → optionally Read existing files → Edit/Write 1+ files → done).
-const MaxExtractorTurns = 5
+// MaxExtractorTurns caps API round-trips inside the dream-extractor
+// fork. Bumped 5 → 30 on 2026-05-21. The 5-turn cap matched openclaude
+// at first design (which assumed extractions complete in 2-4 turns)
+// but the real distribution observed in production is heavier:
+//
+//   - Read manifest (1)
+//   - Read 3-8 existing memo files to dedup (3-8)
+//   - For each new memo: Edit / Write (1-3 per memo, often 3-5 memos)
+//   - Index rebuild via MEMORY.md Write (1)
+//
+// So a "normal" extraction runs 10-15 turns; the 5-turn cap was
+// silently killing them mid-write. Bumping to 30 gives headroom
+// without unbounded runaway. claude-code's autoDream agent doesn't
+// expose a turn cap directly — it relies on a wall-clock + token
+// budget instead.
+const MaxExtractorTurns = 30
 
 // DreamPhase mirrors claude-code's DreamTask.ts state model (G.5,
 // 2026-05-12). The extractor walks through these phases on every fork
@@ -482,6 +494,36 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 		duration := time.Since(startedAt)
 		post, _ := snapshotMemdirNames(context.Background(), e.memdirRoot)
 		touched := diffMemdirNames(pre, post)
+
+		// Post-extraction hygiene pass (2026-05-20):
+		//
+		//   1. Redact + MarkAccessed every file the fork agent
+		//      touched. The fork doesn't know about Strength /
+		//      LastAccessed (or about secret patterns) — the
+		//      extractor prompt deliberately doesn't burden it
+		//      with that. We fix up the frontmatter + body here
+		//      so the freshness clock resets on every rewrite
+		//      and any pasted credential gets blanked before it
+		//      sleeps on disk.
+		//
+		//   2. Decay-sweep the entire memdir. Cheap (touches each
+		//      file once); the >5-month-untouched memos get
+		//      pruned now that there's a fresh extraction batch
+		//      to potentially replace them.
+		//
+		// Both steps are best-effort: errors get logged to
+		// e.lastErr but don't abort the dream cycle.
+		processedRoot := e.memdirRoot
+		if processedRoot != "" {
+			fixupTouchedMemos(processedRoot, touched)
+			if sweep, err := memdir.DecayAndPrune(context.Background(), processedRoot, time.Now()); err == nil {
+				// Treat pruned files as "touched" so the
+				// summary reflects them — user sees "memos: 2
+				// rewritten, 1 pruned" instead of an opaque
+				// gap.
+				touched = append(touched, sweep.Pruned...)
+			}
+		}
 
 		e.mu.Lock()
 		e.inProgress = false
@@ -998,4 +1040,73 @@ func (l *Loop) MaybeExtractMemory(ctx context.Context) int {
 	}
 	l.autoMemExtractor.OnLoopEnd(ctx, "end_turn")
 	return 0
+}
+
+// fixupTouchedMemos applies the post-write hygiene pass to each
+// memdir file the fork agent created or modified during this dream
+// cycle (2026-05-20). Two transforms:
+//
+//  1. memdir.Redact() on the body — strips API keys / JWTs / .env
+//     assignments that the extractor may have transcribed verbatim
+//     from the conversation. When the redactor returns Reject=true
+//     (too many secrets to be a real memo), the entire file is
+//     deleted instead of left as a [REDACTED]-noise body.
+//  2. Frontmatter.MarkAccessed(now) to reset the decay clock —
+//     freshly-rewritten memos start the next 5-month timer from
+//     zero, so anything actively being reused stays in indefinitely.
+//
+// Best-effort: any per-file IO/parse error is silently skipped so
+// one corrupt memo can't take down the whole dream cycle. The fork
+// agent will get another shot next loop end if extraction wasn't
+// retained.
+//
+// `root` is the memdir root, `touched` is a list of basenames the
+// snapshot diff identified — these come from snapshotMemdirNames
+// which calls filepath.Base(f.Path), so they ALREADY include the
+// .md suffix. We deliberately don't re-add it (the original implementation
+// did, leading to xxx.md.md paths that silently never matched — bug
+// fixed 2026-05-21 after the dream cycle correctly extracted a memo
+// but neither Strength/LastAccessed nor Redact ran on it).
+//
+// Skip the .dream-lock marker file — it's an internal coordination
+// file, not a memo; ScanMemoryFiles already excludes it but defensive
+// here too.
+func fixupTouchedMemos(root string, touched []string) {
+	if root == "" || len(touched) == 0 {
+		return
+	}
+	now := time.Now()
+	for _, name := range touched {
+		if name == "" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		path := filepath.Join(root, name)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		fm, body, err := memdir.ParseFile(raw)
+		if err != nil {
+			// Unparseable YAML — leave the file alone; the
+			// extractor's next pass can fix it.
+			continue
+		}
+		// Privacy filter first; if it rejects, delete the file
+		// outright. Doing this before MarkAccessed avoids
+		// rewriting a memo we're about to nuke.
+		res := memdir.Redact(string(body))
+		if res.Reject {
+			_ = os.Remove(path)
+			continue
+		}
+		fm.MarkAccessed(now)
+		out, err := memdir.RenderFile(fm, res.Redacted)
+		if err != nil {
+			continue
+		}
+		// 0o600 mirrors auth.json — these are local-only artifacts
+		// the user controls; world-readable would be a regression
+		// against the same privacy goal Redact() enforces.
+		_ = os.WriteFile(path, out, 0o600)
+	}
 }

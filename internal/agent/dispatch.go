@@ -10,6 +10,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
+	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // toolSpecs builds the per-request `tools[]` array given to the LLM, by
@@ -514,6 +515,49 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		if path, _ := blk.ToolInput["path"].(string); path != "" {
 			if hint := skillReadHint(path, res.Output); hint != "" {
 				resultBody = resultBody + wrapAsSystemReminder(hint)
+			}
+		}
+	}
+	// Vision-aware tools (ViewImage today, future PDF page rasterisers)
+	// return base64-encoded images in res.Images. Promote them to a
+	// multi-part tool_result body so vision-capable providers can
+	// natively show the bytes as an image content block. The text
+	// `resultBody` becomes the first text part (one-line summary like
+	// "ViewImage: /abs/path.png (123 KiB, image/png)"); images follow.
+	//
+	// Vision gate: skip the fan-out entirely when the configured
+	// provider isn't vision-capable (e.g. deepseek-v4-pro on
+	// /chat/completions). The previous behaviour pushed image blocks
+	// to the adapter regardless; non-vision OpenAI-compat providers
+	// then returned 400 "unknown variant image_url" and burned the
+	// whole turn on a cryptic error. With the gate, the model
+	// receives the textual summary alone plus a one-line
+	// system-reminder explaining the image was dropped, so it can
+	// still describe e.g. file size / MIME and either retry on a
+	// vision provider or fall back to other tools. The TUI-paste
+	// path already has the equivalent strip in
+	// internal/tui/keybind_submit.go::splitOffImageBlocks; this is
+	// the tool-result twin.
+	if len(res.Images) > 0 {
+		visionOK := l.Provider != nil && pubprovider.ProviderSupportsVision(l.Provider)
+		if !visionOK {
+			resultBody = resultBody + wrapAsSystemReminder(
+				fmt.Sprintf("%d image attachment(s) dropped — current provider doesn't support vision input. To actually see the image, switch to a vision-capable model (e.g. claude-*, gpt-4o, minimax-m*, glm-5*, kimi-k2*, deepseek-vl*).", len(res.Images)),
+			)
+		} else {
+			blocks := make([]llm.ContentBlock, 0, 1+len(res.Images))
+			if resultBody != "" {
+				blocks = append(blocks, llm.ContentBlock{Type: "text", Text: resultBody})
+			}
+			for _, img := range res.Images {
+				blocks = append(blocks, llm.ContentBlock{
+					Type: "image", MediaType: img.MediaType, Data: img.Data,
+				})
+			}
+			return llm.ContentBlock{
+				Type: "tool_result", ToolUseID: blk.ToolUseID,
+				ToolResult: resultBody, IsError: res.IsError,
+				ToolResultBlocks: blocks,
 			}
 		}
 	}

@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -108,10 +109,20 @@ func expandPastedImages(text string, idx map[int]string) string {
 }
 
 // toolArgsPreview produces the parenthesized argument summary that
-// appears next to a tool name in the transcript: `Read(foo.go)`,
+// appears next to a tool name in the transcript: `Read(/abs/foo.go)`,
 // `Bash(go test ./...)`, etc. Per-tool dispatch keeps the preview
-// format meaningful — for Bash it's the command, for Read it's the
-// basename, for Grep it's the pattern.
+// format meaningful — for Bash it's the command, for Read/Write/Edit
+// it's the FULL absolute path (relative → resolved via filepath.Abs),
+// for Grep it's the pattern.
+//
+// 2026-05-20 rework (user-requested): preview no longer basenames
+// file paths or applies the previous 45-rune truncation. The full
+// absolute path is shown so the user can copy-paste it as-is and
+// know exactly which file the model touched. We still cap at a
+// generous toolArgsPreviewMaxRunes (200) for truly pathological
+// arguments — a 10k char Bash heredoc shouldn't blow up the
+// transcript layout — but normal file paths and commands now render
+// in full.
 func toolArgsPreview(name string, input map[string]any) string {
 	if input == nil {
 		return ""
@@ -120,40 +131,28 @@ func toolArgsPreview(name string, input map[string]any) string {
 	switch name {
 	case "Read", "Write", "Edit":
 		if v, ok := input["path"].(string); ok {
-			preview = basename(v)
+			preview = absPath(v)
 		}
 	case "Glob":
 		// Glob's args are (pattern, root, limit, max_depth) — not path.
 		// Without this case the leader row showed `glob …` with no
 		// pattern, hiding what the model was searching for. Format
-		// "<pattern>" or "<root>:<pattern>" so the user sees both.
+		// "<pattern>" or "<abs-root>:<pattern>" so the user sees both.
 		if pat, ok := input["pattern"].(string); ok && pat != "" {
 			preview = pat
 			if root, _ := input["root"].(string); root != "" && root != "." {
-				preview = root + ":" + pat
+				preview = absPath(root) + ":" + pat
 			}
 		}
 	case "Bash":
 		if v, ok := input["command"].(string); ok {
-			// Rune-based slice — `v[:42]` sliced through Chinese
-			// command arguments (e.g. paths under
-			// "/公司学习文件/...") at byte 42, which often lands
-			// mid-codepoint and emits invalid UTF-8 followed by a
-			// stray "…". The terminal renders that as a grey
-			// corruption box. See truncate() doc + 2026-05-16
-			// image #14 repro.
-			rs := []rune(v)
-			if len(rs) > 45 {
-				preview = string(rs[:42]) + "…"
-			} else {
-				preview = v
-			}
+			preview = v
 		}
 	case "Grep":
 		if v, ok := input["pattern"].(string); ok {
 			preview = v
 			if root, _ := input["root"].(string); root != "" && root != "." {
-				preview = root + ":" + v
+				preview = absPath(root) + ":" + v
 			}
 		}
 	case "WebFetch":
@@ -163,12 +162,47 @@ func toolArgsPreview(name string, input map[string]any) string {
 	default:
 		for _, key := range []string{"path", "command", "query", "name", "url"} {
 			if v, ok := input[key].(string); ok {
-				preview = v
+				if key == "path" {
+					preview = absPath(v)
+				} else {
+					preview = v
+				}
 				break
 			}
 		}
 	}
-	return truncate(preview, 45)
+	// Cap at toolArgsPreviewMaxRunes runes (rune-aware) so a 10k-char
+	// Bash heredoc doesn't blow the transcript layout. Normal file
+	// paths and commands fit comfortably; only pathological inputs
+	// get truncated. Truncation is rune-based to avoid mid-codepoint
+	// cuts in CJK paths (see 2026-05-16 image #14 repro).
+	rs := []rune(preview)
+	if len(rs) > toolArgsPreviewMaxRunes {
+		preview = string(rs[:toolArgsPreviewMaxRunes-1]) + "…"
+	}
+	return preview
+}
+
+// toolArgsPreviewMaxRunes — soft cap on the parenthesized arg preview
+// width. Set generously so absolute file paths (often 80-150 chars in
+// nested project layouts) render in full. Tightened from "200" only
+// if it starts forcing line wraps in the most common 100-col terminal
+// sizes, but the bench rigs use 180-220 cols, so 200 stays comfortable.
+const toolArgsPreviewMaxRunes = 200
+
+// absPath returns the absolute form of p when p is relative. Falls
+// back to p verbatim on any filepath.Abs error (which only happens
+// when os.Getwd fails — almost never). Used by toolArgsPreview to
+// guarantee the user sees a path they can copy-paste directly into a
+// shell without guessing which directory the agent was in.
+func absPath(p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 func basename(path string) string {

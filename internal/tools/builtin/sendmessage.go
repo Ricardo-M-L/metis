@@ -2,7 +2,6 @@ package builtin
 
 import (
 	"context"
-	"errors"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/channels"
@@ -60,7 +59,20 @@ func (m *SendMessage) Execute(ctx context.Context, in map[string]any) (*tools.Re
 	channel, _ := in["channel"].(string)
 	text, _ := in["text"].(string)
 	if channel == "" || text == "" {
-		return nil, errors.New("channel and text are required")
+		// 2026-05-22: report exactly WHICH field is missing instead
+		// of a generic "both required" — saves the model a turn
+		// figuring out what to fix.
+		missing := []string{}
+		if channel == "" {
+			missing = append(missing, "`channel`")
+		}
+		if text == "" {
+			missing = append(missing, "`text`")
+		}
+		return &tools.Result{
+			Output:  "SendMessage: " + strings.Join(missing, " + ") + " required. Example: SendMessage({channel: \"slack:#oncall\" or \"email:user@x.com\", text: \"deploy finished\"}).",
+			IsError: true,
+		}, nil
 	}
 	title, _ := in["title"].(string)
 	markdown, _ := in["markdown"].(bool)

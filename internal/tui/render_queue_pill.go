@@ -27,7 +27,7 @@ func renderQueuePill(m *Model) string {
 	accent := lipgloss.NewStyle().Foreground(accentBlue)
 
 	prefix := fmt.Sprintf("queued × %d", len(m.queuedPrompts))
-	peek := strings.TrimSpace(m.queuedPrompts[0])
+	peek := strings.TrimSpace(m.queuedPrompts[0].Text)
 	if peek == "" {
 		// Defensive — empty strings shouldn't reach the queue but
 		// some programmatic path could push one. Skip the peek.

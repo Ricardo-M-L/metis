@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -127,6 +128,17 @@ Exit codes: 0 ok / 1 hard fail / 2 flag error`)
 	if len(all) < 5 {
 		d.fail("tool registry", fmt.Sprintf("only %d tools — likely registration regression", len(all)))
 	}
+
+	// --- websearch backends ------------------------------------------------
+	// Report which of the 4 ordered backends are currently available
+	// so users discover the env-var path to richer results. None of
+	// the surveyed open-source agent CLIs (claude-code, hermes,
+	// crush, deepseek-tui) currently expose this kind of "which key
+	// would help" view; we add it because metis defaults to the
+	// zero-config DDG floor and most users never realise they can
+	// upgrade for free.
+	d.section("websearch backends")
+	d.reportWebSearchBackends()
 
 	// --- optional: tool smoke ---------------------------------------------
 	if *toolSmoke {
@@ -324,6 +336,54 @@ func (d *diagAcc) hasFail() bool {
 		}
 	}
 	return false
+}
+
+// reportWebSearchBackends prints the live status of each WebSearch
+// backend: ✓ if the gating env var is set (or it's the zero-config
+// floor), ✗ + free-tier hint otherwise. We deliberately don't make
+// it a fail/warn — WebSearch always works via DDG, the upgrades are
+// strictly opt-in quality boosts.
+//
+// Layout mirrors the cli-web-search "Provider:" status pattern but
+// adds the free-tier sign-up nudge so a fresh metis install knows
+// exactly how to upgrade without grepping the source. Backend list
+// stays in sync with internal/tools/builtin/websearch.go::
+// webSearchBackends — the duplicated knowledge is fine here
+// because diag is a CLI-side reporting concern that shouldn't
+// reach back into internal/ for one slice.
+func (d *diagAcc) reportWebSearchBackends() {
+	type backendInfo struct {
+		name   string // matches webSearchBackends.name
+		env    string // gating env var ("" for zero-config)
+		tier   string // human-readable free/paid tier
+		signup string // one-line "how do I get this?"
+	}
+	backends := []backendInfo{
+		{"tavily", "TAVILY_API_KEY", "1k searches/mo free", "register at tavily.com"},
+		{"brave", "BRAVE_SEARCH_API_KEY", "2k queries/mo free, no credit card", "register at api.search.brave.com"},
+		{"serper", "SERPER_API_KEY", "paid Google SERP", "register at serper.dev"},
+		{"ddg", "", "zero-config fallback", "always available"},
+	}
+	for _, b := range backends {
+		if b.env == "" {
+			d.ok(b.name, b.tier)
+			continue
+		}
+		// Precedence mirrors resolveSearchKey() in
+		// internal/tools/builtin/websearch.go — env wins, auth.json
+		// is the persistent fallback. Report which source actually
+		// supplied the key so debugging "why did metis use ddg
+		// instead of tavily" doesn't require re-deriving the rule.
+		if v := os.Getenv(b.env); v != "" {
+			d.ok(b.name, fmt.Sprintf("%s set via env, %d chars (%s…)", b.env, len(v), safePrefix(v, 6)))
+			continue
+		}
+		if v, _ := auth.GetSearchKey(b.name); v != "" {
+			d.ok(b.name, fmt.Sprintf("set via auth.json (search:%s), %d chars (%s…)", b.name, len(v), safePrefix(v, 6)))
+			continue
+		}
+		d.warn(b.name, fmt.Sprintf("%s unset — %s (%s; or `metis auth keys put %s <key>`)", b.env, b.tier, b.signup, b.name))
+	}
 }
 
 func (d *diagAcc) text() string {

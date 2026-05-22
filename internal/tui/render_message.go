@@ -11,6 +11,7 @@ import (
 	"charm.land/glamour/v2"
 	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
+	xansi "github.com/charmbracelet/x/ansi"
 )
 
 // renderMessage prints a single transcript row. Spacing convention:
@@ -37,9 +38,36 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// User prompt opens a new turn — leading blank above and
 		// trailing blank below so the eye lands on the whole turn
 		// as a discrete block.
+		//
+		// Wrap to the chat surface width (image #21 feedback
+		// 2026-05-20: a 200-cell path + CJK overflowed past the
+		// right edge without wrapping because we passed the whole
+		// content through styleUser.Render as one line). xansi.Wrap
+		// preserves SGR sequences AND counts cells correctly for
+		// CJK (uniseg-based grapheme width), so we wrap to a body
+		// width that mirrors the assistant-body math: `width - 4`
+		// (2 left indent + 2 right safety). Breakpoints " /-_."
+		// let paths split at slashes and underscores too, not just
+		// spaces — readable for the Unix-path-heavy prompts metis
+		// users tend to type.
+		bodyW := width - 4
+		if bodyW < 20 {
+			bodyW = 20
+		}
+		wrapped := xansi.Wrap(msg.Content, bodyW, " /-_.")
+		lines := strings.Split(wrapped, "\n")
 		s.WriteString("\n")
-		s.WriteString(styleUser.Render("  " + glyphPrompt + " " + msg.Content))
-		s.WriteString("\n")
+		for i, ln := range lines {
+			if i == 0 {
+				s.WriteString(styleUser.Render("  " + glyphPrompt + " " + ln))
+			} else {
+				// Continuation rows: keep the 4-cell indent (2
+				// margin + glyph + space) but drop the glyph so
+				// the eye reads it as the same turn.
+				s.WriteString(styleUser.Render("    " + ln))
+			}
+			s.WriteString("\n")
+		}
 		// Pasted-image attachments: claude-code prints one indented
 		// `└ [Image #N]` row per placeholder underneath the prompt so
 		// the user has a visible "yes, the agent received the image"
@@ -75,44 +103,53 @@ func renderMessage(msg Message, width int, expand bool) string {
 		}
 		s.WriteString("\n\n")
 	case "thinking":
-		// Extended-thinking trace. By default we collapse to a single
-		// dim italic line so the transcript stays readable; the user
-		// can press Ctrl+O to unfold all thinking + tool output at
-		// once (claude-code's verbose flow). Without this gate, a
-		// chatty model floods the screen with grey italic that
-		// visually competes with the actual reply (image #17 user
-		// feedback 2026-05-10).
-		// Glyph in cyan accent (matches the `thought-summary` row's
-		// styleAccent below at line ~111 — visual consistency between
-		// streaming "thinking" and turn-end "Tinkered for Xs"). Body
-		// text in styleDim (#a0a0a0) instead of styleMuted (#606060)
-		// because claude-code's AssistantThinkingMessage uses
-		// `dimColor` (ANSI Faint, ~50% of fg) rather than fixed
-		// ultra-grey — readable on dark themes, doesn't disappear.
+		// Extended-thinking trace. 2026-05-21 — switched from "collapse
+		// to one line by default + Ctrl+O to expand" to "always full".
+		//
+		// Why the reversal: the prior collapse-default was added on
+		// 2026-05-10 (image #17) when a noisy model flooded the screen.
+		// But the user reported on 2026-05-21 (session
+		// f460e252-...-1779295464) that long silent-tool-loop turns
+		// (minimax-m2.7 doing 6+ rescue cycles, each generating a full
+		// thinking paragraph) created stacks of one-line collapsed
+		// rows that looked like "compressed mush" with no way to tell
+		// what the model was actually reasoning about. Collapse was
+		// pure visual save (zero token / context impact — see
+		// `expand` param doc) so the trade-off shifted: full thinking
+		// out-of-the-box matches claude-code's
+		// AssistantThinkingMessage default and gives the user a real
+		// window into the model's reasoning during long turns.
+		//
+		// expand parameter retained: callers (Ctrl+O toggle, the
+		// in-progress thinking item, redacted_thinking) still hit
+		// this path and most still pass false. We ignore expand for
+		// the "thinking" body — always render full — but the param
+		// stays in the signature because tests + render-cache key on
+		// it. If the noise complaint comes back, the
+		// re-collapse-by-default switch is a 3-line revert.
 		s.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
 		thinkStyle := styleDim.Italic(true)
-		if !expand {
-			// Folded view — first line preview only, plus a hint when
-			// the row has room. Width-aware so the hint never wraps
-			// onto a second row over the next chat item (image #7/#8).
-			first := firstThinkingLine(msg.Content, width)
-			s.WriteString(thinkStyle.Render(first))
-			if thinkingHintFits(width) {
-				s.WriteString(styleMuted.Render("  "))
-				s.WriteString(styleMuted.Render("(ctrl+o to expand)"))
-			}
-			s.WriteString("\n")
-		} else {
-			thinkLines := strings.Split(msg.Content, "\n")
-			if len(thinkLines) > 0 {
-				s.WriteString(thinkStyle.Render(thinkLines[0]))
-				for _, ln := range thinkLines[1:] {
-					s.WriteString("\n  ")
-					s.WriteString(thinkStyle.Render(ln))
-				}
-			}
-			s.WriteString("\n")
+		// Wrap to body width before splitting on \n, otherwise streamed
+		// thinking content (often arrives as one long paragraph with
+		// no line breaks) blows past the right edge — same fix as
+		// renderMessage::case "user" got on the same day. Breakpoints
+		// include path separators because models often reason about
+		// file paths inside thinking blocks.
+		bodyW := width - 4
+		if bodyW < 20 {
+			bodyW = 20
 		}
+		wrapped := xansi.Wrap(msg.Content, bodyW, " /-_.")
+		thinkLines := strings.Split(wrapped, "\n")
+		if len(thinkLines) > 0 {
+			s.WriteString(thinkStyle.Render(thinkLines[0]))
+			for _, ln := range thinkLines[1:] {
+				s.WriteString("\n  ")
+				s.WriteString(thinkStyle.Render(ln))
+			}
+		}
+		s.WriteString("\n")
+		_ = expand // see note above — kept for cache-key + signature stability
 	case "redacted_thinking":
 		// Anthropic safety classifier replaced this reasoning chunk
 		// with opaque cipher text. The cipher text is in msg.Content
@@ -201,6 +238,32 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// ⚠ for warning). Without the prefix the eye lost the column
 		// and info messages floated awkwardly.
 		s.WriteString(styleMuted.Render("  · " + msg.Content))
+		s.WriteString("\n")
+	case "plan-proposal":
+		// ExitPlanMode emits the full plan markdown as EventInfo with
+		// a "[plan proposal]\n..." prefix. Before 2026-05-21 it
+		// rendered via the "info" case → styleMuted whole-block grey
+		// (image #43): the user can't review a plan that's the same
+		// washed-out color as a routine "expand tool output: on"
+		// status ping. We split it off here so the markdown body
+		// renders at default fg via glamour and the [plan proposal]
+		// banner gets the green accent treatment ExitPlanMode
+		// earns by being a moment that calls for user attention.
+		body := msg.Content
+		// Strip the marker prefix; replace with a styled banner so
+		// the body below renders as clean markdown.
+		const marker = "[plan proposal]\n"
+		body = strings.TrimPrefix(body, marker)
+		s.WriteString(styleSuccess.Render("  ⏸ "))
+		s.WriteString(styleAccent.Render("plan proposal"))
+		s.WriteString("\n\n")
+		rendered := renderAssistantBody(body, width)
+		bodyLines := strings.Split(rendered, "\n")
+		for _, ln := range bodyLines {
+			s.WriteString("  ")
+			s.WriteString(ln)
+			s.WriteString("\n")
+		}
 		s.WriteString("\n")
 	case "user-steer":
 		// Mid-turn user input that was injected via SteerInject (the

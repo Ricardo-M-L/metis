@@ -138,20 +138,75 @@ func TestWebSearch_NameIsClaudeCodeAligned(t *testing.T) {
 }
 
 func TestFormatSearchResults_NoResults(t *testing.T) {
-	got := formatSearchResults("xyz", nil)
+	got := formatSearchResults("xyz", nil, "ddg", nil)
 	if !strings.Contains(got, "no results") {
 		t.Errorf("empty-results output should explain to LLM; got %q", got)
+	}
+	// Even on no-results the footer should still tag the backend so
+	// the model can decide whether to retry on a richer backend.
+	if !strings.Contains(got, "[via ddg") {
+		t.Errorf("empty-results output should still carry [via X] footer; got %q", got)
 	}
 }
 
 func TestFormatSearchResults_FormatsAllFields(t *testing.T) {
 	got := formatSearchResults("test", []webSearchResult{
 		{Title: "Foo", Link: "https://foo.example", Snippet: "About foo.", Position: 1},
-	})
-	for _, want := range []string{"test", "Foo", "https://foo.example", "About foo."} {
+	}, "tavily", nil)
+	for _, want := range []string{"test", "Foo", "https://foo.example", "About foo.", "[via tavily]"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q; got:\n%s", want, got)
 		}
+	}
+}
+
+// TestFormatSearchResults_BackendTag — the [via X] footer is the
+// load-bearing UX signal that lets users + model see which tier
+// served the request. Pin its presence + exact bracket shape so a
+// careless future edit doesn't silently revert the transparency
+// improvement.
+func TestFormatSearchResults_BackendTag(t *testing.T) {
+	for _, backend := range []string{"tavily", "brave", "serper", "ddg"} {
+		got := formatSearchResults("q", []webSearchResult{
+			{Title: "T", Link: "https://x", Snippet: "S", Position: 1},
+		}, backend, nil)
+		want := "[via " + backend
+		if !strings.Contains(got, want) {
+			t.Errorf("backend=%s: output missing %q; got %q", backend, want, got)
+		}
+	}
+}
+
+// TestFormatSearchResults_DDGFooterPromptsForKey — the zero-config
+// floor backend should call out itself + suggest the env vars that
+// upgrade it. Without this prompt users never discover the better
+// backends (cli-web-search survey, 2026-05-20: nobody else in the
+// open source agent space does this hint).
+func TestFormatSearchResults_DDGFooterPromptsForKey(t *testing.T) {
+	got := formatSearchResults("q", []webSearchResult{
+		{Title: "T", Link: "https://x", Snippet: "S", Position: 1},
+	}, "ddg", nil)
+	for _, want := range []string{"TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DDG footer should advertise %s as upgrade path; got %q", want, got)
+		}
+	}
+}
+
+// TestFormatSearchResults_FallbackTrail — when a higher-tier backend
+// failed before we reached the one that worked, the trail must be
+// visible so the user can see WHY they're not on their preferred
+// backend (e.g. Tavily rate-limited → fell back to DDG). Silent
+// fallback is the prior behaviour we're fixing.
+func TestFormatSearchResults_FallbackTrail(t *testing.T) {
+	got := formatSearchResults("q", []webSearchResult{
+		{Title: "T", Link: "https://x", Snippet: "S", Position: 1},
+	}, "ddg", []string{"tavily failed: status 429: rate limited"})
+	if !strings.Contains(got, "[fallback:") {
+		t.Errorf("expected [fallback: ...] footer; got %q", got)
+	}
+	if !strings.Contains(got, "tavily failed") {
+		t.Errorf("fallback footer should name the failed backend; got %q", got)
 	}
 }
 

@@ -138,12 +138,27 @@ func (o *OpenAI) SupportsVision() bool {
 		strings.HasPrefix(m, "o4"),
 		strings.HasPrefix(m, "chatgpt-4o"):
 		return true
-	// Chinese OSS families whose new flagships ship with native vision and
-	// route through the OpenAI-chat shape. Includes both text-flagship names
-	// (deepseek-v4, kimi-k2, glm-5) that user confirms support image_url and
-	// explicit *-vl / *-vision variants.
-	case strings.HasPrefix(m, "deepseek-v4"),
-		strings.HasPrefix(m, "deepseek-vl"),
+	// Chinese OSS families. Two cohorts:
+	//
+	//   1. Text-flagship names that DO natively accept image_url on
+	//      the same /chat/completions endpoint. Confirmed by live
+	//      2026-05-20 smoke: glm-5.1 + minimax-m2.7 both correctly
+	//      identified colors in a test PNG. kimi-k2 stays on the
+	//      list pending a Kimi-side smoke (no API key in the test
+	//      run); user can drop it themselves if their kimi
+	//      configuration 400s on image_url.
+	//
+	//   2. Explicit *-vl / *-vision / *-4v variants — always vision.
+	//
+	// Notable exclusion: deepseek-v4-pro / deepseek-v4-flash. Sounds
+	// like they should be on the list, but DeepSeek's published
+	// list-models API exposes no vision-capable V4 id, and live
+	// smoke returns 400 "unknown variant image_url" on V4-Pro. The
+	// marketing "DeepSeek V4 Vision" capability has no API model id
+	// yet. Per the false-positive cost rationale above (a cryptic
+	// 400 burns the whole turn), we'd rather strip the image and
+	// surface a clean "provider lacks vision support" note.
+	case strings.HasPrefix(m, "deepseek-vl"),
 		strings.HasPrefix(m, "kimi-k2"),
 		strings.HasPrefix(m, "kimi-latest"),
 		strings.HasPrefix(m, "kimi-vl"),
@@ -517,8 +532,44 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 					}
 					text.WriteString(c.Text)
 				case "tool_result":
+					// Vision-aware tools (ViewImage) populate
+					// ToolResultBlocks with [{text}, {image}...]. OpenAI's
+					// tool role only accepts a string Content — images
+					// can't ride inside the tool message. So we siphon
+					// any image blocks into the shared `images` slice
+					// (which folds into the synthetic user message
+					// below) and keep the textual portion as the tool
+					// message body. The model then sees the tool reply
+					// followed by a user message carrying the image,
+					// preserving the visual context within the same
+					// turn. Used by DeepSeek/Kimi/GLM (all openai-compat
+					// custom providers) so ViewImage works there too,
+					// not just on the Anthropic path.
+					textPart := c.ToolResult
+					if len(c.ToolResultBlocks) > 0 {
+						var sb strings.Builder
+						for _, b := range c.ToolResultBlocks {
+							switch b.Type {
+							case "text":
+								if sb.Len() > 0 {
+									sb.WriteByte('\n')
+								}
+								sb.WriteString(b.Text)
+							case "image":
+								images = append(images, oaiContentPart{
+									Type: "image_url",
+									ImageURL: &oaiImageURL{
+										URL: "data:" + b.MediaType + ";base64," + b.Data,
+									},
+								})
+							}
+						}
+						if sb.Len() > 0 {
+							textPart = sb.String()
+						}
+					}
 					toolMsgs = append(toolMsgs, oaiMessage{
-						Role: "tool", ToolCallID: c.ToolUseID, Content: c.ToolResult,
+						Role: "tool", ToolCallID: c.ToolUseID, Content: textPart,
 					})
 				case "image":
 					images = append(images, oaiContentPart{

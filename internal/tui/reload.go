@@ -14,6 +14,7 @@ package tui
 // shape served the same goal.
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -57,7 +58,19 @@ func (m *Model) Reload(opts ReloadOpts) {
 		if reason == "" {
 			reason = "reload"
 		}
-		_ = m.loop.Memory.SaveDailyNote(m.sessionID, reason, summary)
+		// 2026-05-22: surface SaveDailyNote errors instead of
+		// silently dropping. The note IS the user's audit trail
+		// for "what happened in the session I just cleared" — a
+		// write failure here used to vanish; now it shows in
+		// the chat as a warning row so the user can at least
+		// retry from a snapshot.
+		if err := m.loop.Memory.SaveDailyNote(m.sessionID, reason, summary); err != nil {
+			m.messages = append(m.messages, Message{
+				Role:      "warning",
+				Content:   fmt.Sprintf("(reload: failed to save daily note: %v — session history is cleared but no audit trail was written)", err),
+				Timestamp: time.Now(),
+			})
+		}
 	}
 	if m.loop != nil {
 		m.loop.Reset()

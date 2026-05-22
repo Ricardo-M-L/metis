@@ -2,7 +2,6 @@ package builtin
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,7 +46,21 @@ func (l LS) CanUse(_ context.Context, in map[string]any) (tools.Permission, stri
 func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	path, _ := in["path"].(string)
 	if path == "" {
-		return nil, errors.New("path required (use \".\" for current directory)")
+		// 2026-05-22: rich error replacing bare errors.New short-
+		// circuit so the model gets a redirect hint when it passed
+		// the wrong arg name (`dir` / `directory` / `command` / ...).
+		hint := ""
+		if d, _ := in["dir"].(string); d != "" {
+			hint = "\n\nYou passed `dir`. The argument name is `path`. Try LS({path: \"" + d + "\"})."
+		} else if d, _ := in["directory"].(string); d != "" {
+			hint = "\n\nYou passed `directory`. The argument name is `path`. Try LS({path: \"" + d + "\"})."
+		} else if c, _ := in["command"].(string); c != "" {
+			hint = "\n\nYou passed `command`. That's the Bash tool's input — call Bash if you want to run a shell command."
+		}
+		return &tools.Result{
+			Output:  "LS: `path` is required (use \".\" for current directory, or an absolute path like /Users/x/proj). LS lists DIRECTORY entries; for file contents use Read, for name-pattern search use Glob." + hint,
+			IsError: true,
+		}, nil
 	}
 	// Resolve relative paths against cwd. Earlier this hard-failed with
 	// "absolute path required", which forced the LLM into a retry loop

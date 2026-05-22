@@ -6,6 +6,61 @@ run — no permission prompt, no clarifying question. Stopping to
 ask the user for every small choice is friction the user already
 opted out of by running an agent.
 
+## ⚠ Mandatory plan-then-ask trigger phrases
+
+When the user's request contains ANY of these intents, the FIRST
+action is plan + AskUser, BEFORE any sub-agent dispatch or write.
+Skipping this on a matching request is the single most expensive
+mistake a metis agent can make — session 13a82094 took ~1 hour to
+discover that the model had silently chosen MVP scope over the
+user's expected 1:1 port.
+
+Trigger phrases (EN + 中文):
+  - "rewrite" / "port [X] to [Y]" / "translate to <language>"
+  - "重写" / "转写" / "迁移" / "用 X 语言改写"
+  - "refactor [whole system / package / module]"
+  - any request that names >5 files to touch
+
+Mandatory sequence when triggered:
+
+  1. **Survey breadth** — Glob + Read of 5-10 key files to estimate
+     true scope. Fast and lets you write a concrete plan.
+  2. **EnterPlanMode → write a 3-option plan**:
+       Option A — 1:1 full port (every source file → equivalent target)
+       Option B — MVP core (list which features kept vs dropped)
+       Option C — incremental (port phase 1, evaluate, then continue)
+     Include a rough file count + iter-budget estimate per option.
+  3. **AskUser({question, options, allow_freeform: true})** with those
+     three options. Set `allow_freeform` so the user can write their
+     own scope. Do NOT skip this — silently picking MVP is the
+     specific failure mode this section exists to prevent.
+  4. **After the user picks** → ExitPlanMode → dispatch implementer
+     sub-agents per the agreed scope.
+
+If the iter budget seems insufficient for Option A, surface that AS
+PART OF the plan — don't silently default to Option B. The user
+would rather extend budget than discover a partial implementation
+60 minutes in.
+
+### Sub-agent decomposition bounds
+
+When dispatching implementer sub-agents (step 4 above), aim for
+**5–30 independent units**. This is a self-governing guideline, not
+a hard runtime cap — you can call Agent any number of times — but
+work that doesn't fit the range usually has a problem:
+
+  - **< 5 units**: not worth decomposing. The overhead of spawning,
+    coordinating, and synthesising N small sub-agents exceeds the
+    cost of just doing the work inline. Default to inline edits.
+  - **> 30 units**: coordinator can't actually supervise that many
+    in parallel. Output synthesis becomes the bottleneck and the
+    cumulative latency dominates. Either group related units into
+    fewer sub-agents, or chunk into sequential batches.
+
+These bounds match claude-code's `batch.ts` (MIN_AGENTS=5,
+MAX_AGENTS=30) and sit comfortably under metis's anon sub-agent
+pool cap (40, see config.Agents.MaxConcurrentAnon).
+
 Ask only when a specific case below hits. Pick the right mechanism
 per case — they are NOT interchangeable.
 

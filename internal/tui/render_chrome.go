@@ -710,3 +710,72 @@ func renderHints(m *Model) string {
 	s.WriteString("\n")
 	return s.String()
 }
+
+// renderQueuedPreview shows the messages the user has typed while a
+// turn was in flight. Empty when the queue is empty.
+//
+// Why a dedicated band (not just the status-bar chip): prior to this
+// the only feedback for `m.queuedPrompts` was the compact `◷ N queued`
+// chip way down in the status bar. Users (2026-05-20 feedback) saw
+// the input clear after Enter and assumed the message had been
+// dropped — claude-code's PromptInputQueuedCommands.tsx renders each
+// queued message as a faded message bubble between the input and
+// status bar, which the user immediately recognises as "captured,
+// will run next". We mirror that here with a one-line-per-message
+// preview directly below renderHints so the eye lands on it without
+// scanning the status bar.
+//
+// Display rules borrowed from claude-code:
+//   - Cap at queuedPreviewMaxRows visible rows (3); collapse the rest
+//     into a "+ N more queued" footer.
+//   - Truncate each line at queuedPreviewMaxRunes (90 runes, rune-
+//     aware to avoid CJK mid-codepoint corruption — same lesson as
+//     toolArgsPreview).
+//   - styleDim so the preview reads as anticipated future input, not
+//     part of the live transcript.
+func renderQueuedPreview(m *Model) string {
+	if len(m.queuedPrompts) == 0 {
+		return ""
+	}
+	const (
+		queuedPreviewMaxRows  = 3
+		queuedPreviewMaxRunes = 90
+	)
+	var b strings.Builder
+	visible := m.queuedPrompts
+	overflow := 0
+	if len(visible) > queuedPreviewMaxRows {
+		overflow = len(visible) - queuedPreviewMaxRows
+		visible = visible[:queuedPreviewMaxRows]
+	}
+	for _, q := range visible {
+		// Collapse newlines so a pasted multi-line prompt still fits
+		// one preview row. The full text survives in m.queuedPrompts
+		// and runs verbatim when its turn comes.
+		line := strings.ReplaceAll(q.Text, "\n", " ⏎ ")
+		rs := []rune(line)
+		if len(rs) > queuedPreviewMaxRunes {
+			line = string(rs[:queuedPreviewMaxRunes-1]) + "…"
+		}
+		b.WriteString("  ")
+		// Priority badge: Now → "!" Later → ".". Default Next has
+		// no badge so the common case stays as terse as the
+		// pre-priority preview. Use effective() so uninitialised
+		// (zero) Priority renders as Next without a badge.
+		badge := ""
+		switch q.Priority.effective() {
+		case QueuePriorityNow:
+			badge = "! "
+		case QueuePriorityLater:
+			badge = ". "
+		}
+		b.WriteString(styleDim.Render("⏵ queued · " + badge + line))
+		b.WriteString("\n")
+	}
+	if overflow > 0 {
+		b.WriteString("  ")
+		b.WriteString(styleMuted.Render(fmt.Sprintf("+ %d more queued (press Esc to cancel the running turn first to send any sooner)", overflow)))
+		b.WriteString("\n")
+	}
+	return b.String()
+}

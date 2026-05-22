@@ -3,7 +3,6 @@ package builtin
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os/exec"
 	"strings"
 
@@ -40,7 +39,20 @@ func (g Git) CanUse(_ context.Context, in map[string]any) (tools.Permission, str
 func (Git) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	args, _ := in["args"].(string)
 	if args == "" {
-		return nil, errors.New("args required")
+		// 2026-05-22: rich error replacing bare errors.New. Common
+		// confusions: model passed `command` or `cmd` thinking it
+		// was the field name, or sub-command alone like just
+		// "status" needs "args".
+		hint := ""
+		if c, _ := in["command"].(string); c != "" {
+			hint = "\n\nYou passed `command`. The argument name is `args`. Try Git({args: \"" + c + "\"})."
+		} else if c, _ := in["cmd"].(string); c != "" {
+			hint = "\n\nYou passed `cmd`. The argument name is `args`. Try Git({args: \"" + c + "\"})."
+		}
+		return &tools.Result{
+			Output:  "Git: `args` is required (e.g. \"status\", \"diff HEAD~1\", \"log --oneline -10\"). The args string is everything that would follow `git` on the command line." + hint,
+			IsError: true,
+		}, nil
 	}
 	cwd, _ := in["cwd"].(string)
 

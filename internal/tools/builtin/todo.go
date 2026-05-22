@@ -27,7 +27,19 @@ type Todo struct {
 
 func (Todo) Name() string { return "TodoWrite" }
 func (Todo) Description() string {
-	return "Create or update a task in the session task list. Persists to ~/.metis/tasks/."
+	return `Create or update a task in the session task list. Persists to ~/.metis/tasks/.
+
+UPDATE vs CREATE — match by content; id is auto-managed:
+  - Brand new task: pass content + (optional) status. metis generates an id internally.
+  - Updating existing: pass the SAME content string + the new status. metis matches by content (exact then normalised — "Cluster 2: Wire Protocol" matches "2. Wire Protocol", etc.) and updates in place.
+  - Keep content STABLE across updates. If you reword "implement plan module" to "Phase 1: plan", you risk creating a duplicate if the normaliser misses it.
+
+STATUS transitions:
+  - pending → in_progress when you start working on it
+  - in_progress → completed when done
+  - Only ONE task should be in_progress at a time; finish (or push back to pending) before starting the next.
+
+To LIST current tasks before deciding to update or create, call TodoRead first (zero-cost; reads the same file).`
 }
 func (Todo) InputSchema() map[string]any {
 	return map[string]any{
@@ -36,10 +48,10 @@ func (Todo) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"id": map[string]any{
 				"type":        "string",
-				"description": "Optional id to update; if absent we match by content or append.",
+				"description": "Advanced/optional. Internal task ID for direct update. Almost always you should OMIT this — metis matches by content (exact + normalised) when id is absent. Only pass id if you've explicitly retrieved it from a prior TodoWrite tool_result.",
 			},
-			"status":   map[string]any{"type": "string", "description": "in_progress | completed | pending"},
-			"content":  map[string]any{"type": "string"},
+			"status":   map[string]any{"type": "string", "description": "in_progress | completed | pending. Only ONE in_progress at a time."},
+			"content":  map[string]any{"type": "string", "description": "Task description. Keep stable across updates — changing the wording without passing `id` creates a duplicate."},
 			"priority": map[string]any{"type": "string", "description": "high | medium | low"},
 		},
 	}
@@ -173,6 +185,15 @@ func (TodoRead) Execute(_ context.Context, _ map[string]any) (*tools.Result, err
 	if len(tl.Items) == 0 {
 		return &tools.Result{Output: "(no tasks yet — call TodoWrite to create one)"}, nil
 	}
+	// Format: `<icon> <status> <content>`. Matches claude-code's
+	// TodoItemSchema (utils/todo/types.ts) which exposes only
+	// content + status + activeForm — no id. metis still uses id
+	// internally as a dedup key (image #50 fix), but the model
+	// doesn't need to see it: TodoWrite's `id` is optional and
+	// the Upsert path falls back to content-normalised matching
+	// when omitted (tasks.go::normalizeTaskContent). Showing id
+	// historically tempted models to copy-paste rather than rely
+	// on content stability — and added visual noise.
 	var b strings.Builder
 	for _, it := range tl.Items {
 		icon := "○"
@@ -182,7 +203,7 @@ func (TodoRead) Execute(_ context.Context, _ map[string]any) (*tools.Result, err
 		case "in_progress":
 			icon = "◐"
 		}
-		fmt.Fprintf(&b, "%s [%s] %-10s  %s\n", icon, it.ID, it.Status, it.Content)
+		fmt.Fprintf(&b, "%s %-11s  %s\n", icon, it.Status, it.Content)
 	}
 	return &tools.Result{Output: strings.TrimRight(b.String(), "\n")}, nil
 }

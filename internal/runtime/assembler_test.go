@@ -33,9 +33,19 @@ func TestAssembleBaseSections_SubAgentMinimal(t *testing.T) {
 		HasSkills:    true,
 		IsSubAgent:   true,
 	})
-	wantNames := map[string]bool{"identity": true, "privacy": true, "style": true}
+	// 2026-05-21 — tool_redirects is now included for sub-agents that
+	// have Read/LS in their enabled set (image #31 repro: a Read-only
+	// sub-agent kept calling LS on file paths because the redirects
+	// table was Bash-gated and hidden from it). The table now includes
+	// the directory-vs-file decision rules which apply even without Bash.
+	wantNames := map[string]bool{
+		"identity":       true,
+		"privacy":        true,
+		"style":          true,
+		"tool_redirects": true,
+	}
 	if len(got) != len(wantNames) {
-		t.Errorf("sub-agent should produce %d sections (identity+privacy+style), got %d: %v",
+		t.Errorf("sub-agent should produce %d sections, got %d: %v",
 			len(wantNames), len(got), sectionNames(got))
 	}
 	for _, sec := range got {

@@ -74,8 +74,8 @@ func TestEnqueue_LongPromptDoesNotPolluteChat(t *testing.T) {
 	if got := len(m.messages); got != priorMsgCount {
 		t.Errorf("long prompt enqueue must not add chat rows; len(messages) went %d → %d", priorMsgCount, got)
 	}
-	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0] != long {
-		t.Errorf("queued prompt should preserve the full prompt verbatim; got %q", m.queuedPrompts)
+	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0].Text != long {
+		t.Errorf("queued prompt should preserve the full prompt verbatim; got %+v", m.queuedPrompts)
 	}
 }
 
@@ -86,7 +86,7 @@ func TestEnqueue_LongPromptDoesNotPolluteChat(t *testing.T) {
 func TestStatusBar_QueuedChipVisible(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.width = 120
-	m.queuedPrompts = []string{"first queued", "second queued"}
+	m.queuedPrompts = []queuedItem{{Text:"first queued"}, {Text:"second queued"}}
 
 	bar := renderStatusBar(m)
 	if !strings.Contains(bar, "◷ 2 queued") {
@@ -182,7 +182,7 @@ func TestRender_StickyPillNoLongerCalled(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.width = 100
 	m.height = 30
-	m.queuedPrompts = []string{"please don't render me as a sticky pill"}
+	m.queuedPrompts = []queuedItem{{Text:"please don't render me as a sticky pill"}}
 
 	view := m.View().Content
 	// The sticky pill format from render_queue_pill.go renders the

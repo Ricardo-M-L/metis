@@ -36,9 +36,15 @@ func TestContract_ThresholdViaWrites(t *testing.T) {
 
 func TestContract_ThresholdViaAgentDispatches(t *testing.T) {
 	var ct contractTracker
-	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "plan"})})
+	// Loop-parameterised on contractAgentThreshold (2026-05-21:
+	// bumped 2 → 10, so the old "1 dispatch then 1 more" fixture
+	// no longer matched). After (threshold-1) dispatches the
+	// tracker must still report not-met; the next one tips it over.
+	for i := 0; i < contractAgentThreshold-1; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "plan"})})
+	}
 	if ct.thresholdMet() {
-		t.Fatalf("threshold should not yet be met at %d dispatches", ct.agentDispatches)
+		t.Fatalf("threshold should not yet be met at %d dispatches (threshold=%d)", ct.agentDispatches, contractAgentThreshold)
 	}
 	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "general"})})
 	if !ct.thresholdMet() {
@@ -95,13 +101,19 @@ func TestContract_MidTurnReminder_FiresOnceAtThreshold(t *testing.T) {
 
 func TestContract_MidTurnReminder_QuietIfVerifyAlreadyDispatched(t *testing.T) {
 	var ct contractTracker
-	// Cross threshold via Agent dispatches, one of which IS verify
-	ct.observeToolUses([]llm.ContentBlock{
-		makeToolUse("Agent", map[string]any{"subagent_type": "plan"}),
+	// Cross threshold via Agent dispatches, one of which IS verify.
+	// Loop-parameterised on contractAgentThreshold (2026-05-21 bump:
+	// 2 → 10; the old fixture's "1 plan + 1 verify" no longer meets
+	// the threshold).
+	uses := []llm.ContentBlock{
 		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
-	})
+	}
+	for i := 0; i < contractAgentThreshold-1; i++ {
+		uses = append(uses, makeToolUse("Agent", map[string]any{"subagent_type": "plan"}))
+	}
+	ct.observeToolUses(uses)
 	if !ct.thresholdMet() {
-		t.Fatalf("test premise: threshold should be met")
+		t.Fatalf("test premise: threshold should be met (have %d dispatches, threshold=%d)", ct.agentDispatches, contractAgentThreshold)
 	}
 	if body := ct.shouldFireMidTurnReminder(); body != "" {
 		t.Errorf("reminder should stay quiet when verify already dispatched; got: %q", body)

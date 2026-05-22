@@ -130,12 +130,19 @@ func StyleSection(_ PromptCtx) SystemPromptSection {
 	}
 }
 
-// ToolRedirectsSection — fires only when Bash is in the enabled set.
-// Sub-agents with read-only tool sets (explore, plan) don't need the
-// "use Read not cat" table — they have no Bash to misuse.
+// ToolRedirectsSection — fires when any of the tools the redirects
+// table covers (Bash, LS, Read) is enabled. Used to be Bash-gated
+// only, but the table now includes the LS↔Read "directory vs file"
+// pair which is just as useful for sub-agents that have file I/O
+// tools without Bash (image #31 repro 2026-05-21: a read-only
+// sub-agent with LS+Read kept calling LS on file paths because the
+// guard was hiding the table from it).
 func ToolRedirectsSection(ctx PromptCtx) SystemPromptSection {
-	if ctx.EnabledTools != nil && !ctx.EnabledTools["Bash"] {
-		return SystemPromptSection{}
+	if ctx.EnabledTools != nil {
+		anyRelevant := ctx.EnabledTools["Bash"] || ctx.EnabledTools["LS"] || ctx.EnabledTools["Read"]
+		if !anyRelevant {
+			return SystemPromptSection{}
+		}
 	}
 	return SystemPromptSection{
 		Name:  "tool_redirects",

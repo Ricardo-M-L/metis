@@ -32,7 +32,22 @@ const modeCycleDebounce = 200 * time.Millisecond
 // cannot stall an agent indefinitely. Cross-CLI testing exposed the
 // "VNC viewer left running, agent stuck for >6 minutes on a single
 // permission prompt" failure mode this guards against.
-const permissionTimeout = 60 * time.Second
+//
+// 2026-05-22: changed from const → var so config.UI.PermissionTimeoutSeconds
+// can override at startup. SetPermissionTimeout is the injection hook
+// called by cmd/metis/main.go after config load. Tests can also poke
+// it directly to exercise timeout paths in fast time.
+var permissionTimeout = 60 * time.Second
+
+// SetPermissionTimeout overrides the wall-clock window for permission
+// prompts. Called once at startup from cmd/metis/main.go with the
+// value from config.UI.PermissionTimeout(). Caller is responsible for
+// ensuring d > 0 (a zero/negative value would auto-deny instantly).
+func SetPermissionTimeout(d time.Duration) {
+	if d > 0 {
+		permissionTimeout = d
+	}
+}
 
 // handlePermKey processes a key while the permission prompt is up.
 //

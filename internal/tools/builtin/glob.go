@@ -2,7 +2,6 @@ package builtin
 
 import (
 	"context"
-	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -118,7 +117,33 @@ func (g Glob) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	pattern, _ := in["pattern"].(string)
 	if pattern == "" {
-		return nil, errors.New("pattern required")
+		// Richer error message — "pattern required" alone was too
+		// terse. Image #34 repro (2026-05-21): a sub-agent called
+		// Glob with NO pattern (passed `command` field with a shell
+		// invocation instead), got "pattern required", and looped.
+		// The new message names the expected shape AND points at
+		// the right tools for the misuse cases we've seen in the
+		// wild (shell commands → Bash, file contents → Read,
+		// directory listing → LS).
+		hint := globMisuseHint(in)
+		return &tools.Result{
+			Output: "Glob: `pattern` field is required (e.g. \"**/*.go\" or \"src/**/*.ts\"). " +
+				"Glob ONLY finds files by name pattern; it doesn't run shell commands, read file contents, or list directories." +
+				hint,
+			IsError: true,
+		}, nil
+	}
+	// Shell-command-shaped pattern: a string with shell metachars
+	// like `||`, `&&`, `2>`, `/dev/null`, leading `ls `/`find `/`grep `
+	// is almost certainly the model trying to use Glob as a Bash
+	// substitute. Reject with a Bash redirect BEFORE the doublestar
+	// engine produces a "no matches" result (which the model would
+	// then misread as "wrong glob; try different syntax" and loop).
+	if hint := globShellShapeHint(pattern); hint != "" {
+		return &tools.Result{
+			Output: "Glob: pattern looks like a shell command, not a glob. " + hint,
+			IsError: true,
+		}, nil
 	}
 	root, _ := in["root"].(string)
 	if root == "" {
@@ -270,4 +295,66 @@ func globToRegex(pat string) string {
 	}
 	b.WriteByte('$')
 	return b.String()
+}
+
+// globMisuseHint inspects the input bag for fields that suggest the
+// model meant a different tool. Triggered when `pattern` is empty:
+// if we see a `command` or `cmd` field it's almost certainly a
+// model that confused Glob with Bash; a `path` field with a file
+// extension points at Read or LS. The hint is appended to the
+// "pattern required" error so the model's next turn lands on the
+// right tool instead of looping on Glob with a different empty arg.
+func globMisuseHint(in map[string]any) string {
+	if cmd, _ := in["command"].(string); cmd != "" {
+		return "\n\nYou passed a `command` field (\"" + truncForHint(cmd, 80) + "\"). That's the Bash tool's input — call Bash if you want to run a shell command."
+	}
+	if cmd, _ := in["cmd"].(string); cmd != "" {
+		return "\n\nYou passed a `cmd` field. Glob takes `pattern`. Call Bash if you want to run a shell command."
+	}
+	if p, _ := in["path"].(string); p != "" {
+		return "\n\nYou passed a `path` field (\"" + truncForHint(p, 80) + "\"). If it's a directory, use LS. If it's a file, use Read. Glob is for name-pattern searches."
+	}
+	if q, _ := in["query"].(string); q != "" {
+		return "\n\nYou passed a `query` field. For text-in-files search use Grep; for name-pattern search use Glob with `pattern: \"**/*.ext\"`."
+	}
+	return ""
+}
+
+// globShellShapeHint detects a pattern that smells like a shell
+// command and returns a Bash-redirect hint. Heuristics chosen to
+// catch the most common confusions without false-positiving on a
+// valid path-y glob:
+//
+//   - shell metachars `||` / `&&` / `2>` / `|` / `>` / `<`
+//   - device redirects `/dev/null`, `/dev/stdin`, etc.
+//   - leading shell tokens `ls ` / `find ` / `grep ` / `cat ` /
+//     `echo ` / `cd ` (a token + space is a strong signal — a real
+//     glob would rarely start with one of these words followed by
+//     space).
+//
+// Returns "" when the pattern looks like a normal glob.
+func globShellShapeHint(p string) string {
+	for _, sub := range []string{"||", "&&", "2>", "&>", ">|", "/dev/null", "/dev/stdin", "/dev/stderr"} {
+		if strings.Contains(p, sub) {
+			return "Found `" + sub + "`. Use Bash(command=\"" + truncForHint(p, 80) + "\") to run shell commands; use LS for directory listings."
+		}
+	}
+	leads := []string{"ls ", "find ", "grep ", "cat ", "echo ", "cd ", "rg ", "head ", "tail ", "awk ", "sed "}
+	for _, lead := range leads {
+		if strings.HasPrefix(p, lead) {
+			return "Pattern starts with `" + strings.TrimSpace(lead) + "`. That's a shell command — use Bash, or pick LS/Read/Grep for the dedicated equivalent."
+		}
+	}
+	return ""
+}
+
+// truncForHint shortens a string for embedding in an error message
+// so a 500-char shell command doesn't blow the result-row layout.
+// Rune-aware to avoid mid-codepoint cuts on CJK paths.
+func truncForHint(s string, maxRunes int) string {
+	rs := []rune(s)
+	if len(rs) <= maxRunes {
+		return s
+	}
+	return string(rs[:maxRunes-1]) + "…"
 }

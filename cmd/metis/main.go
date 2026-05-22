@@ -23,6 +23,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/channels"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/exitcode"
+	"github.com/Ricardo-M-L/metis/internal/helpdocs"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
@@ -142,6 +143,13 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdUpdate(ctx, args[1:])
 	case "version", "-v", "--version":
 		return cmdVersion(args[1:])
+	case "env":
+		// 2026-05-22: print the curated env-var reference
+		// (internal/helpdocs/env.md, embedded). Surfaces what
+		// otherwise lived only as `os.Getenv("METIS_...")` calls
+		// scattered across the code — users were missing knobs.
+		fmt.Print(helpdocs.Env())
+		return nil
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -272,6 +280,7 @@ Usage:
   metis eval [--dir DIR] [--tag T] [--out P]  Run the markdown scenario pack
   metis update [--check]  Self-update from the private release (needs METIS_GITHUB_TOKEN)
   metis version [-V]    Print version (-V for build fingerprint)
+  metis env             Print the full METIS_* env-var reference
   metis help            This help
 
 Flags (chat / run):
@@ -280,7 +289,7 @@ Flags (chat / run):
       --mode <id>       Permission mode: ask | auto | bypass | plan | deny
       --no-markdown     Disable markdown rendering of assistant output
       --no-stream       Don't stream (assemble then print)
-      --max-iter <n>    Iteration cap per turn (default 50)
+      --max-iter <n>    Iteration cap per turn (default 150; overrides [session] max_iterations in config.toml)
       --add-dir <path>  Add a directory to the agent's accessible scope (repeatable)
       --agent <name>    Load an agent profile from ~/.metis/agents/<name>.md
   -W, --worktree [slug] Spawn in a fresh git worktree (slug optional)
@@ -1285,6 +1294,15 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		MaxMountedItems: cfg.UI.Performance.MaxMountedItems,
 		ScrollQuantum:   cfg.UI.Performance.ScrollQuantum,
 	})
+
+	// 2026-05-22: apply UI tunables that used to be hardcoded
+	// constants (permissionTimeout / voiceMaxRecord / statusLineRefresh).
+	// All three are mutable package-vars with defaults — these calls
+	// override them when the user set explicit values in [ui].
+	tui.SetPermissionTimeout(cfg.UI.PermissionTimeout())
+	tui.SetVoiceMaxRecord(cfg.UI.VoiceMaxRecord())
+	tui.SetStatusLineRefresh(cfg.UI.StatusLineRefresh())
+
 	return rt, nil
 }
 

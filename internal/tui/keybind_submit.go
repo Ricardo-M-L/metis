@@ -15,6 +15,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/notify"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/themes"
@@ -122,6 +123,38 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// /now <text> + /later <text> — explicit priority overrides
+		// (2026-05-21). Intercepted BEFORE the slash registry so a
+		// shadowed real command can't swallow them.
+		//
+		//   /now   → Priority=Now. Pops before any pending Next batch;
+		//            users use this when a follow-up is more urgent
+		//            than what they queued earlier ("wait — first try
+		//            X instead").
+		//   /later → Priority=Later. Drains AFTER every Next item is
+		//            done. Lets a user say "also if you have time:"
+		//            without bumping into the active follow-up batch.
+		//
+		// Both reuse the same enqueueQueuedItem path so the queue
+		// preview's badge (`! ` for Now, `. ` for Later) and the
+		// `(dequeued ×N merged · M remaining)` notice work out of the
+		// box. Empty body → refuse with hint instead of queuing the
+		// bare command.
+		if prio, body, ok := parsePriorityCommand(raw); ok {
+			if body == "" {
+				m.messages = append(m.messages, Message{
+					Role:      "info",
+					Content:   "(empty " + prioCommandName(prio) + " — write the message after the command)",
+					Timestamp: time.Now(),
+				})
+				m.input.Reset()
+				return m, nil
+			}
+			m.enqueueQueuedItem(body, prio)
+			m.input.Reset()
+			return m, nil
+		}
+
 		if strings.HasPrefix(raw, "/") && m.slash != nil {
 			handled, display, sig, _ := m.slash.Parse(raw)
 			if handled {
@@ -174,12 +207,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		}
 
 		// Plain text mid-turn: claude-code's queued-messages behavior.
-		// Push to FIFO; finalizeTurn dequeues the head and submits it
-		// as the next user turn. Distinct from steering (mid-turn
-		// injection into the running turn) — that path is now
-		// reserved for slash commands above and the explicit /steer
-		// alias users can still call.
-		m.queuedPrompts = append(m.queuedPrompts, raw)
+		// Push to the priority queue at default Priority=Next;
+		// finalizeTurn dequeues the highest-priority batch and
+		// submits it as the next user turn. Multi-item batching
+		// (drainNextQueuedBatch) merges adjacent same-priority
+		// items into one merged user message — the 2026-05-21
+		// follow-up-spam optimization. Distinct from steering
+		// (mid-turn injection into the running turn) — that path is
+		// reserved for slash commands above and the explicit
+		// /steer alias.
+		m.enqueueQueuedItem(raw, QueuePriorityNext)
 		// Match claude-code: the queued-message count lives only in
 		// the status bar `◷ N queued` chip (render_chrome.go). The
 		// in-stream notice row was redundant — every queue add added
@@ -189,6 +226,30 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		m.input.Reset()
 		return m, nil
 	}
+	// /now /later out-of-turn: priority is meaningless when there's
+	// nothing running to preempt, so strip the prefix and submit the
+	// body as a normal user message. Without this stripping the slash
+	// registry would 404 the unknown name and the user would see
+	// "/now: unknown command — try /help" — confusing because the
+	// command IS recognised when a turn is in flight. Empty body →
+	// info hint, same as the mid-turn refusal path.
+	if prio, body, ok := parsePriorityCommand(text); ok {
+		if body == "" {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(empty " + prioCommandName(prio) + " — write the message after the command)",
+				Timestamp: time.Now(),
+			})
+			m.input.Reset()
+			return m, nil
+		}
+		// Replace `text` with the body so the rest of submitInput
+		// (palette logic, slash parse, llm submit) treats it as a
+		// plain user prompt. Priority field is intentionally dropped
+		// here — we already chose to ignore it out-of-turn.
+		text = body
+	}
+
 	// claude-code parity: when the palette is open with at least one
 	// match, treat Enter as "select the highlighted candidate then
 	// submit". Without this, typing /effo + Enter dispatches a literal
@@ -602,6 +663,57 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				text = display
 				display = ""
 			}
+		case slash.SignalPlan:
+			// /plan + /p — switch the gate to plan mode (read-only;
+			// tool calls collected as proposal instead of executed).
+			// Pre-2026-05-21 the signal was declared but had no
+			// case, so typing /plan in the input box was silently
+			// dead (compiled-bug-list audit).
+			m.gate.SetMode(permission.ModePlan)
+			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: plan — tool calls will be surfaced for review)", Timestamp: time.Now()})
+		case slash.SignalBypass:
+			// /bypass + /yolo — switch to bypass mode (no permission
+			// prompts). Same dead-signal fix as SignalPlan above.
+			m.gate.SetMode(permission.ModeBypass)
+			m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: bypass — all tool calls auto-approved; use /mode ask to re-enable prompts)", Timestamp: time.Now()})
+		case slash.SignalAuto:
+			// /auto + /a — legacy alias for ModeAuto which was
+			// REMOVED on 2026-05-11 (see safe_commands_test.go
+			// graveyard comment). slash registry still advertised
+			// the command. Rather than silently dropping, redirect
+			// the user to the modes that DO exist so they can pick
+			// the right one for their use case.
+			m.messages = append(m.messages, Message{Role: "info", Content: "(/auto removed in 2026-05-11; pick: /plan (read-only) / /bypass (auto-approve) / /mode ask (default))", Timestamp: time.Now()})
+		case slash.SignalRetry:
+			// /retry — pull the last user prompt out of history and
+			// stuff it into the input box so the user can edit + hit
+			// Enter to re-send. Mirrors cmdReplay's InsertInput
+			// pattern (cmdReview did this in 2026-05-18).
+			lastUser := ""
+			hist := m.loop.History()
+			for i := len(hist) - 1; i >= 0; i-- {
+				if hist[i].Role == llm.RoleUser && len(hist[i].Content) > 0 {
+					lastUser = hist[i].Content[0].Text
+					break
+				}
+			}
+			if lastUser == "" {
+				m.messages = append(m.messages, Message{Role: "warning", Content: "(retry: no prior user prompt found in history)", Timestamp: time.Now()})
+			} else {
+				m.input.SetValue(lastUser)
+				m.messages = append(m.messages, Message{Role: "info", Content: "(retry: prompt loaded — edit if needed, press Enter to re-send)", Timestamp: time.Now()})
+			}
+		case slash.SignalLoop:
+			// /loop — autopilot scheduling not yet implemented in the
+			// chat surface (it works as a top-level skill in some
+			// environments). Redirect to /cron which is the working
+			// equivalent in metis core.
+			m.messages = append(m.messages, Message{Role: "info", Content: "(/loop autopilot not wired in chat — use /cron for scheduled prompts instead)", Timestamp: time.Now()})
+		case slash.SignalReload:
+			// /reload — reloading the in-process tool registry from
+			// inside an active session is complex (it would need to
+			// recreate the Loop). For now, surface the workaround.
+			m.messages = append(m.messages, Message{Role: "info", Content: "(/reload not implemented — restart metis to pick up new tools / skills / config)", Timestamp: time.Now()})
 		}
 		// Slash commands that produced a regular reply terminate here.
 		// /batch and /custom-prompt rewrite `text` above and re-enter

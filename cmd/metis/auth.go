@@ -36,11 +36,110 @@ func cmdAuth(ctx context.Context, args []string) error {
 		return cmdAuthList()
 	case "oauth":
 		return cmdAuthOAuth(rest)
+	case "keys":
+		return cmdAuthKeys(rest)
 	case "help", "-h", "--help":
 		printAuthUsage()
 		return nil
 	}
-	return fmt.Errorf("auth: unknown subcommand %q (use: login | logout | list | oauth)", sub)
+	return fmt.Errorf("auth: unknown subcommand %q (use: login | logout | list | oauth | keys)", sub)
+}
+
+// cmdAuthKeys handles `metis auth keys <put|list|rm> ...` for
+// non-LLM credentials — currently just WebSearch backend keys
+// (Tavily / Brave / Serper). Distinct subcommand on purpose:
+// `metis auth login` is for LLM providers and runs the bubbletea
+// wizard; search-backend keys are flat strings written
+// non-interactively so a `keys put` one-liner is the right shape.
+func cmdAuthKeys(args []string) error {
+	if len(args) == 0 {
+		printAuthKeysUsage()
+		return nil
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "put", "set":
+		return cmdAuthKeysPut(rest)
+	case "list", "ls":
+		return cmdAuthKeysList()
+	case "rm", "remove", "delete":
+		return cmdAuthKeysRemove(rest)
+	case "help", "-h", "--help":
+		printAuthKeysUsage()
+		return nil
+	}
+	return fmt.Errorf("auth keys: unknown subcommand %q (use: put | list | rm)", sub)
+}
+
+func printAuthKeysUsage() {
+	fmt.Println(`metis auth keys — manage non-LLM API keys (WebSearch backends)
+
+Usage:
+  metis auth keys put <backend> <key>   Store a WebSearch backend key
+  metis auth keys list                   List stored search-backend keys
+  metis auth keys rm <backend>           Remove a stored search-backend key
+
+Known backends: tavily, brave, serper
+
+Notes:
+  Stored under "search:<backend>" in ~/.metis/auth.json (0o600). Env vars
+  (TAVILY_API_KEY / BRAVE_SEARCH_API_KEY / SERPER_API_KEY) still take
+  precedence — useful for CI overrides without touching the file.
+
+  Free tiers:
+    tavily  — 1k searches/mo, tavily.com
+    brave   — 2k queries/mo, api.search.brave.com
+    serper  — paid Google SERP, serper.dev`)
+}
+
+func cmdAuthKeysPut(args []string) error {
+	if len(args) < 2 {
+		return errors.New("auth keys put: usage `metis auth keys put <backend> <key>`")
+	}
+	backend, key := args[0], args[1]
+	if err := auth.SetSearchKey(backend, key); err != nil {
+		return fmt.Errorf("auth keys put %s: %w", backend, err)
+	}
+	fmt.Fprintf(os.Stderr, "✓ saved search:%s\n", backend)
+	return nil
+}
+
+func cmdAuthKeysList() error {
+	keys, err := auth.ListSearchKeys()
+	if err != nil {
+		return err
+	}
+	if len(keys) == 0 {
+		fmt.Println("(no search keys stored — try `metis auth keys put tavily tvly-...`)")
+		return nil
+	}
+	fmt.Printf("# stored in %s\n", auth.Path())
+	for _, k := range keys {
+		// Show only the prefix so a screen-share doesn't leak the
+		// full key. Same shape as `metis diag` uses for provider
+		// keys (safePrefix(v, 6) + "…").
+		v, _ := auth.GetSearchKey(k)
+		head := v
+		if len(head) > 6 {
+			head = head[:6] + "…"
+		}
+		fmt.Printf("- %s (%s)\n", k, head)
+	}
+	return nil
+}
+
+func cmdAuthKeysRemove(args []string) error {
+	if len(args) == 0 {
+		return errors.New("auth keys rm: backend name required")
+	}
+	for _, b := range args {
+		if err := auth.RemoveSearchKey(b); err != nil {
+			return fmt.Errorf("remove search:%s: %w", b, err)
+		}
+		fmt.Fprintf(os.Stderr, "✓ removed search:%s\n", b)
+	}
+	return nil
 }
 
 // cmdAuthOAuth runs the browser-based OAuth flow for the named
@@ -121,6 +220,8 @@ Usage:
   metis auth logout <prov>    Remove a stored credential
   metis auth list             Show which providers have stored credentials
   metis auth oauth <prov>     Browser-based OAuth login (github, etc.)
+  metis auth keys <sub>       Manage WebSearch backend keys
+                              (try ` + "`metis auth keys help`" + ` for the sub-commands)
 
 Notes:
   Stored as 0o600. Env vars (e.g. ANTHROPIC_API_KEY) still take precedence

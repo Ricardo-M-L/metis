@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -116,8 +117,29 @@ func Upsert(sessionID string, in Item) (Item, error) {
 		}
 	}
 	if idx < 0 && in.Content != "" {
+		// Exact-match pass first (fastest, lossless).
 		for i := range tl.Items {
 			if tl.Items[i].Content == in.Content {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 && in.Content != "" {
+		// Normalised-match fallback (2026-05-21, image #50 repro):
+		// model created "Cluster 2: Wire Protocol (...)" then later
+		// re-wrote it as "2. Wire Protocol (...)" without passing
+		// id; the bare equality check missed the dup and metis
+		// appended a second entry. normalizeTaskContent strips
+		// numbering prefixes ("Cluster N:" / "N." / "N)") and
+		// trailing ellipsis so the dedup catches these re-wordings
+		// without merging genuinely distinct tasks like "Cluster
+		// 1: Foundation" vs "Cluster 1: exception, ..." (those
+		// normalise differently because the meaningful body
+		// differs).
+		want := normalizeTaskContent(in.Content)
+		for i := range tl.Items {
+			if normalizeTaskContent(tl.Items[i].Content) == want {
 				idx = i
 				break
 			}
@@ -176,4 +198,120 @@ func CurrentSessionID() string {
 	currMu.RLock()
 	defer currMu.RUnlock()
 	return current
+}
+
+// normalizeTaskContent strips superficial decorations that often
+// differ between create + update calls when the model forgets to
+// pass the original id:
+//
+//   - Numbering prefixes ("Cluster N:", "Phase N:", "N.", "N)")
+//   - Leading/trailing whitespace
+//   - Trailing ellipsis (… or ...) — a common LLM artefact from
+//     truncated rendering of an earlier listing
+//   - Multiple internal spaces collapsed to one
+//
+// The goal is to catch "Cluster 2: Wire Protocol" ≡
+// "2. Wire Protocol" as the same task while keeping genuinely
+// distinct items ("Cluster 1: Foundation" vs "Cluster 1: exception
+// + constant") separate (their bodies differ post-normalization).
+//
+// Lowercase comparison is intentional: the model sometimes
+// re-cases its own task names mid-stream ("CLuster" vs "Cluster").
+// Lossy enough to catch dupes; specific enough not to over-merge.
+func normalizeTaskContent(s string) string {
+	t := strings.TrimSpace(s)
+	t = stripNumberingPrefix(t)
+	t = strings.TrimRight(t, ". \t…")
+	// Collapse any run of whitespace to a single space.
+	var b strings.Builder
+	b.Grow(len(t))
+	lastSpace := false
+	for _, r := range t {
+		if r == ' ' || r == '\t' || r == '\n' {
+			if !lastSpace {
+				b.WriteByte(' ')
+				lastSpace = true
+			}
+			continue
+		}
+		lastSpace = false
+		b.WriteRune(r)
+	}
+	return strings.ToLower(b.String())
+}
+
+// stripNumberingPrefix removes a leading numbered/labelled prefix
+// the model commonly attaches to task items. Handles:
+//
+//   "Cluster 1: foo"        → "foo"
+//   "Phase 2 - foo"         → "foo"
+//   "2. foo"                → "foo"
+//   "2) foo"                → "foo"
+//   "[2] foo"               → "foo"
+//
+// Returns the original string unchanged when no recognised prefix
+// matches — so a task whose real content starts with "Wire Protocol"
+// is left alone.
+func stripNumberingPrefix(s string) string {
+	// Try "Cluster N:" / "Phase N:" / "Step N:" patterns.
+	for _, word := range []string{"Cluster", "Phase", "Step", "Part", "Stage"} {
+		if rest, ok := tryStripWordNumberSep(s, word); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	// Try plain "N. " / "N) " / "[N] " numbering.
+	if rest, ok := tryStripPlainNumber(s); ok {
+		return strings.TrimSpace(rest)
+	}
+	return s
+}
+
+func tryStripWordNumberSep(s, word string) (string, bool) {
+	lower := strings.ToLower(s)
+	wLower := strings.ToLower(word)
+	if !strings.HasPrefix(lower, wLower+" ") {
+		return "", false
+	}
+	rest := s[len(word)+1:]
+	rest = strings.TrimLeft(rest, " ")
+	// Expect a digit run next.
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return "", false
+	}
+	rest = rest[end:]
+	// Eat the separator: ':' / '-' / '—' / '.'
+	rest = strings.TrimLeft(rest, ":-—. )]")
+	return rest, true
+}
+
+func tryStripPlainNumber(s string) (string, bool) {
+	// Optional leading '[' for "[N] ..." form.
+	bracketed := strings.HasPrefix(s, "[")
+	rest := s
+	if bracketed {
+		rest = rest[1:]
+	}
+	// Scan a digit run.
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return "", false
+	}
+	tail := rest[end:]
+	// Must be followed by a separator that signals "this was a
+	// numbering label" — otherwise the number is part of the
+	// content (e.g. "5-second timeout"). Accept ". " / ") " /
+	// "] " / ": ".
+	for _, sep := range []string{". ", ") ", "] ", ": "} {
+		if strings.HasPrefix(tail, sep) {
+			return tail[len(sep):], true
+		}
+	}
+	return "", false
 }

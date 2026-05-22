@@ -38,8 +38,20 @@ import (
 )
 
 const (
-	contractWriteThreshold   = 5
-	contractAgentThreshold   = 2
+	contractWriteThreshold = 5
+	// contractAgentThreshold: # of Agent dispatches before the
+	// "you should spawn verify" reminder fires.
+	//
+	// 2026-05-21: bumped 2 → 10 after session 13a82094 analysis.
+	// claude-code's coordinator-mode design has NO equivalent
+	// hard-injected reminder — it relies on system prompt + worker
+	// self-verify spec. metis keeps the reminder as a backstop but
+	// raises the threshold so it only fires in genuine
+	// runaway-dispatch scenarios (10+ sub-agents with zero
+	// verification). At 2 it was misfiring on routine multi-survey
+	// tasks like "rewrite this project" (3-4 survey sub-agents +
+	// 4-5 impl sub-agents is normal, not pathological).
+	contractAgentThreshold   = 10
 	contractMaxGateAttempts  = 2
 	contractOverridePhrase   = "OVERRIDE CONTRACT:"
 	contractDisableEnvVar    = "METIS_CONTRACT_DISABLE"

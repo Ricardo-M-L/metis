@@ -71,6 +71,17 @@ type ContentBlock struct {
 	// Image-specific (Type="image"):
 	MediaType string `json:"media_type,omitempty"` // e.g., "image/png"
 	Data      string `json:"data,omitempty"`       // base64-encoded bytes
+
+	// ToolResultBlocks is the multi-part body for a Type="tool_result"
+	// block that mixes text + images (vision-aware tools like
+	// ViewImage). Anthropic accepts this natively as
+	// content=[{text}, {image}]; OpenAI-style adapters fan it out into
+	// the role="tool" textual content + a follow-up user message
+	// carrying the image_url parts. When empty, fall back to the
+	// ToolResult string above. Skipped in JSON persistence to keep
+	// the on-disk transcript format stable — vision payloads are
+	// large and not worth replaying.
+	ToolResultBlocks []ContentBlock `json:"-"`
 }
 
 // Message is a single turn in a conversation.

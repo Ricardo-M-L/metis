@@ -75,11 +75,32 @@ const (
 // representation the TUI may pick up (e.g. truncation hints, pre-formatted
 // markdown). Meta is a free-form map for tool-specific metadata that the
 // agent loop / hooks may inspect.
+//
+// Images, when non-empty, attaches inline image blocks to the
+// tool_result the model sees on its next turn. Used by vision-aware
+// tools (ViewImage, future PDF page rasterisers) so the model can
+// actually SEE binary content that lives on disk. Anthropic-family
+// providers render the images directly inside the tool_result block;
+// OpenAI-style providers receive them as image_url content parts
+// alongside the textual tool_result. Output remains the canonical
+// text — it doubles as the fallback when the provider doesn't
+// support vision and as a one-line summary in the TUI transcript.
 type Result struct {
 	Output  string
 	IsError bool
 	Display string
 	Meta    map[string]any
+	Images  []ImageAttachment
+}
+
+// ImageAttachment is one inline image returned by a tool. MediaType is
+// a full IANA type ("image/png", "image/jpeg", "image/gif",
+// "image/webp"). Data is the base64-encoded payload — the tool itself
+// is responsible for encoding raw bytes; the dispatch layer simply
+// forwards what's here into the provider-specific wire shape.
+type ImageAttachment struct {
+	MediaType string
+	Data      string
 }
 
 // Tool is the contract every built-in and plugin tool implements.
