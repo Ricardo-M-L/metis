@@ -343,6 +343,35 @@ type runtime struct {
 	subAgentRoster *agent.Roster
 }
 
+// WaitForMCP blocks until the background MCP launcher finishes spawning
+// + handshaking with every configured server, or until `timeout` elapses
+// — whichever comes first. Safe to call from cmdRun before the first
+// LLM round-trip so tool registration is complete when the model sees
+// the catalog.
+//
+// Pre-2026-05-22 `metis run` raced the launcher: the LLM frequently
+// got an empty `mcp__*` table because the goroutine in setupRuntime
+// hadn't connected yet (remote-server cu test, 2026-05-22). cmdRun
+// now calls WaitForMCP before AppendUser; TUI / chat paths skip the
+// wait because they're long-running and the launcher settles on its
+// own before the first user keystroke.
+//
+// Returns true if the launcher finished within `timeout`, false on
+// timeout. Caller decides whether to surface the failure (run mode
+// prints a warning to stderr but continues so simple no-MCP-needed
+// prompts still complete).
+func (r *runtime) WaitForMCP(timeout time.Duration) bool {
+	if r.mcpLauncherDone == nil {
+		return true
+	}
+	select {
+	case <-r.mcpLauncherDone:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // Cleanup closes any subprocesses or connections owned by the runtime.
 // Safe to call multiple times.
 func (r *runtime) Cleanup() {
@@ -1442,6 +1471,18 @@ func cmdRun(ctx context.Context, args []string) error {
 				time.Since(hit.CreatedAt).Round(time.Second))
 			return nil
 		}
+	}
+
+	// 2026-05-22: wait for MCP launcher to settle BEFORE we hand the
+	// prompt to the loop. Without this, `metis run` raced the
+	// async-spawn goroutine in setupRuntime — the LLM would frequently
+	// see an empty mcp__* table and report "no such tool" even though
+	// servers were correctly configured (remote tencent-cloud cu test,
+	// 2026-05-22). 15 s covers a cold npx-resolve startup; if servers
+	// are slower the run continues but warns to stderr so the user
+	// knows tool calls will fail.
+	if ok := rt.WaitForMCP(15 * time.Second); !ok {
+		fmt.Fprintln(os.Stderr, "metis: MCP launcher still running after 15s — continuing without it (mcp__* tools may be unavailable)")
 	}
 
 	// Subdirectory hints (mirrors TUI submit path): when the prompt
