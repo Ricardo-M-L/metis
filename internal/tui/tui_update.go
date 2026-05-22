@@ -81,6 +81,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// 2026-05-23: publish the chat-surface width to the package
+		// level so render_tool.go's renderEditDiff (which has no
+		// width parameter — toolEventItem doesn't carry one) can
+		// pad its add/del rows to full row width. Without padding,
+		// the colored background stops at content end, leaving a
+		// "half-row" diff (image #57 user feedback). claude-code /
+		// Cursor render full-row background.
+		setLastKnownChatWidth(msg.Width)
 		// Reserve rows for the always-visible chrome:
 		//   header (1) + separator (1) + spinner (2) + input (2)
 		//   + status bar (2) + hints (1) + safety (1) ≈ 10

@@ -20,6 +20,8 @@ package transport
 
 import (
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -69,11 +71,29 @@ func NewHTTPClient(timeout time.Duration, provider string) *http.Client {
 		inner = &http.Transport{ResponseHeaderTimeout: timeout}
 	}
 	rt := WrapRoundTripper(inner, provider, GlobalSessionID)
+	// 2026-05-23: added whole-request hard cap. The earlier
+	// "Timeout=0" rationale (don't chop legitimate streaming
+	// responses) covered the common case but left mid-stream
+	// hangs uncatchable — user repro session 64ff0df3 showed
+	// deepseek streaming briefly, then hanging for 19m44s with
+	// no way to interrupt (ESC ESC bug fixed separately;
+	// also need a server-side bound so the request actually
+	// returns instead of waiting on the socket forever).
+	//
+	// 20 min is generous for legitimate long generations
+	// (MiniMax-M2.7 + 40K context typically finishes < 5 min;
+	// 10 min is the 99th percentile). Override via
+	// METIS_HTTP_TIMEOUT_SECS for workflows that legitimately
+	// need longer.
+	hardCap := 20 * time.Minute
+	if env := os.Getenv("METIS_HTTP_TIMEOUT_SECS"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 {
+			hardCap = time.Duration(n) * time.Second
+		}
+	}
 	return &http.Client{
 		Transport: rt,
-		// Timeout: 0 — explicit. Whole-request timeout would chop
-		// streaming responses; ResponseHeaderTimeout above covers the
-		// "server is dead" case for the only deadline-sensitive phase.
+		Timeout:   hardCap,
 	}
 }
 

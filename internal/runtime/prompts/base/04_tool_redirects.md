@@ -16,6 +16,21 @@ Many shell habits map to better tools. Use the right one:
 Reach for Bash for the rest: git, package managers, test runners,
 builds, system queries, real chained logic.
 
+**Bash is also right for multi-step filesystem ops** — when you
+would otherwise emit 3+ Read/Write/Edit/LS calls back-to-back to do
+`mkdir … && cp … && mv … && rm …`-style work, ONE Bash chain is
+faster, costs fewer tokens, and avoids the per-step model
+round-trip. Examples that should be a single Bash:
+
+- creating a directory + moving a batch of existing files into it
+- archiving files (cp / mv / tar) before a rewrite
+- bulk renames driven by shell globbing
+- combining `find` / `xargs` / `sort` / `uniq` for analysis
+
+Reserve Read/Edit/Write for the case where you actually need
+metis's per-file staleness tracking, structured diff display, or
+syntax-aware in-place edits.
+
 ## What goes where: directory vs file
 
 A common slip is calling LS on a file path or Read on a directory. They are

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -326,6 +327,19 @@ type Event struct {
 	ToolName   string
 	ToolInput  map[string]any
 	ToolResult *ToolResult
+	// Elapsed is the authoritative wall-clock duration of the tool
+	// call. Set by dispatch.go on EventToolResult only — populated
+	// from `time.Since(jobStartedAt)` inside the loop that ACTUALLY
+	// ran the tool, so forwarded sub-agent results carry the real
+	// child-loop duration instead of the gap between parent-side
+	// event arrivals.
+	//
+	// 2026-05-23: added after image #54 repro — sub-agent Read
+	// calls showed 0ms because parent's `time.Since(startTime)`
+	// only measured the inter-event delay (~µs) once the forwarded
+	// start + result both reached the parent's channel. With this
+	// field the TUI reads the loop's own measurement instead.
+	Elapsed time.Duration
 
 	// ToolCall captures the tool a Plan Mode loop wants to call.
 	// When Kind == EventPlan, ToolCalls is non-empty.

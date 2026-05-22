@@ -411,6 +411,34 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			vimModeState = vimNormal
 			return m, nil
 		}
+		// 2026-05-23: when a turn is in flight, ESC cancels it —
+		// matches claude-code behavior and what the spinner's hint
+		// "press esc to interrupt" promises. Pre-fix ESC only ever
+		// touched the input box; the user with a hung deepseek
+		// stream (image #59 — 19m44s stuck spinner) hit ESC ESC
+		// expecting to bail out and got nothing. Now the first ESC
+		// during a live turn delivers the cancellation; subsequent
+		// double-tap-clear logic only fires when no turn is running.
+		if m.turnCancel != nil {
+			m.turnCancel()
+			m.turnCancel = nil
+			// Drop queued prompts so the cancellation actually stops
+			// everything (parity with Ctrl+C handler above).
+			queueCleared := len(m.queuedPrompts)
+			m.queuedPrompts = nil
+			m.queuePending = false
+			msg2 := "interrupted (esc)"
+			if queueCleared > 0 {
+				msg2 = fmt.Sprintf("interrupted (esc) · dropped %d queued", queueCleared)
+			}
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   msg2,
+				Timestamp: time.Now(),
+			})
+			m.lastEsc = time.Time{}
+			return m, nil
+		}
 		// Single ESC: dismiss palette / pending state, leave typed
 		// input alone. Double-tap (within doubleEscWindow): clear the
 		// input completely. Mirrors claude-code's "double tap esc to

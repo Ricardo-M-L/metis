@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -156,11 +157,12 @@ func shortToolDesc(full string) string {
 func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, out chan<- Event, tc HookContext) ([]llm.ContentBlock, error) {
 	results := make([]llm.ContentBlock, len(toolUses))
 	type job struct {
-		idx   int
-		blk   llm.ContentBlock
-		t     tools.Tool
-		early *llm.ContentBlock // set when pre-check decided result
-		ready bool              // true once pre-checks all pass
+		idx       int
+		blk       llm.ContentBlock
+		t         tools.Tool
+		early     *llm.ContentBlock // set when pre-check decided result
+		ready     bool              // true once pre-checks all pass
+		startedAt time.Time         // set when EventToolStart is emitted; used to populate Event.Elapsed on result
 	}
 	jobs := make([]*job, len(toolUses))
 
@@ -173,10 +175,12 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		// Synthetic ToolSearch (lazy-MCP-schema feature, Task #72) is
 		// not in the Registry — handle it inline.
 		if b.ToolName == "ToolSearch" {
+			tsStart := time.Now()
 			results[i] = handleToolSearch(l, b)
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
 				ToolResult: &ToolResult{Output: results[i].ToolResult, IsError: results[i].IsError},
+				Elapsed:    time.Since(tsStart),
 			})
 			continue
 		}
@@ -209,6 +213,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		// for "veto chain" hooks (the model wandered into a forbidden
 		// path; abort the turn rather than just denying one tool).
 		if l.Hooks != nil {
+			hookStart := time.Now()
 			mod := l.Hooks.EmitPreToolUse(ctx, tc, &PreToolUseHook{
 				Context: tc, Tool: b.ToolName, Input: b.ToolInput,
 			})
@@ -228,6 +233,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 					emit(ctx, out, Event{
 						Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
 						ToolResult: &ToolResult{Output: mod.Output.Content, IsError: mod.Output.IsError},
+						Elapsed:    time.Since(hookStart),
 					})
 					j.early = &blkOut
 					continue
@@ -451,7 +457,14 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	if tools.GetInterruptBehavior(t) == tools.InterruptBlock {
 		toolCtx = context.WithoutCancel(toolCtx)
 	}
+	// 2026-05-23: measure wall-clock around Execute so EventToolResult
+	// carries the authoritative duration. forwardSubAgentEvent
+	// preserves Event.Elapsed via shallow copy, so the parent TUI
+	// reads the child loop's measurement instead of computing an
+	// inter-event delta that hits 0ms on fast Reads (image #54).
+	execStart := time.Now()
 	res, err := t.Execute(toolCtx, blk.ToolInput)
+	execElapsed := time.Since(execStart)
 	if l.Detector != nil {
 		l.Detector.Record(blk.ToolName, blk.ToolInput)
 	}
@@ -483,6 +496,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		emit(ctx, out, Event{
 			Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
 			ToolResult: &ToolResult{Output: s, IsError: true},
+			Elapsed:    execElapsed,
 		})
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: blk.ToolUseID,
@@ -492,6 +506,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	emit(ctx, out, Event{
 		Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
 		ToolResult: &ToolResult{Output: res.Output, IsError: res.IsError},
+		Elapsed:    execElapsed,
 	})
 
 	// Anti-pattern nudge: when the model uses Bash for something a

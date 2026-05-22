@@ -142,6 +142,18 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// mis-paired against the latest Start → Duration ≈ 0ms
 		// (image #48 repro 200+ Reads showing 0ms).
 		matched := false
+		// 2026-05-23: prefer ev.Elapsed (set by dispatch.go) over
+		// time.Since(StartTime). Latter measures inter-event delta
+		// on the parent's channel, which collapses to ~0ms for
+		// forwarded sub-agent results when start + result arrive
+		// back-to-back. ev.Elapsed carries the actual Execute()
+		// wall time from the loop that ran the tool.
+		duration := func(start time.Time) time.Duration {
+			if ev.Elapsed > 0 {
+				return ev.Elapsed
+			}
+			return time.Since(start)
+		}
 		for i := len(m.toolEvents) - 1; i >= 0; i-- {
 			if m.toolEvents[i].Kind != "start" {
 				continue
@@ -150,7 +162,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 				m.toolEvents[i].Kind = "result"
 				m.toolEvents[i].Output = ev.ToolResult.Output
 				m.toolEvents[i].IsError = ev.ToolResult.IsError
-				m.toolEvents[i].Duration = time.Since(m.toolEvents[i].StartTime)
+				m.toolEvents[i].Duration = duration(m.toolEvents[i].StartTime)
 				matched = true
 				break
 			}
@@ -165,7 +177,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 					m.toolEvents[i].Kind = "result"
 					m.toolEvents[i].Output = ev.ToolResult.Output
 					m.toolEvents[i].IsError = ev.ToolResult.IsError
-					m.toolEvents[i].Duration = time.Since(m.toolEvents[i].StartTime)
+					m.toolEvents[i].Duration = duration(m.toolEvents[i].StartTime)
 					break
 				}
 			}

@@ -13,6 +13,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"charm.land/lipgloss/v2"
 	udiff "github.com/aymanbagabas/go-udiff"
@@ -329,8 +330,26 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 		return ""
 	}
 
-	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
-	delBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffDelBg)
+	// Full-row background fill: lipgloss .Width(N) pads the rendered
+	// output with spaces so the background colour extends to column N
+	// even when the diff text is shorter. Matches claude-code / Cursor
+	// diff rendering (image #56 / #57 user feedback 2026-05-23). The
+	// per-row width is the chat surface width minus the gutter ("       %4d "
+	// = 7 + 4 + 1 = 12 chars) and the "+ "/"- " marker (2 chars). If we
+	// haven't received a WindowSizeMsg yet, fall back to 100 — a sensible
+	// "wide enough to look like a diff row" default.
+	rowWidth := lastKnownChatWidth()
+	if rowWidth <= 0 {
+		rowWidth = 100
+	}
+	innerWidth := rowWidth - 12 - 2
+	if innerWidth < 30 {
+		innerWidth = 30
+	}
+	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg).Width(innerWidth)
+	delBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffDelBg).Width(innerWidth)
+	addBgInline := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
+	delBgInline := lipgloss.NewStyle().Background(themes.Current().DiffDelBg)
 	addStrong := lipgloss.NewStyle().Background(themes.Current().DiffAddBg).Foreground(themes.Current().DiffAddFg).Bold(true)
 	delStrong := lipgloss.NewStyle().Background(themes.Current().DiffDelBg).Foreground(themes.Current().DiffDelFg).Bold(true)
 	gutterStyle := lipgloss.NewStyle().Foreground(textMuted)
@@ -376,14 +395,21 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 				i++
 			case udiff.Delete:
 				s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", oldLine)))
-				s.WriteString(delBgOnly.Render("- "))
+				// Build the row body (marker + content + inline
+				// strong highlights) into a single string, then wrap
+				// the entire row in delBgOnly (which has .Width set)
+				// so the background fills to chat width — matches
+				// claude-code / Cursor diff rendering.
+				var rowBody strings.Builder
+				rowBody.WriteString(delBgInline.Render("- "))
 				if delMask != nil {
-					s.WriteString(applyMask(content, delMask,
-						func(s string) string { return delBgOnly.Render(s) },
+					rowBody.WriteString(applyMask(content, delMask,
+						func(s string) string { return delBgInline.Render(s) },
 						func(s string) string { return delStrong.Render(s) }))
 				} else {
-					s.WriteString(delBgOnly.Render(highlightLine(content, filename)))
+					rowBody.WriteString(delBgInline.Render(highlightLine(content, filename)))
 				}
+				s.WriteString(delBgOnly.Render(rowBody.String()))
 				oldLine++
 				i++
 				if partner != nil {
@@ -393,17 +419,21 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 						break
 					}
 					s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", newLine)))
-					s.WriteString(addBgOnly.Render("+ "))
-					s.WriteString(applyMask(*partner, insMask,
-						func(s string) string { return addBgOnly.Render(s) },
+					var addBody strings.Builder
+					addBody.WriteString(addBgInline.Render("+ "))
+					addBody.WriteString(applyMask(*partner, insMask,
+						func(s string) string { return addBgInline.Render(s) },
 						func(s string) string { return addStrong.Render(s) }))
+					s.WriteString(addBgOnly.Render(addBody.String()))
 					newLine++
 					i++
 				}
 			case udiff.Insert:
 				s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", newLine)))
-				s.WriteString(addBgOnly.Render("+ "))
-				s.WriteString(addBgOnly.Render(highlightLine(content, filename)))
+				var addBody strings.Builder
+				addBody.WriteString(addBgInline.Render("+ "))
+				addBody.WriteString(addBgInline.Render(highlightLine(content, filename)))
+				s.WriteString(addBgOnly.Render(addBody.String()))
 				newLine++
 				i++
 			}
@@ -429,7 +459,18 @@ func renderWritePreview(input map[string]any, expanded bool) string {
 	if c == "" {
 		return ""
 	}
-	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
+	// Width-padded variant — full-row green background like Cursor /
+	// claude-code. See renderEditDiff for the rowWidth rationale.
+	rowWidth := lastKnownChatWidth()
+	if rowWidth <= 0 {
+		rowWidth = 100
+	}
+	innerWidth := rowWidth - 12 - 2
+	if innerWidth < 30 {
+		innerWidth = 30
+	}
+	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg).Width(innerWidth)
+	addBgInline := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
 	gutterStyle := lipgloss.NewStyle().Foreground(textMuted)
 	filename := pickLanguageFromInput(input)
 
@@ -442,8 +483,10 @@ func renderWritePreview(input map[string]any, expanded bool) string {
 	var s strings.Builder
 	for i, ln := range show {
 		s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", i+1)))
-		s.WriteString(addBgOnly.Render("+ "))
-		s.WriteString(addBgOnly.Render(highlightLine(truncateRunes(ln, 100), filename)))
+		var rowBody strings.Builder
+		rowBody.WriteString(addBgInline.Render("+ "))
+		rowBody.WriteString(addBgInline.Render(highlightLine(truncateRunes(ln, 100), filename)))
+		s.WriteString(addBgOnly.Render(rowBody.String()))
 		s.WriteString("\n")
 	}
 	if !expanded && len(lines) > maxShow {
@@ -659,4 +702,27 @@ func countEditDiff(input map[string]any) (added, removed int) {
 		}
 	}
 	return
+}
+
+// chatWidthMu + lastChatWidth — published from tui_update's
+// WindowSizeMsg handler so renderEditDiff / renderWritePreview can
+// pad their diff rows to full width without a parameter chain.
+//
+// Mutex used over sync/atomic only because the read+default-fallback
+// happens at most once per row render — contention is irrelevant.
+var (
+	chatWidthMu   sync.RWMutex
+	lastChatWidth int
+)
+
+func setLastKnownChatWidth(w int) {
+	chatWidthMu.Lock()
+	lastChatWidth = w
+	chatWidthMu.Unlock()
+}
+
+func lastKnownChatWidth() int {
+	chatWidthMu.RLock()
+	defer chatWidthMu.RUnlock()
+	return lastChatWidth
 }
