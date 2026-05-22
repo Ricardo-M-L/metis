@@ -27,6 +27,25 @@ round-trip. Examples that should be a single Bash:
 - bulk renames driven by shell globbing
 - combining `find` / `xargs` / `sort` / `uniq` for analysis
 
+**Coalesce sequential Bash calls into one.** If your next intended
+Bash starts with the same `cd …` / `cd "$DIR"` or sets the same env
+var as the previous Bash, you are about to waste a round-trip.
+Combine them with `&&`. Examples of WASTE that the model should
+catch BEFORE invoking:
+
+- `Bash(cd X && ls)` then `Bash(cd X && cat foo)` → one
+  `Bash(cd X && ls && cat foo)`
+- `Bash(DST=/a/b; find $DST -name "*.go")` then
+  `Bash(DST=/a/b; wc -l $DST/x.go)` → one
+  `Bash(DST=/a/b && find $DST -name "*.go" | head && wc -l $DST/x.go)`
+- Independent investigative commands run back-to-back
+  (`go vet ./...` then `go test ./...` then `git status`) →
+  one `Bash(go vet ./... && go test ./... && git status)`
+
+The cap on stop-on-error is `&&`. If you genuinely need each step
+to run independently regardless of failure, use `;` or split into
+separate Bash calls — but that's the exception, not the default.
+
 Reserve Read/Edit/Write for the case where you actually need
 metis's per-file staleness tracking, structured diff display, or
 syntax-aware in-place edits.
