@@ -68,6 +68,14 @@ type ContentBlock struct {
 	ToolResult string         `json:"content,omitempty"`
 	IsError    bool           `json:"is_error,omitempty"`
 
+	// ProviderHint carries opaque provider-specific blobs that must
+	// round-trip across requests. Gemini-3.5+ uses
+	// `gemini.thought_signature` — emitted by the model on parts
+	// containing a function_call and required to be echoed back on
+	// the corresponding history entry, else gemini rejects the next
+	// turn. Other providers ignore unknown keys.
+	ProviderHint map[string]string `json:"provider_hint,omitempty"`
+
 	// Image-specific (Type="image"):
 	MediaType string `json:"media_type,omitempty"` // e.g., "image/png"
 	Data      string `json:"data,omitempty"`       // base64-encoded bytes
@@ -167,6 +175,12 @@ type StreamEvent struct {
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 	Err                      error
+	// ProviderHint propagates opaque provider-specific blobs from a
+	// streaming response back to ContentBlock.ProviderHint via the
+	// stream consumer (see internal/agent/loop.go::consumeStream).
+	// Currently used for gemini-3.5+ `thoughtSignature` on
+	// tool_use_start events. Other providers ignore it.
+	ProviderHint map[string]string
 }
 
 // Response is the final aggregated result of a (possibly streamed)

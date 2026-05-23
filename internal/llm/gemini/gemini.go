@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,6 +117,14 @@ type gemPart struct {
 	Text             string           `json:"text,omitempty"`
 	FunctionCall     *gemFunctionCall `json:"functionCall,omitempty"`
 	FunctionResponse *gemFunctionResp `json:"functionResponse,omitempty"`
+	// ThoughtSignature is Gemini-3.5+ thinking-model artifact: the
+	// model emits this opaque blob on parts that carry a function
+	// call; clients MUST echo it back on the corresponding history
+	// entry or Gemini rejects the next turn with
+	//   "Function call is missing a thought_signature"
+	// (gemini-3.5-flash 2026-05 enforcement). Captured in
+	// fromGeminiChunk, replayed via toGemini.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 }
 
 type gemFunctionCall struct {
@@ -144,9 +153,26 @@ type gemFunctionDecl struct {
 }
 
 type gemGenConfig struct {
-	Temperature     *float64 `json:"temperature,omitempty"`
-	MaxOutputTokens int      `json:"maxOutputTokens,omitempty"`
-	StopSequences   []string `json:"stopSequences,omitempty"`
+	Temperature     *float64        `json:"temperature,omitempty"`
+	MaxOutputTokens int             `json:"maxOutputTokens,omitempty"`
+	StopSequences   []string        `json:"stopSequences,omitempty"`
+	ThinkingConfig  *gemThinkingCfg `json:"thinkingConfig,omitempty"`
+}
+
+// gemThinkingCfg controls Gemini's thinking mode (gemini-2.5-pro,
+// gemini-3.5-flash, etc). thinkingBudget=0 disables thinking entirely,
+// which avoids the thought_signature round-trip requirement that
+// gemini-3.5-flash enforces on function_call parts. metis's ContentBlock
+// doesn't yet carry the signature, so without this setting we'd see:
+//   400 Function call is missing a thought_signature in functionCall
+//       parts. This is required for tools to work correctly.
+//
+// Future: capture + echo thought_signature → re-enable thinking via
+// METIS_GEMINI_THINKING=low/high.
+type gemThinkingCfg struct {
+	// ThinkingBudget=0 disables; -1 = default (model-decided).
+	// Positive values cap thinking tokens.
+	ThinkingBudget *int `json:"thinkingBudget,omitempty"`
 }
 
 type gemReq struct {
@@ -167,6 +193,14 @@ func toGemini(req Request, maxTokens int) gemReq {
 		GenerationConfig: &gemGenConfig{
 			MaxOutputTokens: mt,
 			StopSequences:   req.StopSequences,
+			// 2026-05-23: thinking off by default (budget=0).
+			// gemini-3.5-flash requires thought_signature echoed on
+			// every function_call once thinking is on; metis's
+			// ContentBlock doesn't carry the signature yet, so we
+			// disable thinking to avoid the 400 "missing
+			// thought_signature" error. Override via env later when
+			// we wire signature round-trip.
+			ThinkingConfig: geminiThinkingConfig(),
 		},
 	}
 	if req.Temperature > 0 {
@@ -178,6 +212,20 @@ func toGemini(req Request, maxTokens int) gemReq {
 			Parts: []gemPart{{Text: req.System}},
 		}
 	}
+	// 2026-05-23: Gemini requires functionResponse.name to be
+	// non-empty (mirrors the function_call.name that triggered it).
+	// metis's ContentBlock for tool_result only carries ToolUseID,
+	// not ToolName, so we build a map from tool_use_id → tool_name
+	// by pre-scanning the request's assistant messages.
+	toolUseIDToName := map[string]string{}
+	for _, m := range req.Messages {
+		for _, c := range m.Content {
+			if c.Type == "tool_use" && c.ToolUseID != "" && c.ToolName != "" {
+				toolUseIDToName[c.ToolUseID] = c.ToolName
+			}
+		}
+	}
+
 	for _, m := range req.Messages {
 		var role string
 		switch m.Role {
@@ -201,16 +249,37 @@ func toGemini(req Request, maxTokens int) gemReq {
 					parts = append(parts, gemPart{Text: c.Text})
 				}
 			case "tool_use":
-				parts = append(parts, gemPart{FunctionCall: &gemFunctionCall{
+				gp := gemPart{FunctionCall: &gemFunctionCall{
 					Name: c.ToolName, Args: c.ToolInput,
-				}})
+				}}
+				// Echo thoughtSignature back if we captured one on
+				// the originating response — gemini-3.5+ requires it
+				// on every function_call replayed in history.
+				if c.ProviderHint != nil {
+					if sig := c.ProviderHint["gemini.thought_signature"]; sig != "" {
+						gp.ThoughtSignature = sig
+					}
+				}
+				parts = append(parts, gp)
 			case "tool_result":
 				// Gemini's functionResponse must wrap the tool output in
 				// an object — strings are not allowed at the top of
 				// `response`. Wrap raw text under `content` so the model
 				// can still read it as JSON.
+				name := c.ToolName
+				if name == "" {
+					name = toolUseIDToName[c.ToolUseID]
+				}
+				if name == "" {
+					// Fallback so Gemini doesn't reject "Name cannot
+					// be empty"; happens when an orphan tool_result
+					// has no matching tool_use in the visible window
+					// (post-compact, partial replay). "unknown" loses
+					// the name signal but keeps the request valid.
+					name = "unknown"
+				}
 				parts = append(parts, gemPart{FunctionResponse: &gemFunctionResp{
-					Name:     c.ToolName,
+					Name:     name,
 					Response: map[string]any{"content": c.ToolResult, "is_error": c.IsError},
 				}})
 			}
@@ -222,12 +291,73 @@ func toGemini(req Request, maxTokens int) gemReq {
 	}
 	for _, t := range req.Tools {
 		// Gemini batches all function declarations under a single tools
-		// entry. Schema goes through verbatim — it accepts JSON Schema.
+		// entry. Schema sanitized first — Gemini's parser rejects JSON
+		// Schema fields that OpenAI/Anthropic accept (additionalProperties,
+		// $schema, etc.). Repro 2026-05-23 with gemini-3.5-flash:
+		//   "Unknown name \"additionalProperties\" at
+		//    'tools[40].function_declarations[0].parameters': Cannot
+		//    find field."
 		out.Tools = append(out.Tools, gemTool{
 			FunctionDeclarations: []gemFunctionDecl{{
-				Name: t.Name, Description: t.Description, Parameters: t.InputSchema,
+				Name: t.Name, Description: t.Description,
+				Parameters: sanitizeSchemaForGemini(t.InputSchema),
 			}},
 		})
+	}
+	return out
+}
+
+// sanitizeSchemaForGemini recursively strips JSON Schema fields Gemini
+// rejects. The whitelist approach (keep only known-good fields) is
+// safer than blacklist because Gemini's API spec evolves and silently
+// 400s on new unknown fields.
+//
+// Kept fields per Google's API spec
+// (https://ai.google.dev/api/caching#Schema):
+//   type, format, description, nullable, enum, properties, required,
+//   items, minimum, maximum, minLength, maxLength, pattern, default
+//
+// Stripped: additionalProperties, $schema, $defs, $ref, oneOf, anyOf,
+// allOf, not, examples, title, const, ...
+func sanitizeSchemaForGemini(s map[string]any) map[string]any {
+	if s == nil {
+		return nil
+	}
+	allowed := map[string]bool{
+		"type": true, "format": true, "description": true, "nullable": true,
+		"enum": true, "properties": true, "required": true, "items": true,
+		"minimum": true, "maximum": true, "minLength": true, "maxLength": true,
+		"pattern": true, "default": true,
+	}
+	out := make(map[string]any, len(s))
+	for k, v := range s {
+		if !allowed[k] {
+			continue
+		}
+		switch k {
+		case "properties":
+			if props, ok := v.(map[string]any); ok {
+				cleanProps := make(map[string]any, len(props))
+				for name, schema := range props {
+					if sub, ok := schema.(map[string]any); ok {
+						cleanProps[name] = sanitizeSchemaForGemini(sub)
+					} else {
+						cleanProps[name] = schema
+					}
+				}
+				out[k] = cleanProps
+			} else {
+				out[k] = v
+			}
+		case "items":
+			if sub, ok := v.(map[string]any); ok {
+				out[k] = sanitizeSchemaForGemini(sub)
+			} else {
+				out[k] = v
+			}
+		default:
+			out[k] = v
+		}
 	}
 	return out
 }
@@ -359,12 +489,20 @@ func fromGeminiChunk(chunk gemRespChunk) *Response {
 			r.Content = append(r.Content, ContentBlock{Type: "text", Text: p.Text})
 		}
 		if p.FunctionCall != nil {
-			r.Content = append(r.Content, ContentBlock{
+			block := ContentBlock{
 				Type:      "tool_use",
 				ToolUseID: gemToolID(p.FunctionCall.Name),
 				ToolName:  p.FunctionCall.Name,
 				ToolInput: p.FunctionCall.Args,
-			})
+			}
+			// gemini-3.5+ thinking models attach a thoughtSignature
+			// to function_call parts. Stash on ProviderHint so the
+			// next turn's toGemini() can echo it back — Gemini
+			// rejects the follow-up turn otherwise.
+			if p.ThoughtSignature != "" {
+				block.ProviderHint = map[string]string{"gemini.thought_signature": p.ThoughtSignature}
+			}
+			r.Content = append(r.Content, block)
 		}
 	}
 	return r
@@ -483,9 +621,18 @@ func (s *geminiStream) queueChunk(chunk gemRespChunk) {
 		if p.FunctionCall != nil {
 			s.idCounter++
 			id := fmt.Sprintf("gem_%d", s.idCounter)
-			s.pending = append(s.pending,
-				StreamEvent{Type: "tool_use_start", ToolUseID: id, ToolName: p.FunctionCall.Name},
-			)
+			startEv := StreamEvent{Type: "tool_use_start", ToolUseID: id, ToolName: p.FunctionCall.Name}
+			// gemini-3.5+ thinking models attach thoughtSignature to
+			// the same part as functionCall. Capture it onto the
+			// tool_use_start event so the loop's consumeStream can
+			// stash it on the ContentBlock that gets persisted into
+			// message history — next turn's toGemini() echoes it
+			// back, satisfying Gemini's "Function call is missing a
+			// thought_signature" enforcement.
+			if p.ThoughtSignature != "" {
+				startEv.ProviderHint = map[string]string{"gemini.thought_signature": p.ThoughtSignature}
+			}
+			s.pending = append(s.pending, startEv)
 			if len(p.FunctionCall.Args) > 0 {
 				args, _ := json.Marshal(p.FunctionCall.Args)
 				s.pending = append(s.pending,
@@ -515,3 +662,22 @@ func (s *geminiStream) queueChunk(chunk gemRespChunk) {
 		s.done = true
 	}
 }
+
+// geminiThinkingConfig builds the thinkingConfig for Gemini requests.
+// Default disables thinking (budget=0) so gemini-3.5-flash doesn't
+// require thought_signature echo. Set METIS_GEMINI_THINKING_BUDGET to
+// an integer (0 to disable, -1 for model-decided, positive value to
+// cap thinking tokens) to override.
+func geminiThinkingConfig() *gemThinkingCfg {
+	budget := 0
+	if v := strings.TrimSpace(envLookup("METIS_GEMINI_THINKING_BUDGET")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			budget = n
+		}
+	}
+	return &gemThinkingCfg{ThinkingBudget: &budget}
+}
+
+// envLookup is a tiny stdlib wrapper so the body above stays compact
+// and so the test rig can inject without monkey-patching os.Getenv.
+var envLookup = func(k string) string { return os.Getenv(k) }

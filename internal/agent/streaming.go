@@ -137,6 +137,14 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			flushThinking()
 			flushText()
 			curTool = &llm.ContentBlock{Type: "tool_use", ToolUseID: ev.ToolUseID, ToolName: ev.ToolName}
+			// Propagate provider-specific blobs (gemini thoughtSignature,
+			// future provider hints) onto the ContentBlock so they round-
+			// trip when the message is later re-sent in history. Without
+			// this, gemini-3.5+ rejects subsequent turns with "Function
+			// call is missing a thought_signature".
+			if len(ev.ProviderHint) > 0 {
+				curTool.ProviderHint = ev.ProviderHint
+			}
 			curJSON = ""
 		case "tool_input_delta":
 			curJSON += ev.InputDelta
