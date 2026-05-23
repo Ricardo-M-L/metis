@@ -1758,7 +1758,7 @@ func cmdRun(ctx context.Context, args []string) error {
 			// would block legitimate provider-side stop reasons we
 			// haven't enumerated yet.
 			switch finalStop {
-			case "diminishing_returns", "max_iterations", "loop_detected", "stuck_after_reset":
+			case "diminishing_returns", "max_iterations", "loop_detected", "stuck_after_reset", "turn_wall_clock":
 				incompleteReason = finalStop
 				incompleteDetail = lastInfoText
 			}
@@ -1780,9 +1780,16 @@ func cmdRun(ctx context.Context, args []string) error {
 			if totalInput > 0 {
 				hitPct = float64(totCacheRead) / float64(totalInput) * 100
 			}
+			// 2026-05-23: added stop_reason so users can tell at a glance
+			// WHY the loop ended — previously they had to read the JSONL
+			// metrics-log to distinguish "done" / "max_iterations" /
+			// "diminishing_returns" / "stuck_after_reset" / "loop_detected"
+			// / "halted_by_hook" / "plan_mode" / provider-supplied stops.
+			// Tail of the [metrics] line so existing parsers that ignore
+			// trailing fields still work.
 			fmt.Fprintf(os.Stderr,
-				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d cache_hit=%.1f%% duration_ms=%d\n",
-				totIn, totOut, totCacheRead, totCacheCreate, hitPct, time.Since(runStart).Milliseconds())
+				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d cache_hit=%.1f%% duration_ms=%d stop_reason=%s\n",
+				totIn, totOut, totCacheRead, totCacheCreate, hitPct, time.Since(runStart).Milliseconds(), finalStop)
 		case agent.EventError:
 			return ev.Err
 		}

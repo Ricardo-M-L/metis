@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -588,7 +590,44 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	progress := newProgressDetector()           // see progress_detector.go
 	stuckDet := &stuckDetector{}                // see stuck_detector.go — Phase C-mini
 
+	// 2026-05-23: cumulative output tokens this Run() so the iter
+	// nudge formatter can include "you've also used N output tokens"
+	// — claude-code's tokenBudget continuation message gives the
+	// model the same kind of cost-context. metis budgets by iter not
+	// tokens, but the cost context still helps the model decide
+	// whether to keep exploring or wrap up.
+	var runOutputTokens int
+
+	// 2026-05-23: per-Run wall-clock cap. iter count is the primary
+	// budget but doesn't bound real time — a Run that hangs in 30
+	// iter could nominally take 60+ minutes if every iter triggers a
+	// long Bash + reads. Independent cap so a runaway turn surfaces
+	// instead of silently burning hours. Override via
+	// METIS_TURN_MAX_SECONDS for workflows that legitimately need
+	// longer turns (test runs, slow Docker builds, etc).
+	turnDeadline := time.Now().Add(45 * time.Minute)
+	if env := os.Getenv("METIS_TURN_MAX_SECONDS"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 {
+			turnDeadline = time.Now().Add(time.Duration(n) * time.Second)
+		}
+	}
+
 	for {
+		// Per-turn wall-clock cap (see deadline computation above).
+		// Checked at the top of each iter so an in-flight Bash /
+		// LLM call still finishes before we abort — same shape as
+		// the iter-cap branch farther down.
+		if time.Now().After(turnDeadline) {
+			stopReason = "turn_wall_clock"
+			l.Hooks.EmitLoopEnd(ctx, tc, "turn_wall_clock")
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: "turn wall-clock cap reached (METIS_TURN_MAX_SECONDS) — aborting before next iteration",
+			})
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "turn_wall_clock"})
+			return nil
+		}
+
 		l.mu.Lock()
 		l.iterIdx++
 		curIter := l.iterIdx
@@ -614,7 +653,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// Soft iter-budget nudges at 50% / 75% / 90% — see
 		// iter_nudge.go. Fire at most one per threshold per turn so
 		// the model gets a heads-up before the hard cap kicks in.
-		if idx, body := shouldFireNudge(curIter, l.MaxIters, nudgeFired); body != "" {
+		// runOutputTokens is included so the nudge body can give the
+		// model real cost context ("you've also used 12K output
+		// tokens"), matching claude-code's tokenBudget continuation
+		// message style.
+		if idx, body := shouldFireNudgeWithTokens(curIter, l.MaxIters, runOutputTokens, nudgeFired); body != "" {
 			nudgeFired[idx] = true
 			l.mu.Lock()
 			l.Messages = append(l.Messages, llm.Message{
@@ -671,6 +714,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return err
 		}
 		if usage != nil {
+			runOutputTokens += usage.out
 			emit(ctx, out, Event{
 				Kind:                     EventTokens,
 				InputTokens:              usage.in,

@@ -70,6 +70,16 @@ var iterNudges = []iterNudgeThreshold{
 // into the same iteration — sub-10-iter caps are typically test
 // rigs, not real sessions.
 func shouldFireNudge(curIter, maxIters int, fired []bool) (idx int, body string) {
+	return shouldFireNudgeWithTokens(curIter, maxIters, 0, fired)
+}
+
+// shouldFireNudgeWithTokens is the token-aware variant. cumulativeOutputTokens
+// is the total assistant output tokens emitted so far in this Run() — passed
+// through so the formatted nudge body can give the model genuine cost context
+// ("you've also burned ~12k output tokens"), matching the spirit of
+// claude-code's tokenBudget continuation message (constants/prompts.ts:540
+// + utils/tokenBudget.ts). Pass 0 if you don't have the counter handy.
+func shouldFireNudgeWithTokens(curIter, maxIters, cumulativeOutputTokens int, fired []bool) (idx int, body string) {
 	if maxIters < 10 {
 		return -1, ""
 	}
@@ -79,15 +89,27 @@ func shouldFireNudge(curIter, maxIters int, fired []bool) (idx int, body string)
 			continue
 		}
 		if ratio >= n.pct {
-			return i, formatIterNudge(curIter, maxIters, n.body)
+			return i, formatIterNudgeWithTokens(curIter, maxIters, cumulativeOutputTokens, n.body)
 		}
 	}
 	return -1, ""
 }
 
 func formatIterNudge(curIter, maxIters int, body string) string {
-	return fmt.Sprintf("<system-reminder>\n[iter %d / %d budget check]\n%s\n</system-reminder>",
-		curIter, maxIters, body)
+	return formatIterNudgeWithTokens(curIter, maxIters, 0, body)
+}
+
+func formatIterNudgeWithTokens(curIter, maxIters, cumulativeOutputTokens int, body string) string {
+	// Only include the token line when we actually have a number to
+	// show — most call sites have it from runOutputTokens, but a few
+	// older paths (tests, mock loops) still call the zero-token form.
+	tokenLine := ""
+	if cumulativeOutputTokens > 0 {
+		tokenLine = fmt.Sprintf("(you've also generated ~%d output tokens this turn)\n",
+			cumulativeOutputTokens)
+	}
+	return fmt.Sprintf("<system-reminder>\n[iter %d / %d budget check]\n%s%s\n</system-reminder>",
+		curIter, maxIters, tokenLine, body)
 }
 
 // finalSummaryRescueMessage is injected when the iter cap is fully
