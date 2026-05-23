@@ -12,6 +12,7 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 	"sync"
 
@@ -355,6 +356,17 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 	gutterStyle := lipgloss.NewStyle().Foreground(textMuted)
 	filename := pickLanguageFromInput(input)
 
+	// 2026-05-23: chroma highlightLine emits `\x1b[0m` (full reset)
+	// after every syntax token. When the rendered diff line has a
+	// background applied at the OUTER level, each chroma reset wipes
+	// the bg on the cells that follow — leaving visible "uncovered"
+	// gaps inside the row (user screenshot 60 feedback "中间还有
+	// 一部分肢体没有被覆盖到"). reinjectBg post-processes the body
+	// to re-establish the bg ANSI code after every `\x1b[0m` so the
+	// outer Width-padded wrapper produces a contiguous coloured row.
+	addBgAnsi := bgAnsiPrefix(themes.Current().DiffAddBg)
+	delBgAnsi := bgAnsiPrefix(themes.Current().DiffDelBg)
+
 	var s strings.Builder
 	rendered := 0
 	totalDiffLines := 0
@@ -409,7 +421,7 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 				} else {
 					rowBody.WriteString(delBgInline.Render(highlightLine(content, filename)))
 				}
-				s.WriteString(delBgOnly.Render(rowBody.String()))
+				s.WriteString(delBgOnly.Render(reinjectBg(rowBody.String(), delBgAnsi)))
 				oldLine++
 				i++
 				if partner != nil {
@@ -424,7 +436,7 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 					addBody.WriteString(applyMask(*partner, insMask,
 						func(s string) string { return addBgInline.Render(s) },
 						func(s string) string { return addStrong.Render(s) }))
-					s.WriteString(addBgOnly.Render(addBody.String()))
+					s.WriteString(addBgOnly.Render(reinjectBg(addBody.String(), addBgAnsi)))
 					newLine++
 					i++
 				}
@@ -433,7 +445,7 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 				var addBody strings.Builder
 				addBody.WriteString(addBgInline.Render("+ "))
 				addBody.WriteString(addBgInline.Render(highlightLine(content, filename)))
-				s.WriteString(addBgOnly.Render(addBody.String()))
+				s.WriteString(addBgOnly.Render(reinjectBg(addBody.String(), addBgAnsi)))
 				newLine++
 				i++
 			}
@@ -480,13 +492,16 @@ func renderWritePreview(input map[string]any, expanded bool) string {
 	if !expanded && len(show) > maxShow {
 		show = show[:maxShow]
 	}
+	// Same bg-reinject treatment as renderEditDiff — chroma's per-token
+	// `\x1b[0m` would otherwise leave uncovered cells inside the green row.
+	addBgAnsi := bgAnsiPrefix(themes.Current().DiffAddBg)
 	var s strings.Builder
 	for i, ln := range show {
 		s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", i+1)))
 		var rowBody strings.Builder
 		rowBody.WriteString(addBgInline.Render("+ "))
 		rowBody.WriteString(addBgInline.Render(highlightLine(truncateRunes(ln, 100), filename)))
-		s.WriteString(addBgOnly.Render(rowBody.String()))
+		s.WriteString(addBgOnly.Render(reinjectBg(rowBody.String(), addBgAnsi)))
 		s.WriteString("\n")
 	}
 	if !expanded && len(lines) > maxShow {
@@ -725,4 +740,41 @@ func lastKnownChatWidth() int {
 	chatWidthMu.RLock()
 	defer chatWidthMu.RUnlock()
 	return lastChatWidth
+}
+
+// bgAnsiPrefix extracts the "background ANSI start" sequence lipgloss
+// would emit for the given color. e.g. for #1a2a1a in 256-color terms,
+// it returns "\x1b[48;5;234m" (or similar). Empty if lipgloss couldn't
+// produce a styled output (e.g. NoColor profile).
+//
+// Trick: render a single space with bg-only, then strip the visible
+// space + trailing reset to get only the start prefix. lipgloss's
+// renderer is stable enough that this round-trip works reliably.
+func bgAnsiPrefix(c color.Color) string {
+	out := lipgloss.NewStyle().Background(c).Render(" ")
+	// Typical shape: "\x1b[<bg>m \x1b[0m". Find the FIRST space —
+	// everything before it is the bg prefix.
+	idx := strings.IndexByte(out, ' ')
+	if idx <= 0 {
+		return ""
+	}
+	return out[:idx]
+}
+
+// reinjectBg makes the given bg-ANSI prefix "sticky" across internal
+// resets. chroma's terminal256 formatter emits `\x1b[0m` after every
+// syntax token, which would otherwise wipe the outer background and
+// leave cells with no fill. By post-processing the chroma output to
+// insert the bg prefix immediately after each reset, the background
+// re-establishes for all following cells. The outer lipgloss wrapper
+// still adds its own start prefix + final reset, so this is
+// idempotent / safe to chain.
+func reinjectBg(s, bgAnsi string) string {
+	if bgAnsi == "" || s == "" {
+		return s
+	}
+	if !strings.Contains(s, "\x1b[0m") {
+		return s
+	}
+	return strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+bgAnsi)
 }
