@@ -114,17 +114,21 @@ func (l *List) HandleMouseDown(x, y, clickCount int) bool {
 	case 3:
 		return l.selectLine(itemIdx, itemY)
 	}
-	// Single-click. If a selection is already on screen (HasContent
-	// from the previous mouse-up), STAGE this new anchor and leave the
-	// old highlight intact. The first HandleMouseDrag promotes the
-	// staged anchor; HandleMouseUp (no drag occurred) clears the stage
-	// without touching the live selection.
-	if l.sel.HasContent {
-		l.sel.stagedAnchor = SelectionPoint{ItemIdx: itemIdx, Line: itemY, Col: x}
-		l.sel.hasStaged = true
-		return true
-	}
-	// No prior selection — go directly into drag-tracking mode.
+	// Single-click. 2026-05-23: user feedback — previous behavior
+	// preserved the prior selection on the screen on the theory that
+	// cmd+C should still work after drag. Empirically that conflicts
+	// with the "click-anywhere-to-deselect" intuition every terminal
+	// app trains: select text, click somewhere else, selection clears.
+	// Since MouseReleaseMsg already copied the dragged selection to
+	// the clipboard (copySelectionAndReport runs before this next
+	// click), the only thing the staged-anchor preservation bought
+	// was a visible highlight — and that visible highlight is
+	// exactly what the user wants gone when they click elsewhere.
+	//
+	// New behavior: always clear prior selection on single-click
+	// then start a fresh drag-tracking session anchored at this
+	// click. If the click is a no-drag click (just a tap to
+	// deselect), HandleMouseUp leaves the empty selection alone.
 	l.sel = selectionState{
 		Anchor:   SelectionPoint{ItemIdx: itemIdx, Line: itemY, Col: x},
 		Focus:    SelectionPoint{ItemIdx: itemIdx, Line: itemY, Col: x},
