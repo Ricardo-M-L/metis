@@ -105,6 +105,16 @@ func (r Read) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 	return mapDecision(d), src
 }
 
+// fileUnchangedStub is returned by Read when sessionReadState already
+// holds a full snapshot of the path AND the on-disk file hasn't
+// drifted. Verbatim from claude-code's FILE_UNCHANGED_STUB
+// (tools/FileReadTool/prompt.ts) — keeping the wording identical so
+// model behaviour matches the upstream prompt's well-trained
+// expectations.
+const fileUnchangedStub = "File unchanged since last read. The " +
+	"content from the earlier Read tool_result in this conversation " +
+	"is still current — refer to that instead of re-reading."
+
 // MaxReadFileSize caps the total bytes Read will load into memory
 // before returning. claude-code uses 1 GiB; we pick 256 MiB because
 // Go runtime memory pressure on a 16 GB Mac with a long context
@@ -161,6 +171,40 @@ func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 			Output:  fmt.Sprintf("file too large: %d bytes exceeds %d byte cap (use Bash with head/tail to inspect)", st.Size(), MaxReadFileSize),
 			IsError: true,
 		}, nil
+	}
+
+	// 2026-05-23: FILE_UNCHANGED_STUB short-circuit. If sessionReadState
+	// already has a FULL snapshot of this path AND the on-disk file
+	// hasn't drifted (mtime equal — fast path; hash equal — slow path
+	// covering touch / cloud-sync that bumps mtime without changing
+	// content), return a short stub instead of re-emitting the full
+	// content. Mirrors claude-code's FILE_UNCHANGED_STUB
+	// (tools/FileReadTool/FileReadTool.ts). Cuts ~30% Read tokens on
+	// runs where parent + sub-agents repeatedly Read the same files
+	// (the kimi-cli-go porting test 2026-05-23 hit this hard: 186
+	// Reads, ~half on files already in state).
+	//
+	// Skip the stub for partial reads (offset / limit set) — the
+	// caller is explicitly asking for a slice, not a re-read of the
+	// whole file. Also skip on partial-view prior entries (Edit would
+	// reject those anyway, but a full Read should pull the actual
+	// content so the model can edit it).
+	if r.state != nil && offset == 1 && limit == 2000 {
+		if prior, ok := r.state.Get(path); ok && !prior.IsPartialView {
+			if prior.MTime.Equal(st.ModTime()) {
+				return &tools.Result{Output: fileUnchangedStub}, nil
+			}
+			// mtime drifted — verify hash before claiming unchanged.
+			if data, rerr := os.ReadFile(path); rerr == nil {
+				if hashBytes(data) == prior.Hash {
+					// Content unchanged; just refresh mtime so
+					// next call hits the fast path.
+					r.state.Record(path, st.ModTime(), data)
+					return &tools.Result{Output: fileUnchangedStub}, nil
+				}
+			}
+			// Drift detected — fall through, do a real Read.
+		}
 	}
 
 	f, err := os.Open(path)
