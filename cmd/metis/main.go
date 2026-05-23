@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1505,6 +1506,26 @@ func cmdRun(ctx context.Context, args []string) error {
 	_ = rtpkg.AppendHistory(rtpkg.HistoryEntry{
 		SessionID: rt.sessionID, Input: prompt, Source: "run",
 	})
+
+	// 2026-05-23: per-run wall-clock cap covers the WHOLE invocation
+	// (parent loop + every sub-agent / fork spawned under it). The
+	// existing per-turn wall-clock in loop.go (45 min default) only
+	// bounds ONE turn — a fanned-out run with 18 sub-agents each
+	// running 5-10 min easily blew past wall expectations even though
+	// no single turn was abnormally long (see kimi-cli-go porting
+	// test 2026-05-23 — 41 min on --max-iter 30, sub-agent budget
+	// wasn't inherited so each agent ran its own 100-iter default).
+	//
+	// Default: 30 min. Override via METIS_RUN_MAX_SECONDS for
+	// workflows that genuinely need longer.
+	runWallCap := 30 * time.Minute
+	if env := os.Getenv("METIS_RUN_MAX_SECONDS"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 {
+			runWallCap = time.Duration(n) * time.Second
+		}
+	}
+	ctx, cancelRunCap := context.WithTimeout(ctx, runWallCap)
+	defer cancelRunCap()
 
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
