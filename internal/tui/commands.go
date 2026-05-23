@@ -74,7 +74,15 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "fast", Description: "fast mode: on | off | toggle (effort=low + halved tokens)", Handler: cmdFast})
 	r.Register(REPLCommand{Name: "theme", Description: "switch color theme: dark | light | dark-daltonized", Handler: cmdTheme})
 	r.Register(REPLCommand{Name: "vim", Description: "vim mode: on | off | toggle (modal input — hjkl in NORMAL)", Handler: cmdVim})
-	r.Register(REPLCommand{Name: "voice", Description: "voice input: start | stop | toggle (records mic, transcribes via whisper)", Handler: cmdVoice})
+	// /voice hidden from the palette 2026-05-23 — feature requires
+	// an OpenAI API key in ~/.metis/auth.json for Whisper transcription,
+	// and most users hit "voice: openai api key required..." on first
+	// use. Code (voice.go + cmdVoice handler) retained so we can re-
+	// enable cleanly once the alternative transcription paths land
+	// (Gemini audio in, macOS native Dictation, etc — see voice.go
+	// header for the three candidate approaches). To re-enable without
+	// rebuilding: uncomment this Register line.
+	// r.Register(REPLCommand{Name: "voice", Description: "voice input: start | stop | toggle (records mic, transcribes via whisper)", Handler: cmdVoice})
 	r.Register(REPLCommand{Name: "share", Description: "share session over local HTTP+SSE: start | stop (URL printed for IDE/browser clients)", Handler: cmdShare})
 
 	// === Productivity / inspection ===
