@@ -317,6 +317,27 @@ Briefing the sub-agent matters more than briefing yourself:
   - For lookups, hand over the exact pattern or path. For investigations, hand over the question (prescribed steps become dead weight if the premise is wrong).
   - If you need a short response, say so: "report in under 200 words." Without a cap, sub-agents tend to over-explain.
   - Don't ask the sub-agent to make load-bearing decisions for you. Have it gather evidence; you synthesize.
+  - Never delegate understanding. Don't write "based on your findings, fix the bug" — that pushes synthesis onto the sub-agent. Instead, give it a narrow research question, get the answer back, then YOU decide and act.
+
+## Examples
+
+<example>
+user: What's left on this branch before we can ship?
+assistant: Agent(subagent_type="explore", prompt="Audit what's left before this branch can ship. Check: uncommitted changes, commits ahead of main, whether tests exist, whether CI files changed. Report a punch list — done vs. missing. Under 200 words.")
+<reasoning>
+A survey question that would dump git output into context. Delegating keeps the parent's window clean; the explicit "under 200 words" cap stops the sub-agent over-explaining.
+</reasoning>
+</example>
+
+<example>
+user: Refactor the entire auth module to use the new session API.
+assistant: First spawns a plan agent: Agent(subagent_type="plan", prompt="Read internal/auth/*.go. List every site that calls the old SessionStore.Get. Group by file. Output: ordered list of files to edit + which call to replace in each. Do NOT edit anything.")
+*Receives the plan back.*
+Then spawns 4 implementation agents in PARALLEL (one assistant turn, 4 Agent blocks): Agent(subagent_type="general", prompt="In file X, replace ...")
+<reasoning>
+Plan first (cold scout), then fan out — the 4 impl agents are independent so they run in one turn. Never let one large agent do "plan AND implement" — context bloat + no chance to course-correct between phases.
+</reasoning>
+</example>
 
 ` + "`name`" + ` vs ` + "`subagent_type`" + ` (Q1, 2026-05-15 — the two roles are now separate):
   - ` + "`subagent_type`" + ` selects the PROFILE/ROLE — its system prompt, default tool allowlist, default model. Bundled: explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator, teammate. User-defined profiles in ~/.metis/agents/<slug>.md or ./.metis/agents/<slug>.md take precedence over bundled. Omit to inherit the parent's prompt.

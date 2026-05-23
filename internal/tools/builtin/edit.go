@@ -44,7 +44,35 @@ Strategy:
   - For wholly new file content or full rewrites, use Write instead.
   - For multi-file refactors (rename a symbol across the repo), don't pack many old→new into one call — call Edit once per file. The model gets clearer feedback when one fails.
 
-Edit is irreversible (writes to disk immediately). The user's permission mode decides whether the call needs explicit approval; you don't need to guess.`
+Edit is irreversible (writes to disk immediately). The user's permission mode decides whether the call needs explicit approval; you don't need to guess.
+
+## Examples
+
+<example>
+context: Rename one variable in foo.go that appears 5 times.
+assistant: Edit(path="/repo/foo.go", old="userId", new="userID", all=true)
+<reasoning>
+all=true is right for a global unambiguous rename. Saves 4 round-trips vs editing each occurrence with unique context.
+</reasoning>
+</example>
+
+<example>
+context: Add a single field to a struct.
+assistant: Edit(path="/repo/types.go",
+  old="type User struct {\n\tName string\n}",
+  new="type User struct {\n\tName  string\n\tEmail string\n}")
+<reasoning>
+Targeted change. old includes 2 lines of unique context so the match is unambiguous without all=true.
+</reasoning>
+</example>
+
+<example>
+context: Same symbol needs renaming across 4 files.
+assistant: One Edit call per file (separate calls).
+<reasoning>
+DO NOT pack 4 files into one call. Per-file Edits give clearer error messages when one fails — e.g. unique-context violation in file 3 doesn't roll back files 1-2.
+</reasoning>
+</example>`
 }
 func (Edit) InputSchema() map[string]any {
 	return map[string]any{

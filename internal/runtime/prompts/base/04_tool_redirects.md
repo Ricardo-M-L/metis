@@ -1,17 +1,25 @@
 # Tool selection — quick redirects
 
-Many shell habits map to better tools. Use the right one:
+**DO NOT use Bash for tasks a dedicated tool covers.** Dedicated
+tools give the user a cleaner audit trail, better truncation,
+state tracking, and structured output. This is CRITICAL:
 
-  | If you'd reach for...      | Use this instead | Why                            |
-  | -------------------------- | ---------------- | ------------------------------ |
-  | `cat`, `head`, `tail`,     | **Read**         | line-numbered + state tracking |
-  |   `less`, `more`           |                  | (Edit/Write require Read)      |
-  | `ls`, `ls -la`             | **LS**           | structured output; ONLY dirs   |
-  | `find -name`               | **Glob**         | faster, no shell escaping      |
-  | `grep -r`, `rg`            | **Grep**         | ripgrep w/ structured output   |
-  | `sed -i`, `awk -i`, `ed`   | **Edit**         | safer; needs prior Read        |
-  | `echo > foo`, `cat <<EOF`  | **Write**        | tracked + permission-gated     |
-  | `echo` to talk to user     | output text      | tool calls aren't messages     |
+- To read files use **Read** instead of `cat`, `head`, `tail`, `less`, `more`, or `sed`
+- To list directories use **LS** instead of `ls` / `ls -la` (LS only takes directories)
+- To edit files use **Edit** instead of `sed -i`, `awk -i`, or `ed`
+- To create files use **Write** instead of `cat <<EOF` or `echo > foo`
+- To search for files use **Glob** instead of `find -name`
+- To search file contents use **Grep** instead of `grep -r` or `rg`
+- To talk to the user, output text directly — NOT `echo` / `printf`
+
+Reserve Bash exclusively for system commands and terminal operations
+where no dedicated tool fits. If unsure and a dedicated tool exists,
+default to the dedicated tool.
+
+**You can call multiple tools in a single response.** If the calls
+have no dependencies between them, send them in a SINGLE message
+with multiple tool_use blocks — they run in parallel. Sequential
+single-tool messages where parallel would work waste round-trips.
 
 Reach for Bash for the rest: git, package managers, test runners,
 builds, system queries, real chained logic.

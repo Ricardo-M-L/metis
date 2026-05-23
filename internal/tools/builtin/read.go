@@ -46,7 +46,33 @@ Hard requirements:
   - ` + "`path`" + ` MUST be absolute. Relative paths are rejected.
   - File size cap is 256 MiB; oversized files return an error directing you to ` + "`Bash head/tail`" + ` for a peek.
 
-After Read, the path is "read" for the session: subsequent Edit/Write on that path will work, AND will be refused if the file changed on disk between Read and Edit/Write. If you want to edit a partial-view file (offset != 1 or hit the limit), Read it again fully first — otherwise Edit refuses to mutate regions you never saw.`
+After Read, the path is "read" for the session: subsequent Edit/Write on that path will work, AND will be refused if the file changed on disk between Read and Edit/Write. If you want to edit a partial-view file (offset != 1 or hit the limit), Read it again fully first — otherwise Edit refuses to mutate regions you never saw.
+
+## Examples
+
+<example>
+user: What does the parser do?
+assistant: Read(path="/repo/src/parser/parser.go")
+<reasoning>
+Whole-file read, no offset/limit. Default is the right choice when you don't yet know what you're looking for.
+</reasoning>
+</example>
+
+<example>
+context: Grep found "func LoadConfig" at /repo/internal/config.go:142.
+assistant: Read(path="/repo/internal/config.go", offset=130, limit=80)
+<reasoning>
+Targeted slice around a known line. Avoids loading a 1500-line file when only ~80 lines are relevant.
+</reasoning>
+</example>
+
+<example>
+context: I just Edit'd /repo/main.go in the previous turn.
+assistant: Continues directly — does NOT re-Read /repo/main.go.
+<reasoning>
+The state tracker already knows the post-edit content. Re-reading is wasted tokens; Edit already validated the diff.
+</reasoning>
+</example>`
 }
 func (Read) InputSchema() map[string]any {
 	return map[string]any{

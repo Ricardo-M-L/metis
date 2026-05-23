@@ -29,15 +29,86 @@ func (Todo) Name() string { return "TodoWrite" }
 func (Todo) Description() string {
 	return `Create or update a task in the session task list. Persists to ~/.metis/tasks/.
 
-UPDATE vs CREATE — match by content; id is auto-managed:
+## When to use this tool
+
+Use proactively in these scenarios:
+1. Complex multi-step tasks — when a task requires 3 or more distinct steps.
+2. Non-trivial work — careful planning needed; multiple operations.
+3. User explicitly asks for a todo list.
+4. User provides multiple tasks (numbered or comma-separated).
+5. After receiving new instructions — capture user requirements immediately.
+6. When you start working on a task — mark it as in_progress BEFORE beginning.
+7. After completing a task — mark it as completed and add any follow-ups.
+
+## When NOT to use this tool
+
+Skip when:
+1. There is only a single, straightforward task.
+2. The task is trivial; tracking it adds no organisational benefit.
+3. The task can be completed in less than 3 trivial steps.
+4. The request is purely conversational / informational.
+
+## UPDATE vs CREATE — match by content; id is auto-managed
+
   - Brand new task: pass content + (optional) status. metis generates an id internally.
   - Updating existing: pass the SAME content string + the new status. metis matches by content (exact then normalised — "Cluster 2: Wire Protocol" matches "2. Wire Protocol", etc.) and updates in place.
   - Keep content STABLE across updates. If you reword "implement plan module" to "Phase 1: plan", you risk creating a duplicate if the normaliser misses it.
 
-STATUS transitions:
+## STATUS transitions
+
   - pending → in_progress when you start working on it
   - in_progress → completed when done
   - Only ONE task should be in_progress at a time; finish (or push back to pending) before starting the next.
+
+## Examples
+
+<example>
+user: I want to add a dark mode toggle to the application settings. Make sure you run the tests and build when you're done.
+assistant: *Creates todo list with these items:*
+1. Create dark mode toggle component in Settings page
+2. Add dark mode state management (context/store)
+3. Implement CSS-in-JS styles for dark theme
+4. Update existing components to support theme switching
+5. Run tests + build, address any failures
+*Begins working on the first task*
+<reasoning>
+Multi-step feature affecting UI + state + styling. The user also asked for tests/build, which the assistant captured as a final task so it isn't forgotten.
+</reasoning>
+</example>
+
+<example>
+user: Help me rename the function getCwd to getCurrentWorkingDirectory across my project
+assistant: *Uses Grep to find all instances of getCwd*
+I found 15 instances of 'getCwd' across 8 different files.
+*Creates a todo per file that needs updating*
+<reasoning>
+After search reveals scope (multiple files), todo list ensures every instance is tracked systematically.
+</reasoning>
+</example>
+
+<example>
+user: How do I print 'Hello World' in Python?
+assistant: print("Hello World")
+<reasoning>
+Single, trivial answer. Todo list adds nothing.
+</reasoning>
+</example>
+
+<example>
+user: Add a comment to the calculateTotal function explaining what it does.
+assistant: *Uses Edit to add the comment in one shot.*
+<reasoning>
+One file, one location. No tracking needed.
+</reasoning>
+</example>
+
+<example>
+user: Run npm install and tell me what happens.
+assistant: *Bash: npm install* + reports output.
+<reasoning>
+Single command, immediate result.
+</reasoning>
+</example>
 
 To LIST current tasks before deciding to update or create, call TodoRead first (zero-cost; reads the same file).`
 }

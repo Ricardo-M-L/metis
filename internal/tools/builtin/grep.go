@@ -22,7 +22,35 @@ type Grep struct {
 
 func (Grep) Name() string { return "Grep" }
 func (Grep) Description() string {
-	return "Search file contents with a Go regex. Returns matching lines with file:line prefix. Skips .git/node_modules/vendor."
+	return `Search file contents with a Go regex. Returns matching lines with file:line prefix. Skips .git / node_modules / vendor by default.
+
+Use Grep for content matching. Use Glob when you only need filenames (no content). Use Bash + grep -r only when you need flags Grep can't express (-A/-B context, -P perl regex).
+
+## Examples
+
+<example>
+context: Find every place that calls LoadConfig.
+assistant: Grep(pattern="LoadConfig\\(")
+<reasoning>
+Function-call regex (note the escaped paren). Returns file:line:match across the whole repo.
+</reasoning>
+</example>
+
+<example>
+context: Find TODO comments only in Python files.
+assistant: Grep(pattern="TODO|FIXME", glob="**/*.py")
+<reasoning>
+glob filter avoids scanning JS/Go/Rust files. Alternation handles both keywords in one call.
+</reasoning>
+</example>
+
+<example>
+context: Searching for a symbol that might have hundreds of hits — paginate.
+assistant: Grep(pattern="UserID", max=50)
+<reasoning>
+Default cap is 250. When you want a quick first batch (e.g. to gauge scope), pass a smaller max — and pair with offset on the next call to walk the rest.
+</reasoning>
+</example>`
 }
 func (Grep) InputSchema() map[string]any {
 	return map[string]any{

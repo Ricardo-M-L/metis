@@ -82,7 +82,35 @@ type Glob struct {
 
 func (Glob) Name() string { return "Glob" }
 func (Glob) Description() string {
-	return "Find files matching a doublestar glob pattern. Examples: \"**/*.go\" (all .go files recursively), \"src/**/*.ts\" (TS files under src), \"*.md\" (top-level markdown). Returns paths sorted by modification time, newest first."
+	return `Find files matching a doublestar glob pattern. Examples: "**/*.go" (all .go files recursively), "src/**/*.ts" (TS files under src), "*.md" (top-level markdown). Returns paths sorted by modification time, newest first.
+
+Use Glob for file-name / path patterns. Use Grep when you need to match file CONTENTS instead. Use Bash + find only when you need filters Glob can't express (mtime, size, perms).
+
+## Examples
+
+<example>
+context: Find every Go test file in the repo.
+assistant: Glob(pattern="**/*_test.go")
+<reasoning>
+Doublestar recurses through all subdirs. Sorted newest-first so the file you most recently touched appears at the top.
+</reasoning>
+</example>
+
+<example>
+context: Find TypeScript files in a specific subdir of a monorepo.
+assistant: Glob(pattern="**/*.ts", root="/repo/packages/web/src")
+<reasoning>
+Scoping with root is much faster than matching against the whole monorepo.
+</reasoning>
+</example>
+
+<example>
+context: Locate anything that looks like a config file in one shot.
+assistant: Glob(pattern="**/{*.toml,*.yaml,*.json,*.ini}")
+<reasoning>
+Brace expansion catches multiple extensions in one call instead of 4 separate Glob invocations.
+</reasoning>
+</example>`
 }
 func (Glob) InputSchema() map[string]any {
 	return map[string]any{

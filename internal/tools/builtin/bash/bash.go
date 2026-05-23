@@ -78,9 +78,19 @@ Do NOT use Bash for these — use the dedicated tool, which gives the user a cle
   - Searching text      → use Grep (not grep -r / rg)
   - Talking to the user → just output text (not echo / printf)
 
-Quoting and safety:
-  - Quote paths with spaces: cd "/Users/x/My Folder", not cd /Users/x/My Folder.
-  - Never prepend 'cd <current-dir>' to a git command — git already works on cwd, and the combo triggers a permission prompt.
+When issuing multiple commands:
+  - If the commands are independent and can run in parallel, make multiple Bash tool calls in a single message. Example: "git status" and "git diff" → ONE message with TWO Bash tool_use blocks.
+  - If the commands depend on each other and must run sequentially, use a SINGLE Bash call with '&&' to chain them — not N separate Bash calls.
+  - Use ';' only when you need to run commands sequentially but DON'T care if earlier commands fail.
+  - DO NOT use newlines to separate commands (newlines are ok inside quoted strings).
+
+Path + cwd discipline:
+  - Quote paths with spaces: cd "/Users/x/My Folder", NOT cd /Users/x/My Folder.
+  - Prefer absolute paths over 'cd' so the cwd stays predictable across calls. Use 'cd' only when the user explicitly asks for it or when an external tool (a build script, npm) requires being run from a specific directory.
+  - Never prepend 'cd <current-dir>' to a git command — git already operates on the current working tree, and the combo triggers a permission prompt.
+  - Before creating new directories or files, first run 'ls' (or just check) to verify the parent directory exists and is the correct location.
+
+Safety:
   - Never pass --no-verify, --no-gpg-sign, --force-with-lease without explicit user consent; never 'git push --force' to main/master.
   - Never 'rm -rf' or pipe to /dev/sd*; never run a command whose effect you can't reverse without asking first.
 
