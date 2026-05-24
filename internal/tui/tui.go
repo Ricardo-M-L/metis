@@ -423,6 +423,23 @@ type Model struct {
 	// doubleEscWindow clears the input.
 	lastEsc time.Time
 
+	// 2026-05-24: sticky-strip selection state (image 67 user feedback
+	// — drag-to-select the bottom bypass-mode / tasks region).
+	// stripStartY is the row inside the View where the sticky strip's
+	// first line lands; set in tui_render.View() so MouseClickMsg /
+	// MouseMotionMsg can derive a 0-based line index inside the strip
+	// (`msg.Y - stripStartY`). stripPlainLines is the plain (ANSI-
+	// stripped) per-line text, sourced from renderStickyTaskStrip's
+	// styled output and used as the clipboard payload when a selection
+	// is finalised. stripSelStart/End are line indices into
+	// stripPlainLines; -1 means "no selection". stripSelDragging tracks
+	// whether mouse-down landed in strip and a drag is in progress.
+	stripStartY      int
+	stripPlainLines  []string
+	stripSelStart    int
+	stripSelEnd      int
+	stripSelDragging bool
+
 	// turnCancel cancels the in-flight turn's ctx (cancellable copy of
 	// m.ctx). Set by runTurnAsync, cleared when the turn finishes.
 	// Ctrl-C calls it to abort the LLM stream + tool execution while
@@ -665,6 +682,11 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		overlays:     overlay.New(),
 		renderCache:  newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
 		showBanner:   true,
+		// Sticky-strip selection state — -1 = no selection. Updated by
+		// MouseClickMsg / MouseMotionMsg / MouseReleaseMsg when click
+		// lands in the strip area (msg.Y >= stripStartY).
+		stripSelStart: -1,
+		stripSelEnd:   -1,
 		firstRender:  true,
 		input:        ti,
 		chatList:     cl,

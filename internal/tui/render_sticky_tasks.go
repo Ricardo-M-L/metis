@@ -178,7 +178,50 @@ func renderStickyTaskStrip(m *Model) string {
 		)
 	}
 
-	return s.String()
+	styled := s.String()
+	// 2026-05-24: cache the strip's plain (ANSI-stripped) per-line
+	// text on the Model so MouseClickMsg / MouseReleaseMsg can derive
+	// the clipboard payload for drag-selected rows. The trailing
+	// newline (writeRow always appends "\n") becomes a stray empty
+	// line after Split — trim before storing so line-index math
+	// matches the visible row count.
+	plainBody := strings.TrimRight(ansiCSIInTUI.ReplaceAllString(styled, ""), "\n")
+	m.stripPlainLines = strings.Split(plainBody, "\n")
+
+	// Apply selection overlay on top of the styled output: each row
+	// whose line index falls inside [stripSelStart, stripSelEnd]
+	// gets wrapped in inverse-video (`\x1b[7m...\x1b[27m`). Inverse
+	// video swaps fg/bg at the terminal level so it composes
+	// cleanly with the per-cell foreground/strikethrough styling the
+	// row itself already carries — no need to rebuild the row with
+	// a fresh bg color attribute.
+	if m.stripSelStart >= 0 && m.stripSelEnd >= 0 {
+		styled = applyStripSelectionOverlay(styled, m.stripSelStart, m.stripSelEnd)
+	}
+	return styled
+}
+
+// applyStripSelectionOverlay wraps each line in selectedRange with
+// inverse-video ANSI so the user sees their drag-selected rows
+// highlighted. selStart/selEnd are line indices (0-based) — order-
+// agnostic (drag can go either direction). Out-of-range indices are
+// clamped so a partial drag past the end doesn't blow up.
+func applyStripSelectionOverlay(styled string, selStart, selEnd int) string {
+	lines := strings.Split(strings.TrimRight(styled, "\n"), "\n")
+	lo, hi := selStart, selEnd
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	if hi >= len(lines) {
+		hi = len(lines) - 1
+	}
+	for i := lo; i <= hi; i++ {
+		lines[i] = "\x1b[7m" + lines[i] + "\x1b[27m"
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // truncateTodoContent shortens a todo's free-text content to the

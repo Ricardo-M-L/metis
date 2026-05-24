@@ -265,18 +265,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if localY >= m.chatList.Height() {
-			// 2026-05-24 second pass (image 67 feedback): the previous
-			// fix appended a "copied N chars" info row to chat on
-			// every click — five clicks left five lines of confirmation
-			// noise in the transcript. Switched to SILENT copy
-			// (same pattern as copySelectionAndReport's claude-code-
-			// parity rationale: copy is a low-ceremony action, the
-			// clipboard write IS the success signal).
-			plain := plainStickyStripText(m)
-			if plain != "" {
-				writeClipboard(plain)
+			// 2026-05-24: drag-to-select in the strip area. Compute the
+			// line index by subtracting the cached stripStartY from
+			// the raw msg.Y. In-range clicks start a fresh selection
+			// (also clears any chat-list selection so the two don't
+			// fight visually); out-of-range fall back to silent
+			// clear-strip-selection so click-on-status-bar / click-on-
+			// hints behaves like "click elsewhere = deselect".
+			if m.stripStartY > 0 && len(m.stripPlainLines) > 0 {
+				lineIdx := msg.Y - m.stripStartY
+				if lineIdx >= 0 && lineIdx < len(m.stripPlainLines) {
+					m.chatList.ClearSelection()
+					m.stripSelStart = lineIdx
+					m.stripSelEnd = lineIdx
+					m.stripSelDragging = true
+					return m, nil
+				}
 			}
+			// Click outside the strip rows (status bar / hints region) →
+			// drop any prior strip selection.
+			m.stripSelStart = -1
+			m.stripSelEnd = -1
+			m.stripSelDragging = false
 			return m, nil
+		}
+		// Click in chat area — clear strip selection (same intuition
+		// as the existing "click clears chat selection" rule).
+		if m.stripSelStart >= 0 {
+			m.stripSelStart = -1
+			m.stripSelEnd = -1
+			m.stripSelDragging = false
 		}
 		// Click-count tracking — same algorithm as crush's chat.go.
 		// Within doubleClickThreshold + clickPosTolerance the counter
@@ -316,6 +334,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showHistory || m.showTaskPanel {
 			return m, nil
 		}
+		// 2026-05-24: drag in the strip area extends the strip line-
+		// selection (start at click, follow cursor). Clamp to the
+		// strip's line range so a drag past either edge sticks rather
+		// than evaporating.
+		if m.stripSelDragging && m.stripStartY > 0 && len(m.stripPlainLines) > 0 {
+			lineIdx := msg.Y - m.stripStartY
+			if lineIdx < 0 {
+				lineIdx = 0
+			}
+			if lineIdx >= len(m.stripPlainLines) {
+				lineIdx = len(m.stripPlainLines) - 1
+			}
+			m.stripSelEnd = lineIdx
+			return m, nil
+		}
 		localY := msg.Y - chatStartY
 		// Don't clamp here — HandleMouseDrag clamps internally to the
 		// visible item range so a drag past the bottom edge doesn't
@@ -332,6 +365,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Button != tea.MouseLeft ||
 			m.permActive || m.copyMode || m.activeScreen != nil ||
 			m.showHistory || m.showTaskPanel {
+			return m, nil
+		}
+		// 2026-05-24: finalize strip-area drag selection if one was in
+		// progress. Copy the plain-text of the selected range to
+		// clipboard; keep the highlight visible (claude-code parity —
+		// the user can cmd+C the same selection or click elsewhere to
+		// clear).
+		if m.stripSelDragging {
+			m.stripSelDragging = false
+			if m.stripSelStart >= 0 && m.stripSelEnd >= 0 && len(m.stripPlainLines) > 0 {
+				lo, hi := m.stripSelStart, m.stripSelEnd
+				if lo > hi {
+					lo, hi = hi, lo
+				}
+				if hi >= len(m.stripPlainLines) {
+					hi = len(m.stripPlainLines) - 1
+				}
+				if lo >= 0 && lo <= hi {
+					selected := m.stripPlainLines[lo : hi+1]
+					writeClipboard(strings.Join(selected, "\n"))
+				}
+			}
 			return m, nil
 		}
 		hadDrag := m.chatList.HandleMouseUp()

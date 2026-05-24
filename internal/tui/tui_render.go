@@ -290,13 +290,21 @@ func (m *Model) View() tea.View {
 	if m.showSearch {
 		lower.WriteString(renderTranscriptSearch(m))
 	}
+	// 2026-05-24: stripOffsetInLower records newlines in `lower` BEFORE
+	// the strip is appended. The actual Y in the final View is computed
+	// post-chatList-sizing (see "strip Y calculation" block after Phase 2)
+	// because chatList.Height() isn't known until then.
+	stripOffsetInLower := -1
 	if m.showTaskPanel {
 		lower.WriteString(renderTaskPanel(m))
+		m.stripStartY = -1
+		m.stripPlainLines = nil
 	} else {
 		// Sticky live todo strip — always-on compact view of the
 		// model's current focus + lookahead, when the Ctrl+T overlay
 		// isn't already showing the full list. Empty when the session
 		// has no todos. Image #1 user request 2026-05-17.
+		stripOffsetInLower = strings.Count(lower.String(), "\n")
 		lower.WriteString(renderStickyTaskStrip(m))
 	}
 	lower.WriteString(renderStatusBar(m))
@@ -332,6 +340,16 @@ func (m *Model) View() tea.View {
 	m.chatList.SetSize(w-2, desiredVp) // -2 for the scrollbar gutter
 	if m.stickyBottom && wasAtBottom {
 		m.chatList.ScrollToBottom()
+	}
+
+	// 2026-05-24: now that chatList is sized, compute the strip's actual
+	// Y in the final View output. Layout: header(headerLines) + listView
+	// (desiredVp lines) + 1 separator + upperLines + lower-pre-strip
+	// (stripOffsetInLower lines). Used by MouseClickMsg / MouseMotionMsg
+	// to derive `lineIdx := msg.Y - m.stripStartY` for in-strip drag
+	// selection (image 67 user feedback).
+	if stripOffsetInLower >= 0 {
+		m.stripStartY = headerLines + desiredVp + listSeparatorLines + upperLines + stripOffsetInLower
 	}
 
 	// Phase 3: stitch [header][listView][upper][lower] together.
