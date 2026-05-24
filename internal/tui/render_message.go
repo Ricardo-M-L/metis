@@ -372,6 +372,19 @@ func metisCodeBlockStyle() ansi.StyleConfig {
 	chroma.CommentPreproc = zero
 	cfg.CodeBlock.Chroma = &chroma
 
+	// 2026-05-23 user screenshot 61 feedback: assistant final answer
+	// rendered too dim — looked "folded" / collapsed. Root cause:
+	// glamour's DarkStyleConfig sets Document.Color = "252" (light
+	// grey, ANSI 256), which on dark terminals reads as muted/
+	// secondary rather than primary content. claude-code shows
+	// assistant text in terminal's default fg (bright white on
+	// standard dark themes). Clear the Color so glamour stops
+	// emitting the 252-grey ANSI prefix and the terminal default fg
+	// takes over.
+	doc := cfg.Document
+	doc.Color = nil
+	cfg.Document = doc
+
 	// Force ASCII table separators. glamour DarkStyleConfig leaves
 	// CenterSeparator/ColumnSeparator/RowSeparator nil, so lipgloss
 	// falls back to NormalBorder which uses `─ │ ┼` — all East Asian
