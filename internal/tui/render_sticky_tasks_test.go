@@ -8,9 +8,20 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// stripAnsiForTest peels ANSI CSI sequences so substring assertions
+// survive lipgloss's per-character escape wrapping (Strikethrough
+// styles in particular emit one CSI run per rune, so "Read source"
+// becomes "\x1b[...mR\x1b[m\x1b[...me\x1b[m...").
+var ansiCSIPattern = regexp.MustCompile(`\x1b\[[^a-zA-Z]*[a-zA-Z]`)
+
+func stripAnsiForTest(s string) string {
+	return ansiCSIPattern.ReplaceAllString(s, "")
+}
 
 // setupStickyTasksTestEnv sandboxes ~/.metis to a temp dir and seeds
 // the task file the sticky strip reads from. Returns the (model,
@@ -62,40 +73,50 @@ func TestStickyTaskStrip_InProgressOnTop(t *testing.T) {
 		{ID: "2", Status: "in_progress", Content: "Write parser"},
 		{ID: "3", Status: "pending", Content: "Add tests"},
 	})
-	out := renderStickyTaskStrip(m)
+	out := stripAnsiForTest(renderStickyTaskStrip(m))
 	if out == "" {
 		t.Fatalf("non-empty session should render")
 	}
 	iInProgress := strings.Index(out, "Write parser")
 	iPending := strings.Index(out, "Add tests")
-	iCompleted := strings.Index(out, "done")
+	// 2026-05-24: completed task no longer collapses into "1 done"
+	// rollup — claude-code-style inline strikethrough means we look
+	// for the actual content of the completed row.
+	iCompleted := strings.Index(out, "Read source")
 	if iInProgress < 0 || iPending < 0 || iCompleted < 0 {
 		t.Fatalf("strip missing expected rows: %q", out)
 	}
 	if !(iInProgress < iPending && iPending < iCompleted) {
-		t.Errorf("ordering should be in_progress → pending → done rollup; got positions: in_progress=%d pending=%d completed=%d in %q",
+		t.Errorf("ordering should be in_progress → pending → completed; got positions: in_progress=%d pending=%d completed=%d in %q",
 			iInProgress, iPending, iCompleted, out)
 	}
 }
 
-func TestStickyTaskStrip_CompletedRollsUpToCount(t *testing.T) {
-	// 7 completed items → one "7 done" row, never 7 separate rows.
-	// Cap exists so a long task history doesn't push the active
-	// row off-screen.
+func TestStickyTaskStrip_CompletedShownInlineUpToCap(t *testing.T) {
+	// 7 completed items → show stickyMaxCompleted (5) inline with
+	// strikethrough, collapse the remaining 2 into "+2 more done"
+	// trailer. Cap exists so a long task history doesn't push the
+	// active row off-screen, but each visible completion is still
+	// identifiable (mirrors claude-code's inline-strikethrough UX).
 	items := []TaskItem{
 		{ID: "active", Status: "in_progress", Content: "Working on X"},
 	}
 	for i := 0; i < 7; i++ {
-		items = append(items, TaskItem{ID: "done-" + string(rune('a'+i)), Status: "completed", Content: "finished step"})
+		items = append(items, TaskItem{
+			ID:      "done-" + string(rune('a'+i)),
+			Status:  "completed",
+			Content: "finished step " + string(rune('a'+i)),
+		})
 	}
 	m, _ := setupStickyTasksTestEnv(t, items)
-	out := renderStickyTaskStrip(m)
-	if !strings.Contains(out, "7 done") {
-		t.Errorf("expected '7 done' rollup; got: %q", out)
+	out := stripAnsiForTest(renderStickyTaskStrip(m))
+	if !strings.Contains(out, "+2 more done") {
+		t.Errorf("expected '+2 more done' trailer for excess beyond cap; got: %q", out)
 	}
-	// Should NOT contain 7 separate "finished step" rows
-	if strings.Count(out, "finished step") > 0 {
-		t.Errorf("completed item content should be hidden under rollup; got: %q", out)
+	// 5 inline rows (the most recent stickyMaxCompleted) — verify
+	// at least one is rendered with the unique content suffix.
+	if !strings.Contains(out, "finished step") {
+		t.Errorf("expected inline completed rows; got: %q", out)
 	}
 }
 

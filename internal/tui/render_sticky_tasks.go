@@ -44,6 +44,16 @@ import (
 // half the chat surface.
 const stickyMaxPending = 3
 
+// stickyMaxCompleted bounds how many DONE rows the sticky bar shows
+// inline before collapsing the rest into a "+N more done" trailer.
+// 5 keeps the strip visible on a typical 24-row terminal even when
+// every cap is hit (3 in-progress + 3 pending + 5 completed + 1
+// trailer + label = 13 rows worst case, leaves room for chat). User
+// feedback 2026-05-24 (image 63): the old "+N done" roll-up hid
+// what specifically was done; inline strikethrough rows mirror
+// claude-code's behaviour.
+const stickyMaxCompleted = 5
+
 // stickyContentWidth — character budget for a todo's content text
 // in the strip. Renderer truncates and adds an ellipsis if longer.
 // Held below renderTaskPanel's 40 so the strip stays visually
@@ -95,10 +105,23 @@ func renderStickyTaskStrip(m *Model) string {
 	}
 
 	// Cap pending lookahead — too many trailing items push the
-	// active row off-screen. Completed always rolls up to a single
-	// "+N done" line; user can hit Ctrl+T to see them in detail.
+	// active row off-screen.
 	if len(pending) > stickyMaxPending {
 		pending = pending[:stickyMaxPending]
+	}
+	// 2026-05-24: switched from "+N done" roll-up to claude-code-style
+	// inline strikethrough on the actual completed task contents.
+	// User feedback "得像 claude code 一样在原来的任务上画横线变灰"
+	// (image 63). Keep a screen-safety cap so a 40-task session doesn't
+	// flood the chat — show the most recent stickyMaxCompleted and
+	// roll any further excess into a small "+N more done" trailer.
+	completedTrailer := 0
+	if len(completed) > stickyMaxCompleted {
+		completedTrailer = len(completed) - stickyMaxCompleted
+		// Most-recent-N is the tail of the list (TodoList iteration
+		// order is insertion order; completed ones get pushed to the
+		// end when status flips).
+		completed = completed[len(completed)-stickyMaxCompleted:]
 	}
 
 	inProgStyle := lipgloss.NewStyle().Foreground(accentOrange).Bold(true)
@@ -106,6 +129,10 @@ func renderStickyTaskStrip(m *Model) string {
 	completedStyle := lipgloss.NewStyle().Foreground(accentGreen)
 	contentInProg := lipgloss.NewStyle().Foreground(textPrimary).Bold(true)
 	contentPending := styleText
+	// Completed content: dim + strikethrough — claude-code parity.
+	// textSecondary keeps the row readable but visually "done"; the
+	// strikethrough is the unambiguous "finished" signal.
+	contentCompleted := lipgloss.NewStyle().Foreground(textSecondary).Strikethrough(true)
 	label := styleMuted.Render("  tasks ")
 
 	var s strings.Builder
@@ -135,12 +162,19 @@ func renderStickyTaskStrip(m *Model) string {
 			contentPending.Render(truncateTodoContent(t.Content)),
 		)
 	}
-	// Roll up completed into one summary line so a 40-task session
-	// doesn't push the chat off-screen.
-	if n := len(completed); n > 0 {
+	// Completed: claude-code-style inline rows with strikethrough on
+	// the original content. Capped above to stickyMaxCompleted; any
+	// excess collapses into a "+N more done" trailer.
+	for _, t := range completed {
 		writeRow(
 			completedStyle.Render(glyphTaskCompleted+" "),
-			styleMuted.Render(fmt.Sprintf("%d done", n)),
+			contentCompleted.Render(truncateTodoContent(t.Content)),
+		)
+	}
+	if completedTrailer > 0 {
+		writeRow(
+			completedStyle.Render(glyphTaskCompleted+" "),
+			styleMuted.Render(fmt.Sprintf("+%d more done (use /tasks for full list)", completedTrailer)),
 		)
 	}
 
