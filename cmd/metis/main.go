@@ -1811,6 +1811,35 @@ func cmdRun(ctx context.Context, args []string) error {
 			fmt.Fprintf(os.Stderr,
 				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d cache_hit=%.1f%% duration_ms=%d stop_reason=%s\n",
 				totIn, totOut, totCacheRead, totCacheCreate, hitPct, time.Since(runStart).Milliseconds(), finalStop)
+
+			// 2026-05-24: persist the assistant tail to the session
+			// JSONL. Pre-fix, cmdRun only wrote the user prompt
+			// (line 1502) — the assistant message + every tool_use +
+			// tool_result that the loop produced lived only in
+			// memory, gone the moment the process exited. Resume of
+			// a `metis run` session saw only the user prompt and
+			// nothing else (user test 2026-05-24, session
+			// 8b6ddd95). The TUI's persistTail (tui_update.go:738)
+			// already handles this correctly for chat mode; this
+			// applies the same pattern to one-shot run mode so
+			// session files stay symmetric across modes.
+			//
+			// Walk back through History from the end to find the
+			// last user message; append every block after it. Empty
+			// no-op when there's nothing to flush (loop hadn't
+			// recorded the prompt yet — shouldn't happen post-
+			// LoopDone but safer to be defensive).
+			if rt.store != nil && rt.sessionID != "" {
+				hist := rt.loop.History()
+				for i := len(hist) - 1; i >= 0; i-- {
+					if hist[i].Role == llm.RoleUser && len(hist[i].Content) > 0 && hist[i].Content[0].Type == "text" {
+						for j := i + 1; j < len(hist); j++ {
+							_ = rt.store.AppendMessage(rt.sessionID, hist[j])
+						}
+						break
+					}
+				}
+			}
 		case agent.EventError:
 			return ev.Err
 		}
