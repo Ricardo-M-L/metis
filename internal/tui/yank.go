@@ -25,7 +25,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -290,3 +292,36 @@ func (m *Model) yankFullTranscript() string {
 	return fmt.Sprintf("(copied transcript — %d chars across %d turn(s) via %s)",
 		len(b), turns, osc52Status())
 }
+
+// plainStickyStripText renders the current sticky tasks strip and
+// strips ANSI escapes so the resulting plain text is suitable for
+// clipboard. Returns empty when the strip would be empty (no tasks
+// active). Called from the MouseClickMsg "click in strip area"
+// shortcut so the user can grab the visible task list without
+// keyboard tricks (image 67 feedback 2026-05-24).
+func plainStickyStripText(m *Model) string {
+	if m == nil {
+		return ""
+	}
+	raw := renderStickyTaskStrip(m)
+	if raw == "" {
+		return ""
+	}
+	// Strip CSI sequences and trim trailing whitespace per line so
+	// the clipboard payload is exactly what the user sees, minus
+	// styling. lipgloss emits one ANSI run per cell when strikethrough
+	// is active (claude-code-parity todo done rows); the regex handles
+	// both compact and per-cell forms.
+	out := ansiCSIInTUI.ReplaceAllString(raw, "")
+	lines := strings.Split(out, "\n")
+	for i, ln := range lines {
+		lines[i] = strings.TrimRight(ln, " \t\r")
+	}
+	out = strings.Join(lines, "\n")
+	return strings.TrimRight(out, "\n")
+}
+
+// ansiCSIInTUI matches a CSI escape sequence: ESC '[' params CMD.
+// Covers SGR (color, bold, strikethrough) which is all the strip
+// renderer emits.
+var ansiCSIInTUI = regexp.MustCompile(`\x1b\[[^a-zA-Z]*[a-zA-Z]`)

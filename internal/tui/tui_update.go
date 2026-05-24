@@ -261,7 +261,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		localY := msg.Y - chatStartY
-		if localY < 0 || localY >= m.chatList.Height() {
+		if localY < 0 {
+			return m, nil
+		}
+		if localY >= m.chatList.Height() {
+			// 2026-05-24: click landed BELOW the chat list — inside the
+			// sticky strip / status chrome (image #67 user feedback:
+			// blue-boxed area unselectable). Pre-fix the event was
+			// dropped silently; now we copy the strip's plain-text
+			// content to the clipboard so users can grab the visible
+			// task list without keyboard tricks. One-shot:
+			// click anywhere in the strip → whole strip text → clipboard
+			// + info row "copied strip to clipboard".
+			plain := plainStickyStripText(m)
+			if plain != "" {
+				writeClipboard(plain)
+				m.messages = append(m.messages, Message{
+					Role:      "info",
+					Content:   fmt.Sprintf("copied %d chars from sticky strip", len(plain)),
+					Timestamp: time.Now(),
+				})
+			}
 			return m, nil
 		}
 		// Click-count tracking — same algorithm as crush's chat.go.
