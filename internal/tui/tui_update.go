@@ -265,22 +265,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if localY >= m.chatList.Height() {
-			// 2026-05-24: click landed BELOW the chat list — inside the
-			// sticky strip / status chrome (image #67 user feedback:
-			// blue-boxed area unselectable). Pre-fix the event was
-			// dropped silently; now we copy the strip's plain-text
-			// content to the clipboard so users can grab the visible
-			// task list without keyboard tricks. One-shot:
-			// click anywhere in the strip → whole strip text → clipboard
-			// + info row "copied strip to clipboard".
+			// 2026-05-24 second pass (image 67 feedback): the previous
+			// fix appended a "copied N chars" info row to chat on
+			// every click — five clicks left five lines of confirmation
+			// noise in the transcript. Switched to SILENT copy
+			// (same pattern as copySelectionAndReport's claude-code-
+			// parity rationale: copy is a low-ceremony action, the
+			// clipboard write IS the success signal).
 			plain := plainStickyStripText(m)
 			if plain != "" {
 				writeClipboard(plain)
-				m.messages = append(m.messages, Message{
-					Role:      "info",
-					Content:   fmt.Sprintf("copied %d chars from sticky strip", len(plain)),
-					Timestamp: time.Now(),
-				})
 			}
 			return m, nil
 		}
