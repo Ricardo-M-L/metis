@@ -26,6 +26,47 @@ import (
 var exitFunc = os.Exit
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// 2026-05-26: ESC during a running turn must always cancel the turn,
+	// taking priority over every overlay-dismissal handler below. User
+	// screenshot showed a slash-command palette open while a python3
+	// tool call was executing; pressing ESC twice failed to stop the
+	// task because:
+	//   1st ESC → palette intercept (line ~58) closed palette + reset
+	//             input, never reached the turnCancel branch
+	//   2nd ESC → palette already closed, finally reached turnCancel,
+	//             but by then the user perception is "two ESCs and
+	//             it's still running" (the model may have already
+	//             emitted the next tool call by the time the second
+	//             ESC arrives)
+	// claude-code's contract — and the spinner hint "press esc to
+	// interrupt" — both imply ESC is the one true cancel key when a
+	// turn is in flight. Honour that BEFORE any overlay logic.
+	if m.turnCancel != nil && msg.String() == "esc" {
+		m.turnCancel()
+		m.turnCancel = nil
+		// Close any open overlays so the user lands at a clean prompt
+		// after the cancel — otherwise they'd see "interrupted" stacked
+		// under a still-open palette / search / @-mention dropdown.
+		m.showPalette = false
+		m.palFilter = ""
+		m.showSearch = false
+		m.atActive = false
+		queueCleared := len(m.queuedPrompts)
+		m.queuedPrompts = nil
+		m.queuePending = false
+		msg2 := "interrupted (esc)"
+		if queueCleared > 0 {
+			msg2 = fmt.Sprintf("interrupted (esc) · dropped %d queued", queueCleared)
+		}
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   msg2,
+			Timestamp: time.Now(),
+		})
+		m.lastEsc = time.Time{}
+		return m, nil
+	}
+
 	if m.permActive {
 		// Permission prompt consumes ONLY navigation/decision keys
 		// (arrows, enter/space, esc). Any other key falls through to
@@ -411,34 +452,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			vimModeState = vimNormal
 			return m, nil
 		}
-		// 2026-05-23: when a turn is in flight, ESC cancels it —
-		// matches claude-code behavior and what the spinner's hint
-		// "press esc to interrupt" promises. Pre-fix ESC only ever
-		// touched the input box; the user with a hung deepseek
-		// stream (image #59 — 19m44s stuck spinner) hit ESC ESC
-		// expecting to bail out and got nothing. Now the first ESC
-		// during a live turn delivers the cancellation; subsequent
-		// double-tap-clear logic only fires when no turn is running.
-		if m.turnCancel != nil {
-			m.turnCancel()
-			m.turnCancel = nil
-			// Drop queued prompts so the cancellation actually stops
-			// everything (parity with Ctrl+C handler above).
-			queueCleared := len(m.queuedPrompts)
-			m.queuedPrompts = nil
-			m.queuePending = false
-			msg2 := "interrupted (esc)"
-			if queueCleared > 0 {
-				msg2 = fmt.Sprintf("interrupted (esc) · dropped %d queued", queueCleared)
-			}
-			m.messages = append(m.messages, Message{
-				Role:      "info",
-				Content:   msg2,
-				Timestamp: time.Now(),
-			})
-			m.lastEsc = time.Time{}
-			return m, nil
-		}
+		// Turn-in-flight ESC cancel was moved to the very top of
+		// handleKey on 2026-05-26 so overlay handlers (palette,
+		// askUser, search, at-mention) can no longer swallow it. If
+		// we reach this case branch it means no turn is running, so
+		// we only do palette-dismiss + double-tap-clear here.
 		// Single ESC: dismiss palette / pending state, leave typed
 		// input alone. Double-tap (within doubleEscWindow): clear the
 		// input completely. Mirrors claude-code's "double tap esc to
