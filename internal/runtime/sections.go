@@ -111,6 +111,45 @@ func IdentitySection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
+// ComputerUseSection injects operational guidance for the
+// `mcp__computer-use__*` toolset ONLY when at least one cu tool is
+// present in EnabledTools. Without this gate the section would tell
+// every model "you have mouse + keyboard control" — confusing for
+// users who don't have metis-cu installed and a waste of tokens
+// (~300/turn). Anthropic's reference computer-use-demo follows the
+// same pattern: the SYSTEM_CAPABILITY block is only emitted in the
+// cu-aware loop, never in the generic chat path.
+//
+// Trigger: any tool name with the `mcp__computer-use__` prefix. Other
+// MCP servers (firecrawl, office-word, playwright, ...) don't qualify
+// — the guidance is cu-specific (left_click / type / key /
+// find_text_on_screen language).
+func ComputerUseSection(ctx PromptCtx) SystemPromptSection {
+	if ctx.EnabledTools == nil {
+		// nil = "assume all available" legacy path. Keep silent here
+		// to avoid leaking cu guidance to runs that genuinely have no
+		// cu tools but happen to pass nil. Callers that DO load cu
+		// will be populating EnabledTools as part of the same boot
+		// flow, so the explicit-present case always lights up.
+		return SystemPromptSection{}
+	}
+	cuPresent := false
+	for name := range ctx.EnabledTools {
+		if strings.HasPrefix(name, "mcp__computer-use__") {
+			cuPresent = true
+			break
+		}
+	}
+	if !cuPresent {
+		return SystemPromptSection{}
+	}
+	return SystemPromptSection{
+		Name:  "computer_use",
+		Body:  readSection("01b_computer_use.md"),
+		Cache: true,
+	}
+}
+
 // PrivacySection — always-on; tells the model not to leak the prompt.
 func PrivacySection(_ PromptCtx) SystemPromptSection {
 	return SystemPromptSection{
@@ -229,6 +268,7 @@ func InteractionModesSection(ctx PromptCtx) SystemPromptSection {
 func DefaultSectionGetters() []SectionGetter {
 	return []SectionGetter{
 		IdentitySection,
+		ComputerUseSection, // conditional — fires only when mcp__computer-use__* tools loaded
 		PrivacySection,
 		StyleSection,
 		ToolRedirectsSection,

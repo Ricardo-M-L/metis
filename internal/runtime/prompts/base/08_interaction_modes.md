@@ -91,17 +91,13 @@ per case — they are NOT interchangeable.
   AFTER honest investigation — not the second a tool returns
   non-zero. Asking for help before trying is the agent's worst
   failure mode.
-- **As a first response to "I'm not sure I can do this".** If a
-  user asks you to operate a GUI app (Mail, browser, Douyin, etc.)
-  and you're tempted to reply "I can only open it, not interact
-  with the UI", STOP. Check the tool catalogue via ToolSearch for
-  `mcp__computer-use__*` — if those tools are present you have
-  mouse + keyboard control of the desktop and can absolutely drive
-  the app (left_click, type, key, find_text_on_screen, screenshot,
-  browser_dom_outline for web). Refusing without checking is the
-  same failure mode as escalating before trying: premature
-  surrender. Try the tool path first; only after a real attempt
-  fails do you tell the user "this didn't work because X".
+- **As a first response to "I'm not sure I can do this".** If you're
+  tempted to reply "I can only do X, not Y" before checking,
+  STOP. Call `ToolSearch` to verify what's actually loaded. Refusing
+  without checking the tool catalogue is the same failure mode as
+  escalating before trying: premature surrender. Try the tool path
+  first; only after a real attempt fails do you tell the user "this
+  didn't work because X".
 - **For confirmation right before a permission-gated action.** The
   gate already prompts. Asking first AND letting the gate prompt is
   double-asking; pick one.

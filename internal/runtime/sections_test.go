@@ -88,17 +88,18 @@ func TestReversibilitySection_SubAgentSkipped(t *testing.T) {
 func TestDefaultSectionGetters_Ordered(t *testing.T) {
 	getters := DefaultSectionGetters()
 	wantNames := []string{
-		"identity", "privacy", "style", "tool_redirects",
+		"identity", "computer_use", "privacy", "style", "tool_redirects",
 		"working_efficiently", "skills", "reversibility",
 		"interaction_modes",
 	}
 	if len(getters) != len(wantNames) {
 		t.Fatalf("expected %d getters, got %d", len(wantNames), len(getters))
 	}
-	// Drive them with a maximal ctx that fires every section.
+	// Drive them with a maximal ctx that fires every section, including
+	// a mcp__computer-use__* tool name so ComputerUseSection lights up.
 	ctx := PromptCtx{
 		Model:        "x",
-		EnabledTools: map[string]bool{"Bash": true},
+		EnabledTools: map[string]bool{"Bash": true, "mcp__computer-use__screenshot": true},
 		HasSkills:    true,
 	}
 	for i, getter := range getters {
