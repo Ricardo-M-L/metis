@@ -816,7 +816,22 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		SessionID: m.sessionID, Input: text, Source: "tui",
 	})
 	m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
-	m.toolEvents = nil
+	// 2026-05-25: do NOT wipe m.toolEvents on each new submit. Pre-fix
+	// behaviour cleared every prior turn's tool calls the moment the
+	// user typed a new prompt — the second turn collapsed to just the
+	// model's narration + "thought-summary" + "recap" rows, hiding
+	// the actual bash/edit/read tool history that produced the answer
+	// (user image 70→71 feedback: same turn looked complete with all
+	// the tool rows visible, then on next submit the rows disappeared
+	// leaving only italic narration bullets). claude-code preserves
+	// every tool call in the transcript for the lifetime of the
+	// session; chatList virtualisation handles the row count fine
+	// (setMaxMounted caps mounted item count for render perf, the
+	// underlying slice can grow unbounded).
+	//
+	// streamingText cleared on each turn boundary so the new turn's
+	// in-flight assistant text doesn't visually concatenate with the
+	// previous turn's tail (that one is intentional and unchanged).
 	m.streamingText = ""
 	m.turnActive = true
 	m.spinnerActive = true
