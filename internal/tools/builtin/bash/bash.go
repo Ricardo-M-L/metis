@@ -330,6 +330,17 @@ func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 	if r := CheckCommand(cmd); !r.Allow {
 		return tools.PermissionDeny, "bash-security rule #" + itoa(r.RuleID) + ": " + r.Reason
 	}
+	// sandbox auto-allow: when the user opted into the macOS Seatbelt
+	// wrapper AND asked for auto-allow, the gate is short-circuited
+	// to PermissionAllow. The kernel-level sandbox is the safety
+	// boundary here — asking the user to also click "yes" on every
+	// call is double-confirming. claude-code parity for image #76
+	// option 1 ("Sandbox BashTool, with auto-allow"). Adversarial
+	// pre-check above still runs, so jailbreak attempts are NOT
+	// auto-approved.
+	if SandboxModeAutoApprovesGate(effectiveMode(b.settings.Sandbox.Mode)) {
+		return tools.PermissionAllow, "sandbox auto-allow"
+	}
 	d, src := b.gate.Check(context.Background(), "Bash", cmd)
 	return mapDecision(d), src
 }
@@ -471,6 +482,18 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	// (CwdFromContext returns "" when no override is set).
 	if cwd := agent.CwdFromContext(ctx); cwd != "" {
 		exe.Dir = cwd
+	}
+	// Wrap in macOS Seatbelt sandbox when configured. No-op for
+	// mode=off, the legacy default. cwd is whichever Dir we just
+	// set (or the process cwd) so the file-write allowlist is
+	// scoped correctly.
+	if wrapped, err := applySandboxWrap(cctx, exe, effectiveMode(b.settings.Sandbox.Mode), exe.Dir); err != nil {
+		return &tools.Result{
+			Output:  "sandbox wrap failed: " + err.Error(),
+			IsError: true,
+		}, nil
+	} else {
+		exe = wrapped
 	}
 	// Put the bash leader + its children in their own process group so
 	// kill-on-promote (Adopt path) tree-kills cleanly. Effectively a
@@ -637,6 +660,20 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 		exe.Dir = cwd
 	}
 	jobs.ApplyProcessGroup(exe)
+
+	// Sandbox the background subprocess the same way the foreground
+	// path does. Background jobs outlive the foreground turn but the
+	// sandbox restrictions don't expire with the context, so the
+	// wrap is just as effective.
+	if wrapped, err := applySandboxWrap(bgCtx, exe, effectiveMode(b.settings.Sandbox.Mode), exe.Dir); err != nil {
+		cancel()
+		return &tools.Result{
+			Output:  "sandbox wrap failed: " + err.Error(),
+			IsError: true,
+		}, nil
+	} else {
+		exe = wrapped
+	}
 
 	jb, err := b.Jobs.Spawn(jobs.SpawnArgs{
 		Command: cmdStr,

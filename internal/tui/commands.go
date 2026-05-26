@@ -152,6 +152,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Permissions ===
 	r.Register(REPLCommand{Name: "mode", Description: "show or set permission mode (ask|auto|bypass|deny)", Handler: cmdMode})
 	r.Register(REPLCommand{Name: "allow", Description: "allow a tool permanently (e.g. allow Bash)", Handler: cmdAllow})
+	r.Register(REPLCommand{Name: "sandbox", Description: "Bash sandbox (macOS Seatbelt): status | off | permissions | auto-allow", Handler: cmdSandbox})
 
 	// === System ===
 	r.Register(REPLCommand{Name: "compact", Description: "force context compaction now", Handler: cmdCompact})

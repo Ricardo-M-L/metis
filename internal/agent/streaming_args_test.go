@@ -305,3 +305,91 @@ func TestConsumeStream_ToolUseStopShorterKeepsCurJSON(t *testing.T) {
 		t.Errorf("path = %q, want %q (longer curJSON wins)", path, "internal/jobs/jobs.go")
 	}
 }
+
+// TestConsumeStream_UnwrapsMinimaxBundledArgs — 2026-05-26 regression
+// for session 87e366fa. MiniMax-M2.7 anthropic-shim emits cu mouse_move
+// tool calls as `{"_": "{\"x\":735,\"y\":130}"}` instead of the spec
+// `{"x":735,"y":130}` shape, and every cu call subsequently failed
+// with `missing required field: x`. The stream consumer must now
+// unwrap that bundle before the tool dispatcher sees it.
+func TestConsumeStream_UnwrapsMinimaxBundledArgs(t *testing.T) {
+	bundled := `{"_": "{\"x\":735,\"y\":130}"}`
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "mcp__computer-use__mouse_move"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: bundled},
+		{Type: "tool_use_stop", ToolUseID: "t1", InputDelta: bundled},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	var toolBlock *llm.ContentBlock
+	for i := range blocks {
+		if blocks[i].Type == "tool_use" {
+			toolBlock = &blocks[i]
+		}
+	}
+	if toolBlock == nil {
+		t.Fatalf("no tool_use block; blocks=%+v", blocks)
+	}
+	if _, isWrapper := toolBlock.ToolInput["_"]; isWrapper {
+		t.Fatalf("MiniMax `_` wrapper survived to dispatcher; got %+v", toolBlock.ToolInput)
+	}
+	if x, _ := toolBlock.ToolInput["x"].(float64); x != 735 {
+		t.Errorf("x = %v, want 735 (unwrap should expose the embedded field)", toolBlock.ToolInput["x"])
+	}
+	if y, _ := toolBlock.ToolInput["y"].(float64); y != 130 {
+		t.Errorf("y = %v, want 130 (unwrap should expose the embedded field)", toolBlock.ToolInput["y"])
+	}
+}
+
+// TestConsumeStream_DoesNotUnwrapNormalArgs — defensive twin of the
+// regression above: a well-formed cu screenshot call must NOT be
+// touched by the unwrap path. Pins the "保证别影响别的模型" guarantee
+// at the stream level so a future refactor of argsunwrap's guard can't
+// silently widen the trigger.
+func TestConsumeStream_DoesNotUnwrapNormalArgs(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "Read"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `{"path":"/tmp/foo.go"}`},
+		{Type: "tool_use_stop", ToolUseID: "t1", InputDelta: `{"path":"/tmp/foo.go"}`},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	var toolBlock *llm.ContentBlock
+	for i := range blocks {
+		if blocks[i].Type == "tool_use" {
+			toolBlock = &blocks[i]
+		}
+	}
+	if toolBlock == nil {
+		t.Fatalf("no tool_use block; blocks=%+v", blocks)
+	}
+	if path, _ := toolBlock.ToolInput["path"].(string); path != "/tmp/foo.go" {
+		t.Errorf("normal args were tampered with; got %+v", toolBlock.ToolInput)
+	}
+}

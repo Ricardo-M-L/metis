@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/argsunwrap"
 )
 
 // usageTotals holds the input / output token tallies a streaming response
@@ -69,7 +70,13 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		if curJSON != "" {
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(curJSON), &parsed); err == nil {
-				curTool.ToolInput = parsed
+				// MiniMax-M2.7 anthropic-shim wraps args as
+				// {"_": "<json-object-string>"} (session 87e366fa);
+				// argsunwrap is a no-op for every well-formed shape so
+				// applying it unconditionally is safe across providers.
+				// See internal/llm/argsunwrap/argsunwrap.go for the
+				// structural guard.
+				curTool.ToolInput = argsunwrap.Unwrap(parsed)
 			} else {
 				curTool.ToolInput = map[string]any{"_raw": curJSON}
 			}

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm/argsunwrap"
 	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
@@ -770,8 +771,13 @@ func fromAnthropic(resp anthropicResp) *Response {
 		case "text":
 			out.Content = append(out.Content, ContentBlock{Type: "text", Text: c.Text})
 		case "tool_use":
+			// MiniMax-style {"_": "<json-string>"} bundle gets
+			// unwrapped here; argsunwrap is a structural no-op for
+			// every other provider, so this stays safe for native
+			// Anthropic / OpenRouter / Yunwu etc. (session 87e366fa).
 			out.Content = append(out.Content, ContentBlock{
-				Type: "tool_use", ToolUseID: c.ID, ToolName: c.Name, ToolInput: c.Input,
+				Type: "tool_use", ToolUseID: c.ID, ToolName: c.Name,
+				ToolInput: argsunwrap.Unwrap(c.Input),
 			})
 		}
 	}

@@ -566,6 +566,16 @@ type SandboxBashSettings struct {
 	Network                 string   `toml:"network"` // "default" | "block"
 	DangerouslyInheritEnv   bool     `toml:"dangerously_inherit_env"`
 	DangerouslyAllowNetwork bool     `toml:"dangerously_allow_network"`
+
+	// Mode selects the macOS Seatbelt (sandbox-exec) wrapper applied
+	// to bash subprocesses. One of "off" (default — direct spawn,
+	// backwards compatible) / "permissions" (Seatbelt profile with
+	// global read + cwd/temp/~/.metis write) / "auto-allow" (same
+	// profile + permission gate auto-approves). See
+	// internal/tools/builtin/bash/sandbox_darwin.go for the profile
+	// content. Non-macOS platforms reject anything other than "off"
+	// with a clear error rather than silently running unsandboxed.
+	Mode string `toml:"mode"`
 }
 
 // Home returns the directory metis treats as its single source of truth.
