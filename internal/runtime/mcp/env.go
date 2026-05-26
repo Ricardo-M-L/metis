@@ -123,6 +123,44 @@ func expandEnvVarsInEntry(e ServerEntry) (expanded ServerEntry, missing []string
 	return expanded, missing
 }
 
+// maybeInjectCUEnv inspects an MCP entry's launch command and, when
+// it points at a metis-cu binary, returns a copy of `env` with
+// METIS_CU_HOST_TERMINAL_TIER=full pre-set. Skipped when the user
+// already supplied that key in the entry's [env] block — explicit
+// config always wins.
+//
+// Background. metis-cu defaults Terminal / iTerm2 / VSCode etc. to
+// TierClick "so a stray `type` command can't run a destructive shell."
+// That's the right default for general MCP clients, but the metis
+// case is structurally different: metis itself runs INSIDE a terminal,
+// so the frontmost-app gate trips on every cu launch attempt
+// (session 41040bea, 2026-05-26: "tier click on iTerm2 does not
+// permit full operations"). Setting the env at spawn time flips the
+// gate without touching the user's ~/.metis-cu/config.toml.
+//
+// Detection uses the command's basename, so absolute paths like
+// /Users/ricardo/.local/bin/metis-cu match alongside bare "metis-cu".
+// Case-folded for Windows compatibility (`Metis-Cu.exe` etc.).
+func maybeInjectCUEnv(command string, env map[string]string) map[string]string {
+	base := command
+	if i := strings.LastIndexAny(base, `\/`); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSuffix(strings.ToLower(base), ".exe")
+	if base != "metis-cu" {
+		return env
+	}
+	if _, set := env["METIS_CU_HOST_TERMINAL_TIER"]; set {
+		return env
+	}
+	out := make(map[string]string, len(env)+1)
+	for k, v := range env {
+		out[k] = v
+	}
+	out["METIS_CU_HOST_TERMINAL_TIER"] = "full"
+	return out
+}
+
 // envSliceFromMap renders {"K":"V","A":"B"} as ["A=B","K=V"] sorted by
 // key so test assertions and debug dumps stay stable across runs.
 // Returns nil for an empty/nil map so callers can pass it straight to

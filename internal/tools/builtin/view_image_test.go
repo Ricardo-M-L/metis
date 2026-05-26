@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,6 +161,71 @@ func TestViewImage_DirectoryRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "directory") {
 		t.Errorf("error should mention directory; got %q", err.Error())
+	}
+}
+
+// TestViewImage_OversizeAutoResized — 2026-05-26 regression for
+// session 41040bea: a 2940×1912 Retina screencapture (≈5.6 MiB after
+// PNG encode, well above the 5 MiB base64 cap) used to be hard-
+// rejected with "exceeds the 5120 KiB cap. Resize the image…",
+// forcing the model into 8 rounds of `screencapture + sips -Z 1200`
+// before it could see the screen. The fix wires the same
+// imageprep.Preprocess pipeline the Ctrl+V paste flow uses, so the
+// tool auto-resizes oversize inputs to ≤1568×1568 (PNG → PNG when it
+// fits, else JPEG q=80) and only rejects what still won't fit.
+//
+// This test pins:
+//   - oversize input is NOT IsError-rejected
+//   - the resulting attachment is ≤ the 5 MiB base64 cap
+//   - the output summary mentions auto-resize so the model knows
+//     not to retry with a manual sips
+func TestViewImage_OversizeAutoResized(t *testing.T) {
+	dir := t.TempDir()
+	// 2940×1912 filled with true-random RGB bytes so PNG zlib can't
+	// compress it under the cap. Deterministic seed keeps the test
+	// reproducible across runs without flaking on size boundaries.
+	w, h := 2940, 1912
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	rng := rand.New(rand.NewPCG(0xCAFE, 0xBEEF))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{
+				R: uint8(rng.UintN(256)),
+				G: uint8(rng.UintN(256)),
+				B: uint8(rng.UintN(256)),
+				A: 255,
+			})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("png.Encode: %v", err)
+	}
+	if buf.Len() < 4*1024*1024 {
+		t.Fatalf("test setup: oversize PNG should be ≥4 MiB raw to exercise the cap; got %d B", buf.Len())
+	}
+	path := filepath.Join(dir, "huge.png")
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	v := ViewImage{gate: permission.New(permission.ModeBypass)}
+	res, err := v.Execute(context.Background(), map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("oversize PNG should auto-resize, not error; Output=%q", res.Output)
+	}
+	if len(res.Images) != 1 {
+		t.Fatalf("expected 1 attachment after auto-resize; got %d", len(res.Images))
+	}
+	if len(res.Images[0].Data) > viewImageMaxBase64Bytes {
+		t.Errorf("resized attachment %d B base64 still exceeds %d B cap",
+			len(res.Images[0].Data), viewImageMaxBase64Bytes)
+	}
+	if !strings.Contains(res.Output, "auto-resize") {
+		t.Errorf("Output should mention auto-resize so model knows not to retry manually; got %q", res.Output)
 	}
 }
 

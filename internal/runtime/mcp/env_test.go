@@ -267,3 +267,72 @@ func TestSetReservedComputerUseServer_RoundTrip(t *testing.T) {
 		t.Errorf("set should not duplicate; got %d entries", len(reg.Servers))
 	}
 }
+
+// TestMaybeInjectCUEnv_AddsTierForMetisCu — 2026-05-26: every metis-cu
+// MCP spawn should auto-set METIS_CU_HOST_TERMINAL_TIER=full so the
+// frontmost-app tier gate (terminal app = TierClick) doesn't reject
+// `open_application` and friends. Covers basename detection across
+// bare command, absolute path, and Windows .exe.
+func TestMaybeInjectCUEnv_AddsTierForMetisCu(t *testing.T) {
+	for _, cmd := range []string{
+		"metis-cu",
+		"/Users/ricardo/.local/bin/metis-cu",
+		"C:\\bin\\metis-cu.exe",
+		"Metis-Cu.exe", // case-insensitive
+	} {
+		out := maybeInjectCUEnv(cmd, nil)
+		if got := out["METIS_CU_HOST_TERMINAL_TIER"]; got != "full" {
+			t.Errorf("cmd=%q: tier env = %q, want full", cmd, got)
+		}
+	}
+}
+
+// TestMaybeInjectCUEnv_LeavesOthersAlone — only metis-cu spawns
+// should pick up the override. Defensive: a regression here would
+// silently inject the env into unrelated MCP servers (firecrawl,
+// playwright, office-word, ...) and could break their config.
+func TestMaybeInjectCUEnv_LeavesOthersAlone(t *testing.T) {
+	for _, cmd := range []string{
+		"npx",
+		"uvx",
+		"python3",
+		"/usr/local/bin/firecrawl-mcp",
+		"playwright-mcp",
+	} {
+		out := maybeInjectCUEnv(cmd, map[string]string{"FOO": "bar"})
+		if _, set := out["METIS_CU_HOST_TERMINAL_TIER"]; set {
+			t.Errorf("cmd=%q: must NOT inject tier env into non-metis-cu spawns", cmd)
+		}
+		// Existing entries must round-trip untouched.
+		if out["FOO"] != "bar" {
+			t.Errorf("cmd=%q: existing env dropped; got %v", cmd, out)
+		}
+	}
+}
+
+// TestMaybeInjectCUEnv_RespectsUserOverride — the user setting
+// METIS_CU_HOST_TERMINAL_TIER explicitly in their [env] block must
+// win over our default. The user might want "read" for a paranoid
+// sandboxed run, or "click" to opt back into the historical default.
+func TestMaybeInjectCUEnv_RespectsUserOverride(t *testing.T) {
+	in := map[string]string{"METIS_CU_HOST_TERMINAL_TIER": "click"}
+	out := maybeInjectCUEnv("metis-cu", in)
+	if got := out["METIS_CU_HOST_TERMINAL_TIER"]; got != "click" {
+		t.Errorf("user-set tier should be preserved; got %q want click", got)
+	}
+}
+
+// TestMaybeInjectCUEnv_NilInputSafe — defensive: a nil env map is
+// the common case (most users don't set [env] at all) and must not
+// panic when we add the tier key.
+func TestMaybeInjectCUEnv_NilInputSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("nil env caused panic: %v", r)
+		}
+	}()
+	out := maybeInjectCUEnv("metis-cu", nil)
+	if out["METIS_CU_HOST_TERMINAL_TIER"] != "full" {
+		t.Errorf("nil env case lost the tier injection")
+	}
+}

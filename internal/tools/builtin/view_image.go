@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Ricardo-M-L/metis/internal/imageprep"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
@@ -16,11 +17,12 @@ import (
 
 // viewImageMaxBase64Bytes caps the base64-encoded payload at 5 MiB.
 // That matches the chat-side ceiling enforced in
-// internal/tui/image_paste.go::loadAndPrepImage, keeping the vision
-// pipeline bounded on both ingest paths (user paste vs. tool read).
-// Raise both constants in lock-step if a future provider supports
-// larger inline images and Anthropic raises its 5 MiB cap.
-const viewImageMaxBase64Bytes = 5 * 1024 * 1024
+// internal/tui/image_paste.go::loadAndPrepImage and the shared
+// imageprep package, keeping the vision pipeline bounded on every
+// ingest path (user paste, tool read, future drag-drop). All three
+// constants are wired to imageprep.MaxBase64Bytes so they move in
+// lock-step.
+const viewImageMaxBase64Bytes = imageprep.MaxBase64Bytes
 
 // supportedImageMime is the closed allow-list of media types every
 // vision-capable provider accepts. Anthropic + OpenAI both speak
@@ -68,9 +70,10 @@ Hard requirements:
   - ` + "`path`" + ` MUST be a regular file. Relative paths are resolved against
     the agent's cwd; the response always echoes the absolute path.
   - Supported MIME: png, jpeg, gif, webp. Other types are rejected.
-  - Base64-encoded payload cap: 5 MiB. Larger images are rejected
-    with a hint to resize; there's no automatic downsampling on this
-    path (unlike the TUI paste pipeline which compresses).
+  - Base64-encoded payload cap: 5 MiB. Oversize images are automatically
+    decoded, resized to fit 1568×1568 and re-encoded (PNG → PNG when it
+    fits, else JPEG q=80). Same pipeline the TUI paste path uses.
+    Only files that still won't fit after that fallback are rejected.
 
 The textual ` + "`Output`" + ` is a one-line summary (path, byte size,
 MIME). The actual visual data rides on the ` + "`Images`" + ` attachment that
@@ -103,11 +106,11 @@ func (v ViewImage) CanUse(_ context.Context, in map[string]any) (tools.Permissio
 }
 
 func (ViewImage) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	raw, _ := in["path"].(string)
-	if raw == "" {
+	rawPath, _ := in["path"].(string)
+	if rawPath == "" {
 		return nil, errors.New("path required")
 	}
-	abs := raw
+	abs := rawPath
 	if !filepath.IsAbs(abs) {
 		if resolved, err := filepath.Abs(abs); err == nil {
 			abs = resolved
@@ -120,17 +123,17 @@ func (ViewImage) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 	if info.IsDir() {
 		return nil, fmt.Errorf("%s is a directory, not a file", abs)
 	}
-	bytes, err := os.ReadFile(abs)
+	raw, err := os.ReadFile(abs)
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	if len(bytes) == 0 {
+	if len(raw) == 0 {
 		return nil, fmt.Errorf("%s is empty", abs)
 	}
 	// http.DetectContentType sniffs the first 512 bytes; reliable for
 	// the four image types we accept, returns "application/octet-stream"
 	// for anything else (which falls through to the unsupported branch).
-	mime := http.DetectContentType(bytes)
+	mime := http.DetectContentType(raw)
 	if _, ok := supportedImageMime[mime]; !ok {
 		return &tools.Result{
 			Output: fmt.Sprintf(
@@ -140,18 +143,54 @@ func (ViewImage) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 			IsError: true,
 		}, nil
 	}
-	encoded := base64.StdEncoding.EncodeToString(bytes)
+
+	// 2026-05-26 — try the cheap path first (pass raw bytes through
+	// unchanged when they already fit the 5 MiB base64 cap AND the
+	// decoded image is ≤ 1568px on each side, mirroring imageprep's
+	// own RawTarget/MaxPixelSide check). When the cheap path would
+	// trip the cap we route through imageprep.Preprocess (decode →
+	// resize → re-encode → JPEG q=80 fallback), the same pipeline the
+	// Ctrl+V paste flow uses. Resolves session 41040bea where a
+	// 2940×1912 Retina screencapture → ViewImage → reject loop forced
+	// the model into 8 rounds of `screencapture + sips -Z 1200` before
+	// it could see the screen at all.
+	outBytes := raw
+	outMime := mime
+	encoded := base64.StdEncoding.EncodeToString(outBytes)
 	if len(encoded) > viewImageMaxBase64Bytes {
+		processed, processedMime, err := imageprep.Preprocess(raw, mime)
+		if err != nil {
+			return &tools.Result{
+				Output: fmt.Sprintf(
+					"ViewImage: %s base64-encodes to %d KiB which exceeds the %d KiB cap, and auto-resize failed (%v). Resize manually (e.g. `sips -Z 1600 path`) and retry.",
+					abs, len(encoded)/1024, viewImageMaxBase64Bytes/1024, err,
+				),
+				IsError: true,
+			}, nil
+		}
+		reEncoded := base64.StdEncoding.EncodeToString(processed)
+		if len(reEncoded) > viewImageMaxBase64Bytes {
+			return &tools.Result{
+				Output: fmt.Sprintf(
+					"ViewImage: %s still exceeds the %d KiB cap after auto-resize (%d KiB base64). Resize manually (e.g. `sips -Z 1200 path`) and retry.",
+					abs, viewImageMaxBase64Bytes/1024, len(reEncoded)/1024,
+				),
+				IsError: true,
+			}, nil
+		}
+		outBytes = processed
+		outMime = processedMime
+		encoded = reEncoded
 		return &tools.Result{
 			Output: fmt.Sprintf(
-				"ViewImage: %s base64-encodes to %d KiB which exceeds the %d KiB cap. Resize the image (e.g. `sips -Z 1600 path`) and retry.",
-				abs, len(encoded)/1024, viewImageMaxBase64Bytes/1024,
+				"ViewImage: %s (%d bytes raw → %d bytes after auto-resize to ≤1568px, %s)",
+				abs, len(raw), len(outBytes), outMime,
 			),
-			IsError: true,
+			Images: []pubtool.ImageAttachment{{MediaType: outMime, Data: encoded}},
 		}, nil
 	}
 	return &tools.Result{
-		Output: fmt.Sprintf("ViewImage: %s (%d bytes, %s)", abs, len(bytes), mime),
-		Images: []pubtool.ImageAttachment{{MediaType: mime, Data: encoded}},
+		Output: fmt.Sprintf("ViewImage: %s (%d bytes, %s)", abs, len(outBytes), outMime),
+		Images: []pubtool.ImageAttachment{{MediaType: outMime, Data: encoded}},
 	}, nil
 }

@@ -377,7 +377,10 @@ func LaunchServer(ctx context.Context, reg *Registry, name string, registry *too
 	case expanded.URL != "":
 		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, expanded.Headers)
 	case expanded.Command != "":
-		srv, err = mcptools.NewServerWithEnv(ctx, expanded.Name, expanded.Command, envSliceFromMap(expanded.Env), expanded.Args...)
+		srv, err = mcptools.NewServerWithEnv(
+			ctx, expanded.Name, expanded.Command,
+			envSliceFromMap(maybeInjectCUEnv(expanded.Command, expanded.Env)),
+			expanded.Args...)
 	default:
 		return nil, fmt.Errorf("mcp: server %q has neither command nor url", name)
 	}
@@ -581,7 +584,9 @@ func buildLazyServer(expanded, original ServerEntry, cachedTools []CachedTool) *
 		case expanded.URL != "":
 			return mcpsdk.NewHTTPClient(ctx, expanded.URL, expanded.Headers)
 		case expanded.Command != "":
-			return mcpsdk.NewStdioClientWithEnv(ctx, expanded.Command, envSliceFromMap(expanded.Env), expanded.Args...)
+			return mcpsdk.NewStdioClientWithEnv(ctx, expanded.Command,
+				envSliceFromMap(maybeInjectCUEnv(expanded.Command, expanded.Env)),
+				expanded.Args...)
 		default:
 			return nil, fmt.Errorf("mcp: server %q has neither command nor url", expanded.Name)
 		}

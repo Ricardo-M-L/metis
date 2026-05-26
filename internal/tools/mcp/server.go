@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/mcp"
@@ -93,7 +94,7 @@ func (t *MCPTool) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	}
 	result, err := t.server.client.CallTool(ctx, t.name, args)
 	if err != nil {
-		return &tools.Result{Output: err.Error(), IsError: true}, nil
+		return &tools.Result{Output: friendlyMCPError(t.server.name, err), IsError: true}, nil
 	}
 	// Try to pretty-print JSON result
 	var pretty json.RawMessage
@@ -360,4 +361,58 @@ func (s *Server) GetPrompt(ctx context.Context, name string, args map[string]str
 		return nil, err
 	}
 	return s.client.GetPrompt(ctx, name, args)
+}
+
+// friendlyMCPError wraps raw transport errors with actionable guidance
+// for the model. Without this wrapper a dead MCP subprocess (stdio
+// child crashed mid-session) surfaces as the cryptic
+//
+//	mcp stdio write: write |1: broken pipe
+//
+// to the model, which has no idea what to do — session 41040bea
+// (2026-05-26) shows the model burning 20+ turns retrying cu tool
+// calls one by one as the server stayed dead.
+//
+// The friendly text:
+//   - tells the model the subprocess is dead, not that the call is
+//     malformed (so it doesn't keep retrying with permutations of args)
+//   - names the server so the model can disambiguate when multiple are
+//     loaded
+//   - suggests `/cu disable && /cu enable` (or the generic /mcp restart
+//     for non-cu servers) so the user can recover without leaving the
+//     session
+//   - keeps the underlying error in parentheses so devs / debug.log
+//     readers still have the root cause
+//
+// Non-transport errors (real tool errors, schema mismatches, etc.)
+// pass through unchanged — the model can act on those normally.
+func friendlyMCPError(serverName string, err error) string {
+	msg := err.Error()
+	transportNeedles := []string{
+		"broken pipe",
+		"write |1:",
+		"transport closed",
+		"connection refused",
+		"connection reset",
+		"use of closed network connection",
+		"EOF",
+		"file already closed",
+	}
+	for _, needle := range transportNeedles {
+		if strings.Contains(msg, needle) {
+			restart := fmt.Sprintf("/mcp restart %s", serverName)
+			if serverName == "computer-use" {
+				restart = "/cu disable then /cu enable"
+			}
+			return fmt.Sprintf(
+				"MCP server %q is no longer reachable — the subprocess "+
+					"appears to have crashed. Ask the user to run `%s` "+
+					"to relaunch it. Do not retry the same call until "+
+					"the server is back; use a Bash fallback if the "+
+					"task is time-sensitive. (raw: %s)",
+				serverName, restart, msg,
+			)
+		}
+	}
+	return msg
 }
