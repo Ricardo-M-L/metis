@@ -1400,19 +1400,44 @@ func estimateTokens(messages []llm.Message) int {
 	for _, m := range messages {
 		total += 4 // per-message role/wrapper overhead (~16 chars JSON)
 		for _, c := range m.Content {
-			// Per-block JSON envelope: {"type":"...",...} ~ 8 tokens.
-			total += 8
-			total += estimateStringTokens(c.Text)
-			total += estimateStringTokens(c.ToolResult)
-			// ToolName / ToolUseID are short identifiers; ASCII
-			// chars/4 is fine.
-			total += len(c.ToolName) / 4
-			total += len(c.ToolUseID) / 4
-			// Tool input — count the keys + naive value lengths.
-			for k, v := range c.ToolInput {
-				total += len(k) / 4
-				total += approxValueLen(v) / 4
-			}
+			total += estimateContentBlockTokens(c)
+		}
+	}
+	return total
+}
+
+// estimateContentBlockTokens budgets one ContentBlock for the
+// estimator. Extracted from estimateTokens so the recursive
+// tool_result.ToolResultBlocks case can reuse the per-block
+// accounting (image-bearing tool_result blocks are otherwise
+// invisible to the size estimator — pre-2026-05-27 bug surfaced as
+// Kimi sessions blowing 262k cap despite our local estimator
+// saying ~80k).
+func estimateContentBlockTokens(c llm.ContentBlock) int {
+	total := 8 // per-block JSON envelope: {"type":"...",...} ~ 8 tokens
+	total += estimateStringTokens(c.Text)
+	total += estimateStringTokens(c.ToolResult)
+	total += len(c.ToolName) / 4
+	total += len(c.ToolUseID) / 4
+	for k, v := range c.ToolInput {
+		total += len(k) / 4
+		total += approxValueLen(v) / 4
+	}
+	// Image data: base64 is near-1:1 against the model tokeniser
+	// (high-entropy alphabet, no whitespace, no language-model-
+	// friendly prefixes). 4 chars/token underestimates by ~3x on
+	// the server side, which is what made Kimi sessions silently
+	// blow through the 262k cap. The 0.75 multiplier puts the
+	// estimate closer to the actual tiktoken-cl100k cost.
+	if c.Type == "image" && len(c.Data) > 0 {
+		total += int(float64(len(c.Data)) * 0.75)
+	}
+	// tool_result with vision-aware sub-blocks (ViewImage,
+	// cu screenshot-attaching tools): recurse so the inner
+	// image counts toward the parent message.
+	if len(c.ToolResultBlocks) > 0 {
+		for _, sub := range c.ToolResultBlocks {
+			total += estimateContentBlockTokens(sub)
 		}
 	}
 	return total

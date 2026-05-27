@@ -82,12 +82,13 @@ func TestE2E_MetisCU_Roundtrip(t *testing.T) {
 		if res.IsError {
 			t.Fatalf("cursor_position IsError=true; output=%q", res.Output)
 		}
-		// MCPTool.Execute pretty-prints the full MCP CallToolResult
-		// envelope (content[].text), so the inner cursor JSON appears
-		// as JSON-string-escaped bytes within. Search for the
-		// always-escaped substring `x\":` (4 bytes — `x`, `\`, `"`,
-		// `:`) which only appears inside the envelope's escaped text.
-		if !strings.Contains(res.Output, `x\":`) || !strings.Contains(res.Output, `y\":`) {
+		// 2026-05-27: MCPTool.Execute now parses the MCP envelope and
+		// surfaces the inner text part directly, no longer the
+		// outer JSON-pretty-printed envelope. The cursor JSON
+		// (`{"x":N,"y":N}`) thus appears UNESCAPED in res.Output.
+		// Pre-fix test asserted `x\":` (escaped); now we check the
+		// plain unescaped keys.
+		if !strings.Contains(res.Output, `"x":`) || !strings.Contains(res.Output, `"y":`) {
 			t.Errorf("cursor_position output doesn't contain {x,y} keys: %s", res.Output)
 		}
 		t.Logf("cursor_position OK; output:\n%s", strings.TrimSpace(res.Output))

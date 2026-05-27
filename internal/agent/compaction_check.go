@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -24,6 +25,57 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// Tier 0 — Image prune: drop image content blocks past the most
+	// recent keepN (1/2/3 depending on the model's context window).
+	// Cheap, no LLM, no threshold gate — runs every iteration because:
+	//   * inline image payloads inflate context faster than anything
+	//     else (cu screenshot ~130KB JPEG ≈ 90-100k REAL server tokens —
+	//     the local estimator under-counted these until 2026-05-27)
+	//   * keeping only the most recent N is the same strategy
+	//     Anthropic's computer-use-demo and claude-code both ship
+	//     (see compact_images.go docstring)
+	//   * pruning's a no-op when image count ≤ keepN so non-cu
+	//     workloads pay zero cost
+	// keepN scales with maxCtx — Kimi-K2.6 (262k) gets keep=1 or it
+	// blows the cap on the 3rd screenshot; Claude/MiniMax (1M+) get
+	// keep=3 for richer state-machine reasoning.
+	keepN := keepRecentImagesFor(l.Compactor.MaxContextTokens)
+	if keepN > 0 {
+		beforeBytes := estimateTokens(l.Messages)
+		pruned, n := PruneOldImages(l.Messages, keepN)
+		// METIS_DEBUG_IMG_PRUNE=1 surfaces the per-iteration prune
+		// telemetry to stderr. Useful when investigating "why
+		// didn't my model session prune" — left in as an opt-in
+		// (zero perf cost when unset) because diagnosing
+		// MCP-tool-result image extraction is annoying without it.
+		if os.Getenv("METIS_DEBUG_IMG_PRUNE") != "" {
+			imgCount := 0
+			for _, m := range l.Messages {
+				for _, c := range m.Content {
+					if c.Type == "image" {
+						imgCount++
+					}
+					for _, sub := range c.ToolResultBlocks {
+						if sub.Type == "image" {
+							imgCount++
+						}
+					}
+				}
+			}
+			fmt.Fprintf(os.Stderr, "[img-prune] maxCtx=%d keepN=%d totalImages=%d pruned=%d beforeBytes=%d\n",
+				l.Compactor.MaxContextTokens, keepN, imgCount, n, beforeBytes)
+		}
+		if n > 0 {
+			l.Messages = pruned
+			afterBytes := estimateTokens(pruned)
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("image-pruned %d older screenshots (kept %d most recent): ~%d → ~%d tokens",
+					n, keepN, beforeBytes, afterBytes),
+			})
+		}
+	}
 
 	// Tier 1 — Snip: cheap tool-result truncation, no LLM call. Runs
 	// at a lower threshold than full compaction so a tool-heavy

@@ -10,6 +10,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 // maxToolDescriptionBytes caps a single MCP tool's description length
@@ -96,13 +97,108 @@ func (t *MCPTool) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	if err != nil {
 		return &tools.Result{Output: friendlyMCPError(t.server.name, err), IsError: true}, nil
 	}
-	// Try to pretty-print JSON result
+	// MCP tool responses follow a structured envelope
+	//   {"content": [{"type":"text","text":"..."},
+	//                {"type":"image","data":"<base64>","mimeType":"image/png"}],
+	//    "isError": false}
+	// Split text vs image parts so:
+	//   * image bytes land in tools.Result.Images — the dispatch layer
+	//     fans them out as proper image ContentBlocks the compactor /
+	//     image-pruner can actually see (pre-2026-05-27 every cu
+	//     screenshot was dumped into Output as a base64 string blob,
+	//     invisible to PruneOldImages and counted as plain text by the
+	//     estimator, which is what made Kimi blow the 262k cap)
+	//   * text parts become the human-readable Output summary
+	//   * isError marks the whole result as failed without losing the
+	//     text payload the model needs to recover
+	parsed, ok := parseMCPResponse(result)
+	if ok {
+		return parsed, nil
+	}
+	// Fallback for non-standard / malformed responses: best-effort
+	// pretty-print. Same behaviour as pre-fix — keeps weird providers
+	// (lazy MCP servers that returned a raw string) working.
 	var pretty json.RawMessage
 	if json.Unmarshal(result, &pretty) == nil {
 		b, _ := json.MarshalIndent(pretty, "", "  ")
 		return &tools.Result{Output: string(b)}, nil
 	}
 	return &tools.Result{Output: string(result)}, nil
+}
+
+// mcpContent is the wire shape an MCP tool emits for a single content
+// part. Image parts come with `data` (base64) + `mimeType`; text parts
+// come with `text`. Unknown variants are forwarded as JSON to Output
+// so a future content type doesn't silently disappear.
+type mcpContent struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Data     string `json:"data,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+}
+
+type mcpEnvelope struct {
+	Content []mcpContent `json:"content"`
+	IsError bool         `json:"isError"`
+}
+
+// parseMCPResponse extracts text + image parts from the standard
+// MCP envelope. Returns (result, true) on a recognisable envelope
+// (even when content is empty); (nil, false) for non-envelope
+// shapes so the caller falls back to the legacy raw-dump path.
+//
+// Multiple text parts are joined with blank lines so the
+// human-readable summary stays grep-able. Multiple image parts are
+// kept distinct so the model can act on each as its own block.
+func parseMCPResponse(raw []byte) (*tools.Result, bool) {
+	var env mcpEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, false
+	}
+	if env.Content == nil {
+		// Envelope key missing entirely — likely some other shape.
+		// Distinguish from "valid envelope with empty content" by
+		// re-parsing into a map and looking for the literal key.
+		var probe map[string]json.RawMessage
+		if json.Unmarshal(raw, &probe) != nil {
+			return nil, false
+		}
+		if _, present := probe["content"]; !present {
+			return nil, false
+		}
+	}
+	var textParts []string
+	var images []pubtool.ImageAttachment
+	for _, c := range env.Content {
+		switch c.Type {
+		case "text":
+			if c.Text != "" {
+				textParts = append(textParts, c.Text)
+			}
+		case "image":
+			if c.Data == "" {
+				continue
+			}
+			mt := c.MimeType
+			if mt == "" {
+				mt = "image/png" // MCP-spec default for missing mimeType
+			}
+			images = append(images, pubtool.ImageAttachment{
+				MediaType: mt, Data: c.Data,
+			})
+		default:
+			// Forward unknown variant as JSON so we don't lose
+			// future content types silently.
+			b, _ := json.Marshal(c)
+			textParts = append(textParts, string(b))
+		}
+	}
+	out := strings.Join(textParts, "\n\n")
+	return &tools.Result{
+		Output:  out,
+		IsError: env.IsError,
+		Images:  images,
+	}, true
 }
 
 // NewServer connects to a stdio MCP server (subprocess) and returns a
