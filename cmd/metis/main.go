@@ -116,6 +116,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdSkills(args[1:])
 	case "acp":
 		return cmdACP(ctx, args[1:])
+	case "mcp-serve":
+		return cmdMCPServe(ctx, args[1:])
 	case "daemon":
 		return cmdDaemon(ctx, args[1:])
 	case "ps":
@@ -274,6 +276,7 @@ Usage:
   metis skills list     List built-in skills library
   metis skills install <name>  Install a built-in skill
   metis acp [--addr ADDR]  Run as Agent Client Protocol server (default: stdio)
+  metis mcp-serve [--mode MODE]  Run as MCP server (stdio); register with: claude mcp add metis -- metis mcp-serve
   metis cron <list|add|rm|pause|resume|run|start|audit>  Manage scheduled prompts
   metis auth <login|logout|list>  Manage provider credentials (~/.metis/auth.json)
   metis audit           Print a security audit of the current configuration

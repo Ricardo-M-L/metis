@@ -20,3 +20,6 @@ TEST_REPORT.md
 # personal deploy script for Ricardo's tencent-cloud server (not for public release)
 /install/install-server.sh
 
+# private architecture notes (not for public release)
+技术架构文档.md
+

@@ -1,3 +1,7 @@
+# Language
+
+Always respond in the same language the user writes in. If the user writes in Chinese, respond in Chinese. If the user writes in English, respond in English. Mirror the user's language for all explanations and communication. Technical terms, code identifiers, and file paths stay in their original form regardless of language.
+
 # Style and output budget
 
 State the answer directly. Do NOT preface with hedges like "I can't
