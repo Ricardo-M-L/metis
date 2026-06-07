@@ -145,6 +145,13 @@ func ClassifyError(err error) ErrorClass {
 	// crucial because compaction CAN'T fix some 2013s (e.g. payload
 	// > MiniMax's body byte cap), but the recovery path should at
 	// least try once before bubbling up.
+	//
+	// Kimi K2.6 (Moonshot) surfaces overflow as:
+	//   "Invalid request: Your request exceeded model token limit:
+	//    262144 (requested: 410013) (invalid_request_error)"
+	// This message also contains "invalid request" which would
+	// otherwise match ErrInvalidRequest below — must be checked
+	// FIRST (order of checks is significant here).
 	if strings.Contains(msg, "prompt is too long") ||
 		strings.Contains(msg, "exceeds context length") ||
 		strings.Contains(msg, "context_length_exceeded") ||
@@ -152,6 +159,7 @@ func ClassifyError(err error) ErrorClass {
 		strings.Contains(msg, "exceeds limit") ||
 		strings.Contains(msg, "too many tokens") ||
 		strings.Contains(msg, "request entity too large") ||
+		strings.Contains(msg, "exceeded model token limit") ||
 		strings.Contains(msg, "code 2013") ||
 		strings.Contains(msg, "\"code\":2013") ||
 		strings.Contains(msg, "(2013)") ||

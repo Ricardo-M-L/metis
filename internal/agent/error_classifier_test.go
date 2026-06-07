@@ -22,6 +22,13 @@ func TestClassifyError(t *testing.T) {
 		{"context overflow request entity too large", errors.New("API Error: request entity too large"), ErrContextOverflow},
 		{"context overflow stripped paren 2013", errors.New("status: 400, code: 2013) something"), ErrContextOverflow},
 		{"context overflow openai", errors.New("context_length_exceeded: please reduce the length"), ErrContextOverflow},
+		// Kimi K2.6 (Moonshot) format — 2026-06-07 production hit:
+		// "Invalid request: Your request exceeded model token limit: 262144
+		//  (requested: 410013) (invalid_request_error)"
+		// Previously misclassified as ErrInvalidRequest because
+		// "invalid request" appeared in the message before the overflow
+		// check found "exceeded model token limit".
+		{"context overflow kimi", errors.New("Invalid request: Your request exceeded model token limit: 262144 (requested: 410013) (invalid_request_error)"), ErrContextOverflow},
 		{"rate limit 429", errors.New("HTTP 429: Too Many Requests"), ErrRateLimit},
 		{"rate limit phrasing", errors.New("rate limit reached, please wait"), ErrRateLimit},
 		{"billing 402", errors.New("HTTP 402 payment required"), ErrBilling},

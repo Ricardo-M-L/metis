@@ -108,7 +108,9 @@ func errorRecoveryHint(s string) string {
 		strings.Contains(low, "context_length") ||
 		strings.Contains(low, "exceeds limit") ||
 		strings.Contains(low, "too many tokens") ||
-		strings.Contains(low, "prompt is too long"):
+		strings.Contains(low, "prompt is too long") ||
+		strings.Contains(low, "exceeded model token limit") ||
+		strings.Contains(low, "request entity too large"):
 		return "auto-compacting on next attempt — or /clear to start fresh"
 	case strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") ||
 		strings.Contains(low, "429"):
