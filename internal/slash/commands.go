@@ -15,6 +15,20 @@ type Cmd struct {
 	Aliases     []string
 	Description string
 	Handler     Handler
+
+	// AllowedTools / Model carry per-command frontmatter overrides from
+	// user-authored commands (~/.metis/commands/*.md). Empty = no
+	// override. Consumed by callers that apply a per-turn tool allowlist
+	// or model switch when dispatching a SignalCustomPrompt command.
+	AllowedTools []string
+	Model        string
+
+	// Custom is true for user-authored commands loaded from
+	// ~/.metis/commands/*.md (and project .metis/commands/). The
+	// SlashCommand tool only lets the model invoke Custom commands —
+	// built-in TUI commands (quit/clear/compact/…) need Signals a tool
+	// can't honor, so they're refused.
+	Custom bool
 }
 
 // Handler executes the command.

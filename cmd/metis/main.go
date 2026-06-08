@@ -1422,6 +1422,14 @@ func cmdChat(ctx context.Context, args []string) error {
 		}
 	}()
 	sl := buildSlash(rt)
+	// Late-register the SlashCommand tool now that both the tool registry
+	// (rt.registry) and the slash registry (sl) exist — the tool lets the
+	// model invoke user-authored custom commands. Registered here rather
+	// than in BuildToolRegistry because the slash registry is built after
+	// the tool registry, and the registry accepts post-construction adds.
+	if rt.registry != nil {
+		rt.registry.Register(builtin.NewSlashCommand(rt.gate, slashModelRunner{reg: sl}))
+	}
 
 	useTUI := flags.useTUI
 	if !useTUI {

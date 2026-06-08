@@ -148,13 +148,75 @@ func TestLoadCustomCommands_MissingDir(t *testing.T) {
 // TestParseFrontMatter_NoYAML — `description:` is a plain key/value line,
 // not full YAML. Other keys (model:, tools:, etc.) get preserved into
 // the body so future fields don't silently disappear.
-func TestParseFrontMatter_OtherKeysPassThrough(t *testing.T) {
-	src := "---\ndescription: short\nmodel: claude-haiku\n---\nbody text\n"
-	desc, body := parseFrontMatter(src)
-	if desc != "short" {
-		t.Errorf("description = %q, want \"short\"", desc)
+func TestParseFrontMatter_RecognizedKeys(t *testing.T) {
+	src := "---\ndescription: short\nmodel: claude-haiku\nargument-hint: [pr]\nallowed-tools: Bash, Read\nunknown: ignored\n---\nbody text\n"
+	meta, body := parseFrontMatter(src)
+	if meta.description != "short" {
+		t.Errorf("description = %q, want \"short\"", meta.description)
+	}
+	if meta.model != "claude-haiku" {
+		t.Errorf("model = %q, want \"claude-haiku\"", meta.model)
+	}
+	if meta.argumentHint != "[pr]" {
+		t.Errorf("argumentHint = %q, want \"[pr]\"", meta.argumentHint)
+	}
+	if len(meta.allowedTools) != 2 || meta.allowedTools[0] != "Bash" || meta.allowedTools[1] != "Read" {
+		t.Errorf("allowedTools = %v, want [Bash Read]", meta.allowedTools)
 	}
 	if body != "body text\n" {
 		t.Errorf("body = %q, want \"body text\\n\" (front matter must be stripped fully)", body)
+	}
+}
+
+func TestRenderTemplate_BashInjection(t *testing.T) {
+	out := renderTemplate("before !`echo hello` after", "")
+	if out != "before hello after" {
+		t.Errorf("bash injection: got %q, want \"before hello after\"", out)
+	}
+	// Failure is surfaced inline, not dropped.
+	got := renderTemplate("x !`exit 3` y", "")
+	if !strings.Contains(got, "exited") && !strings.Contains(got, "failed") {
+		t.Errorf("failed command should surface an error note; got %q", got)
+	}
+}
+
+func TestRenderTemplate_FileInjection(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(f, []byte("FILE BODY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := renderTemplate("see @"+f+" end", "")
+	if !strings.Contains(out, "FILE BODY") {
+		t.Errorf("file injection failed; got %q", out)
+	}
+	// A non-file @token (email-shaped) is left untouched.
+	out2 := renderTemplate("ping user@example.com now", "")
+	if !strings.Contains(out2, "user@example.com") {
+		t.Errorf("non-file @token should be preserved; got %q", out2)
+	}
+}
+
+func TestLoadCustomCommands_FrontMatterOverrides(t *testing.T) {
+	dir := t.TempDir()
+	cmdDir := filepath.Join(dir, "commands")
+	_ = os.MkdirAll(cmdDir, 0o755)
+	src := "---\ndescription: review a PR\nargument-hint: [pr-number]\nallowed-tools: Bash, Read\nmodel: claude-opus-4-8\n---\nReview PR $1.\n"
+	_ = os.WriteFile(filepath.Join(cmdDir, "rev.md"), []byte(src), 0o644)
+
+	r := NewRegistry()
+	LoadCustomCommands(r, dir)
+	c, ok := r.Get("rev")
+	if !ok {
+		t.Fatal("/rev not registered")
+	}
+	if !strings.Contains(c.Description, "args: [pr-number]") {
+		t.Errorf("argument-hint not surfaced in description: %q", c.Description)
+	}
+	if c.Model != "claude-opus-4-8" {
+		t.Errorf("Model override = %q", c.Model)
+	}
+	if len(c.AllowedTools) != 2 {
+		t.Errorf("AllowedTools = %v", c.AllowedTools)
 	}
 }
