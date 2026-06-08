@@ -311,6 +311,13 @@ func NewStdioClientWithEnv(ctx context.Context, command string, extraEnv []strin
 	go c.readLoop()
 	handshakeCtx, cancel := context.WithTimeout(ctx, ConnectTimeout())
 	defer cancel()
+	if err := c.initialize(handshakeCtx); err != nil {
+		c.Close()
+		if stderr := transport.Stderr(); stderr != "" {
+			return nil, fmt.Errorf("MCP initialize: %w\nserver stderr:\n%s", err, stderr)
+		}
+		return nil, fmt.Errorf("MCP initialize: %w", err)
+	}
 	if _, err := c.ListTools(handshakeCtx); err != nil {
 		c.Close()
 		// Surface stderr from the subprocess so the user sees the
@@ -349,6 +356,10 @@ func NewHTTPClient(ctx context.Context, endpoint string, optHeaders ...map[strin
 	go c.httpNotificationLoop()
 	handshakeCtx, cancel := context.WithTimeout(ctx, ConnectTimeout())
 	defer cancel()
+	if err := c.initialize(handshakeCtx); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("MCP HTTP initialize: %w", err)
+	}
 	if _, err := c.ListTools(handshakeCtx); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("MCP HTTP handshake: %w", err)
@@ -372,9 +383,18 @@ func (c *Client) Close() error {
 //  3. pending[id] leaking when ctx is cancelled or HTTP returns directly
 //     — every exit path through this function deletes the entry.
 func (c *Client) send(ctx context.Context, method string, params interface{}) (*JSONRPCResponse, error) {
-	raw, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
+	// Omit params entirely when nil rather than sending `"params":null`.
+	// Spec-strict servers (the official @modelcontextprotocol/sdk) validate
+	// the JSON-RPC envelope with a schema where params is optional-not-
+	// nullable, and reject a literal null with -32700. Leaving raw empty
+	// lets the omitempty tag drop the field.
+	var raw json.RawMessage
+	if params != nil {
+		var err error
+		raw, err = json.Marshal(params)
+		if err != nil {
+			return nil, err
+		}
 	}
 	id := fmt.Sprintf("%d", c.idSeq.Add(1))
 	ch := make(chan *JSONRPCResponse, 1)
@@ -455,6 +475,85 @@ func (c *Client) send(ctx context.Context, method string, params interface{}) (*
 	case resp := <-ch:
 		return resp, nil
 	}
+}
+
+// MCPProtocolVersion is the MCP version metis advertises in the
+// initialize handshake. 2024-11-05 is the Streamable-HTTP baseline the
+// official SDK servers accept.
+const MCPProtocolVersion = "2024-11-05"
+
+// initialize performs the MCP lifecycle handshake the spec requires
+// before any other request: an `initialize` request followed by an
+// `notifications/initialized` notification. metis historically skipped
+// this and used tools/list as a de-facto handshake — lenient servers
+// tolerated it, but spec-strict ones (the official @modelcontextprotocol
+// SDK) reject the out-of-order tools/list. Called once by the client
+// constructors before the initial ListTools.
+func (c *Client) initialize(ctx context.Context) error {
+	params := map[string]any{
+		"protocolVersion": MCPProtocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "metis", "version": "0.1"},
+	}
+	resp, err := c.send(ctx, "initialize", params)
+	if err != nil {
+		return err
+	}
+	if resp.Error != nil {
+		return fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
+	}
+	// Best-effort initialized notification; servers don't reply to it.
+	return c.sendNotification(ctx, "notifications/initialized", nil)
+}
+
+// sendNotification writes a fire-and-forget JSON-RPC notification (no id,
+// no response awaited). Used for notifications/initialized.
+func (c *Client) sendNotification(ctx context.Context, method string, params interface{}) error {
+	var raw json.RawMessage
+	if params != nil {
+		var err error
+		raw, err = json.Marshal(params)
+		if err != nil {
+			return err
+		}
+	}
+	msg := Notification{Method: method, Params: raw}
+	envelope := struct {
+		JSONRPC string `json:"jsonrpc"`
+		Notification
+	}{JSONRPC: "2.0", Notification: msg}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	transport := c.transport
+	c.mu.RUnlock()
+
+	switch t := transport.(type) {
+	case *StdioTransport:
+		_, err := t.stdin.Write(append(data, '\n'))
+		return err
+	case *HTTPTransport:
+		req, rerr := http.NewRequestWithContext(ctx, "POST", t.endpoint, strings.NewReader(string(data)))
+		if rerr != nil {
+			return rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		for k, v := range t.headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := t.client.Do(req)
+		if err != nil {
+			return err
+		}
+		// Notifications get 202 Accepted with no body; drain + close.
+		_ = resp.Body.Close()
+		return nil
+	}
+	return nil
 }
 
 // readLoop pumps JSON-RPC messages from the stdio transport. On EOF or any
