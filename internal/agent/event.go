@@ -137,6 +137,70 @@ const (
 	EventAskUser
 )
 
+// agentNameKey carries the current agent's team identity (the `name` param
+// passed to Agent({name: "alice"})) through the tool-execute context so
+// MessageTeammate can show the real sender instead of the hardcoded "main".
+// Fallback is "main" for the top-level loop which has no roster name.
+type agentNameKey struct{}
+
+// WithAgentName stamps ctx with the sub-agent's roster name. Called by
+// the Agent tool after the teammate entry is resolved, before building
+// baseCtx for the sub-loop — so all tools that sub-agent calls
+// (including MessageTeammate) read the right identity.
+func WithAgentName(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, agentNameKey{}, name)
+}
+
+// AgentNameFromContext returns the current agent's roster name, or "main"
+// when none is stamped (top-level loop, headless tests, or any tool path
+// that doesn't go through a named Agent spawn).
+func AgentNameFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return "main"
+	}
+	if v, ok := ctx.Value(agentNameKey{}).(string); ok && v != "" {
+		return v
+	}
+	return "main"
+}
+
+// subAgentNotifyKey carries the parent loop's sub-agent notification
+// channel send end down to the Agent tool so background sub-agents can
+// signal completion without the parent polling SubAgentList. Mirrors
+// claude-code's idle_notification flow: worker finishes → sends to
+// parent's notify channel → parent injects <sub_agent_idle> at the
+// next iter boundary.
+//
+// Deliberately NOT inherited by child sub-loops: Agent.Execute extracts
+// the value from the tool's ctx, shadows the key with nil in baseCtx,
+// and passes the extracted channel directly to executeBackground. This
+// prevents sub-sub-agents (depth >= 2) from accidentally notifying the
+// grandparent's loop.
+type subAgentNotifyKey struct{}
+
+// WithSubAgentNotify stamps ctx with the parent loop's sub-agent notify
+// send channel. Called by Loop.Run at the top so every tool dispatched
+// in that turn can reach the channel via SubAgentNotifyFromContext.
+// Storing nil is intentional: Agent.Execute uses it to shadow the key
+// in baseCtx so the child loop doesn't inherit a stale pointer.
+func WithSubAgentNotify(ctx context.Context, ch chan<- SubAgentNotification) context.Context {
+	return context.WithValue(ctx, subAgentNotifyKey{}, ch)
+}
+
+// SubAgentNotifyFromContext retrieves the parent loop's sub-agent notify
+// send channel, or nil when not stamped (top-level loop, tests, or a
+// context where the key was explicitly cleared by the Agent tool).
+func SubAgentNotifyFromContext(ctx context.Context) chan<- SubAgentNotification {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(subAgentNotifyKey{}).(chan<- SubAgentNotification)
+	return v
+}
+
 // eventOutKey carries the parent loop's event channel down to tools
 // (specifically the Agent tool) via context so sub-loops can forward
 // progress events upstream for live UI rendering. Without this, the

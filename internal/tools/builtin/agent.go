@@ -793,13 +793,30 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		timeout = a.defaultTimeout
 	}
 
+	// Extract the parent loop's sub-agent notification channel BEFORE
+	// building baseCtx. The channel was stamped into ctx by the parent
+	// Loop.Run(); we pull it out here so we can pass it directly to
+	// executeBackground — and explicitly shadow the key with nil in
+	// baseCtx so child sub-agents (depth >= 2) don't accidentally
+	// write to the grandparent's notify channel.
+	parentNotify := agent.SubAgentNotifyFromContext(ctx)
+
 	// Build the sub-agent ctx with depth + cwd + (optional) timeout.
 	// For the background path the goroutine owns the cancel func and
 	// keeps the ctx alive past Execute's return — context.WithCancel
 	// doesn't leak when the deferred goroutine runs cancel on its
 	// own exit. G.2: subCwd stamps the effective working directory
 	// onto the ctx so cwd-aware tools (Bash) inherit it.
-	baseCtx := agent.WithCwd(context.WithValue(ctx, agentDepthKey{}, depth+1), subCwd)
+	// subAgentNotify key is explicitly cleared (nil) so the child
+	// loop's tools don't see the grandparent's notify channel.
+	baseCtx := agent.WithSubAgentNotify(
+		agent.WithCwd(context.WithValue(ctx, agentDepthKey{}, depth+1), subCwd),
+		nil,
+	)
+	// Stamp the teammate's roster name so the child's tools (especially
+	// MessageTeammate) can read the correct sender identity via
+	// AgentNameFromContext instead of falling back to "main".
+	baseCtx = agent.WithAgentName(baseCtx, teammateName)
 	childCtx, cancel := context.WithCancel(baseCtx)
 	if timeout > 0 {
 		childCtx, cancel = context.WithTimeout(childCtx, timeout)
@@ -828,7 +845,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	if runInBackground {
-		return a.executeBackground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
+		return a.executeBackground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk, parentNotify)
 	}
 	return a.executeForeground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
 }
@@ -1025,6 +1042,12 @@ func persistNewMessages(t *agent.SubAgentTranscript, sub *agent.Loop, idx int) i
 // exit (Completed / Failed / Killed). The Roster.Unregister is
 // likewise deferred inside the goroutine so background sub-agents
 // stay visible in /agents list until they actually finish.
+//
+// parentNotify, when non-nil, receives a SubAgentNotification after
+// teammate.Finish — the parent Loop.Run drains this channel at its next
+// iter boundary and injects a <sub_agent_idle> reminder (mirrors
+// claude-code's idle_notification). nil is fine (tests, loops without
+// a subAgentNotify channel).
 func (a Agent) executeBackground(
 	sub *agent.Loop,
 	childCtx context.Context,
@@ -1035,6 +1058,7 @@ func (a Agent) executeBackground(
 	timeout time.Duration,
 	transcript *agent.SubAgentTranscript,
 	persistedOnDisk int,
+	parentNotify chan<- agent.SubAgentNotification,
 ) (*tools.Result, error) {
 	if teammate == nil {
 		// No Roster wired — graceful fallback to foreground so callers
@@ -1044,6 +1068,7 @@ func (a Agent) executeBackground(
 	}
 
 	go func() {
+		startedAt := time.Now()
 		defer cancel()
 		defer transcript.Close()
 		defer func() {
@@ -1057,6 +1082,7 @@ func (a Agent) executeBackground(
 		defer func() {
 			if r := recover(); r != nil {
 				teammate.Finish(agent.StatusFailed, "", fmt.Errorf("panic: %v", r), "panic")
+				notifyParent(parentNotify, teammate, time.Since(startedAt))
 			}
 		}()
 
@@ -1093,6 +1119,7 @@ func (a Agent) executeBackground(
 						hint = "cancelled"
 					}
 					teammate.Finish(status, teammateSnapshotOutput(teammate), ev.Err, hint)
+					notifyParent(parentNotify, teammate, time.Since(startedAt))
 					return
 				}
 			}
@@ -1109,6 +1136,7 @@ func (a Agent) executeBackground(
 		default:
 			teammate.Finish(agent.StatusFailed, final, err, stopReason)
 		}
+		notifyParent(parentNotify, teammate, time.Since(startedAt))
 	}()
 
 	return &tools.Result{
@@ -1168,6 +1196,30 @@ func forwardSubAgentEvent(parentOut chan<- agent.Event, parentToolUseID string, 
 // SubAgentOutput after a failure still see partial progress.
 func teammateSnapshotOutput(t *agent.Teammate) string {
 	return strings.TrimSpace(t.Snapshot().Output)
+}
+
+// notifyParent sends a SubAgentNotification to the parent loop's notify
+// channel after a background sub-agent finishes. Non-blocking (select
+// default) — if the channel is full the parent can still discover the
+// completion via SubAgentList polling. nil parentNotify is a no-op so
+// callers in tests or loops without a subAgentNotify channel don't need
+// to guard.
+func notifyParent(ch chan<- agent.SubAgentNotification, t *agent.Teammate, dur time.Duration) {
+	if ch == nil || t == nil {
+		return
+	}
+	snap := t.Snapshot()
+	select {
+	case ch <- agent.SubAgentNotification{
+		Name:     snap.Name,
+		AgentID:  snap.AgentID,
+		Status:   snap.Status,
+		Summary:  snap.Result,
+		Duration: dur,
+		Err:      snap.ExitErr,
+	}:
+	default:
+	}
 }
 
 // wrapTimeoutErr converts a sub-loop error into a user-readable

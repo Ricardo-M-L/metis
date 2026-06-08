@@ -45,6 +45,10 @@ func TestErrorRecoveryHint_Categories(t *testing.T) {
 	}{
 		{"context window exceeds limit", true},
 		{"prompt is too long", true},
+		// OpenAI-variant — was missing from the old hand-rolled list
+		{"exceeds context length: please reduce the length", true},
+		// Kimi K2.6 (Moonshot) format
+		{"Invalid request: Your request exceeded model token limit: 262144 (requested: 410013) (invalid_request_error)", true},
 		{"invalid api key", true},
 		{"401 Unauthorized", true},
 		{"deadline exceeded", true},

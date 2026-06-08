@@ -54,7 +54,7 @@ func (MessageTeammate) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"to": map[string]any{
 				"type":        "string",
-				"description": "The recipient teammate's name as passed to Agent({name: \"...\"}). Use SubAgentList to see available names.",
+				"description": "The recipient teammate's name as passed to Agent({name: \"...\"}). Use SubAgentList to see available names. Pass \"*\" to broadcast to all named teammates currently in the roster.",
 			},
 			"body": map[string]any{
 				"type":        "string",
@@ -101,7 +101,7 @@ func humanDuration(d time.Duration) string {
 	}
 }
 
-func (m MessageTeammate) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (m MessageTeammate) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	if m.roster == nil {
 		return &tools.Result{Output: "MessageTeammate unavailable: no Roster wired in this session", IsError: true}, nil
 	}
@@ -113,6 +113,18 @@ func (m MessageTeammate) Execute(_ context.Context, in map[string]any) (*tools.R
 	}
 	if strings.TrimSpace(body) == "" {
 		return &tools.Result{Output: "`body` is required and cannot be empty", IsError: true}, nil
+	}
+
+	// Resolve sender identity from context. Sub-agents spawned with
+	// Agent({name: "alice"}) have their name stamped into ctx by
+	// agent.go's Execute; the top-level loop falls back to "main".
+	// Fixes the previous hardcoded `from := "main"` that made every
+	// peer-to-peer chain show "main → bob".
+	from := agent.AgentNameFromContext(ctx)
+
+	// Broadcast: to=="*" delivers to every named teammate in the roster.
+	if to == "*" {
+		return m.executeBroadcast(body, from)
 	}
 
 	t, ok := m.roster.Lookup(to)
@@ -161,14 +173,6 @@ func (m MessageTeammate) Execute(_ context.Context, in map[string]any) (*tools.R
 		}, nil
 	}
 
-	// Sender identity — currently best-effort. The root loop shows as
-	// "main"; sub-agent senders would need a ctx-stamped identity we
-	// haven't wired yet (TODO: when G.x adds sender-from-ctx, plumb it
-	// here so a peer-to-peer chain shows "alice → bob" not "main →
-	// bob"). claude-code threads sender identity through their task
-	// graph; we'll catch up once the right plumbing lands.
-	from := "main"
-
 	select {
 	case t.Mailbox <- agent.PeerMessage{From: from, Body: body, Sent: time.Now()}:
 		return &tools.Result{
@@ -187,4 +191,36 @@ func (m MessageTeammate) Execute(_ context.Context, in map[string]any) (*tools.R
 			IsError: true,
 		}, nil
 	}
+}
+
+// executeBroadcast fans out body to every named (non-anonymous) teammate
+// currently in the Roster. Non-blocking send per mailbox: full mailboxes
+// are reported in the result rather than silently dropped or blocking.
+// Mirrors claude-code's SendMessage({to: "*"}) semantics.
+func (m MessageTeammate) executeBroadcast(body, from string) (*tools.Result, error) {
+	named := m.roster.ListNamed()
+	if len(named) == 0 {
+		return &tools.Result{Output: "broadcast: no named teammates in roster"}, nil
+	}
+	var sent, full []string
+	for _, t := range named {
+		if t.Mailbox == nil {
+			continue
+		}
+		msg := agent.PeerMessage{From: from, Body: body, Sent: time.Now()}
+		select {
+		case t.Mailbox <- msg:
+			sent = append(sent, t.Name)
+		default:
+			full = append(full, t.Name)
+		}
+	}
+	var parts []string
+	if len(sent) > 0 {
+		parts = append(parts, fmt.Sprintf("delivered to: %s", strings.Join(sent, ", ")))
+	}
+	if len(full) > 0 {
+		parts = append(parts, fmt.Sprintf("mailbox full (retry): %s", strings.Join(full, ", ")))
+	}
+	return &tools.Result{Output: "broadcast " + strings.Join(parts, "; ")}, nil
 }

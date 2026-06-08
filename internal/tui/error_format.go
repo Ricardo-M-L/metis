@@ -15,8 +15,11 @@ package tui
 
 import (
 	"encoding/json"
+	"errors"
 	"regexp"
 	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/agent"
 )
 
 // formatProviderError compresses a provider error message into a
@@ -104,13 +107,7 @@ func stripRequestID(s string) string {
 func errorRecoveryHint(s string) string {
 	low := strings.ToLower(s)
 	switch {
-	case strings.Contains(low, "context window") ||
-		strings.Contains(low, "context_length") ||
-		strings.Contains(low, "exceeds limit") ||
-		strings.Contains(low, "too many tokens") ||
-		strings.Contains(low, "prompt is too long") ||
-		strings.Contains(low, "exceeded model token limit") ||
-		strings.Contains(low, "request entity too large"):
+	case agent.ClassifyError(errors.New(s)) == agent.ErrContextOverflow:
 		return "auto-compacting on next attempt — or /clear to start fresh"
 	case strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit") ||
 		strings.Contains(low, "429"):

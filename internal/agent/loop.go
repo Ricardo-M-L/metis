@@ -180,6 +180,20 @@ type Loop struct {
 	// has no Roster entry) and for headless tests.
 	PeerInbox <-chan PeerMessage
 
+	// subAgentNotify is the internal channel used to receive completion
+	// signals from background sub-agents. Both ends are created in
+	// NewLoop; the send end is stamped into ctx at the top of Run()
+	// so the Agent tool can post a SubAgentNotification after each
+	// background sub-agent finishes. Run drains it at every iter
+	// boundary (injectSubAgentNotifications) and synthesizes a
+	// <sub_agent_idle> system-reminder so the model learns about
+	// the completion without polling SubAgentList each turn.
+	//
+	// Mirrors claude-code's idle_notification flow. Buffer 64 is
+	// generous — the practical concurrent background cap is far lower
+	// (capNamed default 20).
+	subAgentNotify chan SubAgentNotification
+
 	// DreamNotify is the receive end of the auto-memory extractor's
 	// completion channel (G.5, 2026-05-12). When the extractor's
 	// background fork finishes, it posts a DreamNotification here
@@ -287,6 +301,7 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 		MaxIters:                    maxIter,
 		GraceCalls:                  1,
 		lastTimeBasedMicrocompactAt: time.Now(),
+		subAgentNotify:              make(chan SubAgentNotification, 64),
 	}
 }
 
@@ -562,6 +577,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	l.haltReason = ""
 	l.mu.Unlock()
 
+	// Stamp the sub-agent notification send end into ctx so the Agent
+	// tool can post SubAgentNotification when a background sub-agent
+	// finishes. The Agent tool extracts it before building baseCtx and
+	// shadows the key with nil in the child's ctx to prevent
+	// grandchild agents from writing to the wrong channel.
+	if l.subAgentNotify != nil {
+		ctx = WithSubAgentNotify(ctx, l.subAgentNotify)
+	}
+
 	tc := HookContext{Model: l.Model, Turn: l.turnIdx}
 	l.Hooks.EmitSessionStart(ctx, tc, l.System, l.Model)
 
@@ -643,6 +667,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// matching claude-code's <task_notification> envelope.
 		l.injectJobNotifications(out)
 		l.injectPeerMessages(out)
+		l.injectSubAgentNotifications(out)
 		l.injectDreamNotifications(out)
 		// Same pattern for Monitor pattern-matches — pulls every
 		// MonitorEvent buffered since last iter and injects them as

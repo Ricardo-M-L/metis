@@ -39,13 +39,42 @@ import (
 	"time"
 )
 
-// PeerMessage carries a SendMessage payload between named teammates.
-// `From` is the sender's roster name (auto-generated for anonymous
-// senders); `Body` is the model-authored text.
+// MsgType distinguishes peer messages by protocol role. Zero value
+// MsgTypeContent is the default for all model-authored messages so
+// existing senders that don't set Type continue to work unchanged.
+// MsgTypeIdleNotification is reserved for future typed-protocol
+// routing (e.g. injecting idle signals through the mailbox path).
+type MsgType string
+
+const (
+	MsgTypeContent          MsgType = "content"
+	MsgTypeIdleNotification MsgType = "idle_notification"
+)
+
+// PeerMessage carries a MessageTeammate payload between named teammates.
+// `From` is the sender's roster name; `Body` is the model-authored text.
+// `Type` defaults to MsgTypeContent (zero value) — existing senders that
+// don't set it are unaffected.
 type PeerMessage struct {
 	From string
 	Body string
 	Sent time.Time
+	Type MsgType // zero value treated as MsgTypeContent
+}
+
+// SubAgentNotification is posted to the parent loop's subAgentNotify
+// channel when a background sub-agent completes (any terminal status).
+// Mirrors claude-code's idle_notification: the parent loop drains this
+// channel at each iter boundary and injects a <sub_agent_idle>
+// system-reminder so the model learns about the completion without
+// polling SubAgentList.
+type SubAgentNotification struct {
+	Name     string
+	AgentID  string
+	Status   TeammateStatus
+	Summary  string        // final text output or partial on Killed/Failed
+	Duration time.Duration // wall-clock from goroutine start to Finish
+	Err      error
 }
 
 // TeammateKind tags a sub-agent by orchestration shape (G.12,
@@ -662,6 +691,23 @@ func (r *Roster) CancelAll() {
 		}
 	}
 	r.teammates = make(map[string]*Teammate)
+}
+
+// ListNamed returns a snapshot of all currently-registered named
+// teammates (Anonymous==false). Used by MessageTeammate's broadcast
+// path (to=="*") to fan out a message to every addressable peer.
+// Callers must treat the returned slice as read-only — the Teammate
+// pointers are live and mutations would race the runner goroutines.
+func (r *Roster) ListNamed() []*Teammate {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*Teammate, 0, len(r.teammates))
+	for _, t := range r.teammates {
+		if !t.Anonymous {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // anonName generates an auto-name for sub-agents that didn't pass
