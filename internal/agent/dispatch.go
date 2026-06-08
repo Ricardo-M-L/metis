@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -411,6 +412,31 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	return results, nil
 }
 
+// safeToolExecute runs a tool's Execute with panic recovery. Tools run
+// inside the dispatcher's safe-fanout goroutine (executeBatch Phase 1a),
+// where an UNrecovered panic crashes the entire metis process — taking
+// every other in-flight sub-agent and the user's whole session down with
+// it. Recovering here turns ANY tool fault (a buggy builtin, an MCP server
+// wrapper, a sub-agent loop) into an ordinary error result the model can
+// see and work around. This is the process-wide crash-isolation backstop;
+// it's why metis doesn't need to spawn each sub-agent as its own OS
+// process to get fault containment. The Agent/Fork tools also recover
+// internally, but this guard covers the long tail of every other tool.
+func safeToolExecute(ctx context.Context, t tools.Tool, in map[string]any) (res *tools.Result, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = nil
+			err = fmt.Errorf("tool %q crashed (recovered panic): %v", t.Name(), r)
+			// Full stack only under METIS_DEBUG so the TUI alt-screen
+			// stays clean in normal runs (stderr leaks corrupt it).
+			if os.Getenv("METIS_DEBUG") != "" {
+				fmt.Fprintf(os.Stderr, "metis: recovered tool panic in %s: %v\n%s\n", t.Name(), r, debug.Stack())
+			}
+		}
+	}()
+	return t.Execute(ctx, in)
+}
+
 // runExecute runs the post-permission portion of a single tool_use:
 // tool.Execute → PostToolUse hook → emit ToolResult event. It assumes
 // PreToolUse + permission have already passed in executeBatch's
@@ -463,7 +489,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// reads the child loop's measurement instead of computing an
 	// inter-event delta that hits 0ms on fast Reads (image #54).
 	execStart := time.Now()
-	res, err := t.Execute(toolCtx, blk.ToolInput)
+	res, err := safeToolExecute(toolCtx, t, blk.ToolInput)
 	execElapsed := time.Since(execStart)
 	if l.Detector != nil {
 		l.Detector.Record(blk.ToolName, blk.ToolInput)
