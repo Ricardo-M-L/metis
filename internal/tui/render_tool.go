@@ -264,6 +264,15 @@ func summarizeToolResult(te ToolEvent) string {
 		}
 		return fmt.Sprintf("%s · %s", dur, truncate(first, 60))
 	case "Glob":
+		// Error-path: te.Output is the error message (e.g. the
+		// "pattern field is required" hint when the model called Glob
+		// with a `path` and no `pattern`), so lineCount(Output) would
+		// report "Found N files" for the N lines of error text — a
+		// contradictory "✗ Found 3 files". Surface the failure instead,
+		// matching the Read branch above.
+		if te.IsError {
+			return fmt.Sprintf("%s · failed", dur)
+		}
 		if strings.HasPrefix(strings.TrimSpace(te.Output), "(no matches)") {
 			return fmt.Sprintf("%s · No files matched", dur)
 		}
@@ -274,6 +283,11 @@ func summarizeToolResult(te ToolEvent) string {
 		}
 		return fmt.Sprintf("%s · Found %d %s", dur, n, word)
 	case "Grep":
+		// Same error-path guard as Glob/Read — don't count error-message
+		// lines as if they were matches.
+		if te.IsError {
+			return fmt.Sprintf("%s · failed", dur)
+		}
 		out := strings.TrimSpace(te.Output)
 		if strings.HasPrefix(out, "(no matches)") {
 			return fmt.Sprintf("%s · No matches", dur)

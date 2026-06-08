@@ -111,6 +111,28 @@ func TestSummarizeToolResult_ReadError(t *testing.T) {
 	}
 }
 
+// TestSummarizeToolResult_GlobGrepError — an errored Glob/Grep must not
+// count its error-message lines as matches (the "✗ Found 3 files" bug:
+// the model called Glob with a `path` and no `pattern`, the 3-line error
+// hint got line-counted as files found).
+func TestSummarizeToolResult_GlobGrepError(t *testing.T) {
+	for _, tool := range []string{"Glob", "Grep"} {
+		te := ToolEvent{
+			ToolName: tool,
+			Input:    map[string]any{"path": "/some/file"},
+			Output:   "Glob: `pattern` field is required (e.g. \"**/*.go\").\n\nYou passed a `path` field. Use Read.",
+			IsError:  true,
+		}
+		got := summarizeToolResult(te)
+		if strings.Contains(got, "Found") || strings.Contains(got, "matches") || strings.Contains(got, "match ") {
+			t.Errorf("%s error summary must not report a count; got %q", tool, got)
+		}
+		if !strings.Contains(got, "failed") {
+			t.Errorf("%s error summary should say 'failed'; got %q", tool, got)
+		}
+	}
+}
+
 // TestTruncateMiddle_PreservesBothEnds — for path-bearing error lines
 // the basename at the END is what tells the user what failed; the
 // pre-fix tail-cut form hid it. Middle truncation keeps both ends
