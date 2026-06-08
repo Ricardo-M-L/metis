@@ -66,6 +66,18 @@ func (f *fakeMCPServer) Handler() http.Handler {
 			result = map[string]interface{}{
 				"content": fmt.Sprintf("ok:%s", p.Name),
 			}
+		case "resources/list":
+			result = ListResourcesResult{Resources: []Resource{
+				{URI: "file:///x.md", Name: "x", Description: "doc x", MimeType: "text/markdown"},
+			}}
+		case "resources/read":
+			var p struct {
+				URI string `json:"uri"`
+			}
+			_ = json.Unmarshal(req.Params, &p)
+			result = ReadResourceResult{Contents: []ResourceContent{
+				{URI: p.URI, MimeType: "text/markdown", Text: "hello from " + p.URI},
+			}}
 		default:
 			result = map[string]interface{}{}
 		}
@@ -176,5 +188,37 @@ func TestHTTPClient_CallTool(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "ok:echo") {
 		t.Fatalf("unexpected result: %s", raw)
+	}
+}
+
+// TestHTTPClient_Resources covers resources/list + resources/read over
+// the HTTP transport against the fake server.
+func TestHTTPClient_Resources(t *testing.T) {
+	fake := &fakeMCPServer{}
+	srv := httptest.NewServer(fake.Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := NewHTTPClient(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	defer c.Close()
+
+	res, err := c.ListResources(ctx)
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	if len(res) != 1 || res[0].URI != "file:///x.md" || res[0].MimeType != "text/markdown" {
+		t.Fatalf("unexpected resources: %#v", res)
+	}
+
+	rr, err := c.ReadResource(ctx, "file:///x.md")
+	if err != nil {
+		t.Fatalf("ReadResource: %v", err)
+	}
+	if len(rr.Contents) != 1 || rr.Contents[0].Text != "hello from file:///x.md" {
+		t.Fatalf("unexpected contents: %#v", rr.Contents)
 	}
 }

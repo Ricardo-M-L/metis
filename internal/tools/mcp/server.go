@@ -459,6 +459,28 @@ func (s *Server) GetPrompt(ctx context.Context, name string, args map[string]str
 	return s.client.GetPrompt(ctx, name, args)
 }
 
+// ListResources surfaces the underlying client's resources/list. Servers
+// without the capability (or a not-yet-spawned lazy server) return
+// (nil, nil) so callers can treat "no resources" uniformly.
+func (s *Server) ListResources(ctx context.Context) ([]mcp.Resource, error) {
+	s.mu.RLock()
+	c := s.client
+	s.mu.RUnlock()
+	if c == nil {
+		return nil, nil
+	}
+	return c.ListResources(ctx)
+}
+
+// ReadResource fetches one resource by URI. Forces a lazy server to spawn
+// first, since reading a resource is an explicit model action.
+func (s *Server) ReadResource(ctx context.Context, uri string) (*mcp.ReadResourceResult, error) {
+	if err := s.ensureClient(ctx); err != nil {
+		return nil, err
+	}
+	return s.client.ReadResource(ctx, uri)
+}
+
 // friendlyMCPError wraps raw transport errors with actionable guidance
 // for the model. Without this wrapper a dead MCP subprocess (stdio
 // child crashed mid-session) surfaces as the cryptic

@@ -1429,6 +1429,10 @@ func cmdChat(ctx context.Context, args []string) error {
 	// the tool registry, and the registry accepts post-construction adds.
 	if rt.registry != nil {
 		rt.registry.Register(builtin.NewSlashCommand(rt.gate, slashModelRunner{reg: sl}))
+		// MCP resource tools — read the async-populated server list live.
+		resAdapter := mcpResourceAdapter{rt: rt}
+		rt.registry.Register(builtin.NewListMcpResources(rt.gate, resAdapter))
+		rt.registry.Register(builtin.NewReadMcpResource(rt.gate, resAdapter))
 	}
 
 	useTUI := flags.useTUI

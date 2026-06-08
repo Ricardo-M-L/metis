@@ -619,6 +619,13 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 		return nil, err
 	}
 	if resp.Error != nil {
+		// -32601 method-not-found: the server advertises no tools
+		// capability (e.g. a resources-only or prompts-only server).
+		// Normalize to "no tools" so the handshake still succeeds — same
+		// contract as ListPrompts / ListResources.
+		if resp.Error.Code == -32601 {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
 	}
 	var result ListToolsResult
@@ -702,6 +709,83 @@ func (c *Client) ListPrompts(ctx context.Context) ([]Prompt, error) {
 		return nil, err
 	}
 	return result.Prompts, nil
+}
+
+// Resource is an MCP-server-advertised resource (a file, DB row, API
+// response, …) the client can read by URI. Mirrors the MCP spec's
+// resources/list entry shape.
+type Resource struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	MimeType    string `json:"mimeType,omitempty"`
+}
+
+// ListResourcesResult mirrors the `resources/list` response.
+type ListResourcesResult struct {
+	Resources []Resource `json:"resources"`
+}
+
+// ResourceContent is one returned chunk from resources/read: either text
+// (Text set) or base64 binary (Blob set).
+type ResourceContent struct {
+	URI      string `json:"uri"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     string `json:"blob,omitempty"`
+}
+
+// ReadResourceResult mirrors the `resources/read` response.
+type ReadResourceResult struct {
+	Contents []ResourceContent `json:"contents"`
+}
+
+// ListResources returns the resources a server advertises. Servers
+// without the resources capability return method-not-found (-32601),
+// which we normalize to (nil, nil) — same "treat absence uniformly"
+// contract as ListPrompts.
+func (c *Client) ListResources(ctx context.Context) ([]Resource, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, RequestTimeout())
+		defer cancel()
+	}
+	resp, err := c.send(ctx, "resources/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		if resp.Error.Code == -32601 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
+	}
+	var result ListResourcesResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, err
+	}
+	return result.Resources, nil
+}
+
+// ReadResource fetches the contents of one resource by URI.
+func (c *Client) ReadResource(ctx context.Context, uri string) (*ReadResourceResult, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, RequestTimeout())
+		defer cancel()
+	}
+	resp, err := c.send(ctx, "resources/read", map[string]any{"uri": uri})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
+	}
+	var result ReadResourceResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // GetPrompt resolves a prompt template against `args`. Returns the
