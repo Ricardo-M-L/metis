@@ -1,0 +1,62 @@
+{
+  "name": "metis-ide",
+  "displayName": "Metis IDE",
+  "description": "Hosts an MCP server that lets the Metis CLI read your editor selection, see diagnostics, and show inline diffs.",
+  "version": "0.1.0",
+  "publisher": "ricardo-m-l",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "metis.ide.status",
+        "title": "Metis: IDE Bridge Status"
+      },
+      {
+        "command": "metis.ide.restart",
+        "title": "Metis: Restart IDE Bridge"
+      }
+    ],
+    "configuration": {
+      "title": "Metis IDE",
+      "properties": {
+        "metis.ide.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Host the MCP server the Metis CLI connects to."
+        },
+        "metis.ide.port": {
+          "type": "number",
+          "default": 0,
+          "description": "Fixed port for the MCP server (0 = pick a free port)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run build -- --watch",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "npm run build -- --minify"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^4.19.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}

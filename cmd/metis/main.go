@@ -1230,6 +1230,13 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			rt.mcpServersMu.Lock()
 			rt.mcpServers = append(rt.mcpServers, servers...)
 			rt.mcpServersMu.Unlock()
+			// Attach to a running IDE's MCP server if one advertises a
+			// matching workspace via ~/.metis/ide/*.lock (best-effort).
+			if ide := connectIDE(ctx, reg, debugLogFile); ide != nil {
+				rt.mcpServersMu.Lock()
+				rt.mcpServers = append(rt.mcpServers, ide)
+				rt.mcpServersMu.Unlock()
+			}
 		}(reg, mcpReg, lazyMode)
 	} else {
 		// Bare / non-TUI mode — stderr is fine, the user expects it.
@@ -1243,6 +1250,11 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			rt.mcpServersMu.Lock()
 			rt.mcpServers = append(rt.mcpServers, servers...)
 			rt.mcpServersMu.Unlock()
+			if ide := connectIDE(ctx, reg, os.Stderr); ide != nil {
+				rt.mcpServersMu.Lock()
+				rt.mcpServers = append(rt.mcpServers, ide)
+				rt.mcpServersMu.Unlock()
+			}
 		}(reg, mcpReg)
 	}
 

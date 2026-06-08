@@ -530,10 +530,22 @@ func cmdTasks(r *REPL, args string) string {
 // cmdIDE shows IDE / remote-bridge status so the user knows whether
 // /share is running and what address external clients should hit.
 func cmdIDE(r *REPL, args string) string {
-	if addr := bridgeCurrentAddr(); addr != "" {
-		return "ide: bridge running on http://" + addr
+	var lines []string
+	// IDE MCP attachment (extension hosts the server, metis connects).
+	if cwd, err := os.Getwd(); err == nil {
+		if lock, ok := runtime.DiscoverIDE(cwd); ok {
+			lines = append(lines, fmt.Sprintf("ide: attached to %s MCP at %s (tools: mcp__ide__*)", lock.IDEName, lock.Endpoint()))
+		} else {
+			lines = append(lines, "ide: no IDE MCP server found (looked in ~/.metis/ide/*.lock)")
+		}
 	}
-	return "ide: bridge off — start with /share to expose a localhost SSE endpoint"
+	// Outbound bridge (/share + ACP) status.
+	if addr := bridgeCurrentAddr(); addr != "" {
+		lines = append(lines, "bridge: running on http://"+addr)
+	} else {
+		lines = append(lines, "bridge: off — start with /share to expose a localhost SSE endpoint")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // cmdReview emits a system-prompt-style nudge asking the model to
@@ -1396,6 +1408,16 @@ func cmdCompact(r *REPL, args string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// PreCompact hook — trigger "manual" (the auto path in
+	// compaction_check.go fires its own with trigger "auto"). Lets
+	// observers back up the transcript before the summarizer runs.
+	if r.Loop.Hooks != nil {
+		r.Loop.Hooks.EmitPreCompact(ctx, agent.HookContext{Model: r.Loop.Model}, &agent.PreCompact{
+			Trigger:         "manual",
+			MessageCount:    before,
+			EstimatedTokens: r.Loop.EstimateContextTokens(),
+		})
+	}
 	compacted, err := r.Loop.Compactor.Compact(ctx, hist)
 	if err != nil {
 		return "compact failed: " + err.Error()

@@ -163,7 +163,7 @@ the agent doesn't re-ask the same question in the session.
 | `permission_ask.go` | mid-turn permission prompt with reply channel |
 | `compaction_check.go` | `maybeCompact` (preflight) + `tryRecoverOverflow` (retry on 4xx) |
 | `plan_emit.go` | PlanMode short-circuit |
-| `hooks.go` | PreToolUse / PostToolUse / Session* / Turn* / LoopEnd / Error |
+| `hooks.go` | PreToolUse / PostToolUse / Session* / Turn* / LoopEnd / Error / PreCompact |
 | `loopdetection.go` | repeated-call patterns → abort |
 | `loop_skill.go` | `/loop` driver (continuous self-paced execution) |
 
@@ -228,6 +228,24 @@ Two transports:
 Tools loaded from MCP servers register as `mcp__<server>__<tool>` so
 collisions with built-ins are impossible. Auth headers (`x-goog-api-key`,
 `Authorization`, …) forwarded through.
+
+Both transports run the spec-required lifecycle handshake — an
+`initialize` request + `notifications/initialized` — before the first
+`tools/list`. (Earlier metis used tools/list as a de-facto handshake;
+that broke against spec-strict servers like the official
+`@modelcontextprotocol/sdk`, which the VS Code IDE bridge is built on.)
+
+#### IDE integration (`internal/runtime/ide.go`, `editors/vscode/`)
+
+CC-style editor bridge. A VS Code extension (`editors/vscode/`) hosts a
+Streamable-HTTP MCP server exposing `getCurrentSelection` /
+`getDiagnostics` / `openDiff`, and writes a discovery lockfile to
+`~/.metis/ide/<port>.lock` (pid, port, workspace folders, bearer token).
+On startup metis runs `DiscoverIDE(cwd)` — picks the live server whose
+workspace contains cwd — and connects via the HTTP MCP client, surfacing
+its tools as `mcp__ide__*`. `/ide` shows attachment status. (CC uses a
+WebSocket transport here; metis reuses its existing HTTP/SSE client
+instead — both are valid MCP transports.)
 
 ### `internal/channels` — Chat-platform adapters
 
