@@ -222,3 +222,34 @@ func TestHTTPClient_Resources(t *testing.T) {
 		t.Fatalf("unexpected contents: %#v", rr.Contents)
 	}
 }
+
+// TestIsServerRequest distinguishes server→client requests (id+method)
+// from responses (id only) and notifications (method only).
+func TestIsServerRequest(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"server request", `{"jsonrpc":"2.0","id":1,"method":"roots/list"}`, true},
+		{"response", `{"jsonrpc":"2.0","id":1,"result":{}}`, false},
+		{"notification", `{"jsonrpc":"2.0","method":"notifications/initialized"}`, false},
+		{"null id with method", `{"jsonrpc":"2.0","id":null,"method":"x"}`, false},
+	}
+	for _, c := range cases {
+		_, m, _, ok := isServerRequest([]byte(c.msg))
+		if ok != c.want {
+			t.Errorf("%s: isServerRequest=%v want %v (method=%q)", c.name, ok, c.want, m)
+		}
+	}
+}
+
+func TestDefaultRootsHasCwd(t *testing.T) {
+	roots := defaultRoots()
+	if len(roots) == 0 {
+		t.Fatal("expected at least the cwd root")
+	}
+	if !strings.HasPrefix(roots[0].URI, "file://") {
+		t.Errorf("root URI should be a file:// URI, got %q", roots[0].URI)
+	}
+}

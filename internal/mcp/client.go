@@ -274,6 +274,56 @@ type Client struct {
 	// instead of time.UnixNano() avoids collisions when two send() calls
 	// land in the same nanosecond.
 	idSeq atomic.Uint64
+
+	// roots are the workspace roots advertised to servers and returned
+	// when a server sends a roots/list request. Defaults to cwd.
+	roots []Root
+	// sampler, when set, fulfills server-initiated sampling/createMessage
+	// requests by generating with the host LLM. nil → the client doesn't
+	// advertise the sampling capability and declines such requests.
+	sampler SamplingHandler
+}
+
+// Root is a workspace root advertised to MCP servers (roots/list).
+type Root struct {
+	URI  string `json:"uri"`
+	Name string `json:"name,omitempty"`
+}
+
+// SamplingHandler fulfills a server-initiated sampling/createMessage
+// request: given the raw params, it returns the raw JSON result (a
+// CreateMessageResult) or an error. Wired by the runtime to the host
+// provider; nil disables sampling.
+type SamplingHandler func(ctx context.Context, params json.RawMessage) (json.RawMessage, error)
+
+// SetRoots overrides the advertised workspace roots. Call before the
+// initialize handshake (i.e. before NewClient runs it) to have the
+// capability reflected; the roots/list responder uses the latest value
+// regardless.
+func (c *Client) SetRoots(roots []Root) { c.roots = roots }
+
+// SetSamplingHandler wires server-initiated sampling to the host LLM.
+// Call before NewClient's initialize so the capability is advertised.
+func (c *Client) SetSamplingHandler(h SamplingHandler) { c.sampler = h }
+
+// defaultRoots returns the cwd as the single advertised root.
+func defaultRoots() []Root {
+	wd, err := os.Getwd()
+	if err != nil || wd == "" {
+		return nil
+	}
+	return []Root{{URI: "file://" + wd, Name: filepathBase(wd)}}
+}
+
+// filepathBase is a tiny basename to avoid importing path/filepath just
+// for the root Name.
+func filepathBase(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' {
+			return p[i+1:]
+		}
+	}
+	return p
 }
 
 // NewClient creates an MCP client using the given transport.
@@ -285,6 +335,7 @@ func NewClient(ctx context.Context, transport Transport) *Client {
 		notifications: make(chan Notification, 50),
 		ctx:           ctx,
 		cancel:        cancel,
+		roots:         defaultRoots(),
 	}
 }
 
@@ -490,9 +541,19 @@ const MCPProtocolVersion = "2024-11-05"
 // SDK) reject the out-of-order tools/list. Called once by the client
 // constructors before the initial ListTools.
 func (c *Client) initialize(ctx context.Context) error {
+	// Advertise the client capabilities the server may rely on:
+	//   - roots: we answer roots/list with the workspace roots.
+	//   - sampling: only when a host-LLM sampler is wired, so servers
+	//     don't send sampling/createMessage we can't fulfill.
+	caps := map[string]any{
+		"roots": map[string]any{"listChanged": false},
+	}
+	if c.sampler != nil {
+		caps["sampling"] = map[string]any{}
+	}
 	params := map[string]any{
 		"protocolVersion": MCPProtocolVersion,
-		"capabilities":    map[string]any{},
+		"capabilities":    caps,
 		"clientInfo":      map[string]any{"name": "metis", "version": "0.1"},
 	}
 	resp, err := c.send(ctx, "initialize", params)
@@ -556,6 +617,110 @@ func (c *Client) sendNotification(ctx context.Context, method string, params int
 	return nil
 }
 
+// handleServerRequest fulfills a server→client JSON-RPC request (a
+// message carrying BOTH an id and a method). The two the spec defines
+// for our advertised capabilities are roots/list and
+// sampling/createMessage; ping is answered too. Anything else gets a
+// method-not-found error. The response is written back on the transport.
+//
+// Without this, server→client requests fell through the response/
+// notification split (they have an id, so the dispatcher looked them up
+// in c.pending, missed, and dropped them) — leaving the server hung
+// waiting for a reply.
+func (c *Client) handleServerRequest(id json.RawMessage, method string, params json.RawMessage) {
+	switch method {
+	case "roots/list":
+		c.writeServerResult(id, map[string]any{"roots": c.roots})
+	case "ping":
+		c.writeServerResult(id, map[string]any{})
+	case "sampling/createMessage":
+		if c.sampler == nil {
+			c.writeServerError(id, -32601, "client does not support sampling")
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.ctx, RequestTimeout())
+		defer cancel()
+		res, err := c.sampler(ctx, params)
+		if err != nil {
+			c.writeServerError(id, -32603, "sampling failed: "+err.Error())
+			return
+		}
+		c.writeServerRawResult(id, res)
+	default:
+		c.writeServerError(id, -32601, "method not found: "+method)
+	}
+}
+
+// writeServerResult marshals result and writes a JSON-RPC response with
+// the given id back to the server.
+func (c *Client) writeServerResult(id json.RawMessage, result any) {
+	raw, err := json.Marshal(result)
+	if err != nil {
+		c.writeServerError(id, -32603, "marshal result: "+err.Error())
+		return
+	}
+	c.writeServerRawResult(id, raw)
+}
+
+func (c *Client) writeServerRawResult(id json.RawMessage, raw json.RawMessage) {
+	c.writeServerEnvelope(map[string]any{"jsonrpc": "2.0", "id": id, "result": raw})
+}
+
+func (c *Client) writeServerError(id json.RawMessage, code int, msg string) {
+	c.writeServerEnvelope(map[string]any{
+		"jsonrpc": "2.0", "id": id,
+		"error": map[string]any{"code": code, "message": msg},
+	})
+}
+
+// writeServerEnvelope frames and sends a server→client response. stdio
+// writes to stdin; HTTP POSTs the response back to the endpoint (the
+// Streamable-HTTP way a client replies to a server request).
+func (c *Client) writeServerEnvelope(env map[string]any) {
+	data, err := json.Marshal(env)
+	if err != nil {
+		return
+	}
+	c.mu.RLock()
+	transport := c.transport
+	c.mu.RUnlock()
+	switch t := transport.(type) {
+	case *StdioTransport:
+		_, _ = t.stdin.Write(append(data, '\n'))
+	case *HTTPTransport:
+		req, err := http.NewRequestWithContext(c.ctx, "POST", t.endpoint, strings.NewReader(string(data)))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		for k, v := range t.headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := t.client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}
+}
+
+// isServerRequest reports whether a raw message is a server→client
+// request (both id and method present) and extracts the pieces.
+func isServerRequest(msg []byte) (id json.RawMessage, method string, params json.RawMessage, ok bool) {
+	var probe struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(msg, &probe) != nil {
+		return nil, "", nil, false
+	}
+	if len(probe.ID) > 0 && string(probe.ID) != "null" && probe.Method != "" {
+		return probe.ID, probe.Method, probe.Params, true
+	}
+	return nil, "", nil, false
+}
+
 // readLoop pumps JSON-RPC messages from the stdio transport. On EOF or any
 // decode error it cancels c.ctx so blocked send() callers wake up with
 // ErrTransportClosed instead of waiting on their per-call ctx to expire.
@@ -577,6 +742,13 @@ func (c *Client) readLoop() {
 		var msg json.RawMessage
 		if err := dec.Decode(&msg); err != nil {
 			return
+		}
+		// Server→client request (has BOTH id and method) — answer it.
+		// Must be checked before the response branch, which keys only on
+		// the presence of an id.
+		if id, method, params, ok := isServerRequest(msg); ok {
+			go c.handleServerRequest(id, method, params)
+			continue
 		}
 		// Try response (has id)
 		var resp JSONRPCResponse
@@ -921,6 +1093,12 @@ func (c *Client) parseSSE(r io.Reader) {
 // channel (no id). Shared between stdio and HTTP+SSE paths so the
 // per-transport code only needs to forward bytes.
 func (c *Client) dispatchJSONRPC(data []byte) {
+	// Server→client request (id AND method) — answer it before the
+	// response/notification split below.
+	if id, method, params, ok := isServerRequest(data); ok {
+		go c.handleServerRequest(id, method, params)
+		return
+	}
 	var probe struct {
 		ID interface{} `json:"id"`
 	}
