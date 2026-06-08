@@ -16,8 +16,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 // injectPeerMessages drains every pending PeerMessage on
@@ -32,36 +30,15 @@ func (l *Loop) injectPeerMessages(out chan<- Event) {
 	if l.PeerInbox == nil {
 		return
 	}
-	msgs := drainPeerMessages(l.PeerInbox)
+	msgs := drainChan(l.PeerInbox)
 	if len(msgs) == 0 {
 		return
 	}
-	body := formatPeerMessages(msgs)
-	l.Messages = append(l.Messages, llm.Message{
-		Role:    llm.RoleUser,
-		Content: []llm.ContentBlock{{Type: "text", Text: body}},
-	})
+	l.appendInjectedMessage(formatPeerMessages(msgs))
 	emit(context.Background(), out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[peer messaging] %d message(s) delivered", len(msgs)),
 	})
-}
-
-// drainPeerMessages pulls every PeerMessage currently buffered on
-// the channel without blocking. Returns them in arrival order.
-func drainPeerMessages(ch <-chan PeerMessage) []PeerMessage {
-	var out []PeerMessage
-	for {
-		select {
-		case m, ok := <-ch:
-			if !ok {
-				return out
-			}
-			out = append(out, m)
-		default:
-			return out
-		}
-	}
 }
 
 // formatPeerMessages builds the synthetic user message body. Outer

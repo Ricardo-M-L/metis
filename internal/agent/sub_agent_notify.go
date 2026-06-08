@@ -15,9 +15,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
-
-	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 // injectSubAgentNotifications drains every pending SubAgentNotification
@@ -31,36 +28,15 @@ func (l *Loop) injectSubAgentNotifications(out chan<- Event) {
 	if l.subAgentNotify == nil {
 		return
 	}
-	notifs := drainSubAgentNotifications(l.subAgentNotify)
+	notifs := drainChan(l.subAgentNotify)
 	if len(notifs) == 0 {
 		return
 	}
-	body := formatSubAgentNotifications(notifs)
-	l.Messages = append(l.Messages, llm.Message{
-		Role:    llm.RoleUser,
-		Content: []llm.ContentBlock{{Type: "text", Text: body}},
-	})
+	l.appendInjectedMessage(formatSubAgentNotifications(notifs))
 	emit(context.Background(), out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[sub-agent idle] %d background sub-agent(s) finished", len(notifs)),
 	})
-}
-
-// drainSubAgentNotifications pulls every SubAgentNotification currently
-// buffered on ch without blocking. Returns them in arrival order.
-func drainSubAgentNotifications(ch <-chan SubAgentNotification) []SubAgentNotification {
-	var out []SubAgentNotification
-	for {
-		select {
-		case n, ok := <-ch:
-			if !ok {
-				return out
-			}
-			out = append(out, n)
-		default:
-			return out
-		}
-	}
 }
 
 // formatSubAgentNotifications builds the synthetic user message body.
@@ -75,7 +51,7 @@ func formatSubAgentNotifications(ns []SubAgentNotification) string {
 		fmt.Fprintf(&b, "Background sub-agent %q (%s) finished with status %s",
 			n.Name, n.AgentID, n.Status)
 		if n.Duration > 0 {
-			fmt.Fprintf(&b, " in %s", humanizeDuration(n.Duration))
+			fmt.Fprintf(&b, " in %s", HumanizeDuration(n.Duration))
 		}
 		b.WriteString(".\n")
 		if n.Err != nil {
@@ -89,7 +65,7 @@ func formatSubAgentNotifications(ns []SubAgentNotification) string {
 		for _, n := range ns {
 			fmt.Fprintf(&b, "  - %q (%s): %s", n.Name, n.AgentID, n.Status)
 			if n.Duration > 0 {
-				fmt.Fprintf(&b, " (%s)", humanizeDuration(n.Duration))
+				fmt.Fprintf(&b, " (%s)", HumanizeDuration(n.Duration))
 			}
 			if n.Err != nil {
 				fmt.Fprintf(&b, " — error: %v", n.Err)
@@ -100,21 +76,4 @@ func formatSubAgentNotifications(ns []SubAgentNotification) string {
 	b.WriteString("Use SubAgentOutput to read each sub-agent's full output.")
 	b.WriteString("\n</sub_agent_idle>")
 	return b.String()
-}
-
-// humanizeDuration formats a duration as a concise human string.
-// Reuses the same thresholds as message_teammate.go's humanDuration
-// so idle notification timing reads consistently with the "finished
-// 35s ago" message the model already sees from MessageTeammate errors.
-func humanizeDuration(d time.Duration) string {
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
-	}
 }

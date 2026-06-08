@@ -18,8 +18,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 // injectDreamNotifications drains every pending DreamNotification on
@@ -33,36 +31,17 @@ func (l *Loop) injectDreamNotifications(out chan<- Event) {
 	if l.DreamNotify == nil {
 		return
 	}
-	notifs := drainDreamNotifications(l.DreamNotify)
+	notifs := drainChan(l.DreamNotify)
 	if len(notifs) == 0 {
 		return
 	}
-	body := formatDreamNotifications(notifs)
-	l.Messages = append(l.Messages, llm.Message{
-		Role:    llm.RoleUser,
-		Content: []llm.ContentBlock{{Type: "text", Text: body}},
-	})
+	l.appendInjectedMessage(formatDreamNotifications(notifs))
 	// Mirror surface to the TUI so the user sees the same "memory
 	// updated" banner the model is reacting to.
 	emit(context.Background(), out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[auto-memory] %d consolidation(s) completed", len(notifs)),
 	})
-}
-
-func drainDreamNotifications(ch <-chan DreamNotification) []DreamNotification {
-	var out []DreamNotification
-	for {
-		select {
-		case n, ok := <-ch:
-			if !ok {
-				return out
-			}
-			out = append(out, n)
-		default:
-			return out
-		}
-	}
 }
 
 // formatDreamNotifications builds the <memory_consolidation_done>

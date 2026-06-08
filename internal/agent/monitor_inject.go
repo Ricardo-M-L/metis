@@ -11,8 +11,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 // injectMonitorEvents drains every pending MonitorEvent on
@@ -27,36 +25,15 @@ func (l *Loop) injectMonitorEvents(out chan<- Event) {
 	if l.Monitors == nil {
 		return
 	}
-	events := drainMonitorEvents(l.Monitors.Events())
+	events := drainChan(l.Monitors.Events())
 	if len(events) == 0 {
 		return
 	}
-	body := formatMonitorEvents(events)
-	l.Messages = append(l.Messages, llm.Message{
-		Role:    llm.RoleUser,
-		Content: []llm.ContentBlock{{Type: "text", Text: body}},
-	})
+	l.appendInjectedMessage(formatMonitorEvents(events))
 	emit(context.Background(), out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[monitor] %d match(es) injected", len(events)),
 	})
-}
-
-// drainMonitorEvents pulls every event currently buffered without
-// blocking. Returns them in arrival order.
-func drainMonitorEvents(ch <-chan MonitorEvent) []MonitorEvent {
-	var out []MonitorEvent
-	for {
-		select {
-		case e, ok := <-ch:
-			if !ok {
-				return out
-			}
-			out = append(out, e)
-		default:
-			return out
-		}
-	}
 }
 
 // formatMonitorEvents builds the synthetic user message body. The

@@ -197,8 +197,10 @@ func SubAgentNotifyFromContext(ctx context.Context) chan<- SubAgentNotification 
 	if ctx == nil {
 		return nil
 	}
-	v, _ := ctx.Value(subAgentNotifyKey{}).(chan<- SubAgentNotification)
-	return v
+	if v, ok := ctx.Value(subAgentNotifyKey{}).(chan<- SubAgentNotification); ok {
+		return v
+	}
+	return nil
 }
 
 // eventOutKey carries the parent loop's event channel down to tools

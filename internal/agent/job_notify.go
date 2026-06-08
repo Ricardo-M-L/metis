@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/jobs"
-	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 // injectJobNotifications drains every pending notification on
@@ -35,15 +34,11 @@ func (l *Loop) injectJobNotifications(out chan<- Event) {
 	if l.JobNotify == nil {
 		return
 	}
-	notifs := drainJobNotifications(l.JobNotify)
+	notifs := drainChan(l.JobNotify)
 	if len(notifs) == 0 {
 		return
 	}
-	body := formatJobNotifications(notifs)
-	l.Messages = append(l.Messages, llm.Message{
-		Role:    llm.RoleUser,
-		Content: []llm.ContentBlock{{Type: "text", Text: body}},
-	})
+	l.appendInjectedMessage(formatJobNotifications(notifs))
 	// Surface to the TUI too so the user sees the same notification
 	// banner the model is reacting to (helps explain why the model
 	// suddenly says "I see job bg_xxx finished, ...").
@@ -51,23 +46,6 @@ func (l *Loop) injectJobNotifications(out chan<- Event) {
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[job pool] %d notification(s) injected", len(notifs)),
 	})
-}
-
-// drainJobNotifications pulls every notification currently buffered
-// on the channel without blocking. Returns them in arrival order.
-func drainJobNotifications(ch <-chan jobs.Notification) []jobs.Notification {
-	var out []jobs.Notification
-	for {
-		select {
-		case n, ok := <-ch:
-			if !ok {
-				return out
-			}
-			out = append(out, n)
-		default:
-			return out
-		}
-	}
 }
 
 // formatJobNotifications builds the synthetic user message body. The
