@@ -424,7 +424,7 @@ that lights up while the turn is running and clears on completion.
 | `Edit` | exclusive | unique-match enforced, structured diff render |
 | `Write` | exclusive | absolute paths only |
 | `NotebookEdit` | exclusive | edit a single cell in a `.ipynb` notebook |
-| `LSP` | safe | symbol/diagnostic lookups via gopls when available |
+| `LSP` | safe | hover/definition/references/implementations via gopls (Go), pyright (Python), typescript-language-server (TS/JS), rust-analyzer (Rust) when installed |
 | `Memory` | exclusive | persistent memory CRUD |
 | `Skill` | safe | invoke a registered skill |
 | `AskUser` | exclusive | blocking 3-5 option menu — model surfaces a question, TUI renders numbered choices + optional freeform input, tool returns chosen answer |

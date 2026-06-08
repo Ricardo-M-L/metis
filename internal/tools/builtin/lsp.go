@@ -13,49 +13,44 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-// LSP is a "minimum useful" LSP query tool that shells out to per-language
-// LSP CLIs (gopls / pyright / typescript-language-server stdio probe).
-// Not a full LSP client — claude-code's LSPTool is, and metis can grow
-// into one later. For now this covers the 80% cases (hover, definition,
-// references on Go) and degrades gracefully for other languages.
+// LSP is a "minimum useful" LSP query tool. Go is driven through gopls's
+// mature query CLI (`gopls definition`, …); every other language is
+// driven through a minimal stdio LSP client (lsp_client.go) that spins a
+// fresh server per query — pyright (Python), typescript-language-server
+// (TS/JS), rust-analyzer (Rust). Languages with no installed backend
+// degrade gracefully with a clear message rather than pretending.
 //
 // Action set:
 //   - hover       — return hover text at file:line:col
 //   - definition  — find where the symbol at file:line:col is defined
 //   - references  — find every reference to the symbol at file:line:col
-//   - implementations — find implementations (Go interfaces) at file:line:col
-//
-// Only Go is fully supported (uses `gopls` CLI subcommand). For other
-// languages we return a clear "no LSP backend available" rather than
-// pretending. Users can install gopls if needed.
+//   - implementations — find implementations at file:line:col
 //
 // LSP intentionally does NOT embed tools.BaseTool — it implements its
-// own IsEnabled() that checks whether `gopls` is on PATH. When gopls
-// is missing the tool is hidden from the model entirely so it never
-// gets a tool call it can only fail. This is the "tool self-decides
-// based on environment" pattern claude-code uses for tools like
-// WebBrowser (depends on chromium binary).
+// own IsEnabled() that checks whether ANY supported backend is on PATH.
+// When none is present the tool is hidden from the model entirely so it
+// never gets a tool call it can only fail. This is the "tool
+// self-decides based on environment" pattern claude-code uses for tools
+// like WebBrowser (depends on chromium binary).
 type LSP struct{ gate *permission.Gate }
 
-// IsEnabled reports whether the LSP tool can actually function in
-// this environment. Today that means: gopls is on PATH. Other
-// languages would extend this — e.g. add pyright / tsserver checks
-// once their handlers land. Called once at registration; the
-// exec.LookPath cost (one stat call) is negligible.
+// IsEnabled reports whether the LSP tool can function here — i.e. at
+// least one supported backend (gopls / pyright / typescript-language-
+// server / rust-analyzer) is on PATH. Called once at registration; the
+// exec.LookPath cost (a few stat calls) is negligible.
 //
-// Rationale for self-disable rather than degrade-and-error: a tool
-// that 100% errors on every input is noise in the model's tool
-// palette. Hiding it (IsEnabled=false → reg.Restrict filters out)
-// is cleaner — model doesn't see it, model doesn't try it. Mirrors
-// claude-code's Tool.isEnabled (Tool.ts:403).
+// Rationale for self-disable rather than degrade-and-error: a tool that
+// 100% errors on every input is noise in the model's tool palette.
+// Hiding it (IsEnabled=false → reg.Restrict filters out) is cleaner —
+// model doesn't see it, model doesn't try it. Mirrors claude-code's
+// Tool.isEnabled (Tool.ts:403).
 func (LSP) IsEnabled() bool {
-	_, err := exec.LookPath("gopls")
-	return err == nil
+	return anyLSPServerAvailable()
 }
 
 func (LSP) Name() string { return "LSP" }
 func (LSP) Description() string {
-	return "Query LSP-style semantics (hover / definition / references / implementations) at file:line:col. Currently backed by gopls for Go; other languages return a friendly fallback."
+	return "Query LSP-style semantics (hover / definition / references / implementations) at file:line:col. Backed by gopls (Go), pyright (Python), typescript-language-server (TS/JS), and rust-analyzer (Rust) when installed; languages with no installed server return a friendly fallback."
 }
 
 func (LSP) InputSchema() map[string]any {
@@ -99,14 +94,22 @@ func (l LSP) Execute(ctx context.Context, in map[string]any) (*tools.Result, err
 	}
 
 	lang := detectLanguage(path)
-	switch lang {
-	case "go":
+	if lang == "go" {
 		return runGoplsQuery(ctx, action, path, line, col)
-	default:
+	}
+	// Non-Go: drive the language's stdio server via the minimal client.
+	srv, known := stdioLSPServerFor(lang)
+	if !known {
 		return &tools.Result{
-			Output: fmt.Sprintf("LSP backend for %s not configured. Install gopls for Go; other languages are TODO. (file: %s)", lang, filepath.Base(path)),
+			Output: fmt.Sprintf("LSP backend for %s not configured (supported: Go, Python, TypeScript, JavaScript, Rust). (file: %s)", lang, filepath.Base(path)),
 		}, nil
 	}
+	if !srv.available() {
+		return &tools.Result{
+			Output: fmt.Sprintf("LSP server %q for %s is not installed — `%s` not on PATH. (file: %s)", srv.cmd, lang, srv.cmd, filepath.Base(path)),
+		}, nil
+	}
+	return runStdioLSPQuery(ctx, srv, action, path, line, col)
 }
 
 func detectLanguage(path string) string {

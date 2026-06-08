@@ -44,6 +44,13 @@ func TestLSP_RequiresAction(t *testing.T) {
 }
 
 func TestLSP_NonGoLanguageDegradeGracefully(t *testing.T) {
+	// When the language's server isn't installed, Execute must degrade
+	// to a friendly non-error message rather than failing. If pyright
+	// happens to be installed in this environment we skip — it would
+	// (correctly) error on the nonexistent /tmp/x.py file.
+	if srv, ok := stdioLSPServerFor("python"); ok && srv.available() {
+		t.Skip("pyright installed; skipping the no-backend degrade assertion")
+	}
 	tool := LSP{gate: permission.New(permission.ModeBypass)}
 	res, err := tool.Execute(context.Background(), map[string]any{
 		"action": "definition", "path": "/tmp/x.py", "line": 1, "column": 1,
@@ -52,7 +59,36 @@ func TestLSP_NonGoLanguageDegradeGracefully(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.IsError {
-		t.Errorf("non-Go should NOT mark as error, just an info message")
+		t.Errorf("non-Go with no backend should NOT mark as error, just an info message")
+	}
+}
+
+func TestLSP_UnknownLanguageDegradeGracefully(t *testing.T) {
+	// A language metis has no server table entry for must always degrade
+	// to a non-error info message, regardless of installed tooling.
+	tool := LSP{gate: permission.New(permission.ModeBypass)}
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"action": "definition", "path": "/tmp/x.rb", "line": 1, "column": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Errorf("unknown language should degrade to a non-error info message")
+	}
+}
+
+func TestStdioLSPServerFor(t *testing.T) {
+	for _, lang := range []string{"python", "typescript", "javascript", "rust"} {
+		if _, ok := stdioLSPServerFor(lang); !ok {
+			t.Errorf("expected a server config for %q", lang)
+		}
+	}
+	if _, ok := stdioLSPServerFor("go"); ok {
+		t.Error("go must NOT be in the stdio table (driven via gopls CLI)")
+	}
+	if _, ok := stdioLSPServerFor("ruby"); ok {
+		t.Error("ruby has no configured server; expected ok=false")
 	}
 }
 
