@@ -50,6 +50,12 @@ const (
 	EventSubagentStart      Event = "SubagentStart"
 	EventSubagentStop       Event = "SubagentStop"
 	EventCwdChanged         Event = "CwdChanged"
+	// EventPreCompact fires just before the agent loop summarizes its
+	// history (auto-compaction crossing the threshold, or a manual
+	// /compact). Observers use it to back up / log the transcript
+	// before it's collapsed. Read-only — matches claude-code's
+	// PreCompact hook (settings.json: "PreCompact").
+	EventPreCompact Event = "PreCompact"
 )
 
 // Context is the read-only data available to all hook handlers.
@@ -188,6 +194,17 @@ type CwdChanged struct {
 	NewCwd string
 }
 
+// PreCompact fires just before the loop summarizes its history. Trigger
+// is "auto" (threshold crossed) or "manual" (/compact). MessageCount and
+// EstimatedTokens describe the transcript about to be compacted, so an
+// observer can decide whether to back it up. Read-only.
+type PreCompact struct {
+	Context
+	Trigger         string // "auto" | "manual"
+	MessageCount    int
+	EstimatedTokens int
+}
+
 // Handler signatures for each event type. Plugin authors write one of
 // these and pass it to Registry.Register.
 type (
@@ -209,6 +226,7 @@ type (
 	SubagentStartHandler      func(context.Context, Context, *SubagentStart)
 	SubagentStopHandler       func(context.Context, Context, *SubagentStop)
 	CwdChangedHandler         func(context.Context, Context, *CwdChanged)
+	PreCompactHandler         func(context.Context, Context, *PreCompact)
 )
 
 // asyncBit is the per-handler async flag stored alongside the handler.
@@ -246,6 +264,10 @@ type permDeniedEntry struct {
 	h     PermissionDeniedHandler
 	async bool
 }
+type preCompactEntry struct {
+	h     PreCompactHandler
+	async bool
+}
 
 // Registry holds registered hooks, grouped by event type. Thread-safe.
 // Pre-action hooks (PreToolUse, PermissionRequest, SessionStart) fire
@@ -273,6 +295,7 @@ type Registry struct {
 	subagentStart []SubagentStartHandler
 	subagentStop  []SubagentStopHandler
 	cwdChanged    []CwdChangedHandler
+	preCompact    []preCompactEntry
 }
 
 func NewRegistry() *Registry { return &Registry{} }
@@ -344,6 +367,8 @@ func (r *Registry) register(handler any, async bool) {
 		r.subagentStop = append(r.subagentStop, h)
 	case CwdChangedHandler:
 		r.cwdChanged = append(r.cwdChanged, h)
+	case PreCompactHandler:
+		r.preCompact = append(r.preCompact, preCompactEntry{h: h, async: async})
 	}
 }
 
@@ -461,6 +486,22 @@ func (r *Registry) EmitNotification(ctx context.Context, tc Context, n *Notifica
 			go e.h(ctx, tc, n)
 		} else {
 			e.h(ctx, tc, n)
+		}
+	}
+}
+
+// EmitPreCompact fans out to all PreCompact handlers before the loop
+// summarizes its history. Read-only (observers back up / log the
+// transcript); sync handlers run inline, async ones detach.
+func (r *Registry) EmitPreCompact(ctx context.Context, tc Context, in *PreCompact) {
+	r.mu.RLock()
+	handlers := r.preCompact
+	r.mu.RUnlock()
+	for _, e := range handlers {
+		if e.async {
+			go e.h(ctx, tc, in)
+		} else {
+			e.h(ctx, tc, in)
 		}
 	}
 }

@@ -35,6 +35,7 @@ type (
 	ModifiedPreToolUse = pubhook.ModifiedPreToolUse
 	HookOutput         = pubhook.Output
 	PostToolUseHook    = pubhook.PostToolUse
+	PreCompact         = pubhook.PreCompact
 )
 
 // Handler typedef re-exports.
@@ -47,6 +48,7 @@ type (
 	TurnEndHandler      = pubhook.TurnEndHandler
 	LoopEndHandler      = pubhook.LoopEndHandler
 	ErrorHandler        = pubhook.ErrorHandler
+	PreCompactHandler   = pubhook.PreCompactHandler
 )
 
 // HookRegistry is the in-process registry. Re-exported here so existing

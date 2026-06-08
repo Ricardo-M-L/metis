@@ -423,6 +423,12 @@ func renderHooksList(cfg *config.Config) string {
 		{"PostToolUse", cfg.Hooks.PostToolUse},
 		{"SessionStart", cfg.Hooks.SessionStart},
 		{"SessionEnd", cfg.Hooks.SessionEnd},
+		{"UserPromptSubmit", cfg.Hooks.UserPromptSubmit},
+		{"Notification", cfg.Hooks.Notification},
+		{"PermissionRequest", cfg.Hooks.PermissionRequest},
+		{"PermissionDenied", cfg.Hooks.PermissionDenied},
+		{"CwdChanged", cfg.Hooks.CwdChanged},
+		{"PreCompact", cfg.Hooks.PreCompact},
 	}
 	rows := make([]infoRow, 0, 16)
 	any := false

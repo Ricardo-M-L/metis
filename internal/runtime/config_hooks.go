@@ -225,6 +225,25 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 			}
 		}))
 	}
+	for _, h := range cfg.PreCompact {
+		spec := h
+		if !isCommandType(spec.Type) {
+			continue
+		}
+		reg.Register(pubhook.PreCompactHandler(func(ctx context.Context, tc pubhook.Context, p *pubhook.PreCompact) {
+			payload := map[string]any{
+				"hook_event_name":  "PreCompact",
+				"session_id":       tc.SessionID,
+				"model":            tc.Model,
+				"trigger":          p.Trigger,
+				"message_count":    p.MessageCount,
+				"estimated_tokens": p.EstimatedTokens,
+			}
+			if _, err := runHookCommand(ctx, spec, payload); err != nil {
+				fmt.Fprintf(os.Stderr, "hook PreCompact %s: %v\n", spec.Command, err)
+			}
+		}))
+	}
 }
 
 // parseUserPromptResponse expects an empty body (proceed) or:

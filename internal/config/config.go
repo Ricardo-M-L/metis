@@ -152,6 +152,7 @@ type HooksConfig struct {
 	PermissionRequest []HookSpec `toml:"permission_request"`
 	PermissionDenied  []HookSpec `toml:"permission_denied"`
 	CwdChanged        []HookSpec `toml:"cwd_changed"`
+	PreCompact        []HookSpec `toml:"pre_compact"`
 }
 
 // HookSpec is one entry in HooksConfig. Type defaults to "command".

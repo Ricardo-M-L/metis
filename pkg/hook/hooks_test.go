@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRegistry_PreToolUse_Intercept(t *testing.T) {
@@ -54,6 +55,51 @@ func TestRegistry_PostToolUseFanOut(t *testing.T) {
 	if n.Load() != 5 {
 		t.Errorf("expected 5 fan-outs, got %d", n.Load())
 	}
+}
+
+func TestRegistry_PreCompactFanOut(t *testing.T) {
+	r := NewRegistry()
+	var got atomic.Int32
+	var trigger atomic.Value
+	for i := 0; i < 3; i++ {
+		r.Register(PreCompactHandler(func(_ context.Context, _ Context, p *PreCompact) {
+			got.Add(1)
+			trigger.Store(p.Trigger)
+		}))
+	}
+	r.EmitPreCompact(context.Background(), Context{}, &PreCompact{
+		Trigger:         "auto",
+		MessageCount:    42,
+		EstimatedTokens: 9000,
+	})
+	if got.Load() != 3 {
+		t.Errorf("expected 3 PreCompact fan-outs, got %d", got.Load())
+	}
+	if trigger.Load() != "auto" {
+		t.Errorf("expected trigger=auto, got %v", trigger.Load())
+	}
+}
+
+func TestRegistry_PreCompactAsyncDetaches(t *testing.T) {
+	r := NewRegistry()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	r.RegisterAsync(PreCompactHandler(func(_ context.Context, _ Context, _ *PreCompact) {
+		close(started)
+		<-release // would block the emitter if run inline
+	}))
+	done := make(chan struct{})
+	go func() {
+		r.EmitPreCompact(context.Background(), Context{}, &PreCompact{Trigger: "manual"})
+		close(done)
+	}()
+	<-started // handler is running
+	select {
+	case <-done: // emitter returned without waiting for the handler — async worked
+	case <-time.After(2 * time.Second):
+		t.Fatal("EmitPreCompact blocked on async handler")
+	}
+	close(release)
 }
 
 func TestRegistry_UnknownHandlerSilentlyDropped(t *testing.T) {

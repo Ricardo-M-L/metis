@@ -139,6 +139,37 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 		}
 	}
 
+	// PreCompact hook — fires exactly once per maybeCompact pass, right
+	// before the first LLM-driven summarization tier (Collapse or
+	// Compact, whichever runs first). Observers use it to back up / log
+	// the transcript before it's folded. Trigger "auto": threshold
+	// crossed. Manual /compact emits its own with "manual".
+	//
+	// The emit happens with l.mu RELEASED, even though maybeCompact holds
+	// it for the rest of the body. A PreCompact handler's natural move is
+	// to read the transcript (l.History) to back it up — and History
+	// takes l.mu, so emitting under the lock would deadlock the agent on
+	// the obvious handler. We snapshot the size first (under the lock),
+	// drop the lock for the emit, then reacquire. The transcript is in a
+	// consistent between-tier state at this point; the tier that runs
+	// next re-reads l.Messages fresh.
+	preCompactFired := false
+	firePreCompact := func() {
+		if preCompactFired || l.Hooks == nil {
+			return
+		}
+		preCompactFired = true
+		pc := &PreCompact{
+			Trigger:         "auto",
+			MessageCount:    len(l.Messages),
+			EstimatedTokens: estimateTokens(l.Messages),
+		}
+		tc := HookContext{Model: l.Model, Turn: l.turnIdx}
+		l.mu.Unlock()
+		l.Hooks.EmitPreCompact(ctx, tc, pc)
+		l.mu.Lock()
+	}
+
 	// Tier 3 — Context-collapse: fold early middle into a summary
 	// (lighter than full Compact, heavier than snip). Runs at 0.78
 	// vs Compact's 0.85 so a long-thread session gets an early
@@ -152,6 +183,7 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	// counter and decides accordingly.
 	if l.Compactor.ShouldCollapse(l.Messages) {
 		before := len(l.Messages)
+		firePreCompact()
 		// Tell the UI we're entering an LLM-driven phase so it can swap
 		// the spinner label. Without this the TUI shows "Thinking..." for
 		// 5-30s while summarize streams, which looks like a hang — see
@@ -188,6 +220,7 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 		return
 	}
 	before := len(l.Messages)
+	firePreCompact() // no-op if collapse already fired it this pass
 	emit(ctx, out, Event{Kind: EventCompactionStart, Info: "compact"})
 	compactCtx := WithEventOut(ctx, out)
 	compacted, err := l.Compactor.Compact(compactCtx, l.Messages)
