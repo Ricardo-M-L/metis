@@ -449,6 +449,13 @@ func exchangeCodeForTokenFull(p OAuthProvider, code, redirectURI, verifier strin
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, fmt.Errorf("token endpoint: bad response: %w", err)
 	}
+	return tokenFromRaw(raw)
+}
+
+// tokenFromRaw decodes an OAuth token-endpoint JSON object into a Token,
+// converting expires_in (seconds) to an absolute ExpiresAt. Shared by the
+// authorization-code exchange and the refresh-token flow.
+func tokenFromRaw(raw map[string]any) (*Token, error) {
 	access, _ := raw["access_token"].(string)
 	if access == "" {
 		if e, ok := raw["error"].(string); ok {
@@ -466,18 +473,76 @@ func exchangeCodeForTokenFull(p OAuthProvider, code, redirectURI, verifier strin
 	if v, ok := raw["token_type"].(string); ok {
 		tok.TokenType = v
 	}
-	// expires_in is in seconds; convert to absolute time so callers
-	// don't have to re-compute against the token-receipt timestamp.
 	switch v := raw["expires_in"].(type) {
 	case float64:
 		if v > 0 {
 			tok.ExpiresAt = time.Now().Add(time.Duration(v) * time.Second)
 		}
 	case string:
-		// Some PHP-backed IdPs send expires_in as a string.
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			tok.ExpiresAt = time.Now().Add(time.Duration(n) * time.Second)
 		}
+	}
+	return tok, nil
+}
+
+// OAuthLoginWithProvider runs the PKCE login flow against an explicitly
+// supplied provider config (e.g. one discovered from an MCP server's
+// .well-known metadata) rather than a KnownProviders name. Returns the
+// rich Token (access + refresh + expiry).
+func OAuthLoginWithProvider(p OAuthProvider, opts OAuthOptions) (*Token, error) {
+	verifier, challenge := makePKCE()
+	state, err := randomState()
+	if err != nil {
+		return nil, err
+	}
+	if opts.Manual {
+		if p.ManualRedirectURL == "" {
+			return nil, fmt.Errorf("manual mode requires ManualRedirectURL")
+		}
+		return runOAuthManual(p, verifier, challenge, state, opts)
+	}
+	return runOAuthAutomatic(p, verifier, challenge, state, opts)
+}
+
+// RefreshToken exchanges a refresh_token for a fresh access token at the
+// provider's token endpoint. Used to renew an expired MCP OAuth token
+// without a new browser round-trip.
+func RefreshToken(p OAuthProvider, refreshToken string) (*Token, error) {
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	if p.ClientID != "" {
+		form.Set("client_id", p.ClientID)
+	}
+	if len(p.Scopes) > 0 {
+		form.Set("scope", strings.Join(p.Scopes, " "))
+	}
+	req, err := http.NewRequest("POST", p.TokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("refresh token endpoint %d", resp.StatusCode)
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("refresh: bad response: %w", err)
+	}
+	tok, err := tokenFromRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	// Some providers omit refresh_token on refresh — keep the old one.
+	if tok.RefreshToken == "" {
+		tok.RefreshToken = refreshToken
 	}
 	return tok, nil
 }

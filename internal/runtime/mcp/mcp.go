@@ -26,6 +26,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
+	"github.com/Ricardo-M-L/metis/internal/mcpoauth"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
@@ -38,6 +39,29 @@ import (
 // secrets/paths/argv out of the otherwise-shareable config.toml.
 type Registry struct {
 	Servers []ServerEntry `toml:"servers"`
+}
+
+// resolveAuthHeaders returns the HTTP headers to use for a server,
+// injecting a freshly-ensured OAuth Bearer token when the entry declares
+// auth="oauth". On any OAuth failure it logs to stderr and falls back to
+// the static Headers, so a broken auth setup degrades to "connect without
+// the token" (the server then returns its own 401) rather than hard-
+// failing the whole launch. No-op for stdio entries.
+func resolveAuthHeaders(ctx context.Context, e ServerEntry) map[string]string {
+	if e.URL == "" || !strings.EqualFold(e.Auth, "oauth") {
+		return e.Headers
+	}
+	tok, err := mcpoauth.NewTokenStore().EnsureToken(ctx, e.Name, e.URL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mcp: oauth for %q failed: %v\n", e.Name, err)
+		return e.Headers
+	}
+	out := make(map[string]string, len(e.Headers)+1)
+	for k, v := range e.Headers {
+		out[k] = v
+	}
+	out["Authorization"] = "Bearer " + tok
+	return out
 }
 
 // ServerEntry mirrors config.MCPServer but lives in this package so the
@@ -58,6 +82,12 @@ type ServerEntry struct {
 	Args     []string          `toml:"args,omitempty"`
 	URL      string            `toml:"url,omitempty"`     // HTTP endpoint
 	Headers  map[string]string `toml:"headers,omitempty"` // optional HTTP auth
+	// Auth selects an authentication strategy for an HTTP server. "oauth"
+	// runs the OAuth 2.0 (PKCE) flow against the server's discovered
+	// endpoints and attaches the resulting Bearer token; the token is
+	// cached + refreshed in ~/.metis/mcp-oauth.json. Empty = use Headers
+	// verbatim (static API key or none).
+	Auth string `toml:"auth,omitempty"`
 	// Env injects extra environment variables into a stdio subprocess
 	// (no effect for url-transport servers). Values are env-expanded the
 	// same way command/args/url are — so `FIRECRAWL_API_KEY = "${FC_KEY}"`
@@ -375,7 +405,7 @@ func LaunchServer(ctx context.Context, reg *Registry, name string, registry *too
 	var err error
 	switch {
 	case expanded.URL != "":
-		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, expanded.Headers)
+		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, resolveAuthHeaders(ctx, expanded))
 	case expanded.Command != "":
 		srv, err = mcptools.NewServerWithEnv(
 			ctx, expanded.Name, expanded.Command,
@@ -582,7 +612,7 @@ func buildLazyServer(expanded, original ServerEntry, cachedTools []CachedTool) *
 	spawn := func(ctx context.Context) (*mcpsdk.Client, error) {
 		switch {
 		case expanded.URL != "":
-			return mcpsdk.NewHTTPClient(ctx, expanded.URL, expanded.Headers)
+			return mcpsdk.NewHTTPClient(ctx, expanded.URL, resolveAuthHeaders(ctx, expanded))
 		case expanded.Command != "":
 			return mcpsdk.NewStdioClientWithEnv(ctx, expanded.Command,
 				envSliceFromMap(maybeInjectCUEnv(expanded.Command, expanded.Env)),
