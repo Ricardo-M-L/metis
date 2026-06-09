@@ -31,6 +31,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/telemetry"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
@@ -1625,7 +1626,23 @@ func cmdRun(ctx context.Context, args []string) error {
 	var turnToolCalls, turnToolErrors int
 	var turnNudges, turnRescues int
 
+	// OTLP metrics exporter — active only when OTEL_EXPORTER_OTLP_ENDPOINT
+	// is set; nil otherwise (all methods no-op). Records each turn's spend
+	// and is flushed when cmdRun returns (best-effort).
+	otlp := telemetry.New(rt.model, rt.sessionID)
+	defer func() { _ = otlp.Export(context.Background()) }()
+
 	emitMetrics := func(stopReason string) {
+		// Fold the turn into the OTLP counters regardless of --metrics-log.
+		otlp.RecordTurn(telemetry.TurnMetrics{
+			InputTokens:  turnIn,
+			OutputTokens: turnOut,
+			CacheRead:    turnCacheRead,
+			CacheCreate:  turnCacheCreate,
+			ToolCalls:    turnToolCalls,
+			ToolErrors:   turnToolErrors,
+			DurationMS:   time.Since(turnStart).Milliseconds(),
+		})
 		if metricsLogFile == nil {
 			return
 		}
