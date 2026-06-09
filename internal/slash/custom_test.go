@@ -169,14 +169,30 @@ func TestParseFrontMatter_RecognizedKeys(t *testing.T) {
 }
 
 func TestRenderTemplate_BashInjection(t *testing.T) {
-	out := renderTemplate("before !`echo hello` after", "")
+	out := renderTemplate("before !`echo hello` after", "", true)
 	if out != "before hello after" {
 		t.Errorf("bash injection: got %q, want \"before hello after\"", out)
 	}
 	// Failure is surfaced inline, not dropped.
-	got := renderTemplate("x !`exit 3` y", "")
+	got := renderTemplate("x !`exit 3` y", "", true)
 	if !strings.Contains(got, "exited") && !strings.Contains(got, "failed") {
 		t.Errorf("failed command should surface an error note; got %q", got)
+	}
+}
+
+func TestRenderTemplate_UntrustedSkipsInjection(t *testing.T) {
+	// Project-local (untrusted) commands must NOT execute !`cmd` or read
+	// @file — the injections stay as inert literal text.
+	out := renderTemplate("run !`echo SHOULD_NOT_RUN` here", "", false)
+	if strings.Contains(out, "SHOULD_NOT_RUN\n") || !strings.Contains(out, "!`echo SHOULD_NOT_RUN`") {
+		t.Errorf("untrusted bash injection must stay literal; got %q", out)
+	}
+	dir := t.TempDir()
+	f := filepath.Join(dir, "secret.txt")
+	_ = os.WriteFile(f, []byte("TOPSECRET"), 0o644)
+	out2 := renderTemplate("leak @"+f, "", false)
+	if strings.Contains(out2, "TOPSECRET") {
+		t.Errorf("untrusted file injection must not read the file; got %q", out2)
 	}
 }
 
@@ -186,12 +202,12 @@ func TestRenderTemplate_FileInjection(t *testing.T) {
 	if err := os.WriteFile(f, []byte("FILE BODY"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out := renderTemplate("see @"+f+" end", "")
+	out := renderTemplate("see @"+f+" end", "", true)
 	if !strings.Contains(out, "FILE BODY") {
 		t.Errorf("file injection failed; got %q", out)
 	}
 	// A non-file @token (email-shaped) is left untouched.
-	out2 := renderTemplate("ping user@example.com now", "")
+	out2 := renderTemplate("ping user@example.com now", "", true)
 	if !strings.Contains(out2, "user@example.com") {
 		t.Errorf("non-file @token should be preserved; got %q", out2)
 	}

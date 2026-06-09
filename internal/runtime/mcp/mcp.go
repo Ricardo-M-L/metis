@@ -51,9 +51,12 @@ func resolveAuthHeaders(ctx context.Context, e ServerEntry) map[string]string {
 	if e.URL == "" || !strings.EqualFold(e.Auth, "oauth") {
 		return e.Headers
 	}
-	tok, err := mcpoauth.NewTokenStore().EnsureToken(ctx, e.Name, e.URL)
+	// interactive=false: an autonomous connect (startup / lazy tool call)
+	// must not block on a browser flow. Missing token → connect without
+	// (server returns 401); the user runs an explicit login to authorize.
+	tok, err := mcpoauth.NewTokenStore().EnsureToken(ctx, e.Name, e.URL, false)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "mcp: oauth for %q failed: %v\n", e.Name, err)
+		fmt.Fprintf(os.Stderr, "mcp: oauth for %q: %v\n", e.Name, err)
 		return e.Headers
 	}
 	out := make(map[string]string, len(e.Headers)+1)

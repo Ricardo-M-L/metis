@@ -74,7 +74,7 @@ func TestExporter_RecordAndExport(t *testing.T) {
 	body := string(gotBody)
 	for _, want := range []string{
 		"metis.tokens.input", "metis.tokens.output", "metis.tool.calls",
-		"metis.tool.errors", "metis.turns", "metis.turn.duration_ms",
+		"metis.tool.errors", "metis.rounds", "metis.round.duration_ms",
 		"deepseek-v4", "sess-1", "service.name", "metis",
 	} {
 		if !strings.Contains(body, want) {

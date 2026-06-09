@@ -46,23 +46,31 @@ func (l *Loop) snapPreEdit(toolName string, input map[string]any) {
 	}
 	turns := l.CountTurns()
 	l.ckptMu.Lock()
-	if l.ckptSnappedAt == turns {
-		l.ckptMu.Unlock()
+	already := l.ckptSnappedAt == turns
+	l.ckptMu.Unlock()
+	if already {
 		return
 	}
-	l.ckptSnappedAt = turns
-	l.ckptMu.Unlock()
 
+	// Snap BEFORE marking the slot. A read-only Bash (cat/ls/git status)
+	// is in mutatingTools too but produces an empty hash (no diff to
+	// commit); a transient Snap error returns "". In both cases we must
+	// NOT mark the turn snapped — otherwise the real Edit that follows in
+	// the same turn early-returns and the turn loses its only rewind
+	// point. Only a real, non-empty snapshot consumes the slot.
 	hash, err := l.Checkpointer.Snap(toolName, argsHash(input), fmt.Sprintf("before turn %d", turns))
 	if err != nil || hash == "" {
 		return
 	}
 	l.ckptMu.Lock()
-	l.ckptStack = append(l.ckptStack, ckptEntry{
-		hash:           hash,
-		restoreToTurns: turns - 1, // rewinding drops this turn's edits + conversation
-		label:          fmt.Sprintf("before turn %d", turns),
-	})
+	if l.ckptSnappedAt != turns { // re-check: another tool may have won the race
+		l.ckptSnappedAt = turns
+		l.ckptStack = append(l.ckptStack, ckptEntry{
+			hash:           hash,
+			restoreToTurns: turns - 1, // rewinding drops this turn's edits + conversation
+			label:          fmt.Sprintf("before turn %d", turns),
+		})
+	}
 	l.ckptMu.Unlock()
 }
 

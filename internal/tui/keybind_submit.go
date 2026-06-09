@@ -459,8 +459,12 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// Unified rewind: restore files AND conversation to the
 			// pre-edit snapshot of the last edit-turn.
 			if res, ok := m.loop.Rewind(); ok {
-				m.messages = trimVisibleMessagesToLastUser(m.messages)
-				for i := 1; i < res.TurnsUndone; i++ {
+				// Trim exactly as many visible user blocks as turns were
+				// undone — guards the TurnsUndone==0 case (e.g. /undo then
+				// /rewind already rolled the conversation past the
+				// snapshot) where an unconditional trim would desync the
+				// on-screen chat from the loop's Messages.
+				for i := 0; i < res.TurnsUndone; i++ {
 					m.messages = trimVisibleMessagesToLastUser(m.messages)
 				}
 				m.toolEvents = nil

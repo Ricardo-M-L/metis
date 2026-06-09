@@ -55,7 +55,7 @@ func mockAS(t *testing.T) *httptest.Server {
 
 func TestDiscover(t *testing.T) {
 	srv := mockAS(t)
-	p, err := Discover(context.Background(), srv.URL+"/mcp", "http://127.0.0.1:7700/callback")
+	p, err := Discover(context.Background(), srv.URL+"/mcp", []string{"http://127.0.0.1:7700/callback"})
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestEnsureToken_CachedValid(t *testing.T) {
 	_ = s.Put("srv", &auth.Token{AccessToken: "still-good", ExpiresAt: time.Now().Add(time.Hour)})
 	// serverURL is bogus on purpose — a valid cached token must NOT hit
 	// the network.
-	got, err := s.EnsureToken(context.Background(), "srv", "http://127.0.0.1:1/never")
+	got, err := s.EnsureToken(context.Background(), "srv", "http://127.0.0.1:1/never", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestEnsureToken_RefreshesExpired(t *testing.T) {
 		RefreshToken: "my-refresh",
 		ExpiresAt:    time.Now().Add(-time.Minute),
 	})
-	got, err := s.EnsureToken(context.Background(), "srv", srv.URL+"/mcp")
+	got, err := s.EnsureToken(context.Background(), "srv", srv.URL+"/mcp", false)
 	if err != nil {
 		t.Fatalf("EnsureToken: %v", err)
 	}

@@ -170,8 +170,11 @@ func (e *Exporter) buildPayload() map[string]any {
 		sum("metis.tokens.cache_create", e.cacheCreate),
 		sum("metis.tool.calls", e.toolCalls),
 		sum("metis.tool.errors", e.toolErrors),
-		sum("metis.turns", e.turns),
-		gauge("metis.turn.duration_ms", e.lastDurMS),
+		// "rounds" = LLM round-trips (RecordTurn fires once per
+		// EventTurnEnd + the final EventLoopDone), NOT user prompts —
+		// named accordingly so dashboards don't mistake it for turns.
+		sum("metis.rounds", e.turns),
+		gauge("metis.round.duration_ms", e.lastDurMS),
 	}
 	return map[string]any{
 		"resourceMetrics": []map[string]any{{

@@ -275,6 +275,14 @@ type Client struct {
 	// land in the same nanosecond.
 	idSeq atomic.Uint64
 
+	// writeMu serializes writes to the stdio transport's stdin. send(),
+	// sendNotification(), and writeServerEnvelope() can all write
+	// concurrently (the last from the handleServerRequest goroutine);
+	// without this, two JSON-RPC frames interleave on the pipe and the
+	// server's decoder chokes. HTTP transports write independent requests
+	// so they don't need it.
+	writeMu sync.Mutex
+
 	// roots are the workspace roots advertised to servers and returned
 	// when a server sends a roots/list request. Defaults to cwd.
 	roots []Root
@@ -470,8 +478,11 @@ func (c *Client) send(ctx context.Context, method string, params interface{}) (*
 
 	switch t := transport.(type) {
 	case *StdioTransport:
-		if _, err := t.stdin.Write(append(data, '\n')); err != nil {
-			return nil, fmt.Errorf("mcp stdio write: %w", err)
+		c.writeMu.Lock()
+		_, werr := t.stdin.Write(append(data, '\n'))
+		c.writeMu.Unlock()
+		if werr != nil {
+			return nil, fmt.Errorf("mcp stdio write: %w", werr)
 		}
 	case *HTTPTransport:
 		// Streamable HTTP: POST the request, then look at
@@ -594,7 +605,9 @@ func (c *Client) sendNotification(ctx context.Context, method string, params int
 
 	switch t := transport.(type) {
 	case *StdioTransport:
+		c.writeMu.Lock()
 		_, err := t.stdin.Write(append(data, '\n'))
+		c.writeMu.Unlock()
 		return err
 	case *HTTPTransport:
 		req, rerr := http.NewRequestWithContext(ctx, "POST", t.endpoint, strings.NewReader(string(data)))
@@ -686,9 +699,16 @@ func (c *Client) writeServerEnvelope(env map[string]any) {
 	c.mu.RUnlock()
 	switch t := transport.(type) {
 	case *StdioTransport:
+		c.writeMu.Lock()
 		_, _ = t.stdin.Write(append(data, '\n'))
+		c.writeMu.Unlock()
 	case *HTTPTransport:
-		req, err := http.NewRequestWithContext(c.ctx, "POST", t.endpoint, strings.NewReader(string(data)))
+		// Bound the reply POST so a hung server can't leak this
+		// goroutine + connection until the whole client closes (the
+		// transport's http.Client has no Timeout).
+		ctx, cancel := context.WithTimeout(c.ctx, RequestTimeout())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "POST", t.endpoint, strings.NewReader(string(data)))
 		if err != nil {
 			return
 		}
@@ -711,11 +731,18 @@ func isServerRequest(msg []byte) (id json.RawMessage, method string, params json
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
 	}
 	if json.Unmarshal(msg, &probe) != nil {
 		return nil, "", nil, false
 	}
-	if len(probe.ID) > 0 && string(probe.ID) != "null" && probe.Method != "" {
+	// A request has an id + method and NO result/error. Requiring the
+	// absence of result/error guards against a non-conformant server that
+	// echoes a `method` alongside a response — misrouting that to the
+	// request handler would strand the real caller waiting on its reply.
+	if len(probe.ID) > 0 && string(probe.ID) != "null" && probe.Method != "" &&
+		len(probe.Result) == 0 && len(probe.Error) == 0 {
 		return probe.ID, probe.Method, probe.Params, true
 	}
 	return nil, "", nil, false

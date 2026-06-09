@@ -52,7 +52,7 @@ var httpClient = &http.Client{Timeout: 15 * time.Second}
 // server origin's authorization-server metadata directly. When the AS
 // advertises a registration endpoint, a public client is dynamically
 // registered to obtain a client_id.
-func Discover(ctx context.Context, serverURL, redirectURI string) (auth.OAuthProvider, error) {
+func Discover(ctx context.Context, serverURL string, redirectURIs []string) (auth.OAuthProvider, error) {
 	origin, err := originOf(serverURL)
 	if err != nil {
 		return auth.OAuthProvider{}, err
@@ -77,7 +77,7 @@ func Discover(ctx context.Context, serverURL, redirectURI string) (auth.OAuthPro
 
 	clientID := ""
 	if md.RegistrationEndpoint != "" {
-		id, err := registerClient(ctx, md.RegistrationEndpoint, redirectURI)
+		id, err := registerClient(ctx, md.RegistrationEndpoint, redirectURIs)
 		if err == nil {
 			clientID = id
 		}
@@ -134,10 +134,10 @@ func fetchASMetadata(ctx context.Context, issuer string) (asMetadata, error) {
 
 // registerClient performs RFC 7591 dynamic client registration and
 // returns the issued client_id. Public client (no secret), PKCE-capable.
-func registerClient(ctx context.Context, regEndpoint, redirectURI string) (string, error) {
+func registerClient(ctx context.Context, regEndpoint string, redirectURIs []string) (string, error) {
 	body, _ := json.Marshal(map[string]any{
 		"client_name":                "metis",
-		"redirect_uris":              []string{redirectURI},
+		"redirect_uris":              redirectURIs,
 		"grant_types":                []string{"authorization_code", "refresh_token"},
 		"response_types":             []string{"code"},
 		"token_endpoint_auth_method": "none",
@@ -177,17 +177,23 @@ func registerClient(ctx context.Context, regEndpoint, redirectURI string) (strin
 //
 // serverKey identifies the stored entry (usually the server name);
 // serverURL is the MCP endpoint used for discovery. The interactive
-// branch (3) opens a browser; (1) and (2) are non-interactive.
-func (s *TokenStore) EnsureToken(ctx context.Context, serverKey, serverURL string) (string, error) {
+// branch (3) opens a browser and is taken ONLY when interactive=true —
+// autonomous connect paths (tool calls, headless runs) pass false so a
+// missing token surfaces as an error instead of hanging on a browser
+// flow that may never complete.
+func (s *TokenStore) EnsureToken(ctx context.Context, serverKey, serverURL string, interactive bool) (string, error) {
 	if t, ok := s.Get(serverKey); ok && t.AccessToken != "" && !t.IsExpired() {
 		return t.AccessToken, nil
 	}
-	// Representative loopback redirect for dynamic registration. Per
-	// RFC 8252 §7.3 an AS must allow any loopback port, so registering
-	// one port and completing on another (pickCallbackPort's range) is
-	// spec-compliant.
-	const redirect = "http://127.0.0.1:7700/callback"
-	p, err := Discover(ctx, serverURL, redirect)
+	// Register every loopback callback port the auth flow might bind
+	// (pickCallbackPort uses [7700,7720)), so whichever free port the
+	// actual flow lands on still matches a registered redirect_uri — even
+	// on a strict AS that doesn't honor RFC 8252's loopback-port leniency.
+	redirects := make([]string, 0, 20)
+	for port := 7700; port < 7720; port++ {
+		redirects = append(redirects, fmt.Sprintf("http://127.0.0.1:%d/callback", port))
+	}
+	p, err := Discover(ctx, serverURL, redirects)
 	if err != nil {
 		return "", err
 	}
@@ -198,7 +204,10 @@ func (s *TokenStore) EnsureToken(ctx context.Context, serverKey, serverURL strin
 			return nt.AccessToken, nil
 		}
 	}
-	// Fresh interactive login.
+	// Fresh login requires a browser — only when explicitly allowed.
+	if !interactive {
+		return "", fmt.Errorf("mcp oauth: no valid token for %q and interactive login not allowed here — run `metis mcp login %s` first", serverKey, serverKey)
+	}
 	nt, err := auth.OAuthLoginWithProvider(p, auth.OAuthOptions{})
 	if err != nil {
 		return "", err

