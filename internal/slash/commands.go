@@ -49,6 +49,11 @@ const (
 	SignalNew
 	SignalRetry
 	SignalUndo
+	// SignalRewind: restore the working tree to the pre-edit snapshot of
+	// the last edit-turn AND undo the conversation to that point — the
+	// unified code+conversation rewind. Handled by the TUI calling
+	// loop.Rewind().
+	SignalRewind
 	SignalHistory
 	SignalSave
 	SignalBranch
@@ -229,6 +234,10 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 		// Empty display — the actual confirmation is printed by the
 		// runtime once it knows whether anything was undone.
 		return "", SignalUndo
+	}})
+	r.Register(Cmd{Name: "rewind", Description: "undo the last edit-turn AND restore the files it changed (code + conversation together)", Handler: func(_ string) (string, Signal) {
+		// Empty display — the runtime reports what was rewound.
+		return "", SignalRewind
 	}})
 	r.Register(Cmd{Name: "history", Aliases: []string{"hist"}, Description: "show conversation history (Esc / q to close)", Handler: func(_ string) (string, Signal) {
 		// Display is empty — the runtime renders the screen directly.

@@ -455,6 +455,23 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			} else {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to undo)", Timestamp: time.Now()})
 			}
+		case slash.SignalRewind:
+			// Unified rewind: restore files AND conversation to the
+			// pre-edit snapshot of the last edit-turn.
+			if res, ok := m.loop.Rewind(); ok {
+				m.messages = trimVisibleMessagesToLastUser(m.messages)
+				for i := 1; i < res.TurnsUndone; i++ {
+					m.messages = trimVisibleMessagesToLastUser(m.messages)
+				}
+				m.toolEvents = nil
+				m.messages = append(m.messages, Message{
+					Role:      "success",
+					Content:   fmt.Sprintf("(rewound: restored files + undid %d turn(s) — %s)", res.TurnsUndone, res.Label),
+					Timestamp: time.Now(),
+				})
+			} else {
+				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to rewind — no file snapshots yet, or checkpointing is off)", Timestamp: time.Now()})
+			}
 		case slash.SignalHistory:
 			hs := screen.NewHistoryScreen(m.loop.History(), m.width, m.height)
 			hs.Title = "session history (" + m.sessionID + ")"

@@ -29,6 +29,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/security"
@@ -1433,6 +1434,14 @@ func cmdChat(ctx context.Context, args []string) error {
 		resAdapter := mcpResourceAdapter{rt: rt}
 		rt.registry.Register(builtin.NewListMcpResources(rt.gate, resAdapter))
 		rt.registry.Register(builtin.NewReadMcpResource(rt.gate, resAdapter))
+	}
+	// Wire the working-tree checkpointer so /rewind can restore files +
+	// conversation together. Best-effort: a shadow-repo init failure just
+	// leaves /rewind reporting "nothing to rewind".
+	if rt.loop != nil && rt.sessionID != "" {
+		if cwd, err := os.Getwd(); err == nil {
+			rt.loop.Checkpointer = checkpoint.NewManager(rt.sessionID, cwd, "")
+		}
 	}
 
 	useTUI := flags.useTUI

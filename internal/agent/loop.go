@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
+	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
@@ -194,6 +195,16 @@ type Loop struct {
 	// (capNamed default 20).
 	subAgentNotify chan SubAgentNotification
 
+	// Checkpointer, when set, snapshots the working tree before the first
+	// file-mutating tool of each user turn (shadow-git copy). It powers
+	// the unified /rewind — restoring BOTH file state and conversation to
+	// a chosen turn. nil disables checkpointing (best-effort feature;
+	// Snap/Restore errors are swallowed). See checkpoint_hook.go.
+	Checkpointer  *checkpoint.Manager
+	ckptMu        sync.Mutex
+	ckptStack     []ckptEntry
+	ckptSnappedAt int // CountTurns() value last snapped; -1 = none yet
+
 	// DreamNotify is the receive end of the auto-memory extractor's
 	// completion channel (G.5, 2026-05-12). When the extractor's
 	// background fork finishes, it posts a DreamNotification here
@@ -302,6 +313,7 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 		GraceCalls:                  1,
 		lastTimeBasedMicrocompactAt: time.Now(),
 		subAgentNotify:              make(chan SubAgentNotification, 64),
+		ckptSnappedAt:               -1,
 	}
 }
 

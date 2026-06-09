@@ -488,6 +488,12 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// preserves Event.Elapsed via shallow copy, so the parent TUI
 	// reads the child loop's measurement instead of computing an
 	// inter-event delta that hits 0ms on fast Reads (image #54).
+	// Unified-rewind hook: snapshot the working tree before the first
+	// file-mutating tool of this turn, so /rewind can restore files +
+	// conversation together. Best-effort, once per turn, no-op when
+	// checkpointing is off. See checkpoint_hook.go.
+	l.snapPreEdit(blk.ToolName, blk.ToolInput)
+
 	execStart := time.Now()
 	res, err := safeToolExecute(toolCtx, t, blk.ToolInput)
 	execElapsed := time.Since(execStart)
