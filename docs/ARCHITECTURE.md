@@ -429,6 +429,15 @@ appends the thought-summary + recap rows, writes a learning record to
 
 ## Auto-compaction
 
+Upstream of all compaction tiers sits **ingestion-time spill**
+(2026-06-11, claude-code's `maxResultSizeChars`): when a tool result
+exceeds its per-tool cap (default 50k chars, `pkg/tool.MaxResultSizer`
+to override, Read opts out), the dispatch layer persists the full
+content under the microcompact cache dir via `internal/spill` and the
+model receives a 2k preview + the file path — recoverable with Read,
+so a 500 KB Bash dump never enters the window wholesale. `METIS_SPILL=0`
+disables.
+
 Triggered preflight (size threshold) **and** reactively (4xx with
 context-window phrasing). `estimateTokens` counts text body + tool input
 JSON + tool result content + tool name (every byte that goes on the
@@ -604,6 +613,17 @@ tool.CanUse(ctx, input)              ← consults permission.Gate
                               if Allow:      execute
                               if Deny:       synthesize error
 ```
+
+Rule resolution (2026-06-11, claude-code parity): the gate picks the
+matching rule with the highest source **authority** — `policy:`
+(`/etc/metis/policy.toml` / `METIS_POLICY_FILE`, never overridable) >
+`cli` > `interactive` (TUI "always allow") > `config:` > `persistent`
+— and uses append recency only to break same-authority ties
+(`internal/permission/source_rank.go`). Rule `match` content supports
+three grammars (`internal/permission/rulematch.go`): `prefix:*`
+command-prefix with a chain guard (a `git status:*` allow never
+matches `git status; rm -rf /`), gitignore-style path globs
+(`/etc/**`), and legacy substring for backward compatibility.
 
 ## Plugin model
 

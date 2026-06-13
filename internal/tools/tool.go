@@ -51,6 +51,13 @@ var (
 	IsBypassImmune          = pubtool.IsBypassImmune
 	GetInterruptBehavior    = pubtool.GetInterruptBehavior
 	DescriptionFor          = pubtool.DescriptionFor
+	MaxResultSizeChars      = pubtool.MaxResultSizeChars
+)
+
+// Spill threshold constants — see pkg/tool for the rationale.
+const (
+	DefaultMaxResultSizeChars = pubtool.DefaultMaxResultSizeChars
+	ResultSizeUnlimited       = pubtool.ResultSizeUnlimited
 )
 
 // ShortDescriptor — see pkg/tool for the rationale. Re-exported here
@@ -63,6 +70,11 @@ type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
 	order []string // preserves registration order for deterministic listing
+	// aliases maps alternative names → canonical Name() for tools that
+	// implement pubtool.Aliaser. Resolved by Get() only — aliases never
+	// appear in All()/SortedForCache(), so the LLM sees one name while
+	// old transcripts and configs using a prior name keep resolving.
+	aliases map[string]string
 }
 
 // global registry; built-in packages register themselves into it via init().
@@ -86,6 +98,43 @@ func (r *Registry) Register(t Tool) {
 	}
 	r.tools[name] = t
 	r.order = append(r.order, name)
+	r.indexAliases(t)
+}
+
+// clearAliasesOf removes every alias entry currently pointing at name.
+// Caller holds mu. Run before re-indexing on Replace so a tool that
+// dropped or changed its alias set doesn't leave stale entries that
+// keep resolving to it — and so a freed alias can be reclaimed by
+// another tool on its next (re-)index.
+func (r *Registry) clearAliasesOf(name string) {
+	for a, canon := range r.aliases {
+		if canon == name {
+			delete(r.aliases, a)
+		}
+	}
+}
+
+// indexAliases records t's declared aliases (if any). Caller holds mu.
+// A real tool name always wins over an alias — Get checks r.tools
+// first — and the first tool to claim an alias keeps it; later
+// claimants are skipped rather than silently stealing resolution.
+func (r *Registry) indexAliases(t Tool) {
+	names := pubtool.Aliases(t)
+	if len(names) == 0 {
+		return
+	}
+	if r.aliases == nil {
+		r.aliases = make(map[string]string, len(names))
+	}
+	for _, a := range names {
+		if a == "" || a == t.Name() {
+			continue
+		}
+		if _, taken := r.aliases[a]; taken {
+			continue
+		}
+		r.aliases[a] = t.Name()
+	}
 }
 
 // Replace installs t under its Name(), overwriting any prior tool with
@@ -102,17 +151,31 @@ func (r *Registry) Replace(t Tool) {
 		// First-time install — fall through to the order-appending path.
 		r.tools[name] = t
 		r.order = append(r.order, name)
+		r.indexAliases(t)
 		return
 	}
+	// Re-index from a clean slate: drop the prior tool's alias claims
+	// before recording the replacement's, so dropped aliases stop
+	// resolving and freed ones can be reclaimed (2026-06-12 review).
+	r.clearAliasesOf(name)
 	r.tools[name] = t
+	r.indexAliases(t)
 }
 
-// Get looks up a tool by name.
+// Get looks up a tool by name, falling back to declared aliases
+// (pubtool.Aliaser) so renamed tools keep resolving for old
+// transcripts, configs and models that learned the prior name.
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	t, ok := r.tools[name]
-	return t, ok
+	if t, ok := r.tools[name]; ok {
+		return t, ok
+	}
+	if canonical, ok := r.aliases[name]; ok {
+		t, ok := r.tools[canonical]
+		return t, ok
+	}
+	return nil, false
 }
 
 // All returns tools in registration order.

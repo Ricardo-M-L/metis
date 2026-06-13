@@ -296,6 +296,8 @@ Flags (chat / run):
       --no-markdown     Disable markdown rendering of assistant output
       --no-stream       Don't stream (assemble then print)
       --max-iter <n>    Iteration cap per turn (default 150; overrides [session] max_iterations in config.toml)
+      --max-budget-usd <x>  Stop the session once cumulative LLM spend reaches x USD (0 = unlimited; sub-agents draw from the same pool)
+      --output-schema <file>  (run) Constrain the final reply to a JSON Schema — validated locally, 2 correction retries, then exit 11
       --add-dir <path>  Add a directory to the agent's accessible scope (repeatable)
       --agent <name>    Load an agent profile from ~/.metis/agents/<name>.md
   -W, --worktree [slug] Spawn in a fresh git worktree (slug optional)
@@ -426,6 +428,7 @@ type cliFlags struct {
 	noStream     bool
 	streamlined  bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
 	maxIter      int
+	maxBudgetUSD float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
 	system       string
 	resumeID     string
 	cont         bool // -c / --continue: pick up the most recently modified session
@@ -471,6 +474,12 @@ type cliFlags struct {
 	// Mirrors Claude Code's `--output-format json|stream-json`.
 	inputFormat  string
 	outputFormat string
+
+	// --output-schema <file>: constrain the FINAL reply of `metis run`
+	// to a JSON Schema. Validated locally after the loop; invalid
+	// output buys the model up to 2 correction turns, then exit 11.
+	// Mirrors claude-code's headless jsonSchema QueryParam.
+	outputSchema string
 
 	// --auto-memory: turn on extractMemories v2 (Claude Code parity).
 	// Off by default — opt-in keeps the per-turn LLM-call cost
@@ -572,6 +581,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.noStream, "no-stream", false, "disable streaming")
 	f.BoolVar(&out.streamlined, "streamlined", false, "distillation-resistant output: drop thinking, collapse tool calls into cumulative summaries (per-call override of [ui] streamlined_output)")
 	f.IntVar(&out.maxIter, "max-iter", 0, "max tool iterations per turn")
+	f.Float64Var(&out.maxBudgetUSD, "max-budget-usd", 0, "stop the session once cumulative LLM spend reaches this many USD (0 = unlimited)")
 	f.StringVar(&out.system, "system", "", "override system prompt")
 	f.StringVar(&out.resumeID, "resume", "", "resume session id")
 	// `-r` short alias for --resume. Claude Code accepts both; metis used
@@ -617,6 +627,8 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 		"`metis run` input mode: json (NDJSON prompts on stdin)")
 	f.StringVar(&out.outputFormat, "output-format", "",
 		"`metis run` output mode: json | stream-json")
+	f.StringVar(&out.outputSchema, "output-schema", "",
+		"`metis run`: path to a JSON Schema the final reply must conform to (validated locally; invalid output retried up to 2x, then exit 11)")
 	// Phase E #46-#48
 	f.StringVar(&out.sessionName, "name", "",
 		"human-friendly session label (shows in /sessions; persisted via SetTitle)")
@@ -1116,6 +1128,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		MemoryManager: memoryMgr,
 		Jobs:          jobsPool,
 		Monitors:      monitorReg,
+		MaxBudgetUSD:  flags.maxBudgetUSD,
 	})
 
 	// METIS_SIMPLE / --simple → use the curated short tool descriptions
@@ -1534,6 +1547,17 @@ func cmdRun(ctx context.Context, args []string) error {
 			llmPrompt = hints + "\n\n" + prompt
 		}
 	}
+	// --output-schema: load the schema up front (a typo'd path errors
+	// before any tokens burn) and append the output contract to the
+	// prompt. Final-reply validation + correction retries happen after
+	// the event loop below.
+	schemaEnforcer, err := rtpkg.NewOutputSchemaEnforcer(flags.outputSchema)
+	if err != nil {
+		return err
+	}
+	if schemaEnforcer != nil {
+		llmPrompt = llmPrompt + "\n\n" + schemaEnforcer.Instruction()
+	}
 	rt.loop.AppendUser(llmPrompt)
 	if rt.store != nil && rt.sessionID != "" {
 		_ = rt.store.AppendMessage(rt.sessionID, llm.Message{
@@ -1594,6 +1618,12 @@ func cmdRun(ctx context.Context, args []string) error {
 	// would lie about that observation).
 	var cacheTextBuf strings.Builder
 	usedToolsThisRun := false
+
+	// --output-schema: accumulate assistant text instead of streaming
+	// it to stdout — partial/invalid candidates must not pollute the
+	// pipe; only the final validated JSON is printed (CC headless
+	// contract). stderr traffic (tools, metrics) is unaffected.
+	var schemaTextBuf strings.Builder
 
 	// Token totals — summed across every API call this run made.
 	// Emitted as a single `[metrics]` line at LoopDone so the eval
@@ -1695,7 +1725,11 @@ func cmdRun(ctx context.Context, args []string) error {
 			if streamlined {
 				flushAccum()
 			}
-			fmt.Print(ev.TextDelta)
+			if schemaEnforcer != nil {
+				schemaTextBuf.WriteString(ev.TextDelta)
+			} else {
+				fmt.Print(ev.TextDelta)
+			}
 			if cacheKey != "" {
 				cacheTextBuf.WriteString(ev.TextDelta)
 			}
@@ -1808,6 +1842,10 @@ func cmdRun(ctx context.Context, args []string) error {
 			// only fires after a tool-use round) then reset.
 			emitMetrics("tool_use")
 			resetTurn()
+			// Schema mode validates the FINAL turn's text only — interim
+			// "let me check..." prose from tool-use turns is not the
+			// answer and would confuse JSON extraction.
+			schemaTextBuf.Reset()
 		case agent.EventLoopDone:
 			if streamlined {
 				flushAccum() // emit any trailing tool counts
@@ -1832,7 +1870,7 @@ func cmdRun(ctx context.Context, args []string) error {
 			// would block legitimate provider-side stop reasons we
 			// haven't enumerated yet.
 			switch finalStop {
-			case "diminishing_returns", "max_iterations", "loop_detected", "stuck_after_reset", "turn_wall_clock":
+			case "diminishing_returns", "max_iterations", "loop_detected", "stuck_after_reset", "turn_wall_clock", "budget_usd":
 				incompleteReason = finalStop
 				incompleteDetail = lastInfoText
 			}
@@ -1898,6 +1936,31 @@ func cmdRun(ctx context.Context, args []string) error {
 		}
 	}
 	err = <-done
+
+	// --output-schema: validate the final reply; invalid output buys
+	// the model up to MaxSchemaRetries correction turns carrying the
+	// exact validation error, then fails with exit 11 so wrappers see
+	// parseable-or-failed semantics. Only the validated JSON reaches
+	// stdout (text deltas were suppressed above).
+	if schemaEnforcer != nil && err == nil {
+		finalText := schemaTextBuf.String()
+		validated, verr := schemaEnforcer.Validate(finalText)
+		for attempt := 1; verr != nil && attempt <= rtpkg.MaxSchemaRetries; attempt++ {
+			fmt.Fprintf(os.Stderr, "[schema] output invalid (%v) — correction %d/%d\n", verr, attempt, rtpkg.MaxSchemaRetries)
+			rt.loop.AppendUser(schemaEnforcer.RetryMessage(verr))
+			finalText, err = rtpkg.RunLoopCollectText(ctx, rt.loop)
+			if err != nil {
+				return err
+			}
+			validated, verr = schemaEnforcer.Validate(finalText)
+		}
+		if verr != nil {
+			fmt.Println(finalText) // last candidate — caller may still salvage it
+			fmt.Fprintf(os.Stderr, "\n[metis] TASK INCOMPLETE — reason: output_schema\n[metis] detail: %v\n", verr)
+			return &exitcode.IncompleteError{Reason: "output_schema", Detail: verr.Error()}
+		}
+		fmt.Println(validated)
+	}
 
 	// CACHE-D: save the response IFF user opted in AND no tools ran.
 	// Tool-using turns are excluded by design — replaying them from

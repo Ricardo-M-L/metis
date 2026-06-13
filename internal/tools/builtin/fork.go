@@ -198,6 +198,10 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	if snap.Model != "" {
 		sub.Model = snap.Model
 	}
+	// Shared USD budget — same pool as the parent (see builtin/agent.go).
+	sub.Budget = agent.BudgetFromContext(ctx)
+	// Shared spill dir — child offloads oversized tool results too.
+	sub.SpillDir = agent.SpillDirFromContext(ctx)
 	// Forks also get short-form tool descriptions — they inherit the
 	// parent's snap.System (already heavy with conversation context)
 	// and don't need the parent's full tool prompts repeated. Phase

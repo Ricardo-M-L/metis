@@ -20,6 +20,7 @@ import (
 	"unicode"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/spill"
 )
 
 // errIsEOF returns true for the io.EOF the streaming providers signal
@@ -568,7 +569,11 @@ func (c *Compactor) Microcompact(messages []llm.Message) []llm.Message {
 			if id == "" {
 				id = fmt.Sprintf("anon_%d_%d", i, bi) // shouldn't happen but be defensive
 			}
-			path := filepath.Join(c.MicrocompactDir, id+".txt")
+			// Sanitize identically to spill (internal/spill.SanitizeID):
+			// a slash-bearing MCP/OpenAI-compat id would otherwise make
+			// the os.WriteFile target a non-existent subdirectory and
+			// silently skip the offload (2026-06-13 review).
+			path := filepath.Join(c.MicrocompactDir, spill.SanitizeID(id)+".txt")
 			if err := os.WriteFile(path, []byte(b.ToolResult), 0o600); err != nil {
 				continue
 			}

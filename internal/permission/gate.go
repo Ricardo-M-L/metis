@@ -5,7 +5,6 @@ package permission
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 )
@@ -547,15 +546,35 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		return DecisionAsk, "safety_check:bypass_immune"
 	}
 
-	// Iterate in reverse — later rules (higher precedence) win.
+	// Rule resolution: authority first (sourceRank — policy > cli >
+	// interactive > config > persistent), recency second. Among rules
+	// of equal authority the LAST appended wins. Scan BACK-to-front
+	// with a strict `>`: the first rule seen at a given rank is the
+	// latest-appended at that rank, so it wins its tie — equivalent to
+	// the historical reverse-iteration semantics. Scanning backward
+	// also lets a policy-rank match short-circuit: policy is the
+	// ceiling and the first one found here is the latest-appended
+	// policy rule, so nothing earlier can outrank or out-recency it.
+	// Match grammar: prefix (`git push:*`), glob (`/etc/**`), or legacy
+	// substring — see rulematch.go.
+	bestIdx, bestRank := -1, -1
 	for i := len(g.rules) - 1; i >= 0; i-- {
 		r := g.rules[i]
 		if r.Tool != "*" && r.Tool != tool {
 			continue
 		}
-		if r.Match != "" && !strings.Contains(stringInput, r.Match) {
+		if !MatchesRuleContent(r.Match, stringInput) {
 			continue
 		}
+		if rank := sourceRank(r.Source); rank > bestRank {
+			bestRank, bestIdx = rank, i
+			if rank == rankPolicy {
+				break // ceiling reached at the latest policy rule
+			}
+		}
+	}
+	if bestIdx >= 0 {
+		r := g.rules[bestIdx]
 		return g.applyBreaker(r.Verb, r.Source, breakerActive)
 	}
 

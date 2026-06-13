@@ -109,6 +109,8 @@ metis version [-V]            # short semver (-V for full build fingerprint)
 | `--no-stream` | wait for the full reply before printing |
 | `--streamlined` | thinking dropped, tool calls collapsed into summaries |
 | `--max-iter <n>` | cap tool iterations per turn |
+| `--max-budget-usd <x>` | stop once cumulative LLM spend reaches x USD (sub-agents share the pool) |
+| `--output-schema <file>` | `metis run`: final reply must conform to this JSON Schema (2 retries, then exit 11) |
 | `--system <text>` | override system prompt |
 | `--effort low\|medium\|high` | reasoning intensity (Anthropic thinking, OpenAI reasoning_effort) |
 | `--fast` | one-shot fast turn (effort=low + halved max_tokens) |
@@ -270,7 +272,17 @@ mode = "auto"
 tool = "Read"
 [[permission.allow]]
 tool = "Bash"
-match = "git status"
+# Match grammar (claude-code parity):
+#   "git status:*"  → command prefix; never matches a chained command
+#                     ("git status; rm -rf /" falls through to ASK)
+#   "/etc/**"       → path glob (** crosses directories, * stays in one)
+#   "git status"    → legacy substring (matches anywhere — prefer :* )
+match = "git status:*"
+
+# Layers: ~/.metis/config.toml < .metis/config.toml < .metis/config.local.toml
+# (gitignored, per-checkout). /etc/metis/policy.toml (or METIS_POLICY_FILE)
+# is the managed tier — its rules outrank config, CLI flags and the TUI's
+# "always allow", so a policy deny can't be overridden.
 
 [ui]
 theme = "auto"

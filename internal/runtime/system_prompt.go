@@ -2,10 +2,10 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -274,6 +274,23 @@ func AssembleSystemPromptSectionsCtx(ctx PromptCtx, opts AssembleOptions) []Syst
 	}
 	if !opts.SkipEnv {
 		secs = append(secs, SystemPromptSection{Name: "env", Body: buildEnvBlock(), Cache: false, Volatile: true})
+		secs = appendGitContextSection(secs, mode)
+	}
+	return secs
+}
+
+// appendGitContextSection adds the git workspace snapshot (claude-code's
+// getGitStatus attachment, context.ts:124-142). Volatile like env — it
+// changes every boot — and skipped for minimal (sub-agent) prompts,
+// whose parents already distilled the relevant workspace state into
+// the task. Shared by both Assemble* constructors so the gating can't
+// drift between them.
+func appendGitContextSection(secs []SystemPromptSection, mode PromptMode) []SystemPromptSection {
+	if mode == PromptMinimal {
+		return secs
+	}
+	if gitCtx := buildGitContext(); gitCtx != "" {
+		secs = append(secs, SystemPromptSection{Name: "git_context", Body: gitCtx, Cache: false, Volatile: true})
 	}
 	return secs
 }
@@ -334,6 +351,7 @@ func AssembleSystemPromptSections(base string, opts AssembleOptions) []SystemPro
 	// Env LAST — see comment above.
 	if !opts.SkipEnv {
 		secs = append(secs, SystemPromptSection{Name: "env", Body: buildEnvBlock(), Cache: false, Volatile: true})
+		secs = appendGitContextSection(secs, mode)
 	}
 	return secs
 }
@@ -692,13 +710,13 @@ func buildEnvBlock() string {
 
 // currentGitBranch returns the active branch name, or "" when the cwd
 // isn't a git repo. Cached implicitly per chat boot via the
-// buildEnvBlock callsite.
+// buildEnvBlock callsite. Goes through gitOut so a frozen NFS mount /
+// gc-ing monorepo can't hang chat boot — pre-2026-06-11 this was a
+// bare exec.Command with no deadline.
 func currentGitBranch() string {
-	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	ctx, cancel := context.WithTimeout(context.Background(), gitContextTimeout)
+	defer cancel()
+	return gitOut(ctx, "rev-parse", "--abbrev-ref", "HEAD")
 }
 
 func loadSystemPromptAddendum() string {

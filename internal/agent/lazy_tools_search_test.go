@@ -7,8 +7,8 @@ package agent
 //
 // Reference: claude-code-sourcemap/restored-src/src/tools/ToolSearchTool/
 // ToolSearchTool.ts:186-302 (searchToolsWithKeywords). The scoring
-// table here mirrors theirs minus the searchHint weight, which metis
-// doesn't have a curated source for yet.
+// table here mirrors theirs; the searchHint weight (+4, via
+// pkg/tool.SearchHinter) is covered in lazy_tools_hint_test.go.
 
 import (
 	"encoding/json"

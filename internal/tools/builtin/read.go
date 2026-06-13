@@ -100,6 +100,13 @@ func (Read) Concurrency(map[string]any) tools.Concurrency { return tools.Concurr
 // summarise its tool_result aggressively.
 func (Read) IsReadOnly(map[string]any) bool { return true }
 
+// MaxResultSizeChars opts Read out of ingestion-time spilling: persisting
+// Read output to a file the model recovers WITH Read is circular, and
+// Read already self-bounds via its line/offset limits. Mirrors
+// claude-code's maxResultSizeChars: Infinity on FileRead
+// (toolResultStorage.ts::getPersistenceThreshold).
+func (Read) MaxResultSizeChars() int { return tools.ResultSizeUnlimited }
+
 func (r Read) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
 	d, src := r.gate.Check(context.Background(), "Read", strFromAny(in["path"]))
 	return mapDecision(d), src

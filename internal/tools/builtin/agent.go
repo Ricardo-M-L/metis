@@ -713,6 +713,12 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 
 	sub := agent.NewLoop(a.provider, subRegistry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
+	// Shared USD budget: the child adds usage to the parent's tracker,
+	// so --max-budget-usd caps the whole agent tree, not just the root.
+	sub.Budget = agent.BudgetFromContext(ctx)
+	// Shared spill dir: the child offloads its own oversized tool
+	// results too, instead of flooding its context window.
+	sub.SpillDir = agent.SpillDirFromContext(ctx)
 	// Sub-agents get the curated short-form tool descriptions: they
 	// already inherit a tight tool palette + a profile-supplied system
 	// prompt, so the main-loop's full multi-paragraph tool docs are

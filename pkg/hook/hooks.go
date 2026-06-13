@@ -22,6 +22,7 @@ package hook
 
 import (
 	"context"
+	"strings"
 	"sync"
 )
 
@@ -108,6 +109,17 @@ type PostToolUse struct {
 	Input   map[string]any
 	Output  string
 	IsError bool
+}
+
+// ModifiedPostToolUse is what a PostToolUseContextHandler returns.
+// AdditionalContext, when non-empty, is appended to the tool_result
+// the MODEL sees (wrapped in a <system-reminder> by the dispatch
+// layer) — the channel a formatter/linter hook uses to feed its
+// diagnostics back into the conversation. Mirrors claude-code's
+// PostToolUse hook additionalContext response field. nil / zero
+// value = observe only, no injection.
+type ModifiedPostToolUse struct {
+	AdditionalContext string
 }
 
 // UserPromptSubmit fires when the user submits a prompt. Handlers can
@@ -210,6 +222,12 @@ type PreCompact struct {
 type (
 	PreToolUseHandler   func(context.Context, Context, *PreToolUse) *ModifiedPreToolUse
 	PostToolUseHandler  func(context.Context, Context, *PostToolUse)
+	// PostToolUseContextHandler is the feedback-capable PostToolUse
+	// variant: its return value can inject AdditionalContext into the
+	// tool_result. Sync only — the dispatch path consumes the return,
+	// so RegisterAsync treats it as sync. Plain observers should keep
+	// using PostToolUseHandler (cheaper, async-capable).
+	PostToolUseContextHandler func(context.Context, Context, *PostToolUse) *ModifiedPostToolUse
 	SessionStartHandler func(context.Context, Context, string, string) // system, model
 	SessionEndHandler   func(context.Context, Context, int, string)    // msgCount, stopReason
 	TurnStartHandler    func(context.Context, Context, int)            // turn idx
@@ -276,9 +294,10 @@ type preCompactEntry struct {
 // at registration; async ones run in a goroutine to keep the dispatch
 // hot path uncapped by slow webhook handlers.
 type Registry struct {
-	mu         sync.RWMutex
-	preTool    []PreToolUseHandler
-	postTool   []postToolEntry
+	mu          sync.RWMutex
+	preTool     []PreToolUseHandler
+	postTool    []postToolEntry
+	postToolCtx []PostToolUseContextHandler
 	session    []SessionStartHandler
 	sessionEnd []sessionEndEntry
 	turnStart  []TurnStartHandler
@@ -337,6 +356,9 @@ func (r *Registry) register(handler any, async bool) {
 		r.preTool = append(r.preTool, h)
 	case PostToolUseHandler:
 		r.postTool = append(r.postTool, postToolEntry{h: h, async: async})
+	case PostToolUseContextHandler:
+		// Sync only — the dispatch path consumes the return value.
+		r.postToolCtx = append(r.postToolCtx, h)
 	case SessionStartHandler:
 		r.session = append(r.session, h) // sync — gates startup
 	case SessionEndHandler:
@@ -399,6 +421,24 @@ func (r *Registry) EmitPostToolUse(ctx context.Context, tc Context, in *PostTool
 			e.h(ctx, tc, in)
 		}
 	}
+}
+
+// EmitPostToolUseContext fans out to the feedback-capable PostToolUse
+// handlers and returns their AdditionalContext strings joined by
+// newlines ("" when nothing was contributed). The dispatch layer
+// appends the result to the tool_result as a <system-reminder> so the
+// model sees hook diagnostics (lint output, format fixes) next turn.
+func (r *Registry) EmitPostToolUseContext(ctx context.Context, tc Context, in *PostToolUse) string {
+	r.mu.RLock()
+	handlers := r.postToolCtx
+	r.mu.RUnlock()
+	var parts []string
+	for _, h := range handlers {
+		if mod := h(ctx, tc, in); mod != nil && mod.AdditionalContext != "" {
+			parts = append(parts, mod.AdditionalContext)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (r *Registry) EmitSessionStart(ctx context.Context, tc Context, system, model string) {

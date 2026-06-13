@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
@@ -422,6 +423,16 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 // it's why metis doesn't need to spawn each sub-agent as its own OS
 // process to get fault containment. The Agent/Fork tools also recover
 // internally, but this guard covers the long tail of every other tool.
+// spillDir returns the directory for ingestion-time result spilling.
+// SpillDir is wired independently from the Compactor's microcompact
+// cache (runtime/agent_loop.go): the two share the Read-recovery
+// idiom but NOT a kill switch — METIS_MICROCOMPACT=0 must not
+// silently disable spill too (2026-06-11 review finding). Empty =
+// spilling disabled.
+func (l *Loop) spillDir() string {
+	return l.SpillDir
+}
+
 func safeToolExecute(ctx context.Context, t tools.Tool, in map[string]any) (res *tools.Result, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -459,6 +470,13 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	}
 	l.mu.RUnlock()
 	toolCtx = WithParentSnapshot(toolCtx, snap)
+	// Shared USD budget: sub-agent builders (Agent / Fork) pull this so
+	// child spend draws down the parent's pool. nil when no cap is set.
+	toolCtx = WithBudget(toolCtx, l.Budget)
+	// Shared spill dir: sub-agents offload their own oversized tool
+	// results to the same session store instead of flooding the child
+	// context. Empty when spilling is disabled.
+	toolCtx = WithSpillDir(toolCtx, l.SpillDir)
 	// Plan-mode controller: lets EnterPlanMode / ExitPlanMode flip
 	// loop.PlanMode mid-turn. Empty interface check is unnecessary —
 	// *Loop always satisfies PlanController. Tools that don't care
@@ -500,6 +518,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	if l.Detector != nil {
 		l.Detector.Record(blk.ToolName, blk.ToolInput)
 	}
+	var hookContext string // PostToolUseContext additionalContext, appended below
 	if l.Hooks != nil {
 		var output string
 		var isErr bool
@@ -508,10 +527,17 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		} else if res != nil {
 			output, isErr = res.Output, res.IsError
 		}
-		l.Hooks.EmitPostToolUse(ctx, tc, &PostToolUseHook{
+		post := &PostToolUseHook{
 			Context: tc, Tool: blk.ToolName, Input: blk.ToolInput,
 			Output: output, IsError: isErr,
-		})
+		}
+		l.Hooks.EmitPostToolUse(ctx, tc, post)
+		// Feedback-capable variant: handlers can return
+		// AdditionalContext (lint diagnostics, format fixes) that gets
+		// appended to the tool_result as a <system-reminder> so the
+		// MODEL sees it next turn. Mirrors claude-code's PostToolUse
+		// additionalContext response field.
+		hookContext = l.Hooks.EmitPostToolUseContext(ctx, tc, post)
 		// Distinct PostToolUseFailure firing on tool errors so observers
 		// can subscribe to "only failures" without filtering by IsError
 		// inside every PostToolUse handler. Mirrors claude-code's split.
@@ -541,13 +567,34 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		Elapsed:    execElapsed,
 	})
 
+	// Ingestion-time spill (claude-code's maxResultSizeChars, Tool.ts:456):
+	// an oversized tool_result never enters the context wholesale — the
+	// full content is persisted under the microcompact cache dir and the
+	// model gets a preview + path it can Read back. Complements
+	// Microcompact, which only offloads retroactively once the context
+	// passes the snip threshold; by then a 500 KB dump has already
+	// burned a turn of window. The TUI event above already carried the
+	// full output, so on-screen display is unaffected. METIS_SPILL=0
+	// disables (same spirit as the METIS_MICROCOMPACT kill switch).
+	resultBody := res.Output
+	if limit := tools.MaxResultSizeChars(t); limit > 0 && len(resultBody) > limit {
+		if dir := l.spillDir(); dir != "" {
+			if sr, serr := spill.Store(dir, blk.ToolUseID, resultBody); serr == nil {
+				resultBody = sr.Stub()
+			}
+		}
+	}
+	// PostToolUseContext hook feedback — appended AFTER the spill check
+	// so fresh diagnostics never get offloaded with the bulk output.
+	if hookContext != "" {
+		resultBody = resultBody + wrapAsSystemReminder(hookContext)
+	}
 	// Anti-pattern nudge: when the model uses Bash for something a
 	// dedicated tool would do better (cat → Read, find → Glob, etc.),
 	// append a one-line <system-reminder> to the tool_result. The
 	// command still ran (no refusal); the nudge teaches the model to
 	// pick the right tool next turn. See bash_redirects.go for the
 	// detector logic.
-	resultBody := res.Output
 	if blk.ToolName == "Bash" && !res.IsError {
 		if cmd, _ := blk.ToolInput["command"].(string); cmd != "" {
 			if hint := bashRedirect(cmd); hint != "" {

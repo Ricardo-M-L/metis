@@ -33,6 +33,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 // MaxToolSearchResults caps the matches a single ToolSearch keyword
@@ -195,9 +196,9 @@ func handleKeywordSearch(l *Loop, toolUseID, query string, maxResults int) llm.C
 //	+12   exact-part match in name (mcp__server__action split on `__`)
 //	+8    required term present in name
 //	+6    partial substring in name
-//	+4    `searchHint` present (reserved — metis has no curated hint
-//	      field yet; left as a TODO so adding it later doesn't shift
-//	      the weight table for unrelated terms)
+//	+4    appears in the tool's curated searchHint (pkg/tool.SearchHinter;
+//	      MCP servers surface it via _meta — most tools have none and
+//	      simply never collect this weight)
 //	+2    appears in description (word-boundary fuzzy via Contains)
 //
 // Required terms are also part of the rank score, so among tools that
@@ -227,13 +228,14 @@ func searchToolsWithKeywords(l *Loop, query string, maxResults int) []map[string
 		}
 		nameLower := strings.ToLower(name)
 		descLower := strings.ToLower(t.Description())
+		hintLower := strings.ToLower(pubtool.SearchHint(t))
 		nameParts := splitToolNameParts(nameLower)
 
 		// Required-term filter: every required term must appear
-		// somewhere (name or description). One miss disqualifies.
+		// somewhere (name, hint or description). One miss disqualifies.
 		skip := false
 		for _, req := range required {
-			if !strings.Contains(nameLower, req) && !strings.Contains(descLower, req) {
+			if !strings.Contains(nameLower, req) && !strings.Contains(descLower, req) && !strings.Contains(hintLower, req) {
 				skip = true
 				break
 			}
@@ -242,7 +244,7 @@ func searchToolsWithKeywords(l *Loop, query string, maxResults int) []map[string
 			continue
 		}
 
-		score := scoreQueryAgainstTool(required, optional, nameParts, nameLower, descLower)
+		score := scoreQueryAgainstTool(required, optional, nameParts, nameLower, descLower, hintLower)
 		if score == 0 {
 			// No signal at all — only required terms matched and they
 			// only appear in description with no extras. Skip to keep
@@ -315,7 +317,7 @@ func splitToolNameParts(name string) []string {
 
 // scoreQueryAgainstTool applies the weight table to one tool. Kept as
 // a separate fn so tests can call it directly with controlled inputs.
-func scoreQueryAgainstTool(required, optional, nameParts []string, nameLower, descLower string) int {
+func scoreQueryAgainstTool(required, optional, nameParts []string, nameLower, descLower, hintLower string) int {
 	score := 0
 	for _, term := range optional {
 		for _, part := range nameParts {
@@ -327,6 +329,9 @@ func scoreQueryAgainstTool(required, optional, nameParts []string, nameLower, de
 		if strings.Contains(nameLower, term) {
 			score += 6
 		}
+		if hintLower != "" && strings.Contains(hintLower, term) {
+			score += 4
+		}
 		if strings.Contains(descLower, term) {
 			score += 2
 		}
@@ -334,6 +339,9 @@ func scoreQueryAgainstTool(required, optional, nameParts []string, nameLower, de
 	for _, req := range required {
 		if strings.Contains(nameLower, req) {
 			score += 8
+		}
+		if hintLower != "" && strings.Contains(hintLower, req) {
+			score += 4
 		}
 		if strings.Contains(descLower, req) {
 			score += 2

@@ -282,6 +282,26 @@ func (c *Client) LookupContextWindowByModelID(modelID string) (int, bool) {
 	return 0, false
 }
 
+// LookupCostByModelID scans every provider for a model whose key
+// matches and returns its Cost (USD per million tokens). Same scan
+// semantics and caveats as LookupContextWindowByModelID. ok=false
+// when the cache is empty, the model is unknown, or the entry has no
+// pricing (some Bedrock variants) — callers treat that as "track
+// nothing" rather than guessing.
+func (c *Client) LookupCostByModelID(modelID string) (Cost, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || modelID == "" {
+		return Cost{}, false
+	}
+	for _, p := range c.cached {
+		if m, ok := p.Models[modelID]; ok && (m.Cost.Input > 0 || m.Cost.Output > 0) {
+			return m.Cost, true
+		}
+	}
+	return Cost{}, false
+}
+
 // Stat is a point-in-time snapshot of the catalog's freshness +
 // coverage, surfaced via MetisInfo's [catalog] section + the
 // `metis models status` CLI. Lets the model self-check "did catalog

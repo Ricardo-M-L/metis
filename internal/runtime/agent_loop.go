@@ -8,9 +8,11 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/budget"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -55,6 +57,12 @@ type AgentLoopOptions struct {
 	// Loop.injectMonitorEvents drains it at every iteration boundary
 	// and pushes <monitor_event> system-reminder messages.
 	Monitors *agent.MonitorRegistry
+
+	// MaxBudgetUSD caps the session's cumulative LLM spend in USD
+	// (claude-code's maxBudgetUsd). 0 = no cap. Pricing is resolved
+	// from the models.dev catalog by model ID; unknown pricing means
+	// the cap never trips (safe direction — see internal/budget).
+	MaxBudgetUSD float64
 }
 
 // BuildMemoryManager constructs a MemoryManager. Returns nil on error
@@ -136,6 +144,38 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	loop := agent.NewLoop(opts.Provider, opts.Registry, opts.Gate,
 		hookReg, opts.System, maxIter)
 	loop.Model = opts.Model
+
+	// USD budget cap (claude-code's maxBudgetUsd). Pricing comes from
+	// the models.dev catalog, which warms up in a BACKGROUND goroutine
+	// — a lookup at build time usually misses. The lazy tracker
+	// re-resolves on each round-trip until pricing lands; a model the
+	// catalog never prices stays at zero rates and never trips (safe
+	// direction — the cap must not kill a session on a bogus $0 math).
+	// Sub-agent builders share the parent's tracker pointer instead of
+	// calling this path (see builtin/agent.go).
+	if opts.MaxBudgetUSD > 0 {
+		model := opts.Model
+		loop.Budget = budget.NewTrackerLazy(opts.MaxBudgetUSD, func() (budget.Rates, bool) {
+			cli := catalog.Default()
+			if cli == nil {
+				return budget.Rates{}, false
+			}
+			cost, ok := cli.LookupCostByModelID(model)
+			if !ok {
+				// Distinguish "catalog not warmed yet" (keep retrying)
+				// from "warmed and this model has no pricing" (final —
+				// stop rescanning the full provider map every
+				// round-trip; 2026-06-11 review finding).
+				return budget.Rates{}, cli.Stat().InMemory
+			}
+			return budget.Rates{
+				InputPerMTok:      cost.Input,
+				OutputPerMTok:     cost.Output,
+				CacheReadPerMTok:  cost.CacheRead,
+				CacheWritePerMTok: cost.CacheWrite,
+			}, true
+		})
+	}
 	if len(opts.SystemSections) > 0 {
 		loop.SystemSections = toLLMSections(opts.SystemSections)
 	}
@@ -256,6 +296,16 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		if os.Getenv("METIS_DEBUG") == "1" {
 			fmt.Fprintf(os.Stderr, "metis: microcompact cache dir = %s\n", loop.Compactor.MicrocompactDir)
 		}
+	}
+
+	// Ingestion-time spill store (claude-code's maxResultSizeChars).
+	// Wired SEPARATELY from MicrocompactDir on purpose: each offload
+	// path has its own kill switch, and METIS_MICROCOMPACT=0 must not
+	// silently disable spill too (2026-06-11 review finding). Shares
+	// the microcompact cache directory so Read-recovery stubs from
+	// both paths point into one store.
+	if os.Getenv("METIS_SPILL") != "0" && cfg.Session.Dir != "" {
+		loop.SpillDir = filepath.Join(cfg.Session.Dir, "microcompact-cache")
 	}
 
 	// Loop detector — wired by default (post-2026-05-08). The earlier

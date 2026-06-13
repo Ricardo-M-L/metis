@@ -50,6 +50,44 @@ func TestMicrocompact_OffloadsLargeBlocks(t *testing.T) {
 	}
 }
 
+// TestMicrocompact_SlashBearingToolUseID — a tool_use_id containing a
+// slash (seen from MCP / OpenAI-compat gateways) must still offload.
+// Pre-2026-06-13 the raw id made filepath.Join target a non-existent
+// subdirectory, os.WriteFile failed with ENOENT, and the offload was
+// silently skipped — the oversized result stayed in context. Now the
+// id is sanitized identically to spill (spill.SanitizeID).
+func TestMicrocompact_SlashBearingToolUseID(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultCompactionConfig()
+	cfg.ProtectFirst = 1
+	cfg.ProtectLast = 2
+	cfg.MicrocompactDir = dir
+	cfg.MicrocompactMinChars = 100
+	cfg.KeepRecentToolResults = 0
+	c := NewCompactor(cfg, "test", 1000, &fakeSummarizer{})
+
+	bigPayload := strings.Repeat("B", 500)
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		toolUseMsg("mcp/jira/search:42", "mcp__jira__search"),
+		toolResultMsg("mcp/jira/search:42", bigPayload),
+		msg(llm.RoleUser, "tail-1"),
+		msg(llm.RoleAssistant, "tail-2"),
+	}
+	out := c.Microcompact(msgs)
+
+	got := out[2].Content[0].ToolResult
+	if strings.Contains(got, bigPayload) {
+		t.Fatal("slash-bearing id: offload was silently skipped, full payload still inline")
+	}
+	if !strings.Contains(got, "cached at") {
+		t.Errorf("expected a recoverable stub; got %q", got)
+	}
+	if !strings.Contains(got, dir) {
+		t.Errorf("stub should reference the cache dir; got %q", got)
+	}
+}
+
 // TestMicrocompact_DisabledWhenNoDir — no MicrocompactDir → no-op.
 // Production-safe default for builds that haven't wired the cache path.
 func TestMicrocompact_DisabledWhenNoDir(t *testing.T) {

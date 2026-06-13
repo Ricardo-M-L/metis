@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/budget"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
@@ -334,6 +335,52 @@ func ParentSnapshotFromContext(ctx context.Context) *ParentSnapshot {
 		return &v
 	}
 	return nil
+}
+
+// budgetKey carries the parent loop's *budget.Tracker to sub-agent
+// builders (Agent / Fork tools). Children add their usage to the SAME
+// tracker, so a session-level USD cap covers the whole agent tree —
+// a parent can't dodge its budget by fanning out sub-agents.
+type budgetKey struct{}
+
+// WithBudget tags ctx with the parent loop's budget tracker. Called
+// by dispatch.go alongside WithParentSnapshot. nil trackers are not
+// stored.
+func WithBudget(ctx context.Context, t *budget.Tracker) context.Context {
+	if t == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, budgetKey{}, t)
+}
+
+// BudgetFromContext returns the shared budget tracker, or nil when
+// the parent loop has no USD cap.
+func BudgetFromContext(ctx context.Context) *budget.Tracker {
+	t, _ := ctx.Value(budgetKey{}).(*budget.Tracker)
+	return t
+}
+
+// spillDirKey carries the parent loop's SpillDir to sub-agent builders
+// so a sub-agent's oversized tool results spill to disk too, instead
+// of entering the child context wholesale. Sub-agents share the
+// parent's session store; tool_use_ids are globally unique so files
+// never collide across the tree.
+type spillDirKey struct{}
+
+// WithSpillDir tags ctx with the parent loop's spill directory. Called
+// by dispatch.go alongside WithBudget. Empty dir is not stored.
+func WithSpillDir(ctx context.Context, dir string) context.Context {
+	if dir == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, spillDirKey{}, dir)
+}
+
+// SpillDirFromContext returns the inherited spill directory, or "" when
+// spilling is disabled in the parent.
+func SpillDirFromContext(ctx context.Context) string {
+	d, _ := ctx.Value(spillDirKey{}).(string)
+	return d
 }
 
 // PlanController exposes mid-conversation plan-mode toggles to tools.

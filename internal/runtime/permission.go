@@ -1,12 +1,15 @@
 package runtime
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 )
 
 // BuildPermissionGate returns a fully wired permission.Gate seeded with the
-// allow / deny rules from config.toml.
+// allow / deny rules from config.toml plus the managed policy file.
 //
 // Extracted from cmd/metis/main.go's setupRuntime so main.go can stay
 // composer-only — the contract is "give me cfg + a mode, hand me back a
@@ -22,13 +25,12 @@ func BuildPermissionGate(cfg *config.Config, mode string) *permission.Gate {
 	}
 	gate := permission.New(permission.Mode(mode))
 
-	// Load order matters: gate.Decide iterates rules in REVERSE,
-	// so the LAST appended rule wins on conflict. We want config
-	// rules (admin policy) to override persistent "Yes always"
-	// approvals (per-session user choices) — if an admin adds a
-	// Bash deny tomorrow, the user's old persistent allow should
-	// not silently bypass it. So persistent goes in FIRST (becomes
-	// the floor); config rules go on top.
+	// Append order is mostly cosmetic since 2026-06-11: the gate now
+	// resolves conflicts by source AUTHORITY first (policy > cli >
+	// interactive > config > persistent — see permission/source_rank.go)
+	// and append recency only breaks same-authority ties. We still load
+	// persistent first / config second so same-rank behavior matches
+	// the historical "config overrides persistent" stack.
 	//
 	// Persistent approvals load from ~/.metis/persistent-permissions.jsonl.
 	// Errors are silent — missing / corrupt file just means "no
@@ -46,6 +48,30 @@ func BuildPermissionGate(cfg *config.Config, mode string) *permission.Gate {
 			Tool: r.Tool, Match: r.Match,
 			Verb: permission.DecisionDeny, Source: "config:deny",
 		})
+	}
+
+	// Managed policy (/etc/metis/policy.toml or METIS_POLICY_FILE) —
+	// claude-code's policySettings tier. The "policy:" source prefix
+	// maps to the top authority rank, so nothing later in the session
+	// (config edits, TUI "always allow") can override these rules.
+	// A malformed policy file is logged-and-skipped rather than fatal:
+	// refusing to boot would lock the user out of fixing it, but the
+	// parse error lands on stderr so it isn't silent.
+	if pol, err := config.LoadPolicy(); err != nil {
+		fmt.Fprintf(os.Stderr, "metis: %v (policy rules NOT applied)\n", err)
+	} else if pol != nil {
+		for _, r := range pol.Permission.Allow {
+			gate.AppendRules(permission.Rule{
+				Tool: r.Tool, Match: r.Match,
+				Verb: permission.DecisionAllow, Source: "policy:allow",
+			})
+		}
+		for _, r := range pol.Permission.Deny {
+			gate.AppendRules(permission.Rule{
+				Tool: r.Tool, Match: r.Match,
+				Verb: permission.DecisionDeny, Source: "policy:deny",
+			})
+		}
 	}
 	return gate
 }

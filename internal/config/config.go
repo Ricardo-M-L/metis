@@ -809,8 +809,42 @@ func searchPaths() []string {
 	out = append(out, filepath.Join(Home(), "config.toml"))
 	if cwd, err := os.Getwd(); err == nil {
 		out = append(out, filepath.Join(cwd, ".metis", "config.toml"))
+		// Per-checkout overrides that stay out of version control —
+		// claude-code's settings.local.json equivalent. Loaded after
+		// the shared project file so a developer's local tweaks win
+		// over the committed config without editing it.
+		out = append(out, filepath.Join(cwd, ".metis", "config.local.toml"))
 	}
 	return out
+}
+
+// PolicyPath is where the machine-managed policy file lives —
+// claude-code's policySettings equivalent. Permission rules loaded
+// from here carry the "policy:" source prefix, the highest authority
+// rank: neither config files, CLI flags, nor a TUI "always allow" can
+// override a policy deny. METIS_POLICY_FILE overrides the location
+// (tests, non-root setups).
+func PolicyPath() string {
+	if p := os.Getenv("METIS_POLICY_FILE"); p != "" {
+		return p
+	}
+	return "/etc/metis/policy.toml"
+}
+
+// LoadPolicy reads the managed policy file. Returns (nil, nil) when
+// the file doesn't exist — most machines have no policy. Unlike Load,
+// a malformed policy file is an ERROR for the caller to surface: a
+// policy that silently fails open defeats its purpose.
+func LoadPolicy() (*Config, error) {
+	path := PolicyPath()
+	if _, err := os.Stat(path); err != nil {
+		return nil, nil
+	}
+	cfg := &Config{}
+	if _, err := toml.DecodeFile(path, cfg); err != nil {
+		return nil, fmt.Errorf("load policy %s: %w", path, err)
+	}
+	return cfg, nil
 }
 
 // migrateLegacyHome moves config + data from previous home-dir locations

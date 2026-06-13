@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
+	"github.com/Ricardo-M-L/metis/internal/budget"
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -102,6 +103,22 @@ type Loop struct {
 
 	// Compactor handles automatic context window compaction. nil = disabled.
 	Compactor *Compactor
+
+	// Budget enforces the session-level USD cap (claude-code's
+	// maxBudgetUsd). nil = no cap. Sub-agent loops receive the SAME
+	// tracker pointer as their parent, so child spend draws down one
+	// shared pool. Checked at the top of each iteration (same clean
+	// boundary as the wall-clock cap — no orphaned tool_use blocks);
+	// usage lands after each consumeStream.
+	Budget *budget.Tracker
+
+	// SpillDir is where ingestion-time result spilling persists
+	// oversized tool outputs (claude-code's maxResultSizeChars; see
+	// internal/spill). Wired by runtime independently from the
+	// Compactor's MicrocompactDir so the two kill switches
+	// (METIS_SPILL / METIS_MICROCOMPACT) stay independent. Empty =
+	// spilling disabled.
+	SpillDir string
 
 	// Detector monitors tool call patterns; aborts run when ShouldAbort returns true.
 	// nil = disabled.
@@ -664,6 +681,35 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return nil
 		}
 
+		// USD budget cap (claude-code's maxBudgetUsd) — same clean
+		// pre-request boundary as the wall-clock check above, so no
+		// tool_use is left orphaned by a mid-batch stop.
+		if l.Budget.Exceeded() {
+			stopReason = "budget_usd"
+			l.Hooks.EmitLoopEnd(ctx, tc, "budget_usd")
+			emit(ctx, out, Event{Kind: EventInfo, Info: l.Budget.ExceededMessage()})
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "budget_usd"})
+			return nil
+		}
+		// One-shot 90%-budget warning. Injected HERE — the same
+		// pre-request boundary the iter nudge uses — and not in the
+		// post-stream usage block, because there the assistant message
+		// hadn't been appended yet: the warning would land BEFORE the
+		// reply the model produced without seeing it, corrupting
+		// transcript order (caught by 2026-06-11 review).
+		if warn := l.Budget.TakeWarning(); warn != "" {
+			l.mu.Lock()
+			l.Messages = append(l.Messages, llm.Message{
+				Role:    llm.RoleUser,
+				Content: []llm.ContentBlock{{Type: "text", Text: warn}},
+			})
+			l.mu.Unlock()
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("(budget nudge: $%.4f spent — model asked to wrap up)", l.Budget.SpentUSD()),
+			})
+		}
+
 		l.mu.Lock()
 		l.iterIdx++
 		curIter := l.iterIdx
@@ -759,6 +805,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				CacheCreationInputTokens: usage.cacheCreate,
 				CacheReadInputTokens:     usage.cacheRead,
 			})
+			l.Budget.AddUsage(usage.in, usage.out, usage.cacheRead, usage.cacheCreate)
 		}
 
 		l.mu.Lock()

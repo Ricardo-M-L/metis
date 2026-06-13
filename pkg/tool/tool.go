@@ -191,6 +191,80 @@ func DescriptionFor(t Tool, short bool) string {
 	return t.Description()
 }
 
+// SearchHinter lets a tool publish a curated 3-10 word capability
+// summary consumed by the lazy-tools keyword ranker (ToolSearch). A
+// hint match scores between a name match and a description match:
+// names are precise but cryptic (mcp__jira__jql_search), descriptions
+// are long and noisy — the hint is the author saying "these are the
+// words people reach for". Mirrors claude-code's Tool.searchHint
+// (Tool.ts:371).
+type SearchHinter interface {
+	SearchHint() string
+}
+
+// SearchHint returns t's curated hint, or "" when t doesn't implement
+// SearchHinter.
+func SearchHint(t Tool) string {
+	if h, ok := t.(SearchHinter); ok {
+		return h.SearchHint()
+	}
+	return ""
+}
+
+// Aliaser lets a tool declare alternative names it answers to. The
+// registry resolves aliases in Get() so a renamed tool keeps working
+// for old transcripts, configs and models trained on the prior name.
+// Aliases never appear in the tools[] array sent to the LLM — they
+// are a lookup courtesy, not advertised surface. Mirrors claude-code's
+// Tool.aliases (Tool.ts:368).
+type Aliaser interface {
+	Aliases() []string
+}
+
+// Aliases returns t's declared alternative names, or nil.
+func Aliases(t Tool) []string {
+	if a, ok := t.(Aliaser); ok {
+		return a.Aliases()
+	}
+	return nil
+}
+
+// Result-size spill thresholds. When a tool's textual output exceeds its
+// effective MaxResultSizeChars, the dispatch layer persists the full
+// content to disk (internal/spill) and hands the model a preview + file
+// path instead — the model recovers the rest via Read on demand. This is
+// the ingestion-time counterpart to Microcompact's retroactive offload:
+// a single 500 KB Bash dump never enters the context wholesale.
+//
+// Mirrors claude-code's Tool.maxResultSizeChars (Tool.ts:456) with the
+// same 50k default (constants/toolLimits.ts:13).
+const (
+	// DefaultMaxResultSizeChars applies to tools that don't implement
+	// MaxResultSizer.
+	DefaultMaxResultSizeChars = 50_000
+
+	// ResultSizeUnlimited opts a tool out of spilling entirely. Read
+	// uses it: persisting Read output to a file the model re-Reads is
+	// circular, and Read already self-bounds via its own line limits.
+	ResultSizeUnlimited = -1
+)
+
+// MaxResultSizer lets a tool override the default spill threshold for
+// its textual output. Return ResultSizeUnlimited to opt out.
+type MaxResultSizer interface {
+	MaxResultSizeChars() int
+}
+
+// MaxResultSizeChars returns t's effective spill threshold. Default is
+// DefaultMaxResultSizeChars when t does not implement MaxResultSizer.
+// A non-positive return (ResultSizeUnlimited) disables spilling.
+func MaxResultSizeChars(t Tool) int {
+	if m, ok := t.(MaxResultSizer); ok {
+		return m.MaxResultSizeChars()
+	}
+	return DefaultMaxResultSizeChars
+}
+
 // InterruptBehavior controls what happens when the user submits a new
 // message while a tool is mid-execution. Mirrors claude-code's Tool.ts:416.
 //

@@ -82,7 +82,16 @@ func ApplyResume(store *session.Store, sessionID string, loop *agent.Loop,
 		for _, r := range hdr.AlwaysAllow {
 			gate.AppendRules(permission.Rule{
 				Tool: r.Tool, Match: r.Match,
-				Verb: permission.Decision(r.Verb), Source: r.Source,
+				Verb: permission.Decision(r.Verb),
+				// Sanitize the source through the resume boundary: a
+				// session file is user-editable, and the gate ranks
+				// authority by source prefix — a forged "policy*" /
+				// "cli*" source would otherwise resurrect with
+				// top-rank, un-overridable authority (2026-06-11
+				// review finding). Legit policy/cli rules are re-built
+				// fresh at boot anyway, so resumed copies never need
+				// those ranks.
+				Source: permission.SanitizeResumedSource(r.Source),
 			})
 		}
 		if hdr.WorkDir != "" {
