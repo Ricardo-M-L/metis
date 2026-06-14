@@ -170,8 +170,21 @@ func (m *Manager) Snap(toolName, argsHash, message string) (string, error) {
 
 // skipDirs are the cwd subtrees we never copy into the shadow.
 // Tuned for typical projects.
+//
+// `.metis` is CRITICAL here, not just an optimization: the shadow repo
+// lives at ~/.metis/checkpoints/<id>. When metis runs with cwd at (or
+// above) ~/.metis — e.g. launched from the home directory — copyTree
+// would otherwise Walk straight into the shadow dir it is writing to,
+// copying the checkpoint tree into itself. Each snapshot then nests
+// another `.metis/checkpoints/<id>/` layer until paths blow past the
+// 255-byte filename limit ("file name too long"), spamming errors and
+// hanging the turn (2026-06-14 user report). `.augmentcode` is excluded
+// for the same reason — its checkpoint-documents store holds very long
+// path-encoded filenames that compound the overflow.
 var skipDirs = map[string]bool{
 	".git":         true,
+	".metis":       true,
+	".augmentcode": true,
 	"node_modules": true,
 	".venv":        true,
 	"venv":         true,
@@ -206,6 +219,14 @@ func (m *Manager) copyTree() error {
 		// the entire subtree.
 		if info.IsDir() {
 			if skipDirs[info.Name()] {
+				return filepath.SkipDir
+			}
+			// Defensive backstop against the self-recursion bug: never
+			// descend into the shadow dir we are writing to, even if it
+			// somehow lives under cwd under a non-skipped name (e.g. a
+			// custom shadowRoot). Belt-and-suspenders with the `.metis`
+			// skipDir above.
+			if m.shadowDir != "" && (path == m.shadowDir || strings.HasPrefix(path, m.shadowDir+string(os.PathSeparator))) {
 				return filepath.SkipDir
 			}
 			return nil

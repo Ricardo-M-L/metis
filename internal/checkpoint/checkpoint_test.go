@@ -157,6 +157,61 @@ func TestSnap_SkipsKnownDirs(t *testing.T) {
 	}
 }
 
+// TestSnap_SkipsMetisDir — the self-recursion fix (2026-06-14). A
+// `.metis` subtree under cwd (which contains the shadow dir itself when
+// metis runs from home) must be pruned, or copyTree nests the shadow
+// into itself until paths overflow the 255-byte filename limit.
+func TestSnap_SkipsMetisDir(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	mdir := filepath.Join(cwd, ".metis", "checkpoints", "abc")
+	if err := os.MkdirAll(mdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mdir, "shadow.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "real.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Snap("Write", "k", "test"); err != nil {
+		t.Fatalf("Snap: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(m.shadowDir, ".metis")); err == nil {
+		t.Error(".metis must be pruned (self-recursion guard)")
+	}
+	if _, err := os.Stat(filepath.Join(m.shadowDir, "real.txt")); err != nil {
+		t.Error("non-.metis content should still be snapshotted")
+	}
+}
+
+// TestSnap_NeverRecursesIntoShadowUnderCwd — the defensive backstop:
+// even with a custom shadowRoot living UNDER cwd (not named .metis),
+// copyTree must not copy the shadow dir into itself. Two snaps that
+// would otherwise nest deeper each time.
+func TestSnap_NeverRecursesIntoShadowUnderCwd(t *testing.T) {
+	skipIfNoGit(t)
+	cwd := t.TempDir()
+	shadowRoot := filepath.Join(cwd, "myshadow") // under cwd, non-.metis name
+	m := NewManager("session-test", cwd, shadowRoot)
+	if err := os.WriteFile(filepath.Join(cwd, "real.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Snap("Write", "k1", "test"); err != nil {
+		t.Fatalf("Snap1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "real.txt"), []byte("ok2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Snap("Write", "k2", "test"); err != nil {
+		t.Fatalf("Snap2: %v", err)
+	}
+	// The shadow must not contain a copy of itself.
+	if _, err := os.Stat(filepath.Join(m.shadowDir, "myshadow")); err == nil {
+		t.Error("shadow recursed into itself — self-copy was not pruned")
+	}
+}
+
 func TestHashArgs_Deterministic(t *testing.T) {
 	a := HashArgs(map[string]any{"file_path": "x", "content": "y"})
 	b := HashArgs(map[string]any{"content": "y", "file_path": "x"})
