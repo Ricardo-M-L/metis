@@ -88,25 +88,98 @@ func Store(dir, toolUseID, content string) (*Result, error) {
 func (r *Result) Stub() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[tool output too large (%d chars). Full output saved to: %s — use Read tool with this exact path to recover the full content]\n\n", r.OriginalSize, r.Path)
-	fmt.Fprintf(&b, "Preview (first %d chars):\n", PreviewChars)
+	b.WriteString("Preview:\n")
 	b.WriteString(r.Preview)
-	if r.HasMore {
-		b.WriteString("\n...")
-	}
 	return b.String()
 }
 
-// makePreview cuts content at limit without splitting a UTF-8 rune
-// mid-sequence (CJK tool output is common here).
+// errorMarkers (lowercase) trigger tail-preservation when found in the
+// part of the output that head-only truncation would drop. Compiler /
+// test / stack-trace failures put their verdict at the very END, so a
+// pure-head preview is exactly where it goes blind.
+var errorMarkers = []string{
+	"error", "exception", "traceback", "panic", "fatal",
+	"failed", "fail:", "segfault", "assert", "--- fail",
+}
+
+// makePreview builds the in-context preview of oversized content. It is
+// head-only by default, but when the dropped tail carries error signal
+// it keeps head (70%) + tail (30%) so the model still sees the failure.
+// Mirrors MiMo-Code's error-aware truncation (Claude Code, by contrast,
+// truncates head-only and loses tail errors). All cuts respect UTF-8
+// rune boundaries (CJK tool output is common). Returns the fully
+// formatted preview (truncation markers included) plus whether any
+// truncation happened.
 func makePreview(content string, limit int) (string, bool) {
 	if len(content) <= limit {
 		return content, false
 	}
-	cut := limit
-	for cut > 0 && !utf8.RuneStart(content[cut]) {
-		cut--
+	if hasErrorTail(content, limit) {
+		head := cutRuneSafe(content, limit*7/10)
+		tail := cutRuneSafeFromEnd(content, limit-len(head))
+		omitted := len(content) - len(head) - len(tail)
+		return fmt.Sprintf(
+			"%s\n\n... [%d chars omitted; tail kept below — it contains error output] ...\n\n%s",
+			head, omitted, tail), true
 	}
-	return content[:cut], true
+	head := cutRuneSafe(content, limit)
+	return fmt.Sprintf("%s\n\n... [%d chars truncated] ...", head, len(content)-len(head)), true
+}
+
+// hasErrorTail reports whether the portion of content that pure-head
+// truncation would discard (content[limit:]) contains an error marker.
+// Only the dropped region matters: an error already inside the head is
+// visible without keeping the tail.
+func hasErrorTail(content string, limit int) bool {
+	if limit >= len(content) {
+		return false
+	}
+	return HasErrorMarker(content[limit:])
+}
+
+// HasErrorMarker reports whether text contains a recognized error /
+// failure marker (case-insensitive). The single source of truth for
+// "is this output a failure?" — shared by spill's tail preservation and
+// Bash's capped-output tail ring (internal/tools/builtin/bash), so both
+// offload paths agree on what's worth keeping.
+func HasErrorMarker(text string) bool {
+	low := strings.ToLower(text)
+	for _, m := range errorMarkers {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// cutRuneSafe returns the first n bytes of s without splitting a rune.
+func cutRuneSafe(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// cutRuneSafeFromEnd returns roughly the last n bytes of s without
+// splitting a rune at the start of the slice.
+func cutRuneSafeFromEnd(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }
 
 // SanitizeID keeps tool_use_ids filesystem-safe. Provider IDs are

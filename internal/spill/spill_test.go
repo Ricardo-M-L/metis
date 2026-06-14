@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 	"testing"
 )
 
@@ -20,8 +21,13 @@ func TestStoreWritesAndStubs(t *testing.T) {
 	if !r.HasMore {
 		t.Fatal("HasMore = false, want true")
 	}
-	if len(r.Preview) != PreviewChars {
-		t.Fatalf("Preview len = %d, want %d", len(r.Preview), PreviewChars)
+	// Head-only (no error tail): preview is the head plus a truncation
+	// marker, so it's bounded near PreviewChars but not exactly equal.
+	if len(r.Preview) > PreviewChars+80 {
+		t.Fatalf("preview unexpectedly long: %d", len(r.Preview))
+	}
+	if !strings.Contains(r.Preview, "truncated") {
+		t.Errorf("head-only preview should carry a truncation marker; got %q", r.Preview[:60])
 	}
 	got, err := os.ReadFile(r.Path)
 	if err != nil {
@@ -85,15 +91,60 @@ func TestStoreFilenameDisjointFromMicrocompact(t *testing.T) {
 	}
 }
 
-// Preview must not split a multi-byte rune at the cut point.
+// Preview must not split a multi-byte rune at the cut point (head-only
+// path — all-CJK content with no error markers).
 func TestPreviewRespectsUTF8(t *testing.T) {
 	content := strings.Repeat("中", PreviewChars) // 3 bytes each — guaranteed mid-rune cut
 	preview, hasMore := makePreview(content, PreviewChars)
 	if !hasMore {
 		t.Fatal("hasMore = false, want true")
 	}
-	if !strings.HasSuffix(preview, "中") {
-		t.Fatalf("preview ends mid-rune: %q", preview[len(preview)-4:])
+	if !utf8.ValidString(preview) {
+		t.Fatal("preview contains an invalid UTF-8 sequence (split a rune)")
+	}
+	if !strings.Contains(preview, "truncated") {
+		t.Errorf("head-only preview should carry a truncation marker; got tail %q", preview[len(preview)-30:])
+	}
+}
+
+// When the dropped tail carries error output, the preview keeps both
+// head AND tail so the model still sees the failure verdict (compiler /
+// test / stack-trace errors land at the very end). This is the MiMo-Code
+// error-aware behavior Claude Code lacks.
+func TestPreviewKeepsErrorTail(t *testing.T) {
+	head := strings.Repeat("compiling step ok\n", 300) // pushes well past the limit
+	tail := "\n\npanic: runtime error: index out of range [5] with length 3\n--- FAIL: TestThing"
+	content := head + tail
+
+	preview, hasMore := makePreview(content, PreviewChars)
+	if !hasMore {
+		t.Fatal("hasMore = false, want true")
+	}
+	if !strings.Contains(preview, "panic: runtime error") {
+		t.Error("error tail was dropped — pure-head truncation lost the failure")
+	}
+	if !strings.Contains(preview, "--- FAIL: TestThing") {
+		t.Error("test-failure verdict at the very end was dropped")
+	}
+	if !strings.Contains(preview, "omitted") || !strings.Contains(preview, "error output") {
+		t.Errorf("head+tail preview should explain the omission; got %q", preview)
+	}
+	// Head must still be present (not just the tail).
+	if !strings.Contains(preview, "compiling step ok") {
+		t.Error("head was dropped")
+	}
+}
+
+// No error markers in the dropped tail → stays head-only (don't pay the
+// tail-preservation cost for ordinary large output).
+func TestPreviewHeadOnlyWhenNoErrorTail(t *testing.T) {
+	content := strings.Repeat("ordinary log line\n", 400)
+	preview, _ := makePreview(content, PreviewChars)
+	if strings.Contains(preview, "error output") {
+		t.Error("kept tail for non-error output — should be head-only")
+	}
+	if !strings.Contains(preview, "truncated") {
+		t.Error("expected a plain head truncation marker")
 	}
 }
 

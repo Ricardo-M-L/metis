@@ -14,9 +14,11 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
+	"github.com/Ricardo-M-L/metis/internal/workflow"
 )
 
 // ToolRegistryOptions bundles inputs BuildToolRegistry needs from the
@@ -195,6 +197,38 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// with nil and Execute returns a clear error so the capability
 	// shows up in /tools but isn't usable.
 	reg.Register(builtin.NewMemory(opts.Gate, opts.MemoryManager))
+	// History tool: searches the FULL on-disk session transcript,
+	// including messages auto-compaction has summarized away from the
+	// live context. The loadFn closure reads the session JSONL fresh on
+	// each call (low-frequency tool — no caching needed), so it always
+	// sees the verbatim history even after several compactions. Empty
+	// session id (informational `metis tools` listing) → no messages,
+	// which the tool reports cleanly.
+	sessionDir := opts.Cfg.Session.Dir
+	// Build the store ONCE here (NewStore does an os.MkdirAll) rather
+	// than per History call — the closure only does the per-call Load.
+	var histStore *session.Store
+	if sessionDir != "" {
+		histStore, _ = session.NewStore(sessionDir) // err → nil store → tool reports "unavailable"
+	}
+	reg.Register(builtin.NewHistory(func() ([]llm.Message, error) {
+		id := CurrentSessionID()
+		if id == "" || histStore == nil {
+			return nil, nil
+		}
+		_, msgs, err := histStore.Load(id)
+		return msgs, err
+	}))
+	// Workflow tool: ordered multi-step shell sequences with per-step
+	// status (build→test→lint). Named workflows persist next to the
+	// session dir under ../workflows so they're reusable across
+	// sessions. Empty session dir → store stays nil and only inline
+	// `run` works (named persistence disabled), reported cleanly.
+	var wfStore *workflow.Store
+	if sessionDir != "" {
+		wfStore = workflow.NewStore(filepath.Join(sessionDir, "..", "workflows"))
+	}
+	reg.Register(builtin.NewWorkflow(opts.Gate, wfStore))
 	// MetisInfo tool: LLM-facing introspection. Reads the same
 	// references this function already has, so it sees changes that
 	// happen later (e.g. /reload toggling an MCP server's Disabled

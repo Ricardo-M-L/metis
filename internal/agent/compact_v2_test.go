@@ -144,13 +144,18 @@ func longMiddle() []llm.Message {
 	return out
 }
 
-// --- #1: 5-section prompt --------------------------------------------------
+// --- #1: structured summary prompt (8 sections, CC-aligned 2026-06-13) ------
 
-func TestSummary_InitialPromptHasFiveSections(t *testing.T) {
+func TestSummary_InitialPromptHasAllSections(t *testing.T) {
+	// 8 sections: the crush-5 plus the Claude-Code-aligned additions
+	// (Primary Request & Intent, Errors & Fixes, Pending Tasks).
 	want := []string{
+		"## Primary Request & Intent",
 		"## Current State",
 		"## Files & Changes",
 		"## Technical Context",
+		"## Errors & Fixes",
+		"## Pending Tasks",
 		"## Strategy & Approach",
 		"## Exact Next Steps",
 	}
@@ -158,11 +163,14 @@ func TestSummary_InitialPromptHasFiveSections(t *testing.T) {
 		if !strings.Contains(SummarySystemPromptInitial, h) {
 			t.Errorf("SummarySystemPromptInitial missing %q", h)
 		}
-	}
-	for _, h := range want {
 		if !strings.Contains(SummarySystemPromptMerge, h) {
 			t.Errorf("SummarySystemPromptMerge missing %q", h)
 		}
+	}
+	// Drift guard: Next Steps must instruct verbatim quoting of the
+	// latest user ask (the CC anti-drift property).
+	if !strings.Contains(SummarySystemPromptInitial, "VERBATIM") {
+		t.Error("Next Steps should require quoting the latest user request verbatim (drift guard)")
 	}
 }
 

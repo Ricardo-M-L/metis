@@ -87,6 +87,19 @@ type ProviderCapabilities struct {
 	// translates between them downstream — this atom just tells the
 	// model what wire shape its end of the API speaks.
 	OpenAIFunctionCalls bool
+
+	// BehaviorNotes is a short family-specific BEHAVIORAL nudge,
+	// distinct from the wire-shape / quirk atoms above (those are about
+	// HOW to talk to the API). This reinforces how a given model family
+	// tends to behave and what's worth correcting for — e.g. Kimi:
+	// track multi-step work with todos; Anthropic: scrutinize
+	// destructive actions; DeepSeek: act on the reasoning, don't narrate
+	// it. Mirrors MiMo-Code's per-model prompt specialization, but as an
+	// additive section over metis's single base prompt rather than N
+	// separate full prompts (Claude Code's model-conditional-section
+	// approach, which is far cheaper to maintain than MiMo's 8 files).
+	// Empty → nothing appended.
+	BehaviorNotes string
 }
 
 // DetectProviderCapabilities maps a (provider, model) tuple to a
@@ -115,6 +128,7 @@ func DetectProviderCapabilities(provider, model string) ProviderCapabilities {
 			AnthropicCompatTools: true,
 			HasThinkingBlocks:    true,
 			PromptCachingActive:  true,
+			BehaviorNotes:        "Before any destructive or hard-to-reverse action, weigh reversibility and blast radius. Follow the project's existing conventions (AGENTS.md / CLAUDE.md, surrounding code style) closely rather than imposing your own.",
 		}
 	case strings.HasPrefix(p, "minimax"):
 		return ProviderCapabilities{
@@ -129,12 +143,14 @@ func DetectProviderCapabilities(provider, model string) ProviderCapabilities {
 		return ProviderCapabilities{
 			FamilyName:        "DeepSeek",
 			HasReasoningSplit: true,
+			BehaviorNotes:     "You reason strongly — act on that reasoning directly instead of narrating it back, and keep the final answer tight.",
 		}
 	case strings.HasPrefix(p, "kimi") || strings.Contains(p, "moonshot"):
 		c := ProviderCapabilities{
-			FamilyName:  "Moonshot Kimi",
-			LongContext: true,
-			Bilingual:   true,
+			FamilyName:    "Moonshot Kimi",
+			LongContext:   true,
+			Bilingual:     true,
+			BehaviorNotes: "For any multi-step task, sketch a brief plan first and track progress with the Todo/Task tools as you go — it keeps long runs from drifting or repeating work. Lean on the large context, but still keep replies tight.",
 		}
 		if strings.Contains(m, "thinking") {
 			c.HasThinkingBlocks = true
@@ -224,6 +240,14 @@ func composeProviderHint(caps ProviderCapabilities) string {
 	}
 	if caps.EmptyStreamChunks {
 		parts = append(parts, atomEmptyStreamChunks)
+	}
+
+	// Behavioral nudge LAST — it's the most "soft" of the atoms (how to
+	// behave, not how to talk to the API), so it reads naturally as a
+	// closing note. Its own labelled sub-section so it's visually
+	// distinct from the wire-shape facts above.
+	if caps.BehaviorNotes != "" {
+		parts = append(parts, "## Behavior\n"+caps.BehaviorNotes)
 	}
 
 	// Strip the header when no atoms fire (FamilyName known but no

@@ -1,7 +1,6 @@
 package bash
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +15,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -501,7 +501,6 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	// universally rather than guess at adoption time.
 	jobs.ApplyProcessGroup(exe)
 
-	var buf bytes.Buffer
 	maxBytes := b.settings.MaxOutputBytes
 	if maxBytes <= 0 {
 		// In-process default — matches the config default
@@ -511,7 +510,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		// tokens of build log.
 		maxBytes = 32 * 1024
 	}
-	cappedBuf := &cappedWriter{w: &buf, max: maxBytes}
+	cappedBuf := newCappedWriter(maxBytes)
 
 	// If the job pool is wired up, also tee output to disk so we can
 	// adopt the cmd into a Job without losing anything. If the pool
@@ -568,7 +567,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		if diskOut != nil {
 			b.Jobs.CleanupOrphan(diskOut)
 		}
-		out := buf.String()
+		out := cappedBuf.preview()
 		if cappedBuf.truncated {
 			out += "\n\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}
@@ -606,20 +605,20 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 			// Adoption failed — let the cmd finish in the foreground
 			// after all. Drain the wait we already started.
 			err2 := <-waitCh
-			out := buf.String()
+			out := cappedBuf.preview()
 			res := &tools.Result{Output: out, IsError: err2 != nil}
 			return res, nil
 		}
 		canceled = true // Adopt owns the cancel now
-		preview := buf.String()
+		preview := cappedBuf.preview()
 		if cappedBuf.truncated {
 			preview += "\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}
 		msg := fmt.Sprintf(
 			"[command moved to background after %s — still running, job_id=%s]\n"+
 				"Use Output {job_id: %q} to read more output, Kill {job_id: %q} to stop.\n"+
-				"Output captured in foreground (%d bytes):\n%s",
-			AutoBackgroundThreshold, jb.ID, jb.ID, jb.ID, len(buf.Bytes()), preview,
+				"Output captured in foreground:\n%s",
+			AutoBackgroundThreshold, jb.ID, jb.ID, jb.ID, preview,
 		)
 		// IsError=false: this is a normal flow, not an error. The
 		// model should treat the job_id as the way forward.
@@ -761,32 +760,71 @@ func detectBlockedSleepPattern(cmd string) string {
 	return fmt.Sprintf("`sleep %d` with trailing args", secs)
 }
 
+// cappedWriter bounds an in-memory output preview to `max` bytes, but
+// — unlike a plain head cap — it also retains the LAST `tailMax` bytes
+// in a ring. When the captured stream is truncated and that tail
+// carries error output (compiler / test / stack-trace failures land at
+// the very end), preview() returns head + tail so the model still sees
+// the verdict. Mirrors MiMo-Code's error-aware truncation; pure-head
+// capping (the prior behavior, also Claude Code's) went blind there.
 type cappedWriter struct {
-	w         io.Writer
-	max       int
-	written   int
+	head      []byte
+	headMax   int
+	tail      []byte // ring of up to tailMax most-recent bytes
+	tailMax   int
 	truncated bool
 }
 
+func newCappedWriter(max int) *cappedWriter {
+	// Head keeps the FULL cap (no regression for ordinary output, which
+	// stays head-only). The tail ring is an ADDITIONAL 30% reserve,
+	// surfaced only when truncation happens AND the tail looks like a
+	// failure — so error output costs a little extra, ordinary output
+	// costs nothing.
+	return &cappedWriter{headMax: max, tailMax: max * 3 / 10}
+}
+
 func (c *cappedWriter) Write(p []byte) (int, error) {
-	if c.truncated {
-		return len(p), nil
-	}
-	remain := c.max - c.written
-	if remain <= 0 {
-		c.truncated = true
-		return len(p), nil
-	}
-	if len(p) > remain {
-		_, err := c.w.Write(p[:remain])
-		c.written = c.max
-		c.truncated = true
-		if err != nil {
-			return 0, err
+	n := len(p)
+	if len(c.head) < c.headMax {
+		room := c.headMax - len(c.head)
+		if room >= len(p) {
+			c.head = append(c.head, p...)
+			return n, nil
 		}
-		return len(p), nil
+		c.head = append(c.head, p[:room]...)
+		p = p[room:]
 	}
-	n, err := c.w.Write(p)
-	c.written += n
-	return n, err
+	if len(p) > 0 {
+		c.truncated = true
+		c.pushTail(p)
+	}
+	return n, nil
+}
+
+// pushTail keeps only the last tailMax bytes seen so far.
+func (c *cappedWriter) pushTail(p []byte) {
+	if len(p) >= c.tailMax {
+		c.tail = append(c.tail[:0], p[len(p)-c.tailMax:]...)
+		return
+	}
+	c.tail = append(c.tail, p...)
+	if len(c.tail) > c.tailMax {
+		c.tail = c.tail[len(c.tail)-c.tailMax:]
+	}
+}
+
+// preview renders the in-memory output. Full head when not truncated;
+// head + tail when the dropped tail looks like a failure; head only
+// otherwise.
+func (c *cappedWriter) preview() string {
+	if !c.truncated {
+		return string(c.head)
+	}
+	if spill.HasErrorMarker(string(c.tail)) {
+		return string(c.head) +
+			"\n\n... [middle omitted; tail kept below — it contains error output] ...\n\n" +
+			string(c.tail)
+	}
+	return string(c.head)
 }

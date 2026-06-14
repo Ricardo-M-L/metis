@@ -438,6 +438,27 @@ model receives a 2k preview + the file path — recoverable with Read,
 so a 500 KB Bash dump never enters the window wholesale. `METIS_SPILL=0`
 disables.
 
+The spill preview (and Bash's own 32 KiB output cap) is **error-aware**
+(2026-06-13, MiMo-Code parity; Claude Code truncates head-only): when
+the dropped tail carries failure signal (`error` / `panic` / `traceback`
+/ `--- FAIL` …, via `spill.HasErrorMarker`), the preview keeps head +
+tail so a compiler/test/stack-trace verdict — which lands at the very
+end — survives truncation. Ordinary output stays head-only at no extra
+cost.
+
+When compaction does fire, the structured summary uses an **8-section**
+template (`internal/agent/compact.go`, extended 2026-06-13 from the
+crush-5 toward Claude Code's compaction prompt): Primary Request &
+Intent, Current State, Files & Changes, Technical Context, Errors &
+Fixes, Pending Tasks, Strategy & Approach, and an Exact Next Steps that
+quotes the latest user ask verbatim to guard against task drift.
+
+For anything compaction *does* summarize away, the **`History` tool**
+(`internal/tools/builtin/history.go`) BM25-searches the verbatim on-disk
+session transcript (`search` + `around`), so the model can still recover
+the exact wording of an evicted message — the one recall path neither
+spill nor the summary covers.
+
 Triggered preflight (size threshold) **and** reactively (4xx with
 context-window phrasing). `estimateTokens` counts text body + tool input
 JSON + tool result content + tool name (every byte that goes on the

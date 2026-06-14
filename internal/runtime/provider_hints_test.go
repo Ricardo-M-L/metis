@@ -75,3 +75,33 @@ func TestRenderBasePrompt_NoHintWhenEmpty(t *testing.T) {
 		t.Errorf("expected no provider notes section when ProviderHint empty:\n%s", out)
 	}
 }
+
+// Per-model behavioral nudges (2026-06-13, point #3): each family that
+// declares BehaviorNotes surfaces a labelled ## Behavior section, and
+// the nudges are family-specific (Kimi → task tracking, Anthropic →
+// destructive-action caution, DeepSeek → act-don't-narrate).
+func TestProviderHint_BehaviorNotes(t *testing.T) {
+	kimi := ProviderHintFor("kimi", "kimi-k2.6")
+	if !strings.Contains(kimi, "## Behavior") {
+		t.Errorf("kimi hint missing ## Behavior section; got:\n%s", kimi)
+	}
+	if !strings.Contains(kimi, "Todo/Task") {
+		t.Errorf("kimi behavior should push task tracking; got:\n%s", kimi)
+	}
+
+	anthropic := ProviderHintFor("anthropic", "claude-opus-4-8")
+	if !strings.Contains(anthropic, "reversibility") {
+		t.Errorf("anthropic behavior should stress reversibility; got:\n%s", anthropic)
+	}
+
+	deepseek := ProviderHintFor("deepseek", "deepseek-v4-pro")
+	if !strings.Contains(deepseek, "## Behavior") || !strings.Contains(deepseek, "narrat") {
+		t.Errorf("deepseek behavior should say act-don't-narrate; got:\n%s", deepseek)
+	}
+
+	// A family without BehaviorNotes (OpenAI) must NOT emit the section.
+	openai := ProviderHintFor("openai", "gpt-5.1")
+	if strings.Contains(openai, "## Behavior") {
+		t.Errorf("openai has no behavior notes; should not emit the section; got:\n%s", openai)
+	}
+}

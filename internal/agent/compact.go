@@ -1060,18 +1060,26 @@ func lastUserTextBefore(messages []llm.Message, before int) int {
 }
 
 // SummarySystemPromptInitial is the system instruction the summarizer
-// LLM sees on a FRESH compact (no prior summary to merge). The 5-section
-// structure mirrors crush's internal/agent/templates/summary.md and is
-// strong enough to survive across providers (Anthropic / GLM / Kimi /
-// DeepSeek all handle markdown sections well; raw "summarize concisely"
-// without structure tends to collapse to a single paragraph the model
-// then mis-reads as "small talk recap").
+// LLM sees on a FRESH compact (no prior summary to merge). The 8-section
+// structure descends from crush's 5-section template, extended
+// 2026-06-13 to absorb the high-value sections Claude Code's compaction
+// prompt carries that the 5-section form folded together too coarsely:
+// a dedicated Errors & Fixes (don't re-trip the same failure), Pending
+// Tasks (discrete todos survive the boundary), Primary Request & Intent
+// (capture how the ask evolved), and a drift-guard on Next Steps (quote
+// the latest user ask verbatim). Strong enough to survive across
+// providers (Anthropic / GLM / Kimi / DeepSeek all handle markdown
+// sections well; raw "summarize concisely" collapses to one paragraph
+// the model mis-reads as small talk).
 const SummarySystemPromptInitial = `You are summarizing an agent conversation so it can be folded into a context-window boundary. The summary is the ONLY context the agent will have for what happened before this point — be specific, not glossy.
 
-Output the summary as concise Markdown with these five sections in order. Omit a section only if it is genuinely empty.
+Output the summary as concise Markdown with these sections in order. Omit a section only if it is genuinely empty.
+
+## Primary Request & Intent
+- Every distinct thing the user asked for, in order (verbatim if short, paraphrased if long, but keep the actual ask)
+- How the request evolved — later messages that changed direction or added constraints
 
 ## Current State
-- Exact user request (verbatim if short, paraphrased if long, but include the actual ask)
 - What's done / in progress / blocked
 - What remains, with concrete next-step granularity
 
@@ -1083,7 +1091,15 @@ Output the summary as concise Markdown with these five sections in order. Omit a
 ## Technical Context
 - Architecture / pattern decisions and the reason
 - Libraries, commands, environment details that worked or failed (exact form)
-- Constants, IDs, paths, error messages worth preserving
+- Constants, IDs, paths worth preserving
+
+## Errors & Fixes
+- Errors, test failures, and build breaks encountered — the exact message
+- How each was fixed, or that it is still open
+- Any user feedback or correction that prompted a change (so it isn't repeated)
+
+## Pending Tasks
+- Explicit todos the user requested that are not yet done, as discrete checkable items
 
 ## Strategy & Approach
 - Overall approach and why it was chosen
@@ -1092,6 +1108,7 @@ Output the summary as concise Markdown with these five sections in order. Omit a
 
 ## Exact Next Steps
 - Numbered, imperative, concrete (e.g. "Add JWT middleware to src/middleware/auth.js:15")
+- Quote the most recent user request/task VERBATIM so the next step stays anchored to what was actually asked (prevents drift)
 - Include exact commands or test invocations the agent should run
 
 Tone: briefing a teammate who just walked in cold. No emojis. No filler. No "the user wanted to know about X" framing — write what the actual answer was. Err on too much specificity rather than too little.`
@@ -1102,13 +1119,16 @@ Tone: briefing a teammate who just walked in cold. No emojis. No filler. No "the
 // rather than re-summarize from scratch. Priority on conflict:
 //
 //	Active Task > Completed Actions > Resolved Questions.
-const SummarySystemPromptMerge = `You are UPDATING an existing conversation summary with new messages that have happened since the last summary. The previous summary will be shown to you; treat it as authoritative for everything that came before, and integrate the new messages into the same five-section structure.
+const SummarySystemPromptMerge = `You are UPDATING an existing conversation summary with new messages that have happened since the last summary. The previous summary will be shown to you; treat it as authoritative for everything that came before, and integrate the new messages into the same section structure.
 
 Output the updated summary as concise Markdown using these sections:
 
+## Primary Request & Intent
 ## Current State
 ## Files & Changes
 ## Technical Context
+## Errors & Fixes
+## Pending Tasks
 ## Strategy & Approach
 ## Exact Next Steps
 

@@ -438,6 +438,8 @@ that lights up while the turn is running and clears on completion.
 | `NotebookEdit` | exclusive | edit a single cell in a `.ipynb` notebook |
 | `LSP` | safe | hover/definition/references/implementations via gopls (Go), pyright (Python), typescript-language-server (TS/JS), rust-analyzer (Rust) when installed |
 | `Memory` | exclusive | persistent memory CRUD |
+| `History` | safe | search the full session transcript — including messages auto-compaction summarized away — and read around any hit (recover exact past wording) |
+| `Workflow` | exclusive | run an ordered sequence of shell steps as one unit with per-step status + stop-on-failure; save/reuse named workflows. Each step gated like Bash |
 | `Skill` | safe | invoke a registered skill |
 | `AskUser` | exclusive | blocking 3-5 option menu — model surfaces a question, TUI renders numbered choices + optional freeform input, tool returns chosen answer |
 | `TodoWrite` / `TodoRead` | exclusive / safe | task list, persisted per-session |
