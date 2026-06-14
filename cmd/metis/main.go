@@ -1222,24 +1222,27 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	// Phase 2 MCP launch — kicked off only after `rt` is fully built so
 	// the goroutine can reach into rt.mcpServers / rt.mcpServersMu. Bare
-	// mode already closed the done-channel above; this is the !flags.bare
-	// arm. Lazy mode selection mirrors the legacy synchronous path.
+	// mode already closed the done-channel above and starts NO launcher.
+	// (The prior code let bare fall into a headless `else` arm whose
+	// goroutine `defer close`d mcpLauncherDoneCh a SECOND time → "close
+	// of closed channel" panic on startup — caught 2026-06-15 launching
+	// `metis chat --bare`.)
 	if !flags.bare {
+		// Diagnostic sink for async MCP errors: a TUI must keep stderr
+		// OFF the alt-screen (→ debug log, possibly nil = silent), since
+		// stray stderr corrupts the chat; a headless run wants it on
+		// stderr, its only output channel.
+		diag := os.Stderr
+		if flags.useTUI || term.IsTerminal(int(os.Stdout.Fd())) {
+			diag = debugLogFile
+		}
 		lazyMode := mcp.ParseLazyMode(os.Getenv("METIS_LAZY_MCP"))
 		go func(reg *tools.Registry, mcpReg *mcp.Registry, mode mcp.LazyMode) {
 			defer close(mcpLauncherDoneCh)
 			servers, errs := mcp.LaunchAllLazy(ctx, mcpReg, reg, mode)
-			// 2026-05-18: under TUI mode, stderr leaks into the
-			// alt-screen and corrupts the chat (user report: "每次
-			// 问完一句话 metis 就自动出现 MCP handshake: context
-			// deadline exceeded"). MCP launch is async + best-effort;
-			// the user discovers failures via /mcp list and the
-			// debug log. Stderr is reserved for non-TUI runs (bare
-			// mode, headless invocations) where it's the only output
-			// channel.
 			for _, e := range errs {
-				if debugLogFile != nil {
-					fmt.Fprintf(debugLogFile, "metis: MCP launch: %v\n", e)
+				if diag != nil {
+					fmt.Fprintf(diag, "metis: MCP launch: %v\n", e)
 				}
 			}
 			rt.mcpServersMu.Lock()
@@ -1247,30 +1250,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			rt.mcpServersMu.Unlock()
 			// Attach to a running IDE's MCP server if one advertises a
 			// matching workspace via ~/.metis/ide/*.lock (best-effort).
-			if ide := connectIDE(ctx, reg, debugLogFile); ide != nil {
+			if ide := connectIDE(ctx, reg, diag); ide != nil {
 				rt.mcpServersMu.Lock()
 				rt.mcpServers = append(rt.mcpServers, ide)
 				rt.mcpServersMu.Unlock()
 			}
 		}(reg, mcpReg, lazyMode)
-	} else {
-		// Bare / non-TUI mode — stderr is fine, the user expects it.
-		go func(reg *tools.Registry, mcpReg *mcp.Registry) {
-			defer close(mcpLauncherDoneCh)
-			lazyMode := mcp.ParseLazyMode(os.Getenv("METIS_LAZY_MCP"))
-			servers, errs := mcp.LaunchAllLazy(ctx, mcpReg, reg, lazyMode)
-			for _, e := range errs {
-				fmt.Fprintf(os.Stderr, "metis: MCP launch: %v\n", e)
-			}
-			rt.mcpServersMu.Lock()
-			rt.mcpServers = append(rt.mcpServers, servers...)
-			rt.mcpServersMu.Unlock()
-			if ide := connectIDE(ctx, reg, os.Stderr); ide != nil {
-				rt.mcpServersMu.Lock()
-				rt.mcpServers = append(rt.mcpServers, ide)
-				rt.mcpServersMu.Unlock()
-			}
-		}(reg, mcpReg)
 	}
 
 	// Resolve resume target. Order: explicit --resume <id> wins; then
