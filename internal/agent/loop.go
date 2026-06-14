@@ -151,6 +151,14 @@ type Loop struct {
 	turnIdx  int
 	iterIdx  int
 
+	// todoWriteIter / todoReminderIter drive the periodic todo
+	// re-surfacing (todo_reminder.go): the iteration of the last
+	// TodoWrite call and the last reminder injection, so we can fire a
+	// <system-reminder> when the list has gone untouched for a while
+	// with incomplete items.
+	todoWriteIter    int
+	todoReminderIter int
+
 	// haltSignal carries a "stop after this iteration" signal raised
 	// by a PreToolUse hook returning Halt=true (claude-code parity:
 	// subprocess hooks signal halt via JSON `{"decision":"halt"}`
@@ -732,6 +740,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// <monitor_event> system-reminders. Cheap when no Monitor is
 		// active (nil registry → instant return).
 		l.injectMonitorEvents(out)
+		// Re-surface the todo list when it's gone untouched for a while
+		// with incomplete items — claude-code's todo_reminder mechanism,
+		// the thing that actually keeps tasks from being left stuck
+		// mid-status (see todo_reminder.go).
+		l.injectTodoReminder(out)
 
 		// Soft iter-budget nudges at 50% / 75% / 90% — see
 		// iter_nudge.go. Fire at most one per threshold per turn so
@@ -904,6 +917,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		}
 
 		toolUses := filterToolUses(assistant)
+		// Reset the todo-reminder countdown whenever the model touches
+		// the tracker, so we only re-surface the list after a genuine
+		// lull (todo_reminder.go).
+		for _, tu := range toolUses {
+			if tu.ToolName == "TodoWrite" {
+				l.noteTodoWriteActivity(curIter)
+				break
+			}
+		}
 		// Dispatch-contract observation + mid-turn reminder. Count
 		// the batch the model just emitted (Write/Edit/MultiEdit/
 		// Agent), and if the threshold just crossed without a verify
