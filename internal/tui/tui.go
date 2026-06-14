@@ -102,6 +102,13 @@ type ToolEvent struct {
 	IsError   bool
 	Duration  time.Duration
 	StartTime time.Time
+	// SubAgentParentID is set (to the parent Agent tool's tool_use_id)
+	// when this tool call was forwarded from a child sub-agent loop.
+	// Non-empty → the row renders INDENTED under its parent agent row
+	// instead of flat at top level, so the tree reads
+	// "agent(x) → glob → grep" (claude-code's nested display) rather
+	// than a flat "agent(x)" followed by a top-level "sub: glob".
+	SubAgentParentID string
 }
 
 type permChoice struct {

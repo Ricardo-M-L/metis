@@ -76,7 +76,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// any order matched against the LATEST Start each time, so
 		// Duration ended up ~0ms regardless of real wall time
 		// (image #48 repro: 200+ file Reads all showing "0ms").
-		m.toolEvents = append(m.toolEvents, ToolEvent{ID: ev.ToolUseID, Kind: "start", ToolName: ev.ToolName, Input: ev.ToolInput, StartTime: time.Now()})
+		m.toolEvents = append(m.toolEvents, ToolEvent{ID: ev.ToolUseID, Kind: "start", ToolName: ev.ToolName, Input: ev.ToolInput, StartTime: time.Now(), SubAgentParentID: ev.SubAgentParentID})
 		m.spinnerVerb = toolVerb(ev.ToolName)
 		m.spinnerSub = toolArgsPreview(ev.ToolName, ev.ToolInput)
 		// Sub-agent visualization: when the Agent tool fires, push

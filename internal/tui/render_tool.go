@@ -59,8 +59,24 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 			leaderColor = styleSuccess
 		}
 	}
-	s.WriteString(leaderColor.Render("  " + glyphBullet + " "))
-	s.WriteString(styleToolName.Render(displayToolName(te.ToolName)))
+	// Sub-agent tool calls (forwarded from a child Agent loop, carrying
+	// a SubAgentParentID + a "sub: " name prefix) render INDENTED under
+	// their parent agent row, so the transcript reads as a tree —
+	// "agent(x)" then indented "glob", "grep" — instead of a flat
+	// "agent(x)" followed by top-level "sub: glob". The extra indent
+	// (+4) on both the leader and result rows is the visual nesting;
+	// the "sub: " prefix is then redundant and stripped, since the
+	// indentation already says "this came from the sub-agent above".
+	// Mirrors claude-code's nested sub-agent display.
+	isSub := te.SubAgentParentID != ""
+	leadIndent, resultIndent := "  ", "    "
+	displayName := te.ToolName
+	if isSub {
+		leadIndent, resultIndent = "      ", "        "
+		displayName = strings.TrimPrefix(displayName, "sub: ")
+	}
+	s.WriteString(leaderColor.Render(leadIndent + glyphBullet + " "))
+	s.WriteString(styleToolName.Render(displayToolName(displayName)))
 	if args := toolArgsPreview(te.ToolName, te.Input); args != "" {
 		// Brackets are pure structural chrome — stay muted. The args
 		// payload inside them is what the user came to read (path /
@@ -98,7 +114,7 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// renders at default fg — user screenshot 36 / 2026-05-17 flagged
 	// the dim grey as too low-contrast. This is the most-scanned line
 	// per tool call and it's informational, not chrome.
-	s.WriteString(styleDim.Render("    " + glyphTreeLeaf + "  "))
+	s.WriteString(styleDim.Render(resultIndent + glyphTreeLeaf + "  "))
 	if te.IsError {
 		s.WriteString(styleErr.Render("✗ "))
 	} else {

@@ -402,3 +402,58 @@ func TestRenderToolEvent_LeaderRowFormat(t *testing.T) {
 		t.Errorf("done missing tree-leaf summary: %s", done)
 	}
 }
+
+// TestRenderToolEvent_SubAgentIndent — sub-agent tool calls (carrying a
+// SubAgentParentID + "sub: " name prefix) must render INDENTED under
+// the parent agent, with the "sub: " prefix stripped (the indent says
+// "this is from the sub-agent"). Fixes the flat "sub: glob" display
+// the user flagged (2026-06-14).
+func TestRenderToolEvent_SubAgentIndent(t *testing.T) {
+	// A top-level tool: baseline indent (2 spaces before the bullet).
+	top := renderToolEvent(ToolEvent{
+		Kind: "start", ToolName: "Glob", Input: map[string]any{"pattern": "**/*.go"},
+	}, false)
+	// A forwarded sub-agent tool: same Glob, but with the sub markers.
+	sub := renderToolEvent(ToolEvent{
+		Kind: "start", ToolName: "sub: Glob", Input: map[string]any{"pattern": "**/*.go"},
+		SubAgentParentID: "tu_parent",
+	}, false)
+
+	// The sub row must NOT show the literal "sub: " prefix.
+	if strings.Contains(sub, "sub:") {
+		t.Errorf("sub-agent row should strip the 'sub: ' prefix; got:\n%q", sub)
+	}
+	// Both should name the tool (glob, lowercased).
+	if !strings.Contains(top, "glob") || !strings.Contains(sub, "glob") {
+		t.Fatalf("expected 'glob' in both rows; top=%q sub=%q", top, sub)
+	}
+	// The sub row must be indented deeper than the top row. Compare the
+	// leading whitespace before the first non-space, non-escape glyph.
+	if subLead, topLead := leadingSpaces(sub), leadingSpaces(top); subLead <= topLead {
+		t.Errorf("sub-agent row should be indented deeper: subLead=%d topLead=%d\ntop=%q\nsub=%q",
+			subLead, topLead, top, sub)
+	}
+}
+
+// leadingSpaces counts leading ASCII spaces, skipping ANSI escape
+// sequences (lipgloss color codes) so the count reflects visual indent.
+func leadingSpaces(s string) int {
+	n := 0
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' { // skip an ANSI escape: ESC ... 'm'
+			for i < len(s) && s[i] != 'm' {
+				i++
+			}
+			i++ // consume the 'm'
+			continue
+		}
+		if s[i] == ' ' {
+			n++
+			i++
+			continue
+		}
+		break
+	}
+	return n
+}
