@@ -175,6 +175,81 @@ func Upsert(sessionID string, in Item) (Item, error) {
 	return in, Save(tl)
 }
 
+// ReplaceAll replaces the entire task list with `items` — the Claude
+// Code TodoWrite semantics (declarative full-list replace). Because the
+// caller restates EVERY task with its current status on each call,
+// earlier tasks can't be silently left stuck mid-status. This is the
+// fix for the 2026-06-14 bug where a model finished three verify tasks,
+// marked only the final summary completed, and left the three showing
+// "in progress" — the single-task Upsert form makes that omission easy,
+// the full-list form makes it impossible.
+//
+// Existing tasks are matched (id → exact content → normalised content,
+// the same ladder as Upsert) so a task keeps its id + CreatedAt across
+// calls instead of churning a fresh id every time.
+func ReplaceAll(sessionID string, items []Item) (*List, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	old, err := Load(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := make([]Item, 0, len(items))
+	for _, in := range items {
+		if strings.TrimSpace(in.Content) == "" {
+			continue
+		}
+		if prev := findExisting(old, in); prev != nil {
+			in.ID = prev.ID
+			in.CreatedAt = prev.CreatedAt
+		} else {
+			if in.ID == "" {
+				in.ID = uuid.NewString()[:8]
+			}
+			in.CreatedAt = now
+		}
+		if in.Status == "" {
+			in.Status = "pending"
+		}
+		if in.Priority == "" {
+			in.Priority = "medium"
+		}
+		in.UpdatedAt = now
+		out = append(out, in)
+	}
+	tl := &List{SessionID: sessionID, Items: out}
+	return tl, Save(tl)
+}
+
+// findExisting locates the item in `old` matching `in` by the same
+// ladder Upsert uses: id, then exact content, then normalised content.
+// Returns nil when nothing matches.
+func findExisting(old *List, in Item) *Item {
+	if old == nil {
+		return nil
+	}
+	if in.ID != "" {
+		for i := range old.Items {
+			if old.Items[i].ID == in.ID {
+				return &old.Items[i]
+			}
+		}
+	}
+	for i := range old.Items {
+		if old.Items[i].Content == in.Content {
+			return &old.Items[i]
+		}
+	}
+	want := normalizeTaskContent(in.Content)
+	for i := range old.Items {
+		if normalizeTaskContent(old.Items[i].Content) == want {
+			return &old.Items[i]
+		}
+	}
+	return nil
+}
+
 // CurrentSessionID is set by setupRuntime once a session exists. The
 // TodoWrite tool reads it lazily because tools are stateless and built
 // before the session id is available.

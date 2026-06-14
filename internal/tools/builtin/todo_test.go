@@ -119,3 +119,90 @@ func TestTodoWrite_VerifierNudge_OnlyFiresOnCompletion(t *testing.T) {
 		t.Errorf("in_progress update should not nudge; got: %q", res.Output)
 	}
 }
+
+// TestTodoWrite_FullListReplace — the Claude Code form. Passing the
+// complete `todos` array replaces the whole list; restating all tasks
+// with their status is what fixes the 2026-06-14 bug (earlier tasks
+// silently left mid-status). The final call below marks the three
+// verify tasks completed and they MUST all show completed.
+func TestTodoWrite_FullListReplace(t *testing.T) {
+	setupTodoTestEnv(t)
+	tool := Todo{gate: permission.New(permission.ModeBypass)}
+
+	mk := func(statuses ...string) map[string]any {
+		names := []string{"验证 MiMo-Code", "验证 Metis", "验证 Codex", "汇总报告"}
+		todos := make([]any, len(names))
+		for i, n := range names {
+			todos[i] = map[string]any{"content": n, "status": statuses[i], "priority": "high"}
+		}
+		return map[string]any{"todos": todos}
+	}
+
+	// Initial: first in progress, rest pending.
+	if _, err := tool.Execute(context.Background(), mk("in_progress", "pending", "pending", "pending")); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// Final: all three verify tasks completed + summary completed.
+	res, err := tool.Execute(context.Background(), mk("completed", "completed", "completed", "completed"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	tl, _ := tasks.Load(tasks.CurrentSessionID())
+	if len(tl.Items) != 4 {
+		t.Fatalf("expected 4 tasks, got %d (list replace should not duplicate)", len(tl.Items))
+	}
+	for _, it := range tl.Items {
+		if it.Status != "completed" {
+			t.Errorf("task %q left at status %q — full-list replace must mark all as sent", it.Content, it.Status)
+		}
+	}
+	// Output should show every task, all completed.
+	if strings.Count(res.Output, "[completed]") < 4 {
+		t.Errorf("result should list all 4 completed tasks; got:\n%s", res.Output)
+	}
+}
+
+// TestTodoWrite_FullListReplace_PreservesIdentity — re-sending the same
+// task by content keeps its id + CreatedAt (no churn / no duplicate).
+func TestTodoWrite_FullListReplace_PreservesIdentity(t *testing.T) {
+	setupTodoTestEnv(t)
+	tool := Todo{gate: permission.New(permission.ModeBypass)}
+
+	one := func(status string) map[string]any {
+		return map[string]any{"todos": []any{map[string]any{"content": "task A", "status": status}}}
+	}
+	if _, err := tool.Execute(context.Background(), one("in_progress")); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := tasks.Load(tasks.CurrentSessionID())
+	id0, created0 := before.Items[0].ID, before.Items[0].CreatedAt
+
+	if _, err := tool.Execute(context.Background(), one("completed")); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := tasks.Load(tasks.CurrentSessionID())
+	if len(after.Items) != 1 {
+		t.Fatalf("expected 1 task, got %d (identity not preserved → duplicate)", len(after.Items))
+	}
+	if after.Items[0].ID != id0 || !after.Items[0].CreatedAt.Equal(created0) {
+		t.Error("re-sent task should keep its id + CreatedAt")
+	}
+	if after.Items[0].Status != "completed" {
+		t.Errorf("status should update to completed, got %q", after.Items[0].Status)
+	}
+}
+
+// TestTodoWrite_SingleTaskBackCompat — the legacy single-task form must
+// still work (one-off updates).
+func TestTodoWrite_SingleTaskBackCompat(t *testing.T) {
+	setupTodoTestEnv(t)
+	tool := Todo{gate: permission.New(permission.ModeBypass)}
+	if _, err := tool.Execute(context.Background(), map[string]any{"content": "lone task", "status": "in_progress"}); err != nil {
+		t.Fatalf("single-task form should still work: %v", err)
+	}
+	tl, _ := tasks.Load(tasks.CurrentSessionID())
+	if len(tl.Items) != 1 || tl.Items[0].Status != "in_progress" {
+		t.Errorf("single-task upsert broken: %+v", tl.Items)
+	}
+}

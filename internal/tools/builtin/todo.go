@@ -27,7 +27,20 @@ type Todo struct {
 
 func (Todo) Name() string { return "TodoWrite" }
 func (Todo) Description() string {
-	return `Create or update a task in the session task list. Persists to ~/.metis/tasks/.
+	return `Manage the session task list. Persists to ~/.metis/tasks/.
+
+## How to call it
+
+PREFERRED: pass a ` + "`todos`" + ` array containing the COMPLETE list every
+time, each item {content, status, priority?}. This REPLACES the whole
+list, so you restate every task and its current status on each call —
+which is exactly what stops earlier tasks from being left half-done.
+Example: marking task 2 done → send all tasks, with task 1 completed,
+task 2 completed, task 3 pending. Keep exactly ONE task in_progress.
+
+(A single-task form — bare content+status — still works for one-off
+updates, but prefer the array: it's how you avoid forgetting to close
+finished tasks.)
 
 ## When to use this tool
 
@@ -113,17 +126,34 @@ Single command, immediate result.
 To LIST current tasks before deciding to update or create, call TodoRead first (zero-cost; reads the same file).`
 }
 func (Todo) InputSchema() map[string]any {
-	return map[string]any{
-		"type":     "object",
-		"required": []string{"content"},
+	todoItem := map[string]any{
+		"type": "object",
 		"properties": map[string]any{
+			"content":  map[string]any{"type": "string", "description": "Task description."},
+			"status":   map[string]any{"type": "string", "description": "pending | in_progress | completed. Keep exactly ONE in_progress."},
+			"priority": map[string]any{"type": "string", "description": "high | medium | low"},
+		},
+		"required": []string{"content", "status"},
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			// Preferred form (Claude Code semantics): the COMPLETE list.
+			"todos": map[string]any{
+				"type":        "array",
+				"items":       todoItem,
+				"description": "The COMPLETE, current task list. Pass EVERY task on every call with its up-to-date status — this REPLACES the whole list. Restating all tasks each time is what prevents earlier tasks from being silently left half-done. This is the form you want; prefer it over the single-task fields below.",
+			},
+			// Legacy single-task upsert (back-compat). Updates/creates one
+			// task matched by content (or id). Kept working but discouraged
+			// — it's easy to forget to close earlier tasks this way.
 			"id": map[string]any{
 				"type":        "string",
-				"description": "Advanced/optional. Internal task ID for direct update. Almost always you should OMIT this — metis matches by content (exact + normalised) when id is absent. Only pass id if you've explicitly retrieved it from a prior TodoWrite tool_result.",
+				"description": "Advanced/optional (single-task form only). Internal task ID for direct update; usually OMIT — metis matches by content.",
 			},
-			"status":   map[string]any{"type": "string", "description": "in_progress | completed | pending. Only ONE in_progress at a time."},
-			"content":  map[string]any{"type": "string", "description": "Task description. Keep stable across updates — changing the wording without passing `id` creates a duplicate."},
-			"priority": map[string]any{"type": "string", "description": "high | medium | low"},
+			"status":   map[string]any{"type": "string", "description": "Single-task form: in_progress | completed | pending."},
+			"content":  map[string]any{"type": "string", "description": "Single-task form: the task description."},
+			"priority": map[string]any{"type": "string", "description": "Single-task form: high | medium | low."},
 		},
 	}
 }
@@ -139,9 +169,19 @@ func (t Todo) CanUse(_ context.Context, _ map[string]any) (tools.Permission, str
 }
 
 func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+	// Preferred path: a `todos` array IS the entire list (Claude Code
+	// semantics). Every major model is trained on this declarative form,
+	// and replacing the whole list each call means a task can never be
+	// left stuck mid-status because the model "forgot" to close it
+	// (2026-06-14 bug). Falls through to the legacy single-task upsert
+	// only when no array is given.
+	if raw, ok := in["todos"].([]any); ok && len(raw) > 0 {
+		return replaceTodoList(raw)
+	}
+
 	content, _ := in["content"].(string)
 	if strings.TrimSpace(content) == "" {
-		return &tools.Result{Output: "TodoWrite: content required", IsError: true}, nil
+		return &tools.Result{Output: "TodoWrite: provide a `todos` array (preferred) or a single `content`+`status`.", IsError: true}, nil
 	}
 	id, _ := in["id"].(string)
 	status, _ := in["status"].(string)
@@ -167,6 +207,58 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 		out += "\n\n" + nudge
 	}
 	return &tools.Result{Output: out}, nil
+}
+
+// replaceTodoList handles the Claude-Code full-list form: parse the
+// todos array, replace the entire stored list, and render it back so
+// the model sees every task's resulting status in one place.
+func replaceTodoList(raw []any) (*tools.Result, error) {
+	items := make([]tasks.Item, 0, len(raw))
+	for _, r := range raw {
+		m, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, _ := m["content"].(string)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		status, _ := m["status"].(string)
+		priority, _ := m["priority"].(string)
+		id, _ := m["id"].(string)
+		items = append(items, tasks.Item{ID: id, Content: content, Status: status, Priority: priority})
+	}
+	if len(items) == 0 {
+		return &tools.Result{Output: "TodoWrite: `todos` array had no items with content.", IsError: true}, nil
+	}
+	tl, err := tasks.ReplaceAll(tasks.CurrentSessionID(), items)
+	if err != nil {
+		return &tools.Result{Output: "TodoWrite: " + err.Error(), IsError: true}, nil
+	}
+	var b strings.Builder
+	for _, it := range tl.Items {
+		fmt.Fprintf(&b, "%s [%s] %s\n", todoStatusIcon(it.Status), it.Status, it.Content)
+	}
+	out := strings.TrimRight(b.String(), "\n")
+	// Reuse the verify-step advisory: it reads the freshly-saved list,
+	// so it works identically for the full-list form.
+	if nudge := todoVerifierNudge("completed"); nudge != "" {
+		out += "\n\n" + nudge
+	}
+	return &tools.Result{Output: out}, nil
+}
+
+// todoStatusIcon maps a status to its list glyph (shared by the
+// full-list renderer and the single-task path).
+func todoStatusIcon(status string) string {
+	switch status {
+	case "completed":
+		return "●"
+	case "in_progress":
+		return "◐"
+	default:
+		return "○"
+	}
 }
 
 // todoVerifierNudge mirrors the TaskUpdate nudge in task.go but reads
