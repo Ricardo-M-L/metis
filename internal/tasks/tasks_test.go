@@ -108,3 +108,29 @@ func TestUpsert_EmptySessionFallsBackToDefault(t *testing.T) {
 		t.Errorf("empty session should write to default file; entries: %+v", entries)
 	}
 }
+
+// TestReplaceAll_DuplicateContentDistinctIDs — two items whose content
+// normalises to the same thing must NOT both claim the same id (the
+// 2026-06-14 review finding); the second gets a fresh id.
+func TestReplaceAll_DuplicateContentDistinctIDs(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	sid := "dup-id-test"
+	// Seed one task so both new items have something to (wrongly) match.
+	if _, err := Upsert(sid, Item{Content: "1. wire protocol", Status: "pending"}); err != nil {
+		t.Fatal(err)
+	}
+	// Two new items that normalise to the same content as the seed.
+	tl, err := ReplaceAll(sid, []Item{
+		{Content: "1. wire protocol", Status: "in_progress"},
+		{Content: "wire protocol", Status: "pending"}, // normalises the same
+	})
+	if err != nil {
+		t.Fatalf("ReplaceAll: %v", err)
+	}
+	if len(tl.Items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(tl.Items))
+	}
+	if tl.Items[0].ID == tl.Items[1].ID {
+		t.Errorf("duplicate ids %q — claimed-set guard failed", tl.Items[0].ID)
+	}
+}

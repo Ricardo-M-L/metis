@@ -195,19 +195,26 @@ func ReplaceAll(sessionID string, items []Item) (*List, error) {
 		return nil, err
 	}
 	now := time.Now()
+	// claimed tracks old IDs already matched in THIS call so two new
+	// items whose content normalises to the same thing don't both claim
+	// the same old id (which would produce duplicate ids). The second
+	// one falls through to a fresh id.
+	claimed := make(map[string]bool, len(items))
 	out := make([]Item, 0, len(items))
 	for _, in := range items {
 		if strings.TrimSpace(in.Content) == "" {
 			continue
 		}
-		if prev := findExisting(old, in); prev != nil {
+		if prev := findExisting(old, in); prev != nil && !claimed[prev.ID] {
 			in.ID = prev.ID
 			in.CreatedAt = prev.CreatedAt
+			claimed[prev.ID] = true
 		} else {
-			if in.ID == "" {
+			if in.ID == "" || claimed[in.ID] {
 				in.ID = uuid.NewString()[:8]
 			}
 			in.CreatedAt = now
+			claimed[in.ID] = true
 		}
 		if in.Status == "" {
 			in.Status = "pending"

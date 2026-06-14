@@ -292,3 +292,32 @@ func TestParseCheckpoint_RoundTrip(t *testing.T) {
 		t.Errorf("Time should parse; got zero")
 	}
 }
+
+// TestIsUnsafeCheckpointRoot_SymlinkedHome — a cwd that reaches home
+// through a symlink (or macOS firmlink) must still be detected, so the
+// whole-home snapshot can't slip past the bare string compare
+// (2026-06-14 review finding).
+func TestIsUnsafeCheckpointRoot_SymlinkedHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	// Build a symlink that points at home, then check a cwd expressed
+	// through the symlink is flagged unsafe.
+	link := filepath.Join(t.TempDir(), "homelink")
+	if err := os.Symlink(home, link); err != nil {
+		t.Skipf("cannot symlink: %v", err)
+	}
+	if !isUnsafeCheckpointRoot(link) {
+		t.Error("a symlink resolving to home should be flagged unsafe")
+	}
+	// A symlink to a NON-home dir must stay safe.
+	other := filepath.Join(t.TempDir(), "proj")
+	os.MkdirAll(other, 0o755)
+	link2 := filepath.Join(t.TempDir(), "projlink")
+	if err := os.Symlink(other, link2); err == nil {
+		if isUnsafeCheckpointRoot(link2) {
+			t.Error("a symlink to a normal project dir must not be flagged unsafe")
+		}
+	}
+}

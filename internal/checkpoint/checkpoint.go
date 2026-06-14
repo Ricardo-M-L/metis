@@ -91,8 +91,21 @@ func isUnsafeCheckpointRoot(cwd string) bool {
 	if clean == "/" {
 		return true
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		if clean == filepath.Clean(home) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	cleanHome := filepath.Clean(home)
+	if clean == cleanHome {
+		return true
+	}
+	// Symlink/firmlink resolution: on macOS the home dir is reachable
+	// as both /Users/x and /System/Volumes/Data/Users/x, and a user may
+	// have a symlinked home. A bare string compare misses those, letting
+	// the whole-home snapshot slip through. Resolve both and compare —
+	// best-effort, falls back to the string compare above on error.
+	if rc, e1 := filepath.EvalSymlinks(clean); e1 == nil {
+		if rh, e2 := filepath.EvalSymlinks(cleanHome); e2 == nil && rc == rh {
 			return true
 		}
 	}
