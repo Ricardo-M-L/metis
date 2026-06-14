@@ -60,11 +60,52 @@ func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 			shadowRoot = "/tmp/metis-checkpoints"
 		}
 	}
-	return &Manager{
+	m := &Manager{
 		sessionID: sessionID,
 		shadowDir: filepath.Join(shadowRoot, sessionID),
 		cwd:       cwd,
 	}
+	// Disable checkpointing when cwd is too broad to snapshot — the home
+	// directory or the filesystem root. Checkpoint exists to undo edits
+	// inside a PROJECT working tree; snapshotting the entire home tree
+	// is never the intent, produces a huge shadow copy, and that copy
+	// then slows down later `find ~`-style commands (and, pre-v0.2.1,
+	// recursed into itself). Running metis from ~ is a misuse; fail the
+	// checkpoint quietly rather than mirroring the whole home dir.
+	// 2026-06-14.
+	if isUnsafeCheckpointRoot(cwd) {
+		m.disabled = true
+	}
+	return m
+}
+
+// isUnsafeCheckpointRoot reports whether cwd is too broad to checkpoint:
+// the filesystem root or the user's home directory itself. Sub-dirs of
+// home (e.g. ~/Documents/project) are fine — only the bare roots are
+// rejected.
+func isUnsafeCheckpointRoot(cwd string) bool {
+	if cwd == "" {
+		return true
+	}
+	clean := filepath.Clean(cwd)
+	if clean == "/" {
+		return true
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if clean == filepath.Clean(home) {
+			return true
+		}
+	}
+	return false
+}
+
+// Disabled reports whether checkpointing is off for this manager (init
+// error, or an unsafe cwd root). Lets runtime warn the user that
+// /rewind won't be available this session.
+func (m *Manager) Disabled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.disabled
 }
 
 // initShadowRepo lazily creates and `git init`s the shadow dir.

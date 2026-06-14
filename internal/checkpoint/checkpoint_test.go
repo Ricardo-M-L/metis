@@ -212,6 +212,56 @@ func TestSnap_NeverRecursesIntoShadowUnderCwd(t *testing.T) {
 	}
 }
 
+// TestNewManager_DisablesOnUnsafeRoot — running from ~ or / must
+// disable checkpointing so we never snapshot the entire home tree
+// (the root cause of the slow `find ~` + huge shadow, 2026-06-14).
+func TestNewManager_DisablesOnUnsafeRoot(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	cases := []struct {
+		cwd          string
+		wantDisabled bool
+	}{
+		{home, true},                              // bare home
+		{home + "/", true},                        // home with trailing slash (Clean normalizes)
+		{"/", true},                               // filesystem root
+		{"", true},                                // empty (defensive)
+		{filepath.Join(home, "Documents", "p"), false}, // a real project subdir
+		{t.TempDir(), false},                      // an unrelated dir
+	}
+	for _, c := range cases {
+		m := NewManager("s", c.cwd, t.TempDir())
+		if got := m.Disabled(); got != c.wantDisabled {
+			t.Errorf("NewManager(cwd=%q).Disabled() = %v, want %v", c.cwd, got, c.wantDisabled)
+		}
+	}
+}
+
+// A disabled manager must make Snap a fast no-op (never touch disk).
+func TestSnap_NoOpWhenDisabledOnHome(t *testing.T) {
+	skipIfNoGit(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	shadow := t.TempDir()
+	m := NewManager("s", home, shadow)
+	hash, err := m.Snap("Write", "k", "test")
+	if err == nil {
+		t.Error("Snap on a home-cwd manager should return the disabled error")
+	}
+	if hash != "" {
+		t.Errorf("disabled Snap returned a hash %q", hash)
+	}
+	// Shadow dir must stay empty — nothing snapshotted.
+	entries, _ := os.ReadDir(filepath.Join(shadow, "s"))
+	if len(entries) != 0 {
+		t.Errorf("disabled manager wrote %d entries to shadow", len(entries))
+	}
+}
+
 func TestHashArgs_Deterministic(t *testing.T) {
 	a := HashArgs(map[string]any{"file_path": "x", "content": "y"})
 	b := HashArgs(map[string]any{"content": "y", "file_path": "x"})
