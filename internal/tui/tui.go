@@ -684,6 +684,17 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 		cfg:          cfg,
 		cmds:         BuildREPLCommands(),
 		startTime:    time.Now(),
+		// Default terminal size so the FIRST frame paints a real banner
+		// instead of a blank screen. bubbletea delivers WindowSizeMsg
+		// asynchronously — the first View() runs before it arrives, and
+		// under tmux that message can lag a SIGWINCH by seconds. Every
+		// width-driven renderer (banner, input, status bar) collapses to
+		// empty output at width 0, so without a default the user stares
+		// at a blank screen and thinks metis hung (2026-06-15). 80x24 is
+		// the universal terminal fallback; the real WindowSizeMsg
+		// re-renders at the true size a frame later.
+		width:  80,
+		height: 24,
 		eventCh:      make(chan agent.Event, eventBufferSize()),
 		doneCh:       make(chan error, 1),
 		overlays:     overlay.New(),

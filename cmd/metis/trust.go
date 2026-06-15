@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -62,7 +63,16 @@ type trustModel struct {
 	cancelled bool
 }
 
-func (trustModel) Init() tea.Cmd { return nil }
+func (trustModel) Init() tea.Cmd {
+	// Same first-frame blank-screen workaround as the chat surface (see
+	// internal/tui Model.Init): bubbletea v2.0.6's startup GetSize can
+	// return 0x0 under tmux before the pty size is negotiated, blanking
+	// the first frame. Re-request the size shortly after start so the
+	// trust prompt actually paints instead of looking hung.
+	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg {
+		return tea.RequestWindowSize()
+	})
+}
 
 func (m *trustModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// v2: KeyMsg is interface; switch on .String() for both named keys

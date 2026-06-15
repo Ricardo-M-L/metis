@@ -23,8 +23,22 @@ import (
 )
 
 func (m *Model) Init() tea.Cmd {
-	// No initial command - let View() render first frame with banner
-	return nil
+	// First-frame blank-screen workaround. bubbletea v2.0.6 reads the
+	// terminal size ONCE at startup via term.GetSize (tea.go:1045) and
+	// does NOT guard against a 0x0 result. Under tmux the pty size often
+	// isn't negotiated yet at that instant, so GetSize returns (0,0)
+	// with no error; bubbletea then resizes its renderer to 0x0 and the
+	// entire first frame is clipped to nothing — the user sees a blank
+	// screen and thinks metis hung, until a real SIGWINCH (resize /
+	// keypress) arrives. Re-request the size after a short delay, by
+	// which point tmux has negotiated the pty, so the renderer gets a
+	// correct resize and paints. (Upstream fix belongs in bubbletea:
+	// fall back to a default when GetSize yields 0 — see the PR note in
+	// docs/. This Tick is the client-side mitigation so metis paints
+	// immediately regardless.)
+	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg {
+		return tea.RequestWindowSize()
+	})
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -79,6 +93,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
+		// Ignore the bogus 0x0 bubbletea emits at tmux startup (see
+		// Init): keeping the default 80x24 the Model was built with is
+		// better than zeroing the layout. The delayed RequestWindowSize
+		// from Init delivers the real size a frame later.
+		if msg.Width <= 0 || msg.Height <= 0 {
+			break
+		}
 		m.width = msg.Width
 		m.height = msg.Height
 		// 2026-05-23: publish the chat-surface width to the package
