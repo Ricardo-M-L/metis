@@ -44,6 +44,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.turnCancel != nil && msg.String() == "esc" {
 		m.turnCancel()
 		m.turnCancel = nil
+		// Stop the spinner immediately for instant "cancel registered"
+		// feedback. turnActive stays set until the goroutine unwinds and
+		// finalizeTurn runs (so a new submit can't race the dying turn);
+		// we just stop painting "thinking…".
+		m.spinnerActive = false
 		// Close any open overlays so the user lands at a clean prompt
 		// after the cancel — otherwise they'd see "interrupted" stacked
 		// under a still-open palette / search / @-mention dropdown.
@@ -224,6 +229,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.turnCancel != nil {
 			m.turnCancel()
 			m.turnCancel = nil
+			m.spinnerActive = false // instant feedback; turnActive clears on finalize
 		}
 		// Drop any queued prompts when the user cancels — claude-code
 		// behavior. A user hitting Ctrl+C is saying "stop everything";

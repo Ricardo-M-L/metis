@@ -35,6 +35,13 @@ import (
 	"time"
 )
 
+// oauthHTTPClient bounds the code→token exchange and refresh calls. The
+// browser-authorization step has its own 2-minute select timeout, but the
+// token exchange used http.DefaultClient (NO timeout): a wedged or malicious
+// token endpoint would hang the CLI forever after the user had already
+// authorized. 30s is generous for an OAuth round-trip.
+var oauthHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 // OAuthProvider describes one OAuth 2.0 endpoint set. Add an entry
 // to KnownProviders and `metis auth oauth <name>` will pick it up.
 type OAuthProvider struct {
@@ -437,7 +444,7 @@ func exchangeCodeForTokenFull(p OAuthProvider, code, redirectURI, verifier strin
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +531,7 @@ func RefreshToken(p OAuthProvider, refreshToken string) (*Token, error) {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

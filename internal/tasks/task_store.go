@@ -63,7 +63,9 @@ type TaskStore struct {
 // taskFilePath uses tasks-structured.json (not tasks.json) so the simple
 // Item store in this same package can keep its existing tasks.json file.
 func taskFilePath(sessionID string) string {
-	return filepath.Join(config.Home(), "sessions", sessionID, "tasks-structured.json")
+	// Path-traversal guard (mirrors session.Store.path): a crafted session
+	// id with separators / ".." must not escape the sessions tree.
+	return filepath.Join(config.Home(), "sessions", filepath.Base(sessionID), "tasks-structured.json")
 }
 
 // NewTaskStore opens (or creates empty) the task store for the given

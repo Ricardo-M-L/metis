@@ -119,7 +119,14 @@ func ReadJobOutput(path string, tailMax int) (string, error) {
 		_, _ = f.Seek(size-int64(tailMax), io.SeekStart)
 	}
 
-	buf := make([]byte, 0, size)
+	// Pre-size to what we'll actually keep, not the whole file: a tail read
+	// of a 100 MB log with a 64 KB tailMax must not reserve 100 MB up front
+	// (the disk-backed design exists precisely to avoid that).
+	capHint := size
+	if tailMax > 0 && int64(tailMax) < capHint {
+		capHint = int64(tailMax) + 64*1024
+	}
+	buf := make([]byte, 0, capHint)
 	chunk := make([]byte, 64*1024)
 	for {
 		n, err := f.Read(chunk)

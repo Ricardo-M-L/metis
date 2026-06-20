@@ -419,7 +419,7 @@ func (g *Gemini) Complete(ctx context.Context, req Request) (*Response, error) {
 		if resp.StatusCode >= 400 {
 			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
 			if transport.IsRetryableStatus(resp.StatusCode) {
-				return &transport.RetryableError{Err: httpErr}
+				return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 			}
 			return httpErr
 		}
@@ -460,7 +460,7 @@ func (g *Gemini) Stream(ctx context.Context, req Request) (StreamReader, error) 
 			_ = resp.Body.Close()
 			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
 			if transport.IsRetryableStatus(resp.StatusCode) {
-				return &transport.RetryableError{Err: httpErr}
+				return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 			}
 			return httpErr
 		}

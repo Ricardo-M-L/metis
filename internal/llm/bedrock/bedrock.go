@@ -192,7 +192,7 @@ func (b *Bedrock) Complete(ctx context.Context, req Request) (*Response, error) 
 		if resp.StatusCode >= 400 {
 			httpErr := fmt.Errorf("bedrock %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
 			if transport.IsRetryableStatus(resp.StatusCode) {
-				return &transport.RetryableError{Err: httpErr}
+				return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 			}
 			return httpErr
 		}

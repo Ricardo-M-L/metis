@@ -78,6 +78,18 @@ type CronJob struct {
 	SessionMode   string       `json:"session_mode,omitempty"`
 	SessionRef    string       `json:"session_ref,omitempty"`
 	DisabledTools []string     `json:"disabled_tools,omitempty"`
+	// AllowTools is the per-job pre-authorization allow-list — claude-code's
+	// "always allow" rules adapted for UNATTENDED fires. A cron daemon has
+	// no human to answer a mid-fire permission prompt, so the decision is
+	// made entirely from this list, set ahead of time by the user (`cron
+	// add --allow ...` / `cron allow <id> ...`). Each entry is a rule in
+	// `Tool(content)` form: `Bash(git pull:*)`, `Write`, `Edit(/repo/**)`.
+	// At fire time a tool call matching ANY entry runs without prompting;
+	// anything else is denied and recorded to the denied store for the user
+	// to review (`cron denied <id>`). Dangerous-pattern commands (rm -rf /,
+	// fork bombs) stay denied even when allow-listed — pre-authorization
+	// can't punch through the hard floor (see EvaluateCronPermission).
+	AllowTools    []string     `json:"allow_tools,omitempty"`
 	CreatedAt     time.Time    `json:"created_at"`
 	LastRun       time.Time    `json:"last_run,omitempty"`
 	NextRun       time.Time    `json:"next_run,omitempty"`
@@ -99,6 +111,16 @@ type CronJob struct {
 	// and the user will check audit logs when something looks off.
 	// Loud (non-silent) is the default — silent is opt-in.
 	Silent bool `json:"silent,omitempty"`
+
+	// Ephemeral marks a session-only job — claude-code's `durable: false`
+	// default. It lives only in this process's CronService (created via the
+	// CronCreate tool during a chat) and is NEVER written to disk, so the
+	// standalone `metis cron start` daemon (which reads jobs off disk in a
+	// separate process) can't see it and there's no double-fire. The owning
+	// chat session's in-session scheduler fires it via FireDueEphemeral
+	// while idle and SteerInjects the prompt. Not serialized: anything on
+	// disk is durable by definition, so this is always false after a load.
+	Ephemeral bool `json:"-"`
 }
 
 // SessionMode constants. Use these instead of bare strings when
@@ -166,6 +188,14 @@ func (s *CronService) loadJob(id string, job *CronJob) error {
 }
 
 func (s *CronService) saveJob(job *CronJob) error {
+	// Ephemeral (session-only) jobs must never touch disk — persisting one
+	// would let the standalone daemon load + fire it, breaking the no-
+	// double-fire invariant. Guarding the single persistence chokepoint
+	// covers every path (Create / Update / Pause / Resume / runJob) so the
+	// invariant can't be defeated by a future caller that forgets it.
+	if job.Ephemeral {
+		return nil
+	}
 	b, err := json.MarshalIndent(job, "", "  ")
 	if err != nil {
 		return err
@@ -196,7 +226,44 @@ func (s *CronService) Create(job *CronJob) error {
 		s.computeNextRun(job)
 	}
 	s.jobs[job.ID] = job
+	// saveJob is a no-op for ephemeral (session-only) jobs — they stay in
+	// memory, the in-session scheduler fires them, the daemon never learns
+	// they exist.
 	return s.saveJob(job)
+}
+
+// FireDueEphemeral advances and returns every ephemeral (session-only) job
+// that is due at `now`, mirroring runJob's bookkeeping (LastRun, RunCount,
+// Repeat→disable, computeNextRun) but WITHOUT saveJob — these jobs never
+// hit disk. The TUI's in-session scheduler calls this on a tick and
+// SteerInjects each returned job's prompt into the live session. Durable
+// jobs are skipped entirely (they're the `metis cron start` daemon's job),
+// so the two firing paths never overlap.
+func (s *CronService) FireDueEphemeral(now time.Time) []*CronJob {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var fired []*CronJob
+	for _, j := range s.jobs {
+		if !j.Ephemeral || !j.Enabled || j.Paused || j.NextRun.IsZero() {
+			continue
+		}
+		if !j.ExpiresAt.IsZero() && now.After(j.ExpiresAt) {
+			continue
+		}
+		if j.NextRun.After(now) {
+			continue
+		}
+		j.LastRun = now
+		j.RunCount++
+		if j.Repeat > 0 && j.RunCount >= j.Repeat {
+			j.Enabled = false
+		}
+		if j.Enabled && !j.Paused {
+			s.computeNextRun(j)
+		}
+		fired = append(fired, j)
+	}
+	return fired
 }
 
 // validateSchedule checks the per-kind fields without mutating state.

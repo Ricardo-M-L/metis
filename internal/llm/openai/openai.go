@@ -721,7 +721,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 				lastBody = string(rb)
 				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
 				if transport.IsRetryableStatus(resp.StatusCode) {
-					return &transport.RetryableError{Err: httpErr}
+					return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 				}
 				return httpErr
 			}
@@ -788,7 +788,7 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 				lastBody = string(rb)
 				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
 				if transport.IsRetryableStatus(resp.StatusCode) {
-					return &transport.RetryableError{Err: httpErr}
+					return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 				}
 				return httpErr
 			}

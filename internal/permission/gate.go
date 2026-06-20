@@ -545,6 +545,13 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		// trip the denial breaker.
 		return DecisionAsk, "safety_check:bypass_immune"
 	}
+	// Reading a credential file leaks the secret into the model context /
+	// transcript / provider request. Read of a secret path (~/.ssh/id_*,
+	// ~/.aws/credentials, …) is gated to ASK even in ask / acceptEdits /
+	// bypass modes, where read-only tools are otherwise auto-allowed below.
+	if isSecretReadAttempt(tool, stringInput) {
+		return DecisionAsk, "secret_read:bypass_immune"
+	}
 
 	// Rule resolution: authority first (sourceRank — policy > cli >
 	// interactive > config > persistent), recency second. Among rules

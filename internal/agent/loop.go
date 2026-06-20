@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
@@ -148,8 +149,14 @@ type Loop struct {
 
 	mu       sync.RWMutex
 	Messages []llm.Message
-	turnIdx  int
-	iterIdx  int
+	// estTokens caches the last context-token estimate so the TUI can read
+	// it WITHOUT taking l.mu (see EstimateContextTokens) — otherwise a
+	// render-frame RLock during compaction (which holds l.mu through a
+	// 5-30s summarization) freezes the UI and deadlocks against the loop's
+	// emit() under the same lock.
+	estTokens atomic.Int64
+	turnIdx   int
+	iterIdx   int
 
 	// todoWriteIter / todoReminderIter drive the periodic todo
 	// re-surfacing (todo_reminder.go): the iteration of the last
@@ -158,6 +165,11 @@ type Loop struct {
 	// with incomplete items.
 	todoWriteIter    int
 	todoReminderIter int
+	// todoReconciledThisTurn guards the end-of-turn todo reconciliation
+	// (the no_tool_calls branch in Run) to at most once per turn — without
+	// it a model that keeps stopping without updating the list would loop.
+	// Reset at the top of Run.
+	todoReconciledThisTurn bool
 
 	// haltSignal carries a "stop after this iteration" signal raised
 	// by a PreToolUse hook returning Halt=true (claude-code parity:
@@ -455,9 +467,21 @@ func (l *Loop) History() []llm.Message {
 // (compaction_check.go::maybeCompact); exposing it on the public
 // surface so the TUI doesn't have to duplicate the estimator.
 func (l *Loop) EstimateContextTokens() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return estimateTokens(l.Messages)
+	// TryRLock, NOT a blocking lock: the TUI calls this every render frame.
+	// maybeCompact holds l.mu (the write lock) across an entire compaction
+	// pass — including a 5-30s summarization LLM call — and emits progress
+	// events under it. A blocking lock here would freeze the bubbletea
+	// Update/View goroutine, which then stops draining the agent event
+	// channel, so that under-lock emit() blocks forever: a lock+channel
+	// deadlock that spins the spinner for hours (observed: the 6h "stuck"
+	// session). Falling back to the cached estimate keeps the UI draining.
+	if l.mu.TryRLock() {
+		v := estimateTokens(l.Messages)
+		l.mu.RUnlock()
+		l.estTokens.Store(int64(v))
+		return v
+	}
+	return int(l.estTokens.Load())
 }
 
 // haltTurn marks the current Run for halt-after-current-iteration. The
@@ -612,6 +636,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	l.mu.Lock()
 	l.haltRequested = false
 	l.haltReason = ""
+	l.todoReconciledThisTurn = false
 	l.mu.Unlock()
 
 	// Stamp the sub-agent notification send end into ctx so the Agent
@@ -744,7 +769,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// with incomplete items — claude-code's todo_reminder mechanism,
 		// the thing that actually keeps tasks from being left stuck
 		// mid-status (see todo_reminder.go).
-		l.injectTodoReminder(out)
+		l.injectTodoReminder(ctx, out)
 
 		// Soft iter-budget nudges at 50% / 75% / 90% — see
 		// iter_nudge.go. Fire at most one per threshold per turn so
@@ -897,6 +922,31 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					Kind: EventInfo,
 					Info: "(contract override: model explicitly bypassed the verify gate)",
 				})
+			}
+
+			// End-of-turn todo reconciliation. The model is ending the turn
+			// (stop != "tool_use"). If the task list still has open items and
+			// we haven't nudged this turn, re-surface it and run one more
+			// iteration so the model marks finished items completed (or says
+			// what's blocked) before stopping. Without this, a turn that
+			// finishes within todoReminderTurns of the last TodoWrite leaves a
+			// stale in_progress row in the bottom task strip — the work is
+			// delivered but the tracker still shows ◐ (observed 2026-06-17:
+			// "总结变更并给出 PR 建议" left in_progress after the PR suggestion was
+			// given). Mirrors the contract-gate re-entry above; once-per-turn
+			// so a stubborn model can't loop here.
+			if !l.todoReconciledThisTurn {
+				if items := l.incompleteTodos(); items != nil {
+					l.mu.Lock()
+					l.todoReconciledThisTurn = true
+					l.mu.Unlock()
+					l.appendInjectedMessage(endOfTurnTodoReminder(items))
+					emit(ctx, out, Event{
+						Kind: EventInfo,
+						Info: "[todo] open items at turn end — asking the model to reconcile before stopping",
+					})
+					continue
+				}
 			}
 
 			stopReason = stop

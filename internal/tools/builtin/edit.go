@@ -185,9 +185,15 @@ func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 					IsError: true,
 				}, nil
 			}
+			// The content hash is the precise signal: if it changed, the file
+			// was modified out-of-band since we Read it → refuse (stale write).
+			// The old `&&` also required mtime to differ, so a content change
+			// that preserved mtime (mtime granularity, `touch -r`, restore)
+			// slipped through and clobbered the on-disk change. mtime alone is
+			// not a content signal (a bare `touch` changes mtime but not hash),
+			// so the hash check is both necessary and sufficient.
 			currentHash := hashBytes(bs)
-			currentMTime := st.ModTime()
-			if currentHash != entry.Hash && !currentMTime.Equal(entry.MTime) {
+			if currentHash != entry.Hash {
 				return &tools.Result{
 					Output:  FileUnexpectedlyModified + ": " + path,
 					IsError: true,

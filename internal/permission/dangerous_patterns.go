@@ -94,8 +94,14 @@ func CheckDangerousPattern(stringInput string) *DangerousPattern {
 		return nil
 	}
 	low := strings.ToLower(stringInput)
+	// Collapse runs of whitespace (spaces, tabs, newlines) to a single space
+	// so trivial padding can't evade the substring table: `rm  -rf  /`,
+	// `rm -rf\t/`, and `rm -rf\n/` all canonicalise to `rm -rf /` and match.
+	// The table's patterns are written with single spaces.
+	canon := strings.Join(strings.Fields(low), " ")
 	for i := range dangerousPatterns {
-		if strings.Contains(low, dangerousPatterns[i].Substr) {
+		sub := dangerousPatterns[i].Substr
+		if strings.Contains(low, sub) || strings.Contains(canon, sub) {
 			return &dangerousPatterns[i]
 		}
 	}

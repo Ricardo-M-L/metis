@@ -139,8 +139,13 @@ func (cm *CoreMemory) UpdateBlock(label, content string) error {
 			b.Content = content
 			b.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 			// Persist immediately + refresh snapshot so next render
-			// picks up the change.
-			cm.saveBlockLocked(b)
+			// picks up the change. Surface a persist failure instead of
+			// silently dropping it — otherwise the in-memory edit looks
+			// saved but the on-disk md never changed and the user's memory
+			// edit is lost on the next session Load.
+			if err := cm.saveBlockLocked(b); err != nil {
+				return err
+			}
 			cm.snapshot = cm.renderLocked()
 			return nil
 		}
@@ -149,16 +154,16 @@ func (cm *CoreMemory) UpdateBlock(label, content string) error {
 }
 
 // saveBlockLocked persists a single block. Caller must hold cm.mu.Lock().
-func (cm *CoreMemory) saveBlockLocked(b *Block) {
+func (cm *CoreMemory) saveBlockLocked(b *Block) error {
 	if cm.memoryRoot == "" {
-		return
+		return nil
 	}
 	path := cm.pathForBlock(b.Label)
 	if path == "" {
-		return
+		return nil
 	}
 	content := renderBlockHermes(b)
-	atomicWriteFile(path, content, 0o644)
+	return atomicWriteFile(path, content, 0o644)
 }
 
 // Render returns the memory as a string for system prompt injection.

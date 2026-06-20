@@ -112,3 +112,50 @@ var fileTouchingTools = map[string]bool{
 func isFileTouchingTool(tool string) bool {
 	return fileTouchingTools[tool]
 }
+
+// secretReadPathFragments are credential FILES whose CONTENT is itself a
+// secret — reading them leaks the credential into the model context, the
+// transcript, and the provider request. Unlike SafetyCheckPathFragments
+// (which guards WRITES that could plant code), these guard READS, and the
+// list is deliberately narrow: reading .git/config or /etc/hosts is benign,
+// reading an SSH private key or cloud credentials is not. Common dev files
+// (.env, .npmrc) are intentionally excluded to avoid prompt fatigue.
+var secretReadPathFragments = []string{
+	".ssh/",
+	"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+	".aws/credentials",
+	".kube/config",
+	".docker/config.json",
+	".gnupg/",
+	".netrc",
+	"service-account", "service_account",
+	"credentials.json",
+}
+
+// readPathTools are tools that expose a file's CONTENT to the model via a
+// path in their stringInput — so a secret-path read must be gated to ASK
+// even in modes that auto-allow read-only tools.
+var readPathTools = map[string]bool{
+	"Read": true,
+}
+
+// matchesSecretReadPath reports whether stringInput points at a credential
+// file whose content is a secret.
+func matchesSecretReadPath(stringInput string) bool {
+	if stringInput == "" {
+		return false
+	}
+	low := strings.ToLower(stringInput)
+	for _, frag := range secretReadPathFragments {
+		if strings.Contains(low, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSecretReadAttempt reports whether tool would read the content of a
+// credential file (Read tool + a secret path).
+func isSecretReadAttempt(tool, stringInput string) bool {
+	return readPathTools[tool] && matchesSecretReadPath(stringInput)
+}

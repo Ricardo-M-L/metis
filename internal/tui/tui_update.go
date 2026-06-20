@@ -36,9 +36,17 @@ func (m *Model) Init() tea.Cmd {
 	// fall back to a default when GetSize yields 0 — see the PR note in
 	// docs/. This Tick is the client-side mitigation so metis paints
 	// immediately regardless.)
-	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg {
+	sizeTick := tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg {
 		return tea.RequestWindowSize()
 	})
+	// In-session cron scheduler — claude-code's useScheduledTasks. When a
+	// CronService is wired in, arm a recurring tick that fires due session-
+	// only (ephemeral) jobs into this live chat. No-op tick when cronSvc is
+	// nil (headless paths never reach RunTUI anyway).
+	if m.cronSvc != nil {
+		return tea.Batch(sizeTick, cronTickCmd())
+	}
+	return sizeTick
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -91,6 +99,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+
+	case cronFireTickMsg:
+		return m.handleCronTick(time.Time(msg))
+
+	case bashLocalResultMsg:
+		// Async `!cmd` finished off-thread — append its output here on the
+		// Update goroutine (see bashLocalCmd).
+		m.messages = append(m.messages, msg.row)
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		// Ignore the bogus 0x0 bubbletea emits at tmux startup (see
@@ -883,7 +900,21 @@ func runTurnAsync(
 	done := make(chan error, 1)
 	go func() { done <- loop.Run(turnCtx, events); close(events) }()
 	for ev := range events {
-		eventCh <- ev
+		// Forward to the TUI, but never wedge here on a full eventCh: if the
+		// consumer (bubbletea Update) has stopped draining — frozen, quitting,
+		// or the turn was cancelled — a blocking `eventCh <- ev` would leak
+		// this goroutine and, because doneCh is only written after this loop,
+		// the turn would never finalize (spinner forever). On cancel we stop
+		// forwarding but KEEP ranging `events` so loop.Run's emit() unblocks
+		// and Run can return cleanly (events then closes and the loop ends).
+		if turnCtx.Err() != nil {
+			continue
+		}
+		select {
+		case eventCh <- ev:
+		case <-turnCtx.Done():
+			// next iterations fall through the Err() drain above
+		}
 	}
 	doneCh <- <-done
 }

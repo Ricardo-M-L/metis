@@ -32,7 +32,7 @@ const todoReminderTurns = 10
 // since the last TodoWrite, (b) >= todoReminderTurns since the last
 // reminder, and (c) the list has incomplete items. Cheap no-op when the
 // list is empty or fully done.
-func (l *Loop) injectTodoReminder(out chan<- Event) {
+func (l *Loop) injectTodoReminder(ctx context.Context, out chan<- Event) {
 	l.mu.RLock()
 	cur := l.iterIdx
 	lastWrite := l.todoWriteIter
@@ -56,7 +56,7 @@ func (l *Loop) injectTodoReminder(out chan<- Event) {
 	l.mu.Lock()
 	l.todoReminderIter = cur
 	l.mu.Unlock()
-	emit(context.Background(), out, Event{
+	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: "[todo] re-surfaced incomplete task list (no TodoWrite recently)",
 	})
@@ -69,6 +69,40 @@ func (l *Loop) noteTodoWriteActivity(cur int) {
 	l.mu.Lock()
 	l.todoWriteIter = cur
 	l.mu.Unlock()
+}
+
+// incompleteTodos returns the current session's task list if it has any
+// non-completed item, else nil. Drives the end-of-turn reconciliation in
+// Run (loop.go no_tool_calls branch).
+func (l *Loop) incompleteTodos() []tasks.Item {
+	tl, err := tasks.Load(tasks.CurrentSessionID())
+	if err != nil || tl == nil || len(tl.Items) == 0 {
+		return nil
+	}
+	if !hasIncompleteTodos(tl.Items) {
+		return nil
+	}
+	return tl.Items
+}
+
+// endOfTurnTodoReminder is the nudge injected when the model tries to end a
+// turn with open todos. Stronger than the periodic reminder: the model is
+// about to STOP, so it must mark finished items completed now (or say what's
+// blocked) — otherwise the bottom task strip shows a stale in_progress row
+// after the work is already delivered.
+func endOfTurnTodoReminder(items []tasks.Item) string {
+	var b strings.Builder
+	b.WriteString("<system-reminder>\n")
+	b.WriteString("You're about to end the turn, but the task list still has open items. ")
+	b.WriteString("Call TodoWrite now to mark every task you've finished as completed (including any you just described as done). ")
+	b.WriteString("If an item genuinely isn't finished or is blocked on the user, leave it and briefly say so — but don't leave a finished task showing in_progress. ")
+	b.WriteString("Do NOT mention this reminder to the user.\n\n")
+	b.WriteString("Current task list:\n")
+	for i, it := range items {
+		fmt.Fprintf(&b, "%d. [%s] %s\n", i+1, it.Status, it.Content)
+	}
+	b.WriteString("</system-reminder>")
+	return b.String()
 }
 
 func hasIncompleteTodos(items []tasks.Item) bool {

@@ -595,6 +595,43 @@ Implementation reuses cron: a wakeup is a one-shot job with `Kind=at`
 Range clamped to `[30s, 24h]` — sub-30s feels like a hot-loop typo,
 24h+ should be a real `/cron` the user can audit.
 
+### 3b. `CronCreate` / `CronList` / `CronDelete` + in-session firing (Claude Code)
+
+claude-code's `ScheduleCronTool` (CronCreate/List/Delete) +
+`useScheduledTasks` — conversational scheduling. The user asks in chat
+("every 5 min, check the build"), the model calls `CronCreate`, and the
+job fires *in the same session* without any daemon. Two halves:
+
+**The tools** (`internal/tools/builtin/cron_tools.go`) mirror
+ScheduleWakeup's plumbing — they hold the session's `*agent.CronService`
+and are registered (runtime/tools.go) only when one exists (the chat
+REPL). `CronCreate` takes `every`/`cron`/`at` + `prompt` + `recurring` +
+`durable` + `allow`.
+
+**Session-only vs durable** is the key split, mapping claude-code's
+`durable: false` default:
+
+| | session-only (`durable:false`, default) | durable (`durable:true`) |
+|---|---|---|
+| storage | in-memory (`CronJob.Ephemeral`, `json:"-"`) | disk, `~/.metis/sessions/cron/*.json` |
+| fired by | this chat's in-session scheduler | `metis cron start` daemon |
+| permissions | live — user approves in chat | pre-authorized `allow` list (unattended) |
+| lifetime | dies with the session | until `CronDelete` |
+
+Because ephemeral jobs are never written to disk, the daemon (a separate
+process reading disk) can't see them — so the two firing paths
+(`FireDueEphemeral` in-session vs the daemon's `schedulerLoop`) never
+touch the same job and there's **no double-fire**, even when both run.
+
+**In-session scheduler** (`internal/tui/cron_scheduler.go`): a 2s
+bubbletea `tea.Tick` (`cronFireTickMsg`) calls
+`CronService.FireDueEphemeral(now)`, which advances + returns due
+ephemeral jobs (mirrors `runJob` minus the disk write). For each, the TUI
+either starts a turn immediately (`beginTurn`, when idle) or queues it at
+`Next` priority (mid-turn) — claude-code's "enqueue, drain between turns"
+via `enqueuePendingNotification`. Each fire shows an inline `⏰` row + a
+desktop notification so the user knows the chat didn't type it itself.
+
 ### 4. `CronJob.DisabledTools` — per-job tool blacklist (Hermes)
 
 Borrowed from Hermes's `enabled_toolsets`. Each name in the list gets a
@@ -612,6 +649,40 @@ metis cron add --cron "0 9 * * 1-5" --tz "America/Los_Angeles" \
   --disable-tools "WebFetch,Agent" \
   --prompt "post weekday metrics summary"
 ```
+
+### Unattended permissions (pre-authorization)
+
+A scheduled fire runs with no human attached, so it cannot answer the
+gate's `ASK` tier interactively. Rather than blocking the daemon waiting
+for an approval that may never come (both claude-code and MiMo-Code
+deliberately avoid this — a background agent that hangs on a prompt is a
+worse failure than one that denies), metis decides from a **per-job
+allow-list** set ahead of time, mirroring claude-code's background-agent
+`shouldAvoidPermissionPrompts` + persisted-`alwaysAllow` model:
+
+- `CronJob.AllowTools []string` — rules in `Tool(content)` form
+  (`Bash(git pull:*)`, `Write`, `Edit(/repo/**)`), set via `cron add
+  --allow` (repeatable) or `cron allow <id> <rule>`.
+- At fire time, `executeCronJob`'s `EventPermissionRequest` handler calls
+  `agent.EvaluateCronPermission(job, tool, input)`:
+  1. **dangerous-pattern hard floor** — `permission.CheckDangerousPattern`
+     denies `rm -rf /` etc. *even if allow-listed*. The gate only runs
+     that pre-filter in bypass mode, so the cron evaluator re-checks it
+     itself (a job's default-mode runtime would otherwise surface a
+     dangerous command as a plain `ASK`).
+  2. **allow-list match** (`permission.ParseToolRule` +
+     `MatchesRuleContent`, same prefix/glob/substring grammar as gate
+     rules) → allow.
+  3. otherwise → deny, append to the **denied store**
+     (`<cronRoot>/denied/<id>.jsonl`) and nudge once at end-of-fire.
+- `cron denied <id>` lists blocked calls with a copy-paste approval line;
+  `cron allow <id> <rule>` appends to `AllowTools` and clears the log.
+
+This is the "user agrees, then it executes" guarantee for unattended
+work: the agreement is the pre-authorization, captured before the fire
+instead of mid-fire. Read-only tools never reach the handler (the gate
+auto-allows them), so a job with no `--allow` still does read-only work
+but blocks every write/exec/network call.
 
 ## Permission flow
 

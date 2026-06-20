@@ -184,6 +184,13 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// `metis run` one-shots where there's no scheduler ticking.
 	if opts.CronService != nil {
 		reg.Register(builtin.NewScheduleWakeup(opts.Gate, opts.CronService))
+		// CronCreate/List/Delete: claude-code-style conversational
+		// scheduling. Same gating as ScheduleWakeup — a live CronService
+		// (chat REPL) is required so session-only jobs have an in-session
+		// scheduler to fire them.
+		reg.Register(builtin.NewCronCreate(opts.Gate, opts.CronService))
+		reg.Register(builtin.NewCronList(opts.CronService))
+		reg.Register(builtin.NewCronDelete(opts.Gate, opts.CronService))
 	}
 	// Skill tool: register the bundled+user+project layers up-front. If
 	// the caller has plugins to add, they'll call RegisterSkillTool

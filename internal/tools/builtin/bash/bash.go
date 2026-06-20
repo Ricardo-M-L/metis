@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -768,6 +769,10 @@ func detectBlockedSleepPattern(cmd string) string {
 // the verdict. Mirrors MiMo-Code's error-aware truncation; pure-head
 // capping (the prior behavior, also Claude Code's) went blind there.
 type cappedWriter struct {
+	// mu guards all fields: os/exec drives a non-*os.File Stdout and Stderr
+	// from TWO separate copier goroutines, and this writer is shared as both
+	// (bash.go ~537), so Write is called concurrently → data race without it.
+	mu        sync.Mutex
 	head      []byte
 	headMax   int
 	tail      []byte // ring of up to tailMax most-recent bytes
@@ -785,6 +790,8 @@ func newCappedWriter(max int) *cappedWriter {
 }
 
 func (c *cappedWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	n := len(p)
 	if len(c.head) < c.headMax {
 		room := c.headMax - len(c.head)
@@ -818,6 +825,8 @@ func (c *cappedWriter) pushTail(p []byte) {
 // head + tail when the dropped tail looks like a failure; head only
 // otherwise.
 func (c *cappedWriter) preview() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.truncated {
 		return string(c.head)
 	}

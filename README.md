@@ -453,10 +453,31 @@ that lights up while the turn is running and clears on completion.
 | `SubAgentStop` | exclusive | terminate a running sub-agent |
 | `SendMessage` | safe | send to a registered channel (Telegram, Slack, …) |
 | `ScheduleWakeup` | safe | LLM self-pacing — schedule a future re-entry with a prompt |
+| `CronCreate` | safe | schedule a prompt (recurring/one-shot, session-only or durable) — conversational scheduling |
+| `CronList` | safe | list scheduled jobs |
+| `CronDelete` | safe | cancel a scheduled job by id |
 
 ## Scheduling
 
-Three layers; details in [`docs/ARCHITECTURE.md#scheduling--continuous-execution`](docs/ARCHITECTURE.md#scheduling--continuous-execution).
+Two ways to schedule, plus a daemon to fire unattended jobs. Details in
+[`docs/ARCHITECTURE.md#scheduling--continuous-execution`](docs/ARCHITECTURE.md#scheduling--continuous-execution).
+
+### Conversational (claude-code style)
+
+Just ask in chat — the model calls `CronCreate`:
+
+> "every 5 minutes, check the build and tell me if it breaks"
+> "remind me in 20 minutes to push the branch"
+
+By default these are **session-only**: they fire *in the current chat while
+it's open and idle* (the in-session scheduler injects the prompt as a new
+turn), and disappear when you exit. You see each fire inline and approve any
+tool use live — no daemon needed. Ask for it to "persist" / "keep running
+across restarts" and the model sets `durable: true`, which writes it to disk
+to be fired unattended by `metis cron start` (and pre-authorizes the tools it
+needs, since no one's watching). `CronList` / `CronDelete` manage them.
+
+### CLI
 
 ```sh
 # 5-field cron (or @daily / @hourly / @every 1h30m descriptors)
@@ -484,6 +505,27 @@ metis cron resume <id>
 metis cron rm <id>
 metis cron run <id>            # fire immediately, ignore schedule
 metis cron start               # foreground daemon (Ctrl+C to stop)
+```
+
+**Unattended permissions (pre-authorization).** A cron daemon has no human
+to answer a mid-fire permission prompt, so — mirroring claude-code's
+background-agent model — the decision is made entirely from a per-job
+allow-list set ahead of time. A tool call that isn't pre-authorized is
+denied and recorded; **dangerous-pattern commands (`rm -rf /`, fork bombs)
+stay blocked even if allow-listed.** Without any `--allow`, a job can only
+run read-only tools (writes/exec/network are blocked) — so a job that needs
+to write files or run commands *must* be granted them, or it silently does
+nothing.
+
+```sh
+# pre-authorize specific tools (repeatable, `Tool(content)` form)
+metis cron add --every 1h --silent \
+  --prompt "git pull and summarize new commits" \
+  --allow 'Bash(git pull:*)' --allow 'Bash(git log:*)' --allow Write
+
+metis cron denied <id>         # what a fire tried to do but wasn't allowed,
+                               # with a ready-to-paste approval line per call
+metis cron allow <id> 'Bash(git pull:*)'   # authorize it for next time
 ```
 
 `SessionMode` choices:

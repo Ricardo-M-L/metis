@@ -823,9 +823,16 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// MessageTeammate) can read the correct sender identity via
 	// AgentNameFromContext instead of falling back to "main".
 	baseCtx = agent.WithAgentName(baseCtx, teammateName)
-	childCtx, cancel := context.WithCancel(baseCtx)
+	// Pick ONE cancel context. The old form created WithCancel(baseCtx) then
+	// reassigned both vars from WithTimeout(childCtx, timeout) when timeout>0,
+	// orphaning the first cancel (lostcancel: a leaked cancelCtx registered on
+	// baseCtx until the parent turn ends — one per timed sub-agent spawn).
+	var childCtx context.Context
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		childCtx, cancel = context.WithTimeout(childCtx, timeout)
+		childCtx, cancel = context.WithTimeout(baseCtx, timeout)
+	} else {
+		childCtx, cancel = context.WithCancel(baseCtx)
 	}
 	if teammate != nil {
 		teammate.Cancel = cancel

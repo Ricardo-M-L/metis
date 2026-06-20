@@ -128,8 +128,11 @@ func (w Write) Execute(_ context.Context, in map[string]any) (*tools.Result, err
 					}, nil
 				}
 				if data, rerr := os.ReadFile(path); rerr == nil {
+					// Content hash is the precise stale-write signal; the old
+					// `&&` mtime requirement let a content change with a
+					// preserved mtime slip through and clobber on-disk edits.
 					currentHash := hashBytes(data)
-					if currentHash != entry.Hash && !st.ModTime().Equal(entry.MTime) {
+					if currentHash != entry.Hash {
 						return &tools.Result{
 							Output:  FileUnexpectedlyModified + ": " + path,
 							IsError: true,

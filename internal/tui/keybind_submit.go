@@ -298,8 +298,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			})
 			return m, nil
 		}
-		m.runBashLocal(cmd)
-		return m, nil
+		// Run ASYNC via a tea.Cmd: a synchronous CombinedOutput here would
+		// block the bubbletea Update goroutine (and thus the whole UI, the
+		// spinner, and event draining) for up to the bash timeout — `!sleep 60`
+		// froze the TUI hard. The result lands as a bashLocalResultMsg.
+		return m, m.bashLocalCmd(cmd)
 	}
 
 	// Built-in commands

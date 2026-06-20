@@ -2,6 +2,7 @@
 package memory
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,20 @@ func (ds *DailyStore) Save(sessionID, source, summary string) error {
 
 	filename := dateStr + "-" + slug + ".md"
 	path := filepath.Join(ds.root, filename)
+	// Uniqueness guard: two saves in the same minute with the same/empty
+	// summary produce the same slug → the same filename → the second
+	// silently overwrote the first (losing a session's daily note). If the
+	// path is taken, disambiguate with the HHMMSS time, then a counter.
+	if _, err := os.Stat(path); err == nil {
+		alt := dateStr + "-" + slug + "-" + strings.ReplaceAll(timeStr, ":", "") + ".md"
+		path = filepath.Join(ds.root, alt)
+		for i := 2; ; i++ {
+			if _, err := os.Stat(path); err != nil {
+				break
+			}
+			path = filepath.Join(ds.root, fmt.Sprintf("%s-%s-%d.md", dateStr, slug, i))
+		}
+	}
 
 	// Build Markdown entry
 	var sb strings.Builder
@@ -161,7 +176,10 @@ func (ds *DailyStore) List(limit int) ([]DailyNote, error) {
 	// Sort by date descending (newest first)
 	for i := 0; i < len(notes)-1; i++ {
 		for j := i + 1; j < len(notes); j++ {
-			if notes[j].Date > notes[i].Date {
+			// Newest first; break same-day ties by CreatedAt (RFC3339, also
+			// sortable) so multiple sessions on one day keep a stable order.
+			if notes[j].Date > notes[i].Date ||
+				(notes[j].Date == notes[i].Date && notes[j].CreatedAt > notes[i].CreatedAt) {
 				notes[i], notes[j] = notes[j], notes[i]
 			}
 		}

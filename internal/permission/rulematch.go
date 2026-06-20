@@ -27,6 +27,25 @@ import (
 	"sync"
 )
 
+// ParseToolRule splits a compact `Tool(content)` rule string into its
+// tool and content parts — claude-code's permission-rule surface syntax
+// (`Bash(git pull:*)`, `Edit(/etc/**)`). A bare `Write` (no parens)
+// parses as tool-only with empty content, which MatchesRuleContent
+// treats as "any input for this tool". The content half is matched via
+// MatchesRuleContent, so it accepts the same prefix/glob/substring grammar.
+//
+// Whitespace around the tool name and the whole string is trimmed; an
+// unterminated `Bash(foo` (no closing paren) is treated as a bare tool
+// name so a typo fails safe (matches nothing useful) rather than silently
+// becoming a wildcard. `*` as the tool means "any tool".
+func ParseToolRule(s string) (tool, content string) {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '('); i >= 0 && strings.HasSuffix(s, ")") {
+		return strings.TrimSpace(s[:i]), s[i+1 : len(s)-1]
+	}
+	return s, ""
+}
+
 // MatchesRuleContent reports whether one rule's Match pattern matches
 // the stringified tool input. Empty pattern matches everything (the
 // rule is tool-scoped only).

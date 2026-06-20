@@ -822,7 +822,7 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 				lastBody = string(rb)
 				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
 				if transport.IsRetryableStatus(resp.StatusCode) {
-					return &transport.RetryableError{Err: httpErr}
+					return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 				}
 				return httpErr
 			}
@@ -907,7 +907,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 				// still work.
 				httpErr = wrapWithMinimaxHint(httpErr, bodyStr)
 				if transport.IsRetryableStatus(resp.StatusCode) {
-					return &transport.RetryableError{Err: httpErr}
+					return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 				}
 				return httpErr
 			}

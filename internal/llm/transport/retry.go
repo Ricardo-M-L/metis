@@ -11,14 +11,47 @@ import (
 	"errors"
 	"math/rand"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
+// ParseRetryAfter extracts the HTTP Retry-After header (delta-seconds or an
+// HTTP-date) from a response, returning 0 when absent or unparseable.
+// Providers pass the result into RetryableError.After so RetryWithBackoff
+// honors a server-requested cool-down on 429/503.
+func ParseRetryAfter(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
+	}
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 // RetryableError marks an error that RetryWithBackoff should attempt
 // again. HTTP-status helpers below wrap raw errors in this type when
 // appropriate.
-type RetryableError struct{ Err error }
+type RetryableError struct {
+	Err error
+	// After, when > 0, is the server-requested cool-down (the HTTP
+	// Retry-After header on a 429/503). RetryWithBackoff waits at least
+	// this long instead of its own exponential schedule, so we don't
+	// re-fire a rate-limited request sooner than the server asked for.
+	// Providers that surface a 429 should populate this from the header.
+	After time.Duration
+}
 
 func (e *RetryableError) Error() string { return e.Err.Error() }
 func (e *RetryableError) Unwrap() error { return e.Err }
@@ -62,6 +95,16 @@ func RetryWithBackoff(ctx context.Context, attempts int, maxBackoff time.Duratio
 			backoff -= jitter
 		} else {
 			backoff += jitter
+		}
+		// Honor a server Retry-After when the error carries one — wait AT
+		// LEAST that long (no down-jitter), capped at 60s so a hostile or
+		// buggy header can't park the CLI for minutes.
+		var re *RetryableError
+		if errors.As(err, &re) && re.After > 0 {
+			backoff = re.After
+			if backoff > 60*time.Second {
+				backoff = 60 * time.Second
+			}
 		}
 		select {
 		case <-ctx.Done():

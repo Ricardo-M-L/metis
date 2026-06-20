@@ -561,6 +561,15 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 			ToolResult: s, IsError: true,
 		}
 	}
+	if res == nil {
+		// A tool returned (nil, nil) — valid by the (*tools.Result, error)
+		// signature but a bug (mock tools / a misbehaving MCP wrapper do it).
+		// Without this guard the res.Output deref below panics inside the
+		// fan-out goroutine, which has NO recover (safeToolExecute's recover
+		// only covers Execute), crashing the whole process. fork.go guards
+		// the same case; do it here too.
+		res = &tools.Result{Output: "tool returned no result", IsError: true}
+	}
 	emit(ctx, out, Event{
 		Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
 		ToolResult: &ToolResult{Output: res.Output, IsError: res.IsError},

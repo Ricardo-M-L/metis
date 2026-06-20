@@ -52,7 +52,11 @@ func NewStore(dir string) (*Store, error) {
 func (s *Store) NewSessionID() string { return uuid.NewString() }
 
 func (s *Store) path(id string) string {
-	return filepath.Join(s.Dir, id+".jsonl")
+	// Path-traversal guard: filepath.Base strips any directory parts, so a
+	// crafted/imported id like "../../tmp/evil" collapses to "evil" and can
+	// never escape s.Dir. Legit ids (uuid / timestamp) have no separators,
+	// so this is a no-op for them.
+	return filepath.Join(s.Dir, filepath.Base(id)+".jsonl")
 }
 
 func (s *Store) WriteHeader(id, model, system string) error {

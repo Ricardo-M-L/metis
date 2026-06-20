@@ -140,6 +140,10 @@ type ExternalHooks struct {
 type Model struct {
 	ctx       context.Context
 	loop      *agent.Loop
+	// cronSvc backs the in-session scheduler (cron_scheduler.go) — the same
+	// CronService the CronCreate/List/Delete tools mutate, so session-only
+	// jobs the model schedules mid-chat fire here. nil ⇒ no in-session ticks.
+	cronSvc   *agent.CronService
 	gate      *permission.Gate
 	slash     *slash.Registry
 	session   *session.Store
@@ -577,7 +581,7 @@ const ctrlCQuitWindow = 600 * time.Millisecond
 // Constructor + entry point
 // ============================================================================
 
-func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config) *Model {
+func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config) *Model {
 	ti := textarea.New()
 	ti.Placeholder = "type a message · /commands · alt+enter newline"
 	ti.Focus()
@@ -674,6 +678,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *ses
 	mdl := &Model{
 		ctx:          ctx,
 		loop:         loop,
+		cronSvc:      cronSvc,
 		gate:         gate,
 		slash:        sl,
 		session:      st,
@@ -769,8 +774,8 @@ func (m *Model) SetExternalHooks(h ExternalHooks) {
 
 // RunTUI starts the terminal UI. If hooks is non-nil it is attached to
 // the underlying Model before the program runs.
-func RunTUI(ctx context.Context, loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config, forceBanner bool, hooks ...ExternalHooks) error {
-	m := NewModel(ctx, loop, sl, st, sid, gate, model, providerName, skillDir, cfg)
+func RunTUI(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config, forceBanner bool, hooks ...ExternalHooks) error {
+	m := NewModel(ctx, loop, cronSvc, sl, st, sid, gate, model, providerName, skillDir, cfg)
 	if len(hooks) > 0 {
 		m.SetExternalHooks(hooks[0])
 	}

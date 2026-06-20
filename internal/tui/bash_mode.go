@@ -19,17 +19,22 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
 )
 
-// runBashLocal runs cmd via the user's shell and appends the output to
-// the transcript. Synchronous (foreground) — short commands like ls/pwd
-// are why this exists; long-running stuff should still go through the
-// Bash tool with proper streaming and timeout enforcement.
-//
-// Honours cfg.Tools.Bash settings (timeout / max_output_bytes / shell)
-// so a global denylist applies here too. Bash mode is NOT a backdoor
-// around the permission gate — it's a UX shortcut.
-func (m *Model) runBashLocal(cmd string) {
+// bashLocalResultMsg carries the finished `!cmd` output back to the Update
+// goroutine so it can be appended to the transcript on the main thread.
+type bashLocalResultMsg struct{ row Message }
+
+// bashLocalCmd runs cmd via the user's shell ASYNCHRONOUSLY (off the
+// bubbletea Update goroutine) and returns its output as a bashLocalResultMsg.
+// Synchronous execution here would freeze the entire UI for up to the bash
+// timeout (`!sleep 60` hung the TUI). Short commands like ls/pwd are the
+// intended use; long-running stuff should go through the Bash tool with
+// streaming. Honours cfg.Tools.Bash settings (timeout / max_output_bytes /
+// shell / denylist). Bash mode is NOT a permission-gate backdoor — a UX shortcut.
+func (m *Model) bashLocalCmd(cmd string) tea.Cmd {
 	settings := m.cfg.Tools.Bash
 	timeout := time.Duration(settings.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -43,42 +48,39 @@ func (m *Model) runBashLocal(cmd string) {
 	if shell == "" {
 		shell = "/bin/sh"
 	}
+	denylist := append([]string(nil), settings.Denylist...) // snapshot; closure must not touch m
 
-	// Quick denylist check (mirrors a slice of internal/tools/builtin/bash
-	// without dragging that whole package in — we can't easily call the
-	// Bash tool from here because it expects to be wired through the
-	// agent dispatcher).
-	for _, deny := range settings.Denylist {
-		if deny != "" && strings.Contains(cmd, deny) {
-			m.messages = append(m.messages, Message{
-				Role:      "bash-error",
-				Content:   fmt.Sprintf("$ %s\n(refused: matches denylist entry %q)", cmd, deny),
-				Timestamp: time.Now(),
-			})
-			return
+	return func() tea.Msg {
+		// Quick denylist check (mirrors a slice of internal/tools/builtin/bash).
+		for _, deny := range denylist {
+			if deny != "" && strings.Contains(cmd, deny) {
+				return bashLocalResultMsg{Message{
+					Role:      "bash-error",
+					Content:   fmt.Sprintf("$ %s\n(refused: matches denylist entry %q)", cmd, deny),
+					Timestamp: time.Now(),
+				}}
+			}
 		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		start := time.Now()
+		out, err := exec.CommandContext(ctx, shell, "-c", cmd).CombinedOutput()
+		elapsed := time.Since(start).Truncate(time.Millisecond)
+
+		if int64(len(out)) > int64(maxBytes) {
+			out = append(out[:maxBytes], []byte(fmt.Sprintf("\n... (truncated at %d bytes)\n", maxBytes))...)
+		}
+
+		role := "bash"
+		body := fmt.Sprintf("$ %s\n%s", cmd, strings.TrimRight(string(out), "\n"))
+		if err != nil {
+			role = "bash-error"
+			body = fmt.Sprintf("%s\n(exit: %v, %s)", body, err, elapsed)
+		} else {
+			body = fmt.Sprintf("%s\n(%s)", body, elapsed)
+		}
+		return bashLocalResultMsg{Message{Role: role, Content: body, Timestamp: time.Now()}}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	start := time.Now()
-	out, err := exec.CommandContext(ctx, shell, "-c", cmd).CombinedOutput()
-	elapsed := time.Since(start).Truncate(time.Millisecond)
-
-	if int64(len(out)) > int64(maxBytes) {
-		out = append(out[:maxBytes], []byte(fmt.Sprintf("\n... (truncated at %d bytes)\n", maxBytes))...)
-	}
-
-	role := "bash"
-	body := fmt.Sprintf("$ %s\n%s", cmd, strings.TrimRight(string(out), "\n"))
-	if err != nil {
-		role = "bash-error"
-		body = fmt.Sprintf("%s\n(exit: %v, %s)", body, err, elapsed)
-	} else {
-		body = fmt.Sprintf("%s\n(%s)", body, elapsed)
-	}
-	m.messages = append(m.messages, Message{
-		Role: role, Content: body, Timestamp: time.Now(),
-	})
 }

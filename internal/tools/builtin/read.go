@@ -131,7 +131,10 @@ const fileUnchangedStub = "File unchanged since last read. The " +
 // fail fast instead of swapping. Override via METIS_READ_MAX_BYTES.
 const MaxReadFileSize = 256 * 1024 * 1024
 
-func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	path, _ := in["path"].(string)
 	if path == "" {
 		// Richer error than the bare "path is required" — same
@@ -227,6 +230,17 @@ func (r Read) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	emitted := 0
 	for sc.Scan() {
 		lineno++
+		// Honor cancellation so a huge-file scan (up to the 256 MiB cap) or
+		// a slow/blocking read can't pin this goroutine after the parent
+		// turn is cancelled or times out. Cheap: a non-blocking select every
+		// ~512 lines.
+		if lineno%512 == 0 {
+			select {
+			case <-ctx.Done():
+				return &tools.Result{Output: "Read cancelled: " + ctx.Err().Error(), IsError: true}, nil
+			default:
+			}
+		}
 		if lineno < offset {
 			continue
 		}

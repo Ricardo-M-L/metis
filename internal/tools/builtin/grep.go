@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -81,7 +82,20 @@ func (g Grep) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 // minified or generated code.
 const DefaultGrepLimit = 250
 
-func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+// grepMaxFileSize caps per-file scanning: line-scanning a multi-GB log /
+// database / binary is one way a stray Grep used to hang for hours.
+const grepMaxFileSize = 5 << 20 // 5 MiB
+
+// grepWalkTimeout is a wall-clock safety budget on the whole walk, independent
+// of (and in addition to) the caller's context. A Grep launched from $HOME
+// once ran for 5+ hours enumerating ~/Library; this bounds the worst case even
+// when the context has no deadline.
+const grepWalkTimeout = 20 * time.Second
+
+func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	if ctx == nil {
+		ctx = context.Background() // defensive: ctx.Done() below must not panic
+	}
 	patStr, _ := in["pattern"].(string)
 	if patStr == "" {
 		// 2026-05-22: rich error + redirect hint, same approach as
@@ -131,16 +145,37 @@ func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	totalSeen := 0 // every match (skipped + rendered) — used to detect truncation
 	limitHit := false
 
-	// Out-of-worktree depth clamp: same rationale as Glob (scope.go).
-	// When the cwd is not inside a git work tree, cap walk depth so a
-	// stray Grep("foo") from $HOME doesn't enumerate every cached file.
+	// Out-of-worktree clamp: same rationale as Glob (scope.go). When the cwd
+	// is not inside a git work tree, cap BOTH walk depth and the number of
+	// files scanned so a stray Grep("foo") from $HOME doesn't enumerate every
+	// cached file under ~/Library. (Pre-2026-06: only depth was honored — the
+	// item cap was discarded — so a low-hit search from $HOME walked the whole
+	// home tree for hours.)
 	rootAbs, _ := filepath.Abs(root)
 	rootClean := filepath.Clean(rootAbs)
-	walkDepthCap, _ := walkBudget(rootClean)
+	walkDepthCap, walkItemCap := walkBudget(rootClean)
+
+	deadline := time.Now().Add(grepWalkTimeout)
+	filesScanned := 0
+	budgetHit := false
 
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
+		}
+		// Cancellable + time-bounded. The callback runs per entry, so this is
+		// the natural place to honor cancellation and the wall-clock budget —
+		// previously Execute ignored ctx entirely, so an in-flight walk could
+		// not be stopped.
+		select {
+		case <-ctx.Done():
+			budgetHit = true
+			return filepath.SkipAll
+		default:
+		}
+		if time.Now().After(deadline) {
+			budgetHit = true
+			return filepath.SkipAll
 		}
 		if d.IsDir() {
 			n := d.Name()
@@ -161,11 +196,31 @@ func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 			}
 			return nil
 		}
+		// Only search regular files. Skips symlinks, FIFOs, sockets, and
+		// device files — os.Open on a FIFO blocks forever waiting for a
+		// writer, which is the other way Grep used to hang.
+		if !d.Type().IsRegular() {
+			return nil
+		}
 		if globPat != "" {
 			ok, _ := doublestarMatch(globPat, path)
 			if !ok {
 				return nil
 			}
+		}
+		// Out-of-worktree file budget: stop after touching walkItemCap files
+		// so a search that matches little can't enumerate an entire home dir.
+		if walkItemCap > 0 {
+			filesScanned++
+			if filesScanned > walkItemCap {
+				budgetHit = true
+				return filepath.SkipAll
+			}
+		}
+		// Skip oversized files (logs / databases / binaries). Line-scanning a
+		// multi-GB file is slow and pollutes results with binary noise.
+		if info, ierr := d.Info(); ierr == nil && info.Size() > grepMaxFileSize {
+			return nil
 		}
 		f, err := os.Open(path)
 		if err != nil {
@@ -199,6 +254,9 @@ func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 		return nil, err
 	}
 	if hits == 0 && skipped == 0 {
+		if budgetHit {
+			return &tools.Result{Output: "(no matches; search stopped early by the walk budget — pass a narrower `root` inside your project, this looks like an out-of-worktree / $HOME search)"}, nil
+		}
 		return &tools.Result{Output: "(no matches)"}, nil
 	}
 	// Pagination footer: only emitted when truncation actually happened.
@@ -206,6 +264,8 @@ func (Grep) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	// the results" case avoids polluting context with a useless line.
 	if limitHit {
 		fmt.Fprintf(&b, "\n[truncated at %d matches; pass offset=%d for the next page]\n", max, offset+max)
+	} else if budgetHit {
+		fmt.Fprintf(&b, "\n[partial results: walk budget reached (%d files / %s) — narrow `root` to your project for a complete search]\n", walkItemCap, grepWalkTimeout)
 	} else if offset > 0 && hits == 0 {
 		fmt.Fprintf(&b, "\n[offset %d past end of %d total matches]\n", offset, totalSeen)
 	}

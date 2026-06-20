@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -27,7 +28,7 @@ func TestInjectTodoReminder_FiresAfterLullWithIncomplete(t *testing.T) {
 	l := &Loop{}
 	l.iterIdx = todoReminderTurns + 1 // enough turns since write(0) + reminder(0)
 	out := make(chan Event, 8)
-	l.injectTodoReminder(out)
+	l.injectTodoReminder(context.Background(), out)
 
 	hist := l.History()
 	if len(hist) != 1 {
@@ -40,7 +41,7 @@ func TestInjectTodoReminder_FiresAfterLullWithIncomplete(t *testing.T) {
 		}
 	}
 	// Second call within the gap must NOT double-remind.
-	l.injectTodoReminder(out)
+	l.injectTodoReminder(context.Background(), out)
 	if n := len(l.History()); n != 1 {
 		t.Errorf("reminder double-fired within the gap: %d messages", n)
 	}
@@ -55,7 +56,7 @@ func TestInjectTodoReminder_QuietWhenAllDone(t *testing.T) {
 	l := &Loop{}
 	l.iterIdx = todoReminderTurns + 5
 	out := make(chan Event, 8)
-	l.injectTodoReminder(out)
+	l.injectTodoReminder(context.Background(), out)
 	if n := len(l.History()); n != 0 {
 		t.Errorf("no reminder expected when all tasks done; got %d", n)
 	}
@@ -67,7 +68,7 @@ func TestInjectTodoReminder_QuietWithinLull(t *testing.T) {
 	l := &Loop{}
 	l.iterIdx = todoReminderTurns - 1 // not enough turns yet
 	out := make(chan Event, 8)
-	l.injectTodoReminder(out)
+	l.injectTodoReminder(context.Background(), out)
 	if n := len(l.History()); n != 0 {
 		t.Errorf("reminder fired too early (within the lull window); got %d", n)
 	}
@@ -78,7 +79,7 @@ func TestInjectTodoReminder_QuietWhenEmpty(t *testing.T) {
 	l := &Loop{}
 	l.iterIdx = todoReminderTurns + 5
 	out := make(chan Event, 8)
-	l.injectTodoReminder(out)
+	l.injectTodoReminder(context.Background(), out)
 	if n := len(l.History()); n != 0 {
 		t.Errorf("no reminder expected for empty list; got %d", n)
 	}
@@ -93,7 +94,7 @@ func TestNoteTodoWriteActivity_ResetsCountdown(t *testing.T) {
 	l.iterIdx = todoReminderTurns + 1
 	l.noteTodoWriteActivity(l.iterIdx) // model just touched the tracker
 	out := make(chan Event, 8)
-	l.injectTodoReminder(out)
+	l.injectTodoReminder(context.Background(), out)
 	if n := len(l.History()); n != 0 {
 		t.Errorf("reminder should be quiet right after a TodoWrite; got %d", n)
 	}

@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
@@ -507,7 +508,13 @@ func snipForkMessages(messages []llm.Message) []llm.Message {
 				continue
 			}
 			head := b.ToolResult[:PostCompactMaxToolResultChars]
-			omitted := len(b.ToolResult) - PostCompactMaxToolResultChars
+			// Don't cut mid-rune: back up to a UTF-8 boundary so the snipped
+			// result isn't invalid encoding that a strict gateway (the
+			// MiniMax overflow path this recovers) would reject.
+			for len(head) > 0 && !utf8.RuneStart(head[len(head)-1]) {
+				head = head[:len(head)-1]
+			}
+			omitted := len(b.ToolResult) - len(head)
 			b.ToolResult = head + fmt.Sprintf("\n[truncated post-compact: %d chars omitted]", omitted)
 			rowChanged = true
 		}

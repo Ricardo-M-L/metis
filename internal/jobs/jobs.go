@@ -515,10 +515,11 @@ func (r *Registry) Stop(id string, grace time.Duration) error {
 		// context cancellation drops cmd.Wait via the runtime's own
 		// kill path and we still get a clean state transition.
 		if cancel != nil {
-			go func() {
-				time.Sleep(grace + 500*time.Millisecond)
-				cancel()
-			}()
+			// time.AfterFunc instead of a parked sleeping goroutine: same
+			// delayed belt-and-suspenders cancel, but the runtime timer is
+			// lighter and reclaimed when it fires (cancel is idempotent if
+			// the job already exited cleanly).
+			time.AfterFunc(grace+500*time.Millisecond, cancel)
 		}
 	}
 

@@ -28,6 +28,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
@@ -321,6 +322,11 @@ type runtime struct {
 	sessionID         string
 	sessionPointerCwd string // cwd used to key the crash-recovery pointer; empty if write failed at boot
 	loop              *agent.Loop
+	// cronSvc is the per-session cron service shared with the CronCreate/
+	// List/Delete + ScheduleWakeup tools. The TUI mounts an in-session
+	// scheduler on this same instance so session-only (ephemeral) jobs the
+	// model schedules mid-chat actually fire. nil in headless paths.
+	cronSvc           *agent.CronService
 	useMD             bool
 	showTok           bool
 	model             string
@@ -1211,7 +1217,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	rt := &runtime{
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
-		loop: loop, useMD: cfg.UI.Markdown && !flags.noMarkdown,
+		loop: loop, cronSvc: cronSvc, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
 		mcpLauncherDone:  mcpLauncherDoneCh,
 		plugins:          pluginReg,
@@ -1463,7 +1469,7 @@ func cmdChat(ctx context.Context, args []string) error {
 			earlyIn.Stop() // idempotent — safe even if trust prompt called it
 			tui.SetEarlyInputReader(earlyIn.Reader())
 		}
-		return tui.RunTUI(ctx, rt.loop, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.providerName, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
+		return tui.RunTUI(ctx, rt.loop, rt.cronSvc, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.providerName, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
 	}
 	// Non-TUI path: just stop the capture so terminal mode is restored.
 	if earlyIn != nil {
@@ -2119,7 +2125,7 @@ func cmdAudit() error {
 
 func cmdCron(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: metis cron <list|add|rm|pause|resume|run|start|audit>")
+		return errors.New("usage: metis cron <list|add|rm|pause|resume|run|start|audit|allow|denied>")
 	}
 	cfg, _, err := config.Load()
 	if err != nil {
@@ -2172,6 +2178,10 @@ func cmdCron(ctx context.Context, args []string) error {
 		return cmdCronStart(ctx, svc)
 	case "audit":
 		return cmdCronAudit(svc, rest)
+	case "allow":
+		return cmdCronAllow(svc, cronRoot, rest)
+	case "denied":
+		return cmdCronDenied(cronRoot, rest)
 	}
 	return fmt.Errorf("cron: unknown subcommand %q", sub)
 }
@@ -2225,6 +2235,75 @@ func cmdCronAudit(svc *agent.CronService, args []string) error {
 	return nil
 }
 
+// cmdCronDenied shows the tool calls an unattended job tried to make but
+// wasn't pre-authorized for. This is the "review before you approve"
+// surface: each line carries a ready-to-paste rule so the user can run
+// `cron allow <id> <rule>` to authorize it for next time.
+func cmdCronDenied(cronRoot string, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: metis cron denied <id>")
+	}
+	jobID := args[0]
+	denials, err := agent.ListCronDenials(cronRoot, jobID)
+	if err != nil {
+		return err
+	}
+	if len(denials) == 0 {
+		fmt.Printf("(no blocked tool calls for %s — nothing to approve)\n", jobID)
+		return nil
+	}
+	// Collapse duplicate suggestions: a job firing every minute blocks the
+	// same call repeatedly, but the user only needs to approve the rule once.
+	seen := map[string]bool{}
+	fmt.Printf("Blocked tool calls for %s (not pre-authorized):\n\n", jobID)
+	for _, d := range denials {
+		if seen[d.Suggest] {
+			continue
+		}
+		seen[d.Suggest] = true
+		fmt.Printf("  %s  %s\n", d.Tool, d.Input)
+		if strings.HasPrefix(d.Reason, "dangerous_pattern:") {
+			fmt.Printf("    ⚠ dangerous (%s) — denied even if allow-listed; cannot be approved\n",
+				strings.TrimPrefix(d.Reason, "dangerous_pattern:"))
+			continue
+		}
+		fmt.Printf("    approve: metis cron allow %s '%s'\n", jobID, d.Suggest)
+	}
+	return nil
+}
+
+// cmdCronAllow appends a pre-authorization rule to a job's allow-list and
+// clears its denied log (the user has acted on it). Subsequent fires run
+// any tool call matching the rule without prompting.
+func cmdCronAllow(svc *agent.CronService, cronRoot string, args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: metis cron allow <id> <rule>   e.g. metis cron allow <id> 'Bash(git pull:*)'")
+	}
+	jobID := args[0]
+	rule := strings.TrimSpace(args[1])
+	if rule == "" {
+		return errors.New("cron allow: empty rule")
+	}
+	if _, ok := svc.Get(jobID); !ok {
+		return fmt.Errorf("cron allow: job not found: %s", jobID)
+	}
+	if err := svc.Update(jobID, func(j *agent.CronJob) {
+		for _, existing := range j.AllowTools {
+			if existing == rule {
+				return // already authorized — no-op
+			}
+		}
+		j.AllowTools = append(j.AllowTools, rule)
+	}); err != nil {
+		return err
+	}
+	// Best-effort: clear the denied log now that the user has acted. A
+	// failure here is cosmetic (stale entries reappear once re-denied).
+	_ = agent.ClearCronDenials(cronRoot, jobID)
+	fmt.Printf("authorized %q for cron job %s\n", rule, jobID)
+	return nil
+}
+
 func cmdCronAdd(svc *agent.CronService, args []string) error {
 	fs := flag.NewFlagSet("cron add", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -2242,6 +2321,8 @@ func cmdCronAdd(svc *agent.CronService, args []string) error {
 	fs.StringVar(&mode, "mode", "isolated", "session mode: isolated | persistent | main")
 	fs.StringVar(&sessionRef, "session", "", "session ref for mode=main (default \"main\")")
 	fs.StringVar(&disabled, "disable-tools", "", "comma-separated tools to deny while this job runs (e.g. WebFetch,Agent)")
+	var allow stringList
+	fs.Var(&allow, "allow", "pre-authorize a tool for unattended fires, repeatable. `Tool(content)` form: --allow 'Bash(git pull:*)' --allow Write. Unlisted tool calls are denied + recorded for `cron denied`.")
 	var silent bool
 	fs.BoolVar(&silent, "silent", false, "fire without printing to chat — transcripts land in ~/.metis/cron/audit/<id>/ for `cron audit <id>` to inspect")
 	if err := fs.Parse(args); err != nil {
@@ -2267,6 +2348,7 @@ func cmdCronAdd(svc *agent.CronService, args []string) error {
 			}
 		}
 	}
+	job.AllowTools = append(job.AllowTools, allow...)
 	switch {
 	case every != "":
 		d, err := time.ParseDuration(every)
@@ -2298,6 +2380,12 @@ func cmdCronAdd(svc *agent.CronService, args []string) error {
 		return err
 	}
 	fmt.Printf("created cron job: %s (next: %s)\n", job.ID, job.NextRun.Format(time.RFC3339))
+	if len(job.AllowTools) > 0 {
+		fmt.Printf("  pre-authorized: %s\n", strings.Join(job.AllowTools, ", "))
+	} else {
+		fmt.Printf("  no tools pre-authorized — write/exec/network calls will be blocked.\n")
+		fmt.Printf("  authorize with: --allow 'Bash(<cmd>:*)' / --allow Write, or `metis cron denied %s` after a fire.\n", job.ID)
+	}
 	return nil
 }
 
@@ -2309,7 +2397,11 @@ func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) erro
 	if !ok {
 		return fmt.Errorf("cron job not found: %s", args[0])
 	}
-	rt, err := setupRuntime(ctx, &cliFlags{})
+	// Force ModeAsk regardless of cfg.Permission.Mode — see cmdCronStart
+	// for the full rationale: a cron fire is governed by its allow-list,
+	// not the operator's ambient mode, and only ModeAsk routes ask-tier
+	// tool calls through executeCronJob's EvaluateCronPermission handler.
+	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeAsk)})
 	if err != nil {
 		return err
 	}
@@ -2323,7 +2415,17 @@ func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) erro
 }
 
 func cmdCronStart(ctx context.Context, svc *agent.CronService) error {
-	rt, err := setupRuntime(ctx, &cliFlags{})
+	// Force ModeAsk regardless of cfg.Permission.Mode. A durable cron
+	// fire's permission model is its pre-authorization allow-list
+	// (enforced in executeCronJob's EventPermissionRequest handler via
+	// EvaluateCronPermission), NOT the operator's ambient interactive
+	// mode. If the daemon host's config is bypass/acceptEdits, the gate
+	// would auto-allow state-changing tools WITHOUT ever emitting
+	// EventPermissionRequest, so the allow-list is silently never
+	// consulted and the job runs every (non-dangerous-pattern) tool the
+	// model emits. ModeAsk routes every ask-tier call through the handler
+	// so the allow-list — and its dangerous-pattern floor — always govern.
+	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeAsk)})
 	if err != nil {
 		return err
 	}
@@ -2384,15 +2486,20 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	// chat surface doesn't fill with cron noise. Mirrors hermes
 	// SILENT_MARKER but with a per-fire transcript instead of a single
 	// rolling log.
+	// cronRoot must match NewCronService's root (runtime.cronRoot ==
+	// filepath.Join(cfg.Session.Dir, "cron")) so audit transcripts and the
+	// denied store land where the `cron audit` / `cron denied` readers look.
+	// The old derivation used filepath.Dir(SessionDir)/cron, one level too
+	// high (~/.metis/cron vs ~/.metis/sessions/cron) — `cron audit` then
+	// reported "no audit log" while the files sat in the wrong tree.
+	sessionDir := rt.cfg.Session.Dir
+	if sessionDir == "" {
+		sessionDir = filepath.Join(os.Getenv("HOME"), ".metis", "sessions")
+	}
+	cronRoot := filepath.Join(sessionDir, "cron")
+
 	var auditW *agent.AuditWriter
 	if job.Silent {
-		root := rt.cfg.Session.Dir // best-effort — falls back below if empty
-		if root == "" {
-			root = filepath.Join(os.Getenv("HOME"), ".metis")
-		}
-		// cron service uses ~/.metis/cron as root; audit logs live
-		// alongside the job files under cron/audit/<id>/
-		cronRoot := filepath.Join(filepath.Dir(root), "cron")
 		if w, err := agent.OpenAuditLog(cronRoot, job.ID); err == nil {
 			auditW = w
 			auditW.Append(agent.AuditEntry{Kind: "start", Text: job.Name})
@@ -2434,6 +2541,11 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() { done <- rt.loop.Run(ctx, events); close(events) }()
+
+	// Counts tool calls this fire that were denied for lack of pre-
+	// authorization, so we can nudge the user once at the end ("N blocked,
+	// run `cron denied`") instead of staying silent like the old auto-deny.
+	cronDeniedCount := 0
 
 	for ev := range events {
 		switch ev.Kind {
@@ -2486,7 +2598,37 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 				auditW.Append(agent.AuditEntry{Kind: "info", Text: ev.Info})
 			}
 		case agent.EventPermissionRequest:
-			ev.PermissionReply <- agent.PermissionDecisionDeny
+			// Cron fires are unattended: there's no operator to answer a
+			// mid-fire confirmation. The original code auto-DENIED every
+			// ask-tier request, which silently broke any job whose prompt
+			// needed a write/exec/network tool (observed 2026-06-15: a
+			// Bash-write job fired on schedule but produced nothing, the
+			// transcript showed "权限门拒绝"). Now the decision comes from the
+			// job's pre-authorization allow-list (claude-code's background-
+			// agent model): the user grants specific tools ahead of time via
+			// `cron add --allow` / `cron allow`, those run; everything else is
+			// denied and recorded so the user can review and extend the list.
+			// Dangerous-pattern commands stay denied even if allow-listed.
+			if allow, reason := agent.EvaluateCronPermission(job, ev.PermissionTool, ev.PermissionInput); allow {
+				ev.PermissionReply <- agent.PermissionDecisionAllow
+			} else {
+				ev.PermissionReply <- agent.PermissionDecisionDeny
+				cronDeniedCount++
+				_ = agent.RecordCronDenial(cronRoot, job.ID, agent.CronDenial{
+					Tool:    ev.PermissionTool,
+					Input:   agent.FlattenToolInput(ev.PermissionInput),
+					Reason:  reason,
+					Suggest: agent.SuggestCronRule(ev.PermissionTool, ev.PermissionInput),
+				})
+				if auditW != nil {
+					auditW.Append(agent.AuditEntry{
+						Kind:    "denied",
+						Tool:    ev.PermissionTool,
+						Text:    reason,
+						IsError: true,
+					})
+				}
+			}
 		case agent.EventAskUser:
 			// Cron-run path: no operator on the other end. Drain with
 			// empty answer so the tool surfaces a structured error and
@@ -2509,6 +2651,17 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 		}
 	}
 	runErr := <-done
+
+	// Nudge the user once if this fire wanted tools it wasn't pre-authorized
+	// for. Without this the denials are invisible until they go looking —
+	// the same silent-failure trap the old blanket auto-deny created. Both
+	// surfaces (stderr for an attached daemon, notify for backgrounded) so
+	// the hint lands wherever the user is.
+	if cronDeniedCount > 0 {
+		msg := fmt.Sprintf("cron %q: %d tool call(s) blocked (not pre-authorized) — run `metis cron denied %s` to review/allow", job.Name, cronDeniedCount, job.ID)
+		fmt.Fprintf(os.Stderr, "[cron %s] %s\n", job.ID, msg)
+		notify.SendNotification("metis cron", msg)
+	}
 
 	// 3. Save history back to the right cache for next fire. Skip on
 	//    error so a partial run doesn't poison the persistent thread —
