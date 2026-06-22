@@ -22,8 +22,9 @@ model can invoke via `Skill(name="…")`.
 | `expand.go` | Renders a skill body template with arg substitution before handing to the LLM. |
 | `filter.go` | Post-load filter (per-session enable/disable, per-tool allowlist). |
 | `synth.go` + `synth_tool.go` | The `metis skills synth <name>` path — generate a new skill from a natural-language description, dispatched as a Synth subagent. |
+| `curator.go` | Agent-skill lifecycle. Mirror of `internal/memdir`'s decay, but for procedural memory: archives idle agent-created skills so the synthesized library converges instead of growing without bound. Runs automatically at the end of each dream cycle and manually via `metis skills curator`. |
 
-12 prod + 12 test files. Each file is its own well-defined concern;
+13 prod + 13 test files. Each file is its own well-defined concern;
 no further sub-package split is warranted.
 
 ## Where do I find...
@@ -37,6 +38,11 @@ no further sub-package split is warranted.
 - **Bundled built-in skills** (compiled into the binary) →
   `embedded.go` + `internal/agent/skills/builtin/` subdir.
 - **Synthesizing a new skill from a prompt** → `synth.go` / `synth_tool.go`.
+- **Retiring stale agent-created skills** (the self-evolution loop's
+  garbage collector) → `curator.go`. Synth creates; the curator prunes.
+  Only flat agent-written `*.md` skills are eligible; installed,
+  bundled, project, and pinned skills are never archived, and every
+  archive is recoverable (`metis skills curator restore <name>`).
 
 ## Design invariants
 

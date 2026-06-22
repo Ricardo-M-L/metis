@@ -452,6 +452,15 @@ func dirLayer(name string, priority int, dir, trust string) Layer {
 				if isJunkFilename(entryName) {
 					continue
 				}
+				// Skip dot-prefixed entries in on-disk skill dirs: `.git`,
+				// and the curator's state (`.archive/` of retired skills,
+				// `.curator-pins.json`). A real skill is never dot-named, so
+				// this keeps an archived skill from re-surfacing in the list
+				// without over-filtering the shared isJunkFilename (whose
+				// contract is "a single leading dot is fine").
+				if strings.HasPrefix(entryName, ".") {
+					continue
+				}
 				full := filepath.Join(dir, entryName)
 				// Symlink-aware dir detection: ReadDir's IsDir() returns
 				// false for a symlink even when its target is a dir, so
@@ -560,6 +569,13 @@ func scanSkillSubtreeDedup(root string, maxDepth int, seen map[string]bool) []Sk
 	for _, e := range ents {
 		name := e.Name()
 		if isJunkFilename(name) {
+			continue
+		}
+		// Skip dot-prefixed entries here too (matches the top-level
+		// dirLayer scan) so curator state — `.archive/`, `.curator-pins.json`
+		// — that migrates or lands inside a category subdir never re-surfaces
+		// as a phantom skill.
+		if strings.HasPrefix(name, ".") {
 			continue
 		}
 		full := filepath.Join(root, name)

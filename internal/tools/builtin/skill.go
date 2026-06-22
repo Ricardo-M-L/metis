@@ -16,12 +16,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubskill "github.com/Ricardo-M-L/metis/pkg/skill"
 )
+
+// underDir reports whether path lives inside dir, comparing with a
+// path-separator boundary (so `/a/skills` does not match `/a/skills-x`)
+// and absolute-normalizing both sides (so a relative configured skill_dir
+// still matches the always-absolute manifest LocalPath).
+func underDir(path, dir string) bool {
+	ad, err1 := filepath.Abs(dir)
+	ap, err2 := filepath.Abs(path)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return strings.HasPrefix(ap, ad+string(os.PathSeparator))
+}
 
 // Skill exposes list/get/invoke over the multi-source skill loader.
 type Skill struct {
@@ -178,6 +192,21 @@ func (s Skill) invokeSkill(ctx context.Context, name string) (*tools.Result, err
 				}
 			}
 		}
+	}
+
+	// Refresh the on-disk mtime of a user-owned skill so the skill
+	// curator's idle clock tracks real usage. The Uses bump above only
+	// touches a same-named .json (legacy installed format); agent-created
+	// skills are flat .md files the curator ages by file mtime, so without
+	// this an actively-invoked .md skill would still be archived ~90 days
+	// after creation. Chtimes leaves content untouched, so the prefix
+	// cache / content hash are unaffected. Restricted to userDir (with a
+	// path-separator boundary + abs normalization so a sibling dir like
+	// `skills-shared` can't false-match and a relative skill_dir still
+	// resolves) so we never touch bundled / project / plugin / mcp skills.
+	if s.userDir != "" && sk.LocalPath != "" && underDir(sk.LocalPath, s.userDir) {
+		now := time.Now()
+		_ = os.Chtimes(sk.LocalPath, now, now)
 	}
 
 	var b strings.Builder

@@ -18,10 +18,14 @@ func newTestExtractor(t *testing.T, prov llm.Provider, root string) (*Loop, *Aut
 	loop := NewLoop(prov, reg, nil, nil, "system", 10)
 	loop.Model = "test"
 	loop.AutoMemory = true
-	ext, err := NewAutoMemoryExtractor(loop, root)
+	ext, err := NewAutoMemoryExtractor(loop, root, "")
 	if err != nil {
 		t.Fatalf("NewAutoMemoryExtractor: %v", err)
 	}
+	// Test-isolate the skills dir too: the dream cycle reads/synthesizes/
+	// curates here, so without this a dream run would touch (and the
+	// curator could archive) the host's real ~/.metis/skills.
+	ext.skillsDir = filepath.Join(t.TempDir(), "skills")
 	loop.autoMemExtractor = ext
 
 	// Phase A test-isolation: point the dream gate at a temp sessions

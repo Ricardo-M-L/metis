@@ -590,6 +590,16 @@ func Home() string {
 	return filepath.Join(home, ".metis")
 }
 
+// SkillsDir is the canonical user-skills root: where the dreaming
+// subagent's SkillSynth writes, where the skill curator archives, and
+// the default for [session] skill_dir. Resolved through Home() so it
+// honors METIS_HOME. A single source of truth shared by the agent's
+// dream cycle and the `metis skills curator` CLI so the two never
+// target different directories.
+func SkillsDir() string {
+	return filepath.Join(Home(), "skills")
+}
+
 func defaults() *Config {
 	dh := Home()
 	return &Config{

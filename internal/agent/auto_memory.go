@@ -42,6 +42,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memdir"
 	"github.com/Ricardo-M-L/metis/internal/memory"
@@ -137,6 +138,12 @@ type AutoMemoryExtractor struct {
 	// os.UserHomeDir per invocation.
 	memdirRoot string
 
+	// skillsDir is the user-skills root the dream cycle reads (snapshot),
+	// writes (SkillSynth), and curates (idle-archive). Resolved once in
+	// the constructor to userSkillsDirDefault(); tests inject a temp dir
+	// so a dream run never touches the host's real ~/.metis/skills.
+	skillsDir string
+
 	// Phase is the current DreamTask state (G.5). Tracked alongside
 	// the legacy inProgress bool so existing call sites stay
 	// unchanged while /dream status can read the finer-grained
@@ -194,7 +201,14 @@ type AutoMemoryExtractor struct {
 // NewAutoMemoryExtractor wires an extractor to a loop. memdirRoot
 // defaults to memdir.DefaultRoot() if empty (the production path);
 // tests pass a t.TempDir() to keep the host's real memdir clean.
-func NewAutoMemoryExtractor(loop *Loop, memdirRoot string) (*AutoMemoryExtractor, error) {
+//
+// skillsDir is the user-skills root the dream cycle reads/synthesizes/
+// curates. Production passes cfg.Session.SkillDir so SkillSynth, the
+// curator, and the live Skill tool (which uses the same configured dir)
+// all agree even when [session] skill_dir is overridden. Empty falls
+// back to config.SkillsDir() — the default — for the lazy Loop path and
+// tests (which then override the field directly).
+func NewAutoMemoryExtractor(loop *Loop, memdirRoot, skillsDir string) (*AutoMemoryExtractor, error) {
 	if loop == nil {
 		return nil, fmt.Errorf("auto-memory: nil loop")
 	}
@@ -208,9 +222,13 @@ func NewAutoMemoryExtractor(loop *Loop, memdirRoot string) (*AutoMemoryExtractor
 	if err := memdir.EnsureRoot(memdirRoot); err != nil {
 		return nil, err
 	}
+	if skillsDir == "" {
+		skillsDir = userSkillsDirDefault()
+	}
 	return &AutoMemoryExtractor{
 		loop:       loop,
 		memdirRoot: memdirRoot,
+		skillsDir:  skillsDir,
 	}, nil
 }
 
@@ -471,7 +489,7 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// into memdir). Empty preSkills when the dir doesn't exist —
 	// the diff still works, every file present afterward counts as
 	// new.
-	preSkills := snapshotSkillNames(userSkillsDirDefault())
+	preSkills := snapshotSkillNames(e.skillsDir)
 
 	var runErr error
 	defer func() {
@@ -525,6 +543,17 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 			}
 		}
 
+		// 3. Skills-side mirror of the memdir decay above. SkillSynth
+		//    only ever *creates* skills during the dream; without this
+		//    the user-skills dir grows without bound. The curator
+		//    archives idle agent-created skills (recoverable; pinned and
+		//    installed skills are never touched) so the procedural-memory
+		//    library converges the same way declarative memory does.
+		//    Best-effort — a curator error never aborts the dream.
+		if sdir := e.skillsDir; sdir != "" {
+			_, _ = skills.NewCurator(sdir).Sweep(time.Now())
+		}
+
 		e.mu.Lock()
 		e.inProgress = false
 		e.phase = DreamPhaseDone
@@ -543,7 +572,7 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 		// created during this run (Δ = post − pre on the skills dir).
 		if eventOut != nil {
 			memCount := len(touched)
-			postSkills := snapshotSkillNames(userSkillsDirDefault())
+			postSkills := snapshotSkillNames(e.skillsDir)
 			skillCount := countNewSkills(preSkills, postSkills)
 			summary := formatDreamSummary(memCount, skillCount, runErr)
 			select {
@@ -599,7 +628,7 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// is nil intentionally: plumbing the live *skills.Loader from
 	// runtime through Loop would be invasive; newly-synthesized skills
 	// become visible on the next metis launch. Acceptable for Phase B.
-	userSkillsDir := userSkillsDirDefault()
+	userSkillsDir := e.skillsDir
 	dreamReg := buildDreamRegistry(e.loop.Registry, userSkillsDir, nil)
 
 	// CRITICAL (Phase B fix 2026-05-16): the fork's LLM request reads
@@ -1032,7 +1061,12 @@ func (l *Loop) MaybeExtractMemory(ctx context.Context) int {
 		return 0
 	}
 	if l.autoMemExtractor == nil {
-		ext, err := NewAutoMemoryExtractor(l, "")
+		// Lazy path (runtime didn't pre-wire an extractor): the Loop
+		// carries no configured skill dir, so fall back to the default
+		// (config.SkillsDir()). Identical to cfg.Session.SkillDir unless
+		// [session] skill_dir is overridden — the runtime path below
+		// (cmd/metis) passes the configured dir explicitly for that case.
+		ext, err := NewAutoMemoryExtractor(l, "", "")
 		if err != nil {
 			return 0
 		}

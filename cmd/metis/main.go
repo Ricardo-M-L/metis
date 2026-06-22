@@ -278,6 +278,7 @@ Usage:
   metis sessions import [--id ID] Read JSONL from stdin and create a new session
   metis skills list     List built-in skills library
   metis skills install <name>  Install a built-in skill
+  metis skills curator <status|run|list-archived|restore|pin|unpin>  Manage agent-created skills
   metis acp [--addr ADDR]  Run as Agent Client Protocol server (default: stdio)
   metis mcp-serve [--mode MODE]  Run as MCP server (stdio); register with: claude mcp add metis -- metis mcp-serve
   metis cron <list|add|rm|pause|resume|run|start|audit>  Manage scheduled prompts
@@ -1189,7 +1190,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// and never blocks the turn.
 	if flags.autoMemory || os.Getenv("METIS_AUTO_MEMORY") == "1" {
 		loop.AutoMemory = true
-		ext, err := agent.NewAutoMemoryExtractor(loop, "")
+		// Pass the configured skill dir so SkillSynth + curator target the
+		// same directory the live Skill tool / loader use (honors a custom
+		// [session] skill_dir override).
+		ext, err := agent.NewAutoMemoryExtractor(loop, "", cfg.Session.SkillDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "metis: auto-memory init: %v (disabled)\n", err)
 		} else {
@@ -3031,8 +3035,112 @@ func cmdSkills(args []string) error {
 		}
 		fmt.Println("uninstalled:", args[1])
 		return nil
+	case "curator":
+		// cfg.Session.SkillDir: the authoritative user-skills dir the
+		// loader, installer, and live Skill tool all use (honors a custom
+		// [session] skill_dir). The dream-cycle auto-sweep is wired to the
+		// same dir (cmd/metis passes cfg.Session.SkillDir into the
+		// extractor), so the manual CLI and the automatic path agree.
+		return cmdSkillsCurator(args[1:], cfg.Session.SkillDir)
 	}
-	return fmt.Errorf("skills: unknown subcommand %q (use: list | install | info | uninstall)", sub)
+	return fmt.Errorf("skills: unknown subcommand %q (use: list | install | info | uninstall | curator)", sub)
+}
+
+// cmdSkillsCurator drives the agent-skill curator from the CLI — the
+// manual counterpart to the automatic sweep that runs at the end of each
+// dream cycle. The curator only ever touches agent-created (flat .md) user
+// skills; installed, bundled, project, and pinned skills are never
+// archived, and archiving is always recoverable.
+func cmdSkillsCurator(args []string, skillDir string) error {
+	c := skills.NewCurator(skillDir)
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "status":
+		cands, err := c.IdleCandidates(time.Now())
+		if err != nil {
+			return err
+		}
+		pins, err := c.Pins()
+		if err != nil {
+			return err
+		}
+		archived, err := c.ListArchived()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("skill curator (idle window: %d days)\n", skills.CuratorIdleDaysDefault)
+		fmt.Printf("  archive candidates: %d%s\n", len(cands), formatNameList(cands))
+		fmt.Printf("  pinned:             %d%s\n", len(pins), formatNameList(pins))
+		fmt.Printf("  archived:           %d%s\n", len(archived), formatNameList(archived))
+		if len(cands) > 0 {
+			fmt.Println("  run `metis skills curator run` to archive idle skills (recoverable).")
+		}
+		return nil
+	case "run":
+		res, err := c.Sweep(time.Now())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("curator: scanned %d, archived %d, kept-fresh %d, pinned %d, failed %d\n",
+			res.Scanned, len(res.Archived), res.Skipped, res.Pinned, res.Failed)
+		for _, n := range res.Archived {
+			fmt.Println("  archived:", n)
+		}
+		return nil
+	case "list-archived":
+		archived, err := c.ListArchived()
+		if err != nil {
+			return err
+		}
+		if len(archived) == 0 {
+			fmt.Println("no archived skills")
+			return nil
+		}
+		for _, n := range archived {
+			fmt.Println(n)
+		}
+		return nil
+	case "restore":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: metis skills curator restore <name>")
+		}
+		if err := c.Restore(args[1]); err != nil {
+			return err
+		}
+		fmt.Println("restored:", args[1])
+		return nil
+	case "pin":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: metis skills curator pin <name>")
+		}
+		if err := c.Pin(args[1]); err != nil {
+			return err
+		}
+		fmt.Println("pinned:", args[1])
+		return nil
+	case "unpin":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: metis skills curator unpin <name>")
+		}
+		if err := c.Unpin(args[1]); err != nil {
+			return err
+		}
+		fmt.Println("unpinned:", args[1])
+		return nil
+	}
+	return fmt.Errorf("skills curator: unknown subcommand %q (use: status | run | list-archived | restore <name> | pin <name> | unpin <name>)", sub)
+}
+
+// formatNameList renders a " (a, b, c)" suffix for a count line, or "" when
+// the list is empty.
+func formatNameList(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(names, ", ") + ")"
 }
 
 // installSkillUnified picks between local-bundled install and GitHub fetch

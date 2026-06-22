@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -26,6 +27,38 @@ func writeSkill(t *testing.T, dir, name, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestSkillInvoke_RefreshesUserSkillMtime guards the signal the skill
+// curator relies on: invoking a user-layer skill must bump its file mtime
+// so an actively-used flat .md skill stays "fresh" and isn't archived.
+func TestSkillInvoke_RefreshesUserSkillMtime(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "hot", `---
+name: hot
+description: frequently used
+---
+body
+`)
+	path := filepath.Join(dir, "hot.md")
+	old := time.Now().AddDate(0, 0, -200)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	loader := skillsloader.NewLoader(dir, "", nil)
+	tool := NewSkill(permission.New(permission.ModeBypass), loader, dir)
+
+	res, err := tool.Execute(context.Background(), map[string]any{"action": "invoke", "name": "hot"})
+	if err != nil || res == nil || res.IsError {
+		t.Fatalf("invoke failed: err=%v res=%+v", err, res)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(info.ModTime()) > time.Minute {
+		t.Errorf("invoke did not refresh mtime; still %v old", time.Since(info.ModTime()))
+	}
 }
 
 func TestSkillInvoke_TemplateAndShellExpansion_UserTrust(t *testing.T) {

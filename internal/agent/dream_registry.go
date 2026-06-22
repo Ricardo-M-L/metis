@@ -11,23 +11,20 @@ package agent
 // (2026-05-16) — partner of internal/agent/skills/synth.go.
 
 import (
-	"os"
-	"path/filepath"
-
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // userSkillsDirDefault returns the canonical user-skills directory.
-// Empty when UserHomeDir fails — callers should treat empty as
-// "SkillSynth unavailable" and skip the wiring.
+// Routes through config.SkillsDir() so SkillSynth (writer) and the
+// curator (archiver) honor METIS_HOME and agree with the
+// `metis skills curator` CLI — previously this used os.UserHomeDir
+// directly and silently ignored METIS_HOME, so an isolated run touched
+// the developer's real ~/.metis/skills.
 func userSkillsDirDefault() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".metis", "skills")
+	return config.SkillsDir()
 }
 
 // buildDreamRegistry returns a fresh *tools.Registry that holds every
