@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -29,10 +28,11 @@ func writeSkill(t *testing.T, dir, name, body string) string {
 	return path
 }
 
-// TestSkillInvoke_RefreshesUserSkillMtime guards the signal the skill
-// curator relies on: invoking a user-layer skill must bump its file mtime
-// so an actively-used flat .md skill stays "fresh" and isn't archived.
-func TestSkillInvoke_RefreshesUserSkillMtime(t *testing.T) {
+// TestSkillInvoke_RecordsUsage guards the signal the skill curator relies
+// on: invoking a user-layer skill records a use event (count + timestamp)
+// in the usage store so an actively-used skill stays "active" and isn't
+// archived — without mutating the file on disk (the old mtime-bump hack).
+func TestSkillInvoke_RecordsUsage(t *testing.T) {
 	dir := t.TempDir()
 	writeSkill(t, dir, "hot", `---
 name: hot
@@ -40,11 +40,6 @@ description: frequently used
 ---
 body
 `)
-	path := filepath.Join(dir, "hot.md")
-	old := time.Now().AddDate(0, 0, -200)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatal(err)
-	}
 	loader := skillsloader.NewLoader(dir, "", nil)
 	tool := NewSkill(permission.New(permission.ModeBypass), loader, dir)
 
@@ -52,12 +47,48 @@ body
 	if err != nil || res == nil || res.IsError {
 		t.Fatalf("invoke failed: err=%v res=%+v", err, res)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
+	rec, ok := skillsloader.NewUsageStore(dir).Get("hot")
+	if !ok {
+		t.Fatal("invoke should have created a usage record")
+	}
+	if rec.UseCount != 1 || rec.LastUsedAt == "" {
+		t.Errorf("want UseCount=1 + LastUsedAt set, got %+v", rec)
+	}
+
+	// A `get` records a VIEW, kept distinct from a use.
+	if _, err := tool.Execute(context.Background(), map[string]any{"action": "get", "name": "hot"}); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(info.ModTime()) > time.Minute {
-		t.Errorf("invoke did not refresh mtime; still %v old", time.Since(info.ModTime()))
+	rec, _ = skillsloader.NewUsageStore(dir).Get("hot")
+	if rec.ViewCount != 1 || rec.UseCount != 1 {
+		t.Errorf("view should increment ViewCount only; got UseCount=%d ViewCount=%d", rec.UseCount, rec.ViewCount)
+	}
+}
+
+// TestSkillInvoke_UsageKeyedByFilename guards the fix for the curator/usage
+// key mismatch: usage must be recorded under the on-disk FILENAME base, not
+// the frontmatter `name:` (which the curator can't see when it scans by
+// filename). Here the file is on-disk-name.md but frontmatter name differs.
+func TestSkillInvoke_UsageKeyedByFilename(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "on-disk-name", `---
+name: friendly-display-name
+description: x
+---
+body
+`)
+	loader := skillsloader.NewLoader(dir, "", nil)
+	tool := NewSkill(permission.New(permission.ModeBypass), loader, dir)
+	// Invoke by the loader-resolved (frontmatter) name.
+	if _, err := tool.Execute(context.Background(), map[string]any{"action": "invoke", "name": "friendly-display-name"}); err != nil {
+		t.Fatal(err)
+	}
+	store := skillsloader.NewUsageStore(dir)
+	if _, ok := store.Get("on-disk-name"); !ok {
+		t.Error("usage must be keyed by the on-disk filename base")
+	}
+	if _, ok := store.Get("friendly-display-name"); ok {
+		t.Error("usage must NOT be keyed by the frontmatter name (curator can't see it)")
 	}
 }
 

@@ -51,6 +51,7 @@ type SynthSkillMeta struct {
 type Synth struct {
 	dir    string // typically ~/.metis/skills (the "user" layer dir)
 	loader *Loader
+	usage  *UsageStore
 }
 
 // NewSynth returns a Synth bound to dir (the user-skills directory).
@@ -58,11 +59,31 @@ type Synth struct {
 // on it so the next List/Get sees the new file without a full
 // process restart.
 func NewSynth(dir string, loader *Loader) *Synth {
-	return &Synth{dir: dir, loader: loader}
+	return &Synth{dir: dir, loader: loader, usage: NewUsageStore(dir)}
 }
 
 // Dir is the absolute target directory. Exposed for tests + logs.
 func (s *Synth) Dir() string { return s.dir }
+
+// ArchiveSkill retires a redundant user skill into the recoverable
+// archive — the consolidation counterpart to CreateSkill. Used by the
+// dreaming fork after it merges duplicates into an umbrella skill.
+// Routes through the curator so the same validation + .archive/ layout
+// + restore path apply.
+func (s *Synth) ArchiveSkill(name string) error {
+	// No sanitizeName here: that regex (lowercase-only, min length 2) is the
+	// rule for *creating* a name, but an existing on-disk skill being
+	// retired may be `Go.md` or a single char. Curator.Archive applies the
+	// path-safety check (validateSkillName) + case-insensitive file lookup,
+	// which is the right gate for an existing file.
+	if err := NewCurator(s.dir).Archive(name); err != nil {
+		return err
+	}
+	if s.loader != nil {
+		s.loader.Invalidate()
+	}
+	return nil
+}
 
 // nameRE allows ASCII alnum + dash + underscore. No path separators,
 // no leading dots (would hide the file), no spaces. The same shape
@@ -119,6 +140,10 @@ func (s *Synth) CreateSkill(meta SynthSkillMeta, body string) (string, error) {
 	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
 		return "", fmt.Errorf("synth: write %s: %w", path, err)
 	}
+	// Stamp authoritative provenance + creation time in the usage store so
+	// the curator knows this is agent-created (not a hand-written flat .md)
+	// and can anchor its lifecycle clock on a real activity timestamp.
+	s.usage.RecordCreate(name, SourceAgentSynth)
 	if s.loader != nil {
 		s.loader.Invalidate()
 	}
@@ -164,6 +189,9 @@ func (s *Synth) UpdateSkill(name, body string) (string, error) {
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		return "", fmt.Errorf("synth: write %s: %w", path, err)
 	}
+	// Record the patch event (count + last_patched_at) so the curator sees
+	// "recently improved" as activity that keeps the skill fresh.
+	s.usage.RecordPatch(clean)
 	if s.loader != nil {
 		s.loader.Invalidate()
 	}

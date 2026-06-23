@@ -223,8 +223,23 @@ func TestAutoMemoryExtractor_RegeneratesIndex(t *testing.T) {
 	}
 }
 
+func TestBuildExtractorPrompt_ConsolidationGated(t *testing.T) {
+	// No overlaps → no consolidation section (the common case).
+	noOverlap := buildExtractorPrompt("/tmp/x", "m", []string{"a"}, nil)
+	if strings.Contains(noOverlap, "Consolidation") {
+		t.Error("consolidation section must be absent when no overlaps detected")
+	}
+	// Overlaps → section names the cluster + the archive_skill action.
+	withOverlap := buildExtractorPrompt("/tmp/x", "m", []string{"a", "b"}, [][]string{{"git-commit", "commit-helper"}})
+	if !strings.Contains(withOverlap, "Consolidation") ||
+		!strings.Contains(withOverlap, "git-commit, commit-helper") ||
+		!strings.Contains(withOverlap, "archive_skill") {
+		t.Errorf("consolidation section missing/incomplete:\n%s", withOverlap)
+	}
+}
+
 func TestBuildExtractorPrompt_IncludesManifest(t *testing.T) {
-	got := buildExtractorPrompt("/tmp/x", "## existing\n- one\n", nil)
+	got := buildExtractorPrompt("/tmp/x", "## existing\n- one\n", nil, nil)
 	if !strings.Contains(got, "/tmp/x") {
 		t.Errorf("prompt missing root: %q", got)
 	}

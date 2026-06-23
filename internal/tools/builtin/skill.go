@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -35,6 +34,13 @@ func underDir(path, dir string) bool {
 		return false
 	}
 	return strings.HasPrefix(ap, ad+string(os.PathSeparator))
+}
+
+// skillFileBase is the on-disk filename without extension — the key the
+// curator's usage store uses (it scans by filename, not frontmatter name).
+func skillFileBase(localPath string) string {
+	b := filepath.Base(localPath)
+	return strings.TrimSuffix(b, filepath.Ext(b))
 }
 
 // Skill exposes list/get/invoke over the multi-source skill loader.
@@ -160,6 +166,12 @@ func (s Skill) getSkill(name string) (*tools.Result, error) {
 	if sk == nil {
 		return &tools.Result{Output: "skill not found: " + name, IsError: true}, nil
 	}
+	// Record a view for a user-owned skill — distinct from an invoke, so the
+	// curator can tell "the agent keeps reading this for reference" from
+	// "the agent keeps running it". Keyed by filename base (see invokeSkill).
+	if s.userDir != "" && sk.LocalPath != "" && underDir(sk.LocalPath, s.userDir) {
+		skillsloader.NewUsageStore(s.userDir).RecordView(skillFileBase(sk.LocalPath))
+	}
 	out, _ := json.MarshalIndent(sk, "", "  ")
 	return &tools.Result{Output: string(out)}, nil
 }
@@ -194,19 +206,16 @@ func (s Skill) invokeSkill(ctx context.Context, name string) (*tools.Result, err
 		}
 	}
 
-	// Refresh the on-disk mtime of a user-owned skill so the skill
-	// curator's idle clock tracks real usage. The Uses bump above only
-	// touches a same-named .json (legacy installed format); agent-created
-	// skills are flat .md files the curator ages by file mtime, so without
-	// this an actively-invoked .md skill would still be archived ~90 days
-	// after creation. Chtimes leaves content untouched, so the prefix
-	// cache / content hash are unaffected. Restricted to userDir (with a
-	// path-separator boundary + abs normalization so a sibling dir like
-	// `skills-shared` can't false-match and a relative skill_dir still
-	// resolves) so we never touch bundled / project / plugin / mcp skills.
+	// Record an invoke in the curator's usage store so its lifecycle clock
+	// tracks real usage. This replaces an earlier os.Chtimes-on-invoke hack
+	// (which mutated the file on every read and couldn't tell use from view
+	// from patch). Scoped to userDir-owned skills so we never record for
+	// bundled / project / plugin / mcp skills. Keyed by the on-disk filename
+	// base (NOT the invoke arg / frontmatter name) so it matches how the
+	// curator scans — otherwise a skill whose frontmatter `name:` differs
+	// from its filename records under one key and ages under another.
 	if s.userDir != "" && sk.LocalPath != "" && underDir(sk.LocalPath, s.userDir) {
-		now := time.Now()
-		_ = os.Chtimes(sk.LocalPath, now, now)
+		skillsloader.NewUsageStore(s.userDir).RecordUse(skillFileBase(sk.LocalPath))
 	}
 
 	var b strings.Builder

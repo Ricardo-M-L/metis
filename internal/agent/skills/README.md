@@ -22,7 +22,9 @@ model can invoke via `Skill(name="…")`.
 | `expand.go` | Renders a skill body template with arg substitution before handing to the LLM. |
 | `filter.go` | Post-load filter (per-session enable/disable, per-tool allowlist). |
 | `synth.go` + `synth_tool.go` | The `metis skills synth <name>` path — generate a new skill from a natural-language description, dispatched as a Synth subagent. |
-| `curator.go` | Agent-skill lifecycle. Mirror of `internal/memdir`'s decay, but for procedural memory: archives idle agent-created skills so the synthesized library converges instead of growing without bound. Runs automatically at the end of each dream cycle and manually via `metis skills curator`. |
+| `curator.go` | Agent-skill lifecycle. Mirror of `internal/memdir`'s decay, but for procedural memory: archives idle agent-created skills so the synthesized library converges instead of growing without bound. Runs automatically at the end of each dream cycle and manually via `metis skills curator`. Buckets skills into active / idle / archive-candidate states (`LifecycleStates`). |
+| `usage.go` | Per-skill usage record (use/view/patch counts + timestamps, created_at + provenance source). The curator's freshness + provenance signal — replaces the older file-mtime heuristic. Written by the Skill tool (invoke→use, get→view) and synth (create→provenance, update→patch); read by the curator to age skills by real activity. Mirrors hermes-agent's `tools/skill_usage.py`. |
+| `overlap.go` | Deterministic redundancy detection (Jaccard over tokenized name+description). Gates the dream's LLM consolidation pass: `DetectOverlaps` nominates near-duplicate clusters and only then does the dreaming fork get a "merge these into an umbrella skill (`create_skill` + `archive_skill`)" instruction — no overlaps → no aux-model merge cost. The cheap-detect / expensive-merge split of hermes' curator consolidation. |
 
 13 prod + 13 test files. Each file is its own well-defined concern;
 no further sub-package split is warranted.

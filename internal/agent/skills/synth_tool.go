@@ -47,8 +47,8 @@ func (SkillSynthTool) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type":        "string",
-				"description": "create_skill (refuses if name exists) | update_skill (refuses if name missing) | list_user_skills (no other inputs needed)",
-				"enum":        []string{"create_skill", "update_skill", "list_user_skills"},
+				"description": "create_skill (refuses if name exists) | update_skill (refuses if name missing) | archive_skill (retire a redundant skill into the recoverable archive — use after merging it into an umbrella skill) | list_user_skills (no other inputs needed)",
+				"enum":        []string{"create_skill", "update_skill", "archive_skill", "list_user_skills"},
 			},
 			"name": map[string]any{
 				"type":        "string",
@@ -103,6 +103,12 @@ func (t SkillSynthTool) Execute(_ context.Context, in map[string]any) (*tools.Re
 		return t.handleCreate(in)
 	case "update_skill":
 		return t.handleUpdate(in)
+	case "archive_skill":
+		name, _ := in["name"].(string)
+		if err := t.synth.ArchiveSkill(name); err != nil {
+			return &tools.Result{Output: "archive_skill: " + err.Error(), IsError: true}, nil
+		}
+		return &tools.Result{Output: fmt.Sprintf("archived %q (recoverable via `metis skills curator restore %s`)", name, name)}, nil
 	case "list_user_skills":
 		names := t.synth.ListUserSkills()
 		buf, _ := json.MarshalIndent(map[string]any{

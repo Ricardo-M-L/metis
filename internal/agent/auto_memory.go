@@ -648,7 +648,12 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// missing/unreadable dir collapses to an empty list.
 	existingSkills := listUserSkillNames(userSkillsDir)
 
-	prompt := buildExtractorPrompt(e.memdirRoot, manifest, existingSkills)
+	// Gated consolidation input: cheap deterministic overlap detection
+	// nominates near-duplicate clusters. Empty result (the common case) →
+	// no consolidation section in the prompt → no aux-model merge work.
+	overlaps := skills.DetectOverlaps(userSkillsDir)
+
+	prompt := buildExtractorPrompt(e.memdirRoot, manifest, existingSkills, overlaps)
 
 	gate := CreateAutoMemCanUseTool(e.memdirRoot, dreamReg)
 
@@ -938,7 +943,7 @@ func listUserSkillNames(dir string) []string {
 // skill names currently on disk. The dream agent uses it in the
 // Orient stage to avoid proposing a skill that already exists; if it
 // genuinely wants to revise one, it calls SkillSynth.update_skill.
-func buildExtractorPrompt(memdirRoot, manifest string, existingSkills []string) string {
+func buildExtractorPrompt(memdirRoot, manifest string, existingSkills []string, overlaps [][]string) string {
 	abs, _ := filepath.Abs(memdirRoot)
 	if abs == "" {
 		abs = memdirRoot
@@ -1002,7 +1007,8 @@ func buildExtractorPrompt(memdirRoot, manifest string, existingSkills []string) 
 		sb.WriteString("Tool actions:\n")
 		sb.WriteString("- `SkillSynth(action=\"list_user_skills\")` — see what you've already saved\n")
 		sb.WriteString("- `SkillSynth(action=\"create_skill\", name=\"<kebab-case>\", description=\"...\", when_to_use=\"...\", body=\"# Title\\n\\nSteps...\")` — new skill\n")
-		sb.WriteString("- `SkillSynth(action=\"update_skill\", name=\"<existing>\", body=\"...\")` — revise body only (frontmatter preserved)\n\n")
+		sb.WriteString("- `SkillSynth(action=\"update_skill\", name=\"<existing>\", body=\"...\")` — revise body only (frontmatter preserved)\n")
+		sb.WriteString("- `SkillSynth(action=\"archive_skill\", name=\"<existing>\")` — retire a redundant skill (recoverable)\n\n")
 		if len(existingSkills) > 0 {
 			sb.WriteString("Already on disk: ")
 			sb.WriteString(strings.Join(existingSkills, ", "))
@@ -1011,6 +1017,21 @@ func buildExtractorPrompt(memdirRoot, manifest string, existingSkills []string) 
 			sb.WriteString("No user-layer skills exist yet — this is the first dream cycle.\n\n")
 		}
 		sb.WriteString("**Skill threshold**: only synthesize a skill when the workflow is concrete enough that a single 3-7 step recipe captures it. *Generic advice* (\"use proper error handling\") is NOT a skill. *Specific recipes* (\"to add a new ZF feature flag: edit etc/feature_flags.toml, regenerate enum, run goalfy-spec\") ARE skills.\n\n")
+
+		// Consolidation pass (gated): only injected when deterministic
+		// overlap detection found near-duplicate clusters, so the aux-model
+		// isn't asked to scan-and-merge the whole library every dream. The
+		// agent decides whether the cluster is truly redundant — detection
+		// only nominates candidates.
+		if len(overlaps) > 0 {
+			sb.WriteString("**Consolidation (these skills look redundant)**:\n\n")
+			for _, cluster := range overlaps {
+				sb.WriteString("- ")
+				sb.WriteString(strings.Join(cluster, ", "))
+				sb.WriteString("\n")
+			}
+			sb.WriteString("\nFor each cluster above, read the skills (Read their .md files). If they genuinely cover the same procedure, merge them: `create_skill` (or `update_skill`) ONE umbrella skill that captures the union, then `archive_skill` the others. If they're actually distinct, leave them and optionally sharpen each skill's `dont_use_when` so they stop looking alike. Never archive a skill without first folding its content into a survivor.\n\n")
+		}
 	}
 	sb.WriteString("Begin.")
 	return sb.String()

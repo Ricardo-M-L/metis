@@ -3059,7 +3059,7 @@ func cmdSkillsCurator(args []string, skillDir string) error {
 	}
 	switch sub {
 	case "status":
-		cands, err := c.IdleCandidates(time.Now())
+		active, idle, cands, err := c.LifecycleStates(time.Now())
 		if err != nil {
 			return err
 		}
@@ -3071,7 +3071,10 @@ func cmdSkillsCurator(args []string, skillDir string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("skill curator (idle window: %d days)\n", skills.CuratorIdleDaysDefault)
+		fmt.Printf("skill curator (idle after %d days, archive after %d days)\n",
+			skills.CuratorIdleStateDaysDefault, skills.CuratorIdleDaysDefault)
+		fmt.Printf("  active:             %d%s\n", len(active), formatNameList(active))
+		fmt.Printf("  idle:               %d%s\n", len(idle), formatNameList(idle))
 		fmt.Printf("  archive candidates: %d%s\n", len(cands), formatNameList(cands))
 		fmt.Printf("  pinned:             %d%s\n", len(pins), formatNameList(pins))
 		fmt.Printf("  archived:           %d%s\n", len(archived), formatNameList(archived))

@@ -44,10 +44,15 @@ import (
 )
 
 const (
-	// CuratorIdleDaysDefault matches hermes' 90-day idle window. Tuned to
+	// CuratorIdleDaysDefault matches hermes' 90-day archive window. Tuned to
 	// be conservative: a skill must go untouched (neither re-synthesized
 	// nor invoked) for a full quarter before it's archived.
 	CuratorIdleDaysDefault = 90
+
+	// CuratorIdleStateDaysDefault is the boundary between ACTIVE and IDLE
+	// lifecycle states — a skill quiet this long is "idle" (a retirement
+	// candidate the user can see in `curator status`) but not yet archived.
+	CuratorIdleStateDaysDefault = 21
 
 	curatorArchiveDir = ".archive"          // <root>/.archive/
 	curatorPinsFile   = ".curator-pins.json" // <root>/.curator-pins.json
@@ -56,23 +61,46 @@ const (
 // Curator archives idle agent-created skills under a user-skills root.
 // Stateless apart from the root path + tuning; safe to construct per-call.
 type Curator struct {
-	root     string
-	idleDays int
+	root      string
+	idleDays  int // ARCHIVE threshold: quiet this long → archived
+	stateDays int // IDLE threshold: quiet this long → idle (but not yet archived)
+	usage     *UsageStore
 }
 
 // NewCurator returns a Curator for the given user-skills root (typically
-// ~/.metis/skills) with the default idle window.
+// ~/.metis/skills) with the default windows.
 func NewCurator(root string) *Curator {
-	return &Curator{root: root, idleDays: CuratorIdleDaysDefault}
+	return &Curator{
+		root:      root,
+		idleDays:  CuratorIdleDaysDefault,
+		stateDays: CuratorIdleStateDaysDefault,
+		usage:     NewUsageStore(root),
+	}
 }
 
-// WithIdleDays overrides the idle window (days). Non-positive values are
+// WithIdleDays overrides the archive window (days). Non-positive values are
 // ignored so a misconfigured 0 can't archive every skill on the next sweep.
 func (c *Curator) WithIdleDays(d int) *Curator {
 	if d > 0 {
 		c.idleDays = d
 	}
 	return c
+}
+
+// activity returns the freshness anchor for a skill: the newest of its
+// usage-store activity (use/view/patch/created) and the file mtime. The
+// usage store is the richer signal; the mtime fallback keeps legacy flat
+// .md skills (created before the usage store) and hand-created files aging
+// correctly.
+func (c *Curator) activity(name string, modTime time.Time) time.Time {
+	if c.usage != nil {
+		if r, ok := c.usage.Get(name); ok {
+			if act, ok2 := r.LatestActivity(); ok2 && act.After(modTime) {
+				return act
+			}
+		}
+	}
+	return modTime
 }
 
 // CuratorResult summarises a Sweep.
@@ -150,7 +178,7 @@ func (c *Curator) Sweep(now time.Time) (CuratorResult, error) {
 			res.Pinned++
 			continue
 		}
-		if now.Sub(sk.modTime) < cutoff {
+		if now.Sub(c.activity(sk.name, sk.modTime)) < cutoff {
 			res.Skipped++
 			continue
 		}
@@ -178,13 +206,47 @@ func (c *Curator) IdleCandidates(now time.Time) ([]string, error) {
 	cutoff := time.Duration(c.idleDays) * 24 * time.Hour
 	var out []string
 	for _, sk := range cands {
-		if pins[sk.name] || now.Sub(sk.modTime) < cutoff {
+		if pins[sk.name] || now.Sub(c.activity(sk.name, sk.modTime)) < cutoff {
 			continue
 		}
 		out = append(out, sk.name)
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// LifecycleStates buckets eligible (agent-created, non-pinned) skills by
+// derived state at `now`: active (recently touched), idle (quiet past the
+// idle window but not yet old enough to retire), and candidates (quiet
+// past the archive window — a Sweep will retire these). Powers the
+// richer `curator status` view.
+func (c *Curator) LifecycleStates(now time.Time) (active, idle, candidates []string, err error) {
+	cands, pins, err := c.scan()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	idleAfter := time.Duration(c.stateDays) * 24 * time.Hour
+	archiveAfter := time.Duration(c.idleDays) * 24 * time.Hour
+	for _, sk := range cands {
+		if pins[sk.name] {
+			continue
+		}
+		// Same boundary logic as usage.DeriveState (via the shared
+		// stateForAge helper), but anchored on the blended activity time
+		// (usage record max file mtime) rather than the record alone.
+		switch stateForAge(now.Sub(c.activity(sk.name, sk.modTime)), idleAfter, archiveAfter) {
+		case StateArchived:
+			candidates = append(candidates, sk.name)
+		case StateIdle:
+			idle = append(idle, sk.name)
+		default:
+			active = append(active, sk.name)
+		}
+	}
+	sort.Strings(active)
+	sort.Strings(idle)
+	sort.Strings(candidates)
+	return active, idle, candidates, nil
 }
 
 type curatorSkill struct {
@@ -260,6 +322,31 @@ func (c *Curator) archive(name string) error {
 		dst = filepath.Join(archDir, fmt.Sprintf("%s.%d%s", name, time.Now().Unix(), ext))
 	}
 	return os.Rename(src, dst)
+}
+
+// Archive retires a live skill on demand (validated). Exposed so the
+// dreaming subagent's consolidation pass can retire a skill it merged into
+// an umbrella, and so callers other than Sweep (which uses the internal
+// archive) can trigger a single recoverable retirement.
+//
+// Refuses to archive a pinned skill — pins are the user's explicit "never
+// auto-retire this" and must hold on the on-demand path too, not just in
+// Sweep. Without this a consolidation pass could archive a pinned skill.
+func (c *Curator) Archive(name string) error {
+	if err := validateSkillName(name); err != nil {
+		return err
+	}
+	if c.root == "" {
+		return errors.New("skills curator: empty root")
+	}
+	pins, err := c.loadPins()
+	if err != nil {
+		return err
+	}
+	if pins[name] {
+		return fmt.Errorf("skills curator: %q is pinned — unpin before archiving", name)
+	}
+	return c.archive(name)
 }
 
 // Restore moves an archived skill back into the active root. Refuses to
@@ -387,9 +474,6 @@ func (c *Curator) loadPins() (map[string]bool, error) {
 }
 
 func (c *Curator) savePins(pins map[string]bool) error {
-	if err := os.MkdirAll(c.root, 0o755); err != nil {
-		return err
-	}
 	names := make([]string, 0, len(pins))
 	for n := range pins {
 		names = append(names, n)
@@ -399,5 +483,8 @@ func (c *Curator) savePins(pins map[string]bool) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(c.root, curatorPinsFile), data, 0o644)
+	// Atomic write (shared helper): pins are a safety gate — a torn read
+	// that reset them to empty would un-protect every pinned skill right
+	// before a Sweep, worse than losing advisory usage history.
+	return atomicWriteFile(filepath.Join(c.root, curatorPinsFile), data)
 }
