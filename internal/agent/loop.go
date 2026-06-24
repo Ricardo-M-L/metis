@@ -42,7 +42,14 @@ type Loop struct {
 	Registry *tools.Registry
 	Gate     *permission.Gate
 	Hooks    *HookRegistry
-	System   string
+
+	// TimingSink, when set, is called with each tool's measured execution
+	// time (name, elapsed, isError). The runtime wires it to the session's
+	// timing sidecar so `metis sessions timing <id>` can show per-step
+	// durations after the fact. nil = not recorded.
+	TimingSink func(tool string, elapsed time.Duration, isError bool)
+
+	System string
 	// SystemSections is the typed-section form of the system prompt.
 	// When non-empty, buildRequest passes it through llm.Request so the
 	// Anthropic provider can emit per-section cache_control. Memory

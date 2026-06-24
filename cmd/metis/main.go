@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -109,6 +110,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdProjects(args[1:])
 	case "tools":
 		return cmdTools(args[1:])
+	case "schema":
+		return cmdSchema(args[1:])
 	case "models":
 		return cmdModels(ctx, args[1:])
 	case "sessions":
@@ -270,10 +273,12 @@ Usage:
   metis config show     Print effective config + which files were read
   metis config init     Write a starter config to ~/.metis/config.toml
   metis tools           List available tools
+  metis schema          Print the tool contract (JSON Schema) — the SDK's typed surface
   metis models          List LLM providers + models from models.dev catalog
   metis models <p>      Show one provider's models + capabilities + cost
   metis models <p> <m>  Deep-dive on a model + generate config.toml snippet
   metis sessions list   List recent saved sessions
+  metis sessions timing <id>      Per-step timing breakdown of a past session
   metis sessions export <id>      Print a session's JSONL to stdout
   metis sessions import [--id ID] Read JSONL from stdin and create a new session
   metis skills list     List built-in skills library
@@ -1306,6 +1311,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.sessionName != "" {
 		_ = store.SetTitle(rt.sessionID, flags.sessionName)
 	}
+	// Wire per-step tool timing into this session's sidecar so
+	// `metis sessions timing <id>` can show where the run spent its
+	// wall-clock time after the fact. Best-effort + cheap; appends one
+	// JSONL line per tool call.
+	loop.TimingSink = store.NewTimingRecorder(rt.sessionID).Record
+
 	// Tell the tasks pkg what session id is current so TodoWrite /
 	// TodoRead persist into the right per-session file. Done last so a
 	// resume failure above doesn't leave a stale id in the singleton.
@@ -2818,54 +2829,39 @@ func cmdTools(args []string) error {
 	if err != nil {
 		return err
 	}
+	reg := buildListingRegistry(cfg, allowFlag, denyFlag)
+	for _, t := range reg.All() {
+		fmt.Printf("%-15s  %s\n", t.Name(), t.Description())
+	}
+	return nil
+}
+
+// buildListingRegistry assembles the full informational tool registry the
+// user would see in a chat — every builtin + sub-agent + memory/cron/etc.
+// tool wired against stubs — with the same visibility filter the chat REPL
+// applies. Shared by `metis tools` (human listing) and `metis schema`
+// (machine-readable contract) so both advertise the identical tool surface.
+func buildListingRegistry(cfg *config.Config, allowFlag, denyFlag string) *tools.Registry {
 	gate := permission.New("ask")
 	reg := tools.NewRegistry()
 	builtin.Register(reg, cfg, gate)
-	// Show the Agent tool for completeness even though Execute will error
-	// without a real provider — this is just an informational listing.
 	reg.Register(builtin.NewAgent(gate, nil, reg, "", ""))
-	// Fork (warm-start sub-agent) — same informational-listing path.
-	// Real wiring lives in runtime.tools.go for live sessions.
 	reg.Register(builtin.NewFork(gate, nil, reg))
-	// SubAgent reader tools (G.1, 2026-05-12) — listing them so the user
-	// sees the full background-sub-agent surface area, even though
-	// Execute will refuse (no Roster wired in this code path).
-	// G.3 adds MessageTeammate to the same family for peer messaging.
 	tmpRoster := agent.NewRoster(0, 0)
 	builtin.AttachSubAgentTools(reg, gate, tmpRoster)
 	reg.Register(builtin.NewMessageTeammate(gate, tmpRoster))
-	// Same for SendMessage — its real wiring lives in setupRuntime, but
-	// we want it visible in `metis tools` so users know the capability
-	// exists without firing up a chat session.
 	reg.Register(builtin.NewSendMessage(gate, channels.NewRegistry(), cfg.Channels.DefaultPlatform))
-	// ScheduleWakeup also needs a CronService reference at chat time;
-	// in this informational listing we point it at a stub so the tool
-	// shows up in /tools output. Calling Execute would error, but the
-	// listing should advertise the capability.
 	if cronSvc, err := agent.NewCronService(filepath.Join(cfg.Session.Dir, "cron")); err == nil {
 		reg.Register(builtin.NewScheduleWakeup(gate, cronSvc))
 	}
-	// Memory tool — same pattern, point at the real on-disk store so
-	// `/tools` listing reflects it.
 	reg.Register(builtin.NewMemory(gate, rtpkg.BuildMemoryManager(cfg)))
-	// MetisInfo — read-only introspection. Listed so users know the
-	// capability exists; live wiring (skills loader / jobs registry /
-	// snapshot) only happens in setupRuntime / chat sessions.
 	reg.Register(builtin.NewMetisInfo(gate, cfg, nil, nil, reg))
-	// EnterPlanMode / ExitPlanMode — list for `metis tools` parity
-	// with the chat REPL registration above. Production wiring passes
-	// the gate so plan-mode entry/exit also flips Gate.Mode (the
-	// listener bridges Gate→Loop).
 	reg.Register(builtin.NewEnterPlanModeWithGate(gate))
 	reg.Register(builtin.NewExitPlanModeWithGate(gate))
-	// G.8 — if the user is previewing tool availability under
-	// METIS_COORDINATOR_MODE=1, apply the same filter the chat REPL
-	// would. Stubs replace mutation tools so the listing shows the
-	// "disabled in coordinator mode" hint instead of the real desc.
 	rtpkg.FilterRegistryInPlace(reg)
 
-	// Mirror setupRuntime's visibility merge so `metis tools --tools X
-	// --disallow-tools Y` previews the exact pool a chat would expose.
+	// Mirror setupRuntime's visibility merge so a `--tools X --disallow-tools
+	// Y` preview matches the exact pool a chat would expose.
 	allowVis := tools.SplitCSV(allowFlag)
 	if len(allowVis) == 0 {
 		allowVis = cfg.Tools.Allowed
@@ -2873,11 +2869,50 @@ func cmdTools(args []string) error {
 	denyVis := append([]string(nil), cfg.Tools.Disallowed...)
 	denyVis = append(denyVis, tools.SplitCSV(denyFlag)...)
 	tools.ApplyToolVisibility(reg, allowVis, denyVis)
+	return reg
+}
 
-	for _, t := range reg.All() {
-		fmt.Printf("%-15s  %s\n", t.Name(), t.Description())
+// cmdSchema prints the machine-readable tool contract — every tool's name,
+// description, and JSON-Schema input — as one JSON document. This is metis'
+// analogue of Claude Code's generated sdk-tools.d.ts: the stable, typed
+// surface a client SDK (any language) consumes so it and the agent never
+// drift on tool shapes. Generated from the live tool registry, so it's
+// always in sync with what `metis acp` / `metis chat` actually expose.
+func cmdSchema(args []string) error {
+	fs := flag.NewFlagSet("metis schema", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var allowFlag, denyFlag string
+	fs.StringVar(&allowFlag, "tools", "", "allowlist (same grammar as `metis chat --tools`)")
+	fs.StringVar(&denyFlag, "disallow-tools", "", "blocklist (same grammar as `metis chat --disallow-tools`)")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	return nil
+	cfg, _, err := config.Load()
+	if err != nil {
+		return err
+	}
+	reg := buildListingRegistry(cfg, allowFlag, denyFlag)
+
+	type toolContract struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description"`
+		InputSchema map[string]any `json:"input_schema"`
+	}
+	out := make([]toolContract, 0, len(reg.All()))
+	for _, t := range reg.All() {
+		out = append(out, toolContract{
+			Name:        t.Name(),
+			Description: t.Description(),
+			InputSchema: t.InputSchema(),
+		})
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{
+		"metis_version": version.Version,
+		"protocol":      "acp",
+		"tools":         out,
+	})
 }
 
 func cmdSessions(args []string) error {
@@ -2962,8 +2997,103 @@ func cmdSessions(args []string) error {
 		}
 		fmt.Println(newID)
 		return nil
+	case "timing":
+		if len(args) < 2 {
+			return errors.New("usage: metis sessions timing <id>")
+		}
+		return printSessionTiming(store, args[1])
 	}
 	return fmt.Errorf("sessions: unknown subcommand %q", sub)
+}
+
+// printSessionTiming renders a past session's per-step timing: a timeline
+// of every tool call with its duration (slowest flagged) plus a /cost-style
+// totals footer (wall clock, total tool time, per-tool breakdown). The data
+// comes from the session's timing sidecar, written live by the Loop's
+// TimingSink.
+func printSessionTiming(store *session.Store, id string) error {
+	steps, err := store.ReadTiming(id)
+	if err != nil {
+		return err
+	}
+	if len(steps) == 0 {
+		fmt.Printf("no timing recorded for session %s\n", id)
+		fmt.Println("(timing is captured for runs after this feature shipped; older sessions have none)")
+		return nil
+	}
+
+	// Header (created_at) for wall-clock context, best-effort.
+	var created time.Time
+	if hdr, _, lerr := store.Load(id); lerr == nil && hdr != nil {
+		created = hdr.CreatedAt
+	}
+
+	fmt.Printf("session %s — %d tool steps\n", id, len(steps))
+	fmt.Println("────────────────────────────────────────────────────────")
+
+	var total time.Duration
+	perTool := map[string]time.Duration{}
+	perToolN := map[string]int{}
+	var slowest session.TimingStep
+	for _, s := range steps {
+		d := time.Duration(s.ElapsedMS) * time.Millisecond
+		total += d
+		perTool[s.Tool] += d
+		perToolN[s.Tool]++
+		if s.ElapsedMS > slowest.ElapsedMS {
+			slowest = s
+		}
+	}
+	for i, s := range steps {
+		mark := "  "
+		if s.Tool == slowest.Tool && s.ElapsedMS == slowest.ElapsedMS {
+			mark = "▲ " // slowest step
+		}
+		errMark := ""
+		if s.IsError {
+			errMark = " [error]"
+		}
+		fmt.Printf("%s%3d. %-16s %8s%s\n", mark, i+1, s.Tool,
+			formatDur(time.Duration(s.ElapsedMS)*time.Millisecond), errMark)
+	}
+
+	fmt.Println("────────────────────────────────────────────────────────")
+	// Per-tool breakdown, sorted by total time descending.
+	type row struct {
+		tool string
+		d    time.Duration
+		n    int
+	}
+	rows := make([]row, 0, len(perTool))
+	for t, d := range perTool {
+		rows = append(rows, row{t, d, perToolN[t]})
+	}
+	sort.Slice(rows, func(a, b int) bool { return rows[a].d > rows[b].d })
+	fmt.Println("by tool (total time):")
+	for _, r := range rows {
+		fmt.Printf("  %-16s %8s  ×%d\n", r.tool, formatDur(r.d), r.n)
+	}
+
+	fmt.Println("────────────────────────────────────────────────────────")
+	fmt.Printf("total tool time:  %s across %d calls\n", formatDur(total), len(steps))
+	fmt.Printf("slowest step:     %s (%s)\n", slowest.Tool, formatDur(time.Duration(slowest.ElapsedMS)*time.Millisecond))
+	if !created.IsZero() {
+		fmt.Printf("session started:  %s\n", created.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Println("(LLM round timing + token cost for the LIVE session: use /cost in chat)")
+	return nil
+}
+
+// formatDur renders a duration compactly: 12ms / 1.4s / 2m3s.
+func formatDur(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	case d < time.Minute:
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	default:
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
 }
 
 // atoiSafe parses an int without pulling strconv across the file's

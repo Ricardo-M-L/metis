@@ -515,6 +515,12 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	execStart := time.Now()
 	res, err := safeToolExecute(toolCtx, t, blk.ToolInput)
 	execElapsed := time.Since(execStart)
+	// Persist per-step timing to the session sidecar (best-effort). This is
+	// the single chokepoint every path's tool calls pass through, so one
+	// hook covers TUI / headless / cron / sub-agents.
+	if l.TimingSink != nil {
+		l.TimingSink(blk.ToolName, execElapsed, err != nil || (res != nil && res.IsError))
+	}
 	if l.Detector != nil {
 		l.Detector.Record(blk.ToolName, blk.ToolInput)
 	}
