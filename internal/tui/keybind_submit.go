@@ -59,15 +59,14 @@ func (m *Model) openBodyScreen(command, body string) {
 // pattern of "modal for browseable content, inline for confirmations".
 var modalCommands = map[string]bool{
 	"help":   true,
-	"cost":   true,
-	"tokens": true,
 	"doctor": true,
-	// "context" intentionally NOT modal — claude-code parity (2026-05-11
-	// user request, image #1): /context renders inline as a chat-style
-	// info message so it stays in the transcript and the user doesn't
-	// need to press Esc to return to typing. The renderer
-	// (render_info.go::renderContext) is grid-shaped but fits inline
-	// fine; long output is just scrolled past like any other long reply.
+	// "context" / "cost" / "tokens" intentionally NOT modal — claude-code
+	// parity (2026-05-11 image #1 for /context, 2026-06-24 image #4 for
+	// /cost): short status/info commands render inline as a chat-style info
+	// message so the conversation stays visible and the user doesn't need to
+	// press Esc to return to typing. Only browsable lists (tools, skills,
+	// stats…) and interactive pickers stay modal. The renderers
+	// (render_info.go::renderCost etc.) are box-shaped but fit inline fine.
 	"stats":       true,
 	"keybindings": true,
 	"permissions": true,
@@ -548,12 +547,12 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			ps.Resize(m.width, m.height)
 			m.activeScreen = ps
 		case slash.SignalSession:
-			m.openBodyScreen("/session", renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())))
+			m.messages = append(m.messages, Message{Role: "info", Content: renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())), Timestamp: time.Now()})
 		case slash.SignalStatus:
 			// Reuse renderCurrentSession — same data the user wants from
-			// /status. Was previously falling through to default which
-			// only showed the placeholder "(status: see REPL)".
-			m.openBodyScreen("/status", renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())))
+			// /status. Inline (not modal) so the transcript stays visible —
+			// claude-code parity (image #4).
+			m.messages = append(m.messages, Message{Role: "info", Content: renderCurrentSession(m.session, m.sessionID, m.loop, m.model, string(m.gate.Mode())), Timestamp: time.Now()})
 		case slash.SignalSkills:
 			items := m.skillsPickerItems()
 			ps := screen.NewPickerScreen("/skills", pickerSubtitle("skills loaded", len(items)), items)
@@ -596,9 +595,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				}
 			}
 		case slash.SignalCost:
-			m.openBodyScreen("/cost", renderCost(m))
+			m.messages = append(m.messages, Message{Role: "info", Content: renderCost(m), Timestamp: time.Now()})
 		case slash.SignalDiff:
-			m.openBodyScreen("/diff", renderDiff(m))
+			m.messages = append(m.messages, Message{Role: "info", Content: renderDiff(m), Timestamp: time.Now()})
 		case slash.SignalDoctor:
 			m.openBodyScreen("/doctor", renderDoctor(m))
 		case slash.SignalStats:

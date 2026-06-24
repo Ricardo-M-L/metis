@@ -13,14 +13,12 @@ import (
 func TestModalDispatch_REPLCommand(t *testing.T) {
 	cases := []string{
 		"help",
-		"cost",
-		"tokens",
 		"doctor",
-		// "context" intentionally removed from this list 2026-05-11 —
-		// /context now renders inline as a chat message (claude-code
-		// parity, user image #1) so the user can scroll past instead
-		// of pressing Esc. Inline coverage is in
-		// TestContextRendersInline below.
+		// "context" (2026-05-11, image #1) and "cost"/"tokens" (2026-06-24,
+		// image #4) intentionally removed from this list — they now render
+		// inline as chat messages (claude-code parity) so the conversation
+		// stays visible and the user doesn't press Esc to return to typing.
+		// Inline coverage is in TestInfoCommandsRenderInline below.
 		"env",
 		"version",
 	}
@@ -111,5 +109,26 @@ func TestContextRendersInline(t *testing.T) {
 	}
 	if !strings.Contains(last.Content, "Context Usage") {
 		t.Errorf("/context output should contain 'Context Usage' header; got: %q", last.Content)
+	}
+}
+
+// TestInfoCommandsRenderInline — short status/info commands (/cost, /tokens)
+// render inline in the transcript rather than opening a modal overlay that
+// hides the conversation (claude-code parity, 2026-06-24 image #4).
+func TestInfoCommandsRenderInline(t *testing.T) {
+	for _, name := range []string{"cost", "tokens"} {
+		t.Run("/"+name, func(t *testing.T) {
+			m := newSlashTestModel(t)
+			before := len(m.messages)
+			m.input.SetValue("/" + name)
+			pressEnter(t, m)
+
+			if m.activeScreen != nil {
+				t.Errorf("/%s should NOT open a screen overlay; got activeScreen=%T", name, m.activeScreen)
+			}
+			if len(m.messages) <= before {
+				t.Errorf("/%s should append at least one inline message; before=%d after=%d", name, before, len(m.messages))
+			}
+		})
 	}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
 func (m *Model) handleAgentEvent(ev agent.Event) {
@@ -240,6 +241,14 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		m.askUserInput = newAskUserInput()
 	case agent.EventTokens:
 		m.totalTokens.add(ev.InputTokens, ev.OutputTokens, ev.CacheCreationInputTokens, ev.CacheReadInputTokens)
+		// Persist cumulative cost so /cost survives a resume. Best-effort;
+		// a tiny overwrite per LLM call, negligible next to the round-trip.
+		if m.session != nil && m.sessionID != "" {
+			in, out, cc, cr := m.totalTokens.Snapshot()
+			_ = m.session.WriteCost(m.sessionID, session.CostSnapshot{
+				InputTokens: in, OutputTokens: out, CacheCreateTokens: cc, CacheReadTokens: cr,
+			})
+		}
 	case agent.EventTurnEnd:
 		// Flush any in-flight thinking/streaming text before the turn
 		// closes so the final reply appears in the transcript. Without

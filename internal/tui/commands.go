@@ -1948,6 +1948,24 @@ func (t *tokenTracker) Reset() {
 	t.dispOut = 0
 }
 
+// Snapshot returns the cumulative session totals — for persisting cost
+// across a resume.
+func (t *tokenTracker) Snapshot() (in, out, cacheCreate, cacheRead int) {
+	return t.in, t.out, t.cacheCreate, t.cacheRead
+}
+
+// Restore seeds the cumulative totals from a persisted snapshot so a
+// resumed session's /cost reflects pre-resume spend (claude-code parity —
+// CC stores/restores session cost via project config). The display values
+// are set to match so the restored totals show immediately rather than
+// animating up from zero. last* (per-turn) stay zero — there's no "most
+// recent call" until the next turn runs.
+func (t *tokenTracker) Restore(in, out, cacheCreate, cacheRead int) {
+	t.in, t.out = in, out
+	t.cacheCreate, t.cacheRead = cacheCreate, cacheRead
+	t.dispIn, t.dispOut = in, out
+}
+
 // Animate nudges the displayed counters one step closer to the actual
 // counts. Safe to call on every spinner tick — it's a no-op when the
 // gap is zero.

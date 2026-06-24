@@ -70,6 +70,51 @@ func (r *TimingRecorder) Record(tool string, elapsed time.Duration, isError bool
 	_, _ = f.Write(append(b, '\n'))
 }
 
+// CostSnapshot is a session's cumulative token usage, persisted so /cost
+// survives a resume (the conversation JSONL restores messages but not the
+// running token tally). Mirrors what Claude Code stashes in project config.
+type CostSnapshot struct {
+	InputTokens       int `json:"input_tokens"`
+	OutputTokens      int `json:"output_tokens"`
+	CacheCreateTokens int `json:"cache_create_tokens"`
+	CacheReadTokens   int `json:"cache_read_tokens"`
+}
+
+func (s *Store) costPath(id string) string {
+	return filepath.Join(s.Dir, filepath.Base(id)+".cost.json")
+}
+
+// WriteCost overwrites the session's cost sidecar with the latest totals.
+// Atomic (temp+rename) so a concurrent reader never sees a half-written
+// file. Best-effort at the call site — cost is diagnostic.
+func (s *Store) WriteCost(id string, c CostSnapshot) error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	tmp := s.costPath(id) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.costPath(id))
+}
+
+// ReadCost loads the session's persisted cost. ok=false (no error) when the
+// session has no cost sidecar (pre-feature sessions, or none written yet).
+func (s *Store) ReadCost(id string) (c CostSnapshot, ok bool, err error) {
+	data, rerr := os.ReadFile(s.costPath(id))
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return CostSnapshot{}, false, nil
+		}
+		return CostSnapshot{}, false, rerr
+	}
+	if jerr := json.Unmarshal(data, &c); jerr != nil {
+		return CostSnapshot{}, false, nil // corrupt → treat as absent
+	}
+	return c, true, nil
+}
+
 // ReadTiming loads a session's recorded steps in order. Returns nil (no
 // error) when the session has no timing sidecar.
 func (s *Store) ReadTiming(id string) ([]TimingStep, error) {

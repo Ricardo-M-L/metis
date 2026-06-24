@@ -237,8 +237,21 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// left edge with the other roles (✗ for error, ✓ for success,
 		// ⚠ for warning). Without the prefix the eye lost the column
 		// and info messages floated awkwardly.
-		s.WriteString(styleMuted.Render("  · " + msg.Content))
-		s.WriteString("\n")
+		//
+		// 2026-06-24 (image #5): multi-line info — the /cost and /context
+		// boxes that now render inline — must keep EVERY line at the same
+		// left edge, or a bordered block's top/left borders shift out of
+		// alignment (only line 1 used to get the "  · " prefix). Indent
+		// continuation lines by the same 4-column width as the prefix so a
+		// box stays square.
+		for i, line := range strings.Split(msg.Content, "\n") {
+			if i == 0 {
+				s.WriteString(styleMuted.Render("  · " + line))
+			} else {
+				s.WriteString(styleMuted.Render("    " + line))
+			}
+			s.WriteString("\n")
+		}
 	case "plan-proposal":
 		// ExitPlanMode emits the full plan markdown as EventInfo with
 		// a "[plan proposal]\n..." prefix. Before 2026-05-21 it

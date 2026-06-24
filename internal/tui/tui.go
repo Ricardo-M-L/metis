@@ -756,6 +756,15 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 	// opens a blank chat even though the LLM has full context.
 	// No-op for fresh sessions (loop.Messages is empty).
 	mdl.hydrateFromLoopHistory()
+	// Restore the persisted cumulative cost so a resumed session's /cost
+	// reflects pre-resume spend — the conversation hydrates above, but the
+	// token tally would otherwise start at zero (image #5). No-op for fresh
+	// sessions or ones with no cost sidecar yet.
+	if st != nil && sid != "" {
+		if c, ok, _ := st.ReadCost(sid); ok {
+			mdl.totalTokens.Restore(c.InputTokens, c.OutputTokens, c.CacheCreateTokens, c.CacheReadTokens)
+		}
+	}
 	// Default thinking display mode = "auto" (collapsed with
 	// ctrl+o-to-expand for normal thinking, 🔒 placeholder for
 	// redacted). User flips it via /thinking show / hide / auto.
