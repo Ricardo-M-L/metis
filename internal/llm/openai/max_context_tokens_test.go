@@ -56,10 +56,10 @@ func TestMaxContextTokens_VendorPublishedDefaults(t *testing.T) {
 		{"GLM-4-Plus", 128_000},
 		{"glm-4-flash", 128_000},
 		{"glm-4.5", 128_000},
-		{"glm-4.6", 200_000},   // 2025 bump (per z.ai docs)
-		{"glm-4.7", 200_000},   // 2026 release; Flash same window
+		{"glm-4.6", 200_000}, // 2025 bump (per z.ai docs)
+		{"glm-4.7", 200_000}, // 2026 release; Flash same window
 		{"glm-4.7-flash", 200_000},
-		{"glm-5.1", 200_000},   // 2026-04-07 release; docs.bigmodel.cn confirms 200K
+		{"glm-5.1", 200_000}, // 2026-04-07 release; docs.bigmodel.cn confirms 200K
 		{"GLM-5.1", 200_000},
 
 		// MiniMax via openai_chat (rare but valid)

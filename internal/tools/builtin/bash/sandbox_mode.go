@@ -34,9 +34,10 @@ const (
 // is "no sandbox", which matches the historical default.
 //
 // Accepted aliases (case-insensitive):
-//   off / disabled / none           → off
-//   permissions / on / enabled      → permissions
-//   auto-allow / autoallow / auto   → auto-allow
+//
+//	off / disabled / none           → off
+//	permissions / on / enabled      → permissions
+//	auto-allow / autoallow / auto   → auto-allow
 func NormalizeSandboxMode(mode string) string {
 	switch mode {
 	case "", SandboxModeOff, "disabled", "none":

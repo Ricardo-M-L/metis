@@ -335,7 +335,6 @@ func idOf(all []*taskstore.Task, _ *taskstore.TaskStatus) string {
 	return "?"
 }
 
-
 // --- TaskOutput ---
 
 type TaskOutput struct {

@@ -128,11 +128,11 @@ func TestStatusBar_PercentFormula(t *testing.T) {
 		input, output, cacheCreate, cacheRead, maxCtx int
 		wantPct                                       string
 	}{
-		{1000, 0, 0, 0, 100000, "(1%)"},     // 1000 / 100000
-		{50000, 0, 0, 0, 200000, "(25%)"},   // 50000 / 200000
-		{180000, 0, 0, 0, 200000, "(90%)"},  // 180000 / 200000
-		{500, 9999, 0, 99500, 200000, ""},   // cache_read inflated; numerator stays 500 (well under 1%) — see ImmuneToOverreportedCacheRead test
-		{500, 0, 9500, 0, 200000, "(5%)"},   // cache_creation IS counted: 10000 / 200000
+		{1000, 0, 0, 0, 100000, "(1%)"},    // 1000 / 100000
+		{50000, 0, 0, 0, 200000, "(25%)"},  // 50000 / 200000
+		{180000, 0, 0, 0, 200000, "(90%)"}, // 180000 / 200000
+		{500, 9999, 0, 99500, 200000, ""},  // cache_read inflated; numerator stays 500 (well under 1%) — see ImmuneToOverreportedCacheRead test
+		{500, 0, 9500, 0, 200000, "(5%)"},  // cache_creation IS counted: 10000 / 200000
 	}
 	for _, tc := range cases {
 		m := minimalModel(tc.maxCtx)

@@ -295,10 +295,12 @@ func ruleQuotedNewlineExfil(cmd string) SecurityRuleResult {
 }
 
 // hereDocStartRe matches a bash heredoc start token:
-//   `<<EOF`           — basic
-//   `<<-EOF`          — leading-tab strip variant
-//   `<<'EOF'` / `<<"EOF"` — quoted delimiter (no parameter expansion)
-//   `<<MARKER123_x`   — any identifier delimiter
+//
+//	`<<EOF`           — basic
+//	`<<-EOF`          — leading-tab strip variant
+//	`<<'EOF'` / `<<"EOF"` — quoted delimiter (no parameter expansion)
+//	`<<MARKER123_x`   — any identifier delimiter
+//
 // The DELIM token is `[A-Za-z_][A-Za-z0-9_]*`. We don't try to find
 // the closing delimiter (that would require multi-line scanning); the
 // mere presence of `<<DELIM` is enough to declare "this command has

@@ -18,10 +18,10 @@ import (
 // branch of the dispatch image-gate fires.
 type stubVisionProvider struct{ visionOK bool }
 
-func (s stubVisionProvider) Name() string                                       { return "stub" }
-func (s stubVisionProvider) ModelID() string                                    { return "stub-model" }
-func (s stubVisionProvider) MaxContextTokens() int                              { return 100_000 }
-func (s stubVisionProvider) SupportsVision() bool                               { return s.visionOK }
+func (s stubVisionProvider) Name() string          { return "stub" }
+func (s stubVisionProvider) ModelID() string       { return "stub-model" }
+func (s stubVisionProvider) MaxContextTokens() int { return 100_000 }
+func (s stubVisionProvider) SupportsVision() bool  { return s.visionOK }
 func (s stubVisionProvider) Complete(context.Context, provider.Request) (*provider.Response, error) {
 	return nil, io.EOF
 }

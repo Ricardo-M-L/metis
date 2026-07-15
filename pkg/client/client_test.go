@@ -36,10 +36,10 @@ func TestSpawn_Handshake(t *testing.T) {
 // TestEventFromMap unit-tests the wire→Event decoder without a subprocess.
 func TestEventFromMap(t *testing.T) {
 	ev := eventFromMap(map[string]any{
-		"kind":       "tool_result",
-		"tool_id":    "t1",
+		"kind":        "tool_result",
+		"tool_id":     "t1",
 		"tool_result": "ok",
-		"tool_error": true,
+		"tool_error":  true,
 	})
 	if ev.Kind != "tool_result" || ev.ToolID != "t1" || ev.ToolResult != "ok" || !ev.ToolError {
 		t.Errorf("bad decode: %+v", ev)

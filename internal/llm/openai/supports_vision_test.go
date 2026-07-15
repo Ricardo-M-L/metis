@@ -20,7 +20,7 @@ func TestSupportsVision(t *testing.T) {
 		{"o4-mini", true},
 		// Text-only / non-vision text-completion lineage
 		{"gpt-3.5-turbo", false},
-		{"gpt-4", false},  // bare gpt-4 was text-only on launch
+		{"gpt-4", false}, // bare gpt-4 was text-only on launch
 		{"text-davinci-003", false},
 		// Chinese-OSS vision flagships routed via openai_chat. The
 		// list mirrors openai.go::SupportsVision exactly — kept in

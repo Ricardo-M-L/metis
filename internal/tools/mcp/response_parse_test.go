@@ -104,8 +104,8 @@ func TestParseMCPResponse_IsErrorPropagates(t *testing.T) {
 func TestParseMCPResponse_NonEnvelopeRejected(t *testing.T) {
 	for _, raw := range []string{
 		`"just a bare string"`,
-		`{"hello":"world"}`,                       // no content key
-		`[{"type":"text","text":"naked array"}]`,  // top-level array
+		`{"hello":"world"}`,                      // no content key
+		`[{"type":"text","text":"naked array"}]`, // top-level array
 	} {
 		if _, ok := parseMCPResponse([]byte(raw)); ok {
 			t.Errorf("non-envelope %q was incorrectly accepted", raw)

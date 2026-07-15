@@ -31,14 +31,16 @@ import (
 // natural word boundary in conversational text.
 //
 // Examples that match:
-//   @screenshot.png
-//   @./relative/path/to/img.jpg
-//   @/abs/path/to/photo.webp
+//
+//	@screenshot.png
+//	@./relative/path/to/img.jpg
+//	@/abs/path/to/photo.webp
 //
 // Examples that DON'T match:
-//   @username       — no recognized image extension
-//   @file.txt       — wrong extension
-//   email@host.com  — leading char isn't whitespace/start (handled via lookbehind below)
+//
+//	@username       — no recognized image extension
+//	@file.txt       — wrong extension
+//	email@host.com  — leading char isn't whitespace/start (handled via lookbehind below)
 var atFileImagePattern = regexp.MustCompile(`(?:^|\s)@(\S+?\.(?:png|jpe?g|gif|webp|bmp))`)
 
 // expandAtFileImageBlocks scans text for `@path.png`-style image

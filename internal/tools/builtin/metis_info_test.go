@@ -14,8 +14,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
-	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
 
 // stubProvider satisfies the bare minimum of llm.Provider needed by

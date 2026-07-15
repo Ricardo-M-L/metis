@@ -42,12 +42,12 @@ func TestCmdSandbox_SetsRuntimeOverride(t *testing.T) {
 func TestCmdSandbox_AliasesAcceptedButCanonicalised(t *testing.T) {
 	resetSandboxOverride(t)
 	cases := map[string]string{
-		"on":         "permissions",
-		"enabled":    "permissions",
-		"auto":       "auto-allow",
-		"autoallow":  "auto-allow",
-		"disabled":   "off",
-		"none":       "off",
+		"on":        "permissions",
+		"enabled":   "permissions",
+		"auto":      "auto-allow",
+		"autoallow": "auto-allow",
+		"disabled":  "off",
+		"none":      "off",
 	}
 	for alias, want := range cases {
 		bash.SetRuntimeSandboxMode("")
@@ -65,7 +65,7 @@ func TestCmdSandbox_AliasesAcceptedButCanonicalised(t *testing.T) {
 func TestCmdSandbox_RejectsUnknownMode(t *testing.T) {
 	resetSandboxOverride(t)
 	bash.SetRuntimeSandboxMode("permissions") // pre-set so we can check non-clobbering
-	out := cmdSandbox(nil, "permission") // typo, no -s
+	out := cmdSandbox(nil, "permission")      // typo, no -s
 	if !strings.Contains(out, "unknown mode") {
 		t.Errorf("typo should be rejected; got %q", out)
 	}

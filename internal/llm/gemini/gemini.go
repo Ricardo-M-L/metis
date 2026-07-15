@@ -164,8 +164,9 @@ type gemGenConfig struct {
 // which avoids the thought_signature round-trip requirement that
 // gemini-3.5-flash enforces on function_call parts. metis's ContentBlock
 // doesn't yet carry the signature, so without this setting we'd see:
-//   400 Function call is missing a thought_signature in functionCall
-//       parts. This is required for tools to work correctly.
+//
+//	400 Function call is missing a thought_signature in functionCall
+//	    parts. This is required for tools to work correctly.
 //
 // Future: capture + echo thought_signature → re-enable thinking via
 // METIS_GEMINI_THINKING=low/high.
@@ -314,8 +315,9 @@ func toGemini(req Request, maxTokens int) gemReq {
 //
 // Kept fields per Google's API spec
 // (https://ai.google.dev/api/caching#Schema):
-//   type, format, description, nullable, enum, properties, required,
-//   items, minimum, maximum, minLength, maxLength, pattern, default
+//
+//	type, format, description, nullable, enum, properties, required,
+//	items, minimum, maximum, minLength, maxLength, pattern, default
 //
 // Stripped: additionalProperties, $schema, $defs, $ref, oneOf, anyOf,
 // allOf, not, examples, title, const, ...

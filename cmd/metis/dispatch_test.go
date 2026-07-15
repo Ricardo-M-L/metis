@@ -13,10 +13,10 @@ import (
 
 func TestFindEarlySubcommand_RunAfterGlobals(t *testing.T) {
 	cases := []struct {
-		name     string
-		args     []string
-		wantIdx  int
-		wantFnd  bool
+		name    string
+		args    []string
+		wantIdx int
+		wantFnd bool
 	}{
 		{"run after -p X -m Y", []string{"-p", "minimax", "-m", "MiniMax-M2.7", "run", "--mode", "ask", "hi"}, 4, true},
 		{"run at args[0]", []string{"run", "hi"}, 0, false}, // already at 0, no hoist needed (switch handles it)
@@ -47,10 +47,10 @@ func TestLooksLikeFlagOrValue(t *testing.T) {
 		idx  int
 		want bool
 	}{
-		{0, true},  // "-p" is a flag
-		{1, true},  // "minimax" is value of -p
-		{2, true},  // "-m" is a flag
-		{3, true},  // "MiniMax-M2.7" is value of -m
+		{0, true}, // "-p" is a flag
+		{1, true}, // "minimax" is value of -p
+		{2, true}, // "-m" is a flag
+		{3, true}, // "MiniMax-M2.7" is value of -m
 	}
 	for _, c := range cases {
 		if got := looksLikeFlagOrValue(args, c.idx); got != c.want {

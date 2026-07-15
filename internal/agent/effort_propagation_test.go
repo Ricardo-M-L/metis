@@ -21,7 +21,7 @@ type captureProvider struct {
 
 func (p *captureProvider) Name() string          { return "capture" }
 func (p *captureProvider) MaxContextTokens() int { return 200_000 }
-func (p *captureProvider) ModelID() string { return "" }
+func (p *captureProvider) ModelID() string       { return "" }
 func (p *captureProvider) Complete(ctx context.Context, req llm.Request) (*llm.Response, error) {
 	p.mu.Lock()
 	p.lastReq = req

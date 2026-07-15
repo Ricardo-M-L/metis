@@ -80,11 +80,11 @@ func resolveAuthHeaders(ctx context.Context, e ServerEntry) map[string]string {
 // LaunchServer auto-detects from whichever pair is populated, so
 // existing stdio-only registries continue to load unchanged.
 type ServerEntry struct {
-	Name     string            `toml:"name"`
-	Command  string            `toml:"command,omitempty"`
-	Args     []string          `toml:"args,omitempty"`
-	URL      string            `toml:"url,omitempty"`     // HTTP endpoint
-	Headers  map[string]string `toml:"headers,omitempty"` // optional HTTP auth
+	Name    string            `toml:"name"`
+	Command string            `toml:"command,omitempty"`
+	Args    []string          `toml:"args,omitempty"`
+	URL     string            `toml:"url,omitempty"`     // HTTP endpoint
+	Headers map[string]string `toml:"headers,omitempty"` // optional HTTP auth
 	// Auth selects an authentication strategy for an HTTP server. "oauth"
 	// runs the OAuth 2.0 (PKCE) flow against the server's discovered
 	// endpoints and attaches the resulting Bearer token; the token is

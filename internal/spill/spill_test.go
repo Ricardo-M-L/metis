@@ -4,8 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unicode/utf8"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestStoreWritesAndStubs(t *testing.T) {

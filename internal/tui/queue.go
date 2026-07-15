@@ -69,9 +69,9 @@ func (p QueuePriority) effective() QueuePriority {
 // dequeue order; QueuedAt is a monotonic seq from Model.queueClock,
 // used as a deterministic tiebreaker within a priority bucket.
 type queuedItem struct {
-	Text      string
-	Priority  QueuePriority
-	QueuedAt  uint64
+	Text     string
+	Priority QueuePriority
+	QueuedAt uint64
 }
 
 // enqueueQueuedItem appends one item to the model's queue, stamping

@@ -27,13 +27,13 @@ func TestParseModelWindowSuffix_AllVendorConventions(t *testing.T) {
 		{"Moonshot-V1-128K", 128_000, true},
 
 		// Negative cases — no suffix or non-window k/m inside body.
-		{"deepseek-v4-pro", 0, false},      // "pro" isn't a number
-		{"claude-opus-4-7", 0, false},      // numeric segment but no k/m
-		{"kimi-k2-instruct", 0, false},     // "k2" is family, not "-2k"
-		{"gpt-4o-mini", 0, false},          // contains 'o' but no suffix
-		{"", 0, false},                     // empty
+		{"deepseek-v4-pro", 0, false},       // "pro" isn't a number
+		{"claude-opus-4-7", 0, false},       // numeric segment but no k/m
+		{"kimi-k2-instruct", 0, false},      // "k2" is family, not "-2k"
+		{"gpt-4o-mini", 0, false},           // contains 'o' but no suffix
+		{"", 0, false},                      // empty
 		{"32k-prefix-not-suffix", 0, false}, // suffix-only rule
-		{"-5k", 5_000, true},               // bare "-Nk" still matches by spec — caller filters
+		{"-5k", 5_000, true},                // bare "-Nk" still matches by spec — caller filters
 	}
 	for _, c := range cases {
 		got, ok := ParseModelWindowSuffix(c.in)

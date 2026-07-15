@@ -67,10 +67,10 @@ const stickyContentWidth = 60
 //
 // Output shape (3 in-progress + 2 pending + 5 completed example):
 //
-//	  tasks  ◼ Refactor auth gate · ◼ Wire MFA fallback
-//	         ◻ Add session timeout tests
-//	         ◻ Update docs
-//	         ✔ 5 done
+//	tasks  ◼ Refactor auth gate · ◼ Wire MFA fallback
+//	       ◻ Add session timeout tests
+//	       ◻ Update docs
+//	       ✔ 5 done
 //
 // Single-line label "  tasks " prefixes the first row so the eye
 // can chunk it as a unit; subsequent rows are aligned with leading

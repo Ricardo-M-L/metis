@@ -307,13 +307,13 @@ func (c *Client) LookupCostByModelID(modelID string) (Cost, bool) {
 // `metis models status` CLI. Lets the model self-check "did catalog
 // warm-up succeed yet?" without forcing the synchronous Get() path.
 type Stat struct {
-	CachePath       string    // ~/.metis/cache/models.json (empty if no disk cache resolved)
-	CacheBytes      int64     // size on disk; 0 if missing
-	CacheModTime    time.Time // mtime; zero if missing
-	InMemory        bool      // true once Default()'s warm-up populated c.cached
-	LoadedAt        time.Time // when the in-memory copy was loaded; zero if still empty
-	ProviderCount   int       // providers in the loaded snapshot
-	ModelCount      int       // total model entries across all providers
+	CachePath     string    // ~/.metis/cache/models.json (empty if no disk cache resolved)
+	CacheBytes    int64     // size on disk; 0 if missing
+	CacheModTime  time.Time // mtime; zero if missing
+	InMemory      bool      // true once Default()'s warm-up populated c.cached
+	LoadedAt      time.Time // when the in-memory copy was loaded; zero if still empty
+	ProviderCount int       // providers in the loaded snapshot
+	ModelCount    int       // total model entries across all providers
 }
 
 // Stat returns a freshness + coverage snapshot. Read-only; safe to

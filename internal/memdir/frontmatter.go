@@ -62,10 +62,10 @@ func (t MemoryType) IsValid() bool {
 // frontmatter without losing custom keys (e.g. team-memory's
 // `team: <name>`).
 type Frontmatter struct {
-	Name            string  `yaml:"name"`
-	Description     string  `yaml:"description"`
+	Name            string     `yaml:"name"`
+	Description     string     `yaml:"description"`
 	Type            MemoryType `yaml:"type"`
-	OriginSessionID string  `yaml:"originSessionId,omitempty"`
+	OriginSessionID string     `yaml:"originSessionId,omitempty"`
 	// Strength is the recorded retention coefficient at LastAccessed,
 	// in (0, 1]. New writes default to 1.0. Subsequent reads compute
 	// the *current* decayed value via CurrentStrength(now); the

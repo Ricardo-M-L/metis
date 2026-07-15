@@ -11,11 +11,11 @@ type aliasedTool struct {
 	aliases []string
 }
 
-func (a aliasedTool) Name() string                                { return a.name }
-func (a aliasedTool) Description() string                         { return "aliased stub" }
-func (a aliasedTool) InputSchema() map[string]any                 { return map[string]any{"type": "object"} }
-func (a aliasedTool) Concurrency(map[string]any) Concurrency      { return ConcurrencySafe }
-func (a aliasedTool) Aliases() []string                           { return a.aliases }
+func (a aliasedTool) Name() string                           { return a.name }
+func (a aliasedTool) Description() string                    { return "aliased stub" }
+func (a aliasedTool) InputSchema() map[string]any            { return map[string]any{"type": "object"} }
+func (a aliasedTool) Concurrency(map[string]any) Concurrency { return ConcurrencySafe }
+func (a aliasedTool) Aliases() []string                      { return a.aliases }
 func (a aliasedTool) CanUse(context.Context, map[string]any) (Permission, string) {
 	return PermissionAllow, ""
 }

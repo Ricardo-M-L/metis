@@ -43,8 +43,8 @@ func TestDispatch_SpillsOversizedToolResult(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.Register(bigOutputTool{output: payload})
 	loop := &Loop{
-		Registry:  reg,
-		SpillDir:  dir,
+		Registry: reg,
+		SpillDir: dir,
 	}
 	uses := []llm.ContentBlock{
 		{Type: "tool_use", ToolUseID: "tu_big", ToolName: "BigStub"},
@@ -88,8 +88,8 @@ func TestDispatch_SpillRespectsUnlimitedOptOut(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.Register(unlimitedTool{bigOutputTool{output: payload}})
 	loop := &Loop{
-		Registry:  reg,
-		SpillDir:  dir,
+		Registry: reg,
+		SpillDir: dir,
 	}
 	uses := []llm.ContentBlock{
 		{Type: "tool_use", ToolUseID: "tu_unlimited", ToolName: "UnlimitedStub"},

@@ -6,8 +6,8 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
-	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
 
 func Register(r *tools.Registry, cfg *config.Config, gate *permission.Gate) {

@@ -243,9 +243,9 @@ func TestPruneOldImages_PreservesUnrelatedBlocks(t *testing.T) {
 // regressions when the constants shift.
 func TestKeepRecentImagesFor(t *testing.T) {
 	cases := []struct {
-		name    string
-		maxCtx  int
-		want    int
+		name   string
+		maxCtx int
+		want   int
 	}{
 		{"unknown defaults to 3", 0, DefaultKeepRecentImageBlocks},
 		{"unknown-negative same", -1, DefaultKeepRecentImageBlocks},

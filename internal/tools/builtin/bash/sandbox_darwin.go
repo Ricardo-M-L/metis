@@ -106,16 +106,16 @@ func applySandboxWrap(ctx context.Context, cmd *exec.Cmd, mode string, cwd strin
 // allowed for `permissions` and `auto-allow` modes. The shape is
 // deliberately conservative:
 //
-//   * deny everything by default
-//   * allow process operations the shell needs (fork/exec/signal/wait)
-//   * allow Mach lookups + sysctl reads + iokit-open (a TON of CLI
+//   - deny everything by default
+//   - allow process operations the shell needs (fork/exec/signal/wait)
+//   - allow Mach lookups + sysctl reads + iokit-open (a TON of CLI
 //     tools fail in opaque ways without these — `ls`, `go`, `git`
 //     all use them indirectly)
-//   * allow file reads everywhere (the model needs to inspect the
+//   - allow file reads everywhere (the model needs to inspect the
 //     codebase)
-//   * allow file writes only inside cwd, the user's ~/.metis state
+//   - allow file writes only inside cwd, the user's ~/.metis state
 //     directory, the OS temp dir, and /dev/stdout|stderr|null
-//   * allow network — the [sandbox.bash] network=block knob is a
+//   - allow network — the [sandbox.bash] network=block knob is a
 //     separate layer; double-restricting here would surprise users
 //     who didn't ask for it
 //

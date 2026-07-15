@@ -224,12 +224,12 @@ func TestNewManager_DisablesOnUnsafeRoot(t *testing.T) {
 		cwd          string
 		wantDisabled bool
 	}{
-		{home, true},                              // bare home
-		{home + "/", true},                        // home with trailing slash (Clean normalizes)
-		{"/", true},                               // filesystem root
-		{"", true},                                // empty (defensive)
+		{home, true},       // bare home
+		{home + "/", true}, // home with trailing slash (Clean normalizes)
+		{"/", true},        // filesystem root
+		{"", true},         // empty (defensive)
 		{filepath.Join(home, "Documents", "p"), false}, // a real project subdir
-		{t.TempDir(), false},                      // an unrelated dir
+		{t.TempDir(), false},                           // an unrelated dir
 	}
 	for _, c := range cases {
 		m := NewManager("s", c.cwd, t.TempDir())

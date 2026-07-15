@@ -52,12 +52,12 @@ func TestShouldInjectPlanTrigger_NegativeCases(t *testing.T) {
 	cases := []string{
 		"",
 		"hello",
-		"refactor this function please",            // function-level, not "the whole X"
-		"port 8080 is in use",                     // "port" alone (no "to/from")
-		"could you migrate this single test?",     // no "to" — narrow scope
+		"refactor this function please",       // function-level, not "the whole X"
+		"port 8080 is in use",                 // "port" alone (no "to/from")
+		"could you migrate this single test?", // no "to" — narrow scope
 		"how does the import work?",
 		"please run go vet",
-		"重构这个函数",                                  // 重构 not in trigger list (重写 is)
+		"重构这个函数", // 重构 not in trigger list (重写 is)
 	}
 	for _, in := range cases {
 		t.Run(in, func(t *testing.T) {

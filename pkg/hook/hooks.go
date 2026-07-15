@@ -220,20 +220,20 @@ type PreCompact struct {
 // Handler signatures for each event type. Plugin authors write one of
 // these and pass it to Registry.Register.
 type (
-	PreToolUseHandler   func(context.Context, Context, *PreToolUse) *ModifiedPreToolUse
-	PostToolUseHandler  func(context.Context, Context, *PostToolUse)
+	PreToolUseHandler  func(context.Context, Context, *PreToolUse) *ModifiedPreToolUse
+	PostToolUseHandler func(context.Context, Context, *PostToolUse)
 	// PostToolUseContextHandler is the feedback-capable PostToolUse
 	// variant: its return value can inject AdditionalContext into the
 	// tool_result. Sync only — the dispatch path consumes the return,
 	// so RegisterAsync treats it as sync. Plain observers should keep
 	// using PostToolUseHandler (cheaper, async-capable).
 	PostToolUseContextHandler func(context.Context, Context, *PostToolUse) *ModifiedPostToolUse
-	SessionStartHandler func(context.Context, Context, string, string) // system, model
-	SessionEndHandler   func(context.Context, Context, int, string)    // msgCount, stopReason
-	TurnStartHandler    func(context.Context, Context, int)            // turn idx
-	TurnEndHandler      func(context.Context, Context, int)            // turn idx
-	LoopEndHandler      func(context.Context, Context, string)         // stopReason
-	ErrorHandler        func(context.Context, Context, error)
+	SessionStartHandler       func(context.Context, Context, string, string) // system, model
+	SessionEndHandler         func(context.Context, Context, int, string)    // msgCount, stopReason
+	TurnStartHandler          func(context.Context, Context, int)            // turn idx
+	TurnEndHandler            func(context.Context, Context, int)            // turn idx
+	LoopEndHandler            func(context.Context, Context, string)         // stopReason
+	ErrorHandler              func(context.Context, Context, error)
 	// 2026-05-01 additions
 	UserPromptSubmitHandler   func(context.Context, Context, *UserPromptSubmit) *ModifiedUserPromptSubmit
 	NotificationHandler       func(context.Context, Context, *Notification)
@@ -298,12 +298,12 @@ type Registry struct {
 	preTool     []PreToolUseHandler
 	postTool    []postToolEntry
 	postToolCtx []PostToolUseContextHandler
-	session    []SessionStartHandler
-	sessionEnd []sessionEndEntry
-	turnStart  []TurnStartHandler
-	turnEnd    []turnEndEntry
-	loopEnd    []LoopEndHandler
-	errorHook  []ErrorHandler
+	session     []SessionStartHandler
+	sessionEnd  []sessionEndEntry
+	turnStart   []TurnStartHandler
+	turnEnd     []turnEndEntry
+	loopEnd     []LoopEndHandler
+	errorHook   []ErrorHandler
 	// 2026-05-01 additions
 	userPrompt    []UserPromptSubmitHandler
 	notification  []notificationEntry

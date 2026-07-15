@@ -54,7 +54,7 @@ const (
 	// candidate the user can see in `curator status`) but not yet archived.
 	CuratorIdleStateDaysDefault = 21
 
-	curatorArchiveDir = ".archive"          // <root>/.archive/
+	curatorArchiveDir = ".archive"           // <root>/.archive/
 	curatorPinsFile   = ".curator-pins.json" // <root>/.curator-pins.json
 )
 

@@ -22,7 +22,7 @@ type fakeSummarizer struct {
 
 func (f *fakeSummarizer) Name() string          { return "fake" }
 func (f *fakeSummarizer) MaxContextTokens() int { return 100000 }
-func (f *fakeSummarizer) ModelID() string { return "" }
+func (f *fakeSummarizer) ModelID() string       { return "" }
 func (f *fakeSummarizer) Stream(_ context.Context, req llm.Request) (llm.StreamReader, error) {
 	f.calls++
 	f.lastReq = req
@@ -445,7 +445,7 @@ type errSummarizer struct{ err error }
 
 func (e *errSummarizer) Name() string          { return "err-fake" }
 func (e *errSummarizer) MaxContextTokens() int { return 100000 }
-func (e *errSummarizer) ModelID() string { return "" }
+func (e *errSummarizer) ModelID() string       { return "" }
 func (e *errSummarizer) Stream(_ context.Context, _ llm.Request) (llm.StreamReader, error) {
 	return nil, e.err
 }

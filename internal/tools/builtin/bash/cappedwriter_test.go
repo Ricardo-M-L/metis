@@ -64,9 +64,9 @@ func TestCappedWriter_HeadOnlyForOrdinaryOutput(t *testing.T) {
 // The tail ring must hold the LAST tailMax bytes across many small
 // writes, not the first ones.
 func TestCappedWriter_TailRingKeepsMostRecent(t *testing.T) {
-	w := newCappedWriter(100) // tail 30
-	w.Write([]byte(strings.Repeat("H", 70)))   // fills head
-	for i := 0; i < 100; i++ {                 // stream lots of tail bytes
+	w := newCappedWriter(100)                // tail 30
+	w.Write([]byte(strings.Repeat("H", 70))) // fills head
+	for i := 0; i < 100; i++ {               // stream lots of tail bytes
 		w.Write([]byte("error-marker-here-")) // ensure tail kept + recent
 	}
 	w.Write([]byte("LASTBYTES_error"))

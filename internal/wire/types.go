@@ -34,10 +34,10 @@ func (t ThinkPart) Mark() string { return "think" }
 
 // ImageURLPart represents an image content part
 type ImageURLPart struct {
-	URL         string `json:"url,omitempty"`
-	Base64      string `json:"base64,omitempty"`
-	MimeType    string `json:"mime_type,omitempty"`
-	AltText     string `json:"alt_text,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Base64   string `json:"base64,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	AltText  string `json:"alt_text,omitempty"`
 }
 
 func (i ImageURLPart) Mark() string { return "image_url" }
@@ -113,7 +113,7 @@ func (c CompactionEnd) GetType() string { return "compaction_end" }
 
 // MCPLoadingBegin event
 type MCPLoadingBegin struct {
-	Type    string `json:"type"`
+	Type    string   `json:"type"`
 	Servers []string `json:"servers,omitempty"`
 }
 
@@ -121,7 +121,7 @@ func (m MCPLoadingBegin) GetType() string { return "mcp_loading_begin" }
 
 // MCPLoadingEnd event
 type MCPLoadingEnd struct {
-	Type    string `json:"type"`
+	Type    string   `json:"type"`
 	Servers []string `json:"servers,omitempty"`
 }
 
@@ -129,10 +129,10 @@ func (m MCPLoadingEnd) GetType() string { return "mcp_loading_end" }
 
 // StatusUpdate event
 type StatusUpdate struct {
-	Type     string `json:"type"`
-	Status   string `json:"status"`
+	Type     string   `json:"type"`
+	Status   string   `json:"status"`
 	Progress *float64 `json:"progress,omitempty"`
-	Message  string `json:"message,omitempty"`
+	Message  string   `json:"message,omitempty"`
 }
 
 func (s StatusUpdate) GetType() string { return "status_update" }
@@ -163,7 +163,7 @@ func (t ToolCall) GetType() string { return "tool_call" }
 
 // ToolCallRequest event
 type ToolCallRequest struct {
-	Type     string `json:"type"`
+	Type     string   `json:"type"`
 	ToolCall ToolCall `json:"tool_call"`
 }
 
@@ -189,10 +189,10 @@ func (t ToolResult) GetType() string { return "tool_result" }
 
 // ApprovalRequest event
 type ApprovalRequest struct {
-	Type      string `json:"type"`
-	RequestID string `json:"request_id,omitempty"`
-	Action    string `json:"action,omitempty"`
-	Message   string `json:"message,omitempty"`
+	Type      string    `json:"type"`
+	RequestID string    `json:"request_id,omitempty"`
+	Action    string    `json:"action,omitempty"`
+	Message   string    `json:"message,omitempty"`
 	ToolCall  *ToolCall `json:"tool_call,omitempty"`
 }
 
@@ -219,9 +219,9 @@ func (q QuestionRequest) GetType() string { return "question_request" }
 
 // HookRequest event
 type HookRequest struct {
-	Type    string `json:"type"`
-	HookName string `json:"hook_name,omitempty"`
-	Params  map[string]interface{} `json:"params,omitempty"`
+	Type     string                 `json:"type"`
+	HookName string                 `json:"hook_name,omitempty"`
+	Params   map[string]interface{} `json:"params,omitempty"`
 }
 
 func (h HookRequest) GetType() string { return "hook_request" }
@@ -274,9 +274,9 @@ func (b BtwEnd) GetType() string { return "btw_end" }
 
 // SubagentEvent event
 type SubagentEvent struct {
-	Type       string `json:"type"`
-	SubagentID string `json:"subagent_id,omitempty"`
-	Event      string `json:"event,omitempty"`
+	Type       string                 `json:"type"`
+	SubagentID string                 `json:"subagent_id,omitempty"`
+	Event      string                 `json:"event,omitempty"`
 	Data       map[string]interface{} `json:"data,omitempty"`
 }
 

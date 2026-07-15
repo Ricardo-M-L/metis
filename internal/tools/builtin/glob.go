@@ -169,7 +169,7 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	// then misread as "wrong glob; try different syntax" and loop).
 	if hint := globShellShapeHint(pattern); hint != "" {
 		return &tools.Result{
-			Output: "Glob: pattern looks like a shell command, not a glob. " + hint,
+			Output:  "Glob: pattern looks like a shell command, not a glob. " + hint,
 			IsError: true,
 		}, nil
 	}

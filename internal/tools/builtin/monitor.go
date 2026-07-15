@@ -28,8 +28,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
-	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
 
 // Monitor is the tool struct. Wires through Permission for gating

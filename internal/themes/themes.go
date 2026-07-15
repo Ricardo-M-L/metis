@@ -77,10 +77,10 @@ var darkTheme = Theme{
 	// claude-code's softer palette (user feedback "颜色丑").
 	// Old #1e3a1e/#3a1e1e read as bright green/red; #1a2a1a/#2a1a1a
 	// land closer to "subtle dark tint with content readable on top".
-	DiffAddBg:     lipgloss.Color("#1a2a1a"),
-	DiffAddFg:     lipgloss.Color("#9be09b"),
-	DiffDelBg:     lipgloss.Color("#2a1a1a"),
-	DiffDelFg:     lipgloss.Color("#e09b9b"),
+	DiffAddBg: lipgloss.Color("#1a2a1a"),
+	DiffAddFg: lipgloss.Color("#9be09b"),
+	DiffDelBg: lipgloss.Color("#2a1a1a"),
+	DiffDelFg: lipgloss.Color("#e09b9b"),
 }
 
 // lightTheme inverts the tonality for light terminals — primary text

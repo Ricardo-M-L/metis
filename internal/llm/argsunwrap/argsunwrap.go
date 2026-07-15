@@ -23,10 +23,10 @@
 // detection MUST be structural and conservative enough that a non-
 // buggy provider never trips it. The check:
 //
-//   1. map has exactly ONE key
-//   2. that key is literally "_"
-//   3. value is a string
-//   4. string parses as a JSON OBJECT (not array / scalar)
+//  1. map has exactly ONE key
+//  2. that key is literally "_"
+//  3. value is a string
+//  4. string parses as a JSON OBJECT (not array / scalar)
 //
 // No realistic tool schema declares a single argument named "_" of
 // type string-containing-JSON, so steps 1-3 already filter almost

@@ -144,4 +144,3 @@ func TestExpandAtFileImageBlocks_ExtensionMatchVsContent(t *testing.T) {
 		t.Errorf("MediaType = %q, want image/png (sniffed from magic bytes)", blocks[0].MediaType)
 	}
 }
-

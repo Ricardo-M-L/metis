@@ -4,8 +4,8 @@
 // stays self-contained — users don't need a separate doc install.
 //
 // Add a new topic by:
-//   1. Drop the file under internal/helpdocs/<name>.md
-//   2. Wire it in cmd/metis (new case in the dispatch table).
+//  1. Drop the file under internal/helpdocs/<name>.md
+//  2. Wire it in cmd/metis (new case in the dispatch table).
 //
 // Keep docs SHORT and curated — this isn't a substitute for a real
 // docs site. It's the answer the user wants when they're already at

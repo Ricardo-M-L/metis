@@ -477,10 +477,10 @@ type Event struct {
 	// to AskUserReply. Empty AllowFreeform means the user is restricted
 	// to the supplied options; true means they may type a custom
 	// answer instead.
-	AskUserQuestion     string
-	AskUserOptions      []string
+	AskUserQuestion      string
+	AskUserOptions       []string
 	AskUserAllowFreeform bool
-	AskUserReply        chan string // buffered, size 1
+	AskUserReply         chan string // buffered, size 1
 
 	// Token + info. CacheCreationInputTokens / CacheReadInputTokens
 	// mirror Anthropic's prompt-caching usage and let the TUI compute

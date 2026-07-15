@@ -29,7 +29,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-
 )
 
 // Option configures Spawn.

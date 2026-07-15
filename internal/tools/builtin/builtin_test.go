@@ -11,8 +11,8 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
-	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
 
 func bypassGate() *permission.Gate { return permission.New(permission.ModeBypass) }
@@ -531,10 +531,10 @@ func TestBash_EmptyCommand(t *testing.T) {
 
 func TestBash_OutputCap(t *testing.T) {
 	b := bash.New(bypassGate(), config.ToolBashSettings{
-			TimeoutSeconds: 5,
-			MaxOutputBytes: 64, // tiny cap
-			Shell:          "/bin/sh",
-		})
+		TimeoutSeconds: 5,
+		MaxOutputBytes: 64, // tiny cap
+		Shell:          "/bin/sh",
+	})
 	res, _ := b.Execute(context.Background(), map[string]any{
 		"command": "yes A | head -c 1000",
 	})

@@ -325,11 +325,11 @@ func normalizeTaskContent(s string) string {
 // stripNumberingPrefix removes a leading numbered/labelled prefix
 // the model commonly attaches to task items. Handles:
 //
-//   "Cluster 1: foo"        → "foo"
-//   "Phase 2 - foo"         → "foo"
-//   "2. foo"                → "foo"
-//   "2) foo"                → "foo"
-//   "[2] foo"               → "foo"
+//	"Cluster 1: foo"        → "foo"
+//	"Phase 2 - foo"         → "foo"
+//	"2. foo"                → "foo"
+//	"2) foo"                → "foo"
+//	"[2] foo"               → "foo"
 //
 // Returns the original string unchanged when no recognised prefix
 // matches — so a task whose real content starts with "Wire Protocol"

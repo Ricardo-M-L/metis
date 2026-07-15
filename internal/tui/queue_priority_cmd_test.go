@@ -50,13 +50,13 @@ func TestParsePriorityCommand_LaterFormats(t *testing.T) {
 func TestParsePriorityCommand_Misses(t *testing.T) {
 	for _, in := range []string{
 		"",
-		"/nowhere",            // continuation after /now
+		"/nowhere",             // continuation after /now
 		"/laterally important", // continuation after /later
 		"/notify me",
 		"/help",
 		"now write tests", // no leading slash
 		"hello /now world",
-		"/Now uppercase",  // case-sensitive
+		"/Now uppercase", // case-sensitive
 	} {
 		if _, _, ok := parsePriorityCommand(in); ok {
 			t.Errorf("parsePriorityCommand(%q) matched; want miss", in)
