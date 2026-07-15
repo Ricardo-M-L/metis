@@ -8,11 +8,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/desktop"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -82,11 +86,26 @@ var modalCommands = map[string]bool{
 	"mcp":         true,
 	"sessions":    true,
 	"statusline":  true,
+	"resume":      true,
+	"diff-view":   true,
+	"agents-view": true,
+	"desktop":     true,
 }
 
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
+		return m, nil
+	}
+	// /agents-view is a local, read-only view and is safe to open while the
+	// agent loop is running. Handle it before the generic mid-turn queue/
+	// steering branch; otherwise the literal command is queued as a prompt and
+	// the only useful moment for inspecting running sub-agents is lost.
+	if isAgentsViewCommand(text) {
+		m.input.Reset()
+		m.showPalette = false
+		m.palFilter = ""
+		m.openAgentsView()
 		return m, nil
 	}
 	// `[Image #N]` placeholders STAY in the displayed text — the user
@@ -384,6 +403,44 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// === Desktop Features (Codex parity) ===
+		if name == "resume" || name == "rs" {
+			sessions := m.buildResumeSessions()
+			rs := screen.NewResumeScreen(sessions)
+			rs.Resize(m.width, m.height)
+			m.activeScreen = rs
+			return m, nil
+		}
+		if name == "diff-view" || name == "dv" {
+			files := m.buildDiffFiles()
+			dv := screen.NewDiffViewerScreen(files)
+			dv.Resize(m.width, m.height)
+			m.activeScreen = dv
+			return m, nil
+		}
+		if name == "agents-view" || name == "av" {
+			m.openAgentsView()
+			return m, nil
+		}
+		if name == "desktop" {
+			cwd, _ := os.Getwd()
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "launching desktop app for: " + cwd,
+				Timestamp: time.Now(),
+			})
+			// open(1) returns quickly. Keep the mutation on Bubble Tea's update
+			// goroutine; writing m.messages from a detached goroutine races render.
+			if err := desktop.LaunchApp(cwd); err != nil {
+				m.messages = append(m.messages, Message{
+					Role:      "error",
+					Content:   "desktop launch failed: " + err.Error(),
+					Timestamp: time.Now(),
+				})
+			}
+			return m, nil
+		}
+
 		if cmd := m.cmds.Get(name); cmd != nil {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
@@ -393,7 +450,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.Reload(ReloadOpts{})
 				return m, nil
 			}
-			output := cmd.Handler(m.asREPL(), args)
+			repl := m.asREPL()
+			output := cmd.Handler(repl, args)
+			// asREPL is a value bridge. Model/provider switches mutate the
+			// bridge and the shared Loop, so copy the successful labels back to
+			// the TUI chrome as well. On rebuild failure the REPL helper is
+			// atomic and these values remain unchanged.
+			if cmd.Name == "model" {
+				m.model = repl.model
+				m.providerName = repl.providerName
+			}
 			// Sync m.sessionTitle from disk after REPL commands that
 			// mutate the session header. cmdRename (registered in
 			// commands.go as `rename` with alias `title`) calls
@@ -435,11 +501,32 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalClear:
 			m.Reload(ReloadOpts{})
 		case slash.SignalNew:
-			m.Reload(ReloadOpts{
-				SaveDailyNote: true,
-				ResetReason:   "new",
-				ShowBanner:    true,
-			})
+			if err := m.persistActiveSessionState(); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "new session: " + err.Error(), Timestamp: time.Now()})
+				break
+			}
+			var noteErr error
+			if m.loop != nil && m.loop.Memory != nil {
+				noteErr = m.loop.Memory.SaveDailyNote(m.sessionID, "new", m.summarizeHistory())
+			}
+			newID, hdr, err := m.createFreshSession()
+			if err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "new session: " + err.Error(), Timestamp: time.Now()})
+				break
+			}
+			if err := m.activateSession(newID, hdr, nil, false); err != nil {
+				m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning("new session activation", err), Timestamp: time.Now()})
+				if noteErr != nil {
+					m.messages = append(m.messages, Message{Role: "warning", Content: "failed to save previous session note: " + noteErr.Error(), Timestamp: time.Now()})
+				}
+				break
+			}
+			m.firstRender = true
+			m.showBanner = true
+			m.messages = append(m.messages, Message{Role: "success", Content: "started new session: " + shortID(newID), Timestamp: time.Now()})
+			if noteErr != nil {
+				m.messages = append(m.messages, Message{Role: "warning", Content: "failed to save previous session note: " + noteErr.Error(), Timestamp: time.Now()})
+			}
 		case slash.SignalUndo:
 			// Prefill behaviour: pop the last turn AND drop the user's
 			// original text into the input box so they can edit-and-resend
@@ -522,10 +609,20 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalBranch:
 			if m.session == nil || m.sessionID == "" {
 				m.messages = append(m.messages, Message{Role: "warning", Content: "(branch: no session store)", Timestamp: time.Now()})
-			} else if newID, err := m.session.Branch(m.sessionID, m.loop.History()); err != nil {
-				m.messages = append(m.messages, Message{Role: "error", Content: "branch: " + err.Error(), Timestamp: time.Now()})
 			} else {
-				m.sessionID = newID
+				if err := m.persistActiveSessionState(); err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "branch: " + err.Error(), Timestamp: time.Now()})
+					break
+				}
+				newID, hdr, err := m.forkSession(m.sessionID, m.loop.History())
+				if err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "branch: " + err.Error(), Timestamp: time.Now()})
+					break
+				}
+				if err := m.activateSession(newID, hdr, m.loop.History(), false); err != nil {
+					m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning("branch activation", err), Timestamp: time.Now()})
+					break
+				}
 				m.messages = append(m.messages, Message{Role: "success", Content: "(branched → " + newID + ")", Timestamp: time.Now()})
 			}
 		case slash.SignalSave:
@@ -899,4 +996,309 @@ func slashName(raw string) string {
 		return "/" + rest[:i]
 	}
 	return "/" + rest
+}
+
+// =============================================================================
+// Desktop Feature Helpers
+// =============================================================================
+
+// buildResumeSessions converts the session store entries to ResumeScreen items.
+func (m *Model) buildResumeSessions() []screen.SessionEntry {
+	if m.session == nil {
+		return nil
+	}
+	entries, err := m.session.List(50)
+	if err != nil {
+		return nil
+	}
+	out := make([]screen.SessionEntry, 0, len(entries))
+	for _, e := range entries {
+		messageCount := 0
+		if m.session.CheckResumeSize(e.ID) == nil {
+			_, messages, _ := m.session.Load(e.ID)
+			messageCount = len(messages)
+		}
+		out = append(out, screen.SessionEntry{
+			ID:           e.ID,
+			Title:        e.Title,
+			Model:        e.Model,
+			CreatedAt:    e.CreatedAt,
+			MessageCount: messageCount,
+		})
+	}
+	return out
+}
+
+// buildDiffFiles returns tracked staged/unstaged changes plus untracked files
+// that are not ignored. `git diff HEAD` deliberately omits the latter, so the
+// untracked list must be queried separately and rendered as additions.
+func (m *Model) buildDiffFiles() []screen.DiffFile {
+	// HEAD includes both staged and unstaged changes, matching what users
+	// expect from a desktop "Changes" view.
+	cmd := exec.Command("git", "diff", "HEAD", "--no-color", "--no-ext-diff")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	files := parseGitDiff(string(out))
+
+	// -z keeps unusual but valid file names (spaces, tabs and newlines) intact;
+	// --exclude-standard applies repository, info and global ignore rules.
+	untracked, err := exec.Command("git", "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil {
+		// A failure to enumerate new files must not hide the tracked changes we
+		// already collected.
+		return files
+	}
+	for _, rawPath := range strings.Split(string(untracked), "\x00") {
+		if rawPath == "" {
+			continue
+		}
+		files = append(files, buildUntrackedDiffFile(rawPath))
+	}
+	return files
+}
+
+// buildUntrackedDiffFile asks git to produce the same unified patch format as
+// tracked files. Exit status 1 is normal for --no-index when files differ, so
+// the output is useful regardless of err. Empty and unreadable files still get
+// an A entry even when no hunk can be produced.
+func buildUntrackedDiffFile(path string) screen.DiffFile {
+	out, _ := exec.Command(
+		"git", "diff", "--no-index", "--no-color", "--no-ext-diff", "--", "/dev/null", path,
+	).CombinedOutput()
+	parsed := parseGitDiff(string(out))
+	if len(parsed) == 0 {
+		return screen.DiffFile{Path: path, Status: "A"}
+	}
+	file := parsed[0]
+	// Git quotes unusual paths in patch headers. The NUL-delimited ls-files
+	// result is authoritative and preserves the exact repository-relative name.
+	file.Path = path
+	file.Status = "A"
+	return file
+}
+
+// parseGitDiff parses unified diff output into DiffFile structures.
+func parseGitDiff(diff string) []screen.DiffFile {
+	var files []screen.DiffFile
+	var current *screen.DiffFile
+	var currentHunk *screen.DiffHunk
+	oldNum, newNum := 0, 0
+
+	lines := strings.Split(diff, "\n")
+	// A patch normally ends in a newline. strings.Split would turn that
+	// terminator into a synthetic empty context line in the final hunk.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "diff --git"):
+			// New file.
+			parts := strings.Fields(line)
+			path := ""
+			if len(parts) >= 4 {
+				path = strings.TrimPrefix(parts[3], "b/")
+			}
+			files = append(files, screen.DiffFile{Path: path, Status: "M"})
+			current = &files[len(files)-1]
+			currentHunk = nil
+		case strings.HasPrefix(line, "--- a/"):
+			if current != nil {
+				current.Status = "M"
+			}
+		case strings.HasPrefix(line, "+++ /dev/null"):
+			if current != nil {
+				current.Status = "D"
+			}
+		case strings.HasPrefix(line, "--- /dev/null"):
+			if current != nil {
+				current.Status = "A"
+			}
+		case strings.HasPrefix(line, "new file mode "):
+			if current != nil {
+				current.Status = "A"
+			}
+		case strings.HasPrefix(line, "deleted file mode "):
+			if current != nil {
+				current.Status = "D"
+			}
+		case strings.HasPrefix(line, "rename to "):
+			if current != nil {
+				current.Status = "R"
+				current.Path = strings.TrimPrefix(line, "rename to ")
+			}
+		case strings.HasPrefix(line, "@@"):
+			if current == nil {
+				break
+			}
+			hunk, ok := parseDiffHunkHeader(line)
+			if !ok {
+				currentHunk = nil
+				break
+			}
+			current.Hunks = append(current.Hunks, hunk)
+			currentHunk = &current.Hunks[len(current.Hunks)-1]
+			oldNum, newNum = hunk.OldStart, hunk.NewStart
+		case strings.HasPrefix(line, "+") && currentHunk != nil:
+			currentHunk.Lines = append(currentHunk.Lines, screen.DiffLine{
+				Type:    "+",
+				Content: line[1:],
+				NewNum:  newNum,
+			})
+			newNum++
+		case strings.HasPrefix(line, "-") && currentHunk != nil:
+			currentHunk.Lines = append(currentHunk.Lines, screen.DiffLine{
+				Type:    "-",
+				Content: line[1:],
+				OldNum:  oldNum,
+			})
+			oldNum++
+		case currentHunk != nil && !strings.HasPrefix(line, "\\ No newline at end of file"):
+			content := strings.TrimPrefix(line, " ")
+			currentHunk.Lines = append(currentHunk.Lines, screen.DiffLine{
+				Type:    " ",
+				Content: content,
+				OldNum:  oldNum,
+				NewNum:  newNum,
+			})
+			oldNum++
+			newNum++
+		}
+	}
+	return files
+}
+
+var diffHunkRE = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
+
+func parseDiffHunkHeader(line string) (screen.DiffHunk, bool) {
+	m := diffHunkRE.FindStringSubmatch(line)
+	if m == nil {
+		return screen.DiffHunk{}, false
+	}
+	atoi := func(v string, fallback int) int {
+		if v == "" {
+			return fallback
+		}
+		n, _ := strconv.Atoi(v)
+		return n
+	}
+	return screen.DiffHunk{
+		OldStart: atoi(m[1], 0), OldCount: atoi(m[2], 1),
+		NewStart: atoi(m[3], 0), NewCount: atoi(m[4], 1),
+	}, true
+}
+
+func isAgentsViewCommand(text string) bool {
+	if !strings.HasPrefix(text, "/") {
+		return false
+	}
+	name, _, _ := cut(strings.TrimPrefix(text, "/"), " ")
+	return name == "agents-view" || name == "av"
+}
+
+func (m *Model) openAgentsView() {
+	// A live source lets spinner ticks refresh the modal after new agent/tool
+	// events are drained, without sharing mutable screen state with the worker
+	// goroutine (all callbacks run on Bubble Tea's Update/View goroutine).
+	av := screen.NewLiveMultiAgentScreen(m.buildAgentTasks)
+	av.Resize(m.width, m.height)
+	m.activeScreen = av
+}
+
+// buildAgentTasks converts the live status-bar roster and the retained tool
+// event timeline to MultiAgentScreen items. subAgents is intentionally pruned
+// shortly after completion; toolEvents survives for the session, so it serves
+// as the durable fallback and keeps /agents-view useful after the 2s pill tail.
+func (m *Model) buildAgentTasks() []screen.AgentTask {
+	eventTasks := make(map[string]screen.AgentTask)
+	eventOrder := make([]string, 0)
+	for i, event := range m.toolEvents {
+		if event.ToolName != "Agent" {
+			continue
+		}
+		key := event.ID
+		if key == "" {
+			// Current producers always carry an ID. Keep legacy/resumed events
+			// independently addressable rather than collapsing them together.
+			key = fmt.Sprintf("legacy-agent-%d", i)
+		}
+		name := "agent"
+		if prompt, ok := event.Input["prompt"].(string); ok && strings.TrimSpace(prompt) != "" {
+			name = truncate(strings.TrimSpace(prompt), 24)
+		}
+		status := "running"
+		if event.Kind != "start" {
+			status = "completed"
+			if event.IsError {
+				status = "failed"
+			}
+		}
+		task := screen.AgentTask{
+			ID:        event.ID,
+			Name:      name,
+			Status:    status,
+			StartedAt: event.StartTime,
+		}
+		if event.Kind != "start" && !event.StartTime.IsZero() {
+			if event.Duration > 0 {
+				task.FinishedAt = event.StartTime.Add(event.Duration)
+			} else {
+				// Resumed transcripts do not retain tool durations. Suppress the
+				// clock instead of showing a completed task whose elapsed time
+				// keeps increasing forever.
+				task.StartedAt = time.Time{}
+			}
+		}
+		if event.IsError {
+			task.Error = event.Output
+		}
+		eventTasks[key] = task
+		eventOrder = append(eventOrder, key)
+	}
+	for _, event := range m.toolEvents {
+		if event.SubAgentParentID == "" {
+			continue
+		}
+		task, ok := eventTasks[event.SubAgentParentID]
+		if !ok {
+			continue
+		}
+		task.ToolsCount++
+		task.LastTool = strings.TrimPrefix(event.ToolName, "sub: ")
+		eventTasks[event.SubAgentParentID] = task
+	}
+
+	// Put currently running/recent agents first, then retain completed history
+	// newest-first. This avoids opening a long session at an old, irrelevant
+	// agent while still making prior results inspectable.
+	out := make([]screen.AgentTask, 0, len(m.subAgents)+len(eventTasks))
+	seen := make(map[string]bool, len(m.subAgents))
+	for _, sa := range m.subAgents {
+		task := screen.AgentTask{
+			ID:         sa.ID,
+			Name:       sa.Name,
+			Status:     sa.Status,
+			StartedAt:  sa.StartedAt,
+			FinishedAt: sa.FinishedAt,
+			ToolsCount: sa.ToolsCount,
+			LastTool:   sa.LastTool,
+		}
+		// Retain an error string captured by the durable event snapshot.
+		if historical, ok := eventTasks[sa.ID]; ok {
+			task.Error = historical.Error
+		}
+		out = append(out, task)
+		seen[sa.ID] = true
+	}
+	for i := len(eventOrder) - 1; i >= 0; i-- {
+		key := eventOrder[i]
+		task := eventTasks[key]
+		if task.ID != "" && seen[task.ID] {
+			continue
+		}
+		out = append(out, task)
+	}
+	return out
 }

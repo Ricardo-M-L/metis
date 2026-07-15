@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -43,11 +44,22 @@ type REPL struct {
 	// on the right profile when the user does /model <id> mid-session.
 	// Empty for legacy callers that didn't thread it through; switchModel
 	// then falls back to cfg.Provider.Default.
-	providerName string
-	cfg          *config.Config
-	skillDir     string
-	cmds         *REPLCommandRegistry
-	totalTokens  tokenTracker
+	providerName       string
+	cfg                *config.Config
+	skillDir           string
+	cmds               *REPLCommandRegistry
+	totalTokens        tokenTracker
+	baseSystem         string
+	baseSystemSections []llm.SystemSection
+	// SessionSwitch rebinds runtime-owned Todo/Task/dump/checkpoint routers.
+	SessionSwitch func(sessionID string)
+	// SessionBoundary releases process-owned work tied to the session being
+	// left. It runs only after the destination is durably created and before
+	// the Loop is reset to that destination.
+	SessionBoundary func()
+	// FreshPermissionMode is the invocation-level baseline used by /new and
+	// /branch; it must not be inherited from a resumed bypass session.
+	FreshPermissionMode permission.Mode
 
 	stdin io.Reader
 	out   io.Writer
@@ -125,14 +137,35 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 		UseMarkdown: useMarkdown,
 		ShowTokens:  showTokens,
 		model:       model,
-		skillDir:    skillDir,
-		cmds:        BuildREPLCommands(),
-		stdin:       os.Stdin,
-		out:         os.Stdout,
+		baseSystem:  loop.System,
+		baseSystemSections: append([]llm.SystemSection(nil),
+			loop.SystemSections...),
+		skillDir: skillDir,
+		cmds:     BuildREPLCommands(),
+		stdin:    os.Stdin,
+		out:      os.Stdout,
 	}, nil
 }
 
-func (r *REPL) Run(ctx context.Context) error {
+// ConfigureProviderSwitch supplies the runtime context needed for a real
+// provider rebuild in the plain (non-Bubble Tea) REPL. Keeping this separate
+// from NewREPL preserves the public constructor used by embedders while the
+// production composition layer can avoid a misleading string-only /model
+// switch and can persist Provider correctly in /new headers.
+func (r *REPL) ConfigureProviderSwitch(cfg *config.Config, providerName string) {
+	if r == nil {
+		return
+	}
+	r.cfg = cfg
+	r.providerName = providerName
+}
+
+func (r *REPL) Run(ctx context.Context) (runErr error) {
+	defer func() {
+		if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.providerName, r.model, r.Loop.System); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}()
 	r.printBanner()
 
 	// Readline gives us history (up/down arrows) and tab completion for
@@ -211,8 +244,12 @@ func (r *REPL) Run(ctx context.Context) error {
 					summary := r.summarizeHistory()
 					_ = r.Loop.Memory.SaveDailyNote(r.SessionID, "new", summary)
 				}
-				r.Loop.Reset()
-				fmt.Fprintln(r.out, r.Styles.Hint.Render("(starting new session...)"))
+				newID, err := r.startFreshSession()
+				if err != nil {
+					fmt.Fprintln(r.out, r.Styles.Err.Render("new session: "+err.Error()))
+				} else {
+					fmt.Fprintln(r.out, r.Styles.Hint.Render("(started new session "+newID+")"))
+				}
 			case slash.SignalUndo:
 				// Plain REPL mode has no rich-input prefill — show the
 				// undone user text as a hint so the user can copy-paste
@@ -248,10 +285,9 @@ func (r *REPL) Run(ctx context.Context) error {
 			case slash.SignalBranch:
 				if r.Session == nil || r.SessionID == "" {
 					fmt.Fprintln(r.out, r.Styles.Hint.Render("(branch: no session store)"))
-				} else if newID, err := r.Session.Branch(r.SessionID, r.Loop.History()); err != nil {
+				} else if newID, err := r.branchSession(); err != nil {
 					fmt.Fprintln(r.out, r.Styles.Err.Render("branch: "+err.Error()))
 				} else {
-					r.SessionID = newID
 					fmt.Fprintln(r.out, r.Styles.Hint.Render("(branched → "+newID+")"))
 				}
 			case slash.SignalSave:

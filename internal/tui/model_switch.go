@@ -39,14 +39,10 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 		return fmt.Errorf("model switch: empty model id")
 	}
 
-	// Always update the string fields first — keeps callers (and tests
-	// that don't have a real cfg / provider profile wired) working with
-	// the legacy "rename the model string" semantics. The Provider
-	// rebuild below is the extra correctness layer for production use.
-	m.model = newModel
-	m.loop.Model = newModel
-
 	if m.cfg == nil {
+		m.model = newModel
+		m.loop.Model = newModel
+		rtpkg.RebindLoopRuntime(m.loop, m.loop.Provider, newModel, m.loop.System, m.sessionID)
 		return nil // string-only swap; cfg not wired (test path)
 	}
 
@@ -58,17 +54,17 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 		provName = m.cfg.Provider.Default
 	}
 	if provName == "" {
+		m.model = newModel
+		m.loop.Model = newModel
+		rtpkg.RebindLoopRuntime(m.loop, m.loop.Provider, newModel, m.loop.System, m.sessionID)
 		return nil // no provider profile to rebuild against
 	}
 
 	pb, err := rtpkg.BuildProvider(m.cfg, provName, newModel)
 	if err != nil {
-		// Couldn't rebuild — leave the existing Provider in place.
-		// String fields already updated above so the user sees the new
-		// model id in the chrome, but auto-compaction + actual wire
-		// model stay on the previous Provider. Caller can choose to
-		// surface this as a warning row; we return the error so they
-		// have the option.
+		// Atomic failure: keep the old model strings and Provider together.
+		// A chrome label that disagrees with the transport is more dangerous
+		// than leaving the prior selection visible.
 		return fmt.Errorf("model switch: BuildProvider(%s, %s): %w",
 			provName, newModel, err)
 	}
@@ -80,6 +76,7 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 	m.loop.ContextWindow = pb.Provider.MaxContextTokens()
 	m.model = pb.Model
 	m.providerName = provName
+	rtpkg.RebindLoopRuntime(m.loop, pb.Provider, pb.Model, m.loop.System, m.sessionID)
 
 	// Rebuild Compactor so ShouldCompact / threshold math uses the
 	// new provider's MaxContextTokens. Preserve the existing Config

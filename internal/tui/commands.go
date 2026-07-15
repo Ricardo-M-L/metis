@@ -19,8 +19,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
-	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -175,6 +175,12 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "ultraplan", Description: "deep-plan nudge: bumps effort=high and pre-loads the planning frame", Handler: cmdUltraplan})
 	r.Register(REPLCommand{Name: "onboarding", Description: "first-run setup recap (auth, config, /init, talk)", Handler: cmdOnboarding})
 
+	// === Desktop Features (Codex parity) ===
+	r.Register(REPLCommand{Name: "resume", Aliases: []string{"rs"}, Description: "resume/fork session with search, fork, and fresh start", Handler: cmdResume})
+	r.Register(REPLCommand{Name: "diff-view", Aliases: []string{"dv"}, Description: "full-screen git diff viewer with file list", Handler: cmdDiffView})
+	r.Register(REPLCommand{Name: "agents-view", Aliases: []string{"av"}, Description: "multi-agent task visualization with tree view", Handler: cmdAgentsView})
+	r.Register(REPLCommand{Name: "desktop", Description: "launch native desktop app (macOS/Linux/Windows)", Handler: cmdDesktop})
+
 	// === Info ===
 	r.Register(REPLCommand{Name: "version", Aliases: []string{"v", "--version"}, Description: "show version", Handler: cmdVersion})
 	r.Register(REPLCommand{Name: "login", Description: "set up provider credentials (delegates to metis auth login)", Handler: cmdLogin})
@@ -242,12 +248,12 @@ func cmdModel(r *REPL, args string) string {
 	// string-only update when no cfg / profile is available (tests, plain
 	// REPL), so existing surfaces stay green.
 	err := switchREPLModel(r, args)
+	if err != nil {
+		return "model switch failed; previous model remains active: " + r.model + "\n(" + err.Error() + ")"
+	}
 	out := "model set to: " + r.model
 	if r.providerName != "" {
 		out += "  ·  provider: " + r.providerName
-	}
-	if err != nil {
-		out += "\n(warning: Provider rebuild failed — " + err.Error() + ")"
 	}
 	return out
 }
@@ -262,12 +268,10 @@ func switchREPLModel(r *REPL, newModel string) error {
 	if r == nil || r.Loop == nil {
 		return fmt.Errorf("repl not fully wired (loop missing)")
 	}
-	// String-side update first — guarantees the chrome shows the new
-	// id even if the Provider rebuild below can't run (tests with
-	// stubbed cfg, REPL fallback without a real profile, etc.).
-	r.model = newModel
-	r.Loop.Model = newModel
 	if r.cfg == nil {
+		r.model = newModel
+		r.Loop.Model = newModel
+		runtime.RebindLoopRuntime(r.Loop, r.Loop.Provider, newModel, r.Loop.System, r.SessionID)
 		return nil // string-only swap (test path)
 	}
 	// Look up the requested model in the picker list — if it's there we
@@ -287,10 +291,16 @@ func switchREPLModel(r *REPL, newModel string) error {
 		newProvName = r.cfg.Provider.Default
 	}
 	if newProvName == "" {
+		r.model = newModel
+		r.Loop.Model = newModel
+		runtime.RebindLoopRuntime(r.Loop, r.Loop.Provider, newModel, r.Loop.System, r.SessionID)
 		return nil // no profile to rebuild against
 	}
 	pb, err := runtime.BuildProvider(r.cfg, newProvName, newModel)
 	if err != nil {
+		// Keep labels and transport on the same model/profile. Reporting the
+		// requested model as active after a failed rebuild sends the next turn
+		// over the old provider with misleading UI state.
 		return fmt.Errorf("BuildProvider(%s, %s): %w", newProvName, newModel, err)
 	}
 	r.Loop.Provider = pb.Provider
@@ -298,6 +308,7 @@ func switchREPLModel(r *REPL, newModel string) error {
 	r.Loop.ContextWindow = pb.Provider.MaxContextTokens()
 	r.model = pb.Model
 	r.providerName = newProvName
+	runtime.RebindLoopRuntime(r.Loop, pb.Provider, pb.Model, r.Loop.System, r.SessionID)
 	if r.Loop.Compactor != nil {
 		oldCfg := r.Loop.Compactor.Config
 		oldMaxOut := r.Loop.Compactor.MaxOutputTokens
@@ -2017,4 +2028,51 @@ func animateOne(current, target int) int {
 		step = gap
 	}
 	return current + step
+}
+
+// =============================================================================
+// DESKTOP FEATURES (Codex parity)
+// =============================================================================
+
+// cmdResume opens the enhanced resume/fork session picker.
+func cmdResume(r *REPL, args string) string {
+	if r.Session == nil {
+		return "session store not available"
+	}
+	sessions, err := r.Session.List(50)
+	if err != nil {
+		return "failed to list sessions: " + err.Error()
+	}
+	// This is a placeholder — the actual screen is opened via the TUI's
+	// applyScreenResult path. The REPL fallback just lists sessions.
+	var b strings.Builder
+	b.WriteString("Recent sessions:\n")
+	for i, s := range sessions {
+		if i >= 20 {
+			break
+		}
+		title := s.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		b.WriteString(fmt.Sprintf("  %s  %s\n", shortID(s.ID), title))
+	}
+	b.WriteString("\nUse /resume in the TUI for the full picker with search and fork.")
+	return b.String()
+}
+
+// cmdDiffView opens the full-screen git diff viewer.
+func cmdDiffView(r *REPL, args string) string {
+	return "opening diff viewer..."
+}
+
+// cmdAgentsView opens the multi-agent task visualization.
+func cmdAgentsView(r *REPL, args string) string {
+	return "opening agents view..."
+}
+
+// cmdDesktop launches the native desktop app.
+func cmdDesktop(r *REPL, args string) string {
+	cwd, _ := os.Getwd()
+	return fmt.Sprintf("desktop app launch: run 'metis desktop' from terminal to launch the native app for workspace %s", cwd)
 }

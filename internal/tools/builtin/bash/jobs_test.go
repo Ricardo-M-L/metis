@@ -168,6 +168,36 @@ func TestBashOutput_ReadsRunningJob(t *testing.T) {
 	}
 }
 
+func TestBashListAndOutputReadSnapshotsDuringCompletion(t *testing.T) {
+	pool, gate := jobPoolFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "printf 'reader-start\\n'; sleep 0.15; printf 'reader-done\\n'")
+	j, err := pool.Spawn(jobs.SpawnArgs{Command: "reader transition", Cmd: cmd, Cancel: cancel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listTool := List{gate: gate, pool: pool}
+	outputTool := Output{gate: gate, pool: pool}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := listTool.Execute(context.Background(), nil); err != nil {
+			t.Fatalf("List while completing: %v", err)
+		}
+		if _, err := outputTool.Execute(context.Background(), map[string]any{"job_id": j.ID}); err != nil {
+			t.Fatalf("Output while completing: %v", err)
+		}
+		if snap, ok := pool.Get(j.ID); ok && snap.Status != jobs.StatusRunning {
+			if snap.Status != jobs.StatusCompleted || snap.ExitCode != 0 {
+				t.Fatalf("terminal snapshot = %s exit=%d", snap.Status, snap.ExitCode)
+			}
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("job did not complete while readers were polling")
+}
+
 func TestBashKill_StopsRunningJob(t *testing.T) {
 	pool, gate := jobPoolFixture(t)
 	j := spawnSleepyJob(t, pool, "to-be-killed")

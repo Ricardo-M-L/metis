@@ -180,8 +180,8 @@ func (o Output) Execute(_ context.Context, in map[string]any) (*tools.Result, er
 	if id == "" {
 		return nil, fmt.Errorf("job_id is required")
 	}
-	j := o.pool.Get(id)
-	if j == nil {
+	j, ok := o.pool.Get(id)
+	if !ok {
 		return &tools.Result{
 			Output:  fmt.Sprintf("[no such job %q — call List to see live jobs]", id),
 			IsError: true,

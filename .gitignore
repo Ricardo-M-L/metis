@@ -3,6 +3,7 @@
 /bin/
 /metis
 /metis-*
+!/metis-desktop/
 *.test
 *.out
 .DS_Store
@@ -22,4 +23,3 @@ TEST_REPORT.md
 
 # private architecture notes (not for public release)
 技术架构文档.md
-

@@ -42,3 +42,43 @@ jobs:
 
       - name: go test
         run: go test -count=1 -timeout 90s ./...
+
+  desktop:
+    name: Desktop build & test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: metis-desktop/go.mod
+          cache: true
+          cache-dependency-path: metis-desktop/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: metis-desktop/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: metis-desktop/frontend
+        run: npm ci
+
+      - name: Check and build frontend
+        working-directory: metis-desktop/frontend
+        run: |
+          npm run check
+          npm run build
+
+      - name: Vet desktop module
+        working-directory: metis-desktop
+        run: go vet ./...
+
+      - name: Test desktop module
+        working-directory: metis-desktop
+        run: go test -race -count=1 ./...
+
+      - name: Build production desktop module
+        working-directory: metis-desktop
+        run: go build -tags production ./...

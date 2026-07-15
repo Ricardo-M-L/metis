@@ -1,0 +1,106 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+
+	"github.com/Ricardo-M-L/metis/internal/desktop"
+	"github.com/Ricardo-M-L/metis/internal/webui"
+)
+
+var launchNativeDesktop = desktop.LaunchApp
+
+// cmdDesktop implements `metis desktop`. The native Wails client is the
+// default; the old browser UI remains available behind --web for development
+// and backwards compatibility.
+//
+// Usage:
+//
+//	metis desktop                   # native desktop app
+//	metis desktop --web             # browser UI on port 8080
+//	metis desktop --web --port 9090 # browser UI on a custom port
+func cmdDesktop(ctx context.Context, args []string) error {
+	opts, err := parseDesktopOptions(args, os.Getenv)
+	if err != nil {
+		return err
+	}
+	if opts.help {
+		fmt.Print(desktopHelp)
+		return nil
+	}
+	if !opts.web {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("desktop: determine workspace: %w", err)
+		}
+		return launchNativeDesktop(cwd)
+	}
+
+	rt, err := setupRuntime(ctx, &cliFlags{})
+	if err != nil {
+		return err
+	}
+	defer rt.Cleanup()
+
+	addr := "127.0.0.1:" + opts.port
+	srv := webui.NewServer(addr, rt.loop, rt.store)
+	fmt.Fprintf(os.Stderr, "metis desktop --web: starting web UI on %s\n", addr)
+	fmt.Fprintf(os.Stderr, "Open http://%s in your browser\n", addr)
+
+	return srv.Run(ctx)
+}
+
+type desktopOptions struct {
+	web  bool
+	port string
+	help bool
+}
+
+func parseDesktopOptions(args []string, getenv func(string) string) (desktopOptions, error) {
+	opts := desktopOptions{port: "8080"}
+	explicit := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--web":
+			opts.web = true
+		case "--port", "-p":
+			if i+1 >= len(args) {
+				return desktopOptions{}, fmt.Errorf("%s requires a port", args[i])
+			}
+			opts.port = args[i+1]
+			opts.web = true
+			explicit = true
+			i++
+		case "--help", "-h":
+			opts.help = true
+		default:
+			return desktopOptions{}, fmt.Errorf("unknown desktop option: %s", args[i])
+		}
+	}
+	if opts.web && !explicit && getenv != nil {
+		if p := getenv("METIS_PORT"); p != "" {
+			opts.port = p
+		}
+	}
+	n, convErr := strconv.Atoi(opts.port)
+	if convErr != nil || n < 1 || n > 65535 {
+		return desktopOptions{}, fmt.Errorf("invalid desktop port %q (want 1-65535)", opts.port)
+	}
+	return opts, nil
+}
+
+var desktopHelp = `metis desktop — Launch the native Metis desktop app
+
+Usage:
+  metis desktop                    Open the native desktop client
+  metis desktop --web              Start the browser UI on port 8080
+  metis desktop --web --port 9090  Start the browser UI on a custom port
+
+Flags:
+
+  --web         Run the legacy browser UI instead of the native app
+  --port, -p    Browser UI port (implies --web; env: METIS_PORT)
+  --help, -h    Show this help
+`

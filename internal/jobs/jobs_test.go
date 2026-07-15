@@ -37,17 +37,13 @@ func spawnEcho(t *testing.T, r *Registry, msg string) *Job {
 // waitForStatus polls the registry until the job leaves StatusRunning
 // or the test deadline trips. Eliminates flaky time.Sleep waits.
 //
-// Uses Snapshot (not Get) so the Status field read is taken under
-// r.mu — the spawn goroutine concurrently writes Status / EndTime /
-// ExitCode from inside waitAndComplete and would race against a
-// naked `r.Get(id).Status` read. The returned *Job is a fresh value
-// copy; callers that need to inspect the LIVE handles (cmd/cancel/
-// output) must still go through Get + lock discipline.
+// Get returns a detached value snapshot taken under r.mu, so the spawn
+// goroutine can concurrently update Status / EndTime / ExitCode safely.
 func waitForStatus(t *testing.T, r *Registry, id string, want Status, timeout time.Duration) *Job {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		snap, ok := r.Snapshot(id)
+		snap, ok := r.Get(id)
 		if ok && snap.Status == want {
 			return &snap
 		}
@@ -221,6 +217,32 @@ func TestList_StableOrder(t *testing.T) {
 	}
 	if got[0].ID != a.ID || got[1].ID != b.ID || got[2].ID != c.ID {
 		t.Errorf("List order wrong: got %s, %s, %s", got[0].ID, got[1].ID, got[2].ID)
+	}
+}
+
+func TestListAndGetReturnDetachedSnapshots(t *testing.T) {
+	r := quickRegistry(t)
+	j := spawnEcho(t, r, "snapshot")
+
+	got, ok := r.Get(j.ID)
+	if !ok {
+		t.Fatal("Get did not find spawned job")
+	}
+	got.Status = StatusKilled
+	got.Command = "mutated by caller"
+
+	list := r.List()
+	if len(list) != 1 {
+		t.Fatalf("List len = %d, want 1", len(list))
+	}
+	list[0].Description = "also mutated"
+
+	fresh, ok := r.Get(j.ID)
+	if !ok {
+		t.Fatal("second Get did not find spawned job")
+	}
+	if fresh.Command == got.Command || fresh.Description == list[0].Description {
+		t.Fatalf("caller mutation leaked into registry: %+v", fresh)
 	}
 }
 

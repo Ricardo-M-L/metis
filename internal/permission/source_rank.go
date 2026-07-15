@@ -60,3 +60,19 @@ func SanitizeResumedSource(source string) string {
 	}
 	return source
 }
+
+// ResumedSessionSource marks every rule read from a session file as
+// session-scoped, regardless of the diagnostic source stored in that file.
+// Sanitizing authority alone is insufficient for a long-lived TUI: a saved
+// rule claiming "config:allow" would otherwise survive the next in-process
+// session switch because it looks like process-scoped configuration.
+func ResumedSessionSource(source string) string {
+	source = SanitizeResumedSource(source)
+	if source == "" {
+		source = "unknown"
+	}
+	if strings.HasPrefix(source, "session:") {
+		return source
+	}
+	return "session:resumed(" + source + ")"
+}

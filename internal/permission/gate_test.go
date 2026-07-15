@@ -254,6 +254,58 @@ func TestGate_RememberAcrossCalls(t *testing.T) {
 	}
 }
 
+func TestGate_ResetSessionStateClearsTransientStateAndPreservesBaseRules(t *testing.T) {
+	g := New(ModeBypass)
+	g.AppendRules(
+		Rule{Tool: "Read", Verb: DecisionAllow, Source: "config:allow"},
+		Rule{Tool: "Bash", Verb: DecisionDeny, Source: "policy:deny"},
+		Rule{Tool: "Edit", Verb: DecisionAllow, Source: "interactive"},
+		Rule{Tool: "WebFetch", Verb: DecisionAllow, Source: "session:resumed(old)"},
+	)
+	g.Remember("Bash", "git status")
+	// Populate denial counters too; those are session-local circuit-breaker
+	// state and must not make the destination session fall back to ASK.
+	g.SetMode(ModeDeny)
+	_, _ = g.Check(context.Background(), "Bash", "rm x")
+
+	listenerCalls := 0
+	g.SetModeChangeListener(func(mode Mode) {
+		listenerCalls++
+		if mode != ModeAsk {
+			t.Errorf("listener mode = %q, want ask", mode)
+		}
+	})
+	g.ResetSessionState(ModeAsk, []Rule{{
+		Tool: "Glob", Verb: DecisionAllow, Source: "session:resumed(new)",
+	}})
+
+	if got := g.Mode(); got != ModeAsk {
+		t.Fatalf("mode = %q, want ask", got)
+	}
+	if listenerCalls != 1 {
+		t.Fatalf("mode listener calls = %d, want 1", listenerCalls)
+	}
+	if g.Remembered("Bash", "git status") {
+		t.Fatal("remembered approval leaked across session boundary")
+	}
+	if consecutive, total, fallback := g.DenialState(); consecutive != 0 || total != 0 || fallback {
+		t.Fatalf("denial state leaked: consecutive=%d total=%d fallback=%v", consecutive, total, fallback)
+	}
+
+	rules := g.Snapshot()
+	if len(rules) != 3 {
+		t.Fatalf("rules = %+v, want two base rules plus destination rule", rules)
+	}
+	for _, rule := range rules {
+		if rule.Tool == "Edit" || rule.Tool == "WebFetch" {
+			t.Errorf("old session rule survived: %+v", rule)
+		}
+	}
+	if decision, _ := g.Check(context.Background(), "Glob", "*.go"); decision != DecisionAllow {
+		t.Errorf("destination session rule not active: %v", decision)
+	}
+}
+
 // TestGate_PopRulesUndoesAppend covers the cron scheduler's per-job
 // tool blacklist installation: AppendRules + run + PopRules(N) must
 // leave the gate in exactly its pre-Append state.

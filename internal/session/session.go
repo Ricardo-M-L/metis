@@ -185,6 +185,9 @@ func mergeHeader(dst *Header, src *Header) {
 	if src.Title != "" {
 		dst.Title = src.Title
 	}
+	if src.Provider != "" {
+		dst.Provider = src.Provider
+	}
 	if src.Model != "" {
 		dst.Model = src.Model
 	}
@@ -197,7 +200,10 @@ func mergeHeader(dst *Header, src *Header) {
 	if src.Mode != "" {
 		dst.Mode = src.Mode
 	}
-	if len(src.AlwaysAllow) > 0 {
+	if src.ClearAlwaysAllow {
+		dst.AlwaysAllow = nil
+		dst.ClearAlwaysAllow = false
+	} else if len(src.AlwaysAllow) > 0 {
 		dst.AlwaysAllow = src.AlwaysAllow
 	}
 	if src.SubAgentOf != "" {
@@ -319,9 +325,10 @@ func (s *Store) Branch(id string, messages []llm.Message) (string, error) {
 	}
 	newID := s.NewSessionID()
 	newHdr := Header{
-		ID:     newID,
-		Model:  hdr.Model,
-		System: hdr.System,
+		ID:       newID,
+		Provider: hdr.Provider,
+		Model:    hdr.Model,
+		System:   hdr.System,
 		ForkedFrom: &pubsess.ForkRef{
 			SessionID:    id,
 			MessageCount: len(messages),

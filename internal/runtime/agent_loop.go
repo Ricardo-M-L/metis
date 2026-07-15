@@ -12,7 +12,6 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
-	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -154,27 +153,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// Sub-agent builders share the parent's tracker pointer instead of
 	// calling this path (see builtin/agent.go).
 	if opts.MaxBudgetUSD > 0 {
-		model := opts.Model
-		loop.Budget = budget.NewTrackerLazy(opts.MaxBudgetUSD, func() (budget.Rates, bool) {
-			cli := catalog.Default()
-			if cli == nil {
-				return budget.Rates{}, false
-			}
-			cost, ok := cli.LookupCostByModelID(model)
-			if !ok {
-				// Distinguish "catalog not warmed yet" (keep retrying)
-				// from "warmed and this model has no pricing" (final —
-				// stop rescanning the full provider map every
-				// round-trip; 2026-06-11 review finding).
-				return budget.Rates{}, cli.Stat().InMemory
-			}
-			return budget.Rates{
-				InputPerMTok:      cost.Input,
-				OutputPerMTok:     cost.Output,
-				CacheReadPerMTok:  cost.CacheRead,
-				CacheWritePerMTok: cost.CacheWrite,
-			}, true
-		})
+		loop.Budget = budget.NewTrackerLazy(opts.MaxBudgetUSD, modelRatesResolver(opts.Model))
 	}
 	if len(opts.SystemSections) > 0 {
 		loop.SystemSections = toLLMSections(opts.SystemSections)

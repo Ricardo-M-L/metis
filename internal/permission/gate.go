@@ -5,6 +5,7 @@ package permission
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 )
@@ -404,6 +405,55 @@ func (g *Gate) SetMode(m Mode) {
 	if listener != nil {
 		listener(m)
 	}
+}
+
+// ResetSessionState crosses a top-level chat-session boundary without
+// rebuilding the Gate. Process-scoped wiring (managed/config/CLI/persistent
+// rules, classifier, read-only hook, mode listener and denial limits) stays in
+// place, while state granted or accumulated by the previous interactive
+// session is discarded.
+//
+// resumedRules must contain only rules loaded from the destination session.
+// Callers should tag them with a "session:" source so a later switch can
+// discard them again. The replacement is committed under one lock, preventing
+// a concurrent permission check from observing a half-cleared rule stack.
+func (g *Gate) ResetSessionState(mode Mode, resumedRules []Rule) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	kept := g.rules[:0]
+	for _, rule := range g.rules {
+		if isSessionRuleSource(rule.Source) {
+			continue
+		}
+		kept = append(kept, rule)
+	}
+	// Detach from the old backing array before appending destination rules.
+	// Besides making the ownership boundary explicit, this prevents a caller's
+	// later mutation of resumedRules from changing the live Gate.
+	g.rules = append([]Rule(nil), kept...)
+	g.rules = append(g.rules, resumedRules...)
+	g.mode = mode
+	g.memoAllow = make(map[string]bool)
+	g.consecutiveDenials = 0
+	g.totalDenials = 0
+	g.denialFallbackUntil = time.Time{}
+	listener := g.onModeChange
+	g.mu.Unlock()
+
+	// Match SetMode's callback contract: fire only after releasing the lock so
+	// the Loop listener can safely call back into Gate-owned state.
+	if listener != nil {
+		listener(mode)
+	}
+}
+
+// isSessionRuleSource identifies grants whose lifetime is one interactive
+// chat. "interactive" is used by /allow and the permission prompt; resumed
+// rules are normalized to "session:*" at the persistence boundary.
+func isSessionRuleSource(source string) bool {
+	return source == "interactive" || strings.HasPrefix(source, "session:")
 }
 
 // SetModeChangeListener wires a callback that fires every time SetMode

@@ -6,8 +6,17 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
+
+func configureModelWidgetAnthropic(m *Model) {
+	m.providerName = "anthropic"
+	m.cfg.Provider.Default = "anthropic"
+	m.cfg.Provider.Anthropic.APIKey = "test-anthropic-key"
+	m.cfg.Provider.Anthropic.Model = "claude-sonnet-4-6"
+	m.cfg.Provider.Anthropic.ContextWindow = 200_000
+}
 
 // TestModelWidget_BareSlashOpensPicker — typing /model opens the picker
 // widget (claude-code parity for browseable model selection).
@@ -42,6 +51,7 @@ func TestModelWidget_AliasOpensPicker(t *testing.T) {
 // inline so scripted usage is unchanged.
 func TestModelWidget_ExplicitArgStaysInline(t *testing.T) {
 	m := newSlashTestModel(t)
+	configureModelWidgetAnthropic(m)
 	m.input.SetValue("/model claude-opus-4-7")
 	pressEnter(t, m)
 
@@ -57,14 +67,15 @@ func TestModelWidget_ExplicitArgStaysInline(t *testing.T) {
 // chosen model to both m.model and m.loop.Model.
 func TestModelWidget_ApplyUpdatesModel(t *testing.T) {
 	m := newSlashTestModel(t)
+	configureModelWidgetAnthropic(m)
 	m.input.SetValue("/model")
 	pressEnter(t, m)
 
 	// Cursor starts wherever m.model matches; for newSlashTestModel
 	// it's "claude-sonnet-4-6" which is index 1 in builtinModelChoices.
-	// Move down twice to MiniMax.
-	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
-	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	// Move up once to Opus; the configured Anthropic profile makes this a
+	// real successful Provider rebuild rather than a string-only test path.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if m.activeScreen != nil {
@@ -83,5 +94,35 @@ func TestModelWidget_ApplyUpdatesModel(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected success-role 'model: ...' confirmation; got: %+v", messageContents(m))
+	}
+}
+
+func TestModelWidget_BuildFailurePreservesModelAndDoesNotReportSuccess(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.providerName = "missing-profile"
+	m.cfg = &config.Config{}
+	oldProvider := m.loop.Provider
+	oldModel := m.model
+	oldLoopModel := m.loop.Model
+	before := len(m.messages)
+
+	picker := screen.NewModelScreen(oldModel, []screen.ModelChoice{{ID: "new-model", Provider: "missing-profile"}})
+	picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m.applyScreenResult(picker)
+
+	if m.model != oldModel || m.loop.Model != oldLoopModel || m.loop.Provider != oldProvider {
+		t.Fatalf("failed picker rebuild changed live state: model=%q loopModel=%q provider=%T", m.model, m.loop.Model, m.loop.Provider)
+	}
+	var warning bool
+	for _, msg := range m.messages[before:] {
+		if msg.Role == "success" && strings.Contains(msg.Content, "model:") {
+			t.Fatalf("failed model switch reported success: %+v", m.messages[before:])
+		}
+		if msg.Role == "warning" && strings.Contains(msg.Content, "previous model remains active") {
+			warning = true
+		}
+	}
+	if !warning {
+		t.Fatalf("failed model switch did not report an actionable warning: %+v", m.messages[before:])
 	}
 }

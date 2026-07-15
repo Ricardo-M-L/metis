@@ -112,6 +112,43 @@ func TestCronService_PauseResume(t *testing.T) {
 	}
 }
 
+func TestCronService_MetadataUpdatesPreserveNextRun(t *testing.T) {
+	svc, err := NewCronService(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &CronJob{
+		Name: "before", Prompt: "work", Enabled: true,
+		Schedule: CronSchedule{Kind: "every", EveryMs: int64(time.Hour / time.Millisecond)},
+	}
+	if err := svc.Create(job); err != nil {
+		t.Fatal(err)
+	}
+	originalNext := job.NextRun
+
+	if err := svc.Update(job.ID, func(current *CronJob) {
+		current.AllowTools = append(current.AllowTools, "Read")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	afterAllow, _ := svc.Get(job.ID)
+	if !afterAllow.NextRun.Equal(originalNext) {
+		t.Fatalf("allow update postponed next run: before=%v after=%v", originalNext, afterAllow.NextRun)
+	}
+
+	if err := svc.Update(job.ID, func(current *CronJob) {
+		current.Name = "after"
+		current.Prompt = "updated work"
+		current.Silent = true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	afterMetadata, _ := svc.Get(job.ID)
+	if !afterMetadata.NextRun.Equal(originalNext) {
+		t.Fatalf("metadata update postponed next run: before=%v after=%v", originalNext, afterMetadata.NextRun)
+	}
+}
+
 func TestCronService_PersistenceAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	svc, _ := NewCronService(dir)

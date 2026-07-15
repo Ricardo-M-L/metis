@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -269,6 +270,8 @@ func TestResolveAPIKey_CustomMissingEverywhere(t *testing.T) {
 	cfg := customProfileWithKeys("TEST_METIS_NEVER_SET_x", "")
 	if _, err := cfg.ResolveAPIKey("deepseek"); err == nil {
 		t.Error("expected 'missing API key' error when all 3 slots empty")
+	} else if !errors.Is(err, ErrMissingAPIKey) {
+		t.Fatalf("missing credential error = %v, want ErrMissingAPIKey", err)
 	}
 }
 

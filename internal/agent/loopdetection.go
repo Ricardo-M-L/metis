@@ -195,6 +195,24 @@ func (d *LoopDetector) RecordProgress() {
 	d.resetCounts()
 }
 
+// Reset clears all counters at a top-level session boundary while preserving
+// thresholds and callbacks.
+func (d *LoopDetector) Reset() {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.callCounts = make(map[string]int)
+	d.toolSeq = nil
+	d.globalCount = 0
+	d.lastProgress = time.Now()
+	d.pollPatterns = make(map[string]int)
+	d.pingPongPairs = make(map[string]int)
+	d.signatureWindow = nil
+	d.signatureTripped = false
+}
+
 // resetCounts resets per-turn counters after a successful turn.
 //
 // signatureWindow + signatureTripped intentionally NOT reset: a

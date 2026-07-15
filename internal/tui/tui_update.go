@@ -59,6 +59,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	default:
 	}
 
+	// Scheduler ticks are lifecycle messages, not screen input. Handle them
+	// before a full-window picker/modal gets first refusal; otherwise the first
+	// tick received while a screen is open is swallowed and, because
+	// handleCronTick is what re-arms the timer, session scheduling stops for
+	// the rest of the process.
+	if tick, ok := msg.(cronFireTickMsg); ok {
+		return m.handleCronTick(time.Time(tick))
+	}
+
 	// Active full-window screen (e.g. /history) takes over input + view.
 	// We still let WindowSizeMsg reach the main chat so the underlying
 	// layout is correct when the screen closes; everything else routes
@@ -99,9 +108,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
-
-	case cronFireTickMsg:
-		return m.handleCronTick(time.Time(msg))
 
 	case bashLocalResultMsg:
 		// Async `!cmd` finished off-thread — append its output here on the
@@ -862,27 +868,27 @@ func (m *Model) persistTail() {
 // by value at the call site. This rules out the data race fixed on
 // 2026-05-20:
 //
-//   pre-fix (method on *Model):
-//     - goroutine read m.ctx, wrote m.turnCancel, read m.loop, used
-//       m.eventCh and m.doneCh — all while the main bubbletea
-//       Update goroutine could legitimately mutate those same
-//       fields (test pressEnter ran Update which queued another
-//       handleSubmit BEFORE the previous turn's runTurnAsync had
-//       drained). go test -race caught it in
-//       TestChatSubmit_RuneByRuneSubmission /
-//       TestChatSubmit_RuneByRuneMultibyte /
-//       TestSlashE2E_BatchRewritesPrompt.
+//	pre-fix (method on *Model):
+//	  - goroutine read m.ctx, wrote m.turnCancel, read m.loop, used
+//	    m.eventCh and m.doneCh — all while the main bubbletea
+//	    Update goroutine could legitimately mutate those same
+//	    fields (test pressEnter ran Update which queued another
+//	    handleSubmit BEFORE the previous turn's runTurnAsync had
+//	    drained). go test -race caught it in
+//	    TestChatSubmit_RuneByRuneSubmission /
+//	    TestChatSubmit_RuneByRuneMultibyte /
+//	    TestSlashE2E_BatchRewritesPrompt.
 //
-//   post-fix (free function):
-//     - caller snapshots m.ctx → derives turnCtx, stores cancel
-//       into m.turnCancel BEFORE the `go` statement (single
-//       writer on main thread)
-//     - caller snapshots m.loop, m.eventCh, m.doneCh
-//     - goroutine touches no Model state — only the passed-in
-//       values + the events channel forwarding loop
-//     - turnCancel cleanup moves to finalizeTurn (main thread,
-//       reached via doneCh handler) so we never write to Model
-//       state from inside the goroutine
+//	post-fix (free function):
+//	  - caller snapshots m.ctx → derives turnCtx, stores cancel
+//	    into m.turnCancel BEFORE the `go` statement (single
+//	    writer on main thread)
+//	  - caller snapshots m.loop, m.eventCh, m.doneCh
+//	  - goroutine touches no Model state — only the passed-in
+//	    values + the events channel forwarding loop
+//	  - turnCancel cleanup moves to finalizeTurn (main thread,
+//	    reached via doneCh handler) so we never write to Model
+//	    state from inside the goroutine
 //
 // The eventCh / doneCh channels themselves are concurrent-safe
 // (Go's channel semantics) so writing to them from the goroutine

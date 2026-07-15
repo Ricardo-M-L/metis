@@ -102,16 +102,17 @@ func TestFireDueEphemeralAdvancesAndRepeats(t *testing.T) {
 	if len(fired) != 1 || fired[0].ID != rec.ID {
 		t.Fatalf("recurring due job should fire once, got %d", len(fired))
 	}
-	if rec.RunCount != 1 {
-		t.Errorf("RunCount = %d, want 1", rec.RunCount)
+	recState, _ := svc.Get(rec.ID)
+	if recState.RunCount != 1 {
+		t.Errorf("RunCount = %d, want 1", recState.RunCount)
 	}
-	if !rec.Enabled {
+	if !recState.Enabled {
 		t.Errorf("recurring job should stay enabled after firing")
 	}
 	// computeNextRun for "every" is wall-clock now+interval, so after firing
 	// the job must have a fresh future next-run (it keeps recurring).
-	if !rec.NextRun.After(time.Now()) {
-		t.Errorf("recurring job should have a future NextRun after firing, got %v", rec.NextRun)
+	if !recState.NextRun.After(time.Now()) {
+		t.Errorf("recurring job should have a future NextRun after firing, got %v", recState.NextRun)
 	}
 	_ = firstNext
 
@@ -127,7 +128,8 @@ func TestFireDueEphemeralAdvancesAndRepeats(t *testing.T) {
 	if fired := svcOne.FireDueEphemeral(due); len(fired) != 1 {
 		t.Fatalf("one-shot should fire once, got %d", len(fired))
 	}
-	if one.Enabled {
+	oneState, _ := svcOne.Get(one.ID)
+	if oneState.Enabled {
 		t.Errorf("one-shot should be disabled after its single fire")
 	}
 	// Not due again.

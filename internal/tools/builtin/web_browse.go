@@ -138,8 +138,18 @@ func (WebBrowse) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 	cmd = exec.CommandContext(ctx2, cmd.Path, cmd.Args[1:]...)
 	out, err := cmd.Output()
 	if err != nil {
+		// An installed browser is not necessarily runnable in the current
+		// environment (CI sandboxes, low-memory hosts, damaged installations).
+		// Preserve WebBrowse's documented graceful degradation instead of
+		// failing a URL that the plain HTTP path can still retrieve.
+		body, fallbackErr := plainFetch(ctx, rawURL)
+		if fallbackErr == nil {
+			return &tools.Result{
+				Output: fmt.Sprintf("[fallback: chromium failed (%v); this is plain HTTP fetch, no JS executed]\n\n%s", err, body),
+			}, nil
+		}
 		return &tools.Result{
-			Output:  fmt.Sprintf("error: chromium exec failed: %v", err),
+			Output:  fmt.Sprintf("error: chromium exec failed: %v; fallback HTTP fetch failed: %v", err, fallbackErr),
 			IsError: true,
 		}, nil
 	}

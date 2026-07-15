@@ -13,6 +13,7 @@ package tui
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -20,6 +21,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 )
 
 // switchTestProvider keeps things minimal: just enough to satisfy
@@ -84,6 +86,7 @@ func TestSwitchModel_RebuildsProviderForKnownProfile(t *testing.T) {
 		permission.New(permission.ModeAcceptEdits),
 		nil, "sys", 5)
 	m.loop.Compactor = agent.NewCompactor(agent.DefaultCompactionConfig(), "old-model", 50_000, oldProv)
+	m.loop.Registry.Register(builtin.NewMetisInfo(m.loop.Gate, nil, nil, nil, m.loop.Registry).WithModel(oldProv, "old-model"))
 	m.providerName = "openai"
 	m.cfg = &config.Config{}
 	// Minimal openai profile so BuildProvider succeeds. APIKey can be a
@@ -115,13 +118,22 @@ func TestSwitchModel_RebuildsProviderForKnownProfile(t *testing.T) {
 		t.Errorf("Compactor.MaxContextTokens (%d) should match Provider.MaxContextTokens (%d) after rebuild",
 			m.loop.Compactor.MaxContextTokens, m.loop.Provider.MaxContextTokens())
 	}
+	infoTool, ok := m.loop.Registry.Get("MetisInfo")
+	if !ok {
+		t.Fatal("MetisInfo disappeared during model rebind")
+	}
+	info, err := infoTool.Execute(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("MetisInfo after switch: %v", err)
+	}
+	if !strings.Contains(info.Output, "id = gpt-4o-mini") {
+		t.Fatalf("MetisInfo still exposes the startup model:\n%s", info.Output)
+	}
 }
 
-// TestSwitchModel_UnknownProfileReturnsErrorButStringsUpdate — when
-// the new profile isn't in cfg, BuildProvider errors; the call returns
-// that error so callers can surface a warning, but the string fields
-// still update so the chrome reflects the user's intent.
-func TestSwitchModel_UnknownProfileReturnsErrorButStringsUpdate(t *testing.T) {
+// TestSwitchModel_UnknownProfileIsAtomic — when the provider cannot be
+// rebuilt, labels must stay paired with the live transport.
+func TestSwitchModel_UnknownProfileIsAtomic(t *testing.T) {
 	m := newE2EModel(t, 120, 30, 0)
 	m.loop = agent.NewLoop(&switchTestProvider{id: "old", maxCtx: 100_000},
 		tools.NewRegistry(),
@@ -133,7 +145,28 @@ func TestSwitchModel_UnknownProfileReturnsErrorButStringsUpdate(t *testing.T) {
 	if err == nil {
 		t.Error("rebuild should return error for unknown profile")
 	}
-	if m.model != "new-model" {
-		t.Errorf("strings should still update on rebuild failure; m.model=%q", m.model)
+	if m.model != "" || m.loop.Model != "" || m.loop.Provider.ModelID() != "old" {
+		t.Errorf("failed rebuild changed model/provider state: model=%q loopModel=%q wire=%q", m.model, m.loop.Model, m.loop.Provider.ModelID())
+	}
+}
+
+func TestSwitchREPLModel_ProviderBuildFailureIsAtomic(t *testing.T) {
+	oldProvider := &switchTestProvider{id: "old-wire", maxCtx: 100_000}
+	loop := agent.NewLoop(oldProvider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "sys", 5)
+	loop.Model = "old-model"
+	r := &REPL{
+		Loop: loop, model: "old-model", providerName: "missing-profile", cfg: &config.Config{},
+	}
+
+	if err := switchREPLModel(r, "new-model"); err == nil {
+		t.Fatal("expected provider build failure")
+	}
+	if r.model != "old-model" || r.Loop.Model != "old-model" || r.Loop.Provider != oldProvider || r.providerName != "missing-profile" {
+		t.Fatalf("failed REPL rebuild changed live state: model=%q loopModel=%q provider=%T profile=%q", r.model, r.Loop.Model, r.Loop.Provider, r.providerName)
+	}
+
+	out := cmdModel(r, "new-model")
+	if !strings.Contains(out, "previous model remains active: old-model") || strings.Contains(out, "model set to") {
+		t.Fatalf("failure output is misleading: %q", out)
 	}
 }

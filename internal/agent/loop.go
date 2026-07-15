@@ -535,6 +535,18 @@ func (l *Loop) SetPrePlanMode(mode string) {
 	l.mu.Unlock()
 }
 
+// SetCheckpointer rebinds working-tree checkpoints at a top-level session
+// boundary. The stack is session-scoped: retaining hashes from the previous
+// manager would let /rewind in the destination session restore unrelated file
+// state and conversation turns.
+func (l *Loop) SetCheckpointer(manager *checkpoint.Manager) {
+	l.ckptMu.Lock()
+	defer l.ckptMu.Unlock()
+	l.Checkpointer = manager
+	l.ckptStack = nil
+	l.ckptSnappedAt = -1
+}
+
 // Reset clears the conversation.
 func (l *Loop) Reset() {
 	l.mu.Lock()
@@ -564,6 +576,10 @@ func (l *Loop) Reset() {
 func (l *Loop) Restore(messages []llm.Message) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.restoreMessagesLocked(messages)
+}
+
+func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
 	if messages == nil {
 		l.Messages = nil
 	} else {
@@ -572,6 +588,77 @@ func (l *Loop) Restore(messages []llm.Message) {
 	}
 	l.turnIdx = 0
 	l.iterIdx = 0
+}
+
+// ResetSession crosses a top-level chat-session boundary. Unlike Restore,
+// which is also used by lightweight history swaps, this clears every mutable
+// guard/cache whose lifetime must not span independent conversations.
+// Callers invoke it only while no foreground turn is running.
+func (l *Loop) ResetSession(messages []llm.Message) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.restoreMessagesLocked(messages)
+	l.estTokens.Store(0)
+	l.todoWriteIter = 0
+	l.todoReminderIter = 0
+	l.todoReconciledThisTurn = false
+	l.haltRequested = false
+	l.haltReason = ""
+	l.steerBuf = nil
+	l.compactCircuitNoticeSent = false
+	l.lastTimeBasedMicrocompactAt = time.Now()
+	l.lastAutoMemoryTurn = 0
+	l.BypassNextCache = false
+	l.discoveredMCP = nil
+	l.discoveredMCPHydrated = false
+	l.contract.reset()
+	l.mu.Unlock()
+
+	if l.Compactor != nil {
+		l.Compactor.ResetCircuit()
+	}
+	if l.Budget != nil {
+		l.Budget.Reset()
+	}
+	if l.Detector != nil {
+		l.Detector.Reset()
+	}
+	if l.CacheStats != nil {
+		l.CacheStats.Reset()
+	}
+	if l.Monitors != nil {
+		l.Monitors.StopAll()
+	}
+	// Rotate the completion channel at a top-level session boundary. A
+	// cancelled background sub-agent may finish slightly later; it retains the
+	// old send endpoint and therefore cannot inject its completion into the new
+	// conversation. The old channel is buffered, so a late non-blocking notify
+	// remains safe until it is garbage-collected.
+	drainSubAgentNotifications(l.subAgentNotify)
+	l.subAgentNotify = make(chan SubAgentNotification, 64)
+	drainJobNotifications(l.JobNotify)
+}
+
+func drainSubAgentNotifications(ch <-chan SubAgentNotification) {
+	for ch != nil {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+func drainJobNotifications(ch <-chan jobs.Notification) {
+	for ch != nil {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
 
 // UndoLastTurn pops the most recent user→assistant exchange (including any

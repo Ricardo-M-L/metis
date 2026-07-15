@@ -10,6 +10,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 func (m *Model) handleSessionPick() (tea.Model, tea.Cmd) {
@@ -119,6 +121,12 @@ func (m *Model) asREPL() *REPL {
 		skillDir:     m.skillDir,
 		cmds:         m.cmds,
 		totalTokens:  m.totalTokens,
+		baseSystem:   m.baseSystem,
+		baseSystemSections: append([]llm.SystemSection(nil),
+			m.baseSystemSections...),
+		SessionSwitch:       m.ext.SessionSwitch,
+		SessionBoundary:     m.ext.SessionBoundary,
+		FreshPermissionMode: m.ext.FreshPermissionMode,
 	}
 	// Live-state closures so slash handlers can read TUI-only data
 	// (sub-agent roster, bg-turn state) and write to TUI-only surfaces

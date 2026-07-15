@@ -2,6 +2,7 @@ package permission
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -13,7 +14,7 @@ func TestMatchesRuleContent_Prefix(t *testing.T) {
 		{"git push:*", "git push", true},
 		{"git push:*", "git push origin main", true},
 		{"git push:*", "git push --force-with-lease", true},
-		{"git push:*", "git pushup", false},          // token boundary
+		{"git push:*", "git pushup", false},                  // token boundary
 		{"git status:*", "git status; rm -rf /tmp/x", false}, // chain guard
 		{"git status:*", "git status && rm -rf /", false},
 		{"git status:*", "git status || true", false},
@@ -41,7 +42,7 @@ func TestMatchesRuleContent_Glob(t *testing.T) {
 		{"/etc/**", "/home/etc/x", false}, // anchored
 		{"/home/*/notes.md", "/home/alice/notes.md", true},
 		{"/home/*/notes.md", "/home/alice/sub/notes.md", false}, // * stays in segment
-		{"**/*.env", "project/sub/.env", true}, // gitignore semantics: * may be empty
+		{"**/*.env", "project/sub/.env", true},                  // gitignore semantics: * may be empty
 		{"**/*.go", "internal/agent/loop.go", true},
 		{"*.secret", "api.secret", true},
 	}
@@ -160,6 +161,18 @@ func TestSanitizeResumedSource(t *testing.T) {
 	}
 	if got := SanitizeResumedSource("config:allow"); got != "config:allow" {
 		t.Errorf("config source mangled: %q", got)
+	}
+}
+
+func TestResumedSessionSourceAlwaysHasSessionLifetime(t *testing.T) {
+	for _, source := range []string{"interactive", "config:allow", "policy:deny", ""} {
+		got := ResumedSessionSource(source)
+		if !strings.HasPrefix(got, "session:") {
+			t.Errorf("ResumedSessionSource(%q) = %q, want session prefix", source, got)
+		}
+		if sourceRank(got) > rankInteractive {
+			t.Errorf("ResumedSessionSource(%q) retained elevated rank: %q", source, got)
+		}
 	}
 }
 

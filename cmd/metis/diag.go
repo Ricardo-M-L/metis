@@ -198,6 +198,9 @@ func providerKeyAndModel(cfg *config.Config, name string) (string, string) {
 	case "gemini":
 		return cfg.Provider.Gemini.APIKeyEnv, cfg.Provider.Gemini.Model
 	}
+	if raw, ok := cfg.Provider.Custom[name]; ok {
+		return raw.APIKeyEnv, raw.Model
+	}
 	return "", ""
 }
 

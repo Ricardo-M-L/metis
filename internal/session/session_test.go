@@ -166,6 +166,7 @@ func TestSession_WriteHeaderFullPreservesAllFields(t *testing.T) {
 	}
 	want := Header{
 		ID:          "resume-test",
+		Provider:    "anthropic",
 		Model:       "claude-opus",
 		System:      "you are helpful",
 		WorkDir:     "/tmp/scratch",
@@ -179,7 +180,7 @@ func TestSession_WriteHeaderFullPreservesAllFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Mode != "auto" || got.WorkDir != "/tmp/scratch" {
+	if got.Provider != "anthropic" || got.Mode != "auto" || got.WorkDir != "/tmp/scratch" {
 		t.Errorf("header roundtrip wrong: %+v", got)
 	}
 	if len(got.AlwaysAllow) != 2 {
@@ -187,6 +188,95 @@ func TestSession_WriteHeaderFullPreservesAllFields(t *testing.T) {
 	}
 	if got.AlwaysAllow[0].Tool != "Bash" || got.AlwaysAllow[0].Match != "git" {
 		t.Errorf("rule[0] mismatch: %+v", got.AlwaysAllow[0])
+	}
+}
+
+func TestSession_HeaderProviderMergesAndBranchPreservesIt(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const parentID = "provider-parent"
+	if err := store.WriteHeaderFull(Header{
+		ID: parentID, Provider: "anthropic", Model: "claude-old", System: "parent-system",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A title-only append must not erase the provider. A later explicit
+	// provider/model append must replace both fields together.
+	if err := store.SetTitle(parentID, "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(Header{ID: parentID, Provider: "openai", Model: "gpt-new"}); err != nil {
+		t.Fatal(err)
+	}
+	hdr, _, err := store.LoadHeader(parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Provider != "openai" || hdr.Model != "gpt-new" || hdr.System != "parent-system" || hdr.Title != "renamed" {
+		t.Fatalf("merged header = %+v", hdr)
+	}
+
+	branchID, err := store.Branch(parentID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, _, err := store.LoadHeader(branchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.Provider != "openai" || branch.Model != "gpt-new" || branch.System != "parent-system" {
+		t.Fatalf("branch lost provider/model/system: %+v", branch)
+	}
+}
+
+func TestSession_ClearAlwaysAllowTombstone(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "clear-rules"
+	if err := store.WriteHeaderFull(Header{
+		ID: id, Model: "test",
+		AlwaysAllow: []SavedRule{{Tool: "Edit", Verb: 1, Source: "interactive"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(Header{ID: id, ClearAlwaysAllow: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, load := range []struct {
+		name string
+		fn   func() (*Header, error)
+	}{
+		{name: "Load", fn: func() (*Header, error) { h, _, err := store.Load(id); return h, err }},
+		{name: "LoadHeader", fn: func() (*Header, error) { h, _, err := store.LoadHeader(id); return h, err }},
+	} {
+		t.Run(load.name, func(t *testing.T) {
+			hdr, err := load.fn()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(hdr.AlwaysAllow) != 0 {
+				t.Fatalf("tombstone did not clear rules: %+v", hdr.AlwaysAllow)
+			}
+		})
+	}
+
+	// The tombstone clears prior state; it must not permanently prevent a
+	// later interactive approval from being persisted.
+	if err := store.WriteHeaderFull(Header{
+		ID: id, AlwaysAllow: []SavedRule{{Tool: "Read", Verb: 1, Source: "interactive"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hdr, _, err := store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hdr.AlwaysAllow) != 1 || hdr.AlwaysAllow[0].Tool != "Read" {
+		t.Fatalf("rule written after tombstone was not restored: %+v", hdr.AlwaysAllow)
 	}
 }
 

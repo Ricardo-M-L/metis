@@ -81,20 +81,16 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			}
 		}
 		switchErr := m.switchModel(applied, newProvName)
-		// Success row fires unconditionally — switchModel always updates
-		// m.model + m.loop.Model up front, even when the Provider
-		// rebuild itself can't run (missing profile in cfg, no API key,
-		// etc.). A separate warning row surfaces the rebuild failure so
-		// the user knows the Provider stayed on the old transport.
-		m.messages = append(m.messages, Message{
-			Role:      "success",
-			Content:   "model: " + applied + "  ·  provider: " + m.providerName,
-			Timestamp: time.Now(),
-		})
 		if switchErr != nil {
 			m.messages = append(m.messages, Message{
 				Role:      "warning",
-				Content:   "model name updated, but Provider rebuild failed: " + switchErr.Error(),
+				Content:   "model switch failed; previous model remains active: " + switchErr.Error(),
+				Timestamp: time.Now(),
+			})
+		} else {
+			m.messages = append(m.messages, Message{
+				Role:      "success",
+				Content:   "model: " + m.model + "  ·  provider: " + m.providerName,
 				Timestamp: time.Now(),
 			})
 		}
@@ -201,17 +197,28 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			if m.session == nil {
 				return nil
 			}
+			if err := m.session.CheckResumeSize(picked); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: err.Error(), Timestamp: time.Now()})
+				return nil
+			}
+			if err := m.persistActiveSessionState(); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "resume failed: " + err.Error(), Timestamp: time.Now()})
+				return nil
+			}
 			if hdr, msgs, err := m.session.Load(picked); err == nil && hdr != nil {
-				m.sessionID = picked
-				m.loop.Restore(msgs)
-				m.messages = nil
-				m.toolEvents = nil
-				m.totalTokens.Reset()
+				workDirWarning := m.sessionWorkDirWarning(hdr)
+				if err := m.activateSession(picked, hdr, msgs, true); err != nil {
+					m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning("resume", err), Timestamp: time.Now()})
+					return nil
+				}
 				m.messages = append(m.messages, Message{
 					Role:      "success",
 					Content:   "resumed session: " + shortID(picked),
 					Timestamp: time.Now(),
 				})
+				if workDirWarning != "" {
+					m.messages = append(m.messages, Message{Role: "warning", Content: workDirWarning, Timestamp: time.Now()})
+				}
 			} else if err != nil {
 				m.messages = append(m.messages, Message{
 					Role:      "error",
@@ -234,6 +241,124 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 				m.activeScreen = ds
 			}
 		}
+
+	// === Feature 1: Resume/Fork Picker ===
+	case *screen.ResumeScreen:
+		action := w.Action()
+		sid := w.Selected()
+		if sid == "" && action != screen.ResumeActionFresh {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(resume dialog dismissed)",
+				Timestamp: time.Now(),
+			})
+			return nil
+		}
+		if action == screen.ResumeActionFresh {
+			if m.session == nil || m.loop == nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "cannot start a fresh session: session runtime unavailable", Timestamp: time.Now()})
+				return nil
+			}
+			if err := m.persistActiveSessionState(); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "fresh session failed: " + err.Error(), Timestamp: time.Now()})
+				return nil
+			}
+			newID, hdr, err := m.createFreshSession()
+			if err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "fresh session failed: " + err.Error(), Timestamp: time.Now()})
+				return nil
+			}
+			if err := m.activateSession(newID, hdr, nil, false); err != nil {
+				m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning("fresh session activation", err), Timestamp: time.Now()})
+				return nil
+			}
+			m.messages = append(m.messages, Message{
+				Role:      "success",
+				Content:   "started fresh session: " + shortID(newID),
+				Timestamp: time.Now(),
+			})
+			return nil
+		}
+		if m.session == nil {
+			return nil
+		}
+		if err := m.session.CheckResumeSize(sid); err != nil {
+			m.messages = append(m.messages, Message{Role: "error", Content: err.Error(), Timestamp: time.Now()})
+			return nil
+		}
+		if err := m.persistActiveSessionState(); err != nil {
+			m.messages = append(m.messages, Message{Role: "error", Content: "resume failed: " + err.Error(), Timestamp: time.Now()})
+			return nil
+		}
+		hdr, msgs, err := m.session.Load(sid)
+		if err != nil || hdr == nil {
+			detail := "session header missing"
+			if err != nil {
+				detail = err.Error()
+			}
+			m.messages = append(m.messages, Message{
+				Role:      "error",
+				Content:   "resume failed: " + detail,
+				Timestamp: time.Now(),
+			})
+			return nil
+		}
+		if action == screen.ResumeActionFork {
+			newID, newHdr, branchErr := m.forkSession(sid, msgs)
+			if branchErr != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "fork failed: " + branchErr.Error(), Timestamp: time.Now()})
+				return nil
+			}
+			sid = newID
+			hdr = newHdr
+		}
+		workDirWarning := ""
+		if action == screen.ResumeActionResume {
+			workDirWarning = m.sessionWorkDirWarning(hdr)
+		}
+		label := "resumed"
+		failureAction := "resume"
+		if action == screen.ResumeActionFork {
+			label = "forked"
+			failureAction = "fork activation"
+		}
+		if err := m.activateSession(sid, hdr, msgs, action == screen.ResumeActionResume); err != nil {
+			m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning(failureAction, err), Timestamp: time.Now()})
+			return nil
+		}
+		m.messages = append(m.messages, Message{
+			Role:      "success",
+			Content:   label + " session: " + shortID(sid),
+			Timestamp: time.Now(),
+		})
+		if workDirWarning != "" {
+			m.messages = append(m.messages, Message{Role: "warning", Content: workDirWarning, Timestamp: time.Now()})
+		}
+
+	// === Feature 3: Diff Viewer ===
+	case *screen.DiffViewerScreen:
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   "(diff viewer dismissed)",
+			Timestamp: time.Now(),
+		})
+
+	// === Feature 4: Multi-Agent Visualization ===
+	case *screen.MultiAgentScreen:
+		picked := w.Selected()
+		if picked == "" {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(agents dialog dismissed)",
+				Timestamp: time.Now(),
+			})
+			return nil
+		}
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   "selected agent: " + picked,
+			Timestamp: time.Now(),
+		})
 	}
 	return nil
 }

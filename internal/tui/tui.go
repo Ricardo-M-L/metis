@@ -15,6 +15,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
@@ -135,11 +137,23 @@ type ExternalHooks struct {
 	// write. Returns the assistant text, or an error. Implementation
 	// expected to share the parent's prompt cache.
 	BtwAsk func(ctx context.Context, question string) (string, error)
+	// SessionSwitch rebinds process/runtime-owned session routers (Todo/Task
+	// stores, prompt dumps and working-tree checkpoints). The TUI owns the
+	// transcript, gate, timing, title and cost portions of the same boundary.
+	SessionSwitch func(sessionID string)
+	// SessionBoundary releases process-owned work tied to the session being
+	// left (for example background bash jobs and monitor goroutines). It runs
+	// only after destination preflight succeeds and before the new ID commits.
+	SessionBoundary func()
+	// FreshPermissionMode is the invocation-resolved mode after CLI/profile
+	// overrides. A fresh/forked session must use this baseline, not inherit a
+	// resumed session's bypass/deny posture.
+	FreshPermissionMode permission.Mode
 }
 
 type Model struct {
-	ctx       context.Context
-	loop      *agent.Loop
+	ctx  context.Context
+	loop *agent.Loop
 	// cronSvc backs the in-session scheduler (cron_scheduler.go) — the same
 	// CronService the CronCreate/List/Delete tools mutate, so session-only
 	// jobs the model schedules mid-chat fire here. nil ⇒ no in-session ticks.
@@ -156,7 +170,12 @@ type Model struct {
 	// previously-set title takes effect on first frame; updated in
 	// keybind_submit.go's SignalTitle handler when the user renames.
 	sessionTitle string
-	model        string
+	// baseSystem is the invocation-level system prompt. Old session files may
+	// omit System; falling back here prevents the system prompt of the session
+	// being left from leaking into a fresh/legacy destination.
+	baseSystem         string
+	baseSystemSections []llm.SystemSection
+	model              string
 	// providerName tracks the provider profile the running Loop.Provider
 	// was built from (cfg.Provider.Default at startup, or whichever
 	// profile the user picked via /model). Required for mid-session
@@ -676,13 +695,16 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 	pc := perfConfig()
 
 	mdl := &Model{
-		ctx:          ctx,
-		loop:         loop,
-		cronSvc:      cronSvc,
-		gate:         gate,
-		slash:        sl,
-		session:      st,
-		sessionID:    sid,
+		ctx:        ctx,
+		loop:       loop,
+		cronSvc:    cronSvc,
+		gate:       gate,
+		slash:      sl,
+		session:    st,
+		sessionID:  sid,
+		baseSystem: loop.System,
+		baseSystemSections: append([]llm.SystemSection(nil),
+			loop.SystemSections...),
 		model:        model,
 		providerName: providerName,
 		skillDir:     skillDir,
@@ -698,22 +720,22 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		// at a blank screen and thinks metis hung (2026-06-15). 80x24 is
 		// the universal terminal fallback; the real WindowSizeMsg
 		// re-renders at the true size a frame later.
-		width:  80,
-		height: 24,
-		eventCh:      make(chan agent.Event, eventBufferSize()),
-		doneCh:       make(chan error, 1),
-		overlays:     overlay.New(),
-		renderCache:  newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
-		showBanner:   true,
+		width:       80,
+		height:      24,
+		eventCh:     make(chan agent.Event, eventBufferSize()),
+		doneCh:      make(chan error, 1),
+		overlays:    overlay.New(),
+		renderCache: newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
+		showBanner:  true,
 		// Sticky-strip selection state — -1 = no selection. Updated by
 		// MouseClickMsg / MouseMotionMsg / MouseReleaseMsg when click
 		// lands in the strip area (msg.Y >= stripStartY).
 		stripSelStart: -1,
 		stripSelEnd:   -1,
-		firstRender:  true,
-		input:        ti,
-		chatList:     cl,
-		stickyBottom: true,
+		firstRender:   true,
+		input:         ti,
+		chatList:      cl,
+		stickyBottom:  true,
 		// 4-level permission ask, matching claude-code's pattern:
 		//   y — allow this once
 		//   a — allow always (whitelist this tool for the session)
@@ -825,14 +847,20 @@ func RunTUI(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, s
 
 	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
+	// Persist the final mode + interactive approvals even when the user never
+	// switched sessions in-process; otherwise a later --resume has nothing to
+	// restore from the header's AlwaysAllow field.
+	if persistErr := m.persistActiveSessionState(); persistErr != nil {
+		err = errors.Join(err, persistErr)
+	}
 	// Claude-code-style goodbye hint — print AFTER bubbletea releases
 	// alt-screen so it lands in the user's normal scrollback. Tells
 	// them how to come back to this exact session next time. Skipped
 	// on error (the error itself is the priority message) and when sid
 	// is empty (e.g. the user quit during the auth wizard before any
 	// session was created).
-	if err == nil && sid != "" {
-		printResumeHint(m.session, sid)
+	if err == nil && m.sessionID != "" {
+		printResumeHint(m.session, m.sessionID)
 	}
 	return err
 }

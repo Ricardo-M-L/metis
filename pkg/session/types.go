@@ -19,12 +19,16 @@ import "time"
 type Header struct {
 	ID          string      `json:"id"`
 	CreatedAt   time.Time   `json:"created_at"`
+	Provider    string      `json:"provider,omitempty"`
 	Model       string      `json:"model"`
 	System      string      `json:"system,omitempty"`
 	WorkDir     string      `json:"work_dir,omitempty"`
 	Mode        string      `json:"mode,omitempty"`
 	AlwaysAllow []SavedRule `json:"always_allow,omitempty"`
-	Title       string      `json:"title,omitempty"`
+	// ClearAlwaysAllow is an append-only tombstone used when a later header
+	// must remove every previously persisted interactive grant.
+	ClearAlwaysAllow bool   `json:"clear_always_allow,omitempty"`
+	Title            string `json:"title,omitempty"`
 	// ForkedFrom — non-nil when this session was created via /branch. Stores
 	// the parent session ID so a viewer / `metis sessions list` can render
 	// the lineage. Mirrors claude-code's `forkedFrom` metadata; the link is

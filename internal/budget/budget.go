@@ -70,6 +70,27 @@ func NewTrackerLazy(maxUSD float64, fn func() (Rates, bool)) *Tracker {
 	return &Tracker{maxUSD: maxUSD, ratesFn: fn}
 }
 
+// SetRatesResolver changes the pricing source used for future usage without
+// resetting spend or the configured cap. A long-lived TUI can switch models
+// inside one session; keeping the old model's resolved rates would make every
+// subsequent request (and the budget warning/cap) use the wrong price.
+//
+// The new resolver is evaluated lazily on the next AddUsage call, matching
+// NewTrackerLazy's catalogue warm-up behaviour. A nil resolver deliberately
+// installs fixed zero rates, which is the safe fallback for an unpriceable
+// model: usage remains counted by the caller, but no bogus USD amount is
+// charged.
+func (t *Tracker) SetRatesResolver(fn func() (Rates, bool)) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rates = Rates{}
+	t.ratesFn = fn
+	t.resolved = fn == nil
+}
+
 // currentRates returns the effective rates, re-resolving lazily until
 // the source declares its answer final. Caller holds t.mu.
 func (t *Tracker) currentRates() Rates {
@@ -95,6 +116,18 @@ func (t *Tracker) AddUsage(in, out, cacheRead, cacheWrite int) {
 		float64(out)/mtok*r.OutputPerMTok +
 		float64(cacheRead)/mtok*r.CacheReadPerMTok +
 		float64(cacheWrite)/mtok*r.CacheWritePerMTok
+}
+
+// Reset starts a new top-level session budget while preserving the configured
+// cap and pricing resolver.
+func (t *Tracker) Reset() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.spent = 0
+	t.warned = false
 }
 
 // SpentUSD returns the cumulative spend so far.

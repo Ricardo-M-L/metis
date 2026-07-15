@@ -89,11 +89,11 @@ type CronJob struct {
 	// to review (`cron denied <id>`). Dangerous-pattern commands (rm -rf /,
 	// fork bombs) stay denied even when allow-listed — pre-authorization
 	// can't punch through the hard floor (see EvaluateCronPermission).
-	AllowTools    []string     `json:"allow_tools,omitempty"`
-	CreatedAt     time.Time    `json:"created_at"`
-	LastRun       time.Time    `json:"last_run,omitempty"`
-	NextRun       time.Time    `json:"next_run,omitempty"`
-	RunCount      int          `json:"run_count"`
+	AllowTools []string  `json:"allow_tools,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastRun    time.Time `json:"last_run,omitempty"`
+	NextRun    time.Time `json:"next_run,omitempty"`
+	RunCount   int       `json:"run_count"`
 	// ExpiresAt — when set, the scheduler skips this job after the deadline
 	// and the next List/persist sweep removes it. /loop sets this to 7 days
 	// out by default so accidentally-left-running loops eventually clean
@@ -138,7 +138,15 @@ type CronService struct {
 	jobs    map[string]*CronJob
 	done    chan struct{}
 	running bool // true while a schedulerLoop goroutine owns `done`
+
+	// refreshInterval bounds how long a running daemon can retain a stale
+	// view of durable jobs. CLI mutations happen in separate processes, so an
+	// in-memory-only scheduler would otherwise never observe add/rm/pause/
+	// resume/allow changes until restart. Tests shorten this interval.
+	refreshInterval time.Duration
 }
+
+const defaultCronRefreshInterval = time.Second
 
 // NewCronService creates a new cron service.
 func NewCronService(root string) (*CronService, error) {
@@ -146,9 +154,10 @@ func NewCronService(root string) (*CronService, error) {
 		return nil, err
 	}
 	s := &CronService{
-		root: root,
-		jobs: make(map[string]*CronJob),
-		done: make(chan struct{}),
+		root:            root,
+		jobs:            make(map[string]*CronJob),
+		done:            make(chan struct{}),
+		refreshInterval: defaultCronRefreshInterval,
 	}
 	if err := s.loadAll(); err != nil {
 		return nil, err
@@ -160,11 +169,12 @@ func (s *CronService) path(id string) string {
 	return filepath.Join(s.root, id+".json")
 }
 
-func (s *CronService) loadAll() error {
+func (s *CronService) readDurableJobs() (map[string]*CronJob, error) {
 	ents, err := os.ReadDir(s.root)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	loaded := make(map[string]*CronJob)
 	for _, e := range ents {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
@@ -174,7 +184,51 @@ func (s *CronService) loadAll() error {
 		if err := s.loadJob(id, &job); err != nil {
 			continue
 		}
-		s.jobs[id] = &job
+		// The filename is the storage identity. Do not trust a stale or
+		// hand-edited JSON id to redirect later saves to a different path.
+		job.ID = id
+		job.Ephemeral = false
+		loaded[id] = &job
+	}
+	return loaded, nil
+}
+
+func (s *CronService) loadAll() error {
+	loaded, err := s.readDurableJobs()
+	if err != nil {
+		return err
+	}
+	for id, job := range loaded {
+		s.jobs[id] = job
+	}
+	return nil
+}
+
+// reloadDurableFromDisk merges the latest cross-process durable state into
+// the live service while preserving session-only jobs. Every `metis cron`
+// invocation owns a separate CronService, so polling this storage boundary is
+// what makes a long-running `cron start` daemon observe CRUD and allow-list
+// changes made by later CLI/Desktop processes.
+func (s *CronService) reloadDurableFromDisk() error {
+	loaded, err := s.readDurableJobs()
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, job := range s.jobs {
+		if !job.Ephemeral {
+			delete(s.jobs, id)
+		}
+	}
+	for id, job := range loaded {
+		// An ID collision is vanishingly unlikely, but a live session-only
+		// job must never silently turn durable because a file appeared.
+		if existing, ok := s.jobs[id]; ok && existing.Ephemeral {
+			continue
+		}
+		s.jobs[id] = job
 	}
 	return nil
 }
@@ -200,13 +254,50 @@ func (s *CronService) saveJob(job *CronJob) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path(job.ID), b, 0o644)
+	// The daemon polls this directory while sibling CLI processes write it.
+	// Publish via rename so a refresh can see either the old complete JSON or
+	// the new complete JSON, never a truncate-in-progress document.
+	tmp, err := os.CreateTemp(s.root, "."+job.ID+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, s.path(job.ID))
+}
+
+// cloneCronJob returns a fully independent public snapshot. CronJob contains
+// slices, so a shallow struct copy would still let callers race with Update or
+// the scheduler by mutating shared backing arrays after List/Get returns.
+func cloneCronJob(job *CronJob) *CronJob {
+	if job == nil {
+		return nil
+	}
+	clone := *job
+	clone.Skills = append([]string(nil), job.Skills...)
+	clone.DisabledTools = append([]string(nil), job.DisabledTools...)
+	clone.AllowTools = append([]string(nil), job.AllowTools...)
+	return &clone
 }
 
 // Create adds a new cron job. Validates the schedule shape up-front so
 // a bad cron expression is rejected at create time rather than silently
 // disabling the job after the first scheduler tick.
 func (s *CronService) Create(job *CronJob) error {
+	if job == nil {
+		return fmt.Errorf("cron job required")
+	}
 	if err := validateSchedule(job.Schedule); err != nil {
 		return fmt.Errorf("invalid schedule: %w", err)
 	}
@@ -216,20 +307,27 @@ func (s *CronService) Create(job *CronJob) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if job.ID == "" {
-		job.ID = generateID()
+	created := cloneCronJob(job)
+	if created.ID == "" {
+		created.ID = generateID()
 	}
-	if job.CreatedAt.IsZero() {
-		job.CreatedAt = time.Now()
+	if created.CreatedAt.IsZero() {
+		created.CreatedAt = time.Now()
 	}
-	if job.Enabled {
-		s.computeNextRun(job)
+	if created.Enabled {
+		s.computeNextRun(created)
 	}
-	s.jobs[job.ID] = job
 	// saveJob is a no-op for ephemeral (session-only) jobs — they stay in
 	// memory, the in-session scheduler fires them, the daemon never learns
 	// they exist.
-	return s.saveJob(job)
+	if err := s.saveJob(created); err != nil {
+		return err
+	}
+	s.jobs[created.ID] = created
+	// Preserve the long-standing caller contract: Create fills ID/CreatedAt/
+	// NextRun on the supplied value, while the service keeps its own copy.
+	*job = *cloneCronJob(created)
+	return nil
 }
 
 // FireDueEphemeral advances and returns every ephemeral (session-only) job
@@ -243,7 +341,7 @@ func (s *CronService) FireDueEphemeral(now time.Time) []*CronJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var fired []*CronJob
-	for _, j := range s.jobs {
+	for id, j := range s.jobs {
 		if !j.Ephemeral || !j.Enabled || j.Paused || j.NextRun.IsZero() {
 			continue
 		}
@@ -253,15 +351,10 @@ func (s *CronService) FireDueEphemeral(now time.Time) []*CronJob {
 		if j.NextRun.After(now) {
 			continue
 		}
-		j.LastRun = now
-		j.RunCount++
-		if j.Repeat > 0 && j.RunCount >= j.Repeat {
-			j.Enabled = false
+		advanced, err := s.advanceJobLocked(id, now)
+		if err == nil {
+			fired = append(fired, advanced)
 		}
-		if j.Enabled && !j.Paused {
-			s.computeNextRun(j)
-		}
-		fired = append(fired, j)
 	}
 	return fired
 }
@@ -318,7 +411,7 @@ func (s *CronService) List() []*CronJob {
 	defer s.mu.RUnlock()
 	out := make([]*CronJob, 0, len(s.jobs))
 	for _, j := range s.jobs {
-		out = append(out, j)
+		out = append(out, cloneCronJob(j))
 	}
 	return out
 }
@@ -328,22 +421,39 @@ func (s *CronService) Get(id string) (*CronJob, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	j, ok := s.jobs[id]
-	return j, ok
+	return cloneCronJob(j), ok
 }
 
 // Update modifies an existing job.
 func (s *CronService) Update(id string, patch func(*CronJob)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	job, ok := s.jobs[id]
+	current, ok := s.jobs[id]
 	if !ok {
 		return fmt.Errorf("job not found: %s", id)
 	}
+	job := cloneCronJob(current)
+	previousSchedule := job.Schedule
+	wasEnabled := job.Enabled
+	wasPaused := job.Paused
 	patch(job)
-	if job.Enabled && !job.Paused {
+	// Storage identity is controlled by the map key / filename, not by an
+	// arbitrary patch callback.
+	job.ID = id
+	// Authorization and descriptive metadata updates must not postpone an
+	// already-scheduled fire. Recompute only when the timing/lifecycle change
+	// requires a new deadline (or a legacy job has none at all).
+	scheduleChanged := job.Schedule != previousSchedule
+	becameEnabled := !wasEnabled && job.Enabled
+	resumed := wasPaused && !job.Paused
+	if job.Enabled && !job.Paused && (scheduleChanged || becameEnabled || resumed || job.NextRun.IsZero()) {
 		s.computeNextRun(job)
 	}
-	return s.saveJob(job)
+	if err := s.saveJob(job); err != nil {
+		return err
+	}
+	s.jobs[id] = job
+	return nil
 }
 
 // Remove deletes a job.
@@ -353,8 +463,15 @@ func (s *CronService) Remove(id string) error {
 	if _, ok := s.jobs[id]; !ok {
 		return fmt.Errorf("job not found: %s", id)
 	}
+	job := s.jobs[id]
 	delete(s.jobs, id)
-	os.Remove(s.path(id))
+	if job != nil && !job.Ephemeral {
+		if err := os.Remove(s.path(id)); err != nil && !os.IsNotExist(err) {
+			// Restore the in-memory entry when durable deletion did not land.
+			s.jobs[id] = job
+			return err
+		}
+	}
 	return nil
 }
 
@@ -369,24 +486,26 @@ func (s *CronService) Pause(id string) error {
 func (s *CronService) Resume(id string) error {
 	return s.Update(id, func(j *CronJob) {
 		j.Paused = false
-		if j.Enabled {
-			s.computeNextRun(j)
-		}
 	})
 }
 
 // Run triggers immediate execution of a job.
 func (s *CronService) Run(id string) error {
-	job, ok := s.Get(id)
-	if !ok {
-		return fmt.Errorf("job not found: %s", id)
-	}
-	return s.runJob(job)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.advanceJobLocked(id, time.Now())
+	return err
 }
 
-// runJob executes a job's prompt.
-func (s *CronService) runJob(job *CronJob) error {
-	job.LastRun = time.Now()
+// advanceJobLocked records one firing and returns an immutable callback
+// snapshot. The caller must hold s.mu for writing.
+func (s *CronService) advanceJobLocked(id string, ranAt time.Time) (*CronJob, error) {
+	current, ok := s.jobs[id]
+	if !ok {
+		return nil, fmt.Errorf("job not found: %s", id)
+	}
+	job := cloneCronJob(current)
+	job.LastRun = ranAt
 	job.RunCount++
 	if job.Repeat > 0 && job.RunCount >= job.Repeat {
 		job.Enabled = false
@@ -394,7 +513,30 @@ func (s *CronService) runJob(job *CronJob) error {
 	if job.Enabled && !job.Paused {
 		s.computeNextRun(job)
 	}
-	return s.saveJob(job)
+	if err := s.saveJob(job); err != nil {
+		return nil, err
+	}
+	s.jobs[id] = job
+	return cloneCronJob(job), nil
+}
+
+// ClearEphemeral drops every session-only job at a top-level chat-session
+// boundary. Durable jobs remain process/global and continue to be managed by
+// the standalone daemon.
+func (s *CronService) ClearEphemeral() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for id, job := range s.jobs {
+		if job.Ephemeral {
+			delete(s.jobs, id)
+			removed++
+		}
+	}
+	return removed
 }
 
 // computeNextRun calculates the next run time based on schedule.
@@ -486,34 +628,66 @@ func (s *CronService) Start(ctx context.Context, onFire func(*CronJob) error) {
 }
 
 func (s *CronService) schedulerLoop(ctx context.Context, onFire func(*CronJob) error) {
+	refreshInterval := s.refreshInterval
+	if refreshInterval <= 0 {
+		refreshInterval = defaultCronRefreshInterval
+	}
 	for {
+		// Durable CRUD is performed by short-lived sibling processes. Refresh
+		// before choosing the next timer so the daemon never treats its startup
+		// snapshot as authoritative forever.
+		_ = s.reloadDurableFromDisk()
 		s.reapExpired()
 		s.mu.RLock()
-		job, next := s.nextJob()
+		jobID, next := s.nextJob()
 		s.mu.RUnlock()
 
-		if job == nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-s.done:
-				return
-			case <-time.After(1 * time.Minute):
-				continue
+		wait := refreshInterval
+		if jobID != "" {
+			until := time.Until(next)
+			if until < 0 {
+				until = 0
+			}
+			if until < wait {
+				wait = until
 			}
 		}
 
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		case <-s.done:
+			timer.Stop()
 			return
-		case <-time.After(time.Until(next)):
-			s.mu.Lock()
-			if err := s.runJob(job); err == nil {
-				onFire(job)
+		case <-timer.C:
+		}
+
+		if jobID == "" {
+			continue
+		}
+
+		// Re-read once more at the firing edge. An external pause/rm/allow
+		// may have landed while this timer was asleep; using the pre-sleep
+		// pointer here would both mis-fire and overwrite the newer file.
+		_ = s.reloadDurableFromDisk()
+		s.reapExpired()
+		var fired *CronJob
+		s.mu.Lock()
+		if current, ok := s.jobs[jobID]; ok && current.Enabled && !current.Paused &&
+			!current.NextRun.IsZero() && !current.NextRun.After(time.Now()) {
+			if snapshot, err := s.advanceJobLocked(jobID, time.Now()); err == nil {
+				fired = snapshot
 			}
-			s.mu.Unlock()
+		}
+		s.mu.Unlock()
+
+		// A cron fire can run an LLM for minutes and may itself invoke cron
+		// tools. Never retain the service mutex across that callback: CRUD must
+		// remain responsive and recursive use must not deadlock.
+		if fired != nil && onFire != nil {
+			_ = onFire(fired)
 		}
 	}
 }
@@ -544,13 +718,15 @@ func (s *CronService) reapExpired() {
 	}
 }
 
-// nextJob returns the job with the earliest NextRun time.
-func (s *CronService) nextJob() (*CronJob, time.Time) {
-	var earliest *CronJob
+// nextJob returns the ID with the earliest NextRun time. The caller holds at
+// least s.mu.RLock; returning an ID instead of the internal pointer prevents a
+// stale pointer from escaping across the scheduler's sleep.
+func (s *CronService) nextJob() (string, time.Time) {
+	earliestID := ""
 	var earliestTime time.Time
 	now := time.Now()
 
-	for _, j := range s.jobs {
+	for id, j := range s.jobs {
 		if !j.Enabled || j.Paused {
 			continue
 		}
@@ -561,17 +737,17 @@ func (s *CronService) nextJob() (*CronJob, time.Time) {
 			continue
 		}
 		if j.NextRun.Before(now) {
-			return j, now
+			return id, now
 		}
-		if earliest == nil || j.NextRun.Before(earliestTime) {
-			earliest = j
+		if earliestID == "" || j.NextRun.Before(earliestTime) {
+			earliestID = id
 			earliestTime = j.NextRun
 		}
 	}
-	if earliest != nil {
-		return earliest, earliestTime
+	if earliestID != "" {
+		return earliestID, earliestTime
 	}
-	return nil, time.Now().Add(24 * time.Hour)
+	return "", time.Now().Add(24 * time.Hour)
 }
 
 func generateID() string {

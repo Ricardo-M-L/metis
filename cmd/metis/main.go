@@ -23,6 +23,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/channels"
+	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/exitcode"
 	"github.com/Ricardo-M-L/metis/internal/helpdocs"
@@ -31,14 +32,13 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/permission"
-	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
-	"github.com/Ricardo-M-L/metis/internal/telemetry"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	taskstore "github.com/Ricardo-M-L/metis/internal/tasks"
+	"github.com/Ricardo-M-L/metis/internal/telemetry"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
@@ -120,6 +120,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdStats(ctx, args[1:])
 	case "skills":
 		return cmdSkills(args[1:])
+	case "desktop":
+		return cmdDesktop(ctx, args[1:])
 	case "acp":
 		return cmdACP(ctx, args[1:])
 	case "mcp-serve":
@@ -194,7 +196,7 @@ func findEarlySubcommand(args []string, lookahead int) (int, bool) {
 		"acp": true, "daemon": true, "ps": true, "logs": true,
 		"kill": true, "attach": true, "coordinator": true, "cron": true,
 		"auth": true, "plugin": true, "plugins": true, "audit": true,
-		"diag": true, "eval": true, "update": true, "version": true,
+		"desktop": true, "diag": true, "eval": true, "update": true, "version": true,
 		"dirs": true, "projects": true, "help": true,
 	}
 	if lookahead > len(args) {
@@ -284,6 +286,7 @@ Usage:
   metis skills list     List built-in skills library
   metis skills install <name>  Install a built-in skill
   metis skills curator <status|run|list-archived|restore|pin|unpin>  Manage agent-created skills
+  metis desktop [--web] [--port PORT]  Launch native desktop (or legacy browser UI)
   metis acp [--addr ADDR]  Run as Agent Client Protocol server (default: stdio)
   metis mcp-serve [--mode MODE]  Run as MCP server (stdio); register with: claude mcp add metis -- metis mcp-serve
   metis cron <list|add|rm|pause|resume|run|start|audit>  Manage scheduled prompts
@@ -332,11 +335,12 @@ type runtime struct {
 	// List/Delete + ScheduleWakeup tools. The TUI mounts an in-session
 	// scheduler on this same instance so session-only (ephemeral) jobs the
 	// model schedules mid-chat actually fire. nil in headless paths.
-	cronSvc           *agent.CronService
-	useMD             bool
-	showTok           bool
-	model             string
-	providerName      string // resolved provider profile name (cfg.Provider.Default OR --provider). Threaded to the TUI so mid-session /model switches know which profile to rebuild against.
+	cronSvc               *agent.CronService
+	useMD                 bool
+	showTok               bool
+	model                 string
+	providerName          string          // resolved provider profile name (cfg.Provider.Default OR --provider). Threaded to the TUI so mid-session /model switches know which profile to rebuild against.
+	defaultPermissionMode permission.Mode // invocation-resolved baseline for in-process /new and /branch
 	// mcpServers collects handles to live MCP server subprocesses for
 	// Cleanup. Written from the background-launch goroutine kicked off
 	// in setupRuntime when phase-2 async MCP is enabled, hence the
@@ -350,7 +354,7 @@ type runtime struct {
 	// stderr are noisy and obscure the real shutdown cause.
 	mcpLauncherDone <-chan struct{}
 	plugins         *rtpkg.PluginRegistry // nil when no plugins installed
-	allowedDirs       *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
+	allowedDirs     *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
 	// autoMemExtractor is the live G.5 DreamTask handle. Surfaced
 	// to the slash registry so /dream status can read phase + last-
 	// run stats. nil when --auto-memory isn't set.
@@ -392,9 +396,59 @@ func (r *runtime) WaitForMCP(timeout time.Duration) bool {
 	}
 }
 
+// rebindSession updates every process-owned router used by a long-lived TUI
+// after /resume, /branch or /new. Keeping this in the composition layer avoids
+// making internal/tui depend on transport/task/checkpoint implementations.
+func (r *runtime) rebindSession(sessionID string) {
+	if r == nil || sessionID == "" {
+		return
+	}
+	r.sessionID = sessionID
+	rtpkg.SetCurrentSessionID(sessionID)
+	transport.SetSessionID(sessionID)
+	taskstore.SetCurrentTaskStore(sessionID)
+	if r.loop != nil {
+		if cwd, err := os.Getwd(); err == nil {
+			r.loop.SetCheckpointer(checkpoint.NewManager(sessionID, cwd, ""))
+		}
+	}
+	if r.sessionPointerCwd != "" {
+		_ = session.WritePointer(sessionID, r.sessionPointerCwd)
+	}
+}
+
+// releaseSessionWork stops process-owned work that must not cross a top-level
+// /new, /branch or /resume boundary. Each component is optional because tests,
+// embedders and reduced runtimes do not necessarily wire all three.
+func (r *runtime) releaseSessionWork() {
+	if r == nil {
+		return
+	}
+	if r.cronSvc != nil {
+		r.cronSvc.ClearEphemeral()
+	}
+	if r.subAgentRoster != nil {
+		r.subAgentRoster.CancelAll()
+	}
+	if r.loop == nil {
+		return
+	}
+	if r.loop.Monitors != nil {
+		r.loop.Monitors.StopAll()
+	}
+	if r.loop.Jobs != nil {
+		r.loop.Jobs.Shutdown(0)
+	}
+}
+
 // Cleanup closes any subprocesses or connections owned by the runtime.
 // Safe to call multiple times.
 func (r *runtime) Cleanup() {
+	// Stop session-owned work before closing the provider/MCP dependencies it
+	// may still be using. This is idempotent, so it is safe after an in-process
+	// session boundary already released the prior session's workers.
+	r.releaseSessionWork()
+
 	// Wait briefly for the background MCP launcher so we close handles
 	// that DID come online. After the grace cap we move on — orphan
 	// handshake goroutines get reaped on process exit anyway, and a
@@ -435,6 +489,8 @@ func (r *runtime) Cleanup() {
 type cliFlags struct {
 	model        string
 	provider     string
+	modelSet     bool // true when --model/-m was present, even with an empty value
+	providerSet  bool // true when --provider/-p was present, even with an empty value
 	mode         string
 	noMarkdown   bool
 	noStream     bool
@@ -442,8 +498,10 @@ type cliFlags struct {
 	maxIter      int
 	maxBudgetUSD float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
 	system       string
+	systemSet    bool // true when --system was present, even with an empty value
 	resumeID     string
-	cont         bool // -c / --continue: pick up the most recently modified session
+	newSessionID string // internal/native-client hook: choose ID for a fresh run
+	cont         bool   // -c / --continue: pick up the most recently modified session
 	useTUI       bool
 	noAuthWizard bool   // skip the first-run wizard (CI / scripted use)
 	effort       string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
@@ -596,6 +654,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.Float64Var(&out.maxBudgetUSD, "max-budget-usd", 0, "stop the session once cumulative LLM spend reaches this many USD (0 = unlimited)")
 	f.StringVar(&out.system, "system", "", "override system prompt")
 	f.StringVar(&out.resumeID, "resume", "", "resume session id")
+	f.StringVar(&out.newSessionID, "session-id", "", "use this id for a fresh session")
 	// `-r` short alias for --resume. Claude Code accepts both; metis used
 	// to error with `flag provided but not defined: -r` (user video bug
 	// 2026-05-07 21:14). Mapping the short flag onto the same var means a
@@ -674,6 +733,16 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
+	f.Visit(func(fl *flag.Flag) {
+		switch fl.Name {
+		case "model", "m":
+			out.modelSet = true
+		case "provider", "p":
+			out.providerSet = true
+		case "system":
+			out.systemSet = true
+		}
+	})
 	return out, f.Args(), nil
 }
 
@@ -685,6 +754,32 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if os.Getenv("METIS_DEBUG") == "1" {
 		fmt.Fprintln(os.Stderr, "metis: loaded config files:", loaded)
 	}
+
+	// Resolve and load a resumed session before provider/client and prompt
+	// construction. Provider, model, and system are persisted in the header;
+	// reading them after BuildProvider would restore the transcript while still
+	// sending future turns through whatever happens to be configured today.
+	store, err := session.NewStore(cfg.Session.Dir)
+	if err != nil {
+		return nil, err
+	}
+	resumeTarget, err := resolveResumeTarget(flags, store)
+	if err != nil {
+		return nil, err
+	}
+	var preparedResume *rtpkg.PreparedResume
+	if resumeTarget != "" {
+		preparedResume, err = rtpkg.PrepareResume(store, resumeTarget)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Non-empty values also count as explicit for in-process callers that
+	// construct cliFlags directly instead of going through parseFlags.
+	providerSet := flags.providerSet || flags.provider != ""
+	modelSet := flags.modelSet || flags.model != ""
+	systemSet := flags.systemSet || flags.system != ""
 
 	// Project registry: bump cwd's last-accessed entry. Idempotent;
 	// failures are stderr-logged and swallowed (a broken registry
@@ -720,10 +815,16 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	// Apply flag overrides
 	provName := cfg.Provider.Default
+	if preparedResume != nil && !providerSet && preparedResume.Header.Provider != "" {
+		provName = preparedResume.Header.Provider
+	}
 	if flags.provider != "" {
 		provName = flags.provider
 	}
 	model := flags.model
+	if preparedResume != nil && !modelSet && !providerSet && preparedResume.Header.Model != "" {
+		model = preparedResume.Header.Model
+	}
 	mode := cfg.Permission.Mode
 	if flags.mode != "" {
 		mode = flags.mode
@@ -818,10 +919,16 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	//   1. --system flag overrides entirely (user-supplied prompt).
 	//   2. METIS_SIMPLE=1 / --simple → one-sentence stub for CI use.
 	//   3. Default → section registry assembled with promptCtx.
+	var resumedSystem string
+	if preparedResume != nil && !systemSet {
+		resumedSystem = preparedResume.Header.System
+	}
 	var system string
 	switch {
-	case flags.system != "":
+	case systemSet:
 		system = flags.system
+	case resumedSystem != "":
+		system = resumedSystem
 	case rtpkg.IsSimpleMode():
 		system = rtpkg.SimpleBasePrompt(model)
 	default:
@@ -833,7 +940,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Agent profile body REPLACES the default system prompt — that's the
 	// whole point of "I am a code reviewer". Skip when profile body is
 	// empty (frontmatter-only profiles still customize tools/model).
-	if agentProf != nil && agentProf.SystemPrompt != "" {
+	if agentProf != nil && agentProf.SystemPrompt != "" && !systemSet && resumedSystem == "" {
 		system = agentProf.SystemPrompt
 	}
 	// Append user's optional ~/.metis/system.md addendum (claude-code-style
@@ -856,7 +963,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	}
 
 	var systemSections []rtpkg.SystemPromptSection
-	if agentProf == nil || !agentProf.OmitClaudeMd {
+	if resumedSystem == "" && (agentProf == nil || !agentProf.OmitClaudeMd) {
 		assembleOpts := rtpkg.AssembleOptions{}
 		// Inject the coordinator overlay between `base` and the
 		// project-context sections so it shares the cached prefix.
@@ -880,7 +987,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		//   - --simple / --system override / explicit user prompt:
 		//     wrap `system` as one "base" section to preserve the
 		//     caller's intent (don't fragment a user-supplied prompt).
-		if flags.system != "" || rtpkg.IsSimpleMode() {
+		if systemSet || rtpkg.IsSimpleMode() {
 			systemSections = rtpkg.AssembleSystemPromptSections(system, assembleOpts)
 		} else {
 			systemSections = rtpkg.AssembleSystemPromptSectionsCtx(promptCtx, assembleOpts)
@@ -891,7 +998,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// --add-dir / persisted additional dirs. Done before system prompt
 	// finalization so the LLM sees the list at turn 0.
 	allowedDirs := rtpkg.NewAllowedDirs(flags.addDirs)
-	if extra := allowedDirs.SystemPromptAddendum(); extra != "" {
+	if extra := allowedDirs.SystemPromptAddendum(); extra != "" && resumedSystem == "" {
 		system = system + extra
 		// Allowed-dirs is stable per-session (set once at boot, doesn't
 		// drift), so cache it as its own section. Volatile=false +
@@ -957,12 +1064,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// the stack: tools with no Monitor wiring just skip the tool, the
 	// loop's drain is a no-op.
 	monitorReg := agent.NewMonitorRegistry(0)
-	// Cancel every tail-watcher goroutine on chat exit so a long-lived
-	// parent process doesn't accumulate readers across restarts. The
-	// underlying jobs themselves keep running (they outlive the turn
-	// intentionally — same as bash run_in_background); only the file-
-	// scan goroutines unwind here.
-	defer monitorReg.StopAll()
+	// Runtime cleanup and in-process session boundaries stop all tail watchers.
+	// Do not defer that here: setupRuntime returns before the chat starts, so a
+	// setup-local defer cannot own the live runtime's lifecycle.
 
 	// Sub-agent Roster — process-wide registry that backs G.0's
 	// concurrency cap and G.3 named teammates / G.16 UI observability.
@@ -974,11 +1078,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	//   legacy config.Agents.MaxConcurrentSubAgents (split 1:2)
 	//   defaults (20 named / 40 anon)
 	//
-	// Cancel everyone on chat exit so orphan sub-agents don't keep
-	// burning tokens after the parent shell goes away.
+	// Runtime cleanup and in-process session boundaries cancel everyone so
+	// orphan sub-agents cannot keep burning tokens or report into a new session.
 	capNamed, capAnon := resolveRosterCaps(cfg)
 	subAgentRoster := agent.NewRoster(capNamed, capAnon)
-	defer subAgentRoster.CancelAll()
 
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
 		Cfg:             cfg,
@@ -1122,12 +1225,6 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	denyVis = append(denyVis, tools.SplitCSV(flags.disallowTools)...)
 	tools.ApplyToolVisibility(reg, allowVis, denyVis)
 
-	// Session store
-	store, err := session.NewStore(cfg.Session.Dir)
-	if err != nil {
-		return nil, err
-	}
-
 	maxIter := flags.maxIter
 	if maxIter == 0 {
 		maxIter = cfg.Session.MaxIterations
@@ -1228,11 +1325,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, cronSvc: cronSvc, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
-		mcpLauncherDone:  mcpLauncherDoneCh,
-		plugins:          pluginReg,
-		allowedDirs:      allowedDirs,
-		autoMemExtractor: pendingExtractor,
-		subAgentRoster:   subAgentRoster,
+		defaultPermissionMode: permission.Mode(mode),
+		mcpLauncherDone:       mcpLauncherDoneCh,
+		plugins:               pluginReg,
+		allowedDirs:           allowedDirs,
+		autoMemExtractor:      pendingExtractor,
+		subAgentRoster:        subAgentRoster,
 	}
 
 	// Phase 2 MCP launch — kicked off only after `rt` is fully built so
@@ -1273,43 +1371,45 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		}(reg, mcpReg, lazyMode)
 	}
 
-	// Resolve resume target. Order: explicit --resume <id> wins; then
-	// bare `-r` / `--resume` opens an interactive picker over recent
-	// sessions; then --continue picks the most-recent session by
-	// mtime. Empty across all three lands the user on a fresh session.
-	resumeTarget := flags.resumeID
-	if resumeTarget == "" && flags.pickResume {
-		picked, err := runResumePicker(store)
+	if preparedResume != nil {
+		res, err := rtpkg.ApplyPreparedResume(preparedResume, loop, gate, os.Stderr)
 		if err != nil {
-			return nil, err
-		}
-		resumeTarget = picked
-	}
-	if resumeTarget == "" && flags.cont {
-		entries, listErr := store.List(1)
-		if listErr != nil {
-			fmt.Fprintf(os.Stderr, "metis: --continue: %v (starting fresh)\n", listErr)
-		} else if len(entries) == 0 {
-			fmt.Fprintln(os.Stderr, "metis: --continue: no prior sessions found (starting fresh)")
-		} else {
-			resumeTarget = entries[0].ID
-		}
-	}
-	if resumeTarget != "" {
-		res, err := rtpkg.ApplyResume(store, resumeTarget, loop, gate, os.Stderr)
-		if err != nil {
+			rt.Cleanup()
 			return nil, err
 		}
 		rt.sessionID = res.SessionID
+		// An explicit CLI mode is an invocation override. ApplyResume restores
+		// the stored posture first; the command-line choice wins last.
+		if flags.mode != "" || flags.dangerouslySkipPerms {
+			gate.SetMode(permission.Mode(mode))
+		}
 	} else {
-		rt.sessionID = store.NewSessionID()
-		_ = rtpkg.WriteFreshHeader(store, rt.sessionID, model, system, cfg.Permission.Mode)
+		if flags.newSessionID != "" {
+			if !validExplicitSessionID(flags.newSessionID) {
+				return nil, fmt.Errorf("invalid --session-id %q", flags.newSessionID)
+			}
+			if _, err := os.Stat(filepath.Join(store.Dir, flags.newSessionID+".jsonl")); err == nil {
+				return nil, fmt.Errorf("session %s already exists", flags.newSessionID)
+			} else if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("check session %s: %w", flags.newSessionID, err)
+			}
+			rt.sessionID = flags.newSessionID
+		} else {
+			rt.sessionID = store.NewSessionID()
+		}
+		if err := persistFreshSessionHeader(store, rt.sessionID, provName, model, system, mode); err != nil {
+			rt.Cleanup()
+			return nil, err
+		}
 	}
 	// --name <text> persists as the session title. Done after the
 	// fresh-header write so resume → already-existing sessions also
 	// get re-titled via the same path.
 	if flags.sessionName != "" {
-		_ = store.SetTitle(rt.sessionID, flags.sessionName)
+		if err := persistSessionTitle(store, rt.sessionID, flags.sessionName); err != nil {
+			rt.Cleanup()
+			return nil, err
+		}
 	}
 	// Wire per-step tool timing into this session's sidecar so
 	// `metis sessions timing <id>` can show where the run spent its
@@ -1370,6 +1470,47 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	tui.SetStatusLineRefresh(cfg.UI.StatusLineRefresh())
 
 	return rt, nil
+}
+
+// resolveResumeTarget selects the session before provider and prompt
+// construction so setupRuntime can restore header defaults in time. Order:
+// explicit --resume, interactive picker, then --continue's newest session.
+func resolveResumeTarget(flags *cliFlags, store *session.Store) (string, error) {
+	resumeTarget := flags.resumeID
+	if resumeTarget == "" && flags.pickResume {
+		picked, err := runResumePicker(store)
+		if err != nil {
+			return "", err
+		}
+		resumeTarget = picked
+	}
+	if resumeTarget == "" && flags.cont {
+		entries, listErr := store.List(1)
+		if listErr != nil {
+			fmt.Fprintf(os.Stderr, "metis: --continue: %v (starting fresh)\n", listErr)
+		} else if len(entries) == 0 {
+			fmt.Fprintln(os.Stderr, "metis: --continue: no prior sessions found (starting fresh)")
+		} else {
+			resumeTarget = entries[0].ID
+		}
+	}
+	if resumeTarget != "" && flags.newSessionID != "" {
+		return "", errors.New("--resume and --session-id are mutually exclusive")
+	}
+	return resumeTarget, nil
+}
+
+func validExplicitSessionID(id string) bool {
+	if id == "" || id == "." || id == ".." || filepath.Base(id) != id || strings.ContainsAny(id, `/\\`) {
+		return false
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // NewRegistry helper because tools.NewRegistry doesn't exist; create one.
@@ -1472,10 +1613,13 @@ func cmdChat(ctx context.Context, args []string) error {
 
 	if useTUI {
 		hooks := tui.ExternalHooks{
-			DirAdd:    rt.allowedDirs.Add,
-			DirRemove: rt.allowedDirs.Remove,
-			DirList:   rt.allowedDirs.All,
-			BtwAsk:    rt.askSideQuestion,
+			DirAdd:              rt.allowedDirs.Add,
+			DirRemove:           rt.allowedDirs.Remove,
+			DirList:             rt.allowedDirs.All,
+			BtwAsk:              rt.askSideQuestion,
+			FreshPermissionMode: rt.defaultPermissionMode,
+			SessionSwitch:       rt.rebindSession,
+			SessionBoundary:     rt.releaseSessionWork,
 		}
 		// Hand the early-input buffer to bubbletea. If the trust prompt
 		// already consumed it (Stop() was called above), Reader()
@@ -1495,6 +1639,10 @@ func cmdChat(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	repl.ConfigureProviderSwitch(rt.cfg, rt.providerName)
+	repl.SessionSwitch = rt.rebindSession
+	repl.SessionBoundary = rt.releaseSessionWork
+	repl.FreshPermissionMode = rt.defaultPermissionMode
 	return repl.Run(ctx)
 }
 
@@ -2032,6 +2180,44 @@ func waitForkInflight(maxWait time.Duration) {
 	}
 }
 
+// acpAuthRequiredProvider keeps the ACP control plane available before the
+// user configures credentials. Initialize remains a credential-free
+// capability handshake; the first prompt still fails with the exact auth
+// error setupRuntime produced, so starting ACP never weakens model access.
+type acpAuthRequiredProvider struct {
+	name  string
+	model string
+	err   error
+}
+
+func (p *acpAuthRequiredProvider) Name() string { return p.name }
+func (p *acpAuthRequiredProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, p.err
+}
+func (p *acpAuthRequiredProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return nil, p.err
+}
+func (p *acpAuthRequiredProvider) MaxContextTokens() int { return 200_000 }
+func (p *acpAuthRequiredProvider) ModelID() string       { return p.model }
+
+func prepareACPLoop(ctx context.Context, flags *cliFlags) (*agent.Loop, func(), error) {
+	rt, err := setupRuntime(ctx, flags)
+	if err == nil {
+		return rt.loop, rt.Cleanup, nil
+	}
+	if !errors.Is(err, config.ErrMissingAPIKey) {
+		return nil, nil, err
+	}
+	providerName := flags.provider
+	if providerName == "" {
+		providerName = "unconfigured"
+	}
+	provider := &acpAuthRequiredProvider{name: providerName, model: flags.model, err: err}
+	gate := permission.New(permission.ModeDeny)
+	loop := agent.NewLoop(provider, tools.NewRegistry(), gate, nil, "", 1)
+	return loop, func() {}, nil
+}
+
 func cmdACP(ctx context.Context, args []string) error {
 	addr := "stdio"
 	rest := make([]string, 0, len(args))
@@ -2047,15 +2233,18 @@ func cmdACP(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	rt, err := setupRuntime(ctx, flags)
+	// ACP is a protocol service, not an interactive auth surface. It must be
+	// ready to answer initialize even when the client has not configured a key.
+	flags.noAuthWizard = true
+	loop, cleanup, err := prepareACPLoop(ctx, flags)
 	if err != nil {
 		return err
 	}
-	defer rt.Cleanup()
+	defer cleanup()
 	// Tell the ACP layer what version to advertise in InitializeResult
 	// so clients see the same version as `metis --version`.
 	acp.SetServerVersion(version.Version)
-	srv := acp.NewServer(rt.loop, addr)
+	srv := acp.NewServer(loop, addr)
 	if err := srv.Listen(); err != nil {
 		return err
 	}
@@ -2156,20 +2345,11 @@ func cmdCron(ctx context.Context, args []string) error {
 	rest := args[1:]
 	switch sub {
 	case "list":
-		jobs := svc.List()
-		if len(jobs) == 0 {
-			fmt.Println("(no cron jobs)")
-			return nil
+		opts, err := parseCronListOptions(rest)
+		if err != nil {
+			return err
 		}
-		for _, j := range jobs {
-			next := "—"
-			if !j.NextRun.IsZero() {
-				next = j.NextRun.Format(time.RFC3339)
-			}
-			fmt.Printf("%s  enabled=%v paused=%v next=%s name=%q\n",
-				j.ID, j.Enabled, j.Paused, next, j.Name)
-		}
-		return nil
+		return writeCronList(os.Stdout, svc.List(), opts)
 	case "rm":
 		if len(rest) == 0 {
 			return errors.New("rm: missing id")
@@ -2408,9 +2588,9 @@ func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) erro
 	if len(args) == 0 {
 		return errors.New("cron run: missing id")
 	}
-	job, ok := svc.Get(args[0])
-	if !ok {
-		return fmt.Errorf("cron job not found: %s", args[0])
+	job, err := advanceManualCronRun(svc, args[0])
+	if err != nil {
+		return fmt.Errorf("cron run %s: %w", args[0], err)
 	}
 	// Force ModeAsk regardless of cfg.Permission.Mode — see cmdCronStart
 	// for the full rationale: a cron fire is governed by its allow-list,
@@ -2458,7 +2638,8 @@ func cmdCronStart(ctx context.Context, svc *agent.CronService) error {
 	mainHist := map[string][]llm.Message{}
 	onFire := func(j *agent.CronJob) error {
 		fmt.Fprintf(os.Stderr, "[cron] firing %s (%s, mode=%s)\n", j.ID, j.Name, sessionModeOrDefault(j))
-		return executeCronJob(ctx, rt, j, persistentHist, mainHist)
+		err := executeCronJob(ctx, rt, j, persistentHist, mainHist)
+		return reportCronFireError(os.Stderr, j, err)
 	}
 	svc.Start(ctx, onFire)
 	fmt.Fprintln(os.Stderr, "metis cron scheduler running (Ctrl-C to stop)")
@@ -2702,9 +2883,27 @@ func cmdConfig(args []string) error {
 	}
 	switch args[0] {
 	case "show":
+		jsonOutput := false
+		for _, arg := range args[1:] {
+			if arg == "--json" {
+				jsonOutput = true
+				continue
+			}
+			return fmt.Errorf("config show: unknown option %q", arg)
+		}
 		cfg, loaded, err := config.Load()
 		if err != nil {
 			return err
+		}
+		if jsonOutput {
+			_, model := providerKeyAndModel(cfg, cfg.Provider.Default)
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"provider":       cfg.Provider.Default,
+				"model":          model,
+				"permissionMode": cfg.Permission.Mode,
+				"sessionDir":     cfg.Session.Dir,
+				"files":          loaded,
+			})
 		}
 		fmt.Println("# files read:")
 		for _, p := range loaded {
@@ -2930,9 +3129,29 @@ func cmdSessions(args []string) error {
 	}
 	switch sub {
 	case "list":
-		es, err := store.List(20)
+		opts, err := parseSessionListOptions(args[1:])
 		if err != nil {
 			return err
+		}
+		es, err := listSessionEntries(store, opts)
+		if err != nil {
+			return err
+		}
+		if opts.jsonOutput {
+			records := make([]sessionListRecord, 0, len(es))
+			for _, e := range es {
+				hdr, _, _ := store.LoadHeader(e.ID)
+				record := sessionListRecord{
+					ID: e.ID, Title: e.Title, Model: e.Model,
+					CreatedAt: e.CreatedAt.UTC().Format(time.RFC3339),
+				}
+				if hdr != nil {
+					record.Provider = hdr.Provider
+					record.WorkDir = hdr.WorkDir
+				}
+				records = append(records, record)
+			}
+			return json.NewEncoder(os.Stdout).Encode(records)
 		}
 		if len(es) == 0 {
 			fmt.Println("(no sessions)")
@@ -3004,6 +3223,15 @@ func cmdSessions(args []string) error {
 		return printSessionTiming(store, args[1])
 	}
 	return fmt.Errorf("sessions: unknown subcommand %q", sub)
+}
+
+type sessionListRecord struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model"`
+	WorkDir   string `json:"workDir,omitempty"`
+	CreatedAt string `json:"createdAt"`
 }
 
 // printSessionTiming renders a past session's per-step timing: a timeline

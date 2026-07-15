@@ -198,6 +198,12 @@ type AdoptArgs struct {
 	// so the model sees the true wall-clock duration, not the moment
 	// of background-promotion.
 	StartTime time.Time
+	// WaitResult transfers ownership of an already-started Cmd.Wait call.
+	// The foreground Bash promotion path must race process completion
+	// against its timer, so it starts the sole waiter before calling Adopt.
+	// When non-nil, Registry consumes exactly one result from this channel
+	// instead of calling Cmd.Wait a second time. Nil means Registry owns Wait.
+	WaitResult <-chan error
 }
 
 // Spawn registers a new job, opens its output file, and starts the
@@ -246,6 +252,7 @@ func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
 		cancel:      a.Cancel,
 		output:      out,
 	}
+	snapshot := publicJobSnapshot(j)
 
 	r.mu.Lock()
 	r.jobs[id] = j
@@ -254,9 +261,9 @@ func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
 	// Wait goroutine: blocks on Wait, transitions state, publishes
 	// Notification. Outside the registry lock so JobOutput readers
 	// can hit the disk file mid-run without serialising on r.mu.
-	go r.waitAndComplete(j)
+	go r.waitAndComplete(j, nil)
 
-	return j, nil
+	return snapshot, nil
 }
 
 // Adopt registers an already-running foreground cmd as a background
@@ -296,14 +303,15 @@ func (r *Registry) Adopt(a AdoptArgs) (*Job, error) {
 		cancel:      a.Cancel,
 		output:      a.Output,
 	}
+	snapshot := publicJobSnapshot(j)
 
 	r.mu.Lock()
 	r.jobs[id] = j
 	r.mu.Unlock()
 
-	go r.waitAndComplete(j)
+	go r.waitAndComplete(j, a.WaitResult)
 
-	return j, nil
+	return snapshot, nil
 }
 
 // NewDiskOutput exposes the disk-file constructor so bash.go can
@@ -335,8 +343,13 @@ func (r *Registry) CleanupOrphan(out *DiskOutput) {
 	_ = os.Remove(path)
 }
 
-func (r *Registry) waitAndComplete(j *Job) {
-	err := j.cmd.Wait()
+func (r *Registry) waitAndComplete(j *Job, waitResult <-chan error) {
+	var err error
+	if waitResult != nil {
+		err = <-waitResult
+	} else {
+		err = j.cmd.Wait()
+	}
 	r.mu.Lock()
 	if j.Status == StatusKilled {
 		// JobStop already set the terminal state. Don't overwrite
@@ -381,16 +394,15 @@ func (r *Registry) waitAndComplete(j *Job) {
 	}
 }
 
-// List returns a snapshot of all jobs sorted by StartTime ascending.
-// Caller may store / mutate the slice but not the *Job entries (still
-// owned by Registry). For prompt-facing rendering use the JobList
-// tool which builds its own JSON-serializable view.
-func (r *Registry) List() []*Job {
+// List returns detached value snapshots sorted by StartTime ascending.
+// Callers may freely retain or mutate them: no entry aliases Registry's live
+// state, so waitAndComplete can transition jobs concurrently without racing.
+func (r *Registry) List() []Job {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]*Job, 0, len(r.jobs))
+	out := make([]Job, 0, len(r.jobs))
 	for _, j := range r.jobs {
-		out = append(out, j)
+		out = append(out, *publicJobSnapshot(j))
 	}
 	// Stable order: oldest first. List() in claude-code returns the
 	// same order; the model relies on it to find "the most recent
@@ -405,17 +417,16 @@ func (r *Registry) List() []*Job {
 	return out
 }
 
-// Get returns the Job with the given ID, or nil if unknown.
-//
-// CAUTION: the returned pointer is to the SAME Job that the spawn
-// goroutine mutates as the process state changes. Reading Status /
-// ExitCode / EndTime through this pointer outside r.mu is a data
-// race. Use Snapshot(id) for safe field reads from a caller that
-// doesn't hold the lock.
-func (r *Registry) Get(id string) *Job {
+// Get returns a detached value snapshot of the Job with the given ID.
+// The bool is false for an unknown ID. Internal process handles are omitted.
+func (r *Registry) Get(id string) (Job, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.jobs[id]
+	j, ok := r.jobs[id]
+	if !ok || j == nil {
+		return Job{}, false
+	}
+	return *publicJobSnapshot(j), true
 }
 
 // Snapshot returns a value copy of the Job's public, mutable fields
@@ -424,20 +435,20 @@ func (r *Registry) Get(id string) *Job {
 // intentionally NOT copied — callers outside this package shouldn't
 // touch them anyway.
 //
-// Use this instead of `Get(id).Status` when you need to read job
-// state without going through r.mu yourself. Pre-fix waitForStatus
-// in tests did the unsafe pointer-then-read pattern, which the
-// race detector caught against the spawn goroutine's writes
-// (jobs.go:353 waitAndComplete). Bug had latent production
-// equivalents in any caller doing `r.Get(id).Status` outside lock.
+// Retained as a descriptive alias for Get for callers that want to make the
+// snapshot semantics explicit.
 func (r *Registry) Snapshot(id string) (Job, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	j, ok := r.jobs[id]
-	if !ok || j == nil {
-		return Job{}, false
+	return r.Get(id)
+}
+
+// publicJobSnapshot copies only externally observable state. The caller must
+// hold r.mu once j is visible to waitAndComplete; Spawn and Adopt capture the
+// initial snapshot before launching their waiter goroutine.
+func publicJobSnapshot(j *Job) *Job {
+	if j == nil {
+		return nil
 	}
-	return Job{
+	return &Job{
 		ID:          j.ID,
 		Command:     j.Command,
 		Description: j.Description,
@@ -446,7 +457,7 @@ func (r *Registry) Snapshot(id string) (Job, bool) {
 		EndTime:     j.EndTime,
 		ExitCode:    j.ExitCode,
 		OutputPath:  j.OutputPath,
-	}, true
+	}
 }
 
 // CleanedUp reports whether the job's internal handles (cmd / cancel /

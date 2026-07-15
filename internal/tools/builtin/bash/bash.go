@@ -547,10 +547,9 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	}
 	startedAt := time.Now()
 
-	// Race the wait against the auto-bg threshold timer. A select
-	// with two channels is the textbook pattern; we just have to
-	// drain the goroutine on the timer-wins branch (the cmd is still
-	// running on the other side).
+	// Race the sole Cmd.Wait owner against the auto-bg threshold timer.
+	// If the timer wins, Adopt receives this result channel and consumes it;
+	// Registry must not call Cmd.Wait again for the same process.
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- exe.Wait() }()
 
@@ -568,8 +567,8 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		if diskOut != nil {
 			b.Jobs.CleanupOrphan(diskOut)
 		}
-		out := cappedBuf.preview()
-		if cappedBuf.truncated {
+		out, truncated := cappedBuf.snapshot()
+		if truncated {
 			out += "\n\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}
 		res := &tools.Result{Output: out}
@@ -601,6 +600,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 			Cancel:      cancel,
 			Output:      diskOut,
 			StartTime:   startedAt,
+			WaitResult:  waitCh,
 		})
 		if err != nil {
 			// Adoption failed — let the cmd finish in the foreground
@@ -611,8 +611,8 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 			return res, nil
 		}
 		canceled = true // Adopt owns the cancel now
-		preview := cappedBuf.preview()
-		if cappedBuf.truncated {
+		preview, truncated := cappedBuf.snapshot()
+		if truncated {
 			preview += "\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}
 		msg := fmt.Sprintf(
@@ -825,15 +825,23 @@ func (c *cappedWriter) pushTail(p []byte) {
 // head + tail when the dropped tail looks like a failure; head only
 // otherwise.
 func (c *cappedWriter) preview() string {
+	out, _ := c.snapshot()
+	return out
+}
+
+// snapshot returns a consistent preview + truncation bit while a promoted
+// command may still be writing. Reading truncated separately after preview
+// would race the os/exec copier goroutines.
+func (c *cappedWriter) snapshot() (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.truncated {
-		return string(c.head)
+		return string(c.head), false
 	}
 	if spill.HasErrorMarker(string(c.tail)) {
 		return string(c.head) +
 			"\n\n... [middle omitted; tail kept below — it contains error output] ...\n\n" +
-			string(c.tail)
+			string(c.tail), true
 	}
-	return string(c.head)
+	return string(c.head), true
 }

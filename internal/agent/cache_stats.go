@@ -92,6 +92,16 @@ func (r *CacheStatsRing) Add(s CacheStat) {
 	r.buf = append(r.buf, s)
 }
 
+// Reset drops stats from the previous top-level session.
+func (r *CacheStatsRing) Reset() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = nil
+}
+
 // Snapshot returns a defensive copy of the current ring contents.
 func (r *CacheStatsRing) Snapshot() []CacheStat {
 	r.mu.RLock()

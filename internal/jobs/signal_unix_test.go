@@ -155,11 +155,13 @@ func TestRegistryStop_TreeKillsEntireGroup(t *testing.T) {
 	// transitions Status to StatusKilled). Then check descendants.
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if r.Get(j.ID).Status == StatusKilled && countDescendants(t, leader) == 0 {
+		got, ok := r.Get(j.ID)
+		if ok && got.Status == StatusKilled && countDescendants(t, leader) == 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	got, _ := r.Get(j.ID)
 	t.Fatalf("after Registry.Stop: status=%s descendants=%d",
-		r.Get(j.ID).Status, countDescendants(t, leader))
+		got.Status, countDescendants(t, leader))
 }

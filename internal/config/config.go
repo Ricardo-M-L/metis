@@ -12,6 +12,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,12 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
 )
+
+// ErrMissingAPIKey identifies the credential-absent case separately from an
+// unknown provider or malformed configuration. Protocol frontends such as ACP
+// may still start and complete their capability handshake, while deferring
+// this error until the first model-backed request.
+var ErrMissingAPIKey = errors.New("missing API key")
 
 type Config struct {
 	Provider      ProviderSet   `toml:"provider"`
@@ -1061,7 +1068,7 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 			return raw.APIKey, nil
 		}
 	}
-	return "", fmt.Errorf("missing API key for provider %q", provider)
+	return "", fmt.Errorf("%w for provider %q", ErrMissingAPIKey, provider)
 }
 
 // PermissionTimeout returns the duration (with default fallback) to
