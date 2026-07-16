@@ -7,18 +7,10 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 )
 
-// advanceManualCronRun records the manual fire before the prompt is executed,
-// then reloads the updated job so RunCount/LastRun/Repeat/NextRun shown by the
-// desktop and CLI reflect the same fire.
+// advanceManualCronRun records the manual fire before the prompt is executed
+// and returns the immutable snapshot saved by that same storage transaction.
 func advanceManualCronRun(svc *agent.CronService, id string) (*agent.CronJob, error) {
-	if err := svc.Run(id); err != nil {
-		return nil, err
-	}
-	job, ok := svc.Get(id)
-	if !ok {
-		return nil, fmt.Errorf("cron job disappeared after run bookkeeping: %s", id)
-	}
-	return job, nil
+	return svc.RunNow(id)
 }
 
 func reportCronFireError(w io.Writer, job *agent.CronJob, err error) error {

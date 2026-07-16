@@ -202,6 +202,47 @@ func TestStop_AlreadyTerminalIsNoOp(t *testing.T) {
 	}
 }
 
+// TestRegistryResetStartsFreshSessionState verifies the in-place reset used by
+// /new, /branch and /resume. Tool instances keep the Registry pointer, so a
+// reset must hide old completed/running jobs without making that pointer
+// unusable for the destination session.
+func TestRegistryResetStartsFreshSessionState(t *testing.T) {
+	r := quickRegistry(t)
+	completed := spawnEcho(t, r, "old-completed")
+	waitForStatus(t, r, completed.ID, StatusCompleted, 3*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	running, err := r.Spawn(SpawnArgs{
+		Command: "sleep 30",
+		Cmd:     exec.CommandContext(ctx, "sh", "-c", "sleep 30"),
+		Cancel:  cancel,
+	})
+	if err != nil {
+		t.Fatalf("spawn old running job: %v", err)
+	}
+
+	r.Reset(0)
+	if got := r.List(); len(got) != 0 {
+		t.Fatalf("old jobs visible after reset: %+v", got)
+	}
+	for _, id := range []string{completed.ID, running.ID} {
+		if _, ok := r.Get(id); ok {
+			t.Errorf("old job %s remains addressable after reset", id)
+		}
+	}
+
+	fresh := spawnEcho(t, r, "new-session")
+	waitForStatus(t, r, fresh.ID, StatusCompleted, 3*time.Second)
+	select {
+	case n := <-r.Notify():
+		if n.JobID != fresh.ID {
+			t.Fatalf("stale notification crossed reset: got %s, want %s", n.JobID, fresh.ID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fresh job did not publish through reset registry")
+	}
+}
+
 // TestList_StableOrder — multiple jobs return in start-time order,
 // regardless of map iteration order.
 func TestList_StableOrder(t *testing.T) {

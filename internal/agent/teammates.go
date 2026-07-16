@@ -538,10 +538,25 @@ func (r *Roster) Register(t *Teammate) error {
 // discoverable via LookupByAgentID and shows up in List() until
 // evicted from the LRU.
 func (r *Roster) Unregister(name string) {
+	r.unregister(name, nil)
+}
+
+// UnregisterTeammate removes t only when the live entry still points to that
+// exact teammate. Background cleanup must use this identity-aware form: after
+// a session reset, a new session may already have registered the same display
+// name, and the old goroutine must not unregister the replacement.
+func (r *Roster) UnregisterTeammate(t *Teammate) {
+	if t == nil {
+		return
+	}
+	r.unregister(t.Name, t)
+}
+
+func (r *Roster) unregister(name string, expected *Teammate) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	t, ok := r.teammates[name]
-	if !ok {
+	if !ok || (expected != nil && t != expected) {
 		return
 	}
 	delete(r.teammates, name)
@@ -691,6 +706,22 @@ func (r *Roster) CancelAll() {
 		}
 	}
 	r.teammates = make(map[string]*Teammate)
+}
+
+// Reset cancels live teammates and forgets both live and recently-finished
+// entries at a top-level session boundary. The Roster itself remains usable
+// because Agent/SubAgent tools retain this pointer across in-process /new,
+// /branch and /resume operations.
+func (r *Roster) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, t := range r.teammates {
+		if t.Cancel != nil {
+			t.Cancel()
+		}
+	}
+	r.teammates = make(map[string]*Teammate)
+	r.recentlyFinished = nil
 }
 
 // ListNamed returns a snapshot of all currently-registered named

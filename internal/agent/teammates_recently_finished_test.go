@@ -126,3 +126,62 @@ func TestRoster_FinishedDoesNotCountTowardCap(t *testing.T) {
 		t.Error("agt-a should still be findable in recentlyFinished")
 	}
 }
+
+func TestRoster_ResetStartsFreshSessionState(t *testing.T) {
+	r := NewRoster(2)
+	cancelled := false
+	oldLive := &Teammate{Name: "live", AgentID: "agt-old-live", Cancel: func() { cancelled = true }}
+	oldDone := &Teammate{Name: "done", AgentID: "agt-old-done"}
+	if err := r.Register(oldLive); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(oldDone); err != nil {
+		t.Fatal(err)
+	}
+	r.Unregister(oldDone.Name)
+
+	r.Reset()
+	if !cancelled {
+		t.Fatal("reset did not cancel live teammate")
+	}
+	if got := r.List(); len(got) != 0 {
+		t.Fatalf("old teammates visible after reset: %+v", got)
+	}
+	for _, id := range []string{oldLive.AgentID, oldDone.AgentID} {
+		if _, ok := r.LookupByAgentID(id); ok {
+			t.Errorf("old teammate %s remains addressable after reset", id)
+		}
+	}
+
+	fresh := &Teammate{Name: "done", AgentID: "agt-new"}
+	if err := r.Register(fresh); err != nil {
+		t.Fatalf("fresh registration through reset roster: %v", err)
+	}
+	if got, ok := r.LookupByAgentID(fresh.AgentID); !ok || got != fresh {
+		t.Fatalf("fresh teammate unavailable after reset: ok=%v got=%v", ok, got)
+	}
+}
+
+func TestRoster_OldCleanupCannotUnregisterSameNameInNewSession(t *testing.T) {
+	r := NewRoster(2)
+	old := &Teammate{Name: "worker", AgentID: "agt-old"}
+	if err := r.Register(old); err != nil {
+		t.Fatal(err)
+	}
+	r.Reset()
+
+	fresh := &Teammate{Name: "worker", AgentID: "agt-fresh"}
+	if err := r.Register(fresh); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the cancelled old goroutine reaching its deferred cleanup after
+	// the destination session has already reused the display name.
+	r.UnregisterTeammate(old)
+
+	if got, ok := r.Lookup("worker"); !ok || got != fresh {
+		t.Fatalf("old cleanup removed destination teammate: ok=%v got=%v", ok, got)
+	}
+	if _, ok := r.LookupByAgentID(old.AgentID); ok {
+		t.Fatal("old teammate leaked into recently-finished state")
+	}
+}

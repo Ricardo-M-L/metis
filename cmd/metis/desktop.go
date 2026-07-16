@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/Ricardo-M-L/metis/internal/desktop"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/webui"
 )
 
@@ -45,7 +46,16 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	defer rt.Cleanup()
 
 	addr := "127.0.0.1:" + opts.port
-	srv := webui.NewServer(addr, rt.loop, rt.store)
+	srv := webui.NewServer(addr, rt.loop, rt.store, webui.RuntimeBindings{
+		InitialSessionID:    rt.sessionID,
+		ProviderName:        rt.providerName,
+		FreshPermissionMode: rt.defaultPermissionMode,
+		BuildProvider: func(providerName, model string) (*rtpkg.ProviderBuild, error) {
+			return rtpkg.BuildProvider(rt.cfg, providerName, model)
+		},
+		SessionBoundary: rt.releaseSessionWork,
+		SessionSwitch:   rt.rebindSession,
+	})
 	fmt.Fprintf(os.Stderr, "metis desktop --web: starting web UI on %s\n", addr)
 	fmt.Fprintf(os.Stderr, "Open http://%s in your browser\n", addr)
 

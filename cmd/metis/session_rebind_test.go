@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
@@ -77,8 +80,28 @@ func TestRuntimeReleaseSessionWorkCancelsRosterAndIsNilSafe(t *testing.T) {
 	if err := roster.Register(&agent.Teammate{Name: "worker", Cancel: func() { cancelled++ }}); err != nil {
 		t.Fatal(err)
 	}
+	finished := &agent.Teammate{Name: "finished", AgentID: "agt-old-finished"}
+	// The configured cap is split by kind, so use the anonymous slot for a
+	// separate completed entry while the named worker remains live.
+	finished.Anonymous = true
+	if err := roster.Register(finished); err != nil {
+		t.Fatal(err)
+	}
+	roster.Unregister(finished.Name)
 	gate := permission.New(permission.ModeAsk)
 	loop := agent.NewLoop(nil, tools.NewRegistry(), gate, nil, "system", 3)
+	jobsPool := jobs.NewRegistry(t.TempDir())
+	ctx, cancelJob := context.WithCancel(context.Background())
+	oldJob, err := jobsPool.Spawn(jobs.SpawnArgs{
+		Command: "sleep 30",
+		Cmd:     exec.CommandContext(ctx, "sh", "-c", "sleep 30"),
+		Cancel:  cancelJob,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop.Jobs = jobsPool
+	loop.JobNotify = jobsPool.Notify()
 	loop.Monitors = agent.NewMonitorRegistry(1)
 	cronSvc, err := agent.NewCronService(filepath.Join(t.TempDir(), "cron"))
 	if err != nil {
@@ -106,6 +129,18 @@ func TestRuntimeReleaseSessionWorkCancelsRosterAndIsNilSafe(t *testing.T) {
 	if cancelled != 1 || roster.Count() != 0 {
 		t.Fatalf("session work not cancelled: cancelled=%v roster=%d", cancelled, roster.Count())
 	}
+	if got := roster.List(); len(got) != 0 {
+		t.Fatalf("session boundary retained roster state: %+v", got)
+	}
+	if _, ok := roster.LookupByAgentID(finished.AgentID); ok {
+		t.Fatal("session boundary retained recently-finished sub-agent output")
+	}
+	if got := jobsPool.List(); len(got) != 0 {
+		t.Fatalf("session boundary retained Bash jobs: %+v", got)
+	}
+	if _, ok := jobsPool.Get(oldJob.ID); ok {
+		t.Fatal("session boundary retained addressable Bash output")
+	}
 	if _, ok := cronSvc.Get(ephemeral.ID); ok {
 		t.Fatal("session boundary retained an ephemeral cron job")
 	}
@@ -116,6 +151,33 @@ func TestRuntimeReleaseSessionWorkCancelsRosterAndIsNilSafe(t *testing.T) {
 	if cancelled != 1 {
 		t.Fatalf("idempotent cleanup cancelled an already-cleared roster %d times", cancelled)
 	}
+	if err := roster.Register(&agent.Teammate{Name: "new-worker", AgentID: "agt-new"}); err != nil {
+		t.Fatalf("reset roster rejected destination-session teammate: %v", err)
+	}
+	if _, ok := roster.LookupByAgentID("agt-new"); !ok {
+		t.Fatal("destination-session teammate unavailable through retained roster pointer")
+	}
+	newJobCtx, cancelNewJob := context.WithCancel(context.Background())
+	newJob, err := jobsPool.Spawn(jobs.SpawnArgs{
+		Command: "echo new-session",
+		Cmd:     exec.CommandContext(newJobCtx, "sh", "-c", "echo new-session"),
+		Cancel:  cancelNewJob,
+	})
+	if err != nil {
+		t.Fatalf("reset jobs registry rejected destination-session job: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap, ok := jobsPool.Get(newJob.ID); ok && snap.Status == jobs.StatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snap, ok := jobsPool.Get(newJob.ID); !ok || snap.Status != jobs.StatusCompleted {
+		t.Fatalf("destination-session job unavailable through retained registry pointer: ok=%v job=%+v", ok, snap)
+	}
+	jobsPool.Reset(0)
+	roster.Reset()
 	(&runtime{}).releaseSessionWork()
 	var nilRuntime *runtime
 	nilRuntime.releaseSessionWork()

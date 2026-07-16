@@ -428,7 +428,7 @@ func (r *runtime) releaseSessionWork() {
 		r.cronSvc.ClearEphemeral()
 	}
 	if r.subAgentRoster != nil {
-		r.subAgentRoster.CancelAll()
+		r.subAgentRoster.Reset()
 	}
 	if r.loop == nil {
 		return
@@ -437,7 +437,7 @@ func (r *runtime) releaseSessionWork() {
 		r.loop.Monitors.StopAll()
 	}
 	if r.loop.Jobs != nil {
-		r.loop.Jobs.Shutdown(0)
+		r.loop.Jobs.Reset(0)
 	}
 }
 

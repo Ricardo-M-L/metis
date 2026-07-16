@@ -584,7 +584,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		// spawned goroutine takes ownership of Unregister. Foreground
 		// callers unregister here when Execute returns.
 		if !runInBackground {
-			defer a.roster.Unregister(teammate.Name)
+			defer a.roster.UnregisterTeammate(teammate)
 		}
 	}
 
@@ -1086,7 +1086,7 @@ func (a Agent) executeBackground(
 		defer transcript.Close()
 		defer func() {
 			if a.roster != nil {
-				a.roster.Unregister(teammate.Name)
+				a.roster.UnregisterTeammate(teammate)
 			}
 		}()
 		// panic recovery — a background sub-agent that panics should

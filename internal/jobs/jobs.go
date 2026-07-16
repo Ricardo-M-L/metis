@@ -87,6 +87,10 @@ type Job struct {
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
 	output *DiskOutput
+	// generation identifies the top-level session that registered the job.
+	// It is used only to suppress a completion notification that races a
+	// Registry.Reset boundary; public snapshots intentionally omit it.
+	generation uint64
 }
 
 // Notification is published on Registry.Notify when a job leaves
@@ -112,9 +116,10 @@ type Notification struct {
 // state transitions take a write lock; reads (List / Get / Output)
 // take read locks.
 type Registry struct {
-	mu     sync.RWMutex
-	jobs   map[string]*Job
-	notify chan Notification // buffered, drained by agent loop
+	mu         sync.RWMutex
+	jobs       map[string]*Job
+	notify     chan Notification // buffered, drained by agent loop
+	generation uint64            // incremented whenever session state is reset
 
 	// dir overrides ~/.metis/jobs (used by tests).
 	dir string
@@ -135,9 +140,10 @@ func NewRegistryBuffered(dir string, notifyBuf int) *Registry {
 		dir = home()
 	}
 	return &Registry{
-		jobs:   make(map[string]*Job),
-		notify: make(chan Notification, notifyBuf),
-		dir:    filepath.Join(dir, "jobs"),
+		jobs:       make(map[string]*Job),
+		notify:     make(chan Notification, notifyBuf),
+		generation: 1,
+		dir:        filepath.Join(dir, "jobs"),
 	}
 }
 
@@ -255,6 +261,7 @@ func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
 	snapshot := publicJobSnapshot(j)
 
 	r.mu.Lock()
+	j.generation = r.generation
 	r.jobs[id] = j
 	r.mu.Unlock()
 
@@ -306,6 +313,7 @@ func (r *Registry) Adopt(a AdoptArgs) (*Job, error) {
 	snapshot := publicJobSnapshot(j)
 
 	r.mu.Lock()
+	j.generation = r.generation
 	r.jobs[id] = j
 	r.mu.Unlock()
 
@@ -383,11 +391,26 @@ func (r *Registry) waitAndComplete(j *Job, waitResult <-chan error) {
 		Elapsed:  j.EndTime.Sub(j.StartTime),
 		Command:  j.Command,
 	}
+	generation := j.generation
 	r.mu.Unlock()
 
-	// Non-blocking publish: if no one drains, drop. This keeps a
-	// runaway "job spam" from deadlocking the wait goroutine. The
-	// model can still see the completed status via JobList/JobOutput.
+	r.publish(generation, notif)
+}
+
+// publish delivers a terminal notification only while the job still belongs
+// to the active top-level session. Holding the read lock through the
+// non-blocking send makes Reset atomic with respect to publishers: a send that
+// wins the race is drained by Reset, while one that loses observes the new
+// generation and is discarded.
+func (r *Registry) publish(generation uint64, notif Notification) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if generation != r.generation {
+		return
+	}
+	// Non-blocking publish: if no one drains, drop. This keeps a runaway
+	// "job spam" from deadlocking the wait goroutine. The model can still
+	// see the completed status via JobList/JobOutput.
 	select {
 	case r.notify <- notif:
 	default:
@@ -513,6 +536,7 @@ func (r *Registry) Stop(id string, grace time.Duration) error {
 	j.ExitCode = -1
 	command := j.Command
 	elapsed := j.EndTime.Sub(j.StartTime)
+	generation := j.generation
 	r.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {
@@ -534,17 +558,65 @@ func (r *Registry) Stop(id string, grace time.Duration) error {
 		}
 	}
 
-	select {
-	case r.notify <- Notification{
+	r.publish(generation, Notification{
 		JobID:    id,
 		Status:   StatusKilled,
 		ExitCode: -1,
 		Elapsed:  elapsed,
 		Command:  command,
-	}:
-	default:
-	}
+	})
 	return nil
+}
+
+// Reset terminates and forgets every job owned by the session being left.
+// Unlike Shutdown, Reset also clears completed entries and pending
+// notifications while keeping this Registry pointer reusable. The latter is
+// important because Bash/Agent tools and the main Loop all retain this same
+// pointer across in-process /new, /branch and /resume operations.
+func (r *Registry) Reset(grace time.Duration) {
+	type runningProcess struct {
+		cmd    *exec.Cmd
+		cancel context.CancelFunc
+	}
+
+	r.mu.Lock()
+	r.generation++
+	running := make([]runningProcess, 0, len(r.jobs))
+	now := time.Now()
+	for _, j := range r.jobs {
+		if j == nil || j.Status != StatusRunning {
+			continue
+		}
+		j.Status = StatusKilled
+		j.EndTime = now
+		j.ExitCode = -1
+		running = append(running, runningProcess{cmd: j.cmd, cancel: j.cancel})
+	}
+	r.jobs = make(map[string]*Job)
+
+drainNotifications:
+	for {
+		select {
+		case <-r.notify:
+			continue
+		default:
+			break drainNotifications
+		}
+	}
+	r.mu.Unlock()
+
+	// Process termination happens outside the registry lock. Reset already
+	// made the old entries invisible, and waitAndComplete sees StatusKilled
+	// on each detached Job so it only releases handles and never publishes.
+	for _, p := range running {
+		if p.cmd == nil || p.cmd.Process == nil {
+			continue
+		}
+		killTreeStaged(p.cmd.Process, grace, nil)
+		if p.cancel != nil {
+			time.AfterFunc(grace+500*time.Millisecond, p.cancel)
+		}
+	}
 }
 
 // Shutdown closes the notify channel and best-effort kills every
