@@ -29,7 +29,17 @@ func TestCmdSandbox_SetsRuntimeOverride(t *testing.T) {
 	resetSandboxOverride(t)
 
 	for _, mode := range []string{"off", "permissions", "auto-allow"} {
+		bash.SetRuntimeSandboxMode("")
 		out := cmdSandbox(nil, mode)
+		if mode != bash.SandboxModeOff && !bash.SandboxAvailable() {
+			if !strings.Contains(out, "only `off` is supported") {
+				t.Errorf("%q: expected unsupported-platform message; got %q", mode, out)
+			}
+			if got := bash.RuntimeSandboxMode(); got != "" {
+				t.Errorf("%q: rejected mode changed runtime override to %q", mode, got)
+			}
+			continue
+		}
 		if !strings.Contains(out, "mode set to") {
 			t.Errorf("%q: expected confirmation; got %q", mode, out)
 		}
@@ -52,6 +62,15 @@ func TestCmdSandbox_AliasesAcceptedButCanonicalised(t *testing.T) {
 	for alias, want := range cases {
 		bash.SetRuntimeSandboxMode("")
 		out := cmdSandbox(nil, alias)
+		if want != bash.SandboxModeOff && !bash.SandboxAvailable() {
+			if !strings.Contains(out, "only `off` is supported") {
+				t.Errorf("alias %q: expected unsupported-platform message; got %q", alias, out)
+			}
+			if got := bash.RuntimeSandboxMode(); got != "" {
+				t.Errorf("alias %q: rejected mode changed runtime override to %q", alias, got)
+			}
+			continue
+		}
 		if !strings.Contains(out, "mode set to") {
 			t.Errorf("alias %q rejected: %q", alias, out)
 			continue
