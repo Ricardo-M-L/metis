@@ -19,8 +19,7 @@ import (
 
 // Per-section files. Numeric prefixes pin the canonical order so a
 // new section can be inserted between two existing ones by renaming.
-// The bodies still go through text/template so identity.md keeps its
-// {{.Model}} variable.
+// The bodies still go through text/template for future expansion.
 //
 //go:embed prompts/base/*.md
 var baseSectionFS embed.FS
@@ -32,7 +31,8 @@ var baseSectionFS embed.FS
 // behavior.
 type PromptCtx struct {
 	// Model is the resolved model id ("MiniMax-M2.7", "claude-opus-4-7",
-	// ...). Surfaced via {{.Model}} in identity.md.
+	// ...). Retained for compatibility and provider hints, but the identity
+	// prompt no longer surfaces it by default.
 	Model string
 
 	// ProviderName is the metis-side provider label
@@ -57,8 +57,8 @@ type PromptCtx struct {
 	// wasted on them.
 	IsSubAgent bool
 
-	// Mode mirrors the permission mode label ("ask" / "auto" / "bypass"
-	// / "plan" / "deny"). Some sections might want to specialize per
+	// Mode mirrors Claude Code's permission mode label ("default" /
+	// "acceptEdits" / "plan" / "dontAsk" / "bypassPermissions"). Some sections might want to specialize per
 	// mode in the future (e.g. reversibility might be terser in
 	// bypass).
 	Mode string
@@ -81,7 +81,7 @@ func readSection(name string) string {
 }
 
 // expandTemplate runs the section body through the base template
-// machinery so {{.Model}} etc still expand. Returns the body unchanged
+// machinery so any future {{.Var}} markers still expand. Returns the body unchanged
 // when there's no template syntax.
 func expandTemplate(body string, vars BasePromptVars) string {
 	if !strings.Contains(body, "{{") {
@@ -101,7 +101,7 @@ func expandTemplate(body string, vars BasePromptVars) string {
 // Built-in section getters. Order here = order in the assembled prompt.
 // ----------------------------------------------------------------------
 
-// IdentitySection — always-on intro line with {{.Model}}.
+// IdentitySection — always-on intro line.
 func IdentitySection(ctx PromptCtx) SystemPromptSection {
 	body := expandTemplate(readSection("01_identity.md"), BasePromptVars{Model: ctx.Model})
 	return SystemPromptSection{

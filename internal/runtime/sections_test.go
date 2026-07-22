@@ -5,20 +5,23 @@ import (
 	"testing"
 )
 
-func TestIdentitySection_ExpandsModel(t *testing.T) {
+func TestIdentitySection_DoesNotExpandModel(t *testing.T) {
 	got := IdentitySection(PromptCtx{Model: "claude-opus-4-7"})
 	if got.Name != "identity" {
 		t.Errorf("Name=%q, want identity", got.Name)
 	}
-	if !strings.Contains(got.Body, "powered by claude-opus-4-7") {
-		t.Errorf("identity body missing model substitution; got:\n%s", got.Body)
+	if strings.Contains(got.Body, "powered by") || strings.Contains(got.Body, "claude-opus-4-7") {
+		t.Errorf("identity body should not surface model name; got:\n%s", got.Body)
+	}
+	if !strings.Contains(got.Body, "You are metis, a fast, local-first agent CLI.") {
+		t.Errorf("identity body missing metis intro; got:\n%s", got.Body)
 	}
 	if !got.Cache {
 		t.Error("identity should be cacheable")
 	}
 }
 
-func TestIdentitySection_NoModelOmitsClause(t *testing.T) {
+func TestIdentitySection_NoModelStillOmitsClause(t *testing.T) {
 	got := IdentitySection(PromptCtx{})
 	if strings.Contains(got.Body, "powered by") {
 		t.Errorf("empty model should not render 'powered by' clause; got:\n%s", got.Body)

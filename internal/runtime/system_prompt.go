@@ -25,7 +25,7 @@ const SystemPromptFileName = "system.md"
 // basePromptTPL is the embedded base prompt template. Lives in
 // prompts/base.md so the prompt text is editable without
 // recompiling inline string constants. text/template syntax —
-// variables: .Model, .ProviderHint (mirror crush's .md.tpl pattern).
+// variables: .ProviderHint (mirror crush's .md.tpl pattern).
 //
 //go:embed prompts/base.md
 var basePromptTPL string
@@ -35,7 +35,7 @@ var basePromptTPL string
 // missing → silent. Add new fields here and their `{{ .Foo }}`
 // reference in base.md together.
 type BasePromptVars struct {
-	Model        string // e.g. "claude-opus-4-7" — surfaced as "powered by ..."
+	Model        string // resolved model id; retained for compatibility, not surfaced in identity text
 	ProviderHint string // optional provider-specific guidance (Claude→XML, OpenAI→JSON)
 }
 
@@ -71,12 +71,10 @@ func DefaultBasePrompt() string {
 // The user message + tool schemas still carry their own context; this
 // just drops the ~5K-char base prompt to a single line.
 func SimpleBasePrompt(model string) string {
+	_ = model // model is intentionally not surfaced in the prompt
 	cwd, _ := os.Getwd()
-	if model == "" {
-		model = "an LLM"
-	}
-	return fmt.Sprintf("You are metis, a fast local-first agent CLI powered by %s. CWD: %s. Date: %s.",
-		model, cwd, time.Now().Format("2006-01-02"))
+	return fmt.Sprintf("You are metis, a fast local-first agent CLI. CWD: %s. Date: %s.",
+		cwd, time.Now().Format("2006-01-02"))
 }
 
 // IsSimpleMode returns true when the user opted into the simple-prompt

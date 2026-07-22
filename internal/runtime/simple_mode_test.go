@@ -7,8 +7,8 @@ import (
 
 func TestSimpleBasePrompt_ContainsModelAndDate(t *testing.T) {
 	out := SimpleBasePrompt("MiniMax-M2.7")
-	if !strings.Contains(out, "MiniMax-M2.7") {
-		t.Errorf("simple prompt should mention model; got:\n%s", out)
+	if strings.Contains(out, "MiniMax-M2.7") {
+		t.Errorf("simple prompt should not mention model; got:\n%s", out)
 	}
 	if !strings.Contains(out, "CWD:") {
 		t.Errorf("simple prompt should mention CWD; got:\n%s", out)
@@ -25,8 +25,8 @@ func TestSimpleBasePrompt_ContainsModelAndDate(t *testing.T) {
 
 func TestSimpleBasePrompt_NoModelFallback(t *testing.T) {
 	out := SimpleBasePrompt("")
-	if !strings.Contains(out, "an LLM") {
-		t.Errorf("empty model should fall back to 'an LLM'; got:\n%s", out)
+	if strings.Contains(out, "an LLM") || strings.Contains(out, "powered by") {
+		t.Errorf("simple prompt should stay model-agnostic; got:\n%s", out)
 	}
 }
 

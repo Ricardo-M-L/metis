@@ -5,13 +5,15 @@ import (
 	"testing"
 )
 
-// TestRenderBasePrompt_WithModel verifies the {{.Model}} template
-// variable expands when set; legacy empty variant matches the
-// pre-template default.
+// TestRenderBasePrompt_WithModel verifies the model is not surfaced
+// in the identity text even when provided.
 func TestRenderBasePrompt_WithModel(t *testing.T) {
 	out := RenderBasePrompt(BasePromptVars{Model: "claude-opus-4-7"})
-	if !strings.Contains(out, "powered by claude-opus-4-7") {
-		t.Errorf("base prompt should mention model; got:\n%s", out)
+	if strings.Contains(out, "powered by claude-opus-4-7") {
+		t.Errorf("base prompt should not mention model in identity; got:\n%s", out)
+	}
+	if !strings.Contains(out, "You are metis, a fast, local-first agent CLI.") {
+		t.Errorf("base prompt missing metis identity line; got:\n%s", out)
 	}
 	// Legacy / empty variant must not contain the conditional clause.
 	out2 := RenderBasePrompt(BasePromptVars{})

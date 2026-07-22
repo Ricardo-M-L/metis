@@ -71,8 +71,8 @@ func TestRenderBasePrompt_StillEmbedsProviderHint(t *testing.T) {
 		Model:        "MiniMax-M2.7",
 		ProviderHint: "# Provider notes (test)\nQuirk: x.",
 	})
-	if !strings.Contains(out, "MiniMax-M2.7") {
-		t.Error("rendered prompt missing model")
+	if strings.Contains(out, "powered by MiniMax-M2.7") {
+		t.Error("rendered prompt should not surface model in identity")
 	}
 	if !strings.Contains(out, "# Provider notes (test)") {
 		t.Error("rendered prompt missing provider hint suffix")
