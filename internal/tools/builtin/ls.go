@@ -39,7 +39,8 @@ func (LS) InputSchema() map[string]any {
 }
 func (LS) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
 func (l LS) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := l.gate.Check(context.Background(), "LS", strFromAny(in["path"]))
+	path := strFromAny(in["path"])
+	d, src := l.gate.CheckPath(context.Background(), "LS", path, path)
 	return mapDecision(d), src
 }
 

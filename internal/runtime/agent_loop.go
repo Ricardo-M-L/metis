@@ -143,6 +143,10 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	loop := agent.NewLoop(opts.Provider, opts.Registry, opts.Gate,
 		hookReg, opts.System, maxIter)
 	loop.Model = opts.Model
+	// Plan instructions are live session state, not part of the stable boot
+	// prompt. Loop.buildRequest adds this body only while Loop.PlanMode is true
+	// and drops it immediately after ExitPlanMode approval.
+	loop.PlanSystemPrompt = PlanOverlay(true).Body
 
 	// USD budget cap (claude-code's maxBudgetUsd). Pricing comes from
 	// the models.dev catalog, which warms up in a BACKGROUND goroutine
@@ -158,14 +162,12 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	if len(opts.SystemSections) > 0 {
 		loop.SystemSections = toLLMSections(opts.SystemSections)
 	}
-	// "plan" permission mode and Loop.PlanMode are two separate flags
-	// today — gate gates tools to read-only, Loop.PlanMode makes the
-	// loop emit EventPlan (collect tool calls) instead of executing.
-	// Bind them here so `--mode plan` triggers both: the user's mental
-	// model is "I asked for plan mode, I want to see the plan, don't
-	// run anything."
+	// "plan" permission mode and Loop.PlanMode are separate state holders:
+	// Gate enforces read-only access, while Loop partitions plan-control,
+	// read-only, and mutating calls and feeds every result back to the model.
+	// Bind them here so `--mode plan` activates both halves.
 	if opts.Gate != nil && string(opts.Gate.Mode()) == string(permission.ModePlan) {
-		loop.PlanMode = true
+		loop.SetPlanMode(true)
 	}
 
 	// Memory manager — persistent recall across sessions. Caller can

@@ -130,15 +130,10 @@ func (m *Model) cyclePermissionMode() {
 	}
 	m.lastModeCycle = now
 
-	// Shift+Tab cycle. Aligned with claude-code's getNextPermissionMode
-	// (utils/permissions/getNextPermissionMode.ts:39) since 2026-05-11:
-	// metis's old `auto` mode (read-only auto-allow) collided with
-	// claude-code's ant-only `auto` (LLM-classifier) — confusing
-	// naming, distinct semantics. Removed to avoid the trap. Users who
-	// want "auto-allow writes but ask for shell" pick acceptEdits;
-	// users who want "auto-allow everything" pick bypass.
-	modes := []string{"ask", "acceptEdits", "plan", "bypass", "deny"}
-	current := string(m.gate.Mode())
+	// Claude Code's public cycle intentionally excludes dontAsk:
+	// default -> acceptEdits -> plan -> bypassPermissions -> default.
+	modes := permission.CycleModes
+	current := m.gate.Mode()
 	nextIdx := 0
 	for i, mode := range modes {
 		if mode == current {
@@ -146,8 +141,8 @@ func (m *Model) cyclePermissionMode() {
 			break
 		}
 	}
-	m.gate.SetMode(permission.Mode(modes[nextIdx]))
-	// Mode change is shown in the footer ("· auto mode on (shift+tab to
+	m.gate.SetMode(modes[nextIdx])
+	// Mode change is shown in the footer ("· plan mode on (shift+tab to
 	// cycle)"). We deliberately don't append a chat message — every
 	// Shift+Tab press would otherwise pollute history.
 }

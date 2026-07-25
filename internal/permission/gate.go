@@ -1,6 +1,6 @@
 // Package permission implements cascading permission rules inspired by
 // Claude Code's settings precedence (CLI > local > project > user > policy).
-// Modes mirror the operator-friendly defaults: ask / auto / plan / deny.
+// Modes mirror Claude Code's five public permission modes.
 package permission
 
 import (
@@ -14,21 +14,70 @@ import (
 type Mode string
 
 const (
-	ModeAsk         Mode = "ask"         // prompt for every non-allowlisted action
-	ModeAcceptEdits Mode = "acceptEdits" // auto-allow reads + project-local writes; ask for shell
-	ModeBypass      Mode = "bypass"      // approve everything (dangerous; opt-in)
-	ModePlan        Mode = "plan"        // read-only mode; no edits or shell writes
-	ModeDeny        Mode = "deny"        // refuse everything that asks
+	ModeDefault           Mode = "default"           // allow read-only tools; ask before state changes
+	ModeAcceptEdits       Mode = "acceptEdits"       // auto-allow edits; ask for other state changes
+	ModeBypassPermissions Mode = "bypassPermissions" // approve tool calls (dangerous; explicit opt-in)
+	ModePlan              Mode = "plan"              // read-only exploration until the plan is approved
+	ModeDontAsk           Mode = "dontAsk"           // allow what is already allowed; deny instead of prompting
 
-	// Removed 2026-05-11: ModeAcceptEdits. Old semantics were "auto-allow
-	// read-only + safe bash, ask for writes" — a midpoint between
-	// ModeAsk and ModeAcceptEdits. The name collided with claude-code's
-	// ant-only `auto` (which is an LLM-classifier mode and means
-	// something entirely different), confusing every user who tried to
-	// compare the two. Users who want "auto-allow file edits, ask for
-	// shell" should pick ModeAcceptEdits — that matches claude-code's
-	// public `acceptEdits` exactly.
+	// Deprecated source-level aliases. Persisted sessions and user config
+	// from Metis <=0.2.8 used ask/bypass/deny. Keep Go callers compiling,
+	// while every value written back to disk and shown in the UI is the
+	// Claude Code canonical spelling.
+	ModeAsk    = ModeDefault
+	ModeBypass = ModeBypassPermissions
+	ModeDeny   = ModeDontAsk
 )
+
+// Modes is the canonical five-mode public set, in the same order Claude
+// Code exposes in settings. Shift+Tab intentionally uses CycleModes below:
+// dontAsk exists for headless/policy workflows but Claude does not put it in
+// the interactive cycle.
+var Modes = []Mode{
+	ModeAcceptEdits,
+	ModeBypassPermissions,
+	ModeDefault,
+	ModeDontAsk,
+	ModePlan,
+}
+
+// CycleModes matches Claude Code's public Shift+Tab cycle when bypass mode is
+// available: default -> acceptEdits -> plan -> bypassPermissions -> default.
+var CycleModes = []Mode{
+	ModeDefault,
+	ModeAcceptEdits,
+	ModePlan,
+	ModeBypassPermissions,
+}
+
+// ParseMode validates a user/session value and returns its canonical form.
+// Legacy Metis spellings remain accepted as read-time aliases only.
+func ParseMode(raw string) (Mode, bool) {
+	switch strings.TrimSpace(raw) {
+	case "default", "ask":
+		return ModeDefault, true
+	case "acceptEdits":
+		return ModeAcceptEdits, true
+	case "bypassPermissions", "bypass":
+		return ModeBypassPermissions, true
+	case "plan":
+		return ModePlan, true
+	case "dontAsk", "deny":
+		return ModeDontAsk, true
+	default:
+		return "", false
+	}
+}
+
+// CanonicalMode normalizes known values and safely falls back to default for
+// corrupt/unknown persisted state. CLI and slash-command entry points should
+// call ParseMode first so typos are reported instead of silently falling back.
+func CanonicalMode(raw string) Mode {
+	if mode, ok := ParseMode(raw); ok {
+		return mode
+	}
+	return ModeDefault
+}
 
 // Decision is the final verdict for a tool call.
 type Decision int
@@ -159,6 +208,17 @@ type Gate struct {
 	mu    sync.RWMutex
 	mode  Mode
 	rules []Rule
+
+	// modeNotifyMu serializes delivery of mode changes without holding mu.
+	// SetMode can be called concurrently by the UI and an in-flight plan tool;
+	// invoking captured callbacks directly allowed an older callback to land
+	// after a newer one and leave Loop.planMode out of sync with Gate.mode.
+	// The small pending-drain state also permits a listener to call SetMode
+	// re-entrantly: the nested update is coalesced and delivered after the
+	// current callback returns instead of deadlocking.
+	modeNotifyMu      sync.Mutex
+	modeNotifyRunning bool
+	modeNotifyPending bool
 	// remembered "ask once, apply forever this session"
 	memoAllow map[string]bool
 
@@ -204,6 +264,14 @@ type Gate struct {
 	// it.
 	readOnlyHook func(toolName, stringInput string) bool
 
+	// pathScopeHook answers whether a concrete filesystem target belongs to
+	// the launch cwd or an explicitly added directory. Only callers using
+	// CheckPath opt into this boundary; Bash intentionally stays out because
+	// reliably extracting every shell-touched path requires shell parsing.
+	// nil preserves the historical unrestricted behavior for embedders and
+	// tests that construct a Gate without the CLI runtime.
+	pathScopeHook func(path string) bool
+
 	// onModeChange — fired AFTER SetMode commits the new mode. Used by
 	// the runtime to keep dependent state in sync (most importantly:
 	// Loop.PlanMode must match Gate.Mode==ModePlan, otherwise users
@@ -221,7 +289,7 @@ type Gate struct {
 
 func New(mode Mode) *Gate {
 	return &Gate{
-		mode:         mode,
+		mode:         CanonicalMode(string(mode)),
 		memoAllow:    make(map[string]bool),
 		denialLimits: DefaultDenialLimits,
 	}
@@ -243,6 +311,25 @@ func (g *Gate) SetReadOnlyHook(fn func(toolName, stringInput string) bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.readOnlyHook = fn
+}
+
+// SetPathScopeHook installs the runtime's filesystem-scope resolver. The hook
+// is evaluated outside the Gate lock so it may safely maintain its own dynamic
+// /add-dir state. Passing nil disables scope enforcement.
+func (g *Gate) SetPathScopeHook(fn func(path string) bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pathScopeHook = fn
+}
+
+func (g *Gate) pathInScope(path string) (enforced, inScope bool) {
+	g.mu.RLock()
+	fn := g.pathScopeHook
+	g.mu.RUnlock()
+	if fn == nil || strings.TrimSpace(path) == "" {
+		return false, true
+	}
+	return true, fn(path)
 }
 
 // IsReadOnly is a public, lock-managing wrapper around the runtime's
@@ -386,24 +473,57 @@ func (g *Gate) Clone() *Gate {
 	rulesCopy := make([]Rule, len(g.rules))
 	copy(rulesCopy, g.rules)
 	return &Gate{
-		mode:         g.mode,
-		rules:        rulesCopy,
-		memoAllow:    make(map[string]bool),
-		classifier:   g.classifier,
-		denialLimits: g.denialLimits,
+		mode:          g.mode,
+		rules:         rulesCopy,
+		memoAllow:     make(map[string]bool),
+		classifier:    g.classifier,
+		readOnlyHook:  g.readOnlyHook,
+		pathScopeHook: g.pathScopeHook,
+		denialLimits:  g.denialLimits,
 		// Counters + breakers start fresh by design.
 	}
 }
 
 func (g *Gate) SetMode(m Mode) {
+	m = CanonicalMode(string(m))
 	g.mu.Lock()
 	g.mode = m
-	listener := g.onModeChange
 	g.mu.Unlock()
-	// Fire AFTER releasing the lock so the listener is free to call
-	// back into Gate (or any other locked subsystem) without deadlock.
-	if listener != nil {
-		listener(m)
+	g.notifyModeChange()
+}
+
+// notifyModeChange delivers the latest committed mode in commit order. Calls
+// made while another callback is running are coalesced; every sequential call
+// still fires synchronously, while concurrent/re-entrant updates are guaranteed
+// to finish with the listener observing the final Gate.mode.
+func (g *Gate) notifyModeChange() {
+	g.modeNotifyMu.Lock()
+	if g.modeNotifyRunning {
+		g.modeNotifyPending = true
+		g.modeNotifyMu.Unlock()
+		return
+	}
+	g.modeNotifyRunning = true
+	g.modeNotifyMu.Unlock()
+
+	for {
+		g.mu.RLock()
+		mode := g.mode
+		listener := g.onModeChange
+		g.mu.RUnlock()
+		if listener != nil {
+			listener(mode)
+		}
+
+		g.modeNotifyMu.Lock()
+		if g.modeNotifyPending {
+			g.modeNotifyPending = false
+			g.modeNotifyMu.Unlock()
+			continue
+		}
+		g.modeNotifyRunning = false
+		g.modeNotifyMu.Unlock()
+		return
 	}
 }
 
@@ -434,19 +554,17 @@ func (g *Gate) ResetSessionState(mode Mode, resumedRules []Rule) {
 	// later mutation of resumedRules from changing the live Gate.
 	g.rules = append([]Rule(nil), kept...)
 	g.rules = append(g.rules, resumedRules...)
+	mode = CanonicalMode(string(mode))
 	g.mode = mode
 	g.memoAllow = make(map[string]bool)
 	g.consecutiveDenials = 0
 	g.totalDenials = 0
 	g.denialFallbackUntil = time.Time{}
-	listener := g.onModeChange
 	g.mu.Unlock()
 
-	// Match SetMode's callback contract: fire only after releasing the lock so
-	// the Loop listener can safely call back into Gate-owned state.
-	if listener != nil {
-		listener(mode)
-	}
+	// Match SetMode's ordered callback contract. The listener runs outside mu,
+	// so it may safely inspect Gate state or request another mode change.
+	g.notifyModeChange()
 }
 
 // isSessionRuleSource identifies grants whose lifetime is one interactive
@@ -501,8 +619,8 @@ func (g *Gate) PopRules(n int) {
 // stringInput is a flattened representation used for substring matching.
 //
 // Precedence (mirrors claude-code permissions.ts:1158-1320):
-//  1. Hard modes (Plan / Deny) override everything: user-safety stances
-//     that mustn't be defeated by a leftover "Yes always" rule.
+//  1. Plan overrides user rules, but read-only candidates still pass the
+//     bypass-immune safety/secret checks before they are auto-allowed.
 //  2. Safety-check paths (.git/, .ssh/, ~/.bashrc, ...) → ASK even in
 //     Bypass mode. These are bypass-immune by virtue of the path: the
 //     model writing to ~/.bashrc is always worth a human glance.
@@ -511,16 +629,26 @@ func (g *Gate) PopRules(n int) {
 //     auto-deny loop.
 //  4. Declarative rules win (user set them on purpose).
 //  5. Mode-default fallthrough.
-func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, string) {
+func (g *Gate) Check(ctx context.Context, tool, stringInput string) (Decision, string) {
+	return g.check(ctx, tool, stringInput, false)
+}
+
+// CheckPath is Check plus the cwd/--add-dir boundary for one concrete target.
+// Declarative rules retain their normal precedence, so a deliberate user
+// allow can grant an outside path. ModePlan remains stronger for mutations:
+// its Edit/Write/NotebookEdit denial cannot be overridden by a scope grant.
+func (g *Gate) CheckPath(ctx context.Context, tool, stringInput, path string) (Decision, string) {
+	enforced, inScope := g.pathInScope(path)
+	return g.check(ctx, tool, stringInput, enforced && !inScope)
+}
+
+func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope bool) (Decision, string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Hard modes — applied BEFORE rules so leftover allow rules can't
-	// punch a hole through plan/deny.
+	// Plan is applied BEFORE rules so leftover allow rules cannot punch
+	// a state-changing hole through the read-only planning boundary.
 	switch g.mode {
-	case ModeDeny:
-		g.recordDenial()
-		return DecisionDeny, "mode:deny"
 	case ModePlan:
 		// Plan-mode allowlist policy (2026-05-18 expanded):
 		//
@@ -534,21 +662,20 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		//       trapping it in a deny-storm.
 		//   (b) Even with Loop.PlanMode=true, the model couldn't use
 		//       AskUser to ask the human, couldn't ExitPlanMode to
-		//       leave, couldn't TodoWrite to plan, couldn't query
-		//       MetisInfo to introspect. plan mode became "blanket
+		//       leave, or query MetisInfo to introspect. plan mode became "blanket
 		//       deny with five exceptions" — not actually plannable.
 		//
 		// New policy (in order):
 		//   1. Plan-mode meta tools always pass (EnterPlanMode is a
 		//      no-op when already in plan; ExitPlanMode is the only
 		//      way out — denying it would be a trap).
-		//   2. The runtime's readOnlyHook decides any tool with no
-		//      side effects (queries the registry's IsReadOnly). This
-		//      auto-covers AskUser / MetisInfo / Todo* / SubAgent* /
-		//      BashOutput / TaskOutput / Skill / LSP / WebFetch / etc.
-		//      — same hook ModeAcceptEdits already uses.
-		//   3. Fallback legacy allowlist for the headless / test paths
-		//      where no hook is wired.
+		//   2. The runtime's readOnlyHook decides tools with no side
+		//      effects (queries the registry's IsReadOnly). This covers
+		//      MetisInfo, Agent, read-only output/query tools, Skill, LSP,
+		//      WebFetch, etc. TodoWrite and Fork intentionally remain denied.
+		//   3. Before allowing a read-only candidate, apply the same
+		//      bypass-immune path and secret-read checks used by other modes.
+		//   4. A fallback allowlist supports headless/test paths with no hook.
 		switch tool {
 		case "EnterPlanMode", "ExitPlanMode":
 			g.recordAllow()
@@ -565,18 +692,40 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 			g.recordAllow()
 			return DecisionAllow, "mode:plan:askuser"
 		}
+		allowSource := ""
 		if g.callReadOnlyHookLocked(tool, stringInput) {
-			g.recordAllow()
-			return DecisionAllow, "mode:plan:readonly"
+			allowSource = "mode:plan:readonly"
+		} else {
+			switch tool {
+			case "Read", "LS", "Glob", "Grep", "WebFetch":
+				allowSource = "mode:plan:fallback"
+			}
 		}
-		switch tool {
-		case "Read", "LS", "Glob", "Grep", "WebFetch":
+		if allowSource != "" {
+			// A read-only Bash command can still expose a bypass-immune path
+			// (for example `cat ~/.ssh/config`). Likewise, Read can leak a
+			// private key. Plan mode must not skip those checks merely because
+			// its hard boundary is evaluated before normal rules.
+			if isFileTouchingTool(tool) && matchesSafetyPath(stringInput) {
+				return DecisionAsk, "safety_check:bypass_immune"
+			}
+			if isSecretReadAttempt(tool, stringInput) {
+				return DecisionAsk, "secret_read:bypass_immune"
+			}
+			if outOfScope {
+				// Plan ignores ordinary rules as an execution boundary, but an
+				// explicit matching ALLOW may expand where its read-only tools
+				// explore. A higher-authority matching DENY still wins here.
+				if idx, ok := g.bestMatchingRuleLocked(tool, stringInput); !ok || g.rules[idx].Verb != DecisionAllow {
+					return DecisionAsk, "scope:outside"
+				}
+			}
 			g.recordAllow()
-			return DecisionAllow, "mode:plan:fallback"
-		default:
-			g.recordDenial()
-			return DecisionDeny, "mode:plan"
+			return DecisionAllow, allowSource
 		}
+
+		g.recordDenial()
+		return DecisionDeny, "mode:plan"
 	}
 
 	// Denial-fallback circuit breaker. Once tripped, force ASK so a
@@ -593,6 +742,10 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 		// Don't recordDenial here — safety ASK is informational, not
 		// a "rule denied" signal. Repeated touches of .git/ shouldn't
 		// trip the denial breaker.
+		if g.mode == ModeDontAsk {
+			g.recordDenial()
+			return DecisionDeny, "mode:dontAsk:safety_check"
+		}
 		return DecisionAsk, "safety_check:bypass_immune"
 	}
 	// Reading a credential file leaks the secret into the model context /
@@ -600,6 +753,10 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 	// ~/.aws/credentials, …) is gated to ASK even in ask / acceptEdits /
 	// bypass modes, where read-only tools are otherwise auto-allowed below.
 	if isSecretReadAttempt(tool, stringInput) {
+		if g.mode == ModeDontAsk {
+			g.recordDenial()
+			return DecisionDeny, "mode:dontAsk:secret_read"
+		}
 		return DecisionAsk, "secret_read:bypass_immune"
 	}
 
@@ -614,29 +771,36 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 	// policy rule, so nothing earlier can outrank or out-recency it.
 	// Match grammar: prefix (`git push:*`), glob (`/etc/**`), or legacy
 	// substring — see rulematch.go.
-	bestIdx, bestRank := -1, -1
-	for i := len(g.rules) - 1; i >= 0; i-- {
-		r := g.rules[i]
-		if r.Tool != "*" && r.Tool != tool {
-			continue
-		}
-		if !MatchesRuleContent(r.Match, stringInput) {
-			continue
-		}
-		if rank := sourceRank(r.Source); rank > bestRank {
-			bestRank, bestIdx = rank, i
-			if rank == rankPolicy {
-				break // ceiling reached at the latest policy rule
-			}
-		}
-	}
-	if bestIdx >= 0 {
+	bestIdx, matched := g.bestMatchingRuleLocked(tool, stringInput)
+	if matched {
 		r := g.rules[bestIdx]
-		return g.applyBreaker(r.Verb, r.Source, breakerActive)
+		decision, source := g.applyBreaker(r.Verb, r.Source, breakerActive)
+		if g.mode == ModeDontAsk && decision == DecisionAsk {
+			g.recordDenial()
+			return DecisionDeny, "mode:dontAsk:" + source
+		}
+		return decision, source
+	}
+
+	// Scope is a permission boundary, not a hard blacklist: ordinary modes
+	// ask the user before touching a path outside cwd/--add-dir, dontAsk turns
+	// that prompt into a denial, and the explicitly dangerous bypass mode keeps
+	// its documented unrestricted behavior. Matching declarative rules were
+	// resolved above, so a deliberate allow/deny still takes precedence.
+	if outOfScope {
+		switch g.mode {
+		case ModeBypassPermissions:
+			// Continue into the bypass classifier/dangerous-pattern checks.
+		case ModeDontAsk:
+			g.recordDenial()
+			return DecisionDeny, "mode:dontAsk:scope"
+		default:
+			return DecisionAsk, "scope:outside"
+		}
 	}
 
 	switch g.mode {
-	case ModeBypass:
+	case ModeBypassPermissions:
 		// Pre-filter: DangerousPatterns hard-blacklist runs BEFORE
 		// the LLM classifier. These shapes ("rm -rf /", "fork bomb",
 		// "kill -9 -1", etc.) have no defensible reason for an agent
@@ -670,33 +834,33 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 			}
 		}
 		g.recordAllow()
-		return DecisionAllow, "mode:bypass"
-	case ModeAsk:
-		// Auto-allow read-only operations even in ask mode — without
+		return DecisionAllow, "mode:bypassPermissions"
+	case ModeDefault:
+		// Auto-allow read-only operations even in default mode — without
 		// this, the user has to confirm every Read / Grep / Glob, which
 		// is enormous friction for legitimate exploration and matches
 		// what claude-code does in its "default" mode (read-only tools
-		// have implicit allowlist via isReadOnly). The "ask" semantic
+		// have implicit allowlist via isReadOnly). The default semantic
 		// is "ask for anything that could change state", not "ask for
 		// literally every tool". Writes / Bash / Edit / Memory.add etc.
 		// still fall through to DecisionAsk (the default at the bottom).
-		// 2026-05-18 fix: pre this, `metis run --mode ask 'read X'` in
+		// 2026-05-18 fix: pre this, `metis run --mode default 'read X'` in
 		// headless mode auto-denied the Read, surprising users.
 		if g.callReadOnlyHookLocked(tool, stringInput) {
 			g.recordAllow()
-			return DecisionAllow, "mode:ask:readonly"
+			return DecisionAllow, "mode:default:readonly"
 		}
 		// Hardcoded fallback for test paths without a hook.
 		switch tool {
 		case "Read", "LS", "Glob", "Grep", "WebFetch":
 			g.recordAllow()
-			return DecisionAllow, "mode:ask:readonly_fallback"
+			return DecisionAllow, "mode:default:readonly_fallback"
 		}
 	case ModeAcceptEdits:
 		// Auto-allow read-only AND project-local writes/edits. Bash
 		// still falls through to ASK so commands aren't auto-run.
-		// This sits between Auto (asks for any write) and Bypass
-		// (allows anything). claude-code's acceptEdits.
+		// This sits between default (asks for writes) and
+		// bypassPermissions (allows ordinary state changes).
 
 		// Registry-driven path (preferred): the runtime hook receives
 		// (tool, stringInput) and answers "auto-allow this call?".
@@ -731,8 +895,46 @@ func (g *Gate) Check(_ context.Context, tool, stringInput string) (Decision, str
 			g.recordAllow()
 			return DecisionAllow, "mode:acceptEdits"
 		}
+	case ModeDontAsk:
+		// Claude Code's dontAsk is not a blanket deny. It preserves all
+		// normal implicit/explicit allows (especially read-only tools), but
+		// converts anything that would open an approval prompt into DENY.
+		if g.callReadOnlyHookLocked(tool, stringInput) {
+			g.recordAllow()
+			return DecisionAllow, "mode:dontAsk:readonly"
+		}
+		switch tool {
+		case "Read", "LS", "Glob", "Grep", "WebFetch":
+			g.recordAllow()
+			return DecisionAllow, "mode:dontAsk:readonly_fallback"
+		}
+		g.recordDenial()
+		return DecisionDeny, "mode:dontAsk"
 	}
 	return DecisionAsk, "default"
+}
+
+// bestMatchingRuleLocked resolves authority first and recency second. Caller
+// must hold g.mu. Keeping this in one helper ensures plan's narrow scope-grant
+// exception and the ordinary rule path cannot drift apart.
+func (g *Gate) bestMatchingRuleLocked(tool, stringInput string) (int, bool) {
+	bestIdx, bestRank := -1, -1
+	for i := len(g.rules) - 1; i >= 0; i-- {
+		r := g.rules[i]
+		if r.Tool != "*" && r.Tool != tool {
+			continue
+		}
+		if !MatchesRuleContent(r.Match, stringInput) {
+			continue
+		}
+		if rank := sourceRank(r.Source); rank > bestRank {
+			bestRank, bestIdx = rank, i
+			if rank == rankPolicy {
+				break
+			}
+		}
+	}
+	return bestIdx, bestIdx >= 0
 }
 
 // applyBreaker downgrades DENY → ASK when the denial-tracking breaker

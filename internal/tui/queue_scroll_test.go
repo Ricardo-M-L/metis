@@ -35,7 +35,7 @@ func TestEnqueue_AddsNoChatRow(t *testing.T) {
 	m := newSlashTestModel(t)
 	priorMsgCount := len(m.messages)
 
-	prompt := "为什么cd执行了这么久还没好"
+	prompt := "/later 为什么cd执行了这么久还没好"
 	for _, r := range prompt {
 		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
@@ -65,7 +65,7 @@ func TestEnqueue_LongPromptDoesNotPolluteChat(t *testing.T) {
 	priorMsgCount := len(m.messages)
 
 	long := strings.Repeat("中文测试", 40)
-	for _, r := range long {
+	for _, r := range "/later " + long {
 		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	m.turnActive = true

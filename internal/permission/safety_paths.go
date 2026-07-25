@@ -137,6 +137,9 @@ var secretReadPathFragments = []string{
 // even in modes that auto-allow read-only tools.
 var readPathTools = map[string]bool{
 	"Read": true,
+	// Grep returns matching file contents, so scanning a credential root can
+	// leak the same secrets as Read. Its permission payload includes `root`.
+	"Grep": true,
 }
 
 // matchesSecretReadPath reports whether stringInput points at a credential

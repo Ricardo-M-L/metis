@@ -27,10 +27,9 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-// EnterPlanMode flips the active loop into plan mode. After the call
-// succeeds, the next iteration's tool batch is intercepted (collected
-// and emitted as EventPlan instead of executed) so the model has to
-// surface its proposed actions before they happen.
+// EnterPlanMode flips the active loop into plan mode. Read-only exploration
+// continues normally; state-changing tools receive ordinary permission-denied
+// results so the model can recover, finish the proposal, and call ExitPlanMode.
 type EnterPlanMode struct {
 	tools.BaseTool
 	// gate, when non-nil, lets EnterPlanMode flip Gate.Mode in addition
@@ -55,22 +54,13 @@ func NewEnterPlanModeWithGate(g *permission.Gate) EnterPlanMode {
 func (EnterPlanMode) Name() string { return "EnterPlanMode" }
 
 func (EnterPlanMode) Description() string {
-	return "Switch the agent into plan mode. After this call, the next " +
-		"batch of tool calls will be SHOWN to the user as a plan " +
-		"instead of executed — use this when the user asked for a " +
-		"proposal before action, or when the task is risky enough that " +
-		"a dry-run review is warranted. Call ExitPlanMode with the " +
-		"final plan markdown to surface it for approval and resume " +
-		"normal execution.\n\n" +
-		"Caveat: in metis, ExitPlanMode surfaces the plan for review and " +
-		"then resumes execution on the next turn — the user must " +
-		"actively interrupt (Ctrl+C) to halt. It is NOT a blocking " +
-		"approval gate. Headless / scheduled runs see the plan in the " +
-		"event stream but cannot pause for human input. Do NOT rely on " +
-		"this tool for true 'wait for user to click approve' semantics. " +
-		"For multi-choice clarification (pick one of N options), use " +
-		"`AskUser` instead — that's the right tool when you actually " +
-		"need a response back."
+	return "Switch the agent into plan mode. Read-only exploration remains " +
+		"available, including the Agent tool (its child inherits the plan " +
+		"gate), while edits and commands that change state are blocked. " +
+		"Use this when the user asked for a proposal before action. When " +
+		"the plan is complete, call ExitPlanMode with the final markdown; " +
+		"it presents a blocking approval prompt before implementation can " +
+		"start. For requirements clarification during planning, use AskUser."
 }
 
 func (EnterPlanMode) InputSchema() map[string]any {
@@ -88,10 +78,16 @@ func (EnterPlanMode) Concurrency(map[string]any) tools.Concurrency {
 	return tools.ConcurrencyExclusive
 }
 
-// CanUse: plan mode entry has no permission impact (no FS / network
-// effects), so always allow regardless of gate mode.
-func (EnterPlanMode) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
-	return tools.PermissionAllow, ""
+// Entering plan mode changes the agent's operating contract and therefore
+// requires an explicit user decision, matching Claude Code's EnterPlanMode
+// tool. A redundant call while plan mode is already active is metadata-only
+// and may pass without prompting; this also prevents a model retry from
+// trapping the user in duplicate approval dialogs.
+func (e EnterPlanMode) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
+	if e.gate != nil && e.gate.Mode() == permission.ModePlan {
+		return tools.PermissionAllow, "already in plan mode"
+	}
+	return tools.PermissionAsk, "entering plan mode requires user approval"
 }
 
 func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Result, error) {
@@ -118,7 +114,7 @@ func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Re
 		}
 		e.gate.SetMode(permission.ModePlan)
 		return &tools.Result{
-			Output: "Plan mode active. Tool calls from your next turn will be collected as a plan for user review instead of executed. When ready, call ExitPlanMode with a `plan` argument containing the markdown plan body.",
+			Output: "Plan mode active. Read-only exploration and Agent delegation remain available; state-changing tools are denied. When ready, call ExitPlanMode with a `plan` argument containing the markdown plan body for user approval.",
 		}, nil
 	}
 	// Fallback path for test harnesses that build a Loop without a
@@ -127,7 +123,7 @@ func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Re
 	// limitation — production always wires the gate.
 	ctrl.SetPlanMode(true)
 	return &tools.Result{
-		Output: "Plan mode active. Tool calls from your next turn will be collected as a plan for user review instead of executed. When ready, call ExitPlanMode with a `plan` argument containing the markdown plan body.",
+		Output: "Plan mode active. Read-only exploration remains available; state-changing tools are denied. When ready, call ExitPlanMode with a `plan` argument containing the markdown plan body for user approval.",
 	}, nil
 }
 
@@ -136,10 +132,8 @@ func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Re
 // flips the loop out of plan mode so subsequent tool calls execute
 // normally.
 //
-// claude-code's variant blocks on user approval before continuing;
-// metis surfaces the plan and lets normal execution resume on the
-// next turn. The user can Ctrl+C to halt if the plan looks wrong —
-// matches the existing metis interrupt UX.
+// Like Claude Code, the production path blocks on user approval before
+// changing permission mode. Rejection and headless execution remain in plan.
 type ExitPlanMode struct {
 	tools.BaseTool
 	gate *permission.Gate // optional; production wires via NewExitPlanModeWithGate
@@ -160,15 +154,13 @@ func (ExitPlanMode) Description() string {
 	return "Leave plan mode and surface the final plan to the user. " +
 		"Required argument `plan` is the markdown body of your " +
 		"proposed work — bullet points, file paths, exact commands, " +
-		"expected outcomes. After this call, normal tool execution " +
-		"resumes; the user can interrupt (Ctrl+C) if the plan needs " +
-		"revision.\n\n" +
+		"expected outcomes. This call blocks until the user approves " +
+		"implementation or chooses to keep planning.\n\n" +
 		"Important: this is the right tool when you want to PROPOSE " +
-		"a multi-step plan and continue (the user reads it, the next " +
-		"turn starts executing). It is NOT the right tool when you " +
+		"a multi-step plan and request approval. It is NOT the right tool when you " +
 		"need a structured pick-one-of-N answer — use `AskUser` for " +
 		"that. The two tools cover different cases: ExitPlanMode says " +
-		"'here is what I'm about to do, speak up if wrong'; AskUser " +
+		"'here is the plan; approve or keep planning'; AskUser " +
 		"says 'pick one of these options, I'll wait.'"
 }
 
@@ -212,26 +204,73 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 			Info: "[plan proposal]\n" + plan,
 		}
 	}
-	// Production path: restore the user's pre-plan posture via the
-	// gate (listener propagates to Loop.PlanMode). Fall back to
-	// ModeAsk when no prePlanMode was captured (e.g., model called
-	// ExitPlanMode without a matching EnterPlanMode, or the loop
-	// restarted mid-plan). ModeAsk is the safest default: any write
-	// will prompt rather than silently auto-execute or get denied.
-	if e.gate != nil {
-		restore := permission.Mode(ctrl.PrePlanMode())
-		if restore == "" || restore == permission.ModePlan {
-			restore = permission.ModeAsk
-		}
-		e.gate.SetMode(restore)
-		ctrl.SetPrePlanMode("") // consume the snapshot
+	// Lightweight embedders/tests that construct the tool without a Gate have
+	// no permission mode to restore and historically used the controller-only
+	// toggle. Preserve that fallback; production always uses WithGate and takes
+	// the blocking approval path below.
+	if e.gate == nil {
+		ctrl.SetPlanMode(false)
+		ctrl.SetPrePlanMode("")
+		return &tools.Result{Output: "Plan surfaced for review. Plan mode disabled by the controller-only fallback."}, nil
+	}
+	// Match Claude Code's approval boundary: exiting plan mode is a real
+	// blocking user interaction, not an informational message followed by
+	// automatic execution. Headless callers cannot approve, so they remain in
+	// plan mode and receive a structured error instead of silently proceeding.
+	out := agent.EventOutFromContext(ctx)
+	if out == nil {
 		return &tools.Result{
-			Output: "Plan surfaced for user review. Plan mode disabled — subsequent tool calls will execute normally. If the user objects, they will interrupt; otherwise continue with the plan.",
+			Output:  "ExitPlanMode: no interactive UI is available to approve this plan; remaining in plan mode",
+			IsError: true,
 		}, nil
 	}
-	// Fallback path for test harnesses without a Gate.
-	ctrl.SetPlanMode(false)
-	return &tools.Result{
-		Output: "Plan surfaced for user review. Plan mode disabled — subsequent tool calls will execute normally. If the user objects, they will interrupt; otherwise continue with the plan.",
-	}, nil
+
+	restore := permission.ModeDefault
+	if prev, ok := permission.ParseMode(ctrl.PrePlanMode()); ok && prev != permission.ModePlan {
+		restore = prev
+	}
+	primaryLabel := "Yes, auto-accept edits"
+	primaryMode := permission.ModeAcceptEdits
+	if restore == permission.ModeBypassPermissions {
+		primaryLabel = "Yes, bypass permissions"
+		primaryMode = permission.ModeBypassPermissions
+	}
+	const manualLabel = "Yes, manually approve edits"
+	const rejectLabel = "No, keep planning"
+	reply := make(chan string, 1)
+	out <- agent.Event{
+		Kind:            agent.EventAskUser,
+		AskUserQuestion: "Ready to implement this plan?",
+		AskUserOptions:  []string{primaryLabel, manualLabel, rejectLabel},
+		AskUserReply:    reply,
+	}
+
+	select {
+	case answer := <-reply:
+		switch strings.TrimSpace(answer) {
+		case primaryLabel:
+			if e.gate != nil {
+				e.gate.SetMode(primaryMode)
+			} else {
+				ctrl.SetPlanMode(false)
+			}
+			ctrl.SetPrePlanMode("")
+			return &tools.Result{Output: "User approved the plan. Continue implementation in " + string(primaryMode) + " mode."}, nil
+		case manualLabel:
+			if e.gate != nil {
+				e.gate.SetMode(permission.ModeDefault)
+			} else {
+				ctrl.SetPlanMode(false)
+			}
+			ctrl.SetPrePlanMode("")
+			return &tools.Result{Output: "User approved the plan. Continue implementation in default mode; state-changing tools require approval."}, nil
+		default:
+			return &tools.Result{Output: "User chose to keep planning. Remain in plan mode and revise the proposal before calling ExitPlanMode again."}, nil
+		}
+	case <-ctx.Done():
+		return &tools.Result{
+			Output:  "ExitPlanMode: approval cancelled; remaining in plan mode",
+			IsError: true,
+		}, nil
+	}
 }

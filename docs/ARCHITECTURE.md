@@ -138,14 +138,18 @@ through `mcp.Client.RegisterTools(reg)`. Plugin tools register through
 
 ### `internal/permission` — Permission gate
 
-Five modes (`ask` / `auto` / `bypass` / `plan` / `deny`), cascading
+Five Claude Code modes (`default` / `acceptEdits` / `plan` / `dontAsk` /
+`bypassPermissions`), cascading
 `Rule` stack. Sources appended at startup (default → user config →
 project config → CLI flags); rules evaluated in **reverse order** —
 last appended wins.
 
-`auto` auto-allows read-only Safe tools and asks otherwise; `plan`
-denies anything that mutates state and forces `Loop.PlanMode=true` so
-the loop emits `EventPlan` instead of executing.
+`default` allows read-only tools and asks before state changes;
+`acceptEdits` additionally allows file edits; `dontAsk` converts would-be
+prompts into denials; `bypassPermissions` skips ordinary prompts. `plan`
+allows read-only exploration and Agent delegation, returns normal denial
+results for state-changing tools, and requires approval through ExitPlanMode
+before implementation.
 
 The interactive TUI promotes "always" responses to in-memory rules so
 the agent doesn't re-ask the same question in the session.

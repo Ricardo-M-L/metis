@@ -191,12 +191,12 @@ func TestT12_ToolArgsDeltaEvent_SetsSpinnerSubline(t *testing.T) {
 	if !strings.Contains(m.spinnerSub, "/tmp/foo.go") {
 		t.Errorf("spinnerSub should preview first value; got %q", m.spinnerSub)
 	}
-	if len(m.toolArgsStream) == 0 {
-		t.Error("toolArgsStream buffer should accumulate the delta bytes")
+	if len(m.toolArgsStreams["t1"].data) == 0 {
+		t.Error("toolArgsStreams[t1] buffer should accumulate the delta bytes")
 	}
 }
 
-// TestT12_ToolArgsDeltaThenResult_ResetsBuffer — toolArgsStream
+// TestT12_ToolArgsDeltaThenResult_ResetsBuffer — the matching stream
 // should clear on EventToolResult so the next tool starts clean.
 func TestT12_ToolArgsDeltaThenResult_ResetsBuffer(t *testing.T) {
 	m := newE2EModel(t, 120, 30, 0)
@@ -207,7 +207,7 @@ func TestT12_ToolArgsDeltaThenResult_ResetsBuffer(t *testing.T) {
 		ToolUseID: "t1",
 		TextDelta: `{"path":"/tmp"}`,
 	})
-	if len(m.toolArgsStream) == 0 {
+	if len(m.toolArgsStreams["t1"].data) == 0 {
 		t.Fatal("setup: buffer should be populated")
 	}
 
@@ -218,9 +218,8 @@ func TestT12_ToolArgsDeltaThenResult_ResetsBuffer(t *testing.T) {
 		ToolResult: &agent.ToolResult{Output: "foo content"},
 	})
 
-	if len(m.toolArgsStream) != 0 {
-		t.Errorf("EventToolResult should reset toolArgsStream; got %d bytes",
-			len(m.toolArgsStream))
+	if _, ok := m.toolArgsStreams["t1"]; ok {
+		t.Error("EventToolResult should clear only toolArgsStreams[t1]")
 	}
 }
 
@@ -239,10 +238,49 @@ func TestT12_MultipleDeltas_AccumulateInBuffer(t *testing.T) {
 		TextDelta: `atus"}`,
 	})
 
-	if got := string(m.toolArgsStream); got != `{"command":"git status"}` {
+	if got := string(m.toolArgsStreams["b1"].data); got != `{"command":"git status"}` {
 		t.Errorf("buffer should accumulate to full JSON; got %q", got)
 	}
 	if !strings.Contains(m.spinnerSub, "git status") {
 		t.Errorf("spinnerSub should reflect post-accumulate value; got %q", m.spinnerSub)
+	}
+}
+
+func TestT12_InterleavedToolArgsRemainIndependent(t *testing.T) {
+	m := newE2EModel(t, 120, 30, 0)
+
+	m.handleAgentEvent(agent.Event{Kind: agent.EventToolArgsDelta, ToolName: "Read", ToolUseID: "a", TextDelta: `{"path":"/tmp/a`})
+	m.handleAgentEvent(agent.Event{Kind: agent.EventToolArgsDelta, ToolName: "Read", ToolUseID: "b", TextDelta: `{"path":"/tmp/b`})
+	m.handleAgentEvent(agent.Event{Kind: agent.EventToolArgsDelta, ToolName: "Read", ToolUseID: "a", TextDelta: `.go"}`})
+	m.handleAgentEvent(agent.Event{Kind: agent.EventToolArgsDelta, ToolName: "Read", ToolUseID: "b", TextDelta: `.go"}`})
+
+	if got := string(m.toolArgsStreams["a"].data); got != `{"path":"/tmp/a.go"}` {
+		t.Fatalf("stream a mixed with another call: %q", got)
+	}
+	if got := string(m.toolArgsStreams["b"].data); got != `{"path":"/tmp/b.go"}` {
+		t.Fatalf("stream b mixed with another call: %q", got)
+	}
+
+	m.handleAgentEvent(agent.Event{Kind: agent.EventToolResult, ToolName: "Read", ToolUseID: "b", ToolResult: &agent.ToolResult{Output: "b"}})
+	if _, ok := m.toolArgsStreams["b"]; ok {
+		t.Fatal("completed stream b was not cleared")
+	}
+	if _, ok := m.toolArgsStreams["a"]; !ok {
+		t.Fatal("result for b incorrectly cleared parallel stream a")
+	}
+	if !strings.Contains(m.spinnerSub, "/tmp/a.go") {
+		t.Fatalf("remaining stream preview was not retained: %q", m.spinnerSub)
+	}
+}
+
+func TestT12_EmptyToolUseIDUsesLegacyStream(t *testing.T) {
+	m := newE2EModel(t, 120, 30, 0)
+	m.handleAgentEvent(agent.Event{Kind: agent.EventToolArgsDelta, ToolName: "Glob", TextDelta: `{"pattern":"**/*.go"}`})
+	if got := string(m.toolArgsStreams[""].data); got != `{"pattern":"**/*.go"}` {
+		t.Fatalf("legacy empty-ID stream = %q", got)
+	}
+	m.handleAgentEvent(agent.Event{Kind: agent.EventToolResult, ToolName: "Glob", ToolResult: &agent.ToolResult{Output: "a.go"}})
+	if len(m.toolArgsStreams) != 0 {
+		t.Fatalf("legacy empty-ID result did not clear its stream: %#v", m.toolArgsStreams)
 	}
 }

@@ -30,11 +30,11 @@ func TestModeIcon_GlyphsMatchClaudeCode(t *testing.T) {
 		glyph string
 		note  string
 	}{
-		{"ask", "", "default mode renders without a badge (PermissionMode.ts:48)"},
+		{"default", "", "default mode renders without a badge (PermissionMode.ts:48)"},
 		{"acceptEdits", "⏵⏵", "claude-code autoAccept double-chevron"},
-		{"bypass", "⏵⏵", "claude-code bypassPermissions — same glyph as acceptEdits, red color (PermissionMode.ts:69)"},
+		{"bypassPermissions", "⏵⏵", "claude-code bypassPermissions — same glyph as acceptEdits, red color (PermissionMode.ts:69)"},
 		{"plan", "⏸ ", "pause icon"},
-		{"deny", "⏹ ", "stop icon"},
+		{"dontAsk", "⏵⏵", "claude-code dontAsk double-chevron in error color"},
 	}
 	for _, c := range cases {
 		t.Run(c.mode, func(t *testing.T) {
@@ -53,7 +53,7 @@ func TestModeIcon_GlyphsMatchClaudeCode(t *testing.T) {
 // glance — they share the ⏵⏵ glyph by claude-code parity. The color
 // is what carries the safety signal.
 func TestModeIcon_BypassIsRed(t *testing.T) {
-	_, col := modeIcon("bypass")
+	_, col := modeIcon("bypassPermissions")
 	// lipgloss.Color returns a color.Color; the user-visible hex is
 	// what we care about. Format as hex and compare prefix.
 	r, g, b, _ := col.RGBA()
@@ -62,6 +62,25 @@ func TestModeIcon_BypassIsRed(t *testing.T) {
 	// it stays in the "red" family.
 	if r>>8 < 200 || g>>8 > 150 || b>>8 > 150 {
 		t.Errorf("bypass color should be red-family; got rgba (%d,%d,%d)", r>>8, g>>8, b>>8)
+	}
+}
+
+func TestModeIcon_DontAskIsRed(t *testing.T) {
+	_, col := modeIcon("dontAsk")
+	r, g, b, _ := col.RGBA()
+	if r>>8 < 200 || g>>8 > 150 || b>>8 > 150 {
+		t.Errorf("dontAsk color should be red-family; got rgba (%d,%d,%d)", r>>8, g>>8, b>>8)
+	}
+}
+
+func TestModeCommandHelpUsesCanonicalNames(t *testing.T) {
+	cmd := BuildREPLCommands().Get("mode")
+	if cmd == nil {
+		t.Fatal("mode command is not registered")
+	}
+	want := "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions)"
+	if cmd.Description != want {
+		t.Fatalf("mode help = %q, want %q", cmd.Description, want)
 	}
 }
 
@@ -104,8 +123,8 @@ func TestRenderHints_NonAskShowsBadge(t *testing.T) {
 	}{
 		{permission.ModeAcceptEdits, "acceptEdits mode"},
 		{permission.ModePlan, "plan mode"},
-		{permission.ModeBypass, "bypass mode"},
-		{permission.ModeDeny, "deny mode"},
+		{permission.ModeBypassPermissions, "bypassPermissions mode"},
+		{permission.ModeDontAsk, "dontAsk mode"},
 	}
 	for _, c := range cases {
 		t.Run(string(c.mode), func(t *testing.T) {

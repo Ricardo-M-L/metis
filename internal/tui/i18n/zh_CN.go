@@ -8,14 +8,13 @@ var zhCN = map[string]string{
 	"input.bash_mode":   "bash 模式 — `!cmd` 直接执行不调 LLM",
 	"input.send_hint":   "回车发送 · Alt+回车换行",
 
-	// 权限模式。auto 在 2026-05-11 被移除（跟 claude-code 内部 LLM 分类器
-	// auto 重名造成混淆）。
-	"mode.ask":         "询问",
-	"mode.acceptEdits": "接受编辑",
-	"mode.bypass":      "放行",
-	"mode.plan":        "计划",
-	"mode.deny":        "拒绝",
-	"mode.cycle_hint":  "shift+tab 切换",
+	// 权限模式使用 Claude Code 的规范公开名称。
+	"mode.default":           "默认询问",
+	"mode.acceptEdits":       "接受编辑",
+	"mode.bypassPermissions": "绕过权限",
+	"mode.plan":              "计划",
+	"mode.dontAsk":           "不询问",
+	"mode.cycle_hint":        "shift+tab 切换",
 
 	// Permission prompt
 	"perm.allow":        "是",

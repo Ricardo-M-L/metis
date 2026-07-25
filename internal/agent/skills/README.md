@@ -15,7 +15,7 @@ model can invoke via `Skill(name="…")`.
 | `manifest.go` | YAML-frontmatter parser. Validates `name`, `description`, `tools`, `permission_mode`, `effort`, `max_turns` fields. |
 | `store.go` | In-memory registry of loaded skills. The Tool implementation queries this. |
 | `search.go` | Skill-name search + fuzzy matching for the `Skill(name="…")` tool input. |
-| `safety.go` | Pre-load safety filter: reject manifests that ask for `permission_mode: bypass` from untrusted sources, or that include suspicious shell. |
+| `safety.go` | Pre-load safety filter: reject manifests that ask for `permission_mode: bypassPermissions` from untrusted sources, or that include suspicious shell. |
 | `marketplace.go` | `metis skills install <name>` plumbing — fetches optional skills from the marketplace registry. |
 | `embedded.go` | The bundled (compiled-in) skill set — defaults that ship with metis. |
 | `inline_shell.go` | Parses `<inline:bash>...</inline:bash>` blocks inside a skill manifest body. Pre-Skill-tool execution. |
@@ -48,7 +48,7 @@ no further sub-package split is warranted.
 
 ## Design invariants
 
-- A skill manifest with `permission_mode: bypass` from an untrusted
+- A skill manifest with `permission_mode: bypassPermissions` from an untrusted
   source (anything outside `bundled` and `optional`) is **dropped at
   load time** with a warning. The safety filter never silently
   approves bypass for user/project/plugin/mcp skills.

@@ -8,14 +8,13 @@ var en = map[string]string{
 	"input.bash_mode":   "bash mode — `!cmd` runs without LLM",
 	"input.send_hint":   "Enter send · Alt+Enter newline",
 
-	// Permission modes. `auto` was removed 2026-05-11 (collided with
-	// claude-code's ant-only LLM-classifier mode of the same name).
-	"mode.ask":         "ask",
-	"mode.acceptEdits": "acceptEdits",
-	"mode.bypass":      "bypass",
-	"mode.plan":        "plan",
-	"mode.deny":        "deny",
-	"mode.cycle_hint":  "shift+tab to cycle",
+	// Permission modes use Claude Code's canonical public names.
+	"mode.default":           "default",
+	"mode.acceptEdits":       "acceptEdits",
+	"mode.bypassPermissions": "bypassPermissions",
+	"mode.plan":              "plan",
+	"mode.dontAsk":           "dontAsk",
+	"mode.cycle_hint":        "shift+tab to cycle",
 
 	// Permission prompt
 	"perm.allow":        "Yes",

@@ -108,7 +108,8 @@ func (Read) IsReadOnly(map[string]any) bool { return true }
 func (Read) MaxResultSizeChars() int { return tools.ResultSizeUnlimited }
 
 func (r Read) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := r.gate.Check(context.Background(), "Read", strFromAny(in["path"]))
+	path := strFromAny(in["path"])
+	d, src := r.gate.CheckPath(context.Background(), "Read", path, path)
 	return mapDecision(d), src
 }
 

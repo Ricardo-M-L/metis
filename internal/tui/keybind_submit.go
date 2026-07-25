@@ -2,7 +2,8 @@ package tui
 
 // keybind_submit.go — handleSubmit + dispatch for slash commands and
 // user prompts. Slash commands route through the REPL command registry
-// or the slash-signal table; plain user text starts a new turn.
+// or the slash-signal table; plain user text starts a new turn when idle
+// and steers the current turn while one is running.
 
 import (
 	"context"
@@ -112,15 +113,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// pasted those and expects to see them in the transcript. The
 	// real image bytes are split out into ContentBlocks at the
 	// AppendUserBlocks call site below; here we leave the text alone.
-	// Refuse to submit while a turn is in flight. Without this guard
-	// the new submit clears m.streamingText / m.toolEvents and spawns a
-	// second runTurnAsync goroutine that races on doneCh — which the
-	// user saw as "I typed a message but it never appeared and the
-	// previous reply got swallowed." Show a hint, leave the input
-	// alone so the user doesn't lose their prompt to a stray Enter.
+	// Never start a second turn while one is in flight. Mid-turn text is
+	// injected into the running loop at its next iteration boundary;
+	// commands that explicitly request queueing still use queuedPrompts.
+	// This avoids racing a second runTurnAsync goroutine on doneCh while
+	// letting follow-up instructions affect work that is already running.
 	if m.turnActive {
 		// Steering (Task #78) + slash-during-steer (Task #87): mid-turn
-		// input is queued onto the agent loop and folded into the next
+		// input is injected into the agent loop and folded into the next
 		// iteration's user message. Slash classification:
 		//
 		//   - Destructive (/clear /new /quit /compact /undo /retry …)
@@ -193,25 +193,24 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					if display == "" {
 						return m, nil
 					}
-					m.loop.SteerInject(display)
+					if !m.loop.SteerInject(display) {
+						// LoopDone may be racing this Enter: the TUI still says
+						// turnActive for one render tick after the loop atomically
+						// closes steering. Preserve the input as a next-turn item.
+						m.enqueueQueuedItem(display, QueuePriorityNext)
+						m.messages = append(m.messages, Message{
+							Role:      "info",
+							Content:   "(current turn was already closing — queued for the next turn)",
+							Timestamp: time.Now(),
+						})
+						m.input.Reset()
+						return m, nil
+					}
 					// user-steer (not info) so the steered prompt is
 					// visible in the same lane as a normal user message.
 					m.messages = append(m.messages, Message{
 						Role:      "user-steer",
 						Content:   display,
-						Timestamp: time.Now(),
-					})
-					// Mi1 (2026-05-18) — make the steer-vs-queue
-					// asymmetry visible. Plain text mid-turn QUEUES
-					// (runs as next turn); custom slash commands
-					// STEER (fold into running turn). The previous
-					// silent steer surprised users who expected
-					// queue semantics across the board. Cheap one-
-					// line note solves the WTF without changing the
-					// documented dispatch contract.
-					m.messages = append(m.messages, Message{
-						Role:      "info",
-						Content:   "(steered into current turn · plain text would have queued — press Esc first to queue this instead)",
 						Timestamp: time.Now(),
 					})
 					m.input.Reset()
@@ -224,23 +223,25 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Plain text mid-turn: claude-code's queued-messages behavior.
-		// Push to the priority queue at default Priority=Next;
-		// finalizeTurn dequeues the highest-priority batch and
-		// submits it as the next user turn. Multi-item batching
-		// (drainNextQueuedBatch) merges adjacent same-priority
-		// items into one merged user message — the 2026-05-21
-		// follow-up-spam optimization. Distinct from steering
-		// (mid-turn injection into the running turn) — that path is
-		// reserved for slash commands above and the explicit
-		// /steer alias.
-		m.enqueueQueuedItem(raw, QueuePriorityNext)
-		// Match claude-code: the queued-message count lives only in
-		// the status bar `◷ N queued` chip (render_chrome.go). The
-		// in-stream notice row was redundant — every queue add added
-		// another scroll-back line, which the user flagged as clutter.
-		// (claude-code carries the same model via CoordinatorAgentStatus
-		// `· N queued` suffix on the spinner line.)
+		// Plain text plus safe/unknown slash input steers the current
+		// turn. Keep the submitted text visible in the transcript so
+		// users can see that it landed; /later remains the explicit way
+		// to defer a message to the next turn.
+		if !m.loop.SteerInject(raw) {
+			m.enqueueQueuedItem(raw, QueuePriorityNext)
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(current turn was already closing — queued for the next turn)",
+				Timestamp: time.Now(),
+			})
+			m.input.Reset()
+			return m, nil
+		}
+		m.messages = append(m.messages, Message{
+			Role:      "user-steer",
+			Content:   raw,
+			Timestamp: time.Now(),
+		})
 		m.input.Reset()
 		return m, nil
 	}
@@ -447,7 +448,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 			if cmd.Name == "clear" {
 				// Consolidated path — see internal/tui/reload.go.
-				m.Reload(ReloadOpts{})
+				if err := m.Reload(ReloadOpts{}); err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "clear: " + err.Error(), Timestamp: time.Now()})
+				}
 				return m, nil
 			}
 			repl := m.asREPL()
@@ -499,7 +502,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalQuit:
 			return m, tea.Quit
 		case slash.SignalClear:
-			m.Reload(ReloadOpts{})
+			if err := m.Reload(ReloadOpts{}); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "clear: " + err.Error(), Timestamp: time.Now()})
+			}
 		case slash.SignalNew:
 			if err := m.persistActiveSessionState(); err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "new session: " + err.Error(), Timestamp: time.Now()})
@@ -533,13 +538,21 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// instead of retyping. Mirrors kimi-cli's /undo UX. Empty
 			// prefill (synthetic turn) preserves the input box untouched.
 			if prefill, ok := m.loop.UndoLastTurnWithPrefill(); ok {
+				persistErr := m.session.ReplaceHistoryAndMark(m.sessionID, m.loop.History(), &m.historyCursor)
 				m.messages = trimVisibleMessagesToLastUser(m.messages)
 				m.toolEvents = nil
 				if prefill != "" {
 					m.input.SetValue(prefill)
-					m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn — original text in input)", Timestamp: time.Now()})
+					if persistErr == nil {
+						m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn — original text in input)", Timestamp: time.Now()})
+					}
 				} else {
-					m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn)", Timestamp: time.Now()})
+					if persistErr == nil {
+						m.messages = append(m.messages, Message{Role: "success", Content: "(undid last turn)", Timestamp: time.Now()})
+					}
+				}
+				if persistErr != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "undo applied in memory but failed to persist: " + persistErr.Error(), Timestamp: time.Now()})
 				}
 			} else {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to undo)", Timestamp: time.Now()})
@@ -548,6 +561,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// Unified rewind: restore files AND conversation to the
 			// pre-edit snapshot of the last edit-turn.
 			if res, ok := m.loop.Rewind(); ok {
+				persistErr := m.session.ReplaceHistoryAndMark(m.sessionID, m.loop.History(), &m.historyCursor)
 				// Trim exactly as many visible user blocks as turns were
 				// undone — guards the TurnsUndone==0 case (e.g. /undo then
 				// /rewind already rolled the conversation past the
@@ -557,11 +571,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					m.messages = trimVisibleMessagesToLastUser(m.messages)
 				}
 				m.toolEvents = nil
-				m.messages = append(m.messages, Message{
-					Role:      "success",
-					Content:   fmt.Sprintf("(rewound: restored files + undid %d turn(s) — %s)", res.TurnsUndone, res.Label),
-					Timestamp: time.Now(),
-				})
+				if persistErr != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "rewind applied but failed to persist conversation: " + persistErr.Error(), Timestamp: time.Now()})
+				} else {
+					m.messages = append(m.messages, Message{
+						Role:      "success",
+						Content:   fmt.Sprintf("(rewound: restored files + undid %d turn(s) — %s)", res.TurnsUndone, res.Label),
+						Timestamp: time.Now(),
+					})
+				}
 			} else {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to rewind — no file snapshots yet, or checkpointing is off)", Timestamp: time.Now()})
 			}
@@ -791,19 +809,18 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// dead (compiled-bug-list audit).
 			m.gate.SetMode(permission.ModePlan)
 			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: plan — tool calls will be surfaced for review)", Timestamp: time.Now()})
-		case slash.SignalBypass:
-			// /bypass + /yolo — switch to bypass mode (no permission
-			// prompts). Same dead-signal fix as SignalPlan above.
-			m.gate.SetMode(permission.ModeBypass)
-			m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: bypass — all tool calls auto-approved; use /mode ask to re-enable prompts)", Timestamp: time.Now()})
-		case slash.SignalAuto:
-			// /auto + /a — legacy alias for ModeAuto which was
-			// REMOVED on 2026-05-11 (see safe_commands_test.go
-			// graveyard comment). slash registry still advertised
-			// the command. Rather than silently dropping, redirect
-			// the user to the modes that DO exist so they can pick
-			// the right one for their use case.
-			m.messages = append(m.messages, Message{Role: "info", Content: "(/auto removed in 2026-05-11; pick: /plan (read-only) / /bypass (auto-approve) / /mode ask (default))", Timestamp: time.Now()})
+		case slash.SignalAcceptEdits:
+			m.gate.SetMode(permission.ModeAcceptEdits)
+			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: acceptEdits — file edits are accepted; other state changes may still ask)", Timestamp: time.Now()})
+		case slash.SignalBypassPermissions:
+			m.gate.SetMode(permission.ModeBypassPermissions)
+			m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: bypassPermissions — tool calls auto-approved; use /default to restore prompts)", Timestamp: time.Now()})
+		case slash.SignalDefault:
+			m.gate.SetMode(permission.ModeDefault)
+			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: default — ask before state changes)", Timestamp: time.Now()})
+		case slash.SignalDontAsk:
+			m.gate.SetMode(permission.ModeDontAsk)
+			m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: dontAsk — actions requiring approval will be denied)", Timestamp: time.Now()})
 		case slash.SignalRetry:
 			// /retry — pull the last user prompt out of history and
 			// stuff it into the input box so the user can edit + hit
@@ -927,9 +944,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	} else {
 		m.loop.AppendUser(llmTextRewritten)
 	}
-	if m.session != nil && m.sessionID != "" {
-		_ = m.session.AppendMessage(m.sessionID, lastUserMessage(m.loop.History()))
-	}
+	// Persist through a durable history cursor. This records the initial
+	// prompt now, then persistTail at turn end records every assistant/tool
+	// message plus any user steering injected while the run was active.
+	m.persistTail()
 	// Mirror to ~/.metis/history.jsonl for cross-session prompt search.
 	// Fire-and-forget — disk hiccups must not block the chat.
 	_ = runtime.AppendHistory(runtime.HistoryEntry{
@@ -953,6 +971,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// in-flight assistant text doesn't visually concatenate with the
 	// previous turn's tail (that one is intentional and unchanged).
 	m.streamingText = ""
+	m.turnToolEventStart = len(m.toolEvents)
 	m.turnActive = true
 	m.spinnerActive = true
 	m.spinnerFrame = 0

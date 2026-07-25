@@ -124,6 +124,7 @@ func (m *Model) asREPL() *REPL {
 		baseSystem:   m.baseSystem,
 		baseSystemSections: append([]llm.SystemSection(nil),
 			m.baseSystemSections...),
+		historyCursor:       &m.historyCursor,
 		SessionSwitch:       m.ext.SessionSwitch,
 		SessionBoundary:     m.ext.SessionBoundary,
 		FreshPermissionMode: m.ext.FreshPermissionMode,

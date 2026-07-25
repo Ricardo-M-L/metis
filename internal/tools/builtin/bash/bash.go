@@ -331,18 +331,14 @@ func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 	if r := CheckCommand(cmd); !r.Allow {
 		return tools.PermissionDeny, "bash-security rule #" + itoa(r.RuleID) + ": " + r.Reason
 	}
-	// sandbox auto-allow: when the user opted into the macOS Seatbelt
-	// wrapper AND asked for auto-allow, the gate is short-circuited
-	// to PermissionAllow. The kernel-level sandbox is the safety
-	// boundary here — asking the user to also click "yes" on every
-	// call is double-confirming. claude-code parity for image #76
-	// option 1 ("Sandbox BashTool, with auto-allow"). Adversarial
-	// pre-check above still runs, so jailbreak attempts are NOT
-	// auto-approved.
-	if SandboxModeAutoApprovesGate(effectiveMode(b.settings.Sandbox.Mode)) {
+	// Always consult the gate before applying sandbox auto-allow. Plan and
+	// dontAsk are hard denials, and explicit deny rules must not be bypassed
+	// merely because Seatbelt is enabled. Auto-allow only replaces an ASK;
+	// the kernel sandbox remains the approval boundary for that prompt.
+	d, src := b.gate.Check(context.Background(), "Bash", cmd)
+	if d == permission.DecisionAsk && SandboxModeAutoApprovesGate(effectiveMode(b.settings.Sandbox.Mode)) {
 		return tools.PermissionAllow, "sandbox auto-allow"
 	}
-	d, src := b.gate.Check(context.Background(), "Bash", cmd)
 	return mapDecision(d), src
 }
 

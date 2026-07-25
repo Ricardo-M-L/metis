@@ -24,8 +24,9 @@ quirks. `Metis` aims for:
   compatible gateway (MiniMax, Together, Groq, Ollama, OpenRouter).
 - **MCP-native** — stdio + Streamable HTTP/SSE clients; tools auto-
   registered and namespaced.
-- **Permission-aware** — 5 modes (`ask` / `auto` / `bypass` / `plan` /
-  `deny`), cascading rules from CLI > project > user > defaults, "always
+- **Permission-aware** — Claude Code's 5 public modes (`default` /
+  `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions`), cascading
+  rules from CLI > project > user > defaults, "always
   allow" remembered for the session, input-dependent bash classifier.
 - **Streaming-first** — text deltas + tool input deltas render as they
   arrive; safe tools fan out in parallel, queueable tools FIFO, exclusive
@@ -96,8 +97,8 @@ metis version [-V]            # short semver (-V for full build fingerprint)
 |------|------|
 | `-m, --model <id>` | override model |
 | `-p, --provider <id>` | `anthropic` / `openai` / `gemini` / any custom |
-| `--mode <id>` | permission mode (`ask` / `auto` / `bypass` / `plan` / `deny`) |
-| `--dangerously-skip-permissions` | alias of `--mode bypass` (named for Claude Code muscle memory) |
+| `--mode <id>` | permission mode (`default` / `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions`) |
+| `--dangerously-skip-permissions` | alias of `--mode bypassPermissions` |
 | `-c, --continue` | resume the most recently modified session |
 | `-r, --resume [<id>]` | resume a session by full UUID OR any unambiguous prefix (e.g. the 12-char id the picker prints). Bare `-r` opens the picker; ambiguous prefix errors with the candidate list |
 | `-d, --debug` | mirror logs into `~/.metis/debug.log` |
@@ -151,7 +152,7 @@ CLI `--tools` REPLACES `cfg.Tools.Allowed` if set. CLI `--disallow-tools` UNIONS
 Session: `/new` `/clear` `/retry` `/undo` `/history` `/save` `/title`
 `/rename` `/tag` `/branch` `/sessions` `/export`
 
-Mode: `/plan` `/auto` `/bypass` `/compact` `/effort` `/fast` `/output-style`
+Mode: `/default` `/plan` `/dontAsk` `/bypassPermissions` `/mode` `/compact` `/effort` `/fast` `/output-style`
 
 Info: `/status` `/session` `/model` `/tools` `/skills` `/memory`
 `/cost` `/usage` `/tokens` `/context` `/stats` `/keybindings` `/permissions`
@@ -186,7 +187,7 @@ MCP servers that advertise prompts/list register automatically as
 
 | Key | What |
 |------|------|
-| `Shift+Tab` | cycle permission mode (ask → auto → bypass → plan) |
+| `Shift+Tab` | cycle permission mode (default → acceptEdits → plan → bypassPermissions) |
 | `Ctrl+T` | toggle todo overlay |
 | `Ctrl+O` | expand the last tool result |
 | `Ctrl+P` | session picker |
@@ -267,7 +268,7 @@ context_window = 1000000
 #   metis models deepseek deepseek-chat  # ready-to-paste config snippet
 
 [permission]
-mode = "auto"
+mode = "default"
 [[permission.allow]]
 tool = "Read"
 [[permission.allow]]
@@ -558,8 +559,8 @@ Agent({prompt: "...", run_in_background: true})
 # Per-invocation worktree isolation
 Agent({prompt: "...", isolation: "worktree"})
 
-# Per-invocation permission mode override (parent stays in ask)
-Agent({prompt: "...", permission_mode: "bypass"})
+# Per-invocation permission mode override (parent stays in default)
+Agent({prompt: "...", permission_mode: "bypassPermissions"})
 
 # Per-invocation tool narrowing (intersection with profile filter)
 Agent({prompt: "...", allowed_tools: ["Read", "Grep"]})

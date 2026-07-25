@@ -10,7 +10,7 @@
 //	model: claude-haiku-4-5
 //	tools: Read, Glob, Grep, LS
 //	disallowed_tools: Bash, Write, Edit
-//	permission_mode: ask
+//	permission_mode: default
 //	effort: low
 //	max_turns: 20
 //	initial_prompt: |
@@ -47,7 +47,7 @@ type AgentProfile struct {
 	Model           string   // empty = inherit
 	Tools           []string // allowlist; empty = inherit (no filter)
 	DisallowedTools []string // blocklist applied after allowlist
-	PermissionMode  string   // ask | auto | bypass | plan | deny; empty = inherit
+	PermissionMode  string   // default | acceptEdits | plan | dontAsk | bypassPermissions; empty = inherit
 	Effort          string   // low | medium | high; empty = inherit
 	MaxTurns        int      // 0 = inherit
 	InitialPrompt   string   // prepended to first user message

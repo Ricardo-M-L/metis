@@ -302,7 +302,7 @@ Usage:
 Flags (chat / run):
   -m, --model <id>      Override model
   -p, --provider <id>   Override provider (anthropic | openai | gemini | <custom>)
-      --mode <id>       Permission mode: ask | auto | bypass | plan | deny
+      --mode <id>       Permission mode: default | acceptEdits | plan | dontAsk | bypassPermissions
       --no-markdown     Disable markdown rendering of assistant output
       --no-stream       Don't stream (assemble then print)
       --max-iter <n>    Iteration cap per turn (default 150; overrides [session] max_iterations in config.toml)
@@ -522,7 +522,7 @@ type cliFlags struct {
 	// dropping them shaves ~600ms off boot on a populated config.
 	bare bool
 
-	// --dangerously-skip-permissions: alias of `--mode bypass`. Named to
+	// --dangerously-skip-permissions: alias of `--mode bypassPermissions`. Named to
 	// match Claude Code so an existing user's muscle memory works. Wins
 	// over --mode if both are set (the explicit --mode loses to the
 	// "yes I really mean it" wrapper).
@@ -681,10 +681,10 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	// --bare: skip MCP / plugins / hooks / skills loading. Sometimes the
 	// fastest cold start is the right answer (CI, throwaway smoke).
 	f.BoolVar(&out.bare, "bare", false, "skip MCP and plugin loaders (fastest cold start)")
-	// --dangerously-skip-permissions: friendly alias of `--mode bypass`.
+	// --dangerously-skip-permissions: friendly alias of `--mode bypassPermissions`.
 	// Named to match Claude Code so muscle memory works.
 	f.BoolVar(&out.dangerouslySkipPerms, "dangerously-skip-permissions", false,
-		"equivalent to --mode bypass (no permission prompts; use with care)")
+		"equivalent to --mode bypassPermissions (no permission prompts; use with care)")
 	// --scope / -s: forward-compat for the per-scope mcp.toml / skills/
 	// layout that lands with the daemon work. Today only `user` is
 	// honored; anything else logs a warning at startup. Plumbed here
@@ -829,36 +829,27 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.mode != "" {
 		mode = flags.mode
 	}
-	// --dangerously-skip-permissions overrides any other mode. Named to
-	// match Claude Code; a deliberate "I really mean it" wrapper around
-	// `--mode bypass`.
+	// --dangerously-skip-permissions overrides any other mode using Claude
+	// Code's canonical public name.
 	if flags.dangerouslySkipPerms {
-		mode = "bypass"
+		mode = string(permission.ModeBypassPermissions)
 	}
-	// 2026-05-11: ModeAuto removed. Reject both CLI flag and config
-	// values to surface the change loud and clear — silent fallback
-	// would just shift the user's confusion to "why is metis behaving
-	// differently than before". Includes the migration hint inline so
-	// the user knows what to switch to.
+	// Auto is internal-only in Claude Code and is not one of the five
+	// external permission modes Metis exposes.
 	if mode == "auto" {
 		return nil, errors.New("permission mode \"auto\" has been removed.\n" +
-			"It collided with claude-code's `auto` (LLM-classifier, ant-only)\n" +
-			"and was confusing every user comparing the two.\n" +
-			"\n" +
-			"Pick one of:\n" +
-			"  ask          — prompt for every non-allowlisted action (claude-code default)\n" +
-			"  acceptEdits  — auto-allow Edit/Write/NotebookEdit, ask for Bash\n" +
-			"  plan         — read-only mode, no writes or shell\n" +
-			"  bypass       — approve everything (use --dangerously-skip-permissions)\n" +
-			"  deny         — refuse everything\n" +
-			"\n" +
-			"Edit ~/.metis/config.toml `mode = ...` or run with `--mode acceptEdits`.")
+			"Use one of Claude Code's public modes: default, acceptEdits, plan, dontAsk, bypassPermissions.")
 	}
 	// Profile-on-CLI merge.
 	mergedModel, mergedMode, mergedEffort, mergedMaxIter :=
 		agentProf.MergeOnto(model, mode, flags.effort, flags.maxIter)
 	model = mergedModel
 	mode = mergedMode
+	canonicalMode, ok := permission.ParseMode(mode)
+	if !ok {
+		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions)", mode)
+	}
+	mode = string(canonicalMode)
 	if flags.effort == "" {
 		flags.effort = mergedEffort
 	}
@@ -937,6 +928,13 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			system = system + "\n\n" + hint
 		}
 	}
+	// Metis <=0.2.8 persisted the Plan overlay inside Header.System. Once
+	// that session left plan mode the stale "do not implement" instruction
+	// remained forever. Remove only the exact legacy built-in body; live Plan
+	// instructions are now attached per request by Loop.buildRequest.
+	if resumedSystem != "" {
+		system = rtpkg.RemoveLegacyPlanOverlay(system)
+	}
 	// Agent profile body REPLACES the default system prompt — that's the
 	// whole point of "I am a code reviewer". Skip when profile body is
 	// empty (frontmatter-only profiles still customize tools/model).
@@ -972,13 +970,13 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		if ov := rtpkg.CoordinatorOverlay(); ov.Name != "" {
 			assembleOpts.Overlays = append(assembleOpts.Overlays, ov)
 		}
-		// Plan-mode overlay: when `--mode plan` is active, append a
-		// short fragment explaining the read-only workflow so the
-		// model doesn't waste turns hitting permission denials. The
-		// permission gate already enforces read-only at the tool
-		// layer; this just tells the model NOT to try mutating tools.
-		if ov := rtpkg.PlanOverlay(mode == string(permission.ModePlan)); ov.Name != "" {
-			assembleOpts.Overlays = append(assembleOpts.Overlays, ov)
+		// Normal chat attaches Plan instructions dynamically in
+		// Loop.buildRequest. Prompt-dump has no Loop, so include the live
+		// overlay here only for that diagnostic output.
+		if flags.dumpPrompt {
+			if ov := rtpkg.PlanOverlay(mode == string(permission.ModePlan)); ov.Name != "" {
+				assembleOpts.Overlays = append(assembleOpts.Overlays, ov)
+			}
 		}
 		// Two assembly paths:
 		//   - Default: per-section registry (identity/privacy/style/...).
@@ -998,6 +996,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// --add-dir / persisted additional dirs. Done before system prompt
 	// finalization so the LLM sees the list at turn 0.
 	allowedDirs := rtpkg.NewAllowedDirs(flags.addDirs)
+	// Make cwd + --add-dir an actual permission boundary for path-aware
+	// filesystem tools. Bash is intentionally excluded: extracting every path
+	// a shell program may touch requires sandboxing, not string heuristics.
+	gate.SetPathScopeHook(allowedDirs.Contains)
 	if extra := allowedDirs.SystemPromptAddendum(); extra != "" && resumedSystem == "" {
 		system = system + extra
 		// Allowed-dirs is stable per-session (set once at boot, doesn't
@@ -1132,7 +1134,16 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		if !ok {
 			return false
 		}
-		return tools.IsReadOnly(t, nil)
+		// Most tools are input-invariant, but dispatchers such as Skill and
+		// Agent can be read-only for one action and state-changing for another.
+		// stringifyToolInput sends their complete input as JSON; preserve it
+		// here instead of erasing the distinction with a nil argument.
+		var toolInput map[string]any
+		trimmed := strings.TrimSpace(stringInput)
+		if strings.HasPrefix(trimmed, "{") {
+			_ = json.Unmarshal([]byte(trimmed), &toolInput)
+		}
+		return tools.IsReadOnly(t, toolInput)
 	})
 
 	// MCP servers — launch each enabled stdio server, register its tools as
@@ -1325,7 +1336,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, cronSvc: cronSvc, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
-		defaultPermissionMode: permission.Mode(mode),
+		defaultPermissionMode: canonicalMode,
 		mcpLauncherDone:       mcpLauncherDoneCh,
 		plugins:               pluginReg,
 		allowedDirs:           allowedDirs,
@@ -1712,11 +1723,25 @@ func cmdRun(ctx context.Context, args []string) error {
 	if schemaEnforcer != nil {
 		llmPrompt = llmPrompt + "\n\n" + schemaEnforcer.Instruction()
 	}
+	historyCursor := session.NewHistoryCursor(rt.loop.History())
+	// Flush once more on every return path (including schema retries and
+	// errors). EventLoopDone also flushes eagerly; the cursor makes the defer
+	// idempotent while preserving partial tool history on late failures.
+	defer func() {
+		if rt.store != nil && rt.sessionID != "" {
+			_ = rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor)
+		}
+	}()
 	rt.loop.AppendUser(llmPrompt)
 	if rt.store != nil && rt.sessionID != "" {
-		_ = rt.store.AppendMessage(rt.sessionID, llm.Message{
+		if err := rt.store.AppendMessage(rt.sessionID, llm.Message{
 			Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: prompt}},
-		})
+		}); err == nil {
+			// The loop intentionally sees llmPrompt (subdir hints / schema
+			// contract), while the exported transcript keeps the raw prompt.
+			// Mark the corresponding in-memory position as durable.
+			historyCursor.Mark(rt.loop.History())
+		}
 	}
 	_ = rtpkg.AppendHistory(rtpkg.HistoryEntry{
 		SessionID: rt.sessionID, Input: prompt, Source: "run",
@@ -2057,33 +2082,12 @@ func cmdRun(ctx context.Context, args []string) error {
 				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d cache_hit=%.1f%% duration_ms=%d stop_reason=%s\n",
 				totIn, totOut, totCacheRead, totCacheCreate, hitPct, time.Since(runStart).Milliseconds(), finalStop)
 
-			// 2026-05-24: persist the assistant tail to the session
-			// JSONL. Pre-fix, cmdRun only wrote the user prompt
-			// (line 1502) — the assistant message + every tool_use +
-			// tool_result that the loop produced lived only in
-			// memory, gone the moment the process exited. Resume of
-			// a `metis run` session saw only the user prompt and
-			// nothing else (user test 2026-05-24, session
-			// 8b6ddd95). The TUI's persistTail (tui_update.go:738)
-			// already handles this correctly for chat mode; this
-			// applies the same pattern to one-shot run mode so
-			// session files stay symmetric across modes.
-			//
-			// Walk back through History from the end to find the
-			// last user message; append every block after it. Empty
-			// no-op when there's nothing to flush (loop hadn't
-			// recorded the prompt yet — shouldn't happen post-
-			// LoopDone but safer to be defensive).
+			// Persist the full not-yet-durable history suffix. In particular,
+			// do not walk back to the last user text: a steering user message
+			// can appear after tool_use/tool_result blocks and would otherwise
+			// make session export silently drop those earlier blocks.
 			if rt.store != nil && rt.sessionID != "" {
-				hist := rt.loop.History()
-				for i := len(hist) - 1; i >= 0; i-- {
-					if hist[i].Role == llm.RoleUser && len(hist[i].Content) > 0 && hist[i].Content[0].Type == "text" {
-						for j := i + 1; j < len(hist); j++ {
-							_ = rt.store.AppendMessage(rt.sessionID, hist[j])
-						}
-						break
-					}
-				}
+				_ = rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor)
 			}
 		case agent.EventError:
 			return ev.Err
@@ -2213,7 +2217,7 @@ func prepareACPLoop(ctx context.Context, flags *cliFlags) (*agent.Loop, func(), 
 		providerName = "unconfigured"
 	}
 	provider := &acpAuthRequiredProvider{name: providerName, model: flags.model, err: err}
-	gate := permission.New(permission.ModeDeny)
+	gate := permission.New(permission.ModeDontAsk)
 	loop := agent.NewLoop(provider, tools.NewRegistry(), gate, nil, "", 1)
 	return loop, func() {}, nil
 }
@@ -2592,11 +2596,11 @@ func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) erro
 	if err != nil {
 		return fmt.Errorf("cron run %s: %w", args[0], err)
 	}
-	// Force ModeAsk regardless of cfg.Permission.Mode — see cmdCronStart
+	// Force ModeDefault regardless of cfg.Permission.Mode — see cmdCronStart
 	// for the full rationale: a cron fire is governed by its allow-list,
-	// not the operator's ambient mode, and only ModeAsk routes ask-tier
+	// not the operator's ambient mode, and only ModeDefault routes ask-tier
 	// tool calls through executeCronJob's EvaluateCronPermission handler.
-	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeAsk)})
+	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeDefault)})
 	if err != nil {
 		return err
 	}
@@ -2610,7 +2614,7 @@ func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) erro
 }
 
 func cmdCronStart(ctx context.Context, svc *agent.CronService) error {
-	// Force ModeAsk regardless of cfg.Permission.Mode. A durable cron
+	// Force ModeDefault regardless of cfg.Permission.Mode. A durable cron
 	// fire's permission model is its pre-authorization allow-list
 	// (enforced in executeCronJob's EventPermissionRequest handler via
 	// EvaluateCronPermission), NOT the operator's ambient interactive
@@ -2618,9 +2622,9 @@ func cmdCronStart(ctx context.Context, svc *agent.CronService) error {
 	// would auto-allow state-changing tools WITHOUT ever emitting
 	// EventPermissionRequest, so the allow-list is silently never
 	// consulted and the job runs every (non-dangerous-pattern) tool the
-	// model emits. ModeAsk routes every ask-tier call through the handler
+	// model emits. ModeDefault routes every ask-tier call through the handler
 	// so the allow-list — and its dangerous-pattern floor — always govern.
-	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeAsk)})
+	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeDefault)})
 	if err != nil {
 		return err
 	}
@@ -3041,7 +3045,7 @@ func cmdTools(args []string) error {
 // applies. Shared by `metis tools` (human listing) and `metis schema`
 // (machine-readable contract) so both advertise the identical tool surface.
 func buildListingRegistry(cfg *config.Config, allowFlag, denyFlag string) *tools.Registry {
-	gate := permission.New("ask")
+	gate := permission.New(permission.ModeDefault)
 	reg := tools.NewRegistry()
 	builtin.Register(reg, cfg, gate)
 	reg.Register(builtin.NewAgent(gate, nil, reg, "", ""))
@@ -3620,14 +3624,18 @@ func buildSlash(rt *runtime) *slash.Registry {
 
 	// /mode — unique to the CLI build, lets the user inspect or set the
 	// permission mode by string. Not in RegisterAll because the signal
-	// path already exposes individual /auto, /bypass, /plan, /ask
+	// path already exposes individual mode shortcuts
 	// togglers; this is the catch-all "show me / set me" form.
-	r.Register(slash.Cmd{Name: "mode", Description: "show or set permission mode (ask|auto|bypass|plan|deny)", Handler: func(arg string) (string, slash.Signal) {
+	r.Register(slash.Cmd{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions)", Handler: func(arg string) (string, slash.Signal) {
 		if arg == "" {
 			return "mode: " + string(rt.gate.Mode()), slash.SignalNone
 		}
-		rt.gate.SetMode(permission.Mode(arg))
-		return "mode set to " + arg, slash.SignalNone
+		mode, ok := permission.ParseMode(arg)
+		if !ok {
+			return "unknown mode: " + arg + " (want default|acceptEdits|plan|dontAsk|bypassPermissions)", slash.SignalNone
+		}
+		rt.gate.SetMode(mode)
+		return "mode set to " + string(mode), slash.SignalNone
 	}})
 	// /dream — DreamTask (auto-memory) status (G.5, 2026-05-12).
 	// Reads the live extractor's phase + last-run stats. Off-mode
@@ -3926,8 +3934,8 @@ timeout_seconds = 120
 temperature = 1.0
 
 [permission]
-# ask | auto | bypass | plan | deny
-mode = "ask"
+# default | acceptEdits | plan | dontAsk | bypassPermissions
+mode = "default"
 
 # Always allow these without prompting:
 [[permission.allow]]

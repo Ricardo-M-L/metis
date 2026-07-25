@@ -2,7 +2,7 @@
 name: go-reviewer
 description: Go code review agent — reads diffs and flags issues by severity
 tools: Read, Grep, Glob, LS, Bash
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: high
 max_turns: 25
 ---

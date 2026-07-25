@@ -150,7 +150,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "export", Description: "export current session to a file", Handler: cmdExport})
 
 	// === Permissions ===
-	r.Register(REPLCommand{Name: "mode", Description: "show or set permission mode (ask|auto|bypass|deny)", Handler: cmdMode})
+	r.Register(REPLCommand{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions)", Handler: cmdMode})
 	r.Register(REPLCommand{Name: "allow", Description: "allow a tool permanently (e.g. allow Bash)", Handler: cmdAllow})
 	r.Register(REPLCommand{Name: "sandbox", Description: "Bash sandbox (macOS Seatbelt): status | off | permissions | auto-allow", Handler: cmdSandbox})
 
@@ -227,6 +227,9 @@ func cmdQuit(r *REPL, args string) string {
 }
 
 func cmdClear(r *REPL, args string) string {
+	if err := r.replaceHistory(nil); err != nil {
+		return "clear failed: " + err.Error()
+	}
 	r.Loop.Reset()
 	return "(history cleared)"
 }
@@ -1385,8 +1388,12 @@ func cmdMode(r *REPL, args string) string {
 	if args == "" {
 		return "mode: " + string(r.Gate.Mode())
 	}
-	r.Gate.SetMode(permission.Mode(args))
-	return "mode set to: " + args
+	mode, ok := permission.ParseMode(args)
+	if !ok {
+		return "unknown mode: " + args + " (want default|acceptEdits|plan|dontAsk|bypassPermissions)"
+	}
+	r.Gate.SetMode(mode)
+	return "mode set to: " + string(mode)
 }
 
 func cmdAllow(r *REPL, args string) string {
@@ -1437,6 +1444,9 @@ func cmdCompact(r *REPL, args string) string {
 		return fmt.Sprintf("compact: no reduction (%d → %d messages)", before, len(compacted))
 	}
 	r.Loop.Restore(compacted)
+	if err := r.replaceHistory(compacted); err != nil {
+		return fmt.Sprintf("compact: %d → %d messages in memory, but history persistence failed: %v", before, len(compacted), err)
+	}
 	return fmt.Sprintf("compact: %d → %d messages (saved %d)", before, len(compacted), before-len(compacted))
 }
 

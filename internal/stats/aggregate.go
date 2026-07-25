@@ -262,12 +262,17 @@ func readSessionFile(path string) (*sessionRowRaw, error) {
 		ID: strings.TrimSuffix(filepath.Base(path), ".jsonl"),
 	}
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<22)
+	// A history_replace line contains the complete live transcript and can be
+	// larger than the old 4 MiB per-message ceiling. Match session.Load's
+	// 16 MiB entry limit so stats does not silently fall back to stale rows.
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	type entry struct {
-		Type    string          `json:"type"`
-		Header  *pubsess.Header `json:"header,omitempty"`
-		Message *llm.Message    `json:"message,omitempty"`
+		Type     string          `json:"type"`
+		Header   *pubsess.Header `json:"header,omitempty"`
+		Message  *llm.Message    `json:"message,omitempty"`
+		Messages []llm.Message   `json:"messages,omitempty"`
 	}
+	var messages []llm.Message
 	for sc.Scan() {
 		var e entry
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
@@ -283,17 +288,22 @@ func readSessionFile(path string) (*sessionRowRaw, error) {
 			}
 		case "message":
 			if e.Message != nil {
-				row.Messages++
-				chars := 0
-				for _, b := range e.Message.Content {
-					chars += len(b.Text) + len(b.ToolResult)
-				}
-				if e.Message.Role == "user" || e.Message.Role == "tool" {
-					row.tokensIn += chars / 4
-				} else {
-					row.tokensOut += chars / 4
-				}
+				messages = append(messages, *e.Message)
 			}
+		case "history_replace":
+			messages = append([]llm.Message(nil), e.Messages...)
+		}
+	}
+	row.Messages = len(messages)
+	for _, message := range messages {
+		chars := 0
+		for _, b := range message.Content {
+			chars += len(b.Text) + len(b.ToolResult)
+		}
+		if message.Role == "user" || message.Role == "tool" {
+			row.tokensIn += chars / 4
+		} else {
+			row.tokensOut += chars / 4
 		}
 	}
 	if row.Started.IsZero() {

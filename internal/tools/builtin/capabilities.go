@@ -1,6 +1,9 @@
 package builtin
 
 import (
+	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -57,10 +60,19 @@ func (SubAgentOutput) IsReadOnly(map[string]any) bool { return true }
 // LSP queries language-server diagnostics — read-only.
 func (LSP) IsReadOnly(map[string]any) bool { return true }
 
-// Skill listing / inspection is read-only. Invoking a skill that
-// runs inner tools is a different story (those tools' own readonly
-// flags decide), but Skill itself is a dispatcher.
-func (Skill) IsReadOnly(map[string]any) bool { return true }
+// Skill list/get are read-only at the user-content boundary. Invoke is not:
+// it records usage and trusted skills may execute inline shell expansion.
+// The runtime passes the structured input through its read-only hook so Plan
+// mode can still use list/get while refusing invoke.
+func (Skill) IsReadOnly(in map[string]any) bool {
+	action, _ := in["action"].(string)
+	return action != "invoke"
+}
+
+func (Skill) IsDestructive(in map[string]any) bool {
+	action, _ := in["action"].(string)
+	return action == "invoke"
+}
 
 // --- mutating but reversible -------------------------------------------
 
@@ -100,11 +112,30 @@ func (ScheduleWakeup) IsReadOnly(map[string]any) bool { return false }
 // retained context for the model's next turn).
 func (Git) IsReadOnly(map[string]any) bool { return false }
 
-// Agent dispatches a sub-loop that may itself call any tool. Treat
-// as not read-only because we can't statically know what the inner
-// loop did — its tool_result might contain edit diffs the model
-// needs verbatim later.
-func (Agent) IsReadOnly(map[string]any) bool { return false }
+// Agent delegates permission checks to the child's gate-bound tool registry,
+// matching Claude Code's normal no-extra-prompt spawn behavior. An explicit
+// permission override is still a parent-boundary concern: a more permissive
+// child posture is not read-only and must go through the parent's normal
+// approval flow. Worktree isolation is never read-only because its setup
+// changes git metadata before the child runs.
+func (a Agent) IsReadOnly(in map[string]any) bool {
+	if isolation, _ := in["isolation"].(string); strings.TrimSpace(isolation) == "worktree" {
+		return false
+	}
+
+	parentMode := permission.ModeDefault
+	if a.gate != nil {
+		parentMode = a.gate.Mode()
+	}
+	requested, hasRequested, err := requestedAgentPermissionMode(in)
+	if err != nil {
+		return false
+	}
+	if !hasRequested {
+		return true
+	}
+	return !agentPermissionModeEscalates(parentMode, requested)
+}
 
 // Fork is the warm-start variant of Agent — same caveat applies:
 // can't statically know what the child did, so not read-only.

@@ -92,8 +92,8 @@ func TestCyclePermissionMode_AllowsCycleAfterDebounceWindow(t *testing.T) {
 	m.lastModeCycle = time.Now().Add(-modeCycleDebounce - 10*time.Millisecond)
 	m.cyclePermissionMode() // plan → bypass
 
-	if got := string(m.gate.Mode()); got != "bypass" {
-		t.Errorf("after debounce window, mode = %q, want bypass", got)
+	if got := string(m.gate.Mode()); got != "bypassPermissions" {
+		t.Errorf("after debounce window, mode = %q, want bypassPermissions", got)
 	}
 }
 

@@ -125,6 +125,116 @@ func TestOpenAIStream_ToolCall(t *testing.T) {
 	mustNext("message_stop")
 }
 
+func TestOpenAIStream_ToolCallWithoutIndexOrIDKeepsOneIdentity(t *testing.T) {
+	for _, startID := range []string{"", "call_name_only_id"} {
+		name := "fully_anonymous"
+		idField := ""
+		if startID != "" {
+			name = "id_only_on_name_frame"
+			idField = `"id":"` + startID + `",`
+		}
+		t.Run(name, func(t *testing.T) {
+			payload := strings.Join([]string{
+				`data: {"choices":[{"delta":{"tool_calls":[{` + idField + `"function":{"name":"Read"}}]}}]}`,
+				``,
+				`data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"path\":"}}]}}]}`,
+				``,
+				`data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"/tmp/a.go\"}"}}]}}]}`,
+				``,
+				`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+				``,
+				`data: [DONE]`,
+				``,
+			}, "\n")
+			s := makeStream(payload)
+			defer s.Close()
+
+			var starts, deltas, stops []StreamEvent
+			for {
+				ev, err := s.Recv()
+				switch ev.Type {
+				case "tool_use_start":
+					starts = append(starts, ev)
+				case "tool_input_delta":
+					deltas = append(deltas, ev)
+				case "tool_use_stop":
+					stops = append(stops, ev)
+				}
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(starts) != 1 || len(deltas) != 2 || len(stops) != 1 {
+				t.Fatalf("starts=%+v deltas=%+v stops=%+v", starts, deltas, stops)
+			}
+			id := starts[0].ToolUseID
+			if id == "" || deltas[0].ToolUseID != id || deltas[1].ToolUseID != id || stops[0].ToolUseID != id {
+				t.Fatalf("anonymous call identity changed: starts=%+v deltas=%+v stops=%+v", starts, deltas, stops)
+			}
+			if startID != "" && id != startID {
+				t.Fatalf("provider id changed: got %q want %q", id, startID)
+			}
+			if stops[0].InputDelta != `{"path":"/tmp/a.go"}` {
+				t.Fatalf("accumulated arguments = %q", stops[0].InputDelta)
+			}
+		})
+	}
+}
+
+func TestOpenAIStream_IDThenIndexReconcilesToOriginalCall(t *testing.T) {
+	for _, includeIDOnIndexedFrame := range []bool{true, false} {
+		name := "index_only_later"
+		indexedDelta := `{"index":7,"function":{"arguments":"{\"path\":\"/tmp/a.go\"}"}}`
+		if includeIDOnIndexedFrame {
+			name = "id_and_index_later"
+			indexedDelta = `{"index":7,"id":"call_reconcile","function":{"arguments":"{\"path\":\"/tmp/a.go\"}"}}`
+		}
+		t.Run(name, func(t *testing.T) {
+			payload := strings.Join([]string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_reconcile","function":{"name":"Read"}}]}}]}`,
+				``,
+				`data: {"choices":[{"delta":{"tool_calls":[` + indexedDelta + `]}}]}`,
+				``,
+				`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+				``,
+				`data: [DONE]`,
+				``,
+			}, "\n")
+			s := makeStream(payload)
+			defer s.Close()
+
+			var starts, stops []StreamEvent
+			for {
+				ev, err := s.Recv()
+				if ev.Type == "tool_use_start" {
+					starts = append(starts, ev)
+				}
+				if ev.Type == "tool_use_stop" {
+					stops = append(stops, ev)
+				}
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(starts) != 1 || len(stops) != 1 {
+				t.Fatalf("call was split: starts=%+v stops=%+v", starts, stops)
+			}
+			if starts[0].ToolUseID != "call_reconcile" || stops[0].ToolUseID != "call_reconcile" {
+				t.Fatalf("id was not preserved: starts=%+v stops=%+v", starts, stops)
+			}
+			if stops[0].InputDelta != `{"path":"/tmp/a.go"}` {
+				t.Fatalf("arguments were not reconciled: %q", stops[0].InputDelta)
+			}
+		})
+	}
+}
+
 // Regression: when the upstream omits `index` (e.g. some Groq/Together
 // streams), the previous code defaulted every parallel call to index 0
 // and merged their arguments. We now route each call to its own slot
@@ -165,6 +275,149 @@ func TestOpenAIStream_ParallelToolCallsWithoutIndex(t *testing.T) {
 	}
 	if got := stops["call_b"]; got != `{"b":2}` {
 		t.Errorf("call_b accumulated = %q, want {\"b\":2}", got)
+	}
+}
+
+// Some OpenAI-compatible providers retain the standard index field but omit
+// tool_call.id entirely. The adapter must manufacture a stable id per index;
+// otherwise consumeStream sees every call under the empty-string map key and
+// interleaved arguments overwrite one another.
+func TestOpenAIStream_ParallelToolCallsWithoutIDs(t *testing.T) {
+	payload := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Read","arguments":"{\"path\":\"/tmp/"}},{"index":1,"function":{"name":"Grep","arguments":"{\"pattern\":\"TO"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"DO\"}"}},{"index":0,"function":{"arguments":"a.go\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	s := makeStream(payload)
+	defer s.Close()
+
+	var starts, stops []StreamEvent
+	for {
+		ev, err := s.Recv()
+		switch ev.Type {
+		case "tool_use_start":
+			starts = append(starts, ev)
+		case "tool_use_stop":
+			stops = append(stops, ev)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(starts) != 2 || len(stops) != 2 {
+		t.Fatalf("starts=%+v stops=%+v; want two of each", starts, stops)
+	}
+	if starts[0].ToolUseID == "" || starts[1].ToolUseID == "" {
+		t.Fatalf("synthetic ids must be non-empty: %+v", starts)
+	}
+	if starts[0].ToolUseID == starts[1].ToolUseID {
+		t.Fatalf("parallel calls reused synthetic id %q", starts[0].ToolUseID)
+	}
+	if stops[0].ToolUseID != starts[0].ToolUseID || stops[1].ToolUseID != starts[1].ToolUseID {
+		t.Fatalf("stop ids did not retain start identity: starts=%+v stops=%+v", starts, stops)
+	}
+	if stops[0].InputDelta != `{"path":"/tmp/a.go"}` {
+		t.Errorf("Read args crossed streams: %q", stops[0].InputDelta)
+	}
+	if stops[1].InputDelta != `{"pattern":"TODO"}` {
+		t.Errorf("Grep args crossed streams: %q", stops[1].InputDelta)
+	}
+}
+
+// Stops must be deterministic and follow tool start order. consumeStream
+// reserves assistant content blocks at start time, so stable stop order also
+// makes raw adapter traces reproducible instead of depending on Go map order.
+func TestOpenAIStream_ParallelToolStopsKeepStartOrder(t *testing.T) {
+	payload := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"Read","arguments":"{\"path\":\"/tmp/a\"}"}},{"index":1,"id":"call_b","function":{"name":"Read","arguments":"{\"path\":\"/tmp/b\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	s := makeStream(payload)
+	defer s.Close()
+
+	var starts, stops []string
+	for {
+		ev, err := s.Recv()
+		if ev.Type == "tool_use_start" {
+			starts = append(starts, ev.ToolUseID)
+		}
+		if ev.Type == "tool_use_stop" {
+			stops = append(stops, ev.ToolUseID)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if strings.Join(starts, ",") != "call_a,call_b" {
+		t.Fatalf("start order = %v", starts)
+	}
+	if strings.Join(stops, ",") != "call_a,call_b" {
+		t.Fatalf("stop order = %v", stops)
+	}
+}
+
+func TestFromOpenAIChoice_MissingToolIDsGetResponseScopedIDs(t *testing.T) {
+	choice := oaiChoice{FinishReason: "tool_calls"}
+	choice.Message.ToolCalls = make([]oaiToolCall, 2)
+	choice.Message.ToolCalls[0].Function.Name = "Read"
+	choice.Message.ToolCalls[0].Function.Arguments = `{"path":"/tmp/a"}`
+	choice.Message.ToolCalls[1].Function.Name = "Grep"
+	choice.Message.ToolCalls[1].Function.Arguments = `{"pattern":"TODO"}`
+
+	first := fromOpenAIChoice(choice, oaiUsage{})
+	second := fromOpenAIChoice(choice, oaiUsage{})
+	if len(first.Content) != 2 || len(second.Content) != 2 {
+		t.Fatalf("unexpected content: first=%+v second=%+v", first.Content, second.Content)
+	}
+	firstA, firstB := first.Content[0].ToolUseID, first.Content[1].ToolUseID
+	if firstA == "" || firstB == "" || firstA == firstB {
+		t.Fatalf("missing/non-unique synthetic ids: %q %q", firstA, firstB)
+	}
+	if firstA == second.Content[0].ToolUseID || firstB == second.Content[1].ToolUseID {
+		t.Fatalf("identical responses reused history-visible ids: first=%+v second=%+v", first.Content, second.Content)
+	}
+}
+
+func TestOpenAIStream_SyntheticIDsDoNotDependOnProcessSequence(t *testing.T) {
+	payload := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Read","arguments":"{\"path\":\"/tmp/a\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	readID := func() string {
+		s := makeStream(payload)
+		defer s.Close()
+		for {
+			ev, err := s.Recv()
+			if ev.Type == "tool_use_start" {
+				return ev.ToolUseID
+			}
+			if err != nil {
+				t.Fatalf("did not receive tool start: %v", err)
+			}
+		}
+	}
+	first, second := readID(), readID()
+	if first == "" || second == "" || first == second {
+		t.Fatalf("response-scoped synthetic ids collided: %q %q", first, second)
 	}
 }
 

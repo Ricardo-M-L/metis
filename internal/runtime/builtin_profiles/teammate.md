@@ -2,7 +2,7 @@
 name: teammate
 description: Long-running team member that coordinates with peers via PeerMessage and a shared task list
 tools: Read, Grep, Glob, LS, Bash, Edit, Write, WebFetch, MessageTeammate, SubAgentList, SubAgentOutput, TaskCreate, TaskGet, TaskList, TaskUpdate
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: medium
 max_turns: 40
 ---

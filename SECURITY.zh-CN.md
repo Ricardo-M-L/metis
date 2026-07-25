@@ -39,7 +39,7 @@ Metis 处于 `0.x` 阶段，仅最新 minor 版本接收安全修复。
 
 **不在范围**（请勿提交）：
 
-- 用户自己设置 `--mode bypass` 并运行危险命令 —— 该模式已声明「自负责任」
+- 用户自己设置 `--mode bypassPermissions` 并运行危险命令 —— 该模式已声明「自负责任」
 - 上游 LLM provider API 的问题
 - 巨大输入导致的拒绝服务（Metis 是本地 CLI，请用 ulimit）
 - 用户自己以明文写进 config 文件的敏感数据
@@ -48,5 +48,5 @@ Metis 处于 `0.x` 阶段，仅最新 minor 版本接收安全修复。
 
 - 永远不要在 config.toml 用 `api_key = "..."` 直填真实 API key。
   改用 `api_key_env = "ANTHROPIC_API_KEY"`，把密钥放在环境变量。
-- 在审过哪些工具可信任自动运行之前，默认 `mode = "ask"`。
+- 在审过哪些工具可信任自动运行之前，默认 `mode = "default"`。
 - 把 `~/.metis/` 当 `~/.ssh/` 同等保护 —— 同样的文件权限，不要 checkin 到共享 dotfiles 仓库。

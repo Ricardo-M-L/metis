@@ -51,6 +51,9 @@ type REPL struct {
 	totalTokens        tokenTracker
 	baseSystem         string
 	baseSystemSections []llm.SystemSection
+	// historyCursor is shared with the TUI bridge (when present) and tracks
+	// the exact durable prefix of Loop.History across steering/tool turns.
+	historyCursor *session.HistoryCursor
 	// SessionSwitch rebinds runtime-owned Todo/Task/dump/checkpoint routers.
 	SessionSwitch func(sessionID string)
 	// SessionBoundary releases process-owned work tied to the session being
@@ -126,6 +129,7 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 	if err != nil {
 		md = nil
 	}
+	cursor := session.NewHistoryCursor(loop.History())
 	return &REPL{
 		Loop:        loop,
 		Gate:        gate,
@@ -140,10 +144,11 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 		baseSystem:  loop.System,
 		baseSystemSections: append([]llm.SystemSection(nil),
 			loop.SystemSections...),
-		skillDir: skillDir,
-		cmds:     BuildREPLCommands(),
-		stdin:    os.Stdin,
-		out:      os.Stdout,
+		historyCursor: &cursor,
+		skillDir:      skillDir,
+		cmds:          BuildREPLCommands(),
+		stdin:         os.Stdin,
+		out:           os.Stdout,
 	}, nil
 }
 
@@ -236,6 +241,10 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 			case slash.SignalQuit:
 				return nil
 			case slash.SignalClear:
+				if err := r.replaceHistory(nil); err != nil {
+					fmt.Fprintln(r.out, r.Styles.Err.Render("clear: "+err.Error()))
+					break
+				}
 				r.Loop.Reset()
 				fmt.Fprintln(r.out, r.Styles.Hint.Render("(history cleared)"))
 			case slash.SignalNew:
@@ -256,6 +265,9 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 				// + edit if they want to retry. Matches kimi-cli's
 				// non-TUI fallback for /undo prefill.
 				if prefill, ok := r.Loop.UndoLastTurnWithPrefill(); ok {
+					if err := r.replaceHistory(r.Loop.History()); err != nil {
+						fmt.Fprintln(r.out, r.Styles.Err.Render("undo applied in memory but failed to persist: "+err.Error()))
+					}
 					if prefill != "" {
 						p := strings.ReplaceAll(prefill, "\n", " ")
 						if len(p) > 80 {
@@ -318,9 +330,7 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 		}
 
 		r.Loop.AppendUser(text)
-		if r.Session != nil && r.SessionID != "" {
-			_ = r.Session.AppendMessage(r.SessionID, lastUserMessage(r.Loop.History()))
-		}
+		r.persistTail()
 		_ = runtime.AppendHistory(runtime.HistoryEntry{
 			SessionID: r.SessionID, Input: text, Source: "repl",
 		})
@@ -537,6 +547,9 @@ func historyFilePath() string {
 }
 
 func (r *REPL) runTurn(ctx context.Context) error {
+	// EventLoopDone normally flushes eagerly below; the deferred retry covers
+	// provider errors/cancellation paths that close the event stream first.
+	defer r.persistTail()
 	events := make(chan agent.Event, eventBufferSize())
 	done := make(chan error, 1)
 
@@ -715,20 +728,26 @@ func (r *REPL) askPermission(ev agent.Event) agent.PermissionDecision {
 }
 
 func (r *REPL) persistTail() {
-	if r.Session == nil || r.SessionID == "" {
+	if r.Session == nil || r.SessionID == "" || r.Loop == nil {
 		return
 	}
-	hist := r.Loop.History()
-	// Persist the last assistant turn + any tool_result user turn
-	// (everything after the last user-only message).
-	for i := len(hist) - 1; i >= 0; i-- {
-		if hist[i].Role == llm.RoleUser && len(hist[i].Content) > 0 && hist[i].Content[0].Type == "text" {
-			for j := i + 1; j < len(hist); j++ {
-				_ = r.Session.AppendMessage(r.SessionID, hist[j])
-			}
-			return
-		}
+	if r.historyCursor == nil {
+		cursor := session.NewHistoryCursor(nil)
+		r.historyCursor = &cursor
 	}
+	_ = r.Session.AppendHistoryTail(r.SessionID, r.Loop.History(), r.historyCursor)
+}
+
+func (r *REPL) replaceHistory(history []llm.Message) error {
+	if r.historyCursor == nil {
+		cursor := session.NewHistoryCursor(nil)
+		r.historyCursor = &cursor
+	}
+	if r.Session == nil || r.SessionID == "" {
+		r.historyCursor.Mark(history)
+		return nil
+	}
+	return r.Session.ReplaceHistoryAndMark(r.SessionID, history, r.historyCursor)
 }
 
 func lastUserMessage(hist []llm.Message) llm.Message {

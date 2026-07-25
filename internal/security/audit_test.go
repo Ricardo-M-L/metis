@@ -29,7 +29,7 @@ func (s stubTool) Execute(_ context.Context, _ map[string]any) (*tools.Result, e
 
 func minimalCfg() *config.Config {
 	return &config.Config{
-		Permission: config.Permission{Mode: "ask"},
+		Permission: config.Permission{Mode: "default"},
 		Tools: config.Tools{
 			Bash: config.ToolBashSettings{
 				Denylist: []string{"rm -rf /", "dd of=/dev", ":(){:|:&};:"},
@@ -78,14 +78,18 @@ func TestRun_HardcodedAPIKey(t *testing.T) {
 }
 
 func TestRun_BypassModeIsCritical(t *testing.T) {
-	cfg := minimalCfg()
-	cfg.Permission.Mode = "bypass"
-	rep := Run(cfg, tools.NewRegistry())
-	if !rep.HasCritical() {
-		t.Error("bypass mode should produce a critical finding")
-	}
-	if !findingHasCode(rep, "PERMISSION_BYPASS") {
-		t.Error("expected PERMISSION_BYPASS code")
+	for _, mode := range []string{"bypassPermissions", "bypass"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := minimalCfg()
+			cfg.Permission.Mode = mode
+			rep := Run(cfg, tools.NewRegistry())
+			if !rep.HasCritical() {
+				t.Error("bypassPermissions mode should produce a critical finding")
+			}
+			if !findingHasCode(rep, "PERMISSION_BYPASS") {
+				t.Error("expected PERMISSION_BYPASS code")
+			}
+		})
 	}
 }
 

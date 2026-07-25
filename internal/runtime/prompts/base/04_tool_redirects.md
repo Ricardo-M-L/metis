@@ -55,7 +55,7 @@ to run independently regardless of failure, use `;` or split into
 separate Bash calls — but that's the exception, not the default.
 
 Reserve Read/Edit/Write for the case where you actually need
-metis's per-file staleness tracking, structured diff display, or
+per-file staleness tracking, structured diff display, or
 syntax-aware in-place edits.
 
 ## What goes where: directory vs file

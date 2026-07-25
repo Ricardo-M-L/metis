@@ -2,7 +2,7 @@
 name: explore
 description: Fast read-only code search and discovery agent
 tools: Read, Grep, Glob, LS, WebFetch
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: low
 max_turns: 25
 ---

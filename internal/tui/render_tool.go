@@ -33,6 +33,7 @@ import (
 // instead of capping at 5-20 lines.
 func renderToolEvent(te ToolEvent, expanded bool) string {
 	var s strings.Builder
+	baseName := strings.TrimPrefix(te.ToolName, "sub: ")
 
 	// Leader row: ⏺ toolname(arg)
 	//
@@ -121,6 +122,9 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		s.WriteString(styleAccent.Render("✓ "))
 	}
 	s.WriteString(summarizeToolResult(te))
+	if !te.IsError && !expanded && te.Output != "" && collapseToolBodyByDefault(baseName) {
+		s.WriteString(styleMuted.Render(" (ctrl+O to expand)"))
+	}
 	s.WriteString("\n")
 
 	// Body: structured diff for Edit/Write, task-list for TodoWrite,
@@ -140,7 +144,6 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		// preview (image #49 repro). The display name above keeps
 		// the "sub: " prefix so the user still sees it came from a
 		// sub-agent; only the renderer dispatch uses the base name.
-		baseName := strings.TrimPrefix(te.ToolName, "sub: ")
 		switch baseName {
 		case "Edit":
 			s.WriteString(renderEditDiff(te.Input, expanded))
@@ -149,13 +152,29 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		case "TodoWrite":
 			s.WriteString(renderTodoSnapshot())
 		default:
-			if te.Output != "" {
+			if te.Output != "" && (expanded || !collapseToolBodyByDefault(baseName)) {
 				s.WriteString(renderToolOutputPreview(te.ToolName, te.Output, expanded))
 			}
 		}
 	}
 	s.WriteString("\n")
 	return s.String()
+}
+
+// collapseToolBodyByDefault matches Claude Code's compact transcript: high-
+// volume exploration and delegated-agent results render as a one-line summary
+// until Ctrl+O switches to transcript mode. Metis previously printed the first
+// five lines of every such result followed by "… +N more lines", producing a
+// wall of ellipses even though the per-turn recap already summarized the work.
+// Errors remain expanded enough to diagnose, and Edit/Write/Bash keep their
+// dedicated visible renderers.
+func collapseToolBodyByDefault(toolName string) bool {
+	switch toolName {
+	case "Read", "LS", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Fork":
+		return true
+	default:
+		return false
+	}
 }
 
 // renderErrorBody is the error-path counterpart to renderToolOutputPreview:

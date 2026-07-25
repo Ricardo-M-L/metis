@@ -106,7 +106,8 @@ func (Edit) Concurrency(map[string]any) tools.Concurrency { return tools.Concurr
 func (Edit) IsDestructive(map[string]any) bool { return true }
 
 func (e Edit) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := e.gate.Check(context.Background(), "Edit", strFromAny(in["path"]))
+	path := strFromAny(in["path"])
+	d, src := e.gate.CheckPath(context.Background(), "Edit", path, path)
 	return mapDecision(d), src
 }
 

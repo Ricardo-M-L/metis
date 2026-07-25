@@ -1,7 +1,7 @@
 ---
 name: general
 description: Catch-all agent profile with all tools available — use when you don't have a more specific profile
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: medium
 max_turns: 30
 ---

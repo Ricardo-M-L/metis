@@ -73,6 +73,64 @@ func TestConsumeStream_EmitsToolArgsDelta(t *testing.T) {
 	}
 }
 
+// TestConsumeStream_InterleavedParallelTools keeps one independent JSON
+// accumulator per tool_use_id. OpenAI-compatible providers can interleave
+// argument deltas for several calls in one response; the old single curTool
+// slot overwrote earlier calls and reduced every batch to its final tool.
+func TestConsumeStream_InterleavedParallelTools(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "tool_use_start", ToolUseID: "read-a", ToolName: "Read"},
+		{Type: "tool_input_delta", ToolUseID: "read-a", InputDelta: `{"path":"/tmp/a`},
+		{Type: "tool_use_start", ToolUseID: "grep-b", ToolName: "Grep"},
+		{Type: "tool_input_delta", ToolUseID: "grep-b", InputDelta: `{"pattern":"TODO`},
+		{Type: "tool_input_delta", ToolUseID: "read-a", InputDelta: `.go"}`},
+		{Type: "tool_input_delta", ToolUseID: "grep-b", InputDelta: `","root":"/tmp"}`},
+		// Stop in reverse order. Content-block order must still follow starts.
+		{Type: "tool_use_stop", ToolUseID: "grep-b"},
+		{Type: "tool_use_stop", ToolUseID: "read-a"},
+		{Type: "message_stop", StopReason: "tool_use"},
+	}}
+	out := make(chan Event, 32)
+	loop := &Loop{}
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = loop.consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	var deltaIDs []string
+	for ev := range out {
+		if ev.Kind == EventToolArgsDelta {
+			deltaIDs = append(deltaIDs, ev.ToolUseID)
+		}
+	}
+	<-done
+
+	if len(blocks) != 2 {
+		t.Fatalf("expected both parallel tool blocks, got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].ToolUseID != "read-a" || blocks[0].ToolName != "Read" {
+		t.Errorf("block[0] lost start order: %+v", blocks[0])
+	}
+	if blocks[1].ToolUseID != "grep-b" || blocks[1].ToolName != "Grep" {
+		t.Errorf("block[1] lost start order: %+v", blocks[1])
+	}
+	if got, _ := blocks[0].ToolInput["path"].(string); got != "/tmp/a.go" {
+		t.Errorf("read args crossed streams: got %q (%+v)", got, blocks[0].ToolInput)
+	}
+	if got, _ := blocks[1].ToolInput["pattern"].(string); got != "TODO" {
+		t.Errorf("grep args crossed streams: got %q (%+v)", got, blocks[1].ToolInput)
+	}
+	if got, _ := blocks[1].ToolInput["root"].(string); got != "/tmp" {
+		t.Errorf("grep root missing: got %q (%+v)", got, blocks[1].ToolInput)
+	}
+	if strings.Join(deltaIDs, ",") != "read-a,grep-b,read-a,grep-b" {
+		t.Errorf("args delta attribution = %v", deltaIDs)
+	}
+}
+
 // TestConsumeStream_NoArgsDeltaWithoutToolStart — stray
 // tool_input_delta before any tool_use_start should NOT emit an args
 // event (no in-flight tool to attribute it to). Defensive — guards

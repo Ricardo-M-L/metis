@@ -15,6 +15,7 @@ package tui
 // renderCache so glamour cost is paid once per content change.
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -69,6 +70,78 @@ type toolEventItem struct {
 	te     ToolEvent
 	expand bool
 	cache  *renderCache
+}
+
+// explorationGroupItem is Claude Code's collapsed Read/Search cluster. The
+// underlying tools remain one event each (and still execute/audit normally),
+// but consecutive successful Read/Grep/Glob/LS rows render as one compact
+// count summary. Ctrl+O uses the same item to reveal every original row.
+type explorationGroupItem struct {
+	events []ToolEvent
+	expand bool
+}
+
+func (i *explorationGroupItem) Render(width int) string {
+	_ = width
+	if i.expand {
+		var out strings.Builder
+		for _, te := range i.events {
+			out.WriteString(renderToolEvent(te, true))
+		}
+		return out.String()
+	}
+	reads, searches, listings := 0, 0, 0
+	for _, te := range i.events {
+		switch strings.TrimPrefix(te.ToolName, "sub: ") {
+		case "Read":
+			reads++
+		case "Grep":
+			searches++
+		case "Glob":
+			searches++
+		case "LS":
+			listings++
+		}
+	}
+	parts := make([]string, 0, 3)
+	if reads > 0 {
+		parts = append(parts, fmt.Sprintf("Read %d %s", reads, pluralN(reads, "file", "files")))
+	}
+	if searches > 0 {
+		parts = append(parts, fmt.Sprintf("Searched %d %s", searches, pluralN(searches, "pattern", "patterns")))
+	}
+	if listings > 0 {
+		parts = append(parts, fmt.Sprintf("Listed %d %s", listings, pluralN(listings, "directory", "directories")))
+	}
+	var out strings.Builder
+	out.WriteString(styleSuccess.Render("  " + glyphBullet + " "))
+	out.WriteString(styleToolName.Render("explored"))
+	out.WriteString("\n")
+	out.WriteString(styleDim.Render("    " + glyphTreeLeaf + "  "))
+	out.WriteString(styleAccent.Render("✓ "))
+	out.WriteString(strings.Join(parts, " · "))
+	out.WriteString(styleMuted.Render(" (ctrl+O to expand)"))
+	out.WriteString("\n\n")
+	return out.String()
+}
+
+func pluralN(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
+}
+
+func groupableExplorationEvent(te ToolEvent) bool {
+	if te.Kind == "start" || te.IsError || te.SubAgentParentID != "" {
+		return false
+	}
+	switch strings.TrimPrefix(te.ToolName, "sub: ") {
+	case "Read", "Grep", "Glob", "LS":
+		return true
+	default:
+		return false
+	}
 }
 
 // Render implements list.Item. The width parameter is ignored because
@@ -211,9 +284,23 @@ func (m *Model) buildChatItems() []list.Item {
 	// the old collapsed-by-default-with-ctrl+o behaviour.
 	hideThinking := m.thinkingDisplay == "hide"
 	forceExpandThinking := m.thinkingDisplay == "show"
+	var explorationRun []ToolEvent
+	flushExploration := func() {
+		if len(explorationRun) == 0 {
+			return
+		}
+		if len(explorationRun) == 1 {
+			out = append(out, &toolEventItem{te: explorationRun[0], expand: m.expandToolOutputs, cache: m.renderCache})
+		} else {
+			events := append([]ToolEvent(nil), explorationRun...)
+			out = append(out, &explorationGroupItem{events: events, expand: m.expandToolOutputs})
+		}
+		explorationRun = explorationRun[:0]
+	}
 	for _, it := range merged {
 		switch {
 		case it.msg != nil:
+			flushExploration()
 			if hideThinking && (it.msg.Role == "thinking" || it.msg.Role == "redacted_thinking") {
 				continue
 			}
@@ -223,9 +310,15 @@ func (m *Model) buildChatItems() []list.Item {
 			}
 			out = append(out, &messageItem{msg: *it.msg, expand: expand, cache: m.renderCache})
 		case it.te != nil:
+			if groupableExplorationEvent(*it.te) {
+				explorationRun = append(explorationRun, *it.te)
+				continue
+			}
+			flushExploration()
 			out = append(out, &toolEventItem{te: *it.te, expand: m.expandToolOutputs, cache: m.renderCache})
 		}
 	}
+	flushExploration()
 	if m.thinkingText != "" && !hideThinking {
 		out = append(out, &inProgressThinkingItem{
 			text:   m.thinkingText,

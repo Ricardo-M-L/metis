@@ -683,7 +683,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if val == "/clear" || val == "/reset" {
-			m.Reload(ReloadOpts{})
+			if err := m.Reload(ReloadOpts{}); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "clear: " + err.Error(), Timestamp: time.Now()})
+			}
 			return m, cmd
 		}
 	}

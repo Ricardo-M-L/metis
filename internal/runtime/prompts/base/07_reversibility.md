@@ -6,7 +6,7 @@ those freely.
 
 These are NOT reversible and require user confirmation before you act
 (unless the user already authorized the specific action this session,
-or `--mode bypass` is set):
+or `--mode bypassPermissions` is set):
 
   - **Destructive shell**: `rm -rf`, `dd`, `mkfs`, `shred`, redirects
     to `/dev/sd*`, anything matching the destructive-keywords list.

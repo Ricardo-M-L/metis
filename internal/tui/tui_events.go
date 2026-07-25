@@ -15,6 +15,46 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
+const maxToolArgsPreviewBytes = 4096
+
+func (m *Model) appendToolArgsDelta(toolUseID, toolName, delta string) []byte {
+	if m.toolArgsStreams == nil {
+		m.toolArgsStreams = make(map[string]toolArgsStreamState)
+	}
+	state := m.toolArgsStreams[toolUseID] // empty ID is the legacy stream
+	state.data = append(state.data, []byte(delta)...)
+	if len(state.data) > maxToolArgsPreviewBytes {
+		state.data = state.data[:maxToolArgsPreviewBytes]
+	}
+	if toolName != "" {
+		state.toolName = toolName
+	}
+	m.toolArgsSeq++
+	state.seq = m.toolArgsSeq
+	m.toolArgsStreams[toolUseID] = state
+	return state.data
+}
+
+// clearToolArgsStream removes only the completed call's preview. If another
+// parallel call is still streaming, keep the most recently updated preview on
+// screen instead of blanking the spinner for all calls.
+func (m *Model) clearToolArgsStream(toolUseID string) {
+	delete(m.toolArgsStreams, toolUseID)
+	var latest toolArgsStreamState
+	found := false
+	for _, state := range m.toolArgsStreams {
+		if !found || state.seq > latest.seq {
+			latest = state
+			found = true
+		}
+	}
+	if !found {
+		m.spinnerSub = ""
+		return
+	}
+	m.spinnerSub = previewStreamingArgs(latest.toolName, latest.data)
+}
+
 func (m *Model) handleAgentEvent(ev agent.Event) {
 	switch ev.Kind {
 	case agent.EventThinkingDelta:
@@ -119,17 +159,12 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// the LIVE spinner — the persisted ToolEvent uses the parsed
 		// version. Truncate aggressively to keep the spinner row
 		// readable on narrow terminals.
-		m.toolArgsStream = append(m.toolArgsStream, []byte(ev.TextDelta)...)
-		// Cap the live preview at 4KB so a runaway args string
-		// doesn't balloon memory between tool_use_stop calls. Real
-		// tool args are almost never this large.
-		if len(m.toolArgsStream) > 4096 {
-			m.toolArgsStream = m.toolArgsStream[:4096]
-		}
-		m.spinnerSub = previewStreamingArgs(ev.ToolName, m.toolArgsStream)
+		buf := m.appendToolArgsDelta(ev.ToolUseID, ev.ToolName, ev.TextDelta)
+		m.spinnerSub = previewStreamingArgs(ev.ToolName, buf)
 	case agent.EventToolResult:
-		// Reset streaming-args buffer so the next tool starts clean.
-		m.toolArgsStream = m.toolArgsStream[:0]
+		// Clear only this call's args. Parallel calls keep their independent
+		// buffers and the newest remaining one stays visible in the spinner.
+		m.clearToolArgsStream(ev.ToolUseID)
 		if ev.ToolResult == nil {
 			return
 		}
@@ -184,7 +219,6 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			}
 		}
 		m.spinnerVerb = chooseSpinnerVerb(m.sessionID)
-		m.spinnerSub = ""
 		// Tool finished → the agent is about to send another API
 		// request with the tool result. Flip back to "requesting"
 		// (↑) until the next stream byte arrives.

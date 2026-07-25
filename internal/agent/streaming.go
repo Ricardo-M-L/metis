@@ -30,11 +30,16 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		blocks      []llm.ContentBlock
 		curText     string
 		curThinking string
-		curTool     *llm.ContentBlock
-		curJSON     string
 		stopReas    string
 		usage       usageTotals
 	)
+	type streamedTool struct {
+		blockIndex int
+		json       string
+		finished   bool
+	}
+	toolsByID := make(map[string]*streamedTool)
+	var toolOrder []*streamedTool
 	flushText := func() {
 		if curText != "" {
 			blocks = append(blocks, llm.ContentBlock{Type: "text", Text: curText})
@@ -63,34 +68,59 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			curThinking = ""
 		}
 	}
-	flushTool := func() {
-		if curTool == nil {
+	flushTool := func(tool *streamedTool) {
+		if tool == nil || tool.finished {
 			return
 		}
-		if curJSON != "" {
+		tool.finished = true
+		if tool.json != "" {
 			var parsed map[string]any
-			if err := json.Unmarshal([]byte(curJSON), &parsed); err == nil {
+			if err := json.Unmarshal([]byte(tool.json), &parsed); err == nil {
 				// MiniMax-M2.7 anthropic-shim wraps args as
 				// {"_": "<json-object-string>"} (session 87e366fa);
 				// argsunwrap is a no-op for every well-formed shape so
 				// applying it unconditionally is safe across providers.
 				// See internal/llm/argsunwrap/argsunwrap.go for the
 				// structural guard.
-				curTool.ToolInput = argsunwrap.Unwrap(parsed)
+				blocks[tool.blockIndex].ToolInput = argsunwrap.Unwrap(parsed)
 			} else {
-				curTool.ToolInput = map[string]any{"_raw": curJSON}
+				blocks[tool.blockIndex].ToolInput = map[string]any{"_raw": tool.json}
 			}
 		}
-		blocks = append(blocks, *curTool)
-		curTool = nil
-		curJSON = ""
+	}
+	flushTools := func() {
+		for _, tool := range toolOrder {
+			flushTool(tool)
+		}
+	}
+	lookupTool := func(id string) *streamedTool {
+		if tool := toolsByID[id]; tool != nil && !tool.finished {
+			return tool
+		}
+		// A few compatibility providers omit the id on delta/stop events.
+		// Preserve the historical single-tool behaviour when attribution is
+		// unambiguous, but never guess when multiple calls are in flight.
+		if id == "" {
+			var only *streamedTool
+			for _, tool := range toolsByID {
+				if tool.finished {
+					continue
+				}
+				if only != nil {
+					return nil
+				}
+				only = tool
+			}
+			return only
+		}
+		return nil
 	}
 	for {
 		ev, err := s.Recv()
 		if errors.Is(err, io.EOF) {
 			flushThinking()
 			flushText()
-			flushTool()
+			flushTools()
 			return blocks, stopReas, &usage, nil
 		}
 		if err != nil {
@@ -143,28 +173,42 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// the trace before the tool block.
 			flushThinking()
 			flushText()
-			curTool = &llm.ContentBlock{Type: "tool_use", ToolUseID: ev.ToolUseID, ToolName: ev.ToolName}
+			// Reserve the block at start time, rather than appending it at
+			// stop time. Parallel providers may stop calls in any order; the
+			// assistant message must retain the model's content-block order.
+			blockIndex := len(blocks)
+			blocks = append(blocks, llm.ContentBlock{
+				Type:      "tool_use",
+				ToolUseID: ev.ToolUseID,
+				ToolName:  ev.ToolName,
+			})
+			tool := &streamedTool{blockIndex: blockIndex}
+			toolsByID[ev.ToolUseID] = tool
+			toolOrder = append(toolOrder, tool)
 			// Propagate provider-specific blobs (gemini thoughtSignature,
 			// future provider hints) onto the ContentBlock so they round-
 			// trip when the message is later re-sent in history. Without
 			// this, gemini-3.5+ rejects subsequent turns with "Function
 			// call is missing a thought_signature".
 			if len(ev.ProviderHint) > 0 {
-				curTool.ProviderHint = ev.ProviderHint
+				blocks[blockIndex].ProviderHint = ev.ProviderHint
 			}
-			curJSON = ""
 		case "tool_input_delta":
-			curJSON += ev.InputDelta
+			tool := lookupTool(ev.ToolUseID)
+			if tool != nil {
+				tool.json += ev.InputDelta
+			}
 			// Forward the partial JSON chunk to the UI so the user sees
 			// tool args appear as they're generated — kimi-cli's
 			// streamingjson behavior, claude-code parity. ToolUseID lets
 			// the UI route the delta to the right in-flight row when
 			// multiple tools are spawning in parallel.
-			if curTool != nil {
+			if tool != nil {
+				block := blocks[tool.blockIndex]
 				emit(ctx, out, Event{
 					Kind:      EventToolArgsDelta,
-					ToolUseID: curTool.ToolUseID,
-					ToolName:  curTool.ToolName,
+					ToolUseID: block.ToolUseID,
+					ToolName:  block.ToolName,
 					TextDelta: ev.InputDelta,
 				})
 			}
@@ -176,18 +220,20 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// dropped on a flaky connection — surfaced as the MiniMax
 			// "internal/jobs/jobs.go → l/jobs/jobs.go" path corruption,
 			// where `interna` was eaten between deltas), the provider's
-			// full string is the source of truth. Prefer it whenever
-			// it's at least as long as what we built up.
-			//
-			// Strict-equal length is the typical case (no loss). Longer
-			// = our accumulator dropped bytes; we resync. Shorter is
-			// surprising (would mean the provider undercounted) — we
-			// keep curJSON in that case so we don't accidentally trim
-			// real data.
-			if ev.InputDelta != "" && len(ev.InputDelta) >= len(curJSON) {
-				curJSON = ev.InputDelta
+			// full string is the source of truth when it is at least as
+			// complete as the incremental buffer. Keep the longer local
+			// buffer if a compatibility provider emits a truncated stop
+			// payload (covered by ToolUseStopShorterKeepsCurJSON).
+			tool := lookupTool(ev.ToolUseID)
+			if tool != nil {
+				if ev.InputDelta != "" && len(ev.InputDelta) >= len(tool.json) {
+					tool.json = ev.InputDelta
+				}
+				flushTool(tool)
+				if toolsByID[ev.ToolUseID] == tool {
+					delete(toolsByID, ev.ToolUseID)
+				}
 			}
-			flushTool()
 		case "message_delta":
 			if ev.StopReason != "" {
 				stopReas = ev.StopReason
@@ -210,7 +256,7 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		case "message_stop":
 			flushThinking()
 			flushText()
-			flushTool()
+			flushTools()
 			return blocks, stopReas, &usage, nil
 		case "error":
 			return nil, "", nil, ev.Err

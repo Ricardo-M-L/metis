@@ -223,6 +223,61 @@ func TestAggregate_TokenApproximation(t *testing.T) {
 	}
 }
 
+func TestAggregate_HistoryReplaceCountsOnlyLiveSnapshotAndTail(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "replaced.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	started := time.Now()
+	if err := enc.Encode(map[string]any{
+		"type":   "header",
+		"header": pubsess.Header{ID: "replaced", CreatedAt: started, Model: "m"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	encodeMessage := func(role, text string) {
+		t.Helper()
+		if err := enc.Encode(map[string]any{
+			"type": "message",
+			"message": map[string]any{
+				"role":    role,
+				"content": []map[string]any{{"type": "text", "text": text}},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encodeMessage("user", strings.Repeat("x", 400))
+	encodeMessage("assistant", strings.Repeat("y", 800))
+	if err := enc.Encode(map[string]any{
+		"type": "history_replace",
+		"messages": []map[string]any{{
+			"role":    "user",
+			"content": []map[string]any{{"type": "text", "text": strings.Repeat("n", 40)}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	encodeMessage("assistant", strings.Repeat("z", 80))
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Aggregate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Total.Messages != 2 {
+		t.Fatalf("messages = %d, want snapshot(1) + tail(1)", s.Total.Messages)
+	}
+	if s.Total.ApproxTokensIn != 10 || s.Total.ApproxTokensOut != 20 {
+		t.Fatalf("tokens include replaced history: in=%d out=%d", s.Total.ApproxTokensIn, s.Total.ApproxTokensOut)
+	}
+}
+
 func TestAggregate_ActiveDaysCount(t *testing.T) {
 	dir := t.TempDir()
 	d1 := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)

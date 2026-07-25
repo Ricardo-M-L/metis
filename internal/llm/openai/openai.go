@@ -8,6 +8,8 @@ package openai
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -661,11 +663,19 @@ func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
 	if str, ok := c.Message.Content.(string); ok && str != "" {
 		out.Content = append(out.Content, ContentBlock{Type: "text", Text: str})
 	}
-	for _, tc := range c.Message.ToolCalls {
+	toolIDPrefix := ""
+	for i, tc := range c.Message.ToolCalls {
 		var input map[string]any
 		_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
+		id := tc.ID
+		if id == "" {
+			if toolIDPrefix == "" {
+				toolIDPrefix = newSyntheticToolIDPrefix()
+			}
+			id = syntheticToolUseID(toolIDPrefix, i)
+		}
 		out.Content = append(out.Content, ContentBlock{
-			Type: "tool_use", ToolUseID: tc.ID, ToolName: tc.Function.Name, ToolInput: input,
+			Type: "tool_use", ToolUseID: id, ToolName: tc.Function.Name, ToolInput: input,
 		})
 	}
 	return out
@@ -826,15 +836,29 @@ func (o *OpenAI) setHeaders(r *http.Request) {
 type openAIStream struct {
 	body io.ReadCloser
 	sse  *sse.Reader
-	// per-tool-call accumulator keyed by index
+	// toolIDPrefix is random for every response. Unlike a process-local
+	// counter, it cannot repeat merely because Metis restarted while old
+	// synthetic ids are still present in session history.
+	toolIDPrefix string
+	// Calls are keyed by a response-local identity rather than by the wire
+	// index. OpenAI-compatible gateways are inconsistent about which delta
+	// carries id/index, so both fields bind to this stable internal key.
 	calls        map[int]*oaiCallAccum
+	callOrder    []int
 	emittedStart map[int]bool
-	// idToIdx maps a tool_call.id to the synthetic index we picked when the
-	// upstream provider didn't send one. Some OpenAI-compat servers (Groq,
-	// Together) omit the index field on parallel tool calls and the previous
-	// "default to 0" code collapsed every call into calls[0].
-	idToIdx          map[string]int
-	nextSyntheticIdx int
+	idToKey      map[string]int
+	indexToKey   map[int]int
+	keyToIndex   map[int]int
+	nextCallKey  int
+	// unindexedOrder records calls first introduced without a wire index.
+	// If a later delta supplies only the index, its ordinal lets us reconcile
+	// that delta with the already-started call instead of splitting it.
+	unindexedOrder []int
+	// anonymousOrder provides the only sound fallback available when a
+	// non-standard provider omits both id and index. A sole name-only start
+	// followed by argument-only chunks remains one logical call; parallel
+	// anonymous deltas are associated by their array ordinal.
+	anonymousOrder []int
 	// Some providers (Gemini's OpenAI-compat layer) bundle multiple logical
 	// events into a single SSE chunk (content + finish_reason + usage).
 	// We queue events so each Recv() returns exactly one.
@@ -842,47 +866,175 @@ type openAIStream struct {
 }
 
 type oaiCallAccum struct {
-	ID      string
-	Name    string
-	JSONBuf strings.Builder
+	ID          string
+	SyntheticID bool
+	Name        string
+	JSONBuf     strings.Builder
 }
 
 func newOpenAIStream(body io.ReadCloser) *openAIStream {
 	return &openAIStream{
 		body:         body,
 		sse:          sse.NewReader(body),
+		toolIDPrefix: newSyntheticToolIDPrefix(),
 		calls:        make(map[int]*oaiCallAccum),
 		emittedStart: make(map[int]bool),
-		idToIdx:      make(map[string]int),
+		idToKey:      make(map[string]int),
+		indexToKey:   make(map[int]int),
+		keyToIndex:   make(map[int]int),
 	}
+}
+
+func newSyntheticToolIDPrefix() string {
+	var nonce [12]byte
+	if _, err := rand.Read(nonce[:]); err == nil {
+		return hex.EncodeToString(nonce[:])
+	}
+	// crypto/rand failures are exceptional, but tool parsing must not fail
+	// merely because the OS entropy source is temporarily unavailable. The
+	// time/process fallback is still response-scoped and does not reset to a
+	// small global counter after a restart.
+	fallback := []byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid()))
+	return hex.EncodeToString(fallback)
+}
+
+func syntheticToolUseID(prefix string, key int) string {
+	return fmt.Sprintf("metis_oai_%s_%d", prefix, key)
 }
 
 func (s *openAIStream) Close() error { return s.body.Close() }
 
-// resolveToolCallIdx assigns a stable map key for a streamed tool_call delta.
-// The OpenAI spec sends `index` for every chunk, but Groq/Together and other
-// compat servers sometimes omit it on parallel calls — we then fall back to
-// the call id, and if even that is missing we hand out fresh synthetic
-// indices. The previous code defaulted to 0 here, which collapsed every
-// indexless tool call into a single accumulator.
-func (s *openAIStream) resolveToolCallIdx(tc oaiToolCall) int {
-	if tc.Index != nil {
-		return *tc.Index
+func (s *openAIStream) newCallKey(hasIndex, anonymous bool) int {
+	key := s.nextCallKey
+	s.nextCallKey++
+	if !hasIndex {
+		s.unindexedOrder = append(s.unindexedOrder, key)
 	}
-	if tc.ID != "" {
-		if known, ok := s.idToIdx[tc.ID]; ok {
-			return known
+	if anonymous {
+		s.anonymousOrder = append(s.anonymousOrder, key)
+	}
+	return key
+}
+
+func (s *openAIStream) bindIndex(idx, key int) {
+	s.indexToKey[idx] = key
+	s.keyToIndex[key] = idx
+}
+
+func (s *openAIStream) firstUnindexedKey(idx int) (int, bool) {
+	// Wire index is the call's ordinal among all calls, including calls whose
+	// earlier frames already carried an index. Use creation order rather than
+	// indexing into only the unbound subset.
+	if idx >= 0 && idx < len(s.callOrder) {
+		key := s.callOrder[idx]
+		if _, bound := s.keyToIndex[key]; !bound {
+			return key, true
 		}
-		// Pick a synthetic slot above any real index we've seen so we
-		// don't collide with future numbered chunks.
-		idx := s.nextSyntheticIdx
-		s.nextSyntheticIdx++
-		s.idToIdx[tc.ID] = idx
-		return idx
 	}
-	idx := s.nextSyntheticIdx
-	s.nextSyntheticIdx++
-	return idx
+	// A non-zero/irregular provider index cannot be matched by ordinal. It is
+	// still safe to reconcile when exactly one call remains unbound.
+	unboundKey := 0
+	unboundCount := 0
+	for _, key := range s.unindexedOrder {
+		if _, bound := s.keyToIndex[key]; !bound {
+			unboundKey = key
+			unboundCount++
+		}
+	}
+	return unboundKey, unboundCount == 1
+}
+
+func (s *openAIStream) resolveAnonymousKey(tc oaiToolCall, ordinal int) int {
+	// A function name marks the start of a new anonymous call. Subsequent
+	// argument-only frames reuse it. If several anonymous calls are carried
+	// in parallel arrays, their array ordinal is the best identity available.
+	if tc.Function.Name != "" {
+		return s.newCallKey(false, true)
+	}
+	// Some gateways send id only on the name frame, then omit both id and
+	// index from arguments. The sole active call is unambiguous regardless of
+	// whether it began as anonymous, id-only, or index-only.
+	if len(s.calls) == 1 {
+		for key := range s.calls {
+			return key
+		}
+	}
+	if ordinal >= 0 && ordinal < len(s.callOrder) {
+		key := s.callOrder[ordinal]
+		if _, active := s.calls[key]; active {
+			return key
+		}
+	}
+	if len(s.anonymousOrder) > 0 {
+		return s.anonymousOrder[len(s.anonymousOrder)-1]
+	}
+	return s.newCallKey(false, true)
+}
+
+// resolveToolCallKey assigns a stable response-local identity to a streamed
+// tool_call delta. ID is authoritative when it has been seen before, even if
+// a later frame introduces an index. This prevents an id-only start and an
+// id+index argument frame from being split into separate accumulators.
+func (s *openAIStream) resolveToolCallKey(tc oaiToolCall, ordinal int) int {
+	if tc.ID != "" {
+		if key, ok := s.idToKey[tc.ID]; ok {
+			if tc.Index != nil {
+				s.bindIndex(*tc.Index, key)
+			}
+			return key
+		}
+	}
+
+	if tc.Index != nil {
+		idx := *tc.Index
+		if key, ok := s.indexToKey[idx]; ok {
+			if tc.ID != "" {
+				s.idToKey[tc.ID] = key
+			}
+			return key
+		}
+		// With no id, a newly introduced index can only be reconciled by
+		// response order. A new, non-empty id is authoritative evidence of a
+		// distinct call and must never be folded into an unrelated id-only call.
+		if tc.ID == "" {
+			if key, ok := s.firstUnindexedKey(idx); ok {
+				s.bindIndex(idx, key)
+				return key
+			}
+		}
+		key := s.newCallKey(true, false)
+		s.bindIndex(idx, key)
+		if tc.ID != "" {
+			s.idToKey[tc.ID] = key
+		}
+		return key
+	}
+
+	if tc.ID != "" {
+		key := s.newCallKey(false, false)
+		s.idToKey[tc.ID] = key
+		return key
+	}
+
+	return s.resolveAnonymousKey(tc, ordinal)
+}
+
+// flushToolStops emits tool stops in the same stable order in which their
+// accumulators were created. Ranging over calls directly made parallel tool
+// blocks nondeterministic because Go deliberately randomizes map iteration.
+func (s *openAIStream) flushToolStops() {
+	for _, idx := range s.callOrder {
+		c, ok := s.calls[idx]
+		if !ok {
+			continue
+		}
+		if s.emittedStart[idx] {
+			s.pending = append(s.pending, StreamEvent{Type: "tool_use_stop", ToolUseID: c.ID, InputDelta: c.JSONBuf.String()})
+		}
+		delete(s.calls, idx)
+		delete(s.emittedStart, idx)
+	}
+	s.callOrder = s.callOrder[:0]
 }
 
 func (s *openAIStream) Recv() (StreamEvent, error) {
@@ -909,13 +1061,7 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 		}
 		if payload == "[DONE]" {
 			// flush any pending tool_use_stop, then enqueue message_stop.
-			for idx, c := range s.calls {
-				if s.emittedStart[idx] {
-					s.pending = append(s.pending, StreamEvent{Type: "tool_use_stop", ToolUseID: c.ID, InputDelta: c.JSONBuf.String()})
-				}
-				delete(s.calls, idx)
-				delete(s.emittedStart, idx)
-			}
+			s.flushToolStops()
 			s.pending = append(s.pending, StreamEvent{Type: "message_stop"})
 			return s.popPending()
 		}
@@ -942,20 +1088,32 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 			if str, ok := ch.Delta.Content.(string); ok && str != "" {
 				s.pending = append(s.pending, StreamEvent{Type: "text_delta", TextDelta: str})
 			}
-			for _, tc := range ch.Delta.ToolCalls {
-				idx := s.resolveToolCallIdx(tc)
-				c, ok := s.calls[idx]
+			for ordinal, tc := range ch.Delta.ToolCalls {
+				key := s.resolveToolCallKey(tc, ordinal)
+				c, ok := s.calls[key]
 				if !ok {
-					c = &oaiCallAccum{}
-					s.calls[idx] = c
+					id := tc.ID
+					synthetic := false
+					if id == "" {
+						id = syntheticToolUseID(s.toolIDPrefix, key)
+						synthetic = true
+					}
+					c = &oaiCallAccum{ID: id, SyntheticID: synthetic}
+					s.calls[key] = c
+					s.callOrder = append(s.callOrder, key)
 				}
-				if tc.ID != "" {
+				// If the provider sends the real id in a later pre-start chunk,
+				// prefer it. Once tool_use_start has been emitted the event id is
+				// immutable: changing it would make later deltas/stops impossible
+				// for consumeStream to associate with the reserved content block.
+				if tc.ID != "" && !s.emittedStart[key] {
 					c.ID = tc.ID
+					c.SyntheticID = false
 				}
 				if tc.Function.Name != "" {
 					c.Name = tc.Function.Name
-					if !s.emittedStart[idx] {
-						s.emittedStart[idx] = true
+					if !s.emittedStart[key] {
+						s.emittedStart[key] = true
 						s.pending = append(s.pending, StreamEvent{Type: "tool_use_start", ToolUseID: c.ID, ToolName: c.Name})
 					}
 				}
@@ -965,13 +1123,7 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 				}
 			}
 			if ch.FinishReason != "" {
-				for idx, c := range s.calls {
-					if s.emittedStart[idx] {
-						s.pending = append(s.pending, StreamEvent{Type: "tool_use_stop", ToolUseID: c.ID, InputDelta: c.JSONBuf.String()})
-					}
-					delete(s.calls, idx)
-					delete(s.emittedStart, idx)
-				}
+				s.flushToolStops()
 				ev := StreamEvent{Type: "message_delta", StopReason: mapOAIStop(ch.FinishReason)}
 				if env.Usage != nil {
 					ev.InputTokens = env.Usage.PromptTokens

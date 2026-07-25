@@ -42,7 +42,7 @@ In scope (we want to know):
 
 Out of scope (please don't report):
 
-- The user voluntarily setting `--mode bypass` and running unsafe commands —
+- The user voluntarily setting `--mode bypassPermissions` and running unsafe commands —
   that mode is documented as "you are on your own"
 - Issues in upstream LLM provider APIs
 - Denial of service via giant inputs (Metis is a local CLI; use ulimit)
@@ -52,7 +52,7 @@ Out of scope (please don't report):
 
 - Never pass real API keys via the `api_key = "..."` field in config.toml.
   Use `api_key_env = "ANTHROPIC_API_KEY"` and keep the secret out of the file.
-- Default to `mode = "ask"` until you've reviewed which tools you trust to
+- Default to `mode = "default"` until you've reviewed which tools you trust to
   auto-run.
 - Treat `~/.metis/` as you would treat `~/.ssh/` — same filesystem permissions,
   no checking it into a shared dotfiles repo.

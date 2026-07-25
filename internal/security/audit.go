@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -122,11 +123,12 @@ func checkAPIKeyHardcoded(cfg *config.Config, r *Report) {
 }
 
 func checkPermissionMode(cfg *config.Config, r *Report) {
-	if cfg.Permission.Mode == "bypass" {
+	mode, ok := permission.ParseMode(cfg.Permission.Mode)
+	if ok && mode == permission.ModeBypassPermissions {
 		r.Findings = append(r.Findings, Finding{
 			Severity: SeverityCritical,
 			Code:     "PERMISSION_BYPASS",
-			Message:  "permission mode = bypass; tools execute without confirmation",
+			Message:  "permission mode = bypassPermissions; tools execute without ordinary confirmation",
 			Resource: "config.toml [permission]",
 		})
 	}

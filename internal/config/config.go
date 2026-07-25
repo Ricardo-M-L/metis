@@ -650,7 +650,7 @@ func defaults() *Config {
 			Custom: map[string]ProviderRaw{},
 		},
 		Permission: Permission{
-			Mode: "ask",
+			Mode: "default",
 		},
 		UI: UI{
 			Theme:        "auto",

@@ -25,7 +25,7 @@ type PermRule struct {
 //
 //	[/permissions]
 //
-//	  Mode:  ◀  auto  ▶          (interactive — Enter to apply mode)
+//	  Mode:  ◀  default  ▶       (interactive — Enter to apply mode)
 //
 //	  Rules (3):                   (read-only — use /allow to add)
 //	    allow  Bash      session
@@ -50,11 +50,10 @@ type PermissionsScreen struct {
 // NewPermissionsScreen builds the widget. `currentMode` is the active
 // permission mode; rules is a snapshot of the gate's rules.
 func NewPermissionsScreen(currentMode string, rules []PermRule) *PermissionsScreen {
-	// Order matches keybind_permission.go::cyclePermissionMode (the
-	// Shift+Tab cycler) — kept in sync after the 2026-05-11 removal
-	// of `auto` mode.
-	modes := []string{"ask", "acceptEdits", "plan", "bypass", "deny"}
-	cur := 0 // ask default
+	// All five Claude Code external modes. dontAsk is selectable here but,
+	// matching Claude, intentionally absent from the Shift+Tab cycle.
+	modes := []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+	cur := 0 // default
 	for i, m := range modes {
 		if m == currentMode {
 			cur = i

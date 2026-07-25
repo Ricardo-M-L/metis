@@ -7,8 +7,8 @@ package builtin
 //
 //   1. Default path (no permission_mode arg) — sub-agent inherits the
 //      parent's mode via the clone.
-//   2. `permission_mode: "bypass"` arg — sub-agent's gate is in
-//      bypass even when parent is in ask.
+//   2. `permission_mode: "bypassPermissions"` arg — sub-agent's gate is in
+//      bypassPermissions even when parent is in default.
 //   3. Override doesn't leak back to the parent gate.
 
 import (
@@ -43,14 +43,14 @@ func TestAgentExecute_DefaultModeInherits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.Header.Mode != "ask" {
-		t.Errorf("Default sub-agent should inherit parent mode 'ask'; got %q", snap.Header.Mode)
+	if snap.Header.Mode != "default" {
+		t.Errorf("Default sub-agent should inherit parent mode 'default'; got %q", snap.Header.Mode)
 	}
 }
 
 // TestAgentExecute_PermissionModeOverridesChild — passing
-// permission_mode="bypass" flips ONLY the sub-agent's gate; the
-// parent stays in ask.
+// permission_mode="bypassPermissions" flips ONLY the sub-agent's gate; the
+// parent stays in default.
 func TestAgentExecute_PermissionModeOverridesChild(t *testing.T) {
 	dir := t.TempDir()
 	gate := permission.New(permission.ModeAsk)
@@ -61,7 +61,7 @@ func TestAgentExecute_PermissionModeOverridesChild(t *testing.T) {
 
 	res, err := tool.Execute(context.Background(), map[string]any{
 		"prompt":          "x",
-		"permission_mode": "bypass",
+		"permission_mode": "bypassPermissions",
 	})
 	if err != nil || res.IsError {
 		t.Fatalf("Execute: err=%v res=%+v", err, res)
@@ -71,8 +71,8 @@ func TestAgentExecute_PermissionModeOverridesChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.Header.Mode != "bypass" {
-		t.Errorf("override sub-agent mode = %q, want bypass", snap.Header.Mode)
+	if snap.Header.Mode != "bypassPermissions" {
+		t.Errorf("override sub-agent mode = %q, want bypassPermissions", snap.Header.Mode)
 	}
 	// Parent gate unchanged.
 	if gate.Mode() != permission.ModeAsk {

@@ -68,7 +68,8 @@ func (Write) Concurrency(map[string]any) tools.Concurrency { return tools.Concur
 func (Write) IsDestructive(map[string]any) bool { return true }
 
 func (w Write) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := w.gate.Check(context.Background(), "Write", strFromAny(in["path"]))
+	path := strFromAny(in["path"])
+	d, src := w.gate.CheckPath(context.Background(), "Write", path, path)
 	return mapDecision(d), src
 }
 

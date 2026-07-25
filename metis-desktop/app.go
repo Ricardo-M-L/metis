@@ -474,10 +474,16 @@ func userVisibleCLIWarning(stderr string) string {
 
 func normalizeApprovalMode(mode string) string {
 	switch strings.TrimSpace(mode) {
-	case "bypass", "ask", "plan", "deny", "acceptEdits":
+	case "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions":
 		return strings.TrimSpace(mode)
-	case "auto":
+	case "auto", "accept":
 		return "acceptEdits"
+	case "ask":
+		return "default"
+	case "bypass":
+		return "bypassPermissions"
+	case "deny":
+		return "dontAsk"
 	default:
 		return "acceptEdits"
 	}

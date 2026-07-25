@@ -80,7 +80,15 @@ func (Skill) Name() string { return "Skill" }
 func (Skill) Description() string {
 	return "Look up or invoke a named skill from any registered source (bundled, user, project, plugin, mcp)."
 }
-func (Skill) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (Skill) Concurrency(in map[string]any) tools.Concurrency {
+	if action, _ := in["action"].(string); action == "invoke" {
+		// A trusted skill may expand inline shell commands. Keep invocation
+		// serialized with other state-changing tools; list/get remain safe to
+		// fan out with ordinary read-only exploration.
+		return tools.ConcurrencyExclusive
+	}
+	return tools.ConcurrencySafe
+}
 
 func (s Skill) InputSchema() map[string]any {
 	return map[string]any{
@@ -101,7 +109,20 @@ func (s Skill) InputSchema() map[string]any {
 }
 
 func (s Skill) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	return tools.PermissionAllow, "skill lookup"
+	action, _ := in["action"].(string)
+	if action != "invoke" {
+		return tools.PermissionAllow, "skill lookup"
+	}
+	if s.gate == nil {
+		return tools.PermissionDeny, "skill invoke requires a permission gate"
+	}
+	// `invoke` is not merely a lookup: it updates usage metadata and a
+	// trusted skill may execute inline shell while expanding its prompt.
+	// Route it through the permission gate with the full structured input so
+	// input-aware read-only resolution cannot mistake it for list/get.
+	payload, _ := json.Marshal(in)
+	d, src := s.gate.Check(context.Background(), "Skill", string(payload))
+	return mapDecision(d), src
 }
 
 func (s Skill) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
@@ -120,6 +141,15 @@ func (s Skill) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	case "get":
 		return s.getSkill(name)
 	case "invoke":
+		// Execute is normally reached only after CanUse, but keep the Plan
+		// boundary here too: direct embedders and future dispatch paths must
+		// not turn a trusted skill's inline shell into a Plan-mode escape.
+		if s.gate != nil && s.gate.Mode() == permission.ModePlan {
+			return &tools.Result{
+				Output:  "Skill invoke is disabled while the parent is in plan mode; use Skill get to inspect it, then invoke after the plan is approved",
+				IsError: true,
+			}, nil
+		}
 		return s.invokeSkill(ctx, name)
 	}
 	return &tools.Result{
@@ -169,7 +199,8 @@ func (s Skill) getSkill(name string) (*tools.Result, error) {
 	// Record a view for a user-owned skill — distinct from an invoke, so the
 	// curator can tell "the agent keeps reading this for reference" from
 	// "the agent keeps running it". Keyed by filename base (see invokeSkill).
-	if s.userDir != "" && sk.LocalPath != "" && underDir(sk.LocalPath, s.userDir) {
+	if s.userDir != "" && sk.LocalPath != "" && underDir(sk.LocalPath, s.userDir) &&
+		(s.gate == nil || s.gate.Mode() != permission.ModePlan) {
 		skillsloader.NewUsageStore(s.userDir).RecordView(skillFileBase(sk.LocalPath))
 	}
 	out, _ := json.MarshalIndent(sk, "", "  ")

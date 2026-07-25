@@ -95,8 +95,8 @@ func TestParseDesktopLaunchArguments(t *testing.T) {
 
 func TestNormalizeApprovalMode(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
-		{"auto", "acceptEdits"}, {"acceptEdits", "acceptEdits"}, {"ask", "ask"},
-		{"plan", "plan"}, {"deny", "deny"}, {"bypass", "bypass"},
+		{"auto", "acceptEdits"}, {"acceptEdits", "acceptEdits"}, {"ask", "default"},
+		{"plan", "plan"}, {"deny", "dontAsk"}, {"bypass", "bypassPermissions"},
 		{"unexpected", "acceptEdits"}, {"", "acceptEdits"},
 	} {
 		if got := normalizeApprovalMode(tc.in); got != tc.want {

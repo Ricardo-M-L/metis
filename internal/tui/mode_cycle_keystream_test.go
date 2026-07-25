@@ -14,7 +14,7 @@ package tui
 // only the bubbletea runtime + pty layer (which we know are
 // unreliable under tmux) are bypassed.
 //
-// The cycle being locked: ask → acceptEdits → plan → bypass → deny → ask.
+// The cycle being locked: default → acceptEdits → plan → bypassPermissions → default.
 // This is the order from keybind_permission.go::cyclePermissionMode
 // after the 2026-05-11 ModeAuto removal — must match claude-code's
 // getNextPermissionMode.ts:39.
@@ -49,7 +49,7 @@ func pressShiftTab(t *testing.T, m *Model) {
 // modeCycleTestModel builds a minimal Model for keypress-driven
 // cycling. startTime is backdated past modeCycleStartupGrace so the
 // first Shift+Tab isn't swallowed by the "alt-screen escape burst"
-// guard; permission gate starts at the documented default ("ask").
+// guard; permission gate starts at the documented default.
 func modeCycleTestModel() *Model {
 	return &Model{
 		gate:      permission.New(permission.ModeAsk),
@@ -57,23 +57,22 @@ func modeCycleTestModel() *Model {
 	}
 }
 
-// TestModeCycle_FullKeystreamWalk — the headline E2E. Five Shift+Tab
-// presses must walk the gate through every mode and back to ask.
+// TestModeCycle_FullKeystreamWalk — the headline E2E. Four Shift+Tab
+// presses must walk Claude Code's interactive cycle back to default.
 // Locks both the order AND the wraparound. A future refactor that
 // drops a mode, reorders, or breaks the wrap will trip immediately.
 func TestModeCycle_FullKeystreamWalk(t *testing.T) {
 	m := modeCycleTestModel()
 	want := []permission.Mode{
-		permission.ModeAcceptEdits, // ask → acceptEdits
-		permission.ModePlan,        // acceptEdits → plan
-		permission.ModeBypass,      // plan → bypass
-		permission.ModeDeny,        // bypass → deny
-		permission.ModeAsk,         // deny → ask (wraparound)
+		permission.ModeAcceptEdits,       // default → acceptEdits
+		permission.ModePlan,              // acceptEdits → plan
+		permission.ModeBypassPermissions, // plan → bypassPermissions
+		permission.ModeDefault,           // bypassPermissions → default (wraparound)
 	}
 	for i, expected := range want {
 		pressShiftTab(t, m)
 		if got := m.gate.Mode(); got != expected {
-			t.Fatalf("step %d: gate.Mode() = %q, want %q (full sequence: ask → acceptEdits → plan → bypass → deny → ask)",
+			t.Fatalf("step %d: gate.Mode() = %q, want %q (full sequence: default → acceptEdits → plan → bypassPermissions → default)",
 				i+1, got, expected)
 		}
 	}
@@ -96,11 +95,10 @@ func TestModeCycle_HintsReflectEachStep(t *testing.T) {
 	walk := []step{
 		{permission.ModeAcceptEdits, "acceptEdits mode", ""},
 		{permission.ModePlan, "plan mode", ""},
-		{permission.ModeBypass, "bypass mode", ""},
-		{permission.ModeDeny, "deny mode", ""},
+		{permission.ModeBypassPermissions, "bypassPermissions mode", ""},
 		// Wraparound back to ask: badge is suppressed (only "shift+tab"
 		// hint remains — the claude-code-parity move).
-		{permission.ModeAsk, "shift+tab", "ask mode"},
+		{permission.ModeDefault, "shift+tab", "default mode"},
 	}
 	for i, s := range walk {
 		pressShiftTab(t, m)
@@ -127,12 +125,12 @@ func TestModeCycle_HintsReflectEachStep(t *testing.T) {
 // visual cue they've entered the dangerous mode.
 func TestModeCycle_BypassCarriesWarningGlyph(t *testing.T) {
 	m := modeCycleTestModel()
-	// ask → acceptEdits → plan → bypass (3 presses).
+	// default → acceptEdits → plan → bypassPermissions (3 presses).
 	for i := 0; i < 3; i++ {
 		pressShiftTab(t, m)
 	}
-	if got := m.gate.Mode(); got != permission.ModeBypass {
-		t.Fatalf("3 Shift+Tab from ask should land on bypass; got %q", got)
+	if got := m.gate.Mode(); got != permission.ModeBypassPermissions {
+		t.Fatalf("3 Shift+Tab from default should land on bypassPermissions; got %q", got)
 	}
 	out := renderHints(m)
 	if !strings.Contains(out, "⏵⏵") {
@@ -147,7 +145,7 @@ func TestModeCycle_BypassCarriesWarningGlyph(t *testing.T) {
 // would walk past the user's intended mode.
 func TestModeCycle_DebounceBlocksDoublePress(t *testing.T) {
 	m := modeCycleTestModel()
-	// First press advances: ask → acceptEdits.
+	// First press advances: default → acceptEdits.
 	msg := tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
 	updated, _ := m.Update(msg)
 	*m = *(updated.(*Model))

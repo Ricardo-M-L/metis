@@ -345,10 +345,10 @@ Plan first (cold scout), then fan out — the 4 impl agents are independent so t
   - Back-compat: if you pass ` + "`name=\"explore\"`" + ` without ` + "`subagent_type`" + `, it's still treated as ` + "`subagent_type=\"explore\"`" + `. Explicit subagent_type is preferred — name should be a label like "alice", not a role like "explore".
 
 Other knobs:
-  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a worktree (no nesting).
+  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
   - ` + "`cwd`" + ` runs the sub-agent in a specific directory (mutually exclusive with ` + "`isolation`" + `).
   - ` + "`run_in_background: true`" + ` → returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
-  - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. let an explorer run with "auto" while the parent stays "ask").
+  - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. constrain a worker to "plan" while the parent stays in "default"). A Plan parent may only inherit Plan or explicitly request "plan"; approving a plan starts a fresh implementation turn instead of upgrading an already-running child.
   - ` + "`allowed_tools`" + ` / ` + "`disallowed_tools`" + ` narrow the sub-agent's tool view; combine with the profile's filters as INTERSECTION (allow) + UNION (deny).`
 }
 func (Agent) InputSchema() map[string]any {
@@ -375,7 +375,7 @@ func (Agent) InputSchema() map[string]any {
 			"isolation": map[string]any{
 				"type":        "string",
 				"enum":        []string{"worktree"},
-				"description": "Spawn this sub-agent in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). Mutually exclusive with `cwd`. Refuses when parent is already inside a worktree (no nesting).",
+				"description": "Spawn this sub-agent in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). Mutually exclusive with `cwd`. Refuses when parent is already inside a worktree (no nesting) or when the parent is in Plan mode (worktree setup changes git metadata).",
 			},
 			"cwd": map[string]any{
 				"type":        "string",
@@ -395,8 +395,8 @@ func (Agent) InputSchema() map[string]any {
 			},
 			"permission_mode": map[string]any{
 				"type":        "string",
-				"enum":        []string{"ask", "auto", "bypass", "plan", "deny"},
-				"description": "Override the permission mode for this sub-agent's gate. The parent's gate is unchanged; the sub-agent gets a clone with its own mode + a fresh denial-streak counter. Useful for letting an explore-agent run with `auto` while the parent stays in `ask`. Omit to inherit the parent's current mode.",
+				"enum":        []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"},
+				"description": "Override the permission mode for this sub-agent's gate using a Claude Code public mode. The parent's gate is unchanged; the sub-agent gets a clone with its own mode + a fresh denial-streak counter. Omit to inherit the parent's current mode. While the parent is in Plan, this must be omitted or set to `plan`; an existing Plan child is never upgraded after plan approval.",
 			},
 			"allowed_tools": map[string]any{
 				"type":        "array",
@@ -428,18 +428,31 @@ func (Agent) Concurrency(in map[string]any) tools.Concurrency {
 	return tools.ConcurrencyExclusive
 }
 
-func (a Agent) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := a.gate.Check(context.Background(), "Agent", strFromAny(in["prompt"]))
+func (a Agent) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	parentWasPlan := a.gate != nil && a.gate.Mode() == permission.ModePlan
+	if err := validatePlanAgentInput(parentWasPlan, in); err != nil {
+		return tools.PermissionDeny, err.Error()
+	}
+	if a.gate == nil {
+		return tools.PermissionDeny, "Agent tool has no permission gate"
+	}
+	d, src := a.gate.Check(ctx, "Agent", marshalAgentToolInput(in))
 	return mapDecision(d), src
 }
 
 func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	// Capture the parent's posture at the actual execution boundary. CanUse
+	// runs after PreToolUse hooks, but the UI can still change modes before a
+	// queued/background call reaches Execute. A call that starts in Plan must
+	// stay Plan-scoped for its entire child lifetime even if the parent later
+	// leaves Plan.
+	parentWasPlan := a.gate != nil && a.gate.Mode() == permission.ModePlan
 	prompt, _ := in["prompt"].(string)
 	if strings.TrimSpace(prompt) == "" {
 		return nil, errors.New("prompt is required")
 	}
-	if a.provider == nil || a.registry == nil {
-		return nil, errors.New("Agent tool not fully wired (missing provider/registry)")
+	if a.provider == nil || a.registry == nil || a.gate == nil {
+		return nil, errors.New("Agent tool not fully wired (missing provider/registry/gate)")
 	}
 	depth, _ := ctx.Value(agentDepthKey{}).(int)
 	if cap := a.effectiveMaxDepth(); depth >= cap {
@@ -447,6 +460,13 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			Output:  fmt.Sprintf("agent nesting limit (%d) exceeded — raise [agents].max_agent_depth in ~/.metis/config.toml if this is legitimate", cap),
 			IsError: true,
 		}, nil
+	}
+	if err := validatePlanAgentInput(parentWasPlan, in); err != nil {
+		return &tools.Result{Output: err.Error(), IsError: true}, nil
+	}
+	requestedMode, hasRequestedMode, err := requestedAgentPermissionMode(in)
+	if err != nil {
+		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 
 	// G.2 — resolve per-invocation isolation/cwd BEFORE registering
@@ -682,8 +702,13 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// classifier — the snapshot is mode + rules at spawn time.
 	// Profile-driven mode comes via the schema field `permission_mode`.
 	subGate := a.gate.Clone()
-	if pm, _ := in["permission_mode"].(string); pm != "" {
-		subGate.SetMode(permission.Mode(pm))
+	if parentWasPlan {
+		// A Plan child is immutable for its full lifetime. In particular, a
+		// background child must not gain write access when the parent approves
+		// the plan and changes its own gate to acceptEdits/default/bypass.
+		subGate.SetMode(permission.ModePlan)
+	} else if hasRequestedMode {
+		subGate.SetMode(requestedMode)
 	}
 
 	// G.14 (2026-05-12) — per-invocation tool filter. The schema
@@ -706,13 +731,30 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		allowedTools = intersectAllow(profile.Tools, allowedTools)
 		disallowedTools = unionStrings(profile.DisallowedTools, disallowedTools)
 	}
-	subRegistry := a.registry
+	filteredRegistry := a.registry
 	if len(allowedTools) > 0 || len(disallowedTools) > 0 {
-		subRegistry = filterRegistry(a.registry, allowedTools, disallowedTools)
+		filteredRegistry = filterRegistry(a.registry, allowedTools, disallowedTools)
+	}
+	planLocked := subGate.Mode() == permission.ModePlan
+	// Always build a distinct, child-gated registry. Merely cloning Gate is
+	// insufficient because the concrete tools in a.registry still capture the
+	// parent's Gate pointer. The outer wrapper freezes the child policy; Plan
+	// children additionally lose permission-control, nested-agent, and Skill
+	// invocation surfaces entirely.
+	subRegistry := agentChildRegistry(filteredRegistry, subGate, planLocked)
+	if planLocked {
+		subSystem += "\n\n<plan_subagent_boundary>\nYou are a read-only planning and investigation sub-agent. Inspect with the available read-only tools, then return your findings or proposed plan directly to the parent. Do not implement changes and do not attempt to call EnterPlanMode or ExitPlanMode; only the parent can request plan approval and begin a fresh implementation turn.\n</plan_subagent_boundary>"
 	}
 
 	sub := agent.NewLoop(a.provider, subRegistry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
+	// Agent is allowed as read-only delegation during plan mode. Keep the
+	// child loop's live PlanMode in sync with its cloned gate so NewLoop's
+	// fallback Plan prompt is attached and mutating child calls are returned as
+	// denied results instead of the child repeatedly attempting them.
+	if subGate != nil && subGate.Mode() == permission.ModePlan {
+		sub.SetPlanMode(true)
+	}
 	// Shared USD budget: the child adds usage to the parent's tracker,
 	// so --max-budget-usd caps the whole agent tree, not just the root.
 	sub.Budget = agent.BudgetFromContext(ctx)

@@ -21,6 +21,36 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
+// Byte-for-byte fixture of the startup-only Plan section persisted by Metis
+// <=0.2.8. Keep this local to the integration test: runtime owns the migration
+// constant, while the TUI test should exercise the public cleanup path exactly
+// as an old on-disk Header.System supplies it.
+const legacyPlanOverlayFixture = "# Plan mode — read-only exploration only\n\n" +
+	"You are in plan mode. The permission gate will deny every tool that\n" +
+	"mutates state: Edit, Write, NotebookEdit, Bash (any non-read-only\n" +
+	"command), MessageTeammate to send PRs, etc. Don't try to call them;\n" +
+	"the user will see the denial and you'll have to retry. Allowed tools:\n" +
+	"Read, LS, Glob, Grep, WebFetch, and any sub-agent (Agent / Fork) you\n" +
+	"spawn in read-only mode.\n\n" +
+	"Workflow for plan mode:\n\n" +
+	"  1. Explore. Use Read, Grep, Glob freely to understand the codebase.\n" +
+	"     Spawn Agent sub-agents for deep dives that would otherwise burn\n" +
+	"     your main context.\n" +
+	"  2. Synthesize. Decide what would need to change, in what order,\n" +
+	"     with what trade-offs.\n" +
+	"  3. Produce a plan. Write it out as the final assistant message:\n" +
+	"     a numbered list of concrete steps, the files each step touches,\n" +
+	"     and the risks / open questions. Use TodoWrite to track the plan\n" +
+	"     items so the user sees the checklist in the UI.\n" +
+	"  4. STOP and wait. Do NOT start implementing. The user reviews the\n" +
+	"     plan, then exits plan mode (`/auto` or `/bypass`) when ready —\n" +
+	"     that's the signal to execute. If you implement now, you'll just\n" +
+	"     hit denials.\n\n" +
+	"Keep the plan compact. Bullet points, not essays. Skip \"next steps\"\n" +
+	"and \"future improvements\" sections unless the user asked. The plan\n" +
+	"should be a thing the user can scan in 30 seconds and the next-turn\n" +
+	"you can execute step-by-step without rereading."
+
 func newSessionSwitchModel(t *testing.T, mode permission.Mode) (*Model, *session.Store) {
 	t.Helper()
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
@@ -117,6 +147,56 @@ func TestActivateSessionRebindsAllSessionScopedState(t *testing.T) {
 	sourceTiming, err := store.ReadTiming("source")
 	if err != nil || len(sourceTiming) != 0 {
 		t.Fatalf("source timing received destination event: %+v, err=%v", sourceTiming, err)
+	}
+}
+
+func TestActivateSessionRemovesAndPersistsLegacyPlanOverlay(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	const id = "legacy-plan-resume"
+	legacySystem := "base instructions\n\n" + legacyPlanOverlayFixture + "\n\n<env>live</env>"
+	hdr := session.Header{ID: id, Model: "test-model", System: legacySystem, Mode: "default"}
+	if err := store.WriteHeaderFull(hdr); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.activateSession(id, &hdr, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	want := "base instructions\n\n<env>live</env>"
+	if m.loop.System != want {
+		t.Fatalf("live resumed system = %q, want %q", m.loop.System, want)
+	}
+	persisted, _, err := store.LoadHeader(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.System != want {
+		t.Fatalf("persisted resumed system = %q, want %q", persisted.System, want)
+	}
+}
+
+func TestForkSessionDoesNotInheritLegacyPlanOverlay(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	const parent = "legacy-plan-parent"
+	legacySystem := "parent base\n\n" + legacyPlanOverlayFixture + "\n\n<env>parent</env>"
+	if err := store.WriteHeaderFull(session.Header{ID: parent, Model: "test-model", System: legacySystem}); err != nil {
+		t.Fatal(err)
+	}
+
+	id, hdr, err := m.forkSession(parent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "parent base\n\n<env>parent</env>"
+	if hdr.System != want {
+		t.Fatalf("fork header system = %q, want %q", hdr.System, want)
+	}
+	persisted, _, err := store.LoadHeader(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.System != want {
+		t.Fatalf("persisted fork system = %q, want %q", persisted.System, want)
 	}
 }
 
@@ -329,8 +409,8 @@ func TestFreshAndForkStartNewPermissionLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load fresh: %v", err)
 	}
-	if loadedFresh.Mode != "ask" || loadedFresh.System != "base-system" {
-		t.Errorf("fresh header = %+v, want ask + invocation system", loadedFresh)
+	if loadedFresh.Mode != "default" || loadedFresh.System != "base-system" {
+		t.Errorf("fresh header = %+v, want default + invocation system", loadedFresh)
 	}
 
 	parent := "parent"
@@ -356,7 +436,7 @@ func TestFreshAndForkStartNewPermissionLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load fork: %v", err)
 	}
-	if loadedFork.Mode != "ask" || len(loadedFork.AlwaysAllow) != 0 || loadedFork.ForkedFrom == nil || loadedFork.ForkedFrom.SessionID != parent {
+	if loadedFork.Mode != "default" || len(loadedFork.AlwaysAllow) != 0 || loadedFork.ForkedFrom == nil || loadedFork.ForkedFrom.SessionID != parent {
 		t.Errorf("fork header = %+v", loadedFork)
 	}
 }

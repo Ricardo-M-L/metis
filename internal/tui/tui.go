@@ -113,6 +113,12 @@ type ToolEvent struct {
 	SubAgentParentID string
 }
 
+type toolArgsStreamState struct {
+	data     []byte
+	toolName string
+	seq      uint64
+}
+
 type permChoice struct {
 	Label string
 	Key   string
@@ -195,6 +201,14 @@ type Model struct {
 
 	messages   []Message
 	toolEvents []ToolEvent
+	// turnToolEventStart is the first toolEvents index owned by the current
+	// top-level UI turn. Historical tool rows stay mounted for the lifetime of
+	// the session, but recap/learning summaries must only inspect this suffix.
+	turnToolEventStart int
+	// historyCursor tracks the durable prefix of loop.History(). Unlike the
+	// old "walk back to the last user text" heuristic it preserves assistant
+	// tool_use + user tool_result messages that precede a mid-turn steer.
+	historyCursor session.HistoryCursor
 	// thinkingText accumulates extended-thinking deltas for the
 	// in-flight turn. Rendered live above the streaming reply with
 	// dim/italic styling; flushed into a "thinking" Message when the
@@ -290,11 +304,12 @@ type Model struct {
 	histDirectIdx   int
 	histDirectDraft string
 
-	// Streaming tool args buffer (T12). Each EventToolArgsDelta
-	// appends here; previewStreamingArgs() shapes it into a spinner
-	// subline. Reset on every EventToolResult so consecutive tools
-	// don't bleed into each other. Capped at 4KB to bound memory.
-	toolArgsStream []byte
+	// Streaming tool args buffers (T12), keyed by ToolUseID. Providers may
+	// interleave deltas for several parallel calls; a single global byte slice
+	// mixed their JSON and one result incorrectly erased every preview. The
+	// empty key retains compatibility with legacy producers that omit IDs.
+	toolArgsStreams map[string]toolArgsStreamState
+	toolArgsSeq     uint64
 
 	// @-mention dropdown state. Tracked separately from the slash
 	// palette so an in-progress `@xxx` filter doesn't fight the slash
@@ -747,9 +762,10 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 			{Label: "No", Key: "n"},
 			{Label: "Cancel turn", Key: "c"},
 		},
-		histDirectIdx:  -1, // not navigating yet — first ↑ jumps to histAll[0]
-		toolArgsStream: make([]byte, 0, 256),
+		histDirectIdx:   -1, // not navigating yet — first ↑ jumps to histAll[0]
+		toolArgsStreams: make(map[string]toolArgsStreamState),
 	}
+	mdl.historyCursor = session.NewHistoryCursor(loop.History())
 	// Hydrate sessionTitle from the on-disk header so a resumed session
 	// (e.g. metis --resume <id> where the previous run had run /rename
 	// "foo") shows "foo" in the terminal tab on first frame, not just

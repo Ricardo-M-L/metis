@@ -57,11 +57,11 @@ func TestBuiltinProfile_FrontmatterIsParsed(t *testing.T) {
 		wantTools         []string
 		wantPermissionMod string
 	}{
-		{"explore", []string{"Read", "Grep", "Glob", "LS", "WebFetch"}, "bypass"},
-		{"plan", []string{"Read", "Grep", "Glob", "LS", "WebFetch"}, "bypass"},
-		{"verify", []string{"Read", "Bash", "Grep", "Glob", "LS"}, "bypass"},
-		{"go-reviewer", []string{"Read", "Grep", "Glob", "LS", "Bash"}, "bypass"},
-		{"mcp-debugger", []string{"Read", "Grep", "Glob", "LS", "Bash", "MetisInfo"}, "bypass"},
+		{"explore", []string{"Read", "Grep", "Glob", "LS", "WebFetch"}, "bypassPermissions"},
+		{"plan", []string{"Read", "Grep", "Glob", "LS", "WebFetch"}, "bypassPermissions"},
+		{"verify", []string{"Read", "Bash", "Grep", "Glob", "LS"}, "bypassPermissions"},
+		{"go-reviewer", []string{"Read", "Grep", "Glob", "LS", "Bash"}, "bypassPermissions"},
+		{"mcp-debugger", []string{"Read", "Grep", "Glob", "LS", "Bash", "MetisInfo"}, "bypassPermissions"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

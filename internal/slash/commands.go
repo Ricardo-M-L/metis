@@ -44,8 +44,10 @@ const (
 	SignalCompact
 	SignalReload
 	SignalPlan
-	SignalBypass
-	SignalAuto
+	SignalAcceptEdits
+	SignalBypassPermissions
+	SignalDefault
+	SignalDontAsk
 	SignalNew
 	SignalRetry
 	SignalUndo
@@ -384,14 +386,20 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	}})
 
 	// Mode commands
-	r.Register(Cmd{Name: "plan", Aliases: []string{"p"}, Description: "switch to plan mode (show plan before executing)", Handler: func(_ string) (string, Signal) {
-		return "(plan mode: on — /auto to exit)", SignalPlan
+	r.Register(Cmd{Name: "plan", Aliases: []string{"p"}, Description: "switch to plan mode (read-only exploration, then approval)", Handler: func(_ string) (string, Signal) {
+		return "(mode: plan)", SignalPlan
 	}})
-	r.Register(Cmd{Name: "auto", Aliases: []string{"a"}, Description: "auto mode (read-only tools auto-allow)", Handler: func(_ string) (string, Signal) {
-		return "(mode: auto)", SignalAuto
+	r.Register(Cmd{Name: "acceptEdits", Description: "accept file edits without prompting; ask for other state changes", Handler: func(_ string) (string, Signal) {
+		return "(mode: acceptEdits)", SignalAcceptEdits
 	}})
-	r.Register(Cmd{Name: "bypass", Aliases: []string{"yolo"}, Description: "bypass mode (no permission prompts)", Handler: func(_ string) (string, Signal) {
-		return "(mode: bypass — WARNING: approves all)", SignalBypass
+	r.Register(Cmd{Name: "default", Aliases: []string{"ask"}, Description: "default mode (ask before state changes)", Handler: func(_ string) (string, Signal) {
+		return "(mode: default)", SignalDefault
+	}})
+	r.Register(Cmd{Name: "bypassPermissions", Aliases: []string{"bypass", "yolo"}, Description: "bypass permissions (dangerous; no approval prompts)", Handler: func(_ string) (string, Signal) {
+		return "(mode: bypassPermissions — WARNING: approves tools)", SignalBypassPermissions
+	}})
+	r.Register(Cmd{Name: "dontAsk", Aliases: []string{"deny"}, Description: "deny actions that would otherwise prompt", Handler: func(_ string) (string, Signal) {
+		return "(mode: dontAsk)", SignalDontAsk
 	}})
 	r.Register(Cmd{Name: "compact", Description: "force context compaction", Handler: func(_ string) (string, Signal) {
 		return "(compaction triggered)", SignalCompact

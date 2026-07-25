@@ -33,9 +33,10 @@ type (
 )
 
 type Entry struct {
-	Type    string       `json:"type"` // "header" | "message"
-	Header  *Header      `json:"header,omitempty"`
-	Message *llm.Message `json:"message,omitempty"`
+	Type     string        `json:"type"` // "header" | "message" | "history_replace"
+	Header   *Header       `json:"header,omitempty"`
+	Message  *llm.Message  `json:"message,omitempty"`
+	Messages []llm.Message `json:"messages,omitempty"`
 }
 
 type Store struct {
@@ -77,6 +78,31 @@ func (s *Store) WriteHeaderFull(h Header) error {
 
 func (s *Store) AppendMessage(id string, m llm.Message) error {
 	return s.append(id, Entry{Type: "message", Message: &m})
+}
+
+// ReplaceHistoryAndMark appends a full-history snapshot to the session log.
+// Load treats this entry as a replacement for every earlier message entry,
+// while later message entries continue to append normally. Keeping the JSONL
+// append-only preserves atomic line writes and concurrent-reader behaviour,
+// but makes destructive in-memory operations (/clear, /undo, /rewind and
+// compaction) durable instead of allowing old messages to reappear on resume.
+//
+// The cursor advances only after the snapshot line reaches disk. A failed
+// write therefore remains retryable: the next AppendHistoryTail still sees
+// the old anchor and emits the replacement again.
+func (s *Store) ReplaceHistoryAndMark(id string, history []llm.Message, cursor *HistoryCursor) error {
+	if cursor == nil {
+		return errors.New("replace history: nil cursor")
+	}
+	if s == nil || id == "" {
+		cursor.Mark(history)
+		return nil
+	}
+	if err := s.append(id, Entry{Type: "history_replace", Messages: history}); err != nil {
+		return fmt.Errorf("replace history: %w", err)
+	}
+	cursor.Mark(history)
+	return nil
 }
 
 func (s *Store) append(id string, e Entry) error {
@@ -156,6 +182,10 @@ func (s *Store) Load(id string) (*Header, []llm.Message, error) {
 			if e.Message != nil {
 				msgs = append(msgs, *e.Message)
 			}
+		case "history_replace":
+			// A nil/omitted messages field is a valid empty snapshot and is
+			// how /clear invalidates every earlier message in the JSONL.
+			msgs = append([]llm.Message(nil), e.Messages...)
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -414,7 +444,14 @@ func (s *Store) Import(r io.Reader, preferredID string) (string, error) {
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
 			return "", fmt.Errorf("import: line decode: %w", err)
 		}
-		if e.Type != "message" || e.Message == nil {
+		switch e.Type {
+		case "message":
+			if e.Message == nil {
+				return "", errors.New("import: message entry missing message")
+			}
+		case "history_replace":
+			// Empty messages is a valid clear snapshot.
+		default:
 			return "", fmt.Errorf("import: unexpected entry type %q after header", e.Type)
 		}
 		if err := s.append(newID, e); err != nil {

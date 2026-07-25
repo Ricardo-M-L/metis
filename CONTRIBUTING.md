@@ -33,7 +33,7 @@ internal/runtime/mcp/      MCP registry + cache + prompts collector
 internal/tui/              bubbletea chat surface (~83 files, single Model)
 internal/tui/screen/       full-screen overlays (help/history/…)
 internal/slash/            slash-command registry + handlers
-internal/permission/       5-mode cascading gate (allow/deny/ask/auto/bypass)
+internal/permission/       5-mode cascading gate (default/acceptEdits/plan/dontAsk/bypassPermissions)
 internal/exitcode/         typed errors → shell exit codes
 internal/jobs/             background process pool for the Bash family
 internal/channels/         9 chat-platform adapters (Slack/DingTalk/…)

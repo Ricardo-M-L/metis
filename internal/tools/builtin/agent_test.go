@@ -60,6 +60,13 @@ func TestAgentTool_RequiresPrompt(t *testing.T) {
 	}
 }
 
+func TestAgentTool_IsReadOnlyDelegationBoundary(t *testing.T) {
+	tool := NewAgent(permission.New(permission.ModePlan), helloProvider(), tools.NewRegistry(), "model", "system")
+	if !tool.IsReadOnly(map[string]any{"prompt": "inspect the repository"}) {
+		t.Fatal("Agent must be read-only at the parent boundary; child tool calls enforce their own permissions")
+	}
+}
+
 func TestAgentTool_ReturnsSubAgentText(t *testing.T) {
 	gate := permission.New(permission.ModeBypass)
 	reg := tools.NewRegistry()
@@ -109,6 +116,27 @@ func TestAgentTool_Schema(t *testing.T) {
 	required, _ := schema["required"].([]string)
 	if len(required) != 1 || required[0] != "prompt" {
 		t.Errorf("required = %v, want [prompt]", required)
+	}
+	props, _ := schema["properties"].(map[string]any)
+	modeSchema, _ := props["permission_mode"].(map[string]any)
+	gotModes, _ := modeSchema["enum"].([]string)
+	wantModes := []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+	if strings.Join(gotModes, ",") != strings.Join(wantModes, ",") {
+		t.Errorf("permission_mode enum = %v, want %v", gotModes, wantModes)
+	}
+}
+
+func TestAgentTool_RejectsUnknownPermissionMode(t *testing.T) {
+	tool := NewAgent(permission.New(permission.ModeDefault), helloProvider(), tools.NewRegistry(), "model", "system")
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"prompt":          "inspect",
+		"permission_mode": "auto",
+	})
+	if err != nil {
+		t.Fatalf("Execute returned Go error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(res.Output, "unknown permission_mode") {
+		t.Fatalf("removed permission_mode should be rejected: %+v", res)
 	}
 }
 

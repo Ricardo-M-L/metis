@@ -15,9 +15,13 @@ func TestAllowedDirs_AddRoundTrip(t *testing.T) {
 	if err := d.Add(tmp, true); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
+	want, err := normalizeDir(tmp)
+	if err != nil {
+		t.Fatalf("normalize temp dir: %v", err)
+	}
 	got := d.All()
-	if len(got) != 1 || got[0] != tmp {
-		t.Errorf("All() = %v, want [%q]", got, tmp)
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("All() = %v, want [%q]", got, want)
 	}
 
 	// Re-add same path is idempotent.
@@ -40,9 +44,13 @@ func TestAllowedDirs_PersistAcrossNew(t *testing.T) {
 	}
 
 	d2 := NewAllowedDirs(nil)
+	want, err := normalizeDir(tmp)
+	if err != nil {
+		t.Fatalf("normalize temp dir: %v", err)
+	}
 	got := d2.All()
-	if len(got) != 1 || got[0] != tmp {
-		t.Errorf("after reload All() = %v, want [%q]", got, tmp)
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("after reload All() = %v, want [%q]", got, want)
 	}
 }
 
@@ -84,5 +92,96 @@ func TestAllowedDirs_RemoveErrorsOnMissing(t *testing.T) {
 	d := NewAllowedDirs(nil)
 	if err := d.Remove("/tmp"); err == nil {
 		t.Errorf("Remove of unknown dir should error")
+	}
+}
+
+func TestAllowedDirs_ContainsLaunchCWDAndAdditionalRoots(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	root := t.TempDir()
+	extra := t.TempDir()
+	d := newAllowedDirs(root, nil)
+
+	canonicalRoot, err := normalizeDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.Scope(); len(got) != 1 || got[0] != canonicalRoot {
+		t.Fatalf("initial Scope() = %v, want cwd %q", got, canonicalRoot)
+	}
+	if !d.Contains(filepath.Join(root, "new", "file.go")) {
+		t.Fatal("new file below launch cwd should be in scope")
+	}
+	if !d.Contains(filepath.Join("relative", "file.go")) {
+		t.Fatal("relative path should resolve below launch cwd")
+	}
+	if d.Contains(filepath.Dir(root)) {
+		t.Fatal("cwd parent must not be in scope")
+	}
+
+	if err := d.Add(extra, false); err != nil {
+		t.Fatal(err)
+	}
+	if !d.Contains(filepath.Join(extra, "new.txt")) {
+		t.Fatal("file below --add-dir root should be in scope")
+	}
+	if err := d.Remove(extra); err != nil {
+		t.Fatal(err)
+	}
+	if d.Contains(filepath.Join(extra, "new.txt")) {
+		t.Fatal("removed additional root must leave scope immediately")
+	}
+}
+
+func TestAllowedDirs_ContainsRejectsDotDotAndPrefixSibling(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	parent := t.TempDir()
+	root := filepath.Join(parent, "repo")
+	sibling := filepath.Join(parent, "repo-secret")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d := newAllowedDirs(root, nil)
+
+	if d.Contains(filepath.Join(root, "..", "repo-secret", "key")) {
+		t.Fatal(".. traversal escaped cwd scope")
+	}
+	if d.Contains(filepath.Join(sibling, "key")) {
+		t.Fatal("component-prefix sibling was treated as a child")
+	}
+}
+
+func TestAllowedDirs_ContainsResolvesExistingAndDanglingSymlinks(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	root := t.TempDir()
+	outside := t.TempDir()
+	inside := filepath.Join(root, "inside")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "outside-link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(inside, filepath.Join(root, "inside-link")); err != nil {
+		t.Fatal(err)
+	}
+	// The target file deliberately does not exist. EvalSymlinks alone would
+	// fail and a lexical-prefix fallback would incorrectly allow this Write.
+	danglingTarget := filepath.Join(outside, "not-created-yet.txt")
+	if err := os.Symlink(danglingTarget, filepath.Join(root, "dangling-link")); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newAllowedDirs(root, nil)
+	if d.Contains(filepath.Join(root, "outside-link", "secret")) {
+		t.Fatal("existing symlink escaped cwd scope")
+	}
+	if d.Contains(filepath.Join(root, "dangling-link")) {
+		t.Fatal("dangling symlink to an outside write target escaped cwd scope")
+	}
+	if !d.Contains(filepath.Join(root, "inside-link", "new.txt")) {
+		t.Fatal("symlink resolving back inside cwd should remain in scope")
 	}
 }

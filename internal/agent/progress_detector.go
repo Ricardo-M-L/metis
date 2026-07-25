@@ -17,10 +17,10 @@ package agent
 //
 // The detector only fires AFTER the 75% iter nudge has already
 // gone out — before that we trust the model to find its rhythm.
-// Three consecutive low-progress iters past 75% → abort with
-// an informative event so the user knows WHY metis stopped
-// short of the cap (vs the cap being reached or LoopDetector
-// firing on identical-signature repeats).
+// Three consecutive low-progress iters past 75% → inject one focused
+// recovery reminder. This detector must never hard-stop inside a tool
+// batch: doing so would discard completed results and suppress the final
+// assistant response. MaxIters remains the bounded terminal backstop.
 
 import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -39,8 +39,7 @@ import (
 const progressLowBytesThreshold = 256
 
 // progressMaxLowIters is the number of consecutive low-progress
-// iters that triggers abort. 3 matches claude-code's continuation
-// count (tokenBudget.ts:60).
+// iters that triggers the one-shot recovery advisory.
 const progressMaxLowIters = 3
 
 // progressDetector tracks recent iter productivity. Lives next
@@ -143,8 +142,7 @@ func (p *progressDetector) Reset() {
 }
 
 // ConsecutiveLow returns the current streak length. Used by
-// the abort EventInfo message so the user sees the actual count
-// instead of just "diminishing returns".
+// the recovery EventInfo message and detector tests.
 func (p *progressDetector) ConsecutiveLow() int {
 	return p.consecutiveLowIters
 }

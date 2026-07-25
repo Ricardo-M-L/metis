@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+func TestParseMode_CanonicalAndLegacyAliases(t *testing.T) {
+	t.Parallel()
+	cases := map[string]Mode{
+		"default":           ModeDefault,
+		"acceptEdits":       ModeAcceptEdits,
+		"bypassPermissions": ModeBypassPermissions,
+		"plan":              ModePlan,
+		"dontAsk":           ModeDontAsk,
+		"ask":               ModeDefault,
+		"bypass":            ModeBypassPermissions,
+		"deny":              ModeDontAsk,
+	}
+	for raw, want := range cases {
+		raw, want := raw, want
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+			got, ok := ParseMode(raw)
+			if !ok || got != want {
+				t.Fatalf("ParseMode(%q) = %q, %v; want %q, true", raw, got, ok, want)
+			}
+		})
+	}
+	if got, ok := ParseMode("auto"); ok || got != "" {
+		t.Fatalf("removed mode auto must be rejected, got %q, %v", got, ok)
+	}
+}
+
 func TestGate_DefaultModeAsks(t *testing.T) {
 	g := New(ModeAsk)
 	d, _ := g.Check(context.Background(), "Bash", "rm -rf /tmp/foo")
@@ -21,11 +48,13 @@ func TestGate_BypassAllowsEverything(t *testing.T) {
 	}
 }
 
-func TestGate_DenyDeniesEverything(t *testing.T) {
-	g := New(ModeDeny)
-	d, _ := g.Check(context.Background(), "Read", "/etc/passwd")
-	if d != DecisionDeny {
-		t.Errorf("deny → want deny, got %v", d)
+func TestGate_DontAskAllowsReadsAndDeniesPrompts(t *testing.T) {
+	g := New(ModeDontAsk)
+	if d, _ := g.Check(context.Background(), "Read", "/etc/passwd"); d != DecisionAllow {
+		t.Errorf("dontAsk should preserve implicit read allow, got %v", d)
+	}
+	if d, _ := g.Check(context.Background(), "Bash", "make test"); d != DecisionDeny {
+		t.Errorf("dontAsk should turn a would-be prompt into deny, got %v", d)
 	}
 }
 

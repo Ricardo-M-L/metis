@@ -658,7 +658,7 @@ func modeIcon(mode string) (glyph string, c color.Color) {
 	switch mode {
 	case "acceptEdits":
 		return "⏵⏵", lipgloss.Color("#64b5f6") // claude-code's autoAccept (PermissionMode.ts:62)
-	case "bypass":
+	case "bypassPermissions":
 		// claude-code's bypassPermissions uses ⏵⏵ in the `error` color
 		// family (PermissionMode.ts:69) — same glyph as acceptEdits but
 		// red to telegraph "this one is dangerous". Matches the source
@@ -666,9 +666,11 @@ func modeIcon(mode string) (glyph string, c color.Color) {
 		return "⏵⏵", lipgloss.Color("#e57373")
 	case "plan":
 		return "⏸ ", lipgloss.Color("#81c784")
-	case "deny":
-		return "⏹ ", lipgloss.Color("#e57373")
-	case "ask":
+	case "dontAsk":
+		// Claude Code renders dontAsk with the same double-chevron/error
+		// treatment as bypassPermissions (PermissionMode.ts:73-78).
+		return "⏵⏵", lipgloss.Color("#e57373")
+	case "default":
 		// Match claude-code's `default` mode (PermissionMode.ts:48):
 		// symbol = '' (empty). The most conservative mode renders
 		// without a badge so its presence doesn't visually compete with
@@ -680,7 +682,7 @@ func modeIcon(mode string) (glyph string, c color.Color) {
 
 // renderHints draws the bottom-of-screen mode indicator.
 //
-// For `ask` mode (default) we omit the bold "ask mode" badge entirely
+// For `default` mode we omit the bold mode badge entirely
 // and show only a dim "shift+tab to cycle" hint — matches claude-code's
 // PermissionMode.ts:45-51 where `default` carries an empty symbol so
 // the most conservative state renders without visual emphasis.
@@ -696,7 +698,7 @@ func renderHints(m *Model) string {
 	var s strings.Builder
 	s.WriteString("  ")
 	if glyph == "" {
-		// `ask` mode — quiet. Just the discovery hint so the user
+		// `default` mode — quiet. Just the discovery hint so the user
 		// knows Shift+Tab is available, no badge.
 		s.WriteString(styleMuted.Render("shift+tab to cycle modes"))
 	} else {

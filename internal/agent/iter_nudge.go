@@ -16,10 +16,9 @@ package agent
 // model was doing useful work right up to iter 50; metis killed it
 // silently. claude-code's nudge wording is "Stopped at N% of token
 // target. Keep working — do not summarize." — they want the model
-// to continue. We want the OPPOSITE shape: as iters climb, push
-// the model toward closure ("wrap up open threads; don't start new
-// explorations") so it spends its last few iters writing the
-// answer, not opening another rabbit hole.
+// to continue. Metis similarly narrows scope as the cap approaches:
+// finish and verify the active change, avoid new exploration, and only
+// report incomplete when a concrete blocker remains.
 
 import "fmt"
 
@@ -42,21 +41,16 @@ var iterNudges = []iterNudgeThreshold{
 	{
 		pct: 0.75,
 		body: "You're at 75% of your iteration budget. " +
-			"Wrap up what you have. Don't start new explorations; " +
-			"write up the answer based on what you already know.",
+			"Narrow the scope, complete the change already in progress, and verify it. " +
+			"Do not abandon unfinished work merely because this warning appeared. " +
+			"Only report incomplete if there is a concrete blocker.",
 	},
 	{
 		pct: 0.9,
-		body: "You're at 90% of your iteration budget. Pick the single most " +
-			"important remaining task and finish it now. Then write " +
-			"the final answer for the user — even a one-line summary " +
-			"is better than running out of budget mid-investigation.\n\n" +
-			"If substantial work still remains, your better option is to " +
-			"dispatch it: `Agent({subagent_type: \"plan\", prompt: \"<the " +
-			"remaining work in one paragraph>\"})` returns a fresh iter " +
-			"budget AND a stepped plan you can hand to implementer agents. " +
-			"Single-threading the last 10% guarantees the failure mode " +
-			"where you stop mid-task with nothing checked in — fan out instead.",
+		body: "You're at 90% of your iteration budget. Finish the single critical " +
+			"open task and run its verification; do not open new scope. If it cannot " +
+			"be completed safely, give the user an honest incomplete status with the " +
+			"exact remaining step instead of claiming success.",
 	},
 }
 
@@ -126,4 +120,15 @@ new tool calls — that just burns the rescue iteration with no
 chance to deliver a result. If you genuinely have nothing useful
 to report, say "couldn't complete in budget — here's where I got
 stuck: ..." and stop.
+</system-reminder>`
+
+// diminishingReturnsRescueMessage is folded into the same user message as
+// the completed tool results, preserving provider adjacency and making the
+// next model call focus on the concrete blocker instead of silently ending.
+const diminishingReturnsRescueMessage = `<system-reminder>
+Recent tool calls produced little new output. Do not stop just because of
+the iteration warning. Stay on the current task: resolve the active failure,
+finish the smallest remaining change, and run the relevant verification.
+Do not start a new investigation. If a real blocker prevents completion,
+state that blocker and the exact unfinished step in your final response.
 </system-reminder>`

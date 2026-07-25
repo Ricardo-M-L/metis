@@ -82,6 +82,12 @@ func (r *REPL) freshPermissionMode() permission.Mode {
 
 func (r *REPL) rebindFreshSession(id string) {
 	r.SessionID = id
+	if r.historyCursor == nil {
+		cursor := session.NewHistoryCursor(r.Loop.History())
+		r.historyCursor = &cursor
+	} else {
+		r.historyCursor.Mark(r.Loop.History())
+	}
 	rtpkg.RebindLoopRuntime(r.Loop, r.Loop.Provider, r.model, r.Loop.System, id)
 	r.Gate.ResetSessionState(r.freshPermissionMode(), nil)
 	r.Loop.SetPrePlanMode("")
@@ -132,6 +138,11 @@ func (r *REPL) branchSession() (string, error) {
 	cwd, _ := os.Getwd()
 	if err := r.Session.WriteHeaderFull(session.Header{
 		ID: id, WorkDir: cwd, Mode: string(r.freshPermissionMode()),
+		// Branch reads the source header from disk, which may predate the
+		// dynamic Plan overlay migration even though this live Loop was cleaned
+		// at resume. Persist the live cleaned system so the child does not inherit
+		// an obsolete static "do not implement" instruction.
+		System: rtpkg.RemoveLegacyPlanOverlay(r.Loop.System),
 	}); err != nil {
 		return "", err
 	}
@@ -181,6 +192,18 @@ func (m *Model) forkSession(parentID string, messages []llm.Message) (string, *s
 	if err != nil {
 		return "", nil, err
 	}
+	cleanedSystem := rtpkg.RemoveLegacyPlanOverlay(hdr.System)
+	if cleanedSystem != hdr.System {
+		// The fork's initial header was copied from the selected parent. Append a
+		// corrected header immediately so the new branch is clean even if it is
+		// never activated in this process.
+		if cleanedSystem != "" {
+			if err := m.session.WriteHeaderFull(session.Header{ID: id, System: cleanedSystem}); err != nil {
+				return "", nil, fmt.Errorf("clean legacy plan overlay from fork %s: %w", id, err)
+			}
+		}
+		hdr.System = cleanedSystem
+	}
 	return id, hdr, nil
 }
 
@@ -225,6 +248,20 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 		}
 	}
 
+	// Metis <=0.2.8 persisted Plan instructions in Header.System. Startup
+	// resume cleans them in cmd/metis, but the in-process session picker bypasses
+	// that boot path. Clean and persist the destination before committing the
+	// switch so leaving plan mode actually removes the old static restriction.
+	destinationSystem := ""
+	if hdr != nil {
+		destinationSystem = rtpkg.RemoveLegacyPlanOverlay(hdr.System)
+		if destinationSystem != hdr.System && destinationSystem != "" {
+			if err := m.session.WriteHeaderFull(session.Header{ID: id, System: destinationSystem}); err != nil {
+				return fmt.Errorf("clean legacy plan overlay from session %s: %w", shortID(id), err)
+			}
+		}
+	}
+
 	mode := m.freshPermissionMode()
 	var resumedRules []permission.Rule
 	if restorePermissions && hdr != nil {
@@ -256,8 +293,8 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	m.loop.SetPrePlanMode("")
 
 	if hdr != nil && hdr.System != "" {
-		m.loop.System = hdr.System
-		if hdr.System == m.baseSystem {
+		m.loop.System = destinationSystem
+		if destinationSystem == m.baseSystem {
 			m.loop.SystemSections = append([]llm.SystemSection(nil), m.baseSystemSections...)
 		} else {
 			// A persisted free-form system prompt has no typed-section
@@ -280,6 +317,7 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 		m.sessionTitle = strings.TrimSpace(hdr.Title)
 	}
 	m.loop.ResetSession(messages)
+	m.historyCursor.Mark(messages)
 	m.loop.TimingSink = m.session.NewTimingRecorder(id).Record
 	if m.ext.SessionSwitch != nil {
 		m.ext.SessionSwitch(id)
@@ -288,6 +326,7 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	// Clear every UI-side cache derived from the old transcript/session.
 	m.messages = nil
 	m.toolEvents = nil
+	m.turnToolEventStart = 0
 	m.subAgents = nil
 	m.thinkingText = ""
 	m.streamingText = ""

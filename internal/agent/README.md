@@ -47,7 +47,7 @@ by domain prefix:
 - `Loop.Run` is **single-threaded**: detectors / contract / dispatch all
   run sequentially per iter. Goroutines (e.g., subagent dispatch) emit
   results via channels back to the loop.
-- Stop reasons in `{diminishing_returns, max_iterations, loop_detected,
+- Stop reasons in `{max_iterations, loop_detected,
   stuck_after_reset}` are **incomplete**: `cmd/metis/main.go` maps them
   to `exitcode.Incomplete = 11`. Don't add new stop reasons without
   deciding whether they're complete or incomplete.

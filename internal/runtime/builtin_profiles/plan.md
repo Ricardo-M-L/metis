@@ -2,7 +2,7 @@
 name: plan
 description: Implementation planning agent — designs strategy, does not write code
 tools: Read, Grep, Glob, LS, WebFetch
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: high
 max_turns: 30
 ---

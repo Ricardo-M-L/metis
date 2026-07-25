@@ -14,7 +14,7 @@ description: code reviewer
 model: claude-haiku-4-5
 tools: Read, Glob, Grep
 disallowed_tools: Bash, Write
-permission_mode: ask
+permission_mode: default
 effort: low
 max_turns: 20
 initial_prompt: review the diff
@@ -37,7 +37,7 @@ You are a code reviewer.`
 	if got := prof.DisallowedTools; len(got) != 2 || got[1] != "Write" {
 		t.Errorf("DisallowedTools = %v", got)
 	}
-	if prof.PermissionMode != "ask" {
+	if prof.PermissionMode != "default" {
 		t.Errorf("PermissionMode = %q", prof.PermissionMode)
 	}
 	if prof.Effort != "low" {
@@ -150,19 +150,19 @@ func TestAgentProfile_FilterToolNames(t *testing.T) {
 func TestAgentProfile_MergeOnto(t *testing.T) {
 	prof := &AgentProfile{
 		Model:          "claude-opus-4-7",
-		PermissionMode: "auto",
+		PermissionMode: "acceptEdits",
 		Effort:         "high",
 		MaxTurns:       50,
 	}
 	// CLI passes nothing — profile fully wins.
 	m, mo, e, it := prof.MergeOnto("", "", "", 0)
-	if m != "claude-opus-4-7" || mo != "auto" || e != "high" || it != 50 {
+	if m != "claude-opus-4-7" || mo != "acceptEdits" || e != "high" || it != 50 {
 		t.Errorf("profile-only merge: got (%q,%q,%q,%d)", m, mo, e, it)
 	}
 
 	// CLI overrides model — profile loses on that field only.
 	m2, mo2, _, _ := prof.MergeOnto("claude-haiku-4-5", "", "", 0)
-	if m2 != "claude-haiku-4-5" || mo2 != "auto" {
+	if m2 != "claude-haiku-4-5" || mo2 != "acceptEdits" {
 		t.Errorf("CLI override broke: got (%q,%q)", m2, mo2)
 	}
 }

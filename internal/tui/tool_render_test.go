@@ -373,6 +373,27 @@ func TestBuildTurnRecap(t *testing.T) {
 	}
 }
 
+func TestBuildTurnRecap_UsesCurrentTurnSuffixOnly(t *testing.T) {
+	m := &Model{
+		toolEvents: []ToolEvent{
+			{Kind: "result", ToolName: "Read"},
+			{Kind: "result", ToolName: "Read"},
+			{Kind: "result", ToolName: "Glob"},
+			{Kind: "result", ToolName: "Bash", Input: map[string]any{"command": "go test ./..."}},
+		},
+		turnToolEventStart: 2,
+	}
+	recap := buildTurnRecap(m.currentTurnToolEvents())
+	if strings.Contains(recap, "reads") {
+		t.Fatalf("recap accumulated prior-turn reads: %q", recap)
+	}
+	for _, want := range []string{"1 searches", "ran `go test ./...`"} {
+		if !strings.Contains(recap, want) {
+			t.Errorf("current-turn recap missing %q: %q", want, recap)
+		}
+	}
+}
+
 // TestRenderToolEvent_LeaderRowFormat ensures the ⏺/⎿ hierarchy holds
 // on both the in-flight and completed paths.
 func TestRenderToolEvent_LeaderRowFormat(t *testing.T) {
@@ -400,6 +421,31 @@ func TestRenderToolEvent_LeaderRowFormat(t *testing.T) {
 	}
 	if !strings.Contains(done, glyphTreeLeaf) {
 		t.Errorf("done missing tree-leaf summary: %s", done)
+	}
+}
+
+func TestRenderToolEvent_ExplorationOutputCompactAndExpandable(t *testing.T) {
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Read",
+		Input:    map[string]any{"path": "/tmp/large.go"},
+		Output:   "line one\nline two\nline three\nline four\nline five\nline six\n",
+	}
+
+	compact := stripANSI(renderToolEvent(te, false))
+	if !strings.Contains(compact, "ctrl+O to expand") {
+		t.Fatalf("compact exploration result should advertise expansion: %q", compact)
+	}
+	if strings.Contains(compact, "line one") || strings.Contains(compact, "more lines") || strings.Contains(compact, "… +") {
+		t.Fatalf("compact exploration result leaked preview/ellipsis wall: %q", compact)
+	}
+
+	expanded := stripANSI(renderToolEvent(te, true))
+	if !strings.Contains(expanded, "line one") || !strings.Contains(expanded, "line six") {
+		t.Fatalf("expanded exploration result should contain the full output: %q", expanded)
+	}
+	if strings.Contains(expanded, "more lines") || strings.Contains(expanded, "… +") {
+		t.Fatalf("expanded exploration result should not truncate with ellipses: %q", expanded)
 	}
 }
 

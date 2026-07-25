@@ -36,9 +36,19 @@ func TestParsePriorityCommand_NowFormats(t *testing.T) {
 // TestParsePriorityCommand_LaterFormats — symmetric coverage for the
 // /later variant.
 func TestParsePriorityCommand_LaterFormats(t *testing.T) {
-	prio, body, ok := parsePriorityCommand("/later if you have time, also check X")
-	if !ok || prio != QueuePriorityLater || body != "if you have time, also check X" {
-		t.Errorf("/later parse wrong: ok=%v prio=%d body=%q", ok, prio, body)
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"/later if you have time, also check X", "if you have time, also check X"},
+		{"/later\nverify after this turn", "verify after this turn"},
+		{"/later\r\nrun tests", "run tests"},
+		{"/later\vcheck logs", "check logs"},
+		{"/later\u2003unicode whitespace", "unicode whitespace"},
+	} {
+		prio, body, ok := parsePriorityCommand(tc.in)
+		if !ok || prio != QueuePriorityLater || body != tc.want {
+			t.Errorf("parsePriorityCommand(%q): ok=%v prio=%d body=%q, want %q", tc.in, ok, prio, body, tc.want)
+		}
 	}
 }
 

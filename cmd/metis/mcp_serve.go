@@ -44,6 +44,7 @@ import (
 	"bufio"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
@@ -90,8 +91,8 @@ func cmdMCPServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("mcp-serve: %w", err)
 	}
 	if flags.mode == "" {
-		// Default bypass: automated callers cannot respond to permission prompts.
-		flags.mode = "bypass"
+		// Automated callers cannot respond to permission prompts.
+		flags.mode = string(permission.ModeBypassPermissions)
 	}
 	// Never show the interactive auth wizard on the MCP stdio transport —
 	// any wizard output written to stdout would corrupt the JSON-RPC stream.

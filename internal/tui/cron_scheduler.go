@@ -95,15 +95,14 @@ func (m *Model) beginTurn(text string) tea.Cmd {
 		return nil
 	}
 	m.loop.AppendUser(text)
-	if m.session != nil && m.sessionID != "" {
-		_ = m.session.AppendMessage(m.sessionID, lastUserMessage(m.loop.History()))
-	}
+	m.persistTail()
 	_ = runtime.AppendHistory(runtime.HistoryEntry{
 		SessionID: m.sessionID, Input: text, Source: "cron",
 	})
 	m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
 
 	m.streamingText = ""
+	m.turnToolEventStart = len(m.toolEvents)
 	m.turnActive = true
 	m.spinnerActive = true
 	m.spinnerFrame = 0

@@ -138,7 +138,10 @@ func (Glob) InputSchema() map[string]any {
 }
 func (Glob) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
 func (g Glob) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := g.gate.Check(context.Background(), "Glob", strFromAny(in["pattern"]))
+	// Include the search root in the permission payload. Pattern-only checks
+	// let a rule denying a sensitive directory be bypassed simply by moving
+	// that directory from the glob pattern into `root`.
+	d, src := g.gate.CheckPath(context.Background(), "Glob", searchPermissionInput(in), searchScopePath(in))
 	return mapDecision(d), src
 }
 

@@ -24,6 +24,8 @@ package tui
 
 import (
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // QueuePriority enumerates the three priorities. Smaller value =
@@ -206,14 +208,22 @@ func parsePriorityCommand(raw string) (QueuePriority, string, bool) {
 	switch {
 	case raw == prefixNow:
 		return QueuePriorityNow, "", true
-	case len(raw) > len(prefixNow) && raw[:len(prefixNow)] == prefixNow && isSpace(raw[len(prefixNow)]):
+	case hasWhitespaceSeparator(raw, prefixNow):
 		return QueuePriorityNow, strings.TrimSpace(raw[len(prefixNow):]), true
 	case raw == prefixLater:
 		return QueuePriorityLater, "", true
-	case len(raw) > len(prefixLater) && raw[:len(prefixLater)] == prefixLater && isSpace(raw[len(prefixLater)]):
+	case hasWhitespaceSeparator(raw, prefixLater):
 		return QueuePriorityLater, strings.TrimSpace(raw[len(prefixLater):]), true
 	}
 	return 0, "", false
+}
+
+func hasWhitespaceSeparator(raw, prefix string) bool {
+	if !strings.HasPrefix(raw, prefix) || len(raw) == len(prefix) {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(raw[len(prefix):])
+	return unicode.IsSpace(r)
 }
 
 // prioCommandName returns the user-facing slash name for a priority.
@@ -229,5 +239,3 @@ func prioCommandName(p QueuePriority) string {
 	}
 	return ""
 }
-
-func isSpace(b byte) bool { return b == ' ' || b == '\t' }

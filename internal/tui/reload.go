@@ -45,13 +45,14 @@ type ReloadOpts struct {
 	PreserveInput bool
 }
 
-// Reload performs the consolidated reset. Returns nothing — call
-// sites that have a tea.Cmd to forward (rare) keep their own return
-// path.
+// Reload performs the consolidated reset. It returns a persistence error and
+// leaves the live conversation intact when the clearing snapshot cannot be
+// written; callers surface that error in the current UI.
 //
 // Order matters: save-daily-note happens BEFORE loop.Reset() because
 // summarizeHistory reads from the loop's history.
-func (m *Model) Reload(opts ReloadOpts) {
+func (m *Model) Reload(opts ReloadOpts) error {
+	var noteErr error
 	if opts.SaveDailyNote && m.loop != nil && m.loop.Memory != nil {
 		summary := m.summarizeHistory()
 		reason := opts.ResetReason
@@ -64,19 +65,24 @@ func (m *Model) Reload(opts ReloadOpts) {
 		// write failure here used to vanish; now it shows in
 		// the chat as a warning row so the user can at least
 		// retry from a snapshot.
-		if err := m.loop.Memory.SaveDailyNote(m.sessionID, reason, summary); err != nil {
-			m.messages = append(m.messages, Message{
-				Role:      "warning",
-				Content:   fmt.Sprintf("(reload: failed to save daily note: %v — session history is cleared but no audit trail was written)", err),
-				Timestamp: time.Now(),
-			})
+		noteErr = m.loop.Memory.SaveDailyNote(m.sessionID, reason, summary)
+	}
+	// Persist the empty target history before mutating the live loop. If the
+	// snapshot append fails, leave the conversation intact so /clear can be
+	// retried instead of reporting success while resume would resurrect it.
+	if m.loop != nil && m.session != nil && m.sessionID != "" {
+		if err := m.session.ReplaceHistoryAndMark(m.sessionID, nil, &m.historyCursor); err != nil {
+			return fmt.Errorf("persist cleared history: %w", err)
 		}
+	} else {
+		m.historyCursor.Mark(nil)
 	}
 	if m.loop != nil {
 		m.loop.Reset()
 	}
 	m.messages = nil
 	m.toolEvents = nil
+	m.turnToolEventStart = 0
 	m.totalTokens.Reset()
 	if !opts.PreserveInput {
 		m.input.Reset()
@@ -88,6 +94,14 @@ func (m *Model) Reload(opts ReloadOpts) {
 		m.firstRender = true
 		m.showBanner = true
 	}
+	if noteErr != nil {
+		m.messages = append(m.messages, Message{
+			Role:      "warning",
+			Content:   fmt.Sprintf("(reload: failed to save daily note: %v — session history is cleared but no audit trail was written)", noteErr),
+			Timestamp: time.Now(),
+		})
+	}
+	return nil
 }
 
 // ReloadEcho appends a one-line confirmation to the message stream.

@@ -55,19 +55,18 @@ func TestPermissionsScreen_EmptyRulesShowsHint(t *testing.T) {
 
 // TestPermissionsScreen_InitialModeCursor — cursor seeded by `currentMode`.
 func TestPermissionsScreen_InitialModeCursor(t *testing.T) {
-	// Cursor seeded by currentMode. Order follows the Shift+Tab cycle
-	// (keybind_permission.go::cyclePermissionMode) — kept in sync with
-	// the widget's `modes` slice.
+	// Cursor seeded by currentMode. The widget exposes all five external
+	// modes; dontAsk is intentionally not in the Shift+Tab cycle.
 	cases := []struct {
 		current string
 		want    int
 	}{
-		{"ask", 0},
+		{"default", 0},
 		{"acceptEdits", 1},
 		{"plan", 2},
-		{"bypass", 3},
-		{"deny", 4},
-		{"unknown", 0}, // fallback to ask
+		{"dontAsk", 3},
+		{"bypassPermissions", 4},
+		{"unknown", 0}, // fallback to default
 	}
 	for _, tc := range cases {
 		s := NewPermissionsScreen(tc.current, nil)
@@ -79,10 +78,10 @@ func TestPermissionsScreen_InitialModeCursor(t *testing.T) {
 
 // TestPermissionsScreen_ModeCyclesWraparound — ←/→ cycle the mode set.
 func TestPermissionsScreen_ModeCyclesWraparound(t *testing.T) {
-	s := NewPermissionsScreen("ask", nil) // cursor=0
+	s := NewPermissionsScreen("default", nil) // cursor=0
 	s.Resize(100, 20)
 
-	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // wrap to 4 (deny)
+	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // wrap to 4 (bypassPermissions)
 	if s.modeCursor != 4 {
 		t.Errorf("Left at 0 should wrap to 4; got %d", s.modeCursor)
 	}

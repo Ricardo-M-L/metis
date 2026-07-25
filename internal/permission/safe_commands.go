@@ -59,7 +59,6 @@ var safeBashFirstTokens = map[string]bool{
 	"printf":   true,
 	"true":     true,
 	"false":    true,
-	"env":      true, // bare `env` lists; `env FOO=bar prog` does NOT match
 	"basename": true,
 	"dirname":  true,
 	"realpath": true,
@@ -82,15 +81,10 @@ var safeGitSubcommands = map[string]bool{
 	"diff":      true,
 	"show":      true,
 	"blame":     true,
-	"branch":    true, // `git branch` lists; `git branch -D foo` is dangerous but the leading-tokens rule catches that via `-D` being non-allowlisted? No — see special-case below.
-	"remote":    true, // `git remote` lists; `git remote add` is mutating but uncommon enough we accept the false-positive risk
-	"config":    true, // `git config --get foo`; `git config --global ...` writes — we filter on `--global`/`--system` below
 	"describe":  true,
 	"rev-parse": true,
 	"ls-files":  true,
 	"ls-tree":   true,
-	"reflog":    true,
-	"tag":       true, // `git tag` lists; `git tag -d foo` deletes — we filter on `-d`/`-D` below
 }
 
 // gitDangerousFlags are flags that, when present anywhere after `git
@@ -98,16 +92,121 @@ var safeGitSubcommands = map[string]bool{
 // subcommand was on the allowlist. Captures the few mutating forms
 // of otherwise-read-only verbs (e.g. `git branch -D foo`).
 var gitDangerousFlags = map[string]bool{
-	"-D":          true,
-	"-d":          true,
-	"--delete":    true,
-	"--global":    true,
-	"--system":    true,
-	"--unset":     true,
-	"--unset-all": true,
-	"-f":          true,
-	"--force":     true,
-	"--rename":    true,
+	"-D":                 true,
+	"-d":                 true,
+	"--delete":           true,
+	"--unset":            true,
+	"--unset-all":        true,
+	"-f":                 true,
+	"--force":            true,
+	"--rename":           true,
+	"--edit-description": true,
+	"--add":              true,
+	"--replace-all":      true,
+	"--rename-section":   true,
+	"--remove-section":   true,
+	"--edit":             true,
+	"-e":                 true,
+}
+
+func hasGitWriteFlag(args []string) bool {
+	for _, tok := range args {
+		if gitDangerousFlags[tok] || tok == "--output" || strings.HasPrefix(tok, "--output=") {
+			return true
+		}
+	}
+	return false
+}
+
+func isSafeGitBranch(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	if hasGitWriteFlag(args) {
+		return false
+	}
+	// A positional first argument creates a branch. Listing with an
+	// explicit --list/-l may take any following pattern; the remaining
+	// accepted flags are display-only and take no positional value.
+	if args[0] == "--list" || args[0] == "-l" {
+		return true
+	}
+	readFlags := map[string]bool{
+		"-a": true, "--all": true, "-r": true, "--remotes": true,
+		"-v": true, "-vv": true, "--verbose": true,
+		"--show-current": true, "--ignore-case": true,
+		"--column": true, "--no-column": true,
+	}
+	for _, arg := range args {
+		if !readFlags[arg] && !strings.HasPrefix(arg, "--format=") && !strings.HasPrefix(arg, "--sort=") {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeGitRemote(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	if hasGitWriteFlag(args) {
+		return false
+	}
+	if len(args) == 1 {
+		return args[0] == "-v" || args[0] == "--verbose"
+	}
+	// get-url only reads configured URLs; add/set-url/rename/remove/update
+	// are deliberately not accepted.
+	return args[0] == "get-url"
+}
+
+func isSafeGitConfig(args []string) bool {
+	if len(args) == 0 || hasGitWriteFlag(args) {
+		return len(args) == 0
+	}
+	readOp := false
+	positionals := 0
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--get", "--get-all", "--get-regexp", "--get-urlmatch",
+			"--list", "-l", "--name-only", "--show-origin", "--show-scope":
+			readOp = true
+		case "--file", "-f", "--type", "--default":
+			// These options consume one value. They are safe only in a read
+			// shape, which the positional-count/readOp rule below enforces.
+			if i+1 < len(args) {
+				i++
+			}
+		case "--global", "--system", "--local", "--worktree", "--includes", "--no-includes", "-z", "--null", "--fixed-value":
+			// Scope/format modifiers do not themselves write.
+		default:
+			if strings.HasPrefix(arg, "--type=") || strings.HasPrefix(arg, "--format=") {
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				return false
+			}
+			positionals++
+		}
+	}
+	// Explicit getters may legitimately take a value pattern. Without a
+	// getter, zero/one positional is help or a key lookup; two writes key=value.
+	return readOp || positionals <= 1
+}
+
+func isSafeGitTag(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	if hasGitWriteFlag(args) {
+		return false
+	}
+	switch args[0] {
+	case "-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at":
+		return true
+	}
+	return strings.HasPrefix(args[0], "--sort=") || strings.HasPrefix(args[0], "--format=")
 }
 
 // IsSafeReadOnlyBash returns true when the given bash command is a
@@ -141,6 +240,29 @@ func IsSafeReadOnlyBash(cmd string) bool {
 		return false
 	}
 
+	// `env` is read-only only when bare. With further argv it is an
+	// arbitrary command launcher (`env touch /tmp/x`), not an inspector.
+	if first == "env" {
+		return len(fields) == 1
+	}
+
+	// `date` and `hostname` have privileged mutating forms on common
+	// platforms. Keep their query forms but reject setters/positionals.
+	if first == "date" {
+		for _, tok := range fields[1:] {
+			if tok == "-s" || tok == "--set" || strings.HasPrefix(tok, "--set=") || (!strings.HasPrefix(tok, "-") && !strings.HasPrefix(tok, "+")) {
+				return false
+			}
+		}
+		return true
+	}
+	if first == "hostname" {
+		if len(fields) == 1 {
+			return true
+		}
+		return len(fields) == 2 && map[string]bool{"-f": true, "-s": true, "-d": true, "-i": true, "-I": true}[fields[1]]
+	}
+
 	// Git: needs a recognized read-only sub-command and no mutating flags.
 	if first == "git" {
 		if len(fields) < 2 {
@@ -148,15 +270,23 @@ func IsSafeReadOnlyBash(cmd string) bool {
 			return true
 		}
 		sub := fields[1]
+		args := fields[2:]
+		switch sub {
+		case "branch":
+			return isSafeGitBranch(args)
+		case "remote":
+			return isSafeGitRemote(args)
+		case "config":
+			return isSafeGitConfig(args)
+		case "tag":
+			return isSafeGitTag(args)
+		case "reflog":
+			return len(args) == 0 || (!hasGitWriteFlag(args) && (args[0] == "show" || args[0] == "exists"))
+		}
 		if !safeGitSubcommands[sub] {
 			return false
 		}
-		for _, tok := range fields[2:] {
-			if gitDangerousFlags[tok] {
-				return false
-			}
-		}
-		return true
+		return !hasGitWriteFlag(args)
 	}
 
 	// Generic allowlist hit.

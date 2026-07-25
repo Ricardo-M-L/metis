@@ -72,8 +72,32 @@ func (Grep) Concurrency(map[string]any) tools.Concurrency { return tools.Concurr
 func (Grep) IsReadOnly(map[string]any) bool { return true }
 
 func (g Grep) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := g.gate.Check(context.Background(), "Grep", strFromAny(in["pattern"]))
+	d, src := g.gate.CheckPath(context.Background(), "Grep", searchPermissionInput(in), searchScopePath(in))
 	return mapDecision(d), src
+}
+
+func searchScopePath(in map[string]any) string {
+	root := strFromAny(in["root"])
+	if root == "" {
+		return "."
+	}
+	return root
+}
+
+// searchPermissionInput keeps both the directory scope and query visible to
+// substring rules and secret-path checks. Newline is deliberately simple and
+// unambiguous while preserving the existing pattern-only payload when root is
+// omitted (so saved rules continue to match).
+func searchPermissionInput(in map[string]any) string {
+	pattern := strFromAny(in["pattern"])
+	root := strFromAny(in["root"])
+	if root == "" {
+		return pattern
+	}
+	// Root is a directory. Preserve an explicit separator so a credential
+	// directory such as `~/.ssh` matches the secret fragment `.ssh/` even
+	// when the caller omitted the trailing slash.
+	return strings.TrimRight(root, "/") + "/\n" + pattern
 }
 
 // DefaultGrepLimit is the default cap when callers don't pass `max`.

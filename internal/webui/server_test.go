@@ -288,8 +288,8 @@ func TestActivateSessionRestoresHeaderStateAndRebindsSidecars(t *testing.T) {
 	if loop.System != "target-system" || len(loop.SystemSections) != 0 {
 		t.Fatalf("system state not restored: system=%q sections=%+v", loop.System, loop.SystemSections)
 	}
-	if gate.Mode() != permission.ModePlan || !loop.PlanMode {
-		t.Fatalf("permission mode not restored: gate=%q plan=%v", gate.Mode(), loop.PlanMode)
+	if gate.Mode() != permission.ModePlan || !loop.IsPlanMode() {
+		t.Fatalf("permission mode not restored: gate=%q plan=%v", gate.Mode(), loop.IsPlanMode())
 	}
 	rules := gate.Snapshot()
 	if len(rules) != 2 || rules[0].Source != "config:allow" || rules[1].Source != "session:resumed(policy:forged)" {

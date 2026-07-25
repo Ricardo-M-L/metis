@@ -2,7 +2,7 @@
 name: verify
 description: Test/verify agent — runs tests, parses results, reports pass/fail with evidence
 tools: Read, Bash, Grep, Glob, LS
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: low
 max_turns: 20
 ---

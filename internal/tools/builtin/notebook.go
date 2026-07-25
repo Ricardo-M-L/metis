@@ -56,7 +56,8 @@ func (NotebookEdit) Concurrency(map[string]any) tools.Concurrency {
 }
 
 func (n NotebookEdit) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := n.gate.Check(context.Background(), "NotebookEdit", strFromAny(in["path"]))
+	path := strFromAny(in["path"])
+	d, src := n.gate.CheckPath(context.Background(), "NotebookEdit", path, path)
 	return mapDecision(d), src
 }
 

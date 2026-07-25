@@ -30,7 +30,7 @@ func TestApplyResume_RestoresMessagesAndMode(t *testing.T) {
 	hdr := session.Header{
 		ID:    id,
 		Model: "claude-x",
-		Mode:  "auto",
+		Mode:  "acceptEdits",
 		AlwaysAllow: []session.SavedRule{
 			{Tool: "Bash", Match: "git status", Verb: int(permission.DecisionAllow), Source: "user-allow"},
 		},
@@ -59,7 +59,7 @@ func TestApplyResume_RestoresMessagesAndMode(t *testing.T) {
 	if len(loop.Messages) != 1 || loop.Messages[0].Content[0].Text != "first prompt" {
 		t.Errorf("messages not restored: %+v", loop.Messages)
 	}
-	if string(gate.Mode()) != "auto" {
+	if gate.Mode() != permission.ModeAcceptEdits {
 		t.Errorf("mode not restored: got %q", gate.Mode())
 	}
 	rules := gate.Snapshot()
@@ -216,7 +216,7 @@ func TestApplyResume_KeepsExistingModeWhenHeaderIsBlank(t *testing.T) {
 	if _, err := ApplyResume(store, id, loop, gate, nil); err != nil {
 		t.Fatalf("ApplyResume: %v", err)
 	}
-	if string(gate.Mode()) != "bypass" {
+	if gate.Mode() != permission.ModeBypassPermissions {
 		t.Errorf("blank header mode shouldn't change gate; got %q", gate.Mode())
 	}
 }

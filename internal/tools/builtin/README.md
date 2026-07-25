@@ -36,7 +36,7 @@ them into `internal/runtime/tools.go`.
   `CanUse(ctx, input)` for permission gate input, `Execute(ctx, input)`
   for the work.
 - `Bash.CanUse` runs `CheckCommand(cmd)` (bash_security_rules.go) BEFORE
-  the user-permission gate. Even in `--mode bypass`, security rules
+  the user-permission gate. Even in `--mode bypassPermissions`, security rules
   still block — these are adversarial-input checks, not user
   preferences.
 - Tools that produce binary output (audio/video/image/PDF) save to

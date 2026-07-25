@@ -6,6 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
@@ -31,16 +32,12 @@ func TestTurnActive_AcceptsTyping(t *testing.T) {
 	}
 }
 
-// TestTurnActive_SubmitQueues — post-task#35 behavior (claude-code
-// parity): pressing Enter while a turn is in flight queues the input
-// onto m.queuedPrompts instead of steer-injecting into the running
-// turn. The queue drains on turn end (finalizeTurn) by loading the
-// head into the input and firing handleSubmit on the next tick.
-//
-// Steering remains available via slash mid-turn handling for users
-// who explicitly want it — only plain text routes through the queue.
-func TestTurnActive_SubmitQueues(t *testing.T) {
+// TestTurnActive_SubmitSteersCurrentTurn — pressing Enter while a turn
+// is in flight injects ordinary text into that turn instead of silently
+// deferring it as a separate queued turn.
+func TestTurnActive_SubmitSteersCurrentTurn(t *testing.T) {
 	m := newSlashTestModel(t)
+	priorMsgCount := len(m.messages)
 	for _, r := range "use Edit not Write" {
 		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
@@ -48,22 +45,69 @@ func TestTurnActive_SubmitQueues(t *testing.T) {
 
 	pressEnter(t, m)
 
-	// Verify the queue holds the typed text.
-	if len(m.queuedPrompts) != 1 {
-		t.Fatalf("expected 1 queued prompt; got %d (%v)", len(m.queuedPrompts), m.queuedPrompts)
+	if len(m.queuedPrompts) != 0 {
+		t.Fatalf("plain mid-turn input must not queue; got %v", m.queuedPrompts)
 	}
-	if m.queuedPrompts[0].Text != "use Edit not Write" {
-		t.Errorf("queue head wrong; got %q", m.queuedPrompts[0].Text)
-	}
-	// Input must be cleared so the user sees the queue acceptance
-	// (matches normal-submit affordance — input clears on send).
 	if m.input.Value() != "" {
-		t.Errorf("input should be cleared after queueing; got %q", m.input.Value())
+		t.Errorf("input should be cleared after steering; got %q", m.input.Value())
 	}
-	// The agent loop's steer buffer must NOT have been touched —
-	// queueing is a different pipeline.
+	if got := m.loop.SteerInjectDrainForTest(); got != "use Edit not Write" {
+		t.Errorf("steer buffer = %q, want submitted text", got)
+	}
+	if got := m.messages[priorMsgCount:]; len(got) != 1 || got[0].Role != "user-steer" || got[0].Content != "use Edit not Write" {
+		t.Errorf("submitted steer should be visible as user-steer; got %+v", got)
+	}
+}
+
+// TestTurnActive_LaterStillQueuesNextTurn — users retain an explicit
+// way to defer work instead of steering the active turn.
+func TestTurnActive_LaterStillQueuesNextTurn(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	for _, r := range "/later verify after the current turn" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+
+	pressEnter(t, m)
+
+	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0].Text != "verify after the current turn" {
+		t.Fatalf("/later should queue its body for the next turn; got %+v", m.queuedPrompts)
+	}
 	if got := m.loop.SteerInjectDrainForTest(); got != "" {
-		t.Errorf("steer buffer should be empty; got %q", got)
+		t.Errorf("/later must not steer the active turn; got %q", got)
+	}
+	if m.input.Value() != "" {
+		t.Errorf("input should be cleared after /later; got %q", m.input.Value())
+	}
+}
+
+// TestTurnActive_ClosingRaceFallsBackToQueue covers the render-tick window
+// where Model.turnActive is still true but Loop.Run has already atomically
+// closed steering. The input must land exactly once in the next-turn queue.
+func TestTurnActive_ClosingRaceFallsBackToQueue(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.loop.AppendUser("finish now")
+	out := make(chan agent.Event, 64)
+	if err := m.loop.Run(m.ctx, out); err != nil {
+		t.Fatalf("closing test loop: %v", err)
+	}
+	close(out)
+
+	m.turnActive = true // simulate one stale TUI frame before LoopDone update
+	for _, r := range "one last instruction" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	pressEnter(t, m)
+
+	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0].Text != "one last instruction" {
+		t.Fatalf("closing-race input should queue exactly once; got %+v", m.queuedPrompts)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("closing-race input must not remain in steer buffer: %q", got)
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "info" || !strings.Contains(last.Content, "queued for the next turn") {
+		t.Fatalf("closing-race fallback should be visible; got %+v", last)
 	}
 }
 
@@ -186,15 +230,35 @@ func TestTurnActive_CustomSlashResolvesAndSteers(t *testing.T) {
 	}
 }
 
+// TestTurnActive_SafeSlashFallsThroughToSteer — known informational
+// slash commands do not start another dispatcher while a turn is active;
+// their literal text is made available to the running model instead.
+func TestTurnActive_SafeSlashFallsThroughToSteer(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	for _, r := range "/cost" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+
+	pressEnter(t, m)
+
+	if got := m.loop.SteerInjectDrainForTest(); got != "/cost" {
+		t.Errorf("safe slash should steer literal input; got %q", got)
+	}
+	if len(m.queuedPrompts) != 0 {
+		t.Errorf("safe slash must not queue; got %+v", m.queuedPrompts)
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "user-steer" || last.Content != "/cost" {
+		t.Errorf("safe slash steer should be visible; got %+v", last)
+	}
+}
+
 // TestTurnActive_UnknownSlashFallsThroughToSteer — unknown /<command>
 // goes through the steer path as literal text. This is the safe
 // default — user might be typing actual chat content that happens to
 // start with a slash.
-func TestTurnActive_UnknownSlashFallsThroughToQueue(t *testing.T) {
-	// Post-task#35: unknown slash (MidTurnSafe → fall-through) lands
-	// in the queue, not the steer buffer. The slash itself isn't a
-	// known command so we treat the literal text as a future user
-	// turn, matching claude-code's "next message" semantics.
+func TestTurnActive_UnknownSlashFallsThroughToSteer(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.turnActive = true
 	for _, r := range "/notarealcommand" {
@@ -203,10 +267,14 @@ func TestTurnActive_UnknownSlashFallsThroughToQueue(t *testing.T) {
 
 	pressEnter(t, m)
 
-	if got := m.loop.SteerInjectDrainForTest(); got != "" {
-		t.Errorf("steer buffer should be empty after queueing; got %q", got)
+	if got := m.loop.SteerInjectDrainForTest(); got != "/notarealcommand" {
+		t.Errorf("unknown slash should steer literal input; got %q", got)
 	}
-	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0].Text != "/notarealcommand" {
-		t.Errorf("expected single queued prompt with literal slash; got %v", m.queuedPrompts)
+	if len(m.queuedPrompts) != 0 {
+		t.Errorf("unknown slash must not queue; got %v", m.queuedPrompts)
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "user-steer" || last.Content != "/notarealcommand" {
+		t.Errorf("unknown slash steer should be visible; got %+v", last)
 	}
 }

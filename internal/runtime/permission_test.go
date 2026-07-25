@@ -8,9 +8,9 @@ import (
 
 func TestBuildPermissionGate_DefaultsToConfigMode(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Permission.Mode = "auto"
+	cfg.Permission.Mode = "acceptEdits"
 	g := BuildPermissionGate(cfg, "")
-	if string(g.Mode()) != "auto" {
+	if string(g.Mode()) != "acceptEdits" {
 		t.Errorf("empty mode override should fall back to cfg; got %q", g.Mode())
 	}
 }
@@ -19,7 +19,7 @@ func TestBuildPermissionGate_OverrideTakesPrecedence(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Permission.Mode = "ask"
 	g := BuildPermissionGate(cfg, "bypass")
-	if string(g.Mode()) != "bypass" {
+	if string(g.Mode()) != "bypassPermissions" {
 		t.Errorf("override should win; got %q", g.Mode())
 	}
 }

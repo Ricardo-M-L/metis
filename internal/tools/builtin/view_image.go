@@ -101,7 +101,8 @@ func (ViewImage) Concurrency(map[string]any) tools.Concurrency {
 }
 
 func (v ViewImage) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := v.gate.Check(context.Background(), "ViewImage", strFromAny(in["path"]))
+	path := strFromAny(in["path"])
+	d, src := v.gate.CheckPath(context.Background(), "ViewImage", path, path)
 	return mapDecision(d), src
 }
 

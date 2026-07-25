@@ -23,7 +23,15 @@ func TestIsSafeReadOnlyBash_PositiveCases(t *testing.T) {
 		"git show HEAD",
 		"git blame README.md",
 		"git branch",
+		"git branch --list feature/*",
+		"git remote -v",
+		"git remote get-url origin",
 		"git config --get user.email",
+		"git config --global --get user.email",
+		"git config user.email",
+		"git tag",
+		"git tag --list 'v*'",
+		"git reflog show HEAD",
 		"git rev-parse HEAD",
 		"git ls-files",
 		"head -n 50 foo.txt",
@@ -83,24 +91,30 @@ func TestIsSafeReadOnlyBash_NegativeCases(t *testing.T) {
 		{"git rebase main", "rebase is not safe"},
 		{"git branch -D feature", "git branch with -D"},
 		{"git branch --delete feature", "git branch with --delete"},
+		{"git branch feature", "git branch positional creates a branch"},
+		{"git branch --edit-description", "git branch edits config"},
 		{"git config --global user.email me@x", "git config --global writes user-wide"},
 		{"git config --system foo bar", "git config --system writes system-wide"},
+		{"git config user.email me@x", "git config two positionals writes local config"},
+		{"git config --add foo bar", "git config add writes"},
 		{"git config --unset user.email", "git config --unset"},
 		{"git tag -d v1", "git tag -d deletes"},
 		{"git tag --delete v1", "git tag --delete"},
-		{"git remote add origin foo", "git remote add could be ok but we accept false-negative for safety? — wait, this is positive in code"},
+		{"git tag v1", "git tag positional creates a tag"},
+		{"git remote add origin foo", "git remote add mutates config"},
+		{"git remote set-url origin foo", "git remote set-url mutates config"},
+		{"git reflog expire --all", "git reflog expire mutates logs"},
+		{"git show --output=/tmp/show.txt HEAD", "git output writes a file"},
+		{"env touch /tmp/metis-safe-command-escape", "env launches arbitrary programs"},
+		{"env FOO=bar sh -c true", "env assignment launches a shell"},
+		{"date -s tomorrow", "date can set system time"},
+		{"hostname new-name", "hostname positional can set host name"},
 		{"unknowncmd foo", "first token not allowlisted"},
 		{"./run-script.sh", "relative-path script execution"},
 		{"/tmp/x.sh", "absolute-path script execution"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.reason, func(t *testing.T) {
-			// "git remote add" — the test setup above includes it but we
-			// expect it negative; safeGitSubcommands has "remote" so it
-			// would pass. Skip that one with a focused note.
-			if tc.cmd == "git remote add origin foo" {
-				t.Skip("known false-positive: 'git remote' is on the allowlist; we accept this since the typical add-form is uncommon and harmless")
-			}
 			if IsSafeReadOnlyBash(tc.cmd) {
 				t.Errorf("expected NOT safe: %q (reason: %s)", tc.cmd, tc.reason)
 			}

@@ -15,7 +15,6 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
-	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/tui/overlay"
@@ -729,11 +728,12 @@ func (m *Model) finalizeTurn(err error) {
 		notify.SendProgress(notify.ProgressError, 0)
 	}
 	notify.SendProgress(notify.ProgressClear, 0)
+	turnToolEvents := m.currentTurnToolEvents()
 	// Structural recap below the thought-summary, when this turn did
 	// enough work to be worth summarizing (≥2 tool calls).
 	recap := ""
 	if err == nil {
-		recap = buildTurnRecap(m.toolEvents)
+		recap = buildTurnRecap(turnToolEvents)
 		if recap != "" {
 			m.messages = append(m.messages, Message{
 				Role:      "recap",
@@ -756,7 +756,7 @@ func (m *Model) finalizeTurn(err error) {
 			}
 		}
 		hadErrors := false
-		for _, te := range m.toolEvents {
+		for _, te := range turnToolEvents {
 			if te.Kind != "result" {
 				continue
 			}
@@ -848,19 +848,19 @@ func (m *Model) finalizeTurn(err error) {
 	}
 }
 
+func (m *Model) currentTurnToolEvents() []ToolEvent {
+	start := m.turnToolEventStart
+	if start < 0 || start > len(m.toolEvents) {
+		start = len(m.toolEvents)
+	}
+	return m.toolEvents[start:]
+}
+
 func (m *Model) persistTail() {
-	if m.session == nil || m.sessionID == "" {
+	if m.session == nil || m.sessionID == "" || m.loop == nil {
 		return
 	}
-	hist := m.loop.History()
-	for i := len(hist) - 1; i >= 0; i-- {
-		if hist[i].Role == llm.RoleUser && len(hist[i].Content) > 0 && hist[i].Content[0].Type == "text" {
-			for j := i + 1; j < len(hist); j++ {
-				_ = m.session.AppendMessage(m.sessionID, hist[j])
-			}
-			return
-		}
-	}
+	_ = m.session.AppendHistoryTail(m.sessionID, m.loop.History(), &m.historyCursor)
 }
 
 // runTurnAsync runs one agent turn in a goroutine. It is a FREE

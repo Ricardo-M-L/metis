@@ -131,6 +131,20 @@ func TestParse_RealCommandsStillWork(t *testing.T) {
 	}
 }
 
+func TestParse_AcceptEditsShortcutEmitsModeSignal(t *testing.T) {
+	r := newRegistryWithBuiltins(t)
+	handled, display, sig, _ := r.Parse("/acceptEdits")
+	if !handled {
+		t.Fatal("/acceptEdits should be handled")
+	}
+	if sig != SignalAcceptEdits {
+		t.Fatalf("/acceptEdits signal = %v, want SignalAcceptEdits", sig)
+	}
+	if display != "(mode: acceptEdits)" {
+		t.Fatalf("/acceptEdits display = %q", display)
+	}
+}
+
 func TestIsCommandShape(t *testing.T) {
 	cases := []struct {
 		in   string

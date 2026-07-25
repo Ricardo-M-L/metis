@@ -3,8 +3,8 @@ package tui
 // view_cache_test.go — integration coverage for the View() ↔ renderCache
 // boundary. Unit tests in render_cache_test.go cover the cache's own
 // contract; here we exercise the end-to-end path with realistic data
-// (100 assistant messages + 50 tool results) and confirm:
-//   * miss counter == numMessages+numTools after the cache warms once
+// (100 assistant messages + 50 consecutive Read results) and confirm:
+//   * message misses warm once; the Read run is one pre-rendered group
 //   * subsequent frames are 100% hits (miss counter is stable)
 //   * width changes and InvalidateAll force re-render
 //
@@ -67,11 +67,13 @@ func TestView_LongTranscript_StableHitRate(t *testing.T) {
 	// item multiple times per frame (TotalLineCount + Render +
 	// AtBottom paths), so 1st-frame hits >= 0 (not necessarily 0)
 	// because the second query of the same item within frame 1 hits.
-	// What we assert: miss == exactly the number of unique items.
+	// Consecutive Read results now form one explorationGroupItem which renders
+	// its compact count directly (no per-tool cache entries). What we assert:
+	// each of the 100 unique markdown messages misses exactly once.
 	_ = m.View()
 	_, miss1, _ := m.renderCache.Stats()
-	if miss1 != int64(numMessages+numTools) {
-		t.Errorf("first frame miss=%d, want %d (one per unique item)", miss1, numMessages+numTools)
+	if miss1 != int64(numMessages) {
+		t.Errorf("first frame miss=%d, want %d message entries (Read tools are one grouped item)", miss1, numMessages)
 	}
 
 	// Subsequent 99 frames: items are unchanged, so every Get hits.

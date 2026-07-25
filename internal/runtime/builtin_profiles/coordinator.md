@@ -1,7 +1,7 @@
 ---
 name: coordinator
 description: Multi-agent team lead — plans, dispatches, synthesizes
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: high
 max_turns: 40
 ---

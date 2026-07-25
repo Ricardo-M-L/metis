@@ -17,6 +17,7 @@ import (
 
 	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 func writeSkill(t *testing.T, dir, name, body string) string {
@@ -89,6 +90,73 @@ body
 	}
 	if _, ok := store.Get("friendly-display-name"); ok {
 		t.Error("usage must NOT be keyed by the frontmatter name (curator can't see it)")
+	}
+}
+
+func TestSkill_PlanAllowsInspectionButRejectsInvoke(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "must-not-exist")
+	writeSkill(t, dir, "plan-safe", `---
+name: plan-safe
+description: plan boundary regression
+---
+result=!`+"`"+`touch `+marker+"`"+`
+`)
+	gate := permission.New(permission.ModePlan)
+	tool := NewSkill(gate, skillsloader.NewLoader(dir, "", nil), dir)
+
+	for _, action := range []string{"list", "get"} {
+		in := map[string]any{"action": action, "name": "plan-safe"}
+		got, source := tool.CanUse(context.Background(), in)
+		if got != tools.PermissionAllow {
+			t.Fatalf("Skill %s in Plan = %v (%s), want allow", action, got, source)
+		}
+	}
+
+	invoke := map[string]any{"action": "invoke", "name": "plan-safe"}
+	got, source := tool.CanUse(context.Background(), invoke)
+	if got != tools.PermissionDeny {
+		t.Fatalf("Skill invoke in Plan = %v (%s), want deny", got, source)
+	}
+	res, err := tool.Execute(context.Background(), invoke)
+	if err != nil || res == nil || !res.IsError {
+		t.Fatalf("direct Execute must retain Plan guard: err=%v res=%+v", err, res)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("Plan invoke executed inline shell; marker stat err=%v", err)
+	}
+}
+
+func TestSkillGet_PlanDoesNotWriteUsageTelemetry(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "inspect-only", `---
+name: inspect-only
+description: read-only lookup
+---
+body
+`)
+	gate := permission.New(permission.ModePlan)
+	tool := NewSkill(gate, skillsloader.NewLoader(dir, "", nil), dir)
+
+	res, err := tool.Execute(context.Background(), map[string]any{"action": "get", "name": "inspect-only"})
+	if err != nil || res == nil || res.IsError {
+		t.Fatalf("Plan get failed: err=%v res=%+v", err, res)
+	}
+	if _, ok := skillsloader.NewUsageStore(dir).Get("inspect-only"); ok {
+		t.Fatal("Plan get must not write a usage/view record")
+	}
+}
+
+func TestSkillCapability_IsInputAware(t *testing.T) {
+	var tool Skill
+	if !tool.IsReadOnly(map[string]any{"action": "get"}) {
+		t.Fatal("Skill get should be read-only")
+	}
+	if tool.IsReadOnly(map[string]any{"action": "invoke"}) {
+		t.Fatal("Skill invoke must not be read-only")
+	}
+	if tool.Concurrency(map[string]any{"action": "invoke"}) != tools.ConcurrencyExclusive {
+		t.Fatal("Skill invoke must serialize with state-changing tools")
 	}
 }
 

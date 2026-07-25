@@ -23,7 +23,7 @@ func BuildPermissionGate(cfg *config.Config, mode string) *permission.Gate {
 	if mode == "" {
 		mode = cfg.Permission.Mode
 	}
-	gate := permission.New(permission.Mode(mode))
+	gate := permission.New(permission.CanonicalMode(mode))
 
 	// Append order is mostly cosmetic since 2026-06-11: the gate now
 	// resolves conflicts by source AUTHORITY first (policy > cli >

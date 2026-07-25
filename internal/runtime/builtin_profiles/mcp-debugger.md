@@ -2,7 +2,7 @@
 name: mcp-debugger
 description: MCP server troubleshooting agent — diagnoses why an MCP tool isn't working
 tools: Read, Grep, Glob, LS, Bash, MetisInfo
-permission_mode: bypass
+permission_mode: bypassPermissions
 effort: medium
 max_turns: 25
 ---
