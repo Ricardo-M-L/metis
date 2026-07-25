@@ -354,12 +354,17 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// Phase C3: bare `/model` (alias `/m`) opens the picker widget.
 		// Explicit `/model claude-opus-4-7` falls through to cmdModel
 		// for scripted usage / palette autocomplete.
-		if (name == "model" || name == "m") && strings.TrimSpace(args) == "" {
-			mp := screen.NewModelScreen(m.model, builtinModelChoices)
-			mp.Resize(m.width, m.height)
-			m.activeScreen = mp
-			return m, nil
-		}
+			if (name == "model" || name == "m") && strings.TrimSpace(args) == "" {
+				choices := make([]screen.ModelChoice, len(builtinModelChoices))
+				copy(choices, builtinModelChoices)
+				for i := range choices {
+					choices[i].Recent = getModelState().IsRecent(choices[i].ID)
+				}
+				mp := screen.NewModelScreen(m.model, choices)
+				mp.Resize(m.width, m.height)
+				m.activeScreen = mp
+				return m, nil
+			}
 
 		// Phase C4: bare `/theme` opens the cycle widget with live
 		// swatches. Explicit `/theme dark` falls through to cmdTheme

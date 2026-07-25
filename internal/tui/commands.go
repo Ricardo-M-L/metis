@@ -312,6 +312,7 @@ func switchREPLModel(r *REPL, newModel string) error {
 	r.model = pb.Model
 	r.providerName = newProvName
 	runtime.RebindLoopRuntime(r.Loop, pb.Provider, pb.Model, r.Loop.System, r.SessionID)
+	getModelState().AddRecent(pb.Model)
 	if r.Loop.Compactor != nil {
 		oldCfg := r.Loop.Compactor.Config
 		oldMaxOut := r.Loop.Compactor.MaxOutputTokens
