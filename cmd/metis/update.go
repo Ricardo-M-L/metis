@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,16 +15,21 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
-// maybeNotifyUpdate runs at TUI/REPL startup. It throttles to one network
-// call per 24h and only returns a one-line notice — never auto-installs.
-// Errors are swallowed silently; this should never block the user.
+// maybeAutoUpdate runs at TUI/REPL startup. It throttles to one network
+// call per 24h and, when a newer release exists, downloads and installs it
+// silently in the background. Errors are swallowed; this should never block
+// the user.
 //
-// Returns the formatted notice string (empty when up-to-date or check
-// errored). Caller is responsible for surfacing the notice. For TUI we
-// stash it via tui.SetPendingUpdateNotice so it lands as an info row
-// inside alt-screen — writing to stderr direct gets eaten when
-// bubbletea swaps to the alternate buffer.
-func maybeNotifyUpdate() string {
+// Returns the formatted notice string (empty when up-to-date, check errored,
+// or auto-update is disabled). Caller surfaces the notice. For TUI we stash
+// it via tui.SetPendingUpdateNotice so it lands as an info row inside
+// alt-screen.
+//
+// Disable with METIS_NO_UPDATE_CHECK=1.
+func maybeAutoUpdate() string {
+	if os.Getenv("METIS_NO_UPDATE_CHECK") == "1" {
+		return ""
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	tag := update.MaybeCheck(ctx, config.Home(), version.Version)
@@ -31,11 +37,67 @@ func maybeNotifyUpdate() string {
 		return ""
 	}
 	update.MarkNotified(config.Home(), tag)
+
+	// Attempt silent auto-install. If it fails (no token, go-install managed,
+	// network error, etc.), fall back to the manual notice.
+	if notice := tryAutoInstall(tag); notice != "" {
+		return notice
+	}
+
 	notice := fmt.Sprintf("metis %s available (current: %s) — run `metis update` to install",
 		strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"))
-	// Also write to stderr for non-TUI callers (metis run / scripted).
-	// The TUI path overwrites this with an in-app info row anyway.
 	fmt.Fprintf(os.Stderr, "\033[33m[update]\033[0m %s\n", notice)
+	return notice
+}
+
+// tryAutoInstall attempts to download and install the given tag without
+// user interaction. Returns a notice string on success, empty on failure.
+//
+// Locking: ~/.metis/.update.lock prevents concurrent auto-installs across
+// metis processes. The lock is best-effort — failure to acquire just skips
+// this round.
+func tryAutoInstall(tag string) string {
+	token := update.Token()
+	if token == "" {
+		return ""
+	}
+
+	// Best-effort lock: create exclusively, 5-minute expiry.
+	lockPath := filepath.Join(config.Home(), ".update.lock")
+	if f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644); err != nil {
+		// Lock held by another process — check if it's stale.
+		if info, err2 := os.Stat(lockPath); err2 == nil && time.Since(info.ModTime()) > 5*time.Minute {
+			_ = os.Remove(lockPath)
+		} else {
+			return ""
+		}
+	} else {
+		f.Close()
+		defer os.Remove(lockPath)
+	}
+
+	self, err := update.SelfPath()
+	if err != nil {
+		return ""
+	}
+	if err := update.CheckSelfPathSafe(self); err != nil {
+		// go-install managed or unsafe path — skip auto-install.
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	rel, err := update.Latest(ctx, token)
+	if err != nil {
+		return ""
+	}
+	if err := update.Apply(ctx, token, self, rel); err != nil {
+		return ""
+	}
+
+	notice := fmt.Sprintf("metis %s installed (restart to apply)",
+		strings.TrimPrefix(rel.TagName, "v"))
+	fmt.Fprintf(os.Stderr, "\033[32m[update]\033[0m %s\n", notice)
 	return notice
 }
 

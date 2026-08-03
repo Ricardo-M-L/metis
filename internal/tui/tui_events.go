@@ -145,7 +145,18 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 					continue
 				}
 				m.subAgents[i].ToolsCount++
-				m.subAgents[i].LastTool = strings.TrimPrefix(ev.ToolName, "sub: ")
+				toolName := strings.TrimPrefix(ev.ToolName, "sub: ")
+				// claude-code's AgentProgressLine shows "Read: internal/foo.go"
+				// — tool name plus a short arg summary — instead of a bare
+				// "Read" glyph, so the user can tell WHICH file the
+				// sub-agent is touching right now. Reuse toolArgsPreview
+				// (already CJK-safe + abs-path resolved) and only glue it
+				// on when the preview is non-empty.
+				if args := toolArgsPreview(toolName, ev.ToolInput); args != "" {
+					m.subAgents[i].LastTool = toolName + ": " + args
+				} else {
+					m.subAgents[i].LastTool = toolName
+				}
 				break
 			}
 		}
@@ -361,6 +372,13 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// doesn't need exposed in the spinner row.
 		m.spinnerOverride = "Compacting conversation..."
 		m.spinnerCompactionBytes = 0
+		// P1-1 (2026-08-02): stamp compactionStartedAt so the C3
+		// indeterminate sliding bar tracks THIS compaction's lifetime,
+		// not the parent turn's spinnerStartedAt. Without this the bar
+		// position jumps back to 0 on every turn boundary even when the
+		// compaction is still running — visually the bar "restarts"
+		// mid-compaction.
+		m.compactionStartedAt = time.Now()
 		// OSC 9;4 indeterminate — terminals that support it (iTerm2
 		// 3.6.6+, Ghostty 1.2.0+, ConEmu) render a progress indicator
 		// on the tab/taskbar so the user has a visual cue even when

@@ -10,8 +10,23 @@ import (
 )
 
 func planAgentForBoundaryTest(gate *permission.Gate, reg *tools.Registry) Agent {
-	gate.SetReadOnlyHook(func(name, _ string) bool { return name == "Agent" || name == "Read" })
-	return NewAgent(gate, helloProvider(), reg, "model", "system")
+	tool := NewAgent(gate, helloProvider(), reg, "model", "system")
+	// Wire the read-only hook to actually consult Agent.IsReadOnly so
+	// the test exercises the production code path (capabilities.go).
+	// The previous hook hardcoded `name == "Agent"` which short-
+	// circuited IsReadOnly and hid the 2026-07-27 plan-mode behavior
+	// change from these tests.
+	gate.SetReadOnlyHook(func(name, stringInput string) bool {
+		if name == "Agent" {
+			// The hook receives a stringified input; Agent.IsReadOnly
+			// only inspects structured fields (isolation, permission_mode),
+			// both of which are absent here, so an empty map matches
+			// production behavior for these tests.
+			return tool.IsReadOnly(map[string]any{})
+		}
+		return name == "Read"
+	})
+	return tool
 }
 
 func TestAgentPlanBoundaryRejectsPermissionEscalation(t *testing.T) {
@@ -51,15 +66,23 @@ func TestAgentPlanBoundaryRejectsWorktreeBeforeSpawn(t *testing.T) {
 	}
 }
 
-func TestAgentPlanBoundaryAllowsBackgroundPlanChild(t *testing.T) {
+func TestAgentPlanBoundaryDeniesBackgroundChild(t *testing.T) {
+	// 2026-07-27: previously this test asserted Allow — the read-only
+	// hook flagged Agent as side-effect-free when no permission_mode
+	// was requested, so plan-mode parents could spawn children at
+	// will. The fix in capabilities.go Agent.IsReadOnly now returns
+	// false whenever the parent is in ModePlan, so even background
+	// spawns are denied at the parent boundary. The downstream
+	// validatePlanAgentInput still refuses non-plan overrides; this
+	// test locks in the stricter parent-side deny.
 	gate := permission.New(permission.ModePlan)
 	tool := planAgentForBoundaryTest(gate, tools.NewRegistry())
 	got, reason := tool.CanUse(context.Background(), map[string]any{
 		"prompt":            "inspect in parallel",
 		"run_in_background": true,
 	})
-	if got != tools.PermissionAllow {
-		t.Fatalf("background Plan child CanUse = (%v, %q), want allow", got, reason)
+	if got != tools.PermissionDeny {
+		t.Fatalf("plan-mode parent Agent CanUse = (%v, %q), want deny (2026-07-27 contract)", got, reason)
 	}
 }
 
@@ -92,7 +115,20 @@ func TestAgentIsReadOnlyPermissionEscalationMatrix(t *testing.T) {
 	for _, parent := range permission.Modes {
 		t.Run("parent_"+string(parent), func(t *testing.T) {
 			tool := NewAgent(permission.New(parent), helloProvider(), tools.NewRegistry(), "m", "s")
-			if !tool.IsReadOnly(map[string]any{"prompt": "delegate"}) {
+			noOverrideReadOnly := tool.IsReadOnly(map[string]any{"prompt": "delegate"})
+			// 2026-07-27: when the parent is in ModePlan, Agent is no
+			// longer advertised as read-only even without an explicit
+			// permission_mode override. Reasoning: plan mode's
+			// user-visible contract is "stop and propose a plan";
+			// allowing Agent through the read-only path let the model
+			// spin up arbitrarily many read-only children to keep
+			// exploring, which made plan mode indistinguishable from
+			// a normal turn. See capabilities.go Agent.IsReadOnly.
+			if parent == permission.ModePlan {
+				if noOverrideReadOnly {
+					t.Error("plan-mode parent must NOT advertise Agent as read-only (2026-07-27 plan-mode contract)")
+				}
+			} else if !noOverrideReadOnly {
 				t.Error("no-override Agent should remain read-only at the parent boundary")
 			}
 			if tool.IsReadOnly(map[string]any{"prompt": "delegate", "isolation": "worktree"}) {
@@ -107,6 +143,17 @@ func TestAgentIsReadOnlyPermissionEscalationMatrix(t *testing.T) {
 					"prompt":          "delegate",
 					"permission_mode": string(requested),
 				})
+				// In plan mode, IsReadOnly is unconditionally false
+				// regardless of the requested override — the
+				// escalation matrix still governs the downstream
+				// validatePlanAgentInput refusal, but the read-only
+				// fast-path is closed off entirely.
+				if parent == permission.ModePlan {
+					if gotReadOnly {
+						t.Errorf("IsReadOnly parent=%s requested=%s = true, want false (plan-mode parent always blocks Agent via read-only path)", parent, requested)
+					}
+					continue
+				}
 				if gotReadOnly == wantEscalation {
 					t.Errorf("IsReadOnly parent=%s requested=%s = %v, want %v", parent, requested, gotReadOnly, !wantEscalation)
 				}

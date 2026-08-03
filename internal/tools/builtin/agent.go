@@ -360,6 +360,10 @@ func (Agent) InputSchema() map[string]any {
 				"type":        "string",
 				"description": "the focused task for the sub-agent",
 			},
+			"description": map[string]any{
+				"type":        "string",
+				"description": "Optional 3-5 word human-readable summary of the task (e.g. \"search auth flow\", \"fix login bug\"). Shown in the TUI's collapsed tool-call header as `Explore (search auth flow)` so the user can see WHAT this sub-agent is doing without expanding the prompt. claude-code-style label. Keep it short — 6 words max.",
+			},
 			"max_iter": map[string]any{
 				"type":        "integer",
 				"description": "tool-call budget for the sub-agent (default 100). Bumped from 10 → 100 on 2026-05-21 after image #36 repro: impl-* sub-agents kept hitting the 10-turn cap mid-implementation. claude-code's equivalent (forkSubagent.maxTurns) is 200; metis goes 100 as a middle ground that covers typical large file rewrites without unbounded runaway.",

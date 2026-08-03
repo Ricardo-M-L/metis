@@ -54,17 +54,39 @@ type Provider struct {
 // about: context window for compaction, tool_call support for tool-use
 // gating, cost for the eventual /cost slash command.
 type Model struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Family      string `json:"family"`
-	ReleaseDate string `json:"release_date"`
-	Reasoning   bool   `json:"reasoning"`
-	ToolCall    bool   `json:"tool_call"`
-	Attachment  bool   `json:"attachment"`
-	Cost        Cost   `json:"cost"`
-	Limit       Limit  `json:"limit"`
-	Status      string `json:"status"` // "" | alpha | beta | deprecated
-	Temperature bool   `json:"temperature"`
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Family      string     `json:"family"`
+	ReleaseDate string     `json:"release_date"`
+	Reasoning   bool       `json:"reasoning"`
+	ToolCall    bool       `json:"tool_call"`
+	Attachment  bool       `json:"attachment"`
+	Cost        Cost       `json:"cost"`
+	Limit       Limit      `json:"limit"`
+	Status      string     `json:"status"` // "" | alpha | beta | deprecated
+	Temperature bool       `json:"temperature"`
+	Modalities  Modalities `json:"modalities"`
+}
+
+// Modalities declares the input/output shapes a model accepts.
+// models.dev's schema: input is one or more of
+// "text"|"image"|"audio"|"video"|"pdf"; output is usually just "text".
+// SupportsVision checks Input contains "image".
+type Modalities struct {
+	Input  []string `json:"input"`
+	Output []string `json:"output"`
+}
+
+// SupportsImage reports whether m accepts image input. Used by
+// llm.OpenAI.SupportsVision / llm.Anthropic.SupportsVision as the
+// catalog-backed replacement for the hardcoded prefix whitelist.
+func (m Model) SupportsImage() bool {
+	for _, mod := range m.Modalities.Input {
+		if mod == "image" {
+			return true
+		}
+	}
+	return false
 }
 
 // Cost is the per-million-token pricing in USD. Optional because some
@@ -268,6 +290,30 @@ func (c *Client) loadFromDisk() (Catalog, error) {
 // realistic collision shape is a self-hosted re-publish of a hosted
 // model under a different provider name, which would carry the same
 // window anyway.
+// LookupVisionByModelID reports whether the given model accepts image
+// input, per the models.dev catalog's modalities.input array. Returns
+// (supported, found) — found=false when the model isn't in the catalog
+// (caller should fall back to a heuristic, e.g. a prefix whitelist, or
+// default to false).
+//
+// Synchronous + read-only — same safety profile as
+// LookupContextWindowByModelID. Never makes a network request; the
+// caller is responsible for triggering Get() at startup so the cache
+// is warm by the time this is called from a hot path.
+func (c *Client) LookupVisionByModelID(modelID string) (bool, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || modelID == "" {
+		return false, false
+	}
+	for _, p := range c.cached {
+		if m, ok := p.Models[modelID]; ok {
+			return m.SupportsImage(), true
+		}
+	}
+	return false, false
+}
+
 func (c *Client) LookupContextWindowByModelID(modelID string) (int, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

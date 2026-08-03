@@ -417,21 +417,55 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+o":
-		// Toggle global "expand truncated output" — claude-code's ctrl+o.
-		m.expandToolOutputs = !m.expandToolOutputs
-		state := "off"
-		if m.expandToolOutputs {
-			state = "on"
+		// A1 (2026-08-02): replace the global "expand truncated output"
+		// toggle with one-at-a-time semantics. The previous behaviour
+		// flipped m.expandToolOutputs globally — every tool call on the
+		// transcript suddenly rendered its full body, exploding the
+		// viewport height and pushing history out of view (BUG-A).
+		//
+		// New behaviour:
+		//   - Find the LATEST tool event (by toolEvents slice order)
+		//   - If expandedToolID == its ID → clear (collapse it)
+		//   - Otherwise → set expandedToolID to its ID (expand just it)
+		// Only one tool event can be expanded at a time, bounding the
+		// viewport to one extra-full row.
+		if len(m.toolEvents) == 0 {
+			return m, nil
 		}
-		newContent := "expand tool output: " + state
+		// Pick the latest COMPLETED tool event (kind == "result"). Skip
+		// in-flight "start" events — they have no output to expand yet.
+		var latestID string
+		for i := len(m.toolEvents) - 1; i >= 0; i-- {
+			if m.toolEvents[i].Kind == "result" {
+				latestID = m.toolEvents[i].ID
+				break
+			}
+		}
+		if latestID == "" {
+			return m, nil
+		}
+		// Toggle: same ID → collapse; different ID → expand the new one.
+		// P2-2 (2026-08-02): show an info message so the user knows
+		// ctrl+O actually did something. The previous A1 implementation
+		// silently mutated expandedToolID with no visual feedback —
+		// users pressed ctrl+O and nothing appeared to happen if the
+		// latest tool event was already at the bottom of the screen.
+		var newContent string
+		if m.expandedToolID == latestID {
+			m.expandedToolID = ""
+			newContent = "collapse tool output"
+		} else {
+			m.expandedToolID = latestID
+			newContent = "expand tool output (latest)"
+		}
 		// REPLACE the trailing info message instead of appending a new
-		// one when the previous message is also an `expand tool
-		// output: …` toggle. Otherwise rapid ctrl+O presses pile up
-		// "off / on / off / on / off" rows in the transcript.
-		// Feedback 2026-05-05.
+		// one when the previous message is also a tool-output toggle.
+		// Otherwise rapid ctrl+O presses pile up "expand / collapse /
+		// expand / collapse" rows in the transcript.
 		if n := len(m.messages); n > 0 &&
 			m.messages[n-1].Role == "info" &&
-			strings.HasPrefix(m.messages[n-1].Content, "expand tool output:") {
+			(strings.HasPrefix(m.messages[n-1].Content, "expand tool output") ||
+				strings.HasPrefix(m.messages[n-1].Content, "collapse tool output")) {
 			m.messages[n-1].Content = newContent
 			m.messages[n-1].Timestamp = time.Now()
 		} else {

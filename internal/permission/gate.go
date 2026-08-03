@@ -829,7 +829,19 @@ func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope boo
 				case YoloHardDeny:
 					return g.applyBreaker(DecisionDeny, "yolo:hard_deny:"+src, breakerActive)
 				case YoloSoftDeny:
-					return DecisionAsk, "yolo:soft_deny:" + src
+					// 2026-07-26: collapsed to ALLOW in bypass mode.
+					// claude-code's auto-mode classifier has only two
+					// terminal verdicts — shouldBlock:true (deny) and
+					// shouldBlock:false (allow). There is no third
+					// "ambiguous → prompt the human" state; ambiguous
+					// falls into shouldBlock:false. metis used to ship
+					// a YoloSoftDeny → DecisionAsk branch, which meant
+					// bypassPermissions mode STILL popped a permission
+					// dialog every time the classifier wasn't sure —
+					// exactly the UX claude-code's bypassPermissions
+					// avoids (user feedback: bypass should not prompt).
+					// Hard deny stays hard; soft deny joins the allow path.
+					_ = src
 				}
 			}
 		}

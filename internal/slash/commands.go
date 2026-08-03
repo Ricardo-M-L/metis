@@ -214,6 +214,19 @@ func cut(s, sep string) (before, after string, found bool) {
 
 // RegisterAll installs the full built-in command set.
 func RegisterAll(r *Registry, cfg *config.Config) {
+	// /debug — claude-code parity. Lives in a sibling file (debug.go)
+	// because the handler synthesises a multi-paragraph prompt that
+	// gets injected as the next user message (SignalCustomPrompt),
+	// not a string for the REPL to render directly.
+	RegisterDebugCommand(r)
+
+	// /review — same sibling-file pattern (review.go). Builds a
+	// code-review prompt against a local diff (staged by default) or
+	// a PR via `gh`, then SignalCustomPrompt routes it through the
+	// agent loop. Modeled on claude-code's /review and codex's
+	// review_request.rs.
+	RegisterReviewCommand(r)
+
 	// Core commands
 	r.Register(Cmd{Name: "help", Description: "show this help", Handler: func(_ string) (string, Signal) {
 		return r.HelpText(), SignalNone

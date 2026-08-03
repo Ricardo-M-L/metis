@@ -387,38 +387,51 @@ func TestShouldCompact(t *testing.T) {
 	}
 }
 
-// TestShouldCompact_AccountsForMaxTokens locks in the bug-#6 fix: the
-// effective input cap subtracts the per-request max_tokens budget so
-// compaction fires *before* the API's `input + max_tokens > window`
-// check rejects the next request.
+// TestShouldCompact_AccountsForMaxTokens — repro of the user's MiniMax-M2.7
+// case in miniature: context window 1000, max_tokens 400, threshold 0.85.
 //
-// Repro of the user's MiniMax-M2.7 case in miniature:
-//   - context window 1000, max_tokens 400, threshold 0.85
-//   - effective input cap = 1000 - 400 = 600
-//   - threshold trigger    = 600 * 0.85 = 510 tokens
+// B3 (2026-08-02): the trigger is now MaxContextTokens × Threshold,
+// NOT effectiveInputCap × Threshold. The old "subtract max_tokens
+// from the denominator" formula was the root cause of BUG-B — it
+// made the displayed percentage (against MaxContextTokens) disagree
+// with the trigger percentage (against effectiveInputCap), and when
+// max_tokens was large it fired the compactor long before the real
+// cap was hit. Worse, when max_tokens was very large the trigger
+// could fire BEFORE the context was actually full, letting it grow
+// past the cap and produce "99%+ (224%)" in the footer (BUG-D).
 //
-// Without the fix the threshold would be 1000 * 0.85 = 850, so a 700-
-// token conversation would NOT compact, then the next request (700
-// input + 400 max_tokens = 1100 > 1000) would be rejected by the API.
+// The new behaviour: 700 tokens on a 1000-cap model with 0.85
+// threshold does NOT compact (850 trigger). The next request will
+// hit the API with 700 + max_tokens, and the API will reject it if
+// over — that's the API's job, not the compactor's.
 func TestShouldCompact_AccountsForMaxTokens(t *testing.T) {
 	p := &fakeSummarizer{}
 	c := NewCompactor(Config{Threshold: 0.85}, "m", 1000, p)
 	c.MaxOutputTokens = 400
 
-	// 700 tokens (under raw 850 threshold, OVER effective 510 threshold).
-	// estimateTokens charges ~12 tokens of envelope per message + 4 chars/token
-	// for text, so ~2700 chars of body tips us over 700 tokens of input.
-	mid := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 2700))}
-	if !c.ShouldCompact(mid) {
-		t.Errorf("should compact: input ~700 tokens > effective threshold (1000-400)*0.85=510")
+	// P1-3 (2026-08-02): don't rely on estimateTokens's envelope math
+	// (~12 tokens/message + 4 chars/token) to land at exactly ~700 or
+	// ~900 tokens — that couples the test to an implementation detail
+	// that can drift. Instead, push the message count high enough that
+	// we're clearly below / above the 850 trigger regardless of small
+	// envelope changes. 2000 chars ≈ 500 tokens (safely below 850);
+	// 5000 chars ≈ 1250 tokens (safely above 850).
+	below := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 2000))}
+	if c.ShouldCompact(below) {
+		t.Errorf("B3: ~500 tokens should be safely below 850 trigger — should NOT compact")
 	}
 
-	// Verify the legacy path: when MaxOutputTokens is 0, falls back to
-	// using full MaxContextTokens (so the original 850 threshold applies
-	// and the same 700-token convo does NOT compact).
+	above := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 5000))}
+	if !c.ShouldCompact(above) {
+		t.Errorf("B3: ~1250 tokens should be safely above 850 trigger — should compact")
+	}
+
+	// MaxOutputTokens no longer affects the trigger — B3 makes the
+	// threshold MaxContextTokens-relative only. The legacy "shrink
+	// denominator by max_tokens" formula is gone.
 	c.MaxOutputTokens = 0
-	if c.ShouldCompact(mid) {
-		t.Errorf("legacy path: 700 tokens < 1000*0.85=850 threshold should NOT compact")
+	if c.ShouldCompact(below) {
+		t.Errorf("B3: MaxOutputTokens=0 should not change the trigger — ~500 tokens still below 850")
 	}
 }
 
@@ -820,7 +833,131 @@ func TestDefaultCompactionConfig_KeepsMinimumTokensZero(t *testing.T) {
 	if cfg.MinimumTokens != 0 {
 		t.Errorf("DefaultCompactionConfig().MinimumTokens = %d, want 0 (package-level stays disabled; runtime/agent_loop.go injects production value from cfg.Session.AutoCompactMinimumTokens)", cfg.MinimumTokens)
 	}
-	if cfg.Threshold != 0.95 {
-		t.Errorf("DefaultCompactionConfig().Threshold = %v, want 0.95 (raised from 0.85 on 2026-05-16)", cfg.Threshold)
+	if cfg.Threshold != 0.80 {
+		t.Errorf("DefaultCompactionConfig().Threshold = %v, want 0.80 (dropped from 0.95 on 2026-07-26 — large-window compaction was timing out)", cfg.Threshold)
+	}
+}
+
+// TestDefaultCompactionConfig_SetsMaxSummarizeInputTokens — locks in
+// the 2026-07-27 default. 200K keeps any single summarize() call
+// under ~60s on slow providers (~3K tok/s input), regardless of
+// how large the parent context window is. Setting this to 0 would
+// re-enable the "1M-context Compact eats the whole middle in one
+// call" path that produced the 2026-07-26 "compaction stuck at
+// 950K tokens" report.
+func TestDefaultCompactionConfig_SetsMaxSummarizeInputTokens(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	if cfg.MaxSummarizeInputTokens != 200_000 {
+		t.Errorf("DefaultCompactionConfig().MaxSummarizeInputTokens = %d, want 200_000", cfg.MaxSummarizeInputTokens)
+	}
+}
+
+// TestCompact_RespectsMaxSummarizeInputTokens — when the pending
+// middle slice exceeds MaxSummarizeInputTokens, Compact must invoke
+// CollapseMiddle repeatedly to fold the oldest history first, and
+// only call the final summarize() on a middle that fits the budget.
+// Locks in the "summarize input has a ceiling" behaviour added
+// 2026-07-27.
+func TestCompact_RespectsMaxSummarizeInputTokens(t *testing.T) {
+	// Build a long conversation: system + many user/assistant text
+	// pairs, each ~1000 estimated tokens (4000 ASCII chars / 4).
+	big := strings.Repeat("x", 4000)
+	msgs := []llm.Message{msg(llm.RoleSystem, "sys")}
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, msg(llm.RoleUser, big))
+		msgs = append(msgs, msg(llm.RoleAssistant, big))
+	}
+	// Total ≈ 1 + 60 messages, each ~1000 tokens → ~60K middle.
+	// Cap the summarize input at 5K so Compact MUST fold at least
+	// a few times before the final summarize. CollapseFoldWindow=10
+	// folds 10 messages (~10K tokens) per pass, so 5+ folds needed.
+
+	cfg := DefaultCompactionConfig()
+	cfg.ProtectFirst = 1
+	cfg.ProtectLast = 5
+	cfg.CollapseFoldWindow = 10
+	cfg.MaxSummarizeInputTokens = 5_000
+
+	p := &fakeSummarizer{}
+	c := NewCompactor(cfg, "test", 100_000, p)
+	c.Provider = p
+
+	out, err := c.Compact(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if len(out) >= len(msgs) {
+		t.Errorf("Compact returned no progress: in=%d out=%d", len(msgs), len(out))
+	}
+	// The final summarize() call must have received a middle that
+	// fits the budget. Inspect the recorded request: the prompt's
+	// message list is what was fed to summarize(). We assert the
+	// ESTIMATED size of that prompt is ≤ MaxSummarizeInputTokens
+	// plus a generous slack for the system prompt + iterative seed
+	// text (which aren't part of the budget but do land in the
+	// request).
+	if p.calls == 0 {
+		t.Fatal("expected summarize to be called at least once")
+	}
+	lastReq := p.lastReq
+	var fedMessages []llm.Message
+	for _, m := range lastReq.Messages {
+		fedMessages = append(fedMessages, m)
+	}
+	fed := estimateTokens(fedMessages)
+	// The budget guards the middle slice; the assembled prompt also
+	// carries the system instruction + optional priorSummary seed,
+	// so we allow 4x slack before flagging a regression.
+	if fed > cfg.MaxSummarizeInputTokens*4 {
+		t.Errorf("final summarize() prompt estimate = %d tokens, want ≤ ~%d (4x slack over budget %d)",
+			fed, cfg.MaxSummarizeInputTokens*4, cfg.MaxSummarizeInputTokens)
+	}
+}
+
+// TestCompact_NoSummarizeWhenCollapseConsumesAll — boundary case:
+// when CollapseMiddle folds everything except ProtectFirst +
+// ProtectLast, Compact must skip the final summarize call entirely
+// (no middle left to summarize). Guards against a wasted LLM call
+// and against recordCompactResult(false) firing on a successful
+// collapse-only pass.
+func TestCompact_NoSummarizeWhenCollapseConsumesAll(t *testing.T) {
+	big := strings.Repeat("y", 4000) // ~1000 tokens each
+	// 1 system + 10 user/assistant pairs + 4 tail messages = 25 msgs.
+	// ProtectFirst=1 + ProtectLast=5 → middle is 19 messages.
+	// CollapseFoldWindow=25 makes CollapseMiddle eat the entire
+	// middle in one pass, leaving nothing for the final summarize.
+	msgs := []llm.Message{msg(llm.RoleSystem, "sys")}
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs, msg(llm.RoleUser, big))
+		msgs = append(msgs, msg(llm.RoleAssistant, big))
+	}
+	for i := 0; i < 4; i++ {
+		msgs = append(msgs, msg(llm.RoleUser, "tail"))
+	}
+
+	cfg := DefaultCompactionConfig()
+	cfg.ProtectFirst = 1
+	cfg.ProtectLast = 5
+	cfg.CollapseFoldWindow = 25
+	cfg.MaxSummarizeInputTokens = 1_000 // tiny: forces the pre-fold loop
+
+	p := &fakeSummarizer{}
+	c := NewCompactor(cfg, "test", 100_000, p)
+	c.Provider = p
+
+	callsBefore := p.calls
+	out, err := c.Compact(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if len(out) >= len(msgs) {
+		t.Errorf("expected progress: in=%d out=%d", len(msgs), len(out))
+	}
+	// CollapseMiddle called summarize once for its own fold; the
+	// FINAL Compact summarize must NOT have fired (no middle left).
+	// So total calls should be exactly 1 (the collapse fold).
+	if p.calls != callsBefore+1 {
+		t.Errorf("summarize calls = %d, want %d (collapse only, no final summarize)",
+			p.calls, callsBefore+1)
 	}
 }

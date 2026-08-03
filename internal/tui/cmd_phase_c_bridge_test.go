@@ -1,10 +1,15 @@
 package tui
 
 // Tests for the Phase-C commands that gained REPL-bridge closures
-// (cmdBg / cmdAgents / cmdReview / cmdSecurityReview / cmdBreakCache
-// / cmdUsage / cmdBug). The bridge fields on REPL are funcs, so we can
-// fully drive them without spinning up a Model — pass closures that
-// capture test-local state and assert on it.
+// (cmdBg / cmdAgents / cmdSecurityReview / cmdBreakCache / cmdUsage /
+// cmdBug). The bridge fields on REPL are funcs, so we can fully drive
+// them without spinning up a Model — pass closures that capture test-
+// local state and assert on it.
+//
+// 2026-07-28: cmdReview was removed (its REPL shadow of the slash
+// registry's /review handler is gone). The two cmdReview tests that
+// lived here moved to internal/slash/review_test.go where the new
+// handler actually runs.
 
 import (
 	"strings"
@@ -30,26 +35,6 @@ func TestBreakCache_FallsBackWithoutBridge(t *testing.T) {
 	out := cmdBreakCache(r, "")
 	if !strings.Contains(out, "/compact") {
 		t.Errorf("fallback should mention /compact; got:\n%s", out)
-	}
-}
-
-func TestReview_LoadsPromptIntoInput(t *testing.T) {
-	var captured string
-	r := &REPL{InsertInput: func(s string) { captured = s }}
-	out := cmdReview(r, "internal/auth/")
-	if !strings.Contains(captured, "internal/auth/") {
-		t.Errorf("InsertInput should receive prompt referencing target; got: %q", captured)
-	}
-	if !strings.Contains(out, "loaded into input") {
-		t.Errorf("out should confirm load; got: %q", out)
-	}
-}
-
-func TestReview_FallsBackWhenNoInputBridge(t *testing.T) {
-	r := &REPL{}
-	out := cmdReview(r, "")
-	if !strings.Contains(out, "paste this") {
-		t.Errorf("fallback should ask user to paste; got: %q", out)
 	}
 }
 

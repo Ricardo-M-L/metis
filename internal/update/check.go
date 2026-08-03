@@ -14,8 +14,16 @@ const (
 	// stateFile lives under the user's metis config dir and remembers when
 	// we last successfully checked + the latest tag we saw.
 	stateFile = ".update-check"
-	// minInterval throttles the background daily check.
-	minInterval = 24 * time.Hour
+	// minInterval throttles the background update check. Mirrors
+	// claude-code's AutoUpdater.tsx (`useInterval(checkForUpdates, 30*60*1000)`)
+	// — 30 minutes is short enough that a fresh install never lingers on
+	// a stale "latest" hint for a whole day, but long enough that we
+	// don't hammer the releases API on every TUI repaint.
+	// 2026-07-26: was 24h; shortened after user feedback that
+	// `current: v0.3.0 · latest: v0.2.8` (an inverted pair) stayed on
+	// screen for hours after a manual upgrade because the 24h-throttled
+	// cache hadn't refreshed yet.
+	minInterval = 30 * time.Minute
 )
 
 type checkState struct {
@@ -91,12 +99,24 @@ func MaybeCheck(ctx context.Context, configHome, currentVersion string) string {
 	}
 	sp := statePath(configHome)
 	st := loadState(sp)
+	// Stale-cache guard (2026-07-26): if the cached LatestTag is OLDER
+	// than the running binary, the cache is from a previous install
+	// (user upgraded by hand via `go install` / tarball / `metis update`)
+	// and the throttle window is now misleading. Drop LastCheck so we
+	// fall through to a real fetch below; otherwise the TUI would keep
+	// showing `current: v0.3.0 · latest: v0.2.8` until the 30-minute
+	// window expired on its own. Mirrors claude-code's AutoUpdater.tsx
+	// which always fetches fresh on startup instead of trusting a
+	// day-old cached LatestTag.
+	if st.LatestTag != "" && IsNewer(st.LatestTag, currentVersion) {
+		st.LastCheck = time.Time{}
+	}
 	if !st.LastCheck.IsZero() && time.Since(st.LastCheck) < minInterval {
 		// Within throttle window — refresh the TUI hint file from cache
 		// so the chrome row keeps showing "latest" even when we don't
 		// hit the network this startup. Without this, users who delete
 		// ~/.metis/latest_version (or upgrade past it) lose the hint
-		// for up to 24h until the next throttle expiry.
+		// for up to 30 minutes until the next throttle expiry.
 		writeLatestVersionFile(configHome, st.LatestTag)
 		// Within throttle window — but if we already saw a newer tag and
 		// haven't notified the user about *this* version yet, surface it.

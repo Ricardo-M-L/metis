@@ -256,6 +256,16 @@ type Model struct {
 	// Feeds the progress bar + % rendered under the compaction spinner
 	// row (claude-code image #19 layout). Reset on EventContextCompacted.
 	spinnerCompactionBytes int
+
+	// compactionStartedAt is the timestamp of the most recent
+	// EventCompactionStart. The C3 indeterminate sliding bar uses
+	// time.Since(compactionStartedAt) to compute block position, so
+	// the bar tracks THIS compaction's lifetime, not the parent turn's
+	// spinnerStartedAt. Without this field the bar position jumps back
+	// to 0 on every turn boundary even when the compaction is still
+	// running — visually the bar "restarts" mid-compaction (P1-1
+	// 2026-08-02).
+	compactionStartedAt time.Time
 	// spinnerPhase mirrors claude-code's SpinnerMode (sourcemap
 	// restored-src/src/components/Spinner/SpinnerAnimationRow.tsx
 	// lines 235-265). Drives the directional arrow:
@@ -433,11 +443,21 @@ type Model struct {
 	// that across two updates avoids re-entrant runTurnAsync issues
 	// where finalizeTurn is mid-cleanup.
 	queuePending bool
-	// expandToolOutputs is the global "show full tool output" toggle
-	// (claude-code's ctrl+o). When false (default), Edit diffs cap at
-	// 20 lines, Bash output at 5 lines, and extended-thinking blocks
-	// fold to a one-line preview. When true the user gets every byte.
-	expandToolOutputs bool
+
+	// expandedToolID is the A1 ctrl+O mechanism: the **single** tool
+	// event currently expanded. Empty string means "nothing expanded"
+	// (default). When the user presses ctrl+O:
+	//   - if expandedToolID == latest tool event ID → clear (collapse)
+	//   - otherwise → set to latest tool event ID (expand that one)
+	// Only one tool event can be expanded at a time, which keeps the
+	// viewport height bounded (BUG-A fix).
+	//
+	// 2026-08-02 P0-1: the legacy expandToolOutputs global toggle has
+	// been REMOVED. It used to live here and power ctrl+O, but the
+	// global-toggle semantics exploded the viewport on busy transcripts
+	// (every tool call suddenly rendered its full body), pushing history
+	// out of view. The one-at-a-time semantics above replace it.
+	expandedToolID string
 
 	// thinkingDisplay controls how Message{Role:"thinking"} +
 	// Message{Role:"redacted_thinking"} render in the transcript.

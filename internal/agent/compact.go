@@ -166,23 +166,56 @@ type Config struct {
 	// Session.AutoCompactMinimumTokens (toml `auto_compact_minimum_tokens`,
 	// default 50_000).
 	MinimumTokens int
+
+	// MaxSummarizeInputTokens caps how many estimated tokens the
+	// summarize() prompt may ingest in ONE Compact call. When the
+	// pending middle slice exceeds this, Compact first runs
+	// CollapseMiddle (which itself calls the LLM summarizer, but on a
+	// much smaller CollapseFoldWindow-sized batch) repeatedly until
+	// the remaining middle fits, THEN calls summarize on the trimmed
+	// slice. Decouples "when to trigger compaction" (Threshold ×
+	// context window) from "how much the summarizer can chew at once"
+	// (a function of provider input throughput).
+	//
+	// Why this exists (2026-07-27): on a 1M-context Kimi/DeepSeek
+	// window with Threshold=0.95, summarize() was ingesting ~950K
+	// tokens of transcript. At ~3K tok/s input throughput that's ~5
+	// minutes of streaming before the first summary byte comes back —
+	// the "compaction stuck" UX. Lowering Threshold to 0.80 helped
+	// (~800K → ~4 min) but didn't address the root cause: summarize's
+	// input had no ceiling. This cap makes the ceiling explicit. 200K
+	// keeps the summarize call under ~60s on slow providers,
+	// regardless of how large the parent context window is.
+	//
+	// Set 0 to disable (legacy behaviour: summarize always ingests
+	// the full middle).
+	MaxSummarizeInputTokens int
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultCompactionConfig() Config {
 	return Config{
-		// 0.95 (up from 0.85 on 2026-05-16): the 2026-05-16 longrun
-		// against DeepSeek-V4-Pro (1M context) hit 1.3M tokens per
-		// turn before the 0.85 trigger would have fired, because the
-		// per-turn peak still sat under cap*0.85 = 850K. Raising the
-		// gate to 0.95 means compaction now fires at ~950K — close
-		// enough to the cap that the LLM-side recovery (transport
-		// overflow auto-retry) catches the rare overshoot, and the
-		// prompt cache survives much longer between rewrites. On
-		// smaller windows (128K), 0.95 = 121.6K, which is roughly
-		// what the old 0.85 default (108K) gave anyway minus the
-		// per-request output reservation.
-		Threshold:              0.95,
+		// Threshold at which full LLM-driven compaction fires, as a
+		// fraction of effectiveInputCap. 0.80 balances two constraints:
+		//
+		//   - High enough that Snip / Microcompact / Collapse (0.70 /
+		//     0.78) get a real chance to shrink context cheaply first
+		//     — those tiers have no LLM cost.
+		//   - Low enough that when Compact DOES fire on a 1M-context
+		//     window, the middle slice feeding summarize() is bounded
+		//     by MaxSummarizeInputTokens (default 200K), keeping the
+		//     summarize call under ~60s on slow providers.
+		//
+		// Note: this percentage is NOT comparable to claude-code's
+		// ~0.97 effective trigger (autoCompact.ts: effectiveWindow −
+		// 13K buffer on a 1M window). CC can afford a high trigger
+		// because its microCompact path uses the cache_edits API to
+		// delete tool_results server-side WITHOUT invalidating the
+		// prompt cache — metis has no equivalent API on Kimi /
+		// DeepSeek / MiniMax, so its defense-in-depth stops at the
+		// local Snip/Microcompact tier and the summarize-input cap
+		// below.
+		Threshold:              0.80,
 		ProtectFirst:           1, // system message
 		ProtectLast:            5, // recent turns
 		MaxSummaryTokens:       512,
@@ -199,16 +232,33 @@ func DefaultCompactionConfig() Config {
 		// "[snipped: N chars]" rewrite. memory_query / memory_recall:
 		// the model uses these for cross-session recall and frequently
 		// re-cites the exact strings later. skill_help: typically a
-		// short instruction sheet, shouldn't be dropped. Read: the
-		// model is often actively planning around the read body, and
-		// a stale "[snipped]" marker would force a redundant re-read
-		// of the same file on the next iteration.
-		ProtectedTools:        []string{"memory_query", "memory_recall", "skill_help", "Read"},
+		// short instruction sheet, shouldn't be dropped.
+		//
+		// 2026-07-26: removed "Read" from the protected set. A Read
+		// tool_result is the single biggest contributor to context
+		// bloat (a single Read of a 1500-line file is ~12k tokens,
+		// 5 of those is bigger than some model windows). Protecting
+		// them meant Compact had to summarize ALL of them verbatim
+		// — the dominant input to the summarize call — which is
+		// exactly why 1M-context compaction was timing out. The
+		// file is on disk; if the model needs the body again it
+		// can re-Read it. Memory / skill_help stay protected
+		// because they are NOT cheaply re-fetchable.
+		ProtectedTools:        []string{"memory_query", "memory_recall", "skill_help"},
 		RedactSecrets:         true,
 		IterativeSummary:      true,
 		MaxSummaryRetries:     2,
 		IdleMaxSeconds:        3600, // 1h — mirrors CC's timeBasedMC cache-TTL window
 		KeepRecentToolResults: 5,    // mirrors CC microCompact keepRecent=5
+		// 2026-07-27: cap summarize() input at 200K estimated tokens.
+		// On a 1M-context window with Threshold=0.80, the middle slice
+		// feeding summarize() could be ~800K tokens — at typical
+		// Kimi/DeepSeek input throughput (~3K tok/s) that's 4-5 minutes
+		// of streaming before the first summary byte. 200K keeps any
+		// single summarize call under ~60s; Compact invokes
+		// CollapseMiddle repeatedly to fold older history first when
+		// the cap would be exceeded.
+		MaxSummarizeInputTokens: 200_000,
 	}
 }
 
@@ -347,7 +397,23 @@ func (c *Compactor) ShouldCompact(messages []llm.Message) bool {
 	if c.MinimumTokens > 0 && rough < c.MinimumTokens {
 		return false
 	}
-	return float64(rough) >= float64(c.effectiveInputCap())*c.Threshold
+	// B3 (2026-08-02): trigger on MaxContextTokens directly, not
+	// effectiveInputCap. The old formula (MaxContextTokens − reserved) ×
+	// Threshold made the trigger point depend on the user's max_tokens
+	// config — a large max_tokens (e.g. 200K on a 1M-context Kimi model)
+	// shrunk effectiveInputCap by 20K, but the displayed percentage in
+	// the footer used MaxContextTokens as denominator, so users saw
+	// "context at 11% / auto at 91%" and reasonably concluded the
+	// compactor was misfiring (BUG-B). Worse, when max_tokens config
+	// was very large, the trigger could fire BEFORE the context was
+	// actually full, letting it grow past the model's true cap and
+	// produce the impossible "99%+ (224%)" footer state (BUG-D).
+	//
+	// Using MaxContextTokens directly means the displayed percentage
+	// and the actual trigger share the same denominator. Context can
+	// never exceed 100% — the compactor fires at Threshold × cap and
+	// the API would reject anything larger anyway.
+	return float64(rough) >= float64(c.MaxContextTokens)*c.Threshold
 }
 
 // ShouldSnip returns true when the cheap tool-result truncation pass
@@ -863,6 +929,52 @@ func (c *Compactor) Compact(ctx context.Context, messages []llm.Message) ([]llm.
 		// shape is preventing progress — repeated calls won't help.
 		c.recordCompactResult(false, nil)
 		return messages, nil
+	}
+
+	// Pre-summarize budget guard (2026-07-27). When the pending middle
+	// slice alone is bigger than MaxSummarizeInputTokens, fold the
+	// OLDEST folds into collapse boundaries first — each CollapseMiddle
+	// summarizes only CollapseFoldWindow messages at a time, so its
+	// per-call LLM cost is bounded — until the remaining middle fits
+	// the budget. Bounded loop: each iteration either removes
+	// CollapseFoldWindow messages or returns unchanged (nothing left
+	// to fold), in which case we give up and proceed with the
+	// oversized middle — a slow summarize beats none.
+	if c.MaxSummarizeInputTokens > 0 {
+		for i := 0; i < 8; i++ { // hard bound: 8 folds ≈ 80 messages
+			mid := messages[c.ProtectFirst:cut]
+			if estimateTokens(mid) <= c.MaxSummarizeInputTokens {
+				break
+			}
+			folded, err := c.CollapseMiddle(ctx, messages)
+			if err != nil {
+				// Collapse already counted the failure via
+				// recordCompactResult; bubble so the caller
+				// (maybeCompact / tryRecoverOverflow) sees the error
+				// and doesn't immediately retry Compact in the same
+				// iteration.
+				return nil, err
+			}
+			if len(folded) >= len(messages) {
+				break // can't fold further; proceed with what we have
+			}
+			messages = folded
+			// Recompute cut against the shrunk slice.
+			cut = len(messages) - c.ProtectLast
+			cut = adjustCutForToolPairs(messages, cut)
+			if !sliceHasUserText(messages[cut:]) {
+				if anchor := lastUserTextBefore(messages, cut); anchor >= 0 && anchor < cut {
+					cut = anchor
+					cut = adjustCutForToolPairs(messages, cut)
+				}
+			}
+			if cut <= c.ProtectFirst {
+				// Collapse consumed everything — we're done, no
+				// summarize call needed at all.
+				c.recordCompactResult(true, nil)
+				return messages, nil
+			}
+		}
 	}
 
 	keepFirst := messages[:c.ProtectFirst]

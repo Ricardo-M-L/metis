@@ -8,16 +8,21 @@ import (
 
 // TestCompactionExtras_LayoutMatchesImage19 — when spinnerOverride is
 // the "Compacting conversation..." label, renderSpinnerStatus must emit
-// three rows: the spinner verb line, a progress bar with %, and a
-// sub-line announcing the auto-window threshold and configure command.
-// Format mirrors claude-code's image #19 (user feedback 2026-05-16).
+// three rows: the spinner verb line, an INDETERMINATE sliding bar, and
+// a sub-line announcing the auto-window threshold and configure command.
+//
+// C3 (2026-08-02): switched from a percentage bar (bytes/80 capped at
+// 95%) to an indeterminate sliding bar. The percentage version was a
+// lie — summaries usually finish in 1-3s, the bar visually jumped
+// 0→95% between two frames, and the user complained "压缩进度条还没长
+// 就过了" (BUG-C). An indeterminate bar telegraphs "work in progress"
+// without pretending to track real progress.
 func TestCompactionExtras_LayoutMatchesImage19(t *testing.T) {
 	m := minimalModel(200_000)
 	m.spinnerActive = true
 	m.spinnerStartedAt = m.startTime
 	m.spinnerVerb = "thinking" // would normally render
 	m.spinnerOverride = "Compacting conversation..."
-	m.spinnerCompactionBytes = 4000 // → ~50% on the 8000-byte heuristic
 
 	out := stripANSI(renderSpinnerStatus(m))
 
@@ -29,21 +34,19 @@ func TestCompactionExtras_LayoutMatchesImage19(t *testing.T) {
 		t.Fatalf("override should suppress the generic thinking verb; got:\n%s", out)
 	}
 
-	// Row 2: filled progress glyph + a percentage. The exact % depends
-	// on bytes/80 saturation; assert it lies in 1–99 inclusive so we
-	// don't fight rounding but still catch a "0%" or "100%" regression.
+	// Row 2: filled + empty progress glyphs (the sliding block). The
+	// exact position depends on time.Since(spinnerStartedAt), so we
+	// assert only that BOTH glyphs appear (some block somewhere on
+	// the track), not WHERE.
 	if !strings.Contains(out, "▰") {
 		t.Fatalf("expected filled progress glyph ▰; got:\n%s", out)
 	}
 	if !strings.Contains(out, "▱") {
 		t.Fatalf("expected empty progress glyph ▱; got:\n%s", out)
 	}
-	if !strings.Contains(out, "%") {
-		t.Fatalf("expected percentage in output; got:\n%s", out)
-	}
-	// 4000 / 80 = 50.
-	if !strings.Contains(out, "50%") {
-		t.Fatalf("expected 50%% from 4000 bytes; got:\n%s", out)
+	// C3: NO percentage in output — indeterminate bar by design.
+	if strings.Contains(out, "%") {
+		t.Fatalf("C3 indeterminate bar must not show a percentage; got:\n%s", out)
 	}
 
 	// Row 3: literal sub-line announcing the auto-window threshold and
@@ -62,7 +65,6 @@ func TestCompactionExtras_NotShownOutsideCompaction(t *testing.T) {
 	m.spinnerActive = true
 	m.spinnerStartedAt = m.startTime
 	m.spinnerVerb = "thinking"
-	m.spinnerCompactionBytes = 4000 // would render 50% IF compacting
 
 	out := stripANSI(renderSpinnerStatus(m))
 	if strings.Contains(out, "▰") || strings.Contains(out, "▱") {
@@ -73,22 +75,27 @@ func TestCompactionExtras_NotShownOutsideCompaction(t *testing.T) {
 	}
 }
 
-// TestCompactionExtras_SaturatesAt95 — bytes well past the 8KB target
-// must not roll the bar over to 100% (we never know the actual finish
-// until EventContextCompacted fires; a 100% bar that keeps spinning
-// would feel broken).
-func TestCompactionExtras_SaturatesAt95(t *testing.T) {
-	m := minimalModel(200_000)
-	m.spinnerActive = true
-	m.spinnerStartedAt = m.startTime.Add(-3 * time.Second)
-	m.spinnerOverride = "Compacting conversation..."
-	m.spinnerCompactionBytes = 100_000 // pathological — way past target
+// TestCompactionExtras_SlidingBlockMoves — the indeterminate bar's
+// block position must change over time. If the bar froze at one spot,
+// the user would think compaction stalled. We snapshot the bar at two
+// different spinnerStartedAt values and assert the rendered string
+// differs (i.e. the block has moved along the track).
+func TestCompactionExtras_SlidingBlockMoves(t *testing.T) {
+	m1 := minimalModel(200_000)
+	m1.spinnerActive = true
+	m1.spinnerStartedAt = time.Now() // NOT m1.startTime — that's zero, collapses t=0/t=1s
+	m1.spinnerOverride = "Compacting conversation..."
+	out1 := stripANSI(renderSpinnerStatus(m1))
 
-	out := stripANSI(renderSpinnerStatus(m))
-	if !strings.Contains(out, "95%") {
-		t.Fatalf("expected saturating cap at 95%% for huge byte counts; got:\n%s", out)
-	}
-	if strings.Contains(out, "100%") {
-		t.Fatalf("bar must not show 100%% while call is in flight; got:\n%s", out)
+	// Advance start time by ~1 second — should land the block at a
+	// different position on the track.
+	m2 := minimalModel(200_000)
+	m2.spinnerActive = true
+	m2.spinnerStartedAt = time.Now().Add(-1 * time.Second)
+	m2.spinnerOverride = "Compacting conversation..."
+	out2 := stripANSI(renderSpinnerStatus(m2))
+
+	if out1 == out2 {
+		t.Fatalf("indeterminate bar should move as time advances; got identical output:\n--- t=0 ---\n%s\n--- t=1s ---\n%s", out1, out2)
 	}
 }

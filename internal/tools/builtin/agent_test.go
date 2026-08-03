@@ -61,9 +61,19 @@ func TestAgentTool_RequiresPrompt(t *testing.T) {
 }
 
 func TestAgentTool_IsReadOnlyDelegationBoundary(t *testing.T) {
-	tool := NewAgent(permission.New(permission.ModePlan), helloProvider(), tools.NewRegistry(), "model", "system")
-	if !tool.IsReadOnly(map[string]any{"prompt": "inspect the repository"}) {
-		t.Fatal("Agent must be read-only at the parent boundary; child tool calls enforce their own permissions")
+	// 2026-07-27: rescoped. The previous version asserted Agent was
+	// read-only when the parent was in ModePlan — that's exactly the
+	// leak the plan-mode contract fix closed. Agent in a plan-mode
+	// parent is now NOT read-only at the boundary (so the Gate denies
+	// it via the plan-mode write path); outside plan mode the boundary
+	// remains read-only when no permission_mode override is requested.
+	planTool := NewAgent(permission.New(permission.ModePlan), helloProvider(), tools.NewRegistry(), "model", "system")
+	if planTool.IsReadOnly(map[string]any{"prompt": "inspect the repository"}) {
+		t.Error("Agent in a plan-mode parent must NOT be advertised as read-only (2026-07-27 contract)")
+	}
+	defaultTool := NewAgent(permission.New(permission.ModeDefault), helloProvider(), tools.NewRegistry(), "model", "system")
+	if !defaultTool.IsReadOnly(map[string]any{"prompt": "inspect the repository"}) {
+		t.Error("Agent outside plan mode with no override should remain read-only; child tool calls enforce their own permissions")
 	}
 }
 

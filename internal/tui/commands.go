@@ -101,7 +101,10 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "replay", Description: "re-run the last turn with the same prompt (no edits)", Handler: cmdReplay})
 	r.Register(REPLCommand{Name: "tasks", Description: "list session todos (TodoRead)", Handler: cmdTasks})
 	r.Register(REPLCommand{Name: "ide", Description: "show IDE / remote bridge status (/share + ACP)", Handler: cmdIDE})
-	r.Register(REPLCommand{Name: "review", Description: "request a code review of the current branch / staged changes", Handler: cmdReview})
+	// /review is owned by the slash registry (internal/slash/review.go)
+	// — see the 2026-07-28 cleanup that removed the legacy cmdReview
+	// REPL shadow. The slash handler emits a SignalCustomPrompt that
+	// keybind_submit routes back into the agent loop.
 	r.Register(REPLCommand{Name: "bug", Description: "compose a bug report (opens editor or pastes session log)", Handler: cmdBug})
 	r.Register(REPLCommand{Name: "lessons", Description: "show recent turn outcomes from ~/.metis/learned.jsonl (continuous-learning v0)", Handler: cmdLessons})
 	r.Register(REPLCommand{Name: "rename", Aliases: []string{"title"}, Description: "rename current session: rename <new title>", Handler: cmdRename})
@@ -189,9 +192,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "statusline", Description: "show + customize the bottom status line", Handler: cmdStatusLine})
 	r.Register(REPLCommand{Name: "bg", Description: "background-turn status (alias for Ctrl+B mid-turn)", Handler: cmdBg})
 	r.Register(REPLCommand{Name: "cost", Description: "show token usage for current session", Handler: cmdCost})
-	r.Register(REPLCommand{Name: "tokens", Description: "show last API call's raw token breakdown (input/output/cache)", Handler: cmdTokens})
 	r.Register(REPLCommand{Name: "usage", Description: "show API rate limit info", Handler: cmdUsage})
-	r.Register(REPLCommand{Name: "debug", Description: "show debug info (session, model, messages, compact)", Handler: cmdDebug})
 
 	// === Debug ===
 	r.Register(REPLCommand{Name: "stack", Description: "show panic stack trace", Handler: cmdStack})
@@ -563,31 +564,13 @@ func cmdIDE(r *REPL, args string) string {
 	return strings.Join(lines, "\n")
 }
 
-// cmdReview emits a system-prompt-style nudge asking the model to
-// review staged changes. The actual review happens in the next turn
-// via Bash + LLM analysis.
-//
-// Refactored 2026-05-18: instead of returning a string telling the user
-// to type the prompt themselves, build the full review prompt and stuff
-// it into the input textarea via r.InsertInput. The user just hits
-// Enter to submit. Falls back to the legacy "go prompt the model with…"
-// string when invoked from a headless REPL with no input bridge.
-func cmdReview(r *REPL, args string) string {
-	target := strings.TrimSpace(args)
-	if target == "" {
-		target = "staged changes (git diff --cached)"
-	}
-	prompt := buildReviewPrompt(target, false)
-	if r != nil && r.InsertInput != nil {
-		r.InsertInput(prompt)
-		return "review: prompt loaded into input — review, then press Enter to send"
-	}
-	return "review: paste this into the prompt to start —\n\n" + prompt
-}
-
-// buildReviewPrompt is the shared prompt body used by /review and
-// /security-review. Pulled out so the prompt itself can be unit-tested
-// without driving the TUI input path.
+// buildReviewPrompt is the shared prompt body used by /security-review.
+// /review itself moved to internal/slash/review.go on 2026-07-28 —
+// the legacy cmdReview REPL handler that used this for the default
+// "staged changes" target has been removed so the slash path can
+// drive a richer, model-directed review (CC-style LOCAL_REVIEW_PROMPT).
+// Pulled out so the prompt itself can be unit-tested without driving
+// the TUI input path.
 func buildReviewPrompt(target string, security bool) string {
 	var b strings.Builder
 	if security {
@@ -1653,48 +1636,6 @@ func cmdUsage(r *REPL, args string) string {
 	return renderInfoBox("Usage", rows)
 }
 
-// cmdTokens surfaces the most recent API call's raw token breakdown +
-// the session cumulative breakdown. The user reported the bottom-right
-// percentage looking inflated and asked "is this counting wrong?";
-// this command lets them see EXACTLY what the provider returned for
-// each field, so they can disambiguate "metis math bug" from "provider
-// reported it that way" from "long history naturally inflates input".
-//
-// Layout matches /cost so the two read consistently.
-func cmdTokens(r *REPL, args string) string {
-	t := &r.totalTokens
-	rows := []infoRow{
-		{Key: "── most recent API call ──", Value: ""},
-		{Key: "input_tokens", Value: fmtThousands(t.LastIn()), Hint: "fresh tokens this round"},
-		{Key: "output_tokens", Value: fmtThousands(t.LastOut()), Hint: "tokens the model produced"},
-		{Key: "cache_creation", Value: fmtThousands(t.LastCacheCreate()), Hint: "tokens written to prompt cache"},
-		{Key: "cache_read", Value: fmtThousands(t.LastCacheRead()), Hint: "tokens served from prompt cache"},
-		{Key: "── derived ──", Value: ""},
-		{Key: "per-turn cost", Value: fmtThousands(t.LastTotal()), Hint: "input + output (spinner row)"},
-		{Key: "context load", Value: fmtThousands(t.ContextUsage()), Hint: "input + cache_create + cache_read (bottom-right)"},
-		{Key: "── session cumulative ──", Value: ""},
-		{Key: "input total", Value: fmtThousands(t.Input())},
-		{Key: "output total", Value: fmtThousands(t.Output())},
-		{Key: "cache_create total", Value: fmtThousands(t.CacheCreate())},
-		{Key: "cache_read total", Value: fmtThousands(t.CacheRead())},
-		{Key: "cache hit rate", Value: fmt.Sprintf("%.1f%%", t.CacheHitRate()*100), Hint: "cache_read / (read+create+input)"},
-	}
-	return renderInfoBox("Token Breakdown", rows)
-}
-
-func cmdDebug(r *REPL, args string) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("  session:  %s\n", r.SessionID))
-	b.WriteString(fmt.Sprintf("  model:    %s\n", r.Loop.Model))
-	b.WriteString(fmt.Sprintf("  messages: %d\n", len(r.Loop.History())))
-	b.WriteString(fmt.Sprintf("  compact:  %v\n", r.Loop.Compactor != nil))
-	if r.skillDir != "" {
-		b.WriteString(fmt.Sprintf("  skillDir: %s\n", r.skillDir))
-	}
-	b.WriteString(fmt.Sprintf("  mode:     %s\n", r.Gate.Mode()))
-	b.WriteString(fmt.Sprintf("  tools:    %d\n", len(r.Loop.Registry.All())))
-	return b.String()
-}
 
 func cmdStack(r *REPL, args string) string {
 	return string(debug.Stack())

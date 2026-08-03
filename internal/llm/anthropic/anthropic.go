@@ -142,18 +142,24 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 func (a *Anthropic) ModelID() string { return a.Model }
 
 // SupportsVision reports whether the configured Anthropic model
-// accepts image content blocks. All Claude 3+ family models do; the
-// legacy claude-2.x line did not. We err on the side of allow
-// (return true) for any model id starting with "claude-3" /
-// "claude-4" / "claude-opus" / "claude-sonnet" / "claude-haiku" —
-// covers every Anthropic vision model since Claude 3 launch.
+// accepts image content blocks.
 //
-// Custom-base-URL providers (MiniMax anthropic-compat layer, etc.)
-// that don't support vision configure themselves as a custom
-// transport and DON'T inherit from this struct, so they correctly
-// land in the "no SupportsVision method → ProviderSupportsVision
-// returns false" path.
+// 2026-08-01 rework: catalog-first, whitelist-fallback. Same pattern
+// as OpenAI.SupportsVision — the previous prefix list covered only
+// the Claude lineage + minimax, but newer vision models surface in
+// the models.dev catalog automatically now. The catalog knows all
+// Anthropic models (claude-3, claude-4, claude-opus-4-5, etc.) so
+// in practice the catalog path always answers; the prefix list is
+// retained only as the cold-cache / offline fallback.
 func (a *Anthropic) SupportsVision() bool {
+	// Tier 1 — models.dev catalog.
+	if cli := catalog.Default(); cli != nil {
+		if supported, found := cli.LookupVisionByModelID(a.Model); found {
+			return supported
+		}
+	}
+
+	// Tier 2 — prefix whitelist (cold-cache / offline fallback).
 	m := strings.ToLower(a.Model)
 	switch {
 	case strings.HasPrefix(m, "claude-3"),
@@ -161,9 +167,7 @@ func (a *Anthropic) SupportsVision() bool {
 		strings.HasPrefix(m, "claude-opus"),
 		strings.HasPrefix(m, "claude-sonnet"),
 		strings.HasPrefix(m, "claude-haiku"),
-		// MiniMax via the api.minimaxi.com/anthropic-compat layer. User
-		// confirms minimax-m2.x accepts image content blocks through this
-		// endpoint despite the model not matching the Claude lineage.
+		// MiniMax via the api.minimaxi.com/anthropic-compat layer.
 		strings.HasPrefix(m, "minimax-m"),
 		strings.HasPrefix(m, "minimax-vl"):
 		return true

@@ -159,6 +159,54 @@ func toolArgsPreview(name string, input map[string]any) string {
 		if v, ok := input["url"].(string); ok {
 			preview = v
 		}
+	case "WebSearch":
+		// Surface the query so the header reads `WebSearch(foo bar)`,
+		// mirroring DeepSeek-TUI's `Search · <query>` collapsed row.
+		if v, ok := input["query"].(string); ok {
+			preview = v
+		}
+	case "Agent", "Fork":
+		// claude-code-style sub-agent label: `Explore (search auth flow)`.
+		// The LLM supplies a 3-5 word `description` (added to Agent's
+		// InputSchema 2026-07-27); we render `<type> (<description>)`
+		// when both are present. Falls back to first ~6 words of prompt
+		// when description is empty (legacy callers / external tools
+		// that don't know about the field), and to bare type/name when
+		// neither is set. The old auto-suffix `<type>-N` form
+		// (explore-1, explore-2) is gone from the leader — it was just
+		// the registry's internal name and read as noise.
+		st, _ := input["subagent_type"].(string)
+		nm, _ := input["name"].(string)
+		desc, _ := input["description"].(string)
+		pr, _ := input["prompt"].(string)
+		// Derive a short slug from the first ~6 words of the prompt
+		// when description is missing — keeps any prompt-only Agent
+		// call visually meaningful without depending on the LLM
+		// knowing about the new field.
+		if desc == "" && pr != "" {
+			words := strings.Fields(pr)
+			if len(words) > 6 {
+				words = words[:6]
+			}
+			desc = strings.Join(words, " ")
+			desc = strings.TrimRight(desc, ".,;:!?…")
+		}
+		// Cap description at ~40 runes so the leader doesn't wrap.
+		if rs := []rune(desc); len(rs) > 40 {
+			desc = string(rs[:39]) + "…"
+		}
+		label := st
+		if label == "" {
+			label = nm
+		}
+		switch {
+		case label != "" && desc != "":
+			preview = label + " (" + desc + ")"
+		case desc != "":
+			preview = desc
+		case label != "":
+			preview = label
+		}
 	default:
 		for _, key := range []string{"path", "command", "query", "name", "url"} {
 			if v, ok := input[key].(string); ok {

@@ -118,7 +118,7 @@ func TestWriteLatestVersionFile_SilentOnEmptyArgs(t *testing.T) {
 
 // TestMaybeCheck_WritesLatestVersionFromCache locks in the throttle-
 // window code path: even when MaybeCheck doesn't hit the network this
-// startup (24h throttle), it must refresh the latest_version hint
+// startup (30min throttle), it must refresh the latest_version hint
 // from the cached state file so the chrome row keeps showing
 // "latest" across throttle windows.
 func TestMaybeCheck_WritesLatestVersionFromCache(t *testing.T) {
@@ -126,7 +126,7 @@ func TestMaybeCheck_WritesLatestVersionFromCache(t *testing.T) {
 	t.Setenv("METIS_GITHUB_TOKEN", "fake-token-for-throttle-path")
 	// Pre-populate state so MaybeCheck takes the throttle-cache branch.
 	saveState(statePath(dir), checkState{
-		LastCheck: time.Now().Add(-time.Hour), // within minInterval (24h)
+		LastCheck: time.Now().Add(-time.Minute), // within minInterval (30min)
 		LatestTag: "v0.2.0",
 		// Mark this tag as already-notified so we don't try to surface it.
 		LastTagSeen: "v0.2.0",

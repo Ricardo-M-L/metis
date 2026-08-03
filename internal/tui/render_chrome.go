@@ -315,26 +315,55 @@ func renderDreamingExtras(m *Model) string {
 // with it. Layout mirrors claude-code's compaction display (image #19
 // user feedback 2026-05-15).
 func renderCompactionExtras(m *Model) string {
-	// 8000-byte heuristic target: summaries usually land between 4-12KB,
-	// so bytes/80 puts a typical run at 50–95% by the time it finishes.
-	pct := m.spinnerCompactionBytes / 80
-	if pct > 95 {
-		pct = 95
-	}
-	if pct < 0 {
-		pct = 0
-	}
+	// C3 (2026-08-02): switch from a percentage bar (bytes/80 capped at 95%)
+	// to an indeterminate sliding bar. The percentage version was a lie —
+	// summaries usually finish in 1-3s, the bar visually jumped 0→95%
+	// between two frames, and the user complained "压缩进度条还没长就过了"
+	// (BUG-C). An indeterminate bar telegraphs "work in progress, don't
+	// know how long" without pretending to track real progress.
+	//
+	// Implementation: a 4-cell block slides left-to-right across a 22-cell
+	// track. Position is derived from elapsed time (120ms per step ≈ the
+	// spinner tick rate), so the bar moves on every repaint even when the
+	// summarize stream is idle.
 	const barWidth = 22
-	filled := pct * barWidth / 100
-	if filled > barWidth {
-		filled = barWidth
+	const blockWidth = 4
+	// P1-1 (2026-08-02): use compactionStartedAt (stamped on
+	// EventCompactionStart) instead of spinnerStartedAt (turn start).
+	// spinnerStartedAt resets every turn — using it meant the bar
+	// position jumped back to 0 on turn boundaries even when the
+	// compaction was still running.
+	startedAt := m.compactionStartedAt
+	if startedAt.IsZero() {
+		// Cold-render path (tests, pre-EventCompactionStart): fall back
+		// to spinnerStartedAt so the bar still animates in test fixtures.
+		startedAt = m.spinnerStartedAt
+	}
+	// P2-1 (2026-08-02): shorten the per-step time from 120ms to 80ms.
+	// The original 120ms × 36 steps = 4.32s full cycle was longer than
+	// a typical summarize call (1-3s), so users never saw a complete
+	// L→R→L sweep — the bar looked "stuck" at one position. 80ms × 36
+	// steps = 2.88s cycle, which fits inside a typical summarize and
+	// still reads as "smooth motion" rather than "jittery".
+	steps := int(time.Since(startedAt) / (80 * time.Millisecond))
+	// Ping-pong: 0 → (barWidth-blockWidth) → 0
+	cycle := (barWidth - blockWidth) * 2
+	pos := 0
+	if cycle > 0 {
+		p := steps % cycle
+		if p <= barWidth-blockWidth {
+			pos = p
+		} else {
+			pos = cycle - p
+		}
 	}
 	var bar strings.Builder
-	for i := 0; i < filled; i++ {
-		bar.WriteString("▰")
-	}
-	for i := filled; i < barWidth; i++ {
-		bar.WriteString("▱")
+	for i := 0; i < barWidth; i++ {
+		if i >= pos && i < pos+blockWidth {
+			bar.WriteString("▰")
+		} else {
+			bar.WriteString("▱")
+		}
 	}
 
 	// Auto-window threshold = Compactor.Threshold (default 0.85) ×
@@ -358,7 +387,6 @@ func renderCompactionExtras(m *Model) string {
 	var s strings.Builder
 	s.WriteString("  ")
 	s.WriteString(styleAccent.Render(bar.String()))
-	s.WriteString(styleDim.Render(fmt.Sprintf(" %d%%", pct)))
 	s.WriteString("\n")
 	s.WriteString("  ")
 	if autoWindow > 0 {
@@ -574,6 +602,14 @@ func renderStatusBar(m *Model) string {
 // we read it from ~/.metis/latest_version (a file the user or a future
 // background fetcher writes); when absent or equal to current we drop
 // it so we don't print noise like "current: 0.1.0 · latest: 0.1.0".
+//
+// Note: we deliberately don't filter "latest older than current" here.
+// That case is handled upstream in internal/update/check.go MaybeCheck
+// via the stale-cache invalidation: when the running binary is newer
+// than the cached LatestTag, LastCheck is cleared so the next startup
+// fetches fresh. Doing the filter here would hide the symptom (stale
+// cache) without fixing the cause — exactly the wrong layer to
+// intervene (2026-07-26 discussion).
 func renderVersionLine() string {
 	cur := version.Short()
 	if cur == "" || cur == "unknown" {

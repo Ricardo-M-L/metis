@@ -82,7 +82,17 @@ func (m *Model) View() tea.View {
 	chatView := func(content string) tea.View {
 		v := tea.NewView(content)
 		v.AltScreen = true
-		v.MouseMode = tea.MouseModeCellMotion
+		// MouseModeNone: don't capture the mouse at all. The terminal
+		// then handles drag-to-select natively, so Cmd+C just works
+		// for copying any on-screen text — including the input box,
+		// which is what the user actually wants (2026-08-01 user
+		// report: "输入框里的文字没法用光标选择").
+		//
+		// Trade-off: the mouse wheel no longer scrolls chat history
+		// (it now scrolls the terminal's native scrollback instead,
+		// which is empty in alt-screen mode). Users scroll chat via
+		// PgUp/PgDn / arrow keys / the scroll bar.
+		v.MouseMode = tea.MouseModeNone
 		// Enable xterm focus reporting (DECSET 1004 — `\x1b[?1004h`)
 		// so bubbletea v2 dispatches FocusMsg / BlurMsg when the
 		// terminal tab gains/loses focus. tui_update.go handles

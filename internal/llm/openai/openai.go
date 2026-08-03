@@ -117,17 +117,38 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 func (o *OpenAI) ModelID() string { return o.Model }
 
 // SupportsVision reports whether the configured OpenAI model accepts
-// image_url content parts. Vision-capable lineage: gpt-4-vision-*,
-// gpt-4-turbo*, gpt-4o*, gpt-5*, o3*, o4*. Compat-base-URL providers
-// (DeepSeek, Kimi, GLM, MiniMax openai-mode) overwhelmingly DON'T
-// support vision and use model ids that won't match the prefixes
-// below — those correctly fall through to false.
+// image_url content parts.
 //
-// We're conservative on purpose: a false negative (model COULD do
-// vision, gate says no) just costs a re-paste in a vision model. A
-// false positive (text-only model gets image bytes) burns the entire
-// turn on a cryptic API rejection.
+// 2026-08-01 rework: catalog-first, whitelist-fallback. The previous
+// implementation was a hardcoded prefix list — every new vision model
+// (kimi-k3, glm-5v-turbo, etc.) required a code change and a metis
+// release. Now we ask the models.dev catalog first (same source
+// opencode / hermes-agent / MiMo-Code use), and only fall back to
+// the prefix list when the catalog hasn't warmed yet or doesn't know
+// the model. New models surface automatically when models.dev updates
+// upstream; no metis release needed.
+//
+// We're still conservative on purpose: a false negative (model COULD
+// do vision, gate says no) just costs a re-paste in a vision model.
+// A false positive (text-only model gets image bytes) burns the
+// entire turn on a cryptic API rejection. So both the catalog path
+// and the whitelist path prefer "say no" on ambiguity.
 func (o *OpenAI) SupportsVision() bool {
+	// Tier 1 — models.dev catalog. Default() returns nil in CI or when
+	// METIS_CATALOG_DISABLE=1; LookupVisionByModelID returns
+	// found=false when the cache is cold or the model is unknown.
+	// Both are nil/miss-safe, so this branch is free when the catalog
+	// can't help.
+	if cli := catalog.Default(); cli != nil {
+		if supported, found := cli.LookupVisionByModelID(o.Model); found {
+			return supported
+		}
+	}
+
+	// Tier 2 — prefix whitelist. Kept as the cold-cache / offline /
+	// not-yet-in-catalog fallback. List mirrors the pre-2026-08-01
+	// hardcoded set; new entries should go through the catalog path
+	// whenever possible instead of being added here.
 	m := strings.ToLower(o.Model)
 	switch {
 	// OpenAI native lineage.
@@ -140,28 +161,10 @@ func (o *OpenAI) SupportsVision() bool {
 		strings.HasPrefix(m, "o4"),
 		strings.HasPrefix(m, "chatgpt-4o"):
 		return true
-	// Chinese OSS families. Two cohorts:
-	//
-	//   1. Text-flagship names that DO natively accept image_url on
-	//      the same /chat/completions endpoint. Confirmed by live
-	//      2026-05-20 smoke: glm-5.1 + minimax-m2.7 both correctly
-	//      identified colors in a test PNG. kimi-k2 stays on the
-	//      list pending a Kimi-side smoke (no API key in the test
-	//      run); user can drop it themselves if their kimi
-	//      configuration 400s on image_url.
-	//
-	//   2. Explicit *-vl / *-vision / *-4v variants — always vision.
-	//
-	// Notable exclusion: deepseek-v4-pro / deepseek-v4-flash. Sounds
-	// like they should be on the list, but DeepSeek's published
-	// list-models API exposes no vision-capable V4 id, and live
-	// smoke returns 400 "unknown variant image_url" on V4-Pro. The
-	// marketing "DeepSeek V4 Vision" capability has no API model id
-	// yet. Per the false-positive cost rationale above (a cryptic
-	// 400 burns the whole turn), we'd rather strip the image and
-	// surface a clean "provider lacks vision support" note.
+	// Chinese OSS families (fallback only — prefer catalog above).
 	case strings.HasPrefix(m, "deepseek-vl"),
 		strings.HasPrefix(m, "kimi-k2"),
+		strings.HasPrefix(m, "kimi-k3"),
 		strings.HasPrefix(m, "kimi-latest"),
 		strings.HasPrefix(m, "kimi-vl"),
 		strings.HasPrefix(m, "moonshot-v1-vision"),

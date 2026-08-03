@@ -37,9 +37,12 @@ func TestBuildChatItems_GroupsConsecutiveExplorationTools(t *testing.T) {
 		t.Errorf("compact group leaked per-file rows:\n%s", compact)
 	}
 
-	m.expandToolOutputs = true
-	expandedItems := m.buildChatItems()
-	expanded := expandedItems[1].Render(100)
+	// P0-1 (2026-08-02): the legacy expandToolOutputs toggle is gone;
+	// explorationGroupItem's expand flag is now driven exclusively by
+	// the construction site (always false in production). Test the
+	// expand=true render path directly by constructing the item by hand.
+	directGroup := &explorationGroupItem{events: m.toolEvents, expand: true}
+	expanded := directGroup.Render(100)
 	for _, want := range []string{"a.go", "b.go", "TODO", "**/*.go"} {
 		if !strings.Contains(expanded, want) {
 			t.Errorf("expanded group missing original %q:\n%s", want, expanded)

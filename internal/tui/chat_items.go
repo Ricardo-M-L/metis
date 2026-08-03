@@ -76,9 +76,22 @@ type toolEventItem struct {
 // underlying tools remain one event each (and still execute/audit normally),
 // but consecutive successful Read/Grep/Glob/LS rows render as one compact
 // count summary. Ctrl+O uses the same item to reveal every original row.
+//
+// 2026-07-27 grouping tweak (user feedback "一堆省略号"): the previous
+// groupableExplorationEvent filter rejected any event with a non-empty
+// SubAgentParentID, so a fan-out of 5 sub-agents × 3 greps each produced
+// 15 un-grouped rows of "⏺ grep …" + "(ctrl+O to expand)" — visually a
+// wall of ellipses. We now track SubAgentParentID on the group and let
+// same-parent sub-agent events cluster together; the rendered block is
+// indented when the whole group came from a child agent, so the
+// transcript still reads as a tree.
 type explorationGroupItem struct {
 	events []ToolEvent
 	expand bool
+	// subParent is the shared SubAgentParentID across all events ("" for
+	// top-level groups). Stamped at flush time so Render can decide
+	// whether to indent without re-deriving it.
+	subParent string
 }
 
 func (i *explorationGroupItem) Render(width int) string {
@@ -113,11 +126,20 @@ func (i *explorationGroupItem) Render(width int) string {
 	if listings > 0 {
 		parts = append(parts, fmt.Sprintf("Listed %d %s", listings, pluralN(listings, "directory", "directories")))
 	}
+	// Sub-agent groups render INDENTED under their parent Agent row,
+	// mirroring the per-tool sub-agent indentation in render_tool.go's
+	// isSub branch. Keeps the tree visual: top-level "explored" is
+	// flush-left, sub-agent groups sit at +4.
+	isSub := i.subParent != ""
+	leadIndent, resultIndent := "  ", "    "
+	if isSub {
+		leadIndent, resultIndent = "      ", "        "
+	}
 	var out strings.Builder
-	out.WriteString(styleSuccess.Render("  " + glyphBullet + " "))
+	out.WriteString(styleSuccess.Render(leadIndent + glyphBullet + " "))
 	out.WriteString(styleToolName.Render("explored"))
 	out.WriteString("\n")
-	out.WriteString(styleDim.Render("    " + glyphTreeLeaf + "  "))
+	out.WriteString(styleDim.Render(resultIndent + glyphTreeLeaf + "  "))
 	out.WriteString(styleAccent.Render("✓ "))
 	out.WriteString(strings.Join(parts, " · "))
 	out.WriteString(styleMuted.Render(" (ctrl+O to expand)"))
@@ -132,8 +154,14 @@ func pluralN(n int, singular, plural string) string {
 	return plural
 }
 
+// groupableExplorationEvent reports whether te can join an exploration
+// cluster. Errors and in-flight "start" rows are excluded — they need
+// their own visual treatment. Sub-agent events ARE included now (they
+// were excluded pre-2026-07-27, causing the un-grouped "wall of dots");
+// buildChatItems' flushExploration additionally keys clusters by
+// SubAgentParentID so events from different children never mix.
 func groupableExplorationEvent(te ToolEvent) bool {
-	if te.Kind == "start" || te.IsError || te.SubAgentParentID != "" {
+	if te.Kind == "start" || te.IsError {
 		return false
 	}
 	switch strings.TrimPrefix(te.ToolName, "sub: ") {
@@ -188,40 +216,67 @@ func (s *staticItem) Render(width int) string {
 // mouse wheel, causing it to "stick" on screen as the user scrolled).
 // Not cached — content updates on every spinner tick.
 type inProgressThinkingItem struct {
-	text   string
-	expand bool
-	width  int // captured for thinkingHintFits gate; safe to ignore Render arg
+	text    string
+	expand  bool
+	width   int           // captured for thinkingHintFits gate; safe to ignore Render arg
+	elapsed time.Duration // time since thinking started; 0 = omit from header
 }
+
+// thinkingLiveWindow is the number of trailing thinking lines shown
+// during streaming. Matches DeepSeek-TUI's collapsed reasoning card
+// (3-4 content lines) — long enough to show the current thread,
+// short enough that 60+ token/s streams don't drown the viewport.
+const thinkingLiveWindow = 4
 
 func (it *inProgressThinkingItem) Render(width int) string {
 	if it.text == "" {
 		return ""
 	}
-	// 2026-05-21: aligned with renderMessage::case "thinking" — always
-	// render full. See that case for the rationale (silent-tool-loop
-	// turns produced stacks of one-line collapsed rows; full reasoning
-	// gives the user a real window into the model). `expand` field
-	// kept on the struct for cache-stability + future re-flip.
 	var sb strings.Builder
+	// Header: "✻ thinking … live · 3.2s". Mirrors DeepSeek-TUI's
+	// "… reasoning live|done · 12.3s" pattern. Elapsed is optional —
+	// callers that haven't been taught about the field pass 0 and
+	// the header omits it.
 	sb.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
+	sb.WriteString(styleAccent.Render("thinking"))
+	sb.WriteString(styleMuted.Render(" … live"))
+	if it.elapsed > 0 {
+		sb.WriteString(styleMuted.Render(" · " + formatElapsed(it.elapsed)))
+	}
+	sb.WriteString("\n")
+
 	thinkStyle := styleDim.Italic(true)
-	// Wrap before line-splitting — same lesson as renderMessage:
-	// streamed thinking arrives as a single long line and would
-	// overflow the right edge if rendered raw.
 	bodyW := width - 4
 	if bodyW < 20 {
 		bodyW = 20
 	}
 	wrapped := xansi.Wrap(it.text, bodyW, " /-_.")
 	lines := strings.Split(wrapped, "\n")
-	if len(lines) > 0 {
-		sb.WriteString(thinkStyle.Render(lines[0]))
-		for _, ln := range lines[1:] {
-			sb.WriteString("\n  ")
-			sb.WriteString(thinkStyle.Render(ln))
-		}
+	// Sliding window: keep only the LAST thinkingLiveWindow lines.
+	// A leading "…" row hints that earlier lines exist; the full
+	// text is preserved on the historical thinking message that
+	// lands after streaming ends (renderMessage::case "thinking").
+	truncated := false
+	if len(lines) > thinkingLiveWindow {
+		lines = lines[len(lines)-thinkingLiveWindow:]
+		truncated = true
 	}
-	sb.WriteString("\n")
+	railStyle := styleDim
+	if truncated {
+		sb.WriteString(railStyle.Render("  ╎ "))
+		sb.WriteString(thinkStyle.Render("…"))
+		sb.WriteString("\n")
+	}
+	for i, ln := range lines {
+		sb.WriteString(railStyle.Render("  ╎ "))
+		sb.WriteString(thinkStyle.Render(ln))
+		// Trailing cursor on the LAST line — DeepSeek-TUI's "▎"
+		// glyph, signals "stream is still appending".
+		if i == len(lines)-1 {
+			sb.WriteString(styleAccent.Render(" ▎"))
+		}
+		sb.WriteString("\n")
+	}
 	return sb.String()
 }
 
@@ -290,10 +345,22 @@ func (m *Model) buildChatItems() []list.Item {
 			return
 		}
 		if len(explorationRun) == 1 {
-			out = append(out, &toolEventItem{te: explorationRun[0], expand: m.expandToolOutputs, cache: m.renderCache})
+			// A1 (2026-08-02): expand only when this event's ID matches
+			// expandedToolID. The legacy m.expandToolOutputs global
+			// toggle has been removed (see tui.go) — the old OR-fallback
+			// branch was dead code in production but a foot-gun in tests.
+			out = append(out, &toolEventItem{te: explorationRun[0], expand: explorationRun[0].ID == m.expandedToolID, cache: m.renderCache})
 		} else {
 			events := append([]ToolEvent(nil), explorationRun...)
-			out = append(out, &explorationGroupItem{events: events, expand: m.expandToolOutputs})
+			// explorationGroupItem has no per-event expand plumbing —
+			// grouped events always render collapsed. Ctrl+O against a
+			// grouped event currently no-ops; per-event expansion inside
+			// a group is a follow-up.
+			out = append(out, &explorationGroupItem{
+				events:    events,
+				expand:    false,
+				subParent: events[0].SubAgentParentID,
+			})
 		}
 		explorationRun = explorationRun[:0]
 	}
@@ -304,26 +371,46 @@ func (m *Model) buildChatItems() []list.Item {
 			if hideThinking && (it.msg.Role == "thinking" || it.msg.Role == "redacted_thinking") {
 				continue
 			}
-			expand := m.expandToolOutputs
-			if forceExpandThinking && it.msg.Role == "thinking" {
-				expand = true
-			}
+			// A1 (2026-08-02): thinking rows honour /thinking show only.
+			// The legacy expandToolOutputs global toggle is gone; ctrl+O
+			// against a thinking row no longer expands it (only tool
+			// events participate in one-at-a-time expansion).
+			expand := forceExpandThinking && it.msg.Role == "thinking"
 			out = append(out, &messageItem{msg: *it.msg, expand: expand, cache: m.renderCache})
 		case it.te != nil:
+			// Cluster boundary: a groupable event joins the current run
+			// only if its SubAgentParentID MATCHES the run's existing
+			// parent. Prevents 5 parallel sub-agents' grep calls from
+			// collapsing into one giant "Searched 15 patterns" blob
+			// that loses track of which child produced what.
 			if groupableExplorationEvent(*it.te) {
+				if len(explorationRun) > 0 &&
+					explorationRun[0].SubAgentParentID != it.te.SubAgentParentID {
+					flushExploration()
+				}
 				explorationRun = append(explorationRun, *it.te)
 				continue
 			}
 			flushExploration()
-			out = append(out, &toolEventItem{te: *it.te, expand: m.expandToolOutputs, cache: m.renderCache})
+			// A1: expand only when this event's ID matches expandedToolID.
+			out = append(out, &toolEventItem{te: *it.te, expand: it.te.ID == m.expandedToolID, cache: m.renderCache})
 		}
 	}
 	flushExploration()
 	if m.thinkingText != "" && !hideThinking {
+		// Elapsed: time since the first streaming delta arrived. Falls
+		// back to 0 when firstStreamAt is unset (e.g. thinking started
+		// before any text — rare but possible) so the header just omits
+		// the duration rather than showing a bogus value.
+		var elapsed time.Duration
+		if !m.firstStreamAt.IsZero() {
+			elapsed = time.Since(m.firstStreamAt)
+		}
 		out = append(out, &inProgressThinkingItem{
-			text:   m.thinkingText,
-			expand: m.expandToolOutputs || forceExpandThinking,
-			width:  m.width,
+			text:    m.thinkingText,
+			expand:  forceExpandThinking,
+			width:   m.width,
+			elapsed: elapsed,
 		})
 	}
 	if m.streamingText != "" {

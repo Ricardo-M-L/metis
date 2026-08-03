@@ -535,8 +535,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.stickyBottom = true
 			}
 		}
-		return m, nil
-
 	case spinnerTick:
 		// Spinner glyph index is now time-gated (renderSpinnerStatus
 		// computes it from elapsed via spinnerStepMs), so we no longer
@@ -646,6 +644,14 @@ func (m *Model) finalizeTurn(err error) {
 	m.backgroundedAt = time.Time{}
 	m.turnActive = false
 	m.spinnerActive = false
+	// Clear spinnerSub on turn end so a stale sub-label doesn't leak
+	// into the NEXT turn's first spinner frame. Pre-2026-08-01 the
+	// label survived finalizeTurn; the elapsed-display branch then
+	// matched `spinnerSub != ""`, walked back to the last tool start
+	// event (possibly from a turn that ended hours ago), and rendered
+	// absurd durations like "22h 47m" for a fresh `ls`. See
+	// render_chrome.go:172-180 for the consumer.
+	m.spinnerSub = ""
 	// Turn complete — clear the per-turn cancel func now that we're
 	// on the main thread. Previously runTurnAsync did this from
 	// inside the goroutine, which raced against handleSubmit on the

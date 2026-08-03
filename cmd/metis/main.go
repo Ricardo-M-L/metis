@@ -1559,7 +1559,7 @@ func cmdChat(ctx context.Context, args []string) error {
 		if err := ensureTrusted(); err != nil {
 			return err
 		}
-		if notice := maybeNotifyUpdate(); notice != "" {
+		if notice := maybeAutoUpdate(); notice != "" {
 			tui.SetPendingUpdateNotice(notice)
 		}
 	}

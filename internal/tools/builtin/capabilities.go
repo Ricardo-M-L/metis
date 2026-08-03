@@ -118,6 +118,18 @@ func (Git) IsReadOnly(map[string]any) bool { return false }
 // child posture is not read-only and must go through the parent's normal
 // approval flow. Worktree isolation is never read-only because its setup
 // changes git metadata before the child runs.
+//
+// 2026-07-27: when the parent is itself in ModePlan, Agent is NO LONGER
+// advertised as read-only — even though the spawned child would be locked
+// into ModePlan downstream (agent.go:709). Reasoning: the user-visible
+// contract of plan mode is "stop and propose a plan, don't keep working".
+// Treating Agent as read-only let the model spin up arbitrarily many
+// read-only children to keep exploring, which (a) burns tokens, (b) makes
+// plan mode feel indistinguishable from a normal turn, and (c) differs
+// from claude-code's "write the plan file, then ExitPlanMode" contract.
+// Returning false here routes Agent through the same deny path as
+// Edit/Write in plan mode, forcing the model to exit plan mode before
+// delegating further work.
 func (a Agent) IsReadOnly(in map[string]any) bool {
 	if isolation, _ := in["isolation"].(string); strings.TrimSpace(isolation) == "worktree" {
 		return false
@@ -126,6 +138,9 @@ func (a Agent) IsReadOnly(in map[string]any) bool {
 	parentMode := permission.ModeDefault
 	if a.gate != nil {
 		parentMode = a.gate.Mode()
+	}
+	if parentMode == permission.ModePlan {
+		return false
 	}
 	requested, hasRequested, err := requestedAgentPermissionMode(in)
 	if err != nil {

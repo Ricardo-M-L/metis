@@ -82,13 +82,16 @@ func TestBuildChatItems_ThinkingDisplay_Hide_DropsBothRows(t *testing.T) {
 }
 
 // TestBuildChatItems_ThinkingDisplay_Show_ForcesExpand — `/thinking show`
-// must force normal thinking rows to render expanded regardless of the
-// global expandToolOutputs state. Redacted rows are unaffected (they
-// have no expand state).
+// must force normal thinking rows to render expanded. Redacted rows are
+// unaffected (they have no expand state).
+//
+// P0-1 (2026-08-02): the global expandToolOutputs toggle was removed;
+// thinking rows now honour /thinking show only. The comment about
+// "even when expandToolOutputs=false" is preserved as historical
+// context but the field no longer exists on the Model.
 func TestBuildChatItems_ThinkingDisplay_Show_ForcesExpand(t *testing.T) {
 	m := newTestModelForVisibility()
 	m.thinkingDisplay = "show"
-	m.expandToolOutputs = false // global toggle is OFF
 	m.messages = []Message{
 		{Role: "thinking", Content: "multi-line\nreasoning trace"},
 	}
@@ -99,19 +102,21 @@ func TestBuildChatItems_ThinkingDisplay_Show_ForcesExpand(t *testing.T) {
 			continue
 		}
 		if !mi.expand {
-			t.Errorf("/thinking show must force thinking rows to render expanded even when expandToolOutputs=false")
+			t.Errorf("/thinking show must force thinking rows to render expanded")
 		}
 	}
 }
 
 // TestBuildChatItems_ThinkingDisplay_Auto_KeepsLegacyBehaviour — `auto`
-// (the default) preserves the pre-change semantics: thinking renders
-// collapsed unless expandToolOutputs is on, redacted_thinking renders
-// as a placeholder, both rows are kept in the item list.
+// (the default) preserves the collapsed-by-default semantics: thinking
+// renders collapsed, redacted_thinking renders as a placeholder, both
+// rows are kept in the item list.
+//
+// P0-1 (2026-08-02): expandToolOutputs is gone, so the test no longer
+// sets it; the assertion flips to "/thinking auto renders collapsed".
 func TestBuildChatItems_ThinkingDisplay_Auto_KeepsLegacyBehaviour(t *testing.T) {
 	m := newTestModelForVisibility()
 	m.thinkingDisplay = "auto"
-	m.expandToolOutputs = false
 	m.messages = []Message{
 		{Role: "thinking", Content: "trace"},
 		{Role: "redacted_thinking", Content: "CIPHER"},
@@ -126,7 +131,7 @@ func TestBuildChatItems_ThinkingDisplay_Auto_KeepsLegacyBehaviour(t *testing.T) 
 		if mi.msg.Role == "thinking" {
 			thinkingKept = true
 			if mi.expand {
-				t.Errorf("/thinking auto + expandToolOutputs=false must render thinking COLLAPSED (mi.expand=true is wrong)")
+				t.Errorf("/thinking auto must render thinking COLLAPSED (mi.expand=true is wrong)")
 			}
 		}
 		if mi.msg.Role == "redacted_thinking" {

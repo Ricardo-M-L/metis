@@ -5,6 +5,7 @@ package tui
 // recap lines, info/error banners. Tool events live in render_tool.go.
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -31,6 +32,12 @@ import (
 // AssistantThinkingMessage shouldShowFullThinking gate (controlled by
 // transcript-mode + verbose flag there; metis reuses Ctrl+O's
 // expandToolOutputs toggle for both tool output and thinking).
+// thinkingHistoryWindow is the number of leading lines shown when a
+// historical thinking block is collapsed. Matches the live-stream
+// window (thinkingLiveWindow in chat_items.go) so the visual density
+// is consistent pre/post finalization.
+const thinkingHistoryWindow = 4
+
 func renderMessage(msg Message, width int, expand bool) string {
 	var s strings.Builder
 	switch msg.Role {
@@ -128,6 +135,8 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// it. If the noise complaint comes back, the
 		// re-collapse-by-default switch is a 3-line revert.
 		s.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
+		s.WriteString(styleAccent.Render("thinking"))
+		s.WriteString("\n")
 		thinkStyle := styleDim.Italic(true)
 		// Wrap to body width before splitting on \n, otherwise streamed
 		// thinking content (often arrives as one long paragraph with
@@ -141,15 +150,31 @@ func renderMessage(msg Message, width int, expand bool) string {
 		}
 		wrapped := xansi.Wrap(msg.Content, bodyW, " /-_.")
 		thinkLines := strings.Split(wrapped, "\n")
-		if len(thinkLines) > 0 {
-			s.WriteString(thinkStyle.Render(thinkLines[0]))
-			for _, ln := range thinkLines[1:] {
-				s.WriteString("\n  ")
-				s.WriteString(thinkStyle.Render(ln))
-			}
+		// 2026-08-01 collapse-by-default (user request): show the FIRST
+		// thinkingHistoryWindow lines as a preview, then a "(ctrl+O to
+		// see N more lines)" affordance. The 2026-05-21 "always full"
+		// behaviour dumped 100+ line reasoning traces into the transcript
+		// and buried the actual answer; DeepSeek-TUI's collapsed
+		// reasoning card is the model here. expand=true (ctrl+O) still
+		// reveals the full text — same affordance as tool outputs.
+		showLines := thinkLines
+		truncated := false
+		if !expand && len(thinkLines) > thinkingHistoryWindow {
+			showLines = thinkLines[:thinkingHistoryWindow]
+			truncated = true
 		}
-		s.WriteString("\n")
-		_ = expand // see note above — kept for cache-key + signature stability
+		railStyle := styleDim
+		for _, ln := range showLines {
+			s.WriteString(railStyle.Render("  ╎ "))
+			s.WriteString(thinkStyle.Render(ln))
+			s.WriteString("\n")
+		}
+		if truncated {
+			remaining := len(thinkLines) - thinkingHistoryWindow
+			s.WriteString(railStyle.Render("  ╎ "))
+			s.WriteString(styleMuted.Render(fmt.Sprintf("(ctrl+O to see %d more lines)", remaining)))
+			s.WriteString("\n")
+		}
 	case "redacted_thinking":
 		// Anthropic safety classifier replaced this reasoning chunk
 		// with opaque cipher text. The cipher text is in msg.Content

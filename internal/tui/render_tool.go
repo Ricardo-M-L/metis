@@ -151,6 +151,17 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 			s.WriteString(renderWritePreview(te.Input, expanded))
 		case "TodoWrite":
 			s.WriteString(renderTodoSnapshot())
+		case "SubAgentOutput":
+			// SubAgentOutput's LLM-facing body starts with a machine KV
+			// header ("agent_id=agt-XXX name=YYY status=running …")
+			// followed by "---output---" / "---end---" markers. That
+			// envelope is useful to the model but reads as noise in the
+			// TUI — strip those lines and render only the agent's own
+			// text content.
+			filtered := stripSubAgentOutputEnvelope(te.Output)
+			if filtered != "" {
+				s.WriteString(renderToolOutputPreview(te.ToolName, filtered, expanded))
+			}
 		default:
 			if te.Output != "" && (expanded || !collapseToolBodyByDefault(baseName)) {
 				s.WriteString(renderToolOutputPreview(te.ToolName, te.Output, expanded))
@@ -170,8 +181,16 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 // dedicated visible renderers.
 func collapseToolBodyByDefault(toolName string) bool {
 	switch toolName {
-	case "Read", "LS", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Fork":
+	case "Read", "LS", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Fork",
+		"SubAgentList", "SubAgentStop":
 		return true
+	// SubAgentOutput is intentionally NOT collapsed by default: the
+	// point of polling a sub-agent output is to READ what it produced,
+	// so hiding it behind ctrl+O defeats the purpose (user feedback
+	// 2026-08-01). claude-code collapses it; we diverge because
+	// SubAgent results are usually the final answer the user asked for.
+	case "SubAgentOutput":
+		return false
 	default:
 		return false
 	}
@@ -317,6 +336,154 @@ func summarizeToolResult(te ToolEvent) string {
 			word = "file"
 		}
 		return fmt.Sprintf("%s · Found %d %s", dur, n, word)
+	case "SubAgentOutput":
+		// SubAgentOutput's LLM-facing output begins with a machine KV
+		// line "agent_id=agt-XXX name=YYY status=running …" — useful
+		// for the model (which needs the ID to refer back) but noise
+		// in the TUI. claude-code's TaskOutput leader shows a semantic
+		// label ("Task is still running…"), codex shows the agent
+		// nickname + friendly state. We do the same: the leader
+		// surfaces the STATUS + how much output the child has
+		// produced, NOT the internal IDs. The full KV line still
+		// reaches the LLM; only the user-visible row is filtered.
+		if te.IsError {
+			return fmt.Sprintf("%s · failed", dur)
+		}
+		out := strings.TrimSpace(te.Output)
+		if out == "" {
+			return fmt.Sprintf("%s · no output yet", dur)
+		}
+		status := ""
+		// Parse "status=X" from the FIRST whitespace-separated KV line.
+		// Two shapes:
+		//   - multi-line output: head = up to first "\n"
+		//   - single-line output (just spawned, no body yet): head = whole out
+		head := out
+		if nl := strings.Index(out, "\n"); nl > 0 {
+			head = out[:nl]
+		}
+		for _, kv := range strings.Fields(head) {
+			if strings.HasPrefix(kv, "status=") {
+				status = strings.TrimPrefix(kv, "status=")
+				break
+			}
+		}
+		body := ""
+		if idx := strings.Index(out, "---output---"); idx >= 0 {
+			body = out[idx+len("---output---"):]
+		}
+		n := lineCount(strings.TrimSpace(body))
+		word := "lines"
+		if n == 1 {
+			word = "line"
+		}
+		switch status {
+		case "running":
+			if n > 0 {
+				return fmt.Sprintf("%s · still running · %d %s", dur, n, word)
+			}
+			return fmt.Sprintf("%s · still running", dur)
+		case "completed":
+			return fmt.Sprintf("%s · completed · %d %s", dur, n, word)
+		case "killed":
+			return fmt.Sprintf("%s · killed", dur)
+		case "failed":
+			return fmt.Sprintf("%s · failed", dur)
+		}
+		return fmt.Sprintf("%s · %d %s", dur, n, word)
+	case "SubAgentList":
+		// SubAgentList returns a roster dump of "agent_id=... name=..."
+		// KV lines — one per agent. Surface just the COUNT in the
+		// leader; the user can ctrl+O for the roster detail.
+		if te.IsError {
+			return fmt.Sprintf("%s · failed", dur)
+		}
+		out := strings.TrimSpace(te.Output)
+		if out == "" || strings.HasPrefix(out, "(no sub-agents") {
+			return fmt.Sprintf("%s · no sub-agents", dur)
+		}
+		n := lineCount(out)
+		word := "agents"
+		if n == 1 {
+			word = "agent"
+		}
+		return fmt.Sprintf("%s · %d %s", dur, n, word)
+	case "SubAgentStop":
+		if te.IsError {
+			return fmt.Sprintf("%s · failed", dur)
+		}
+		return fmt.Sprintf("%s · stopped", dur)
+	case "WebSearch":
+		// Output begins with `WebSearch "<query>" — N results:` (see
+		// websearch.go formatter). Parse N + the trailing "[via X]"
+		// footer so the leader reads "12ms · 5 results · via tavily"
+		// instead of dumping the first 60 chars of raw output. Mirrors
+		// DeepSeek-TUI's `Found N result(s)` summary line.
+		if te.IsError {
+			return fmt.Sprintf("%s · failed", dur)
+		}
+		out := strings.TrimSpace(te.Output)
+		if out == "" {
+			return fmt.Sprintf("%s · 0 results", dur)
+		}
+		backend := ""
+		if idx := strings.LastIndex(out, "[via "); idx >= 0 {
+			tail := out[idx+len("[via "):]
+			if end := strings.Index(tail, "]"); end > 0 {
+				backend = tail[:end]
+			}
+		}
+		n := -1
+		// Parse "— N results" from the FIRST line. Two shapes:
+		//   - multi-line output: head = up to first "\n"
+		//   - single-line output (no "\n" — partial stream or tiny
+		//     response): head = whole out
+		// Pre-2026-07-27 the `nl > 0` guard skipped parse entirely
+		// when the output was a single line, dropping the result count.
+		head := out
+		if nl := strings.Index(out, "\n"); nl > 0 {
+			head = out[:nl]
+		}
+		// "— " is U+2014 em dash + space = 3+1 = 4 bytes, NOT 2.
+		// SscanF-skipping via head[i+2:] lands INSIDE the em dash and
+		// the %d never matches. Use len() so the byte math is right.
+		if i := strings.Index(head, "— "); i >= 0 {
+			var cnt int
+			if _, err := fmt.Sscanf(head[i+len("— "):], "%d results", &cnt); err == nil {
+				n = cnt
+			}
+		}
+		word := "results"
+		if n == 1 {
+			word = "result"
+		}
+		switch {
+		case n >= 0 && backend != "":
+			return fmt.Sprintf("%s · %d %s · via %s", dur, n, word, backend)
+		case n >= 0:
+			return fmt.Sprintf("%s · %d %s", dur, n, word)
+		case backend != "":
+			return fmt.Sprintf("%s · via %s", dur, backend)
+		}
+		return fmt.Sprintf("%s · %s", dur, truncate(firstNonEmptyLine(out), 60))
+	case "WebFetch":
+		if te.IsError {
+			return fmt.Sprintf("%s · failed", dur)
+		}
+		out := strings.TrimSpace(te.Output)
+		if out == "" {
+			return fmt.Sprintf("%s · empty", dur)
+		}
+		// Body size is the most useful "what did I just download" signal.
+		n := len(te.Output)
+		switch {
+		case n >= 1024*1024:
+			return fmt.Sprintf("%s · %.1f MB", dur, float64(n)/(1024*1024))
+		case n >= 1024:
+			return fmt.Sprintf("%s · %.1f KB", dur, float64(n)/1024)
+		default:
+			return fmt.Sprintf("%s · %d B", dur, n)
+		}
 	case "Grep":
 		// Same error-path guard as Glob/Read — don't count error-message
 		// lines as if they were matches.
@@ -600,6 +767,34 @@ func renderToolOutputPreview(toolName, out string, expanded bool) string {
 		s.WriteString("\n")
 	}
 	return s.String()
+}
+
+// stripSubAgentOutputEnvelope removes the machine-readable wrapper from
+// SubAgentOutput's result body so only the agent's own text renders in
+// the TUI. Dropped lines:
+//   - the leading "agent_id=agt-XXX name=YYY status=ZZZ …" KV header
+//   - the "---output---" section marker
+//   - the trailing "---end (elapsed=…)--- [hint]" footer
+//
+// The LLM still receives the full envelope (this filter only runs at
+// the render boundary); the user sees just the agent's transcript text.
+func stripSubAgentOutputEnvelope(out string) string {
+	var kept []string
+	for i, ln := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(ln)
+		// First line is the KV header when it begins with agent_id=.
+		if i == 0 && strings.HasPrefix(trimmed, "agent_id=") {
+			continue
+		}
+		if trimmed == "---output---" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "---end ") && strings.HasSuffix(trimmed, "---") {
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
 // formatToolPreviewLine applies per-tool prefix-dimming so the

@@ -323,6 +323,17 @@ func (l *List) SelectedText() string {
 				continue
 			}
 			seg := ansi.Strip(ansi.Cut(line, lo, hi))
+			// H1d: trim trailing whitespace ONLY when it looks like viewport
+			// padding (not real content). The TUI pads every rendered row
+			// to m.width so viewport math works — copying `111111111111`
+			// from a 200-col terminal would yield 188 dead spaces. We
+			// distinguish padding from real trailing blanks by heuristic:
+			// if the trailing run is >8 chars, it's almost certainly
+			// viewport fill (real trailing blanks in chat content rarely
+			// exceed a couple spaces). Short runs stay (test
+			// TestSelection_BackwardDragNormalizes expects "alpha beta "
+			// with a single trailing space preserved).
+			seg = trimViewportPadding(seg)
 			b.WriteString(seg)
 			if li < toLine || idx < end.ItemIdx {
 				b.WriteString("\n")
@@ -330,6 +341,28 @@ func (l *List) SelectedText() string {
 		}
 	}
 	return b.String()
+}
+
+// trimViewportPadding strips trailing whitespace ONLY when the trailing
+// run is long enough to be viewport fill (not real content). The TUI
+// pads every rendered row to m.width so viewport math works, but the
+// user expects the clipboard to hold the natural content — claude-code
+// / codex don't carry trailing blanks when you drag-copy a short line.
+//
+// Heuristic: trailing run >16 chars = viewport fill (strip it); short
+// runs = real content (keep them). The original threshold of 8 was too
+// aggressive (P1-2 2026-08-02) — code blocks with indented blank lines
+// or trailing comments (e.g. `        // comment`) easily exceed 8
+// spaces at indent level 2+, and the trim would eat real content. 16
+// matches the longest legitimate trailing-blank run we've seen in chat
+// (deeply-nested code blocks at indent 4 = 16 spaces) while still
+// catching the 100+ char viewport padding that motivated H1.
+func trimViewportPadding(s string) string {
+	trimmed := strings.TrimRight(s, " \t")
+	if len(s)-len(trimmed) > 16 {
+		return trimmed
+	}
+	return s
 }
 
 // selectionBgOpen / selectionBgClose paint the highlight as a SOLID

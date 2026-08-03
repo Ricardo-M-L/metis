@@ -29,18 +29,19 @@ func TestYolo_AllowPassesThrough(t *testing.T) {
 	}
 }
 
-// TestYolo_SoftDenyDowngradesToAsk — soft_deny means "ambiguous, prompt
-// the user". Even in bypass mode, the user gets the prompt — that's the
-// safety-net point of the classifier.
-func TestYolo_SoftDenyDowngradesToAsk(t *testing.T) {
+// TestYolo_SoftDenyAllowsInBypass — 2026-07-26 behaviour change.
+// claude-code's auto-mode classifier has only two terminal verdicts
+// (shouldBlock:true → deny, shouldBlock:false → allow); there is no
+// third "ambiguous → prompt" state. metis used to map YoloSoftDeny to
+// DecisionAsk, which made bypassPermissions mode still pop permission
+// dialogs — exactly the UX claude-code's bypassPermissions avoids.
+// Soft deny now collapses into the allow path. Hard deny stays hard.
+func TestYolo_SoftDenyAllowsInBypass(t *testing.T) {
 	g := New(ModeBypass)
 	g.SetClassifier(&stubClassifier{verdict: YoloSoftDeny, reason: "rm -rf-ish"})
 	d, src := g.Check(context.Background(), "Bash", "rm -r .")
-	if d != DecisionAsk {
-		t.Errorf("YoloSoftDeny → DecisionAsk; got %v src=%q", d, src)
-	}
-	if src == "" || src == "default" {
-		t.Errorf("source should reflect yolo classification; got %q", src)
+	if d != DecisionAllow {
+		t.Errorf("YoloSoftDeny in bypass mode → DecisionAllow (claude-code parity); got %v src=%q", d, src)
 	}
 }
 
