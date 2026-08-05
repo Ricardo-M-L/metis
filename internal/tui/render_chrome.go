@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
+	xansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -143,6 +144,46 @@ func renderInputLine(m *Model) string {
 	return s.String()
 }
 
+
+// clampLine truncates a single rendered row (already styled, ANSI escapes
+// included) to fit `width` terminal cells. The chat list measures item
+// heights by counting newlines: a styled row longer than the viewport
+// wraps in the TERMINAL (soft-wrap) but not in our count, so the
+// renderer's frame-diff walks one row short on the next repaint and
+// leaves stale fragments of the old frame on screen (2026-08-04 user
+// screenshot: "g" / "1." debris on the left margin during Compacting,
+// caused by the 74-cell "Compacting at auto window (235k tokens)"
+// sub-line soft-wrapping on a ~72-col pane). Truncating here guarantees
+// one logical line == one physical row.
+//
+// xansi.Truncate is ANSI-aware (never cuts an escape sequence) and
+// cell-aware (CJK glyphs count as 2 cells), and appends an ellipsis
+// when it actually truncates.
+func clampLine(line string, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+	if xansi.StringWidth(line) <= width {
+		return line
+	}
+	return xansi.Truncate(line, width, "…")
+}
+
+// clampBlock applies clampLine to every newline-separated row of a
+// rendered block. Trailing-newline structure is preserved because we
+// split and rejoin on the same separator.
+func clampBlock(block string, width int) string {
+	nl := "\n"
+	if !strings.Contains(block, nl) {
+		return clampLine(block, width)
+	}
+	rows := strings.Split(block, nl)
+	for i, r := range rows {
+		rows[i] = clampLine(r, width)
+	}
+	return strings.Join(rows, nl)
+}
+
 // renderSpinnerStatus builds the streaming-state line:
 //
 //   - Verb sub (12s · ↓ 3.1k tokens · thought for 1s)
@@ -238,7 +279,16 @@ func renderSpinnerStatus(m *Model) string {
 		s.WriteString("\n")
 		return s.String()
 	}
-	s.WriteString(styleAccent.Render("  " + frame + " "))
+	// 2026-08-04 line-wrap fix: assemble the spinner main line into a
+	// local buffer first, then clamp to the terminal width before it
+	// hits the chat list. The list measures item heights by counting
+	// newlines, so a spinner row wider than the viewport soft-wraps in
+	// the terminal but not in our count — the next frame's diff then
+	// walks one row short and leaves stale debris on screen (the "g" /
+	// "1." fragments in the user's screenshot, which came from this
+	// exact row during Compacting).
+	var mainRow strings.Builder
+	mainRow.WriteString(styleAccent.Render("  " + frame + " "))
 	switch {
 	case m.spinnerOverride != "":
 		// Compaction (or any other long-running blocking phase) — the
@@ -249,21 +299,22 @@ func renderSpinnerStatus(m *Model) string {
 		// EventCompactionStart) is the primary visual cue; an inline
 		// token counter on top of that is redundant (user feedback
 		// 2026-05-15).
-		s.WriteString(shimmerStyle(elapsed).Render(m.spinnerOverride))
+		mainRow.WriteString(shimmerStyle(elapsed).Render(m.spinnerOverride))
 	case m.spinnerSub != "":
-		s.WriteString(toolUseFlashStyle(elapsed).Render(m.spinnerVerb))
-		s.WriteString(styleDim.Render(" · " + truncate(m.spinnerSub, 35)))
+		mainRow.WriteString(toolUseFlashStyle(elapsed).Render(m.spinnerVerb))
+		mainRow.WriteString(styleDim.Render(" · " + truncate(m.spinnerSub, 35)))
 	default:
-		s.WriteString(shimmerStyle(elapsed).Render(m.spinnerVerb))
+		mainRow.WriteString(shimmerStyle(elapsed).Render(m.spinnerVerb))
 	}
 	if len(parts) > 0 {
 		// Status info (elapsed · tokens · thought) — readable in dim,
 		// not buried in muted grey. Parens themselves stay muted as
 		// punctuation so the eye reads through them.
-		s.WriteString(styleMuted.Render(" ("))
-		s.WriteString(styleDim.Render(strings.Join(parts, " · ")))
-		s.WriteString(styleMuted.Render(")"))
+		mainRow.WriteString(styleMuted.Render(" ("))
+		mainRow.WriteString(styleDim.Render(strings.Join(parts, " · ")))
+		mainRow.WriteString(styleMuted.Render(")"))
 	}
+	s.WriteString(clampLine(mainRow.String(), m.width))
 	s.WriteString("\n")
 	// Compaction extras — match claude-code's image #19 layout: spinner
 	// row + progress bar with % + sub-line announcing the auto-window
@@ -388,11 +439,15 @@ func renderCompactionExtras(m *Model) string {
 	s.WriteString("  ")
 	s.WriteString(styleAccent.Render(bar.String()))
 	s.WriteString("\n")
-	s.WriteString("  ")
+	// 2026-08-04: clamp the sub-line to the terminal width. The full
+	// string is ~74 cells ("└ Compacting at auto window (235k tokens) ·
+	// /autocompact to configure") and soft-wrapped on panes narrower
+	// than that, desyncing the renderer's per-frame line accounting —
+	// the debris in the user's screenshot came from this row.
 	if autoWindow > 0 {
-		s.WriteString(styleDim.Render(fmt.Sprintf("└ Compacting at auto window (%s tokens) · /autocompact to configure", formatTokens(autoWindow))))
+		s.WriteString(clampLine("  "+styleDim.Render(fmt.Sprintf("└ Compacting at auto window (%s tokens) · /autocompact to configure", formatTokens(autoWindow))), m.width))
 	} else {
-		s.WriteString(styleDim.Render("└ Compacting at auto window · /autocompact to configure"))
+		s.WriteString(clampLine("  "+styleDim.Render("└ Compacting at auto window · /autocompact to configure"), m.width))
 	}
 	s.WriteString("\n")
 	return s.String()
@@ -550,7 +605,22 @@ func renderStatusBar(m *Model) string {
 	if w <= 0 {
 		w = 80
 	}
-	gap := w - lipgloss.Width(left) - lipgloss.Width(right) - 2
+	// 2026-08-04: when many status chips are active (sub-agents, cron,
+	// voice, bridge, branch, session id, todos, jobs, queue…) the left
+	// side alone can exceed the terminal width. The old code clamped
+	// `gap` at 1 but still emitted the full left string, so the row
+	// soft-wrapped and desynced the frame-diff line accounting (same
+	// root cause as the Compacting debris in the user screenshot).
+	// Reserve space for the right side, then truncate the left to fit.
+	rightW := lipgloss.Width(right)
+	maxLeft := w - rightW - 3 // 1 leading gap cell + 2 trailing cells
+	if maxLeft < 10 {
+		maxLeft = 10
+	}
+	if lipgloss.Width(left) > maxLeft {
+		left = xansi.Truncate(left, maxLeft, "…")
+	}
+	gap := w - lipgloss.Width(left) - rightW - 2
 	if gap < 1 {
 		gap = 1
 	}
@@ -726,7 +796,13 @@ func modeIcon(mode string) (glyph string, c color.Color) {
 // telegraphing "you're not in default anymore" is the right call.
 func renderHints(m *Model) string {
 	if m.permActive {
-		return ""
+		// Keep a visible anchor under the input box while the permission
+		// prompt owns the decision keys. Previously this returned "" so
+		// the band collapsed — combined with the still-editable textarea
+		// (keybind_permission routes letter keys through), users typed,
+		// saw the mode badge vanish, and read the screen as "frozen".
+		return styleWarn.Render("  ⏳ waiting for your permission decision above") +
+			styleMuted.Render(" · you can keep typing here") + "\n"
 	}
 	mode := string(m.gate.Mode())
 	glyph, col := modeIcon(mode)

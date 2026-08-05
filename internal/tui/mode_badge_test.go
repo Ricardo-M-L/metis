@@ -152,16 +152,21 @@ func TestRenderHints_BypassCarriesGlyph(t *testing.T) {
 }
 
 // TestRenderHints_PermPromptActiveSuppresses — when a permission
-// prompt is mid-flight (m.permActive=true), the bottom hint is
-// suppressed entirely so the permission dialog has the floor. Pin
-// this so a refactor of permActive handling can't accidentally
-// double-up the hint line on top of the prompt.
+// prompt is mid-flight (m.permActive=true), renderHints keeps a
+// visible "waiting for permission" anchor under the input box instead
+// of collapsing to empty. The old empty-return made the mode badge
+// vanish mid-typing; users (whose letter keys still reach the textarea
+// via keybind_permission) read the disappearing chrome as a frozen UI.
 func TestRenderHints_PermPromptActiveSuppresses(t *testing.T) {
 	m := &Model{
 		gate:       permission.New(permission.ModeAsk),
 		permActive: true,
 	}
-	if got := renderHints(m); got != "" {
-		t.Errorf("renderHints during active perm prompt must be empty; got %q", got)
+	got := renderHints(m)
+	if got == "" {
+		t.Error("renderHints during active perm prompt must keep a waiting anchor, not collapse to empty")
+	}
+	if !strings.Contains(got, "waiting for your permission") {
+		t.Errorf("renderHints during perm prompt should say we're waiting; got %q", got)
 	}
 }

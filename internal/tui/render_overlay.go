@@ -335,53 +335,69 @@ func renderAtMention(m *Model) string {
 	return s.String()
 }
 
-// renderPermission draws the permission prompt — claude-code's
-// flat, no-box style. Hierarchical text:
+// renderPermission draws the permission prompt. Flat text blended into
+// the transcript too easily — users scrolled past the prompt, kept
+// typing into the (still-live) textarea, and concluded the UI had
+// frozen. The current design wraps the whole block in an orange left
+// gutter (▌) plus a top accent rule so it reads as a distinct card that
+// clearly owns the keyboard's decision keys:
 //
-//	<tool name>
-//	  <arg preview>
+//	────────────────────────────────────────────
+//	▌ ⚠ Bash needs your approval
+//	▌   ls -la /tmp
+//	▌
+//	▌ Allow this Bash command?
+//	▌ ❯ 1. Yes
+//	▌   2. Yes, always (this session)
+//	▌   3. No
+//	▌   4. Cancel turn
+//	▌
+//	▌ ↑↓ select · enter confirm · esc deny · typing still goes to the input box
+//	▌ auto-deny in 42s
 //
-//	Allow this action?
-//	❯ 1. Yes
-//	  2. Yes, always (this session)
-//	  3. No
-//	  4. Cancel turn
-//
-//	  ↑↓ select · enter confirm · 1-4 / y a n c shortcuts
-//
-// Tool name is bold/orange (the permission accent color). Arg preview
-// sits dim under it. Numbered options match claude-code's convention.
+// The footer explicitly tells the user the textarea is NOT dead —
+// keybind_permission.go routes letter keys to the input editor, only
+// arrows/enter/esc are intercepted for the prompt.
 func renderPermission(m *Model) string {
 	var s strings.Builder
 	headerStyle := lipgloss.NewStyle().Foreground(accentOrange).Bold(true)
+	bar := lipgloss.NewStyle().Foreground(accentOrange).Bold(true).Render("▌")
+	rule := lipgloss.NewStyle().Foreground(accentOrange).Render("  " + strings.Repeat("─", 56))
 
 	s.WriteString("\n")
+	s.WriteString(rule)
+	s.WriteString("\n")
 	if m.permTool != "" {
-		s.WriteString("  ")
-		s.WriteString(headerStyle.Render(m.permTool + " command"))
+		s.WriteString(bar)
+		s.WriteString(" ")
+		s.WriteString(headerStyle.Render("⚠ " + m.permTool + " needs your approval"))
 		s.WriteString("\n")
 		if m.permArgs != "" {
-			s.WriteString("    ")
+			s.WriteString(bar)
+			s.WriteString("   ")
 			s.WriteString(styleText.Render(m.permArgs))
 			s.WriteString("\n")
 		}
 	} else if m.permQuestion != "" {
-		s.WriteString("  ")
+		s.WriteString(bar)
+		s.WriteString(" ")
 		s.WriteString(headerStyle.Render(m.permQuestion))
 		s.WriteString("\n")
 	}
 	s.WriteString("\n")
 
-	s.WriteString("  ")
+	s.WriteString(bar)
+	s.WriteString(" ")
 	if m.permTool != "" {
-		s.WriteString(styleText.Render("Allow this " + m.permTool + " command?"))
+		s.WriteString(styleText.Bold(true).Render("Allow this " + m.permTool + " command?"))
 	} else {
-		s.WriteString(styleText.Render("Allow this action?"))
+		s.WriteString(styleText.Bold(true).Render("Allow this action?"))
 	}
 	s.WriteString("\n")
 
 	for i, choice := range m.permChoices {
-		s.WriteString("  ")
+		s.WriteString(bar)
+		s.WriteString(" ")
 		num := fmt.Sprintf("%d. ", i+1)
 		if i == m.permCursor {
 			s.WriteString(styleAccent.Bold(true).Render("❯ "))
@@ -394,7 +410,9 @@ func renderPermission(m *Model) string {
 		s.WriteString("\n")
 	}
 	s.WriteString("\n")
-	s.WriteString(styleMuted.Render("  ↑↓ select · enter confirm · y/a/n/c shortcuts · esc deny"))
+	s.WriteString(bar)
+	s.WriteString(" ")
+	s.WriteString(styleMuted.Render("↑↓ select · enter confirm · esc deny · typing still goes to the input box"))
 	s.WriteString("\n")
 	// Auto-deny countdown — gives the user a clear visual that the
 	// prompt won't wait forever, and provides closure when the operator
@@ -402,7 +420,9 @@ func renderPermission(m *Model) string {
 	if !m.permStartedAt.IsZero() {
 		remaining := permissionTimeout - time.Since(m.permStartedAt)
 		if remaining > 0 {
-			s.WriteString(styleMuted.Render(fmt.Sprintf("  auto-deny in %ds", int(remaining.Seconds()))))
+			s.WriteString(bar)
+			s.WriteString(" ")
+			s.WriteString(styleMuted.Render(fmt.Sprintf("auto-deny in %ds", int(remaining.Seconds()))))
 			s.WriteString("\n")
 		}
 	}
