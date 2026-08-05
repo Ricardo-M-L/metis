@@ -1636,7 +1636,6 @@ func cmdUsage(r *REPL, args string) string {
 	return renderInfoBox("Usage", rows)
 }
 
-
 func cmdStack(r *REPL, args string) string {
 	return string(debug.Stack())
 }
