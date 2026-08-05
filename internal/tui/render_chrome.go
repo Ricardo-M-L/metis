@@ -144,7 +144,6 @@ func renderInputLine(m *Model) string {
 	return s.String()
 }
 
-
 // clampLine truncates a single rendered row (already styled, ANSI escapes
 // included) to fit `width` terminal cells. The chat list measures item
 // heights by counting newlines: a styled row longer than the viewport
@@ -356,61 +355,34 @@ func renderDreamingExtras(m *Model) string {
 // renderCompactionExtras draws the two rows that sit under the spinner
 // during LLM-driven compaction:
 //
-//	▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱ 42%
+//	▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱
 //	└ Compacting at auto window (170k tokens) · /autocompact to configure
 //
-// The progress is a saturating estimate based on summarize-stream bytes
-// (we don't know the final summary length until done); it caps at 95%
-// so the user never sees "100%" while the call is still mid-flight. On
-// EventContextCompacted the override clears and these rows disappear
-// with it. Layout mirrors claude-code's compaction display (image #19
-// user feedback 2026-05-15).
+// The progress is a time-driven, left-to-right visual estimate. The
+// compactor reports cumulative output bytes but not the final summary
+// size, so those bytes cannot honestly be converted to a percentage.
+// Instead the bar advances monotonically, then stops with two cells
+// deliberately empty until EventContextCompacted clears the row. This
+// gives users a progressive animation without implying that we know
+// how much work remains. Layout mirrors claude-code's compaction display
+// (image #19 user feedback 2026-05-15).
 func renderCompactionExtras(m *Model) string {
-	// C3 (2026-08-02): switch from a percentage bar (bytes/80 capped at 95%)
-	// to an indeterminate sliding bar. The percentage version was a lie —
-	// summaries usually finish in 1-3s, the bar visually jumped 0→95%
-	// between two frames, and the user complained "压缩进度条还没长就过了"
-	// (BUG-C). An indeterminate bar telegraphs "work in progress, don't
-	// know how long" without pretending to track real progress.
-	//
-	// Implementation: a 4-cell block slides left-to-right across a 22-cell
-	// track. Position is derived from elapsed time (120ms per step ≈ the
-	// spinner tick rate), so the bar moves on every repaint even when the
-	// summarize stream is idle.
 	const barWidth = 22
-	const blockWidth = 4
-	// P1-1 (2026-08-02): use compactionStartedAt (stamped on
-	// EventCompactionStart) instead of spinnerStartedAt (turn start).
-	// spinnerStartedAt resets every turn — using it meant the bar
-	// position jumped back to 0 on turn boundaries even when the
-	// compaction was still running.
 	startedAt := m.compactionStartedAt
 	if startedAt.IsZero() {
 		// Cold-render path (tests, pre-EventCompactionStart): fall back
-		// to spinnerStartedAt so the bar still animates in test fixtures.
+		// to spinnerStartedAt so the bar still advances in test fixtures.
 		startedAt = m.spinnerStartedAt
 	}
-	// P2-1 (2026-08-02): shorten the per-step time from 120ms to 80ms.
-	// The original 120ms × 36 steps = 4.32s full cycle was longer than
-	// a typical summarize call (1-3s), so users never saw a complete
-	// L→R→L sweep — the bar looked "stuck" at one position. 80ms × 36
-	// steps = 2.88s cycle, which fits inside a typical summarize and
-	// still reads as "smooth motion" rather than "jittery".
-	steps := int(time.Since(startedAt) / (80 * time.Millisecond))
-	// Ping-pong: 0 → (barWidth-blockWidth) → 0
-	cycle := (barWidth - blockWidth) * 2
-	pos := 0
-	if cycle > 0 {
-		p := steps % cycle
-		if p <= barWidth-blockWidth {
-			pos = p
-		} else {
-			pos = cycle - p
-		}
+	elapsed := time.Duration(0)
+	if !startedAt.IsZero() {
+		elapsed = time.Since(startedAt)
 	}
+	filled := compactionProgressCells(elapsed, barWidth)
+
 	var bar strings.Builder
 	for i := 0; i < barWidth; i++ {
-		if i >= pos && i < pos+blockWidth {
+		if i < filled {
 			bar.WriteString("▰")
 		} else {
 			bar.WriteString("▱")
@@ -451,6 +423,38 @@ func renderCompactionExtras(m *Model) string {
 	}
 	s.WriteString("\n")
 	return s.String()
+}
+
+// compactionProgressCells maps elapsed wall time to a monotonic visual
+// estimate. It deliberately caps at width-2 cells after eight seconds:
+// the remaining cells mean "still waiting for the real completion
+// event", not a fabricated 100%. A quadratic ease-out makes short,
+// typical compactions visibly advance while longer calls slow into a
+// stable waiting state instead of looping back and forth.
+func compactionProgressCells(elapsed time.Duration, width int) int {
+	if width <= 0 {
+		return 0
+	}
+	if width <= 2 {
+		return 1
+	}
+	if elapsed < 0 {
+		elapsed = 0
+	}
+
+	const fillDuration = 8 * time.Second
+	maxFilled := width - 2
+	if elapsed >= fillDuration {
+		return maxFilled
+	}
+
+	ratio := float64(elapsed) / float64(fillDuration)
+	eased := 1 - (1-ratio)*(1-ratio)
+	filled := 1 + int(eased*float64(maxFilled-1))
+	if filled > maxFilled {
+		return maxFilled
+	}
+	return filled
 }
 
 // renderStatusBar paints the bottom-of-chat divider line. Wall-clock

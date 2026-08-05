@@ -7,6 +7,7 @@ import (
 
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
@@ -62,6 +63,49 @@ func TestLongContent_ChatListClampsAndScrolls(t *testing.T) {
 	m.chatList.ScrollToTop()
 	if m.chatList.AtBottom() {
 		t.Error("after ScrollToTop, AtBottom should be false")
+	}
+}
+
+// TestLongConversation_FrameFitsPhysicalTerminal locks the invariant the
+// bubbletea renderer relies on: one logical row in View.Content must fit on
+// one physical terminal row, and the full frame must fit inside the terminal.
+// If either bound is exceeded, iTerm2/tmux can auto-wrap while bubbletea still
+// counts newline-delimited rows, leaving old-frame fragments in the middle of
+// long conversations.
+func TestLongConversation_FrameFitsPhysicalTerminal(t *testing.T) {
+	const termW, termH = 80, 24
+	m := newScrollTestModel(termW, termH)
+	base := time.Now()
+	for i := 0; i < 16; i++ {
+		m.messages = append(m.messages,
+			Message{
+				Role:      "user",
+				Content:   "这是第几轮问题？请比较 loop 工程和 graph 工程在长任务中的差异。",
+				Timestamp: base.Add(time.Duration(i*2) * time.Millisecond),
+			},
+			Message{
+				Role:      "assistant",
+				Content:   "Loop 根据模型反馈动态推进，Graph 用显式节点和边约束控制流。任务轮数增加时，两者仍应保持稳定排版。",
+				Timestamp: base.Add(time.Duration(i*2+1) * time.Millisecond),
+			},
+		)
+	}
+	// Streaming deltas can arrive as one long paragraph before the final
+	// markdown renderer gets a chance to wrap them.
+	m.streamingText = strings.Repeat("streaming-response-without-newline-", 8)
+
+	view := m.View().Content
+	rows := strings.Split(view, "\n")
+	if got := len(rows); got > termH {
+		t.Errorf("frame has %d logical rows, terminal height is %d", got, termH)
+	}
+	for i, row := range rows {
+		// Keep one cell free at the right margin. Several terminals enter
+		// pending-wrap state after writing the final column, so width==termW
+		// is not a safe single-row frame even though it looks exact on paper.
+		if got := ansi.StringWidth(row); got >= termW {
+			t.Errorf("row %d uses %d cells, want < %d: %q", i, got, termW, ansi.Strip(row))
+		}
 	}
 }
 

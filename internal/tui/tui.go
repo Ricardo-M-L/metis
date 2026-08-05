@@ -253,18 +253,14 @@ type Model struct {
 
 	// spinnerCompactionBytes is the cumulative byte count of the
 	// in-flight summarize stream, updated by EventCompactionProgress.
-	// Feeds the progress bar + % rendered under the compaction spinner
-	// row (claude-code image #19 layout). Reset on EventContextCompacted.
+	// It is an activity signal only: the final summary size is unknown,
+	// so it cannot be converted into a truthful completion percentage.
+	// Reset on EventContextCompacted.
 	spinnerCompactionBytes int
 
 	// compactionStartedAt is the timestamp of the most recent
-	// EventCompactionStart. The C3 indeterminate sliding bar uses
-	// time.Since(compactionStartedAt) to compute block position, so
-	// the bar tracks THIS compaction's lifetime, not the parent turn's
-	// spinnerStartedAt. Without this field the bar position jumps back
-	// to 0 on every turn boundary even when the compaction is still
-	// running — visually the bar "restarts" mid-compaction (P1-1
-	// 2026-08-02).
+	// EventCompactionStart. The monotonic progress estimate uses this
+	// instead of spinnerStartedAt so it never restarts at a turn boundary.
 	compactionStartedAt time.Time
 	// spinnerPhase mirrors claude-code's SpinnerMode (sourcemap
 	// restored-src/src/components/Spinner/SpinnerAnimationRow.tsx

@@ -372,12 +372,9 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// doesn't need exposed in the spinner row.
 		m.spinnerOverride = "Compacting conversation..."
 		m.spinnerCompactionBytes = 0
-		// P1-1 (2026-08-02): stamp compactionStartedAt so the C3
-		// indeterminate sliding bar tracks THIS compaction's lifetime,
-		// not the parent turn's spinnerStartedAt. Without this the bar
-		// position jumps back to 0 on every turn boundary even when the
-		// compaction is still running — visually the bar "restarts"
-		// mid-compaction.
+		// Stamp compactionStartedAt so the monotonic visual estimate
+		// tracks this compaction's lifetime instead of restarting at
+		// a parent-turn boundary.
 		m.compactionStartedAt = time.Now()
 		// OSC 9;4 indeterminate — terminals that support it (iTerm2
 		// 3.6.6+, Ghostty 1.2.0+, ConEmu) render a progress indicator
@@ -385,11 +382,9 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// the in-pane spinner is scrolled off-screen.
 		SetTerminalProgress(ProgressIndeterminate)
 	case agent.EventCompactionProgress:
-		// summarize stream is feeding bytes — bump the counter (kept
-		// in state for potential future use, e.g. debug overlay) but
-		// no longer rendered in the spinner row (user feedback: the
-		// terminal-tab indicator is enough; the inline token count
-		// was noise).
+		// summarize stream is feeding bytes — bump the activity counter.
+		// The final byte count is unknown, so this is deliberately not
+		// converted into a completion percentage.
 		m.spinnerCompactionBytes = ev.InputTokens
 	case agent.EventContextCompacted:
 		// Either tier finished (success or failure) — release the

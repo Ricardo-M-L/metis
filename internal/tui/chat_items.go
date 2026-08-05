@@ -292,13 +292,24 @@ type inProgressStreamingItem struct {
 }
 
 func (it *inProgressStreamingItem) Render(width int) string {
-	_ = width
 	if it.text == "" || it.backgrounded {
 		return ""
 	}
+	// Streaming text arrives before the final assistant message goes through
+	// glamour, so a provider may give us one very long paragraph with no
+	// newlines. Wrap it here using the same width budget as historical
+	// assistant rows. Otherwise the list counts it as one row while the
+	// terminal paints/truncates it at the right edge, which desynchronizes
+	// frame geometry during long, frequently repainted conversations.
+	bodyW := width - 4
+	if bodyW < 20 {
+		bodyW = 20
+	}
+	wrapped := xansi.Wrap(it.text, bodyW, " /-_.")
+
 	var sb strings.Builder
 	sb.WriteString(styleAsst.Render("  " + glyphBullet + " "))
-	lines := strings.Split(it.text, "\n")
+	lines := strings.Split(wrapped, "\n")
 	if len(lines) > 0 {
 		sb.WriteString(styleText.Render(lines[0]))
 		for _, ln := range lines[1:] {

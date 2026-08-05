@@ -251,11 +251,15 @@ func (m *Model) renderHeaderBanner() string {
 	}
 	row += dimStyle.Render(" · ") + valueStyle.Render(cwd)
 
-	// Separator stretches across the full terminal so the header reads
-	// as one continuous strip, matching the bottom status bar's width.
-	sepWidth := m.width
+	// Leave the terminal's final column unused. Writing a printable cell in
+	// the rightmost column puts iTerm2/tmux into pending-wrap state; repeated
+	// full-screen repaints can then advance one physical row even though the
+	// frame still contains only one newline-delimited separator row. The
+	// resulting cursor drift leaves fragments of older frames in the middle
+	// of long conversations.
+	sepWidth := m.width - 1
 	if sepWidth <= 0 {
-		sepWidth = 60
+		sepWidth = 59
 	}
 	return row + "\n" + dimStyle.Render(strings.Repeat("─", sepWidth)) + "\n"
 }

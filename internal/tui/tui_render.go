@@ -80,6 +80,17 @@ func (m *Model) View() tea.View {
 	// drops the terminal back to its native buffer where the user
 	// can mouse-select scrollback as before.
 	chatView := func(content string) tea.View {
+		// Last-resort frame invariant: no logical row may reach the
+		// terminal's final column. Component renderers normally wrap to their
+		// own narrower budgets, but one missed dynamic label/tool result is
+		// enough to trigger terminal auto-wrap and make bubbletea's
+		// newline-based row accounting drift from the physical screen. Keep
+		// one cell free at the right margin on every full-screen frame.
+		safeWidth := m.width - 1
+		if safeWidth <= 0 {
+			safeWidth = 79
+		}
+		content = clampBlock(content, safeWidth)
 		v := tea.NewView(content)
 		v.AltScreen = true
 		// MouseModeNone: don't capture the mouse at all. The terminal
