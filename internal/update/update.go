@@ -25,11 +25,14 @@ import (
 
 const (
 	defaultRepo  = "Ricardo-M-L/metis"
-	apiBase      = "https://api.github.com"
 	userAgent    = "metis-self-update"
 	checkTimeout = 10 * time.Second
 	dlTimeout    = 5 * time.Minute
 )
+
+// apiBase is the GitHub API root. A var (not const) so apply_test.go can
+// point Apply at an httptest server instead of the real api.github.com.
+var apiBase = "https://api.github.com"
 
 // Repo identifies the GitHub owner/repo to query. Override via METIS_REPO.
 func Repo() string {
@@ -148,8 +151,17 @@ func Latest(ctx context.Context, token string) (*release, error) {
 	return &r, nil
 }
 
+// targetForTest overrides Target()'s platform tag in tests. Empty in
+// production; set via t.Cleanup-restored package var in apply_test.go so
+// Apply can be exercised against a fake "test-os-arch" release without
+// cross-compiling fixtures for the host platform.
+var targetForTest = ""
+
 // Target returns the platform tag (e.g. "darwin-arm64") used in asset names.
 func Target() string {
+	if targetForTest != "" {
+		return targetForTest
+	}
 	return fmt.Sprintf("%s-%s", goruntime.GOOS, goruntime.GOARCH)
 }
 
@@ -176,9 +188,29 @@ func (r *release) findAsset(target string) (binary, sum *asset, err error) {
 	return binary, sum, nil
 }
 
-// Apply downloads the latest release for the current platform, verifies its
-// sha256, and atomically replaces the file at destPath. destPath should be
-// the absolute path to the running metis binary.
+// Apply downloads the release for the current platform, verifies its
+// sha256, and installs it using a versioned layout that mirrors claude-
+// code's self-update (2026-08-05 user request: "像 Claude Code 那样"):
+//
+//	~/.local/share/metis/versions/<semver>   — actual binary, one per version
+//	~/.local/bin/metis                       — symlink → current version
+//
+// Why a symlink farm instead of overwriting destPath in place:
+//   - Atomic switch: the symlink swap (rename of a temp link) is atomic,
+//     so a running metis never sees a half-written binary — the old code
+//     path's atomicReplace had the same property, but only for the file
+//     itself, not for "which version is live".
+//   - Instant rollback: the previous version's directory stays on disk;
+//     repointing the symlink rolls back without a re-download.
+//   - Go-install coexistence: binaries under ~/.local/share/metis are
+//     outside $GOBIN/$GOPATH/bin, so CheckSelfPathSafe no longer refuses
+//     to manage them (the old "ErrGoInstallManaged" skip meant users who
+//     first installed via `go install` never got auto-updates).
+//
+// destPath is the path of the user-facing symlink (e.g. resolved from
+// SelfPath of the running binary). The parent directory of destPath is
+// where the "metis" symlink lives; the versions farm sits alongside it
+// at ../share/metis/versions (claude-code: ~/.local/bin + ~/.local/share).
 func Apply(ctx context.Context, token, destPath string, r *release) error {
 	if token == "" {
 		return ErrNoToken
@@ -227,7 +259,66 @@ func Apply(ctx context.Context, token, destPath string, r *release) error {
 	if err := os.Chmod(binPath, 0o755); err != nil {
 		return err
 	}
-	return atomicReplace(binPath, destPath)
+
+	// Lay out the versioned install. binDir = dir of destPath (e.g.
+	// ~/.local/bin); shareDir = sibling "share/metis/versions" (e.g.
+	// ~/.local/share/metis/versions).
+	binDir := filepath.Dir(destPath)
+	version := strings.TrimPrefix(r.TagName, "v")
+	versionsRoot := filepath.Join(filepath.Dir(binDir), "share", "metis", "versions")
+	versionDir := filepath.Join(versionsRoot, version)
+	if err := os.MkdirAll(versionDir, 0o755); err != nil {
+		return fmt.Errorf("create version dir: %w", err)
+	}
+	versionedBin := filepath.Join(versionDir, "metis")
+
+	// Move the extracted binary into its version directory. Same-filesystem
+	// rename is the common case (~/.local/share is one volume); fall back
+	// to copy+rename across devices (e.g. tmp on tmpfs, home elsewhere).
+	if err := moveFile(binPath, versionedBin); err != nil {
+		return fmt.Errorf("install versioned binary: %w", err)
+	}
+
+	// Atomically repoint the symlink: build a temp symlink in binDir,
+	// then rename it over destPath. rename(2) replaces the destination
+	// atomically on POSIX, so a concurrent `metis` invocation either
+	// resolves the old link or the new one — never a missing file.
+	tmpLink := filepath.Join(binDir, ".metis-link-*")
+	tmpLink = strings.Replace(tmpLink, "*", fmt.Sprint(os.Getpid()), 1)
+	_ = os.Remove(tmpLink) // best-effort clean of a stale temp from a crash
+	if err := os.Symlink(versionedBin, tmpLink); err != nil {
+		return fmt.Errorf("create temp symlink: %w", err)
+	}
+	if err := os.Rename(tmpLink, destPath); err != nil {
+		_ = os.Remove(tmpLink)
+		return fmt.Errorf("swap symlink: %w", err)
+	}
+	return nil
+}
+
+// moveFile renames src to dst, falling back to copy+delete across
+// filesystems. dst's parent must already exist.
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 func downloadAsset(ctx context.Context, token string, id int64, dest string) error {
@@ -352,43 +443,6 @@ func extractBinary(tarPath, tmpDir, innerName string) (string, error) {
 		return out, nil
 	}
 	return "", fmt.Errorf("tarball missing %s", innerName)
-}
-
-// atomicReplace moves src over dest. On Unix os.Rename is atomic when both
-// paths live on the same filesystem; we fall back to copy+rename otherwise.
-func atomicReplace(src, dest string) error {
-	if err := os.Rename(src, dest); err == nil {
-		return nil
-	}
-	// Cross-device fallback: copy to a sibling of dest, then rename.
-	destDir := filepath.Dir(dest)
-	tmp, err := os.CreateTemp(destDir, ".metis-update-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = os.Remove(tmpPath)
-	}()
-
-	in, err := os.Open(src)
-	if err != nil {
-		tmp.Close()
-		return err
-	}
-	defer in.Close()
-	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, dest)
 }
 
 func setAuth(req *http.Request, token, accept string) {

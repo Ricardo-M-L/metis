@@ -178,6 +178,34 @@ You appear to have installed metis with `+"`go install`"+`. To upgrade, run:
 	if err := update.Apply(ctx, token, self, rel); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
-	fmt.Printf("installed metis %s at %s\n", latest, self)
+	versionedBin := filepath.Join(filepath.Dir(filepath.Dir(self)), "share", "metis", "versions", latest, "metis")
+	fmt.Printf("installed metis %s → %s (symlink → %s)\n", latest, self, versionedBin)
+	warnIfGoBinShadows()
 	return nil
+}
+
+// warnIfGoBinShadows prints a heads-up when a second metis binary exists
+// under $GOBIN/$GOPATH/bin. If that directory precedes ~/.local/bin in
+// PATH, the stale go-install binary shadows the freshly self-updated one
+// and the user never sees the new version (verify report 2026-08-05:
+// "PATH-shadowing after migration gets no user-facing warning").
+func warnIfGoBinShadows() {
+	gobin := os.Getenv("GOBIN")
+	if gobin == "" {
+		if gopath := os.Getenv("GOPATH"); gopath != "" {
+			gobin = filepath.Join(gopath, "bin")
+		} else if home, err := os.UserHomeDir(); err == nil {
+			gobin = filepath.Join(home, "go", "bin")
+		}
+	}
+	if gobin == "" {
+		return
+	}
+	stale := filepath.Join(gobin, "metis")
+	if _, err := os.Stat(stale); err != nil {
+		return
+	}
+	fmt.Printf("\nwarning: a second metis binary exists at %s\n", stale)
+	fmt.Printf("if `%s` appears before the self-update directory in PATH, the stale binary will shadow this install — delete it:\n", gobin)
+	fmt.Printf("  rm %s\n", stale)
 }

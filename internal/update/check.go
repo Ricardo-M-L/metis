@@ -158,19 +158,24 @@ func MarkNotified(configHome, tag string) {
 	saveState(sp, st)
 }
 
-// SelfPath returns the absolute path to the running metis binary.
+// SelfPath returns the absolute path to the running metis binary as the
+// user invoked it — symlinks are NOT resolved. The versioned self-update
+// (Apply) installs binaries under ~/.local/share/metis/versions/<ver> and
+// repoints a symlink at ~/.local/bin/metis; resolving the symlink here
+// would return the version-directory path, and Apply would then try to
+// swap a symlink *inside* the farm instead of the user-facing link.
+// Returning the unresolved path keeps the swap target stable across
+// upgrades (claude-code does the same: ~/.local/bin/claude stays the
+// symlink, versions live in ~/.local/share/claude/versions).
 func SelfPath() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	resolved, err := filepath.EvalSymlinks(exe)
-	if err != nil {
-		// EvalSymlinks fails on platforms / paths where it can't stat;
-		// fall back to the raw exe path.
-		return exe, nil
-	}
-	return resolved, nil
+	// os.Executable on darwin/linux already returns the path used to
+	// launch (may itself be a symlink); we deliberately skip
+	// filepath.EvalSymlinks so the symlink path is preserved.
+	return exe, nil
 }
 
 // ErrGoInstallManaged is returned when SelfPath points at $GOBIN/$GOPATH/bin,
