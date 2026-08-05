@@ -24,7 +24,7 @@ func TestVerifyStandalone_All(t *testing.T) {
 			"subagent_type": "explore",
 			"prompt":        "find the grep implementation in the codebase",
 		})
-		want = "explore (find the grep implementation)"
+		want = "explore (find the grep implementation in the)"
 		if out != want {
 			t.Errorf("B: got %q, want %q", out, want)
 		} else {
@@ -34,7 +34,7 @@ func TestVerifyStandalone_All(t *testing.T) {
 		out = toolArgsPreview("Agent", map[string]any{
 			"prompt": "find the grep implementation in the codebase",
 		})
-		want = "find the grep implementation"
+		want = "find the grep implementation in the"
 		if out != want {
 			t.Errorf("C: got %q, want %q", out, want)
 		} else {

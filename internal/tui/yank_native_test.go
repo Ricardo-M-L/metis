@@ -34,8 +34,16 @@ func TestRunClipWrite_PbcopyRoundTrip(t *testing.T) {
 	if _, err := exec.LookPath("pbpaste"); err != nil {
 		t.Skip("pbpaste not in PATH")
 	}
+	// Finding pbcopy/pbpaste in PATH does not guarantee that this process has
+	// access to a macOS pasteboard. Headless launchd/CI sessions expose both
+	// binaries, but they exit 1 because no pasteboard server is available.
+	// Skip only that environment; once pbpaste works, keep the round-trip
+	// assertion strict so a runClipWrite return-path regression still fails.
+	orig, err := exec.Command("pbpaste").Output()
+	if err != nil {
+		t.Skipf("macOS pasteboard unavailable: pbpaste: %v", err)
+	}
 	// Save the user's existing clipboard so we restore it after.
-	orig, _ := exec.Command("pbpaste").Output()
 	defer func() {
 		// Best-effort restore.
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

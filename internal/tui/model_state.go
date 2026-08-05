@@ -57,11 +57,15 @@ func (s *modelState) load() {
 	_ = json.Unmarshal(data, &s.data) // corrupt file is fine too
 }
 
-// save writes the current state to disk. Errors are logged but
-// non-fatal — the app keeps working with in-memory state.
-func (s *modelState) save() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// saveLocked writes the current state to disk. The caller must hold s.mu for
+// writing. AddRecent and ToggleFavorite mutate the state and persist it in one
+// critical section so concurrent selections cannot write an older snapshot
+// after a newer one.
+//
+// Do not acquire s.mu here: sync.RWMutex is not reentrant. The previous save
+// method attempted RLock while its callers already held Lock, deadlocking the
+// first model selection and the entire TUI test package.
+func (s *modelState) saveLocked() {
 	data, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return
@@ -88,7 +92,7 @@ func (s *modelState) AddRecent(modelID string) {
 	if len(s.data.Recent) > 10 {
 		s.data.Recent = s.data.Recent[:10]
 	}
-	s.save()
+	s.saveLocked()
 }
 
 // IsRecent checks if a model ID is in the recent list.
@@ -110,12 +114,12 @@ func (s *modelState) ToggleFavorite(modelID string) {
 	for i, id := range s.data.Favorite {
 		if id == modelID {
 			s.data.Favorite = append(s.data.Favorite[:i], s.data.Favorite[i+1:]...)
-			s.save()
+			s.saveLocked()
 			return
 		}
 	}
 	s.data.Favorite = append(s.data.Favorite, modelID)
-	s.save()
+	s.saveLocked()
 }
 
 // IsFavorite checks if a model ID is in the favorite list.
