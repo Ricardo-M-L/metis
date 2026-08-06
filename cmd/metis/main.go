@@ -1530,18 +1530,15 @@ func validExplicitSessionID(id string) bool {
 // --- subcommands ---
 
 func cmdChat(ctx context.Context, args []string) error {
-	// Early input capture (Task #76): start grabbing stdin RIGHT NOW so
-	// keystrokes typed during the cold-start window (config load,
-	// runtime build, slash registry, etc.) don't echo to a phantom
-	// prompt before bubbletea takes over. Stop() is called just before
-	// RunTUI, and the buffered bytes are forwarded to bubbletea via
-	// SetEarlyInputReader. No-op when stdin isn't a TTY.
-	earlyIn := rtpkg.NewEarlyInput()
+	// Do not start runtime.NewEarlyInput here while RunTUI uses Bubble Tea's
+	// default stdin path. Its captured reader is deliberately not forwarded
+	// (custom readers lost raw-mode handling in the original v2 migration),
+	// and on real TTYs the pre-reader's blocking Read made Stop wait for the
+	// first keypress before startup could continue. Leaving stdin untouched
+	// lets Bubble Tea take ownership immediately; keybind_main.go safely
+	// ignores any canonical-mode blank Enters that were queued meanwhile.
 	flags, _, err := parseFlags(args)
 	if err != nil {
-		if earlyIn != nil {
-			earlyIn.Stop()
-		}
 		return err
 	}
 	// Trust-this-folder safety check — claude-code's first-run dance.
@@ -1549,13 +1546,6 @@ func cmdChat(ctx context.Context, args []string) error {
 	// when METIS_NO_TRUST_PROMPT=1. Persists answer to
 	// ~/.metis/trusted-dirs.json so it asks once per directory.
 	if term.IsTerminal(int(os.Stdin.Fd())) {
-		// Trust prompt reads stdin too — restore terminal mode FIRST
-		// so the bufio.Scanner inside ensureTrusted sees normal line
-		// input, not raw bytes. The buffer (if any) is preserved for
-		// the bubbletea hand-off below.
-		if earlyIn != nil {
-			earlyIn.Stop()
-		}
 		if err := ensureTrusted(); err != nil {
 			return err
 		}
@@ -1632,18 +1622,7 @@ func cmdChat(ctx context.Context, args []string) error {
 			SessionSwitch:       rt.rebindSession,
 			SessionBoundary:     rt.releaseSessionWork,
 		}
-		// Hand the early-input buffer to bubbletea. If the trust prompt
-		// already consumed it (Stop() was called above), Reader()
-		// returns os.Stdin directly — no double-read of the same fd.
-		if earlyIn != nil {
-			earlyIn.Stop() // idempotent — safe even if trust prompt called it
-			tui.SetEarlyInputReader(earlyIn.Reader())
-		}
 		return tui.RunTUI(ctx, rt.loop, rt.cronSvc, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.providerName, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
-	}
-	// Non-TUI path: just stop the capture so terminal mode is restored.
-	if earlyIn != nil {
-		earlyIn.Stop()
 	}
 
 	repl, err := tui.NewREPL(rt.loop, sl, rt.store, rt.sessionID, rt.useMD, rt.showTok, rt.gate, rt.model, rt.cfg.Session.SkillDir)
