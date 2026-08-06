@@ -8,12 +8,12 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 )
 
-// TestBuildChatItems_WelcomeBannerFirst confirms the welcome card is
-// prepended as the first item in the chat list once messages exist —
-// the user-visible behavior is "the brand strip stays at the top of
-// the transcript and scrolls naturally with the conversation" instead
-// of disappearing the moment the user types.
-func TestBuildChatItems_WelcomeBannerFirst(t *testing.T) {
+// TestBuildChatItems_ActiveChatDoesNotRepeatWelcome confirms the large fresh
+// session card is not retained as a scrollable transcript item. Active chat
+// already has a compact sticky header; rendering both wastes most of a short
+// terminal and gives fullscreen renderers a large shared block to hard-scroll
+// during the structurally different welcome-to-chat transition.
+func TestBuildChatItems_ActiveChatDoesNotRepeatWelcome(t *testing.T) {
 	m := &Model{
 		model: "claude-opus-4-7",
 		width: 120,
@@ -25,26 +25,18 @@ func TestBuildChatItems_WelcomeBannerFirst(t *testing.T) {
 	}
 
 	items := m.buildChatItems()
-	if len(items) != 3 {
-		t.Fatalf("expected 3 items (1 banner + 2 messages); got %d", len(items))
+	if len(items) != 2 {
+		t.Fatalf("expected exactly 2 message items; got %d", len(items))
 	}
 
-	first, ok := items[0].(*staticItem)
+	first, ok := items[0].(*messageItem)
 	if !ok {
-		t.Fatalf("first item should be the welcome banner staticItem; got %T", items[0])
+		t.Fatalf("first active-chat item should be a message, not welcome chrome; got %T", items[0])
 	}
 	rendered := first.Render(120)
-	if rendered == "" {
-		t.Fatal("welcome banner item should not render empty")
-	}
-	// "metis" branding appears in the banner title.
-	if !strings.Contains(rendered, "metis") {
-		t.Errorf("welcome banner should contain 'metis'; got %q", rendered)
-	}
-	// The "Type a message to start" hint is for the empty-state path —
-	// once we have messages, the active-chat banner drops it.
-	if strings.Contains(rendered, "Type a message to start") {
-		t.Error("active-chat welcome banner should NOT show 'Type a message to start' hint")
+	if strings.Contains(rendered, "Type a message to start") ||
+		strings.Contains(rendered, metisOwlGlyphLines[0]) {
+		t.Errorf("active-chat item unexpectedly contains welcome chrome: %q", rendered)
 	}
 }
 

@@ -25,6 +25,18 @@ type timelineItem struct {
 	ts  time.Time
 }
 
+// rendersWelcomeFrame is the single state predicate shared by View and Update.
+// Keeping it centralized matters because the welcome -> active transition
+// needs a forced renderer re-anchor regardless of what produced the first
+// message (Enter, local bash result, clipboard notice, cron event, etc.).
+func (m *Model) rendersWelcomeFrame() bool {
+	return m != nil &&
+		!m.copyMode &&
+		m.activeScreen == nil &&
+		len(m.messages) == 0 &&
+		!m.spinnerActive
+}
+
 // sortTimelineByTime sorts a chronological merge of timelineItems
 // in-place. Stable so two items with identical Timestamps preserve
 // their append order.
@@ -180,7 +192,7 @@ func (m *Model) View() tea.View {
 	// type immediately). claude-code's pattern: the 3-line logo
 	// persists at the top of a fresh session until the user actually
 	// types something.
-	if len(m.messages) == 0 && !m.spinnerActive {
+	if m.rendersWelcomeFrame() {
 		m.firstRender = false
 		m.showBanner = false
 		var s strings.Builder

@@ -128,13 +128,13 @@ func TestVerifyStandalone_All(t *testing.T) {
 			{Kind: "result", ToolName: "Grep", Input: map[string]any{"pattern": "y"}, StartTime: now.Add(2 * time.Millisecond), SubAgentParentID: "parent-1"},
 		}
 		items := m.buildChatItems()
-		if len(items) != 2 {
-			t.Errorf("A: items = %d, want banner + 1 group", len(items))
+		if len(items) != 1 {
+			t.Errorf("A: items = %d, want 1 group", len(items))
 		} else {
-			if _, ok := items[1].(*explorationGroupItem); !ok {
-				t.Errorf("A: item[1] = %T, want *explorationGroupItem", items[1])
+			if _, ok := items[0].(*explorationGroupItem); !ok {
+				t.Errorf("A: item[0] = %T, want *explorationGroupItem", items[0])
 			} else {
-				t.Logf("A OK: banner + 1 explorationGroupItem")
+				t.Logf("A OK: 1 explorationGroupItem")
 			}
 		}
 
@@ -146,15 +146,15 @@ func TestVerifyStandalone_All(t *testing.T) {
 			{Kind: "result", ToolName: "Read", Input: map[string]any{"path": "/tmp/b"}, StartTime: now.Add(time.Millisecond), SubAgentParentID: "parent-2"},
 		}
 		items2 := m2.buildChatItems()
-		if len(items2) != 3 {
-			t.Errorf("B: items = %d, want banner + 2 singletons", len(items2))
+		if len(items2) != 2 {
+			t.Errorf("B: items = %d, want 2 singletons", len(items2))
 		} else {
-			ok1, isGroup1 := items2[1].(*explorationGroupItem)
-			ok2, isGroup2 := items2[2].(*explorationGroupItem)
+			ok1, isGroup1 := items2[0].(*explorationGroupItem)
+			ok2, isGroup2 := items2[1].(*explorationGroupItem)
 			_ = ok1
 			_ = ok2
 			if isGroup1 || isGroup2 {
-				t.Errorf("B: singletons should NOT be groups, got %T %T", items2[1], items2[2])
+				t.Errorf("B: singletons should NOT be groups, got %T %T", items2[0], items2[1])
 			} else {
 				t.Logf("B OK: 2 separate toolEventItems (different parents)")
 			}

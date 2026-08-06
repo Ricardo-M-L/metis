@@ -48,7 +48,28 @@ func (m *Model) Init() tea.Cmd {
 	return sizeTick
 }
 
-func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
+	// The welcome page and active chat have very different row geometry.
+	// Ultraviolet's fullscreen hard-scroll optimizer can transform that
+	// first transition with IL/scroll-region commands instead of an ED2
+	// redraw. Direct iTerm2 occasionally applies the sequence with a stale
+	// physical cursor and leaves the complete welcome frame above the chat.
+	//
+	// Treat welcome -> non-welcome as a renderer invariant at the Update
+	// boundary, not as an Enter-key special case: the first visible message
+	// can also come from `!cmd`, clipboard/image handling, cron, or an agent
+	// event drained below. Bookending the original command repairs the
+	// synchronous frame promptly and guarantees a final full redraw after an
+	// asynchronous command produces its first row.
+	wasWelcome := m.rendersWelcomeFrame()
+	defer func() {
+		// Copy mode intentionally exits alt-screen and prints native
+		// scrollback. Never clear that normal-screen output.
+		if wasWelcome && !m.copyMode && !m.rendersWelcomeFrame() {
+			cmd = tea.Sequence(tea.ClearScreen, cmd, tea.ClearScreen)
+		}
+	}()
+
 	// Drain agent events
 	select {
 	case ev, ok := <-m.eventCh:

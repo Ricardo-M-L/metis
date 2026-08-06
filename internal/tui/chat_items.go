@@ -192,13 +192,9 @@ func (i *toolEventItem) Render(width int) string {
 }
 
 // staticItem is a list.Item whose render is precomputed once per
-// buildChatItems call. Used for the welcome banner that we want to
-// scroll naturally with the transcript instead of disappearing the
-// moment the user types their first message.
-//
-// Width is intentionally ignored — the welcome banner sizes itself
-// against m.width at build time, and the list package re-builds items
-// when width changes (terminal resize triggers View() → buildChatItems).
+// buildChatItems call. It carries transient rows such as spinner status that
+// should scroll with the transcript but do not need a dedicated item type.
+// Width is intentionally ignored because the string was sized at build time.
 type staticItem struct {
 	rendered string
 }
@@ -326,13 +322,6 @@ func (it *inProgressStreamingItem) Render(width int) string {
 // (sort by Timestamp / StartTime, stable order on ties), but produces
 // list-compatible items so the chat list can virtualize the render.
 //
-// The welcome banner is prepended as the first item so the brand strip
-// (ASCII bot + version + model + cwd) stays at the top of the
-// transcript and scrolls with the conversation, instead of being
-// replaced by the compact top-of-screen header strip the moment the
-// first message arrives. Mirrors claude-code's "banner is the first
-// thing in the chat history" pattern (user feedback 2026-05-09).
-//
 // Streaming text (m.streamingText / m.thinkingText) is appended at the
 // tail as live in-progress items so they scroll WITH the transcript
 // rather than sticking above the input (image #12 user feedback). The
@@ -342,8 +331,7 @@ func (it *inProgressStreamingItem) Render(width int) string {
 // re-rendered per frame.
 func (m *Model) buildChatItems() []list.Item {
 	merged := m.timeline()
-	out := make([]list.Item, 0, len(merged)+3)
-	out = append(out, &staticItem{rendered: m.renderWelcomeBannerNoHint()})
+	out := make([]list.Item, 0, len(merged)+2)
 	// thinkingDisplay = "hide" drops every reasoning row from the
 	// transcript and from the live-streaming preview. "show" forces
 	// expanded view regardless of ctrl+o state. "auto" (default) keeps

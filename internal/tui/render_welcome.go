@@ -104,27 +104,14 @@ func owlRowColor(i int) color.Color {
 	}
 }
 
-// renderWelcomeBanner paints the bordered, centered welcome card we
-// show on a fresh session — and again as the first scrollable item
-// once the user starts chatting (so the brand strip doesn't suddenly
-// disappear after the first turn). Same package as the rest of tui
-// so the renderer can read Model state without exporting fields.
-//
-// Keeps the trailing "Type a message to start · /help · /quit" hint —
-// the active-chat path uses renderWelcomeBannerNoHint so that
-// already-engaged users aren't told to start typing.
+// renderWelcomeBanner paints the bordered, centered welcome card shown on a
+// fresh session. Once the first prompt is submitted, the active-chat path uses
+// the compact sticky header instead of repeating this large card in history.
 func (m *Model) renderWelcomeBanner() string {
-	return m.renderWelcomeBannerCard(true)
+	return m.renderWelcomeBannerCard()
 }
 
-// renderWelcomeBannerNoHint is the same card without the
-// "Type a message to start" line. Used when the banner appears
-// inside an active chat list (where the hint is stale).
-func (m *Model) renderWelcomeBannerNoHint() string {
-	return m.renderWelcomeBannerCard(false)
-}
-
-func (m *Model) renderWelcomeBannerCard(showHint bool) string {
+func (m *Model) renderWelcomeBannerCard() string {
 	titleStyle := lipgloss.NewStyle().
 		Foreground(accentBlue).
 		Bold(true)
@@ -200,9 +187,6 @@ func (m *Model) renderWelcomeBannerCard(showHint bool) string {
 		Width(boxWidth).
 		Render(body)
 
-	if !showHint {
-		return box + "\n"
-	}
 	hint := labelStyle.Render("  Type a message to start  ·  ") +
 		titleStyle.Render("/help") +
 		labelStyle.Render(" for commands  ·  ") +

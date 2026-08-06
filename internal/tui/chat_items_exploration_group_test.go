@@ -17,12 +17,12 @@ func TestBuildChatItems_GroupsConsecutiveExplorationTools(t *testing.T) {
 		{Kind: "result", ToolName: "Glob", Input: map[string]any{"pattern": "**/*.go"}, Output: "/tmp/a.go", StartTime: now.Add(3 * time.Millisecond)},
 	}
 	items := m.buildChatItems()
-	if len(items) != 2 { // welcome banner + one grouped exploration item
-		t.Fatalf("items = %d, want banner + group", len(items))
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want one grouped exploration item", len(items))
 	}
-	group, ok := items[1].(*explorationGroupItem)
+	group, ok := items[0].(*explorationGroupItem)
 	if !ok {
-		t.Fatalf("item[1] = %T, want explorationGroupItem", items[1])
+		t.Fatalf("item[0] = %T, want explorationGroupItem", items[0])
 	}
 	compact := group.Render(100)
 	for _, want := range []string{"Read 2 files", "Searched 2 patterns", "ctrl+O to expand"} {
