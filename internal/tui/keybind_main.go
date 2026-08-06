@@ -555,6 +555,17 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+j":
 		// Ctrl+J — alternate "newline" keybind for terminals that don't
 		// distinguish Alt+Enter from plain Enter.
+		//
+		// During a slow cold start (notably a first-run self-update), the
+		// terminal is briefly still in canonical mode. Enter is then queued
+		// as LF, which Bubble Tea correctly decodes as Ctrl+J rather than
+		// KeyEnter. A user tapping Enter while waiting could therefore fill
+		// an empty DynamicHeight textarea with blank lines and stretch it to
+		// MaxHeight before the first frame. Ignore Ctrl+J while the input is
+		// whitespace-only; after real text exists it remains a newline key.
+		if strings.TrimSpace(m.input.Value()) == "" {
+			return m, nil
+		}
 		m.input.InsertRune('\n')
 		return m, nil
 
