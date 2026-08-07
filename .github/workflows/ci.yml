@@ -43,6 +43,14 @@ jobs:
       - name: go test
         run: go test -count=1 -timeout 90s ./...
 
+      - name: Vet patched Bubble Tea module
+        working-directory: vendor-patches/bubbletea-v2
+        run: go vet ./...
+
+      - name: Test patched Bubble Tea module
+        working-directory: vendor-patches/bubbletea-v2
+        run: go test -race -count=1 ./...
+
   desktop:
     name: Desktop build & test
     runs-on: macos-latest

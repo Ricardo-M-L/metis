@@ -105,6 +105,11 @@ func tailForRendererTest(s string, max int) string {
 
 func startTransitionRenderer(t *testing.T, m *Model) (*tea.Program, *lockedOutput) {
 	t.Helper()
+	return startTransitionRendererAtSize(t, m, 100, 40)
+}
+
+func startTransitionRendererAtSize(t *testing.T, m *Model, width, height int) (*tea.Program, *lockedOutput) {
+	t.Helper()
 
 	out := &lockedOutput{}
 	p := tea.NewProgram(
@@ -119,7 +124,7 @@ func startTransitionRenderer(t *testing.T, m *Model) (*tea.Program, *lockedOutpu
 			"COLORTERM=truecolor",
 		}),
 		tea.WithoutSignals(),
-		tea.WithWindowSize(100, 40),
+		tea.WithWindowSize(width, height),
 	)
 
 	runDone := make(chan error, 1)
@@ -150,10 +155,11 @@ func assertRendererTransitionEndsWithFullRedraw(t *testing.T, suffix, marker str
 			marker, suffix[lastClear:])
 	}
 
-	// CSI Ps L/M/S/T are insert/delete/scroll operations used by the
-	// fullscreen hard-scroll optimizer. A later ED2 guarantees their result is
-	// replaced by a renderer state anchored at the physical screen origin.
-	hardScroll := regexp.MustCompile("\x1b\\[[0-9;]*[LMST]")
+	// CSI Ps L/M/S/T and bare ESC M (Reverse Index) are insert/delete/scroll
+	// operations used by the fullscreen hard-scroll optimizer. A later ED2
+	// guarantees their result is replaced by a renderer state anchored at the
+	// physical screen origin.
+	hardScroll := regexp.MustCompile("(?:\x1b\\[[0-9;]*[LMST]|\x1bM)")
 	lastHardScroll := -1
 	for _, loc := range hardScroll.FindAllStringIndex(suffix, -1) {
 		lastHardScroll = loc[0]

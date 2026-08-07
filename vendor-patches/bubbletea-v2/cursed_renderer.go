@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"image/color"
 	"io"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -136,10 +135,7 @@ func (s *cursedRenderer) start() {
 	_, _ = s.scr.WriteString(ansi.SetModifyOtherKeys2)
 
 	kittyFlags := keyboardEnhancementsFlags(s.lastView.KeyboardEnhancements)
-	// METIS PATCH: only push kitty enhancements when explicitly opted in.
-	if kittyFlags != 0 {
-		_, _ = s.scr.WriteString(ansi.KittyKeyboard(kittyFlags, 1))
-	}
+	_, _ = s.scr.WriteString(ansi.KittyKeyboard(kittyFlags, 1))
 }
 
 // close implements renderer.
@@ -389,16 +385,11 @@ func (s *cursedRenderer) flush(closing bool) error {
 		_, _ = s.scr.WriteString(ansi.SetModifyOtherKeys2)
 
 		kittyFlags := keyboardEnhancementsFlags(view.KeyboardEnhancements)
-		// METIS PATCH: only push kitty enhancements when the caller
-		// actually opted in (any flag set). Skip RequestKittyKeyboard
-		// always — the query response leaks into iTerm2's alt-screen
-		// rendering as `^[[?1u`. Apps that need the response can
-		// enable it via a future option, but no current metis path
-		// requires it.
-		if kittyFlags != 0 {
-			_, _ = s.scr.WriteString(ansi.KittyKeyboard(kittyFlags, 1))
+		_, _ = s.scr.WriteString(ansi.KittyKeyboard(kittyFlags, 1))
+		if !closing {
+			// Request keyboard enhancements when they change
+			_, _ = s.scr.WriteString(ansi.RequestKittyKeyboard)
 		}
-		_ = closing // RequestKittyKeyboard intentionally not sent
 	}
 
 	// Set terminal colors.
@@ -611,7 +602,13 @@ func reset(s *cursedRenderer) {
 	}
 	scr.SetBackspace(s.backspace)
 	scr.SetMapNewline(s.mapnl)
-	scr.SetScrollOptim(runtime.GOOS != "windows") // disable scroll optimization on Windows due to bugs in some terminals
+	// Metis renders a fullscreen chat surface whose height can change sharply
+	// when background-agent events arrive in one batch. Ultraviolet's
+	// fullscreen hard-scroll path emits IL/DL/SU/SD operations relative to its
+	// cached cursor; direct iTerm2 can apply those against a stale physical
+	// cursor and leave an old frame above the new one. Keep ordinary cell
+	// diffing, but disable the unsafe whole-line scroll optimization.
+	scr.SetScrollOptim(false)
 	s.scr = scr
 }
 
@@ -772,8 +769,14 @@ func (s *cursedRenderer) insertAbove(str string) error {
 
 // onMouse implements renderer.
 func (s *cursedRenderer) onMouse(m MouseMsg) Cmd {
-	if s.lastView != nil && s.lastView.OnMouse != nil {
-		return s.lastView.OnMouse(m)
+	var onMouse func(MouseMsg) Cmd
+	s.mu.Lock()
+	if s.lastView != nil {
+		onMouse = s.lastView.OnMouse
+	}
+	s.mu.Unlock()
+	if onMouse != nil {
+		return onMouse(m)
 	}
 	return nil
 }
@@ -844,16 +847,8 @@ func viewEquals(a, b *View) bool {
 	return true
 }
 
-// METIS PATCH (2026-05-05): default flags=0 instead of 1.
-// Upstream forces basic key disambiguation on (flags=1) which makes
-// every Ctrl-modifier key arrive as a CSI u sequence; combined with
-// the unconditional RequestKittyKeyboard query at first frame, iTerm2
-// 3.6.10 in alt-screen mode echoes the response (`^[[?1u`) onto the
-// visible buffer instead of routing it to stdin. Setting the floor
-// to 0 lets metis ship without that visual artifact while preserving
-// any explicit opt-in via tea.View.KeyboardEnhancements.
 func keyboardEnhancementsFlags(ke KeyboardEnhancements) int {
-	flags := 0
+	flags := 1 // always enable basic key disambiguation
 	if ke.ReportEventTypes {
 		flags |= ansi.KittyReportEventTypes
 	}
