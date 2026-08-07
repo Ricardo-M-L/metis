@@ -30,6 +30,71 @@ type testModel struct {
 	counter  atomic.Value
 }
 
+type controlledRendererTicker struct {
+	ticks       chan time.Time
+	stopEntered chan struct{}
+	stopDone    chan struct{}
+	allowStop   chan struct{}
+	stopOnce    sync.Once
+	releaseOnce sync.Once
+	stopCount   atomic.Int32
+}
+
+func newControlledRendererTicker() *controlledRendererTicker {
+	return &controlledRendererTicker{
+		ticks:       make(chan time.Time, 2),
+		stopEntered: make(chan struct{}),
+		stopDone:    make(chan struct{}),
+		allowStop:   make(chan struct{}),
+	}
+}
+
+func (t *controlledRendererTicker) Ticks() <-chan time.Time {
+	return t.ticks
+}
+
+func (t *controlledRendererTicker) Stop() {
+	t.stopOnce.Do(func() {
+		t.stopCount.Add(1)
+		close(t.stopEntered)
+		<-t.allowStop
+		close(t.stopDone)
+	})
+}
+
+func (t *controlledRendererTicker) releaseStop() {
+	t.releaseOnce.Do(func() {
+		close(t.allowStop)
+	})
+}
+
+type rendererLifecycleProbe struct {
+	renderer
+	periodicFlushes chan struct{}
+}
+
+func (r *rendererLifecycleProbe) start() {}
+
+func (r *rendererLifecycleProbe) close() error {
+	return nil
+}
+
+func (r *rendererLifecycleProbe) flush(closing bool) error {
+	if !closing {
+		r.periodicFlushes <- struct{}{}
+	}
+	return nil
+}
+
+func waitForLifecycleSignal(t *testing.T, ch <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
 func (m *testModel) Init() Cmd {
 	return nil
 }
@@ -64,6 +129,76 @@ func (m *testModel) Update(msg Msg) (Model, Cmd) {
 func (m *testModel) View() View {
 	m.executed.Store(true)
 	return NewView("success")
+}
+
+func TestRendererRestartKeepsTickerOwnershipPerGeneration(t *testing.T) {
+	first := newControlledRendererTicker()
+	second := newControlledRendererTicker()
+
+	probe := &rendererLifecycleProbe{
+		periodicFlushes: make(chan struct{}, 3),
+	}
+	p := NewProgram(&testModel{})
+	p.renderer = probe
+	t.Cleanup(func() {
+		// Unblock either generation before asking an active renderer loop to
+		// stop. Closing this test Program's done channel then broadcasts to
+		// every possible generation, including regression implementations
+		// that accidentally start more than one loop.
+		first.releaseStop()
+		second.releaseStop()
+		close(p.rendererDone)
+	})
+
+	tickers := []rendererTicker{first, second}
+	factoryCalls := 0
+	p.newRendererTicker = func(time.Duration) rendererTicker {
+		if factoryCalls >= len(tickers) {
+			t.Fatalf("renderer ticker factory called more than %d times", len(tickers))
+		}
+		ticker := tickers[factoryCalls]
+		factoryCalls++
+		return ticker
+	}
+
+	p.startRenderer()
+	first.ticks <- time.Now()
+	waitForLifecycleSignal(t, probe.periodicFlushes, "first-generation flush")
+
+	// The unbuffered rendererDone send returns as soon as generation one has
+	// selected its teardown branch. Its Stop deliberately remains blocked so
+	// generation two starts while the old teardown is still in flight.
+	p.stopRenderer(false)
+	waitForLifecycleSignal(t, first.stopEntered, "first-generation ticker stop")
+
+	p.startRenderer()
+	if factoryCalls != 2 {
+		t.Fatalf("renderer restart reused an old ticker; factory calls = %d, want 2", factoryCalls)
+	}
+	second.ticks <- time.Now()
+	waitForLifecycleSignal(t, probe.periodicFlushes, "second-generation flush")
+
+	// Let the old teardown finish. It must only stop its own ticker; the new
+	// renderer must continue flushing after that point.
+	first.releaseStop()
+	waitForLifecycleSignal(t, first.stopDone, "first-generation ticker shutdown")
+	if got := second.stopCount.Load(); got != 0 {
+		t.Fatalf("old renderer stopped the second-generation ticker %d times", got)
+	}
+
+	second.ticks <- time.Now()
+	waitForLifecycleSignal(t, probe.periodicFlushes, "post-teardown second-generation flush")
+
+	second.releaseStop()
+	p.stopRenderer(true)
+	waitForLifecycleSignal(t, second.stopDone, "second-generation ticker shutdown")
+
+	if got := first.stopCount.Load(); got != 1 {
+		t.Fatalf("first-generation ticker stop count = %d, want 1", got)
+	}
+	if got := second.stopCount.Load(); got != 1 {
+		t.Fatalf("second-generation ticker stop count = %d, want 1", got)
+	}
 }
 
 func TestTeaModel(t *testing.T) {

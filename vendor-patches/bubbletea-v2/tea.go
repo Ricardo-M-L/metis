@@ -422,6 +422,26 @@ func (h *channelHandlers) shutdown() {
 	wg.Wait()
 }
 
+// rendererTicker is the clock owned by one renderer flush loop. Keeping the
+// clock behind this small interface lets lifecycle tests control the exact
+// ordering between one renderer stopping and the next renderer starting.
+type rendererTicker interface {
+	Ticks() <-chan time.Time
+	Stop()
+}
+
+type wallClockRendererTicker struct {
+	*time.Ticker
+}
+
+func (t *wallClockRendererTicker) Ticks() <-chan time.Time {
+	return t.C
+}
+
+func newWallClockRendererTicker(d time.Duration) rendererTicker {
+	return &wallClockRendererTicker{Ticker: time.NewTicker(d)}
+}
+
 // Program is a terminal user interface.
 type Program struct {
 	// disableInput disables all input. This is useful for programs that
@@ -537,6 +557,11 @@ type Program struct {
 	// rendererDone is used to stop the renderer.
 	rendererDone chan struct{}
 
+	// newRendererTicker creates the clock owned by each renderer generation.
+	// It is a field, rather than package-global state, so lifecycle tests can
+	// substitute deterministic clocks without affecting concurrent Programs.
+	newRendererTicker func(time.Duration) rendererTicker
+
 	// Initial window size. Mainly used for testing.
 	width, height int
 
@@ -591,10 +616,11 @@ func Interrupt() Msg {
 // NewProgram creates a new [Program].
 func NewProgram(model Model, opts ...ProgramOption) *Program {
 	p := &Program{
-		initialModel: model,
-		msgs:         make(chan Msg),
-		errs:         make(chan error, 1),
-		rendererDone: make(chan struct{}),
+		initialModel:      model,
+		msgs:              make(chan Msg),
+		errs:              make(chan error, 1),
+		rendererDone:      make(chan struct{}),
+		newRendererTicker: newWallClockRendererTicker,
 	}
 
 	// Apply all options to the program.
@@ -1392,7 +1418,7 @@ func (p *Program) startRenderer() {
 	// Each renderer generation owns its ticker. In particular, the goroutine
 	// stopped by ReleaseTerminal must never be able to stop a ticker created
 	// later by RestoreTerminal.
-	ticker := time.NewTicker(framerate)
+	ticker := p.newRendererTicker(framerate)
 
 	// Since the renderer can be restarted after a stop, we need to reset
 	// the done channel and its corresponding sync.Once.
@@ -1407,7 +1433,7 @@ func (p *Program) startRenderer() {
 			case <-p.rendererDone:
 				return
 
-			case <-ticker.C:
+			case <-ticker.Ticks():
 				_ = p.flush()
 				_ = p.renderer.flush(false)
 			}
