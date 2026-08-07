@@ -531,9 +531,6 @@ type Program struct {
 	// modes keeps track of terminal modes that have been enabled or disabled.
 	ignoreSignals uint32
 
-	// ticker is the ticker that will be used to write to the renderer.
-	ticker *time.Ticker
-
 	// once is used to stop the renderer.
 	once sync.Once
 
@@ -1392,13 +1389,10 @@ func (p *Program) Printf(template string, args ...any) {
 // startRenderer starts the renderer.
 func (p *Program) startRenderer() {
 	framerate := time.Second / time.Duration(p.fps)
-	if p.ticker == nil {
-		p.ticker = time.NewTicker(framerate)
-	} else {
-		// If the ticker already exists, it has been stopped and we need to
-		// reset it.
-		p.ticker.Reset(framerate)
-	}
+	// Each renderer generation owns its ticker. In particular, the goroutine
+	// stopped by ReleaseTerminal must never be able to stop a ticker created
+	// later by RestoreTerminal.
+	ticker := time.NewTicker(framerate)
 
 	// Since the renderer can be restarted after a stop, we need to reset
 	// the done channel and its corresponding sync.Once.
@@ -1407,13 +1401,13 @@ func (p *Program) startRenderer() {
 	// Start the renderer.
 	p.renderer.start()
 	go func() {
+		defer ticker.Stop()
 		for {
 			select {
 			case <-p.rendererDone:
-				p.ticker.Stop()
 				return
 
-			case <-p.ticker.C:
+			case <-ticker.C:
 				_ = p.flush()
 				_ = p.renderer.flush(false)
 			}

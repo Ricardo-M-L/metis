@@ -21,53 +21,85 @@ import (
 // and leave the old frame above a second full frame. Metis therefore requires
 // its Bubble Tea renderer configuration to avoid CSI L/M/S/T and bare ESC M.
 func TestBurstAgentRowsAvoidHardScrollRendererPath(t *testing.T) {
-	m := newActiveTransitionRendererModel(t, "requesting")
-	m.eventCh = make(chan agent.Event, 32)
-	p, out := startTransitionRendererAtSize(t, m, 100, 29)
-
-	initial := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
-		return strings.Contains(s, "renderer-user-marker") &&
-			strings.Contains(s, "connecting")
-	})
-	transitionOffset := len(initial)
-
-	for i := 0; i < 10; i++ {
-		description := fmt.Sprintf("Search benchmark %02d", i)
-		if i == 9 {
-			description = "Search Terminal-Bench benchmark"
-		}
-		m.eventCh <- agent.Event{
-			Kind:      agent.EventToolStart,
-			ToolUseID: fmt.Sprintf("agent-%02d", i),
-			ToolName:  "Agent",
-			ToolInput: map[string]any{
-				"description":       description,
-				"prompt":            description,
-				"run_in_background": true,
-			},
-		}
-	}
-	for i := 0; i < 10; i++ {
-		m.eventCh <- agent.Event{
-			Kind:      agent.EventToolResult,
-			ToolUseID: fmt.Sprintf("agent-%02d", i),
-			ToolName:  "Agent",
-			ToolResult: &agent.ToolResult{
-				Output: fmt.Sprintf("sub-agent spawned in background %02d", i),
-			},
-		}
+	tests := []struct {
+		name            string
+		restoreRenderer bool
+	}{
+		{name: "initial renderer"},
+		{name: "restored renderer", restoreRenderer: true},
 	}
 
-	p.Send(spinnerTick{})
-	snapshot := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
-		return strings.Contains(s[transitionOffset:], "Search Terminal-Bench benchmark")
-	})
-	suffix := snapshot[transitionOffset:]
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newActiveTransitionRendererModel(t, "requesting")
+			m.eventCh = make(chan agent.Event, 32)
+			p, out := startTransitionRendererAtSize(t, m, 100, 29)
 
-	hardScroll := regexp.MustCompile("(?:\x1b\\[[0-9;]*[LMST]|\x1bM)")
-	if matches := hardScroll.FindAllString(suffix, -1); len(matches) != 0 {
-		t.Fatalf("burst Agent rows emitted %d fullscreen hard-scroll operations %q; output=%q",
-			len(matches), matches, suffix)
+			initial := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
+				return strings.Contains(s, "renderer-user-marker") &&
+					strings.Contains(s, "connecting")
+			})
+			if tt.restoreRenderer {
+				if err := p.ReleaseTerminal(); err != nil {
+					t.Fatalf("release terminal: %v", err)
+				}
+				restoreOffset := len(out.snapshot())
+				if err := p.RestoreTerminal(); err != nil {
+					t.Fatalf("restore terminal: %v", err)
+				}
+				// RestoreTerminal restarts the renderer, but a frame is only
+				// produced when the event loop next renders the model. Force
+				// one explicit baseline redraw so this lifecycle check never
+				// depends on the timing of the next asynchronous spinner tick.
+				p.Send(tea.ClearScreen())
+				initial = waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
+					return len(s) >= restoreOffset &&
+						strings.Contains(s[restoreOffset:], "renderer-user-marker") &&
+						strings.Contains(s[restoreOffset:], "connecting")
+				})
+			}
+			transitionOffset := len(initial)
+
+			for i := 0; i < 10; i++ {
+				description := fmt.Sprintf("Search benchmark %02d", i)
+				if i == 9 {
+					description = "Search Terminal-Bench benchmark"
+				}
+				m.eventCh <- agent.Event{
+					Kind:      agent.EventToolStart,
+					ToolUseID: fmt.Sprintf("agent-%02d", i),
+					ToolName:  "Agent",
+					ToolInput: map[string]any{
+						"description":       description,
+						"prompt":            description,
+						"run_in_background": true,
+					},
+				}
+			}
+			for i := 0; i < 10; i++ {
+				m.eventCh <- agent.Event{
+					Kind:      agent.EventToolResult,
+					ToolUseID: fmt.Sprintf("agent-%02d", i),
+					ToolName:  "Agent",
+					ToolResult: &agent.ToolResult{
+						Output: fmt.Sprintf("sub-agent spawned in background %02d", i),
+					},
+				}
+			}
+
+			p.Send(spinnerTick{})
+			snapshot := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
+				return len(s) >= transitionOffset &&
+					strings.Contains(s[transitionOffset:], "Search Terminal-Bench benchmark")
+			})
+			suffix := snapshot[transitionOffset:]
+
+			hardScroll := regexp.MustCompile("(?:\x1b\\[[0-9;]*[LMST]|\x1bM)")
+			if matches := hardScroll.FindAllString(suffix, -1); len(matches) != 0 {
+				t.Fatalf("burst Agent rows emitted %d fullscreen hard-scroll operations %q; output=%q",
+					len(matches), matches, suffix)
+			}
+		})
 	}
 }
 
