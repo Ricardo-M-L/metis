@@ -37,6 +37,76 @@ func (m *Model) rendersWelcomeFrame() bool {
 		!m.spinnerActive
 }
 
+// frameGeometryPhase groups chat states by terminal row geometry rather than
+// by every spinner label. Ultraviolet's fullscreen renderer may optimize a
+// geometry change with insert/delete/scroll escapes. Direct iTerm2 can apply
+// those escapes against a stale physical cursor, so transitions between these
+// groups need an ED2 re-anchor while ordinary token deltas inside live remain
+// incremental.
+type frameGeometryPhase uint8
+
+const (
+	frameGeometryOther frameGeometryPhase = iota
+	frameGeometryCopy
+	frameGeometryWelcome
+	frameGeometryIdle
+	frameGeometryRequesting
+	frameGeometryLive
+)
+
+func (m *Model) currentFrameGeometryPhase() frameGeometryPhase {
+	if m == nil {
+		return frameGeometryOther
+	}
+	if m.copyMode {
+		return frameGeometryCopy
+	}
+	if m.rendersWelcomeFrame() {
+		return frameGeometryWelcome
+	}
+	if m.activeScreen != nil {
+		return frameGeometryOther
+	}
+	if !m.spinnerActive {
+		return frameGeometryIdle
+	}
+
+	switch m.spinnerPhase {
+	case "thinking", "responding", "tool", "tool-input", "tool-use":
+		return frameGeometryLive
+	case "requesting":
+		return frameGeometryRequesting
+	default:
+		// Legacy/tests can leave spinnerPhase unset. Preserve the renderer's
+		// old heuristic so a buffered response is still classified as live.
+		if !m.firstStreamAt.IsZero() || m.streamingText != "" || m.thinkingText != "" {
+			return frameGeometryLive
+		}
+		return frameGeometryRequesting
+	}
+}
+
+func isActiveChatGeometryPhase(phase frameGeometryPhase) bool {
+	switch phase {
+	case frameGeometryIdle, frameGeometryRequesting, frameGeometryLive:
+		return true
+	default:
+		return false
+	}
+}
+
+func needsFrameGeometryReanchor(before, after frameGeometryPhase) bool {
+	if before == after || before == frameGeometryCopy || after == frameGeometryCopy {
+		return false
+	}
+	// Preserve the original welcome invariant even when the destination is a
+	// full-window screen rather than the ordinary chat surface.
+	if before == frameGeometryWelcome {
+		return true
+	}
+	return isActiveChatGeometryPhase(before) && isActiveChatGeometryPhase(after)
+}
+
 // sortTimelineByTime sorts a chronological merge of timelineItems
 // in-place. Stable so two items with identical Timestamps preserve
 // their append order.
