@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // TestRendererBackend_ClearTouchesEveryRow protects the two-frame invariant
@@ -66,5 +67,42 @@ func TestRendererBackend_ReanchorsCJKRows(t *testing.T) {
 
 	if got := strings.Count(out.String(), "\x1b[5G"); got != 1 {
 		t.Fatalf("CJK row emitted %d end-of-line reanchors, want 1; output=%q", got, out.String())
+	}
+}
+
+// TestRendererBackend_FullscreenVerticalMovesUseCUP pins the direct-iTerm2
+// fix at the application module boundary. Disabling hard-scroll alone is not
+// sufficient: Ultraviolet's ordinary cursor optimizer used bare LF/RI for
+// one-row moves, which scroll at the physical bottom/top margin after even a
+// one-row cursor drift and leave a complete old frame above the new frame.
+func TestRendererBackend_FullscreenVerticalMovesUseCUP(t *testing.T) {
+	tests := []struct {
+		name       string
+		fromY, toY int
+	}{
+		{name: "down", fromY: 1, toY: 2},
+		{name: "up", fromY: 2, toY: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			renderer := uv.NewTerminalRenderer(&out, []string{"TERM=xterm-256color"})
+			renderer.SetFullscreen(true)
+			renderer.SetRelativeCursor(false)
+			renderer.SetScrollOptim(false)
+			renderer.SetTabStops(138)
+			renderer.SetPosition(0, tt.fromY)
+
+			renderer.MoveTo(0, tt.toY)
+			if err := renderer.Flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+
+			want := ansi.CursorPosition(1, tt.toY+1)
+			if got := out.String(); got != want {
+				t.Fatalf("vertical move output = %q, want absolute CUP %q", got, want)
+			}
+		})
 	}
 }

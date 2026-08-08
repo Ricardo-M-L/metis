@@ -51,6 +51,14 @@ jobs:
         working-directory: vendor-patches/bubbletea-v2
         run: go test -race -count=1 ./...
 
+      - name: Vet patched Ultraviolet module
+        working-directory: vendor-patches/ultraviolet
+        run: go vet ./...
+
+      - name: Test patched Ultraviolet module
+        working-directory: vendor-patches/ultraviolet
+        run: go test -race -count=1 ./...
+
   desktop:
     name: Desktop build & test
     runs-on: macos-latest

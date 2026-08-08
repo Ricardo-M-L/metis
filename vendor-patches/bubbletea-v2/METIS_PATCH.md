@@ -1,7 +1,8 @@
 # Metis Bubble Tea patch
 
 This directory is Bubble Tea `v2.0.8`
-(`h1:SxTJMhCAI3lbPmy4SgX5LWZ24AdINr4I6UEqzZvYJuY=`) plus two Metis patches:
+(`h1:SxTJMhCAI3lbPmy4SgX5LWZ24AdINr4I6UEqzZvYJuY=`) plus two Metis patches,
+and its `go.mod` points at the adjacent patched Ultraviolet module:
 
 - `cursed_renderer.go` disables Ultraviolet fullscreen scroll optimization.
   Direct iTerm2 can apply its whole-line `IL`/`DL`/`SU`/`SD` operations at a

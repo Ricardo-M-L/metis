@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"regexp"
 	"strings"
@@ -344,6 +345,52 @@ func TestStreamingToIdleTransitionEndsWithFullRedraw(t *testing.T) {
 	suffix := snapshot[transitionOffset:]
 	assertRendererTransitionEndsWithFullRedraw(t, suffix, responseMarker)
 	assertSingleActiveFrameAfterLastClear(t, suffix, responseMarker, true)
+}
+
+// TestRequestingToProviderEOFDoesNotScrollFullscreen reproduces the exact
+// direct-iTerm2 path from the v0.4.9 report at the reported 138x44 size. The
+// provider ends before producing a token, so the renderer moves directly from
+// the requesting frame to the final API-error frame. Every cross-row movement
+// must be margin-safe; a bare LF/RI can scroll the physical alt screen when
+// its cursor is one row out of sync and leave multiple complete frames.
+func TestRequestingToProviderEOFDoesNotScrollFullscreen(t *testing.T) {
+	m := newActiveTransitionRendererModel(t, "requesting")
+	p, out := startTransitionRendererAtSize(t, m, 138, 44)
+
+	initial := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
+		return strings.Contains(s, "renderer-user-marker") &&
+			strings.Contains(s, "connecting")
+	})
+	transitionOffset := len(initial)
+
+	m.doneCh <- io.EOF
+	p.Send(spinnerTick{})
+	snapshot := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
+		return len(s) > transitionOffset &&
+			strings.Contains(s[transitionOffset:], "API Error: EOF")
+	})
+	suffix := snapshot[transitionOffset:]
+
+	lastClear := strings.LastIndex(suffix, ansi.EraseEntireScreen)
+	if lastClear < 0 {
+		t.Fatalf("provider EOF transition did not re-anchor with ED2; output=%q", suffix)
+	}
+	finalFrame := suffix[lastClear:]
+	if count := strings.Count(finalFrame, "✻ metis "); count != 1 {
+		t.Fatalf("final EOF frame contains %d headers, want exactly 1; output=%q", count, finalFrame)
+	}
+	if count := strings.Count(finalFrame, "API Error: EOF"); count != 1 {
+		t.Fatalf("final EOF frame contains %d EOF errors, want exactly 1; output=%q", count, finalFrame)
+	}
+	if strings.Contains(finalFrame, "connecting") {
+		t.Fatalf("final EOF frame retained the requesting spinner; output=%q", finalFrame)
+	}
+
+	unsafeVertical := regexp.MustCompile("(?:\\n|\\x1bM|\\x1b\\[[0-9;]*[LMST])")
+	if matches := unsafeVertical.FindAllString(suffix, -1); len(matches) != 0 {
+		t.Fatalf("provider EOF transition emitted %d scroll-capable movements %q; output=%q",
+			len(matches), matches, suffix)
+	}
 }
 
 func TestActiveFrameTransitionDoesNotClearEveryTextDelta(t *testing.T) {
