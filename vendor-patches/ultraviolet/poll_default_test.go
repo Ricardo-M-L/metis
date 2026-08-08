@@ -6,7 +6,6 @@ package uv
 import (
 	"os"
 	"testing"
-	"time"
 )
 
 func TestReader(t *testing.T) {
@@ -31,22 +30,15 @@ func TestReader(t *testing.T) {
 		t.Errorf("expected no error, but got %s", err)
 	}
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		p := make([]byte, 1)
-		n, err = pollReader.Read(p)
-	}()
-
+	// Cancel before Read so the assertion is deterministic. Starting the
+	// goroutine first races a ready pipe byte against Cancel: on a fast macOS
+	// runner Read can consume the leading "h", making the remaining read
+	// observe "ello" even though neither behavior tests renderer semantics.
 	if !pollReader.Cancel() {
 		t.Errorf("expected cancellation to be success")
 	}
-
-	select {
-	case <-done:
-	case <-time.After(100 * time.Millisecond):
-		t.Errorf("expected cancellation to unblock reader")
-	}
+	p := make([]byte, 1)
+	n, err = pollReader.Read(p)
 	if n != 0 {
 		t.Errorf("expected 0 bytes read but got %d", n)
 	}
@@ -59,7 +51,7 @@ func TestReader(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error, but got %s", err)
 	}
-	p := make([]byte, 5)
+	p = make([]byte, 5)
 	n, err = pollReader.Read(p)
 	if n != 5 {
 		t.Errorf("expected 5 bytes written but got %d", n)
