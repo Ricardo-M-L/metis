@@ -56,7 +56,7 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		// the slash-signal path now wins, producing the grid + breakdown.
 		// Expectation updated to match the new "Context Usage" headline.
 		{"/context", []string{"Context Usage", "window", "tokens"}, "slash"},
-		{"/export", []string{"exported", "messages to"}, "repl"},
+		{"/export", []string{"Conversation exported to:", ".txt"}, "repl"},
 
 		// Slash-owned (added in 2026-05-01 audit) --------------------------
 		{"/keybindings", []string{"Keybindings", "Ctrl-C", "Esc"}, "slash"},
@@ -98,6 +98,31 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSlashE2E_ExportUsesClaudeStyleResultLane(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	m := newSlashTestModel(t)
+	before := len(m.messages)
+
+	m.input.SetValue("/export")
+	pressEnter(t, m)
+
+	if len(m.messages) != before+2 {
+		t.Fatalf("/export appended %d rows, want command + result", len(m.messages)-before)
+	}
+	invocation := m.messages[len(m.messages)-2]
+	if invocation.Role != "user" || invocation.Content != "/export" {
+		t.Fatalf("export invocation = %+v, want visible user command", invocation)
+	}
+	result := m.messages[len(m.messages)-1]
+	if result.Role != "command-result" {
+		t.Fatalf("export result role = %q, want command-result", result.Role)
+	}
+	rendered := stripANSI(renderMessage(result, 120, false))
+	if !strings.Contains(rendered, "⎿  Conversation exported to:") {
+		t.Fatalf("export result does not match Claude-style TUI lane: %q", rendered)
 	}
 }
 

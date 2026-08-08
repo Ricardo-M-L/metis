@@ -125,8 +125,8 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// reflects the in-flight child loop.
 		if ev.ToolName == "Agent" {
 			name := "agent"
-			if p, ok := ev.ToolInput["prompt"].(string); ok && p != "" {
-				name = truncate(strings.TrimSpace(p), 24)
+			if label := agentDisplayLabel(ev.ToolInput); label != "" {
+				name = truncate(label, 32)
 			}
 			m.subAgents = append(m.subAgents, SubAgentInfo{
 				ID:        ev.ToolUseID,

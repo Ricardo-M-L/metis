@@ -51,8 +51,8 @@ func TestWelcomeTransitionInvariantPreservesCopyModeScrollback(t *testing.T) {
 	if !m.copyMode {
 		t.Fatal("Ctrl+S should enter copy mode")
 	}
-	if cmd != nil {
-		t.Fatalf("entering copy mode returned %T; a ClearScreen wrapper would erase native scrollback", cmd)
+	if cmd == nil {
+		t.Fatal("entering copy mode must schedule the managed normal-screen transcript/hint print")
 	}
 }
 

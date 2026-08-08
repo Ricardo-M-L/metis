@@ -458,6 +458,12 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			// Claude Code keeps the `/export` invocation visible directly
+			// above its `⎿ Conversation exported to: …` result. Other Metis
+			// slash commands retain their existing compact behavior.
+			if cmd.Name == "export" {
+				m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+			}
 			repl := m.asREPL()
 			output := cmd.Handler(repl, args)
 			// asREPL is a value bridge. Model/provider switches mutate the
@@ -735,14 +741,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			toggleVimMode()
 			m.messages = append(m.messages, Message{Role: "info", Content: vimModeStatus(), Timestamp: time.Now()})
 		case slash.SignalExport:
-			if m.session == nil || m.sessionID == "" {
-				m.messages = append(m.messages, Message{Role: "error", Content: "(export: no session store)", Timestamp: time.Now()})
+			if m.loop == nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: exportFailure(fmt.Errorf("no active conversation")), Timestamp: time.Now()})
 			} else {
-				p, err := exportSessionToFile(m.session, m.sessionID)
+				p, err := exportConversationToFile(m.loop.History(), args, time.Now())
 				if err != nil {
-					m.messages = append(m.messages, Message{Role: "error", Content: "export: " + err.Error(), Timestamp: time.Now()})
+					m.messages = append(m.messages, Message{Role: "error", Content: exportFailure(err), Timestamp: time.Now()})
 				} else {
-					m.messages = append(m.messages, Message{Role: "success", Content: "(exported → " + p + ")", Timestamp: time.Now()})
+					m.messages = append(m.messages, Message{Role: "command-result", Content: exportSuccess(p), Timestamp: time.Now()})
 				}
 			}
 		case slash.SignalReleaseNotes:
@@ -1249,8 +1255,8 @@ func (m *Model) buildAgentTasks() []screen.AgentTask {
 			key = fmt.Sprintf("legacy-agent-%d", i)
 		}
 		name := "agent"
-		if prompt, ok := event.Input["prompt"].(string); ok && strings.TrimSpace(prompt) != "" {
-			name = truncate(strings.TrimSpace(prompt), 24)
+		if label := agentDisplayLabel(event.Input); label != "" {
+			name = truncate(label, 40)
 		}
 		status := "running"
 		if event.Kind != "start" {

@@ -20,6 +20,8 @@ func TestClassifyREPLOutput(t *testing.T) {
 		{"(session synced to disk)", "success"},
 		{"tagged: scratch", "success"},
 		{"(allowed) — Bash", "success"},
+		{"Conversation exported to: /tmp/session.txt", "command-result"},
+		{"Conversation copied to clipboard", "command-result"},
 
 		// warning
 		{"rename: no active session store", "warning"},

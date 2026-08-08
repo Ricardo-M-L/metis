@@ -3,7 +3,7 @@ package tui
 import "strings"
 
 // classifyREPLOutput maps a REPL command's plain-string output to the
-// best-fit Message.Role (info / success / warning / error). Phase B
+// best-fit Message.Role (info / command-result / success / warning / error). Phase B
 // added per-glyph styling for these roles; without classification, the
 // REPL command dispatch hard-coded everything as "info" so success
 // confirmations like "rename: session title set to X" rendered with
@@ -43,6 +43,15 @@ func classifyREPLOutput(out string) string {
 		strings.Contains(low, "not wired") ||
 		strings.Contains(low, "use ") && strings.Contains(low, "to set") {
 		return "warning"
+	}
+
+	// Claude Code renders a slash-command result in the tool-result lane
+	// (`⎿  …`), not as a celebratory green check. Keep export's completion
+	// line in that lane so `/export` has the same visual shape as the
+	// reference TUI while retaining the exact success/error wording.
+	if strings.HasPrefix(low, "conversation exported to:") ||
+		strings.HasPrefix(low, "conversation copied to clipboard") {
+		return "command-result"
 	}
 
 	// success markers — "X: did the thing" lines.

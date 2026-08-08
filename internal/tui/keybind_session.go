@@ -14,6 +14,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
+const copyModeHint = "[copy mode — mouse-select/copy · Ctrl+S to return to chat]"
+
 func (m *Model) handleSessionPick() (tea.Model, tea.Cmd) {
 	if m.session == nil {
 		m.messages = append(m.messages, Message{Role: "info", Content: "(no session store)", Timestamp: time.Now()})
@@ -42,9 +44,10 @@ func (m *Model) handleSessionPick() (tea.Model, tea.Cmd) {
 }
 
 // toggleCopyMode flips the alt-screen on/off so the user can natively
-// select and copy chat content. Entering: print the current transcript
-// to stdout (visible in scrollback) then exit alt-screen. Exiting:
-// re-enter alt-screen, the chat redraws fresh.
+// select and copy chat content. Entering schedules the current transcript
+// through Bubble Tea's managed print path; the renderer first applies the
+// pending AltScreen=false View, then inserts the transcript into native
+// scrollback. Exiting re-enters alt-screen and redraws the chat.
 //
 // v2: tea.EnterAltScreen / tea.ExitAltScreen Cmds are gone. Alt-screen
 // state is declared via tea.View.AltScreen each frame; View() reads
@@ -56,12 +59,17 @@ func (m *Model) toggleCopyMode() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.copyMode = true
-	// Dump a plain transcript so the user has SOMETHING to select
-	// after we leave alt-screen — otherwise the post-alt screen
-	// shows nothing related to metis. Strip ANSI for clean copy.
-	fmt.Println(m.buildPlainTranscript())
-	fmt.Println("[copy mode — Ctrl+S to return to chat]")
-	return m, nil
+	// Never write directly with fmt.Println here. Update runs while the
+	// terminal is still in alt-screen; direct output would therefore be
+	// clipped to the physical viewport before View() can request the exit.
+	// tea.Println is ordered by our Bubble Tea renderer patch: pending View
+	// state is flushed first, so the transcript reaches native scrollback
+	// only after DECRST 1049 has restored the normal screen.
+	transcript := strings.TrimRight(m.buildPlainTranscript(), "\n")
+	if transcript == "" {
+		return m, tea.Println(copyModeHint)
+	}
+	return m, tea.Println(transcript + "\n" + copyModeHint)
 }
 
 // buildPlainTranscript renders messages + tool events as a single

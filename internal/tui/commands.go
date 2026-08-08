@@ -3,7 +3,6 @@ package tui
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -150,7 +149,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Session ===
 	r.Register(REPLCommand{Name: "session", Aliases: []string{"sid"}, Description: "show current session id", Handler: cmdSession})
 	r.Register(REPLCommand{Name: "sessions", Aliases: []string{"ls"}, Description: "list saved sessions", Handler: cmdSessions})
-	r.Register(REPLCommand{Name: "export", Description: "export current session to a file", Handler: cmdExport})
+	r.Register(REPLCommand{Name: "export", Description: "export the current conversation to a readable text file", Handler: cmdExport})
 
 	// === Permissions ===
 	r.Register(REPLCommand{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions)", Handler: cmdMode})
@@ -1334,33 +1333,14 @@ func cmdSessions(r *REPL, args string) string {
 }
 
 func cmdExport(r *REPL, args string) string {
-	args = strings.TrimSpace(args)
-	var path string
-	if args == "" {
-		// Default destination: ~/.metis/exports/session-<id>-<unix>.jsonl.
-		// Earlier this returned a usage hint, which felt like the command
-		// was broken — users expect "/export" to actually export. Pass an
-		// explicit path only when you want to override.
-		home, _ := os.UserHomeDir()
-		dir := filepath.Join(home, ".metis", "exports")
-		_ = os.MkdirAll(dir, 0o755)
-		sid := r.SessionID
-		if sid == "" {
-			sid = "untitled"
-		}
-		path = filepath.Join(dir, fmt.Sprintf("session-%s-%d.jsonl", sid, time.Now().Unix()))
-	} else {
-		path = args
+	if r == nil || r.Loop == nil {
+		return exportFailure(fmt.Errorf("no active conversation"))
 	}
-	hist := r.Loop.History()
-	data, err := json.MarshalIndent(hist, "", "  ")
+	path, err := exportConversationToFile(r.Loop.History(), args, time.Now())
 	if err != nil {
-		return "export failed: " + err.Error()
+		return exportFailure(err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return "export failed: " + err.Error()
-	}
-	return "exported " + fmt.Sprintf("%d messages", len(hist)) + " to " + path
+	return exportSuccess(path)
 }
 
 // =============================================================================

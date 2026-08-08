@@ -882,7 +882,20 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				p.execute(fmt.Sprint(msg.Msg))
 
 			case printLineMessage:
-				p.renderer.insertAbove(msg.messageBody) //nolint:errcheck,gosec
+				// A model can switch from alt-screen to inline mode and return
+				// Println from the same Update. render(model) has already queued
+				// that View, but the frame-rate goroutine may not have flushed it
+				// yet. Flush synchronously before insertAbove so normal-screen
+				// output is never written into the old alternate buffer and lost.
+				if err := p.flush(); err != nil {
+					return model, err
+				}
+				if err := p.renderer.flush(false); err != nil {
+					return model, err
+				}
+				if err := p.renderer.insertAbove(msg.messageBody); err != nil { //nolint:gosec
+					return model, err
+				}
 
 			case clearScreenMsg:
 				p.renderer.clearScreen()

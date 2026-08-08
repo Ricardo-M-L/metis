@@ -127,16 +127,15 @@ func TestF8_MouseWheel_ScrollsTranscript(t *testing.T) {
 	}
 }
 
-// TestF8_MouseModeLeavesSelectionNative — Model.View() deliberately leaves
-// mouse tracking disabled so iTerm2 owns drag-to-select and Cmd+C can copy
-// text from the input as well as the transcript. Keyboard scrolling remains
-// available; the wheel-handler tests above exercise the Update path directly.
-func TestF8_MouseModeLeavesSelectionNative(t *testing.T) {
+// TestF8_MouseModeCapturesWheel — active fullscreen chat must request cell
+// motion so real SGR wheel events reach Update instead of scrolling iTerm2's
+// unrelated normal-screen scrollback behind the alternate buffer.
+func TestF8_MouseModeCapturesWheel(t *testing.T) {
 	m := newE2EModel(t, 120, 30, 0)
 	v := m.View()
-	if v.MouseMode != tea.MouseModeNone {
-		t.Errorf("MouseMode must be None (= %v) so native selection remains available; got %v",
-			tea.MouseModeNone, v.MouseMode)
+	if v.MouseMode != tea.MouseModeCellMotion {
+		t.Errorf("MouseMode must be CellMotion (= %v) so wheel events reach chat; got %v",
+			tea.MouseModeCellMotion, v.MouseMode)
 	}
 }
 

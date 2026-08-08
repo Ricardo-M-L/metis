@@ -230,6 +230,19 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// landed, not just another grey line in the scroll.
 		s.WriteString(styleSuccess.Render("  ✓ " + msg.Content))
 		s.WriteString("\n")
+	case "command-result":
+		// Slash-command completion in Claude Code's result lane. Export uses
+		// this instead of the generic green success row so the live TUI reads:
+		//   ❯ /export
+		//     ⎿  Conversation exported to: …
+		for i, line := range strings.Split(msg.Content, "\n") {
+			if i == 0 {
+				s.WriteString(styleMuted.Render("  " + glyphTreeLeaf + "  " + line))
+			} else {
+				s.WriteString(styleMuted.Render("     " + line))
+			}
+			s.WriteString("\n")
+		}
 	case "warning":
 		// ⚠ in yellow for soft warnings (no session store, deprecated
 		// usage). Visible without screaming like "error".

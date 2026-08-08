@@ -341,7 +341,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "vim", Description: "toggle vim-style modal editing for the input box", Handler: func(_ string) (string, Signal) {
 		return "", SignalVim
 	}})
-	r.Register(Cmd{Name: "export", Description: "export the current session as JSONL to stdout (mirrored to ~/.metis/exports/)", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "export", Description: "export the current conversation to a readable text file", Handler: func(_ string) (string, Signal) {
 		return "", SignalExport
 	}})
 	r.Register(Cmd{Name: "release-notes", Aliases: []string{"changelog", "whatsnew"}, Description: "show recent metis release notes", Handler: func(_ string) (string, Signal) {

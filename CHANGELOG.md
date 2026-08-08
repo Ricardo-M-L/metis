@@ -467,6 +467,24 @@ NOT done in this round (deferred):
   slash_help, input_repeat, arrow_jump, slash_skills, slash_mcp_list,
   double_esc_clear, ctrl_c_quit).
 
+## [0.4.11] - 2026-08-08
+
+### Changed
+
+- `/export` now writes a Claude Code-style, readable `.txt` transcript to
+  `~/.metis/exports/`, shows the command and destination in the TUI, and omits
+  system prompts, hidden thinking, internal reminders, binary image data, and
+  detected secrets.
+
+### Fixed
+
+- Restored mouse-wheel navigation of Metis chat history so iTerm2 and tmux no
+  longer mix stale terminal scrollback with the active alternate-screen frame.
+- Fixed Ctrl+S copy mode so the full transcript is written only after leaving
+  the alternate screen, preserving earlier lines in native terminal scrollback.
+- Sub-agent status and `/agents-view` now prefer each agent's short
+  `description`, avoiding duplicate labels when prompts share the same prefix.
+
 ## [0.1.1] - 2026-05-01
 
 ### Added
@@ -506,6 +524,7 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.11...HEAD
+[0.4.11]: https://github.com/Ricardo-M-L/metis/compare/v0.4.10...v0.4.11
 [0.1.1]: https://github.com/Ricardo-M-L/metis/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Ricardo-M-L/metis/releases/tag/v0.1.0

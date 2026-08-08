@@ -7,7 +7,6 @@ package tui
 
 import (
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -539,32 +538,6 @@ func renderModelList(loop interface{ Model() string }) string {
 }
 
 var _ = renderModelList // keep available for future Ctrl-L wiring
-
-// exportSessionToFile writes the session JSONL to ~/.metis/exports/<id>.jsonl
-// and returns the file path. Mirrors `metis sessions export` but lives
-// inside the chat surface so users don't have to leave the TUI.
-func exportSessionToFile(store sessionExporter, id string) (string, error) {
-	dir := filepath.Join(config.Home(), "exports")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	out := filepath.Join(dir, id+".jsonl")
-	f, err := os.Create(out)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if err := store.Export(id, f); err != nil {
-		return "", err
-	}
-	return out, nil
-}
-
-// sessionExporter narrows what /export needs from the session store —
-// keeps render_info.go decoupled from the full Store API.
-type sessionExporter interface {
-	Export(id string, w io.Writer) error
-}
 
 // --- P1 renderers ---
 

@@ -53,6 +53,17 @@ func TestRender_ErrorRoleStillHasXGlyph(t *testing.T) {
 	}
 }
 
+func TestRender_CommandResultUsesClaudeTreeLeaf(t *testing.T) {
+	msg := Message{Role: "command-result", Content: "Conversation exported to: /tmp/session.txt", Timestamp: time.Now()}
+	out := stripANSI(renderMessage(msg, 100, false))
+	if !strings.Contains(out, "⎿  Conversation exported to:") {
+		t.Fatalf("command result should use Claude-style tree leaf; got: %q", out)
+	}
+	if strings.Contains(out, "✓") {
+		t.Fatalf("command result must not use the generic success check; got: %q", out)
+	}
+}
+
 // TestRender_AllStatusRolesDistinguishable — under stripANSI the four
 // status rows have visually distinct prefixes. Catches a future patch
 // that copy-pastes the wrong glyph into the wrong case.

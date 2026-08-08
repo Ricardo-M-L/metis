@@ -151,12 +151,13 @@ func (m *Model) View() tea.View {
 	// chatView wraps a content string with the metis-standard view
 	// flags. AltScreen on for the full-screen TUI surface; mouse mode
 	// is CellMotion (button-event tracking — clicks + wheel + drag-
-	// while-button-pressed, NO hover). bubbletea v2.0.6 reliably
-	// consumes the wheel/click reports at this level; the leakage
-	// problem we hit earlier was specifically AllMotion (drag/hover
-	// reports leaking as `^[[<0;col;rowM` text). Without CellMotion
-	// the user's trackpad scroll inside the TUI does nothing —
-	// feedback 2026-05-05.
+	// while-button-pressed, NO hover). bubbletea v2 reliably consumes
+	// wheel/click reports at this level; the leakage problem we hit
+	// earlier was specifically AllMotion (hover reports leaking as
+	// `^[[<0;col;rowM` text). Without CellMotion, iTerm2 scrolls its
+	// own normal-screen history while Metis remains in alt-screen.
+	// That produces a misleading composite of stale shell rows and the
+	// bottom of the current TUI instead of scrolling chat history.
 	//
 	// Copy mode below still works: it returns AltScreen=false, which
 	// drops the terminal back to its native buffer where the user
@@ -175,17 +176,10 @@ func (m *Model) View() tea.View {
 		content = clampBlock(content, safeWidth)
 		v := tea.NewView(content)
 		v.AltScreen = true
-		// MouseModeNone: don't capture the mouse at all. The terminal
-		// then handles drag-to-select natively, so Cmd+C just works
-		// for copying any on-screen text — including the input box,
-		// which is what the user actually wants (2026-08-01 user
-		// report: "输入框里的文字没法用光标选择").
-		//
-		// Trade-off: the mouse wheel no longer scrolls chat history
-		// (it now scrolls the terminal's native scrollback instead,
-		// which is empty in alt-screen mode). Users scroll chat via
-		// PgUp/PgDn / arrow keys / the scroll bar.
-		v.MouseMode = tea.MouseModeNone
+		// CellMotion captures clicks, drags and wheel events but not hover.
+		// Native selection remains available through Ctrl+S copy mode,
+		// where AltScreen and mouse tracking are both disabled.
+		v.MouseMode = tea.MouseModeCellMotion
 		// Enable xterm focus reporting (DECSET 1004 — `\x1b[?1004h`)
 		// so bubbletea v2 dispatches FocusMsg / BlurMsg when the
 		// terminal tab gains/loses focus. tui_update.go handles
@@ -243,10 +237,11 @@ func (m *Model) View() tea.View {
 	}
 
 	// Copy mode: alt-screen is exited so the user can mouse-select
-	// from native scrollback. Return empty + AltScreen=false so the
-	// terminal drops back to the inline buffer for selection.
+	// from native scrollback. Keep a one-cell inline frame as a renderer
+	// anchor; tea.Println then writes the full transcript and the visible
+	// Ctrl+S hint after the renderer has applied AltScreen=false.
 	if m.copyMode {
-		v := tea.NewView("")
+		v := tea.NewView(" ")
 		v.AltScreen = false
 		return v
 	}
