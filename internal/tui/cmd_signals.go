@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
-	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -105,9 +104,8 @@ func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Lo
 // renderSkillsList aggregates every layer of the skill loader (bundled +
 // user + project) and prints name + description. After the multi-source
 // loader landed, "skills" is a union not just an on-disk store.
-func renderSkillsList(skillDir string) string {
-	loader := skills.NewLoader(skillDir, "", nil)
-	list, err := loader.List()
+func renderSkillsList(loop *agent.Loop, skillDir string) string {
+	list, err := loadSkillCatalog(loop, skillDir)
 	if err != nil {
 		return "skills: " + err.Error()
 	}

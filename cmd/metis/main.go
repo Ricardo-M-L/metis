@@ -3506,10 +3506,13 @@ func installSkillUnified(ref, skillDir string) error {
 }
 
 func showSkillInfo(name, skillDir string) error {
-	store := skills.NewStore(skillDir)
-	sk, err := store.Get(name)
+	loader := rtpkg.NewSkillCatalogLoader(skillDir, nil)
+	sk, err := loader.Get(name)
 	if err != nil {
 		return err
+	}
+	if sk == nil {
+		return fmt.Errorf("skill not found: %s", name)
 	}
 	fmt.Printf("name:        %s\n", sk.Name)
 	fmt.Printf("description: %s\n", sk.Description)
@@ -3540,7 +3543,7 @@ func listBuiltInSkills() error {
 	if err != nil {
 		return err
 	}
-	loader := skills.NewLoader(cfg.Session.SkillDir, "", nil)
+	loader := rtpkg.NewSkillCatalogLoader(cfg.Session.SkillDir, nil)
 	all, err := loader.List()
 	if err != nil {
 		return err

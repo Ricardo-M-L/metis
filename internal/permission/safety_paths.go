@@ -7,11 +7,13 @@ import "strings"
 // claude-code's bypass-immune safetyCheck flow (filesystem.ts:55-78,
 // permissions.ts:1252-1260).
 //
-// Substring match (not glob) — chosen for speed and to handle relative
-// vs absolute path variants uniformly. The set is the union of:
+// Lightweight fragment match (not glob) — chosen for speed and to handle
+// relative vs absolute path variants uniformly. Directory fragments also use
+// path/shell boundaries so `.claude` matches but `.claude-backup` does not.
+// The set is the union of:
 //
-//   - VCS internals (.git/config, .git/hooks/, .git/objects/, .git/HEAD)
-//     where a malicious commit hook is a remote-execution vector
+//   - VCS internals (.git/) where a malicious commit hook is a
+//     remote-execution vector
 //   - Shell startup files (.bashrc / .zshrc / .profile / .zprofile /
 //     .bash_profile) where appended commands run on every new shell
 //   - SSH key material (.ssh/, authorized_keys, known_hosts) — credential
@@ -25,12 +27,7 @@ import "strings"
 //   - macOS auto-start (LaunchAgents / LaunchDaemons)
 var SafetyCheckPathFragments = []string{
 	// VCS internals
-	".git/config",
-	".git/hooks",
-	".git/objects",
-	".git/HEAD",
-	".git/index",
-	".git/refs",
+	".git/",
 
 	// Shell startup
 	".bashrc",
@@ -84,11 +81,47 @@ func matchesSafetyPath(stringInput string) bool {
 		return false
 	}
 	for _, frag := range SafetyCheckPathFragments {
-		if strings.Contains(stringInput, frag) {
+		if containsSafetyPathFragment(stringInput, frag) {
 			return true
 		}
 	}
 	return false
+}
+
+// containsSafetyPathFragment preserves the historical substring check while
+// also recognizing a protected directory itself, without requiring a trailing
+// slash. For example, both `~/.claude/settings.json` and `rm -rf ~/.claude`
+// are safety-path hits, while `~/.claude-backup` is not mistaken for the
+// protected directory.
+func containsSafetyPathFragment(input, fragment string) bool {
+	if !strings.HasSuffix(fragment, "/") {
+		return strings.Contains(input, fragment)
+	}
+	base := strings.TrimSuffix(fragment, "/")
+	for offset := 0; offset < len(input); {
+		idx := strings.Index(input[offset:], base)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(base)
+		startOK := start == 0 || isSafetyPathBoundary(input[start-1])
+		endOK := end == len(input) || isSafetyPathBoundary(input[end])
+		if startOK && endOK {
+			return true
+		}
+		offset = end
+	}
+	return false
+}
+
+func isSafetyPathBoundary(ch byte) bool {
+	switch ch {
+	case '/', '\\', ' ', '\t', '\n', '\r', '\'', '"', ';', '&', '|', '<', '>', '(', ')', '[', ']', '{', '}', '=', ':', ',':
+		return true
+	default:
+		return false
+	}
 }
 
 // fileTouchingTools is the set of tools whose stringInput is plausibly
@@ -158,7 +191,15 @@ func matchesSecretReadPath(stringInput string) bool {
 }
 
 // isSecretReadAttempt reports whether tool would read the content of a
-// credential file (Read tool + a secret path).
+// credential file. Bash participates only when its complete command is
+// classified as read-only; mutating Bash calls are already handled by the
+// broader safety-path check.
 func isSecretReadAttempt(tool, stringInput string) bool {
-	return readPathTools[tool] && matchesSecretReadPath(stringInput)
+	if !matchesSecretReadPath(stringInput) {
+		return false
+	}
+	if readPathTools[tool] {
+		return true
+	}
+	return tool == "Bash" && IsReadOnlyBashSafetyOperation(stringInput)
 }

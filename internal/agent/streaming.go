@@ -76,6 +76,19 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		if tool.json != "" {
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(tool.json), &parsed); err == nil {
+				// JSON null is valid JSON, but it is not a valid function-tool
+				// argument object. Some OpenAI-compatible providers emit a final
+				// name-only tool call when the response is cut at the output-token
+				// limit. Unmarshalling its "null" arguments into a map succeeds
+				// with parsed == nil; persisting that nil later becomes
+				// function.arguments="null", which provider-side chat templates
+				// commonly reject while iterating argument key/value pairs.
+				// Canonicalise it to an empty object here. The tool can then return
+				// its normal missing-required-field error, and the next model turn
+				// remains wire-valid.
+				if parsed == nil {
+					parsed = map[string]any{}
+				}
 				// MiniMax-M2.7 anthropic-shim wraps args as
 				// {"_": "<json-object-string>"} (session 87e366fa);
 				// argsunwrap is a no-op for every well-formed shape so
@@ -181,6 +194,10 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 				Type:      "tool_use",
 				ToolUseID: ev.ToolUseID,
 				ToolName:  ev.ToolName,
+				// Tool inputs are objects by protocol. Start with a non-nil empty
+				// object so a name-only / output-truncated call never enters live
+				// history as null even when no argument delta arrives at all.
+				ToolInput: map[string]any{},
 			})
 			tool := &streamedTool{blockIndex: blockIndex}
 			toolsByID[ev.ToolUseID] = tool

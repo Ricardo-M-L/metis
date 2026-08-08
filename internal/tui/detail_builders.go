@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -24,8 +23,7 @@ func jsonPrettyOrEmpty(v map[string]any) string {
 // skillDetailScreen builds the DetailScreen for a picked skill name.
 // Returns nil when the skill isn't loadable (caller silently no-ops).
 func (m *Model) skillDetailScreen(name string) *screen.DetailScreen {
-	loader := skills.NewLoader(m.skillDir, "", nil)
-	list, err := loader.List()
+	list, err := loadSkillCatalog(m.loop, m.skillDir)
 	if err != nil {
 		return nil
 	}

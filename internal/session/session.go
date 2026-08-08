@@ -201,7 +201,25 @@ func (s *Store) Load(id string) (*Header, []llm.Message, error) {
 	if hdr == nil {
 		return nil, nil, errors.New("session header missing")
 	}
+	canonicalizeToolInputs(msgs)
 	return hdr, msgs, nil
+}
+
+// canonicalizeToolInputs heals transcripts written before name-only tool calls
+// were normalised at stream ingestion. ContentBlock.input is intentionally
+// `omitempty`, so an empty object and a legacy nil both appear as an omitted
+// field on disk; after decoding, however, every tool_use must expose an object
+// to provider adapters and tool dispatch. Keep this repair in Load so resume,
+// branch, and imported-session paths all get the same safe representation.
+func canonicalizeToolInputs(messages []llm.Message) {
+	for i := range messages {
+		for j := range messages[i].Content {
+			block := &messages[i].Content[j]
+			if block.Type == "tool_use" && block.ToolInput == nil {
+				block.ToolInput = map[string]any{}
+			}
+		}
+	}
 }
 
 // mergeHeader applies non-zero fields from src onto dst. The caller decides

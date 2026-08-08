@@ -13,11 +13,14 @@ package tui
 import (
 	"fmt"
 	"image/color"
+	"regexp"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"charm.land/lipgloss/v2"
 	udiff "github.com/aymanbagabas/go-udiff"
+	xansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/themes"
 )
@@ -34,6 +37,11 @@ import (
 func renderToolEvent(te ToolEvent, expanded bool) string {
 	var s strings.Builder
 	baseName := strings.TrimPrefix(te.ToolName, "sub: ")
+	partialRecovery := completedBeforeTimeout(te)
+	neutralNoMatch := benignReadOnlyNoMatch(te)
+	// ToolEvent is passed by value: normalize the user-visible copy once while
+	// preserving the raw event for the model, transcript, and audit log.
+	te.Output = normalizeToolOutput(te.Output)
 
 	// Leader row: ⏺ toolname(arg)
 	//
@@ -54,7 +62,11 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// success/error so the bullet carries actual semantic color.
 	leaderColor := styleAccent
 	if te.Kind != "start" {
-		if te.IsError {
+		if neutralNoMatch {
+			leaderColor = styleDim
+		} else if partialRecovery {
+			leaderColor = styleWarn
+		} else if te.IsError {
 			leaderColor = styleErr
 		} else {
 			leaderColor = styleSuccess
@@ -116,13 +128,28 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// the dim grey as too low-contrast. This is the most-scanned line
 	// per tool call and it's informational, not chrome.
 	s.WriteString(styleDim.Render(resultIndent + glyphTreeLeaf + "  "))
-	if te.IsError {
+	if neutralNoMatch {
+		s.WriteString(styleDim.Render("○ "))
+	} else if partialRecovery {
+		s.WriteString(styleWarn.Render("↻ "))
+	} else if te.IsError {
 		s.WriteString(styleErr.Render("✗ "))
 	} else {
 		s.WriteString(styleAccent.Render("✓ "))
 	}
-	s.WriteString(summarizeToolResult(te))
-	if !te.IsError && !expanded && te.Output != "" && collapseToolBodyByDefault(baseName) {
+	if neutralNoMatch {
+		s.WriteString(fmt.Sprintf("%s · No matches", formatElapsed(te.Duration)))
+	} else if partialRecovery {
+		s.WriteString(summarizePartialToolResult(te))
+	} else {
+		s.WriteString(summarizeNormalizedToolResult(te))
+	}
+	if neutralNoMatch {
+		// A read-only search with the conventional exit code 1 means
+		// "nothing found". There is no diagnostic body to expand.
+	} else if partialRecovery && !expanded {
+		s.WriteString(styleMuted.Render(" (ctrl+O to inspect timeout)"))
+	} else if !te.IsError && !expanded && te.Output != "" && collapseToolBodyByDefault(baseName) {
 		s.WriteString(styleMuted.Render(" (ctrl+O to expand)"))
 	}
 	s.WriteString("\n")
@@ -131,8 +158,14 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// line-capped preview otherwise. On error, surface the error
 	// output so the user can see WHY it failed.
 	if te.IsError {
-		if te.Output != "" {
-			s.WriteString(renderErrorBody(te.Output, expanded))
+		// A command can cross the outer timeout after the inner program has
+		// already printed a strong completion marker (for example, npx skills
+		// prints both "Installation complete" and the installed path before
+		// its wrapper is killed). That is a partial/recovered state, not a
+		// plain failure. Keep the timeout in the event and reveal it on Ctrl+O,
+		// but do not paint the whole raw body red in the compact transcript.
+		if te.Output != "" && !neutralNoMatch && (!partialRecovery || expanded) {
+			s.WriteString(renderNormalizedErrorBody(te.Output, expanded))
 		}
 	} else {
 		// Strip the forwarded-sub-agent "sub: " prefix when routing
@@ -160,11 +193,11 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 			// text content.
 			filtered := stripSubAgentOutputEnvelope(te.Output)
 			if filtered != "" {
-				s.WriteString(renderToolOutputPreview(te.ToolName, filtered, expanded))
+				s.WriteString(renderNormalizedToolOutputPreview(te.ToolName, filtered, expanded))
 			}
 		default:
 			if te.Output != "" && (expanded || !collapseToolBodyByDefault(baseName)) {
-				s.WriteString(renderToolOutputPreview(te.ToolName, te.Output, expanded))
+				s.WriteString(renderNormalizedToolOutputPreview(te.ToolName, te.Output, expanded))
 			}
 		}
 	}
@@ -196,6 +229,290 @@ func collapseToolBodyByDefault(toolName string) bool {
 	}
 }
 
+var (
+	terminalLineResetRE = regexp.MustCompile(`\x1b\[[0-9;?]*[GK]`)
+	// The completion marker is deliberately line-anchored and positive. It
+	// must not accept prose such as "not installed 1 skill" or the vacuous
+	// "Installed 0 skills".
+	installedSkillsMarkerRE = regexp.MustCompile(`(?im)^[[:space:]│◇◆✓✔└├┌┐┘┬┴─•*-]*installed[[:space:]]+[1-9][0-9]*[[:space:]]+skills?\b`)
+	skillsAddCommandRE      = regexp.MustCompile(`(?i)(?:^|[;&|][[:space:]]*)npx(?:[[:space:]]+(?:--yes|-y))*[[:space:]]+skills[[:space:]]+add(?:[[:space:]]|$)`)
+	hyperframesUpdateRE     = regexp.MustCompile(`(?i)(?:^|[;&|][[:space:]]*)npx(?:[[:space:]]+(?:--yes|-y))*[[:space:]]+hyperframes(?:@[^[:space:]]+)?[[:space:]]+skills[[:space:]]+update(?:[[:space:]]|$)`)
+)
+
+// terminalSpinnerRunes covers the two frame families seen most often in
+// package managers (ora's quarter circles and the common braille spinner).
+// They are only treated specially when a line contains at least two frames,
+// so ordinary prose containing one decorative glyph is left alone.
+const terminalSpinnerRunes = "◒◐◓◑⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+// normalizeToolOutput turns captured terminal animation into the text a user
+// would have seen after the command settled. PTY programs repaint one logical
+// row with CR and CSI erase/cursor-home sequences; storing those bytes and then
+// rendering them as plain text produced hundreds of concatenated spinner
+// frames in Metis. We preserve every non-animation status/error line, collapse
+// a repaint row to its final frame, and strip foreign ANSI before applying the
+// Metis palette.
+func normalizeToolOutput(out string) string {
+	if out == "" {
+		return ""
+	}
+	// Treat cursor-home / erase-line as a repaint boundary before stripping
+	// ANSI. Once stripped, adjacent frames would otherwise be inseparable.
+	out = terminalLineResetRE.ReplaceAllString(out, "\r")
+	out = xansi.Strip(out)
+	out = strings.ReplaceAll(out, "\r\n", "\n")
+
+	rawLines := strings.Split(out, "\n")
+	lines := make([]string, 0, len(rawLines))
+	for _, raw := range rawLines {
+		// CR means "return to column zero and overwrite this row". Keep the
+		// last non-empty frame, which is the settled terminal state.
+		frame := raw
+		if strings.Contains(raw, "\r") {
+			frame = ""
+			for _, candidate := range strings.Split(raw, "\r") {
+				if strings.TrimSpace(candidate) != "" {
+					frame = candidate
+				}
+			}
+		}
+		frame = collapseInlineSpinnerFrames(frame)
+		// ANSI cursor-up renderers can leave one spinner frame per logical
+		// line after escape stripping. Keep only the last consecutive frame.
+		if isSpinnerProgressLine(frame) && len(lines) > 0 && isSpinnerProgressLine(lines[len(lines)-1]) {
+			lines[len(lines)-1] = frame
+			continue
+		}
+		// Do not deduplicate ordinary adjacent lines. Repeated test output,
+		// counters, and printf data are real evidence; only explicit terminal
+		// repaint boundaries and recognizable spinner frames may collapse.
+		lines = append(lines, frame)
+	}
+	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
+}
+
+func isSpinnerRune(r rune) bool {
+	return strings.ContainsRune(terminalSpinnerRunes, r)
+}
+
+func isSpinnerProgressLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(trimmed)
+	if isSpinnerRune(r) {
+		return true
+	}
+	// Captured output can be tail-capped in the middle of a frame, leaving a
+	// short fragment before the next spinner glyph (for example `G◒ Cloning`).
+	// Three or more frame glyphs still prove this is terminal animation.
+	count := 0
+	for _, candidate := range trimmed {
+		if isSpinnerRune(candidate) {
+			count++
+		}
+	}
+	return count >= 3
+}
+
+func collapseInlineSpinnerFrames(line string) string {
+	trimmed := strings.TrimSpace(line)
+	firstRune, _ := utf8.DecodeRuneInString(trimmed)
+	startsWithSpinner := isSpinnerRune(firstRune)
+	count, lastByte := 0, -1
+	for byteIdx, r := range line {
+		if isSpinnerRune(r) {
+			count++
+			lastByte = byteIdx
+		}
+	}
+	if count < 2 || lastByte < 0 || (!startsWithSpinner && count < 3) {
+		return line
+	}
+	return line[lastByte:]
+}
+
+func outputContainsTimeout(out string) bool {
+	low := strings.ToLower(out)
+	return strings.Contains(low, "command exceeded timeout") ||
+		strings.Contains(low, "timed out after") ||
+		strings.Contains(low, "timeout exceeded") ||
+		strings.Contains(low, "deadline exceeded")
+}
+
+func knownSkillInstallerCommand(te ToolEvent) bool {
+	if strings.TrimPrefix(te.ToolName, "sub: ") != "Bash" {
+		return false
+	}
+	command, _ := te.Input["command"].(string)
+	return skillsAddCommandRE.MatchString(command) || hyperframesUpdateRE.MatchString(command)
+}
+
+func positiveInstalledSkillsMarker(out string) (int, bool) {
+	loc := installedSkillsMarkerRE.FindStringIndex(out)
+	if loc == nil {
+		return 0, false
+	}
+	return loc[1], true
+}
+
+func fatalInstallEvidenceAfter(out string, markerEnd int) bool {
+	if markerEnd < 0 || markerEnd > len(out) {
+		return true
+	}
+	tail := strings.ToLower(out[markerEnd:])
+	for _, marker := range []string{
+		"authentication failed", "permission denied", "validation failed",
+		"installation failed", "failed to", "failure", "fatal", "error:",
+		"forbidden", "unauthorized", "access denied", "denied by",
+		"unable to", "could not", "not installed", "invalid", "canceled", "cancelled",
+	} {
+		if strings.Contains(tail, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// completedBeforeTimeout is deliberately conservative: timeout alone is an
+// error, and vague output such as "done" is not enough. Only a strong install
+// completion marker plus an outer timeout qualifies as partial/recovered. The
+// original IsError bit and output remain untouched for the model, transcript,
+// audit log, and expanded rendering.
+func completedBeforeTimeout(te ToolEvent) bool {
+	if !te.IsError || importantToolError(te) {
+		return false
+	}
+	return completedBeforeTimeoutAfterImportanceCheck(te)
+}
+
+// completedBeforeTimeoutAfterImportanceCheck avoids rescanning a large PTY
+// capture when the caller has already excluded permission/security failures.
+func completedBeforeTimeoutAfterImportanceCheck(te ToolEvent) bool {
+	if !te.IsError || !knownSkillInstallerCommand(te) {
+		return false
+	}
+	// Completion/timeout markers are plain text even when the surrounding
+	// progress UI uses ANSI. A positive installer count must precede the timeout,
+	// and no fatal/validation evidence may follow it. This remains a reported
+	// partial completion, never proof that the installed skill is usable.
+	markerEnd, ok := positiveInstalledSkillsMarker(te.Output)
+	if !ok || !outputContainsTimeout(te.Output[markerEnd:]) || fatalInstallEvidenceAfter(te.Output, markerEnd) {
+		return false
+	}
+	return true
+}
+
+func summarizePartialToolResult(te ToolEvent) string {
+	return fmt.Sprintf("%s · install reported complete before timeout; verify", formatElapsed(te.Duration))
+}
+
+func onlyExitStatusOne(out string) bool {
+	if len(out) > 256 {
+		return false
+	}
+	low := strings.ToLower(strings.TrimSpace(normalizeToolOutput(out)))
+	low = strings.TrimSpace(strings.TrimPrefix(low, "error:"))
+	switch low {
+	case "[exit status 1]", "exit status 1", "[command exited with code 1]", "command exited with code 1":
+		return true
+	default:
+		return false
+	}
+}
+
+func shellProgramName(field string) string {
+	field = strings.Trim(field, "'\"")
+	if slash := strings.LastIndexByte(field, '/'); slash >= 0 {
+		field = field[slash+1:]
+	}
+	return field
+}
+
+// readOnlySearchCommand is intentionally narrower than a shell parser. It
+// recognizes the no-match convention only when every command/pipeline segment
+// starts with a known read-only search or output-filter program and contains no
+// mutation primitive. Unknown shell syntax stays an error.
+func readOnlySearchCommand(command string) bool {
+	low := strings.ToLower(strings.TrimSpace(command))
+	if low == "" {
+		return false
+	}
+	// This classifier is not a shell parser. Command/process substitution and
+	// grouping can hide an arbitrary side effect behind an apparently harmless
+	// grep/find segment, so unknown shell syntax fails closed.
+	if strings.Contains(low, "$(") || strings.Contains(low, "`") ||
+		strings.Contains(low, "<(") || strings.Contains(low, ">(") ||
+		strings.Contains(low, "(") || strings.Contains(low, ")") {
+		return false
+	}
+	for _, unsafe := range []string{
+		" -delete", " -exec", " -execdir", " -fls", " -fprint", " -fprint0", " -fprintf",
+		" -ok", " -okdir", " --delete", " --pre",
+		" sed -i", " sed --in-place", " sort -o", " sort --output",
+		" rm ", " mv ", " cp ", " tee ", " truncate ",
+	} {
+		if strings.Contains(" "+low+" ", unsafe) {
+			return false
+		}
+	}
+	// A redirect to /dev/null is diagnostic suppression, not a write. Any
+	// remaining output redirect means the command has a side effect.
+	withoutDevNull := strings.NewReplacer(
+		"2>/dev/null", "", "2> /dev/null", "", ">/dev/null", "", "> /dev/null", "",
+	).Replace(low)
+	if strings.Contains(withoutDevNull, ">") {
+		return false
+	}
+
+	segments := strings.FieldsFunc(low, func(r rune) bool {
+		return r == ';' || r == '|' || r == '&' || r == '\n'
+	})
+	if len(segments) == 0 {
+		return false
+	}
+	allowed := map[string]struct{}{
+		"cut": {}, "egrep": {}, "fgrep": {}, "find": {}, "grep": {},
+		"head": {}, "rg": {}, "tail": {}, "uniq": {}, "wc": {},
+	}
+	sawSearch := false
+	for _, segment := range segments {
+		fields := strings.Fields(strings.TrimSpace(segment))
+		if len(fields) == 0 {
+			continue
+		}
+		first := 0
+		for first < len(fields) && strings.Contains(fields[first], "=") && !strings.HasPrefix(fields[first], "-") {
+			first++
+		}
+		if first >= len(fields) {
+			return false
+		}
+		program := shellProgramName(fields[first])
+		if _, ok := allowed[program]; !ok {
+			return false
+		}
+		switch program {
+		case "find", "grep", "egrep", "fgrep", "rg":
+			sawSearch = true
+		}
+	}
+	return sawSearch
+}
+
+// benignReadOnlyNoMatch maps the conventional grep/rg exit 1 (and the same
+// status from a stderr-suppressed find chain) to a neutral empty result. The
+// IsError bit remains unchanged for audit/model semantics; only the TUI avoids
+// presenting "no match" as a red execution failure.
+func benignReadOnlyNoMatch(te ToolEvent) bool {
+	if !te.IsError || strings.TrimPrefix(te.ToolName, "sub: ") != "Bash" || !onlyExitStatusOne(te.Output) {
+		return false
+	}
+	command, _ := te.Input["command"].(string)
+	return readOnlySearchCommand(command)
+}
+
 // renderErrorBody is the error-path counterpart to renderToolOutputPreview:
 // same 5-line cap with truncation tail, but rendered in error red so the
 // failure mode is visually unmistakable.
@@ -208,7 +525,10 @@ func collapseToolBodyByDefault(toolName string) bool {
 // confusingly making the error look unrelated to the read it came
 // from. Image bug 2026-05-15.
 func renderErrorBody(out string, expanded bool) string {
-	out = strings.TrimRight(out, "\n")
+	return renderNormalizedErrorBody(normalizeToolOutput(out), expanded)
+}
+
+func renderNormalizedErrorBody(out string, expanded bool) string {
 	if out == "" {
 		return ""
 	}
@@ -261,9 +581,58 @@ func truncateMiddle(s string, maxRunes int) string {
 	return string(rs[:head]) + sep + string(rs[len(rs)-tail:])
 }
 
+// bestErrorSummaryLine selects the most actionable diagnostic from terminal
+// output instead of blindly taking its first non-empty row. Installers often
+// start with box-drawing chrome or "Source: ..." and put the real cause at the
+// end (for example, "Authentication failed ..."). Ties prefer the later line,
+// matching conventional CLI error epilogues.
+func bestErrorSummaryLine(out string) string {
+	best, bestScore := "", -1
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(raw)
+		line = strings.TrimSpace(strings.TrimLeft(line, "│◇◆■□└├┌┐┘┬┴─•*-"))
+		if line == "" || isSpinnerProgressLine(line) {
+			continue
+		}
+		low := strings.ToLower(line)
+		score := 10
+		switch {
+		case strings.Contains(low, "authentication failed"),
+			strings.Contains(low, "permission denied"),
+			strings.Contains(low, "denied by permission"),
+			strings.Contains(low, "security rule"):
+			score = 100
+		case strings.Contains(low, "failed to clone"), strings.Contains(low, "installation failed"):
+			score = 90
+		case strings.Contains(low, "fatal"), strings.Contains(low, "error:"):
+			score = 85
+		case strings.Contains(low, "not found"), strings.Contains(low, "unable to"), strings.Contains(low, "could not"):
+			score = 80
+		case strings.Contains(low, "failed"), strings.Contains(low, "failure"):
+			score = 70
+		case strings.Contains(low, "timeout"), strings.Contains(low, "timed out"), strings.Contains(low, "deadline exceeded"):
+			score = 60
+		case strings.Contains(low, "exit status"), strings.Contains(low, "exited with code"):
+			score = 50
+		}
+		if score >= bestScore {
+			best, bestScore = line, score
+		}
+	}
+	return best
+}
+
 // summarizeToolResult crafts the per-tool one-line description that
 // follows the ⎿ checkmark. Format is `<elapsed> · <tool-specific phrase>`.
 func summarizeToolResult(te ToolEvent) string {
+	// Summaries must describe the settled terminal output, not the first
+	// captured animation frame. Keep normalization at the render boundary so
+	// the model and persisted transcript still receive the original bytes.
+	te.Output = normalizeToolOutput(te.Output)
+	return summarizeNormalizedToolResult(te)
+}
+
+func summarizeNormalizedToolResult(te ToolEvent) string {
 	// Use formatElapsed (tui_spinner.go) instead of bare
 	// Duration.String() so a zero-or-sub-millisecond Duration
 	// renders as "0ms" rather than "0s" — image #27 (2026-05-21):
@@ -312,6 +681,12 @@ func summarizeToolResult(te ToolEvent) string {
 		}
 		return dur
 	case "Bash":
+		if te.IsError {
+			if diagnostic := bestErrorSummaryLine(te.Output); diagnostic != "" {
+				return fmt.Sprintf("%s · %s", dur, truncate(diagnostic, 60))
+			}
+			return fmt.Sprintf("%s · failed", dur)
+		}
 		first := firstNonEmptyLine(te.Output)
 		if first == "" {
 			return dur
@@ -420,6 +795,9 @@ func summarizeToolResult(te ToolEvent) string {
 		// instead of dumping the first 60 chars of raw output. Mirrors
 		// DeepSeek-TUI's `Found N result(s)` summary line.
 		if te.IsError {
+			if diagnostic := bestErrorSummaryLine(te.Output); diagnostic != "" {
+				return fmt.Sprintf("%s · %s", dur, truncate(diagnostic, 60))
+			}
 			return fmt.Sprintf("%s · failed", dur)
 		}
 		out := strings.TrimSpace(te.Output)
@@ -468,6 +846,9 @@ func summarizeToolResult(te ToolEvent) string {
 		return fmt.Sprintf("%s · %s", dur, truncate(firstNonEmptyLine(out), 60))
 	case "WebFetch":
 		if te.IsError {
+			if diagnostic := bestErrorSummaryLine(te.Output); diagnostic != "" {
+				return fmt.Sprintf("%s · %s", dur, truncate(diagnostic, 60))
+			}
 			return fmt.Sprintf("%s · failed", dur)
 		}
 		out := strings.TrimSpace(te.Output)
@@ -511,6 +892,12 @@ func summarizeToolResult(te ToolEvent) string {
 		out := strings.TrimSpace(te.Output)
 		if out == "" {
 			return dur
+		}
+		if te.IsError {
+			if diagnostic := bestErrorSummaryLine(out); diagnostic != "" {
+				return fmt.Sprintf("%s · %s", dur, truncate(diagnostic, 60))
+			}
+			return fmt.Sprintf("%s · failed", dur)
 		}
 		return fmt.Sprintf("%s · %s", dur, truncate(firstNonEmptyLine(out), 60))
 	}
@@ -746,7 +1133,10 @@ func renderWritePreview(input map[string]any, expanded bool) string {
 // content blurred into the chrome and you had to squint to find the
 // match you ran the command for.
 func renderToolOutputPreview(toolName, out string, expanded bool) string {
-	out = strings.TrimRight(out, "\n")
+	return renderNormalizedToolOutputPreview(toolName, normalizeToolOutput(out), expanded)
+}
+
+func renderNormalizedToolOutputPreview(toolName, out string, expanded bool) string {
 	if out == "" {
 		return ""
 	}

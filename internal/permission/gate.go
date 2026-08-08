@@ -621,14 +621,15 @@ func (g *Gate) PopRules(n int) {
 // Precedence (mirrors claude-code permissions.ts:1158-1320):
 //  1. Plan overrides user rules, but read-only candidates still pass the
 //     bypass-immune safety/secret checks before they are auto-allowed.
-//  2. Safety-check paths (.git/, .ssh/, ~/.bashrc, ...) → ASK even in
-//     Bypass mode. These are bypass-immune by virtue of the path: the
-//     model writing to ~/.bashrc is always worth a human glance.
-//  3. Denial-fallback breaker: if the gate has been denying repeatedly
+//  2. Explicit ASK/DENY rules win. An explicit ALLOW remains subject to the
+//     bypass-immune safety checks below.
+//  3. Safety-check writes (.git/, .ssh/, ~/.bashrc, ...) → ASK even in
+//     Bypass mode. Read-only Bash operations are distinguished from writes,
+//     while credential reads retain their own bypass-immune check.
+//  4. Denial-fallback breaker: if the gate has been denying repeatedly
 //     (consecutive ≥3 OR total ≥20), force ASK so a human breaks the
 //     auto-deny loop.
-//  4. Declarative rules win (user set them on purpose).
-//  5. Mode-default fallthrough.
+//  5. Explicit ALLOW rules and mode-default fallthrough.
 func (g *Gate) Check(ctx context.Context, tool, stringInput string) (Decision, string) {
 	return g.check(ctx, tool, stringInput, false)
 }
@@ -735,10 +736,31 @@ func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope boo
 	// rule decision and downgrading DENY → ASK if breaker is hot.
 	breakerActive := !g.denialFallbackUntil.IsZero() && time.Now().Before(g.denialFallbackUntil)
 
+	// Resolve explicit ASK/DENY before implicit safety-path allowances. This is
+	// especially important in bypassPermissions: classifying a sensitive-path
+	// Bash command as read-only must not erase a deliberate policy/user rule.
+	// Explicit ALLOW is intentionally deferred until after the bypass-immune
+	// safety checks, so it cannot authorize a write to ~/.ssh or ~/.claude.
+	bestIdx, matched := g.bestMatchingRuleLocked(tool, stringInput)
+	if matched && g.rules[bestIdx].Verb != DecisionAllow {
+		r := g.rules[bestIdx]
+		decision, source := g.applyBreaker(r.Verb, r.Source, breakerActive)
+		if g.mode == ModeDontAsk && decision == DecisionAsk {
+			g.recordDenial()
+			return DecisionDeny, "mode:dontAsk:" + source
+		}
+		return decision, source
+	}
+
 	// Safety-check paths: bypass-immune via path pattern. Applies only
 	// to tools that touch the filesystem / shell. Even in mode=Bypass,
-	// writing to .ssh/ or .git/config gets a human in the loop.
-	if isFileTouchingTool(tool) && matchesSafetyPath(stringInput) {
+	// writing to .ssh/ or .git/config gets a human in the loop. Unlike
+	// the old path-substring-only check, a Bash command that merely reads
+	// a sensitive agent directory can pass in bypass mode; Claude Code's
+	// Bash path validation makes the same read/write operation distinction.
+	safetyPathHit := isFileTouchingTool(tool) && matchesSafetyPath(stringInput)
+	readOnlyBypassBash := g.mode == ModeBypassPermissions && tool == "Bash" && IsReadOnlyBashSafetyOperation(stringInput)
+	if safetyPathHit && !readOnlyBypassBash {
 		// Don't recordDenial here — safety ASK is informational, not
 		// a "rule denied" signal. Repeated touches of .git/ shouldn't
 		// trip the denial breaker.
@@ -771,7 +793,6 @@ func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope boo
 	// policy rule, so nothing earlier can outrank or out-recency it.
 	// Match grammar: prefix (`git push:*`), glob (`/etc/**`), or legacy
 	// substring — see rulematch.go.
-	bestIdx, matched := g.bestMatchingRuleLocked(tool, stringInput)
 	if matched {
 		r := g.rules[bestIdx]
 		decision, source := g.applyBreaker(r.Verb, r.Source, breakerActive)

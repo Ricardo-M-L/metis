@@ -443,8 +443,8 @@ type Model struct {
 	// expandedToolID is the A1 ctrl+O mechanism: the **single** tool
 	// event currently expanded. Empty string means "nothing expanded"
 	// (default). When the user presses ctrl+O:
-	//   - if expandedToolID == latest tool event ID → clear (collapse)
-	//   - otherwise → set to latest tool event ID (expand that one)
+	//   - with nothing selected, expand the latest row with hidden detail
+	//   - repeated presses walk backward through expandable rows, then clear
 	// Only one tool event can be expanded at a time, which keeps the
 	// viewport height bounded (BUG-A fix).
 	//

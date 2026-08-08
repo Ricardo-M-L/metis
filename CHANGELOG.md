@@ -467,6 +467,34 @@ NOT done in this round (deferred):
   slash_help, input_repeat, arrow_jump, slash_skills, slash_mcp_list,
   double_esc_clear, ctrl_c_quit).
 
+## [0.4.12] - 2026-08-08
+
+### Added
+
+- Added a deterministic `Skill plan_install` flow and a unified skill catalog
+  covering project, plugin, `~/.agents/skills`, and `~/.metis/skills` roots, so
+  agents can resolve requested skills before attempting downloads or writes.
+
+### Changed
+
+- Reduced TUI noise by collapsing transient spinner redraws, recovered
+  intermediate failures, and no-match searches while keeping real failures,
+  authentication errors, permission decisions, and security warnings visible.
+- Bash output is normalized before entering model context, and `find`/`rg`
+  no-match exit codes are treated as neutral without weakening fail-closed
+  handling for malformed or complex shell commands.
+- `bypassPermissions` now permits safe read-only access to sensitive paths but
+  continues to require protection for credential reads and sensitive writes.
+
+### Fixed
+
+- Prevented output-truncated or name-only tool calls from persisting
+  `arguments: null`; live streams, restored sessions, and outgoing
+  OpenAI-compatible requests now canonicalize missing inputs to `{}`, avoiding
+  cascading provider 400 errors on every later turn.
+- Fixed Ctrl+O traversal of earlier collapsed TUI errors and improved restored
+  error matching so unrelated or genuinely failed actions remain inspectable.
+
 ## [0.4.11] - 2026-08-08
 
 ### Changed
@@ -524,7 +552,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.11...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.12...HEAD
+[0.4.12]: https://github.com/Ricardo-M-L/metis/compare/v0.4.11...v0.4.12
 [0.4.11]: https://github.com/Ricardo-M-L/metis/compare/v0.4.10...v0.4.11
 [0.1.1]: https://github.com/Ricardo-M-L/metis/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Ricardo-M-L/metis/releases/tag/v0.1.0

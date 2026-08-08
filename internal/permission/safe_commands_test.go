@@ -93,6 +93,10 @@ func TestIsSafeReadOnlyBash_NegativeCases(t *testing.T) {
 		{"git branch --delete feature", "git branch with --delete"},
 		{"git branch feature", "git branch positional creates a branch"},
 		{"git branch --edit-description", "git branch edits config"},
+		{"git branch --list --set-upstream-to=origin/main", "git branch sets upstream"},
+		{"git branch --list -c copied", "git branch copies a ref"},
+		{"git branch --list -m moved", "git branch moves a ref"},
+		{"git branch --list --create-reflog", "git branch creates reflog"},
 		{"git config --global user.email me@x", "git config --global writes user-wide"},
 		{"git config --system foo bar", "git config --system writes system-wide"},
 		{"git config user.email me@x", "git config two positionals writes local config"},
@@ -101,6 +105,10 @@ func TestIsSafeReadOnlyBash_NegativeCases(t *testing.T) {
 		{"git tag -d v1", "git tag -d deletes"},
 		{"git tag --delete v1", "git tag --delete"},
 		{"git tag v1", "git tag positional creates a tag"},
+		{"git tag --list -a", "git tag annotate flag creates a tag"},
+		{"git tag --list --sign", "git tag sign flag creates a tag"},
+		{"git tag --list --message=release", "git tag message flag creates a tag"},
+		{"git tag --list --file=message.txt", "git tag file flag creates a tag"},
 		{"git remote add origin foo", "git remote add mutates config"},
 		{"git remote set-url origin foo", "git remote set-url mutates config"},
 		{"git reflog expire --all", "git reflog expire mutates logs"},
@@ -109,6 +117,15 @@ func TestIsSafeReadOnlyBash_NegativeCases(t *testing.T) {
 		{"env FOO=bar sh -c true", "env assignment launches a shell"},
 		{"date -s tomorrow", "date can set system time"},
 		{"hostname new-name", "hostname positional can set host name"},
+		{"file -C -m ~/.claude/magic", "file compile writes a magic database"},
+		{"file --compile -m ~/.claude/magic", "file long compile flag writes"},
+		{"file --compile=~/.claude/magic", "file compile assignment writes"},
+		{"file -bC -m ~/.claude/magic", "file clustered compile flag writes"},
+		{"tree ~/.claude -o /tmp/tree.txt", "tree output flag writes a file"},
+		{"tree ~/.claude --output=/tmp/tree.txt", "tree long output flag writes a file"},
+		{"tree -Cfo /tmp/tree.txt ~/.claude", "tree clustered output flag writes a file"},
+		{"git diff --ext-diff ~/.git/config", "external diff helper may execute code"},
+		{"git show --textconv HEAD:.git/config", "textconv helper may execute code"},
 		{"unknowncmd foo", "first token not allowlisted"},
 		{"./run-script.sh", "relative-path script execution"},
 		{"/tmp/x.sh", "absolute-path script execution"},
@@ -117,6 +134,57 @@ func TestIsSafeReadOnlyBash_NegativeCases(t *testing.T) {
 		t.Run(tc.reason, func(t *testing.T) {
 			if IsSafeReadOnlyBash(tc.cmd) {
 				t.Errorf("expected NOT safe: %q (reason: %s)", tc.cmd, tc.reason)
+			}
+		})
+	}
+}
+
+func TestIsReadOnlyBashSafetyOperation_CompoundReadOnly(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`ls ~/.claude/skills/ 2>/dev/null || echo "no claude skills dir"`,
+		`ls ~/.metis/skills 2> /dev/null && echo done`,
+		"git config --file ~/.git/config --get user.email\nprintf done",
+		`cat ~/.claude/settings.json | wc -l`,
+		`echo quiet >/dev/null`,
+	}
+	for _, cmd := range cases {
+		cmd := cmd
+		t.Run(cmd, func(t *testing.T) {
+			t.Parallel()
+			if !IsReadOnlyBashSafetyOperation(cmd) {
+				t.Fatalf("expected read-only safety operation: %q", cmd)
+			}
+		})
+	}
+}
+
+func TestIsReadOnlyBashSafetyOperation_FailsClosedOnWritesOrShellExpansion(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`echo pwned > ~/.claude/settings.json`,
+		`rm -rf ~/.metis/cache`,
+		`git config --file ~/.git/config user.email attacker@example.com`,
+		`ls ~/.claude/skills || touch ~/.claude/pwned`,
+		`tree ~/.claude -o /tmp/tree.txt`,
+		`file -bC -m ~/.claude/magic`,
+		`git diff --ext-diff ~/.git/config`,
+		`git show --textconv HEAD:.git/config`,
+		`ls ~/.claude/skills 2>/tmp/metis-errors`,
+		`ls ~/.claude/skills 2>>/dev/null`,
+		`ls ~/.claude/skills 2>&1`,
+		`echo $(rm -rf ~/.claude)`,
+		`echo "$HOME/.claude"`,
+		"ls ~/.claude/skills\nrm -rf ~/.claude",
+		`ls ~/.claude/skills & echo background`,
+		`ls ~/.claude/skills ||`,
+	}
+	for _, cmd := range cases {
+		cmd := cmd
+		t.Run(cmd, func(t *testing.T) {
+			t.Parallel()
+			if IsReadOnlyBashSafetyOperation(cmd) {
+				t.Fatalf("expected mutating/ambiguous safety operation: %q", cmd)
 			}
 		})
 	}

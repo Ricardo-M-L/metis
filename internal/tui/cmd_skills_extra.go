@@ -28,9 +28,10 @@ func (r *REPL) handleSkillInfo(name string) string {
 	if r.skillDir == "" {
 		return "(skills directory not configured)"
 	}
-	store := skills.NewStore(r.skillDir)
-	sk, err := store.Get(name)
-	if err != nil {
+	loader := skillCatalogLoader(r.Loop, r.skillDir)
+	loader.Invalidate()
+	sk, err := loader.Get(name)
+	if err != nil || sk == nil {
 		return "(no skill named: " + name + ")"
 	}
 	rows := []infoRow{
@@ -188,11 +189,7 @@ func (r *REPL) handleSkillCreate(name string) string {
 // reuse the same enumeration logic the LLM-side prompt builder runs
 // (everything in r.skillDir, .json only).
 func (r *REPL) listSkillsForSearch() []skills.Skill {
-	if r.skillDir == "" {
-		return nil
-	}
-	store := skills.NewStore(r.skillDir)
-	all, err := store.List()
+	all, err := loadSkillCatalog(r.Loop, r.skillDir)
 	if err != nil {
 		return nil
 	}
@@ -249,7 +246,7 @@ func cmdSkills(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
 	if args == "" {
 		// No args — preserve the old "render full installed list" behavior.
-		return renderSkillsList(r.skillDir)
+		return renderSkillsList(r.Loop, r.skillDir)
 	}
 	parts := strings.SplitN(args, " ", 2)
 	sub := strings.ToLower(strings.TrimSpace(parts[0]))
@@ -259,7 +256,7 @@ func cmdSkills(r *REPL, args string) string {
 	}
 	switch sub {
 	case "list", "ls":
-		return renderSkillsList(r.skillDir)
+		return renderSkillsList(r.Loop, r.skillDir)
 	case "install":
 		if rest == "" {
 			return "usage: /skills install <name>"

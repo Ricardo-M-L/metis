@@ -265,6 +265,7 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 //
 //	bundled (in-binary)        — TrustBuiltin
 //	optional (~/.metis/optional-skills)  — TrustTrusted, official-but-not-default
+//	universal (~/.agents/skills) — TrustCommunity, cross-agent installs
 //	user (~/.metis/skills)     — TrustUser
 //	project (./.metis/skills)  — TrustProject
 //	plugin (LoadPlugins)       — TrustCommunity
@@ -277,9 +278,37 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 // (MetisInfo). The loader is hot — Invalidate-aware — so passing the
 // same instance everywhere keeps the introspection view honest.
 func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) *skills.Loader {
-	userDir := opts.Cfg.Session.SkillDir
-	// Project layer is the first existing `.metis/skills/` walking up
-	// from CWD. We resolve at construct time; the loader doesn't watch
+	// Plugin discovery is a second bootstrap phase. Reuse the phase-one
+	// loader when present so MetisInfo and every UI consumer keep observing
+	// the same pointer instead of retaining a stale plugin-less snapshot.
+	var loader *skills.Loader
+	if current, ok := reg.Get("Skill"); ok {
+		if provider, ok := current.(interface {
+			CatalogLoader() *skills.Loader
+		}); ok {
+			loader = provider.CatalogLoader()
+		}
+	}
+	if loader != nil {
+		loader.SetPluginSources(opts.PluginSources)
+	} else {
+		loader = NewSkillCatalogLoader(opts.Cfg.Session.SkillDir, opts.PluginSources)
+	}
+
+	// Replace, not Register — the second phase (after LoadPlugins) needs
+	// to overwrite the first phase's plugin-less Skill tool without
+	// panicking on duplicate registration.
+	reg.Replace(builtin.NewSkill(opts.Gate, loader, opts.Cfg.Session.SkillDir).WithSessionIDFn(CurrentSessionID))
+	return loader
+}
+
+// NewSkillCatalogLoader constructs the production catalog used by the Skill
+// tool and non-agent CLI surfaces. Callers that already have a live registry
+// should reuse the Skill tool's CatalogLoader instead, because it may contain
+// plugin sources attached during phase two.
+func NewSkillCatalogLoader(userDir string, pluginSources []skills.PluginSkillSource) *skills.Loader {
+	// Project layer is the current working directory's `.metis/skills/`.
+	// We resolve at construct time; the loader doesn't watch
 	// for new projects mid-session (chat scope = single project).
 	var projectDir string
 	if cwd, err := os.Getwd(); err == nil {
@@ -292,13 +321,14 @@ func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) *skills.Lo
 	// ~/.metis/optional-skills. `metis skills install --optional <name>`
 	// drops manifests here.
 	optionalDir := filepath.Join(filepath.Dir(userDir), "optional-skills")
-	loader := skills.NewLoaderWithOptional(userDir, projectDir, optionalDir, opts.PluginSources)
-	// Replace, not Register — the second phase (after LoadPlugins) needs
-	// to overwrite the first phase's plugin-less Skill tool without
-	// panicking on duplicate registration.
-	// WithSessionIDFn plumbs CurrentSessionID into the Skill tool so
-	// ${METIS_SESSION_ID} / ${CLAUDE_SESSION_ID} can expand in skill
-	// prompt bodies without builtin needing to import runtime.
-	reg.Replace(builtin.NewSkill(opts.Gate, loader, userDir).WithSessionIDFn(CurrentSessionID))
-	return loader
+	// Agent Skills uses ~/.agents/skills as the cross-client install root.
+	// `npx skills` writes there and symlinks agent-specific directories (Claude,
+	// Codex, etc.) back to it. Scan the canonical root once instead of following
+	// every client's symlink farm. Skip it when userDir is empty so zero-value
+	// configs used by embedders/tests never pull in the host user's catalog.
+	var universalDir string
+	if userDir != "" {
+		universalDir = universalSkillsDir()
+	}
+	return skills.NewLoaderWithUniversal(userDir, projectDir, optionalDir, universalDir, pluginSources)
 }

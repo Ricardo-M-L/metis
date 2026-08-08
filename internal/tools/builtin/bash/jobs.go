@@ -198,6 +198,7 @@ func (o Output) Execute(_ context.Context, in map[string]any) (*tools.Result, er
 			IsError: true,
 		}, nil
 	}
+	body = normalizeCapturedOutput(body)
 	end := j.EndTime
 	if end.IsZero() {
 		end = time.Now()

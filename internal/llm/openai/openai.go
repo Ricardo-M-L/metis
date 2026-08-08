@@ -610,10 +610,9 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 					}
 					text.WriteString(c.Text)
 				case "tool_use":
-					argsJSON, _ := json.Marshal(c.ToolInput)
 					tc := oaiToolCall{ID: c.ToolUseID, Type: "function"}
 					tc.Function.Name = c.ToolName
-					tc.Function.Arguments = string(argsJSON)
+					tc.Function.Arguments = marshalToolArguments(c.ToolInput)
 					am.ToolCalls = append(am.ToolCalls, tc)
 				case "thinking":
 					// Captured reasoning trace from a prior turn. Keep
@@ -653,6 +652,29 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 	return out
 }
 
+// marshalToolArguments preserves the OpenAI function-call invariant that
+// `function.arguments` contains a JSON OBJECT string. Older Metis sessions can
+// contain a tool_use without `input` (decoded as a nil map) when an upstream
+// stream ended after the tool name but before its argument delta. json.Marshal
+// on that value produces the syntactically-valid string "null"; several
+// OpenAI-compatible chat templates (including SenseNova) then fail while
+// iterating it as a mapping, poisoning every later turn in the session.
+//
+// Empty-object fallback is deliberately request-local: it repairs already
+// persisted histories without rewriting the user's append-only transcript.
+// The matching tool_result still tells the model that required fields were
+// missing, so no failed action is reclassified as successful.
+func marshalToolArguments(input map[string]any) string {
+	if input == nil {
+		return "{}"
+	}
+	b, err := json.Marshal(input)
+	if err != nil || string(b) == "null" {
+		return "{}"
+	}
+	return string(b)
+}
+
 func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
 	out := &Response{
 		StopReason:           mapOAIStop(c.FinishReason),
@@ -668,8 +690,17 @@ func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
 	}
 	toolIDPrefix := ""
 	for i, tc := range c.Message.ToolCalls {
-		var input map[string]any
-		_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
+		input := map[string]any{}
+		if raw := strings.TrimSpace(tc.Function.Arguments); raw != "" && raw != "null" {
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(raw), &parsed); err == nil && parsed != nil {
+				input = parsed
+			} else if err != nil {
+				// Match the streaming path: retain malformed bytes for a useful
+				// tool-side error instead of collapsing the whole input to nil.
+				input["_raw"] = tc.Function.Arguments
+			}
+		}
 		id := tc.ID
 		if id == "" {
 			if toolIDPrefix == "" {

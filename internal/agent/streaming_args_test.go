@@ -156,6 +156,62 @@ func TestConsumeStream_NoArgsDeltaWithoutToolStart(t *testing.T) {
 	}
 }
 
+// A provider can hit its output-token ceiling after emitting a parallel tool
+// call's id/name but before emitting any argument bytes. The resulting input
+// must be an empty object, not nil: nil later becomes OpenAI
+// function.arguments="null" and permanently poisons the conversation history
+// on providers whose chat template iterates argument mappings.
+func TestConsumeStream_NameOnlyTrailingToolCanonicalizesEmptyInput(t *testing.T) {
+	for _, trailingArgs := range []string{"", "null"} {
+		name := "no_argument_delta"
+		if trailingArgs != "" {
+			name = "explicit_null_delta"
+		}
+		t.Run(name, func(t *testing.T) {
+			events := []llm.StreamEvent{
+				{Type: "message_start"},
+				{Type: "tool_use_start", ToolUseID: "write-complete", ToolName: "Write"},
+				{Type: "tool_input_delta", ToolUseID: "write-complete", InputDelta: `{"path":"/tmp/a","content":"a"}`},
+				{Type: "tool_use_stop", ToolUseID: "write-complete"},
+				{Type: "tool_use_start", ToolUseID: "write-truncated", ToolName: "Write"},
+			}
+			if trailingArgs != "" {
+				events = append(events,
+					llm.StreamEvent{Type: "tool_input_delta", ToolUseID: "write-truncated", InputDelta: trailingArgs},
+				)
+			}
+			events = append(events,
+				llm.StreamEvent{Type: "tool_use_stop", ToolUseID: "write-truncated"},
+				llm.StreamEvent{Type: "message_delta", StopReason: "max_tokens"},
+				llm.StreamEvent{Type: "message_stop"},
+			)
+
+			out := make(chan Event, 32)
+			blocks, stop, _, err := (&Loop{}).consumeStream(
+				context.Background(), &mockStream{events: events}, out,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stop != "max_tokens" {
+				t.Fatalf("stop = %q, want max_tokens", stop)
+			}
+			if len(blocks) != 2 {
+				t.Fatalf("blocks = %+v, want two tool calls", blocks)
+			}
+			if got := blocks[0].ToolInput["path"]; got != "/tmp/a" {
+				t.Fatalf("completed sibling input changed: %+v", blocks[0].ToolInput)
+			}
+			if blocks[1].ToolInput == nil {
+				t.Fatal("name-only trailing tool input is nil; want empty object")
+			}
+			if len(blocks[1].ToolInput) != 0 {
+				t.Fatalf("trailing tool input = %+v, want empty object", blocks[1].ToolInput)
+			}
+		})
+	}
+}
+
 // TestConsumeStream_PersistsThinkingBlock — thinking_delta accumulates
 // into a ContentBlock{Type:"thinking"} on the assistant message so it
 // survives the session jsonl round-trip (and shows up after /resume).

@@ -49,3 +49,51 @@ func TestBashCanUse_SandboxAutoAllowStillReplacesOrdinaryAsk(t *testing.T) {
 		t.Fatalf("ordinary ask + sandbox auto-allow = %v (%s), want allow", got, source)
 	}
 }
+
+func TestBashCanUse_BypassAllowsReadOnlyClaudeSkillsProbe(t *testing.T) {
+	t.Parallel()
+	gate := permission.New(permission.ModeBypassPermissions)
+	tool := New(gate, config.ToolBashSettings{})
+	const command = `ls ~/.claude/skills/ 2>/dev/null || echo "no claude skills dir"`
+
+	got, source := tool.CanUse(context.Background(), map[string]any{"command": command})
+	if got != tools.PermissionAllow || source != "mode:bypassPermissions" {
+		t.Fatalf("bypass Claude skills probe = %v (%s), want allow mode:bypassPermissions", got, source)
+	}
+}
+
+func TestBashCanUse_BypassAllowsCanonicalSkillInstallCommands(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`mkdir -p ~/.agents/skills`,
+		`curl --fail --location https://uizze.com/.well-known/agent-skills/index.json`,
+		`npx skills add https://uizze.com --skill ui-radar --yes --global`,
+		`npx hyperframes skills update`,
+		`git clone --depth 1 https://github.com/heygen-com/hyperframes ~/.agents/skills/hyperframes`,
+	}
+	for _, command := range cases {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			gate := permission.New(permission.ModeBypassPermissions)
+			tool := New(gate, config.ToolBashSettings{})
+
+			got, source := tool.CanUse(context.Background(), map[string]any{"command": command})
+			if got != tools.PermissionAllow || source != "mode:bypassPermissions" {
+				t.Fatalf("canonical skill install command = %v (%s), want allow mode:bypassPermissions", got, source)
+			}
+		})
+	}
+}
+
+func TestBashCanUse_BypassStillAsksForDirectClaudeSkillWrite(t *testing.T) {
+	t.Parallel()
+	gate := permission.New(permission.ModeBypassPermissions)
+	tool := New(gate, config.ToolBashSettings{})
+	const command = `mkdir -p ~/.claude/skills/untrusted`
+
+	got, source := tool.CanUse(context.Background(), map[string]any{"command": command})
+	if got != tools.PermissionAsk || source != "safety_check:bypass_immune" {
+		t.Fatalf("direct Claude skill write = %v (%s), want ask safety_check:bypass_immune", got, source)
+	}
+}

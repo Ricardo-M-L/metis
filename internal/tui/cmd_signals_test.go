@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
@@ -95,7 +97,7 @@ func TestRenderSkillsList_NoUserDirStillShowsBundled(t *testing.T) {
 	// contributes ~20+ skills regardless of skillDir. Empty skillDir is
 	// no longer a "no skills" state — it just means "no user-overridden
 	// skills". The listing should still render bundled.
-	got := renderSkillsList("")
+	got := renderSkillsList(nil, "")
 	if !strings.Contains(got, "Skills · ") {
 		t.Errorf("empty user-dir should still list bundled skills; got %q", got)
 	}
@@ -107,9 +109,31 @@ func TestRenderSkillsList_NoUserDirStillShowsBundled(t *testing.T) {
 func TestRenderSkillsList_UserDirAddedToBundled(t *testing.T) {
 	dir := t.TempDir()
 	// Empty user dir: just bundled.
-	got := renderSkillsList(dir)
+	got := renderSkillsList(nil, dir)
 	if !strings.Contains(got, "Skills · ") {
 		t.Errorf("expected bundled skills; got %q", got)
+	}
+}
+
+func TestRenderSkillsList_UsesLiveUniversalCatalog(t *testing.T) {
+	universal := t.TempDir()
+	dir := filepath.Join(universal, "shared-demo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "---\nname: shared-demo\ndescription: universal test skill\n---\nbody"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := skills.NewLoaderWithUniversal("", "", "", universal, nil)
+	reg := tools.NewRegistry()
+	reg.Register(builtin.NewSkill(permission.New(permission.ModeBypassPermissions), loader, ""))
+	loop := agent.NewLoop(nil, reg, permission.New(permission.ModeBypassPermissions), nil, "sys", 5)
+
+	got := renderSkillsList(loop, "")
+	if !strings.Contains(got, "shared-demo") {
+		t.Fatalf("live universal skill missing from /skills output: %s", got)
 	}
 }
 

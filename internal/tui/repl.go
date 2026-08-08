@@ -317,7 +317,7 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 			case slash.SignalSession:
 				fmt.Fprintln(r.out, renderCurrentSession(r.Session, r.SessionID, r.Loop, r.model, string(r.Gate.Mode())))
 			case slash.SignalSkills:
-				fmt.Fprintln(r.out, renderSkillsList(r.skillDir))
+				fmt.Fprintln(r.out, renderSkillsList(r.Loop, r.skillDir))
 			case slash.SignalVersion:
 				fmt.Fprintln(r.out, renderVersion())
 			case slash.SignalKeybindings:

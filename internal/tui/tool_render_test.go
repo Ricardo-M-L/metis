@@ -133,6 +133,238 @@ func TestSummarizeToolResult_GlobGrepError(t *testing.T) {
 	}
 }
 
+func TestNormalizeToolOutput_CollapsesCRAndANSISpinnerFrames(t *testing.T) {
+	raw := "\x1b[31m◒ Cloning repository…\x1b[0m\r" +
+		"\x1b[2K◐ Cloning repository…\r" +
+		"\x1b[2K◇ Installation complete\n" +
+		"◇ Installed 1 skill\n" +
+		"◇ Installed 1 skill\n"
+	got := normalizeToolOutput(raw)
+	if strings.ContainsAny(got, "◒◐") || strings.Contains(got, "\x1b[") {
+		t.Fatalf("animation/ANSI frames leaked into settled output: %q", got)
+	}
+	if !strings.Contains(got, "Installation complete") || !strings.Contains(got, "Installed 1 skill") {
+		t.Fatalf("final status evidence was lost: %q", got)
+	}
+	if strings.Count(got, "Installed 1 skill") != 2 {
+		t.Fatalf("ordinary repeated status lines are evidence and must be preserved: %q", got)
+	}
+}
+
+func TestNormalizeToolOutput_PreservesOrdinaryAdjacentDuplicates(t *testing.T) {
+	got := normalizeToolOutput("x\nx\n2 passed\n2 passed\n")
+	if got != "x\nx\n2 passed\n2 passed" {
+		t.Fatalf("ordinary duplicate output was collapsed: %q", got)
+	}
+}
+
+func TestNormalizeToolOutput_CollapsesInlineSpinnerFramesOnSuccess(t *testing.T) {
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Output:   "◒ Downloading…◐ Downloading…◓ Downloading…◑ Downloaded\nready",
+	}
+	out := stripANSI(renderToolEvent(te, false))
+	for _, stale := range []string{"◒ Downloading", "◐ Downloading", "◓ Downloading"} {
+		if strings.Contains(out, stale) {
+			t.Fatalf("successful Bash preview leaked stale spinner frame %q:\n%s", stale, out)
+		}
+	}
+	if !strings.Contains(out, "◑ Downloaded") {
+		t.Fatalf("successful Bash preview lost the final spinner frame:\n%s", out)
+	}
+}
+
+func TestNormalizeToolOutput_CollapsesTailCappedSpinnerWithPrefixFragment(t *testing.T) {
+	raw := "G◒ Cloning repository…◐ Cloning repository…◓ Cloning repository…◑ Clone failed\n" +
+		"■ Failed to clone repository\nAuthentication failed for https://github.com/uizze/ui-radar.git."
+	got := normalizeToolOutput(raw)
+	for _, stale := range []string{"G◒ Cloning", "◐ Cloning", "◓ Cloning"} {
+		if strings.Contains(got, stale) {
+			t.Fatalf("tail-capped spinner residue %q leaked: %q", stale, got)
+		}
+	}
+	for _, want := range []string{"◑ Clone failed", "Failed to clone repository", "Authentication failed"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("settled diagnostic %q was lost: %q", want, got)
+		}
+	}
+}
+
+func TestRenderToolEvent_CompletionBeforeTimeoutIsPartialAndExpandable(t *testing.T) {
+	te := ToolEvent{
+		ID:       "install-1",
+		Kind:     "result",
+		ToolName: "Bash",
+		Input: map[string]any{
+			"command":     "npx skills add github/awesome-copilot --skill anti-ui-slop",
+			"description": "Install anti-ui-slop skill",
+		},
+		Output: "◒ Cloning repository…\r\x1b[2K◐ Cloning repository…\r\x1b[2K" +
+			"◇ Installation complete\n◇ Installed 1 skill\n[command exceeded timeout 30s]",
+		IsError:  true,
+		Duration: 30 * time.Second,
+	}
+	if !completedBeforeTimeout(te) {
+		t.Fatal("strong completion marker followed by outer timeout should be partial/recovered")
+	}
+
+	compact := stripANSI(renderToolEvent(te, false))
+	for _, want := range []string{"reported complete before timeout; verify", "ctrl+O to inspect timeout"} {
+		if !strings.Contains(compact, want) {
+			t.Fatalf("compact partial state missing %q:\n%s", want, compact)
+		}
+	}
+	if strings.Contains(compact, "command exceeded timeout") {
+		t.Fatalf("compact partial state should defer raw timeout to expansion:\n%s", compact)
+	}
+
+	expanded := stripANSI(renderToolEvent(te, true))
+	if !strings.Contains(expanded, "command exceeded timeout 30s") {
+		t.Fatalf("expanded partial state lost original timeout evidence:\n%s", expanded)
+	}
+	if strings.ContainsAny(expanded, "◒◐") {
+		t.Fatalf("expanded diagnostics should keep evidence, not animation frames:\n%s", expanded)
+	}
+}
+
+func TestCompletedBeforeTimeout_RejectsWeakOrContradictoryEvidence(t *testing.T) {
+	base := ToolEvent{
+		Kind: "result", ToolName: "Bash", IsError: true,
+		Input: map[string]any{"command": "npx skills add owner/repo --skill demo"},
+	}
+	cases := map[string]string{
+		"zero count":             "Installation complete\nInstalled 0 skills\n[command exceeded timeout 30s]",
+		"negated count":          "not installed 1 skill\n[command exceeded timeout 30s]",
+		"fatal after completion": "Installed 1 skill\nValidation failed: SKILL.md missing\n[command exceeded timeout 30s]",
+		"timeout before marker":  "[command exceeded timeout 30s]\nInstalled 1 skill",
+		"vague completion":       "Installation complete\n[command exceeded timeout 30s]",
+	}
+	for name, output := range cases {
+		t.Run(name, func(t *testing.T) {
+			te := base
+			te.Output = output
+			if completedBeforeTimeout(te) {
+				t.Fatalf("contradictory/weak installer output was mislabeled partial: %q", output)
+			}
+		})
+	}
+
+	t.Run("unrelated command", func(t *testing.T) {
+		te := base
+		te.Input = map[string]any{"command": "go test ./..."}
+		te.Output = "Installed 1 skill\n[command exceeded timeout 30s]"
+		if completedBeforeTimeout(te) {
+			t.Fatal("arbitrary command output must not trigger installer recovery")
+		}
+	})
+}
+
+func TestRenderToolEvent_SecurityDenialNeverBecomesRecovered(t *testing.T) {
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Output: "Installation complete\n" +
+			"Error: denied by permission policy: bash-security rule #23\n" +
+			"[command exceeded timeout 30s]",
+		IsError: true,
+	}
+	if completedBeforeTimeout(te) {
+		t.Fatal("permission/security refusal must remain an important error")
+	}
+	out := stripANSI(renderToolEvent(te, false))
+	if strings.Contains(out, "completed before timeout") || !strings.Contains(out, "denied by permission policy") {
+		t.Fatalf("security refusal was hidden or mislabeled:\n%s", out)
+	}
+}
+
+func TestRenderToolEvent_ReadOnlyExitOneIsNeutralNoMatches(t *testing.T) {
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Input: map[string]any{
+			"command": "find /Users/tester/Library -name 'IMG_0309.JPG' 2>/dev/null; " +
+				"find /Users/tester/Downloads -name 'IMG_0309.JPG' 2>/dev/null",
+			"description": "Search more locations for IMG_0309.JPG",
+		},
+		Output:   "Error: [exit status 1]",
+		IsError:  true,
+		Duration: 30 * time.Second,
+	}
+	if !benignReadOnlyNoMatch(te) {
+		t.Fatal("read-only find chain with only exit status 1 should be a neutral empty result")
+	}
+	out := stripANSI(renderToolEvent(te, false))
+	if !strings.Contains(out, "No matches") || strings.Contains(out, "exit status 1") {
+		t.Fatalf("read-only no-match was still rendered as an execution error:\n%s", out)
+	}
+	if strings.Contains(out, "recovered") {
+		t.Fatalf("empty search result is neutral, not recovered:\n%s", out)
+	}
+}
+
+func TestRenderToolEvent_ExitOneForMutatingOrUnknownCommandStaysError(t *testing.T) {
+	commands := []string{
+		"git diff --quiet",
+		"find /tmp -name '*.tmp' -delete",
+		"find /tmp -name '*.tmp' -fprint report.txt",
+		"find /tmp -name '*.tmp' -fprint0 report.bin",
+		"find /tmp -name '*.tmp' -fprintf report.txt '%p\\n'",
+		"find /tmp -name '*.tmp' -fls report.txt",
+		"rg --pre 'python transform.py' token .",
+		"rg token . > matches.txt",
+		"awk 'BEGIN { system(\"touch /tmp/pwn\") }' data.txt",
+		"sed -n 'w report.txt' data.txt",
+		"sort -o sorted.txt data.txt",
+		"sed --in-place=.bak 's/a/b/' data.txt",
+		"sort --output=sorted.txt data.txt",
+		"rg token $(touch /tmp/pwn)",
+		"rg token `touch /tmp/pwn`",
+		"rg token <(touch /tmp/pwn)",
+		"(rg token .)",
+	}
+	for _, command := range commands {
+		t.Run(command, func(t *testing.T) {
+			te := ToolEvent{
+				Kind: "result", ToolName: "Bash", Input: map[string]any{"command": command},
+				Output: "[exit status 1]", IsError: true,
+			}
+			if benignReadOnlyNoMatch(te) {
+				t.Fatalf("non-read-only/unknown exit 1 was mislabeled neutral: %q", command)
+			}
+			out := stripANSI(renderToolEvent(te, false))
+			if !strings.Contains(out, "exit status 1") {
+				t.Fatalf("real error evidence disappeared for %q:\n%s", command, out)
+			}
+		})
+	}
+}
+
+func TestSummarizeToolResult_CloneFailureUsesActionableTail(t *testing.T) {
+	te := ToolEvent{
+		Kind: "result", ToolName: "Bash", IsError: true,
+		Input: map[string]any{"command": "npx skills add uizze/ui-radar"},
+		Output: "│\n◇ Source: https://github.com/uizze/ui-radar.git\n" +
+			"◒ Cloning repository…\r\x1b[2K◐ Cloning repository…\r\x1b[2K│\n" +
+			"■ Failed to clone repository\n│\n" +
+			"│ Authentication failed for https://github.com/uizze/ui-radar.git.\n" +
+			"└ Installation failed\n",
+	}
+	got := summarizeToolResult(te)
+	if !strings.Contains(got, "Authentication failed") {
+		t.Fatalf("summary chose installer chrome instead of actionable cause: %q", got)
+	}
+	rendered := stripANSI(renderToolEvent(te, false))
+	if !strings.Contains(rendered, "Failed to clone repository") || !strings.Contains(rendered, "Authentication failed") {
+		t.Fatalf("normalization dropped final clone diagnostics:\n%s", rendered)
+	}
+	for _, stale := range []string{"◒ Cloning", "◐ Cloning"} {
+		if strings.Contains(rendered, stale) {
+			t.Fatalf("clone spinner frame leaked after settlement %q:\n%s", stale, rendered)
+		}
+	}
+}
+
 // TestTruncateMiddle_PreservesBothEnds — for path-bearing error lines
 // the basename at the END is what tells the user what failed; the
 // pre-fix tail-cut form hid it. Middle truncation keeps both ends

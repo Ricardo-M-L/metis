@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestBuildChatItems_GroupsConsecutiveExplorationTools(t *testing.T) {
@@ -66,5 +68,192 @@ func TestBuildChatItems_ErrorAndNonExplorationBreakGroups(t *testing.T) {
 		if _, grouped := item.(*explorationGroupItem); grouped {
 			t.Fatalf("error/Edit boundaries must prevent cross-boundary grouping: %#v", items)
 		}
+	}
+}
+
+func TestBuildChatItems_RecoveredErrorStaysInPlaceAcrossAssistantCommentary(t *testing.T) {
+	now := time.Now()
+	m := newSlashTestModel(t)
+	m.messages = []Message{
+		{Role: "user", Content: "query the photo database", Timestamp: now},
+		{Role: "assistant", Content: "The first schema guess failed; I will inspect it and retry.", Timestamp: now.Add(2 * time.Millisecond)},
+	}
+	m.toolEvents = []ToolEvent{
+		{
+			ID: "query-failed", Kind: "result", ToolName: "Bash", IsError: true,
+			Input:     map[string]any{"command": "sqlite3 wrong.db ...", "description": "Query Photos SQLite for IMG_0309"},
+			Output:    "unable to open database",
+			StartTime: now.Add(time.Millisecond),
+		},
+		{
+			ID: "query-ok", Kind: "result", ToolName: "Bash",
+			Input:     map[string]any{"command": "sqlite3 correct.db ...", "description": "Retry Photos SQLite query for IMG_0309"},
+			Output:    "(no rows)",
+			StartTime: now.Add(3 * time.Millisecond),
+		},
+	}
+
+	items := m.buildChatItems()
+	var group *recoveredErrorGroupItem
+	groupIndex, commentaryIndex := -1, -1
+	for idx, item := range items {
+		switch typed := item.(type) {
+		case *recoveredErrorGroupItem:
+			group = typed
+			groupIndex = idx
+		case *messageItem:
+			if strings.Contains(typed.msg.Content, "schema guess failed") {
+				commentaryIndex = idx
+			}
+		}
+	}
+	if group == nil {
+		t.Fatalf("later successful retry should compact the earlier error in place; items=%#v", items)
+	}
+	if groupIndex < 0 || commentaryIndex < 0 || groupIndex >= commentaryIndex {
+		t.Fatalf("recovered row moved across assistant commentary: group=%d commentary=%d", groupIndex, commentaryIndex)
+	}
+	compact := stripANSI(group.Render(100))
+	if !strings.Contains(compact, "1 intermediate error recovered") || strings.Contains(compact, "unable to open database") {
+		t.Fatalf("unexpected compact recovered row:\n%s", compact)
+	}
+
+	// Drive the real keyboard path. The later successful Bash result is the
+	// newest completed event, but it has no hidden body; Ctrl+O must target the
+	// older recovered row that actually advertises inspection.
+	m.Update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	if m.expandedToolID != "query-failed" {
+		t.Fatalf("Ctrl+O selected %q, want historical recovered event", m.expandedToolID)
+	}
+	for _, item := range m.buildChatItems() {
+		if expanded, ok := item.(*recoveredErrorGroupItem); ok {
+			out := stripANSI(expanded.Render(100))
+			if !strings.Contains(out, "unable to open database") {
+				t.Fatalf("Ctrl+O mapping lost original recovered error:\n%s", out)
+			}
+			return
+		}
+	}
+	t.Fatal("expanded rebuild lost recovered error group")
+}
+
+func TestBuildChatItems_UnrecoveredAndSecurityErrorsStayVisible(t *testing.T) {
+	now := time.Now()
+	m := newSlashTestModel(t)
+	m.messages = []Message{{Role: "user", Content: "run it", Timestamp: now}}
+	m.toolEvents = []ToolEvent{
+		{
+			ID: "unrecovered", Kind: "result", ToolName: "Bash", IsError: true,
+			Input:  map[string]any{"command": "clone missing", "description": "Install ui-radar skill"},
+			Output: "Failed to clone repository", StartTime: now.Add(time.Millisecond),
+		},
+		{
+			ID: "denied", Kind: "result", ToolName: "Bash", IsError: true,
+			Input:  map[string]any{"command": "unsafe", "description": "Run protected command"},
+			Output: "denied by permission policy: bash-security rule #23", StartTime: now.Add(2 * time.Millisecond),
+		},
+		{
+			ID: "later-ok", Kind: "result", ToolName: "Bash",
+			Input:  map[string]any{"command": "safe", "description": "Retry protected command"},
+			Output: "ok", StartTime: now.Add(3 * time.Millisecond),
+		},
+	}
+	items := m.buildChatItems()
+	for _, item := range items {
+		if _, compacted := item.(*recoveredErrorGroupItem); compacted {
+			t.Fatalf("unrecovered/security error was compacted as recovered: %#v", items)
+		}
+	}
+	rendered := ""
+	for _, item := range items {
+		rendered += stripANSI(item.Render(100))
+	}
+	for _, want := range []string{"Failed to clone repository", "denied by permission policy"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("important error evidence %q disappeared:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestBuildChatItems_PartialTimeoutCompactsWithoutLaterSuccess(t *testing.T) {
+	now := time.Now()
+	m := newSlashTestModel(t)
+	m.messages = []Message{{Role: "user", Content: "install", Timestamp: now}}
+	m.toolEvents = []ToolEvent{{
+		ID: "partial", Kind: "result", ToolName: "Bash", IsError: true,
+		Input:  map[string]any{"command": "npx skills add x", "description": "Install x skill"},
+		Output: "Installation complete\nInstalled 1 skill\n[command exceeded timeout 30s]", StartTime: now.Add(time.Millisecond),
+	}}
+	items := m.buildChatItems()
+	if len(items) != 2 { // user + compact recovered row
+		t.Fatalf("items=%d, want user + recovered partial row", len(items))
+	}
+	group, ok := items[1].(*recoveredErrorGroupItem)
+	if !ok {
+		t.Fatalf("partial timeout item=%T, want recoveredErrorGroupItem", items[1])
+	}
+	out := stripANSI(group.Render(100))
+	if !strings.Contains(out, "install reported complete before timeout; verify") {
+		t.Fatalf("partial completion state missing:\n%s", out)
+	}
+}
+
+func TestSameRecoveryOperation_RejectsGenericDescriptionOverlap(t *testing.T) {
+	failed := ToolEvent{
+		ToolName: "Bash",
+		Input: map[string]any{
+			"command":     "npm test",
+			"description": "Run tests",
+		},
+	}
+	succeeded := ToolEvent{
+		ToolName: "Bash",
+		Input: map[string]any{
+			"command":     "go test ./...",
+			"description": "Retry tests",
+		},
+	}
+	if sameRecoveryOperation(failed, succeeded) {
+		t.Fatal("one generic description word hid an unrelated failed command")
+	}
+
+	failed.Input["description"] = "Query Photos SQLite for IMG_0309"
+	succeeded.Input["description"] = "Retry Photos SQLite query for IMG_0309"
+	if !sameRecoveryOperation(failed, succeeded) {
+		t.Fatal("specific multi-token retry intent should match")
+	}
+
+	failed.Input["path"] = "/tmp/a"
+	succeeded.Input["path"] = "/tmp/b"
+	if sameRecoveryOperation(failed, succeeded) {
+		t.Fatal("concrete target mismatch must override similar descriptions")
+	}
+
+	failed.Input = map[string]any{"path": "/tmp/tree", "pattern": "TODO", "description": "Search project markers"}
+	succeeded.Input = map[string]any{"path": "/tmp/tree", "pattern": "FIXME", "description": "Search project markers"}
+	if sameRecoveryOperation(failed, succeeded) {
+		t.Fatal("matching path must not hide a later structured pattern mismatch")
+	}
+}
+
+func TestSameRecoveryOperation_DispatchActionsMustMatch(t *testing.T) {
+	failed := ToolEvent{
+		ToolName: "Skill",
+		Input:    map[string]any{"action": "invoke", "name": "anti-ui-slop"},
+	}
+	succeeded := ToolEvent{
+		ToolName: "Skill",
+		Input:    map[string]any{"action": "get", "name": "anti-ui-slop"},
+	}
+	if sameRecoveryOperation(failed, succeeded) {
+		t.Fatal("successful Skill get must not hide a failed Skill invoke")
+	}
+	succeeded.Input["action"] = "invoke"
+	if !sameRecoveryOperation(failed, succeeded) {
+		t.Fatal("same Skill action and target should count as a successful retry")
+	}
+	delete(succeeded.Input, "action")
+	if sameRecoveryOperation(failed, succeeded) {
+		t.Fatal("missing dispatcher action must fail closed")
 	}
 }

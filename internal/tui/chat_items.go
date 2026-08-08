@@ -16,8 +16,10 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	xansi "github.com/charmbracelet/x/ansi"
 
@@ -92,6 +94,261 @@ type explorationGroupItem struct {
 	// top-level groups). Stamped at flush time so Render can decide
 	// whether to indent without re-deriving it.
 	subParent string
+}
+
+// recoveredErrorGroupItem is the compact, evidence-preserving state between
+// success and failure. It contains only tool errors for which this render pass
+// has positive recovery evidence: either the same operation later succeeded
+// in the same user turn, or the command printed a strong completion
+// marker before the outer timeout fired. Permission/security refusals never
+// enter this group. The original ToolEvents remain untouched and Ctrl+O
+// expands this item back into their full diagnostic rows.
+type recoveredErrorGroupItem struct {
+	events       []ToolEvent
+	expand       bool
+	expandID     string
+	subParent    string
+	partialCount int
+	retriedCount int
+}
+
+func (i *recoveredErrorGroupItem) Render(width int) string {
+	_ = width
+	if i.expand {
+		var out strings.Builder
+		for _, te := range i.events {
+			out.WriteString(renderToolEvent(te, true))
+		}
+		return out.String()
+	}
+	parts := make([]string, 0, 2)
+	if i.partialCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s reported complete before timeout; verify", i.partialCount, pluralN(i.partialCount, "install", "installs")))
+	}
+	if i.retriedCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d intermediate %s recovered", i.retriedCount, pluralN(i.retriedCount, "error", "errors")))
+	}
+
+	leadIndent := "  "
+	if i.subParent != "" {
+		leadIndent = "      "
+	}
+	var out strings.Builder
+	out.WriteString(styleWarn.Render(leadIndent + "↻ "))
+	label := "recovered"
+	if i.partialCount > 0 && i.retriedCount == 0 {
+		label = "partial"
+	}
+	out.WriteString(styleToolName.Render(label))
+	out.WriteString(styleDim.Render(" · "))
+	out.WriteString(strings.Join(parts, " · "))
+	out.WriteString(styleMuted.Render(" (ctrl+O to inspect)"))
+	out.WriteString("\n")
+	return out.String()
+}
+
+type recoveredErrorGroupPlan struct {
+	anchor       *ToolEvent
+	events       []ToolEvent
+	expandID     string
+	subParent    string
+	partialCount int
+	retriedCount int
+}
+
+var recoveryDescriptionStopWords = map[string]struct{}{
+	"a": {}, "again": {}, "an": {}, "and": {}, "check": {}, "command": {},
+	"build": {}, "builds": {}, "data": {}, "dir": {}, "directory": {}, "fetch": {},
+	"file": {}, "files": {}, "find": {}, "for": {}, "from": {}, "higher": {}, "install": {},
+	"installation": {}, "query": {}, "read": {}, "retry": {}, "run": {}, "search": {},
+	"output": {}, "repo": {}, "repository": {}, "request": {}, "requests": {},
+	"skill": {}, "skills": {}, "task": {}, "tasks": {}, "test": {}, "tests": {},
+	"the": {}, "timeout": {}, "try": {}, "url": {}, "using": {}, "via": {}, "with": {},
+}
+
+var importantToolErrorRE = regexp.MustCompile(`(?i)(access denied|authentication failed|forbidden|unauthorized|denied by permission|denied by user|permission denied|permission policy|requires approval|security rule|bash-security|operation not permitted|user denied|unsafe command)`)
+
+func importantToolError(te ToolEvent) bool {
+	return te.IsError && importantToolErrorRE.MatchString(te.Output)
+}
+
+func recoveryWords(s string) map[string]struct{} {
+	words := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_'
+	})
+	out := make(map[string]struct{}, len(words))
+	for _, word := range words {
+		word = strings.Trim(word, "-_")
+		if len([]rune(word)) < 3 {
+			continue
+		}
+		if _, stop := recoveryDescriptionStopWords[word]; stop {
+			continue
+		}
+		out[word] = struct{}{}
+	}
+	return out
+}
+
+func sameRecoveryOperation(failed, succeeded ToolEvent) bool {
+	if strings.TrimPrefix(failed.ToolName, "sub: ") != strings.TrimPrefix(succeeded.ToolName, "sub: ") ||
+		failed.SubAgentParentID != succeeded.SubAgentParentID {
+		return false
+	}
+	// Dispatcher-style tools reuse one ToolName for distinct operations. A
+	// successful Skill get does not recover a failed Skill invoke merely because
+	// both name the same skill; the same applies to job/task/session methods.
+	for _, key := range []string{"action", "operation", "method", "job_id", "task_id", "session_id", "id"} {
+		aValue, aOK := recoveryIdentityValue(failed.Input, key)
+		bValue, bOK := recoveryIdentityValue(succeeded.Input, key)
+		if !aOK && !bOK {
+			continue
+		}
+		if !aOK || !bOK || !strings.EqualFold(aValue, bValue) {
+			return false
+		}
+	}
+	// Concrete targets beat prose intent labels. A path/query/URL mismatch is
+	// decisive; an exact command replay is decisive success evidence. Bash retry
+	// commands may legitimately differ, so a non-equal command falls through to
+	// the description check instead of being treated as a match by itself.
+	structuredTarget := false
+	for _, key := range []string{"path", "file_path", "pattern", "query", "url", "name"} {
+		aValue, _ := failed.Input[key].(string)
+		bValue, _ := succeeded.Input[key].(string)
+		aValue, bValue = strings.TrimSpace(aValue), strings.TrimSpace(bValue)
+		if aValue == "" && bValue == "" {
+			continue
+		}
+		if aValue == "" || bValue == "" || !strings.EqualFold(aValue, bValue) {
+			return false
+		}
+		structuredTarget = true
+	}
+	if structuredTarget {
+		return true
+	}
+	failedCommand, _ := failed.Input["command"].(string)
+	succeededCommand, _ := succeeded.Input["command"].(string)
+	if strings.TrimSpace(failedCommand) != "" && strings.EqualFold(strings.TrimSpace(failedCommand), strings.TrimSpace(succeededCommand)) {
+		return true
+	}
+	failedDesc, _ := failed.Input["description"].(string)
+	succeededDesc, _ := succeeded.Input["description"].(string)
+	aText, bText := strings.TrimSpace(failedDesc), strings.TrimSpace(succeededDesc)
+	if aText == "" || bText == "" {
+		return false
+	}
+	a, b := recoveryWords(aText), recoveryWords(bText)
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	shared := 0
+	for word := range a {
+		if _, ok := b[word]; ok {
+			shared++
+		}
+	}
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	if minLen == 1 {
+		if shared != 1 {
+			return false
+		}
+		for word := range a {
+			if _, ok := b[word]; ok {
+				// A single shared generic word is not enough ("Run tests" /
+				// "Retry tests"). Accept only an identifier-like token such as
+				// IMG_0309 or anti-ui-slop.
+				return len([]rune(word)) >= 6 && strings.ContainsAny(word, "0123456789_-")
+			}
+		}
+		return false
+	}
+	return shared >= 2 && shared*4 >= minLen*3
+}
+
+func recoveryIdentityValue(input map[string]any, key string) (string, bool) {
+	value, ok := input[key]
+	if !ok || value == nil {
+		return "", false
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	return text, text != ""
+}
+
+// recoveredErrorPlans searches for recovery within one user turn but keeps
+// each recovered error at its original timeline position. Assistant
+// commentary is not a boundary: models commonly say what they will retry
+// between two attempts. We intentionally avoid collecting non-contiguous
+// failures into one earlier row because expanding such a group would reorder
+// evidence around that commentary.
+func recoveredErrorPlans(merged []timelineItem) map[*ToolEvent]*recoveredErrorGroupPlan {
+	plans := make(map[*ToolEvent]*recoveredErrorGroupPlan)
+	turn := make([]*ToolEvent, 0, 8)
+	flush := func() {
+		if len(turn) == 0 {
+			return
+		}
+		for idx, te := range turn {
+			if !te.IsError || benignReadOnlyNoMatch(*te) {
+				continue
+			}
+			if importantToolError(*te) {
+				continue
+			}
+			partial := completedBeforeTimeoutAfterImportanceCheck(*te)
+			recovered := partial
+			if !recovered {
+				// A bounded lookahead keeps this per-frame render planning O(n)
+				// even in pathological agent loops while covering ordinary retry
+				// sequences (which are normally adjacent or only a few calls apart).
+				end := idx + 1 + 24
+				if end > len(turn) {
+					end = len(turn)
+				}
+				for _, later := range turn[idx+1 : end] {
+					if later.Kind == "result" && !later.IsError && sameRecoveryOperation(*te, *later) {
+						recovered = true
+						break
+					}
+				}
+			}
+			if recovered {
+				plan := &recoveredErrorGroupPlan{
+					anchor:       te,
+					events:       []ToolEvent{*te},
+					expandID:     te.ID,
+					subParent:    te.SubAgentParentID,
+					partialCount: boolInt(partial),
+					retriedCount: boolInt(!partial),
+				}
+				plans[te] = plan
+			}
+		}
+		turn = turn[:0]
+	}
+
+	for _, item := range merged {
+		if item.msg != nil && item.msg.Role == "user" {
+			flush()
+			continue
+		}
+		if item.te != nil && item.te.Kind == "result" {
+			turn = append(turn, item.te)
+		}
+	}
+	flush()
+	return plans
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (i *explorationGroupItem) Render(width int) string {
@@ -331,6 +588,7 @@ func (it *inProgressStreamingItem) Render(width int) string {
 // re-rendered per frame.
 func (m *Model) buildChatItems() []list.Item {
 	merged := m.timeline()
+	recoveryPlans := recoveredErrorPlans(merged)
 	out := make([]list.Item, 0, len(merged)+2)
 	// thinkingDisplay = "hide" drops every reasoning row from the
 	// transcript and from the live-streaming preview. "show" forces
@@ -351,13 +609,19 @@ func (m *Model) buildChatItems() []list.Item {
 			out = append(out, &toolEventItem{te: explorationRun[0], expand: explorationRun[0].ID == m.expandedToolID, cache: m.renderCache})
 		} else {
 			events := append([]ToolEvent(nil), explorationRun...)
-			// explorationGroupItem has no per-event expand plumbing —
-			// grouped events always render collapsed. Ctrl+O against a
-			// grouped event currently no-ops; per-event expansion inside
-			// a group is a follow-up.
+			// A grouped row expands when Ctrl+O targets any member ID. This
+			// keeps the compact default while making the advertised affordance
+			// real (the old construction hard-coded expand=false).
+			expand := false
+			for _, event := range events {
+				if event.ID != "" && event.ID == m.expandedToolID {
+					expand = true
+					break
+				}
+			}
 			out = append(out, &explorationGroupItem{
 				events:    events,
-				expand:    false,
+				expand:    expand,
 				subParent: events[0].SubAgentParentID,
 			})
 		}
@@ -377,6 +641,29 @@ func (m *Model) buildChatItems() []list.Item {
 			expand := forceExpandThinking && it.msg.Role == "thinking"
 			out = append(out, &messageItem{msg: *it.msg, expand: expand, cache: m.renderCache})
 		case it.te != nil:
+			if plan, recovered := recoveryPlans[it.te]; recovered {
+				flushExploration()
+				if it.te == plan.anchor {
+					expand := plan.expandID != "" && plan.expandID == m.expandedToolID
+					if !expand && m.expandedToolID != "" {
+						for _, event := range plan.events {
+							if event.ID == m.expandedToolID {
+								expand = true
+								break
+							}
+						}
+					}
+					out = append(out, &recoveredErrorGroupItem{
+						events:       append([]ToolEvent(nil), plan.events...),
+						expand:       expand,
+						expandID:     plan.expandID,
+						subParent:    plan.subParent,
+						partialCount: plan.partialCount,
+						retriedCount: plan.retriedCount,
+					})
+				}
+				continue
+			}
 			// Cluster boundary: a groupable event joins the current run
 			// only if its SubAgentParentID MATCHES the run's existing
 			// parent. Prevents 5 parallel sub-agents' grep calls from

@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -390,6 +391,79 @@ func TestFromOpenAIChoice_MissingToolIDsGetResponseScopedIDs(t *testing.T) {
 	}
 	if firstA == second.Content[0].ToolUseID || firstB == second.Content[1].ToolUseID {
 		t.Fatalf("identical responses reused history-visible ids: first=%+v second=%+v", first.Content, second.Content)
+	}
+}
+
+func TestFromOpenAIChoice_EmptyOrNullToolArgumentsBecomeObject(t *testing.T) {
+	choice := oaiChoice{FinishReason: "tool_calls"}
+	choice.Message.ToolCalls = make([]oaiToolCall, 3)
+	for i, args := range []string{"", "null", "  null  "} {
+		choice.Message.ToolCalls[i].ID = "call_" + string(rune('a'+i))
+		choice.Message.ToolCalls[i].Function.Name = "Write"
+		choice.Message.ToolCalls[i].Function.Arguments = args
+	}
+
+	got := fromOpenAIChoice(choice, oaiUsage{})
+	if len(got.Content) != 3 {
+		t.Fatalf("content = %+v", got.Content)
+	}
+	for i, block := range got.Content {
+		if block.ToolInput == nil {
+			t.Errorf("tool %d input is nil; want empty object", i)
+		}
+		if len(block.ToolInput) != 0 {
+			t.Errorf("tool %d input = %+v, want empty object", i, block.ToolInput)
+		}
+	}
+}
+
+// Regression for session 64fd6e14: a sixth, output-truncated Write was
+// persisted without input. Every later user message rebuilt it as
+// function.arguments="null", and the OpenAI-compatible provider returned
+// "Can only get item pairs from a mapping" forever. Rebuilding the request
+// repeatedly must keep the old call as a JSON object string.
+func TestToOpenAI_LegacyNilToolInputDoesNotPoisonLaterTurns(t *testing.T) {
+	history := []Message{
+		{Role: RoleAssistant, Content: []ContentBlock{{
+			Type: "tool_use", ToolUseID: "call_truncated", ToolName: "Write",
+			ToolInput: nil,
+		}}},
+		{Role: RoleUser, Content: []ContentBlock{{
+			Type: "tool_result", ToolUseID: "call_truncated",
+			ToolResult: "Write: `path` field is required", IsError: true,
+		}}},
+	}
+
+	for _, userText := range []string{"same question", "111", "third retry"} {
+		history = append(history, Message{
+			Role: RoleUser, Content: []ContentBlock{{Type: "text", Text: userText}},
+		})
+		wire := toOpenAI(Request{Messages: history}, "test-model", 4096)
+		if len(wire.Messages) < 1 || len(wire.Messages[0].ToolCalls) != 1 {
+			t.Fatalf("wire messages lost legacy call: %+v", wire.Messages)
+		}
+		args := wire.Messages[0].ToolCalls[0].Function.Arguments
+		if args != "{}" {
+			t.Fatalf("after %q arguments = %q, want {}", userText, args)
+		}
+		var object map[string]any
+		if err := json.Unmarshal([]byte(args), &object); err != nil || object == nil {
+			t.Fatalf("after %q arguments is not a JSON object: %q err=%v", userText, args, err)
+		}
+		body, err := json.Marshal(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), `"arguments":"null"`) {
+			t.Fatalf("request still contains poisoned arguments after %q: %s", userText, body)
+		}
+	}
+}
+
+func TestMarshalToolArguments_MarshalFailureFallsBackToObject(t *testing.T) {
+	got := marshalToolArguments(map[string]any{"unsupported": func() {}})
+	if got != "{}" {
+		t.Fatalf("marshal fallback = %q, want {}", got)
 	}
 }
 

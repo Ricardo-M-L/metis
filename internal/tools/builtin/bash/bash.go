@@ -564,6 +564,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 			b.Jobs.CleanupOrphan(diskOut)
 		}
 		out, truncated := cappedBuf.snapshot()
+		out = normalizeCapturedOutput(out)
 		if truncated {
 			out += "\n\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}
@@ -576,6 +577,16 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		if err != nil {
 			var ee *exec.ExitError
 			if errors.As(err, &ee) {
+				if ee.ExitCode() == 1 {
+					if semantic, handled := interpretSearchExitOne(cmdStr, out); handled {
+						if strings.TrimSpace(out) == "" {
+							res.Output = semantic
+						} else {
+							res.Output = out + "\n\n[" + semantic + "]"
+						}
+						return res, nil
+					}
+				}
 				res.Output = out + "\n\n[exit status " + intStr(ee.ExitCode()) + "]"
 				res.IsError = true
 				return res, nil
@@ -608,6 +619,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		}
 		canceled = true // Adopt owns the cancel now
 		preview, truncated := cappedBuf.snapshot()
+		preview = normalizeCapturedOutput(preview)
 		if truncated {
 			preview += "\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}

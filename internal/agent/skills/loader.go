@@ -16,7 +16,7 @@ import (
 // determines who wins when two layers contribute a skill of the same name
 // (higher wins). Conventional priority floor → ceiling:
 //
-//	bundled(0) < optional(5) < user(10) < project(20) < plugin(30) < mcp(40)
+//	bundled(0) < optional(5) < universal(8) < user(10) < project(20) < plugin(30) < mcp(40)
 //
 // optional sits between bundled and user: it's "official but not on by
 // default" — same trust level as built-ins but the user opts in via
@@ -56,8 +56,8 @@ type Loader struct {
 	dirty bool
 }
 
-// NewLoader builds the standard 5-layer loader (bundled / optional /
-// user / project / plugin). The MCP layer is omitted when mcp is nil
+// NewLoader builds the standard loader (bundled / optional / user /
+// project / plugin). The MCP layer is omitted when mcp is nil
 // — kept as a separate constructor option so unit tests don't need
 // an MCP client.
 //
@@ -74,11 +74,32 @@ func NewLoader(userDir, projectDir string, plugins []PluginSkillSource) *Loader 
 // "optional" layer between bundled and user. Mirrors hermes-agent's
 // optional-skills tree.
 func NewLoaderWithOptional(userDir, projectDir, optionalDir string, plugins []PluginSkillSource) *Loader {
+	return NewLoaderWithUniversal(userDir, projectDir, optionalDir, "", plugins)
+}
+
+// NewLoaderWithUniversal adds the cross-agent Agent Skills convention
+// (`~/.agents/skills`) between Metis's optional and user-owned layers.
+//
+// Keep this as an explicit constructor argument instead of reaching into the
+// process HOME from the loader. Unit tests and embedders frequently point the
+// Metis user layer at a temporary directory; implicitly scanning the machine's
+// real ~/.agents/skills would make their catalog nondeterministic. The runtime
+// passes the real universal directory, while existing callers retain the
+// isolated behavior of NewLoaderWithOptional.
+//
+// Universal skills are stamped community trust: they may have been installed
+// by any compatible agent/package manager, so Metis must safety-scan them and
+// must not grant trusted inline-shell privileges merely because the files are
+// local. A same-named ~/.metis skill still wins at priority 10.
+func NewLoaderWithUniversal(userDir, projectDir, optionalDir, universalDir string, plugins []PluginSkillSource) *Loader {
 	layers := []Layer{
 		bundledLayer(),
 	}
 	if optionalDir != "" {
 		layers = append(layers, dirLayer("optional", 5, optionalDir, pubskill.TrustTrusted))
+	}
+	if universalDir != "" {
+		layers = append(layers, dirLayer("universal", 8, universalDir, pubskill.TrustCommunity))
 	}
 	if userDir != "" {
 		layers = append(layers, dirLayer("user", 10, userDir, pubskill.TrustUser))
@@ -112,6 +133,32 @@ type PluginSkillSource interface {
 func (l *Loader) Invalidate() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.dirty = true
+}
+
+// SetPluginSources replaces the optional plugin layer in place and invalidates
+// the catalog. Keeping the Loader pointer stable matters: the LLM-facing Skill
+// tool, MetisInfo, and the TUI can all hold the same live catalog while plugins
+// are discovered during the second bootstrap phase.
+func (l *Loader) SetPluginSources(plugins []PluginSkillSource) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	layers := make([]Layer, 0, len(l.Layers)+1)
+	for _, layer := range l.Layers {
+		if layer.Name != "plugin" {
+			layers = append(layers, layer)
+		}
+	}
+	if len(plugins) > 0 {
+		layers = append(layers, pluginLayer(plugins))
+	}
+	sort.Slice(layers, func(i, j int) bool { return layers[i].Priority < layers[j].Priority })
+	l.Layers = layers
+	l.cache = nil
 	l.dirty = true
 }
 
@@ -258,6 +305,47 @@ func (l *Loader) List() ([]Skill, error) {
 	l.cache = out
 	l.dirty = false
 	return append([]Skill(nil), out...), nil
+}
+
+// ListDeclared returns the manifests contributed by every layer before
+// availability policy is applied. Unlike List, it intentionally does not run
+// the safety scanner and does not filter Disabled or ActivateOn skills.
+//
+// The install planner uses this view only to answer "is this already present?"
+// so an inactive, disabled, or quarantined manifest is not downloaded again in
+// a loop. Invocation and prompt rendering must continue to use List/Get, which
+// retain all safety and activation checks. This method is uncached so a package
+// manager that writes during the current session is visible immediately.
+func (l *Loader) ListDeclared() ([]Skill, error) {
+	l.mu.RLock()
+	layers := append([]Layer(nil), l.Layers...)
+	logger := l.Logger
+	l.mu.RUnlock()
+
+	type winner struct {
+		sk    Skill
+		layer string
+	}
+	seen := map[string]winner{}
+	for _, layer := range layers {
+		declared, err := layer.Scan()
+		if err != nil {
+			logger("skill layer %q declaration scan error: %v", layer.Name, err)
+			continue
+		}
+		for _, sk := range declared {
+			if layer.Trust != "" {
+				sk.TrustLevel = layer.Trust
+			}
+			seen[sk.Name] = winner{sk: sk, layer: layer.Name}
+		}
+	}
+	out := make([]Skill, 0, len(seen))
+	for _, w := range seen {
+		out = append(out, w.sk)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 // Get returns one skill by name, or (nil, nil) when missing. Errors are

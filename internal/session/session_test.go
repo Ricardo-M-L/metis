@@ -49,6 +49,44 @@ func TestSession_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestSession_LoadCanonicalizesLegacyNilToolInput(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := store.NewSessionID()
+	if err := store.WriteHeader(id, "test-model", ""); err != nil {
+		t.Fatal(err)
+	}
+	// ToolInput is nil, matching old name-only calls. Because the field is
+	// omitempty, this also exercises the exact on-disk shape of the affected
+	// session rather than manufacturing a special fixture.
+	if err := store.AppendMessage(id, llm.Message{
+		Role: llm.RoleAssistant,
+		Content: []llm.ContentBlock{{
+			Type: "tool_use", ToolUseID: "call_truncated", ToolName: "Write",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, messages, err := store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || len(messages[0].Content) != 1 {
+		t.Fatalf("messages = %+v", messages)
+	}
+	input := messages[0].Content[0].ToolInput
+	if input == nil {
+		t.Fatal("loaded legacy tool input is nil; want empty object")
+	}
+	if len(input) != 0 {
+		t.Fatalf("loaded tool input = %+v, want empty object", input)
+	}
+}
+
 func TestSession_List(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewStore(dir)

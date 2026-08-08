@@ -3,7 +3,6 @@ package tui
 import (
 	"sort"
 
-	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
@@ -102,8 +101,7 @@ func (m *Model) helpCustomCommandsRows() []screen.HelpRow {
 		{Value: "Drop a SKILL.md under ~/.metis/skills/ to add your own."},
 		{},
 	}
-	loader := skills.NewLoader(m.skillDir, "", nil)
-	list, err := loader.List()
+	list, err := loadSkillCatalog(m.loop, m.skillDir)
 	if err != nil || len(list) == 0 {
 		rows = append(rows, screen.HelpRow{Value: "(no skills loaded)"})
 		return rows

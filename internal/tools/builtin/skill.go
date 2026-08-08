@@ -76,9 +76,15 @@ func (s Skill) WithSessionIDFn(fn func() string) Skill {
 	return s
 }
 
+// CatalogLoader exposes the shared read-side catalog to trusted in-process UI
+// surfaces. It deliberately returns the Loader, not a copied skill slice, so
+// /skills can invalidate after an external package manager changes the disk.
+// Tool callers cannot access this method through the JSON tool protocol.
+func (s Skill) CatalogLoader() *skillsloader.Loader { return s.loader }
+
 func (Skill) Name() string { return "Skill" }
 func (Skill) Description() string {
-	return "Look up or invoke a named skill from any registered source (bundled, user, project, plugin, mcp)."
+	return "Inspect or invoke the live local skill catalog. For any request to install skills, call action=plan_install with every requested name before Bash, WebSearch, or git: it checks installed skills first, flags typos/ambiguity without guessing, and returns a deterministic official lifecycle or one discovery step."
 }
 func (Skill) Concurrency(in map[string]any) tools.Concurrency {
 	if action, _ := in["action"].(string); action == "invoke" {
@@ -97,12 +103,19 @@ func (s Skill) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type":        "string",
-				"description": "list | get | invoke",
-				"enum":        []string{"list", "get", "invoke"},
+				"description": "list | get | invoke | plan_install",
+				"enum":        []string{"list", "get", "invoke", "plan_install"},
 			},
 			"name": map[string]any{
 				"type":        "string",
-				"description": "Skill name (for get/invoke actions)",
+				"description": "Skill name (for get/invoke, or one-name plan_install)",
+			},
+			"names": map[string]any{
+				"type":        "array",
+				"description": "All names exactly as the user typed them (for plan_install). Preserve possible typos; the tool resolves them safely.",
+				"items": map[string]any{
+					"type": "string",
+				},
 			},
 		},
 	}
@@ -138,6 +151,12 @@ func (s Skill) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	switch action {
 	case "list":
 		return s.listSkills()
+	case "plan_install":
+		names := stringSlice(in["names"])
+		if len(names) == 0 && name != "" {
+			names = []string{name}
+		}
+		return s.planSkillInstall(names)
 	case "get":
 		return s.getSkill(name)
 	case "invoke":
@@ -153,12 +172,15 @@ func (s Skill) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		return s.invokeSkill(ctx, name)
 	}
 	return &tools.Result{
-		Output:  "unknown action: " + action + " (use: list | get | invoke)",
+		Output:  "unknown action: " + action + " (use: list | get | invoke | plan_install)",
 		IsError: true,
 	}, nil
 }
 
 func (s Skill) listSkills() (*tools.Result, error) {
+	// A package manager may have installed a universal skill during this
+	// session. Refresh on explicit list rather than requiring a Metis restart.
+	s.loader.Invalidate()
 	skills, err := s.loader.List()
 	if err != nil {
 		return &tools.Result{Output: "list error: " + err.Error(), IsError: true}, nil

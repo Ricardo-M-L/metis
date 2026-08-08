@@ -25,6 +25,49 @@ import (
 // passing.
 var exitFunc = os.Exit
 
+// expandableToolEventIDs returns chronological targets whose collapsed row
+// contains hidden diagnostics. Group rows expose one representative member ID;
+// buildChatItems expands the whole group when that ID is selected.
+func (m *Model) expandableToolEventIDs() []string {
+	items := m.buildChatItems()
+	ids := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	add := func(id string) {
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, item := range items {
+		switch typed := item.(type) {
+		case *recoveredErrorGroupItem:
+			add(typed.expandID)
+		case *explorationGroupItem:
+			for idx := len(typed.events) - 1; idx >= 0; idx-- {
+				if typed.events[idx].ID != "" {
+					add(typed.events[idx].ID)
+					break
+				}
+			}
+		case *toolEventItem:
+			if typed.te.Kind != "result" || typed.te.ID == "" {
+				continue
+			}
+			// Render the compact form only on an explicit keypress. This keeps
+			// the hot per-frame path unchanged while ensuring the selector and
+			// the visible `(ctrl+O ...)` affordance cannot disagree.
+			if strings.Contains(renderToolEvent(typed.te, false), "(ctrl+O to ") {
+				add(typed.te.ID)
+			}
+		}
+	}
+	return ids
+}
+
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 2026-05-26: ESC during a running turn must always cancel the turn,
 	// taking priority over every overlay-dismissal handler below. User
@@ -417,45 +460,37 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+o":
-		// A1 (2026-08-02): replace the global "expand truncated output"
-		// toggle with one-at-a-time semantics. The previous behaviour
-		// flipped m.expandToolOutputs globally — every tool call on the
-		// transcript suddenly rendered its full body, exploding the
-		// viewport height and pushing history out of view (BUG-A).
-		//
-		// New behaviour:
-		//   - Find the LATEST tool event (by toolEvents slice order)
-		//   - If expandedToolID == its ID → clear (collapse it)
-		//   - Otherwise → set expandedToolID to its ID (expand just it)
-		// Only one tool event can be expanded at a time, bounding the
-		// viewport to one extra-full row.
-		if len(m.toolEvents) == 0 {
+		// Keep one-at-a-time expansion, but target rows that actually advertise
+		// hidden detail. The old "latest completed event" rule could select a
+		// later one-line success while an earlier recovered/error group displayed
+		// `(ctrl+O to inspect)`, making that affordance impossible to reach.
+		// Repeated presses walk backward through expandable rows, then collapse.
+		candidates := m.expandableToolEventIDs()
+		if len(candidates) == 0 {
 			return m, nil
 		}
-		// Pick the latest COMPLETED tool event (kind == "result"). Skip
-		// in-flight "start" events — they have no output to expand yet.
-		var latestID string
-		for i := len(m.toolEvents) - 1; i >= 0; i-- {
-			if m.toolEvents[i].Kind == "result" {
-				latestID = m.toolEvents[i].ID
-				break
-			}
-		}
-		if latestID == "" {
-			return m, nil
-		}
-		// Toggle: same ID → collapse; different ID → expand the new one.
 		// P2-2 (2026-08-02): show an info message so the user knows
 		// ctrl+O actually did something. The previous A1 implementation
 		// silently mutated expandedToolID with no visual feedback —
 		// users pressed ctrl+O and nothing appeared to happen if the
 		// latest tool event was already at the bottom of the screen.
+		current := -1
+		for idx, id := range candidates {
+			if id == m.expandedToolID {
+				current = idx
+				break
+			}
+		}
 		var newContent string
-		if m.expandedToolID == latestID {
+		switch {
+		case current == 0:
 			m.expandedToolID = ""
 			newContent = "collapse tool output"
-		} else {
-			m.expandedToolID = latestID
+		case current > 0:
+			m.expandedToolID = candidates[current-1]
+			newContent = "expand tool output (previous)"
+		default:
+			m.expandedToolID = candidates[len(candidates)-1]
 			newContent = "expand tool output (latest)"
 		}
 		// REPLACE the trailing info message instead of appending a new
