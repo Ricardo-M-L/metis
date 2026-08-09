@@ -467,6 +467,15 @@ NOT done in this round (deferred):
   slash_help, input_repeat, arrow_jump, slash_skills, slash_mcp_list,
   double_esc_clear, ctrl_c_quit).
 
+## [0.4.16] - 2026-08-09
+
+### Changed
+
+- The base prompt's language rule now covers internal reasoning: thinking is
+  written in the same language as the reply, which mirrors the user's language
+  (`internal/runtime/prompts/base/03_style.md`). Previously models reasoned in
+  English even when replying in Chinese.
+
 ## [0.4.15] - 2026-08-09
 
 ### Added
@@ -646,7 +655,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.15...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.16...HEAD
+[0.4.16]: https://github.com/Ricardo-M-L/metis/compare/v0.4.15...v0.4.16
 [0.4.15]: https://github.com/Ricardo-M-L/metis/compare/v0.4.14...v0.4.15
 [0.4.14]: https://github.com/Ricardo-M-L/metis/compare/v0.4.13...v0.4.14
 [0.4.13]: https://github.com/Ricardo-M-L/metis/compare/v0.4.12...v0.4.13
