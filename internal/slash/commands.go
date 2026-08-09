@@ -271,7 +271,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 				return "usage: /thinking [show|hide|auto]\n" +
 					"  show — always render thinking fully expanded\n" +
 					"  hide — drop all thinking + redacted_thinking rows\n" +
-					"  auto — collapsed with ctrl+o to expand (default)", SignalNone
+					"  auto — compact live/history preview (default)", SignalNone
 			case "show", "hide", "auto":
 				return "", SignalThinkingDisplay
 			default:

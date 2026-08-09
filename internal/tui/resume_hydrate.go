@@ -25,6 +25,8 @@ package tui
 //
 //   - text block on a user message     → Message{Role: "user"}
 //   - text block on an assistant message → Message{Role: "assistant"}
+//   - thinking block (assistant)        → Message{Role: "thinking"}
+//   - redacted_thinking block           → opaque placeholder row
 //   - tool_use block (assistant)         → ToolEvent{Kind: "start"}
 //   - tool_result block (user)           → upgrade matching ToolEvent
 //                                          to Kind "end" with output
@@ -88,6 +90,26 @@ func (m *Model) hydrateFromLoopHistory() {
 				m.messages = append(m.messages, Message{
 					Role:      role,
 					Content:   blk.Text,
+					Timestamp: tsNext(),
+					ID:        m.nextID(),
+				})
+			case "thinking":
+				if strings.TrimSpace(blk.Text) == "" {
+					continue
+				}
+				m.messages = append(m.messages, Message{
+					Role:      "thinking",
+					Content:   blk.Text,
+					Timestamp: tsNext(),
+					ID:        m.nextID(),
+				})
+			case "redacted_thinking":
+				if blk.Data == "" {
+					continue
+				}
+				m.messages = append(m.messages, Message{
+					Role:      "redacted_thinking",
+					Content:   blk.Data,
 					Timestamp: tsNext(),
 					ID:        m.nextID(),
 				})

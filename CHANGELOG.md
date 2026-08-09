@@ -467,6 +467,32 @@ NOT done in this round (deferred):
   slash_help, input_repeat, arrow_jump, slash_skills, slash_mcp_list,
   double_esc_clear, ctrl_c_quit).
 
+## [0.4.14] - 2026-08-09
+
+### Added
+
+- OpenAI-compatible providers now surface DeepSeek-style
+  `reasoning_content` (with `reasoning` fallback) as live TUI thinking,
+  including non-streaming responses and restored session history.
+- Added `[ui] thinking_display = "show|auto|hide"`; `/thinking show` now
+  changes the active TUI immediately without sending text to the model.
+
+### Changed
+
+- Full thinking display renders a UTF-8-safe live tail to keep the TUI clock
+  responsive during long reasoning traces while retaining the complete trace
+  in conversation history.
+- `/history` now includes provider reasoning, while redacted thinking remains
+  protected behind a non-sensitive placeholder. `/export` continues to omit
+  thinking by design.
+
+### Fixed
+
+- Preserved thinking and redacted-thinking rows across session resume, and
+  replaced the misleading Ctrl+O expansion hint with `/thinking show`.
+- Kept mixed reasoning, answer text, and tool-call deltas in provider order and
+  prevented duplicate output when both compatible reasoning aliases appear.
+
 ## [0.4.13] - 2026-08-09
 
 ### Added
@@ -585,7 +611,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.13...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.14...HEAD
+[0.4.14]: https://github.com/Ricardo-M-L/metis/compare/v0.4.13...v0.4.14
 [0.4.13]: https://github.com/Ricardo-M-L/metis/compare/v0.4.12...v0.4.13
 [0.4.12]: https://github.com/Ricardo-M-L/metis/compare/v0.4.11...v0.4.12
 [0.4.11]: https://github.com/Ricardo-M-L/metis/compare/v0.4.10...v0.4.11

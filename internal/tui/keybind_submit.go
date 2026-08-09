@@ -151,6 +151,53 @@ func (m *Model) isExportCommand(text string) bool {
 	return cmd != nil && cmd.Name == "export"
 }
 
+func isThinkingDisplayCommand(text string) bool {
+	if !strings.HasPrefix(text, "/") {
+		return false
+	}
+	name, _, _ := cut(text[1:], " ")
+	return strings.EqualFold(name, "thinking")
+}
+
+func (m *Model) applyThinkingDisplay(mode string) {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if mode != "show" && mode != "hide" && mode != "auto" {
+		return
+	}
+	m.thinkingDisplay = mode
+	if m.renderCache != nil {
+		m.renderCache.InvalidateAll()
+	}
+	m.messages = append(m.messages, Message{
+		Role:      "info",
+		Content:   "thinking display: " + mode,
+		Timestamp: time.Now(),
+	})
+}
+
+// /thinking changes only local presentation state, so it must work while a
+// turn is streaming. Routing it through SteerInject made the model receive the
+// literal command while the TUI stayed unchanged.
+func (m *Model) handleLocalThinkingDisplay(text string) bool {
+	if !isThinkingDisplayCommand(text) || m.slash == nil {
+		return false
+	}
+	handled, display, sig, args := m.slash.Parse(text)
+	if !handled {
+		return false
+	}
+	m.input.Reset()
+	m.showPalette = false
+	m.palFilter = ""
+	if display != "" {
+		m.messages = append(m.messages, Message{Role: "info", Content: display, Timestamp: time.Now()})
+	}
+	if sig == slash.SignalThinkingDisplay {
+		m.applyThinkingDisplay(args)
+	}
+	return true
+}
+
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
@@ -185,6 +232,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				Timestamp: time.Now(),
 			})
 		}
+		return m, nil
+	}
+	if m.handleLocalThinkingDisplay(text) {
 		return m, nil
 	}
 	// /agents-view is a local, read-only view and is safe to open while the
@@ -674,24 +724,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			hs.Title = "session history (" + m.sessionID + ")"
 			m.activeScreen = hs
 		case slash.SignalThinkingDisplay:
-			// /thinking [show|hide|auto] — flip the transcript-mode
-			// preference for reasoning rows. Args are pre-validated
-			// to one of the three accepted values by the slash handler.
-			arg := strings.TrimSpace(strings.ToLower(args))
-			m.thinkingDisplay = arg
-			// Invalidate the per-row render cache: the change flips
-			// the "collapse / hide / show" branch in buildChatItems,
-			// so previously-cached frames must be re-rendered. Pre-
-			// invalidation the user sees stale folded rows even after
-			// /thinking show until they scroll.
-			if m.renderCache != nil {
-				m.renderCache.InvalidateAll()
-			}
-			m.messages = append(m.messages, Message{
-				Role:      "info",
-				Content:   "thinking display: " + arg,
-				Timestamp: time.Now(),
-			})
+			m.applyThinkingDisplay(args)
 		case slash.SignalTitle:
 			title := strings.TrimSpace(args)
 			if title == "" {

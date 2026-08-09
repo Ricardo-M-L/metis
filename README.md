@@ -289,6 +289,7 @@ match = "git status:*"
 theme = "auto"
 markdown = true
 show_tokens = true
+thinking_display = "auto"   # show=full provider reasoning; auto=compact; hide=off
 
 [ui.performance]
 tick_ms = 40                  # 25fps default; 16=60fps, 100=10fps

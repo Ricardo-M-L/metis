@@ -43,6 +43,24 @@ func TestHistoryScreen_RendersUserAndAssistant(t *testing.T) {
 	}
 }
 
+func TestHistoryScreen_RendersThinkingWithoutLeakingRedactedPayload(t *testing.T) {
+	s := NewHistoryScreen([]llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+		{Type: "thinking", Text: "inspect the repository first"},
+		{Type: "redacted_thinking", Data: "SECRET-CIPHER-BYTES"},
+		{Type: "text", Text: "done"},
+	}}}, 80, 24)
+	view := s.View()
+	if !strings.Contains(view, "thinking") || !strings.Contains(view, "inspect the repository first") {
+		t.Fatalf("visible thinking missing: %s", view)
+	}
+	if !strings.Contains(view, "thinking redacted") {
+		t.Fatalf("redacted placeholder missing: %s", view)
+	}
+	if strings.Contains(view, "SECRET-CIPHER-BYTES") {
+		t.Fatalf("redacted payload leaked: %s", view)
+	}
+}
+
 func TestHistoryScreen_RendersToolCallAndResult(t *testing.T) {
 	s := NewHistoryScreen([]llm.Message{
 		userMsg("read foo"),

@@ -89,6 +89,29 @@ func TestTurnActive_ClosingExportDoesNotQueue(t *testing.T) {
 	}
 }
 
+func TestTurnActive_ThinkingDisplayRunsLocally(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	m.thinkingText = "line 1\nline 2\nline 3\nline 4\nline 5"
+	m.input.SetValue("/thinking show")
+
+	pressEnter(t, m)
+
+	if m.thinkingDisplay != "show" {
+		t.Fatalf("thinkingDisplay = %q, want show", m.thinkingDisplay)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("/thinking must not reach the model: %q", got)
+	}
+	if len(m.queuedPrompts) != 0 || m.input.Value() != "" {
+		t.Fatalf("local command queued or retained input: queue=%+v input=%q", m.queuedPrompts, m.input.Value())
+	}
+	view := m.View().Content
+	if !strings.Contains(view, "line 1") || !strings.Contains(view, "line 5") {
+		t.Fatalf("show mode did not expand live reasoning: %s", view)
+	}
+}
+
 func TestFinalizeTurn_ErrorStillRetainsOrdinaryQueuedPrompt(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.turnActive = true

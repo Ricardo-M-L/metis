@@ -374,11 +374,16 @@ type Rule struct {
 }
 
 type UI struct {
-	Theme        string        `toml:"theme"`
-	Markdown     bool          `toml:"markdown"`
-	ShowTokens   bool          `toml:"show_tokens"`
-	ShowToolJSON bool          `toml:"show_tool_json"`
-	Performance  UIPerformance `toml:"performance"`
+	Theme        string `toml:"theme"`
+	Markdown     bool   `toml:"markdown"`
+	ShowTokens   bool   `toml:"show_tokens"`
+	ShowToolJSON bool   `toml:"show_tool_json"`
+	// ThinkingDisplay controls provider-visible reasoning in the TUI:
+	// "show" renders the full trace, "auto" keeps a compact live/history
+	// preview, and "hide" suppresses it. This never invents hidden model
+	// reasoning; it only affects thinking blocks returned by the provider.
+	ThinkingDisplay string        `toml:"thinking_display"`
+	Performance     UIPerformance `toml:"performance"`
 	// StreamlinedOutput enables the CC-style "distillation-resistant"
 	// output mode for `metis run` (non-interactive). Mirrors
 	// claude-code's utils/streamlinedTransform.ts behavior:
@@ -653,10 +658,11 @@ func defaults() *Config {
 			Mode: "default",
 		},
 		UI: UI{
-			Theme:        "auto",
-			Markdown:     true,
-			ShowTokens:   true,
-			ShowToolJSON: false,
+			Theme:           "auto",
+			Markdown:        true,
+			ShowTokens:      true,
+			ShowToolJSON:    false,
+			ThinkingDisplay: "auto",
 			Performance: UIPerformance{
 				TickMs:          40,
 				EventBufferSize: 256,

@@ -39,6 +39,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.Session.AutoCompactMinimumTokens != 50_000 {
 		t.Errorf("AutoCompactMinimumTokens default = %d, want 50000 (DeepSeek-TUI-style absolute floor — prevents Compact churn on small/fresh sessions)", cfg.Session.AutoCompactMinimumTokens)
 	}
+	if cfg.UI.ThinkingDisplay != "auto" {
+		t.Errorf("UI.ThinkingDisplay default = %q, want auto", cfg.UI.ThinkingDisplay)
+	}
 }
 
 // Regression: the security audit's three required denylist patterns must

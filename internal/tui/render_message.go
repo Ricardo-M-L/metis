@@ -27,11 +27,8 @@ import (
 // instead of the raw terminal width.
 // renderMessage prints a single transcript row. expand=true means the
 // caller wants verbose rendering — extended thinking unfolded, otherwise
-// thinking collapses to a one-liner so the chat surface isn't drowned
-// in dim italic. Mirrors claude-code's
-// AssistantThinkingMessage shouldShowFullThinking gate (controlled by
-// transcript-mode + verbose flag there; metis reuses Ctrl+O's
-// expandToolOutputs toggle for both tool output and thinking).
+// thinking keeps a compact preview so the chat surface isn't drowned
+// in dim italic. `/thinking show` or ui.thinking_display="show" expands it.
 // thinkingHistoryWindow is the number of leading lines shown when a
 // historical thinking block is collapsed. Matches the live-stream
 // window (thinkingLiveWindow in chat_items.go) so the visual density
@@ -110,30 +107,9 @@ func renderMessage(msg Message, width int, expand bool) string {
 		}
 		s.WriteString("\n\n")
 	case "thinking":
-		// Extended-thinking trace. 2026-05-21 — switched from "collapse
-		// to one line by default + Ctrl+O to expand" to "always full".
-		//
-		// Why the reversal: the prior collapse-default was added on
-		// 2026-05-10 (image #17) when a noisy model flooded the screen.
-		// But the user reported on 2026-05-21 (session
-		// f460e252-...-1779295464) that long silent-tool-loop turns
-		// (minimax-m2.7 doing 6+ rescue cycles, each generating a full
-		// thinking paragraph) created stacks of one-line collapsed
-		// rows that looked like "compressed mush" with no way to tell
-		// what the model was actually reasoning about. Collapse was
-		// pure visual save (zero token / context impact — see
-		// `expand` param doc) so the trade-off shifted: full thinking
-		// out-of-the-box matches claude-code's
-		// AssistantThinkingMessage default and gives the user a real
-		// window into the model's reasoning during long turns.
-		//
-		// expand parameter retained: callers (Ctrl+O toggle, the
-		// in-progress thinking item, redacted_thinking) still hit
-		// this path and most still pass false. We ignore expand for
-		// the "thinking" body — always render full — but the param
-		// stays in the signature because tests + render-cache key on
-		// it. If the noise complaint comes back, the
-		// re-collapse-by-default switch is a 3-line revert.
+		// Provider-visible reasoning trace. `expand` comes from
+		// ui.thinking_display or `/thinking show`; auto mode keeps a compact
+		// preview so long DeepSeek traces do not bury the final answer.
 		s.WriteString(styleAccent.Render("  " + glyphAsterisk + " "))
 		s.WriteString(styleAccent.Render("thinking"))
 		s.WriteString("\n")
@@ -150,13 +126,9 @@ func renderMessage(msg Message, width int, expand bool) string {
 		}
 		wrapped := xansi.Wrap(msg.Content, bodyW, " /-_.")
 		thinkLines := strings.Split(wrapped, "\n")
-		// 2026-08-01 collapse-by-default (user request): show the FIRST
-		// thinkingHistoryWindow lines as a preview, then a "(ctrl+O to
-		// see N more lines)" affordance. The 2026-05-21 "always full"
-		// behaviour dumped 100+ line reasoning traces into the transcript
-		// and buried the actual answer; DeepSeek-TUI's collapsed
-		// reasoning card is the model here. expand=true (ctrl+O) still
-		// reveals the full text — same affordance as tool outputs.
+		// Auto mode shows the first few lines. Show mode reveals the full
+		// historical block; the live view stays separately bounded for redraw
+		// performance and the complete text appears here once finalized.
 		showLines := thinkLines
 		truncated := false
 		if !expand && len(thinkLines) > thinkingHistoryWindow {
@@ -172,7 +144,7 @@ func renderMessage(msg Message, width int, expand bool) string {
 		if truncated {
 			remaining := len(thinkLines) - thinkingHistoryWindow
 			s.WriteString(railStyle.Render("  ╎ "))
-			s.WriteString(styleMuted.Render(fmt.Sprintf("(ctrl+O to see %d more lines)", remaining)))
+			s.WriteString(styleMuted.Render(fmt.Sprintf("(/thinking show to see %d more lines)", remaining)))
 			s.WriteString("\n")
 		}
 	case "redacted_thinking":

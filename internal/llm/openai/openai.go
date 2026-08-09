@@ -456,11 +456,27 @@ type oaiMessage struct {
 	// validates, and other OpenAI-compatible providers ignore unknown
 	// keys so it doesn't break OpenAI / DeepSeek / Together / Groq.
 	//
-	// Future: extend the Anthropic + OpenAI stream parsers to capture
-	// thinking_delta / reasoning_content_delta as a "thinking"
-	// ContentBlock type, then this field would round-trip the model's
-	// actual chain of thought instead of an empty string. Tracked.
+	// The receive path maps this field to provider-neutral "thinking"
+	// blocks/events, so DeepSeek/Ark/Kimi reasoning is visible in the TUI
+	// and round-trips faithfully on the next tool iteration.
 	ReasoningContent *string `json:"reasoning_content,omitempty"`
+
+	// Reasoning is the newer alias emitted by vLLM/OpenRouter-compatible
+	// Chat Completions endpoints. We accept it on responses but always send
+	// history back through the widely-supported reasoning_content field above.
+	Reasoning *string `json:"reasoning,omitempty"`
+}
+
+// reasoningText normalizes the two Chat Completions reasoning extensions.
+// Some gateways send both aliases with identical bytes, so select the first
+// non-empty value instead of concatenating and showing the trace twice.
+func (m oaiMessage) reasoningText() string {
+	for _, candidate := range []*string{m.ReasoningContent, m.Reasoning} {
+		if candidate != nil && *candidate != "" {
+			return *candidate
+		}
+	}
+	return ""
 }
 
 // oaiContentPart is one element of a multimodal user-message Content
@@ -791,6 +807,12 @@ func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
 		InputTokens:          usage.PromptTokens,
 		OutputTokens:         usage.CompletionTokens,
 		CacheReadInputTokens: cacheReadTokens(usage),
+	}
+	// Reasoning is emitted before visible text/tool calls. Preserving that
+	// chronology lets the shared stream consumer persist [thinking, text, tool]
+	// in exactly the order the model produced it.
+	if reasoning := c.Message.reasoningText(); reasoning != "" {
+		out.Content = append(out.Content, ContentBlock{Type: "thinking", Text: reasoning})
 	}
 	// oaiMessage.Content is `any` (request side may be string OR
 	// content-parts array for multimodal user turns). The response
@@ -1302,6 +1324,13 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 		// Each chunk may contain multiple of these — enqueue all, return first.
 		if len(env.Choices) > 0 {
 			ch := env.Choices[0]
+			// DeepSeek/Ark/Kimi/vLLM reasoning arrives beside ordinary content
+			// in the delta object. Emit it first when a gateway bundles both in
+			// one SSE frame so consumeStream flushes a chronological thinking
+			// block before the visible answer or tool call.
+			if reasoning := ch.Delta.reasoningText(); reasoning != "" {
+				s.pending = append(s.pending, StreamEvent{Type: "thinking_delta", TextDelta: reasoning})
+			}
 			// Stream delta content is always a string in OpenAI SSE
 			// (assistants never stream images). Type-assert to string;
 			// ignore non-string values (defensive — a vendor extension

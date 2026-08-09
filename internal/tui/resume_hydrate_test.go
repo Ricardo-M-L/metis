@@ -109,6 +109,30 @@ func TestHydrateFromLoopHistory_SkipsEmptyText(t *testing.T) {
 	}
 }
 
+func TestHydrateFromLoopHistory_RestoresThinkingBlocks(t *testing.T) {
+	t.Parallel()
+	hist := []llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+		{Type: "thinking", Text: "先分析问题"},
+		{Type: "redacted_thinking", Data: "OPAQUE-CIPHER"},
+		{Type: "text", Text: "最终回答"},
+	}}}
+	m := &Model{loop: makeLoopWithHistory(t, hist), sessionID: "reasoning-resume"}
+	m.hydrateFromLoopHistory()
+
+	if len(m.messages) != 4 {
+		t.Fatalf("messages = %+v", m.messages)
+	}
+	wantRoles := []string{"thinking", "redacted_thinking", "assistant", "info"}
+	for i, role := range wantRoles {
+		if m.messages[i].Role != role {
+			t.Fatalf("message %d role = %q, want %q", i, m.messages[i].Role, role)
+		}
+	}
+	if m.messages[0].Content != "先分析问题" || m.messages[1].Content != "OPAQUE-CIPHER" {
+		t.Fatalf("thinking content not restored: %+v", m.messages[:2])
+	}
+}
+
 func TestHydrateFromLoopHistory_ToolUseAndResult(t *testing.T) {
 	t.Parallel()
 	hist := []llm.Message{

@@ -468,7 +468,7 @@ type Model struct {
 	// thinkingDisplay controls how Message{Role:"thinking"} +
 	// Message{Role:"redacted_thinking"} render in the transcript.
 	// Three values, set via /thinking slash command:
-	//   "auto"   (default) — collapsed thinking with ctrl+o to expand,
+	//   "auto"   (default) — compact live/history preview,
 	//                        🔒 placeholder for redacted blocks
 	//   "show"   — always expanded, never collapse
 	//   "hide"   — skip ALL thinking/redacted_thinking rows entirely
@@ -734,6 +734,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 	// active perf config; both fall back to the cache's own defaults
 	// when the snapshot is zero (tests / fresh installs without TOML).
 	pc := perfConfig()
+	thinkingDisplay := configuredThinkingDisplay(cfg)
 
 	mdl := &Model{
 		ctx:        ctx,
@@ -771,12 +772,13 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		// Sticky-strip selection state — -1 = no selection. Updated by
 		// MouseClickMsg / MouseMotionMsg / MouseReleaseMsg when click
 		// lands in the strip area (msg.Y >= stripStartY).
-		stripSelStart: -1,
-		stripSelEnd:   -1,
-		firstRender:   true,
-		input:         ti,
-		chatList:      cl,
-		stickyBottom:  true,
+		stripSelStart:   -1,
+		stripSelEnd:     -1,
+		firstRender:     true,
+		input:           ti,
+		chatList:        cl,
+		stickyBottom:    true,
+		thinkingDisplay: thinkingDisplay,
 		// 4-level permission ask, matching claude-code's pattern:
 		//   y — allow this once
 		//   a — allow always (whitelist this tool for the session)
@@ -829,13 +831,18 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 			mdl.totalTokens.Restore(c.InputTokens, c.OutputTokens, c.CacheCreateTokens, c.CacheReadTokens)
 		}
 	}
-	// Default thinking display mode = "auto" (collapsed with
-	// ctrl+o-to-expand for normal thinking, 🔒 placeholder for
-	// redacted). User flips it via /thinking show / hide / auto.
-	if mdl.thinkingDisplay == "" {
-		mdl.thinkingDisplay = "auto"
-	}
 	return mdl
+}
+
+func configuredThinkingDisplay(cfg *config.Config) string {
+	if cfg != nil {
+		mode := strings.ToLower(strings.TrimSpace(cfg.UI.ThinkingDisplay))
+		switch mode {
+		case "show", "hide", "auto":
+			return mode
+		}
+	}
+	return "auto"
 }
 
 // SetExternalHooks attaches optional callbacks for features whose state

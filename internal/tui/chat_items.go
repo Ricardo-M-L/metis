@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	xansi "github.com/charmbracelet/x/ansi"
 
@@ -537,6 +538,22 @@ type inProgressThinkingItem struct {
 // short enough that 60+ token/s streams don't drown the viewport.
 const thinkingLiveWindow = 4
 
+// Bound work on every spinner frame. The complete trace remains in
+// m.thinkingText and is rendered from the cached historical message after the
+// stream finishes; the live card only needs a recent, responsive window.
+const thinkingLiveMaxBytes = 16 * 1024
+
+func liveThinkingTail(text string) (string, bool) {
+	if len(text) <= thinkingLiveMaxBytes {
+		return text, false
+	}
+	start := len(text) - thinkingLiveMaxBytes
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	return text[start:], true
+}
+
 func (it *inProgressThinkingItem) Render(width int) string {
 	if it.text == "" {
 		return ""
@@ -559,14 +576,15 @@ func (it *inProgressThinkingItem) Render(width int) string {
 	if bodyW < 20 {
 		bodyW = 20
 	}
-	wrapped := xansi.Wrap(it.text, bodyW, " /-_.")
+	liveText, clipped := liveThinkingTail(it.text)
+	wrapped := xansi.Wrap(liveText, bodyW, " /-_.")
 	lines := strings.Split(wrapped, "\n")
 	// Sliding window: keep only the LAST thinkingLiveWindow lines.
 	// A leading "…" row hints that earlier lines exist; the full
 	// text is preserved on the historical thinking message that
 	// lands after streaming ends (renderMessage::case "thinking").
-	truncated := false
-	if len(lines) > thinkingLiveWindow {
+	truncated := clipped
+	if !it.expand && len(lines) > thinkingLiveWindow {
 		lines = lines[len(lines)-thinkingLiveWindow:]
 		truncated = true
 	}
