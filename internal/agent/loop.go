@@ -16,6 +16,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -1028,11 +1029,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					emit(ctx, out, Event{Kind: EventInfo, Info: "[" + class.String() + "] " + msg})
 				}
 			case RecoveryRetry:
-				// Rate / server / network — single retry with brief
-				// backoff. The loop's outer iteration handles
-				// repeated rate-limit cases; here we just absorb the
-				// transient first 4xx/5xx if it clears immediately.
-				stream, err = l.Provider.Stream(ctx, req)
+				// Providers using transport.RetryWithBackoff already spent
+				// their full retry budget. Do not turn three bounded attempts
+				// into a second immediate three-attempt round. Custom providers
+				// that return a plain transient error still retain this one
+				// loop-level recovery attempt.
+				if !transport.IsRetryExhausted(err) {
+					stream, err = l.Provider.Stream(ctx, req)
+				}
 			}
 			if err != nil {
 				l.Hooks.EmitError(ctx, tc, err)

@@ -9,11 +9,13 @@ package transport
 import (
 	"context"
 	"errors"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -56,9 +58,29 @@ type RetryableError struct {
 func (e *RetryableError) Error() string { return e.Err.Error() }
 func (e *RetryableError) Unwrap() error { return e.Err }
 
+// RetryExhaustedError marks a transient failure whose complete provider-level
+// retry budget has already been consumed. Agent loops use this typed boundary
+// to avoid wrapping a three-attempt provider retry in another whole retry
+// round. Unwrap deliberately preserves errors.Is/errors.As access to both a
+// RetryableError and its underlying network/status error.
+type RetryExhaustedError struct {
+	Err      error
+	Attempts int
+}
+
+func (e *RetryExhaustedError) Error() string { return e.Err.Error() }
+func (e *RetryExhaustedError) Unwrap() error { return e.Err }
+
+// IsRetryExhausted reports whether err crossed a provider retry boundary.
+func IsRetryExhausted(err error) bool {
+	var exhausted *RetryExhaustedError
+	return errors.As(err, &exhausted)
+}
+
 // RetryWithBackoff calls fn until it returns nil, ctx is cancelled, or
-// attempts is exhausted. Backoff = 2^i * 100ms, capped at maxBackoff,
-// with ±20% jitter.
+// attempts is exhausted. Ordinary transient failures back off from 500ms;
+// rate limits without Retry-After back off from 5s. Both use ±20% jitter so
+// a fan-out of sub-agents does not retry in lock-step.
 //
 // Only RetryableError or transient network errors trigger another
 // attempt. 4xx (except 429) and authentication failures bypass retry —
@@ -86,15 +108,25 @@ func RetryWithBackoff(ctx context.Context, attempts int, maxBackoff time.Duratio
 		if i == attempts-1 {
 			break
 		}
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > maxBackoff {
+		backoff := time.Duration(1<<uint(i)) * 500 * time.Millisecond
+		if isRateLimitError(err) {
+			// An RPM bucket normally needs seconds, not the old 100/200ms
+			// loop. Keep this finite: three attempts wait about 15s total,
+			// while the caller's context remains the final upper bound.
+			backoff = time.Duration(1<<uint(i)) * 5 * time.Second
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		} else if backoff > maxBackoff {
 			backoff = maxBackoff
 		}
-		jitter := time.Duration(rand.Int63n(int64(backoff) / 5))
-		if rand.Intn(2) == 0 {
-			backoff -= jitter
-		} else {
-			backoff += jitter
+		if jitterWindow := backoff / 5; jitterWindow > 0 {
+			jitter := time.Duration(rand.Int63n(int64(jitterWindow)))
+			if rand.Intn(2) == 0 {
+				backoff -= jitter
+			} else {
+				backoff += jitter
+			}
 		}
 		// Honor a server Retry-After when the error carries one — wait AT
 		// LEAST that long (no down-jitter), capped at 60s so a hostile or
@@ -112,28 +144,80 @@ func RetryWithBackoff(ctx context.Context, attempts int, maxBackoff time.Duratio
 		case <-time.After(backoff):
 		}
 	}
-	return lastErr
+	return &RetryExhaustedError{Err: lastErr, Attempts: attempts}
 }
 
 func shouldRetry(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Cancellation is a caller decision, not a transport failure. In
+	// particular, don't turn Esc into another outbound request.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
 	var re *RetryableError
 	if errors.As(err, &re) {
 		return true
 	}
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
+	// net/http can surface a server disappearing before headers as bare EOF,
+	// and a truncated response body as UnexpectedEOF. Both are safe to retry
+	// at this layer because provider request bodies are replayable byte slices
+	// and WebFetch only opts in for idempotent GETs.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.EPIPE) {
 		return true
 	}
-	msg := err.Error()
+	// A resolver's "no such host" can be a momentary local DNS outage (the
+	// user's SenseNova trace recovered on the next lookup). Treat DNS errors as
+	// transient here; attempts/context keep a genuinely bad hostname bounded.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		if ne.Timeout() || ne.Temporary() {
+			return true
+		}
+		// Dial/read/write net.OpErrors such as "network is unreachable" and
+		// "connection reset by peer" are transient even when Timeout=false.
+		var opErr *net.OpError
+		if errors.As(err, &opErr) {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
 	for _, code := range []string{" 429:", " 503:", " 529:", " 502:", " 504:"} {
 		if strings.Contains(msg, code) {
 			return true
 		}
 	}
+	for _, transient := range []string{
+		"no such host", "temporary failure in name resolution", "server misbehaving",
+		"network unreachable", "network is unreachable", "connection reset by peer",
+		"connection refused", "broken pipe",
+	} {
+		if strings.Contains(msg, transient) {
+			return true
+		}
+	}
 	return false
+}
+
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, " 429:") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "rate_limit") ||
+		strings.Contains(msg, "rpm exhausted") ||
+		strings.Contains(msg, "too many requests")
 }
 
 // IsRetryableStatus picks the HTTP status codes that can plausibly be

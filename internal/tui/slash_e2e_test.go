@@ -74,6 +74,9 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
 			m := newSlashTestModel(t)
+			if tc.input == "/export" {
+				m.loop.AppendUser("conversation fixture for export")
+			}
 			before := len(m.messages)
 
 			m.input.SetValue(tc.input)
@@ -104,6 +107,7 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 func TestSlashE2E_ExportUsesClaudeStyleResultLane(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
 	m := newSlashTestModel(t)
+	m.loop.AppendUser("conversation fixture for export")
 	before := len(m.messages)
 
 	m.input.SetValue("/export")

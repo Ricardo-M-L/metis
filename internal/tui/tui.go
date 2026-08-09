@@ -201,6 +201,16 @@ type Model struct {
 
 	messages   []Message
 	toolEvents []ToolEvent
+	// recoveryPlanCache keeps the v0.4.12 recovered-error grouping pass off
+	// the 40ms spinner hot path. The plan only changes when the historical
+	// message/tool slices change; elapsed time, spinner glyphs, token counts,
+	// and streaming-tail text do not affect it. Without this cache every frame
+	// rescanned every historical error output (including large Agent/Bash
+	// payloads), which made the elapsed clock visibly skip under busy
+	// multi-agent sessions.
+	recoveryPlanCache      map[*ToolEvent]*recoveredErrorGroupPlan
+	recoveryPlanCacheKey   recoveryPlanCacheKey
+	recoveryPlanCacheValid bool
 	// turnToolEventStart is the first toolEvents index owned by the current
 	// top-level UI turn. Historical tool rows stay mounted for the lifetime of
 	// the session, but recap/learning summaries must only inspect this suffix.

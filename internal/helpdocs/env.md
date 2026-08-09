@@ -52,6 +52,7 @@ respect existing user preferences.
 | `METIS_MODELS_URL` | (built-in catalog) | Custom URL for the model catalog JSON. Used by `metis models` to fetch the list of available models. |
 | `METIS_CATALOG_DISABLE` | off | Set to `1` to skip the remote catalog fetch entirely (use cached / built-in list only). |
 | `METIS_SIMPLE` | off | Set to `1` for a stripped-down system prompt (no advanced sections). Equivalent to `--simple`. |
+| `METIS_OPENAI_MAX_CONCURRENCY` | `4` | Maximum simultaneous OpenAI-compatible requests per provider instance, shared by the parent and sub-agents. Set `0` to disable the gate. |
 
 ## Sessions / persistence
 

@@ -467,6 +467,39 @@ NOT done in this round (deferred):
   slash_help, input_repeat, arrow_jump, slash_skills, slash_mcp_list,
   double_esc_clear, ctrl_c_quit).
 
+## [0.4.13] - 2026-08-09
+
+### Added
+
+- Added `METIS_OPENAI_MAX_CONCURRENCY` to bound shared OpenAI-compatible
+  requests across the parent agent and sub-agents (default: 4).
+
+### Changed
+
+- OpenAI-compatible requests now share concurrency slots, rate-limit cooldowns,
+  and bounded exponential backoff for transient EOF, DNS, connection, and 429
+  failures. WebFetch applies the same bounded recovery policy to transient GET
+  and retryable HTTP failures.
+- TUI agent events are drained in bounded batches, recovered-error rendering is
+  cached, and full-screen agent views continue receiving spinner ticks, keeping
+  elapsed time smooth during large multi-agent runs.
+- The slash-command palette now uses the compact Claude Code-style inline
+  footer layout with a six-row viewport and centered selection scrolling.
+
+### Fixed
+
+- `/export` executes immediately during an active or closing turn instead of
+  entering the prompt queue, prevents duplicate Enter submissions, and no
+  longer reports success for an empty conversation.
+- Preserved queued prompts and image attachments across provider failures and
+  active turns; text-only models no longer receive a bare `[Image #N]` marker
+  or invent a stale desktop path for an unavailable attachment.
+- Propagated truncated HTTP 200 response-body errors into the retry layer and
+  prevented the agent loop from replaying a provider request after its internal
+  retry budget is exhausted.
+- Delayed turn finalization until all trailing agent events are applied, so the
+  last response text is not lost under event backlog.
+
 ## [0.4.12] - 2026-08-08
 
 ### Added
@@ -552,7 +585,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.12...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.13...HEAD
+[0.4.13]: https://github.com/Ricardo-M-L/metis/compare/v0.4.12...v0.4.13
 [0.4.12]: https://github.com/Ricardo-M-L/metis/compare/v0.4.11...v0.4.12
 [0.4.11]: https://github.com/Ricardo-M-L/metis/compare/v0.4.10...v0.4.11
 [0.1.1]: https://github.com/Ricardo-M-L/metis/releases/tag/v0.1.1

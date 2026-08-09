@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
@@ -181,6 +182,24 @@ func TestExportConversationToFile_WritesPrivateReadableText(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("export mode = %o, want 600", got)
+	}
+}
+
+func TestCmdExport_EmptyConversationDoesNotCreateSuccessFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+
+	got := cmdExport(&REPL{Loop: &agent.Loop{}}, "")
+	if !strings.Contains(got, "Failed to export conversation") ||
+		!strings.Contains(got, "no conversation to export") {
+		t.Fatalf("empty export result = %q", got)
+	}
+	paths, err := filepath.Glob(filepath.Join(home, "exports", "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("empty conversation left fake-success exports: %v", paths)
 	}
 }
 

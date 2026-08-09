@@ -1336,7 +1336,11 @@ func cmdExport(r *REPL, args string) string {
 	if r == nil || r.Loop == nil {
 		return exportFailure(fmt.Errorf("no active conversation"))
 	}
-	path, err := exportConversationToFile(r.Loop.History(), args, time.Now())
+	history := r.Loop.History()
+	if len(history) == 0 {
+		return exportFailure(fmt.Errorf("no conversation to export"))
+	}
+	path, err := exportConversationToFile(history, args, time.Now())
 	if err != nil {
 		return exportFailure(err)
 	}

@@ -156,6 +156,62 @@ type recoveredErrorGroupPlan struct {
 	retriedCount int
 }
 
+// recoveryPlanCacheKey is deliberately cheap to compute: it observes slice
+// identity plus the result/error state that EventToolResult mutates in place.
+// It does not hash Output bytes; summing their lengths is enough to catch the
+// production transition from an in-flight start row to its settled result,
+// while avoiding the very full-output scan this cache is meant to remove.
+// Slice endpoint pointers also invalidate same-sized session replacements.
+type recoveryPlanCacheKey struct {
+	messageCount int
+	toolCount    int
+	resultCount  int
+	errorCount   int
+	outputBytes  int
+	firstMessage *Message
+	lastMessage  *Message
+	firstTool    *ToolEvent
+	lastTool     *ToolEvent
+}
+
+func (m *Model) currentRecoveryPlanCacheKey() recoveryPlanCacheKey {
+	key := recoveryPlanCacheKey{
+		messageCount: len(m.messages),
+		toolCount:    len(m.toolEvents),
+	}
+	if len(m.messages) > 0 {
+		key.firstMessage = &m.messages[0]
+		key.lastMessage = &m.messages[len(m.messages)-1]
+	}
+	if len(m.toolEvents) > 0 {
+		key.firstTool = &m.toolEvents[0]
+		key.lastTool = &m.toolEvents[len(m.toolEvents)-1]
+	}
+	for idx := range m.toolEvents {
+		te := &m.toolEvents[idx]
+		if te.Kind == "result" {
+			key.resultCount++
+		}
+		if te.IsError {
+			key.errorCount++
+		}
+		key.outputBytes += len(te.Output)
+	}
+	return key
+}
+
+func (m *Model) cachedRecoveredErrorPlans(merged []timelineItem) map[*ToolEvent]*recoveredErrorGroupPlan {
+	key := m.currentRecoveryPlanCacheKey()
+	if m.recoveryPlanCacheValid && key == m.recoveryPlanCacheKey {
+		return m.recoveryPlanCache
+	}
+	plans := recoveredErrorPlans(merged)
+	m.recoveryPlanCache = plans
+	m.recoveryPlanCacheKey = key
+	m.recoveryPlanCacheValid = true
+	return plans
+}
+
 var recoveryDescriptionStopWords = map[string]struct{}{
 	"a": {}, "again": {}, "an": {}, "and": {}, "check": {}, "command": {},
 	"build": {}, "builds": {}, "data": {}, "dir": {}, "directory": {}, "fetch": {},
@@ -588,7 +644,10 @@ func (it *inProgressStreamingItem) Render(width int) string {
 // re-rendered per frame.
 func (m *Model) buildChatItems() []list.Item {
 	merged := m.timeline()
-	recoveryPlans := recoveredErrorPlans(merged)
+	// Recovery grouping is historical state, not animation state. Cache it so
+	// spinner-only redraws still update elapsed time smoothly without rescanning
+	// every prior error payload 25 times per second.
+	recoveryPlans := m.cachedRecoveredErrorPlans(merged)
 	out := make([]list.Item, 0, len(merged)+2)
 	// thinkingDisplay = "hide" drops every reasoning row from the
 	// transcript and from the live-streaming preview. "show" forces

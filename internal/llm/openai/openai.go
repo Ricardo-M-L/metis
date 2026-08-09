@@ -16,7 +16,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
@@ -67,6 +69,19 @@ type OpenAI struct {
 	// whose name doesn't match a known prefix.
 	ContextWindow int
 	httpClient    *http.Client
+	// requestSlots is shared by the parent loop and every sub-agent using
+	// this provider instance. Holding a slot until a streaming body closes
+	// prevents an 8-agent fan-out from opening 8 simultaneous generations
+	// against the same OpenAI-compatible RPM bucket.
+	requestSlots chan struct{}
+	// rateUntil is a provider-instance-wide 429 cooldown. The parent loop and
+	// all Agent children share this OpenAI pointer, so one RPM response pauses
+	// requests that have not reached the wire yet instead of letting every
+	// child independently discover the same exhausted bucket.
+	rateMu      sync.Mutex
+	rateUntil   time.Time
+	rateLastHit time.Time
+	rateStrikes int
 }
 
 func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, temperature float64) *OpenAI {
@@ -80,13 +95,108 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 		maxTokens = 4096
 	}
 	return &OpenAI{
-		APIKey:      apiKey,
-		BaseURL:     strings.TrimRight(baseURL, "/"),
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
-		httpClient:  transport.NewHTTPClient(timeout, "openai"),
+		APIKey:       apiKey,
+		BaseURL:      strings.TrimRight(baseURL, "/"),
+		Model:        model,
+		MaxTokens:    maxTokens,
+		Temperature:  temperature,
+		httpClient:   transport.NewHTTPClient(timeout, "openai"),
+		requestSlots: newOpenAIRequestSlots(),
 	}
+}
+
+const defaultOpenAIConcurrency = 4
+
+func newOpenAIRequestSlots() chan struct{} {
+	limit := defaultOpenAIConcurrency
+	if raw := strings.TrimSpace(os.Getenv("METIS_OPENAI_MAX_CONCURRENCY")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			limit = n
+		}
+	}
+	if limit <= 0 {
+		return nil
+	}
+	return make(chan struct{}, limit)
+}
+
+func (o *OpenAI) acquireRequestSlot(ctx context.Context) (func(), error) {
+	if o.requestSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case o.requestSlots <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-o.requestSlots }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (o *OpenAI) waitRateCooldown(ctx context.Context) error {
+	for {
+		o.rateMu.Lock()
+		remaining := time.Until(o.rateUntil)
+		o.rateMu.Unlock()
+		if remaining <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			// Go 1.23+ timer channels are synchronous. A failed Stop no
+			// longer implies that a value is available to drain, so a
+			// blocking receive here can park cancellation forever.
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			// Another concurrent 429 may have extended rateUntil while this
+			// timer slept. Loop and re-read instead of firing early.
+		}
+	}
+}
+
+// noteRateLimit records a shared cooldown and returns the delay this request
+// should attach to RetryableError.After. Without a server Retry-After,
+// concurrent RPM failures escalate 5s -> 10s -> 20s -> 30s (capped), which
+// turns an 8-agent burst into one bounded cool-down rather than 8 retry loops.
+func (o *OpenAI) noteRateLimit(after time.Duration) time.Duration {
+	now := time.Now()
+	o.rateMu.Lock()
+	defer o.rateMu.Unlock()
+	if o.rateLastHit.IsZero() || now.Sub(o.rateLastHit) > time.Minute {
+		o.rateStrikes = 0
+	}
+	o.rateLastHit = now
+	o.rateStrikes++
+	if after <= 0 {
+		shift := o.rateStrikes - 1
+		if shift > 3 {
+			shift = 3
+		}
+		after = time.Duration(1<<uint(shift)) * 5 * time.Second
+		if after > 30*time.Second {
+			after = 30 * time.Second
+		}
+	}
+	if after > 60*time.Second {
+		after = 60 * time.Second
+	}
+	if until := now.Add(after); until.After(o.rateUntil) {
+		o.rateUntil = until
+	}
+	// A sibling may already have installed a longer cooldown. Make this
+	// request honor the shared deadline too, not merely its local response.
+	return time.Until(o.rateUntil)
+}
+
+func (o *OpenAI) noteRateSuccess() {
+	now := time.Now()
+	o.rateMu.Lock()
+	if !now.Before(o.rateUntil) {
+		o.rateStrikes = 0
+	}
+	o.rateMu.Unlock()
 }
 
 // MaxContextTokens resolves the active model's context window through
@@ -734,6 +844,11 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
+	release, err := o.acquireRequestSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	var or oaiResp
 	// lastBody holds the most recent 4xx response body so the
@@ -750,6 +865,10 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 			return err
 		}
 		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
+			lastBody = ""
+			if err := o.waitRateCooldown(ctx); err != nil {
+				return err
+			}
 			httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
 			if err != nil {
 				return err
@@ -760,20 +879,28 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 				return err
 			}
 			defer resp.Body.Close()
-			rb, _ := io.ReadAll(resp.Body)
+			rb, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				return o.responseBodyReadError(resp, readErr)
+			}
 			if resp.StatusCode >= 400 {
 				lastBody = string(rb)
 				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
 				if transport.IsRetryableStatus(resp.StatusCode) {
-					return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
+					after := transport.ParseRetryAfter(resp)
+					if resp.StatusCode == http.StatusTooManyRequests {
+						after = o.noteRateLimit(after)
+					}
+					return &transport.RetryableError{Err: httpErr, After: after}
 				}
 				return httpErr
 			}
+			o.noteRateSuccess()
 			return json.Unmarshal(rb, &or)
 		})
 	}
 
-	err := doOnce(o.MaxTokens)
+	err = doOnce(o.MaxTokens)
 	if err != nil {
 		// CC-aligned auto-recovery for 400 context overflow: parse the
 		// input/cap figures out of the failing body, reduce max_tokens
@@ -805,6 +932,10 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
+	release, err := o.acquireRequestSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	var resp *http.Response
 	var lastBody string
@@ -817,6 +948,10 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 			return err
 		}
 		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
+			lastBody = ""
+			if err := o.waitRateCooldown(ctx); err != nil {
+				return err
+			}
 			httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
 			if err != nil {
 				return err
@@ -827,20 +962,28 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 				return err
 			}
 			if resp.StatusCode >= 400 {
-				rb, _ := io.ReadAll(resp.Body)
+				rb, readErr := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
+				if readErr != nil {
+					return o.responseBodyReadError(resp, readErr)
+				}
 				lastBody = string(rb)
 				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
 				if transport.IsRetryableStatus(resp.StatusCode) {
-					return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
+					after := transport.ParseRetryAfter(resp)
+					if resp.StatusCode == http.StatusTooManyRequests {
+						after = o.noteRateLimit(after)
+					}
+					return &transport.RetryableError{Err: httpErr, After: after}
 				}
 				return httpErr
 			}
+			o.noteRateSuccess()
 			return nil
 		})
 	}
 
-	err := openOnce(o.MaxTokens)
+	err = openOnce(o.MaxTokens)
 	if err != nil {
 		if in, cap, ok := transport.ParseContextOverflow(lastBody); ok {
 			if adjusted, retryOK := transport.ComputeAdjustedMaxTokens(in, cap); retryOK {
@@ -855,14 +998,58 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 		}
 	}
 	if err != nil {
+		release()
 		return nil, err
 	}
-	return newOpenAIStream(resp.Body), nil
+	return &requestSlotStream{StreamReader: newOpenAIStream(resp.Body), release: release}, nil
+}
+
+// requestSlotStream retains an OpenAI concurrency slot for the lifetime of a
+// streaming generation, not merely until response headers arrive. Recv errors
+// and Close both release idempotently so early cancellation cannot leak slots.
+type requestSlotStream struct {
+	StreamReader
+	release func()
+	once    sync.Once
+}
+
+func (s *requestSlotStream) releaseOnce() {
+	s.once.Do(s.release)
+}
+
+func (s *requestSlotStream) Recv() (StreamEvent, error) {
+	ev, err := s.StreamReader.Recv()
+	if err != nil {
+		s.releaseOnce()
+	}
+	return ev, err
+}
+
+func (s *requestSlotStream) Close() error {
+	err := s.StreamReader.Close()
+	s.releaseOnce()
+	return err
 }
 
 func (o *OpenAI) setHeaders(r *http.Request) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+o.APIKey)
+}
+
+// responseBodyReadError preserves both transport and HTTP retry semantics.
+// A truncated 200 is retryable through the wrapped io error; a truncated
+// 429/5xx additionally retains Retry-After and the shared 429 cooldown even
+// though its error JSON could not be read completely.
+func (o *OpenAI) responseBodyReadError(resp *http.Response, readErr error) error {
+	err := fmt.Errorf("openai %d response body: %w", resp.StatusCode, readErr)
+	if !transport.IsRetryableStatus(resp.StatusCode) {
+		return err
+	}
+	after := transport.ParseRetryAfter(resp)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		after = o.noteRateLimit(after)
+	}
+	return &transport.RetryableError{Err: err, After: after}
 }
 
 // --- SSE stream ---

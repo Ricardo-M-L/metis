@@ -21,6 +21,57 @@ import (
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
+// Keep one Update call short enough that Bubble Tea can service keyboard and
+// mouse messages while a fast provider is continuously filling eventCh. The
+// previous drain-until-empty loop could stay inside one spinnerTick for the
+// entire response, making the elapsed clock and `/export` appear frozen.
+const maxAgentEventsPerUpdate = 64
+
+// A bounded drain that hit its budget schedules a near-immediate continuation
+// rather than waiting for the normal animation interval. The small delay gives
+// terminal input already queued by Bubble Tea a chance to run between bursts.
+func backlogDrainTickCmd() tea.Msg {
+	time.Sleep(time.Millisecond)
+	return spinnerTick{}
+}
+
+func (m *Model) drainAgentEvents(limit int) int {
+	drained := 0
+	for drained < limit {
+		select {
+		case ev, ok := <-m.eventCh:
+			if !ok {
+				return drained
+			}
+			m.handleAgentEvent(ev)
+			drained++
+		default:
+			return drained
+		}
+	}
+	return drained
+}
+
+// finalizeTurnAfterForwardedEvents closes the cross-channel ordering gap
+// between eventCh and doneCh. Once done has been received, runTurnAsync has
+// finished every eventCh send, so one final bounded drain observes a stable
+// tail. If it does not fit the remaining budget, put done back into its
+// dedicated one-slot channel and continue on the next quick tick.
+func (m *Model) finalizeTurnAfterForwardedEvents(err error, alreadyDrained int) bool {
+	if alreadyDrained < maxAgentEventsPerUpdate {
+		alreadyDrained += m.drainAgentEvents(maxAgentEventsPerUpdate - alreadyDrained)
+	}
+	if alreadyDrained >= maxAgentEventsPerUpdate || len(m.eventCh) > 0 {
+		// doneCh is always a one-slot channel and this call just consumed its
+		// value, so restoring it cannot block. No next turn starts before this
+		// one finalizes.
+		m.doneCh <- err
+		return false
+	}
+	m.finalizeTurn(err)
+	return true
+}
+
 func (m *Model) Init() tea.Cmd {
 	// First-frame blank-screen workaround. bubbletea v2.0.6 reads the
 	// terminal size ONCE at startup via term.GetSize (tea.go:1045) and
@@ -69,14 +120,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		}
 	}()
 
-	// Drain agent events
-	select {
-	case ev, ok := <-m.eventCh:
-		if ok {
-			m.handleAgentEvent(ev)
-		}
-	default:
-	}
+	// Drain one agent event before ordinary input. spinnerTick adds a bounded
+	// batch below, sharing this counter so the whole Update stays capped.
+	agentEventsDrained := m.drainAgentEvents(1)
 
 	// Scheduler ticks are lifecycle messages, not screen input. Handle them
 	// before a full-window picker/modal gets first refusal; otherwise the first
@@ -89,41 +135,44 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 
 	// Active full-window screen (e.g. /history) takes over input + view.
 	// We still let WindowSizeMsg reach the main chat so the underlying
-	// layout is correct when the screen closes; everything else routes
-	// only to the screen.
+	// layout is correct when the screen closes. spinnerTick is lifecycle,
+	// not screen input: it must continue through to event/done draining and
+	// re-arm itself while `/agents-view` or another full-window screen is open.
 	if m.activeScreen != nil {
-		if ws, ok := msg.(tea.WindowSizeMsg); ok {
-			m.width = ws.Width
-			m.height = ws.Height
-			m.activeScreen.Resize(ws.Width, ws.Height)
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.activeScreen, cmd = m.activeScreen.Update(msg)
-		if m.activeScreen.Done() {
-			// Phase C widgets that "report a result" on dismissal
-			// are caught here. Type-assert + apply before clearing
-			// the activeScreen reference. Each new widget that needs
-			// to commit user-chosen state adds a case here.
-			//
-			// applyScreenResult may set m.activeScreen to a NEW screen
-			// (PickerScreen → DetailScreen drill-down). Snapshot the
-			// done screen first, run apply, then only clear if apply
-			// didn't replace it.
-			doneScreen := m.activeScreen
-			extraCmd := m.applyScreenResult(doneScreen)
-			if m.activeScreen == doneScreen {
-				// apply didn't open a follow-up — clear as usual.
-				m.activeScreen = nil
+		if _, lifecycleTick := msg.(spinnerTick); !lifecycleTick {
+			if ws, ok := msg.(tea.WindowSizeMsg); ok {
+				m.width = ws.Width
+				m.height = ws.Height
+				m.activeScreen.Resize(ws.Width, ws.Height)
+				return m, nil
 			}
-			if extraCmd != nil {
-				if cmd != nil {
-					return m, tea.Batch(cmd, extraCmd)
+			var cmd tea.Cmd
+			m.activeScreen, cmd = m.activeScreen.Update(msg)
+			if m.activeScreen.Done() {
+				// Phase C widgets that "report a result" on dismissal
+				// are caught here. Type-assert + apply before clearing
+				// the activeScreen reference. Each new widget that needs
+				// to commit user-chosen state adds a case here.
+				//
+				// applyScreenResult may set m.activeScreen to a NEW screen
+				// (PickerScreen → DetailScreen drill-down). Snapshot the
+				// done screen first, run apply, then only clear if apply
+				// didn't replace it.
+				doneScreen := m.activeScreen
+				extraCmd := m.applyScreenResult(doneScreen)
+				if m.activeScreen == doneScreen {
+					// apply didn't open a follow-up — clear as usual.
+					m.activeScreen = nil
 				}
-				return m, extraCmd
+				if extraCmd != nil {
+					if cmd != nil {
+						return m, tea.Batch(cmd, extraCmd)
+					}
+					return m, extraCmd
+				}
 			}
+			return m, cmd
 		}
-		return m, cmd
 	}
 
 	switch msg := msg.(type) {
@@ -590,20 +639,19 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 			m.executePermission("n")
 		}
 
-		// Drain any agent events that landed since the last tick. The
-		// previous code only popped one event per tick, which made bursty
-		// streams (text_delta + tool_use back-to-back) lag visibly.
-		for drained := false; !drained; {
-			select {
-			case ev, ok := <-m.eventCh:
-				if ok {
-					m.handleAgentEvent(ev)
-				} else {
-					drained = true
-				}
-			default:
-				drained = true
-			}
+		// Drain a bounded batch. Draining until empty starved Bubble Tea's
+		// input queue whenever a provider produced deltas faster than this
+		// loop could observe an empty channel.
+		if agentEventsDrained < maxAgentEventsPerUpdate {
+			agentEventsDrained += m.drainAgentEvents(maxAgentEventsPerUpdate - agentEventsDrained)
+		}
+		// When the budget was exhausted, do not consume doneCh yet: the
+		// producer sends done only after forwarding every event, so a ready
+		// done alongside buffered events must wait until their tail is
+		// applied. Schedule a quick continuation instead of the 40ms
+		// animation cadence.
+		if agentEventsDrained == maxAgentEventsPerUpdate || len(m.eventCh) > 0 {
+			return m, backlogDrainTickCmd
 		}
 
 		// Check turn completion BEFORE deciding to continue ticking — the
@@ -613,7 +661,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		select {
 		case err, ok := <-m.doneCh:
 			if ok {
-				m.finalizeTurn(err)
+				if !m.finalizeTurnAfterForwardedEvents(err, agentEventsDrained) {
+					return m, backlogDrainTickCmd
+				}
 			}
 		default:
 		}

@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -81,12 +82,47 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(cctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "metis/0.1 (+local)")
-	resp, err := client.Do(req)
+	var (
+		status       string
+		statusCode   int
+		responseHead http.Header
+		body         []byte
+		bodyComplete bool
+	)
+	err := transport.RetryWithBackoff(cctx, 3, 0, func() error {
+		// Clear the prior attempt before dialing. If this attempt dies before
+		// headers, the final error must remain visible rather than accidentally
+		// returning an older 503 body as though it were the last response.
+		status = ""
+		statusCode = 0
+		responseHead = nil
+		body = nil
+		bodyComplete = false
+		// A fresh request is required for each retry. GET has no body and is
+		// idempotent, so replay is safe after EOF/DNS/reset/read truncation.
+		req, err := http.NewRequestWithContext(cctx, "GET", url, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "metis/0.1 (+local)")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		status, statusCode = resp.Status, resp.StatusCode
+		responseHead = resp.Header.Clone()
+		body, err = io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+		_ = resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		bodyComplete = true
+		if transport.IsRetryableStatus(resp.StatusCode) {
+			httpErr := fmt.Errorf("webfetch %d: %s", resp.StatusCode, transport.Truncate(string(body), 500))
+			return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
+		}
+		return nil
+	})
 	if err != nil {
 		// Clean up the SSRF block message — the wrapped DNSError /
 		// net.OpError makes it noisy. errors.Is unwraps to ErrBlocked.
@@ -99,11 +135,13 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 				}, nil
 			}
 		}
-		return nil, err
+		// A fully-read final HTTP response remains useful evidence (status +
+		// provider body) even when all retryable attempts were exhausted.
+		// Transport/read failures have no trustworthy body and stay errors.
+		if statusCode == 0 || !bodyComplete {
+			return nil, err
+		}
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
 	truncatedSuffix := ""
 	if len(body) >= maxBytes {
 		truncatedSuffix = "\n\n[truncated at " + bytesString(maxBytes) + "]"
@@ -124,7 +162,7 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	//     crush's pattern).
 	//   text/* / application/json / fallback → original string-body
 	//     return path (unchanged).
-	ct := resp.Header.Get("Content-Type")
+	ct := responseHead.Get("Content-Type")
 	mediaType, _, _ := mime.ParseMediaType(ct)
 	mediaType = strings.ToLower(mediaType)
 
@@ -151,7 +189,7 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 			// with raw bytes — surface the error cleanly.
 			return &tools.Result{
 				Output: fmt.Sprintf("HTTP %s\n[binary content (%s, %s) suppressed — failed to save: %v]",
-					resp.Status, hintMime, bytesString(len(body)), saveErr),
+					status, hintMime, bytesString(len(body)), saveErr),
 				IsError: true,
 			}, nil
 		}
@@ -161,18 +199,18 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 				"If the model has vision capability and this is an image, "+
 				"Read will surface it as an image block; otherwise it will be "+
 				"reported as binary.",
-			resp.Status, hintMime, bytesString(len(body)), savedPath,
+			status, hintMime, bytesString(len(body)), savedPath,
 		)
 		return &tools.Result{
 			Output:  summary + truncatedSuffix,
-			IsError: resp.StatusCode >= 400,
+			IsError: statusCode >= 400,
 		}, nil
 	}
 
 	out := string(body)
 	return &tools.Result{
-		Output:  "HTTP " + resp.Status + "\n" + out + truncatedSuffix,
-		IsError: resp.StatusCode >= 400,
+		Output:  "HTTP " + status + "\n" + out + truncatedSuffix,
+		IsError: statusCode >= 400,
 	}, nil
 }
 

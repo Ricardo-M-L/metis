@@ -45,6 +45,20 @@ func splitOffImageBlocks(blocks []llm.ContentBlock) (int, []llm.ContentBlock) {
 	return stripped, out
 }
 
+// appendImageWarningOnce prevents key-repeat / repeated Enter from filling the
+// transcript with the same preflight message while the attachment remains in
+// the editor. Refreshing the timestamp is unnecessary: the warning describes
+// unchanged state, and retaining its original position keeps the chat stable.
+func (m *Model) appendImageWarningOnce(content string) {
+	if n := len(m.messages); n > 0 {
+		last := m.messages[n-1]
+		if last.Role == "warning" && last.Content == content {
+			return
+		}
+	}
+	m.messages = append(m.messages, Message{Role: "warning", Content: content, Timestamp: time.Now()})
+}
+
 // openBodyScreen wraps screen.NewBodyScreen with a Resize so tests
 // (which never receive a real tea.WindowSizeMsg) and the cold-open
 // path both render with the right dimensions on the first frame. Real
@@ -93,9 +107,84 @@ var modalCommands = map[string]bool{
 	"desktop":     true,
 }
 
+// promotePaletteSelection applies Enter's palette-selection semantics to the
+// submitted text. It deliberately runs before turn-state routing so commands
+// selected while an agent is busy behave exactly like commands selected while
+// idle. Exact command names are never replaced, even when the cursor points at
+// a different palette row.
+func (m *Model) promotePaletteSelection(text string) string {
+	if !m.showPalette || len(m.palMatched) == 0 || !strings.HasPrefix(text, "/") {
+		return text
+	}
+
+	typedName, restArgs, hasArgs := cut(text[1:], " ")
+	exactREPL := m.cmds != nil && m.cmds.Get(typedName) != nil
+	exactSlash := false
+	if m.slash != nil {
+		_, exactSlash = m.slash.Get(typedName)
+	}
+	if exactREPL || exactSlash {
+		return text
+	}
+
+	cursor := m.palCursor
+	if cursor < 0 || cursor >= len(m.palMatched) {
+		cursor = 0
+	}
+	promoted := "/" + m.palMatched[cursor].Name
+	if hasArgs {
+		promoted += " " + restArgs
+	}
+	return promoted
+}
+
+// isExportCommand resolves aliases through the REPL registry rather than
+// comparing raw text. Export is intentionally the only command dispatched by
+// handleSubmit before the active-turn steering branch: it is read-only with
+// respect to the live loop and its history snapshot is concurrency-safe.
+func (m *Model) isExportCommand(text string) bool {
+	if m.cmds == nil || !strings.HasPrefix(text, "/") {
+		return false
+	}
+	name, _, _ := cut(text[1:], " ")
+	cmd := m.cmds.Get(name)
+	return cmd != nil && cmd.Name == "export"
+}
+
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
+		return m, nil
+	}
+	// Resolve the highlighted slash-palette entry before any mid-turn
+	// routing. Previously this happened only after the turnActive branch,
+	// so `/expo` + Enter while a turn was closing was treated as literal
+	// model input and queued instead of invoking `/export`.
+	text = m.promotePaletteSelection(text)
+
+	// /export is a local snapshot operation. Loop.History returns a locked
+	// copy, so it is safe to run while the provider/tool loop is active (or
+	// in the one-frame window where the loop has closed steering but the TUI
+	// has not received doneCh yet). Handle it before generic steering: sending
+	// `/export` to the model made a closing/error turn retain it forever in the
+	// ordinary prompt queue. Resetting the editor first also makes key-repeat
+	// Enter events idempotent: subsequent empty submits are no-ops.
+	if m.isExportCommand(text) {
+		m.input.Reset()
+		m.showPalette = false
+		m.palFilter = ""
+		m.stickyBottom = true
+		m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+
+		name, args, _ := cut(text[1:], " ")
+		cmd := m.cmds.Get(name)
+		if output := cmd.Handler(m.asREPL(), args); output != "" {
+			m.messages = append(m.messages, Message{
+				Role:      classifyREPLOutput(output),
+				Content:   output,
+				Timestamp: time.Now(),
+			})
+		}
 		return m, nil
 	}
 	// /agents-view is a local, read-only view and is safe to open while the
@@ -119,6 +208,23 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// This avoids racing a second runTurnAsync goroutine on doneCh while
 	// letting follow-up instructions affect work that is already running.
 	if m.turnActive {
+		// A text steer cannot carry multimodal ContentBlocks. The previous
+		// path injected the literal "[Image #N]" into the running loop,
+		// reset the editor, and left the model to invent a filesystem path.
+		// Preserve both editor text and imagePaste until the active turn ends;
+		// the next Enter then follows the normal vision-aware submit path.
+		if len(m.imagePaste) > 0 {
+			model := m.model
+			if m.loop != nil && m.loop.Model != "" {
+				model = m.loop.Model
+			}
+			hint := "image kept — wait for the running turn to finish (or press Esc), then press Enter again"
+			if m.loop != nil && m.loop.Provider != nil && !pubprov.ProviderSupportsVision(m.loop.Provider) {
+				hint = fmt.Sprintf("image kept — current model (%s) is text-only. After this turn, copy/cut the prompt, run /model, then paste it back; the cached [Image #N] stays attached", model)
+			}
+			m.appendImageWarningOnce(hint)
+			return m, nil
+		}
 		// Steering (Task #78) + slash-during-steer (Task #87): mid-turn
 		// input is injected into the agent loop and folded into the next
 		// iteration's user message. Slash classification:
@@ -136,7 +242,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		//     Fixing that requires running the signal-overlay path
 		//     without re-entering runTurnAsync, which is a separate
 		//     refactor.
-		raw := strings.TrimSpace(m.input.Value())
+		raw := text
 		if raw == "" {
 			return m, nil
 		}
@@ -267,31 +373,6 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// plain user prompt. Priority field is intentionally dropped
 		// here — we already chose to ignore it out-of-turn.
 		text = body
-	}
-
-	// claude-code parity: when the palette is open with at least one
-	// match, treat Enter as "select the highlighted candidate then
-	// submit". Without this, typing /effo + Enter dispatches a literal
-	// /effo, which fails as "unknown: /effo — try /help" — even though
-	// the palette below the input is showing /effort highlighted.
-	// Only auto-promote when the typed name is NOT itself a registered
-	// command (so /help typed verbatim still goes to /help, even if the
-	// cursor happened to land on /history).
-	if m.showPalette && len(m.palMatched) > 0 && strings.HasPrefix(text, "/") {
-		typedName, restArgs, hasArgs := cut(text[1:], " ")
-		exactREPL := m.cmds.Get(typedName) != nil
-		_, exactSlash := m.slash.Get(typedName)
-		if !exactREPL && !exactSlash {
-			cursor := m.palCursor
-			if cursor < 0 || cursor >= len(m.palMatched) {
-				cursor = 0
-			}
-			promoted := "/" + m.palMatched[cursor].Name
-			if hasArgs {
-				promoted += " " + restArgs
-			}
-			text = promoted
-		}
 	}
 
 	m.input.Reset()
@@ -457,12 +538,6 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					m.messages = append(m.messages, Message{Role: "error", Content: "clear: " + err.Error(), Timestamp: time.Now()})
 				}
 				return m, nil
-			}
-			// Claude Code keeps the `/export` invocation visible directly
-			// above its `⎿ Conversation exported to: …` result. Other Metis
-			// slash commands retain their existing compact behavior.
-			if cmd.Name == "export" {
-				m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
 			}
 			repl := m.asREPL()
 			output := cmd.Handler(repl, args)
@@ -922,26 +997,32 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 		}
 		blocks = append(blocks, atFileBlocks...)
+		// Pasted attachments are all-or-nothing. If a cached file vanished
+		// or failed preprocessing, do not send the generated local-path
+		// fallback as though it were the image. That reproduces the stale
+		// Desktop-path failure from the user's session and then clears the
+		// only attachment mapping that could recover it. Keep both editor
+		// and side-table intact so a re-paste/retry is lossless.
+		if len(errs) > 0 {
+			m.input.SetValue(text)
+			m.appendImageWarningOnce("image not sent — prompt and cached attachment(s) are kept: " + strings.Join(errs, "; "))
+			return m, nil
+		}
 
-		// P2 (2026-05-18) — vision capability gate. If the active
-		// provider doesn't advertise vision support, strip image
-		// blocks and warn ONCE rather than send a request the model
-		// will reject with a cryptic 400. crush parity:
-		// filterFileParts() drops non-text on non-vision providers
-		// silently. We're slightly louder: a one-line warning so the
-		// user knows the image didn't reach the model.
+		// Vision capability gate. Never strip the image and submit the text
+		// remainder: that leaves a visible [Image #N] with no corresponding
+		// bytes and invites the model to guess a stale local path. Keep the
+		// editor + cached image intact so /model followed by Enter sends the
+		// original attachment without another paste.
 		if m.loop != nil && m.loop.Provider != nil && !pubprov.ProviderSupportsVision(m.loop.Provider) {
-			stripped, kept := splitOffImageBlocks(blocks)
+			stripped, _ := splitOffImageBlocks(blocks)
 			if stripped > 0 {
-				m.messages = append(m.messages, Message{
-					Role: "warning",
-					Content: fmt.Sprintf(
-						"image: %d block(s) dropped — current model (%s) doesn't accept vision input. Switch to a vision-capable model (e.g. claude-sonnet, gpt-4o) and re-paste.",
-						stripped, m.loop.Model,
-					),
-					Timestamp: time.Now(),
-				})
-				blocks = kept
+				m.input.SetValue(text)
+				m.appendImageWarningOnce(fmt.Sprintf(
+					"image not sent — current model (%s) is text-only. Prompt and %d image(s) are kept. Copy/cut the prompt, run /model, then paste it back; cached [Image #N] stays attached.",
+					m.loop.Model, stripped,
+				))
+				return m, nil
 			}
 		}
 		m.loop.AppendUserBlocks(blocks)

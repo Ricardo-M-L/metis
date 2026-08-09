@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -9,6 +11,98 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
+
+func TestTurnActive_ExportRunsLocallyOnce(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	m := newSlashTestModel(t)
+	m.loop.AppendUser("conversation to export")
+	m.turnActive = true
+	before := len(m.messages)
+	m.input.SetValue("/export")
+
+	pressEnter(t, m)
+
+	if len(m.queuedPrompts) != 0 {
+		t.Fatalf("mid-turn /export must not enter the prompt queue: %+v", m.queuedPrompts)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("mid-turn /export must not be sent to the model: %q", got)
+	}
+	if len(m.messages) != before+2 {
+		t.Fatalf("/export appended %d rows, want invocation + result", len(m.messages)-before)
+	}
+	invocation := m.messages[len(m.messages)-2]
+	if invocation.Role != "user" || invocation.Content != "/export" {
+		t.Fatalf("export invocation = %+v", invocation)
+	}
+	result := m.messages[len(m.messages)-1]
+	if result.Role != "command-result" || !strings.HasPrefix(result.Content, "Conversation exported to: ") {
+		t.Fatalf("export result = %+v", result)
+	}
+	path := strings.TrimPrefix(result.Content, "Conversation exported to: ")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("exported transcript %q: %v", path, err)
+	}
+
+	// A held/repeated Enter arrives after handleSubmit reset the editor. It
+	// must not create another export row or queue a synthetic empty command.
+	pressEnter(t, m)
+	if len(m.messages) != before+2 || len(m.queuedPrompts) != 0 {
+		t.Fatalf("repeated Enter duplicated export: messages=%d queue=%+v", len(m.messages)-before, m.queuedPrompts)
+	}
+}
+
+func TestTurnActive_ClosingExportDoesNotQueue(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	m := newSlashTestModel(t)
+	m.loop.AppendUser("finish now")
+	out := make(chan agent.Event, 64)
+	if err := m.loop.Run(m.ctx, out); err != nil {
+		t.Fatalf("closing test loop: %v", err)
+	}
+	close(out)
+
+	// Reproduce the screenshot's stale frame: loop steering is closed but the
+	// TUI has not consumed doneCh and still reports an active turn.
+	m.turnActive = true
+	for _, r := range "/expo" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	if !m.showPalette || len(m.palMatched) == 0 || m.palMatched[0].Name != "export" {
+		t.Fatalf("precondition: /expo should select export, matches=%+v", m.palMatched)
+	}
+	before := len(m.messages)
+
+	pressEnter(t, m)
+
+	if len(m.queuedPrompts) != 0 {
+		t.Fatalf("closing-turn /expo selection must not queue: %+v", m.queuedPrompts)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("closing-turn export must not reach steering: %q", got)
+	}
+	if len(m.messages) != before+2 || m.messages[len(m.messages)-2].Content != "/export" {
+		t.Fatalf("palette export did not execute exactly once: %+v", m.messages[before:])
+	}
+	if !strings.HasPrefix(m.messages[len(m.messages)-1].Content, "Conversation exported to: ") {
+		t.Fatalf("missing export success: %+v", m.messages[len(m.messages)-1])
+	}
+}
+
+func TestFinalizeTurn_ErrorStillRetainsOrdinaryQueuedPrompt(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	m.enqueueQueuedItem("retry this work when connectivity returns", QueuePriorityNext)
+
+	m.finalizeTurn(errors.New("provider EOF"))
+
+	if len(m.queuedPrompts) != 1 || m.queuedPrompts[0].Text != "retry this work when connectivity returns" {
+		t.Fatalf("error completion must preserve ordinary queued work: %+v", m.queuedPrompts)
+	}
+	if m.queuePending {
+		t.Fatal("error completion must not auto-submit an ordinary queued prompt")
+	}
+}
 
 // TestTurnActive_AcceptsTyping — pre-fix: handleKey gated all keys
 // behind `if m.turnActive { ... return m, nil }`, so the user couldn't

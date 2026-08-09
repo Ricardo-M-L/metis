@@ -142,68 +142,65 @@ func renderTaskPanel(m *Model) string {
 	return s.String()
 }
 
-// renderPalette draws the live slash-command suggestion box. Inspired by
-// claude-code's "/" popup: a small bordered list of matches that filters
-// as the user types, with the highlighted row marked by a "▸". We cap
-// at paletteMaxRows so a long match list doesn't fill the terminal.
-const paletteMaxRows = 8
+// renderPalette mirrors Claude Code's PromptInputFooterSuggestions: a compact,
+// borderless two-column list below the input. Claude Code shows at most six
+// rows in the normal prompt footer, centers the window around the selection,
+// and relies on color/dimming rather than a pointer glyph or a "N more" row.
+const paletteMaxRows = 6
 
 func renderPalette(m *Model) string {
 	var s strings.Builder
-	// Adaptive description budget: terminal width minus the box chrome
-	// ("  │ ▸ /<name> "), capped at 80 so on ultra-wide screens we
-	// don't render absurdly long descriptions. Falls back to 40 when
-	// width isn't known yet.
 	termW := m.width
 	if termW <= 0 {
 		termW = 80
 	}
-	const namePad = 12 // "/<10-char name> "
-	const chromeW = 8  // "  │ ▸ " + trailing space
-	descBudget := termW - chromeW - namePad - 4
-	if descBudget < 20 {
-		descBudget = 20
-	}
-	if descBudget > 80 {
-		descBudget = 80
-	}
-
-	s.WriteString(styleMuted.Render("  ┌─ slash commands ") + styleMuted.Render("─────────────────────────") + "\n")
-
 	if len(m.palMatched) == 0 {
-		s.WriteString(styleMuted.Render("  │ ") + styleErr.Render("no match for /"+m.palFilter) + "\n")
-		s.WriteString(styleMuted.Render("  └────────────────────────────────────────────") + "\n")
-		return s.String()
+		return ""
 	}
 
 	rows := m.palMatched
 	start := 0
 	if len(rows) > paletteMaxRows {
-		if m.palCursor >= paletteMaxRows {
-			start = m.palCursor - paletteMaxRows + 1
+		// Same centered sliding window as Claude Code:
+		// selected - floor(maxVisible/2), clamped to both ends.
+		start = m.palCursor - paletteMaxRows/2
+		if start < 0 {
+			start = 0
+		}
+		maxStart := len(rows) - paletteMaxRows
+		if start > maxStart {
+			start = maxStart
 		}
 		end := start + paletteMaxRows
-		if end > len(rows) {
-			end = len(rows)
-			start = end - paletteMaxRows
-		}
 		rows = rows[start:end]
+	}
+
+	// Claude Code keeps the command-name column stable while filtering. Use
+	// every registered command for the width, capped at 40% of the terminal so
+	// descriptions retain useful room on narrow panes.
+	nameColumn := 0
+	for _, cmd := range m.cmds.All() {
+		if width := lipgloss.Width("/" + cmd.Name); width > nameColumn {
+			nameColumn = width
+		}
+	}
+	nameColumn += 5
+	maxNameColumn := termW * 2 / 5
+	if maxNameColumn < 12 {
+		maxNameColumn = 12
+	}
+	if nameColumn > maxNameColumn {
+		nameColumn = maxNameColumn
+	}
+	descBudget := termW - nameColumn - 4
+	if descBudget < 0 {
+		descBudget = 0
 	}
 
 	for i, cmd := range rows {
 		idx := start + i
-		marker := "  "
-		if idx == m.palCursor {
-			marker = styleAccent.Render("▸ ")
-		}
-		s.WriteString(styleMuted.Render("  │ "))
-		s.WriteString(marker)
-		name := fmt.Sprintf("/%-10s ", cmd.Name)
-		if idx == m.palCursor {
-			s.WriteString(styleSelected.Render(name))
-		} else {
-			s.WriteString(styleText.Render(name))
-		}
+		name := truncateCells("/"+cmd.Name, nameColumn-1)
+		name += strings.Repeat(" ", max(0, nameColumn-lipgloss.Width(name)))
 		// Phase D: when the command opens an interactive widget, swap
 		// the static description for a "→ widget hint" so the user
 		// knows pressing Enter launches a UI rather than dumping text.
@@ -212,17 +209,20 @@ func renderPalette(m *Model) string {
 		if hint := widgetHint(cmd.Name); hint != "" {
 			desc = hint
 		}
-		if len(desc) > descBudget {
-			desc = desc[:descBudget-1] + "…"
+		desc = strings.Join(strings.Fields(desc), " ")
+		if descBudget > 0 {
+			desc = truncateCells(desc, descBudget)
+		} else {
+			desc = ""
 		}
-		s.WriteString(styleMuted.Render(desc))
+		row := "  " + name + desc
+		if idx == m.palCursor {
+			s.WriteString(styleAccent.Render(row))
+		} else {
+			s.WriteString(styleMuted.Render(row))
+		}
 		s.WriteString("\n")
 	}
-	if len(m.palMatched) > paletteMaxRows {
-		s.WriteString(styleMuted.Render(fmt.Sprintf("  │ … %d more (↑↓ to scroll)\n",
-			len(m.palMatched)-paletteMaxRows)))
-	}
-	s.WriteString(styleMuted.Render("  └────────────────────────────────────────────") + "\n")
 	return s.String()
 }
 
