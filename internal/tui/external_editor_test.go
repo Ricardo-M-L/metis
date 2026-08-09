@@ -57,3 +57,18 @@ func TestApplyExternalEditorResult_ErrorSurfaced(t *testing.T) {
 		t.Errorf("expected role=error; got %q", last.Role)
 	}
 }
+
+func TestConfigSlashReturnsManagedExecCommand(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	m := newSlashTestModel(t)
+	m.input.SetValue("/config")
+	cmd := pressEnter(t, m)
+	if cmd == nil {
+		t.Fatal("/config must return a Bubble Tea managed editor command")
+	}
+	for _, msg := range m.messages {
+		if strings.Contains(msg.Content, "config updated") || strings.Contains(msg.Content, "config saved") {
+			t.Fatalf("/config reported success before editor exited: %+v", msg)
+		}
+	}
+}

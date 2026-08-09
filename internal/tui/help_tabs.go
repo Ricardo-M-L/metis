@@ -62,7 +62,7 @@ func (m *Model) helpGeneralRows() []screen.HelpRow {
 // helpCommandsRows — every registered REPL command sorted alphabetically.
 // Long list, scrollable. Mirrors claude-code's "commands" tab (image #8).
 func (m *Model) helpCommandsRows() []screen.HelpRow {
-	all := m.cmds.All()
+	all := m.commandCatalog()
 	// Dedup by canonical name (aliases share the underlying entry).
 	seen := map[string]bool{}
 	type entry struct{ name, desc string }
@@ -90,29 +90,28 @@ func (m *Model) helpCommandsRows() []screen.HelpRow {
 	return rows
 }
 
-// helpCustomCommandsRows — bundled + user-installed skills surface as
-// "custom commands" to mirror claude-code's "custom-commands" tab
-// (image #9). Each skill becomes a /<name> the user can invoke via
-// the Skill tool.
+// helpCustomCommandsRows lists the actual user/project-authored slash
+// commands loaded from ~/.metis/commands and .metis/commands. Skills are
+// tools, not slash commands, and advertising them as /<skill> made /help
+// promise commands that the dispatcher could never resolve.
 func (m *Model) helpCustomCommandsRows() []screen.HelpRow {
 	rows := []screen.HelpRow{
-		{Heading: "Custom commands (skills)"},
-		{Value: "Bundled + user-installed skills available via the Skill tool."},
-		{Value: "Drop a SKILL.md under ~/.metis/skills/ to add your own."},
+		{Heading: "Custom commands"},
+		{Value: "Loaded from ~/.metis/commands/ and .metis/commands/."},
+		{Value: "Drop a Markdown prompt template there to add your own."},
 		{},
 	}
-	list, err := loadSkillCatalog(m.loop, m.skillDir)
-	if err != nil || len(list) == 0 {
-		rows = append(rows, screen.HelpRow{Value: "(no skills loaded)"})
+	list := m.customCommandCatalog()
+	if len(list) == 0 {
+		rows = append(rows, screen.HelpRow{Value: "(no custom commands loaded)"})
 		return rows
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-	for _, sk := range list {
-		desc := sk.Description
+	for _, cmd := range list {
+		desc := cmd.Description
 		if desc == "" {
 			desc = "(no description)"
 		}
-		rows = append(rows, screen.HelpRow{Key: "/" + sk.Name, Value: desc})
+		rows = append(rows, screen.HelpRow{Key: "/" + cmd.Name, Value: desc})
 	}
 	return rows
 }

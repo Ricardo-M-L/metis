@@ -152,15 +152,34 @@ func (a *Anthropic) ModelID() string { return a.Model }
 // in practice the catalog path always answers; the prefix list is
 // retained only as the cold-cache / offline fallback.
 func (a *Anthropic) SupportsVision() bool {
+	return SupportsVisionModel(a.Model)
+}
+
+// SupportsVisionModel is the key-free capability lookup used by UI model
+// pickers before a provider client has been constructed.
+func SupportsVisionModel(model string) bool {
 	// Tier 1 — models.dev catalog.
 	if cli := catalog.Default(); cli != nil {
-		if supported, found := cli.LookupVisionByModelID(a.Model); found {
+		if supported, found := cli.LookupVisionByModelID(model); found {
 			return supported
 		}
 	}
 
 	// Tier 2 — prefix whitelist (cold-cache / offline fallback).
-	m := strings.ToLower(a.Model)
+	m := strings.ToLower(strings.TrimSpace(model))
+	// Bedrock wraps Anthropic model IDs as either
+	// `anthropic.claude-*` or `<geo>.anthropic.claude-*` (for example
+	// `us.anthropic.claude-sonnet-4-5-...-v1:0`). Normalize that routing
+	// prefix before applying the same cold-cache fallback used by the direct
+	// Anthropic and Vertex transports. Catalog hits above still win.
+	if strings.HasPrefix(m, "anthropic.") {
+		m = strings.TrimPrefix(m, "anthropic.")
+	} else if firstDot := strings.IndexByte(m, '.'); firstDot > 0 {
+		rest := m[firstDot+1:]
+		if strings.HasPrefix(rest, "anthropic.") {
+			m = strings.TrimPrefix(rest, "anthropic.")
+		}
+	}
 	switch {
 	case strings.HasPrefix(m, "claude-3"),
 		strings.HasPrefix(m, "claude-4"),

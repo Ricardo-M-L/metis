@@ -46,6 +46,7 @@ func TestSupportsVision(t *testing.T) {
 		{"deepseek-v4-flash", false},
 		{"deepseek-v3", false},
 		{"deepseek-chat", false},
+		{"ark-code-latest", false},
 		{"kimi-k1.5", false},
 		{"glm-4-flash", false},
 		// minimax-m* routes via the anthropic transport, not openai — keep false here.

@@ -63,6 +63,102 @@ func TestDefaults_BashDenylistCoversAuditFloor(t *testing.T) {
 	}
 }
 
+func TestLoad_RejectsDeprecatedSandboxTable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[bash.sandbox]
+mode = "permissions"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "[tools.bash.sandbox]") {
+		t.Fatalf("Load() error = %v, want migration hint for [tools.bash.sandbox]", err)
+	}
+}
+
+func TestLoad_ParsesCanonicalSandboxTable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[tools.bash.sandbox]
+mode = "permissions"
+network = "block"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if got := cfg.Tools.Bash.Sandbox.Mode; got != "permissions" {
+		t.Fatalf("sandbox mode = %q, want permissions", got)
+	}
+	if got := cfg.Tools.Bash.Sandbox.Network; got != "block" {
+		t.Fatalf("sandbox network = %q, want block", got)
+	}
+}
+
+func TestLoad_RejectsUnknownSandboxMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[tools.bash.sandbox]
+mode = "premissions"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "invalid tools.bash.sandbox.mode") {
+		t.Fatalf("Load() error = %v, want strict sandbox mode error", err)
+	}
+}
+
+func TestLoad_RejectsUnknownSandboxNetwork(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[tools.bash.sandbox]
+mode = "permissions"
+network = "blokc"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "invalid tools.bash.sandbox.network") {
+		t.Fatalf("Load() error = %v, want strict sandbox network error", err)
+	}
+}
+
+func TestLoad_AcceptsCanonicalSandboxNetworkValues(t *testing.T) {
+	for _, network := range []string{"", "allow", "block"} {
+		t.Run("network="+network, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("METIS_HOME", home)
+			body := "[tools.bash.sandbox]\nmode = \"permissions\"\n"
+			if network != "" {
+				body += "network = \"" + network + "\"\n"
+			}
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, _, err := Load()
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			if got := cfg.Tools.Bash.Sandbox.Network; got != network {
+				t.Fatalf("sandbox network = %q, want %q", got, network)
+			}
+		})
+	}
+}
+
 func TestMCPServersParse(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

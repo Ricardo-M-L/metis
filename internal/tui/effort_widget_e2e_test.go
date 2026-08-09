@@ -7,26 +7,34 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
-	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
-// TestEffortWidget_BareSlashOpensSlider — typing `/effort` (no args)
-// must open the EffortScreen widget rather than inlining a one-line
-// confirmation. claude-code parity (image #6 in user feedback).
+// TestEffortWidget_BareSlashOpensSlider — typing `/effort` keeps the chat
+// mounted and renders the selector directly below the input.
 func TestEffortWidget_BareSlashOpensSlider(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.input.SetValue("/effort")
 	pressEnter(t, m)
 
-	if m.activeScreen == nil {
-		t.Fatalf("/effort with no args should open EffortScreen; activeScreen is nil")
+	if m.activeScreen != nil {
+		t.Fatalf("/effort must not replace chat with activeScreen; got %T", m.activeScreen)
 	}
-	if _, ok := m.activeScreen.(*screen.EffortScreen); !ok {
-		t.Errorf("activeScreen has wrong type: %T", m.activeScreen)
+	if m.effortPicker == nil {
+		t.Fatal("/effort should open the inline effort picker")
 	}
-	view := m.activeScreen.View()
-	if !strings.Contains(view, "Speed") || !strings.Contains(view, "Intelligence") {
-		t.Errorf("EffortScreen view missing Speed/Intelligence labels:\n%s", view)
+	if got := m.input.Value(); got != "/effort" {
+		t.Fatalf("input should retain /effort while picker is open; got %q", got)
+	}
+	viewState := m.View()
+	view := viewState.Content
+	if !strings.Contains(view, "Faster") || !strings.Contains(view, "Smarter") {
+		t.Errorf("inline picker missing Faster/Smarter labels:\n%s", view)
+	}
+	if !strings.Contains(view, "(test session)") {
+		t.Errorf("opening /effort hid the existing transcript:\n%s", view)
+	}
+	if viewState.Cursor != nil {
+		t.Error("textarea cursor should be hidden while the effort picker owns input")
 	}
 }
 
@@ -55,22 +63,21 @@ func TestEffortWidget_ExplicitArgStaysInline(t *testing.T) {
 }
 
 // TestEffortWidget_ApplyUpdatesLoop — Enter on the slider sets
-// m.loop.Effort to the chosen level via applyScreenResult.
+// the loop effort to the chosen level via applyScreenResult.
 func TestEffortWidget_ApplyUpdatesLoop(t *testing.T) {
 	m := newSlashTestModel(t)
+	m.loop.SetEffort(llm.EffortMedium)
 	m.input.SetValue("/effort")
 	pressEnter(t, m)
 
-	// Cursor starts on whatever m.loop.Effort was at construction time
-	// — for newSlashTestModel that's empty, which falls back to medium.
-	// Move right to "high" then Enter.
+	// Cursor starts on the live medium setting. Move right to high, apply.
 	m.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // → high
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
-	if m.activeScreen != nil {
-		t.Errorf("Enter should dismiss the EffortScreen; activeScreen still: %T", m.activeScreen)
+	if m.effortPicker != nil {
+		t.Error("Enter should dismiss the inline effort picker")
 	}
-	if got := m.loop.Effort; got != llm.EffortHigh {
+	if got := m.loop.EffortValue(); got != llm.EffortHigh {
 		t.Errorf("after Enter on 'high', loop.Effort = %q, want %q", got, llm.EffortHigh)
 	}
 	// Confirmation message uses success role (Phase B integration).
@@ -87,10 +94,11 @@ func TestEffortWidget_ApplyUpdatesLoop(t *testing.T) {
 }
 
 // TestEffortWidget_EscPreservesLoop — Esc dismisses without changing
-// m.loop.Effort even if the cursor moved during the session.
+// the loop effort even if the cursor moved during the session.
 func TestEffortWidget_EscPreservesLoop(t *testing.T) {
 	m := newSlashTestModel(t)
-	m.loop.Effort = llm.EffortLow
+	m.loop.SetEffort(llm.EffortLow)
+	before := len(m.messages)
 	m.input.SetValue("/effort")
 	pressEnter(t, m)
 
@@ -99,10 +107,70 @@ func TestEffortWidget_EscPreservesLoop(t *testing.T) {
 	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 
-	if m.activeScreen != nil {
-		t.Errorf("Esc should dismiss EffortScreen")
+	if m.effortPicker != nil {
+		t.Error("Esc should dismiss inline effort picker")
 	}
-	if got := m.loop.Effort; got != llm.EffortLow {
+	if got := m.loop.EffortValue(); got != llm.EffortLow {
 		t.Errorf("Esc should preserve loop.Effort; got %q, want %q (low)", got, llm.EffortLow)
+	}
+	if len(m.messages) != before {
+		t.Errorf("quiet cancel should not append transcript noise: before=%d after=%d", before, len(m.messages))
+	}
+}
+
+func TestEffortWidget_FreshSessionKeepsWelcomeVisible(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.messages = nil
+	m.input.SetValue("/effort")
+	pressEnter(t, m)
+
+	view := stripANSI(m.View().Content)
+	if !strings.Contains(view, "metis v") || !strings.Contains(view, "Effort") {
+		t.Fatalf("fresh-session effort picker should keep welcome + inline chooser visible:\n%s", view)
+	}
+}
+
+func TestEffortWidget_BlocksPasteWhilePickerOwnsKeyboard(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.input.SetValue("/effort")
+	pressEnter(t, m)
+
+	m.Update(tea.PasteMsg{Content: "must-not-leak"})
+	if got := m.input.Value(); got != "/effort" {
+		t.Fatalf("paste leaked into picker-owned input: %q", got)
+	}
+}
+
+func TestEffortWidget_TurnActiveBareCommandStaysLocal(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	m.loop.SetEffort(llm.EffortMedium)
+	m.input.SetValue("/effort")
+	pressEnter(t, m)
+
+	if m.effortPicker == nil {
+		t.Fatal("turn-active /effort should open the local inline picker")
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("turn-active /effort leaked into model steering: %q", got)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if got := m.loop.EffortValue(); got != llm.EffortHigh {
+		t.Fatalf("turn-active effort choice = %q, want high", got)
+	}
+}
+
+func TestEffortWidget_TurnActiveExplicitCommandStaysLocal(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	m.input.SetValue("/effort low")
+	pressEnter(t, m)
+
+	if got := m.loop.EffortValue(); got != llm.EffortLow {
+		t.Fatalf("turn-active explicit effort = %q, want low", got)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("turn-active explicit /effort leaked into steering: %q", got)
 	}
 }

@@ -71,7 +71,7 @@ func cmdThinkback(r *REPL, args string) string {
 // alias.
 func cmdUltraplan(r *REPL, args string) string {
 	if r != nil && r.Loop != nil {
-		r.Loop.Effort = llm.EffortHigh
+		r.Loop.SetEffort(llm.EffortHigh)
 	}
 	target := strings.TrimSpace(args)
 	if target == "" {

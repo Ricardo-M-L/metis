@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -47,6 +49,25 @@ func TestRenderStats_ShowsSystemSectionBreakdown(t *testing.T) {
 	}
 	if !strings.Contains(out, "volatile") {
 		t.Errorf("stats should label volatile row; got:\n%s", out)
+	}
+}
+
+func TestRenderStats_DistinguishesActualIterationsFromPerTurnCap(t *testing.T) {
+	loop := &agent.Loop{Model: "test-model", MaxIters: 12}
+	m := &Model{loop: loop, sessionID: "abc"}
+
+	out := ansi.Strip(renderStats(m))
+	if !strings.Contains(out, "loop iterations: 0") {
+		t.Errorf("stats should report the live iteration count, got:\n%s", out)
+	}
+	if !strings.Contains(out, "iteration cap:   12") {
+		t.Errorf("stats should label MaxIters as a per-turn cap, got:\n%s", out)
+	}
+}
+
+func TestFormatIterationCap_Unlimited(t *testing.T) {
+	if got := formatIterationCap(0); got != "unlimited" {
+		t.Fatalf("formatIterationCap(0) = %q", got)
 	}
 }
 

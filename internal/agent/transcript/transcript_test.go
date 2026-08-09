@@ -101,6 +101,46 @@ func TestUndoWithPrefill_SkipsToolResultUserMessages(t *testing.T) {
 	}
 }
 
+func TestUndoWithPrefill_SkipsSyntheticReminderMessages(t *testing.T) {
+	msgs := []llm.Message{
+		userText("real user prompt"),
+		assistantText(""),
+		userText("<system-reminder>internal rescue</system-reminder>"),
+		assistantText("final answer"),
+	}
+	out, prefill, ok := UndoWithPrefill(msgs)
+	if !ok || prefill != "real user prompt" {
+		t.Fatalf("UndoWithPrefill = (%q, %v), want real user prompt", prefill, ok)
+	}
+	if len(out) != 0 {
+		t.Fatalf("synthetic reminder split the turn: %+v", out)
+	}
+}
+
+func TestUndoWithPrefill_StripsPrependedReminderButKeepsUserText(t *testing.T) {
+	msgs := []llm.Message{
+		userText("<system-reminder>plan policy</system-reminder>\n\nimplement the feature"),
+		assistantText("done"),
+	}
+	_, prefill, ok := UndoWithPrefill(msgs)
+	if !ok || prefill != "implement the feature" {
+		t.Fatalf("UndoWithPrefill = (%q, %v), want visible prompt", prefill, ok)
+	}
+}
+
+func TestCountTurns_IgnoresSyntheticUserMessages(t *testing.T) {
+	msgs := []llm.Message{
+		userText("first"),
+		assistantText("working"),
+		userText("<job_notification>done</job_notification>"),
+		userText("<system-reminder>internal</system-reminder>"),
+		assistantText("finished"),
+	}
+	if got := CountTurns(msgs); got != 1 {
+		t.Fatalf("CountTurns = %d, want 1 real user turn", got)
+	}
+}
+
 func TestUndo_PopsTheLastTurn(t *testing.T) {
 	msgs := []llm.Message{
 		userText("first prompt"),

@@ -100,6 +100,23 @@ func TestBridge_MessagePostQueues(t *testing.T) {
 	}
 }
 
+func TestBridge_MessageReturnsUnavailableInShareReadOnlyMode(t *testing.T) {
+	defer stopBridge()
+	addr, err := startBridge(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.NewBufferString(`{"text":"must not disappear into an undrained queue"}`)
+	resp, err := http.Post("http://"+addr+"/message", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("read-only POST /message status = %d, want 503", resp.StatusCode)
+	}
+}
+
 func TestBridge_MessageRejectsGet(t *testing.T) {
 	defer stopBridge()
 	addr, err := startBridge(make(chan string, 1))

@@ -10,11 +10,8 @@ package tui
 // Registered from BuildREPLCommands at the bottom of commands.go.
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -23,6 +20,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
 // cmdCopy yanks the last N assistant messages and pushes them through
@@ -89,50 +87,86 @@ func assembleAssistantText(m llm.Message) string {
 	return b.String()
 }
 
-// cmdCommitPushPR is the three-step sugar: git add -A → git commit -m
-// <args> → git push → gh pr create. Each step prints its own result so
-// the user can intervene mid-flow. Refuses when args is empty (a commit
-// message is required by convention).
+// cmdCommitPushPR loads a normal agent prompt instead of executing a hidden
+// four-process pipeline. The resulting Git/Bash calls therefore pass through
+// the same permission gate, OS sandbox, progress UI and error recovery as any
+// other requested repository change.
 func cmdCommitPushPR(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
 	if args == "" {
-		return "usage: /commit-push-pr <commit message>\n" +
-			"  runs: git add -A → git commit -m \"<msg>\" → git push -u origin HEAD → gh pr create --fill"
+		return "usage: /commit-push-pr <commit message>"
 	}
-	steps := []struct {
-		name string
-		argv []string
-	}{
-		{"git add", []string{"git", "add", "-A"}},
-		{"git commit", []string{"git", "commit", "-m", args}},
-		{"git push", []string{"git", "push", "-u", "origin", "HEAD"}},
-		{"gh pr create", []string{"gh", "pr", "create", "--fill"}},
+	prompt := "Prepare and publish the current repository changes safely. " +
+		"First inspect git status and the complete diff. Do not stage unrelated user changes. " +
+		"Run the relevant tests, stage only the intended files, commit with this exact message: " + fmt.Sprintf("%q", args) + ". " +
+		"Then push the current branch and create a pull request with gh pr create --fill if no pull request already exists. " +
+		"Stop and explain any test, authentication, push, or PR error; never force-push."
+	if r != nil && r.InsertInput != nil {
+		r.InsertInput(prompt)
+		return "commit-push-pr: safe workflow loaded into input — review, then press Enter"
 	}
-	var b strings.Builder
-	for _, s := range steps {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		cmd := exec.CommandContext(ctx, s.argv[0], s.argv[1:]...)
-		out, err := cmd.CombinedOutput()
-		cancel()
-		fmt.Fprintf(&b, "── %s ──\n", s.name)
-		if t := strings.TrimSpace(string(out)); t != "" {
-			b.WriteString(t)
-			b.WriteString("\n")
-		}
-		if err != nil {
-			fmt.Fprintf(&b, "%s failed: %v — stopping pipeline\n", s.name, err)
-			return b.String()
-		}
-	}
-	b.WriteString("(commit-push-pr: all steps ok)")
-	return b.String()
+	return "commit-push-pr: submit this prompt to run through the normal tool permission path:\n\n" + prompt
 }
 
-// cmdInsights aggregates session activity from ~/.metis/sessions/*.jsonl
-// over the last N days (default 7). Counts turns / unique tools / error
-// rates, plus the model mix. Honest about scope — this is a deterministic
-// summary, not LLM analysis (the latter is a Phase F item if anyone
-// asks for it).
+type sessionInsights struct {
+	sessions   int
+	messages   int
+	toolCalls  int
+	toolErrors int
+	modelMix   map[string]int
+}
+
+// collectSessionInsights reads the current typed session envelope rather than
+// treating each JSONL object as a top-level llm.Message. Store.Load also
+// applies history_replace records, so the totals describe each session's
+// current logical transcript instead of counting messages that /clear, /undo,
+// or /rewind already removed.
+func collectSessionInsights(store *session.Store, cutoff time.Time) (sessionInsights, error) {
+	stats := sessionInsights{modelMix: make(map[string]int)}
+	if store == nil {
+		return stats, fmt.Errorf("session store unavailable")
+	}
+	entries, err := os.ReadDir(store.Dir)
+	if err != nil {
+		return stats, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().Before(cutoff) {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".jsonl")
+		header, messages, err := store.Load(id)
+		if err != nil || header == nil {
+			continue
+		}
+		stats.sessions++
+		stats.messages += len(messages)
+		if model := strings.TrimSpace(header.Model); model != "" {
+			stats.modelMix[model]++
+		}
+		for _, message := range messages {
+			for _, block := range message.Content {
+				switch block.Type {
+				case "tool_use":
+					stats.toolCalls++
+				case "tool_result":
+					if block.IsError {
+						stats.toolErrors++
+					}
+				}
+			}
+		}
+	}
+	return stats, nil
+}
+
+// cmdInsights aggregates logical session activity over the last N days
+// (default 7). It is deterministic local analysis, not an LLM-generated
+// summary.
 func cmdInsights(r *REPL, args string) string {
 	days := 7
 	for _, tok := range strings.Fields(args) {
@@ -143,89 +177,34 @@ func cmdInsights(r *REPL, args string) string {
 		}
 	}
 	dir := filepath.Join(config.Home(), "sessions")
+	store := &session.Store{Dir: dir}
+	if r != nil && r.Session != nil {
+		store = r.Session
+		dir = store.Dir
+	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
-	entries, err := os.ReadDir(dir)
+	stats, err := collectSessionInsights(store, cutoff)
 	if err != nil {
 		return "insights: " + err.Error()
 	}
-	var (
-		sessions   int
-		messages   int
-		toolCalls  int
-		toolErrors int
-		modelMix   = map[string]int{}
-	)
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
-			continue
-		}
-		info, ierr := e.Info()
-		if ierr != nil || info.ModTime().Before(cutoff) {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		data, rerr := os.ReadFile(path)
-		if rerr != nil {
-			continue
-		}
-		sessions++
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var rec map[string]any
-			if json.Unmarshal([]byte(line), &rec) != nil {
-				continue
-			}
-			// Header line carries `model`.
-			if model, ok := rec["model"].(string); ok && model != "" {
-				modelMix[model]++
-				continue
-			}
-			messages++
-			if role, _ := rec["role"].(string); role == "assistant" {
-				if content, ok := rec["content"].([]any); ok {
-					for _, c := range content {
-						cm, _ := c.(map[string]any)
-						if t, _ := cm["type"].(string); t == "tool_use" {
-							toolCalls++
-						}
-					}
-				}
-			}
-			if role, _ := rec["role"].(string); role == "user" {
-				if content, ok := rec["content"].([]any); ok {
-					for _, c := range content {
-						cm, _ := c.(map[string]any)
-						if t, _ := cm["type"].(string); t == "tool_result" {
-							if isErr, _ := cm["is_error"].(bool); isErr {
-								toolErrors++
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	if sessions == 0 {
+	if stats.sessions == 0 {
 		return fmt.Sprintf("(no sessions modified in the last %d day(s) at %s)", days, dir)
 	}
 	rows := []infoRow{
 		{Key: "window", Value: fmt.Sprintf("last %d day(s)", days)},
-		{Key: "sessions", Value: strconv.Itoa(sessions)},
-		{Key: "messages", Value: strconv.Itoa(messages)},
-		{Key: "tool calls", Value: strconv.Itoa(toolCalls)},
-		{Key: "tool errors", Value: strconv.Itoa(toolErrors)},
+		{Key: "sessions", Value: strconv.Itoa(stats.sessions)},
+		{Key: "messages", Value: strconv.Itoa(stats.messages)},
+		{Key: "tool calls", Value: strconv.Itoa(stats.toolCalls)},
+		{Key: "tool errors", Value: strconv.Itoa(stats.toolErrors)},
 	}
-	if len(modelMix) > 0 {
+	if len(stats.modelMix) > 0 {
 		// Stable order by count desc, then name asc.
 		type kv struct {
 			K string
 			V int
 		}
-		pairs := make([]kv, 0, len(modelMix))
-		for k, v := range modelMix {
+		pairs := make([]kv, 0, len(stats.modelMix))
+		for k, v := range stats.modelMix {
 			pairs = append(pairs, kv{k, v})
 		}
 		sort.Slice(pairs, func(i, j int) bool {
@@ -243,21 +222,30 @@ func cmdInsights(r *REPL, args string) string {
 	return renderInfoBox("Session Insights", rows)
 }
 
-// cmdOutputStyle records the user's preferred output verbosity on the
-// REPL. claude-code's three modes — minimal, full, streamlined — map
-// to: full=streaming on + thinking visible (default), streamlined=
-// thinking dropped + tool calls collapsed, minimal=streamlined+no
-// markdown. The REPL.outputStyle field is the source of truth; the
-// render pipeline reads from it where it's already wired (markdown
-// toggling) and the streamlined-render gating lands in the follow-up
-// pass that ports cmdRun's accumulator into the interactive path.
+const (
+	outputStyleFull        = "full"
+	outputStyleStreamlined = "streamlined"
+	outputStyleMinimal     = "minimal"
+)
+
+func normalizeOutputStyle(style string) string {
+	switch strings.ToLower(strings.TrimSpace(style)) {
+	case outputStyleStreamlined:
+		return outputStyleStreamlined
+	case outputStyleMinimal:
+		return outputStyleMinimal
+	default:
+		return outputStyleFull
+	}
+}
+
+// cmdOutputStyle updates both the plain REPL state and, through the bridge
+// installed by Model.asREPL, the live TUI model. The renderer consumes the
+// same value in buildChatItems.
 func cmdOutputStyle(r *REPL, args string) string {
 	arg := strings.ToLower(strings.TrimSpace(args))
 	if arg == "" {
-		state := r.outputStyle
-		if state == "" {
-			state = "full"
-		}
+		state := normalizeOutputStyle(r.outputStyle)
 		return renderInfoBox("Output Style", []infoRow{
 			{Key: "current", Value: state},
 			{Key: "", Value: ""},
@@ -266,17 +254,31 @@ func cmdOutputStyle(r *REPL, args string) string {
 			{Key: "/output-style minimal", Value: "streamlined + no-markdown rendering"},
 		})
 	}
-	switch arg {
-	case "full", "default":
-		r.outputStyle = "full"
+	style := arg
+	if style == "default" {
+		style = outputStyleFull
+	}
+	switch style {
+	case outputStyleFull:
+		r.outputStyle = outputStyleFull
 		r.UseMarkdown = true
+		if r.ApplyOutputStyle != nil {
+			r.ApplyOutputStyle(outputStyleFull)
+		}
 		return "(output style: full)"
-	case "streamlined":
-		r.outputStyle = "streamlined"
-		return "(output style: streamlined — thinking dropped, tool calls summarized [render gate pending])"
-	case "minimal":
-		r.outputStyle = "minimal"
+	case outputStyleStreamlined:
+		r.outputStyle = outputStyleStreamlined
+		r.UseMarkdown = true
+		if r.ApplyOutputStyle != nil {
+			r.ApplyOutputStyle(outputStyleStreamlined)
+		}
+		return "(output style: streamlined — thinking hidden, tool calls summarized)"
+	case outputStyleMinimal:
+		r.outputStyle = outputStyleMinimal
 		r.UseMarkdown = false
+		if r.ApplyOutputStyle != nil {
+			r.ApplyOutputStyle(outputStyleMinimal)
+		}
 		return "(output style: minimal — streamlined + no-markdown)"
 	}
 	return "output-style: unknown '" + arg + "' — use: full | streamlined | minimal"

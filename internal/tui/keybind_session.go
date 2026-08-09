@@ -136,6 +136,9 @@ func (m *Model) asREPL() *REPL {
 		SessionSwitch:       m.ext.SessionSwitch,
 		SessionBoundary:     m.ext.SessionBoundary,
 		FreshPermissionMode: m.ext.FreshPermissionMode,
+		sandbox:             m.ext.Sandbox,
+		UseMarkdown:         normalizeOutputStyle(m.outputStyle) != outputStyleMinimal,
+		outputStyle:         normalizeOutputStyle(m.outputStyle),
 	}
 	// Live-state closures so slash handlers can read TUI-only data
 	// (sub-agent roster, bg-turn state) and write to TUI-only surfaces
@@ -166,6 +169,17 @@ func (m *Model) asREPL() *REPL {
 		if m.loop != nil {
 			m.loop.BypassNextCache = true
 		}
+	}
+	r.ApplyOutputStyle = func(style string) {
+		m.outputStyle = normalizeOutputStyle(style)
+	}
+	r.RecapSnapshot = func() string {
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if m.messages[i].Role == "recap" {
+				return m.messages[i].Content
+			}
+		}
+		return ""
 	}
 	return r
 }

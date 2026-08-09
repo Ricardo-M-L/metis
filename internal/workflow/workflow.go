@@ -17,10 +17,12 @@ package workflow
 import (
 	"bytes"
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/spill"
 )
 
@@ -58,6 +60,8 @@ type RunOptions struct {
 	StopOnError    bool          // mark remaining steps skipped after a failure
 	PerStepTimeout time.Duration // 0 → DefaultStepTimeout
 	MaxOutputBytes int           // 0 → DefaultMaxOutputBytes; per-step output cap
+	Sandbox        *sandbox.Manager
+	Network        sandbox.NetworkPolicy // empty inherits Manager default (allow without one)
 }
 
 const (
@@ -89,7 +93,7 @@ func Run(ctx context.Context, wf Workflow, opts RunOptions) []StepResult {
 			results = append(results, StepResult{Name: s.Name, Command: s.Command, Status: StatusSkipped})
 			continue
 		}
-		r := runStep(ctx, s, opts.Cwd, timeout, maxBytes)
+		r := runStep(ctx, s, opts, timeout, maxBytes)
 		results = append(results, r)
 		if r.Status == StatusFailed && opts.StopOnError {
 			stopped = true
@@ -98,13 +102,34 @@ func Run(ctx context.Context, wf Workflow, opts RunOptions) []StepResult {
 	return results
 }
 
-func runStep(ctx context.Context, s Step, cwd string, timeout time.Duration, maxBytes int) StepResult {
+func runStep(ctx context.Context, s Step, opts RunOptions, timeout time.Duration, maxBytes int) StepResult {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, "sh", "-c", s.Command)
-	if cwd != "" {
-		cmd.Dir = cwd
+	if opts.Cwd != "" {
+		cmd.Dir = opts.Cwd
+	}
+	if opts.Sandbox != nil {
+		// Workflow steps are model-controlled shell commands, so they use the
+		// same credential filter and private temp root as Bash.
+		cmd.Env = opts.Sandbox.FilterEnv(os.Environ(), false)
+		if opts.Sandbox.EffectiveMode() != sandbox.ModeOff {
+			if tempDir := opts.Sandbox.TempDir(); tempDir != "" {
+				cmd.Env = workflowTempEnv(cmd.Env, tempDir)
+			}
+		}
+		wrapped, err := opts.Sandbox.Wrap(cmd, sandbox.Request{Cwd: cmd.Dir, Network: opts.Network})
+		if err != nil {
+			return StepResult{
+				Name:     s.Name,
+				Command:  s.Command,
+				ExitCode: -1,
+				Status:   StatusFailed,
+				Output:   "[sandbox wrap failed: " + err.Error() + "]",
+			}
+		}
+		cmd = wrapped
 	}
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -130,6 +155,21 @@ func runStep(ctx context.Context, s Step, cwd string, timeout time.Duration, max
 		}
 	}
 	return res
+}
+
+func workflowTempEnv(env []string, tempDir string) []string {
+	out := make([]string, 0, len(env)+3)
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok {
+			switch strings.ToUpper(name) {
+			case "TMPDIR", "TMP", "TEMP":
+				continue
+			}
+		}
+		out = append(out, entry)
+	}
+	return append(out, "TMPDIR="+tempDir, "TMP="+tempDir, "TEMP="+tempDir)
 }
 
 // capOutput truncates step output to max bytes, preserving the tail

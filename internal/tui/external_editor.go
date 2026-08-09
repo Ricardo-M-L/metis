@@ -19,6 +19,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/config"
 )
 
 // externalEditorDoneMsg flows back into Update once the editor exits.
@@ -29,6 +31,8 @@ type externalEditorDoneMsg struct {
 	err      error
 	tmpPath  string // for cleanup
 }
+
+type configEditorDoneMsg struct{ err error }
 
 // openExternalEditor returns a tea.Cmd that suspends the program,
 // runs the editor, then re-enters with externalEditorDoneMsg. Caller
@@ -60,6 +64,18 @@ func (m *Model) openExternalEditor() tea.Cmd {
 			tmpPath:  tmpPath,
 		}
 	})
+}
+
+// openConfigEditor suspends Bubble Tea before handing the terminal to the
+// user's editor. Running the editor synchronously inside handleSubmit corrupts
+// the alt-screen and used to report success even when the editor failed.
+func (m *Model) openConfigEditor() tea.Cmd {
+	path := filepath.Join(config.Home(), "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return func() tea.Msg { return configEditorDoneMsg{err: err} }
+	}
+	cmd := exec.Command(pickEditor(), path)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg { return configEditorDoneMsg{err: err} })
 }
 
 // writeDraftToTemp writes `body` to a fresh temp file with a .md

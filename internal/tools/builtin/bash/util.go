@@ -15,6 +15,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -52,9 +53,67 @@ func bytesString(n int) string {
 // Jobs registry is wired later by runtime.RegisterBashJobs when the
 // agent loop has constructed it.
 func New(gate *permission.Gate, settings config.ToolBashSettings) Bash {
-	return Bash{
+	b := Bash{
 		gate:       gate,
 		settings:   settings,
 		classifier: NewBashClassifier(),
 	}
+	mode, err := sandbox.ParseMode(settings.Sandbox.Mode)
+	if err != nil {
+		b.sandboxInitErr = err
+		return b
+	}
+	// Avoid allocating a private temporary directory for the historical
+	// mode=off constructor. Runtimes that own a shared Manager use
+	// NewWithSandbox instead; this compatibility path exists for direct tool
+	// construction in tests and embedders.
+	if mode == sandbox.ModeOff {
+		return b
+	}
+	b.sandbox, b.sandboxInitErr = sandbox.NewManagerWithOptions(sandbox.Options{
+		Mode:    string(mode),
+		Network: b.sandboxNetworkPolicy(),
+	})
+	return b
 }
+
+// NewWithSandbox constructs Bash with the runtime-owned sandbox Manager.
+// The same Manager should be shared with Git and Workflow so /sandbox runtime
+// changes apply consistently to every subprocess tool.
+func NewWithSandbox(gate *permission.Gate, settings config.ToolBashSettings, manager *sandbox.Manager) Bash {
+	b := Bash{
+		gate:       gate,
+		settings:   settings,
+		classifier: NewBashClassifier(),
+		sandbox:    manager,
+	}
+	if manager == nil {
+		mode, err := sandbox.ParseMode(settings.Sandbox.Mode)
+		if err != nil {
+			b.sandboxInitErr = err
+		} else if mode != sandbox.ModeOff {
+			b.sandboxInitErr = fmt.Errorf("sandbox mode %q requires a runtime sandbox manager", mode)
+		}
+	}
+	return b
+}
+
+// WithSandbox returns a copy of Bash wired to manager. Bash is registered as
+// a value tool, so returning a copy keeps Registry.Replace straightforward.
+func (b Bash) WithSandbox(manager *sandbox.Manager) Bash {
+	b.sandbox = manager
+	b.sandboxInitErr = nil
+	if manager == nil {
+		mode, err := sandbox.ParseMode(b.settings.Sandbox.Mode)
+		if err != nil {
+			b.sandboxInitErr = err
+		} else if mode != sandbox.ModeOff {
+			b.sandboxInitErr = fmt.Errorf("sandbox mode %q requires a runtime sandbox manager", mode)
+		}
+	}
+	return b
+}
+
+// SandboxManager exposes the injected per-runtime manager for registry wiring
+// and diagnostics. Callers must not replace it with package-global state.
+func (b Bash) SandboxManager() *sandbox.Manager { return b.sandbox }

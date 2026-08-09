@@ -14,7 +14,7 @@ import (
 //
 //	[/effort]                                                       (header)
 //
-//	     Speed                                       Intelligence
+//	     Faster                                           Smarter
 //	  ────────────────────────────────────────────────────────────────
 //	    off       low      medium      high
 //	                          ▲
@@ -42,11 +42,16 @@ type EffortScreen struct {
 }
 
 // NewEffortScreen builds the screen with `current` highlighted as the
-// active level. Pass the live agent.Loop.Effort string ("off" / "low"
+// active level. Pass the live agent.Loop.EffortValue() string ("off" / "low"
 // / "medium" / "high"); unknown values fall back to "medium".
 func NewEffortScreen(current string) *EffortScreen {
 	levels := []string{"off", "low", "medium", "high"}
 	cur := 2 // medium default
+	if strings.TrimSpace(current) == "" {
+		// llm.EffortDefault is the empty string and the UI's "off" entry
+		// means exactly that: do not override the provider default.
+		cur = 0
+	}
 	for i, l := range levels {
 		if l == strings.ToLower(strings.TrimSpace(current)) {
 			cur = i
@@ -62,7 +67,7 @@ func NewEffortScreen(current string) *EffortScreen {
 
 // Applied returns the effort the user picked, or empty if they cancelled.
 // Caller (handleSubmit) reads this in the activeScreen.Done() branch
-// and applies to loop.Effort before clearing the screen reference.
+// and applies via loop.SetEffort before clearing the screen reference.
 func (s *EffortScreen) Applied() string { return s.applied }
 
 func (s *EffortScreen) Init() tea.Cmd { return nil }
@@ -119,6 +124,7 @@ var (
 	effortActiveStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#bd93f9")).Bold(true)
 	effortPolarStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8be9fd")).Italic(true)
 	effortPointerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#bd93f9")).Bold(true)
+	effortTitleStyle   = lipgloss.NewStyle().Bold(true)
 )
 
 func (s *EffortScreen) View() string {
@@ -127,16 +133,66 @@ func (s *EffortScreen) View() string {
 	// Header stripe — same as BodyScreen for visual consistency.
 	out.WriteString(infoHeaderStripe.Render("/effort"))
 	out.WriteString("\n\n")
+	out.WriteString(s.sliderView())
 
-	// Compute layout: 4 levels + per-level cell width. We allocate a
-	// fixed cell width so the slider looks the same regardless of
-	// terminal width past a reasonable minimum.
-	const cellW = 12
+	return out.String()
+}
+
+// InlineView renders the picker as chat chrome instead of a full-window
+// Screen. Bare /effort uses this path so the transcript and input stay visible
+// while the user chooses a level, matching Claude Code's inline selector.
+// View remains available for older/full-screen callers and focused unit tests.
+func (s *EffortScreen) InlineView() string {
+	var out strings.Builder
+	out.WriteString("  ")
+	out.WriteString(effortTitleStyle.Render("Effort"))
+	out.WriteString("\n\n")
+	out.WriteString(s.sliderView())
+	out.WriteString("\n")
+	return out.String()
+}
+
+func (s *EffortScreen) sliderView() string {
+	var out strings.Builder
+
+	// Compute layout from the live terminal width. Four 12-cell segments are
+	// retained on normal panes; narrow tmux splits reduce each segment and, when
+	// necessary, abbreviate labels instead of letting the right-hand levels
+	// disappear beyond the final column.
+	width := s.width
+	if width <= 0 {
+		width = 80
+	}
+	available := width - 3 // two-cell indent + one-cell terminal wrap guard
+	if available < 4 {
+		available = 4
+	}
+	cellW := available / len(s.levels)
+	if cellW > 12 {
+		cellW = 12
+	}
+	if cellW < 1 {
+		cellW = 1
+	}
 	totalW := cellW * len(s.levels)
+	displayLevels := s.levels
+	if cellW < len("medium") {
+		displayLevels = []string{"off", "lo", "med", "hi"}
+	}
+	if cellW < 3 {
+		displayLevels = []string{"o", "l", "m", "h"}
+	}
 
-	// Polar labels: "Speed" left, "Intelligence" right.
-	leftLbl := effortPolarStyle.Render("Speed")
-	rightLbl := effortPolarStyle.Render("Intelligence")
+	// Polar labels match Claude Code's current inline effort dial.
+	leftText, rightText := "Faster", "Smarter"
+	if totalW < 14 {
+		leftText, rightText = "Fast", "Smart"
+	}
+	if totalW < 10 {
+		leftText, rightText = "F", "S"
+	}
+	leftLbl := effortPolarStyle.Render(leftText)
+	rightLbl := effortPolarStyle.Render(rightText)
 	gap := totalW - lipgloss.Width(leftLbl) - lipgloss.Width(rightLbl)
 	if gap < 1 {
 		gap = 1
@@ -147,21 +203,19 @@ func (s *EffortScreen) View() string {
 	out.WriteString(rightLbl)
 	out.WriteString("\n")
 
-	// Axis line.
+	// Axis line with the active pointer embedded in the track. Keeping the
+	// triangle on the same row is both more compact and visually matches the
+	// current Claude Code selector.
+	pointerPos := cellW*s.cursor + cellW/2
 	out.WriteString("  ")
-	out.WriteString(effortAxisStyle.Render(strings.Repeat("─", totalW)))
-	out.WriteString("\n")
-
-	// Pointer ▲ row — placed under the active cell.
-	pointerLine := strings.Repeat(" ", cellW*s.cursor+(cellW/2))
-	out.WriteString("  ")
-	out.WriteString(pointerLine)
+	out.WriteString(effortAxisStyle.Render(strings.Repeat("─", pointerPos)))
 	out.WriteString(effortPointerStyle.Render("▲"))
+	out.WriteString(effortAxisStyle.Render(strings.Repeat("─", totalW-pointerPos-1)))
 	out.WriteString("\n")
 
 	// Level labels row, with the active one highlighted.
 	out.WriteString("  ")
-	for i, lvl := range s.levels {
+	for i, lvl := range displayLevels {
 		// Center each label inside its cell.
 		pad := (cellW - len(lvl)) / 2
 		left := strings.Repeat(" ", pad)
@@ -180,6 +234,15 @@ func (s *EffortScreen) View() string {
 
 	// Footer hint.
 	hint := "← / →  h/l  to choose  ·  Enter to apply  ·  Esc to cancel"
+	if width < 70 {
+		hint = "←/→ choose · Enter apply · Esc cancel"
+	}
+	if width < 40 {
+		hint = "←/→ · Enter · Esc"
+	}
+	if width < 22 {
+		hint = "←→ Enter Esc"
+	}
 	out.WriteString(infoFooterStyle.Render("  " + hint))
 
 	return out.String()

@@ -1,6 +1,7 @@
 package screen
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -56,6 +57,42 @@ func TestModelScreen_InitialCursorOnCurrent(t *testing.T) {
 	}
 }
 
+func TestModelScreen_CurrentProviderDisambiguatesDuplicateID(t *testing.T) {
+	choices := []ModelChoice{
+		{ID: "gpt-4o", Provider: "openai"},
+		{ID: "gpt-4o", Provider: "relay"},
+	}
+	s := NewModelScreen("gpt-4o", choices)
+	s.SetCurrentProvider("relay")
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	choice, ok := s.AppliedChoice()
+	if !ok || choice.Provider != "relay" {
+		t.Fatalf("duplicate model ID selected provider=%q, want active relay", choice.Provider)
+	}
+}
+
+func TestModelScreen_HeightBoundsAndFollowsCursor(t *testing.T) {
+	choices := make([]ModelChoice, 20)
+	for i := range choices {
+		choices[i] = ModelChoice{ID: fmt.Sprintf("model-%02d", i+1), Provider: "test"}
+	}
+	s := NewModelScreen("model-01", choices)
+	s.Resize(80, 10) // six chrome rows + four visible choices
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
+	out := stripANSIEffort(s.View())
+
+	if lines := strings.Count(out, "\n") + 1; lines > 10 {
+		t.Fatalf("picker rendered %d rows into height 10:\n%s", lines, out)
+	}
+	if !strings.Contains(out, "model-20") || !strings.Contains(out, "model-17") || strings.Contains(out, "model-16") {
+		t.Fatalf("cursor-centred window did not follow End selection:\n%s", out)
+	}
+	if !strings.Contains(out, "20/20") {
+		t.Fatalf("clipped picker lacks position indicator:\n%s", out)
+	}
+}
+
 // TestModelScreen_ArrowNavWrapsAround — picker uses circular nav
 // (claude-code parity, see palette wrap fix from earlier session).
 func TestModelScreen_ArrowNavWrapsAround(t *testing.T) {
@@ -86,6 +123,19 @@ func TestModelScreen_EnterApplies(t *testing.T) {
 	}
 	if got := s.Applied(); got != "MiniMax-M2.7" {
 		t.Errorf("Applied() = %q, want %q", got, "MiniMax-M2.7")
+	}
+	choice, ok := s.AppliedChoice()
+	if !ok || choice.ID != "MiniMax-M2.7" || choice.Provider != "minimax" {
+		t.Errorf("AppliedChoice() = %+v, %v; want MiniMax/minimax", choice, ok)
+	}
+}
+
+func TestModelScreen_CustomTitle(t *testing.T) {
+	s := NewModelScreen("", sampleChoices())
+	s.SetTitle("Choose a vision model · prompt kept")
+	out := stripANSIEffort(s.View())
+	if !strings.Contains(out, "Choose a vision model") {
+		t.Fatalf("custom title missing:\n%s", out)
 	}
 }
 

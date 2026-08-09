@@ -15,6 +15,7 @@ func TestClassifyMidTurn_Destructive(t *testing.T) {
 		SignalCompact,
 		SignalReload,
 		SignalUndo,
+		SignalRewind,
 		SignalRetry,
 		SignalBranch,
 		SignalResume,

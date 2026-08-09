@@ -35,6 +35,34 @@ import (
 // is consistent pre/post finalization.
 const thinkingHistoryWindow = 4
 
+// renderMessagePlain keeps the ordinary transcript chrome but bypasses
+// glamour for assistant text. It is the TUI half of /output-style minimal:
+// Markdown markers remain literal and the renderer performs only safe terminal
+// wrapping.
+func renderMessagePlain(msg Message, width int, expand bool) string {
+	if msg.Role != "assistant" {
+		return renderMessage(msg, width, expand)
+	}
+	bodyW := width - 4
+	if bodyW < 20 {
+		bodyW = 20
+	}
+	wrapped := xansi.Wrap(msg.Content, bodyW, " /-_.")
+	lines := strings.Split(wrapped, "\n")
+	var out strings.Builder
+	out.WriteString("  ")
+	out.WriteString(styleAsst.Render(glyphBullet + " "))
+	if len(lines) > 0 {
+		out.WriteString(styleText.Render(lines[0]))
+		for _, line := range lines[1:] {
+			out.WriteString("\n  ")
+			out.WriteString(styleText.Render(line))
+		}
+	}
+	out.WriteString("\n\n")
+	return out.String()
+}
+
 func renderMessage(msg Message, width int, expand bool) string {
 	var s strings.Builder
 	switch msg.Role {

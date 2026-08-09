@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,6 +49,86 @@ func isAnthropicOrigin(baseURL string) bool {
 type ProviderBuild struct {
 	Provider llm.Provider
 	Model    string
+}
+
+// ProviderHasCredentials reports whether a configured provider has the
+// authentication material its transport actually consumes. Most transports
+// use an API key, but Vertex and Bedrock deliberately do not share that auth
+// shape: Vertex reads a service-account file, while Bedrock needs an AWS
+// access-key/secret-key pair. Keeping this check transport-aware prevents the
+// vision recovery picker from hiding usable cloud profiles (or offering an AWS
+// profile whose secret half is absent).
+//
+// This is a local, non-networking preflight. The transport constructor remains
+// authoritative and returns the detailed error if a credential file is
+// malformed or another required profile field is missing.
+func ProviderHasCredentials(cfg *config.Config, name string) bool {
+	if cfg == nil || strings.TrimSpace(name) == "" {
+		return false
+	}
+
+	if name == "google" {
+		name = "gemini"
+	}
+	raw, custom := cfg.Provider.Custom[name]
+	if !custom {
+		_, err := cfg.ResolveAPIKey(name)
+		return err == nil
+	}
+
+	switch normalizedCustomTransport(raw) {
+	case "vertex_anthropic", "vertex":
+		path := strings.TrimSpace(raw.ServiceAccountFile)
+		if path == "" {
+			return false
+		}
+		info, err := os.Stat(filepath.Clean(path))
+		return err == nil && !info.IsDir()
+	case "bedrock_anthropic", "bedrock":
+		accessKey, err := resolveCustomProviderAPIKey(cfg, name, raw)
+		return err == nil && strings.TrimSpace(accessKey) != "" && bedrockSecretKey(raw) != ""
+	default:
+		_, err := cfg.ResolveAPIKey(name)
+		return err == nil
+	}
+}
+
+func normalizedCustomTransport(raw config.ProviderRaw) string {
+	transportName := strings.ToLower(strings.TrimSpace(raw.Transport))
+	if transportName == "" {
+		return "anthropic_messages"
+	}
+	return transportName
+}
+
+// resolveCustomProviderAPIKey returns the value carried in BuildOpts.APIKey.
+// Vertex has no API-key concept, and Bedrock accepts the standard AWS env var
+// even when api_key_env was not repeated in config.toml. All other transports
+// retain the existing ResolveAPIKey chain (env -> auth.json -> inline config).
+func resolveCustomProviderAPIKey(cfg *config.Config, id string, raw config.ProviderRaw) (string, error) {
+	switch normalizedCustomTransport(raw) {
+	case "vertex_anthropic", "vertex":
+		return "", nil
+	case "bedrock_anthropic", "bedrock":
+		if key, err := cfg.ResolveAPIKey(id); err == nil && strings.TrimSpace(key) != "" {
+			return key, nil
+		}
+		if key := os.Getenv("AWS_ACCESS_KEY_ID"); strings.TrimSpace(key) != "" {
+			return key, nil
+		}
+		return "", fmt.Errorf("%w for provider %q (set api_key_env or AWS_ACCESS_KEY_ID)", config.ErrMissingAPIKey, id)
+	default:
+		return cfg.ResolveAPIKey(id)
+	}
+}
+
+func bedrockSecretKey(raw config.ProviderRaw) string {
+	if envName := strings.TrimSpace(raw.SecretKeyEnv); envName != "" {
+		if secret := os.Getenv(envName); secret != "" {
+			return secret
+		}
+	}
+	return os.Getenv("AWS_SECRET_ACCESS_KEY")
 }
 
 // BuildProvider constructs the LLM client for `name` using cfg + an
@@ -170,7 +251,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 // transport.Register in init(), blank-import it from this file" —
 // no need to grow the case list here.
 func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, modelOverride string) (*ProviderBuild, error) {
-	key, err := cfg.ResolveAPIKey(id)
+	key, err := resolveCustomProviderAPIKey(cfg, id, raw)
 	if err != nil {
 		return nil, err
 	}

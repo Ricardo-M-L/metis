@@ -84,12 +84,13 @@ func (m *Model) hydrateFromLoopHistory() {
 		for _, blk := range lm.Content {
 			switch blk.Type {
 			case "text":
-				if strings.TrimSpace(blk.Text) == "" {
+				visibleText := stripInternalReviewPrompt(blk.Text)
+				if visibleText == "" {
 					continue
 				}
 				m.messages = append(m.messages, Message{
 					Role:      role,
-					Content:   blk.Text,
+					Content:   visibleText,
 					Timestamp: tsNext(),
 					ID:        m.nextID(),
 				})

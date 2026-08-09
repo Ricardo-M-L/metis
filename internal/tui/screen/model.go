@@ -1,6 +1,7 @@
 package screen
 
 import (
+	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -32,35 +33,75 @@ type ModelChoice struct {
 //
 //	  Type to search · ↑/↓ to choose · Enter to apply · Esc to cancel
 type ModelScreen struct {
-	choices  []ModelChoice // full list
-	filtered []int         // indexes into choices after filter
-	current  string        // existing model — highlighted as starting cursor
-	cursor   int           // index into filtered
-	filter   string        // current search text
-	width    int
-	height   int
-	done     bool
-	applied  string // empty if cancelled, else chosen ModelChoice.ID
+	choices         []ModelChoice // full list
+	filtered        []int         // indexes into choices after filter
+	current         string        // existing model — highlighted as starting cursor
+	currentProvider string        // active profile; disambiguates duplicate model IDs
+	title           string        // optional purpose-specific title
+	cursor          int           // index into filtered
+	filter          string        // current search text
+	width           int
+	height          int
+	done            bool
+	applied         string      // empty if cancelled, else chosen ModelChoice.ID
+	appliedChoice   ModelChoice // includes provider profile for a real rebuild
+	hasApplied      bool
 }
 
 // NewModelScreen builds the picker. `current` is the currently-active
 // model (used to seed the cursor on the matching entry). If no choice
 // matches `current`, the cursor starts at 0.
 func NewModelScreen(current string, choices []ModelChoice) *ModelScreen {
-	s := &ModelScreen{choices: choices, current: current}
+	s := &ModelScreen{choices: choices, current: current, title: "Pick a model"}
 	s.refilter()
-	// Seed cursor on current model.
-	for i, idx := range s.filtered {
-		if choices[idx].ID == current {
-			s.cursor = i
-			break
-		}
-	}
+	s.seedCurrentCursor()
 	return s
 }
 
 // Applied returns the chosen model ID, or empty if the user cancelled.
 func (s *ModelScreen) Applied() string { return s.applied }
+
+// AppliedChoice returns the committed model together with its provider
+// profile. Applied() is retained for existing callers, but an ID alone is not
+// enough when two configured providers expose different models/transports.
+func (s *ModelScreen) AppliedChoice() (ModelChoice, bool) {
+	return s.appliedChoice, s.hasApplied
+}
+
+// SetTitle customizes the picker purpose (for example, image recovery).
+func (s *ModelScreen) SetTitle(title string) {
+	if strings.TrimSpace(title) != "" {
+		s.title = title
+	}
+}
+
+// SetCurrentProvider disambiguates identical model IDs exposed by multiple
+// profiles. A bare /model followed immediately by Enter must keep the active
+// provider, not select whichever built-in entry happened to sort first.
+func (s *ModelScreen) SetCurrentProvider(provider string) {
+	s.currentProvider = provider
+	s.seedCurrentCursor()
+}
+
+func (s *ModelScreen) seedCurrentCursor() {
+	fallback := -1
+	for i, idx := range s.filtered {
+		choice := s.choices[idx]
+		if choice.ID != s.current {
+			continue
+		}
+		if fallback < 0 {
+			fallback = i
+		}
+		if s.currentProvider != "" && strings.EqualFold(choice.Provider, s.currentProvider) {
+			s.cursor = i
+			return
+		}
+	}
+	if fallback >= 0 {
+		s.cursor = fallback
+	}
+}
 
 func (s *ModelScreen) Init() tea.Cmd { return nil }
 
@@ -70,6 +111,34 @@ func (s *ModelScreen) Resize(width, height int) {
 }
 
 func (s *ModelScreen) Done() bool { return s.done }
+
+// visibleRange returns a cursor-centred window that fits within the resized
+// terminal. Header/subheader/footer consume six rows; before the first resize
+// height is zero and tests/callers retain the legacy all-items view.
+func (s *ModelScreen) visibleRange() (start, end int) {
+	n := len(s.filtered)
+	if n == 0 {
+		return 0, 0
+	}
+	maxVisible := n
+	if s.height > 0 {
+		maxVisible = s.height - 6
+		if maxVisible < 1 {
+			maxVisible = 1
+		}
+		if maxVisible > n {
+			maxVisible = n
+		}
+	}
+	start = s.cursor - maxVisible/2
+	if start < 0 {
+		start = 0
+	}
+	if start+maxVisible > n {
+		start = n - maxVisible
+	}
+	return start, start + maxVisible
+}
 
 // refilter rebuilds the filtered index list from the current filter text.
 func (s *ModelScreen) refilter() {
@@ -138,7 +207,9 @@ func (s *ModelScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			return s, nil
 		case "enter":
 			if s.cursor >= 0 && s.cursor < len(s.filtered) {
-				s.applied = s.choices[s.filtered[s.cursor]].ID
+				s.appliedChoice = s.choices[s.filtered[s.cursor]]
+				s.applied = s.appliedChoice.ID
+				s.hasApplied = true
 			}
 			s.done = true
 			return s, nil
@@ -210,7 +281,7 @@ func (s *ModelScreen) View() string {
 
 	// Sub-header showing current model + filter.
 	out.WriteString("  ")
-	out.WriteString(modelTitleStyle.Render("Pick a model"))
+	out.WriteString(modelTitleStyle.Render(s.title))
 	if s.current != "" {
 		out.WriteString(modelHeaderHint.Render(" · current: "))
 		out.WriteString(modelCurrentTag.Render(s.current))
@@ -221,9 +292,11 @@ func (s *ModelScreen) View() string {
 	}
 	out.WriteString("\n\n")
 
-	// Find the longest ID for column alignment.
+	visibleStart, visibleEnd := s.visibleRange()
+
+	// Find the longest visible ID for column alignment.
 	idW := 0
-	for _, idx := range s.filtered {
+	for _, idx := range s.filtered[visibleStart:visibleEnd] {
 		c := s.choices[idx]
 		if l := lipgloss.Width(c.ID); l > idW {
 			idW = l
@@ -236,7 +309,8 @@ func (s *ModelScreen) View() string {
 		out.WriteString(modelDescStyle.Render("No models match your search."))
 		out.WriteString("\n")
 	} else {
-		for i, idx := range s.filtered {
+		for i := visibleStart; i < visibleEnd; i++ {
+			idx := s.filtered[i]
 			c := s.choices[idx]
 			// Cursor arrow.
 			if i == s.cursor {
@@ -278,6 +352,12 @@ func (s *ModelScreen) View() string {
 		out.WriteString(modelFooterStyle.Render("  Type to search · ↑/↓ k/j to choose · Enter to apply · Esc to cancel"))
 	} else {
 		out.WriteString(modelFooterStyle.Render("  Backspace to clear · ↑/↓ k/j to choose · Enter to apply · Esc to cancel"))
+	}
+	if len(s.filtered) > 0 && visibleEnd-visibleStart < len(s.filtered) {
+		out.WriteString(modelFooterStyle.Render(" · "))
+		out.WriteString(modelHeaderHint.Render(
+			fmt.Sprintf("%d/%d", s.cursor+1, len(s.filtered)),
+		))
 	}
 
 	return out.String()

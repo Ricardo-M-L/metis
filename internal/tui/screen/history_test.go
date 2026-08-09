@@ -43,6 +43,24 @@ func TestHistoryScreen_RendersUserAndAssistant(t *testing.T) {
 	}
 }
 
+func TestHistoryScreen_HidesInternalUserAttachments(t *testing.T) {
+	s := NewHistoryScreen([]llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			{Type: "text", Text: "<metis-internal-review>\nSECRET REVIEW PROMPT\n</metis-internal-review>"},
+			{Type: "text", Text: "/review main"},
+		}},
+		userMsg("<system-reminder>SECRET RESCUE</system-reminder>"),
+		assistantText("done"),
+	}, 80, 24)
+	view := s.View()
+	if !strings.Contains(view, "/review main") {
+		t.Fatalf("visible review invocation missing: %s", view)
+	}
+	if strings.Contains(view, "SECRET REVIEW PROMPT") || strings.Contains(view, "SECRET RESCUE") || strings.Contains(view, "system-reminder") {
+		t.Fatalf("internal attachment leaked into history: %s", view)
+	}
+}
+
 func TestHistoryScreen_RendersThinkingWithoutLeakingRedactedPayload(t *testing.T) {
 	s := NewHistoryScreen([]llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
 		{Type: "thinking", Text: "inspect the repository first"},

@@ -49,10 +49,12 @@ type AuthGateOptions struct {
 	Stderr io.Writer
 }
 
-// EnsureAPIKey verifies cfg has an API key resolvable for `provName`.
-// When missing AND wizard is allowed AND stderr is a tty, the wizard
-// runs to completion and the caller gets the (possibly different) chosen
-// provider plus a fresh cfg with auth.json picked up.
+// EnsureAPIKey verifies cfg has the credentials required by `provName`.
+// API-key transports use ResolveAPIKey; Vertex service-account and Bedrock AWS
+// credentials use the same transport-aware preflight as the model picker. When
+// credentials are missing AND the wizard is allowed AND stderr is a tty, the
+// wizard runs to completion and the caller gets the (possibly different)
+// chosen provider plus a fresh cfg with auth.json picked up.
 //
 // Returns:
 //   - the cfg the caller should use going forward (may be a fresh load
@@ -66,8 +68,10 @@ func EnsureAPIKey(cfg *config.Config, provName string, opts AuthGateOptions) (*c
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	// Happy path: a key already exists, no wizard needed.
-	if _, err := cfg.ResolveAPIKey(provName); err == nil {
+	// Happy path: the active transport's credentials already exist, no wizard
+	// needed. In particular, do not send a correctly configured Vertex or
+	// Bedrock profile through an API-key wizard.
+	if ProviderHasCredentials(cfg, provName) {
 		return cfg, provName, nil
 	}
 
@@ -96,10 +100,27 @@ func EnsureAPIKey(cfg *config.Config, provName string, opts AuthGateOptions) (*c
 
 	// After the wizard run (or skipped), final check. If still missing,
 	// surface a clear error pointing the user at remediation.
-	if _, err := cfg.ResolveAPIKey(provName); err != nil {
-		return nil, "", fmt.Errorf("%w: try `metis auth login` or export the api_key_env", err)
+	if !ProviderHasCredentials(cfg, provName) {
+		return nil, "", missingProviderCredentialsError(cfg, provName)
 	}
 	return cfg, provName, nil
+}
+
+func missingProviderCredentialsError(cfg *config.Config, provName string) error {
+	if cfg != nil {
+		if raw, ok := cfg.Provider.Custom[provName]; ok {
+			switch normalizedCustomTransport(raw) {
+			case "vertex_anthropic", "vertex":
+				return fmt.Errorf("missing credentials for provider %q: set service_account_file to a readable GCP service-account JSON file", provName)
+			case "bedrock_anthropic", "bedrock":
+				return fmt.Errorf("missing credentials for provider %q: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or api_key_env and secret_key_env)", provName)
+			}
+		}
+		if _, err := cfg.ResolveAPIKey(provName); err != nil {
+			return fmt.Errorf("%w: try `metis auth login` or export the api_key_env", err)
+		}
+	}
+	return fmt.Errorf("missing credentials for provider %q", provName)
 }
 
 // IsKnownProvider reports whether the given provider id is one setupRuntime

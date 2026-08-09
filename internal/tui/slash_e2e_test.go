@@ -13,6 +13,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
@@ -47,10 +48,10 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 		// REPL-owned (pre-existing) ----------------------------------------
 		{"/cost", []string{"Session Cost", "input tokens", "output tokens", "est. cost"}, "repl"},
 		{"/usage", []string{"Usage", "provider", "dashboard", "session totals"}, "repl"},
-		{"/doctor", []string{"Metis Doctor", "config", "git"}, "repl"},
+		{"/doctor", []string{"Metis Doctor", "version", "tools", "API keys"}, "slash"},
 		{"/vim", []string{"vim mode:"}, "repl"},
-		{"/theme", []string{"Theme", "◀", "▶"}, "widget"},             // Phase C4: opens cycle widget
-		{"/effort", []string{"Speed", "Intelligence", "▲"}, "widget"}, // Phase C1: opens slider widget
+		{"/theme", []string{"Theme", "◀", "▶"}, "widget"},         // Phase C4: opens cycle widget
+		{"/effort", []string{"Faster", "Smarter", "▲"}, "widget"}, // inline slider widget
 		{"/effort high", []string{"effort: high"}, "repl"},
 		// /context was un-shadowed from the old REPLCommand on 2026-05-11 —
 		// the slash-signal path now wins, producing the grid + breakdown.
@@ -88,6 +89,8 @@ func TestSlashE2E_TableDriven(t *testing.T) {
 			// so this test stays valid across the migration.
 			var output string
 			switch {
+			case m.effortPicker != nil:
+				output = m.effortPicker.InlineView()
 			case m.activeScreen != nil:
 				output = m.activeScreen.View()
 			case len(m.messages) > before:
@@ -231,6 +234,102 @@ func TestSlashE2E_AddDirAndList(t *testing.T) {
 	pressEnter(t, m)
 	if !strings.Contains(m.messages[len(m.messages)-1].Content, "removed") {
 		t.Errorf("/rm-dir output: %q", m.messages[len(m.messages)-1].Content)
+	}
+}
+
+func TestSlashE2E_ReloadRefreshesCatalog(t *testing.T) {
+	m := newSlashTestModel(t)
+	calls := 0
+	m.SetExternalHooks(ExternalHooks{ReloadCatalog: func() (string, error) {
+		calls++
+		return "12 skills · 2 custom commands", nil
+	}})
+	m.input.SetValue("/reload")
+	pressEnter(t, m)
+
+	if calls != 1 {
+		t.Fatalf("reload hook calls=%d, want 1", calls)
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "success" || !strings.Contains(last.Content, "12 skills") {
+		t.Fatalf("reload result=%+v", last)
+	}
+}
+
+func TestSlashE2E_ClearDismissesPaletteCache(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.input.SetValue("/clear")
+	m.showPalette = true
+	m.palFilter = "clear"
+	m.matchCommands()
+	if len(m.palMatched) == 0 {
+		t.Fatal("test precondition: /clear must have a palette match")
+	}
+
+	pressEnter(t, m)
+
+	if m.input.Value() != "" || m.showPalette || m.palFilter != "" || m.palCursor != 0 || len(m.palMatched) != 0 {
+		t.Fatalf("/clear retained completion state: input=%q show=%v filter=%q cursor=%d matches=%d",
+			m.input.Value(), m.showPalette, m.palFilter, m.palCursor, len(m.palMatched))
+	}
+}
+
+func TestSlashE2E_ReviewKeepsInternalPromptOutOfVisibleHistory(t *testing.T) {
+	m := newSlashTestModelWithLoop(t)
+	m.input.SetValue("/review main")
+	pressEnter(t, m)
+	if cancel, ok := m.ctx.Value(cancelKey{}).(context.CancelFunc); ok {
+		cancel()
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	for _, msg := range m.messages {
+		if strings.Contains(msg.Content, "# Code Review") || strings.Contains(msg.Content, internalReviewPromptOpen) {
+			t.Fatalf("internal review frame leaked into live transcript: %+v", msg)
+		}
+	}
+	foundVisible := false
+	for _, msg := range m.messages {
+		if msg.Role == "user" && msg.Content == "/review main" {
+			foundVisible = true
+		}
+	}
+	if !foundVisible {
+		t.Fatalf("visible /review invocation missing: %+v", m.messages)
+	}
+
+	history := m.loop.History()
+	providerPromptFound := false
+	for _, msg := range history {
+		if msg.Role != provider.RoleUser {
+			continue
+		}
+		for _, block := range msg.Content {
+			if strings.Contains(block.Text, "# Code Review") && strings.Contains(block.Text, internalReviewPromptOpen) {
+				providerPromptFound = true
+			}
+		}
+	}
+	if !providerPromptFound {
+		t.Fatalf("provider-facing review frame missing from durable history: %+v", history)
+	}
+	if _, prefill, ok := transcript.UndoWithPrefill(history); !ok || prefill != "/review main" {
+		t.Fatalf("/undo and /retry prefill = %q, %v; want the visible review invocation", prefill, ok)
+	}
+
+	exported := conversationText(history)
+	if !strings.Contains(exported, "❯ /review main") || strings.Contains(exported, "# Code Review") || strings.Contains(exported, internalReviewPromptOpen) {
+		t.Fatalf("review export crossed the visibility boundary:\n%s", exported)
+	}
+
+	resumed := newSlashTestModel(t)
+	resumed.messages = nil
+	resumed.loop.Restore(history)
+	resumed.hydrateFromLoopHistory()
+	for _, msg := range resumed.messages {
+		if strings.Contains(msg.Content, "# Code Review") || strings.Contains(msg.Content, internalReviewPromptOpen) {
+			t.Fatalf("internal review frame leaked after resume: %+v", msg)
+		}
 	}
 }
 

@@ -10,7 +10,46 @@
 // observability are the caller's responsibility.
 package transcript
 
-import "github.com/Ricardo-M-L/metis/internal/llm"
+import (
+	"regexp"
+	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/llm"
+)
+
+// internalUserSections are runtime-generated attachments carried with the
+// provider's user role. They are not turns the person typed, so undo/retry and
+// turn counters must ignore them. A real prompt may follow one of these blocks
+// in the same ContentBlock (plan-mode does this), hence removal instead of a
+// simple HasPrefix check.
+var internalUserSections = []*regexp.Regexp{
+	regexp.MustCompile(`(?is)<system-reminder(?:\s[^>]*)?>.*?</system-reminder\s*>`),
+	regexp.MustCompile(`(?is)<memory-context(?:\s[^>]*)?>.*?</memory-context\s*>`),
+	regexp.MustCompile(`(?is)<auto-retrieve(?:\s[^>]*)?>.*?</auto-retrieve\s*>`),
+	regexp.MustCompile(`(?is)<peer_message(?:\s[^>]*)?>.*?</peer_message\s*>`),
+	regexp.MustCompile(`(?is)<task-context(?:\s[^>]*)?>.*?</task-context\s*>`),
+	regexp.MustCompile(`(?is)<project-context(?:\s[^>]*)?>.*?</project-context\s*>`),
+	regexp.MustCompile(`(?is)<job_notification(?:\s[^>]*)?>.*?</job_notification\s*>`),
+	regexp.MustCompile(`(?is)<sub_agent_idle(?:\s[^>]*)?>.*?</sub_agent_idle\s*>`),
+	regexp.MustCompile(`(?is)<memory_consolidation_done(?:\s[^>]*)?>.*?</memory_consolidation_done\s*>`),
+	regexp.MustCompile(`(?is)<monitor_event(?:\s[^>]*)?>.*?</monitor_event\s*>`),
+	regexp.MustCompile(`(?is)<post_compact_context(?:\s[^>]*)?>.*?</post_compact_context\s*>`),
+	regexp.MustCompile(`(?is)<metis-internal-review(?:\s[^>]*)?>.*?</metis-internal-review\s*>`),
+}
+
+var unterminatedInternalUserSection = regexp.MustCompile(`(?is)<(?:system-reminder|memory-context|auto-retrieve|peer_message|task-context|project-context|job_notification|sub_agent_idle|memory_consolidation_done|monitor_event|post_compact_context|metis-internal-review)(?:\s[^>]*)?>.*\z`)
+
+// VisibleUserText removes provider-facing runtime attachments from a user-role
+// text block and returns only text that belongs on user-facing transcript
+// surfaces. It also lets callers distinguish a synthetic user-role message
+// (empty result) from a real prompt.
+func VisibleUserText(text string) string {
+	for _, section := range internalUserSections {
+		text = section.ReplaceAllString(text, "")
+	}
+	text = unterminatedInternalUserSection.ReplaceAllString(text, "")
+	return strings.TrimSpace(text)
+}
 
 // Undo trims the last completed turn off `msgs` and returns the result.
 //
@@ -46,8 +85,10 @@ func UndoWithPrefill(msgs []llm.Message) (out []llm.Message, prefill string, ok 
 		return msgs, "", false
 	}
 	for _, c := range msgs[idx].Content {
-		if c.Type == "text" && c.Text != "" {
-			prefill = c.Text
+		if c.Type == "text" {
+			if visible := VisibleUserText(c.Text); visible != "" {
+				prefill = visible
+			}
 		}
 	}
 	out = append([]llm.Message(nil), msgs[:idx]...)
@@ -68,7 +109,7 @@ func LastPlainUserIndex(msgs []llm.Message) int {
 			continue
 		}
 		for _, c := range m.Content {
-			if c.Type == "text" && c.Text != "" {
+			if c.Type == "text" && VisibleUserText(c.Text) != "" {
 				return i
 			}
 		}
@@ -100,7 +141,7 @@ func CountTurns(msgs []llm.Message) int {
 			continue
 		}
 		for _, c := range m.Content {
-			if c.Type == "text" && c.Text != "" {
+			if c.Type == "text" && VisibleUserText(c.Text) != "" {
 				n++
 				break
 			}

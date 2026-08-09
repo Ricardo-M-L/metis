@@ -5,15 +5,50 @@ package runtime
 // shape verification — no network calls, no model invocations.
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 )
 
 func newCfgWithCustom(name string, raw config.ProviderRaw) *config.Config {
 	cfg := &config.Config{}
 	cfg.Provider.Custom = map[string]config.ProviderRaw{name: raw}
 	return cfg
+}
+
+func writeRuntimeTestServiceAccount(t *testing.T) string {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatalf("x509.MarshalPKCS8PrivateKey: %v", err)
+	}
+	data, err := json.Marshal(cloud.ServiceAccountKey{
+		Type:        "service_account",
+		ClientEmail: "metis-test@example.iam.gserviceaccount.com",
+		PrivateKey:  string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
+		TokenURI:    "https://oauth2.googleapis.com/token",
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "service-account.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write service account: %v", err)
+	}
+	return path
 }
 
 func TestBuildProvider_Custom_AnthropicTransport(t *testing.T) {
@@ -75,6 +110,60 @@ func TestBuildProvider_Custom_GeminiTransport(t *testing.T) {
 	}
 	if pb.Provider.Name() != "gemini" {
 		t.Errorf("provider.Name() = %q, want gemini", pb.Provider.Name())
+	}
+}
+
+func TestBuildProvider_Custom_VertexUsesServiceAccountWithoutAPIKey(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	cfg := newCfgWithCustom("vertex-claude", config.ProviderRaw{
+		Transport:          "vertex_anthropic",
+		ServiceAccountFile: writeRuntimeTestServiceAccount(t),
+		Project:            "metis-test-project",
+		Region:             "us-central1",
+		Model:              "claude-sonnet-4-6",
+	})
+
+	pb, err := BuildProvider(cfg, "vertex-claude", "")
+	if err != nil {
+		t.Fatalf("BuildProvider rejected service-account auth: %v", err)
+	}
+	if pb.Provider.Name() != "vertex" || pb.Model != "claude-sonnet-4-6" {
+		t.Fatalf("unexpected Vertex build: provider=%q model=%q", pb.Provider.Name(), pb.Model)
+	}
+}
+
+func TestBuildProvider_Custom_BedrockUsesStandardAWSEnvironment(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIA_METIS_TEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "metis-test-secret")
+	t.Setenv("AWS_SESSION_TOKEN", "metis-test-session")
+	cfg := newCfgWithCustom("bedrock-claude", config.ProviderRaw{
+		Transport: "bedrock_anthropic",
+		Region:    "us-east-1",
+		Model:     "us.anthropic.claude-sonnet-4-6-v1:0",
+	})
+
+	pb, err := BuildProvider(cfg, "bedrock-claude", "")
+	if err != nil {
+		t.Fatalf("BuildProvider rejected standard AWS credentials: %v", err)
+	}
+	if pb.Provider.Name() != "bedrock" || pb.Model != "us.anthropic.claude-sonnet-4-6-v1:0" {
+		t.Fatalf("unexpected Bedrock build: provider=%q model=%q", pb.Provider.Name(), pb.Model)
+	}
+}
+
+func TestBuildProvider_Custom_BedrockRequiresSecretHalf(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIA_METIS_TEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	cfg := newCfgWithCustom("bedrock-claude", config.ProviderRaw{
+		Transport: "bedrock_anthropic",
+		Model:     "us.anthropic.claude-sonnet-4-6-v1:0",
+	})
+
+	_, err := BuildProvider(cfg, "bedrock-claude", "")
+	if err == nil || !strings.Contains(err.Error(), "AWS_SECRET_ACCESS_KEY") {
+		t.Fatalf("missing AWS secret should fail clearly, got %v", err)
 	}
 }
 

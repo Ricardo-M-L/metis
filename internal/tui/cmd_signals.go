@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -67,13 +69,15 @@ func renderSessionsList(store *session.Store, limit int) string {
 	return renderInfoBox(fmt.Sprintf("Recent Sessions · %d", len(entries)), rows)
 }
 
-// renderCurrentSession describes the currently-active session: id, title,
-// model, mode, message+turn count. Useful as a "where am I" panel.
+// renderCurrentSession describes the currently-active session using live loop
+// state rather than only the persisted header. It is the shared implementation
+// behind /status in both the Bubble Tea and readline surfaces.
 func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Loop, model string, mode string) string {
 	if sessionID == "" {
 		return "(no active session)"
 	}
 	rows := []infoRow{{Key: "id", Value: sessionID}}
+	workDir := ""
 	if store != nil {
 		if hdr, _, err := store.LoadHeader(sessionID); err == nil && hdr != nil {
 			if hdr.Title != "" {
@@ -82,7 +86,24 @@ func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Lo
 			if !hdr.CreatedAt.IsZero() {
 				rows = append(rows, infoRow{Key: "since", Value: hdr.CreatedAt.Local().Format(time.RFC3339)})
 			}
+			workDir = hdr.WorkDir
+			if model == "" {
+				model = hdr.Model
+			}
+			if mode == "" {
+				mode = hdr.Mode
+			}
 		}
+		rows = append(rows, infoRow{
+			Key:   "transcript",
+			Value: filepath.Join(store.Dir, filepath.Base(sessionID)+".jsonl"),
+		})
+	}
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+	if workDir != "" {
+		rows = append(rows, infoRow{Key: "working dir", Value: workDir})
 	}
 	if model != "" {
 		rows = append(rows, infoRow{Key: "model", Value: model})
@@ -92,6 +113,35 @@ func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Lo
 	}
 	if loop != nil {
 		hist := loop.History()
+		if loop.Provider != nil {
+			rows = append(rows, infoRow{Key: "provider", Value: loop.Provider.Name()})
+		}
+		effort := string(loop.EffortValue())
+		if effort == "" {
+			effort = "provider default"
+		}
+		rows = append(rows, infoRow{Key: "effort", Value: effort})
+		rows = append(rows, infoRow{Key: "fast mode", Value: fmt.Sprintf("%t", loop.Fast)})
+		rows = append(rows, infoRow{Key: "plan mode", Value: fmt.Sprintf("%t", loop.IsPlanMode())})
+
+		used := loop.EstimateContextTokens()
+		limit := loop.ContextWindow
+		if limit <= 0 && loop.Provider != nil {
+			limit = loop.Provider.MaxContextTokens()
+		}
+		contextValue := fmt.Sprintf("~%s tokens", fmtThousands(used))
+		contextHint := "window unknown"
+		if limit > 0 {
+			contextValue = fmt.Sprintf("~%s / %s tokens", fmtThousands(used), fmtThousands(limit))
+			contextHint = fmt.Sprintf("%.1f%% used", float64(used)*100/float64(limit))
+		}
+		rows = append(rows, infoRow{Key: "context", Value: contextValue, Hint: contextHint})
+
+		iterCap := "unlimited"
+		if loop.MaxIters > 0 {
+			iterCap = fmt.Sprintf("%d per turn", loop.MaxIters)
+		}
+		rows = append(rows, infoRow{Key: "loop iterations", Value: fmt.Sprintf("%d", loop.IterIdx()), Hint: "cap " + iterCap})
 		rows = append(rows, infoRow{
 			Key:   "turns",
 			Value: fmt.Sprintf("%d", transcript.CountTurns(hist)),

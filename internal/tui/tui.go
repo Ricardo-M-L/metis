@@ -31,6 +31,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
@@ -155,6 +156,13 @@ type ExternalHooks struct {
 	// overrides. A fresh/forked session must use this baseline, not inherit a
 	// resumed session's bypass/deny posture.
 	FreshPermissionMode permission.Mode
+	// Sandbox is passed as runtime infrastructure, not discovered through the
+	// Bash tool registry: a disabled/hidden Bash tool must not turn local !cmd
+	// into an unsandboxed execution path.
+	Sandbox *sandbox.Manager
+	// ReloadCatalog refreshes disk-backed skills and custom slash commands
+	// without rebuilding the active Loop or discarding conversation history.
+	ReloadCatalog func() (string, error)
 }
 
 type Model struct {
@@ -231,12 +239,23 @@ type Model struct {
 	// Reset after submit; never persisted across turns.
 	imagePaste   map[int]string // N -> /path/to/cached.png
 	imageCounter int            // 1-based; matches the visible #N
+	// imageRecoveryPending marks a /model picker opened by the text-only
+	// vision gate. The original editor text and imagePaste side-table remain
+	// untouched; after a successful switch the user can press Enter once to
+	// submit the exact original multimodal prompt.
+	imageRecoveryPending    bool
+	imageRecoveryImageCount int
 
 	// input is the chat-surface multi-line editor. textarea (instead of
 	// textinput) lets the user paste multi-line code and split prompts
 	// across rows with Alt+Enter / Ctrl+J. Enter still submits — handleKey
 	// intercepts KeyEnter before it reaches textarea.
 	input textarea.Model
+	// effortPicker is the inline /effort selector rendered immediately below
+	// the input. It intentionally does not use activeScreen: opening the effort
+	// dial must preserve the visible transcript instead of replacing the chat
+	// with a standalone page.
+	effortPicker *screen.EffortScreen
 	// chatList is a virtualized list (internal/tui/list) that renders
 	// only the items intersecting the current viewport. Replaces the
 	// previous bubbles/viewport.Model, which paid O(N) string-cat per
@@ -476,6 +495,11 @@ type Model struct {
 	// as an explicit user preference so the user picks how chatty
 	// the trace should be on EVERY turn, not per-press.
 	thinkingDisplay string
+	// outputStyle controls transcript density independently from the explicit
+	// /thinking preference. full keeps the normal renderer; streamlined hides
+	// reasoning and collapses every tool call to a summary; minimal additionally
+	// renders assistant text without Markdown styling.
+	outputStyle string
 
 	// stickyBottom controls auto-follow during streaming. true (the
 	// default) means new content auto-scrolls into view; user wheel-up
@@ -516,6 +540,16 @@ type Model struct {
 	// Ctrl-C calls it to abort the LLM stream + tool execution while
 	// keeping the session alive.
 	turnCancel context.CancelFunc
+	// turnCancelledByUser distinguishes an intentional /abort, Esc, or Ctrl-C
+	// from a provider/network failure. The canceled request still unwinds with
+	// context.Canceled, but that transport detail must not be rendered as a red
+	// API error after the TUI has already acknowledged "interrupted".
+	turnCancelledByUser bool
+	// dispatchingMidTurnCommand lets handleSubmit re-enter its normal local
+	// command dispatcher while an agent turn is active. It is set only for a
+	// command that slash.ClassifyMidTurn marked safe, preventing informational
+	// commands such as /cost from being leaked to the model as steer text.
+	dispatchingMidTurnCommand bool
 	// lastCtrlC records the last time Ctrl-C was pressed *outside* an
 	// active turn, so the second press within ctrlCQuitWindow exits.
 	lastCtrlC time.Time
@@ -779,6 +813,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		chatList:        cl,
 		stickyBottom:    true,
 		thinkingDisplay: thinkingDisplay,
+		outputStyle:     outputStyleFull,
 		// 4-level permission ask, matching claude-code's pattern:
 		//   y — allow this once
 		//   a — allow always (whitelist this tool for the session)

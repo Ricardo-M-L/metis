@@ -372,3 +372,46 @@ func TestGate_PopRulesOversizeIsSafe(t *testing.T) {
 		t.Errorf("oversized Pop should clear the stack; got %d rules", len(g.Snapshot()))
 	}
 }
+
+func TestGate_PushScopedRulesRemovesOnlyItsOwnRules(t *testing.T) {
+	g := New(ModeDefault)
+	g.AppendRules(Rule{Tool: "Read", Verb: DecisionAllow, Source: "config"})
+
+	cleanup := g.PushScopedRules(Rule{
+		Tool: "Bash", Match: "git status:*", Verb: DecisionAllow,
+	})
+	if decision, _ := g.Check(context.Background(), "Bash", "git status --short"); decision != DecisionAllow {
+		t.Fatalf("scoped command rule decision = %v, want allow", decision)
+	}
+
+	// Simulate a permission-dialog approval arriving while the custom-command
+	// turn is still running. Cleanup must retain this later rule.
+	g.AppendRules(Rule{Tool: "Write", Match: "notes.md", Verb: DecisionAllow, Source: "interactive"})
+	cleanup()
+	cleanup() // idempotent
+
+	rules := g.Snapshot()
+	if len(rules) != 2 {
+		t.Fatalf("rules after scoped cleanup = %+v, want base + interactive", rules)
+	}
+	for _, rule := range rules {
+		if rule.Tool == "Bash" {
+			t.Fatalf("scoped rule survived cleanup: %+v", rule)
+		}
+	}
+	if decision, _ := g.Check(context.Background(), "Write", "notes.md"); decision != DecisionAllow {
+		t.Fatalf("later interactive rule was removed: decision=%v", decision)
+	}
+}
+
+func TestGate_PushScopedRulesCannotOverrideCLIDeny(t *testing.T) {
+	g := New(ModeDefault)
+	g.AppendRules(Rule{Tool: "Bash", Verb: DecisionDeny, Source: "cli:deny"})
+	cleanup := g.PushScopedRules(Rule{Tool: "Bash", Verb: DecisionAllow})
+	defer cleanup()
+
+	decision, source := g.Check(context.Background(), "Bash", "git status")
+	if decision != DecisionDeny || source != "cli:deny" {
+		t.Fatalf("decision=%v source=%q, want CLI deny", decision, source)
+	}
+}

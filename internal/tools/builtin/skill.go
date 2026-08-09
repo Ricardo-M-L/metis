@@ -19,6 +19,7 @@ import (
 
 	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubskill "github.com/Ricardo-M-L/metis/pkg/skill"
 )
@@ -58,6 +59,9 @@ type Skill struct {
 	// the runtime so internal/tools/builtin doesn't take a back-
 	// dependency on internal/runtime.
 	sessionIDFn func() string
+	// sandbox is shared with other model-controlled process launchers so a
+	// trusted skill's inline shell cannot bypass an enabled OS boundary.
+	sandbox *sandbox.Manager
 }
 
 // NewSkill is the runtime constructor. The loader is built by the caller
@@ -73,6 +77,12 @@ func NewSkill(gate *permission.Gate, loader *skillsloader.Loader, userDir string
 // CurrentSessionID without creating an import cycle.
 func (s Skill) WithSessionIDFn(fn func() string) Skill {
 	s.sessionIDFn = fn
+	return s
+}
+
+// WithSandbox returns a copy wired to the runtime's shared sandbox manager.
+func (s Skill) WithSandbox(manager *sandbox.Manager) Skill {
+	s.sandbox = manager
 	return s
 }
 
@@ -292,7 +302,7 @@ func (s Skill) invokeSkill(ctx context.Context, name string) (*tools.Result, err
 		// skill can't smuggle shell into the prompt. Mirrors
 		// claude-code's MCP-skill carve-out in executeShellCommandsInPrompt.
 		if skillsloader.ShouldRunInlineShell(sk.TrustLevel) {
-			body = skillsloader.ExpandInlineShell(ctx, body, skillDir)
+			body = skillsloader.ExpandInlineShellWithSandbox(ctx, body, skillDir, s.sandbox)
 		}
 		fmt.Fprintf(&b, "## Skill: %s\n\n", sk.Name)
 		b.WriteString(body)

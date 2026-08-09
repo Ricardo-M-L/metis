@@ -12,6 +12,17 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
+// dismissPalette clears both the visible dropdown and its cached selection.
+// Clearing only showPalette/palFilter leaves the previous match slice/cursor
+// alive, which can be painted again by the same Enter key update after a
+// destructive command resets the input.
+func (m *Model) dismissPalette() {
+	m.showPalette = false
+	m.palFilter = ""
+	m.palCursor = 0
+	m.palMatched = nil
+}
+
 func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// v2: KeyMsg is interface; switch on .String() and treat any
 	// single-rune press as the "typed character" branch (replaces v1
@@ -19,8 +30,7 @@ func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	keyName := msg.String()
 	switch keyName {
 	case "esc":
-		m.showPalette = false
-		m.palFilter = ""
+		m.dismissPalette()
 		m.input.Reset()
 	case "up":
 		// claude-code parity: ↑ at the top wraps to the bottom (and Tab
@@ -101,7 +111,7 @@ func (m *Model) doAutocomplete() {
 	// the registered command list and inserts the first prefix match.
 	if strings.HasPrefix(val, "/") {
 		partial := strings.ToLower(strings.TrimPrefix(val, "/"))
-		for _, cmd := range m.cmds.All() {
+		for _, cmd := range m.commandCatalog() {
 			if strings.HasPrefix(strings.ToLower(cmd.Name), partial) {
 				m.input.SetValue("/" + cmd.Name + " ")
 				m.input.CursorEnd()
@@ -147,7 +157,7 @@ func (m *Model) matchCommands() {
 		filter = filter[:idx]
 	}
 	if filter == "" {
-		m.palMatched = append(m.palMatched, m.cmds.All()...)
+		m.palMatched = append(m.palMatched, m.commandCatalog()...)
 		return
 	}
 	// added[name] tracks which commands have already been queued so an
@@ -166,7 +176,7 @@ func (m *Model) matchCommands() {
 		*dst = append(*dst, cmd)
 	}
 	var prefixHits, containsHits []REPLCommand
-	for _, cmd := range m.cmds.All() {
+	for _, cmd := range m.commandCatalog() {
 		name := strings.ToLower(cmd.Name)
 		switch {
 		case name == filter:

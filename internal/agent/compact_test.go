@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -167,6 +168,54 @@ func TestCompact_ProducesBoundaryWithSummary(t *testing.T) {
 	}
 	if len(out[2].Content) == 0 || !strings.Contains(out[2].Content[0].Text, "old user 5") {
 		t.Errorf("out[2] should be the active-task anchor msgs[11]; got %v", out[2].Content)
+	}
+}
+
+func TestCompactWithInstructions_IsRequestLocalAndDelimited(t *testing.T) {
+	p := &fakeSummarizer{}
+	c := newCompactorFor(p)
+	msgs := []llm.Message{msg(llm.RoleSystem, "sys")}
+	for i := 0; i < 6; i++ {
+		msgs = append(msgs,
+			msg(llm.RoleUser, "old user "+istr(i)),
+			msg(llm.RoleAssistant, "old assistant "+istr(i)),
+		)
+	}
+	msgs = append(msgs,
+		msg(llm.RoleUser, "recent user"),
+		msg(llm.RoleAssistant, "recent assistant"),
+		msg(llm.RoleUser, "active task"),
+	)
+
+	if _, err := c.CompactWithInstructions(context.Background(), msgs, " Preserve exact file paths and open questions. "); err != nil {
+		t.Fatal(err)
+	}
+	firstPrompt := p.lastReq.Messages[0].Content[0].Text
+	if !strings.Contains(firstPrompt, "<compact_instructions>\nPreserve exact file paths and open questions.\n</compact_instructions>") {
+		t.Fatalf("custom instructions were not delimited in summarizer prompt:\n%s", firstPrompt)
+	}
+
+	if _, err := c.Compact(context.Background(), msgs); err != nil {
+		t.Fatal(err)
+	}
+	secondPrompt := p.lastReq.Messages[0].Content[0].Text
+	if strings.Contains(secondPrompt, "Preserve exact file paths") || strings.Contains(secondPrompt, "<compact_instructions>") {
+		t.Fatalf("manual compact instructions leaked into the next ordinary Compact:\n%s", secondPrompt)
+	}
+}
+
+func TestNormalizeCompactInstructions_BoundsRunesWithoutBreakingUTF8(t *testing.T) {
+	in := strings.Repeat("界", maxCompactInstructionRunes+10)
+	got := normalizeCompactInstructions(in)
+	if !strings.Contains(got, "[additional compact instructions truncated]") {
+		t.Fatal("long instructions were not marked truncated")
+	}
+	prefix, _, _ := strings.Cut(got, "\n[additional")
+	if len([]rune(prefix)) != maxCompactInstructionRunes {
+		t.Fatalf("bounded prefix runes = %d, want %d", len([]rune(prefix)), maxCompactInstructionRunes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("normalization produced invalid UTF-8")
 	}
 }
 

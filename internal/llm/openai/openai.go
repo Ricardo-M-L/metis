@@ -244,13 +244,20 @@ func (o *OpenAI) ModelID() string { return o.Model }
 // entire turn on a cryptic API rejection. So both the catalog path
 // and the whitelist path prefer "say no" on ambiguity.
 func (o *OpenAI) SupportsVision() bool {
+	return SupportsVisionModel(o.Model)
+}
+
+// SupportsVisionModel exposes the same catalog-first capability decision for
+// configured-profile pickers that need to filter candidates before building a
+// live provider. It performs no request and requires no API key.
+func SupportsVisionModel(model string) bool {
 	// Tier 1 — models.dev catalog. Default() returns nil in CI or when
 	// METIS_CATALOG_DISABLE=1; LookupVisionByModelID returns
 	// found=false when the cache is cold or the model is unknown.
 	// Both are nil/miss-safe, so this branch is free when the catalog
 	// can't help.
 	if cli := catalog.Default(); cli != nil {
-		if supported, found := cli.LookupVisionByModelID(o.Model); found {
+		if supported, found := cli.LookupVisionByModelID(model); found {
 			return supported
 		}
 	}
@@ -259,7 +266,7 @@ func (o *OpenAI) SupportsVision() bool {
 	// not-yet-in-catalog fallback. List mirrors the pre-2026-08-01
 	// hardcoded set; new entries should go through the catalog path
 	// whenever possible instead of being added here.
-	m := strings.ToLower(o.Model)
+	m := strings.ToLower(model)
 	switch {
 	// OpenAI native lineage.
 	case strings.HasPrefix(m, "gpt-4o"),

@@ -51,7 +51,7 @@ func ClassifyMidTurn(s Signal) MidTurnClass {
 	// Destructive: would interrupt / invalidate the running turn or
 	// destroy state the in-flight turn depends on.
 	case SignalQuit, SignalClear, SignalNew, SignalCompact,
-		SignalReload, SignalUndo, SignalRetry, SignalBranch,
+		SignalReload, SignalUndo, SignalRewind, SignalRetry, SignalBranch,
 		SignalResume:
 		return MidTurnDestructive
 	// Custom: handler returned resolved prompt text in display; we

@@ -331,6 +331,9 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
 			m.streamingText = ""
 		}
+		if m.turnCancelledByUser && isContextCancellation(ev.Err) {
+			return
+		}
 		// Strip provider JSON envelope, attach a recovery hint when we
 		// recognize the failure class. Same error firing N times in a
 		// row collapses into one row with "(×N)" — image #62 had 4

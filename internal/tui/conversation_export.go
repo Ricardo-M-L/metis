@@ -18,6 +18,30 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/security"
 )
 
+const (
+	internalReviewPromptOpen  = "<metis-internal-review>"
+	internalReviewPromptClose = "</metis-internal-review>"
+)
+
+var (
+	internalReviewPromptSection      = regexp.MustCompile(`(?is)<metis-internal-review(?:\s[^>]*)?>.*?</metis-internal-review\s*>`)
+	unterminatedInternalReviewPrompt = regexp.MustCompile(`(?is)<metis-internal-review(?:\s[^>]*)?>.*\z`)
+)
+
+func wrapInternalReviewPrompt(prompt string) string {
+	return internalReviewPromptOpen + "\n" + prompt + "\n" + internalReviewPromptClose
+}
+
+// stripInternalReviewPrompt is shared by live export and resume hydration.
+// The provider-facing review frame belongs in durable loop history so a
+// resumed model retains its task, but it is implementation detail rather than
+// a user-authored transcript row.
+func stripInternalReviewPrompt(text string) string {
+	text = internalReviewPromptSection.ReplaceAllString(text, "")
+	text = unterminatedInternalReviewPrompt.ReplaceAllString(text, "")
+	return strings.TrimSpace(text)
+}
+
 // conversationText renders the provider-neutral history as the same kind of
 // readable, glyph-led transcript Claude Code writes from /export. It is
 // deliberately built from the visible message blocks instead of serializing
@@ -144,6 +168,7 @@ func cleanExportText(text string) string {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
 	text = ansi.Strip(text)
+	text = stripInternalReviewPrompt(text)
 	for _, re := range internalExportSections {
 		text = re.ReplaceAllString(text, "")
 	}

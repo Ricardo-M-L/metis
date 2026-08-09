@@ -2,8 +2,12 @@ package workflow
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
 func TestRun_AllStepsSucceed(t *testing.T) {
@@ -75,5 +79,55 @@ func TestCapOutput_KeepsErrorTail(t *testing.T) {
 	}
 	if !strings.Contains(got, "error output") {
 		t.Errorf("missing omission marker: %q", got)
+	}
+}
+
+func TestRun_SandboxWrapFailureFailsClosedAndStops(t *testing.T) {
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(t.TempDir(), "must-not-run")
+	wf := Workflow{Steps: []Step{
+		{Name: "wrapped", Command: "printf should-not-run > '" + sentinel + "'"},
+		{Name: "after", Command: "printf also-must-not-run"},
+	}}
+
+	results := Run(context.Background(), wf, RunOptions{StopOnError: true, Sandbox: manager})
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if results[0].Status != StatusFailed || results[0].ExitCode != -1 || !strings.Contains(results[0].Output, "sandbox wrap failed") {
+		t.Fatalf("first result = %+v, want explicit sandbox failure", results[0])
+	}
+	if results[1].Status != StatusSkipped {
+		t.Fatalf("second result = %+v, want skipped", results[1])
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("workflow step ran after Wrap failure: stat err=%v", err)
+	}
+}
+
+func TestRun_InjectedManagerFiltersSecretsAndSetsPrivateTemp(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "must-not-leak")
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	wf := Workflow{Steps: []Step{{
+		Name:    "env",
+		Command: `if [ -n "${OPENAI_API_KEY:-}" ]; then echo leaked; exit 9; fi; printf %s "$TMPDIR"`,
+	}}}
+
+	results := Run(context.Background(), wf, RunOptions{StopOnError: true, Sandbox: manager})
+	if len(results) != 1 || results[0].Status != StatusOK {
+		t.Fatalf("workflow env probe failed: %+v", results)
+	}
+	if results[0].Output != manager.TempDir() {
+		t.Fatalf("workflow TMPDIR=%q, want private temp %q", results[0].Output, manager.TempDir())
 	}
 }

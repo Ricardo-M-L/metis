@@ -156,7 +156,7 @@ func (r *CacheStatsRing) LastBreak() (oldFP, newFP string) {
 //	model — Loop.Model (the resolved id)
 //	system — the assembled system prompt at the time of the call
 //	tools — the tool spec list ([]llm.ToolSpec); only Name participates
-//	effort — Loop.Effort
+//	effort — Loop.EffortValue()
 //
 // Output: hex-encoded sha256, first 12 chars (full hash is overkill
 // for prefix-cache invalidation analysis).

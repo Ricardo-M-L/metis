@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/fun"
@@ -16,12 +17,18 @@ type Cmd struct {
 	Description string
 	Handler     Handler
 
-	// AllowedTools / Model carry per-command frontmatter overrides from
-	// user-authored commands (~/.metis/commands/*.md). Empty = no
-	// override. Consumed by callers that apply a per-turn tool allowlist
-	// or model switch when dispatching a SignalCustomPrompt command.
+	// AllowedTools / Model carry per-command frontmatter requests from
+	// user-authored commands (~/.metis/commands/*.md). Empty = no request.
+	// Trusted AllowedTools become one-turn pre-approvals. Model is validated
+	// against the already active model; Metis does not silently rebuild the
+	// provider, and a mismatch tells the user to run /model explicitly.
 	AllowedTools []string
 	Model        string
+	// Trusted is true only for commands loaded from the user's Metis home.
+	// Project-local commands are prompt templates but cannot use frontmatter
+	// to auto-approve tools or influence model selection until Metis has a project-trust
+	// decision comparable to Claude Code's trust boundary.
+	Trusted bool
 
 	// Custom is true for user-authored commands loaded from
 	// ~/.metis/commands/*.md (and project .metis/commands/). The
@@ -106,15 +113,19 @@ const (
 )
 
 type Registry struct {
-	cmds  []Cmd
-	index map[string]*Cmd
+	mu       sync.RWMutex
+	cmds     []Cmd
+	index    map[string]*Cmd
+	reserved map[string]struct{}
 }
 
 func NewRegistry() *Registry {
-	return &Registry{index: make(map[string]*Cmd)}
+	return &Registry{index: make(map[string]*Cmd), reserved: make(map[string]struct{})}
 }
 
 func (r *Registry) Register(c Cmd) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.cmds = append(r.cmds, c)
 	cp := &r.cmds[len(r.cmds)-1]
 	r.index[c.Name] = cp
@@ -124,14 +135,62 @@ func (r *Registry) Register(c Cmd) {
 }
 
 func (r *Registry) All() []Cmd {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := append([]Cmd(nil), r.cmds...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
 func (r *Registry) Get(name string) (*Cmd, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	c, ok := r.index[name]
 	return c, ok
+}
+
+// Reserve prevents a user-authored custom command from claiming a name owned
+// by another dispatcher (notably the legacy TUI REPL registry). Reserved names
+// do not become callable slash commands by themselves.
+func (r *Registry) Reserve(names ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			r.reserved[name] = struct{}{}
+		}
+	}
+}
+
+func (r *Registry) IsReserved(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.reserved[name]
+	return ok
+}
+
+// RemoveCustom drops every command loaded from commands/*.md and rebuilds the
+// alias index. It lets /reload reflect edits and deletions instead of stacking
+// stale closures for the lifetime of the process.
+func (r *Registry) RemoveCustom() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := make([]Cmd, 0, len(r.cmds))
+	for _, cmd := range r.cmds {
+		if !cmd.Custom {
+			kept = append(kept, cmd)
+		}
+	}
+	r.cmds = kept
+	r.index = make(map[string]*Cmd, len(r.cmds))
+	for i := range r.cmds {
+		cmd := &r.cmds[i]
+		r.index[cmd.Name] = cmd
+		for _, alias := range cmd.Aliases {
+			r.index[alias] = cmd
+		}
+	}
 }
 
 // Parse returns (true, output, signal, args) if input is a slash command,
@@ -157,7 +216,7 @@ func (r *Registry) Parse(input string) (handled bool, display string, sig Signal
 		// the original input as plain text.
 		return false, "", SignalNone, ""
 	}
-	c, ok := r.index[name]
+	c, ok := r.Get(name)
 	if !ok {
 		return true, fmt.Sprintf("unknown: /%s — try /help", name), SignalNone, ""
 	}
@@ -243,7 +302,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 		return "(history cleared)", SignalClear
 	}})
 	r.Register(Cmd{Name: "retry", Description: "retry last assistant response", Handler: func(_ string) (string, Signal) {
-		return "(retrying last response...)", SignalRetry
+		return "", SignalRetry
 	}})
 	r.Register(Cmd{Name: "undo", Aliases: []string{"u"}, Description: "remove last user/assistant exchange (incl. tool calls)", Handler: func(_ string) (string, Signal) {
 		// Empty display — the actual confirmation is printed by the
@@ -428,7 +487,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 
 	// Info commands
 	r.Register(Cmd{Name: "status", Description: "show session info", Handler: func(_ string) (string, Signal) {
-		return "(status: see REPL)", SignalStatus
+		return "", SignalStatus
 	}})
 	r.Register(Cmd{Name: "session", Aliases: []string{"sid"}, Description: "show current session id + title + turn count", Handler: func(_ string) (string, Signal) {
 		return "", SignalSession
@@ -441,11 +500,8 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	}})
 
 	// Tools & Skills
-	r.Register(Cmd{Name: "tools", Aliases: []string{"t"}, Description: "list registered tools (Read / Bash / Glob / …)", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "tools", Aliases: []string{"t", "toolsets"}, Description: "list registered tools (Read / Bash / Glob / …)", Handler: func(_ string) (string, Signal) {
 		return "", SignalTools
-	}})
-	r.Register(Cmd{Name: "toolsets", Description: "show available toolsets", Handler: func(_ string) (string, Signal) {
-		return "(toolsets: file, terminal, web, memory, skills, cronjob, delegation, web)", SignalNone
 	}})
 	r.Register(Cmd{Name: "skills", Aliases: []string{"sk"}, Description: "list installed skills under ~/.metis/skills", Handler: func(_ string) (string, Signal) {
 		return "", SignalSkills
@@ -453,7 +509,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "memory", Description: "auto-memory: list | show <file> | rm <file> | path", Handler: func(args string) (string, Signal) {
 		return handleMemoryCommand(args), SignalNone
 	}})
-	r.Register(Cmd{Name: "reload", Description: "reload tools and skills", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "reload", Description: "reload disk-backed skills and custom commands", Handler: func(_ string) (string, Signal) {
 		return "(reloading...)", SignalReload
 	}})
 
@@ -479,9 +535,6 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 		// (and any tool-loop bundle) so your previous prompt is the
 		// next thing to send — you just retype with edits.
 		return "", SignalUndo
-	}})
-	r.Register(Cmd{Name: "submit", Aliases: []string{"s"}, Description: "submit and finalize", Handler: func(_ string) (string, Signal) {
-		return "(submit: use /plan to preview first)", SignalNone
 	}})
 	r.Register(Cmd{Name: "config", Aliases: []string{"cfg"}, Description: "open config in editor", Handler: func(_ string) (string, Signal) {
 		return "(config: ~/.metis/config.toml)", SignalNone

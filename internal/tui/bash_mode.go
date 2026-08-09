@@ -16,11 +16,14 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
 // bashLocalResultMsg carries the finished `!cmd` output back to the Update
@@ -49,6 +52,7 @@ func (m *Model) bashLocalCmd(cmd string) tea.Cmd {
 		shell = "/bin/sh"
 	}
 	denylist := append([]string(nil), settings.Denylist...) // snapshot; closure must not touch m
+	manager := replSandboxManager(m.asREPL())
 
 	return func() tea.Msg {
 		// Quick denylist check (mirrors a slice of internal/tools/builtin/bash).
@@ -66,7 +70,20 @@ func (m *Model) bashLocalCmd(cmd string) tea.Cmd {
 		defer cancel()
 
 		start := time.Now()
-		out, err := exec.CommandContext(ctx, shell, "-c", cmd).CombinedOutput()
+		exe := exec.CommandContext(ctx, shell, "-c", cmd)
+		if manager != nil {
+			exe.Env = manager.FilterEnv(os.Environ(), settings.Sandbox.DangerouslyInheritEnv)
+			wrapped, wrapErr := manager.Wrap(exe, sandbox.Request{})
+			if wrapErr != nil {
+				return bashLocalResultMsg{Message{
+					Role:      "bash-error",
+					Content:   fmt.Sprintf("$ %s\n(sandbox failed closed: %v)", cmd, wrapErr),
+					Timestamp: time.Now(),
+				}}
+			}
+			exe = wrapped
+		}
+		out, err := exe.CombinedOutput()
 		elapsed := time.Since(start).Truncate(time.Millisecond)
 
 		if int64(len(out)) > int64(maxBytes) {

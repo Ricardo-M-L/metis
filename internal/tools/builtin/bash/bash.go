@@ -16,6 +16,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -36,6 +37,13 @@ type Bash struct {
 	gate       *permission.Gate
 	settings   config.ToolBashSettings
 	classifier *BashClassifier
+	sandbox    *sandbox.Manager
+
+	// sandboxInitErr preserves constructor failures for the legacy New API,
+	// whose value-returning signature cannot surface an error. Execute checks
+	// it before spawning anything, so an invalid/enabled-but-unavailable
+	// sandbox always fails closed.
+	sandboxInitErr error
 
 	// Jobs is the process-wide background job pool. nil disables the
 	// auto-background path entirely (foreground commands still run,
@@ -336,7 +344,7 @@ func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 	// merely because Seatbelt is enabled. Auto-allow only replaces an ASK;
 	// the kernel sandbox remains the approval boundary for that prompt.
 	d, src := b.gate.Check(context.Background(), "Bash", cmd)
-	if d == permission.DecisionAsk && SandboxModeAutoApprovesGate(effectiveMode(b.settings.Sandbox.Mode)) {
+	if d == permission.DecisionAsk && b.sandbox != nil && b.sandbox.AutoAllow() {
 		return tools.PermissionAllow, "sandbox auto-allow"
 	}
 	return mapDecision(d), src
@@ -468,9 +476,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	// On macOS/Windows it's a plain `shell -c cmdStr` (no /proc here).
 	// See internal/jobs/oom_linux.go.
 	exe := jobs.OOMWrappedCommand(cctx, shell, cmdStr)
-	childEnv := FilterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
-	childEnv = ApplyNetworkPolicy(childEnv, b.settings.Sandbox)
-	exe.Env = childEnv
+	exe.Env = b.commandEnv(os.Environ())
 	// G.2 (2026-05-12): when a sub-agent was spawned with `cwd:"..."`
 	// or `isolation:"worktree"`, the Agent tool stamps the effective
 	// cwd into context. Bash threads it through to exec.Cmd.Dir so the
@@ -480,11 +486,9 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	if cwd := agent.CwdFromContext(ctx); cwd != "" {
 		exe.Dir = cwd
 	}
-	// Wrap in macOS Seatbelt sandbox when configured. No-op for
-	// mode=off, the legacy default. cwd is whichever Dir we just
-	// set (or the process cwd) so the file-write allowlist is
-	// scoped correctly.
-	if wrapped, err := applySandboxWrap(cctx, exe, effectiveMode(b.settings.Sandbox.Mode), exe.Dir); err != nil {
+	// Enter the runtime-owned OS sandbox after Dir and Env are finalised.
+	// Wrap failures are ordinary tool errors and always fail closed.
+	if wrapped, err := b.wrapCommand(exe); err != nil {
 		return &tools.Result{
 			Output:  "sandbox wrap failed: " + err.Error(),
 			IsError: true,
@@ -658,9 +662,7 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	}
 	// Linux OOM-score wrapping (see jobs.OOMWrappedCommand).
 	exe := jobs.OOMWrappedCommand(bgCtx, shell, cmdStr)
-	childEnv := FilterEnv(os.Environ(), b.settings.Sandbox.DangerouslyInheritEnv)
-	childEnv = ApplyNetworkPolicy(childEnv, b.settings.Sandbox)
-	exe.Env = childEnv
+	exe.Env = b.commandEnv(os.Environ())
 	// G.2 — read effective cwd from the ORIGINAL ctx (not bgCtx,
 	// which is fresh). The sub-agent ctx the Agent tool stamped lives
 	// on the upstream chain; bgCtx is just for cancellation lifetime.
@@ -673,7 +675,7 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	// path does. Background jobs outlive the foreground turn but the
 	// sandbox restrictions don't expire with the context, so the
 	// wrap is just as effective.
-	if wrapped, err := applySandboxWrap(bgCtx, exe, effectiveMode(b.settings.Sandbox.Mode), exe.Dir); err != nil {
+	if wrapped, err := b.wrapCommand(exe); err != nil {
 		cancel()
 		return &tools.Result{
 			Output:  "sandbox wrap failed: " + err.Error(),

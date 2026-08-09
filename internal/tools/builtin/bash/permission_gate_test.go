@@ -6,17 +6,20 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 func autoAllowBashForTest(t *testing.T, gate *permission.Gate) Bash {
 	t.Helper()
-	previous := RuntimeSandboxMode()
-	SetRuntimeSandboxMode("")
-	t.Cleanup(func() { SetRuntimeSandboxMode(previous) })
-	return New(gate, config.ToolBashSettings{
+	manager, err := sandbox.NewManager(string(sandbox.ModeAutoAllow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	return NewWithSandbox(gate, config.ToolBashSettings{
 		Sandbox: config.SandboxBashSettings{Mode: SandboxModeAutoAllow},
-	})
+	}, manager)
 }
 
 func TestBashCanUse_SandboxAutoAllowCannotEscapePlan(t *testing.T) {
@@ -47,6 +50,31 @@ func TestBashCanUse_SandboxAutoAllowStillReplacesOrdinaryAsk(t *testing.T) {
 	got, source := tool.CanUse(context.Background(), map[string]any{"command": "touch /tmp/metis-approved-in-sandbox"})
 	if got != tools.PermissionAllow || source != "sandbox auto-allow" {
 		t.Fatalf("ordinary ask + sandbox auto-allow = %v (%s), want allow", got, source)
+	}
+}
+
+func TestBashCanUse_PermissionsModeDoesNotReplaceAsk(t *testing.T) {
+	manager, err := sandbox.NewManager(string(sandbox.ModePermissions))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	tool := NewWithSandbox(permission.New(permission.ModeDefault), config.ToolBashSettings{}, manager)
+
+	got, source := tool.CanUse(context.Background(), map[string]any{"command": "touch ordinary-ask"})
+	if got != tools.PermissionAsk || source == "sandbox auto-allow" {
+		t.Fatalf("permissions-mode decision = %v (%s), want original ask", got, source)
+	}
+}
+
+func TestBashCanUse_SandboxAutoAllowDoesNotRelabelExistingAllow(t *testing.T) {
+	gate := permission.New(permission.ModeDefault)
+	gate.AppendRules(permission.Rule{Tool: "Bash", Verb: permission.DecisionAllow, Source: "test-explicit-allow"})
+	tool := autoAllowBashForTest(t, gate)
+
+	got, source := tool.CanUse(context.Background(), map[string]any{"command": "touch explicitly-allowed"})
+	if got != tools.PermissionAllow || source == "sandbox auto-allow" {
+		t.Fatalf("explicit allow + sandbox auto-allow = %v (%s), want original allow source", got, source)
 	}
 }
 

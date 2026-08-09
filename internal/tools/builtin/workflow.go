@@ -18,7 +18,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/workflow"
 )
@@ -26,14 +28,38 @@ import (
 // Workflow is the LLM-facing tool.
 type Workflow struct {
 	tools.BaseTool
-	gate  *permission.Gate
-	store *workflow.Store
+	gate    *permission.Gate
+	store   *workflow.Store
+	sandbox *sandbox.Manager
 }
 
 // NewWorkflow builds the tool. store may be nil (named-workflow
 // persistence disabled); inline run still works.
 func NewWorkflow(gate *permission.Gate, store *workflow.Store) *Workflow {
 	return &Workflow{gate: gate, store: store}
+}
+
+// NewWorkflowWithSandbox builds Workflow with the runtime-owned sandbox
+// Manager shared by Bash and Git.
+func NewWorkflowWithSandbox(gate *permission.Gate, store *workflow.Store, manager *sandbox.Manager) *Workflow {
+	return &Workflow{gate: gate, store: store, sandbox: manager}
+}
+
+// WithSandbox installs the runtime-owned Manager and returns w for fluent
+// registry construction.
+func (w *Workflow) WithSandbox(manager *sandbox.Manager) *Workflow {
+	if w != nil {
+		w.sandbox = manager
+	}
+	return w
+}
+
+// SandboxManager returns the Manager used for workflow subprocesses.
+func (w *Workflow) SandboxManager() *sandbox.Manager {
+	if w == nil {
+		return nil
+	}
+	return w.sandbox
 }
 
 func (Workflow) Name() string { return "Workflow" }
@@ -122,6 +148,9 @@ func (w Workflow) CanUse(ctx context.Context, in map[string]any) (tools.Permissi
 		case tools.PermissionDeny:
 			return tools.PermissionDeny, s
 		case tools.PermissionAsk:
+			if w.sandbox != nil && w.sandbox.AutoAllow() {
+				continue
+			}
 			worst = tools.PermissionAsk
 			src = s
 		}
@@ -183,8 +212,11 @@ func (w Workflow) execRun(ctx context.Context, wf workflow.Workflow, in map[stri
 	if v, ok := in["stop_on_error"].(bool); ok {
 		stop = v
 	}
-	cwd, _ := os.Getwd()
-	results := workflow.Run(ctx, wf, workflow.RunOptions{Cwd: cwd, StopOnError: stop})
+	cwd := agent.CwdFromContext(ctx)
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	results := workflow.Run(ctx, wf, workflow.RunOptions{Cwd: cwd, StopOnError: stop, Sandbox: w.sandbox})
 
 	var b strings.Builder
 	label := wf.Name

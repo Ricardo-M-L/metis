@@ -23,6 +23,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -63,6 +64,16 @@ type REPL struct {
 	// FreshPermissionMode is the invocation-level baseline used by /new and
 	// /branch; it must not be inherited from a resumed bypass session.
 	FreshPermissionMode permission.Mode
+	// sandbox is the runtime-owned command boundary. It is wired directly by
+	// the composition layer so /sandbox and local !cmd remain protected even
+	// when the model-facing Bash tool is disabled or hidden from the registry.
+	sandbox *sandbox.Manager
+	// Directory-scope callbacks share the runtime's live AllowedDirs backend
+	// with the Bubble Tea surface. Nil means the embedder did not wire mutable
+	// scope management; signal dispatch then says so explicitly.
+	DirAdd    func(path string, persist bool) error
+	DirRemove func(path string) error
+	DirList   func() []string
 
 	stdin io.Reader
 	out   io.Writer
@@ -76,12 +87,14 @@ type REPL struct {
 	// once at end of turn rather than re-rendering line-by-line.
 	streamBuf strings.Builder
 
-	// outputStyle tracks the user's /output-style choice. Used by the
-	// chat surface to decide thinking visibility + tool-row collapsing
-	// (Phase C: state captured here; render-pipeline gating lands with
-	// the streamlined-output refactor in a follow-up). Values: "" /
-	// "full" / "streamlined" / "minimal".
+	// outputStyle tracks the user's /output-style choice in the plain REPL.
+	// The TUI bridge copies the live Model value into this field and installs
+	// ApplyOutputStyle so a command handler updates both surfaces atomically.
 	outputStyle string
+	// ApplyOutputStyle is nil in the headless readline REPL. Model.asREPL sets
+	// it to update the live chat renderer instead of only mutating this
+	// short-lived bridge value.
+	ApplyOutputStyle func(style string)
 
 	// TUI-only bridges: slash handlers run in the REPL layer but a few
 	// genuinely need access to TUI-side state (sub-agent roster) or
@@ -107,6 +120,9 @@ type REPL struct {
 	// BypassCache flips a Loop flag that makes the next request skip
 	// the prompt-cache breakpoint write. Consumed by cmdBreakCache.
 	BypassCache func()
+	// RecapSnapshot returns the latest structural turn recap already rendered
+	// by the TUI. The headless REPL leaves it nil because it has no recap rows.
+	RecapSnapshot func() string
 
 	shouldQuit bool
 }
@@ -165,6 +181,15 @@ func (r *REPL) ConfigureProviderSwitch(cfg *config.Config, providerName string) 
 	r.providerName = providerName
 }
 
+// ConfigureSandbox supplies the runtime-owned OS sandbox independently of
+// tool visibility. Registry lookup remains as a compatibility fallback for
+// embedders that construct a REPL around a sandboxed Bash tool directly.
+func (r *REPL) ConfigureSandbox(manager *sandbox.Manager) {
+	if r != nil {
+		r.sandbox = manager
+	}
+}
+
 func (r *REPL) Run(ctx context.Context) (runErr error) {
 	defer func() {
 		if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.providerName, r.model, r.Loop.System); err != nil {
@@ -216,6 +241,10 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 		if text == "" {
 			continue
 		}
+		turnCtx := ctx
+		visibleInput := text
+		submitSlashPrompt := false
+		reviewInvocation := ""
 
 		// Built-in REPL command? (parsed before LLM)
 		if cmd := r.parseREPLCommand(text); cmd != nil {
@@ -233,11 +262,25 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 
 		// Slash command?
 		if handled, display, sig, args := r.Slash.Parse(text); handled {
-			if display != "" {
+			// SignalCustomPrompt display is provider-facing prompt material. It
+			// must not be echoed to stdout (especially /review's internal frame),
+			// and ordinary custom commands should not appear twice.
+			if display != "" && sig != slash.SignalCustomPrompt {
 				fmt.Fprintln(r.out, display)
 			}
 			_ = args // consumed by signal handlers below
+			support := classifyPlainREPLSignal(sig)
+			if support == plainREPLSignalTUIOnly {
+				fmt.Fprintln(r.out, r.Styles.Hint.Render(plainREPLTUIOnlyMessage(sig)))
+				continue
+			}
+			if support == plainREPLSignalUnknown {
+				fmt.Fprintf(r.out, "slash command signal %d is not implemented in the plain readline REPL\n", sig)
+				continue
+			}
 			switch sig {
+			case slash.SignalNone:
+				// Handler display (usage/help) was already printed above.
 			case slash.SignalQuit:
 				return nil
 			case slash.SignalClear:
@@ -247,6 +290,8 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 				}
 				r.Loop.Reset()
 				fmt.Fprintln(r.out, r.Styles.Hint.Render("(history cleared)"))
+			case slash.SignalCompact:
+				fmt.Fprintln(r.out, cmdCompact(r, args))
 			case slash.SignalNew:
 				// Save daily note before starting new session
 				if r.Loop.Memory != nil {
@@ -281,6 +326,10 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 				} else {
 					fmt.Fprintln(r.out, r.Styles.Hint.Render("(nothing to undo)"))
 				}
+			case slash.SignalRewind:
+				fmt.Fprintln(r.out, r.rewindLastEditTurn())
+			case slash.SignalRetry:
+				r.retryLastResponse(ctx)
 			case slash.SignalHistory:
 				fmt.Fprintln(r.out, renderHistoryForREPL(r.Loop.History()))
 			case slash.SignalTitle:
@@ -310,31 +359,165 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 				} else {
 					fmt.Fprintln(r.out, r.Styles.Hint.Render("(session synced to disk)"))
 				}
+			case slash.SignalStatus:
+				mode := ""
+				if r.Gate != nil {
+					mode = string(r.Gate.Mode())
+				}
+				fmt.Fprintln(r.out, renderCurrentSession(r.Session, r.SessionID, r.Loop, r.model, mode))
 			case slash.SignalTools:
 				fmt.Fprintln(r.out, renderToolsList(r.Loop))
 			case slash.SignalSessions:
 				fmt.Fprintln(r.out, renderSessionsList(r.Session, 20))
 			case slash.SignalSession:
-				fmt.Fprintln(r.out, renderCurrentSession(r.Session, r.SessionID, r.Loop, r.model, string(r.Gate.Mode())))
+				mode := ""
+				if r.Gate != nil {
+					mode = string(r.Gate.Mode())
+				}
+				fmt.Fprintln(r.out, renderCurrentSession(r.Session, r.SessionID, r.Loop, r.model, mode))
 			case slash.SignalSkills:
 				fmt.Fprintln(r.out, renderSkillsList(r.Loop, r.skillDir))
 			case slash.SignalVersion:
 				fmt.Fprintln(r.out, renderVersion())
+			case slash.SignalAddDir:
+				if r.DirAdd == nil {
+					fmt.Fprintln(r.out, "/add-dir: runtime directory-scope backend unavailable in this REPL build")
+				} else if err := r.DirAdd(args, true); err != nil {
+					fmt.Fprintln(r.out, "add-dir: "+err.Error())
+				} else {
+					fmt.Fprintln(r.out, "(added: "+strings.TrimSpace(args)+")")
+				}
+			case slash.SignalRemoveDir:
+				if r.DirRemove == nil {
+					fmt.Fprintln(r.out, "/rm-dir: runtime directory-scope backend unavailable in this REPL build")
+				} else if err := r.DirRemove(args); err != nil {
+					fmt.Fprintln(r.out, "rm-dir: "+err.Error())
+				} else {
+					fmt.Fprintln(r.out, "(removed: "+strings.TrimSpace(args)+")")
+				}
+			case slash.SignalListDirs:
+				if r.DirList == nil {
+					fmt.Fprintln(r.out, "/add-dir: runtime directory-scope backend unavailable in this REPL build")
+				} else if dirs := r.DirList(); len(dirs) == 0 {
+					fmt.Fprintln(r.out, "(no additional dirs — `/add-dir <path>` to add one)")
+				} else {
+					fmt.Fprintln(r.out, "additional dirs:\n  "+strings.Join(dirs, "\n  "))
+				}
+			case slash.SignalCost:
+				fmt.Fprintln(r.out, cmdCost(r, args))
+			case slash.SignalDiff:
+				fmt.Fprintln(r.out, cmdGitDiff(r, args))
+			case slash.SignalDoctor:
+				fmt.Fprintln(r.out, cmdDoctor(r, args))
+			case slash.SignalStats:
+				fmt.Fprintln(r.out, renderREPLStats(r))
 			case slash.SignalKeybindings:
-				// Bubbletea TUI also handles this signal
-				// (internal/tui/keybind_submit.go); the readline REPL
-				// was missing the case so /keybindings looked silent.
-				fmt.Fprintln(r.out, renderKeybindings())
+				fmt.Fprintln(r.out, renderREPLKeybindings())
+			case slash.SignalPermissions:
+				if r.Gate == nil {
+					fmt.Fprintln(r.out, "permissions: permission gate unavailable")
+				} else {
+					fmt.Fprintln(r.out, renderPermissions(&Model{gate: r.Gate}))
+				}
+			case slash.SignalHooks:
+				fmt.Fprintln(r.out, renderHooksList(r.cfg))
+			case slash.SignalExport:
+				fmt.Fprintln(r.out, cmdExport(r, args))
+			case slash.SignalReleaseNotes:
+				fmt.Fprintln(r.out, renderReleaseNotes())
+			case slash.SignalEffort:
+				fmt.Fprintln(r.out, cmdEffort(r, args))
+			case slash.SignalPRComments:
+				fmt.Fprintln(r.out, renderPRComments(args))
+			case slash.SignalUpgrade:
+				fmt.Fprintln(r.out, renderUpgrade())
+			case slash.SignalContext:
+				fmt.Fprintln(r.out, renderREPLContext(r))
+			case slash.SignalResume:
+				id := r.SessionID
+				if id == "" {
+					id = "<session-id>"
+				}
+				fmt.Fprintf(r.out, "To resume this session later:\n\n  metis chat --resume %s\n", id)
+			case slash.SignalTag:
+				if r.Session == nil || r.SessionID == "" {
+					fmt.Fprintln(r.out, "(tag: no session store)")
+				} else if err := tagCurrentSession(r.Session, r.SessionID, args); err != nil {
+					fmt.Fprintln(r.out, "tag: "+err.Error())
+				} else {
+					fmt.Fprintln(r.out, "(tagged: "+strings.TrimSpace(args)+")")
+				}
+			case slash.SignalPlan:
+				r.setPermissionMode(permission.ModePlan, "plan")
+			case slash.SignalAcceptEdits:
+				r.setPermissionMode(permission.ModeAcceptEdits, "acceptEdits")
+			case slash.SignalBypassPermissions:
+				r.setPermissionMode(permission.ModeBypassPermissions, "bypassPermissions")
+			case slash.SignalDefault:
+				r.setPermissionMode(permission.ModeDefault, "default")
+			case slash.SignalDontAsk:
+				r.setPermissionMode(permission.ModeDontAsk, "dontAsk")
+			case slash.SignalRename:
+				title := strings.TrimSpace(args)
+				if title == "" || r.Session == nil || r.SessionID == "" {
+					fmt.Fprintln(r.out, "rename: no active session/title")
+				} else if err := r.Session.SetTitle(r.SessionID, title); err != nil {
+					fmt.Fprintln(r.out, "rename: "+err.Error())
+				} else {
+					fmt.Fprintln(r.out, "(title set: "+title+")")
+				}
+			case slash.SignalReload:
+				fmt.Fprintln(r.out, r.reloadDiskCatalog())
+			case slash.SignalBatch:
+				// /batch is prompt rewriting, not TUI chrome. Submit the same
+				// Research -> Plan -> Execute contract in readline mode that the
+				// Bubble Tea dispatcher sends in interactive mode.
+				text = slash.BatchPrompt(args)
+				submitSlashPrompt = true
+			case slash.SignalCustomPrompt:
+				customCmd := customCommandFromInput(r.Slash, visibleInput)
+				preparedCtx, warnings, err := prepareCustomCommandTurn(turnCtx, customCmd, r.Loop)
+				for _, warning := range warnings {
+					fmt.Fprintln(r.out, r.Styles.Hint.Render(warning))
+				}
+				if err != nil {
+					fmt.Fprintln(r.out, r.Styles.Err.Render(err.Error()))
+					break
+				}
+				if display == "" {
+					break
+				}
+				turnCtx = preparedCtx
+				if strings.EqualFold(slashName(visibleInput), "/review") {
+					reviewInvocation = visibleInput
+					text = wrapInternalReviewPrompt(display)
+				} else {
+					text = display
+				}
+				submitSlashPrompt = true
+			default:
+				// Known backend signals must never disappear if a future edit
+				// forgets to add its concrete case here.
+				fmt.Fprintf(r.out, "slash command signal %d is recognized but has no plain REPL backend handler\n", sig)
 			}
-			continue
+			if !submitSlashPrompt {
+				continue
+			}
 		}
 
-		r.Loop.AppendUser(text)
+		if reviewInvocation != "" {
+			r.Loop.AppendUserBlocks([]llm.ContentBlock{
+				{Type: "text", Text: text},
+				{Type: "text", Text: reviewInvocation},
+			})
+		} else {
+			r.Loop.AppendUser(text)
+		}
 		r.persistTail()
 		_ = runtime.AppendHistory(runtime.HistoryEntry{
-			SessionID: r.SessionID, Input: text, Source: "repl",
+			SessionID: r.SessionID, Input: visibleInput, Source: "repl",
 		})
-		if err := r.runTurn(ctx); err != nil {
+		if err := r.runTurn(turnCtx); err != nil {
 			errMsg := err.Error()
 			// Provide helpful guidance for common errors
 			if strings.Contains(errMsg, "API key not configured") {

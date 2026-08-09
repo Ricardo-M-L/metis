@@ -7,6 +7,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -26,6 +27,14 @@ import (
 // previous drain-until-empty loop could stay inside one spinnerTick for the
 // entire response, making the elapsed clock and `/export` appear frozen.
 const maxAgentEventsPerUpdate = 64
+
+func isContextCancellation(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) ||
+		strings.Contains(strings.ToLower(err.Error()), "context canceled")
+}
 
 // A bounded drain that hit its budget schedules a near-immediate continuation
 // rather than waiting for the normal animation interval. The small delay gives
@@ -193,6 +202,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		}
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.effortPicker != nil {
+			m.effortPicker.Resize(msg.Width, msg.Height)
+		}
 		// 2026-05-23: publish the chat-surface width to the package
 		// level so render_tool.go's renderEditDiff (which has no
 		// width parameter — toolEventItem doesn't carry one) can
@@ -287,9 +299,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		// and pasting into a permission dialog is meaningless.
 		// (turnActive is NOT a guard: users routinely queue the next
 		// prompt while the agent is mid-stream.)
-		if m.permActive || m.copyMode || m.activeScreen != nil {
-			pasteDebug("blocked: perm=%v copy=%v screen=%v len=%d",
-				m.permActive, m.copyMode, m.activeScreen != nil, len(msg.Content))
+		if m.permActive || m.copyMode || m.activeScreen != nil || m.effortPicker != nil {
+			pasteDebug("blocked: perm=%v copy=%v screen=%v effort=%v len=%d",
+				m.permActive, m.copyMode, m.activeScreen != nil, m.effortPicker != nil, len(msg.Content))
 			return m, nil
 		}
 		text := msg.Content
@@ -358,6 +370,14 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		// Phase D #41 — Ctrl+G round-trip. Editor exited; merge the
 		// saved buffer back into the textarea (or surface the error).
 		m.applyExternalEditorResult(msg)
+		return m, nil
+
+	case configEditorDoneMsg:
+		if msg.err != nil {
+			m.messages = append(m.messages, Message{Role: "error", Content: "config editor: " + msg.err.Error(), Timestamp: time.Now()})
+		} else {
+			m.messages = append(m.messages, Message{Role: "success", Content: "config saved · restart metis for provider/tool changes", Timestamp: time.Now()})
+		}
 		return m, nil
 
 	case tea.MouseClickMsg:
@@ -704,6 +724,8 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 // the thought-summary + recap rows, log the turn for /lessons, and
 // persist the tail to disk.
 func (m *Model) finalizeTurn(err error) {
+	userCancelled := m.turnCancelledByUser && isContextCancellation(err)
+	defer func() { m.turnCancelledByUser = false }()
 	// Phase F Ctrl+B (2026-05-12) — capture whether the turn was
 	// running in background mode BEFORE we reset the flag below, so
 	// the notification + result-banner logic can force-fire even on
@@ -800,7 +822,7 @@ func (m *Model) finalizeTurn(err error) {
 	// of duration / error — leaving it stuck would mislead a glance at
 	// the dock. Indicate failure with the Error variant first so the
 	// dock briefly shows red before clearing.
-	if err != nil {
+	if err != nil && !userCancelled {
 		notify.SendProgress(notify.ProgressError, 0)
 	}
 	notify.SendProgress(notify.ProgressClear, 0)
@@ -860,7 +882,7 @@ func (m *Model) finalizeTurn(err error) {
 		})
 	}
 	m.persistTail()
-	if err != nil {
+	if err != nil && !userCancelled {
 		// finalizeTurn fires when the loop's done channel returns. Most
 		// of the time that error has ALREADY been surfaced via the
 		// EventError path (tui_events.go), with formatProviderError

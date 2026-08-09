@@ -5,6 +5,7 @@ package permission
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -208,6 +209,12 @@ type Gate struct {
 	mu    sync.RWMutex
 	mode  Mode
 	rules []Rule
+	// nextScopedRuleID gives each temporary rule set an identity that can be
+	// removed precisely. A simple AppendRules + PopRules pair is unsafe across
+	// an agent turn: an interactive "always allow" may be appended while the
+	// turn is running, and PopRules would then remove the user's new rule rather
+	// than the command-scoped one.
+	nextScopedRuleID uint64
 
 	// modeNotifyMu serializes delivery of mode changes without holding mu.
 	// SetMode can be called concurrently by the UI and an in-flight plan tool;
@@ -592,6 +599,44 @@ func (g *Gate) AppendRules(rules ...Rule) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.rules = append(g.rules, rules...)
+}
+
+// PushScopedRules installs rules for a bounded operation and returns an
+// idempotent cleanup function that removes exactly those rules, even if other
+// rules are appended in the meantime. The caller-provided Source is replaced
+// with a unique session-scoped source so managed-policy and CLI rules retain
+// their higher authority.
+//
+// This is used by custom-command `allowed-tools`: the entries are temporary
+// pre-approvals for one Loop.Run, not persistent permission changes.
+func (g *Gate) PushScopedRules(rules ...Rule) func() {
+	if g == nil || len(rules) == 0 {
+		return func() {}
+	}
+
+	g.mu.Lock()
+	g.nextScopedRuleID++
+	source := "session:scoped-command:" + strconv.FormatUint(g.nextScopedRuleID, 10)
+	for i := range rules {
+		rules[i].Source = source
+	}
+	g.rules = append(g.rules, rules...)
+	g.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			kept := g.rules[:0]
+			for _, rule := range g.rules {
+				if rule.Source != source {
+					kept = append(kept, rule)
+				}
+			}
+			g.rules = kept
+			g.mu.Unlock()
+		})
+	}
 }
 
 // PopRules drops the trailing n rules from the stack. Used by the cron

@@ -24,12 +24,13 @@ package skills
 import (
 	"bytes"
 	"context"
-	"errors"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 
 	pubskill "github.com/Ricardo-M-L/metis/pkg/skill"
 )
@@ -79,6 +80,13 @@ func ShouldRunInlineShell(trust string) bool {
 // directory (filepath.Dir(sk.LocalPath)) so `cat ./template.json`
 // resolves the way the author expects.
 func ExpandInlineShell(ctx context.Context, body, cwd string) string {
+	return ExpandInlineShellWithSandbox(ctx, body, cwd, nil)
+}
+
+// ExpandInlineShellWithSandbox expands trusted skill shell blocks through the
+// runtime's shared OS sandbox. Keeping the old wrapper preserves embedders that
+// intentionally execute outside a Metis runtime.
+func ExpandInlineShellWithSandbox(ctx context.Context, body, cwd string, manager *sandbox.Manager) string {
 	if body == "" || !strings.Contains(body, "!") {
 		return body
 	}
@@ -91,14 +99,14 @@ func ExpandInlineShell(ctx context.Context, body, cwd string) string {
 		if len(sub) < 2 {
 			return match
 		}
-		return runInlineShell(ctx, sub[1], cwd)
+		return runInlineShell(ctx, sub[1], cwd, manager)
 	})
 	body = inlineShellBacktickRE.ReplaceAllStringFunc(body, func(match string) string {
 		sub := inlineShellBacktickRE.FindStringSubmatch(match)
 		if len(sub) < 2 {
 			return match
 		}
-		return runInlineShell(ctx, sub[1], cwd)
+		return runInlineShell(ctx, sub[1], cwd, manager)
 	})
 	return body
 }
@@ -106,7 +114,7 @@ func ExpandInlineShell(ctx context.Context, body, cwd string) string {
 // runInlineShell executes one shell command via `sh -c` with a per-
 // invocation timeout and byte cap. Returns the (trimmed) stdout on
 // success or a "[shell error: ...]" sentinel on failure.
-func runInlineShell(ctx context.Context, cmd, cwd string) string {
+func runInlineShell(ctx context.Context, cmd, cwd string, manager *sandbox.Manager) string {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return ""
@@ -131,22 +139,16 @@ func runInlineShell(ctx context.Context, cmd, cwd string) string {
 	//   2. WaitDelay=500ms is a belt-and-braces: if anything in the
 	//      group survives Setpgid (unlikely), the I/O goroutines
 	//      still force-close after 500ms.
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	c.Cancel = func() error {
-		if c.Process == nil {
-			return nil
-		}
-		if err := syscall.Kill(-c.Process.Pid, syscall.SIGKILL); err != nil {
-			// Falls back to the default behaviour (single-pid kill)
-			// when group kill is unsupported on the platform.
-			if errors.Is(err, syscall.ESRCH) {
-				return nil
-			}
-			return err
-		}
-		return nil
-	}
+	configureInlineShellCancellation(c)
 	c.WaitDelay = 500 * time.Millisecond
+	if manager != nil {
+		c.Env = manager.FilterEnv(os.Environ(), false)
+		wrapped, err := manager.Wrap(c, sandbox.Request{Cwd: cwd})
+		if err != nil {
+			return "[shell sandbox error: " + err.Error() + "]"
+		}
+		c = wrapped
+	}
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr

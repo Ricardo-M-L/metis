@@ -91,7 +91,6 @@ var modalCommands = map[string]bool{
 	"permissions": true,
 	"hooks":       true,
 	"tools":       true,
-	"toolsets":    true,
 	"skills":      true,
 	"version":     true,
 	"env":         true,
@@ -110,8 +109,10 @@ var modalCommands = map[string]bool{
 // promotePaletteSelection applies Enter's palette-selection semantics to the
 // submitted text. It deliberately runs before turn-state routing so commands
 // selected while an agent is busy behave exactly like commands selected while
-// idle. Exact command names are never replaced, even when the cursor points at
-// a different palette row.
+// idle. Exact command names are never replaced, and an incomplete prefix is
+// promoted only when it identifies one command. With several matches, Tab or
+// arrow navigation first writes the chosen canonical name into the input; a
+// bare ambiguous prefix such as /s must not silently become /share.
 func (m *Model) promotePaletteSelection(text string) string {
 	if !m.showPalette || len(m.palMatched) == 0 || !strings.HasPrefix(text, "/") {
 		return text
@@ -124,6 +125,9 @@ func (m *Model) promotePaletteSelection(text string) string {
 		_, exactSlash = m.slash.Get(typedName)
 	}
 	if exactREPL || exactSlash {
+		return text
+	}
+	if len(m.palMatched) != 1 {
 		return text
 	}
 
@@ -208,6 +212,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// so `/expo` + Enter while a turn was closing was treated as literal
 	// model input and queued instead of invoking `/export`.
 	text = m.promotePaletteSelection(text)
+	// Most prompts have identical provider-facing and transcript-facing text.
+	// /review is the exception: the model needs a long internal review frame,
+	// while the user should see only the command they submitted.
+	visibleUserText := ""
+	// Custom-command frontmatter may attach request-local permission rules.
+	// Keep the derived context local to this submit; ordinary prompts continue
+	// using m.ctx and cannot inherit a prior command's approvals.
+	turnRunCtx := m.ctx
 
 	// /export is a local snapshot operation. Loop.History returns a locked
 	// copy, so it is safe to run while the provider/tool loop is active (or
@@ -248,6 +260,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		m.openAgentsView()
 		return m, nil
 	}
+	// Reasoning effort is local runtime state, not model input. Handle it
+	// before turnActive routing so `/effort` never becomes a literal steer.
+	if m.handleLocalEffortCommand(text) {
+		return m, nil
+	}
 	// `[Image #N]` placeholders STAY in the displayed text — the user
 	// pasted those and expects to see them in the transcript. The
 	// real image bytes are split out into ContentBlocks at the
@@ -257,7 +274,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// commands that explicitly request queueing still use queuedPrompts.
 	// This avoids racing a second runTurnAsync goroutine on doneCh while
 	// letting follow-up instructions affect work that is already running.
-	if m.turnActive {
+	if m.turnActive && !m.dispatchingMidTurnCommand {
 		// A text steer cannot carry multimodal ContentBlocks. The previous
 		// path injected the literal "[Image #N]" into the running loop,
 		// reset the editor, and left the model to invent a filesystem path.
@@ -270,7 +287,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 			hint := "image kept — wait for the running turn to finish (or press Esc), then press Enter again"
 			if m.loop != nil && m.loop.Provider != nil && !pubprov.ProviderSupportsVision(m.loop.Provider) {
-				hint = fmt.Sprintf("image kept — current model (%s) is text-only. After this turn, copy/cut the prompt, run /model, then paste it back; the cached [Image #N] stays attached", model)
+				hint = fmt.Sprintf("image kept — current model (%s) is text-only. Wait for the running turn to finish (or press Esc), then press Enter again to choose a vision model; prompt and cached images stay attached", model)
 			}
 			m.appendImageWarningOnce(hint)
 			return m, nil
@@ -294,6 +311,28 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		//     refactor.
 		raw := text
 		if raw == "" {
+			return m, nil
+		}
+		// /abort is the command spelling of the single Ctrl-C interrupt. It
+		// cancels the live provider/tool context and clears queued follow-ups;
+		// sending the literal command to the model cannot abort anything.
+		if strings.EqualFold(strings.TrimSpace(raw), "/abort") {
+			m.turnCancelledByUser = true
+			if m.turnCancel != nil {
+				m.turnCancel()
+				m.turnCancel = nil
+				m.spinnerActive = false
+			}
+			queueCleared := len(m.queuedPrompts)
+			m.queuedPrompts = nil
+			m.queuePending = false
+			m.input.Reset()
+			m.dismissPalette()
+			msg := "interrupted"
+			if queueCleared > 0 {
+				msg = fmt.Sprintf("interrupted · queue cleared (%d dropped)", queueCleared)
+			}
+			m.messages = append(m.messages, Message{Role: "info", Content: msg, Timestamp: time.Now()})
 			return m, nil
 		}
 
@@ -346,6 +385,26 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					// Custom command's handler already templated the
 					// prompt into `display`. Steer THAT, not the
 					// literal `/intro Chinese` text.
+					customCmd := customCommandFromInput(m.slash, raw)
+					if customCommandNeedsFreshTurn(customCmd, m.loop) {
+						m.messages = append(m.messages, Message{
+							Role: "warning",
+							Content: fmt.Sprintf(
+								"(can't /%s mid-turn — trusted allowed-tools require a new turn boundary; wait for this turn to finish, and use /model first if the command names another model)",
+								customCmd.Name,
+							),
+							Timestamp: time.Now(),
+						})
+						// Keep the invocation in the editor so it can be submitted once
+						// the active turn ends; silently clearing it loses user intent.
+						return m, nil
+					}
+					if customCmd != nil && !customCmd.Trusted {
+						_, warnings, _ := prepareCustomCommandTurn(m.ctx, customCmd, m.loop)
+						for _, warning := range warnings {
+							m.messages = append(m.messages, Message{Role: "warning", Content: warning, Timestamp: time.Now()})
+						}
+					}
 					if display == "" {
 						return m, nil
 					}
@@ -371,11 +430,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					})
 					m.input.Reset()
 					return m, nil
+				case slash.MidTurnSafe:
+					// Execute the same local REPL/signal path used while idle. The
+					// guard prevents recursion from re-entering this mid-turn branch,
+					// while turnActive remains true for handlers such as /bg.
+					m.dispatchingMidTurnCommand = true
+					defer func() { m.dispatchingMidTurnCommand = false }()
+					return m.handleSubmit()
 				}
-				// MidTurnSafe falls through to the literal-steer path
-				// below — same as plain text. Future work: route safe
-				// signals through their overlay handlers without re-
-				// entering runTurnAsync.
 			}
 		}
 
@@ -460,14 +522,12 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		cmdText := text[1:]
 		name, args, _ := cut(cmdText, " ")
 
-		// Phase C1: bare `/effort` opens the slider widget BEFORE the
-		// REPL command lookup runs cmdEffort (which would inline a
-		// renderInfoBox). Explicit `/effort high` falls through to the
-		// REPL path so scripted usage stays the same.
+		// Defensive fallback for callers that reach this branch without the
+		// early inline interception above. Explicit `/effort high` still falls
+		// through to the REPL path so scripted usage stays unchanged.
 		if name == "effort" && strings.TrimSpace(args) == "" {
-			eff := screen.NewEffortScreen(string(m.loop.Effort))
-			eff.Resize(m.width, m.height)
-			m.activeScreen = eff
+			m.input.SetValue("/effort")
+			m.openInlineEffortPicker()
 			return m, nil
 		}
 
@@ -486,14 +546,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// Explicit `/model claude-opus-4-7` falls through to cmdModel
 		// for scripted usage / palette autocomplete.
 		if (name == "model" || name == "m") && strings.TrimSpace(args) == "" {
-			choices := make([]screen.ModelChoice, len(builtinModelChoices))
-			copy(choices, builtinModelChoices)
-			for i := range choices {
-				choices[i].Recent = getModelState().IsRecent(choices[i].ID)
-			}
-			mp := screen.NewModelScreen(m.model, choices)
-			mp.Resize(m.width, m.height)
-			m.activeScreen = mp
+			m.openModelPicker(false, 0)
 			return m, nil
 		}
 
@@ -520,19 +573,28 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// (cursor + Enter to pick). Pre-empt the BodyScreen path so
 		// the user can select + invoke instead of just reading a list.
 		switch name {
-		case "sessions":
+		case "sessions", "ls":
+			if strings.TrimSpace(args) != "" {
+				break
+			}
 			items := m.sessionsPickerItems(20)
 			ps := screen.NewPickerScreen("/sessions", pickerSubtitle("recent sessions", len(items)), items)
 			ps.Resize(m.width, m.height)
 			m.activeScreen = ps
 			return m, nil
-		case "skills":
+		case "skills", "sk":
+			if strings.TrimSpace(args) != "" {
+				break
+			}
 			items := m.skillsPickerItems()
 			ps := screen.NewPickerScreen("/skills", pickerSubtitle("skills loaded", len(items)), items)
 			ps.Resize(m.width, m.height)
 			m.activeScreen = ps
 			return m, nil
-		case "tools":
+		case "tools", "t", "toolsets":
+			if strings.TrimSpace(args) != "" {
+				break
+			}
 			items := m.toolsPickerItems()
 			ps := screen.NewPickerScreen("/tools", pickerSubtitle("tools registered", len(items)), items)
 			ps.Resize(m.width, m.height)
@@ -577,8 +639,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if name == "config" || name == "cfg" {
+			return m, m.openConfigEditor()
+		}
 
-		if cmd := m.cmds.Get(name); cmd != nil {
+		if cmd := m.cmds.Get(name); cmd != nil && !preferSlashInTUI(cmd.Name) {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
 			}
@@ -630,7 +695,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 
 	// Slash registry
 	if handled, display, sig, args := m.slash.Parse(text); handled {
-		if display != "" {
+		// Prompt-rewriting signals consume display as model input below. Echoing
+		// it here first exposes internal /review instructions in the transcript
+		// (and duplicates user-authored custom-command bodies).
+		if display != "" && sig != slash.SignalCustomPrompt && sig != slash.SignalBatch {
 			m.messages = append(m.messages, Message{Role: "info", Content: display, Timestamp: time.Now()})
 		}
 		_ = args // many signals don't need it; the ones that do read below
@@ -866,15 +934,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// not browseable. Phase C4 will replace with a cycle widget.
 			m.messages = append(m.messages, Message{Role: "info", Content: renderTheme(args), Timestamp: time.Now()})
 		case slash.SignalEffort:
-			// Phase C1: bare `/effort` opens the interactive slider
-			// widget (claude-code parity, see image #6 in user's TUI
-			// feedback). Explicit form `/effort high` stays inline so
-			// scripted / palette-autocomplete usage still works without
-			// hijacking the screen.
+			// Bare `/effort` is rendered below the chat input; explicit form
+			// `/effort high` remains a one-line command result.
 			if strings.TrimSpace(args) == "" {
-				eff := screen.NewEffortScreen(string(m.loop.Effort))
-				eff.Resize(m.width, m.height)
-				m.activeScreen = eff
+				m.input.SetValue("/effort")
+				m.openInlineEffortPicker()
 			} else {
 				m.messages = append(m.messages, Message{Role: "info", Content: renderEffort(args), Timestamp: time.Now()})
 			}
@@ -917,7 +981,22 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// it like /batch — re-enter the agent path with the
 			// rewritten text, no separate echo of the template.
 			if display != "" {
-				text = display
+				customCmd := customCommandFromInput(m.slash, text)
+				preparedCtx, warnings, err := prepareCustomCommandTurn(turnRunCtx, customCmd, m.loop)
+				for _, warning := range warnings {
+					m.messages = append(m.messages, Message{Role: "warning", Content: warning, Timestamp: time.Now()})
+				}
+				if err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: err.Error(), Timestamp: time.Now()})
+					return m, nil
+				}
+				turnRunCtx = preparedCtx
+				if strings.EqualFold(slashName(text), "/review") {
+					visibleUserText = text
+					text = wrapInternalReviewPrompt(display)
+				} else {
+					text = display
+				}
 				display = ""
 			}
 		case slash.SignalPlan:
@@ -941,23 +1020,28 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			m.gate.SetMode(permission.ModeDontAsk)
 			m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: dontAsk — actions requiring approval will be denied)", Timestamp: time.Now()})
 		case slash.SignalRetry:
-			// /retry — pull the last user prompt out of history and
-			// stuff it into the input box so the user can edit + hit
-			// Enter to re-send. Mirrors cmdReplay's InsertInput
-			// pattern (cmdReview did this in 2026-05-18).
-			lastUser := ""
-			hist := m.loop.History()
-			for i := len(hist) - 1; i >= 0; i-- {
-				if hist[i].Role == llm.RoleUser && len(hist[i].Content) > 0 {
-					lastUser = hist[i].Content[0].Text
-					break
-				}
-			}
-			if lastUser == "" {
+			// A retry replaces the prior user→assistant exchange, then submits
+			// the same user prompt immediately. Merely prefilling the editor
+			// created a duplicate turn and did not retry the response at all.
+			lastUser, ok := m.loop.UndoLastTurnWithPrefill()
+			if !ok || strings.TrimSpace(lastUser) == "" {
 				m.messages = append(m.messages, Message{Role: "warning", Content: "(retry: no prior user prompt found in history)", Timestamp: time.Now()})
 			} else {
+				if m.session != nil && m.sessionID != "" {
+					if err := m.session.ReplaceHistoryAndMark(m.sessionID, m.loop.History(), &m.historyCursor); err != nil {
+						m.messages = append(m.messages, Message{Role: "error", Content: "retry: failed to persist rollback: " + err.Error(), Timestamp: time.Now()})
+						break
+					}
+				}
+				m.messages = trimVisibleMessagesToLastUser(m.messages)
+				if m.turnToolEventStart >= 0 && m.turnToolEventStart <= len(m.toolEvents) {
+					m.toolEvents = m.toolEvents[:m.turnToolEventStart]
+				} else {
+					m.toolEvents = nil
+				}
 				m.input.SetValue(lastUser)
-				m.messages = append(m.messages, Message{Role: "info", Content: "(retry: prompt loaded — edit if needed, press Enter to re-send)", Timestamp: time.Now()})
+				m.messages = append(m.messages, Message{Role: "info", Content: "(retrying last response)", Timestamp: time.Now()})
+				return m.handleSubmit()
 			}
 		case slash.SignalLoop:
 			// /loop — autopilot scheduling not yet implemented in the
@@ -966,10 +1050,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// equivalent in metis core.
 			m.messages = append(m.messages, Message{Role: "info", Content: "(/loop autopilot not wired in chat — use /cron for scheduled prompts instead)", Timestamp: time.Now()})
 		case slash.SignalReload:
-			// /reload — reloading the in-process tool registry from
-			// inside an active session is complex (it would need to
-			// recreate the Loop). For now, surface the workaround.
-			m.messages = append(m.messages, Message{Role: "info", Content: "(/reload not implemented — restart metis to pick up new tools / skills / config)", Timestamp: time.Now()})
+			if m.ext.ReloadCatalog == nil {
+				m.messages = append(m.messages, Message{Role: "warning", Content: "reload: catalog hook unavailable in this build", Timestamp: time.Now()})
+			} else if summary, err := m.ext.ReloadCatalog(); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "reload: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				if strings.TrimSpace(summary) == "" {
+					summary = "catalog refreshed"
+				}
+				m.messages = append(m.messages, Message{Role: "success", Content: "reload: " + summary, Timestamp: time.Now()})
+			}
 		}
 		// Slash commands that produced a regular reply terminate here.
 		// /batch and /custom-prompt rewrite `text` above and re-enter
@@ -1051,10 +1141,17 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			stripped, _ := splitOffImageBlocks(blocks)
 			if stripped > 0 {
 				m.input.SetValue(text)
-				m.appendImageWarningOnce(fmt.Sprintf(
-					"image not sent — current model (%s) is text-only. Prompt and %d image(s) are kept. Copy/cut the prompt, run /model, then paste it back; cached [Image #N] stays attached.",
-					m.loop.Model, stripped,
-				))
+				if m.openModelPicker(true, stripped) {
+					m.appendImageWarningOnce(fmt.Sprintf(
+						"image not sent — current model (%s) is text-only. Prompt and %d image(s) are kept; choose a vision model, then press Enter to send.",
+						m.loop.Model, stripped,
+					))
+				} else {
+					m.appendImageWarningOnce(fmt.Sprintf(
+						"image not sent — current model (%s) is text-only. Prompt and %d image(s) are kept, but no configured vision-capable provider profile is available.",
+						m.loop.Model, stripped,
+					))
+				}
 				return m, nil
 			}
 		}
@@ -1066,6 +1163,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		}
 		m.imagePaste = nil
 		m.imageCounter = 0
+	} else if visibleUserText != "" {
+		// Keep the tagged provider frame first and the concise invocation last.
+		// transcript.UndoWithPrefill intentionally returns the last text block as
+		// the user's editable input; reversing this order leaks the internal
+		// review frame through /undo and /retry. Resume/export filter the tagged
+		// block and show only the final invocation.
+		m.loop.AppendUserBlocks([]llm.ContentBlock{
+			{Type: "text", Text: llmTextRewritten},
+			{Type: "text", Text: visibleUserText},
+		})
 	} else {
 		m.loop.AppendUser(llmTextRewritten)
 	}
@@ -1075,10 +1182,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.persistTail()
 	// Mirror to ~/.metis/history.jsonl for cross-session prompt search.
 	// Fire-and-forget — disk hiccups must not block the chat.
+	transcriptText := text
+	if visibleUserText != "" {
+		transcriptText = visibleUserText
+	}
 	_ = runtime.AppendHistory(runtime.HistoryEntry{
-		SessionID: m.sessionID, Input: text, Source: "tui",
+		SessionID: m.sessionID, Input: transcriptText, Source: "tui",
 	})
-	m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	m.messages = append(m.messages, Message{Role: "user", Content: transcriptText, Timestamp: time.Now()})
 	// 2026-05-25: do NOT wipe m.toolEvents on each new submit. Pre-fix
 	// behaviour cleared every prior turn's tool calls the moment the
 	// user typed a new prompt — the second turn collapsed to just the
@@ -1113,12 +1224,13 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// this once the first byte arrives.
 	m.spinnerPhase = "requesting"
 	m.showBanner = false // Hide banner after first message
+	m.turnCancelledByUser = false
 
 	// Snapshot what runTurnAsync needs BEFORE the `go` — see the
 	// comment on runTurnAsync for why. m.turnCancel must be written
 	// on this (main) thread, not from inside the goroutine; cleared
 	// in finalizeTurn when doneCh fires.
-	turnCtx, cancel := context.WithCancel(m.ctx)
+	turnCtx, cancel := context.WithCancel(turnRunCtx)
 	m.turnCancel = cancel
 	go runTurnAsync(turnCtx, cancel, m.loop, m.eventCh, m.doneCh)
 	// Critical: must return tickCmd here so spinnerTick events start flowing,

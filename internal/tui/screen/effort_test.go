@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // TestEffortScreen_RendersAllLevels — every level must appear in the
@@ -20,12 +21,28 @@ func TestEffortScreen_RendersAllLevels(t *testing.T) {
 		}
 	}
 	// Polar labels.
-	if !strings.Contains(out, "Speed") || !strings.Contains(out, "Intelligence") {
-		t.Errorf("missing Speed↔Intelligence polar labels:\n%s", out)
+	if !strings.Contains(out, "Faster") || !strings.Contains(out, "Smarter") {
+		t.Errorf("missing Faster↔Smarter polar labels:\n%s", out)
 	}
 	// Pointer.
 	if !strings.Contains(out, "▲") {
 		t.Errorf("missing ▲ pointer:\n%s", out)
+	}
+}
+
+func TestEffortScreen_NarrowPaneKeepsAllLevelsOnScreen(t *testing.T) {
+	s := NewEffortScreen("medium")
+	s.Resize(30, 20)
+	out := stripANSIEffort(s.InlineView())
+	for _, lvl := range []string{"off", "low", "medium", "high"} {
+		if !strings.Contains(out, lvl) {
+			t.Fatalf("narrow picker lost level %q:\n%s", lvl, out)
+		}
+	}
+	for i, line := range strings.Split(out, "\n") {
+		if got := lipgloss.Width(line); got > 29 { // keep final terminal cell free
+			t.Fatalf("narrow picker line %d width=%d, want <=29: %q", i, got, line)
+		}
 	}
 }
 
@@ -40,8 +57,8 @@ func TestEffortScreen_InitialCursor(t *testing.T) {
 		{"low", 1},
 		{"medium", 2},
 		{"high", 3},
-		{"unknown", 2},  // fallback to medium
-		{"", 2},         // also fallback to medium
+		{"unknown", 2},  // unknown non-empty values fall back to medium
+		{"", 0},         // empty llm.EffortDefault maps to the UI's off
 		{"  HIGH  ", 3}, // case + whitespace tolerant
 	}
 	for _, tc := range cases {

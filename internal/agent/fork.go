@@ -99,7 +99,9 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 	}
 	prefix := append([]llm.Message(nil), loop.Messages...)
 	model := loop.Model
-	effort := loop.Effort
+	// Effort has its own lock and may change while the parent snapshot is
+	// assembled; capture one valid value for the fork.
+	effort := loop.EffortValue()
 	loop.mu.RUnlock()
 
 	// Pre-emptive prefix snip — applies the post-compact budget cap

@@ -117,6 +117,7 @@ func NewBedrock(accessKey, secretKey, sessionToken, region, model string, maxTok
 
 func (b *Bedrock) Name() string          { return "bedrock" }
 func (b *Bedrock) ModelID() string       { return b.Model }
+func (b *Bedrock) SupportsVision() bool  { return anthropic.SupportsVisionModel(b.Model) }
 func (b *Bedrock) MaxContextTokens() int { return b.ContextWindow }
 
 // invokeURL is the synchronous Bedrock Runtime endpoint. Returns the

@@ -110,6 +110,12 @@ func (a *Azure) Name() string { return "azure" }
 // ModelID returns the wire-level model id this provider sends.
 func (a *Azure) ModelID() string { return a.Model }
 
+// SupportsVision reports whether the configured deployment/model identifier
+// is known to accept image content. Azure reuses the OpenAI request encoder,
+// so its capability decision must match openai.ToRequest and the TUI's
+// pre-switch filter. Unknown deployment aliases stay conservatively false.
+func (a *Azure) SupportsVision() bool { return openai.SupportsVisionModel(a.Model) }
+
 // MaxContextTokens returns the configured override or 0 (caller falls
 // back to the model-prefix lookup, which is unlikely to match Azure
 // deployment names — set context_window in config.toml for accuracy).

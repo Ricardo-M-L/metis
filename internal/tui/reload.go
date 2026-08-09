@@ -87,6 +87,11 @@ func (m *Model) Reload(opts ReloadOpts) error {
 	if !opts.PreserveInput {
 		m.input.Reset()
 	}
+	// /clear is intercepted by handleKey before the ordinary submit path gets
+	// a chance to dismiss slash completion. Reset the complete palette cache
+	// here so clearing a conversation cannot leave a stale `/clear` row under
+	// the now-empty editor.
+	m.dismissPalette()
 	if opts.Prefill != "" {
 		m.input.SetValue(opts.Prefill)
 	}

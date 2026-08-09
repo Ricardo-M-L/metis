@@ -11,12 +11,12 @@ package tui
 //
 //	GET  /transcript        full snapshot as JSON (one shot)
 //	GET  /events            SSE stream of new messages (live)
-//	POST /message           inject a user prompt (body: {"text":"..."})
+//	POST /message           optional input when an embedding supplies a consumer
 //	GET  /health            "ok\n" (for readiness probes)
 //
-// Lifecycle: `/share` slash command starts/stops it. Address is
-// 127.0.0.1:<auto> chosen at start; cmdShare returns the URL so
-// the user can copy-paste it into their browser / IDE config.
+// Lifecycle: `/share` starts it read-only because the Bubble Tea chat does not
+// yet consume remote input. Embedders may pass an input channel to startBridge;
+// with no channel, POST /message truthfully returns 503.
 //
 // Reference: claude-code's `bridge/bridgeMain.ts` (~3k lines, full
 // duplex JSON-RPC). We trade richness for simplicity — SSE + JSON
@@ -229,8 +229,8 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 
 // handleMessage accepts {"text": "..."} via POST and forwards to
 // the chat surface's input channel. Returns 503 if no chat is
-// listening (shouldn't happen since the bridge only starts from
-// inside an active chat session).
+// listening. `/share` deliberately uses this state until remote input is wired
+// into the Bubble Tea update loop.
 func handleMessage(w http.ResponseWriter, r *http.Request, ch chan string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

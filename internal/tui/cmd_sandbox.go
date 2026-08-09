@@ -1,104 +1,181 @@
 package tui
 
-// /sandbox — manage the macOS Seatbelt (sandbox-exec) wrapper applied
-// to Bash subprocesses. Implements the same three-option choice
-// claude-code surfaces in its image #76 menu:
-//
-//   off          — direct spawn, legacy default
-//   permissions  — wrap in sandbox-exec; gate still asks/auto/bypass
-//   auto-allow   — wrap + auto-approve the gate (sandbox is the
-//                  bound, not the user click)
-//
-// The slash command writes to the in-process runtime override
-// (bash.SetRuntimeSandboxMode) so the change takes effect on the
-// VERY NEXT Bash call — no restart. Persistence to ~/.metis/config.toml
-// is intentionally NOT done here; users who want a setting to survive
-// restarts edit [bash.sandbox] mode = "..." in config.toml directly
-// (the runtime override always wins, so the next /sandbox call shows
-// the override they set even after a config edit).
-//
-// On non-darwin platforms only `off` is supported; the command
-// rejects the other modes with a clear message rather than silently
-// running unsandboxed.
+// /sandbox manages the per-runtime OS sandbox shared by every
+// model-controlled command entry point. Permission mode and sandbox mode are
+// deliberately orthogonal: bypassPermissions can remove approval prompts, but
+// it never disables an enabled kernel sandbox.
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
-func cmdSandbox(_ *REPL, args string) string {
-	args = strings.TrimSpace(strings.ToLower(args))
-	if args == "" || args == "status" {
-		return sandboxStatus()
-	}
-	if args == "help" {
-		return sandboxHelp()
-	}
-
-	// Treat any other argument as a mode-set request.
-	canonical := bash.NormalizeSandboxMode(args)
-	// NormalizeSandboxMode silently collapses unknown values to
-	// "off" — for the slash command we'd rather REJECT typos so a
-	// user typing `/sandbox permission` (no -s) doesn't think they
-	// set permissions when they actually disabled the sandbox.
-	if canonical == bash.SandboxModeOff && args != "off" && args != "disabled" && args != "none" {
-		return fmt.Sprintf("sandbox: unknown mode %q. usage: /sandbox [status | off | permissions | auto-allow]", args)
-	}
-
-	// Platform check before we accept anything other than off — on
-	// non-macOS the wrapper would error on the next Bash call anyway,
-	// but surfacing it here gives the user a single clean message
-	// instead of seeing the failure on every command.
-	if canonical != bash.SandboxModeOff && !bash.SandboxAvailable() {
-		return "sandbox: only `off` is supported on this platform (macOS-only today; Linux landlock / Windows job-objects pending)"
-	}
-
-	bash.SetRuntimeSandboxMode(canonical)
-	return fmt.Sprintf("sandbox: mode set to %q (effective immediately for new Bash calls)\n  • persists for this session only — edit ~/.metis/config.toml [bash.sandbox] mode = %q to survive restarts",
-		canonical, canonical)
+type sandboxManagerProvider interface {
+	SandboxManager() *sandbox.Manager
 }
 
-func sandboxStatus() string {
-	override := bash.RuntimeSandboxMode()
-	available := bash.SandboxAvailable()
+func replSandboxManager(r *REPL) *sandbox.Manager {
+	if r == nil || r.Loop == nil || r.Loop.Registry == nil {
+		if r != nil {
+			return r.sandbox
+		}
+		return nil
+	}
+	if r.sandbox != nil {
+		return r.sandbox
+	}
+	tool, ok := r.Loop.Registry.Get("Bash")
+	if !ok {
+		return nil
+	}
+	provider, ok := tool.(sandboxManagerProvider)
+	if !ok {
+		return nil
+	}
+	return provider.SandboxManager()
+}
+
+func cmdSandbox(r *REPL, args string) string {
+	manager := replSandboxManager(r)
+	if manager == nil {
+		return "sandbox: runtime manager is unavailable"
+	}
+
+	arg := strings.ToLower(strings.TrimSpace(args))
+	switch arg {
+	case "", "status":
+		return sandboxStatus(manager)
+	case "help":
+		return sandboxHelp()
+	case "doctor":
+		return sandboxDoctor(manager)
+	case "reset", "config":
+		manager.ClearRuntimeMode()
+		return fmt.Sprintf("sandbox: runtime override cleared; effective mode is %q from [tools.bash.sandbox]", manager.EffectiveMode())
+	}
+
+	canonical, ok := interactiveSandboxMode(arg)
+	if !ok {
+		return fmt.Sprintf("sandbox: unknown mode %q. usage: /sandbox [status | doctor | reset | off | permissions | auto-allow]", arg)
+	}
+	if canonical != sandbox.ModeOff {
+		diagnostic := manager.Doctor()
+		if !diagnostic.Available {
+			return fmt.Sprintf("sandbox: cannot enable %q: %v (fail-closed; mode unchanged)", canonical, diagnostic.Err)
+		}
+	}
+	if err := manager.SetRuntimeMode(string(canonical)); err != nil {
+		return "sandbox: mode unchanged: " + err.Error()
+	}
+	return fmt.Sprintf(
+		"sandbox: mode set to %q for this runtime (effective immediately for Bash, Workflow, Git, Skill and custom-command shell calls)\n  • bypassPermissions does not disable this boundary\n  • persist with [tools.bash.sandbox] mode = %q in ~/.metis/config.toml",
+		canonical, canonical,
+	)
+}
+
+func interactiveSandboxMode(arg string) (sandbox.Mode, bool) {
+	switch arg {
+	case "off", "disabled", "none":
+		return sandbox.ModeOff, true
+	case "permissions", "on", "enabled":
+		return sandbox.ModePermissions, true
+	case "auto-allow", "autoallow", "auto":
+		return sandbox.ModeAutoAllow, true
+	default:
+		return "", false
+	}
+}
+
+func sandboxStatus(manager *sandbox.Manager) string {
+	state := manager.State()
+	diagnostic := manager.Doctor()
 	var b strings.Builder
-	if override != "" {
-		fmt.Fprintf(&b, "sandbox: %s (runtime override active)\n", override)
+	fmt.Fprintf(&b, "sandbox: %s", state.Effective)
+	if state.HasRuntimeOverride {
+		fmt.Fprintf(&b, " (runtime override; configured: %s)", state.Configured)
 	} else {
-		b.WriteString("sandbox: using config.toml [bash.sandbox] mode (default: off)\n")
+		b.WriteString(" (from [tools.bash.sandbox])")
 	}
-	if !available {
-		b.WriteString("  • this platform supports `off` only (macOS-only today)\n")
+	fmt.Fprintf(&b, "\n  • backend: %s on %s", diagnostic.Backend, diagnostic.Platform)
+	if diagnostic.Available {
+		fmt.Fprintf(&b, " (%s)", diagnostic.Executable)
+	} else {
+		fmt.Fprintf(&b, " (unavailable: %v)", diagnostic.Err)
 	}
-	b.WriteString("\nmodes:\n")
-	b.WriteString("  off          — direct spawn (current legacy default)\n")
-	b.WriteString("  permissions  — wrap in sandbox-exec; cwd/temp/~/.metis writable, rest read-only; gate still asks\n")
-	b.WriteString("  auto-allow   — wrap + auto-approve the permission gate (sandbox bounds the blast)\n")
-	b.WriteString("\nusage: /sandbox [status | off | permissions | auto-allow]")
+	fmt.Fprintf(&b, "\n  • network: %s", manager.NetworkPolicy())
+	if manager.NetworkPolicy() == sandbox.NetworkBlock && diagnostic.Backend == "bubblewrap" {
+		b.WriteString(" (IP namespace; common container sockets masked; abstract AF_UNIX is not seccomp-filtered)")
+	}
+	if temp := manager.TempDir(); temp != "" {
+		fmt.Fprintf(&b, "\n  • private temp: %s", temp)
+	}
+	b.WriteString("\n  • writable: effective cwd/worktree + private temp; Metis control files and Git hooks/config stay protected")
+	if sandboxCwdIsHome() && state.Effective != sandbox.ModeOff {
+		b.WriteString("\n  ⚠ workspace root is your home directory, so the writable boundary is broad; start Metis inside the project directory for tighter isolation")
+	}
+	b.WriteString("\n\nmodes:\n")
+	b.WriteString("  off          — direct host spawn\n")
+	b.WriteString("  permissions  — OS sandbox; permission gate still applies\n")
+	b.WriteString("  auto-allow   — same OS sandbox; ordinary Ask prompts auto-allow (explicit deny/plan still win)\n")
+	b.WriteString("\nusage: /sandbox [status | doctor | reset | off | permissions | auto-allow]")
 	return b.String()
+}
+
+func sandboxCwdIsHome() bool {
+	cwd, cwdErr := os.Getwd()
+	home, homeErr := os.UserHomeDir()
+	if cwdErr != nil || homeErr != nil || home == "" {
+		return false
+	}
+	cwd, _ = filepath.Abs(cwd)
+	home, _ = filepath.Abs(home)
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		cwd = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(home); err == nil {
+		home = resolved
+	}
+	return filepath.Clean(cwd) == filepath.Clean(home)
+}
+
+func sandboxDoctor(manager *sandbox.Manager) string {
+	d := manager.Doctor()
+	status := "unavailable"
+	if d.Available {
+		status = "ready"
+	}
+	out := fmt.Sprintf("sandbox doctor: %s\n  platform: %s\n  backend: %s\n  executable: %s", status, d.Platform, d.Backend, d.Executable)
+	if d.Err != nil {
+		out += "\n  error: " + d.Err.Error()
+	}
+	return out
 }
 
 func sandboxHelp() string {
 	return strings.TrimSpace(`
-/sandbox — macOS Seatbelt wrapper for the Bash tool.
+/sandbox — per-runtime operating-system sandbox for model-controlled commands.
 
-  /sandbox             show current mode + options
+  /sandbox             show effective/configured mode and backend
   /sandbox status      same as no-arg
-  /sandbox off         disable the wrapper (legacy default)
-  /sandbox permissions wrap bash via sandbox-exec; gate keeps asking
-  /sandbox auto-allow  wrap + auto-approve so the sandbox is the only bound
+  /sandbox doctor      diagnose sandbox backend/dependency
+  /sandbox reset       clear the session override and use config
+  /sandbox off         direct host execution
+  /sandbox permissions enable OS isolation; permission gate still applies
+  /sandbox auto-allow  enable OS isolation and auto-allow ordinary Ask prompts
 
-Aliases:
-  on / enabled         → permissions
-  auto / autoallow     → auto-allow
-  disabled / none      → off
+Aliases: on/enabled -> permissions; auto/autoallow -> auto-allow;
+disabled/none -> off.
 
-The setting takes effect on the next Bash call — no restart needed.
-To make it stick across restarts, edit ~/.metis/config.toml:
+The setting applies to new commands in this runtime. To persist it:
 
-  [bash.sandbox]
+  [tools.bash.sandbox]
   mode = "permissions"
-`)
+  network = "block"
+
+bypassPermissions only changes approval prompts; it does not disable an
+enabled OS sandbox.`)
 }

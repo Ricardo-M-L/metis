@@ -8,6 +8,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -32,21 +33,40 @@ func TestLoginSlash_OpensInfoModal(t *testing.T) {
 	}
 }
 
-// TestLogoutSlash_OpensInfoModal — /logout same shape.
-func TestLogoutSlash_OpensInfoModal(t *testing.T) {
+// /logout without a provider reports the real credential-store state rather
+// than telling the user to exit the active chat.
+func TestLogoutSlash_ReportsStoredProviders(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.Set("openai", "test-secret"); err != nil {
+		t.Fatal(err)
+	}
 	m := newSlashTestModel(t)
 	m.input.SetValue("/logout")
 	pressEnter(t, m)
 
 	found := false
 	for _, msg := range m.messages {
-		if strings.Contains(msg.Content, "metis auth logout") {
+		if strings.Contains(msg.Content, "provider required") && strings.Contains(msg.Content, "openai") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("/logout should surface 'metis auth logout' instructions; got: %+v", messageContents(m))
+		t.Errorf("/logout should list the stored provider; got: %+v", messageContents(m))
+	}
+}
+
+func TestLogoutSlash_RemovesCredentialDirectly(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.Set("openai", "test-secret"); err != nil {
+		t.Fatal(err)
+	}
+	got := cmdLogout(nil, "openai")
+	if !strings.Contains(got, "removed stored credentials for openai") {
+		t.Fatalf("cmdLogout output = %q", got)
+	}
+	if key, err := auth.Get("openai"); err != nil || key != "" {
+		t.Fatalf("credential remains after /logout: key=%q err=%v", key, err)
 	}
 }
 
@@ -143,6 +163,8 @@ func TestInit_DetectsProjectType(t *testing.T) {
 // TestStatusLine_OpensModal — /statusline is in modalCommands, so it
 // opens BodyScreen.
 func TestStatusLine_OpensModal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
 	m := newSlashTestModel(t)
 	m.input.SetValue("/statusline")
 	pressEnter(t, m)
@@ -154,8 +176,11 @@ func TestStatusLine_OpensModal(t *testing.T) {
 	if !strings.Contains(view, "Status Line") {
 		t.Errorf("statusline modal missing title; got:\n%s", view)
 	}
-	if !strings.Contains(view, "config.toml") {
-		t.Errorf("statusline modal should mention config.toml; got:\n%s", view)
+	if !strings.Contains(view, filepath.Join(home, "statusline.sh")) {
+		t.Errorf("statusline modal should show the real script path; got:\n%s", view)
+	}
+	if strings.Contains(view, "config.toml") || strings.Contains(view, "[ui]") {
+		t.Errorf("statusline modal must not claim unsupported config.toml customization; got:\n%s", view)
 	}
 }
 
@@ -201,5 +226,38 @@ func TestToolsPicker_EnterOpensDetailScreen(t *testing.T) {
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if _, ok := m.activeScreen.(*screen.DetailScreen); !ok {
 		t.Errorf("after Enter on tool, activeScreen should be DetailScreen; got %T", m.activeScreen)
+	}
+}
+
+// Canonical list commands and their short aliases must enter the same picker
+// path. Letting aliases fall through to the legacy REPL body screen produced
+// different counts (/tools reported 47 while /t reported 48) and different
+// interaction models for the same command.
+func TestListPickerAliasesMatchCanonical(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	for _, tc := range []struct {
+		canonical string
+		alias     string
+	}{
+		{canonical: "/tools", alias: "/t"},
+		{canonical: "/skills", alias: "/sk"},
+		{canonical: "/sessions", alias: "/ls"},
+	} {
+		t.Run(tc.alias, func(t *testing.T) {
+			canonical := newSlashTestModel(t)
+			canonical.input.SetValue(tc.canonical)
+			pressEnter(t, canonical)
+
+			alias := newSlashTestModel(t)
+			alias.input.SetValue(tc.alias)
+			pressEnter(t, alias)
+
+			if canonical.activeScreen == nil || alias.activeScreen == nil {
+				t.Fatalf("picker missing: canonical=%T alias=%T", canonical.activeScreen, alias.activeScreen)
+			}
+			if got, want := alias.activeScreen.View(), canonical.activeScreen.View(); got != want {
+				t.Fatalf("%s differs from %s\n--- alias ---\n%s\n--- canonical ---\n%s", tc.alias, tc.canonical, got, want)
+			}
+		})
 	}
 }

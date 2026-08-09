@@ -30,6 +30,77 @@ func TestEnsureAPIKey_HappyPath(t *testing.T) {
 	}
 }
 
+func TestEnsureAPIKey_VertexServiceAccountSkipsAPIKeyWizard(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	cfg := newCfgWithCustom("vertex-claude", config.ProviderRaw{
+		Transport:          "vertex_anthropic",
+		ServiceAccountFile: writeRuntimeTestServiceAccount(t),
+		Project:            "metis-test-project",
+		Model:              "claude-sonnet-4-6",
+	})
+	wizardRan := false
+
+	got, gotProv, err := EnsureAPIKey(cfg, "vertex-claude", AuthGateOptions{
+		IsTTY: func() bool { return true },
+		RunWizard: func() (*WizardResult, error) {
+			wizardRan = true
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureAPIKey rejected Vertex service-account auth: %v", err)
+	}
+	if wizardRan {
+		t.Error("API-key wizard ran for a configured Vertex service account")
+	}
+	if got != cfg || gotProv != "vertex-claude" {
+		t.Fatalf("unexpected auth-gate result: cfg=%p want=%p provider=%q", got, cfg, gotProv)
+	}
+}
+
+func TestEnsureAPIKey_BedrockAWSCredentialsSkipAPIKeyWizard(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIA_METIS_TEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "metis-test-secret")
+	cfg := newCfgWithCustom("bedrock-claude", config.ProviderRaw{
+		Transport: "bedrock_anthropic",
+		Model:     "us.anthropic.claude-sonnet-4-6-v1:0",
+	})
+	wizardRan := false
+
+	got, gotProv, err := EnsureAPIKey(cfg, "bedrock-claude", AuthGateOptions{
+		IsTTY: func() bool { return true },
+		RunWizard: func() (*WizardResult, error) {
+			wizardRan = true
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureAPIKey rejected Bedrock AWS auth: %v", err)
+	}
+	if wizardRan {
+		t.Error("API-key wizard ran for configured Bedrock AWS credentials")
+	}
+	if got != cfg || gotProv != "bedrock-claude" {
+		t.Fatalf("unexpected auth-gate result: cfg=%p want=%p provider=%q", got, cfg, gotProv)
+	}
+}
+
+func TestEnsureAPIKey_BedrockMissingSecretHasCloudSpecificError(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIA_METIS_TEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	cfg := newCfgWithCustom("bedrock-claude", config.ProviderRaw{
+		Transport: "bedrock_anthropic",
+		Model:     "us.anthropic.claude-sonnet-4-6-v1:0",
+	})
+
+	_, _, err := EnsureAPIKey(cfg, "bedrock-claude", AuthGateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "AWS_SECRET_ACCESS_KEY") {
+		t.Fatalf("missing Bedrock secret should return AWS-specific guidance, got %v", err)
+	}
+}
+
 func TestEnsureAPIKey_NoTTY_NoWizardRuns(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir()) // isolate from user's real auth.json
 	cfg := &config.Config{}

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -347,10 +348,9 @@ func TestTurnActive_CustomSlashResolvesAndSteers(t *testing.T) {
 	}
 }
 
-// TestTurnActive_SafeSlashFallsThroughToSteer — known informational
-// slash commands do not start another dispatcher while a turn is active;
-// their literal text is made available to the running model instead.
-func TestTurnActive_SafeSlashFallsThroughToSteer(t *testing.T) {
+// TestTurnActive_SafeSlashRunsLocally — known informational commands execute
+// through the ordinary local dispatcher while a turn is active.
+func TestTurnActive_SafeSlashRunsLocally(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.turnActive = true
 	for _, r := range "/cost" {
@@ -359,23 +359,21 @@ func TestTurnActive_SafeSlashFallsThroughToSteer(t *testing.T) {
 
 	pressEnter(t, m)
 
-	if got := m.loop.SteerInjectDrainForTest(); got != "/cost" {
-		t.Errorf("safe slash should steer literal input; got %q", got)
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Errorf("safe slash leaked to model steering: %q", got)
 	}
 	if len(m.queuedPrompts) != 0 {
 		t.Errorf("safe slash must not queue; got %+v", m.queuedPrompts)
 	}
 	last := m.messages[len(m.messages)-1]
-	if last.Role != "user-steer" || last.Content != "/cost" {
-		t.Errorf("safe slash steer should be visible; got %+v", last)
+	if last.Role == "user-steer" || !strings.Contains(last.Content, "Session Cost") {
+		t.Errorf("safe slash did not execute locally; got %+v", last)
 	}
 }
 
-// TestTurnActive_UnknownSlashFallsThroughToSteer — unknown /<command>
-// goes through the steer path as literal text. This is the safe
-// default — user might be typing actual chat content that happens to
-// start with a slash.
-func TestTurnActive_UnknownSlashFallsThroughToSteer(t *testing.T) {
+// TestTurnActive_UnknownSlashReportsLocally — command-shaped unknown input is
+// diagnosed by the slash registry instead of being whispered to the model.
+func TestTurnActive_UnknownSlashReportsLocally(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.turnActive = true
 	for _, r := range "/notarealcommand" {
@@ -384,14 +382,54 @@ func TestTurnActive_UnknownSlashFallsThroughToSteer(t *testing.T) {
 
 	pressEnter(t, m)
 
-	if got := m.loop.SteerInjectDrainForTest(); got != "/notarealcommand" {
-		t.Errorf("unknown slash should steer literal input; got %q", got)
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Errorf("unknown slash leaked to model steering: %q", got)
 	}
 	if len(m.queuedPrompts) != 0 {
 		t.Errorf("unknown slash must not queue; got %v", m.queuedPrompts)
 	}
 	last := m.messages[len(m.messages)-1]
-	if last.Role != "user-steer" || last.Content != "/notarealcommand" {
-		t.Errorf("unknown slash steer should be visible; got %+v", last)
+	if !strings.Contains(last.Content, "unknown: /notarealcommand") {
+		t.Errorf("unknown slash should be diagnosed locally; got %+v", last)
+	}
+}
+
+func TestTurnActive_AbortCancelsInsteadOfSteering(t *testing.T) {
+	m := newSlashTestModel(t)
+	cancelled := false
+	m.turnActive = true
+	m.turnCancel = func() { cancelled = true }
+	m.enqueueQueuedItem("later work", QueuePriorityNext)
+	m.input.SetValue("/abort")
+	m.showPalette = true
+	m.palFilter = "abort"
+	m.matchCommands()
+
+	pressEnter(t, m)
+
+	if !cancelled || m.turnCancel != nil {
+		t.Fatalf("/abort did not cancel the active turn")
+	}
+	if len(m.queuedPrompts) != 0 {
+		t.Fatalf("/abort retained queued prompts: %+v", m.queuedPrompts)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("/abort leaked to model: %q", got)
+	}
+	if m.showPalette || m.palFilter != "" || m.palCursor != 0 || len(m.palMatched) != 0 {
+		t.Fatalf("/abort retained palette state: show=%v filter=%q cursor=%d matches=%d",
+			m.showPalette, m.palFilter, m.palCursor, len(m.palMatched))
+	}
+
+	cancelErr := errors.Join(errors.New("provider request failed"), context.Canceled)
+	m.handleAgentEvent(agent.Event{Kind: agent.EventError, Err: cancelErr})
+	m.finalizeTurn(cancelErr)
+	for _, msg := range m.messages {
+		if msg.Role == "error" && strings.Contains(strings.ToLower(msg.Content), "context canceled") {
+			t.Fatalf("intentional /abort rendered a provider error: %+v", msg)
+		}
+	}
+	if m.turnCancelledByUser {
+		t.Fatal("finalizeTurn retained the user-cancellation marker")
 	}
 }

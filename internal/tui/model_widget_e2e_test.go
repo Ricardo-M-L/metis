@@ -63,6 +63,86 @@ func TestModelWidget_ExplicitArgStaysInline(t *testing.T) {
 	}
 }
 
+func TestModelWidget_ConfiguredCustomProfilesAppear(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark":  {Transport: "openai_chat", Model: "ark-code-latest"},
+		"kimi": {Transport: "openai_chat", Model: "kimi-k3"},
+	}
+	m.input.SetValue("/model")
+	pressEnter(t, m)
+
+	if m.activeScreen == nil {
+		t.Fatal("/model should open picker")
+	}
+	view := m.activeScreen.View()
+	for _, want := range []string{"ark-code-latest", "kimi-k3", "ark", "kimi"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("configured model/profile %q missing from picker:\n%s", want, view)
+		}
+	}
+}
+
+func TestModelWidget_DuplicateIDEnterKeepsActiveProvider(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.OpenAI = config.ProviderOpenAI{
+		APIKey: "openai-test", Model: "gpt-4o", BaseURL: "http://127.0.0.1:1",
+	}
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"relay": {
+			Transport: "openai_chat", APIKey: "relay-test",
+			BaseURL: "http://127.0.0.1:1", Model: "gpt-4o",
+		},
+	}
+	m.providerName = "relay"
+	m.model = "gpt-4o"
+	m.loop.Model = "gpt-4o"
+	m.input.SetValue("/model")
+	pressEnter(t, m)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	if m.providerName != "relay" || m.model != "gpt-4o" {
+		t.Fatalf("bare picker Enter changed duplicate-ID active profile: provider=%q model=%q", m.providerName, m.model)
+	}
+}
+
+func TestModelCommand_CustomModelRebindsConfiguredProvider(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-code-latest",
+		},
+		"kimi": {
+			Transport: "openai_chat", APIKey: "kimi-test", BaseURL: "http://127.0.0.1:1", Model: "kimi-k3",
+		},
+	}
+	m.providerName = "ark"
+	m.model = "ark-code-latest"
+	m.loop.Model = "ark-code-latest"
+	m.input.SetValue("/model kimi-k3")
+	pressEnter(t, m)
+
+	if m.providerName != "kimi" || m.model != "kimi-k3" || m.loop.Model != "kimi-k3" {
+		t.Fatalf("custom model stayed on old provider: profile=%q model=%q loop=%q", m.providerName, m.model, m.loop.Model)
+	}
+}
+
+func TestModelCommand_ProviderQualifiedModel(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"kimi": {
+			Transport: "openai_chat", APIKey: "kimi-test", BaseURL: "http://127.0.0.1:1", Model: "kimi-k3",
+		},
+	}
+	m.providerName = "other"
+	m.input.SetValue("/model kimi/kimi-k3")
+	pressEnter(t, m)
+
+	if m.providerName != "kimi" || m.model != "kimi-k3" {
+		t.Fatalf("provider-qualified switch failed: profile=%q model=%q", m.providerName, m.model)
+	}
+}
+
 // TestModelWidget_ApplyUpdatesModel — Enter on the picker commits the
 // chosen model to both m.model and m.loop.Model.
 func TestModelWidget_ApplyUpdatesModel(t *testing.T) {

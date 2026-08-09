@@ -564,30 +564,28 @@ type ToolBashSettings struct {
 	Sandbox SandboxBashSettings `toml:"sandbox"`
 }
 
-// SandboxBashSettings controls the soft sandbox applied to Bash tool calls.
+// SandboxBashSettings controls the command policy under
+// [tools.bash.sandbox]. Mode is shared by every model-controlled process
+// launcher; the allow/deny command lists remain Bash-specific.
 //
 //   - Allow / Deny operate on the canonical command name (first token of cmd,
 //     after stripping a `cmd.subcmd` suffix).
-//   - Network=block injects HTTP_PROXY=http://localhost:0 into the child env so
-//     curl/wget/etc fail to connect; it's not a kernel-level network namespace
-//     (we deliberately don't pull in Docker/unshare for this).
+//   - Network=block disables network access in the OS sandbox and also keeps
+//     the legacy proxy guard for defense in depth. Empty/allow permits network.
 //   - DangerouslyInheritEnv disables the API-key/credential blocklist.
 //   - DangerouslyAllowNetwork is a hard override that skips the proxy injection.
 type SandboxBashSettings struct {
 	Allow                   []string `toml:"allow"`
 	Deny                    []string `toml:"deny"`
-	Network                 string   `toml:"network"` // "default" | "block"
+	Network                 string   `toml:"network"` // "allow" | "block" (empty = allow)
 	DangerouslyInheritEnv   bool     `toml:"dangerously_inherit_env"`
 	DangerouslyAllowNetwork bool     `toml:"dangerously_allow_network"`
 
-	// Mode selects the macOS Seatbelt (sandbox-exec) wrapper applied
-	// to bash subprocesses. One of "off" (default — direct spawn,
-	// backwards compatible) / "permissions" (Seatbelt profile with
-	// global read + cwd/temp/~/.metis write) / "auto-allow" (same
-	// profile + permission gate auto-approves). See
-	// internal/tools/builtin/bash/sandbox_darwin.go for the profile
-	// content. Non-macOS platforms reject anything other than "off"
-	// with a clear error rather than silently running unsandboxed.
+	// Mode selects the OS sandbox: "off" (default, direct spawn),
+	// "permissions" (kernel sandbox + normal permission gate), or
+	// "auto-allow" (same kernel sandbox; ordinary Ask decisions are
+	// auto-approved). macOS uses Seatbelt and Linux uses bubblewrap;
+	// a requested backend that is unavailable fails closed.
 	Mode string `toml:"mode"`
 }
 
@@ -775,10 +773,35 @@ func Load() (*Config, []string, error) {
 		if _, err := os.Stat(path); err != nil {
 			continue
 		}
-		if _, err := toml.DecodeFile(path, cfg); err != nil {
+		md, err := toml.DecodeFile(path, cfg)
+		if err != nil {
 			return nil, loaded, fmt.Errorf("load %s: %w", path, err)
 		}
+		// `/sandbox` historically printed the wrong persistence path,
+		// `[bash.sandbox]`. That table is not part of Config (the real path is
+		// `[tools.bash.sandbox]`), so BurntSushi/toml quietly left it
+		// undecoded and Metis started with sandbox mode=off. Fail with a
+		// migration-quality error instead of accepting a security setting that
+		// has no effect.
+		if md.IsDefined("bash") || md.IsDefined("bash", "sandbox") {
+			return nil, loaded, fmt.Errorf("load %s: [bash.sandbox] is not a valid table; use [tools.bash.sandbox]", path)
+		}
 		loaded = append(loaded, path)
+	}
+
+	// A misspelled sandbox mode must never degrade to a direct host spawn.
+	// Empty is the documented backwards-compatible default (off). Config files
+	// accept canonical values only; the interactive command may translate its
+	// convenience aliases before it updates the runtime manager.
+	if !validSandboxMode(cfg.Tools.Bash.Sandbox.Mode) {
+		return nil, loaded, fmt.Errorf("invalid tools.bash.sandbox.mode %q (want off, permissions, or auto-allow)", cfg.Tools.Bash.Sandbox.Mode)
+	}
+	// Network policy is security-sensitive too: setupRuntime maps this value
+	// into the kernel backend, so accepting a typo here would silently turn an
+	// intended block into allow. Keep the empty value as the backwards-
+	// compatible default, but otherwise require one of the canonical values.
+	if !validSandboxNetwork(cfg.Tools.Bash.Sandbox.Network) {
+		return nil, loaded, fmt.Errorf("invalid tools.bash.sandbox.network %q (want allow or block)", cfg.Tools.Bash.Sandbox.Network)
 	}
 
 	// `metis config init` from the XDG era wrote the old data paths into
@@ -825,6 +848,24 @@ func Load() (*Config, []string, error) {
 		}
 	}
 	return cfg, loaded, nil
+}
+
+func validSandboxMode(mode string) bool {
+	switch mode {
+	case "", "off", "permissions", "auto-allow":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSandboxNetwork(network string) bool {
+	switch network {
+	case "", "allow", "block":
+		return true
+	default:
+		return false
+	}
 }
 
 func searchPaths() []string {

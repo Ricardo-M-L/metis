@@ -304,7 +304,8 @@ func renderStats(m *Model) string {
 		{Key: "tool calls", Value: fmt.Sprintf("%d", toolCalls)},
 		{Key: "input tokens", Value: fmtThousands(in)},
 		{Key: "output tokens", Value: fmtThousands(out)},
-		{Key: "loop iters", Value: fmt.Sprintf("%d", m.loop.MaxIters)},
+		{Key: "loop iterations", Value: fmt.Sprintf("%d", m.loop.IterIdx()), Hint: "actual iterations completed in this session"},
+		{Key: "iteration cap", Value: formatIterationCap(m.loop.MaxIters), Hint: "maximum per user turn"},
 		{Key: "history msgs", Value: fmt.Sprintf("%d", len(m.loop.History()))},
 	}
 	// System prompt + cache breakdown — useful when debugging "why
@@ -334,6 +335,13 @@ func renderStats(m *Model) string {
 		rows = append(rows, infoRow{Key: "system sections", Value: "(flat / no cache flags)"})
 	}
 	return renderInfoBox("Session Stats", rows)
+}
+
+func formatIterationCap(cap int) string {
+	if cap <= 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d", cap)
 }
 
 func renderKeybindings() string {
@@ -471,6 +479,17 @@ func renderReleaseNotes() string {
 	candidates := []string{
 		filepath.Join(config.Home(), "CHANGELOG.md"),
 	}
+	// Source builds often sit beside CHANGELOG.md. Packaged installs currently
+	// ship a single binary, but also search conventional share/app-resource
+	// locations so distributors can add the changelog without changing code.
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "CHANGELOG.md"),
+			filepath.Clean(filepath.Join(exeDir, "..", "share", "metis", "CHANGELOG.md")),
+			filepath.Clean(filepath.Join(exeDir, "..", "Resources", "CHANGELOG.md")),
+		)
+	}
 	// metis source dir if user is iterating on the binary itself.
 	if cwd, err := os.Getwd(); err == nil {
 		candidates = append(candidates, filepath.Join(cwd, "CHANGELOG.md"))
@@ -498,7 +517,15 @@ func renderReleaseNotes() string {
 		}
 		return "from " + p + ":\n\n" + strings.Join(lines[:end], "\n")
 	}
-	return fmt.Sprintf("metis %s — no CHANGELOG.md found in %s or cwd", version.Version, config.Home())
+	return fmt.Sprintf("metis %s — this installation does not include CHANGELOG.md\n\nRelease notes: %s", version.Version, releaseNotesURL())
+}
+
+func releaseNotesURL() string {
+	v := strings.TrimSpace(version.Short())
+	if v == "" || v == "dev" || v == "unknown" {
+		return "https://github.com/Ricardo-M-L/metis/releases/latest"
+	}
+	return "https://github.com/Ricardo-M-L/metis/releases/tag/v" + v
 }
 
 // fmtThousands formats an int with thousands separators ("12,345").

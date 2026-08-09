@@ -467,6 +467,41 @@ NOT done in this round (deferred):
   slash_help, input_repeat, arrow_jump, slash_skills, slash_mcp_list,
   double_esc_clear, ctrl_c_quit).
 
+## [0.4.15] - 2026-08-09
+
+### Added
+
+- Added one runtime-owned OS sandbox policy across Bash, Git, workflow,
+  skill-shell, and custom-command process launchers. macOS uses Seatbelt and
+  Linux uses Bubblewrap; unavailable backends and unsafe policy gaps fail
+  closed instead of silently executing on the host.
+- Added the inline `/effort` selector, argument-aware `/compact`, real
+  Research → Plan → Execute `/batch` behavior, and a unified command catalog
+  used by the palette and help views.
+- Added request-local `allowed-tools` support for trusted custom commands;
+  permissions expire when that command turn finishes.
+
+### Changed
+
+- `/agents` now reads the live sub-agent roster, `/reload` invalidates and
+  reloads the skill catalog, and list-command aliases enter the same picker as
+  their canonical commands.
+- Custom-command `model:` metadata now validates the selected model and gives
+  an actionable `/model` instruction instead of pretending to switch models.
+- Conversation exports use a readable text transcript while session JSONL
+  remains the internal resume format.
+
+### Fixed
+
+- Kept internal `/review` prompts out of chat, history, resume, and exports;
+  `/undo` and `/retry` now target the visible user turn rather than hidden
+  system reminders.
+- Restored provider-aware image handling and vision-model recovery, including
+  configured OpenAI-compatible, Vertex, and Bedrock transports.
+- Prevented mid-turn rewind from racing active file-writing tools, corrected
+  bypass-permission handling, and stabilized command submission, overlays,
+  history rendering, and elapsed-time updates under busy agent output.
+
 ## [0.4.14] - 2026-08-09
 
 ### Added
@@ -611,7 +646,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.14...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.15...HEAD
+[0.4.15]: https://github.com/Ricardo-M-L/metis/compare/v0.4.14...v0.4.15
 [0.4.14]: https://github.com/Ricardo-M-L/metis/compare/v0.4.13...v0.4.14
 [0.4.13]: https://github.com/Ricardo-M-L/metis/compare/v0.4.12...v0.4.13
 [0.4.12]: https://github.com/Ricardo-M-L/metis/compare/v0.4.11...v0.4.12

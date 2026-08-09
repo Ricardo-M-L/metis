@@ -17,9 +17,8 @@ import (
 // TestREPL_KeybindingsSlash — pre-fix regression: typing /keybindings
 // (or its alias /keys) into the readline REPL produced no output. The
 // signal was registered in slash.Registry but the REPL's slash dispatch
-// switch had no case for it, so the handler returned ("", SignalKeybindings)
-// and the empty display silently dropped on the floor. The fix wires
-// SignalKeybindings to renderKeybindings() in repl.go.
+// switch had no case for it. The plain surface now renders its own truthful
+// readline bindings instead of showing Bubble Tea-only Esc/overlay shortcuts.
 //
 // This test exercises the readline REPL path end-to-end with a piped
 // stdin, NOT the bubbletea TUI (slash_e2e_test.go covers that path
@@ -35,12 +34,13 @@ func TestREPL_KeybindingsSlash(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			out := runREPLWithInput(t, tc.input)
-			// The renderKeybindings table must be present:
-			// title + the two pillar shortcut rows.
-			mustContain(t, out, "TUI Keybindings", "renderKeybindings title")
+			mustContain(t, out, "Readline REPL Keybindings", "readline keybindings title")
 			mustContain(t, out, "Ctrl-C", "Ctrl-C row")
 			mustContain(t, out, "Tab", "Tab row")
-			mustContain(t, out, "Esc", "Esc row")
+			mustContain(t, out, "Up / Down", "history row")
+			if strings.Contains(out, "Esc:") {
+				t.Errorf("plain REPL must not advertise TUI-only Esc overlays:\n%s", out)
+			}
 		})
 	}
 }
@@ -49,9 +49,9 @@ func TestREPL_KeybindingsSlash(t *testing.T) {
 // session must produce two render blocks (no caching / dedup bug).
 func TestREPL_KeybindingsRepeats(t *testing.T) {
 	out := runREPLWithInput(t, "/keybindings\n/keybindings\n/quit\n")
-	count := strings.Count(out, "TUI Keybindings")
+	count := strings.Count(out, "Readline REPL Keybindings")
 	if count != 2 {
-		t.Errorf("expected 2 'TUI Keybindings' renders, got %d:\n%s", count, out)
+		t.Errorf("expected 2 readline keybinding renders, got %d:\n%s", count, out)
 	}
 }
 
@@ -69,14 +69,15 @@ func runREPLWithInput(t *testing.T, input string) string {
 	slash.RegisterAll(sl, &config.Config{})
 
 	r := &REPL{
-		Loop:   loop,
-		Gate:   gate,
-		Slash:  sl,
-		Styles: NewStyles(),
-		model:  "test-model",
-		cmds:   BuildREPLCommands(),
-		stdin:  strings.NewReader(input),
-		out:    &stdout,
+		Loop:      loop,
+		Gate:      gate,
+		Slash:     sl,
+		SessionID: "test-session",
+		Styles:    NewStyles(),
+		model:     "test-model",
+		cmds:      BuildREPLCommands(),
+		stdin:     strings.NewReader(input),
+		out:       &stdout,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

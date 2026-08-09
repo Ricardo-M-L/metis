@@ -154,7 +154,12 @@ type Loop struct {
 	//   "medium"  → balanced
 	//   "high"    → deep reasoning, slowest
 	// Maps to Anthropic thinking.budget_tokens and OpenAI reasoning_effort.
-	Effort llm.Effort
+	//
+	// Live callers use EffortValue / SetEffort. Keep this on a small dedicated
+	// lock: buildRequest's main mu can cover memory assembly and must not stall
+	// the Bubble Tea renderer just because it reads the status-bar glyph.
+	effortMu sync.RWMutex
+	effort   llm.Effort
 
 	// Fast collapses the next turn's resource use:
 	//   - effort drops to "low" (overrides Effort for the request)
@@ -600,6 +605,31 @@ func (l *Loop) IsPlanMode() bool {
 	return l.planMode
 }
 
+// EffortValue returns the live reasoning-effort preference. The TUI may read
+// this while Run is assembling a provider request, so direct field access from
+// presentation or command code would otherwise race with /effort updates.
+func (l *Loop) EffortValue() llm.Effort {
+	if l == nil {
+		return llm.EffortDefault
+	}
+	l.effortMu.RLock()
+	defer l.effortMu.RUnlock()
+	return l.effort
+}
+
+// SetEffort changes the reasoning-effort preference for the next request
+// snapshot. A running iteration may already have captured the previous value;
+// the following iteration observes this update without racing buildRequest or
+// SnapshotForFork.
+func (l *Loop) SetEffort(e llm.Effort) {
+	if l == nil {
+		return
+	}
+	l.effortMu.Lock()
+	l.effort = e
+	l.effortMu.Unlock()
+}
+
 // PrePlanMode / SetPrePlanMode implement the PlanController surface
 // for EnterPlanMode/ExitPlanMode to round-trip the user's prior gate
 // posture across the plan window. See the prePlanMode field doc for
@@ -805,6 +835,14 @@ func (l *Loop) IterIdx() int {
 //  8. Append assistant + tool_results, emit TurnEnd
 //  9. Loop-detect / max-iter / grace-call checks
 func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
+	// Custom-command `allowed-tools` are one-turn pre-approvals. Install them
+	// under a unique source and remove that exact source on every exit path;
+	// later interactive approvals must survive this cleanup.
+	if rules := turnPermissionRulesFromContext(ctx); len(rules) > 0 && l.Gate != nil {
+		cleanup := l.Gate.PushScopedRules(rules...)
+		defer cleanup()
+	}
+
 	// Clear any halt signal carried over from a prior turn — Run is the
 	// boundary between user prompts, and a halt request only governs
 	// the turn that raised it.
@@ -1858,10 +1896,12 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 		Messages:       append([]llm.Message(nil), l.Messages...),
 		Tools:          specs,
 		Stream:         true,
-		Effort:         l.Effort,
+		// Effort has a dedicated lock so the TUI can update it while the main
+		// request snapshot lock is busy assembling memory and messages.
+		Effort: l.EffortValue(),
 	}
 	// Fast mode is a pure request-time override. We don't mutate
-	// l.Effort because the user's persistent /effort preference
+	// l.effort because the user's persistent /effort preference
 	// should survive a transient /fast toggle.
 	if l.Fast {
 		req.Effort = llm.EffortLow

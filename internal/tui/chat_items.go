@@ -38,6 +38,7 @@ import (
 type messageItem struct {
 	msg    Message
 	expand bool
+	plain  bool
 	cache  *renderCache
 }
 
@@ -49,6 +50,9 @@ type messageItem struct {
 // keys into the cache via PutMessage/GetMessage — so toggling Ctrl+O
 // invalidates cached folded thinking blocks and forces a re-render.
 func (i *messageItem) Render(width int) string {
+	if i.plain {
+		return renderMessagePlain(i.msg, width, i.expand)
+	}
 	if i.cache != nil {
 		if cached, ok := i.cache.GetMessage(i.msg, width, i.expand); ok {
 			return cached
@@ -61,6 +65,31 @@ func (i *messageItem) Render(width int) string {
 		i.cache.PutMessage(i.msg, width, i.expand, rendered)
 	}
 	return rendered
+}
+
+// compactToolEventItem preserves the normal tool header + result summary but
+// removes all preview/error bodies. This is the streamlined/minimal rendering
+// contract: execution remains visible and auditable without filling the
+// transcript with command output or diffs.
+type compactToolEventItem struct {
+	te ToolEvent
+}
+
+func (i *compactToolEventItem) Render(width int) string {
+	_ = width
+	full := strings.TrimRight(renderToolEvent(i.te, false), "\n")
+	if full == "" {
+		return ""
+	}
+	lines := strings.Split(full, "\n")
+	limit := 2
+	if i.te.Kind == "start" {
+		limit = 1
+	}
+	if len(lines) > limit {
+		lines = lines[:limit]
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // toolEventItem adapts a ToolEvent into list.Item.
@@ -671,8 +700,11 @@ func (m *Model) buildChatItems() []list.Item {
 	// transcript and from the live-streaming preview. "show" forces
 	// expanded view regardless of ctrl+o state. "auto" (default) keeps
 	// the old collapsed-by-default-with-ctrl+o behaviour.
-	hideThinking := m.thinkingDisplay == "hide"
+	style := normalizeOutputStyle(m.outputStyle)
+	hideThinking := m.thinkingDisplay == "hide" || style != outputStyleFull
 	forceExpandThinking := m.thinkingDisplay == "show"
+	compactTools := style != outputStyleFull
+	plainAssistant := style == outputStyleMinimal
 	var explorationRun []ToolEvent
 	flushExploration := func() {
 		if len(explorationRun) == 0 {
@@ -711,13 +743,21 @@ func (m *Model) buildChatItems() []list.Item {
 			if hideThinking && (it.msg.Role == "thinking" || it.msg.Role == "redacted_thinking") {
 				continue
 			}
+			if style != outputStyleFull && it.msg.Role == "thought-summary" {
+				continue
+			}
 			// A1 (2026-08-02): thinking rows honour /thinking show only.
 			// The legacy expandToolOutputs global toggle is gone; ctrl+O
 			// against a thinking row no longer expands it (only tool
 			// events participate in one-at-a-time expansion).
 			expand := forceExpandThinking && it.msg.Role == "thinking"
-			out = append(out, &messageItem{msg: *it.msg, expand: expand, cache: m.renderCache})
+			out = append(out, &messageItem{msg: *it.msg, expand: expand, plain: plainAssistant && it.msg.Role == "assistant", cache: m.renderCache})
 		case it.te != nil:
+			if compactTools {
+				flushExploration()
+				out = append(out, &compactToolEventItem{te: *it.te})
+				continue
+			}
 			if plan, recovered := recoveryPlans[it.te]; recovered {
 				flushExploration()
 				if it.te == plan.anchor {

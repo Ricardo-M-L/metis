@@ -14,12 +14,13 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
-	"github.com/Ricardo-M-L/metis/internal/agent/skills"
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -65,7 +66,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Core ===
 	r.Register(REPLCommand{Name: "help", Aliases: []string{"h", "?"}, Description: "show this help", Handler: cmdHelp})
 	r.Register(REPLCommand{Name: "quit", Aliases: []string{"q", "exit", "bye"}, Description: "exit metis", Handler: cmdQuit})
-	r.Register(REPLCommand{Name: "clear", Aliases: []string{"reset", "cls"}, Description: "clear conversation history", Handler: cmdClear})
+	r.Register(REPLCommand{Name: "clear", Aliases: []string{"cls"}, Description: "clear conversation history", Handler: cmdClear})
 
 	// === Model ===
 	r.Register(REPLCommand{Name: "model", Aliases: []string{"m"}, Description: "show or switch model (e.g. model claude-opus-4-7)", Handler: cmdModel})
@@ -131,7 +132,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "gst", Aliases: []string{"st"}, Description: "git status (alias 'st')", Handler: cmdGitStatus})
 
 	// === Tools ===
-	r.Register(REPLCommand{Name: "tools", Aliases: []string{"t"}, Description: "list available tools", Handler: cmdTools})
+	r.Register(REPLCommand{Name: "tools", Aliases: []string{"t", "toolsets"}, Description: "list available tools", Handler: cmdTools})
 
 	// === Skills ===
 	// /skills is the canonical form; the singular /skill alias was
@@ -154,7 +155,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Permissions ===
 	r.Register(REPLCommand{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions)", Handler: cmdMode})
 	r.Register(REPLCommand{Name: "allow", Description: "allow a tool permanently (e.g. allow Bash)", Handler: cmdAllow})
-	r.Register(REPLCommand{Name: "sandbox", Description: "Bash sandbox (macOS Seatbelt): status | off | permissions | auto-allow", Handler: cmdSandbox})
+	r.Register(REPLCommand{Name: "sandbox", Description: "OS command sandbox: status | doctor | reset | off | permissions | auto-allow", Handler: cmdSandbox})
 
 	// === System ===
 	r.Register(REPLCommand{Name: "compact", Description: "force context compaction now", Handler: cmdCompact})
@@ -277,15 +278,20 @@ func switchREPLModel(r *REPL, newModel string) error {
 		runtime.RebindLoopRuntime(r.Loop, r.Loop.Provider, newModel, r.Loop.System, r.SessionID)
 		return nil // string-only swap (test path)
 	}
-	// Look up the requested model in the picker list — if it's there we
-	// pick up the canonical provider profile for it. Otherwise stay on
-	// the current profile.
-	newProvName := ""
+	// `/model <provider>/<model>` is unambiguous for custom profiles. For a
+	// bare model ID, resolve an exact configured-profile match before falling
+	// back to the current provider. Without this, `/model kimi-k3` changed the
+	// label but still sent the request through the previous Ark endpoint.
+	newProvName, resolvedModel := splitConfiguredProviderModel(r.cfg, newModel)
+	newModel = resolvedModel
 	for _, c := range builtinModelChoices {
-		if c.ID == newModel {
+		if newProvName == "" && c.ID == newModel {
 			newProvName = c.Provider
 			break
 		}
+	}
+	if newProvName == "" {
+		newProvName = configuredProviderForModel(r.cfg, newModel)
 	}
 	if newProvName == "" {
 		newProvName = r.providerName
@@ -470,11 +476,12 @@ func cmdMemory(r *REPL, args string) string {
 // cmdRecap re-emits the most recent turn-end recap line. Useful when
 // scrolled away.
 func cmdRecap(r *REPL, args string) string {
-	hist := r.Loop.History()
-	if len(hist) == 0 {
-		return "recap: no turns yet"
+	if r != nil && r.RecapSnapshot != nil {
+		if recap := strings.TrimSpace(r.RecapSnapshot()); recap != "" {
+			return "※ recap: " + recap
+		}
 	}
-	return "recap: scroll up to see ※ recap line of the last turn (auto-generated at turn end)"
+	return "recap: no structural recap yet (a recap appears after a turn with multiple tool calls)"
 }
 
 // cmdReplay re-runs the last user prompt by appending the same text
@@ -735,19 +742,16 @@ func cmdShare(r *REPL, args string) string {
 		return "share: stopped"
 	case "", "start", "on":
 		if cur := bridgeCurrentAddr(); cur != "" {
-			return "share: already running on http://" + cur
+			return "share: already running read-only on http://" + cur
 		}
-		// Make a buffered channel so a quick burst of POSTs doesn't
-		// stall the HTTP handler. Drained by the chat surface (TODO
-		// once Model wires it; today the channel is registered but
-		// the chat surface doesn't yet consume — read-only mode is
-		// useful enough for v1).
-		ch := make(chan string, 8)
-		addr, err := startBridge(ch)
+		// The Bubble Tea surface does not currently consume bridge input. Start
+		// explicitly in read-only mode instead of advertising a /message queue
+		// that accepts prompts but never executes them.
+		addr, err := startBridge(nil)
 		if err != nil {
 			return "share: " + err.Error()
 		}
-		return fmt.Sprintf("share: http://%s — endpoints: /transcript /events /message /health", addr)
+		return fmt.Sprintf("share: http://%s — read-only endpoints: /transcript /events /health", addr)
 	}
 	return "share: unknown arg " + args
 }
@@ -866,7 +870,7 @@ func cmdTheme(r *REPL, args string) string {
 func cmdEffort(r *REPL, args string) string {
 	arg := strings.ToLower(strings.TrimSpace(args))
 	if arg == "" {
-		cur := string(r.Loop.Effort)
+		cur := string(r.Loop.EffortValue())
 		if cur == "" {
 			cur = "default (provider decides)"
 		}
@@ -880,14 +884,14 @@ func cmdEffort(r *REPL, args string) string {
 		})
 	}
 	if arg == "off" || arg == "default" || arg == "none" {
-		r.Loop.Effort = llm.EffortDefault
+		r.Loop.SetEffort(llm.EffortDefault)
 		return "effort: cleared (using provider default)"
 	}
 	e, ok := llm.ParseEffort(arg)
 	if !ok {
 		return "(unknown effort: " + args + " — use: effort low|medium|high|off)"
 	}
-	r.Loop.Effort = e
+	r.Loop.SetEffort(e)
 	switch e {
 	case llm.EffortLow:
 		return "effort: low — small thinking budget, faster"
@@ -931,11 +935,33 @@ func cmdFast(r *REPL, args string) string {
 // =============================================================================
 
 func cmdGit(r *REPL, args string) string {
-	return runGitCmd(args, "status")
+	fields := strings.Fields(strings.TrimSpace(args))
+	if len(fields) == 0 || fields[0] == "status" {
+		return cmdGitStatus(r, strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args), "status")))
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args), fields[0]))
+	switch fields[0] {
+	case "diff":
+		return cmdGitDiff(r, rest)
+	case "log":
+		return cmdGitLog(r, rest)
+	case "branch":
+		return cmdGitBranch(r, rest)
+	case "checkout":
+		return cmdGitCheckout(r, rest)
+	case "stash":
+		return cmdGitStash(r, rest)
+	case "fetch":
+		return cmdGitFetch(r, rest)
+	case "commit":
+		return cmdGitCommit(r, rest)
+	default:
+		return "git: unsupported shortcut " + fields[0] + " (use status|diff|log|branch|checkout|stash|fetch|commit)"
+	}
 }
 
 func cmdGitStatus(r *REPL, args string) string {
-	return runGitCmd(args, "status")
+	return runGitCmd(r, args, "status")
 }
 
 func cmdGitDiff(r *REPL, args string) string {
@@ -944,7 +970,7 @@ func cmdGitDiff(r *REPL, args string) string {
 	if staged {
 		gitArgs = []string{"diff", "--cached"}
 	}
-	return runGitCmd(strings.TrimSpace(args), gitArgs...)
+	return runGitCmd(r, strings.TrimSpace(args), gitArgs...)
 }
 
 func cmdGitLog(r *REPL, args string) string {
@@ -957,24 +983,24 @@ func cmdGitLog(r *REPL, args string) string {
 		}
 	}
 	if stat {
-		return runGitCmd(args, "log", "--stat", "-n", n)
+		return runGitCmd(r, args, "log", "--stat", "-n", n)
 	}
-	return runGitCmd(args, "log", "-n", n, "--oneline")
+	return runGitCmd(r, args, "log", "-n", n, "--oneline")
 }
 
 func cmdGitBranch(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
 	if strings.Contains(args, "-a") {
-		return runGitCmd(args, "branch", "-a")
+		return runGitCmd(r, args, "branch", "-a")
 	}
 	if strings.HasPrefix(args, "-c ") {
 		name := strings.TrimSpace(strings.TrimPrefix(args, "-c"))
 		if name == "" {
 			return "(branch name required: branch -c <name>)"
 		}
-		return runGitCmd(args, "branch", name)
+		return runGitCmd(r, args, "branch", name)
 	}
-	return runGitCmd(args, "branch")
+	return runGitCmd(r, args, "branch")
 }
 
 func cmdGitCheckout(r *REPL, args string) string {
@@ -982,20 +1008,20 @@ func cmdGitCheckout(r *REPL, args string) string {
 	if args == "" {
 		return "(branch name required: checkout <branch>)"
 	}
-	return runGitCmd(args, "checkout", args)
+	return runGitCmd(r, args, "checkout", args)
 }
 
 func cmdGitStash(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
 	if args == "" || args == "push" {
 		msg := "metis stash " + time.Now().Format(time.RFC3339)
-		return runGitCmd(args, "stash", "push", "-m", msg)
+		return runGitCmd(r, args, "stash", "push", "-m", msg)
 	}
 	if args == "pop" {
-		return runGitCmd(args, "stash", "pop")
+		return runGitCmd(r, args, "stash", "pop")
 	}
 	if args == "list" {
-		return runGitCmd(args, "stash", "list")
+		return runGitCmd(r, args, "stash", "list")
 	}
 	return "(stash: use: stash push | stash pop | stash list)"
 }
@@ -1003,29 +1029,29 @@ func cmdGitStash(r *REPL, args string) string {
 func cmdGitFetch(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
 	if args == "--all" || args == "-a" {
-		return runGitCmd(args, "fetch", "--all")
+		return runGitCmd(r, args, "fetch", "--all")
 	}
 	if args != "" {
-		return runGitCmd(args, "fetch", args)
+		return runGitCmd(r, args, "fetch", args)
 	}
-	return runGitCmd(args, "fetch")
+	return runGitCmd(r, args, "fetch")
 }
 
 func cmdGitCommit(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
 	msg := extractFlag(args, "-m")
 	if msg == "" {
-		diff, _ := runGitCmdOut("diff", "--staged")
+		diff, _ := runGitCmdOut(r, "diff", "--staged")
 		if len(diff) == 0 {
 			return "(nothing staged to commit)"
 		}
 		return "(no commit message; use: commit -m 'your message')"
 	}
-	return runGitCmd(args, "commit", "-m", msg)
+	return runGitCmd(r, args, "commit", "-m", msg)
 }
 
-func runGitCmd(rest string, gitArgs ...string) string {
-	out, err := runGitCmdOut(gitArgs...)
+func runGitCmd(r *REPL, rest string, gitArgs ...string) string {
+	out, err := runGitCmdOut(r, gitArgs...)
 	if err != nil {
 		return "git " + strings.Join(gitArgs, " ") + ": " + err.Error()
 	}
@@ -1035,10 +1061,21 @@ func runGitCmd(rest string, gitArgs ...string) string {
 	return string(out)
 }
 
-func runGitCmdOut(args ...string) ([]byte, error) {
+func runGitCmdOut(r *REPL, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
+	if r != nil && r.sandbox != nil {
+		cmd.Env = r.sandbox.FilterEnv(os.Environ(), false)
+		if tempDir := r.sandbox.TempDir(); tempDir != "" {
+			cmd.Env = append(cmd.Env, "TMPDIR="+tempDir, "TMP="+tempDir, "TEMP="+tempDir)
+		}
+		wrapped, err := r.sandbox.Wrap(cmd, sandbox.Request{})
+		if err != nil {
+			return nil, fmt.Errorf("sandbox failed closed: %w", err)
+		}
+		cmd = wrapped
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -1049,11 +1086,21 @@ func runGitCmdOut(args ...string) ([]byte, error) {
 }
 
 func extractFlag(args, flag string) string {
-	parts := strings.Split(args, flag)
-	if len(parts) < 2 {
+	idx := strings.Index(args, flag)
+	if idx < 0 {
 		return ""
 	}
-	return strings.TrimSpace(strings.SplitN(strings.TrimSpace(parts[1]), " ", 2)[0])
+	tail := strings.TrimSpace(args[idx+len(flag):])
+	if tail == "" {
+		return ""
+	}
+	if tail[0] == '\'' || tail[0] == '"' {
+		quote := tail[0]
+		if end := strings.IndexByte(tail[1:], quote); end >= 0 {
+			return tail[1 : end+1]
+		}
+	}
+	return tail
 }
 
 // =============================================================================
@@ -1069,9 +1116,8 @@ func cmdTools(r *REPL, args string) string {
 // =============================================================================
 
 // cmdSkills lives in cmd_skills_extra.go (full subcommand dispatcher).
-// /skill (singular) keeps the historical narrow surface: list / install /
-// uninstall / search-on-github. Users typing the plural form get the
-// extended Phase-A surface.
+// cmdSkill remains only as a compatibility implementation for embedders; the
+// registered canonical surface is /skills and both paths use SKILL.md.
 
 func cmdSkill(r *REPL, args string) string {
 	parts := strings.SplitN(strings.TrimSpace(args), " ", 2)
@@ -1369,10 +1415,14 @@ func cmdAllow(r *REPL, args string) string {
 	if args == "" {
 		return "usage: allow <tool-name> (e.g. allow Bash)"
 	}
-	r.Gate.AppendRules(permission.Rule{
-		Tool: args, Verb: permission.DecisionAllow, Source: "interactive",
-	})
-	return "allowed: " + args
+	if r == nil || r.Gate == nil {
+		return "allow: permission gate unavailable"
+	}
+	store := permission.Default(config.Home())
+	if err := r.Gate.RememberPersistent(store, args, ""); err != nil {
+		return "allowed for this session, but persistence failed: " + err.Error()
+	}
+	return "allowed permanently: " + args
 }
 
 // =============================================================================
@@ -1404,7 +1454,8 @@ func cmdCompact(r *REPL, args string) string {
 			EstimatedTokens: r.Loop.EstimateContextTokens(),
 		})
 	}
-	compacted, err := r.Loop.Compactor.Compact(ctx, hist)
+	instructions := strings.TrimSpace(args)
+	compacted, err := r.Loop.Compactor.CompactWithInstructions(ctx, hist, instructions)
 	if err != nil {
 		return "compact failed: " + err.Error()
 	}
@@ -1415,7 +1466,11 @@ func cmdCompact(r *REPL, args string) string {
 	if err := r.replaceHistory(compacted); err != nil {
 		return fmt.Sprintf("compact: %d → %d messages in memory, but history persistence failed: %v", before, len(compacted), err)
 	}
-	return fmt.Sprintf("compact: %d → %d messages (saved %d)", before, len(compacted), before-len(compacted))
+	result := fmt.Sprintf("compact: %d → %d messages (saved %d)", before, len(compacted), before-len(compacted))
+	if instructions != "" {
+		result += " · applied custom summary instructions"
+	}
+	return result
 }
 
 func cmdConfig(r *REPL, args string) string {
@@ -1428,8 +1483,10 @@ func cmdConfig(r *REPL, args string) string {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Run()
-	return "(config updated — restart metis for changes to take effect)"
+	if err := cmd.Run(); err != nil {
+		return "config editor failed: " + err.Error()
+	}
+	return "(config saved — restart metis for changes to take effect)"
 }
 
 func cmdEnv(r *REPL, args string) string {
@@ -1464,7 +1521,11 @@ func cmdDoctor(r *REPL, args string) string {
 	}
 	for _, k := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"} {
 		if v := os.Getenv(k); v != "" {
-			rows = append(rows, infoRow{Key: k, Value: "set", Hint: v[:4] + "…"})
+			prefix := v
+			if len(prefix) > 4 {
+				prefix = prefix[:4]
+			}
+			rows = append(rows, infoRow{Key: k, Value: "set", Hint: prefix + "…"})
 		}
 	}
 	gitHint := "not found"
@@ -1489,31 +1550,60 @@ func cmdVersion(r *REPL, args string) string {
 	return renderVersion()
 }
 
-// cmdLogin / cmdLogout — slash entries that delegate to the top-level
-// `metis auth` family. The auth wizard runs its own bubbletea program
-// which can't safely re-enter the chat surface's program, so we surface
-// a clear "exit + run from shell" hint rather than crash. Adding these
-// slashes lets users discover credential setup from inside chat (CC
-// parity — they have /login and /logout in the slash registry too).
+// cmdLogin / cmdLogout expose the top-level auth store without pretending a
+// nested Bubble Tea wizard can run inside the active chat program. Login stays
+// a precise cross-terminal handoff; logout is safe to perform directly.
 func cmdLogin(r *REPL, args string) string {
 	provider := strings.TrimSpace(args)
 	if provider == "" {
-		return "login: exit chat (Ctrl-D or /quit) and run `metis auth login`\n" +
-			"  · interactive wizard picks provider + stores key in ~/.metis/auth.json\n" +
-			"  · or one-shot: `metis auth login <provider>` (anthropic | openai | gemini)"
+		return "login: keep this chat open and run `metis auth login` in another terminal\n" +
+			"  · the interactive wizard selects a provider and stores its credential in " + auth.Path() + "\n" +
+			"  · browser OAuth: `metis auth oauth <provider>`"
 	}
-	return "login: exit chat and run `metis auth login " + provider + "`\n" +
-		"  · sets the credential for " + provider + " then resume metis"
+	return "login: inline provider selection is not supported while chat is active\n" +
+		"  · keep this chat open and run `metis auth login` in another terminal, then choose " + provider + "\n" +
+		"  · for OAuth providers, run `metis auth oauth " + provider + "`"
 }
 
 func cmdLogout(r *REPL, args string) string {
-	provider := strings.TrimSpace(args)
-	if provider == "" {
-		return "logout: exit chat and run `metis auth logout <provider>`\n" +
-			"  · removes that provider's stored key from ~/.metis/auth.json\n" +
-			"  · use `metis auth list` first to see what's stored"
+	providers := strings.Fields(args)
+	stored, err := auth.List()
+	if err != nil {
+		return "logout: could not read " + auth.Path() + ": " + err.Error()
 	}
-	return "logout: exit chat and run `metis auth logout " + provider + "`"
+	if len(providers) == 0 {
+		if len(stored) == 0 {
+			return "logout: no stored provider credentials in " + auth.Path()
+		}
+		return "logout: provider required — stored: " + strings.Join(stored, ", ") + "\n" +
+			"  usage: /logout <provider> [provider...]"
+	}
+
+	known := make(map[string]bool, len(stored))
+	for _, provider := range stored {
+		known[provider] = true
+	}
+	removed := make([]string, 0, len(providers))
+	missing := make([]string, 0)
+	for _, provider := range providers {
+		if !known[provider] {
+			missing = append(missing, provider)
+			continue
+		}
+		if err := auth.Remove(provider); err != nil {
+			return "logout: remove " + provider + ": " + err.Error()
+		}
+		removed = append(removed, provider)
+	}
+	parts := make([]string, 0, 3)
+	if len(removed) > 0 {
+		parts = append(parts, "logout: removed stored credentials for "+strings.Join(removed, ", "))
+	}
+	if len(missing) > 0 {
+		parts = append(parts, "no stored credential for "+strings.Join(missing, ", "))
+	}
+	parts = append(parts, "environment variables are unchanged and may still authenticate the provider")
+	return strings.Join(parts, "\n")
 }
 
 // cmdInit scaffolds a CLAUDE.md in cwd for this project. Cross-tool
@@ -1527,29 +1617,40 @@ func cmdInit(r *REPL, args string) string {
 	return output
 }
 
-// cmdStatusLine documents the current status-line layout and points at
-// the config knobs that customize it. Full customization (preset
-// layouts, custom format strings) is a separate refactor — for now
-// this is the discoverability hook so users can find the configuration
-// surface from inside chat (CC parity for /statusline as a discovery
-// command, even if the editing UX is config-file rather than TUI).
+// cmdStatusLine reports the actual customization contract implemented by
+// statusline_script.go: an executable statusline script under METIS_HOME.
 func cmdStatusLine(r *REPL, args string) string {
+	home := config.Home()
+	path := filepath.Join(home, "statusline.sh")
+	state := "not installed"
+	if active := statusLineScriptPath(); active != "" {
+		path = active
+		state = "active"
+	} else {
+		for _, candidate := range []string{path, filepath.Join(home, "statusline")} {
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				path = candidate
+				state = "present but not executable (run chmod +x)"
+				break
+			}
+		}
+	}
 	return renderInfoBox("Status Line", []infoRow{
 		{Key: "current layout", Value: "elapsed · effort · mode · subagents · tokens"},
+		{Key: "custom script", Value: path},
+		{Key: "script status", Value: state},
+		{Key: "refresh", Value: statusLineRefresh.String()},
 		{Key: "", Value: ""},
-		{Key: "Customize via:", Value: ""},
-		{Key: "  ~/.metis/config.toml", Value: "[ui] section — set theme + statusline knobs"},
-		{Key: "  METIS_THEME env", Value: "override theme without editing the file"},
+		{Key: "Customize", Value: "create the script above, make it executable, and print one line to stdout"},
+		{Key: "environment", Value: "METIS_MODEL, METIS_MODE, METIS_SESSION, METIS_TOKENS_TOTAL, METIS_CWD"},
 		{Key: "", Value: ""},
-		{Key: "Available pieces:", Value: ""},
+		{Key: "Built-in pieces:", Value: ""},
 		{Key: "  elapsed", Value: "wall-clock for the current turn"},
 		{Key: "  effort", Value: "reasoning effort glyph (low/med/high/off)"},
 		{Key: "  mode", Value: "permission mode (auto/ask/bypass/plan/deny)"},
 		{Key: "  subagents", Value: "active Agent tool sub-agent pills"},
 		{Key: "  tokens", Value: "context-window load + percent (right-aligned)"},
 		{Key: "  spinner", Value: "↑in / ↓out per-turn breakdown"},
-		{Key: "", Value: ""},
-		{Key: "", Value: "Customize via [ui] section in ~/.metis/config.toml."},
 	})
 }
 
@@ -1629,108 +1730,21 @@ func cmdStack(r *REPL, args string) string {
 // =============================================================================
 
 func (r *REPL) handleSkillList() string {
-	if r.skillDir == "" {
-		return "(skills directory not configured)"
-	}
-	entries, err := os.ReadDir(r.skillDir)
-	if err != nil {
-		return "(no skills: " + err.Error() + ")"
-	}
-	var b strings.Builder
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		name := strings.TrimSuffix(e.Name(), ".json")
-		b.WriteString("  " + name + "\n")
-	}
-	if b.Len() == 0 {
-		return "(no skills — use 'skill install <name>' to add)"
-	}
-	return b.String()
+	return r.renderManagedSkillsList()
 }
 
 func (r *REPL) handleSkillInstall(name string) string {
-	if r.skillDir == "" {
-		return "(skills directory not configured)"
-	}
-	name = sanitize(name)
-	skillJSON := fmt.Sprintf(`{
-  "name": %q,
-  "description": "user-installed skill",
-  "category": "custom",
-  "prompt": "",
-  "tools": [],
-  "tags": [],
-  "uses": 0
-}`, name)
-	path := filepath.Join(r.skillDir, name+".json")
-	if _, err := os.Stat(path); err == nil {
-		return "(skill already exists: " + name + ")"
-	}
-	if err := os.WriteFile(path, []byte(skillJSON), 0o644); err != nil {
-		return "install failed: " + err.Error()
-	}
-	return "installed: " + name + "\nedit: " + path
+	return r.skillInstallPlan(name)
 }
 
 func (r *REPL) handleSkillUninstall(name string) string {
-	if r.skillDir == "" {
-		return "(skills directory not configured)"
-	}
-	name = sanitize(name)
-	path := filepath.Join(r.skillDir, name+".json")
-	if _, err := os.Stat(path); err != nil {
-		return "(skill not found: " + name + ")"
-	}
-	if err := os.Remove(path); err != nil {
-		return "uninstall failed: " + err.Error()
-	}
-	return "uninstalled: " + name
+	return r.removeManagedSkill(name)
 }
 
-// handleSkillSearch hits GitHub's code search and prints the top matches.
-// Each row is formatted so the user can copy-paste straight into
-// `skill install <ref>`.
-//
-// Network call goes through the default GitHub source. Hits are capped at
-// 10 to keep the chat output readable; raise via `/skill search <q> 30`
-// is intentionally NOT supported here — the user can fall back to the
-// browser if they need deeper paging.
+// handleSkillSearch is the compatibility wrapper for the canonical guarded
+// local-search + install-planner path. It performs no network request itself.
 func (r *REPL) handleSkillSearch(query string) string {
-	if query == "" {
-		return "usage: skill search <query>"
-	}
-	src := skills.NewGitHubSource()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	hits, err := src.Search(ctx, query, 10)
-	if err != nil {
-		return "skill search: " + err.Error()
-	}
-	if len(hits) == 0 {
-		return "(no skills found for: " + query + ")"
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d match(es) on github:\n", len(hits))
-	for _, h := range hits {
-		desc := h.Description
-		if desc == "" {
-			desc = "(no description)"
-		}
-		fmt.Fprintf(&b, "  %s — %s\n", h.Ref, desc)
-	}
-	b.WriteString("\ninstall any with: skill install <ref>")
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func sanitize(name string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '/' || r == '\\' || r == '.' || r == 0 {
-			return -1
-		}
-		return r
-	}, name)
+	return r.handleSkillSearchLocal(query)
 }
 
 // tokenTracker tracks token usage with two distinct concepts:

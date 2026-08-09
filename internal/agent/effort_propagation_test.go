@@ -59,7 +59,7 @@ func (s *captureStream) Recv() (llm.StreamEvent, error) {
 func TestLoopRun_PropagatesEffortToProviderRequest(t *testing.T) {
 	p := &captureProvider{}
 	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
-	loop.Effort = llm.EffortHigh
+	loop.SetEffort(llm.EffortHigh)
 	loop.AppendUser("ping")
 
 	out := make(chan Event, 16)
@@ -84,7 +84,7 @@ func TestLoopRun_PropagatesEffortToProviderRequest(t *testing.T) {
 func TestLoopRun_FastModeForcesLowEffortAndCapsMaxTokens(t *testing.T) {
 	p := &captureProvider{}
 	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
-	loop.Effort = llm.EffortHigh // user's persistent preference
+	loop.SetEffort(llm.EffortHigh) // user's persistent preference
 	loop.Fast = true
 	loop.AppendUser("ping")
 
@@ -109,8 +109,68 @@ func TestLoopRun_FastModeForcesLowEffortAndCapsMaxTokens(t *testing.T) {
 	}
 
 	// Persistent /effort preference must NOT have been mutated.
-	if loop.Effort != llm.EffortHigh {
-		t.Errorf("loop.Effort got mutated to %q; should remain high", loop.Effort)
+	if got := loop.EffortValue(); got != llm.EffortHigh {
+		t.Errorf("loop effort got mutated to %q; should remain high", got)
+	}
+}
+
+func TestLoopEffortConcurrentRequestSnapshots(t *testing.T) {
+	p := &captureProvider{}
+	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
+	levels := []llm.Effort{
+		llm.EffortDefault,
+		llm.EffortLow,
+		llm.EffortMedium,
+		llm.EffortHigh,
+	}
+	valid := func(e llm.Effort) bool {
+		for _, candidate := range levels {
+			if e == candidate {
+				return true
+			}
+		}
+		return false
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan llm.Effort, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			loop.SetEffort(levels[i%len(levels)])
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			// buildRequest is the same locked snapshot path used by Run. The
+			// accessor is exercised too because TUI rendering can happen at
+			// the same time as the provider loop assembles the next request.
+			if got := loop.buildRequest(nil).Effort; !valid(got) {
+				select {
+				case errCh <- got:
+				default:
+				}
+				return
+			}
+			if got := loop.EffortValue(); !valid(got) {
+				select {
+				case errCh <- got:
+				default:
+				}
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+	close(errCh)
+	if got, ok := <-errCh; ok {
+		t.Fatalf("concurrent effort snapshot returned invalid value %q", got)
 	}
 }
 

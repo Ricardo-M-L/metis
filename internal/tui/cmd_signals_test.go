@@ -74,6 +74,9 @@ func TestRenderCurrentSession_WithLoopShowsTurns(t *testing.T) {
 	id := "session-current"
 	_ = store.WriteHeader(id, "m", "")
 	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
+	loop.ContextWindow = 100_000
+	loop.Fast = true
+	loop.SetEffort("high")
 	loop.AppendUser("u1")
 	loop.AppendUser("u2")
 	// v2: lipgloss styles each label/value separately, so a literal
@@ -89,6 +92,11 @@ func TestRenderCurrentSession_WithLoopShowsTurns(t *testing.T) {
 	}
 	if !strings.Contains(got, "auto") {
 		t.Errorf("mode missing: %s", got)
+	}
+	for _, field := range []string{"transcript:", "working dir:", "effort:", "high", "fast mode:", "true", "context:", "100,000", "loop iterations:"} {
+		if !strings.Contains(got, field) {
+			t.Errorf("richer status missing %q: %s", field, got)
+		}
 	}
 }
 

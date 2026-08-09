@@ -14,6 +14,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
@@ -50,6 +51,9 @@ type ToolRegistryOptions struct {
 	CronService     *agent.CronService
 	PluginSources   []skills.PluginSkillSource
 	MemoryManager   *memory.MemoryManager
+	// Sandbox is the per-runtime OS command boundary shared by Bash, Git,
+	// Workflow, trusted Skill inline shell and UI/custom-command launchers.
+	Sandbox *sandbox.Manager
 
 	// Jobs is the process-wide background-bash pool shared with
 	// agent.Loop. When non-nil:
@@ -90,7 +94,7 @@ type ToolRegistryOptions struct {
 // Future tool families (memory tools, observability tools) plug in here.
 func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	reg := tools.NewRegistry()
-	builtin.Register(reg, opts.Cfg, opts.Gate)
+	builtin.RegisterWithSandbox(reg, opts.Cfg, opts.Gate, opts.Sandbox)
 	// Wire jobs.Registry into Bash + register the three job-pool
 	// tools. Done as a post-step so builtin.Register can stay
 	// dependency-free (jobs is a leaf package the runtime owns).
@@ -235,7 +239,7 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	if sessionDir != "" {
 		wfStore = workflow.NewStore(filepath.Join(sessionDir, "..", "workflows"))
 	}
-	reg.Register(builtin.NewWorkflow(opts.Gate, wfStore))
+	reg.Register(builtin.NewWorkflowWithSandbox(opts.Gate, wfStore, opts.Sandbox))
 	// MetisInfo tool: LLM-facing introspection. Reads the same
 	// references this function already has, so it sees changes that
 	// happen later (e.g. /reload toggling an MCP server's Disabled
@@ -298,7 +302,9 @@ func RegisterSkillTool(reg *tools.Registry, opts ToolRegistryOptions) *skills.Lo
 	// Replace, not Register — the second phase (after LoadPlugins) needs
 	// to overwrite the first phase's plugin-less Skill tool without
 	// panicking on duplicate registration.
-	reg.Replace(builtin.NewSkill(opts.Gate, loader, opts.Cfg.Session.SkillDir).WithSessionIDFn(CurrentSessionID))
+	reg.Replace(builtin.NewSkill(opts.Gate, loader, opts.Cfg.Session.SkillDir).
+		WithSessionIDFn(CurrentSessionID).
+		WithSandbox(opts.Sandbox))
 	return loader
 }
 

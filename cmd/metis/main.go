@@ -34,6 +34,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
@@ -365,6 +366,9 @@ type runtime struct {
 	// the /agents slash command can render the live state instead
 	// of the placeholder hint (G.17, 2026-05-12).
 	subAgentRoster *agent.Roster
+	// sandbox is shared by every model-controlled command launcher in this
+	// runtime. It owns a private temp directory and is closed after jobs stop.
+	sandbox *sandbox.Manager
 }
 
 // WaitForMCP blocks until the background MCP launcher finishes spawning
@@ -476,6 +480,10 @@ func (r *runtime) Cleanup() {
 	if r.plugins != nil {
 		_ = r.plugins.Close()
 		r.plugins = nil
+	}
+	if r.sandbox != nil {
+		_ = r.sandbox.Close()
+		r.sandbox = nil
 	}
 	// Clear the crash-recovery pointer on clean shutdown — its
 	// continued presence would re-prompt "found a recent session" on
@@ -881,6 +889,24 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Permission gate (allow/deny rules from config.toml).
 	gate := rtpkg.BuildPermissionGate(cfg, mode)
 
+	networkPolicy := sandbox.NetworkAllow
+	if strings.EqualFold(cfg.Tools.Bash.Sandbox.Network, "block") && !cfg.Tools.Bash.Sandbox.DangerouslyAllowNetwork {
+		networkPolicy = sandbox.NetworkBlock
+	}
+	sandboxMgr, err := sandbox.NewManagerWithOptions(sandbox.Options{
+		Mode:    cfg.Tools.Bash.Sandbox.Mode,
+		Network: networkPolicy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sandbox configuration: %w", err)
+	}
+	sandboxOwned := true
+	defer func() {
+		if sandboxOwned {
+			_ = sandboxMgr.Close()
+		}
+	}()
+
 	// Tool registry: built-ins + Agent + SendMessage in one go. Channel
 	// adapter assembly happens inside BuildToolRegistry's caller; we pass
 	// it the configured registry so SendMessage can advertise the right
@@ -1096,6 +1122,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		DefaultPlatform: cfg.Channels.DefaultPlatform,
 		CronService:     cronSvc,
 		MemoryManager:   memoryMgr,
+		Sandbox:         sandboxMgr,
 		Jobs:            jobsPool,
 		Monitors:        monitorReg,
 		ConfigSnapshot:  snap,
@@ -1215,6 +1242,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			Cfg:           cfg,
 			Gate:          gate,
 			PluginSources: pluginReg.SkillSources(),
+			Sandbox:       sandboxMgr,
 		})
 	}
 
@@ -1266,7 +1294,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// intent. --fast is a separate boolean handled by Loop.buildRequest.
 	if flags.effort != "" {
 		if e, ok := llm.ParseEffort(flags.effort); ok {
-			loop.Effort = e
+			loop.SetEffort(e)
 		} else {
 			fmt.Fprintf(os.Stderr, "metis: --effort %q ignored (must be low|medium|high)\n", flags.effort)
 		}
@@ -1342,6 +1370,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		allowedDirs:           allowedDirs,
 		autoMemExtractor:      pendingExtractor,
 		subAgentRoster:        subAgentRoster,
+		sandbox:               sandboxMgr,
 	}
 
 	// Phase 2 MCP launch — kicked off only after `rt` is fully built so
@@ -1480,6 +1509,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	tui.SetVoiceMaxRecord(cfg.UI.VoiceMaxRecord())
 	tui.SetStatusLineRefresh(cfg.UI.StatusLineRefresh())
 
+	sandboxOwned = false
 	return rt, nil
 }
 
@@ -1621,6 +1651,28 @@ func cmdChat(ctx context.Context, args []string) error {
 			FreshPermissionMode: rt.defaultPermissionMode,
 			SessionSwitch:       rt.rebindSession,
 			SessionBoundary:     rt.releaseSessionWork,
+			Sandbox:             rt.sandbox,
+			ReloadCatalog: func() (string, error) {
+				skillCount := 0
+				if rt.registry != nil {
+					if tool, ok := rt.registry.Get("Skill"); ok {
+						if catalog, ok := tool.(interface{ CatalogLoader() *skills.Loader }); ok {
+							loader := catalog.CatalogLoader()
+							if loader != nil {
+								loader.Invalidate()
+								loaded, loadErr := loader.List()
+								if loadErr != nil {
+									return "", fmt.Errorf("skills: %w", loadErr)
+								}
+								skillCount = len(loaded)
+							}
+						}
+					}
+				}
+				sl.RemoveCustom()
+				custom := slash.LoadCustomCommandsWithSandbox(sl, config.Home(), rt.sandbox)
+				return fmt.Sprintf("%d skills · %d custom commands", skillCount, len(custom)), nil
+			},
 		}
 		return tui.RunTUI(ctx, rt.loop, rt.cronSvc, sl, rt.store, rt.sessionID, rt.gate, rt.model, rt.providerName, rt.cfg.Session.SkillDir, rt.cfg, true, hooks) // true = force new session banner
 	}
@@ -1630,6 +1682,10 @@ func cmdChat(ctx context.Context, args []string) error {
 		return err
 	}
 	repl.ConfigureProviderSwitch(rt.cfg, rt.providerName)
+	repl.ConfigureSandbox(rt.sandbox)
+	repl.DirAdd = rt.allowedDirs.Add
+	repl.DirRemove = rt.allowedDirs.Remove
+	repl.DirList = rt.allowedDirs.All
 	repl.SessionSwitch = rt.rebindSession
 	repl.SessionBoundary = rt.releaseSessionWork
 	repl.FreshPermissionMode = rt.defaultPermissionMode
@@ -3648,13 +3704,20 @@ func buildSlash(rt *runtime) *slash.Registry {
 			return runTeammateMessage(rt.subAgentRoster, arg), slash.SignalNone
 		},
 	})
+	// Custom commands share the TUI namespace with the legacy REPL registry
+	// even though they live in a separate dispatcher. Reserve those names and
+	// aliases before scanning commands/*.md so a file such as fast.md or
+	// sandbox.md cannot load successfully only to remain forever unreachable.
+	for _, cmd := range tui.BuildREPLCommands().All() {
+		r.Reserve(append([]string{cmd.Name}, cmd.Aliases...)...)
+	}
 	// User-authored commands from ~/.metis/commands/*.md and
 	// <cwd>/.metis/commands/*.md. Loaded LAST so a user .md can't
 	// shadow a built-in (LoadCustomCommands refuses to register on
 	// name collision). Errors are silent — a missing dir is the
 	// common case. The returned name list is logged for
 	// observability (`metis doctor` surfaces it).
-	_ = slash.LoadCustomCommands(r, config.Home())
+	_ = slash.LoadCustomCommandsWithSandbox(r, config.Home(), rt.sandbox)
 
 	// MCP prompts (Phase D #40). Each launched server is asked for its
 	// prompts/list; capable servers contribute `mcp__<server>__<prompt>`

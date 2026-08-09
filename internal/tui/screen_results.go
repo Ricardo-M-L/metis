@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -51,7 +52,7 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		default:
 			return nil
 		}
-		m.loop.Effort = e
+		m.loop.SetEffort(e)
 		effortState = applied
 		m.messages = append(m.messages, Message{
 			Role:      "success",
@@ -60,37 +61,45 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		})
 
 	case *screen.ModelScreen:
-		applied := w.Applied()
-		if applied == "" {
+		imageRecovery := m.imageRecoveryPending
+		recoveryImageCount := m.imageRecoveryImageCount
+		m.imageRecoveryPending = false
+		m.imageRecoveryImageCount = 0
+		choice, selected := w.AppliedChoice()
+		if !selected || choice.ID == "" {
+			content := "(model dialog dismissed)"
+			if imageRecovery {
+				content = "(vision model selection cancelled — prompt and attachments kept)"
+			}
 			m.messages = append(m.messages, Message{
 				Role:      "info",
-				Content:   "(model dialog dismissed)",
+				Content:   content,
 				Timestamp: time.Now(),
 			})
 			return nil
 		}
-		// Look up the picker entry to get the provider profile name;
-		// without it switchModel would just bump the model field on the
-		// current provider, which is wrong for cross-vendor jumps
-		// (deepseek → MiniMax requires a different transport + base URL).
-		newProvName := ""
-		for _, c := range builtinModelChoices {
-			if c.ID == applied {
-				newProvName = c.Provider
-				break
-			}
-		}
-		switchErr := m.switchModel(applied, newProvName)
+		// ModelScreen returns the provider profile together with the ID. This
+		// is essential for dynamic [provider.custom.*] entries: carrying only
+		// the model string would accidentally send it through the old backend.
+		switchErr := m.switchModel(choice.ID, choice.Provider)
 		if switchErr != nil {
+			content := "model switch failed; previous model remains active: " + switchErr.Error()
+			if imageRecovery {
+				content += " · prompt and attachments kept"
+			}
 			m.messages = append(m.messages, Message{
 				Role:      "warning",
-				Content:   "model switch failed; previous model remains active: " + switchErr.Error(),
+				Content:   content,
 				Timestamp: time.Now(),
 			})
 		} else {
+			content := "model: " + m.model + "  ·  provider: " + m.providerName
+			if imageRecovery {
+				content += fmt.Sprintf(" · prompt and %d image(s) kept — press Enter to send", recoveryImageCount)
+			}
 			m.messages = append(m.messages, Message{
 				Role:      "success",
-				Content:   "model: " + m.model + "  ·  provider: " + m.providerName,
+				Content:   content,
 				Timestamp: time.Now(),
 			})
 		}

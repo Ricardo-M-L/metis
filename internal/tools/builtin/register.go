@@ -6,12 +6,20 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
 
 func Register(r *tools.Registry, cfg *config.Config, gate *permission.Gate) {
-	RegisterWithDirs(r, cfg, gate, cfg.Session.SkillDir, cfg.Session.Dir)
+	RegisterWithSandbox(r, cfg, gate, nil)
+}
+
+// RegisterWithSandbox wires every process-launching builtin to the same
+// per-runtime Manager. Register remains available for informational/test
+// registries that intentionally have no runtime sandbox.
+func RegisterWithSandbox(r *tools.Registry, cfg *config.Config, gate *permission.Gate, manager *sandbox.Manager) {
+	RegisterWithDirsAndSandbox(r, cfg, gate, cfg.Session.SkillDir, cfg.Session.Dir, manager)
 }
 
 // sessionReadState is a package-level pointer so the same store is
@@ -28,6 +36,10 @@ var sessionReadState *ReadFileState
 func SessionReadState() *ReadFileState { return sessionReadState }
 
 func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Gate, skillDir, memoryDir string) {
+	RegisterWithDirsAndSandbox(r, cfg, gate, skillDir, memoryDir, nil)
+}
+
+func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *permission.Gate, skillDir, memoryDir string, manager *sandbox.Manager) {
 	disabled := make(map[string]bool, len(cfg.Tools.Disabled))
 	for _, n := range cfg.Tools.Disabled {
 		disabled[n] = true
@@ -51,18 +63,24 @@ func RegisterWithDirs(r *tools.Registry, cfg *config.Config, gate *permission.Ga
 	//     appear in the next turn's system prompt — bug audit 2026-04-30).
 	// `metis tools` and the chat REPL both go through BuildToolRegistry
 	// after this Register call, so both tools always show up in the end.
+	bashTool := bash.New(gate, cfg.Tools.Bash)
+	gitTool := NewGit(gate)
+	if manager != nil {
+		bashTool = bash.NewWithSandbox(gate, cfg.Tools.Bash, manager)
+		gitTool = NewGitWithSandbox(gate, manager)
+	}
 	all := []tools.Tool{
 		Read{gate: gate, state: sessionReadState},
 		Write{gate: gate, state: sessionReadState},
 		Edit{gate: gate, state: sessionReadState},
-		bash.New(gate, cfg.Tools.Bash),
+		bashTool,
 		LS{gate: gate},
 		Glob{gate: gate},
 		Grep{gate: gate},
 		WebFetch{gate: gate},
 		WebBrowse{gate: gate},
 		ViewImage{gate: gate},
-		Git{gate: gate},
+		gitTool,
 		WebSearch{gate: gate},
 		Todo{gate: gate},
 		TodoRead{gate: gate},

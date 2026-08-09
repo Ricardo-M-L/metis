@@ -85,6 +85,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// interrupt" — both imply ESC is the one true cancel key when a
 	// turn is in flight. Honour that BEFORE any overlay logic.
 	if m.turnCancel != nil && msg.String() == "esc" {
+		m.turnCancelledByUser = true
 		m.turnCancel()
 		m.turnCancel = nil
 		// Stop the spinner immediately for instant "cancel registered"
@@ -95,8 +96,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Close any open overlays so the user lands at a clean prompt
 		// after the cancel — otherwise they'd see "interrupted" stacked
 		// under a still-open palette / search / @-mention dropdown.
-		m.showPalette = false
-		m.palFilter = ""
+		m.dismissPalette()
 		m.showSearch = false
 		m.atActive = false
 		queueCleared := len(m.queuedPrompts)
@@ -113,6 +113,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		})
 		m.lastEsc = time.Time{}
 		return m, nil
+	}
+
+	// Bare /effort is an inline picker, not a full-window screen. While it is
+	// open it owns the keyboard so navigation keys cannot leak into the input
+	// editor or slash palette. The transcript remains mounted and visible.
+	if m.effortPicker != nil {
+		return m.handleEffortPickerKey(msg)
 	}
 
 	if m.permActive {
@@ -270,6 +277,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.lastCtrlC = time.Now()
 		if m.turnCancel != nil {
+			m.turnCancelledByUser = true
 			m.turnCancel()
 			m.turnCancel = nil
 			m.spinnerActive = false // instant feedback; turnActive clears on finalize

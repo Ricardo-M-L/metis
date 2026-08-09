@@ -34,6 +34,9 @@ func TestLoadCustomCommands_BasicMarkdown(t *testing.T) {
 	if !strings.HasPrefix(c.Description, "[user] ") {
 		t.Errorf("description must be prefixed with [user]; got %q", c.Description)
 	}
+	if !c.Trusted {
+		t.Fatal("user-level custom command must be marked trusted")
+	}
 	prompt, sig := c.Handler("")
 	if sig != SignalCustomPrompt {
 		t.Errorf("handler must return SignalCustomPrompt; got %d", sig)
@@ -113,6 +116,36 @@ func TestLoadCustomCommands_RefusesShadowingBuiltins(t *testing.T) {
 	c, _ := r.Get("help")
 	if !strings.Contains(c.Description, "REAL") {
 		t.Errorf("built-in /help was overwritten by user .md; description now %q", c.Description)
+	}
+}
+
+func TestLoadCustomCommands_RefusesNamesReservedByTUI(t *testing.T) {
+	dir := t.TempDir()
+	cmdDir := filepath.Join(dir, "commands")
+	_ = os.MkdirAll(cmdDir, 0o755)
+	_ = os.WriteFile(filepath.Join(cmdDir, "fast.md"), []byte("shadow fast"), 0o644)
+
+	r := NewRegistry()
+	r.Reserve("fast")
+	if loaded := LoadCustomCommands(r, dir); len(loaded) != 0 {
+		t.Fatalf("reserved TUI command loaded as custom: %v", loaded)
+	}
+	if _, ok := r.Get("fast"); ok {
+		t.Fatal("reserved name should not create a callable slash entry")
+	}
+}
+
+func TestRemoveCustomReflectsDeletionWithoutDroppingBuiltins(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Cmd{Name: "help", Handler: func(string) (string, Signal) { return "help", SignalNone }})
+	r.Register(Cmd{Name: "check", Custom: true, Handler: func(string) (string, Signal) { return "old", SignalCustomPrompt }})
+
+	r.RemoveCustom()
+	if _, ok := r.Get("check"); ok {
+		t.Fatal("RemoveCustom retained stale custom command")
+	}
+	if _, ok := r.Get("help"); !ok {
+		t.Fatal("RemoveCustom dropped built-in command")
 	}
 }
 
@@ -234,5 +267,38 @@ func TestLoadCustomCommands_FrontMatterOverrides(t *testing.T) {
 	}
 	if len(c.AllowedTools) != 2 {
 		t.Errorf("AllowedTools = %v", c.AllowedTools)
+	}
+}
+
+func TestLoadCustomCommands_ProjectCommandIsNotTrustedForOverrides(t *testing.T) {
+	project := t.TempDir()
+	commandDir := filepath.Join(project, ".metis", "commands")
+	if err := os.MkdirAll(commandDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := "---\nallowed-tools: Bash(git status:*), Write\nmodel: other-model\n---\nInspect the project.\n"
+	if err := os.WriteFile(filepath.Join(commandDir, "inspect.md"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(project); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldCwd) }()
+
+	r := NewRegistry()
+	LoadCustomCommands(r, t.TempDir())
+	cmd, ok := r.Get("inspect")
+	if !ok {
+		t.Fatal("project command not loaded")
+	}
+	if cmd.Trusted {
+		t.Fatal("project-level command must not be trusted for permission/model overrides")
+	}
+	if len(cmd.AllowedTools) != 2 || cmd.Model != "other-model" {
+		t.Fatalf("metadata should remain available for an explicit ignored-warning: %+v", cmd)
 	}
 }

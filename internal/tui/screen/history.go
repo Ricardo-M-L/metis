@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
 )
@@ -229,7 +230,7 @@ func renderHistory(messages []llm.Message, width int) string {
 func renderUserMessage(b *strings.Builder, m llm.Message, width int) {
 	hasText := false
 	for _, c := range m.Content {
-		if c.Type == "text" && c.Text != "" {
+		if c.Type == "text" && transcript.VisibleUserText(c.Text) != "" {
 			hasText = true
 			break
 		}
@@ -238,8 +239,12 @@ func renderUserMessage(b *strings.Builder, m llm.Message, width int) {
 		b.WriteString(histRoleUser.Render("▸ user"))
 		b.WriteString("\n")
 		for _, c := range m.Content {
-			if c.Type == "text" && c.Text != "" {
-				b.WriteString(indent(histText.Render(wrap(c.Text, width-4)), "  "))
+			if c.Type == "text" {
+				visible := transcript.VisibleUserText(c.Text)
+				if visible == "" {
+					continue
+				}
+				b.WriteString(indent(histText.Render(wrap(visible, width-4)), "  "))
 				b.WriteString("\n")
 			}
 		}

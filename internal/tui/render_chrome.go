@@ -469,8 +469,9 @@ func renderStatusBar(m *Model) string {
 	// surfaces per-turn duration when it matters.
 	var leftParts []string
 	if m.loop != nil {
-		if g := effortGlyph(m.loop.Effort); g != "" {
-			leftParts = append(leftParts, g+" "+string(m.loop.Effort))
+		effort := m.loop.EffortValue()
+		if g := effortGlyph(effort); g != "" {
+			leftParts = append(leftParts, g+" "+string(effort))
 		}
 		if m.loop.Fast {
 			leftParts = append(leftParts, "↯ fast")

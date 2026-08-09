@@ -47,12 +47,11 @@ func TestPalette_EnterAutopromotesIncompleteSlash(t *testing.T) {
 			t.Fatalf("autopromote regression: got unknown error: %q", msg.Content)
 		}
 	}
-	// Phase C1: /effort (bare) opens the slider widget (EffortScreen)
-	// instead of inlining a "Reasoning Effort" box. Look in either
-	// place — widget view or message log — for evidence the right
-	// command ran.
+	// Bare /effort opens the inline slider rather than a full-window screen.
 	var output string
-	if m.activeScreen != nil {
+	if m.effortPicker != nil {
+		output = m.effortPicker.InlineView()
+	} else if m.activeScreen != nil {
 		output = m.activeScreen.View()
 	} else {
 		var b strings.Builder
@@ -61,7 +60,7 @@ func TestPalette_EnterAutopromotesIncompleteSlash(t *testing.T) {
 		}
 		output = b.String()
 	}
-	if !strings.Contains(output, "Speed") && !strings.Contains(output, "Intelligence") &&
+	if !strings.Contains(output, "Faster") && !strings.Contains(output, "Smarter") &&
 		!strings.Contains(strings.ToLower(output), "effort") &&
 		!strings.Contains(output, "Reasoning") {
 		t.Errorf("expected /effort widget or output in message log; got: %+v", messageContents(m))
@@ -94,6 +93,23 @@ func TestPalette_EnterPreservesArgs(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected 'high' in /effort output (args preserved); got: %+v", messageContents(m))
+	}
+}
+
+// A short prefix such as /s matches many real commands (save, sessions,
+// share, skills, stats, status, ...). Enter must not pick whichever command
+// happens to be first in registration order. The user can still choose a row
+// with Tab/arrow, which writes an exact command into the input before Enter.
+func TestPalette_EnterDoesNotPromoteAmbiguousPrefix(t *testing.T) {
+	m := newSlashTestModel(t)
+	for _, r := range "/s" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	if len(m.palMatched) < 2 {
+		t.Fatalf("fixture needs an ambiguous /s prefix, matches=%+v", m.palMatched)
+	}
+	if got := m.promotePaletteSelection("/s"); got != "/s" {
+		t.Fatalf("ambiguous /s promoted to %q; want original input", got)
 	}
 }
 

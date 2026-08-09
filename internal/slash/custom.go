@@ -35,10 +35,12 @@
 //	@path                    → inject the contents of an existing file
 //
 // `description`/`argument-hint` shape the `/help` line. `allowed-tools`
-// and `model` are parsed and exposed on the Cmd (AllowedTools / Model)
-// for callers that apply per-turn overrides; they are stripped from the
-// body either way. Without front matter, the description defaults to the
-// first non-blank body line truncated to 80 chars.
+// and `model` are parsed and exposed on the Cmd (AllowedTools / Model): a
+// trusted user command may install one-turn tool pre-approvals, while `model`
+// is only validated against the active model (a mismatch requires an explicit
+// `/model` first). They are stripped from the body either way. Without front
+// matter, the description defaults to the first non-blank body line truncated
+// to 80 chars.
 package slash
 
 import (
@@ -49,6 +51,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
 // LoadCustomCommands scans the conventional locations and registers each
@@ -60,23 +64,31 @@ import (
 // Returns the list of registered command names so callers can log /
 // surface the inventory.
 func LoadCustomCommands(r *Registry, homeDir string) []string {
+	return LoadCustomCommandsWithSandbox(r, homeDir, nil)
+}
+
+// LoadCustomCommandsWithSandbox is the runtime form of LoadCustomCommands.
+// Trusted user commands may contain !`cmd` substitutions, so they must share
+// the same OS sandbox as Bash/Workflow/Git instead of becoming an escape hatch.
+func LoadCustomCommandsWithSandbox(r *Registry, homeDir string, manager *sandbox.Manager) []string {
 	var loaded []string
+	cwd, _ := os.Getwd()
 	// Per-user FIRST, then project-local SECOND so project entries
 	// override on name collision. The Registry's Register appends to
 	// cmds AND overwrites index[name], so the project-local handler
 	// wins on /name dispatch.
 	if homeDir != "" {
-		loaded = append(loaded, scanDir(r, filepath.Join(homeDir, "commands"), "user")...)
+		loaded = append(loaded, scanDir(r, filepath.Join(homeDir, "commands"), "user", cwd, manager)...)
 	}
-	if cwd, err := os.Getwd(); err == nil {
-		loaded = append(loaded, scanDir(r, filepath.Join(cwd, ".metis", "commands"), "project")...)
+	if cwd != "" {
+		loaded = append(loaded, scanDir(r, filepath.Join(cwd, ".metis", "commands"), "project", cwd, manager)...)
 	}
 	return loaded
 }
 
 // scanDir reads <dir>/*.md and registers each. `source` is annotated
 // onto the description so `/help` users can tell user vs project.
-func scanDir(r *Registry, dir, source string) []string {
+func scanDir(r *Registry, dir, source, executionCwd string, manager *sandbox.Manager) []string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil // dir missing is the common case — silent
@@ -100,8 +112,16 @@ func scanDir(r *Registry, dir, source string) []string {
 		// the index map — re-Register() with same name silently shadows
 		// the built-in, which is footgun-shaped. We refuse the load
 		// instead.
-		if _, exists := r.Get(base); exists {
+		if r.IsReserved(base) {
 			continue
+		}
+		if existing, exists := r.Get(base); exists {
+			// Project-local custom commands intentionally override the same
+			// user-level custom command. Built-ins and runtime commands remain
+			// protected from shadowing.
+			if source != "project" || !existing.Custom {
+				continue
+			}
 		}
 		body, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
@@ -133,9 +153,10 @@ func scanDir(r *Registry, dir, source string) []string {
 			Description:  desc,
 			AllowedTools: meta.allowedTools,
 			Model:        meta.model,
+			Trusted:      trusted,
 			Custom:       true,
 			Handler: func(args string) (string, Signal) {
-				return renderTemplate(tmpl, args, trusted), SignalCustomPrompt
+				return renderTemplateWithSandbox(tmpl, args, trusted, executionCwd, manager), SignalCustomPrompt
 			},
 		})
 		names = append(names, base)
@@ -247,6 +268,10 @@ var fileInjectRe = regexp.MustCompile(`@([A-Za-z0-9_./\-]+)`)
 // command from an untrusted repo can't run shell or read arbitrary files
 // just by being invoked.
 func renderTemplate(template, args string, trusted bool) string {
+	return renderTemplateWithSandbox(template, args, trusted, "", nil)
+}
+
+func renderTemplateWithSandbox(template, args string, trusted bool, cwd string, manager *sandbox.Manager) string {
 	out := strings.ReplaceAll(template, "$ARGUMENTS", args)
 	parts := strings.Fields(args)
 	for i, p := range parts {
@@ -257,7 +282,7 @@ func renderTemplate(template, args string, trusted bool) string {
 		out = strings.ReplaceAll(out, "$"+itoa(i), "")
 	}
 	if trusted {
-		out = expandBashInjections(out)
+		out = expandBashInjectionsWithSandbox(out, cwd, manager)
 		out = expandFileInjections(out)
 	}
 	return strings.TrimSpace(out)
@@ -268,6 +293,10 @@ func renderTemplate(template, args string, trusted bool) string {
 // with a short "[!cmd failed: …]" note so the model sees what happened
 // instead of a dangling backtick.
 func expandBashInjections(s string) string {
+	return expandBashInjectionsWithSandbox(s, "", nil)
+}
+
+func expandBashInjectionsWithSandbox(s, cwd string, manager *sandbox.Manager) string {
 	return bashInjectRe.ReplaceAllStringFunc(s, func(m string) string {
 		sub := bashInjectRe.FindStringSubmatch(m)
 		if len(sub) < 2 {
@@ -277,6 +306,17 @@ func expandBashInjections(s string) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		c := exec.CommandContext(ctx, "sh", "-c", cmd) //nolint:gosec — author-owned command file, same trust as the prompt body
+		if cwd != "" {
+			c.Dir = cwd
+		}
+		if manager != nil {
+			c.Env = manager.FilterEnv(os.Environ(), false)
+			wrapped, wrapErr := manager.Wrap(c, sandbox.Request{Cwd: cwd})
+			if wrapErr != nil {
+				return "[!`" + cmd + "` sandbox failed: " + wrapErr.Error() + "]"
+			}
+			c = wrapped
+		}
 		outBytes, err := c.CombinedOutput()
 		res := strings.TrimRight(string(outBytes), "\n")
 		if err != nil {

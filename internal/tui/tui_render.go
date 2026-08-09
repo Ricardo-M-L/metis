@@ -212,7 +212,7 @@ func (m *Model) View() tea.View {
 	// Mirrors claude-code: native terminal cursor at the textarea
 	// position rather than a fake inverse-block character.
 	attachCursor := func(v tea.View, inputStartRow int) tea.View {
-		if m.activeScreen != nil || m.copyMode || m.permActive || m.askUserActive || m.showHistory {
+		if m.activeScreen != nil || m.effortPicker != nil || m.copyMode || m.permActive || m.askUserActive || m.showHistory {
 			return v
 		}
 		cur := m.input.Cursor()
@@ -264,19 +264,23 @@ func (m *Model) View() tea.View {
 		s.WriteString(m.renderWelcomeBanner())
 		inputStartRow := strings.Count(s.String(), "\n")
 		s.WriteString(renderInputLine(m))
-		// hints (mode indicator) goes IMMEDIATELY below the input box —
-		// claude-code parity: the user's eye is already on the input,
-		// the mode reminder belongs adjacent to it. Status bar (with
-		// tokens / version on the right) is a separate, lower band.
-		s.WriteString(renderHints(m))
-		if m.showPalette {
-			s.WriteString(renderPalette(m))
-		}
-		if m.showHistory {
-			s.WriteString(renderHistorySearch(m))
-		}
-		if m.atActive && len(m.atMatched) > 0 {
-			s.WriteString(renderAtMention(m))
+		if m.effortPicker != nil {
+			s.WriteString(m.effortPicker.InlineView())
+		} else {
+			// hints (mode indicator) goes IMMEDIATELY below the input box —
+			// claude-code parity: the user's eye is already on the input,
+			// the mode reminder belongs adjacent to it. Status bar (with
+			// tokens / version on the right) is a separate, lower band.
+			s.WriteString(renderHints(m))
+			if m.showPalette {
+				s.WriteString(renderPalette(m))
+			}
+			if m.showHistory {
+				s.WriteString(renderHistorySearch(m))
+			}
+			if m.atActive && len(m.atMatched) > 0 {
+				s.WriteString(renderAtMention(m))
+			}
 		}
 		s.WriteString(renderStatusBar(m))
 		s.WriteString("\033[0m")
@@ -365,6 +369,7 @@ func (m *Model) View() tea.View {
 	// height understates input rows when the user is mid-typing a
 	// multi-line prompt.
 	var lower strings.Builder
+	stripOffsetInLower := -1
 	// Queue indication: previously a sticky pill above the input box,
 	// but that anchored to the bottom and didn't follow the chat list
 	// when the user scrolled. Now the enqueue notice goes through
@@ -373,37 +378,40 @@ func (m *Model) View() tea.View {
 	// chip sits in the status bar so the count is always visible
 	// without blocking the message stream.
 	lower.WriteString(renderInputLine(m))
-	lower.WriteString(renderHints(m))
-	// Queued-prompts preview (claude-code PromptInputQueuedCommands
-	// parity, 2026-05-20). Visible only when the user has typed
-	// mid-turn; rendered as faint one-line rows below renderHints so
-	// the user sees their input was captured. Without this band the
-	// only feedback was the status-bar `◷ N queued` chip, which
-	// users (image #1 feedback 2026-05-20) consistently missed —
-	// they thought Enter had silently dropped their message.
-	lower.WriteString(renderQueuedPreview(m))
-	if m.showPalette {
-		lower.WriteString(renderPalette(m))
-	}
-	if m.showSearch {
-		lower.WriteString(renderTranscriptSearch(m))
-	}
-	// 2026-05-24: stripOffsetInLower records newlines in `lower` BEFORE
-	// the strip is appended. The actual Y in the final View is computed
-	// post-chatList-sizing (see "strip Y calculation" block after Phase 2)
-	// because chatList.Height() isn't known until then.
-	stripOffsetInLower := -1
-	if m.showTaskPanel {
-		lower.WriteString(renderTaskPanel(m))
-		m.stripStartY = -1
-		m.stripPlainLines = nil
+	if m.effortPicker != nil {
+		lower.WriteString(m.effortPicker.InlineView())
 	} else {
-		// Sticky live todo strip — always-on compact view of the
-		// model's current focus + lookahead, when the Ctrl+T overlay
-		// isn't already showing the full list. Empty when the session
-		// has no todos. Image #1 user request 2026-05-17.
-		stripOffsetInLower = strings.Count(lower.String(), "\n")
-		lower.WriteString(renderStickyTaskStrip(m))
+		lower.WriteString(renderHints(m))
+		// Queued-prompts preview (claude-code PromptInputQueuedCommands
+		// parity, 2026-05-20). Visible only when the user has typed
+		// mid-turn; rendered as faint one-line rows below renderHints so
+		// the user sees their input was captured. Without this band the
+		// only feedback was the status-bar `◷ N queued` chip, which
+		// users (image #1 feedback 2026-05-20) consistently missed —
+		// they thought Enter had silently dropped their message.
+		lower.WriteString(renderQueuedPreview(m))
+		if m.showPalette {
+			lower.WriteString(renderPalette(m))
+		}
+		if m.showSearch {
+			lower.WriteString(renderTranscriptSearch(m))
+		}
+		// 2026-05-24: stripOffsetInLower records newlines in `lower` BEFORE
+		// the strip is appended. The actual Y in the final View is computed
+		// post-chatList-sizing (see "strip Y calculation" block after Phase 2)
+		// because chatList.Height() isn't known until then.
+		if m.showTaskPanel {
+			lower.WriteString(renderTaskPanel(m))
+			m.stripStartY = -1
+			m.stripPlainLines = nil
+		} else {
+			// Sticky live todo strip — always-on compact view of the
+			// model's current focus + lookahead, when the Ctrl+T overlay
+			// isn't already showing the full list. Empty when the session
+			// has no todos. Image #1 user request 2026-05-17.
+			stripOffsetInLower = strings.Count(lower.String(), "\n")
+			lower.WriteString(renderStickyTaskStrip(m))
+		}
 	}
 	lower.WriteString(renderStatusBar(m))
 	for _, ov := range m.overlays.View(m.width, m.height) {

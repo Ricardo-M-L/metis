@@ -2,10 +2,13 @@ package builtin
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/workflow"
 )
@@ -100,5 +103,79 @@ func TestWorkflowTool_NamedUnavailableWithoutStore(t *testing.T) {
 	res, _ := w.Execute(context.Background(), map[string]any{"operation": "run_named", "name": "x"})
 	if !res.IsError || !strings.Contains(res.Output, "not available") {
 		t.Errorf("run_named without a store should report unavailable; got %s", res.Output)
+	}
+}
+
+func TestWorkflowTool_SandboxManagerInjectionAndWrapFailure(t *testing.T) {
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := NewWorkflowWithSandbox(permission.New(permission.ModeBypass), nil, manager)
+	if w.SandboxManager() != manager {
+		t.Fatal("NewWorkflowWithSandbox did not retain Manager")
+	}
+	if NewWorkflow(permission.New(permission.ModeBypass), nil).WithSandbox(manager).SandboxManager() != manager {
+		t.Fatal("Workflow.WithSandbox did not retain Manager")
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := w.Execute(context.Background(), map[string]any{
+		"operation": "run",
+		"steps":     inlineSteps([2]string{"blocked", "echo should-not-run"}),
+	})
+	if err != nil {
+		t.Fatalf("Execute returned Go error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(res.Output, "sandbox wrap failed") || !strings.Contains(res.Output, sandbox.ErrManagerClosed.Error()) {
+		t.Fatalf("got %+v, want explicit sandbox Wrap failure", res)
+	}
+}
+
+func TestWorkflowTool_SandboxAutoAllowOnlyReplacesAsk(t *testing.T) {
+	manager, err := sandbox.NewManager(string(sandbox.ModeAutoAllow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	in := map[string]any{
+		"operation": "run",
+		"steps":     inlineSteps([2]string{"write", "touch workflow-auto-allow"}),
+	}
+
+	ask := NewWorkflowWithSandbox(permission.New(permission.ModeDefault), nil, manager)
+	if got, _ := ask.CanUse(context.Background(), in); got != tools.PermissionAllow {
+		t.Fatalf("ordinary Ask + auto-allow = %v, want allow", got)
+	}
+	plan := NewWorkflowWithSandbox(permission.New(permission.ModePlan), nil, manager)
+	if got, _ := plan.CanUse(context.Background(), in); got != tools.PermissionDeny {
+		t.Fatalf("Plan + auto-allow = %v, want deny", got)
+	}
+	deniedGate := permission.New(permission.ModeDefault)
+	deniedGate.AppendRules(permission.Rule{Tool: "Bash", Verb: permission.DecisionDeny, Source: "test"})
+	denied := NewWorkflowWithSandbox(deniedGate, nil, manager)
+	if got, _ := denied.CanUse(context.Background(), in); got != tools.PermissionDeny {
+		t.Fatalf("explicit deny + auto-allow = %v, want deny", got)
+	}
+}
+
+func TestWorkflowTool_UsesAgentContextCwd(t *testing.T) {
+	cwd := t.TempDir()
+	w := NewWorkflow(permission.New(permission.ModeBypass), nil)
+	res, err := w.Execute(agent.WithCwd(context.Background(), cwd), map[string]any{
+		"operation": "run",
+		"steps":     inlineSteps([2]string{"cwd", "pwd"}),
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("workflow cwd probe failed: err=%v result=%+v", err, res)
+	}
+	resolved, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Output, resolved) && !strings.Contains(res.Output, cwd) {
+		t.Fatalf("workflow ignored context cwd %q: %s", cwd, res.Output)
 	}
 }
