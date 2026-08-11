@@ -869,6 +869,19 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// MessageTeammate) can read the correct sender identity via
 	// AgentNameFromContext instead of falling back to "main".
 	baseCtx = agent.WithAgentName(baseCtx, teammateName)
+	// Background sub-agents must outlive the parent turn. The TUI tears
+	// down each turn's context (cancel) and closes the turn's event
+	// channel the moment loop.Run returns; without detaching here, a
+	// background goroutine inheriting the turn ctx is instantly killed
+	// ("killed: context canceled") the first time its parent turn ends -
+	// even while the agent is still mid-tool-call. context.WithoutCancel
+	// keeps all context values (depth, cwd, budget, event-out key used by
+	// forwardSubAgentEvent) but severs the turn's cancellation chain so
+	// the sub-agent is session-scoped, killed only by its own timeout /
+	// SubAgentStop (teammate.Cancel) / Roster.CancelAll on exit.
+	if runInBackground {
+		baseCtx = context.WithoutCancel(baseCtx)
+	}
 	// Pick ONE cancel context. The old form created WithCancel(baseCtx) then
 	// reassigned both vars from WithTimeout(childCtx, timeout) when timeout>0,
 	// orphaning the first cancel (lostcancel: a leaked cancelCtx registered on
@@ -1241,11 +1254,22 @@ func forwardSubAgentEvent(parentOut chan<- agent.Event, parentToolUseID string, 
 		// crucial when N sub-agents run in parallel and each
 		// generates its own "sub: Read" / "sub: Bash" stream.
 		forwarded.SubAgentParentID = parentToolUseID
-		select {
-		case parentOut <- forwarded:
-		default:
-			// parent buffer full — drop silently rather than block
-		}
+		// Guard against "send on closed channel". The parent's event
+		// channel is closed by the TUI the instant the parent turn's
+		// loop.Run returns; a background sub-agent can outlive that
+		// turn and still be forwarding tool events. select+default does
+		// NOT protect against a send on a closed channel (it only
+		// protects against a full buffer), so we recover here. A closed
+		// parent channel means the parent TUI is gone anyway, so
+		// dropping the event is correct.
+		func() {
+			defer func() { _ = recover() }()
+			select {
+			case parentOut <- forwarded:
+			default:
+				// parent buffer full - drop silently rather than block
+			}
+		}()
 	}
 }
 

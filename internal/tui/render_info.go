@@ -69,6 +69,14 @@ func renderInfoBox(title string, rows []infoRow) string {
 		}
 	}
 	titleLine := styleAccent.Bold(true).Render(title)
+	// Empty body guard: when every row is a blank spacer, body.String()
+	// is nothing but bare newlines. Rendering a bordered box with an
+	// empty body produces a large empty cyan rectangle in the transcript
+	// - the "big empty blue box" bug (2026-08-10 user report). Skip the
+	// box entirely when there is no visible content.
+	if strings.TrimSpace(body.String()) == "" && title == "" {
+		return ""
+	}
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#8be9fd")).
