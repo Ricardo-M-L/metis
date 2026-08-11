@@ -1,59 +1,85 @@
 # internal/runtime
 
-The wiring layer between `cmd/metis` (entry point) and the agent /
-tools / TUI packages. Handles: provider construction from config,
-tool slice assembly, MCP client/server lifecycle, plan-mode setup,
-plugin loading, prompt assembly, history persistence, scheduler /
-daemon scaffolding. If a `metis <subcommand>` needs to build out the
-agent and its dependencies, the wiring lives here.
+The composition layer between `cmd/metis` and the agent, provider, tool,
+plugin, MCP, persistence, and prompt packages. It builds runnable object
+graphs from configuration and current process state. Policy implementations
+generally live in their owning packages; the code here decides which pieces a
+particular command or session receives.
 
-## File-naming convention (browse by family)
+## Browse by concern
 
-| Family | Files | What it owns | Entry file |
-|---|---|---|---|
-| `mcp*` | 3 | MCP client setup + env-var expansion in MCP server configs | `mcp.go`, `mcp_env.go` |
-| `plan*` | 2 | Plan-mode entry + flag handling | `plan_mode.go` |
-| `agent*` | 2 | Agent profile loader + per-profile wiring | `agent_profile.go` |
-| `provider*` | 2 | LLM provider construction from `[providers.*]` toml | `provider.go` |
-| singletons | ~30 | Each a single wiring concern: `tools.go`, `tasks.go`, `system_prompt.go`, `sections.go`, `permission.go`, `skills.go`, `schedule.go`, `streamlined.go`, `snapshot.go`, `run.go`, `resume.go`, `history.go`, `early_init.go`, `dirs.go`, `daemon.go`, `coordinator.go`, `preconnect.go`, `plugin.go`, `learning.go`, `subdir.go` |
+| Concern | Main files |
+|---|---|
+| Provider construction and hints | `provider.go`, `provider_hints.go`, `auth_gate.go` |
+| Loop and tool graph assembly | `agent_loop.go`, `tools.go`, `runtime_rebind.go`, `channels.go` |
+| System prompt composition | `assembler.go`, `sections.go`, `system_prompt.go`, `skills_probe.go`, `git_context.go`, `subdir_hints.go` |
+| Agent profiles | `agent_profile.go`, `builtin_profiles.go`, `builtin_profiles/` |
+| MCP lifecycle and prompt/resource support | `mcp/` |
+| Plugins | `plugin.go`, `bundled_plugins.go` |
+| Live plan state | `plan_overlay.go`, `plan_archive.go` |
+| Sessions and machine-readable output | `resume.go`, `snapshot.go`, `run_cache.go`, `history_jsonl.go`, `output_schema.go` |
+| Coordinator, daemon, and scheduling | `coordinator.go`, `coordinator_mode.go`, `daemon.go`, `cron.go`, `schedule_installer.go` |
+| Permissions and startup context | `permission.go`, `config_hooks.go`, `early_input.go`, `dirs.go`, `ide.go`, `preconnect.go` |
 
-## Sub-packages
+## Sub-packages and embedded data
 
 | Path | Purpose |
 |---|---|
-| `prompts/` | The system-prompt template assembly (base sections + addenda) |
-| `prompts/base/` | The 8-file ordered base prompt (`01_identity.md` through `08_interaction_modes.md`) |
-| `builtin_profiles/` | Built-in subagent profiles (`verify.md`, `plan.md`, `general.md` ...) used by `Agent({subagent_type: ...})` |
+| `prompts/` | Prompt source and the legacy aggregate base template |
+| `prompts/base/` | Numbered base-prompt sections, including the optional computer-use section |
+| `builtin_profiles/` | Bundled sub-agent profiles such as coordinator, explore, plan, teammate, and verify |
+| `mcp/` | MCP configuration expansion, client/server lifecycle, prompt discovery, and cache support |
 
-## Where do I find...
+## Provider construction
 
-- **System prompt assembly** → `system_prompt.go` + `sections.go`; the
-  base text lives under `prompts/base/`
-- **Provider construction** (from `~/.metis/config.toml`) → `provider.go`
-- **Tool slice the runtime exports to the loop** → `tools.go`
-- **MCP wiring** (clients, env-var expansion, server lifecycle) →
-  `mcp.go`, `mcp_env.go`
-- **Plan-mode setup** → `plan_mode.go`
-- **Subagent profile definitions** → `builtin_profiles/<name>.md`
-- **Daemon / coordinator wiring** (for background mode) → `daemon.go`,
-  `coordinator.go`
-- **Plugin loading** → `plugin.go`
-- **History entries** (`AppendHistory` used by `metis run` / TUI) →
-  `history.go`
+Provider configuration is rooted at singular TOML sections such as
+`[provider]`, `[provider.anthropic]`, and `[provider.custom.<id>]`.
+`provider.go` has two construction paths:
 
-## Design invariants
+- Built-in provider families are constructed directly because they need
+  provider-specific configuration and authentication plumbing.
+- Entries under `[provider.custom.<id>]` resolve their selected transport and
+  are built through `internal/llm/transport`'s constructor registry.
 
-- `runtime` depends on nothing in `internal/agent` for types other
-  than `agent.Loop` itself — the dependency arrow is `runtime → agent`,
-  never the reverse.
-- Provider construction reads `~/.metis/config.toml` AND honors env
-  overrides (e.g., `METIS_MAX_SUBAGENTS`). Any new env var goes here
-  + documented in the config schema.
-- The base prompt files in `prompts/base/` are ordered: earlier files
-  carry more weight in the model's attention. Don't reorder without
-  benchmarking.
-- Subagent profiles in `builtin_profiles/*.md` use YAML frontmatter
-  (`name`, `description`, `tools`, `permission_mode`, `effort`,
-  `max_turns`) + Markdown body. The `verify` profile's mandatory
-  `VERDICT: PASS/FAIL/PARTIAL` trailing line is the contract gate's
-  hook — see `internal/agent/contract.go::extractVerdict`.
+Do not describe the transport registry as the universal provider factory; it
+is the custom-profile extension path. Provider capability normalization and
+user-facing hints live beside construction in `provider.go` and
+`provider_hints.go`.
+
+Environment overrides are owned by the concern that consumes them, not all by
+`provider.go`. For example, provider credentials belong to provider/config
+resolution, prompt toggles belong to prompt assembly, and sub-agent roster
+caps are resolved by `cmd/metis`. Document a new public environment variable
+centrally, but keep its implementation with its actual owner.
+
+## Prompt and plan assembly
+
+`assembler.go` executes the ordered getters from `sections.go`; source text is
+split across the numbered files in `prompts/base/`. Callers may interleave
+project context, provider hints, permission-aware sections, and volatile
+overlays before rendering. The numbering is semantic ordering, so reorder or
+recache sections only with prompt/cache behavior in mind.
+
+Plan mode is live state, not a startup-only prompt flag. `plan_overlay.go`
+adds a volatile per-request section while the permission mode is plan;
+`EnterPlanMode`/`ExitPlanMode` tools and the permission gate enforce the
+transition and read-only boundary. `plan_archive.go` handles persisted plan
+artifacts. The permission gate remains authoritative if prompt text and live
+mode ever disagree.
+
+## Agent profiles and dependency direction
+
+Agent profiles are Markdown with frontmatter parsed by `agent_profile.go`.
+The schema includes model/tool filters, `permission_mode`, `effort`,
+`max_turns`, initial prompt, skills, memory snapshot, and related options; the
+Markdown body becomes the profile system prompt. Project profiles override
+user profiles, which override bundled profiles.
+
+The package intentionally imports multiple `internal/agent` types, including
+`Loop`, events, hooks, monitors, cron services/jobs, tool calls, and the
+sub-agent roster. The dependency direction is still `runtime → agent` (never
+`agent → runtime`), but `Loop` is not the only shared type.
+
+The bundled `verify` profile requires a trailing
+`VERDICT: PASS|FAIL|PARTIAL`; `internal/agent/contract.go` parses the last such
+marker for the large-run verification gate.

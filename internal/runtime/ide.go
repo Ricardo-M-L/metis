@@ -19,15 +19,14 @@ package runtime
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/processutil"
 )
 
 // IDELock is the on-disk description an IDE extension writes so metis can
@@ -150,17 +149,5 @@ func readIDELock(path string) (*IDELock, error) {
 // Only ESRCH ("no such process") counts as dead. Getting this wrong
 // would make liveIDELocks sweep a perfectly valid lockfile.
 func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Unix FindProcess always succeeds; Signal(0) is the real check.
-	err = proc.Signal(syscall.Signal(0))
-	if err == nil || errors.Is(err, syscall.EPERM) {
-		return true
-	}
-	return false
+	return processutil.Alive(pid)
 }

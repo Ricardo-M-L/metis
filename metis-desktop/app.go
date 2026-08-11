@@ -401,7 +401,7 @@ func (a *App) SendMessage(input, threadID, approvalMode string) MessageResponse 
 	} else {
 		args = append(args, "--resume", threadID)
 	}
-	args = append(args, "--mode", mode, "--no-stream")
+	args = append(args, "--mode", mode)
 	args = append(args, "--", input)
 
 	base := a.ctx

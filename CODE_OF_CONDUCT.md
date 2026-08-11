@@ -12,8 +12,10 @@ commit messages, and any communication tied to this repository.
 
 ## Reporting
 
-Report concerns to the maintainer at
-`Ricardo-M-L@users.noreply.github.com`.
+Report concerns privately through GitHub's
+[private reporting form](https://github.com/Ricardo-M-L/metis/security/advisories/new).
+State clearly that the report concerns the Code of Conduct rather than a
+software vulnerability.
 
 Reports are handled privately. We follow the enforcement guidelines from the
 Contributor Covenant 2.1.

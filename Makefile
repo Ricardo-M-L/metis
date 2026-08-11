@@ -97,11 +97,20 @@ release-patch: bump-patch install
 release-minor: bump-minor install
 release-major: bump-major install
 
-# cross-compile for distribution (local only — never published)
+# Cross-compile the GitHub Release assets. Unix targets use tar.gz; Windows
+# targets use zip so the archive works with built-in PowerShell tooling.
 dist: clean
 	mkdir -p dist
-	GOOS=darwin  GOARCH=arm64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-darwin-arm64  ./cmd/metis
-	GOOS=darwin  GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-darwin-amd64  ./cmd/metis
-	GOOS=linux   GOARCH=arm64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-linux-arm64   ./cmd/metis
-	GOOS=linux   GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-linux-amd64   ./cmd/metis
-	cd dist && for f in $(BIN_NAME)-*; do tar czf $$f.tar.gz $$f && shasum -a 256 $$f.tar.gz > $$f.tar.gz.sha256; done
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-darwin-arm64  ./cmd/metis
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-darwin-amd64  ./cmd/metis
+	CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-linux-arm64   ./cmd/metis
+	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-linux-amd64   ./cmd/metis
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-windows-arm64.exe ./cmd/metis
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-windows-amd64.exe ./cmd/metis
+	cd dist && for f in $(BIN_NAME)-darwin-* $(BIN_NAME)-linux-*; do \
+		tar czf $$f.tar.gz $$f && shasum -a 256 $$f.tar.gz > $$f.tar.gz.sha256; \
+	done
+	cd dist && for f in $(BIN_NAME)-windows-*.exe; do \
+		archive=$${f%.exe}.zip; cp $$f metis.exe; zip -q $$archive metis.exe; rm metis.exe; \
+		shasum -a 256 $$archive > $$archive.sha256; \
+	done

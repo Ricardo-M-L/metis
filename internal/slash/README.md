@@ -1,44 +1,112 @@
-# internal/slash
+# `internal/slash`
 
-Slash-command system. The TUI (and headless REPL via `metis chat`)
-routes any input starting with `/` through here: parse the name,
-look up the handler in the registry, run it, and return a `Signal`
-that tells the caller what to do next (insert text, send to model,
-clear, quit, etc.).
+This package owns the signal-based slash-command registry and the loader for
+Markdown prompt commands. It is not the only command dispatcher: interactive
+Metis currently has two registries, and routing order matters.
 
-## File-naming convention
+## Runtime routing
 
-| File | What it owns |
+1. `internal/tui.REPLCommandRegistry`, built in
+   `internal/tui/commands.go`, is consulted first. Its handlers receive the
+   live `*REPL`, may change live state, and return display text directly.
+2. `internal/slash.Registry`, populated by `slash.RegisterAll` plus runtime
+   registrations, is the fallback. Its handlers return `(display, Signal)`;
+   the TUI or plain REPL interprets the signal.
+
+The Bubble Tea TUI intentionally prefers the slash implementation for the
+duplicate names `memory` and `doctor`; other duplicates remain REPL-owned.
+The plain REPL uses strict REPL-first, slash-second routing. The merged command
+catalog in `internal/tui/command_catalog.go` applies the same ownership rules
+for `/help`, completion, and the command palette.
+
+Do not maintain a copied list of every command here. The live `/help` / command
+palette is the user-visible inventory, and the registries plus their routing
+tests are the implementation authority.
+
+## Package map
+
+| File | Responsibility |
 |---|---|
-| `commands.go` | The core types: `Cmd`, `Handler`, `Signal`, and the registry that resolves a name to a handler. Built-in slash commands register here. |
-| `custom.go` | User-authored slash commands loaded from `~/.metis/slash/*.md` (a Markdown body becomes a prompt template; YAML frontmatter sets the name + description + args). |
-| `midturn.go` | Mid-turn signal classification — when the user types while the model is still streaming, classify whether to interrupt / queue / steer. |
-| `batch_prompt.go` | The multi-stage prompt template for `/batch <task>` — fans out N sub-tasks via the Agent tool. |
-| `cron_handler.go` | `/cron` subcommands: list / add / pause / resume / rm / run / start. |
-| `loop_handler.go` | `/loop` subcommands. Tags every spawned job with a `loop:` prefix so `/loop list` and `/loop stop` can find them again. |
-| `memory_cmd.go` | `/memory` subcommands: list / read / write / clear, gated on the memory subsystem being enabled. |
+| `commands.go` | `Cmd`, `Handler`, `Signal`, `Registry`, aliases/reservations, built-in signal commands, and `/reload`. |
+| `custom.go` | User and project Markdown commands, frontmatter parsing, template expansion, trust boundaries, and custom-command reload support. |
+| `debug.go`, `review.go` | Specialized prompt-producing commands kept out of the main registration body. |
+| `batch_prompt.go` | Prompt construction for `/batch`. |
+| `cron_handler.go`, `loop_handler.go`, `memory_cmd.go` | Feature-specific command implementations. |
+| `midturn.go` | Classification of slash input received while a model turn is active. |
 
-7 prod + 7 test files. Each handler file is its own concern; the
-registry in `commands.go` is the meeting point.
+The other half of the system lives in `internal/tui/commands.go` (direct REPL
+commands), `internal/tui/keybind_submit.go` and `internal/tui/repl.go`
+(dispatch), and `internal/tui/command_catalog.go` (merged discovery). Runtime
+wiring, reservations, custom loading, and MCP prompt registration happen in
+`cmd/metis/main.go`.
 
-## Where do I find...
+## Custom Markdown commands
 
-- **Adding a built-in slash command** → register in `commands.go`'s
-  table (or a feature-specific handler file like `cron_handler.go`).
-- **A user adding their own `/foo`** → drop a Markdown file in
-  `~/.metis/slash/`; `custom.go` loads at REPL startup.
-- **What happens when user types `/x` mid-stream** → `midturn.go`
-  classifies as interrupt / queue / steer.
-- **The Signal enum** (return value of every handler) → `commands.go`.
+Commands are loaded from these directories, in order:
 
-## Design invariants
+- `$METIS_HOME/commands/*.md` (normally `~/.metis/commands/*.md`): user-level,
+  trusted commands.
+- `<cwd>/.metis/commands/*.md`: project-level, untrusted commands; a project
+  file may replace a same-named user custom command.
 
-- Handlers are **pure functions** of `(args string) → (display, Signal)`.
-  Side effects on the REPL state happen via the returned `Signal`,
-  not by reaching into the caller's struct.
-- The registry is **resolved at REPL startup** — adding/removing
-  commands at runtime isn't supported (custom slash files are
-  re-read only on REPL restart, mirroring claude-code's pattern).
-- Built-in slash commands take precedence over custom ones with the
-  same name (no override). Custom names that collide log a warning
-  during load.
+The filename without `.md` is the command name. Optional flat frontmatter
+recognizes `description`, `argument-hint`, `allowed-tools`, and `model`. The
+body is a prompt template: `$ARGUMENTS` and `$1` through `$9` are expanded for
+both trust levels.
+
+Trust changes behavior:
+
+- A trusted user command may execute `` !`shell command` `` and inject the
+  command's output. Each substitution has a five-second limit and uses the
+  runtime sandbox when one is wired.
+- A trusted user command may replace `@path` with a readable file's contents.
+- Trusted `allowed-tools` metadata can install one-turn permission rules.
+  Trusted `model` metadata must be `inherit` or exactly match the active model;
+  it does not switch models automatically.
+- Project commands leave shell and file substitutions literal. Their
+  `allowed-tools` and non-`inherit` `model` metadata are ignored with a
+  warning, while normal permission checks remain active.
+
+Invoking a trusted custom command can therefore perform shell and file I/O;
+slash handlers are not generally pure functions. The model-facing
+`SlashCommand` tool accepts custom commands only and refuses built-ins, whose
+signals require a UI caller.
+
+## Name conflicts
+
+- Built-in slash names and aliases are protected from custom commands.
+- `cmd/metis` also reserves every REPL command name and alias before scanning
+  `commands/*.md`, so a custom command cannot load successfully while being
+  unreachable behind the first dispatcher.
+- Conflicting custom files are skipped silently; no warning is logged.
+- Project custom commands are the one deliberate exception: because they load
+  after user custom commands, a project command with the same name wins.
+- Runtime sources such as MCP prompts add names dynamically. Use distinct,
+  preferably namespaced custom names instead of depending on a collision with
+  a runtime registration.
+
+## Reloading
+
+`/reload` returns `SignalReload`. The TUI and plain REPL then invalidate the
+disk-backed skill catalog, call `Registry.RemoveCustom()`, and rescan both
+custom-command directories. Built-ins and other non-custom runtime commands
+remain registered, while edited and deleted Markdown files take effect without
+restarting Metis. `/reload` is not a general configuration or MCP-server
+restart.
+
+## Adding or changing a command
+
+- For a direct UI/REPL operation that needs live state, register a
+  `REPLCommand` in `internal/tui/commands.go`.
+- For signal-based behavior, register a `Cmd` in `RegisterAll` or a focused
+  file in this package, then implement the signal in both the Bubble Tea and
+  plain-REPL dispatch paths where it is supported.
+- For a user-authored prompt recipe, add a Markdown file under one of the
+  `commands/` directories rather than changing Go code.
+- For behavior while a model response is in progress, update `midturn.go` and
+  the relevant queue/steering tests.
+
+When a name exists in both registries, make the intended owner explicit and
+cover it in `internal/tui/command_catalog_test.go` and the slash end-to-end
+tests. Do not assume that adding a signal handler makes it reachable if a REPL
+command already owns the name.

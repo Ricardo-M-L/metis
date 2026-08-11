@@ -124,6 +124,7 @@ func TestDumpTransport_RedactsAuthHeader(t *testing.T) {
 	req, _ := http.NewRequestWithContext(context.Background(), "POST", "https://api.x/v1", bytes.NewReader([]byte("{}")))
 	req.Header.Set("Authorization", "Bearer sk-secret-DO-NOT-LEAK")
 	req.Header.Set("X-API-Key", "another-secret")
+	req.Header.Set("X-Goog-Api-Key", "gemini-secret-DO-NOT-LEAK")
 	if _, err := rt.RoundTrip(req); err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +139,9 @@ func TestDumpTransport_RedactsAuthHeader(t *testing.T) {
 		}
 		if strings.Contains(string(raw), "another-secret") {
 			t.Errorf("X-API-Key not redacted; headers=%s", raw)
+		}
+		if strings.Contains(string(raw), "gemini-secret-DO-NOT-LEAK") {
+			t.Errorf("X-Goog-Api-Key not redacted; headers=%s", raw)
 		}
 		if !strings.Contains(string(raw), "REDACTED") {
 			t.Errorf("expected [REDACTED] marker; headers=%s", raw)

@@ -7,6 +7,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.18] - 2026-08-11
+
+### Added
+
+- **Windows CLI releases**: GitHub Releases now include checksummed
+  `windows-amd64` and `windows-arm64` ZIPs. `install/install.ps1` resolves
+  public releases anonymously, validates the SHA-256 sidecar and archive
+  shape, stages the executable, and preserves the previous install on a
+  failed replacement.
+- **Windows CI**: native Windows vet/build/test, installer regression tests,
+  CLI smoke checks, and an arm64 cross-build now gate changes. Tag releases
+  also run anonymous Linux and Windows installation smokes.
+
+### Changed
+
+- **cross-platform runtime**: Unix-only process-group, signal, PID liveness,
+  and terminal-drain behavior is isolated behind platform-specific files so
+  the CLI builds cleanly for both Windows architectures.
+- **documentation refresh**: public, contributor, security, architecture,
+  CLI/env/slash, desktop/editor, and internal package documentation now tracks
+  the current runtime and avoids unstable hand-maintained inventory counts.
+- **Windows update boundary**: `metis update --check` remains available on
+  Windows, while installation directs users to the PowerShell installer
+  instead of attempting an unsafe in-process replacement of a running EXE.
+
+### Fixed
+
+- **public installation and self-update**: `install/install.sh`, startup update
+  checks, and `metis update` now work anonymously against the public GitHub
+  release. `METIS_GITHUB_TOKEN` remains optional for higher API rate limits.
+- **config initialization**: `metis config init` now writes to the canonical
+  `METIS_HOME`/`~/.metis` path and uses the current safe Bash output default.
+- **prompt-dump redaction**: Gemini's `x-goog-api-key` header is now redacted
+  before an explicitly enabled request dump is written to disk.
+
+## [0.4.17] - 2026-08-11
+
 ### Fixed
 
 - **sub-agent stability**: background sub-agents no longer crash when the

@@ -1,107 +1,150 @@
 # Environment variables
 
-metis honors the following environment variables. Most have a sensible
-default; set them only when you need to override behavior. All names
-start with `METIS_` to avoid collisions; the exceptions (`EDITOR`,
-`SHELL`, `HOME`, etc) are standard POSIX variables metis reads to
-respect existing user preferences.
+Metis reads the variables below at process startup or at the point where the
+related feature is used. Unless noted otherwise, an unset or malformed value
+falls back to the configured or built-in default. This page documents the
+supported operational surface first; implementation and test escape hatches
+are kept in a separate section at the end.
 
-## Core paths
-
-| Variable | Default | Description |
-|---|---|---|
-| `METIS_HOME` | `~/.metis` | Override the root directory for sessions, memory, cache, config. Useful for sandbox / CI / per-project isolation. |
-
-## Debug & tracing
+## Paths and desktop launch
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_DEBUG` | off | Set to `1` to enable verbose trace logging to `~/.metis/debug.log` (or the path in `METIS_DEBUG_LOG`). |
-| `METIS_DEBUG_LOG` | `~/.metis/debug.log` | Override the debug log path. |
-| `METIS_DEBUG_GEMINI` | off | Set to `1` for Gemini-provider-specific verbose traces. |
-| `METIS_DEBUG_OPENAI` | off | Set to `1` for OpenAI-provider-specific verbose traces. |
-| `METIS_DUMP_PROMPTS` | off | Set to `1` (or use `DUMP_PROMPTS=1`) to dump every assembled system prompt to `~/.metis/dump-prompts/`. Inspect to verify section ordering / cache boundaries. |
-| `METIS_PASTE_DEBUG` | off | Set to `1` to log clipboard paste handler events (useful when @-mentions or pasted images misbehave). |
+| `METIS_HOME` | `~/.metis` | Root for config, sessions, memory, caches, skills, and user commands. Useful for CI or isolated profiles. |
+| `METIS_PORT` | `8080` | Port for `metis desktop --web`. An explicit `--port` / `-p` wins. Valid range: `1`-`65535`. |
+| `METIS_DESKTOP_APP` | auto-discovered | Override the native desktop application path used by `metis desktop`. |
+| `METIS_BIN` | auto-discovered | Override the Metis CLI executable used by the desktop client. |
 
-## Auto-memory & dream
+## Debugging and prompt inspection
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_AUTO_MEMORY` | off | Set to `1` to enable on-turn-end memory extraction (writes to `~/.metis/memory/<topic>.md`). Same as the `--auto-memory` CLI flag. |
-| `METIS_AUTO_MEMORY_DEBUG` | off | Set to `1` to log auto-memory extractor decisions / failures verbatim. Pair with `METIS_AUTO_MEMORY=1`. |
-| `METIS_AUTO_RETRIEVE` | off | Auto memory retrieval policy. `1` / `on` to enable; can also accept other tokens recognized by the retrieval policy parser. |
-| `METIS_AUTO_RETRIEVE_RERANK` | off | Set to `1` / `true` to enable rerank for retrieved memories. |
-| `METIS_DREAM_INTERVAL_HOURS` | (gate default) | Override the wall-clock interval between dream-extractor passes. Integer hours. |
-| `METIS_DREAM_MIN_SESSIONS` | (gate default) | Minimum sessions since the last dream before another can fire. Integer count. |
+| `METIS_DEBUG` | off | Set to `1` for verbose diagnostics. LLM transport traces are appended to `METIS_DEBUG_LOG`; some runtime diagnostics also go to stderr. |
+| `METIS_DEBUG_LOG` | `$METIS_HOME/debug.log` | Override the LLM transport debug-log path. |
+| `METIS_DEBUG_GEMINI` | off | Set to `1` for Gemini-provider-specific traces. Read at process startup. |
+| `METIS_DEBUG_OPENAI` | off | Set to `1` for OpenAI-provider-specific traces. Read at process startup. |
+| `METIS_DUMP_PROMPTS` | off | Set to a truthy value (normally `1`) to write assembled prompts under `$METIS_HOME/dump-prompts/`. `DUMP_PROMPTS` is also accepted. |
+| `METIS_PASTE_DEBUG` | off | Set to `1` to write clipboard-paste diagnostics to `$METIS_HOME/paste-debug.log`. |
 
-## TUI / display
-
-| Variable | Default | Description |
-|---|---|---|
-| `METIS_THEME` | (config / auto) | Force a specific theme (`dark`, `light`, etc). Overrides `[ui] theme` in config.toml. |
-| `METIS_LANG` | (locale) | Override the UI language for translated strings. |
-| `METIS_REDUCED_MOTION` | off | Set to `1` (or `NO_MOTION=1`) to disable progress animations. |
-| `METIS_TICK_MS` | (perf default) | TUI refresh tick interval in milliseconds. Lower for snappier UI; higher to reduce CPU. |
-| `METIS_MOUSE_WHEEL_LINES` | (perf default) | Lines scrolled per mouse-wheel tick. |
-| `METIS_EVENT_BUFFER` | (perf default) | Event channel buffer size. |
-
-## Models / providers
+## Memory and dream extraction
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_MODELS_URL` | (built-in catalog) | Custom URL for the model catalog JSON. Used by `metis models` to fetch the list of available models. |
-| `METIS_CATALOG_DISABLE` | off | Set to `1` to skip the remote catalog fetch entirely (use cached / built-in list only). |
-| `METIS_SIMPLE` | off | Set to `1` for a stripped-down system prompt (no advanced sections). Equivalent to `--simple`. |
-| `METIS_OPENAI_MAX_CONCURRENCY` | `4` | Maximum simultaneous OpenAI-compatible requests per provider instance, shared by the parent and sub-agents. Set `0` to disable the gate. |
+| `METIS_AUTO_MEMORY` | off | Set to `1` to run memory extraction at turn boundaries. Equivalent to `--auto-memory`. |
+| `METIS_AUTO_MEMORY_DEBUG` | off | Set to `1` to log extractor decisions and failures. Has practical value only with auto-memory enabled. |
+| `METIS_AUTO_RETRIEVE` | off | Positive integer top-K for archival memory retrieval on every turn. Values above `50` are clamped to `50`; non-positive or non-numeric values leave retrieval off. |
+| `METIS_AUTO_RETRIEVE_RERANK` | off | Set to `1` or `true` to rerank the retrieved candidates with the active model. Adds one model call per retrieval. |
+| `METIS_DREAM_INTERVAL_HOURS` | `12` | Minimum hours between dream passes. Fractional values are accepted; `0` or a negative value disables dreaming. |
+| `METIS_DREAM_MIN_SESSIONS` | `3` | Minimum distinct sessions touched since the previous dream. Values below `1` are clamped to `1`. |
 
-## Sessions / persistence
-
-| Variable | Default | Description |
-|---|---|---|
-| `METIS_RESUME_MAX_MB` | (default cap) | Maximum size (MB) of a session JSONL file metis will attempt to resume. Larger files are refused to avoid load-time OOM. |
-| `METIS_MICROCOMPACT` | on | Set to `0` to disable per-turn micro-compaction (the lightweight summarizer that runs between full compactions). |
-| `METIS_COMPACT_RESERVE_FULL_MAX_TOKENS` | off | Set to `1` to reserve the full `max_tokens` headroom even when shrinking would be safe. Useful for providers that hard-fail on header math. |
-
-## Sub-agent / loop budgets
+## TUI, locale, and notifications
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_LAZY_MCP` | off | Lazy-load MCP servers (`lazy` / `eager`). Lazy mode defers MCP startup until a tool is actually called. |
-| `METIS_RUN_CACHE` | off | Set to `1` to enable on-disk response cache for `metis run`. Same as the `--run-cache` flag. Tool-use turns are never cached. |
+| `METIS_THEME` | terminal auto-detection | Theme name: `dark`, `light`, or `dark-daltonized`. An unknown value is ignored. |
+| `METIS_LANG` | `$LANG`, then `en` | UI locale override. The shipped locales are `en` and `zh-CN`. |
+| `METIS_REDUCED_MOTION` | off | Set to `1` to reduce animations and use a `500ms` TUI tick. `NO_MOTION=1` is also accepted. |
+| `METIS_TICK_MS` | `40` | TUI tick interval in milliseconds, valid from `1` to `1000`. Reduced-motion mode takes precedence. |
+| `METIS_MOUSE_WHEEL_LINES` | `1` | Transcript lines scrolled per wheel event, valid from `1` to `50`. |
+| `METIS_EVENT_BUFFER` | `256` | TUI event-channel capacity, valid from `16` to `16384`. |
+| `METIS_NOTIFY_CHANNEL` | `auto` | Terminal notification protocol. Canonical values: `auto`, `iterm2`, `iterm2_with_bell`, `kitty`, `ghostty`, `bell`, or `off`. This is not a Slack or email route. |
 
-## Network / updates
-
-| Variable | Default | Description |
-|---|---|---|
-| `METIS_NO_UPDATE_CHECK` | off | Set to `1` to suppress the periodic "new version available" prompt. |
-| `METIS_REPO` | `Ricardo-M-L/metis` | Override the GitHub repo metis checks for updates. |
-| `METIS_GITHUB_TOKEN` | (none) | Personal access token for higher GitHub API rate limits during `metis update`. |
-
-## Notifications
+## Models and providers
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_NOTIFY_CHANNEL` | (none) | Default channel route for tool-driven notifications (`slack:#chan`, `email:user@x`, etc). |
+| `METIS_MODELS_URL` | `https://models.dev/api.json` | Model-catalog JSON endpoint used by catalog clients, including `metis models`. |
+| `METIS_SIMPLE` | off | Set to `1` for the short system prompt and short tool descriptions. Equivalent to `--simple`. |
+| `METIS_OPENAI_MAX_CONCURRENCY` | `4` | Per-provider cap for simultaneous OpenAI-compatible requests, shared by parent and sub-agents. `0` or a negative value disables the gate. |
+| `METIS_GEMINI_THINKING_BUDGET` | `0` | Gemini thinking-token budget: `0` disables thinking, `-1` lets the model decide, and a positive integer sets a cap. |
 
-## Safety / trust
+## Sessions and context management
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_NO_TRUST_PROMPT` | off | Set to `1` to skip the cwd trust prompt on first launch in a new directory (use cautiously — only on machines you fully control). |
-| `METIS_DISABLE_INJECTION_SCAN` | off | Set to `1` to disable the prompt-injection scanner. Don't disable unless you know exactly why. |
+| `METIS_RESUME_MAX_MB` | `8` | Maximum session JSONL size, in MiB, accepted for resume or branch. `0` or a negative value disables the size check. |
+| `METIS_MICROCOMPACT` | on | Set to `0` to disable lossless offloading of large historical tool results into the session microcompact cache. |
+| `METIS_SPILL` | on | Set to `0` to disable ingestion-time spill of oversized tool results. This switch is independent of `METIS_MICROCOMPACT`. |
+| `METIS_COMPACT_RESERVE_FULL_MAX_TOKENS` | off | Set to `1` to reserve the provider's full configured `max_tokens` during compaction instead of capping the reply reserve at 20K. |
 
-## Standard POSIX vars metis honors
+## Agent coordination
 
-`HOME` · `EDITOR` · `VISUAL` · `SHELL` · `TERM` · `TERM_PROGRAM` · `TERM_PROGRAM_VERSION` · `TMUX` · `XDG_CONFIG_HOME` · `LANG` · `LC_TERMINAL` · `NO_COLOR` · `CI` · `DEBUG` · `SSH_CONNECTION` · `KITTY_WINDOW_ID` · `ALACRITTY_LOG` · `WT_SESSION` · `STY` · `GOPATH` · `GOBIN`
+| Variable | Default | Description |
+|---|---|---|
+| `METIS_COORDINATOR_MODE` | off | Set to `1` or `true` to enable team-lead mode. Equivalent to `--coordinator`. |
+| `METIS_COORDINATOR_EXTRA_TOOLS` | empty | Comma-separated tool names added back to the coordinator-mode allowlist. |
+| `METIS_MAX_SUBAGENTS` | unset | Combined named + anonymous concurrency cap. It is split approximately `1:2`; per-kind variables below take precedence. `0` or a negative value means unlimited. |
+| `METIS_MAX_SUBAGENTS_NAMED` | `20` | Named-teammate concurrency cap. `0` or a negative value means unlimited. |
+| `METIS_MAX_SUBAGENTS_ANON` | `40` | Anonymous sub-agent concurrency cap. `0` or a negative value means unlimited. |
 
-## Provider credentials
+## MCP and tool discovery
 
-These are read by the LLM providers when their built-in auth flow runs:
+| Variable | Default | Description |
+|---|---|---|
+| `METIS_LAZY_MCP` | `auto` | MCP startup policy. Unset / `auto` uses a valid cache and starts a server on cache miss; `always` (also `true`, `1`, `yes`) requires lazy startup; `never` (also `false`, `0`, `no`, `off`) starts eagerly. Unknown values fall back to `auto`. |
+| `ENABLE_TOOL_SEARCH` | always defer MCP schemas | Controls deferred MCP tool-schema discovery. Unset / `true` always defers, `false` sends full schemas, `auto` uses a 10% context threshold, and `auto:N` uses an `N` percent threshold (`1`-`99`). |
+| `MCP_CONNECT_TIMEOUT` | `30s` | MCP startup, handshake, and initial-list timeout. Accepts Go duration syntax such as `45s` or `2m`. |
+| `MCP_REQUEST_TIMEOUT` | `60s` | Timeout for non-tool MCP RPCs. Accepts Go duration syntax. |
+| `MCP_TOOL_TIMEOUT` | `100000s` | Timeout for MCP `tools/call` (about 27.8 hours). Accepts Go duration syntax. |
 
-`ANTHROPIC_API_KEY` · `OPENAI_API_KEY` · `GOOGLE_API_KEY` · `GITHUB_TOKEN` · `AWS_REGION` · `AWS_ACCESS_KEY_ID` · `AWS_SECRET_ACCESS_KEY` · `AWS_SESSION_TOKEN`
+## Runtime limits, cache, and telemetry
 
-Prefer `[provider.*]` blocks in `~/.metis/config.toml` for production; env vars are the fastest path for one-off testing.
+| Variable | Default | Description |
+|---|---|---|
+| `METIS_RUN_CACHE` | off | Set exactly to `1` to enable the on-disk response cache for `metis run`. Equivalent to `--cache`; tool-use turns are not cached. |
+| `METIS_RUN_MAX_SECONDS` | `1800` | Whole-invocation wall-clock cap for `metis run` and Metis MCP tool calls. Only positive integers override the default. |
+| `METIS_TURN_MAX_SECONDS` | `2700` | Per-agent-turn wall-clock cap. It is checked between loop iterations; an in-flight operation is allowed to return first. |
+| `METIS_HTTP_TIMEOUT_SECS` | `1200` | Whole-request timeout for model HTTP clients. Only positive integers override the default. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables OTLP/HTTP JSON metrics export. A base endpoint gets `/v1/metrics` appended automatically. |
 
-## Internal — don't set unless you're debugging metis itself
+## Updates
 
-`ENABLE_TOOL_SEARCH` · `C` (test fixtures) · `METIS_NO_UPDATE_CHECK` (CI)
+| Variable | Default | Description |
+|---|---|---|
+| `METIS_NO_UPDATE_CHECK` | off | Set to `1` to suppress the throttled startup update check. It does not disable an explicit `metis update`. |
+| `METIS_REPO` | `Ricardo-M-L/metis` | Override the GitHub `owner/repo` used for release checks and updates. |
+| `METIS_GITHUB_TOKEN` | unset | Preferred GitHub token for update requests. Resolution then falls back to `GITHUB_TOKEN` and finally `gh auth token`; public releases work anonymously. |
+
+## Safety and managed policy
+
+| Variable | Default | Description |
+|---|---|---|
+| `METIS_POLICY_FILE` | `/etc/metis/policy.toml` | Override the machine-managed permission-policy file. Policy denies have higher authority than user or project config. |
+| `METIS_NO_TRUST_PROMPT` | off | Set to `1` to skip the first-use current-directory trust prompt. Use only in controlled CI or on directories you already trust. |
+| `METIS_DISABLE_INJECTION_SCAN` | off | Set to `1` to bypass the prompt-injection scanner. Use only when deliberately accepting that risk. |
+
+## Credentials
+
+Built-in providers and tools read these conventional variables:
+
+| Variable | Used by |
+|---|---|
+| `ANTHROPIC_API_KEY` | Anthropic |
+| `OPENAI_API_KEY` | OpenAI and OpenAI-compatible configuration when selected as its key environment variable |
+| `GEMINI_API_KEY` | Gemini (preferred) |
+| `GOOGLE_API_KEY` | Gemini fallback |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION` | Amazon Bedrock; the session token is optional and the region falls back to `us-east-1` |
+| `TAVILY_API_KEY`, `BRAVE_SEARCH_API_KEY`, `SERPER_API_KEY` | Web search, tried in that order |
+
+Custom provider blocks may name a different credential variable through their
+`api_key_env` (and, where applicable, `secret_key_env`) setting. Prefer the
+auth store or provider configuration for long-lived credentials; environment
+variables are convenient for CI and one-off runs.
+
+## Standard runtime variables
+
+Metis also respects standard shell, terminal, locale, and toolchain variables,
+including `HOME`, `PATH`, `EDITOR`, `VISUAL`, `SHELL`, `TERM`, `TERM_PROGRAM`,
+`TERM_PROGRAM_VERSION`, `TMUX`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `LANG`,
+`LC_TERMINAL`, `NO_COLOR`, `CI`, `SSH_CONNECTION`, `KITTY_WINDOW_ID`,
+`ALACRITTY_LOG`, `WT_SESSION`, `STY`, `GOPATH`, and `GOBIN`.
+
+## Internal debugging and test escape hatches
+
+These are implementation aids, not a stable user-facing configuration API:
+
+| Variable | Default | Description |
+|---|---|---|
+| `METIS_CATALOG_DISABLE` | off | Set to `1` to make the process-wide background catalog singleton unavailable. This does **not** disable the explicit fetch performed by `metis models`. |
+| `METIS_CONTRACT_DISABLE` | off | Set to `1` to disable the verification contract. Intended for focused tests and runtime debugging. |
+| `METIS_DEBUG_IMG_PRUNE` | off | Any non-empty value emits per-iteration image-pruning diagnostics. |

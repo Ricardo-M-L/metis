@@ -155,7 +155,7 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 	p := &Plugin{Manifest: m, RootDir: rootDir}
 
 	// Spawn MCP server if declared. Tools auto-register as
-	// `plugin__<name>__<tool>` via the existing mcptools machinery.
+	// `mcp__plugin:<name>__<tool>` via the existing mcptools machinery.
 	if m.MCPServer != nil {
 		// Apply env overrides. Each plugin's env doesn't leak into the
 		// parent process — applied only to the child via os/exec.

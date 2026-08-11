@@ -10,10 +10,25 @@
 
 ## How was it tested
 
-- [ ] `go test -count=1 -timeout 90s ./...` passes locally
-- [ ] `go vet ./...` is clean
+Root module (required):
+
 - [ ] `gofmt -l .` returns nothing
-- [ ] New behavior covered by a test, OR manually tested (describe below)
+- [ ] `go vet ./...` is clean
+- [ ] `go build ./...` succeeds
+- [ ] `go test -count=1 -timeout 90s ./...` passes locally
+
+Additional CI surfaces:
+
+- [ ] Patched Bubble Tea: `go vet ./...` and `go test -race -count=1 ./...`
+      from `vendor-patches/bubbletea-v2`
+- [ ] Patched Ultraviolet: `go vet ./...` and `go test -race -count=1 ./...`
+      from `vendor-patches/ultraviolet`
+- [ ] Desktop frontend: `npm ci`, `npm run check`, and `npm run build` from
+      `metis-desktop/frontend`
+- [ ] Desktop Go module: `go vet ./...`, `go test -race -count=1 ./...`, and
+      `go build -tags production ./...` from `metis-desktop`
+- [ ] GitHub Actions is green on Ubuntu, macOS, and Windows
+- [ ] New behavior is covered by a test, OR manually tested (describe below)
 
 <!-- If manually tested, paste the commands you ran and the output. -->
 

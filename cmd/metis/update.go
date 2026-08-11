@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	gort "runtime"
 	"strings"
 	"time"
 
@@ -15,8 +16,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
-// maybeAutoUpdate runs at TUI/REPL startup. It throttles to one network
-// call per 24h and, when a newer release exists, downloads and installs it
+// maybeAutoUpdate runs at TUI/REPL startup. It throttles release checks and,
+// when a newer release exists, downloads and installs it on supported Unix
 // silently in the background. Errors are swallowed; this should never block
 // the user.
 //
@@ -38,14 +39,20 @@ func maybeAutoUpdate() string {
 	}
 	update.MarkNotified(config.Home(), tag)
 
-	// Attempt silent auto-install. If it fails (no token, go-install managed,
+	// Attempt silent auto-install. If it fails (go-install managed,
 	// network error, etc.), fall back to the manual notice.
 	if notice := tryAutoInstall(tag); notice != "" {
 		return notice
 	}
 
-	notice := fmt.Sprintf("metis %s available (current: %s) — run `metis update` to install",
-		strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"))
+	var notice string
+	if gort.GOOS == "windows" {
+		notice = fmt.Sprintf("metis %s available (current: %s) — install with: %s",
+			strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"), windowsInstallCommand(tag))
+	} else {
+		notice = fmt.Sprintf("metis %s available (current: %s) — run `metis update` to install",
+			strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"))
+	}
 	fmt.Fprintf(os.Stderr, "\033[33m[update]\033[0m %s\n", notice)
 	return notice
 }
@@ -57,10 +64,13 @@ func maybeAutoUpdate() string {
 // metis processes. The lock is best-effort — failure to acquire just skips
 // this round.
 func tryAutoInstall(tag string) string {
-	token := update.Token()
-	if token == "" {
+	// Windows cannot atomically replace a running .exe and the Unix updater
+	// uses a symlink-based version farm. Keep the background check enabled,
+	// but leave installation to the signed/checksummed PowerShell installer.
+	if gort.GOOS == "windows" {
 		return ""
 	}
+	token := update.Token()
 
 	// Best-effort lock: create exclusively, 5-minute expiry.
 	lockPath := filepath.Join(config.Home(), ".update.lock")
@@ -108,8 +118,8 @@ func cmdUpdate(ctx context.Context, args []string) error {
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: metis update [--check] [--force]
 
-Self-update metis from the private GitHub release. Requires:
-  METIS_GITHUB_TOKEN (or GITHUB_TOKEN) — PAT with read access to the repo
+Self-update metis from the public GitHub release. No token is required.
+METIS_GITHUB_TOKEN (or GITHUB_TOKEN) is optional for higher API rate limits.
 
 Flags:
   --check    Only check whether a newer release exists
@@ -117,24 +127,13 @@ Flags:
 
 Other env:
   METIS_REPO              Override repo (default: Ricardo-M-L/metis)
-  METIS_NO_UPDATE_CHECK=1 Disable the daily startup check (does not affect this command)`)
+  METIS_NO_UPDATE_CHECK=1 Disable the throttled startup check (does not affect this command)`)
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	token := update.Token()
-	if token == "" {
-		return errors.New(`no GitHub token set.
-
-Set one of:
-  export METIS_GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
-  export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
-
-The token only needs read access to the metis repo (fine-grained PAT,
-"Contents: Read-only" scope is enough).`)
-	}
-
 	cur := strings.TrimPrefix(version.Version, "v")
 
 	rel, err := update.Latest(ctx, token)
@@ -148,7 +147,11 @@ The token only needs read access to the metis repo (fine-grained PAT,
 		if update.IsNewer(cur, rel.TagName) {
 			fmt.Printf("update available: %s -> %s\n", cur, latest)
 			fmt.Printf("  release: %s\n", rel.HTMLURL)
-			fmt.Printf("  run `metis update` to install\n")
+			if gort.GOOS == "windows" {
+				fmt.Printf("  install with: %s\n", windowsInstallCommand(rel.TagName))
+			} else {
+				fmt.Printf("  run `metis update` to install\n")
+			}
 			return nil
 		}
 		fmt.Printf("metis %s is up to date\n", cur)
@@ -157,6 +160,14 @@ The token only needs read access to the metis repo (fine-grained PAT,
 		fmt.Printf("metis %s is already the latest release\n", cur)
 		fmt.Printf("(use --force to reinstall)\n")
 		return nil
+	}
+
+	if gort.GOOS == "windows" {
+		return fmt.Errorf(`automatic replacement of a running Windows executable is not supported
+
+Install %s with the checksummed PowerShell installer:
+
+  %s`, latest, windowsInstallCommand(rel.TagName))
 	}
 
 	self, err := update.SelfPath()
@@ -182,6 +193,10 @@ You appear to have installed metis with `+"`go install`"+`. To upgrade, run:
 	fmt.Printf("installed metis %s → %s (symlink → %s)\n", latest, self, versionedBin)
 	warnIfGoBinShadows()
 	return nil
+}
+
+func windowsInstallCommand(tag string) string {
+	return fmt.Sprintf("$env:METIS_VERSION='%s'; irm https://raw.githubusercontent.com/Ricardo-M-L/metis/%s/install/install.ps1 | iex", tag, tag)
 }
 
 // warnIfGoBinShadows prints a heads-up when a second metis binary exists

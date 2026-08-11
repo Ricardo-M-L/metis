@@ -19,16 +19,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
-)
 
-// noopSignal is the "kill -0" idiom: signal 0 is "noop / probe" on
-// POSIX, used to test whether a pid is still receiving signals.
-// Hoisted to a package var so tests can substitute it on platforms
-// that don't support sig 0 (Windows isn't a supported metis target,
-// so this lives in the shared file).
-var noopSignal = syscall.Signal(0)
+	"github.com/Ricardo-M-L/metis/internal/processutil"
+)
 
 // Snapshot is the per-session runtime state captured for recovery.
 // Fields are intentionally lean — anything bigger should live in the
@@ -250,15 +244,5 @@ func LooksCrashed(s Snapshot, maxAge time.Duration) bool {
 // signal 0 is "noop, just check permissions" — returns nil on a
 // running process owned by us, ESRCH otherwise.
 func processExists(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if err := p.Signal(noopSignal); err != nil {
-		return false
-	}
-	return true
+	return processutil.Alive(pid)
 }

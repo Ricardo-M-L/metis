@@ -657,7 +657,7 @@ func renderUpgrade() string {
 	out, _ := cmd.CombinedOutput()
 	body := strings.TrimSpace(string(out))
 	if body == "" {
-		return "(/upgrade: no output; set METIS_GITHUB_TOKEN if running against private release)"
+		return "(/upgrade: no output; run `metis update --check` for details)"
 	}
 	return body
 }

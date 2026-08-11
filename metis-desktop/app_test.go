@@ -119,7 +119,7 @@ func TestSendMessageNewSessionCLIArgs(t *testing.T) {
 		"run", "--no-auth-wizard",
 		"--session-id", response.ThreadID,
 		"--name", "implement desktop flow",
-		"--mode", "acceptEdits", "--no-stream",
+		"--mode", "acceptEdits",
 		"--", "implement desktop flow",
 	}
 	assertSingleCall(t, fake, workDir, want)
@@ -134,7 +134,7 @@ func TestSendMessageExistingSessionCLIArgs(t *testing.T) {
 	}
 	want := []string{
 		"run", "--no-auth-wizard", "--resume", "session_123",
-		"--mode", "plan", "--no-stream", "--", "continue",
+		"--mode", "plan", "--", "continue",
 	}
 	assertSingleCall(t, fake, workDir, want)
 }

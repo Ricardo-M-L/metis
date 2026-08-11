@@ -17,79 +17,97 @@ quirks. `Metis` aims for:
 
 - **Fast** — single static Go binary, sub-100ms cold start, no Node /
   Python runtime in the loop.
-- **Local-first** — state lives in `~/.metis/` (sessions, memory, plans,
-  tasks, history). Nothing phones home.
-- **Multi-provider** — Anthropic Messages API, OpenAI Chat Completions,
-  Google Gemini native, plus any OpenAI-compatible or Anthropic-
-  compatible gateway (MiniMax, Together, Groq, Ollama, OpenRouter).
+- **Local-first** — persistent state stays on local disk, primarily in
+  `~/.metis/` with opt-in project-local `.metis/` data. Model requests,
+  configured MCP/web/channel tools, plugin marketplaces, and the
+  throttled GitHub release check (including automatic Unix updates) can
+  use the network. Set `METIS_NO_UPDATE_CHECK=1` to disable that startup
+  check and auto-update path.
+- **Multi-provider** — native Anthropic Messages, OpenAI Chat Completions,
+  and Google Gemini transports; custom profiles support compatible
+  gateways plus Azure OpenAI, Vertex Anthropic, and Bedrock Anthropic
+  cloud-auth transports.
 - **MCP-native** — stdio + Streamable HTTP/SSE clients; tools auto-
   registered and namespaced.
 - **Permission-aware** — Claude Code's 5 public modes (`default` /
   `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions`), cascading
-  rules from CLI > project > user > defaults, "always
-  allow" remembered for the session, input-dependent bash classifier.
+  authority from managed policy > CLI > in-session approvals > config >
+  persisted approvals, plus an input-dependent bash classifier.
 - **Streaming-first** — text deltas + tool input deltas render as they
-  arrive; safe tools fan out in parallel, queueable tools FIFO, exclusive
-  tools serialize.
+  arrive; safe tools fan out in parallel, queueable tools run FIFO,
+  exclusive tools serialize, and background tools return immediately.
 - **Memory-aware** — three-tier (Core block / Archival JSONL / Recall
   history) with frozen-snapshot semantics borrowed from Hermes and
   context-fencing borrowed from Claude Code.
 
 ## Install
 
-This project is local-only — there's no public release URL. Build locally:
+### macOS / Linux
+
+Install the latest public release (`arm64` or `amd64`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.sh | bash
+"$HOME/.local/bin/metis" version
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.ps1 | iex
+& "$env:LOCALAPPDATA\Programs\Metis\bin\metis.exe" version
+```
+
+The Windows installer writes to
+`%LOCALAPPDATA%\Programs\Metis\bin` by default and tells you how to add
+that directory to your user `PATH` when necessary.
+
+Public releases do not require a GitHub token. `METIS_GITHUB_TOKEN` (or
+`GITHUB_TOKEN`) is optional and only raises GitHub's API rate limit. To
+pin a release or choose another directory, set `METIS_VERSION` and
+`METIS_INSTALL_DIR` before running the installer. For example:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.sh | \
+  env METIS_VERSION=vX.Y.Z METIS_INSTALL_DIR="$HOME/.local/bin" bash
+```
+
+```powershell
+$env:METIS_VERSION = "vX.Y.Z"
+$env:METIS_INSTALL_DIR = "$env:LOCALAPPDATA\Programs\Metis\bin"
+irm https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.ps1 | iex
+```
+
+On macOS and Linux, `metis update` can switch the installed versioned
+binary in place. Windows keeps `metis update --check`, but upgrading must
+rerun `install.ps1` because Windows cannot safely replace the running
+`metis.exe`.
+
+For local development, build from source:
 
 ```sh
 make install            # builds + installs to ~/.local/bin/metis and ~/go/bin/metis
-metis version
 ```
-
-Or via the curl one-liner against a local release dir:
-
-```sh
-make dist               # produces dist/metis-{darwin,linux}-{arm64,amd64}.tar.gz
-mkdir -p ~/.metis-releases/$(cat VERSION)
-cp dist/*.tar.gz dist/*.sha256 ~/.metis-releases/$(cat VERSION)/
-
-METIS_VERSION=$(cat VERSION) bash install/install.sh
-```
-
-`METIS_RELEASE_BASE` defaults to `file://$HOME/.metis-releases` — there
-is **no hardcoded public URL**.
 
 ## Usage
 
 ```sh
 metis                         # interactive chat (full bubbletea TUI)
-metis chat                    # same
 metis run "<prompt>"          # one-shot, prints reply, exits
 metis config show             # effective config + which files were read
-metis config init             # write starter config to ~/.metis/config.toml
-metis tools                   # list registered tools (built-in + MCP + plugin)
+metis models [provider] [model] # browse models.dev and print config snippets
 metis sessions list           # recent saved sessions
-metis sessions export <id>    # dump a session's JSONL to stdout
-metis sessions import         # import JSONL from stdin (optional --id)
-metis skills list             # built-in skills library
-metis skills install <ref>    # install a skill (bundled name or owner/repo:name)
-metis skills info <name>      # show one skill's manifest fields
-metis skills uninstall <name> # remove a skill
-metis ps [--limit N]          # list recent sessions (newest first; pid + size + title)
-metis logs <session-id>       # print a session's transcript (compact role/peek format)
-metis attach <session-id>     # alias of `metis chat -r <id>` (tmux-attach parity)
-metis kill <session-id>       # SIGTERM the metis pid backing this session
-metis daemon [--idle 10m]     # KAIROS-style file-watcher (~/.metis/inbox → outbox)
+metis skills list             # discover available skills
 metis plugin list             # installed plugins
-metis plugin info <name>      # show one plugin's manifest details
-metis plugin remove <name> [--yes]  # delete a plugin (--yes to actually rm -rf)
-metis cron <list|add|...>     # scheduled-job CRUD (see Scheduling section)
-metis acp [--addr ADDR]       # JSON-RPC server (stdio default; TCP for Zed/etc.)
-metis auth login              # opencode-style provider wizard (writes ~/.metis/auth.json)
-metis audit                   # security audit of the current configuration
+metis cron list               # scheduled jobs
 metis diag [--llm] [--tool-smoke] [--json]   # non-interactive health check
-metis eval [--dir D] [--tag T] [--out P]     # run the markdown scenario pack
-metis update [--check]        # self-update from the private GitHub release
+metis update --check          # check the public GitHub release
 metis version [-V]            # short semver (-V for full build fingerprint)
+metis help                    # complete current command surface
 ```
+
+Run `metis help` for the current top-level command and common-flag overview;
+subcommand-specific help and `metis env` cover the detailed surfaces.
 
 ### Flags
 
@@ -103,12 +121,8 @@ metis version [-V]            # short semver (-V for full build fingerprint)
 | `-r, --resume [<id>]` | resume a session by full UUID OR any unambiguous prefix (e.g. the 12-char id the picker prints). Bare `-r` opens the picker; ambiguous prefix errors with the candidate list |
 | `-d, --debug` | mirror logs into `~/.metis/debug.log` |
 | `--bare` | skip MCP / plugin loaders for fastest cold start |
-| `-s, --scope <local\|user\|project>` | config scope (today only `user` is honored) |
-| `--input-format json` | `metis run`: read NDJSON prompts from stdin |
-| `--output-format json\|stream-json` | `metis run`: emit structured events |
 | `--no-markdown` | disable glamour markdown rendering |
-| `--no-stream` | wait for the full reply before printing |
-| `--streamlined` | thinking dropped, tool calls collapsed into summaries |
+| `--streamlined` | `metis run`: drop thinking and collapse tool calls into summaries |
 | `--max-iter <n>` | cap tool iterations per turn |
 | `--max-budget-usd <x>` | stop once cumulative LLM spend reaches x USD (sub-agents share the pool) |
 | `--output-schema <file>` | `metis run`: final reply must conform to this JSON Schema (2 retries, then exit 11) |
@@ -117,11 +131,10 @@ metis version [-V]            # short semver (-V for full build fingerprint)
 | `--fast` | one-shot fast turn (effort=low + halved max_tokens) |
 | `--add-dir <path>` | add a directory to the agent's accessible scope (repeatable) |
 | `--agent <name>` | load an agent profile from `~/.metis/agents/<name>.md` |
-| `--worktree <slug>` / `-W` | spin up the session inside a git worktree |
-| `--name <text>` | human-friendly session label (visible in `/sessions`) |
-| `--agent-teams` | start in agent-teams mode (alias for `/batch` entry path) |
-| `--tmux` | when starting in a worktree, also wrap in a tmux pane |
-| `--tui` | force the TUI (default when stdout is a TTY) |
+| `--worktree <slug>` / `-W` | chat only: use the given worktree slug; bare `-W` generates one |
+| `--name <text>` | human-friendly session label shown in session listings |
+| `--coordinator` | restrict the main loop to coordination-oriented tools and prompts |
+| `--tui` | chat only: force the TUI (default when stdout is a TTY) |
 | `--no-auth-wizard` | skip the first-run auth wizard |
 | `--tools <list>` | allowlist (CSV or space-separated): only expose these tools to the model. Empty = use config + all registered tools. |
 | `--disallow-tools <list>` | blocklist (CSV/space): hide these tools from the model. Supports MCP server prefix — `mcp__office-word` mutes the whole server; `mcp__` mutes every MCP tool. |
@@ -130,7 +143,7 @@ metis version [-V]            # short semver (-V for full build fingerprint)
 
 `metis chat --tools "Read,Edit,Bash"` — only those three are visible to the model this session. Useful for sandboxed audits or constrained sub-agents.
 
-`metis chat --disallow-tools "mcp__office-word,WebFetch"` — every other tool stays available; the `office-word` MCP server's 54 tools and `WebFetch` are stripped before reaching the prompt. Saves substantial cache tokens.
+`metis chat --disallow-tools "mcp__office-word,WebFetch"` — every other tool stays available; that MCP server's tools and `WebFetch` are stripped before reaching the prompt. Saves substantial cache tokens.
 
 Persistent equivalents live in `~/.metis/config.toml`:
 
@@ -149,32 +162,9 @@ CLI `--tools` REPLACES `cfg.Tools.Allowed` if set. CLI `--disallow-tools` UNIONS
 
 ### Slash commands (in chat)
 
-Session: `/new` `/clear` `/retry` `/undo` `/history` `/save` `/title`
-`/rename` `/tag` `/branch` `/sessions` `/export`
-
-Mode: `/default` `/plan` `/dontAsk` `/bypassPermissions` `/mode` `/compact` `/effort` `/fast` `/output-style`
-
-Info: `/status` `/session` `/model` `/tools` `/skills` `/memory`
-`/cost` `/usage` `/tokens` `/context` `/stats` `/keybindings` `/permissions`
-`/hooks` `/doctor` `/version` `/help` `/onboarding`
-
-Productivity: `/copy [N]` `/share` `/export` `/files` `/recap` `/replay`
-`/insights [--days N]` `/lessons` `/break-cache` `/statusline`
-
-Git / review: `/diff` `/git` `/commit` `/log` `/checkout` `/stash` `/fetch`
-`/review` `/security-review` `/commit-push-pr` `/feedback`
-
-Tooling: `/loop` `/cron` `/edit` `/agents` `/batch` `/btw` `/abort`
-`/voice` `/thinkback` `/ultraplan`
-
-MCP: `/mcp list` `/mcp add <name> <cmd>` `/mcp remove <name>`
-`/mcp enable <name>` `/mcp disable <name>` `/mcp edit [<name>]`
-`/mcp test <name>` `/mcp logs <name>` `/mcp reload` `/mcp start <name>`
-`/cu enable` `/cu disable`
-
-Skills: `/skills list` `/skills install <name>` `/skills remove <name>`
-`/skills info <name>` `/skills edit <name>` `/skills enable <name>`
-`/skills disable <name>` `/skills create <name>` `/skills search <query>`
+Run `/help` inside chat for the live slash-command registry and current
+syntax. This avoids pinning the README to handlers that may change between
+releases.
 
 User-authored: drop `*.md` files under `~/.metis/commands/` or
 `<cwd>/.metis/commands/`. Each becomes `/<filename>`. YAML frontmatter
@@ -182,6 +172,13 @@ sets the description; `$ARGUMENTS` / `$1` / `$2` get substituted.
 
 MCP servers that advertise prompts/list register automatically as
 `/mcp__<server>__<prompt>` slashes.
+
+### Skill sources
+
+The runtime merges skill sources in increasing priority: bundled skills,
+`~/.metis/optional-skills/`, the cross-agent `~/.agents/skills/` directory,
+`~/.metis/skills/`, `<cwd>/.metis/skills/`, and plugin-contributed skills.
+A later source wins when two skills have the same name.
 
 ### Keybindings (in chat)
 
@@ -238,11 +235,15 @@ model = "gemini-2.5-pro"
 # when a vendor exposes both Anthropic-compatible and OpenAI-compatible
 # endpoints (MiniMax, OpenRouter, GLM, …).
 [provider.custom.minimax-openai]
-transport   = "openai_chat"            # anthropic_messages | openai_chat | gemini_native
+transport   = "openai_chat"            # API-key transports: anthropic_messages | openai_chat | gemini_native
 api_key_env = "MINIMAX_API_KEY"
 base_url    = "https://api.minimaxi.com/v1"
 model       = "MiniMax-M2.7"
 context_window = 192000
+
+# Cloud-auth custom transports are also available: azure_openai,
+# vertex_anthropic, and bedrock_anthropic. Their required profile fields
+# differ; use `metis config schema` and command help as the source of truth.
 
 [provider.custom.deepseek]
 transport   = "openai_chat"
@@ -263,7 +264,7 @@ context_window = 1000000
 #   metis -p deepseek run "..."
 
 # Don't know the right base_url / model name / env var? Run:
-#   metis models                      # list 117 providers from models.dev
+#   metis models                      # browse providers from models.dev
 #   metis models deepseek             # all DeepSeek models + cost + context
 #   metis models deepseek deepseek-chat  # ready-to-paste config snippet
 
@@ -298,8 +299,9 @@ mouse_wheel_lines = 1         # 1=pixel-precise, 3=jumpy
 reduced_motion = false        # accessibility: 500ms tick + no shimmer
 
 [session]
-auto_compact_threshold = 0.85   # fraction of context window
-max_iterations = 50
+auto_compact_threshold = 0.95       # fraction of context window
+auto_compact_minimum_tokens = 50000 # do not compact below this estimate
+max_iterations = 100
 
 [tools]
 # ToolSearch lazy MCP schema is controlled by the ENABLE_TOOL_SEARCH
@@ -344,8 +346,9 @@ max_iterations = 50
 
 [tools.bash]
 timeout_seconds = 120
-max_output_bytes = 1048576
-denylist = ["rm -rf /", "shutdown"]
+max_output_bytes = 32768
+# Re-include these baseline patterns if you replace the denylist.
+denylist = ["rm -rf /", "dd of=/dev", ":(){:|:&};:"]
 
 [loop_detection]
 # On by default since 2026-05-08. Set `disabled = true` to opt out.
@@ -357,7 +360,7 @@ signature_window      = 10  # steps to keep in the sliding window
 signature_max_repeats = 5   # same-signature count that trips the abort
 warning               = 10  # legacy per-tool consecutive-call warning
 critical              = 20  # legacy per-tool consecutive-call critical
-global                = 80  # absolute ceiling on tool calls per Run
+global                = 0   # disabled; set a positive total-call ceiling to opt in
 ```
 
 ### Background bash + job pool
@@ -389,7 +392,7 @@ are rejected — they're polling primitives that shouldn't burn the
 foreground turn. Sub-2s pacing, pipeline / subshell / loop sleeps
 are fine.
 
-### Desktop notifications (5-channel matrix)
+### Desktop notifications
 
 When a turn runs longer than 30 seconds and you haven't pressed a key
 in the last 6, metis pops a desktop notification so you can switch back
@@ -425,39 +428,20 @@ that lights up while the turn is running and clears on completion.
 
 ## Built-in tools
 
-| Tool | Concurrency | Notes |
-|------|-------------|-------|
-| `Read` | safe | line-numbered, offset+limit, image-aware |
-| `LS` | safe | filters dot-dirs |
-| `Glob` | safe | doublestar globs, sorted by mtime |
-| `Grep` | safe | Go regex, skips `.git`/`node_modules`/`vendor` |
-| `WebFetch` | safe | bounded body, configurable timeout |
-| `Search` | queue | web search via DuckDuckGo HTML |
-| `Git` | queue | safe git subcommands; mutating ops downgrade to exclusive |
-| `Bash` | input-dep | classified per command — `ls`/`grep` safe, `rm`/`git push` exclusive |
-| `Edit` | exclusive | unique-match enforced, structured diff render |
-| `Write` | exclusive | absolute paths only |
-| `NotebookEdit` | exclusive | edit a single cell in a `.ipynb` notebook |
-| `LSP` | safe | hover/definition/references/implementations via gopls (Go), pyright (Python), typescript-language-server (TS/JS), rust-analyzer (Rust) when installed |
-| `Memory` | exclusive | persistent memory CRUD |
-| `History` | safe | search the full session transcript — including messages auto-compaction summarized away — and read around any hit (recover exact past wording) |
-| `Workflow` | exclusive | run an ordered sequence of shell steps as one unit with per-step status + stop-on-failure; save/reuse named workflows. Each step gated like Bash |
-| `Skill` | safe | invoke a registered skill |
-| `AskUser` | exclusive | blocking 3-5 option menu — model surfaces a question, TUI renders numbered choices + optional freeform input, tool returns chosen answer |
-| `TodoWrite` / `TodoRead` | exclusive / safe | task list, persisted per-session |
-| `BashList` / `BashOutput` / `BashKill` | safe | inspect / read / terminate background bash jobs |
-| `EnterPlanMode` / `ExitPlanMode` | exclusive | enter/leave plan mode mid-turn (claude-code parity) |
-| `Agent` | queue / background | spawn sub-agent — supports `name`, `isolation:"worktree"`, `cwd`, `run_in_background`, `permission_mode`, `allowed_tools`, `disallowed_tools`, `resume_from`, `timeout_seconds` |
-| `Fork` | queue | warm-context sub-agent (inherits parent's full history) |
-| `MessageTeammate` | safe | peer-to-peer messaging to a named sub-agent's mailbox |
-| `SubAgentList` | safe | enumerate active + recent sub-agents |
-| `SubAgentOutput` | safe | read a sub-agent's running output buffer |
-| `SubAgentStop` | exclusive | terminate a running sub-agent |
-| `SendMessage` | safe | send to a registered channel (Telegram, Slack, …) |
-| `ScheduleWakeup` | safe | LLM self-pacing — schedule a future re-entry with a prompt |
-| `CronCreate` | safe | schedule a prompt (recurring/one-shot, session-only or durable) — conversational scheduling |
-| `CronList` | safe | list scheduled jobs |
-| `CronDelete` | safe | cancel a scheduled job by id |
+Metis combines a static base registry with tools added by the selected
+runtime: file/search/edit/shell operations, jobs, memory/history,
+workflows, plan mode, cron, skills, sub-agents, MCP resources, and channel
+messaging. Availability depends on mode, config, platform, and runtime
+dependencies, so a hand-maintained table is not authoritative.
+
+```sh
+metis tools       # built-in/static contract after visibility filters
+metis schema      # current machine-readable tool schemas
+```
+
+Each call is classified from its input as `Safe`, `Queue`, `Exclusive`,
+or `Background`. Bash first applies hard safety rules, then the permission
+gate; a permissive user mode cannot bypass hard destructive-command blocks.
 
 ## Scheduling
 
@@ -547,8 +531,8 @@ at a glance.
 ## Multi-agent (Phase G — claude-code parity)
 
 Metis runs multiple sub-agents concurrently with peer messaging,
-named teammates, per-task isolation, and resumable state. Eighteen
-features land under Phase G of the parity plan; the headline surface:
+named teammates, per-task isolation, and resumable state. The headline
+surface:
 
 ```sh
 # Spawn a focused, isolated sub-agent
@@ -574,30 +558,24 @@ METIS_COORDINATOR_MODE=1 metis chat
 # or: metis --coordinator chat
 ```
 
-Six bundled agent profiles ship via `//go:embed`:
-`explore` / `plan` / `verify` / `general` (generic) and
-`go-reviewer` / `mcp-debugger` (metis-specific). User overrides at
-`~/.metis/agents/<name>.md` always win. A seventh `coordinator.md`
-backs `--coordinator`.
-
-Slash surface:
-
-- `/agents list [all]` — roster snapshot, anonymous teammates
-  hidden by default
-- `/agents status <name|id>` — full state for one teammate
-- `/agents kill <name|id>` — cancel a running teammate
-- `/agents resume <id>` — hint pointing at `Agent({resume_from})`
-- `/dream [status]` — DreamTask (auto-memory) phase + last run stats
+Eight bundled agent profiles ship via `//go:embed`: `explore`, `plan`,
+`verify`, `general`, `go-reviewer`, `mcp-debugger`, `coordinator`, and
+`teammate`. User overrides at `~/.metis/agents/<name>.md` always win.
+Use `/help` in chat for the live agent-management slash commands.
 
 Cross-cutting:
 
-- Concurrency cap (`config.Agents.MaxConcurrentSubAgents`, default 5)
+- Separate concurrency caps for named teammates and anonymous workers
+  (`agents.max_concurrent_named = 20` and
+  `agents.max_concurrent_anon = 40` by default); the old combined cap
+  remains only for backward-compatible configuration.
 - Timeout budget (`config.Agents.DefaultTimeoutSeconds`, default 600s)
   with per-invocation override via `timeout_seconds`
 - Sub-agent transcripts persisted to
   `<session-dir>/subagents/<agent_id>.jsonl` for `resume_from`
-- 3-layer memory scoping (user / project / local) with priority
-  cascade — same pattern as `internal/config/searchPaths`
+- Memory uses `./.metis/memory/` only when that directory exists in the
+  process's exact current working directory; otherwise it uses
+  `<session-dir>/memory`. Memory lookup does not walk parent directories.
 - Per-agent `permission.Gate.Clone()` so a child's mode flip can't
   leak back to the parent
 - DreamTask phase model (idle/starting/extracting/writing/done)
@@ -629,7 +607,7 @@ Two narrow-but-high-leverage features from claude-code's prompt layer:
   invocation: **10s timeout, 8 KiB stdout cap, `[shell error: …]`
   sentinel on failure**. Trust gate: only skills at
   `builtin` / `trusted` / `user` / `project` trust can run inline
-  shell — `community` / mcp-source skills get the raw text (claude-
+  shell — `community` skills get the raw text (claude-
   code parity, prevents third-party manifests from smuggling shell
   at invoke time). Implementation:
   `internal/agent/skills/{expand,inline_shell}.go`.
@@ -700,10 +678,11 @@ custom rollups.
 
 ## Channels (chat-platform adapters)
 
-`internal/channels/*` ships adapters for **DingTalk, Discord, Feishu,
-iMessage, Mattermost, Signal, Slack, Telegram, WeChat**.
-Configured via `[channels.<name>]` in config; `SendMessage` tool routes to
-them. Use cases: ops automations, scheduled cron-driven reports.
+The runtime wires six configurable `SendMessage` adapters: **Slack,
+Telegram, Discord, DingTalk, Feishu, and WeChat**. An adapter activates
+only when the credential environment variable named in its
+`[channels.<name>]` config is present. Use cases include ops automation
+and scheduled reports.
 
 ## Plugins
 
@@ -714,34 +693,36 @@ manifest_version = 1
 name = "browser-mcp"
 version = "0.3.1"
 description = "Browser automation"
+skills = ["skills/screenshot.md"]
 
 [mcp_server]
 command = "node"
 args = ["index.js"]
-
-skills = ["skills/screenshot.md"]
 ```
 
 ```sh
-metis plugin list                       # show installed
-metis plugin info <name>                # manifest details
-metis plugin remove <name>              # dry-run (just prints path)
-metis plugin remove <name> --yes        # actually delete (rm -rf the dir)
+metis plugin marketplace list
+metis plugin marketplace add <name> github:<owner>/<repo>
+metis plugin search <query>
+metis plugin install <plugin>[@<marketplace>]
+metis plugin list
+metis plugin info <name>
+metis plugin remove <name> --yes
 ```
 
-Plugin tools register as `plugin__<name>__<tool>`; plugin skills are
+Plugin MCP tools register as `mcp__plugin:<name>__<tool>`; plugin skills are
 namespaced as `<plugin>:<skill>` so they don't collide with bundled or
 user skills. Both surface to the LLM through the regular tool / skill
 discovery paths — no extra wiring needed.
 
-There's no `metis plugin install` (no remote registry yet) — to "install"
-a plugin from elsewhere, just clone or copy its directory under
-`~/.metis/plugins/`.
+Marketplace entries whose source is a path inside the marketplace clone
+install automatically. External-repository source kinds are not fetched
+yet; clone those manually into `~/.metis/plugins/<name>/`.
 
 ## Computer use (driving the desktop)
 
 Companion binary [`metis-cu`](https://github.com/Ricardo-M-L/metis-cu)
-exposes 24 desktop-control tools (screenshot / mouse / keyboard /
+exposes desktop-control tools (screenshot / mouse / keyboard /
 clipboard / window) over the standard MCP stdio transport. The tool
 names and parameter shapes mirror Anthropic's `mcp__computer-use__*`
 namespace exactly, so prompts and traces written for Claude Code's
@@ -757,7 +738,7 @@ make install                # writes ~/go/bin/metis-cu + ~/.local/bin/metis-cu
 # Register with metis (one liner — writes ~/.metis/mcp.toml + hot-loads)
 metis chat
 > /cu enable
-cu: enabled — computer-use (24 tools); binary=/Users/.../go/bin/metis-cu
+cu: enabled — computer-use; binary=/Users/.../go/bin/metis-cu
 ```
 
 Then in chat the tools appear as `mcp__computer-use__screenshot`,
@@ -819,46 +800,33 @@ configured shows up in the ACP session too.
 
 ## Architecture
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Cross-project
-positioning lives in [`../COMPARISON.md`](../COMPARISON.md).
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ```
-cmd/metis/                       main + per-CLI-subcommand files
-                                 (auth/diag/dirs/plugin/stats/trust/…)
-pkg/                             public SDK (provider, tool, hook,
-                                 channel, skill, memory, session,
-                                 plugin, llm.Effort)
-internal/llm/                    Anthropic / OpenAI / Gemini stream parsers
-internal/llm/transport/          shared HTTP client + retry / dump / log
-internal/tools/                  Tool interface + registry
-internal/tools/builtin/          first-party tools (Read/Write/Edit/Glob/
-                                 Grep/LS/Git/WebFetch/WebSearch/WebBrowse/
-                                 NotebookEdit/Todo/Ask/LSP/Task* + plan-mode)
-internal/tools/builtin/bash/     Bash tool family (Bash + List/Output/Kill
-                                 jobs + classifier + security rules)
-internal/permission/             cascading rule gate + 5 modes
-internal/agent/                  Loop, dispatch, streaming, compaction,
-                                 hooks, plan, cron, loop-detection,
-                                 verdict gate, stuck/progress detectors,
-                                 orphan-tool-use repair
-internal/agent/skills/           SKILL.md loader (5 layers: bundled /
-                                 user / project / plugin / mcp), 23
-                                 bundled skills
-internal/agent/transcript/       per-run transcript persistence
-internal/mcp/                    stdio + Streamable HTTP/SSE clients
-internal/channels/               9 chat-platform adapters
-internal/memory/                 Core/Archival/Recall + daily notes
-internal/session/                JSONL persistence, branch + snapshot
-internal/runtime/                composer helpers (provider, channels,
-                                 plugin, system_prompt, plan_archive, …)
-internal/runtime/mcp/            MCP registry + cache + prompts collector
-internal/slash/                  slash-command registry + handlers
-internal/tui/                    bubbletea TUI (~83 files)
-internal/tui/screen/             full-screen overlays (help/history/…)
-internal/exitcode/               typed errors → shell exit codes
-                                 (incl. IncompleteError → 11)
-internal/jobs/                   background process pool (job-aware Bash)
-install/                         curl + npm installer wrappers
+cmd/metis/                       CLI composition and subcommands
+pkg/                             public SDK contracts
+internal/llm/                    provider implementations and streaming
+internal/llm/transport/          shared HTTP, retry, dump, and logging
+internal/tools/                  tool registry and visibility helpers
+internal/tools/builtin/          first-party tools
+internal/tools/builtin/bash/     Bash jobs, classification, and safety rules
+internal/permission/             rule gate and public permission modes
+internal/agent/                  loop, dispatch, compaction, hooks, and cron
+internal/agent/skills/           SKILL.md loader: bundled, optional,
+                                 universal, user, project, and plugin sources
+internal/agent/transcript/       in-memory transcript helpers
+internal/mcp/                    stdio and Streamable HTTP/SSE clients
+internal/channels/               wired chat-platform adapters
+internal/memory/                 Core, Archival, Recall, and daily notes
+internal/session/                JSONL persistence, branching, and snapshots
+internal/runtime/                top-level runtime composition
+internal/runtime/mcp/            MCP registry, cache, and prompt collection
+internal/slash/                  slash-command registry and handlers
+internal/tui/                    Bubble Tea TUI
+internal/tui/screen/             full-screen overlays
+internal/exitcode/               typed errors mapped to shell exit codes
+internal/jobs/                   background process pool
+install/                         shell, PowerShell, and npm installers
 ```
 
 Several internal packages carry a `README.md` documenting their

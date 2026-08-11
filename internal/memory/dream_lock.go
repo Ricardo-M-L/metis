@@ -34,8 +34,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/processutil"
 )
 
 // DreamLockFilename is the per-memdir lock file name. Hidden so it
@@ -110,29 +111,7 @@ func (d *DreamLock) LastSuccessAt() time.Time {
 // delivered (process exists, even zombie). ESRCH means the PID is
 // gone. Other errors (EPERM, etc.) mean the process exists but we
 // can't signal it — still "alive" for our purpose.
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// os.FindProcess on Unix always succeeds; Signal(0) is the actual
-	// liveness check. On Windows, FindProcess fails for dead PIDs.
-	err = proc.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
-	}
-	// Process gone: macOS wraps ESRCH as os.ErrProcessDone, Linux
-	// surfaces raw syscall.ESRCH. Check both. Everything else (EPERM,
-	// permission denied signalling another user's process) means
-	// "alive from our perspective".
-	if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
-		return false
-	}
-	return true
-}
+func pidAlive(pid int) bool { return processutil.Alive(pid) }
 
 // TryAcquire writes our PID into the lock file and re-reads to verify
 // no other process clobbered us. Returns:

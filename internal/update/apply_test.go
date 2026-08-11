@@ -63,14 +63,23 @@ func buildFakeRelease(t *testing.T, version, target string, binContent []byte) (
 	}
 
 	repo := Repo()
+	assertNoEmptyBearer := func(r *http.Request) {
+		t.Helper()
+		if got := r.Header.Get("Authorization"); got == "Bearer " {
+			t.Errorf("request sent an empty bearer token")
+		}
+	}
 	mux.HandleFunc("/repos/"+repo+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		assertNoEmptyBearer(r)
 		json.NewEncoder(w).Encode(rel)
 	})
 	mux.HandleFunc("/repos/"+repo+"/releases/assets/1", func(w http.ResponseWriter, r *http.Request) {
+		assertNoEmptyBearer(r)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(tarball)
 	})
 	mux.HandleFunc("/repos/"+repo+"/releases/assets/2", func(w http.ResponseWriter, r *http.Request) {
+		assertNoEmptyBearer(r)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write([]byte(sumLine))
 	})
@@ -80,7 +89,7 @@ func buildFakeRelease(t *testing.T, version, target string, binContent []byte) (
 // TestApply_VersionedInstall pins the claude-code-style layout:
 // binary lands at <base>/share/metis/versions/<ver>/metis and
 // <base>/bin/metis is a symlink pointing at it. Uses a fake release
-// server so no network/token is needed.
+// server so no network or token is needed.
 func TestApply_VersionedInstall(t *testing.T) {
 	// Redirect the API base Apply hits to our fake server.
 	srv, rel := buildFakeRelease(t, "0.5.0", "test-os-arch", []byte("#!/bin/sh\necho fake-metis-0.5.0\n"))
@@ -111,7 +120,7 @@ func TestApply_VersionedInstall(t *testing.T) {
 		t.Fatalf("seed symlink: %v", err)
 	}
 
-	if err := Apply(context.Background(), "fake-token", destLink, rel); err != nil {
+	if err := Apply(context.Background(), "", destLink, rel); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 

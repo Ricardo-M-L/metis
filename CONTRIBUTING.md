@@ -13,16 +13,16 @@ cmd/metis/                 CLI entry + one file per subcommand
 internal/agent/            the message → tool → message loop (Loop +
                            dispatch + detectors + verdict gate +
                            contract + orphan repair)
-internal/agent/skills/     SKILL.md loader + 23 bundled skills
+internal/agent/skills/     SKILL.md loader + bundled skills
 internal/agent/transcript/ per-run transcript persistence
 internal/tools/            Tool interface + registry
-internal/tools/builtin/    ~30 first-party tools (Read/Write/Edit/Glob/
+internal/tools/builtin/    first-party tools (Read/Write/Edit/Glob/
                            Grep/LS/Git/WebFetch/WebSearch/WebBrowse/
                            NotebookEdit/Todo/Ask/LSP/Agent/Fork/Task*/
                            plan-mode/Skill/Memory/MetisInfo/Monitor/
                            ScheduleWakeup/MessageTeammate/SendMessage)
 internal/tools/builtin/bash/  Bash family (Bash + List/Output/Kill
-                              jobs + classifier + 30+ security rules)
+                              jobs + classifier + security rules)
 internal/llm/              provider clients (Anthropic, OpenAI, Gemini,
                            Azure, Bedrock, Vertex, Cloud, custom)
 internal/llm/transport/    shared HTTP client + retry/dump/log/overflow
@@ -30,13 +30,14 @@ internal/memory/           multi-tier memory (Core / Archival / Recall + Daily)
 internal/runtime/          bootstrap glue: build provider, build registry,
                            build loop
 internal/runtime/mcp/      MCP registry + cache + prompts collector
-internal/tui/              bubbletea chat surface (~83 files, single Model)
+internal/tui/              bubbletea chat surface (split by concern,
+                           single Model)
 internal/tui/screen/       full-screen overlays (help/history/…)
 internal/slash/            slash-command registry + handlers
 internal/permission/       5-mode cascading gate (default/acceptEdits/plan/dontAsk/bypassPermissions)
 internal/exitcode/         typed errors → shell exit codes
 internal/jobs/             background process pool for the Bash family
-internal/channels/         9 chat-platform adapters (Slack/DingTalk/…)
+internal/channels/         chat-platform adapters (Slack/DingTalk/…)
 internal/mcp/              stdio + Streamable HTTP/SSE clients (SDK shape)
 acp/                       Agent Client Protocol JSON-RPC server
 pkg/                       stable public API (tool, memory, plugin,
@@ -55,14 +56,39 @@ when navigating a cluttered package (`internal/tui/`, `internal/agent/`,
 
 ## Building & testing
 
+Use the Go toolchain declared by `go.mod`; CI reads that file rather than
+duplicating a version number in this guide.
+
+Root module checks (required for every code change):
+
 ```sh
-go build ./...                          # binary at ./metis
-go test -count=1 -timeout 90s ./...     # full unit suite (~30s)
-go vet ./...                            # default vet checks
-make install                            # publish to ~/.local/bin/metis + ~/go/bin/metis
-                                        # (run after every code change so tmux e2e + manual smoke
-                                        # both pick up the new binary)
+gofmt -l .                              # must print nothing
+go vet ./...
+go build ./...                          # compile every root-module package
+go test -count=1 -timeout 90s ./...
 ```
+
+Common local build and install targets:
+
+```sh
+make test                               # optional root-module race + coverage run
+make build                              # versioned CLI at ./bin/metis
+make install                            # ~/.local/bin/metis + the active Go bin dir
+```
+
+The repository also contains nested modules that root-level `./...` does not
+cross. Run the matching checks when those areas change; CI runs all of them:
+
+```sh
+(cd vendor-patches/bubbletea-v2 && go vet ./... && go test -race -count=1 ./...)
+(cd vendor-patches/ultraviolet && go vet ./... && go test -race -count=1 ./...)
+
+(cd metis-desktop/frontend && npm ci && npm run check && npm run build)
+(cd metis-desktop && go vet ./... && go test -race -count=1 ./... && go build -tags production ./...)
+```
+
+GitHub Actions repeats the root-module formatting, vet, build, and test checks
+on Ubuntu, macOS, and Windows. The desktop job runs on macOS.
 
 End-to-end (TUI behaviour) — uses tmux to drive a real `metis chat`
 session and `capture-pane` to assert visible state:
@@ -93,13 +119,14 @@ Output: `/tmp/metis-cmp-captures/*.txt` (full pane dumps) and
 
 Pre-commit checklist:
 
-1. `go test ./...` is green
-2. `go vet ./...` is clean
-3. `gofmt -l .` returns nothing
-4. The change has either a test or a clear "tested manually because <reason>" note
-5. Touched docs in the same PR if behaviour changed (README's flag /
-   slash / keybind tables, `CHANGELOG.md` Unreleased entry,
-   `docs/ARCHITECTURE.md` if a package moved)
+1. The root-module format, vet, build, and test commands above pass.
+2. Checks for every touched nested module or frontend area pass.
+3. TUI-facing changes pass the relevant tmux case (and parity case when
+   applicable), or the PR explains why they were tested manually.
+4. New behaviour has a test, or a clear "tested manually because <reason>" note.
+5. Behaviour changes update the relevant docs in the same PR (README flag /
+   slash / keybind tables, `CHANGELOG.md` Unreleased entry, and
+   `docs/ARCHITECTURE.md` when architecture or package boundaries change).
 
 ## Style
 

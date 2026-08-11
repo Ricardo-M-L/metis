@@ -1,11 +1,83 @@
 package update
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestLatestSupportsAnonymousPublicRelease(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	mux.HandleFunc("/repos/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("anonymous request sent Authorization header %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
+	})
+
+	oldAPI := apiBase
+	apiBase = server.URL
+	t.Cleanup(func() { apiBase = oldAPI })
+
+	got, err := Latest(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Latest without token: %v", err)
+	}
+	if got.TagName != "v9.9.9" {
+		t.Fatalf("Latest tag = %q, want v9.9.9", got.TagName)
+	}
+}
+
+func TestLatestUsesTokenWhenProvided(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	mux.HandleFunc("/repos/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("Authorization = %q, want Bearer test-token", got)
+		}
+		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
+	})
+
+	oldAPI := apiBase
+	apiBase = server.URL
+	t.Cleanup(func() { apiBase = oldAPI })
+
+	if _, err := Latest(context.Background(), "test-token"); err != nil {
+		t.Fatalf("Latest with token: %v", err)
+	}
+}
+
+func TestMaybeCheckSupportsAnonymousPublicRelease(t *testing.T) {
+	t.Setenv("METIS_GITHUB_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("PATH", t.TempDir()) // keep Token from finding a logged-in gh CLI
+	resetGhTokenCache()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	mux.HandleFunc("/repos/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
+	})
+
+	oldAPI := apiBase
+	apiBase = server.URL
+	t.Cleanup(func() { apiBase = oldAPI })
+
+	if got := MaybeCheck(context.Background(), t.TempDir(), "0.1.0"); got != "v9.9.9" {
+		t.Fatalf("MaybeCheck without token = %q, want v9.9.9", got)
+	}
+}
 
 func TestIsNewer(t *testing.T) {
 	cases := []struct {

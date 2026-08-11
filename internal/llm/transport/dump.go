@@ -258,7 +258,7 @@ func redactHeaders(h http.Header) map[string]any {
 	out := make(map[string]any, len(h))
 	for k, v := range h {
 		lk := strings.ToLower(k)
-		if lk == "authorization" || lk == "x-api-key" || lk == "anthropic-api-key" || lk == "api-key" || strings.Contains(lk, "token") || strings.Contains(lk, "secret") {
+		if lk == "authorization" || lk == "x-api-key" || lk == "x-goog-api-key" || lk == "anthropic-api-key" || lk == "api-key" || strings.Contains(lk, "token") || strings.Contains(lk, "secret") {
 			out[k] = "[REDACTED]"
 			continue
 		}

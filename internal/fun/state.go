@@ -12,8 +12,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/processutil"
 )
 
 // PlayerState is what `~/.metis/fun/music_state.json` contains. Kept
@@ -99,25 +100,7 @@ func ClearState() error {
 // on macOS / Linux. ESRCH means no such process; EPERM means it
 // exists but we don't own it (counts as alive — we recorded it, so
 // we own it, but extra-paranoid case).
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = proc.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
-	}
-	// EPERM = process exists but we lack permission; still counts.
-	return errIsEPERM(err)
-}
-
-func errIsEPERM(err error) bool {
-	return err != nil && err.Error() == "operation not permitted"
-}
+func pidAlive(pid int) bool { return processutil.Alive(pid) }
 
 // FormatUptime returns a human-readable duration since the state was
 // created, e.g. "2m 14s" or "1h 03m". Used by /fun music status.

@@ -77,14 +77,13 @@ func saveState(path string, s checkState) {
 	_ = os.WriteFile(path, b, 0o644)
 }
 
-// MaybeCheck is the daily-throttled version notifier intended for chat
+// MaybeCheck is the throttled version notifier intended for chat
 // startup. It returns the latest available tag if one is strictly newer than
 // `currentVersion`; "" otherwise (also returns "" on any error so callers can
 // ignore failures silently).
 //
 // Skipped entirely when:
 //   - METIS_NO_UPDATE_CHECK=1 is set
-//   - no token is available
 //   - we already checked within minInterval
 //
 // configHome is the metis config dir (e.g. ~/.metis); the throttle state
@@ -94,9 +93,6 @@ func MaybeCheck(ctx context.Context, configHome, currentVersion string) string {
 		return ""
 	}
 	token := Token()
-	if token == "" {
-		return ""
-	}
 	sp := statePath(configHome)
 	st := loadState(sp)
 	// Stale-cache guard (2026-07-26): if the cached LatestTag is OLDER

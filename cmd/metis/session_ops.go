@@ -24,11 +24,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/processutil"
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
@@ -166,7 +166,7 @@ func cmdKill(_ context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("malformed pidfile for %s: %v", id, err)
 	}
-	if err := syscall.Kill(pidNum, syscall.SIGTERM); err != nil {
+	if err := processutil.Terminate(pidNum); err != nil {
 		return fmt.Errorf("kill %d: %v", pidNum, err)
 	}
 	fmt.Printf("(SIGTERM sent to pid %d for session %s)\n", pidNum, id)
@@ -204,10 +204,9 @@ func readPidIfExists(sessionID string) string {
 		return "-"
 	}
 	// Verify the process is still alive — a stale pidfile shows "(dead)"
-	// rather than a misleading number. signal 0 is the universal "is it
-	// alive" probe on Unix.
+	// rather than a misleading number.
 	if pidNum, err := strconv.Atoi(pid); err == nil {
-		if err := syscall.Kill(pidNum, 0); err != nil {
+		if !processutil.Alive(pidNum) {
 			return pid + "(dead)"
 		}
 	}

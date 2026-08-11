@@ -1,6 +1,6 @@
-// Package update implements self-update for Metis against a private GitHub
-// release. All network calls require a GitHub PAT with read access to the
-// repo (METIS_GITHUB_TOKEN, falling back to GITHUB_TOKEN).
+// Package update implements self-update for Metis from GitHub releases.
+// Public releases work anonymously; METIS_GITHUB_TOKEN (falling back to
+// GITHUB_TOKEN) is optional and raises the GitHub API rate limit.
 package update
 
 import (
@@ -42,7 +42,10 @@ func Repo() string {
 	return defaultRepo
 }
 
-// Token returns the PAT to authenticate against GitHub, or "" if none set.
+// Token returns an optional token for GitHub API requests, or "" if none is
+// available. Public Metis releases can be checked and downloaded anonymously;
+// authentication raises GitHub's API rate limit and also supports a private
+// METIS_REPO override.
 //
 // Resolution order (first non-empty wins):
 //  1. METIS_GITHUB_TOKEN env var (explicit, scoped to metis)
@@ -53,12 +56,8 @@ func Repo() string {
 //     loop; ghAuthToken caches per-process so the spawn cost is paid
 //     at most once per metis run.
 //
-// Without #3, the version-check + self-update silently no-op'd on
-// every machine where the user hadn't manually exported a PAT —
-// "current: vX" showed but "latest: vY" never lit up because
-// MaybeCheck bailed at the empty-token guard. (User report
-// 2026-05-10: "metis 打开会不会显示当前版本和最新版本" — answer was
-// "yes in code, no in practice because no token".)
+// The gh fallback is best-effort: not having gh installed or logged in is a
+// normal anonymous-public-release path, not an error.
 func Token() string {
 	if v := strings.TrimSpace(os.Getenv("METIS_GITHUB_TOKEN")); v != "" {
 		return v
@@ -104,9 +103,6 @@ func ghAuthToken() string {
 	return ghAuthTokenCached
 }
 
-// ErrNoToken is returned when no PAT is configured.
-var ErrNoToken = errors.New("no GitHub token set (METIS_GITHUB_TOKEN or GITHUB_TOKEN)")
-
 type asset struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
@@ -124,9 +120,6 @@ type release struct {
 
 // Latest fetches the latest non-draft release.
 func Latest(ctx context.Context, token string) (*release, error) {
-	if token == "" {
-		return nil, ErrNoToken
-	}
 	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBase, Repo())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -212,9 +205,6 @@ func (r *release) findAsset(target string) (binary, sum *asset, err error) {
 // where the "metis" symlink lives; the versions farm sits alongside it
 // at ../share/metis/versions (claude-code: ~/.local/bin + ~/.local/share).
 func Apply(ctx context.Context, token, destPath string, r *release) error {
-	if token == "" {
-		return ErrNoToken
-	}
 	if r == nil {
 		var err error
 		r, err = Latest(ctx, token)
@@ -446,7 +436,9 @@ func extractBinary(tarPath, tmpDir, innerName string) (string, error) {
 }
 
 func setAuth(req *http.Request, token, accept string) {
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", userAgent)

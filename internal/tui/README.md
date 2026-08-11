@@ -1,54 +1,79 @@
 # internal/tui
 
-bubbletea-based terminal UI. `Model` owns all interactive state; `Update`
-is the sole writer. Goroutines snapshot what they need at the call site
-and return values via `tea.Msg`. See `tui.go` for the Model struct,
-`tui_update.go` for the central dispatcher, `tui_events.go` for the
-agent-event handler, `repl.go` for the non-TUI fallback path.
+The Bubble Tea terminal UI. `Model` owns interactive state and the Bubble Tea
+program goroutine owns its mutation. Most writes happen in `Update`; the
+current `View` path also performs legacy lazy ID backfilling through
+`ensureIDs`. Agent/provider work runs asynchronously from snapshots and
+communicates back through messages or channels. `repl.go` is the non-TUI
+fallback and does not share the Bubble Tea model lifecycle.
 
-## File-naming convention (browse by prefix)
+## Browse by concern
 
-The package has ~80 production files. They organise by prefix:
+| Family | What it owns | Entry files |
+|---|---|---|
+| `tui*` | Model, update loop, event application, rendering, spinner, and styles | `tui.go`, `tui_update.go`, `tui_events.go` |
+| `render_*` | Transcript rows, tools, overlays, status chrome, queues, and welcome UI | `render_chrome.go`, `render_message.go`, `render_tool.go` |
+| `keybind_*` | Root-screen input dispatch and submit/permission/session behavior | `keybind_main.go`, `keybind_submit.go` |
+| `cmd_*` | Slash-command implementations | `commands.go`, `command_catalog.go` |
+| `model_*` | Model choices, live state, and switching | `model_choices.go`, `model_state.go`, `model_switch.go` |
+| `screen/` | Full-screen help, history, picker, detail/diff, permissions, effort, model, multi-agent, resume, theme, and related screens | `screen/screen.go` |
+| `overlay/` | Stackable modal overlays | `overlay/overlay.go` |
+| `list/` | Generic focused/scrollable list primitives | `list/list.go` |
+| `keybind/` | Vim-style key parsing and resolution | `keybind/resolver.go` |
+| `i18n/` | Chat-side localization catalog | `i18n/i18n.go` |
 
-| Prefix | Count | What it owns | Entry file |
-|---|---|---|---|
-| `render_*` | 11 | Visible output: status bar, transcript rows, code blocks, banners, chrome | `render_chrome.go` |
-| `keybind_*` | 8 | Per-screen key handling that dispatches to handlers | `keybind_main.go`, `keybind_submit.go` |
-| `cmd_*` | 8 | slash-command implementations the registry routes to | `commands.go` (registry) + `cmd_phase_c.go` |
-| `tui_*` | 5 | Model + Update + event dispatcher + persistTail | `tui.go`, `tui_update.go`, `tui_events.go` |
-| `statusline_*` | 2 | Status-bar composition | `statusline.go` |
-| `model_*` | 2 | Model-switching modal / per-model UI tweaks | `model.go` |
-| singletons | ~50 | Per-concern widgets / small features: `vim.go`, `voice.go`, `yank.go`, `picker.go`, `terminal.go`, `search.go`, `resume.go`, `reload.go`, `repl.go`, `image_paste.go`, `at_file_image.go`, etc. | one file per concept |
-
-When a feature gets >2 files it earns a prefix.
-
-## Sub-packages
-
-| Path | Purpose |
-|---|---|
-| `screen/` | 11 full-screen overlays: help / history / picker / theme / detail / info / permissions / effort / body / model |
-| `keybind/` | vim-mode key bindings (the heavy bit; root `keybind_*` is the light dispatchers) |
-| `overlay/` | Modal overlays (BtwOverlay etc.) — stacked on top of the main view |
-| `list/` | Generic scrollable list component used by pickers |
-| `i18n/` | i18n catalog for chat-side strings |
+Other root files are feature-oriented: image paste/mentions, queueing,
+conversation export, session resume/switching, transcript search, terminal
+reset/progress, voice, clipboard/yank, and REPL support. Use `rg --files
+internal/tui` rather than relying on a static file count.
 
 ## Where do I find...
 
 - **The Model struct** → `tui.go`
-- **The Update dispatcher** → `tui_update.go` (`func (m *Model) Update`)
-- **Agent event handling** (text deltas, tool results, etc.) → `tui_events.go`
-- **handleSubmit / runTurnAsync** (the message loop + async turn) → `keybind_submit.go`, `tui_update.go`
-- **Slash-command registration** → `commands.go`
-- **A specific render piece** (token counter, spinner, banner) → grep `render_*` then the concrete file name
-- **REPL / non-interactive mode** → `repl.go`
-- **Image paste handling** → `image_paste.go` + `at_file_image.go`
+- **The Bubble Tea dispatcher and turn finalization** → `tui_update.go`
+- **Agent event application** (thinking/text deltas, tool args/results,
+  permissions, AskUser, usage) → `tui_events.go`
+- **Submit and async turn launch** → `keybind_submit.go` and
+  `runTurnAsync` in `tui_update.go`
+- **Slash-command registration** → `commands.go` and `command_catalog.go`
+- **Model switching** → `model_state.go` and `model_switch.go`
+- **Transcript search and session resume** → `search_transcript.go`,
+  `resume_hydrate.go`, and `screen/resume.go`
+- **Terminal lifecycle** → `terminal_reset.go`, `terminal_drain_*.go`, and
+  `term_progress.go`
+- **Image input** → `image_paste.go` and `at_file_image.go`
 
-## Design invariants
+## UI-thread ownership and async-turn invariants
 
-- `Update` is the **sole writer** of `Model` state. Goroutines that need
-  state pass it by value at launch (snapshot) and return updates via
-  `tea.Msg`. Violations get caught by `go test -race ./internal/tui/...`
-  — see `runTurnAsync` comment for the canonical example.
-- Long-running work (LLM streams, agent ticks) lives in goroutines that
-  forward through `m.eventCh` / `m.doneCh`. `finalizeTurn` is where the
-  main thread reconciles their results.
+- Background goroutines must receive every needed value as a launch-time
+  snapshot and must not read or write `m.*`. Model mutations stay on Bubble
+  Tea's program goroutine.
+- `View` is not currently referentially pure: `tui_render.go` calls
+  `ensureIDs`, which may assign IDs in `messages`, `toolEvents`, and `msgSeq`.
+  Do not add more render-time mutation; new state transitions belong in
+  `Update`, and removing this lazy-backfill exception is preferable.
+- `runTurnAsync` is intentionally a free function. Its caller snapshots the
+  context, loop, event channel, and done channel before launch. Clearing the
+  Model's `turnCancel` field and `finalizeTurn` remain on the Bubble Tea
+  thread; the worker may invoke its copied cancel function when it exits.
+- After cancellation, `runTurnAsync` stops forwarding new UI events but keeps
+  draining the loop's private event stream. This lets blocked emitters exit
+  and prevents a leaked turn goroutine.
+- The done signal is sent only after the loop event stream closes. The update
+  path drains the stable event tail before `finalizeTurn`, so completion
+  cannot overtake already-forwarded deltas.
+
+Run `go test -race ./internal/tui/...` when changing these boundaries; normal
+unit tests cannot prove the absence of cross-goroutine Model access.
+
+## Streaming and backpressure
+
+One `Update` call drains at most 64 agent events. If the channel still has a
+backlog, it schedules a 1 ms continuation so queued keyboard and mouse input
+can run between bursts. A ready done signal is deferred until the backlog and
+final stable tail are applied.
+
+Streaming tool arguments are tracked in `toolArgsStreams` by `ToolUseID`, not
+in one global buffer. A result clears only its own preview, preventing
+parallel tool-call JSON fragments from mixing. Preserve that keying for any
+new streamed tool event.

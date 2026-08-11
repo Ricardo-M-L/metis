@@ -20,6 +20,8 @@ jobs:
   build:
     name: Cross-compile and upload
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ref.outputs.tag }}
     steps:
       - name: Resolve target ref
         id: ref
@@ -44,7 +46,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Cross-compile (darwin/linux × amd64/arm64)
+      - name: Cross-compile (darwin/linux/windows × amd64/arm64)
         run: make dist
 
       - name: List artifacts
@@ -60,8 +62,58 @@ jobs:
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "${TAG#v}" \
-              --notes "Automated release for $TAG"
+              --generate-notes
           fi
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            dist/metis-*.tar.gz \
-            dist/metis-*.tar.gz.sha256
+          # Build the list from assets that actually exist. This preserves the
+          # workflow_dispatch backfill path for old tags whose Makefile did not
+          # create Windows archives yet.
+          mapfile -t assets < <(find dist -maxdepth 1 -type f \
+            \( -name 'metis-*.tar.gz' -o -name 'metis-*.tar.gz.sha256' \
+               -o -name 'metis-*.zip' -o -name 'metis-*.zip.sha256' \) \
+            -print | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "no release assets found" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+
+  smoke-unix:
+    name: Anonymous install smoke (Linux)
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.tag }}
+
+      - name: Install without a GitHub token
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          install_dir="$RUNNER_TEMP/metis-bin"
+          env -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN \
+            METIS_VERSION="$TAG" METIS_INSTALL_DIR="$install_dir" \
+            bash install/install.sh
+          "$install_dir/metis" version
+
+  smoke-windows:
+    name: Anonymous install smoke (Windows)
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.tag }}
+
+      - name: Install without a GitHub token
+        shell: pwsh
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          $installDir = Join-Path $env:RUNNER_TEMP "metis-bin"
+          & ./install/install.ps1 -Version $env:TAG -InstallDir $installDir
+          & (Join-Path $installDir "metis.exe") version

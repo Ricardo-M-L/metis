@@ -275,6 +275,9 @@ Usage:
   metis run <prompt>    Non-interactive: one prompt, print result, exit
   metis config show     Print effective config + which files were read
   metis config init     Write a starter config to ~/.metis/config.toml
+  metis config schema   Write the config.toml JSON Schema
+  metis dirs            Manage additional accessible directories
+  metis projects        List known projects
   metis tools           List available tools
   metis schema          Print the tool contract (JSON Schema) — the SDK's typed surface
   metis models          List LLM providers + models from models.dev catalog
@@ -282,20 +285,26 @@ Usage:
   metis models <p> <m>  Deep-dive on a model + generate config.toml snippet
   metis sessions list   List recent saved sessions
   metis sessions timing <id>      Per-step timing breakdown of a past session
+  metis sessions branch <id>      Create a branch from a saved session
   metis sessions export <id>      Print a session's JSONL to stdout
   metis sessions import [--id ID] Read JSONL from stdin and create a new session
+  metis stats           Summarize local token and session usage
   metis skills list     List built-in skills library
   metis skills install <name>  Install a built-in skill
   metis skills curator <status|run|list-archived|restore|pin|unpin>  Manage agent-created skills
   metis desktop [--web] [--port PORT]  Launch native desktop (or legacy browser UI)
   metis acp [--addr ADDR]  Run as Agent Client Protocol server (default: stdio)
   metis mcp-serve [--mode MODE]  Run as MCP server (stdio); register with: claude mcp add metis -- metis mcp-serve
+  metis daemon [--poll DURATION] Run the file-queue daemon
+  metis ps|logs|kill|attach      Inspect and control managed processes
+  metis coordinator <dispatch|worker>  Use the filesystem coordinator MVP
   metis cron <list|add|rm|pause|resume|run|start|audit>  Manage scheduled prompts
-  metis auth <login|logout|list>  Manage provider credentials (~/.metis/auth.json)
+  metis auth <login|logout|list|oauth|keys>  Manage provider credentials
+  metis plugin <marketplace|search|install|list|info|remove>  Manage plugins
   metis audit           Print a security audit of the current configuration
   metis diag [--llm] [--tool-smoke] [--json]  Run a non-interactive health check
   metis eval [--dir DIR] [--tag T] [--out P]  Run the markdown scenario pack
-  metis update [--check]  Self-update from the private release (needs METIS_GITHUB_TOKEN)
+  metis update [--check] [--force]  Self-update from the public GitHub release
   metis version [-V]    Print version (-V for build fingerprint)
   metis env             Print the full METIS_* env-var reference
   metis help            This help
@@ -305,13 +314,13 @@ Flags (chat / run):
   -p, --provider <id>   Override provider (anthropic | openai | gemini | <custom>)
       --mode <id>       Permission mode: default | acceptEdits | plan | dontAsk | bypassPermissions
       --no-markdown     Disable markdown rendering of assistant output
-      --no-stream       Don't stream (assemble then print)
-      --max-iter <n>    Iteration cap per turn (default 150; overrides [session] max_iterations in config.toml)
+      --max-iter <n>    Iteration cap per turn (default 100; overrides [session] max_iterations in config.toml)
       --max-budget-usd <x>  Stop the session once cumulative LLM spend reaches x USD (0 = unlimited; sub-agents draw from the same pool)
       --output-schema <file>  (run) Constrain the final reply to a JSON Schema — validated locally, 2 correction retries, then exit 11
       --add-dir <path>  Add a directory to the agent's accessible scope (repeatable)
       --agent <name>    Load an agent profile from ~/.metis/agents/<name>.md
-  -W, --worktree [slug] Spawn in a fresh git worktree (slug optional)
+      --worktree <slug> Spawn chat in a fresh git worktree with this slug
+  -W                    Spawn chat in a fresh git worktree with an automatic slug
 
 Env:
   ANTHROPIC_API_KEY     Required for Anthropic provider
@@ -501,7 +510,7 @@ type cliFlags struct {
 	providerSet  bool // true when --provider/-p was present, even with an empty value
 	mode         string
 	noMarkdown   bool
-	noStream     bool
+	noStream     bool // reserved compatibility flag; currently no runtime effect
 	streamlined  bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
 	maxIter      int
 	maxBudgetUSD float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
@@ -544,12 +553,8 @@ type cliFlags struct {
 	// the Phase E daemon work where per-scope mcp.toml lookup matters.
 	scope string
 
-	// --input-format / --output-format: I/O modes for `metis run`.
-	//   * input-format=json: read JSONL from stdin, one prompt per line
-	//   * output-format=json | stream-json: emit structured events instead
-	//     of the human-readable transcript (json = single object at end;
-	//     stream-json = NDJSON during the turn)
-	// Mirrors Claude Code's `--output-format json|stream-json`.
+	// Reserved compatibility flags. They remain parseable so old wrappers do
+	// not fail flag parsing, but the current runtime does not consume them.
 	inputFormat  string
 	outputFormat string
 
@@ -570,8 +575,8 @@ type cliFlags struct {
 	// name shown in /sessions) or sugar over existing surfaces (a /batch
 	// shortcut, a tmux launcher).
 	sessionName string // --name <text>: human-friendly session label
-	agentTeams  bool   // --agent-teams: alias for /batch entry path
-	tmuxOn      bool   // --tmux: when starting a worktree, wrap the session in tmux
+	agentTeams  bool   // reserved compatibility flag; currently no runtime effect
+	tmuxOn      bool   // reserved compatibility flag; currently no runtime effect
 
 	// coordinator — Phase G.8 (2026-05-12). Flips the main loop into
 	// team-lead mode: tool palette narrows to orchestration tools and
@@ -656,7 +661,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.StringVar(&out.provider, "p", "", "provider id (shorthand)")
 	f.StringVar(&out.mode, "mode", "", "permission mode")
 	f.BoolVar(&out.noMarkdown, "no-markdown", false, "disable markdown rendering")
-	f.BoolVar(&out.noStream, "no-stream", false, "disable streaming")
+	f.BoolVar(&out.noStream, "no-stream", false, "reserved compatibility flag (currently no runtime effect)")
 	f.BoolVar(&out.streamlined, "streamlined", false, "distillation-resistant output: drop thinking, collapse tool calls into cumulative summaries (per-call override of [ui] streamlined_output)")
 	f.IntVar(&out.maxIter, "max-iter", 0, "max tool iterations per turn")
 	f.Float64Var(&out.maxBudgetUSD, "max-budget-usd", 0, "stop the session once cumulative LLM spend reaches this many USD (0 = unlimited)")
@@ -700,12 +705,11 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	// future scope-aware code reads from one cliFlags field.
 	f.StringVar(&out.scope, "scope", "", "config scope: local | user | project (default user)")
 	f.StringVar(&out.scope, "s", "", "config scope: local | user | project (short for --scope)")
-	// --input-format / --output-format: machine-readable I/O for `metis
-	// run`. Defaults stay human-readable for interactive runs.
+	// Reserved for future machine-readable `metis run` I/O.
 	f.StringVar(&out.inputFormat, "input-format", "",
-		"`metis run` input mode: json (NDJSON prompts on stdin)")
+		"reserved compatibility flag (currently no runtime effect)")
 	f.StringVar(&out.outputFormat, "output-format", "",
-		"`metis run` output mode: json | stream-json")
+		"reserved compatibility flag (currently no runtime effect)")
 	f.StringVar(&out.outputSchema, "output-schema", "",
 		"`metis run`: path to a JSON Schema the final reply must conform to (validated locally; invalid output retried up to 2x, then exit 11)")
 	// Phase E #46-#48
@@ -714,9 +718,9 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.coordinator, "coordinator", false,
 		"team-lead mode: narrow tool palette to orchestration tools (Agent / Fork / SendMessage / SubAgent* / Read / Grep / ...) and overlay a coordinator system prompt. Equivalent to setting METIS_COORDINATOR_MODE=1.")
 	f.BoolVar(&out.agentTeams, "agent-teams", false,
-		"start in agent-teams mode (a /batch shortcut surface)")
+		"reserved compatibility flag (currently no runtime effect)")
 	f.BoolVar(&out.tmuxOn, "tmux", false,
-		"when starting in a worktree, also wrap the session in a tmux pane")
+		"reserved compatibility flag (currently no runtime effect)")
 	// Auto-memory v2 — extractMemories on LoopEnd via forked agent.
 	f.BoolVar(&out.autoMemory, "auto-memory", false,
 		"enable auto-memory extraction on every turn boundary (writes to ~/.metis/memory/<topic>.md)")
@@ -3953,16 +3957,11 @@ func formatDreamStatus(ext *agent.AutoMemoryExtractor, arg string) string {
 }
 
 func writeStarterConfig() error {
-	xdg := os.Getenv("XDG_CONFIG_HOME")
-	if xdg == "" {
-		home, _ := os.UserHomeDir()
-		xdg = home + "/.config"
-	}
-	dir := xdg + "/metis"
+	dir := config.Home()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	path := dir + "/config.toml"
+	path := filepath.Join(dir, "config.toml")
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("%s already exists; not overwriting", path)
 	}
@@ -3974,7 +3973,7 @@ default = "anthropic"
 [provider.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
 model = "claude-opus-4-7"
-max_tokens = 8192
+max_tokens = 64000
 timeout_seconds = 120
 temperature = 1.0
 
@@ -3999,7 +3998,7 @@ show_tokens = true
 
 [tools.bash]
 timeout_seconds = 120
-max_output_bytes = 1048576
+max_output_bytes = 32768
 `
 	if err := os.WriteFile(path, []byte(starter), 0o644); err != nil {
 		return err

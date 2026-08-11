@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -78,7 +77,7 @@ func stopPlayer(s *PlayerState) error {
 	if err != nil {
 		return err
 	}
-	_ = proc.Signal(syscall.SIGTERM)
+	_ = terminatePlayer(proc)
 	// brief settle window
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -88,7 +87,7 @@ func stopPlayer(s *PlayerState) error {
 		time.Sleep(50 * time.Millisecond)
 	}
 	// Stubborn — escalate.
-	return proc.Signal(syscall.SIGKILL)
+	return killPlayer(proc)
 }
 
 // spawnMpv launches mpv detached so it survives metis exit. Returns
@@ -119,7 +118,7 @@ func spawnMpv(url string) (int, error) {
 	)
 	cmd.Stdout = logf
 	cmd.Stderr = logf
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	configureDetachedPlayer(cmd)
 	if err := cmd.Start(); err != nil {
 		return 0, err
 	}

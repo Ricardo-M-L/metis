@@ -1,32 +1,31 @@
 #!/usr/bin/env bash
-# metis installer — curl one-liner front-end for the PRIVATE release.
+# metis installer — curl one-liner front-end for the public release.
 #
-# Usage (curl one-liner against GitHub Contents API — the API path is
-# more reliable than raw.githubusercontent.com for private repos; we
-# saw the raw host time out where /repos/.../contents/<path> works):
+# Usage:
 #
-#   export METIS_GITHUB_TOKEN=ghp_xxx           # PAT, Contents:read on metis
 #   curl -fsSL \
-#       -H "Authorization: Bearer $METIS_GITHUB_TOKEN" \
-#       -H "Accept: application/vnd.github.raw" \
-#       https://api.github.com/repos/Ricardo-M-L/metis/contents/install/install.sh \
+#     https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.sh \
 #     | bash
 #
 # Or after cloning:
-#   METIS_GITHUB_TOKEN=ghp_xxx bash install/install.sh
+#   bash install/install.sh
 #
-# Env (all optional except the token):
-#   METIS_GITHUB_TOKEN   GitHub PAT with read access to Ricardo-M-L/metis
+# Env (all optional):
+#   METIS_GITHUB_TOKEN   GitHub PAT for a higher API rate limit
 #                        (GITHUB_TOKEN is also accepted as fallback)
 #   METIS_VERSION        Tag to install (default: latest release)
 #   METIS_INSTALL_DIR    Install destination (default: $HOME/.local/bin)
 #   METIS_REPO           Override repo (default: Ricardo-M-L/metis)
+#   METIS_GITHUB_API_BASE  Override GitHub API base (advanced)
+#   METIS_GITHUB_WEB_BASE  Override GitHub web base (advanced)
 
 set -euo pipefail
 
 readonly METIS_REPO="${METIS_REPO:-Ricardo-M-L/metis}"
 readonly METIS_VERSION="${METIS_VERSION:-latest}"
 readonly METIS_INSTALL_DIR="${METIS_INSTALL_DIR:-$HOME/.local/bin}"
+readonly METIS_GITHUB_API_BASE="${METIS_GITHUB_API_BASE:-https://api.github.com}"
+readonly METIS_GITHUB_WEB_BASE="${METIS_GITHUB_WEB_BASE:-https://github.com}"
 
 # Token: prefer dedicated env var, fall back to GITHUB_TOKEN.
 TOKEN="${METIS_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
@@ -56,44 +55,78 @@ detect_target() {
     printf '%s-%s' "$os" "$arch"
 }
 
-# Resolve "latest" or "vX.Y.Z" → release JSON.
+# Fetch release metadata. Anonymous installs resolve "latest" through the
+# public web redirect instead, avoiding GitHub REST's low shared-IP limit.
 fetch_release_json() {
     local tag="$1" url
     if [ "$tag" = "latest" ]; then
-        url="https://api.github.com/repos/${METIS_REPO}/releases/latest"
+        url="${METIS_GITHUB_API_BASE}/repos/${METIS_REPO}/releases/latest"
     else
-        url="https://api.github.com/repos/${METIS_REPO}/releases/tags/${tag}"
+        url="${METIS_GITHUB_API_BASE}/repos/${METIS_REPO}/releases/tags/${tag}"
     fi
-    curl -fsSL \
-        -H "Authorization: Bearer ${TOKEN}" \
-        -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "$url"
+    if [ -n "$TOKEN" ]; then
+        curl -fsSL \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$url"
+    else
+        curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$url"
+    fi
 }
 
-# Extract a release-asset ID by name (jq optional, fall back to grep/sed).
-asset_id_for() {
-    local json="$1" name="$2"
+release_tag_from_json() {
+    local json="$1"
     if command -v jq >/dev/null 2>&1; then
-        printf '%s' "$json" | jq -r --arg n "$name" \
-            '.assets[] | select(.name == $n) | .id'
+        printf '%s' "$json" | jq -r '.tag_name'
     else
-        # Naive but adequate: assets are flat objects with id+name fields.
-        printf '%s' "$json" | tr ',' '\n' \
-            | grep -E '"(id|name)"\s*:' \
-            | paste - - \
-            | awk -F'"' -v n="$name" '$8 == n { print $4 }'
+        printf '%s' "$json" \
+            | tr ',' '\n' \
+            | grep -E '"tag_name"' \
+            | head -n1 \
+            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
     fi
 }
 
-download_asset() {
-    local id="$1" out="$2"
-    curl -fsSL \
-        -H "Authorization: Bearer ${TOKEN}" \
-        -H "Accept: application/octet-stream" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "https://api.github.com/repos/${METIS_REPO}/releases/assets/${id}" \
-        -o "$out"
+resolve_release_tag() {
+    local requested="$1"
+    if [ "$requested" != "latest" ]; then
+        printf '%s' "$requested"
+        return
+    fi
+
+    if [ -n "$TOKEN" ]; then
+        local json
+        json="$(fetch_release_json latest)"
+        release_tag_from_json "$json"
+        return
+    fi
+
+    local latest_url resolved
+    latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "${METIS_GITHUB_WEB_BASE}/${METIS_REPO}/releases/latest")" \
+        || err "could not resolve the latest public release"
+    resolved="${latest_url##*/}"
+    resolved="${resolved%%\?*}"
+    resolved="${resolved%%#*}"
+    [ -n "$resolved" ] && [ "$resolved" != "latest" ] \
+        || err "could not resolve the latest public release tag"
+    printf '%s' "$resolved"
+}
+
+download_release_file() {
+    local tag="$1" name="$2" out="$3"
+    local url="${METIS_GITHUB_WEB_BASE}/${METIS_REPO}/releases/download/${tag}/${name}"
+    if [ -n "$TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer ${TOKEN}" "$url" -o "$out" \
+            || err "could not download ${name} from release ${tag}"
+    else
+        curl -fsSL "$url" -o "$out" \
+            || err "could not download ${name} from release ${tag}"
+    fi
 }
 
 verify_sha256() {
@@ -110,55 +143,24 @@ verify_sha256() {
 main() {
     require_cmd curl tar uname
 
-    if [ -z "$TOKEN" ]; then
-        err "$(cat <<'EOF'
-
-This is a PRIVATE repository — anonymous downloads are not possible.
-Set a GitHub Personal Access Token first:
-
-    export METIS_GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
-
-The token only needs read access to Ricardo-M-L/metis. A fine-grained
-PAT scoped to "Contents: Read-only" on this single repo is enough.
-
-EOF
-)"
-    fi
-
     local target tmpdir
     target="$(detect_target)"
     tmpdir="$(mktemp -d -t metis-install.XXXXXX)"
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" EXIT
 
-    log "fetching release info (${METIS_VERSION})"
-    local json
-    json="$(fetch_release_json "$METIS_VERSION")"
-
+    log "resolving release (${METIS_VERSION})"
     local resolved_tag
-    if command -v jq >/dev/null 2>&1; then
-        resolved_tag="$(printf '%s' "$json" | jq -r '.tag_name')"
-    else
-        resolved_tag="$(printf '%s' "$json" \
-            | tr ',' '\n' \
-            | grep -E '"tag_name"' \
-            | head -n1 \
-            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
-    fi
-    [ -n "$resolved_tag" ] || err "could not resolve release tag"
+    resolved_tag="$(resolve_release_tag "$METIS_VERSION")"
+    [ -n "$resolved_tag" ] && [ "$resolved_tag" != "null" ] \
+        || err "could not resolve release tag"
 
     local artifact="metis-${target}.tar.gz"
     local sumfile="${artifact}.sha256"
 
-    local artifact_id sum_id
-    artifact_id="$(asset_id_for "$json" "$artifact")"
-    sum_id="$(asset_id_for "$json" "$sumfile")"
-    [ -n "$artifact_id" ] || err "release ${resolved_tag} has no asset named ${artifact} — has the build workflow finished?"
-    [ -n "$sum_id" ]      || err "release ${resolved_tag} has no asset named ${sumfile}"
-
     log "installing metis ${resolved_tag} for ${target}"
-    download_asset "$artifact_id" "${tmpdir}/${artifact}"
-    download_asset "$sum_id"      "${tmpdir}/${sumfile}"
+    download_release_file "$resolved_tag" "$artifact" "${tmpdir}/${artifact}"
+    download_release_file "$resolved_tag" "$sumfile"  "${tmpdir}/${sumfile}"
     verify_sha256 "${tmpdir}/${artifact}" "${tmpdir}/${sumfile}"
 
     tar -xzf "${tmpdir}/${artifact}" -C "${tmpdir}"
@@ -172,13 +174,14 @@ EOF
     fi
     "${METIS_INSTALL_DIR}/metis" version || true
 
-    cat <<EOF
+    if [ -z "$TOKEN" ]; then
+        cat <<'EOF'
 
-Tip: keep the token in your shell rc so \`metis update\` can self-upgrade:
-
-    export METIS_GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+No GitHub token is required for public releases. If GitHub rate limits become
+a problem, set METIS_GITHUB_TOKEN and run the installer again.
 
 EOF
+    fi
 }
 
 main "$@"

@@ -98,3 +98,50 @@ jobs:
       - name: Build production desktop module
         working-directory: metis-desktop
         run: go build -tags production ./...
+
+  windows:
+    name: Windows CLI build & test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        shell: pwsh
+        run: |
+          $out = gofmt -l .
+          if ($out) {
+            throw "gofmt found unformatted files:`n$out"
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: Run CLI smoke checks
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:RUNNER_TEMP "metis.exe"
+          go build -o $binary ./cmd/metis
+          & $binary version
+          if ($LASTEXITCODE -ne 0) { throw "metis version failed" }
+          & $binary help
+          if ($LASTEXITCODE -ne 0) { throw "metis help failed" }
+
+      - name: go test
+        run: go test -count=1 -timeout 90s ./...
+
+      - name: Cross-build Windows arm64
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "windows"
+          $env:GOARCH = "arm64"
+          go build -o (Join-Path $env:RUNNER_TEMP "metis-arm64.exe") ./cmd/metis
+          if ($LASTEXITCODE -ne 0) { throw "Windows arm64 cross-build failed" }

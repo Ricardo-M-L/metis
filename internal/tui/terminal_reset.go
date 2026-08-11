@@ -2,9 +2,7 @@ package tui
 
 import (
 	"os"
-	"time"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -70,50 +68,6 @@ func resetTerminal(saved *term.State) {
 	if saved != nil {
 		_ = drainStdin(int(os.Stdin.Fd()))
 	}
-}
-
-// drainStdin reads and discards any bytes sitting in the stdin buffer.
-// Used by resetTerminal to swallow in-flight terminal events (mouse
-// reports, kitty-keyboard sequences) that the terminal queued before
-// the disable escape sequences propagated.
-//
-// Switches to nonblocking mode for the duration so a read on an empty
-// buffer returns immediately rather than parking the process — we're
-// about to os.Exit and don't want to hang there. Reverts back so the
-// next consumer (typically the shell) sees the fd in its original
-// blocking state.
-//
-// The 30ms pre-sleep gives the terminal time to actually process the
-// disable sequences we just wrote — without it, a fast mouse mover
-// can still squeeze 1-2 events into the buffer between WriteString
-// returning and our drain starting. 30ms is the floor that consistently
-// caught all events in repro testing; below 20ms still leaked
-// occasionally on Terminal.app and iTerm2.
-// Returns the total byte count drained — production code discards it,
-// but tests use the count to verify drainStdin actually read the pipe
-// content they pre-loaded.
-func drainStdin(fd int) int {
-	time.Sleep(30 * time.Millisecond)
-
-	if err := unix.SetNonblock(fd, true); err != nil {
-		return 0
-	}
-	defer func() { _ = unix.SetNonblock(fd, false) }()
-
-	buf := make([]byte, 1024)
-	drained := 0
-	// Cap iterations so a bizarre kernel state can't loop us forever.
-	// 64 × 1024 = 64KiB worth of drain capacity is far more than any
-	// terminal buffers — even a stuck mouse spamming events at 1kHz
-	// for a second fills < 30KiB of SGR reports.
-	for i := 0; i < 64; i++ {
-		n, err := unix.Read(fd, buf)
-		if n <= 0 || err != nil {
-			return drained
-		}
-		drained += n
-	}
-	return drained
 }
 
 // snapshotTerminal captures the current termios so resetTerminal can

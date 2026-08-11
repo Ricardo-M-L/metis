@@ -4,17 +4,22 @@ A Chinese version is available at [SECURITY.zh-CN.md](SECURITY.zh-CN.md).
 
 ## Supported versions
 
-Metis is on `0.x`. Only the latest minor release receives security fixes.
+Metis is on `0.x`. Security fixes are provided for the latest published
+release only. The current release line is `0.4.x`; users on that line should
+run its latest available release.
 
 | Version | Supported |
-|--------:|:---------:|
-|   0.1.x |    ✅      |
+|---|:---:|
+| Latest published `0.4.x` release | ✅ |
+| Earlier releases | ❌ |
 
 ## Reporting a vulnerability
 
 **Do not open a public GitHub issue for security problems.**
 
-Email the maintainer at `Ricardo-M-L@users.noreply.github.com` with:
+Use GitHub's
+[private vulnerability reporting form](https://github.com/Ricardo-M-L/metis/security/advisories/new).
+The report should include:
 
 - A description of the issue
 - Steps to reproduce (PoC code or commands welcome)
