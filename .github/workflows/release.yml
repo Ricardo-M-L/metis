@@ -2,85 +2,176 @@ name: Release
 
 on:
   push:
+    # GitHub tag filters are globs, so the build job performs the authoritative
+    # stable-semver check before any source is built or published.
     tags:
       - 'v*'
-  # Manual trigger lets us backfill binaries to an existing tag's release
-  # without recreating the tag.
+  # Rebuild an existing stable, version-consistent tag with the current release
+  # tooling. Existing public releases are immutable; only drafts may be updated.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re)build binaries for (e.g. v0.1.0)'
+        description: 'Existing stable tag to (re)build binaries for (e.g. v0.4.18)'
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    name: Cross-compile and upload
+    name: Validate and build all platforms
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.ref.outputs.tag }}
     steps:
-      - name: Resolve target ref
+      - name: Resolve and validate target tag
         id: ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUSH_REF: ${{ github.ref }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "ref=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag=$INPUT_TAG
           else
-            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            tag=${PUSH_REF#refs/tags/}
           fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid release tag (expected stable vX.Y.Z): $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      # For workflow_dispatch, release-tools is the current default-branch
+      # workflow commit while source is the historical tag being backfilled.
+      # On a tag push both checkouts resolve to the tagged commit.
+      - name: Check out release tooling
+        uses: actions/checkout@v4
         with:
-          ref: ${{ steps.ref.outputs.ref }}
-          # Need full history so `git describe --tags` in the Makefile picks
-          # up the tag we just checked out.
+          ref: ${{ github.sha }}
+          path: release-tools
+
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.tag }}
+          path: source
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: source/go.mod
           cache: true
+          cache-dependency-path: source/go.sum
 
-      - name: Cross-compile (darwin/linux/windows × amd64/arm64)
-        run: make dist
+      - name: Cross-compile and verify release set
+        working-directory: source
+        env:
+          TAG: ${{ steps.ref.outputs.tag }}
+        run: make -f ../release-tools/Makefile verify-dist TAG="$TAG"
 
-      - name: List artifacts
-        run: ls -lah dist/
+      - name: Upload verified workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metis-release-${{ steps.ref.outputs.tag }}
+          path: source/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
-      - name: Upload to release
+  smoke-unix-artifact:
+    name: Smoke verified Linux artifact
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: metis-release-${{ needs.build.outputs.tag }}
+          path: dist
+
+      - name: Checksum, extract, and run
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          cd dist
+          shasum -a 256 -c metis-linux-amd64.tar.gz.sha256
+          mkdir smoke
+          tar -xzf metis-linux-amd64.tar.gz -C smoke
+          reported=$(smoke/metis-linux-amd64 version | awk 'NR == 1 { print $1 }')
+          test "$reported" = "$TAG"
+
+  smoke-windows-artifact:
+    name: Smoke verified Windows artifact
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: metis-release-${{ needs.build.outputs.tag }}
+          path: dist
+
+      - name: Checksum, extract, and run
+        shell: pwsh
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          $archive = Join-Path $PWD "dist/metis-windows-amd64.zip"
+          $expected = ((Get-Content "$archive.sha256") -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Windows archive checksum mismatch" }
+          $smokeDir = Join-Path $env:RUNNER_TEMP "metis-smoke"
+          Expand-Archive -LiteralPath $archive -DestinationPath $smokeDir
+          $output = @(& (Join-Path $smokeDir "metis.exe") version)
+          if ($LASTEXITCODE -ne 0) { throw "metis.exe version failed" }
+          $reported = ($output[0] -split '\s+')[0]
+          if ($reported -ne $env:TAG) {
+            throw "metis.exe reports $reported instead of $env:TAG"
+          }
+
+  publish:
+    name: Publish only after artifact smoke tests
+    needs: [build, smoke-unix-artifact, smoke-windows-artifact]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: metis-release-${{ needs.build.outputs.tag }}
+          path: dist
+
+      - name: Require a draft, upload all assets, then publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.ref.outputs.tag }}
+          TAG: ${{ needs.build.outputs.tag }}
         run: |
-          # If we're on a fresh tag push, the release may not exist yet.
-          # gh release upload --clobber works for both fresh and backfill.
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "${TAG#v}" \
-              --generate-notes
-          fi
-          # Build the list from assets that actually exist. This preserves the
-          # workflow_dispatch backfill path for old tags whose Makefile did not
-          # create Windows archives yet.
-          mapfile -t assets < <(find dist -maxdepth 1 -type f \
-            \( -name 'metis-*.tar.gz' -o -name 'metis-*.tar.gz.sha256' \
-               -o -name 'metis-*.zip' -o -name 'metis-*.zip.sha256' \) \
-            -print | sort)
-          if [ "${#assets[@]}" -eq 0 ]; then
-            echo "no release assets found" >&2
+          mapfile -t assets < <(find dist -mindepth 1 -maxdepth 1 -type f -print | sort)
+          if [ "${#assets[@]}" -ne 12 ]; then
+            echo "expected exactly 12 verified assets, found ${#assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
 
-  smoke-unix:
+          if is_draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$is_draft" != "true" ]; then
+              echo "release $TAG is already public; refusing to replace its assets" >&2
+              exit 1
+            fi
+          else
+            # If lookup failed for any reason other than absence, creation also
+            # fails before upload. This keeps an existing public release intact.
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --title "${TAG#v}" --generate-notes
+          fi
+
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  install-smoke-unix:
     name: Anonymous install smoke (Linux)
     if: github.event_name == 'push'
-    needs: build
+    needs: [build, publish]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,12 +186,13 @@ jobs:
           env -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN \
             METIS_VERSION="$TAG" METIS_INSTALL_DIR="$install_dir" \
             bash install/install.sh
-          "$install_dir/metis" version
+          reported=$("$install_dir/metis" version | awk 'NR == 1 { print $1 }')
+          test "$reported" = "$TAG"
 
-  smoke-windows:
+  install-smoke-windows:
     name: Anonymous install smoke (Windows)
     if: github.event_name == 'push'
-    needs: build
+    needs: [build, publish]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,4 +208,9 @@ jobs:
           Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
           $installDir = Join-Path $env:RUNNER_TEMP "metis-bin"
           & ./install/install.ps1 -Version $env:TAG -InstallDir $installDir
-          & (Join-Path $installDir "metis.exe") version
+          $output = @(& (Join-Path $installDir "metis.exe") version)
+          if ($LASTEXITCODE -ne 0) { throw "installed metis.exe version failed" }
+          $reported = ($output[0] -split '\s+')[0]
+          if ($reported -ne $env:TAG) {
+            throw "installed metis.exe reports $reported instead of $env:TAG"
+          }

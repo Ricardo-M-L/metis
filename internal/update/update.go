@@ -5,6 +5,7 @@ package update
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,15 +26,22 @@ import (
 )
 
 const (
-	defaultRepo  = "Ricardo-M-L/metis"
-	userAgent    = "metis-self-update"
-	checkTimeout = 10 * time.Second
-	dlTimeout    = 5 * time.Minute
+	defaultRepo           = "Ricardo-M-L/metis"
+	userAgent             = "metis-self-update"
+	checkTimeout          = 10 * time.Second
+	dlTimeout             = 5 * time.Minute
+	verifyTimeout         = 15 * time.Second
+	maxArchiveSize  int64 = 128 << 20
+	maxExpandedSize int64 = 128 << 20
+	maxVerifyOutput       = 64 << 10
 )
 
 // apiBase is the GitHub API root. A var (not const) so apply_test.go can
 // point Apply at an httptest server instead of the real api.github.com.
-var apiBase = "https://api.github.com"
+var (
+	apiBase = "https://api.github.com"
+	webBase = "https://github.com"
+)
 
 // Repo identifies the GitHub owner/repo to query. Override via METIS_REPO.
 func Repo() string {
@@ -104,9 +113,10 @@ func ghAuthToken() string {
 }
 
 type asset struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
-	Size int64  `json:"size"`
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Size               int64  `json:"size"`
+	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
 type release struct {
@@ -120,6 +130,20 @@ type release struct {
 
 // Latest fetches the latest non-draft release.
 func Latest(ctx context.Context, token string) (*release, error) {
+	// Anonymous public updates intentionally avoid the shared-IP GitHub REST
+	// limit (60 requests/hour). The stable web redirect reveals the tag; Metis
+	// release asset names are deterministic, so no REST asset IDs are needed.
+	if strings.TrimSpace(token) == "" {
+		if r, err := latestFromPublicWeb(ctx); err == nil {
+			return r, nil
+		}
+		// Fall through to anonymous REST for GitHub-compatible mirrors that do
+		// not expose the standard web redirect.
+	}
+	return latestFromAPI(ctx, token)
+}
+
+func latestFromAPI(ctx context.Context, token string) (*release, error) {
 	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBase, Repo())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -144,6 +168,54 @@ func Latest(ctx context.Context, token string) (*release, error) {
 	return &r, nil
 }
 
+func latestFromPublicWeb(ctx context.Context) (*release, error) {
+	latestURL := strings.TrimRight(webBase, "/") + "/" + strings.Trim(Repo(), "/") + "/releases/latest"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	setAuth(req, "", "text/html")
+	resp, err := (&http.Client{Timeout: checkTimeout}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github releases web %d", resp.StatusCode)
+	}
+	prefix := "/" + strings.Trim(Repo(), "/") + "/releases/tag/"
+	if !strings.HasPrefix(resp.Request.URL.Path, prefix) {
+		return nil, fmt.Errorf("latest release redirect did not resolve to a tag: %s", resp.Request.URL.Path)
+	}
+	escapedTag := strings.TrimPrefix(resp.Request.URL.Path, prefix)
+	tag, err := url.PathUnescape(escapedTag)
+	if err != nil || tag == "" || strings.Contains(tag, "/") {
+		return nil, fmt.Errorf("invalid latest release tag %q", escapedTag)
+	}
+	if _, err := normalizeVersion(tag); err != nil {
+		return nil, err
+	}
+	return deterministicPublicRelease(tag), nil
+}
+
+func deterministicPublicRelease(tag string) *release {
+	target := Target()
+	extension := ".tar.gz"
+	if strings.HasPrefix(target, "windows-") {
+		extension = ".zip"
+	}
+	name := "metis-" + target + extension
+	base := strings.TrimRight(webBase, "/") + "/" + strings.Trim(Repo(), "/") + "/releases/download/" + url.PathEscape(tag) + "/"
+	return &release{
+		TagName: tag,
+		HTMLURL: strings.TrimRight(webBase, "/") + "/" + strings.Trim(Repo(), "/") + "/releases/tag/" + url.PathEscape(tag),
+		Assets: []asset{
+			{Name: name, BrowserDownloadURL: base + url.PathEscape(name)},
+			{Name: name + ".sha256", BrowserDownloadURL: base + url.PathEscape(name+".sha256")},
+		},
+	}
+}
+
 // targetForTest overrides Target()'s platform tag in tests. Empty in
 // production; set via t.Cleanup-restored package var in apply_test.go so
 // Apply can be exercised against a fake "test-os-arch" release without
@@ -161,7 +233,11 @@ func Target() string {
 // findAsset returns the asset whose name matches `metis-<target>.tar.gz`
 // and its sha256 sibling.
 func (r *release) findAsset(target string) (binary, sum *asset, err error) {
-	wantBin := fmt.Sprintf("metis-%s.tar.gz", target)
+	extension := ".tar.gz"
+	if strings.HasPrefix(target, "windows-") {
+		extension = ".zip"
+	}
+	wantBin := fmt.Sprintf("metis-%s%s", target, extension)
 	wantSum := wantBin + ".sha256"
 	for i := range r.Assets {
 		a := &r.Assets[i]
@@ -182,108 +258,214 @@ func (r *release) findAsset(target string) (binary, sum *asset, err error) {
 }
 
 // Apply downloads the release for the current platform, verifies its
-// sha256, and installs it using a versioned layout that mirrors claude-
-// code's self-update (2026-08-05 user request: "像 Claude Code 那样"):
+// sha256, smoke-tests its reported version, and installs it using a versioned
+// layout that mirrors Claude Code's native self-update:
 //
-//	~/.local/share/metis/versions/<semver>   — actual binary, one per version
-//	~/.local/bin/metis                       — symlink → current version
+//	Unix:    <prefix>/share/metis/versions/<semver>/metis + bin/metis symlink
+//	Windows: <install-root>/versions/<semver>/metis.exe + bin/metis.exe copy
 //
-// Why a symlink farm instead of overwriting destPath in place:
-//   - Atomic switch: the symlink swap (rename of a temp link) is atomic,
-//     so a running metis never sees a half-written binary — the old code
-//     path's atomicReplace had the same property, but only for the file
-//     itself, not for "which version is live".
-//   - Instant rollback: the previous version's directory stays on disk;
-//     repointing the symlink rolls back without a re-download.
-//   - Go-install coexistence: binaries under ~/.local/share/metis are
-//     outside $GOBIN/$GOPATH/bin, so CheckSelfPathSafe no longer refuses
-//     to manage them (the old "ErrGoInstallManaged" skip meant users who
-//     first installed via `go install` never got auto-updates).
+// Unix atomically renames a temporary symlink. Windows first renames the
+// visible executable to a rollback name, copies the verified immutable
+// version, and rolls back on failure. Both paths share the same cross-process
+// lock and retain current plus the two newest unprotected rollback versions.
 //
-// destPath is the path of the user-facing symlink (e.g. resolved from
-// SelfPath of the running binary). The parent directory of destPath is
-// where the "metis" symlink lives; the versions farm sits alongside it
-// at ../share/metis/versions (claude-code: ~/.local/bin + ~/.local/share).
+// destPath is always the stable user-facing launcher returned by SelfPath;
+// an immutable versions/<version> target is normalized back to that launcher
+// only when the managed relationship can be verified.
 func Apply(ctx context.Context, token, destPath string, r *release) error {
+	_, err := apply(ctx, token, destPath, r, false)
+	return err
+}
+
+// ApplyIfNeeded is the automatic-update variant. It avoids downloading the
+// same release after another process has already activated it while this
+// caller waited on the shared install lock. Manual `metis update --force`
+// continues to use Apply and therefore really reinstalls.
+func ApplyIfNeeded(ctx context.Context, token, destPath string, r *release) (bool, error) {
+	return apply(ctx, token, destPath, r, true)
+}
+
+func apply(ctx context.Context, token, destPath string, r *release, skipCurrent bool) (bool, error) {
+	_, layout, ok := managedLayoutForApply(destPath)
+	if !ok {
+		return false, fmt.Errorf("refusing to treat managed version target %q as launcher", destPath)
+	}
+	releaseLock, err := acquireInstallLock(ctx, layout)
+	if err != nil {
+		return false, err
+	}
+	defer releaseLock()
+	if err := reconcileActivation(layout); err != nil {
+		return false, fmt.Errorf("recover interrupted activation: %w", err)
+	}
+	cleanupStaging(layout.stagingRoot, time.Now().Add(-stagingMaxAge))
+	cleanupPlatformTemps(layout, time.Now().Add(-stagingMaxAge).UnixNano())
+	cleanupStaleLockArtifacts(layout.locksRoot, time.Now().Add(-staleLockArtifactAge))
+
 	if r == nil {
-		var err error
 		r, err = Latest(ctx, token)
 		if err != nil {
-			return err
+			return false, err
 		}
+	}
+	version, err := normalizeVersion(r.TagName)
+	if err != nil {
+		return false, err
+	}
+	// Another process may have completed this exact update while this caller
+	// waited for the cross-process lock.
+	if current, currentOK := resolveCurrentVersion(layout); skipCurrent && currentOK && current == version {
+		return false, cleanupManagedLocked(layout, time.Now())
 	}
 	target := Target()
 	binAsset, sumAsset, err := r.findAsset(target)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if binAsset.Size > maxArchiveSize {
+		return false, fmt.Errorf("release archive is too large: %d bytes (limit %d)", binAsset.Size, maxArchiveSize)
 	}
 
-	tmpDir, err := os.MkdirTemp("", "metis-update-*")
-	if err != nil {
-		return err
+	// All staging lives below managedRoot so the final version-directory rename
+	// is same-filesystem and atomic. Old staging is cleaned only by age.
+	if err := ensureDirectDirectory(layout.stagingRoot, 0o755); err != nil {
+		return false, fmt.Errorf("create staging root: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	nonce, err := randomNonce()
+	if err != nil {
+		return false, err
+	}
+	stageDir := filepath.Join(layout.stagingRoot, "install-"+nonce)
+	if err := os.Mkdir(stageDir, 0o700); err != nil {
+		return false, fmt.Errorf("create update staging directory: %w", err)
+	}
+	defer os.RemoveAll(stageDir)
 
-	tarPath := filepath.Join(tmpDir, binAsset.Name)
-	if err := downloadAsset(ctx, token, binAsset.ID, tarPath); err != nil {
-		return fmt.Errorf("download tarball: %w", err)
+	archivePath := filepath.Join(stageDir, binAsset.Name)
+	if err := downloadAsset(ctx, token, binAsset, archivePath); err != nil {
+		return false, fmt.Errorf("download release archive: %w", err)
 	}
 
-	wantSum, err := fetchSum(ctx, token, sumAsset.ID, binAsset.Name)
+	wantSum, err := fetchSum(ctx, token, sumAsset, binAsset.Name)
 	if err != nil {
-		return fmt.Errorf("fetch sha256: %w", err)
+		return false, fmt.Errorf("fetch sha256: %w", err)
 	}
-	gotSum, err := sha256File(tarPath)
+	gotSum, err := sha256File(archivePath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !strings.EqualFold(gotSum, wantSum) {
-		return fmt.Errorf("sha256 mismatch: got %s want %s", gotSum, wantSum)
+		return false, fmt.Errorf("sha256 mismatch: got %s want %s", gotSum, wantSum)
 	}
 
 	innerName := fmt.Sprintf("metis-%s", target)
-	binPath, err := extractBinary(tarPath, tmpDir, innerName)
+	if strings.HasPrefix(target, "windows-") {
+		innerName = "metis.exe"
+	}
+	binPath, err := extractReleaseBinary(archivePath, stageDir, innerName)
 	if err != nil {
-		return fmt.Errorf("extract: %w", err)
+		return false, fmt.Errorf("extract: %w", err)
 	}
 	if err := os.Chmod(binPath, 0o755); err != nil {
+		return false, err
+	}
+	if targetForTest == "" {
+		if err := verifyCandidate(ctx, binPath, version); err != nil {
+			return false, fmt.Errorf("verify downloaded binary: %w", err)
+		}
+	}
+
+	if err := ensureDirectDirectory(layout.versionsRoot, 0o755); err != nil {
+		return false, fmt.Errorf("create versions root: %w", err)
+	}
+	if err := migrateLegacyLauncher(ctx, layout); err != nil {
+		return false, err
+	}
+	versionStage := filepath.Join(layout.stagingRoot, "version-"+version+"-"+nonce)
+	if err := os.Mkdir(versionStage, 0o755); err != nil {
+		return false, fmt.Errorf("create version staging directory: %w", err)
+	}
+	defer os.RemoveAll(versionStage)
+	stagedBinary := filepath.Join(versionStage, executableName())
+	if err := moveFile(binPath, stagedBinary); err != nil {
+		return false, fmt.Errorf("stage versioned binary: %w", err)
+	}
+	versionedBin, err := installImmutableVersion(layout, version, versionStage, stagedBinary)
+	if err != nil {
+		return false, err
+	}
+	if err := activateVersion(layout, version, versionedBin); err != nil {
+		return false, err
+	}
+	// Never prune before the candidate has passed checksum/health validation
+	// and the launcher switch has succeeded. Cleanup failure does not roll back
+	// an already-atomic successful activation.
+	_ = cleanupManagedLocked(layout, time.Now())
+	return true, nil
+}
+
+func migrateLegacyLauncher(ctx context.Context, layout installLayout) error {
+	if _, managed := resolveCurrentVersion(layout); managed {
+		return nil
+	}
+	info, err := os.Lstat(layout.launcher)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-
-	// Lay out the versioned install. binDir = dir of destPath (e.g.
-	// ~/.local/bin); shareDir = sibling "share/metis/versions" (e.g.
-	// ~/.local/share/metis/versions).
-	binDir := filepath.Dir(destPath)
-	version := strings.TrimPrefix(r.TagName, "v")
-	versionsRoot := filepath.Join(filepath.Dir(binDir), "share", "metis", "versions")
-	versionDir := filepath.Join(versionsRoot, version)
-	if err := os.MkdirAll(versionDir, 0o755); err != nil {
-		return fmt.Errorf("create version dir: %w", err)
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to replace unrecognized launcher %s", layout.launcher)
 	}
-	versionedBin := filepath.Join(versionDir, "metis")
-
-	// Move the extracted binary into its version directory. Same-filesystem
-	// rename is the common case (~/.local/share is one volume); fall back
-	// to copy+rename across devices (e.g. tmp on tmpfs, home elsewhere).
-	if err := moveFile(binPath, versionedBin); err != nil {
-		return fmt.Errorf("install versioned binary: %w", err)
+	legacyVersion, output, err := reportedBinaryVersion(ctx, layout.launcher)
+	if err != nil {
+		return fmt.Errorf("verify legacy launcher before migration: %w: %s", err, output)
 	}
-
-	// Atomically repoint the symlink: build a temp symlink in binDir,
-	// then rename it over destPath. rename(2) replaces the destination
-	// atomically on POSIX, so a concurrent `metis` invocation either
-	// resolves the old link or the new one — never a missing file.
-	tmpLink := filepath.Join(binDir, ".metis-link-*")
-	tmpLink = strings.Replace(tmpLink, "*", fmt.Sprint(os.Getpid()), 1)
-	_ = os.Remove(tmpLink) // best-effort clean of a stale temp from a crash
-	if err := os.Symlink(versionedBin, tmpLink); err != nil {
-		return fmt.Errorf("create temp symlink: %w", err)
+	nonce, err := randomNonce()
+	if err != nil {
+		return err
 	}
-	if err := os.Rename(tmpLink, destPath); err != nil {
-		_ = os.Remove(tmpLink)
-		return fmt.Errorf("swap symlink: %w", err)
+	stage := filepath.Join(layout.stagingRoot, "legacy-"+legacyVersion+"-"+nonce)
+	if err := os.Mkdir(stage, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	stagedBinary := filepath.Join(stage, executableName())
+	if err := copyFile(layout.launcher, stagedBinary, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("preserve legacy launcher: %w", err)
+	}
+	_ = os.Chtimes(stagedBinary, info.ModTime(), info.ModTime())
+	if _, err := installImmutableVersion(layout, legacyVersion, stage, stagedBinary); err != nil {
+		return fmt.Errorf("preserve legacy rollback version: %w", err)
 	}
 	return nil
+}
+
+func installImmutableVersion(layout installLayout, version, stagedDir, stagedBinary string) (string, error) {
+	finalDir := filepath.Join(layout.versionsRoot, version)
+	finalBinary := versionBinary(layout, version)
+	info, err := os.Lstat(finalDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(stagedDir, finalDir); err != nil {
+			return "", fmt.Errorf("install immutable version directory: %w", err)
+		}
+		return finalBinary, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("version path %s is not a regular directory", finalDir)
+	}
+	binInfo, err := os.Lstat(finalBinary)
+	if err != nil || !binInfo.Mode().IsRegular() || binInfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("existing version %s is not a regular immutable binary", version)
+	}
+	if !sameFileContents(stagedBinary, finalBinary) {
+		return "", fmt.Errorf("existing immutable version %s differs from downloaded release", version)
+	}
+	return finalBinary, nil
 }
 
 // moveFile renames src to dst, falling back to copy+delete across
@@ -292,27 +474,23 @@ func moveFile(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
+	if err := copyFile(src, dst, 0o755); err != nil {
 		return err
 	}
 	return os.Remove(src)
 }
 
-func downloadAsset(ctx context.Context, token string, id int64, dest string) error {
-	url := fmt.Sprintf("%s/repos/%s/releases/assets/%d", apiBase, Repo(), id)
+func downloadAsset(ctx context.Context, token string, a *asset, dest string) error {
+	if a == nil {
+		return fmt.Errorf("missing release asset")
+	}
+	if a.Size > maxArchiveSize {
+		return fmt.Errorf("asset %s is too large", a.Name)
+	}
+	url := fmt.Sprintf("%s/repos/%s/releases/assets/%d", apiBase, Repo(), a.ID)
+	if strings.TrimSpace(token) == "" && a.BrowserDownloadURL != "" {
+		url = a.BrowserDownloadURL
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -329,21 +507,34 @@ func downloadAsset(ctx context.Context, token string, id int64, dest string) err
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("github API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	if resp.ContentLength > maxArchiveSize {
+		return fmt.Errorf("asset %s is too large: %d bytes", a.Name, resp.ContentLength)
+	}
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxArchiveSize+1))
+	if err != nil {
 		return err
+	}
+	if n > maxArchiveSize {
+		return fmt.Errorf("asset %s exceeds %d bytes", a.Name, maxArchiveSize)
 	}
 	return f.Close()
 }
 
 // fetchSum reads the .sha256 sidecar file and returns the hex digest for the
 // given filename. shasum format: "<hex>  <name>\n".
-func fetchSum(ctx context.Context, token string, id int64, wantName string) (string, error) {
-	url := fmt.Sprintf("%s/repos/%s/releases/assets/%d", apiBase, Repo(), id)
+func fetchSum(ctx context.Context, token string, a *asset, wantName string) (string, error) {
+	if a == nil {
+		return "", fmt.Errorf("missing checksum asset")
+	}
+	url := fmt.Sprintf("%s/repos/%s/releases/assets/%d", apiBase, Repo(), a.ID)
+	if strings.TrimSpace(token) == "" && a.BrowserDownloadURL != "" {
+		url = a.BrowserDownloadURL
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -390,6 +581,13 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func extractReleaseBinary(archivePath, tmpDir, innerName string) (string, error) {
+	if strings.HasSuffix(strings.ToLower(archivePath), ".zip") {
+		return extractZipBinary(archivePath, tmpDir, innerName)
+	}
+	return extractBinary(archivePath, tmpDir, innerName)
+}
+
 func extractBinary(tarPath, tmpDir, innerName string) (string, error) {
 	f, err := os.Open(tarPath)
 	if err != nil {
@@ -401,7 +599,8 @@ func extractBinary(tarPath, tmpDir, innerName string) (string, error) {
 		return "", err
 	}
 	defer gz.Close()
-	tr := tar.NewReader(gz)
+	tr := tar.NewReader(io.LimitReader(gz, maxExpandedSize+(1<<20)))
+	extracted := ""
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -410,30 +609,147 @@ func extractBinary(tarPath, tmpDir, innerName string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// Reject anything that would write outside tmpDir.
-		clean := filepath.Clean(hdr.Name)
-		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
-			return "", fmt.Errorf("tarball contains unsafe path: %s", hdr.Name)
+		// The release format is exactly one root-level regular binary. Do not
+		// accept a matching basename nested under an attacker-controlled path.
+		if hdr.Name != innerName || extracted != "" {
+			return "", fmt.Errorf("tarball contains unexpected entry %s", hdr.Name)
 		}
-		if filepath.Base(clean) != innerName {
-			continue
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			return "", fmt.Errorf("archive entry %s is not a regular file", hdr.Name)
+		}
+		if hdr.Size < 0 || hdr.Size > maxExpandedSize {
+			return "", fmt.Errorf("archive entry %s exceeds %d bytes", hdr.Name, maxExpandedSize)
 		}
 		out := filepath.Join(tmpDir, innerName)
-		of, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+		of, err := os.OpenFile(out, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
 		if err != nil {
 			return "", err
 		}
-		if _, err := io.Copy(of, tr); err != nil {
+		n, copyErr := io.Copy(of, io.LimitReader(tr, maxExpandedSize+1))
+		if copyErr != nil {
 			of.Close()
-			return "", err
+			_ = os.Remove(out)
+			return "", copyErr
+		}
+		if n != hdr.Size || n > maxExpandedSize {
+			of.Close()
+			_ = os.Remove(out)
+			return "", fmt.Errorf("archive entry %s has invalid extracted size", hdr.Name)
 		}
 		if err := of.Close(); err != nil {
 			return "", err
 		}
-		return out, nil
+		extracted = out
 	}
-	return "", fmt.Errorf("tarball missing %s", innerName)
+	if extracted == "" {
+		return "", fmt.Errorf("tarball missing %s", innerName)
+	}
+	return extracted, nil
 }
+
+func extractZipBinary(zipPath, tmpDir, innerName string) (string, error) {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return "", err
+	}
+	defer zr.Close()
+	if len(zr.File) != 1 {
+		return "", fmt.Errorf("zip must contain exactly one root entry named %s", innerName)
+	}
+	entry := zr.File[0]
+	if entry.Name != innerName || entry.FileInfo().IsDir() || !entry.Mode().IsRegular() {
+		return "", fmt.Errorf("zip entry must be one root-level regular file named %s", innerName)
+	}
+	if entry.UncompressedSize64 > uint64(maxExpandedSize) {
+		return "", fmt.Errorf("zip entry %s exceeds %d bytes", innerName, maxExpandedSize)
+	}
+	r, err := entry.Open()
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	out := filepath.Join(tmpDir, innerName)
+	f, err := os.OpenFile(out, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	if err != nil {
+		return "", err
+	}
+	n, copyErr := io.Copy(f, io.LimitReader(r, maxExpandedSize+1))
+	closeErr := f.Close()
+	if copyErr != nil || closeErr != nil || n != int64(entry.UncompressedSize64) || n > maxExpandedSize {
+		_ = os.Remove(out)
+		if copyErr != nil {
+			return "", copyErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		return "", fmt.Errorf("zip entry %s has invalid extracted size", innerName)
+	}
+	return out, nil
+}
+
+func verifyCandidate(ctx context.Context, binary, version string) error {
+	reported, output, err := reportedBinaryVersion(ctx, binary)
+	if err != nil {
+		return fmt.Errorf("%s version failed: %w: %s", filepath.Base(binary), err, output)
+	}
+	want, err := normalizeVersion(version)
+	if err != nil {
+		return err
+	}
+	if reported != want {
+		return fmt.Errorf("binary reported %q, expected version %s", output, want)
+	}
+	return nil
+}
+
+func reportedBinaryVersion(ctx context.Context, binary string) (version, output string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	vctx, cancel := context.WithTimeout(ctx, verifyTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(vctx, binary, "version")
+	var captured limitedBuffer
+	captured.limit = maxVerifyOutput
+	cmd.Stdout = &captured
+	cmd.Stderr = &captured
+	if err := cmd.Run(); err != nil {
+		return "", strings.TrimSpace(captured.String()), err
+	}
+	trimmed := strings.TrimSpace(captured.String())
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return "", trimmed, fmt.Errorf("empty version output")
+	}
+	first := fields[0]
+	if strings.HasPrefix(first, "v") {
+		first = strings.TrimPrefix(first, "v")
+	}
+	if err := validateNormalizedVersion(first); err != nil {
+		return "", trimmed, fmt.Errorf("invalid leading version field %q", fields[0])
+	}
+	return first, trimmed, nil
+}
+
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	original := len(p)
+	remaining := b.limit - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		_, _ = b.buf.Write(p)
+	}
+	return original, nil
+}
+
+func (b *limitedBuffer) String() string { return b.buf.String() }
 
 func setAuth(req *http.Request, token, accept string) {
 	if token = strings.TrimSpace(token); token != "" {

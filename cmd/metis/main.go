@@ -44,6 +44,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tui"
+	"github.com/Ricardo-M-L/metis/internal/update"
 	"github.com/Ricardo-M-L/metis/internal/version"
 	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
@@ -57,21 +58,40 @@ import (
 // directly.
 var defaultSystem = rtpkg.DefaultBasePrompt()
 
+var errPromptDumpComplete = errors.New("prompt dump complete")
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	// Managed installs keep immutable version binaries on disk. Register the
+	// image this process is actually running before any command can trigger an
+	// update, so housekeeping never removes an older version that still has a
+	// live session. This is intentionally independent of
+	// METIS_NO_UPDATE_CHECK: disabling network checks must not disable the
+	// local safety lock. Development/go-install binaries are a no-op.
+	releaseRunningVersion := func() {}
+	if self, err := update.SelfPath(); err == nil {
+		if release, err := update.RegisterRunningVersion(self, version.Version); err == nil && release != nil {
+			releaseRunningVersion = release
+		}
+	}
+	defer releaseRunningVersion()
 	// Wait for in-flight LLM transport dump-prompts goroutines before
 	// process exit so the JSONL file isn't missing the response side
 	// of fast `metis run` invocations. METIS_DUMP_PROMPTS off → no-op
 	// (no goroutines to wait on). 2026-05-09 fix.
 	defer transport.FlushDumps()
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
+		if errors.Is(err, errPromptDumpComplete) {
+			return
+		}
 		if !errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, "metis:", err)
 		}
 		// FlushDumps must run before os.Exit (deferred funcs are
 		// skipped on os.Exit). Call directly here too.
 		transport.FlushDumps()
+		releaseRunningVersion()
 		os.Exit(exitcode.Classify(err))
 	}
 }
@@ -1047,12 +1067,13 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// --prompt-dump: short-circuit before any LLM / channel / cron
 	// wiring. We've already done provider resolution, mode resolution,
 	// overlay assembly, allowed_dirs — i.e. exactly what would be sent
-	// to the model on turn 0. Print to stdout and exit 0; nothing
+	// to the model on turn 0. Print to stdout and return success through
+	// main so process-lifetime update locks and other defers are released; nothing
 	// downstream gets initialised. Per-section markers (=== N: Name
 	// [cache?] ===) so a token-counter can split + budget per section.
 	if flags.dumpPrompt {
 		printPromptDump(systemSections, system)
-		os.Exit(0)
+		return nil, errPromptDumpComplete
 	}
 
 	chReg := rtpkg.BuildChannelRegistry(&cfg.Channels)
@@ -1583,7 +1604,7 @@ func cmdChat(ctx context.Context, args []string) error {
 		if err := ensureTrusted(); err != nil {
 			return err
 		}
-		if notice := maybeAutoUpdate(); notice != "" {
+		if notice := maybeAutoUpdate(ctx); notice != "" {
 			tui.SetPendingUpdateNotice(notice)
 		}
 	}

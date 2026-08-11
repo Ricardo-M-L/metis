@@ -20,9 +20,9 @@ quirks. `Metis` aims for:
 - **Local-first** — persistent state stays on local disk, primarily in
   `~/.metis/` with opt-in project-local `.metis/` data. Model requests,
   configured MCP/web/channel tools, plugin marketplaces, and the
-  throttled GitHub release check (including automatic Unix updates) can
-  use the network. Set `METIS_NO_UPDATE_CHECK=1` to disable that startup
-  check and auto-update path.
+  background GitHub release check and native auto-updater can use the
+  network. Set `METIS_NO_UPDATE_CHECK=1` to disable both the automatic
+  check and install loop.
 - **Multi-provider** — native Anthropic Messages, OpenAI Chat Completions,
   and Google Gemini transports; custom profiles support compatible
   gateways plus Azure OpenAI, Vertex Anthropic, and Bedrock Anthropic
@@ -58,9 +58,11 @@ irm https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.ps1
 & "$env:LOCALAPPDATA\Programs\Metis\bin\metis.exe" version
 ```
 
-The Windows installer writes to
+The Windows installer writes the stable command to
 `%LOCALAPPDATA%\Programs\Metis\bin` by default and tells you how to add
-that directory to your user `PATH` when necessary.
+that directory to your user `PATH` when necessary. Both installers verify
+the release SHA-256 before switching the stable command to the downloaded
+version.
 
 Public releases do not require a GitHub token. `METIS_GITHUB_TOKEN` (or
 `GITHUB_TOKEN`) is optional and only raises GitHub's API rate limit. To
@@ -78,10 +80,29 @@ $env:METIS_INSTALL_DIR = "$env:LOCALAPPDATA\Programs\Metis\bin"
 irm https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.ps1 | iex
 ```
 
-On macOS and Linux, `metis update` can switch the installed versioned
-binary in place. Windows keeps `metis update --check`, but upgrading must
-rerun `install.ps1` because Windows cannot safely replace the running
-`metis.exe`.
+The bootstrap command is only needed for the first install. A native install
+uses a managed, versioned layout:
+
+- macOS/Linux: `~/.local/bin/metis` points to
+  `~/.local/share/metis/versions/<version>/metis`.
+- Windows: `%LOCALAPPDATA%\Programs\Metis\bin\metis.exe` is the stable
+  launcher; immutable copies live under
+  `%LOCALAPPDATA%\Programs\Metis\versions\<version>\metis.exe`.
+
+When interactive `metis` starts on a TTY, it immediately starts a release
+check off the startup path and repeats the check every 30 minutes while that
+process is running. A new release is downloaded, verified and installed in
+the background on macOS, Linux and Windows. The current process keeps using
+the version it started with; the next invocation uses the newly installed
+version. Set `METIS_NO_UPDATE_CHECK=1` to disable this automatic loop. The
+explicit `metis update` and `metis update --check` commands remain available
+and are not disabled by that variable.
+
+Cleanup normally keeps the active version plus the two newest rollback
+versions. A version still used by a running process is protected until a
+later cleanup, so there can temporarily be more than three version
+directories. On Windows, a renamed running launcher is likewise removed
+by a later cleanup after the process releases it.
 
 For local development, build from source:
 

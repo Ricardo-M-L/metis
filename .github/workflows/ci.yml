@@ -10,6 +10,20 @@ permissions:
   contents: read
 
 jobs:
+  dist:
+    name: Cross-platform dist & manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and verify all release assets
+        run: make verify-dist
+
   test:
     name: Build & test
     runs-on: ${{ matrix.os }}

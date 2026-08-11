@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -154,24 +156,69 @@ func MarkNotified(configHome, tag string) {
 	saveState(sp, st)
 }
 
-// SelfPath returns the absolute path to the running metis binary as the
-// user invoked it — symlinks are NOT resolved. The versioned self-update
-// (Apply) installs binaries under ~/.local/share/metis/versions/<ver> and
-// repoints a symlink at ~/.local/bin/metis; resolving the symlink here
-// would return the version-directory path, and Apply would then try to
-// swap a symlink *inside* the farm instead of the user-facing link.
-// Returning the unresolved path keeps the swap target stable across
-// upgrades (claude-code does the same: ~/.local/bin/claude stays the
-// symlink, versions live in ~/.local/share/claude/versions).
+// SelfPath returns the stable user-facing launcher. It verifies argv[0]/PATH
+// candidates against os.Executable and, when Linux has already resolved the
+// symlink to versions/<version>/metis, derives and verifies <prefix>/bin/metis.
+// It never returns a managed immutable version target as the update
+// destination. Windows returns the stable visible bin/metis.exe launcher.
 func SelfPath() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	// os.Executable on darwin/linux already returns the path used to
-	// launch (may itself be a symlink); we deliberately skip
-	// filepath.EvalSymlinks so the symlink path is preserved.
-	return exe, nil
+	// An explicit install directory is the strongest launcher hint, but only
+	// trust it when it resolves to the same file as os.Executable.
+	if installDir := strings.TrimSpace(os.Getenv("METIS_INSTALL_DIR")); installDir != "" {
+		candidate := filepath.Join(installDir, executableName())
+		if sameFile(candidate, exe) {
+			abs, absErr := filepath.Abs(candidate)
+			if absErr == nil {
+				return abs, nil
+			}
+		}
+	}
+	return resolveSelfPath(os.Args[0], exe, exec.LookPath)
+}
+
+// resolveSelfPath recovers the stable user-facing launcher without assuming
+// os.Executable preserves argv[0]. Linux /proc/self/exe normally resolves a
+// launcher symlink to versions/<version>/metis, while Apply must always switch
+// <prefix>/bin/metis. Every argv/PATH candidate is verified to identify the
+// same file; an unverified managed version target is rejected rather than used
+// as a launcher.
+func resolveSelfPath(argv0, executable string, lookPath func(string) (string, error)) (string, error) {
+	executable, err := filepath.Abs(executable)
+	if err != nil {
+		return "", err
+	}
+
+	var candidate string
+	if argv0 != "" {
+		if filepath.IsAbs(argv0) || filepath.Dir(argv0) != "." {
+			candidate, _ = filepath.Abs(argv0)
+		} else if lookPath != nil {
+			if found, lookErr := lookPath(argv0); lookErr == nil && found != "" {
+				candidate, _ = filepath.Abs(found)
+			}
+		}
+	}
+	if candidate != "" && sameFile(candidate, executable) {
+		_, isImmutableTarget := launcherFromVersionExecutableShape(candidate)
+		_, isBackupTarget := launcherFromBackupExecutableShape(candidate)
+		if !isImmutableTarget && !isBackupTarget {
+			return candidate, nil
+		}
+	}
+	if launcher, ok := managedLauncherForExecutable(executable); ok {
+		return launcher, nil
+	}
+	if _, isImmutableTarget := launcherFromVersionExecutableShape(executable); isImmutableTarget {
+		return "", fmt.Errorf("running from managed version %s but stable launcher could not be verified", executable)
+	}
+	if _, isBackupTarget := launcherFromBackupExecutableShape(executable); isBackupTarget {
+		return "", fmt.Errorf("running from managed backup %s but stable launcher could not be verified", executable)
+	}
+	return executable, nil
 }
 
 // ErrGoInstallManaged is returned when SelfPath points at $GOBIN/$GOPATH/bin,

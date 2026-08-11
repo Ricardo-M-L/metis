@@ -359,24 +359,40 @@ under the configured Metis home.
 macOS, Linux and Windows on amd64 and arm64. Unix assets are `.tar.gz`; Windows
 assets are `.zip` archives containing `metis.exe`.
 
-- `install/install.sh` is the macOS/Linux installer. It resolves a public
+- `install/install.sh` is the macOS/Linux bootstrap. It resolves a public
   GitHub release, downloads the matching archive and `.sha256`, verifies it,
-  and installs to `METIS_INSTALL_DIR` (default `~/.local/bin`).
-- `install/install.ps1` is the Windows installer. It resolves the matching
-  Windows zip, verifies SHA-256 and stages/replaces `metis.exe` in the selected
-  install directory.
-- Public releases work anonymously. `METIS_GITHUB_TOKEN` or `GITHUB_TOKEN` is
-  optional for higher API limits or an authenticated repository override.
-- On Unix, `metis update` uses the same release metadata/assets and a versioned
-  layout under `~/.local/share/metis/versions`, switching the user-facing
-  binary atomically by symlink.
-- A running Windows executable is not replaced by `metis update`; the command
-  directs the user to the checksummed PowerShell installer. Windows release
-  support and Windows in-process self-replacement are separate capabilities.
-- Interactive TTY chat performs a throttled best-effort release check. On a
-  safe Unix-managed install it may install the new version for the next restart;
-  otherwise it shows a notice. Windows performs the check but not silent
-  replacement. `METIS_NO_UPDATE_CHECK=1` disables startup checks.
+  stages an immutable version under `~/.local/share/metis/versions/<version>`
+  by default, and atomically switches `~/.local/bin/metis` to that binary.
+  `METIS_INSTALL_DIR` changes the launcher directory; the managed data root is
+  the sibling `share/metis` directory below the same prefix.
+- `install/install.ps1` is the Windows bootstrap. It verifies and stages the
+  matching Windows zip under `<install-root>\versions\<version>`, keeps
+  `<install-root>\bin\metis.exe` as the stable launcher, and records the
+  selected version in `<install-root>\current-version`. If the launcher is
+  already running, Windows permits it to be renamed before the verified new
+  launcher is copied into place; the old copy is deleted immediately when
+  possible or by a later cleanup after the process exits.
+- Public installation and update work anonymously. `METIS_GITHUB_TOKEN` or
+  `GITHUB_TOKEN` is optional and is used only when a higher GitHub API rate
+  limit or an authenticated repository override is needed.
+- The bootstrap installers and `metis update` share the versioned lifecycle:
+  checksum and binary-version verification, staging before activation, a
+  cross-process install lock, atomic/best-effort rollback-safe launcher
+  switching, and post-switch cleanup. A recognized legacy flat Metis binary is
+  migrated into the managed store as a rollback version; an unrelated or
+  ambiguous launcher is not overwritten.
+- Cleanup keeps the current version plus the two newest inactive rollback
+  versions. Process-lifetime version locks protect binaries still in use;
+  ambiguous launcher or lock state causes cleanup to retain rather than
+  delete. Protected running versions can therefore temporarily raise the
+  on-disk count above three.
+- Interactive TTY chat starts the updater asynchronously, checks immediately,
+  then checks every 30 minutes while the process remains alive. Successful
+  downloads are activated for the next invocation, so the running process is
+  never replaced underneath itself. Errors remain non-fatal and do not block
+  TUI startup. `METIS_NO_UPDATE_CHECK=1` disables this automatic check/install
+  loop but does not disable the explicit `metis update` and
+  `metis update --check` commands.
 - `install/npm/` remains a private/local-development wrapper and is not the
   documented public install path.
 

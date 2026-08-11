@@ -22,10 +22,18 @@ func TestLatestSupportsAnonymousPublicRelease(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
 	})
+	mux.HandleFunc("/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/"+Repo()+"/releases/tag/v9.9.9", http.StatusFound)
+	})
+	mux.HandleFunc("/"+Repo()+"/releases/tag/v9.9.9", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
 	oldAPI := apiBase
+	oldWeb := webBase
 	apiBase = server.URL
-	t.Cleanup(func() { apiBase = oldAPI })
+	webBase = server.URL
+	t.Cleanup(func() { apiBase, webBase = oldAPI, oldWeb })
 
 	got, err := Latest(context.Background(), "")
 	if err != nil {
@@ -69,10 +77,18 @@ func TestMaybeCheckSupportsAnonymousPublicRelease(t *testing.T) {
 	mux.HandleFunc("/repos/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
 	})
+	mux.HandleFunc("/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/"+Repo()+"/releases/tag/v9.9.9", http.StatusFound)
+	})
+	mux.HandleFunc("/"+Repo()+"/releases/tag/v9.9.9", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
 	oldAPI := apiBase
+	oldWeb := webBase
 	apiBase = server.URL
-	t.Cleanup(func() { apiBase = oldAPI })
+	webBase = server.URL
+	t.Cleanup(func() { apiBase, webBase = oldAPI, oldWeb })
 
 	if got := MaybeCheck(context.Background(), t.TempDir(), "0.1.0"); got != "v9.9.9" {
 		t.Fatalf("MaybeCheck without token = %q, want v9.9.9", got)
@@ -102,6 +118,13 @@ func TestIsNewer(t *testing.T) {
 		if got != tc.newer {
 			t.Errorf("IsNewer(%q,%q) = %v, want %v", tc.have, tc.want, got, tc.newer)
 		}
+	}
+}
+
+func TestNormalizeVersionAllowsSemverBuildMetadata(t *testing.T) {
+	got, err := normalizeVersion("v1.2.3+build.7")
+	if err != nil || got != "1.2.3+build.7" {
+		t.Fatalf("normalizeVersion = %q, %v", got, err)
 	}
 }
 

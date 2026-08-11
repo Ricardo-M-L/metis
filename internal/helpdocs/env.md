@@ -101,7 +101,7 @@ are kept in a separate section at the end.
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_NO_UPDATE_CHECK` | off | Set to `1` to suppress the throttled startup update check. It does not disable an explicit `metis update`. |
+| `METIS_NO_UPDATE_CHECK` | off | Set to `1` to disable the interactive TTY background update loop, which checks at startup and about every 30 minutes; a successful install takes effect on the next invocation. Explicit `metis update` commands remain enabled. |
 | `METIS_REPO` | `Ricardo-M-L/metis` | Override the GitHub `owner/repo` used for release checks and updates. |
 | `METIS_GITHUB_TOKEN` | unset | Preferred GitHub token for update requests. Resolution then falls back to `GITHUB_TOKEN` and finally `gh auth token`; public releases work anonymously. |
 

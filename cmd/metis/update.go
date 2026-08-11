@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	gort "runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -16,99 +16,174 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
-// maybeAutoUpdate runs at TUI/REPL startup. It throttles release checks and,
-// when a newer release exists, downloads and installs it on supported Unix
-// silently in the background. Errors are swallowed; this should never block
-// the user.
-//
-// Returns the formatted notice string (empty when up-to-date, check errored,
-// or auto-update is disabled). Caller surfaces the notice. For TUI we stash
-// it via tui.SetPendingUpdateNotice so it lands as an info row inside
-// alt-screen.
-//
-// Disable with METIS_NO_UPDATE_CHECK=1.
-func maybeAutoUpdate() string {
-	if os.Getenv("METIS_NO_UPDATE_CHECK") == "1" {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	tag := update.MaybeCheck(ctx, config.Home(), version.Version)
-	if tag == "" {
-		return ""
-	}
-	update.MarkNotified(config.Home(), tag)
+const (
+	autoUpdateInterval            = 30 * time.Minute
+	autoUpdateHousekeepingTimeout = 5 * time.Second
+)
 
-	// Attempt silent auto-install. If it fails (go-install managed,
-	// network error, etc.), fall back to the manual notice.
-	if notice := tryAutoInstall(tag); notice != "" {
-		return notice
-	}
-
-	var notice string
-	if gort.GOOS == "windows" {
-		notice = fmt.Sprintf("metis %s available (current: %s) — install with: %s",
-			strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"), windowsInstallCommand(tag))
-	} else {
-		notice = fmt.Sprintf("metis %s available (current: %s) — run `metis update` to install",
-			strings.TrimPrefix(tag, "v"), strings.TrimPrefix(version.Version, "v"))
-	}
-	fmt.Fprintf(os.Stderr, "\033[33m[update]\033[0m %s\n", notice)
-	return notice
+// autoUpdateDependencies keeps the scheduler deterministic in tests. The
+// production functions are assembled in defaultAutoUpdateDependencies; the
+// loop itself never reaches out to global clocks or the network directly.
+type autoUpdateDependencies struct {
+	check          func(context.Context) string
+	install        func(context.Context, string) (autoUpdateInstallResult, error)
+	cleanupManaged func(context.Context)
+	markNotified   func(string)
+	notify         func(string)
+	wait           func(context.Context, time.Duration) bool
 }
 
-// tryAutoInstall attempts to download and install the given tag without
-// user interaction. Returns a notice string on success, empty on failure.
-//
-// Locking: ~/.metis/.update.lock prevents concurrent auto-installs across
-// metis processes. The lock is best-effort — failure to acquire just skips
-// this round.
-func tryAutoInstall(tag string) string {
-	// Windows cannot atomically replace a running .exe and the Unix updater
-	// uses a symlink-based version farm. Keep the background check enabled,
-	// but leave installation to the signed/checksummed PowerShell installer.
-	if gort.GOOS == "windows" {
-		return ""
-	}
-	token := update.Token()
+type autoUpdateInstallResult struct {
+	installed bool
+	notice    string
+}
 
-	// Best-effort lock: create exclusively, 5-minute expiry.
-	lockPath := filepath.Join(config.Home(), ".update.lock")
-	if f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644); err != nil {
-		// Lock held by another process — check if it's stale.
-		if info, err2 := os.Stat(lockPath); err2 == nil && time.Since(info.ModTime()) > 5*time.Minute {
-			_ = os.Remove(lockPath)
-		} else {
-			return ""
+type autoUpdaterStarter struct {
+	once sync.Once
+}
+
+var processAutoUpdater autoUpdaterStarter
+
+func defaultAutoUpdateDependencies() autoUpdateDependencies {
+	return autoUpdateDependencies{
+		check: func(ctx context.Context) string {
+			return update.MaybeCheck(ctx, config.Home(), version.Version)
+		},
+		install: tryAutoInstall,
+		cleanupManaged: func(ctx context.Context) {
+			self, err := update.SelfPath()
+			if err != nil {
+				return
+			}
+			cleanupCtx, cancel := context.WithTimeout(ctx, autoUpdateHousekeepingTimeout)
+			defer cancel()
+			_ = update.CleanupManaged(cleanupCtx, self)
+		},
+		markNotified: func(tag string) {
+			update.MarkNotified(config.Home(), tag)
+		},
+		wait: waitForAutoUpdate,
+	}
+}
+
+// maybeAutoUpdate starts the process-lifetime updater and returns immediately.
+// The string return is retained for compatibility with the existing chat
+// startup call. The background goroutine never writes directly to the active
+// Bubble Tea terminal; after an install, the next launch simply uses the new
+// version. Network and install failures are silent. Disable the loop with
+// METIS_NO_UPDATE_CHECK=1.
+func maybeAutoUpdate(ctx context.Context) string {
+	processAutoUpdater.start(ctx, defaultAutoUpdateDependencies())
+	return ""
+}
+
+// start launches at most one updater loop without performing any network or
+// filesystem work on the caller's goroutine. Keeping the Once on an instance
+// makes the process singleton deterministic in tests without resetting a
+// package global while another goroutine may still be alive.
+func (s *autoUpdaterStarter) start(ctx context.Context, deps autoUpdateDependencies) bool {
+	if os.Getenv("METIS_NO_UPDATE_CHECK") == "1" {
+		return false
+	}
+	started := false
+	s.once.Do(func() {
+		started = true
+		go runAutoUpdateLoop(ctx, deps)
+	})
+	return started
+}
+
+func runAutoUpdateLoop(ctx context.Context, deps autoUpdateDependencies) {
+	handledTag := ""
+	for {
+		if ctx.Err() != nil {
+			return
 		}
-	} else {
-		f.Close()
-		defer os.Remove(lockPath)
-	}
 
+		tag := ""
+		if deps.check != nil {
+			tag = deps.check(ctx)
+		}
+		// The running process still reports the version it started with after
+		// the launcher is switched. Remember a handled tag so the 30-minute
+		// check does not ask the core updater about it repeatedly.
+		if tag != "" && tag != handledTag && deps.install != nil {
+			result, err := deps.install(ctx, tag)
+			if err == nil {
+				// installed=false means another process won the shared lock and
+				// already activated this tag. It is handled for this process, but
+				// must not produce a false "installed" notification.
+				handledTag = tag
+				if result.installed {
+					if deps.markNotified != nil {
+						deps.markNotified(tag)
+					}
+					if result.notice != "" && deps.notify != nil {
+						deps.notify(result.notice)
+					}
+				}
+			}
+		}
+		// Cleanup is useful even when there is no new release: a version
+		// protected by another process during the previous update becomes
+		// eligible after that process exits.
+		if deps.cleanupManaged != nil {
+			deps.cleanupManaged(ctx)
+		}
+
+		if deps.wait == nil || !deps.wait(ctx, autoUpdateInterval) {
+			return
+		}
+	}
+}
+
+func waitForAutoUpdate(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// tryAutoInstall downloads and installs the latest release without user
+// interaction. update.ApplyIfNeeded owns the cross-process install lock and
+// the platform-specific atomic switch; that keeps automatic and manual
+// updates on the same path, including Windows. The running process is left
+// untouched and observes the new version only after restart.
+func tryAutoInstall(ctx context.Context, tag string) (autoUpdateInstallResult, error) {
+	token := update.Token()
 	self, err := update.SelfPath()
 	if err != nil {
-		return ""
+		return autoUpdateInstallResult{}, err
 	}
 	if err := update.CheckSelfPathSafe(self); err != nil {
-		// go-install managed or unsafe path — skip auto-install.
-		return ""
+		return autoUpdateInstallResult{}, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	installCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	rel, err := update.Latest(ctx, token)
+	rel, err := update.Latest(installCtx, token)
 	if err != nil {
-		return ""
+		return autoUpdateInstallResult{}, err
 	}
-	if err := update.Apply(ctx, token, self, rel); err != nil {
-		return ""
+	installed, err := update.ApplyIfNeeded(installCtx, token, self, rel)
+	if err != nil {
+		return autoUpdateInstallResult{}, err
+	}
+	if !installed {
+		return autoUpdateInstallResult{}, nil
 	}
 
+	installedTag := rel.TagName
+	if installedTag == "" {
+		installedTag = tag
+	}
 	notice := fmt.Sprintf("metis %s installed (restart to apply)",
-		strings.TrimPrefix(rel.TagName, "v"))
-	fmt.Fprintf(os.Stderr, "\033[32m[update]\033[0m %s\n", notice)
-	return notice
+		strings.TrimPrefix(installedTag, "v"))
+	return autoUpdateInstallResult{installed: true, notice: notice}, nil
 }
 
 func cmdUpdate(ctx context.Context, args []string) error {
@@ -127,7 +202,7 @@ Flags:
 
 Other env:
   METIS_REPO              Override repo (default: Ricardo-M-L/metis)
-  METIS_NO_UPDATE_CHECK=1 Disable the throttled startup check (does not affect this command)`)
+  METIS_NO_UPDATE_CHECK=1 Disable the interactive background update loop (does not affect this command)`)
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -147,11 +222,7 @@ Other env:
 		if update.IsNewer(cur, rel.TagName) {
 			fmt.Printf("update available: %s -> %s\n", cur, latest)
 			fmt.Printf("  release: %s\n", rel.HTMLURL)
-			if gort.GOOS == "windows" {
-				fmt.Printf("  install with: %s\n", windowsInstallCommand(rel.TagName))
-			} else {
-				fmt.Printf("  run `metis update` to install\n")
-			}
+			fmt.Printf("  run `metis update` to install\n")
 			return nil
 		}
 		fmt.Printf("metis %s is up to date\n", cur)
@@ -160,14 +231,6 @@ Other env:
 		fmt.Printf("metis %s is already the latest release\n", cur)
 		fmt.Printf("(use --force to reinstall)\n")
 		return nil
-	}
-
-	if gort.GOOS == "windows" {
-		return fmt.Errorf(`automatic replacement of a running Windows executable is not supported
-
-Install %s with the checksummed PowerShell installer:
-
-  %s`, latest, windowsInstallCommand(rel.TagName))
 	}
 
 	self, err := update.SelfPath()
@@ -189,14 +252,9 @@ You appear to have installed metis with `+"`go install`"+`. To upgrade, run:
 	if err := update.Apply(ctx, token, self, rel); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
-	versionedBin := filepath.Join(filepath.Dir(filepath.Dir(self)), "share", "metis", "versions", latest, "metis")
-	fmt.Printf("installed metis %s → %s (symlink → %s)\n", latest, self, versionedBin)
+	fmt.Printf("installed metis %s; restart running sessions to use it\n", latest)
 	warnIfGoBinShadows()
 	return nil
-}
-
-func windowsInstallCommand(tag string) string {
-	return fmt.Sprintf("$env:METIS_VERSION='%s'; irm https://raw.githubusercontent.com/Ricardo-M-L/metis/%s/install/install.ps1 | iex", tag, tag)
 }
 
 // warnIfGoBinShadows prints a heads-up when a second metis binary exists

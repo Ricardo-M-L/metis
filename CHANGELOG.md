@@ -19,6 +19,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - **Windows CI**: native Windows vet/build/test, installer regression tests,
   CLI smoke checks, and an arm64 cross-build now gate changes. Tag releases
   also run anonymous Linux and Windows installation smokes.
+- **cross-platform background updates**: interactive TTY chat now starts the
+  native updater off the startup path, checks immediately and every 30 minutes,
+  and installs verified releases for the next invocation on macOS, Linux and
+  Windows. `METIS_NO_UPDATE_CHECK=1` disables the automatic loop without
+  disabling explicit `metis update` commands.
 
 ### Changed
 
@@ -28,15 +33,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - **documentation refresh**: public, contributor, security, architecture,
   CLI/env/slash, desktop/editor, and internal package documentation now tracks
   the current runtime and avoids unstable hand-maintained inventory counts.
-- **Windows update boundary**: `metis update --check` remains available on
-  Windows, while installation directs users to the PowerShell installer
-  instead of attempting an unsafe in-process replacement of a running EXE.
+- **managed native installs**: the curl and PowerShell bootstraps and
+  `metis update` now share a staged, checksummed version lifecycle and stable
+  launcher. Cleanup keeps the current version plus the two newest rollback
+  versions, protects versions still used by running processes, and defers
+  deletion of locked Windows launcher backups until a later cleanup.
 
 ### Fixed
 
-- **public installation and self-update**: `install/install.sh`, startup update
-  checks, and `metis update` now work anonymously against the public GitHub
-  release. `METIS_GITHUB_TOKEN` remains optional for higher API rate limits.
+- **public installation and self-update**: `install/install.sh`,
+  `install/install.ps1`, background updates, and `metis update` now work
+  anonymously against the public GitHub release. `METIS_GITHUB_TOKEN` and
+  `GITHUB_TOKEN` remain optional for higher API rate limits.
 - **config initialization**: `metis config init` now writes to the canonical
   `METIS_HOME`/`~/.metis` path and uses the current safe Bash output default.
 - **prompt-dump redaction**: Gemini's `x-goog-api-key` header is now redacted

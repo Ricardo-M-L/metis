@@ -1,6 +1,7 @@
 .PHONY: build install test clean run dev fmt vet tidy dist \
-        bump-patch bump-minor bump-major sync-version print-version \
-        release-patch release-minor release-major
+		verify-version verify-dist \
+		bump-patch bump-minor bump-major sync-version print-version \
+		release-patch release-minor release-major
 
 BIN_NAME := metis
 PKG := github.com/Ricardo-M-L/metis
@@ -10,12 +11,12 @@ PKG := github.com/Ricardo-M-L/metis
 # do NOT touch it — they just read. To advance the version number, run one of
 # the explicit bump targets below.
 #
-# If we're inside a real git repo with tags, `git describe` overrides the file
-# (and gets the dirty-suffix etc for free).
 VERSION_FILE := VERSION
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || cat $(VERSION_FILE) 2>/dev/null || echo "0.1.0")
+VERSION := $(shell cat $(VERSION_FILE) 2>/dev/null || echo "0.1.0")
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+MAKEFILE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+VERIFY_DIST := $(MAKEFILE_DIR)/scripts/verify-dist.sh
 
 LDFLAGS := -ldflags "-s -w \
 	-X $(PKG)/internal/version.Version=$(VERSION) \
@@ -56,6 +57,9 @@ clean:
 
 print-version:
 	@echo $(VERSION)
+
+verify-version:
+	@"$(VERIFY_DIST)" --repo "$(CURDIR)" --metadata-only $(if $(TAG),--tag "$(TAG)")
 
 # ---- Version bumping (opt-in) -----------------------------------------------
 # Default behavior: build/install never advance the version. To bump, run one
@@ -98,8 +102,10 @@ release-minor: bump-minor install
 release-major: bump-major install
 
 # Cross-compile the GitHub Release assets. Unix targets use tar.gz; Windows
-# targets use zip so the archive works with built-in PowerShell tooling.
-dist: clean
+# targets use zip so the archive works with built-in PowerShell tooling. Raw
+# binaries are removed after packing so dist/ is exactly the 12 files uploaded
+# to GitHub (six archives and six checksum sidecars).
+dist: clean verify-version
 	mkdir -p dist
 	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-darwin-arm64  ./cmd/metis
 	CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-darwin-amd64  ./cmd/metis
@@ -107,10 +113,13 @@ dist: clean
 	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-linux-amd64   ./cmd/metis
 	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-windows-arm64.exe ./cmd/metis
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o dist/$(BIN_NAME)-windows-amd64.exe ./cmd/metis
-	cd dist && for f in $(BIN_NAME)-darwin-* $(BIN_NAME)-linux-*; do \
-		tar czf $$f.tar.gz $$f && shasum -a 256 $$f.tar.gz > $$f.tar.gz.sha256; \
+	cd dist || exit 1; set -e; for f in $(BIN_NAME)-darwin-* $(BIN_NAME)-linux-*; do \
+		tar czf $$f.tar.gz $$f && shasum -a 256 $$f.tar.gz > $$f.tar.gz.sha256 && rm $$f; \
 	done
-	cd dist && for f in $(BIN_NAME)-windows-*.exe; do \
+	cd dist || exit 1; set -e; for f in $(BIN_NAME)-windows-*.exe; do \
 		archive=$${f%.exe}.zip; cp $$f metis.exe; zip -q $$archive metis.exe; rm metis.exe; \
-		shasum -a 256 $$archive > $$archive.sha256; \
+		shasum -a 256 $$archive > $$archive.sha256; rm $$f; \
 	done
+
+verify-dist: dist
+	@"$(VERIFY_DIST)" --repo "$(CURDIR)" $(if $(TAG),--tag "$(TAG)")
