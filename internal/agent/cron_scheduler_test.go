@@ -193,6 +193,52 @@ func TestCronSchedulerDoesNotHoldLockDuringOnFire(t *testing.T) {
 	once.Do(func() { close(release) })
 }
 
+func TestCronStopWaitsForSchedulerExit(t *testing.T) {
+	svc, err := NewCronService(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.refreshInterval = 5 * time.Millisecond
+	job := &CronJob{
+		ID: "stop-waits", Name: "stop waits", Prompt: "work", Enabled: true, Repeat: 1,
+		Schedule: CronSchedule{Kind: "every", EveryMs: 5},
+	}
+	if err := svc.Create(job); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	svc.Start(context.Background(), func(*CronJob) error {
+		close(entered)
+		<-release
+		return nil
+	})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler did not enter callback")
+	}
+
+	stopReturned := make(chan struct{})
+	go func() {
+		svc.Stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+		t.Fatal("Stop returned while the scheduler callback was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after the scheduler callback exited")
+	}
+}
+
 func TestCronServiceSnapshotsAreIndependentAndRaceFree(t *testing.T) {
 	svc, err := NewCronService(t.TempDir())
 	if err != nil {

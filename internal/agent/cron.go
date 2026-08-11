@@ -137,6 +137,7 @@ type CronService struct {
 	root    string
 	jobs    map[string]*CronJob
 	done    chan struct{}
+	stopped chan struct{}
 	running bool // true while a schedulerLoop goroutine owns `done`
 
 	// refreshInterval bounds how long a running daemon can retain a stale
@@ -707,19 +708,25 @@ func (s *CronService) Start(ctx context.Context, onFire func(*CronJob) error) {
 		s.mu.Unlock()
 		return
 	}
-	s.done = make(chan struct{})
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	s.done = done
+	s.stopped = stopped
 	s.running = true
 	s.mu.Unlock()
 
 	go func() {
-		s.schedulerLoop(ctx, onFire)
+		s.schedulerLoop(ctx, onFire, done)
 		s.mu.Lock()
-		s.running = false
+		if s.done == done {
+			s.running = false
+		}
+		close(stopped)
 		s.mu.Unlock()
 	}()
 }
 
-func (s *CronService) schedulerLoop(ctx context.Context, onFire func(*CronJob) error) {
+func (s *CronService) schedulerLoop(ctx context.Context, onFire func(*CronJob) error, done <-chan struct{}) {
 	refreshInterval := s.refreshInterval
 	if refreshInterval <= 0 {
 		refreshInterval = defaultCronRefreshInterval
@@ -749,7 +756,7 @@ func (s *CronService) schedulerLoop(ctx context.Context, onFire func(*CronJob) e
 		case <-ctx.Done():
 			timer.Stop()
 			return
-		case <-s.done:
+		case <-done:
 			timer.Stop()
 			return
 		case <-timer.C:
@@ -813,14 +820,25 @@ func (s *CronService) claimDueJob(id string, now time.Time) (*CronJob, error) {
 	return fired, err
 }
 
-// Stop halts the scheduler.
+// Stop halts the scheduler and waits for its goroutine to exit. Waiting keeps
+// callers from tearing down the storage root while a final persistence pass is
+// still in flight.
 func (s *CronService) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if !s.running {
+		s.mu.Unlock()
+		return
+	}
+	done := s.done
+	stopped := s.stopped
 	select {
-	case <-s.done:
+	case <-done:
 	default:
-		close(s.done)
+		close(done)
+	}
+	s.mu.Unlock()
+	if stopped != nil {
+		<-stopped
 	}
 }
 
