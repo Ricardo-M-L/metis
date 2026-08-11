@@ -45,6 +45,14 @@ func newTestExtractor(t *testing.T, prov llm.Provider, root string) (*Loop, *Aut
 		}
 	}
 	ext.SetSessionsDir(sessDir)
+	// OnLoopEnd intentionally detaches its fork from the caller. Register this
+	// after the fixture TempDirs so it runs first and joins any final index,
+	// hygiene, curator, or dream-lock writes before those directories vanish.
+	t.Cleanup(func() {
+		waitFor(t, 2*time.Second, func() bool {
+			return !ext.Stats().InProgress && ForkInflight() == 0
+		})
+	})
 	return loop, ext
 }
 
@@ -100,9 +108,12 @@ func TestAutoMemoryExtractor_OnLoopEnd_TriggersAndAdvancesCursor(t *testing.T) {
 	loop.mu.Unlock()
 
 	ext.OnLoopEnd(context.Background(), "end_turn")
-	// The fork goroutine is async; wait for it.
+	// TotalExtractions advances before index regeneration and deferred
+	// filesystem cleanup. Wait for the full fork lifecycle so TempDir cleanup
+	// cannot race those final writes.
 	waitFor(t, time.Second, func() bool {
-		return ext.Stats().TotalExtractions == 1
+		stats := ext.Stats()
+		return stats.TotalExtractions == 1 && !stats.InProgress && ForkInflight() == 0
 	})
 	stats := ext.Stats()
 	if stats.LastProcessedIdx != 2 {
@@ -125,7 +136,10 @@ func TestAutoMemoryExtractor_RateLimitsRapidLoopEnds(t *testing.T) {
 	ext.setDreamGateBypass(true)
 
 	ext.OnLoopEnd(context.Background(), "end_turn")
-	waitFor(t, time.Second, func() bool { return ext.Stats().TotalExtractions == 1 })
+	waitFor(t, time.Second, func() bool {
+		stats := ext.Stats()
+		return stats.TotalExtractions == 1 && !stats.InProgress && ForkInflight() == 0
+	})
 
 	// Second call within MinInterval should NOT fire a 2nd extraction.
 	ext.OnLoopEnd(context.Background(), "end_turn")
@@ -242,7 +256,7 @@ func TestAutoMemoryExtractor_RegeneratesIndex(t *testing.T) {
 	indexPath := memdir.IndexPath(root)
 	waitFor(t, 2*time.Second, func() bool {
 		_, err := os.Stat(indexPath)
-		return err == nil
+		return err == nil && !ext.Stats().InProgress && ForkInflight() == 0
 	})
 
 	indexBytes, err := os.ReadFile(indexPath)

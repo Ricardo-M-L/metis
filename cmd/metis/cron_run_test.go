@@ -6,39 +6,45 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 )
 
 func TestAdvanceManualCronRunPersistsBookkeeping(t *testing.T) {
-	svc, err := agent.NewCronService(filepath.Join(t.TempDir(), "cron"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	job := &agent.CronJob{
-		ID: "manual-job", Name: "Manual", Prompt: "check", Enabled: true,
-		Schedule: agent.CronSchedule{Kind: "every", EveryMs: int64(time.Hour / time.Millisecond)},
-		Repeat:   2,
-	}
-	if err := svc.Create(job); err != nil {
-		t.Fatal(err)
-	}
-	before := job.NextRun
-	got, err := advanceManualCronRun(svc, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.RunCount != 1 || got.LastRun.IsZero() || !got.NextRun.After(before) || !got.Enabled {
-		t.Fatalf("bookkeeping after first run = %+v (previous next %v)", got, before)
-	}
-	got, err = advanceManualCronRun(svc, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.RunCount != 2 || got.Enabled {
-		t.Fatalf("repeat limit after second run = %+v", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		svc, err := agent.NewCronService(filepath.Join(t.TempDir(), "cron"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		job := &agent.CronJob{
+			ID: "manual-job", Name: "Manual", Prompt: "check", Enabled: true,
+			Schedule: agent.CronSchedule{Kind: "every", EveryMs: int64(time.Hour / time.Millisecond)},
+			Repeat:   2,
+		}
+		if err := svc.Create(job); err != nil {
+			t.Fatal(err)
+		}
+		before := job.NextRun
+		// Advance the synthetic wall clock so the assertion does not depend on
+		// the host OS clock tick (consecutive Windows reads may be identical).
+		time.Sleep(2 * time.Millisecond)
+		got, err := advanceManualCronRun(svc, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.RunCount != 1 || got.LastRun.IsZero() || !got.NextRun.After(before) || !got.Enabled {
+			t.Fatalf("bookkeeping after first run = %+v (previous next %v)", got, before)
+		}
+		got, err = advanceManualCronRun(svc, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.RunCount != 2 || got.Enabled {
+			t.Fatalf("repeat limit after second run = %+v", got)
+		}
+	})
 }
 
 func TestAdvanceManualCronRunRejectsMissingJob(t *testing.T) {
