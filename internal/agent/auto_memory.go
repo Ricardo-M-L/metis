@@ -492,7 +492,13 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	preSkills := snapshotSkillNames(e.skillsDir)
 
 	var runErr error
-	defer func() {
+	finishDreamLock := func() {
+		if !lockHeld || dl == nil {
+			return
+		}
+		// Mark this holder consumed before touching disk so the fallback
+		// defer cannot finalize the same lock twice.
+		lockHeld = false
 		// Phase A — release or roll back the lock based on outcome.
 		// runErr is the fork's own outcome (network/provider/gate);
 		// success advances LastSuccessAt to "now" (the WriteFile in
@@ -500,14 +506,15 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 		// PID body to mark "completed cleanly"). Failure rolls back
 		// to priorMtime so the next process's time gate doesn't think
 		// we just dreamed when in fact we crashed.
-		if lockHeld && dl != nil {
-			if runErr != nil {
-				_ = dl.Rollback(priorMtime)
-			} else {
-				_ = dl.Release()
-			}
+		if runErr != nil {
+			_ = dl.Rollback(priorMtime)
+		} else {
+			_ = dl.Release()
 		}
-	}()
+	}
+	// Fallback for any early return or panic before the normal completion
+	// defer reaches its lifecycle handoff below.
+	defer finishDreamLock()
 	defer func() {
 		duration := time.Since(startedAt)
 		post, _ := snapshotMemdirNames(context.Background(), e.memdirRoot)
@@ -554,6 +561,12 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 			_, _ = skills.NewCurator(sdir).Sweep(time.Now())
 		}
 
+		// Finalizing the disk lock is the last filesystem write owned by this
+		// extraction. Keep inProgress true until it finishes so callers and
+		// tests can use the idle transition as a real lifecycle barrier rather
+		// than racing TempDir cleanup against .dream-lock Release/Rollback.
+		finishDreamLock()
+
 		e.mu.Lock()
 		e.inProgress = false
 		e.phase = DreamPhaseDone
@@ -598,11 +611,12 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 		}
 
 		if shouldTrail {
-			// Queue a trailing run on a fresh background ctx so a
-			// cancelled parent doesn't take the trailing extraction
-			// down with it. We re-enter via OnLoopEnd("end_turn") to
-			// reuse all the same gates.
-			go e.OnLoopEnd(context.Background(), "end_turn")
+			// Re-enter synchronously on a fresh background ctx. OnLoopEnd
+			// itself remains non-blocking and starts a fork goroutine only
+			// when the gates allow it. Keeping the handoff in this goroutine
+			// prevents an orphan scheduler goroutine from starting after an
+			// observer has already seen both idle state and zero inflight forks.
+			e.OnLoopEnd(context.Background(), "end_turn")
 		}
 	}()
 

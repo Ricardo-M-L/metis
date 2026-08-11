@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,9 +139,25 @@ func TestAutoMemoryExtractor_RateLimitsRapidLoopEnds(t *testing.T) {
 }
 
 func TestAutoMemoryExtractor_StashesPendingDuringInProgress(t *testing.T) {
+	// No prior test's detached fork may be part of this test's completion
+	// boundary. Package tests are serial, so this drains earlier async work.
+	waitFor(t, 2*time.Second, func() bool { return ForkInflight() == 0 })
+
 	// blocking provider blocks first Complete forever.
 	bp := &blockingProvider{release: make(chan struct{})}
-	_, ext := newTestExtractor(t, bp, t.TempDir())
+	root := t.TempDir()
+	_, ext := newTestExtractor(t, bp, root)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(bp.release) }) }
+	// newTestExtractor registered several TempDir cleanups before this one.
+	// Waiting here therefore drains background filesystem work before those
+	// directories are removed, including on an earlier assertion failure.
+	t.Cleanup(func() {
+		release()
+		waitFor(t, 2*time.Second, func() bool {
+			return !ext.Stats().InProgress && ForkInflight() == 0
+		})
+	})
 	// Bypass the disk gate so this test exercises the in-memory
 	// in-progress / pending trailing-run machinery (see sibling
 	// rate-limit test for the same reasoning).
@@ -154,7 +171,21 @@ func TestAutoMemoryExtractor_StashesPendingDuringInProgress(t *testing.T) {
 	if !ext.Stats().Pending {
 		t.Errorf("expected pending=true after second call during in-progress")
 	}
-	close(bp.release)
+	release()
+	// Idle is the lifecycle barrier: all post-extraction writes, including
+	// dream-lock finalization, must finish before the test's TempDirs clean up.
+	waitFor(t, 2*time.Second, func() bool {
+		stats := ext.Stats()
+		return !stats.InProgress && stats.TotalExtractions == 1 && ForkInflight() == 0
+	})
+	// Prove the completed boundary is safe for TempDir cleanup now, rather
+	// than relying on testing.T to discover a late background writer.
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("remove completed extractor temp root: %v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("extractor temp root still exists after idle cleanup: %v", err)
+	}
 }
 
 func TestAutoMemoryExtractor_MutualExclusionWithMainAgent(t *testing.T) {

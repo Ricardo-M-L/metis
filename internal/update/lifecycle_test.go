@@ -126,8 +126,13 @@ func TestCleanupManagedIsNoopForUnmanagedFlatBinary(t *testing.T) {
 	if err := CleanupManaged(context.Background(), launcher); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(layout.managedRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("CleanupManaged created state for unmanaged binary: err=%v", err)
+	// On Windows managedRoot is the install root itself (the parent of bin),
+	// which necessarily already exists in this fixture. Assert on updater-owned
+	// state rather than the platform-dependent root container.
+	for _, path := range []string{layout.versionsRoot, layout.stagingRoot, layout.locksRoot, layout.currentVersion} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("CleanupManaged created updater state %s: err=%v", path, err)
+		}
 	}
 }
 

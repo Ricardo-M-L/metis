@@ -238,6 +238,35 @@ function Test-IsReparsePoint([System.IO.FileSystemInfo]$Item) {
     return (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
 }
 
+function Get-SHA256Hex([string]$Path) {
+    $info = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($info.PSIsContainer -or (Test-IsReparsePoint $info)) {
+        throw "SHA-256 input must be a direct non-reparse regular file: $Path"
+    }
+
+    $stream = $null
+    $sha256 = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $digest = $sha256.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($digest)).Replace("-", "")
+    }
+    finally {
+        if ($null -ne $sha256) {
+            $sha256.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
 function Assert-ManagedDirectory([string]$Path) {
     try {
         $info = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -527,7 +556,7 @@ function Get-ManagedVersionMatches([string]$VersionsDir, [string]$FilePath) {
     if ($fileInfo.PSIsContainer -or (Test-IsReparsePoint $fileInfo)) {
         throw "Candidate launcher is not a direct regular file: $FilePath"
     }
-    $candidateHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $FilePath).Hash
+    $candidateHash = Get-SHA256Hex $FilePath
     foreach ($entry in @(Get-ChildItem -LiteralPath $VersionsDir -Force -ErrorAction Stop)) {
         if ($entry.Name -like ".migrate-*") {
             if (-not $entry.PSIsContainer -or (Test-IsReparsePoint $entry)) {
@@ -543,7 +572,7 @@ function Get-ManagedVersionMatches([string]$VersionsDir, [string]$FilePath) {
             throw "Unexpected version directory name: $($entry.Name)"
         }
         $binary = Get-ManagedVersionBinary $VersionsDir $entry.Name
-        $managedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash
+        $managedHash = Get-SHA256Hex $binary
         if ($managedHash.Equals($candidateHash, [StringComparison]::OrdinalIgnoreCase)) {
             Write-Output $entry.Name
         }
@@ -608,14 +637,14 @@ function Repair-InterruptedLauncherSwap([string]$LauncherPath, [string]$Versions
     if ($markerExists) {
         $currentVersion = Read-CurrentVersion $CurrentVersionFile
         $currentBinary = Get-ManagedVersionBinary $VersionsDir $currentVersion
-        $currentHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $currentBinary).Hash
+        $currentHash = Get-SHA256Hex $currentBinary
         $launcherMatchesCurrent = $false
         if ($launcherExists) {
             $launcherInfo = Get-Item -LiteralPath $LauncherPath -Force -ErrorAction Stop
             if ($launcherInfo.PSIsContainer -or (Test-IsReparsePoint $launcherInfo)) {
                 throw "Refusing to repair a non-regular launcher: $LauncherPath"
             }
-            $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $LauncherPath).Hash
+            $launcherHash = Get-SHA256Hex $LauncherPath
             $launcherMatchesCurrent = $launcherHash.Equals($currentHash, [StringComparison]::OrdinalIgnoreCase)
             if (-not $launcherMatchesCurrent) {
                 $knownMatches = @(Get-ManagedVersionMatches $VersionsDir $LauncherPath)
@@ -635,7 +664,7 @@ function Repair-InterruptedLauncherSwap([string]$LauncherPath, [string]$Versions
             $displacedLauncher = $false
             try {
                 Copy-Item -LiteralPath $currentBinary -Destination $repairTemp -ErrorAction Stop
-                $repairHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $repairTemp).Hash
+                $repairHash = Get-SHA256Hex $repairTemp
                 if (-not $repairHash.Equals($currentHash, [StringComparison]::OrdinalIgnoreCase)) {
                     throw "Repair launcher hash does not match current-version"
                 }
@@ -728,8 +757,8 @@ function Migrate-FlatLauncher([string]$LauncherPath, [string]$VersionsDir, [stri
                 $markedBinaryInfo.PSIsContainer -or (Test-IsReparsePoint $markedBinaryInfo)) {
                 throw "managed current version is not regular"
             }
-            $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $LauncherPath).Hash
-            $markedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $markedBinary).Hash
+            $launcherHash = Get-SHA256Hex $LauncherPath
+            $markedHash = Get-SHA256Hex $markedBinary
             if (-not $launcherHash.Equals($markedHash, [StringComparison]::OrdinalIgnoreCase)) {
                 throw "visible launcher does not match current-version"
             }
@@ -766,14 +795,14 @@ function Migrate-FlatLauncher([string]$LauncherPath, [string]$VersionsDir, [stri
 
     $legacyVersionDir = Join-Path $VersionsDir $legacyVersion
     $legacyVersionBinary = Join-Path $legacyVersionDir "metis.exe"
-    $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $LauncherPath).Hash
+    $launcherHash = Get-SHA256Hex $LauncherPath
     if (Test-Path -LiteralPath $legacyVersionDir) {
         $legacyInfo = Get-Item -LiteralPath $legacyVersionDir -Force
         if (-not $legacyInfo.PSIsContainer -or (Test-IsReparsePoint $legacyInfo) -or
             -not (Test-Path -LiteralPath $legacyVersionBinary -PathType Leaf)) {
             throw "Legacy version path is not a regular managed directory: $legacyVersionDir"
         }
-        $managedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyVersionBinary).Hash
+        $managedHash = Get-SHA256Hex $legacyVersionBinary
         if (-not $managedHash.Equals($launcherHash, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Refusing to overwrite managed version $legacyVersion with a different flat launcher"
         }
@@ -786,7 +815,7 @@ function Migrate-FlatLauncher([string]$LauncherPath, [string]$VersionsDir, [stri
         New-Item -ItemType Directory -Path $migrationDir -ErrorAction Stop | Out-Null
         $migrationBinary = Join-Path $migrationDir "metis.exe"
         Copy-Item -LiteralPath $LauncherPath -Destination $migrationBinary -ErrorAction Stop
-        $migratedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $migrationBinary).Hash
+        $migratedHash = Get-SHA256Hex $migrationBinary
         if (-not $migratedHash.Equals($launcherHash, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Migrated legacy launcher hash does not match its source"
         }
@@ -1080,7 +1109,7 @@ try {
     if ($expected -notmatch '^[0-9a-f]{64}$') {
         throw "Checksum sidecar contains an invalid SHA-256 value"
     }
-    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+    $actual = (Get-SHA256Hex $zipPath).ToLowerInvariant()
     if ($actual -ne $expected) {
         throw "SHA-256 mismatch: got $actual, expected $expected"
     }
@@ -1096,8 +1125,8 @@ try {
         if (-not $versionInfo.PSIsContainer -or (Test-IsReparsePoint $versionInfo) -or -not (Test-Path -LiteralPath $versionBinary -PathType Leaf)) {
             throw "Managed version path is not a regular version directory: $versionDir"
         }
-        $installedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $versionBinary).Hash
-        $downloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $extractedBinary).Hash
+        $installedHash = Get-SHA256Hex $versionBinary
+        $downloadedHash = Get-SHA256Hex $extractedBinary
         if (-not $installedHash.Equals($downloadedHash, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Existing managed version $versionName differs from the verified release asset"
         }
@@ -1108,8 +1137,8 @@ try {
 
     Assert-ManagedDirectory $normalizedInstallDir
     Copy-Item -LiteralPath $versionBinary -Destination $stagedLauncher -Force
-    $versionHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $versionBinary).Hash
-    $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedLauncher).Hash
+    $versionHash = Get-SHA256Hex $versionBinary
+    $launcherHash = Get-SHA256Hex $stagedLauncher
     if (-not $versionHash.Equals($launcherHash, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Staged launcher hash does not match the managed version"
     }

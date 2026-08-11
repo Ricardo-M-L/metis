@@ -48,6 +48,8 @@ func TestPowerShellInstallerHasManagedVersionLifecycle(t *testing.T) {
 		`$MaxArchiveBytes = 128MB`,
 		`$MaxExpandedBytes = 128MB`,
 		`function Download-FileWithLimit`,
+		`function Get-SHA256Hex`,
+		`[System.Security.Cryptography.SHA256]::Create()`,
 		`ContentLength`,
 		`$entry.Length -gt $MaxExpandedBytes`,
 		`[TimeSpan]::FromSeconds(30)`,
@@ -61,10 +63,9 @@ func TestPowerShellInstallerHasManagedVersionLifecycle(t *testing.T) {
 		`function Read-JSONOwner`,
 		`[System.IO.Directory]::Move($pendingDir, $lockDir)`,
 		`function Assert-ManagedDirectory`,
-		`Assert-ManagedDirectory $versionsDir`,
-		`Assert-ManagedDirectory $stagingDir`,
-		`Assert-ManagedDirectory $locksDir`,
-		`Assert-ManagedDirectory $runningLocksDir`,
+		`foreach ($managedPath in @($normalizedInstallDir, $versionsDir, $stagingDir, $locksDir, $runningLocksDir))`,
+		`Assert-ManagedDirectory $managedPath`,
+		`Ensure-ManagedDirectory $managedPath`,
 		`Move-Item -LiteralPath $destination -Destination $backup`,
 		`Move-Item -LiteralPath $backup -Destination $destination`,
 	} {
@@ -74,6 +75,12 @@ func TestPowerShellInstallerHasManagedVersionLifecycle(t *testing.T) {
 	}
 	if strings.Contains(text, "Expand-Archive") {
 		t.Error("install.ps1 uses unbounded Expand-Archive")
+	}
+	if strings.Contains(text, "Get-FileHash") {
+		t.Error("install.ps1 depends on Get-FileHash, which is unavailable in the supported Windows PowerShell environment")
+	}
+	if strings.Count(text, `foreach ($managedPath in @($normalizedInstallDir, $versionsDir, $stagingDir, $locksDir, $runningLocksDir))`) < 2 {
+		t.Error("install.ps1 must validate existing managed roots before ensuring missing managed roots")
 	}
 	if strings.Contains(text, "$IncompleteLockMaxAge") {
 		t.Error("install.ps1 may reclaim an ownerless fixed lock by age")
