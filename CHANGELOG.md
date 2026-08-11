@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **sub-agent stability**: background sub-agents no longer crash when the
+  parent turn ends. Two coupled bugs fixed in internal/tools/builtin/agent.go:
+  - forwardSubAgentEvent now recovers from "send on closed channel" - the
+    parent's per-turn event channel is closed when the turn's loop.Run
+    returns, and a background agent outliving that turn used to panic on the
+    next forwarded tool event.
+  - background sub-agent contexts are detached from the parent turn with
+    context.WithoutCancel, so turn teardown no longer kills them
+    ("killed: context canceled"). They are now session-scoped, terminated
+    only by their own timeout, SubAgentStop, or session exit
+    (Roster.Reset / Roster.CancelAll).
+- **TUI**: renderInfoBox no longer draws an empty cyan bordered box when
+  its body has no visible content (was producing ~20-line blank rectangles
+  in the transcript).
+
 ### Added — Bash auto-background + job pool (claude-code parity, 60s threshold)
 
 - New `internal/jobs/` package: a process-wide pool tracking
