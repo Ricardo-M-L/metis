@@ -141,16 +141,10 @@ func (m *Model) asREPL() *REPL {
 		outputStyle:         normalizeOutputStyle(m.outputStyle),
 	}
 	// Live-state closures so slash handlers can read TUI-only data
-	// (sub-agent roster, bg-turn state) and write to TUI-only surfaces
+	// (such as bg-turn state) and write to TUI-only surfaces
 	// (the input textarea) without REPL having to import textarea or
 	// hold a Model pointer. The headless readline REPL leaves these
 	// nil and the handlers gracefully fall back.
-	r.SubAgentSnapshot = func() []SubAgentInfo {
-		// Copy so the caller can't mutate the live slice.
-		out := make([]SubAgentInfo, len(m.subAgents))
-		copy(out, m.subAgents)
-		return out
-	}
 	r.InsertInput = func(text string) {
 		m.input.InsertString(text)
 	}
@@ -169,6 +163,9 @@ func (m *Model) asREPL() *REPL {
 		if m.loop != nil {
 			m.loop.BypassNextCache = true
 		}
+	}
+	r.ResetTokenUsageAfterCompaction = func() {
+		resetTokenUsageAfterCompaction(&m.totalTokens, m.session, m.sessionID)
 	}
 	r.ApplyOutputStyle = func(style string) {
 		m.outputStyle = normalizeOutputStyle(style)

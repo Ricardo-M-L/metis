@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -192,7 +193,7 @@ func toolArgsPreview(name string, input map[string]any) string {
 }
 
 // agentDisplayLabel is the single human-readable naming policy for Agent and
-// Fork calls across the transcript, live status chips, and /agents-view.
+// Fork calls across the transcript, live status chips, and /agents.
 // `description` is explicitly the short TUI summary in the tool schema; using
 // the raw prompt instead made parallel research workers all look identical
 // when their prompts shared a role preamble (for example, four prompts that
@@ -276,25 +277,28 @@ func basename(path string) string {
 // rare "ASCII slightly longer than max" case still allocates a rune
 // slice, but that's fine — these strings are short (preview lines,
 // tool-args headers).
-// formatContextPct renders the right-side status-bar percentage with a
-// 99%+ ceiling. Reasons we clamp instead of showing the raw value:
+// formatContextPct renders the right-side status-bar percentage with the same
+// rounded 0..100 clamp Claude Code uses in calculateContextPercentages.
+// Reasons we clamp instead of showing the raw value:
 //   - `used` is the larger of API-reported tokens and
 //     EstimateContextTokens() (chars/4). The latter over-counts CJK
 //     because a 3-byte UTF-8 char doesn't equal one token. The
 //     2026-05-16 user repro showed 207k/200k = 107% on a session
 //     that wasn't actually past the API cap.
-//   - Anything past 99% is the same actionable signal ("compact soon
-//     or risk a 4xx"); the specific number above that is noise.
-//   - >100% looks like a bug to users — they reasonably expect the
-//     API to reject any request over the cap, so a 107% display
-//     erodes trust in every other metric we show.
+//   - Anything at/past the limit is the same actionable signal; the
+//     specific number above 100 is noise.
+//   - "99%+" looked like an impossible measurement after compaction.
+//     A conventional 100% ceiling is both honest and source-compatible.
 func formatContextPct(used, cap int) string {
 	if cap <= 0 {
 		return ""
 	}
-	pct := used * 100 / cap
-	if pct > 99 {
-		return "99%+"
+	pct := int(math.Round(float64(used) * 100 / float64(cap)))
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
 	}
 	return fmt.Sprintf("%d%%", pct)
 }

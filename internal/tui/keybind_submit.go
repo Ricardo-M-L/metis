@@ -102,7 +102,6 @@ var modalCommands = map[string]bool{
 	"statusline":  true,
 	"resume":      true,
 	"diff-view":   true,
-	"agents-view": true,
 	"desktop":     true,
 }
 
@@ -249,7 +248,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	if m.handleLocalThinkingDisplay(text) {
 		return m, nil
 	}
-	// /agents-view is a local, read-only view and is safe to open while the
+	// /agents is a local, read-only view and is safe to open while the
 	// agent loop is running. Handle it before the generic mid-turn queue/
 	// steering branch; otherwise the literal command is queued as a prompt and
 	// the only useful moment for inspecting running sub-agents is lost.
@@ -617,7 +616,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			m.activeScreen = dv
 			return m, nil
 		}
-		if name == "agents-view" || name == "av" {
+		if name == "agents" || name == "av" {
 			m.openAgentsView()
 			return m, nil
 		}
@@ -1451,7 +1450,7 @@ func isAgentsViewCommand(text string) bool {
 		return false
 	}
 	name, _, _ := cut(strings.TrimPrefix(text, "/"), " ")
-	return name == "agents-view" || name == "av"
+	return name == "agents" || name == "av"
 }
 
 func (m *Model) openAgentsView() {
@@ -1466,7 +1465,7 @@ func (m *Model) openAgentsView() {
 // buildAgentTasks converts the live status-bar roster and the retained tool
 // event timeline to MultiAgentScreen items. subAgents is intentionally pruned
 // shortly after completion; toolEvents survives for the session, so it serves
-// as the durable fallback and keeps /agents-view useful after the 2s pill tail.
+// as the durable fallback and keeps /agents useful after the 2s pill tail.
 func (m *Model) buildAgentTasks() []screen.AgentTask {
 	eventTasks := make(map[string]screen.AgentTask)
 	eventOrder := make([]string, 0)

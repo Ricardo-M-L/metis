@@ -688,6 +688,10 @@ func (l *Loop) Restore(messages []llm.Message) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.restoreMessagesLocked(messages)
+	// Restore is also used by manual /compact. Refresh the non-blocking
+	// estimate immediately so the next render cannot reuse the pre-compact
+	// cache while the history replacement is already visible.
+	l.estTokens.Store(int64(estimateTokens(l.Messages)))
 }
 
 func (l *Loop) restoreMessagesLocked(messages []llm.Message) {

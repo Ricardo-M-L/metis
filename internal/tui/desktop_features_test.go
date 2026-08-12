@@ -123,12 +123,12 @@ func TestAgentsViewOpensLocallyDuringActiveTurnAndRefreshes(t *testing.T) {
 	m.subAgents = []SubAgentInfo{{
 		ID: "agent-running", Name: "inspect tests", Status: "running", StartedAt: time.Now(),
 	}}
-	m.input.SetValue("/agents-view")
+	m.input.SetValue("/agents")
 
 	pressEnter(t, m)
 	av, ok := m.activeScreen.(*screen.MultiAgentScreen)
 	if !ok {
-		t.Fatalf("/agents-view mid-turn should open local modal, got %T", m.activeScreen)
+		t.Fatalf("/agents mid-turn should open local modal, got %T", m.activeScreen)
 	}
 	if len(m.queuedPrompts) != 0 {
 		t.Fatalf("local command must not be queued/steered: %+v", m.queuedPrompts)

@@ -86,7 +86,6 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "share", Description: "share session over local HTTP+SSE: start | stop (URL printed for IDE/browser clients)", Handler: cmdShare})
 
 	// === Productivity / inspection ===
-	r.Register(REPLCommand{Name: "agents", Description: "list sub-agents currently in flight (Agent tool)", Handler: cmdAgents})
 	r.Register(REPLCommand{Name: "files", Description: "show workspace file index (used by @-mention)", Handler: cmdFiles})
 	// `/context` deliberately NOT registered as a REPLCommand any more
 	// (claude-code parity, 2026-05-11): the slash-signal path
@@ -181,7 +180,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Desktop Features (Codex parity) ===
 	r.Register(REPLCommand{Name: "resume", Aliases: []string{"rs"}, Description: "resume/fork session with search, fork, and fresh start", Handler: cmdResume})
 	r.Register(REPLCommand{Name: "diff-view", Aliases: []string{"dv"}, Description: "full-screen git diff viewer with file list", Handler: cmdDiffView})
-	r.Register(REPLCommand{Name: "agents-view", Aliases: []string{"av"}, Description: "multi-agent task visualization with tree view", Handler: cmdAgentsView})
+	r.Register(REPLCommand{Name: "agents", Aliases: []string{"av"}, Description: "inspect sub-agent work in a live tree view", Handler: cmdAgentsView})
 	r.Register(REPLCommand{Name: "desktop", Description: "launch native desktop app (macOS/Linux/Windows)", Handler: cmdDesktop})
 
 	// === Info ===
@@ -352,32 +351,6 @@ func cmdBg(r *REPL, args string) string {
 		out += fmt.Sprintf(" · %d prompt(s) queued", st.QueuedCount)
 	}
 	return out + "\n  " + hint
-}
-
-// cmdAgents lists sub-agents currently dispatched via the Agent tool.
-// Reads the live roster through r.SubAgentSnapshot (closure filled by
-// Model.asREPL); falls back to the original hint when invoked outside
-// the TUI surface.
-func cmdAgents(r *REPL, args string) string {
-	if r == nil || r.SubAgentSnapshot == nil {
-		return "agents: sub-agent roster not available (headless REPL).\n" +
-			"  Spawn via the Agent tool — list shown as ◇ pills in the status bar."
-	}
-	roster := r.SubAgentSnapshot()
-	if len(roster) == 0 {
-		return "agents: (no sub-agents in flight)\n" +
-			"  Spawn via the Agent tool; ◇ pills appear in the status bar while they run."
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "agents: %d sub-agent(s)\n", len(roster))
-	for _, a := range roster {
-		status := a.Status
-		if status == "" {
-			status = "running"
-		}
-		fmt.Fprintf(&b, "  ◇ %s  [%s]  id=%s\n", a.Name, status, a.ID)
-	}
-	return strings.TrimRight(b.String(), "\n")
 }
 
 // cmdFiles dumps the @-mention file index so the user can verify
@@ -1463,6 +1436,7 @@ func cmdCompact(r *REPL, args string) string {
 		return fmt.Sprintf("compact: no reduction (%d → %d messages)", before, len(compacted))
 	}
 	r.Loop.Restore(compacted)
+	r.resetTokenUsageAfterCompaction()
 	if err := r.replaceHistory(compacted); err != nil {
 		return fmt.Sprintf("compact: %d → %d messages in memory, but history persistence failed: %v", before, len(compacted), err)
 	}
@@ -1891,10 +1865,10 @@ func (t *tokenTracker) ContextUsage() int {
 	return t.lastIn + t.lastCacheCreate
 }
 
-// Reset zeroes both raw and displayed counters. Called by /clear and /new
-// when the conversation is being thrown away so the displayed total
-// matches the new (empty) history. claude-code resets too — a /clear
-// session shouldn't carry forward the old session's API spend.
+// Reset zeroes both raw and displayed counters. Called by /clear, /new and a
+// successful compaction so pre-boundary API usage cannot masquerade as the
+// current context size. /cost intentionally restarts at a compact boundary;
+// /usage points to the provider's authoritative usage surface.
 func (t *tokenTracker) Reset() {
 	t.in = 0
 	t.out = 0
@@ -2015,7 +1989,7 @@ func cmdDiffView(r *REPL, args string) string {
 	return "opening diff viewer..."
 }
 
-// cmdAgentsView opens the multi-agent task visualization.
+// cmdAgentsView is the headless fallback for the TUI-owned /agents screen.
 func cmdAgentsView(r *REPL, args string) string {
 	return "opening agents view..."
 }

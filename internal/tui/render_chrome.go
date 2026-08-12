@@ -362,7 +362,7 @@ func renderDreamingExtras(m *Model) string {
 // compactor reports cumulative output bytes but not the final summary
 // size, so those bytes cannot honestly be converted to a percentage.
 // Instead the bar advances monotonically, then stops with two cells
-// deliberately empty until EventContextCompacted clears the row. This
+// deliberately empty until EventCompactionEnd clears the row. This
 // gives users a progressive animation without implying that we know
 // how much work remains. Layout mirrors claude-code's compaction display
 // (image #19 user feedback 2026-05-15).

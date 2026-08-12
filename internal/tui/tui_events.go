@@ -316,6 +316,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			SetTerminalProgress(ProgressClear)
 			m.spinnerOverride = ""
 			m.spinnerCompactionBytes = 0
+			m.compactionStartedAt = time.Time{}
 		}
 		// Flush any in-flight thinking/streaming text before painting
 		// the error so the partial reply isn't silently dropped. This
@@ -390,11 +391,22 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// converted into a completion percentage.
 		m.spinnerCompactionBytes = ev.InputTokens
 	case agent.EventContextCompacted:
-		// Either tier finished (success or failure) — release the
-		// override so the normal thinking verb returns on the next
-		// turn or tool call.
+		// A smaller history was successfully installed. Discard the old
+		// provider-reported usage here: it describes the pre-compact API
+		// request and otherwise wins max(ContextUsage, historyEstimate),
+		// leaving the status bar stuck at e.g. 500k after a 40k compact.
+		// The loop cached ev.ContextTokens before sending this event, so
+		// renderStatusBar can immediately show the post-compact estimate
+		// even while maybeCompact still owns the history lock.
+		resetTokenUsageAfterCompaction(&m.totalTokens, m.session, m.sessionID)
+	case agent.EventCompactionEnd:
+		// Lifecycle only: every attempt ends, including failures. Do not
+		// reset token state or imply success here. Claude Code likewise
+		// emits compact_end from finally while applying a valid result is
+		// a separate operation.
 		m.spinnerOverride = ""
 		m.spinnerCompactionBytes = 0
+		m.compactionStartedAt = time.Time{}
 		SetTerminalProgress(ProgressClear)
 	case agent.EventInfo:
 		// Sniff for distinctive payload shapes that deserve their own

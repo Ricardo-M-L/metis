@@ -44,7 +44,7 @@ const (
 	// Context window pressure — emitted before auto-compaction kicks in
 	// so external observers can snapshot history before mutation.
 	EventContextWarn      // crossed soft threshold (e.g., 70%)
-	EventContextCompacted // auto-compaction just ran (also emits as EventInfo today)
+	EventContextCompacted // context history was successfully reduced and applied
 
 	// EventCompactionStart marks the start of an LLM-driven compaction
 	// tier (Collapse or Compact). The TUI swaps the spinner label to
@@ -136,6 +136,16 @@ const (
 	// "non-interactive" so the model gets a structured error instead
 	// of an indefinite hang.
 	EventAskUser
+
+	// EventCompactionEnd is the lifecycle counterpart to
+	// EventCompactionStart. It is emitted after every LLM-driven
+	// compaction attempt, including failures, and exists only to release
+	// progress UI. A successful history mutation is reported separately by
+	// EventContextCompacted. This mirrors Claude Code's compact_end event:
+	// ending the animation must not claim that compaction succeeded.
+	// Appended here (rather than beside EventCompactionStart) to preserve
+	// the numeric values of existing EventKind constants.
+	EventCompactionEnd
 )
 
 // agentNameKey carries the current agent's team identity (the `name` param
@@ -490,8 +500,15 @@ type Event struct {
 	OutputTokens             int
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
-	StopReason               string
-	Info                     string
+	// PreviousContextTokens and ContextTokens are byte-derived context
+	// estimates attached to EventContextCompacted. They describe the
+	// history that was actually replaced, unlike the compaction API call's
+	// own input/output usage (which is roughly the pre-compact context and
+	// must never be shown as the resulting context size).
+	PreviousContextTokens int
+	ContextTokens         int
+	StopReason            string
+	Info                  string
 
 	// Error
 	Err error

@@ -129,18 +129,37 @@ func TestRichSlashHandlersOwnConflictingTUICommands(t *testing.T) {
 	}
 
 	if preferSlashInTUI("agents") {
-		t.Fatal("/agents must remain owned by cmdAgents so it can read the live roster")
+		t.Fatal("/agents must remain owned by the live multi-agent tree command")
+	}
+	if legacy := m.cmds.Get("agents-view"); legacy != nil {
+		t.Fatalf("legacy /agents-view command is still registered: %+v", legacy)
+	}
+	if canonical := m.cmds.Get("agents"); canonical == nil || !strings.Contains(canonical.Description, "tree") {
+		t.Fatalf("canonical /agents tree command missing: %+v", canonical)
+	}
+	if alias := m.cmds.Get("av"); alias == nil || alias.Name != "agents" {
+		t.Fatalf("/av should resolve to canonical /agents: %+v", alias)
+	}
+	for command, want := range map[string]bool{
+		"/agents":      true,
+		"/av":          true,
+		"/agents-view": false,
+	} {
+		if got := isAgentsViewCommand(command); got != want {
+			t.Errorf("isAgentsViewCommand(%q) = %v, want %v", command, got, want)
+		}
 	}
 	// /memory path opens a modal. Use a fresh model so this assertion tests
 	// /agents routing instead of sending Enter to the still-open memory screen.
 	agentsModel := newSlashTestModel(t)
 	agentsModel.input.SetValue("/agents")
 	_, _ = agentsModel.handleSubmit()
-	if agentsModel.activeScreen == nil {
-		t.Fatal("/agents did not open its roster screen")
+	if _, ok := agentsModel.activeScreen.(*screen.MultiAgentScreen); !ok {
+		t.Fatalf("/agents did not open the tree screen: %T", agentsModel.activeScreen)
 	}
 	agentsView := agentsModel.activeScreen.View()
-	if !strings.Contains(agentsView, "no sub-agents") || strings.Contains(agentsView, "single agent mode") {
+	if !strings.Contains(agentsView, "/agents") || !strings.Contains(agentsView, "0 agents") ||
+		strings.Contains(agentsView, "single agent mode") {
 		t.Fatalf("/agents did not use the live roster backend: %q", agentsView)
 	}
 }

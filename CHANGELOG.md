@@ -7,6 +7,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.19] - 2026-08-12
+
+### Changed
+
+- **cleaner TUI transcript rhythm**: top-level chat entries now use one
+  consistent blank-row gap while each tool invocation and its result remain a
+  compact block. Bash timeouts render once as a semantic result and retain any
+  useful output produced before the timeout.
+- **canonical multi-agent view**: the live tree screen is now `/agents` with
+  `/av` as its alias; the older text roster and `/agents-view` command were
+  removed from the TUI command surface.
+- **language guidance**: response and reasoning-language matching now lives in
+  its own early, cached base-prompt section instead of being buried in style
+  guidance.
+
+### Fixed
+
+- **compaction lifecycle and token state**: ending a compaction attempt is now
+  distinct from successfully applying a smaller context. Failed/no-op attempts
+  only clear progress UI, while successful automatic or manual compaction
+  refreshes the context estimate and resets stale pre-compaction token/cost
+  counters.
+- **context percentage display**: status percentages are rounded and clamped
+  to the conventional `0-100%` range.
+
 ## [0.4.18] - 2026-08-11
 
 ### Added

@@ -277,14 +277,14 @@ type Model struct {
 	// user sees "Compacting conversation..." instead of the thinking
 	// verb that would otherwise show during a 5-30s summarize call —
 	// that was the "input area looks frozen" user report (2026-05-15
-	// screenshot #3). Cleared on EventContextCompacted.
+	// screenshot #3). Cleared on EventCompactionEnd.
 	spinnerOverride string
 
 	// spinnerCompactionBytes is the cumulative byte count of the
 	// in-flight summarize stream, updated by EventCompactionProgress.
 	// It is an activity signal only: the final summary size is unknown,
 	// so it cannot be converted into a truthful completion percentage.
-	// Reset on EventContextCompacted.
+	// Reset on EventCompactionEnd.
 	spinnerCompactionBytes int
 
 	// compactionStartedAt is the timestamp of the most recent
@@ -748,7 +748,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 	// keeps test code that constructs a Model literal usable.
 	cl := list.NewList()
 	cl.SetSize(80, 20)
-	cl.SetGap(0) // assistant/user message renderers already include trailing newlines
+	cl.SetGap(chatItemGap)
 	// Wheel step is config-tunable now (default 1 = pixel-precise).
 	// A trackpad fires many wheel events per gesture; with the bubbletea
 	// default of 3 the transcript jumps too far per detent. Users who

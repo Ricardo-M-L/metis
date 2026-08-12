@@ -97,17 +97,13 @@ type REPL struct {
 	ApplyOutputStyle func(style string)
 
 	// TUI-only bridges: slash handlers run in the REPL layer but a few
-	// genuinely need access to TUI-side state (sub-agent roster) or
-	// surfaces (the input textarea). asREPL() fills these closures with
+	// genuinely need access to TUI-side state or surfaces (the input
+	// textarea). asREPL() fills these closures with
 	// live Model pointers; the plain readline-REPL leaves them nil so
 	// the handlers fall back to a graceful "(not available in headless
 	// REPL)" message instead of crashing. Closures rather than direct
 	// pointers because internal/tui/repl.go must not import textarea
 	// for the plain-readline path (no terminal in CI / pipes).
-	//
-	// SubAgentSnapshot returns the current sub-agent roster (Agent tool
-	// spawns). Consumed by cmdAgents to print "◇ name [status]" rows.
-	SubAgentSnapshot func() []SubAgentInfo
 	// InsertInput appends text to the input textarea. Consumed by
 	// cmdReview / cmdSecurityReview to pre-populate a review prompt
 	// so the user can edit + Enter to submit — instead of the prior
@@ -123,6 +119,11 @@ type REPL struct {
 	// RecapSnapshot returns the latest structural turn recap already rendered
 	// by the TUI. The headless REPL leaves it nil because it has no recap rows.
 	RecapSnapshot func() string
+	// ResetTokenUsageAfterCompaction updates the live Bubble Tea tracker.
+	// asREPL copies tokenTracker by value, so cmdCompact cannot mutate the
+	// Model's counters without this bridge. Nil in the plain REPL, where the
+	// REPL-owned tracker is updated directly.
+	ResetTokenUsageAfterCompaction func()
 
 	shouldQuit bool
 }
@@ -796,6 +797,8 @@ func (r *REPL) runTurn(ctx context.Context) error {
 					fmt.Sprintf("    [tokens in=%d out=%d]", ev.InputTokens, ev.OutputTokens),
 				))
 			}
+		case agent.EventContextCompacted:
+			r.resetTokenUsageAfterCompaction()
 		case agent.EventLoopDone:
 			r.flushTextBeforeTool(turnStartedText)
 			r.persistTail()

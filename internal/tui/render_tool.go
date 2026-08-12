@@ -42,6 +42,7 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// ToolEvent is passed by value: normalize the user-visible copy once while
 	// preserving the raw event for the model, transcript, and audit log.
 	te.Output = normalizeToolOutput(te.Output)
+	timeoutBody, timeoutLimit, timedOut := splitCommandTimeoutOutput(te.Output)
 
 	// Leader row: ⏺ toolname(arg)
 	//
@@ -141,6 +142,12 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		s.WriteString(fmt.Sprintf("%s · No matches", formatElapsed(te.Duration)))
 	} else if partialRecovery {
 		s.WriteString(summarizePartialToolResult(te))
+	} else if timedOut {
+		// The timeout marker already carries the meaningful wall-clock limit.
+		// Showing the event Duration as well produced contradictory rows such as
+		// "0ms · [command exceeded timeout 20s]" when a resumed/forwarded event
+		// did not retain its start time. Render one semantic result instead.
+		s.WriteString("timed out after " + timeoutLimit)
 	} else {
 		s.WriteString(summarizeNormalizedToolResult(te))
 	}
@@ -164,7 +171,15 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		// its wrapper is killed). That is a partial/recovered state, not a
 		// plain failure. Keep the timeout in the event and reveal it on Ctrl+O,
 		// but do not paint the whole raw body red in the compact transcript.
-		if te.Output != "" && !neutralNoMatch && (!partialRecovery || expanded) {
+		if timedOut && !partialRecovery {
+			// Bash appends a machine-oriented timeout marker after any captured
+			// stdout/stderr. The result row above communicates that state once;
+			// keep useful pre-timeout output without echoing the marker as a red
+			// diagnostic line underneath it.
+			if timeoutBody != "" {
+				s.WriteString(renderNormalizedErrorBody(timeoutBody, expanded))
+			}
+		} else if te.Output != "" && !neutralNoMatch && (!partialRecovery || expanded) {
 			s.WriteString(renderNormalizedErrorBody(te.Output, expanded))
 		}
 	} else {
@@ -231,6 +246,7 @@ func collapseToolBodyByDefault(toolName string) bool {
 
 var (
 	terminalLineResetRE = regexp.MustCompile(`\x1b\[[0-9;?]*[GK]`)
+	commandTimeoutRE    = regexp.MustCompile(`(?i)^\[command exceeded timeout ([^]\r\n]+)\]$`)
 	// The completion marker is deliberately line-anchored and positive. It
 	// must not accept prose such as "not installed 1 skill" or the vacuous
 	// "Installed 0 skills".
@@ -289,6 +305,23 @@ func normalizeToolOutput(out string) string {
 		lines = append(lines, frame)
 	}
 	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
+}
+
+// splitCommandTimeoutOutput recognizes the exact terminal marker emitted by
+// the Bash tool and separates it from any output produced before the process
+// was killed. Matching only the final line prevents ordinary prose mentioning
+// a timeout from being rewritten. The caller operates on a display-only copy;
+// persisted/model-visible tool output remains byte-for-byte unchanged.
+func splitCommandTimeoutOutput(out string) (body, limit string, ok bool) {
+	trimmed := strings.TrimRight(out, " \t")
+	lineStart := strings.LastIndexByte(trimmed, '\n') + 1
+	marker := strings.TrimSpace(trimmed[lineStart:])
+	match := commandTimeoutRE.FindStringSubmatch(marker)
+	if len(match) != 2 || strings.TrimSpace(match[1]) == "" {
+		return out, "", false
+	}
+	body = strings.TrimRight(trimmed[:lineStart], "\n")
+	return body, strings.TrimSpace(match[1]), true
 }
 
 func isSpinnerRune(r rune) bool {

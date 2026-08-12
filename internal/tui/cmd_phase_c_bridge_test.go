@@ -1,8 +1,8 @@
 package tui
 
 // Tests for the Phase-C commands that gained REPL-bridge closures
-// (cmdBg / cmdAgents / cmdSecurityReview / cmdBreakCache / cmdUsage /
-// cmdBug). The bridge fields on REPL are funcs, so we can fully drive
+// (cmdBg / cmdSecurityReview / cmdBreakCache / cmdUsage / cmdBug).
+// The bridge fields on REPL are funcs, so we can fully drive
 // them without spinning up a Model — pass closures that capture test-
 // local state and assert on it.
 //
@@ -74,29 +74,6 @@ func TestBg_RendersIdleSnapshot(t *testing.T) {
 	out := cmdBg(r, "")
 	if !strings.Contains(strings.ToLower(out), "no") && !strings.Contains(out, "idle") {
 		t.Errorf("idle path should say no/idle; got: %q", out)
-	}
-}
-
-func TestAgents_EmptyRoster(t *testing.T) {
-	r := &REPL{SubAgentSnapshot: func() []SubAgentInfo { return nil }}
-	out := cmdAgents(r, "")
-	if !strings.Contains(strings.ToLower(out), "no") {
-		t.Errorf("empty roster should say none; got: %q", out)
-	}
-}
-
-func TestAgents_PopulatedRoster(t *testing.T) {
-	r := &REPL{
-		SubAgentSnapshot: func() []SubAgentInfo {
-			return []SubAgentInfo{
-				{ID: "abc12345", Name: "explorer", Status: "running"},
-				{ID: "def67890", Name: "planner", Status: "done"},
-			}
-		},
-	}
-	out := cmdAgents(r, "")
-	if !strings.Contains(out, "explorer") || !strings.Contains(out, "planner") {
-		t.Errorf("both agent names should surface; got:\n%s", out)
 	}
 }
 

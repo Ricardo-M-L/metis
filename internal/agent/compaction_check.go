@@ -26,6 +26,31 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// A compaction attempt and an applied context reduction are different
+	// lifecycle facts. Claude Code emits compact_end from a finally block to
+	// stop progress UI, while callers only replace their message list after a
+	// valid result is returned. Keep the same split here:
+	//
+	//   EventCompactionEnd      — the attempt stopped (success or failure)
+	//   EventContextCompacted   — smaller history was installed successfully
+	//
+	// Cache the post-reduction estimate before emitting the success event. The
+	// TUI consumes events while this function still owns l.mu, so its
+	// non-blocking EstimateContextTokens call must be able to read the new
+	// value instead of the pre-compact cache.
+	emitContextReduced := func(tier string, beforeTokens, afterTokens int) {
+		l.estTokens.Store(int64(afterTokens))
+		emit(ctx, out, Event{
+			Kind:                  EventContextCompacted,
+			Info:                  tier,
+			PreviousContextTokens: beforeTokens,
+			ContextTokens:         afterTokens,
+		})
+	}
+	endCompactionAttempt := func(tier string, err error) {
+		emit(ctx, out, Event{Kind: EventCompactionEnd, Info: tier, Err: err})
+	}
+
 	// Tier 0 — Image prune: drop image content blocks past the most
 	// recent keepN (1/2/3 depending on the model's context window).
 	// Cheap, no LLM, no threshold gate — runs every iteration because:
@@ -42,7 +67,7 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	// keep=3 for richer state-machine reasoning.
 	keepN := keepRecentImagesFor(l.Compactor.MaxContextTokens)
 	if keepN > 0 {
-		beforeBytes := estimateTokens(l.Messages)
+		beforeTokens := estimateTokens(l.Messages)
 		pruned, n := PruneOldImages(l.Messages, keepN)
 		// METIS_DEBUG_IMG_PRUNE=1 surfaces the per-iteration prune
 		// telemetry to stderr. Useful when investigating "why
@@ -64,15 +89,16 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 				}
 			}
 			fmt.Fprintf(os.Stderr, "[img-prune] maxCtx=%d keepN=%d totalImages=%d pruned=%d beforeBytes=%d\n",
-				l.Compactor.MaxContextTokens, keepN, imgCount, n, beforeBytes)
+				l.Compactor.MaxContextTokens, keepN, imgCount, n, beforeTokens)
 		}
 		if n > 0 {
 			l.Messages = pruned
-			afterBytes := estimateTokens(pruned)
+			afterTokens := estimateTokens(pruned)
+			emitContextReduced("image-prune", beforeTokens, afterTokens)
 			emit(ctx, out, Event{
 				Kind: EventInfo,
 				Info: fmt.Sprintf("image-pruned %d older screenshots (kept %d most recent): ~%d → ~%d tokens",
-					n, keepN, beforeBytes, afterBytes),
+					n, keepN, beforeTokens, afterTokens),
 			})
 		}
 	}
@@ -84,14 +110,15 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	// estimator size dropped) — otherwise it's invisible bookkeeping
 	// and not worth a chat-line interruption.
 	if l.Compactor.ShouldSnip(l.Messages) {
-		beforeBytes := estimateTokens(l.Messages)
+		beforeTokens := estimateTokens(l.Messages)
 		snipped := l.Compactor.Snip(l.Messages)
-		afterBytes := estimateTokens(snipped)
-		if afterBytes < beforeBytes {
+		afterTokens := estimateTokens(snipped)
+		if afterTokens < beforeTokens {
 			l.Messages = snipped
+			emitContextReduced("snip", beforeTokens, afterTokens)
 			emit(ctx, out, Event{
 				Kind: EventInfo,
-				Info: fmt.Sprintf("context snipped: ~%d → ~%d tokens", beforeBytes, afterBytes),
+				Info: fmt.Sprintf("context snipped: ~%d → ~%d tokens", beforeTokens, afterTokens),
 			})
 		}
 	}
@@ -106,14 +133,15 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	if l.Compactor.IdleMaxSeconds > 0 && l.Compactor.MicrocompactDir != "" {
 		idle := time.Since(l.lastTimeBasedMicrocompactAt)
 		if idle > time.Duration(l.Compactor.IdleMaxSeconds)*time.Second {
-			beforeBytes := estimateTokens(l.Messages)
+			beforeTokens := estimateTokens(l.Messages)
 			offloaded := l.Compactor.Microcompact(l.Messages)
-			afterBytes := estimateTokens(offloaded)
-			if afterBytes < beforeBytes {
+			afterTokens := estimateTokens(offloaded)
+			if afterTokens < beforeTokens {
 				l.Messages = offloaded
+				emitContextReduced("microcompact-idle", beforeTokens, afterTokens)
 				emit(ctx, out, Event{
 					Kind: EventInfo,
-					Info: fmt.Sprintf("context microcompacted (time-based, idle %.0fs): ~%d → ~%d tokens", idle.Seconds(), beforeBytes, afterBytes),
+					Info: fmt.Sprintf("context microcompacted (time-based, idle %.0fs): ~%d → ~%d tokens", idle.Seconds(), beforeTokens, afterTokens),
 				})
 			}
 			l.lastTimeBasedMicrocompactAt = time.Now()
@@ -124,14 +152,15 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	// to disk. Lossless from the model's POV — it can Read the cached
 	// path to recover. Runs in same threshold window as Snip.
 	if l.Compactor.ShouldMicrocompact(l.Messages) {
-		beforeBytes := estimateTokens(l.Messages)
+		beforeTokens := estimateTokens(l.Messages)
 		offloaded := l.Compactor.Microcompact(l.Messages)
-		afterBytes := estimateTokens(offloaded)
-		if afterBytes < beforeBytes {
+		afterTokens := estimateTokens(offloaded)
+		if afterTokens < beforeTokens {
 			l.Messages = offloaded
+			emitContextReduced("microcompact", beforeTokens, afterTokens)
 			emit(ctx, out, Event{
 				Kind: EventInfo,
-				Info: fmt.Sprintf("context microcompacted: ~%d → ~%d tokens (cached to disk, recoverable via Read)", beforeBytes, afterBytes),
+				Info: fmt.Sprintf("context microcompacted: ~%d → ~%d tokens (cached to disk, recoverable via Read)", beforeTokens, afterTokens),
 			})
 			// Threshold-driven Microcompact also resets the time-based
 			// window — no need to fire again immediately.
@@ -183,6 +212,7 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 	// counter and decides accordingly.
 	if l.Compactor.ShouldCollapse(l.Messages) {
 		before := len(l.Messages)
+		beforeTokens := estimateTokens(l.Messages)
 		firePreCompact()
 		// Tell the UI we're entering an LLM-driven phase so it can swap
 		// the spinner label. Without this the TUI shows "Thinking..." for
@@ -194,17 +224,21 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 		// same channel for the TUI's "(N tokens streamed)" suffix.
 		collapseCtx := WithEventOut(ctx, out)
 		collapsed, err := l.Compactor.CollapseMiddle(collapseCtx, l.Messages)
-		emit(ctx, out, Event{Kind: EventContextCompacted, Info: "collapse"})
 		if err != nil {
+			endCompactionAttempt("collapse", err)
 			return // skip Compact attempt — see comment above
 		}
 		if len(collapsed) < before {
 			l.Messages = collapsed
+			afterTokens := estimateTokens(collapsed)
+			emitContextReduced("collapse", beforeTokens, afterTokens)
 			emit(ctx, out, Event{
 				Kind: EventInfo,
-				Info: fmt.Sprintf("context collapsed (early middle): %d → %d messages", before, len(collapsed)),
+				Info: fmt.Sprintf("context collapsed (early middle): %d → %d messages · ~%d → ~%d tokens",
+					before, len(collapsed), beforeTokens, afterTokens),
 			})
 		}
+		endCompactionAttempt("collapse", nil)
 	}
 	if !l.Compactor.ShouldCompact(l.Messages) {
 		// Surface the tripped breaker exactly once per state change.
@@ -220,20 +254,21 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 		return
 	}
 	before := len(l.Messages)
+	beforeTokens := estimateTokens(l.Messages)
 	firePreCompact() // no-op if collapse already fired it this pass
 	emit(ctx, out, Event{Kind: EventCompactionStart, Info: "compact"})
 	compactCtx := WithEventOut(ctx, out)
 	compacted, err := l.Compactor.Compact(compactCtx, l.Messages)
-	emit(ctx, out, Event{Kind: EventContextCompacted, Info: "compact"})
-	if err != nil || len(compacted) >= before {
+	if err != nil {
+		endCompactionAttempt("compact", err)
+		return
+	}
+	if len(compacted) >= before {
+		endCompactionAttempt("compact", nil)
 		return
 	}
 	l.Messages = compacted
 	l.compactCircuitNoticeSent = false // success → re-arm the notice
-	emit(ctx, out, Event{
-		Kind: EventInfo,
-		Info: fmt.Sprintf("context compacted: %d → %d messages", before, len(compacted)),
-	})
 
 	// Post-compact budget enforcement. Compact reduced the message
 	// COUNT but the protected tail (last N messages) might still hold
@@ -280,6 +315,19 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 			})
 		}
 	}
+
+	// Report success only after the final post-compact history is installed
+	// and all size guards have run. The estimate on this event is therefore
+	// the context the next model request will actually inherit, not the token
+	// usage of the summarization API call itself.
+	afterTokens := estimateTokens(l.Messages)
+	emitContextReduced("compact", beforeTokens, afterTokens)
+	endCompactionAttempt("compact", nil)
+	emit(ctx, out, Event{
+		Kind: EventInfo,
+		Info: fmt.Sprintf("context compacted: %d → %d messages · ~%d → ~%d tokens",
+			before, len(l.Messages), beforeTokens, afterTokens),
+	})
 }
 
 // sameSlice returns true when two []llm.Message refer to the same

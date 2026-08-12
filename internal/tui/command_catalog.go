@@ -60,9 +60,9 @@ func (m *Model) commandCatalog() []REPLCommand {
 
 // preferSlashInTUI records the remaining intentional ownership decisions for
 // names exposed by both legacy registries. These slash handlers have access to
-// richer live runtime state than their old REPL counterparts. /agents is
-// intentionally REPL-owned because cmdAgents is the implementation wired to
-// the live sub-agent roster.
+// richer live runtime state than their old REPL counterparts. /agents remains
+// REPL-owned because its handler is the canonical entry point for the live
+// multi-agent tree screen.
 func preferSlashInTUI(name string) bool {
 	switch strings.ToLower(name) {
 	case "memory", "doctor":

@@ -146,7 +146,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 	// We still let WindowSizeMsg reach the main chat so the underlying
 	// layout is correct when the screen closes. spinnerTick is lifecycle,
 	// not screen input: it must continue through to event/done draining and
-	// re-arm itself while `/agents-view` or another full-window screen is open.
+	// re-arm itself while `/agents` or another full-window screen is open.
 	if m.activeScreen != nil {
 		if _, lifecycleTick := msg.(spinnerTick); !lifecycleTick {
 			if ws, ok := msg.(tea.WindowSizeMsg); ok {

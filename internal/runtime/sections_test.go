@@ -91,7 +91,7 @@ func TestReversibilitySection_SubAgentSkipped(t *testing.T) {
 func TestDefaultSectionGetters_Ordered(t *testing.T) {
 	getters := DefaultSectionGetters()
 	wantNames := []string{
-		"identity", "computer_use", "privacy", "style", "tool_redirects",
+		"identity", "language", "computer_use", "privacy", "style", "tool_redirects",
 		"working_efficiently", "skills", "reversibility",
 		"interaction_modes",
 	}

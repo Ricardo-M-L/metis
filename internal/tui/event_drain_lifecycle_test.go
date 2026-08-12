@@ -43,7 +43,7 @@ func TestActiveScreenSpinnerTickKeepsTurnLifecycleAlive(t *testing.T) {
 	m.doneCh <- nil
 	m.Update(spinnerTick{})
 	if m.turnActive || m.spinnerActive {
-		t.Fatal("turn did not finalize while /agents-view remained open")
+		t.Fatal("turn did not finalize while /agents remained open")
 	}
 	if m.activeScreen != opened {
 		t.Fatalf("turn completion unexpectedly closed active screen: %T", m.activeScreen)

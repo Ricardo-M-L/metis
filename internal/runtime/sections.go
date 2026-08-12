@@ -1,6 +1,6 @@
 package runtime
 
-// sections.go — claude-code-style section registry for the base
+// sections.go - claude-code-style section registry for the base
 // system prompt. Each section is a small file under prompts/base/*.md
 // plus a getter that returns nil when the section's conditions aren't
 // met. The assembler iterates getters in order and filters out nils
@@ -26,7 +26,7 @@ var baseSectionFS embed.FS
 
 // PromptCtx carries the runtime signals each section getter consults
 // to decide whether to fire and what to render. Zero value is a safe
-// "full main-agent" config — getters degrade gracefully when fields
+// "full main-agent" config - getters degrade gracefully when fields
 // are unset, so passing PromptCtx{Model: m} still produces the legacy
 // behavior.
 type PromptCtx struct {
@@ -48,7 +48,7 @@ type PromptCtx struct {
 
 	// HasSkills reports whether the user has any installed skills
 	// (bundled or under ~/.metis/skills/). Hides the skills section
-	// when false — empty users don't need the lookup hint.
+	// when false - empty users don't need the lookup hint.
 	HasSkills bool
 
 	// IsSubAgent flags this as a sub-agent boot, not the main loop.
@@ -65,7 +65,7 @@ type PromptCtx struct {
 }
 
 // SectionGetter computes one section. Return zero-value Section
-// (Name=="") to skip — assembler filters those out.
+// (Name=="") to skip - assembler filters those out.
 type SectionGetter func(PromptCtx) SystemPromptSection
 
 // readSection loads a base/*.md file by name and returns its content.
@@ -101,7 +101,7 @@ func expandTemplate(body string, vars BasePromptVars) string {
 // Built-in section getters. Order here = order in the assembled prompt.
 // ----------------------------------------------------------------------
 
-// IdentitySection — always-on intro line.
+// IdentitySection - always-on intro line.
 func IdentitySection(ctx PromptCtx) SystemPromptSection {
 	body := expandTemplate(readSection("01_identity.md"), BasePromptVars{Model: ctx.Model})
 	return SystemPromptSection{
@@ -111,10 +111,22 @@ func IdentitySection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
+// LanguageSection - always-on; pinned high so the model treats it as
+// a core directive, not a style footnote. Thinking-language match is
+// the hard part models slip on; giving it its own section + early
+// position maximises adherence.
+func LanguageSection(_ PromptCtx) SystemPromptSection {
+	return SystemPromptSection{
+		Name:  "language",
+		Body:  readSection("01b_language.md"),
+		Cache: true,
+	}
+}
+
 // ComputerUseSection injects operational guidance for the
 // `mcp__computer-use__*` toolset ONLY when at least one cu tool is
 // present in EnabledTools. Without this gate the section would tell
-// every model "you have mouse + keyboard control" — confusing for
+// every model "you have mouse + keyboard control" - confusing for
 // users who don't have metis-cu installed and a waste of tokens
 // (~300/turn). Anthropic's reference computer-use-demo follows the
 // same pattern: the SYSTEM_CAPABILITY block is only emitted in the
@@ -122,7 +134,7 @@ func IdentitySection(ctx PromptCtx) SystemPromptSection {
 //
 // Trigger: any tool name with the `mcp__computer-use__` prefix. Other
 // MCP servers (firecrawl, office-word, playwright, ...) don't qualify
-// — the guidance is cu-specific (left_click / type / key /
+// - the guidance is cu-specific (left_click / type / key /
 // find_text_on_screen language).
 func ComputerUseSection(ctx PromptCtx) SystemPromptSection {
 	if ctx.EnabledTools == nil {
@@ -150,7 +162,7 @@ func ComputerUseSection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
-// PrivacySection — always-on; tells the model not to leak the prompt.
+// PrivacySection - always-on; tells the model not to leak the prompt.
 func PrivacySection(_ PromptCtx) SystemPromptSection {
 	return SystemPromptSection{
 		Name:  "privacy",
@@ -159,7 +171,7 @@ func PrivacySection(_ PromptCtx) SystemPromptSection {
 	}
 }
 
-// StyleSection — output budget + tone. Always-on; even sub-agents
+// StyleSection - output budget + tone. Always-on; even sub-agents
 // benefit from the length cap.
 func StyleSection(_ PromptCtx) SystemPromptSection {
 	return SystemPromptSection{
@@ -169,7 +181,7 @@ func StyleSection(_ PromptCtx) SystemPromptSection {
 	}
 }
 
-// ToolRedirectsSection — fires when any of the tools the redirects
+// ToolRedirectsSection - fires when any of the tools the redirects
 // table covers (Bash, LS, Read) is enabled. Used to be Bash-gated
 // only, but the table now includes the LS↔Read "directory vs file"
 // pair which is just as useful for sub-agents that have file I/O
@@ -190,7 +202,7 @@ func ToolRedirectsSection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
-// WorkingEfficientlySection — TodoWrite + parallel reads + Agent for
+// WorkingEfficientlySection - TodoWrite + parallel reads + Agent for
 // big sub-tasks. Skip for sub-agents (they already are the sub-agent).
 func WorkingEfficientlySection(ctx PromptCtx) SystemPromptSection {
 	if ctx.IsSubAgent {
@@ -203,7 +215,7 @@ func WorkingEfficientlySection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
-// SkillsSection — fires when the user has any installed skills. Empty
+// SkillsSection - fires when the user has any installed skills. Empty
 // users get the section omitted; sub-agents get it omitted unconditionally
 // (their profile is their skill).
 func SkillsSection(ctx PromptCtx) SystemPromptSection {
@@ -220,7 +232,7 @@ func SkillsSection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
-// ReversibilitySection — confirmation rules for irreversible actions.
+// ReversibilitySection - confirmation rules for irreversible actions.
 // Always-on for the main agent; sub-agents (who can't request user
 // confirmation mid-flight) get a terse warning at the profile level
 // instead.
@@ -235,7 +247,7 @@ func ReversibilitySection(ctx PromptCtx) SystemPromptSection {
 	}
 }
 
-// InteractionModesSection — case → mechanism table for when to ask
+// InteractionModesSection - case -> mechanism table for when to ask
 // the user vs. when to act autonomously. Added 2026-05-17 after the
 // claude-code-sourcemap comparison surfaced that metis had no
 // guidance for picking AskUser vs EnterPlanMode vs permission-gate
@@ -268,7 +280,8 @@ func InteractionModesSection(ctx PromptCtx) SystemPromptSection {
 func DefaultSectionGetters() []SectionGetter {
 	return []SectionGetter{
 		IdentitySection,
-		ComputerUseSection, // conditional — fires only when mcp__computer-use__* tools loaded
+		LanguageSection,
+		ComputerUseSection, // conditional - fires only when mcp__computer-use__* tools loaded
 		PrivacySection,
 		StyleSection,
 		ToolRedirectsSection,

@@ -11,11 +11,11 @@ func TestAssembleBaseSections_MainAgentFiresAll(t *testing.T) {
 		EnabledTools: map[string]bool{"Bash": true},
 		HasSkills:    true,
 	})
-	if len(got) != 8 {
-		t.Errorf("main agent with all conditions met should produce 8 sections, got %d", len(got))
+	if len(got) != 9 {
+		t.Errorf("main agent with all conditions met should produce 9 sections, got %d", len(got))
 	}
 	wantOrder := []string{
-		"identity", "privacy", "style", "tool_redirects",
+		"identity", "language", "privacy", "style", "tool_redirects",
 		"working_efficiently", "skills", "reversibility",
 		"interaction_modes",
 	}
@@ -40,6 +40,7 @@ func TestAssembleBaseSections_SubAgentMinimal(t *testing.T) {
 	// the directory-vs-file decision rules which apply even without Bash.
 	wantNames := map[string]bool{
 		"identity":       true,
+		"language":       true,
 		"privacy":        true,
 		"style":          true,
 		"tool_redirects": true,
@@ -63,6 +64,9 @@ func TestAssembleBaseString_NonEmpty(t *testing.T) {
 	// Sanity: section bodies must be joined with double-newlines
 	if !strings.Contains(s, "\n\n") {
 		t.Error("expected double-newline between sections")
+	}
+	if strings.Count(s, "# Language") != 1 {
+		t.Error("language directive should be assembled exactly once")
 	}
 }
 

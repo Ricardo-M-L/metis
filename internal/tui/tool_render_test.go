@@ -228,6 +228,64 @@ func TestRenderToolEvent_CompletionBeforeTimeoutIsPartialAndExpandable(t *testin
 	}
 }
 
+func TestRenderToolEvent_PureTimeoutIsOneSemanticResult(t *testing.T) {
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Input:    map[string]any{"command": "sleep 30"},
+		Output:   "\n\n[command exceeded timeout 20s]",
+		IsError:  true,
+		// A restored or forwarded event may not retain its start timestamp.
+		// The marker is still authoritative and must not be paired with 0ms.
+		Duration: 0,
+	}
+
+	out := stripANSI(renderToolEvent(te, false))
+	if got := strings.Count(out, "timed out after 20s"); got != 1 {
+		t.Fatalf("timeout should appear once as a semantic result, got %d:\n%s", got, out)
+	}
+	for _, unwanted := range []string{"0ms", "command exceeded timeout", "[command"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("raw/contradictory timeout text %q leaked:\n%s", unwanted, out)
+		}
+	}
+}
+
+func TestRenderToolEvent_TimeoutKeepsPriorOutputWithoutMarker(t *testing.T) {
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Input:    map[string]any{"command": "make all"},
+		Output:   "compiled 12 targets\ncache saved\n\n[command exceeded timeout 1m0s]",
+		IsError:  true,
+	}
+
+	for _, expanded := range []bool{false, true} {
+		out := stripANSI(renderToolEvent(te, expanded))
+		for _, want := range []string{"timed out after 1m0s", "compiled 12 targets", "cache saved"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("expanded=%v timeout rendering lost %q:\n%s", expanded, want, out)
+			}
+		}
+		if strings.Contains(out, "command exceeded timeout") || strings.Contains(out, "0ms") {
+			t.Fatalf("expanded=%v leaked raw marker or synthetic duration:\n%s", expanded, out)
+		}
+	}
+}
+
+func TestSplitCommandTimeoutOutput_OnlyMatchesTerminalMarker(t *testing.T) {
+	body, limit, ok := splitCommandTimeoutOutput("progress\n[command exceeded timeout 250ms]")
+	if !ok || body != "progress" || limit != "250ms" {
+		t.Fatalf("terminal timeout split = (%q, %q, %v)", body, limit, ok)
+	}
+
+	original := "warning: [command exceeded timeout 20s] but process recovered\nready"
+	body, limit, ok = splitCommandTimeoutOutput(original)
+	if ok || body != original || limit != "" {
+		t.Fatalf("ordinary timeout prose was rewritten: (%q, %q, %v)", body, limit, ok)
+	}
+}
+
 func TestCompletedBeforeTimeout_RejectsWeakOrContradictoryEvidence(t *testing.T) {
 	base := ToolEvent{
 		Kind: "result", ToolName: "Bash", IsError: true,

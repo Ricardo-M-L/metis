@@ -27,6 +27,17 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
 )
 
+// chatItemGap is the single source of vertical rhythm for the transcript.
+// Individual renderers may contain blank lines inside Markdown, diffs, or tool
+// output, but top-level timeline items do not manufacture their own outer
+// whitespace. This mirrors Claude Code's per-message marginTop={1}: one blank
+// row separates messages while a tool's leader/result rows stay one block.
+const chatItemGap = 1
+
+func normalizeChatItemBoundary(rendered string) string {
+	return strings.Trim(rendered, "\n")
+}
+
 // messageItem adapts a Message into list.Item.
 //
 // We carry the Message by value, not pointer: the list package walks
@@ -51,11 +62,11 @@ type messageItem struct {
 // invalidates cached folded thinking blocks and forces a re-render.
 func (i *messageItem) Render(width int) string {
 	if i.plain {
-		return renderMessagePlain(i.msg, width, i.expand)
+		return normalizeChatItemBoundary(renderMessagePlain(i.msg, width, i.expand))
 	}
 	if i.cache != nil {
 		if cached, ok := i.cache.GetMessage(i.msg, width, i.expand); ok {
-			return cached
+			return normalizeChatItemBoundary(cached)
 		}
 	}
 	t0 := time.Now()
@@ -64,7 +75,7 @@ func (i *messageItem) Render(width int) string {
 		i.cache.RecordRender(i.msg.Role, len(i.msg.Content), time.Since(t0))
 		i.cache.PutMessage(i.msg, width, i.expand, rendered)
 	}
-	return rendered
+	return normalizeChatItemBoundary(rendered)
 }
 
 // compactToolEventItem preserves the normal tool header + result summary but
@@ -89,7 +100,7 @@ func (i *compactToolEventItem) Render(width int) string {
 	if len(lines) > limit {
 		lines = lines[:limit]
 	}
-	return strings.Join(lines, "\n") + "\n"
+	return normalizeChatItemBoundary(strings.Join(lines, "\n"))
 }
 
 // toolEventItem adapts a ToolEvent into list.Item.
@@ -149,7 +160,7 @@ func (i *recoveredErrorGroupItem) Render(width int) string {
 		for _, te := range i.events {
 			out.WriteString(renderToolEvent(te, true))
 		}
-		return out.String()
+		return normalizeChatItemBoundary(out.String())
 	}
 	parts := make([]string, 0, 2)
 	if i.partialCount > 0 {
@@ -174,7 +185,7 @@ func (i *recoveredErrorGroupItem) Render(width int) string {
 	out.WriteString(strings.Join(parts, " · "))
 	out.WriteString(styleMuted.Render(" (ctrl+O to inspect)"))
 	out.WriteString("\n")
-	return out.String()
+	return normalizeChatItemBoundary(out.String())
 }
 
 type recoveredErrorGroupPlan struct {
@@ -444,7 +455,7 @@ func (i *explorationGroupItem) Render(width int) string {
 		for _, te := range i.events {
 			out.WriteString(renderToolEvent(te, true))
 		}
-		return out.String()
+		return normalizeChatItemBoundary(out.String())
 	}
 	reads, searches, listings := 0, 0, 0
 	for _, te := range i.events {
@@ -487,7 +498,7 @@ func (i *explorationGroupItem) Render(width int) string {
 	out.WriteString(strings.Join(parts, " · "))
 	out.WriteString(styleMuted.Render(" (ctrl+O to expand)"))
 	out.WriteString("\n\n")
-	return out.String()
+	return normalizeChatItemBoundary(out.String())
 }
 
 func pluralN(n int, singular, plural string) string {
@@ -522,7 +533,7 @@ func (i *toolEventItem) Render(width int) string {
 	_ = width
 	if i.cache != nil {
 		if cached, ok := i.cache.GetTool(i.te, i.expand, width); ok {
-			return cached
+			return normalizeChatItemBoundary(cached)
 		}
 	}
 	t0 := time.Now()
@@ -531,7 +542,7 @@ func (i *toolEventItem) Render(width int) string {
 		i.cache.RecordRender("tool:"+i.te.ToolName, len(i.te.Output), time.Since(t0))
 		i.cache.PutTool(i.te, i.expand, width, rendered)
 	}
-	return rendered
+	return normalizeChatItemBoundary(rendered)
 }
 
 // staticItem is a list.Item whose render is precomputed once per
@@ -544,7 +555,7 @@ type staticItem struct {
 
 func (s *staticItem) Render(width int) string {
 	_ = width
-	return s.rendered
+	return normalizeChatItemBoundary(s.rendered)
 }
 
 // inProgressThinkingItem renders the live thinking summary for the
@@ -633,7 +644,7 @@ func (it *inProgressThinkingItem) Render(width int) string {
 		}
 		sb.WriteString("\n")
 	}
-	return sb.String()
+	return normalizeChatItemBoundary(sb.String())
 }
 
 // inProgressStreamingItem renders the partial assistant reply for the
@@ -674,7 +685,7 @@ func (it *inProgressStreamingItem) Render(width int) string {
 		}
 	}
 	sb.WriteString("\n")
-	return sb.String()
+	return normalizeChatItemBoundary(sb.String())
 }
 
 // buildChatItems composes a chronologically-ordered []list.Item from the

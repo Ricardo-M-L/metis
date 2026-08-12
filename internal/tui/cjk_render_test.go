@@ -137,28 +137,28 @@ func TestToolArgsPreview_RelativePathResolved(t *testing.T) {
 	}
 }
 
-// TestFormatContextPct_ClampsAbove99 — the 2026-05-16 image #13 repro:
+// TestFormatContextPct_ClampsAt100 — the 2026-05-16 image #13 repro:
 // status bar showed "207139 tokens (107%)". EstimateContextTokens
 // over-counts CJK because chars/4 isn't one-token-per-char on
-// multi-byte glyphs. Anything past 99% is the same signal ("compact
-// soon"), so we clamp the display to "99%+" rather than report a
-// misleading raw number that looks like a bug to users.
-func TestFormatContextPct_ClampsAbove99(t *testing.T) {
+// multi-byte glyphs. Match Claude Code's rounded 0..100 calculation so
+// neither an over-cap raw percentage nor the misleading "99%+" sentinel
+// reaches the UI.
+func TestFormatContextPct_ClampsAt100(t *testing.T) {
 	cases := []struct {
 		used, cap int
 		want      string
 	}{
 		{0, 200000, "0%"},
 		{40000, 200000, "20%"},
-		{99000, 200000, "49%"},
+		{99000, 200000, "50%"},
 		{198000, 200000, "99%"},  // exact boundary — still numeric
 		{198001, 200000, "99%"},  // 99.0005% → integer 99
-		{199500, 200000, "99%"},  // 99.75% → integer 99
-		{200000, 200000, "99%+"}, // exactly cap — clamp signals "at limit"
-		{207139, 200000, "99%+"}, // the actual user-repro number
-		{500000, 200000, "99%+"}, // wildly over (defensive)
-		{120000, 128000, "93%"},  // DeepSeek 128K window normal case
-		{145000, 128000, "99%+"}, // DeepSeek over-cap
+		{199500, 200000, "100%"}, // 99.75% rounds to the limit
+		{200000, 200000, "100%"}, // exactly at the limit
+		{207139, 200000, "100%"}, // the actual user-repro number
+		{500000, 200000, "100%"}, // wildly over (defensive)
+		{120000, 128000, "94%"},  // rounded like Claude Code
+		{145000, 128000, "100%"}, // DeepSeek over-cap
 	}
 	for _, c := range cases {
 		got := formatContextPct(c.used, c.cap)

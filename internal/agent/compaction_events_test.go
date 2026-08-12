@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -10,9 +12,9 @@ import (
 
 // TestMaybeCompact_EmitsCompactionStartEnd — both LLM-driven tiers
 // (Collapse and Compact) must bracket their summarize calls with a
-// CompactionStart / ContextCompacted pair so the TUI can swap the
-// spinner label. Without this the user sees "Thinking..." for 5-30s
-// during summarize and assumes the input area is frozen.
+// CompactionStart / CompactionEnd pair so the TUI can swap the spinner
+// label without conflating lifecycle completion with successful history
+// replacement. ContextCompacted is success-only.
 func TestMaybeCompact_EmitsCompactionStartEnd(t *testing.T) {
 	// Force both tiers to trigger by stuffing the convo with text bulk
 	// that puts us above CollapseThreshold (0.78) and Threshold (0.85).
@@ -28,8 +30,11 @@ func TestMaybeCompact_EmitsCompactionStartEnd(t *testing.T) {
 	// 30 mid-sized messages — enough to cross both Collapse and Compact
 	// thresholds against the 1000-token cap.
 	l.Messages = []llm.Message{msg(llm.RoleUser, "seed")}
-	for i := 0; i < 30; i++ {
-		l.Messages = append(l.Messages, msg(llm.RoleAssistant, strings.Repeat("x", 100)))
+	for i := 0; i < 15; i++ {
+		l.Messages = append(l.Messages,
+			msg(llm.RoleUser, strings.Repeat("u", 100)),
+			msg(llm.RoleAssistant, strings.Repeat("a", 100)),
+		)
 	}
 
 	out := make(chan Event, 64)
@@ -37,12 +42,15 @@ func TestMaybeCompact_EmitsCompactionStartEnd(t *testing.T) {
 	close(out)
 
 	var startTiers, endTiers []string
+	var successes []Event
 	for ev := range out {
 		switch ev.Kind {
 		case EventCompactionStart:
 			startTiers = append(startTiers, ev.Info)
-		case EventContextCompacted:
+		case EventCompactionEnd:
 			endTiers = append(endTiers, ev.Info)
+		case EventContextCompacted:
+			successes = append(successes, ev)
 		}
 	}
 	if len(startTiers) == 0 {
@@ -58,6 +66,69 @@ func TestMaybeCompact_EmitsCompactionStartEnd(t *testing.T) {
 		if i < len(endTiers) && endTiers[i] != tier {
 			t.Errorf("start[%d]=%q but end[%d]=%q — pairs must match", i, tier, i, endTiers[i])
 		}
+	}
+	if len(successes) == 0 {
+		t.Fatal("no successful EventContextCompacted emitted")
+	}
+	last := successes[len(successes)-1]
+	if last.ContextTokens <= 0 || last.PreviousContextTokens <= last.ContextTokens {
+		t.Errorf("success event must carry a real context drop; before=%d after=%d",
+			last.PreviousContextTokens, last.ContextTokens)
+	}
+	if got := int(l.estTokens.Load()); got != estimateTokens(l.Messages) {
+		t.Errorf("cached post-compact estimate = %d, want final history estimate %d",
+			got, estimateTokens(l.Messages))
+	}
+}
+
+// TestMaybeCompact_FailureEndsProgressWithoutSuccess pins the Claude Code
+// lifecycle split: compact_end is emitted from the failure path so the spinner
+// clears, but no ContextCompacted event may claim that history changed.
+func TestMaybeCompact_FailureEndsProgressWithoutSuccess(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	cfg.ProtectFirst = 1
+	cfg.ProtectLast = 3
+	cfg.SnipThreshold = 0
+	cfg.CollapseThreshold = 0
+	cfg.MicrocompactDir = ""
+	cfg.IdleMaxSeconds = 0
+	c := NewCompactor(cfg, "test", 1000, &errSummarizer{err: errors.New("summary unavailable")})
+	l := &Loop{Compactor: c}
+	l.Messages = []llm.Message{msg(llm.RoleUser, "seed")}
+	for i := 0; i < 15; i++ {
+		l.Messages = append(l.Messages,
+			msg(llm.RoleUser, strings.Repeat("u", 100)),
+			msg(llm.RoleAssistant, strings.Repeat("a", 100)),
+		)
+	}
+	before := append([]llm.Message(nil), l.Messages...)
+
+	out := make(chan Event, 32)
+	l.maybeCompact(context.Background(), out)
+	close(out)
+
+	starts, ends, successes := 0, 0, 0
+	for ev := range out {
+		switch ev.Kind {
+		case EventCompactionStart:
+			starts++
+		case EventCompactionEnd:
+			ends++
+			if ev.Err == nil {
+				t.Error("failed attempt emitted CompactionEnd without its error")
+			}
+		case EventContextCompacted:
+			successes++
+		}
+	}
+	if starts != 1 || ends != 1 {
+		t.Fatalf("failure lifecycle starts=%d ends=%d, want 1/1", starts, ends)
+	}
+	if successes != 0 {
+		t.Fatalf("failed compaction emitted %d success events", successes)
+	}
+	if !reflect.DeepEqual(l.Messages, before) {
+		t.Error("failed compaction mutated conversation history")
 	}
 }
 
@@ -163,7 +234,7 @@ func TestMaybeCompact_NoCompactionEventsWhenBelowThreshold(t *testing.T) {
 	close(out)
 
 	for ev := range out {
-		if ev.Kind == EventCompactionStart || ev.Kind == EventContextCompacted {
+		if ev.Kind == EventCompactionStart || ev.Kind == EventCompactionEnd || ev.Kind == EventContextCompacted {
 			t.Errorf("unexpected compaction event below threshold: kind=%v info=%q", ev.Kind, ev.Info)
 		}
 	}
