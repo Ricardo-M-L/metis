@@ -101,7 +101,7 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	if opts.Jobs != nil {
 		bash.AttachJobsRegistry(reg, opts.Jobs, opts.Gate)
 		if opts.Monitors != nil {
-			builtin.AttachMonitorRegistry(reg, opts.Jobs, opts.Monitors, opts.Gate, opts.Cfg.Tools.Bash)
+			builtin.AttachMonitorRegistryWithSandbox(reg, opts.Jobs, opts.Monitors, opts.Gate, opts.Cfg.Tools.Bash, opts.Sandbox)
 		}
 	}
 	// Agent tool: needs the provider + registry references that

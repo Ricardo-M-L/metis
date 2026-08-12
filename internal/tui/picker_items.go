@@ -2,7 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -15,13 +18,14 @@ func (m *Model) sessionsPickerItems(limit int) []screen.PickerItem {
 	if limit <= 0 {
 		limit = 20
 	}
-	entries, err := m.session.List(limit)
+	cwd, _ := os.Getwd()
+	entries, err := m.session.ListResumable(session.ResumeListOptions{Limit: limit, WorkDir: cwd})
 	if err != nil || len(entries) == 0 {
 		return nil
 	}
 	out := make([]screen.PickerItem, 0, len(entries))
 	for _, e := range entries {
-		ts := e.CreatedAt.Local().Format("2006-01-02 15:04")
+		ts := sessionEntryTime(e).Local().Format("2006-01-02 15:04")
 		label := e.Title
 		if label == "" {
 			label = shortID(e.ID)
@@ -35,6 +39,13 @@ func (m *Model) sessionsPickerItems(limit int) []screen.PickerItem {
 		})
 	}
 	return out
+}
+
+func sessionEntryTime(entry session.ListEntry) time.Time {
+	if !entry.UpdatedAt.IsZero() {
+		return entry.UpdatedAt
+	}
+	return entry.CreatedAt
 }
 
 // skillsPickerItems builds the picker rows for /skills.

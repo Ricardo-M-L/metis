@@ -75,10 +75,6 @@ var dangerousPatterns = []DangerousPattern{
 	{Substr: "nc -e /bin/sh", Reason: "netcat with -e (reverse shell)"},
 	{Substr: "nc -e /bin/bash", Reason: "netcat with -e (reverse shell)"},
 	{Substr: "bash -i >& /dev/tcp/", Reason: "/dev/tcp reverse shell"},
-
-	// Mass kill family.
-	{Substr: "kill -9 -1", Reason: "kill -9 -1 (signal everything)"},
-	{Substr: "killall -9", Reason: "killall -9"},
 }
 
 // CheckDangerousPattern scans the canonicalised command/argument

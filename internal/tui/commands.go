@@ -21,6 +21,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -1962,7 +1963,8 @@ func cmdResume(r *REPL, args string) string {
 	if r.Session == nil {
 		return "session store not available"
 	}
-	sessions, err := r.Session.List(50)
+	cwd, _ := os.Getwd()
+	sessions, err := r.Session.ListResumable(session.ResumeListOptions{Limit: 50, WorkDir: cwd})
 	if err != nil {
 		return "failed to list sessions: " + err.Error()
 	}

@@ -3,9 +3,12 @@ package runtime
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
 )
 
@@ -185,6 +188,83 @@ func TestEnsureAPIKey_WizardErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestEnsureAPIKey_WizardCanSelectNewCustomProvider(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	cfg := &config.Config{}
+	cfg.Provider.Default = "anthropic"
+	cfg.Provider.Anthropic.APIKeyEnv = "METIS_TEST_NO_KEY_HERE"
+
+	got, gotProv, err := EnsureAPIKey(cfg, "anthropic", AuthGateOptions{
+		IsTTY: func() bool { return true },
+		RunWizard: func() (*WizardResult, error) {
+			contents := `[provider]
+default = "sensenova"
+
+[provider.custom.sensenova]
+transport = "openai_chat"
+base_url = "https://token.sensenova.cn/v1"
+model = "sensenova-6.8-flash-lite"
+`
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(contents), 0o600); err != nil {
+				return nil, err
+			}
+			if err := auth.Set("sensenova", "sk-test-only"); err != nil {
+				return nil, err
+			}
+			return &WizardResult{Provider: "sensenova", Key: "sk-test-only"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureAPIKey rejected custom provider created by wizard: %v", err)
+	}
+	if gotProv != "sensenova" {
+		t.Fatalf("provider = %q, want sensenova", gotProv)
+	}
+	raw, ok := got.Provider.Custom["sensenova"]
+	if !ok || raw.Model != "sensenova-6.8-flash-lite" {
+		t.Fatalf("reloaded custom provider = %#v, present=%v", raw, ok)
+	}
+}
+
+func TestEnsureAPIKey_WizardConfigReloadErrorPropagates(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	cfg := &config.Config{}
+	cfg.Provider.Default = "anthropic"
+	cfg.Provider.Anthropic.APIKeyEnv = "METIS_TEST_NO_KEY_HERE"
+
+	_, _, err := EnsureAPIKey(cfg, "anthropic", AuthGateOptions{
+		IsTTY: func() bool { return true },
+		RunWizard: func() (*WizardResult, error) {
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[provider\n"), 0o600); err != nil {
+				return nil, err
+			}
+			return &WizardResult{Provider: "sensenova", Key: "sk-test-only"}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "reload config after auth setup") {
+		t.Fatalf("malformed wizard config should return a reload error, got %v", err)
+	}
+}
+
+func TestEnsureAPIKey_WizardUnknownProviderFailsClearly(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	cfg := &config.Config{}
+	cfg.Provider.Default = "anthropic"
+	cfg.Provider.Anthropic.APIKeyEnv = "METIS_TEST_NO_KEY_HERE"
+
+	_, _, err := EnsureAPIKey(cfg, "anthropic", AuthGateOptions{
+		IsTTY: func() bool { return true },
+		RunWizard: func() (*WizardResult, error) {
+			return &WizardResult{Provider: "missing-profile", Key: "sk-test-only"}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), `wizard selected unknown provider "missing-profile"`) {
+		t.Fatalf("unknown wizard provider should fail clearly, got %v", err)
+	}
+}
+
 func TestIsKnownProvider(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Provider.Custom = map[string]config.ProviderRaw{
@@ -193,6 +273,8 @@ func TestIsKnownProvider(t *testing.T) {
 	cases := map[string]bool{
 		"anthropic": true,
 		"openai":    true,
+		"gemini":    true,
+		"google":    true,
 		"groq":      true,
 		"unknown":   false,
 		"":          false,

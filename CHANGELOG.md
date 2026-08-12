@@ -7,6 +7,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **complete custom-provider first-run setup**: the interactive auth wizard
+  now collects the wire protocol, base URL, model id, and API key, persists the
+  non-secret profile separately from credentials, and accepts terminal paste
+  in every text field.
+- **optional terminal-native mouse handling**: `METIS_DISABLE_MOUSE=1` leaves
+  TUI mouse capture off while preserving cell-motion tracking by default.
+
+### Fixed
+
+- **safe process control for model shell tools**: Bash, Workflow, and Monitor
+  now reject direct kill-family shell commands, common wrapped and nested
+  forms, and syntax the guard cannot inspect. Models must stop registered jobs
+  through `BashKill(job_id)`, preventing broad `kill -9` commands from killing
+  Metis; the OS sandbox remains the boundary for arbitrary executable code.
+- **clean project-scoped resume lists**: resume pickers now hide header-only
+  and sub-agent records, default to the current working directory, sort by
+  recent activity, derive titles from the first user prompt, and treat Esc as
+  cancellation instead of silently starting another empty session.
+- **first-run provider activation**: a provider created by the wizard is now
+  reloaded and selected in the same process instead of falling back to the
+  pre-wizard default. API-key input is visible and editable for correction,
+  and custom transports report their effective default model consistently.
+- **credential-to-endpoint binding**: setup validates the final merged endpoint
+  before storing a key, rejects ambiguous existing credentials, and no longer
+  reuses third-party compatibility keys for Anthropic or OpenAI.
+
 ## [0.4.19] - 2026-08-12
 
 ### Changed

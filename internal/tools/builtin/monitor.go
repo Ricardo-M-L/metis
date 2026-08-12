@@ -22,12 +22,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
+	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/shellguard"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 )
@@ -42,6 +46,7 @@ type Monitor struct {
 	Watches  *agent.MonitorRegistry
 	gate     *permission.Gate
 	settings config.ToolBashSettings
+	sandbox  *sandbox.Manager
 }
 
 // NewMonitor wires the tool with the registries the agent loop owns.
@@ -49,10 +54,45 @@ type Monitor struct {
 // caller without backing infra (sub-agent, headless test) shouldn't
 // see the tool listed at all.
 func NewMonitor(j *jobs.Registry, w *agent.MonitorRegistry, gate *permission.Gate, settings config.ToolBashSettings) *Monitor {
+	return NewMonitorWithSandbox(j, w, gate, settings, nil)
+}
+
+// NewMonitorWithSandbox constructs Monitor with the runtime-owned sandbox
+// manager shared by the other model-controlled command tools.
+func NewMonitorWithSandbox(j *jobs.Registry, w *agent.MonitorRegistry, gate *permission.Gate, settings config.ToolBashSettings, manager *sandbox.Manager) *Monitor {
 	if j == nil || w == nil {
 		return nil
 	}
-	return &Monitor{Jobs: j, Watches: w, gate: gate, settings: settings}
+	return &Monitor{Jobs: j, Watches: w, gate: gate, settings: settings, sandbox: manager}
+}
+
+// WithSandbox installs the runtime-owned sandbox manager.
+func (m *Monitor) WithSandbox(manager *sandbox.Manager) *Monitor {
+	if m != nil {
+		m.sandbox = manager
+	}
+	return m
+}
+
+// SandboxManager exposes the injected manager for runtime wiring tests.
+func (m Monitor) SandboxManager() *sandbox.Manager { return m.sandbox }
+
+func (m Monitor) wrapCommand(cmd *exec.Cmd) (*exec.Cmd, error) {
+	if m.sandbox == nil {
+		mode, err := sandbox.ParseMode(m.settings.Sandbox.Mode)
+		if err != nil {
+			return nil, err
+		}
+		if mode != sandbox.ModeOff {
+			return nil, fmt.Errorf("sandbox mode %q requires a runtime sandbox manager", mode)
+		}
+		return cmd, nil
+	}
+	network := sandbox.NetworkAllow
+	if !m.settings.Sandbox.DangerouslyAllowNetwork && strings.EqualFold(m.settings.Sandbox.Network, "block") {
+		network = sandbox.NetworkBlock
+	}
+	return m.sandbox.Wrap(cmd, sandbox.Request{Cwd: cmd.Dir, Network: network})
 }
 
 // AttachMonitorRegistry registers the Monitor tool. Called from the
@@ -64,7 +104,13 @@ func NewMonitor(j *jobs.Registry, w *agent.MonitorRegistry, gate *permission.Gat
 // signature stable (no agent.MonitorRegistry param) — callers that
 // don't need watching can wire jobs without touching monitor.
 func AttachMonitorRegistry(reg *tools.Registry, j *jobs.Registry, w *agent.MonitorRegistry, gate *permission.Gate, settings config.ToolBashSettings) {
-	tool := NewMonitor(j, w, gate, settings)
+	AttachMonitorRegistryWithSandbox(reg, j, w, gate, settings, nil)
+}
+
+// AttachMonitorRegistryWithSandbox registers Monitor with the same sandbox
+// manager used by Bash and Workflow.
+func AttachMonitorRegistryWithSandbox(reg *tools.Registry, j *jobs.Registry, w *agent.MonitorRegistry, gate *permission.Gate, settings config.ToolBashSettings, manager *sandbox.Manager) {
+	tool := NewMonitorWithSandbox(j, w, gate, settings, manager)
 	if tool == nil {
 		return
 	}
@@ -112,6 +158,9 @@ func (m Monitor) CanUse(ctx context.Context, in map[string]any) (tools.Permissio
 	if cmd == "" {
 		return tools.PermissionDeny, "Monitor: empty command"
 	}
+	if err := shellguard.Check(cmd); err != nil {
+		return tools.PermissionDeny, "Monitor: " + err.Error()
+	}
 	if m.gate != nil {
 		decision, src := m.gate.Check(ctx, "Bash", cmd)
 		switch decision {
@@ -132,6 +181,9 @@ func (m Monitor) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 	desc, _ := in["description"].(string)
 	if cmd == "" {
 		return &tools.Result{Output: "Monitor: command required", IsError: true}, nil
+	}
+	if err := shellguard.Check(cmd); err != nil {
+		return &tools.Result{Output: "Monitor: " + err.Error(), IsError: true}, nil
 	}
 	if desc == "" {
 		desc = "(no description)"
@@ -161,8 +213,21 @@ func (m Monitor) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 		shell = "/bin/bash"
 	}
 	exe := jobs.OOMWrappedCommand(bgCtx, shell, cmd)
-	exe.Env = bash.FilterEnv(os.Environ(), m.settings.Sandbox.DangerouslyInheritEnv)
+	if m.sandbox != nil {
+		exe.Env = m.sandbox.FilterEnv(os.Environ(), m.settings.Sandbox.DangerouslyInheritEnv)
+	} else {
+		exe.Env = bash.FilterEnv(os.Environ(), m.settings.Sandbox.DangerouslyInheritEnv)
+	}
 	exe.Env = bash.ApplyNetworkPolicy(exe.Env, m.settings.Sandbox)
+	if cwd := agent.CwdFromContext(ctx); cwd != "" {
+		exe.Dir = cwd
+	}
+	wrapped, err := m.wrapCommand(exe)
+	if err != nil {
+		cancel()
+		return &tools.Result{Output: "Monitor: sandbox wrap failed: " + err.Error(), IsError: true}, nil
+	}
+	exe = wrapped
 	jobs.ApplyProcessGroup(exe)
 
 	jb, err := m.Jobs.Spawn(jobs.SpawnArgs{

@@ -891,12 +891,30 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	// First-run auth gate: launches the wizard when no key is resolvable
 	// AND stderr is interactive AND the user hasn't passed --no-auth-wizard.
+	providerBeforeAuth := provName
+	cfgBeforeAuth := cfg
+	// The first-run wizard may create or update the user config while this
+	// function is running. Re-pin both the merged config and its staleness
+	// baseline so the brand-new provider profile is not immediately reported
+	// as an external mid-session edit.
 	cfg, provName, err = rtpkg.EnsureAPIKey(cfg, provName, rtpkg.AuthGateOptions{
 		NoWizard:  flags.noAuthWizard,
 		IsTTY:     func() bool { return term.IsTerminal(int(os.Stderr.Fd())) },
 		RunWizard: wizardAdapter,
 		Stderr:    os.Stderr,
 	})
+	if err != nil {
+		return nil, err
+	}
+	authReloadedConfig := cfg != cfgBeforeAuth
+	_, wizardConfiguredCustom := cfg.Provider.Custom[provName]
+	model = modelAfterProviderSelection(model, providerBeforeAuth, provName, modelSet, authReloadedConfig && wizardConfiguredCustom)
+	// EnsureAPIKey returns the original config pointer on the ordinary
+	// credentials-present path and a freshly loaded config after the wizard.
+	// Refresh the staleness baseline only for the latter: unrelated edits that
+	// happen during a normal startup must remain visible as config drift rather
+	// than being silently incorporated halfway through setup.
+	cfg, snap, err = refreshConfigSnapshotAfterAuth(cfg, snap, authReloadedConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -1551,7 +1569,8 @@ func resolveResumeTarget(flags *cliFlags, store *session.Store) (string, error) 
 		resumeTarget = picked
 	}
 	if resumeTarget == "" && flags.cont {
-		entries, listErr := store.List(1)
+		cwd, _ := os.Getwd()
+		entries, listErr := store.ListResumable(session.ResumeListOptions{Limit: 1, WorkDir: cwd})
 		if listErr != nil {
 			fmt.Fprintf(os.Stderr, "metis: --continue: %v (starting fresh)\n", listErr)
 		} else if len(entries) == 0 {
@@ -1627,6 +1646,9 @@ func cmdChat(ctx context.Context, args []string) error {
 
 	rt, err := setupRuntime(ctx, flags)
 	if err != nil {
+		if errors.Is(err, errResumePickerCancelled) {
+			return nil
+		}
 		return err
 	}
 	defer rt.Cleanup()
@@ -4117,4 +4139,22 @@ func wizardAdapter() (*rtpkg.WizardResult, error) {
 		return nil, err
 	}
 	return &rtpkg.WizardResult{Provider: res.Provider, Key: res.Key}, nil
+}
+
+func refreshConfigSnapshotAfterAuth(cfg *config.Config, snap *config.Snapshot, authReloadedConfig bool) (*config.Config, *config.Snapshot, error) {
+	if !authReloadedConfig {
+		return cfg, snap, nil
+	}
+	reloaded, _, fresh, err := config.LoadWithSnapshot()
+	if err != nil {
+		return nil, nil, fmt.Errorf("reload config snapshot after auth setup: %w", err)
+	}
+	return reloaded, fresh, nil
+}
+
+func modelAfterProviderSelection(model, before, after string, explicit, wizardConfiguredCustom bool) string {
+	if !explicit && (before != after || wizardConfiguredCustom) {
+		return ""
+	}
+	return model
 }

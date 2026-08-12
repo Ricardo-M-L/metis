@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -95,6 +96,32 @@ func TestWorkflowTool_PermissionGatesEveryStep(t *testing.T) {
 	perm, _ := w.CanUse(context.Background(), in)
 	if perm != tools.PermissionDeny {
 		t.Errorf("a denied step command must deny the workflow; got %v", perm)
+	}
+}
+
+func TestWorkflowTool_ProcessGuardPreflightsAllSteps(t *testing.T) {
+	t.Parallel()
+	w := NewWorkflow(permission.New(permission.ModeBypassPermissions), nil)
+	marker := filepath.Join(t.TempDir(), "must-not-exist")
+	in := map[string]any{
+		"operation": "run",
+		"steps": inlineSteps(
+			[2]string{"would-run-first", "touch " + marker},
+			[2]string{"dangerous", "pkill metis"},
+		),
+	}
+	if got, source := w.CanUse(context.Background(), in); got != tools.PermissionDeny || !strings.Contains(source, "BashKill(job_id)") {
+		t.Fatalf("CanUse = %v (%q), want process-guard deny", got, source)
+	}
+	res, err := w.Execute(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !res.IsError || !strings.Contains(res.Output, "BashKill(job_id)") {
+		t.Fatalf("Execute = %+v, want process-guard denial", res)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("workflow ran an earlier step before preflight; marker stat err=%v", err)
 	}
 }
 

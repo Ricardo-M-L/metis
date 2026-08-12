@@ -242,8 +242,9 @@ func (Kill) InputSchema() map[string]any {
 	}
 }
 func (Kill) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
-func (k Kill) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
-	d, src := k.gate.Check(context.Background(), "Kill", "")
+func (k Kill) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	id, _ := in["job_id"].(string)
+	d, src := k.gate.Check(ctx, "BashKill", id)
 	return mapDecision(d), src
 }
 func (k Kill) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {

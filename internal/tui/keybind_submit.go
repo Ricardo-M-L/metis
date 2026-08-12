@@ -22,6 +22,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
@@ -1262,23 +1263,19 @@ func (m *Model) buildResumeSessions() []screen.SessionEntry {
 	if m.session == nil {
 		return nil
 	}
-	entries, err := m.session.List(50)
+	cwd, _ := os.Getwd()
+	entries, err := m.session.ListResumable(session.ResumeListOptions{Limit: 50, WorkDir: cwd})
 	if err != nil {
 		return nil
 	}
 	out := make([]screen.SessionEntry, 0, len(entries))
 	for _, e := range entries {
-		messageCount := 0
-		if m.session.CheckResumeSize(e.ID) == nil {
-			_, messages, _ := m.session.Load(e.ID)
-			messageCount = len(messages)
-		}
 		out = append(out, screen.SessionEntry{
 			ID:           e.ID,
 			Title:        e.Title,
 			Model:        e.Model,
-			CreatedAt:    e.CreatedAt,
-			MessageCount: messageCount,
+			CreatedAt:    sessionEntryTime(e),
+			MessageCount: e.MessageCount,
 		})
 	}
 	return out

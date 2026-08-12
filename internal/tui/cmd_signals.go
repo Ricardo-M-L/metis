@@ -46,7 +46,8 @@ func renderSessionsList(store *session.Store, limit int) string {
 	if limit <= 0 {
 		limit = 20
 	}
-	entries, err := store.List(limit)
+	cwd, _ := os.Getwd()
+	entries, err := store.ListResumable(session.ResumeListOptions{Limit: limit, WorkDir: cwd})
 	if err != nil {
 		return "sessions: " + err.Error()
 	}
@@ -55,7 +56,7 @@ func renderSessionsList(store *session.Store, limit int) string {
 	}
 	rows := make([]infoRow, 0, len(entries))
 	for _, e := range entries {
-		ts := e.CreatedAt.Local().Format("2006-01-02 15:04")
+		ts := sessionEntryTime(e).Local().Format("2006-01-02 15:04")
 		label := e.Title
 		if label == "" {
 			label = e.Model

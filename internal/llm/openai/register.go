@@ -24,5 +24,5 @@ func build(opts transport.BuildOpts) (*transport.Result, error) {
 	if opts.ContextWindow > 0 {
 		p.ContextWindow = opts.ContextWindow
 	}
-	return &transport.Result{Provider: p, Model: opts.Model}, nil
+	return &transport.Result{Provider: p, Model: p.Model}, nil
 }

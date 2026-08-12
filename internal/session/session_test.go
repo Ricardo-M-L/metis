@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -99,6 +100,119 @@ func TestSession_List(t *testing.T) {
 	}
 	if len(es) != 3 {
 		t.Errorf("got %d sessions, want 3", len(es))
+	}
+}
+
+func TestListResumableFiltersEmptySubagentAndOtherWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(t.TempDir(), "current")
+	other := filepath.Join(t.TempDir(), "other")
+	if err := os.MkdirAll(current, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := NewStore(dir)
+	write := func(h Header, messages ...llm.Message) {
+		t.Helper()
+		if err := store.WriteHeaderFull(h); err != nil {
+			t.Fatal(err)
+		}
+		for _, message := range messages {
+			if err := store.AppendMessage(h.ID, message); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	user := func(text string) llm.Message {
+		return llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: text}}}
+	}
+	write(Header{ID: "empty", WorkDir: current, Model: "m"})
+	write(Header{ID: "other", WorkDir: other, Model: "m"}, user("other prompt"))
+	write(Header{ID: "child", WorkDir: current, Model: "m", SubAgentOf: "parent"}, user("child prompt"))
+	write(Header{ID: "current", WorkDir: current, Model: "m"}, user("fix the resume picker"))
+
+	got, err := store.ListResumable(ResumeListOptions{Limit: 20, WorkDir: current})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "current" {
+		t.Fatalf("resumable = %#v, want only current", got)
+	}
+	if got[0].MessageCount != 1 || got[0].Title != "fix the resume picker" {
+		t.Fatalf("metadata = %#v, want message count and first-prompt title", got[0])
+	}
+}
+
+func TestListResumableIncludesSameRepositorySubdirectory(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	subdir := filepath.Join(repo, "nested", "package")
+	otherRepo := filepath.Join(t.TempDir(), "other-repo")
+	for _, dir := range []string{filepath.Join(repo, ".git"), subdir, filepath.Join(otherRepo, ".git")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store, _ := NewStore(t.TempDir())
+	user := llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "same repository"}}}
+	for _, header := range []Header{
+		{ID: "repo-root", WorkDir: repo, Model: "m"},
+		{ID: "other-repo", WorkDir: otherRepo, Model: "m"},
+	} {
+		if err := store.WriteHeaderFull(header); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendMessage(header.ID, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := store.ListResumable(ResumeListOptions{Limit: 20, WorkDir: subdir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "repo-root" {
+		t.Fatalf("resumable from repo subdirectory = %#v, want repo-root", got)
+	}
+}
+
+func TestListUsesLatestActivityAndHistoryReplaceCount(t *testing.T) {
+	store, _ := NewStore(t.TempDir())
+	base := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	for _, id := range []string{"older-created", "newer-created"} {
+		if err := store.WriteHeaderFull(Header{ID: id, CreatedAt: base, Model: "m"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendMessage(id, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: id}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	olderPath := store.path("older-created")
+	newerPath := store.path("newer-created")
+	if err := os.Chtimes(newerPath, base.Add(time.Minute), base.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(olderPath, base.Add(2*time.Minute), base.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceHistoryAndMark("older-created", []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "replacement"}}},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "answer"}}},
+	}, &HistoryCursor{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(olderPath, base.Add(3*time.Minute), base.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.List(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "older-created" || got[0].MessageCount != 2 || got[0].Title != "replacement" {
+		t.Fatalf("list = %#v", got)
 	}
 }
 

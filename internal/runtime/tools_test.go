@@ -4,9 +4,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/channels"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 )
 
 func TestBuildToolRegistry_RegistersBuiltinsAndAgentAndSendMessage(t *testing.T) {
@@ -63,5 +67,46 @@ func TestBuildToolRegistry_AgentToolHasModelAndSystem(t *testing.T) {
 	}
 	if agent.Description() == "" {
 		t.Error("Agent tool description should be non-empty")
+	}
+}
+
+func TestBuildToolRegistryInjectsSandboxIntoMonitor(t *testing.T) {
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	pool := jobs.NewRegistry(t.TempDir())
+	t.Cleanup(func() { pool.Shutdown(0) })
+
+	reg := BuildToolRegistry(ToolRegistryOptions{
+		Cfg:             &config.Config{},
+		Gate:            permission.New(permission.ModeBypassPermissions),
+		Provider:        &stubProvider{maxCtx: 100_000},
+		Model:           "test-model",
+		System:          "test-system",
+		ChannelRegistry: channels.NewRegistry(),
+		Sandbox:         manager,
+		Jobs:            pool,
+		Monitors:        agent.NewMonitorRegistry(1),
+	})
+	t.Cleanup(func() {
+		if monitor, ok := reg.Get("Monitor"); ok {
+			if typed, ok := monitor.(builtin.Monitor); ok {
+				typed.Watches.StopAll()
+			}
+		}
+	})
+
+	registered, ok := reg.Get("Monitor")
+	if !ok {
+		t.Fatal("Monitor tool was not registered")
+	}
+	monitor, ok := registered.(builtin.Monitor)
+	if !ok {
+		t.Fatalf("Monitor registration type = %T", registered)
+	}
+	if monitor.SandboxManager() != manager {
+		t.Fatal("BuildToolRegistry did not inject its sandbox Manager into Monitor")
 	}
 }

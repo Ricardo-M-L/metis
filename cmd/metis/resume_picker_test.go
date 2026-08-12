@@ -1,8 +1,14 @@
 package main
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
 func TestLiftBareResume(t *testing.T) {
@@ -66,6 +72,48 @@ func TestLiftBareResume(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRunResumePickerDoesNotOfferHeaderOnlySessions(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := os.Getwd()
+	if err := store.WriteHeaderFull(session.Header{ID: "empty", WorkDir: cwd, Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runResumePicker(store); !errors.Is(err, errResumePickerCancelled) {
+		t.Fatalf("runResumePicker error = %v, want cancellation without creating fresh session", err)
+	}
+	entries, err := store.List(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "empty" {
+		t.Fatalf("picker mutated sessions: %#v", entries)
+	}
+}
+
+func TestListResumableForPickerScopesToCurrentDirectory(t *testing.T) {
+	store, _ := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	current := t.TempDir()
+	other := t.TempDir()
+	for id, workDir := range map[string]string{"current": current, "other": other} {
+		if err := store.WriteHeaderFull(session.Header{ID: id, WorkDir: workDir, Model: "m"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendMessage(id, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: id}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := store.ListResumable(session.ResumeListOptions{Limit: 200, WorkDir: current})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "current" {
+		t.Fatalf("picker entries = %#v, want current workspace only", got)
 	}
 }
 

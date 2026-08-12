@@ -131,6 +131,7 @@ func TestF8_MouseWheel_ScrollsTranscript(t *testing.T) {
 // motion so real SGR wheel events reach Update instead of scrolling iTerm2's
 // unrelated normal-screen scrollback behind the alternate buffer.
 func TestF8_MouseModeCapturesWheel(t *testing.T) {
+	t.Setenv("METIS_DISABLE_MOUSE", "")
 	m := newE2EModel(t, 120, 30, 0)
 	v := m.View()
 	if v.MouseMode != tea.MouseModeCellMotion {

@@ -1190,7 +1190,7 @@ function renderSessions() {
   const now = Date.now();
 
   sessions.forEach(s => {
-    const t = new Date(s.createdAt).getTime();
+    const t = new Date(s.updatedAt || s.createdAt).getTime();
     const diff = now - t;
     if (diff < 86400000) today.push(s);
     else if (diff < 7 * 86400000) thisWeek.push(s);

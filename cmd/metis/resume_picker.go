@@ -21,6 +21,7 @@ package main
 // safety prompt.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -32,6 +33,8 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
+
+var errResumePickerCancelled = errors.New("resume picker cancelled")
 
 // liftBareResume walks `args` and removes any `-r` / `--resume` token
 // that's NOT followed by a value. Sets *pick=true when it removes one.
@@ -69,22 +72,18 @@ func liftBareResume(args []string, pick *bool) []string {
 }
 
 // runResumePicker opens a bubbletea selector over recent sessions and
-// returns the full session id the user chose. Empty string + nil
-// means "user cancelled — start a fresh session" (Esc / q / Enter on
-// an empty list).
-//
-// Errors are reserved for store/IO failures; everything user-driven
-// (cancel, no sessions, bad terminal) returns ("", nil) and the
-// caller falls through to a fresh chat.
+// returns the full session id the user chose. Cancelling is distinct from
+// starting fresh: merely opening `metis -r` must never create a new session.
 func runResumePicker(store *session.Store) (string, error) {
 	const limit = 200
-	entries, err := store.List(limit)
+	cwd, _ := os.Getwd()
+	entries, err := store.ListResumable(session.ResumeListOptions{Limit: limit, WorkDir: cwd})
 	if err != nil {
 		return "", fmt.Errorf("list sessions: %w", err)
 	}
 	if len(entries) == 0 {
-		fmt.Fprintln(os.Stderr, "(no prior sessions — starting fresh)")
-		return "", nil
+		fmt.Fprintln(os.Stderr, "(no resumable sessions for this directory)")
+		return "", errResumePickerCancelled
 	}
 
 	m := &resumePickerModel{entries: entries, viewSize: 15}
@@ -98,8 +97,8 @@ func runResumePicker(store *session.Store) (string, error) {
 		return runResumePickerFallback(store, entries)
 	}
 	if m.cancelled || m.cursor < 0 {
-		fmt.Fprintln(os.Stderr, "(starting fresh)")
-		return "", nil
+		fmt.Fprintln(os.Stderr, "(resume cancelled)")
+		return "", errResumePickerCancelled
 	}
 	return m.entries[m.cursor].ID, nil
 }
@@ -225,7 +224,7 @@ func (m *resumePickerModel) View() tea.View {
 		if title == "" {
 			title = "(untitled)"
 		}
-		date := e.CreatedAt.Format("2006-01-02 15:04")
+		date := resumeEntryTime(e).Format("2006-01-02 15:04")
 		// Compose the row. Format:
 		//   ❯ <full-uuid>  <date>  <title>
 		// Truncate the title rather than the id so the user can always
@@ -290,21 +289,21 @@ func runResumePickerFallback(store *session.Store, entries []session.ListEntry) 
 			title = "(untitled)"
 		}
 		fmt.Fprintf(os.Stderr, "  %2d. %s  %s  %s\n",
-			i+1, e.ID, e.CreatedAt.Format("2006-01-02 15:04"), title)
+			i+1, e.ID, resumeEntryTime(e).Format("2006-01-02 15:04"), title)
 	}
-	fmt.Fprint(os.Stderr, "Pick number (or `q` / Enter for fresh): ")
+	fmt.Fprint(os.Stderr, "Pick number (or `q` / Enter to cancel): ")
 	var line string
 	if _, err := fmt.Fscanln(os.Stdin, &line); err != nil {
-		return "", nil
+		return "", errResumePickerCancelled
 	}
 	line = strings.TrimSpace(line)
 	if line == "" || line == "q" || line == "Q" || line == "0" {
-		return "", nil
+		return "", errResumePickerCancelled
 	}
 	n, err := strconv.Atoi(line)
 	if err != nil || n < 1 || n > len(entries) {
-		fmt.Fprintf(os.Stderr, "(invalid choice %q — starting fresh)\n", line)
-		return "", nil
+		fmt.Fprintf(os.Stderr, "(invalid choice %q — resume cancelled)\n", line)
+		return "", errResumePickerCancelled
 	}
 	return entries[n-1].ID, nil
 }
@@ -322,3 +321,10 @@ func short12(id string) string {
 // Compile-time sanity that time.Time stays imported (we use it via
 // session.ListEntry.CreatedAt above).
 var _ = time.Time{}
+
+func resumeEntryTime(entry session.ListEntry) time.Time {
+	if !entry.UpdatedAt.IsZero() {
+		return entry.UpdatedAt
+	}
+	return entry.CreatedAt
+}

@@ -74,9 +74,11 @@ type SavedRule struct {
 // ListEntry is one row of session.Store.List() output: enough to render
 // a session-picker without loading the full transcript.
 type ListEntry struct {
-	ID        string
-	CreatedAt time.Time
-	Model     string
-	Title     string // empty when /title hasn't been called for this session
-	Bytes     int64
+	ID           string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	Model        string
+	Title        string // custom title, or a display fallback derived from the first user prompt
+	Bytes        int64
+	MessageCount int
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -265,6 +266,99 @@ func mergeHeader(dst *Header, src *Header) {
 // ListEntry re-export — same alias pattern.
 type ListEntry = pubsess.ListEntry
 
+// ResumeListOptions limits the user-facing resume catalog. Administrative
+// callers such as `metis ps` should keep using List so a live header-only
+// process remains observable even before its first prompt.
+type ResumeListOptions struct {
+	Limit   int
+	WorkDir string
+}
+
+// ListResumable returns top-level sessions that contain conversation history.
+// Header-only startup artifacts and sub-agent transcripts are intentionally
+// absent from the human resume picker. When WorkDir is set, sessions from a
+// different project are hidden; legacy headers without a work_dir remain
+// visible so old conversations are not stranded.
+func (s *Store) ListResumable(opts ResumeListOptions) ([]ListEntry, error) {
+	entries, err := s.List(0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ListEntry, 0, min(len(entries), opts.Limit))
+	for _, entry := range entries {
+		if entry.MessageCount == 0 {
+			continue
+		}
+		hdr, _, err := s.LoadHeader(entry.ID)
+		if err != nil || hdr.SubAgentOf != "" {
+			continue
+		}
+		if opts.WorkDir != "" && hdr.WorkDir != "" && !sameWorkDir(hdr.WorkDir, opts.WorkDir) {
+			continue
+		}
+		out = append(out, entry)
+		if opts.Limit > 0 && len(out) == opts.Limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func sameWorkDir(left, right string) bool {
+	if samePath(left, right) {
+		return true
+	}
+	leftRoot := nearestGitRoot(left)
+	rightRoot := nearestGitRoot(right)
+	if leftRoot != "" && rightRoot != "" {
+		return samePath(leftRoot, rightRoot)
+	}
+	return false
+}
+
+func nearestGitRoot(path string) string {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		path = filepath.Dir(path)
+	}
+	for {
+		if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
+			return path
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return ""
+		}
+		path = parent
+	}
+}
+
+func samePath(left, right string) bool {
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	if leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo) {
+		return true
+	}
+	if abs, err := filepath.Abs(left); err == nil {
+		left = abs
+	}
+	if abs, err := filepath.Abs(right); err == nil {
+		right = abs
+	}
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
 // List enumerates available sessions, newest first.
 func (s *Store) List(limit int) ([]ListEntry, error) {
 	entries, err := os.ReadDir(s.Dir)
@@ -281,16 +375,21 @@ func (s *Store) List(limit int) ([]ListEntry, error) {
 			continue
 		}
 		id := e.Name()[:len(e.Name())-len(".jsonl")]
-		hdr, _, err := s.LoadHeader(id)
+		hdr, messageCount, err := s.LoadHeader(id)
 		if err != nil {
 			continue
 		}
 		out = append(out, ListEntry{
-			ID: id, CreatedAt: hdr.CreatedAt, Model: hdr.Model,
-			Title: hdr.Title, Bytes: info.Size(),
+			ID: id, CreatedAt: hdr.CreatedAt, UpdatedAt: info.ModTime(), Model: hdr.Model,
+			Title: hdr.Title, Bytes: info.Size(), MessageCount: messageCount,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
@@ -306,18 +405,41 @@ func (s *Store) LoadHeader(id string) (*Header, int, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	var hdr *Header
+	messageCount := 0
+	firstUserPrompt := ""
 	for sc.Scan() {
 		var e Entry
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
 			return nil, 0, err
 		}
-		if e.Type != "header" || e.Header == nil {
-			continue
-		}
-		if hdr == nil {
-			hdr = e.Header
-		} else {
-			mergeHeader(hdr, e.Header)
+		switch e.Type {
+		case "header":
+			if e.Header == nil {
+				continue
+			}
+			if hdr == nil {
+				hdr = e.Header
+			} else {
+				mergeHeader(hdr, e.Header)
+			}
+		case "message":
+			if e.Message != nil {
+				messageCount++
+				if firstUserPrompt == "" && e.Message.Role == llm.RoleUser {
+					firstUserPrompt = sessionMessageTitle(*e.Message)
+				}
+			}
+		case "history_replace":
+			messageCount = len(e.Messages)
+			firstUserPrompt = ""
+			for _, message := range e.Messages {
+				if message.Role == llm.RoleUser {
+					firstUserPrompt = sessionMessageTitle(message)
+					if firstUserPrompt != "" {
+						break
+					}
+				}
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -326,7 +448,29 @@ func (s *Store) LoadHeader(id string) (*Header, int, error) {
 	if hdr == nil {
 		return nil, 0, errors.New("session header missing")
 	}
-	return hdr, 0, nil
+	if hdr.Title == "" {
+		hdr.Title = firstUserPrompt
+	}
+	return hdr, messageCount, nil
+}
+
+func sessionMessageTitle(message llm.Message) string {
+	for _, block := range message.Content {
+		if block.Type != "text" {
+			continue
+		}
+		text := strings.Join(strings.Fields(block.Text), " ")
+		if text == "" {
+			continue
+		}
+		const maxRunes = 72
+		runes := []rune(text)
+		if len(runes) > maxRunes {
+			return string(runes[:maxRunes-1]) + "…"
+		}
+		return text
+	}
+	return ""
 }
 
 // SetTitle records a free-form title for the session by appending a partial

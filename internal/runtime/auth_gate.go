@@ -88,14 +88,22 @@ func EnsureAPIKey(cfg *config.Config, provName string, opts AuthGateOptions) (*c
 			}
 			return nil, "", werr
 		}
-		if res != nil && res.Provider != "" && res.Provider != provName && IsKnownProvider(cfg, res.Provider) {
-			provName = res.Provider
-		}
 		// Reload config so any state the wizard wrote (auth.json) is
-		// reflected for the rest of bootstrap.
-		if newCfg, _, lerr := config.Load(); lerr == nil {
-			cfg = newCfg
+		// reflected for the rest of bootstrap. Custom-provider setup may
+		// also have created config.toml, so validate the selected provider
+		// against the freshly loaded config rather than the stale input.
+		newCfg, _, lerr := config.Load()
+		if lerr != nil {
+			return nil, "", fmt.Errorf("reload config after auth setup: %w", lerr)
 		}
+		cfg = newCfg
+		if res == nil || res.Provider == "" {
+			return nil, "", errors.New("auth wizard returned no provider")
+		}
+		if !IsKnownProvider(cfg, res.Provider) {
+			return nil, "", fmt.Errorf("wizard selected unknown provider %q", res.Provider)
+		}
+		provName = res.Provider
 	}
 
 	// After the wizard run (or skipped), final check. If still missing,
@@ -131,7 +139,7 @@ func missingProviderCredentialsError(cfg *config.Config, provName string) error 
 // keeps its original choice.
 func IsKnownProvider(cfg *config.Config, id string) bool {
 	switch id {
-	case "anthropic", "openai":
+	case "anthropic", "openai", "gemini", "google":
 		return true
 	}
 	if cfg == nil {

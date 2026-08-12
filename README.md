@@ -227,9 +227,21 @@ A later source wins when two skills have the same name.
 | `!cmd` | bash mode — runs `cmd` in shell without invoking the LLM |
 | Enter mid-turn | queue input; runs as the next turn after the current one finishes |
 
+Mouse capture defaults to cell-motion mode so Metis can scroll the transcript,
+copy clicked or dragged text, and open rendered links. Set
+`METIS_DISABLE_MOUSE=1` before launch to leave mouse handling to the terminal.
+With capture disabled, Metis does not receive wheel, click, drag, or link-click
+events: use `PgUp`/`PgDn` and `Home`/`End` to navigate, `Ctrl+Y` or
+`Ctrl+Shift+Y` to copy replies, and `Ctrl+S` for native selection (including
+copying a URL to open manually).
+
 ## Configuration
 
 Edit `~/.metis/config.toml`. Project-local `./.metis/config.toml` overrides.
+On first run, the interactive setup can also create a custom API-key profile:
+choose its wire protocol, paste either a base URL or a recognized full endpoint,
+then enter the model id and editable API key. The key is stored separately in
+`~/.metis/auth.json`, never in the generated provider block.
 
 ```toml
 [provider]
@@ -404,6 +416,13 @@ Three tools work the pool:
 | `BashList` | JSON snapshot of all jobs (id, status, command, elapsed, exit_code) |
 | `BashOutput` | Read a job's captured stdout/stderr; `tail_max` caps return size (default 50 KiB) |
 | `BashKill` | SIGTERM + 2s grace + SIGKILL escalation |
+
+Direct shell invocations of `kill`, `pkill`, `killall`, `taskkill`, and
+`Stop-Process` are blocked in model-controlled Bash, Workflow, and Monitor
+execution, including common wrapped or nested forms. Commands the guard cannot
+parse are rejected rather than executed. Use `BashKill(job_id)` so process
+termination stays scoped to jobs Metis registered for the current process;
+the OS sandbox remains the boundary for arbitrary interpreter or binary code.
 
 Output is captured to `~/.metis/jobs/<id>.out` (mode 0600). The TUI
 status bar shows `⚙ N jobs` while jobs are alive.

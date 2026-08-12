@@ -78,6 +78,15 @@ func TestSessionCreateListAndLoad(t *testing.T) {
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(created.ID)) {
 		t.Fatalf("list: %d %s", rr.Code, rr.Body.String())
 	}
+	var listed struct {
+		Sessions []sessionItem `json:"sessions"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Sessions) != 1 || !listed.Sessions[0].CreatedAt.Equal(created.CreatedAt) || listed.Sessions[0].UpdatedAt.IsZero() {
+		t.Fatalf("listed session timestamps = %+v, want stable createdAt plus updatedAt", listed.Sessions)
+	}
 
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/"+created.ID, nil))

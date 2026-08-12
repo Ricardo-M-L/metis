@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/shellguard"
 	"github.com/Ricardo-M-L/metis/internal/spill"
 )
 
@@ -77,6 +78,21 @@ const (
 // failed step (non-zero exit, timeout, or spawn error) stops the run
 // when StopOnError; the remaining steps are returned with StatusSkipped.
 func Run(ctx context.Context, wf Workflow, opts RunOptions) []StepResult {
+	// Preflight the complete workflow before spawning step one. Model callers
+	// can reach this lower-level runner without the Workflow tool's CanUse, and
+	// discovering a blocked later step after earlier mutations is too late.
+	for blockedIndex, step := range wf.Steps {
+		if err := shellguard.Check(step.Command); err != nil {
+			results := make([]StepResult, len(wf.Steps))
+			for i, candidate := range wf.Steps {
+				results[i] = StepResult{Name: candidate.Name, Command: candidate.Command, Status: StatusSkipped}
+			}
+			results[blockedIndex].Status = StatusFailed
+			results[blockedIndex].ExitCode = -1
+			results[blockedIndex].Output = "[blocked] " + err.Error()
+			return results
+		}
+	}
 	timeout := opts.PerStepTimeout
 	if timeout <= 0 {
 		timeout = DefaultStepTimeout

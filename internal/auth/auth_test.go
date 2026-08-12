@@ -41,6 +41,28 @@ func TestSetAndGetRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGetDoesNotReuseThirdPartyCredentialForBuiltInProvider(t *testing.T) {
+	withTempHome(t)
+	for provider, key := range map[string]string{
+		"minimax": "sk-minimax-test",
+		"gemini":  "sk-gemini-test",
+		"groq":    "sk-groq-test",
+	} {
+		if err := Set(provider, key); err != nil {
+			t.Fatalf("Set(%s): %v", provider, err)
+		}
+	}
+	for _, provider := range []string{"anthropic", "openai"} {
+		got, err := Get(provider)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", provider, err)
+		}
+		if got != "" {
+			t.Fatalf("Get(%s) reused a third-party credential", provider)
+		}
+	}
+}
+
 func TestSet_RejectsEmptyInputs(t *testing.T) {
 	withTempHome(t)
 	if err := Set("", "k"); err == nil {

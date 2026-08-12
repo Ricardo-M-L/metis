@@ -211,6 +211,7 @@ type sessionItem struct {
 	Title     string    `json:"title"`
 	Model     string    `json:"model"`
 	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -220,18 +221,15 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		entries, err := s.store.List(100)
+		cwd, _ := os.Getwd()
+		entries, err := s.store.ListResumable(session.ResumeListOptions{Limit: 100, WorkDir: cwd})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list sessions")
 			return
 		}
 		items := make([]sessionItem, 0, len(entries))
 		for _, e := range entries {
-			title := e.Title
-			if title == "" {
-				title = "Untitled"
-			}
-			items = append(items, sessionItem{ID: e.ID, Title: title, Model: e.Model, CreatedAt: e.CreatedAt})
+			items = append(items, sessionItem{ID: e.ID, Title: e.Title, Model: e.Model, CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": items})
 	case http.MethodPost:
@@ -260,7 +258,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "failed to create session")
 			return
 		}
-		writeJSON(w, http.StatusCreated, sessionItem{ID: id, Title: "Untitled", Model: model, CreatedAt: createdAt})
+		writeJSON(w, http.StatusCreated, sessionItem{ID: id, Title: "Untitled", Model: model, CreatedAt: createdAt, UpdatedAt: createdAt})
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")

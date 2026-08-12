@@ -17,6 +17,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/shellguard"
 	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -331,6 +332,9 @@ func splitOnAny(s string, seps []string) []string {
 }
 func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
 	cmd, _ := in["command"].(string)
+	if err := shellguard.Check(cmd); err != nil {
+		return tools.PermissionDeny, err.Error()
+	}
 	// CC-style adversarial-input checks (Task #73): IFS injection,
 	// /proc/environ exfil, zero-width unicode spoofing, etc. These
 	// run BEFORE the user-permission gate because no permission level
@@ -363,6 +367,11 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	cmd, _ := in["command"].(string)
 	if strings.TrimSpace(cmd) == "" {
 		return nil, errors.New("command is required")
+	}
+	// Execute repeats the non-bypassable process guard because Fork and other
+	// internal callers may intentionally skip Tool.CanUse.
+	if err := shellguard.Check(cmd); err != nil {
+		return &tools.Result{Output: "[blocked] " + err.Error(), IsError: true}, nil
 	}
 
 	timeout := time.Duration(b.settings.TimeoutSeconds) * time.Second

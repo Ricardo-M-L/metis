@@ -11,6 +11,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -55,6 +56,7 @@ func TestRenderSessionsList_RendersTitleWhenSet(t *testing.T) {
 	id := "session-x"
 	_ = store.WriteHeader(id, "claude-opus-4-7", "sys")
 	_ = store.SetTitle(id, "refactor sprint")
+	_ = store.AppendMessage(id, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "hello"}}})
 	got := renderSessionsList(store, 5)
 	if !strings.Contains(got, "refactor sprint") {
 		t.Errorf("title not surfaced in listing: %s", got)

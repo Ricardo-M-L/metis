@@ -15,6 +15,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // jobPoolFixture spins up a fresh registry + bypass gate so each test
@@ -230,6 +231,20 @@ func TestBashKill_UnknownIDIsError(t *testing.T) {
 	}
 	if !res.IsError {
 		t.Error("unknown job ID should be IsError")
+	}
+}
+
+func TestBashKillCanUseChecksRealToolAndJobID(t *testing.T) {
+	t.Parallel()
+	gate := permission.New(permission.ModeDefault)
+	gate.AppendRules(permission.Rule{Tool: "BashKill", Match: "bg_allowed", Verb: permission.DecisionAllow, Source: "test:job"})
+	tool := Kill{gate: gate}
+
+	if got, source := tool.CanUse(context.Background(), map[string]any{"job_id": "bg_allowed"}); got != tools.PermissionAllow || source != "test:job" {
+		t.Fatalf("matching BashKill rule = %v (%q), want allow from test:job", got, source)
+	}
+	if got, _ := tool.CanUse(context.Background(), map[string]any{"job_id": "bg_other"}); got == tools.PermissionAllow {
+		t.Fatalf("different job_id unexpectedly reused bg_allowed permission")
 	}
 }
 

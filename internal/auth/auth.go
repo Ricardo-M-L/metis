@@ -175,14 +175,14 @@ func Set(provider, key string) error {
 	return Save(f)
 }
 
-// Get returns the api key for a provider. Empty string + nil error if missing
-// — callers fall through to env / config.toml.
+// Get returns the api key for the exact provider id. Empty string + nil error
+// means missing, allowing callers to fall through to env / config.toml.
 //
-// Compat fallback: when the canonical id ("anthropic" / "openai") has no
-// entry, we check known compat aliases ("minimax" → anthropic transport,
-// "gemini" → openai transport). This recovers users who picked a
-// compat-labeled option in an older wizard build that saved under the
-// label id rather than the transport id.
+// Credentials are deliberately never guessed across provider ids. Wire-format
+// compatibility does not imply endpoint identity: treating a MiniMax or Groq
+// key as an Anthropic or OpenAI key can send it to the wrong vendor. Legacy
+// alias entries remain listable/removable and can be migrated only after an
+// explicit provider profile binds them to the intended endpoint.
 func Get(provider string) (string, error) {
 	f, err := Load()
 	if err != nil {
@@ -191,20 +191,7 @@ func Get(provider string) (string, error) {
 	if e, ok := f[provider]; ok {
 		return e.Key, nil
 	}
-	// Compat aliases — keep the table small, document each one.
-	for _, alias := range compatAliases[provider] {
-		if e, ok := f[alias]; ok {
-			return e.Key, nil
-		}
-	}
 	return "", nil
-}
-
-// compatAliases lists which auth.json ids can serve as a fallback for
-// each canonical transport id. Order matters: first hit wins.
-var compatAliases = map[string][]string{
-	"anthropic": {"minimax"},        // MiniMax is anthropic-wire-compatible
-	"openai":    {"gemini", "groq"}, // Gemini + Groq are OpenAI-wire-compatible
 }
 
 // Remove deletes a provider entry. No-op if it didn't exist.
@@ -257,8 +244,7 @@ func isNamespacedKey(k string) bool {
 // GetSearchKey returns the persisted API key for a WebSearch
 // backend, or empty string if not set. Distinct from Get() so it
 // can't accidentally collide with provider credentials (search:tavily
-// vs. tavily-as-llm-provider) and skips the compatAliases lookup
-// which is provider-specific. Empty backend → empty result, never
+// vs. tavily-as-llm-provider). Empty backend → empty result, never
 // errors on a missing entry; the caller decides whether to fall
 // through to env vars or skip the backend.
 func GetSearchKey(backend string) (string, error) {

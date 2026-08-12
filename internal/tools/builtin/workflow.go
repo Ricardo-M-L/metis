@@ -21,6 +21,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/shellguard"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/workflow"
 )
@@ -124,9 +125,6 @@ func (Workflow) IsDestructive(map[string]any) bool { return true }
 // strictest decision across the steps wins (any Deny → Deny, else any
 // Ask → Ask, else Allow). "list" needs no command permission.
 func (w Workflow) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
-	if w.gate == nil {
-		return tools.PermissionAllow, ""
-	}
 	op, _ := in["operation"].(string)
 	if op == "list" {
 		return tools.PermissionAllow, ""
@@ -135,6 +133,14 @@ func (w Workflow) CanUse(ctx context.Context, in map[string]any) (tools.Permissi
 	if err != nil {
 		// Can't determine commands (e.g. unknown named workflow) — let
 		// Execute surface the error; don't hard-deny on a lookup miss.
+		return tools.PermissionAllow, ""
+	}
+	for _, command := range cmds {
+		if err := shellguard.Check(command); err != nil {
+			return tools.PermissionDeny, err.Error()
+		}
+	}
+	if w.gate == nil {
 		return tools.PermissionAllow, ""
 	}
 	worst := tools.PermissionAllow
@@ -185,11 +191,21 @@ func (w Workflow) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	case "list":
 		return w.execList()
 	case "save":
-		return w.execSave(in)
+		wf, err := parseInlineWorkflow(in)
+		if err != nil {
+			return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
+		}
+		if err := preflightWorkflow(wf); err != nil {
+			return blockedWorkflowResult(err), nil
+		}
+		return w.execSaveWorkflow(wf, in)
 	case "run":
 		wf, err := parseInlineWorkflow(in)
 		if err != nil {
 			return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
+		}
+		if err := preflightWorkflow(wf); err != nil {
+			return blockedWorkflowResult(err), nil
 		}
 		return w.execRun(ctx, wf, in), nil
 	case "run_named":
@@ -201,10 +217,26 @@ func (w Workflow) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		if err != nil {
 			return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
 		}
+		if err := preflightWorkflow(wf); err != nil {
+			return blockedWorkflowResult(err), nil
+		}
 		return w.execRun(ctx, wf, in), nil
 	default:
 		return &tools.Result{Output: fmt.Sprintf("Workflow: unknown operation %q (want run/save/run_named/list).", op), IsError: true}, nil
 	}
+}
+
+func preflightWorkflow(wf workflow.Workflow) error {
+	for _, step := range wf.Steps {
+		if err := shellguard.Check(step.Command); err != nil {
+			return fmt.Errorf("step %q: %w", step.Name, err)
+		}
+	}
+	return nil
+}
+
+func blockedWorkflowResult(err error) *tools.Result {
+	return &tools.Result{Output: "Workflow: [blocked] " + err.Error(), IsError: true}
 }
 
 func (w Workflow) execRun(ctx context.Context, wf workflow.Workflow, in map[string]any) *tools.Result {
@@ -251,6 +283,13 @@ func (w Workflow) execSave(in map[string]any) (*tools.Result, error) {
 	if err != nil {
 		return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
 	}
+	if err := preflightWorkflow(wf); err != nil {
+		return blockedWorkflowResult(err), nil
+	}
+	return w.execSaveWorkflow(wf, in)
+}
+
+func (w Workflow) execSaveWorkflow(wf workflow.Workflow, in map[string]any) (*tools.Result, error) {
 	name, _ := in["name"].(string)
 	wf.Name = name
 	if err := w.store.Save(wf); err != nil {

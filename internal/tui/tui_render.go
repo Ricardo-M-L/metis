@@ -8,12 +8,32 @@ package tui
 // banner), render_util.go (shared helpers).
 
 import (
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
+
+const disableMouseEnvVar = "METIS_DISABLE_MOUSE"
+
+// mouseTrackingDisabled mirrors the project's existing truthy-env semantics:
+// any non-empty value other than 0/false/no/off/n disables TUI mouse capture.
+// Read on every View call so tests and embedding callers can change the setting
+// without relying on package-initialization order.
+func mouseTrackingDisabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(disableMouseEnvVar)))
+	if v == "" {
+		return false
+	}
+	switch v {
+	case "0", "false", "no", "off", "n":
+		return false
+	default:
+		return true
+	}
+}
 
 // timelineItem is a chronologically-orderable wrapper around either a
 // Message or a ToolEvent. We keep two separate slices on the Model
@@ -178,8 +198,13 @@ func (m *Model) View() tea.View {
 		v.AltScreen = true
 		// CellMotion captures clicks, drags and wheel events but not hover.
 		// Native selection remains available through Ctrl+S copy mode,
-		// where AltScreen and mouse tracking are both disabled.
-		v.MouseMode = tea.MouseModeCellMotion
+		// where AltScreen and mouse tracking are both disabled. Users who
+		// prefer terminal-native mouse handling can explicitly opt out.
+		if mouseTrackingDisabled() {
+			v.MouseMode = tea.MouseModeNone
+		} else {
+			v.MouseMode = tea.MouseModeCellMotion
+		}
 		// Enable xterm focus reporting (DECSET 1004 — `\x1b[?1004h`)
 		// so bubbletea v2 dispatches FocusMsg / BlurMsg when the
 		// terminal tab gains/loses focus. tui_update.go handles

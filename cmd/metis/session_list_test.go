@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
@@ -52,13 +53,20 @@ func TestListSessionEntriesFiltersWorkspaceBeforeLimit(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.AppendMessage("current-old", llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "current"}}}); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 31; i++ {
+		id := fmt.Sprintf("other-new-%02d", i)
 		if err := store.WriteHeaderFull(session.Header{
-			ID:        fmt.Sprintf("other-new-%02d", i),
+			ID:        id,
 			WorkDir:   otherWorkDir,
 			Model:     "other-model",
 			CreatedAt: base.Add(time.Duration(i+1) * time.Minute),
 		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendMessage(id, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "other"}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -78,6 +86,9 @@ func TestListSessionEntriesIncludesLegacyHeaderWithoutWorkDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.WriteHeaderFull(session.Header{ID: "legacy", Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessage("legacy", llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "legacy"}}}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := listSessionEntries(store, sessionListOptions{limit: 30, workDir: t.TempDir()})

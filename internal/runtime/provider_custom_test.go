@@ -95,6 +95,35 @@ func TestBuildProvider_Custom_OpenAITransport(t *testing.T) {
 	}
 }
 
+func TestBuildProvider_CustomTransportReportsEffectiveDefaultModel(t *testing.T) {
+	t.Setenv("FAKE_KEY", "sk-test")
+	tests := []struct {
+		name      string
+		transport string
+		wantModel string
+	}{
+		{name: "openai", transport: "openai_chat", wantModel: "gpt-4o-mini"},
+		{name: "anthropic", transport: "anthropic_messages", wantModel: "claude-opus-4-7"},
+		{name: "gemini", transport: "gemini_native", wantModel: "gemini-2.5-pro"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newCfgWithCustom("custom-provider", config.ProviderRaw{
+				Transport: tt.transport,
+				APIKeyEnv: "FAKE_KEY",
+				BaseURL:   "https://api.example.invalid",
+			})
+			pb, err := BuildProvider(cfg, "custom-provider", "")
+			if err != nil {
+				t.Fatalf("BuildProvider: %v", err)
+			}
+			if pb.Model != tt.wantModel || pb.Provider.ModelID() != tt.wantModel {
+				t.Fatalf("effective models = build %q provider %q, want %q", pb.Model, pb.Provider.ModelID(), tt.wantModel)
+			}
+		})
+	}
+}
+
 func TestBuildProvider_Custom_GeminiTransport(t *testing.T) {
 	t.Setenv("FAKE_KEY", "AIza-test")
 	cfg := newCfgWithCustom("vertex-shim", config.ProviderRaw{

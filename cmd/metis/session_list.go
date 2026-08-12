@@ -55,30 +55,7 @@ func parseSessionListOptions(args []string) (sessionListOptions, error) {
 // another repository must not evict an older session from the active one.
 // Legacy headers without WorkDir remain visible for backwards compatibility.
 func listSessionEntries(store *session.Store, opts sessionListOptions) ([]session.ListEntry, error) {
-	loadLimit := opts.limit
-	if opts.workDir != "" {
-		loadLimit = 0
-	}
-	entries, err := store.List(loadLimit)
-	if err != nil || opts.workDir == "" {
-		return entries, err
-	}
-
-	filtered := make([]session.ListEntry, 0, min(opts.limit, len(entries)))
-	for _, entry := range entries {
-		hdr, _, err := store.LoadHeader(entry.ID)
-		if err != nil {
-			continue
-		}
-		if hdr.WorkDir != "" && !sameSessionWorkDir(hdr.WorkDir, opts.workDir) {
-			continue
-		}
-		filtered = append(filtered, entry)
-		if len(filtered) == opts.limit {
-			break
-		}
-	}
-	return filtered, nil
+	return store.ListResumable(session.ResumeListOptions{Limit: opts.limit, WorkDir: opts.workDir})
 }
 
 func sameSessionWorkDir(left, right string) bool {

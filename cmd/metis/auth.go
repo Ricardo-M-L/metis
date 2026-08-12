@@ -18,8 +18,8 @@ import (
 // Subcommands intentionally mirror opencode's surface so muscle memory carries
 // over: `login`, `logout`, `list`. We don't implement opencode's `oauth` flow
 // — every provider Metis supports today (Anthropic / OpenAI / MiniMax /
-// Gemini-OAI / custom) takes a flat API key, so the simpler password prompt
-// is enough.
+// Gemini-OAI / custom) takes a flat API key, so the interactive credential
+// prompt is enough.
 func cmdAuth(ctx context.Context, args []string) error {
 	sub := "login"
 	rest := []string{}
@@ -216,7 +216,7 @@ func printAuthUsage() {
 	fmt.Println(`metis auth — manage provider credentials in ~/.metis/auth.json
 
 Usage:
-  metis auth login            Interactive wizard: pick provider + enter key
+  metis auth login            Interactive wizard: configure provider + credentials
   metis auth logout <prov>    Remove a stored credential
   metis auth list             Show which providers have stored credentials
   metis auth oauth <prov>     Browser-based OAuth login (github, etc.)

