@@ -102,7 +102,17 @@ type SessionRow struct {
 // directory so the caller doesn't have to special-case "fresh
 // install" — the dashboard just shows zero everywhere.
 func Aggregate(sessionsDir string) (*Stats, error) {
-	s := &Stats{GeneratedAt: time.Now()}
+	return aggregateAt(sessionsDir, time.Now())
+}
+
+// aggregateAt is Aggregate with an explicit clock. Keeping the clock at this
+// boundary makes the rolling activity window deterministic in tests without
+// exposing another public API.
+func aggregateAt(sessionsDir string, now time.Time) (*Stats, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s := &Stats{GeneratedAt: now}
 	dowCount := map[time.Weekday]int{}
 	hourCount := map[int]int{}
 	modelCount := map[string]*ModelUsage{}
@@ -111,18 +121,21 @@ func Aggregate(sessionsDir string) (*Stats, error) {
 
 	entries, err := os.ReadDir(sessionsDir)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return s, nil
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
 		}
-		return nil, err
+		entries = nil
 	}
 
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") || strings.HasSuffix(e.Name(), ".timing.jsonl") {
 			continue
 		}
 		row, err := readSessionFile(filepath.Join(sessionsDir, e.Name()))
 		if err != nil || row == nil {
+			continue
+		}
+		if row.Started.After(now) {
 			continue
 		}
 		s.Total.Sessions++
@@ -212,24 +225,22 @@ func Aggregate(sessionsDir string) (*Stats, error) {
 		s.RecentSessions = s.RecentSessions[:20]
 	}
 
-	// Recent 30 days — fill from newest day backwards. Days with no
-	// activity get explicit zeros so the timeline isn't gappy.
-	if !s.Total.NewestSessionDate.IsZero() {
-		newest := time.Date(s.Total.NewestSessionDate.Year(), s.Total.NewestSessionDate.Month(),
-			s.Total.NewestSessionDate.Day(), 0, 0, 0, 0, s.Total.NewestSessionDate.Location())
-		for i := 0; i < 30; i++ {
-			d := newest.AddDate(0, 0, -i)
-			key := d.Format("2006-01-02")
-			if v, ok := dayCount[key]; ok {
-				s.RecentDays = append(s.RecentDays, *v)
-			} else {
-				s.RecentDays = append(s.RecentDays, DayActivity{Date: d})
-			}
+	// Recent 30 days — always anchor to today's natural date. Anchoring to
+	// the newest session made a stale archive claim that an old month was the
+	// "last 30 days", and a future-dated file could move the window forward.
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	for i := 0; i < 30; i++ {
+		d := today.AddDate(0, 0, -i)
+		key := d.Format("2006-01-02")
+		if v, ok := dayCount[key]; ok {
+			s.RecentDays = append(s.RecentDays, *v)
+		} else {
+			s.RecentDays = append(s.RecentDays, DayActivity{Date: d})
 		}
-		// Reverse so the chart reads left-to-right oldest→newest.
-		for i, j := 0, len(s.RecentDays)-1; i < j; i, j = i+1, j-1 {
-			s.RecentDays[i], s.RecentDays[j] = s.RecentDays[j], s.RecentDays[i]
-		}
+	}
+	// Reverse so the chart reads left-to-right oldest→newest.
+	for i, j := 0, len(s.RecentDays)-1; i < j; i, j = i+1, j-1 {
+		s.RecentDays[i], s.RecentDays[j] = s.RecentDays[j], s.RecentDays[i]
 	}
 
 	return s, nil
@@ -295,6 +306,9 @@ func readSessionFile(path string) (*sessionRowRaw, error) {
 		}
 	}
 	row.Messages = len(messages)
+	if row.Messages == 0 {
+		return nil, nil
+	}
 	for _, message := range messages {
 		chars := 0
 		for _, b := range message.Content {

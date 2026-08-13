@@ -327,7 +327,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 // threshold calculation in that case).
 //
 // We can't ask the Provider interface directly — `MaxTokens()` was never
-// exposed, partly because per-call overrides (Loop.Fast halves it on
+// exposed, partly because per-call overrides (Loop.SetFast halves it on
 // the wire) make a fixed accessor misleading. Reading from cfg here is
 // the next-best thing: same source the Provider constructor used at
 // toLLMSections converts the runtime-side SystemPromptSection slice

@@ -77,7 +77,7 @@ func TestRenderCurrentSession_WithLoopShowsTurns(t *testing.T) {
 	_ = store.WriteHeader(id, "m", "")
 	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.ContextWindow = 100_000
-	loop.Fast = true
+	loop.SetFast(true)
 	loop.SetEffort("high")
 	loop.AppendUser("u1")
 	loop.AppendUser("u2")
@@ -95,7 +95,7 @@ func TestRenderCurrentSession_WithLoopShowsTurns(t *testing.T) {
 	if !strings.Contains(got, "auto") {
 		t.Errorf("mode missing: %s", got)
 	}
-	for _, field := range []string{"transcript:", "working dir:", "effort:", "high", "fast mode:", "true", "context:", "100,000", "loop iterations:"} {
+	for _, field := range []string{"transcript:", "working dir:", "effort:", "high", "quick output:", "true", "context:", "100,000", "loop iterations:"} {
 		if !strings.Contains(got, field) {
 			t.Errorf("richer status missing %q: %s", field, got)
 		}

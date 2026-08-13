@@ -1,47 +1,31 @@
 package tui
 
 import (
-	"sort"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
-// candidateSource returns the set of slash-style commands a completer
-// should match against. Implementations are pure / cheap so the readline
-// hot path stays responsive.
+// candidateSource returns the set of slash-style commands a completer should
+// match against. Implementations are pure / cheap so readline stays responsive.
 type candidateSource interface {
 	Candidates() []string
 }
 
-// replCandidates merges the global slash registry with the local
-// REPLCommandRegistry. Aliases are intentionally excluded — completing
-// to the canonical name keeps history searches unambiguous.
+// replCandidates adapts the same effective metadata catalog used by the TUI
+// palette and /help. Aliases are intentionally excluded from returned strings
+// so readline writes canonical names into history.
 type replCandidates struct {
 	Slash *slash.Registry
 	REPL  *REPLCommandRegistry
 }
 
 func (rc *replCandidates) Candidates() []string {
-	seen := make(map[string]struct{})
-	var out []string
-	if rc.Slash != nil {
-		for _, c := range rc.Slash.All() {
-			if _, ok := seen[c.Name]; !ok {
-				seen[c.Name] = struct{}{}
-				out = append(out, c.Name)
-			}
-		}
+	catalog := effectiveCommandCatalog(rc.REPL, rc.Slash)
+	out := make([]string, 0, len(catalog))
+	for _, cmd := range catalog {
+		out = append(out, cmd.Name)
 	}
-	if rc.REPL != nil {
-		for _, c := range rc.REPL.All() {
-			if _, ok := seen[c.Name]; !ok {
-				seen[c.Name] = struct{}{}
-				out = append(out, c.Name)
-			}
-		}
-	}
-	sort.Strings(out)
 	return out
 }
 

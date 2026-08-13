@@ -514,6 +514,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 
 	execStart := time.Now()
 	res, err := safeToolExecute(toolCtx, t, blk.ToolInput)
+	l.recordCheckpointMutation(blk.ToolName, blk.ToolInput, res, err)
 	execElapsed := time.Since(execStart)
 	// Persist per-step timing to the session sidecar (best-effort). This is
 	// the single chokepoint every path's tool calls pass through, so one

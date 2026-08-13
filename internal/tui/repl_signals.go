@@ -35,6 +35,7 @@ func classifyPlainREPLSignal(sig slash.Signal) plainREPLSignalClass {
 	case slash.SignalNone:
 		return plainREPLSignalBackend
 	case slash.SignalBtw,
+		slash.SignalDiff,
 		slash.SignalLoop,
 		slash.SignalVim,
 		slash.SignalTheme,
@@ -68,7 +69,6 @@ func classifyPlainREPLSignal(sig slash.Signal) plainREPLSignalClass {
 		slash.SignalListDirs,
 		slash.SignalBatch,
 		slash.SignalCost,
-		slash.SignalDiff,
 		slash.SignalDoctor,
 		slash.SignalStats,
 		slash.SignalKeybindings,
@@ -96,6 +96,9 @@ func plainREPLTUIOnlyMessage(sig slash.Signal) string {
 	switch sig {
 	case slash.SignalBtw:
 		feature = "/btw side-question overlay"
+	case slash.SignalDiff:
+		feature = "/diff interactive viewer"
+		suggestion = "start metis in the interactive TUI, or use /git diff for raw output"
 	case slash.SignalLoop:
 		feature = "/loop interactive control"
 		suggestion = "use /cron in plain REPL, or start the interactive TUI"
@@ -128,7 +131,12 @@ func renderREPLStats(r *REPL) string {
 			}
 		}
 	}
-	return renderInfoBox("Session Stats", []infoRow{
+	rows := usageActivityRows(r.Session)
+	rows = append(rows,
+		infoRow{Key: "", Value: ""},
+		infoRow{Key: "", Value: "Current Session Stats"},
+	)
+	rows = append(rows, []infoRow{
 		{Key: "session id", Value: r.SessionID},
 		{Key: "user turns", Value: fmt.Sprintf("%d", transcript.CountTurns(history))},
 		{Key: "tool calls", Value: fmt.Sprintf("%d", toolCalls)},
@@ -138,7 +146,8 @@ func renderREPLStats(r *REPL) string {
 		{Key: "loop iterations", Value: fmt.Sprintf("%d", r.Loop.IterIdx()), Hint: "actual iterations completed in this session"},
 		{Key: "iteration cap", Value: formatIterationCap(r.Loop.MaxIters), Hint: "maximum per user turn"},
 		{Key: "history msgs", Value: fmt.Sprintf("%d", len(history))},
-	})
+	}...)
+	return renderInfoBox("Usage & Activity", rows)
 }
 
 func renderREPLContext(r *REPL) string {

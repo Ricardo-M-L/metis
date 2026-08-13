@@ -886,6 +886,22 @@ func (c *Compactor) CompactWithInstructions(ctx context.Context, messages []llm.
 	return c.compact(ctx, messages, normalizeCompactInstructions(instructions))
 }
 
+// SummarizeSegment produces a summary for an explicitly selected contiguous
+// section without applying Compact's ProtectFirst/ProtectLast slicing. It is
+// used by /rewind's "Summarize from here" action, where the caller has already
+// chosen the exact message boundary. Unlike iterative compaction, this does
+// not mutate LastSummary: the retained full prefix means the segment summary
+// is not a running summary of everything that came before it.
+func (c *Compactor) SummarizeSegment(ctx context.Context, messages []llm.Message, instructions string) (string, error) {
+	if c == nil || c.Provider == nil {
+		return "", errors.New("summarize segment: compactor/provider unavailable")
+	}
+	if len(messages) == 0 {
+		return "", errors.New("summarize segment: empty message range")
+	}
+	return c.summarizeWithInstructions(ctx, messages, "", normalizeCompactInstructions(instructions))
+}
+
 // compact summarizes old messages into boundary turns.
 // ProtectFirst and ProtectLast messages are kept intact.
 //

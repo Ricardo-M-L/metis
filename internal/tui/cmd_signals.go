@@ -122,7 +122,7 @@ func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Lo
 			effort = "provider default"
 		}
 		rows = append(rows, infoRow{Key: "effort", Value: effort})
-		rows = append(rows, infoRow{Key: "fast mode", Value: fmt.Sprintf("%t", loop.Fast)})
+		rows = append(rows, infoRow{Key: "quick output", Value: fmt.Sprintf("%t", loop.FastEnabled())})
 		rows = append(rows, infoRow{Key: "plan mode", Value: fmt.Sprintf("%t", loop.IsPlanMode())})
 
 		used := loop.EstimateContextTokens()

@@ -141,6 +141,26 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 	if tick, ok := msg.(cronFireTickMsg); ok {
 		return m.handleCronTick(time.Time(tick))
 	}
+	// Provider-backed rewind summaries are lifecycle results, not picker
+	// input. Apply them before activeScreen gets first refusal so opening a
+	// different modal while the command runs cannot swallow the completion.
+	if result, ok := msg.(rewindSummaryResultMsg); ok {
+		m.handleRewindSummaryResult(result)
+		return m, nil
+	}
+	// Diff collection is also lifecycle work. The command only reads Git and
+	// files; this handler is the sole place that mutates the active screen.
+	if result, ok := msg.(diffResultMsg); ok {
+		m.handleDiffResult(result)
+		return m, nil
+	}
+	// Update checks are also lifecycle results. A user may open another
+	// full-screen view while the subprocess runs; that view must not swallow
+	// completion and leave the pending guard stuck forever.
+	if result, ok := msg.(updateCheckResultMsg); ok {
+		m.handleUpdateCheckResult(result)
+		return m, nil
+	}
 
 	// Active full-window screen (e.g. /history) takes over input + view.
 	// We still let WindowSizeMsg reach the main chat so the underlying
@@ -378,6 +398,14 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 			m.messages = append(m.messages, Message{Role: "error", Content: "config editor: " + msg.err.Error(), Timestamp: time.Now()})
 		} else {
 			m.messages = append(m.messages, Message{Role: "success", Content: "config saved · restart metis for provider/tool changes", Timestamp: time.Now()})
+		}
+		return m, nil
+
+	case planEditorDoneMsg:
+		if msg.err != nil {
+			m.messages = append(m.messages, Message{Role: "error", Content: "plan editor: " + msg.err.Error(), Timestamp: time.Now()})
+		} else {
+			m.messages = append(m.messages, Message{Role: "success", Content: "plan saved · " + msg.path, Timestamp: time.Now()})
 		}
 		return m, nil
 

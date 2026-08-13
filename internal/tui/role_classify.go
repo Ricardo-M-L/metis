@@ -67,10 +67,10 @@ func classifyREPLOutput(out string) string {
 	}
 
 	// "/<setting>: <value>" prefix — covers cmdEffort / cmdTheme /
-	// cmdModel / cmdVim / cmdFast confirmation strings like
+	// cmdModel / cmdVim / cmdQuick confirmation strings like
 	// "effort: high — small budget".
 	settingPrefixes := []string{
-		"effort: ", "theme: ", "model: ", "vim mode: ", "fast mode",
+		"effort: ", "theme: ", "model: ", "vim mode: ", "quick output",
 	}
 	for _, p := range settingPrefixes {
 		if strings.HasPrefix(low, p) {

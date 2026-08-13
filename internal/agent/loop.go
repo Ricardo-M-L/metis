@@ -161,12 +161,14 @@ type Loop struct {
 	effortMu sync.RWMutex
 	effort   llm.Effort
 
-	// Fast collapses the next turn's resource use:
+	// fast collapses the next turn's resource use:
 	//   - effort drops to "low" (overrides Effort for the request)
 	//   - max_tokens halved via Request.MaxTokens override
 	// Useful for "I just need a quick answer" rather than spinning up
-	// deep deliberation on a one-line clarification.
-	Fast bool
+	// deep deliberation on a one-line clarification. It is atomic because a
+	// local /quick command can toggle it while Run snapshots the next provider
+	// request and the TUI renders the status bar.
+	fast atomic.Bool
 
 	// BypassNextCache, when true, makes buildRequest append a unique
 	// nonce to the system prompt for the next request, guaranteeing a
@@ -628,6 +630,33 @@ func (l *Loop) SetEffort(e llm.Effort) {
 	l.effortMu.Lock()
 	l.effort = e
 	l.effortMu.Unlock()
+}
+
+// FastEnabled returns the live quick-output preference. The setting can be
+// read concurrently by provider request assembly and TUI rendering.
+func (l *Loop) FastEnabled() bool {
+	return l != nil && l.fast.Load()
+}
+
+// SetFast changes the quick-output preference for subsequent request
+// snapshots. A request already assembled may retain the previous value.
+func (l *Loop) SetFast(on bool) {
+	if l != nil {
+		l.fast.Store(on)
+	}
+}
+
+// ToggleFast atomically flips quick-output mode and returns its new value.
+func (l *Loop) ToggleFast() bool {
+	if l == nil {
+		return false
+	}
+	for {
+		old := l.fast.Load()
+		if l.fast.CompareAndSwap(old, !old) {
+			return !old
+		}
+	}
 }
 
 // PrePlanMode / SetPrePlanMode implement the PlanController surface
@@ -1907,7 +1936,7 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 	// Fast mode is a pure request-time override. We don't mutate
 	// l.effort because the user's persistent /effort preference
 	// should survive a transient /fast toggle.
-	if l.Fast {
+	if l.FastEnabled() {
 		req.Effort = llm.EffortLow
 		req.MaxTokens = l.Provider.MaxContextTokens() / 16
 		if req.MaxTokens > 4096 {

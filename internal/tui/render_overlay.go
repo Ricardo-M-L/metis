@@ -179,8 +179,17 @@ func renderPalette(m *Model) string {
 	// every registered command for the width, capped at 40% of the terminal so
 	// descriptions retain useful room on narrow panes.
 	nameColumn := 0
-	for _, cmd := range m.cmds.All() {
-		if width := lipgloss.Width("/" + cmd.Name); width > nameColumn {
+	for _, cmd := range m.commandCatalog() {
+		label := commandPaletteLabel(cmd)
+		if width := lipgloss.Width(label); width > nameColumn {
+			nameColumn = width
+		}
+	}
+	// Alias annotations are match-specific and therefore do not exist in the
+	// base catalog used above. Include the current result rows in the width
+	// calculation so `/canonical (alias)` does not get clipped unnecessarily.
+	for _, cmd := range m.palMatched {
+		if width := lipgloss.Width(commandPaletteLabel(cmd)); width > nameColumn {
 			nameColumn = width
 		}
 	}
@@ -199,7 +208,8 @@ func renderPalette(m *Model) string {
 
 	for i, cmd := range rows {
 		idx := start + i
-		name := truncateCells("/"+cmd.Name, nameColumn-1)
+		label := commandPaletteLabel(cmd)
+		name := truncateCells(label, nameColumn-1)
 		name += strings.Repeat(" ", max(0, nameColumn-lipgloss.Width(name)))
 		// Phase D: when the command opens an interactive widget, swap
 		// the static description for a "→ widget hint" so the user
@@ -208,6 +218,9 @@ func renderPalette(m *Model) string {
 		desc := cmd.Description
 		if hint := widgetHint(cmd.Name); hint != "" {
 			desc = hint
+		}
+		if badge := commandSourceBadge(cmd); badge != "" {
+			desc = badge + " " + desc
 		}
 		desc = strings.Join(strings.Fields(desc), " ")
 		if descBudget > 0 {
@@ -224,6 +237,17 @@ func renderPalette(m *Model) string {
 		s.WriteString("\n")
 	}
 	return s.String()
+}
+
+func commandPaletteLabel(cmd CommandCatalogEntry) string {
+	label := "/" + cmd.Name
+	if cmd.MatchedAlias != "" {
+		label += " (" + cmd.MatchedAlias + ")"
+	}
+	if cmd.ArgumentHint != "" {
+		label += " " + cmd.ArgumentHint
+	}
+	return label
 }
 
 // historySearchMaxRows caps the visible candidate list so the overlay

@@ -27,6 +27,11 @@ import (
 // forget applies.
 func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 	switch w := s.(type) {
+	case *screen.ConfigScreen:
+		return m.applyConfigScreen(w)
+	case *screen.RewindScreen:
+		return m.applyRewindScreen(w)
+
 	case *screen.EffortScreen:
 		applied := w.Applied()
 		if applied == "" {

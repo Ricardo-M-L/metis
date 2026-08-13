@@ -85,7 +85,7 @@ func TestLoopRun_FastModeForcesLowEffortAndCapsMaxTokens(t *testing.T) {
 	p := &captureProvider{}
 	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.SetEffort(llm.EffortHigh) // user's persistent preference
-	loop.Fast = true
+	loop.SetFast(true)
 	loop.AppendUser("ping")
 
 	out := make(chan Event, 16)
@@ -172,6 +172,32 @@ func TestLoopEffortConcurrentRequestSnapshots(t *testing.T) {
 	if got, ok := <-errCh; ok {
 		t.Fatalf("concurrent effort snapshot returned invalid value %q", got)
 	}
+}
+
+func TestLoopFastConcurrentRequestSnapshots(t *testing.T) {
+	p := &captureProvider{}
+	loop := NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			loop.SetFast(i%2 == 0)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			_ = loop.buildRequest(nil)
+			_ = loop.FastEnabled()
+		}
+	}()
+	close(start)
+	wg.Wait()
 }
 
 func TestLoopRun_NoEffortNoFastSendsDefault(t *testing.T) {

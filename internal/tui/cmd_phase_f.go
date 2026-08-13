@@ -5,7 +5,7 @@ package tui
 // pipeline, daemon attach) are tracked separately.
 //
 // What lands here:
-//   /thinkback   — surface the last assistant turn's thinking trace
+//   /thoughts    — surface the last assistant turn's thinking trace
 //   /ultraplan   — guided "deep plan" prompt: bumps effort to high
 //                   and pre-loads the planning frame
 //   /onboarding  — interactive setup recap (auth → config → first prompt)
@@ -23,13 +23,13 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
-// cmdThinkback walks the conversation history backwards looking for
+// cmdLastThinking walks the conversation history backwards looking for
 // the most recent assistant message that carried a "thinking" block.
 // Many providers don't persist thinking into Content — only as
 // transient EventThinkingDelta — so the typical answer is "no thinking
 // captured for this turn". We surface that explicitly rather than
 // silently empty so the user knows the feature works as designed.
-func cmdThinkback(r *REPL, args string) string {
+func cmdLastThinking(r *REPL, args string) string {
 	if r == nil || r.Loop == nil {
 		return "(no active session)"
 	}
@@ -55,7 +55,7 @@ func cmdThinkback(r *REPL, args string) string {
 			}
 		}
 		// Found the most recent assistant turn — stop, even if it had
-		// no thinking. /thinkback is "the LAST one", not "any prior".
+		// no thinking. /thoughts is "the LAST one", not "any prior".
 		break
 	}
 	return "(no thinking trace captured for the most recent turn — " +
@@ -101,10 +101,10 @@ func cmdOnboarding(r *REPL, args string) string {
 		{Key: "", Value: "  stores key under " + authPath},
 		{Key: "", Value: ""},
 		{Key: "2. project doc", Value: "/init   (this chat)"},
-		{Key: "", Value: "  scaffolds CLAUDE.md so the model knows the conventions"},
+		{Key: "", Value: "  analyzes the repository and creates or improves CLAUDE.md"},
 		{Key: "", Value: ""},
-		{Key: "3. config", Value: cfgPath},
-		{Key: "", Value: "  edit defaults: provider, model, theme, statusline"},
+		{Key: "3. config", Value: "/config   (this chat)"},
+		{Key: "", Value: "  settings panel; press e for raw TOML at " + cfgPath},
 		{Key: "", Value: ""},
 		{Key: "4. talk!", Value: "type anything, or /help for commands"},
 		{Key: "", Value: "  cwd today: " + cwdPart},

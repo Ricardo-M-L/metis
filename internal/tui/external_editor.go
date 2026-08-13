@@ -21,6 +21,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	runtimepkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
 // externalEditorDoneMsg flows back into Update once the editor exits.
@@ -33,6 +34,11 @@ type externalEditorDoneMsg struct {
 }
 
 type configEditorDoneMsg struct{ err error }
+
+type planEditorDoneMsg struct {
+	path string
+	err  error
+}
 
 // openExternalEditor returns a tea.Cmd that suspends the program,
 // runs the editor, then re-enters with externalEditorDoneMsg. Caller
@@ -76,6 +82,20 @@ func (m *Model) openConfigEditor() tea.Cmd {
 	}
 	cmd := exec.Command(pickEditor(), path)
 	return tea.ExecProcess(cmd, func(err error) tea.Msg { return configEditorDoneMsg{err: err} })
+}
+
+// openPlanEditor edits the stable session plan rather than a temporary input
+// draft. The file remains available to bare `/plan` and future sessions after
+// the editor exits.
+func (m *Model) openPlanEditor() tea.Cmd {
+	path, err := runtimepkg.EnsureCurrentPlan(m.sessionID)
+	if err != nil {
+		return func() tea.Msg { return planEditorDoneMsg{path: path, err: err} }
+	}
+	cmd := exec.Command(pickEditor(), path)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return planEditorDoneMsg{path: path, err: err}
+	})
 }
 
 // writeDraftToTemp writes `body` to a fresh temp file with a .md

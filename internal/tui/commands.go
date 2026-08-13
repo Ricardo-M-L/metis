@@ -29,11 +29,22 @@ import (
 
 // REPLCommand is a built-in command that runs directly in the REPL, not via LLM.
 type REPLCommand struct {
-	Name        string
-	Aliases     []string
-	Description string
-	Handler     func(r *REPL, args string) string
+	Name         string
+	Aliases      []string
+	Description  string
+	ArgumentHint string
+	Source       string
+	Category     string
+	Handler      func(r *REPL, args string) string
+
+	// Optional live discovery predicates. Nil means true so existing command
+	// registrations remain visible and enabled by default.
+	Visible func() bool
+	Enabled func() bool
 }
+
+func (c REPLCommand) IsVisible() bool { return c.Visible == nil || c.Visible() }
+func (c REPLCommand) IsEnabled() bool { return c.Enabled == nil || c.Enabled() }
 
 type REPLCommandRegistry struct {
 	commands []REPLCommand
@@ -45,19 +56,84 @@ func NewREPLCommandRegistry() *REPLCommandRegistry {
 }
 
 func (r *REPLCommandRegistry) Register(c REPLCommand) {
+	if c.Source == "" {
+		c.Source = "repl"
+	}
+	if c.Category == "" {
+		c.Category = "built-in"
+	}
 	r.commands = append(r.commands, c)
-	r.index[c.Name] = &c
-	for _, a := range c.Aliases {
-		r.index[a] = &c
+	r.rebuildIndex()
+}
+
+func (r *REPLCommandRegistry) rebuildIndex() {
+	latest := make(map[string]int, len(r.commands))
+	for i := range r.commands {
+		latest[r.commands[i].Name] = i
+	}
+	r.index = make(map[string]*REPLCommand, len(r.commands)*2)
+	for name, i := range latest {
+		r.index[name] = &r.commands[i]
+	}
+	for i := range r.commands {
+		cmd := &r.commands[i]
+		if latest[cmd.Name] != i {
+			continue
+		}
+		for _, alias := range cmd.Aliases {
+			if _, canonical := latest[alias]; canonical {
+				continue
+			}
+			r.index[alias] = cmd
+		}
 	}
 }
 
 func (r *REPLCommandRegistry) Get(name string) *REPLCommand {
+	return r.Resolve(name)
+}
+
+// Resolve maps a canonical name or alias to the canonical command entry.
+func (r *REPLCommandRegistry) Resolve(name string) *REPLCommand {
 	return r.index[name]
+}
+
+func (r *REPLCommandRegistry) CanonicalName(name string) (string, bool) {
+	cmd := r.Resolve(name)
+	if cmd == nil {
+		return "", false
+	}
+	return cmd.Name, true
 }
 
 func (r *REPLCommandRegistry) All() []REPLCommand {
 	return r.commands
+}
+
+// Catalog returns only the registrations that currently own their canonical
+// name, with aliases filtered through the same last-write-wins index used by
+// dispatch.
+func (r *REPLCommandRegistry) Catalog() []REPLCommand {
+	byName := make(map[string]*REPLCommand, len(r.index))
+	for _, cmd := range r.index {
+		if cmd == nil || r.index[cmd.Name] != cmd {
+			continue
+		}
+		byName[cmd.Name] = cmd
+	}
+	out := make([]REPLCommand, 0, len(byName))
+	for _, cmd := range byName {
+		cp := *cmd
+		cp.Aliases = make([]string, 0, len(cmd.Aliases))
+		for _, alias := range cmd.Aliases {
+			if r.index[alias] == cmd {
+				cp.Aliases = append(cp.Aliases, alias)
+			}
+		}
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // BuildREPLCommands creates the full command registry for the REPL.
@@ -67,12 +143,12 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === Core ===
 	r.Register(REPLCommand{Name: "help", Aliases: []string{"h", "?"}, Description: "show this help", Handler: cmdHelp})
 	r.Register(REPLCommand{Name: "quit", Aliases: []string{"q", "exit", "bye"}, Description: "exit metis", Handler: cmdQuit})
-	r.Register(REPLCommand{Name: "clear", Aliases: []string{"cls"}, Description: "clear conversation history", Handler: cmdClear})
+	r.Register(REPLCommand{Name: "clear-history", Aliases: []string{"cls"}, Description: "clear conversation history without creating a new session", Category: "session", Handler: cmdClear})
 
 	// === Model ===
 	r.Register(REPLCommand{Name: "model", Aliases: []string{"m"}, Description: "show or switch model (e.g. model claude-opus-4-7)", Handler: cmdModel})
 	r.Register(REPLCommand{Name: "effort", Description: "set reasoning effort: low | medium | high | off", Handler: cmdEffort})
-	r.Register(REPLCommand{Name: "fast", Description: "fast mode: on | off | toggle (effort=low + halved tokens)", Handler: cmdFast})
+	r.Register(REPLCommand{Name: "quick", Description: "quick output: effort=low with max_tokens halved", ArgumentHint: "[on|off|toggle]", Category: "model", Handler: cmdQuick})
 	r.Register(REPLCommand{Name: "theme", Description: "switch color theme: dark | light | dark-daltonized", Handler: cmdTheme})
 	r.Register(REPLCommand{Name: "vim", Description: "vim mode: on | off | toggle (modal input — hjkl in NORMAL)", Handler: cmdVim})
 	// /voice hidden from the palette 2026-05-23 — feature requires
@@ -87,7 +163,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "share", Description: "share session over local HTTP+SSE: start | stop (URL printed for IDE/browser clients)", Handler: cmdShare})
 
 	// === Productivity / inspection ===
-	r.Register(REPLCommand{Name: "files", Description: "show workspace file index (used by @-mention)", Handler: cmdFiles})
+	r.Register(REPLCommand{Name: "files", Description: "show files currently loaded in this conversation context", Category: "context", Handler: cmdFiles})
 	// `/context` deliberately NOT registered as a REPLCommand any more
 	// (claude-code parity, 2026-05-11): the slash-signal path
 	// (SignalContext → renderContext) produces a much richer grid +
@@ -99,7 +175,8 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "memory", Description: "memory ops: read | write | search | clear", Handler: cmdMemory})
 	r.Register(REPLCommand{Name: "recap", Description: "show structural recap of the just-finished turn", Handler: cmdRecap})
 	r.Register(REPLCommand{Name: "replay", Description: "re-run the last turn with the same prompt (no edits)", Handler: cmdReplay})
-	r.Register(REPLCommand{Name: "tasks", Description: "list session todos (TodoRead)", Handler: cmdTasks})
+	r.Register(REPLCommand{Name: "todos", Description: "list the session checklist (TodoRead)", Category: "session", Handler: cmdTodos})
+	r.Register(REPLCommand{Name: "tasks", Description: "manage background jobs for this session", ArgumentHint: "[list|output <id>|stop <id>]", Category: "session", Handler: cmdBackgroundTasks})
 	r.Register(REPLCommand{Name: "ide", Description: "show IDE / remote bridge status (/share + ACP)", Handler: cmdIDE})
 	// /review is owned by the slash registry (internal/slash/review.go)
 	// — see the 2026-07-28 cleanup that removed the legacy cmdReview
@@ -148,7 +225,8 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "cu", Description: "computer-use (metis-cu) ops: enable | disable | status", Handler: cmdCU})
 
 	// === Session ===
-	r.Register(REPLCommand{Name: "session", Aliases: []string{"sid"}, Description: "show current session id", Handler: cmdSession})
+	r.Register(REPLCommand{Name: "session", Description: "show or control the local read-only sharing session", ArgumentHint: "[status|start|stop]", Category: "session", Handler: cmdSessionShare})
+	r.Register(REPLCommand{Name: "session-info", Aliases: []string{"sid"}, Description: "show current local session id, title, turns, and model", Category: "session", Handler: cmdSessionInfo})
 	r.Register(REPLCommand{Name: "sessions", Aliases: []string{"ls"}, Description: "list saved sessions", Handler: cmdSessions})
 	r.Register(REPLCommand{Name: "export", Description: "export the current conversation to a readable text file", Handler: cmdExport})
 
@@ -160,12 +238,12 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	// === System ===
 	r.Register(REPLCommand{Name: "compact", Description: "force context compaction now", Handler: cmdCompact})
 	r.Register(REPLCommand{Name: "ctx", Description: "show compaction state: cap, threshold, current tokens, trigger distance", Handler: cmdCtx})
-	r.Register(REPLCommand{Name: "config", Aliases: []string{"cfg"}, Description: "open config in $EDITOR", Handler: cmdConfig})
+	r.Register(REPLCommand{Name: "config", Aliases: []string{"cfg"}, Description: "view and edit Metis settings", Category: "system", Handler: cmdConfig})
 	r.Register(REPLCommand{Name: "env", Description: "show environment info (OS, arch, CPU, memory)", Handler: cmdEnv})
 	r.Register(REPLCommand{Name: "doctor", Description: "diagnose metis installation", Handler: cmdDoctor})
 
-	// === Phase C: claude-code parity slashes ===
-	r.Register(REPLCommand{Name: "copy", Description: "copy last N assistant replies to clipboard (default 1)", Handler: cmdCopy})
+	// === Phase C: interactive helper slashes ===
+	r.Register(REPLCommand{Name: "copy", Description: "copy the Nth-latest assistant reply", ArgumentHint: "[N]", Category: "session", Handler: cmdCopy})
 	r.Register(REPLCommand{Name: "commit-push-pr", Aliases: []string{"cpp"}, Description: "git add -A → commit -m <msg> → push → gh pr create --fill", Handler: cmdCommitPushPR})
 	r.Register(REPLCommand{Name: "insights", Description: "summarize sessions in last N days: /insights [--days=N] (default 7)", Handler: cmdInsights})
 	r.Register(REPLCommand{Name: "output-style", Description: "output verbosity: full | streamlined | minimal", Handler: cmdOutputStyle})
@@ -174,7 +252,8 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "feedback", Description: "alias of /bug — file a metis issue", Handler: cmdFeedback})
 
 	// === Phase F: discoverability slashes ===
-	r.Register(REPLCommand{Name: "thinkback", Description: "show the most recent assistant turn's extended-thinking trace", Handler: cmdThinkback})
+	r.Register(REPLCommand{Name: "think-back", Aliases: []string{"thinkback"}, Description: "show the current year's cross-session activity review", Handler: cmdThinkBack})
+	r.Register(REPLCommand{Name: "thoughts", Description: "show the most recent assistant turn's extended-thinking trace", Handler: cmdThoughts})
 	r.Register(REPLCommand{Name: "ultraplan", Description: "deep-plan nudge: bumps effort=high and pre-loads the planning frame", Handler: cmdUltraplan})
 	r.Register(REPLCommand{Name: "onboarding", Description: "first-run setup recap (auth, config, /init, talk)", Handler: cmdOnboarding})
 
@@ -188,7 +267,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "version", Aliases: []string{"v", "--version"}, Description: "show version", Handler: cmdVersion})
 	r.Register(REPLCommand{Name: "login", Description: "set up provider credentials (delegates to metis auth login)", Handler: cmdLogin})
 	r.Register(REPLCommand{Name: "logout", Description: "remove a stored provider credential", Handler: cmdLogout})
-	r.Register(REPLCommand{Name: "init", Description: "scaffold a CLAUDE.md for this repo (claude-code parity)", Handler: cmdInit})
+	r.Register(REPLCommand{Name: "init", Description: "create a starter CLAUDE.md for this repo (fallback handler)", Handler: cmdInit})
 	r.Register(REPLCommand{Name: "statusline", Description: "show + customize the bottom status line", Handler: cmdStatusLine})
 	r.Register(REPLCommand{Name: "bg", Description: "background-turn status (alias for Ctrl+B mid-turn)", Handler: cmdBg})
 	r.Register(REPLCommand{Name: "cost", Description: "show token usage for current session", Handler: cmdCost})
@@ -205,14 +284,13 @@ func BuildREPLCommands() *REPLCommandRegistry {
 // =============================================================================
 
 func cmdHelp(r *REPL, args string) string {
-	seen := make(map[string]bool)
 	rows := make([]infoRow, 0, 64)
-	for _, c := range r.cmds.All() {
-		if seen[c.Name] {
-			continue
+	for _, c := range effectiveCommandCatalog(r.cmds, r.Slash) {
+		key := "/" + c.Name
+		if c.ArgumentHint != "" {
+			key += " " + c.ArgumentHint
 		}
-		seen[c.Name] = true
-		rows = append(rows, infoRow{Key: "/" + c.Name, Value: c.Description})
+		rows = append(rows, infoRow{Key: key, Value: c.Description})
 	}
 	rows = append(rows, infoRow{Key: "", Value: ""})
 	rows = append(rows, infoRow{Key: "", Value: "git/diff/commit/log/branch/checkout — git shortcuts"})
@@ -354,25 +432,11 @@ func cmdBg(r *REPL, args string) string {
 	return out + "\n  " + hint
 }
 
-// cmdFiles dumps the @-mention file index so the user can verify
-// what's pickable via Tab completion.
+// cmdFiles reports the concrete files represented in the live model context.
+// Workspace discovery belongs to @-mention; /files answers the narrower
+// question "which files has this conversation actually loaded?".
 func cmdFiles(r *REPL, args string) string {
-	// We can't import internal/tui from the REPL handler context
-	// directly (already in tui pkg), so call the index helper.
-	files := atMentionIndex()
-	if len(files) == 0 {
-		return "files: index empty (cwd unreadable?)"
-	}
-	const maxShow = 30
-	out := fmt.Sprintf("files: %d indexed (showing first %d)\n", len(files), maxShow)
-	for i, f := range files {
-		if i >= maxShow {
-			out += fmt.Sprintf("  ... %d more\n", len(files)-maxShow)
-			break
-		}
-		out += "  " + f + "\n"
-	}
-	return strings.TrimRight(out, "\n")
+	return renderContextFiles(r)
 }
 
 // cmdContext shows current context-window usage. Calculates percent
@@ -673,12 +737,12 @@ func llmMessageText(m llm.Message) string {
 
 // cmdRename writes a new title onto the current session. Persists
 // via session.Store.SetTitle which append-only rewrites the header
-// row in the JSONL file. /sessions and /session both reflect the
+// row in the JSONL file. /sessions and /session-info both reflect the
 // new title on the next read.
 func cmdRename(r *REPL, args string) string {
 	title := strings.TrimSpace(args)
 	if title == "" {
-		return "rename: usage `/rename <new title>` (current title shown via /session)"
+		return "rename: usage `/rename <new title>` (current title shown via /session-info)"
 	}
 	if r.Session == nil || r.SessionID == "" {
 		return "rename: no active session store"
@@ -884,19 +948,18 @@ func cmdFast(r *REPL, args string) string {
 	switch arg {
 	case "":
 		state := "off"
-		if r.Loop.Fast {
+		if r.Loop.FastEnabled() {
 			state = "on"
 		}
 		return "fast mode: " + state + " — use: fast on | fast off | fast toggle"
 	case "on", "true", "1", "yes":
-		r.Loop.Fast = true
+		r.Loop.SetFast(true)
 		return "fast mode: on (effort=low, max_tokens halved for next turn)"
 	case "off", "false", "0", "no":
-		r.Loop.Fast = false
+		r.Loop.SetFast(false)
 		return "fast mode: off"
 	case "toggle", "t":
-		r.Loop.Fast = !r.Loop.Fast
-		if r.Loop.Fast {
+		if r.Loop.ToggleFast() {
 			return "fast mode: on"
 		}
 		return "fast mode: off"

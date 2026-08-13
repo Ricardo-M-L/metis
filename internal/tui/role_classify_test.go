@@ -15,6 +15,7 @@ func TestClassifyREPLOutput(t *testing.T) {
 		{"effort: high", "success"},
 		{"theme: dark", "success"},
 		{"model: claude-opus-4-7", "success"},
+		{"quick output: on", "success"},
 		{"(history cleared)", "info"}, // no success keyword; falls to info
 		{"branched → abc123", "success"},
 		{"(session synced to disk)", "success"},

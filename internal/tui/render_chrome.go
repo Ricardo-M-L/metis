@@ -499,7 +499,7 @@ func renderStatusBar(m *Model) string {
 		if g := effortGlyph(effort); g != "" {
 			leftParts = append(leftParts, g+" "+string(effort))
 		}
-		if m.loop.Fast {
+		if m.loop.FastEnabled() {
 			leftParts = append(leftParts, "↯ fast")
 		}
 	}

@@ -20,6 +20,7 @@ func TestClassifyMidTurn_Destructive(t *testing.T) {
 		SignalBranch,
 		SignalResume,
 		SignalBatch,
+		SignalPlan,
 	}
 	for _, s := range destructive {
 		if got := ClassifyMidTurn(s); got != MidTurnDestructive {

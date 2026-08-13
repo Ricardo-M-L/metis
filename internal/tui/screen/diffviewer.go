@@ -3,6 +3,7 @@ package screen
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -29,7 +30,18 @@ type DiffLine struct {
 	NewNum  int
 }
 
+// DiffSource is one selectable snapshot in the interactive diff viewer.
+// Working tree is normally first; later entries represent individual turns.
+type DiffSource struct {
+	Label    string
+	Subtitle string
+	Files    []DiffFile
+	Error    string
+}
+
 type DiffViewerScreen struct {
+	sources  []DiffSource
+	source   int
 	files    []DiffFile
 	cursor   int // file cursor
 	scroll   int // line scroll within current file
@@ -42,7 +54,19 @@ type DiffViewerScreen struct {
 }
 
 func NewDiffViewerScreen(files []DiffFile) *DiffViewerScreen {
-	return &DiffViewerScreen{files: files, wordDiff: true}
+	return NewDiffViewerScreenWithSources([]DiffSource{{Label: "Working tree", Files: files}})
+}
+
+func NewDiffViewerScreenWithSources(sources []DiffSource) *DiffViewerScreen {
+	if len(sources) == 0 {
+		sources = []DiffSource{{Label: "Working tree"}}
+	}
+	copySources := append([]DiffSource(nil), sources...)
+	return &DiffViewerScreen{
+		sources:  copySources,
+		files:    copySources[0].Files,
+		wordDiff: true,
+	}
 }
 
 func (s *DiffViewerScreen) Init() tea.Cmd { return nil }
@@ -137,6 +161,12 @@ func (s *DiffViewerScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		case "w":
 			s.wordDiff = !s.wordDiff
 			return s, nil
+		case "left", "[", "shift+tab":
+			s.changeSource(-1)
+			return s, nil
+		case "right", "]", "tab":
+			s.changeSource(1)
+			return s, nil
 		case "up", "k":
 			if s.fileView == 0 {
 				if n := len(s.files); n > 0 {
@@ -230,6 +260,17 @@ func (s *DiffViewerScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	return s, nil
 }
 
+func (s *DiffViewerScreen) changeSource(delta int) {
+	if len(s.sources) < 2 {
+		return
+	}
+	s.source = (s.source + delta + len(s.sources)) % len(s.sources)
+	s.files = s.sources[s.source].Files
+	s.cursor = 0
+	s.scroll = 0
+	s.fileView = 0
+}
+
 var (
 	diffTitleStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#bd93f9")).Bold(true)
 	diffCursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#bd93f9")).Bold(true)
@@ -275,16 +316,17 @@ func (s *DiffViewerScreen) flattenDiff() []string {
 		out = append(out, diffHunkHeader.Render(header))
 		for _, line := range hunk.Lines {
 			var b strings.Builder
+			content := safeDiffDisplayText(line.Content, s.diffContentWidth())
 			switch line.Type {
 			case "+":
 				b.WriteString(diffAddNum.Render(fmt.Sprintf("%4d ", line.NewNum)))
-				b.WriteString(diffAddBg.Render("+" + line.Content))
+				b.WriteString(diffAddBg.Render("+" + content))
 			case "-":
 				b.WriteString(diffDelNum.Render(fmt.Sprintf("%4d ", line.OldNum)))
-				b.WriteString(diffDelBg.Render("-" + line.Content))
+				b.WriteString(diffDelBg.Render("-" + content))
 			default:
 				b.WriteString(diffContextNum.Render(fmt.Sprintf("%4d ", line.NewNum)))
-				b.WriteString(" " + line.Content)
+				b.WriteString(" " + content)
 			}
 			out = append(out, b.String())
 		}
@@ -296,6 +338,20 @@ func (s *DiffViewerScreen) View() string {
 	var out strings.Builder
 
 	out.WriteString(infoHeaderStripe.Render("diff"))
+	if len(s.sources) > 0 {
+		out.WriteString("  ")
+		for index, source := range s.sources {
+			if index > 0 {
+				out.WriteString("  ")
+			}
+			label := " " + safeDiffDisplayText(source.Label, 24) + " "
+			if index == s.source {
+				out.WriteString(diffTitleStyle.Render("[" + label + "]"))
+			} else {
+				out.WriteString(diffFooterStyle.Render(label))
+			}
+		}
+	}
 	totalAdd, totalDel := 0, 0
 	for _, f := range s.files {
 		for _, h := range f.Hunks {
@@ -319,7 +375,25 @@ func (s *DiffViewerScreen) View() string {
 		out.WriteString("  ")
 		out.WriteString(diffStatusD.Render(fmt.Sprintf("-%d", totalDel)))
 	}
-	out.WriteString("\n\n")
+	out.WriteString("\n")
+	if s.source >= 0 && s.source < len(s.sources) && s.sources[s.source].Subtitle != "" {
+		out.WriteString("  ")
+		out.WriteString(diffFooterStyle.Render(safeDiffDisplayText(s.sources[s.source].Subtitle, s.diffContentWidth())))
+		out.WriteString("\n")
+	}
+	out.WriteString("\n")
+	if len(s.files) == 0 {
+		out.WriteString("  ")
+		if s.source >= 0 && s.source < len(s.sources) && s.sources[s.source].Error != "" {
+			out.WriteString(diffStatusD.Render("Unable to load working tree changes: "))
+			out.WriteString(diffFooterStyle.Render(safeDiffDisplayText(s.sources[s.source].Error, s.diffContentWidth())))
+		} else if s.source == 0 {
+			out.WriteString(diffFooterStyle.Render("Working tree clean — no uncommitted changes."))
+		} else {
+			out.WriteString(diffFooterStyle.Render("No reconstructable file changes for this turn."))
+		}
+		out.WriteString("\n")
+	}
 
 	if s.fileView == 0 {
 		// File list.
@@ -330,15 +404,16 @@ func (s *DiffViewerScreen) View() string {
 		}
 		for i := s.scroll; i < end; i++ {
 			f := s.files[i]
+			path := safeDiffDisplayText(f.Path, s.diffPathWidth())
 			var line strings.Builder
 			if i == s.cursor {
 				line.WriteString(diffCursorStyle.Render("▸ "))
 				line.WriteString(s.statusStyle(f.Status).Render("[" + f.Status + "] "))
-				line.WriteString(diffFileActive.Render(f.Path))
+				line.WriteString(diffFileActive.Render(path))
 			} else {
 				line.WriteString("  ")
 				line.WriteString(s.statusStyle(f.Status).Render("[" + f.Status + "] "))
-				line.WriteString(diffFileIdle.Render(f.Path))
+				line.WriteString(diffFileIdle.Render(path))
 			}
 			// File stats.
 			adds, dels := 0, 0
@@ -397,7 +472,7 @@ func (s *DiffViewerScreen) View() string {
 	// Footer.
 	out.WriteString("\n")
 	if s.fileView == 0 {
-		hints := []string{"↑/↓ select", "Enter view diff", "Esc close"}
+		hints := []string{"←/→ or Tab source", "↑/↓ select", "Enter view diff", "Esc close"}
 		out.WriteString(diffFooterStyle.Render("  " + strings.Join(hints, "  ·  ")))
 	} else {
 		hints := []string{"↑/↓ scroll", "n/p next/prev file", "Esc back", "q close"}
@@ -408,4 +483,72 @@ func (s *DiffViewerScreen) View() string {
 	}
 
 	return out.String()
+}
+
+func (s *DiffViewerScreen) diffPathWidth() int {
+	width := s.width - 24 // cursor, status, indentation, and file stats
+	if width <= 0 {
+		width = 56
+	}
+	if width > 120 {
+		width = 120
+	}
+	return width
+}
+
+func (s *DiffViewerScreen) diffContentWidth() int {
+	width := s.width - 10 // outer indent, line number, and diff marker
+	if width <= 0 {
+		width = 70
+	}
+	if width > 200 {
+		width = 200
+	}
+	return width
+}
+
+// safeDiffDisplayText is the terminal boundary for repository-controlled file
+// names and contents. It leaves ordinary Unicode intact, makes all control
+// runes visible (so CSI/OSC/BEL cannot execute), and bounds the rendered cell
+// width without rewriting the underlying DiffFile/DiffLine values.
+func safeDiffDisplayText(raw string, maxWidth int) string {
+	var b strings.Builder
+	for _, r := range raw {
+		switch r {
+		case '\t':
+			b.WriteString("⇥")
+		case '\n':
+			b.WriteString("⏎")
+		case '\r':
+			b.WriteString("␍")
+		case '\x1b':
+			b.WriteString(`\x1b`)
+		default:
+			if unicode.IsControl(r) {
+				if r <= 0xff {
+					fmt.Fprintf(&b, `\x%02x`, r)
+				} else {
+					fmt.Fprintf(&b, `\u{%x}`, r)
+				}
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	clean := b.String()
+	if maxWidth <= 0 || lipgloss.Width(clean) <= maxWidth {
+		return clean
+	}
+	var clipped strings.Builder
+	width := 0
+	for _, r := range clean {
+		runeWidth := lipgloss.Width(string(r))
+		if width+runeWidth+1 > maxWidth {
+			break
+		}
+		clipped.WriteRune(r)
+		width += runeWidth
+	}
+	clipped.WriteRune('…')
+	return clipped.String()
 }

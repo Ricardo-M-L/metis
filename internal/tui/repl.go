@@ -266,7 +266,7 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 			// SignalCustomPrompt display is provider-facing prompt material. It
 			// must not be echoed to stdout (especially /review's internal frame),
 			// and ordinary custom commands should not appear twice.
-			if display != "" && sig != slash.SignalCustomPrompt {
+			if display != "" && sig != slash.SignalCustomPrompt && sig != slash.SignalPlan {
 				fmt.Fprintln(r.out, display)
 			}
 			_ = args // consumed by signal handlers below
@@ -449,7 +449,40 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 					fmt.Fprintln(r.out, "(tagged: "+strings.TrimSpace(args)+")")
 				}
 			case slash.SignalPlan:
-				r.setPermissionMode(permission.ModePlan, "plan")
+				wasPlan := activatePlanMode(r.Gate, r.Loop)
+				planArg := strings.TrimSpace(args)
+				switch {
+				case strings.EqualFold(planArg, "open"):
+					if !wasPlan {
+						fmt.Fprintln(r.out, "(mode set: plan)")
+					}
+					if err := r.editCurrentPlan(); err != nil {
+						fmt.Fprintln(r.out, r.Styles.Err.Render("plan editor: "+err.Error()))
+					}
+				case planArg == "":
+					if !wasPlan {
+						fmt.Fprintln(r.out, "(mode set: plan)")
+						break
+					}
+					current, err := currentPlanText(r.SessionID)
+					if err != nil {
+						fmt.Fprintln(r.out, r.Styles.Err.Render("plan: "+err.Error()))
+					} else {
+						fmt.Fprintln(r.out, current)
+					}
+				default:
+					if err := updateCurrentPlanDraft(r.SessionID, planArg); err != nil {
+						fmt.Fprintln(r.out, r.Styles.Err.Render("plan: "+err.Error()))
+						break
+					}
+					if !wasPlan {
+						fmt.Fprintln(r.out, "(mode set: plan)")
+					} else {
+						fmt.Fprintln(r.out, "(current plan update accepted)")
+					}
+					text = planArg
+					submitSlashPrompt = true
+				}
 			case slash.SignalAcceptEdits:
 				r.setPermissionMode(permission.ModeAcceptEdits, "acceptEdits")
 			case slash.SignalBypassPermissions:
@@ -489,7 +522,7 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 					break
 				}
 				turnCtx = preparedCtx
-				if strings.EqualFold(slashName(visibleInput), "/review") {
+				if shouldHideInternalCommandPrompt(visibleInput) {
 					reviewInvocation = visibleInput
 					text = wrapInternalReviewPrompt(display)
 				} else {
@@ -542,7 +575,13 @@ func (r *REPL) parseREPLCommand(text string) *REPLCommand {
 	if name == "" {
 		return nil
 	}
-	return r.cmds.Get(name)
+	cmd := r.cmds.Resolve(name)
+	if cmd != nil && preferSlashInPlainREPL(cmd.Name) && r.Slash != nil {
+		if _, ok := r.Slash.Resolve(name); ok {
+			return nil
+		}
+	}
+	return cmd
 }
 
 // extractCommandName splits "cmd arg1 arg2" into ("cmd", "arg1 arg2").
@@ -807,7 +846,11 @@ func (r *REPL) runTurn(ctx context.Context) error {
 		case agent.EventError:
 			fmt.Fprintln(r.out, r.Styles.Err.Render("error: "+ev.Err.Error()))
 		case agent.EventInfo:
+			_, planPersistErr := persistPlanProposal(r.SessionID, ev.Info)
 			fmt.Fprintln(r.out, r.Styles.Info.Render("    "+ev.Info))
+			if planPersistErr != nil {
+				fmt.Fprintln(r.out, r.Styles.Err.Render("failed to save current plan: "+planPersistErr.Error()))
+			}
 		case agent.EventPlan:
 			_ = runtime.ArchivePlan(runtime.ArchivedPlan{
 				SessionID: r.SessionID,

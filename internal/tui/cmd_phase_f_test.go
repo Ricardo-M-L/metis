@@ -9,9 +9,9 @@ import (
 	"testing"
 )
 
-func TestThinkback_NoSession(t *testing.T) {
+func TestThoughts_NoSession(t *testing.T) {
 	r := &REPL{}
-	out := cmdThinkback(r, "")
+	out := cmdThoughts(r, "")
 	if !strings.Contains(out, "no active session") {
 		t.Errorf("expected 'no active session'; got: %q", out)
 	}

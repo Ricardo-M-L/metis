@@ -186,6 +186,13 @@ func (m *Model) modelPickerChoices(requireVision bool) []screen.ModelChoice {
 // recovery picker used when a text-only model receives image attachments.
 // It returns false when no configured vision-capable profile exists.
 func (m *Model) openModelPicker(requireVision bool, recoveryImageCount int) bool {
+	if m == nil || m.turnActive || m.rewindSummaryPending {
+		if m != nil && requireVision {
+			m.imageRecoveryPending = false
+			m.imageRecoveryImageCount = 0
+		}
+		return false
+	}
 	choices := m.modelPickerChoices(requireVision)
 	if len(choices) == 0 {
 		if requireVision {

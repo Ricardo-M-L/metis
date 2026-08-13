@@ -155,6 +155,39 @@ func (m *Model) isExportCommand(text string) bool {
 	return cmd != nil && cmd.Name == "export"
 }
 
+func (m *Model) isModelCommand(text string) bool {
+	if m == nil || m.cmds == nil || !strings.HasPrefix(text, "/") {
+		return false
+	}
+	name, _, _ := cut(text[1:], " ")
+	cmd := m.cmds.Resolve(name)
+	return cmd != nil && cmd.Name == "model"
+}
+
+func (m *Model) refuseModelSwitch(text, blocker string) {
+	name := "model"
+	if strings.HasPrefix(text, "/") {
+		if parsed, _, _ := cut(text[1:], " "); parsed != "" {
+			name = parsed
+		}
+	}
+	m.messages = append(m.messages, Message{
+		Role: "info",
+		Content: fmt.Sprintf("(can't /%s while %s is active — wait for it to finish or cancel it first)",
+			name, blocker),
+		Timestamp: time.Now(),
+	})
+	// Keep an explicit model choice in the editor so the user can submit it at
+	// the safe boundary. A bare picker invocation has no choice to preserve.
+	if strings.TrimSpace(text) == "/model" || strings.TrimSpace(text) == "/m" {
+		m.input.Reset()
+	} else {
+		m.input.SetValue(text)
+		m.input.CursorEnd()
+	}
+	m.dismissPalette()
+}
+
 func isThinkingDisplayCommand(text string) bool {
 	if !strings.HasPrefix(text, "/") {
 		return false
@@ -230,8 +263,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// Enter events idempotent: subsequent empty submits are no-ops.
 	if m.isExportCommand(text) {
 		m.input.Reset()
-		m.showPalette = false
-		m.palFilter = ""
+		m.dismissPalette()
 		m.stickyBottom = true
 		m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
 
@@ -311,6 +343,13 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		//     refactor.
 		raw := text
 		if raw == "" {
+			return m, nil
+		}
+		// /model is REPL-owned, so slash.Parse reports SignalNone and cannot
+		// classify its real behavior. Switching transport/model/compactor while
+		// Run snapshots them is unsafe; require a fresh-turn boundary explicitly.
+		if m.isModelCommand(raw) {
+			m.refuseModelSwitch(raw, "the running turn")
 			return m, nil
 		}
 		// /abort is the command spelling of the single Ctrl-C interrupt. It
@@ -488,8 +527,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	}
 
 	m.input.Reset()
-	m.showPalette = false
-	m.palFilter = ""
+	m.dismissPalette()
 
 	// Submitting a new prompt re-anchors the viewport to the live
 	// tail. claude-code parity: typing into the editor and hitting
@@ -521,6 +559,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	if strings.HasPrefix(text, "/") {
 		cmdText := text[1:]
 		name, args, _ := cut(cmdText, " ")
+		if (name == "model" || name == "m") && m.rewindSummaryPending {
+			m.refuseModelSwitch(text, "the rewind summary")
+			return m, nil
+		}
 
 		// Defensive fallback for callers that reach this branch without the
 		// early inline interception above. Explicit `/effort high` still falls
@@ -611,11 +653,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if name == "diff-view" || name == "dv" {
-			files := m.buildDiffFiles()
-			dv := screen.NewDiffViewerScreen(files)
-			dv.Resize(m.width, m.height)
-			m.activeScreen = dv
-			return m, nil
+			return m, m.openDiffViewer()
 		}
 		if name == "agents" || name == "av" {
 			m.openAgentsView()
@@ -640,17 +678,18 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if name == "config" || name == "cfg" {
-			return m, m.openConfigEditor()
+			m.openConfigScreen()
+			return m, nil
 		}
 
 		if cmd := m.cmds.Get(name); cmd != nil && !preferSlashInTUI(cmd.Name) {
 			if cmd.Name == "quit" || cmd.Name == "exit" {
 				return m, tea.Quit
 			}
-			if cmd.Name == "clear" {
+			if cmd.Name == "clear-history" {
 				// Consolidated path — see internal/tui/reload.go.
 				if err := m.Reload(ReloadOpts{}); err != nil {
-					m.messages = append(m.messages, Message{Role: "error", Content: "clear: " + err.Error(), Timestamp: time.Now()})
+					m.messages = append(m.messages, Message{Role: "error", Content: "clear-history: " + err.Error(), Timestamp: time.Now()})
 				}
 				return m, nil
 			}
@@ -695,10 +734,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 
 	// Slash registry
 	if handled, display, sig, args := m.slash.Parse(text); handled {
+		submitPlanPrompt := false
 		// Prompt-rewriting signals consume display as model input below. Echoing
 		// it here first exposes internal /review instructions in the transcript
 		// (and duplicates user-authored custom-command bodies).
-		if display != "" && sig != slash.SignalCustomPrompt && sig != slash.SignalBatch {
+		if display != "" && sig != slash.SignalCustomPrompt && sig != slash.SignalBatch && sig != slash.SignalPlan {
 			m.messages = append(m.messages, Message{Role: "info", Content: display, Timestamp: time.Now()})
 		}
 		_ = args // many signals don't need it; the ones that do read below
@@ -762,30 +802,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to undo)", Timestamp: time.Now()})
 			}
 		case slash.SignalRewind:
-			// Unified rewind: restore files AND conversation to the
-			// pre-edit snapshot of the last edit-turn.
-			if res, ok := m.loop.Rewind(); ok {
-				persistErr := m.session.ReplaceHistoryAndMark(m.sessionID, m.loop.History(), &m.historyCursor)
-				// Trim exactly as many visible user blocks as turns were
-				// undone — guards the TurnsUndone==0 case (e.g. /undo then
-				// /rewind already rolled the conversation past the
-				// snapshot) where an unconditional trim would desync the
-				// on-screen chat from the loop's Messages.
-				for i := 0; i < res.TurnsUndone; i++ {
-					m.messages = trimVisibleMessagesToLastUser(m.messages)
-				}
-				m.toolEvents = nil
-				if persistErr != nil {
-					m.messages = append(m.messages, Message{Role: "error", Content: "rewind applied but failed to persist conversation: " + persistErr.Error(), Timestamp: time.Now()})
-				} else {
-					m.messages = append(m.messages, Message{
-						Role:      "success",
-						Content:   fmt.Sprintf("(rewound: restored files + undid %d turn(s) — %s)", res.TurnsUndone, res.Label),
-						Timestamp: time.Now(),
-					})
-				}
+			if strings.EqualFold(strings.TrimSpace(args), "last") {
+				m.applyLegacyRewind()
 			} else {
-				m.messages = append(m.messages, Message{Role: "info", Content: "(nothing to rewind — no file snapshots yet, or checkpointing is off)", Timestamp: time.Now()})
+				m.openRewindScreen()
 			}
 		case slash.SignalHistory:
 			hs := screen.NewHistoryScreen(m.loop.History(), m.width, m.height)
@@ -899,7 +919,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalCost:
 			m.messages = append(m.messages, Message{Role: "info", Content: renderCost(m), Timestamp: time.Now()})
 		case slash.SignalDiff:
-			m.messages = append(m.messages, Message{Role: "info", Content: renderDiff(m), Timestamp: time.Now()})
+			return m, m.openDiffViewer()
 		case slash.SignalDoctor:
 			m.openBodyScreen("/doctor", renderDoctor(m))
 		case slash.SignalStats:
@@ -945,7 +965,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		case slash.SignalPRComments:
 			m.openBodyScreen("/pr_comments", renderPRComments(args))
 		case slash.SignalUpgrade:
-			m.openBodyScreen("/upgrade", renderUpgrade())
+			return m, m.startUpdateCheck()
 		case slash.SignalContext:
 			// Inline render (claude-code parity, 2026-05-11). Append
 			// as an info-role message so it lives in the chat scroll
@@ -991,7 +1011,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				turnRunCtx = preparedCtx
-				if strings.EqualFold(slashName(text), "/review") {
+				if shouldHideInternalCommandPrompt(text) {
 					visibleUserText = text
 					text = wrapInternalReviewPrompt(display)
 				} else {
@@ -1000,13 +1020,40 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				display = ""
 			}
 		case slash.SignalPlan:
-			// /plan + /p — switch the gate to plan mode (read-only;
-			// tool calls collected as proposal instead of executed).
-			// Pre-2026-05-21 the signal was declared but had no
-			// case, so typing /plan in the input box was silently
-			// dead (compiled-bug-list audit).
-			m.gate.SetMode(permission.ModePlan)
-			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: plan — tool calls will be surfaced for review)", Timestamp: time.Now()})
+			wasPlan := activatePlanMode(m.gate, m.loop)
+			planArg := strings.TrimSpace(args)
+			switch {
+			case strings.EqualFold(planArg, "open"):
+				if !wasPlan {
+					m.messages = append(m.messages, Message{Role: "success", Content: planModeStartedText(), Timestamp: time.Now()})
+				}
+				return m, m.openPlanEditor()
+			case planArg == "":
+				if !wasPlan {
+					m.messages = append(m.messages, Message{Role: "success", Content: planModeStartedText(), Timestamp: time.Now()})
+					break
+				}
+				current, err := currentPlanText(m.sessionID)
+				if err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "plan: " + err.Error(), Timestamp: time.Now()})
+				} else {
+					m.messages = append(m.messages, Message{Role: "plan-proposal", Content: current, Timestamp: time.Now()})
+				}
+			default:
+				if err := updateCurrentPlanDraft(m.sessionID, planArg); err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "plan: " + err.Error(), Timestamp: time.Now()})
+					break
+				}
+				if !wasPlan {
+					m.messages = append(m.messages, Message{Role: "success", Content: "(mode: plan · planning brief accepted)", Timestamp: time.Now()})
+				} else {
+					m.messages = append(m.messages, Message{Role: "success", Content: "(current plan update accepted)", Timestamp: time.Now()})
+				}
+				// Re-enter the ordinary agent path with the description. The live
+				// plan overlay supplies the read-only planning contract.
+				text = planArg
+				submitPlanPrompt = true
+			}
 		case slash.SignalAcceptEdits:
 			m.gate.SetMode(permission.ModeAcceptEdits)
 			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: acceptEdits — file edits are accepted; other state changes may still ask)", Timestamp: time.Now()})
@@ -1064,7 +1111,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// Slash commands that produced a regular reply terminate here.
 		// /batch and /custom-prompt rewrite `text` above and re-enter
 		// the agent path below; everything else returns.
-		if sig != slash.SignalBatch && sig != slash.SignalCustomPrompt {
+		if sig != slash.SignalBatch && sig != slash.SignalCustomPrompt && !submitPlanPrompt {
 			return m, nil
 		}
 	}

@@ -422,13 +422,21 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		//     plan-proposal apart from a routine info row because
 		//     both were rendered the same dim color).
 		role := "info"
+		isPlanProposal, planPersistErr := persistPlanProposal(m.sessionID, ev.Info)
 		switch {
 		case strings.HasPrefix(ev.Info, "context compacted:"):
 			role = "compaction"
-		case strings.HasPrefix(ev.Info, "[plan proposal]"):
+		case isPlanProposal:
 			role = "plan-proposal"
 		}
 		m.messages = append(m.messages, Message{Role: role, Content: ev.Info, Timestamp: time.Now()})
+		if planPersistErr != nil {
+			m.messages = append(m.messages, Message{
+				Role:      "error",
+				Content:   "failed to save current plan: " + planPersistErr.Error(),
+				Timestamp: time.Now(),
+			})
+		}
 	case agent.EventPlan:
 		// Plan-mode result: archive to ~/.metis/plans/ + render the
 		// full proposal inline so the user can actually review what

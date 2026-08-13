@@ -28,9 +28,16 @@ func registerMCPPromptsAsSlash(r *slash.Registry, handles []mcp.PromptHandle) []
 	var names []string
 	for i := range handles {
 		h := handles[i] // capture
+		desc := strings.TrimSpace(h.Description)
+		if desc == "" {
+			desc = "MCP prompt from " + h.ServerName
+		}
 		r.Register(slash.Cmd{
-			Name:        h.SlashName,
-			Description: h.PromptDescription(),
+			Name:         h.SlashName,
+			Description:  desc,
+			ArgumentHint: strings.Join(h.Arguments, " "),
+			Source:       "mcp:" + h.ServerName,
+			Category:     "mcp",
 			Handler: func(args string) (string, slash.Signal) {
 				argv := strings.Fields(args)
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

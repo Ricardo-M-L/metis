@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"sort"
-
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
@@ -59,29 +57,49 @@ func (m *Model) helpGeneralRows() []screen.HelpRow {
 	}
 }
 
-// helpCommandsRows — every registered REPL command sorted alphabetically.
+// helpCommandsRows — every effective command grouped by source tier and
+// sorted alphabetically inside each group.
 // Long list, scrollable. Mirrors claude-code's "commands" tab (image #8).
 func (m *Model) helpCommandsRows() []screen.HelpRow {
 	all := m.commandCatalog()
 	// Dedup by canonical name (aliases share the underlying entry).
 	seen := map[string]bool{}
-	type entry struct{ name, desc string }
+	type entry struct {
+		name, hint, desc, group, badge string
+	}
 	pairs := make([]entry, 0, len(all))
 	for _, c := range all {
 		if seen[c.Name] {
 			continue
 		}
 		seen[c.Name] = true
-		pairs = append(pairs, entry{name: c.Name, desc: c.Description})
+		pairs = append(pairs, entry{
+			name: c.Name, hint: c.ArgumentHint, desc: c.Description,
+			group: commandCatalogGroup(c), badge: commandSourceBadge(c),
+		})
 	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].name < pairs[j].name })
 	rows := []screen.HelpRow{
-		{Heading: "Built-in commands"},
 		{Value: "Type any of these or use `/` + Tab to autocomplete."},
 		{},
 	}
+	group := ""
 	for _, p := range pairs {
-		rows = append(rows, screen.HelpRow{Key: "/" + p.name, Value: p.desc})
+		if p.group != group {
+			if group != "" {
+				rows = append(rows, screen.HelpRow{})
+			}
+			group = p.group
+			rows = append(rows, screen.HelpRow{Heading: group})
+		}
+		key := "/" + p.name
+		if p.hint != "" {
+			key += " " + p.hint
+		}
+		desc := p.desc
+		if p.badge != "" && group == "MCP and other commands" {
+			desc = p.badge + " " + desc
+		}
+		rows = append(rows, screen.HelpRow{Key: key, Value: desc})
 	}
 	rows = append(rows,
 		screen.HelpRow{},
@@ -111,7 +129,11 @@ func (m *Model) helpCustomCommandsRows() []screen.HelpRow {
 		if desc == "" {
 			desc = "(no description)"
 		}
-		rows = append(rows, screen.HelpRow{Key: "/" + cmd.Name, Value: desc})
+		key := "/" + cmd.Name
+		if cmd.ArgumentHint != "" {
+			key += " " + cmd.ArgumentHint
+		}
+		rows = append(rows, screen.HelpRow{Key: key, Value: desc})
 	}
 	return rows
 }

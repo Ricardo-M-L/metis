@@ -230,7 +230,7 @@ func formatTurnDuration(d time.Duration) string {
 // The user still gets the "this is a tool, not thinking" signal via
 // color but no flicker.
 func toolUseFlashStyle(elapsed time.Duration) lipgloss.Style {
-	if reducedMotionEnabled {
+	if reducedMotionEnabled || perfConfig().ReducedMotion {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb74d"))
 	}
 	t := elapsed.Seconds()
@@ -257,7 +257,7 @@ func toolUseFlashStyle(elapsed time.Duration) lipgloss.Style {
 // Reduced-motion: skip pulsing, return a static mid-grey. Same
 // semantics ("the model is thinking") but without the flicker.
 func shimmerStyle(elapsed time.Duration) lipgloss.Style {
-	if reducedMotionEnabled {
+	if reducedMotionEnabled || perfConfig().ReducedMotion {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#909090"))
 	}
 	const start = 3 * time.Second

@@ -132,10 +132,6 @@ func scanDir(r *Registry, dir, source, executionCwd string, manager *sandbox.Man
 		if desc == "" {
 			desc = firstNonBlankLine(template, 80)
 		}
-		if meta.argumentHint != "" {
-			desc += " (args: " + meta.argumentHint + ")"
-		}
-		desc = "[" + source + "] " + desc
 		// Capture template by value so each Cmd's closure has its own
 		// copy (loop iteration shares variable scope otherwise).
 		tmpl := template
@@ -151,6 +147,9 @@ func scanDir(r *Registry, dir, source, executionCwd string, manager *sandbox.Man
 		r.Register(Cmd{
 			Name:         base,
 			Description:  desc,
+			ArgumentHint: meta.argumentHint,
+			Source:       source,
+			Category:     "custom",
 			AllowedTools: meta.allowedTools,
 			Model:        meta.model,
 			Trusted:      trusted,

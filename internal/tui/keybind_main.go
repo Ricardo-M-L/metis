@@ -777,26 +777,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Slash command shortcuts: a complete "/quit" or "/clear" submitted
-	// via typing alone (no Enter) still takes effect.
-	//
-	// Mid-turn protection (Task #87): destructive shortcuts skip the
-	// live-fire path when a turn is active, falling through to
-	// handleSubmit's MidTurnDestructive branch which surfaces the
-	// "press Esc to cancel first" hint. Without this guard, /clear
-	// typed during a running turn would silently wipe state without
-	// the user pressing Enter — exactly the kind of accidental
-	// destruction the mid-turn refusal exists to prevent.
+	// Keep the historical live /quit shortcut, but require Enter for every
+	// state-mutating slash command. In particular, /clear and its /new and
+	// /reset aliases must all travel through the same SignalNew dispatch path;
+	// executing /clear while it is merely present in the input used to make
+	// /reset look as though it had been intercepted before submission.
 	val := m.input.Value()
 	if !m.turnActive {
 		if val == "/quit" || val == "/exit" {
 			return m, tea.Quit
-		}
-		if val == "/clear" || val == "/reset" {
-			if err := m.Reload(ReloadOpts{}); err != nil {
-				m.messages = append(m.messages, Message{Role: "error", Content: "clear: " + err.Error(), Timestamp: time.Now()})
-			}
-			return m, cmd
 		}
 	}
 

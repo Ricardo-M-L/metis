@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -47,6 +48,31 @@ func TestTickInterval(t *testing.T) {
 				t.Errorf("tickInterval = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReducedMotionConfigDisablesAnimatedColorChanges(t *testing.T) {
+	oldRM := reducedMotionEnabled
+	oldCfg := perfConfig()
+	defer func() {
+		reducedMotionEnabled = oldRM
+		SetPerfConfig(oldCfg)
+	}()
+	reducedMotionEnabled = false
+	SetPerfConfig(PerfConfig{ReducedMotion: true})
+
+	flashA := toolUseFlashStyle(100 * time.Millisecond).Render("working")
+	flashB := toolUseFlashStyle(800 * time.Millisecond).Render("working")
+	if flashA != flashB {
+		t.Fatalf("reduced-motion tool color still animates:\nA=%q\nB=%q", flashA, flashB)
+	}
+	shimmerA := shimmerStyle(4 * time.Second).Render("thinking")
+	shimmerB := shimmerStyle(4500 * time.Millisecond).Render("thinking")
+	if shimmerA != shimmerB {
+		t.Fatalf("reduced-motion thinking color still animates:\nA=%q\nB=%q", shimmerA, shimmerB)
+	}
+	if !strings.Contains(flashA, "working") || !strings.Contains(shimmerA, "thinking") {
+		t.Fatal("style fixture lost visible text")
 	}
 }
 

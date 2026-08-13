@@ -1,11 +1,7 @@
 package tui
 
-// cmd_phase_c.go — claude-code-parity slash commands added in Phase C.
-// Each handler is small; the goal is matching surface area, not
-// re-architecting the chat loop. Where a richer LLM-driven version is
-// the obvious follow-up (drafted commit messages, sanitized exports),
-// the v1 here points the user at the manual workflow + leaves a TODO
-// at the relevant call site.
+// cmd_phase_c.go — interactive helper slash commands added in Phase C.
+// Each handler stays small and delegates to the existing chat-loop services.
 //
 // Registered from BuildREPLCommands at the bottom of commands.go.
 
@@ -23,16 +19,16 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
-// cmdCopy yanks the last N assistant messages and pushes them through
+// cmdCopy yanks the Nth-latest assistant message and pushes it through
 // the same OSC 52 + ~/.metis/clipboard.txt path the Ctrl+Y key already
-// uses. /copy with no arg = last 1 message (matches Ctrl+Y); /copy 3 =
-// concatenated last 3 assistant messages with `---` separators.
+// uses. /copy with no arg = latest message (matches Ctrl+Y); /copy 3 =
+// the third-latest assistant reply rather than treating N as a batch size.
 func cmdCopy(r *REPL, args string) string {
 	n := 1
 	if v := strings.TrimSpace(args); v != "" {
 		parsed, err := strconv.Atoi(v)
 		if err != nil || parsed <= 0 {
-			return "usage: /copy [N]  — N defaults to 1; counts most recent assistant replies"
+			return "usage: /copy [N]  — copy the Nth-latest assistant reply (default 1)"
 		}
 		n = parsed
 	}
@@ -40,8 +36,9 @@ func cmdCopy(r *REPL, args string) string {
 		return "(no active session)"
 	}
 	hist := r.Loop.History()
-	collected := make([]string, 0, n)
-	for i := len(hist) - 1; i >= 0 && len(collected) < n; i-- {
+	seen := 0
+	body := ""
+	for i := len(hist) - 1; i >= 0; i-- {
 		m := hist[i]
 		if m.Role != llm.RoleAssistant {
 			continue
@@ -50,21 +47,49 @@ func cmdCopy(r *REPL, args string) string {
 		if text == "" {
 			continue
 		}
-		// Prepend so final order is oldest → newest.
-		collected = append([]string{text}, collected...)
+		seen++
+		if seen == n {
+			body = text
+			break
+		}
 	}
-	if len(collected) == 0 {
+	if seen == 0 {
 		return "(nothing to copy yet — type a message and let the model reply)"
 	}
-	body := strings.Join(collected, "\n\n---\n\n")
+	if body == "" {
+		return fmt.Sprintf("(cannot copy %s assistant reply — only %d available)", latestOrdinal(n), seen)
+	}
 	writeClipboard(body)
 	// Match the silent-copy norm — no chat row pollution. A single
 	// confirm string is fine because slash-command output is a
 	// dedicated, ephemeral row, not a chat message.
-	if len(collected) == 1 {
+	if n == 1 {
 		return fmt.Sprintf("(copied %d chars)", len(body))
 	}
-	return fmt.Sprintf("(copied %d assistant replies · %d chars total)", len(collected), len(body))
+	return fmt.Sprintf("(copied %s assistant reply · %d chars)", latestOrdinal(n), len(body))
+}
+
+func latestOrdinal(n int) string {
+	switch n {
+	case 1:
+		return "latest"
+	case 2:
+		return "second-latest"
+	case 3:
+		return "third-latest"
+	}
+	suffix := "th"
+	if n%100 < 11 || n%100 > 13 {
+		switch n % 10 {
+		case 1:
+			suffix = "st"
+		case 2:
+			suffix = "nd"
+		case 3:
+			suffix = "rd"
+		}
+	}
+	return fmt.Sprintf("%d%s-latest", n, suffix)
 }
 
 // assembleAssistantText flattens an assistant message's text blocks
@@ -302,14 +327,15 @@ func cmdBreakCache(r *REPL, args string) string {
 		{Key: "", Value: "request that supports it. To force a fresh cache write:"},
 		{Key: "", Value: ""},
 		{Key: "/compact", Value: "summarize history → new cache prefix"},
-		{Key: "/clear", Value: "drop history entirely → fresh cache from turn 0"},
+		{Key: "/clear-history", Value: "drop this session's history → fresh cache prefix"},
+		{Key: "/clear | /new | /reset", Value: "start a fresh session"},
 		{Key: "metis chat --bare", Value: "skip MCP/plugins; smaller prompt → different prefix"},
 	})
 }
 
 // cmdSecurityReview is a /review with an OWASP-flavored framing.
-// claude-code parity: the same nudge style as cmdReview, just pre-
-// loaded with a security checklist. The actual scan happens in the
+// It uses the same nudge style as cmdReview, pre-loaded with a security
+// checklist. The actual scan happens in the
 // next turn via Bash (git diff) + LLM analysis.
 func cmdSecurityReview(r *REPL, args string) string {
 	target := strings.TrimSpace(args)

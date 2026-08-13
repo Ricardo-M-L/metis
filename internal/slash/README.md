@@ -7,17 +7,19 @@ Metis currently has two registries, and routing order matters.
 ## Runtime routing
 
 1. `internal/tui.REPLCommandRegistry`, built in
-   `internal/tui/commands.go`, is consulted first. Its handlers receive the
-   live `*REPL`, may change live state, and return display text directly.
+   `internal/tui/commands.go`, owns commands that need the live `*REPL`. Its
+   handlers may change live state and return display text directly.
 2. `internal/slash.Registry`, populated by `slash.RegisterAll` plus runtime
-   registrations, is the fallback. Its handlers return `(display, Signal)`;
-   the TUI or plain REPL interprets the signal.
+   registrations, owns signal-based commands. Its handlers return
+   `(display, Signal)` for the TUI or plain REPL to interpret.
 
-The Bubble Tea TUI intentionally prefers the slash implementation for the
-duplicate names `memory` and `doctor`; other duplicates remain REPL-owned.
-The plain REPL uses strict REPL-first, slash-second routing. The merged command
-catalog in `internal/tui/command_catalog.go` applies the same ownership rules
-for `/help`, completion, and the command palette.
+Both interactive dispatchers normally consult REPL commands first, then slash
+commands. Ownership exceptions are surface-specific: the Bubble Tea TUI uses
+the slash implementation for `memory`, `doctor`, `diff` (including
+`diff-view`), and `init`; the plain readline REPL keeps its original
+`memory read|write|search|clear` handler while preferring slash for the other
+three. The merged TUI catalog in `internal/tui/command_catalog.go` applies the
+same ownership and alias rules to `/help`, completion, and the command palette.
 
 Do not maintain a copied list of every command here. The live `/help` / command
 palette is the user-visible inventory, and the registries plus their routing
@@ -29,7 +31,7 @@ tests are the implementation authority.
 |---|---|
 | `commands.go` | `Cmd`, `Handler`, `Signal`, `Registry`, aliases/reservations, built-in signal commands, and `/reload`. |
 | `custom.go` | User and project Markdown commands, frontmatter parsing, template expansion, trust boundaries, and custom-command reload support. |
-| `debug.go`, `review.go` | Specialized prompt-producing commands kept out of the main registration body. |
+| `debug.go`, `review.go`, `init.go` | Specialized prompt-producing commands kept out of the main registration body. |
 | `batch_prompt.go` | Prompt construction for `/batch`. |
 | `cron_handler.go`, `loop_handler.go`, `memory_cmd.go` | Feature-specific command implementations. |
 | `midturn.go` | Classification of slash input received while a model turn is active. |

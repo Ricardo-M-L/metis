@@ -71,6 +71,9 @@ func TestAggregate_NonExistentDirReturnsZeroes(t *testing.T) {
 	if s.Total.Sessions != 0 {
 		t.Errorf("missing dir → sessions=%d, want 0", s.Total.Sessions)
 	}
+	if len(s.RecentDays) != 30 {
+		t.Errorf("missing dir → recent-day buckets=%d, want 30", len(s.RecentDays))
+	}
 }
 
 func TestAggregate_CountsSessionsAndMessages(t *testing.T) {
@@ -95,6 +98,97 @@ func TestAggregate_CountsSessionsAndMessages(t *testing.T) {
 	}
 	if s.Total.Messages != 5 {
 		t.Errorf("messages: got %d, want 5", s.Total.Messages)
+	}
+}
+
+func TestAggregate_IgnoresTimingSidecarsAndZeroMessageSessions(t *testing.T) {
+	dir := t.TempDir()
+	started := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	writeFakeSession(t, dir, "real", "real-model", started, []fakeMsg{{"user", "hello"}})
+	writeFakeSession(t, dir, "header-only", "empty-model", started, nil)
+
+	timing := `{"ts":"2026-08-01T09:00:01Z","tool":"Read","elapsed_ms":12}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "real.timing.jsonl"), []byte(timing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := aggregateAt(dir, started.AddDate(0, 0, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Total.Sessions != 1 || s.Total.Messages != 1 || s.Total.ActiveDays != 1 {
+		t.Fatalf("auxiliary/empty files polluted totals: %+v", s.Total)
+	}
+	if len(s.ByModel) != 1 || s.ByModel[0].Model != "real-model" || s.ByModel[0].Sessions != 1 {
+		t.Fatalf("auxiliary/empty files polluted model counts: %+v", s.ByModel)
+	}
+	if len(s.RecentSessions) != 1 || s.RecentSessions[0].ID != "real" {
+		t.Fatalf("auxiliary/empty files polluted recent sessions: %+v", s.RecentSessions)
+	}
+}
+
+func TestAggregate_KeepsMessageBearingHeaderlessCrashFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "orphan.jsonl")
+	body := `{"type":"message","message":{"role":"user","content":[{"type":"text","text":"recovered"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, started, started); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := aggregateAt(dir, started.AddDate(0, 0, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Total.Sessions != 1 || s.Total.Messages != 1 {
+		t.Fatalf("message-bearing crash file was discarded: %+v", s.Total)
+	}
+	if len(s.RecentSessions) != 1 || s.RecentSessions[0].ID != "orphan" {
+		t.Fatalf("recovered row = %+v", s.RecentSessions)
+	}
+	if len(s.ByModel) != 1 || s.ByModel[0].Model != "(unknown)" {
+		t.Fatalf("recovered model bucket = %+v", s.ByModel)
+	}
+}
+
+func TestAggregate_RecentDaysUsesCurrentNaturalWindowAndIgnoresFutureSessions(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 8, 13, 15, 30, 0, 0, time.UTC)
+	writeFakeSession(t, dir, "old", "old-model", now.AddDate(0, 0, -60), []fakeMsg{{"user", "old"}})
+	writeFakeSession(t, dir, "recent", "recent-model", now.AddDate(0, 0, -10), []fakeMsg{{"user", "recent"}})
+	writeFakeSession(t, dir, "today", "today-model", now.Add(-time.Hour), []fakeMsg{{"user", "today"}})
+	writeFakeSession(t, dir, "future", "future-model", now.AddDate(0, 0, 1), []fakeMsg{{"user", "future"}})
+
+	s, err := aggregateAt(dir, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Total.Sessions != 3 || s.Total.Messages != 3 {
+		t.Fatalf("future session polluted totals: %+v", s.Total)
+	}
+	if len(s.RecentDays) != 30 {
+		t.Fatalf("recent-day bucket count = %d, want 30", len(s.RecentDays))
+	}
+	wantFirst := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	wantLast := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	if !s.RecentDays[0].Date.Equal(wantFirst) || !s.RecentDays[len(s.RecentDays)-1].Date.Equal(wantLast) {
+		t.Fatalf("recent window = %s..%s, want %s..%s",
+			s.RecentDays[0].Date, s.RecentDays[len(s.RecentDays)-1].Date, wantFirst, wantLast)
+	}
+	recentSessions := 0
+	for _, day := range s.RecentDays {
+		recentSessions += day.Sessions
+	}
+	if recentSessions != 2 {
+		t.Fatalf("recent sessions = %d, want 2", recentSessions)
+	}
+	for _, model := range s.ByModel {
+		if model.Model == "future-model" {
+			t.Fatalf("future model leaked into model counts: %+v", s.ByModel)
+		}
 	}
 }
 
@@ -128,7 +222,7 @@ func TestAggregate_GroupsByDayOfWeek(t *testing.T) {
 	writeFakeSession(t, dir, "mon2", "m", mon, []fakeMsg{{"user", "b"}})
 	writeFakeSession(t, dir, "wed1", "m", wed, []fakeMsg{{"user", "c"}})
 
-	s, _ := Aggregate(dir)
+	s, _ := aggregateAt(dir, wed.AddDate(0, 0, 1))
 	dowMap := map[string]int{}
 	for _, d := range s.ByDayOfWeek {
 		dowMap[d.Day] = d.Sessions
@@ -148,11 +242,11 @@ func TestAggregate_GroupsByHour(t *testing.T) {
 	dir := t.TempDir()
 	at9 := time.Date(2026, 5, 4, 9, 30, 0, 0, time.UTC)
 	at14 := time.Date(2026, 5, 4, 14, 0, 0, 0, time.UTC)
-	writeFakeSession(t, dir, "h9_1", "m", at9, nil)
-	writeFakeSession(t, dir, "h9_2", "m", at9, nil)
-	writeFakeSession(t, dir, "h14", "m", at14, nil)
+	writeFakeSession(t, dir, "h9_1", "m", at9, []fakeMsg{{"user", "a"}})
+	writeFakeSession(t, dir, "h9_2", "m", at9, []fakeMsg{{"user", "b"}})
+	writeFakeSession(t, dir, "h14", "m", at14, []fakeMsg{{"user", "c"}})
 
-	s, _ := Aggregate(dir)
+	s, _ := aggregateAt(dir, at14.AddDate(0, 0, 1))
 	hourMap := map[int]int{}
 	for _, h := range s.ByHour {
 		hourMap[h.Hour] = h.Sessions
@@ -170,11 +264,11 @@ func TestAggregate_HourDowMatrix(t *testing.T) {
 	// Mon=0, Wed=2 in our matrix indexing (Sunday→6, Monday→0, …).
 	mon10 := time.Date(2026, 5, 4, 10, 0, 0, 0, time.UTC)
 	wed14 := time.Date(2026, 5, 6, 14, 0, 0, 0, time.UTC)
-	writeFakeSession(t, dir, "mon10", "m", mon10, nil)
-	writeFakeSession(t, dir, "wed14", "m", wed14, nil)
-	writeFakeSession(t, dir, "wed14b", "m", wed14, nil)
+	writeFakeSession(t, dir, "mon10", "m", mon10, []fakeMsg{{"user", "a"}})
+	writeFakeSession(t, dir, "wed14", "m", wed14, []fakeMsg{{"user", "b"}})
+	writeFakeSession(t, dir, "wed14b", "m", wed14, []fakeMsg{{"user", "c"}})
 
-	s, _ := Aggregate(dir)
+	s, _ := aggregateAt(dir, wed14.AddDate(0, 0, 1))
 	if s.HourDowMatrix[0][10] != 1 {
 		t.Errorf("[Mon][10]: got %d, want 1", s.HourDowMatrix[0][10])
 	}
@@ -191,9 +285,9 @@ func TestAggregate_RecentSessionsNewestFirstCappedAt20(t *testing.T) {
 	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 25; i++ {
 		writeFakeSession(t, dir, fmt.Sprintf("s%02d", i), "m",
-			base.Add(time.Duration(i)*time.Hour), nil)
+			base.Add(time.Duration(i)*time.Hour), []fakeMsg{{"user", "message"}})
 	}
-	s, _ := Aggregate(dir)
+	s, _ := aggregateAt(dir, base.AddDate(0, 0, 3))
 	if len(s.RecentSessions) != 20 {
 		t.Errorf("recent cap: got %d, want 20", len(s.RecentSessions))
 	}
@@ -282,11 +376,11 @@ func TestAggregate_ActiveDaysCount(t *testing.T) {
 	dir := t.TempDir()
 	d1 := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	d2 := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC) // skip d2 = active days = 2
-	writeFakeSession(t, dir, "d1a", "m", d1, nil)
-	writeFakeSession(t, dir, "d1b", "m", d1, nil)
-	writeFakeSession(t, dir, "d2", "m", d2, nil)
+	writeFakeSession(t, dir, "d1a", "m", d1, []fakeMsg{{"user", "a"}})
+	writeFakeSession(t, dir, "d1b", "m", d1, []fakeMsg{{"user", "b"}})
+	writeFakeSession(t, dir, "d2", "m", d2, []fakeMsg{{"user", "c"}})
 
-	s, _ := Aggregate(dir)
+	s, _ := aggregateAt(dir, d2.AddDate(0, 0, 1))
 	if s.Total.ActiveDays != 2 {
 		t.Errorf("active days: got %d, want 2", s.Total.ActiveDays)
 	}

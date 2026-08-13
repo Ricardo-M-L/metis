@@ -7,6 +7,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **interactive command workflows**: `/diff` combines uncommitted working-tree
+  changes with best-effort per-turn sources, `/config` opens a searchable
+  settings panel, and `/rewind` can choose a conversation checkpoint and
+  restore code, conversation, both, or replace the later conversation with a
+  summary. The plain readline REPL retains latest-edit rewind behavior.
+- **project and activity views**: `/files` reports files represented in the
+  current model context, `/stats` combines archive-wide activity with current
+  session usage, `/think-back` (alias `/thinkback`) gives a local yearly review,
+  and `/init [focus]` asks the model to inspect the repository before creating
+  or improving `CLAUDE.md`. The former thinking-trace view is now `/thoughts`.
+
+### Changed
+
+- Slash help, completion, and the command palette now share effective command
+  metadata, alias ownership, visibility, categories, argument hints, sorting,
+  and fuzzy matching across the REPL, signal, custom, and MCP prompt sources.
+- `/clear`, `/new`, and `/reset` start a fresh session; `/clear-history` keeps
+  the current session while dropping its conversation. `/quick` owns the local
+  low-effort/short-output toggle, `/tasks` manages background jobs, `/todos`
+  shows the session checklist, `/session` controls local read-only sharing,
+  `/session-info` shows local session metadata, and `/update` checks releases.
+- `/copy N` now copies the Nth-latest assistant reply. `/plan` enters plan mode,
+  shows the current draft when already active, accepts a planning brief, and
+  supports `/plan open` for editor-based changes.
+
 ## [0.4.22] - 2026-08-13
 
 ### Fixed

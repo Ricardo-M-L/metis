@@ -38,6 +38,12 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 	if newModel == "" {
 		return fmt.Errorf("model switch: empty model id")
 	}
+	if m.turnActive {
+		return fmt.Errorf("model switch: running turn is active")
+	}
+	if m.rewindSummaryPending {
+		return fmt.Errorf("model switch: rewind summary is active")
+	}
 
 	if m.cfg == nil {
 		m.model = newModel

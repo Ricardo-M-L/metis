@@ -55,6 +55,19 @@ func TestREPL_KeybindingsRepeats(t *testing.T) {
 	}
 }
 
+func TestPlainREPLKeepsMemoryAndAgentsREPLSurface(t *testing.T) {
+	out := runREPLWithInput(t, "/memory path\n/agents\n/quit\n")
+	if !strings.Contains(out, "memory: not initialized") {
+		t.Fatalf("plain /memory no longer used the original REPL memory handler:\n%s", out)
+	}
+	if strings.Contains(out, "Turn on auto-memory") {
+		t.Fatalf("plain /memory was incorrectly routed to the TUI auto-memory command:\n%s", out)
+	}
+	if !strings.Contains(out, "opening agents view") {
+		t.Fatalf("plain /agents no longer used its REPL fallback:\n%s", out)
+	}
+}
+
 // runREPLWithInput spins up a minimal REPL, feeds the given input on
 // stdin, and returns the captured stdout (ANSI-stripped). No LLM
 // provider is wired — relying on /quit to exit before any prompt

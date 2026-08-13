@@ -1343,7 +1343,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		}
 	}
 	if flags.fast {
-		loop.Fast = true
+		loop.SetFast(true)
 	}
 
 	// Gate→Loop mode bridge — 2026-05-18 fix for the plan-mode deny

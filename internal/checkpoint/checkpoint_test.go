@@ -5,6 +5,7 @@ package checkpoint
 // disables manager).
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -99,12 +100,328 @@ func TestRestore_RoundTripsContent(t *testing.T) {
 
 	// Now mutate to v3 (uncommitted) and restore back to v2's snapshot.
 	_ = os.WriteFile(path, []byte("v3"), 0o600)
+	if err := m.RecordManagedPath(path); err != nil {
+		t.Fatal(err)
+	}
 	if err := m.Restore(hash2); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	body, _ := os.ReadFile(path)
 	if string(body) != "v2" {
 		t.Errorf("after restore body=%q; want v2", body)
+	}
+}
+
+func TestSnap_EmptyProjectCreatesRestorableCheckpoint(t *testing.T) {
+	skipIfNoGit(t)
+	m, _ := freshManager(t)
+	hash, err := m.Snap("Write", "empty", "before first file")
+	if err != nil {
+		t.Fatalf("Snap empty project: %v", err)
+	}
+	if len(hash) < 7 {
+		t.Fatalf("empty project checkpoint hash=%q, want commit", hash)
+	}
+}
+
+func TestSnap_RecordsDeletionInFollowingSnapshot(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	path := filepath.Join(cwd, "deleted.go")
+	if err := os.WriteFile(path, []byte("package deleted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Snap("Write", "present", "file exists"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	deletedHash, err := m.Snap("Write", "deleted", "file deleted")
+	if err != nil {
+		t.Fatalf("Snap after deletion: %v", err)
+	}
+	if deletedHash == "" {
+		t.Fatal("deletion produced no checkpoint commit")
+	}
+	if err := os.WriteFile(path, []byte("recreated by later work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RecordManagedPath(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Restore(deletedHash); err != nil {
+		t.Fatalf("Restore deletion checkpoint: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("deleted file survived restore: err=%v", err)
+	}
+}
+
+func TestRestore_RemovesManagedFileCreatedAfterTarget(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	target, err := m.Snap("Write", "empty", "before first write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := filepath.Join(cwd, "created-by-metis.go")
+	if err := os.WriteFile(created, []byte("package created"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RecordManagedPath(created); err != nil {
+		t.Fatalf("RecordManagedPath: %v", err)
+	}
+	if err := m.Restore(target); err != nil {
+		t.Fatalf("Restore empty target: %v", err)
+	}
+	if _, err := os.Stat(created); !os.IsNotExist(err) {
+		t.Fatalf("managed later-created file survived restore: err=%v", err)
+	}
+}
+
+func TestRestore_PreservesFilesNeverManagedByCheckpoint(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	target, err := m.Snap("Write", "empty", "empty baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unmanaged := filepath.Join(cwd, "user-created.txt")
+	big := filepath.Join(cwd, "large-user.bin")
+	skipped := filepath.Join(cwd, "node_modules", "user.js")
+	if err := os.WriteFile(unmanaged, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(big, make([]byte, maxFileBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(skipped), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(skipped, []byte("keep dependency"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Restore(target); err != nil {
+		t.Fatalf("Restore empty target: %v", err)
+	}
+	for _, path := range []string{unmanaged, big, skipped} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("unmanaged path %s was removed: %v", path, err)
+		}
+	}
+}
+
+func TestRestore_PreservesUnmanagedFileModifiedAfterSnapshot(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	managed := filepath.Join(cwd, "managed.txt")
+	unmanaged := filepath.Join(cwd, "user.txt")
+	_ = os.WriteFile(managed, []byte("managed-before"), 0o600)
+	_ = os.WriteFile(unmanaged, []byte("user-before"), 0o600)
+	target, err := m.Snap("Edit", "baseline", "before agent edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(managed, []byte("managed-after"), 0o600)
+	_ = os.WriteFile(unmanaged, []byte("user-after"), 0o600)
+	states, err := m.CapturePathStates([]string{managed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RestorePathStates(target, states); err != nil {
+		t.Fatal(err)
+	}
+	if body, _ := os.ReadFile(managed); string(body) != "managed-before" {
+		t.Fatalf("managed file=%q, want baseline", body)
+	}
+	if body, _ := os.ReadFile(unmanaged); string(body) != "user-after" {
+		t.Fatalf("unmanaged user edit overwritten: %q", body)
+	}
+}
+
+func TestRestore_RefusesRecreatedManagedFile(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	target, err := m.Snap("Write", "empty", "before create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cwd, "owned-once.txt")
+	_ = os.WriteFile(path, []byte("agent version"), 0o600)
+	states, err := m.CapturePathStates([]string{path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(path)
+	_ = os.WriteFile(path, []byte("user replacement"), 0o600)
+	if err := m.RestorePathStates(target, states); !errors.Is(err, ErrManagedPathChanged) {
+		t.Fatalf("RestorePathStates err=%v, want ErrManagedPathChanged", err)
+	}
+	if body, _ := os.ReadFile(path); string(body) != "user replacement" {
+		t.Fatalf("user replacement was removed: %q", body)
+	}
+}
+
+func TestRestore_RejectsSymlinkParentEscape(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	target, err := m.Snap("Write", "empty", "before external path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.txt")
+	_ = os.WriteFile(victim, []byte("outside"), 0o600)
+	if err := os.Symlink(outside, filepath.Join(cwd, "link")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	throughLink := filepath.Join(cwd, "link", "victim.txt")
+	states, err := m.CapturePathStates([]string{throughLink})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("symlink escape became managed: %+v", states)
+	}
+	if err := m.RestorePathStates(target, map[string]string{"link/victim.txt": "absent"}); err == nil {
+		t.Fatal("explicit symlink escape restore unexpectedly succeeded")
+	}
+	if body, _ := os.ReadFile(victim); string(body) != "outside" {
+		t.Fatalf("outside victim changed: %q", body)
+	}
+}
+
+func TestSnapAndRestore_FileDirectoryTypeReplacements(t *testing.T) {
+	skipIfNoGit(t)
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, path string)
+		flip  func(t *testing.T, path string)
+		check func(t *testing.T, path string)
+	}{
+		{
+			name:  "file-to-directory",
+			setup: func(t *testing.T, path string) { t.Helper(); _ = os.WriteFile(path, []byte("old-file"), 0o600) },
+			flip: func(t *testing.T, path string) {
+				t.Helper()
+				_ = os.Remove(path)
+				_ = os.MkdirAll(path, 0o700)
+				_ = os.WriteFile(filepath.Join(path, "child.txt"), []byte("child"), 0o600)
+			},
+			check: func(t *testing.T, path string) {
+				t.Helper()
+				if body, err := os.ReadFile(path); err != nil || string(body) != "old-file" {
+					t.Fatalf("restored file body=%q err=%v", body, err)
+				}
+			},
+		},
+		{
+			name: "directory-to-file",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				_ = os.MkdirAll(path, 0o700)
+				_ = os.WriteFile(filepath.Join(path, "child.txt"), []byte("old-child"), 0o600)
+			},
+			flip: func(t *testing.T, path string) {
+				t.Helper()
+				_ = os.RemoveAll(path)
+				_ = os.WriteFile(path, []byte("new-file"), 0o600)
+			},
+			check: func(t *testing.T, path string) {
+				t.Helper()
+				if body, err := os.ReadFile(filepath.Join(path, "child.txt")); err != nil || string(body) != "old-child" {
+					t.Fatalf("restored child body=%q err=%v", body, err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, cwd := freshManager(t)
+			path := filepath.Join(cwd, "node")
+			tc.setup(t, path)
+			target, err := m.Snap("Bash", "before", "before replacement")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.flip(t, path)
+			changed, err := m.ChangedPaths(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			states, err := m.CapturePathStates(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.Snap("Bash", "after", "after replacement"); err != nil {
+				t.Fatalf("snapshot type replacement: %v", err)
+			}
+			if err := m.RestorePathStates(target, states); err != nil {
+				t.Fatalf("restore type replacement: %v", err)
+			}
+			tc.check(t, path)
+		})
+	}
+}
+
+func TestRestore_PreservesExecutableBit(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	path := filepath.Join(cwd, "run.sh")
+	_ = os.WriteFile(path, []byte("#!/bin/sh\necho old\n"), 0o700)
+	target, err := m.Snap("Edit", "exec", "before edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(path, []byte("#!/bin/sh\necho new\n"), 0o600)
+	states, _ := m.CapturePathStates([]string{path})
+	if err := m.RestorePathStates(target, states); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Fatalf("executable bit lost: mode=%v", info.Mode())
+	}
+}
+
+func TestRestore_RefusesDirectoryReplacementWithUnmanagedDescendant(t *testing.T) {
+	skipIfNoGit(t)
+	m, cwd := freshManager(t)
+	path := filepath.Join(cwd, "node")
+	if err := os.WriteFile(path, []byte("baseline file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target, err := m.Snap("Bash", "before", "before file becomes directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managedChild := filepath.Join(path, "managed.txt")
+	userChild := filepath.Join(path, "user.txt")
+	_ = os.WriteFile(managedChild, []byte("agent"), 0o600)
+	states, err := m.CapturePathStates([]string{path, managedChild})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userChild, []byte("user data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RestorePathStates(target, states); !errors.Is(err, ErrManagedPathChanged) {
+		t.Fatalf("RestorePathStates err=%v, want ErrManagedPathChanged", err)
+	}
+	if body, err := os.ReadFile(userChild); err != nil || string(body) != "user data" {
+		t.Fatalf("unmanaged descendant lost: body=%q err=%v", body, err)
+	}
+	if body, err := os.ReadFile(managedChild); err != nil || string(body) != "agent" {
+		t.Fatalf("managed descendant changed on failed preflight: body=%q err=%v", body, err)
 	}
 }
 

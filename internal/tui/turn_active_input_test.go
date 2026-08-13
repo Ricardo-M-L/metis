@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -314,6 +315,70 @@ func TestTurnActive_DestructiveSlashRefused(t *testing.T) {
 	// Must NOT have been steered.
 	if got := m.loop.SteerInjectDrainForTest(); got != "" {
 		t.Errorf("destructive slash must NOT reach steerBuf; got %q", got)
+	}
+}
+
+func TestTurnActiveModelSwitchIsRefusedWithoutMutation(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	oldModel := m.model
+	oldLoopModel := m.loop.Model
+	oldProvider := m.loop.Provider
+	m.input.SetValue("/model unsafe-new-model")
+
+	pressEnter(t, m)
+
+	if m.model != oldModel || m.loop.Model != oldLoopModel || m.loop.Provider != oldProvider {
+		t.Fatalf("mid-turn /model mutated live runtime: model=%q loop=%q provider=%T", m.model, m.loop.Model, m.loop.Provider)
+	}
+	if got := m.input.Value(); got != "/model unsafe-new-model" {
+		t.Fatalf("refused explicit /model choice was not preserved: %q", got)
+	}
+	if last := m.messages[len(m.messages)-1].Content; !strings.Contains(last, "can't /model") || !strings.Contains(last, "running turn") {
+		t.Fatalf("mid-turn /model refusal = %q", last)
+	}
+}
+
+func TestTurnActivePlanIsRefusedWithoutModeHistoryOrDraftMutation(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	m.sessionID = "midturn-plan-test"
+	beforeMode := m.gate.Mode()
+	beforeHistory := m.loop.History()
+	m.input.SetValue("/plan do not start another turn")
+
+	pressEnter(t, m)
+
+	if m.gate.Mode() != beforeMode {
+		t.Fatalf("mid-turn /plan changed permission mode: %s -> %s", beforeMode, m.gate.Mode())
+	}
+	if !reflect.DeepEqual(m.loop.History(), beforeHistory) {
+		t.Fatalf("mid-turn /plan changed loop history: before=%+v after=%+v", beforeHistory, m.loop.History())
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("destructive mid-turn /plan input should clear after refusal, got %q", got)
+	}
+	if last := m.messages[len(m.messages)-1].Content; !strings.Contains(last, "can't /plan mid-turn") {
+		t.Fatalf("mid-turn /plan refusal = %q", last)
+	}
+}
+
+func TestPendingRewindSummaryBlocksModelPickerAndSwitch(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.rewindSummaryPending = true
+	oldModel := m.model
+	m.input.SetValue("/model replacement")
+
+	pressEnter(t, m)
+
+	if m.model != oldModel || m.activeScreen != nil {
+		t.Fatalf("pending rewind summary allowed model mutation/picker: model=%q screen=%T", m.model, m.activeScreen)
+	}
+	if got := m.input.Value(); got != "/model replacement" {
+		t.Fatalf("pending-summary explicit model choice was not preserved: %q", got)
+	}
+	if m.openModelPicker(false, 0) {
+		t.Fatal("pending rewind summary opened model picker directly")
 	}
 }
 

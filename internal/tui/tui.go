@@ -310,7 +310,7 @@ type Model struct {
 	showPalette bool
 	palFilter   string
 	palCursor   int
-	palMatched  []REPLCommand
+	palMatched  []CommandCatalogEntry
 
 	// Ctrl+R history search overlay state. Distinct from the slash
 	// palette (`showPalette`) so a user can hit `/` mid-history-search
@@ -580,6 +580,19 @@ type Model struct {
 	// non-nil, the chat surface is hidden and key events are forwarded
 	// to the screen until it reports Done().
 	activeScreen screen.Screen
+
+	// A targeted /rewind summary runs its provider request in tea.Cmd. The
+	// sequence ID rejects stale results after a session/loop transition, while
+	// pending prevents duplicate Enter presses from starting parallel summaries.
+	rewindSummaryPending bool
+	rewindSummarySeq     uint64
+	// /diff collection runs in tea.Cmd. Only the matching typed result may
+	// install a viewer; this rejects duplicates and stale session results.
+	diffPending        bool
+	diffSeq            uint64
+	updateCheckPending bool
+	updateCheckSeq     uint64
+	updateCheckRunner  updateCheckRunner
 
 	eventCh chan agent.Event
 	doneCh  chan error

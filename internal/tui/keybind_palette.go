@@ -133,8 +133,8 @@ func (m *Model) doAutocomplete() {
 	}
 }
 
-// matchCommands populates m.palMatched from the registered slash
-// commands using a 3-tier match: exact name → prefix → contains.
+// matchCommands populates m.palMatched from the effective command catalog
+// using a 4-tier match: exact name → prefix → contains → fuzzy.
 // Description matching was removed because fuzzy-matching against
 // long help text produced false positives (typing "rena" matched
 // /voice because its description happened to contain r,e,n,a in
@@ -160,54 +160,51 @@ func (m *Model) matchCommands() {
 		m.palMatched = append(m.palMatched, m.commandCatalog()...)
 		return
 	}
-	// added[name] tracks which commands have already been queued so an
-	// alias prefix match doesn't double-add the same /help when its
-	// alias 'h' also matches filter 'h' (b2-13 reproducer: typing "/h"
-	// + Tab showed /help twice in the palette). Source-of-truth key is
-	// the canonical command name, since aliases all point to the same
-	// REPLCommand.
-	added := map[string]bool{}
-	queue := func(dst *[]REPLCommand, cmd REPLCommand) {
-		key := strings.ToLower(cmd.Name)
-		if added[key] {
-			return
-		}
-		added[key] = true
-		*dst = append(*dst, cmd)
-	}
-	var prefixHits, containsHits []REPLCommand
-	for _, cmd := range m.commandCatalog() {
-		name := strings.ToLower(cmd.Name)
+	matchRank := func(candidate string) int {
+		candidate = strings.ToLower(candidate)
 		switch {
-		case name == filter:
-			if !added[name] {
-				added[name] = true
-				m.palMatched = append([]REPLCommand{cmd}, m.palMatched...)
-			}
-		case strings.HasPrefix(name, filter):
-			queue(&prefixHits, cmd)
-		case strings.Contains(name, filter):
-			queue(&containsHits, cmd)
-		}
-		// Aliases also count, but only if the canonical name didn't
-		// already match — otherwise we'd double-add.
-		if added[name] {
-			continue
-		}
-		for _, a := range cmd.Aliases {
-			al := strings.ToLower(a)
-			if al == filter {
-				added[name] = true
-				m.palMatched = append([]REPLCommand{cmd}, m.palMatched...)
-				break
-			} else if strings.HasPrefix(al, filter) {
-				queue(&prefixHits, cmd)
-				break
-			}
+		case candidate == filter:
+			return 0
+		case strings.HasPrefix(candidate, filter):
+			return 1
+		case strings.Contains(candidate, filter):
+			return 2
+		case fuzzyMatch(candidate, filter):
+			return 3
+		default:
+			return -1
 		}
 	}
+
+	// Compute one best rank across the canonical name and every effective
+	// alias. The catalog already resolves collisions, so this both avoids
+	// duplicate rows and lets an exact alias outrank a merely fuzzy canonical
+	// match (the old incremental queue could not promote it afterward).
+	var exactHits, prefixHits, containsHits, fuzzyHits []CommandCatalogEntry
+	for _, cmd := range m.commandCatalog() {
+		rank := matchRank(cmd.Name)
+		for _, alias := range cmd.Aliases {
+			aliasRank := matchRank(alias)
+			if aliasRank >= 0 && (rank < 0 || aliasRank < rank) {
+				rank = aliasRank
+				cmd.MatchedAlias = alias
+			}
+		}
+		switch rank {
+		case 0:
+			exactHits = append(exactHits, cmd)
+		case 1:
+			prefixHits = append(prefixHits, cmd)
+		case 2:
+			containsHits = append(containsHits, cmd)
+		case 3:
+			fuzzyHits = append(fuzzyHits, cmd)
+		}
+	}
+	m.palMatched = append(m.palMatched, exactHits...)
 	m.palMatched = append(m.palMatched, prefixHits...)
 	m.palMatched = append(m.palMatched, containsHits...)
+	m.palMatched = append(m.palMatched, fuzzyHits...)
 }
 
 // looksLikeSlashPath returns true when val starts with `/` but the

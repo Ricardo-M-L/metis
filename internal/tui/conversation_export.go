@@ -32,6 +32,19 @@ func wrapInternalReviewPrompt(prompt string) string {
 	return internalReviewPromptOpen + "\n" + prompt + "\n" + internalReviewPromptClose
 }
 
+// shouldHideInternalCommandPrompt identifies built-ins whose expanded prompt
+// is agent orchestration rather than user-authored conversation text. Keep the
+// concise slash invocation visible while retaining the expanded frame in
+// provider history for resume/retry continuity.
+func shouldHideInternalCommandPrompt(input string) bool {
+	switch strings.ToLower(slashName(input)) {
+	case "/review", "/init":
+		return true
+	default:
+		return false
+	}
+}
+
 func removeInternalReviewPrompt(text string) string {
 	text = internalReviewPromptSection.ReplaceAllString(text, "")
 	return unterminatedInternalReviewPrompt.ReplaceAllString(text, "")

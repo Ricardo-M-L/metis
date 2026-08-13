@@ -159,7 +159,7 @@ func TestHandleSubmitUndoPersistsReplacement(t *testing.T) {
 	}
 }
 
-func TestHandleSubmitClearPersistsReplacement(t *testing.T) {
+func TestHandleSubmitClearHistoryPersistsReplacement(t *testing.T) {
 	m := newSlashTestModel(t)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
@@ -172,7 +172,7 @@ func TestHandleSubmitClearPersistsReplacement(t *testing.T) {
 	m.sessionID = sid
 	m.loop.Restore(history)
 	m.historyCursor = session.NewHistoryCursor(history)
-	m.input.SetValue("/clear")
+	m.input.SetValue("/clear-history")
 
 	_, _ = m.handleSubmit()
 	_, loaded, err := store.Load(sid)
@@ -180,6 +180,6 @@ func TestHandleSubmitClearPersistsReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(loaded) != 0 || len(m.loop.History()) != 0 {
-		t.Fatalf("clear revived old turn: disk=%#v memory=%#v", loaded, m.loop.History())
+		t.Fatalf("clear-history revived old turn: disk=%#v memory=%#v", loaded, m.loop.History())
 	}
 }

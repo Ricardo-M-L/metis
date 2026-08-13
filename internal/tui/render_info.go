@@ -306,7 +306,12 @@ func renderStats(m *Model) string {
 	toolCalls := len(m.toolEvents)
 	in := m.totalTokens.Input()
 	out := m.totalTokens.Output()
-	rows := []infoRow{
+	rows := usageActivityRows(m.session)
+	rows = append(rows,
+		infoRow{Key: "", Value: ""},
+		infoRow{Key: "", Value: "Current Session Stats"},
+	)
+	rows = append(rows, []infoRow{
 		{Key: "session id", Value: m.sessionID},
 		{Key: "user turns", Value: fmt.Sprintf("%d", turns)},
 		{Key: "tool calls", Value: fmt.Sprintf("%d", toolCalls)},
@@ -315,7 +320,7 @@ func renderStats(m *Model) string {
 		{Key: "loop iterations", Value: fmt.Sprintf("%d", m.loop.IterIdx()), Hint: "actual iterations completed in this session"},
 		{Key: "iteration cap", Value: formatIterationCap(m.loop.MaxIters), Hint: "maximum per user turn"},
 		{Key: "history msgs", Value: fmt.Sprintf("%d", len(m.loop.History()))},
-	}
+	}...)
 	// System prompt + cache breakdown — useful when debugging "why
 	// did first turn cost X tokens?" / "did the cache flag stick?".
 	// SystemSections is the typed form (per-section Cache flags);
@@ -342,7 +347,7 @@ func renderStats(m *Model) string {
 		rows = append(rows, infoRow{Key: "system chars", Value: fmtThousands(len(m.loop.System))})
 		rows = append(rows, infoRow{Key: "system sections", Value: "(flat / no cache flags)"})
 	}
-	return renderInfoBox("Session Stats", rows)
+	return renderInfoBox("Usage & Activity", rows)
 }
 
 func formatIterationCap(cap int) string {
@@ -644,22 +649,6 @@ func renderPRComments(prNum string) string {
 		lines = append(lines[:200], "... (truncated; see `gh pr view "+prNum+" --comments`)")
 	}
 	return strings.Join(lines, "\n")
-}
-
-// renderUpgrade shells out to `metis update --check`. Surfacing it here
-// lets users check from inside chat without leaving.
-func renderUpgrade() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return "/upgrade: cannot resolve metis path: " + err.Error()
-	}
-	cmd := exec.Command(exe, "update", "--check")
-	out, _ := cmd.CombinedOutput()
-	body := strings.TrimSpace(string(out))
-	if body == "" {
-		return "(/upgrade: no output; run `metis update --check` for details)"
-	}
-	return body
 }
 
 // renderContext is the rich `/context` view (claude-code parity).

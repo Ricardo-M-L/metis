@@ -43,7 +43,7 @@ const (
 func RegisterDebugCommand(r *Registry) {
 	r.Register(Cmd{
 		Name:        "debug",
-		Description: "ask the agent to diagnose an issue using ~/.metis/debug.log (claude-code parity)",
+		Description: "ask the agent to diagnose an issue using ~/.metis/debug.log",
 		Handler:     debugHandler,
 	})
 }

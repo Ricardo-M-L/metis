@@ -58,13 +58,13 @@ func TestApplyExternalEditorResult_ErrorSurfaced(t *testing.T) {
 	}
 }
 
-func TestConfigSlashReturnsManagedExecCommand(t *testing.T) {
+func TestConfigSlashDoesNotReportSaveBeforePanelApply(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
 	m := newSlashTestModel(t)
 	m.input.SetValue("/config")
 	cmd := pressEnter(t, m)
-	if cmd == nil {
-		t.Fatal("/config must return a Bubble Tea managed editor command")
+	if cmd != nil {
+		t.Fatal("/config should open the built-in panel without launching an editor")
 	}
 	for _, msg := range m.messages {
 		if strings.Contains(msg.Content, "config updated") || strings.Contains(msg.Content, "config saved") {

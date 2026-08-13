@@ -187,6 +187,10 @@ Run `/help` inside chat for the live slash-command registry and current
 syntax. This avoids pinning the README to handlers that may change between
 releases.
 
+In the interactive TUI, `/config` opens a searchable settings panel; press
+`e` there to edit the raw TOML in `$EDITOR`. In the plain readline REPL,
+`/config` opens `$EDITOR` directly.
+
 User-authored: drop `*.md` files under `~/.metis/commands/` or
 `<cwd>/.metis/commands/`. Each becomes `/<filename>`. YAML frontmatter
 sets the description; `$ARGUMENTS` / `$1` / `$2` get substituted.

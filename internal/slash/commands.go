@@ -12,10 +12,20 @@ import (
 
 // Cmd is a callable slash command.
 type Cmd struct {
-	Name        string
-	Aliases     []string
-	Description string
-	Handler     Handler
+	Name         string
+	Aliases      []string
+	Description  string
+	ArgumentHint string
+	Source       string
+	Category     string
+	Handler      Handler
+
+	// Visible and Enabled are optional live predicates used by discovery
+	// surfaces. A nil predicate means true, preserving compatibility for all
+	// existing registrations. Dispatch remains independent: phase one unifies
+	// metadata without forcing every handler into a new execution registry.
+	Visible func() bool
+	Enabled func() bool
 
 	// AllowedTools / Model carry per-command frontmatter requests from
 	// user-authored commands (~/.metis/commands/*.md). Empty = no request.
@@ -37,6 +47,10 @@ type Cmd struct {
 	// can't honor, so they're refused.
 	Custom bool
 }
+
+// IsVisible and IsEnabled apply the nil-means-true compatibility default.
+func (c Cmd) IsVisible() bool { return c.Visible == nil || c.Visible() }
+func (c Cmd) IsEnabled() bool { return c.Enabled == nil || c.Enabled() }
 
 // Handler executes the command.
 type Handler func(args string) (display string, control Signal)
@@ -126,27 +140,102 @@ func NewRegistry() *Registry {
 func (r *Registry) Register(c Cmd) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if c.Source == "" {
+		if c.Custom {
+			c.Source = "custom"
+		} else {
+			c.Source = "slash"
+		}
+	}
+	if c.Category == "" {
+		if c.Custom {
+			c.Category = "custom"
+		} else {
+			c.Category = "built-in"
+		}
+	}
 	r.cmds = append(r.cmds, c)
-	cp := &r.cmds[len(r.cmds)-1]
-	r.index[c.Name] = cp
-	for _, a := range c.Aliases {
-		r.index[a] = cp
+	r.rebuildIndexLocked()
+}
+
+// rebuildIndexLocked makes registration replacement and alias collisions
+// deterministic. The latest canonical registration wins; aliases from a
+// replaced registration disappear; and an alias can never shadow a real
+// canonical name. Rebuilding also refreshes pointers after slice growth.
+func (r *Registry) rebuildIndexLocked() {
+	latest := make(map[string]int, len(r.cmds))
+	for i := range r.cmds {
+		latest[r.cmds[i].Name] = i
+	}
+	r.index = make(map[string]*Cmd, len(r.cmds)*2)
+	for name, i := range latest {
+		r.index[name] = &r.cmds[i]
+	}
+	for i := range r.cmds {
+		cmd := &r.cmds[i]
+		if latest[cmd.Name] != i {
+			continue
+		}
+		for _, alias := range cmd.Aliases {
+			if _, canonical := latest[alias]; canonical {
+				continue
+			}
+			r.index[alias] = cmd
+		}
 	}
 }
 
 func (r *Registry) All() []Cmd {
+	return r.Catalog()
+}
+
+// Catalog returns the effective canonical registrations after applying the
+// registry's last-write-wins name and alias rules. This matters for project
+// custom commands and runtime registrations, where keeping stale appended
+// entries would make discovery disagree with Resolve and Parse.
+func (r *Registry) Catalog() []Cmd {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := append([]Cmd(nil), r.cmds...)
+	byName := make(map[string]*Cmd, len(r.index))
+	for _, cmd := range r.index {
+		if cmd == nil || r.index[cmd.Name] != cmd {
+			continue
+		}
+		byName[cmd.Name] = cmd
+	}
+	out := make([]Cmd, 0, len(byName))
+	for _, cmd := range byName {
+		cp := *cmd
+		cp.Aliases = make([]string, 0, len(cmd.Aliases))
+		for _, alias := range cmd.Aliases {
+			if r.index[alias] == cmd {
+				cp.Aliases = append(cp.Aliases, alias)
+			}
+		}
+		out = append(out, cp)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
 func (r *Registry) Get(name string) (*Cmd, bool) {
+	return r.Resolve(name)
+}
+
+// Resolve maps a canonical name or alias to its canonical command.
+func (r *Registry) Resolve(name string) (*Cmd, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	c, ok := r.index[name]
 	return c, ok
+}
+
+func (r *Registry) CanonicalName(name string) (string, bool) {
+	cmd, ok := r.Resolve(name)
+	if !ok {
+		return "", false
+	}
+	return cmd.Name, true
 }
 
 // Reserve prevents a user-authored custom command from claiming a name owned
@@ -183,14 +272,7 @@ func (r *Registry) RemoveCustom() {
 		}
 	}
 	r.cmds = kept
-	r.index = make(map[string]*Cmd, len(r.cmds))
-	for i := range r.cmds {
-		cmd := &r.cmds[i]
-		r.index[cmd.Name] = cmd
-		for _, alias := range cmd.Aliases {
-			r.index[alias] = cmd
-		}
-	}
+	r.rebuildIndexLocked()
 }
 
 // Parse returns (true, output, signal, args) if input is a slash command,
@@ -253,12 +335,26 @@ func (r *Registry) HelpText() string {
 	all := r.All()
 	maxLen := 0
 	for _, c := range all {
-		if l := len(c.Name); l > maxLen {
+		if !c.IsVisible() || !c.IsEnabled() {
+			continue
+		}
+		label := c.Name
+		if c.ArgumentHint != "" {
+			label += " " + c.ArgumentHint
+		}
+		if l := len(label); l > maxLen {
 			maxLen = l
 		}
 	}
 	for _, c := range all {
-		fmt.Fprintf(&b, "  /%-*s  %s\n", maxLen, c.Name, c.Description)
+		if !c.IsVisible() || !c.IsEnabled() {
+			continue
+		}
+		label := c.Name
+		if c.ArgumentHint != "" {
+			label += " " + c.ArgumentHint
+		}
+		fmt.Fprintf(&b, "  /%-*s  %s\n", maxLen, label, c.Description)
 	}
 	return b.String()
 }
@@ -285,6 +381,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	// agent loop. Modeled on claude-code's /review and codex's
 	// review_request.rs.
 	RegisterReviewCommand(r)
+	RegisterInitCommand(r)
 
 	// Core commands
 	r.Register(Cmd{Name: "help", Description: "show this help", Handler: func(_ string) (string, Signal) {
@@ -295,10 +392,10 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	}})
 
 	// Session commands
-	r.Register(Cmd{Name: "new", Aliases: []string{"reset"}, Description: "start a new session", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "clear", Aliases: []string{"new", "reset"}, Description: "start a new session", Category: "session", Handler: func(_ string) (string, Signal) {
 		return "(starting new session...)", SignalNew
 	}})
-	r.Register(Cmd{Name: "clear", Description: "clear conversation history", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "clear-history", Description: "clear conversation history without creating a new session", Category: "session", Handler: func(_ string) (string, Signal) {
 		return "(history cleared)", SignalClear
 	}})
 	r.Register(Cmd{Name: "retry", Description: "retry last assistant response", Handler: func(_ string) (string, Signal) {
@@ -309,7 +406,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 		// runtime once it knows whether anything was undone.
 		return "", SignalUndo
 	}})
-	r.Register(Cmd{Name: "rewind", Description: "undo the last edit-turn AND restore the files it changed (code + conversation together)", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "rewind", Description: "restore from a checkpoint (chooser in TUI; latest edit in plain REPL)", ArgumentHint: "[last]", Category: "session", Handler: func(_ string) (string, Signal) {
 		// Empty display — the runtime reports what was rewound.
 		return "", SignalRewind
 	}})
@@ -379,13 +476,13 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "cost", Aliases: []string{"usage"}, Description: "show token usage and estimated cost for the session", Handler: func(_ string) (string, Signal) {
 		return "", SignalCost
 	}})
-	r.Register(Cmd{Name: "diff", Description: "show git diff for the working tree", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "diff", Aliases: []string{"diff-view", "dv"}, Description: "review uncommitted changes in the interactive diff viewer", Category: "git", Handler: func(_ string) (string, Signal) {
 		return "", SignalDiff
 	}})
 	r.Register(Cmd{Name: "doctor", Description: "run a health check (API key, MCP, tools, cwd)", Handler: func(_ string) (string, Signal) {
 		return "", SignalDoctor
 	}})
-	r.Register(Cmd{Name: "stats", Description: "show session statistics (turns, tool calls, tokens)", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "stats", Description: "show usage and activity across sessions", Category: "session", Handler: func(_ string) (string, Signal) {
 		return "", SignalStats
 	}})
 	r.Register(Cmd{Name: "keybindings", Aliases: []string{"keys"}, Description: "list TUI keybindings", Handler: func(_ string) (string, Signal) {
@@ -427,7 +524,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 		}
 		return "", SignalPRComments
 	}})
-	r.Register(Cmd{Name: "upgrade", Description: "check for a newer metis release (`metis update --check` wrapper)", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "update", Description: "check for a newer Metis release", Category: "system", Handler: func(_ string) (string, Signal) {
 		return "", SignalUpgrade
 	}})
 	r.Register(Cmd{Name: "context", Description: "show context window utilization for the current session", Handler: func(_ string) (string, Signal) {
@@ -458,7 +555,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	}})
 
 	// Mode commands
-	r.Register(Cmd{Name: "plan", Aliases: []string{"p"}, Description: "switch to plan mode (read-only exploration, then approval)", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "plan", Aliases: []string{"p"}, Description: "enter plan mode, show the current plan, or edit/update it", ArgumentHint: "[open|description]", Category: "mode", Handler: func(_ string) (string, Signal) {
 		return "(mode: plan)", SignalPlan
 	}})
 	r.Register(Cmd{Name: "acceptEdits", Description: "accept file edits without prompting; ask for other state changes", Handler: func(_ string) (string, Signal) {
@@ -489,7 +586,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "status", Description: "show session info", Handler: func(_ string) (string, Signal) {
 		return "", SignalStatus
 	}})
-	r.Register(Cmd{Name: "session", Aliases: []string{"sid"}, Description: "show current session id + title + turn count", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "session-info", Aliases: []string{"sid"}, Description: "show current local session id + title + turn count", Category: "session", Handler: func(_ string) (string, Signal) {
 		return "", SignalSession
 	}})
 	r.Register(Cmd{Name: "sessions", Aliases: []string{"ls"}, Description: "list recent saved sessions", Handler: func(_ string) (string, Signal) {
@@ -536,7 +633,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 		// next thing to send — you just retype with edits.
 		return "", SignalUndo
 	}})
-	r.Register(Cmd{Name: "config", Aliases: []string{"cfg"}, Description: "open config in editor", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "config", Aliases: []string{"cfg"}, Description: "view and edit Metis settings", Category: "system", Handler: func(_ string) (string, Signal) {
 		return "(config: ~/.metis/config.toml)", SignalNone
 	}})
 	r.Register(Cmd{Name: "version", Aliases: []string{"v"}, Description: "show metis version", Handler: func(_ string) (string, Signal) {

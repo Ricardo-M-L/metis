@@ -31,8 +31,8 @@ func TestLoadCustomCommands_BasicMarkdown(t *testing.T) {
 	if !ok {
 		t.Fatal("/precommit not registered")
 	}
-	if !strings.HasPrefix(c.Description, "[user] ") {
-		t.Errorf("description must be prefixed with [user]; got %q", c.Description)
+	if c.Description != strings.TrimSpace(body) {
+		t.Errorf("description should not duplicate Source metadata; got %q", c.Description)
 	}
 	if !c.Trusted {
 		t.Fatal("user-level custom command must be marked trusted")
@@ -63,7 +63,7 @@ func TestLoadCustomCommands_FrontMatter(t *testing.T) {
 	if !ok {
 		t.Fatal("/check not registered")
 	}
-	if c.Description != "[user] My custom check" {
+	if c.Description != "My custom check" {
 		t.Errorf("description from front matter mismatch: %q", c.Description)
 	}
 	prompt, _ := c.Handler("the urgent stuff")
@@ -259,8 +259,11 @@ func TestLoadCustomCommands_FrontMatterOverrides(t *testing.T) {
 	if !ok {
 		t.Fatal("/rev not registered")
 	}
-	if !strings.Contains(c.Description, "args: [pr-number]") {
-		t.Errorf("argument-hint not surfaced in description: %q", c.Description)
+	if c.ArgumentHint != "[pr-number]" {
+		t.Errorf("ArgumentHint = %q, want [pr-number]", c.ArgumentHint)
+	}
+	if c.Source != "user" || c.Category != "custom" {
+		t.Errorf("custom command metadata source/category = %q/%q", c.Source, c.Category)
 	}
 	if c.Model != "claude-opus-4-8" {
 		t.Errorf("Model override = %q", c.Model)

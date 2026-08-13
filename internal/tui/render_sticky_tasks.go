@@ -174,7 +174,7 @@ func renderStickyTaskStrip(m *Model) string {
 	if completedTrailer > 0 {
 		writeRow(
 			completedStyle.Render(glyphTaskCompleted+" "),
-			styleMuted.Render(fmt.Sprintf("+%d more done (use /tasks for full list)", completedTrailer)),
+			styleMuted.Render(fmt.Sprintf("+%d more done (use /todos for full list)", completedTrailer)),
 		)
 	}
 

@@ -406,9 +406,9 @@ func (g *Gate) recordAllow() {
 	}
 }
 
-// ResetDenials clears all denial state. Wired to a `/reset` slash
-// command so users can explicitly tell the gate "I know what I'm
-// doing, stop nagging."
+// ResetDenials clears all denial state at an explicit session boundary. The
+// canonical `/clear` command and its `/new` and `/reset` aliases all start a
+// fresh session, whose activation calls this method.
 func (g *Gate) ResetDenials() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
