@@ -28,6 +28,27 @@ func writeFakeGit(t *testing.T, body string) string {
 	return dir
 }
 
+func TestDiffCancellationHelperProcess(t *testing.T) {
+	switch os.Getenv("METIS_DIFF_CANCELLATION_HELPER") {
+	case "parent":
+		child := exec.Command(os.Args[0], "-test.run=^TestDiffCancellationHelperProcess$")
+		child.Env = append(os.Environ(), "METIS_DIFF_CANCELLATION_HELPER=child")
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	case "child":
+		// The child deliberately outlives its parent and keeps the inherited
+		// stdout/stderr pipes open. Killing only the parent therefore makes
+		// exec.Cmd.Wait block until this sleep finishes.
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	}
+}
+
 func TestDiffCommandReturnsTypedResultWithoutMutatingModel(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.input.SetValue("/diff-view")
@@ -75,7 +96,9 @@ func TestDiffStaleResultIgnoredAfterSessionChange(t *testing.T) {
 }
 
 func TestRunBoundedDiffCommandCancelsSlowGit(t *testing.T) {
-	writeFakeGit(t, `sleep 30`)
+	t.Setenv("METIS_DIFF_CANCELLATION_HELPER", "parent")
+	t.Setenv("METIS_DIFF_CANCELLATION_HELPER_BINARY", os.Args[0])
+	writeFakeGit(t, `exec "$METIS_DIFF_CANCELLATION_HELPER_BINARY" -test.run=^TestDiffCancellationHelperProcess$`)
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()

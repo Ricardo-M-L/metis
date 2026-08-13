@@ -74,6 +74,10 @@ func runBoundedDiffCommand(ctx context.Context, dir string, limit int, args ...s
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	configureDiffCommandCancellation(cmd)
+	// Bound Wait even if an unusual descendant escapes the platform tree-kill
+	// mechanism while retaining an inherited stdout/stderr handle.
+	cmd.WaitDelay = 500 * time.Millisecond
 	writer := &cappedDiffWriter{remaining: limit}
 	cmd.Stdout = writer
 	cmd.Stderr = writer
