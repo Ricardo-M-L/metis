@@ -324,15 +324,6 @@ func (m *Model) View() tea.View {
 	// (m *Model).ensureIDs in tui.go for the why.
 	m.ensureIDs()
 
-	// Sticky header banner — Phase-33 redesign (user feedback 2026-05-08).
-	// Same brand strip claude-code keeps pinned at the top of every
-	// session: ✻ metis · model · mode · cwd. Replaces the ad-hoc
-	// "metis · model · mode + ──── separator" so cwd stays visible
-	// during long agent runs (the previous strip dropped cwd as soon
-	// as the welcome banner scrolled off; users couldn't tell which
-	// directory the current turn was operating against).
-	s.WriteString(m.renderHeaderBanner())
-
 	// Build the chat surface via the virtualized list package. Items
 	// are constructed every frame from the chronological merge of
 	// m.messages + m.toolEvents (see chat_items.go::buildChatItems);
@@ -365,7 +356,7 @@ func (m *Model) View() tea.View {
 	// and ScrollToBottom flip it true. (See keybind_main.go +
 	// tui_update.go for flag-flip points.)
 	wasAtBottom := m.chatList.AtBottom()
-	m.chatList.SetItemsKeepScroll(m.buildChatItems()...)
+	m.chatList.SetItemsKeepScroll(m.buildChatSurfaceItems()...)
 
 	// Two-phase render: build the chrome BELOW the chat list first so
 	// we know exactly how many rows it occupies, then size the chat
@@ -450,14 +441,14 @@ func (m *Model) View() tea.View {
 	}
 
 	// Phase 2: size the chat viewport against the actual chrome height.
-	// chrome occupies upperLines + lowerLines + 1 line for the "\n"
-	// written between listView and upper. headerLines = 2 (brand line
-	// + separator) was already written to s above.
-	const headerLines = 2
+	// Chrome occupies upperLines + lowerLines + 1 line for the "\n"
+	// written between listView and upper. The welcome card is item zero in
+	// chatList, so it consumes viewport rows and scrolls like transcript rather
+	// than reserving fixed header rows.
 	const listSeparatorLines = 1
 	upperLines := strings.Count(upper.String(), "\n")
 	lowerLines := strings.Count(lower.String(), "\n")
-	maxVpHeight := m.height - headerLines - listSeparatorLines - upperLines - lowerLines
+	maxVpHeight := m.height - listSeparatorLines - upperLines - lowerLines
 	if maxVpHeight < 3 {
 		// Floor at 3 so the chat surface never collapses entirely; if
 		// the terminal is genuinely too short, the alt-screen will
@@ -478,16 +469,16 @@ func (m *Model) View() tea.View {
 	}
 
 	// 2026-05-24: now that chatList is sized, compute the strip's actual
-	// Y in the final View output. Layout: header(headerLines) + listView
-	// (desiredVp lines) + 1 separator + upperLines + lower-pre-strip
+	// Y in the final View output. Layout: listView (desiredVp lines) +
+	// 1 separator + upperLines + lower-pre-strip
 	// (stripOffsetInLower lines). Used by MouseClickMsg / MouseMotionMsg
 	// to derive `lineIdx := msg.Y - m.stripStartY` for in-strip drag
 	// selection (image 67 user feedback).
 	if stripOffsetInLower >= 0 {
-		m.stripStartY = headerLines + desiredVp + listSeparatorLines + upperLines + stripOffsetInLower
+		m.stripStartY = desiredVp + listSeparatorLines + upperLines + stripOffsetInLower
 	}
 
-	// Phase 3: stitch [header][listView][upper][lower] together.
+	// Phase 3: stitch [listView][upper][lower] together.
 	// inputStartRow points at the row where renderInputLine begins, so
 	// attachCursor can position the terminal cursor correctly.
 	listView := m.chatList.Render()

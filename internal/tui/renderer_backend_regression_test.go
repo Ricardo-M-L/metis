@@ -10,10 +10,11 @@ import (
 )
 
 // TestRendererBackend_ClearTouchesEveryRow protects the two-frame invariant
-// that Bubble Tea relies on when a tall welcome frame is replaced by a shorter
-// active-chat frame. Ultraviolet versions before c5f3028e cleared the in-memory
-// cells without marking those rows as touched, so the terminal never received
-// erase operations for the old welcome card/input/status rows.
+// that Bubble Tea relies on when the standalone welcome frame becomes the
+// active transcript frame. The same card remains, but the hint, message list,
+// spinner, input, and status geometry all change. Ultraviolet versions before
+// c5f3028e cleared the in-memory cells without marking those rows as touched,
+// so the terminal never received erase operations for old rows.
 func TestRendererBackend_ClearTouchesEveryRow(t *testing.T) {
 	const width, height = 138, 44
 

@@ -7,6 +7,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude Code-style welcome lifecycle**: submitting the first prompt no
+  longer replaces the full welcome card with a separate sticky
+  `metis · model · mode · cwd` bar. The same card now remains as the first
+  scrollable transcript element, while only the one-time start hint is
+  removed; it naturally scrolls away as the conversation grows.
+
 ## [0.4.21] - 2026-08-13
 
 ### Fixed

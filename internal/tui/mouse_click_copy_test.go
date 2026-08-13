@@ -13,6 +13,7 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,9 +54,12 @@ func TestClickCopy_ChatRowYanksToClipboard(t *testing.T) {
 	m := makeChatTestModel(t)
 	preCount := len(m.messages)
 
-	// y=2 is the first chat list row (header y=0, separator y=1).
-	m.Update(tea.MouseClickMsg{X: 5, Y: 2, Button: tea.MouseLeft})
-	m.Update(tea.MouseReleaseMsg{X: 5, Y: 2, Button: tea.MouseLeft})
+	// The welcome card is item zero in the chat list. Target the first user
+	// message immediately below that scrollable prologue.
+	welcome := normalizeChatItemBoundary(m.renderWelcomeBannerCard())
+	firstUserY := strings.Count(welcome, "\n") + 1 + chatItemGap
+	m.Update(tea.MouseClickMsg{X: 5, Y: firstUserY, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: 5, Y: firstUserY, Button: tea.MouseLeft})
 
 	// Silent copy: messages count must NOT change.
 	if len(m.messages) != preCount {
@@ -69,6 +73,9 @@ func TestClickCopy_ChatRowYanksToClipboard(t *testing.T) {
 	}
 	if len(body) == 0 {
 		t.Errorf("clipboard fallback should hold the copied row; got empty")
+	}
+	if !strings.Contains(string(body), "first user line") {
+		t.Errorf("clicked first user row copied %q", string(body))
 	}
 }
 
@@ -101,17 +108,16 @@ func TestClickCopy_PermissionActiveBlocks(t *testing.T) {
 	}
 }
 
-// TestClickCopy_HeaderClickIgnored — clicks on y=0 (brand) or y=1
-// (separator) are above the chat list; do nothing.
-func TestClickCopy_HeaderClickIgnored(t *testing.T) {
+// TestClickCopy_WelcomeCardDoesNotPolluteTranscript — the welcome prologue is
+// inside the chat list for scrolling, but clicking it must not append any
+// transcript messages.
+func TestClickCopy_WelcomeCardDoesNotPolluteTranscript(t *testing.T) {
 	m := makeChatTestModel(t)
 	preCount := len(m.messages)
-	m.Update(tea.MouseClickMsg{X: 5, Y: 0, Button: tea.MouseLeft})
-	m.Update(tea.MouseReleaseMsg{X: 5, Y: 0, Button: tea.MouseLeft})
 	m.Update(tea.MouseClickMsg{X: 5, Y: 1, Button: tea.MouseLeft})
 	m.Update(tea.MouseReleaseMsg{X: 5, Y: 1, Button: tea.MouseLeft})
 	if len(m.messages) != preCount {
-		t.Errorf("clicks on header rows must not yank; messages changed")
+		t.Errorf("clicking the welcome prologue must not mutate transcript messages")
 	}
 }
 

@@ -1,6 +1,6 @@
 package tui
 
-// Banner-pass tests — version cropping, cwd prettifier, header
+// Banner-pass tests — version, cwd prettifier, and transcript prologue
 // emits expected substrings.
 
 import (
@@ -40,25 +40,16 @@ func TestPrettifyCwd_ReturnsAbsolutePath(t *testing.T) {
 	}
 }
 
-func TestRenderHeaderBanner_NotCrashOnNilModel(t *testing.T) {
-	// Defensive: callers shouldn't pass nil but covering it stops a
-	// stray banner from panicking the chat surface.
-	got := (*Model)(nil).renderHeaderBanner()
-	if got != "" {
-		t.Errorf("nil model should yield empty string; got %q", got)
-	}
-}
-
-func TestRenderHeaderBanner_ContainsModelAndCwd(t *testing.T) {
+func TestRenderWelcomeBannerCard_ContainsModelAndCwd(t *testing.T) {
 	m := &Model{model: "claude-opus-4-7", width: 120}
-	// Gate is the one field we can't trivially mock without dragging
-	// permission into the test; the renderHeaderBanner path tolerates
-	// a nil gate via the early return so we test that route instead.
-	got := m.renderHeaderBanner()
-	if got == "" {
-		t.Skip("renderHeaderBanner returned empty (likely nil-gate path); fine")
-	}
+	got := m.renderWelcomeBannerCard()
 	if !strings.Contains(got, "metis") {
-		t.Errorf("expected 'metis' in header; got: %q", got)
+		t.Errorf("expected 'metis' in welcome card; got: %q", got)
+	}
+	if !strings.Contains(got, "claude-opus-4-7") {
+		t.Errorf("expected model in welcome card; got: %q", got)
+	}
+	if !strings.Contains(got, prettifyCwd(currentCwd())) {
+		t.Errorf("expected cwd in welcome card; got: %q", got)
 	}
 }

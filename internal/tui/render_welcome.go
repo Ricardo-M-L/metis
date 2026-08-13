@@ -9,12 +9,11 @@ package tui
 //     earlier METIS wordmark rendered as MCTIS in some terminals).
 //   * The session UUID didn't belong on the banner — it's noise the
 //     user can find via /session if they need it. Dropped.
-//   * cwd was already shown but got scrolled off as soon as the agent
-//     ran. The renderer paths now share one banner: the "fresh" frame
-//     and the "active chat" frame both call renderWelcomeBanner, with
-//     the active-chat path rendering a compact one-row variant via
-//     renderHeaderBanner so it stays sticky above the chat list
-//     without dominating the screen.
+//   * The welcome card belongs to the transcript, not to fixed chrome.
+//     Claude Code renders LogoHeader as the first child of Messages, so
+//     the same card remains above the first user turn and later scrolls
+//     away naturally. Metis mirrors that lifecycle: the empty frame adds
+//     a start hint, while active chat reuses the card itself as item zero.
 
 import (
 	"image/color"
@@ -104,11 +103,12 @@ func owlRowColor(i int) color.Color {
 	}
 }
 
-// renderWelcomeBanner paints the bordered, centered welcome card shown on a
-// fresh session. Once the first prompt is submitted, the active-chat path uses
-// the compact sticky header instead of repeating this large card in history.
+// renderWelcomeBanner paints the fresh-session card plus its one-time start
+// hint. Active chat inserts renderWelcomeBannerCard as the first transcript
+// item, keeping the visual identity stable without retaining a stale
+// "Type a message to start" instruction after the user has already started.
 func (m *Model) renderWelcomeBanner() string {
-	return m.renderWelcomeBannerCard()
+	return m.renderWelcomeBannerCard() + "\n" + m.renderWelcomeHint() + "\n"
 }
 
 func (m *Model) renderWelcomeBannerCard() string {
@@ -148,15 +148,18 @@ func (m *Model) renderWelcomeBannerCard() string {
 	// row, cwd row. The icon goes in the left column. lipgloss.JoinHorizontal
 	// lines them up; the JoinVertical inside the right column handles
 	// the row stack.
+	modelRow := lipgloss.JoinHorizontal(lipgloss.Left,
+		labelStyle.Render("model: "),
+		valueStyle.Render(effectiveModelID(m)),
+	)
+	if m != nil && m.gate != nil {
+		modelRow += labelStyle.Render("  ·  mode: ") +
+			valueStyle.Render(string(m.gate.Mode()))
+	}
 	right := lipgloss.JoinVertical(lipgloss.Left,
 		titleRow,
 		"",
-		lipgloss.JoinHorizontal(lipgloss.Left,
-			labelStyle.Render("model: "),
-			valueStyle.Render(effectiveModelID(m)),
-			labelStyle.Render("  ·  mode: "),
-			valueStyle.Render(string(m.gate.Mode())),
-		),
+		modelRow,
 		// cwd row drops the "cwd:" label (claude-code doesn't print one
 		// either — the path stands on its own and avoids burning a
 		// label-column on a value users already recognize).
@@ -187,65 +190,17 @@ func (m *Model) renderWelcomeBannerCard() string {
 		Width(boxWidth).
 		Render(body)
 
-	hint := labelStyle.Render("  Type a message to start  ·  ") +
+	return box
+}
+
+func (m *Model) renderWelcomeHint() string {
+	titleStyle := lipgloss.NewStyle().Foreground(accentBlue).Bold(true)
+	labelStyle := lipgloss.NewStyle().Foreground(textMuted)
+	return labelStyle.Render("  Type a message to start  ·  ") +
 		titleStyle.Render("/help") +
 		labelStyle.Render(" for commands  ·  ") +
 		titleStyle.Render("/quit") +
 		labelStyle.Render(" to exit")
-
-	return box + "\n" + hint + "\n"
-}
-
-// renderHeaderBanner is the compact, single-row variant of the welcome
-// card used in the active-chat path. Stays at the top above the chat
-// list so the user can always see their model + cwd without typing
-// /session. claude-code's `claude · model · cwd` ribbon is the
-// reference. Width-aware: truncates the cwd from the left when the
-// terminal is narrow.
-func (m *Model) renderHeaderBanner() string {
-	if m == nil {
-		return ""
-	}
-	titleStyle := lipgloss.NewStyle().Foreground(accentBlue).Bold(true)
-	dimStyle := lipgloss.NewStyle().Foreground(textMuted)
-	valueStyle := lipgloss.NewStyle().Foreground(textPrimary)
-
-	cwd := prettifyCwd(currentCwd())
-	maxCwd := m.width - 30
-	if maxCwd < 12 {
-		maxCwd = 12
-	}
-	if len(cwd) > maxCwd {
-		// Left-truncate so the trailing path component (where the user
-		// usually orients themselves) stays visible.
-		cwd = "…" + cwd[len(cwd)-maxCwd+1:]
-	}
-
-	mode := ""
-	if m.gate != nil {
-		mode = string(m.gate.Mode())
-	}
-
-	row := titleStyle.Render("✻ metis") +
-		dimStyle.Render(" v"+version.Short()) +
-		dimStyle.Render(" · ") +
-		valueStyle.Render(effectiveModelID(m))
-	if mode != "" {
-		row += dimStyle.Render(" · ") + valueStyle.Render(mode)
-	}
-	row += dimStyle.Render(" · ") + valueStyle.Render(cwd)
-
-	// Leave the terminal's final column unused. Writing a printable cell in
-	// the rightmost column puts iTerm2/tmux into pending-wrap state; repeated
-	// full-screen repaints can then advance one physical row even though the
-	// frame still contains only one newline-delimited separator row. The
-	// resulting cursor drift leaves fragments of older frames in the middle
-	// of long conversations.
-	sepWidth := m.width - 1
-	if sepWidth <= 0 {
-		sepWidth = 59
-	}
-	return row + "\n" + dimStyle.Render(strings.Repeat("─", sepWidth)) + "\n"
 }
 
 // currentCwd is a tiny wrapper so callers don't import os just to
@@ -270,18 +225,10 @@ func currentCwd() string {
 // a glance which directory metis was operating from. Returning the
 // absolute path makes the cwd unambiguous.
 //
-// Long paths are kept readable by the call sites: the compact top
-// header truncates from the left with `…`; the welcome card lets
-// lipgloss wrap the path inside the bordered box.
+// Long paths are kept readable by the welcome card, which lets lipgloss wrap
+// the path inside the bordered box.
 func prettifyCwd(p string) string {
 	return p
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // effectiveModelID returns the model id the running Provider actually

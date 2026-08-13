@@ -56,6 +56,45 @@ func TestWelcomeTransitionInvariantPreservesCopyModeScrollback(t *testing.T) {
 	}
 }
 
+// TestWelcomeToActiveKeepsSameCardAndDropsOnlyHint is the product-level
+// regression for the startup jump reported in v0.4.20. Claude Code keeps its
+// LogoHeader as the first element of Messages; submitting a prompt adds rows
+// beneath it instead of replacing the entire identity with compact chrome.
+func TestWelcomeToActiveKeepsSameCardAndDropsOnlyHint(t *testing.T) {
+	m := newE2EModel(t, 120, 40, 0)
+	welcomeCard := ansi.Strip(m.renderWelcomeBannerCard())
+	welcome := ansi.Strip(m.View().Content)
+	if !strings.Contains(welcome, welcomeCard) {
+		t.Fatal("fresh frame does not contain the canonical welcome card")
+	}
+	if !strings.Contains(welcome, "Type a message to start") {
+		t.Fatal("fresh frame should contain the one-time start hint")
+	}
+
+	m.messages = []Message{{
+		Role:      "user",
+		Content:   "你好",
+		Timestamp: time.Now(),
+	}}
+	m.spinnerActive = true
+	m.spinnerPhase = "requesting"
+	m.spinnerStartedAt = time.Now()
+	m.stickyBottom = true
+	active := ansi.Strip(m.View().Content)
+	if !strings.Contains(active, welcomeCard) {
+		t.Fatal("active frame replaced the welcome card instead of retaining it as transcript prologue")
+	}
+	if strings.Contains(active, "Type a message to start") {
+		t.Fatal("active frame retained the stale one-time start hint")
+	}
+	if !strings.Contains(active, "你好") {
+		t.Fatal("active frame should render the first user prompt below the welcome card")
+	}
+	if count := strings.Count(active, "✻ metis"); count != 1 {
+		t.Fatalf("active frame contains %d Metis identities, want the welcome card only", count)
+	}
+}
+
 // lockedOutput is an io.Writer whose snapshots can safely be inspected while
 // Bubble Tea's renderer goroutine is still flushing terminal bytes.
 type lockedOutput struct {
@@ -188,7 +227,7 @@ func assertSingleActiveFrameAfterLastClear(t *testing.T, suffix, responseMarker 
 		t.Fatalf("active transition did not contain ED2; output=%q", suffix)
 	}
 	finalFrame := suffix[lastClear:]
-	for _, marker := range []string{"✻ metis ", "renderer-user-marker", responseMarker} {
+	for _, marker := range []string{"✻ metis", "renderer-user-marker", responseMarker} {
 		if count := strings.Count(finalFrame, marker); count != 1 {
 			t.Fatalf("final frame contains %q %d times, want exactly 1; output=%q",
 				marker, count, finalFrame)
@@ -338,9 +377,18 @@ func TestStreamingToIdleTransitionEndsWithFullRedraw(t *testing.T) {
 	p.Send(spinnerTick{})
 
 	snapshot := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
-		return rendererMarkerAppearsAfterClear(
+		if !rendererMarkerAppearsAfterClear(
 			s, transitionOffset, initialClearCount+1, responseMarker,
-		)
+		) {
+			return false
+		}
+		// The renderer may still be flushing a queued live frame when doneCh
+		// becomes ready. Do not accept that intermediate ED2 merely because
+		// it already contains the streamed response marker; wait for the
+		// post-finalize frame whose spinner row is actually gone.
+		suffix := s[transitionOffset:]
+		lastClear := strings.LastIndex(suffix, ansi.EraseEntireScreen)
+		return lastClear >= 0 && !strings.Contains(suffix[lastClear:], "connecting")
 	})
 	suffix := snapshot[transitionOffset:]
 	assertRendererTransitionEndsWithFullRedraw(t, suffix, responseMarker)
@@ -376,7 +424,7 @@ func TestRequestingToProviderEOFDoesNotScrollFullscreen(t *testing.T) {
 		t.Fatalf("provider EOF transition did not re-anchor with ED2; output=%q", suffix)
 	}
 	finalFrame := suffix[lastClear:]
-	if count := strings.Count(finalFrame, "✻ metis "); count != 1 {
+	if count := strings.Count(finalFrame, "✻ metis"); count != 1 {
 		t.Fatalf("final EOF frame contains %d headers, want exactly 1; output=%q", count, finalFrame)
 	}
 	if count := strings.Count(finalFrame, "API Error: EOF"); count != 1 {

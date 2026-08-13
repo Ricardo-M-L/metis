@@ -636,11 +636,10 @@ const doubleClickThreshold = 400 * time.Millisecond
 // that two-finger taps in different rows count as a double-click.
 const clickPosTolerance = 2
 
-// chatStartY is the row where chatList's rendering begins inside the
-// alt-screen. y=0 is the brand line ("metis · model · mode"); y=1 is
-// the separator; y=2 onward is the list. Used to translate viewport
-// mouse coordinates into list-relative coordinates.
-const chatStartY = 2
+// chatStartY is the row where chatList begins inside the alt-screen. The
+// welcome card is item zero, matching Claude Code's LogoHeader-first Messages
+// tree, so there is no fixed brand header above the list.
+const chatStartY = 0
 
 // nextID returns a process-stable identifier for a new Message or
 // ToolEvent. Format is "<sessionID>-m<seq>" so debug logs can be

@@ -853,3 +853,19 @@ func (m *Model) buildChatItems() []list.Item {
 	}
 	return out
 }
+
+// buildChatSurfaceItems wraps the chronological message/tool items with the
+// conversation's visual prologue. Claude Code's Messages component renders
+// LogoHeader before every MessageRow inside the scrollable transcript. Keep
+// the Metis welcome card in the same place: it remains visually unchanged
+// after the first submit, then scrolls away with older history instead of
+// being replaced by a second, sticky header design.
+//
+// Keeping this wrapper separate from buildChatItems also preserves the latter
+// as a pure message/tool adapter for export, grouping, and focused unit tests.
+func (m *Model) buildChatSurfaceItems() []list.Item {
+	items := m.buildChatItems()
+	out := make([]list.Item, 0, len(items)+1)
+	out = append(out, &staticItem{rendered: m.renderWelcomeBannerCard()})
+	return append(out, items...)
+}
