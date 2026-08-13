@@ -7,6 +7,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.23] - 2026-08-14
+
 ### Added
 
 - **interactive command workflows**: `/diff` combines uncommitted working-tree
@@ -33,6 +35,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - `/copy N` now copies the Nth-latest assistant reply. `/plan` enters plan mode,
   shows the current draft when already active, accepts a planning brief, and
   supports `/plan open` for editor-based changes.
+
+### Fixed
+
+- **bounded diff cancellation**: canceling or timing out `/diff` now terminates
+  the full Git process tree on Unix and Windows so descendants cannot retain
+  output pipes and stall the TUI or CI runner.
 
 ## [0.4.22] - 2026-08-13
 
@@ -827,7 +835,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.22...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.23...HEAD
+[0.4.23]: https://github.com/Ricardo-M-L/metis/compare/v0.4.22...v0.4.23
 [0.4.22]: https://github.com/Ricardo-M-L/metis/compare/v0.4.21...v0.4.22
 [0.4.21]: https://github.com/Ricardo-M-L/metis/compare/v0.4.20...v0.4.21
 [0.4.20]: https://github.com/Ricardo-M-L/metis/compare/v0.4.19...v0.4.20
