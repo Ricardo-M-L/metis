@@ -659,7 +659,7 @@ type inProgressStreamingItem struct {
 }
 
 func (it *inProgressStreamingItem) Render(width int) string {
-	if it.text == "" || it.backgrounded {
+	if strings.TrimSpace(it.text) == "" || it.backgrounded {
 		return ""
 	}
 	// Streaming text arrives before the final assistant message goes through
@@ -751,6 +751,12 @@ func (m *Model) buildChatItems() []list.Item {
 		switch {
 		case it.msg != nil:
 			flushExploration()
+			// Defense in depth for imported/legacy state. Even though live
+			// streams and resume hydration now discard these, do not let a
+			// whitespace-only assistant occupy an invisible list row + gap.
+			if it.msg.Role == "assistant" && strings.TrimSpace(it.msg.Content) == "" {
+				continue
+			}
 			if hideThinking && (it.msg.Role == "thinking" || it.msg.Role == "redacted_thinking") {
 				continue
 			}

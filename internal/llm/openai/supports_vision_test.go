@@ -1,8 +1,13 @@
 package openai
 
-import "testing"
+import (
+	"testing"
 
-func TestSupportsVision(t *testing.T) {
+	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+func TestFallbackVisionCapability(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		model string
@@ -54,9 +59,38 @@ func TestSupportsVision(t *testing.T) {
 		{"", false},
 	}
 	for _, c := range cases {
-		o := &OpenAI{Model: c.model}
-		if got := o.SupportsVision(); got != c.want {
-			t.Errorf("SupportsVision(%q) = %v, want %v", c.model, got, c.want)
+		got := fallbackVisionCapability(c.model) == provider.VisionSupported
+		if got != c.want {
+			t.Errorf("fallbackVisionCapability(%q) supported = %v, want %v", c.model, got, c.want)
 		}
+	}
+}
+
+func TestCatalogFactPrecedesBroadFallback(t *testing.T) {
+	cli := catalog.NewStaticClient(catalog.Catalog{
+		"fixture": {Models: map[string]catalog.Model{
+			"glm-5.1": {Modalities: catalog.Modalities{Input: []string{"text"}}},
+		}},
+	})
+	if got := visionCapabilityWithCatalog("glm-5.1", "glm-5.1", cli); got != provider.VisionUnsupported {
+		t.Fatalf("catalog text-only fact = %v, want VisionUnsupported", got)
+	}
+	if got := visionCapabilityWithCatalog("glm-5.2", "glm-5.2", cli); got != provider.VisionSupported {
+		t.Fatalf("catalog miss should use offline fallback; got %v", got)
+	}
+}
+
+func TestSenseNovaVisionFactPrecedesCatalogLookup(t *testing.T) {
+	if got := VisionCapabilityForModel("sensenova-6.8-flash-lite"); got != provider.VisionSupported {
+		t.Fatalf("SenseNova capability = %v, want VisionSupported", got)
+	}
+}
+
+func TestVisionCapabilityDistinguishesUnknownFromUnsupported(t *testing.T) {
+	if got := VisionCapabilityForModel("brand-new-private-model"); got != provider.VisionUnknown {
+		t.Fatalf("unknown model capability = %v, want VisionUnknown", got)
+	}
+	if got := VisionCapabilityForModel("gpt-3.5-turbo"); got != provider.VisionUnsupported {
+		t.Fatalf("known text-only model capability = %v, want VisionUnsupported", got)
 	}
 }

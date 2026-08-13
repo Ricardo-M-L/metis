@@ -306,12 +306,19 @@ func (c *Client) LookupVisionByModelID(modelID string) (bool, bool) {
 	if c.cached == nil || modelID == "" {
 		return false, false
 	}
+	found := false
 	for _, p := range c.cached {
 		if m, ok := p.Models[modelID]; ok {
-			return m.SupportsImage(), true
+			found = true
+			// The same wire id can be re-published by multiple gateways. Image
+			// support is usable if any catalog route declares it; returning the
+			// first map hit made the answer nondeterministic across processes.
+			if m.SupportsImage() {
+				return true, true
+			}
 		}
 	}
-	return false, false
+	return false, found
 }
 
 func (c *Client) LookupContextWindowByModelID(modelID string) (int, bool) {
@@ -460,6 +467,13 @@ func Default() *Client {
 		}()
 	})
 	return defaultClient
+}
+
+// NewStaticClient returns an in-memory client for deterministic capability
+// lookups. It performs no network or disk I/O and is primarily useful to
+// callers/tests that already possess catalog facts.
+func NewStaticClient(models Catalog) *Client {
+	return &Client{cached: models}
 }
 
 // TransportHint maps the catalog's `npm` field to one of metis's

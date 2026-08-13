@@ -32,14 +32,17 @@ func wrapInternalReviewPrompt(prompt string) string {
 	return internalReviewPromptOpen + "\n" + prompt + "\n" + internalReviewPromptClose
 }
 
+func removeInternalReviewPrompt(text string) string {
+	text = internalReviewPromptSection.ReplaceAllString(text, "")
+	return unterminatedInternalReviewPrompt.ReplaceAllString(text, "")
+}
+
 // stripInternalReviewPrompt is shared by live export and resume hydration.
 // The provider-facing review frame belongs in durable loop history so a
 // resumed model retains its task, but it is implementation detail rather than
 // a user-authored transcript row.
 func stripInternalReviewPrompt(text string) string {
-	text = internalReviewPromptSection.ReplaceAllString(text, "")
-	text = unterminatedInternalReviewPrompt.ReplaceAllString(text, "")
-	return strings.TrimSpace(text)
+	return strings.TrimSpace(removeInternalReviewPrompt(text))
 }
 
 // conversationText renders the provider-neutral history as the same kind of

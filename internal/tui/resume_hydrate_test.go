@@ -109,6 +109,23 @@ func TestHydrateFromLoopHistory_SkipsEmptyText(t *testing.T) {
 	}
 }
 
+func TestHydrateFromLoopHistory_NormalizesLegacyAssistantLeadingBlankLines(t *testing.T) {
+	t.Parallel()
+	hist := []llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+		{Type: "text", Text: "\r\n \t\n    indented code\n\nnext paragraph"},
+	}}}
+	m := &Model{loop: makeLoopWithHistory(t, hist), sessionID: "legacy-whitespace"}
+	m.hydrateFromLoopHistory()
+
+	if len(m.messages) != 2 {
+		t.Fatalf("expected assistant message + resume marker; got %d (%v)", len(m.messages), msgRoles(m.messages))
+	}
+	const want = "    indented code\n\nnext paragraph"
+	if got := m.messages[0].Content; got != want {
+		t.Fatalf("hydrated assistant content = %q, want %q", got, want)
+	}
+}
+
 func TestHydrateFromLoopHistory_RestoresThinkingBlocks(t *testing.T) {
 	t.Parallel()
 	hist := []llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{

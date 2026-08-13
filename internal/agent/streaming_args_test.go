@@ -323,6 +323,106 @@ func TestConsumeStream_ThinkingDeltaStillEmitted(t *testing.T) {
 	}
 }
 
+// OpenAI-compatible reasoning models may use one or more blank lines as a
+// wire-level separator between reasoning_content and content. Those separator
+// bytes are not an assistant message: forwarding them makes the TUI paint its
+// assistant bullet on an otherwise empty row.
+func TestConsumeStream_StripsLeadingBlankLinesFromAssistantText(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "thinking_delta", TextDelta: "done reasoning"},
+		// Split the separator across chunks to exercise the real streaming
+		// boundary instead of relying on a single convenient provider chunk.
+		{Type: "text_delta", TextDelta: "\r\n"},
+		{Type: "text_delta", TextDelta: " \t\n"},
+		{Type: "text_delta", TextDelta: "answer\n\nsecond paragraph"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = (&Loop{}).consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+
+	var live strings.Builder
+	for ev := range out {
+		if ev.Kind == EventTextDelta {
+			live.WriteString(ev.TextDelta)
+		}
+	}
+	<-done
+
+	const want = "answer\n\nsecond paragraph"
+	if got := live.String(); got != want {
+		t.Fatalf("live assistant text = %q, want %q", got, want)
+	}
+	if len(blocks) != 2 || blocks[1].Type != "text" || blocks[1].Text != want {
+		t.Fatalf("persisted blocks = %+v, want thinking followed by normalized text %q", blocks, want)
+	}
+}
+
+// A whitespace-only compatibility content segment immediately before a tool
+// call must disappear at the content-block boundary. Otherwise it is both
+// persisted and flushed by EventToolStart as a standalone assistant bullet.
+func TestConsumeStream_DropsWhitespaceOnlyTextAtToolBoundary(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "text_delta", TextDelta: "\n \t\r\n"},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "Read"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `{"path":"/tmp/a"}`},
+		{Type: "tool_use_stop", ToolUseID: "t1"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = (&Loop{}).consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+
+	for ev := range out {
+		if ev.Kind == EventTextDelta {
+			t.Fatalf("whitespace-only content leaked as a live text event: %q", ev.TextDelta)
+		}
+	}
+	<-done
+	if len(blocks) != 1 || blocks[0].Type != "tool_use" {
+		t.Fatalf("persisted blocks = %+v, want only tool_use", blocks)
+	}
+}
+
+// Normalization is intentionally narrower than TrimSpace: indentation on the
+// first real line and blank lines inside the answer are authored content.
+func TestConsumeStream_PreservesFirstLineIndentationAndInternalBlankLines(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "text_delta", TextDelta: "    "},
+		{Type: "text_delta", TextDelta: "code\n\n    nested"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = (&Loop{}).consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	const want = "    code\n\n    nested"
+	if len(blocks) != 1 || blocks[0].Text != want {
+		t.Fatalf("persisted text = %+v, want %q", blocks, want)
+	}
+}
+
 // TestConsumeStream_ToolUseStopResyncsLostBytes — defends against the
 // MiniMax char-loss bug surfaced 2026-05-10: a single tool_input_delta
 // chunk dropped between provider and agent (the user's actual report

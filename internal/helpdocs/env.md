@@ -45,7 +45,7 @@ are kept in a separate section at the end.
 | `METIS_LANG` | `$LANG`, then `en` | UI locale override. The shipped locales are `en` and `zh-CN`. |
 | `METIS_REDUCED_MOTION` | off | Set to `1` to reduce animations and use a `500ms` TUI tick. `NO_MOTION=1` is also accepted. |
 | `METIS_TICK_MS` | `40` | TUI tick interval in milliseconds, valid from `1` to `1000`. Reduced-motion mode takes precedence. |
-| `METIS_DISABLE_MOUSE` | off | Set to a truthy value (any non-empty value except `0`, `false`, `no`, `off`, or `n`) to use `MouseModeNone` instead of the default cell-motion capture. Metis then receives no wheel, click, drag, or link-click events; use `PgUp`/`PgDn`, `Home`/`End`, `Ctrl+Y`/`Ctrl+Shift+Y`, and `Ctrl+S` for navigation and copying. |
+| `METIS_DISABLE_MOUSE` | off | Set to a truthy value (any non-empty value except `0`, `false`, `no`, `off`, or `n`) to use `MouseModeNone` instead of the default cell-motion capture. Metis then receives no wheel, click, input/transcript drag-selection, or link-click events; use `PgUp`/`PgDn`, `Home`/`End`, `Ctrl+Y`/`Ctrl+Shift+Y`, and `Ctrl+S` for navigation and copying. |
 | `METIS_MOUSE_WHEEL_LINES` | `1` | Transcript lines scrolled per wheel event, valid from `1` to `50`. |
 | `METIS_EVENT_BUFFER` | `256` | TUI event-channel capacity, valid from `16` to `16384`. |
 | `METIS_NOTIFY_CHANNEL` | `auto` | Terminal notification protocol. Canonical values: `auto`, `iterm2`, `iterm2_with_bell`, `kitty`, `ghostty`, `bell`, or `off`. This is not a Slack or email route. |

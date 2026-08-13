@@ -93,6 +93,15 @@ func (g *Gemini) Name() string { return "gemini" }
 // ModelID returns the wire-level model id this provider sends.
 func (g *Gemini) ModelID() string { return g.Model }
 
+// VisionCapability is explicitly unsupported until the native Gemini request
+// encoder serializes Metis image content blocks. Gemini models may themselves
+// be multimodal; this declaration describes this transport implementation.
+func (g *Gemini) VisionCapability() provider.VisionCapability {
+	return provider.VisionUnsupported
+}
+
+func (g *Gemini) SupportsVision() bool { return false }
+
 // MaxContextTokens — Gemini 2.5 line ships with a 1M-token window for
 // pro / flash; older models cap at 32k or 128k. Pick by model prefix
 // so the compactor uses the right denominator.

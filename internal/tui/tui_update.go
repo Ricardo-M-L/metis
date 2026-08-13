@@ -304,6 +304,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 				m.permActive, m.copyMode, m.activeScreen != nil, m.effortPicker != nil, len(msg.Content))
 			return m, nil
 		}
+		m.inputSelection.Clear()
 		text := msg.Content
 		if text == "" {
 			// Cmd+V / Ctrl+V with an IMAGE on the clipboard: macOS &
@@ -388,10 +389,26 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		// MouseReleaseMsg below — that way single-click-no-drag and
 		// drag-to-select share one outbound copy path.
 		if msg.Button != tea.MouseLeft ||
-			m.permActive || m.copyMode || m.activeScreen != nil ||
-			m.showHistory || m.showTaskPanel {
+			m.inputMouseBlocked() {
 			return m, nil
 		}
+		m.mouseOwner = mouseOwnerNone
+		// The composer is below the chat viewport, so give its exact frame
+		// geometry first refusal before the legacy strip/chrome branches.
+		if hit, ok := m.inputPointAt(msg.X, msg.Y, false); ok {
+			m.chatList.ClearSelection()
+			m.stripSelStart = -1
+			m.stripSelEnd = -1
+			m.stripSelDragging = false
+			m.moveInputCursorTo(hit.caret)
+			m.rebuildInputSelectionSurface()
+			m.inputSelection.Begin(m.input.Value(), hit, msg.X, msg.Y)
+			m.mouseOwner = mouseOwnerInput
+			return m, nil
+		}
+		// A press outside the composer dismisses its retained screen
+		// highlight. The clipboard already received the selection on mouse-up.
+		m.inputSelection.Clear()
 		localY := msg.Y - chatStartY
 		if localY < 0 {
 			return m, nil
@@ -411,6 +428,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 					m.stripSelStart = lineIdx
 					m.stripSelEnd = lineIdx
 					m.stripSelDragging = true
+					m.mouseOwner = mouseOwnerStrip
 					return m, nil
 				}
 			}
@@ -444,6 +462,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		m.lastClickY = msg.Y
 
 		m.chatList.HandleMouseDown(msg.X, localY, m.clickCount)
+		m.mouseOwner = mouseOwnerChat
 		// Double / triple click finalize their selection inside
 		// HandleMouseDown (selectWord / selectLine). Copy on the
 		// spot — the user's intent is unambiguous, no need to wait
@@ -462,8 +481,14 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		// selection-extending; if no anchor is set HandleMouseDrag is
 		// a no-op so spurious motion (e.g. during a click that didn't
 		// land on the chat surface) is harmless.
-		if m.permActive || m.copyMode || m.activeScreen != nil ||
-			m.showHistory || m.showTaskPanel {
+		if m.inputMouseBlocked() {
+			return m, nil
+		}
+		if m.mouseOwner == mouseOwnerInput {
+			m.scrollInputSelectionToward(msg.Y)
+			if hit, ok := m.inputPointAt(msg.X, msg.Y, true); ok {
+				m.inputSelection.Drag(m.input.Value(), hit, msg.X, msg.Y)
+			}
 			return m, nil
 		}
 		// 2026-05-24: drag in the strip area extends the strip line-
@@ -495,8 +520,26 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		//     row" (the original click-to-copy behavior).
 		//  3. Click on chrome (header / below list) → no-op.
 		if msg.Button != tea.MouseLeft ||
-			m.permActive || m.copyMode || m.activeScreen != nil ||
-			m.showHistory || m.showTaskPanel {
+			m.inputMouseBlocked() {
+			return m, nil
+		}
+		owner := m.mouseOwner
+		m.mouseOwner = mouseOwnerNone
+		if owner == mouseOwnerInput {
+			m.scrollInputSelectionToward(msg.Y)
+			hit, ok := m.inputPointAt(msg.X, msg.Y, true)
+			if !ok {
+				m.inputSelection.Clear()
+				return m, nil
+			}
+			if m.inputSelection.Finish(m.input.Value(), hit, msg.X, msg.Y) {
+				selected := m.inputSelection.SelectedText(m.input.Value())
+				if selected != "" {
+					writeInputSelectionClipboard(selected)
+				}
+			} else {
+				m.moveInputCursorTo(hit.caret)
+			}
 			return m, nil
 		}
 		// 2026-05-24: finalize strip-area drag selection if one was in
@@ -504,7 +547,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		// clipboard; keep the highlight visible (claude-code parity —
 		// the user can cmd+C the same selection or click elsewhere to
 		// clear).
-		if m.stripSelDragging {
+		if owner == mouseOwnerStrip && m.stripSelDragging {
 			m.stripSelDragging = false
 			if m.stripSelStart >= 0 && m.stripSelEnd >= 0 && len(m.stripPlainLines) > 0 {
 				lo, hi := m.stripSelStart, m.stripSelEnd
@@ -519,6 +562,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 					writeClipboard(strings.Join(selected, "\n"))
 				}
 			}
+			return m, nil
+		}
+		if owner != mouseOwnerChat {
 			return m, nil
 		}
 		hadDrag := m.chatList.HandleMouseUp()

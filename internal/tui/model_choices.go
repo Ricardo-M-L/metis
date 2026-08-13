@@ -9,6 +9,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
+	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // builtinModelChoices is the curated list shown in the /model picker.
@@ -88,9 +89,9 @@ func modelChoiceKey(c screen.ModelChoice) string {
 	return strings.ToLower(c.Provider) + "\x00" + strings.ToLower(c.ID)
 }
 
-func modelChoiceSupportsVision(cfg *config.Config, c screen.ModelChoice) bool {
+func modelChoiceVisionCapability(cfg *config.Config, c screen.ModelChoice) pubprovider.VisionCapability {
 	if cfg == nil || c.ID == "" {
-		return false
+		return pubprovider.VisionUnsupported
 	}
 	transport := ""
 	switch c.Provider {
@@ -100,26 +101,41 @@ func modelChoiceSupportsVision(cfg *config.Config, c screen.ModelChoice) bool {
 		transport = "openai_chat"
 	case "gemini", "google":
 		// The native Gemini adapter does not encode image content blocks yet.
-		return false
+		return pubprovider.VisionUnsupported
 	default:
 		raw, ok := cfg.Provider.Custom[c.Provider]
 		if !ok {
-			return false
+			return pubprovider.VisionUnsupported
 		}
 		transport = raw.Transport
 		if transport == "" {
 			transport = "anthropic_messages"
 		}
+		if raw.SupportsVision != nil {
+			// Match runtime.BuildProvider: a positive Gemini override cannot be
+			// honored until its native encoder supports image content blocks.
+			if *raw.SupportsVision && (transport == "gemini_native" || transport == "gemini") {
+				return pubprovider.VisionUnsupported
+			}
+			if *raw.SupportsVision {
+				return pubprovider.VisionSupported
+			}
+			return pubprovider.VisionUnsupported
+		}
 	}
 
 	switch transport {
 	case "openai_chat", "azure_openai":
-		return openai.SupportsVisionModel(c.ID)
+		return openai.VisionCapabilityForModel(c.ID)
 	case "anthropic_messages", "bedrock_anthropic", "vertex_anthropic":
-		return anthropic.SupportsVisionModel(c.ID)
+		return anthropic.VisionCapabilityForModel(c.ID)
 	default:
-		return false
+		return pubprovider.VisionUnsupported
 	}
+}
+
+func modelChoiceSupportsVision(cfg *config.Config, c screen.ModelChoice) bool {
+	return modelChoiceVisionCapability(cfg, c) != pubprovider.VisionUnsupported
 }
 
 // modelChoiceHasCredentials mirrors BuildProvider's first precondition without
@@ -138,8 +154,13 @@ func (m *Model) modelPickerChoices(requireVision bool) []screen.ModelChoice {
 	if requireVision {
 		out := make([]screen.ModelChoice, 0, len(configured))
 		for _, c := range configured {
-			if modelChoiceSupportsVision(m.cfg, c) && modelChoiceHasCredentials(m.cfg, c) {
-				c.Description = "configured vision model"
+			capability := modelChoiceVisionCapability(m.cfg, c)
+			if capability != pubprovider.VisionUnsupported && modelChoiceHasCredentials(m.cfg, c) {
+				if capability == pubprovider.VisionSupported {
+					c.Description = "configured vision model"
+				} else {
+					c.Description = "configured model · image support unverified"
+				}
 				out = append(out, c)
 			}
 		}

@@ -535,6 +535,18 @@ type Model struct {
 	stripSelEnd      int
 	stripSelDragging bool
 
+	// Composer selection uses the same press/drag/release ownership model as
+	// the transcript, but maps through textarea's actual wrapped layout back to
+	// source grapheme boundaries. Geometry is refreshed by View so raw SGR
+	// mouse coordinates line up with the frame currently on screen.
+	inputBodyStartY    int
+	inputBodyHeight    int
+	inputContentStartX int
+	inputContentEndX   int
+	inputSurface       inputSelectionSurface
+	inputSelection     inputMouseSelection
+	mouseOwner         mouseGestureOwner
+
 	// turnCancel cancels the in-flight turn's ctx (cancellable copy of
 	// m.ctx). Set by runTurnAsync, cleared when the turn finishes.
 	// Ctrl-C calls it to abort the LLM stream + tool execution while
@@ -675,7 +687,7 @@ const ctrlCQuitWindow = 600 * time.Millisecond
 // Constructor + entry point
 // ============================================================================
 
-func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config) *Model {
+func newComposer() textarea.Model {
 	ti := textarea.New()
 	ti.Placeholder = "type a message · /commands · alt+enter newline"
 	ti.Focus()
@@ -742,6 +754,11 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		}
 		return "  "
 	})
+	return ti
+}
+
+func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config) *Model {
+	ti := newComposer()
 
 	// chatList replaces bubbles/viewport.Model for the chat surface.
 	// Width/Height get sized on the first WindowSizeMsg; default 80×20
@@ -808,6 +825,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		// lands in the strip area (msg.Y >= stripStartY).
 		stripSelStart:   -1,
 		stripSelEnd:     -1,
+		inputBodyStartY: -1,
 		firstRender:     true,
 		input:           ti,
 		chatList:        cl,

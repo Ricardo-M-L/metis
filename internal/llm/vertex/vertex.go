@@ -102,9 +102,12 @@ func NewVertex(serviceAccountPath, project, region, model string, maxTokens int,
 	}, nil
 }
 
-func (v *Vertex) Name() string          { return "vertex" }
-func (v *Vertex) ModelID() string       { return v.Model }
-func (v *Vertex) SupportsVision() bool  { return anthropic.SupportsVisionModel(v.Model) }
+func (v *Vertex) Name() string         { return "vertex" }
+func (v *Vertex) ModelID() string      { return v.Model }
+func (v *Vertex) SupportsVision() bool { return anthropic.SupportsVisionModel(v.Model) }
+func (v *Vertex) VisionCapability() provider.VisionCapability {
+	return anthropic.VisionCapabilityForModel(v.Model)
+}
 func (v *Vertex) MaxContextTokens() int { return v.ContextWindow }
 
 // endpoint renders the Vertex predict URL. `streaming` chooses between

@@ -115,6 +115,28 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Composer mouse selection is a screen-copy range, not an editor
+	// replacement range. Match familiar terminal full-screen behavior: copy
+	// keys consume the retained range before Ctrl-C's cancel/quit meaning;
+	// Escape clears it; any other key dismisses the highlight and then follows
+	// the normal editor/shortcut path.
+	if m.inputSelection.HasSelection(m.input.Value()) {
+		switch msg.String() {
+		case "ctrl+c", "ctrl+shift+c", "super+c":
+			selected := m.inputSelection.SelectedText(m.input.Value())
+			m.inputSelection.Clear()
+			if selected != "" {
+				writeInputSelectionClipboard(selected)
+			}
+			return m, nil
+		case "esc":
+			m.inputSelection.Clear()
+			return m, nil
+		default:
+			m.inputSelection.Clear()
+		}
+	}
+
 	// Bare /effort is an inline picker, not a full-window screen. While it is
 	// open it owns the keyboard so navigation keys cannot leak into the input
 	// editor or slash palette. The transcript remains mounted and visible.

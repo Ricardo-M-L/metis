@@ -22,6 +22,8 @@ type visionFakeProvider struct{ fakeProvider }
 
 func (visionFakeProvider) SupportsVision() bool { return true }
 
+type unknownVisionFakeProvider struct{ pubprov.Provider }
+
 func TestSplitOffImageBlocks_StripsImagesOnly(t *testing.T) {
 	t.Parallel()
 	blocks := []llm.ContentBlock{
@@ -41,6 +43,67 @@ func TestSplitOffImageBlocks_StripsImagesOnly(t *testing.T) {
 		if b.Type != "text" {
 			t.Errorf("kept[%d].Type = %q, want text", i, b.Type)
 		}
+	}
+}
+
+func TestModelChoiceSupportsVisionHonorsCustomOverride(t *testing.T) {
+	tests := []struct {
+		name     string
+		model    string
+		override bool
+	}{
+		{name: "unknown model forced on", model: "vendor-new-multimodal", override: true},
+		{name: "known model forced off", model: "gpt-4o", override: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := tt.override
+			cfg := &config.Config{}
+			cfg.Provider.Custom = map[string]config.ProviderRaw{
+				"custom-provider": {
+					Transport:      "openai_chat",
+					Model:          tt.model,
+					SupportsVision: &v,
+				},
+			}
+			choice := screen.ModelChoice{Provider: "custom-provider", ID: tt.model}
+			if got := modelChoiceSupportsVision(cfg, choice); got != tt.override {
+				t.Fatalf("modelChoiceSupportsVision(%q) = %v, want override %v", tt.model, got, tt.override)
+			}
+		})
+	}
+}
+
+func TestModelChoiceUnknownVisionCapabilityRemainsCandidate(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"custom-provider": {Transport: "openai_chat", Model: "brand-new-private-model"},
+	}
+	choice := screen.ModelChoice{Provider: "custom-provider", ID: "brand-new-private-model"}
+	if got := modelChoiceVisionCapability(cfg, choice); got != pubprov.VisionUnknown {
+		t.Fatalf("capability = %v, want VisionUnknown", got)
+	}
+	if !modelChoiceSupportsVision(cfg, choice) {
+		t.Fatal("unknown capability must remain an image recovery candidate")
+	}
+}
+
+func TestSubmitImageToUnknownCapabilityProviderIsAttempted(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.loop.Provider = unknownVisionFakeProvider{Provider: fakeProvider{}}
+	m.loop.Model = "brand-new-private-model"
+	path := makeTinyPNG(t, t.TempDir(), "unknown.png", 8, 8)
+	m.imagePaste = map[int]string{1: path}
+	m.imageCounter = 1
+	m.input.SetValue("请看 [Image #1]")
+
+	_, _ = m.handleSubmit()
+	hist := m.loop.History()
+	if len(hist) != 1 {
+		t.Fatalf("unknown capability should be sent for provider adjudication; history=%+v", hist)
+	}
+	if m.activeScreen != nil || m.imageRecoveryPending {
+		t.Fatalf("unknown capability was incorrectly blocked: screen=%T pending=%v", m.activeScreen, m.imageRecoveryPending)
 	}
 }
 
@@ -82,7 +145,7 @@ func TestSubmitImageToTextOnlyModelKeepsPromptAndAttachment(t *testing.T) {
 		t.Fatalf("vision recovery picker missing purpose/candidate:\n%s", view)
 	}
 	last := m.messages[len(m.messages)-1]
-	if last.Role != "warning" || !strings.Contains(last.Content, "text-only") || !strings.Contains(last.Content, "kept") || !strings.Contains(last.Content, "choose") {
+	if last.Role != "warning" || !strings.Contains(last.Content, "not recognized or configured as vision-capable") || !strings.Contains(last.Content, "kept") || !strings.Contains(last.Content, "choose") {
 		t.Fatalf("missing actionable preflight warning: %+v", last)
 	}
 	// Key repeat / impatient Enter must not grow an identical warning chain.

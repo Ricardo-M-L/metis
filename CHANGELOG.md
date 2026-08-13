@@ -7,6 +7,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **blank assistant rows from compatibility streams**: leading blank-line
+  separators between reasoning and content are buffered across chunks and
+  removed before live display or persistence; whitespace-only text before a
+  tool call no longer renders as a standalone assistant bullet.
+- **custom-provider image capability overrides**: OpenAI-compatible models can
+  declare `supports_vision = true|false` when public catalogs do not know their
+  private model id. SenseNova 6.8 Flash Lite is also recognized from its
+  vendor-declared text-and-image input metadata, and capability warnings no
+  longer label an unknown model as objectively text-only.
+- **composer mouse selection**: dragging across the input now selects complete
+  Unicode grapheme clusters, copies on release, and keeps a visible highlight;
+  a bare click positions the caret, while `Ctrl+C` copies an active composer
+  selection before falling back to interrupt or quit behavior.
+
 ## [0.4.20] - 2026-08-12
 
 ### Added

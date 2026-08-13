@@ -329,6 +329,11 @@ type ProviderRaw struct {
 	Model       string `toml:"model"`
 	MaxTokens   int    `toml:"max_tokens"`
 	TimeoutSecs int    `toml:"timeout_seconds"`
+	// SupportsVision overrides model-catalog inference for custom profiles.
+	// nil keeps automatic detection; true/false is an explicit operator
+	// declaration. This is intentionally custom-profile-only because gateway
+	// model ids often do not exist in the public models.dev catalog.
+	SupportsVision *bool `toml:"supports_vision"`
 
 	// ContextWindow override. Required for cloud-auth providers
 	// (Azure / Vertex / Bedrock) where the metis side can't infer

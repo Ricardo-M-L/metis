@@ -29,6 +29,21 @@ func (s stubVisionProvider) Stream(context.Context, provider.Request) (provider.
 	return nil, io.EOF
 }
 
+// stubUnknownVisionProvider intentionally implements only the core Provider
+// contract. Missing capability metadata must remain Unknown, not collapse to
+// an explicit text-only decision.
+type stubUnknownVisionProvider struct{}
+
+func (stubUnknownVisionProvider) Name() string          { return "unknown-stub" }
+func (stubUnknownVisionProvider) ModelID() string       { return "private-new-model" }
+func (stubUnknownVisionProvider) MaxContextTokens() int { return 100_000 }
+func (stubUnknownVisionProvider) Complete(context.Context, provider.Request) (*provider.Response, error) {
+	return nil, io.EOF
+}
+func (stubUnknownVisionProvider) Stream(context.Context, provider.Request) (provider.StreamReader, error) {
+	return nil, io.EOF
+}
+
 // visionTool — a stub that returns one inline image so we can verify
 // the dispatch layer fans Result.Images into ContentBlock.ToolResultBlocks.
 // Mirrors the shape ViewImage produces, minus the disk read.
@@ -97,6 +112,20 @@ func TestDispatch_PromotesImagesToToolResultBlocks(t *testing.T) {
 	}
 	if r.ToolResultBlocks[1].Data != "iVBORw0KGgo=" {
 		t.Errorf("image Data lost; got %q", r.ToolResultBlocks[1].Data)
+	}
+}
+
+func TestDispatch_UnknownVisionCapabilityLetsProviderAdjudicate(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.Register(visionTool{})
+	loop := &Loop{Registry: reg, Provider: stubUnknownVisionProvider{}}
+	uses := []llm.ContentBlock{{Type: "tool_use", ToolUseID: "tu_unknown", ToolName: "VisionStub"}}
+	results, err := loop.executeBatch(context.Background(), uses, make(chan Event, 16), HookContext{})
+	if err != nil {
+		t.Fatalf("executeBatch: %v", err)
+	}
+	if len(results) != 1 || len(results[0].ToolResultBlocks) != 2 || results[0].ToolResultBlocks[1].Type != "image" {
+		t.Fatalf("unknown capability should preserve image for upstream adjudication: %+v", results)
 	}
 }
 

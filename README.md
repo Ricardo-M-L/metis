@@ -218,7 +218,7 @@ A later source wins when two skills have the same name.
 | `Ctrl+G` | open the input draft in `$VISUAL`/`$EDITOR`/`vi`; saves on exit |
 | `Ctrl+X` | toggle shell mode (next input runs as `bash -c <input>`) |
 | `Ctrl+J` | newline (alt to Alt+Enter) |
-| `Ctrl+C` | interrupt running turn + clear queued prompts / single-tap idle = quit |
+| `Ctrl+C` | copy and clear an active input selection; otherwise interrupt a running turn + clear queued prompts / single-tap idle = quit |
 | `Ctrl+D` | quit |
 | `↑` / `↓` (single-line) | jump to start / end of input (also recall history when empty) |
 | `Esc Esc` | clear current input (no submit) |
@@ -228,7 +228,12 @@ A later source wins when two skills have the same name.
 | Enter mid-turn | queue input; runs as the next turn after the current one finishes |
 
 Mouse capture defaults to cell-motion mode so Metis can scroll the transcript,
-copy clicked or dragged text, and open rendered links. Set
+copy clicked or dragged transcript text, open rendered links, and drag-select
+the input at Unicode grapheme boundaries. Input selection copies on mouse-up
+and stays highlighted; dragging beyond the input's top or bottom edge scrolls
+long drafts, a bare click moves the caret, and `Ctrl+C` copies and clears the
+retained selection. This is a screen-copy range, so typing dismisses the
+highlight rather than replacing the selected draft text. Set
 `METIS_DISABLE_MOUSE=1` before launch to leave mouse handling to the terminal.
 With capture disabled, Metis does not receive wheel, click, drag, or link-click
 events: use `PgUp`/`PgDn` and `Home`/`End` to navigate, `Ctrl+Y` or
@@ -273,6 +278,9 @@ api_key_env = "MINIMAX_API_KEY"
 base_url    = "https://api.minimaxi.com/v1"
 model       = "MiniMax-M2.7"
 context_window = 192000
+# supports_vision = true               # optional vendor-confirmed override;
+                                       # unset = auto/unknown models are tried,
+                                       # false = force image attachments off
 
 # Cloud-auth custom transports are also available: azure_openai,
 # vertex_anthropic, and bedrock_anthropic. Their required profile fields

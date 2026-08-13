@@ -115,6 +115,9 @@ func (a *Azure) ModelID() string { return a.Model }
 // so its capability decision must match openai.ToRequest and the TUI's
 // pre-switch filter. Unknown deployment aliases stay conservatively false.
 func (a *Azure) SupportsVision() bool { return openai.SupportsVisionModel(a.Model) }
+func (a *Azure) VisionCapability() provider.VisionCapability {
+	return openai.VisionCapabilityForModel(a.Model)
+}
 
 // MaxContextTokens returns the configured override or 0 (caller falls
 // back to the model-prefix lookup, which is unlikely to match Azure

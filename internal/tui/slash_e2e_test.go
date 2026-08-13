@@ -414,6 +414,7 @@ func (fakeProvider) Stream(_ context.Context, _ provider.Request) (provider.Stre
 }
 func (fakeProvider) MaxContextTokens() int { return 200_000 }
 func (fakeProvider) ModelID() string       { return "" }
+func (fakeProvider) SupportsVision() bool  { return false }
 
 // fakeStream emits a single message_stop event then EOF so the agent
 // loop's consumeStream sees a clean turn-ended signal.

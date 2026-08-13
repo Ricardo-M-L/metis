@@ -237,6 +237,10 @@ func (m *Model) View() tea.View {
 	// Mirrors claude-code: native terminal cursor at the textarea
 	// position rather than a fake inverse-block character.
 	attachCursor := func(v tea.View, inputStartRow int) tea.View {
+		// Mouse events use absolute terminal rows. Capture the exact body
+		// origin from the same layout calculation that positions the native
+		// cursor, so selection never relies on a guessed chrome height.
+		m.inputBodyStartY = inputStartRow + 2
 		if m.activeScreen != nil || m.effortPicker != nil || m.copyMode || m.permActive || m.askUserActive || m.showHistory {
 			return v
 		}

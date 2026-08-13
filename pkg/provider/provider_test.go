@@ -44,6 +44,13 @@ func TestProviderInterface_PluginCompiles(t *testing.T) {
 	var _ Provider = &fakeProvider{}
 }
 
+func TestProviderVisionCapabilityUnknownForLegacyProvider(t *testing.T) {
+	p := &fakeProvider{}
+	if got := ProviderVisionCapability(p); got != VisionUnknown {
+		t.Fatalf("ProviderVisionCapability(legacy provider) = %v, want VisionUnknown", got)
+	}
+}
+
 func TestStreamReaderInterface_PluginCompiles(t *testing.T) {
 	var _ StreamReader = eofStream{}
 }

@@ -229,44 +229,66 @@ func (o *OpenAI) ModelID() string { return o.Model }
 // SupportsVision reports whether the configured OpenAI model accepts
 // image_url content parts.
 //
-// 2026-08-01 rework: catalog-first, whitelist-fallback. The previous
-// implementation was a hardcoded prefix list — every new vision model
-// (kimi-k3, glm-5v-turbo, etc.) required a code change and a metis
-// release. Now we ask the models.dev catalog first (same source
-// opencode / hermes-agent / MiMo-Code use), and only fall back to
-// the prefix list when the catalog hasn't warmed yet or doesn't know
-// the model. New models surface automatically when models.dev updates
-// upstream; no metis release needed.
+// 2026-08-01 rework: explicit facts + catalog + whitelist. The previous
+// implementation was only a hardcoded prefix list. We retain confirmed
+// provider facts for deterministic offline behavior, then ask models.dev for
+// ids not covered locally.
 //
-// We're still conservative on purpose: a false negative (model COULD
-// do vision, gate says no) just costs a re-paste in a vision model.
-// A false positive (text-only model gets image bytes) burns the
-// entire turn on a cryptic API rejection. So both the catalog path
-// and the whitelist path prefer "say no" on ambiguity.
+// Capability is tri-state: known text-only stays Unsupported, catalog/model
+// misses remain Unknown, and callers let unknown custom gateways adjudicate.
 func (o *OpenAI) SupportsVision() bool {
-	return SupportsVisionModel(o.Model)
+	return o.VisionCapability() == provider.VisionSupported
+}
+
+func (o *OpenAI) VisionCapability() provider.VisionCapability {
+	return VisionCapabilityForModel(o.Model)
 }
 
 // SupportsVisionModel exposes the same catalog-first capability decision for
 // configured-profile pickers that need to filter candidates before building a
 // live provider. It performs no request and requires no API key.
 func SupportsVisionModel(model string) bool {
-	// Tier 1 — models.dev catalog. Default() returns nil in CI or when
-	// METIS_CATALOG_DISABLE=1; LookupVisionByModelID returns
-	// found=false when the cache is cold or the model is unknown.
-	// Both are nil/miss-safe, so this branch is free when the catalog
-	// can't help.
-	if cli := catalog.Default(); cli != nil {
+	return VisionCapabilityForModel(model) == provider.VisionSupported
+}
+
+// VisionCapabilityForModel distinguishes an explicit text-only catalog entry
+// from a model the local catalog simply does not know. Image submission gates
+// only reject the former; unknown custom gateways get a chance to let their
+// own API make the authoritative decision.
+func VisionCapabilityForModel(model string) provider.VisionCapability {
+	m := strings.ToLower(strings.TrimSpace(model))
+
+	// Vendor-confirmed exact ids take precedence over the shared catalog.
+	// SenseNova's authenticated /models metadata declares text+image input for
+	// this model, while models.dev does not currently carry the vendor entry.
+	// Keeping this exact (rather than a broad sensenova-* prefix) avoids
+	// accidentally sending images to text-only siblings.
+	if m == "sensenova-6.8-flash-lite" {
+		return provider.VisionSupported
+	}
+	return visionCapabilityWithCatalog(model, m, catalog.Default())
+}
+
+func visionCapabilityWithCatalog(model, normalized string, cli *catalog.Client) provider.VisionCapability {
+	// Tier 1 — models.dev. A positive or negative catalog fact is stronger
+	// than broad family heuristics below. A miss falls through to the offline
+	// compatibility table.
+	if cli != nil {
 		if supported, found := cli.LookupVisionByModelID(model); found {
-			return supported
+			if supported {
+				return provider.VisionSupported
+			}
+			return provider.VisionUnsupported
 		}
 	}
+	return fallbackVisionCapability(normalized)
+}
 
-	// Tier 2 — prefix whitelist. Kept as the cold-cache / offline /
-	// not-yet-in-catalog fallback. List mirrors the pre-2026-08-01
-	// hardcoded set; new entries should go through the catalog path
-	// whenever possible instead of being added here.
-	m := strings.ToLower(model)
+// fallbackVisionCapability contains only deterministic cold-cache heuristics.
+// Keeping it separate lets unit tests exercise this table without depending
+// on a user's mutable ~/.metis catalog or a background network refresh.
+func fallbackVisionCapability(m string) provider.VisionCapability {
+	// Tier 2 — cold-cache/offline family facts.
 	switch {
 	// OpenAI native lineage.
 	case strings.HasPrefix(m, "gpt-4o"),
@@ -277,7 +299,7 @@ func SupportsVisionModel(model string) bool {
 		strings.HasPrefix(m, "o3"),
 		strings.HasPrefix(m, "o4"),
 		strings.HasPrefix(m, "chatgpt-4o"):
-		return true
+		return provider.VisionSupported
 	// Chinese OSS families (fallback only — prefer catalog above).
 	case strings.HasPrefix(m, "deepseek-vl"),
 		strings.HasPrefix(m, "kimi-k2"),
@@ -289,9 +311,28 @@ func SupportsVisionModel(model string) bool {
 		strings.HasPrefix(m, "glm-4v"),
 		strings.HasPrefix(m, "qwen-vl"),
 		strings.HasPrefix(m, "qwen2.5-vl"):
-		return true
+		return provider.VisionSupported
 	}
-	return false
+
+	// Confirmed text-only lineages retained from the pre-tristate table.
+	// Everything else is Unknown: absence from this client is not evidence of
+	// an upstream limitation.
+	switch {
+	case strings.HasPrefix(m, "gpt-3.5"),
+		m == "gpt-4",
+		strings.HasPrefix(m, "text-davinci"),
+		strings.HasPrefix(m, "deepseek-v3"),
+		strings.HasPrefix(m, "deepseek-v4"),
+		strings.HasPrefix(m, "deepseek-chat"),
+		strings.HasPrefix(m, "deepseek-reasoner"),
+		strings.HasPrefix(m, "ark-code"),
+		strings.HasPrefix(m, "kimi-k1.5"),
+		strings.HasPrefix(m, "glm-4-flash"),
+		strings.HasPrefix(m, "minimax-m"):
+		return provider.VisionUnsupported
+	}
+
+	return provider.VisionUnknown
 }
 
 func (o *OpenAI) MaxContextTokens() int {

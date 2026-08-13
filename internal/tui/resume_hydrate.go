@@ -85,6 +85,13 @@ func (m *Model) hydrateFromLoopHistory() {
 			switch blk.Type {
 			case "text":
 				visibleText := stripInternalReviewPrompt(blk.Text)
+				if lm.Role == llm.RoleAssistant {
+					// Sessions written before assistant stream normalization may
+					// contain a provider's reasoning/content separator. Repair the
+					// historical display without mutating the durable JSONL, and do
+					// not use TrimSpace: first-line code indentation is authored text.
+					visibleText = llm.TrimLeadingBlankLines(removeInternalReviewPrompt(blk.Text))
+				}
 				if visibleText == "" {
 					continue
 				}

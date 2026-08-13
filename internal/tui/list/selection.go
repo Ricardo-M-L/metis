@@ -454,14 +454,27 @@ func (l *List) applySelectionToLine(line string, itemIdx, lineY int) string {
 		hi = lineWidth
 	}
 
-	if lo >= hi || hi <= 0 {
+	return HighlightColumns(line, lo, hi)
+}
+
+// HighlightColumns paints the half-open display-column range [lo, hi) with
+// the same solid selection background used by transcript selections. It is
+// exported so other text surfaces (notably the composer) can share one ANSI-
+// safe selection renderer instead of each inventing subtly different reset
+// handling.
+func HighlightColumns(line string, lo, hi int) string {
+	lineWidth := ansi.StringWidth(line)
+	if lo >= hi || hi <= 0 || lo > lineWidth {
 		return line
 	}
-	if lo > lineWidth {
-		return line
+	if lo < 0 {
+		lo = 0
 	}
 	if hi > lineWidth {
 		hi = lineWidth
+	}
+	if lo >= hi {
+		return line
 	}
 
 	before := ansi.Cut(line, 0, lo)

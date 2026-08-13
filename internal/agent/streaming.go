@@ -30,6 +30,7 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		blocks      []llm.ContentBlock
 		curText     string
 		curThinking string
+		textFilter  llm.LeadingBlankLineFilter
 		stopReas    string
 		usage       usageTotals
 	)
@@ -45,6 +46,10 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			blocks = append(blocks, llm.ContentBlock{Type: "text", Text: curText})
 			curText = ""
 		}
+		// A tool boundary starts a fresh provider content block. Reset even
+		// when curText is empty so a whitespace-only prefix is discarded
+		// instead of leaking into the next post-tool response.
+		textFilter.Reset()
 	}
 	// flushThinking persists the accumulated reasoning trace as a
 	// ContentBlock on the assistant message. Earlier metis treated
@@ -156,8 +161,12 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// is [thinking, text, ...] which is the order the model
 			// produced + what Anthropic's wire format expects.
 			flushThinking()
-			curText += ev.TextDelta
-			emit(ctx, out, Event{Kind: EventTextDelta, TextDelta: ev.TextDelta})
+			text := textFilter.Push(ev.TextDelta)
+			if text == "" {
+				break
+			}
+			curText += text
+			emit(ctx, out, Event{Kind: EventTextDelta, TextDelta: text})
 		case "thinking_delta":
 			// Accumulate AND surface to the UI. The accumulator feeds
 			// the persisted ContentBlock{Type:"thinking"} flushed by

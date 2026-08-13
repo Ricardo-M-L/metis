@@ -286,8 +286,8 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				model = m.loop.Model
 			}
 			hint := "image kept — wait for the running turn to finish (or press Esc), then press Enter again"
-			if m.loop != nil && m.loop.Provider != nil && !pubprov.ProviderSupportsVision(m.loop.Provider) {
-				hint = fmt.Sprintf("image kept — current model (%s) is text-only. Wait for the running turn to finish (or press Esc), then press Enter again to choose a vision model; prompt and cached images stay attached", model)
+			if m.loop != nil && m.loop.Provider != nil && pubprov.ProviderVisionCapability(m.loop.Provider) == pubprov.VisionUnsupported {
+				hint = fmt.Sprintf("image kept — current model (%s) is not recognized or configured as vision-capable. Wait for the running turn to finish (or press Esc), then press Enter again to choose a vision model; prompt and cached images stay attached", model)
 			}
 			m.appendImageWarningOnce(hint)
 			return m, nil
@@ -1137,18 +1137,18 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// bytes and invites the model to guess a stale local path. Keep the
 		// editor + cached image intact so /model followed by Enter sends the
 		// original attachment without another paste.
-		if m.loop != nil && m.loop.Provider != nil && !pubprov.ProviderSupportsVision(m.loop.Provider) {
+		if m.loop != nil && m.loop.Provider != nil && pubprov.ProviderVisionCapability(m.loop.Provider) == pubprov.VisionUnsupported {
 			stripped, _ := splitOffImageBlocks(blocks)
 			if stripped > 0 {
 				m.input.SetValue(text)
 				if m.openModelPicker(true, stripped) {
 					m.appendImageWarningOnce(fmt.Sprintf(
-						"image not sent — current model (%s) is text-only. Prompt and %d image(s) are kept; choose a vision model, then press Enter to send.",
+						"image not sent — current model (%s) is not recognized or configured as vision-capable. Prompt and %d image(s) are kept; choose a vision model, then press Enter to send.",
 						m.loop.Model, stripped,
 					))
 				} else {
 					m.appendImageWarningOnce(fmt.Sprintf(
-						"image not sent — current model (%s) is text-only. Prompt and %d image(s) are kept, but no configured vision-capable provider profile is available.",
+						"image not sent — current model (%s) is not recognized or configured as vision-capable. Prompt and %d image(s) are kept, but no configured vision-capable provider profile is available.",
 						m.loop.Model, stripped,
 					))
 				}

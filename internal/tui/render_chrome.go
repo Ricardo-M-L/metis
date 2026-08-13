@@ -15,6 +15,7 @@ import (
 	xansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	tuilist "github.com/Ricardo-M-L/metis/internal/tui/list"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
@@ -116,6 +117,31 @@ func renderInputLine(m *Model) string {
 	}
 	body := m.input.View()
 	body = strings.TrimRight(body, "\n")
+	m.rebuildInputSelectionSurface()
+	bodyLines := strings.Split(body, "\n")
+	m.inputBodyHeight = len(bodyLines)
+	// Two cells of outer chrome plus textarea's two-cell "> " / "  "
+	// prompt. Mouse coordinates at or after this X belong to source text.
+	m.inputContentStartX = 4
+	// chatView clamps every final frame row to termW-1 cells. Keep hit-testing
+	// inside that same visible half-open range on very narrow terminals.
+	m.inputContentEndX = min(m.inputContentStartX+m.input.Width(), termW-1)
+	selectionStart, selectionEnd, hasInputSelection := m.inputSelection.Range(m.inputSurface.value)
+	for i := range bodyLines {
+		globalRow := m.inputSurface.scrollOffset + i
+		if hasInputSelection {
+			lo, hi, ok := m.inputSelectionColumns(globalRow, selectionStart, selectionEnd)
+			if !ok {
+				continue
+			}
+			// bodyLines still includes textarea's two-cell prompt; convert
+			// source-content columns to body-relative columns here. The outer
+			// two-cell chrome prefix is added below and is intentionally not
+			// selectable.
+			bodyLines[i] = tuilist.HighlightColumns(bodyLines[i], 2+lo, 2+hi)
+		}
+	}
+	body = strings.Join(bodyLines, "\n")
 
 	// dividerW leaves a 1-cell gap on the right so the total visual width
 	// is termW - 1, not termW. Many terminals (Terminal.app, iTerm2 default

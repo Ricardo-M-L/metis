@@ -648,8 +648,8 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// internal/tui/keybind_submit.go::splitOffImageBlocks; this is
 	// the tool-result twin.
 	if len(res.Images) > 0 {
-		visionOK := l.Provider != nil && pubprovider.ProviderSupportsVision(l.Provider)
-		if !visionOK {
+		visionCapability := pubprovider.ProviderVisionCapability(l.Provider)
+		if visionCapability == pubprovider.VisionUnsupported {
 			resultBody = resultBody + wrapAsSystemReminder(
 				fmt.Sprintf("%d image attachment(s) dropped — current provider doesn't support vision input. To actually see the image, switch to a vision-capable model (e.g. claude-*, gpt-4o, minimax-m*, glm-5*, kimi-k2*, deepseek-vl*).", len(res.Images)),
 			)

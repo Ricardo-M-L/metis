@@ -43,6 +43,9 @@ func renderMessagePlain(msg Message, width int, expand bool) string {
 	if msg.Role != "assistant" {
 		return renderMessage(msg, width, expand)
 	}
+	if strings.TrimSpace(msg.Content) == "" {
+		return ""
+	}
 	bodyW := width - 4
 	if bodyW < 20 {
 		bodyW = 20
@@ -64,6 +67,12 @@ func renderMessagePlain(msg Message, width int, expand bool) string {
 }
 
 func renderMessage(msg Message, width int, expand bool) string {
+	// Defensive final boundary for legacy/imported sessions and callers that
+	// bypass the streaming normalizer. Never manufacture an assistant bullet
+	// when the message contains no visible content.
+	if msg.Role == "assistant" && strings.TrimSpace(msg.Content) == "" {
+		return ""
+	}
 	var s strings.Builder
 	switch msg.Role {
 	case "user":

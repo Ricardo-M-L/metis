@@ -166,6 +166,27 @@ func TestModel_Lookup(t *testing.T) {
 	}
 }
 
+func TestLookupVisionByModelIDAggregatesDuplicateRoutesDeterministically(t *testing.T) {
+	const duplicateFixture = `{
+	  "text-route": {"models": {"shared-model": {"modalities": {"input": ["text"]}}}},
+	  "vision-route": {"models": {"shared-model": {"modalities": {"input": ["text", "image"]}}}}
+}`
+	srv := newServer(t, duplicateFixture)
+	defer srv.Close()
+	c := newClientFor(t, srv.URL)
+	if _, err := c.Get(context.Background()); err != nil {
+		t.Fatalf("warm Get: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if supported, found := c.LookupVisionByModelID("shared-model"); !found || !supported {
+			t.Fatalf("lookup %d = supported=%v found=%v, want any supporting route to win", i, supported, found)
+		}
+	}
+	if supported, found := c.LookupVisionByModelID("missing"); found || supported {
+		t.Fatalf("missing lookup = supported=%v found=%v", supported, found)
+	}
+}
+
 // TestRefresh_ForcesNetwork: even within TTL, Refresh re-fetches.
 func TestRefresh_ForcesNetwork(t *testing.T) {
 	count := 0

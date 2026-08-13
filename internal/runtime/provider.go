@@ -51,6 +51,22 @@ type ProviderBuild struct {
 	Model    string
 }
 
+// visionOverrideProvider preserves the complete Provider contract while
+// replacing only the optional vision capability decision. Custom gateways
+// frequently use private model ids that a public catalog cannot identify.
+type visionOverrideProvider struct {
+	llm.Provider
+	supportsVision bool
+}
+
+func (p visionOverrideProvider) SupportsVision() bool { return p.supportsVision }
+func (p visionOverrideProvider) VisionCapability() llm.VisionCapability {
+	if p.supportsVision {
+		return llm.VisionSupported
+	}
+	return llm.VisionUnsupported
+}
+
 // ProviderHasCredentials reports whether a configured provider has the
 // authentication material its transport actually consumes. Most transports
 // use an API key, but Vertex and Bedrock deliberately do not share that auth
@@ -291,6 +307,16 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 	if err != nil {
 		return nil, fmt.Errorf("provider %q: %w", id, err)
 	}
+	provider := res.Provider
+	if raw.SupportsVision != nil {
+		// The native Gemini request encoder does not yet serialize Metis image
+		// blocks. Refuse a misleading positive override instead of passing the
+		// TUI gate and silently dropping the attachment on the wire.
+		if *raw.SupportsVision && (transportName == "gemini_native" || transportName == "gemini") {
+			return nil, fmt.Errorf("provider %q: supports_vision=true is not available for transport %q", id, transportName)
+		}
+		provider = visionOverrideProvider{Provider: provider, supportsVision: *raw.SupportsVision}
+	}
 	Preconnect(raw.BaseURL)
-	return &ProviderBuild{Provider: res.Provider, Model: res.Model}, nil
+	return &ProviderBuild{Provider: provider, Model: res.Model}, nil
 }

@@ -229,26 +229,57 @@ type StreamReader interface {
 
 // VisionSupporter is an optional interface a Provider may implement
 // to declare whether the active model accepts `image` content blocks.
-// Callers that build user messages with image attachments should
-// type-assert against this and silently strip image blocks (or surface
-// a friendly notice) when the assertion fails or returns false.
+// New callers should prefer ProviderVisionCapability so an absent declaration
+// is not confused with an explicit negative.
 //
 // Optional rather than required so external embedders implementing
 // only the core Provider interface don't break on upgrade. A provider
-// that doesn't implement this is treated as "vision capability
-// unknown" — callers should err on the side of NOT sending images,
-// to avoid the silent API 400 (Anthropic) / cryptic "invalid request"
-// (MiniMax) that text-only models produce when handed an image block.
+// that doesn't implement this is treated as "vision capability unknown".
 type VisionSupporter interface {
 	SupportsVision() bool
 }
 
-// ProviderSupportsVision is the call-site shortcut: type-asserts the
-// optional interface and returns false when not implemented. Keeps
-// every call site from re-writing the same type-assert dance.
-func ProviderSupportsVision(p Provider) bool {
-	if v, ok := p.(VisionSupporter); ok {
-		return v.SupportsVision()
+// VisionCapability is deliberately tri-state. A missing catalog entry or an
+// external Provider that predates capability reporting is Unknown, not proof
+// that the upstream model rejects images.
+type VisionCapability uint8
+
+const (
+	VisionUnknown VisionCapability = iota
+	VisionUnsupported
+	VisionSupported
+)
+
+// VisionCapabilityReporter is the richer optional contract used by image
+// gates. VisionSupporter remains supported for third-party providers compiled
+// against the older boolean API.
+type VisionCapabilityReporter interface {
+	VisionCapability() VisionCapability
+}
+
+// ProviderVisionCapability returns the strongest capability declaration the
+// provider exposes. Legacy providers with no declaration remain Unknown;
+// callers may let the upstream API adjudicate rather than silently dropping
+// user attachments.
+func ProviderVisionCapability(p Provider) VisionCapability {
+	if p == nil {
+		return VisionUnsupported
 	}
-	return false
+	if v, ok := p.(VisionCapabilityReporter); ok {
+		return v.VisionCapability()
+	}
+	if v, ok := p.(VisionSupporter); ok {
+		if v.SupportsVision() {
+			return VisionSupported
+		}
+		return VisionUnsupported
+	}
+	return VisionUnknown
+}
+
+// ProviderSupportsVision is the backwards-compatible boolean shortcut. It is
+// true only for an explicit Supported result; image submission gates that
+// need to distinguish Unknown from Unsupported use ProviderVisionCapability.
+func ProviderSupportsVision(p Provider) bool {
+	return ProviderVisionCapability(p) == VisionSupported
 }

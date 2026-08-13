@@ -44,6 +44,37 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
+func TestProviderRawSupportsVisionIsTriState(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want *bool
+	}{
+		{name: "unset", toml: `model = "unknown"`, want: nil},
+		{name: "enabled", toml: "model = \"unknown\"\nsupports_vision = true", want: boolPtrConfig(true)},
+		{name: "disabled", toml: "model = \"gpt-4o\"\nsupports_vision = false", want: boolPtrConfig(false)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var raw ProviderRaw
+			if _, err := toml.Decode(tt.toml, &raw); err != nil {
+				t.Fatalf("toml.Decode: %v", err)
+			}
+			if tt.want == nil {
+				if raw.SupportsVision != nil {
+					t.Fatalf("SupportsVision = %v, want nil auto-detection", *raw.SupportsVision)
+				}
+				return
+			}
+			if raw.SupportsVision == nil || *raw.SupportsVision != *tt.want {
+				t.Fatalf("SupportsVision = %v, want %v", raw.SupportsVision, *tt.want)
+			}
+		})
+	}
+}
+
+func boolPtrConfig(v bool) *bool { return &v }
+
 // Regression: the security audit's three required denylist patterns must
 // be present out-of-the-box so a fresh install isn't immediately yelling.
 func TestDefaults_BashDenylistCoversAuditFloor(t *testing.T) {

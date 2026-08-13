@@ -144,28 +144,36 @@ func (a *Anthropic) ModelID() string { return a.Model }
 // SupportsVision reports whether the configured Anthropic model
 // accepts image content blocks.
 //
-// 2026-08-01 rework: catalog-first, whitelist-fallback. Same pattern
-// as OpenAI.SupportsVision — the previous prefix list covered only
-// the Claude lineage + minimax, but newer vision models surface in
-// the models.dev catalog automatically now. The catalog knows all
-// Anthropic models (claude-3, claude-4, claude-opus-4-5, etc.) so
-// in practice the catalog path always answers; the prefix list is
-// retained only as the cold-cache / offline fallback.
+// Confirmed Anthropic-family facts are checked first for deterministic
+// cold-cache behavior; models.dev fills in ids outside that set. A miss stays
+// Unknown rather than being treated as proof of text-only behavior.
 func (a *Anthropic) SupportsVision() bool {
-	return SupportsVisionModel(a.Model)
+	return a.VisionCapability() == provider.VisionSupported
+}
+
+func (a *Anthropic) VisionCapability() provider.VisionCapability {
+	return VisionCapabilityForModel(a.Model)
 }
 
 // SupportsVisionModel is the key-free capability lookup used by UI model
 // pickers before a provider client has been constructed.
 func SupportsVisionModel(model string) bool {
-	// Tier 1 — models.dev catalog.
+	return VisionCapabilityForModel(model) == provider.VisionSupported
+}
+
+func VisionCapabilityForModel(model string) provider.VisionCapability {
+	// Tier 1 — models.dev. Explicit catalog facts outrank broad family
+	// fallbacks; missing metadata continues to the offline table.
 	if cli := catalog.Default(); cli != nil {
 		if supported, found := cli.LookupVisionByModelID(model); found {
-			return supported
+			if supported {
+				return provider.VisionSupported
+			}
+			return provider.VisionUnsupported
 		}
 	}
 
-	// Tier 2 — prefix whitelist (cold-cache / offline fallback).
+	// Tier 2 — explicit provider/model facts (cold-cache safe).
 	m := strings.ToLower(strings.TrimSpace(model))
 	// Bedrock wraps Anthropic model IDs as either
 	// `anthropic.claude-*` or `<geo>.anthropic.claude-*` (for example
@@ -189,9 +197,13 @@ func SupportsVisionModel(model string) bool {
 		// MiniMax via the api.minimaxi.com/anthropic-compat layer.
 		strings.HasPrefix(m, "minimax-m"),
 		strings.HasPrefix(m, "minimax-vl"):
-		return true
+		return provider.VisionSupported
 	}
-	return false
+	if strings.HasPrefix(m, "claude-2") || strings.HasPrefix(m, "claude-instant") {
+		return provider.VisionUnsupported
+	}
+
+	return provider.VisionUnknown
 }
 
 func (a *Anthropic) MaxContextTokens() int {

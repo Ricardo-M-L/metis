@@ -17,7 +17,10 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
+	pubprov "github.com/Ricardo-M-L/metis/pkg/provider"
 )
+
+func boolPtr(v bool) *bool { return &v }
 
 func newCfgWithCustom(name string, raw config.ProviderRaw) *config.Config {
 	cfg := &config.Config{}
@@ -92,6 +95,68 @@ func TestBuildProvider_Custom_OpenAITransport(t *testing.T) {
 	}
 	if pb.Provider.Name() != "openai" {
 		t.Errorf("provider.Name() = %q, want openai", pb.Provider.Name())
+	}
+}
+
+func TestBuildProvider_CustomVisionOverride(t *testing.T) {
+	t.Setenv("FAKE_KEY", "sk-test")
+	tests := []struct {
+		name     string
+		model    string
+		override bool
+	}{
+		{name: "force unknown model on", model: "vendor-new-multimodal", override: true},
+		{name: "force known vision model off", model: "gpt-4o", override: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newCfgWithCustom("custom-provider", config.ProviderRaw{
+				Transport:      "openai_chat",
+				APIKeyEnv:      "FAKE_KEY",
+				BaseURL:        "https://api.example.invalid/v1",
+				Model:          tt.model,
+				SupportsVision: boolPtr(tt.override),
+			})
+			pb, err := BuildProvider(cfg, "custom-provider", "")
+			if err != nil {
+				t.Fatalf("BuildProvider: %v", err)
+			}
+			if got := pubprov.ProviderSupportsVision(pb.Provider); got != tt.override {
+				t.Fatalf("ProviderSupportsVision(%q) = %v, want override %v", tt.model, got, tt.override)
+			}
+		})
+	}
+}
+
+func TestBuildProvider_SenseNovaFlashLiteIsVisionCapable(t *testing.T) {
+	t.Setenv("FAKE_KEY", "sk-test")
+	cfg := newCfgWithCustom("sensenova", config.ProviderRaw{
+		Transport: "openai_chat",
+		APIKeyEnv: "FAKE_KEY",
+		BaseURL:   "https://token.sensenova.cn/v1",
+		Model:     "sensenova-6.8-flash-lite",
+	})
+	pb, err := BuildProvider(cfg, "sensenova", "")
+	if err != nil {
+		t.Fatalf("BuildProvider: %v", err)
+	}
+	if got := pubprov.ProviderVisionCapability(pb.Provider); got != pubprov.VisionSupported {
+		t.Fatalf("SenseNova capability = %v, want VisionSupported", got)
+	}
+}
+
+func TestBuildProvider_CustomGeminiRejectsPositiveVisionOverride(t *testing.T) {
+	t.Setenv("FAKE_KEY", "sk-test")
+	cfg := newCfgWithCustom("custom-provider", config.ProviderRaw{
+		Transport:      "gemini_native",
+		APIKeyEnv:      "FAKE_KEY",
+		BaseURL:        "https://generativelanguage.googleapis.com",
+		Model:          "gemini-2.5-pro",
+		SupportsVision: boolPtr(true),
+	})
+	_, err := BuildProvider(cfg, "custom-provider", "")
+	if err == nil || !strings.Contains(err.Error(), "supports_vision=true") {
+		t.Fatalf("positive Gemini override should fail clearly until its encoder supports images, got %v", err)
 	}
 }
 
