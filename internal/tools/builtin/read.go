@@ -118,10 +118,19 @@ func (r Read) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 // drifted. Verbatim from claude-code's FILE_UNCHANGED_STUB
 // (tools/FileReadTool/prompt.ts) — keeping the wording identical so
 // model behaviour matches the upstream prompt's well-trained
-// expectations.
+// expectations — plus one metis-specific escape hatch sentence:
+// after context compaction the "earlier Read tool_result" the stub
+// points at may no longer exist, and export 2026-08-15-150806 shows
+// the model looping 16x on an identical block ("你说得对，这个数据
+// **有问题**" → Write → Read → unchanged → repeat) with no way out.
+// Read only short-circuits on the default (offset=1, limit=2000), so
+// a non-default slice read is the documented way to force content.
 const fileUnchangedStub = "File unchanged since last read. The " +
 	"content from the earlier Read tool_result in this conversation " +
-	"is still current — refer to that instead of re-reading."
+	"is still current — refer to that instead of re-reading. " +
+	"If that earlier result is no longer visible in context (e.g. " +
+	"after compaction), force the content by re-reading a slice with " +
+	"non-default offset/limit (e.g. limit: 500)."
 
 // MaxReadFileSize caps the total bytes Read will load into memory
 // before returning. claude-code uses 1 GiB; we pick 256 MiB because
