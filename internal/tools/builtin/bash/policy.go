@@ -33,10 +33,12 @@ func applyBashPolicy(cmd string, p config.SandboxBashSettings) error {
 			continue
 		}
 		if d == cmdName {
-			return errors.New("blocked by sandbox.bash.deny: " + d)
+			// "[blocked] " prefix keeps sandbox refusals on the same
+			// compact status-row path as the safety classifier.
+			return errors.New("[blocked] command denied by sandbox.bash.deny: " + d)
 		}
 		if strings.Contains(cmd, d) {
-			return errors.New("blocked by sandbox.bash.deny pattern: " + d)
+			return errors.New("[blocked] command matches sandbox.bash.deny pattern: " + d)
 		}
 	}
 
@@ -52,7 +54,7 @@ func applyBashPolicy(cmd string, p config.SandboxBashSettings) error {
 			}
 		}
 		if !matched {
-			return errors.New("not in sandbox.bash.allow: " + cmdName)
+			return errors.New("[blocked] command not in sandbox.bash.allow: " + cmdName)
 		}
 	}
 	return nil

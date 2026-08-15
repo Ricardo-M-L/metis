@@ -392,7 +392,9 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 
 	for _, deny := range b.settings.Denylist {
 		if strings.Contains(cmd, deny) {
-			return nil, errors.New("command matches denylist: " + deny)
+			// Policy refusal: "[blocked] " prefix routes it to the
+			// compact status-row rendering like the other refusals.
+			return &tools.Result{Output: "[blocked] command matches denylist: " + deny, IsError: true}, nil
 		}
 	}
 
