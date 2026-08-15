@@ -5,6 +5,17 @@ All notable changes to Metis are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **bash tool default shell is now bash, not `$SHELL`**: running commands
+  through the user's interactive zsh aborted whole commands with
+  "zsh: no matches found" whenever a glob matched nothing (zsh NOMATCH);
+  bash passes the unmatched pattern through literally. DeepSeek Harness
+  hardcodes `/bin/bash` for the same reason. Systems without bash fall
+  back to the login shell; `[tools.bash] shell = "..."` still overrides.
+
 ## [0.4.24] - 2026-08-15
 
 ### Added
