@@ -758,11 +758,11 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 	// becomes "0ms" — same column-shape as the rest.
 	dur := formatElapsed(te.Duration)
 	// Permission denials get the compact status treatment (claude-code
-	// parity): renderToolEvent's row reads "⛔ Denied" with the full
-	// reason in the body below; this branch keeps the /session summary
-	// view consistent. No elapsed time — a permission refusal is not a
-	// timed operation, and "0ms · denied" only added noise (user
-	// feedback 2026-08-15: "✗ 2ms · denied" 很丑).
+	// parity): renderToolEvent's row reads icon-less "Denied" with the
+	// full reason in the body below; this branch keeps the /session
+	// summary view consistent. No elapsed time — a permission refusal
+	// is not a timed operation, and "0ms · denied" only added noise
+	// (user feedback 2026-08-15: "✗ 2ms · denied" 很丑).
 	if te.IsError && isDeniedToolResult(te.Output) {
 		return "denied"
 	}
