@@ -56,7 +56,7 @@ func classifyREPLOutput(out string) string {
 
 	// success markers — "X: did the thing" lines.
 	successKeywords := []string{
-		"set to ", "saved", "added: ", "removed: ", "synced", "renamed",
+		"set to ", "set to:", "saved", "added: ", "removed: ", "synced", "renamed",
 		"tagged: ", "switched", "applied", "exported", "branched",
 		"(allowed)", "(yes)", "title set",
 	}
@@ -70,7 +70,7 @@ func classifyREPLOutput(out string) string {
 	// cmdModel / cmdVim / cmdQuick confirmation strings like
 	// "effort: high — small budget".
 	settingPrefixes := []string{
-		"effort: ", "theme: ", "model: ", "vim mode: ", "quick output",
+		"effort: ", "theme: ", "model: ", "provider: ", "vim mode: ", "quick output",
 	}
 	for _, p := range settingPrefixes {
 		if strings.HasPrefix(low, p) {

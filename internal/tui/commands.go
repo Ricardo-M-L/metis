@@ -146,7 +146,8 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "clear-history", Aliases: []string{"cls"}, Description: "clear conversation history without creating a new session", Category: "session", Handler: cmdClear})
 
 	// === Model ===
-	r.Register(REPLCommand{Name: "model", Aliases: []string{"m"}, Description: "show or switch model (e.g. model claude-opus-4-7)", Handler: cmdModel})
+	r.Register(REPLCommand{Name: "model", Aliases: []string{"m", "models"}, Description: "switch provider/model (OpenCode-style picker)", ArgumentHint: "[provider/model|model]", Category: "model", Handler: cmdModel})
+	r.Register(REPLCommand{Name: "provider", Aliases: []string{"providers"}, Description: "show or switch configured API provider", ArgumentHint: "[provider[/model]]", Category: "model", Handler: cmdProvider})
 	r.Register(REPLCommand{Name: "effort", Description: "set reasoning effort: low | medium | high | off", Handler: cmdEffort})
 	r.Register(REPLCommand{Name: "quick", Description: "quick output: effort=low with max_tokens halved", ArgumentHint: "[on|off|toggle]", Category: "model", Handler: cmdQuick})
 	r.Register(REPLCommand{Name: "theme", Description: "switch color theme: dark | light | dark-daltonized", Handler: cmdTheme})
@@ -340,6 +341,58 @@ func cmdModel(r *REPL, args string) string {
 	return out
 }
 
+func cmdProvider(r *REPL, args string) string {
+	if r == nil {
+		return "provider: runtime unavailable"
+	}
+	args = strings.TrimSpace(args)
+	if args == "" {
+		providerName := r.providerName
+		if providerName == "" && r.cfg != nil {
+			providerName = r.cfg.Provider.Default
+		}
+		if providerName == "" {
+			return "provider: not configured"
+		}
+		return "provider: " + providerName + "  ·  model: " + r.model
+	}
+	if r.cfg == nil {
+		return "provider switch failed; provider configuration unavailable"
+	}
+
+	providerName, model := splitConfiguredProviderModel(r.cfg, args)
+	ok := providerName != ""
+	if !ok {
+		if rawProvider, rawModel, qualified := strings.Cut(args, "/"); qualified {
+			providerName, _, ok = configuredProviderModel(r.cfg, rawProvider)
+			if ok && strings.TrimSpace(rawModel) != "" {
+				model = strings.TrimSpace(rawModel)
+			} else {
+				ok = false
+			}
+		} else {
+			providerName, model, ok = configuredProviderModel(r.cfg, args)
+		}
+	}
+	if !ok {
+		known := configuredProviderNames(r.cfg)
+		hint := ""
+		if len(known) > 0 {
+			hint = " Known profiles: " + strings.Join(known, ", ")
+		}
+		return fmt.Sprintf("provider switch failed; provider %q is not configured.%s", args, hint)
+	}
+
+	previous := r.providerName
+	if previous == "" {
+		previous = r.cfg.Provider.Default
+	}
+	if err := switchREPLModel(r, providerName+"/"+model); err != nil {
+		return "provider switch failed; previous provider remains active: " + previous + "\n(" + err.Error() + ")"
+	}
+	return "provider set to: " + r.providerName + "  ·  model: " + r.model
+}
+
 // switchREPLModel runs the same Provider rebuild Model.switchModel does,
 // but from the REPL-side surface where we have r.Loop / r.cfg /
 // r.providerName instead of *Model. Same semantics: rebuild Provider,
@@ -390,12 +443,22 @@ func switchREPLModel(r *REPL, newModel string) error {
 		// over the old provider with misleading UI state.
 		return fmt.Errorf("BuildProvider(%s, %s): %w", newProvName, newModel, err)
 	}
+	newSystem, newSections := runtime.RebindProviderPrompt(
+		r.Loop.System, r.Loop.SystemSections, newProvName, pb.Model,
+	)
+	newBaseSystem, newBaseSections := runtime.RebindProviderPrompt(
+		r.baseSystem, r.baseSystemSections, newProvName, pb.Model,
+	)
 	r.Loop.Provider = pb.Provider
 	r.Loop.Model = pb.Model
 	r.Loop.ContextWindow = pb.Provider.MaxContextTokens()
+	r.Loop.System = newSystem
+	r.Loop.SystemSections = newSections
 	r.model = pb.Model
 	r.providerName = newProvName
-	runtime.RebindLoopRuntime(r.Loop, pb.Provider, pb.Model, r.Loop.System, r.SessionID)
+	r.baseSystem = newBaseSystem
+	r.baseSystemSections = newBaseSections
+	runtime.RebindLoopRuntime(r.Loop, pb.Provider, pb.Model, newSystem, r.SessionID)
 	getModelState().AddRecent(pb.Model)
 	if r.Loop.Compactor != nil {
 		oldCfg := r.Loop.Compactor.Config

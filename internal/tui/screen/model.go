@@ -37,6 +37,8 @@ type ModelScreen struct {
 	filtered        []int         // indexes into choices after filter
 	current         string        // existing model — highlighted as starting cursor
 	currentProvider string        // active profile; disambiguates duplicate model IDs
+	providerOnly    bool          // seed cursor by provider even when model is an override
+	command         string        // header label; defaults to /model
 	title           string        // optional purpose-specific title
 	cursor          int           // index into filtered
 	filter          string        // current search text
@@ -52,10 +54,33 @@ type ModelScreen struct {
 // model (used to seed the cursor on the matching entry). If no choice
 // matches `current`, the cursor starts at 0.
 func NewModelScreen(current string, choices []ModelChoice) *ModelScreen {
-	s := &ModelScreen{choices: choices, current: current, title: "Pick a model"}
+	s := &ModelScreen{choices: choices, current: current, command: "/model", title: "Pick a model"}
 	s.refilter()
 	s.seedCurrentCursor()
 	return s
+}
+
+// SetCommand customizes the header label when the same provider-aware picker
+// is reused by another command such as /provider.
+func (s *ModelScreen) SetCommand(command string) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return
+	}
+	if !strings.HasPrefix(command, "/") {
+		command = "/" + command
+	}
+	s.command = command
+}
+
+// Command reports the slash-command surface that opened this picker. The TUI
+// uses it to keep apply/cancel feedback accurate when ModelScreen is reused by
+// /provider.
+func (s *ModelScreen) Command() string {
+	if s.command == "" {
+		return "/model"
+	}
+	return s.command
 }
 
 // Applied returns the chosen model ID, or empty if the user cancelled.
@@ -80,10 +105,28 @@ func (s *ModelScreen) SetTitle(title string) {
 // provider, not select whichever built-in entry happened to sort first.
 func (s *ModelScreen) SetCurrentProvider(provider string) {
 	s.currentProvider = provider
+	s.providerOnly = false
+	s.seedCurrentCursor()
+}
+
+// SetCurrentProviderOnly seeds the cursor using provider identity alone. The
+// /provider picker uses this when the live model may be an override that does
+// not equal the profile's configured default.
+func (s *ModelScreen) SetCurrentProviderOnly(provider string) {
+	s.currentProvider = provider
+	s.providerOnly = true
 	s.seedCurrentCursor()
 }
 
 func (s *ModelScreen) seedCurrentCursor() {
+	if s.providerOnly && s.currentProvider != "" {
+		for i, idx := range s.filtered {
+			if strings.EqualFold(s.choices[idx].Provider, s.currentProvider) {
+				s.cursor = i
+				return
+			}
+		}
+	}
 	fallback := -1
 	for i, idx := range s.filtered {
 		choice := s.choices[idx]
@@ -276,7 +319,7 @@ func (s *ModelScreen) View() string {
 	var out strings.Builder
 
 	// Header stripe.
-	out.WriteString(infoHeaderStripe.Render("/model"))
+	out.WriteString(infoHeaderStripe.Render(s.command))
 	out.WriteString("\n\n")
 
 	// Sub-header showing current model + filter.

@@ -485,11 +485,16 @@ func TestBash_Denylist(t *testing.T) {
 		Shell:          "/bin/sh",
 		Denylist:       []string{"FORBIDDEN_TOKEN"},
 	})
-	_, err := b.Execute(context.Background(), map[string]any{
+	// Denylist refusals follow the same Result contract as the safety
+	// classifier: nil error + IsError result prefixed "[blocked]".
+	res, err := b.Execute(context.Background(), map[string]any{
 		"command": "echo FORBIDDEN_TOKEN here",
 	})
-	if err == nil {
-		t.Fatal("expected denylist rejection")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || !res.IsError || !strings.Contains(res.Output, "[blocked]") {
+		t.Fatalf("expected denylist rejection result, got: %+v", res)
 	}
 }
 

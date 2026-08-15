@@ -339,6 +339,27 @@ func TestTurnActiveModelSwitchIsRefusedWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestTurnActiveProviderSwitchIsRefusedWithoutMutation(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	oldModel := m.model
+	oldLoopModel := m.loop.Model
+	oldProvider := m.loop.Provider
+	m.input.SetValue("/provider alternate")
+
+	pressEnter(t, m)
+
+	if m.model != oldModel || m.loop.Model != oldLoopModel || m.loop.Provider != oldProvider {
+		t.Fatalf("mid-turn /provider mutated live runtime: model=%q loop=%q provider=%T", m.model, m.loop.Model, m.loop.Provider)
+	}
+	if got := m.input.Value(); got != "/provider alternate" {
+		t.Fatalf("refused explicit /provider choice was not preserved: %q", got)
+	}
+	if last := m.messages[len(m.messages)-1].Content; !strings.Contains(last, "can't /provider") || !strings.Contains(last, "running turn") {
+		t.Fatalf("mid-turn /provider refusal = %q", last)
+	}
+}
+
 func TestTurnActivePlanIsRefusedWithoutModeHistoryOrDraftMutation(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.turnActive = true

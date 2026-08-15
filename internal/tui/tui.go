@@ -205,7 +205,8 @@ type Model struct {
 	// settings, Channels for SendMessage routing, etc.). Storing the
 	// whole Config keeps Model self-sufficient — feature additions
 	// don't need to thread new params through NewModel each time.
-	cfg *config.Config
+	cfg                  *config.Config
+	providerConfigLoader func() (*config.Config, error)
 
 	messages   []Message
 	toolEvents []ToolEvent
@@ -810,12 +811,13 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		baseSystem: loop.System,
 		baseSystemSections: append([]llm.SystemSection(nil),
 			loop.SystemSections...),
-		model:        model,
-		providerName: providerName,
-		skillDir:     skillDir,
-		cfg:          cfg,
-		cmds:         BuildREPLCommands(),
-		startTime:    time.Now(),
+		model:                model,
+		providerName:         providerName,
+		skillDir:             skillDir,
+		cfg:                  cfg,
+		providerConfigLoader: defaultProviderConfigLoader,
+		cmds:                 BuildREPLCommands(),
+		startTime:            time.Now(),
 		// Default terminal size so the FIRST frame paints a real banner
 		// instead of a blank screen. bubbletea delivers WindowSizeMsg
 		// asynchronously — the first View() runs before it arrives, and

@@ -74,15 +74,25 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 		return fmt.Errorf("model switch: BuildProvider(%s, %s): %w",
 			provName, newModel, err)
 	}
+	newSystem, newSections := rtpkg.RebindProviderPrompt(
+		m.loop.System, m.loop.SystemSections, provName, pb.Model,
+	)
+	newBaseSystem, newBaseSections := rtpkg.RebindProviderPrompt(
+		m.baseSystem, m.baseSystemSections, provName, pb.Model,
+	)
 
 	// Swap in the new Provider. From this point on the loop's next
 	// request uses the new transport + auth + window.
 	m.loop.Provider = pb.Provider
 	m.loop.Model = pb.Model
 	m.loop.ContextWindow = pb.Provider.MaxContextTokens()
+	m.loop.System = newSystem
+	m.loop.SystemSections = newSections
 	m.model = pb.Model
 	m.providerName = provName
-	rtpkg.RebindLoopRuntime(m.loop, pb.Provider, pb.Model, m.loop.System, m.sessionID)
+	m.baseSystem = newBaseSystem
+	m.baseSystemSections = newBaseSections
+	rtpkg.RebindLoopRuntime(m.loop, pb.Provider, pb.Model, newSystem, m.sessionID)
 
 	// Rebuild Compactor so ShouldCompact / threshold math uses the
 	// new provider's MaxContextTokens. Preserve the existing Config

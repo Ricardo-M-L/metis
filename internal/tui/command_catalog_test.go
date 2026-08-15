@@ -286,6 +286,29 @@ func TestToolsetsAliasesCanonicalToolsPicker(t *testing.T) {
 	}
 }
 
+func TestProviderCommandsAreDiscoverableWithOpenCodeModelsAlias(t *testing.T) {
+	m := newSlashTestModel(t)
+	if cmd := m.cmds.Resolve("models"); cmd == nil || cmd.Name != "model" {
+		t.Fatalf("/models alias = %+v, want canonical /model", cmd)
+	}
+	if cmd := m.cmds.Resolve("providers"); cmd == nil || cmd.Name != "provider" {
+		t.Fatalf("/providers alias = %+v, want canonical /provider", cmd)
+	}
+
+	m.palFilter = "pro"
+	m.matchCommands()
+	found := false
+	for _, entry := range m.palMatched {
+		if entry.Name == "provider" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("/pro palette search did not discover /provider: %+v", m.palMatched)
+	}
+}
+
 // Claude Code exposes submit as the Enter-bound `chat:submit` action, not as a
 // slash command. Keep it out of both Metis command registries so the palette
 // does not advertise a command with no meaningful slash semantics.

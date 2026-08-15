@@ -72,6 +72,21 @@ func TestModelScreen_CurrentProviderDisambiguatesDuplicateID(t *testing.T) {
 	}
 }
 
+func TestModelScreen_ProviderOnlySeedIgnoresModelOverride(t *testing.T) {
+	choices := []ModelChoice{
+		{ID: "ark-default", Provider: "ark"},
+		{ID: "kimi-default", Provider: "kimi"},
+	}
+	s := NewModelScreen("kimi-runtime-override", choices)
+	s.SetCurrentProviderOnly("kimi")
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	choice, ok := s.AppliedChoice()
+	if !ok || choice.Provider != "kimi" {
+		t.Fatalf("provider-only seed selected %+v, want active kimi", choice)
+	}
+}
+
 func TestModelScreen_HeightBoundsAndFollowsCursor(t *testing.T) {
 	choices := make([]ModelChoice, 20)
 	for i := range choices {
@@ -136,6 +151,18 @@ func TestModelScreen_CustomTitle(t *testing.T) {
 	out := stripANSIEffort(s.View())
 	if !strings.Contains(out, "Choose a vision model") {
 		t.Fatalf("custom title missing:\n%s", out)
+	}
+}
+
+func TestModelScreen_CustomCommandHeader(t *testing.T) {
+	s := NewModelScreen("", sampleChoices())
+	s.SetCommand("provider")
+	out := stripANSIEffort(s.View())
+	if !strings.Contains(out, "/provider") || strings.Contains(out, "/model") {
+		t.Fatalf("custom command header missing or stale:\n%s", out)
+	}
+	if got := s.Command(); got != "/provider" {
+		t.Fatalf("Command() = %q, want /provider", got)
 	}
 }
 

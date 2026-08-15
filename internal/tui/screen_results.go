@@ -66,6 +66,7 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		})
 
 	case *screen.ModelScreen:
+		providerPicker := w.Command() == "/provider"
 		imageRecovery := m.imageRecoveryPending
 		recoveryImageCount := m.imageRecoveryImageCount
 		m.imageRecoveryPending = false
@@ -73,7 +74,9 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		choice, selected := w.AppliedChoice()
 		if !selected || choice.ID == "" {
 			content := "(model dialog dismissed)"
-			if imageRecovery {
+			if providerPicker {
+				content = "(provider dialog dismissed)"
+			} else if imageRecovery {
 				content = "(vision model selection cancelled — prompt and attachments kept)"
 			}
 			m.messages = append(m.messages, Message{
@@ -89,7 +92,9 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		switchErr := m.switchModel(choice.ID, choice.Provider)
 		if switchErr != nil {
 			content := "model switch failed; previous model remains active: " + switchErr.Error()
-			if imageRecovery {
+			if providerPicker {
+				content = "provider switch failed; previous provider remains active: " + switchErr.Error()
+			} else if imageRecovery {
 				content += " · prompt and attachments kept"
 			}
 			m.messages = append(m.messages, Message{
@@ -99,7 +104,9 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			})
 		} else {
 			content := "model: " + m.model + "  ·  provider: " + m.providerName
-			if imageRecovery {
+			if providerPicker {
+				content = "provider: " + m.providerName + "  ·  model: " + m.model
+			} else if imageRecovery {
 				content += fmt.Sprintf(" · prompt and %d image(s) kept — press Enter to send", recoveryImageCount)
 			}
 			m.messages = append(m.messages, Message{

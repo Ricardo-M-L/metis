@@ -6,7 +6,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -44,6 +47,146 @@ func TestModelWidget_AliasOpensPicker(t *testing.T) {
 	pressEnter(t, m)
 	if _, ok := m.activeScreen.(*screen.ModelScreen); !ok {
 		t.Errorf("/m alias should open ModelScreen; got %T", m.activeScreen)
+	}
+}
+
+func TestModelWidget_OpenCodeModelsAliasOpensPicker(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.input.SetValue("/models")
+	pressEnter(t, m)
+
+	if _, ok := m.activeScreen.(*screen.ModelScreen); !ok {
+		t.Fatalf("/models alias should open ModelScreen; got %T", m.activeScreen)
+	}
+	if view := m.activeScreen.View(); !strings.Contains(view, "/model") || !strings.Contains(view, "Pick a model") {
+		t.Fatalf("/models did not open the unified provider/model picker:\n%s", view)
+	}
+}
+
+func TestProviderWidget_BareSlashShowsCredentialReadyProfiles(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-code-latest",
+		},
+		"kimi": {
+			Transport: "openai_chat", APIKey: "kimi-test", BaseURL: "http://127.0.0.1:1", Model: "kimi-k3",
+		},
+		"missing-key": {
+			Transport: "openai_chat", BaseURL: "http://127.0.0.1:1", Model: "unusable-model",
+		},
+	}
+	m.providerName = "ark"
+	m.model = "ark-code-latest"
+	m.loop.Model = "ark-code-latest"
+	m.input.SetValue("/provider")
+	pressEnter(t, m)
+
+	if _, ok := m.activeScreen.(*screen.ModelScreen); !ok {
+		t.Fatalf("/provider should open provider picker; got %T", m.activeScreen)
+	}
+	view := m.activeScreen.View()
+	for _, want := range []string{"/provider", "Switch provider", "ark-code-latest", "kimi-k3", "ark", "kimi"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("provider picker missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "unusable-model") || strings.Contains(view, "missing-key") {
+		t.Fatalf("provider picker advertised a profile without credentials:\n%s", view)
+	}
+}
+
+func TestProviderWidget_PluralAliasOpensPicker(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-code-latest",
+		},
+	}
+	m.providerName = "ark"
+	m.model = "ark-code-latest"
+	m.input.SetValue("/providers")
+	pressEnter(t, m)
+
+	if _, ok := m.activeScreen.(*screen.ModelScreen); !ok {
+		t.Fatalf("/providers alias should open provider picker; got %T", m.activeScreen)
+	}
+	if view := m.activeScreen.View(); !strings.Contains(view, "only 1 ready") || !strings.Contains(view, "/login") {
+		t.Fatalf("single-provider picker should explain how to add failover:\n%s", view)
+	}
+}
+
+func TestProviderWidget_CancelUsesProviderFeedback(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-code-latest",
+		},
+	}
+	m.providerName = "ark"
+	m.model = "ark-code-latest"
+	m.input.SetValue("/provider")
+	pressEnter(t, m)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "info" || last.Content != "(provider dialog dismissed)" {
+		t.Fatalf("provider cancel feedback = %+v", last)
+	}
+}
+
+func TestProviderWidget_OverrideSeedsActiveProvider(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-default",
+		},
+		"kimi": {
+			Transport: "openai_chat", APIKey: "kimi-test", BaseURL: "http://127.0.0.1:1", Model: "kimi-default",
+		},
+	}
+	m.providerName = "kimi"
+	m.model = "kimi-runtime-override"
+	m.loop.Model = m.model
+	m.input.SetValue("/provider")
+	pressEnter(t, m)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	if m.providerName != "kimi" || m.model != "kimi-default" {
+		t.Fatalf("provider picker lost active profile: provider=%q model=%q", m.providerName, m.model)
+	}
+}
+
+func TestProviderWidget_ReloadsProfilesAddedAfterStartup(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-default",
+		},
+	}
+	m.providerName = "ark"
+	m.model = "ark-default"
+	for _, spec := range []config.CustomProviderSpec{
+		{ID: "ark", Transport: "openai_chat", BaseURL: "http://127.0.0.1:1", Model: "ark-default"},
+		{ID: "kimi", Transport: "openai_chat", BaseURL: "http://127.0.0.1:1", Model: "kimi-default"},
+	} {
+		if err := config.SaveUserCustomProvider(spec); err != nil {
+			t.Fatalf("save test profile %s: %v", spec.ID, err)
+		}
+		if err := auth.Set(spec.ID, spec.ID+"-test-key"); err != nil {
+			t.Fatalf("save test credential %s: %v", spec.ID, err)
+		}
+	}
+	m.providerConfigLoader = defaultProviderConfigLoader
+	m.input.SetValue("/provider")
+	pressEnter(t, m)
+
+	if _, ok := m.cfg.Provider.Custom["kimi"]; !ok {
+		t.Fatal("fresh provider profile was not merged into the live config")
+	}
+	if view := m.activeScreen.View(); !strings.Contains(view, "kimi-default") {
+		t.Fatalf("fresh provider missing from picker:\n%s", view)
 	}
 }
 
@@ -140,6 +283,95 @@ func TestModelCommand_ProviderQualifiedModel(t *testing.T) {
 
 	if m.providerName != "kimi" || m.model != "kimi-k3" {
 		t.Fatalf("provider-qualified switch failed: profile=%q model=%q", m.providerName, m.model)
+	}
+}
+
+func TestProviderCommand_SwitchesConfiguredProfileAndDefaultModel(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-code-latest",
+		},
+		"kimi": {
+			Transport: "openai_chat", APIKey: "kimi-test", BaseURL: "http://127.0.0.1:1", Model: "kimi-k3",
+		},
+	}
+	m.providerName = "ark"
+	m.model = "ark-code-latest"
+	m.loop.Model = "ark-code-latest"
+	m.input.SetValue("/provider KIMI")
+	pressEnter(t, m)
+
+	if m.providerName != "kimi" || m.model != "kimi-k3" || m.loop.Model != "kimi-k3" {
+		t.Fatalf("provider switch did not rebind default model: provider=%q model=%q loop=%q", m.providerName, m.model, m.loop.Model)
+	}
+	if last := m.messages[len(m.messages)-1]; last.Role != "success" || !strings.Contains(last.Content, "provider set to: kimi") {
+		t.Fatalf("provider switch result = %+v", last)
+	}
+}
+
+func TestProviderCommand_RefreshesProviderPromptAndBaseSnapshot(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Default = "anthropic"
+	m.cfg.Provider.Anthropic = config.ProviderAnthropic{
+		APIKey: "anthropic-test", Model: "claude-sonnet-4-6", BaseURL: "http://127.0.0.1:1",
+	}
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"kimi": {
+			Transport: "openai_chat", APIKey: "kimi-test", BaseURL: "http://127.0.0.1:1", Model: "kimi-k3",
+		},
+	}
+	m.providerName = "anthropic"
+	m.model = "claude-sonnet-4-6"
+	m.loop.Model = m.model
+	oldHint := rtpkg.ProviderHintFor(m.providerName, m.model)
+	sections := []llm.SystemSection{
+		{Name: "identity", Body: "identity", Cache: true},
+		{Name: "provider_hint", Body: oldHint, Cache: true},
+		{Name: "env", Body: "env", Volatile: true},
+	}
+	m.loop.System = "identity\n\n" + oldHint + "\n\nenv"
+	m.loop.SystemSections = append([]llm.SystemSection(nil), sections...)
+	m.baseSystem = m.loop.System
+	m.baseSystemSections = append([]llm.SystemSection(nil), sections...)
+	m.input.SetValue("/provider kimi")
+	pressEnter(t, m)
+
+	newHint := rtpkg.ProviderHintFor("kimi", "kimi-k3")
+	for label, got := range map[string][]llm.SystemSection{
+		"loop": m.loop.SystemSections, "base": m.baseSystemSections,
+	} {
+		if len(got) != 3 || got[1].Name != "provider_hint" || got[1].Body != newHint {
+			t.Fatalf("%s provider hint not refreshed: %+v", label, got)
+		}
+	}
+	if strings.Contains(m.loop.System, oldHint) || !strings.Contains(m.loop.System, newHint) {
+		t.Fatalf("loop system retained stale provider guidance:\n%s", m.loop.System)
+	}
+	if strings.Contains(m.baseSystem, oldHint) || !strings.Contains(m.baseSystem, newHint) {
+		t.Fatalf("base system retained stale provider guidance:\n%s", m.baseSystem)
+	}
+}
+
+func TestProviderCommand_UnknownProfileIsAtomic(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-code-latest",
+		},
+	}
+	m.providerName = "ark"
+	m.model = "ark-code-latest"
+	m.loop.Model = "ark-code-latest"
+	oldProvider := m.loop.Provider
+	m.input.SetValue("/provider nonexistent")
+	pressEnter(t, m)
+
+	if m.providerName != "ark" || m.model != "ark-code-latest" || m.loop.Model != "ark-code-latest" || m.loop.Provider != oldProvider {
+		t.Fatalf("unknown provider changed live runtime: provider=%q model=%q loop=%q", m.providerName, m.model, m.loop.Model)
+	}
+	if last := m.messages[len(m.messages)-1].Content; !strings.Contains(last, "not configured") || !strings.Contains(last, "ark") {
+		t.Fatalf("unknown provider error lacks known-profile hint: %q", last)
 	}
 }
 

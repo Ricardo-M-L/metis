@@ -161,7 +161,7 @@ func (m *Model) isModelCommand(text string) bool {
 	}
 	name, _, _ := cut(text[1:], " ")
 	cmd := m.cmds.Resolve(name)
-	return cmd != nil && cmd.Name == "model"
+	return cmd != nil && (cmd.Name == "model" || cmd.Name == "provider")
 }
 
 func (m *Model) refuseModelSwitch(text, blocker string) {
@@ -177,9 +177,11 @@ func (m *Model) refuseModelSwitch(text, blocker string) {
 			name, blocker),
 		Timestamp: time.Now(),
 	})
-	// Keep an explicit model choice in the editor so the user can submit it at
-	// the safe boundary. A bare picker invocation has no choice to preserve.
-	if strings.TrimSpace(text) == "/model" || strings.TrimSpace(text) == "/m" {
+	// Keep an explicit provider/model choice in the editor so the user can
+	// submit it at the safe boundary. A bare picker invocation has no choice
+	// to preserve, including aliases such as /models and /providers.
+	_, args, _ := cut(strings.TrimPrefix(strings.TrimSpace(text), "/"), " ")
+	if strings.TrimSpace(args) == "" {
 		m.input.Reset()
 	} else {
 		m.input.SetValue(text)
@@ -559,7 +561,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	if strings.HasPrefix(text, "/") {
 		cmdText := text[1:]
 		name, args, _ := cut(cmdText, " ")
-		if (name == "model" || name == "m") && m.rewindSummaryPending {
+		if m.isModelCommand(text) && m.rewindSummaryPending {
 			m.refuseModelSwitch(text, "the rewind summary")
 			return m, nil
 		}
@@ -584,12 +586,28 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Phase C3: bare `/model` (alias `/m`) opens the picker widget.
-		// Explicit `/model claude-opus-4-7` falls through to cmdModel
-		// for scripted usage / palette autocomplete.
-		if (name == "model" || name == "m") && strings.TrimSpace(args) == "" {
-			m.openModelPicker(false, 0)
-			return m, nil
+		// Bare /model (/models) and /provider (/providers) open provider-aware
+		// pickers. Explicit arguments stay on the REPL path for scripting.
+		if cmd := m.cmds.Resolve(name); cmd != nil && strings.TrimSpace(args) == "" {
+			switch cmd.Name {
+			case "model":
+				m.openModelPicker(false, 0)
+				return m, nil
+			case "provider":
+				opened, err := m.openProviderPicker()
+				if err != nil {
+					m.messages = append(m.messages, Message{
+						Role: "warning", Content: "provider: could not reload configuration; current profiles kept: " + err.Error(),
+						Timestamp: time.Now(),
+					})
+				} else if !opened {
+					m.messages = append(m.messages, Message{
+						Role: "info", Content: "provider: no configured provider with usable credentials · add one with /login",
+						Timestamp: time.Now(),
+					})
+				}
+				return m, nil
+			}
 		}
 
 		// Phase C4: bare `/theme` opens the cycle widget with live
@@ -699,9 +717,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// bridge and the shared Loop, so copy the successful labels back to
 			// the TUI chrome as well. On rebuild failure the REPL helper is
 			// atomic and these values remain unchanged.
-			if cmd.Name == "model" {
+			if cmd.Name == "model" || cmd.Name == "provider" {
 				m.model = repl.model
 				m.providerName = repl.providerName
+				m.baseSystem = repl.baseSystem
+				m.baseSystemSections = append([]llm.SystemSection(nil), repl.baseSystemSections...)
 			}
 			// Sync m.sessionTitle from disk after REPL commands that
 			// mutate the session header. cmdRename (registered in

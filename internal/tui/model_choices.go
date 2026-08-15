@@ -85,6 +85,32 @@ func configuredModelChoices(cfg *config.Config) []screen.ModelChoice {
 	return out
 }
 
+// configuredProviderModel resolves a provider spelling to the canonical
+// configured profile and its default model. Provider IDs are matched
+// case-insensitively for terminal ergonomics, while the returned name keeps
+// the exact config key required by runtime.BuildProvider.
+func configuredProviderModel(cfg *config.Config, name string) (providerName, model string, ok bool) {
+	name = strings.TrimSpace(name)
+	if strings.EqualFold(name, "google") {
+		name = "gemini"
+	}
+	for _, choice := range configuredModelChoices(cfg) {
+		if strings.EqualFold(choice.Provider, name) {
+			return choice.Provider, choice.ID, true
+		}
+	}
+	return "", "", false
+}
+
+func configuredProviderNames(cfg *config.Config) []string {
+	choices := configuredModelChoices(cfg)
+	out := make([]string, 0, len(choices))
+	for _, choice := range choices {
+		out = append(out, choice.Provider)
+	}
+	return out
+}
+
 func modelChoiceKey(c screen.ModelChoice) string {
 	return strings.ToLower(c.Provider) + "\x00" + strings.ToLower(c.ID)
 }
@@ -182,6 +208,52 @@ func (m *Model) modelPickerChoices(requireVision bool) []screen.ModelChoice {
 	return out
 }
 
+// providerPickerChoices is deliberately narrower than /model: a failover
+// picker must not advertise a profile that cannot even construct locally.
+// Credential checks are local and transport-aware; remote health remains the
+// provider's responsibility when the next request is sent.
+func defaultProviderConfigLoader() (*config.Config, error) {
+	cfg, _, err := config.Load()
+	return cfg, err
+}
+
+func (m *Model) reloadProviderProfiles() error {
+	if m == nil || m.providerConfigLoader == nil {
+		return nil
+	}
+	fresh, err := m.providerConfigLoader()
+	if err != nil {
+		return err
+	}
+	if fresh == nil {
+		return nil
+	}
+	if m.cfg == nil {
+		m.cfg = fresh
+	} else {
+		// Provider failover is hot-reloadable; unrelated runtime settings keep
+		// their startup semantics and are not silently reapplied mid-session.
+		m.cfg.Provider = fresh.Provider
+	}
+	return nil
+}
+
+func (m *Model) providerPickerChoices() ([]screen.ModelChoice, error) {
+	if err := m.reloadProviderProfiles(); err != nil {
+		return nil, err
+	}
+	configured := configuredModelChoices(m.cfg)
+	out := make([]screen.ModelChoice, 0, len(configured))
+	for _, choice := range configured {
+		if !modelChoiceHasCredentials(m.cfg, choice) {
+			continue
+		}
+		choice.Description = "ready · " + choice.Description
+		out = append(out, choice)
+	}
+	return out, nil
+}
+
 // openModelPicker opens either the ordinary model browser or the restricted
 // recovery picker used when a text-only model receives image attachments.
 // It returns false when no configured vision-capable profile exists.
@@ -218,6 +290,36 @@ func (m *Model) openModelPicker(requireVision bool, recoveryImageCount int) bool
 		m.imageRecoveryImageCount = 0
 	}
 	return true
+}
+
+// openProviderPicker exposes configured, credential-ready provider profiles
+// as an explicit failover surface. ModelScreen already carries provider +
+// model together, so applying a row reaches the same atomic rebuild path as
+// /model without duplicating widget or runtime logic.
+func (m *Model) openProviderPicker() (bool, error) {
+	if m == nil || m.turnActive || m.rewindSummaryPending {
+		return false, nil
+	}
+	choices, err := m.providerPickerChoices()
+	if err != nil {
+		return false, err
+	}
+	if len(choices) == 0 {
+		return false, nil
+	}
+	picker := screen.NewModelScreen(m.model, choices)
+	picker.SetCurrentProviderOnly(m.providerName)
+	picker.SetCommand("/provider")
+	title := "Switch provider · configured credentials only"
+	if len(choices) == 1 {
+		title = "Switch provider · only 1 ready; add another with /login"
+	}
+	picker.SetTitle(title)
+	picker.Resize(m.width, m.height)
+	m.activeScreen = picker
+	m.imageRecoveryPending = false
+	m.imageRecoveryImageCount = 0
+	return true, nil
 }
 
 func configuredProviderForModel(cfg *config.Config, model string) string {

@@ -7,6 +7,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **runtime provider failover**: `/provider` (alias `/providers`) now opens a
+  credential-ready provider picker and atomically rebinds the live transport,
+  model, context window, and compactor. `/models` aliases the existing unified
+  provider/model picker for OpenCode-compatible discoverability; failed or
+  mid-turn switches preserve the active backend. The picker follows the active
+  provider even with model overrides, reloads profiles added by `auth login`,
+  and refreshes provider-specific system guidance after every switch.
+
+### Fixed
+
+- **human security-denial transcript**: permission denials and safety blocks
+  render as compact icon-less `Denied` / `Blocked` status rows with a human
+  explanation beneath — no internal rule IDs, raw regexes, duplicated command
+  echoes, or elapsed-time noise (claude-code/codex parity).
+- **bash security rule 23 false positives**: multi-line quoted arguments such
+  as `python3 -c "…"` are no longer hard-denied; the quoted-newline check now
+  only flags the line-based-check smuggling shape (quoted newline followed by
+  a `#`-prefixed line), matching claude-code. Fixes repeated-announcement
+  loops observed in long sessions.
+- **Read re-read dead end**: the "file unchanged" stub now tells the model how
+  to force content back after context compaction (non-default offset/limit),
+  breaking an observed identical-block loop.
+- **denylist and sandbox.bash refusals** surface through the same compact
+  `Blocked` row as classifier blocks.
+
 ## [0.4.23] - 2026-08-14
 
 ### Added

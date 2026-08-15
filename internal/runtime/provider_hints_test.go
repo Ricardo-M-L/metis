@@ -3,6 +3,8 @@ package runtime
 import (
 	"strings"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 func TestProviderHintFor_DispatchesByProvider(t *testing.T) {
@@ -76,6 +78,32 @@ func TestRenderBasePrompt_NoHintWhenEmpty(t *testing.T) {
 	out := RenderBasePrompt(BasePromptVars{Model: "x"})
 	if strings.Contains(out, "# Provider notes") {
 		t.Errorf("expected no provider notes section when ProviderHint empty:\n%s", out)
+	}
+}
+
+func TestRebindProviderPrompt_ReplacesManagedHintInBothForms(t *testing.T) {
+	oldHint := ProviderHintFor("anthropic", "claude-sonnet-4-6")
+	sections := []llm.SystemSection{
+		{Name: "identity", Body: "identity", Cache: true},
+		{Name: "provider_hint", Body: oldHint, Cache: true},
+		{Name: "env", Body: "env", Volatile: true},
+	}
+
+	system, got := RebindProviderPrompt("stale", sections, "kimi", "kimi-k2.6")
+	newHint := ProviderHintFor("kimi", "kimi-k2.6")
+	if len(got) != 3 || got[1].Name != "provider_hint" || got[1].Body != newHint {
+		t.Fatalf("provider hint section not replaced: %+v", got)
+	}
+	if strings.Contains(system, oldHint) || !strings.Contains(system, newHint) {
+		t.Fatalf("legacy system form not refreshed:\n%s", system)
+	}
+}
+
+func TestRebindProviderPrompt_PreservesExplicitBasePrompt(t *testing.T) {
+	sections := []llm.SystemSection{{Name: "base", Body: "user supplied", Cache: true}}
+	system, got := RebindProviderPrompt("user supplied", sections, "openai", "gpt-4o")
+	if system != "user supplied" || len(got) != 1 || got[0] != sections[0] {
+		t.Fatalf("explicit prompt changed: system=%q sections=%+v", system, got)
 	}
 }
 
