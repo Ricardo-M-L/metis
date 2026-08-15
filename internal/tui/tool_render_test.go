@@ -366,6 +366,35 @@ func TestRenderToolEvent_DenialRendersCompactSummary(t *testing.T) {
 	}
 }
 
+func TestRenderToolEvent_BlockedRendersCompactRowWithoutEnvelope(t *testing.T) {
+	// User-reported 2026-08-15: the Bash safety classifier produced
+	// "[⚠️ blocked] command classified as dangerous: dangerous flag
+	// detected: (?i)-\s*rf\s\n\nCommand: <full command>…" — a regex
+	// leak plus a full command echo. The row must now read "Blocked"
+	// (icon-less, no elapsed time) and the body must show only the
+	// human reason, no "[blocked]" envelope and no command echo.
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Input:    map[string]any{"command": "cd proj && rm -rf build"},
+		Output: "[blocked] dangerous flag: rm -rf style recursive forced delete\n\n" +
+			"The command was not executed. Rephrase it to avoid the flagged part, or ask the user to run it manually.",
+		IsError:  true,
+		Duration: 2 * time.Millisecond,
+	}
+	out := stripANSI(renderToolEvent(te, false))
+	for _, want := range []string{"Blocked", "rm -rf style recursive forced delete", "was not executed"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("blocked row/body missing %q:\n%s", want, out)
+		}
+	}
+	for _, banned := range []string{"2ms", "[blocked]", "(?i)", "Command:", "⚠️"} {
+		if strings.Contains(out, banned) {
+			t.Fatalf("blocked row leaked %q:\n%s", banned, out)
+		}
+	}
+}
+
 func TestRenderToolEvent_ReadOnlyExitOneIsNeutralNoMatches(t *testing.T) {
 	te := ToolEvent{
 		Kind:     "result",

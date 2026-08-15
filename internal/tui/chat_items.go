@@ -266,9 +266,10 @@ var recoveryDescriptionStopWords = map[string]struct{}{
 // importantToolErrorRE marks outputs that must never be swallowed by
 // recovered/compacted grouping. `denied:` matches the TUI-shaped deny
 // envelope ("denied: newline inside …") emitted by dispatch.go since
-// the 2026-08 deny-reason rework; `bash-security` remains for
+// the 2026-08 deny-reason rework; `blocked` covers the Bash safety
+// classifier's "[blocked] …" refusals; `bash-security` remains for
 // historical transcripts resumed from older sessions.
-var importantToolErrorRE = regexp.MustCompile(`(?i)(access denied|authentication failed|forbidden|unauthorized|denied by permission|denied by user|permission denied|permission policy|requires approval|security rule|bash-security|operation not permitted|user denied|unsafe command|denied:)`)
+var importantToolErrorRE = regexp.MustCompile(`(?i)(access denied|authentication failed|forbidden|unauthorized|denied by permission|denied by user|permission denied|permission policy|requires approval|security rule|bash-security|operation not permitted|user denied|unsafe command|denied:|blocked)`)
 
 func importantToolError(te ToolEvent) bool {
 	return te.IsError && importantToolErrorRE.MatchString(te.Output)

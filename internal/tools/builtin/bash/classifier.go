@@ -55,9 +55,20 @@ type BashClassifier struct {
 	// Network commands.
 	networkCmds map[string]bool
 	// Patterns for dangerous flags/args.
-	dangerousFlags []*regexp.Regexp
+	dangerousFlags []dangerPattern
 	// Patterns for destructive operations.
-	destructivePatterns []*regexp.Regexp
+	destructivePatterns []dangerPattern
+}
+
+// dangerPattern pairs a regexp with the human-facing explanation used in
+// blocked-command results. claude-code parity: its bashSecurity.ts returns
+// prose ("Command contains process substitution <()"), never raw regexes —
+// the old "dangerous flag detected: (?i)-\s*rf\s" leaked engine internals
+// into the transcript (user feedback 2026-08-15: codex/claude-code never
+// show this).
+type dangerPattern struct {
+	re    *regexp.Regexp
+	label string
 }
 
 func NewBashClassifier() *BashClassifier {
@@ -102,28 +113,28 @@ func NewBashClassifier() *BashClassifier {
 			"netstat": true, "ss": true, "lsof": true,
 			"nmap": true, "tcpdump": true, "wireshark": true,
 		},
-		dangerousFlags: []*regexp.Regexp{
-			regexp.MustCompile(`(?i)-\s*rf\s`), // rm -rf
+		dangerousFlags: []dangerPattern{
+			{regexp.MustCompile(`(?i)-\s*rf\s`), "rm -rf style recursive forced delete"},
 			// `-r` flag is only dangerous when paired with rm/rmdir.
 			// Earlier rule `(?i)-\s*r\s` matched `grep -r`, `ls -r`,
 			// `docker logs -r`, and `tar -r` — all harmless. The
 			// 2026-05-16 v3 longrun report flagged this as a real
 			// false-positive blocker. Bind to the rm command so only
 			// genuine recursive-delete spellings are caught.
-			regexp.MustCompile(`(?i)\b(rm|rmdir)\s+(?:[^|;&]*\s+)?-\s*r\b`),
-			regexp.MustCompile(`(?i)>/dev/sd[a-z]`), // write to raw disk
-			regexp.MustCompile(`(?i)dd.*of=/dev/`),  // dd to raw device
-			regexp.MustCompile(`(?i)--no-preserve`), // git clean --no-preserve
+			{regexp.MustCompile(`(?i)\b(rm|rmdir)\s+(?:[^|;&]*\s+)?-\s*r\b`), "rm -r recursive delete"},
+			{regexp.MustCompile(`(?i)>/dev/sd[a-z]`), "writing directly to a raw disk device"},
+			{regexp.MustCompile(`(?i)dd.*of=/dev/`), "dd writing to a device file"},
+			{regexp.MustCompile(`(?i)--no-preserve`), "git clean --no-preserve-root (can delete the repo root)"},
 			// Permissive chmod only — `chmod 777`, `chmod 0666`, `chmod 776`.
 			// Earlier rule (`chmod\s+[0-7][0-7][0-7][0-7]?`) flagged plain
 			// `chmod 644 README.md` which is harmless.
-			regexp.MustCompile(`(?i)chmod\s+0?(?:777|766|776|666)\b`),
-			regexp.MustCompile(`(?i)git\s+push\s+(?:[^|]+?\s+)?(?:-f|--force(?:-with-lease)?)`), // forced push
-			regexp.MustCompile(`(?i)git\s+(?:reset\s+--hard|clean\s+-fdx)`),                     // discard work
-			regexp.MustCompile(`(?i)pip\s+install\s+--break-system-packages`),
-			regexp.MustCompile(`(?i)npm\s+publish\s+(?:[^|]+\s+)?--access\s+public`),
+			{regexp.MustCompile(`(?i)chmod\s+0?(?:777|766|776|666)\b`), "world-writable chmod (777/666)"},
+			{regexp.MustCompile(`(?i)git\s+push\s+(?:[^|]+?\s+)?(?:-f|--force(?:-with-lease)?)`), "force push (rewrites remote history)"},
+			{regexp.MustCompile(`(?i)git\s+(?:reset\s+--hard|clean\s+-fdx)`), "git reset --hard / clean -fdx (discards uncommitted work)"},
+			{regexp.MustCompile(`(?i)pip\s+install\s+--break-system-packages`), "pip --break-system-packages (bypasses system package protection)"},
+			{regexp.MustCompile(`(?i)npm\s+publish\s+(?:[^|]+\s+)?--access\s+public`), "npm publish with public access"},
 		},
-		destructivePatterns: []*regexp.Regexp{
+		destructivePatterns: []dangerPattern{
 			// Fork-bomb detection. Earlier rule `(?i)(fork\s*bomb|:.*:.*:.*&)`
 			// produced false positives in two ways:
 			//   1. `fork\s*bomb` matched any prose containing "fork bomb"
@@ -137,17 +148,17 @@ func NewBashClassifier() *BashClassifier {
 			// bomb syntax — `:()` defines a recursive function named `:`
 			// and `{...}` opens its body. Prose can't accidentally hit
 			// this shape.
-			regexp.MustCompile(`:\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:\s*&[^}]*\}`),
-			regexp.MustCompile(`(?i)>\s*/etc/`),   // writing to /etc
-			regexp.MustCompile(`(?i)>\s*/var/`),   // writing to /var
-			regexp.MustCompile(`(?i)>\s*/usr/`),   // writing to /usr
-			regexp.MustCompile(`(?i)>\s*~/.ssh/`), // writing to ssh dir
-			regexp.MustCompile(`(?i)>\s*/sys/`),   // writing to /sys
-			regexp.MustCompile(`(?i)>\s*/proc/`),  // writing to /proc
+			{regexp.MustCompile(`:\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:\s*&[^}]*\}`), "fork bomb pattern"},
+			{regexp.MustCompile(`(?i)>\s*/etc/`), "writing to /etc"},
+			{regexp.MustCompile(`(?i)>\s*/var/`), "writing to /var"},
+			{regexp.MustCompile(`(?i)>\s*/usr/`), "writing to /usr"},
+			{regexp.MustCompile(`(?i)>\s*~/.ssh/`), "writing to ~/.ssh"},
+			{regexp.MustCompile(`(?i)>\s*/sys/`), "writing to /sys"},
+			{regexp.MustCompile(`(?i)>\s*/proc/`), "writing to /proc"},
 			// Pipe-to-shell: curl … | bash, wget -qO- … | sh, etc.
 			// The leading prefix matches a downloader, the tail covers any pipe
 			// landing in a shell or eval — including chained `tee` / `head`.
-			regexp.MustCompile(`(?i)(curl|wget|fetch)\b[^|]*\|\s*(?:[^|]*\|\s*)*(?:bash|sh|zsh|fish|eval)\b`),
+			{regexp.MustCompile(`(?i)(curl|wget|fetch)\b[^|]*\|\s*(?:[^|]*\|\s*)*(?:bash|sh|zsh|fish|eval)\b`), "downloading a script and piping it to a shell (curl | bash)"},
 		},
 	}
 }
@@ -196,22 +207,22 @@ func (c *BashClassifier) Classify(cmd string) Classification {
 
 	// Check dangerous flags/patterns first
 	for _, pattern := range c.dangerousFlags {
-		if pattern.MatchString(cmd) {
+		if pattern.re.MatchString(cmd) {
 			return Classification{
 				Class:   ClassDangerous,
 				Command: command,
 				Args:    args,
-				Reason:  "dangerous flag detected: " + pattern.String(),
+				Reason:  "dangerous flag: " + pattern.label,
 			}
 		}
 	}
 	for _, pattern := range c.destructivePatterns {
-		if pattern.MatchString(cmd) {
+		if pattern.re.MatchString(cmd) {
 			return Classification{
 				Class:   ClassDangerous,
 				Command: command,
 				Args:    args,
-				Reason:  "destructive pattern: " + pattern.String(),
+				Reason:  "destructive pattern: " + pattern.label,
 			}
 		}
 	}

@@ -46,6 +46,9 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// Permission denials get their own row + body treatment (see below);
 	// computed once up front so leader, result row, and body all agree.
 	denied := te.IsError && isDeniedToolResult(te.Output)
+	// Safety/classifier blocks ([blocked] …) get the same compact row
+	// treatment, labelled "Blocked" instead of "Denied".
+	blocked := te.IsError && isBlockedToolResult(te.Output)
 
 	// Leader row: ⏺ toolname(arg)
 	//
@@ -141,6 +144,11 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		// 2026-08-15: "⛔ 这个不好看") dropped for parity. The reason
 		// moves to a single dim prose line below.
 		s.WriteString("Denied")
+	} else if blocked {
+		// Same icon-less status treatment for safety blocks; "Blocked"
+		// rather than "Denied" because this is a policy refusal, not a
+		// permission decision.
+		s.WriteString("Blocked")
 	} else if neutralNoMatch {
 		s.WriteString(styleDim.Render("○ "))
 	} else if partialRecovery {
@@ -150,8 +158,8 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	} else {
 		s.WriteString(styleAccent.Render("✓ "))
 	}
-	if denied {
-		// Row already carries "Denied"; nothing else to append.
+	if denied || blocked {
+		// Row already carries "Denied"/"Blocked"; nothing else to append.
 	} else if neutralNoMatch {
 		s.WriteString(fmt.Sprintf("%s · No matches", formatElapsed(te.Duration)))
 	} else if partialRecovery {
@@ -165,7 +173,7 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	} else {
 		s.WriteString(summarizeNormalizedToolResult(te))
 	}
-	if denied {
+	if denied || blocked {
 		// No ctrl+O hint: the reason below is already the full content.
 	} else if neutralNoMatch {
 		// A read-only search with the conventional exit code 1 means
@@ -187,6 +195,12 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 			// prose (claude-code's RejectedToolUseMessage is dim
 			// text, not an error-red wall).
 			if reason := stripDenyEnvelope(te.Output); reason != "" {
+				s.WriteString(renderDenyReasonBody(reason, expanded))
+			}
+		} else if blocked {
+			// Same treatment for safety blocks: strip the
+			// "[blocked] …" wrapper, show the human reason only.
+			if reason := stripBlockedEnvelope(te.Output); reason != "" {
 				s.WriteString(renderDenyReasonBody(reason, expanded))
 			}
 		} else if timedOut && !partialRecovery {
@@ -688,6 +702,30 @@ func isDeniedToolResult(out string) bool {
 		strings.Contains(low, "denied by permission policy")
 }
 
+// isBlockedToolResult detects safety/classifier refusals — the
+// "[blocked] …" results the Bash tool emits for dangerous commands,
+// denylist hits, and shellguard process-termination blocks. They get
+// the same compact status-row treatment as permission denials: the
+// row reads "Blocked", the reason renders as prose below. Before the
+// 2026-08-15 rework these rendered as a truncated error summary plus
+// a red wall that repeated the whole command ("[⚠️ blocked] command
+// classified as dangerous: dangerous flag detected: (?i)-\s*rf\s
+// \n\nCommand: …") — engine internals neither codex nor claude-code
+// ever surface.
+func isBlockedToolResult(out string) bool {
+	low := strings.ToLower(strings.TrimSpace(normalizeToolOutput(out)))
+	return strings.HasPrefix(low, "[blocked]") || strings.HasPrefix(low, "blocked:")
+}
+
+// stripBlockedEnvelope removes the "[blocked] " / "blocked: " wrapper
+// so the body shows only the human reason.
+func stripBlockedEnvelope(out string) string {
+	o := strings.TrimSpace(normalizeToolOutput(out))
+	o = strings.TrimSpace(strings.TrimPrefix(o, "[blocked]"))
+	o = strings.TrimSpace(strings.TrimPrefix(o, "blocked:"))
+	return o
+}
+
 // stripDenyEnvelope removes the wrapper dispatch.go adds around a deny
 // reason ("denied: …", "denied by permission policy: …", "denied by
 // user: …", optionally behind "Error: ") so the body shows only the
@@ -765,6 +803,11 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 	// (user feedback 2026-08-15: "✗ 2ms · denied" 很丑).
 	if te.IsError && isDeniedToolResult(te.Output) {
 		return "denied"
+	}
+	// Safety/classifier blocks keep the same compact convention in the
+	// /session summary view.
+	if te.IsError && isBlockedToolResult(te.Output) {
+		return "blocked"
 	}
 	// Strip "sub: " for the switch dispatch so per-tool summaries
 	// (Read line count, Edit added/removed, Write line count, etc.)

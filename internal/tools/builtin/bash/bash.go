@@ -414,13 +414,19 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	class := b.classifierFor().Classify(cmd)
 	if class.Class == ClassDangerous {
 		return &tools.Result{
-			Output:  "[⚠️ blocked] command classified as dangerous: " + class.Reason + "\n\nCommand: " + cmd + "\n\nTo execute anyway, split into smaller safe commands or use a different approach.",
+			// Human prose only (claude-code parity): the old message
+			// leaked the raw regex ("dangerous flag detected:
+			// (?i)-\s*rf\s"), repeated the whole command the TUI
+			// already renders in the leader row, and carried an emoji
+			// prefix inconsistent with every other [blocked] surface.
+			Output: "[blocked] " + class.Reason +
+				"\n\nThe command was not executed. Rephrase it to avoid the flagged part, or ask the user to run it manually.",
 			IsError: true,
 		}, nil
 	}
 	if class.Class == ClassSystem {
 		return &tools.Result{
-			Output:  "[ℹ️ system command] " + class.Reason + "\n\nCommand: " + cmd,
+			Output:  "[system command] " + class.Reason,
 			IsError: false,
 		}, nil
 	}
