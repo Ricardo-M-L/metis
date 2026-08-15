@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -494,5 +495,29 @@ func TestLoad_KeepsCustomSessionDir(t *testing.T) {
 	}
 	if cfg.Session.Dir != customDir {
 		t.Errorf("custom Session.Dir should not be rewritten; got %q", cfg.Session.Dir)
+	}
+}
+
+// TestShellDefault_PrefersBashOverLoginShell — zsh's NOMATCH aborts
+// whole commands with "no matches found" when a glob matches nothing;
+// bash passes the unmatched pattern through literally. The default must
+// resolve to bash even when $SHELL points at zsh (user report
+// 2026-08-15, aligned with DeepSeek Harness hardcoding /bin/bash).
+func TestShellDefault_PrefersBashOverLoginShell(t *testing.T) {
+	if bash, err := exec.LookPath("bash"); err == nil && bash != "" {
+		t.Setenv("SHELL", "/bin/zsh")
+		if got := shellDefault(); got != bash {
+			t.Fatalf("shellDefault() = %q, want bash %q even with SHELL=/bin/zsh", got, bash)
+		}
+	}
+}
+
+// TestShellDefault_FallsBackToLoginShell — systems without bash must
+// still get a usable default (e.g. Alpine/FreeBSD with sh/zsh only).
+func TestShellDefault_FallsBackToLoginShell(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // empty dir: LookPath("bash") fails
+	t.Setenv("SHELL", "/bin/zsh")
+	if got := shellDefault(); got != "/bin/zsh" {
+		t.Fatalf("shellDefault() = %q, want SHELL fallback /bin/zsh", got)
 	}
 }

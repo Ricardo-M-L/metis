@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -557,11 +558,14 @@ type Tools struct {
 }
 
 type ToolBashSettings struct {
-	TimeoutSeconds int      `toml:"timeout_seconds"`
-	MaxOutputBytes int      `toml:"max_output_bytes"`
-	Shell          string   `toml:"shell"`
-	Allowlist      []string `toml:"allowlist"`
-	Denylist       []string `toml:"denylist"`
+	TimeoutSeconds int `toml:"timeout_seconds"`
+	MaxOutputBytes int `toml:"max_output_bytes"`
+	// Shell executes Bash tool commands. Defaults to bash (see
+	// shellDefault); set a name or full path to opt into another shell,
+	// e.g. shell = "zsh".
+	Shell     string   `toml:"shell"`
+	Allowlist []string `toml:"allowlist"`
+	Denylist  []string `toml:"denylist"`
 
 	// Soft sandbox — defaults are safe-by-default. Anything that loosens
 	// safety must be named with a `dangerously_` prefix so an audit can
@@ -758,11 +762,25 @@ func defaults() *Config {
 	}
 }
 
+// shellDefault returns the shell Metis executes Bash tool commands with.
+// Deliberately NOT $SHELL: agent-written commands follow bash semantics,
+// and running the user's interactive shell instead (typically zsh) aborts
+// whole commands with "zsh: no matches found" whenever a glob matches
+// nothing — zsh's NOMATCH option kills the command before it runs, while
+// bash passes the unmatched pattern through literally. DeepSeek Harness
+// hardcodes /bin/bash for the same reason (user report 2026-08-15: the
+// error never appears in Harness/Codex/Claude Code).
+//
+// On systems without bash, fall back to the login shell, then /bin/sh.
+// Users who want another shell can set [bash] shell = "..." explicitly.
 func shellDefault() string {
+	if p, err := exec.LookPath("bash"); err == nil && p != "" {
+		return p
+	}
 	if s := os.Getenv("SHELL"); s != "" {
 		return s
 	}
-	return "/bin/bash"
+	return "/bin/sh"
 }
 
 // Load merges defaults + user file + project file. On first run after the
