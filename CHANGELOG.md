@@ -5,7 +5,7 @@ All notable changes to Metis are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.25] - 2026-08-15
 
 ### Fixed
 
@@ -873,7 +873,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.24...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.25...HEAD
+[0.4.25]: https://github.com/Ricardo-M-L/metis/compare/v0.4.24...v0.4.25
 [0.4.24]: https://github.com/Ricardo-M-L/metis/compare/v0.4.23...v0.4.24
 [0.4.23]: https://github.com/Ricardo-M-L/metis/compare/v0.4.22...v0.4.23
 [0.4.22]: https://github.com/Ricardo-M-L/metis/compare/v0.4.21...v0.4.22
