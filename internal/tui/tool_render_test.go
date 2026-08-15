@@ -344,7 +344,7 @@ func TestRenderToolEvent_DenialRendersCompactSummary(t *testing.T) {
 	//  2. "✗ 2ms · denied" — still ugly ("很丑", 2026-08-15): the
 	//     widest column spent on a meaningless 0-2ms duration.
 	// Final form mirrors claude-code/codex: a status-only row
-	// ("⛔ Denied", no elapsed time) plus the reason as prose below.
+	// ("Denied", no glyph, no elapsed time — claude-code/codex parity) plus the reason as prose below.
 	te := ToolEvent{
 		Kind:     "result",
 		ToolName: "Bash",
@@ -354,12 +354,12 @@ func TestRenderToolEvent_DenialRendersCompactSummary(t *testing.T) {
 		Duration: 2 * time.Millisecond,
 	}
 	out := stripANSI(renderToolEvent(te, false))
-	for _, want := range []string{"⛔ Denied", "can hide arguments from line-based permission checks"} {
+	for _, want := range []string{"Denied", "can hide arguments from line-based permission checks"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("denial row/body missing %q:\n%s", want, out)
 		}
 	}
-	for _, banned := range []string{"2ms", "rule #23", "unclosed …", "denied:", "denied by permission policy:"} {
+	for _, banned := range []string{"2ms", "rule #23", "unclosed …", "denied:", "denied by permission policy:", "⛔"} {
 		if strings.Contains(out, banned) {
 			t.Fatalf("denial row leaked %q:\n%s", banned, out)
 		}

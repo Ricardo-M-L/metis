@@ -168,7 +168,7 @@ func TestBuildChatItems_UnrecoveredAndSecurityErrorsStayVisible(t *testing.T) {
 	for _, item := range items {
 		rendered += stripANSI(item.Render(100))
 	}
-	for _, want := range []string{"Failed to clone repository", "⛔ Denied", "can hide arguments from line-based permission checks"} {
+	for _, want := range []string{"Failed to clone repository", "Denied", "can hide arguments from line-based permission checks"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("important error evidence %q disappeared:\n%s", want, rendered)
 		}

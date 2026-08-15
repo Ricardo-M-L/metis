@@ -133,14 +133,13 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// per tool call and it's informational, not chrome.
 	s.WriteString(styleDim.Render(resultIndent + glyphTreeLeaf + "  "))
 	if denied {
-		// Denials render as "⛔ Denied" with NO elapsed time — a
-		// permission refusal is not a timed operation, and the old
-		// "✗ 2ms · denied" row (user feedback 2026-08-15: "很丑")
-		// spent the widest column on a meaningless 0-2ms duration
-		// while burying the actual status. claude-code parity:
-		// "Tool use rejected" — glyph + word, nothing else. The
-		// reason moves to a single dim prose line below.
-		s.WriteString(styleErr.Render("⛔ "))
+		// Denials render as a plain status word with NO glyph and NO
+		// elapsed time. claude-code's transcript shows dim "Tool use
+		// rejected" (no icon — its ⛔/✗ live in the permission DIALOG,
+		// not the result row) and codex shows "Request denied" in bold
+		// text, also icon-less. The metis ⛔ variant (user feedback
+		// 2026-08-15: "⛔ 这个不好看") dropped for parity. The reason
+		// moves to a single dim prose line below.
 		s.WriteString("Denied")
 	} else if neutralNoMatch {
 		s.WriteString(styleDim.Render("○ "))
@@ -152,7 +151,7 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		s.WriteString(styleAccent.Render("✓ "))
 	}
 	if denied {
-		// Row already carries "⛔ Denied"; nothing else to append.
+		// Row already carries "Denied"; nothing else to append.
 	} else if neutralNoMatch {
 		s.WriteString(fmt.Sprintf("%s · No matches", formatElapsed(te.Duration)))
 	} else if partialRecovery {
