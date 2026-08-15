@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -924,5 +925,44 @@ func TestCanUse_PlanModeAllowsReadOnly(t *testing.T) {
 	w := Write{gate: g}
 	if p, _ := w.CanUse(context.Background(), map[string]any{"path": "/tmp/x"}); p != tools.PermissionDeny {
 		t.Errorf("plan mode should deny Write, got %v", p)
+	}
+}
+
+// TestBash_DefaultShellIsGlobSafe — regression for the zsh NOMATCH bug
+// (user report 2026-08-15): with $SHELL=/bin/zsh, commands containing an
+// unmatched glob used to abort with "zsh: no matches found" before the
+// command ran. The config default must resolve to bash, where unmatched
+// globs pass through literally and the command reports its own error.
+// Exercises the REAL chain: config.Load defaults -> ToolBashSettings ->
+// Bash.Execute -> jobs.OOMWrappedCommand spawn.
+func TestBash_DefaultShellIsGlobSafe(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("SHELL", "/bin/zsh") // the poison: pre-fix default was $SHELL
+	cfg, _, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(cfg.Tools.Bash.Shell, "bash") {
+		t.Fatalf("config default shell = %q, want bash", cfg.Tools.Bash.Shell)
+	}
+	b := bash.New(bypassGate(), config.ToolBashSettings{
+		TimeoutSeconds: 10,
+		MaxOutputBytes: 1 << 16,
+		Shell:          cfg.Tools.Bash.Shell,
+	})
+	res, err := b.Execute(context.Background(), map[string]any{
+		"command": "ls /tmp/zzz_metis_nonexistent_glob_" + t.Name() + "_*",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Output, "no matches found") || strings.Contains(res.Output, "zsh:") {
+		t.Fatalf("unmatched glob aborted the command (zsh NOMATCH leak):\n%s", res.Output)
+	}
+	if !strings.Contains(res.Output, "No such file or directory") {
+		t.Fatalf("expected ls to report its own error, got:\n%s", res.Output)
 	}
 }
