@@ -372,7 +372,7 @@ func TestStuckDetector_DeniedBashDoesNotResetCounter(t *testing.T) {
 	deniedResult := llm.ContentBlock{
 		Type:       "tool_result",
 		ToolUseID:  "b-bad",
-		ToolResult: "denied by permission policy: bash-security rule #23: newline inside an unclosed quoted region — multi-line smuggling",
+		ToolResult: "denied by permission policy: newline inside quotes followed by a #-prefixed line — can hide arguments from line-based permission checks",
 		IsError:    true,
 	}
 	s.AfterTurn(

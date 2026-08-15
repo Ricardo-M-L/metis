@@ -39,6 +39,13 @@ func TestCheckCommand_AllowsBenignCommands(t *testing.T) {
 		"cat <<'EOF'\n'literal-quotes-inside'\nEOF",
 		"cat <<\"EOF\"\n\"another-quoted-delim\"\nEOF",
 		"curl -d @body.json https://api.example.com",
+		// Multi-line quoted arguments are ONE argument to the shell —
+		// claude-code allows them (QUOTED_NEWLINE only fires on a
+		// '#'-prefixed follow-up line). Pre-2026-08-15 metis denied
+		// these and the model looped re-announcing the same plan
+		// (export 2026-08-15-150806, 20x "好，我来更新报告").
+		"python3 -c \"\nimport json\nd=json.load(open('/tmp/dh_full_tree.json'))\nprint(d)\n\" 2>&1",
+		"echo \"line1\nline2\"",
 	}
 	for _, cmd := range benign {
 		t.Run(cmd, func(t *testing.T) {
@@ -75,7 +82,12 @@ func TestCheckCommand_BlocksAdversarialPatterns(t *testing.T) {
 		{"zero-width space", "echo x\u200By", 18, "zero-width"},
 		{"zmodload", "zmodload zsh/system", 20, "zsh"},
 		{"comment-quote desync", `echo "hello # not a comment"`, 22, "desync"},
-		{"quoted newline", "echo \"line1\nline2\"", 23, "newline"},
+		// claude-code QUOTED_NEWLINE: a quoted newline followed by a
+		// '#'-prefixed line can hide arguments from line-based checks.
+		{"quoted newline then # line", "echo \"line1\n# not a comment\"", 23, "newline"},
+		// Tab indentation: rule 22 (desync) keys on a SPACE before '#',
+		// so this one must reach rule 23's TrimSpace check.
+		{"quoted newline then tab-indented # line", "echo \"line1\n\t# hidden\"", 23, "newline"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

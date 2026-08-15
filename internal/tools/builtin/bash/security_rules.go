@@ -250,10 +250,20 @@ func ruleCommentQuoteDesync(cmd string) SecurityRuleResult {
 	return SecurityRuleResult{Allow: true}
 }
 
-// 23: QUOTED_NEWLINE — newlines inside an unclosed quote let the model
-// smuggle multi-line payloads past a single-line input field. Bash
-// happily executes them, but the user prompt UI typically only shows
-// the first line.
+// 23: QUOTED_NEWLINE — claude-code parity (bashSecurity.ts QUOTED_NEWLINE,
+// check 23): only deny when a newline inside quotes is followed by a line
+// that STARTS WITH '#'. Line-based permission checkers strip '#'-prefixed
+// lines as comments, so `cmd "arg1\n# looked like a comment\n--hidden-flag"`
+// can hide the trailing argument from whatever inspects only non-comment
+// lines. A plain multi-line quoted argument (`python3 -c "import x\n…"`)
+// is ONE argument to the shell — nothing extra can execute — so it is
+// allowed, exactly like claude-code.
+//
+// Pre-2026-08-15 metis denied ANY newline inside quotes, which false-
+// positively blocked the common `python3 -c "<script>"` / `curl … | jq
+// '…'` multi-line idiom. Export 2026-08-15-150806 shows the model
+// re-announcing the same plan 20x after repeated rule-23 denials of
+// legitimately-quoted python — the deny was worse than the threat.
 //
 // Heredoc carve-out (2026-05-20): commands containing a `<<DELIM` or
 // `<<-DELIM` (optionally quoted: `<<'EOF'` / `<<"EOF"`) heredoc start
@@ -275,7 +285,7 @@ func ruleQuotedNewlineExfil(cmd string) SecurityRuleResult {
 		return SecurityRuleResult{Allow: true}
 	}
 	inSingle, inDouble := false, false
-	for _, r := range cmd {
+	for i, r := range cmd {
 		switch r {
 		case '\'':
 			if !inDouble {
@@ -286,8 +296,24 @@ func ruleQuotedNewlineExfil(cmd string) SecurityRuleResult {
 				inDouble = !inDouble
 			}
 		case '\n':
-			if inSingle || inDouble {
-				return SecurityRuleResult{RuleID: 23, Reason: "newline inside an unclosed quoted region — multi-line smuggling"}
+			if !inSingle && !inDouble {
+				continue
+			}
+			// Newline inside quotes: flag only when the line it
+			// starts is '#'-prefixed (claude-code's exact trigger —
+			// see rule comment).
+			lineStart := i + 1
+			nextNewline := strings.IndexByte(cmd[lineStart:], '\n')
+			lineEnd := len(cmd)
+			if nextNewline >= 0 {
+				lineEnd = lineStart + nextNewline
+			}
+			if strings.HasPrefix(strings.TrimSpace(cmd[lineStart:lineEnd]), "#") {
+				// Worded as a plain explanation (claude-code
+				// bashSecurity.ts style) rather than security
+				// jargon: the model and the user need to know WHAT
+				// is wrong, not the attack taxonomy.
+				return SecurityRuleResult{RuleID: 23, Reason: "newline inside quotes followed by a #-prefixed line — can hide arguments from line-based permission checks"}
 			}
 		}
 	}

@@ -323,7 +323,7 @@ func TestRenderToolEvent_SecurityDenialNeverBecomesRecovered(t *testing.T) {
 		Kind:     "result",
 		ToolName: "Bash",
 		Output: "Installation complete\n" +
-			"Error: denied by permission policy: bash-security rule #23\n" +
+			"Error: denied by permission policy: newline inside quotes followed by a #-prefixed line — can hide arguments from line-based permission checks\n" +
 			"[command exceeded timeout 30s]",
 		IsError: true,
 	}
@@ -333,6 +333,36 @@ func TestRenderToolEvent_SecurityDenialNeverBecomesRecovered(t *testing.T) {
 	out := stripANSI(renderToolEvent(te, false))
 	if strings.Contains(out, "completed before timeout") || !strings.Contains(out, "denied by permission policy") {
 		t.Fatalf("security refusal was hidden or mislabeled:\n%s", out)
+	}
+}
+
+func TestRenderToolEvent_DenialRendersCompactSummary(t *testing.T) {
+	// User-reported 2026-08 regressions, fixed in two steps:
+	//  1. "2ms · denied: bash-security rule #23: newline inside an
+	//     unclosed …" — a 60-rune truncation that leaked the internal
+	//     rule ID and cut the explanation mid-word.
+	//  2. "✗ 2ms · denied" — still ugly ("很丑", 2026-08-15): the
+	//     widest column spent on a meaningless 0-2ms duration.
+	// Final form mirrors claude-code/codex: a status-only row
+	// ("⛔ Denied", no elapsed time) plus the reason as prose below.
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Input:    map[string]any{"command": "curl -s X | python3 -c \"print(1\nprint(2)\""},
+		Output:   "denied: newline inside quotes followed by a #-prefixed line — can hide arguments from line-based permission checks",
+		IsError:  true,
+		Duration: 2 * time.Millisecond,
+	}
+	out := stripANSI(renderToolEvent(te, false))
+	for _, want := range []string{"⛔ Denied", "can hide arguments from line-based permission checks"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("denial row/body missing %q:\n%s", want, out)
+		}
+	}
+	for _, banned := range []string{"2ms", "rule #23", "unclosed …", "denied:", "denied by permission policy:"} {
+		if strings.Contains(out, banned) {
+			t.Fatalf("denial row leaked %q:\n%s", banned, out)
+		}
 	}
 }
 

@@ -341,7 +341,7 @@ func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 	// (even bypass) should let an obviously-adversarial command run —
 	// the model has been jailbroken or got prompt-injected upstream.
 	if r := CheckCommand(cmd); !r.Allow {
-		return tools.PermissionDeny, "bash-security rule #" + itoa(r.RuleID) + ": " + r.Reason
+		return tools.PermissionDeny, securityDenyReason(r)
 	}
 	// Always consult the gate before applying sandbox auto-allow. Plan and
 	// dontAsk are hard denials, and explicit deny rules must not be bypassed
@@ -354,13 +354,21 @@ func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, st
 	return mapDecision(d), src
 }
 
-// itoa is a tiny no-import-strconv helper for the bash-security rule
-// IDs (always 1..23, single or double digit).
-func itoa(n int) string {
-	if n < 10 {
-		return string(rune('0' + n))
-	}
-	return string(rune('0'+n/10)) + string(rune('0'+n%10))
+// securityDenyReason formats a SecurityRuleResult as the user- and
+// model-facing deny reason. claude-code parity: its bashSecurity.ts
+// surfaces prose ("Command contains newlines that could separate
+// multiple commands") and never leaks the internal check ID into the
+// transcript — the old "bash-security rule #23: …" prefix read as
+// engine internals, not an explanation. The RuleID stays inside the
+// bash package (see security_rules.go numbering); the reason text
+// alone identifies the rule for debuggability.
+//
+// Rules 2/4/6/11/13 append " — denied" to their reasons. The caller's
+// deny envelope ("denied: …" / "denied by permission policy: …")
+// already carries that verb, so keeping it produced
+// "denied: jq system() … — denied" — a double denial.
+func securityDenyReason(r SecurityRuleResult) string {
+	return strings.TrimSuffix(r.Reason, " — denied")
 }
 
 func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {

@@ -43,6 +43,9 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// preserving the raw event for the model, transcript, and audit log.
 	te.Output = normalizeToolOutput(te.Output)
 	timeoutBody, timeoutLimit, timedOut := splitCommandTimeoutOutput(te.Output)
+	// Permission denials get their own row + body treatment (see below);
+	// computed once up front so leader, result row, and body all agree.
+	denied := te.IsError && isDeniedToolResult(te.Output)
 
 	// Leader row: ⏺ toolname(arg)
 	//
@@ -129,7 +132,17 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// the dim grey as too low-contrast. This is the most-scanned line
 	// per tool call and it's informational, not chrome.
 	s.WriteString(styleDim.Render(resultIndent + glyphTreeLeaf + "  "))
-	if neutralNoMatch {
+	if denied {
+		// Denials render as "⛔ Denied" with NO elapsed time — a
+		// permission refusal is not a timed operation, and the old
+		// "✗ 2ms · denied" row (user feedback 2026-08-15: "很丑")
+		// spent the widest column on a meaningless 0-2ms duration
+		// while burying the actual status. claude-code parity:
+		// "Tool use rejected" — glyph + word, nothing else. The
+		// reason moves to a single dim prose line below.
+		s.WriteString(styleErr.Render("⛔ "))
+		s.WriteString("Denied")
+	} else if neutralNoMatch {
 		s.WriteString(styleDim.Render("○ "))
 	} else if partialRecovery {
 		s.WriteString(styleWarn.Render("↻ "))
@@ -138,7 +151,9 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	} else {
 		s.WriteString(styleAccent.Render("✓ "))
 	}
-	if neutralNoMatch {
+	if denied {
+		// Row already carries "⛔ Denied"; nothing else to append.
+	} else if neutralNoMatch {
 		s.WriteString(fmt.Sprintf("%s · No matches", formatElapsed(te.Duration)))
 	} else if partialRecovery {
 		s.WriteString(summarizePartialToolResult(te))
@@ -151,7 +166,9 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	} else {
 		s.WriteString(summarizeNormalizedToolResult(te))
 	}
-	if neutralNoMatch {
+	if denied {
+		// No ctrl+O hint: the reason below is already the full content.
+	} else if neutralNoMatch {
 		// A read-only search with the conventional exit code 1 means
 		// "nothing found". There is no diagnostic body to expand.
 	} else if partialRecovery && !expanded {
@@ -165,13 +182,15 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// line-capped preview otherwise. On error, surface the error
 	// output so the user can see WHY it failed.
 	if te.IsError {
-		// A command can cross the outer timeout after the inner program has
-		// already printed a strong completion marker (for example, npx skills
-		// prints both "Installation complete" and the installed path before
-		// its wrapper is killed). That is a partial/recovered state, not a
-		// plain failure. Keep the timeout in the event and reveal it on Ctrl+O,
-		// but do not paint the whole raw body red in the compact transcript.
-		if timedOut && !partialRecovery {
+		if denied {
+			// The row says "Denied" — do not repeat the "denied: …"
+			// envelope in the body. Render just the reason as muted
+			// prose (claude-code's RejectedToolUseMessage is dim
+			// text, not an error-red wall).
+			if reason := stripDenyEnvelope(te.Output); reason != "" {
+				s.WriteString(renderDenyReasonBody(reason, expanded))
+			}
+		} else if timedOut && !partialRecovery {
 			// Bash appends a machine-oriented timeout marker after any captured
 			// stdout/stderr. The result row above communicates that state once;
 			// keep useful pre-timeout output without echoing the marker as a red
@@ -655,6 +674,68 @@ func bestErrorSummaryLine(out string) string {
 	return best
 }
 
+// isDeniedToolResult detects permission-policy denials — the output
+// dispatch.go emits for a PermissionDeny decision ("denied: <reason>"
+// for the TUI, "denied by permission policy: <reason>" for the model).
+// These get a compact "· denied" summary line instead of a 60-rune
+// truncation of the diagnostic; the full reason renders in the error
+// body row directly below, so nothing is lost — just not duplicated.
+func isDeniedToolResult(out string) bool {
+	low := strings.ToLower(strings.TrimSpace(normalizeToolOutput(out)))
+	if low == "" {
+		return false
+	}
+	return strings.HasPrefix(low, "denied") ||
+		strings.Contains(low, "denied by permission policy")
+}
+
+// stripDenyEnvelope removes the wrapper dispatch.go adds around a deny
+// reason ("denied: …", "denied by permission policy: …", "denied by
+// user: …", optionally behind "Error: ") so the body shows only the
+// reason itself. Only applied when the FIRST non-empty line carries
+// the envelope — composite outputs (installer logs that happen to
+// contain a deny line) stay untouched.
+func stripDenyEnvelope(out string) string {
+	o := strings.TrimSpace(normalizeToolOutput(out))
+	o = strings.TrimSpace(strings.TrimPrefix(o, "Error:"))
+	if !strings.HasPrefix(o, "denied") {
+		return o
+	}
+	o = strings.TrimSpace(o[len("denied"):])
+	if strings.HasPrefix(o, "by permission policy") {
+		o = strings.TrimSpace(o[len("by permission policy"):])
+	} else if strings.HasPrefix(o, "by user") {
+		o = strings.TrimSpace(o[len("by user"):])
+	}
+	return strings.TrimLeft(o, ": ")
+}
+
+// renderDenyReasonBody renders the denial reason as muted prose —
+// claude-code parity: its RejectedToolUseMessage / InterruptedByUser
+// are dim text, not an error-red wall. The row above already says
+// "Denied"; the reason is the informational part.
+func renderDenyReasonBody(reason string, expanded bool) string {
+	if reason == "" {
+		return ""
+	}
+	lines := strings.Split(reason, "\n")
+	const maxPreview = 5
+	show := lines
+	if !expanded && len(show) > maxPreview {
+		show = show[:maxPreview]
+	}
+	var s strings.Builder
+	for _, ln := range show {
+		s.WriteString(styleDim.Render("       " + truncateMiddle(ln, 120)))
+		s.WriteString("\n")
+	}
+	if !expanded && len(lines) > maxPreview {
+		s.WriteString(styleMuted.Render(fmt.Sprintf("       … +%d more lines (ctrl+O to expand)", len(lines)-maxPreview)))
+		s.WriteString("\n")
+	}
+	return s.String()
+}
+
 // summarizeToolResult crafts the per-tool one-line description that
 // follows the ⎿ checkmark. Format is `<elapsed> · <tool-specific phrase>`.
 func summarizeToolResult(te ToolEvent) string {
@@ -677,6 +758,15 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 	// formatElapsed always picks the unit by magnitude, so 0
 	// becomes "0ms" — same column-shape as the rest.
 	dur := formatElapsed(te.Duration)
+	// Permission denials get the compact status treatment (claude-code
+	// parity): renderToolEvent's row reads "⛔ Denied" with the full
+	// reason in the body below; this branch keeps the /session summary
+	// view consistent. No elapsed time — a permission refusal is not a
+	// timed operation, and "0ms · denied" only added noise (user
+	// feedback 2026-08-15: "✗ 2ms · denied" 很丑).
+	if te.IsError && isDeniedToolResult(te.Output) {
+		return "denied"
+	}
 	// Strip "sub: " for the switch dispatch so per-tool summaries
 	// (Read line count, Edit added/removed, Write line count, etc.)
 	// fire for forwarded sub-agent events too. Pre-2026-05-21 a

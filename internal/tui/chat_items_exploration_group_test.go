@@ -150,7 +150,7 @@ func TestBuildChatItems_UnrecoveredAndSecurityErrorsStayVisible(t *testing.T) {
 		{
 			ID: "denied", Kind: "result", ToolName: "Bash", IsError: true,
 			Input:  map[string]any{"command": "unsafe", "description": "Run protected command"},
-			Output: "denied by permission policy: bash-security rule #23", StartTime: now.Add(2 * time.Millisecond),
+			Output: "denied by permission policy: newline inside quotes followed by a #-prefixed line — can hide arguments from line-based permission checks", StartTime: now.Add(2 * time.Millisecond),
 		},
 		{
 			ID: "later-ok", Kind: "result", ToolName: "Bash",
@@ -168,7 +168,7 @@ func TestBuildChatItems_UnrecoveredAndSecurityErrorsStayVisible(t *testing.T) {
 	for _, item := range items {
 		rendered += stripANSI(item.Render(100))
 	}
-	for _, want := range []string{"Failed to clone repository", "denied by permission policy"} {
+	for _, want := range []string{"Failed to clone repository", "⛔ Denied", "can hide arguments from line-based permission checks"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("important error evidence %q disappeared:\n%s", want, rendered)
 		}
