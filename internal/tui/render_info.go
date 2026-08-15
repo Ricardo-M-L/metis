@@ -655,7 +655,7 @@ func renderPRComments(prNum string) string {
 // Layout (mirrors claude-code's Context Usage screen):
 //
 //	Context Usage
-//	⛁ ⛁ ⛁ ⛀ ⛶ ⛶ … ⛶  ← 200-cell grid (20 × 10), each cell = cap/200 tokens
+//	⛁ ⛁ ⛁ ⛀ ⛶ ⛶ … ⛶  ← 160-cell grid (20 × 8), each cell = cap/160 tokens
 //	                  Model name (window cap)
 //	                  Provider · model id
 //	                  USED / CAP tokens (PCT%)
@@ -674,7 +674,7 @@ func renderPRComments(prNum string) string {
 func renderContext(m *Model) string {
 	const (
 		cellsW   = 20
-		cellsH   = 10
+		cellsH   = 8
 		cellsTot = cellsW * cellsH
 
 		usedGlyph = "⛁"
@@ -772,8 +772,8 @@ func renderContext(m *Model) string {
 	}
 	annotations[2] = fmt.Sprintf("%s/%s tokens (%d%%)", fmtThousands(used), fmtThousands(cap), pct)
 
-	// Categories rendered on rows 4-9 (rows 0-3 are headline).
-	annotations[4] = "Estimated usage by category"
+	// Categories rendered on rows 3-7 (rows 0-2 are headline).
+	annotations[3] = "─ by category"
 	cats := []struct {
 		label string
 		toks  int
@@ -784,26 +784,19 @@ func renderContext(m *Model) string {
 		{"Messages", msgsEst},
 	}
 	for i, c := range cats {
-		row := 5 + i
+		row := 4 + i
 		if row >= cellsH {
 			break
 		}
 		catPct := 0
 		if cap > 0 {
-			catPct = c.toks * 1000 / cap // ‰ for finer-grained display
+			catPct = c.toks * 100 / cap
 		}
-		annotations[row] = fmt.Sprintf("%s %s: %s tokens (%d.%d%%)",
-			usedGlyph, c.label, fmtThousands(c.toks), catPct/10, catPct%10)
+		annotations[row] = fmt.Sprintf("%s: %s tokens (%d%%)",
+			c.label, fmtThousands(c.toks), catPct)
 	}
-	if cellsH > 9 {
-		free := cap - used
-		if free < 0 {
-			free = 0
-		}
-		freePct := 100 - pct
-		annotations[9] = fmt.Sprintf("%s Free space: %s (%d%%)",
-			freeGlyph, fmtThousands(free), freePct)
-	}
+	// Row 8-9: leave the grid showing remaining free space —
+	// no separate "free space" annotation since the ⛶ cells are visible.
 
 	var s strings.Builder
 	s.WriteString(styleAccent.Render("Context Usage") + "\n")

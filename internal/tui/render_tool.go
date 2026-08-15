@@ -134,29 +134,27 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	// renders at default fg — user screenshot 36 / 2026-05-17 flagged
 	// the dim grey as too low-contrast. This is the most-scanned line
 	// per tool call and it's informational, not chrome.
-	s.WriteString(styleDim.Render(resultIndent + glyphTreeLeaf + "  "))
 	if denied {
-		// Denials render as a plain status word with NO glyph and NO
-		// elapsed time. claude-code's transcript shows dim "Tool use
-		// rejected" (no icon — its ⛔/✗ live in the permission DIALOG,
-		// not the result row) and codex shows "Request denied" in bold
-		// text, also icon-less. The metis ⛔ variant (user feedback
-		// 2026-08-15: "⛔ 这个不好看") dropped for parity. The reason
-		// moves to a single dim prose line below.
-		s.WriteString("Denied")
+		// Denied: flat prose at leader indent (leadIndent), no tree
+		// glyph and no extra indent. The extra indent + ⎿ made the
+		// result look like a nested code-block continuation instead
+		// of a plain status line (user feedback 2026-08-15: "排版太
+		// 突出了"). The denial reason follows on the next line.
+		s.WriteString(styleDim.Render(leadIndent + "Denied"))
 	} else if blocked {
-		// Same icon-less status treatment for safety blocks; "Blocked"
-		// rather than "Denied" because this is a policy refusal, not a
-		// permission decision.
-		s.WriteString("Blocked")
-	} else if neutralNoMatch {
-		s.WriteString(styleDim.Render("○ "))
-	} else if partialRecovery {
-		s.WriteString(styleWarn.Render("↻ "))
-	} else if te.IsError {
-		s.WriteString(styleErr.Render("✗ "))
+		// Same flat treatment for safety blocks.
+		s.WriteString(styleDim.Render(leadIndent + "Blocked"))
 	} else {
-		s.WriteString(styleAccent.Render("✓ "))
+		s.WriteString(styleDim.Render(resultIndent + glyphTreeLeaf + "  "))
+		if neutralNoMatch {
+			s.WriteString(styleDim.Render("○ "))
+		} else if partialRecovery {
+			s.WriteString(styleWarn.Render("⇻ "))
+		} else if te.IsError {
+			s.WriteString(styleErr.Render("✗ "))
+		} else {
+			s.WriteString(styleAccent.Render("✓ "))
+		}
 	}
 	if denied || blocked {
 		// Row already carries "Denied"/"Blocked"; nothing else to append.
