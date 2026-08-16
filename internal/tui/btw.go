@@ -21,5 +21,13 @@ func (m *Model) startBtwQuery(question string) tea.Cmd {
 		return nil
 	}
 	o := overlay.NewBtwOverlay(m.ctx, question, m.ext.BtwAsk)
-	return m.overlays.Push(o)
+	cmd := m.overlays.Push(o)
+	// Reset the input after pushing the overlay so the next Enter (e.g.
+	// the user closes the modal with Esc and immediately presses Enter
+	// again) does not re-invoke handleSubmit with the original "/btw …"
+	// text still sitting in the textarea. Without this the user would
+	// accidentally send "/btw …" as a regular user message instead of
+	// opening the side-question again.
+	m.input.Reset()
+	return cmd
 }

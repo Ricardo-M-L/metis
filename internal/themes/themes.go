@@ -152,7 +152,10 @@ var currentTheme = func() *Theme {
 	// no TTY, no answer, but the 200ms wait still adds startup
 	// latency we can avoid. NO_COLOR is also a strong "user has
 	// non-default expectations" signal where probing is rude.
-	if os.Getenv("CI") == "" && os.Getenv("NO_COLOR") == "" {
+	// METIS_SKIP_OSC11 explicitly opts out — useful for test/CI
+	// environments where neither CI nor NO_COLOR is set but /dev/tty
+	// doesn't behave as a real TTY (2026-08-16 go-test hang).
+	if os.Getenv("CI") == "" && os.Getenv("NO_COLOR") == "" && os.Getenv("METIS_SKIP_OSC11") == "" {
 		if isLight, ok := term.DetectTerminalBackground(); ok && isLight {
 			if t, ok := allThemes["light"]; ok {
 				return t

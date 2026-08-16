@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"golang.org/x/term"
+	"golang.org/x/sys/unix"
 )
 
 // queryOSC11Timeout caps the total time spent waiting for the
@@ -47,43 +48,52 @@ const queryOSC11Timeout = 200 * time.Millisecond
 //
 // > 0.5 of full-scale → light; ≤ 0.5 → dark.
 func DetectTerminalBackground() (isLight bool, ok bool) {
-	// 1. open /dev/tty as read+write. We deliberately don't reuse
-	// os.Stdin / os.Stdout — those may be pipes (`metis | less`) or
-	// captured by the test harness, in which case the OSC query
-	// would never reach a real TTY.
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	// 1. open /dev/tty in NON-BLOCKING mode.
+	// Without O_NONBLOCK, f.Read blocks forever when another process
+	// (e.g. metis itself) already owns this TTY in raw mode and
+	// consumes our OSC 11 response.
+	// (2026-08-16 regression: go test ./internal/tui hung for
+	// minutes because the TTY was already claimed.)
+	tty, err := os.OpenFile("/dev/tty", unix.O_RDWR|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return false, false
 	}
 	defer tty.Close()
 
-	// Switch the TTY into raw mode for the duration of the probe so the
-	// terminal's response isn't echoed back to the screen as visible
-	// `^[]11;rgb:...^G` characters before bubbletea enters alt-screen.
-	// Without this, on cooked-mode startup (the default before any TUI
-	// touches termios) the OSC11 reply leaks onto the user's prompt
-	// area for one frame — looks like a string of garbage characters
-	// before the welcome card paints.
 	fd := int(tty.Fd())
-	if term.IsTerminal(fd) {
-		if oldState, terr := term.MakeRaw(fd); terr == nil {
-			defer term.Restore(fd, oldState)
-		}
+	if !term.IsTerminal(fd) {
+		return false, false
 	}
 
-	// 2. send OSC11 ?-query. We use BEL terminator (\x07) — wider
-	// support than ST (ESC \). Terminals that reject BEL would also
-	// reject ST in our experience; this isn't worth a probe-and-retry.
+	// HARD GUARD: on macOS, if another process owns this TTY in raw
+	// mode, opening /dev/tty yields a POLLNVAL fd (revents=0x20).
+	// unix.Read on such a fd blocks indefinitely even with
+	// O_NONBLOCK — the kernel doesn't return EAGAIN. Detect this
+	// early and bail out. We check POLLERR|POLLHUP|POLLNVAL because
+	// all three mean "fd is not usable for reading."
+	pfds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	_, pollErr := unix.Poll(pfds, 1) // 1ms probe
+	if pollErr != nil && pollErr != unix.EINTR {
+		return false, false
+	}
+	if pfds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+		return false, false
+	}
+
+	// Switch into raw mode so the terminal's response isn't echoed
+	// back to the screen as visible `^[]11;rgb:...^G` characters
+	// before bubbletea enters alt-screen.
+	if oldState, terr := term.MakeRaw(fd); terr == nil {
+		defer term.Restore(fd, oldState)
+	}
+
+	// 2. send OSC 11 query.
 	if _, err := tty.WriteString("\x1b]11;?\x07"); err != nil {
 		return false, false
 	}
 
-	// 3. read response with deadline. We can't use io.ReadAll — that
-	// would block forever on a non-responding TTY. SetReadDeadline
-	// only works on files where the underlying FD supports it; on
-	// macOS BSD a TTY does support it. As a backstop we also run the
-	// read in a goroutine with a select.
-	buf, err := readWithTimeout(tty, queryOSC11Timeout, 64)
+	// 3. read response with a hard poll-based timeout.
+	buf, err := readWithPoll(fd, queryOSC11Timeout, 64)
 	if err != nil {
 		return false, false
 	}
@@ -91,55 +101,65 @@ func DetectTerminalBackground() (isLight bool, ok bool) {
 	if perr != nil {
 		return false, false
 	}
-	// ITU-R BT.601 luma. We use float64 once and discard.
 	y := 0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)
 	return y > 0.5, true
 }
 
-// readWithTimeout drains stdin until we see the BEL or ST terminator,
-// or we hit `dur`. Reads in a goroutine so the timeout select can
-// preempt a syscall that doesn't honor SetReadDeadline (rare but
-// happens in screen / under specific tmux configs).
-func readWithTimeout(f *os.File, dur time.Duration, maxBytes int) ([]byte, error) {
-	type result struct {
-		buf []byte
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		buf := make([]byte, 0, 64)
-		tmp := make([]byte, 1)
-		_ = f.SetReadDeadline(time.Now().Add(dur))
-		defer f.SetReadDeadline(time.Time{}) // clear so subsequent reads aren't truncated
-		for {
-			n, err := f.Read(tmp)
-			if n > 0 {
-				buf = append(buf, tmp[:n]...)
-				// terminators: BEL (0x07) or ST (ESC \).
-				if tmp[0] == 0x07 {
-					ch <- result{buf, nil}
-					return
-				}
-				if len(buf) >= 2 && buf[len(buf)-2] == 0x1b && buf[len(buf)-1] == '\\' {
-					ch <- result{buf, nil}
-					return
-				}
-				if len(buf) >= maxBytes {
-					ch <- result{buf, errors.New("osc11: response too long")}
-					return
-				}
+// readWithPoll reads from an fd using unix.Poll for a hard timeout.
+// We use unix.Poll rather than a Go timer + select because the
+// runtime cannot interrupt a syscall blocked in read(2). Poll returns
+// within pollMs, giving us a reliable timeout. We also check for
+// POLLNVAL (invalid open) which on macOS shared TTY makes unix.Read
+// block forever.
+func readWithPoll(fd int, dur time.Duration, maxBytes int) ([]byte, error) {
+	buf := make([]byte, 0, maxBytes)
+	tmp := make([]byte, 1)
+	deadline := time.Now().Add(dur)
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, errors.New("osc11: timeout")
+		}
+
+		pfds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		pollMs := int(remaining.Milliseconds())
+		if pollMs < 1 {
+			pollMs = 1
+		}
+		_, pollErr := unix.Poll(pfds, pollMs)
+		if pollErr != nil && pollErr != unix.EINTR {
+			return nil, pollErr
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("osc11: timeout")
+		}
+		if pfds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return nil, errors.New("osc11: fd error")
+		}
+		if pfds[0].Revents&unix.POLLIN == 0 {
+			return nil, errors.New("osc11: timeout")
+		}
+
+		n, readErr := unix.Read(fd, tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			if tmp[0] == 0x07 {
+				return buf, nil
 			}
-			if err != nil {
-				ch <- result{buf, err}
-				return
+			if len(buf) >= 2 && buf[len(buf)-2] == 0x1b && buf[len(buf)-1] == '\\' {
+				return buf, nil
+			}
+			if len(buf) >= maxBytes {
+				return buf, errors.New("osc11: response too long")
 			}
 		}
-	}()
-	select {
-	case r := <-ch:
-		return r.buf, r.err
-	case <-time.After(dur + 50*time.Millisecond):
-		return nil, errors.New("osc11: timeout")
+		if readErr == unix.EAGAIN || readErr == unix.EWOULDBLOCK {
+			continue
+		}
+		if readErr != nil {
+			return buf, readErr
+		}
 	}
 }
 
@@ -180,8 +200,6 @@ func parseOSC11Response(buf []byte) (r, g, b float64, err error) {
 		if e != nil {
 			return 0, e
 		}
-		// scale to [0,1]: 4-hex digit (max 0xffff) → /65535;
-		// 2-hex digit → /255.
 		switch len(hex) {
 		case 1:
 			return float64(v) / 15.0, nil
