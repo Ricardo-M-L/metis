@@ -5,6 +5,32 @@ All notable changes to Metis are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.27] - 2026-08-16
+
+### Fixed
+
+- **safe separation between source and release installs**: `make install` no
+  longer writes a second binary to `~/go/bin` and refuses to replace the
+  versioned launcher owned by the curl installer. Local builds therefore
+  cannot silently disable native updates or shadow them through PATH.
+- **portable OSC 11 background probing**: the `/dev/tty` and `poll(2)` probe is
+  now compiled only on Unix, with a non-blocking Windows fallback. This
+  restores Windows amd64/arm64 builds while retaining the Unix hang guard.
+- **terminal reply and input isolation**: partial OSC 11 replies are removed
+  without leaking terminal color fragments or tool results into the composer,
+  and the affected TUI regression files now satisfy the repository format gate.
+
+## [0.4.26] - 2026-08-16
+
+### Fixed
+
+- **compact security-denial rows**: denied and blocked tool results use the
+  normal flat tree rhythm instead of adding an extra icon or indentation.
+- **fragmented OSC 11 reply scrubbing**: partial terminal color-query prefixes
+  and adjacent hex bodies no longer leak into the input box.
+
 ## [0.4.25] - 2026-08-15
 
 ### Fixed
@@ -873,7 +899,9 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.25...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.27...HEAD
+[0.4.27]: https://github.com/Ricardo-M-L/metis/compare/v0.4.26...v0.4.27
+[0.4.26]: https://github.com/Ricardo-M-L/metis/compare/v0.4.25...v0.4.26
 [0.4.25]: https://github.com/Ricardo-M-L/metis/compare/v0.4.24...v0.4.25
 [0.4.24]: https://github.com/Ricardo-M-L/metis/compare/v0.4.23...v0.4.24
 [0.4.23]: https://github.com/Ricardo-M-L/metis/compare/v0.4.22...v0.4.23
