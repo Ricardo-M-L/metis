@@ -107,8 +107,14 @@ by a later cleanup after the process releases it.
 For local development, build from source:
 
 ```sh
-make install            # builds + installs to ~/.local/bin/metis and ~/go/bin/metis
+make build              # versioned source build at ./bin/metis
+./bin/metis
 ```
+
+`make install` installs one local-source binary at `~/.local/bin/metis` only
+when that path is not owned by the curl installer. It refuses to replace a
+managed release and never writes a second copy to `~/go/bin`; this prevents a
+stale source build from shadowing native automatic updates.
 
 ## Usage
 

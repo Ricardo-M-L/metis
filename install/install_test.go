@@ -856,6 +856,137 @@ func TestInstallerRetainsCurrentAndTwoPreviousVersions(t *testing.T) {
 	}
 }
 
+func TestLocalBuildInstallerUsesOneUnmanagedDestination(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local source installer is for macOS and Linux")
+	}
+
+	baseDir := t.TempDir()
+	source := filepath.Join(baseDir, "source-metis")
+	destination := filepath.Join(baseDir, "local", "bin", "metis")
+	want := []byte("#!/bin/sh\necho local-build\n")
+	if err := os.WriteFile(source, want, 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+
+	cmd := exec.Command("bash", "../scripts/install-local-build.sh", source, destination)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install local build: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read installed local build: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("installed local build = %q, want %q", got, want)
+	}
+}
+
+func TestLocalBuildInstallerRefusesCurlManagedLauncher(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local source installer is for macOS and Linux")
+	}
+
+	baseDir := t.TempDir()
+	installDir := filepath.Join(baseDir, "local", "bin")
+	versionsDir := filepath.Join(baseDir, "local", "share", "metis", "versions")
+	versionedDir := filepath.Join(versionsDir, "9.9.9")
+	if err := os.MkdirAll(versionedDir, 0o755); err != nil {
+		t.Fatalf("create managed version directory: %v", err)
+	}
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatalf("create install directory: %v", err)
+	}
+
+	managedBinary := filepath.Join(versionedDir, "metis")
+	managedContent := []byte("#!/bin/sh\necho managed-release\n")
+	if err := os.WriteFile(managedBinary, managedContent, 0o755); err != nil {
+		t.Fatalf("write managed binary: %v", err)
+	}
+	launcher := filepath.Join(installDir, "metis")
+	if err := os.Symlink(managedBinary, launcher); err != nil {
+		t.Fatalf("create managed launcher: %v", err)
+	}
+
+	source := filepath.Join(baseDir, "source-metis")
+	if err := os.WriteFile(source, []byte("#!/bin/sh\necho local-build\n"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	cmd := exec.Command("bash", "../scripts/install-local-build.sh", source, launcher)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("managed launcher was overwritten; output=%q", out)
+	}
+	if !strings.Contains(string(out), "refusing to replace curl-managed Metis") {
+		t.Fatalf("refusal did not explain managed ownership: %q", out)
+	}
+	target, err := os.Readlink(launcher)
+	if err != nil {
+		t.Fatalf("managed launcher is no longer a symlink: %v", err)
+	}
+	if target != managedBinary {
+		t.Fatalf("managed launcher target = %q, want %q", target, managedBinary)
+	}
+}
+
+func TestLocalBuildInstallerRefusesLegacyManagedLayout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local source installer is for macOS and Linux")
+	}
+
+	baseDir := t.TempDir()
+	installDir := filepath.Join(baseDir, "local", "bin")
+	versionsDir := filepath.Join(baseDir, "local", "share", "metis", "versions", "1.2.3")
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatalf("create install directory: %v", err)
+	}
+	if err := os.MkdirAll(versionsDir, 0o755); err != nil {
+		t.Fatalf("create legacy managed directory: %v", err)
+	}
+
+	launcher := filepath.Join(installDir, "metis")
+	want := []byte("#!/bin/sh\necho legacy-managed-release\n")
+	if err := os.WriteFile(launcher, want, 0o755); err != nil {
+		t.Fatalf("write legacy managed launcher: %v", err)
+	}
+	source := filepath.Join(baseDir, "source-metis")
+	if err := os.WriteFile(source, []byte("#!/bin/sh\necho local-build\n"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+
+	cmd := exec.Command("bash", "../scripts/install-local-build.sh", source, launcher)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("legacy managed launcher was overwritten; output=%q", out)
+	}
+	got, err := os.ReadFile(launcher)
+	if err != nil {
+		t.Fatalf("read preserved legacy launcher: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("legacy managed launcher changed: got %q, want %q", got, want)
+	}
+}
+
+func TestMakeInstallDoesNotCreateGoInstallShadow(t *testing.T) {
+	makefile, err := os.ReadFile("../Makefile")
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	text := string(makefile)
+	start := strings.Index(text, "\ninstall: build\n")
+	end := strings.Index(text, "\nrun: build\n")
+	if start < 0 || end <= start {
+		t.Fatalf("could not isolate install target")
+	}
+	recipe := text[start:end]
+	if strings.Contains(recipe, "go install") {
+		t.Fatalf("install target still creates a PATH-shadowing Go binary:\n%s", recipe)
+	}
+	if !strings.Contains(recipe, "LOCAL_INSTALL_SCRIPT") {
+		t.Fatalf("install target bypasses guarded local installer:\n%s", recipe)
+	}
+}
+
 func withoutEnv(env []string, names ...string) []string {
 	blocked := make(map[string]bool, len(names))
 	for _, name := range names {

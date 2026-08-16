@@ -17,6 +17,9 @@ COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 MAKEFILE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 VERIFY_DIST := $(MAKEFILE_DIR)/scripts/verify-dist.sh
+LOCAL_INSTALL_DIR ?= $(HOME)/.local/bin
+LOCAL_INSTALL_PATH := $(LOCAL_INSTALL_DIR)/$(BIN_NAME)
+LOCAL_INSTALL_SCRIPT := $(MAKEFILE_DIR)/scripts/install-local-build.sh
 
 LDFLAGS := -ldflags "-s -w \
 	-X $(PKG)/internal/version.Version=$(VERSION) \
@@ -27,12 +30,7 @@ build:
 	go build $(LDFLAGS) -o bin/$(BIN_NAME) ./cmd/metis
 
 install: build
-	install -m 0755 bin/$(BIN_NAME) $(HOME)/.local/bin/$(BIN_NAME)
-	@# Also install via `go install` so $(GOBIN) (typically ~/go/bin) gets
-	@# the same build with version metadata injected — without this step,
-	@# users whose PATH puts ~/go/bin before ~/.local/bin would run a stale
-	@# `go install` build that lacks the build-time Date.
-	go install $(LDFLAGS) ./cmd/metis
+	@"$(LOCAL_INSTALL_SCRIPT)" "$(CURDIR)/bin/$(BIN_NAME)" "$(LOCAL_INSTALL_PATH)"
 
 run: build
 	./bin/$(BIN_NAME)
@@ -69,10 +67,10 @@ verify-version:
 #   make bump-patch        0.1.0 -> 0.1.1
 #   make bump-minor        0.1.5 -> 0.2.0
 #   make bump-major        0.2.3 -> 1.0.0
-#   make release-patch     bump-patch + install
+#   make release-patch     bump-patch + build
 #
-# During testing keep using `make build` / `make install` — they leave the
-# version number alone.
+# During testing, prefer `make build`. `make install` leaves the version alone,
+# installs one local binary only, and refuses to replace a curl-managed release.
 
 bump-patch:
 	@cur=$$(cat $(VERSION_FILE)); \
@@ -97,9 +95,14 @@ _do-bump:
 	@sed -i.bak -E 's/"version": "[^"]*"/"version": "$(NEW)"/' install/npm/package.json && rm install/npm/package.json.bak
 	@echo "version: $(CUR) -> $(NEW)"
 
-release-patch: bump-patch install
-release-minor: bump-minor install
-release-major: bump-major install
+release-patch: bump-patch
+	@$(MAKE) --no-print-directory build
+
+release-minor: bump-minor
+	@$(MAKE) --no-print-directory build
+
+release-major: bump-major
+	@$(MAKE) --no-print-directory build
 
 # Cross-compile the GitHub Release assets. Unix targets use tar.gz; Windows
 # targets use zip so the archive works with built-in PowerShell tooling. Raw

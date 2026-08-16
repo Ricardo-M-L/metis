@@ -73,8 +73,13 @@ Common local build and install targets:
 ```sh
 make test                               # optional root-module race + coverage run
 make build                              # versioned CLI at ./bin/metis
-make install                            # ~/.local/bin/metis + the active Go bin dir
+make install                            # one local binary; refuses a managed release
 ```
+
+If the curl-installed release already owns `~/.local/bin/metis`, run the
+source build as `./bin/metis`. The Make target deliberately does not call
+`go install`, because a second binary in `~/go/bin` can shadow the managed
+launcher and remain stale after automatic updates.
 
 The repository also contains nested modules that root-level `./...` does not
 cross. Run the matching checks when those areas change; CI runs all of them:
