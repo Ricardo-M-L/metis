@@ -57,6 +57,28 @@ func TestScrubEscapeLeaks(t *testing.T) {
 		// scrubbed.
 		{"OSC 111 with bracket and ST", "]111\x1b\\", ""},
 		{"OSC 110 with ESC anchor and ST", "\x1b110\x1b\\", ""},
+
+		// --- NEW (2026-08-15): partial-prefix leaks from screenshot ---
+		// When bubbletea's parser consumes more of the OSC 11 prefix
+		// than expected (`]11;rgb:1` or even `]11;rgb:`), the remaining
+		// text is just hex fragments that the old patterns couldn't match.
+		{"screenshot hex body", "58e/193a/1e75", ""},
+		{"screenshot hex with ST", "58e/193a/1e75\\", ""},
+		{"screenshot hex with BEL", "58e/193a/1e75\x1b\\", ""},
+		{"semicolon rgb prefix preserved", ";rgb:158e/193a/1e75\\", ""},
+		{"rgb colon prefix preserved", "rgb:158e/193a/1e75\\", ""},
+		{"first digit consumed", "158e/193a/1e75\\", ""},
+		// Adjacent hex bodies from multiple interleaved OSC 11 replies.
+		// The multi-pass loop must catch the second body after the
+		// first is stripped.
+		{"two adjacent hex bodies", "58e/193a/1e7558e/193a/1e75", ""},
+		{"hex body mixed with text", "hello58e/193a/1e75world", "helloworld"},
+		{"CJK with hex body", "说中文58e/193a/1e75测试", "说中文测试"},
+
+		// Date / ratio formats must NOT be stripped — the {2,4} group
+		// size prevents matching single-char groups like `1/22/2024`.
+		{"date not stripped", "1/22/2024", "1/22/2024"},
+		{"ratio not stripped", "a/b/c", "a/b/c"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

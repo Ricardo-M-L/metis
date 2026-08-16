@@ -40,6 +40,35 @@ var escapeLeakPatterns = []*regexp.Regexp{
 	// (the parser ate `]1` together). So we accept ANY leading digit
 	// run before `;rgb:` rather than enumerating 10/11 specifically.
 	regexp.MustCompile(`\]?\d+;rgb:[0-9a-fA-F/]+(?:\x1b\\|\\)?`),
+	// --- NEW (2026-08-15): when the parser eats MORE of the prefix ---
+	// The user screenshot showed `58e/193a/1e75e/193a/1e7575` — that's
+	// OSC 11 replies (`]11;rgb:158e/193a/1e75\`) where the parser
+	// consumed `]11;rgb:1` (or more) and the remaining hex body arrived
+	// as plain text. The existing `\d+;rgb:` patterns can't match these
+	// because there are no digits left before `;rgb:`.
+	//
+	// Three new patterns cover the three degrees of prefix loss:
+	// 1. Digits consumed, `;rgb:` prefix survives.
+	// 2. `;` and digits consumed, `rgb:` prefix survives.
+	// 3. Entire prefix consumed, only the RRRR/GGGG/BBBB hex body
+	//    remains. This is the shape that appeared in the screenshot.
+	//
+	// Group sizes are {2,4} (OSC replies use exactly 4-char groups,
+	// partial consumption can leave 2-4). We deliberately don't allow
+	// 1-char groups to avoid false positives on date formats like
+	// `1/22/2024` or ratio text. The cost is that a single residual
+	// fragment like `e/193a/1e75` may survive, but that's far better
+	// than nothing.
+	//
+	// Placed AFTER the digit-prefixed patterns above so the more
+	// specific matches consume complete sequences first, leaving the
+	// general patterns to clean up only when prefix bytes are gone.
+	// scrubEscapeLeaks loops until stable so adjacent hex bodies
+	// (from multiple interleaved OSC 11 replies) get caught on
+	// subsequent passes.
+	regexp.MustCompile(`;rgb:[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}(?:\x1b\\|\\)?`),
+	regexp.MustCompile(`rgb:[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}(?:\x1b\\|\\)?`),
+	regexp.MustCompile(`[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}(?:\x1b\\|\\)?`),
 	// OSC color-reset: 110/111/112. The numeric body is preceded by
 	// either `]` (the OSC introducer made it through) or — when the
 	// parser ate the introducer — by `\x1b` (the ESC byte itself).
@@ -74,11 +103,22 @@ var escapeLeakPatterns = []*regexp.Regexp{
 // without disturbing genuine user input. Returns the cleaned string;
 // caller compares to the original to decide whether to update the
 // textarea.
+//
+// The outer loop re-applies all patterns until no further changes are
+// made. Without it, adjacent hex bodies from multiple interleaved
+// OSC 11 replies (e.g. `58e/193a/1e7558e/193a/1e75`) would leave
+// residual fragments after a single pass.
 func scrubEscapeLeaks(s string) string {
-	for _, re := range escapeLeakPatterns {
-		s = re.ReplaceAllString(s, "")
+	for {
+		cleaned := s
+		for _, re := range escapeLeakPatterns {
+			cleaned = re.ReplaceAllString(cleaned, "")
+		}
+		if cleaned == s {
+			return cleaned
+		}
+		s = cleaned
 	}
-	return s
 }
 
 // pastedImageTag matches the `[Image #N]` placeholder Ctrl-V inserts
