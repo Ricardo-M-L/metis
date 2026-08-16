@@ -972,7 +972,7 @@ func TestMakeInstallDoesNotCreateGoInstallShadow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read Makefile: %v", err)
 	}
-	text := string(makefile)
+	text := strings.ReplaceAll(string(makefile), "\r\n", "\n")
 	start := strings.Index(text, "\ninstall: build\n")
 	end := strings.Index(text, "\nrun: build\n")
 	if start < 0 || end <= start {
