@@ -410,12 +410,22 @@ func TestRequestingToProviderEOFDoesNotScrollFullscreen(t *testing.T) {
 			strings.Contains(s, "connecting")
 	})
 	transitionOffset := len(initial)
+	initialClearCount := strings.Count(initial, ansi.EraseEntireScreen)
 
 	m.doneCh <- io.EOF
 	p.Send(spinnerTick{})
 	snapshot := waitForRendererOutput(t, out, rendererTestTimeout, func(s string) bool {
-		return len(s) > transitionOffset &&
-			strings.Contains(s[transitionOffset:], "API Error: EOF")
+		if !rendererMarkerAppearsAfterClear(
+			s, transitionOffset, initialClearCount+1, "API Error: EOF",
+		) {
+			return false
+		}
+		// The error line can be flushed as a differential frame before the
+		// geometry-transition ED2 arrives. Wait for the final repaint, where
+		// the requesting spinner has also been removed.
+		suffix := s[transitionOffset:]
+		lastClear := strings.LastIndex(suffix, ansi.EraseEntireScreen)
+		return lastClear >= 0 && !strings.Contains(suffix[lastClear:], "connecting")
 	})
 	suffix := snapshot[transitionOffset:]
 
