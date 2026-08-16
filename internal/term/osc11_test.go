@@ -1,3 +1,5 @@
+//go:build !windows
+
 package term
 
 // osc11_test.go — pin parseOSC11Response across the variants real

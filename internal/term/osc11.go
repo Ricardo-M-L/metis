@@ -1,3 +1,5 @@
+//go:build !windows
+
 package term
 
 // osc11.go — OSC 11 ("dynamic colors") query for the terminal's
@@ -29,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/term"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 // queryOSC11Timeout caps the total time spent waiting for the

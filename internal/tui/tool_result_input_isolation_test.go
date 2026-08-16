@@ -163,8 +163,8 @@ func TestEventToolResult_DoesNotModifyInputBox(t *testing.T) {
 	})
 
 	ev := agent.Event{
-		Kind:     agent.EventToolResult,
-		ToolName: "Bash",
+		Kind:      agent.EventToolResult,
+		ToolName:  "Bash",
 		ToolUseID: "tool-123",
 		ToolResult: &agent.ToolResult{
 			Output:  "ls output /tmp/foo\n/usr/local/bin\n[error] something broke",
