@@ -745,3 +745,114 @@ func TestLoopRun_FinalSummaryRescueStripsTools(t *testing.T) {
 		t.Fatalf("stop reason = %q, want end_turn (rescue text should close the turn cleanly)", stop)
 	}
 }
+
+// summarizerProvider is a compaction summarizer mock: Stream returns one
+// text summary (so summarizeOnce succeeds without the Complete fallback).
+type summarizerProvider struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *summarizerProvider) Name() string          { return "summarizer" }
+func (s *summarizerProvider) ModelID() string       { return "summarizer-model" }
+func (s *summarizerProvider) MaxContextTokens() int { return 200_000 }
+func (s *summarizerProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, errors.New("summarizer uses Stream")
+}
+func (s *summarizerProvider) Stream(_ context.Context, _ llm.Request) (llm.StreamReader, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return textStream("prior work summarized"), nil
+}
+
+func (s *summarizerProvider) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestCompactForSecondWind_ShrinksHistory(t *testing.T) {
+	summarizer := &summarizerProvider{}
+	loop := NewLoop(summarizer, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 50)
+	loop.Compactor = NewCompactor(Config{}, "summarizer-model", 200_000, summarizer)
+
+	// Hand-build a history with a user-text message inside the keepLast
+	// window so the active-task anchor does NOT skip compaction. Long
+	// real turns have user prompts/steers throughout; a pure tool-loop
+	// with a single leading prompt is the case the anchor skips.
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "initial task"}}},
+	}
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("t%d", i)
+		msgs = append(msgs,
+			llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "tool_use", ToolUseID: id, ToolName: "Bash"}}},
+			llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "tool_result", ToolUseID: id, ToolResult: "output"}}},
+		)
+	}
+	msgs = append(msgs,
+		llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "please continue"}}},
+		llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "tool_use", ToolUseID: "t6", ToolName: "Bash"}}},
+		llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "tool_result", ToolUseID: "t6", ToolResult: "output"}}},
+	)
+	loop.mu.Lock()
+	loop.Messages = msgs
+	loop.mu.Unlock()
+
+	out := make(chan Event, 64)
+	if !loop.compactForSecondWind(context.Background(), out) {
+		t.Fatal("compactForSecondWind should shrink a history with a recent user-text anchor")
+	}
+	close(out)
+
+	if got := summarizer.count(); got != 1 {
+		t.Fatalf("summarizer calls = %d, want 1", got)
+	}
+	loop.mu.RLock()
+	after := len(loop.Messages)
+	loop.mu.RUnlock()
+	if after >= len(msgs) {
+		t.Fatalf("history did not shrink: %d -> %d", len(msgs), after)
+	}
+}
+
+func TestLoopRun_SecondWindFallbackEndsCleanly(t *testing.T) {
+	// A pure tool-loop (no user-text in the keepLast window) makes the
+	// active-task anchor skip compaction, so the second wind falls through
+	// to grace -> tool-less rescue -> text. Assert the loop does NOT hang
+	// or loop forever and still ends with a clean conclusion.
+	summarizer := &summarizerProvider{}
+	provider := &rescueStrippingProvider{}
+	registry := tools.NewRegistry()
+	registry.Register(lowOutputTool{})
+	loop := NewLoop(provider, registry, permission.New(permission.ModeAcceptEdits), nil, "sys", 6)
+	loop.GraceCalls = 1
+	loop.Compactor = NewCompactor(Config{}, "summarizer-model", 200_000, summarizer)
+	loop.AppendUser("do a large task")
+	out := make(chan Event, 512)
+	if err := loop.Run(context.Background(), out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+
+	if got := summarizer.count(); got != 0 {
+		t.Fatalf("summarizer calls = %d, want 0 (anchor skip should not summarize)", got)
+	}
+	var stop string
+	var sawRescue bool
+	for ev := range out {
+		if ev.Kind == EventLoopDone {
+			stop = ev.StopReason
+		}
+		if ev.Kind == EventInfo && strings.Contains(ev.Info, "one rescue iteration") {
+			sawRescue = true
+		}
+	}
+	if !sawRescue {
+		t.Fatal("rescue iteration never reached after the skipped second wind")
+	}
+	if stop != "end_turn" {
+		t.Fatalf("stop reason = %q, want end_turn (rescue text closes the turn cleanly)", stop)
+	}
+}

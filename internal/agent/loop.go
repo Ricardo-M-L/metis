@@ -959,6 +959,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	graceUsed := 0
 	emptyStopRescued := false // see empty_stop_rescue.go — at most one rescue per turn
 	finalSummaryRescued := false
+	compactedAtCap := false // at most one forced-compaction "second wind" per turn
 	diminishingRescued := false
 	nudgeFired := make([]bool, len(iterNudges)) // see iter_nudge.go
 	progress := newProgressDetector()           // see progress_detector.go
@@ -1756,12 +1757,29 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return nil
 		}
 
-		// Budget check with grace call + final-summary rescue.
-		// Order matters: grace first (one extra iter for "I'm
-		// almost done"), then final summary rescue (one MORE iter
-		// where we explicitly tell the model to write the answer
-		// now instead of starting new work), then real abort.
+		// Budget check with second wind + grace call + final-summary rescue.
+		// Order matters:
+		//   1. Second wind — force one compaction and reset the budget so a
+		//      long-but-progressing task keeps going instead of hard-stopping
+		//      mid-work (DSH loops while(true); codex/claude-code compact and
+		//      continue rather than stop on an iteration count).
+		//   2. Grace call (one extra iter for "I'm almost done").
+		//   3. Final-summary rescue (one tool-less iter that forces text).
+		//   4. Real abort.
 		if runIter >= l.MaxIters {
+			if !compactedAtCap && l.Compactor != nil {
+				compactedAtCap = true
+				if l.compactForSecondWind(ctx, out) {
+					runIter = 0
+					emit(ctx, out, Event{
+						Kind: EventInfo,
+						Info: fmt.Sprintf("(iteration budget reached at %d — context compacted, continuing this turn with a fresh budget)", l.MaxIters),
+					})
+					continue
+				}
+				// Compaction unavailable/failed — fall through to the
+				// bounded grace → rescue → stop path.
+			}
 			if graceUsed < l.GraceCalls {
 				graceUsed++
 				continue
@@ -1806,6 +1824,56 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			return nil
 		}
 	}
+}
+
+// compactForSecondWind force-compacts the conversation history once when
+// the iteration budget is exhausted, so a long-but-progressing turn gets a
+// fresh budget instead of hard-stopping mid-work (claude-code's token-budget
+// compaction / DSH's unbounded while(true) both prefer continue-over-stop).
+// Returns true when the history actually shrank and the caller should reset
+// its run counter and keep looping. False = compactor unavailable, the
+// circuit breaker tripped, or the history was already too small to shrink —
+// in which case the caller falls through to the bounded grace→rescue→stop
+// path. Holds l.mu across the summarizer call (same contract as maybeCompact).
+func (l *Loop) compactForSecondWind(ctx context.Context, out chan<- Event) bool {
+	if l.Compactor == nil || l.Compactor.Provider == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	beforeTokens := estimateTokens(l.Messages)
+	beforeCount := len(l.Messages)
+	emit(ctx, out, Event{Kind: EventCompactionStart, Info: "second-wind"})
+	compacted, err := l.Compactor.Compact(WithEventOut(ctx, out), l.Messages)
+	if err != nil {
+		emit(ctx, out, Event{Kind: EventCompactionEnd, Info: "second-wind", Err: err})
+		return false
+	}
+	afterTokens := estimateTokens(compacted)
+	if afterTokens >= beforeTokens && len(compacted) >= beforeCount {
+		// Nothing to shrink (history already minimal). Don't grant a
+		// second wind — resetting the budget here would just re-run the
+		// same iterations and loop forever. Let the grace/rescue path
+		// close the turn with a summary instead.
+		emit(ctx, out, Event{Kind: EventCompactionEnd, Info: "second-wind"})
+		return false
+	}
+	l.Messages = compacted
+	l.estTokens.Store(int64(afterTokens))
+	emit(ctx, out, Event{
+		Kind:                  EventContextCompacted,
+		Info:                  "second-wind",
+		PreviousContextTokens: beforeTokens,
+		ContextTokens:         afterTokens,
+	})
+	emit(ctx, out, Event{
+		Kind: EventInfo,
+		Info: fmt.Sprintf("context compacted for budget second wind: %d → %d messages · ~%d → ~%d tokens",
+			beforeCount, len(compacted), beforeTokens, afterTokens),
+	})
+	emit(ctx, out, Event{Kind: EventCompactionEnd, Info: "second-wind"})
+	return true
 }
 
 // buildRequest assembles the per-iteration LLM Request under l.mu so the
