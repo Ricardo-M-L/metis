@@ -653,3 +653,95 @@ func TestLoopRun_DiminishingRescuePreservesResultsAndFinalAnswer(t *testing.T) {
 		t.Fatal("final request did not receive the bounded recovery reminder")
 	}
 }
+
+// rescueStrippingProvider keeps emitting a tool call whenever the request
+// carries tools, and emits a final text answer when tools are absent — so a
+// rescue request with tools stripped is the only thing that terminates the
+// loop. It records every request's tool set for assertions.
+type rescueStrippingProvider struct {
+	mu       sync.Mutex
+	requests []llm.Request
+}
+
+func (p *rescueStrippingProvider) Name() string          { return "rescue-stripping" }
+func (p *rescueStrippingProvider) ModelID() string       { return "test-model" }
+func (p *rescueStrippingProvider) MaxContextTokens() int { return 200_000 }
+func (p *rescueStrippingProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, errors.New("rescue stripping provider only supports Stream")
+}
+func (p *rescueStrippingProvider) Stream(_ context.Context, req llm.Request) (llm.StreamReader, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	call := len(p.requests)
+	p.mu.Unlock()
+	if len(req.Tools) > 0 {
+		id := fmt.Sprintf("low-%02d", call)
+		return &loopRegressionStream{events: []llm.StreamEvent{
+			{Type: "tool_use_start", ToolUseID: id, ToolName: "LowOutput"},
+			{Type: "tool_input_delta", ToolUseID: id, InputDelta: `{"payload":"tiny"}`},
+			{Type: "tool_use_stop", ToolUseID: id},
+			{Type: "message_delta", StopReason: "tool_use"},
+			{Type: "message_stop"},
+		}}, nil
+	}
+	return textStream("final summary written under the rescue cap"), nil
+}
+
+func (p *rescueStrippingProvider) captured() []llm.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]llm.Request(nil), p.requests...)
+}
+
+func TestLoopRun_FinalSummaryRescueStripsTools(t *testing.T) {
+	provider := &rescueStrippingProvider{}
+	registry := tools.NewRegistry()
+	registry.Register(lowOutputTool{})
+	loop := NewLoop(provider, registry, permission.New(permission.ModeAcceptEdits), nil, "sys", 6)
+	loop.GraceCalls = 1
+	loop.AppendUser("do a large task")
+	out := make(chan Event, 256)
+	if err := loop.Run(context.Background(), out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+
+	reqs := provider.captured()
+	var sawRescueRequest, rescueHadTools bool
+	var sawFinalText bool
+	for _, req := range reqs {
+		hasRescue := requestContains(req, "hit the iteration cap")
+		if hasRescue {
+			sawRescueRequest = true
+			rescueHadTools = len(req.Tools) > 0
+		}
+	}
+	for _, msg := range loop.History() {
+		for _, block := range msg.Content {
+			if block.Text == "final summary written under the rescue cap" {
+				sawFinalText = true
+			}
+		}
+	}
+	if !sawRescueRequest {
+		t.Fatal("rescue message never reached a provider request")
+	}
+	if rescueHadTools {
+		t.Fatalf("rescue request still carried tools (model could dodge the summary): tools=%d", len(reqs[len(reqs)-1].Tools))
+	}
+	if !sawFinalText {
+		t.Fatal("turn ended without a final text answer after the rescue")
+	}
+
+	// The loop must have terminated on the rescue iteration's end_turn, not
+	// by silently hitting the stop branch again.
+	var stop string
+	for ev := range out {
+		if ev.Kind == EventLoopDone {
+			stop = ev.StopReason
+		}
+	}
+	if stop != "end_turn" {
+		t.Fatalf("stop reason = %q, want end_turn (rescue text should close the turn cleanly)", stop)
+	}
+}

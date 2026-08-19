@@ -63,6 +63,17 @@ type Loop struct {
 	MaxIters       int
 	GraceCalls     int
 
+	// rescueNoTools forces the NEXT buildRequest to omit the tool list,
+	// guaranteeing a text-only iteration. Set by the final-summary rescue
+	// when the iter cap exhausts: the model is told to "write the answer
+	// now", but previously tools stayed available and a tool_use on that
+	// rescue iteration left its results dangling — the turn then ended
+	// with no conclusion (the "ran and then just stopped" symptom). With
+	// no tools in the schema the provider can only emit text, so the turn
+	// closes with a real summary. Consumed (cleared) by buildRequest so it
+	// affects exactly one request. Guarded by mu.
+	rescueNoTools bool
+
 	// Memory provides persistent memory for system prompt injection.
 	// When set, BuildContext() is called to inject memory into each request.
 	Memory *memory.MemoryManager
@@ -1762,6 +1773,10 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					Role:    llm.RoleUser,
 					Content: []llm.ContentBlock{{Type: "text", Text: finalSummaryRescueMessage}},
 				})
+				// Strip tools from the next request so the model MUST
+				// emit text and the turn ends with a conclusion, not a
+				// dangling tool_use whose results nobody summarizes.
+				l.rescueNoTools = true
 				l.mu.Unlock()
 				emit(ctx, out, Event{
 					Kind: EventInfo,
@@ -1932,6 +1947,15 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 		// Effort has a dedicated lock so the TUI can update it while the main
 		// request snapshot lock is busy assembling memory and messages.
 		Effort: l.EffortValue(),
+	}
+	// Final-summary rescue: the iter cap exhausted and the model was told to
+	// write the answer now. Strip the tool list so the provider can only
+	// emit text — otherwise a tool_use here produces results that never get
+	// a follow-up summary (the turn ends right after), the exact "ran and
+	// stopped with no conclusion" failure mode.
+	if l.rescueNoTools {
+		req.Tools = nil
+		l.rescueNoTools = false
 	}
 	// Fast mode is a pure request-time override. We don't mutate
 	// l.effort because the user's persistent /effort preference
