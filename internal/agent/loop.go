@@ -159,6 +159,11 @@ type Loop struct {
 	// nil = disabled.
 	Detector *LoopDetector
 
+	// RepeatGuard watches consecutive identical tool calls and injects an
+	// escalating advisory reminder (DSH repeat-tool-reminder parity). nil =
+	// disabled; NewRepeatGuard applies the [3,5,8] defaults when nil.
+	RepeatGuard *RepeatGuard
+
 	// Effort sets the reasoning intensity for the next request:
 	//   ""        → don't send a thinking/reasoning field (provider default)
 	//   "low"     → small budget, fastest answers
@@ -734,6 +739,43 @@ func (l *Loop) Restore(messages []llm.Message) {
 	l.estTokens.Store(int64(estimateTokens(l.Messages)))
 }
 
+// FirePostCompactHook emits PostCompact for the manual /compact path
+// (the auto path fires it inside maybeCompact's firePostCompact closure,
+// which already holds l.mu). Any AdditionalContext returned by handlers
+// is appended as a user message so the next request re-anchors —
+// the §28.11 "compact 后 inject 上下文" use case.
+func (l *Loop) FirePostCompactHook(ctx context.Context, trigger, tier string,
+	beforeMsgs, afterMsgs, beforeToks, afterToks int) {
+	if l == nil || l.Hooks == nil {
+		return
+	}
+	l.mu.Lock()
+	model, turn := l.Model, l.turnIdx
+	l.mu.Unlock()
+	pc := &PostCompact{
+		Trigger:        trigger,
+		Tier:           tier,
+		BeforeMessages: beforeMsgs,
+		AfterMessages:  afterMsgs,
+		BeforeTokens:   beforeToks,
+		AfterTokens:    afterToks,
+	}
+	extra := l.Hooks.EmitPostCompact(ctx, HookContext{Model: model, Turn: turn}, pc)
+	if strings.TrimSpace(extra) == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.Messages = append(l.Messages, llm.Message{
+		Role: llm.RoleUser,
+		Content: []llm.ContentBlock{{
+			Type: "text",
+			Text: "[post-compact hook context] " + extra,
+		}},
+	})
+	l.estTokens.Store(int64(estimateTokens(l.Messages)))
+}
+
 func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
 	if messages == nil {
 		l.Messages = nil
@@ -779,6 +821,9 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	}
 	if l.Detector != nil {
 		l.Detector.Reset()
+	}
+	if l.RepeatGuard != nil {
+		l.RepeatGuard.Reset()
 	}
 	if l.CacheStats != nil {
 		l.CacheStats.Reset()
@@ -1594,6 +1639,21 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			l.Detector.RecordStep(toolUses, results)
 		}
 
+		// Repeat-tool reminder (DSH repeat-tool-reminder parity): count
+		// runs of consecutive identical calls and inject an advisory
+		// reminder next to this batch's tool_results when a threshold is
+		// crossed. Advisory only — never vetoes or rewrites a call.
+		if l.RepeatGuard == nil {
+			l.RepeatGuard = NewRepeatGuard(RepeatGuardConfig{})
+		}
+		if reminder := l.RepeatGuard.RecordStep(toolUses); reminder != "" {
+			results = append(results, llm.ContentBlock{Type: "text", Text: reminder, Synthetic: true})
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: "repeat-tool-reminder: model is repeating an identical tool call",
+			})
+		}
+
 		// Phase B verdict tracking: scan results for verify-subagent
 		// VERDICT lines so the end-of-turn gate can refuse release on
 		// non-PASS verdicts. Must run AFTER executeBatch (need result
@@ -2354,6 +2414,12 @@ func textOf(m llm.Message) string {
 // EventPermissionRequest (the consumer holds the only reply channel) and
 // truncate text/tool deltas under load. ctx==nil is treated as background.
 func emit(ctx context.Context, ch chan<- Event, ev Event) {
+	// Stamp sub-agent events at the source: the trace hook must see the
+	// parent's tool_use_id on the child's OWN events (the forwarded copy
+	// alone bypassed the hook, so the recorded spawn-tree never linked).
+	if ev.SubAgentParentID == "" {
+		ev.SubAgentParentID = ParentToolUseIDFromContext(ctx)
+	}
 	if ch == nil {
 		return
 	}
@@ -2365,4 +2431,5 @@ func emit(ctx context.Context, ch chan<- Event, ev Event) {
 	case ch <- ev:
 	case <-ctx.Done():
 	}
+	notifyTraceHook(ev)
 }

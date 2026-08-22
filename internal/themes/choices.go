@@ -36,6 +36,22 @@ var themeSwatchHex = map[string][]string{
 		"#e91e63", // red stand-in (magenta)
 		"#606060",
 	},
+	"nord": {
+		"#88c0d0", // user / cyan
+		"#81a1c1", // accent / blue
+		"#a3be8c", // success / green
+		"#d08770", // warn / orange
+		"#bf616a", // error / red
+		"#868f9c", // muted gutter
+	},
+	"solarized-dark": {
+		"#2aa198", // user / cyan
+		"#268bd2", // accent / blue
+		"#859900", // success / green
+		"#cb4b16", // warn / orange
+		"#dc322f", // error / red
+		"#657b83", // muted gutter
+	},
 }
 
 // BuildThemeChoices snapshots each registered theme into a ThemeChoice

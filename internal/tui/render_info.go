@@ -449,6 +449,7 @@ func renderHooksList(cfg *config.Config) string {
 		{"PermissionDenied", cfg.Hooks.PermissionDenied},
 		{"CwdChanged", cfg.Hooks.CwdChanged},
 		{"PreCompact", cfg.Hooks.PreCompact},
+		{"PostCompact", cfg.Hooks.PostCompact},
 	}
 	rows := make([]infoRow, 0, 16)
 	any := false

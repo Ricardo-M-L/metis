@@ -161,6 +161,7 @@ type HooksConfig struct {
 	PermissionDenied  []HookSpec `toml:"permission_denied"`
 	CwdChanged        []HookSpec `toml:"cwd_changed"`
 	PreCompact        []HookSpec `toml:"pre_compact"`
+	PostCompact       []HookSpec `toml:"post_compact"`
 }
 
 // HookSpec is one entry in HooksConfig. Type defaults to "command".
@@ -308,12 +309,17 @@ type ProviderOpenAI struct {
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
 	Temperature   float64 `toml:"temperature"`
+	// WireProtocol selects the wire format: "" or "chat" = Chat
+	// Completions (/chat/completions); "responses" = the Responses API
+	// (/v1/responses). DeepSeek's official API only serves chat, so
+	// "responses" targets OpenAI/xAI/other Responses origins.
+	WireProtocol string `toml:"wire_protocol"`
 }
 
 type ProviderRaw struct {
 	// Transport picks the wire format. Recognized values:
-	//   anthropic_messages | openai_chat | gemini_native     (HTTP+API key)
-	//   azure_openai      | vertex_anthropic | bedrock_anthropic  (cloud auth)
+	//   anthropic_messages | openai_chat | openai_responses | gemini_native  (HTTP+API key)
+	//   azure_openai      | vertex_anthropic | bedrock_anthropic            (cloud auth)
 	Transport string `toml:"transport"`
 	APIKeyEnv string `toml:"api_key_env"`
 	// APIKey — inline credential, lowest-priority fallback (after

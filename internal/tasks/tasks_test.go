@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -65,6 +66,64 @@ func TestLoad_MissingSessionReturnsEmpty(t *testing.T) {
 	}
 	if len(tl.Items) != 0 {
 		t.Errorf("missing session should yield empty list; got %d items", len(tl.Items))
+	}
+}
+
+func TestDeleteRemovesBothTaskStoresAndPreservesOtherSessions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+
+	if _, err := Upsert("sess", Item{Content: "simple"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Upsert("sess-extra", Item{Content: "keep simple"}); err != nil {
+		t.Fatal(err)
+	}
+	structured := NewTaskStore("sess")
+	if _, err := structured.Create("structured", "", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	otherStructured := NewTaskStore("sess-extra")
+	if _, err := otherStructured.Create("keep structured", "", "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Delete("sess"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := Delete("sess"); err != nil {
+		t.Fatalf("second Delete should be idempotent: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "tasks", "sess.json")); !os.IsNotExist(err) {
+		t.Fatalf("simple task file still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "sessions", "sess")); !os.IsNotExist(err) {
+		t.Fatalf("structured task directory still exists: %v", err)
+	}
+	for _, kept := range []string{
+		filepath.Join(home, "tasks", "sess-extra.json"),
+		filepath.Join(home, "sessions", "sess-extra", "tasks-structured.json"),
+	} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("unrelated task data removed: %s: %v", kept, err)
+		}
+	}
+}
+
+func TestDeleteRejectsUnsafeSessionIDs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	outside := filepath.Join(home, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"", ".", "..", "../outside", "a/b", `a\b`, "bad\nname"} {
+		if err := Delete(id); err == nil {
+			t.Errorf("Delete(%q) unexpectedly succeeded", id)
+		}
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside directory changed: %v", err)
 	}
 }
 

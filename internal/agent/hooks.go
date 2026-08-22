@@ -30,12 +30,14 @@ const (
 
 // Data struct re-exports.
 type (
-	HookContext        = pubhook.Context
-	PreToolUseHook     = pubhook.PreToolUse
-	ModifiedPreToolUse = pubhook.ModifiedPreToolUse
-	HookOutput         = pubhook.Output
-	PostToolUseHook    = pubhook.PostToolUse
-	PreCompact         = pubhook.PreCompact
+	HookContext         = pubhook.Context
+	PreToolUseHook      = pubhook.PreToolUse
+	ModifiedPreToolUse  = pubhook.ModifiedPreToolUse
+	HookOutput          = pubhook.Output
+	PostToolUseHook     = pubhook.PostToolUse
+	PreCompact          = pubhook.PreCompact
+	PostCompact         = pubhook.PostCompact
+	ModifiedPostCompact = pubhook.ModifiedPostCompact
 )
 
 // Handler typedef re-exports.
@@ -49,6 +51,7 @@ type (
 	LoopEndHandler      = pubhook.LoopEndHandler
 	ErrorHandler        = pubhook.ErrorHandler
 	PreCompactHandler   = pubhook.PreCompactHandler
+	PostCompactHandler  = pubhook.PostCompactHandler
 )
 
 // HookRegistry is the in-process registry. Re-exported here so existing

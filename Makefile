@@ -87,12 +87,15 @@ bump-major:
 	new=$$(echo $$cur | awk -F. '{printf "%d.0.0", $$1+1}'); \
 	$(MAKE) --no-print-directory _do-bump CUR=$$cur NEW=$$new
 
-# Internal target — call via bump-* so $(NEW) is set.
+# Internal target — call via bump-* so $(NEW) is set. Keep the CLI, npm
+# installer, and native Desktop metadata on the same release version.
 _do-bump:
 	@if [ -z "$(NEW)" ]; then echo "usage: make bump-{patch,minor,major}" >&2; exit 1; fi
 	@echo "$(NEW)" > $(VERSION_FILE)
 	@sed -i.bak -E 's/Version = "[^"]*"/Version = "$(NEW)"/' internal/version/version.go && rm internal/version/version.go.bak
 	@sed -i.bak -E 's/"version": "[^"]*"/"version": "$(NEW)"/' install/npm/package.json && rm install/npm/package.json.bak
+	@sed -i.bak -E 's/"productVersion": "[^"]*"/"productVersion": "$(NEW)"/' metis-desktop/wails.json && rm metis-desktop/wails.json.bak
+	@sed -i.bak -E 's/return "[0-9]+\.[0-9]+\.[0-9]+"/return "$(NEW)"/' metis-desktop/app.go && rm metis-desktop/app.go.bak
 	@echo "version: $(CUR) -> $(NEW)"
 
 release-patch: bump-patch

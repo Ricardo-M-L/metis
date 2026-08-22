@@ -8,7 +8,7 @@ package runtime
 // install, without the user having to mkdir ~/.metis/agents and drop
 // markdown there.
 //
-// Six profiles ship:
+// Nine profiles ship:
 //
 //   - explore         — fast read-only code search
 //   - plan            — implementation planning (no code edits)
@@ -16,6 +16,9 @@ package runtime
 //   - general         — catch-all with full toolset
 //   - go-reviewer     — metis-specific: Go diff review by severity
 //   - mcp-debugger    — metis-specific: MCP server diagnostics
+//   - creator         — implementation-focused end-to-end work
+//   - coordinator     — delegation and orchestration
+//   - teammate        — long-running coordinated team member
 //
 // User overrides win: if ~/.metis/agents/explore.md or
 // ./.metis/agents/explore.md exists, that one is used instead of the

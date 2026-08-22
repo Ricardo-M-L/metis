@@ -393,6 +393,14 @@ func exportConversationToFile(messages []llm.Message, requested string, now time
 	return path, nil
 }
 
+// ExportConversation writes the same glyph-led transcript the /export
+// command produces to the default ~/.metis/exports directory (0600) and
+// returns the absolute path. Shared by the web UI's session-log export
+// endpoint so both surfaces produce byte-identical output.
+func ExportConversation(messages []llm.Message, now time.Time) (string, error) {
+	return exportConversationToFile(messages, "", now)
+}
+
 // writePrivateExport applies 0600 even when replacing an existing file.
 // os.WriteFile's mode argument only affects newly created files, which could
 // otherwise leave a transcript world-readable when the chosen path was 0644.

@@ -29,6 +29,7 @@ package transport
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -38,6 +39,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Ricardo-M-L/metis/internal/security"
 )
@@ -375,6 +377,42 @@ func FlushDumps() {
 	}
 }
 
+func validDumpSessionID(sessionID string) bool {
+	if sessionID == "" || sessionID == "." || sessionID == ".." {
+		return false
+	}
+	if strings.ContainsAny(sessionID, `/\`) || strings.Contains(sessionID, "..") {
+		return false
+	}
+	return strings.IndexFunc(sessionID, unicode.IsControl) < 0
+}
+
+// DeleteSessionDump waits for pending asynchronous dump writes, closes only
+// the target session's open handle, and removes its JSONL file. A missing dump
+// is treated as already deleted.
+func DeleteSessionDump(sessionID string) error {
+	if !validDumpSessionID(sessionID) {
+		return fmt.Errorf("dump prompts: invalid session_id %q", sessionID)
+	}
+
+	dumpWG.Wait()
+	dumpMu.Lock()
+	defer dumpMu.Unlock()
+
+	var deleteErr error
+	if f := dumpHandles[sessionID]; f != nil {
+		if err := f.Close(); err != nil {
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("dump prompts: close %s: %w", sessionID, err))
+		}
+		delete(dumpHandles, sessionID)
+	}
+	path := filepath.Join(metisHome(), "dump-prompts", sessionID+".jsonl")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		deleteErr = errors.Join(deleteErr, fmt.Errorf("dump prompts: remove %s: %w", sessionID, err))
+	}
+	return deleteErr
+}
+
 // appendDump opens-or-reuses a per-session file under
 // ~/.metis/dump-prompts/<sid>.jsonl and appends one entry. Best-effort
 // — failures are silent (we never want logging to crash the agent).
@@ -382,6 +420,9 @@ func appendDump(sessID string, e dumpEntry) {
 	defer dumpWG.Done()
 	if sessID == "" {
 		sessID = "default"
+	}
+	if !validDumpSessionID(sessID) {
+		return
 	}
 	dumpMu.Lock()
 	defer dumpMu.Unlock()

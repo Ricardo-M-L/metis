@@ -209,6 +209,115 @@ func TestMaybeCompact_NoPreCompactBelowThreshold(t *testing.T) {
 	}
 }
 
+// TestMaybeCompact_EmitsPostCompactHook — the full Compact tier must fire
+// PostCompact (trigger "auto", tier "compact") after the reduced history is
+// installed, and any AdditionalContext the handler returns must land as a
+// trailing user message so the next request re-anchors. Collapse disabled
+// to keep the fire count deterministic at exactly one.
+func TestMaybeCompact_EmitsPostCompactHook(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	cfg.ProtectFirst = 1
+	cfg.ProtectLast = 3
+	cfg.SnipThreshold = 0
+	cfg.CollapseThreshold = 0
+	cfg.MicrocompactDir = ""
+	cfg.IdleMaxSeconds = 0
+	c := NewCompactor(cfg, "test", 1000, &fakeSummarizer{})
+
+	reg := NewHookRegistry()
+	var fired int
+	var gotTrigger, gotTier string
+	var gotAfter int
+	reg.Register(PostCompactHandler(func(_ context.Context, _ HookContext, p *PostCompact) *ModifiedPostCompact {
+		fired++
+		gotTrigger = p.Trigger
+		gotTier = p.Tier
+		gotAfter = p.AfterMessages
+		return &ModifiedPostCompact{AdditionalContext: "branch: main; test cmd: make test"}
+	}))
+	l := &Loop{Compactor: c, Hooks: reg}
+
+	// Alternating user/assistant — keepLast must contain user text so
+	// the active-task anchor (compact.go, 2026-05-13 fix) doesn't pull
+	// the cut back past ProtectFirst and skip the compact as a no-op
+	// (that's what an assistant-only tail does by design).
+	l.Messages = []llm.Message{msg(llm.RoleUser, "seed")}
+	for i := 0; i < 15; i++ {
+		l.Messages = append(l.Messages,
+			msg(llm.RoleUser, strings.Repeat("u", 100)),
+			msg(llm.RoleAssistant, strings.Repeat("a", 100)),
+		)
+	}
+
+	out := make(chan Event, 64)
+	l.maybeCompact(context.Background(), out)
+	close(out)
+
+	if fired != 1 {
+		t.Fatalf("expected PostCompact to fire exactly once, got %d", fired)
+	}
+	if gotTrigger != "auto" {
+		t.Errorf("expected trigger=auto, got %q", gotTrigger)
+	}
+	if gotTier != "compact" {
+		t.Errorf("expected tier=compact, got %q", gotTier)
+	}
+	// AfterMessages describes the history AT FIRE TIME; the injected
+	// context then appends one more message, so final = After+1.
+	if gotAfter != len(l.Messages)-1 {
+		t.Errorf("AfterMessages=%d but final history (incl. injected ctx) has %d messages; want After=%d", gotAfter, len(l.Messages), len(l.Messages)-1)
+	}
+	// The AdditionalContext must be the LAST message, user role, wrapped
+	// in the post-compact envelope — it reads to the model like a fresh
+	// user note pinned right after the boundary.
+	last := l.Messages[len(l.Messages)-1]
+	if last.Role != llm.RoleUser {
+		t.Fatalf("injected context must be user role, got %s", last.Role)
+	}
+	if len(last.Content) == 0 || !strings.Contains(last.Content[0].Text, "[post-compact hook context] branch: main") {
+		t.Errorf("injected context text = %+v, want post-compact envelope with hook payload", last.Content)
+	}
+	// estTokens must reflect the post-injection history (refreshed after append).
+	if got := int(l.estTokens.Load()); got != estimateTokens(l.Messages) {
+		t.Errorf("cached estimate = %d, want %d after context injection", got, estimateTokens(l.Messages))
+	}
+}
+
+// TestMaybeCompact_NoPostCompactBelowThreshold — PostCompact stays silent
+// when no LLM-driven tier runs (cheap tiers don't fire it by design).
+func TestMaybeCompact_NoPostCompactBelowThreshold(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	cfg.ProtectFirst = 1
+	cfg.ProtectLast = 3
+	cfg.SnipThreshold = 0
+	cfg.MicrocompactDir = ""
+	cfg.IdleMaxSeconds = 0
+	c := NewCompactor(cfg, "test", 100000, &fakeSummarizer{}) // huge cap → no trigger
+
+	reg := NewHookRegistry()
+	var fired int
+	reg.Register(PostCompactHandler(func(_ context.Context, _ HookContext, _ *PostCompact) *ModifiedPostCompact {
+		fired++
+		return nil
+	}))
+	l := &Loop{Compactor: c, Hooks: reg}
+	l.Messages = []llm.Message{
+		msg(llm.RoleUser, "seed"),
+		msg(llm.RoleAssistant, "hi"),
+		msg(llm.RoleUser, "tail-1"),
+		msg(llm.RoleAssistant, "tail-2"),
+		msg(llm.RoleUser, "tail-3"),
+	}
+
+	out := make(chan Event, 16)
+	l.maybeCompact(context.Background(), out)
+	close(out)
+
+	if fired != 0 {
+		t.Errorf("PostCompact fired %d times below threshold; want 0", fired)
+	}
+}
+
 // TestMaybeCompact_NoCompactionEventsWhenBelowThreshold — confirms the
 // new events don't fire on every iteration; they're scoped to the
 // LLM-driven tiers and silent when the threshold isn't crossed.

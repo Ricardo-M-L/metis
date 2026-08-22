@@ -1,6 +1,6 @@
 export namespace main {
 
-		export class ChatMessage {
+	export class ChatMessage {
 	    Role: string;
 	    Content: string;
 
@@ -72,11 +72,11 @@ export namespace main {
 	    Model: string;
 	    CreatedAt: string;
 
-		    static createFrom(source: any = {}) {
-		        return new SessionInfo(source);
-		    }
+	    static createFrom(source: any = {}) {
+	        return new SessionInfo(source);
+	    }
 
-		    constructor(source: any = {}) {
+	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ID = source["ID"];
 	        this.Title = source["Title"];

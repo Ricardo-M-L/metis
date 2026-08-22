@@ -22,15 +22,17 @@ import (
 	"testing"
 )
 
-func TestBuiltinProfileNames_All8Present(t *testing.T) {
+func TestBuiltinProfileNames_All9Present(t *testing.T) {
 	t.Parallel()
 	got := BuiltinProfileNames()
-	// 8 total: 6 from G.7 + coordinator from G.8 (2026-05-12) +
+	// 9 total: 6 from G.7 + coordinator from G.8 (2026-05-12) +
 	// teammate from 2026-05-16 (Team-paradigm-aware profile that
 	// bundles MessageTeammate + Task* + base tools so a coordinated
-	// team member doesn't have to guess "do I have peer messaging?").
+	// team member doesn't have to guess "do I have peer messaging?") +
+	// the Desktop-oriented creator preset.
 	want := []string{
 		"coordinator",
+		"creator",
 		"explore",
 		"general",
 		"go-reviewer",
@@ -62,6 +64,7 @@ func TestBuiltinProfile_FrontmatterIsParsed(t *testing.T) {
 		{"verify", []string{"Read", "Bash", "Grep", "Glob", "LS"}, "bypassPermissions"},
 		{"go-reviewer", []string{"Read", "Grep", "Glob", "LS", "Bash"}, "bypassPermissions"},
 		{"mcp-debugger", []string{"Read", "Grep", "Glob", "LS", "Bash", "MetisInfo"}, "bypassPermissions"},
+		{"creator", nil, "acceptEdits"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

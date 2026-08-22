@@ -129,9 +129,123 @@ jobs:
             throw "metis.exe reports $reported instead of $env:TAG"
           }
 
+  desktop-build:
+    name: Desktop ${{ matrix.asset }}
+    if: github.event_name == 'push'
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux/amd64
+            asset: linux-amd64
+          - os: windows-latest
+            platform: windows/amd64
+            asset: windows-amd64
+          - os: macos-latest
+            platform: darwin/universal
+            asset: darwin-universal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            metis-desktop/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: metis-desktop/frontend/package-lock.json
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Check and build frontend
+        working-directory: metis-desktop/frontend
+        run: |
+          npm ci
+          npm run check
+          npm run build
+
+      - name: Build and package Desktop (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: metis-desktop
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -eu
+          tags=
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            tags='-tags webkit2_41'
+          fi
+          wails build -clean -s -trimpath -platform "$PLATFORM" $tags
+          mkdir -p release-dist
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            codesign --force --deep --sign - build/bin/metis-desktop.app
+            codesign --verify --deep --strict build/bin/metis-desktop.app
+            asset="metis-desktop-${ASSET}.zip"
+            ditto -c -k --sequesterRsrc --keepParent build/bin/metis-desktop.app "release-dist/$asset"
+            unzip -tq "release-dist/$asset"
+          else
+            asset="metis-desktop-${ASSET}.tar.gz"
+            tar -C build/bin -czf "release-dist/$asset" metis-desktop
+            test "$(tar -tzf "release-dist/$asset")" = "metis-desktop"
+          fi
+          (cd release-dist && shasum -a 256 "$asset" > "$asset.sha256")
+
+      - name: Build and package Desktop (Windows)
+        if: runner.os == 'Windows'
+        working-directory: metis-desktop
+        shell: pwsh
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          wails build -clean -s -trimpath -platform $env:PLATFORM
+          New-Item -ItemType Directory -Force release-dist | Out-Null
+          $asset = "metis-desktop-$env:ASSET.zip"
+          Compress-Archive -LiteralPath build/bin/metis-desktop.exe -DestinationPath "release-dist/$asset"
+          $smoke = Join-Path $env:RUNNER_TEMP "metis-desktop-smoke"
+          Expand-Archive -LiteralPath "release-dist/$asset" -DestinationPath $smoke
+          if (-not (Test-Path (Join-Path $smoke "metis-desktop.exe"))) {
+            throw "Desktop archive does not contain metis-desktop.exe"
+          }
+          $digest = (Get-FileHash -Algorithm SHA256 "release-dist/$asset").Hash.ToLowerInvariant()
+          "$digest  $asset" | Set-Content "release-dist/$asset.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metis-desktop-${{ matrix.asset }}-${{ needs.build.outputs.tag }}
+          path: metis-desktop/release-dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   publish:
     name: Publish only after artifact smoke tests
-    needs: [build, smoke-unix-artifact, smoke-windows-artifact]
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      needs.smoke-unix-artifact.result == 'success' &&
+      needs.smoke-windows-artifact.result == 'success' &&
+      (github.event_name != 'push' || needs.desktop-build.result == 'success')
+    needs: [build, smoke-unix-artifact, smoke-windows-artifact, desktop-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -141,14 +255,25 @@ jobs:
           name: metis-release-${{ needs.build.outputs.tag }}
           path: dist
 
+      - name: Download Desktop artifacts
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: metis-desktop-*-${{ needs.build.outputs.tag }}
+          path: dist
+          merge-multiple: true
+
       - name: Require a draft, upload all assets, then publish
         env:
+          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.build.outputs.tag }}
         run: |
           mapfile -t assets < <(find dist -mindepth 1 -maxdepth 1 -type f -print | sort)
-          if [ "${#assets[@]}" -ne 12 ]; then
-            echo "expected exactly 12 verified assets, found ${#assets[@]}" >&2
+          expected=12
+          if [ "$EVENT_NAME" = "push" ]; then expected=18; fi
+          if [ "${#assets[@]}" -ne "$expected" ]; then
+            echo "expected exactly $expected verified assets, found ${#assets[@]}" >&2
             exit 1
           fi
 

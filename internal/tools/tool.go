@@ -52,6 +52,7 @@ var (
 	GetInterruptBehavior    = pubtool.GetInterruptBehavior
 	DescriptionFor          = pubtool.DescriptionFor
 	MaxResultSizeChars      = pubtool.MaxResultSizeChars
+	TimeoutMs               = pubtool.TimeoutMs
 )
 
 // Spill threshold constants — see pkg/tool for the rationale.

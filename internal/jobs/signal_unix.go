@@ -35,6 +35,13 @@ func ApplyProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
+// KillProcessGroup terminates a command's entire process group
+// (SIGKILL). Used by tools that spawn wrapper processes (go run, npx)
+// whose children would otherwise outlive the direct child.
+func KillProcessGroup(p *os.Process) {
+	_ = killTree(p, syscall.SIGKILL)
+}
+
 // killTree sends signal to the entire process group. Falls back to a
 // direct PID signal when negative-pid kill fails (process exited just
 // now, or never had Setpgid applied — e.g. a job spawned before the

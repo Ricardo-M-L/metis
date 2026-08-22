@@ -122,6 +122,12 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	if opts.Jobs != nil {
 		agentTool = agentTool.WithJobsPool(opts.Jobs)
 	}
+	// Ralph tool (DSH ralph parity): fresh-agent iterative loop. Shares
+	// the Agent tool's deps; every round builds a COLD child, the
+	// workspace + per-round report files are the only cross-round state.
+	// Registered unconditionally — IsEnabled keeps it inert in
+	// informational listings.
+	reg.Register(builtin.NewRalph(opts.Gate, opts.Provider, reg, opts.Model, opts.System))
 	// G.4 (2026-05-12) — wire on-disk transcript persistence so
 	// sub-agents can be resumed via `/agents resume <id>` or the
 	// `resume_from` schema field. CurrentSessionID() is set by
@@ -230,6 +236,35 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 		_, msgs, err := histStore.Load(id)
 		return msgs, err
 	}))
+	// Sessions tool: cross-session query (DSH session-query parity) —
+	// list / BM25 search / digest-read over EVERY session in the store,
+	// not just the current one. Read-only over the user's own store
+	// dir, so no extra permission gate. Reuses histStore (already nil-
+	// safe: informational `metis tools` listing registers the tool in a
+	// disabled state and Execute reports "unavailable").
+	if histStore != nil {
+		st := histStore
+		reg.Register(builtin.NewSessions(
+			func(limit int) ([]builtin.SessionInfo, error) {
+				entries, err := st.List(limit)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]builtin.SessionInfo, 0, len(entries))
+				for _, e := range entries {
+					out = append(out, builtin.SessionInfo{
+						ID: e.ID, Title: e.Title, Model: e.Model,
+						UpdatedAt: e.UpdatedAt, MessageCount: e.MessageCount,
+					})
+				}
+				return out, nil
+			},
+			func(id string) ([]llm.Message, error) {
+				_, msgs, err := st.Load(id)
+				return msgs, err
+			},
+		))
+	}
 	// Workflow tool: ordered multi-step shell sequences with per-step
 	// status (build→test→lint). Named workflows persist next to the
 	// session dir under ../workflows so they're reusable across
@@ -254,6 +289,15 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// model to call a non-existent tool.
 	reg.Register(builtin.NewEnterPlanModeWithGate(opts.Gate))
 	reg.Register(builtin.NewExitPlanModeWithGate(opts.Gate))
+	// Goal tools (2026-08-16): long-term objective tracking built on the
+	// same session-dir convention as workflow. Goals persist to
+	// <sessionDir>/../goals/goals.json so they're reusable across
+	// sessions. Empty session dir → store stays nil and the tools
+	// report "no goal store" cleanly (sets a fresh store, so the chat
+	// REPL always has one).
+	if sessionDir != "" {
+		builtin.SetGoalStore(builtin.NewGoalStore(filepath.Join(sessionDir, "..", "goals")))
+	}
 	return reg
 }
 

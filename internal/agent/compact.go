@@ -1157,14 +1157,15 @@ func isProtectedToolResult(id string, idToName map[string]string, protected map[
 // USER-role AND carries a non-empty text block (not just tool_result
 // echoes). Used by Compact's anchor logic to decide whether the natural
 // keepLast already contains a user prompt — if so, no anchor pull
-// needed.
+// needed. Synthetic blocks (loop-injected reminders) never count: a
+// repeat-tool nudge is not the human's prompt.
 func sliceHasUserText(slice []llm.Message) bool {
 	for _, m := range slice {
 		if m.Role != llm.RoleUser {
 			continue
 		}
 		for _, b := range m.Content {
-			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+			if b.Type == "text" && !b.Synthetic && strings.TrimSpace(b.Text) != "" {
 				return true
 			}
 		}
@@ -1195,7 +1196,7 @@ func lastUserTextBefore(messages []llm.Message, before int) int {
 			continue
 		}
 		for _, b := range m.Content {
-			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+			if b.Type == "text" && !b.Synthetic && strings.TrimSpace(b.Text) != "" {
 				return i
 			}
 		}

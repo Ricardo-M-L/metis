@@ -58,11 +58,7 @@ type Manager struct {
 // shadowRoot defaults to ~/.metis/checkpoints when empty.
 func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 	if shadowRoot == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			shadowRoot = filepath.Join(home, ".metis", "checkpoints")
-		} else {
-			shadowRoot = "/tmp/metis-checkpoints"
-		}
+		shadowRoot = defaultShadowRoot()
 	}
 	m := &Manager{
 		sessionID: sessionID,

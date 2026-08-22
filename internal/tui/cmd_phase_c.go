@@ -7,6 +7,7 @@ package tui
 
 import (
 	"fmt"
+	"github.com/Ricardo-M-L/metis/internal/bundle"
 	"os"
 	"path/filepath"
 	"sort"
@@ -350,10 +351,69 @@ func cmdSecurityReview(r *REPL, args string) string {
 	return "security-review: paste this into the prompt to start —\n\n" + prompt
 }
 
-// cmdFeedback is /bug under a more discoverable name. Same body —
-// claude-code calls it /feedback and many users expect that.
+// cmdFeedback has three legs:
+//   - bare `/feedback` → bug-report composer (claude-code naming parity)
+//   - `/feedback <remark>` → log-only remark recorded on the session
+//     JSONL as a "feedback" entry (DSH command-feedback parity) that
+//     never enters model context and is ignored by the resume path.
+//   - `/feedback up|down` → rate the LAST assistant reply (DSH
+//     message-feedback parity; same log-only sidecar).
+//   - `/feedback stats` → aggregate this session + all sessions.
 func cmdFeedback(r *REPL, args string) string {
+	fields := strings.Fields(strings.TrimSpace(args))
+	if len(fields) > 0 {
+		switch fields[0] {
+		case "up", "down":
+			if r.Session == nil || r.SessionID == "" {
+				return "feedback: no active session store"
+			}
+			idx := lastAssistantIndex(r)
+			if idx < 0 {
+				return "feedback: no assistant reply to rate yet"
+			}
+			if err := r.Session.AppendRating(r.SessionID, fields[0], strconv.Itoa(idx)); err != nil {
+				return "feedback: " + err.Error()
+			}
+			return "feedback: rated " + fields[0] + " (message " + strconv.Itoa(idx) + ", log-only)"
+		case "stats":
+			if r.Session == nil || r.SessionID == "" {
+				return "feedback: no active session store"
+			}
+			one, err := r.Session.FeedbackStats(r.SessionID)
+			if err != nil {
+				return "feedback: " + err.Error()
+			}
+			all, _ := r.Session.FeedbackStatsAll()
+			return fmt.Sprintf("feedback stats — this session: 👍 %d · 👎 %d · remarks %d | all sessions: 👍 %d · 👎 %d · remarks %d",
+				one.Up, one.Down, one.Remarks, all.Up, all.Down, all.Remarks)
+		}
+	}
+	if text := strings.TrimSpace(args); text != "" {
+		if r.Session == nil || r.SessionID == "" {
+			return "feedback: no active session store"
+		}
+		if err := r.Session.AppendFeedback(r.SessionID, "remark", text); err != nil {
+			return "feedback: " + err.Error()
+		}
+		return "feedback: recorded (log-only; not visible to the model)"
+	}
 	return cmdBug(r, args)
+}
+
+// lastAssistantIndex returns the transcript index of the most recent
+// assistant message (-1 when none). Used by /feedback up|down to bind a
+// rating to the reply the user just read.
+func lastAssistantIndex(r *REPL) int {
+	if r.Loop == nil {
+		return -1
+	}
+	hist := r.Loop.History()
+	for i := len(hist) - 1; i >= 0; i-- {
+		if hist[i].Role == llm.RoleAssistant {
+			return i
+		}
+	}
+	return -1
 }
 
 // cmdInitGuided is unused (kept here so the registration site has a
@@ -364,3 +424,69 @@ func cmdFeedback(r *REPL, args string) string {
 //
 // Phase F adds the actual interactive wizard at registration time;
 // this stub is intentionally a small helper for then.
+
+// metisHomeDir resolves the metis home (METIS_HOME override or
+// ~/.metis) — same convention as clipboard.go / cron_chip.go.
+func metisHomeDir() string {
+	if h := os.Getenv("METIS_HOME"); h != "" {
+		return h
+	}
+	if h, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(h, ".metis")
+	}
+	return ""
+}
+
+// cmdBundle manages profile bundles (DSH bundle parity, metis-native):
+//
+//	/bundle install <path>   validate + copy agents/ & skills/ into metis home
+//	/bundle list             installed bundles from the ledger
+//	/bundle remove <name>    delete recorded files + ledger row
+func cmdBundle(r *REPL, args string) string {
+	home := metisHomeDir()
+	if home == "" {
+		return "bundle: cannot resolve metis home"
+	}
+	fields := strings.Fields(strings.TrimSpace(args))
+	if len(fields) == 0 {
+		return "bundle: usage `/bundle install <path> | list | remove <name>`"
+	}
+	switch fields[0] {
+	case "install":
+		if len(fields) < 2 {
+			return "bundle: usage `/bundle install <path-to-bundle-dir>`"
+		}
+		rec, err := bundle.Install(home, fields[1])
+		if err != nil {
+			return "bundle install: " + err.Error()
+		}
+		return fmt.Sprintf("bundle install: %s v%s — %d files installed (agents/ + skills/)", rec.Name, rec.Version, len(rec.Files))
+	case "list":
+		recs, err := bundle.List(home)
+		if err != nil {
+			return "bundle list: " + err.Error()
+		}
+		if len(recs) == 0 {
+			return "bundle list: no bundles installed"
+		}
+		var b strings.Builder
+		for _, rec := range recs {
+			missing := bundle.MissingFiles(home, rec)
+			b.WriteString(fmt.Sprintf("- %s v%s · %d files · %s\n", rec.Name, rec.Version, len(rec.Files), rec.Installed.Format("2006-01-02")))
+			if missing > 0 {
+				b.WriteString(fmt.Sprintf("  ⚠ %d recorded files missing\n", missing))
+			}
+		}
+		return strings.TrimRight(b.String(), "\n")
+	case "remove":
+		if len(fields) < 2 {
+			return "bundle: usage `/bundle remove <name>`"
+		}
+		if err := bundle.Remove(home, fields[1]); err != nil {
+			return "bundle remove: " + err.Error()
+		}
+		return "bundle remove: " + fields[1] + " uninstalled"
+	default:
+		return "bundle: unknown subcommand " + fields[0] + " (install | list | remove)"
+	}
+}

@@ -58,6 +58,8 @@ fi
 version_file=$repo_root/VERSION
 internal_file=$repo_root/internal/version/version.go
 npm_file=$repo_root/install/npm/package.json
+desktop_config_file=$repo_root/metis-desktop/wails.json
+desktop_app_file=$repo_root/metis-desktop/app.go
 
 [ -f "$version_file" ] || fail "missing VERSION"
 [ -f "$internal_file" ] || fail "missing internal/version/version.go"
@@ -83,6 +85,25 @@ npm_version=$npm_versions
 	fail "internal version $internal_version does not match VERSION $version"
 [ "$npm_version" = "$version" ] || \
 	fail "npm version $npm_version does not match VERSION $version"
+
+# Desktop release metadata was introduced after the earliest stable tags.
+# Verify it whenever present while keeping workflow_dispatch backfills for old
+# CLI-only tags compatible with the historical source tree.
+if [ -f "$desktop_config_file" ] && grep -q '"productVersion"' "$desktop_config_file"; then
+	[ -f "$desktop_app_file" ] || fail "missing metis-desktop/app.go"
+	desktop_config_versions=$(sed -nE 's/^[[:space:]]*"productVersion"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$desktop_config_file")
+	[ "$(printf '%s\n' "$desktop_config_versions" | sed '/^$/d' | wc -l | tr -d ' ')" = "1" ] || \
+		fail "could not identify exactly one Desktop productVersion"
+	desktop_config_version=$desktop_config_versions
+	desktop_app_versions=$(sed -nE 's/^[[:space:]]*return[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' "$desktop_app_file")
+	[ "$(printf '%s\n' "$desktop_app_versions" | sed '/^$/d' | wc -l | tr -d ' ')" = "1" ] || \
+		fail "could not identify exactly one Desktop runtime version"
+	desktop_app_version=$desktop_app_versions
+	[ "$desktop_config_version" = "$version" ] || \
+		fail "Desktop productVersion $desktop_config_version does not match VERSION $version"
+	[ "$desktop_app_version" = "$version" ] || \
+		fail "Desktop runtime version $desktop_app_version does not match VERSION $version"
+fi
 
 expected_tag=v$version
 if [ "$release_tag_provided" = true ] && [ "$release_tag" != "$expected_tag" ]; then

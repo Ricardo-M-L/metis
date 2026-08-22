@@ -8,12 +8,14 @@ package tasks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -93,6 +95,44 @@ func Save(tl *List) error {
 		return err
 	}
 	return os.WriteFile(path(tl.SessionID), b, 0o644)
+}
+
+// Delete removes both todo persistence formats owned by sessionID: the
+// simple TodoWrite file and the structured Task* session directory. It is
+// idempotent. Runtime callers must ensure the session is no longer active.
+func Delete(sessionID string) error {
+	if !validSessionID(sessionID) {
+		return fmt.Errorf("tasks: invalid session id")
+	}
+
+	mu.Lock()
+	simpleErr := os.Remove(path(sessionID))
+	mu.Unlock()
+	if errors.Is(simpleErr, os.ErrNotExist) {
+		simpleErr = nil
+	}
+
+	structuredErr := deleteStructured(sessionID)
+	if simpleErr != nil {
+		simpleErr = fmt.Errorf("tasks: delete todo list: %w", simpleErr)
+	}
+	if structuredErr != nil {
+		structuredErr = fmt.Errorf("tasks: delete structured store: %w", structuredErr)
+	}
+	return errors.Join(simpleErr, structuredErr)
+}
+
+func validSessionID(sessionID string) bool {
+	if strings.TrimSpace(sessionID) == "" || sessionID == "." || sessionID == ".." ||
+		filepath.Base(sessionID) != sessionID || strings.ContainsAny(sessionID, `/\`) {
+		return false
+	}
+	for _, r := range sessionID {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // Upsert creates or updates one item. Match priority: explicit ID >

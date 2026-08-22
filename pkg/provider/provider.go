@@ -76,6 +76,15 @@ type ContentBlock struct {
 	// turn. Other providers ignore unknown keys.
 	ProviderHint map[string]string `json:"provider_hint,omitempty"`
 
+	// Synthetic marks a text block the loop injected (repeat-tool
+	// reminders, steer echoes) rather than the human typing it. The
+	// model still READS synthetic blocks normally; compaction's
+	// active-task anchor scan uses the flag to never mistake a
+	// synthetic reminder for the user's actual prompt. Not persisted —
+	// a replayed session treats the block as ordinary text, which is
+	// the accepted drift (mirrors DSH's reconstructed reminder).
+	Synthetic bool `json:"-"`
+
 	// Image-specific (Type="image"):
 	MediaType string `json:"media_type,omitempty"` // e.g., "image/png"
 	Data      string `json:"data,omitempty"`       // base64-encoded bytes

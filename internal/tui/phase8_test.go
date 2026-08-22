@@ -159,13 +159,17 @@ func TestSwitchTheme(t *testing.T) {
 	}
 }
 
-// TestThemeNames returns all 3 known themes.
+// TestThemeNames returns all 5 known themes (nord and solarized-dark were
+// added alongside the original three).
 func TestThemeNames(t *testing.T) {
 	names := themes.ThemeNames()
-	if len(names) != 3 {
-		t.Errorf("expected 3 themes, got %d: %v", len(names), names)
+	if len(names) != 5 {
+		t.Errorf("expected 5 themes, got %d: %v", len(names), names)
 	}
-	want := map[string]bool{"dark": true, "light": true, "dark-daltonized": true}
+	want := map[string]bool{
+		"dark": true, "light": true, "dark-daltonized": true,
+		"nord": true, "solarized-dark": true,
+	}
 	for _, n := range names {
 		if !want[n] {
 			t.Errorf("unexpected theme name %q", n)

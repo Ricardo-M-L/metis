@@ -361,3 +361,107 @@ func TestSetSessionID_RoundTrip(t *testing.T) {
 	}
 	SetSessionID("")
 }
+
+func TestDeleteSessionDumpClosesTargetHandleAndPreservesOtherSession(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("METIS_HOME", dir)
+	closeDumpForTest()
+	t.Cleanup(closeDumpForTest)
+
+	appendForTest := func(sessionID, reqID string) {
+		t.Helper()
+		dumpWG.Add(1)
+		appendDump(sessionID, dumpEntry{Type: "request", ReqID: reqID})
+	}
+	appendForTest("target", "target-request")
+	appendForTest("other", "other-request")
+
+	dumpMu.Lock()
+	targetHandle := dumpHandles["target"]
+	otherHandle := dumpHandles["other"]
+	dumpMu.Unlock()
+	if targetHandle == nil || otherHandle == nil {
+		t.Fatal("test requires both dump handles to be open")
+	}
+
+	if err := DeleteSessionDump("target"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dump-prompts", "target.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("target dump still exists: %v", err)
+	}
+	otherPath := filepath.Join(dir, "dump-prompts", "other.jsonl")
+	if body, err := os.ReadFile(otherPath); err != nil || !strings.Contains(string(body), "other-request") {
+		t.Fatalf("other dump was changed: body=%q err=%v", body, err)
+	}
+	if _, err := targetHandle.Write([]byte("must fail")); err == nil {
+		t.Fatal("target dump handle remained open")
+	}
+
+	dumpMu.Lock()
+	_, targetOpen := dumpHandles["target"]
+	gotOtherHandle := dumpHandles["other"]
+	dumpMu.Unlock()
+	if targetOpen {
+		t.Fatal("target handle remains registered")
+	}
+	if gotOtherHandle != otherHandle {
+		t.Fatal("other session handle was closed or replaced")
+	}
+
+	if err := DeleteSessionDump("target"); err != nil {
+		t.Fatalf("second delete must be idempotent: %v", err)
+	}
+}
+
+func TestDeleteSessionDumpWaitsForPendingWrite(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("METIS_HOME", dir)
+	closeDumpForTest()
+	t.Cleanup(closeDumpForTest)
+
+	locked := make(chan struct{})
+	dumpMu.Lock()
+	dumpWG.Add(1)
+	go func() {
+		close(locked)
+		appendDump("target", dumpEntry{Type: "request", ReqID: "pending"})
+	}()
+	<-locked
+
+	done := make(chan error, 1)
+	go func() { done <- DeleteSessionDump("target") }()
+	select {
+	case err := <-done:
+		dumpMu.Unlock()
+		t.Fatalf("delete returned before the pending write completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	dumpMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dump-prompts", "target.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("target dump exists after pending write and delete: %v", err)
+	}
+}
+
+func TestDeleteSessionDumpRejectsUnsafeSessionIDs(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("METIS_HOME", dir)
+	closeDumpForTest()
+	t.Cleanup(closeDumpForTest)
+
+	sentinel := filepath.Join(dir, "sentinel.jsonl")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, sessionID := range []string{"", ".", "..", "../sentinel", "a/b", `a\b`, "line\nbreak", "nul\x00byte"} {
+		if err := DeleteSessionDump(sessionID); err == nil {
+			t.Errorf("DeleteSessionDump(%q) succeeded; want validation error", sessionID)
+		}
+	}
+	if body, err := os.ReadFile(sentinel); err != nil || string(body) != "keep" {
+		t.Fatalf("unsafe delete altered sentinel: body=%q err=%v", body, err)
+	}
+}

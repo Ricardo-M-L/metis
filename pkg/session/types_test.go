@@ -15,6 +15,9 @@ func TestHeader_JSONRoundTripPreservesFields(t *testing.T) {
 		System:    "you are helpful",
 		WorkDir:   "/repo",
 		Mode:      "auto",
+		Effort:    "high",
+		Preset:    "creator",
+		Status:    "completed",
 		Title:     "refactor sprint",
 		AlwaysAllow: []SavedRule{
 			{Tool: "Bash", Match: "git status", Verb: 1, Source: "user-allow"},
@@ -28,7 +31,7 @@ func TestHeader_JSONRoundTripPreservesFields(t *testing.T) {
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.ID != in.ID || out.Model != in.Model || out.Title != in.Title {
+	if out.ID != in.ID || out.Model != in.Model || out.Title != in.Title || out.Effort != in.Effort || out.Preset != in.Preset || out.Status != in.Status {
 		t.Errorf("round trip mismatch: %+v", out)
 	}
 	if len(out.AlwaysAllow) != 1 || out.AlwaysAllow[0].Tool != "Bash" {

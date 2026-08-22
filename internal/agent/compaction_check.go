@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -199,6 +200,44 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 		l.mu.Lock()
 	}
 
+	// firePostCompact mirrors firePreCompact's drop-lock emit for the
+	// AFTER side of an LLM-driven tier (collapse / compact). Fired only
+	// when the tier actually reduced the history — the cheap model-free
+	// tiers (snip / microcompact / image-prune) never destroy
+	// conversational content wholesale and stay silent. Handlers may
+	// return AdditionalContext; it's appended as a user message under
+	// the lock so the next request re-anchors on hook-contributed facts
+	// (bug §28.11's "compact 后 inject 上下文" half). Appending AFTER
+	// emitContextReduced means the token estimate must be refreshed —
+	// injected config text is small but not free.
+	firePostCompact := func(tier string, beforeMsgs, afterMsgs, beforeToks, afterToks int) {
+		if l.Hooks == nil {
+			return
+		}
+		pc := &PostCompact{
+			Trigger:        "auto",
+			Tier:           tier,
+			BeforeMessages: beforeMsgs,
+			AfterMessages:  afterMsgs,
+			BeforeTokens:   beforeToks,
+			AfterTokens:    afterToks,
+		}
+		tc := HookContext{Model: l.Model, Turn: l.turnIdx}
+		l.mu.Unlock()
+		extra := l.Hooks.EmitPostCompact(ctx, tc, pc)
+		l.mu.Lock()
+		if strings.TrimSpace(extra) != "" {
+			l.Messages = append(l.Messages, llm.Message{
+				Role: llm.RoleUser,
+				Content: []llm.ContentBlock{{
+					Type: "text",
+					Text: "[post-compact hook context] " + extra,
+				}},
+			})
+			l.estTokens.Store(int64(estimateTokens(l.Messages)))
+		}
+	}
+
 	// Tier 3 — Context-collapse: fold early middle into a summary
 	// (lighter than full Compact, heavier than snip). Runs at 0.78
 	// vs Compact's 0.85 so a long-thread session gets an early
@@ -237,6 +276,11 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 				Info: fmt.Sprintf("context collapsed (early middle): %d → %d messages · ~%d → ~%d tokens",
 					before, len(collapsed), beforeTokens, afterTokens),
 			})
+			// PostCompact hook for the collapse tier — after the final
+			// history is installed, before the compact tier's own
+			// threshold check runs (so a hook that ALSO shrinks nothing
+			// here doesn't see a half-state).
+			firePostCompact("collapse", before, len(collapsed), beforeTokens, afterTokens)
 		}
 		endCompactionAttempt("collapse", nil)
 	}
@@ -328,6 +372,10 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 		Info: fmt.Sprintf("context compacted: %d → %d messages · ~%d → ~%d tokens",
 			before, len(l.Messages), beforeTokens, afterTokens),
 	})
+	// PostCompact hook for the full-compact tier — last, so handlers see
+	// the FINAL post-guard history (message count includes any budget
+	// clamps above) and any AdditionalContext lands after every guard.
+	firePostCompact("compact", before, len(l.Messages), beforeTokens, afterTokens)
 }
 
 // sameSlice returns true when two []llm.Message refer to the same

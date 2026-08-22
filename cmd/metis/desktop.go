@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/desktop"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/webui"
@@ -39,7 +40,17 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		return launchNativeDesktop(cwd)
 	}
 
-	rt, err := setupRuntime(ctx, &cliFlags{})
+	flags := &cliFlags{}
+	presetName := "standard"
+	if prefs, prefErr := webui.LoadDesktopLaunchPreferences(); prefErr != nil {
+		fmt.Fprintf(os.Stderr, "metis desktop: preferences: %v (using Standard preset)\n", prefErr)
+	} else if prefs.DefaultPreset != "" {
+		presetName = prefs.DefaultPreset
+		if presetName != "standard" {
+			flags.agentProfile = presetName
+		}
+	}
+	rt, err := setupRuntime(ctx, flags)
 	if err != nil {
 		return err
 	}
@@ -49,12 +60,21 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	srv := webui.NewServer(addr, rt.loop, rt.store, webui.RuntimeBindings{
 		InitialSessionID:    rt.sessionID,
 		ProviderName:        rt.providerName,
+		PresetName:          presetName,
 		FreshPermissionMode: rt.defaultPermissionMode,
 		BuildProvider: func(providerName, model string) (*rtpkg.ProviderBuild, error) {
-			return rtpkg.BuildProvider(rt.cfg, providerName, model)
+			cfg, _, err := config.Load()
+			if err != nil {
+				return nil, err
+			}
+			return rtpkg.BuildProvider(cfg, providerName, model)
 		},
 		SessionBoundary: rt.releaseSessionWork,
 		SessionSwitch:   rt.rebindSession,
+		OpenWorkspace:   launchNativeDesktop,
+		OpenPath:        desktop.OpenPath,
+		Plugins:         rt.plugins,
+		Roster:          rt.subAgentRoster,
 	})
 	fmt.Fprintf(os.Stderr, "metis desktop --web: starting web UI on %s\n", addr)
 	fmt.Fprintf(os.Stderr, "Open http://%s in your browser\n", addr)

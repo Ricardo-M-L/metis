@@ -25,6 +25,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/themes"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 	pubprov "github.com/Ricardo-M-L/metis/pkg/provider"
 )
@@ -1171,8 +1172,39 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			Role: "warning", Content: "image: " + e, Timestamp: time.Now(),
 		})
 	}
+	// `@session:<ref>` cross-session references (DSH parity): resolve
+	// against the store and inject a bounded digest as a text block.
+	// Same degrade-to-warning convention as @file images. Runs after the
+	// image pass so both rewrites compose on the same text.
+	var atSessionBlocks []llm.ContentBlock
+	if m.session != nil && atSessionPattern.MatchString(llmTextRewritten) {
+		st := m.session
+		rewritten, sBlocks, sErrs := expandAtSession(llmTextRewritten,
+			func(limit int) ([]builtin.SessionInfo, error) {
+				entries, err := st.List(limit)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]builtin.SessionInfo, 0, len(entries))
+				for _, e := range entries {
+					out = append(out, builtin.SessionInfo{ID: e.ID, Title: e.Title, Model: e.Model, UpdatedAt: e.UpdatedAt, MessageCount: e.MessageCount})
+				}
+				return out, nil
+			},
+			func(id string) ([]llm.Message, error) {
+				_, msgs, err := st.Load(id)
+				return msgs, err
+			})
+		llmTextRewritten = rewritten
+		atSessionBlocks = sBlocks
+		for _, e := range sErrs {
+			m.messages = append(m.messages, Message{
+				Role: "warning", Content: e, Timestamp: time.Now(),
+			})
+		}
+	}
 
-	if len(m.imagePaste) > 0 || len(atFileBlocks) > 0 {
+	if len(m.imagePaste) > 0 || len(atFileBlocks) > 0 || len(atSessionBlocks) > 0 {
 		var blocks []llm.ContentBlock
 		var errs []string
 		if len(m.imagePaste) > 0 {
@@ -1180,13 +1212,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			blocks = append(blocks, pasted...)
 			errs = append(errs, pErrs...)
 		} else {
-			// Only @-file path active — text comes through as one block,
-			// images appended after.
+			// Only @-file/@-session path active — text comes through as
+			// one block, images after, session digests BEFORE the text
+			// so the referenced context reads top-down.
 			if llmTextRewritten != "" {
 				blocks = append(blocks, llm.ContentBlock{Type: "text", Text: llmTextRewritten})
 			}
 		}
 		blocks = append(blocks, atFileBlocks...)
+		blocks = append(blocks, atSessionBlocks...)
 		// Pasted attachments are all-or-nothing. If a cached file vanished
 		// or failed preprocessing, do not send the generated local-path
 		// fallback as though it were the image. That reproduces the stale

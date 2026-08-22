@@ -2,117 +2,23 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8"/>
-    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>Metis</title>
-    <link rel="stylesheet" href="./src/style.css"/>
+    <style>
+        html, body { margin: 0; height: 100%; background: #151517; }
+        #boot {
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #adb2b8;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif;
+            font-size: 14px;
+        }
+    </style>
 </head>
 <body>
-<div class="app" id="app">
-  <div class="titlebar">
-    <div class="titlebar-traffic">
-      <div class="titlebar-dot red" id="windowClose" role="button" tabindex="0" aria-label="Close window" title="Close"></div>
-      <div class="titlebar-dot yellow" id="windowMinimise" role="button" tabindex="0" aria-label="Minimise window" title="Minimise"></div>
-      <div class="titlebar-dot green" id="windowMaximise" role="button" tabindex="0" aria-label="Toggle maximise" title="Toggle maximise"></div>
-    </div>
-    <div class="titlebar-title">Metis</div>
-  </div>
-  <div class="body">
-  <aside class="sidebar">
-    <div class="sidebar-header">
-      <div class="sidebar-logo">M</div>
-      <div class="sidebar-title">Metis</div>
-    </div>
-    <nav class="sidebar-nav">
-      <div class="nav-item active" id="navNewChat" onclick="selectNav(this); doNewChat()"><span class="nav-icon">&#9998;</span><span>New Chat</span></div>
-      <div class="nav-item" onclick="selectNav(this); showSearch()"><span class="nav-icon">&#128269;</span><span>Search</span></div>
-      <div class="nav-item" onclick="selectNav(this); showScheduled()"><span class="nav-icon">&#128336;</span><span>Scheduled</span></div>
-      <div class="nav-item" onclick="selectNav(this); showPlugins()"><span class="nav-icon">&#129513;</span><span>Plugins</span></div>
-    </nav>
-    <div class="sidebar-section"><div class="section-label">Projects</div></div>
-    <div class="session-list" id="sessionList"></div>
-    <div class="sidebar-footer" id="navSettings" onclick="openSettings()">
-      <div class="footer-avatar">R</div>
-      <div class="footer-info"><div class="footer-name">Settings</div><div class="footer-role">Account</div></div>
-      <span class="footer-badge" id="statusBadge">Ready</span>
-    </div>
-  </aside>
-  <main class="main">
-    <div class="topbar">
-      <div class="topbar-title" id="topbarTitle">Metis</div>
-      <div class="topbar-actions">
-        <button class="topbar-btn" title="Undo">&#8617;</button>
-        <button class="topbar-btn" title="Redo">&#8618;</button>
-      </div>
-    </div>
-    <div class="chat-area" id="chatArea">
-      <div class="welcome" id="welcomeScreen">
-        <div class="welcome-icon">M</div>
-        <div class="welcome-text">What should we do?</div>
-        <div class="welcome-sub">I can help you with coding, writing, analysis, and more.</div>
-      </div>
-    </div>
-    <div class="input-area" id="inputArea">
-      <div class="input-container">
-        <div class="input-box">
-          <div class="input-row">
-            <textarea class="input-field" id="inputField" placeholder="Ask anything..." rows="1"></textarea>
-            <button class="send-btn" id="sendBtn" disabled onclick="sendMessage()">&#8593;</button>
-          </div>
-          <div class="input-actions">
-            <button class="input-action-btn" id="attachBtn"><span class="input-action-icon">+</span><span>Attach</span></button>
-            <button class="input-action-btn" id="approvalBtn" onclick="toggleApproval()"><span class="input-action-icon">&#9201;</span><span id="approvalLabel">Approve edits</span><span>&#9662;</span></button>
-            <div class="model-selector" id="modelSelector" title="Configured Metis model"><span id="modelName">loading...</span></div>
-          </div>
-        </div>
-        <div class="project-badge"><span class="project-icon">&#128193;</span><span id="projectName">metis</span></div>
-      </div>
-    </div>
-  </main>
-  </div>
-</div>
-<div class="settings-overlay" id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
-  <div class="settings-panel">
-    <div class="settings-sidebar">
-      <div class="settings-back" id="settingsBack" onclick="closeSettings()"><span>&#8592;</span><span>Back to app</span></div>
-      <input type="text" class="settings-search" placeholder="Search settings..."/>
-
-      <div class="settings-group-label">PERSONAL</div>
-      <div class="settings-item active" data-tab="general" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#9881;</span><span>General</span></div>
-      <div class="settings-item" data-tab="appearance" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#127912;</span><span>Appearance</span></div>
-      <div class="settings-item" data-tab="config" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#128295;</span><span>Configuration</span></div>
-      <div class="settings-item" data-tab="personalization" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#128171;</span><span>Personalization</span></div>
-      <div class="settings-item" data-tab="keyboard" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#9000;</span><span>Keyboard Shortcuts</span></div>
-
-      <div class="settings-group-label">INTEGRATIONS</div>
-      <div class="settings-item" data-tab="mcp" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#128279;</span><span>MCP Servers</span></div>
-      <div class="settings-item" data-tab="browser" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#127760;</span><span>Browser</span></div>
-
-      <div class="settings-group-label">CODING</div>
-      <div class="settings-item" data-tab="git" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#128256;</span><span>Git</span></div>
-      <div class="settings-item" data-tab="env" onclick="selectSettingsTab(this)"><span class="settings-item-icon">&#128221;</span><span>Environment</span></div>
-
-    </div>
-    <div class="settings-content" id="settingsContent">
-      <h2>General</h2>
-      <div class="settings-section">
-        <div class="settings-section-title">Work Mode</div>
-        <div class="settings-section-desc">Choose how much technical detail Metis shows</div>
-        <div class="radio-cards">
-          <div class="radio-card selected" onclick="selectRadio(this)"><div class="radio-card-title">For Coding</div><div class="radio-card-desc">More technical responses and controls</div></div>
-          <div class="radio-card" onclick="selectRadio(this)"><div class="radio-card-title">For Daily Work</div><div class="radio-card-desc">Just as capable, with less technical detail</div></div>
-        </div>
-      </div>
-      <div class="settings-section">
-        <div class="settings-section-title">Permissions</div>
-        <div class="settings-card">
-          <div class="settings-card-row"><div><div class="settings-card-label">Default Permissions</div><div class="settings-card-desc">Metis can read and edit files in its workspace.</div></div><div class="toggle on" onclick="this.classList.toggle('on')"></div></div>
-          <div class="settings-card-row"><div><div class="settings-card-label">Auto-Review</div></div><div class="toggle on" onclick="this.classList.toggle('on')"></div></div>
-          <div class="settings-card-row"><div><div class="settings-card-label">Full Access</div></div><div class="toggle" onclick="this.classList.toggle('on')"></div></div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
+<div id="boot"><span id="boot-status">正在启动 Metis…</span></div>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>

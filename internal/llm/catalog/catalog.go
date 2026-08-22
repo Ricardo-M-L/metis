@@ -321,6 +321,28 @@ func (c *Client) LookupVisionByModelID(modelID string) (bool, bool) {
 	return false, found
 }
 
+// LookupReasoningByModelID reports whether catalog metadata marks a model as
+// reasoning-capable. Like the vision lookup this is synchronous, read-only,
+// and never initiates network I/O; callers fall back to conservative local
+// model-family facts when the cache is cold or the id is private.
+func (c *Client) LookupReasoningByModelID(modelID string) (bool, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || modelID == "" {
+		return false, false
+	}
+	found := false
+	for _, p := range c.cached {
+		if m, ok := p.Models[modelID]; ok {
+			found = true
+			if m.Reasoning {
+				return true, true
+			}
+		}
+	}
+	return false, found
+}
+
 func (c *Client) LookupContextWindowByModelID(modelID string) (int, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

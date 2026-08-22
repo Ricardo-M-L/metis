@@ -330,6 +330,27 @@ type Interruptible interface {
 	InterruptBehavior() InterruptBehavior
 }
 
+// TimeoutMsAware lets a tool declare a cooperative per-call deadline in
+// milliseconds (DSH tool-call-timeout-policy parity). The dispatcher
+// arms a context deadline for the declared budget and converts a
+// deadline win into a structured TOOL_TIMEOUT result. The deadline is
+// cooperative: only a tool that forwards ctx to its I/O actually stops;
+// declaring it is a promise the tool respects the signal (the shipped
+// web/network tools are the reference).
+type TimeoutMsAware interface {
+	TimeoutMs() int
+}
+
+// TimeoutMs returns the tool's declared per-call deadline in
+// milliseconds, or 0 (no budget) when it does not implement the
+// capability.
+func TimeoutMs(t Tool) int {
+	if d, ok := t.(TimeoutMsAware); ok {
+		return d.TimeoutMs()
+	}
+	return 0
+}
+
 // IsReadOnly returns whether t reports the input as read-only.
 // Default false (assume side effects) when t does not implement
 // ReadOnlyAware.

@@ -387,3 +387,76 @@ func TestSaveUserProviderDefault_RejectsSymlinkWithoutReplacingTarget(t *testing
 		t.Fatalf("config symlink was replaced: stat=%v err=%v", st.Mode(), err)
 	}
 }
+
+func TestDeleteUserCustomProviderPreservesUnrelatedConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := SaveUserCustomProvider(CustomProviderSpec{
+		ID: "local-gateway", Transport: "openai_chat", BaseURL: "http://127.0.0.1:9000/v1", Model: "local-model",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "config.toml")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\n[ui]\ntheme = \"nord\"\n"); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	if err := DeleteUserCustomProvider("local-gateway"); err == nil || !strings.Contains(err.Error(), "default") {
+		t.Fatalf("deleting current default should fail, got %v", err)
+	}
+	if err := SaveUserProviderDefault("openai"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUserCustomProvider("local-gateway"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "provider.custom.local-gateway") || !strings.Contains(string(b), "theme = \"nord\"") {
+		t.Fatalf("unexpected config after delete:\n%s", b)
+	}
+	var probe userConfigProbe
+	if _, err := toml.Decode(string(b), &probe); err != nil {
+		t.Fatalf("deleted config is invalid: %v", err)
+	}
+	if probe.Provider.Default != "openai" {
+		t.Fatalf("provider.default = %q", probe.Provider.Default)
+	}
+}
+
+func TestProviderOverrideSourcesDetectProjectLayers(t *testing.T) {
+	project := t.TempDir()
+	t.Chdir(project)
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte(`
+[provider]
+default = "project-gateway"
+
+[provider.custom.project-gateway]
+transport = "openai_chat"
+base_url = "https://example.com/v1"
+model = "project-model"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if source, err := ProviderDefaultOverrideSource(); err != nil || source == "" {
+		t.Fatalf("default override source = %q, %v", source, err)
+	}
+	if source, err := CustomProviderOverrideSource("project-gateway"); err != nil || source == "" {
+		t.Fatalf("custom override source = %q, %v", source, err)
+	}
+	if source, err := CustomProviderOverrideSource("other"); err != nil || source != "" {
+		t.Fatalf("unrelated custom source = %q, %v", source, err)
+	}
+}

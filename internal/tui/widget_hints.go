@@ -8,7 +8,7 @@ package tui
 //	/effort       → "→ slider: off / low / medium / high"
 //	/help         → "→ tabs: general / commands / custom-commands"
 //	/model        → "→ picker: choose model from curated list"
-//	/theme        → "→ cycle: dark / light / dark-daltonized"
+//	/theme        → "→ cycle: dark / light / dark-daltonized / nord / solarized-dark"
 //	/permissions  → "→ editor: cycle mode + view rules"
 //
 // Empty return means "use the registered Description" — the default
@@ -22,7 +22,7 @@ func widgetHint(cmdName string) string {
 	case "model", "m":
 		return "→ picker: choose from curated model list"
 	case "theme":
-		return "→ cycle: dark / light / dark-daltonized + live swatches"
+		return "→ cycle: dark / light / dark-daltonized / nord / solarized-dark + live swatches"
 	case "permissions", "perms":
 		return "→ editor: cycle mode + view active rules"
 	}

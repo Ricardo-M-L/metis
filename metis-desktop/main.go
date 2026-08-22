@@ -15,12 +15,13 @@ func main() {
 		Height:    800,
 		MinWidth:  800,
 		MinHeight: 600,
-		Frameless: true,
+		Frameless: false,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
 		BackgroundColour: &options.RGBA{R: 26, G: 26, B: 26, A: 1},
 		OnStartup:        app.startup,
+		OnShutdown:       app.shutdown,
 		Bind: []interface{}{
 			app,
 		},

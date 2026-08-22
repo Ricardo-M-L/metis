@@ -57,6 +57,15 @@ const (
 	// before it's collapsed. Read-only — matches claude-code's
 	// PreCompact hook (settings.json: "PreCompact").
 	EventPreCompact Event = "PreCompact"
+	// EventPostCompact fires just AFTER an LLM-driven compaction tier
+	// (collapse or compact) successfully reduced the live history.
+	// Unlike PreCompact it is feedback-capable: a handler may return
+	// AdditionalContext that the loop appends as a user message right
+	// after the summary boundary, so the model re-anchors (project
+	// layout, active branch, key constraints) without re-reading
+	// files. Mirrors claude-code's PostCompact hook (settings.json:
+	// "PostCompact"); closes metis bug §28.11 (P1).
+	EventPostCompact Event = "PostCompact"
 )
 
 // Context is the read-only data available to all hook handlers.
@@ -217,6 +226,34 @@ type PreCompact struct {
 	EstimatedTokens int
 }
 
+// PostCompact fires after an LLM-driven compaction tier successfully
+// reduced the live history. Tier is "collapse" or "compact" (the cheap
+// model-free tiers — snip / microcompact / image-prune — do NOT fire
+// this event; they never destroy conversational content wholesale).
+// Before/After pairs describe the reduction so observers can log or
+// bill it. Handlers may contribute AdditionalContext (see
+// ModifiedPostCompact); the loop appends it as a user message right
+// after the summary boundary.
+type PostCompact struct {
+	Context
+	Trigger        string // "auto" | "manual"
+	Tier           string // "collapse" | "compact"
+	BeforeMessages int
+	AfterMessages  int
+	BeforeTokens   int
+	AfterTokens    int
+}
+
+// ModifiedPostCompact is the optional PostCompact return. AdditionalContext
+// is injected into the conversation as a user message immediately after
+// the compact boundary — the P1 use case from bug §28.11 ("用户没法在
+// compact 前后 inject 上下文"): re-anchor the model with facts the
+// summarizer may have folded away (current branch, build command, the
+// user's active constraint). Empty string = no injection.
+type ModifiedPostCompact struct {
+	AdditionalContext string
+}
+
 // Handler signatures for each event type. Plugin authors write one of
 // these and pass it to Registry.Register.
 type (
@@ -245,6 +282,12 @@ type (
 	SubagentStopHandler       func(context.Context, Context, *SubagentStop)
 	CwdChangedHandler         func(context.Context, Context, *CwdChanged)
 	PreCompactHandler         func(context.Context, Context, *PreCompact)
+	// PostCompactHandler is the feedback-capable PostCompact variant:
+	// its return value can inject AdditionalContext after the compact
+	// boundary. Sync only — the compaction path consumes the return,
+	// so RegisterAsync treats it as sync (same contract as
+	// PostToolUseContextHandler).
+	PostCompactHandler func(context.Context, Context, *PostCompact) *ModifiedPostCompact
 )
 
 // asyncBit is the per-handler async flag stored alongside the handler.
@@ -315,6 +358,7 @@ type Registry struct {
 	subagentStop  []SubagentStopHandler
 	cwdChanged    []CwdChangedHandler
 	preCompact    []preCompactEntry
+	postCompact   []PostCompactHandler
 }
 
 func NewRegistry() *Registry { return &Registry{} }
@@ -391,6 +435,9 @@ func (r *Registry) register(handler any, async bool) {
 		r.cwdChanged = append(r.cwdChanged, h)
 	case PreCompactHandler:
 		r.preCompact = append(r.preCompact, preCompactEntry{h: h, async: async})
+	case PostCompactHandler:
+		// Sync only — the compaction path consumes the return value.
+		r.postCompact = append(r.postCompact, h)
 	}
 }
 
@@ -544,6 +591,26 @@ func (r *Registry) EmitPreCompact(ctx context.Context, tc Context, in *PreCompac
 			e.h(ctx, tc, in)
 		}
 	}
+}
+
+// EmitPostCompact fans out to the feedback-capable PostCompact handlers
+// and returns their AdditionalContext strings joined by newlines (""
+// when nothing was contributed). The compaction path appends the result
+// as a user message right after the summary boundary, so the model sees
+// hook-contributed anchors (branch, build command, constraints) at the
+// next request without re-reading files. All handlers run sync — the
+// caller consumes the return inside the compaction window.
+func (r *Registry) EmitPostCompact(ctx context.Context, tc Context, in *PostCompact) string {
+	r.mu.RLock()
+	handlers := r.postCompact
+	r.mu.RUnlock()
+	var parts []string
+	for _, h := range handlers {
+		if mod := h(ctx, tc, in); mod != nil && strings.TrimSpace(mod.AdditionalContext) != "" {
+			parts = append(parts, mod.AdditionalContext)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // EmitPermissionRequest returns the first non-nil decision override; nil

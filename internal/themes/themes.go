@@ -124,10 +124,51 @@ var darkDaltonizedTheme = Theme{
 	DiffDelFg:     lipgloss.Color("#f48fb1"),
 }
 
+// nordTheme is a cool-toned palette from the popular Nord scheme
+// (arctic blues, low saturation). High readability, easy on the eyes,
+// popular with terminal users who want a coherent muted aesthetic.
+var nordTheme = Theme{
+	Name:          "nord",
+	BgSecondary:   lipgloss.Color("#2e3440"),
+	TextPrimary:   lipgloss.Color("#eceff4"),
+	TextSecondary: lipgloss.Color("#d8dee9"),
+	TextMuted:     lipgloss.Color("#868f9c"),
+	AccentBlue:    lipgloss.Color("#81a1c1"),
+	AccentGreen:   lipgloss.Color("#a3be8c"),
+	AccentOrange:  lipgloss.Color("#d08770"),
+	AccentRed:     lipgloss.Color("#bf616a"),
+	AccentCyan:    lipgloss.Color("#88c0d0"),
+	DiffAddBg:     lipgloss.Color("#2a3b2f"),
+	DiffAddFg:     lipgloss.Color("#b8d4a3"),
+	DiffDelBg:     lipgloss.Color("#3b2a2e"),
+	DiffDelFg:     lipgloss.Color("#d48b93"),
+}
+
+// solarizedDarkTheme is the Solarized dark palette — warm amber/green
+// tones designed to reduce eye fatigue over long sessions.
+var solarizedDarkTheme = Theme{
+	Name:          "solarized-dark",
+	BgSecondary:   lipgloss.Color("#073642"),
+	TextPrimary:   lipgloss.Color("#eee8d5"),
+	TextSecondary: lipgloss.Color("#b58900"),
+	TextMuted:     lipgloss.Color("#6c71c4"),
+	AccentBlue:    lipgloss.Color("#268bd2"),
+	AccentGreen:   lipgloss.Color("#859900"),
+	AccentOrange:  lipgloss.Color("#cb4b16"),
+	AccentRed:     lipgloss.Color("#dc322f"),
+	AccentCyan:    lipgloss.Color("#2aa198"),
+	DiffAddBg:     lipgloss.Color("#16361f"),
+	DiffAddFg:     lipgloss.Color("#a5c35a"),
+	DiffDelBg:     lipgloss.Color("#3a1a18"),
+	DiffDelFg:     lipgloss.Color("#e06c6c"),
+}
+
 var allThemes = map[string]*Theme{
 	"dark":            &darkTheme,
 	"light":           &lightTheme,
 	"dark-daltonized": &darkDaltonizedTheme,
+	"nord":            &nordTheme,
+	"solarized-dark":  &solarizedDarkTheme,
 }
 
 // currentTheme is the active palette. Resolved at init from this

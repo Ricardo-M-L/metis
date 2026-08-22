@@ -5,8 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +38,37 @@ func (p *activationTestProvider) Stream(context.Context, llm.Request) (llm.Strea
 	return nil, errors.New("stream not used by activation tests")
 }
 
+type statusTestStream struct {
+	ctx     context.Context
+	started chan struct{}
+	once    sync.Once
+	done    bool
+}
+
+func (s *statusTestStream) Recv() (llm.StreamEvent, error) {
+	if s.started != nil {
+		s.once.Do(func() { close(s.started) })
+		<-s.ctx.Done()
+		return llm.StreamEvent{}, s.ctx.Err()
+	}
+	if s.done {
+		return llm.StreamEvent{}, io.EOF
+	}
+	s.done = true
+	return llm.StreamEvent{Type: "message_stop", StopReason: "end_turn"}, nil
+}
+
+func (s *statusTestStream) Close() error { return nil }
+
+type statusTestProvider struct {
+	activationTestProvider
+	started chan struct{}
+}
+
+func (p *statusTestProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamReader, error) {
+	return &statusTestStream{ctx: ctx, started: p.started}, nil
+}
+
 func testServer(t *testing.T) (*Server, *session.Store) {
 	t.Helper()
 	store, err := session.NewStore(t.TempDir())
@@ -50,6 +87,40 @@ func TestHealthAndSecurityHeaders(t *testing.T) {
 	}
 	if got := rr.Header().Get("X-Frame-Options"); got != "DENY" {
 		t.Fatalf("X-Frame-Options = %q", got)
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"build"`)) {
+		t.Fatalf("health response missing build identity: %s", rr.Body.String())
+	}
+}
+
+func TestStatusIncludesContextPressure(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Model = "model"
+	loop.ContextWindow = 128_000
+	loop.Compactor = agent.NewCompactor(agent.DefaultCompactionConfig(), "model", loop.ContextWindow, provider)
+	loop.ResetSession([]llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: strings.Repeat("context ", 200)}}}})
+	s := NewServer("127.0.0.1:0", loop, store)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		ContextUsed      int     `json:"contextUsed"`
+		ContextWindow    int     `json:"contextWindow"`
+		CompactThreshold float64 `json:"compactThreshold"`
+		Build            string  `json:"build"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ContextUsed <= 0 || payload.ContextWindow != 128_000 || payload.CompactThreshold <= 0 || payload.Build == "" {
+		t.Fatalf("incomplete context status: %+v", payload)
 	}
 }
 
@@ -92,6 +163,392 @@ func TestSessionCreateListAndLoad(t *testing.T) {
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/"+created.ID, nil))
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte("hello")) {
 		t.Fatalf("load: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSessionsListUsesStableCursorAndServerSideSearch(t *testing.T) {
+	s, store := testServer(t)
+	for i, title := range []string{"alpha report", "beta migration", "gamma notes"} {
+		id := fmt.Sprintf("page-%d", i)
+		if err := store.WriteHeaderFull(session.Header{ID: id, Model: "gpt-test", Title: title, WorkDir: filepath.Join("/workspace", title)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendMessage(id, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: title}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := s.handler()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions?limit=2", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first page: %d %s", rr.Code, rr.Body.String())
+	}
+	var first struct {
+		Sessions   []sessionItem `json:"sessions"`
+		NextCursor string        `json:"nextCursor"`
+		Total      int           `json:"total"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Sessions) != 2 || first.NextCursor == "" || first.Total != 3 {
+		t.Fatalf("first page = %+v", first)
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions?limit=2&cursor="+first.NextCursor, nil))
+	var second struct {
+		Sessions []sessionItem `json:"sessions"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &second); err != nil || len(second.Sessions) != 1 {
+		t.Fatalf("second page: %d %s err=%v", rr.Code, rr.Body.String(), err)
+	}
+	seen := map[string]bool{}
+	for _, item := range first.Sessions {
+		seen[item.ID] = true
+	}
+	if seen[second.Sessions[0].ID] {
+		t.Fatalf("cursor pages overlap on %q", second.Sessions[0].ID)
+	}
+
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions?q=beta", nil))
+	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte("beta migration")) || bytes.Contains(rr.Body.Bytes(), []byte("alpha report")) {
+		t.Fatalf("server search: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSessionArchiveAPIIsRecoverableAndFiltered(t *testing.T) {
+	s, store := testServer(t)
+	if err := store.WriteHeader("archive-me", "model", "system"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessage("archive-me", llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "keep me"}}}); err != nil {
+		t.Fatal(err)
+	}
+	h := s.handler()
+
+	archive := func(value bool) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{"id": "archive-me", "archived": value})
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/sessions/archive", bytes.NewReader(body)))
+		return rr
+	}
+	if rr := archive(true); rr.Code != http.StatusOK {
+		t.Fatalf("archive: %d %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, "archive-me.jsonl")); err != nil {
+		t.Fatalf("archive removed transcript: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))
+	if bytes.Contains(rr.Body.Bytes(), []byte("archive-me")) {
+		t.Fatalf("default list contains archived session: %s", rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions?archived_only=true", nil))
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"id":"archive-me"`)) || !bytes.Contains(rr.Body.Bytes(), []byte(`"archived":true`)) {
+		t.Fatalf("archive list missing metadata: %s", rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/archive-me", nil))
+	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte("keep me")) {
+		t.Fatalf("archived session is not recoverable: %d %s", rr.Code, rr.Body.String())
+	}
+
+	if rr := archive(false); rr.Code != http.StatusOK {
+		t.Fatalf("restore: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))
+	if !bytes.Contains(rr.Body.Bytes(), []byte("archive-me")) {
+		t.Fatalf("restored session missing from default list: %s", rr.Body.String())
+	}
+}
+
+func TestSessionArchiveAPIRejectsUnsafeID(t *testing.T) {
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/sessions/archive", bytes.NewBufferString(`{"id":"../escape","archived":true}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSessionDeleteAPIRemovesOwnedDataAndPreservesNeighbors(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("METIS_HOME", home)
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const target = "delete-me"
+	const neighbor = "delete-me-too"
+	targetWorkDir := filepath.Join(home, "target-workspace")
+	neighborWorkDir := filepath.Join(home, "neighbor-workspace")
+	for _, id := range []string{target, neighbor} {
+		workDir := targetWorkDir
+		if id == neighbor {
+			workDir = neighborWorkDir
+		}
+		if err := store.WriteHeaderFull(session.Header{ID: id, Model: "model", System: "system", WorkDir: workDir}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendMessage(id, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: id}}}); err != nil {
+			t.Fatal(err)
+		}
+		store.NewTimingRecorder(id).Record("Read", time.Millisecond, false)
+		if err := store.WriteCost(id, session.CostSnapshot{InputTokens: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Snapshot(id, "named"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Archive(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WritePointer(target, targetWorkDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WritePointer(neighbor, neighborWorkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	mustWrite := func(path, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(filepath.Join(home, "tasks", target+".json"), `{}`)
+	mustWrite(filepath.Join(home, "tasks", neighbor+".json"), `{}`)
+	mustWrite(filepath.Join(home, "sessions", target, "tasks-structured.json"), `{}`)
+	mustWrite(filepath.Join(home, "sessions", neighbor, "tasks-structured.json"), `{}`)
+	mustWrite(filepath.Join(home, ".metis", "checkpoints", target, "HEAD"), "target")
+	mustWrite(filepath.Join(home, ".metis", "checkpoints", neighbor, "HEAD"), "neighbor")
+	mustWrite(filepath.Join(home, "dump-prompts", target+".jsonl"), "target\n")
+	mustWrite(filepath.Join(home, "dump-prompts", neighbor+".jsonl"), "neighbor\n")
+	mustWrite(filepath.Join(store.Dir, "tags", target+".txt"), "private")
+	mustWrite(filepath.Join(store.Dir, "tags", neighbor+".txt"), "keep")
+	if _, err := rtpkg.SaveSnapshot(rtpkg.Snapshot{SessionID: target}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rtpkg.SaveSnapshot(rtpkg.Snapshot{SessionID: neighbor}); err != nil {
+		t.Fatal(err)
+	}
+
+	traceAdapter := rtpkg.InstallTrace(filepath.Join(home, "traces"))
+	if traceAdapter == nil || rtpkg.CurrentTraceStore() == nil {
+		t.Fatal("trace store was not installed")
+	}
+	if err := rtpkg.CurrentTraceStore().Append(&session.TraceEvent{SessionID: target, Kind: "text", Text: "private"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rtpkg.CurrentTraceStore().Append(&session.TraceEvent{SessionID: neighbor, Kind: "text", Text: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rtpkg.CurrentTraceStore().Sync(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rtpkg.CurrentTraceStore().Close() })
+
+	s := NewServer("127.0.0.1:0", nil, store)
+	s.hub.publish(target, agent.Event{Kind: agent.EventInfo, Info: "private replay"})
+	s.hub.publish(neighbor, agent.Event{Kind: agent.EventInfo, Info: "keep replay"})
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+target, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Deleted bool   `json:"deleted"`
+		ID      string `json:"id"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil || !response.Deleted || response.ID != target {
+		t.Fatalf("delete response = %+v, err=%v", response, err)
+	}
+
+	removed := []string{
+		filepath.Join(store.Dir, target+".jsonl"),
+		filepath.Join(store.Dir, target+".timing.jsonl"),
+		filepath.Join(store.Dir, target+".cost.json"),
+		filepath.Join(store.Dir, ".archive", target+".json"),
+		filepath.Join(store.Dir, "snapshots", target+"-named.json"),
+		filepath.Join(store.Dir, "tags", target+".txt"),
+		filepath.Join(home, "tasks", target+".json"),
+		filepath.Join(home, "sessions", target),
+		filepath.Join(home, ".metis", "checkpoints", target),
+		filepath.Join(home, "dump-prompts", target+".jsonl"),
+		filepath.Join(home, "snapshots", target+".json"),
+		filepath.Join(home, "traces", target+".jsonl"),
+	}
+	for _, path := range removed {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("deleted session path still exists: %s (err=%v)", path, err)
+		}
+	}
+	kept := []string{
+		filepath.Join(store.Dir, neighbor+".jsonl"),
+		filepath.Join(store.Dir, neighbor+".timing.jsonl"),
+		filepath.Join(store.Dir, neighbor+".cost.json"),
+		filepath.Join(store.Dir, "snapshots", neighbor+"-named.json"),
+		filepath.Join(store.Dir, "tags", neighbor+".txt"),
+		filepath.Join(home, "tasks", neighbor+".json"),
+		filepath.Join(home, "sessions", neighbor, "tasks-structured.json"),
+		filepath.Join(home, ".metis", "checkpoints", neighbor, "HEAD"),
+		filepath.Join(home, "dump-prompts", neighbor+".jsonl"),
+		filepath.Join(home, "snapshots", neighbor+".json"),
+		filepath.Join(home, "traces", neighbor+".jsonl"),
+	}
+	for _, path := range kept {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("neighbor path was removed: %s (%v)", path, err)
+		}
+	}
+	if events := rtpkg.CurrentTraceStore().Events(target); len(events) != 0 {
+		t.Fatalf("deleted trace remained in memory: %+v", events)
+	}
+	if pointer, err := session.ReadPointer(targetWorkDir); err != nil || pointer != nil {
+		t.Fatalf("deleted session recovery pointer = %+v, err=%v", pointer, err)
+	}
+	if pointer, err := session.ReadPointer(neighborWorkDir); err != nil || pointer == nil || pointer.SessionID != neighbor {
+		t.Fatalf("neighbor recovery pointer = %+v, err=%v", pointer, err)
+	}
+	if len(s.hub.replay) != 1 || s.hub.replay[0].session != neighbor {
+		t.Fatalf("SSE replay was not scrubbed exactly: %+v", s.hub.replay)
+	}
+}
+
+func TestSessionDeletePreservesRecoveryPointerOwnedByAnotherSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("METIS_HOME", home)
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const target = "delete-old-session"
+	const current = "keep-new-session"
+	workDir := filepath.Join(home, "shared-workspace")
+	if err := store.WriteHeaderFull(session.Header{ID: target, WorkDir: workDir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WritePointer(current, workDir); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer("127.0.0.1:0", nil, store)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+target, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rr.Code, rr.Body.String())
+	}
+	pointer, err := session.ReadPointer(workDir)
+	if err != nil || pointer == nil || pointer.SessionID != current {
+		t.Fatalf("newer recovery pointer was changed: pointer=%+v err=%v", pointer, err)
+	}
+}
+
+func TestSessionDeleteActiveSessionCrossesToFreshRuntime(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("METIS_HOME", home)
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const target = "active-delete"
+	if err := store.WriteHeaderFull(session.Header{ID: target, Provider: "wire", Model: "model", System: "system", Mode: "ask"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessage(target, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "delete this"}}}); err != nil {
+		t.Fatal(err)
+	}
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Model = "model"
+	loop.Restore([]llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "delete this"}}}})
+	boundaryCalls := 0
+	switchedID := ""
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID:    target,
+		ProviderName:        "wire",
+		FreshPermissionMode: permission.ModeAsk,
+		SessionBoundary:     func() { boundaryCalls++ },
+		SessionSwitch:       func(id string) { switchedID = id },
+	})
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+target, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete active: %d %s", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		ActiveSessionID string `json:"activeSessionId"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ActiveSessionID == "" || response.ActiveSessionID == target {
+		t.Fatalf("replacement session id = %q", response.ActiveSessionID)
+	}
+	s.stateMu.RLock()
+	activeID := s.activeSessionID
+	s.stateMu.RUnlock()
+	if activeID != response.ActiveSessionID || switchedID != response.ActiveSessionID || boundaryCalls != 1 {
+		t.Fatalf("active reset incomplete: active=%q switched=%q boundary=%d response=%q", activeID, switchedID, boundaryCalls, response.ActiveSessionID)
+	}
+	if got := loop.History(); len(got) != 0 {
+		t.Fatalf("replacement runtime retained deleted history: %+v", got)
+	}
+	if _, _, err := store.Load(target); !os.IsNotExist(err) {
+		t.Fatalf("deleted active transcript still loads: %v", err)
+	}
+	if hdr, history, err := store.Load(response.ActiveSessionID); err != nil || hdr == nil || len(history) != 0 {
+		t.Fatalf("replacement is not durable and empty: header=%+v history=%+v err=%v", hdr, history, err)
+	}
+}
+
+func TestSessionDeleteRejectsUnknownUnsafeAndBusyTargets(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("METIS_HOME", home)
+	s, store := testServer(t)
+	if err := store.WriteHeader("busy-delete", "model", "system"); err != nil {
+		t.Fatal(err)
+	}
+	h := s.handler()
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/api/sessions/missing-delete", http.StatusNotFound},
+		{"/api/sessions/a/b", http.StatusBadRequest},
+	} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, tc.path, nil))
+		if rr.Code != tc.want {
+			t.Errorf("DELETE %s = %d, want %d: %s", tc.path, rr.Code, tc.want, rr.Body.String())
+		}
+	}
+
+	s.runMu.Lock()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/busy-delete", nil))
+	s.runMu.Unlock()
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("busy delete = %d, want 409: %s", rr.Code, rr.Body.String())
+	}
+	if _, _, err := store.Load("busy-delete"); err != nil {
+		t.Fatalf("busy delete changed transcript: %v", err)
 	}
 }
 
@@ -155,6 +612,93 @@ func TestTurnRequiresRuntimeAndInput(t *testing.T) {
 	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(`{"input":"hello"}`)))
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+}
+
+func TestFailedTurnPersistsDurableSessionStatus(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Model = "model"
+	const id = "durable-turn-status"
+	if err := store.WriteHeaderFull(session.Header{ID: id, Provider: "wire", Model: "model", System: "system", Status: "idle"}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{ProviderName: "wire", InitialSessionID: id})
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(`{"sessionId":"durable-turn-status","input":"hello"}`)))
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("turn status = %d, want 502: %s", rr.Code, rr.Body.String())
+	}
+	hdr, _, err := store.LoadHeader(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Status != "failed" {
+		t.Fatalf("durable status = %q, want failed", hdr.Status)
+	}
+}
+
+func TestCompletedAndStoppedTurnsPersistDurableSessionStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop bool
+		want string
+	}{
+		{name: "completed", want: "completed"},
+		{name: "stopped", stop: true, want: "stopped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := session.NewStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &statusTestProvider{activationTestProvider: activationTestProvider{name: "wire", model: "model"}}
+			if tc.stop {
+				provider.started = make(chan struct{})
+			}
+			loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+			loop.Model = "model"
+			id := "durable-turn-status-" + tc.name
+			if err := store.WriteHeaderFull(session.Header{ID: id, Provider: "wire", Model: "model", System: "system", Status: "idle"}); err != nil {
+				t.Fatal(err)
+			}
+			s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{ProviderName: "wire", InitialSessionID: id})
+			h := s.handler()
+			turnResult := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rr := httptest.NewRecorder()
+				h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(`{"sessionId":"`+id+`","input":"hello"}`)))
+				turnResult <- rr
+			}()
+			if tc.stop {
+				select {
+				case <-provider.started:
+				case <-time.After(2 * time.Second):
+					t.Fatal("turn did not start")
+				}
+				stopRR := httptest.NewRecorder()
+				h.ServeHTTP(stopRR, httptest.NewRequest(http.MethodPost, "/api/stop", nil))
+				if stopRR.Code != http.StatusOK {
+					t.Fatalf("stop status = %d: %s", stopRR.Code, stopRR.Body.String())
+				}
+			}
+			select {
+			case <-turnResult:
+			case <-time.After(3 * time.Second):
+				t.Fatal("turn did not finish")
+			}
+			hdr, _, err := store.LoadHeader(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hdr.Status != tc.want {
+				t.Fatalf("durable status = %q, want %q", hdr.Status, tc.want)
+			}
+		})
 	}
 }
 

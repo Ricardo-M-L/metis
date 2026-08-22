@@ -14,6 +14,7 @@ package runtime
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -208,11 +209,13 @@ func DeleteSnapshot(sessionID string) error {
 	if err != nil {
 		return err
 	}
-	err = os.Remove(path)
-	if os.IsNotExist(err) {
-		return nil
+	var joined error
+	for _, candidate := range []string{path, path + ".tmp"} {
+		if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
+			joined = errors.Join(joined, err)
+		}
 	}
-	return err
+	return joined
 }
 
 // LooksCrashed reports whether a snapshot is likely from a crashed

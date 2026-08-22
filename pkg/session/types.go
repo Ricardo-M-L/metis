@@ -17,13 +17,27 @@ import "time"
 // every JSONL session file. Subsequent SetTitle calls append a partial
 // header; the on-load merge is documented in internal/session.
 type Header struct {
-	ID          string      `json:"id"`
-	CreatedAt   time.Time   `json:"created_at"`
-	Provider    string      `json:"provider,omitempty"`
-	Model       string      `json:"model"`
-	System      string      `json:"system,omitempty"`
-	WorkDir     string      `json:"work_dir,omitempty"`
-	Mode        string      `json:"mode,omitempty"`
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	Provider  string    `json:"provider,omitempty"`
+	Model     string    `json:"model"`
+	System    string    `json:"system,omitempty"`
+	WorkDir   string    `json:"work_dir,omitempty"`
+	Mode      string    `json:"mode,omitempty"`
+	// Effort stores the reasoning dial for faithful Desktop resume. The
+	// literal "default" represents the provider default; using a non-empty
+	// sentinel lets a later header clear a previously selected low/high value.
+	Effort string `json:"effort,omitempty"`
+	// Preset records the primary Desktop profile used to create the session.
+	// It is informational on cross-process resume because the persisted System
+	// remains authoritative; a new Desktop launch applies the selected preset
+	// before constructing the tool registry.
+	Preset string `json:"preset,omitempty"`
+	// Status is the last durable top-level turn outcome. Fine-grained live
+	// states (approval, question, delegation) remain process-local, while this
+	// field lets Desktop distinguish completed, stopped, failed, and an
+	// interrupted running session after restart.
+	Status      string      `json:"status,omitempty"`
 	AlwaysAllow []SavedRule `json:"always_allow,omitempty"`
 	// ClearAlwaysAllow is an append-only tombstone used when a later header
 	// must remove every previously persisted interactive grant.

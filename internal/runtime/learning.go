@@ -22,8 +22,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+var learnedMu sync.Mutex
 
 // LearnedRecord is one turn's structural summary. Captured at the
 // turn-end hook (chat surface or `metis run`'s tail).
@@ -60,6 +63,8 @@ func learnedPath() (string, error) {
 // IO errors — caller silently degrades when the disk is unavailable
 // (logging shouldn't break the chat surface).
 func AppendLearned(rec LearnedRecord) error {
+	learnedMu.Lock()
+	defer learnedMu.Unlock()
 	path, err := learnedPath()
 	if err != nil {
 		return err
@@ -77,6 +82,8 @@ func AppendLearned(rec LearnedRecord) error {
 // Stops reading early once N is reached. Tail-of-file scan is O(N)
 // for typical log sizes (<10MB) — no need for an index.
 func LoadLearned(n int) ([]LearnedRecord, error) {
+	learnedMu.Lock()
+	defer learnedMu.Unlock()
 	path, err := learnedPath()
 	if err != nil {
 		return nil, err

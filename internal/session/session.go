@@ -33,11 +33,134 @@ type (
 	SavedRule = pubsess.SavedRule
 )
 
+// FeedbackEntry is a log-only human remark (DSH command-feedback parity):
+// it is appended to the session JSONL under type "feedback", never enters
+// model context, and Load ignores it (no history effect). Kinds: "remark"
+// (free text), "rating" (up/down on a specific message), "note" (message
+// annotation).
+type FeedbackEntry struct {
+	Kind string `json:"kind"`
+	Text string `json:"text,omitempty"`
+	// Rating is "up" or "down" (kind=rating only) — DSH message-feedback
+	// parity: a per-message 👍/👎 signal aggregated by FeedbackStats.
+	Rating string `json:"rating,omitempty"`
+	// MsgIdx identifies the rated/annotated message (transcript index or
+	// UI row index, depending on the surface that recorded it).
+	MsgIdx string `json:"msg_idx,omitempty"`
+	At     string `json:"at"` // RFC3339 timestamp
+}
+
 type Entry struct {
-	Type     string        `json:"type"` // "header" | "message" | "history_replace"
-	Header   *Header       `json:"header,omitempty"`
-	Message  *llm.Message  `json:"message,omitempty"`
-	Messages []llm.Message `json:"messages,omitempty"`
+	Type     string         `json:"type"` // "header" | "message" | "history_replace" | "feedback"
+	Header   *Header        `json:"header,omitempty"`
+	Message  *llm.Message   `json:"message,omitempty"`
+	Messages []llm.Message  `json:"messages,omitempty"`
+	Feedback *FeedbackEntry `json:"feedback,omitempty"`
+}
+
+// AppendFeedback records a log-only human feedback entry on the session.
+// Safe to call while a turn is in flight — append-only, same write path
+// as messages.
+func (s *Store) AppendFeedback(id, kind, text string) error {
+	return s.append(id, Entry{
+		Type: "feedback",
+		Feedback: &FeedbackEntry{
+			Kind: kind,
+			Text: text,
+			At:   time.Now().Format(time.RFC3339),
+		},
+	})
+}
+
+// AppendRating records a message-level 👍/👎 (kind=rating). msgIdx is the
+// transcript index of the rated message; rating must be "up" or "down"
+// (anything else is rejected — a malformed rating must not silently land).
+func (s *Store) AppendRating(id, rating, msgIdx string) error {
+	if rating != "up" && rating != "down" {
+		return fmt.Errorf("rating must be up or down, got %q", rating)
+	}
+	return s.append(id, Entry{
+		Type: "feedback",
+		Feedback: &FeedbackEntry{
+			Kind:   "rating",
+			Rating: rating,
+			MsgIdx: msgIdx,
+			At:     time.Now().Format(time.RFC3339),
+		},
+	})
+}
+
+// FeedbackStats is the aggregated sidecar view over a session's feedback
+// entries: how many 👍/👎 and free-text remarks landed.
+type FeedbackStats struct {
+	Up      int
+	Down    int
+	Remarks int
+}
+
+// FeedbackStats aggregates the feedback entries of ONE session.
+func (s *Store) FeedbackStats(id string) (FeedbackStats, error) {
+	var st FeedbackStats
+	err := s.scanFeedback(id, func(f *FeedbackEntry) {
+		switch {
+		case f.Kind == "rating" && f.Rating == "up":
+			st.Up++
+		case f.Kind == "rating" && f.Rating == "down":
+			st.Down++
+		default:
+			st.Remarks++
+		}
+	})
+	return st, err
+}
+
+// FeedbackStatsAll aggregates feedback entries across EVERY session in
+// the store dir (global lifecycle view — DSH message-feedback parity).
+func (s *Store) FeedbackStatsAll() (FeedbackStats, error) {
+	var st FeedbackStats
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		return st, err
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
+			continue
+		}
+		_ = s.scanFeedback(e.Name()[:len(e.Name())-len(".jsonl")], func(f *FeedbackEntry) {
+			switch {
+			case f.Kind == "rating" && f.Rating == "up":
+				st.Up++
+			case f.Kind == "rating" && f.Rating == "down":
+				st.Down++
+			default:
+				st.Remarks++
+			}
+		})
+	}
+	return st, nil
+}
+
+// scanFeedback streams the feedback entries of one session without
+// materializing the message history.
+func (s *Store) scanFeedback(id string, fn func(*FeedbackEntry)) error {
+	f, err := os.Open(s.path(id))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		var e Entry
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil || e.Type != "feedback" || e.Feedback == nil {
+			continue
+		}
+		fn(e.Feedback)
+	}
+	return sc.Err()
 }
 
 type Store struct {
@@ -248,6 +371,15 @@ func mergeHeader(dst *Header, src *Header) {
 	}
 	if src.Mode != "" {
 		dst.Mode = src.Mode
+	}
+	if src.Effort != "" {
+		dst.Effort = src.Effort
+	}
+	if src.Preset != "" {
+		dst.Preset = src.Preset
+	}
+	if src.Status != "" {
+		dst.Status = src.Status
 	}
 	if src.ClearAlwaysAllow {
 		dst.AlwaysAllow = nil
@@ -521,6 +653,9 @@ func (s *Store) Branch(id string, messages []llm.Message) (string, error) {
 		Provider: hdr.Provider,
 		Model:    hdr.Model,
 		System:   hdr.System,
+		Effort:   hdr.Effort,
+		Preset:   hdr.Preset,
+		Status:   "idle",
 		ForkedFrom: &pubsess.ForkRef{
 			SessionID:    id,
 			MessageCount: len(messages),

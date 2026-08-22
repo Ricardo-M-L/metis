@@ -93,6 +93,7 @@ type AgentProfileLoader func(name string) (*AgentProfileSpec, error)
 // internal/runtime/builtin_profiles/*.md.
 var bundledProfileSlugs = map[string]struct{}{
 	"coordinator":  {},
+	"creator":      {},
 	"explore":      {},
 	"general":      {},
 	"go-reviewer":  {},
@@ -340,7 +341,7 @@ Plan first (cold scout), then fan out — the 4 impl agents are independent so t
 </example>
 
 ` + "`name`" + ` vs ` + "`subagent_type`" + ` (Q1, 2026-05-15 — the two roles are now separate):
-  - ` + "`subagent_type`" + ` selects the PROFILE/ROLE — its system prompt, default tool allowlist, default model. Bundled: explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator, teammate. User-defined profiles in ~/.metis/agents/<slug>.md or ./.metis/agents/<slug>.md take precedence over bundled. Omit to inherit the parent's prompt.
+  - ` + "`subagent_type`" + ` selects the PROFILE/ROLE — its system prompt, default tool allowlist, default model. Bundled: explore, plan, creator, verify, general, go-reviewer, mcp-debugger, coordinator, teammate. User-defined profiles in ~/.metis/agents/<slug>.md or ./.metis/agents/<slug>.md take precedence over bundled. Omit to inherit the parent's prompt.
   - ` + "`name`" + ` is the TEAM IDENTITY only — what /agents and MessageTeammate use to address this worker ("alice", "verifier"). Same-name collisions auto-suffix (alice → alice-2 → alice-3 → ...).
   - Back-compat: if you pass ` + "`name=\"explore\"`" + ` without ` + "`subagent_type`" + `, it's still treated as ` + "`subagent_type=\"explore\"`" + `. Explicit subagent_type is preferred — name should be a label like "alice", not a role like "explore".
 
@@ -391,7 +392,7 @@ func (Agent) InputSchema() map[string]any {
 			},
 			"subagent_type": map[string]any{
 				"type":        "string",
-				"description": "Optional profile slug that determines the sub-agent's role + system prompt. Bundled profiles: explore (read-only code search), plan (architect/planning), verify (test runner), general (catch-all), go-reviewer (Go-specific code review), mcp-debugger (MCP issues), coordinator (delegator), teammate (long-running team member with peer-message + shared-task-list coordination — pick this when you spawn multiple named workers that need to talk to each other). User-defined profiles in ~/.metis/agents/<name>.md or ./.metis/agents/<name>.md take precedence over bundled. When omitted, the sub-agent inherits the parent's system prompt. When `name` is set without `subagent_type`, a name matching a known profile slug is treated as the subagent_type for back-compat — explicit `subagent_type` is preferred.",
+				"description": "Optional profile slug that determines the sub-agent's role + system prompt. Bundled profiles: explore (read-only code search), plan (architect/planning), creator (end-to-end implementation), verify (test runner), general (catch-all), go-reviewer (Go-specific code review), mcp-debugger (MCP issues), coordinator (delegator), teammate (long-running team member with peer-message + shared-task-list coordination — pick this when you spawn multiple named workers that need to talk to each other). User-defined profiles in ~/.metis/agents/<name>.md or ./.metis/agents/<name>.md take precedence over bundled. When omitted, the sub-agent inherits the parent's system prompt. When `name` is set without `subagent_type`, a name matching a known profile slug is treated as the subagent_type for back-compat — explicit `subagent_type` is preferred.",
 			},
 			"resume_from": map[string]any{
 				"type":        "string",
@@ -667,7 +668,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}
 		if p == nil {
 			return &tools.Result{
-				Output:  fmt.Sprintf("subagent_type=%q: no such profile (looked in ./.metis/agents, ~/.metis/agents, and the bundled set: explore, plan, verify, general, go-reviewer, mcp-debugger, coordinator)", subagentType),
+				Output:  fmt.Sprintf("subagent_type=%q: no such profile (looked in ./.metis/agents, ~/.metis/agents, and the bundled set: explore, plan, creator, verify, general, go-reviewer, mcp-debugger, coordinator, teammate)", subagentType),
 				IsError: true,
 			}, nil
 		}

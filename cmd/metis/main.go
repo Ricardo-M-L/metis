@@ -440,6 +440,7 @@ func (r *runtime) rebindSession(sessionID string) {
 	rtpkg.SetCurrentSessionID(sessionID)
 	transport.SetSessionID(sessionID)
 	taskstore.SetCurrentTaskStore(sessionID)
+	rtpkg.RebindTrace(sessionID)
 	if r.loop != nil {
 		if cwd, err := os.Getwd(); err == nil {
 			r.loop.SetCheckpointer(checkpoint.NewManager(sessionID, cwd, ""))
@@ -510,6 +511,8 @@ func (r *runtime) Cleanup() {
 		_ = r.plugins.Close()
 		r.plugins = nil
 	}
+	// Flush buffered trace events to disk so the final trajectory is not lost.
+	rtpkg.FlushTrace()
 	if r.sandbox != nil {
 		_ = r.sandbox.Close()
 		r.sandbox = nil
@@ -795,6 +798,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Process-wide trajectory tracing: every agent event (main loop +
+	// sub-agents) lands in ~/.metis/traces/<session>.jsonl, searchable
+	// via the SessionEventRead / SessionEventSearch / SessionTrace tools.
+	rtpkg.InstallTrace(filepath.Join(cfg.Session.Dir, "..", "traces"))
 	resumeTarget, err := resolveResumeTarget(flags, store)
 	if err != nil {
 		return nil, err

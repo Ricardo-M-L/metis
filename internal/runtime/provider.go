@@ -207,6 +207,19 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		if model == "" {
 			model = cfg.Provider.OpenAI.Model
 		}
+		if strings.EqualFold(cfg.Provider.OpenAI.WireProtocol, "responses") {
+			prov := openai.NewResponses(
+				key,
+				cfg.Provider.OpenAI.BaseURL,
+				model,
+				cfg.Provider.OpenAI.MaxTokens,
+				time.Duration(cfg.Provider.OpenAI.TimeoutSecs)*time.Second,
+				cfg.Provider.OpenAI.Temperature,
+			)
+			prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
+			Preconnect(cfg.Provider.OpenAI.BaseURL)
+			return &ProviderBuild{Provider: prov, Model: model}, nil
+		}
 		prov := openai.New(
 			key,
 			cfg.Provider.OpenAI.BaseURL,

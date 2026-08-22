@@ -150,7 +150,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "provider", Aliases: []string{"providers"}, Description: "show or switch configured API provider", ArgumentHint: "[provider[/model]]", Category: "model", Handler: cmdProvider})
 	r.Register(REPLCommand{Name: "effort", Description: "set reasoning effort: low | medium | high | off", Handler: cmdEffort})
 	r.Register(REPLCommand{Name: "quick", Description: "quick output: effort=low with max_tokens halved", ArgumentHint: "[on|off|toggle]", Category: "model", Handler: cmdQuick})
-	r.Register(REPLCommand{Name: "theme", Description: "switch color theme: dark | light | dark-daltonized", Handler: cmdTheme})
+	r.Register(REPLCommand{Name: "theme", Description: "switch color theme: dark | light | dark-daltonized | nord | solarized-dark", Handler: cmdTheme})
 	r.Register(REPLCommand{Name: "vim", Description: "vim mode: on | off | toggle (modal input — hjkl in NORMAL)", Handler: cmdVim})
 	// /voice hidden from the palette 2026-05-23 — feature requires
 	// an OpenAI API key in ~/.metis/auth.json for Whisper transcription,
@@ -250,7 +250,8 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "output-style", Description: "output verbosity: full | streamlined | minimal", Handler: cmdOutputStyle})
 	r.Register(REPLCommand{Name: "break-cache", Description: "explain how to force a fresh prompt-cache write", Handler: cmdBreakCache})
 	r.Register(REPLCommand{Name: "security-review", Description: "OWASP-flavored review nudge (analog of /review for security)", Handler: cmdSecurityReview})
-	r.Register(REPLCommand{Name: "feedback", Description: "alias of /bug — file a metis issue", Handler: cmdFeedback})
+	r.Register(REPLCommand{Name: "feedback", Description: "record a log-only remark (with text) or file a bug report (bare)", ArgumentHint: "[<remark>]", Handler: cmdFeedback})
+	r.Register(REPLCommand{Name: "bundle", Description: "manage profile bundles: install <path> | list | remove <name>", ArgumentHint: "<install|list|remove> [arg]", Category: "context", Handler: cmdBundle})
 
 	// === Phase F: discoverability slashes ===
 	r.Register(REPLCommand{Name: "think-back", Aliases: []string{"thinkback"}, Description: "show the current year's cross-session activity review", Handler: cmdThinkBack})
@@ -1542,6 +1543,7 @@ func cmdCompact(r *REPL, args string) string {
 	if before <= 2 {
 		return fmt.Sprintf("compact: nothing to compact (only %d messages)", before)
 	}
+	beforeTokens := r.Loop.EstimateContextTokens()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	// PreCompact hook — trigger "manual" (the auto path in
@@ -1551,7 +1553,7 @@ func cmdCompact(r *REPL, args string) string {
 		r.Loop.Hooks.EmitPreCompact(ctx, agent.HookContext{Model: r.Loop.Model}, &agent.PreCompact{
 			Trigger:         "manual",
 			MessageCount:    before,
-			EstimatedTokens: r.Loop.EstimateContextTokens(),
+			EstimatedTokens: beforeTokens,
 		})
 	}
 	instructions := strings.TrimSpace(args)
@@ -1567,6 +1569,11 @@ func cmdCompact(r *REPL, args string) string {
 	if err := r.replaceHistory(compacted); err != nil {
 		return fmt.Sprintf("compact: %d → %d messages in memory, but history persistence failed: %v", before, len(compacted), err)
 	}
+	// PostCompact hook — trigger "manual" (the auto path in
+	// compaction_check.go fires its own with trigger "auto"). Lets
+	// handlers inject context right after the compact boundary.
+	r.Loop.FirePostCompactHook(ctx, "manual", "compact",
+		before, len(compacted), beforeTokens, r.Loop.EstimateContextTokens())
 	result := fmt.Sprintf("compact: %d → %d messages (saved %d)", before, len(compacted), before-len(compacted))
 	if instructions != "" {
 		result += " · applied custom summary instructions"

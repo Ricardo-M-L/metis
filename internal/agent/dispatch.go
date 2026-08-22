@@ -513,7 +513,25 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	l.snapPreEdit(blk.ToolName, blk.ToolInput)
 
 	execStart := time.Now()
-	res, err := safeToolExecute(toolCtx, t, blk.ToolInput)
+	// Cooperative per-call timeout (DSH tool-call-timeout-policy parity):
+	// a tool that declares TimeoutMs() arms a deadline; if that deadline
+	// wins, the result becomes a structured TOOL_TIMEOUT error instead of
+	// whatever the tool returned. Arm AFTER the InterruptBlock detach so
+	// the budget survives context.WithoutCancel (that strips the parent's
+	// cancel, not the tool's own deadline).
+	var res *tools.Result
+	var err error
+	if timeoutMs := tools.TimeoutMs(t); timeoutMs > 0 {
+		var cancel context.CancelFunc
+		toolCtx, cancel = context.WithTimeout(toolCtx, time.Duration(timeoutMs)*time.Millisecond)
+		res, err = safeToolExecute(toolCtx, t, blk.ToolInput)
+		cancel()
+		if err == nil && toolCtx.Err() == context.DeadlineExceeded {
+			res = &tools.Result{Output: fmt.Sprintf("Error: tool call timed out after %dms", timeoutMs), IsError: true}
+		}
+	} else {
+		res, err = safeToolExecute(toolCtx, t, blk.ToolInput)
+	}
 	l.recordCheckpointMutation(blk.ToolName, blk.ToolInput, res, err)
 	execElapsed := time.Since(execStart)
 	// Persist per-step timing to the session sidecar (best-effort). This is

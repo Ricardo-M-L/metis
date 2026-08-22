@@ -6,11 +6,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +28,14 @@ type App struct {
 
 	findMetis func() (string, error)
 	runMetis  func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
+
+	// webuiCmd is the in-process-browser backend child (metis desktop
+	// --web). The native window navigates straight to it; the child is
+	// reaped when the Wails context shuts down.
+	webuiCmd  *exec.Cmd
+	webuiDone chan error
+	webuiPort int
+	webuiMu   sync.Mutex
 }
 
 func NewApp() *App {
@@ -52,6 +64,34 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 }
 
+// shutdown is registered with Wails' explicit OnShutdown hook. The startup
+// context is a background context on macOS and is not cancelled by Cmd+Q, so
+// waiting on ctx.Done would leave the web UI child orphaned.
+func (a *App) shutdown(context.Context) {
+	a.stopWebUI()
+}
+
+func (a *App) stopWebUI() {
+	a.webuiMu.Lock()
+	cmd := a.webuiCmd
+	done := a.webuiDone
+	a.webuiCmd = nil
+	a.webuiDone = nil
+	a.webuiPort = 0
+	a.webuiMu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 func parseWorkspaceArg(args []string) string {
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--workspace" && i+1 < len(args) {
@@ -72,8 +112,99 @@ func parseWorkspaceArg(args []string) string {
 	return dir
 }
 
+// StartWebUI launches the in-process browser UI backend (metis desktop
+// --web) on a free loopback port and returns its URL. The native window
+// navigates directly to it: one UI codebase, true SSE streaming, no
+// per-operation CLI subprocesses.
+func (a *App) StartWebUI() (string, error) {
+	a.webuiMu.Lock()
+	defer a.webuiMu.Unlock()
+	if a.webuiCmd != nil && a.webuiPort > 0 {
+		return a.webUIURL(), nil
+	}
+	binary, err := a.findMetis()
+	if err != nil {
+		return "", err
+	}
+	port, err := freePort()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command(binary, "desktop", "--web", "--port", strconv.Itoa(port))
+	cmd.Dir = a.workDir
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start webui: %w", err)
+	}
+	done := make(chan error, 1)
+	a.webuiCmd = cmd
+	a.webuiDone = done
+	a.webuiPort = port
+	// Reap the child on every exit path. Process.Kill alone does not release
+	// the OS process record; Wait belongs in exactly one goroutine.
+	go func() {
+		err := cmd.Wait()
+		done <- err
+		close(done)
+		a.webuiMu.Lock()
+		if a.webuiCmd == cmd {
+			a.webuiCmd = nil
+			a.webuiDone = nil
+			a.webuiPort = 0
+		}
+		a.webuiMu.Unlock()
+	}()
+
+	// Wait for the backend to answer its health probe before the webview
+	// navigates, otherwise the first paint is a connection error.
+	url := a.webUIURL()
+	deadline := time.Now().Add(15 * time.Second)
+	client := &http.Client{Timeout: 750 * time.Millisecond}
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			a.webuiCmd = nil
+			a.webuiDone = nil
+			a.webuiPort = 0
+			if err == nil {
+				err = errors.New("process exited")
+			}
+			return "", fmt.Errorf("webui exited before becoming ready: %w", err)
+		default:
+		}
+		resp, err := client.Get(url + "/api/health")
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return url, nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	_ = cmd.Process.Kill()
+	a.webuiCmd = nil
+	a.webuiDone = nil
+	a.webuiPort = 0
+	return "", errors.New("webui did not become ready within 15 seconds")
+}
+
+func (a *App) webUIURL() string {
+	return "http://127.0.0.1:" + strconv.Itoa(a.webuiPort)
+}
+
+// freePort binds an ephemeral loopback port, closes it, and returns the
+// number. Small race window, acceptable for a local desktop app.
+func freePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port, nil
+}
+
 func (a *App) GetVersion() string {
-	return "0.2.8"
+	return "0.4.28"
 }
 
 func (a *App) GetProjectDir() string {

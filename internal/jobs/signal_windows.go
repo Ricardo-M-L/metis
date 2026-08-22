@@ -16,6 +16,14 @@ import (
 // justified by what metis actually runs there today.
 func ApplyProcessGroup(cmd *exec.Cmd) {}
 
+// KillProcessGroup force-kills the whole tree via taskkill /F /T.
+func KillProcessGroup(p *os.Process) {
+	if p == nil || p.Pid <= 0 {
+		return
+	}
+	_ = runTaskkill([]string{"/F", "/T", "/PID", strconv.Itoa(p.Pid)})
+}
+
 // killTree dispatches to taskkill /T (single signal: best effort
 // graceful, no /F). On Unix this is SIGTERM-to-pgid; the equivalent
 // here is taskkill without /F which sends WM_CLOSE to the leader and

@@ -102,6 +102,51 @@ func TestRegistry_PreCompactAsyncDetaches(t *testing.T) {
 	close(release)
 }
 
+// TestRegistry_PostCompactJoinsAdditionalContext — PostCompact is
+// feedback-capable: every handler's AdditionalContext contributes, in
+// registration order, joined by newlines; nil returns and blank strings
+// are skipped. The compaction path appends the joined string as a user
+// message after the summary boundary.
+func TestRegistry_PostCompactJoinsAdditionalContext(t *testing.T) {
+	r := NewRegistry()
+	r.Register(PostCompactHandler(func(_ context.Context, _ Context, p *PostCompact) *ModifiedPostCompact {
+		if p.Tier != "compact" || p.Trigger != "auto" {
+			t.Errorf("unexpected payload: tier=%q trigger=%q", p.Tier, p.Trigger)
+		}
+		return &ModifiedPostCompact{AdditionalContext: "branch: main"}
+	}))
+	r.Register(PostCompactHandler(func(_ context.Context, _ Context, _ *PostCompact) *ModifiedPostCompact {
+		return nil // observer — contributes nothing
+	}))
+	r.Register(PostCompactHandler(func(_ context.Context, _ Context, _ *PostCompact) *ModifiedPostCompact {
+		return &ModifiedPostCompact{AdditionalContext: "   "} // blank — skipped
+	}))
+	r.Register(PostCompactHandler(func(_ context.Context, _ Context, _ *PostCompact) *ModifiedPostCompact {
+		return &ModifiedPostCompact{AdditionalContext: "run: make test"}
+	}))
+	got := r.EmitPostCompact(context.Background(), Context{}, &PostCompact{
+		Trigger:        "auto",
+		Tier:           "compact",
+		BeforeMessages: 30,
+		AfterMessages:  6,
+		BeforeTokens:   9000,
+		AfterTokens:    1200,
+	})
+	want := "branch: main\nrun: make test"
+	if got != want {
+		t.Errorf("EmitPostCompact joined %q, want %q", got, want)
+	}
+}
+
+// TestRegistry_PostCompactNoHandlers — zero handlers returns "" so the
+// compaction path skips injection entirely.
+func TestRegistry_PostCompactNoHandlers(t *testing.T) {
+	r := NewRegistry()
+	if got := r.EmitPostCompact(context.Background(), Context{}, &PostCompact{Trigger: "auto", Tier: "compact"}); got != "" {
+		t.Errorf("expected empty join with no handlers, got %q", got)
+	}
+}
+
 func TestRegistry_UnknownHandlerSilentlyDropped(t *testing.T) {
 	// Plugin authors might pass any{} that isn't a recognized handler type
 	// — Register should silently ignore rather than panic.

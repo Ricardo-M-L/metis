@@ -323,6 +323,9 @@ func TestSession_WriteHeaderFullPreservesAllFields(t *testing.T) {
 		System:      "you are helpful",
 		WorkDir:     "/tmp/scratch",
 		Mode:        "auto",
+		Effort:      "high",
+		Preset:      "creator",
+		Status:      "completed",
 		AlwaysAllow: rules,
 	}
 	if err := store.WriteHeaderFull(want); err != nil {
@@ -332,7 +335,7 @@ func TestSession_WriteHeaderFullPreservesAllFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Provider != "anthropic" || got.Mode != "auto" || got.WorkDir != "/tmp/scratch" {
+	if got.Provider != "anthropic" || got.Mode != "auto" || got.WorkDir != "/tmp/scratch" || got.Effort != "high" || got.Preset != "creator" || got.Status != "completed" {
 		t.Errorf("header roundtrip wrong: %+v", got)
 	}
 	if len(got.AlwaysAllow) != 2 {
@@ -378,7 +381,7 @@ func TestSession_HeaderProviderMergesAndBranchPreservesIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if branch.Provider != "openai" || branch.Model != "gpt-new" || branch.System != "parent-system" {
+	if branch.Provider != "openai" || branch.Model != "gpt-new" || branch.System != "parent-system" || branch.Status != "idle" {
 		t.Fatalf("branch lost provider/model/system: %+v", branch)
 	}
 }

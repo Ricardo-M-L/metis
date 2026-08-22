@@ -26,6 +26,41 @@ type CustomProviderSpec struct {
 	Model     string
 }
 
+// ProviderDefaultOverrideSource reports whether the current project's config
+// controls provider.default. CustomProviderOverrideSource does the same for a
+// named custom profile. Desktop callers use these preflights so they never
+// claim a user-level edit took effect when a project layer still wins.
+func ProviderDefaultOverrideSource() (string, error) {
+	return providerOverrideSource([]string{"provider", "default"})
+}
+
+func CustomProviderOverrideSource(id string) (string, error) {
+	if err := validateProviderID(id); err != nil {
+		return "", err
+	}
+	return providerOverrideSource([]string{"provider", "custom", id})
+}
+
+func providerOverrideSource(path []string) (string, error) {
+	source := ""
+	for _, candidate := range projectConfigPaths() {
+		if _, err := os.Stat(candidate.path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return "", fmt.Errorf("inspect %s: %w", candidate.label, err)
+		}
+		var raw map[string]any
+		md, err := toml.DecodeFile(candidate.path, &raw)
+		if err != nil {
+			return "", fmt.Errorf("parse %s: %w", candidate.label, err)
+		}
+		if md.IsDefined(path...) {
+			source = candidate.label
+		}
+	}
+	return source, nil
+}
+
 var bareProviderID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // UserSetting is one non-secret scalar setting that can be changed from the
@@ -163,7 +198,7 @@ type userSettingSpec struct {
 
 var editableUserSettings = map[string]userSettingSpec{
 	"permission.mode":                     {table: "permission", field: "mode", kind: userSettingString, validate: oneOf("default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")},
-	"ui.theme":                            {table: "ui", field: "theme", kind: userSettingString, validate: oneOf("auto", "dark", "light", "dark-daltonized")},
+	"ui.theme":                            {table: "ui", field: "theme", kind: userSettingString, validate: oneOf("auto", "dark", "light", "dark-daltonized", "nord", "solarized-dark")},
 	"ui.markdown":                         {table: "ui", field: "markdown", kind: userSettingBool},
 	"ui.show_tokens":                      {table: "ui", field: "show_tokens", kind: userSettingBool},
 	"ui.show_tool_json":                   {table: "ui", field: "show_tool_json", kind: userSettingBool},
@@ -530,6 +565,60 @@ func SaveUserProviderDefault(id string) error {
 		updated, err := renderUserProviderDefault(original, id)
 		if err != nil {
 			return err
+		}
+		if err := atomicWritePrivateFile(path, updated); err != nil {
+			return fmt.Errorf("save user config: %w", err)
+		}
+		return nil
+	})
+}
+
+// DeleteUserCustomProvider removes one canonical [provider.custom.<id>] table
+// from the user config while preserving every unrelated byte range. The
+// active default must be changed first so deletion cannot silently select a
+// different endpoint. Credentials are intentionally handled by internal/auth.
+func DeleteUserCustomProvider(id string) error {
+	if err := validateProviderID(id); err != nil {
+		return err
+	}
+	switch id {
+	case "anthropic", "openai", "gemini", "google", "custom":
+		return fmt.Errorf("provider %q is built in and cannot be deleted", id)
+	}
+	return withUserConfigWriteLock(func(path string) error {
+		if err := rejectConfigSymlink(path); err != nil {
+			return err
+		}
+		original, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read user config: %w", err)
+		}
+		var probe userConfigProbe
+		if _, err := toml.Decode(string(original), &probe); err != nil {
+			return fmt.Errorf("parse user config: %w", err)
+		}
+		if _, ok := probe.Provider.Custom[id]; !ok {
+			return nil
+		}
+		if probe.Provider.Default == id {
+			return fmt.Errorf("custom provider %q is the default; select another default before deleting it", id)
+		}
+		lines := splitLines(string(original))
+		start, end, found := findCanonicalTable(lines, "provider.custom."+id)
+		if !found {
+			return fmt.Errorf("cannot safely delete custom provider %q: use canonical [provider.custom.%s] table syntax", id, id)
+		}
+		updatedLines := append(append([]string(nil), lines[:start]...), lines[end:]...)
+		updated := []byte(strings.Join(updatedLines, ""))
+		var verified userConfigProbe
+		if _, err := toml.Decode(string(updated), &verified); err != nil {
+			return fmt.Errorf("refusing to write invalid updated user config: %w", err)
+		}
+		if _, stillPresent := verified.Provider.Custom[id]; stillPresent {
+			return errors.New("refusing to write user config: custom provider deletion verification failed")
 		}
 		if err := atomicWritePrivateFile(path, updated); err != nil {
 			return fmt.Errorf("save user config: %w", err)

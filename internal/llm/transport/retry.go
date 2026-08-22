@@ -191,6 +191,15 @@ func shouldRetry(err error) bool {
 		}
 	}
 	msg := strings.ToLower(err.Error())
+	// Permanent quota/balance errors must NOT be retried — they fail
+	// identically on every attempt and only waste 35s+ of waiting.
+	// Harness separates these via isQuotaExceededError() → QUOTA code
+	// which is excluded from the default retryable set. We match the
+	// same OpenAI error bodies here.
+	if strings.Contains(msg, "insufficient_quota") || strings.Contains(msg, "quota_exceeded") ||
+		strings.Contains(msg, "insufficient quota") || strings.Contains(msg, "quota exceeded") {
+		return false
+	}
 	for _, code := range []string{" 429:", " 503:", " 529:", " 502:", " 504:"} {
 		if strings.Contains(msg, code) {
 			return true
@@ -217,6 +226,7 @@ func isRateLimitError(err error) bool {
 		strings.Contains(msg, "rate limit") ||
 		strings.Contains(msg, "rate_limit") ||
 		strings.Contains(msg, "rpm exhausted") ||
+		strings.Contains(msg, "tpm exhausted") ||
 		strings.Contains(msg, "too many requests")
 }
 

@@ -310,3 +310,21 @@ func CurrentTaskStore() *TaskStore {
 	defer activeStoreMu.Unlock()
 	return currentTaskStore
 }
+
+// deleteStructured removes the per-session directory used by Task* tools.
+// Holding activeStoreMu prevents the global router from binding a new store
+// for this session midway through deletion. If an old current store is still
+// bound, its mutex also serializes against an in-flight save.
+func deleteStructured(sessionID string) error {
+	activeStoreMu.Lock()
+	defer activeStoreMu.Unlock()
+
+	if currentTaskStore != nil && currentTaskSession == sessionID {
+		currentTaskStore.mu.Lock()
+		defer currentTaskStore.mu.Unlock()
+		currentTaskStore = nil
+		currentTaskSession = ""
+	}
+	dir := filepath.Dir(taskFilePath(sessionID))
+	return os.RemoveAll(dir)
+}

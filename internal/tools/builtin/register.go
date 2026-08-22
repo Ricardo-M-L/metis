@@ -65,10 +65,20 @@ func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *per
 	// after this Register call, so both tools always show up in the end.
 	bashTool := bash.New(gate, cfg.Tools.Bash)
 	gitTool := NewGit(gate)
+	runCode := NewRunCode(gate)
 	if manager != nil {
 		bashTool = bash.NewWithSandbox(gate, cfg.Tools.Bash, manager)
 		gitTool = NewGitWithSandbox(gate, manager)
+		runCode = NewRunCodeWithSandbox(gate, manager)
 	}
+	goalCreate := NewGoalCreate(gate)
+	goalUpdate := NewGoalUpdate(gate)
+	goalList := NewGoalList(gate)
+	goalDelete := NewGoalDelete(gate)
+	eventRead := NewSessionEventRead(gate)
+	eventSearch := NewSessionEventSearch(gate)
+	sessionTrace := NewSessionTrace(gate)
+
 	all := []tools.Tool{
 		Read{gate: gate, state: sessionReadState},
 		Write{gate: gate, state: sessionReadState},
@@ -93,6 +103,14 @@ func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *per
 		TaskOutput{gate: gate},
 		TaskStop{gate: gate},
 		LSP{gate: gate},
+		&runCode,
+		&goalCreate,
+		&goalUpdate,
+		&goalList,
+		&goalDelete,
+		&eventRead,
+		&eventSearch,
+		&sessionTrace,
 	}
 	_ = skillDir // referenced by BuildToolRegistry, kept here for symmetry
 	for _, t := range all {

@@ -98,6 +98,10 @@ func RebindLoopRuntime(loop *agent.Loop, provider llm.Provider, model, system, p
 	if loop.Budget != nil {
 		loop.Budget.SetRatesResolver(modelRatesResolver(model))
 	}
+	// Trace events must follow the session boundary too: without this,
+	// web-UI session switches kept appending trajectory events to the
+	// previously-active session's file.
+	RebindTrace(parentSessionID)
 }
 
 func modelRatesResolver(model string) func() (budget.Rates, bool) {

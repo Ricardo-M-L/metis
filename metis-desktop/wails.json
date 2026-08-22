@@ -6,6 +6,13 @@
   "frontend:build": "npm run build",
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
+  "info": {
+    "companyName": "Metis",
+    "productName": "Metis Desktop",
+    "productVersion": "0.4.28",
+    "copyright": "Copyright © 2026 Metis",
+    "comments": "Metis Desktop — local AI coding agent"
+  },
   "author": {
     "name": "Ricardo-M-L",
     "email": "Ricardo-M-L@users.noreply.github.com"

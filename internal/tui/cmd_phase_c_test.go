@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 func TestCopy_NoActiveSession(t *testing.T) {
@@ -248,5 +251,77 @@ func TestFeedback_AliasesBug(t *testing.T) {
 	bugOut := cmdBug(r, "")
 	if feedbackOut != bugOut {
 		t.Errorf("/feedback should produce identical output to /bug;\nfeedback: %q\nbug: %q", feedbackOut, bugOut)
+	}
+}
+
+func TestFeedback_RemarkRecordsToStore(t *testing.T) {
+	dir := t.TempDir()
+	store, err := session.NewStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	id := store.NewSessionID()
+	if err := store.WriteHeaderFull(session.Header{ID: id, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	r := &REPL{Session: store, SessionID: id}
+	out := cmdFeedback(r, "drifted at step 3")
+	if !strings.Contains(out, "recorded") {
+		t.Fatalf("output = %q", out)
+	}
+	raw, err := os.ReadFile(filepath.Join(store.Dir, id+".jsonl"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(raw), `"type":"feedback"`) || !strings.Contains(string(raw), "drifted at step 3") {
+		t.Fatalf("feedback entry missing:\n%s", raw)
+	}
+	hdr, msgs, err := store.Load(id)
+	if err != nil || hdr == nil {
+		t.Fatalf("load: %v %v", hdr, err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("feedback leaked into history: %d msgs", len(msgs))
+	}
+}
+
+func TestFeedback_RatingLegs(t *testing.T) {
+	dir := t.TempDir()
+	store, err := session.NewStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	id := store.NewSessionID()
+	if err := store.WriteHeaderFull(session.Header{ID: id, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	r := &REPL{Session: store, SessionID: id}
+
+	if out := cmdFeedback(r, "up"); !strings.Contains(out, "no assistant reply") {
+		t.Fatalf("rating without history should say no assistant reply; got %q", out)
+	}
+
+	// Give the loop a history with an assistant reply.
+	r.Loop = agent.NewLoop(fakeProvider{}, tools.NewRegistry(), permission.New(permission.ModeDefault), nil, "sys", 2)
+	r.Loop.AppendUser("hi")
+	r.Loop.Messages = append(r.Loop.Messages, llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "hello"}}})
+
+	if out := cmdFeedback(r, "up"); !strings.Contains(out, "rated up") {
+		t.Fatalf("up rating failed: %q", out)
+	}
+	if out := cmdFeedback(r, "down"); !strings.Contains(out, "rated down") {
+		t.Fatalf("down rating failed: %q", out)
+	}
+	if out := cmdFeedback(r, "stats"); !strings.Contains(out, "👍 1 · 👎 1") {
+		t.Fatalf("stats should aggregate both ratings: %q", out)
+	}
+
+	one, err := store.FeedbackStats(id)
+	if err != nil || one.Up != 1 || one.Down != 1 {
+		t.Fatalf("session stats = %+v err=%v, want up=1 down=1", one, err)
+	}
+	all, err := store.FeedbackStatsAll()
+	if err != nil || all.Up != 1 || all.Down != 1 {
+		t.Fatalf("global stats = %+v err=%v, want up=1 down=1", all, err)
 	}
 }

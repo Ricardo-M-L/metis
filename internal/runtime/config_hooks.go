@@ -244,6 +244,35 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 			}
 		}))
 	}
+	for _, h := range cfg.PostCompact {
+		spec := h
+		if !isCommandType(spec.Type) {
+			continue
+		}
+		reg.Register(pubhook.PostCompactHandler(func(ctx context.Context, tc pubhook.Context, p *pubhook.PostCompact) *pubhook.ModifiedPostCompact {
+			payload := map[string]any{
+				"hook_event_name": "PostCompact",
+				"session_id":      tc.SessionID,
+				"model":           tc.Model,
+				"trigger":         p.Trigger,
+				"tier":            p.Tier,
+				"before_messages": p.BeforeMessages,
+				"after_messages":  p.AfterMessages,
+				"before_tokens":   p.BeforeTokens,
+				"after_tokens":    p.AfterTokens,
+			}
+			out, err := runHookCommand(ctx, spec, payload)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "hook PostCompact %s: %v\n", spec.Command, err)
+				return nil
+			}
+			// stdout may carry context to re-inject after the compact
+			// boundary: {"additional_context": "..."} — the §28.11 P1
+			// use case ("compact 后 inject 上下文"). Empty/garbage body
+			// is a plain observer and injects nothing.
+			return parsePostCompactResponse(out)
+		}))
+	}
 }
 
 // parseUserPromptResponse expects an empty body (proceed) or:
@@ -288,6 +317,26 @@ func parsePermissionResponse(out []byte) *pubhook.ModifiedPermissionRequest {
 		return nil
 	}
 	return &pubhook.ModifiedPermissionRequest{Decision: v.Decision, Reason: v.Reason}
+}
+
+// parsePostCompactResponse expects an empty body (observer) or:
+//
+//	{"additional_context": "..."}   ← inject after the compact boundary
+func parsePostCompactResponse(out []byte) *pubhook.ModifiedPostCompact {
+	out = trimBOM(out)
+	if len(strings.TrimSpace(string(out))) == 0 {
+		return nil
+	}
+	var v struct {
+		AdditionalContext string `json:"additional_context"`
+	}
+	if err := json.Unmarshal(out, &v); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(v.AdditionalContext) == "" {
+		return nil
+	}
+	return &pubhook.ModifiedPostCompact{AdditionalContext: v.AdditionalContext}
 }
 
 func isCommandType(t string) bool {

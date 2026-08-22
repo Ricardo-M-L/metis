@@ -103,11 +103,18 @@ func TestListSnapshots_OrdersByUpdatedAtDesc(t *testing.T) {
 
 func TestDeleteSnapshot_Idempotent(t *testing.T) {
 	withTempMetisHome(t)
-	if _, err := SaveSnapshot(Snapshot{SessionID: "ditch"}); err != nil {
+	path, err := SaveSnapshot(Snapshot{SessionID: "ditch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".tmp", []byte("interrupted"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := DeleteSnapshot("ditch"); err != nil {
 		t.Fatalf("first delete: %v", err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("snapshot temp still exists: %v", err)
 	}
 	if err := DeleteSnapshot("ditch"); err != nil {
 		t.Errorf("second delete (already gone) should not error; got %v", err)

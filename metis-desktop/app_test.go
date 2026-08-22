@@ -6,17 +6,51 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeCLICall struct {
 	binary string
 	args   []string
 	dir    string
+}
+
+func TestShutdownStopsWebUIChild(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestWebUIChildHelper$")
+	cmd.Env = append(os.Environ(), "GO_WANT_METIS_WEBUI_HELPER=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+		close(done)
+	}()
+	app := &App{webuiCmd: cmd, webuiDone: done, webuiPort: 49123}
+
+	app.shutdown(context.Background())
+
+	if cmd.ProcessState == nil {
+		t.Fatal("web UI child was not reaped after desktop shutdown")
+	}
+	if app.webuiCmd != nil || app.webuiDone != nil || app.webuiPort != 0 {
+		t.Fatalf("web UI state not cleared: cmd=%v done=%v port=%d", app.webuiCmd, app.webuiDone, app.webuiPort)
+	}
+}
+
+func TestWebUIChildHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_METIS_WEBUI_HELPER") != "1" {
+		return
+	}
+	for {
+		time.Sleep(time.Second)
+	}
 }
 
 type fakeCLIResult struct {
