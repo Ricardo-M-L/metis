@@ -60,6 +60,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   reducing it to an unusable basename.
 - Session export is presented as an actionable result card rather than a long
   transient filesystem-path toast.
+- Artifact storage no longer mistakes Windows' synthetic `0666`/`0777`
+  `FileMode` values for loose POSIX permissions; Windows still enforces real
+  file/directory types, symlink rejection, stable identity, size, ownership,
+  and content-digest checks.
 
 ## [0.4.28] - 2026-08-22
 

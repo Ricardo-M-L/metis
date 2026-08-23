@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -630,7 +631,7 @@ func readPrivateRegularFile(path string, max int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || info.Size() > max {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !hasPrivatePermissions(info.Mode(), 0o600) || info.Size() > max {
 		return nil, fmt.Errorf("%w: %s", ErrUnsafeFile, filepath.Base(path))
 	}
 	file, err := os.Open(path)
@@ -642,7 +643,7 @@ func readPrivateRegularFile(path string, max int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(info, openedInfo) || !openedInfo.Mode().IsRegular() || openedInfo.Mode().Perm() != 0o600 || openedInfo.Size() > max {
+	if !os.SameFile(info, openedInfo) || !openedInfo.Mode().IsRegular() || !hasPrivatePermissions(openedInfo.Mode(), 0o600) || openedInfo.Size() > max {
 		return nil, fmt.Errorf("%w: %s changed while opening", ErrUnsafeFile, filepath.Base(path))
 	}
 	body, err := io.ReadAll(io.LimitReader(file, max+1))
@@ -656,7 +657,7 @@ func readPrivateRegularFile(path string, max int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(openedInfo, afterInfo) || afterInfo.Size() != int64(len(body)) || afterInfo.Mode().Perm() != 0o600 {
+	if !os.SameFile(openedInfo, afterInfo) || afterInfo.Size() != int64(len(body)) || !hasPrivatePermissions(afterInfo.Mode(), 0o600) {
 		return nil, fmt.Errorf("%w: %s changed while reading", ErrUnsafeFile, filepath.Base(path))
 	}
 	return body, nil
@@ -667,8 +668,21 @@ func requirePrivateDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !hasPrivatePermissions(info.Mode(), 0o700) {
 		return fmt.Errorf("%w: %s must be a private directory", ErrUnsafeFile, filepath.Base(path))
 	}
 	return nil
+}
+
+// hasPrivatePermissions enforces exact owner-only POSIX modes where Go can
+// observe them. Windows exposes ACL-backed files through synthetic 0666/0777
+// FileMode bits, so comparing those bits to 0600/0700 rejects files that were
+// just created below the user's private profile. On Windows the surrounding
+// checks still require a real directory or regular file, reject symlinks,
+// verify stable identity/size while open, and validate the content digest.
+func hasPrivatePermissions(mode, want os.FileMode) bool {
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return mode.Perm() == want
 }

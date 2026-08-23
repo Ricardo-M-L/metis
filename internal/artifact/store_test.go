@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -169,19 +170,38 @@ func TestStorePermissionsDigestAndUnsafeLayout(t *testing.T) {
 		t.Fatalf("digest mismatch error = %v, want ErrUnsafeFile", err)
 	}
 
-	// Even digest-valid content must remain in a private regular file.
-	clean, err := SanitizeHTML("<p>trusted</p>")
-	if err != nil {
-		t.Fatal(err)
+	// Even digest-valid content must remain in a private regular file on
+	// platforms where FileMode represents POSIX permissions. Windows exposes
+	// ACL-backed files through synthetic permission bits instead.
+	if runtime.GOOS != "windows" {
+		clean, err := SanitizeHTML("<p>trusted</p>")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(version, []byte(clean), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(version, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.ReadVersion("session-a", item.ID, 1); !errors.Is(err, ErrUnsafeFile) {
+			t.Fatalf("public version mode error = %v, want ErrUnsafeFile", err)
+		}
 	}
-	if err := os.WriteFile(version, []byte(clean), 0o644); err != nil {
-		t.Fatal(err)
+}
+
+func TestPrivatePermissionValidationUsesPlatformSemantics(t *testing.T) {
+	if !hasPrivatePermissions(0o600, 0o600) || !hasPrivatePermissions(0o700, 0o700) {
+		t.Fatal("exact private modes must always be accepted")
 	}
-	if err := os.Chmod(version, 0o644); err != nil {
-		t.Fatal(err)
+	if runtime.GOOS == "windows" {
+		if !hasPrivatePermissions(0o666, 0o600) || !hasPrivatePermissions(0o777, 0o700) {
+			t.Fatal("Windows synthetic FileMode bits must defer to ACL-backed storage")
+		}
+		return
 	}
-	if _, _, err := store.ReadVersion("session-a", item.ID, 1); !errors.Is(err, ErrUnsafeFile) {
-		t.Fatalf("public version mode error = %v, want ErrUnsafeFile", err)
+	if hasPrivatePermissions(0o644, 0o600) || hasPrivatePermissions(0o755, 0o700) {
+		t.Fatal("non-Windows stores must reject group/other permission bits")
 	}
 }
 
@@ -359,6 +379,9 @@ func assertMode(t *testing.T, path string, want os.FileMode) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		return
 	}
 	if got := info.Mode().Perm(); got != want {
 		t.Fatalf("%s mode = %#o, want %#o", path, got, want)
