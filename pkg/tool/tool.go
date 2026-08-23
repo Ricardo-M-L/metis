@@ -73,8 +73,15 @@ const (
 //
 // Output is the user-visible textual result; Display is an optional richer
 // representation the TUI may pick up (e.g. truncation hints, pre-formatted
-// markdown). Meta is a free-form map for tool-specific metadata that the
-// agent loop / hooks may inspect.
+// markdown). Meta is a free-form map for tool-specific runtime metadata that
+// the agent loop / hooks may inspect.
+//
+// Presentation is structured, JSON-serializable UI metadata that must survive
+// both the live event stream and transcript replay. Unlike Meta, it is part of
+// the persisted presentation contract. Rich result renderers should put a
+// small discriminator plus stable identifiers here (for example
+// {"kind":"artifact","artifact_id":"...","version":2}) rather than asking
+// clients to parse Output or Display.
 //
 // Images, when non-empty, attaches inline image blocks to the
 // tool_result the model sees on its next turn. Used by vision-aware
@@ -90,7 +97,10 @@ type Result struct {
 	IsError bool
 	Display string
 	Meta    map[string]any
-	Images  []ImageAttachment
+	// Presentation is persisted with the tool_result content block. Values
+	// must therefore be JSON-serializable and should not contain large payloads.
+	Presentation map[string]any
+	Images       []ImageAttachment
 }
 
 // ImageAttachment is one inline image returned by a tool. MediaType is

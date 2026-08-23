@@ -63,7 +63,15 @@ func (s *Store) AppendHistoryTail(id string, history []llm.Message, cursor *Hist
 	if cursor == nil {
 		return fmt.Errorf("append history tail: nil cursor")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendHistoryTailLocked(id, history, cursor)
+}
 
+// appendHistoryTailLocked is AppendHistoryTail with the store lock already
+// held. CheckpointCompaction uses it so raw-tail append, fsync, and replacement
+// are one ordered transaction with respect to other writers on this Store.
+func (s *Store) appendHistoryTailLocked(id string, history []llm.Message, cursor *HistoryCursor) error {
 	start := cursor.count
 	lastAnchor := -1
 	if cursor.last != nil {
@@ -76,16 +84,76 @@ func (s *Store) AppendHistoryTail(id string, history []llm.Message, cursor *Hist
 	}
 	anchorMatches := start == 0 || (start <= len(history) && lastAnchor == start-1)
 	if start > len(history) || !anchorMatches {
-		return s.ReplaceHistoryAndMark(id, history, cursor)
+		return s.replaceHistoryAndMarkLocked(id, history, cursor, false)
 	}
 
 	for i := start; i < len(history); i++ {
-		if err := s.AppendMessage(id, history[i]); err != nil {
+		message := history[i]
+		if err := s.appendEntryLocked(id, Entry{Type: "message", Message: &message}, false); err != nil {
 			return err
 		}
 		cursor.count = i + 1
-		msg := history[i]
-		cursor.last = &msg
+		cursor.last = &message
+	}
+	return nil
+}
+
+// replaceHistoryAndMarkLocked appends a replacement and advances cursor only
+// after the requested durability boundary succeeds. s.mu must be held.
+func (s *Store) replaceHistoryAndMarkLocked(id string, history []llm.Message, cursor *HistoryCursor, durable bool) error {
+	if err := s.appendEntryLocked(id, Entry{Type: "history_replace", Messages: history}, durable); err != nil {
+		return err
+	}
+	cursor.Mark(history)
+	return nil
+}
+
+// CheckpointCompaction durably commits a context replacement without losing
+// the raw messages that triggered it. It first appends every message in before
+// that is not yet represented by cursor, then appends a history_replace entry
+// for after and advances cursor to that exact logical snapshot.
+//
+// The two append phases intentionally preserve crash semantics:
+//   - a crash before history_replace resumes the complete raw before history;
+//   - a crash after history_replace resumes the exact compacted after history;
+//   - a write error leaves the cursor at the last line that actually reached
+//     disk, so CompactNow can roll back memory and a later retry is safe.
+//
+// The JSONL remains append-only, therefore the pre-compaction messages stay in
+// the physical audit ledger even though Load applies the later replacement as
+// the current logical conversation.
+func (s *Store) CheckpointCompaction(id string, before, after []llm.Message, cursor *HistoryCursor) error {
+	if cursor == nil {
+		return fmt.Errorf("checkpoint compaction: nil cursor")
+	}
+	if s == nil || id == "" {
+		cursor.Mark(after)
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Work on a copy while appending so any successfully visible prefix can be
+	// published to the caller as one coherent cursor boundary before fsync.
+	rawCursor := *cursor
+	if err := s.appendHistoryTailLocked(id, before, &rawCursor); err != nil {
+		// Successful prefix entries are already visible in the ledger. Preserve
+		// that boundary just as AppendHistoryTail does, so a retry cannot duplicate
+		// them even though the final entry failed.
+		*cursor = rawCursor
+		return fmt.Errorf("checkpoint compaction raw tail: %w", err)
+	}
+	*cursor = rawCursor
+	if err := s.syncLocked(id); err != nil {
+		return fmt.Errorf("checkpoint compaction sync raw tail: %w", err)
+	}
+
+	// The replacement itself is written and fsynced before its logical cursor
+	// becomes visible. A crash before this point resumes the durable raw tail;
+	// a crash after it resumes exactly the compacted checkpoint.
+	if err := s.replaceHistoryAndMarkLocked(id, after, cursor, true); err != nil {
+		return fmt.Errorf("checkpoint compaction replacement: %w", err)
 	}
 	return nil
 }

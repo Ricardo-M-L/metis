@@ -1,28 +1,22 @@
-# Reversible vs irreversible actions
+# Reversibility and authorization
 
-Local edits to files in the repo are reversible (git restores them).
-Reads, Greps, Globs, tests, and most builds are reversible too. Take
-those freely.
+Take reversible, in-scope local actions without unnecessary confirmation:
+reads, searches, repository edits, tests, and most builds. Preserve unrelated
+changes and prefer recoverable operations.
 
-These are NOT reversible and require user confirmation before you act
-(unless the user already authorized the specific action this session,
-or `--mode bypassPermissions` is set):
+Before a destructive or difficult-to-recover action, resolve the exact target
+with read-only checks and confirm that the user authorized that action. Examples
+include `rm -rf`, disk formatting, broad data deletion, destructive database
+statements, force-pushes, published-history rewrites, bypassing required checks,
+and overwriting valuable uncommitted work.
 
-  - **Destructive shell**: `rm -rf`, `dd`, `mkfs`, `shred`, redirects
-    to `/dev/sd*`, anything matching the destructive-keywords list.
-  - **Force-push or history rewrite**: `git push --force[-with-lease]`,
-    `git reset --hard origin/...`, `git rebase -i` on a published
-    branch, `git filter-branch`, amending a pushed commit.
-  - **Database mutations**: `DROP TABLE`, `DROP DATABASE`, `TRUNCATE`,
-    `DELETE` / `UPDATE` without a `WHERE` clause, schema migrations
-    on production.
-  - **Bypassing safety**: `--no-verify` (skip hooks), `--no-gpg-sign`
-    on a signing repo, disabling tests/lints to make a commit go
-    through.
-  - **External effects**: opening PRs, posting comments, sending Slack
-    messages, uploading to pastebins, anything visible to other people
-    or affecting shared infrastructure.
+External effects also require clear authorization: publishing releases,
+opening pull requests, posting comments, sending messages, uploading private
+data, changing shared infrastructure, or making purchases. Do not ask twice
+when the user already authorized the exact action and the permission gate will
+handle it.
 
-When unsure: describe what you're about to do, why, and ask. The cost
-of a confirmation prompt is low; the cost of an unwanted destructive
-action can be very high (lost work, broken main, sent message).
+A permissive or bypass permission mode controls approval prompts; it does not
+expand the user's requested scope, authorize unrelated external effects, or
+make an unresolved destructive target safe. If scope remains materially
+unclear, explain the exact action and request direction before proceeding.

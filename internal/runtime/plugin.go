@@ -30,10 +30,17 @@ func PluginsDir() string {
 // reference (when the manifest declared one). Held by the PluginRegistry
 // so we can call Close() on shutdown.
 type Plugin struct {
-	Manifest pubplugin.Manifest
-	RootDir  string
-	MCP      *mcptools.Server // nil when no [mcp_server] stanza
-	Skills   []skills.Skill   // pre-loaded from manifest's skills entries
+	Manifest   pubplugin.Manifest
+	RootDir    string
+	MCP        *mcptools.Server // legacy first server; nil when none loaded
+	MCPServers []*mcptools.Server
+	Skills     []skills.Skill // pre-loaded from manifest's skills entries
+}
+
+// launchPluginMCPServer is a narrow seam for proving ecosystem manifest
+// translation without spawning test subprocesses.
+var launchPluginMCPServer = func(ctx context.Context, entry mcp.ServerEntry, registry *tools.Registry) (*mcptools.Server, error) {
+	return mcp.LaunchServer(ctx, &mcp.Registry{Servers: []mcp.ServerEntry{entry}}, entry.Name, registry)
 }
 
 // Name implements the loader's PluginSkillSource contract.
@@ -88,7 +95,14 @@ func (r *PluginRegistry) Close() error {
 	defer r.mu.Unlock()
 	var errs []error
 	for _, p := range r.plugins {
-		if p.MCP != nil {
+		for _, server := range p.MCPServers {
+			if server != nil {
+				if err := server.Close(); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+		if len(p.MCPServers) == 0 && p.MCP != nil {
 			if err := p.MCP.Close(); err != nil {
 				errs = append(errs, err)
 			}
@@ -154,27 +168,48 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 
 	p := &Plugin{Manifest: m, RootDir: rootDir}
 
-	// Spawn MCP server if declared. Tools auto-register as
-	// `mcp__plugin:<name>__<tool>` via the existing mcptools machinery.
+	// Spawn every declared MCP server. The singular form remains the legacy
+	// default; ecosystem adapters use the named list so a Codex package keeps
+	// all of its independent servers.
+	specs := append([]pubplugin.MCPServerSpec(nil), m.MCPServers...)
 	if m.MCPServer != nil {
-		// Apply env overrides. Each plugin's env doesn't leak into the
-		// parent process — applied only to the child via os/exec.
-		// (mcptools.NewServer uses os/exec.CommandContext; child env
-		// inheritance is handled there. For now we splice into a
-		// mcp.ServerEntry-like spec.)
-		entry := mcp.ServerEntry{
-			Name:    "plugin:" + m.Name,
-			Command: m.MCPServer.Command,
-			Args:    append([]string(nil), m.MCPServer.Args...),
+		legacy := *m.MCPServer
+		if legacy.Name == "" {
+			legacy.Name = "default"
 		}
-		// Reuse single-server launch path so all our existing MCP
-		// observability (errors, namespacing) applies.
-		fakeReg := &mcp.Registry{Servers: []mcp.ServerEntry{entry}}
-		srv, err := mcp.LaunchServer(ctx, fakeReg, entry.Name, registry)
+		specs = append([]pubplugin.MCPServerSpec{legacy}, specs...)
+	}
+	for _, spec := range specs {
+		if spec.Disabled {
+			continue
+		}
+		serverName := spec.Name
+		if serverName == "" {
+			serverName = "default"
+		}
+		workingDir, err := pluginWorkingDir(rootDir, spec.WorkingDir)
 		if err != nil {
-			return nil, fmt.Errorf("mcp_server: %w", err)
+			return nil, fmt.Errorf("mcp server %s: %w", serverName, err)
 		}
-		p.MCP = srv
+		command := spec.Command
+		if command != "" && (strings.HasPrefix(command, "./") || strings.HasPrefix(command, `.\`)) {
+			command = filepath.Join(workingDir, filepath.FromSlash(strings.TrimPrefix(strings.TrimPrefix(command, "./"), `.\`)))
+		}
+		entry := mcp.ServerEntry{
+			Name:    "plugin:" + m.Name + ":" + serverName,
+			Command: command, Args: append([]string(nil), spec.Args...), URL: spec.URL,
+			Headers: cloneStringMap(spec.Headers), Auth: spec.Auth, Env: cloneStringMap(spec.Env),
+			WorkingDir: workingDir, EnabledTools: append([]string(nil), spec.EnabledTools...),
+			DisabledTools: append([]string(nil), spec.DisabledTools...),
+		}
+		srv, err := launchPluginMCPServer(ctx, entry, registry)
+		if err != nil {
+			return nil, fmt.Errorf("mcp server %s: %w", serverName, err)
+		}
+		p.MCPServers = append(p.MCPServers, srv)
+		if p.MCP == nil {
+			p.MCP = srv
+		}
 	}
 
 	// Pre-load contributed skill files so the skill loader's plugin layer
@@ -218,15 +253,63 @@ func validateManifest(m *pubplugin.Manifest, expectedName string) error {
 		return fmt.Errorf("manifest name %q must match plugin dir %q", m.Name, expectedName)
 	}
 	if m.MCPServer != nil {
-		if m.MCPServer.Command == "" {
-			return errors.New("[mcp_server].command required")
+		if err := validateMCPServer(*m.MCPServer, "[mcp_server]"); err != nil {
+			return err
 		}
-		// Defense-in-depth against shell-tool injection: don't allow
-		// shell metacharacters in command. Args is fine — that's
-		// expected to carry user content.
-		if strings.ContainsAny(m.MCPServer.Command, ";&|`$<>") {
-			return fmt.Errorf("[mcp_server].command contains shell metacharacters: %q", m.MCPServer.Command)
+	}
+	seenServers := map[string]bool{}
+	for i, server := range m.MCPServers {
+		label := fmt.Sprintf("[[mcp_servers]][%d]", i)
+		if server.Name == "" {
+			return fmt.Errorf("%s.name required", label)
+		}
+		if seenServers[server.Name] {
+			return fmt.Errorf("duplicate mcp server name %q", server.Name)
+		}
+		seenServers[server.Name] = true
+		if err := validateMCPServer(server, label); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func validateMCPServer(server pubplugin.MCPServerSpec, label string) error {
+	if server.Command == "" && server.URL == "" {
+		return fmt.Errorf("%s requires command or url", label)
+	}
+	if strings.ContainsAny(server.Command, ";&|`$<>") {
+		return fmt.Errorf("%s.command contains shell metacharacters: %q", label, server.Command)
+	}
+	return nil
+}
+
+func pluginWorkingDir(root, declared string) (string, error) {
+	if strings.TrimSpace(declared) == "" {
+		return root, nil
+	}
+	if filepath.IsAbs(declared) {
+		return "", errors.New("working_dir must be relative to the plugin")
+	}
+	clean := filepath.Clean(filepath.FromSlash(declared))
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("working_dir escapes plugin root")
+	}
+	resolved := filepath.Join(root, clean)
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("working_dir is unavailable")
+	}
+	return resolved, nil
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+	output := make(map[string]string, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
 }

@@ -1546,39 +1546,26 @@ func cmdCompact(r *REPL, args string) string {
 	beforeTokens := r.Loop.EstimateContextTokens()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	// PreCompact hook — trigger "manual" (the auto path in
-	// compaction_check.go fires its own with trigger "auto"). Lets
-	// observers back up the transcript before the summarizer runs.
-	if r.Loop.Hooks != nil {
-		r.Loop.Hooks.EmitPreCompact(ctx, agent.HookContext{Model: r.Loop.Model}, &agent.PreCompact{
-			Trigger:         "manual",
-			MessageCount:    before,
-			EstimatedTokens: beforeTokens,
-		})
-	}
 	instructions := strings.TrimSpace(args)
-	compacted, err := r.Loop.Compactor.CompactWithInstructions(ctx, hist, instructions)
+	result, err := r.Loop.CompactNow(ctx, agent.CompactOptions{
+		Trigger:      "manual",
+		Force:        true,
+		Instructions: instructions,
+		Persist:      r.replaceHistory,
+	})
 	if err != nil {
 		return "compact failed: " + err.Error()
 	}
-	if len(compacted) >= before {
-		return fmt.Sprintf("compact: no reduction (%d → %d messages)", before, len(compacted))
+	if !result.Applied {
+		return fmt.Sprintf("compact: no reduction (%d messages · ~%d tokens)", before, beforeTokens)
 	}
-	r.Loop.Restore(compacted)
 	r.resetTokenUsageAfterCompaction()
-	if err := r.replaceHistory(compacted); err != nil {
-		return fmt.Sprintf("compact: %d → %d messages in memory, but history persistence failed: %v", before, len(compacted), err)
-	}
-	// PostCompact hook — trigger "manual" (the auto path in
-	// compaction_check.go fires its own with trigger "auto"). Lets
-	// handlers inject context right after the compact boundary.
-	r.Loop.FirePostCompactHook(ctx, "manual", "compact",
-		before, len(compacted), beforeTokens, r.Loop.EstimateContextTokens())
-	result := fmt.Sprintf("compact: %d → %d messages (saved %d)", before, len(compacted), before-len(compacted))
+	message := fmt.Sprintf("compact: %d → %d messages · ~%d → ~%d tokens",
+		result.BeforeMessages, result.AfterMessages, result.BeforeTokens, result.AfterTokens)
 	if instructions != "" {
-		result += " · applied custom summary instructions"
+		message += " · applied custom summary instructions"
 	}
-	return result
+	return message
 }
 
 func cmdConfig(r *REPL, args string) string {

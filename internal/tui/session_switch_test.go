@@ -714,8 +714,8 @@ func TestREPLFreshSessionUsesEmptyInvocationBase(t *testing.T) {
 	}
 }
 
-func TestSessionPickersRejectOversizedResumeBeforeLoading(t *testing.T) {
-	t.Setenv("METIS_RESUME_MAX_MB", "1")
+func TestSessionPickersRejectOversizedPhysicalLedgerBeforeLoading(t *testing.T) {
+	t.Setenv("METIS_RESUME_PHYSICAL_MAX_MB", "1")
 	m, store := newSessionSwitchModel(t, permission.ModeAsk)
 	const oversizedID = "oversized-target"
 	if err := os.WriteFile(filepath.Join(store.Dir, oversizedID+".jsonl"), make([]byte, 2*1024*1024), 0o644); err != nil {
@@ -732,7 +732,7 @@ func TestSessionPickersRejectOversizedResumeBeforeLoading(t *testing.T) {
 		}
 		found := false
 		for _, msg := range m.messages[beforeMessages:] {
-			if msg.Role == "error" && strings.Contains(msg.Content, "exceeds the 1.0 MiB resume limit") {
+			if msg.Role == "error" && strings.Contains(msg.Content, "exceeds the 1.0 MiB physical resume limit") {
 				found = true
 			}
 		}

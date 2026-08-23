@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/agent"
 )
 
 // TestCompactionExtras_LayoutMatchesImage19 — when spinnerOverride is
@@ -47,6 +49,19 @@ func TestCompactionExtras_LayoutMatchesImage19(t *testing.T) {
 	// the configure command (matches CC image #19).
 	if !strings.Contains(out, "└ Compacting at auto window (170k tokens) · /autocompact to configure") {
 		t.Fatalf("expected sub-line with 170k auto window; got:\n%s", out)
+	}
+}
+
+func TestCompactionExtras_UsesAuthoritativeEffectiveInputBoundary(t *testing.T) {
+	m := minimalModel(200_000)
+	cfg := agent.DefaultCompactionConfig()
+	m.loop.Compactor = agent.NewCompactor(cfg, "test", 200_000, m.loop.Provider)
+	m.loop.Compactor.MaxOutputTokens = 20_000
+
+	out := stripANSI(renderCompactionExtras(m))
+	// (200K context - 20K response reserve) * 85% = 153K.
+	if !strings.Contains(out, "auto window (153k tokens)") {
+		t.Fatalf("expected authoritative 153k auto window; got:\n%s", out)
 	}
 }
 

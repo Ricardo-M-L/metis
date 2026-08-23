@@ -76,6 +76,7 @@ func TestFingerprintEntry_ChangesOnAnyField(t *testing.T) {
 		{"args", func(e *ServerEntry) { e.Args = []string{"y"} }},
 		{"args-additional", func(e *ServerEntry) { e.Args = []string{"x", "extra"} }},
 		{"url", func(e *ServerEntry) { e.URL = "v" }},
+		{"working directory", func(e *ServerEntry) { e.WorkingDir = "plugin-root" }},
 		{"header-value", func(e *ServerEntry) { e.Headers = map[string]string{"h": "2"} }},
 		{"header-key", func(e *ServerEntry) { e.Headers = map[string]string{"j": "1"} }},
 		{"header-extra", func(e *ServerEntry) { e.Headers = map[string]string{"h": "1", "k": "2"} }},

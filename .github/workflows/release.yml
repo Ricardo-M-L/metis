@@ -65,6 +65,31 @@ jobs:
           cache: true
           cache-dependency-path: source/go.sum
 
+      - name: Run root release gates
+        working-directory: source
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt found unformatted files:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          go vet ./...
+          go build ./...
+          go test -count=1 -timeout 120s ./...
+
+      - name: Vet and race-test patched Bubble Tea
+        working-directory: source/vendor-patches/bubbletea-v2
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Vet and race-test patched Ultraviolet
+        working-directory: source/vendor-patches/ultraviolet
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
       - name: Cross-compile and verify release set
         working-directory: source
         env:
@@ -181,6 +206,29 @@ jobs:
           npm ci
           npm run check
           npm run build
+
+      - name: Vet, race-test, and production-build Desktop (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: metis-desktop
+        run: |
+          tags=
+          production_tags=production
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            tags='-tags webkit2_41'
+            production_tags='production webkit2_41'
+          fi
+          go vet $tags ./...
+          go test -race -count=1 $tags ./...
+          go build -tags "$production_tags" ./...
+
+      - name: Vet, race-test, and production-build Desktop (Windows)
+        if: runner.os == 'Windows'
+        working-directory: metis-desktop
+        shell: pwsh
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+          go build -tags production ./...
 
       - name: Build and package Desktop (Linux/macOS)
         if: runner.os != 'Windows'

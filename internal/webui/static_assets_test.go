@@ -29,18 +29,27 @@ func TestStaticAssetsServed(t *testing.T) {
 	if code != 200 || !strings.Contains(ctype, "css") {
 		t.Fatalf("style.css: code=%d type=%q", code, ctype)
 	}
-	for _, want := range []string{".trace-turn-header", ".trace-inspector", ".trace-timeline", ".chat-area", ".session-delete-dialog", ".k-thinking", ".think-leading", ".think-head:focus-visible", ".composer-add-menu", ".composer-action-dialog"} {
+	for _, want := range []string{".trace-turn-header", ".trace-inspector", ".trace-timeline", ".chat-area", ".session-delete-dialog", ".k-thinking", ".think-leading", ".think-head:focus-visible", ".composer-add-menu", ".composer-action-dialog", ".sb-update", ".update-dialog", ".msg-metrics", ".plugin-ecosystem-grid", ".plugin-ecosystem-card", ".plugin-component-row", "button.sb-settings {\n  width: auto;"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("style.css missing %q", want)
 		}
 	}
+	code, ctype, body = get("/artifacts.css")
+	if code != 200 || !strings.Contains(ctype, "css") || !strings.Contains(body, ".artifact-preview-shell") || !strings.Contains(body, ".artifact-card") || !strings.Contains(body, ".artifact-preview-state[hidden]") {
+		t.Fatalf("artifacts.css: code=%d type=%q", code, ctype)
+	}
 
 	// scripts, each carrying its own domain content
 	scriptChecks := map[string][]string{
-		"app.js":      {"escHtml", "escAttr", "DOMContentLoaded", "detectProject", "contextMeter", "initDesktopPreferences", "renderStatusPopover", "renderStatusSnapshot", "openRailSearch", "applyLanguage", "data-i18n-label", "data-i18n-title", "syncApprovalChip(approvalMode)", "From idea to done", "从想法，到完成", "METIS Desktop"},
-		"sessions.js": {"loadSessions", "loadMoreSessions", "renderSessions", "resumeSession", "archiveSession", "restoreSession", "openSessionDeleteDialog", "confirmSessionDeletion", "closeSessionDeleteDialog", `role="alertdialog"`, "requestAnimationFrame(() => cancel.focus())", "method: 'DELETE'", "setSessionPreference", "workspaceLabel", "sessionItemKeydown", "loadWorkspaces", "addWorkspace", "openWorkspace", "renameWorkspace", "removeWorkspace", "moveWorkspace", "moveSession", "showSessionDetail", "Plan session completed"},
-		"chat.js":     {"connectEvents", "acceptLiveEvent", "sendMessage", "handleTextDelta", "showReconnectBanner", "endStreamingMessage", "openAttachmentPicker", "initAttachmentDrop", "pasteClipboardFilePaths", "pasteAllClipboardFilePaths", "/api/clipboard/files", "selectionStart", "COMPOSER_COMMANDS", "COMPOSER_ADD_ACTIONS", "toggleComposerAddMenu", "getBoundingClientRect().top - 12", "runComposerAddAction", "openComposerActionDialog", "/api/compact", "/api/goals", "/api/feedback", "submitBusyInput", "drainQueuedTurns", "filterSettings", "loadProviders", "saveCustomProvider", "deleteProvider", "validateProvider", "probeProvider", "loadEffort", "loadPresets", "loadPlugins", "loadPluginCatalog", "refreshPluginCatalog", "installPlugin", "removePlugin", "openPluginActionDialog", "/api/plugins/catalog", "/api/plugins/install", "/api/plugins/remove", "loadRouting", "chooseLanguage", "ROUTING_ZH", "appendThinkingRow", "thinkRowKeydown", "REDACTED_THINKING_PLACEHOLDER"},
-		"trace.js":    {"loadTrace", "renderTrace", "switchView", "selectTraceRow", "renderTraceInspector", "toggleFoldTurns", "partialArgs", "mergeTraceEvents", "traceNextCursor", "closeTraceInspector(false)", "thinking_redacted", "k-thinking"},
+		"app.js":       {"escHtml", "escAttr", "DOMContentLoaded", "detectProject", "contextMeter", "initDesktopPreferences", "renderStatusPopover", "renderStatusSnapshot", "openRailSearch", "applyLanguage", "data-i18n-label", "data-i18n-title", "syncApprovalChip(approvalMode)", "requestNative", "checkDesktopUpdate", "openDesktopUpdateDialog", "installDesktopUpdate", "From idea to done", "从想法，到完成", "METIS Desktop"},
+		"sessions.js":  {"loadSessions", "loadMoreSessions", "renderSessions", "resumeSession", "archiveSession", "restoreSession", "openSessionDeleteDialog", "confirmSessionDeletion", "closeSessionDeleteDialog", `role="alertdialog"`, "requestAnimationFrame(() => cancel.focus())", "method: 'DELETE'", "setSessionPreference", "workspaceLabel", "sessionItemKeydown", "loadWorkspaces", "addWorkspace", "requestNative('choose-workspace')", "openWorkspace", "renameWorkspace", "removeWorkspace", "moveWorkspace", "moveSession", "showSessionDetail", "Plan session completed"},
+		"chat.js":      {"connectEvents", "acceptLiveEvent", "sendMessage", "handleTextDelta", "showReconnectBanner", "endStreamingMessage", "openAttachmentPicker", "initAttachmentDrop", "pasteClipboardFilePaths", "pasteAllClipboardFilePaths", "/api/clipboard/files", "selectionStart", "COMPOSER_COMMANDS", "COMPOSER_ADD_ACTIONS", "toggleComposerAddMenu", "getBoundingClientRect().top - 12", "runComposerAddAction", "openComposerActionDialog", "/api/compact", "/api/goals", "/api/feedback", "submitBusyInput", "drainQueuedTurns", "filterSettings", "loadProviders", "saveCustomProvider", "deleteProvider", "validateProvider", "probeProvider", "loadEffort", "loadPresets", "loadPlugins", "loadPluginCatalog", "refreshPluginCatalog", "installPlugin", "removePlugin", "openPluginActionDialog", "pluginEcosystemGrid", "choosePluginEcosystem", "renderPluginEcosystems", "Ecosystem compatibility", "生态兼容层", "/api/plugins/catalog", "/api/plugins/install", "/api/plugins/remove", "loadRouting", "chooseLanguage", "ROUTING_ZH", "appendThinkingRow", "thinkRowKeydown", "REDACTED_THINKING_PLACEHOLDER", "MESSAGE_ACTION_ICONS", "messageActionsMarkup", "msg-metrics"},
+		"trace.js":     {"loadTrace", "renderTrace", "switchView", "selectTraceRow", "renderTraceInspector", "toggleFoldTurns", "partialArgs", "mergeTraceEvents", "traceNextCursor", "closeTraceInspector(false)", "thinking_redacted", "k-thinking"},
+		"artifacts.js": {"renderArtifactPresentation", "loadArtifactsForSession", "openArtifactsPanel", "previewArtifactByID", "safeArtifactURL", "confirmArtifactDeletion", "/api/artifacts"},
+	}
+	_, _, chatBody := get("/chat.js")
+	if strings.Contains(chatBody, "DeepSeek Harness extensions are npm/Cordis packages, not a public METIS-compatible marketplace") {
+		t.Fatal("plugin settings still reduces the DeepSeek ecosystem to the retired no-marketplace notice")
 	}
 	for file, wants := range scriptChecks {
 		code, ctype, body := get("/" + file)
@@ -70,14 +79,16 @@ func TestStaticAssetsServed(t *testing.T) {
 	for _, want := range []string{
 		`href="/favicon.svg"`,
 		`<link rel="stylesheet" href="style.css?v=`,
+		`<link rel="stylesheet" href="artifacts.css?v=`,
 		`<script src="app.js?v=`,
 		`<script src="sessions.js?v=`,
 		`<script src="chat.js?v=`,
+		`<script src="artifacts.js?v=`,
 		`<script src="trace.js?v=`,
-		"viewTabs", "tabTrace", "tracePanel", "traceSearch",
+		"viewTabs", "tabTrace", "tabArtifacts", "artifactsPanel", "artifactPreviewFrame", "tracePanel", "traceSearch",
 		"btnFoldTurns", "btnFoldCalls", "traceTimeline", "traceInspector",
 		"archivedSessionsBtn", "sessionViewBtn", "sessionViewMenu", "attachmentInput", "contextMeter", "Session log",
-		"statusPopover", "commandMenu", "composerAddMenu", "attachmentBtn", "queuedTurns", "details-closed", "workspaceAddBtn", "Model Providers", "Agent Presets", "Plugins", "Smart Routing", "effortBtn", "presetName", "data-i18n", "data-i18n-label", "data-i18n-title",
+		"statusPopover", "commandMenu", "composerAddMenu", "attachmentBtn", "queuedTurns", "details-closed", "workspaceAddBtn", "desktopUpdateBtn", "Model Providers", "Agent Presets", "Plugins", "Smart Routing", "effortBtn", "presetName", "data-i18n", "data-i18n-label", "data-i18n-title",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("index missing %q", want)
@@ -85,6 +96,10 @@ func TestStaticAssetsServed(t *testing.T) {
 	}
 	if strings.Contains(body, "<style>") || strings.Contains(body, "function loadTrace") {
 		t.Fatal("index.html must not inline styles or logic anymore")
+	}
+	if !strings.Contains(body, `id="artifactPreviewFrame" title="Artifact preview" sandbox referrerpolicy="no-referrer"`) ||
+		strings.Contains(body, "allow-scripts") || strings.Contains(body, "allow-same-origin") {
+		t.Fatal("artifact preview iframe must keep an empty sandbox capability set")
 	}
 	if strings.Contains(body, "&#25506;&#32034;&#26410;&#33267;&#20043;&#22659;") || strings.Contains(body, "&#39044;&#35272;&#29256;") {
 		t.Fatal("index.html still contains the retired DeepSeek-style welcome copy")
@@ -113,6 +128,7 @@ func TestComposerAddMenuPreservesAttachmentAndKeepsSlashCommandsIndependent(t *t
 	chat := get("/chat.js")
 	for _, command := range []string{
 		"/compact", "/export", "/feedback", "/goal", "/permission", "/plan", "/model", "/skills", "/plugins",
+		"/artifact", "/artifacts",
 		"/clear-history", "/retry", "/undo", "/save", "/thinking", "/theme", "/cost", "/tools", "/doctor",
 	} {
 		if !strings.Contains(chat, `{ name: '`+command+`'`) {

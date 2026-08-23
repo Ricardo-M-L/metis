@@ -4,6 +4,7 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -165,6 +167,18 @@ func (s *Store) scanFeedback(id string, fn func(*FeedbackEntry)) error {
 
 type Store struct {
 	Dir string
+
+	// mu serializes repair + append sequences for one Store. A normal append is
+	// one O_APPEND write, but recovering an unterminated trailing JSON record
+	// must inspect and possibly truncate the file before that write. Without a
+	// lock, another goroutine using the same Store could append between those
+	// operations and have its valid record truncated.
+	mu sync.Mutex
+
+	// syncFile is an injectable fsync boundary used by durability tests. Nil
+	// means (*os.File).Sync. It is deliberately private so production callers
+	// cannot weaken checkpoint durability.
+	syncFile func(*os.File) error
 }
 
 func NewStore(dir string) (*Store, error) {
@@ -222,10 +236,11 @@ func (s *Store) ReplaceHistoryAndMark(id string, history []llm.Message, cursor *
 		cursor.Mark(history)
 		return nil
 	}
-	if err := s.append(id, Entry{Type: "history_replace", Messages: history}); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.replaceHistoryAndMarkLocked(id, history, cursor, false); err != nil {
 		return fmt.Errorf("replace history: %w", err)
 	}
-	cursor.Mark(history)
 	return nil
 }
 
@@ -234,26 +249,157 @@ func (s *Store) append(id string, e Entry) error {
 	// single Write to guarantee atomic-per-line append. json.Encoder
 	// usually writes once-per-Encode but it's not contractually
 	// guaranteed; for safety we marshal in memory first so the
-	// underlying file.Write is a single syscall (the kernel either
-	// commits the whole buffer or none of it on a clean signal kill —
-	// torn writes only happen on power loss / kernel panic, which is
-	// out of scope for a user-space CLI).
+	// underlying file.Write is a single syscall. Regular-file writes can still
+	// be short or torn on a crash, so appendEntryLocked also repairs an invalid
+	// unterminated suffix before every later append.
 	//
 	// Pairs with Load's tolerant trailing-line handling: even if a
 	// torn write does happen, the resume path now drops the bad
 	// trailing line instead of aborting the whole session.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendEntryLocked(id, e, false)
+}
+
+// appendEntryLocked writes one JSONL entry. s.mu must be held. When durable is
+// true the entry is fsynced before success is reported; compaction uses this
+// for the history_replace commit record.
+func (s *Store) appendEntryLocked(id string, e Entry, durable bool) error {
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-	f, err := os.OpenFile(s.path(id), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.path(id), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.Write(b)
-	return err
+
+	needsSeparator, err := repairUnterminatedTail(f)
+	if err == nil && needsSeparator {
+		b = append([]byte{'\n'}, b...)
+	}
+	writeStart := int64(0)
+	writeStarted := false
+	if err == nil {
+		var st os.FileInfo
+		st, err = f.Stat()
+		if err == nil {
+			writeStart = st.Size()
+		}
+	}
+	if err == nil {
+		var n int
+		writeStarted = true
+		n, err = f.Write(b)
+		if err == nil && n != len(b) {
+			err = io.ErrShortWrite
+		}
+	}
+	if err == nil && durable {
+		err = s.syncOpenFile(f)
+	}
+	if err != nil && writeStarted {
+		// Keep a failed/short append from becoming tomorrow's corrupted tail.
+		// For a durable replacement this also restores the already-fsynced raw
+		// checkpoint state before the error is returned to CompactNow.
+		if truncateErr := f.Truncate(writeStart); truncateErr != nil {
+			err = errors.Join(err, fmt.Errorf("rollback failed session append: %w", truncateErr))
+		} else if durable {
+			// The raw checkpoint crossed its fsync barrier before this durable
+			// replacement began. Persist the truncation too, otherwise a power
+			// loss could resurrect the replacement whose fsync just failed.
+			if rollbackSyncErr := s.syncOpenFile(f); rollbackSyncErr != nil {
+				err = errors.Join(err, fmt.Errorf("sync rolled-back session append: %w", rollbackSyncErr))
+			}
+		}
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	// append historically treated a completed Write as success and ignored a
+	// later Close error. Preserve that cursor contract; durable writes already
+	// crossed fsync above. Returning a Close error here would make callers retry
+	// an entry that is already present.
+	_ = closeErr
+	return nil
+}
+
+const maxTrailingRepairBytes int64 = 16 * 1024 * 1024
+
+// repairUnterminatedTail makes the tolerant Load behaviour safe across a
+// subsequent append. A short/torn O_APPEND write leaves an invalid JSON prefix
+// without its terminating newline. If another record were appended directly,
+// both records would become one permanently invalid line. Before appending we
+// therefore discard only that unterminated invalid suffix. A valid final JSON
+// record that merely lacks a newline is preserved and the caller inserts the
+// missing separator.
+//
+// The bounded scan avoids allocating an attacker-sized malformed suffix. A
+// suffix beyond the bound is rejected rather than silently discarded.
+func repairUnterminatedTail(f *os.File) (needsSeparator bool, err error) {
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return false, err
+	}
+	size := st.Size()
+	last := []byte{0}
+	if _, err := f.ReadAt(last, size-1); err != nil {
+		return false, err
+	}
+	if last[0] == '\n' {
+		return false, nil
+	}
+
+	searchStart := size - maxTrailingRepairBytes
+	if searchStart < 0 {
+		searchStart = 0
+	}
+	tail := make([]byte, size-searchStart)
+	if _, err := f.ReadAt(tail, searchStart); err != nil {
+		return false, err
+	}
+	lineOffset := bytes.LastIndexByte(tail, '\n') + 1
+	if lineOffset == 0 && searchStart > 0 {
+		return false, fmt.Errorf("session trailing record exceeds %s repair limit", fmtBytes(maxTrailingRepairBytes))
+	}
+	lineStart := searchStart + int64(lineOffset)
+	line := tail[lineOffset:]
+	if json.Valid(line) {
+		return true, nil
+	}
+	if lineStart == 0 {
+		return false, errors.New("session contains no complete JSONL record before corrupted tail")
+	}
+	if err := f.Truncate(lineStart); err != nil {
+		return false, fmt.Errorf("truncate corrupted session tail: %w", err)
+	}
+	return false, nil
+}
+
+func (s *Store) syncOpenFile(f *os.File) error {
+	if s.syncFile != nil {
+		return s.syncFile(f)
+	}
+	return f.Sync()
+}
+
+// syncLocked fsyncs an existing session file. s.mu must be held.
+func (s *Store) syncLocked(id string) error {
+	f, err := os.OpenFile(s.path(id), os.O_RDWR, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	err = s.syncOpenFile(f)
+	_ = f.Close()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) Load(id string) (*Header, []llm.Message, error) {
@@ -265,7 +411,7 @@ func (s *Store) Load(id string) (*Header, []llm.Message, error) {
 	var hdr *Header
 	var msgs []llm.Message
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	sc.Buffer(make([]byte, 1<<20), resumeScannerMaxBytes())
 	// 2026-05-22: tolerate a corrupted trailing line. Pre-fix any
 	// JSON decode error aborted Load and the session was effectively
 	// unrecoverable. Real-world torn-write scenarios (SIGKILL during
@@ -535,14 +681,24 @@ func (s *Store) LoadHeader(id string) (*Header, int, error) {
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	sc.Buffer(make([]byte, 1<<20), resumeScannerMaxBytes())
 	var hdr *Header
 	messageCount := 0
 	firstUserPrompt := ""
+	lineNum := 0
+	var pendingBadLine string
 	for sc.Scan() {
+		lineNum++
+		if pendingBadLine != "" {
+			return nil, 0, fmt.Errorf("decode session entry at line %d: %s", lineNum-1, pendingBadLine)
+		}
 		var e Entry
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
-			return nil, 0, err
+			// Match Load's recovery contract: defer a decode error until we know
+			// whether another line follows. A bad final partial write is ignored;
+			// corruption in the middle of the ledger remains a hard error.
+			pendingBadLine = err.Error()
+			continue
 		}
 		switch e.Type {
 		case "header":
@@ -626,16 +782,9 @@ func (s *Store) SetTitle(id, title string) error {
 // durability, but /save lets users explicitly request "I really want this
 // on disk now" before yanking the laptop lid shut.
 func (s *Store) Sync(id string) error {
-	p := s.path(id)
-	f, err := os.OpenFile(p, os.O_RDWR, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncLocked(id)
 }
 
 // Branch creates a new session based on an existing one. The new session
@@ -720,7 +869,7 @@ func (s *Store) Import(r io.Reader, preferredID string) (string, error) {
 	}
 
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	sc.Buffer(make([]byte, 1<<20), resumeScannerMaxBytes())
 	if !sc.Scan() {
 		return "", errors.New("import: input is empty")
 	}

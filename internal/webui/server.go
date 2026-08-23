@@ -23,6 +23,7 @@ import (
 	"unicode"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/artifact"
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/desktop"
@@ -97,6 +98,7 @@ type Server struct {
 	clipboardFiles  func() ([]desktop.ClipboardFile, error)
 	plugins         *rtpkg.PluginRegistry
 	pluginMarket    *pluginmarket.Manager
+	artifactStore   *artifact.Store
 }
 
 // eventHub fans agent events out to zero or more SSE subscribers. The agent
@@ -320,6 +322,8 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/sessions/activate", s.handleSessionActivate)
 	mux.HandleFunc("/api/sessions/", s.handleSession)
+	mux.HandleFunc("/api/artifacts", s.handleArtifacts)
+	mux.HandleFunc("/api/artifacts/", s.handleArtifact)
 	mux.HandleFunc("/api/turns", s.handleTurn)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/settings", s.handleSettings)
@@ -342,6 +346,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/presets/open", s.handlePresetDirectory)
 	mux.HandleFunc("/api/plugins", s.handlePlugins)
 	mux.HandleFunc("/api/plugins/catalog", s.handlePluginCatalog)
+	mux.HandleFunc("/api/plugins/icon", s.handlePluginIcon)
 	mux.HandleFunc("/api/plugins/catalog/refresh", s.handlePluginCatalogRefresh)
 	mux.HandleFunc("/api/plugins/install", s.handlePluginInstall)
 	mux.HandleFunc("/api/plugins/remove", s.handlePluginRemove)
@@ -462,8 +467,20 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 	case agent.EventTokens:
 		payload["inputTokens"] = he.ev.InputTokens
 		payload["outputTokens"] = he.ev.OutputTokens
-	case agent.EventContextWarn, agent.EventContextCompacted, agent.EventCompactionStart, agent.EventCompactionProgress:
+	case agent.EventContextWarn, agent.EventCompactionStart:
 		payload["info"] = he.ev.Info
+	case agent.EventContextCompacted:
+		payload["info"] = he.ev.Info
+		payload["previousContextTokens"] = he.ev.PreviousContextTokens
+		payload["contextTokens"] = he.ev.ContextTokens
+	case agent.EventCompactionProgress:
+		payload["info"] = he.ev.Info
+		payload["progressBytes"] = he.ev.InputTokens
+	case agent.EventCompactionEnd:
+		payload["info"] = he.ev.Info
+		if he.ev.Err != nil {
+			payload["error"] = truncateSSE(he.ev.Err.Error(), 600)
+		}
 	case agent.EventToolStart:
 		if raw, err := json.Marshal(he.ev.ToolInput); err == nil && len(raw) > 0 {
 			payload["input"] = truncateSSE(string(raw), 400)
@@ -471,6 +488,12 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 	case agent.EventToolResult:
 		if he.ev.ToolResult != nil {
 			payload["output"] = truncateSSE(he.ev.ToolResult.Output, 600)
+			if he.ev.ToolResult.Display != "" {
+				payload["display"] = he.ev.ToolResult.Display
+			}
+			if len(he.ev.ToolResult.Presentation) > 0 {
+				payload["presentation"] = he.ev.ToolResult.Presentation
+			}
 		}
 	case agent.EventPermissionRequest:
 		payload["reason"] = he.ev.PermissionReason
@@ -548,8 +571,19 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'self'")
+		// The browser build remains non-embeddable. The Wails shell receives a
+		// fresh high-entropy token on every launch and may frame only the root
+		// document carrying that token; subresources do not need an exception.
+		frameToken := os.Getenv("METIS_DESKTOP_FRAME_TOKEN")
+		nativeFrame := (r.URL.Path == "/" || r.URL.Path == "/index.html") && frameToken != "" && r.URL.Query().Get("desktop-frame") == frameToken
+		if !nativeFrame {
+			w.Header().Set("X-Frame-Options", "DENY")
+		}
+		// Artifact previews run on a capability-bearing, short-lived loopback
+		// origin. Allow only that exact host class to be framed; leaving it out
+		// would make the browser reject the intentionally cross-origin preview,
+		// while a broad http: source would let arbitrary pages enter the app.
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'self'; frame-src http://127.0.0.1:*")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -911,6 +945,11 @@ func (s *Server) deleteSessionData(id, workDir string, ownedJobOutputs []string)
 		err = errors.Join(err, traceStore.Delete(id))
 	}
 	err = errors.Join(err, transport.DeleteSessionDump(id))
+	if artifacts, artifactErr := s.artifacts(); artifactErr != nil {
+		err = errors.Join(err, artifactErr)
+	} else {
+		err = errors.Join(err, artifacts.DeleteSession(id))
+	}
 	err = errors.Join(err, tasks.Delete(id))
 	err = errors.Join(err, checkpoint.DeleteSession(id, ""))
 	err = errors.Join(err, rtpkg.DeleteSnapshot(id))
@@ -1124,6 +1163,18 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to persist input")
 		return
 	}
+	// The user-facing prompt written above can intentionally differ from the
+	// loop-only message (for example a synthetic plan reminder). Anchor the
+	// durable cursor to the live boundary so the normal append path preserves
+	// that display-safe on-disk prompt, while still detecting a later history
+	// replacement caused by automatic compaction.
+	persistedBoundary := s.loop.History()
+	historyCursor := session.NewHistoryCursor(persistedBoundary)
+	previousCheckpoint := s.loop.CompactionCheckpoint
+	s.loop.CompactionCheckpoint = func(before, after []llm.Message) error {
+		return s.store.CheckpointCompaction(body.SessionID, before, after, &historyCursor)
+	}
+	defer func() { s.loop.CompactionCheckpoint = previousCheckpoint }()
 	if len(history) == 0 {
 		title := []rune(input)
 		if len(title) > 60 {
@@ -1201,32 +1252,29 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 				s.hub.publish(body.SessionID, ev, map[string]any{"askId": id})
 				go func() {
 					time.Sleep(120 * time.Second)
-					s.askMu.Lock()
-					cur, ok := s.pendingAsks[id]
-					if ok {
-						delete(s.pendingAsks, id)
-					}
-					s.askMu.Unlock()
-					if ok {
-						cur.reply <- "" // timeout: empty fallback
-					}
+					s.timeoutAsk(id)
 				}()
 			}
 		}
 	}
-	if err := <-done; err != nil {
-		if errors.Is(err, context.Canceled) {
-			finalStatus = "stopped"
-		}
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
+	runErr := <-done
+	if errors.Is(runErr, context.Canceled) {
+		finalStatus = "stopped"
 	}
 	updated := s.loop.History()
-	for i := len(history) + 1; i < len(updated); i++ {
-		if err := s.store.AppendMessage(body.SessionID, updated[i]); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to persist response")
-			return
-		}
+	// The cursor already points at the latest durable compaction checkpoint
+	// when one occurred. AppendHistoryTail therefore writes only messages
+	// produced after it, while still falling back to history_replace for any
+	// other same-length prefix rewrite. Persist before handling Run errors so
+	// completed tool rounds and orphan repairs survive cancellation/failure.
+	persistErr := s.store.AppendHistoryTail(body.SessionID, updated, &historyCursor)
+	if persistErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist turn history")
+		return
+	}
+	if runErr != nil {
+		writeError(w, http.StatusBadGateway, runErr.Error())
+		return
 	}
 	finalStatus = "completed"
 	writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text.String()})
@@ -1535,6 +1583,22 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"resolved": true})
 }
 
+func (s *Server) takePendingAsk(id string) (*askPending, bool) {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	pending, ok := s.pendingAsks[id]
+	if ok {
+		delete(s.pendingAsks, id)
+	}
+	return pending, ok
+}
+
+func (s *Server) timeoutAsk(id string) {
+	if pending, ok := s.takePendingAsk(id); ok {
+		pending.reply <- "" // timeout: empty fallback
+	}
+}
+
 // handleAsk resolves one queued AskUser question with the user's answer.
 func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1549,12 +1613,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	s.askMu.Lock()
-	pending, ok := s.pendingAsks[body.ID]
-	if ok {
-		delete(s.pendingAsks, body.ID)
-	}
-	s.askMu.Unlock()
+	pending, ok := s.takePendingAsk(body.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "question expired or already answered")
 		return
@@ -2058,6 +2117,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	contextUsed, contextWindow := 0, 0
 	compactThreshold := 0.0
+	compactAtTokens := 0
 	toolNames := make([]string, 0)
 	if s.loop != nil {
 		contextUsed = s.loop.EstimateContextTokens()
@@ -2071,6 +2131,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.loop.Compactor != nil {
 			compactThreshold = s.loop.Compactor.Config.Threshold
+			compactAtTokens = s.loop.Compactor.TriggerTokens()
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2078,7 +2139,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"agents": agentDetails, "jobs": jobDetails,
 		"toolCount": len(toolNames), "tools": toolNames,
 		"contextUsed": contextUsed, "contextWindow": contextWindow, "compactThreshold": compactThreshold,
-		"build": s.buildVersion,
+		"compactAtTokens": compactAtTokens,
+		"build":           s.buildVersion,
 	})
 }
 

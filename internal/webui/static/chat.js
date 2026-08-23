@@ -57,6 +57,9 @@ function connectEvents() {
   onLive('tokens', handleTokensEvent);
   onLive('context_warn', d => handleContextEvent(d));
   onLive('context_compacted', d => handleContextEvent(d, true));
+  onLive('compaction_start', handleCompactionStart);
+  onLive('compaction_progress', handleCompactionProgress);
+  onLive('compaction_end', handleCompactionEnd);
   onLive('ask_user', handleAskUser);
   onLive('redacted_thinking', () => handleRedactedThinking());
   onLive('permission_request', handlePermissionRequest);
@@ -184,6 +187,7 @@ function appendThinkingRow(text, options = {}) {
 // Thinking disclosure (DSH ReasoningRow parity): collapsed "Think" row that
 // accumulates reasoning deltas, with a sweep shimmer while running.
 function handleThinkingDelta(d) {
+  if (turnStartMs && !turnFirstTokenMs) turnFirstTokenMs = Date.now();
   if (!thinkingEl) {
     thinkStartMs = Date.now();
     thinkingEl = appendThinkingRow('', { running: true });
@@ -295,15 +299,18 @@ async function submitAskAnswer(answer) {
 }
 
 let turnStartMs = 0;
+let turnFirstTokenMs = 0;
 let turnInTokens = 0;
 let turnOutTokens = 0;
 let turnStatusEl = null;
 let turnStatusTimer = null;
+let compactionInFlight = false;
 
 // "Deep diving..." turn-level status (DSH TurnStatus parity): rides the
 // whole running turn and gains a clock after 15s.
 function beginTurnStatus() {
   turnStartMs = Date.now();
+  turnFirstTokenMs = 0;
   turnInTokens = 0;
   turnOutTokens = 0;
   const area = document.getElementById('chatArea');
@@ -329,21 +336,24 @@ function endTurnStatus() {
 // Per-turn StatsLine (DSH parity): Ran for / Input / Output / tok per s.
 function showTurnStatsLine() {
   if (turnStartMs) {
-    const outT = turnOutTokens;
     const ms = Date.now() - turnStartMs;
-    const tps = ms > 1000 ? Math.round(turnOutTokens / (ms / 1000)) : 0;
-    const now = new Date();
-    const hh = String(now.getHours()).padStart(2, '0');
-    const mm = String(now.getMinutes()).padStart(2, '0');
+    const generationMs = turnFirstTokenMs ? Math.max(1, Date.now() - turnFirstTokenMs) : ms;
+    const tps = generationMs > 1000 ? Math.round(turnOutTokens / (generationMs / 1000)) : 0;
+    const ttft = turnFirstTokenMs ? Math.max(0, turnFirstTokenMs - turnStartMs) : 0;
     const area = document.getElementById('chatArea');
-    area.insertAdjacentHTML('beforeend', `
-      <div class="stats-line">
-        <span>${hh}:${mm}</span>
-        <span class="sl-dot">\u00B7</span>
-        <span>\u7528\u65F6 ${fmtRunDur(ms)}</span>
-        ${tps ? `<span class="sl-dot">\u00B7</span><span>${tps} tok/s</span>` : ''}
-      </div>`);
+    const rows = area.querySelectorAll('.message-assistant .msg-actions');
+    const actions = rows.length ? rows[rows.length - 1] : null;
+    const metrics = `<span class="msg-metrics"><span class="msg-sep">\u00B7</span><span>${uiText('Ran for ', '用时 ')}${fmtRunDur(ms)}</span>${ttft ? `<span class="msg-sep">\u00B7</span><span>${uiText('First token ', '首 token ')}${fmtMs(ttft)}</span>` : ''}${tps ? `<span class="msg-sep">\u00B7</span><span>${tps} tok/s</span>` : ''}</span>`;
+    if (actions) {
+      const previous = actions.querySelector('.msg-metrics');
+      if (previous) previous.remove();
+      actions.insertAdjacentHTML('beforeend', metrics);
+      actions.classList.add('with-metrics');
+    } else {
+      area.insertAdjacentHTML('beforeend', `<div class="stats-line">${metrics}</div>`);
+    }
     turnStartMs = 0;
+    turnFirstTokenMs = 0;
     turnInTokens = 0;
     turnOutTokens = 0;
     autoScroll();
@@ -356,18 +366,65 @@ function handleTokensEvent(d) {
   pollStatus();
 }
 
+function setTurnStatusLabel(label) {
+  if (!turnStatusEl) return false;
+  if (turnStatusEl.firstChild && turnStatusEl.firstChild.nodeType === 3) {
+    turnStatusEl.firstChild.nodeValue = label;
+  } else {
+    turnStatusEl.insertAdjacentText('afterbegin', label);
+  }
+  return true;
+}
+
+function handleCompactionStart() {
+  compactionInFlight = true;
+  if (!setTurnStatusLabel(uiText('Compacting context…', '正在压缩上下文…'))) {
+    showToast(uiText('Compacting context…', '正在压缩上下文…'));
+  }
+}
+
+function handleCompactionProgress(d) {
+  if (!compactionInFlight) handleCompactionStart();
+  const bytes = Number(d.progressBytes) || 0;
+  const suffix = bytes >= 1024 ? ' · ' + Math.round(bytes / 1024) + ' KB' : '';
+  setTurnStatusLabel(uiText('Compacting context…', '正在压缩上下文…') + suffix);
+}
+
+function handleCompactionEnd(d) {
+  compactionInFlight = false;
+  setTurnStatusLabel('Deep diving...');
+  if (d.error) {
+    showToast(uiText('Context compaction failed: ', '上下文压缩失败：') + d.error);
+  }
+  pollStatus();
+}
+
 // Context injection / compaction disclosure rows (DSH ContextInjectionRow).
 function handleContextEvent(d, compacted) {
   const area = document.getElementById('chatArea');
   const text = d.info || '';
+  const before = Number(d.previousContextTokens) || 0;
+  const after = Number(d.contextTokens) || 0;
+  const reduction = compacted && before > 0 && after > 0
+    ? fmtTokens(before) + ' → ' + fmtTokens(after) + ' tokens'
+    : '';
+  const title = compacted
+    ? uiText('Conversation history compacted', '会话历史已压缩') + (reduction ? ' · ' + reduction : '')
+    : uiText('Context', '上下文');
+  const detail = [text, reduction].filter(Boolean).join('\n');
   area.insertAdjacentHTML('beforeend', `
     <div class="context-row">
       <div class="context-head" onclick="toggleContextRow(this)">
         <span class="context-chevron">\u25B8</span>
-        <span class="context-title">${compacted ? 'Context compacted' : 'Context'}</span>
+        <span class="context-title">${escHtml(title)}</span>
       </div>
-      <div class="context-body">${escHtml(text)}</div>
+      <div class="context-body">${escHtml(detail)}</div>
     </div>`);
+  // before/after describe the replaceable conversation history only. The
+  // status meter also includes fixed system/state/memory/tool-schema overhead,
+  // so never overwrite it with the smaller history number; refresh the
+  // authoritative full-request estimate instead.
+  if (compacted && after > 0) pollStatus();
   autoScroll();
 }
 
@@ -380,6 +437,7 @@ function toggleContextRow(head) {
 function handleTextDelta(d) {
   // The first answer token settles the preceding provider reasoning row.
   finishThinking();
+  if (turnStartMs && !turnFirstTokenMs) turnFirstTokenMs = Date.now();
   streamedTextThisTurn = true;
   if (!streaming) startStreamingMessage();
   streamingText += d.delta || '';
@@ -469,6 +527,7 @@ function beginUserTurn() {
 // new chat, and SSE reconnect so nothing from a previous session leaks
 // into the next (timer, pending question, tool details, thinking row).
 function resetTurnState() {
+  compactionInFlight = false;
   endTurnStatus();
   finishThinking();
   if (streamingEl) {
@@ -482,6 +541,7 @@ function resetTurnState() {
   toolDetails = {};
   selectedToolId = null;
   turnStartMs = 0;
+  turnFirstTokenMs = 0;
   turnInTokens = 0;
   turnOutTokens = 0;
   setTurnRunning(false);
@@ -731,6 +791,11 @@ function handleToolResult(d) {
     if (ok && name === 'Grep' && d.output) {
       renderSearchCard(chip, d.output, id);
     }
+    // Rich results use structured presentation metadata persisted beside the
+    // tool result. Never infer an Artifact from model-authored output text.
+    if (ok && d.presentation && typeof renderArtifactPresentation === 'function') {
+      renderArtifactPresentation(chip, d.presentation);
+    }
     if (toolDetails[id]) {
       toolDetails[id].output = d.output || '';
       toolDetails[id].elapsed = d.elapsedMs || 0;
@@ -902,6 +967,7 @@ function newChat() {
     return;
   }
   currentSessionId = null;
+  if (typeof resetArtifactsForSession === 'function') resetArtifactsForSession();
   queuedTurns = [];
   renderQueuedTurns();
   resetTurnState();
@@ -1219,6 +1285,9 @@ async function runTurnItem(item) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
     currentSessionId = data.sessionId;
+    if (typeof loadArtifactsForSession === 'function') {
+      await loadArtifactsForSession(currentSessionId, { rebuildCards: true, silent: true });
+    }
     // If the SSE stream rendered nothing this turn (e.g. an error or a
     // text-less reply), fall back to the server's returned text so the
     // user isn't left with a blank response area.
@@ -1240,23 +1309,46 @@ async function runTurnItem(item) {
   }
 }
 
+const MESSAGE_ACTION_ICONS = {
+  copy: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="11" height="11" rx="2.5"/><path d="M7 5V4.5A2.5 2.5 0 0 1 9.5 2H15a3 3 0 0 1 3 3v5.5a2.5 2.5 0 0 1-2.5 2.5H14"/></svg>',
+  branch: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5" cy="4" r="1.6"/><circle cx="15" cy="5" r="1.6"/><circle cx="15" cy="15" r="1.6"/><path d="M5 5.6v3.1A6.3 6.3 0 0 0 11.3 15h2.1M6.6 4h2.7A5.7 5.7 0 0 1 15 9.7v3.7"/></svg>',
+  feedback: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4.5h14v9H9l-4.5 3v-3H3z"/><path d="M6.5 8h7M6.5 10.5h4.5"/></svg>',
+  up: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.2 16.5H4.7A1.7 1.7 0 0 1 3 14.8V9.3a1.7 1.7 0 0 1 1.7-1.7h2.5zM7.2 8l3.3-5a1.5 1.5 0 0 1 2.7 1v3.1h2.3A1.8 1.8 0 0 1 17.2 9l-1 5.5a2.4 2.4 0 0 1-2.4 2H7.2z"/></svg>',
+  down: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.2 3.5H4.7A1.7 1.7 0 0 0 3 5.2v5.5a1.7 1.7 0 0 0 1.7 1.7h2.5zM7.2 12l3.3 5a1.5 1.5 0 0 0 2.7-1v-3.1h2.3A1.8 1.8 0 0 0 17.2 11l-1-5.5a2.4 2.4 0 0 0-2.4-2H7.2z"/></svg>',
+  done: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4.5 10 3.4 3.4L15.8 5.8"/></svg>',
+};
+
+function messageActionButton(icon, label, onclick) {
+  return `<button type="button" class="msg-btn" data-icon="${icon}" onclick="${onclick}" title="${escAttr(label)}" aria-label="${escAttr(label)}">${MESSAGE_ACTION_ICONS[icon]}</button>`;
+}
+
+function messageActionTime(date = new Date()) {
+  const lang = resolvedLanguage(desktopPreferences.language);
+  const options = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
+  return new Intl.DateTimeFormat(lang === 'en' ? 'en-US' : 'zh-CN', options).format(date);
+}
+
+function messageActionsMarkup(role, date = new Date()) {
+  const copy = messageActionButton('copy', uiText('Copy', '复制'), 'copyMessage(this)');
+  const branch = messageActionButton('branch', uiText('Branch from here', '从此处分支'), 'branchMessage(this)');
+  const feedback = messageActionButton('feedback', uiText('Add private feedback', '添加私密反馈'), 'feedbackMessage(this)');
+  const ratings = role === 'assistant'
+    ? messageActionButton('up', uiText('Good reply', '回答很好'), "rateMessage(this,'up')") + messageActionButton('down', uiText('Bad reply', '回答不好'), "rateMessage(this,'down')")
+    : '';
+  return `<div class="msg-actions">${copy}${ratings}${branch}${feedback}<span class="msg-time">${escHtml(messageActionTime(date))}</span></div>`;
+}
+
 function addMessage(role, content, remember = true, idx = -1) {
   if (remember) messages.push({ role, content, time: new Date() });
   const index = idx >= 0 ? idx : (remember ? messages.length - 1 : -1);
   const area = document.getElementById('chatArea');
-  const timeStr = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
   const idxAttr = index >= 0 ? ` data-idx="${index}"` : '';
 
   if (role === 'user') {
     area.insertAdjacentHTML('beforeend', `
       <div class="message message-user"${idxAttr}>
         <div class="message-bubble">${escHtml(content)}</div>
-        <div class="msg-actions">
-          <span class="msg-time">${timeStr}</span>
-          <button type="button" class="msg-btn" onclick="copyMessage(this)" title="Copy" aria-label="Copy message">&#128203;</button>
-          <button type="button" class="msg-btn" onclick="branchMessage(this)" title="Branch" aria-label="Branch from message">&#9850;</button>
-          <button type="button" class="msg-btn" onclick="feedbackMessage(this)" title="Feedback" aria-label="Send message feedback">&#9998;</button>
-        </div>
+        ${messageActionsMarkup('user')}
       </div>`);
   } else {
     area.insertAdjacentHTML('beforeend', `
@@ -1264,14 +1356,7 @@ function addMessage(role, content, remember = true, idx = -1) {
         <div class="message-avatar">M</div>
         <div class="message-body">
           <div class="message-content">${formatContent(content)}</div>
-          <div class="msg-actions">
-            <span class="msg-time">${timeStr}</span>
-            <button type="button" class="msg-btn" onclick="copyMessage(this)" title="Copy" aria-label="Copy message">&#128203;</button>
-            <button type="button" class="msg-btn" onclick="branchMessage(this)" title="Branch" aria-label="Branch from message">&#9850;</button>
-            <button type="button" class="msg-btn" onclick="feedbackMessage(this)" title="Feedback" aria-label="Send message feedback">&#9998;</button>
-            <button type="button" class="msg-btn" onclick="rateMessage(this,\'up\')" title="Good reply" aria-label="Rate reply as good">&#128077;</button>
-            <button type="button" class="msg-btn" onclick="rateMessage(this,\'down\')" title="Bad reply" aria-label="Rate reply as bad">&#128078;</button>
-          </div>
+          ${messageActionsMarkup('assistant')}
         </div>
       </div>`);
   }
@@ -1286,13 +1371,7 @@ function attachMessageActions(el, idx) {
   el.setAttribute('data-idx', String(idx));
   const body = el.querySelector('.message-body');
   if (!body || body.querySelector('.msg-actions')) return;
-  const timeStr = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-  body.insertAdjacentHTML('beforeend', `
-    <div class="msg-actions">
-      <span class="msg-time">${timeStr}</span>
-      <button type="button" class="msg-btn" onclick="copyMessage(this)" title="Copy" aria-label="Copy message">&#128203;</button>
-      <button type="button" class="msg-btn" onclick="branchMessage(this)" title="Branch" aria-label="Branch from message">&#9850;</button>
-    </div>`);
+  body.insertAdjacentHTML('beforeend', messageActionsMarkup('assistant'));
 }
 
 function copyMessage(btn) {
@@ -1302,8 +1381,8 @@ function copyMessage(btn) {
   const text = src.textContent;
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(() => {
-      btn.textContent = '\u2713';
-      setTimeout(() => { btn.textContent = '\uD83D\uDCCB'; }, 1200);
+      btn.innerHTML = MESSAGE_ACTION_ICONS.done;
+      setTimeout(() => { btn.innerHTML = MESSAGE_ACTION_ICONS[btn.dataset.icon] || MESSAGE_ACTION_ICONS.copy; }, 1200);
     }, () => {});
   }
 }
@@ -1324,8 +1403,8 @@ async function feedbackMessage(btn) {
       body: JSON.stringify({ sessionId: currentSessionId, kind: 'remark', text: (idx ? '(msg ' + idx + ') ' : '') + text }),
     });
     if (!res.ok) throw new Error('feedback: ' + res.status);
-    btn.textContent = '\u2713';
-    setTimeout(() => { btn.textContent = '\u270E'; }, 1200);
+    btn.innerHTML = MESSAGE_ACTION_ICONS.done;
+    setTimeout(() => { btn.innerHTML = MESSAGE_ACTION_ICONS.feedback; }, 1200);
     showToast('Feedback recorded');
   } catch (e) {
     showToast('Feedback failed: ' + e.message);
@@ -1420,7 +1499,15 @@ function renderHistoryMessages(history) {
           : (b.content != null ? JSON.stringify(b.content) : '');
         const det = toolDetails[b.tool_use_id] || {};
         try {
-          handleToolResult({ tool: det.name || 'tool', id: b.tool_use_id, output: out, isError: !!b.is_error, elapsedMs: 0 });
+          handleToolResult({
+            tool: det.name || 'tool',
+            id: b.tool_use_id,
+            output: out,
+            isError: !!b.is_error,
+            elapsedMs: 0,
+            display: b.display,
+            presentation: b.presentation
+          });
         } catch (e) { /* skip */ }
       }
     });
@@ -1656,6 +1743,8 @@ const COMPOSER_COMMANDS = [
   { name: '/compact', label: 'Compact history', hint: 'Summarize older context now', category: 'Session' },
   { name: '/export', label: 'Export session log', hint: 'Write the current transcript to a file', category: 'Session' },
   { name: '/feedback', label: 'Record feedback', hint: 'Save a private log-only note', category: 'Session' },
+  { name: '/artifact', label: 'Create or update artifact', hint: 'Ask the agent to build a durable local HTML artifact', category: 'Artifact' },
+  { name: '/artifacts', label: 'Open artifacts', hint: 'Browse artifacts saved with this session', category: 'Artifact' },
   { name: '/goal', label: 'Set or view goal', hint: 'Track a durable long-running objective', category: 'Workflow' },
   { name: '/plan', label: 'Plan mode', hint: 'Enter or leave read-only planning', category: 'Mode' },
   { name: '/permission', label: 'Permission mode', hint: 'Choose the execution approval policy', category: 'Mode' },
@@ -1923,6 +2012,14 @@ async function executeComposerCommand(text) {
       break;
     case '/compact': await compactCurrentSession(input); break;
     case '/export': await exportSession(); break;
+    case '/artifacts': openArtifactsPanel(); break;
+    case '/artifact':
+      // A request body intentionally continues through the normal model turn:
+      // the model-facing Artifact tool owns creation and versioning. With no
+      // body, use the local gallery as the most useful read-only default.
+      if (!input) openArtifactsPanel();
+      else return false;
+      break;
     case '/feedback':
       if (input) await recordComposerFeedback(input);
       else openComposerActionDialog('feedback', document.getElementById('inputField'));
@@ -2418,9 +2515,9 @@ let settingsCache = null;
 let providersCache = null;
 let presetsCache = null;
 let pluginsCache = null;
-let pluginCatalogCache = { marketplaces: [], plugins: [], needsSync: false };
+let pluginCatalogCache = { ecosystems: [], marketplaces: [], plugins: [], needsSync: false };
 let pluginCatalogQuery = '';
-let pluginMarketplaceFilter = 'all';
+let pluginEcosystemFilter = 'all';
 const PLUGIN_CATALOG_PAGE_SIZE = 60;
 let pluginCatalogLimit = PLUGIN_CATALOG_PAGE_SIZE;
 let pluginCatalogSyncAttempted = false;
@@ -2975,25 +3072,27 @@ async function openPresetDirectory() {
 function renderPluginsTab() {
   return `<h2 id="pluginsSettingsTitle">${uiText('Plugins', '插件')}</h2>
     <div class="plugin-settings" aria-labelledby="pluginsSettingsTitle">
-      <div class="plugin-intro">${uiText('Discover extensions from registered marketplaces or manage installed plugins. Manifests are inspected without starting plugin subprocesses or exposing environment values.', '从已注册的商场发现扩展，或管理已安装插件。读取清单时不会启动插件子进程，也不会暴露环境变量。')}</div>
+      <div class="plugin-intro">${uiText('METIS connects plugin ecosystems through explicit compatibility bridges. Package formats and runtime components are inspected separately from catalog sources, so a foreign runtime is never presented as a native plugin.', 'METIS 通过明确的兼容桥接接入不同插件生态。包格式、运行时组件与内容来源会分开检查，不再把外部运行时伪装成原生插件。')}</div>
       <div class="plugin-tabs" role="tablist" aria-label="${uiText('Plugin views', '插件视图')}">
         <button type="button" class="plugin-tab active" id="pluginMarketplaceTab" role="tab" aria-selected="true" aria-controls="pluginMarketplacePanel" onclick="switchPluginView('marketplace', this)" onkeydown="pluginTabKeydown(event)">${uiText('Marketplace', '插件商场')}</button>
         <button type="button" class="plugin-tab" id="pluginInstalledTab" role="tab" aria-selected="false" aria-controls="pluginInstalledPanel" tabindex="-1" onclick="switchPluginView('installed', this)" onkeydown="pluginTabKeydown(event)">${uiText('Installed', '已安装')} <span class="plugin-count" id="installedPluginCount">0</span></button>
       </div>
       <section class="plugin-panel" id="pluginMarketplacePanel" role="tabpanel" aria-labelledby="pluginMarketplaceTab">
+        <div class="plugin-ecosystem-heading"><div><h3>${uiText('Ecosystem compatibility', '生态兼容层')}</h3><p>${uiText('Choose an ecosystem to inspect what METIS can run, translate, or must leave in its original runtime.', '选择一个生态，查看 METIS 可以原生运行、转换，或必须留在原运行时中的组件。')}</p></div></div>
+        <div id="pluginEcosystemGrid" class="plugin-ecosystem-grid" aria-live="polite"></div>
         <div class="plugin-toolbar">
           <label class="plugin-search">
             <span aria-hidden="true">&#8981;</span>
             <span class="visually-hidden">${uiText('Search marketplace plugins', '搜索商场插件')}</span>
             <input type="search" name="plugin-marketplace-search" autocomplete="off" aria-label="${uiText('Search marketplace plugins', '搜索商场插件')}" placeholder="${uiText('Search plugins…', '搜索插件…')}" oninput="filterPluginCatalog(this.value)">
           </label>
-          <label class="visually-hidden" for="pluginMarketplaceSelect">${uiText('Marketplace source', '商场来源')}</label>
-          <select id="pluginMarketplaceSelect" class="plugin-market-select" name="plugin-marketplace" aria-label="${uiText('Marketplace source', '商场来源')}" onchange="choosePluginMarketplace(this.value)">
-            <option value="all">${uiText('All marketplaces', '全部商场')}</option>
+          <label class="visually-hidden" for="pluginEcosystemSelect">${uiText('Plugin ecosystem', '插件生态')}</label>
+          <select id="pluginEcosystemSelect" class="plugin-market-select" name="plugin-ecosystem" aria-label="${uiText('Plugin ecosystem', '插件生态')}" onchange="choosePluginEcosystem(this.value)">
+            <option value="all">${uiText('All ecosystems', '全部生态')}</option>
           </select>
           <button type="button" class="plugin-refresh" id="pluginRefreshBtn" onclick="refreshPluginCatalog()" aria-label="${uiText('Sync marketplace catalogs', '同步插件商场目录')}"><span aria-hidden="true">&#8635;</span> ${uiText('Sync', '同步')}</button>
         </div>
-        <div id="pluginMarketplaceSources" class="plugin-sources" aria-label="${uiText('Registered marketplaces', '已注册商场')}"></div>
+        <details class="plugin-source-details"><summary>${uiText('Catalog sources', '内容来源')}</summary><div id="pluginMarketplaceSources" class="plugin-sources" aria-label="${uiText('Registered catalog sources', '已注册内容来源')}"></div></details>
         <div id="pluginCatalogStatus" class="plugin-status" aria-live="polite"></div>
         <div class="plugin-catalog-heading"><h3>${uiText('Available plugins', '可用插件')}</h3><span id="pluginCatalogCount">0</span></div>
         <div id="pluginCatalogList" class="plugin-grid" aria-busy="true"><div class="plugin-empty">${uiText('Loading marketplace…', '正在加载插件商场…')}</div></div>
@@ -3094,30 +3193,120 @@ function filterPluginCatalog(value) {
   paintPluginCatalog();
 }
 
-function choosePluginMarketplace(value) {
-  pluginMarketplaceFilter = value || 'all';
+function choosePluginEcosystem(value) {
+  pluginEcosystemFilter = value || 'all';
   pluginCatalogLimit = PLUGIN_CATALOG_PAGE_SIZE;
   paintPluginCatalog();
 }
 
+function pluginMarketplaceMark(market) {
+  const ecosystem = String(market && market.ecosystem || '').toLocaleLowerCase();
+  const label = ecosystem === 'codex' ? 'O' : (ecosystem === 'claude' ? 'A' : String(market && (market.displayName || market.name) || '?').charAt(0).toLocaleUpperCase());
+  return `<span class="plugin-ecosystem-mark ${escAttr(ecosystem || 'other')}" aria-hidden="true">${escHtml(label)}</span>`;
+}
+
+function pluginEcosystemOptions(ecosystems) {
+  return ecosystems.map(ecosystem => `<option value="${escAttr(ecosystem.id)}">${escHtml(ecosystem.displayName || ecosystem.id)}${Number(ecosystem.packageCount || 0) ? ' · ' + Number(ecosystem.packageCount).toLocaleString() : ''}</option>`).join('');
+}
+
+function pluginEcosystemClass(id) {
+  if (id === 'deepseek-harness') return 'deepseek';
+  return id || 'other';
+}
+
+function pluginEcosystemLetter(id) {
+  if (id === 'codex') return 'O';
+  if (id === 'deepseek-harness') return 'D';
+  if (id === 'metis') return 'M';
+  if (id === 'claude') return 'A';
+  return '?';
+}
+
+function renderPluginEcosystems(ecosystems) {
+  const grid = document.getElementById('pluginEcosystemGrid');
+  if (!grid) return;
+  grid.innerHTML = ecosystems.map(ecosystem => {
+    const active = pluginEcosystemFilter === ecosystem.id;
+    const components = (ecosystem.components || []).map(component => `<span class="plugin-component ${escAttr(component.support || 'external')}" title="${escAttr(component.detail || '')}"><strong>${escHtml(component.kind || '')}</strong><small>${escHtml(component.support || '')}</small></span>`).join('');
+    return `<button type="button" class="plugin-ecosystem-card${active ? ' active' : ''}" onclick="choosePluginEcosystem('${escOnclick(ecosystem.id)}')" aria-pressed="${active ? 'true' : 'false'}">
+      <span class="plugin-ecosystem-mark ${escAttr(pluginEcosystemClass(ecosystem.id))}" aria-hidden="true">${escHtml(pluginEcosystemLetter(ecosystem.id))}</span>
+      <span class="plugin-ecosystem-copy"><span class="plugin-ecosystem-title"><strong>${escHtml(ecosystem.displayName || ecosystem.id)}</strong><small class="${escAttr(ecosystem.status || '')}">${escHtml(ecosystem.status || '')}</small></span><span>${escHtml(ecosystem.description || '')}</span><span class="plugin-component-row">${components}</span></span>
+    </button>`;
+  }).join('');
+}
+
+function pluginCardIcon(plugin) {
+  const displayName = plugin.displayName || plugin.name || '?';
+  const fallback = escHtml(displayName.charAt(0).toLocaleUpperCase());
+  const style = plugin.brandColor ? ` style="--plugin-brand:${escAttr(plugin.brandColor)}"` : '';
+  return `<span class="plugin-card-icon"${style}>${plugin.icon ? `<img src="${escAttr(plugin.icon)}" alt="" loading="lazy" onerror="this.remove()">` : ''}<span aria-hidden="true">${fallback}</span></span>`;
+}
+
+function pluginCompatibilityLabel(plugin) {
+  if (plugin.compatibility === 'native') return uiText('METIS native', 'METIS 原生');
+  if (plugin.compatibility === 'skills') return uiText('Skills compatible', 'Skills 兼容');
+  if (plugin.compatibility === 'translated') return uiText('Runtime translated', '运行时已转换');
+  if (plugin.compatibility === 'partial') return uiText('Portable parts only', '仅导入可移植部分');
+  if (plugin.compatibility === 'remote') return uiText('Checked on install', '安装时检查');
+  if (plugin.compatibility === 'external') return uiText('Original runtime', '保留在原运行时');
+  return uiText('Runtime required', '需要原运行时');
+}
+
+function pluginSearchText(plugin) {
+  let text = [plugin.name, plugin.displayName, plugin.packageName, plugin.description, plugin.developer, plugin.category, plugin.marketplace, plugin.ecosystem, (plugin.keywords || []).join(' '), (plugin.capabilities || []).join(' '), (plugin.skills || []).join(' ')].join(' ').toLocaleLowerCase();
+  if (/(ppt|pptx|powerpoint|presentation|slide|deck)/.test(text)) text += ' ppt pptx powerpoint presentation slides deck 幻灯片 演示文稿';
+  return text;
+}
+
+function pluginSearchScore(plugin, query) {
+  if (!query) return 0;
+  const name = String(plugin.name || '').toLocaleLowerCase();
+  const displayName = String(plugin.displayName || '').toLocaleLowerCase();
+  const description = String(plugin.description || '').toLocaleLowerCase();
+  const keywords = (plugin.keywords || []).join(' ').toLocaleLowerCase();
+  const skills = (plugin.skills || []).join(' ').toLocaleLowerCase();
+  let score = name === query ? 600 : (name.startsWith(query) ? 500 : (name.includes(query) ? 420 : 0));
+  if (displayName === query) score += 500;
+  else if (displayName.includes(query)) score += 360;
+  if (keywords.split(/\s+/).includes(query)) score += 320;
+  else if (keywords.includes(query)) score += 260;
+  if (skills.includes(query)) score += 180;
+  if (description.includes(query)) score += 140;
+  if (/^(ppt|pptx|powerpoint|presentation|presentations|slide|slides|deck|decks|幻灯片|演示文稿)$/.test(query)) {
+    const officeTerms = /(ppt|pptx|powerpoint|presentation|slide|deck)/;
+    if (officeTerms.test(name)) score += 520;
+    if (officeTerms.test(displayName)) score += 400;
+    if (officeTerms.test(keywords)) score += 300;
+    if (officeTerms.test(description)) score += 160;
+    if (officeTerms.test(skills)) score += 120;
+  }
+  return score;
+}
+
 function paintPluginCatalog() {
-  const catalog = pluginCatalogCache || { marketplaces: [], plugins: [] };
+  const catalog = pluginCatalogCache || { ecosystems: [], marketplaces: [], plugins: [] };
+  const ecosystems = Array.isArray(catalog.ecosystems) ? catalog.ecosystems : [];
   const markets = Array.isArray(catalog.marketplaces) ? catalog.marketplaces : [];
   const plugins = Array.isArray(catalog.plugins) ? catalog.plugins : [];
-  const select = document.getElementById('pluginMarketplaceSelect');
+  const select = document.getElementById('pluginEcosystemSelect');
   if (select) {
-    const current = pluginMarketplaceFilter;
-    select.innerHTML = '<option value="all">' + uiText('All marketplaces', '全部商场') + '</option>' + markets.map(m => '<option value="' + escAttr(m.name) + '">' + escHtml(m.name) + '</option>').join('');
-    select.value = markets.some(m => m.name === current) ? current : 'all';
-    pluginMarketplaceFilter = select.value;
+    const current = pluginEcosystemFilter;
+    select.innerHTML = '<option value="all">' + uiText('All ecosystems', '全部生态') + '</option>' + pluginEcosystemOptions(ecosystems);
+    select.value = ecosystems.some(item => item.id === current) ? current : 'all';
+    pluginEcosystemFilter = select.value;
   }
+  renderPluginEcosystems(ecosystems);
   const sources = document.getElementById('pluginMarketplaceSources');
-  if (sources) sources.innerHTML = markets.map(m => `<button type="button" class="plugin-source${pluginMarketplaceFilter === m.name ? ' active' : ''}" onclick="choosePluginMarketplace('${escOnclick(m.name)}')" aria-pressed="${pluginMarketplaceFilter === m.name ? 'true' : 'false'}"><span class="plugin-source-dot ${m.error ? 'error' : (m.synced ? 'ready' : '')}" aria-hidden="true"></span><span>${escHtml(m.name)}</span><small>${m.synced ? Number(m.pluginCount || 0).toLocaleString() : (pluginCatalogSyncing ? uiText('Syncing…', '同步中…') : uiText('Not synced', '未同步'))}</small></button>`).join('');
+  if (sources) sources.innerHTML = markets.map(m => `<span class="plugin-source" title="${escAttr(m.description || m.name)}">${pluginMarketplaceMark(m)}<span>${escHtml(m.displayName || m.name)}</span><small>${m.synced ? Number(m.pluginCount || 0).toLocaleString() : (pluginCatalogSyncing ? uiText('Syncing…', '同步中…') : uiText('Not synced', '未同步'))}</small></span>`).join('');
   const filtered = plugins.filter(p => {
-    if (pluginMarketplaceFilter !== 'all' && p.marketplace !== pluginMarketplaceFilter) return false;
+    if (pluginEcosystemFilter !== 'all' && p.ecosystem !== pluginEcosystemFilter) return false;
     if (!pluginCatalogQuery) return true;
-    return [p.name, p.description, p.marketplace, (p.skills || []).join(' ')].join(' ').toLocaleLowerCase().includes(pluginCatalogQuery);
+    return pluginSearchText(p).includes(pluginCatalogQuery);
   }).sort((a, b) => {
+    if (pluginCatalogQuery) {
+      const relevance = pluginSearchScore(b, pluginCatalogQuery) - pluginSearchScore(a, pluginCatalogQuery);
+      if (relevance) return relevance;
+    }
     if (Boolean(a.installable) !== Boolean(b.installable)) return a.installable ? -1 : 1;
     return String(a.name || '').localeCompare(String(b.name || '')) || String(a.marketplace || '').localeCompare(String(b.marketplace || ''));
   });
@@ -3138,14 +3327,19 @@ function paintPluginCatalog() {
   const cards = visible.map(p => {
     const skillCount = Array.isArray(p.skills) ? p.skills.length : 0;
     const disabled = p.installed || !p.installable;
-    const label = p.installed ? uiText('Installed', '已安装') : (p.installable ? uiText('Install', '安装') : uiText('Unavailable', '暂不可用'));
+    const installLabel = p.compatibility === 'remote' ? uiText('Inspect & install', '检查并安装') : ((p.compatibility === 'skills' || p.compatibility === 'partial') ? uiText('Import portable parts', '导入可移植部分') : uiText('Install', '安装'));
+    const label = p.installed ? uiText('Installed', '已安装') : (p.installable ? installLabel : uiText('Unavailable', '暂不可用'));
     const reason = p.unavailableReason || '';
+    const ecosystem = ecosystems.find(item => item.id === p.ecosystem);
+    const origin = (markets.find(m => m.name === p.marketplace) || {}).displayName || (p.packageName ? p.packageName : p.marketplace);
+    const components = (p.components || []).map(component => `<span class="plugin-mini-component ${escAttr(component.support || '')}" title="${escAttr(component.detail || '')}">${escHtml(component.kind || '')}</span>`).join('');
     return `<article class="plugin-card marketplace-card">
-      <div class="plugin-card-top"><div class="plugin-title-wrap"><h4 title="${escAttr(p.name)}">${escHtml(p.name)}</h4></div><span class="plugin-market-badge">${escHtml(p.marketplace)}</span></div>
+      ${pluginCardIcon(p)}<div class="plugin-card-main"><div class="plugin-card-top"><div class="plugin-title-wrap"><h4 title="${escAttr(p.name)}">${escHtml(p.displayName || p.name)}</h4>${p.version ? '<span class="plugin-version">' + escHtml(p.version) + '</span>' : ''}</div><span class="plugin-market-badge">${escHtml((ecosystem || {}).displayName || p.ecosystem || 'METIS')}</span></div>
       <p class="plugin-description">${escHtml(p.description || uiText('No description provided.', '暂无插件说明。'))}</p>
-      <div class="plugin-meta">${skillCount ? skillCount + ' ' + uiText(skillCount === 1 ? 'skill' : 'skills', '个技能') : uiText('Plugin bundle', '插件包')} · ${escHtml(p.sourceKind || uiText('unknown source', '未知来源'))}</div>
-      <div class="plugin-card-footer"><span class="plugin-availability" title="${escAttr(reason)}">${disabled && !p.installed ? escHtml(reason) : ''}</span><button type="button" class="plugin-install" ${disabled ? 'disabled' : ''} onclick="installPlugin('${escOnclick(p.name)}','${escOnclick(p.marketplace)}',this)">${label}</button></div>
-    </article>`;
+      <div class="plugin-meta">${p.category ? escHtml(p.category) + ' · ' : ''}${pluginCompatibilityLabel(p)}${skillCount ? ' · ' + skillCount + ' ' + uiText(skillCount === 1 ? 'skill' : 'skills', '个技能') : ''}${p.developer ? ' · ' + escHtml(p.developer) : ''}</div>
+      <div class="plugin-component-mini-row">${components}</div>
+      <div class="plugin-card-footer"><span class="plugin-availability" title="${escAttr(reason || origin)}">${disabled && !p.installed ? escHtml(reason) : escHtml(origin)}</span><button type="button" class="plugin-install" ${disabled ? 'disabled' : ''} onclick="installPlugin('${escOnclick(p.name)}','${escOnclick(p.marketplace)}',this)">${label}</button></div>
+      </div></article>`;
   }).join('');
   const remaining = filtered.length - visible.length;
   list.innerHTML = cards + (remaining > 0 ? `<div class="plugin-catalog-more"><button type="button" onclick="showMorePluginCatalog()">${uiText('Show more', '显示更多')}</button><span>${remaining.toLocaleString()} ${uiText('remaining', '个待显示')}</span></div>` : '');
@@ -3168,7 +3362,17 @@ async function refreshPluginCatalog(options) {
     ? uiText('Loading all registered marketplaces…', '正在加载全部已注册插件商场…')
     : uiText('Syncing marketplace catalogs…', '正在同步插件商场目录…');
   try {
-    const requested = options.all || pluginMarketplaceFilter === 'all' ? [] : [pluginMarketplaceFilter];
+    const requested = options.all || pluginEcosystemFilter === 'all' ? [] : (pluginCatalogCache.marketplaces || []).filter(market => market.ecosystem === pluginEcosystemFilter).map(market => market.name);
+    if (!options.all && pluginEcosystemFilter !== 'all' && requested.length === 0) {
+      const local = await fetch('/api/plugins/catalog');
+      const localCatalog = await local.json();
+      if (!local.ok) throw new Error(localCatalog.error || 'local ecosystem refresh failed');
+      pluginCatalogCache = localCatalog;
+      pluginCatalogLimit = PLUGIN_CATALOG_PAGE_SIZE;
+      paintPluginCatalog();
+      if (status) status.textContent = uiText('Local ecosystem profiles rescanned.', '已重新扫描本地生态配置。');
+      return;
+    }
     const res = await fetch('/api/plugins/catalog/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ marketplaces: requested }) });
     const data = await res.json();
     if (data.catalog) {
@@ -3199,13 +3403,21 @@ function removePlugin(name, trigger) {
 function openPluginActionDialog(action, name, marketplace, trigger) {
   closePluginActionDialog(true);
   const installing = action === 'install';
+  const catalogPlugin = installing ? (pluginCatalogCache.plugins || []).find(p => p.name === name && p.marketplace === marketplace) : null;
+  const partial = catalogPlugin && catalogPlugin.compatibility === 'partial';
+  const remote = catalogPlugin && catalogPlugin.compatibility === 'remote';
+  const installDescription = partial
+    ? uiText('METIS will import the compatible skill files only. This plugin references Codex apps or runtime tools, so some workflows may remain unavailable after restart.', 'METIS 只会导入兼容的 Skill 文件。该插件引用了 Codex App 或专用运行时工具，重启后仍可能有部分流程不可用。')
+    : (remote
+      ? uiText('METIS will fetch the pinned HTTPS Git source, inspect it, reject unsafe paths or symlinks, and install only if it contains a native manifest or compatible skills.', 'METIS 将获取已锁定的 HTTPS Git 源，检查内容并拒绝越界路径或符号链接；只有包含原生清单或兼容 Skills 时才会安装。')
+      : uiText('METIS will copy this extension from the registered marketplace. Review the source before enabling it; installed plugins may add tools, skills, hooks, or subprocesses after restart.', 'METIS 将从已注册商场复制此扩展。启用前请确认来源；重启后，插件可能增加工具、技能、钩子或子进程。'));
   const overlay = document.createElement('div');
   overlay.className = 'plugin-action-overlay';
   overlay.innerHTML = `<div class="plugin-action-dialog" role="alertdialog" aria-modal="true" aria-labelledby="pluginActionTitle" aria-describedby="pluginActionDescription">
     <div class="plugin-action-icon" aria-hidden="true">${installing ? '&#129513;' : '&#128465;'}</div>
     <div class="plugin-action-copy"><h3 id="pluginActionTitle">${installing ? uiText('Install plugin?', '安装这个插件？') : uiText('Remove plugin?', '移除这个插件？')}</h3>
       <p class="plugin-action-name">${escHtml(name)}</p>
-      <p id="pluginActionDescription">${installing ? uiText('METIS will copy this extension from the registered marketplace. Review the source before enabling it; installed plugins may add tools, skills, hooks, or subprocesses after restart.', 'METIS 将从已注册商场复制此扩展。启用前请确认来源；重启后，插件可能增加工具、技能、钩子或子进程。') : uiText('The plugin will be moved to METIS trash and stop loading after Desktop restarts. It can be recovered manually from the returned trash path.', '插件将移动到 METIS 回收目录，并在 Desktop 重启后停止加载；仍可从返回的回收路径手动恢复。')}</p>
+      <p id="pluginActionDescription">${installing ? installDescription : uiText('The plugin will be moved to METIS trash and stop loading after Desktop restarts. It can be recovered manually from the returned trash path.', '插件将移动到 METIS 回收目录，并在 Desktop 重启后停止加载；仍可从返回的回收路径手动恢复。')}</p>
       <p class="plugin-action-source">${installing ? uiText('Source: ', '来源：') + escHtml(marketplace) : ''}</p><p class="plugin-action-error" role="alert" aria-live="assertive" hidden></p></div>
     <div class="plugin-action-buttons"><button type="button" class="plugin-action-cancel">${uiText('Cancel', '取消')}</button><button type="button" class="plugin-action-confirm ${installing ? '' : 'danger'}">${installing ? uiText('Install plugin', '安装插件') : uiText('Remove plugin', '移除插件')}</button></div>
   </div>`;

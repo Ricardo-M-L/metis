@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>Metis</title>
     <style>
-        html, body { margin: 0; height: 100%; background: #151517; }
+        html, body { margin: 0; height: 100%; background: #151517; overflow: hidden; }
         #boot {
             height: 100%;
             display: flex;
@@ -15,10 +15,12 @@
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif;
             font-size: 14px;
         }
+        #metis-frame { display: none; width: 100%; height: 100%; border: 0; background: #151517; }
     </style>
 </head>
 <body>
 <div id="boot"><span id="boot-status">正在启动 Metis…</span></div>
+<iframe id="metis-frame" title="Metis Desktop"></iframe>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>

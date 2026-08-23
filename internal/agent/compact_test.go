@@ -130,30 +130,12 @@ func TestCompact_ProducesBoundaryWithSummary(t *testing.T) {
 	if p.calls != 1 {
 		t.Errorf("expected 1 summarize call, got %d", p.calls)
 	}
-	// Layout: 1 sys + 12 mid (alternating user/asst, last is asst @ msgs[12])
-	// + 3 recent asst (msgs[13..15]) = 16 total.
-	//
-	// keepLast (msgs[13:16]) is purely assistant → 2026-05-13 anchor
-	// fix detects "no user-text in keepLast" and pulls cut back to
-	// the last user-text msg (msgs[11] = "old user 5"). Post-compact
-	// keepLast becomes msgs[11:16] = 5 messages (1 user + 4 asst).
-	//
-	// Expect: 1 keepFirst + 1 boundary + 5 keepLast = 7.
-	//
-	// (Old behavior was 6 — keepFirst + boundary + synthetic-user-ack +
-	// 3 keepLast — because the pre-2026-05-13 slicer didn't preserve
-	// the active user prompt and the boundary asst → keepLast asst
-	// run required a synthetic ack to maintain user/asst alternation.
-	// New behavior is better: real user prompt survives verbatim,
-	// alternation is natural (boundary asst → keepLast user), no
-	// synthetic ack needed.)
-	//
-	// Boundary is RoleAssistant (not RoleSystem) — bug #10 2026-04-30:
-	// MiniMax + strict Anthropic reject mid-array system role with
-	// error 2013, so the boundary is rendered narratively as if the
-	// assistant said "I summarized our earlier conversation."
-	if len(out) != 7 {
-		t.Fatalf("expected 7 messages after compact (anchor preserves user-text), got %d", len(out))
+	// Unified retention is token/semantic based rather than an exact fixed
+	// count. It must reduce the transcript, begin with a synthetic user
+	// checkpoint followed by an assistant summary, and preserve the active
+	// request verbatim either in the tail or deterministic anchor.
+	if len(out) >= len(msgs) {
+		t.Fatalf("expected history reduction, got %d -> %d", len(msgs), len(out))
 	}
 	if out[1].Role != llm.RoleAssistant {
 		t.Errorf("boundary should be assistant role (mid-array system rejected by APIs), got %q", out[1].Role)
@@ -161,13 +143,8 @@ func TestCompact_ProducesBoundaryWithSummary(t *testing.T) {
 	if len(out[1].Content) == 0 || !strings.Contains(out[1].Content[0].Text, "MOCK_SUMMARY") {
 		t.Errorf("boundary missing summary, got: %v", out[1].Content)
 	}
-	// out[2] is keepLast[0] = msgs[11] = "old user 5" (USER role).
-	// Alternation is natural — no synthetic ack required.
-	if out[2].Role != llm.RoleUser {
-		t.Errorf("keepLast[0] (anchor-preserved user-text) expected at out[2], got role=%q", out[2].Role)
-	}
-	if len(out[2].Content) == 0 || !strings.Contains(out[2].Content[0].Text, "old user 5") {
-		t.Errorf("out[2] should be the active-task anchor msgs[11]; got %v", out[2].Content)
+	if !historyHasText(out, "old user 5") {
+		t.Errorf("active-task anchor old user 5 was lost: %#v", out)
 	}
 }
 
@@ -274,24 +251,7 @@ func TestCompact_ToolPairProtectsResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// After adjustment: keepFirst=1 + boundary=1(asst) + ack=1(user, since
-	// keepLast[0] is the tool_use which is asst-role) + keepLast=5 = 8.
-	if len(out) != 1+1+1+5 {
-		t.Fatalf("expected 8 messages after pair-aware compact, got %d", len(out))
-	}
-	// out[3] starts the kept tail (after keepFirst + boundary + ack);
-	// must be the tool_use, not an orphan tool_result.
-	tail := out[3]
-	hasToolUse := false
-	for _, b := range tail.Content {
-		if b.Type == "tool_use" {
-			hasToolUse = true
-			break
-		}
-	}
-	if !hasToolUse {
-		t.Errorf("kept tail should start with the tool_use (matching the preserved tool_result), got: %+v", tail)
-	}
+	assertBalancedToolPairs(t, out)
 }
 
 func TestCompact_NoOpWhenAdjustmentSwallowsMiddle(t *testing.T) {
@@ -439,48 +399,28 @@ func TestShouldCompact(t *testing.T) {
 // TestShouldCompact_AccountsForMaxTokens — repro of the user's MiniMax-M2.7
 // case in miniature: context window 1000, max_tokens 400, threshold 0.85.
 //
-// B3 (2026-08-02): the trigger is now MaxContextTokens × Threshold,
-// NOT effectiveInputCap × Threshold. The old "subtract max_tokens
-// from the denominator" formula was the root cause of BUG-B — it
-// made the displayed percentage (against MaxContextTokens) disagree
-// with the trigger percentage (against effectiveInputCap), and when
-// max_tokens was large it fired the compactor long before the real
-// cap was hit. Worse, when max_tokens was very large the trigger
-// could fire BEFORE the context was actually full, letting it grow
-// past the cap and produce "99%+ (224%)" in the footer (BUG-D).
-//
-// The new behaviour: 700 tokens on a 1000-cap model with 0.85
-// threshold does NOT compact (850 trigger). The next request will
-// hit the API with 700 + max_tokens, and the API will reject it if
-// over — that's the API's job, not the compactor's.
+// The trigger uses the effective input budget after reserving the configured
+// response allowance. This prevents the request from overflowing before a
+// nominal percentage of MaxContextTokens is reached.
 func TestShouldCompact_AccountsForMaxTokens(t *testing.T) {
 	p := &fakeSummarizer{}
 	c := NewCompactor(Config{Threshold: 0.85}, "m", 1000, p)
 	c.MaxOutputTokens = 400
 
-	// P1-3 (2026-08-02): don't rely on estimateTokens's envelope math
-	// (~12 tokens/message + 4 chars/token) to land at exactly ~700 or
-	// ~900 tokens — that couples the test to an implementation detail
-	// that can drift. Instead, push the message count high enough that
-	// we're clearly below / above the 850 trigger regardless of small
-	// envelope changes. 2000 chars ≈ 500 tokens (safely below 850);
-	// 5000 chars ≈ 1250 tokens (safely above 850).
-	below := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 2000))}
+	below := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 1200))}
 	if c.ShouldCompact(below) {
-		t.Errorf("B3: ~500 tokens should be safely below 850 trigger — should NOT compact")
+		t.Errorf("~300 tokens should be below effective trigger %d", c.TriggerTokens())
 	}
 
-	above := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 5000))}
+	above := []llm.Message{msg(llm.RoleUser, strings.Repeat("x", 3000))}
 	if !c.ShouldCompact(above) {
-		t.Errorf("B3: ~1250 tokens should be safely above 850 trigger — should compact")
+		t.Errorf("~750 tokens should be above effective trigger %d", c.TriggerTokens())
 	}
 
-	// MaxOutputTokens no longer affects the trigger — B3 makes the
-	// threshold MaxContextTokens-relative only. The legacy "shrink
-	// denominator by max_tokens" formula is gone.
+	// Removing the output reservation raises the trigger back to 850.
 	c.MaxOutputTokens = 0
 	if c.ShouldCompact(below) {
-		t.Errorf("B3: MaxOutputTokens=0 should not change the trigger — ~500 tokens still below 850")
+		t.Errorf("MaxOutputTokens=0: small history should remain below trigger %d", c.TriggerTokens())
 	}
 }
 
@@ -882,8 +822,8 @@ func TestDefaultCompactionConfig_KeepsMinimumTokensZero(t *testing.T) {
 	if cfg.MinimumTokens != 0 {
 		t.Errorf("DefaultCompactionConfig().MinimumTokens = %d, want 0 (package-level stays disabled; runtime/agent_loop.go injects production value from cfg.Session.AutoCompactMinimumTokens)", cfg.MinimumTokens)
 	}
-	if cfg.Threshold != 0.80 {
-		t.Errorf("DefaultCompactionConfig().Threshold = %v, want 0.80 (dropped from 0.95 on 2026-07-26 — large-window compaction was timing out)", cfg.Threshold)
+	if cfg.Threshold != 0.85 {
+		t.Errorf("DefaultCompactionConfig().Threshold = %v, want 0.85 (unified heavy checkpoint trigger)", cfg.Threshold)
 	}
 }
 

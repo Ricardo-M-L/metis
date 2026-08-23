@@ -118,7 +118,18 @@ func NewStdioTransport(ctx context.Context, command string, args ...string) (*St
 // metis process env plus the caller-supplied KEY=VAL overrides. nil/empty
 // `extraEnv` matches NewStdioTransport's behavior exactly.
 func NewStdioTransportWithEnv(ctx context.Context, command string, extraEnv []string, args ...string) (*StdioTransport, error) {
+	return NewStdioTransportWithEnvAndDir(ctx, command, extraEnv, "", args...)
+}
+
+// NewStdioTransportWithEnvAndDir is the plugin-aware stdio constructor. A
+// non-empty workingDir is assigned directly to exec.Cmd.Dir, which lets
+// translated Codex MCP bundles keep their package-relative commands and
+// assets without changing the process-wide working directory.
+func NewStdioTransportWithEnvAndDir(ctx context.Context, command string, extraEnv []string, workingDir string, args ...string) (*StdioTransport, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
+	if workingDir != "" {
+		cmd.Dir = workingDir
+	}
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
@@ -362,7 +373,13 @@ func NewStdioClient(ctx context.Context, command string, args ...string) (*Clien
 // `extraEnv` entries (KEY=VAL strings) are appended onto os.Environ()
 // for the spawned subprocess.
 func NewStdioClientWithEnv(ctx context.Context, command string, extraEnv []string, args ...string) (*Client, error) {
-	transport, err := NewStdioTransportWithEnv(ctx, command, extraEnv, args...)
+	return NewStdioClientWithEnvAndDir(ctx, command, extraEnv, "", args...)
+}
+
+// NewStdioClientWithEnvAndDir starts a stdio MCP server inside the declared
+// plugin working directory.
+func NewStdioClientWithEnvAndDir(ctx context.Context, command string, extraEnv []string, workingDir string, args ...string) (*Client, error) {
+	transport, err := NewStdioTransportWithEnvAndDir(ctx, command, extraEnv, workingDir, args...)
 	if err != nil {
 		return nil, err
 	}

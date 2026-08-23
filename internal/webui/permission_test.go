@@ -102,6 +102,38 @@ func TestAskResolve(t *testing.T) {
 	}
 }
 
+func TestAskTimeoutResolvesWithoutDeadlock(t *testing.T) {
+	s, _ := testServer(t)
+	reply := make(chan string, 1)
+	s.pendingAsks["ask-timeout"] = &askPending{reply: reply}
+
+	done := make(chan struct{})
+	go func() {
+		s.timeoutAsk("ask-timeout")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AskUser timeout deadlocked")
+	}
+	select {
+	case answer := <-reply:
+		if answer != "" {
+			t.Fatalf("timeout answer = %q, want empty fallback", answer)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AskUser timeout did not resolve reply channel")
+	}
+
+	s.askMu.Lock()
+	_, stillPending := s.pendingAsks["ask-timeout"]
+	s.askMu.Unlock()
+	if stillPending {
+		t.Fatal("timed out AskUser entry remains pending")
+	}
+}
+
 // Fork creates a new session holding the transcript up to the index.
 func TestForkEndpoint(t *testing.T) {
 	s, store := testServer(t)

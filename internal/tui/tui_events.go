@@ -365,14 +365,14 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 			}
 		}
 	case agent.EventCompactionStart:
-		// LLM-driven compaction tier (Collapse or Compact) is about to
-		// call summarize. Pin the spinner label so the user sees what's
+		// The unified LLM-driven compaction pipeline is about to call
+		// summarize. Pin the spinner label so the user sees what's
 		// happening during the otherwise silent 5-30s window. Mirrors
 		// claude-code REPL.tsx:2504 setSpinnerMessage('Compacting…').
 		//
-		// Label intentionally drops the tier suffix to match claude-code's
+		// Label intentionally drops the trigger suffix to match claude-code's
 		// image-#19 wording "Compacting conversation..." verbatim — the
-		// tier (collapse vs compact) is internal bookkeeping the user
+		// trigger (auto/manual/overflow/second-wind) is internal bookkeeping the user
 		// doesn't need exposed in the spinner row.
 		m.spinnerOverride = "Compacting conversation..."
 		m.spinnerCompactionBytes = 0

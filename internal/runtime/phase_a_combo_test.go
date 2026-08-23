@@ -12,7 +12,7 @@ func TestRenderBasePrompt_WithModel(t *testing.T) {
 	if strings.Contains(out, "powered by claude-opus-4-7") {
 		t.Errorf("base prompt should not mention model in identity; got:\n%s", out)
 	}
-	if !strings.Contains(out, "You are metis, a fast, local-first agent CLI.") {
+	if !strings.Contains(out, "You are metis, a fast, local-first agent.") {
 		t.Errorf("base prompt missing metis identity line; got:\n%s", out)
 	}
 	// Legacy / empty variant must not contain the conditional clause.

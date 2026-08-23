@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -132,6 +133,64 @@ func TestPrepareResumeExposesProviderModelAndSystemBeforeRuntimeBuild(t *testing
 	}
 	if len(prepared.messages) != 1 || prepared.messages[0].Content[0].Text != "resumed prompt" {
 		t.Fatalf("prepared transcript = %+v", prepared.messages)
+	}
+}
+
+func TestPrepareResume_AllowsLargeAuditLedgerWithSmallLogicalCheckpoint(t *testing.T) {
+	store := newResumeStore(t)
+	t.Setenv("METIS_RESUME_MAX_MB", "1")
+	t.Setenv("METIS_RESUME_PHYSICAL_MAX_MB", "4")
+	const id = "prepare-compacted-ledger"
+	if err := store.WriteHeaderFull(session.Header{ID: id, Model: "model"}); err != nil {
+		t.Fatal(err)
+	}
+	largeRaw := llm.Message{
+		Role:    llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: "text", Text: strings.Repeat("x", 2*1024*1024)}},
+	}
+	if err := store.AppendMessage(id, largeRaw); err != nil {
+		t.Fatal(err)
+	}
+	cursor := session.NewHistoryCursor([]llm.Message{largeRaw})
+	want := []llm.Message{{
+		Role:    llm.RoleAssistant,
+		Content: []llm.ContentBlock{{Type: "text", Text: "small checkpoint"}},
+	}}
+	if err := store.ReplaceHistoryAndMark(id, want, &cursor); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := PrepareResume(store, id)
+	if err != nil {
+		t.Fatalf("PrepareResume should apply the logical limit after history_replace: %v", err)
+	}
+	if len(prepared.messages) != 1 || prepared.messages[0].Content[0].Text != "small checkpoint" {
+		t.Fatalf("prepared messages = %#v, want compacted checkpoint", prepared.messages)
+	}
+}
+
+func TestPrepareResume_RejectsLargeLiveLogicalHistory(t *testing.T) {
+	store := newResumeStore(t)
+	t.Setenv("METIS_RESUME_MAX_MB", "1")
+	t.Setenv("METIS_RESUME_PHYSICAL_MAX_MB", "4")
+	const id = "prepare-large-live-history"
+	if err := store.WriteHeaderFull(session.Header{ID: id, Model: "model"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessage(id, llm.Message{
+		Role:    llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: "text", Text: strings.Repeat("x", 2*1024*1024)}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := PrepareResume(store, id)
+	if err == nil {
+		t.Fatal("PrepareResume should reject oversized live logical history")
+	}
+	var tooLarge *session.ResumeTooLargeError
+	if !errors.As(err, &tooLarge) || tooLarge.Scope != session.ResumeSizeLogicalHistory {
+		t.Fatalf("error = %T %v, want logical ResumeTooLargeError", err, err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +70,90 @@ func (p *statusTestProvider) Stream(ctx context.Context, _ llm.Request) (llm.Str
 	return &statusTestStream{ctx: ctx, started: p.started}, nil
 }
 
+type autoCompactPersistenceProvider struct{}
+
+func (*autoCompactPersistenceProvider) Name() string          { return "auto-compact-persistence" }
+func (*autoCompactPersistenceProvider) ModelID() string       { return "auto-compact-persistence" }
+func (*autoCompactPersistenceProvider) MaxContextTokens() int { return 128 }
+func (*autoCompactPersistenceProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, errors.New("test provider expects streaming")
+}
+func (*autoCompactPersistenceProvider) Stream(_ context.Context, req llm.Request) (llm.StreamReader, error) {
+	text := "final answer"
+	if strings.Contains(req.System, "summarizing an agent conversation") {
+		text = "AUTO_COMPACT_SUMMARY"
+	}
+	return &composerSummaryStream{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: text},
+		{Type: "message_stop", StopReason: "end_turn"},
+	}}, nil
+}
+
+type turnTailFailureProvider struct {
+	mu            sync.Mutex
+	calls         int
+	blockOnSecond bool
+	secondStarted chan struct{}
+}
+
+func (*turnTailFailureProvider) Name() string          { return "turn-tail-failure" }
+func (*turnTailFailureProvider) ModelID() string       { return "turn-tail-failure" }
+func (*turnTailFailureProvider) MaxContextTokens() int { return 128_000 }
+func (*turnTailFailureProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, errors.New("test provider expects streaming")
+}
+func (p *turnTailFailureProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamReader, error) {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 1 {
+		return &composerSummaryStream{events: []llm.StreamEvent{
+			{Type: "tool_use_start", ToolUseID: "persist-1", ToolName: "PersistMarker"},
+			{Type: "tool_input_delta", ToolUseID: "persist-1", InputDelta: `{}`},
+			{Type: "tool_use_stop", ToolUseID: "persist-1", InputDelta: `{}`},
+			{Type: "message_delta", StopReason: "tool_use"},
+			{Type: "message_stop"},
+		}}, nil
+	}
+	if p.blockOnSecond {
+		if call == 2 && p.secondStarted != nil {
+			close(p.secondStarted)
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return nil, errors.New("forced follow-up failure")
+}
+
+type turnTailMarkerTool struct {
+	tools.BaseTool
+	poisonPath string
+}
+
+func (turnTailMarkerTool) Name() string        { return "PersistMarker" }
+func (turnTailMarkerTool) Description() string { return "append a durable turn marker" }
+func (turnTailMarkerTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (turnTailMarkerTool) Concurrency(map[string]any) tools.Concurrency {
+	return tools.ConcurrencySafe
+}
+func (turnTailMarkerTool) CanUse(context.Context, map[string]any) (tools.Permission, string) {
+	return tools.PermissionAllow, ""
+}
+func (t turnTailMarkerTool) Execute(context.Context, map[string]any) (*tools.Result, error) {
+	if t.poisonPath != "" {
+		if err := os.Remove(t.poisonPath); err != nil {
+			return nil, err
+		}
+		if err := os.Mkdir(t.poisonPath, 0o700); err != nil {
+			return nil, err
+		}
+	}
+	return &tools.Result{Output: "persisted marker"}, nil
+}
+
 func testServer(t *testing.T) (*Server, *session.Store) {
 	t.Helper()
 	store, err := session.NewStore(t.TempDir())
@@ -90,6 +175,27 @@ func TestHealthAndSecurityHeaders(t *testing.T) {
 	}
 	if !bytes.Contains(rr.Body.Bytes(), []byte(`"build"`)) {
 		t.Fatalf("health response missing build identity: %s", rr.Body.String())
+	}
+}
+
+func TestNativeDesktopFrameRequiresLaunchToken(t *testing.T) {
+	t.Setenv("METIS_DESKTOP_FRAME_TOKEN", "test-launch-token")
+	s, _ := testServer(t)
+
+	for _, tc := range []struct {
+		path      string
+		wantFrame string
+	}{
+		{path: "/", wantFrame: "DENY"},
+		{path: "/?desktop-frame=wrong", wantFrame: "DENY"},
+		{path: "/?desktop-frame=test-launch-token", wantFrame: ""},
+		{path: "/api/health?desktop-frame=test-launch-token", wantFrame: "DENY"},
+	} {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if got := rr.Header().Get("X-Frame-Options"); got != tc.wantFrame {
+			t.Errorf("GET %s X-Frame-Options = %q, want %q", tc.path, got, tc.wantFrame)
+		}
 	}
 }
 
@@ -121,6 +227,87 @@ func TestStatusIncludesContextPressure(t *testing.T) {
 	}
 	if payload.ContextUsed <= 0 || payload.ContextWindow != 128_000 || payload.CompactThreshold <= 0 || payload.Build == "" {
 		t.Fatalf("incomplete context status: %+v", payload)
+	}
+}
+
+func TestTurnPersistsAutomaticCompactionHistoryReplacement(t *testing.T) {
+	provider := &autoCompactPersistenceProvider{}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeBypassPermissions), nil, "system", 2)
+	loop.Model = provider.ModelID()
+	loop.ContextWindow = provider.MaxContextTokens()
+	compactConfig := agent.DefaultCompactionConfig()
+	compactConfig.Threshold = 0.01
+	compactConfig.MinimumTokens = 0
+	compactConfig.ProtectFirst = 1
+	compactConfig.ProtectLast = 2
+	compactConfig.SnipThreshold = 0
+	compactConfig.CollapseThreshold = 0
+	compactConfig.IdleMaxSeconds = 0
+	compactConfig.MaxSummarizeInputTokens = 0
+	loop.Compactor = agent.NewCompactor(compactConfig, provider.ModelID(), provider.MaxContextTokens(), provider)
+
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "auto-compact-persistence"
+	if err := store.WriteHeaderFull(session.Header{
+		ID: id, Provider: provider.Name(), Model: provider.ModelID(), System: "system", Status: "idle",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		role := llm.RoleUser
+		if i%2 == 1 {
+			role = llm.RoleAssistant
+		}
+		text := fmt.Sprintf("old turn %d %s", i, strings.Repeat("history ", 20))
+		if i == 4 {
+			text = "OLD_MIDDLE_SENTINEL " + text
+		}
+		if err := store.AppendMessage(id, llm.Message{Role: role, Content: []llm.ContentBlock{{Type: "text", Text: text}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, history, err := store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop.Restore(history)
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: id,
+		ProviderName:     provider.Name(),
+	})
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(
+		`{"sessionId":"`+id+`","input":"latest request"}`,
+	)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("turn = %d: %s", rr.Code, rr.Body.String())
+	}
+
+	live := loop.History()
+	_, durable, err := store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(durable, live) {
+		t.Fatalf("durable history diverged after automatic compaction:\n durable=%#v\n live=%#v", durable, live)
+	}
+	rawLog, err := os.ReadFile(filepath.Join(store.Dir, id+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(rawLog, []byte(`"type":"history_replace"`)) {
+		t.Fatalf("automatic compaction did not persist a history replacement: %s", rawLog)
+	}
+	for _, message := range durable {
+		for _, block := range message.Content {
+			if strings.Contains(block.Text, "OLD_MIDDLE_SENTINEL") {
+				t.Fatalf("summarized middle message revived in durable history: %#v", message)
+			}
+		}
 	}
 }
 
@@ -639,6 +826,115 @@ func TestFailedTurnPersistsDurableSessionStatus(t *testing.T) {
 	}
 	if hdr.Status != "failed" {
 		t.Fatalf("durable status = %q, want failed", hdr.Status)
+	}
+}
+
+func TestFailedAndCanceledTurnsPersistHistoryTail(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel bool
+	}{
+		{name: "provider error"},
+		{name: "canceled follow-up", cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := session.NewStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := "persist-turn-tail-" + strings.ReplaceAll(tc.name, " ", "-")
+			provider := &turnTailFailureProvider{blockOnSecond: tc.cancel}
+			if tc.cancel {
+				provider.secondStarted = make(chan struct{})
+			}
+			registry := tools.NewRegistry()
+			registry.Register(turnTailMarkerTool{})
+			loop := agent.NewLoop(provider, registry, permission.New(permission.ModeBypassPermissions), nil, "system", 4)
+			loop.Model = provider.ModelID()
+			if err := store.WriteHeaderFull(session.Header{
+				ID: id, Provider: provider.Name(), Model: provider.ModelID(), System: "system", Status: "idle",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+				ProviderName: provider.Name(), InitialSessionID: id,
+			})
+			h := s.handler()
+			turnResult := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rr := httptest.NewRecorder()
+				h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(
+					`{"sessionId":"`+id+`","input":"persist this failed turn"}`,
+				)))
+				turnResult <- rr
+			}()
+
+			if tc.cancel {
+				select {
+				case <-provider.secondStarted:
+				case <-time.After(2 * time.Second):
+					t.Fatal("follow-up request did not start")
+				}
+				stopRR := httptest.NewRecorder()
+				h.ServeHTTP(stopRR, httptest.NewRequest(http.MethodPost, "/api/stop", nil))
+				if stopRR.Code != http.StatusOK {
+					t.Fatalf("stop status = %d: %s", stopRR.Code, stopRR.Body.String())
+				}
+			}
+
+			var rr *httptest.ResponseRecorder
+			select {
+			case rr = <-turnResult:
+			case <-time.After(3 * time.Second):
+				t.Fatal("turn did not finish")
+			}
+			if rr.Code != http.StatusBadGateway {
+				t.Fatalf("turn status = %d, want 502: %s", rr.Code, rr.Body.String())
+			}
+
+			live := loop.History()
+			_, durable, err := store.Load(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(live) < 3 {
+				t.Fatalf("test did not produce a post-checkpoint tool round: %#v", live)
+			}
+			if !reflect.DeepEqual(durable, live) {
+				t.Fatalf("durable history diverged after failed turn:\n durable=%#v\n live=%#v", durable, live)
+			}
+		})
+	}
+}
+
+func TestTurnPersistenceFailureTakesPriorityOverRunError(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "turn-persistence-error-priority"
+	provider := &turnTailFailureProvider{}
+	registry := tools.NewRegistry()
+	registry.Register(turnTailMarkerTool{poisonPath: filepath.Join(store.Dir, id+".jsonl")})
+	loop := agent.NewLoop(provider, registry, permission.New(permission.ModeBypassPermissions), nil, "system", 4)
+	loop.Model = provider.ModelID()
+	if err := store.WriteHeaderFull(session.Header{
+		ID: id, Provider: provider.Name(), Model: provider.ModelID(), System: "system", Status: "idle",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		ProviderName: provider.Name(), InitialSessionID: id,
+	})
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(
+		`{"sessionId":"`+id+`","input":"force persistence failure"}`,
+	)))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("turn status = %d, want 500: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "failed to persist") {
+		t.Fatalf("500 response does not identify persistence failure: %s", rr.Body.String())
 	}
 }
 

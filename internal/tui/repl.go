@@ -147,7 +147,7 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 		md = nil
 	}
 	cursor := session.NewHistoryCursor(loop.History())
-	return &REPL{
+	r := &REPL{
 		Loop:        loop,
 		Gate:        gate,
 		Slash:       sl,
@@ -166,7 +166,22 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 		cmds:          BuildREPLCommands(),
 		stdin:         os.Stdin,
 		out:           os.Stdout,
-	}, nil
+	}
+	// Automatic, overflow and second-wind compaction can happen in the
+	// middle of Run, before the normal turn-end tail flush. Checkpoint both
+	// the raw pre-compact tail and the exact replacement synchronously so a
+	// provider error after compaction cannot resurrect stale history.
+	loop.CompactionCheckpoint = func(before, after []llm.Message) error {
+		if r.Session == nil || r.SessionID == "" {
+			return nil
+		}
+		if r.historyCursor == nil {
+			fresh := session.NewHistoryCursor(nil)
+			r.historyCursor = &fresh
+		}
+		return r.Session.CheckpointCompaction(r.SessionID, before, after, r.historyCursor)
+	}
+	return r, nil
 }
 
 // ConfigureProviderSwitch supplies the runtime context needed for a real

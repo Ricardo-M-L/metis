@@ -21,12 +21,16 @@ func TestResetSessionClearsSessionScopedState(t *testing.T) {
 	loop.haltRequested = true
 	loop.haltReason = "old halt"
 	loop.steerBuf = []string{"old steer"}
+	loop.autoCompactPressurePinned = true
+	loop.autoCompactHistoryTokens = 777
 	loop.compactCircuitNoticeSent = true
 	loop.lastAutoMemoryTurn = 7
 	loop.discoveredMCP = map[string]bool{"mcp__old": true}
 	loop.discoveredMCPHydrated = true
 	loop.contract = contractTracker{
-		mainWrites: 6, agentDispatches: 10, verifyDispatched: true,
+		mainWrites: 6, agentDispatches: 10, implementationAgents: 3,
+		mutatedFiles: map[string]struct{}{"old.go": {}}, validationObserved: true,
+		highImpactAction: true, verifyDispatched: true,
 		reminderFired: true, gateAttempts: 2, lastVerifyVerdict: "FAIL", verdictGateAttempts: 2,
 	}
 	oldSubAgentNotify := loop.subAgentNotify
@@ -80,10 +84,16 @@ func TestResetSessionClearsSessionScopedState(t *testing.T) {
 	if loop.haltRequested || loop.haltReason != "" || len(loop.steerBuf) != 0 || loop.BypassNextCache {
 		t.Errorf("turn controls leaked: halt=%v reason=%q steer=%v bypass=%v", loop.haltRequested, loop.haltReason, loop.steerBuf, loop.BypassNextCache)
 	}
-	if loop.compactCircuitNoticeSent || loop.lastAutoMemoryTurn != 0 || loop.lastTimeBasedMicrocompactAt.Before(before) {
+	if loop.autoCompactPressurePinned || loop.autoCompactHistoryTokens != 0 ||
+		loop.compactCircuitNoticeSent || loop.lastAutoMemoryTurn != 0 || loop.lastTimeBasedMicrocompactAt.Before(before) {
 		t.Errorf("compaction/memory state not reset")
 	}
-	if loop.contract != (contractTracker{}) {
+	if loop.contract.mainWrites != 0 || loop.contract.agentDispatches != 0 ||
+		loop.contract.implementationAgents != 0 || len(loop.contract.mutatedFiles) != 0 ||
+		loop.contract.validationObserved || loop.contract.highImpactAction ||
+		loop.contract.verifyDispatched || loop.contract.reminderFired ||
+		loop.contract.gateAttempts != 0 || loop.contract.lastVerifyVerdict != "" ||
+		loop.contract.verdictGateAttempts != 0 {
 		t.Errorf("dispatch contract leaked: %+v", loop.contract)
 	}
 	if len(loop.subAgentNotify) != 0 {

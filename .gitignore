@@ -4,6 +4,7 @@
 /metis
 /metis-*
 !/metis-desktop/
+/metis-desktop/metis-desktop
 *.test
 *.out
 .DS_Store

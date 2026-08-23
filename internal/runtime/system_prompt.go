@@ -3,14 +3,12 @@ package runtime
 import (
 	"bytes"
 	"context"
-	_ "embed"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 
@@ -22,42 +20,14 @@ import (
 // when assembling the agent's system prompt.
 const SystemPromptFileName = "system.md"
 
-// basePromptTPL is the embedded base prompt template. Lives in
-// prompts/base.md so the prompt text is editable without
-// recompiling inline string constants. text/template syntax —
-// variables: .ProviderHint (mirror crush's .md.tpl pattern).
-//
-//go:embed prompts/base.md
-var basePromptTPL string
-
-// BasePromptVars is the template context for base.md. Empty
-// fields render as their `{{if .X}}...{{end}}` blocks would suggest:
-// missing → silent. Add new fields here and their `{{ .Foo }}`
-// reference in base.md together.
+// BasePromptVars is the template context shared by section files.
 type BasePromptVars struct {
 	Model        string // resolved model id; retained for compatibility, not surfaced in identity text
 	ProviderHint string // optional provider-specific guidance (Claude→XML, OpenAI→JSON)
 }
 
-// compiledBaseTPL caches the parsed template across calls. Parse is
-// cheap but unnecessary on every chat boot.
-var (
-	baseTPLOnce sync.Once
-	baseTPL     *template.Template
-	baseTPLErr  error
-)
-
-func parsedBaseTPL() (*template.Template, error) {
-	baseTPLOnce.Do(func() {
-		baseTPL, baseTPLErr = template.New("base").Parse(basePromptTPL)
-	})
-	return baseTPL, baseTPLErr
-}
-
-// DefaultBasePrompt returns the embedded base prompt with empty
-// template variables — same string the legacy hardcoded `defaultSystem`
-// constant used to provide. Use RenderBasePrompt for variable
-// injection.
+// DefaultBasePrompt returns the canonical assembled section prompt with empty
+// runtime variables. Context-aware callers should use AssembleBaseSections.
 func DefaultBasePrompt() string {
 	return RenderBasePrompt(BasePromptVars{})
 }
@@ -90,14 +60,7 @@ func IsSimpleMode() bool {
 	return false
 }
 
-// RenderBasePrompt expands the base prompt with the given variables.
-// Now backed by the per-section registry (sections.go) instead of the
-// monolithic base.md template — the section path produces the same
-// final text but lets sub-agents / Bash-less tool sets skip
-// irrelevant sections.
-//
-// The legacy basePromptTPL is still embedded for the rare fallback
-// when assembly fails; current code paths never hit that branch.
+// RenderBasePrompt expands the section registry with the given variables.
 //
 // The {{.ProviderHint}} suffix is preserved as a trailing block when
 // vars.ProviderHint is non-empty — callers that want it as a separate

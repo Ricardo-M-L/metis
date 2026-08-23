@@ -46,6 +46,13 @@ type PromptCtx struct {
 	// reachable, etc.
 	EnabledTools map[string]bool
 
+	// ComputerUseAvailable records a configured computer-use capability
+	// before the asynchronous MCP launcher has registered concrete tool
+	// names. EnabledTools remains the authoritative signal when a caller
+	// already has a live registry; this flag closes the bootstrap gap for
+	// the main CLI path without blocking startup on MCP handshakes.
+	ComputerUseAvailable bool
+
 	// HasSkills reports whether the user has any installed skills
 	// (bundled or under ~/.metis/skills/). Hides the skills section
 	// when false - empty users don't need the lookup hint.
@@ -137,6 +144,13 @@ func LanguageSection(_ PromptCtx) SystemPromptSection {
 // - the guidance is cu-specific (left_click / type / key /
 // find_text_on_screen language).
 func ComputerUseSection(ctx PromptCtx) SystemPromptSection {
+	if ctx.ComputerUseAvailable {
+		return SystemPromptSection{
+			Name:  "computer_use",
+			Body:  readSection("01b_computer_use.md"),
+			Cache: true,
+		}
+	}
 	if ctx.EnabledTools == nil {
 		// nil = "assume all available" legacy path. Keep silent here
 		// to avoid leaking cu guidance to runs that genuinely have no

@@ -283,7 +283,7 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 			result.CodeRestored = true
 		}
 		l.restoreMessagesLocked(replacement)
-		l.estTokens.Store(int64(estimateTokens(l.Messages)))
+		l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
 		l.mu.Unlock()
 		result.ConversationRestored = true
 		result.TurnsUndone = turnsBefore - (turn - 1)
@@ -387,7 +387,7 @@ func (l *Loop) CommitRewindSummaryWithPersist(plan *RewindSummaryPlan, summary s
 		}
 	}
 	l.restoreMessagesLocked(replacement)
-	l.estTokens.Store(int64(estimateTokens(l.Messages)))
+	l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
 	l.mu.Unlock()
 	l.discardCheckpointMappingsFrom(plan.turn)
 

@@ -7,6 +7,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,9 +32,25 @@ func errIsEOF(err error) bool { return errors.Is(err, io.EOF) }
 // Config holds compaction thresholds.
 type Config struct {
 	Threshold        float64 // fraction of context window for full Compact (e.g. 0.85)
-	ProtectFirst     int     // always keep first N messages
-	ProtectLast      int     // always keep last N messages
+	ProtectFirst     int     // legacy tier setting; unified Compact never pins the first chat message
+	ProtectLast      int     // legacy tier setting and fallback minimum recent message count
 	MaxSummaryTokens int     // max tokens in a summary turn
+
+	// RetainTokens is the target token budget for the recent verbatim tail
+	// kept after a full compaction. Zero selects a window-aware budget: 8%
+	// of the effective input cap, clamped to 16K..32K on normal model
+	// windows and scaled down for small test/local-model windows.
+	RetainTokens int
+
+	// RetainMinMessages and RetainMinUserMessages are semantic floors
+	// for the recent verbatim tail. They replace the old fixed
+	// ProtectLast-only cut, which could keep five tool messages while
+	// summarizing away the user's active request. Only real (non-synthetic)
+	// user text counts toward RetainMinUserMessages; requests outside the
+	// contiguous tail are copied verbatim into the deterministic checkpoint
+	// anchor instead of forcing every intervening tool dump to survive.
+	RetainMinMessages     int
+	RetainMinUserMessages int
 
 	// SnipThreshold is the lighter-weight threshold for tool-result
 	// truncation (Snip). Triggered BEFORE Compact so a context that's
@@ -156,8 +173,8 @@ type Config struct {
 	// MinimumTokens — absolute lower bound (in estimated tokens). Full
 	// Compact will NOT fire below this even if the percentage threshold
 	// is crossed. Mirrors DeepSeek-TUI's MINIMUM_AUTO_COMPACTION_TOKENS
-	// floor (compaction.rs:29): on a 1M-window provider the 0.95 trigger
-	// is 950K, which is great, but on a fresh session you don't want
+	// floor (compaction.rs:29): on a 1M-window provider the percentage
+	// trigger is already very high, but on a fresh session you don't want
 	// metis rewriting prefix-cache anchors over a 60K-token convo just
 	// because the user's max_tokens config is low. Set 0 to disable —
 	// pre-2026-05-16 behaviour (percent-only). The DefaultCompactionConfig
@@ -178,7 +195,7 @@ type Config struct {
 	// (a function of provider input throughput).
 	//
 	// Why this exists (2026-07-27): on a 1M-context Kimi/DeepSeek
-	// window with Threshold=0.95, summarize() was ingesting ~950K
+	// window, summarize() could ingest most of the available input
 	// tokens of transcript. At ~3K tok/s input throughput that's ~5
 	// minutes of streaming before the first summary byte comes back —
 	// the "compaction stuck" UX. Lowering Threshold to 0.80 helped
@@ -195,44 +212,30 @@ type Config struct {
 // DefaultConfig returns sensible defaults.
 func DefaultCompactionConfig() Config {
 	return Config{
-		// Threshold at which full LLM-driven compaction fires, as a
-		// fraction of effectiveInputCap. 0.80 balances two constraints:
-		//
-		//   - High enough that Snip / Microcompact / Collapse (0.70 /
-		//     0.78) get a real chance to shrink context cheaply first
-		//     — those tiers have no LLM cost.
-		//   - Low enough that when Compact DOES fire on a 1M-context
-		//     window, the middle slice feeding summarize() is bounded
-		//     by MaxSummarizeInputTokens (default 200K), keeping the
-		//     summarize call under ~60s on slow providers.
-		//
-		// Note: this percentage is NOT comparable to claude-code's
-		// ~0.97 effective trigger (autoCompact.ts: effectiveWindow −
-		// 13K buffer on a 1M window). CC can afford a high trigger
-		// because its microCompact path uses the cache_edits API to
-		// delete tool_results server-side WITHOUT invalidating the
-		// prompt cache — metis has no equivalent API on Kimi /
-		// DeepSeek / MiniMax, so its defense-in-depth stops at the
-		// local Snip/Microcompact tier and the summarize-input cap
-		// below.
-		Threshold:              0.80,
+		// One heavy, LLM-driven checkpoint fires at 85% of the effective
+		// input capacity. Image pruning and tool-result offloading happen
+		// inside that same transaction; they never lower pressure first and
+		// thereby cancel the checkpoint (the former 85% -> 75% behaviour).
+		// The recent verbatim tail is token-budgeted and the summarizer input
+		// is capped below, so the installed context is materially smaller.
+		Threshold:              0.85,
 		ProtectFirst:           1, // system message
 		ProtectLast:            5, // recent turns
-		MaxSummaryTokens:       512,
+		MaxSummaryTokens:       8_192,
+		RetainMinMessages:      5,
+		RetainMinUserMessages:  2,
 		SnipThreshold:          0.70, // cheap tool-result trim, kept earlier than Compact
 		SnipMaxToolResultChars: 800,
 		MicrocompactMinChars:   4000, // disk-cache only genuinely big results
-		CollapseThreshold:      0.78, // between snip(0.70) and compact(0.95)
+		CollapseThreshold:      0.78, // retained for explicit segment APIs; not an auto trigger
 		CollapseFoldWindow:     10,
 		// MicrocompactDir is intentionally empty here — runtime sets it
 		// per-session in setupRuntime so the cache lands under
 		// ~/.metis/cache/<sessionID>/.
 
 		// Protect long-term reference tools from Snip/Microcompact's
-		// "[snipped: N chars]" rewrite. memory_query / memory_recall:
-		// the model uses these for cross-session recall and frequently
-		// re-cites the exact strings later. skill_help: typically a
-		// short instruction sheet, shouldn't be dropped.
+		// "[snipped: N chars]" rewrite. Memory and Skill carry durable
+		// recall and instruction text that should not be silently dropped.
 		//
 		// 2026-07-26: removed "Read" from the protected set. A Read
 		// tool_result is the single biggest contributor to context
@@ -242,17 +245,17 @@ func DefaultCompactionConfig() Config {
 		// — the dominant input to the summarize call — which is
 		// exactly why 1M-context compaction was timing out. The
 		// file is on disk; if the model needs the body again it
-		// can re-Read it. Memory / skill_help stay protected
+		// can re-Read it. Memory / Skill stay protected
 		// because they are NOT cheaply re-fetchable.
-		ProtectedTools:        []string{"memory_query", "memory_recall", "skill_help"},
+		ProtectedTools:        []string{"Memory", "Skill"},
 		RedactSecrets:         true,
 		IterativeSummary:      true,
 		MaxSummaryRetries:     2,
 		IdleMaxSeconds:        3600, // 1h — mirrors CC's timeBasedMC cache-TTL window
 		KeepRecentToolResults: 5,    // mirrors CC microCompact keepRecent=5
 		// 2026-07-27: cap summarize() input at 200K estimated tokens.
-		// On a 1M-context window with Threshold=0.80, the middle slice
-		// feeding summarize() could be ~800K tokens — at typical
+		// On a 1M-context window, the middle slice feeding summarize()
+		// can still be hundreds of thousands of tokens — at typical
 		// Kimi/DeepSeek input throughput (~3K tok/s) that's 4-5 minutes
 		// of streaming before the first summary byte. 200K keeps any
 		// single summarize call under ~60s; Compact invokes
@@ -390,30 +393,49 @@ func (c *Compactor) effectiveInputCap() int {
 // rewriting prefix-cache anchors over a small session just because the
 // user-configured max_tokens is low. MinimumTokens=0 disables this guard.
 func (c *Compactor) ShouldCompact(messages []llm.Message) bool {
+	return c.ShouldCompactTokens(estimateTokens(messages))
+}
+
+// ShouldCompactTokens applies the automatic-compaction policy to an already
+// assembled context estimate. Loop preflight uses this form so system prompt,
+// current runtime state, memory and tool schemas participate in the decision;
+// callers that only have a transcript can continue using ShouldCompact.
+func (c *Compactor) ShouldCompactTokens(rough int) bool {
+	if c == nil {
+		return false
+	}
 	if c.consecutiveFailures >= MaxConsecutiveCompactFailures {
 		return false
 	}
-	rough := estimateTokens(messages)
-	if c.MinimumTokens > 0 && rough < c.MinimumTokens {
+	trigger := c.TriggerTokens()
+	if trigger <= 0 {
 		return false
 	}
-	// B3 (2026-08-02): trigger on MaxContextTokens directly, not
-	// effectiveInputCap. The old formula (MaxContextTokens − reserved) ×
-	// Threshold made the trigger point depend on the user's max_tokens
-	// config — a large max_tokens (e.g. 200K on a 1M-context Kimi model)
-	// shrunk effectiveInputCap by 20K, but the displayed percentage in
-	// the footer used MaxContextTokens as denominator, so users saw
-	// "context at 11% / auto at 91%" and reasonably concluded the
-	// compactor was misfiring (BUG-B). Worse, when max_tokens config
-	// was very large, the trigger could fire BEFORE the context was
-	// actually full, letting it grow past the model's true cap and
-	// produce the impossible "99%+ (224%)" footer state (BUG-D).
-	//
-	// Using MaxContextTokens directly means the displayed percentage
-	// and the actual trigger share the same denominator. Context can
-	// never exceed 100% — the compactor fires at Threshold × cap and
-	// the API would reject anything larger anyway.
-	return float64(rough) >= float64(c.MaxContextTokens)*c.Threshold
+	minimum := c.MinimumTokens
+	// A copied 200K floor must not disable compaction for a 128K/192K
+	// provider. Clamp the floor to the actual trigger for this model.
+	if minimum > trigger {
+		minimum = trigger
+	}
+	if minimum > 0 && rough < minimum {
+		return false
+	}
+	return rough >= trigger
+}
+
+// TriggerTokens is the authoritative automatic-compaction boundary used by
+// ShouldCompact and UI diagnostics. It applies the configured percentage to
+// the input budget left after reserving response tokens, preventing an API
+// overflow before a nominal MaxContextTokens percentage is reached.
+func (c *Compactor) TriggerTokens() int {
+	if c == nil || c.Threshold <= 0 {
+		return 0
+	}
+	cap := c.effectiveInputCap()
+	if cap <= 0 {
+		return 0
+	}
+	return int(float64(cap) * c.Threshold)
 }
 
 // ShouldSnip returns true when the cheap tool-result truncation pass
@@ -917,45 +939,28 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	if c.CircuitTripped() {
 		return messages, nil
 	}
-	if len(messages) <= c.ProtectFirst+c.ProtectLast+2 {
+	// One public compaction pipeline, with cheap preparation kept internal.
+	// This prevents a Snip pass from lowering pressure just enough to cancel
+	// the full checkpoint (the observed 85% -> 75% failure mode), while all
+	// trigger surfaces still receive identical image/tool-result handling.
+	if keepN := keepRecentImagesFor(c.MaxContextTokens); keepN > 0 {
+		if pruned, n := PruneOldImages(messages, keepN); n > 0 {
+			messages = pruned
+		}
+	}
+	if c.MicrocompactDir != "" {
+		messages = c.Microcompact(messages)
+	}
+	if len(messages) <= 2 {
 		return messages, nil // nothing to compact
 	}
 
-	cut := len(messages) - c.ProtectLast
-	cut = adjustCutForToolPairs(messages, cut)
-
-	// Active-task anchor (2026-05-13 bugfix):
-	//
-	// ProtectFirst=1 keeps msgs[0] — almost always a greeting like
-	// "你好" / "hi". ProtectLast=5 typically captures recent tool-result
-	// + assistant cycles. The user's ACTUAL question — the one driving
-	// the current turn — can land in the middle and get folded into the
-	// assistant-role summary boundary. The model then scans the
-	// post-compact slice, sees only ONE user-text message (the
-	// greeting), and answers THAT instead of the active task.
-	//
-	// Real transcript that surfaced this (compaction inside a "compare
-	// token consumption" turn):
-	//   ...
-	//   Conversation compacted (context compacted: 31 → 8 messages)
-	//   ...
-	//   The user just said "你好" (hello in Chinese). They previously
-	//   had a task about comparing token consumption... 你好！
-	//
-	// Narrow fix: only pull cut earlier when the *natural* keepLast
-	// has NO user-text message at all (purely tool cycles or assistant
-	// chatter). In that pathological case, walk back to find the most
-	// recent user-text message and pull cut earlier so that message
-	// lands in keepLast verbatim. When keepLast already has a real
-	// user prompt, no intervention — the existing slicing is fine.
-	if !sliceHasUserText(messages[cut:]) {
-		if anchor := lastUserTextBefore(messages, cut); anchor >= 0 && anchor < cut {
-			cut = anchor
-			cut = adjustCutForToolPairs(messages, cut)
-		}
-	}
-
-	if cut <= c.ProtectFirst {
+	// Full compaction uses a semantic, token-budgeted recent tail. The old
+	// ProtectFirst/ProtectLast slicer permanently retained msgs[0] (usually a
+	// greeting, never the top-level system prompt) and could summarize away
+	// the actual request when the final five messages were tool traffic.
+	cut := c.selectRecentTailCut(messages)
+	if cut <= 0 {
 		// Tool-pair adjustment swallowed the middle; skip compaction.
 		// Counts as a failure for the circuit because the conversation
 		// shape is preventing progress — repeated calls won't help.
@@ -974,7 +979,7 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	// oversized middle — a slow summarize beats none.
 	if c.MaxSummarizeInputTokens > 0 {
 		for i := 0; i < 8; i++ { // hard bound: 8 folds ≈ 80 messages
-			mid := messages[c.ProtectFirst:cut]
+			mid := messages[:cut]
 			if estimateTokens(mid) <= c.MaxSummarizeInputTokens {
 				break
 			}
@@ -991,16 +996,9 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 				break // can't fold further; proceed with what we have
 			}
 			messages = folded
-			// Recompute cut against the shrunk slice.
-			cut = len(messages) - c.ProtectLast
-			cut = adjustCutForToolPairs(messages, cut)
-			if !sliceHasUserText(messages[cut:]) {
-				if anchor := lastUserTextBefore(messages, cut); anchor >= 0 && anchor < cut {
-					cut = anchor
-					cut = adjustCutForToolPairs(messages, cut)
-				}
-			}
-			if cut <= c.ProtectFirst {
+			// Recompute the semantic tail against the shrunk slice.
+			cut = c.selectRecentTailCut(messages)
+			if cut <= 0 {
 				// Collapse consumed everything — we're done, no
 				// summarize call needed at all.
 				c.recordCompactResult(true, nil)
@@ -1009,8 +1007,7 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 		}
 	}
 
-	keepFirst := messages[:c.ProtectFirst]
-	middle := messages[c.ProtectFirst:cut]
+	middle := messages[:cut]
 	keepLast := messages[cut:]
 
 	// Iterative mode: when middle[0] is the boundary message from a
@@ -1020,17 +1017,25 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	// re-summarizing from scratch. Falls through to non-iterative
 	// when no prior summary exists in middle (first-time compact).
 	priorSummary := c.LastSummary
-	if len(middle) > 0 {
-		if body, ok := extractPriorSummary(middle[0]); ok {
-			priorSummary = body
-			middle = middle[1:]
-		}
+	if body, rest, ok := extractLeadingCheckpoint(middle); ok {
+		priorSummary = body
+		middle = rest
+	}
+	if len(middle) == 0 && strings.TrimSpace(priorSummary) != "" {
+		// There are no new old-prefix messages to merge. Reusing the prior
+		// checkpoint verbatim is both cheaper and safer than asking the model
+		// to rewrite it with no new evidence.
+		middle = nil
 	}
 
-	summary, err := c.summarizeWithInstructions(ctx, middle, priorSummary, instructions)
-	if err != nil {
-		c.recordCompactResult(false, err)
-		return nil, err
+	summary := priorSummary
+	if len(middle) > 0 || strings.TrimSpace(summary) == "" || instructions != "" {
+		var err error
+		summary, err = c.summarizeWithInstructions(ctx, middle, priorSummary, instructions)
+		if err != nil {
+			c.recordCompactResult(false, err)
+			return nil, err
+		}
 	}
 	c.LastSummary = summary
 
@@ -1054,8 +1059,8 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 		}},
 	}
 
-	out := make([]llm.Message, 0, c.ProtectFirst+3+len(keepLast))
-	out = append(out, keepFirst...)
+	out := make([]llm.Message, 0, 4+len(keepLast))
+	out = append(out, c.buildCheckpointAnchor(messages, cut))
 	out = append(out, boundary)
 	// Post-compact attachment: surface the file paths the agent
 	// touched in the SUMMARIZED middle. The summary text often loses
@@ -1080,8 +1085,230 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 		})
 	}
 	out = append(out, keepLast...)
+	out = c.EnforcePostCompactBudget(out)
+	postTokens := estimateTokens(out)
+	cap := c.effectiveInputCap()
+	if postTokens >= PostCompactTokenBudget || (cap > 0 && postTokens >= cap) {
+		if guarded := c.SnipAll(out); estimateTokens(guarded) < postTokens {
+			out = guarded
+		}
+	}
+
+	// Fail closed when a provider produced a checkpoint that does not
+	// actually free context. Installing a same-size/larger replacement would
+	// immediately retrigger compaction and can create an endless paid loop.
+	beforeTokens := estimateTokens(messages)
+	afterTokens := estimateTokens(out)
+	// Below 1K estimated tokens the fixed checkpoint envelope dominates the
+	// estimator and its error bars; direct/manual callers may still gain a
+	// useful message-count reduction. Automatic production compaction has a
+	// much larger floor, so the strict token-progress gate always applies
+	// where repeated paid compaction would be a real risk.
+	if beforeTokens >= 1_000 && afterTokens >= beforeTokens {
+		err := fmt.Errorf("compact: checkpoint made no token progress (%d -> %d)", beforeTokens, afterTokens)
+		c.recordCompactResult(false, err)
+		return nil, err
+	}
 	c.recordCompactResult(true, nil)
 	return out, nil
+}
+
+const compactionCheckpointRequestText = "<checkpoint/>"
+
+// recentTailTokenBudget returns the target size of the verbatim recent tail.
+// Small windows scale naturally; normal coding-model windows keep 16K..32K,
+// which is enough for the active turn without leaving a post-compact context
+// at 70%+ again.
+func (c *Compactor) recentTailTokenBudget() int {
+	if c.RetainTokens > 0 {
+		return c.RetainTokens
+	}
+	cap := c.effectiveInputCap()
+	if cap <= 0 {
+		cap = c.MaxContextTokens
+	}
+	if cap <= 0 {
+		return 16_000
+	}
+	budget := cap * 8 / 100
+	if cap >= 50_000 && budget < 16_000 {
+		budget = 16_000
+	}
+	if budget > 32_000 {
+		budget = 32_000
+	}
+	if budget < 64 {
+		budget = 64
+	}
+	return budget
+}
+
+// selectRecentTailCut chooses one contiguous recent tail. It is driven by a
+// token budget but refuses to cut away the latest real user requests or split
+// a tool_use/tool_result transaction.
+func (c *Compactor) selectRecentTailCut(messages []llm.Message) int {
+	if len(messages) == 0 {
+		return 0
+	}
+	minMessages := c.RetainMinMessages
+	if minMessages <= 0 {
+		minMessages = c.ProtectLast
+	}
+	if minMessages <= 0 {
+		minMessages = 5
+	}
+	budget := c.recentTailTokenBudget()
+	// Compact() is also the force/manual entry point and is exercised on
+	// histories far below the automatic threshold. Never let a window-derived
+	// tail budget consume the entire transcript in that case; reserve at least
+	// roughly two thirds for the checkpoint candidate.
+	if total := estimateTokens(messages); total > 0 {
+		if forceBudget := total / 3; forceBudget > 0 && budget > forceBudget {
+			budget = forceBudget
+		}
+	}
+	used, retainedMessages, userMessages := 0, 0, 0
+	cut := len(messages)
+	for i := len(messages) - 1; i >= 0; i-- {
+		used += estimateTokens(messages[i : i+1])
+		retainedMessages++
+		if messageHasRealUserText(messages[i]) {
+			userMessages++
+		}
+		cut = i
+		if used >= budget && retainedMessages >= minMessages && userMessages >= 1 {
+			break
+		}
+	}
+	return adjustCutForBalancedToolPairs(messages, cut)
+}
+
+func messageHasRealUserText(m llm.Message) bool {
+	if m.Role != llm.RoleUser {
+		return false
+	}
+	for _, b := range m.Content {
+		if b.Type == "text" && !b.Synthetic && strings.TrimSpace(b.Text) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildCheckpointAnchor emits a compact synthetic user turn before the
+// assistant summary. When one of the latest real user requests falls outside
+// the contiguous token-budgeted tail, its exact text is embedded here. This
+// preserves the anti-drift property without retaining megabytes of tool
+// traffic merely because it occurred between two user steers.
+func (c *Compactor) buildCheckpointAnchor(messages []llm.Message, cut int) llm.Message {
+	wantUsers := c.RetainMinUserMessages
+	if wantUsers <= 0 {
+		wantUsers = 2
+	}
+	type anchor struct {
+		index int
+		text  string
+	}
+	anchors := make([]anchor, 0, wantUsers)
+	for i := len(messages) - 1; i >= 0 && len(anchors) < wantUsers; i-- {
+		if messages[i].Role != llm.RoleUser {
+			continue
+		}
+		for _, b := range messages[i].Content {
+			if b.Type == "text" && !b.Synthetic && strings.TrimSpace(b.Text) != "" {
+				anchors = append(anchors, anchor{index: i, text: b.Text})
+				break
+			}
+		}
+	}
+	var body strings.Builder
+	body.WriteString(compactionCheckpointRequestText)
+	for i := len(anchors) - 1; i >= 0; i-- {
+		if anchors[i].index >= cut {
+			continue
+		}
+		body.WriteString("\n<retained_user_request>\n")
+		body.WriteString(anchors[i].text)
+		body.WriteString("\n</retained_user_request>")
+	}
+	return llm.Message{
+		Role: llm.RoleUser,
+		Content: []llm.ContentBlock{{
+			Type:      "text",
+			Text:      body.String(),
+			Synthetic: true,
+		}},
+	}
+}
+
+// adjustCutForBalancedToolPairs expands a candidate cut toward the past until
+// every tool_result in the retained tail has its matching tool_use retained.
+// Matching IDs are used instead of the old "first message has a result"
+// heuristic, which missed mixed-content and multi-tool messages.
+func adjustCutForBalancedToolPairs(messages []llm.Message, cut int) int {
+	if cut < 0 {
+		cut = 0
+	}
+	if cut > len(messages) {
+		cut = len(messages)
+	}
+	for {
+		uses := make(map[string]bool)
+		results := make(map[string]bool)
+		for _, m := range messages[cut:] {
+			for _, b := range m.Content {
+				switch b.Type {
+				case "tool_use":
+					uses[b.ToolUseID] = true
+				case "tool_result":
+					results[b.ToolUseID] = true
+				}
+			}
+		}
+		newCut := cut
+		for id := range results {
+			if id == "" || uses[id] {
+				continue
+			}
+			for i := cut - 1; i >= 0; i-- {
+				if messageHasToolUseID(messages[i], id) {
+					newCut = i
+					break
+				}
+			}
+		}
+		if newCut == cut {
+			return cut
+		}
+		cut = newCut
+	}
+}
+
+func messageHasToolUseID(m llm.Message, id string) bool {
+	for _, b := range m.Content {
+		if b.Type == "tool_use" && b.ToolUseID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func extractLeadingCheckpoint(messages []llm.Message) (string, []llm.Message, bool) {
+	if len(messages) >= 2 && messages[0].Role == llm.RoleUser {
+		for _, b := range messages[0].Content {
+			if b.Type == "text" && strings.HasPrefix(b.Text, compactionCheckpointRequestText) {
+				if body, ok := extractPriorSummary(messages[1]); ok {
+					return body, messages[2:], true
+				}
+			}
+		}
+	}
+	if len(messages) > 0 {
+		if body, ok := extractPriorSummary(messages[0]); ok {
+			return body, messages[1:], true
+		}
+	}
+	return "", messages, false
 }
 
 // adjustCutForToolPairs walks the cut point earlier so the kept tail never
@@ -1333,7 +1560,7 @@ func redactSecrets(s string) string {
 //
 // When IterativeSummary=true AND priorSummary != "", the LLM is asked
 // to update the prior summary with the new middle messages; otherwise
-// it summarizes from scratch with the 5-section template.
+// it summarizes from scratch with the 8-section template above.
 //
 // Redaction (RedactSecrets=true) runs on each per-message text body
 // just before it joins the prompt. Long messages are NOT individually
@@ -1370,29 +1597,7 @@ func (c *Compactor) summarizeWithInstructions(ctx context.Context, messages []ll
 	for _, m := range messages {
 		role := strings.ToUpper(string(m.Role))
 		for _, blk := range m.Content {
-			switch blk.Type {
-			case "text":
-				if blk.Text == "" {
-					continue
-				}
-				b.WriteString(role + ": " + maybeRedact(blk.Text, c.RedactSecrets) + "\n")
-			case "tool_use":
-				b.WriteString(role + " tool_use(" + blk.ToolName + ")\n")
-			case "tool_result":
-				// Include a TRIMMED tool_result peek (first 400 chars)
-				// — the summarizer needs to know what the tools
-				// returned to write a useful Files & Changes section,
-				// but doesn't need the full 5KB. Snip / microcompact
-				// already shortened older results; this peek is
-				// belt-and-braces for any that slipped through.
-				peek := blk.ToolResult
-				if len(peek) > 400 {
-					peek = peek[:400] + "...[truncated for summary]"
-				}
-				if peek != "" {
-					b.WriteString(role + " tool_result: " + maybeRedact(peek, c.RedactSecrets) + "\n")
-				}
-			}
+			writeSummaryContentBlock(&b, role, blk, c.RedactSecrets)
 		}
 	}
 	if instructions != "" {
@@ -1451,6 +1656,12 @@ func (c *Compactor) summarizeWithInstructions(ctx context.Context, messages []ll
 		}
 		return "", err
 	}
+	if summaryStopReasonIncomplete(resp.StopReason) {
+		if lastErr != nil {
+			return "", fmt.Errorf("summarize: truncated stream and fallback (stop_reason=%s): %w", resp.StopReason, lastErr)
+		}
+		return "", fmt.Errorf("summarize: fallback stopped before checkpoint completed (stop_reason=%s)", resp.StopReason)
+	}
 	for _, blk := range resp.Content {
 		if blk.Type == "text" && strings.TrimSpace(blk.Text) != "" {
 			return strings.TrimSpace(blk.Text), nil
@@ -1502,6 +1713,8 @@ func (c *Compactor) summarizeOnce(ctx context.Context, req llm.Request) (string,
 	const throttleEvery = 256
 	var nextEmit int
 	var out strings.Builder
+	stopReason := ""
+	sawMessageStop := false
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
@@ -1523,7 +1736,18 @@ func (c *Compactor) summarizeOnce(ctx context.Context, req llm.Request) (string,
 				}
 				nextEmit = out.Len() + throttleEvery
 			}
+		case "message_delta":
+			if ev.StopReason != "" {
+				stopReason = ev.StopReason
+			}
 		case "message_stop":
+			sawMessageStop = true
+			if ev.StopReason != "" {
+				stopReason = ev.StopReason
+			}
+			if summaryStopReasonIncomplete(stopReason) {
+				return "", fmt.Errorf("summarize: stream stopped before checkpoint completed (stop_reason=%s)", stopReason)
+			}
 			return strings.TrimSpace(out.String()), nil
 		case "error":
 			if ev.Err != nil {
@@ -1531,7 +1755,103 @@ func (c *Compactor) summarizeOnce(ctx context.Context, req llm.Request) (string,
 			}
 		}
 	}
+	if !sawMessageStop {
+		return "", errors.New("summarize: stream ended before message_stop")
+	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+func summaryStopReasonIncomplete(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_tokens", "length", "max_output_tokens":
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	summaryToolResultHeadRunes = 4_096
+	summaryToolResultTailRunes = 1_024
+	summaryThinkingHeadRunes   = 1_024
+	summaryThinkingTailRunes   = 256
+)
+
+// writeSummaryContentBlock serializes the evidence the checkpoint model needs
+// without copying unbounded payloads. IDs, arguments, error state and both
+// ends of tool output are deliberately preserved: the old serializer kept
+// only the tool name plus the first 400 bytes, which erased exact paths,
+// failure diagnostics and final command status.
+func writeSummaryContentBlock(b *strings.Builder, role string, blk llm.ContentBlock, redact bool) {
+	switch blk.Type {
+	case "text":
+		if blk.Text != "" {
+			b.WriteString(role + ": " + maybeRedact(blk.Text, redact) + "\n")
+		}
+	case "thinking", "reasoning":
+		body := compactRuneWindow(blk.Text, summaryThinkingHeadRunes, summaryThinkingTailRunes, "reasoning")
+		if body != "" {
+			b.WriteString(role + " reasoning_note: " + maybeRedact(body, redact) + "\n")
+		}
+	case "tool_use":
+		fmt.Fprintf(b, "%s tool_use id=%q name=%q", role, blk.ToolUseID, blk.ToolName)
+		if len(blk.ToolInput) > 0 {
+			if raw, err := json.Marshal(blk.ToolInput); err == nil {
+				b.WriteString(" input=" + maybeRedact(string(raw), redact))
+			}
+		}
+		if len(blk.ProviderHint) > 0 {
+			if raw, err := json.Marshal(blk.ProviderHint); err == nil {
+				b.WriteString(" provider_hint=" + maybeRedact(string(raw), redact))
+			}
+		}
+		b.WriteByte('\n')
+	case "tool_result":
+		fmt.Fprintf(b, "%s tool_result id=%q is_error=%t", role, blk.ToolUseID, blk.IsError)
+		if blk.Display != "" {
+			fmt.Fprintf(b, " display=%q", maybeRedact(blk.Display, redact))
+		}
+		if len(blk.Presentation) > 0 {
+			if raw, err := json.Marshal(blk.Presentation); err == nil {
+				b.WriteString(" presentation=" + maybeRedact(string(raw), redact))
+			}
+		}
+		b.WriteString(": ")
+		body := compactRuneWindow(blk.ToolResult, summaryToolResultHeadRunes, summaryToolResultTailRunes, "tool result")
+		b.WriteString(maybeRedact(body, redact))
+		b.WriteByte('\n')
+		for _, sub := range blk.ToolResultBlocks {
+			writeSummaryContentBlock(b, role+" tool_result_part", sub, redact)
+		}
+	case "image":
+		digest := sha256.Sum256([]byte(blk.Data))
+		fmt.Fprintf(b, "%s image media_type=%q bytes=%d sha256=%x\n", role, blk.MediaType, len(blk.Data), digest[:8])
+	default:
+		// Unknown provider blocks are intentionally represented by type so
+		// the checkpoint records that evidence existed without guessing its
+		// semantics or copying opaque payloads.
+		if blk.Type != "" {
+			fmt.Fprintf(b, "%s content_block type=%q\n", role, blk.Type)
+		}
+	}
+}
+
+func compactRuneWindow(s string, head, tail int, label string) string {
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if head < 0 {
+		head = 0
+	}
+	if tail < 0 {
+		tail = 0
+	}
+	if len(runes) <= head+tail || head+tail == 0 {
+		return s
+	}
+	omitted := len(runes) - head - tail
+	return string(runes[:head]) + fmt.Sprintf("\n...[omitted %d runes from %s; head+tail retained]...\n", omitted, label) + string(runes[len(runes)-tail:])
 }
 
 // maybeRedact applies redactSecrets only when the gate is on.

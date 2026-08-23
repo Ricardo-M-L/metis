@@ -105,6 +105,105 @@ func TestLoad_TolerateCorruptedTrailingLine(t *testing.T) {
 	}
 }
 
+func TestAppend_RepairsCorruptedTrailingPartialLine(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const sid = "test-repair-trailing"
+	if err := s.WriteHeader(sid, "test-model", "system prompt"); err != nil {
+		t.Fatal(err)
+	}
+	first := llm.Message{
+		Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "clean prefix"}},
+	}
+	if err := s.AppendMessage(sid, first); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(s.path(sid), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte(`{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"torn`)); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := llm.Message{
+		Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "after restart"}},
+	}
+	if err := s.AppendMessage(sid, second); err != nil {
+		t.Fatal(err)
+	}
+
+	_, got, err := s.Load(sid)
+	if err != nil {
+		t.Fatalf("Load after repairing torn tail: %v", err)
+	}
+	if len(got) != 2 || got[0].Content[0].Text != "clean prefix" || got[1].Content[0].Text != "after restart" {
+		t.Fatalf("recovered history = %#v, want clean prefix and post-restart append", got)
+	}
+
+	body, err := os.ReadFile(s.path(sid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(strings.TrimSuffix(string(body), "\n"), "\n") {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("line %d remains corrupt after append: %q", i+1, line)
+		}
+	}
+}
+
+func TestLoadHeaderAndList_TolerateCorruptedTrailingPartialLine(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sid = "test-list-trailing"
+	if err := s.WriteHeader(sid, "test-model", "system prompt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendMessage(sid, llm.Message{
+		Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "visible session"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(s.path(sid), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte(`{"type":"message","message":{"role":"assistant"`)); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	hdr, count, err := s.LoadHeader(sid)
+	if err != nil {
+		t.Fatalf("LoadHeader should tolerate trailing partial JSON: %v", err)
+	}
+	if hdr == nil || count != 1 {
+		t.Fatalf("LoadHeader = (%#v, %d), want header and one message", hdr, count)
+	}
+	entries, err := s.List(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != sid || entries[0].MessageCount != 1 {
+		t.Fatalf("List hid recoverable session: %#v", entries)
+	}
+}
+
 // TestLoad_FailsOnMidFileCorruption — the security guard: if a
 // non-trailing line is corrupt (FS-level corruption or a deliberate
 // mangling), surface a hard error rather than silently dropping
@@ -146,5 +245,8 @@ func TestLoad_FailsOnMidFileCorruption(t *testing.T) {
 	_, _, err = s.Load(sid)
 	if err == nil {
 		t.Error("mid-file corruption should fail Load, not be silently skipped")
+	}
+	if _, _, err := s.LoadHeader(sid); err == nil {
+		t.Error("mid-file corruption should fail LoadHeader, not be silently skipped")
 	}
 }

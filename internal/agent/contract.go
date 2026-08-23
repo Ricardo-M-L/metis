@@ -1,20 +1,9 @@
 package agent
 
-// contract.go — dispatch-contract enforcement at the agent-loop
-// level. Closes the loophole that broke claude-code-go Round-4
-// (2026-05-17): the model finished 13 Go files of implementation,
-// then end_turn'd without ever calling Agent(subagent_type="verify").
-// Tool-layer nudges in TaskUpdate/TodoWrite were bypassed because
-// the model only created 1 large in_progress task and never closed
-// 3+, so the keyword-based nudge trigger never fired.
-//
-// claude-code-sourcemap has the same blind spot (verified by
-// Explore agent 2026-05-17): its enforcement is also tool-layer
-// nudge + prompt MUST clause. No loop-level gate. metis goes one
-// step beyond on this axis.
-//
-// The contract here counts side-effect-producing tool calls
-// directly instead of trusting Task* tool usage. Two gates:
+// contract.go — risk-based verification enforcement at the agent-loop
+// level. Runtime signals are more reliable than prompt-only thresholds, so
+// the tracker combines mutation scope, implementation fan-out, observed
+// validation, and high-impact commands. Two gates:
 //
 //   (1) mid-turn one-time SystemReminder when threshold first
 //       crosses — heads-up: "you're doing substantial work; plan
@@ -38,35 +27,26 @@ import (
 )
 
 const (
-	contractWriteThreshold = 5
-	// contractAgentThreshold: # of Agent dispatches before the
-	// "you should spawn verify" reminder fires.
-	//
-	// 2026-05-21: bumped 2 → 10 after session 13a82094 analysis.
-	// claude-code's coordinator-mode design has NO equivalent
-	// hard-injected reminder — it relies on system prompt + worker
-	// self-verify spec. metis keeps the reminder as a backstop but
-	// raises the threshold so it only fires in genuine
-	// runaway-dispatch scenarios (10+ sub-agents with zero
-	// verification). At 2 it was misfiring on routine multi-survey
-	// tasks like "rewrite this project" (3-4 survey sub-agents +
-	// 4-5 impl sub-agents is normal, not pathological).
-	contractAgentThreshold   = 10
-	contractMaxGateAttempts  = 2
-	contractOverridePhrase   = "OVERRIDE CONTRACT:"
-	contractDisableEnvVar    = "METIS_CONTRACT_DISABLE"
-	contractVerifySubagentID = "verify"
+	contractIndependentRiskThreshold = 5
+	contractMaxGateAttempts          = 2
+	contractOverridePhrase           = "OVERRIDE CONTRACT:"
+	contractDisableEnvVar            = "METIS_CONTRACT_DISABLE"
+	contractVerifySubagentID         = "verify"
 )
 
 // contractTracker accumulates the side-effect signals one Loop run
 // needs to decide whether the dispatch contract should fire. Lives
 // on the Loop and is reset per Run via Loop.Reset.
 type contractTracker struct {
-	mainWrites       int  // Write + Edit + MultiEdit tool_use counts
-	agentDispatches  int  // Agent tool_use counts (any subagent_type)
-	verifyDispatched bool // true iff one Agent call had subagent_type=verify
-	reminderFired    bool // true iff the mid-turn reminder has already fired
-	gateAttempts     int  // number of times end-of-turn gate held the loop
+	mainWrites           int // Write + Edit + MultiEdit tool_use counts
+	agentDispatches      int // Agent tool_use counts (any subagent_type)
+	implementationAgents int
+	mutatedFiles         map[string]struct{}
+	validationObserved   bool
+	highImpactAction     bool
+	verifyDispatched     bool // true iff one Agent call had subagent_type=verify
+	reminderFired        bool // true iff the mid-turn reminder has already fired
+	gateAttempts         int  // number of times end-of-turn gate held the loop
 
 	// Phase B (2026-05-19): track the verify subagent's VERDICT line
 	// so the end gate can refuse release on FAIL/PARTIAL/MISSING.
@@ -87,15 +67,81 @@ type contractTracker struct {
 func (ct *contractTracker) observeToolUses(toolUses []llm.ContentBlock) {
 	for _, tu := range toolUses {
 		switch tu.ToolName {
-		case "Write", "Edit", "MultiEdit":
+		case "Write", "Edit", "MultiEdit", "NotebookEdit":
 			ct.mainWrites++
+			ct.validationObserved = false
+			if path := mutationPath(tu.ToolInput); path != "" {
+				if ct.mutatedFiles == nil {
+					ct.mutatedFiles = make(map[string]struct{})
+				}
+				ct.mutatedFiles[path] = struct{}{}
+			}
+		case "Bash":
+			command := toolInputString(tu.ToolInput, "command", "cmd")
+			ct.validationObserved = ct.validationObserved || isValidationCommand(command)
+			ct.highImpactAction = ct.highImpactAction || isHighImpactCommand(command)
 		case "Agent":
 			ct.agentDispatches++
-			if st, ok := tu.ToolInput["subagent_type"].(string); ok && st == contractVerifySubagentID {
+			st, _ := tu.ToolInput["subagent_type"].(string)
+			if st == contractVerifySubagentID {
 				ct.verifyDispatched = true
+			} else if isImplementationAgent(st) {
+				ct.implementationAgents++
+				ct.validationObserved = false
 			}
 		}
 	}
+}
+
+func mutationPath(input map[string]any) string {
+	return toolInputString(input, "file_path", "path", "notebook_path")
+}
+
+func toolInputString(input map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := input[key].(string); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func isImplementationAgent(subagentType string) bool {
+	switch strings.ToLower(strings.TrimSpace(subagentType)) {
+	case "", "general", "implement", "implementation", "worker":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidationCommand(command string) bool {
+	lower := strings.ToLower(command)
+	for _, marker := range []string{
+		"go test", "go vet", "cargo test", "pytest", "npm test",
+		"npm run test", "pnpm test", "yarn test", "bun test",
+		"mvn test", "gradle test", "./gradlew test", "make test",
+		"golangci-lint", "npm run lint", "pnpm lint", "yarn lint",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHighImpactCommand(command string) bool {
+	lower := strings.ToLower(command)
+	for _, marker := range []string{
+		"rm -rf", "git push", "gh pr create", "npm publish",
+		"goreleaser", "drop table", "drop database", "truncate table",
+		"terraform apply", "kubectl apply", "helm upgrade",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // observeToolResults pairs the just-completed tool_results with
@@ -161,12 +207,32 @@ func contractDisabled() bool {
 	return os.Getenv(contractDisableEnvVar) == "1"
 }
 
-// thresholdMet — substantial work happened. Either ≥5 direct file
-// writes (model chose to single-thread) OR ≥2 Agent dispatches
-// (model chose to delegate). Both cases warrant a verify pass.
+// riskScore combines mutation volume, distinct-file scope, implementation
+// fan-out, observed validation, and high-impact external actions. Runtime owns
+// this policy so the base prompt only needs to state the invariant.
+func (ct *contractTracker) riskScore() int {
+	if ct.highImpactAction {
+		return contractIndependentRiskThreshold
+	}
+	score := minInt(ct.mainWrites, 3)
+	score += minInt(len(ct.mutatedFiles), 3)
+	score += minInt(ct.implementationAgents*2, 6)
+	if ct.validationObserved && score > 0 {
+		score--
+	}
+	return score
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// thresholdMet reports whether this run warrants independent verification.
 func (ct *contractTracker) thresholdMet() bool {
-	return ct.mainWrites >= contractWriteThreshold ||
-		ct.agentDispatches >= contractAgentThreshold
+	return ct.riskScore() >= contractIndependentRiskThreshold
 }
 
 // shouldFireMidTurnReminder returns the reminder body when the
@@ -184,9 +250,9 @@ func (ct *contractTracker) shouldFireMidTurnReminder() string {
 	ct.reminderFired = true
 	return fmt.Sprintf(
 		"<system-reminder>\n"+
-			"CONTRACT REMINDER (heads-up). You've now dispatched %d Agent "+
-			"sub-agent(s) and made %d direct file mutation(s). Per the "+
-			"dispatch contract in your base prompt, non-trivial "+
+			"CONTRACT REMINDER (heads-up). Runtime risk is now %d/%d "+
+			"(%d mutation(s) across %d file(s), %d implementation agent(s), "+
+			"validation observed: %t, high-impact action: %t). Non-trivial "+
 			"implementation MUST end with a verify sub-agent that returns "+
 			"`VERDICT: PASS`. Plan your remaining moves so the work ends "+
 			"with:\n"+
@@ -195,7 +261,9 @@ func (ct *contractTracker) shouldFireMidTurnReminder() string {
 			"Running `go build` / `npm test` / etc. yourself does NOT "+
 			"substitute. Only the verifier issues a verdict.\n"+
 			"</system-reminder>",
-		ct.agentDispatches, ct.mainWrites,
+		ct.riskScore(), contractIndependentRiskThreshold,
+		ct.mainWrites, len(ct.mutatedFiles), ct.implementationAgents,
+		ct.validationObserved, ct.highImpactAction,
 	)
 }
 
@@ -273,8 +341,9 @@ func (ct *contractTracker) shouldGateEnd(assistantText string) string {
 	ct.gateAttempts++
 	return fmt.Sprintf(
 		"<system-reminder>\n"+
-			"CONTRACT GATE — HALT (attempt %d of %d). You made %d file "+
-			"mutation(s) / dispatched %d Agent sub-agent(s) this run, then "+
+			"CONTRACT GATE — HALT (attempt %d of %d). Runtime risk is %d/%d "+
+			"after %d mutation(s) across %d file(s), %d implementation "+
+			"agent(s), validation observed=%t, high-impact action=%t. You "+
 			"tried to end the turn without spawning a verifier. Per the "+
 			"contract, end is not allowed yet. Pick one:\n\n"+
 			"  (a) Spawn the verifier now and wait for VERDICT: PASS:\n"+
@@ -291,7 +360,9 @@ func (ct *contractTracker) shouldGateEnd(assistantText string) string {
 			"tokens infinitely.\n"+
 			"</system-reminder>",
 		ct.gateAttempts, contractMaxGateAttempts,
-		ct.mainWrites, ct.agentDispatches,
+		ct.riskScore(), contractIndependentRiskThreshold,
+		ct.mainWrites, len(ct.mutatedFiles), ct.implementationAgents,
+		ct.validationObserved, ct.highImpactAction,
 		contractOverridePhrase,
 		ct.gateAttempts, contractMaxGateAttempts,
 	)

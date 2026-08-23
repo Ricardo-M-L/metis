@@ -41,6 +41,12 @@ type Manifest struct {
 	// `plugin__<plugin-name>__<tool-name>`.
 	MCPServer *MCPServerSpec `toml:"mcp_server,omitempty"`
 
+	// MCPServers is the multi-server form used by ecosystem adapters. It maps
+	// Codex's `.mcp.json` entries without collapsing several independent
+	// servers into one. MCPServer remains supported for existing METIS v1
+	// bundles.
+	MCPServers []MCPServerSpec `toml:"mcp_servers,omitempty"`
+
 	// Skills lists relative paths (under the plugin directory) to
 	// SKILL.md files this plugin contributes. They land in the "plugin"
 	// layer of the multi-source skill loader, namespaced as
@@ -56,9 +62,17 @@ type Manifest struct {
 // MCPServerSpec is the stdio command line + env for the MCP subprocess.
 // Args / Env are optional; Command is required.
 type MCPServerSpec struct {
-	Command string            `toml:"command"`
-	Args    []string          `toml:"args,omitempty"`
-	Env     map[string]string `toml:"env,omitempty"`
+	Name          string            `toml:"name,omitempty"`
+	Command       string            `toml:"command,omitempty"`
+	Args          []string          `toml:"args,omitempty"`
+	URL           string            `toml:"url,omitempty"`
+	Headers       map[string]string `toml:"headers,omitempty"`
+	Auth          string            `toml:"auth,omitempty"`
+	Env           map[string]string `toml:"env,omitempty"`
+	WorkingDir    string            `toml:"working_dir,omitempty"`
+	EnabledTools  []string          `toml:"enabled_tools,omitempty"`
+	DisabledTools []string          `toml:"disabled_tools,omitempty"`
+	Disabled      bool              `toml:"disabled,omitempty"`
 }
 
 // HookSpec declares a subprocess hook subscribed to a set of events.

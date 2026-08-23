@@ -48,9 +48,14 @@ function metaOf(kind) {
 }
 
 function switchView(view) {
+  if (view !== 'artifacts' && typeof leaveArtifactsPanel === 'function') {
+    leaveArtifactsPanel();
+  }
   currentView = view;
   document.getElementById('tabChat').classList.toggle('active', view === 'chat');
   document.getElementById('tabTrace').classList.toggle('active', view === 'trace');
+  const artifactsTab = document.getElementById('tabArtifacts');
+  if (artifactsTab) artifactsTab.classList.toggle('active', view === 'artifacts');
   document.querySelector('.main').classList.toggle('trace-mode', view === 'trace');
   document.querySelector('.app').classList.toggle('trace-mode', view === 'trace');
   document.getElementById('tracePanel').classList.toggle('visible', view === 'trace');

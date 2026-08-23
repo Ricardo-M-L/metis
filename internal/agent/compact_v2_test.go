@@ -403,18 +403,11 @@ func TestSummarize_RedactsBeforeSendingToLLM(t *testing.T) {
 	c.RedactSecrets = true
 
 	msgs := []llm.Message{
-		msg(llm.RoleUser, "system seed"),
-		msg(llm.RoleAssistant, "ack"),
 		msg(llm.RoleUser, "set sk-secret_DO_NOT_LEAK_1234567890abcd in env"),
 		msg(llm.RoleAssistant, "done"),
-		msg(llm.RoleUser, "follow-up"),
-		msg(llm.RoleAssistant, "more ack"),
-		msg(llm.RoleUser, "tail1"),
-		msg(llm.RoleAssistant, "tail2"),
-		msg(llm.RoleUser, "tail3"),
 	}
-	if _, err := c.Compact(context.Background(), msgs); err != nil {
-		t.Fatalf("Compact: %v", err)
+	if _, err := c.summarize(context.Background(), msgs, ""); err != nil {
+		t.Fatalf("summarize: %v", err)
 	}
 	if strings.Contains(p.payload, "DO_NOT_LEAK") {
 		t.Errorf("summarize payload leaked secret: %q", truncate(p.payload, 300))
@@ -432,16 +425,11 @@ func TestSummarize_DisableRedactsKeepsSecretsVisible(t *testing.T) {
 	c.RedactSecrets = false
 
 	msgs := []llm.Message{
-		msg(llm.RoleUser, "system seed"),
-		msg(llm.RoleAssistant, "ack"),
 		msg(llm.RoleUser, "sk-leakable_visible_123456789abcd is here"),
 		msg(llm.RoleAssistant, "ok"),
-		msg(llm.RoleUser, "tail1"),
-		msg(llm.RoleAssistant, "tail2"),
-		msg(llm.RoleUser, "tail3"),
 	}
-	if _, err := c.Compact(context.Background(), msgs); err != nil {
-		t.Fatalf("Compact: %v", err)
+	if _, err := c.summarize(context.Background(), msgs, ""); err != nil {
+		t.Fatalf("summarize: %v", err)
 	}
 	if !strings.Contains(p.payload, "sk-leakable_visible") {
 		t.Errorf("RedactSecrets=false must pass secret through; payload=%q",

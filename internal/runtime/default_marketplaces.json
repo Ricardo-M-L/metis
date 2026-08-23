@@ -3,18 +3,38 @@
     "source": {
       "source": "github",
       "repo": "anthropics/skills"
-    }
+    },
+    "displayName": "Anthropic agent skills",
+    "description": "Official document and agent skills from Anthropic",
+    "ecosystem": "claude"
   },
   "claude-plugins-official": {
     "source": {
       "source": "github",
       "repo": "anthropics/claude-plugins-official"
-    }
+    },
+    "displayName": "Claude official",
+    "description": "Official Claude plugin catalog",
+    "ecosystem": "claude"
   },
   "claude-plugins-community": {
     "source": {
       "source": "github",
       "repo": "anthropics/claude-plugins-community"
-    }
+    },
+    "displayName": "Claude community",
+    "description": "Community-maintained Claude plugins",
+    "ecosystem": "claude"
+  },
+  "codex-plugins-official": {
+    "source": {
+      "source": "github",
+      "repo": "openai/plugins"
+    },
+    "displayName": "Codex official",
+    "description": "Official Codex plugins from OpenAI",
+    "ecosystem": "codex",
+    "format": "codex",
+    "manifest": ".agents/plugins/marketplace.json"
   }
 }

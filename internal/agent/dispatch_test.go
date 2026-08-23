@@ -47,6 +47,19 @@ type fakeTool struct {
 	startsOrder *orderRecorder
 }
 
+type presentationTool struct {
+	fakeTool
+	presentation map[string]any
+}
+
+func (f *presentationTool) Execute(context.Context, map[string]any) (*tools.Result, error) {
+	return &tools.Result{
+		Output:       "Artifact updated",
+		Display:      "Interactive artifact",
+		Presentation: f.presentation,
+	}, nil
+}
+
 func (f *fakeTool) Name() string                                 { return f.name }
 func (f *fakeTool) Description() string                          { return "test" }
 func (f *fakeTool) InputSchema() map[string]any                  { return map[string]any{"type": "object"} }
@@ -187,6 +200,68 @@ func TestDispatch_ExclusiveRunsAfterAll(t *testing.T) {
 	}
 	if order[len(order)-1] != "Excl1" {
 		t.Errorf("Excl1 should start last; order=%v", order)
+	}
+}
+
+func TestDispatch_PreservesStructuredPresentationForLiveAndReplay(t *testing.T) {
+	presentation := map[string]any{
+		"kind": "artifact",
+		"artifact": map[string]any{
+			"id":      "art-123",
+			"version": 2,
+		},
+		"actions": []any{
+			map[string]any{"id": "open", "label": "Open"},
+		},
+	}
+	reg := tools.NewRegistry()
+	reg.Register(&presentationTool{
+		fakeTool:     fakeTool{name: "Artifact", conc: tools.ConcurrencySafe},
+		presentation: presentation,
+	})
+	loop := &Loop{Registry: reg}
+	out := make(chan Event, 8)
+	results, err := loop.executeBatch(context.Background(), []llm.ContentBlock{{
+		Type: "tool_use", ToolUseID: "tu-artifact", ToolName: "Artifact",
+	}}, out, HookContext{})
+	if err != nil {
+		t.Fatalf("executeBatch: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("result count = %d, want 1", len(results))
+	}
+	block := results[0]
+	blockArtifact, ok := block.Presentation["artifact"].(map[string]any)
+	if !ok || block.Display != "Interactive artifact" || blockArtifact["id"] != "art-123" {
+		t.Fatalf("persisted block lost presentation metadata: %+v", block)
+	}
+
+	var live *ToolResult
+	for len(out) > 0 {
+		ev := <-out
+		if ev.Kind == EventToolResult {
+			live = ev.ToolResult
+		}
+	}
+	if live == nil {
+		t.Fatal("missing live EventToolResult")
+	}
+	liveArtifact, ok := live.Presentation["artifact"].(map[string]any)
+	if !ok || live.Display != "Interactive artifact" || liveArtifact["version"] != 2 {
+		t.Fatalf("live event lost presentation metadata: %+v", live)
+	}
+
+	// Dispatch owns the two outbound maps: later tool or live-renderer
+	// mutation must not rewrite persisted history (or vice versa).
+	presentation["artifact"].(map[string]any)["version"] = 3
+	liveArtifact["version"] = 4
+	live.Presentation["actions"].([]any)[0].(map[string]any)["label"] = "Launch"
+	if got := blockArtifact["version"]; got != 2 {
+		t.Fatalf("persisted presentation aliased another owner: version = %#v", got)
+	}
+	blockActions := block.Presentation["actions"].([]any)
+	if got := blockActions[0].(map[string]any)["label"]; got != "Open" {
+		t.Fatalf("persisted action aliased live event: label = %#v", got)
 	}
 }
 

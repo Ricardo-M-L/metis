@@ -169,6 +169,38 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	if opts.Gate != nil && string(opts.Gate.Mode()) == string(permission.ModePlan) {
 		loop.SetPlanMode(true)
 	}
+	// Rebuild authoritative runtime state on every provider request. These
+	// facts intentionally live outside conversation Messages so a compaction
+	// checkpoint cannot make permission mode, cwd or the current plan stale.
+	loop.CurrentStateSections = func() []llm.SystemSection {
+		var body strings.Builder
+		body.WriteString("<runtime_state>\n")
+		if opts.Gate != nil {
+			fmt.Fprintf(&body, "permission_mode: %s\n", opts.Gate.Mode())
+		}
+		if cwd, err := os.Getwd(); err == nil && cwd != "" {
+			fmt.Fprintf(&body, "working_directory: %s\n", cwd)
+		}
+		if sessionID := CurrentSessionID(); sessionID != "" {
+			if plan, err := ReadCurrentPlan(sessionID); err == nil {
+				plan = strings.TrimSpace(plan)
+				if plan != "" && plan != strings.TrimSpace(emptyCurrentPlan) {
+					const maxPlanRunes = 32_000
+					runes := []rune(plan)
+					if len(runes) > maxPlanRunes {
+						plan = string(runes[:maxPlanRunes]) + "\n[plan truncated for request state]"
+					}
+					body.WriteString("<current_plan>\n")
+					body.WriteString(plan)
+					body.WriteString("\n</current_plan>\n")
+				}
+			}
+		}
+		body.WriteString("</runtime_state>")
+		return []llm.SystemSection{{
+			Name: "runtime_state", Body: body.String(), Volatile: true,
+		}}
+	}
 
 	// Memory manager — persistent recall across sessions. Caller can
 	// pass a pre-built one (so the same instance gets handed to the

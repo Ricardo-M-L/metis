@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -212,6 +213,7 @@ func TestManualCompactEndpointReplacesDurableHistory(t *testing.T) {
 	s.activeModel = provider.ModelID()
 	s.stateMu.Unlock()
 	_ = hdr
+	beforeTokens := loop.EstimateContextTokens()
 
 	rr := httptest.NewRecorder()
 	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/compact", bytes.NewBufferString(`{"sessionId":"`+id+`"}`)))
@@ -222,7 +224,13 @@ func TestManualCompactEndpointReplacesDurableHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(durable) >= len(history) {
-		t.Fatalf("durable history did not shrink: before=%d after=%d", len(history), len(durable))
+	if reflect.DeepEqual(durable, history) {
+		t.Fatal("durable history was not replaced")
+	}
+	if got := loop.EstimateContextTokens(); got >= beforeTokens {
+		t.Fatalf("durable context did not shrink: before=%d after=%d", beforeTokens, got)
+	}
+	if !reflect.DeepEqual(durable, loop.History()) {
+		t.Fatal("manual compact durable and live histories diverged")
 	}
 }

@@ -20,35 +20,87 @@ func makeToolUse(name string, input map[string]any) llm.ContentBlock {
 	return llm.ContentBlock{Type: "tool_use", ToolName: name, ToolInput: input}
 }
 
-func TestContract_ThresholdViaWrites(t *testing.T) {
-	var ct contractTracker
-	for i := 0; i < contractWriteThreshold-1; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
-	if ct.thresholdMet() {
-		t.Fatalf("threshold should not yet be met at %d writes", ct.mainWrites)
-	}
-	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	if !ct.thresholdMet() {
-		t.Errorf("threshold expected at %d writes; mainWrites=%d", contractWriteThreshold, ct.mainWrites)
+func observeIndependentRisk(ct *contractTracker) {
+	for _, path := range []string{"internal/a.go", "internal/b.go", "internal/c.go"} {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": path})})
 	}
 }
 
-func TestContract_ThresholdViaAgentDispatches(t *testing.T) {
+func TestContract_ThresholdViaMutationScope(t *testing.T) {
 	var ct contractTracker
-	// Loop-parameterised on contractAgentThreshold (2026-05-21:
-	// bumped 2 → 10, so the old "1 dispatch then 1 more" fixture
-	// no longer matched). After (threshold-1) dispatches the
-	// tracker must still report not-met; the next one tips it over.
-	for i := 0; i < contractAgentThreshold-1; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "plan"})})
+	for _, path := range []string{"internal/a.go", "internal/b.go"} {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": path})})
 	}
 	if ct.thresholdMet() {
-		t.Fatalf("threshold should not yet be met at %d dispatches (threshold=%d)", ct.agentDispatches, contractAgentThreshold)
+		t.Fatalf("threshold should not yet be met at risk score %d", ct.riskScore())
+	}
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": "internal/c.go"})})
+	if !ct.thresholdMet() {
+		t.Errorf("threshold expected for multi-file untested change; score=%d", ct.riskScore())
+	}
+}
+
+func TestContract_ThresholdViaImplementationAgents(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < 2; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "general"})})
+	}
+	if ct.thresholdMet() {
+		t.Fatalf("threshold should not yet be met at %d implementation agents", ct.implementationAgents)
 	}
 	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "general"})})
 	if !ct.thresholdMet() {
-		t.Errorf("threshold expected at %d agent dispatches; got %d", contractAgentThreshold, ct.agentDispatches)
+		t.Errorf("threshold expected at %d implementation agents", ct.implementationAgents)
+	}
+}
+
+func TestContract_RiskSameFileWithValidationDoesNotRequireIndependentVerifier(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < 5; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": "internal/a.go"})})
+	}
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Bash", map[string]any{"command": "go test ./internal/..."})})
+	if ct.thresholdMet() {
+		t.Fatal("repeated edits to one file with focused validation should not force independent verification")
+	}
+}
+
+func TestContract_RiskValidationBeforeLatestEditDoesNotLowerRisk(t *testing.T) {
+	var ct contractTracker
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Bash", map[string]any{"command": "go test ./internal/..."})})
+	for _, path := range []string{"internal/a.go", "internal/a.go", "internal/b.go"} {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": path})})
+	}
+	if !ct.thresholdMet() {
+		t.Fatal("validation that ran before the latest edits must not reduce verification risk")
+	}
+}
+
+func TestContract_RiskMultiFileUntestedChangeRequiresIndependentVerifier(t *testing.T) {
+	var ct contractTracker
+	for _, path := range []string{"internal/a.go", "internal/b.go", "internal/c.go"} {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": path})})
+	}
+	if !ct.thresholdMet() {
+		t.Fatal("untested change spanning several files should require independent verification")
+	}
+}
+
+func TestContract_RiskHighImpactCommandRequiresIndependentVerifier(t *testing.T) {
+	var ct contractTracker
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Bash", map[string]any{"command": "git push origin main"})})
+	if !ct.thresholdMet() {
+		t.Fatal("high-impact external command should require independent verification")
+	}
+}
+
+func TestContract_RiskMultipleImplementersRequireIndependentVerifier(t *testing.T) {
+	var ct contractTracker
+	for i := 0; i < 3; i++ {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "general"})})
+	}
+	if !ct.thresholdMet() {
+		t.Fatal("several implementation agents should require independent verification")
 	}
 }
 
@@ -74,15 +126,13 @@ func TestContract_VerifyDispatchedFlag(t *testing.T) {
 // and never repeats.
 func TestContract_MidTurnReminder_FiresOnceAtThreshold(t *testing.T) {
 	var ct contractTracker
-	// 4 writes — below threshold
-	for i := 0; i < contractWriteThreshold-1; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	for _, path := range []string{"internal/a.go", "internal/b.go"} {
+		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": path})})
 	}
 	if body := ct.shouldFireMidTurnReminder(); body != "" {
 		t.Fatalf("reminder fired below threshold; got: %q", body)
 	}
-	// 5th write — should fire
-	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": "internal/c.go"})})
 	body := ct.shouldFireMidTurnReminder()
 	if body == "" {
 		t.Fatalf("reminder should fire at threshold")
@@ -92,8 +142,7 @@ func TestContract_MidTurnReminder_FiresOnceAtThreshold(t *testing.T) {
 			t.Errorf("reminder body missing %q\n---\n%s", want, body)
 		}
 	}
-	// 6th write — must not refire (one-time)
-	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": "internal/d.go"})})
 	if body := ct.shouldFireMidTurnReminder(); body != "" {
 		t.Errorf("reminder re-fired after the first hit; got: %q", body)
 	}
@@ -101,19 +150,15 @@ func TestContract_MidTurnReminder_FiresOnceAtThreshold(t *testing.T) {
 
 func TestContract_MidTurnReminder_QuietIfVerifyAlreadyDispatched(t *testing.T) {
 	var ct contractTracker
-	// Cross threshold via Agent dispatches, one of which IS verify.
-	// Loop-parameterised on contractAgentThreshold (2026-05-21 bump:
-	// 2 → 10; the old fixture's "1 plan + 1 verify" no longer meets
-	// the threshold).
 	uses := []llm.ContentBlock{
 		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
 	}
-	for i := 0; i < contractAgentThreshold-1; i++ {
-		uses = append(uses, makeToolUse("Agent", map[string]any{"subagent_type": "plan"}))
+	for i := 0; i < 3; i++ {
+		uses = append(uses, makeToolUse("Agent", map[string]any{"subagent_type": "general"}))
 	}
 	ct.observeToolUses(uses)
 	if !ct.thresholdMet() {
-		t.Fatalf("test premise: threshold should be met (have %d dispatches, threshold=%d)", ct.agentDispatches, contractAgentThreshold)
+		t.Fatalf("test premise: risk threshold should be met; score=%d", ct.riskScore())
 	}
 	if body := ct.shouldFireMidTurnReminder(); body != "" {
 		t.Errorf("reminder should stay quiet when verify already dispatched; got: %q", body)
@@ -125,9 +170,7 @@ func TestContract_MidTurnReminder_QuietIfVerifyAlreadyDispatched(t *testing.T) {
 // substantial and no verify dispatched.
 func TestContract_GateEnd_FiresAtThresholdNoVerify(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	body := ct.shouldGateEnd("All done!")
 	if body == "" {
 		t.Fatalf("gate should fire on first end-attempt without verify")
@@ -145,9 +188,7 @@ func TestContract_GateEnd_FiresAtThresholdNoVerify(t *testing.T) {
 // must release.
 func TestContract_GateEnd_CapsAtTwoAttempts(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	if ct.shouldGateEnd("done") == "" {
 		t.Fatalf("attempt 1 should fire")
 	}
@@ -170,9 +211,7 @@ func TestContract_GateEnd_QuietBelowThreshold(t *testing.T) {
 
 func TestContract_GateEnd_QuietWhenVerifyDispatched(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	ct.observeToolUses([]llm.ContentBlock{
 		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
 	})
@@ -183,9 +222,7 @@ func TestContract_GateEnd_QuietWhenVerifyDispatched(t *testing.T) {
 
 func TestContract_GateEnd_OverridePhraseReleases(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	const text = "Refactor was pure rename across 5 files, no behavior change.\n" +
 		"OVERRIDE CONTRACT: rename-only refactor, no tests apply"
 	if body := ct.shouldGateEnd(text); body != "" {
@@ -199,9 +236,7 @@ func TestContract_GateEnd_OverridePhraseReleases(t *testing.T) {
 func TestContract_EnvDisableBypassesAll(t *testing.T) {
 	t.Setenv("METIS_CONTRACT_DISABLE", "1")
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	if body := ct.shouldFireMidTurnReminder(); body != "" {
 		t.Errorf("mid-turn reminder should be disabled by env; got: %q", body)
 	}
@@ -212,9 +247,7 @@ func TestContract_EnvDisableBypassesAll(t *testing.T) {
 
 func TestContract_Reset(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	ct.shouldFireMidTurnReminder()
 	ct.shouldGateEnd("done")
 	if ct.mainWrites == 0 || !ct.reminderFired || ct.gateAttempts == 0 {
@@ -309,10 +342,7 @@ func TestObserveToolResults_SetsVerdictFromVerifyOnly(t *testing.T) {
 
 func TestGateEnd_VerdictGate_FailHolds(t *testing.T) {
 	var ct contractTracker
-	// Threshold via writes + verify dispatched.
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
@@ -329,9 +359,7 @@ func TestGateEnd_VerdictGate_FailHolds(t *testing.T) {
 
 func TestGateEnd_VerdictGate_PartialHolds(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
@@ -344,9 +372,7 @@ func TestGateEnd_VerdictGate_PartialHolds(t *testing.T) {
 
 func TestGateEnd_VerdictGate_MissingHolds(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
@@ -359,9 +385,7 @@ func TestGateEnd_VerdictGate_MissingHolds(t *testing.T) {
 
 func TestGateEnd_VerdictGate_PassReleases(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
@@ -374,9 +398,7 @@ func TestGateEnd_VerdictGate_PassReleases(t *testing.T) {
 
 func TestGateEnd_VerdictGate_OverrideReleases(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
@@ -390,9 +412,7 @@ func TestGateEnd_VerdictGate_OverrideReleases(t *testing.T) {
 
 func TestGateEnd_VerdictGate_CapsAtTwoAttempts(t *testing.T) {
 	var ct contractTracker
-	for i := 0; i < contractWriteThreshold; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Write", nil)})
-	}
+	observeIndependentRisk(&ct)
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{

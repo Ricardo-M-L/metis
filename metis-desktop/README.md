@@ -63,9 +63,26 @@ METIS_PORT=9090 metis desktop --web   # env fallback when --port is omitted
 ```
 
 `--port` (or `-p`) implies `--web`. `METIS_PORT` is only consulted for web mode
-when no explicit port was supplied. The native application does not expose this
-HTTP server; Wails development mode may use its own internal development server
-for frontend reloads.
+when no explicit port was supplied. The native shell starts a random loopback
+server and displays it in an embedded frame. The shell keeps a deliberately
+narrow native bridge for the system folder picker and explicit in-app updates;
+the browser-only build receives neither capability.
+
+## In-app updates
+
+The update icon beside Settings performs a read-only release check. Merely
+launching Desktop or seeing the green availability dot never downloads or
+installs anything. The current version remains active until the user opens the
+dialog and chooses **Update and restart**.
+
+After that explicit confirmation, Desktop updates the matching Metis CLI,
+downloads the platform Desktop release and its SHA-256 sidecar, verifies the
+archive and candidate application, atomically activates it, and restarts with
+the same workspace. macOS also verifies the bundle with `codesign` and keeps the
+prior bundle at `<application>.previous` as a rollback copy. Linux supports the
+same explicit flow for the published amd64 binary. Windows release discovery is
+shown but automatic activation is disabled until a signed hand-off helper can
+replace the running executable safely.
 
 ## Development
 

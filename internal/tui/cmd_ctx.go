@@ -15,8 +15,6 @@ package tui
 import (
 	"fmt"
 	"strings"
-
-	"github.com/Ricardo-M-L/metis/internal/agent"
 )
 
 func cmdCtx(r *REPL, args string) string {
@@ -53,18 +51,31 @@ func cmdCtx(r *REPL, args string) string {
 
 	b.WriteString(fmt.Sprintf("  threshold:       %.2f (%d%%)\n",
 		c.Threshold, int(c.Threshold*100)))
+
+	// Use the compactor's public boundary calculation rather than copying its
+	// input-cap reservation logic here. That keeps this diagnostic identical to
+	// ShouldCompact, including compatibility switches and future policy changes.
+	trigger := c.TriggerTokens()
+	minimum := c.MinimumTokens
+	if trigger > 0 && minimum > trigger {
+		minimum = trigger
+	}
 	if c.MinimumTokens > 0 {
-		b.WriteString(fmt.Sprintf("  minimum tokens:  %s (floor — compact disabled below this)\n",
-			fmtThousands(c.MinimumTokens)))
+		if minimum != c.MinimumTokens {
+			b.WriteString(fmt.Sprintf("  minimum tokens:  %s (configured %s; clamped to trigger)\n",
+				fmtThousands(minimum), fmtThousands(c.MinimumTokens)))
+		} else {
+			b.WriteString(fmt.Sprintf("  minimum tokens:  %s (floor — compact disabled below this)\n",
+				fmtThousands(minimum)))
+		}
 	}
 
-	// Trigger point in absolute tokens. effectiveInputCap mirrors
-	// agent.Compactor.effectiveInputCap() (unexported): cap minus the
-	// reserved output budget, clamped at 0.
-	effectiveCap := effectiveInputCap(c)
-	trigger := int(float64(effectiveCap) * c.Threshold)
-	b.WriteString(fmt.Sprintf("  trigger at:      %s tokens (effective cap %s × threshold)\n",
-		fmtThousands(trigger), fmtThousands(effectiveCap)))
+	if trigger > 0 {
+		b.WriteString(fmt.Sprintf("  trigger at:      %s tokens (authoritative compactor boundary)\n",
+			fmtThousands(trigger)))
+	} else {
+		b.WriteString("  trigger at:      disabled (threshold or input capacity unavailable)\n")
+	}
 
 	// Live token estimate from the loop — same source the bottom status
 	// bar reads.
@@ -72,9 +83,11 @@ func cmdCtx(r *REPL, args string) string {
 	b.WriteString(fmt.Sprintf("  current tokens:  %s\n", fmtThousands(used)))
 
 	switch {
-	case c.MinimumTokens > 0 && used < c.MinimumTokens:
+	case trigger <= 0:
+		b.WriteString("  status:          auto-compact disabled (no valid trigger boundary)\n")
+	case minimum > 0 && used < minimum:
 		b.WriteString(fmt.Sprintf("  status:          BELOW MINIMUM FLOOR (%s < %s) — auto-compact gated\n",
-			fmtThousands(used), fmtThousands(c.MinimumTokens)))
+			fmtThousands(used), fmtThousands(minimum)))
 	case used >= trigger:
 		over := used - trigger
 		b.WriteString(fmt.Sprintf("  status:          OVER trigger by %s tokens — will compact at next iter boundary\n",
@@ -93,20 +106,4 @@ func cmdCtx(r *REPL, args string) string {
 		loop.IterIdx()))
 
 	return b.String()
-}
-
-// effectiveInputCap mirrors agent.Compactor.effectiveInputCap()
-// (unexported). Reserves min(MaxOutputTokens, agent.MaxReservedForSummary)
-// from the context window so ShouldCompact accounts for the assistant's
-// output budget; clamps at 0 / MaxContextTokens for edge cases.
-func effectiveInputCap(c *agent.Compactor) int {
-	reserved := c.MaxOutputTokens
-	if reserved > agent.MaxReservedForSummary {
-		reserved = agent.MaxReservedForSummary
-	}
-	cap := c.MaxContextTokens - reserved
-	if cap <= 0 {
-		return c.MaxContextTokens
-	}
-	return cap
 }

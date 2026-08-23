@@ -94,6 +94,10 @@ Bundled marketplaces (auto-registered, override by adding a user entry):
   anthropic-agent-skills      → github:anthropics/skills
   claude-plugins-official     → github:anthropics/claude-plugins-official
   claude-plugins-community    → github:anthropics/claude-plugins-community
+  codex-plugins-official      → github:openai/plugins
+
+Codex package caches and DeepSeek Harness npm profiles are ecosystem adapters,
+not marketplace registrations. Desktop shows their component compatibility.
 
 Set METIS_NO_BUNDLED_PLUGINS=1 to ignore the bundled defaults.`)
 }
@@ -136,8 +140,12 @@ func cmdPluginList(ctx context.Context) error {
 			continue
 		}
 		mcpStatus := ""
+		mcpCount := len(m.MCPServers)
 		if m.MCPServer != nil {
-			mcpStatus = " [mcp]"
+			mcpCount++
+		}
+		if mcpCount > 0 {
+			mcpStatus = fmt.Sprintf(" [mcp:%d]", mcpCount)
 		}
 		fmt.Printf("  %-20s  %s  %s%s\n", m.Name, m.Version, m.Description, mcpStatus)
 		count++
@@ -172,6 +180,21 @@ func cmdPluginInfo(ctx context.Context, name string) error {
 		}
 		if len(m.MCPServer.Env) > 0 {
 			fmt.Printf("  env:       %v\n", m.MCPServer.Env)
+		}
+	}
+	for _, server := range m.MCPServers {
+		fmt.Printf("mcp_server %s:\n", server.Name)
+		if server.Command != "" {
+			fmt.Printf("  command:   %s\n", server.Command)
+		}
+		if server.URL != "" {
+			fmt.Printf("  url:       %s\n", server.URL)
+		}
+		if len(server.Args) > 0 {
+			fmt.Printf("  args:      %v\n", server.Args)
+		}
+		if server.WorkingDir != "" {
+			fmt.Printf("  cwd:       %s\n", server.WorkingDir)
 		}
 	}
 	if len(m.Skills) > 0 {

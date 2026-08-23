@@ -82,6 +82,31 @@ func TestOpenAppBuildsPlatformCommandsWithCLIOverride(t *testing.T) {
 	}
 }
 
+func TestResolveLauncherCLIPathPrefersStableManagedLauncher(t *testing.T) {
+	root := t.TempDir()
+	stable := filepath.Join(root, "bin", "metis")
+	resolved := filepath.Join(root, "share", "metis", "versions", "0.4.28", "metis")
+
+	got := resolveLauncherCLIPath(
+		func() (string, error) { return stable, nil },
+		func() (string, error) { return resolved, nil },
+	)
+	if got != stable {
+		t.Fatalf("resolveLauncherCLIPath() = %q, want stable launcher %q", got, stable)
+	}
+}
+
+func TestResolveLauncherCLIPathFallsBackToExecutable(t *testing.T) {
+	resolved := filepath.Join(t.TempDir(), "metis")
+	got := resolveLauncherCLIPath(
+		func() (string, error) { return "", errors.New("not managed") },
+		func() (string, error) { return resolved, nil },
+	)
+	if got != resolved {
+		t.Fatalf("resolveLauncherCLIPath() = %q, want executable fallback %q", got, resolved)
+	}
+}
+
 func TestFindExistingAppPathOverrideAndLocalBuild(t *testing.T) {
 	tests := []struct {
 		name     string

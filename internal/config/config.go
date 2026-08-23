@@ -688,13 +688,10 @@ func defaults() *Config {
 		Session: Session{
 			Dir:      filepath.Join(dh, "sessions"),
 			SkillDir: filepath.Join(dh, "skills"),
-			// 0.95 (up from 0.85 on 2026-05-16): the per-turn peak
-			// against a 1M-context provider sat under cap*0.85 in the
-			// longrun stress test, so compaction never fired. Pushing
-			// the gate later means the prompt cache survives much
-			// longer between rewrites; the LLM transport overflow
-			// auto-retry catches the rare overshoot.
-			AutoCompactThreshold: 0.95,
+			// One heavy checkpoint at 85%. The unified pipeline retains a
+			// small recent tail and no longer lets an earlier Snip/Collapse
+			// pass lower pressure enough to cancel full compaction.
+			AutoCompactThreshold: 0.85,
 			// 50K absolute floor (DeepSeek-TUI MINIMUM_AUTO_COMPACTION_TOKENS
 			// idea, scaled down from their 500K to fit metis's broader
 			// provider mix). On 1M-context this barely matters; on

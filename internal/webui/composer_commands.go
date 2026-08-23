@@ -200,28 +200,40 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	s.hub.publish(body.SessionID, agent.Event{Kind: agent.EventCompactionStart, Info: "manual"})
-	compacted, err := s.loop.Compactor.CompactWithInstructions(ctx, history, strings.TrimSpace(body.Instructions))
+	cursor := session.NewHistoryCursor(history)
+	result, err := s.loop.CompactNow(ctx, agent.CompactOptions{
+		Trigger:      "manual",
+		Force:        true,
+		Instructions: strings.TrimSpace(body.Instructions),
+		Persist: func(replacement []llm.Message) error {
+			return s.store.ReplaceHistoryAndMark(body.SessionID, replacement, &cursor)
+		},
+		Emit: func(ev agent.Event) {
+			s.hub.publish(body.SessionID, ev)
+		},
+	})
 	if err != nil {
-		s.hub.publish(body.SessionID, agent.Event{Kind: agent.EventCompactionEnd, Info: "manual", Err: err})
 		writeError(w, http.StatusBadGateway, "compact failed: "+err.Error())
 		return
 	}
-	if len(compacted) >= len(history) {
-		s.hub.publish(body.SessionID, agent.Event{Kind: agent.EventCompactionEnd, Info: "manual"})
-		writeJSON(w, http.StatusOK, map[string]any{"compacted": false, "before": len(history), "after": len(compacted), "message": "History did not need compaction"})
+	if !result.Applied {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"compacted":    false,
+			"before":       result.BeforeMessages,
+			"after":        result.AfterMessages,
+			"beforeTokens": result.BeforeTokens,
+			"afterTokens":  result.AfterTokens,
+			"message":      "History did not need compaction",
+		})
 		return
 	}
-	cursor := session.NewHistoryCursor(history)
-	if err := s.store.ReplaceHistoryAndMark(body.SessionID, compacted, &cursor); err != nil {
-		s.hub.publish(body.SessionID, agent.Event{Kind: agent.EventCompactionEnd, Info: "manual", Err: err})
-		writeError(w, http.StatusInternalServerError, "compaction persistence failed: "+err.Error())
-		return
-	}
-	s.loop.Restore(compacted)
-	s.hub.publish(body.SessionID, agent.Event{Kind: agent.EventContextCompacted, Info: "manual"})
-	s.hub.publish(body.SessionID, agent.Event{Kind: agent.EventCompactionEnd, Info: "manual"})
-	writeJSON(w, http.StatusOK, map[string]any{"compacted": true, "before": len(history), "after": len(compacted)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"compacted":    true,
+		"before":       result.BeforeMessages,
+		"after":        result.AfterMessages,
+		"beforeTokens": result.BeforeTokens,
+		"afterTokens":  result.AfterTokens,
+	})
 }
 
 // applyPermissionMode keeps the permission gate and the Loop plan controller

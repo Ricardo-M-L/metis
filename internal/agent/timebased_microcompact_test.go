@@ -9,13 +9,10 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
-// TestLoop_TimeBasedMicrocompact_FiresWhenIdleExceeded — proves the
-// Tier 1.5 path force-runs a Microcompact pass even when SnipThreshold
-// isn't crossed, provided IdleMaxSeconds has elapsed since the last
-// time-based pass. Models CC's services/compact/timeBasedMC, which
-// kicks in around the 60-min provider-cache TTL to avoid re-sending
-// tool_results the cache has already aged out.
-func TestLoop_TimeBasedMicrocompact_FiresWhenIdleExceeded(t *testing.T) {
+// Wall-clock idle maintenance no longer rewrites live history on its own.
+// Microcompact is an internal preparation step of the single heavy pipeline,
+// so an old cache timestamp cannot create a second user-visible compression.
+func TestLoop_TimeBasedMicrocompact_DoesNotRunStandalone(t *testing.T) {
 	cfg := DefaultCompactionConfig()
 	cfg.ProtectFirst = 1
 	cfg.ProtectLast = 3
@@ -29,7 +26,8 @@ func TestLoop_TimeBasedMicrocompact_FiresWhenIdleExceeded(t *testing.T) {
 
 	c := NewCompactor(cfg, "test", 100000, &fakeSummarizer{})
 	l := &Loop{Compactor: c}
-	l.lastTimeBasedMicrocompactAt = time.Now().Add(-5 * time.Second)
+	originalTimestamp := time.Now().Add(-5 * time.Second)
+	l.lastTimeBasedMicrocompactAt = originalTimestamp
 
 	// Build a convo with a fat tool_result. Token total is BELOW SnipThreshold
 	// (we set it to 0.99 so the threshold path stays silent), so only the
@@ -50,21 +48,17 @@ func TestLoop_TimeBasedMicrocompact_FiresWhenIdleExceeded(t *testing.T) {
 	l.maybeCompact(context.Background(), out)
 	close(out)
 
-	timeBased := 0
 	for ev := range out {
 		if ev.Kind == EventInfo && strings.Contains(ev.Info, "microcompacted (time-based") {
-			timeBased++
+			t.Fatalf("standalone time-based microcompact event leaked: %+v", ev)
 		}
 	}
-	if timeBased != 1 {
-		t.Errorf("expected exactly 1 time-based microcompact notice; got %d", timeBased)
-	}
 	got := l.Messages[2].Content[0].ToolResult
-	if len(got) >= 8000 {
-		t.Errorf("tool_result not microcompacted; len=%d (want < 8000)", len(got))
+	if len(got) != 8000 {
+		t.Errorf("history changed below heavy threshold; len=%d", len(got))
 	}
-	if time.Since(l.lastTimeBasedMicrocompactAt) > 2*time.Second {
-		t.Errorf("lastTimeBasedMicrocompactAt was not refreshed after fire")
+	if !l.lastTimeBasedMicrocompactAt.Equal(originalTimestamp) {
+		t.Errorf("standalone path refreshed timestamp: got=%v want=%v", l.lastTimeBasedMicrocompactAt, originalTimestamp)
 	}
 }
 

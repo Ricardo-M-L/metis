@@ -34,6 +34,12 @@ func writeMarketplaceFixture(t *testing.T, home string) {
 	if err := os.MkdirAll(filepath.Join(root, "plugins", "docs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(root, "plugins", "docs", ".claude-plugin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "plugins", "docs", "assets"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	manifest := `{
   "name": "Fixture marketplace",
   "plugins": [
@@ -63,6 +69,14 @@ func writeMarketplaceFixture(t *testing.T, home string) {
 	if err := os.WriteFile(filepath.Join(root, "plugins", "docs", "SKILL.md"), []byte(skill), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	pluginManifest := `{"name":"document-tools","interface":{"displayName":"Document Tools","logo":"./assets/icon.svg","brandColor":"#4668ff"}}`
+	if err := os.WriteFile(filepath.Join(root, "plugins", "docs", ".claude-plugin", "plugin.json"), []byte(pluginManifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	icon := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#4668ff"/></svg>`
+	if err := os.WriteFile(filepath.Join(root, "plugins", "docs", "assets", "icon.svg"), []byte(icon), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPluginMarketplaceCatalogInstallAndRecoverableRemove(t *testing.T) {
@@ -80,12 +94,20 @@ func TestPluginMarketplaceCatalogInstallAndRecoverableRemove(t *testing.T) {
 	}
 	if !bytes.Contains(rr.Body.Bytes(), []byte(`"name":"document-tools"`)) ||
 		!bytes.Contains(rr.Body.Bytes(), []byte(`"marketplace":"fixture-market"`)) ||
-		!bytes.Contains(rr.Body.Bytes(), []byte(`"installable":true`)) {
+		!bytes.Contains(rr.Body.Bytes(), []byte(`"installable":true`)) ||
+		!bytes.Contains(rr.Body.Bytes(), []byte(`"displayName":"Document Tools"`)) ||
+		!bytes.Contains(rr.Body.Bytes(), []byte(`"icon":"/api/plugins/icon?marketplace=fixture-market\u0026plugin=document-tools"`)) {
 		t.Fatalf("catalog missing installable fixture: %s", rr.Body.String())
 	}
 	if !bytes.Contains(rr.Body.Bytes(), []byte(`"name":"external-tool"`)) ||
 		!bytes.Contains(rr.Body.Bytes(), []byte(`"installable":false`)) {
 		t.Fatalf("catalog missing unsupported fixture: %s", rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/plugins/icon?marketplace=fixture-market&plugin=document-tools", nil))
+	if rr.Code != http.StatusOK || rr.Header().Get("Content-Type") != "image/svg+xml" || !bytes.Contains(rr.Body.Bytes(), []byte("<svg")) {
+		t.Fatalf("icon: %d %s %s", rr.Code, rr.Header().Get("Content-Type"), rr.Body.String())
 	}
 
 	rr = httptest.NewRecorder()

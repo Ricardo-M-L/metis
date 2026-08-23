@@ -29,15 +29,21 @@ function workspaceForSession(s) {
 }
 
 async function addWorkspace() {
-  const path = prompt('Add workspace path');
-  if (!path || !path.trim()) return;
-  const name = prompt('Workspace name (optional)', '') || '';
-  try {
-    const res = await fetch('/api/workspaces', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: path.trim(), name: name.trim() })
-    });
+	let path = '';
+	try {
+		path = await requestNative('choose-workspace');
+	} catch (error) {
+		// The standalone browser UI has no Wails shell. Retain a deliberate
+		// path-entry fallback there; native Desktop always opens the OS picker.
+		path = prompt(uiText('Add workspace path', '输入工作区路径'), '') || '';
+	}
+	if (!path || !path.trim()) return;
+	try {
+		const res = await fetch('/api/workspaces', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: path.trim() })
+		});
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'add workspace: ' + res.status);
     await loadWorkspaces();
@@ -838,6 +844,9 @@ async function resumeSession(id) {
     messages = [];
     streamedTextThisTurn = false;
     renderHistoryMessages(data.messages);
+    if (typeof loadArtifactsForSession === 'function') {
+      await loadArtifactsForSession(currentSessionId, { rebuildCards: true });
+    }
     document.getElementById('topbarTitle').textContent = data.session.title || 'Session';
 	const preset = document.getElementById('presetName');
 	if (preset) preset.textContent = presetDisplayName(data.session.preset || 'standard');

@@ -8,6 +8,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -74,6 +75,57 @@ func TestCmdCtx_PrintsAllDiagnosticFields(t *testing.T) {
 		if !strings.Contains(out, w) {
 			t.Errorf("/ctx output missing %q; full output:\n%s", w, out)
 		}
+	}
+}
+
+// TestCmdCtx_UsesAuthoritativeTriggerTokens verifies that /ctx reports the
+// same boundary as Compactor.ShouldCompact even when the full output reserve
+// compatibility switch is enabled. A locally duplicated cap formula used to
+// ignore this switch and display a different trigger from the one in use.
+func TestCmdCtx_UsesAuthoritativeTriggerTokens(t *testing.T) {
+	t.Setenv("METIS_COMPACT_RESERVE_FULL_MAX_TOKENS", "1")
+
+	prov := &ctxTestProvider{id: "large-output-model", maxCtx: 192_000}
+	cfg := agent.DefaultCompactionConfig()
+	cfg.Threshold = 0.8
+
+	loop := agent.NewLoop(prov, tools.NewRegistry(),
+		permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
+	loop.Compactor = agent.NewCompactor(cfg, prov.id, prov.maxCtx, prov)
+	loop.Compactor.MaxOutputTokens = 64_000
+
+	out := cmdCtx(&REPL{Loop: loop}, "")
+	want := fmt.Sprintf("trigger at:      %s tokens", fmtThousands(loop.Compactor.TriggerTokens()))
+	if !strings.Contains(out, want) {
+		t.Fatalf("/ctx trigger must match Compactor.TriggerTokens(); want %q in:\n%s", want, out)
+	}
+}
+
+// TestCmdCtx_ClampsMinimumToTrigger verifies the diagnostic applies the same
+// floor clamp as Compactor.ShouldCompact. A copied 200K minimum must not make
+// /ctx claim compaction is gated past the real boundary of a smaller model.
+func TestCmdCtx_ClampsMinimumToTrigger(t *testing.T) {
+	prov := &ctxTestProvider{id: "small-window-model", maxCtx: 128_000}
+	cfg := agent.DefaultCompactionConfig()
+	cfg.Threshold = 0.85
+	cfg.MinimumTokens = 200_000
+
+	loop := agent.NewLoop(prov, tools.NewRegistry(),
+		permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
+	loop.Compactor = agent.NewCompactor(cfg, prov.id, prov.maxCtx, prov)
+	loop.Compactor.MaxOutputTokens = 20_000
+
+	out := cmdCtx(&REPL{Loop: loop}, "")
+	trigger := loop.Compactor.TriggerTokens()
+	wantFloor := fmt.Sprintf("minimum tokens:  %s (configured %s; clamped to trigger)",
+		fmtThousands(trigger), fmtThousands(cfg.MinimumTokens))
+	if !strings.Contains(out, wantFloor) {
+		t.Fatalf("/ctx must display the effective clamped floor; want %q in:\n%s", wantFloor, out)
+	}
+	wantStatus := fmt.Sprintf("BELOW MINIMUM FLOOR (%s < %s)",
+		fmtThousands(loop.EstimateContextTokens()), fmtThousands(trigger))
+	if !strings.Contains(out, wantStatus) {
+		t.Fatalf("/ctx status must use the effective clamped floor; want %q in:\n%s", wantStatus, out)
 	}
 }
 

@@ -12,6 +12,36 @@ let currentSessionId = null;
 let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN' };
 let lastStatusSnapshot = null;
 
+// The browser UI lives in a loopback iframe inside the Wails shell. This
+// narrow request bridge intentionally exposes three named native actions;
+// arbitrary commands, paths, or Wails bindings never cross the frame.
+let nativeRequestSequence = 0;
+const nativeRequests = new Map();
+
+window.addEventListener('message', event => {
+  const response = event.data || {};
+  if (event.source !== window.parent || response.channel !== 'metis-native' || response.kind !== 'response') return;
+  const pending = nativeRequests.get(response.id);
+  if (!pending) return;
+  nativeRequests.delete(response.id);
+  clearTimeout(pending.timer);
+  if (response.error) pending.reject(new Error(response.error));
+  else pending.resolve(response.value);
+});
+
+function requestNative(action, payload = {}, timeoutMs = 30000) {
+  if (window.parent === window) return Promise.reject(new Error('This action requires the native METIS Desktop app.'));
+  const id = 'native-' + Date.now() + '-' + (++nativeRequestSequence);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nativeRequests.delete(id);
+      reject(new Error('The native Desktop action timed out.'));
+    }, timeoutMs);
+    nativeRequests.set(id, { resolve, reject, timer });
+    window.parent.postMessage({ channel: 'metis-native', kind: 'request', id, action, payload }, '*');
+  });
+}
+
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
   initDesktopPreferences().then(loadWorkspaces).finally(loadSessions);
@@ -30,6 +60,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }).catch(() => {});
 	if (typeof loadEffort === 'function') loadEffort();
   document.getElementById('inputField').focus();
+	setTimeout(() => checkDesktopUpdate(false), 250);
 });
 
 async function initDesktopPreferences() {
@@ -43,7 +74,7 @@ async function initDesktopPreferences() {
 
 const DESKTOP_I18N = {
   en: {
-    newSession: 'New session', workspaces: 'Workspaces', searchSessions: 'Search sessions…', settings: 'Settings',
+    newSession: 'New session', workspaces: 'Workspaces', searchSessions: 'Search sessions…', settings: 'Settings', checkUpdates: 'Check for updates',
     searchSessionsLabel: 'Search sessions', collapseSidebar: 'Collapse sidebar', expandSidebar: 'Expand sidebar',
     context: 'Context', autoCompactAt: 'auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
     chat: 'Chat', trajectory: 'Trajectory', welcome: 'From idea to done', preview: 'METIS Desktop', sessionLog: 'Session log',
@@ -52,7 +83,7 @@ const DESKTOP_I18N = {
     modelProviders: 'Model Providers', agentPresets: 'Agent Presets', plugins: 'Plugins', smartRouting: 'Smart Routing', configuration: 'Configuration'
   },
   'zh-CN': {
-    newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置',
+    newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置', checkUpdates: '检查更新',
     searchSessionsLabel: '搜索会话', collapseSidebar: '收起侧栏', expandSidebar: '展开侧栏',
     context: '上下文', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
     chat: '对话', trajectory: '轨迹', welcome: '从想法，到完成', preview: 'METIS Desktop', sessionLog: '会话日志',
@@ -119,6 +150,112 @@ function escAttr(s) {
 // a real backslash escape instead.
 function escOnclick(s) {
   return escHtml(s).replace(/'/g, "\\'");
+}
+
+let desktopUpdateStatus = null;
+let desktopUpdateChecking = false;
+let desktopUpdateDialog = null;
+
+function paintDesktopUpdateButton() {
+  const button = document.getElementById('desktopUpdateBtn');
+  if (!button) return;
+  button.classList.toggle('checking', desktopUpdateChecking);
+  button.classList.toggle('available', !!(desktopUpdateStatus && desktopUpdateStatus.available));
+  button.classList.toggle('unsupported', !!(desktopUpdateStatus && !desktopUpdateStatus.canUpdate));
+  const title = desktopUpdateChecking
+    ? uiText('Checking for updates…', '正在检查更新…')
+    : desktopUpdateStatus && desktopUpdateStatus.available
+      ? uiText('Update to METIS Desktop ', '更新到 METIS Desktop ') + desktopUpdateStatus.latestVersion
+      : uiText('Check for updates', '检查更新');
+  button.title = title;
+  button.setAttribute('aria-label', title);
+}
+
+async function checkDesktopUpdate(notify = true) {
+  if (desktopUpdateChecking) return desktopUpdateStatus;
+  desktopUpdateChecking = true;
+  paintDesktopUpdateButton();
+  try {
+    desktopUpdateStatus = await requestNative('check-update');
+    paintDesktopUpdateButton();
+    if (notify && desktopUpdateStatus && !desktopUpdateStatus.available) {
+      showToast(desktopUpdateStatus.message || uiText('METIS Desktop is up to date.', 'METIS Desktop 已是最新版本。'));
+    }
+    return desktopUpdateStatus;
+  } catch (error) {
+    // Browser development mode intentionally has no native bridge. Keep the
+    // icon useful there by surfacing the limitation only after a user click.
+    if (notify) showToast(error.message || uiText('Unable to check for updates.', '无法检查更新。'));
+    return null;
+  } finally {
+    desktopUpdateChecking = false;
+    paintDesktopUpdateButton();
+  }
+}
+
+async function openDesktopUpdateDialog() {
+  const status = await checkDesktopUpdate(false);
+  if (!status) {
+    showToast(uiText('Updates are available in the native METIS Desktop app.', '请在原生 METIS Desktop 客户端中检查更新。'));
+    return;
+  }
+  closeDesktopUpdateDialog(true);
+  const available = !!status.available;
+  const canUpdate = !!status.canUpdate;
+  const overlay = document.createElement('div');
+  overlay.className = 'update-overlay';
+  overlay.innerHTML = `<section class="update-dialog" role="alertdialog" aria-modal="true" aria-labelledby="updateDialogTitle" aria-describedby="updateDialogDescription">
+    <div class="update-dialog-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 7.2A7 7 0 1 0 16.2 13"/><path d="M16.5 3.5v3.7h-3.7"/></svg></div>
+    <div class="update-dialog-copy"><h2 id="updateDialogTitle">${available ? uiText('Update available', '发现新版本') : uiText('METIS Desktop is current', 'METIS Desktop 已是最新版本')}</h2>
+      <p id="updateDialogDescription">${escHtml(status.message || '')}</p>
+      <div class="update-version-row"><span>${uiText('Current', '当前')} ${escHtml(status.currentVersion || '-')}</span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 8h10M9 4l4 4-4 4"/></svg><strong>${escHtml(status.latestVersion || status.currentVersion || '-')}</strong></div>
+      <p class="update-safety">${uiText('The release archive, SHA-256 checksum, and candidate app are verified before replacement. Nothing changes until you choose Update and restart.', '替换应用前会验证发布归档、SHA-256 校验值和候选应用。只有点击“更新并重启”才会修改当前版本。')}</p>
+      <p class="update-error" role="alert" hidden></p>
+    </div>
+    <div class="update-dialog-actions"><button type="button" class="update-later">${available ? uiText('Later', '稍后') : uiText('Close', '关闭')}</button>${available ? `<button type="button" class="update-confirm" ${canUpdate ? '' : 'disabled'}>${uiText('Update and restart', '更新并重启')}</button>` : ''}</div>
+  </section>`;
+  document.body.appendChild(overlay);
+  const trigger = document.getElementById('desktopUpdateBtn');
+  desktopUpdateDialog = { overlay, trigger, pending: false };
+  overlay.querySelector('.update-later').addEventListener('click', () => closeDesktopUpdateDialog(false));
+  const confirm = overlay.querySelector('.update-confirm');
+  if (confirm) confirm.addEventListener('click', installDesktopUpdate);
+  overlay.addEventListener('click', event => { if (event.target === overlay) closeDesktopUpdateDialog(false); });
+  overlay.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && !desktopUpdateDialog.pending) { event.preventDefault(); closeDesktopUpdateDialog(false); }
+  });
+  requestAnimationFrame(() => (confirm && !confirm.disabled ? confirm : overlay.querySelector('.update-later')).focus());
+}
+
+function closeDesktopUpdateDialog(force) {
+  if (!desktopUpdateDialog || (desktopUpdateDialog.pending && !force)) return;
+  const state = desktopUpdateDialog;
+  desktopUpdateDialog = null;
+  state.overlay.remove();
+  if (state.trigger) state.trigger.focus();
+}
+
+async function installDesktopUpdate() {
+  const state = desktopUpdateDialog;
+  if (!state || state.pending) return;
+  state.pending = true;
+  const confirm = state.overlay.querySelector('.update-confirm');
+  const later = state.overlay.querySelector('.update-later');
+  const error = state.overlay.querySelector('.update-error');
+  confirm.disabled = true;
+  later.disabled = true;
+  confirm.textContent = uiText('Downloading and verifying…', '正在下载并验证…');
+  try {
+    desktopUpdateStatus = await requestNative('install-update', {}, 15 * 60 * 1000);
+    confirm.textContent = uiText('Restarting…', '正在重启…');
+  } catch (err) {
+    state.pending = false;
+    confirm.disabled = false;
+    later.disabled = false;
+    confirm.textContent = uiText('Try again', '重试');
+    error.hidden = false;
+    error.textContent = err.message || uiText('Update failed.', '更新失败。');
+  }
 }
 // --- Helpers ---
 function escHtml(s) {
@@ -196,12 +333,17 @@ function renderStatusSnapshot(d) {
       if (limit > 0) {
         const fraction = used / limit;
         const percent = Math.max(0, Math.min(999, Math.round(fraction * 100)));
-        const compactAt = Number(d.compactThreshold) || 0;
+        const compactAtTokens = Number(d.compactAtTokens) || 0;
+        const compactAt = compactAtTokens > 0
+          ? compactAtTokens / limit
+          : Number(d.compactThreshold) || 0;
         meter.style.display = '';
         meter.textContent = dict.context + ' ' + percent + '%';
         meter.title = dict.context + ' ' + fmtTokens(used) + ' / ' + fmtTokens(limit) + ' tokens' +
-          (compactAt > 0 ? ' \u00B7 ' + dict.autoCompactAt + ' ' + Math.round(compactAt * 100) + '%' : '');
-        meter.classList.toggle('warn', compactAt > 0 && fraction >= Math.max(0, compactAt - 0.1));
+          (compactAtTokens > 0
+            ? ' \u00B7 ' + dict.autoCompactAt + ' ' + fmtTokens(compactAtTokens) + ' tokens (' + Math.round(compactAt * 100) + '%)'
+            : compactAt > 0 ? ' \u00B7 ' + dict.autoCompactAt + ' ' + Math.round(compactAt * 100) + '%' : '');
+        meter.classList.toggle('warn', compactAt > 0 && used >= Math.max(0, compactAtTokens > 0 ? compactAtTokens * 0.9 : limit * (compactAt - 0.1)));
       } else {
         meter.style.display = 'none';
       }

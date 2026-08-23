@@ -67,6 +67,11 @@ type ContentBlock struct {
 	ToolInput  map[string]any `json:"input,omitempty"`
 	ToolResult string         `json:"content,omitempty"`
 	IsError    bool           `json:"is_error,omitempty"`
+	// Display and Presentation are Metis UI metadata for tool_result blocks.
+	// Provider adapters intentionally ignore them when constructing provider
+	// wire payloads, while session JSON keeps them for faithful history replay.
+	Display      string         `json:"display,omitempty"`
+	Presentation map[string]any `json:"presentation,omitempty"`
 
 	// ProviderHint carries opaque provider-specific blobs that must
 	// round-trip across requests. Gemini-3.5+ uses
@@ -77,13 +82,11 @@ type ContentBlock struct {
 	ProviderHint map[string]string `json:"provider_hint,omitempty"`
 
 	// Synthetic marks a text block the loop injected (repeat-tool
-	// reminders, steer echoes) rather than the human typing it. The
-	// model still READS synthetic blocks normally; compaction's
-	// active-task anchor scan uses the flag to never mistake a
-	// synthetic reminder for the user's actual prompt. Not persisted —
-	// a replayed session treats the block as ordinary text, which is
-	// the accepted drift (mirrors DSH's reconstructed reminder).
-	Synthetic bool `json:"-"`
+	// reminders, steer echoes, compaction checkpoints) rather than the human
+	// typing it. Persisting provenance is required for exact history_replace
+	// replay: otherwise a resumed checkpoint becomes an apparent user request
+	// and may be selected as the active task by a later compaction.
+	Synthetic bool `json:"synthetic,omitempty"`
 
 	// Image-specific (Type="image"):
 	MediaType string `json:"media_type,omitempty"` // e.g., "image/png"

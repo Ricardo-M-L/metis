@@ -274,7 +274,7 @@ type Model struct {
 	spinnerSub       string
 	// spinnerOverride pins the spinner verb to a fixed label that wins
 	// over spinnerVerb / spinnerSub while non-empty. Used when the loop
-	// is in an LLM-driven compaction phase (Collapse / Compact) so the
+	// is in the unified LLM-driven compaction phase so the
 	// user sees "Compacting conversation..." instead of the thinking
 	// verb that would otherwise show during a 5-30s summarize call —
 	// that was the "input area looks frozen" user report (2026-05-15
@@ -861,6 +861,15 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		toolArgsStreams: make(map[string]toolArgsStreamState),
 	}
 	mdl.historyCursor = session.NewHistoryCursor(loop.History())
+	// Commit compaction at the point it happens, not only when the turn ends.
+	// The callback captures the model rather than the initial sid/store so
+	// session switching keeps the checkpoint target and cursor current.
+	loop.CompactionCheckpoint = func(before, after []llm.Message) error {
+		if mdl.session == nil || mdl.sessionID == "" {
+			return nil
+		}
+		return mdl.session.CheckpointCompaction(mdl.sessionID, before, after, &mdl.historyCursor)
+	}
 	// Hydrate sessionTitle from the on-disk header so a resumed session
 	// (e.g. metis --resume <id> where the previous run had run /rename
 	// "foo") shows "foo" in the terminal tab on first frame, not just

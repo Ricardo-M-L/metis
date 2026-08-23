@@ -15,10 +15,7 @@ package runtime
 //      sections with the canonical "\n\n" delimiter, matching
 //      RenderBasePrompt's pre-section output for backward compat.
 //
-// The old monolithic base.md is kept on disk for now (read by the
-// legacy basePromptTPL embed) so existing code paths that haven't
-// migrated to AssembleBaseSections still work. New code should call
-// the assembler.
+// The section files are the only source of truth for the base prompt.
 
 import "strings"
 
@@ -55,4 +52,16 @@ func AssembleBaseString(ctx PromptCtx) string {
 		parts = append(parts, strings.TrimRight(s.Body, "\n"))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// AssembleMinimalSubAgentPrompt builds the prompt used by cold sub-agents.
+// It derives a child context before assembly so main-agent-only sections are
+// never rendered or paid for. The returned typed sections are kept alongside
+// the string form for diagnostics and exact prompt tests.
+func AssembleMinimalSubAgentPrompt(parent PromptCtx) (string, []SystemPromptSection) {
+	child := parent
+	child.IsSubAgent = true
+	child.HasSkills = false
+	sections := AssembleSystemPromptSectionsCtx(child, AssembleOptions{Mode: PromptMinimal})
+	return RenderSections(sections), sections
 }

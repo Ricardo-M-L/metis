@@ -86,6 +86,11 @@ func expandEnvVarsInEntry(e ServerEntry) (expanded ServerEntry, missing []string
 		Name:     e.Name,
 		Disabled: e.Disabled,
 	}
+	if e.WorkingDir != "" {
+		v, m := expandEnvVarsInString(e.WorkingDir)
+		expanded.WorkingDir = v
+		addMissing(m)
+	}
 	if e.Command != "" {
 		v, m := expandEnvVarsInString(e.Command)
 		expanded.Command = v
@@ -120,6 +125,9 @@ func expandEnvVarsInEntry(e ServerEntry) (expanded ServerEntry, missing []string
 			addMissing(m)
 		}
 	}
+	expanded.EnabledTools = append([]string(nil), e.EnabledTools...)
+	expanded.DisabledTools = append([]string(nil), e.DisabledTools...)
+	expanded.Auth = e.Auth
 	return expanded, missing
 }
 

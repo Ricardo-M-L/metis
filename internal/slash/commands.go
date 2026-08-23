@@ -382,6 +382,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	// review_request.rs.
 	RegisterReviewCommand(r)
 	RegisterInitCommand(r)
+	RegisterArtifactCommands(r)
 
 	// Core commands
 	r.Register(Cmd{Name: "help", Description: "show this help", Handler: func(_ string) (string, Signal) {

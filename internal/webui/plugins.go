@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -60,8 +62,16 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		caps := make([]string, 0, 3)
+		mcpCount := len(manifest.MCPServers)
 		if manifest.MCPServer != nil {
-			caps = append(caps, "MCP tools")
+			mcpCount++
+		}
+		if mcpCount > 0 {
+			label := "servers"
+			if mcpCount == 1 {
+				label = "server"
+			}
+			caps = append(caps, fmt.Sprintf("MCP tools (%d %s)", mcpCount, label))
 		}
 		if len(manifest.Skills) > 0 {
 			caps = append(caps, "Skills")
@@ -100,6 +110,37 @@ func (s *Server) handlePluginCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, s.pluginMarketplace().Catalog())
+}
+
+func (s *Server) handlePluginIcon(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	path, err := s.pluginMarketplace().PluginIconPath(r.URL.Query().Get("marketplace"), r.URL.Query().Get("plugin"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "plugin icon not found")
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "plugin icon not found")
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		writeError(w, http.StatusNotFound, "plugin icon not found")
+		return
+	}
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
 }
 
 func (s *Server) handlePluginCatalogRefresh(w http.ResponseWriter, r *http.Request) {

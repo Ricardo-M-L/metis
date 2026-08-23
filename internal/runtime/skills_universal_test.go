@@ -113,18 +113,14 @@ func TestHasInstalledSkillsRecognizesUniversalRoot(t *testing.T) {
 }
 
 func TestSkillsPromptUsesLiveToolWithoutMandatoryListRoundTrip(t *testing.T) {
-	for name, body := range map[string]string{
-		"section":    readSection("06_skills.md"),
-		"monolithic": basePromptTPL,
-	} {
-		if !strings.Contains(body, "cross-agent `~/.agents/skills`") || !strings.Contains(body, "do not call `list` first") {
-			t.Errorf("%s skill prompt missing live-catalog/install guidance", name)
-		}
-		if strings.Contains(body, "injected") || strings.Contains(body, "<available_skills>") {
-			t.Errorf("%s skill prompt claims a catalog attachment the runtime does not inject", name)
-		}
-		if strings.Contains(body, "Before answering anything non-trivial, call the `Skill` tool") {
-			t.Errorf("%s skill prompt still mandates a list tool round trip", name)
-		}
+	body := readSection("06_skills.md")
+	if !strings.Contains(body, "cross-agent `~/.agents/skills`") || !strings.Contains(body, "do not call `list` first") {
+		t.Error("skill prompt missing live-catalog/install guidance")
+	}
+	if strings.Contains(body, "injected") || strings.Contains(body, "<available_skills>") {
+		t.Error("skill prompt claims a catalog attachment the runtime does not inject")
+	}
+	if strings.Contains(body, "Before answering anything non-trivial, call the `Skill` tool") {
+		t.Error("skill prompt still mandates a list tool round trip")
 	}
 }

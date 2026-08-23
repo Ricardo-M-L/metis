@@ -438,7 +438,7 @@ func TestLoopRun_ContractTextReentryEmitsAssistantBoundary(t *testing.T) {
 		textStream("OVERRIDE CONTRACT: verification does not apply to this fixture"),
 	}}
 	loop := NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
-	loop.contract.mainWrites = contractWriteThreshold
+	loop.contract.highImpactAction = true
 	loop.AppendUser("finish")
 	out := make(chan Event, 64)
 	if err := loop.Run(context.Background(), out); err != nil {

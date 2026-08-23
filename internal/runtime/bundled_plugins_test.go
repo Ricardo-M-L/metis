@@ -35,6 +35,18 @@ func TestLoadMarketplaceRegistry_BundledDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadMarketplaceRegistry_CodexCatalogMetadata(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	r := LoadMarketplaceRegistry()
+	remote := r.Entries["codex-plugins-official"]
+	if remote.Source.Repo != "openai/plugins" || remote.Format != "codex" || remote.Manifest != ".agents/plugins/marketplace.json" {
+		t.Fatalf("Codex marketplace metadata = %+v", remote)
+	}
+	if _, exists := r.Entries["codex-local"]; exists {
+		t.Fatal("Codex local cache is an ecosystem adapter, not a marketplace entry")
+	}
+}
+
 func TestLoadMarketplaceRegistry_UserOverrideWins(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("METIS_HOME", dir)

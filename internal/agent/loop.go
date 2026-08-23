@@ -59,9 +59,14 @@ type Loop struct {
 	// updates don't invalidate the addendum cache. nil → fall back to
 	// the System string + boundary-marker parsing path.
 	SystemSections []llm.SystemSection
-	Model          string
-	MaxIters       int
-	GraceCalls     int
+	// CurrentStateSections rebuilds authoritative volatile state for every
+	// request (permission posture, current plan, active runtime metadata).
+	// Because this state lives outside Messages, compaction can aggressively
+	// replace chat history without freezing a stale snapshot into the summary.
+	CurrentStateSections func() []llm.SystemSection
+	Model                string
+	MaxIters             int
+	GraceCalls           int
 
 	// rescueNoTools forces the NEXT buildRequest to omit the tool list,
 	// guaranteeing a text-only iteration. Set by the final-summary rescue
@@ -138,6 +143,20 @@ type Loop struct {
 
 	// Compactor handles automatic context window compaction. nil = disabled.
 	Compactor *Compactor
+	// CompactionCheckpoint, when non-nil, durably records a context
+	// replacement before CompactNow installs it as the loop's final live
+	// history. Both arguments are exact snapshots: before is the raw history
+	// that was summarized (including any not-yet-persisted tool tail), and
+	// after is the final replacement including PostCompact hook context.
+	//
+	// Session-backed surfaces should wire this to
+	// session.Store.CheckpointCompaction. It takes precedence over the legacy
+	// per-call CompactOptions.Persist callback so automatic, overflow and
+	// second-wind compaction cannot bypass the raw-ledger checkpoint. The
+	// callback is synchronous, but CompactNow invokes it without holding
+	// Loop.mu, so implementations may safely inspect the loop (for example via
+	// History). Recursive compaction is still unsupported.
+	CompactionCheckpoint func(before, after []llm.Message) error
 
 	// Budget enforces the session-level USD cap (claude-code's
 	// maxBudgetUsd). nil = no cap. Sub-agent loops receive the SAME
@@ -193,16 +212,39 @@ type Loop struct {
 	// /break-cache slash command.
 	BypassNextCache bool
 
-	mu       sync.RWMutex
-	Messages []llm.Message
+	// compactMu serializes complete compaction transactions. Loop.mu is only
+	// held for short history snapshots/CAS installs; provider calls, hooks,
+	// persistence and event callbacks must remain outside it.
+	compactMu sync.Mutex
+	mu        sync.RWMutex
+	Messages  []llm.Message
 	// estTokens caches the last context-token estimate so the TUI can read
-	// it WITHOUT taking l.mu (see EstimateContextTokens) — otherwise a
-	// render-frame RLock during compaction (which holds l.mu through a
-	// 5-30s summarization) freezes the UI and deadlocks against the loop's
-	// emit() under the same lock.
+	// it WITHOUT taking l.mu (see EstimateContextTokens). Keeping this cache
+	// avoids making render frames contend with request/history assembly.
 	estTokens atomic.Int64
-	turnIdx   int
-	iterIdx   int
+	// requestOverheadTokens caches the most recent non-history request cost
+	// (system/state/memory/tool schemas). Render paths add this without doing
+	// filesystem reads, memory retrieval or registry hydration every frame.
+	requestOverheadTokens atomic.Int64
+	// autoCompactPressurePinned remembers the history size immediately after an
+	// automatic compaction that could not bring the full request below the
+	// trigger because non-history overhead was already too large. Until the
+	// transcript grows materially, another summary would only rewrite the same
+	// checkpoint, spend tokens and eventually trip the failure circuit.
+	// Protected by mu.
+	autoCompactPressurePinned bool
+	autoCompactHistoryTokens  int
+	autoCompactOverheadTokens int
+	// autoCompactHistoryRevision distinguishes a normal append (which should
+	// count toward re-arming) from a manual/overflow/second-wind replacement
+	// (which must establish a new baseline). autoCompactSessionGeneration keeps
+	// a CompactNow result from re-arming state after Reset/Restore won the race.
+	autoCompactHistoryRevision   uint64
+	historyRevision              uint64
+	historyReplacementTokens     int
+	autoCompactSessionGeneration uint64
+	turnIdx                      int
+	iterIdx                      int
 
 	// todoWriteIter / todoReminderIter drive the periodic todo
 	// re-surfacing (todo_reminder.go): the iteration of the last
@@ -556,18 +598,15 @@ func (l *Loop) History() []llm.Message {
 	return transcript.Snapshot(l.Messages)
 }
 
-// EstimateContextTokens returns a rough byte-derived estimate of the
-// current Messages history's token cost. Used as a STABLE floor for
+// EstimateContextTokens returns a rough byte-derived estimate of the current
+// provider request: Messages plus the last preflighted system/state/memory/tool
+// overhead. Used as a STABLE floor for
 // the status bar so providers that under-report cache hits (some
 // Anthropic-compat gateways do) don't make the displayed
-// context-usage number swing down between turns. The status bar
-// renders `max(provider-reported, this estimate)` — number stays
-// monotone until real compaction (Snip/Microcompact/Compact) fires
-// and emits a visible "[info] context snipped: …" event.
-//
-// Same estimator the compaction tier-1 path already uses
-// (compaction_check.go::maybeCompact); exposing it on the public
-// surface so the TUI doesn't have to duplicate the estimator.
+// context-usage number swing down between turns. The status bar renders
+// `max(provider-reported, this estimate)` until the unified compaction
+// pipeline publishes its smaller checkpoint. Exposing the same estimator on
+// the public surface keeps the TUI from duplicating request accounting.
 func (l *Loop) EstimateContextTokens() int {
 	// TryRLock, NOT a blocking lock: the TUI calls this every render frame.
 	// maybeCompact holds l.mu (the write lock) across an entire compaction
@@ -578,12 +617,129 @@ func (l *Loop) EstimateContextTokens() int {
 	// deadlock that spins the spinner for hours (observed: the 6h "stuck"
 	// session). Falling back to the cached estimate keeps the UI draining.
 	if l.mu.TryRLock() {
-		v := estimateTokens(l.Messages)
+		v := estimateTokens(l.Messages) + int(l.requestOverheadTokens.Load())
 		l.mu.RUnlock()
 		l.estTokens.Store(int64(v))
 		return v
 	}
 	return int(l.estTokens.Load())
+}
+
+func (l *Loop) storeContextEstimateFromHistory(historyTokens int) {
+	if l == nil {
+		return
+	}
+	// Every caller holds l.mu and invokes this after replacing the logical
+	// history (including CompactNow's temporary/final/rollback installations).
+	// Ordinary appends intentionally do not advance the revision: their token
+	// growth is what re-arms a pressure-pinned automatic checkpoint.
+	l.historyRevision++
+	l.historyReplacementTokens = historyTokens
+	l.estTokens.Store(int64(historyTokens) + l.requestOverheadTokens.Load())
+}
+
+// EstimateRequestContextTokens preflights the input that the next provider
+// request will carry without consuming one-shot cache/rescue flags or calling
+// an LLM reranker. Callers must obtain specs outside Loop.mu: lazy MCP tool
+// hydration may itself acquire that mutex.
+func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
+	if l == nil {
+		return 0
+	}
+
+	l.mu.RLock()
+	historyTokens := estimateTokens(l.Messages)
+	system := l.System
+	sections := append([]llm.SystemSection(nil), l.SystemSections...)
+	planMode := l.planMode
+	planPrompt := l.PlanSystemPrompt
+	planBodiesToRemove := make([]string, 0, 2)
+	if planPrompt != "" {
+		planBodiesToRemove = append(planBodiesToRemove, planPrompt)
+	}
+	for _, section := range sections {
+		if section.Name != "plan_mode" || section.Body == "" {
+			continue
+		}
+		planBodiesToRemove = append(planBodiesToRemove, section.Body)
+		if planPrompt == "" || planPrompt == agentPlanSystemPromptFallback {
+			planPrompt = section.Body
+		}
+	}
+	for _, body := range planBodiesToRemove {
+		system = strings.TrimSpace(strings.ReplaceAll(system, body, ""))
+	}
+	if planMode && planPrompt != "" {
+		if system != "" {
+			system += "\n\n"
+		}
+		system += planPrompt
+	}
+	memoryManager := l.Memory
+	autoRetrieveK := l.AutoRetrieveK
+	query := lastUserTextLocked(l.Messages)
+	currentState := l.CurrentStateSections
+	rescueWithoutTools := l.rescueNoTools
+	l.mu.RUnlock()
+
+	memBody, retrieveBody := "", ""
+	if memoryManager != nil {
+		memBody = memoryManager.BuildContext()
+		if autoRetrieveK > 0 {
+			// Preflight deliberately uses the local BM25 path even when live
+			// requests enable reranking. Estimation must never spend tokens.
+			retrieveBody = memoryManager.AutoRetrieve(query, autoRetrieveK)
+		}
+	}
+	dynamic := []llm.SystemSection(nil)
+	if currentState != nil {
+		dynamic = currentState()
+	}
+
+	overhead := 0
+	if len(sections) > 0 {
+		for _, section := range sections {
+			if section.Name == "plan_mode" {
+				continue
+			}
+			overhead += 4 + estimateStringTokens(section.Body)
+		}
+		if planMode && planPrompt != "" {
+			overhead += 4 + estimateStringTokens(planPrompt)
+		}
+		if memBody != "" {
+			overhead += 4 + estimateStringTokens(memBody)
+		}
+		if retrieveBody != "" {
+			overhead += 4 + estimateStringTokens(retrieveBody)
+		}
+		for _, section := range dynamic {
+			overhead += 4 + estimateStringTokens(section.Body)
+		}
+	} else {
+		if memBody != "" {
+			system += "\n\n" + memBody
+		}
+		if retrieveBody != "" {
+			system += "\n\n" + retrieveBody
+		}
+		for _, section := range dynamic {
+			if strings.TrimSpace(section.Body) != "" {
+				system += "\n\n" + section.Body
+			}
+		}
+		overhead += estimateStringTokens(system)
+	}
+	if !rescueWithoutTools {
+		for _, spec := range specs {
+			overhead += estimateSpecTokens(spec)
+		}
+	}
+
+	l.requestOverheadTokens.Store(int64(overhead))
+	total := historyTokens + overhead
+	l.estTokens.Store(int64(total))
+	return total
 }
 
 // haltTurn marks the current Run for halt-after-current-iteration. The
@@ -710,11 +866,16 @@ func (l *Loop) Reset() {
 	l.Messages = nil
 	l.turnIdx = 0
 	l.iterIdx = 0
+	l.historyRevision++
+	l.autoCompactSessionGeneration++
+	l.clearAutoCompactPressureLocked()
 	l.compactCircuitNoticeSent = false
 	l.contract.reset()
 	if l.Compactor != nil {
 		l.Compactor.ResetCircuit()
 	}
+	l.requestOverheadTokens.Store(0)
+	l.estTokens.Store(0)
 }
 
 // Restore replaces the conversation history with the supplied messages.
@@ -736,14 +897,13 @@ func (l *Loop) Restore(messages []llm.Message) {
 	// Restore is also used by manual /compact. Refresh the non-blocking
 	// estimate immediately so the next render cannot reuse the pre-compact
 	// cache while the history replacement is already visible.
-	l.estTokens.Store(int64(estimateTokens(l.Messages)))
+	l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
 }
 
-// FirePostCompactHook emits PostCompact for the manual /compact path
-// (the auto path fires it inside maybeCompact's firePostCompact closure,
-// which already holds l.mu). Any AdditionalContext returned by handlers
-// is appended as a user message so the next request re-anchors —
-// the §28.11 "compact 后 inject 上下文" use case.
+// FirePostCompactHook remains for compatibility with external/manual history
+// replacement callers. CompactNow owns hooks for every built-in automatic,
+// manual, overflow and second-wind path. Any AdditionalContext returned by
+// handlers is appended as a user message so the next request re-anchors.
 func (l *Loop) FirePostCompactHook(ctx context.Context, trigger, tier string,
 	beforeMsgs, afterMsgs, beforeToks, afterToks int) {
 	if l == nil || l.Hooks == nil {
@@ -773,7 +933,7 @@ func (l *Loop) FirePostCompactHook(ctx context.Context, trigger, tier string,
 			Text: "[post-compact hook context] " + extra,
 		}},
 	})
-	l.estTokens.Store(int64(estimateTokens(l.Messages)))
+	l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
 }
 
 func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
@@ -785,6 +945,9 @@ func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
 	}
 	l.turnIdx = 0
 	l.iterIdx = 0
+	l.historyRevision++
+	l.autoCompactSessionGeneration++
+	l.clearAutoCompactPressureLocked()
 }
 
 // ResetSession crosses a top-level chat-session boundary. Unlike Restore,
@@ -798,6 +961,7 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	l.mu.Lock()
 	l.restoreMessagesLocked(messages)
 	l.estTokens.Store(0)
+	l.requestOverheadTokens.Store(0)
 	l.todoWriteIter = 0
 	l.todoReminderIter = 0
 	l.todoReconciledThisTurn = false
@@ -1085,8 +1249,6 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		runIter++
 		l.Hooks.EmitTurnStart(ctx, tc, globalIter)
 
-		l.maybeCompact(ctx, out)
-
 		// Drain any background-bash job notifications since the last
 		// iteration and synthesize <job_notification> user messages.
 		// The model sees these as system-reminders telling it which
@@ -1134,6 +1296,13 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			})
 		}
 
+		// Tool/skill/plugin availability is live runtime state. Refresh the
+		// schema every iteration so post-compaction requests cannot inherit a
+		// stale Run-start catalog after lazy MCP discovery or plugin changes.
+		specs = l.toolSpecs()
+		pressureTokens := l.EstimateRequestContextTokens(specs)
+		l.maybeCompactWithPressure(ctx, out, pressureTokens)
+		requestWithoutTools := l.rescueNoToolsSnapshot()
 		req := l.buildRequest(specs)
 
 		stream, err := l.Provider.Stream(ctx, req)
@@ -1146,7 +1315,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			switch class.Recovery() {
 			case RecoveryCompactRetry:
 				if l.tryRecoverOverflow(ctx, err, out) {
-					req = l.buildRequest(specs)
+					req = l.buildRequestForRetry(specs, requestWithoutTools)
 					stream, err = l.Provider.Stream(ctx, req)
 				}
 			case RecoveryFailUser:
@@ -1894,46 +2063,24 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 // its run counter and keep looping. False = compactor unavailable, the
 // circuit breaker tripped, or the history was already too small to shrink —
 // in which case the caller falls through to the bounded grace→rescue→stop
-// path. Holds l.mu across the summarizer call (same contract as maybeCompact).
+// path. CompactNow keeps provider work, hooks and persistence outside l.mu.
 func (l *Loop) compactForSecondWind(ctx context.Context, out chan<- Event) bool {
 	if l.Compactor == nil || l.Compactor.Provider == nil {
 		return false
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	beforeTokens := estimateTokens(l.Messages)
-	beforeCount := len(l.Messages)
-	emit(ctx, out, Event{Kind: EventCompactionStart, Info: "second-wind"})
-	compacted, err := l.Compactor.Compact(WithEventOut(ctx, out), l.Messages)
-	if err != nil {
-		emit(ctx, out, Event{Kind: EventCompactionEnd, Info: "second-wind", Err: err})
-		return false
-	}
-	afterTokens := estimateTokens(compacted)
-	if afterTokens >= beforeTokens && len(compacted) >= beforeCount {
-		// Nothing to shrink (history already minimal). Don't grant a
-		// second wind — resetting the budget here would just re-run the
-		// same iterations and loop forever. Let the grace/rescue path
-		// close the turn with a summary instead.
-		emit(ctx, out, Event{Kind: EventCompactionEnd, Info: "second-wind"})
-		return false
-	}
-	l.Messages = compacted
-	l.estTokens.Store(int64(afterTokens))
-	emit(ctx, out, Event{
-		Kind:                  EventContextCompacted,
-		Info:                  "second-wind",
-		PreviousContextTokens: beforeTokens,
-		ContextTokens:         afterTokens,
+	sessionGeneration := l.autoCompactGenerationSnapshot()
+	result, err := l.CompactNow(ctx, CompactOptions{
+		Trigger: "second-wind",
+		Force:   true,
+		Emit: func(ev Event) {
+			emit(ctx, out, ev)
+		},
 	})
-	emit(ctx, out, Event{
-		Kind: EventInfo,
-		Info: fmt.Sprintf("context compacted for budget second wind: %d → %d messages · ~%d → ~%d tokens",
-			beforeCount, len(compacted), beforeTokens, afterTokens),
-	})
-	emit(ctx, out, Event{Kind: EventCompactionEnd, Info: "second-wind"})
-	return true
+	if err == nil && result.Applied {
+		pressureTokens := result.BeforeTokens + int(l.requestOverheadTokens.Load())
+		l.noteAutoCompactPressure(result, pressureTokens, sessionGeneration)
+	}
+	return err == nil && result.Applied
 }
 
 // buildRequest assembles the per-iteration LLM Request under l.mu so the
@@ -2046,6 +2193,28 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 			system = system + "\n\n" + retrieveBody
 		}
 	}
+	if l.CurrentStateSections != nil {
+		dynamic := l.CurrentStateSections()
+		if len(dynamic) > 0 {
+			if len(sections) > 0 {
+				for _, section := range dynamic {
+					section.Cache = false
+					section.Volatile = true
+					sections = append(sections, section)
+				}
+			} else {
+				for _, section := range dynamic {
+					if strings.TrimSpace(section.Body) == "" {
+						continue
+					}
+					if system != "" {
+						system += "\n\n"
+					}
+					system += section.Body
+				}
+			}
+		}
+	}
 	// BypassNextCache: when /break-cache is invoked, the next request
 	// gets a fresh nonce appended to the system prompt so the prefix
 	// differs from the previous run, guaranteeing a cache miss + fresh
@@ -2096,6 +2265,26 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 		}
 	}
 	return req
+}
+
+func (l *Loop) rescueNoToolsSnapshot() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.rescueNoTools
+}
+
+// buildRequestForRetry preserves the posture of the request that overflowed.
+// In particular, final-summary rescue is intentionally text-only; buildRequest
+// consumes its one-shot flag on the first request, so a compact-and-retry must
+// keep using an empty schema list explicitly.
+func (l *Loop) buildRequestForRetry(specs []llm.ToolSpec, withoutTools bool) llm.Request {
+	if withoutTools {
+		specs = nil
+	}
+	return l.buildRequest(specs)
 }
 
 // maybeDistill runs auto-distillation on the most recent user/asst

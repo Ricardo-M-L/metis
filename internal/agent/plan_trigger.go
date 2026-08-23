@@ -1,21 +1,9 @@
 package agent
 
-// plan_trigger.go — runtime safety net for the "rewrite / port /
-// translate / migrate a project" intent. Backs up the
-// 08_interaction_modes.md "Mandatory plan-then-ask" section with a
-// runtime detector: when a user message contains a trigger phrase
-// AND the agent hasn't yet entered plan mode this session, we
-// prepend a `<system-reminder>` block that names the required
-// sequence (Glob survey → EnterPlanMode → AskUser(3 options) →
-// ExitPlanMode → dispatch).
-//
-// Why runtime instead of pure prompt: some models (notably
-// minimax-m2.7, session 5d9a38e5 repro 2026-05-21) reliably skip
-// mid-prompt instructions when the system prompt is long. The
-// trigger detector is model-independent — pure string match on the
-// user's text — so it fires regardless of which provider is loaded.
-// False-positive rate is bounded by the small trigger-phrase list
-// (only project-level intents, not e.g. "refactor this function").
+// plan_trigger.go — runtime scope-check safety net for broad rewrite, port,
+// translation, and migration requests. It prevents an agent from silently
+// choosing a reduced implementation when parity was expected. Runtime owns
+// detection; the base prompt only states the invariant.
 
 import (
 	"strings"
@@ -112,28 +100,17 @@ func detectPlanModeEntered(msgs []llm.Message) bool {
 	return false
 }
 
-// planTriggerReminder is the actual `<system-reminder>` body. Kept
-// short (LLM attention drops fast on long reminders) and specific
-// (names the 4 steps + cites the prompt section so the model can
-// reconcile with the system prompt it already saw).
+// planTriggerReminder is intentionally short and decision-oriented. Explicit
+// full-parity or scoped requests can proceed without a redundant question;
+// ambiguous scope must be surfaced before implementation.
 const planTriggerReminder = `<system-reminder>
 PLAN-THEN-ASK trigger detected in your last user message
 ("rewrite / port / translate / migrate" intent).
 
-Per 08_interaction_modes.md the FIRST action MUST be:
-
-  1. Glob + Read 5-10 key source files to estimate true scope.
-  2. EnterPlanMode → write a 3-option plan to plan file:
-       Option A — 1:1 full port (every source file → equivalent target)
-       Option B — MVP core (list which features kept vs dropped)
-       Option C — incremental (port phase 1, evaluate, then continue)
-     Include rough file count + iter-budget estimate per option.
-  3. AskUser({question, options: [A, B, C], allow_freeform: true}).
-  4. After the user picks → ExitPlanMode → dispatch implementer agents.
-
-DO NOT skip steps 2-3. Silently choosing MVP scope wastes ~1 hour
-of the user's time discovering a partial implementation 60 minutes
-in (session 5d9a38e5 / image #50 repro). If iter budget seems
-insufficient for Option A, surface that AS PART OF the plan;
-do NOT silently default to Option B.
+Before implementation, inspect enough representative source to establish the
+true scope. Determine whether the request requires full parity, a stated
+subset, or staged delivery. If the user's request and repository already make
+that choice explicit, record it and proceed. Otherwise enter plan mode and ask
+a focused scope question with the materially different options and tradeoffs.
+Never silently substitute an MVP for a full rewrite or port.
 </system-reminder>`

@@ -597,8 +597,13 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	}
 	emit(ctx, out, Event{
 		Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
-		ToolResult: &ToolResult{Output: res.Output, IsError: res.IsError},
-		Elapsed:    execElapsed,
+		ToolResult: &ToolResult{
+			Output:       res.Output,
+			IsError:      res.IsError,
+			Display:      res.Display,
+			Presentation: clonePresentation(res.Presentation),
+		},
+		Elapsed: execElapsed,
 	})
 
 	// Ingestion-time spill (claude-code's maxResultSizeChars, Tool.ts:456):
@@ -686,11 +691,50 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 				Type: "tool_result", ToolUseID: blk.ToolUseID,
 				ToolResult: resultBody, IsError: res.IsError,
 				ToolResultBlocks: blocks,
+				Display:          res.Display,
+				Presentation:     clonePresentation(res.Presentation),
 			}
 		}
 	}
 	return llm.ContentBlock{
 		Type: "tool_result", ToolUseID: blk.ToolUseID,
-		ToolResult: resultBody, IsError: res.IsError,
+		ToolResult:   resultBody,
+		IsError:      res.IsError,
+		Display:      res.Display,
+		Presentation: clonePresentation(res.Presentation),
+	}
+}
+
+// clonePresentation gives the live event and persisted content block
+// independent ownership of JSON-shaped presentation metadata. A shallow map
+// clone is insufficient: artifact cards carry nested descriptors/actions and
+// a renderer may annotate one of those maps while the session writer is still
+// serializing the other.
+func clonePresentation(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = clonePresentationValue(value)
+	}
+	return out
+}
+
+func clonePresentationValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return clonePresentation(typed)
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = clonePresentationValue(item)
+		}
+		return out
+	default:
+		// Presentation is documented as JSON-shaped. JSON scalar values are
+		// immutable, so retaining them is safe; tools should express nested
+		// collections as map[string]any / []any.
+		return value
 	}
 }

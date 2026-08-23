@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	metisupdate "github.com/Ricardo-M-L/metis/internal/update"
 )
 
 const metisReleasesURL = "https://github.com/Ricardo-M-L/metis/releases"
@@ -26,10 +28,7 @@ type launcher struct {
 func systemLauncher() launcher {
 	home, _ := os.UserHomeDir()
 	cwd, _ := os.Getwd()
-	cliPath, _ := os.Executable()
-	if abs, err := filepath.Abs(cliPath); err == nil {
-		cliPath = abs
-	}
+	cliPath := resolveLauncherCLIPath(metisupdate.SelfPath, os.Executable)
 	return launcher{
 		goos:         runtime.GOOS,
 		goarch:       runtime.GOARCH,
@@ -41,6 +40,28 @@ func systemLauncher() launcher {
 		runCommand:   runCommand,
 		startCommand: startCommand,
 	}
+}
+
+// resolveLauncherCLIPath prefers the updater's verified stable launcher over
+// os.Executable. On managed Unix installs os.Executable resolves through the
+// bin/metis symlink to share/metis/versions/<version>/metis; passing that
+// immutable target to Desktop would pin every restarted window to the old CLI
+// after a successful self-update.
+func resolveLauncherCLIPath(stable, executable func() (string, error)) string {
+	for _, resolve := range []func() (string, error){stable, executable} {
+		if resolve == nil {
+			continue
+		}
+		path, err := resolve()
+		if err != nil || path == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(path); err == nil {
+			return abs
+		}
+		return path
+	}
+	return ""
 }
 
 // LaunchApp finds or installs the native Metis Desktop app and opens

@@ -350,7 +350,7 @@ mouse_wheel_lines = 1         # 1=pixel-precise, 3=jumpy
 reduced_motion = false        # accessibility: 500ms tick + no shimmer
 
 [session]
-auto_compact_threshold = 0.95       # fraction of context window
+auto_compact_threshold = 0.85       # fraction of effective input budget
 auto_compact_minimum_tokens = 50000 # do not compact below this estimate
 max_iterations = 100
 
@@ -773,9 +773,52 @@ namespaced as `<plugin>:<skill>` so they don't collide with bundled or
 user skills. Both surface to the LLM through the regular tool / skill
 discovery paths — no extra wiring needed.
 
-Marketplace entries whose source is a path inside the marketplace clone
-install automatically. External-repository source kinds are not fetched
-yet; clone those manually into `~/.metis/plugins/<name>/`.
+METIS exposes ecosystem adapters separately from catalog sources. It understands
+Claude marketplace manifests, Codex `.codex-plugin/plugin.json` bundles, and the
+real npm dependencies mounted by local DeepSeek Harness profiles. Codex skills
+are imported with namespace isolation and Codex MCP declarations are translated
+into METIS multi-server MCP configuration. Codex apps/hooks and DeepSeek Harness
+Cordis services, slots, events, HMR, and fibers remain in their original
+runtimes; portable `SKILL.md` files inside those bundles can still be imported.
+The Desktop labels every component as native, translated, portable-only, or
+original-runtime instead of presenting Codex or DeepSeek Harness themselves as
+installable plugins or marketplaces.
+
+In-repository paths install directly; pinned HTTPS `url` / `git-subdir` entries
+from GitHub, GitLab, or Codeberg are fetched into a temporary checkout and
+inspected before installation. The installer rejects path escapes, symlinks,
+unsafe Git refs, oversized bundles, and entries that contain no compatible
+component.
+
+## Local Artifacts
+
+METIS can create durable, session-owned HTML deliverables through the
+model-facing `Artifact` tool. Each update appends an immutable version under
+`$METIS_HOME/artifacts`; Desktop shows a structured card, a per-session gallery,
+version switching, download, ZIP export, and a confirmed delete action. Deleting
+the owning session also deletes every attached artifact version.
+
+The current local implementation is deliberately static: executable elements,
+external URLs, forms, frames, event handlers, and network-loading CSS are
+removed. Desktop previews the result in an empty-sandbox iframe on a separate,
+short-lived loopback capability origin, so artifact content never shares the
+privileged WebUI origin.
+
+Use `/artifact <request>` or ordinary language in chat. CLI management requires
+an explicit owning session ID:
+
+```sh
+metis artifacts list --session <id>
+metis artifacts show <artifact-id> --session <id>
+metis artifacts create page.html --session <id> --title "Release dashboard"
+metis artifacts update <artifact-id> page.html --session <id>
+metis artifacts export <artifact-id> --session <id> --out /absolute/path/page.html
+metis artifacts delete <artifact-id> --session <id> --yes
+```
+
+This local feature does not manufacture a public URL. Public hosting, audience
+controls, authentication, and shared persistence require a separately operated
+publishing service.
 
 ## Computer use (driving the desktop)
 

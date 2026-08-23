@@ -2,8 +2,9 @@ package runtime
 
 // bundled_plugins.go — bundled plugin marketplace registry. metis ships
 // a small JSON file (default_marketplaces.json) that pre-registers
-// the canonical Anthropic plugin marketplaces (anthropic-agent-skills,
-// claude-plugins-official, claude-plugins-community). Users get
+// canonical Anthropic marketplaces and OpenAI's public Codex marketplace.
+// Runtime ecosystems and local caches are discovered by pluginmarket and are
+// deliberately not registered as marketplaces. Users get
 // `metis plugin search` / `metis plugin install` working out of the
 // box without manually `metis plugin marketplace add <url>` first.
 //
@@ -43,6 +44,11 @@ type MarketplaceSource struct {
 type MarketplaceEntry struct {
 	Name            string            `json:"name"`
 	Source          MarketplaceSource `json:"source"`
+	DisplayName     string            `json:"displayName,omitempty"`
+	Description     string            `json:"description,omitempty"`
+	Ecosystem       string            `json:"ecosystem,omitempty"`
+	Format          string            `json:"format,omitempty"`
+	Manifest        string            `json:"manifest,omitempty"`
 	InstallLocation string            `json:"installLocation,omitempty"`
 	LastUpdated     string            `json:"lastUpdated,omitempty"`
 	Builtin         bool              `json:"builtin,omitempty"` // true for the bundled defaults
@@ -136,6 +142,14 @@ func (e MarketplaceEntry) CloneURL() string {
 		return "https://github.com/" + e.Source.Repo + ".git"
 	}
 	return ""
+}
+
+// IsLocalCatalog reports whether the entry is discovered from another local
+// agent installation instead of fetched from the network. Local catalogs are
+// read-only inputs: METIS copies compatible skills on explicit install but
+// never mutates the source cache.
+func (e MarketplaceEntry) IsLocalCatalog() bool {
+	return strings.EqualFold(e.Source.Source, "codex-cache")
 }
 
 // MarketplaceCloneRoot is where cloned marketplace repositories live

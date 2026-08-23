@@ -85,8 +85,8 @@ Provider implementations live under `internal/llm/<transport-family>/`, while
 
 `internal/agent.Loop` owns one active transcript. A normal iteration:
 
-1. applies the cheap context-maintenance tiers and checks whether LLM-backed
-   compaction is required;
+1. preflights full request pressure and, when required, runs the unified
+   checkpoint-compaction pipeline;
 2. assembles system sections, memory context, transcript and current tool specs;
 3. streams a normalized provider response and persists assistant blocks;
 4. runs pre-tool hooks and permission checks for the whole tool batch;
@@ -279,10 +279,11 @@ continuity. Session/cron/config operations similarly go through the CLI.
 owns one live Loop and serializes turns because the transcript is not safe for
 simultaneous conversations.
 
-The native launcher knows how to find installed macOS, Linux and Windows apps,
-but the release workflow currently publishes CLI archives, not Wails Desktop
-installers. “Platform recognized by the launcher” therefore does not mean a
-Desktop installer is available from the release page.
+Stable tag releases publish checksummed Wails Desktop archives alongside the
+CLI assets: one universal macOS application, one Linux amd64 binary and one
+Windows amd64 executable. The native launcher and updater resolve those exact
+release artifacts; they are application archives rather than OS-native package
+manager formats.
 
 ### Chat channels
 
@@ -311,36 +312,44 @@ mechanism.
 
 ### Compaction pipeline
 
-Context control is layered so expensive summarization is the last resort:
+Automatic pressure, manual `/compact`, provider-overflow recovery and the
+iteration-budget second wind all enter `Loop.CompactNow`. This is one heavy
+checkpoint pipeline: it owns trigger policy, hooks and lifecycle events,
+candidate construction, durable persistence and final in-memory installation.
+There is no separate automatic pre-pass that can reduce the estimate and then
+cancel the checkpoint that was already required.
 
-1. prune older inline/tool-result images according to the active context size;
-2. spill oversized ingestion results to recoverable files;
-3. Snip older tool results with a context-window-specific threshold/cap;
-4. Microcompact large results to the session cache, on threshold or after a
-   long idle period, leaving a recoverable path;
-5. Collapse an early-middle window with the LLM before full compaction; and
-6. Compact the old middle into an iterative summary while preserving anchors
-   and a recent tail.
+The production default triggers at 85% of the effective input cap. The cap is
+the model context window minus the response-token reservation, rather than the
+nominal context window. The configured absolute minimum defaults to 50,000
+tokens, but a minimum above the model-specific percentage boundary is clamped
+to that boundary so it cannot disable compaction on a smaller window. The
+decision uses full request pressure, not transcript size alone: current system
+sections, memory/retrieval context, plan and volatile runtime state, and current
+tool schemas are included in the preflight estimate.
 
-The production default triggers full Compact at
-`estimated tokens >= MaxContextTokens * 0.95`, with an absolute floor of 50,000
-estimated tokens; both percentage and floor are configurable. Full Compact does
-not subtract configured output tokens from the denominator. Collapse defaults to
-an earlier `0.78` threshold against the effective input cap, while Snip is
-adjusted by the model's effective input-window tier. Provider overflow recovery
-can force Compact even if the normal trigger did not fire.
+After the boundary is crossed, the same transaction prunes older images and
+microcompacts oversized recoverable tool results, then produces one final
+summary checkpoint. The old prefix is summarized while a token-budgeted recent
+tail is retained verbatim; on normal model windows that tail targets 8% of the
+effective input cap, clamped to 16K–32K tokens. Tool-use/result pairs remain
+balanced. The two latest real user requests are preserved exactly, either in
+the tail or in the deterministic checkpoint anchor, so intervening tool output
+cannot displace the active request.
 
-A single full summarize request is capped at 200,000 estimated input tokens;
-older history is collapsed first when necessary. The summary prompt has eight
-stable sections: Primary Request & Intent, Current State, Files & Changes,
-Technical Context, Errors & Fixes, Pending Tasks, Strategy & Approach, and Exact
-Next Steps. There is no separate active five-section template.
+The summary prompt has eight stable sections: Primary Request & Intent,
+Current State, Files & Changes, Technical Context, Errors & Fixes, Pending
+Tasks, Strategy & Approach, and Exact Next Steps. `Memory` and `Skill` results
+are protected from preparatory rewriting; ordinary file reads can be recovered
+from disk when needed. A circuit breaker stops repeated failed summaries, and
+post-compaction guards reject a checkpoint that makes no token progress.
 
-The default protected tool results are `memory_query`, `memory_recall`, and
-`skill_help`. `Read` is intentionally not protected because files can be read
-again and large Read results were a major compaction input source. A circuit
-breaker stops repeated failed summaries until reset; post-compaction guards cap
-large tail results before the next provider request.
+Session persistence uses `Store.CheckpointCompaction`: it first appends any raw
+pre-compaction tail that has not reached the JSONL ledger, then appends a
+`history_replace` record for the compacted history. A crash before the replace
+therefore resumes the complete raw history, while a crash after it resumes the
+exact checkpoint. Persistence failure rolls the live Loop back instead of
+leaving memory and disk on different histories.
 
 ## Local-first behavior, telemetry and network boundaries
 
@@ -357,7 +366,9 @@ under the configured Metis home.
 
 `make dist` and the GitHub release workflow build checksummed CLI assets for
 macOS, Linux and Windows on amd64 and arm64. Unix assets are `.tar.gz`; Windows
-assets are `.zip` archives containing `metis.exe`.
+assets are `.zip` archives containing `metis.exe`. A stable tag push also builds
+and publishes checksummed Desktop archives for macOS universal, Linux amd64 and
+Windows amd64.
 
 - `install/install.sh` is the macOS/Linux bootstrap. It resolves a public
   GitHub release, downloads the matching archive and `.sha256`, verifies it,
@@ -396,4 +407,6 @@ assets are `.zip` archives containing `metis.exe`.
 - `install/npm/` remains a private/local-development wrapper and is not the
   documented public install path.
 
-The CLI release pipeline does not package the separate Wails Desktop module.
+The Desktop build matrix runs for stable tag pushes and is required before that
+release is published. A manual release-workflow dispatch remains a CLI-only
+rebuild path; it does not synthesize Desktop assets for an existing tag.

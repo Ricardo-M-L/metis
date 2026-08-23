@@ -83,6 +83,7 @@ func CachePath(serverName string) string {
 func FingerprintEntry(e ServerEntry) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "cmd:%s\n", e.Command)
+	fmt.Fprintf(h, "cwd:%s\n", e.WorkingDir)
 	for _, a := range e.Args {
 		fmt.Fprintf(h, "arg:%s\n", a)
 	}

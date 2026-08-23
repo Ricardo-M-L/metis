@@ -8,6 +8,22 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 )
 
+func TestRegistryHasEnabledServer(t *testing.T) {
+	reg := &Registry{Servers: []ServerEntry{
+		{Name: "disabled", Disabled: true},
+		{Name: ReservedComputerUseName},
+	}}
+	if reg.HasEnabledServer("disabled") {
+		t.Fatal("disabled server should not be reported as available")
+	}
+	if !reg.HasEnabledServer(ReservedComputerUseName) {
+		t.Fatal("enabled computer-use server should be reported as available")
+	}
+	if reg.HasEnabledServer("missing") {
+		t.Fatal("missing server should not be reported as available")
+	}
+}
+
 // withTempHome scopes any Path() reads/writes to a fresh temp dir.
 func withTempHome(t *testing.T) string {
 	t.Helper()

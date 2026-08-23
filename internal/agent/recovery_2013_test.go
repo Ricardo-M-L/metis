@@ -42,8 +42,8 @@ func TestTryRecoverOverflow_RecognizesMiniMaxParen2013(t *testing.T) {
 			info += ev.Info + "\n"
 		}
 	}
-	if !strings.Contains(info, "context overflow") {
-		t.Errorf("expected 'context overflow' notice in events; got:\n%s", info)
+	if !strings.Contains(info, "context compacted (overflow)") {
+		t.Errorf("expected unified overflow compaction notice in events; got:\n%s", info)
 	}
 }
 
@@ -61,10 +61,9 @@ func TestTryRecoverOverflow_IgnoresUnrelatedErrors(t *testing.T) {
 	}
 }
 
-func TestTryRecoverOverflow_SnipsTailFirst(t *testing.T) {
-	// When the conversation has a giant tool_result in the protected
-	// tail (the typical "5MB grep dump as last turn" case), SnipAll
-	// should rescue it without invoking the LLM-summarizer Compact.
+func TestTryRecoverOverflow_UsesUnifiedHeavyPipeline(t *testing.T) {
+	// Overflow uses the same heavy checkpoint first. SnipAll remains an
+	// internal emergency fallback only when a checkpoint cannot make progress.
 	p := &fakeSummarizer{}
 	c := newCompactorFor(p)
 	long := strings.Repeat("X", 10000)
@@ -84,9 +83,8 @@ func TestTryRecoverOverflow_SnipsTailFirst(t *testing.T) {
 		t.Fatalf("recovery didn't fire on tail-snippable overflow")
 	}
 	close(out)
-	// No summarizer call expected — SnipAll should have rescued first.
-	if p.calls > 0 {
-		t.Errorf("SnipAll should have rescued without invoking summarizer; got %d Stream calls", p.calls)
+	if p.calls != 0 {
+		t.Errorf("minimal history should fall back to emergency SnipAll without a useless summary; got %d Stream calls", p.calls)
 	}
 	// Both tail tool_results should now be capped.
 	for i, m := range l.Messages {

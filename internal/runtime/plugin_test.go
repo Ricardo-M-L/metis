@@ -4,9 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
 
 // writePluginManifest builds a plugin dir with the given TOML content.
@@ -151,5 +154,51 @@ skills = ["s.md"]
 	}
 	if len(sources[0].Skills()) != 1 {
 		t.Errorf("source skills count = %d", len(sources[0].Skills()))
+	}
+}
+
+func TestLoadPlugins_MultipleMCPServersResolvePluginWorkingDirectory(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	dir := writePluginManifest(t, "codex-bridge", `manifest_version = 1
+name = "codex-bridge"
+version = "1.0.0"
+description = "translated Codex plugin"
+
+[[mcp_servers]]
+name = "alpha"
+command = "./bin/server-a"
+working_dir = "."
+
+[[mcp_servers]]
+name = "beta"
+url = "https://example.invalid/mcp"
+`)
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "server-a"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var captured []mcp.ServerEntry
+	original := launchPluginMCPServer
+	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, _ *tools.Registry) (*mcptools.Server, error) {
+		captured = append(captured, entry)
+		return nil, nil
+	}
+	t.Cleanup(func() { launchPluginMCPServer = original })
+
+	reg, errs := LoadPlugins(context.Background(), tools.NewRegistry())
+	if len(errs) != 0 {
+		t.Fatalf("load translated plugin: %v", errs)
+	}
+	if len(reg.All()) != 1 || len(captured) != 2 {
+		t.Fatalf("plugins=%d captured=%+v", len(reg.All()), captured)
+	}
+	if captured[0].Name != "plugin:codex-bridge:alpha" || captured[0].WorkingDir != dir || !strings.HasSuffix(captured[0].Command, filepath.Join("bin", "server-a")) {
+		t.Fatalf("stdio entry = %+v", captured[0])
+	}
+	if captured[1].Name != "plugin:codex-bridge:beta" || captured[1].URL != "https://example.invalid/mcp" {
+		t.Fatalf("http entry = %+v", captured[1])
 	}
 }

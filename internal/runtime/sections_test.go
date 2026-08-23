@@ -13,7 +13,7 @@ func TestIdentitySection_DoesNotExpandModel(t *testing.T) {
 	if strings.Contains(got.Body, "powered by") || strings.Contains(got.Body, "claude-opus-4-7") {
 		t.Errorf("identity body should not surface model name; got:\n%s", got.Body)
 	}
-	if !strings.Contains(got.Body, "You are metis, a fast, local-first agent CLI.") {
+	if !strings.Contains(got.Body, "You are metis, a fast, local-first agent.") {
 		t.Errorf("identity body missing metis intro; got:\n%s", got.Body)
 	}
 	if !got.Cache {
@@ -110,6 +110,13 @@ func TestDefaultSectionGetters_Ordered(t *testing.T) {
 		if sec.Name != wantNames[i] {
 			t.Errorf("getter[%d] produced %q, want %q", i, sec.Name, wantNames[i])
 		}
+	}
+}
+
+func TestComputerUseSection_FiresForConfiguredCapability(t *testing.T) {
+	got := ComputerUseSection(PromptCtx{ComputerUseAvailable: true})
+	if got.Name != "computer_use" {
+		t.Fatalf("configured computer-use capability should fire section; got %q", got.Name)
 	}
 }
 

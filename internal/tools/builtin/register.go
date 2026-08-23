@@ -80,6 +80,7 @@ func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *per
 	sessionTrace := NewSessionTrace(gate)
 
 	all := []tools.Tool{
+		NewArtifact(gate),
 		Read{gate: gate, state: sessionReadState},
 		Write{gate: gate, state: sessionReadState},
 		Edit{gate: gate, state: sessionReadState},

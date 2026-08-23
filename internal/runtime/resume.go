@@ -48,17 +48,22 @@ func PrepareResume(store *session.Store, sessionID string) (*PreparedResume, err
 		}
 		return nil, fmt.Errorf("resume: stat %s: %w", sessionID, err)
 	}
-	// Pre-flight size check (#43 / openclaude path): refuse to load a
-	// transcript larger than session.DefaultResumeMaxBytes (8 MiB).
-	// Past that point, even a successful resume usually starves the
-	// model's context window and burns tokens; better to /clear or
-	// /branch from an earlier turn. Override via METIS_RESUME_MAX_MB.
+	// Bound the physical append-only audit ledger before parsing. This cap is
+	// intentionally much higher than the logical context limit because old raw
+	// messages remain on disk behind history_replace checkpoints.
 	if err := store.CheckResumeSize(sessionID); err != nil {
 		return nil, err
 	}
 	hdr, msgs, err := store.Load(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("resume %s: %w", sessionID, err)
+	}
+	// Apply the context-economics limit only after Load has replayed every
+	// history_replace. A compacted session with a large audit ledger therefore
+	// resumes from its small logical checkpoint, while genuinely oversized live
+	// context is still rejected. Override via METIS_RESUME_MAX_MB.
+	if err := session.CheckResumeHistorySize(sessionID, msgs); err != nil {
+		return nil, err
 	}
 	return &PreparedResume{SessionID: sessionID, Header: hdr, messages: msgs}, nil
 }

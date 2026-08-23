@@ -62,12 +62,17 @@ func TestLoop_MaybeCompact_CircuitBreakerEndToEnd(t *testing.T) {
 
 	// Loop.Reset must clear the breaker AND re-arm the notice gate
 	// so a future trip would re-emit.
+	l.autoCompactPressurePinned = true
+	l.autoCompactHistoryTokens = 123
 	l.Reset()
 	if c.CircuitTripped() {
 		t.Errorf("Loop.Reset() did not clear the Compactor breaker")
 	}
 	if l.compactCircuitNoticeSent {
 		t.Errorf("Loop.Reset() did not re-arm the compactCircuitNoticeSent gate")
+	}
+	if l.autoCompactPressurePinned || l.autoCompactHistoryTokens != 0 {
+		t.Errorf("Loop.Reset() did not clear the automatic compaction pressure watermark")
 	}
 }
 

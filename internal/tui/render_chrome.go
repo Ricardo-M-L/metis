@@ -415,17 +415,15 @@ func renderCompactionExtras(m *Model) string {
 		}
 	}
 
-	// Auto-window threshold = Compactor.Threshold (default 0.85) ×
-	// MaxContextTokens. Falls back to 85% of provider cap if the
-	// Compactor isn't reachable (e.g. legacy callers / tests).
+	// Use the same authoritative boundary as ShouldCompact. In production the
+	// effective input cap reserves the provider's response budget, so copying
+	// Threshold × MaxContextTokens here can advertise a later, unsafe trigger.
+	// Fall back to 85% of the provider cap only for legacy callers/tests that
+	// have no Compactor.
 	autoWindow := 0
 	if m.loop != nil {
-		if m.loop.Compactor != nil && m.loop.Compactor.MaxContextTokens > 0 {
-			thr := m.loop.Compactor.Threshold
-			if thr <= 0 {
-				thr = 0.85
-			}
-			autoWindow = int(float64(m.loop.Compactor.MaxContextTokens) * thr)
+		if m.loop.Compactor != nil {
+			autoWindow = m.loop.Compactor.TriggerTokens()
 		} else if m.loop.Provider != nil {
 			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
 				autoWindow = int(float64(cap) * 0.85)

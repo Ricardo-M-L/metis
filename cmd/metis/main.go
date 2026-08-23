@@ -50,14 +50,6 @@ import (
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
-// defaultSystem is the embedded base system prompt. The actual text
-// lives in internal/runtime/prompts/base.md so it diffs as plain
-// markdown and can be edited without recompiling string literals.
-// This package-level var is kept for backward-compat with the
-// pre-embed call sites; new code should call rtpkg.DefaultBasePrompt()
-// directly.
-var defaultSystem = rtpkg.DefaultBasePrompt()
-
 var errPromptDumpComplete = errors.New("prompt dump complete")
 
 func main() {
@@ -137,6 +129,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdModels(ctx, args[1:])
 	case "sessions":
 		return cmdSessions(args[1:])
+	case "artifact", "artifacts":
+		return cmdArtifacts(args[1:])
 	case "stats":
 		return cmdStats(ctx, args[1:])
 	case "skills":
@@ -213,7 +207,7 @@ func dispatch(ctx context.Context, args []string) error {
 func findEarlySubcommand(args []string, lookahead int) (int, bool) {
 	verbs := map[string]bool{
 		"chat": true, "run": true, "config": true, "tools": true,
-		"models": true, "sessions": true, "stats": true, "skills": true,
+		"models": true, "sessions": true, "artifact": true, "artifacts": true, "stats": true, "skills": true,
 		"acp": true, "daemon": true, "ps": true, "logs": true,
 		"kill": true, "attach": true, "coordinator": true, "cron": true,
 		"auth": true, "plugin": true, "plugins": true, "audit": true,
@@ -307,7 +301,8 @@ Usage:
   metis sessions timing <id>      Per-step timing breakdown of a past session
   metis sessions branch <id>      Create a branch from a saved session
   metis sessions export <id>      Print a session's JSONL to stdout
-  metis sessions import [--id ID] Read JSONL from stdin and create a new session
+	  metis sessions import [--id ID] Read JSONL from stdin and create a new session
+	  metis artifacts <list|show|create|update|export|delete>  Manage durable local HTML artifacts
   metis stats           Summarize local token and session usage
   metis skills list     List built-in skills library
   metis skills install <name>  Install a built-in skill
@@ -398,6 +393,18 @@ type runtime struct {
 	// sandbox is shared by every model-controlled command launcher in this
 	// runtime. It owns a private temp directory and is closed after jobs stop.
 	sandbox *sandbox.Manager
+}
+
+func promptContextFromRuntime(model, providerName, mode string, mcpReg *mcp.Registry, hasSkills bool) rtpkg.PromptCtx {
+	return rtpkg.PromptCtx{
+		Model:                model,
+		ProviderName:         providerName,
+		EnabledTools:         nil, // built-ins use legacy defaults until the live registry exists
+		ComputerUseAvailable: mcpReg.HasEnabledServer(mcp.ReservedComputerUseName),
+		HasSkills:            hasSkills,
+		IsSubAgent:           false,
+		Mode:                 mode,
+	}
 }
 
 // WaitForMCP blocks until the background MCP launcher finishes spawning
@@ -968,18 +975,29 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		os.Setenv("METIS_SIMPLE", "1")
 	}
 
+	// Load and merge MCP configuration before assembling the prompt. MCP
+	// processes still launch asynchronously later, but configured capabilities
+	// (notably the reserved computer-use server) must be visible to the prompt
+	// on turn zero. This is configuration-only I/O and does not slow startup on
+	// server handshakes.
+	var mcpReg *mcp.Registry
+	if flags.bare {
+		mcpReg = &mcp.Registry{}
+	} else {
+		var mcpLoadErr error
+		mcpReg, mcpLoadErr = mcp.Load()
+		if mcpLoadErr != nil {
+			fmt.Fprintf(os.Stderr, "metis: mcp.toml: %v\n", mcpLoadErr)
+			mcpReg = &mcp.Registry{}
+		}
+		mcpReg.MergeWithConfig(cfg.MCP.Servers)
+	}
+
 	// promptCtx captures the runtime signals each prompt section
 	// inspects to decide whether to fire. Populated once here so the
 	// dump-prompt path, the simple-mode path, and the regular path all
 	// share the same source of truth.
-	promptCtx := rtpkg.PromptCtx{
-		Model:        model,
-		ProviderName: provName,
-		EnabledTools: nil, // filled in below once registry exists; nil = legacy "assume Bash"
-		HasSkills:    rtpkg.HasInstalledSkills(),
-		IsSubAgent:   false,
-		Mode:         mode,
-	}
+	promptCtx := promptContextFromRuntime(model, provName, mode, mcpReg, rtpkg.HasInstalledSkills())
 
 	// Render the base prompt fresh per boot. Three paths:
 	//   1. --system flag overrides entirely (user-supplied prompt).
@@ -1127,10 +1145,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// sub-agent inheriting them would just re-pay the tokens for
 	// information it doesn't need at its narrower scope. Mirrors
 	// openclaw's "minimal mode" sub-agent prompt.
-	minimalSystem := rtpkg.AssembleSystemPromptWithOptions(
-		rtpkg.DefaultBasePrompt(),
-		rtpkg.AssembleOptions{Minimal: true},
-	)
+	minimalSystem, _ := rtpkg.AssembleMinimalSubAgentPrompt(promptCtx)
 	// Background-bash job pool. One per process so all chat / run /
 	// agent paths share the same `bg_<id>.out` filesystem layout +
 	// `<job_notification>` sink. Created here so BuildToolRegistry
@@ -1239,7 +1254,6 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// blocking the prompt session on a sum-of-handshakes wall clock.
 	// Cleanup waits on `mcpLauncherDone` so we never tear down the
 	// parent process while a goroutine is mid-handshake.
-	var mcpReg *mcp.Registry
 	mcpLauncherDoneCh := make(chan struct{})
 	if flags.bare {
 		// --bare skips the MCP launch dance entirely. The user gets
@@ -1248,14 +1262,6 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		// nothing in this path mutates mcp.toml.
 		mcpReg = &mcp.Registry{}
 		close(mcpLauncherDoneCh) // no work — Cleanup's <-recv is instant
-	} else {
-		var mcpLoadErr error
-		mcpReg, mcpLoadErr = mcp.Load()
-		if mcpLoadErr != nil {
-			fmt.Fprintf(os.Stderr, "metis: mcp.toml: %v\n", mcpLoadErr)
-			mcpReg = &mcp.Registry{}
-		}
-		mcpReg.MergeWithConfig(cfg.MCP.Servers)
 	}
 
 	// Agent profile tool filter — applied after MCP tools register so the
@@ -1813,6 +1819,11 @@ func cmdRun(ctx context.Context, args []string) error {
 		llmPrompt = llmPrompt + "\n\n" + schemaEnforcer.Instruction()
 	}
 	historyCursor := session.NewHistoryCursor(rt.loop.History())
+	if rt.store != nil && rt.sessionID != "" {
+		rt.loop.CompactionCheckpoint = func(before, after []llm.Message) error {
+			return rt.store.CheckpointCompaction(rt.sessionID, before, after, &historyCursor)
+		}
+	}
 	// Flush once more on every return path (including schema retries and
 	// errors). EventLoopDone also flushes eagerly; the cursor makes the defer
 	// idempotent while preserving partial tool history on late failures.
@@ -2057,11 +2068,11 @@ func cmdRun(ctx context.Context, args []string) error {
 			// Same purpose as the TUI's spinner-override: tell the
 			// caller "we're entering a 5-30s LLM summarize" so a long
 			// pause doesn't look like a hang in run/cron-run mode.
-			tier := ev.Info
-			if tier == "" {
-				tier = "compact"
+			trigger := ev.Info
+			if trigger == "" {
+				trigger = "manual"
 			}
-			fmt.Fprintf(os.Stderr, "[compact] starting %s — summarizing history\n", tier)
+			fmt.Fprintf(os.Stderr, "[compact] starting (trigger: %s) — summarizing history\n", trigger)
 			// OSC 9;4 indeterminate — picks up iTerm2 tab / Ghostty tab
 			// progress indicator even when stderr scrolls past the
 			// "[compact]" line. No-op when stdout isn't a TTY (piped
@@ -2859,15 +2870,15 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 				})
 			}
 		case agent.EventCompactionStart:
-			tier := ev.Info
-			if tier == "" {
-				tier = "compact"
+			trigger := ev.Info
+			if trigger == "" {
+				trigger = "manual"
 			}
 			if !job.Silent {
-				fmt.Fprintf(os.Stderr, "[cron %s] [compact] starting %s\n", job.ID, tier)
+				fmt.Fprintf(os.Stderr, "[cron %s] [compact] starting (trigger: %s)\n", job.ID, trigger)
 			}
 			if auditW != nil {
-				auditW.Append(agent.AuditEntry{Kind: "info", Text: "compact start: " + tier})
+				auditW.Append(agent.AuditEntry{Kind: "info", Text: "compact start trigger: " + trigger})
 			}
 		case agent.EventContextCompacted:
 			if !job.Silent {

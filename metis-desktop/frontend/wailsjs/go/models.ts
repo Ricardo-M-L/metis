@@ -14,6 +14,32 @@ export namespace main {
 	        this.Content = source["Content"];
 	    }
 	}
+	export class DesktopUpdateStatus {
+	    currentVersion: string;
+	    latestVersion: string;
+	    available: boolean;
+	    canUpdate: boolean;
+	    installed?: boolean;
+	    restarting?: boolean;
+	    releaseUrl?: string;
+	    message?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopUpdateStatus(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.currentVersion = source["currentVersion"];
+	        this.latestVersion = source["latestVersion"];
+	        this.available = source["available"];
+	        this.canUpdate = source["canUpdate"];
+	        this.installed = source["installed"];
+	        this.restarting = source["restarting"];
+	        this.releaseUrl = source["releaseUrl"];
+	        this.message = source["message"];
+	    }
+	}
 	export class MessageResponse {
 	    text: string;
 	    threadId: string;

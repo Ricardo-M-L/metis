@@ -34,8 +34,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.Tools.Bash.TimeoutSeconds != 120 {
 		t.Errorf("Bash timeout default = %d, want 120", cfg.Tools.Bash.TimeoutSeconds)
 	}
-	if cfg.Session.AutoCompactThreshold != 0.95 {
-		t.Errorf("AutoCompactThreshold default = %v, want 0.95 (raised from 0.85 on 2026-05-16 — the 1M-context longrun proved the per-turn peak sits under cap*0.85 so the old gate never fired)", cfg.Session.AutoCompactThreshold)
+	if cfg.Session.AutoCompactThreshold != 0.85 {
+		t.Errorf("AutoCompactThreshold default = %v, want 0.85 (unified heavy compaction trigger)", cfg.Session.AutoCompactThreshold)
 	}
 	if cfg.Session.AutoCompactMinimumTokens != 50_000 {
 		t.Errorf("AutoCompactMinimumTokens default = %d, want 50000 (DeepSeek-TUI-style absolute floor — prevents Compact churn on small/fresh sessions)", cfg.Session.AutoCompactMinimumTokens)

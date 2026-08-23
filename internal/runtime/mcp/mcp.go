@@ -96,8 +96,9 @@ type ServerEntry struct {
 	// same way command/args/url are — so `FIRECRAWL_API_KEY = "${FC_KEY}"`
 	// works. Wired via `/mcp add --env KEY=VAL` and the user can also
 	// hand-edit `[servers.env]` inline tables in mcp.toml.
-	Env      map[string]string `toml:"env,omitempty"`
-	Disabled bool              `toml:"disabled"`
+	Env        map[string]string `toml:"env,omitempty"`
+	WorkingDir string            `toml:"working_dir,omitempty"`
+	Disabled   bool              `toml:"disabled"`
 	// EnabledTools and DisabledTools filter the tool list a server
 	// exposes after handshake. Modeled on Codex's mcp_servers.<id>
 	// fields with the same names; the motivation is the same — many
@@ -410,9 +411,9 @@ func LaunchServer(ctx context.Context, reg *Registry, name string, registry *too
 	case expanded.URL != "":
 		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, resolveAuthHeaders(ctx, expanded))
 	case expanded.Command != "":
-		srv, err = mcptools.NewServerWithEnv(
+		srv, err = mcptools.NewServerWithEnvAndDir(
 			ctx, expanded.Name, expanded.Command,
-			envSliceFromMap(maybeInjectCUEnv(expanded.Command, expanded.Env)),
+			envSliceFromMap(maybeInjectCUEnv(expanded.Command, expanded.Env)), expanded.WorkingDir,
 			expanded.Args...)
 	default:
 		return nil, fmt.Errorf("mcp: server %q has neither command nor url", name)

@@ -46,11 +46,12 @@ const (
 	EventContextWarn      // crossed soft threshold (e.g., 70%)
 	EventContextCompacted // context history was successfully reduced and applied
 
-	// EventCompactionStart marks the start of an LLM-driven compaction
-	// tier (Collapse or Compact). The TUI swaps the spinner label to
-	// "Compacting conversation (TIER)..." so the user knows the apparent
-	// freeze is a summarization call and not a hang. Info field carries
-	// the tier name. Mirrors claude-code's onCompactProgress event
+	// EventCompactionStart marks the start of the unified LLM-driven
+	// compaction pipeline. The TUI swaps the spinner label to "Compacting
+	// conversation..." so the user knows the apparent freeze is a
+	// summarization call and not a hang. Info carries the trigger name
+	// (auto, manual, overflow, or second-wind). Mirrors claude-code's
+	// onCompactProgress event
 	// (REPL.tsx:2497, case 'compact_start').
 	EventCompactionStart
 
@@ -533,9 +534,10 @@ type ToolCall struct {
 
 // ToolResult wraps a tool execution result for streaming.
 type ToolResult struct {
-	Output  string `json:"output"`
-	IsError bool   `json:"is_error"`
-	Display string `json:"display,omitempty"`
+	Output       string         `json:"output"`
+	IsError      bool           `json:"is_error"`
+	Display      string         `json:"display,omitempty"`
+	Presentation map[string]any `json:"presentation,omitempty"`
 }
 
 type PermissionDecision int

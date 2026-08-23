@@ -70,6 +70,31 @@ func TestAssembleBaseString_NonEmpty(t *testing.T) {
 	}
 }
 
+func TestAssembleMinimalSubAgentPrompt_OmitsMainOnlySections(t *testing.T) {
+	_, sections := AssembleMinimalSubAgentPrompt(PromptCtx{
+		Model:                "test-model",
+		ProviderName:         "test-provider",
+		EnabledTools:         map[string]bool{"Read": true, "Grep": true},
+		HasSkills:            true,
+		ComputerUseAvailable: true,
+	})
+
+	got := make(map[string]bool, len(sections))
+	for _, section := range sections {
+		got[section.Name] = true
+	}
+	for _, name := range []string{"working_efficiently", "skills", "reversibility", "interaction_modes", "project_context", "addendum"} {
+		if got[name] {
+			t.Errorf("minimal sub-agent prompt should omit %q", name)
+		}
+	}
+	for _, name := range []string{"identity", "language", "privacy", "style", "computer_use", "env"} {
+		if !got[name] {
+			t.Errorf("minimal sub-agent prompt should include %q; got %v", name, sectionNames(sections))
+		}
+	}
+}
+
 func TestRenderBasePrompt_StillEmbedsProviderHint(t *testing.T) {
 	out := RenderBasePrompt(BasePromptVars{
 		Model:        "MiniMax-M2.7",

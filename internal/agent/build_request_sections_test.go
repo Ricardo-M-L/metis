@@ -100,6 +100,38 @@ func TestBuildRequest_NoMemoryNoSection(t *testing.T) {
 	}
 }
 
+func TestBuildRequest_ReinjectsCurrentStateAfterHistoryReplacement(t *testing.T) {
+	state := "permission_mode: ask"
+	l := &Loop{
+		System: "BASE",
+		SystemSections: []llm.SystemSection{
+			{Name: "base", Body: "BASE", Cache: true},
+		},
+		CurrentStateSections: func() []llm.SystemSection {
+			return []llm.SystemSection{{Name: "runtime_state", Body: state, Cache: true}}
+		},
+	}
+	first := l.buildRequest(nil)
+	state = "permission_mode: bypassPermissions\n<current_plan>ship release</current_plan>"
+	// Simulate a compaction replacement between requests. Dynamic state must
+	// come from the callback, not from the old message prefix.
+	l.Messages = []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "<checkpoint/>"}}}}
+	second := l.buildRequest(nil)
+	if len(first.SystemSections) != 2 || len(second.SystemSections) != 2 {
+		t.Fatalf("dynamic section counts: first=%d second=%d", len(first.SystemSections), len(second.SystemSections))
+	}
+	if contains(first.SystemSections[1].Body, "bypassPermissions") {
+		t.Fatal("first request unexpectedly saw future state")
+	}
+	got := second.SystemSections[1]
+	if !contains(got.Body, "bypassPermissions") || !contains(got.Body, "ship release") {
+		t.Fatalf("second request missed fresh state: %+v", got)
+	}
+	if got.Cache || !got.Volatile {
+		t.Fatalf("current state must be volatile/non-cacheable: %+v", got)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {

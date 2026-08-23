@@ -51,7 +51,7 @@ func TestConcurrencyConstants(t *testing.T) {
 
 func TestResult_ZeroValueIsUsable(t *testing.T) {
 	r := &Result{}
-	if r.Output != "" || r.IsError || r.Display != "" || r.Meta != nil {
+	if r.Output != "" || r.IsError || r.Display != "" || r.Meta != nil || r.Presentation != nil {
 		t.Errorf("zero-value Result has unexpected fields: %+v", r)
 	}
 }

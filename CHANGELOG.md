@@ -7,6 +7,73 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.29] - 2026-08-24
+
+### Added
+
+- **Desktop workflow parity**: session deletion with confirmation and full
+  sidecar cleanup, interleaved thinking/tool rows, safe expanded reasoning,
+  command and add menus, Finder file/folder paste, richer turn statistics,
+  branded welcome artwork, and a native METIS application icon.
+- **explicit Desktop updates**: the Settings update indicator checks GitHub
+  releases without changing the running app; confirmed updates download and
+  verify the platform archive and checksum, preserve a rollback copy, and
+  restart automatically on supported macOS and Linux installations.
+- **plugin ecosystem bridges**: Claude marketplace catalogs, Codex plugin
+  manifests/skills/MCP declarations, and locally installed DeepSeek Harness
+  profile bundles are discovered with explicit native, translated, portable,
+  and original-runtime compatibility labels.
+- **session-owned local artifacts**: versioned, sanitized HTML deliverables are
+  available from the CLI, model tool, slash command, and Desktop gallery with
+  preview, export, download, and confirmed deletion.
+
+### Changed
+
+- **one heavy context checkpoint pipeline** now serves automatic pressure,
+  manual compact, overflow recovery, and iteration-budget recovery. It triggers
+  at 85% of the effective input budget by default, includes system/state/memory
+  and tool schemas in pressure estimation, retains a bounded recent tail and
+  the latest two real user requests, and persists the exact replacement before
+  it becomes the live conversation.
+- **runtime state survives compaction by construction**: permission mode,
+  working directory, current plan, memory, and the current tool catalog are
+  rebuilt for every provider request rather than depending on summarized chat
+  prose.
+- **prompt assembly is smaller and testable**: the former monolithic prompt was
+  reduced into capability-owned sections, Computer Use detail is injected only
+  when needed, and complete assembled prompts are protected by golden snapshot
+  tests.
+- **Desktop command discovery** uses a compact, scrollable English catalog;
+  choosing an item inserts its slash command into the composer so optional
+  arguments can be added before sending.
+
+### Fixed
+
+- Context compaction no longer performs a shallow trim that turns an 85% full
+  request into a still-heavy 75% request without creating a durable summary.
+- Compaction progress, before/after history size, and the authoritative trigger
+  are surfaced consistently in CLI, TUI, Web, and Desktop interfaces.
+- Expanded reasoning rows participate in normal document flow instead of
+  overlapping the assistant answer; tool calls retain their conversational
+  ordering around reasoning blocks.
+- Folder paste preserves the Finder item's readable absolute path instead of
+  reducing it to an unusable basename.
+- Session export is presented as an actionable result card rather than a long
+  transient filesystem-path toast.
+
+## [0.4.28] - 2026-08-22
+
+### Added
+
+- Published checksummed native Desktop archives for macOS universal, Linux
+  amd64, and Windows amd64 alongside the six CLI platform archives.
+
+### Changed
+
+- Iteration exhaustion can compact and continue for a bounded second wind, and
+  final-answer rescue performs a tool-free completion instead of stopping a
+  long-running task without a conclusion.
+
 ## [0.4.27] - 2026-08-16
 
 ### Fixed
@@ -899,7 +966,9 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.27...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.29...HEAD
+[0.4.29]: https://github.com/Ricardo-M-L/metis/compare/v0.4.28...v0.4.29
+[0.4.28]: https://github.com/Ricardo-M-L/metis/compare/v0.4.27...v0.4.28
 [0.4.27]: https://github.com/Ricardo-M-L/metis/compare/v0.4.26...v0.4.27
 [0.4.26]: https://github.com/Ricardo-M-L/metis/compare/v0.4.25...v0.4.26
 [0.4.25]: https://github.com/Ricardo-M-L/metis/compare/v0.4.24...v0.4.25

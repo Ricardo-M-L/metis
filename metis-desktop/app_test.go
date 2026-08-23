@@ -127,6 +127,25 @@ func TestParseDesktopLaunchArguments(t *testing.T) {
 	}
 }
 
+func TestDesktopFrameURLCarriesFreshLaunchToken(t *testing.T) {
+	tokenA, err := newDesktopFrameToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenB, err := newDesktopFrameToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokenA) != 48 || tokenA == tokenB {
+		t.Fatalf("frame tokens = %q and %q", tokenA, tokenB)
+	}
+	app := &App{webuiPort: 49123, webuiToken: tokenA}
+	want := "http://127.0.0.1:49123/?desktop-frame=" + tokenA
+	if got := app.webUIURL(); got != want {
+		t.Fatalf("webUIURL() = %q, want %q", got, want)
+	}
+}
+
 func TestNormalizeApprovalMode(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"auto", "acceptEdits"}, {"acceptEdits", "acceptEdits"}, {"ask", "default"},
@@ -473,9 +492,28 @@ func TestSendMessageRejectsInvalidInputAndMissingCLI(t *testing.T) {
 }
 
 func TestFindMetisBinaryRejectsNonExecutableOverrides(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "metis")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metis")
+	if runtime.GOOS == "windows" {
+		path += ".exe"
+	}
 	if err := os.WriteFile(path, []byte("binary"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		invalid := filepath.Join(dir, "metis")
+		if err := os.WriteFile(invalid, []byte("binary"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("METIS_BIN", invalid)
+		if _, err := findMetisBinary(""); err == nil || !strings.Contains(err.Error(), "executable") {
+			t.Fatalf("extensionless METIS_BIN error = %v", err)
+		}
+		t.Setenv("METIS_BIN", path)
+		if got, err := findMetisBinary(""); err != nil || got != path {
+			t.Fatalf("Windows METIS_BIN = %q, %v", got, err)
+		}
+		return
 	}
 	t.Setenv("METIS_BIN", path)
 	if _, err := findMetisBinary(""); err == nil || !strings.Contains(err.Error(), "executable") {
@@ -502,6 +540,12 @@ func TestExecutableMetisFileUsesWindowsExtensionInsteadOfUnixBits(t *testing.T) 
 	if !executableMetisFile(exe, info, "windows") {
 		t.Fatal("Windows .exe should not require Unix executable bits")
 	}
+	if executableMetisFile(dir, mustStat(t, dir), "windows") {
+		t.Fatal("directory was accepted as an executable")
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
 	if executableMetisFile(exe, info, "darwin") {
 		t.Fatal("Unix file without executable bits was accepted")
 	}
@@ -514,9 +558,6 @@ func TestExecutableMetisFileUsesWindowsExtensionInsteadOfUnixBits(t *testing.T) 
 	}
 	if !executableMetisFile(exe, info, "darwin") {
 		t.Fatal("Unix executable file was rejected")
-	}
-	if executableMetisFile(dir, mustStat(t, dir), "windows") {
-		t.Fatal("directory was accepted as an executable")
 	}
 }
 
@@ -575,6 +616,180 @@ func TestSaveSettingsReturnsActionableErrors(t *testing.T) {
 	t.Setenv("METIS_HOME", homeFile)
 	if err := app.SaveSettings(`{"theme":"dark"}`); err == nil || !strings.Contains(err.Error(), "save desktop settings") {
 		t.Fatalf("filesystem error = %v", err)
+	}
+}
+
+func TestChooseWorkspaceDirectoryUsesNativePicker(t *testing.T) {
+	current := t.TempDir()
+	selected := t.TempDir()
+	var gotDefault string
+	app := &App{
+		ctx:     context.Background(),
+		workDir: current,
+		chooseWorkspace: func(_ context.Context, defaultDir string) (string, error) {
+			gotDefault = defaultDir
+			return selected, nil
+		},
+	}
+	got, err := app.ChooseWorkspaceDirectory()
+	if err != nil || got != selected {
+		t.Fatalf("ChooseWorkspaceDirectory() = %q, %v", got, err)
+	}
+	if gotDefault != app.workDir {
+		t.Fatalf("native picker default = %q, want %q", gotDefault, app.workDir)
+	}
+}
+
+func TestGetUpdateStatusUsesDesktopVersion(t *testing.T) {
+	var gotVersion string
+	app := &App{
+		ctx: context.Background(),
+		checkDesktopUpdate: func(_ context.Context, current string) (DesktopUpdateStatus, error) {
+			gotVersion = current
+			return DesktopUpdateStatus{CurrentVersion: current, LatestVersion: "9.9.9", Available: true, CanUpdate: true}, nil
+		},
+	}
+	status, err := app.GetUpdateStatus()
+	if err != nil || !status.Available || !status.CanUpdate {
+		t.Fatalf("GetUpdateStatus() = %+v, %v", status, err)
+	}
+	if gotVersion != app.GetVersion() {
+		t.Fatalf("checked version = %q, want %q", gotVersion, app.GetVersion())
+	}
+}
+
+func TestInstallUpdateAndRestartUpdatesCLIThenDesktop(t *testing.T) {
+	workDir := t.TempDir()
+	appPath := filepath.Join(workDir, "Metis.app")
+	fake := &fakeCLI{t: t, results: []fakeCLIResult{{stdout: "installed"}}}
+	var installedPath, restartedPath, restartedWorkspace, restartedCLI, resolvedCLI string
+	quitCalled := false
+	app := &App{
+		ctx:      context.Background(),
+		workDir:  workDir,
+		metisBin: "/fake/bin/metis",
+		findMetis: func() (string, error) {
+			return "/fake/bin/metis", nil
+		},
+		runMetis: fake.runner,
+		checkDesktopUpdate: func(_ context.Context, current string) (DesktopUpdateStatus, error) {
+			return DesktopUpdateStatus{CurrentVersion: current, LatestVersion: "9.9.9", Available: true, CanUpdate: true}, nil
+		},
+		installDesktopUpdate: func(_ context.Context, current, path string) (DesktopUpdateStatus, error) {
+			installedPath = path
+			return DesktopUpdateStatus{CurrentVersion: current, LatestVersion: "9.9.9", Available: false, CanUpdate: true, Installed: true}, nil
+		},
+		desktopPath: func() (string, error) { return appPath, nil },
+		restartDesktop: func(path, workspace, cli string) error {
+			restartedPath, restartedWorkspace, restartedCLI = path, workspace, cli
+			return nil
+		},
+		resolveUpdatedMetis: func(current string) (string, error) {
+			resolvedCLI = current
+			return "/stable/bin/metis", nil
+		},
+		scheduleRestart: func(fn func()) { fn() },
+		quit:            func(context.Context) { quitCalled = true },
+	}
+
+	status, err := app.InstallUpdateAndRestart()
+	if err != nil || !status.Installed {
+		t.Fatalf("InstallUpdateAndRestart() = %+v, %v", status, err)
+	}
+	assertSingleCall(t, fake, workDir, []string{"update"})
+	if installedPath != appPath {
+		t.Fatalf("installed desktop path = %q, want %q", installedPath, appPath)
+	}
+	if resolvedCLI != "/fake/bin/metis" || restartedPath != appPath || restartedWorkspace != workDir || restartedCLI != "/stable/bin/metis" || !quitCalled {
+		t.Fatalf("restart = path:%q workspace:%q cli:%q quit:%v", restartedPath, restartedWorkspace, restartedCLI, quitCalled)
+	}
+}
+
+func TestResolveStableMetisBinaryRebindsManagedVersionPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix managed layout regression")
+	}
+	root := t.TempDir()
+	oldBinary := filepath.Join(root, "share", "metis", "versions", "0.4.28", "metis")
+	newBinary := filepath.Join(root, "share", "metis", "versions", "0.4.29", "metis")
+	stable := filepath.Join(root, "bin", "metis")
+	for _, binary := range []string{oldBinary, newBinary} {
+		if err := os.MkdirAll(filepath.Dir(binary), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(binary, []byte("fixture"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(stable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(newBinary, stable); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveStableMetisBinary(oldBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != stable {
+		t.Fatalf("resolveStableMetisBinary() = %q, want stable launcher %q", got, stable)
+	}
+}
+
+func TestStableMetisLauncherForVersionRejectsLookalikeLayout(t *testing.T) {
+	root := t.TempDir()
+	for _, tc := range []struct {
+		name, goos, current, want string
+		managed                   bool
+	}{
+		{
+			name:    "unix managed",
+			goos:    "darwin",
+			current: filepath.Join(root, "share", "metis", "versions", "1.2.3", "metis"),
+			want:    filepath.Join(root, "bin", "metis"),
+			managed: true,
+		},
+		{
+			name:    "windows managed",
+			goos:    "windows",
+			current: filepath.Join(root, "versions", "1.2.3", "metis.exe"),
+			want:    filepath.Join(root, "bin", "metis.exe"),
+			managed: true,
+		},
+		{
+			name:    "invalid version",
+			goos:    "linux",
+			current: filepath.Join(root, "share", "metis", "versions", "not-a-version", "metis"),
+		},
+		{
+			name:    "unrelated versions tree",
+			goos:    "linux",
+			current: filepath.Join(root, "unrelated", "versions", "1.2.3", "metis"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, managed := stableMetisLauncherForVersion(tc.current, tc.goos)
+			if got != tc.want || managed != tc.managed {
+				t.Fatalf("stableMetisLauncherForVersion() = %q, %v; want %q, %v", got, managed, tc.want, tc.managed)
+			}
+		})
+	}
+}
+
+func TestInstallUpdateAndRestartDoesNothingWhenCurrent(t *testing.T) {
+	app := &App{
+		ctx: context.Background(),
+		checkDesktopUpdate: func(_ context.Context, current string) (DesktopUpdateStatus, error) {
+			return DesktopUpdateStatus{CurrentVersion: current, LatestVersion: current, CanUpdate: true}, nil
+		},
+		findMetis: func() (string, error) {
+			t.Fatal("CLI must not run without an available update")
+			return "", nil
+		},
+	}
+	if _, err := app.InstallUpdateAndRestart(); err == nil || !strings.Contains(err.Error(), "already up to date") {
+		t.Fatalf("InstallUpdateAndRestart() error = %v", err)
 	}
 }
 

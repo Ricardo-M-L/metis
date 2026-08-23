@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"testing"
@@ -114,5 +115,33 @@ func TestContentBlock_ToolUseShape(t *testing.T) {
 	}
 	if b.ToolName != "Read" || b.ToolInput["path"] != "/tmp/x" {
 		t.Errorf("ContentBlock fields wrong: %+v", b)
+	}
+}
+
+func TestContentBlock_ToolResultPresentationJSONRoundTrip(t *testing.T) {
+	in := ContentBlock{
+		Type:       "tool_result",
+		ToolUseID:  "t-2",
+		ToolResult: "Artifact updated",
+		Display:    "Interactive artifact",
+		Presentation: map[string]any{
+			"kind":        "artifact",
+			"artifact_id": "art-123",
+			"version":     2,
+		},
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var out ContentBlock
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.Display != in.Display || out.Presentation["kind"] != "artifact" || out.Presentation["artifact_id"] != "art-123" {
+		t.Fatalf("presentation did not round-trip: %+v", out)
+	}
+	if got, ok := out.Presentation["version"].(float64); !ok || got != 2 {
+		t.Fatalf("version = %#v, want JSON number 2", out.Presentation["version"])
 	}
 }

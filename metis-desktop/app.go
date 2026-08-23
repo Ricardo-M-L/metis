@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
@@ -26,23 +29,53 @@ type App struct {
 	metisBin string
 	sendMu   sync.Mutex
 
-	findMetis func() (string, error)
-	runMetis  func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
+	findMetis            func() (string, error)
+	runMetis             func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
+	chooseWorkspace      func(context.Context, string) (string, error)
+	checkDesktopUpdate   func(context.Context, string) (DesktopUpdateStatus, error)
+	installDesktopUpdate func(context.Context, string, string) (DesktopUpdateStatus, error)
+	desktopPath          func() (string, error)
+	restartDesktop       func(path, workspace, metisBin string) error
+	resolveUpdatedMetis  func(current string) (string, error)
+	scheduleRestart      func(func())
+	quit                 func(context.Context)
+	updateMu             sync.Mutex
 
 	// webuiCmd is the in-process-browser backend child (metis desktop
-	// --web). The native window navigates straight to it; the child is
-	// reaped when the Wails context shuts down.
-	webuiCmd  *exec.Cmd
-	webuiDone chan error
-	webuiPort int
-	webuiMu   sync.Mutex
+	// --web). The native window embeds it behind a tokenised frame URL; the
+	// child is reaped when the Wails context shuts down.
+	webuiCmd   *exec.Cmd
+	webuiDone  chan error
+	webuiPort  int
+	webuiToken string
+	webuiMu    sync.Mutex
 }
 
 func NewApp() *App {
+	updater := defaultDesktopUpdater()
 	app := &App{
 		workDir:  parseWorkspaceArg(os.Args),
 		metisBin: parseMetisBinArg(os.Args),
 		runMetis: runMetisCommand,
+		chooseWorkspace: func(ctx context.Context, defaultDir string) (string, error) {
+			return wailsruntime.OpenDirectoryDialog(ctx, wailsruntime.OpenDialogOptions{
+				Title:                "Choose a workspace folder",
+				DefaultDirectory:     defaultDir,
+				CanCreateDirectories: true,
+			})
+		},
+		checkDesktopUpdate:   updater.Check,
+		installDesktopUpdate: updater.Install,
+		desktopPath:          currentDesktopPath,
+		restartDesktop:       restartDesktopProcess,
+		resolveUpdatedMetis:  resolveStableMetisBinary,
+		scheduleRestart: func(fn func()) {
+			go func() {
+				time.Sleep(350 * time.Millisecond)
+				fn()
+			}()
+		},
+		quit: wailsruntime.Quit,
 	}
 	app.findMetis = func() (string, error) { return findMetisBinary(app.metisBin) }
 	return app
@@ -78,6 +111,7 @@ func (a *App) stopWebUI() {
 	a.webuiCmd = nil
 	a.webuiDone = nil
 	a.webuiPort = 0
+	a.webuiToken = ""
 	a.webuiMu.Unlock()
 
 	if cmd == nil || cmd.Process == nil {
@@ -113,9 +147,9 @@ func parseWorkspaceArg(args []string) string {
 }
 
 // StartWebUI launches the in-process browser UI backend (metis desktop
-// --web) on a free loopback port and returns its URL. The native window
-// navigates directly to it: one UI codebase, true SSE streaming, no
-// per-operation CLI subprocesses.
+// --web) on a free loopback port and returns its tokenised frame URL. The
+// native shell embeds it: one UI codebase, true SSE streaming, no per-operation
+// CLI subprocesses, while Wails bindings remain available in the parent frame.
 func (a *App) StartWebUI() (string, error) {
 	a.webuiMu.Lock()
 	defer a.webuiMu.Unlock()
@@ -130,8 +164,13 @@ func (a *App) StartWebUI() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	frameToken, err := newDesktopFrameToken()
+	if err != nil {
+		return "", fmt.Errorf("create native frame token: %w", err)
+	}
 	cmd := exec.Command(binary, "desktop", "--web", "--port", strconv.Itoa(port))
 	cmd.Dir = a.workDir
+	cmd.Env = append(os.Environ(), "METIS_DESKTOP_FRAME_TOKEN="+frameToken)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start webui: %w", err)
 	}
@@ -139,6 +178,7 @@ func (a *App) StartWebUI() (string, error) {
 	a.webuiCmd = cmd
 	a.webuiDone = done
 	a.webuiPort = port
+	a.webuiToken = frameToken
 	// Reap the child on every exit path. Process.Kill alone does not release
 	// the OS process record; Wait belongs in exactly one goroutine.
 	go func() {
@@ -150,13 +190,14 @@ func (a *App) StartWebUI() (string, error) {
 			a.webuiCmd = nil
 			a.webuiDone = nil
 			a.webuiPort = 0
+			a.webuiToken = ""
 		}
 		a.webuiMu.Unlock()
 	}()
 
 	// Wait for the backend to answer its health probe before the webview
 	// navigates, otherwise the first paint is a connection error.
-	url := a.webUIURL()
+	baseURL := a.webUIBaseURL()
 	deadline := time.Now().Add(15 * time.Second)
 	client := &http.Client{Timeout: 750 * time.Millisecond}
 	for time.Now().Before(deadline) {
@@ -165,17 +206,18 @@ func (a *App) StartWebUI() (string, error) {
 			a.webuiCmd = nil
 			a.webuiDone = nil
 			a.webuiPort = 0
+			a.webuiToken = ""
 			if err == nil {
 				err = errors.New("process exited")
 			}
 			return "", fmt.Errorf("webui exited before becoming ready: %w", err)
 		default:
 		}
-		resp, err := client.Get(url + "/api/health")
+		resp, err := client.Get(baseURL + "/api/health")
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return url, nil
+				return a.webUIURL(), nil
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -184,11 +226,28 @@ func (a *App) StartWebUI() (string, error) {
 	a.webuiCmd = nil
 	a.webuiDone = nil
 	a.webuiPort = 0
+	a.webuiToken = ""
 	return "", errors.New("webui did not become ready within 15 seconds")
 }
 
-func (a *App) webUIURL() string {
+func (a *App) webUIBaseURL() string {
 	return "http://127.0.0.1:" + strconv.Itoa(a.webuiPort)
+}
+
+func (a *App) webUIURL() string {
+	base := a.webUIBaseURL()
+	if a.webuiToken == "" {
+		return base
+	}
+	return base + "/?desktop-frame=" + url.QueryEscape(a.webuiToken)
+}
+
+func newDesktopFrameToken() (string, error) {
+	var token [24]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", token[:]), nil
 }
 
 // freePort binds an ephemeral loopback port, closes it, and returns the
@@ -204,7 +263,175 @@ func freePort() (int, error) {
 }
 
 func (a *App) GetVersion() string {
-	return "0.4.28"
+	return "0.4.29"
+}
+
+// ChooseWorkspaceDirectory is the native half of the iframe bridge. The web
+// UI never receives arbitrary filesystem access: it may only ask Wails to show
+// one system directory picker and gets back the path the user selected.
+func (a *App) ChooseWorkspaceDirectory() (string, error) {
+	if a.chooseWorkspace == nil {
+		return "", errors.New("native directory picker is unavailable")
+	}
+	base := a.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	path, err := a.chooseWorkspace(base, a.workDir)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return strings.TrimSpace(path), err
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve selected workspace: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("selected workspace is not a readable directory")
+	}
+	return abs, nil
+}
+
+// GetUpdateStatus checks only. It never downloads or changes the running app,
+// which preserves the user's explicit choice to stay on the current version.
+func (a *App) GetUpdateStatus() (DesktopUpdateStatus, error) {
+	if a.checkDesktopUpdate == nil {
+		return DesktopUpdateStatus{}, errors.New("Desktop updater is unavailable")
+	}
+	base := a.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, 20*time.Second)
+	defer cancel()
+	return a.checkDesktopUpdate(ctx, a.GetVersion())
+}
+
+// InstallUpdateAndRestart updates the CLI first (the CLI serves the shared
+// Desktop UI), then installs the verified native bundle and starts the new
+// bundle with the same workspace. Nothing runs unless the WebView's explicit
+// update confirmation calls this method.
+func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+
+	status, err := a.GetUpdateStatus()
+	if err != nil {
+		return status, err
+	}
+	if !status.Available {
+		return status, errors.New("Metis Desktop is already up to date")
+	}
+	if !status.CanUpdate {
+		return status, errors.New(status.Message)
+	}
+	binary, err := a.findMetis()
+	if err != nil {
+		return status, err
+	}
+	base := a.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	cliCtx, cliCancel := context.WithTimeout(base, 10*time.Minute)
+	stdout, stderr, err := a.runMetis(cliCtx, binary, []string{"update"}, a.workDir)
+	cliCancel()
+	if err != nil {
+		detail := strings.TrimSpace(stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(stdout)
+		}
+		if detail == "" {
+			detail = err.Error()
+		}
+		return status, fmt.Errorf("update Metis CLI: %s", detail)
+	}
+	if a.resolveUpdatedMetis != nil {
+		binary, err = a.resolveUpdatedMetis(binary)
+		if err != nil {
+			return status, fmt.Errorf("resolve updated Metis CLI: %w", err)
+		}
+	}
+	if a.desktopPath == nil || a.installDesktopUpdate == nil {
+		return status, errors.New("native Desktop updater is unavailable")
+	}
+	appPath, err := a.desktopPath()
+	if err != nil {
+		return status, err
+	}
+	installCtx, installCancel := context.WithTimeout(base, 10*time.Minute)
+	status, err = a.installDesktopUpdate(installCtx, a.GetVersion(), appPath)
+	installCancel()
+	if err != nil {
+		return status, err
+	}
+	if a.restartDesktop == nil || a.scheduleRestart == nil || a.quit == nil {
+		return status, errors.New("Desktop restart is unavailable")
+	}
+	if err := a.restartDesktop(appPath, a.workDir, binary); err != nil {
+		return status, fmt.Errorf("restart updated Desktop: %w", err)
+	}
+	status.Restarting = true
+	a.scheduleRestart(func() { a.quit(base) })
+	return status, nil
+}
+
+// resolveStableMetisBinary keeps Desktop attached to the stable bin/metis
+// launcher after self-update. Older launchers passed os.Executable's resolved
+// share/metis/versions/<version>/metis target; reusing that immutable path
+// would restart the new Desktop against the old CLI and eventually a cleaned
+// up executable.
+func resolveStableMetisBinary(current string) (string, error) {
+	current = strings.TrimSpace(current)
+	if current == "" {
+		return "", errors.New("updated Metis CLI path is invalid")
+	}
+	abs, err := filepath.Abs(current)
+	if err != nil || abs == "" {
+		return "", errors.New("updated Metis CLI path is invalid")
+	}
+	if stable, managed := stableMetisLauncherForVersion(abs, runtime.GOOS); managed {
+		info, statErr := os.Stat(stable)
+		if statErr != nil || !executableMetisFile(stable, info, runtime.GOOS) {
+			return "", fmt.Errorf("managed Metis launcher is unavailable after update: %s", stable)
+		}
+		return stable, nil
+	}
+	info, statErr := os.Stat(abs)
+	if statErr != nil || !executableMetisFile(abs, info, runtime.GOOS) {
+		return "", fmt.Errorf("updated Metis CLI is unavailable: %s", abs)
+	}
+	return abs, nil
+}
+
+func stableMetisLauncherForVersion(path, goos string) (string, bool) {
+	name := "metis"
+	if goos == "windows" {
+		name = "metis.exe"
+	}
+	if (goos == "windows" && !strings.EqualFold(filepath.Base(path), name)) ||
+		(goos != "windows" && filepath.Base(path) != name) {
+		return "", false
+	}
+	versionDir := filepath.Dir(path)
+	versionsRoot := filepath.Dir(versionDir)
+	version := filepath.Base(versionDir)
+	if !validDesktopVersion(version) {
+		return "", false
+	}
+	if (goos == "windows" && !strings.EqualFold(filepath.Base(versionsRoot), "versions")) ||
+		(goos != "windows" && filepath.Base(versionsRoot) != "versions") {
+		return "", false
+	}
+	if goos == "windows" {
+		return filepath.Join(filepath.Dir(versionsRoot), "bin", name), true
+	}
+	managedRoot := filepath.Dir(versionsRoot)
+	shareRoot := filepath.Dir(managedRoot)
+	if filepath.Base(managedRoot) != "metis" || filepath.Base(shareRoot) != "share" {
+		return "", false
+	}
+	return filepath.Join(filepath.Dir(shareRoot), "bin", name), true
 }
 
 func (a *App) GetProjectDir() string {

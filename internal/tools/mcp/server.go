@@ -211,7 +211,13 @@ func NewServer(ctx context.Context, name, command string, args ...string) (*Serv
 // is appended onto os.Environ() for the spawned subprocess so values
 // like `FIRECRAWL_API_KEY = "fc-..."` from mcp.toml reach the server.
 func NewServerWithEnv(ctx context.Context, name, command string, extraEnv []string, args ...string) (*Server, error) {
-	client, err := mcp.NewStdioClientWithEnv(ctx, command, extraEnv, args...)
+	return NewServerWithEnvAndDir(ctx, name, command, extraEnv, "", args...)
+}
+
+// NewServerWithEnvAndDir preserves a plugin package's working-directory
+// contract while keeping the stdio process isolated from the METIS process.
+func NewServerWithEnvAndDir(ctx context.Context, name, command string, extraEnv []string, workingDir string, args ...string) (*Server, error) {
+	client, err := mcp.NewStdioClientWithEnvAndDir(ctx, command, extraEnv, workingDir, args...)
 	if err != nil {
 		return nil, fmt.Errorf("MCP server %q: %w", name, err)
 	}
