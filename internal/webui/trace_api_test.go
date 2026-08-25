@@ -180,6 +180,27 @@ func TestActiveTraceDurationExcludesIdleTimeBetweenTurns(t *testing.T) {
 	}
 }
 
+func TestConcurrentToolDurationsLeaveLLMWallTime(t *testing.T) {
+	start := time.Date(2026, time.August, 25, 10, 0, 0, 0, time.UTC)
+	nodes := []session.TracedNode{
+		{Event: session.TraceEvent{Turn: 1, Kind: "user", TS: start}},
+		{Event: session.TraceEvent{Turn: 1, Kind: "tool_result", ToolName: "Agent", ToolUseID: "agent-a", TS: start.Add(10 * time.Second), ElapsedMs: 8_000}},
+		{Event: session.TraceEvent{Turn: 1, Kind: "tool_result", ToolName: "Agent", ToolUseID: "agent-b", TS: start.Add(12 * time.Second), ElapsedMs: 8_000}},
+		{Event: session.TraceEvent{Turn: 1, Kind: "tool_result", ToolName: "Bash", ToolUseID: "bash-a", ParentID: "agent-a", TS: start.Add(9 * time.Second), ElapsedMs: 2_000}},
+		{Event: session.TraceEvent{Turn: 1, Kind: "tokens", TS: start.Add(15 * time.Second)}},
+	}
+
+	// Agent spans are orchestration containers: their elapsed time includes
+	// child LLM and leaf-tool work. Only the 2s Bash leaf is tool wall time;
+	// summing the two overlapping Agent spans (16s) used to force llmMs to 0.
+	if got, want := activeTraceToolDuration(nodes), int64(2_000); got != want {
+		t.Fatalf("activeTraceToolDuration() = %d ms, want %d ms", got, want)
+	}
+	if got, want := activeTraceDuration(nodes)-activeTraceToolDuration(nodes), int64(13_000); got != want {
+		t.Fatalf("LLM wall time = %d ms, want %d ms", got, want)
+	}
+}
+
 func TestTraceFromHistoryRestoresThinkingWithoutRedactedCiphertext(t *testing.T) {
 	s, store := testServer(t)
 	sid := store.NewSessionID()

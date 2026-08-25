@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2723,6 +2724,87 @@ func activeTraceDuration(nodes []session.TracedNode) int64 {
 	return total
 }
 
+// activeTraceToolDuration returns leaf-tool wall time. Agent spans are
+// orchestration containers: their elapsed time includes child LLM and tool
+// work, so subtracting them from the session duration would erase the child
+// model time. Per-turn interval merging also prevents parallel leaf tools from
+// being counted more than once.
+func activeTraceToolDuration(nodes []session.TracedNode) int64 {
+	type interval struct {
+		start time.Time
+		end   time.Time
+	}
+	type turnIntervals struct {
+		first time.Time
+		last  time.Time
+		tools []interval
+	}
+
+	turns := make(map[int]*turnIntervals)
+	for _, node := range nodes {
+		ev := node.Event
+		if ev.TS.IsZero() {
+			continue
+		}
+		turn := turns[ev.Turn]
+		if turn == nil {
+			turn = &turnIntervals{}
+			turns[ev.Turn] = turn
+		}
+		if turn.first.IsZero() || ev.TS.Before(turn.first) {
+			turn.first = ev.TS
+		}
+		if turn.last.IsZero() || ev.TS.After(turn.last) {
+			turn.last = ev.TS
+		}
+		if ev.Kind != "tool_result" || ev.ElapsedMs <= 0 || strings.EqualFold(ev.ToolName, "Agent") {
+			continue
+		}
+		turn.tools = append(turn.tools, interval{
+			start: ev.TS.Add(-time.Duration(ev.ElapsedMs) * time.Millisecond),
+			end:   ev.TS,
+		})
+	}
+
+	var total int64
+	for _, turn := range turns {
+		if turn.first.IsZero() || !turn.last.After(turn.first) || len(turn.tools) == 0 {
+			continue
+		}
+		clamped := make([]interval, 0, len(turn.tools))
+		for _, tool := range turn.tools {
+			if tool.start.Before(turn.first) {
+				tool.start = turn.first
+			}
+			if tool.end.After(turn.last) {
+				tool.end = turn.last
+			}
+			if tool.end.After(tool.start) {
+				clamped = append(clamped, tool)
+			}
+		}
+		if len(clamped) == 0 {
+			continue
+		}
+		sort.Slice(clamped, func(i, j int) bool {
+			return clamped[i].start.Before(clamped[j].start)
+		})
+		current := clamped[0]
+		for _, next := range clamped[1:] {
+			if !next.start.After(current.end) {
+				if next.end.After(current.end) {
+					current.end = next.end
+				}
+				continue
+			}
+			total += current.end.Sub(current.start).Milliseconds()
+			current = next
+		}
+		total += current.end.Sub(current.start).Milliseconds()
+	}
+	return total
+}
+
 // handleTrace serves the recorded trajectory of a session as a nested
 // event tree plus aggregate stats (duration, turns, tool calls, token
 // totals). Mirrors the harness GUI's trajectory pane.
@@ -2815,7 +2897,8 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 			stats.ToolCalls++
 			stats.Steps++
 		case "tool_result":
-			stats.ToolMs += ev.ElapsedMs
+			// Tool wall time is calculated after the scan so overlapping leaf
+			// tools and Agent orchestration spans are handled correctly.
 		case "error":
 			stats.Errors++
 		case "tokens":
@@ -2841,6 +2924,7 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 			Depth:     n.Depth,
 		})
 	}
+	stats.ToolMs = activeTraceToolDuration(nodes)
 	if stats.DurationMs > stats.ToolMs {
 		stats.LlmMs = stats.DurationMs - stats.ToolMs
 	}
