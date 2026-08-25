@@ -38,6 +38,9 @@ const KIND_META = {
   model_fallback:     { label: 'FALLBACK',   cls: 'k-tool',      lane: 2 },
   tokens:             { label: 'USAGE',      cls: 'k-context',   lane: 1 },
   context_warn:       { label: 'CONTEXT',    cls: 'k-context',   lane: 0 },
+  compaction_start:   { label: 'COMPACTION', cls: 'k-context',   lane: 0 },
+  compaction_progress:{ label: 'COMPACTION', cls: 'k-context',   lane: 0 },
+  compaction_end:     { label: 'COMPACTION', cls: 'k-context',   lane: 0 },
   context_compacted:  { label: 'COMPACTED',  cls: 'k-system',    lane: 0 },
   info:               { label: 'INFO',       cls: 'k-system',    lane: 1 },
   error:              { label: 'ERROR',      cls: 'k-error',     lane: 2 },
@@ -146,15 +149,86 @@ function toggleTraceAssistant(idx) {
 
 // --- Row model ----------------------------------------------------------
 
+// Runtime compaction can emit dozens of byte-progress samples. Keep those
+// events in the saved trace, but present each lifecycle as one readable row.
+function coalesceTraceCompactions(events) {
+  const display = [];
+  const active = new Map();
+  const completed = new Map();
+  const keyOf = ev => String(ev.turn || 0);
+  const runningText = 'Compacting context…';
+  const completeText = 'Conversation history compacted';
+
+  for (const source of events || []) {
+    const ev = Object.assign({}, source);
+    const key = keyOf(ev);
+    if (ev.kind === 'compaction_start') {
+      const aggregate = Object.assign({}, ev, { kind: 'compaction_progress', text: runningText });
+      display.push(aggregate);
+      active.set(key, aggregate);
+      completed.delete(key);
+      continue;
+    }
+    if (ev.kind === 'compaction_progress') {
+      let aggregate = active.get(key);
+      if (!aggregate) {
+        aggregate = Object.assign({}, ev, { kind: 'compaction_progress', text: runningText });
+        display.push(aggregate);
+        active.set(key, aggregate);
+      }
+      aggregate.ts = ev.ts || aggregate.ts;
+      aggregate.elapsedMs = ev.elapsedMs || aggregate.elapsedMs;
+      continue;
+    }
+    if (ev.kind === 'context_compacted') {
+      let aggregate = active.get(key);
+      const text = !ev.text || ev.text === 'auto' ? completeText : ev.text;
+      if (aggregate) Object.assign(aggregate, ev, { kind: 'context_compacted', text });
+      else {
+        aggregate = Object.assign({}, ev, { text });
+        display.push(aggregate);
+      }
+      active.delete(key);
+      completed.set(key, aggregate);
+      continue;
+    }
+    if (ev.kind === 'compaction_end') {
+      const aggregate = active.get(key);
+      if (aggregate) {
+        if (ev.isError) Object.assign(aggregate, ev, { kind: 'error', text: ev.text || 'Context compaction failed' });
+        else {
+          Object.assign(aggregate, ev, { kind: 'context_compacted', text: completeText });
+          completed.set(key, aggregate);
+        }
+        active.delete(key);
+      } else if (ev.isError) {
+        display.push(Object.assign({}, ev, { kind: 'error', text: ev.text || 'Context compaction failed' }));
+      }
+      continue;
+    }
+    if (ev.kind === 'info' && /^context compacted\b/i.test(String(ev.text || ''))) {
+      const aggregate = completed.get(key);
+      if (aggregate) {
+        const summary = String(ev.text || '').replace(/^context compacted\s*(?:\(auto\))?\s*:\s*/i, '');
+        aggregate.text = completeText + (summary ? ' · ' + summary : '');
+        continue;
+      }
+    }
+    display.push(ev);
+  }
+  return display;
+}
+
 function buildTraceRows(events) {
+  const displayEvents = coalesceTraceCompactions(events);
   const rows = [];
   const pendingTool = new Map();   // toolUseID -> tool row awaiting result
   const pendingByName = [];
   const partialArgs = new Map();   // toolUseID/name -> interrupted arg stream
   const partialOrder = [];
   const toolKey = ev => ev.toolUseID ? 'id:' + ev.toolUseID : 'name:' + (ev.toolName || '');
-  for (let i = 0; i < events.length; i++) {
-    const ev = Object.assign({}, events[i]);
+  for (let i = 0; i < displayEvents.length; i++) {
+    const ev = Object.assign({}, displayEvents[i]);
     if (ev.kind === 'turn_end' || ev.kind === 'loop_done') continue; // boundaries only
 
     if (ev.kind === 'tool_args' || ev.kind === 'tool_args_delta') {

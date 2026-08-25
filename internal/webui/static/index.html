@@ -86,7 +86,6 @@
       <div class="welcome" id="welcomeScreen">
         <div class="welcome-line">
           <span class="welcome-text" data-i18n="welcome">&#20174;&#24819;&#27861;&#65292;&#21040;&#23436;&#25104;</span>
-          <span class="welcome-badge" data-i18n="preview">METIS Desktop</span>
         </div>
       </div>
     </div>
@@ -142,8 +141,6 @@
     </section>
 
     <div class="status-row">
-      <span class="top-chip" id="topbarTitle">metis</span>
-      <span class="top-chip" id="presetName">Standard</span>
       <button class="top-chip status-chip" id="statusChip" type="button" style="display:none" aria-label="Agent status details" aria-expanded="false" onclick="toggleStatusPopover(event)"></button>
       <div class="status-popover" id="statusPopover" style="display:none" aria-label="Agent and background task details"></div>
       <button class="topbar-btn session-log-btn" title="Export session log" aria-label="Export session log" onclick="exportSession()">
@@ -153,6 +150,20 @@
 
     <div class="input-area">
       <div class="input-container">
+        <section class="todo-plan-dock" id="todoPlanDock" aria-live="polite" hidden>
+          <div class="todo-plan-popover" id="todoPlanPopover" hidden>
+            <div class="todo-plan-popover-head">
+              <span class="todo-plan-popover-title">任务进度</span>
+              <span class="todo-plan-counts" id="todoPlanCounts"></span>
+            </div>
+            <ul class="todo-plan-list" id="todoPlanList"></ul>
+          </div>
+          <button class="todo-plan-trigger" id="todoPlanTrigger" type="button" aria-expanded="false" aria-controls="todoPlanPopover" onclick="toggleTodoPlan()">
+            <span class="todo-plan-trigger-ring" aria-hidden="true"></span>
+            <span id="todoPlanStepLabel">Step 1 / 1</span>
+            <svg class="todo-plan-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 9 3-3 3 3"/></svg>
+          </button>
+        </section>
         <div class="command-menu" id="commandMenu" role="listbox" aria-label="Commands" style="display:none"></div>
         <div class="composer-add-menu" id="composerAddMenu" role="menu" aria-label="Add and run" hidden></div>
         <div class="drop-overlay" id="dropOverlay" aria-hidden="true">

@@ -282,11 +282,10 @@ Use Agent for:
 
 PARALLEL FAN-OUT (important — this is HOW you scale, not WHEN to ask):
 When you have N independent sub-problems, emit N Agent tool_uses IN
-THE SAME ASSISTANT TURN. metis's dispatcher launches them
-concurrently (Background tier when run_in_background:true,
-otherwise the exclusive queue still avoids re-paying network setup
-per call). Sweet spot is 3–8 parallel agents; cap is 20 named + 40
-anonymous. Example shapes:
+THE SAME ASSISTANT TURN. metis's dispatcher launches foreground
+calls concurrently and starts run_in_background:true calls as
+background jobs that return immediately. Sweet spot is 3–8 parallel
+agents; cap is 20 named + 40 anonymous. Example shapes:
   - Surveying 5 libraries → 5 explore agents in one turn, NOT 5
     sequential turns.
   - Implementing 4 independent file clusters → 4 general agents in
@@ -430,7 +429,11 @@ func (Agent) Concurrency(in map[string]any) tools.Concurrency {
 	if b, ok := in["run_in_background"].(bool); ok && b {
 		return tools.ConcurrencyBackground
 	}
-	return tools.ConcurrencyExclusive
+	// Foreground Agent calls emitted in the same assistant message are
+	// independent child loops. Classify them as safe so executeBatch can fan
+	// them out concurrently; the Agent's shared capacity limiter still bounds
+	// total child work and executeBatch preserves result order.
+	return tools.ConcurrencySafe
 }
 
 func (a Agent) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {

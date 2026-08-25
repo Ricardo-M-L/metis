@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -88,7 +89,7 @@ func TestStaticAssetsServed(t *testing.T) {
 		"viewTabs", "tabTrace", "tabArtifacts", "artifactsPanel", "artifactPreviewFrame", "tracePanel", "traceSearch",
 		"btnFoldTurns", "btnFoldCalls", "traceTimeline", "traceInspector",
 		"archivedSessionsBtn", "sessionViewBtn", "sessionViewMenu", "attachmentInput", "contextMeter", "Session log",
-		"statusPopover", "commandMenu", "composerAddMenu", "attachmentBtn", "queuedTurns", "details-closed", "workspaceAddBtn", "desktopUpdateBtn", "Model Providers", "Agent Presets", "Plugins", "Smart Routing", "effortBtn", "presetName", "data-i18n", "data-i18n-label", "data-i18n-title",
+		"statusPopover", "commandMenu", "composerAddMenu", "attachmentBtn", "queuedTurns", "details-closed", "workspaceAddBtn", "desktopUpdateBtn", "Model Providers", "Agent Presets", "Plugins", "Smart Routing", "effortBtn", "data-i18n", "data-i18n-label", "data-i18n-title",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("index missing %q", want)
@@ -103,6 +104,37 @@ func TestStaticAssetsServed(t *testing.T) {
 	}
 	if strings.Contains(body, "&#25506;&#32034;&#26410;&#33267;&#20043;&#22659;") || strings.Contains(body, "&#39044;&#35272;&#29256;") {
 		t.Fatal("index.html still contains the retired DeepSeek-style welcome copy")
+	}
+}
+
+func TestDesktopChromeOmitsRetiredBrandAndSessionMetadata(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	index := get("/")
+	for _, retired := range []string{`class="welcome-badge"`, `id="topbarTitle"`, `id="presetName"`} {
+		if strings.Contains(index, retired) {
+			t.Fatalf("Desktop chrome still renders retired element %q", retired)
+		}
+	}
+	if !strings.Contains(index, `class="topbar-btn session-log-btn"`) {
+		t.Fatal("removing session metadata also removed the session-log action")
+	}
+
+	for _, asset := range []string{"app.js", "sessions.js", "chat.js", "style.css"} {
+		body := get("/" + asset)
+		for _, retired := range []string{"welcome-badge", "topbarTitle", "presetName"} {
+			if strings.Contains(body, retired) {
+				t.Fatalf("%s still references retired Desktop chrome %q", asset, retired)
+			}
+		}
 	}
 }
 
@@ -262,6 +294,268 @@ func TestExpandedThinkingRowCannotShrinkIntoFollowingMessage(t *testing.T) {
 	rowRule := style[rowStart : rowStart+headOffset]
 	if !strings.Contains(rowRule, "flex: 0 0 auto;") {
 		t.Fatal("canonical .think-row can shrink inside the flex scroll container and overlap the next message")
+	}
+}
+
+func TestComposerSuppressesRootHorizontalScrollAndExplainsPermissionModes(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != 200 {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	style := get("/style.css")
+	chatAreaStart := strings.Index(style, ".chat-area {\n")
+	if chatAreaStart < 0 {
+		t.Fatal("style.css missing .chat-area rule")
+	}
+	chatAreaEnd := strings.Index(style[chatAreaStart:], "\n}")
+	if chatAreaEnd < 0 {
+		t.Fatal("cannot isolate .chat-area rule")
+	}
+	chatAreaRule := style[chatAreaStart : chatAreaStart+chatAreaEnd]
+	if !strings.Contains(chatAreaRule, "overflow-x: hidden;") {
+		t.Fatal("chat transcript can expose a horizontal scrollbar above the composer")
+	}
+
+	chat := get("/chat.js")
+	for _, want := range []string{
+		"dontAsk: 'Never prompt: allow pre-approved and read-only work, deny the rest'",
+		"bypassPermissions: 'Auto-approve ordinary tool calls; critical destructive checks remain'",
+		"dontAsk: '从不弹窗：只执行已允许和只读操作，其余直接拒绝'",
+		"bypassPermissions: '普通工具调用自动执行，严重破坏性操作仍会拦截'",
+	} {
+		if !strings.Contains(chat, want) {
+			t.Fatalf("chat.js missing accurate permission explanation %q", want)
+		}
+	}
+}
+
+func TestComposerEnterRespectsIMEAndFocusHasNoOuterRing(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != 200 {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	chat := get("/chat.js")
+	handlerStart := strings.Index(chat, "function handleKeydown(e) {")
+	if handlerStart < 0 {
+		t.Fatal("chat.js missing handleKeydown")
+	}
+	handler := chat[handlerStart:]
+	guard := strings.Index(handler, "if (e.isComposing || e.keyCode === 229) return;")
+	menuHandling := strings.Index(handler, "const menuOpen =")
+	if guard < 0 || menuHandling < 0 || guard > menuHandling {
+		t.Fatal("handleKeydown must ignore Enter and navigation keys while an IME composition is active")
+	}
+
+	style := get("/style.css")
+	if strings.Contains(style, ".input-box:focus-within") {
+		t.Fatal("composer focus must not draw an outer border or ring")
+	}
+}
+
+func TestResolvedPermissionCardUsesFinalStateAndRemovesActions(t *testing.T) {
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/chat.js", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /chat.js = %d", rr.Code)
+	}
+
+	chat := rr.Body.String()
+	for _, want := range []string{
+		`data-tool="${escAttr(d.tool || 'tool')}"`,
+		`name.textContent = tool + (approve ? ' allowed' : ' denied');`,
+		`actions.remove();`,
+	} {
+		if !strings.Contains(chat, want) {
+			t.Fatalf("resolved permission card is missing final-state behavior %q", want)
+		}
+	}
+}
+
+func TestFileEditRowsRenderExpandableDiffForLiveAndHistory(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	chat := get("/chat.js")
+	for _, want := range []string{
+		"const FILE_DIFF_MAX_LINES",
+		"function parseFileEditInput(name, input)",
+		"function buildFileLineDiff(before, after)",
+		"function renderFileEditCard(chip, name, input)",
+		"args.old_string",
+		"renderFileEditCard(chip, name, chip.getAttribute('data-args') || '')",
+	} {
+		if !strings.Contains(chat, want) {
+			t.Fatalf("chat.js missing file-edit diff behavior %q", want)
+		}
+	}
+
+	style := get("/style.css")
+	for _, want := range []string{
+		".tc-file-diff {",
+		".tc-diff-line[data-kind='add']",
+		".tc-diff-line[data-kind='delete']",
+		".tc-diff-code",
+	} {
+		if !strings.Contains(style, want) {
+			t.Fatalf("style.css missing file-edit diff style %q", want)
+		}
+	}
+}
+
+func TestCompactionPresentationUsesOnePersistentRow(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != 200 {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	chat := get("/chat.js")
+	for _, want := range []string{
+		"let compactionStatusEl = null;",
+		"function upsertCompactionRow(",
+		"upsertCompactionRow(uiText('Compacting context…', '正在压缩上下文…')",
+		"compactionStatusEl.classList.add('complete');",
+		"async function restoreCompactionHistory()",
+	} {
+		if !strings.Contains(chat, want) {
+			t.Fatalf("chat.js missing persistent compaction presentation %q", want)
+		}
+	}
+
+	sessions := get("/sessions.js")
+	if !strings.Contains(sessions, "await restoreCompactionHistory();") {
+		t.Fatal("resuming a saved session does not restore its compaction disclosure rows")
+	}
+
+	trace := get("/trace.js")
+	for _, want := range []string{
+		"compaction_progress:",
+		"function coalesceTraceCompactions(events)",
+		"const displayEvents = coalesceTraceCompactions(events);",
+		"/^context compacted\\b/i.test(String(ev.text || ''))",
+	} {
+		if !strings.Contains(trace, want) {
+			t.Fatalf("trace.js missing compaction coalescing contract %q", want)
+		}
+	}
+}
+
+func TestSessionRenameUsesStyledDialogAndExpandControlIsTextOnly(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != 200 {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	sessions := get("/sessions.js")
+	for _, want := range []string{
+		"let sessionRenameDialog = null;",
+		"function openSessionRenameDialog(",
+		"async function submitSessionRename(",
+		`class="session-rename-dialog" role="dialog"`,
+		`class="session-rename-input"`,
+		"input.select();",
+		"/api/sessions/rename",
+	} {
+		if !strings.Contains(sessions, want) {
+			t.Fatalf("sessions.js missing rename-dialog contract %q", want)
+		}
+	}
+	if strings.Contains(sessions, "prompt('Rename session'") {
+		t.Fatal("session rename still relies on the browser prompt instead of the Desktop dialog")
+	}
+
+	style := get("/style.css")
+	for _, want := range []string{
+		".session-rename-overlay {",
+		".session-rename-dialog {",
+		".session-rename-input {",
+	} {
+		if !strings.Contains(style, want) {
+			t.Fatalf("style.css missing %q", want)
+		}
+	}
+	expandStart := strings.LastIndex(style, ".session-expand {")
+	if expandStart < 0 {
+		t.Fatal("style.css missing canonical .session-expand rule")
+	}
+	expandEnd := strings.Index(style[expandStart:], "\n}")
+	if expandEnd < 0 {
+		t.Fatal("cannot isolate canonical .session-expand rule")
+	}
+	expandRule := style[expandStart : expandStart+expandEnd]
+	for _, want := range []string{"border: 0;", "background: transparent;", "box-shadow: none;"} {
+		if !strings.Contains(expandRule, want) {
+			t.Fatalf("session expand/collapse control is not text-only at line %d; missing %q in %q", strings.Count(style[:expandStart], "\n")+1, want, expandRule)
+		}
+	}
+}
+
+func TestRunningTurnCanBeViewedInBackgroundAndStoppedBySession(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	chat := get("/chat.js")
+	for _, want := range []string{
+		"let runningSessionId = null;",
+		"function detachRunningTurnView()",
+		"body: JSON.stringify({ sessionId: runningSessionId })",
+		"const turnSessionId = currentSessionId;",
+		"currentSessionId === turnSessionId",
+	} {
+		if !strings.Contains(chat, want) {
+			t.Fatalf("chat.js missing background-turn contract %q", want)
+		}
+	}
+
+	sessions := get("/sessions.js")
+	for _, want := range []string{
+		"const viewOnly = typeof turnRunning !== 'undefined' && turnRunning;",
+		"'/api/sessions/' + encodeURIComponent(id)",
+		"detachRunningTurnView();",
+		"s.id === runningSessionId",
+	} {
+		if !strings.Contains(sessions, want) {
+			t.Fatalf("sessions.js missing background-view contract %q", want)
+		}
+	}
+	if strings.Contains(sessions, "Stop the current turn before switching sessions") {
+		t.Fatal("session navigation still blocks while another turn is running")
 	}
 }
 

@@ -73,3 +73,18 @@ func TestNameMatchStillBeatsHint(t *testing.T) {
 		t.Errorf("name match should rank first; got %v", matches[0]["name"])
 	}
 }
+
+func TestToolSearchKeywordIncludesBuiltInTools(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.Register(mcpFake("Agent", "spawn parallel subagents for independent tasks"))
+	reg.Register(mcpFake("mcp__gortex__explore", "explore indexed source code"))
+	l := &Loop{Registry: reg}
+
+	matches := searchToolsWithKeywords(l, "agent task spawn parallel subagent", 5)
+	if len(matches) == 0 {
+		t.Fatal("built-in Agent was omitted from ToolSearch keyword results")
+	}
+	if matches[0]["name"] != "Agent" {
+		t.Fatalf("top match = %v, want Agent", matches[0]["name"])
+	}
+}

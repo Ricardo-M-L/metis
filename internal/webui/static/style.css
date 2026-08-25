@@ -299,13 +299,27 @@ html, body {
 }
 
 .session-expand {
-  font-size: 11px;
-  color: var(--accent);
-  padding: 4px 12px 4px 32px;
+  display: block;
+  width: auto;
+  margin: 4px 0 8px 32px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--fg-dim);
+  font: 12.5px/20px var(--font-ui);
+  text-align: left;
   cursor: pointer;
+  appearance: none;
 }
 
-.session-expand:hover { text-decoration: underline; }
+.session-expand:hover,
+.session-expand:focus-visible {
+  outline: none;
+  color: var(--fg-strong);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 
 /* === Sidebar Footer === */
 .sidebar-footer {
@@ -402,6 +416,9 @@ html, body {
 .chat-area {
   flex: 1;
   overflow-y: auto;
+  /* Long commands, paths, and inline code must scroll inside their own
+     surfaces instead of creating a root scrollbar above the composer. */
+  overflow-x: hidden;
   padding: 20px;
   display: flex;
   flex-direction: column;
@@ -553,6 +570,207 @@ html, body {
 .tool-icon.done { background: var(--green-dim); color: var(--green); }
 .tool-icon.error { background: rgba(248,113,113,0.15); color: var(--red); }
 
+/* === Complex task progress === */
+.todo-plan-dock {
+  position: relative;
+  z-index: 24;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  margin: 0 auto 10px;
+}
+
+.todo-plan-dock[hidden],
+.todo-plan-popover[hidden] {
+  display: none;
+}
+
+.todo-plan-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 0 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface-2) 92%, transparent);
+  box-shadow: var(--shadow-pop);
+  color: var(--fg-mid);
+  font: 600 14px/1 var(--font-ui);
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), color var(--transition), transform var(--transition);
+}
+
+.todo-plan-trigger:hover {
+  border-color: var(--border-hover);
+  background: var(--surface-3);
+  color: var(--fg-strong);
+}
+
+.todo-plan-trigger:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-pop), var(--shadow-focus);
+}
+
+.todo-plan-trigger-ring,
+.todo-plan-glyph {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border-hover);
+  border-radius: 50%;
+}
+
+.todo-plan-trigger-ring {
+  border-color: rgba(86, 134, 254, 0.25);
+  border-top-color: var(--accent);
+  animation: todo-plan-spin 1s linear infinite;
+}
+
+.todo-plan-dock.is-complete .todo-plan-trigger-ring {
+  position: relative;
+  border-color: var(--ok-strong);
+  animation: none;
+}
+
+.todo-plan-dock.is-complete .todo-plan-trigger-ring::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 5px;
+  height: 9px;
+  border: solid var(--ok-strong);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.todo-plan-chevron {
+  width: 16px;
+  height: 16px;
+  transition: transform var(--transition);
+}
+
+.todo-plan-dock.is-open .todo-plan-chevron {
+  transform: rotate(180deg);
+}
+
+.todo-plan-popover {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 10px);
+  width: min(640px, calc(100% - 32px));
+  padding: 14px 16px 12px;
+  transform: translateX(-50%);
+  border: 1px solid var(--border-mid);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface-2) 96%, transparent);
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(18px);
+}
+
+.todo-plan-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.todo-plan-popover-title {
+  color: var(--fg-strong);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.todo-plan-counts {
+  color: var(--fg-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.todo-plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  scrollbar-width: thin;
+}
+
+.todo-plan-item {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-mid);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.todo-plan-item:hover {
+  background: var(--accent-soft);
+}
+
+.todo-plan-item[data-status="pending"] .todo-plan-glyph {
+  border-style: dashed;
+  border-color: var(--fg-faint);
+}
+
+.todo-plan-item[data-status="in_progress"] {
+  color: var(--fg-strong);
+}
+
+.todo-plan-item[data-status="in_progress"] .todo-plan-glyph {
+  border-color: rgba(86, 134, 254, 0.28);
+  border-top-color: var(--accent);
+  animation: todo-plan-spin 1s linear infinite;
+}
+
+.todo-plan-item[data-status="completed"] {
+  color: var(--fg-faint);
+}
+
+.todo-plan-item[data-status="completed"] .todo-plan-glyph {
+  position: relative;
+  border-color: var(--ok-strong);
+}
+
+.todo-plan-item[data-status="completed"] .todo-plan-glyph::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 5px;
+  height: 9px;
+  border: solid var(--ok-strong);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.todo-plan-item-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@keyframes todo-plan-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .todo-plan-trigger-ring,
+  .todo-plan-item[data-status="in_progress"] .todo-plan-glyph {
+    animation: none;
+  }
+}
+
 /* === Input Area === */
 .input-area {
   padding: 0 20px 20px;
@@ -572,11 +790,6 @@ html, body {
   border-radius: 14px;
   padding: 4px;
   transition: border-color var(--transition);
-}
-
-.input-box:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-dim);
 }
 
 .input-row {
@@ -2032,10 +2245,6 @@ body {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
-.input-box:focus-within {
-  border-color: var(--accent-line);
-  box-shadow: var(--shadow-focus);
-}
 .input-field { color: var(--fg); caret-color: var(--accent); font-family: var(--font-ui); }
 .send-btn {
   background: var(--accent);
@@ -2419,7 +2628,6 @@ html, body { font-size: var(--font-base); }
   box-shadow: none;
   transition: border-color var(--transition-fast);
 }
-.input-box:focus-within { border-color: var(--accent-line); box-shadow: var(--shadow-focus); }
 .input-row {
   display: flex;
   align-items: center;
@@ -2829,16 +3037,6 @@ html, body { font-size: var(--font-base); }
    V8: empty-state badge, redacted thinking, markdown tables,
    session status dots.
    ============================================================ */
-.welcome-badge {
-  display: inline-block;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  color: var(--accent-hover);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-line);
-  letter-spacing: 0.04em;
-}
 .think-row.redacted .think-title { color: var(--fg-dim); }
 .think-row.redacted .think-head { cursor: default; }
 .md-table {
@@ -3195,16 +3393,6 @@ html, body { font-size: var(--font-base); }
 .model-option:hover { background: var(--surface-hover); color: var(--fg-strong); }
 
 .welcome-line { display: flex; align-items: center; gap: 10px; }
-.welcome-badge {
-  display: inline-block;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  color: var(--accent-hover);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-line);
-  letter-spacing: 0.04em;
-}
 
 
 /* ============================================================
@@ -3390,6 +3578,95 @@ html, body { font-size: var(--font-base); }
 .tc-io-div { flex: none; height: 1px; background: var(--border); }
 .tc-io-text { min-width: 0; white-space: pre-wrap; word-break: break-word; color: var(--fg-mid); }
 .tc-io-text[data-error] { color: var(--error); }
+
+/* File edits use the persisted tool input to render the same compact diff in
+   live turns and restored sessions. The raw input/output remains in Inspect. */
+.tc-file-diff {
+  margin: 6px 0 6px 4px;
+  overflow: hidden;
+  border: 1px solid var(--border-faint);
+  border-radius: 10px;
+  background: var(--code-bg);
+  font: 400 12px/18px var(--font-mono);
+}
+.tc-diff-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border-faint);
+  color: var(--fg-mid);
+}
+.tc-diff-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-strong);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tc-diff-note {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-faint);
+  font-family: var(--font-sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tc-diff-count { flex: none; font-weight: 600; }
+.tc-diff-count.add { color: var(--success, #3fb950); }
+.tc-diff-count.delete { color: var(--error, #f85149); }
+.tc-diff-full-path {
+  overflow: hidden;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-faint);
+  color: var(--fg-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tc-diff-lines {
+  max-height: 360px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.tc-diff-line {
+  display: grid;
+  grid-template-columns: 38px 38px 20px minmax(max-content, 1fr);
+  min-height: 19px;
+  color: var(--fg-mid);
+}
+.tc-diff-line[data-kind='add'] {
+  background: color-mix(in srgb, var(--success, #3fb950) 13%, transparent);
+}
+.tc-diff-line[data-kind='delete'] {
+  background: color-mix(in srgb, var(--error, #f85149) 13%, transparent);
+}
+.tc-diff-no {
+  padding: 0 7px 0 3px;
+  border-right: 1px solid var(--border-faint);
+  color: var(--fg-faint);
+  text-align: right;
+  user-select: none;
+}
+.tc-diff-mark { color: var(--fg-faint); text-align: center; user-select: none; }
+.tc-diff-line[data-kind='add'] .tc-diff-mark { color: var(--success, #3fb950); }
+.tc-diff-line[data-kind='delete'] .tc-diff-mark { color: var(--error, #f85149); }
+.tc-diff-code {
+  min-width: 100%;
+  box-sizing: border-box;
+  padding: 0 12px 0 4px;
+  color: inherit;
+  white-space: pre;
+}
+.tc-diff-omitted {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-faint);
+  color: var(--fg-faint);
+  font-family: var(--font-sans);
+}
 
 /* "Deep diving..." — DSH TurnStatus: shimmer brand-blue text, clock at >=15s. */
 .turn-status {
@@ -3661,17 +3938,28 @@ html, body { font-size: var(--font-base); }
 .session-item:hover .session-more { opacity: 1; }
 .session-more:hover { color: var(--fg-strong); background: var(--accent-soft); }
 .session-expand {
-  display: flex;
-  align-items: center;
-  height: 28px;
-  padding: 0 12px 0 28px;
-  border-radius: 8px;
-  font-size: 12px;
-  line-height: 20px;
+  display: block;
+  width: auto;
+  height: auto;
+  margin: 4px 0 8px 28px;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
   color: var(--fg-dim);
+  font: 12.5px/20px var(--font-ui);
+  text-align: left;
   cursor: pointer;
+  appearance: none;
 }
-.session-expand:hover { color: var(--fg-mid); text-decoration: none; }
+.session-expand:hover,
+.session-expand:focus-visible {
+  outline: none;
+  color: var(--fg-strong);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 
 /* Settings + explicit updater pinned to the sidebar foot. Update checking is
    read-only; the green dot appears only when a newer signed release exists. */
@@ -5491,6 +5779,124 @@ button.settings-item {
 .update-dialog-actions button:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
 .update-dialog-actions .update-confirm { border-color: var(--accent); background: var(--accent); color: white; }
 .update-dialog-actions button:disabled { cursor: wait; opacity: .58; }
+
+/* Session rename mirrors the compact native dialog used by Desktop peers.
+   It replaces window.prompt(), which is unreliable in embedded WebViews. */
+.session-rename-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 390;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(6px);
+}
+.session-rename-dialog {
+  width: min(460px, calc(100vw - 48px));
+  box-sizing: border-box;
+  padding: 28px;
+  border: 1px solid var(--border-mid);
+  border-radius: 20px;
+  background: var(--surface-2);
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.5);
+  color: var(--fg-strong);
+}
+.session-rename-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 28px;
+}
+.session-rename-heading h2 {
+  margin: 0;
+  font: 650 20px/28px var(--font-ui);
+  letter-spacing: -0.01em;
+}
+.session-rename-close {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--fg-mid);
+  cursor: pointer;
+}
+.session-rename-close svg { width: 20px; height: 20px; }
+.session-rename-close:hover,
+.session-rename-close:focus-visible {
+  outline: none;
+  background: var(--surface-hover);
+  color: var(--fg-strong);
+}
+.session-rename-form { display: grid; gap: 16px; }
+.session-rename-input {
+  width: 100%;
+  height: 56px;
+  box-sizing: border-box;
+  padding: 0 22px;
+  border: 1px solid var(--border-mid);
+  border-radius: 999px;
+  outline: none;
+  background: transparent;
+  color: var(--fg-strong);
+  font: 16px/24px var(--font-ui);
+}
+.session-rename-input:hover { border-color: var(--border-hover); }
+.session-rename-input:focus {
+  border-color: var(--fg-dim);
+  box-shadow: 0 0 0 1px var(--fg-dim);
+}
+.session-rename-error {
+  margin: -5px 8px 0;
+  color: var(--error);
+  font: 12px/18px var(--font-ui);
+}
+.session-rename-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+.session-rename-actions button {
+  min-width: 84px;
+  height: 42px;
+  padding: 0 20px;
+  border: 1px solid var(--border-mid);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-strong);
+  font: 600 14px var(--font-ui);
+  cursor: pointer;
+}
+.session-rename-actions button:hover:not(:disabled),
+.session-rename-actions button:focus-visible {
+  outline: none;
+  border-color: var(--border-hover);
+  background: var(--surface-hover);
+}
+.session-rename-actions .session-rename-confirm {
+  border-color: var(--fg-strong);
+  background: var(--fg-strong);
+  color: var(--bg);
+}
+.session-rename-actions .session-rename-confirm:hover:not(:disabled) {
+  border-color: var(--fg-body);
+  background: var(--fg-body);
+  color: var(--bg);
+}
+.session-rename-actions button:disabled { cursor: default; opacity: 0.42; }
+
+@media (max-width: 520px) {
+  .session-rename-dialog { padding: 22px; }
+  .session-rename-heading { margin-bottom: 22px; }
+  .session-rename-actions { flex-direction: column-reverse; }
+  .session-rename-actions button { width: 100%; }
+}
 
 /* Session deletion is intentionally a dedicated dialog: the destructive
    boundary remains visible even after its sidebar menu has closed. */

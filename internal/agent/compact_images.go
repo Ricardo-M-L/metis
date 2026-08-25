@@ -116,7 +116,18 @@ func PruneOldImages(messages []llm.Message, keepN int) ([]llm.Message, int) {
 	if keepN <= 0 {
 		return messages, 0
 	}
+	return pruneImages(messages, keepN)
+}
 
+// PruneAllImages is the full-checkpoint variant. Automatic lightweight image
+// pruning keeps a few recent screenshots for active visual work, but a paid
+// full compaction must be able to meet its post-compact budget even when one
+// recent base64 image would otherwise consume hundreds of thousands of tokens.
+func PruneAllImages(messages []llm.Message) ([]llm.Message, int) {
+	return pruneImages(messages, 0)
+}
+
+func pruneImages(messages []llm.Message, keepN int) ([]llm.Message, int) {
 	// Deep-enough copy: llm.Message.Content is a slice we
 	// mutate, so we copy each Content slice. ContentBlock itself
 	// is a value type containing only strings / maps / nested

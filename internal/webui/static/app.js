@@ -55,8 +55,6 @@ document.addEventListener('DOMContentLoaded', () => {
       cfgModel = c.model;
       document.getElementById('modelName').textContent = c.model.split('/').pop();
     }
-	const preset = document.getElementById('presetName');
-	if (preset) preset.textContent = presetDisplayName(c.preset || 'standard');
   }).catch(() => {});
 	if (typeof loadEffort === 'function') loadEffort();
   document.getElementById('inputField').focus();
@@ -321,10 +319,6 @@ function renderStatusSnapshot(d) {
     if (d.workspace) {
       const pn = document.getElementById('wsGroupName');
       if (pn) pn.textContent = d.workspace;
-      if (!currentSessionId) {
-        const tt = document.getElementById('topbarTitle');
-        if (tt) tt.textContent = d.workspace;
-      }
     }
     const meter = document.getElementById('contextMeter');
     if (meter) {

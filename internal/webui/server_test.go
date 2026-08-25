@@ -888,8 +888,15 @@ func TestFailedAndCanceledTurnsPersistHistoryTail(t *testing.T) {
 			case <-time.After(3 * time.Second):
 				t.Fatal("turn did not finish")
 			}
-			if rr.Code != http.StatusBadGateway {
-				t.Fatalf("turn status = %d, want 502: %s", rr.Code, rr.Body.String())
+			wantStatus := http.StatusBadGateway
+			if tc.cancel {
+				wantStatus = http.StatusOK
+			}
+			if rr.Code != wantStatus {
+				t.Fatalf("turn status = %d, want %d: %s", rr.Code, wantStatus, rr.Body.String())
+			}
+			if tc.cancel && !bytes.Contains(rr.Body.Bytes(), []byte(`"stopped":true`)) {
+				t.Fatalf("canceled turn missing clean stopped response: %s", rr.Body.String())
 			}
 
 			live := loop.History()
@@ -935,6 +942,57 @@ func TestTurnPersistenceFailureTakesPriorityOverRunError(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "failed to persist") {
 		t.Fatalf("500 response does not identify persistence failure: %s", rr.Body.String())
+	}
+}
+
+func TestStopTargetsRunningSessionAndReturnsCleanStoppedTurn(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &statusTestProvider{
+		activationTestProvider: activationTestProvider{name: "wire", model: "model"},
+		started:                make(chan struct{}),
+	}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Model = "model"
+	const id = "targeted-stop-session"
+	if err := store.WriteHeaderFull(session.Header{ID: id, Provider: "wire", Model: "model", System: "system", Status: "idle"}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{ProviderName: "wire", InitialSessionID: id})
+	h := s.handler()
+	turnResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(`{"sessionId":"`+id+`","input":"keep running"}`)))
+		turnResult <- rr
+	}()
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not start")
+	}
+
+	wrong := httptest.NewRecorder()
+	h.ServeHTTP(wrong, httptest.NewRequest(http.MethodPost, "/api/stop", bytes.NewBufferString(`{"sessionId":"another-session"}`)))
+	if wrong.Code != http.StatusConflict {
+		t.Fatalf("wrong-session stop = %d, want 409: %s", wrong.Code, wrong.Body.String())
+	}
+
+	stop := httptest.NewRecorder()
+	h.ServeHTTP(stop, httptest.NewRequest(http.MethodPost, "/api/stop", bytes.NewBufferString(`{"sessionId":"`+id+`"}`)))
+	if stop.Code != http.StatusOK || !bytes.Contains(stop.Body.Bytes(), []byte(`"stopped":true`)) {
+		t.Fatalf("targeted stop = %d: %s", stop.Code, stop.Body.String())
+	}
+
+	select {
+	case turn := <-turnResult:
+		if turn.Code != http.StatusOK || !bytes.Contains(turn.Body.Bytes(), []byte(`"stopped":true`)) {
+			t.Fatalf("canceled turn = %d, want clean stopped response: %s", turn.Code, turn.Body.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("targeted stop did not finish the turn")
 	}
 }
 

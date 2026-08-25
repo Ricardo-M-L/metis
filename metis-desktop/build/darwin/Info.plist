@@ -5,6 +5,8 @@
         <string>APPL</string>
         <key>CFBundleName</key>
         <string>Metis</string>
+        <key>CFBundleDisplayName</key>
+        <string>Metis</string>
         <key>CFBundleExecutable</key>
         <string>{{.OutputFilename}}</string>
         <key>CFBundleIdentifier</key>
@@ -17,6 +19,8 @@
         <string>{{.Info.ProductVersion}}</string>
         <key>CFBundleIconFile</key>
         <string>iconfile</string>
+        <key>LSMultipleInstancesProhibited</key>
+        <true/>
         <key>LSMinimumSystemVersion</key>
         <string>10.13.0</string>
         <key>NSHighResolutionCapable</key>

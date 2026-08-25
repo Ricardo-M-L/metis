@@ -148,6 +148,50 @@ func TestCompact_ProducesBoundaryWithSummary(t *testing.T) {
 	}
 }
 
+func TestCompact_DropsRetainedImageWhenCheckpointWouldRemainOverBudget(t *testing.T) {
+	p := &fakeSummarizer{}
+	cfg := DefaultCompactionConfig()
+	cfg.RetainMinMessages = 3
+	cfg.RetainMinUserMessages = 1
+	c := NewCompactor(cfg, "large-window", 1_000_000, p)
+
+	msgs := []llm.Message{msg(llm.RoleUser, "old request")}
+	for i := 0; i < 8; i++ {
+		msgs = append(msgs,
+			msg(llm.RoleAssistant, "old assistant "+istr(i)),
+			msg(llm.RoleUser, "old user "+istr(i)),
+		)
+	}
+	msgs = append(msgs, llm.Message{
+		Role: llm.RoleUser,
+		Content: []llm.ContentBlock{
+			{Type: "text", Text: "inspect this screenshot"},
+			{Type: "image", MediaType: "image/png", Data: strings.Repeat("A", 100_000)},
+		},
+	})
+
+	out, err := c.Compact(context.Background(), msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := estimateTokens(out); got >= PostCompactTokenBudget {
+		t.Fatalf("checkpoint still exceeds post-compact budget: %d tokens", got)
+	}
+	for _, m := range out {
+		for _, block := range m.Content {
+			if block.Type == "image" || block.Data != "" {
+				t.Fatal("oversized checkpoint retained raw image payload")
+			}
+			if strings.Contains(block.Text, "image cleared by compactor") && !strings.Contains(block.Text, "0 most recent screenshots kept") {
+				t.Fatalf("full-checkpoint sentinel does not explain that images were cleared: %q", block.Text)
+			}
+		}
+	}
+	if !historyHasText(out, "image cleared by compactor") {
+		t.Fatal("checkpoint removed image payload without leaving a reattach sentinel")
+	}
+}
+
 func TestCompactWithInstructions_IsRequestLocalAndDelimited(t *testing.T) {
 	p := &fakeSummarizer{}
 	c := newCompactorFor(p)

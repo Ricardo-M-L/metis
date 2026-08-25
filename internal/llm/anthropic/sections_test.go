@@ -57,10 +57,10 @@ func TestChooseSystemBlocks_FallsBackToStringWhenNoSections(t *testing.T) {
 	}
 }
 
-func TestBuildSystemBlocksFromSections_BudgetCap(t *testing.T) {
-	// More cacheable sections than the per-system budget (2). The
-	// first 2 get cache markers; the rest pass through as
-	// plain text blocks (still emitted, just not cached).
+func TestBuildSystemBlocksFromSections_MarksEndOfStableRun(t *testing.T) {
+	// A cache breakpoint covers the complete prefix before it. Four
+	// adjacent stable sections therefore need one marker on the last
+	// section, not two markers on the first two short fragments.
 	secs := []SystemSection{
 		{Name: "a", Body: "a", Cache: true},
 		{Name: "b", Body: "b", Cache: true},
@@ -71,14 +71,75 @@ func TestBuildSystemBlocksFromSections_BudgetCap(t *testing.T) {
 	if len(out) != 4 {
 		t.Fatalf("expected 4 blocks, got %d", len(out))
 	}
-	cached := 0
-	for _, blk := range out {
-		if blk.CacheControl != nil {
-			cached++
+	for i := 0; i < len(out)-1; i++ {
+		if out[i].CacheControl != nil {
+			t.Fatalf("stable prefix marker placed too early at block %d", i)
 		}
 	}
-	if cached != 2 {
-		t.Errorf("system-side cache cap not enforced: got %d cached blocks, want 2", cached)
+	if out[len(out)-1].CacheControl == nil {
+		t.Fatal("last block of the stable run must carry the cache breakpoint")
+	}
+}
+
+func TestBuildSystemBlocksFromSections_UsesTwoStableRunBoundaries(t *testing.T) {
+	secs := []SystemSection{
+		{Name: "identity", Body: "identity", Cache: true},
+		{Name: "rules", Body: "rules", Cache: true},
+		{Name: "project", Body: "project", Cache: false},
+		{Name: "addendum", Body: "addendum", Cache: true},
+		{Name: "env", Body: "env", Volatile: true},
+	}
+	out := BuildSystemBlocksFromSections(secs)
+	if out[0].CacheControl != nil || out[1].CacheControl == nil {
+		t.Fatalf("first marker must protect the whole base prefix: %+v", out)
+	}
+	if out[2].CacheControl != nil || out[3].CacheControl == nil || out[4].CacheControl != nil {
+		t.Fatalf("second marker must end at the stable addendum before env: %+v", out)
+	}
+}
+
+func TestToAnthropic_CacheBreakpointBudgetUsesNewestMessageOnly(t *testing.T) {
+	req := Request{
+		SystemSections: []pubprov.SystemSection{
+			{Name: "base", Body: "base prompt", Cache: true},
+			{Name: "project", Body: "project context", Cache: false},
+			{Name: "addendum", Body: "stable addendum", Cache: true},
+		},
+		Tools: []ToolSpec{{Name: "Read", Description: "read a file", InputSchema: map[string]any{"type": "object"}}},
+		Messages: []Message{
+			{Role: RoleUser, Content: []ContentBlock{{Type: "text", Text: "first request"}}},
+			{Role: RoleAssistant, Content: []ContentBlock{{Type: "text", Text: "first response"}}},
+			{Role: RoleUser, Content: []ContentBlock{{Type: "text", Text: "follow-up"}}},
+		},
+	}
+
+	got := toAnthropic(req, "claude-sonnet-4", 1024)
+	markers := 0
+	for _, block := range got.System {
+		if block.CacheControl != nil {
+			markers++
+		}
+	}
+	for _, tool := range got.Tools {
+		if tool.CacheControl != nil {
+			markers++
+		}
+	}
+	for _, message := range got.Messages {
+		for _, block := range message.Content {
+			if block.CacheControl != nil {
+				markers++
+			}
+		}
+	}
+	if markers != 4 {
+		t.Fatalf("Anthropic accepts at most 4 cache breakpoints; got %d", markers)
+	}
+	if got.Messages[0].Content[0].CacheControl != nil {
+		t.Fatal("older user message must not consume a cache breakpoint")
+	}
+	if got.Messages[2].Content[0].CacheControl == nil {
+		t.Fatal("newest user message must carry the rolling cache breakpoint")
 	}
 }
 

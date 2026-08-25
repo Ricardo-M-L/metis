@@ -9,6 +9,7 @@ let sessionsTotal = 0;
 let sessionsLoading = false;
 let sessionSearchTimer = null;
 let sessionDeleteDialog = null;
+let sessionRenameDialog = null;
 
 async function loadWorkspaces() {
   try {
@@ -284,32 +285,148 @@ document.addEventListener('click', event => {
   closeSessionMenu(false);
 });
 
-async function renameSession(id, el) {
-  const item = el.closest('.session-item');
-  const nameEl = item ? item.querySelector('.session-item-name') : null;
-  const current = nameEl ? nameEl.textContent : '';
-  const next = prompt('Rename session', current);
-  if (!next || !next.trim() || next === current) {
-    toggleSessionMenu(el.closest('.session-item').querySelector('.session-more'));
+function closeSessionRenameDialog(force) {
+  if (!sessionRenameDialog || sessionRenameDialog.pending && !force) return;
+  const state = sessionRenameDialog;
+  sessionRenameDialog = null;
+  state.overlay.remove();
+  if (state.trigger && state.trigger.isConnected) state.trigger.focus();
+}
+
+function openSessionRenameDialog(id, title, trigger) {
+  if (sessionRenameDialog) {
+    if (sessionRenameDialog.pending) return;
+    closeSessionRenameDialog(false);
+  }
+  const record = sessions.find(s => s.id === id);
+  const current = String(title || record && record.title || '').trim();
+  const item = trigger && trigger.closest('.session-item');
+  const menuButton = item && item.querySelector('.session-more');
+
+  closeSessionMenu(false);
+  hideSessionDetail();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'session-rename-overlay';
+  overlay.innerHTML = `
+    <div class="session-rename-dialog" role="dialog" aria-modal="true" aria-labelledby="sessionRenameTitle">
+      <div class="session-rename-heading">
+        <h2 id="sessionRenameTitle">${uiText('Rename session', '\u91cd\u547d\u540d\u4f1a\u8bdd')}</h2>
+        <button type="button" class="session-rename-close" aria-label="${uiText('Close rename dialog', '\u5173\u95ed\u91cd\u547d\u540d\u5f39\u7a97')}">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <form class="session-rename-form">
+        <input class="session-rename-input" type="text" maxlength="240" autocomplete="off" spellcheck="false" value="${escAttr(current)}" aria-label="${uiText('Session name', '\u4f1a\u8bdd\u540d\u79f0')}">
+        <p class="session-rename-error" role="alert" aria-live="assertive" hidden></p>
+        <div class="session-rename-actions">
+          <button type="button" class="session-rename-cancel">${uiText('Cancel', '\u53d6\u6d88')}</button>
+          <button type="submit" class="session-rename-confirm">${uiText('Rename', '\u91cd\u547d\u540d')}</button>
+        </div>
+      </form>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const state = { id, current, trigger: menuButton || trigger, overlay, pending: false };
+  sessionRenameDialog = state;
+  const dialog = overlay.querySelector('.session-rename-dialog');
+  const form = overlay.querySelector('.session-rename-form');
+  const input = overlay.querySelector('.session-rename-input');
+  const close = overlay.querySelector('.session-rename-close');
+  const cancel = overlay.querySelector('.session-rename-cancel');
+  const confirm = overlay.querySelector('.session-rename-confirm');
+
+  const syncConfirm = () => {
+    const next = input.value.trim();
+    confirm.disabled = !next;
+  };
+  input.addEventListener('input', syncConfirm);
+  input.addEventListener('keydown', event => {
+    if ((event.isComposing || event.keyCode === 229) && event.key === 'Enter') {
+      event.preventDefault();
+    }
+  });
+  close.addEventListener('click', () => closeSessionRenameDialog(false));
+  cancel.addEventListener('click', () => closeSessionRenameDialog(false));
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    submitSessionRename(state);
+  });
+  overlay.addEventListener('click', event => {
+    if (event.target === overlay) closeSessionRenameDialog(false);
+  });
+  dialog.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeSessionRenameDialog(false);
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(dialog.querySelectorAll('button:not(:disabled), input:not(:disabled)'));
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  syncConfirm();
+  requestAnimationFrame(() => {
+    input.focus();
+    input.select();
+  });
+}
+
+function renameSession(id, el) {
+  const item = el && el.closest('.session-item');
+  const nameEl = item && item.querySelector('.session-item-name');
+  openSessionRenameDialog(id, nameEl ? nameEl.textContent : '', el);
+}
+
+async function submitSessionRename(state) {
+  if (!state || sessionRenameDialog !== state || state.pending) return;
+  const input = state.overlay.querySelector('.session-rename-input');
+  const error = state.overlay.querySelector('.session-rename-error');
+  const controls = Array.from(state.overlay.querySelectorAll('button, input'));
+  const next = input.value.trim();
+  if (!next) return;
+  if (next === state.current) {
+    closeSessionRenameDialog(false);
     return;
   }
+
+  state.pending = true;
+  controls.forEach(control => { control.disabled = true; });
+  error.hidden = true;
+  error.textContent = '';
   try {
     const res = await fetch('/api/sessions/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id, title: next })
+      body: JSON.stringify({ id: state.id, title: next })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'rename: ' + res.status);
-    if (nameEl) nameEl.textContent = data.title || next;
-    showToast('Renamed');
+    const renamed = String(data.title || next).trim();
+    const record = sessions.find(s => s.id === state.id);
+    if (record) record.title = renamed;
+    closeSessionRenameDialog(true);
+    renderSessions();
+    showToast(uiText('Session renamed', '\u4f1a\u8bdd\u5df2\u91cd\u547d\u540d'));
   } catch (e) {
-    showToast('Rename failed: ' + e.message);
+    state.pending = false;
+    controls.forEach(control => { control.disabled = false; });
+    error.textContent = e.message || uiText('Unable to rename this session.', '\u65e0\u6cd5\u91cd\u547d\u540d\u8be5\u4f1a\u8bdd\u3002');
+    error.hidden = false;
+    input.focus();
+    input.select();
+    const confirm = state.overlay.querySelector('.session-rename-confirm');
+    if (confirm) confirm.disabled = !input.value.trim();
   }
-  const btn = el.closest('.session-item').querySelector('.session-more');
-  const m = btn.parentElement.querySelector('.session-menu');
-  if (m) m.style.display = 'none';
-  openMenuBtn = null;
 }
 
 async function branchSessionFromSidebar(id, el) {
@@ -668,6 +785,9 @@ function renderWorkspaceHeader(ws, count, index) {
 
 function sessionState(s) {
   if (s.archived || showArchivedSessions) return { name: 'archived', label: 'Archived' };
+  if (typeof turnRunning !== 'undefined' && turnRunning && runningSessionId && s.id === runningSessionId) {
+    return { name: 'running', label: s.id === currentSessionId ? 'Running' : 'Running in background' };
+  }
   if (s.id !== currentSessionId) {
     if (s.status === 'running') return { name: 'running', label: 'Interrupted while running' };
     if (s.status === 'failed') return { name: 'failed', label: 'Last turn failed' };
@@ -678,7 +798,7 @@ function sessionState(s) {
   }
   if (typeof pendingAsk !== 'undefined' && pendingAsk) return { name: 'waiting', label: 'Waiting for your answer' };
   if (document.querySelector('.perm-card:not(.approved):not(.denied)')) return { name: 'approval', label: 'Waiting for approval' };
-  if (typeof turnRunning !== 'undefined' && turnRunning) {
+  if (typeof turnRunning !== 'undefined' && turnRunning && (!runningSessionId || s.id === runningSessionId)) {
     if (lastStatusSnapshot && Number(lastStatusSnapshot.subAgents) > 0) return { name: 'delegating', label: 'Sub-agents running' };
     return { name: 'running', label: 'Running' };
   }
@@ -828,14 +948,18 @@ function toggleSessionsExpand() {
 }
 
 async function resumeSession(id) {
-  if (typeof turnRunning !== 'undefined' && turnRunning && id !== currentSessionId) {
-    showToast('Stop the current turn before switching sessions');
-    return;
-  }
   try {
-    const res = await fetch('/api/sessions/activate', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id })
-    });
+    const viewOnly = typeof turnRunning !== 'undefined' && turnRunning;
+    if (viewOnly && id !== currentSessionId && currentSessionId === runningSessionId) {
+      detachRunningTurnView();
+    }
+    const endpoint = viewOnly
+      ? '/api/sessions/' + encodeURIComponent(id)
+      : '/api/sessions/activate';
+    const options = viewOnly
+      ? { method: 'GET' }
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) };
+    const res = await fetch(endpoint, options);
     if (!res.ok) throw new Error(`resume: ${res.status}`);
     const data = await res.json();
     currentSessionId = id;
@@ -844,14 +968,16 @@ async function resumeSession(id) {
     messages = [];
     streamedTextThisTurn = false;
     renderHistoryMessages(data.messages);
+    await restoreCompactionHistory();
     if (typeof loadArtifactsForSession === 'function') {
       await loadArtifactsForSession(currentSessionId, { rebuildCards: true });
     }
-    document.getElementById('topbarTitle').textContent = data.session.title || 'Session';
-	const preset = document.getElementById('presetName');
-	if (preset) preset.textContent = presetDisplayName(data.session.preset || 'standard');
 	if (typeof loadEffort === 'function') await loadEffort();
+    if (typeof syncTurnControls === 'function') syncTurnControls();
     renderSessions();
+    if (!turnRunning && queuedTurns.length && (!queuedSessionId || queuedSessionId === currentSessionId)) {
+      setTimeout(drainQueuedTurns, 0);
+    }
   } catch (e) {
     showError('Unable to resume this session.');
   }

@@ -8,10 +8,10 @@
   "frontend:dev:serverUrl": "auto",
   "info": {
     "companyName": "Metis",
-    "productName": "Metis Desktop",
+    "productName": "Metis",
     "productVersion": "0.4.29",
     "copyright": "Copyright © 2026 Metis",
-    "comments": "Metis Desktop — local AI coding agent"
+    "comments": "Metis — local AI coding agent"
   },
   "author": {
     "name": "Ricardo-M-L",

@@ -150,6 +150,34 @@ func parseWorkspaceArg(args []string) string {
 // --web) on a free loopback port and returns its tokenised frame URL. The
 // native shell embeds it: one UI codebase, true SSE streaming, no per-operation
 // CLI subprocesses, while Wails bindings remain available in the parent frame.
+const (
+	webUIStartupAttempts   = 2
+	webUIStartupTimeout    = 15 * time.Second
+	webUIStartupRetryDelay = 250 * time.Millisecond
+	webUIStartupLogLimit   = 32 << 10
+)
+
+type processLogBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *processLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.data = append(b.data, p...)
+	if len(b.data) > webUIStartupLogLimit {
+		b.data = append([]byte(nil), b.data[len(b.data)-webUIStartupLogLimit:]...)
+	}
+	return len(p), nil
+}
+
+func (b *processLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.data)
+}
+
 func (a *App) StartWebUI() (string, error) {
 	a.webuiMu.Lock()
 	defer a.webuiMu.Unlock()
@@ -160,6 +188,23 @@ func (a *App) StartWebUI() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	failures := make([]string, 0, webUIStartupAttempts)
+	for attempt := 1; attempt <= webUIStartupAttempts; attempt++ {
+		frameURL, attemptErr := a.startWebUIAttempt(binary)
+		if attemptErr == nil {
+			return frameURL, nil
+		}
+		failure := fmt.Sprintf("attempt %d/%d: %v", attempt, webUIStartupAttempts, attemptErr)
+		failures = append(failures, failure)
+		fmt.Fprintln(os.Stderr, "Metis Desktop WebUI:", failure)
+		if attempt < webUIStartupAttempts {
+			time.Sleep(webUIStartupRetryDelay)
+		}
+	}
+	return "", fmt.Errorf("webui failed after %d attempts: %s", webUIStartupAttempts, strings.Join(failures, "; "))
+}
+
+func (a *App) startWebUIAttempt(binary string) (string, error) {
 	port, err := freePort()
 	if err != nil {
 		return "", err
@@ -168,9 +213,12 @@ func (a *App) StartWebUI() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create native frame token: %w", err)
 	}
+	logs := &processLogBuffer{}
 	cmd := exec.Command(binary, "desktop", "--web", "--port", strconv.Itoa(port))
 	cmd.Dir = a.workDir
 	cmd.Env = append(os.Environ(), "METIS_DESKTOP_FRAME_TOKEN="+frameToken)
+	cmd.Stdout = logs
+	cmd.Stderr = logs
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start webui: %w", err)
 	}
@@ -187,10 +235,7 @@ func (a *App) StartWebUI() (string, error) {
 		close(done)
 		a.webuiMu.Lock()
 		if a.webuiCmd == cmd {
-			a.webuiCmd = nil
-			a.webuiDone = nil
-			a.webuiPort = 0
-			a.webuiToken = ""
+			a.clearWebUIAttempt(cmd)
 		}
 		a.webuiMu.Unlock()
 	}()
@@ -198,36 +243,56 @@ func (a *App) StartWebUI() (string, error) {
 	// Wait for the backend to answer its health probe before the webview
 	// navigates, otherwise the first paint is a connection error.
 	baseURL := a.webUIBaseURL()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(webUIStartupTimeout)
 	client := &http.Client{Timeout: 750 * time.Millisecond}
+	lastProbe := "health endpoint did not answer"
 	for time.Now().Before(deadline) {
 		select {
-		case err := <-done:
-			a.webuiCmd = nil
-			a.webuiDone = nil
-			a.webuiPort = 0
-			a.webuiToken = ""
-			if err == nil {
-				err = errors.New("process exited")
+		case processErr := <-done:
+			a.clearWebUIAttempt(cmd)
+			if processErr == nil {
+				processErr = errors.New("process exited")
 			}
-			return "", fmt.Errorf("webui exited before becoming ready: %w", err)
+			return "", webUIAttemptError(fmt.Errorf("webui exited before becoming ready: %w", processErr), logs)
 		default:
 		}
-		resp, err := client.Get(baseURL + "/api/health")
-		if err == nil {
+		resp, probeErr := client.Get(baseURL + "/api/health")
+		if probeErr == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return a.webUIURL(), nil
 			}
+			lastProbe = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		} else {
+			lastProbe = probeErr.Error()
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	_ = cmd.Process.Kill()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
+	a.clearWebUIAttempt(cmd)
+	return "", webUIAttemptError(fmt.Errorf("webui did not become ready within %s; last health probe: %s", webUIStartupTimeout, lastProbe), logs)
+}
+
+func (a *App) clearWebUIAttempt(cmd *exec.Cmd) {
+	if a.webuiCmd != cmd {
+		return
+	}
 	a.webuiCmd = nil
 	a.webuiDone = nil
 	a.webuiPort = 0
 	a.webuiToken = ""
-	return "", errors.New("webui did not become ready within 15 seconds")
+}
+
+func webUIAttemptError(err error, logs *processLogBuffer) error {
+	detail := strings.TrimSpace(logs.String())
+	if detail == "" {
+		return err
+	}
+	return fmt.Errorf("%w; child output: %s", err, detail)
 }
 
 func (a *App) webUIBaseURL() string {

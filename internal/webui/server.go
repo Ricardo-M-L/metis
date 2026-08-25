@@ -57,10 +57,13 @@ type Server struct {
 	providersMu  sync.Mutex
 	effortMu     sync.Mutex
 
-	// cancelMu guards cancelTurn, the cancel func for the in-flight turn.
-	// A stop button cancels the turn's context mid-stream.
-	cancelMu   sync.Mutex
-	cancelTurn context.CancelFunc
+	// cancelMu guards the identity, cancel func, and completion signal for the
+	// in-flight turn. Keeping the session identity separate from the session
+	// being viewed lets Desktop browse other transcripts while work continues.
+	cancelMu       sync.Mutex
+	cancelTurn     context.CancelFunc
+	runningSession string
+	turnDone       chan struct{}
 
 	roster *agent.Roster
 
@@ -483,7 +486,7 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 		}
 	case agent.EventToolStart:
 		if raw, err := json.Marshal(he.ev.ToolInput); err == nil && len(raw) > 0 {
-			payload["input"] = truncateSSE(string(raw), 400)
+			payload["input"] = truncateSSE(string(raw), toolInputSSELimit(he.ev.ToolName))
 		}
 	case agent.EventToolResult:
 		if he.ev.ToolResult != nil {
@@ -1192,13 +1195,21 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	// Run under a cancellable context so the stop button can interrupt a
 	// long turn (the model may stream for minutes before first token).
 	turnCtx, cancel := context.WithCancel(r.Context())
+	turnDone := make(chan struct{})
 	s.cancelMu.Lock()
 	s.cancelTurn = cancel
+	s.runningSession = body.SessionID
+	s.turnDone = turnDone
 	s.cancelMu.Unlock()
 	defer func() {
 		s.cancelMu.Lock()
-		s.cancelTurn = nil
+		if s.turnDone == turnDone {
+			s.cancelTurn = nil
+			s.runningSession = ""
+			s.turnDone = nil
+		}
 		s.cancelMu.Unlock()
+		close(turnDone)
 		cancel()
 	}()
 	events := make(chan agent.Event, 64)
@@ -1270,6 +1281,10 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	persistErr := s.store.AppendHistoryTail(body.SessionID, updated, &historyCursor)
 	if persistErr != nil {
 		writeError(w, http.StatusInternalServerError, "failed to persist turn history")
+		return
+	}
+	if errors.Is(runErr, context.Canceled) {
+		writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text.String(), "stopped": true})
 		return
 	}
 	if runErr != nil {
@@ -1539,6 +1554,21 @@ func redactTraceJSON(value any) {
 		for _, child := range typed {
 			redactTraceJSON(child)
 		}
+	}
+}
+
+const fileEditInputSSELimit = 64 * 1024
+
+func toolInputSSELimit(tool string) int {
+	switch strings.ToLower(strings.TrimSpace(tool)) {
+	case "edit", "write":
+		// File-edit rows need the structured old/new or content fields to
+		// produce a useful live diff. Saved history already retains the same
+		// input. Bound the live payload so a pathological Write cannot turn one
+		// SSE frame into a multi-megabyte response.
+		return fileEditInputSSELimit
+	default:
+		return 400
 	}
 }
 
@@ -2034,13 +2064,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 			s.loop.ContextWindow = built.Provider.MaxContextTokens()
 		}
-		s.stateMu.Lock()
-		s.activeProviderName = body.Provider
-		s.activeModel = s.loop.Model
-		s.stateMu.Unlock()
 		capability := reasoningEffortCapability(cfg, body.Provider, s.loop.Model)
 		if !capability.Supported {
 			s.loop.SetEffort(llm.EffortDefault)
+		}
+		if err := s.commitActiveModelSelection(body.Provider, s.loop.Model); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"provider": body.Provider, "model": s.loop.Model,
@@ -2049,6 +2079,19 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// commitActiveModelSelection keeps the live selector and durable resume
+// metadata in sync after a successful provider rebuild.
+func (s *Server) commitActiveModelSelection(providerName, model string) error {
+	s.stateMu.Lock()
+	s.activeProviderName = providerName
+	s.activeModel = model
+	s.stateMu.Unlock()
+	if err := s.persistActiveSessionState(); err != nil {
+		return fmt.Errorf("persist model selection: %w", err)
+	}
+	return nil
 }
 
 // listConfiguredModels enumerates switchable models: built-in providers with
@@ -2196,21 +2239,84 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "sessionId": body.SessionID})
 }
 
-// handleStop cancels the in-flight turn (the composer's stop button).
+// handleStop cancels the in-flight turn (the composer's stop button). The
+// optional session id prevents a stale/background view from stopping the
+// wrong turn, and the response only reports "stopped" after the turn handler
+// has unwound. A slow tool gets a truthful 202 "stopping" response instead.
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid stop request")
+			return
+		}
+		if body.SessionID != "" && !validSessionID(body.SessionID) {
+			writeError(w, http.StatusBadRequest, "invalid session id")
+			return
+		}
+	}
+
 	s.cancelMu.Lock()
 	cancel := s.cancelTurn
+	runningSession := s.runningSession
+	done := s.turnDone
 	s.cancelMu.Unlock()
 	if cancel == nil {
 		writeError(w, http.StatusConflict, "no turn in progress")
 		return
 	}
+	if body.SessionID != "" && runningSession != "" && body.SessionID != runningSession {
+		writeError(w, http.StatusConflict, "requested session is not the running turn")
+		return
+	}
+
 	cancel()
-	writeJSON(w, http.StatusOK, map[string]any{"stopped": true})
+	s.cancelPendingInteractions()
+	if done != nil {
+		select {
+		case <-done:
+			writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": runningSession})
+			return
+		case <-time.After(2 * time.Second):
+			writeJSON(w, http.StatusAccepted, map[string]any{"stopping": true, "sessionId": runningSession})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": runningSession})
+}
+
+// cancelPendingInteractions releases approval and AskUser waits immediately.
+// Context cancellation alone cannot finish a loop that is blocked waiting for
+// one of these browser replies, which made the old stop button appear broken.
+func (s *Server) cancelPendingInteractions() {
+	s.permMu.Lock()
+	permissions := s.pendingPerms
+	s.pendingPerms = make(map[string]*permissionPending)
+	s.permMu.Unlock()
+	for _, pending := range permissions {
+		select {
+		case pending.reply <- agent.PermissionDecisionDeny:
+		default:
+		}
+	}
+
+	s.askMu.Lock()
+	asks := s.pendingAsks
+	s.pendingAsks = make(map[string]*askPending)
+	s.askMu.Unlock()
+	for _, pending := range asks {
+		select {
+		case pending.reply <- "":
+		default:
+		}
+	}
 }
 
 // handleExport writes the session transcript as a glyph-led txt export,

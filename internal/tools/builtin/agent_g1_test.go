@@ -44,23 +44,22 @@ import (
 
 // TestAgentConcurrency_InputAware — the dispatcher's classification
 // decision. Same Agent tool, two different inputs, two different
-// Concurrency values. If this regresses, run_in_background sub-agents
-// either block the dispatcher (Exclusive serialization) or fire
-// unwanted parallelism (every Agent call running in goroutine).
+// Concurrency values. Foreground Agent calls are independent child loops and
+// must fan out when the model emits multiple calls in one assistant message;
+// background calls keep their detached-handshake tier.
 func TestAgentConcurrency_InputAware(t *testing.T) {
 	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
 
-	if got := tool.Concurrency(map[string]any{}); got != tools.ConcurrencyExclusive {
-		t.Errorf("foreground call → Concurrency = %v, want ConcurrencyExclusive", got)
+	if got := tool.Concurrency(map[string]any{}); got != tools.ConcurrencySafe {
+		t.Errorf("foreground call → Concurrency = %v, want ConcurrencySafe", got)
 	}
 	if got := tool.Concurrency(map[string]any{"run_in_background": true}); got != tools.ConcurrencyBackground {
 		t.Errorf("run_in_background:true → Concurrency = %v, want ConcurrencyBackground", got)
 	}
-	// Explicit false MUST also yield Exclusive — not Background — so a
-	// model that wraps every Agent in the field still gets the synchronous
-	// path it expects.
-	if got := tool.Concurrency(map[string]any{"run_in_background": false}); got != tools.ConcurrencyExclusive {
-		t.Errorf("run_in_background:false → Concurrency = %v, want ConcurrencyExclusive", got)
+	// Explicit false is still a foreground call, so it must join the safe
+	// fan-out rather than use the detached background path.
+	if got := tool.Concurrency(map[string]any{"run_in_background": false}); got != tools.ConcurrencySafe {
+		t.Errorf("run_in_background:false → Concurrency = %v, want ConcurrencySafe", got)
 	}
 }
 

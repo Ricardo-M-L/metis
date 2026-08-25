@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,113 @@ type fakeCLICall struct {
 	binary string
 	args   []string
 	dir    string
+}
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GO_WANT_METIS_WEBUI_START_HELPER") == "1" {
+		os.Exit(runWebUIStartHelper(os.Args))
+	}
+	os.Exit(m.Run())
+}
+
+func runWebUIStartHelper(args []string) int {
+	var port string
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--port" {
+			port = args[i+1]
+			break
+		}
+	}
+	if port == "" {
+		fmt.Fprintln(os.Stderr, "simulated webui helper received no port")
+		return 20
+	}
+	switch os.Getenv("METIS_WEBUI_HELPER_MODE") {
+	case "fail-once":
+		stateFile := os.Getenv("METIS_WEBUI_HELPER_STATE")
+		file, err := os.OpenFile(stateFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			_ = file.Close()
+			fmt.Fprintln(os.Stderr, "simulated first webui startup failure")
+			return 21
+		}
+	case "always-fail":
+		fmt.Fprintln(os.Stderr, "simulated webui startup failure")
+		return 22
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	if err := http.ListenAndServe("127.0.0.1:"+port, mux); err != nil {
+		fmt.Fprintln(os.Stderr, "simulated webui listen failure:", err)
+		return 23
+	}
+	return 0
+}
+
+func TestProcessLogBufferKeepsBoundedTail(t *testing.T) {
+	buffer := &processLogBuffer{}
+	input := strings.Repeat("x", webUIStartupLogLimit) + "important tail"
+	written, err := buffer.Write([]byte(input))
+	if err != nil || written != len(input) {
+		t.Fatalf("Write() = %d, %v; want %d", written, err, len(input))
+	}
+	got := buffer.String()
+	if len(got) != webUIStartupLogLimit || !strings.HasSuffix(got, "important tail") {
+		t.Fatalf("bounded log length=%d suffix=%q", len(got), got[len(got)-20:])
+	}
+}
+
+func TestStartWebUIRetriesTransientChildFailure(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "first-attempt")
+	t.Setenv("GO_WANT_METIS_WEBUI_START_HELPER", "1")
+	t.Setenv("METIS_WEBUI_HELPER_MODE", "fail-once")
+	t.Setenv("METIS_WEBUI_HELPER_STATE", stateFile)
+	app := &App{
+		workDir: t.TempDir(),
+		findMetis: func() (string, error) {
+			return os.Args[0], nil
+		},
+	}
+	url, err := app.StartWebUI()
+	if err != nil {
+		t.Fatalf("StartWebUI() failed after a transient child exit: %v", err)
+	}
+	t.Cleanup(app.stopWebUI)
+	if !strings.Contains(url, "desktop-frame=") {
+		t.Fatalf("StartWebUI() URL = %q, want a tokenized frame URL", url)
+	}
+	response, err := http.Get(app.webUIBaseURL() + "/api/health")
+	if err != nil {
+		t.Fatalf("health probe after retry: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("health status after retry = %d, want 200", response.StatusCode)
+	}
+	if _, err := os.Stat(stateFile); err != nil {
+		t.Fatalf("first attempt marker: %v", err)
+	}
+}
+
+func TestStartWebUIReportsChildOutputAfterRetriesFail(t *testing.T) {
+	t.Setenv("GO_WANT_METIS_WEBUI_START_HELPER", "1")
+	t.Setenv("METIS_WEBUI_HELPER_MODE", "always-fail")
+	app := &App{
+		workDir: t.TempDir(),
+		findMetis: func() (string, error) {
+			return os.Args[0], nil
+		},
+	}
+	_, err := app.StartWebUI()
+	if err == nil {
+		t.Fatal("StartWebUI() unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "attempt 2/2") || !strings.Contains(err.Error(), "simulated webui startup failure") {
+		t.Fatalf("StartWebUI() error = %q, want retry count and child stderr", err)
+	}
 }
 
 func TestShutdownStopsWebUIChild(t *testing.T) {
@@ -87,6 +195,42 @@ func newFakeApp(t *testing.T, workDir string, results ...fakeCLIResult) (*App, *
 		runMetis: fake.runner,
 	}
 	return app, fake
+}
+
+func TestBundleMetadataUsesMetisDisplayNameAndSingleInstance(t *testing.T) {
+	data, err := os.ReadFile("wails.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Name           string `json:"name"`
+		OutputFilename string `json:"outputfilename"`
+		Info           struct {
+			ProductName string `json:"productName"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.Name != "metis-desktop" || config.OutputFilename != "metis-desktop" {
+		t.Fatalf("internal bundle names = name:%q output:%q, release-compatible names must stay metis-desktop", config.Name, config.OutputFilename)
+	}
+	if config.Info.ProductName != "Metis" {
+		t.Fatalf("product display name = %q, want Metis", config.Info.ProductName)
+	}
+	plist, err := os.ReadFile(filepath.Join("build", "darwin", "Info.plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := string(plist)
+	for _, want := range []string{
+		"<key>CFBundleDisplayName</key>\n        <string>Metis</string>",
+		"<key>LSMultipleInstancesProhibited</key>\n        <true/>",
+	} {
+		if !strings.Contains(metadata, want) {
+			t.Fatalf("Info.plist missing %q", want)
+		}
+	}
 }
 
 func TestParseDesktopLaunchArguments(t *testing.T) {

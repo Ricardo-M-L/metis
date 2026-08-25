@@ -585,56 +585,28 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 		}
 		out.Messages = append(out.Messages, am)
 	}
-	// Last user message cache (CC-B): mark the LAST content block of
-	// the LAST user message with cache_control. The next turn's
-	// request will hit cache for everything UP TO this point, so a
-	// short follow-up question only re-bills the new user text. The
-	// API allows up to 4 cache_control markers — we now use:
+	// Rolling conversation cache: mark only the last content block of
+	// the newest user message. The next request can reuse the complete
+	// history up to this point, including large tool_result blocks.
 	//
-	//   1. last tool                  (above)
-	//   2. system static prefix       (buildSystemBlocks)
-	//   3. system addendum            (buildSystemBlocks, optional)
-	//   4. last user message          (here)
-	//
-	// claude-code's services/api/claude.ts has the same structure.
-	// Tool-using turns specifically benefit because the long
-	// tool_result blocks become part of the cached prefix on the
-	// follow-up.
+	// Keep exactly one message-level marker. Typed requests may already
+	// consume two markers for stable system sections and one for tools;
+	// adding a second historical anchor would exceed Anthropic's hard
+	// four-breakpoint budget and can prevent the growing conversation
+	// prefix from being cached. Claude Code uses the same single-marker
+	// policy for its message history.
 	if n := len(out.Messages); n > 0 {
-		// Walk backwards to find the last TWO user messages so we can
-		// place rolling cache checkpoints: the last user message is
-		// the "leading edge" marker (next turn caches up through this
-		// point); the second-to-last user message is the "trailing
-		// anchor" so a long conversation's earlier history stays in
-		// cache even after a couple of new turns.
-		//
-		// Cache breakpoint budget: tools, system, last-user, prior-user
-		// = exactly 4. Matches Anthropic's hard cap (last 4 markers
-		// retained; older ones silently dropped). claude-code's
-		// services/api/claude.ts:buildCachePoints applies the same
-		// dual-anchor scheme.
-		lastUser, prevUser := -1, -1
+		lastUser := -1
 		for i := n - 1; i >= 0; i-- {
-			if out.Messages[i].Role != "user" {
-				continue
-			}
-			if lastUser < 0 {
+			if out.Messages[i].Role == "user" {
 				lastUser = i
-				continue
+				break
 			}
-			prevUser = i
-			break
 		}
 		if lastUser >= 0 {
 			cn := len(out.Messages[lastUser].Content)
 			if cn > 0 {
 				out.Messages[lastUser].Content[cn-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
-			}
-		}
-		if prevUser >= 0 {
-			cn := len(out.Messages[prevUser].Content)
-			if cn > 0 {
-				out.Messages[prevUser].Content[cn-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
 			}
 		}
 	}
@@ -681,24 +653,36 @@ func chooseSystemBlocks(req Request) []anthropicSystemBlock {
 }
 
 // BuildSystemBlocksFromSections is the typed-section construction
-// path. Up to 4 cache_control markers in the result; Anthropic's
-// total per-request budget is also 4, but the last-tool + last-user-
-// message markers eat 2, so this function caps system-side at 2.
+// path. Anthropic cache breakpoints protect the complete prefix before
+// each marker, so adjacent stable sections share one marker at the end
+// of their run. This maximizes the protected prefix instead of spending
+// the budget on the first two small fragments. The last-tool and newest-
+// message markers consume the other two slots in the four-marker budget.
 func BuildSystemBlocksFromSections(secs []SystemSection) []anthropicSystemBlock {
 	out := make([]anthropicSystemBlock, 0, len(secs))
-	cacheUsed := 0
-	const maxSystemCache = 2
+	cacheable := make([]bool, 0, len(secs))
 	for _, s := range secs {
 		if s.Body == "" {
 			continue
 		}
-		blk := anthropicSystemBlock{Type: "text", Text: s.Body}
-		wantCache := s.Cache && !s.Volatile && cacheUsed < maxSystemCache
-		if wantCache {
-			blk.CacheControl = &anthropicCacheControl{Type: "ephemeral"}
-			cacheUsed++
+		out = append(out, anthropicSystemBlock{Type: "text", Text: s.Body})
+		cacheable = append(cacheable, s.Cache && !s.Volatile)
+	}
+
+	const maxSystemCache = 2
+	cacheUsed := 0
+	for i := range out {
+		if !cacheable[i] {
+			continue
 		}
-		out = append(out, blk)
+		if i+1 < len(out) && cacheable[i+1] {
+			continue
+		}
+		if cacheUsed >= maxSystemCache {
+			break
+		}
+		out[i].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+		cacheUsed++
 	}
 	return out
 }

@@ -114,16 +114,26 @@ func handleSelectQuery(l *Loop, toolUseID, body string) llm.ContentBlock {
 			missing = append(missing, name)
 			continue
 		}
+		if strings.HasPrefix(t.Name(), "mcp__") {
+			matches = append(matches, map[string]any{
+				"name":         t.Name(),
+				"description":  t.Description(),
+				"input_schema": t.InputSchema(),
+			})
+			// Cross-compaction stability: once we hand the deferred MCP
+			// schema to the model, the next toolSpecs() build keeps it
+			// intact instead of forcing another ToolSearch round-trip.
+			l.markMCPDiscovered(t.Name())
+			continue
+		}
+		// Built-ins are already present in the live tools array. Repeating
+		// their descriptions and schemas in a ToolSearch result can add
+		// tens of thousands of uncached characters to conversation
+		// history without teaching the model anything new.
 		matches = append(matches, map[string]any{
-			"name":         t.Name(),
-			"description":  t.Description(),
-			"input_schema": t.InputSchema(),
+			"name":              t.Name(),
+			"already_available": true,
 		})
-		// Cross-compaction stability: once we hand the schema to the
-		// model, the next toolSpecs() build keeps that mcp__ tool's
-		// schema intact instead of re-stripping it. Avoids an extra
-		// ToolSearch round-trip after compaction (P6).
-		l.markMCPDiscovered(t.Name())
 	}
 	if len(matches) == 0 {
 		// All-miss → IsError so the model retries with a different
@@ -163,7 +173,7 @@ func handleKeywordSearch(l *Loop, toolUseID, query string, maxResults int) llm.C
 	if len(matches) == 0 {
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: toolUseID,
-			ToolResult: fmt.Sprintf("no deferred tools matched %q — try a broader query or `select:<exact-name>` if you know the name", query),
+			ToolResult: fmt.Sprintf("no registered tools matched %q — try a broader query or `select:<exact-name>` if you know the name", query),
 		}
 	}
 	raw, err := json.Marshal(map[string]any{"matches": matches})
@@ -180,9 +190,11 @@ func handleKeywordSearch(l *Loop, toolUseID, query string, maxResults int) llm.C
 	}
 }
 
-// searchToolsWithKeywords ranks the registry's deferred (mcp__) tools
-// against a free-text query, returning the top-N as ordered
-// {name, description} pairs (no schemas).
+// searchToolsWithKeywords ranks deferred MCP tools plus Agent against a
+// free-text query, returning the top-N as ordered {name, description} pairs.
+// Other built-ins already have live schemas and stay out of the deferred-tool
+// catalog; Agent remains discoverable because models may search for the
+// orchestration capability before attempting their first parallel dispatch.
 //
 // Query syntax (mirrors claude-code-sourcemap's
 // ToolSearchTool.ts:186-302 `searchToolsWithKeywords`):
@@ -223,7 +235,7 @@ func searchToolsWithKeywords(l *Loop, query string, maxResults int) []map[string
 	results := make([]scored, 0, len(all))
 	for _, t := range all {
 		name := t.Name()
-		if !strings.HasPrefix(name, "mcp__") {
+		if name != "Agent" && !strings.HasPrefix(name, "mcp__") {
 			continue
 		}
 		nameLower := strings.ToLower(name)

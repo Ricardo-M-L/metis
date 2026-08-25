@@ -10,7 +10,11 @@ let eventSource = null;
 let streaming = false;
 let streamMsgIdx = -1;
 let turnRunning = false;
+let runningSessionId = null;
+let stopRequestPending = false;
+let runningTurnNeedsHistorySync = false;
 let queuedTurns = [];
+let queuedSessionId = null;
 let drainingQueuedTurns = false;
 let streamingEl = null;
 let streamingText = '';
@@ -122,11 +126,15 @@ async function chooseEffort(value) {
   }
 }
 
-// Events carry the session they belong to; a tab only renders the live
-// stream of the session it is viewing. currentSessionId is null while the
-// first turn of a brand-new session is still running (the POST response
-// carries the id), so null means "not yet known" and must not filter.
+// Events carry the session they belong to; the running session and the
+// transcript currently being viewed are intentionally separate. The first
+// event also reveals the id assigned to a brand-new session before its POST
+// resolves, so sidebar navigation can safely background it.
 function sameSession(d) {
+  if (turnRunning && d && d.session && !runningSessionId) {
+    runningSessionId = d.session;
+    renderSessions();
+  }
   return !(d && d.session && currentSessionId && d.session !== currentSessionId);
 }
 
@@ -239,6 +247,145 @@ function finishThinking() {
   }
 }
 
+let todoPlanItems = [];
+let todoPlanOpen = false;
+
+function isTodoWriteTool(name) {
+  const normalized = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  return normalized === 'todowrite';
+}
+
+function normalizeTodoItems(value, base = todoPlanItems) {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); }
+    catch (e) { return null; }
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  const clean = (item) => {
+    if (!item || typeof item !== 'object') return null;
+    const content = String(item.content || '').trim();
+    const status = String(item.status || 'pending').toLowerCase();
+    if (!content || !['pending', 'in_progress', 'completed'].includes(status)) return null;
+    return { content: content, status: status };
+  };
+
+  if (Array.isArray(parsed.todos)) {
+    const todos = parsed.todos.map(clean);
+    return todos.every(Boolean) ? todos : null;
+  }
+
+  const single = clean(parsed);
+  if (!single) return null;
+  const next = base.map(item => ({ content: item.content, status: item.status }));
+  const key = single.content.toLocaleLowerCase();
+  const existing = next.findIndex(item => item.content.toLocaleLowerCase() === key);
+  if (existing >= 0) next[existing] = single;
+  else next.push(single);
+  return next;
+}
+
+function todoPlanMetrics(todos = todoPlanItems) {
+  const total = todos.length;
+  const completed = todos.filter(item => item.status === 'completed').length;
+  const active = todos.filter(item => item.status === 'in_progress').length;
+  const pending = Math.max(0, total - completed - active);
+  const activeIndex = todos.findIndex(item => item.status === 'in_progress');
+  const current = total === 0 ? 0 : (activeIndex >= 0 ? activeIndex + 1 : Math.min(completed + 1, total));
+  return { total, completed, active, pending, current };
+}
+
+function renderTodoPlan() {
+  const dock = document.getElementById('todoPlanDock');
+  const popover = document.getElementById('todoPlanPopover');
+  const trigger = document.getElementById('todoPlanTrigger');
+  const step = document.getElementById('todoPlanStepLabel');
+  const counts = document.getElementById('todoPlanCounts');
+  const list = document.getElementById('todoPlanList');
+  if (!dock || !popover || !trigger || !step || !counts || !list) return;
+
+  const metrics = todoPlanMetrics();
+  if (metrics.total === 0) {
+    dock.hidden = true;
+    popover.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    return;
+  }
+
+  dock.hidden = false;
+  const finished = metrics.completed === metrics.total;
+  step.textContent = finished
+    ? `已完成 ${metrics.completed} / ${metrics.total}`
+    : `第 ${metrics.current} / ${metrics.total} 步`;
+  counts.textContent = [
+    metrics.completed ? `${metrics.completed} 已完成` : '',
+    metrics.active ? `${metrics.active} 进行中` : '',
+    metrics.pending ? `${metrics.pending} 待处理` : '',
+  ].filter(Boolean).join(' · ');
+  list.innerHTML = todoPlanItems.map(item => `
+    <li class="todo-plan-item" data-status="${escAttr(item.status)}">
+      <span class="todo-plan-glyph" aria-hidden="true"></span>
+      <span class="todo-plan-item-text">${escHtml(item.content)}</span>
+    </li>`).join('');
+  popover.hidden = !todoPlanOpen;
+  trigger.setAttribute('aria-expanded', todoPlanOpen ? 'true' : 'false');
+  dock.classList.toggle('is-open', todoPlanOpen);
+}
+
+function applyTodoSnapshot(name, input) {
+  if (!isTodoWriteTool(name)) return false;
+  const next = normalizeTodoItems(input);
+  if (!next) return false;
+  todoPlanItems = next;
+  renderTodoPlan();
+  return true;
+}
+
+function clearTodoPlan() {
+  todoPlanItems = [];
+  todoPlanOpen = false;
+  renderTodoPlan();
+}
+
+function toggleTodoPlan() {
+  if (!todoPlanItems.length) return;
+  todoPlanOpen = !todoPlanOpen;
+  renderTodoPlan();
+}
+
+function restoreTodoPlanFromHistory(history) {
+  const messages = Array.isArray(history) ? history : [];
+  const failedToolUses = new Set();
+  for (const message of messages) {
+    const blocks = Array.isArray(message && message.content) ? message.content : [];
+    for (const block of blocks) {
+      if (block && block.type === 'tool_result' && block.is_error && block.tool_use_id) {
+        failedToolUses.add(String(block.tool_use_id));
+      }
+    }
+  }
+
+  let restored = [];
+  for (const message of messages) {
+    const blocks = Array.isArray(message && message.content)
+      ? message.content
+      : (typeof (message && message.content) === 'string' ? [{ type: 'text', text: message.content }] : []);
+    const startsUserTurn = message && message.role === 'user' && blocks.some(block =>
+      block && block.type === 'text' && String(block.text || block.content || '').trim());
+    if (startsUserTurn) restored = [];
+    for (const block of blocks) {
+      if (!block || block.type !== 'tool_use' || !isTodoWriteTool(block.name)) continue;
+      if (block.tool_use_id && failedToolUses.has(String(block.tool_use_id))) continue;
+      const next = normalizeTodoItems(block.input, restored);
+      if (next) restored = next;
+    }
+  }
+  todoPlanItems = restored;
+  todoPlanOpen = false;
+  renderTodoPlan();
+}
+
 let pendingAsk = null;
 
 // Model's mid-turn question (DSH PendingSteering parity): right-aligned
@@ -305,6 +452,7 @@ let turnOutTokens = 0;
 let turnStatusEl = null;
 let turnStatusTimer = null;
 let compactionInFlight = false;
+let compactionStatusEl = null;
 
 // "Deep diving..." turn-level status (DSH TurnStatus parity): rides the
 // whole running turn and gains a clock after 15s.
@@ -376,25 +524,58 @@ function setTurnStatusLabel(label) {
   return true;
 }
 
+function upsertCompactionRow(title, detail, state) {
+  const area = document.getElementById('chatArea');
+  const nextState = state || 'running';
+  const needsNew = !compactionStatusEl || !compactionStatusEl.isConnected || compactionStatusEl.dataset.state !== 'running';
+  if (needsNew) {
+    const row = document.createElement('div');
+    row.className = 'context-row compaction-row open';
+    row.setAttribute('role', 'status');
+    row.setAttribute('aria-live', 'polite');
+    row.innerHTML = `
+      <div class="context-head" onclick="toggleContextRow(this)">
+        <span class="context-chevron">\u25BE</span>
+        <span class="context-title"></span>
+      </div>
+      <div class="context-body"></div>`;
+    area.appendChild(row);
+    compactionStatusEl = row;
+  }
+  compactionStatusEl.dataset.state = nextState;
+  compactionStatusEl.classList.toggle('running', nextState === 'running');
+  compactionStatusEl.classList.toggle('complete', nextState === 'complete');
+  compactionStatusEl.classList.toggle('failed', nextState === 'failed');
+  const titleEl = compactionStatusEl.querySelector('.context-title');
+  const bodyEl = compactionStatusEl.querySelector('.context-body');
+  if (titleEl) titleEl.textContent = title;
+  if (bodyEl) bodyEl.textContent = detail || '';
+  autoScroll();
+  return compactionStatusEl;
+}
+
 function handleCompactionStart() {
   compactionInFlight = true;
-  if (!setTurnStatusLabel(uiText('Compacting context…', '正在压缩上下文…'))) {
-    showToast(uiText('Compacting context…', '正在压缩上下文…'));
-  }
+  upsertCompactionRow(uiText('Compacting context…', '正在压缩上下文…'),
+    uiText('Preserving decisions, active work, and important details.', '正在保留关键决定、进行中的工作和重要细节。'), 'running');
 }
 
 function handleCompactionProgress(d) {
   if (!compactionInFlight) handleCompactionStart();
   const bytes = Number(d.progressBytes) || 0;
   const suffix = bytes >= 1024 ? ' · ' + Math.round(bytes / 1024) + ' KB' : '';
-  setTurnStatusLabel(uiText('Compacting context…', '正在压缩上下文…') + suffix);
+  upsertCompactionRow(uiText('Compacting context…', '正在压缩上下文…') + suffix,
+    uiText('Preserving decisions, active work, and important details.', '正在保留关键决定、进行中的工作和重要细节。'), 'running');
 }
 
 function handleCompactionEnd(d) {
   compactionInFlight = false;
-  setTurnStatusLabel('Deep diving...');
   if (d.error) {
+    upsertCompactionRow(uiText('Context compaction failed', '上下文压缩失败'), String(d.error), 'failed');
     showToast(uiText('Context compaction failed: ', '上下文压缩失败：') + d.error);
+  } else if (compactionStatusEl && compactionStatusEl.dataset.state === 'running') {
+    upsertCompactionRow(uiText('Conversation history compacted', '会话历史已压缩'),
+      uiText('Important context was preserved for the next request.', '重要上下文已保留，后续请求可继续使用。'), 'complete');
   }
   pollStatus();
 }
@@ -412,14 +593,19 @@ function handleContextEvent(d, compacted) {
     ? uiText('Conversation history compacted', '会话历史已压缩') + (reduction ? ' · ' + reduction : '')
     : uiText('Context', '上下文');
   const detail = [text, reduction].filter(Boolean).join('\n');
-  area.insertAdjacentHTML('beforeend', `
-    <div class="context-row">
-      <div class="context-head" onclick="toggleContextRow(this)">
-        <span class="context-chevron">\u25B8</span>
-        <span class="context-title">${escHtml(title)}</span>
-      </div>
-      <div class="context-body">${escHtml(detail)}</div>
-    </div>`);
+  if (compacted) {
+    upsertCompactionRow(title, detail || uiText('Important context was preserved for the next request.', '重要上下文已保留，后续请求可继续使用。'), 'complete');
+    compactionStatusEl.classList.add('complete');
+  } else {
+    area.insertAdjacentHTML('beforeend', `
+      <div class="context-row">
+        <div class="context-head" onclick="toggleContextRow(this)">
+          <span class="context-chevron">\u25B8</span>
+          <span class="context-title">${escHtml(title)}</span>
+        </div>
+        <div class="context-body">${escHtml(detail)}</div>
+      </div>`);
+  }
   // before/after describe the replaceable conversation history only. The
   // status meter also includes fixed system/state/memory/tool-schema overhead,
   // so never overwrite it with the smaller history number; refresh the
@@ -432,6 +618,25 @@ function toggleContextRow(head) {
   const row = head.parentElement;
   const open = row.classList.toggle('open');
   head.querySelector('.context-chevron').textContent = open ? '\u25BE' : '\u25B8';
+}
+
+async function restoreCompactionHistory() {
+  if (!currentSessionId || typeof coalesceTraceCompactions !== 'function') return;
+  try {
+    const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(currentSessionId) + '&limit=2000');
+    if (!res.ok) return;
+    const data = await res.json();
+    const completed = coalesceTraceCompactions(data.events || []).filter(ev => ev.kind === 'context_compacted');
+    compactionStatusEl = null;
+    for (const ev of completed) {
+      const timestamp = ev.ts ? new Date(ev.ts).toLocaleString() : '';
+      const detail = [
+        uiText('This saved session compacted earlier conversation history.', '此已保存会话曾压缩较早的对话历史。'),
+        timestamp,
+      ].filter(Boolean).join(' · ');
+      upsertCompactionRow(uiText('Previous context compaction', '历史上下文压缩'), detail, 'complete');
+    }
+  } catch (_) {}
 }
 
 function handleTextDelta(d) {
@@ -448,23 +653,78 @@ function handleTextDelta(d) {
   autoScroll();
 }
 
-function setTurnRunning(running) {
+function syncTurnControls() {
+  const sendBtn = document.getElementById('sendBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  if (sendBtn) sendBtn.style.display = turnRunning ? 'none' : '';
+  if (stopBtn) {
+    stopBtn.style.display = turnRunning ? '' : 'none';
+    stopBtn.disabled = stopRequestPending;
+    stopBtn.classList.toggle('stopping', stopRequestPending);
+    stopBtn.title = stopRequestPending ? 'Stopping the running turn…' : 'Stop the running turn';
+  }
+}
+
+function setTurnRunning(running, sessionId) {
   turnRunning = running;
-  document.getElementById('sendBtn').style.display = running ? 'none' : '';
-  document.getElementById('stopBtn').style.display = running ? '' : 'none';
+  if (running) {
+    if (sessionId) runningSessionId = sessionId;
+    else if (!runningSessionId && currentSessionId) runningSessionId = currentSessionId;
+  } else {
+    runningSessionId = null;
+    stopRequestPending = false;
+  }
+  syncTurnControls();
   renderSessions();
 }
 
+// Detach transient DOM state when the user views another transcript. The
+// agent turn remains alive and tracked by runningSessionId; only its old live
+// rendering pointers are discarded so completion cannot write into session B.
+function detachRunningTurnView() {
+  if (turnRunning && currentSessionId && currentSessionId === runningSessionId) {
+    runningTurnNeedsHistorySync = true;
+  }
+  if (streamingEl) {
+    const caret = streamingEl.querySelector('.stream-cursor');
+    if (caret) caret.remove();
+  }
+  streaming = false;
+  streamingEl = null;
+  streamingText = '';
+  endTurnStatus();
+  finishThinking();
+  pendingAsk = null;
+  toolDetails = {};
+  selectedToolId = null;
+  closeToolDetail();
+}
+
 async function stopTurn() {
+  if (!turnRunning || stopRequestPending) return;
+  stopRequestPending = true;
+  syncTurnControls();
   try {
-    const res = await fetch('/api/stop', { method: 'POST' });
-    if (!res.ok) { showToast('No turn in progress'); return; }
+    const res = await fetch('/api/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: runningSessionId })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'stop: ' + res.status);
+    if (data.stopping) showToast('Stopping the running turn…');
     const dropped = queuedTurns.length;
     queuedTurns = [];
+    queuedSessionId = null;
     renderQueuedTurns();
     if (dropped) showToast('Stopped; cleared ' + dropped + ' queued message' + (dropped === 1 ? '' : 's'));
   } catch (e) {
     showToast('Stop failed: ' + e.message);
+  } finally {
+    if (turnRunning) {
+      stopRequestPending = false;
+      syncTurnControls();
+    }
   }
 }
 
@@ -527,7 +787,9 @@ function beginUserTurn() {
 // new chat, and SSE reconnect so nothing from a previous session leaks
 // into the next (timer, pending question, tool details, thinking row).
 function resetTurnState() {
+  clearTodoPlan();
   compactionInFlight = false;
+  compactionStatusEl = null;
   endTurnStatus();
   finishThinking();
   if (streamingEl) {
@@ -620,6 +882,7 @@ const TOOL_VARIANTS = {
   edit:      { title: 'Edit',   keys: ['path', 'file_path'] },
   run_code:  { title: 'Code',   keys: ['description'] },
   todo_write:{ title: '\u66F4\u65B0\u4EFB\u52A1\u6E05\u5355', keys: [] },
+  todowrite: { title: '\u66F4\u65B0\u4EFB\u52A1\u6E05\u5355', keys: [] },
 };
 const TOOL_ICONS = {
   search: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>',
@@ -647,6 +910,15 @@ function firstLine(s) {
   return (i === -1 ? t : t.slice(0, i)).trim();
 }
 function toolSummaryText(name, input) {
+  if (isTodoWriteTool(name)) {
+    const todos = normalizeTodoItems(input);
+    if (todos) {
+      const metrics = todoPlanMetrics(todos);
+      const active = todos.filter(item => item.status === 'in_progress').map(item => item.content);
+      const suffix = active.length ? ` · ${active[0]}${active.length > 1 ? ` +${active.length - 1}` : ''}` : '';
+      return `完成 ${metrics.completed}/${metrics.total}${suffix}`;
+    }
+  }
   let args;
   try { args = JSON.parse(input); } catch (e) { args = undefined; }
   const v = TOOL_VARIANTS[name];
@@ -664,6 +936,122 @@ function toolSummaryText(name, input) {
   const base = firstLine(val || input);
   if (v === undefined && name && name !== 'tool') return name + ' \u00B7 ' + base;
   return base;
+}
+
+const FILE_DIFF_MAX_LINES = 500;
+const FILE_DIFF_MAX_SOURCE_LINES = 1000;
+const FILE_DIFF_MAX_SOURCE_CHARS = 256 * 1024;
+const FILE_DIFF_MAX_CELLS = 80000;
+
+function fileDiffLines(value) {
+  if (value === '') return { lines: [], truncated: false };
+  let text = String(value == null ? '' : value).replace(/\r\n/g, '\n');
+  let truncated = text.length > FILE_DIFF_MAX_SOURCE_CHARS;
+  if (truncated) text = text.slice(0, FILE_DIFF_MAX_SOURCE_CHARS);
+  let lines = text.split('\n');
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  if (lines.length > FILE_DIFF_MAX_SOURCE_LINES) {
+    lines = lines.slice(0, FILE_DIFF_MAX_SOURCE_LINES);
+    truncated = true;
+  }
+  return { lines: lines, truncated: truncated };
+}
+
+function parseFileEditInput(name, input) {
+  const kind = String(name || '').toLowerCase();
+  if (kind !== 'edit' && kind !== 'write') return null;
+  let args = input;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch (e) { return null; }
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  const path = typeof args.path === 'string' ? args.path : (typeof args.file_path === 'string' ? args.file_path : 'file');
+  if (kind === 'edit') {
+    const before = typeof args.old === 'string' ? args.old : args.old_string;
+    const after = typeof args.new === 'string' ? args.new : args.new_string;
+    if (typeof before !== 'string' || typeof after !== 'string') return null;
+    return { kind: kind, path: path, before: before, after: after };
+  }
+  if (typeof args.content !== 'string') return null;
+  return { kind: kind, path: path, before: '', after: args.content };
+}
+
+function buildFileLineDiff(before, after) {
+  const leftSource = fileDiffLines(before);
+  const rightSource = fileDiffLines(after);
+  const left = leftSource.lines;
+  const right = rightSource.lines;
+  const rows = [];
+  const cells = left.length * right.length;
+  let i = 0;
+  let j = 0;
+
+  if (cells <= FILE_DIFF_MAX_CELLS) {
+    const dp = Array.from({ length: left.length + 1 }, () => new Uint16Array(right.length + 1));
+    for (i = left.length - 1; i >= 0; i--) {
+      for (j = right.length - 1; j >= 0; j--) {
+        dp[i][j] = left[i] === right[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    i = 0;
+    j = 0;
+    while (i < left.length || j < right.length) {
+      if (i < left.length && j < right.length && left[i] === right[j]) {
+        rows.push({ kind: 'context', oldLine: i + 1, newLine: j + 1, text: left[i] });
+        i++;
+        j++;
+      } else if (j < right.length && (i === left.length || dp[i][j + 1] >= dp[i + 1][j])) {
+        rows.push({ kind: 'add', oldLine: '', newLine: j + 1, text: right[j] });
+        j++;
+      } else {
+        rows.push({ kind: 'delete', oldLine: i + 1, newLine: '', text: left[i] });
+        i++;
+      }
+    }
+  } else {
+    left.forEach((text, index) => rows.push({ kind: 'delete', oldLine: index + 1, newLine: '', text: text }));
+    right.forEach((text, index) => rows.push({ kind: 'add', oldLine: '', newLine: index + 1, text: text }));
+  }
+
+  return {
+    rows: rows,
+    added: rows.filter(row => row.kind === 'add').length,
+    removed: rows.filter(row => row.kind === 'delete').length,
+    truncated: leftSource.truncated || rightSource.truncated || rows.length > FILE_DIFF_MAX_LINES,
+  };
+}
+
+function renderFileEditCard(chip, name, input) {
+  const edit = parseFileEditInput(name, input);
+  if (!edit) return false;
+  const diff = buildFileLineDiff(edit.before, edit.after);
+  const shown = diff.rows.slice(0, FILE_DIFF_MAX_LINES);
+  const leaf = edit.path.split(/[\\/]/).pop() || edit.path;
+  const summary = chip.querySelector('.tc-summary');
+  if (summary) summary.textContent = leaf + ' \u00B7 +' + diff.added + ' -' + diff.removed;
+  const body = chip.querySelector('.tc-body');
+  if (!body) return false;
+  const rows = shown.map(row => {
+    const mark = row.kind === 'add' ? '+' : (row.kind === 'delete' ? '\u2212' : ' ');
+    return '<div class="tc-diff-line" data-kind="' + row.kind + '">' +
+      '<span class="tc-diff-no">' + row.oldLine + '</span>' +
+      '<span class="tc-diff-no">' + row.newLine + '</span>' +
+      '<span class="tc-diff-mark">' + mark + '</span>' +
+      '<code class="tc-diff-code">' + escHtml(row.text || ' ') + '</code></div>';
+  }).join('');
+  const writeNote = edit.kind === 'write'
+    ? '<span class="tc-diff-note">Written content; the previous full body is not stored in this tool event.</span>'
+    : '<span class="tc-diff-note">Before / after</span>';
+  const omitted = diff.truncated
+    ? '<div class="tc-diff-omitted">Diff truncated after ' + FILE_DIFF_MAX_LINES + ' rows. Inspect the tool input for the complete change.</div>'
+    : '';
+  body.innerHTML = '<div class="tc-file-diff">' +
+    '<div class="tc-diff-head"><span class="tc-diff-path" title="' + escAttr(edit.path) + '">' + escHtml(leaf) + '</span>' +
+    writeNote + '<span class="tc-diff-count add">+' + diff.added + '</span><span class="tc-diff-count delete">-' + diff.removed + '</span></div>' +
+    '<div class="tc-diff-full-path">' + escHtml(edit.path) + '</div>' +
+    '<div class="tc-diff-lines">' + rows + '</div>' + omitted + '</div>';
+  chip.classList.add('file-edit-row');
+  return true;
 }
 
 // Provider-streamed partial tool args (tool_input_delta): route each
@@ -769,6 +1157,9 @@ function handleToolResult(d) {
   if (chip) {
     const ok = !d.isError;
     chip.setAttribute('data-state', ok ? 'ok' : 'error');
+    if (ok && isTodoWriteTool(name)) {
+      applyTodoSnapshot(name, chip.getAttribute('data-args') || '');
+    }
     const leading = chip.querySelector('.tc-leading');
     if (!ok && leading) {
       leading.innerHTML = '<span class="tc-state-dot" data-state="error" aria-hidden="true"></span>';
@@ -790,6 +1181,9 @@ function handleToolResult(d) {
     // of the raw text dump. Details panel keeps the raw output.
     if (ok && name === 'Grep' && d.output) {
       renderSearchCard(chip, d.output, id);
+    }
+    if (ok && (String(name).toLowerCase() === 'edit' || String(name).toLowerCase() === 'write')) {
+      renderFileEditCard(chip, name, chip.getAttribute('data-args') || '');
     }
     // Rich results use structured presentation metadata persisted beside the
     // tool result. Never infer an Artifact from model-authored output text.
@@ -909,7 +1303,7 @@ function handlePermissionRequest(d) {
   const id = d.permId || '';
   if (!id) return;
   area.insertAdjacentHTML('beforeend', `
-    <div class="perm-card" data-perm="${escAttr(id)}">
+    <div class="perm-card" data-perm="${escAttr(id)}" data-tool="${escAttr(d.tool || 'tool')}">
       <span class="tool-icon running">&#128274;</span>
       <div class="tool-body">
         <div class="tool-name">${escHtml(d.tool || 'tool')} needs approval</div>
@@ -935,9 +1329,13 @@ async function resolvePermission(id, approve, btn) {
     if (!res.ok) throw new Error('permission: ' + res.status);
     if (card) {
       card.classList.add(approve ? 'approved' : 'denied');
+      const tool = card.getAttribute('data-tool') || 'tool';
+      const name = card.querySelector('.tool-name');
+      if (name) name.textContent = tool + (approve ? ' allowed' : ' denied');
       const status = card.querySelector('.tool-status');
       if (status) status.textContent = approve ? 'Allowed' : 'Denied';
-      card.querySelectorAll('.perm-btn').forEach(b => b.disabled = true);
+      const actions = card.querySelector('.perm-actions');
+      if (actions) actions.remove();
       const icon = card.querySelector('.tool-icon');
       icon.className = 'tool-icon ' + (approve ? 'done' : 'failed');
       icon.innerHTML = approve ? '&#10003;' : '&#10007;';
@@ -976,13 +1374,9 @@ function newChat() {
     <div class="welcome" id="welcomeScreen">
       <div class="welcome-line">
         <span class="welcome-text" data-i18n="welcome">\u4ECE\u60F3\u6CD5\uFF0C\u5230\u5B8C\u6210</span>
-        <span class="welcome-badge" data-i18n="preview">METIS Desktop</span>
       </div>
     </div>`;
 	applyLanguage(desktopPreferences.language);
-  document.getElementById('topbarTitle').textContent = 'Metis';
-	const preset = document.getElementById('presetName');
-	if (preset) preset.textContent = presetDisplayName(desktopPreferences.defaultPreset || 'standard');
   const bar = document.getElementById('sessionStatsbar');
   if (bar) { bar.style.display = 'none'; bar.textContent = ''; }
   renderSessions();
@@ -1181,6 +1575,11 @@ async function sendMessage(busyBehavior) {
     return;
   }
 
+  if (turnRunning && runningSessionId && currentSessionId !== runningSessionId) {
+    showToast('Another session is still running. Return to it or stop it before sending.');
+    return;
+  }
+
   if (!turnRunning && await executeComposerCommand(text)) {
     input.value = '';
     autoResize(input);
@@ -1225,6 +1624,7 @@ async function submitBusyInput(item, behavior) {
   } else if (behavior === 'send' && item.images.length) {
     showToast('Image follow-ups are queued for the next turn');
   }
+  if (!queuedSessionId) queuedSessionId = runningSessionId || currentSessionId;
   queuedTurns.push(item);
   renderQueuedTurns();
 }
@@ -1246,11 +1646,13 @@ function renderQueuedTurns() {
 
 function removeQueuedTurn(index) {
   queuedTurns.splice(index, 1);
+  if (!queuedTurns.length) queuedSessionId = null;
   renderQueuedTurns();
 }
 
 async function drainQueuedTurns() {
   if (turnRunning || drainingQueuedTurns || pendingAsk || !queuedTurns.length) return;
+  if (queuedSessionId && currentSessionId !== queuedSessionId) return;
   drainingQueuedTurns = true;
   const item = queuedTurns.shift();
   renderQueuedTurns();
@@ -1258,13 +1660,34 @@ async function drainQueuedTurns() {
     await runTurnItem(item);
   } finally {
     drainingQueuedTurns = false;
-    if (queuedTurns.length) setTimeout(drainQueuedTurns, 0);
+    if (!queuedTurns.length) queuedSessionId = null;
+    else if (currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
+  }
+}
+
+async function syncViewedSessionHistory(sessionId) {
+  if (!sessionId || currentSessionId !== sessionId) return false;
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(sessionId), { method: 'GET' });
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (currentSessionId !== sessionId) return false;
+    messages = [];
+    streamedTextThisTurn = false;
+    renderHistoryMessages(data.messages);
+    await restoreCompactionHistory();
+    return true;
+  } catch (e) {
+    return false;
   }
 }
 
 async function runTurnItem(item) {
+  clearTodoPlan();
   const text = item.text || '';
   const images = item.images || [];
+  const turnSessionId = currentSessionId;
+  let resolvedTurnSessionId = turnSessionId;
 
   // Hide welcome
   const welcome = document.getElementById('welcomeScreen');
@@ -1273,39 +1696,55 @@ async function runTurnItem(item) {
   // Add user message (image attachments render as placeholder thumbnails)
   addMessage('user', text || '(image attached)');
   beginUserTurn();
-  setTurnRunning(true);
+  setTurnRunning(true, turnSessionId);
   document.getElementById('sendBtn').disabled = true;
 
   try {
     const res = await fetch('/api/turns', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({sessionId: currentSessionId, input: text, images: images})
+      body: JSON.stringify({sessionId: turnSessionId, input: text, images: images})
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
-    currentSessionId = data.sessionId;
-    if (typeof loadArtifactsForSession === 'function') {
-      await loadArtifactsForSession(currentSessionId, { rebuildCards: true, silent: true });
+    resolvedTurnSessionId = data.sessionId || turnSessionId;
+    if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
+    if (!currentSessionId || currentSessionId === turnSessionId) {
+      currentSessionId = resolvedTurnSessionId;
     }
-    // If the SSE stream rendered nothing this turn (e.g. an error or a
-    // text-less reply), fall back to the server's returned text so the
-    // user isn't left with a blank response area.
-    if (!streamedTextThisTurn && data.text) {
+    const viewingTurn = currentSessionId === resolvedTurnSessionId;
+    if (viewingTurn && typeof loadArtifactsForSession === 'function') {
+      await loadArtifactsForSession(resolvedTurnSessionId, { rebuildCards: true, silent: true });
+    }
+    // If the SSE stream rendered nothing this turn (e.g. a text-less reply),
+    // fall back to the returned text only while still viewing this session.
+    let historySynced = false;
+    if (viewingTurn && runningTurnNeedsHistorySync) {
+      historySynced = await syncViewedSessionHistory(resolvedTurnSessionId);
+      if (historySynced) runningTurnNeedsHistorySync = false;
+    }
+    if (viewingTurn && !historySynced && !streamedTextThisTurn && data.text) {
       addMessage('assistant', data.text);
     }
+    if (viewingTurn && data.stopped) showToast('Turn stopped');
     await loadSessions();
   } catch (e) {
-    showError(e.message || 'The request failed.');
+    const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
+    if (viewingTurn) showError(e.message || 'The request failed.');
+    else showToast('Background turn failed: ' + (e.message || 'request failed'));
   } finally {
-    // The POST resolving is the definitive end-of-turn signal: clear any
-    // lingering status/thinking/stream even if the SSE turn_end never
-    // arrived (a 5-minute idle stream can drop before emitting it).
-    finishUserTurn();
+    // The POST resolving is the definitive end-of-turn signal. Never let a
+    // background turn's cleanup mutate the transcript currently being viewed.
+    const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
+    if (viewingTurn) finishUserTurn();
     setTurnRunning(false);
+    runningTurnNeedsHistorySync = false;
     updateSendBtn();
     loadSessionStatsbar();
-    if (queuedTurns.length && !drainingQueuedTurns) setTimeout(drainQueuedTurns, 0);
+    if (queuedTurns.length && !drainingQueuedTurns) {
+      if (!queuedSessionId || currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
+      else showToast('Queued messages are waiting in the completed session');
+    }
   }
 }
 
@@ -1466,6 +1905,7 @@ function messageText(content) {
 // tool_use_id, name, input} blocks; the following user message carries
 // {type:'tool_result', tool_use_id, content, is_error?} blocks.
 function renderHistoryMessages(history) {
+  queueMicrotask(() => restoreTodoPlanFromHistory(history));
   const area = document.getElementById('chatArea');
   area.innerHTML = '';
   let i = 0;
@@ -2158,13 +2598,13 @@ function openSessionFinder() {
 
 async function renameCurrentSessionFromCommand(title) {
   if (!currentSessionId) { showToast('Open a session before renaming it'); return false; }
-  const next = (title || prompt('Rename session', document.getElementById('topbarTitle').textContent || '') || '').trim();
+  const current = sessions.find(session => session.id === currentSessionId);
+  const next = (title || prompt('Rename session', current ? current.title : '') || '').trim();
   if (!next) return false;
   try {
     const res = await fetch('/api/sessions/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: currentSessionId, title: next }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'rename: ' + res.status);
-    document.getElementById('topbarTitle').textContent = data.title || next;
     await loadSessions();
     showToast('Session renamed');
     return true;
@@ -2406,6 +2846,10 @@ async function confirmComposerAction(event) {
 }
 
 function handleKeydown(e) {
+  // WebKit can report keyCode 229 while an IME candidate is being committed.
+  // Let the input method consume Enter and navigation keys without sending.
+  if (e.isComposing || e.keyCode === 229) return;
+
   const menuOpen = commandMatches.length > 0 && document.getElementById('commandMenu').style.display !== 'none';
   if (menuOpen && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
     e.preventDefault();
@@ -2695,21 +3139,21 @@ const PERMISSION_LABELS = {
   bypassPermissions: 'Bypass Permissions',
 };
 const PERMISSION_DESCS = {
-  default: 'Ask before every tool call',
-  acceptEdits: 'Auto-accept file edits, ask for everything else',
+  default: 'Allow read-only work; ask before changes',
+  acceptEdits: 'Auto-accept file edits; ask before other state changes',
   plan: 'Explore and plan first; no changes without approval',
-  dontAsk: 'Run everything without prompting (be careful)',
-  bypassPermissions: 'Skip all permission checks entirely',
+  dontAsk: 'Never prompt: allow pre-approved and read-only work, deny the rest',
+  bypassPermissions: 'Auto-approve ordinary tool calls; critical destructive checks remain',
 };
 const PERMISSION_LABELS_ZH = {
   default: '默认确认', acceptEdits: '自动接受编辑', plan: '计划模式', dontAsk: '不询问', bypassPermissions: '跳过权限检查',
 };
 const PERMISSION_DESCS_ZH = {
-  default: '每次工具调用前询问',
-  acceptEdits: '自动接受文件编辑，其他操作继续询问',
+  default: '只读操作直接执行，修改前询问',
+  acceptEdits: '自动接受文件编辑，其他状态变更继续询问',
   plan: '先探索和规划，未经确认不修改',
-  dontAsk: '不弹出确认直接执行，请谨慎使用',
-  bypassPermissions: '完全跳过权限检查',
+  dontAsk: '从不弹窗：只执行已允许和只读操作，其余直接拒绝',
+  bypassPermissions: '普通工具调用自动执行，严重破坏性操作仍会拦截',
 };
 
 function syncApprovalChip(mode) {

@@ -1087,6 +1087,17 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	out = append(out, keepLast...)
 	out = c.EnforcePostCompactBudget(out)
 	postTokens := estimateTokens(out)
+	// A retained base64 screenshot can dwarf the entire textual checkpoint
+	// (one real Desktop report stayed at ~226K tokens after its text had been
+	// reduced to a few KB). Keep recent images during ordinary work, but once a
+	// full checkpoint still exceeds the post-compact budget, replace every
+	// remaining image payload with a recoverable/reattach sentinel.
+	if postTokens >= PostCompactTokenBudget {
+		if pruned, count := PruneAllImages(out); count > 0 {
+			out = pruned
+			postTokens = estimateTokens(out)
+		}
+	}
 	cap := c.effectiveInputCap()
 	if postTokens >= PostCompactTokenBudget || (cap > 0 && postTokens >= cap) {
 		if guarded := c.SnipAll(out); estimateTokens(guarded) < postTokens {
