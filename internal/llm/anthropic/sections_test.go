@@ -81,6 +81,24 @@ func TestBuildSystemBlocksFromSections_MarksEndOfStableRun(t *testing.T) {
 	}
 }
 
+func TestBuildSystemBlocksFromSections_RuntimeSnapshotExtendsStablePrefix(t *testing.T) {
+	secs := []SystemSection{
+		{Name: "base", Body: "base", Cache: true},
+		{Name: "runtime_state", Body: "permission_mode: default", Cache: true},
+		{Name: "memory", Body: "changing memory", Volatile: true},
+	}
+	out := BuildSystemBlocksFromSections(secs)
+	if out[0].CacheControl != nil {
+		t.Fatal("base marker should be delayed through the stable runtime snapshot")
+	}
+	if out[1].CacheControl == nil {
+		t.Fatal("runtime snapshot must close the reusable stable prefix")
+	}
+	if out[2].CacheControl != nil {
+		t.Fatal("volatile memory must stay outside the runtime-state breakpoint")
+	}
+}
+
 func TestBuildSystemBlocksFromSections_UsesTwoStableRunBoundaries(t *testing.T) {
 	secs := []SystemSection{
 		{Name: "identity", Body: "identity", Cache: true},

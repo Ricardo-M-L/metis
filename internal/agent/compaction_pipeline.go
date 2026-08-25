@@ -394,6 +394,10 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		durableIdentity = liveIdentity
 	}
 
+	// The history prefix was replaced. Force the next provider request (and
+	// any fork snapshot taken before it) to publish one complete runtime-state
+	// section even when the semantic fields themselves are unchanged.
+	l.InvalidateRuntimeState()
 	result.Applied = true
 	setResultHistory(final)
 	// Drain progress before publishing the applied checkpoint. Besides making

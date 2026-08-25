@@ -169,20 +169,23 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	if opts.Gate != nil && string(opts.Gate.Mode()) == string(permission.ModePlan) {
 		loop.SetPlanMode(true)
 	}
-	// Rebuild authoritative runtime state on every provider request. These
-	// facts intentionally live outside conversation Messages so a compaction
-	// checkpoint cannot make permission mode, cwd or the current plan stale.
-	loop.CurrentStateSections = func() []llm.SystemSection {
-		var body strings.Builder
-		body.WriteString("<runtime_state>\n")
+	// Project authoritative runtime facts on every request, but leave change
+	// detection and rendering to Loop. The comparable snapshot is cheap to
+	// rebuild; unchanged values reuse the prior byte-identical section instead
+	// of manufacturing a fresh volatile prompt tail.
+	loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+		// Provider/model are filled from Loop's live fields at request time so a
+		// runtime model switch cannot be masked by boot-time closure values.
+		state := agent.RuntimeStateSnapshot{}
 		if opts.Gate != nil {
-			fmt.Fprintf(&body, "permission_mode: %s\n", opts.Gate.Mode())
+			state.PermissionMode = string(opts.Gate.Mode())
 		}
-		if cwd, err := os.Getwd(); err == nil && cwd != "" {
-			fmt.Fprintf(&body, "working_directory: %s\n", cwd)
+		if cwd, err := os.Getwd(); err == nil {
+			state.WorkingDirectory = cwd
 		}
-		if sessionID := CurrentSessionID(); sessionID != "" {
-			if plan, err := ReadCurrentPlan(sessionID); err == nil {
+		state.SessionID = CurrentSessionID()
+		if state.SessionID != "" {
+			if plan, err := ReadCurrentPlan(state.SessionID); err == nil {
 				plan = strings.TrimSpace(plan)
 				if plan != "" && plan != strings.TrimSpace(emptyCurrentPlan) {
 					const maxPlanRunes = 32_000
@@ -190,16 +193,11 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 					if len(runes) > maxPlanRunes {
 						plan = string(runes[:maxPlanRunes]) + "\n[plan truncated for request state]"
 					}
-					body.WriteString("<current_plan>\n")
-					body.WriteString(plan)
-					body.WriteString("\n</current_plan>\n")
+					state.CurrentPlan = plan
 				}
 			}
 		}
-		body.WriteString("</runtime_state>")
-		return []llm.SystemSection{{
-			Name: "runtime_state", Body: body.String(), Volatile: true,
-		}}
+		return state
 	}
 
 	// Memory manager — persistent recall across sessions. Caller can

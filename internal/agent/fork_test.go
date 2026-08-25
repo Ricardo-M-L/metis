@@ -360,6 +360,10 @@ func TestSnapshotForFork_HappyPath(t *testing.T) {
 	reg := newRegistryWith(t, forkFakeTool{name: "x"})
 	loop := NewLoop(prov, reg, nil, nil, "you are helpful", 10)
 	loop.Model = "claude-test"
+	loop.SystemSections = []llm.SystemSection{{Name: "base", Body: "you are helpful", Cache: true}}
+	loop.CurrentStateSnapshot = func() RuntimeStateSnapshot {
+		return RuntimeStateSnapshot{PermissionMode: "default", SessionID: "parent-session"}
+	}
 	loop.AppendUser("hello")
 	snap := SnapshotForFork(loop)
 	if snap == nil {
@@ -373,6 +377,40 @@ func TestSnapshotForFork_HappyPath(t *testing.T) {
 	}
 	if len(snap.PrefixMessages) == 0 {
 		t.Errorf("PrefixMessages should include the user message")
+	}
+	state := sectionNamed(t, snap.SystemSections, "runtime_state")
+	if !state.Cache || state.Volatile || !strings.Contains(state.Body, "provider: scripted") || !strings.Contains(state.Body, "model: claude-test") {
+		t.Fatalf("fork runtime snapshot = %+v", state)
+	}
+	// The child owns an independent slice; changing it cannot corrupt the
+	// parent loop's prompt layout.
+	snap.SystemSections[0].Body = "child-only mutation"
+	if loop.SystemSections[0].Body != "you are helpful" {
+		t.Fatal("fork snapshot shares mutable SystemSections with parent")
+	}
+}
+
+func TestRunForkedAgent_PreservesTypedRuntimeStateSections(t *testing.T) {
+	prov := &scriptedProvider{resps: []*llm.Response{{StopReason: "end_turn"}}}
+	state := llm.SystemSection{Name: "runtime_state", Body: "<runtime_state>stable</runtime_state>", Cache: true}
+	_, err := RunForkedAgent(context.Background(), ForkedAgentParams{
+		Cache: CacheSafeParams{
+			Provider:       prov,
+			Model:          "test",
+			SystemSections: []llm.SystemSection{state},
+		},
+		Prompt:     "verify",
+		CanUseTool: AllowAll,
+		Registry:   newRegistryWith(t),
+	})
+	if err != nil {
+		t.Fatalf("RunForkedAgent: %v", err)
+	}
+	if len(prov.calls) != 1 || len(prov.calls[0].SystemSections) != 1 {
+		t.Fatalf("fork request lost typed sections: %+v", prov.calls)
+	}
+	if got := prov.calls[0].SystemSections[0]; got != state {
+		t.Fatalf("fork request section = %+v, want %+v", got, state)
 	}
 }
 

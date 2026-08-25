@@ -59,11 +59,20 @@ type Loop struct {
 	// updates don't invalidate the addendum cache. nil → fall back to
 	// the System string + boundary-marker parsing path.
 	SystemSections []llm.SystemSection
-	// CurrentStateSections rebuilds authoritative volatile state for every
-	// request (permission posture, current plan, active runtime metadata).
-	// Because this state lives outside Messages, compaction can aggressively
-	// replace chat history without freezing a stale snapshot into the summary.
+	// CurrentStateSnapshot reads authoritative mutable state. buildRequest
+	// compares the structured value with the last session baseline and only
+	// re-renders the runtime section when a field actually changes. The exact
+	// same bytes are reused on unchanged iterations, preserving provider prompt
+	// cache prefixes without letting permission/cwd/plan metadata go stale.
+	CurrentStateSnapshot func() RuntimeStateSnapshot
+	// CurrentStateSections is the legacy section callback retained for
+	// embedders. Runtime wiring uses CurrentStateSnapshot; legacy sections stay
+	// volatile because their semantic stability cannot be proven.
 	CurrentStateSections func() []llm.SystemSection
+	runtimeStateSnapshot RuntimeStateSnapshot
+	runtimeStateBody     string
+	runtimeStateReady    bool
+	runtimeStateRevision uint64
 	Model                string
 	MaxIters             int
 	GraceCalls           int
@@ -869,6 +878,7 @@ func (l *Loop) Reset() {
 	l.historyRevision++
 	l.autoCompactSessionGeneration++
 	l.clearAutoCompactPressureLocked()
+	l.invalidateRuntimeStateLocked()
 	l.compactCircuitNoticeSent = false
 	l.contract.reset()
 	if l.Compactor != nil {
@@ -948,6 +958,7 @@ func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
 	l.historyRevision++
 	l.autoCompactSessionGeneration++
 	l.clearAutoCompactPressureLocked()
+	l.invalidateRuntimeStateLocked()
 }
 
 // ResetSession crosses a top-level chat-session boundary. Unlike Restore,
@@ -2155,7 +2166,7 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 	}
 
 	if len(l.SystemSections) > 0 {
-		sections = make([]llm.SystemSection, 0, len(l.SystemSections)+3)
+		sections = make([]llm.SystemSection, 0, len(l.SystemSections)+4)
 		for _, section := range l.SystemSections {
 			if section.Name != "plan_mode" {
 				sections = append(sections, section)
@@ -2164,6 +2175,14 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 		if l.planMode && planPrompt != "" {
 			sections = append(sections, llm.SystemSection{
 				Name: "plan_mode", Body: planPrompt, Cache: false, Volatile: true,
+			})
+		}
+		// Runtime state changes far less often than memory/retrieval output.
+		// Place its byte-stable snapshot before those volatile tails so an
+		// unchanged permission/cwd/plan prefix remains reusable.
+		if state, ok := l.currentRuntimeStateSectionLocked(); ok {
+			sections = append(sections, llm.SystemSection{
+				Name: "runtime_state", Body: state.body, Cache: true,
 			})
 		}
 		if memBody != "" {
@@ -2182,10 +2201,15 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 				Volatile: true,
 			})
 		}
-	} else if memBody != "" || retrieveBody != "" {
-		// Legacy (string-only) path: append both bodies the old way so
-		// the boundary-marker parser still produces [base (cached),
-		// rest]. Cache for `rest` is lost but the base prefix still hits.
+	} else {
+		// Legacy (string-only) path keeps the same semantic snapshot, but
+		// cannot express per-section cache policy on the wire.
+		if state, ok := l.currentRuntimeStateSectionLocked(); ok {
+			if system != "" {
+				system += "\n\n"
+			}
+			system += state.body
+		}
 		if memBody != "" {
 			system = system + "\n\n" + memBody
 		}
@@ -2193,7 +2217,7 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 			system = system + "\n\n" + retrieveBody
 		}
 	}
-	if l.CurrentStateSections != nil {
+	if l.CurrentStateSnapshot == nil && l.CurrentStateSections != nil {
 		dynamic := l.CurrentStateSections()
 		if len(dynamic) > 0 {
 			if len(sections) > 0 {

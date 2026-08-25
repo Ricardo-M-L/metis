@@ -132,6 +132,105 @@ func TestBuildRequest_ReinjectsCurrentStateAfterHistoryReplacement(t *testing.T)
 	}
 }
 
+func TestBuildRequest_ReusesStructuredRuntimeSnapshotUntilStateChanges(t *testing.T) {
+	state := RuntimeStateSnapshot{
+		PermissionMode:   "default",
+		WorkingDirectory: "/work/project",
+		SessionID:        "session-a",
+		CurrentPlan:      "ship the cache fix",
+	}
+	calls := 0
+	l := &Loop{
+		System: "BASE",
+		SystemSections: []llm.SystemSection{
+			{Name: "base", Body: "BASE", Cache: true},
+		},
+		Model: "model-a",
+		CurrentStateSnapshot: func() RuntimeStateSnapshot {
+			calls++
+			return state
+		},
+	}
+
+	first := l.buildRequest(nil)
+	second := l.buildRequest(nil)
+	firstState := sectionNamed(t, first.SystemSections, "runtime_state")
+	secondState := sectionNamed(t, second.SystemSections, "runtime_state")
+	if calls != 2 {
+		t.Fatalf("authoritative state reads = %d, want 2", calls)
+	}
+	if l.runtimeStateRevision != 1 {
+		t.Fatalf("unchanged state rendered %d times, want 1", l.runtimeStateRevision)
+	}
+	if firstState.Body != secondState.Body {
+		t.Fatal("unchanged state did not reuse byte-identical body")
+	}
+	if !firstState.Cache || firstState.Volatile {
+		t.Fatalf("structured runtime state must be stable/cacheable: %+v", firstState)
+	}
+	if !contains(firstState.Body, "model: model-a") || !contains(firstState.Body, "plan_mode: false") {
+		t.Fatalf("runtime-owned fields missing: %q", firstState.Body)
+	}
+
+	state.PermissionMode = "bypassPermissions"
+	third := l.buildRequest(nil)
+	thirdState := sectionNamed(t, third.SystemSections, "runtime_state")
+	if l.runtimeStateRevision != 2 {
+		t.Fatalf("changed state revision = %d, want 2", l.runtimeStateRevision)
+	}
+	if thirdState.Body == secondState.Body || !contains(thirdState.Body, "bypassPermissions") {
+		t.Fatalf("changed state was not rendered: %q", thirdState.Body)
+	}
+}
+
+func TestBuildRequest_RuntimeSnapshotRefreshesAfterRestoreAndPlanChange(t *testing.T) {
+	l := &Loop{
+		System: "BASE",
+		SystemSections: []llm.SystemSection{
+			{Name: "base", Body: "BASE", Cache: true},
+		},
+		CurrentStateSnapshot: func() RuntimeStateSnapshot {
+			return RuntimeStateSnapshot{PermissionMode: "default"}
+		},
+	}
+	_ = l.buildRequest(nil)
+	if l.runtimeStateRevision != 1 {
+		t.Fatalf("initial revision = %d, want 1", l.runtimeStateRevision)
+	}
+
+	l.Restore([]llm.Message{{
+		Role:    llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: "text", Text: "restored"}},
+	}})
+	restored := l.buildRequest(nil)
+	if l.runtimeStateRevision != 2 {
+		t.Fatalf("restore did not force a full snapshot: revision=%d", l.runtimeStateRevision)
+	}
+
+	l.SetPlanMode(true)
+	planned := l.buildRequest(nil)
+	if l.runtimeStateRevision != 3 {
+		t.Fatalf("plan change revision = %d, want 3", l.runtimeStateRevision)
+	}
+	if !contains(sectionNamed(t, planned.SystemSections, "runtime_state").Body, "plan_mode: true") {
+		t.Fatal("plan mode was not projected into runtime state")
+	}
+	if sectionNamed(t, restored.SystemSections, "runtime_state").Body == sectionNamed(t, planned.SystemSections, "runtime_state").Body {
+		t.Fatal("plan transition reused stale runtime-state bytes")
+	}
+}
+
+func sectionNamed(t *testing.T, sections []llm.SystemSection, name string) llm.SystemSection {
+	t.Helper()
+	for _, section := range sections {
+		if section.Name == name {
+			return section
+		}
+	}
+	t.Fatalf("section %q not found in %+v", name, sections)
+	return llm.SystemSection{}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {

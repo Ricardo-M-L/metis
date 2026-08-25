@@ -48,6 +48,10 @@ type CacheSafeParams struct {
 	// Loop.System + Memory.BuildContext output, concatenated). Must
 	// match exactly to share cache.
 	System string
+	// SystemSections preserves the parent's typed prompt layout, including the
+	// independent runtime-state baseline. Each snapshot owns its slice so a
+	// fork cannot observe later parent mutations.
+	SystemSections []llm.SystemSection
 
 	// ToolSpecs is the parent's tool list at fork time. Order matters —
 	// metis already sorts via Registry.SortedForCache(), but if the
@@ -90,11 +94,43 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 	if loop == nil || loop.Provider == nil {
 		return nil
 	}
-	loop.mu.RLock()
+	loop.mu.Lock()
 	system := loop.System
-	if loop.Memory != nil {
-		if memCtx := loop.Memory.BuildContext(); memCtx != "" {
-			system = system + "\n\n" + memCtx
+	sections := make([]llm.SystemSection, 0, len(loop.SystemSections)+3)
+	if len(loop.SystemSections) > 0 {
+		for _, section := range loop.SystemSections {
+			if section.Name != "plan_mode" {
+				sections = append(sections, section)
+			}
+		}
+		if loop.planMode && loop.PlanSystemPrompt != "" {
+			sections = append(sections, llm.SystemSection{
+				Name: "plan_mode", Body: loop.PlanSystemPrompt, Volatile: true,
+			})
+		}
+		if state, ok := loop.currentRuntimeStateSectionLocked(); ok {
+			sections = append(sections, llm.SystemSection{
+				Name: "runtime_state", Body: state.body, Cache: true,
+			})
+		}
+		if loop.Memory != nil {
+			if memCtx := loop.Memory.BuildContext(); memCtx != "" {
+				sections = append(sections, llm.SystemSection{
+					Name: "memory", Body: memCtx, Volatile: true,
+				})
+			}
+		}
+	} else {
+		if loop.planMode && loop.PlanSystemPrompt != "" {
+			system += "\n\n" + loop.PlanSystemPrompt
+		}
+		if state, ok := loop.currentRuntimeStateSectionLocked(); ok {
+			system += "\n\n" + state.body
+		}
+		if loop.Memory != nil {
+			if memCtx := loop.Memory.BuildContext(); memCtx != "" {
+				system += "\n\n" + memCtx
+			}
 		}
 	}
 	prefix := append([]llm.Message(nil), loop.Messages...)
@@ -102,7 +138,7 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 	// Effort has its own lock and may change while the parent snapshot is
 	// assembled; capture one valid value for the fork.
 	effort := loop.EffortValue()
-	loop.mu.RUnlock()
+	loop.mu.Unlock()
 
 	// Pre-emptive prefix snip — applies the post-compact budget cap
 	// to every tool_result in the prefix so the fork doesn't inherit
@@ -115,6 +151,7 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 
 	return &CacheSafeParams{
 		System:         system,
+		SystemSections: append([]llm.SystemSection(nil), sections...),
 		ToolSpecs:      loop.toolSpecs(), // already cache-stable order
 		PrefixMessages: prefix,
 		Model:          model,
@@ -310,12 +347,13 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 		}
 
 		req := llm.Request{
-			Model:     p.Cache.Model,
-			System:    p.Cache.System,
-			Tools:     p.Cache.ToolSpecs,
-			Messages:  append([]llm.Message(nil), msgs...),
-			Effort:    p.Cache.Effort,
-			MaxTokens: p.MaxTokens,
+			Model:          p.Cache.Model,
+			System:         p.Cache.System,
+			SystemSections: append([]llm.SystemSection(nil), p.Cache.SystemSections...),
+			Tools:          p.Cache.ToolSpecs,
+			Messages:       append([]llm.Message(nil), msgs...),
+			Effort:         p.Cache.Effort,
+			MaxTokens:      p.MaxTokens,
 		}
 		resp, err := p.Cache.Provider.Complete(ctx, req)
 		if err != nil && ClassifyError(err) == ErrContextOverflow {

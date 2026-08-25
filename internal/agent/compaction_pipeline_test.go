@@ -57,6 +57,42 @@ func TestCompactNow_AllTriggersShareOneRetentionPipeline(t *testing.T) {
 	}
 }
 
+func TestCompactNow_InvalidatesRuntimeSnapshotAfterAppliedReplacement(t *testing.T) {
+	p := &fakeSummarizer{}
+	cfg := DefaultCompactionConfig()
+	cfg.MaxSummarizeInputTokens = 0
+	loop := &Loop{
+		Compactor: NewCompactor(cfg, "test", 2_000, p),
+		Model:     "test",
+		Messages:  unifiedPipelineHistory(),
+		SystemSections: []llm.SystemSection{
+			{Name: "base", Body: "BASE", Cache: true},
+		},
+		CurrentStateSnapshot: func() RuntimeStateSnapshot {
+			return RuntimeStateSnapshot{PermissionMode: "default"}
+		},
+	}
+	_ = loop.buildRequest(nil)
+	if loop.runtimeStateRevision != 1 || !loop.runtimeStateReady {
+		t.Fatalf("precondition: revision=%d ready=%v", loop.runtimeStateRevision, loop.runtimeStateReady)
+	}
+
+	result, err := loop.CompactNow(context.Background(), CompactOptions{Trigger: "manual", Force: true})
+	if err != nil {
+		t.Fatalf("CompactNow: %v", err)
+	}
+	if !result.Applied {
+		t.Fatal("forced compaction did not apply")
+	}
+	if loop.runtimeStateReady {
+		t.Fatal("applied compaction retained a stale runtime-state baseline")
+	}
+	_ = loop.buildRequest(nil)
+	if loop.runtimeStateRevision != 2 {
+		t.Fatalf("post-compact revision=%d, want full refresh revision 2", loop.runtimeStateRevision)
+	}
+}
+
 func TestCompactNow_AutoDecisionCannotBeCancelledByShallowTrim(t *testing.T) {
 	p := &fakeSummarizer{}
 	cfg := DefaultCompactionConfig()
