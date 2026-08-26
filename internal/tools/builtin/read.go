@@ -46,7 +46,7 @@ Hard requirements:
   - ` + "`path`" + ` MUST be absolute. Relative paths are rejected.
   - File size cap is 256 MiB; oversized files return an error directing you to ` + "`Bash head/tail`" + ` for a peek.
 
-After Read, the path is "read" for the session: subsequent Edit/Write on that path will work, AND will be refused if the file changed on disk between Read and Edit/Write. If you want to edit a partial-view file (offset != 1 or hit the limit), Read it again fully first — otherwise Edit refuses to mutate regions you never saw.
+After Read, the path is "read" for the session: subsequent Edit/Write on that path will be refused if the file changed on disk. A targeted Edit may replace one exact unique string after a partial view because it preserves every other byte and verifies the full-file hash. A full-file Write still requires a complete Read first.
 
 ## Examples
 
@@ -272,10 +272,10 @@ func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// saw mid-stream.
 	//
 	// The view classifier flags partial reads (offset != 1, or hit the
-	// limit before EOF). Edit/Write refuse on partial-view entries:
-	// the model would otherwise rewrite regions of the file it never
-	// saw and silently lose those bytes. The hash we record is still
-	// over the FULL file — what the LLM saw is partial, but the
+	// limit before EOF). A full-file Write refuses partial-view entries;
+	// targeted Edit remains safe because it replaces an exact unique string
+	// and validates this full-file hash before touching the file. The hash we
+	// record is over the FULL file — what the LLM saw is partial, but the
 	// staleness check needs whole-file ground truth.
 	if r.state != nil {
 		if data, rerr := os.ReadFile(path); rerr == nil {

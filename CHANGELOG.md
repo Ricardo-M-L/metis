@@ -7,6 +7,37 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.31] - 2026-08-26
+
+### Added
+
+- The macOS Desktop release now includes a Developer ID signed and Apple
+  notarized DMG with an Applications shortcut; the verified ZIP remains
+  available for atomic in-app updates.
+
+### Changed
+
+- Long TUI tool commands are constrained by terminal cell width while keeping
+  both the command prefix and target tail visible, including CJK paths.
+- Exact targeted Edit operations may follow a partial Read while retaining the
+  whole-file stale-write hash guard; full-file Write still requires a complete
+  Read.
+- Short bounded process-start waits such as `sleep 3` are allowed; only bare
+  polling waits of 10 seconds or more trigger the sleep-pattern guard.
+- Desktop's update affordance uses a Codex-style download glyph and blue
+  available-update state.
+
+### Fixed
+
+- Context percentages are clamped to 0-100 across Desktop and TUI surfaces,
+  while exact estimated token pressure remains available in details.
+- Desktop recovers the authoritative running session after reload and opens
+  other transcripts read-only instead of requiring the active turn to stop.
+- Internal runtime envelopes such as `<system-reminder>` are no longer exposed
+  as user-visible Desktop transcript messages when echoed by a model.
+- Inline Markdown code keeps its red foreground without the inconsistent grey
+  background badge.
+
 ## [0.4.30] - 2026-08-26
 
 ### Fixed

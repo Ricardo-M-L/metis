@@ -545,10 +545,12 @@ func TestRunningTurnCanBeViewedInBackgroundAndStoppedBySession(t *testing.T) {
 
 	sessions := get("/sessions.js")
 	for _, want := range []string{
-		"const viewOnly = typeof turnRunning !== 'undefined' && turnRunning;",
+		"let viewOnly = typeof turnRunning !== 'undefined' && turnRunning;",
 		"'/api/sessions/' + encodeURIComponent(id)",
 		"detachRunningTurnView();",
 		"s.id === runningSessionId",
+		"if (!viewOnly && res.status === 409)",
+		"conflict.runningSessionId",
 	} {
 		if !strings.Contains(sessions, want) {
 			t.Fatalf("sessions.js missing background-view contract %q", want)
@@ -556,6 +558,33 @@ func TestRunningTurnCanBeViewedInBackgroundAndStoppedBySession(t *testing.T) {
 	}
 	if strings.Contains(sessions, "Stop the current turn before switching sessions") {
 		t.Fatal("session navigation still blocks while another turn is running")
+	}
+	app := get("/app.js")
+	for _, want := range []string{
+		"Math.min(100, Math.round(fraction * 100))",
+		"const statusRunning = !!d.turnRunning",
+		"setTurnRunning(statusRunning, statusSession)",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("app.js missing authoritative context/turn status contract %q", want)
+		}
+	}
+	chat = get("/chat.js")
+	for _, want := range []string{
+		"function visibleTranscriptText(value)",
+		"INTERNAL_TRANSCRIPT_SECTION_RE",
+		"formatContent(visibleTranscriptText(streamingText))",
+		"Math.min(100, Math.round(used / limit * 100))",
+	} {
+		if !strings.Contains(chat, want) {
+			t.Fatalf("chat.js missing internal-message redaction contract %q", want)
+		}
+	}
+	index := get("/index.html")
+	for _, want := range []string{"M8 2.25v7.2", "m5.35 7.15 2.65 2.7 2.65-2.7"} {
+		if !strings.Contains(index, want) {
+			t.Fatalf("update button is missing Codex-style download glyph path %q", want)
+		}
 	}
 }
 

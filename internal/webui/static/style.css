@@ -4030,20 +4030,13 @@ html, body { font-size: var(--font-base); }
 .sb-update:focus-visible { box-shadow: var(--shadow-focus); }
 .sb-update.checking svg { animation: update-spin 900ms linear infinite; }
 .sb-update.unsupported { opacity: .52; }
-.sb-update-dot {
-  position: absolute;
-  top: 5px;
-  right: 5px;
-  width: 7px;
-  height: 7px;
-  border: 1.5px solid var(--bg-inset);
+.sb-update.available {
   border-radius: 50%;
-  background: var(--ok);
-  opacity: 0;
-  transform: scale(.6);
-  transition: opacity var(--transition-fast), transform var(--transition-fast);
+  background: #2f9df4;
+  color: #fff;
+  box-shadow: 0 1px 5px rgba(47,157,244,.34);
 }
-.sb-update.available .sb-update-dot { opacity: 1; transform: scale(1); }
+.sb-update.available:hover, .sb-update.available:focus-visible { background: #49aaf7; color: #fff; }
 @keyframes update-spin { to { transform: rotate(360deg); } }
 
 /* ---- Think row: borderless DSH ReasoningRow (24px disclosure) ---- */

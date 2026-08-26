@@ -974,6 +974,23 @@ func TestStopTargetsRunningSessionAndReturnsCleanStoppedTurn(t *testing.T) {
 		t.Fatal("turn did not start")
 	}
 
+	status := httptest.NewRecorder()
+	h.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if status.Code != http.StatusOK || !bytes.Contains(status.Body.Bytes(), []byte(`"turnRunning":true`)) ||
+		!bytes.Contains(status.Body.Bytes(), []byte(`"runningSessionId":"`+id+`"`)) {
+		t.Fatalf("running status = %d: %s", status.Code, status.Body.String())
+	}
+
+	if err := store.WriteHeaderFull(session.Header{ID: "view-another-session", Provider: "wire", Model: "model", System: "system", Status: "idle"}); err != nil {
+		t.Fatal(err)
+	}
+	switchAttempt := httptest.NewRecorder()
+	h.ServeHTTP(switchAttempt, httptest.NewRequest(http.MethodPost, "/api/sessions/activate", bytes.NewBufferString(`{"id":"view-another-session"}`)))
+	if switchAttempt.Code != http.StatusConflict || !bytes.Contains(switchAttempt.Body.Bytes(), []byte(`"turnRunning":true`)) ||
+		!bytes.Contains(switchAttempt.Body.Bytes(), []byte(`"runningSessionId":"`+id+`"`)) {
+		t.Fatalf("running session activation conflict = %d: %s", switchAttempt.Code, switchAttempt.Body.String())
+	}
+
 	wrong := httptest.NewRecorder()
 	h.ServeHTTP(wrong, httptest.NewRequest(http.MethodPost, "/api/stop", bytes.NewBufferString(`{"sessionId":"another-session"}`)))
 	if wrong.Code != http.StatusConflict {

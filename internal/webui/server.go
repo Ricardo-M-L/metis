@@ -1045,7 +1045,14 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.runMu.TryLock() {
-		writeError(w, http.StatusConflict, "a turn is running; stop it before switching sessions")
+		s.cancelMu.Lock()
+		runningSessionID := s.runningSession
+		s.cancelMu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":            "a turn is running; opening the requested session read-only",
+			"turnRunning":      true,
+			"runningSessionId": runningSessionID,
+		})
 		return
 	}
 	defer s.runMu.Unlock()
@@ -2178,13 +2185,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			compactAtTokens = s.loop.Compactor.TriggerTokens()
 		}
 	}
+	s.cancelMu.Lock()
+	runningSessionID := s.runningSession
+	turnRunning := s.turnDone != nil && runningSessionID != ""
+	s.cancelMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
 		"agents": agentDetails, "jobs": jobDetails,
 		"toolCount": len(toolNames), "tools": toolNames,
 		"contextUsed": contextUsed, "contextWindow": contextWindow, "compactThreshold": compactThreshold,
 		"compactAtTokens": compactAtTokens,
-		"build":           s.buildVersion,
+		"turnRunning":     turnRunning, "runningSessionId": runningSessionID,
+		"build": s.buildVersion,
 	})
 }
 

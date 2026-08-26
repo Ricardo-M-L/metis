@@ -15,8 +15,8 @@ import (
 //  1. the on-disk contents drifted between the model's mental snapshot
 //     and the write (mtime / hash check), or
 //  2. the snapshot itself was partial (offset/limit truncated the
-//     view). Editing under (2) is unsafe — the model may rewrite a
-//     region of the file it never saw, silently losing those bytes.
+//     view). Full-file overwrite under (2) is unsafe; an exact targeted
+//     replacement remains safe when the whole-file hash still matches.
 //
 // Mirrors claude-code's readFileState in tools/FileEditTool/utils.ts
 // + fileTracker.ts. The check sits between the staleness Read
@@ -62,7 +62,7 @@ type ReadEntry struct {
 	// future cache decisions can size the entry without re-statting.
 	Size int64
 	// Offset / Limit / IsPartialView record how Read sliced the file.
-	// IsPartialView fires Edit/Write's "re-Read first" guard.
+	// IsPartialView fires Write's "re-Read first" guard; Edit still uses Hash.
 	Offset        int
 	Limit         int
 	IsPartialView bool
@@ -104,9 +104,9 @@ func (s *ReadFileState) Record(path string, mtime time.Time, content []byte) {
 }
 
 // RecordPartial records a truncated snapshot — the model only saw
-// lines [offset, offset+limit). Edit/Write will refuse on this entry
-// until a full Read replaces it; otherwise a write could overwrite
-// regions of the file the model never observed.
+// lines [offset, offset+limit). Write will refuse on this entry until a full
+// Read replaces it; targeted Edit may proceed only while the full-file hash
+// below still matches.
 //
 // content here is still the FULL file bytes (used for the hash
 // staleness check); offset/limit describe what the LLM was shown.

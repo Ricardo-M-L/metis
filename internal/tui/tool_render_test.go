@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	xansi "github.com/charmbracelet/x/ansi"
 )
 
 // TestSummarizeToolResult_PerTool locks in the per-tool summary phrasing
@@ -514,6 +516,27 @@ func TestTruncateMiddle_ShortLeavesUntouched(t *testing.T) {
 	in := "stat /tmp/x: no such file"
 	if got := truncateMiddle(in, 120); got != in {
 		t.Errorf("short input mutated:\n  in:  %q\n  out: %q", in, got)
+	}
+}
+
+func TestToolLeaderLongCommandFitsViewportAndPreservesEnds(t *testing.T) {
+	const width = 80
+	te := ToolEvent{
+		Kind:     "result",
+		ToolName: "Bash",
+		Input: map[string]any{"command": "cd /Users/ricardo/Documents/公司学习文件/opensource-contributions/cordis && " +
+			"grep -n waterfall packages/core/src/events.ts packages/loader/src/index.ts; sed -n '1,220p' packages/core/src/fiber.ts"},
+		Output: "ok",
+	}
+	item := &toolEventItem{te: te}
+	first := strings.Split(stripANSI(item.Render(width)), "\n")[0]
+	if got := xansi.StringWidth(first); got > width {
+		t.Fatalf("tool leader width = %d, want <= %d: %q", got, width, first)
+	}
+	for _, want := range []string{"cd /Users", "…", "fiber.ts"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("tool leader lost %q after width truncation: %q", want, first)
+		}
 	}
 }
 

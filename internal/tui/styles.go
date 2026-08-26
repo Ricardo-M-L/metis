@@ -58,7 +58,9 @@ func MarkdownRenderer(width int) (*glamour.TermRenderer, error) {
 		width = 120
 	}
 	return glamour.NewTermRenderer(
-		glamour.WithEnvironmentConfig(),
+		// Use the same inline-code policy as the full-screen TUI: retain the
+		// code foreground colour, but never paint a grey background behind it.
+		glamour.WithStyles(metisCodeBlockStyle()),
 		glamour.WithWordWrap(width),
 	)
 }

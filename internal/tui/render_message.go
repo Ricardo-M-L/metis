@@ -400,8 +400,8 @@ func getMarkdownRenderer(width int, wide bool) *glamour.TermRenderer {
 	return r
 }
 
-// metisCodeBlockStyle returns glamour's stock dark style with all
-// red-ish chroma colours scrubbed.
+// metisCodeBlockStyle returns glamour's stock dark style with Metis-specific
+// readability fixes for inline code, fenced code, and tables.
 //
 // glamour's default dark theme paints:
 //   - chroma.Error.BackgroundColor = #F05B5B — hot-pink fill on every
@@ -421,6 +421,16 @@ func getMarkdownRenderer(width int, wide bool) *glamour.TermRenderer {
 // readable; only the bath-of-red goes away.
 func metisCodeBlockStyle() ansi.StyleConfig {
 	cfg := styles.DarkStyleConfig
+
+	// Glamour's dark theme renders inline code as red text on a grey
+	// background. Metis tables render inline code with a foreground colour
+	// only, so the same backtick span otherwise changes appearance depending
+	// on which Markdown path rendered it. Keep the red foreground but clear
+	// the background so inline code is consistent everywhere.
+	code := cfg.Code
+	code.BackgroundColor = nil
+	cfg.Code = code
+
 	chroma := *cfg.CodeBlock.Chroma
 	zero := ansi.StylePrimitive{}
 	chroma.Error = zero

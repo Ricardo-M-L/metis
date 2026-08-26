@@ -58,6 +58,15 @@ irm https://raw.githubusercontent.com/Ricardo-M-L/metis/main/install/install.ps1
 & "$env:LOCALAPPDATA\Programs\Metis\bin\metis.exe" version
 ```
 
+### Metis Desktop for macOS
+
+Download `metis-desktop-darwin-universal.dmg` from the
+[latest release](https://github.com/Ricardo-M-L/metis/releases/latest), open
+it, and drag **Metis** into **Applications**. The release also keeps the ZIP
+asset used by the verified in-app updater; users no longer need to launch the
+application directly from a ZIP extraction, which triggers macOS App
+Translocation.
+
 The Windows installer writes the stable command to
 `%LOCALAPPDATA%\Programs\Metis\bin` by default and tells you how to add
 that directory to your user `PATH` when necessary. Both installers verify

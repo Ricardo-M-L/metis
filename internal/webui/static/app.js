@@ -327,7 +327,11 @@ function renderStatusSnapshot(d) {
       const limit = Number(d.contextWindow) || 0;
       if (limit > 0) {
         const fraction = used / limit;
-        const percent = Math.max(0, Math.min(999, Math.round(fraction * 100)));
+        // Context pressure can temporarily estimate above the provider limit
+        // while compaction is running or when fixed tool/system overhead is
+        // irreducible. A progress badge must remain a percentage, not display
+        // values such as 318%; preserve the raw token counts in the tooltip.
+        const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
         const compactAtTokens = Number(d.compactAtTokens) || 0;
         const compactAt = compactAtTokens > 0
           ? compactAtTokens / limit
@@ -341,6 +345,13 @@ function renderStatusSnapshot(d) {
         meter.classList.toggle('warn', compactAt > 0 && used >= Math.max(0, compactAtTokens > 0 ? compactAtTokens * 0.9 : limit * (compactAt - 0.1)));
       } else {
         meter.style.display = 'none';
+      }
+    }
+    if (typeof setTurnRunning === 'function') {
+      const statusRunning = !!d.turnRunning;
+      const statusSession = String(d.runningSessionId || '');
+      if (statusRunning !== turnRunning || (statusRunning && statusSession && statusSession !== runningSessionId)) {
+        setTurnRunning(statusRunning, statusSession);
       }
     }
   } catch (_) { /* status is best-effort */ }

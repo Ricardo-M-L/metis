@@ -87,8 +87,7 @@ type compactToolEventItem struct {
 }
 
 func (i *compactToolEventItem) Render(width int) string {
-	_ = width
-	full := strings.TrimRight(renderToolEvent(i.te, false), "\n")
+	full := strings.TrimRight(renderToolEventAtWidth(i.te, false, width), "\n")
 	if full == "" {
 		return ""
 	}
@@ -536,14 +535,13 @@ func groupableExplorationEvent(te ToolEvent) bool {
 // renderToolEvent doesn't take a width — its lipgloss styling uses
 // terminal default. Reserved for future width-aware tool rendering.
 func (i *toolEventItem) Render(width int) string {
-	_ = width
 	if i.cache != nil {
 		if cached, ok := i.cache.GetTool(i.te, i.expand, width); ok {
 			return normalizeChatItemBoundary(cached)
 		}
 	}
 	t0 := time.Now()
-	rendered := renderToolEvent(i.te, i.expand)
+	rendered := renderToolEventAtWidth(i.te, i.expand, width)
 	if i.cache != nil {
 		i.cache.RecordRender("tool:"+i.te.ToolName, len(i.te.Output), time.Since(t0))
 		i.cache.PutTool(i.te, i.expand, width, rendered)

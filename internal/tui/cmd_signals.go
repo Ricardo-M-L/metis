@@ -134,7 +134,7 @@ func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Lo
 		contextHint := "window unknown"
 		if limit > 0 {
 			contextValue = fmt.Sprintf("~%s / %s tokens", fmtThousands(used), fmtThousands(limit))
-			contextHint = fmt.Sprintf("%.1f%% used", float64(used)*100/float64(limit))
+			contextHint = formatContextPct(used, limit) + " used"
 		}
 		rows = append(rows, infoRow{Key: "context", Value: contextValue, Hint: contextHint})
 

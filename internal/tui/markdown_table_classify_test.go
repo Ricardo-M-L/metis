@@ -48,3 +48,37 @@ func TestClassifyCodeSpan(t *testing.T) {
 		})
 	}
 }
+
+func TestInlineCodeHasForegroundWithoutBackground(t *testing.T) {
+	const text = "use `ark-code-latest` for this request"
+
+	// The current full-screen TUI path.
+	mdRendererMu.Lock()
+	mdRendererNarrow = nil
+	mdRendererWide = nil
+	mdRendererMu.Unlock()
+	fullScreen := renderAssistantBody(text, 80)
+	assertInlineCodeHasNoBackground(t, "full-screen TUI", fullScreen)
+
+	// The line-oriented REPL path must not reintroduce Glamour's default
+	// grey code badge either.
+	legacyRenderer, err := MarkdownRenderer(80)
+	if err != nil {
+		t.Fatalf("create REPL markdown renderer: %v", err)
+	}
+	legacy, err := legacyRenderer.Render(text)
+	if err != nil {
+		t.Fatalf("render REPL markdown: %v", err)
+	}
+	assertInlineCodeHasNoBackground(t, "REPL", legacy)
+}
+
+func assertInlineCodeHasNoBackground(t *testing.T, path, rendered string) {
+	t.Helper()
+	if !strings.Contains(rendered, "38;5;203") {
+		t.Fatalf("%s: inline code lost its red foreground: %q", path, rendered)
+	}
+	if strings.Contains(rendered, "48;5;236") || strings.Contains(rendered, "48;2;48;48;48") {
+		t.Fatalf("%s: inline code still has Glamour's grey background: %q", path, rendered)
+	}
+}

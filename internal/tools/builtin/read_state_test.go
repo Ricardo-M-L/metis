@@ -187,9 +187,11 @@ func TestRead_RecordsFullOnSmallFile(t *testing.T) {
 	}
 }
 
-// TestEdit_RefusesPartialView confirms Edit blocks edits to a file
-// that was Read with a partial view.
-func TestEdit_RefusesPartialView(t *testing.T) {
+// TestEdit_AllowsTargetedEditAfterPartialView pins the Codex-style targeted
+// patch contract: a unique old string may be replaced after a partial Read.
+// Read captured the full-file hash internally, so stale external changes are
+// still rejected while untouched bytes remain byte-for-byte identical.
+func TestEdit_AllowsTargetedEditAfterPartialView(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "long.txt")
 	var sb strings.Builder
@@ -214,16 +216,47 @@ func TestEdit_RefusesPartialView(t *testing.T) {
 	}
 
 	res, err := ed.Execute(context.Background(), map[string]any{
-		"path": path, "old": "line 1", "new": "LINE 1",
+		"path": path, "old": "line 1\n", "new": "LINE 1\n",
 	})
 	if err != nil {
-		t.Fatalf("Edit hard-errored, expected soft fail: %v", err)
+		t.Fatalf("Edit: %v", err)
 	}
-	if res == nil || !res.IsError {
-		t.Fatalf("Edit should soft-fail on partial-view entry, got %+v", res)
+	if res == nil || res.IsError {
+		t.Fatalf("targeted Edit should succeed after partial view, got %+v", res)
 	}
-	if !strings.Contains(res.Output, "partial view") {
-		t.Errorf("Edit error should mention partial view: %q", res.Output)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(got), "LINE 1\nline 2\n") || !strings.HasSuffix(string(got), "line 50\n") {
+		t.Fatalf("targeted Edit changed unexpected bytes:\n%s", got)
+	}
+}
+
+func TestEdit_PartialViewStillRejectsExternalChange(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "long.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gate := permission.New(permission.ModeBypass)
+	state := NewReadFileState()
+	rd := Read{gate: gate, state: state}
+	ed := Edit{gate: gate, state: state}
+	if _, err := rd.Execute(context.Background(), map[string]any{"path": path, "limit": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("alpha\nbeta changed externally\ngamma\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ed.Execute(context.Background(), map[string]any{
+		"path": path, "old": "alpha", "new": "ALPHA",
+	})
+	if err != nil {
+		t.Fatalf("Edit hard-errored, expected stale soft failure: %v", err)
+	}
+	if res == nil || !res.IsError || !strings.Contains(res.Output, FileUnexpectedlyModified) {
+		t.Fatalf("partial-view Edit ignored external change: %+v", res)
 	}
 }
 

@@ -249,18 +249,21 @@ func TestBashKillCanUseChecksRealToolAndJobID(t *testing.T) {
 }
 
 // TestDetectBlockedSleepPattern — pin the sleep blacklist matrix:
-// bare integer sleeps ≥ 2s and `sleep N && rest` are blocked,
-// sub-2s and pipeline / subshell forms are allowed.
+// bare integer sleeps ≥ 10s and `sleep N && rest` are blocked,
+// short waits and pipeline / subshell forms are allowed.
 func TestDetectBlockedSleepPattern(t *testing.T) {
 	cases := []struct {
 		in   string
 		want bool // true → expected blocked
 	}{
-		{"sleep 5", true},
+		{"sleep 3", false},
+		{"sleep 5", false},
+		{"sleep 9", false},
+		{"sleep 10", true},
 		{"sleep 30", true},
-		{"sleep 5 && echo done", true},
-		{"sleep 5; echo done", true},
-		{"sleep 1", false},                        // sub-2s allowed
+		{"sleep 10 && echo done", true},
+		{"sleep 10; echo done", true},
+		{"sleep 1", false},                        // short wait allowed
 		{"sleep 0.5", false},                      // float allowed (regex matches integer only)
 		{"echo a | sleep 5", false},               // sleep at TAIL of pipe → allowed
 		{"(sleep 5; echo b)", false},              // in subshell → allowed

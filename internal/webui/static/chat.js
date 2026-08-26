@@ -652,7 +652,7 @@ function handleTextDelta(d) {
   streamingText += d.delta || '';
   if (streamingEl) {
     const box = streamingEl.querySelector('.message-content');
-    box.innerHTML = formatContent(streamingText) + '<span class="stream-cursor"></span>';
+    box.innerHTML = formatContent(visibleTranscriptText(streamingText)) + '<span class="stream-cursor"></span>';
   }
   autoScroll();
 }
@@ -752,12 +752,19 @@ function startStreamingMessage() {
 
 function endStreamingMessage() {
   finishThinking();
+  const visibleText = visibleTranscriptText(streamingText);
   if (streamingEl) {
     const caret = streamingEl.querySelector('.stream-cursor');
     if (caret) caret.remove();
-    attachMessageActions(streamingEl, streamMsgIdx);
+    const box = streamingEl.querySelector('.message-content');
+    if (visibleText.trim()) {
+      if (box) box.innerHTML = formatContent(visibleText);
+      attachMessageActions(streamingEl, streamMsgIdx);
+    } else {
+      streamingEl.remove();
+    }
   }
-  if (streamingText.trim()) messages.push({ role: 'assistant', content: streamingText, time: new Date() });
+  if (visibleText.trim()) messages.push({ role: 'assistant', content: visibleText, time: new Date() });
   streaming = false;
   streamingEl = null;
   streamingText = '';
@@ -1960,6 +1967,19 @@ function messageText(content) {
   return content.filter(b => b && b.type === 'text').map(b => b.text || '').join('\n');
 }
 
+// Runtime instructions are transported as user-role text because provider
+// APIs have no mid-conversation system role. They are never chat content.
+// Filter complete and currently-streaming envelopes so a model that echoes an
+// internal rescue prompt cannot expose it in Desktop (screenshot regression).
+const INTERNAL_TRANSCRIPT_SECTION_RE = /<(system-reminder|memory-context|auto-retrieve|peer_message|task-context|project-context|job_notification|sub_agent_idle|memory_consolidation_done|monitor_event|post_compact_context|metis-internal-review)(?:\s[^>]*)?>[\s\S]*?<\/\1\s*>/gi;
+const UNTERMINATED_INTERNAL_SECTION_RE = /<(?:system-reminder|memory-context|auto-retrieve|peer_message|task-context|project-context|job_notification|sub_agent_idle|memory_consolidation_done|monitor_event|post_compact_context|metis-internal-review)(?:\s[^>]*)?>[\s\S]*$/i;
+
+function visibleTranscriptText(value) {
+  return String(value == null ? '' : value)
+    .replace(INTERNAL_TRANSCRIPT_SECTION_RE, '')
+    .replace(UNTERMINATED_INTERNAL_SECTION_RE, '');
+}
+
 // Rebuild the full transcript from session history (DSH parity: reloading
 // or resuming a session reconstructs tool call rows, not just text).
 // Shapes come from the JSONL: assistant messages carry {type:'tool_use',
@@ -1981,9 +2001,10 @@ function renderHistoryMessages(history) {
     blocks.forEach(b => {
       if (!b || typeof b !== 'object') return;
       if (b.type === 'text' && (b.text || '').trim()) {
-        const shown = role === 'user' && String(b.text).startsWith('[user steer mid-turn] ')
+        const rawShown = role === 'user' && String(b.text).startsWith('[user steer mid-turn] ')
           ? String(b.text).slice('[user steer mid-turn] '.length) : b.text;
-        addMessage(role, shown, false, i++);
+        const shown = visibleTranscriptText(rawShown);
+        if (shown.trim()) addMessage(role, shown, false, i++);
       } else if (role === 'assistant' && b.type === 'thinking' && (b.text || '').trim()) {
         try {
           appendThinkingRow(b.text);
@@ -2705,7 +2726,8 @@ function showRuntimeSummary(kind) {
     return;
   }
   if (kind === 'context') { showToast('Context: ' + fmtTokens(used) + (limit ? ' / ' + fmtTokens(limit) + ' tokens' : ' tokens')); return; }
-  showToast((d.workspace || 'metis') + ' · ' + (d.subAgents || 0) + ' sub-agents · ' + (d.backgroundTasks || 0) + ' tasks' + (limit ? ' · context ' + Math.round(used / limit * 100) + '%' : ''));
+  const contextPercent = limit ? Math.max(0, Math.min(100, Math.round(used / limit * 100))) : 0;
+  showToast((d.workspace || 'metis') + ' · ' + (d.subAgents || 0) + ' sub-agents · ' + (d.backgroundTasks || 0) + ' tasks' + (limit ? ' · context ' + contextPercent + '%' : ''));
 }
 
 async function compactCurrentSession(instructions) {

@@ -949,17 +949,32 @@ function toggleSessionsExpand() {
 
 async function resumeSession(id) {
   try {
-    const viewOnly = typeof turnRunning !== 'undefined' && turnRunning;
+    let viewOnly = typeof turnRunning !== 'undefined' && turnRunning;
     if (viewOnly && id !== currentSessionId && currentSessionId === runningSessionId) {
       detachRunningTurnView();
     }
-    const endpoint = viewOnly
+    let endpoint = viewOnly
       ? '/api/sessions/' + encodeURIComponent(id)
       : '/api/sessions/activate';
-    const options = viewOnly
+    let options = viewOnly
       ? { method: 'GET' }
       : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) };
-    const res = await fetch(endpoint, options);
+    let res = await fetch(endpoint, options);
+    // The status poll/SSE can race a click by a few milliseconds. If the
+    // backend already owns a running turn, fall back to the transcript-only
+    // endpoint instead of reviving the old "stop before switching" bug.
+    if (!viewOnly && res.status === 409) {
+      const conflict = await res.json().catch(() => ({}));
+      if (conflict.turnRunning) {
+        const active = String(conflict.runningSessionId || currentSessionId || '');
+        if (typeof setTurnRunning === 'function') setTurnRunning(true, active);
+        if (currentSessionId === active) detachRunningTurnView();
+        viewOnly = true;
+        endpoint = '/api/sessions/' + encodeURIComponent(id);
+        options = { method: 'GET' };
+        res = await fetch(endpoint, options);
+      }
+    }
     if (!res.ok) throw new Error(`resume: ${res.status}`);
     const data = await res.json();
     currentSessionId = id;

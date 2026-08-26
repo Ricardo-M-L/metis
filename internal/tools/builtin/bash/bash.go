@@ -436,15 +436,15 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// Reject bare-sleep patterns that would just sit around blocking
 	// the foreground turn for nothing useful. Mirrors claude-code's
 	// detectBlockedSleepPattern (BashTool.tsx:322): standalone `sleep
-	// N` (N≥2) and `sleep N && check` are both pointless — the model
-	// is essentially polling, which a real signal (file watch, MCP
-	// event, or background-task notification) would handle better.
-	// Sub-2s sleeps and sleeps inside pipelines / subshells are fine.
+	// N` (N≥10) and `sleep N && check` are both treated as polling. Short
+	// waits such as `sleep 3` are useful for bounded process start-up and match
+	// Codex CLI behaviour; longer waits should use job/event notifications.
+	// Sub-10s sleeps and sleeps inside pipelines / subshells are fine.
 	if blocked := detectBlockedSleepPattern(cmd); blocked != "" {
 		return &tools.Result{
 			Output: fmt.Sprintf(
 				"[blocked sleep pattern] %s\n\n"+
-					"Bare `sleep N` (N ≥ 2 seconds) is rejected as a polling primitive. "+
+					"Bare `sleep N` (N ≥ 10 seconds) is rejected as a polling primitive. "+
 					"Better alternatives: "+
 					"(1) use the Monitor tool to watch a file/log for a specific pattern — "+
 					"its event arrives the moment the condition fires, not on a polling tick; "+
@@ -734,9 +734,11 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 // (sleep 0.5) the same way — those are legitimate pacing patterns.
 var blockedSleepRE = regexp.MustCompile(`^\s*sleep\s+(\d+)\s*(.*)$`)
 
+const blockedSleepMinimumSeconds = 10
+
 // detectBlockedSleepPattern returns a non-empty diagnostic when cmd
-// is a bare `sleep N` (N ≥ 2) or `sleep N && rest` / `sleep N; rest`
-// pattern. Returns "" when the sleep is fine to execute (sub-2s, in a
+// is a bare `sleep N` (N ≥ 10) or `sleep N && rest` / `sleep N; rest`
+// pattern. Returns "" when the sleep is fine to execute (sub-10s, in a
 // pipeline, in a subshell, in a script).
 //
 // Why we reject these specifically: they're the model's "polling
@@ -772,7 +774,7 @@ func detectBlockedSleepPattern(cmd string) string {
 	for _, c := range m[1] {
 		secs = secs*10 + int(c-'0')
 	}
-	if secs < 2 {
+	if secs < blockedSleepMinimumSeconds {
 		return ""
 	}
 	rest := strings.TrimSpace(m[2])

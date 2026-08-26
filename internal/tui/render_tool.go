@@ -35,6 +35,15 @@ import (
 // ctrl+O), Edit diffs / Bash output / error bodies render in full
 // instead of capping at 5-20 lines.
 func renderToolEvent(te ToolEvent, expanded bool) string {
+	return renderToolEventAtWidth(te, expanded, 0)
+}
+
+// renderToolEventAtWidth keeps the leader row inside the chat viewport before
+// the terminal's last-resort frame clamp runs. In particular, long Bash
+// commands and CJK paths are middle-truncated so both the command prefix and
+// the final file/subcommand remain visible, matching Codex CLI's compact tool
+// rows without creating a physical soft-wrap row.
+func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 	var s strings.Builder
 	baseName := strings.TrimPrefix(te.ToolName, "sub: ")
 	partialRecovery := completedBeforeTimeout(te)
@@ -95,9 +104,19 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 		leadIndent, resultIndent = "      ", "        "
 		displayName = strings.TrimPrefix(displayName, "sub: ")
 	}
+	displayTool := displayToolName(displayName)
+	args := toolArgsPreview(te.ToolName, te.Input)
+	if args != "" && width > 0 {
+		trailingWidth := 2 // parentheses
+		if te.Kind == "start" {
+			trailingWidth += 2 // " …"
+		}
+		fixedWidth := xansi.StringWidth(leadIndent+glyphBullet+" "+displayTool) + trailingWidth
+		args = truncateMiddleCells(args, width-fixedWidth)
+	}
 	s.WriteString(leaderColor.Render(leadIndent + glyphBullet + " "))
-	s.WriteString(styleToolName.Render(displayToolName(displayName)))
-	if args := toolArgsPreview(te.ToolName, te.Input); args != "" {
+	s.WriteString(styleToolName.Render(displayTool))
+	if args != "" {
 		// Brackets are pure structural chrome — stay muted. The args
 		// payload inside them is what the user came to read (path /
 		// query / URL), so it renders at default fg (user screenshot
@@ -246,6 +265,41 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 	}
 	s.WriteString("\n")
 	return s.String()
+}
+
+// truncateMiddleCells is the cell-width counterpart of truncateMiddle. Rune
+// caps are insufficient for Chinese paths because a rune may occupy two
+// terminal cells. The head receives 40% of the budget and the tail 60% so a
+// Bash verb remains recognizable while the target filename is preserved.
+func truncateMiddleCells(value string, maxCells int) string {
+	if maxCells <= 0 {
+		return ""
+	}
+	if xansi.StringWidth(value) <= maxCells {
+		return value
+	}
+	const separator = " … "
+	separatorWidth := xansi.StringWidth(separator)
+	if maxCells <= separatorWidth+2 {
+		return xansi.Truncate(value, maxCells, "…")
+	}
+	headBudget := (maxCells - separatorWidth) * 2 / 5
+	tailBudget := maxCells - separatorWidth - headBudget
+	head := xansi.Truncate(value, headBudget, "")
+
+	runes := []rune(value)
+	tailStart := len(runes)
+	tailWidth := 0
+	for tailStart > 0 {
+		candidate := string(runes[tailStart-1])
+		candidateWidth := xansi.StringWidth(candidate)
+		if tailWidth+candidateWidth > tailBudget {
+			break
+		}
+		tailStart--
+		tailWidth += candidateWidth
+	}
+	return head + separator + string(runes[tailStart:])
 }
 
 // collapseToolBodyByDefault matches Claude Code's compact transcript: high-
