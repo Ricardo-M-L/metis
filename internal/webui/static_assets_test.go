@@ -559,6 +559,56 @@ func TestRunningTurnCanBeViewedInBackgroundAndStoppedBySession(t *testing.T) {
 	}
 }
 
+func TestChatAutoScrollYieldsWhenUserReadsEarlierOutput(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	chat := get("/chat.js")
+	for _, want := range []string{
+		"let followOutput = true;",
+		"function isChatNearBottom(area)",
+		"area.addEventListener('scroll', onChatScroll, { passive: true });",
+		"area.addEventListener('wheel', pauseAutoScrollOnWheel, { passive: true });",
+		"if (!followOutput)",
+		"function resumeAutoScroll()",
+	} {
+		if !strings.Contains(chat, want) {
+			t.Fatalf("chat.js missing sticky-bottom contract %q", want)
+		}
+	}
+	if got := strings.Count(chat, "area.scrollTop = area.scrollHeight;"); got != 1 {
+		t.Fatalf("chat.js has %d unconditional bottom assignments; want only the guarded autoScroll assignment", got)
+	}
+
+	index := get("/")
+	for _, want := range []string{"id=\"jumpLatestBtn\"", "onclick=\"resumeAutoScroll()\"", "data-i18n-label=\"jumpLatest\""} {
+		if !strings.Contains(index, want) {
+			t.Fatalf("index.html missing jump-to-latest contract %q", want)
+		}
+	}
+
+	app := get("/app.js")
+	for _, want := range []string{"initChatScroll();", "jumpLatest: 'Jump to latest'", "jumpLatest: '回到最新'"} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("app.js missing scroll-follow integration %q", want)
+		}
+	}
+
+	style := get("/style.css")
+	for _, want := range []string{".jump-latest {", ".jump-latest[hidden] { display: none; }", "scroll-behavior: auto;"} {
+		if !strings.Contains(style, want) {
+			t.Fatalf("style.css missing scroll-follow presentation %q", want)
+		}
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

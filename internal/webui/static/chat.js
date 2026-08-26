@@ -20,6 +20,10 @@ let streamingEl = null;
 let streamingText = '';
 let streamedTextThisTurn = false;
 let effortState = { supported: false, effort: 'default', options: [] };
+const CHAT_BOTTOM_THRESHOLD = 56;
+let followOutput = true;
+let programmaticChatScroll = false;
+let chatScrollFrame = 0;
 const seenLiveEventIDs = new Set();
 const seenLiveEventQueue = [];
 
@@ -1346,15 +1350,69 @@ async function resolvePermission(id, approve, btn) {
   }
 }
 
-function autoScroll() {
+function isChatNearBottom(area) {
+  if (!area) return true;
+  return area.scrollHeight - area.scrollTop - area.clientHeight <= CHAT_BOTTOM_THRESHOLD;
+}
+
+function updateScrollFollowUI() {
+  const button = document.getElementById('jumpLatestBtn');
   const area = document.getElementById('chatArea');
+  if (button) button.hidden = followOutput || isChatNearBottom(area);
+}
+
+function onChatScroll() {
+  if (programmaticChatScroll) return;
+  const area = document.getElementById('chatArea');
+  followOutput = isChatNearBottom(area);
+  updateScrollFollowUI();
+}
+
+function pauseAutoScrollOnWheel(event) {
+  if (event.deltaY >= 0) return;
+  programmaticChatScroll = false;
+  followOutput = false;
+  updateScrollFollowUI();
+}
+
+function initChatScroll() {
+  const area = document.getElementById('chatArea');
+  if (!area || area.dataset.scrollFollowReady === 'true') return;
+  area.dataset.scrollFollowReady = 'true';
+  area.addEventListener('scroll', onChatScroll, { passive: true });
+  // A trackpad/wheel-up gesture must win even if it lands in the same frame as
+  // a live delta that just moved the transcript programmatically.
+  area.addEventListener('wheel', pauseAutoScrollOnWheel, { passive: true });
+  updateScrollFollowUI();
+}
+
+function autoScroll(force = false) {
+  const area = document.getElementById('chatArea');
+  if (!area) return;
   // Harness renders TurnStatus after every conversation node. METIS appends
   // live nodes imperatively, so move the stable status element back to the
   // tail whenever a thinking/tool/message row arrives.
   if (turnStatusEl && turnStatusEl.parentElement === area && area.lastElementChild !== turnStatusEl) {
     area.appendChild(turnStatusEl);
   }
+  if (force) followOutput = true;
+  if (!followOutput) {
+    updateScrollFollowUI();
+    return;
+  }
+  programmaticChatScroll = true;
   area.scrollTop = area.scrollHeight;
+  if (chatScrollFrame) cancelAnimationFrame(chatScrollFrame);
+  chatScrollFrame = requestAnimationFrame(() => {
+    chatScrollFrame = 0;
+    programmaticChatScroll = false;
+    followOutput = isChatNearBottom(area);
+    updateScrollFollowUI();
+  });
+}
+
+function resumeAutoScroll() {
+  autoScroll(true);
 }
 
 
@@ -1370,6 +1428,8 @@ function newChat() {
   renderQueuedTurns();
   resetTurnState();
   messages = [];
+  followOutput = true;
+  updateScrollFollowUI();
   document.getElementById('chatArea').innerHTML = `
     <div class="welcome" id="welcomeScreen">
       <div class="welcome-line">
@@ -1694,6 +1754,7 @@ async function runTurnItem(item) {
   if (welcome) welcome.remove();
 
   // Add user message (image attachments render as placeholder thumbnails)
+  resumeAutoScroll();
   addMessage('user', text || '(image attached)');
   beginUserTurn();
   setTurnRunning(true, turnSessionId);
@@ -1800,7 +1861,7 @@ function addMessage(role, content, remember = true, idx = -1) {
       </div>`);
   }
 
-  area.scrollTop = area.scrollHeight;
+  autoScroll();
   updateEmptyLayout();
 }
 
@@ -1907,6 +1968,9 @@ function messageText(content) {
 function renderHistoryMessages(history) {
   queueMicrotask(() => restoreTodoPlanFromHistory(history));
   const area = document.getElementById('chatArea');
+  // Avoid forcing a layout/scroll for every reconstructed history block. The
+  // selected transcript is pinned once, after the complete history exists.
+  followOutput = false;
   area.innerHTML = '';
   let i = 0;
   (history || []).forEach(m => {
@@ -1953,7 +2017,7 @@ function renderHistoryMessages(history) {
     });
   });
   updateEmptyLayout();
-  area.scrollTop = area.scrollHeight;
+  resumeAutoScroll();
 }
 
 function showError(text) {

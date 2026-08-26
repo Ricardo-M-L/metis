@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.30] - 2026-08-26
+
+### Fixed
+
+- **live Desktop output no longer steals the transcript scroll position**:
+  automatic following pauses when the user scrolls upward, resumes near the
+  bottom, and exposes a localized “Jump to latest” control while newer output
+  continues to arrive.
+
+### Security
+
+- The macOS universal Desktop release is Developer ID signed, timestamped,
+  notarized by Apple, and distributed with its stapled ticket.
+- Machine-private Apple release material is isolated below the ignored
+  `.private/` directory, requires restrictive local permissions, and is
+  rejected by the local pre-commit guard even if force-added.
+
 ## [0.4.29] - 2026-08-24
 
 ### Added

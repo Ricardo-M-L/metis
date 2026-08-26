@@ -48,6 +48,7 @@ document.addEventListener('DOMContentLoaded', () => {
   detectProject();
   connectEvents();
   initTheme();
+  initChatScroll();
   updateEmptyLayout();
   initLayout(); // DSH AppFrame parity: resizable sidebar/details + auto-collapse
   fetch('/api/config').then(r => r.json()).then(c => {
@@ -76,7 +77,7 @@ const DESKTOP_I18N = {
     searchSessionsLabel: 'Search sessions', collapseSidebar: 'Collapse sidebar', expandSidebar: 'Expand sidebar',
     context: 'Context', autoCompactAt: 'auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
     chat: 'Chat', trajectory: 'Trajectory', welcome: 'From idea to done', preview: 'METIS Desktop', sessionLog: 'Session log',
-    composerPlaceholder: 'Describe what you want to build', details: 'Details', detailsPlaceholder: 'Select a tool row to inspect details',
+    composerPlaceholder: 'Describe what you want to build', jumpLatest: 'Jump to latest', details: 'Details', detailsPlaceholder: 'Select a tool row to inspect details',
     backToApp: 'Back to app', searchSettings: 'Search settings…', personal: 'Personal', general: 'General', appearance: 'Appearance',
     modelProviders: 'Model Providers', agentPresets: 'Agent Presets', plugins: 'Plugins', smartRouting: 'Smart Routing', configuration: 'Configuration'
   },
@@ -85,7 +86,7 @@ const DESKTOP_I18N = {
     searchSessionsLabel: '搜索会话', collapseSidebar: '收起侧栏', expandSidebar: '展开侧栏',
     context: '上下文', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
     chat: '对话', trajectory: '轨迹', welcome: '从想法，到完成', preview: 'METIS Desktop', sessionLog: '会话日志',
-    composerPlaceholder: '描述你想要构建的内容', details: '详情', detailsPlaceholder: '点击消息流中的工具行查看详情',
+    composerPlaceholder: '描述你想要构建的内容', jumpLatest: '回到最新', details: '详情', detailsPlaceholder: '点击消息流中的工具行查看详情',
     backToApp: '返回应用', searchSettings: '搜索设置…', personal: '个人', general: '通用', appearance: '外观',
     modelProviders: '模型提供商', agentPresets: '代理预设', plugins: '插件', smartRouting: '智能路由', configuration: '配置'
   }

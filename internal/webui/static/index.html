@@ -143,6 +143,10 @@
     <div class="status-row">
       <button class="top-chip status-chip" id="statusChip" type="button" style="display:none" aria-label="Agent status details" aria-expanded="false" onclick="toggleStatusPopover(event)"></button>
       <div class="status-popover" id="statusPopover" style="display:none" aria-label="Agent and background task details"></div>
+      <button class="jump-latest" id="jumpLatestBtn" type="button" hidden onclick="resumeAutoScroll()" data-i18n-label="jumpLatest" data-i18n-title="jumpLatest" aria-label="Jump to latest" title="Jump to latest">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+        <span data-i18n="jumpLatest">回到最新</span>
+      </button>
       <button class="topbar-btn session-log-btn" title="Export session log" aria-label="Export session log" onclick="exportSession()">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 2.5h6l2 2v9H4z"/><path d="M6 6h4M6 8.5h4M6 11h2.5"/></svg><span data-i18n="sessionLog">Session log</span>
       </button>

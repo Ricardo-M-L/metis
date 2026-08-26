@@ -16,6 +16,11 @@ node_modules/
 .env
 .env.local
 
+# Local signing credentials and other machine-private release material.
+# Never force-add this directory; official CI must use repository secrets.
+/.private/
+/metis-desktop/release-dist-local/
+
 # local dev artifacts (not for public release)
 TEST_REPORT.md
 
