@@ -6,15 +6,189 @@ package tui
 // all move together or the next turn can read/write the previous session.
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
+
+const (
+	cliDistillationBoundaryGrace = 35 * time.Second
+	cliAutoMemoryBoundaryGrace   = 95 * time.Second
+)
+
+// persistMemoryBoundary is the shared CLI/TUI durability barrier. The caller
+// must stop the foreground turn before entering it. Every successful exchange
+// below the normal cadence is flushed to an immutable distillation job, and all
+// source-session distillation is joined before the Daily hand-off is written or
+// the live history can be replaced. Auto Memory already owns immutable
+// snapshots, so session switches may leave it running; process close joins it
+// before provider dependencies can be closed.
+func persistMemoryBoundary(loop *agent.Loop, sessionID, source, summary string, closing bool) error {
+	return persistMemoryBoundaryWithGrace(
+		loop,
+		sessionID,
+		source,
+		summary,
+		closing,
+		cliDistillationBoundaryGrace,
+		cliAutoMemoryBoundaryGrace,
+	)
+}
+
+// persistMemoryBoundaryWithGrace keeps the production policy testable without
+// mutating process-global timeout knobs. On an in-process switch, a failed
+// distillation join is fail-closed: no Daily note is written and the caller
+// leaves the source session active. A clean process close still attempts the
+// otherwise-valid final Daily and Auto Memory joins, returning all errors to
+// the caller. The wait context is never used to cancel a freshly flushed job.
+func persistMemoryBoundaryWithGrace(
+	loop *agent.Loop,
+	sessionID, source, summary string,
+	closing bool,
+	distillationGrace, autoMemoryGrace time.Duration,
+) error {
+	if loop == nil || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	var errs []error
+
+	// Registration happens before waiting, which closes the race between a
+	// completed short turn and ResetSession/provider cleanup. Wait only observes
+	// the job; unlike CancelAndWaitForDistillation it does not discard residual
+	// memory merely because a session boundary was reached.
+	loop.FlushPendingDistillation(sessionID)
+	distillCtx, cancelDistill := context.WithTimeout(context.Background(), distillationGrace)
+	distillErr := loop.WaitForDistillation(distillCtx, sessionID)
+	cancelDistill()
+	if distillErr != nil {
+		distillErr = fmt.Errorf("join memory distillation for %s: %w", sessionID, distillErr)
+		if !closing {
+			return distillErr
+		}
+		errs = append(errs, distillErr)
+	}
+
+	// Daily is the synchronous, user-visible hand-off record. For a switch it
+	// is written only after all source facts are durable. On close it remains
+	// useful even if a stubborn provider made the join time out.
+	if loop.Memory != nil {
+		if err := loop.Memory.SaveDailyNote(sessionID, source, summary); err != nil {
+			errs = append(errs, fmt.Errorf("save daily memory for %s (%s): %w", sessionID, source, err))
+		}
+	}
+	if !closing {
+		return errors.Join(errs...)
+	}
+
+	autoCtx, cancelAuto := context.WithTimeout(context.Background(), autoMemoryGrace)
+	if err := loop.WaitAutoMemoryIdle(autoCtx); err != nil {
+		errs = append(errs, fmt.Errorf("join auto memory for %s: %w", sessionID, err))
+	}
+	cancelAuto()
+
+	return errors.Join(errs...)
+}
+
+func activationBoundarySource(hdr *session.Header, restorePermissions bool) string {
+	if restorePermissions {
+		return "cli-resume"
+	}
+	if hdr != nil && hdr.ForkedFrom != nil {
+		return "cli-branch"
+	}
+	return "cli-new"
+}
+
+func (r *REPL) leaveActiveSession(source string, closing bool) error {
+	if r == nil || r.sessionBoundaryClosed || r.SessionID == "" {
+		return nil
+	}
+	summary := ""
+	if r.Loop != nil {
+		summary = r.summarizeHistory()
+	}
+	if err := persistMemoryBoundary(r.Loop, r.SessionID, source, summary, closing); err != nil {
+		return err
+	}
+	if r.SessionBoundary != nil {
+		r.SessionBoundary()
+	}
+	r.sessionBoundaryClosed = true
+	return nil
+}
+
+func (m *Model) leaveActiveSession(source string, closing bool) error {
+	if m == nil || m.sessionBoundaryClosed || m.sessionID == "" {
+		return nil
+	}
+	summary := ""
+	if m.loop != nil {
+		summary = m.summarizeHistory()
+	}
+	if err := persistMemoryBoundary(m.loop, m.sessionID, source, summary, closing); err != nil {
+		return err
+	}
+	if m.ext.SessionBoundary != nil {
+		m.ext.SessionBoundary()
+	}
+	m.sessionBoundaryClosed = true
+	return nil
+}
+
+// stopForegroundTurnForClose handles the rare quit-while-cancelling path after
+// Bubble Tea has stopped consuming doneCh. This is deliberately condition-
+// based rather than timeout-based: returning while Loop.Run is still mutating
+// history would let runtime cleanup observe no background writer, close its
+// dependencies, and lose the final transcript/Daily tail. An OS-level force
+// kill remains the explicit escape hatch for a provider that never returns.
+func (m *Model) stopForegroundTurnForClose() error {
+	if m == nil || !m.turnActive {
+		return nil
+	}
+	if m.turnCancel != nil {
+		m.turnCancel()
+		m.turnCancel = nil
+	}
+	<-m.doneCh
+	var persistErr error
+	if m.session != nil && m.sessionID != "" && m.loop != nil {
+		if err := m.session.AppendHistoryTail(m.sessionID, m.loop.History(), &m.historyCursor); err != nil {
+			persistErr = fmt.Errorf("persist foreground turn for session %s: %w", shortID(m.sessionID), err)
+		}
+	}
+	m.turnActive = false
+	m.spinnerActive = false
+	return persistErr
+}
+
+// cleanupUnactivatedSession removes a fresh/fork destination whose activation
+// failed before it ever became live. Resume targets are never passed here: they
+// pre-existed the attempt and must remain available for retry.
+func cleanupUnactivatedSession(store *session.Store, id string, activationErr error) error {
+	if activationErr == nil || store == nil || strings.TrimSpace(id) == "" {
+		return activationErr
+	}
+	if err := store.Delete(id); err != nil {
+		return errors.Join(activationErr, fmt.Errorf("discard unactivated session %s: %w", shortID(id), err))
+	}
+	return activationErr
+}
+
+func (m *Model) activateCreatedSession(id string, hdr *session.Header, messages []llm.Message) error {
+	if err := m.activateSession(id, hdr, messages, false); err != nil {
+		return cleanupUnactivatedSession(m.session, id, err)
+	}
+	return nil
+}
 
 // freshPermissionMode returns the invocation-level posture for a newly
 // created/forked session. Production supplies the fully-resolved value (CLI,
@@ -96,6 +270,7 @@ func (r *REPL) rebindFreshSession(id string) {
 	if r.SessionSwitch != nil {
 		r.SessionSwitch(id)
 	}
+	r.sessionBoundaryClosed = false
 }
 
 func (r *REPL) startFreshSession() (string, error) {
@@ -114,8 +289,8 @@ func (r *REPL) startFreshSession() (string, error) {
 	}); err != nil {
 		return "", err
 	}
-	if r.SessionBoundary != nil {
-		r.SessionBoundary()
+	if err := r.leaveActiveSession("cli-new", false); err != nil {
+		return "", cleanupUnactivatedSession(r.Session, id, err)
 	}
 	r.Loop.System = system
 	r.Loop.SystemSections = append([]llm.SystemSection(nil), r.baseSystemSections...)
@@ -144,10 +319,10 @@ func (r *REPL) branchSession() (string, error) {
 		// an obsolete static "do not implement" instruction.
 		System: rtpkg.RemoveLegacyPlanOverlay(r.Loop.System),
 	}); err != nil {
-		return "", err
+		return "", cleanupUnactivatedSession(r.Session, id, err)
 	}
-	if r.SessionBoundary != nil {
-		r.SessionBoundary()
+	if err := r.leaveActiveSession("cli-branch", false); err != nil {
+		return "", cleanupUnactivatedSession(r.Session, id, err)
 	}
 	r.Loop.ResetSession(r.Loop.History())
 	r.rebindFreshSession(id)
@@ -186,11 +361,11 @@ func (m *Model) forkSession(parentID string, messages []llm.Message) (string, *s
 	if err := m.session.WriteHeaderFull(session.Header{
 		ID: id, WorkDir: cwd, Mode: string(m.freshPermissionMode()),
 	}); err != nil {
-		return "", nil, err
+		return "", nil, cleanupUnactivatedSession(m.session, id, err)
 	}
 	hdr, _, err := m.session.LoadHeader(id)
 	if err != nil {
-		return "", nil, err
+		return "", nil, cleanupUnactivatedSession(m.session, id, err)
 	}
 	cleanedSystem := rtpkg.RemoveLegacyPlanOverlay(hdr.System)
 	if cleanedSystem != hdr.System {
@@ -199,7 +374,7 @@ func (m *Model) forkSession(parentID string, messages []llm.Message) (string, *s
 		// never activated in this process.
 		if cleanedSystem != "" {
 			if err := m.session.WriteHeaderFull(session.Header{ID: id, System: cleanedSystem}); err != nil {
-				return "", nil, fmt.Errorf("clean legacy plan overlay from fork %s: %w", id, err)
+				return "", nil, cleanupUnactivatedSession(m.session, id, fmt.Errorf("clean legacy plan overlay from fork %s: %w", id, err))
 			}
 		}
 		hdr.System = cleanedSystem
@@ -220,6 +395,12 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	if id == "" {
 		return fmt.Errorf("empty session id")
 	}
+	sourceRuntime := m.loop.ProviderRuntimeState()
+	sourceModel := m.model
+	sourceProviderName := m.providerName
+	sourceBaseSystem := m.baseSystem
+	sourceBaseSections := append([]llm.SystemSection(nil), m.baseSystemSections...)
+	sourceSessionID := m.sessionID
 
 	// Provider/model preflight must happen before any other live state changes.
 	// switchModel itself is atomic on BuildProvider failure. Session activation
@@ -278,10 +459,27 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 		}
 	}
 
-	// The fallible preflight has passed. Commit the remaining session-scoped
-	// state as one non-failing boundary.
-	if m.ext.SessionBoundary != nil {
-		m.ext.SessionBoundary()
+	// The destination preflight has passed. Flush/join source distillation and
+	// save its Daily note before the source ID/history can be replaced. Auto
+	// Memory owns immutable snapshots and is joined only at destructive close.
+	if err := m.leaveActiveSession(activationBoundarySource(hdr, restorePermissions), false); err != nil {
+		// switchModel applies a successfully-built target transport during
+		// preflight. A later durability failure must still leave the source
+		// completely usable, so restore that coherent runtime snapshot before
+		// reporting the failed switch.
+		m.loop.RebindProviderRuntime(
+			sourceRuntime.Provider,
+			sourceRuntime.Model,
+			sourceRuntime.MaxOutputTokens,
+			sourceRuntime.System,
+			sourceRuntime.SystemSections,
+		)
+		m.model = sourceModel
+		m.providerName = sourceProviderName
+		m.baseSystem = sourceBaseSystem
+		m.baseSystemSections = sourceBaseSections
+		rtpkg.RebindLoopRuntime(m.loop, sourceRuntime.Provider, sourceRuntime.Model, sourceRuntime.System, sourceSessionID)
+		return fmt.Errorf("persist source session memory: %w", err)
 	}
 	// Ephemeral cron jobs belong to the session being left. Keeping them in
 	// the shared service would make an old reminder fire into the destination
@@ -349,6 +547,7 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	if len(messages) > 0 {
 		m.hydrateFromLoopHistory()
 	}
+	m.sessionBoundaryClosed = false
 	return nil
 }
 

@@ -576,6 +576,16 @@ type Model struct {
 	// shell got echoed as raw `<col;row;buttonM` text — image
 	// 2026-05-15.
 	savedTermios *termSavedState
+	// hardExitCancel stops the Ctrl-C safety-net timer after any foreground turn
+	// has actually unwound. A second Ctrl-C is the escape hatch for a provider
+	// that ignores cancellation, so merely returning from Bubble Tea must not
+	// disarm it before stopForegroundTurnForClose joins that provider. Once the
+	// foreground turn is gone, normal lifecycle cleanup may safely spend longer
+	// than 800ms joining memory workers without being killed mid-rename.
+	hardExitCancel chan struct{}
+	// sessionBoundaryClosed makes each live session generation leave exactly
+	// once. activateSession clears it after committing the destination.
+	sessionBoundaryClosed bool
 
 	// activeScreen is a full-window overlay (e.g. /history). When
 	// non-nil, the chat surface is hidden and key events are forwarded
@@ -827,13 +837,14 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		// at a blank screen and thinks metis hung (2026-06-15). 80x24 is
 		// the universal terminal fallback; the real WindowSizeMsg
 		// re-renders at the true size a frame later.
-		width:       80,
-		height:      24,
-		eventCh:     make(chan agent.Event, eventBufferSize()),
-		doneCh:      make(chan error, 1),
-		overlays:    overlay.New(),
-		renderCache: newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
-		showBanner:  true,
+		width:          80,
+		height:         24,
+		eventCh:        make(chan agent.Event, eventBufferSize()),
+		doneCh:         make(chan error, 1),
+		hardExitCancel: make(chan struct{}),
+		overlays:       overlay.New(),
+		renderCache:    newRenderCache(pc.SlowRenderMs, pc.StatsLogEvery),
+		showBanner:     true,
 		// Sticky-strip selection state — -1 = no selection. Updated by
 		// MouseClickMsg / MouseMotionMsg / MouseReleaseMsg when click
 		// lands in the strip area (msg.Y >= stripStartY).
@@ -972,11 +983,32 @@ func RunTUI(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, s
 
 	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
+	turnStopped := true
+	if turnErr := m.stopForegroundTurnForClose(); turnErr != nil {
+		turnStopped = false
+		err = errors.Join(err, turnErr)
+	}
+	// The user-visible foreground turn is now gone, so disarm the force-exit
+	// fallback before entering the (potentially slower) memory durability
+	// barrier. If the provider ignored cancellation above, a double Ctrl-C keeps
+	// this timer alive and still guarantees an exit.
+	m.cancelHardExitFallback()
 	// Persist the final mode + interactive approvals even when the user never
 	// switched sessions in-process; otherwise a later --resume has nothing to
 	// restore from the header's AlwaysAllow field.
+	persisted := true
 	if persistErr := m.persistActiveSessionState(); persistErr != nil {
+		persisted = false
 		err = errors.Join(err, persistErr)
+	}
+	// Fail closed: a Daily note must never claim a clean source boundary when
+	// either the foreground turn has not stopped or its transcript/header could
+	// not be persisted. Returning the error lets the caller surface the failure;
+	// runtime cleanup still owns the final provider/memory shutdown barrier.
+	if turnStopped && persisted {
+		if boundaryErr := m.leaveActiveSession("cli-close", true); boundaryErr != nil {
+			err = errors.Join(err, boundaryErr)
+		}
 	}
 	// Claude-code-style goodbye hint — print AFTER bubbletea releases
 	// alt-screen so it lands in the user's normal scrollback. Tells

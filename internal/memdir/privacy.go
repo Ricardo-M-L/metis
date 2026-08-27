@@ -5,7 +5,7 @@ package memdir
 // The threat: the auto-memory extractor reads the same conversation
 // the model just saw. If the user pasted an API key (env-var dump,
 // `curl -H "Authorization: ..."`, .env example) the extractor will
-// happily fact-distill it into a memo and persist it 0o644 on disk
+// happily fact-distill it into a memo and persist it on disk
 // under ~/.metis/memory/. From there it leaks to:
 //   - cloud backups / dropbox / icloud sync the user forgot about
 //   - the next session's manifest, sent to whatever model is loaded

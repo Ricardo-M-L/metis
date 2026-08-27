@@ -5,11 +5,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -38,6 +41,7 @@ func (nopStream) Recv() (llm.StreamEvent, error) { return llm.StreamEvent{}, io.
 
 func defaultLoopCfg(t *testing.T) *config.Config {
 	t.Helper()
+	t.Setenv("METIS_HOME", t.TempDir())
 	cfg := &config.Config{}
 	cfg.Session.Dir = t.TempDir()
 	cfg.Session.MaxIterations = 100
@@ -73,6 +77,30 @@ func TestBuildAgentLoop_AppliesAllSubsystems(t *testing.T) {
 	}
 	if loop.MaxIters != 50 {
 		t.Errorf("MaxIters = %d, want 50 (caller override)", loop.MaxIters)
+	}
+}
+
+func TestBuildAgentLoop_ExplicitTypedNilMemoryDoesNotFallback(t *testing.T) {
+	cfg := defaultLoopCfg(t)
+	var concrete *memory.MemoryManager
+	var repository memory.Repository = concrete
+	if repository == nil {
+		t.Fatal("test setup must preserve a typed nil inside the repository interface")
+	}
+
+	loop := BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider:              &stubProvider{maxCtx: 100_000},
+		Registry:              tools.NewRegistry(),
+		Gate:                  permission.New(permission.ModeAcceptEdits),
+		MemoryManager:         repository,
+		MemoryManagerProvided: true,
+	})
+
+	if loop.Memory != nil {
+		t.Fatalf("explicit typed-nil repository must disable memory without fallback; got %#v", loop.Memory)
+	}
+	if _, err := os.Stat(filepath.Join(config.Home(), "memory")); !os.IsNotExist(err) {
+		t.Fatalf("explicit unavailable repository unexpectedly created fallback memory root: %v", err)
 	}
 }
 
@@ -155,7 +183,7 @@ func TestBuildAgentLoop_HonorsDetectorThresholds(t *testing.T) {
 	}
 }
 
-func TestBuildAgentLoop_MemoryDirIsUnderSessionDir(t *testing.T) {
+func TestBuildAgentLoop_MemoryDirIsUnderCanonicalHome(t *testing.T) {
 	cfg := defaultLoopCfg(t)
 	loop := BuildAgentLoop(cfg, AgentLoopOptions{
 		Provider: &stubProvider{maxCtx: 100_000},
@@ -166,25 +194,13 @@ func TestBuildAgentLoop_MemoryDirIsUnderSessionDir(t *testing.T) {
 	// Just confirm the memory manager exists; we don't introspect its
 	// internals (that's memory pkg's responsibility).
 	_ = loop
-	if _, err := dirExists(filepath.Join(cfg.Session.Dir, "memory")); err == nil {
-		// memory.NewMemoryManager creates the dir on success.
+	if _, err := os.Stat(filepath.Join(config.Home(), "memory")); err != nil {
+		t.Fatalf("canonical memory root was not created: %v", err)
 	}
 }
 
-func dirExists(path string) (bool, error) {
-	// Trivial helper used only by the test above; standard library has no
-	// 1-liner so we keep this local instead of introducing a hidden
-	// dependency.
-	_ = path
-	return false, nil
-}
-
-// TestResolveMemoryRoot_PrefersProjectDir — when ./.metis/memory exists
-// in the process cwd, BuildMemoryManager must pick that path over the
-// user-global session dir. Mirrors the project-vs-user precedent
-// already used for agent profiles (LoadAgentProfile).
-func TestResolveMemoryRoot_PrefersProjectDir(t *testing.T) {
-	// Chdir into a fresh tmp dir + create .metis/memory under it.
+// A cwd-local repository is a migration source, never a second active store.
+func TestResolveMemoryRoot_IgnoresProjectDir(t *testing.T) {
 	projectDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(projectDir, ".metis", "memory"), 0o755); err != nil {
 		t.Fatalf("setup: %v", err)
@@ -197,21 +213,17 @@ func TestResolveMemoryRoot_PrefersProjectDir(t *testing.T) {
 
 	cfg := defaultLoopCfg(t)
 	root := resolveMemoryRoot(cfg)
-
-	wantAbs, _ := filepath.Abs(filepath.Join(projectDir, ".metis", "memory"))
-	// Resolve macOS /private/var symlink quirk on tmp dirs.
-	gotResolved, _ := filepath.EvalSymlinks(root)
-	wantResolved, _ := filepath.EvalSymlinks(wantAbs)
-	if gotResolved != wantResolved {
-		t.Errorf("project-scoped root mismatch:\n  got:  %s\n  want: %s", gotResolved, wantResolved)
+	want := filepath.Join(config.Home(), "memory")
+	if root != want {
+		t.Errorf("canonical root mismatch:\n  got:  %s\n  want: %s", root, want)
 	}
 }
 
-// TestResolveMemoryRoot_FallsBackToSessionDir — without ./.metis/memory
-// in cwd, the root must be <cfg.Session.Dir>/memory. Guards against
+// TestResolveMemoryRoot_FallsBackToCanonicalHome — without ./.metis/memory
+// in cwd, the root must be <METIS_HOME>/memory. Guards against
 // accidentally picking up a stray .metis dir from a parent directory
 // (we deliberately don't walk up).
-func TestResolveMemoryRoot_FallsBackToSessionDir(t *testing.T) {
+func TestResolveMemoryRoot_FallsBackToCanonicalHome(t *testing.T) {
 	cleanCwd := t.TempDir()
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(cleanCwd); err != nil {
@@ -221,9 +233,101 @@ func TestResolveMemoryRoot_FallsBackToSessionDir(t *testing.T) {
 
 	cfg := defaultLoopCfg(t)
 	got := resolveMemoryRoot(cfg)
-	want := filepath.Join(cfg.Session.Dir, "memory")
+	want := filepath.Join(config.Home(), "memory")
 	if got != want {
 		t.Errorf("fallback root mismatch:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+func TestBuildMemoryManagerMigratesLegacyGlobalRoot(t *testing.T) {
+	cleanCwd := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(cleanCwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	cfg := defaultLoopCfg(t)
+	legacy := filepath.Join(cfg.Session.Dir, "memory")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "old-topic.md"), []byte("legacy memory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mm := BuildMemoryManager(cfg)
+	if mm == nil {
+		t.Fatal("BuildMemoryManager returned nil")
+	}
+	if mm.Root() != filepath.Join(config.Home(), "memory") {
+		t.Fatalf("root=%q, want canonical home", mm.Root())
+	}
+	if got, err := os.ReadFile(filepath.Join(mm.Root(), "old-topic.md")); err != nil || string(got) != "legacy memory" {
+		t.Fatalf("legacy migration failed: got=%q err=%v", got, err)
+	}
+}
+
+func TestBuildMemoryManagerImportsLegacyJSONLDespiteCanonicalNameConflict(t *testing.T) {
+	projectDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectDir, ".metis", "memory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	cfg := defaultLoopCfg(t)
+	legacy := filepath.Join(cfg.Session.Dir, "memory")
+	canonical := filepath.Join(config.Home(), "memory")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(canonical, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyLine := `{"type":"fact","key":"migration","value":"Legacy Conflict Needle","created_at":"2026-08-27T12:00:00Z"}` + "\n"
+	canonicalLine := `{"type":"fact","key":"migration","value":"Canonical Conflict Needle","created_at":"2026-08-27T11:00:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(legacy, "fact.jsonl"), []byte(legacyLine), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(canonical, "fact.jsonl"), []byte(canonicalLine), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	active := BuildMemoryManager(cfg)
+	if active == nil || active.Root() != canonical {
+		t.Fatalf("canonical repository did not remain active: %+v", active)
+	}
+	raw, err := os.ReadFile(filepath.Join(canonical, "archival", "passages.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Canonical Conflict Needle") || !strings.Contains(string(raw), "Legacy Conflict Needle") {
+		t.Fatalf("canonical repository did not import both conflicting JSONL sources: %s", raw)
+	}
+}
+
+func TestBuildAgentLoopAutoRetrieveDefaultsOnAndAllowsOptOut(t *testing.T) {
+	cfg := defaultLoopCfg(t)
+	loop := BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider: &stubProvider{maxCtx: 100_000},
+		Registry: tools.NewRegistry(),
+		Gate:     permission.New(permission.ModeAcceptEdits),
+	})
+	if loop.AutoRetrieveK != 5 {
+		t.Fatalf("default AutoRetrieveK=%d, want 5", loop.AutoRetrieveK)
+	}
+
+	t.Setenv("METIS_AUTO_RETRIEVE", "off")
+	loop = BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider: &stubProvider{maxCtx: 100_000},
+		Registry: tools.NewRegistry(),
+		Gate:     permission.New(permission.ModeAcceptEdits),
+	})
+	if loop.AutoRetrieveK != 0 {
+		t.Fatalf("explicit off AutoRetrieveK=%d, want 0", loop.AutoRetrieveK)
 	}
 }
 
@@ -272,13 +376,16 @@ func TestBuildAgentLoop_MicrocompactDisabledByEnv(t *testing.T) {
 	}
 }
 
-// TestBuildMemoryManager_ProjectScopeWritesLocally — full integration:
-// create .metis/memory in tmp, run BuildMemoryManager, write a USER
-// block, confirm the file lands under the project dir (not session dir).
-func TestBuildMemoryManager_ProjectScopeWritesLocally(t *testing.T) {
+// A historical project-local repository is imported, but every new write goes
+// to the one canonical repository shared by Desktop, CLI, and Dream.
+func TestBuildMemoryManager_ProjectScopeMigratesThenWritesCanonical(t *testing.T) {
 	projectDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(projectDir, ".metis", "memory"), 0o755); err != nil {
 		t.Fatalf("setup: %v", err)
+	}
+	legacyTopic := filepath.Join(projectDir, ".metis", "memory", "project_legacy.md")
+	if err := os.WriteFile(legacyTopic, []byte("legacy project memory\n"), 0o600); err != nil {
+		t.Fatalf("seed project memory: %v", err)
 	}
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(projectDir); err != nil {
@@ -291,18 +398,137 @@ func TestBuildMemoryManager_ProjectScopeWritesLocally(t *testing.T) {
 	if mm == nil {
 		t.Fatal("BuildMemoryManager returned nil")
 	}
-	if err := mm.Core().UpdateBlock("user", "在项目本地的 memory"); err != nil {
+	canonicalRoot := filepath.Join(config.Home(), "memory")
+	if mm.Root() != canonicalRoot {
+		t.Fatalf("active root=%q, want canonical %q", mm.Root(), canonicalRoot)
+	}
+	if err := mm.Core().UpdateBlock("user", "写入统一 canonical memory"); err != nil {
 		t.Fatalf("UpdateBlock: %v", err)
 	}
 
-	// File should land in the project's .metis/memory/core.d, not under cfg.Session.Dir.
-	// The "user" block persists to MEMORY.md (see labelToFilename in memory pkg).
+	canonicalFile := filepath.Join(canonicalRoot, "core.d", "MEMORY.md")
+	if _, err := os.Stat(canonicalFile); err != nil {
+		t.Errorf("expected MEMORY.md under canonical root at %s: %v", canonicalFile, err)
+	}
+	hits := mm.SearchCandidates("legacy project memory", 10)
+	foundProjectMemory := false
+	for _, hit := range hits {
+		if strings.Contains(hit.Content, "legacy project memory") {
+			foundProjectMemory = true
+			break
+		}
+	}
+	if !foundProjectMemory {
+		t.Fatalf("namespaced project migration was not retrievable: %+v", hits)
+	}
 	projectFile := filepath.Join(projectDir, ".metis", "memory", "core.d", "MEMORY.md")
-	if _, err := os.Stat(projectFile); err != nil {
-		t.Errorf("expected MEMORY.md under project scope at %s: %v", projectFile, err)
+	if _, err := os.Stat(projectFile); err == nil {
+		t.Errorf("new write unexpectedly went to legacy project root: %s", projectFile)
 	}
-	sessionFile := filepath.Join(cfg.Session.Dir, "memory", "core.d", "MEMORY.md")
-	if _, err := os.Stat(sessionFile); err == nil {
-		t.Errorf("user-global file %s should NOT exist when project scope is active", sessionFile)
+}
+
+func TestMigrationAcrossWorkspacesPreservesIsolation(t *testing.T) {
+	metisHome := t.TempDir()
+	t.Setenv("METIS_HOME", metisHome)
+	cfg := &config.Config{Session: config.Session{Dir: filepath.Join(metisHome, "sessions")}}
+	workspaceA := filepath.Join(t.TempDir(), "workspace-a")
+	workspaceB := filepath.Join(t.TempDir(), "workspace-b")
+	for workspace, body := range map[string]string{
+		workspaceA: "alpha workspace core needle",
+		workspaceB: "beta workspace core needle",
+	} {
+		legacy := filepath.Join(workspace, ".metis", "memory")
+		if err := os.MkdirAll(filepath.Join(legacy, "core.d"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		indexNeedle := strings.Replace(body, "core", "index", 1)
+		working := "---\nname: working\ndescription: " + indexNeedle + "\ntype: project\n---\n\n" + body + "\n"
+		if err := os.WriteFile(filepath.Join(legacy, "core.d", "WORKING.md"), []byte(working), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(legacy, "archival"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		archiveBody := strings.Replace(body, "core", "archive", 1)
+		archive := `{"id":"shared-project-id","content":` + strconv.Quote(archiveBody) + `,"type":"project"}` + "\n"
+		if err := os.WriteFile(filepath.Join(legacy, "archival", "passages.jsonl"), []byte(archive), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(legacy, "preference.jsonl"),
+			[]byte(`{"type":"preference","key":"editor","value":"global preference needle","created_at":"2026-08-28T05:00:00Z"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
+
+	buildIn := func(workspace string) *memory.MemoryManager {
+		t.Helper()
+		oldWD, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(workspace); err != nil {
+			t.Fatal(err)
+		}
+		manager := BuildMemoryManager(cfg)
+		if err := os.Chdir(oldWD); err != nil {
+			t.Fatal(err)
+		}
+		if manager == nil {
+			t.Fatal("BuildMemoryManager returned nil")
+		}
+		return manager
+	}
+
+	managerA := buildIn(workspaceA)
+	managerB := buildIn(workspaceB)
+	managerA = buildIn(workspaceA)
+	assertWorkspaceHits := func(manager *memory.MemoryManager, own, other string) {
+		t.Helper()
+		ownHits := manager.SearchCandidates(own, 10)
+		if len(ownHits) == 0 {
+			t.Fatalf("current workspace missed %q", own)
+		}
+		foundOwnScope := false
+		for _, hit := range ownHits {
+			if strings.Contains(hit.Content, own) && strings.HasPrefix(hit.Scope, "workspace:") {
+				foundOwnScope = true
+			}
+		}
+		if !foundOwnScope {
+			t.Fatalf("workspace memory lacked stable scope: %+v", ownHits)
+		}
+		ownArchive := strings.Replace(own, "core", "archive", 1)
+		archiveHits := manager.SearchCandidates(ownArchive, 10)
+		if len(archiveHits) == 0 || !strings.Contains(archiveHits[0].Content, ownArchive) || archiveHits[0].Scope == "" {
+			t.Fatalf("current workspace archive was not scoped/retrievable: %+v", archiveHits)
+		}
+		for _, hit := range manager.SearchCandidates(other, 10) {
+			if strings.Contains(hit.Content, other) {
+				t.Fatalf("cross-workspace memory leaked for %q: %+v", other, hit)
+			}
+		}
+		otherArchive := strings.Replace(other, "core", "archive", 1)
+		for _, hit := range manager.SearchCandidates(otherArchive, 10) {
+			if strings.Contains(hit.Content, otherArchive) {
+				t.Fatalf("cross-workspace archive leaked for %q: %+v", otherArchive, hit)
+			}
+		}
+		ownIndex := strings.Replace(own, "core", "index", 1)
+		otherIndex := strings.Replace(other, "core", "index", 1)
+		context := manager.BuildContext()
+		if !strings.Contains(context, ownIndex) || strings.Contains(context, otherIndex) {
+			t.Fatalf("workspace topic index was not isolated: %q", context)
+		}
+		preferenceHits := manager.SearchCandidates("global preference needle", 10)
+		if len(preferenceHits) == 0 {
+			t.Fatal("user preference was incorrectly workspace-isolated")
+		}
+		for _, hit := range preferenceHits {
+			if strings.Contains(hit.Content, "global preference needle") && hit.Scope != "user" {
+				t.Fatalf("user preference was not kept global: %+v", hit)
+			}
+		}
+	}
+	assertWorkspaceHits(managerA, "alpha workspace core needle", "beta workspace core needle")
+	assertWorkspaceHits(managerB, "beta workspace core needle", "alpha workspace core needle")
 }

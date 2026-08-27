@@ -126,32 +126,52 @@ func (a *App) stopWebUI() {
 const (
 	desktopShutdownTokenHeader  = "X-Metis-Desktop-Token"
 	webUIShutdownRequestTimeout = time.Second
-	webUIShutdownGrace          = 5 * time.Second
-	webUISignalGrace            = 2 * time.Second
-	webUIKillWait               = 2 * time.Second
+	// The backend's accepted shutdown path drains the active turn and then
+	// joins memory distillation (35s) and Auto Memory (95s) before writing the
+	// final session boundary. Keep the native shell alive for the complete
+	// durability barrier instead of interrupting a healthy child after 5s.
+	webUIShutdownGrace = 4 * time.Minute
+	webUISignalGrace   = 10 * time.Second
+	webUIKillWait      = 2 * time.Second
 )
+
+type webUIStopPolicy struct {
+	shutdownGrace time.Duration
+	signalGrace   time.Duration
+	killWait      time.Duration
+}
+
+var defaultWebUIStopPolicy = webUIStopPolicy{
+	shutdownGrace: webUIShutdownGrace,
+	signalGrace:   webUISignalGrace,
+	killWait:      webUIKillWait,
+}
 
 // stopWebUIProcess first uses the authenticated loopback control channel. It
 // works on Windows as well as Unix and lets cmdDesktop return normally through
 // runtime.Cleanup. Interrupt and hard kill remain bounded fallbacks for an
 // older or unresponsive child.
 func stopWebUIProcess(cmd *exec.Cmd, done <-chan error, port int, token string) {
+	stopWebUIProcessWithPolicy(cmd, done, port, token, defaultWebUIStopPolicy)
+}
+
+func stopWebUIProcessWithPolicy(cmd *exec.Cmd, done <-chan error, port int, token string, policy webUIStopPolicy) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	if waitForWebUIProcess(done, 0) {
 		return
 	}
-	if requestWebUIShutdown(port, token) && waitForWebUIProcess(done, webUIShutdownGrace) {
+	if requestWebUIShutdown(port, token) && waitForWebUIProcess(done, policy.shutdownGrace) {
 		return
 	}
 	if err := cmd.Process.Signal(os.Interrupt); err == nil {
-		if waitForWebUIProcess(done, webUISignalGrace) {
+		if waitForWebUIProcess(done, policy.signalGrace) {
 			return
 		}
 	}
 	_ = cmd.Process.Kill()
-	_ = waitForWebUIProcess(done, webUIKillWait)
+	_ = waitForWebUIProcess(done, policy.killWait)
 }
 
 func requestWebUIShutdown(port int, token string) bool {
@@ -404,7 +424,7 @@ func freePort() (int, error) {
 }
 
 func (a *App) GetVersion() string {
-	return "0.4.34"
+	return "0.4.35"
 }
 
 // ChooseWorkspaceDirectory is the native half of the iframe bridge. The web

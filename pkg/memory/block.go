@@ -14,8 +14,8 @@ package memory
 
 // Block is one labeled chunk of core memory.
 //
-// Persisted as JSON under ~/.metis/sessions/.../memory/<label>.json by
-// the in-process manager, but plugin authors should treat it as
+// Persisted as a labeled Markdown block under the canonical
+// $METIS_HOME/memory/core.d directory, but plugin authors should treat it as
 // read-mostly: write operations go through the Memory tool, not by
 // constructing Blocks directly. Construction here is for
 // deserialization (e.g. plugins that want to introspect what memory

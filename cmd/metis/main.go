@@ -348,14 +348,17 @@ Env:
 // --- runtime wiring shared between chat and run ---
 
 type runtime struct {
-	cfg               *config.Config
-	provider          llm.Provider
-	registry          *tools.Registry
-	gate              *permission.Gate
-	store             *session.Store
-	sessionID         string
-	sessionPointerCwd string // cwd used to key the crash-recovery pointer; empty if write failed at boot
-	loop              *agent.Loop
+	cfg                    *config.Config
+	provider               llm.Provider
+	registry               *tools.Registry
+	gate                   *permission.Gate
+	store                  *session.Store
+	sessionID              string
+	sessionPointerCwd      string // cwd used to key the crash-recovery pointer; empty if write failed at boot
+	sessionHeartbeatParent context.Context
+	sessionHeartbeatCancel context.CancelFunc
+	sessionHeartbeatDone   <-chan struct{}
+	loop                   *agent.Loop
 	// cronSvc is the per-session cron service shared with the CronCreate/
 	// List/Delete + ScheduleWakeup tools. The TUI mounts an in-session
 	// scheduler on this same instance so session-only (ephemeral) jobs the
@@ -382,7 +385,7 @@ type runtime struct {
 	allowedDirs     *rtpkg.AllowedDirs    // --add-dir state, persisted to ~/.metis/additional-dirs.json
 	// autoMemExtractor is the live G.5 DreamTask handle. Surfaced
 	// to the slash registry so /dream status can read phase + last-
-	// run stats. nil when --auto-memory isn't set.
+	// run stats. nil when the startup policy disables Auto Memory.
 	autoMemExtractor *agent.AutoMemoryExtractor
 
 	// subAgentRoster is the cross-session Roster every spawned
@@ -394,6 +397,11 @@ type runtime struct {
 	// runtime. It owns a private temp directory and is closed after jobs stop.
 	sandbox *sandbox.Manager
 }
+
+const (
+	runtimeDistillationShutdownGrace = 35 * time.Second
+	runtimeAutoMemoryShutdownGrace   = 95 * time.Second
+)
 
 func promptContextFromRuntime(model, providerName, mode string, mcpReg *mcp.Registry, hasSkills bool) rtpkg.PromptCtx {
 	return rtpkg.PromptCtx{
@@ -440,22 +448,92 @@ func (r *runtime) WaitForMCP(timeout time.Duration) bool {
 // after /resume, /branch or /new. Keeping this in the composition layer avoids
 // making internal/tui depend on transport/task/checkpoint implementations.
 func (r *runtime) rebindSession(sessionID string) {
+	cwd := ""
+	if r != nil {
+		cwd = strings.TrimSpace(r.sessionPointerCwd)
+	}
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	r.rebindSessionAt(sessionID, cwd)
+}
+
+// rebindSessionAt is the Desktop-aware session router. Unlike the terminal
+// wrapper above, its workDir comes from the resumed session header, so file
+// checkpoints and crash recovery follow the workspace actually shown and used
+// by that Desktop turn rather than the process launch directory.
+func (r *runtime) rebindSessionAt(sessionID, workDir string) {
 	if r == nil || sessionID == "" {
 		return
+	}
+	workDir = strings.TrimSpace(workDir)
+	if workDir == "" {
+		workDir, _ = os.Getwd()
 	}
 	r.sessionID = sessionID
 	rtpkg.SetCurrentSessionID(sessionID)
 	transport.SetSessionID(sessionID)
 	taskstore.SetCurrentTaskStore(sessionID)
 	rtpkg.RebindTrace(sessionID)
-	if r.loop != nil {
-		if cwd, err := os.Getwd(); err == nil {
-			r.loop.SetCheckpointer(checkpoint.NewManager(sessionID, cwd, ""))
+	if r.loop != nil && workDir != "" {
+		r.loop.SetCheckpointer(checkpoint.NewManager(sessionID, workDir, ""))
+	}
+	if workDir != "" {
+		r.rebindRecoveryPointer(sessionID, workDir)
+	}
+}
+
+func (r *runtime) rebindRecoveryPointer(sessionID, workDir string) {
+	if r == nil || sessionID == "" || strings.TrimSpace(workDir) == "" {
+		return
+	}
+	if err := session.WritePointer(sessionID, workDir); err != nil {
+		return
+	}
+	oldWorkDir := r.sessionPointerCwd
+	r.stopSessionHeartbeat()
+	if oldWorkDir != "" && oldWorkDir != workDir {
+		_ = session.ClearPointer(oldWorkDir)
+	}
+	r.sessionPointerCwd = workDir
+	if r.sessionHeartbeatParent != nil {
+		r.startSessionHeartbeat(sessionID, workDir)
+	}
+}
+
+func (r *runtime) startSessionHeartbeat(sessionID, workDir string) {
+	if r == nil || r.sessionHeartbeatParent == nil || sessionID == "" || workDir == "" {
+		return
+	}
+	ctx, cancel := context.WithCancel(r.sessionHeartbeatParent)
+	done := make(chan struct{})
+	r.sessionHeartbeatCancel = cancel
+	r.sessionHeartbeatDone = done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(session.HeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = session.RefreshPointer(sessionID, workDir)
+			}
 		}
+	}()
+}
+
+func (r *runtime) stopSessionHeartbeat() {
+	if r == nil || r.sessionHeartbeatCancel == nil {
+		return
 	}
-	if r.sessionPointerCwd != "" {
-		_ = session.WritePointer(sessionID, r.sessionPointerCwd)
+	r.sessionHeartbeatCancel()
+	if r.sessionHeartbeatDone != nil {
+		<-r.sessionHeartbeatDone
 	}
+	r.sessionHeartbeatCancel = nil
+	r.sessionHeartbeatDone = nil
 }
 
 // releaseSessionWork stops process-owned work that must not cross a top-level
@@ -489,6 +567,24 @@ func (r *runtime) Cleanup() {
 	// Desktop shutdown is bounded, so a slow MCP/plugin close must never make
 	// the final assistant/tool events disappear from the resumed session.
 	rtpkg.FlushTrace()
+
+	// Memory workers retain the provider and frozen session state. Join them
+	// before closing plugins/MCP/provider dependencies or clearing session
+	// routers. Auto Memory has a 90 second provider timeout, so its lifecycle
+	// barrier includes a small filesystem-finalization tail.
+	if r.loop != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeDistillationShutdownGrace)
+		if err := r.loop.CancelAndWaitForDistillation(ctx, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "metis: stop memory distillation during cleanup: %v\n", err)
+		}
+		cancel()
+
+		ctx, cancel = context.WithTimeout(context.Background(), runtimeAutoMemoryShutdownGrace)
+		if err := r.loop.WaitAutoMemoryIdle(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "metis: wait for auto memory during cleanup: %v\n", err)
+		}
+		cancel()
+	}
 
 	// Stop session-owned work before closing the provider/MCP dependencies it
 	// may still be using. This is idempotent, so it is safe after an in-process
@@ -534,10 +630,23 @@ func (r *runtime) Cleanup() {
 	// continued presence would re-prompt "found a recent session" on
 	// next startup. Only crashes / kill -9 leave the pointer behind.
 	if r.sessionPointerCwd != "" {
+		r.stopSessionHeartbeat()
 		_ = session.ClearPointer(r.sessionPointerCwd)
 		r.sessionPointerCwd = ""
 	}
 }
+
+type autoMemoryStartupPath uint8
+
+const (
+	// Keep the zero value conservative: setupRuntime is also used by daemon,
+	// coordinator, ACP/MCP and tests. Those headless callers must not gain an
+	// extra extraction-model call merely because they did not identify their
+	// startup path.
+	autoMemoryStartupHeadless autoMemoryStartupPath = iota
+	autoMemoryStartupInteractive
+	autoMemoryStartupDesktop
+)
 
 type cliFlags struct {
 	model        string
@@ -600,11 +709,12 @@ type cliFlags struct {
 	// Mirrors claude-code's headless jsonSchema QueryParam.
 	outputSchema string
 
-	// --auto-memory: turn on extractMemories v2 (Claude Code parity).
-	// Off by default — opt-in keeps the per-turn LLM-call cost
-	// predictable. Also accept METIS_AUTO_MEMORY=1 as env fallback so
-	// users can persist via shell init without typing the flag.
-	autoMemory bool
+	// Auto Memory is on by default for interactive chat and Desktop, but stays
+	// opt-in for headless/one-shot callers so scripts do not silently gain an
+	// extra model charge. --auto-memory remains the headless compatibility
+	// opt-in; METIS_AUTO_MEMORY can explicitly enable or disable every path.
+	autoMemory        bool
+	autoMemoryStartup autoMemoryStartupPath
 
 	// Phase E #46-#48 — small ergonomic flags. None of these change
 	// runtime behaviour drastically; they're either UI hints (a session
@@ -667,6 +777,33 @@ type cliFlags struct {
 	// and ad-hoc spend analysis without forcing the user to parse
 	// stderr `[metrics]` lines or hook into the event stream.
 	metricsLog string
+}
+
+// shouldEnableAutoMemory centralizes the product policy so every startup path
+// uses the same repository-backed extractor without making one-shot/headless
+// commands unexpectedly pay for an additional model call. An explicit
+// environment opt-out wins over both the interactive/Desktop default and the
+// legacy --auto-memory flag; this gives launchers and users a reliable kill
+// switch without introducing a second CLI flag.
+func shouldEnableAutoMemory(flags *cliFlags, lookupEnv func(string) (string, bool)) bool {
+	if flags == nil {
+		return false
+	}
+	if lookupEnv != nil {
+		if raw, ok := lookupEnv("METIS_AUTO_MEMORY"); ok {
+			switch strings.ToLower(strings.TrimSpace(raw)) {
+			case "0", "false", "off":
+				return false
+			case "1", "true", "on":
+				return true
+			}
+		}
+	}
+	if flags.autoMemory {
+		return true
+	}
+	return flags.autoMemoryStartup == autoMemoryStartupInteractive ||
+		flags.autoMemoryStartup == autoMemoryStartupDesktop
 }
 
 // stringList accumulates repeated flag values: --add-dir A --add-dir B → [A,B].
@@ -759,7 +896,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 		"reserved compatibility flag (currently no runtime effect)")
 	// Auto-memory v2 — extractMemories on LoopEnd via forked agent.
 	f.BoolVar(&out.autoMemory, "auto-memory", false,
-		"enable auto-memory extraction on every turn boundary (writes to ~/.metis/memory/<topic>.md)")
+		"enable auto-memory extraction (interactive/Desktop default on; headless default off)")
 	// CACHE-D: response cache for `metis run` (off by default).
 	f.BoolVar(&out.runCache, "cache", false,
 		"enable on-disk response cache for `metis run` (CI/cron use). Tool-use turns are never cached.")
@@ -1335,10 +1472,11 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Provider: prov, Registry: reg, Gate: gate,
 		System: system, SystemSections: systemSections,
 		Model: model, MaxIter: maxIter,
-		MemoryManager: memoryMgr,
-		Jobs:          jobsPool,
-		Monitors:      monitorReg,
-		MaxBudgetUSD:  flags.maxBudgetUSD,
+		MemoryManager:         memoryMgr,
+		MemoryManagerProvided: true,
+		Jobs:                  jobsPool,
+		Monitors:              monitorReg,
+		MaxBudgetUSD:          flags.maxBudgetUSD,
 	})
 
 	// METIS_SIMPLE / --simple → use the curated short tool descriptions
@@ -1388,37 +1526,49 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// compiles in either branch.
 	var pendingExtractor *agent.AutoMemoryExtractor
 
-	// Auto-memory v2: opt-in via --auto-memory or METIS_AUTO_MEMORY=1.
-	// Wires the extractor to LoopEnd; extractor itself is best-effort
-	// and never blocks the turn.
-	if flags.autoMemory || os.Getenv("METIS_AUTO_MEMORY") == "1" {
-		loop.AutoMemory = true
-		// Pass the configured skill dir so SkillSynth + curator target the
-		// same directory the live Skill tool / loader use (honors a custom
-		// [session] skill_dir override).
-		ext, err := agent.NewAutoMemoryExtractor(loop, "", cfg.Session.SkillDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "metis: auto-memory init: %v (disabled)\n", err)
+	// Auto-memory v2: interactive chat and Desktop default on; one-shot and
+	// other headless startup paths remain opt-in. The extractor writes through
+	// the same canonical MemoryRepository used by request-time recall.
+	if shouldEnableAutoMemory(flags, os.LookupEnv) {
+		if memoryMgr == nil {
+			fmt.Fprintln(os.Stderr, "metis: auto-memory disabled: memory repository is unavailable")
 		} else {
-			fmt.Fprintf(os.Stderr, "metis: auto-memory enabled (memdir: %s)\n", ext.MemdirRoot())
-			// G.5 (2026-05-12) — DreamTask completion channel.
-			// Buffered so the extractor never blocks on its
-			// notify-send if the model is still mid-turn; size 8
-			// is generous (a 5-minute auto-memory session rarely
-			// fires more than 1-2 forks).
-			dreamCh := make(chan agent.DreamNotification, 8)
-			loop.DreamNotify = dreamCh
-			ext.SetDreamNotify(dreamCh)
-			loop.Hooks.Register(pubhook.LoopEndHandler(func(ctx context.Context, _ pubhook.Context, stopReason string) {
-				if os.Getenv("METIS_AUTO_MEMORY_DEBUG") == "1" {
-					fmt.Fprintf(os.Stderr, "[auto-memory] LoopEnd stop=%s — invoking extractor\n", stopReason)
-				}
-				ext.OnLoopEnd(ctx, stopReason)
-			}))
-			// Stash on the runtime so the `/dream` slash command
-			// can read live phase + last-run stats. Wired below
-			// after the `rt` struct is constructed.
-			pendingExtractor = ext
+			// Auto Memory/Dream and the request-time repository must write to
+			// the same canonical root. Never pass an empty root: the extractor's
+			// fallback would create a second tree disconnected from the Memory
+			// tool and request-time recall.
+			memoryRoot := memoryMgr.Root()
+			// Pass the configured skill dir so SkillSynth + curator target the
+			// same directory the live Skill tool / loader use (honors a custom
+			// [session] skill_dir override).
+			ext, err := agent.NewAutoMemoryExtractor(loop, memoryRoot, cfg.Session.SkillDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "metis: auto-memory init: %v (disabled)\n", err)
+			} else {
+				loop.AutoMemory = true
+				fmt.Fprintf(os.Stderr, "metis: auto-memory enabled (memdir: %s)\n", ext.MemdirRoot())
+				// G.5 (2026-05-12) — DreamTask completion channel.
+				// Buffered so the extractor never blocks on its
+				// notify-send if the model is still mid-turn; size 8
+				// is generous (a 5-minute auto-memory session rarely
+				// fires more than 1-2 forks).
+				dreamCh := make(chan agent.DreamNotification, 8)
+				loop.DreamNotify = dreamCh
+				ext.SetDreamNotify(dreamCh)
+				ext.SetInvalidationHook(func(agent.MemoryInvalidation) {
+					memoryMgr.Invalidate()
+				})
+				loop.Hooks.Register(pubhook.LoopEndHandler(func(ctx context.Context, _ pubhook.Context, stopReason string) {
+					if os.Getenv("METIS_AUTO_MEMORY_DEBUG") == "1" {
+						fmt.Fprintf(os.Stderr, "[auto-memory] LoopEnd stop=%s — invoking extractor\n", stopReason)
+					}
+					ext.OnLoopEnd(ctx, stopReason)
+				}))
+				// Stash on the runtime so the `/dream` slash command
+				// can read live phase + last-run stats. Wired below
+				// after the `rt` struct is constructed.
+				pendingExtractor = ext
+			}
 		}
 	}
 
@@ -1543,14 +1693,17 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// resume it?" Best-effort throughout — a write/heartbeat failure must
 	// never crash the agent, so errors are intentionally swallowed.
 	if cwd, err := os.Getwd(); err == nil {
-		_ = session.WritePointer(rt.sessionID, cwd)
+		pointerErr := session.WritePointer(rt.sessionID, cwd)
 		// Heartbeat goroutine bumps mtime every HeartbeatInterval until
 		// the parent ctx is cancelled (signal.NotifyContext catches
 		// SIGINT/SIGTERM). Only crashes / kill -9 leave the pointer
 		// behind for the next startup to detect — graceful shutdown
 		// goes through runtime.Cleanup → session.ClearPointer.
-		session.StartHeartbeat(ctx, rt.sessionID, cwd)
-		rt.sessionPointerCwd = cwd
+		if pointerErr == nil {
+			rt.sessionPointerCwd = cwd
+			rt.sessionHeartbeatParent = ctx
+			rt.startSessionHeartbeat(rt.sessionID, cwd)
+		}
 	}
 
 	// Push UI performance tunables into the TUI package so its per-tick
@@ -1639,6 +1792,7 @@ func cmdChat(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	flags.autoMemoryStartup = autoMemoryStartupInteractive
 	// Trust-this-folder safety check — claude-code's first-run dance.
 	// Skipped when stdin isn't a terminal (CI, expect-scripted) or
 	// when METIS_NO_TRUST_PROMPT=1. Persists answer to
@@ -2268,7 +2422,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	// duration from ~10s to 30-60s on slow providers; the prior 45s
 	// cap was truncating mid-fork and leaving stale PID bodies in the
 	// dream lock (which then blocked future dreams via the time gate).
-	if flags.autoMemory || os.Getenv("METIS_AUTO_MEMORY") == "1" {
+	if rt.autoMemExtractor != nil {
 		waitForkInflight(120 * time.Second)
 	}
 	// Phase A — surface incomplete aborts to wrapper scripts via the
@@ -2284,7 +2438,13 @@ func cmdRun(ctx context.Context, args []string) error {
 		}
 		return &exitcode.IncompleteError{Reason: incompleteReason, Detail: incompleteDetail}
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// A clean one-shot run is a durability boundary. Successful exchanges
+	// below the normal cadence are still only pending at this point; register
+	// and join them before Cleanup destructively cancels residual jobs.
+	return rt.persistHeadlessMemoryBoundary("metis run", runtimeDistillationShutdownGrace)
 }
 
 // waitForkInflight blocks until agent.ForkInflight() returns 0 or the
@@ -2364,17 +2524,39 @@ func cmdACP(ctx context.Context, args []string) error {
 	// Tell the ACP layer what version to advertise in InitializeResult
 	// so clients see the same version as `metis --version`.
 	acp.SetServerVersion(version.Version)
-	srv := acp.NewServerForSession(loop, addr, sessionID)
+	srv := acp.NewServerForSessionContext(ctx, loop, addr, sessionID)
 	if err := srv.Listen(); err != nil {
 		return err
 	}
-	if addr == "stdio" || addr == "" {
-		srv.Wait()
-		return nil
+	if addr != "stdio" && addr != "" {
+		fmt.Fprintf(os.Stderr, "metis acp listening on %s (Ctrl-C to stop)\n", addr)
 	}
-	fmt.Fprintf(os.Stderr, "metis acp listening on %s (Ctrl-C to stop)\n", addr)
-	<-ctx.Done()
-	return srv.Close()
+	return waitForACPServer(ctx, srv)
+}
+
+type acpServerLifecycle interface {
+	Wait()
+	Close() error
+}
+
+// waitForACPServer treats process-context cancellation as a service shutdown
+// in both TCP and stdio modes. Waiting on stdio alone is insufficient because
+// its decoder can remain blocked in os.Stdin after SIGINT/SIGTERM.
+func waitForACPServer(ctx context.Context, srv acpServerLifecycle) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		srv.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		return nil
+	case <-ctx.Done():
+		return srv.Close()
+	}
 }
 
 // cmdVersion handles `metis version` (and the `--version` / `-v` aliases).
@@ -2972,6 +3154,9 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 		}
 	}
 	runErr := <-done
+	if runErr == nil {
+		runErr = rt.persistHeadlessMemoryBoundary("cron job "+job.ID, runtimeDistillationShutdownGrace)
+	}
 
 	// Nudge the user once if this fire wanted tools it wasn't pre-authorized
 	// for. Without this the denials are invisible until they go looking —
@@ -3762,9 +3947,9 @@ func buildSlash(rt *runtime) *slash.Registry {
 		return "mode set to " + string(mode), slash.SignalNone
 	}})
 	// /dream — DreamTask (auto-memory) status (G.5, 2026-05-12).
-	// Reads the live extractor's phase + last-run stats. Off-mode
-	// when --auto-memory wasn't set: returns a hint about enabling
-	// it instead of failing silently.
+	// Reads the live extractor's phase + last-run stats. When startup policy or
+	// initialization leaves it unavailable, return a hint instead of failing
+	// silently.
 	r.Register(slash.Cmd{Name: "dream", Description: "DreamTask status — current phase, last run files & duration", Handler: func(arg string) (string, slash.Signal) {
 		return formatDreamStatus(rt.autoMemExtractor, arg), slash.SignalNone
 	}})
@@ -4014,7 +4199,7 @@ func formatDreamStatus(ext *agent.AutoMemoryExtractor, arg string) string {
 		return "(dream: unknown subcommand — usage: /dream [status])"
 	}
 	if ext == nil {
-		return "(dream: auto-memory not enabled — run metis with --auto-memory or set METIS_AUTO_MEMORY=1)"
+		return "(dream: auto-memory unavailable — unset METIS_AUTO_MEMORY=0/false/off; headless callers can use --auto-memory or METIS_AUTO_MEMORY=1)"
 	}
 	st := ext.Stats()
 	var b strings.Builder

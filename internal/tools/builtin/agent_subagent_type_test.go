@@ -17,13 +17,76 @@ package builtin
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+func TestAgentTool_SubagentType_BackgroundSetupFailureReleasesRoster(t *testing.T) {
+	tests := []struct {
+		name   string
+		loader AgentProfileLoader
+	}{
+		{
+			name:   "loader not wired",
+			loader: nil,
+		},
+		{
+			name: "loader error",
+			loader: func(string) (*AgentProfileSpec, error) {
+				return nil, errors.New("profile store unavailable")
+			},
+		},
+		{
+			name: "profile not found",
+			loader: func(string) (*AgentProfileSpec, error) {
+				return nil, nil
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			roster := agent.NewRoster(0)
+			tool := NewAgent(
+				permission.New(permission.ModeBypass),
+				helloProvider(),
+				tools.NewRegistry(),
+				"model",
+				"PARENT-SYSTEM",
+			).WithRoster(roster)
+			if tc.loader != nil {
+				tool = tool.WithProfileLoader(tc.loader)
+			}
+
+			res, err := tool.Execute(context.Background(), map[string]any{
+				"prompt":            "profile setup must fail before runner start",
+				"subagent_type":     "missing",
+				"run_in_background": true,
+			})
+			if err != nil {
+				t.Fatalf("Execute returned transport error: %v", err)
+			}
+			if res == nil || !res.IsError {
+				t.Fatalf("expected profile setup error, got %+v", res)
+			}
+			if got := roster.Count(); got != 0 {
+				t.Fatalf("profile setup failure leaked %d live roster entries; want 0", got)
+			}
+
+			joinCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			if err := roster.CancelAndWait(joinCtx); err != nil {
+				t.Fatalf("CancelAndWait should return immediately after setup failure: %v", err)
+			}
+		})
+	}
+}
 
 // stubLoader returns a profile with a recognizable system prompt so
 // the test can assert the sub-loop's system was overridden.

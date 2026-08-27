@@ -5,10 +5,10 @@ package agent
 // outgoing llm.Request.SystemSections.
 //
 // The bug this prevents: pre-fix, memory was concatenated into the
-// System string. That broke per-section caching because the Anthropic
-// provider couldn't see "memory is dynamic, never cache" — every
-// memory write invalidated the addendum cache, defeating the whole
-// point of prompt caching for long-running sessions.
+// System string. That broke per-section caching because the provider could
+// not reuse the stable short memory index independently from query-specific
+// recall. The index is byte-stable until memory changes; recalled bodies live
+// in a synthetic user tail during live turns.
 
 import (
 	"testing"
@@ -17,7 +17,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/memory"
 )
 
-func TestBuildRequest_AppendsMemoryAsVolatileSection(t *testing.T) {
+func TestBuildRequest_AppendsStableMemoryIndexSection(t *testing.T) {
 	dir := t.TempDir()
 	mm, err := memory.NewMemoryManager(dir)
 	if err != nil {
@@ -40,19 +40,20 @@ func TestBuildRequest_AppendsMemoryAsVolatileSection(t *testing.T) {
 	}
 	req := l.buildRequest(nil)
 
-	// Memory section must be appended at the END with Volatile=true.
+	// The short index is stable and cacheable. Query-specific bodies are not
+	// part of this section and are attached at the conversation tail by Run.
 	if len(req.SystemSections) != 4 {
 		t.Fatalf("expected 4 sections (base + env + addendum + memory), got %d", len(req.SystemSections))
 	}
 	last := req.SystemSections[3]
-	if last.Name != "memory" {
-		t.Errorf("last section should be 'memory', got %q", last.Name)
+	if last.Name != "memory_index" {
+		t.Errorf("last section should be 'memory_index', got %q", last.Name)
 	}
-	if !last.Volatile {
-		t.Error("memory section MUST be Volatile=true (defeats the cache bug)")
+	if last.Volatile {
+		t.Error("stable memory index must not be volatile")
 	}
-	if last.Cache {
-		t.Error("memory section must not be marked Cache=true (Volatile would override but the intent should be clear)")
+	if !last.Cache {
+		t.Error("stable memory index must be cacheable")
 	}
 	if last.Body == "" {
 		t.Error("memory section body is empty — BuildContext returned nothing")
@@ -97,6 +98,20 @@ func TestBuildRequest_NoMemoryNoSection(t *testing.T) {
 	req := l.buildRequest(nil)
 	if len(req.SystemSections) != 1 {
 		t.Errorf("expected exactly 1 section when no memory; got %d", len(req.SystemSections))
+	}
+}
+
+func TestAppendUserClearsPreviousTurnMemorySnapshot(t *testing.T) {
+	l := &Loop{
+		turnMemoryContext:        "old-index",
+		turnMemoryRecall:         "old-recall",
+		turnMemoryPrepared:       true,
+		turnMemoryRecallAttached: true,
+	}
+	l.AppendUser("new query")
+	if l.turnMemoryPrepared || l.turnMemoryRecallAttached || l.turnMemoryContext != "" || l.turnMemoryRecall != "" {
+		t.Fatalf("new user turn retained old memory snapshot: context=%q recall=%q prepared=%v attached=%v",
+			l.turnMemoryContext, l.turnMemoryRecall, l.turnMemoryPrepared, l.turnMemoryRecallAttached)
 	}
 }
 

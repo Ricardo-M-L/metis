@@ -14,6 +14,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	sessionpkg "github.com/Ricardo-M-L/metis/internal/session"
@@ -91,6 +92,44 @@ func (blockingProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamRe
 	}()
 	return bs, nil
 }
+
+// contextBlockingProvider reports when a request reaches the provider and
+// then returns the request context's cancellation error. Unlike blockingStream
+// it cannot turn a cancellation into a clean EOF, which makes it suitable for
+// proving that service shutdown does not persist a partial turn.
+type contextBlockingProvider struct {
+	started       chan struct{}
+	cancelled     chan struct{}
+	startedOnce   sync.Once
+	cancelledOnce sync.Once
+}
+
+func newContextBlockingProvider() *contextBlockingProvider {
+	return &contextBlockingProvider{started: make(chan struct{}), cancelled: make(chan struct{})}
+}
+
+func (p *contextBlockingProvider) Name() string          { return "context-blocking" }
+func (p *contextBlockingProvider) MaxContextTokens() int { return 100000 }
+func (p *contextBlockingProvider) ModelID() string       { return "" }
+func (p *contextBlockingProvider) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
+	return nil, errors.New("not implemented")
+}
+func (p *contextBlockingProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamReader, error) {
+	p.startedOnce.Do(func() { close(p.started) })
+	return &contextBlockingStream{ctx: ctx, provider: p}, nil
+}
+
+type contextBlockingStream struct {
+	ctx      context.Context
+	provider *contextBlockingProvider
+}
+
+func (s *contextBlockingStream) Recv() (llm.StreamEvent, error) {
+	<-s.ctx.Done()
+	s.provider.cancelledOnce.Do(func() { close(s.provider.cancelled) })
+	return llm.StreamEvent{}, s.ctx.Err()
+}
+func (*contextBlockingStream) Close() error { return nil }
 
 // --- helpers -----------------------------------------------------------------
 
@@ -394,6 +433,201 @@ func TestACP_CloseUnblocksActiveTCPConnections(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		conn.Close()
 		t.Fatal("Server.Close hung — active TCP conn was not force-closed")
+	}
+}
+
+func TestACP_CloseCancelsActiveTCPPromptWithoutPersistingPartialTurn(t *testing.T) {
+	const sessionID = "acp-cancelled-session"
+	manager, err := memory.NewMemoryManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &acpPromptBoundaryRepository{Repository: manager}
+	provider := newContextBlockingProvider()
+	loop := agent.NewLoop(
+		provider,
+		tools.NewRegistry(),
+		permission.New(permission.ModeBypass),
+		agent.NewHookRegistry(),
+		"system",
+		5,
+	)
+	loop.Memory = repository
+	loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+		return agent.RuntimeStateSnapshot{SessionID: sessionID}
+	}
+
+	srv := NewServerForSession(loop, "127.0.0.1:0", sessionID)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", srv.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	sendRequest(t, conn, 73, "prompt", map[string]any{"prompt": "do not persist this partial turn"})
+
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt never reached provider")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- srv.Close() }()
+	select {
+	case <-provider.cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Server.Close did not cancel active prompt context")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Server.Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Server.Close hung waiting for cancelled prompt")
+	}
+
+	recorded, distilled := repository.snapshot()
+	if len(recorded) != 0 || len(distilled) != 0 {
+		t.Fatalf("cancelled prompt persisted partial memory: recorded=%v distilled=%v", recorded, distilled)
+	}
+}
+
+func TestACP_CloseUnblocksStdioReader(t *testing.T) {
+	loop := agent.NewLoop(
+		helloProvider(),
+		tools.NewRegistry(),
+		permission.New(permission.ModeBypass),
+		agent.NewHookRegistry(),
+		"system",
+		5,
+	)
+	srv := NewServer(loop, "stdio")
+	inputReader, inputWriter := io.Pipe()
+	defer inputWriter.Close()
+	srv.stdioIn = inputReader
+	srv.stdioOut = io.Discard
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- srv.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Server.Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Server.Close hung on stdio decoder")
+	}
+}
+
+type acpPromptBoundaryRepository struct {
+	memory.Repository
+
+	mu        sync.Mutex
+	recorded  []string
+	distilled []string
+}
+
+func (r *acpPromptBoundaryRepository) RecordTurn(
+	_ context.Context,
+	sessionID, _, _, _ string,
+) error {
+	r.mu.Lock()
+	r.recorded = append(r.recorded, sessionID)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *acpPromptBoundaryRepository) DistillTurnWithMetadata(
+	_ context.Context,
+	_ llm.Provider,
+	sessionID, _, _, _ string,
+) error {
+	r.mu.Lock()
+	r.distilled = append(r.distilled, sessionID)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *acpPromptBoundaryRepository) snapshot() (recorded, distilled []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.recorded...), append([]string(nil), r.distilled...)
+}
+
+func TestACP_TCPPromptPersistsResidualBeforeSuccessResponse(t *testing.T) {
+	const sessionID = "acp-tcp-session"
+	manager, err := memory.NewMemoryManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &acpPromptBoundaryRepository{Repository: manager}
+	loop := agent.NewLoop(
+		helloProvider(),
+		tools.NewRegistry(),
+		permission.New(permission.ModeBypass),
+		agent.NewHookRegistry(),
+		"system",
+		5,
+	)
+	loop.Memory = repository
+	loop.DistillEvery = 5
+	loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+		return agent.RuntimeStateSnapshot{SessionID: sessionID}
+	}
+
+	srv := NewServerForSession(loop, "127.0.0.1:0", sessionID)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	conn, err := net.Dial("tcp", srv.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	request := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      17,
+		"method":  "prompt",
+		"params":  map[string]any{"prompt": "Remember the TCP release codename White Finch."},
+	}
+	if err := json.NewEncoder(conn).Encode(request); err != nil {
+		t.Fatal(err)
+	}
+
+	decoder := json.NewDecoder(conn)
+	for {
+		var response map[string]any
+		if err := decoder.Decode(&response); err != nil {
+			t.Fatalf("decode ACP response: %v", err)
+		}
+		id, hasID := response["id"].(float64)
+		if !hasID || int(id) != 17 {
+			continue
+		}
+		if response["error"] != nil {
+			t.Fatalf("ACP prompt error: %v", response["error"])
+		}
+		break
+	}
+
+	recorded, distilled := repository.snapshot()
+	if len(recorded) != 1 || recorded[0] != sessionID {
+		t.Fatalf("recorded sessions = %v, want [%s]", recorded, sessionID)
+	}
+	if len(distilled) != 1 || distilled[0] != sessionID {
+		t.Fatalf("distilled sessions at success response = %v, want exactly [%s]", distilled, sessionID)
 	}
 }
 

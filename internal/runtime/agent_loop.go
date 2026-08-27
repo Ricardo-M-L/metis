@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -28,20 +29,27 @@ type AgentLoopOptions struct {
 	// SystemSections is the typed-section form of System. When
 	// non-empty, BuildAgentLoop attaches it to the Loop so per-iteration
 	// requests can carry per-section cache_control hints to the
-	// Anthropic provider. Memory becomes its own Volatile section at
-	// request-build time (see Loop.buildRequest), so memory updates
-	// don't invalidate the addendum cache. nil → legacy boundary-marker
-	// path on the System string.
+	// Anthropic provider. The compact Core/topic memory index becomes a
+	// stable cacheable section; query-specific recall remains a volatile
+	// tail at request-build time (see Loop.buildRequest). nil → legacy
+	// boundary-marker path on the System string.
 	SystemSections []SystemPromptSection
 	Model          string
 	MaxIter        int
 	// MemoryManager is optional. When nil, BuildAgentLoop constructs
-	// one at the default location (`<sessionDir>/memory`) — keeps
+	// one at the canonical user/project repository — keeps
 	// existing call-sites working. main.go now constructs it earlier
 	// so the same instance can also be threaded into BuildToolRegistry,
 	// letting the Memory tool write through the same store the Loop
 	// reads via BuildContext (fixes the 2026-04-30 disconnect bug).
-	MemoryManager *memory.MemoryManager
+	MemoryManager memory.Repository
+	// MemoryManagerProvided distinguishes an explicitly constructed memory
+	// repository from an omitted option. This matters when construction failed:
+	// assigning a nil *MemoryManager to the Repository interface produces a
+	// non-nil interface value. In that case the runtime must leave memory
+	// disabled instead of storing the typed nil or silently constructing a
+	// second repository that is disconnected from the Memory tool.
+	MemoryManagerProvided bool
 
 	// Jobs is the background-bash pool shared between Bash auto-bg
 	// promotion and the Loop.injectJobNotifications drainer. nil
@@ -68,52 +76,78 @@ type AgentLoopOptions struct {
 // so callers don't have to thread errors through the bootstrap (memory
 // failure is non-fatal — chat works without persistent recall).
 //
-// Scope resolution (2026-05-15):
-//
-//  1. If `./.metis/memory/` exists in the process cwd, that directory
-//     is the root. This is "project-scoped" memory — running metis
-//     inside a project keeps its notes local instead of polluting the
-//     user-global store. Mirrors the existing precedent for project
-//     agent profiles (./.metis/agents/ wins over ~/.metis/agents/).
-//  2. Otherwise fall back to `<cfg.Session.Dir>/memory`, the
-//     user-global root used historically.
-//
-// Opt-in by design: users have to `mkdir -p .metis/memory` themselves
-// to switch a project to local memory. The detection is presence-only,
-// not "walk up looking for a .metis/ marker" — keeps the rule simple
-// and predictable (no surprise inheritance from a parent directory).
+// There is one active repository: `<METIS_HOME>/memory`. Historical
+// `<cfg.Session.Dir>/memory` and cwd-local `./.metis/memory` trees are migration
+// sources only. Keeping one canonical root is what lets Desktop, CLI, Dream,
+// slash commands, deletion, and cross-session recall share the same lifecycle.
 //
 // Idempotent: calling twice with the same cfg returns two managers
 // pointing at the same on-disk store, both operating on the same
 // files via their internal mutexes.
 func BuildMemoryManager(cfg *config.Config) *memory.MemoryManager {
-	memRoot := resolveMemoryRoot(cfg)
-	mm, err := memory.NewMemoryManager(memRoot)
-	if err != nil {
-		return nil
+	canonicalRoot := filepath.Join(config.Home(), "memory")
+	legacyRoots := make([]string, 0, 1)
+	if strings.TrimSpace(cfg.Session.Dir) != "" {
+		legacyRoots = append(legacyRoots, filepath.Join(cfg.Session.Dir, "memory"))
 	}
-	return mm
-}
-
-// resolveMemoryRoot picks the memory root path per the scope rules
-// documented on BuildMemoryManager. Exported only via that wrapper;
-// callers shouldn't need to know which root won.
-//
-// Logs the chosen root to stderr when METIS_DEBUG=1 so users can
-// verify cwd-scoped memory took effect without grepping the file
-// system.
-func resolveMemoryRoot(cfg *config.Config) string {
-	const projectDir = ".metis/memory"
-	if st, err := os.Stat(projectDir); err == nil && st.IsDir() {
-		abs, err := filepath.Abs(projectDir)
-		if err == nil {
-			if os.Getenv("METIS_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "metis: memory root = %s (project-scoped)\n", abs)
-			}
-			return abs
+	workspacePath, workspaceErr := os.Getwd()
+	projectLegacyRoot := ""
+	projectCandidate := filepath.Join(".metis", "memory")
+	// Lstat is intentional: a symlinked legacy root must reach the migration
+	// trust boundary and produce an explicit diagnostic, never be silently
+	// accepted through Stat or skipped as a missing directory.
+	if _, err := os.Lstat(projectCandidate); err == nil {
+		if projectRoot, absErr := filepath.Abs(projectCandidate); absErr == nil {
+			projectLegacyRoot = projectRoot
 		}
 	}
-	root := filepath.Join(cfg.Session.Dir, "memory")
+	for _, legacyRoot := range legacyRoots {
+		if filepath.Clean(legacyRoot) == filepath.Clean(canonicalRoot) {
+			continue
+		}
+		if err := memory.MigrateLegacyRoot(legacyRoot, canonicalRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "metis: memory migration %s -> %s: %v\n", legacyRoot, canonicalRoot, err)
+		}
+	}
+	if projectLegacyRoot != "" && workspaceErr == nil && filepath.Clean(projectLegacyRoot) != filepath.Clean(canonicalRoot) {
+		if err := memory.MigrateLegacyWorkspaceRoot(projectLegacyRoot, canonicalRoot, workspacePath); err != nil {
+			fmt.Fprintf(os.Stderr, "metis: project memory migration %s -> %s: %v\n", projectLegacyRoot, canonicalRoot, err)
+		}
+	}
+
+	var canonical *memory.MemoryManager
+	var canonicalErr error
+	if workspaceErr == nil {
+		canonical, canonicalErr = memory.NewMemoryManagerForWorkspace(canonicalRoot, workspacePath)
+	} else {
+		canonical, canonicalErr = memory.NewMemoryManager(canonicalRoot)
+	}
+	if canonicalErr != nil {
+		return nil
+	}
+	for _, legacyRoot := range legacyRoots {
+		if filepath.Clean(legacyRoot) == filepath.Clean(canonicalRoot) {
+			continue
+		}
+		if err := canonical.ImportLegacyStore(legacyRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "metis: legacy memory import %s -> %s: %v\n", legacyRoot, canonicalRoot, err)
+		}
+	}
+	return canonical
+}
+
+// BuildMemoryRepository is the interface-first constructor for new callers.
+// BuildMemoryManager remains as a compatibility wrapper for the Memory tool
+// and plugins that still need the concrete tier accessors.
+func BuildMemoryRepository(cfg *config.Config) memory.Repository {
+	return BuildMemoryManager(cfg)
+}
+
+// resolveMemoryRoot returns the one canonical memory root. The cfg argument is
+// retained for source compatibility with tests and embedders.
+func resolveMemoryRoot(cfg *config.Config) string {
+	_ = cfg
+	root := filepath.Join(config.Home(), "memory")
 	if os.Getenv("METIS_DEBUG") == "1" {
 		fmt.Fprintf(os.Stderr, "metis: memory root = %s (user-global)\n", root)
 	}
@@ -200,29 +234,41 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		return state
 	}
 
-	// Memory manager — persistent recall across sessions. Caller can
-	// pass a pre-built one (so the same instance gets handed to the
-	// Memory tool) or leave it nil to fall back to the default store.
-	if opts.MemoryManager != nil {
+	// Memory manager — persistent recall across sessions. Caller can pass a
+	// pre-built one (so the same instance gets handed to the Memory tool) or
+	// omit it to fall back to the default store. An explicitly supplied but
+	// unusable repository disables memory for this runtime: falling back here
+	// would split reads and writes across two independently constructed trees.
+	if usableMemoryRepository(opts.MemoryManager) {
 		loop.Memory = opts.MemoryManager
-	} else if mm := BuildMemoryManager(cfg); mm != nil {
-		loop.Memory = mm
+	} else if !opts.MemoryManagerProvided {
+		mm := BuildMemoryManager(cfg)
+		if mm != nil {
+			loop.Memory = mm
+		}
 	}
 
-	// Per-turn auto retrieval (METIS_AUTO_RETRIEVE=K). Off by default;
-	// users opt in via env. Bound the value: invalid / negative / >50
-	// silently clamp to a safe range so a typo doesn't pull 1000
-	// passages into every system prompt.
-	if v := os.Getenv("METIS_AUTO_RETRIEVE"); v != "" {
-		if k, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && k > 0 {
-			if k > 50 {
-				k = 50
-			}
-			loop.AutoRetrieveK = k
-			if os.Getenv("METIS_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "metis: auto-retrieve enabled (top-%d archival passages per turn)\n", k)
+	// Per-turn local BM25 retrieval defaults to top-5. This reads the cached
+	// unified archival+topic corpus and adds only the relevant volatile tail;
+	// it does not perturb the stable system-prompt prefix or make an LLM call.
+	// METIS_AUTO_RETRIEVE=0/off/false disables it; positive values are clamped
+	// to 1..50 for backwards compatibility with existing tuning.
+	loop.AutoRetrieveK = 5
+	if raw := strings.TrimSpace(os.Getenv("METIS_AUTO_RETRIEVE")); raw != "" {
+		switch strings.ToLower(raw) {
+		case "0", "off", "false", "disabled":
+			loop.AutoRetrieveK = 0
+		default:
+			if k, err := strconv.Atoi(raw); err == nil && k > 0 {
+				if k > 50 {
+					k = 50
+				}
+				loop.AutoRetrieveK = k
 			}
 		}
+	}
+	if os.Getenv("METIS_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "metis: auto-retrieve top-k = %d (cached archival + topic BM25)\n", loop.AutoRetrieveK)
 	}
 
 	// AutoRetrieve LLM rerank (METIS_AUTO_RETRIEVE_RERANK=1). When on,
@@ -349,6 +395,23 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	}
 
 	return loop
+}
+
+// usableMemoryRepository handles typed-nil interface values without limiting
+// Repository implementations to *memory.MemoryManager. Repository is expected
+// to be implemented by pointer-like values, but the kind switch also keeps
+// this helper safe for mocks and adapters introduced later.
+func usableMemoryRepository(repo memory.Repository) bool {
+	if repo == nil {
+		return false
+	}
+	v := reflect.ValueOf(repo)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return !v.IsNil()
+	default:
+		return true
+	}
 }
 
 // providerMaxTokens returns the configured per-request output budget for

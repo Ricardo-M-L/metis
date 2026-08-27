@@ -133,16 +133,19 @@ func trimHookSeparator(s string) string {
 // writes to a sibling tmp file then renames, so a crashed extractor
 // can't leave a half-written index that breaks the next ReadIndex.
 //
-// The output is sorted by type (user, feedback, project, reference,
+// The output is sorted by type (user, feedback, project, context, reference,
 // unclassified) then by filename within each type. Each line is
 // `- [<frontmatter.name>](<basename>) — <description>`. Files with
 // parse errors are dropped from the index — they remain on disk and
 // show up in the manifest's "errors" section but don't pollute the
 // curated index.
 func WriteIndex(root string, files []MemoryFile) error {
+	if err := EnsureRoot(root); err != nil {
+		return err
+	}
 	var sb strings.Builder
 
-	order := []MemoryType{TypeUser, TypeFeedback, TypeProject, TypeReference, ""}
+	order := []MemoryType{TypeUser, TypeFeedback, TypeProject, TypeContext, TypeReference, ""}
 	for _, t := range order {
 		var section []MemoryFile
 		for _, f := range files {
@@ -178,5 +181,8 @@ func WriteIndex(root string, files []MemoryFile) error {
 	if err := os.WriteFile(tmp, []byte(sb.String()), 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, IndexPath(root))
+	if err := os.Rename(tmp, IndexPath(root)); err != nil {
+		return err
+	}
+	return os.Chmod(IndexPath(root), 0o600)
 }

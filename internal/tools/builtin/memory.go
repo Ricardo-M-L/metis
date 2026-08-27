@@ -10,15 +10,17 @@ package builtin
 // — every Memory.add silently dropped on the floor for system-prompt
 // purposes.
 //
-// New design: the tool is a thin wrapper over MemoryManager.Core() +
-// MemoryManager.Archival(). Block writes go through Core.UpdateBlock
-// (so the next BuildContext picks them up); searches hit the same
-// archival passages.jsonl that has BM25 + LLM-rerank already wired.
+// New design: the tool is a thin wrapper over MemoryManager's Repository API.
+// Core block read-modify-write operations reload authoritative state while
+// holding the cross-process repository lock; searches hit the same archival
+// passages.jsonl that has BM25 + LLM-rerank already wired.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -27,22 +29,42 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-// Memory is the LLM-facing tool. It needs a *memory.MemoryManager
-// reference so writes flow through the same store BuildContext reads.
-// The pointer is wired in by `runtime.BuildToolRegistry` after
-// `MemoryManager` is constructed in `runtime.BuildAgentLoop`.
+// Memory is the LLM-facing tool. It keeps the Repository contract rather than
+// a concrete *memory.MemoryManager so Desktop can bind the loop and this tool
+// to one shared, atomically re-targetable workspace view. Writes therefore
+// always flow through the same repository BuildContext reads, including after
+// an in-process session switch crosses workspace boundaries.
 type Memory struct {
 	tools.BaseTool
-	gate *permission.Gate
-	mm   *memory.MemoryManager
+	gate              *permission.Gate
+	mm                memory.Repository
+	sourceSessionIDFn func() string
 }
 
 // NewMemory is the runtime constructor — mirrors NewAgent /
 // NewSendMessage / NewSkill / NewScheduleWakeup. Passing a nil
 // manager doesn't crash; Execute returns a clear error so the LLM
 // knows the capability is unavailable.
-func NewMemory(gate *permission.Gate, mm *memory.MemoryManager) Memory {
+func NewMemory(gate *permission.Gate, mm memory.Repository) Memory {
+	if mm != nil {
+		value := reflect.ValueOf(mm)
+		switch value.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if value.IsNil() {
+				mm = nil
+			}
+		}
+	}
 	return Memory{gate: gate, mm: mm}
+}
+
+// WithSourceSessionIDFn returns a copy that attributes session-owned archival
+// writes to the currently active conversation. Core user/system blocks remain
+// deliberately global preferences; session deletion only removes repository
+// rows whose provenance names that session.
+func (m Memory) WithSourceSessionIDFn(fn func() string) Memory {
+	m.sourceSessionIDFn = fn
+	return m
 }
 
 func (Memory) Name() string { return "Memory" }
@@ -76,7 +98,7 @@ func (m Memory) InputSchema() map[string]any {
 			},
 			"query": map[string]any{
 				"type":        "string",
-				"description": "Search query for archival memory (BM25F-ranked, listwise LLM rerank applied if provider available).",
+				"description": "Search query for unified archival and topic memory (BM25F-ranked).",
 			},
 			"limit": map[string]any{
 				"type":        "number",
@@ -161,7 +183,7 @@ func (m Memory) Execute(_ context.Context, in map[string]any) (*tools.Result, er
 	case "archive":
 		mtype, _ := in["memory_type"].(string)
 		tags := stringsFromAny(in["tags"])
-		return m.archive(content, mtype, tags)
+		return m.archive(content, mtype, tags, m.sourceSessionID())
 	case "stats":
 		return m.stats()
 	}
@@ -179,15 +201,11 @@ func (m Memory) add(target, content string) (*tools.Result, error) {
 	if content == "" {
 		return &tools.Result{Output: "Memory add: content required", IsError: true}, nil
 	}
-	cur := blockText(m.mm.Core().GetBlock(target))
-	next := content
-	if cur != "" {
-		next = cur + "\n" + content
-	}
-	if err := m.mm.Core().UpdateBlock(target, next); err != nil {
+	block, err := m.mm.AddCoreBlock(target, content)
+	if err != nil {
 		return &tools.Result{Output: "Memory add: " + err.Error(), IsError: true}, nil
 	}
-	return &tools.Result{Output: fmt.Sprintf("added to %s memory (now %d chars)", target, len(next))}, nil
+	return &tools.Result{Output: fmt.Sprintf("added to %s memory (now %d chars)", target, len(block.Content))}, nil
 }
 
 // replace swaps the FIRST occurrence of `match` with `content`. Plain
@@ -200,12 +218,11 @@ func (m Memory) replace(target, match, content string) (*tools.Result, error) {
 	if content == "" {
 		return &tools.Result{Output: "Memory replace: content required", IsError: true}, nil
 	}
-	cur := blockText(m.mm.Core().GetBlock(target))
-	if !strings.Contains(cur, match) {
+	_, err := m.mm.ReplaceCoreBlock(target, match, content)
+	if errors.Is(err, memory.ErrCoreMatchNotFound) {
 		return &tools.Result{Output: "Memory replace: match not found in " + target + " block", IsError: true}, nil
 	}
-	next := strings.Replace(cur, match, content, 1)
-	if err := m.mm.Core().UpdateBlock(target, next); err != nil {
+	if err != nil {
 		return &tools.Result{Output: "Memory replace: " + err.Error(), IsError: true}, nil
 	}
 	return &tools.Result{Output: "replaced in " + target + " memory"}, nil
@@ -218,21 +235,23 @@ func (m Memory) remove(target, match string) (*tools.Result, error) {
 	if match == "" {
 		return &tools.Result{Output: "Memory remove: match required", IsError: true}, nil
 	}
-	cur := blockText(m.mm.Core().GetBlock(target))
-	if !strings.Contains(cur, match) {
+	_, err := m.mm.RemoveCoreBlock(target, match)
+	if errors.Is(err, memory.ErrCoreMatchNotFound) {
 		return &tools.Result{Output: "Memory remove: match not found in " + target + " block", IsError: true}, nil
 	}
-	next := strings.Replace(cur, match, "", 1)
-	if err := m.mm.Core().UpdateBlock(target, next); err != nil {
+	if err != nil {
 		return &tools.Result{Output: "Memory remove: " + err.Error(), IsError: true}, nil
 	}
 	return &tools.Result{Output: "removed from " + target + " memory"}, nil
 }
 
 func (m Memory) read(target string) (*tools.Result, error) {
-	blk := m.mm.Core().GetBlock(target)
-	if blk == nil {
+	blk, err := m.mm.ReadCoreBlock(target)
+	if errors.Is(err, memory.ErrCoreBlockNotFound) {
 		return &tools.Result{Output: "(" + target + " block doesn't exist)", IsError: true}, nil
+	}
+	if err != nil {
+		return &tools.Result{Output: "Memory read: " + err.Error(), IsError: true}, nil
 	}
 	body := blockText(blk)
 	if body == "" {
@@ -241,7 +260,7 @@ func (m Memory) read(target string) (*tools.Result, error) {
 	return &tools.Result{Output: body + "\n\n[block " + target + ": " + fmt.Sprintf("%d chars", len(body)) + "]"}, nil
 }
 
-// search hits archival memory (BM25F-ranked passages). Optional
+// search hits the unified archival + topic corpus (BM25F-ranked passages). Optional
 // memory_type filter narrows to one of user/feedback/project/
 // reference/context. Empty type = all types.
 func (m Memory) search(query, memoryType string, limit int) (*tools.Result, error) {
@@ -262,15 +281,15 @@ func (m Memory) search(query, memoryType string, limit int) (*tools.Result, erro
 		}
 		opts.Types = []string{memoryType}
 	}
-	results, err := m.mm.Archival().Search(opts)
+	results, err := m.mm.Search(opts)
 	if err != nil {
 		return &tools.Result{Output: "Memory search: " + err.Error(), IsError: true}, nil
 	}
 	if len(results) == 0 {
-		return &tools.Result{Output: "no archival results for: " + query}, nil
+		return &tools.Result{Output: "no memory results for: " + query}, nil
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Archival search for %q (%d hits):\n\n", query, len(results))
+	fmt.Fprintf(&b, "Memory search for %q (%d hits):\n\n", query, len(results))
 	for i, p := range results {
 		typeLabel := p.Type
 		if typeLabel == "" {
@@ -288,7 +307,7 @@ func (m Memory) search(query, memoryType string, limit int) (*tools.Result, erro
 //
 // Defaults memory_type to "context" when caller doesn't specify — keeps
 // backwards compat and avoids errors on minimal inputs.
-func (m Memory) archive(content, memoryType string, tags []string) (*tools.Result, error) {
+func (m Memory) archive(content, memoryType string, tags []string, sourceSessionID string) (*tools.Result, error) {
 	if content == "" {
 		return &tools.Result{Output: "Memory archive: content required", IsError: true}, nil
 	}
@@ -302,17 +321,30 @@ func (m Memory) archive(content, memoryType string, tags []string) (*tools.Resul
 		}, nil
 	}
 	p := memory.Passage{
-		Content: content,
-		Type:    memoryType,
-		Tags:    tags,
+		Content:         content,
+		Type:            memoryType,
+		Tags:            tags,
+		Source:          "memory-tool",
+		SourceSessionID: sourceSessionID,
 	}
-	if err := m.mm.Archival().Insert(p); err != nil {
+	archival := m.mm.Archival()
+	if archival == nil {
+		return &tools.Result{Output: "Memory archive: memory repository is unavailable", IsError: true}, nil
+	}
+	if err := archival.Insert(p); err != nil {
 		return &tools.Result{Output: "Memory archive: " + err.Error(), IsError: true}, nil
 	}
 	return &tools.Result{
 		Output: fmt.Sprintf("archived passage (type=%s, %d tags, %d chars)",
 			memoryType, len(tags), len(content)),
 	}, nil
+}
+
+func (m Memory) sourceSessionID() string {
+	if m.sourceSessionIDFn == nil {
+		return ""
+	}
+	return strings.TrimSpace(m.sourceSessionIDFn())
 }
 
 // stringsFromAny coerces a JSON-decoded any into a []string. The LLM
@@ -341,15 +373,23 @@ func stringsFromAny(v any) []string {
 // stats reports per-block usage so the LLM can tell when blocks are
 // approaching their character limits and proactively summarize.
 func (m Memory) stats() (*tools.Result, error) {
-	blocks := m.mm.Core().GetBlocks()
+	stats, err := m.mm.CoreBlockStats()
+	if err != nil {
+		return &tools.Result{Output: "Memory stats: " + err.Error(), IsError: true}, nil
+	}
 	type row struct {
 		Label string `json:"label"`
 		Used  int    `json:"used"`
 		Limit int    `json:"limit"`
 	}
-	out := make([]row, 0, len(blocks))
-	for _, b := range blocks {
-		out = append(out, row{Label: b.Label, Used: len(b.Content), Limit: b.MaxChars})
+	labels := []string{"user", "system", "working", "summary"}
+	out := make([]row, 0, len(labels))
+	for _, label := range labels {
+		blockStats, ok := stats[label]
+		if !ok {
+			continue
+		}
+		out = append(out, row{Label: label, Used: blockStats.Used, Limit: blockStats.Limit})
 	}
 	data, _ := json.MarshalIndent(out, "", "  ")
 	stamp := time.Now().Format(time.RFC3339)

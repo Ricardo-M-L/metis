@@ -6,15 +6,20 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/memdir"
 	"github.com/Ricardo-M-L/metis/internal/memory/security"
 	pubmem "github.com/Ricardo-M-L/metis/pkg/memory"
 )
@@ -56,6 +61,11 @@ type CoreMemory struct {
 	// File storage path
 	memoryRoot string
 
+	// Workspace-scoped blocks (working and summary) live outside the shared
+	// core.d directory. User and system remain global, while task-local state
+	// cannot leak between repositories opened by the same Metis installation.
+	workspaceRoot string
+
 	// Frozen snapshot for system prompt - set once at Load() time
 	// Mid-session writes update files but do NOT change this snapshot
 	snapshot string
@@ -80,12 +90,18 @@ const (
 
 // NewCoreMemory creates a new CoreMemory instance.
 func NewCoreMemory(memoryRoot string) *CoreMemory {
+	return newCoreMemory(memoryRoot, "")
+}
+
+func newCoreMemory(memoryRoot, workspaceRoot string) *CoreMemory {
 	cm := &CoreMemory{
-		limits:     defaultLimits,
-		memoryRoot: memoryRoot,
+		limits:        defaultLimits,
+		memoryRoot:    memoryRoot,
+		workspaceRoot: workspaceRoot,
 	}
 	// Initialize with default blocks
-	for label, limit := range defaultLimits {
+	for _, label := range []string{"user", "system", "working", "summary"} {
+		limit := defaultLimits[label]
 		cm.blocks = append(cm.blocks, NewBlock(label, "", limit))
 	}
 	// Try to load existing memory from files
@@ -97,7 +113,11 @@ func NewCoreMemory(memoryRoot string) *CoreMemory {
 func (cm *CoreMemory) GetBlocks() []*Block {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	return cm.blocks
+	blocks := make([]*Block, 0, len(cm.blocks))
+	for _, block := range cm.blocks {
+		blocks = append(blocks, cloneBlock(block))
+	}
+	return blocks
 }
 
 // GetBlock returns block by label.
@@ -106,7 +126,7 @@ func (cm *CoreMemory) GetBlock(label string) *Block {
 	defer cm.mu.RUnlock()
 	for _, b := range cm.blocks {
 		if b.Label == label {
-			return b
+			return cloneBlock(b)
 		}
 	}
 	return nil
@@ -124,33 +144,29 @@ func (cm *CoreMemory) GetBlock(label string) *Block {
 // from tool execution, which sits between request iterations, not
 // during one).
 func (cm *CoreMemory) UpdateBlock(label, content string) error {
-	// Security scan content before saving
-	if security.Scan(content) {
-		// Log warning but still save (security hook could reject in future)
+	if cm == nil {
+		return ErrCoreBlockNotFound
 	}
-
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	for _, b := range cm.blocks {
-		if b.Label == label {
-			if len(content) > b.MaxChars {
-				content = content[:b.MaxChars]
-			}
-			b.Content = content
-			b.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-			// Persist immediately + refresh snapshot so next render
-			// picks up the change. Surface a persist failure instead of
-			// silently dropping it — otherwise the in-memory edit looks
-			// saved but the on-disk md never changed and the user's memory
-			// edit is lost on the next session Load.
-			if err := cm.saveBlockLocked(b); err != nil {
-				return err
-			}
-			cm.snapshot = cm.renderLocked()
-			return nil
+	if err := validateCoreContent(content); err != nil {
+		return err
+	}
+	update := func() error {
+		cm.mu.Lock()
+		defer cm.mu.Unlock()
+		if err := cm.reloadAuthoritativeLocked(true); err != nil {
+			return err
 		}
+		block := cm.blockLocked(label)
+		if block == nil {
+			return fmt.Errorf("%w: %s", ErrCoreBlockNotFound, label)
+		}
+		_, err := cm.persistBlockContentLocked(block, content)
+		return err
 	}
-	return nil
+	if cm.memoryRoot == "" {
+		return update()
+	}
+	return withRepositoryLock(repositoryRootForTier(cm.memoryRoot, "core.d"), update)
 }
 
 // saveBlockLocked persists a single block. Caller must hold cm.mu.Lock().
@@ -163,7 +179,7 @@ func (cm *CoreMemory) saveBlockLocked(b *Block) error {
 		return nil
 	}
 	content := renderBlockHermes(b)
-	return atomicWriteFile(path, content, 0o644)
+	return atomicWriteFile(path, content, 0o600)
 }
 
 // Render returns the memory as a string for system prompt injection.
@@ -270,7 +286,14 @@ func (cm *CoreMemory) pathForBlock(label string) string {
 		return ""
 	}
 	filename := labelToFilename(label)
-	return filepath.Join(cm.memoryRoot, filename)
+	return filepath.Join(cm.rootForBlock(label), filename)
+}
+
+func (cm *CoreMemory) rootForBlock(label string) string {
+	if cm.workspaceRoot != "" && (label == "working" || label == "summary") {
+		return cm.workspaceRoot
+	}
+	return cm.memoryRoot
 }
 
 // labelToFilename maps block label to Hermes-style filename.
@@ -298,23 +321,13 @@ func (cm *CoreMemory) Load() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	for _, b := range cm.blocks {
-		path := cm.pathForBlock(b.Label)
-		if path == "" {
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		// Parse Hermes-style format: strip header, extract content
-		content := parseMemoryFile(string(data), b.Label)
-		b.Content = content
-		b.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	}
-
-	// Capture frozen snapshot for system prompt injection
-	cm.snapshot = cm.renderLocked()
+	// Construction-time hardening normally sanitizes these files before Load,
+	// but embedders can also call Load on a long-lived CoreMemory. Reuse the
+	// strict authoritative reader so a post-construction symlink/non-regular
+	// replacement is never followed into the prompt snapshot. The method keeps
+	// its historical no-error signature; on failure the last known-safe
+	// snapshot remains unchanged.
+	_ = cm.reloadAuthoritativeLocked(true)
 }
 
 // GetSnapshot returns the frozen snapshot for system prompt injection.
@@ -331,25 +344,14 @@ func (cm *CoreMemory) Save() error {
 	if cm.memoryRoot == "" {
 		return nil
 	}
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-
-	if err := os.MkdirAll(cm.memoryRoot, 0o755); err != nil {
-		return err
-	}
-
-	for _, b := range cm.blocks {
-		path := cm.pathForBlock(b.Label)
-		if path == "" {
-			continue
-		}
-		// Render Hermes-style content
-		content := renderBlockHermes(b)
-		if err := atomicWriteFile(path, content, 0o644); err != nil {
-			return err
-		}
-	}
-	return nil
+	return withRepositoryLock(repositoryRootForTier(cm.memoryRoot, "core.d"), func() error {
+		cm.mu.Lock()
+		defer cm.mu.Unlock()
+		// Core mutations are durable before their API returns. Save is a
+		// compatibility synchronization barrier: reload authoritative state
+		// instead of rewriting a stale process snapshot over another writer.
+		return cm.reloadAuthoritativeLocked(true)
+	})
 }
 
 // parseMemoryFile extracts content from Hermes-style memory file.
@@ -427,15 +429,7 @@ func renderBlockHermes(b *Block) string {
 func (cm *CoreMemory) Stats() map[string]BlockStats {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	stats := make(map[string]BlockStats)
-	for _, b := range cm.blocks {
-		stats[b.Label] = BlockStats{
-			Used:  len(b.Content),
-			Limit: b.MaxChars,
-			Pct:   float64(len(b.Content)) / float64(b.MaxChars) * 100,
-		}
-	}
-	return stats
+	return cm.statsLocked()
 }
 
 // BlockStats holds usage statistics for a memory block.
@@ -456,12 +450,20 @@ type BlockStats struct {
 // backwards compatibility with passages written before this field
 // existed.
 type Passage struct {
-	ID        string    `json:"id"`
-	Content   string    `json:"content"`
-	Type      string    `json:"type,omitempty"` // user | feedback | project | reference | context
-	Tags      []string  `json:"tags,omitempty"`
-	Embedding []float32 `json:"embedding,omitempty"` // Not used in v1
-	CreatedAt string    `json:"created_at"`
+	ID              string    `json:"id"`
+	Content         string    `json:"content"`
+	Type            string    `json:"type,omitempty"` // user | feedback | project | reference | context
+	Tags            []string  `json:"tags,omitempty"`
+	Embedding       []float32 `json:"embedding,omitempty"` // Not used in v1
+	CreatedAt       string    `json:"created_at"`
+	UpdatedAt       string    `json:"updated_at,omitempty"`
+	LastUsedAt      string    `json:"last_used_at,omitempty"`
+	Source          string    `json:"source,omitempty"`
+	SourceSessionID string    `json:"source_session_id,omitempty"`
+	SourceMessageID string    `json:"source_message_id,omitempty"`
+	Scope           string    `json:"scope,omitempty"`
+	Confidence      float64   `json:"confidence,omitempty"`
+	UseCount        int       `json:"use_count,omitempty"`
 }
 
 // Passage type constants — borrowed from claude-code's memdir/types.ts
@@ -508,41 +510,110 @@ func IsKnownType(t string) bool {
 // ArchivalMemory manages persistent archival memory with file-based storage.
 // Stores passages in passages.jsonl and maintains an index.json for fast lookup.
 type ArchivalMemory struct {
-	mu    sync.RWMutex
-	root  string
-	index map[string]Passage // in-memory index for fast lookup
+	mu           sync.RWMutex
+	root         string
+	index        map[string]Passage // in-memory index for fast lookup
+	defaultScope string             // workspace namespace for unscoped project writes
 }
 
 // NewArchivalMemory creates a new ArchivalMemory instance.
 func NewArchivalMemory(root string) (*ArchivalMemory, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
 		return nil, err
 	}
 	am := &ArchivalMemory{root: root, index: make(map[string]Passage)}
-	am.loadIndex()
+	if err := am.reloadPassagesLocked(true); err != nil {
+		return nil, err
+	}
 	return am, nil
 }
 
-// loadIndex reads the index file if it exists.
-func (am *ArchivalMemory) loadIndex() {
-	indexPath := filepath.Join(am.root, "index.json")
-	data, err := os.ReadFile(indexPath)
+// reloadPassagesLocked refreshes the authoritative JSONL before a mutation.
+// Strict mode prevents a subsequent rewrite from silently discarding an
+// unparseable line. Caller must hold am.mu.
+func (am *ArchivalMemory) reloadPassagesLocked(strict bool) error {
+	passages, err := am.readPassagesLocked(strict)
 	if err != nil {
-		return
+		return err
 	}
-	// Simple line-based index: ID|Timestamp|ContentPreview
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		parts := strings.SplitN(line, "|", 3)
-		if len(parts) < 3 {
+	index := make(map[string]Passage)
+	for _, passage := range passages {
+		index[passage.ID] = passage
+	}
+	am.index = index
+	return nil
+}
+
+// readPassagesLocked loads the ordered, authoritative JSONL snapshot. A
+// malformed line may be ignored by read-only search for backwards
+// compatibility, but unsafe model-visible content and unsafe filesystem
+// objects always fail the whole read. Callers performing a mutation pass
+// strict=true so corruption cannot be silently dropped by a rewrite.
+func (am *ArchivalMemory) readPassagesLocked(strict bool) ([]Passage, error) {
+	path := filepath.Join(am.root, "passages.jsonl")
+	raw, _, err := readAuthoritativeRegularFile(am.root, path, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read archival passages: %w", err)
+	}
+	passages := make([]Passage, 0)
+	for lineNumber, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		am.index[parts[0]] = Passage{
-			ID:        parts[0],
-			CreatedAt: parts[1],
-			Content:   parts[2],
+		passage, parseErr := parsePassageLine(line)
+		if parseErr != nil || strings.TrimSpace(passage.ID) == "" {
+			if strict {
+				if parseErr == nil {
+					parseErr = errors.New("empty passage id")
+				}
+				return nil, fmt.Errorf("parse archival passages line %d: %w", lineNumber+1, parseErr)
+			}
+			continue
 		}
+		passage, err = validateLoadedPassage(passage)
+		if err != nil {
+			return nil, fmt.Errorf("validate archival passages line %d: %w", lineNumber+1, err)
+		}
+		passages = append(passages, passage)
 	}
+	return passages, nil
+}
+
+// validateLoadedPassage mirrors Insert's trust-boundary checks. In
+// particular, a single credential is redacted before indexing, while an env
+// dump or prompt-injection payload fails closed instead of becoming recalled
+// model context.
+func validateLoadedPassage(p Passage) (Passage, error) {
+	metadata := []string{p.ID, p.Type, p.Source, p.SourceSessionID, p.SourceMessageID, p.Scope}
+	metadata = append(metadata, p.Tags...)
+	if err := validatePersistedMetadata(metadata...); err != nil {
+		return Passage{}, err
+	}
+	content, err := sanitizeLoadedMemoryContent(p.Content)
+	if err != nil {
+		return Passage{}, err
+	}
+	p.Content = content
+	return p, nil
+}
+
+func sanitizeLoadedMemoryContent(content string) (string, error) {
+	redacted := memdir.Redact(content)
+	if redacted.Reject {
+		return "", ErrSensitiveMemory
+	}
+	content = redacted.Redacted
+	if threats := security.ScanAll(content); hasBlockingThreat(threats) {
+		return "", fmt.Errorf("%w: %s", ErrUnsafeMemory, threatKinds(threats))
+	}
+	return content, nil
 }
 
 // saveIndex persists the index to disk.
@@ -552,28 +623,70 @@ func (am *ArchivalMemory) saveIndex() error {
 	for _, p := range am.index {
 		preview := p.Content
 		if len(preview) > 200 {
-			preview = preview[:200]
+			preview = truncate(preview, 200)
 		}
+		preview = strings.NewReplacer("\n", " ", "\r", " ", "|", " ").Replace(preview)
 		lines = append(lines, p.ID+"|"+p.CreatedAt+"|"+preview)
 	}
+	sort.Strings(lines)
 	content := strings.Join(lines, "\n")
-	return atomicWriteFile(indexPath, content, 0o644)
+	return atomicWriteFile(indexPath, content, 0o600)
 }
 
 // Insert adds a new passage to archival memory.
 func (am *ArchivalMemory) Insert(p Passage) error {
-	am.mu.Lock()
-	defer am.mu.Unlock()
+	if am == nil {
+		return nil
+	}
+	p.Scope = scopedMemoryType(p.Type, p.Scope, am.defaultScope)
+	metadata := []string{p.ID, p.Type, p.Source, p.SourceSessionID, p.SourceMessageID, p.Scope}
+	metadata = append(metadata, p.Tags...)
+	if err := validatePersistedMetadata(metadata...); err != nil {
+		return err
+	}
+	redacted := memdir.Redact(p.Content)
+	if redacted.Reject {
+		return ErrSensitiveMemory
+	}
+	p.Content = redacted.Redacted
+	if threats := security.ScanAll(p.Content); hasBlockingThreat(threats) {
+		return fmt.Errorf("%w: %s", ErrUnsafeMemory, threatKinds(threats))
+	}
+	repositoryRoot := repositoryRootForTier(am.root, "archival")
+	return withRepositoryLock(repositoryRoot, func() error {
+		if err := rejectDeletedSessionLocked(repositoryRoot, p.SourceSessionID); err != nil {
+			return err
+		}
+		am.mu.Lock()
+		defer am.mu.Unlock()
+		if err := am.reloadPassagesLocked(true); err != nil {
+			return err
+		}
+		return am.insertLocked(p)
+	})
+}
+
+func (am *ArchivalMemory) insertLocked(p Passage) error {
 
 	if p.ID == "" {
 		p.ID = generateID()
 	}
-	if p.CreatedAt == "" {
-		p.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	if _, exists := am.index[p.ID]; exists {
+		// passages.jsonl is authoritative. Retrying an insert after an
+		// index-write failure should repair the compact index without
+		// appending a duplicate passage.
+		return am.saveIndex()
 	}
-
-	// Update index
-	am.index[p.ID] = p
+	now := time.Now().UTC().Format(time.RFC3339)
+	if p.CreatedAt == "" {
+		p.CreatedAt = now
+	}
+	if p.UpdatedAt == "" {
+		p.UpdatedAt = p.CreatedAt
+	}
+	if p.Confidence == 0 {
+		p.Confidence = 1
+	}
 
 	// Store full passage as JSON lines using proper JSON encoding
 	data, err := json.Marshal(p)
@@ -584,16 +697,22 @@ func (am *ArchivalMemory) Insert(p Passage) error {
 
 	// Store full passage as JSON lines
 	path := filepath.Join(am.root, "passages.jsonl")
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	_, err = f.WriteString(line)
-	if err != nil {
+	if err := f.Chmod(0o600); err != nil {
 		return err
 	}
+
+	if _, err = f.WriteString(line); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	am.index[p.ID] = p
 
 	// Update index file
 	return am.saveIndex()
@@ -617,29 +736,25 @@ type SearchOptions struct {
 //   - "recent" or "" (default): return passages newest-first; query acts
 //     as a case-insensitive substring filter.
 func (am *ArchivalMemory) Search(opts SearchOptions) ([]Passage, error) {
-	am.mu.RLock()
-	defer am.mu.RUnlock()
-
-	path := filepath.Join(am.root, "passages.jsonl")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil // No passages yet
+	if am == nil {
+		return nil, nil
 	}
+	am.mu.Lock()
+	allPassages, err := am.readPassagesLocked(false)
+	if err != nil {
+		am.mu.Unlock()
+		return nil, err
+	}
+	refreshed := make(map[string]Passage, len(allPassages))
+	for _, passage := range allPassages {
+		refreshed[passage.ID] = passage
+	}
+	am.index = refreshed
+	am.mu.Unlock()
 
 	useRelevance := opts.SortBy == "relevance" && opts.Query != ""
-
-	var allPassages []Passage
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		p, err := parsePassageLine(line)
-		if err != nil {
-			continue
-		}
-
+	filteredPassages := make([]Passage, 0, len(allPassages))
+	for _, p := range allPassages {
 		// Substring filter only applies to non-relevance modes; BM25 handles
 		// matching through token overlap and we don't want to throw away
 		// passages that share tokens but not the literal query string.
@@ -693,11 +808,11 @@ func (am *ArchivalMemory) Search(opts SearchOptions) ([]Passage, error) {
 			}
 		}
 
-		allPassages = append(allPassages, p)
+		filteredPassages = append(filteredPassages, p)
 	}
 
-	results := allPassages
-	if useRelevance && len(allPassages) > 0 {
+	results := filteredPassages
+	if useRelevance && len(filteredPassages) > 0 {
 		// Switched to BM25F (Robertson 2005) — passages have a Content
 		// body and a Tags list; tag matches deserve more weight than
 		// arbitrary body matches because tags are curated keywords
@@ -706,9 +821,9 @@ func (am *ArchivalMemory) Search(opts SearchOptions) ([]Passage, error) {
 		// weightContent=1.0) and matches Elasticsearch's
 		// long-standing default. Single-tag-less passages score
 		// identically to old BM25 — backwards compatible.
-		docs := make([]*BM25Doc, 0, len(allPassages))
-		pmap := make(map[string]Passage, len(allPassages))
-		for _, p := range allPassages {
+		docs := make([]*BM25Doc, 0, len(filteredPassages))
+		pmap := make(map[string]Passage, len(filteredPassages))
+		for _, p := range filteredPassages {
 			docs = append(docs, NewBM25FDoc(p.ID, p.Content, p.Tags))
 			pmap[p.ID] = p
 		}
@@ -864,23 +979,32 @@ type RecallMemory struct {
 
 // Message represents a conversation message in recall memory.
 type Message struct {
-	Role      string `json:"role"`
-	Content   string `json:"content"`
-	Timestamp string `json:"timestamp"`
+	Role            string `json:"role"`
+	Content         string `json:"content"`
+	Timestamp       string `json:"timestamp"`
+	SessionID       string `json:"session_id,omitempty"`
+	SourceMessageID string `json:"source_message_id,omitempty"`
+	Scope           string `json:"scope,omitempty"`
 }
 
 // Session represents a conversation session for compression tracking.
 type Session struct {
-	ID        string `json:"id"`
-	StartedAt string `json:"started_at"`
-	EndedAt   string `json:"ended_at"`
-	MsgCount  int    `json:"msg_count"`
-	Summary   string `json:"summary,omitempty"`
+	ID              string `json:"id"`
+	StartedAt       string `json:"started_at"`
+	EndedAt         string `json:"ended_at"`
+	MsgCount        int    `json:"msg_count"`
+	Summary         string `json:"summary,omitempty"`
+	SourceSessionID string `json:"source_session_id,omitempty"`
+	SourceMessageID string `json:"source_message_id,omitempty"`
+	Scope           string `json:"scope,omitempty"`
 }
 
 // NewRecallMemory creates a new RecallMemory instance.
 func NewRecallMemory(root string, limit int) (*RecallMemory, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
 		return nil, err
 	}
 	rm := &RecallMemory{
@@ -889,29 +1013,77 @@ func NewRecallMemory(root string, limit int) (*RecallMemory, error) {
 		sessions: []Session{},
 	}
 	rm.loadMessages()
-	rm.loadSessions()
+	// messages.jsonl is authoritative. sessions.json is a derived index and
+	// may be stale after a crash between the two atomic renames, so never let
+	// it overwrite the metadata rebuilt from messages on startup.
 	return rm, nil
 }
 
 // loadMessages reads existing messages from disk using JSON format.
 func (rm *RecallMemory) loadMessages() {
+	_ = rm.reloadMessagesLocked(false)
+}
+
+// reloadMessagesLocked refreshes the authoritative JSONL snapshot before a
+// read-modify-write. Strict mode refuses to rewrite a file containing a
+// malformed line, because silently skipping it would turn corruption into
+// permanent data loss on the next atomic save. Caller must hold rm.mu.
+func (rm *RecallMemory) reloadMessagesLocked(strict bool) error {
 	path := filepath.Join(rm.root, "messages.jsonl")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
+	data, _, err := readAuthoritativeRegularFile(rm.root, path, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		rm.messages = nil
+		rm.sessions = nil
+		return nil
 	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
+	if err != nil {
+		return err
+	}
+	messages := make([]Message, 0)
+	for lineNumber, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		var msg Message
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			if strict {
+				return fmt.Errorf("parse recall messages line %d: %w", lineNumber+1, err)
+			}
 			continue
 		}
-		rm.messages = append(rm.messages, msg)
+		messages = append(messages, msg)
 	}
+	rm.messages = messages
+	rm.sessions = sessionsFromMessages(messages)
+	return nil
+}
+
+func sessionsFromMessages(messages []Message) []Session {
+	var sessions []Session
+	byID := make(map[string]int)
+	for _, message := range messages {
+		id := strings.TrimSpace(message.SessionID)
+		if id == "" {
+			continue
+		}
+		index, ok := byID[id]
+		if !ok {
+			index = len(sessions)
+			byID[id] = index
+			sessions = append(sessions, Session{
+				ID:              id,
+				StartedAt:       message.Timestamp,
+				SourceSessionID: id,
+			})
+		}
+		session := &sessions[index]
+		session.EndedAt = message.Timestamp
+		session.MsgCount++
+		session.SourceMessageID = message.SourceMessageID
+		session.Scope = message.Scope
+	}
+	return sessions
 }
 
 // saveMessages persists messages to disk using JSON format.
@@ -926,13 +1098,13 @@ func (rm *RecallMemory) saveMessages() error {
 		lines = append(lines, string(data))
 	}
 	content := strings.Join(lines, "\n") + "\n"
-	return atomicWriteFile(path, content, 0o644)
+	return atomicWriteFile(path, content, 0o600)
 }
 
 // loadSessions reads session metadata from disk using JSON format.
 func (rm *RecallMemory) loadSessions() {
 	path := filepath.Join(rm.root, "sessions.json")
-	data, err := os.ReadFile(path)
+	data, _, err := readAuthoritativeRegularFile(rm.root, path, 0)
 	if err != nil {
 		return
 	}
@@ -951,27 +1123,143 @@ func (rm *RecallMemory) saveSessions() error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(path, string(data), 0o644)
+	return atomicWriteFile(path, string(data), 0o600)
 }
 
 // Add adds a message to recall memory and persists to disk.
 func (rm *RecallMemory) Add(role, content string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	rm.messages = append(rm.messages, Message{
-		Role:      role,
-		Content:   content,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	_ = rm.AddWithMetadata(role, content, "", "", "")
+}
+
+// AddWithMetadata persists a recall message with its source identity.
+func (rm *RecallMemory) AddWithMetadata(role, content, sessionID, sourceMessageID, scope string) error {
+	if err := validatePersistedMetadata(role, sessionID, sourceMessageID, scope); err != nil {
+		return err
+	}
+	content, err := sanitizePersistedText(content)
+	if err != nil {
+		return err
+	}
+	repositoryRoot := repositoryRootForTier(rm.root, "recall")
+	return withRepositoryLock(repositoryRoot, func() error {
+		if err := rejectDeletedSessionLocked(repositoryRoot, sessionID); err != nil {
+			return err
+		}
+		rm.mu.Lock()
+		defer rm.mu.Unlock()
+		if err := rm.reloadMessagesLocked(true); err != nil {
+			return err
+		}
+		return rm.addWithMetadataLocked(role, content, sessionID, sourceMessageID, scope)
 	})
-	// Persist after each add
-	rm.saveMessages()
+}
+
+func (rm *RecallMemory) addWithMetadataLocked(role, content, sessionID, sourceMessageID, scope string) error {
+	oldMessages := append([]Message(nil), rm.messages...)
+	oldSessions := append([]Session(nil), rm.sessions...)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rm.messages = append(rm.messages, Message{
+		Role:            role,
+		Content:         content,
+		Timestamp:       now,
+		SessionID:       sessionID,
+		SourceMessageID: sourceMessageID,
+		Scope:           scope,
+	})
+	rm.recordSessionLocked(sessionID, sourceMessageID, scope, now, 1)
+	if err := rm.saveMessages(); err != nil {
+		rm.messages = oldMessages
+		rm.sessions = oldSessions
+		return err
+	}
+	if err := rm.saveSessions(); err != nil {
+		rm.messages = oldMessages
+		rm.sessions = oldSessions
+		return errors.Join(err, rm.saveMessages())
+	}
+	return nil
+}
+
+// AddTurn persists both sides of a completed exchange in one atomic rewrite.
+func (rm *RecallMemory) AddTurn(userContent, assistantContent, sessionID, sourceMessageID, scope string) error {
+	if err := validatePersistedMetadata(sessionID, sourceMessageID, scope); err != nil {
+		return err
+	}
+	userContent, err := sanitizePersistedText(userContent)
+	if err != nil {
+		return err
+	}
+	assistantContent, err = sanitizePersistedText(assistantContent)
+	if err != nil {
+		return err
+	}
+	repositoryRoot := repositoryRootForTier(rm.root, "recall")
+	return withRepositoryLock(repositoryRoot, func() error {
+		if err := rejectDeletedSessionLocked(repositoryRoot, sessionID); err != nil {
+			return err
+		}
+		rm.mu.Lock()
+		defer rm.mu.Unlock()
+		if err := rm.reloadMessagesLocked(true); err != nil {
+			return err
+		}
+		return rm.addTurnLocked(userContent, assistantContent, sessionID, sourceMessageID, scope)
+	})
+}
+
+func (rm *RecallMemory) addTurnLocked(userContent, assistantContent, sessionID, sourceMessageID, scope string) error {
+	oldMessages := append([]Message(nil), rm.messages...)
+	oldSessions := append([]Session(nil), rm.sessions...)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rm.messages = append(rm.messages,
+		Message{Role: "user", Content: userContent, Timestamp: now, SessionID: sessionID, SourceMessageID: sourceMessageID, Scope: scope},
+		Message{Role: "assistant", Content: assistantContent, Timestamp: now, SessionID: sessionID, SourceMessageID: sourceMessageID, Scope: scope},
+	)
+	rm.recordSessionLocked(sessionID, sourceMessageID, scope, now, 2)
+	if err := rm.saveMessages(); err != nil {
+		rm.messages = oldMessages
+		rm.sessions = oldSessions
+		return err
+	}
+	if err := rm.saveSessions(); err != nil {
+		rm.messages = oldMessages
+		rm.sessions = oldSessions
+		return errors.Join(err, rm.saveMessages())
+	}
+	return nil
+}
+
+func (rm *RecallMemory) recordSessionLocked(sessionID, sourceMessageID, scope, now string, messageCount int) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	for i := range rm.sessions {
+		if rm.sessions[i].ID != sessionID {
+			continue
+		}
+		rm.sessions[i].EndedAt = now
+		rm.sessions[i].MsgCount += messageCount
+		rm.sessions[i].SourceSessionID = sessionID
+		rm.sessions[i].SourceMessageID = sourceMessageID
+		rm.sessions[i].Scope = scope
+		return
+	}
+	rm.sessions = append(rm.sessions, Session{
+		ID:              sessionID,
+		StartedAt:       now,
+		EndedAt:         now,
+		MsgCount:        messageCount,
+		SourceSessionID: sessionID,
+		SourceMessageID: sourceMessageID,
+		Scope:           scope,
+	})
 }
 
 // GetMessages returns all messages.
 func (rm *RecallMemory) GetMessages() []Message {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
-	return rm.messages
+	return append([]Message(nil), rm.messages...)
 }
 
 // ShouldSummarize returns true if messages exceed limit.
@@ -1050,16 +1338,41 @@ type MemoryManager struct {
 	recall   *RecallMemory
 	daily    *DailyStore
 
-	root string
+	root           string
+	workspaceScope string
+
+	usageMu        sync.Mutex
+	cache          repositoryCache
+	contextCache   contextSnapshotCache
+	retrievalCache retrievalSnapshotCache
 }
 
 // NewMemoryManager creates a new MemoryManager.
 func NewMemoryManager(root string) (*MemoryManager, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	return newMemoryManager(root, "")
+}
+
+// NewMemoryManagerForWorkspace returns a view of the canonical repository
+// whose project/context retrieval is isolated to workspacePath. User and
+// feedback memory remains shared across workspaces.
+func NewMemoryManagerForWorkspace(root, workspacePath string) (*MemoryManager, error) {
+	scope, err := WorkspaceScope(workspacePath)
+	if err != nil {
+		return nil, err
+	}
+	return newMemoryManager(root, scope)
+}
+
+func newMemoryManager(root, workspaceScope string) (*MemoryManager, error) {
+	// Every constructor is a model-input trust boundary. Runtime startup usually
+	// migrates legacy roots first, but tests, plugins, and embedded callers may
+	// construct a manager directly. Harden before any tier loader reads disk so
+	// unsafe legacy content can never enter the prompt or retrieval index.
+	if err := HardenCanonicalRoot(root); err != nil {
 		return nil, err
 	}
 
-	core, archival, recall, err := loadOrCreate(root)
+	core, archival, recall, err := loadOrCreate(root, workspaceScope)
 	if err != nil {
 		return nil, err
 	}
@@ -1069,22 +1382,38 @@ func NewMemoryManager(root string) (*MemoryManager, error) {
 		return nil, err
 	}
 
-	return &MemoryManager{
-		core:     core,
-		archival: archival,
-		recall:   recall,
-		daily:    daily,
-		root:     root,
-	}, nil
+	mm := &MemoryManager{
+		core:           core,
+		archival:       archival,
+		recall:         recall,
+		daily:          daily,
+		root:           root,
+		workspaceScope: workspaceScope,
+	}
+	archival.defaultScope = workspaceScope
+	if err := mm.importLegacyStoreJSONL(); err != nil {
+		return nil, err
+	}
+	if err := ensurePrivateTree(root); err != nil {
+		return nil, err
+	}
+	return mm, nil
 }
 
-func loadOrCreate(root string) (*CoreMemory, *ArchivalMemory, *RecallMemory, error) {
+func loadOrCreate(root, workspaceScope string) (*CoreMemory, *ArchivalMemory, *RecallMemory, error) {
 	coreRoot := filepath.Join(root, "core.d")
-	if err := os.MkdirAll(coreRoot, 0o755); err != nil {
+	if err := os.MkdirAll(coreRoot, 0o700); err != nil {
 		return nil, nil, nil, err
 	}
+	workspaceCoreRoot := ""
+	if workspaceScope != "" {
+		workspaceCoreRoot = filepath.Join(root, "workspaces", workspaceID(workspaceScope), "core.d")
+		if err := os.MkdirAll(workspaceCoreRoot, 0o700); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 
-	core := NewCoreMemory(coreRoot)
+	core := newCoreMemory(coreRoot, workspaceCoreRoot)
 
 	archival, err := NewArchivalMemory(filepath.Join(root, "archival"))
 	if err != nil {
@@ -1099,21 +1428,37 @@ func loadOrCreate(root string) (*CoreMemory, *ArchivalMemory, *RecallMemory, err
 	return core, archival, recall, nil
 }
 
-// Core returns the in-context block-memory tier. Exposed so the
-// builtin Memory tool can call UpdateBlock / GetBlock directly,
-// keeping a single source of truth for what the LLM sees in
-// BuildContext on the next turn. Without this accessor the tool
-// wrote to its own ~/.metis/memories/ flat-file path and the
-// changes never reached the system prompt — the 2026-04-30 audit's
-// critical disconnect bug.
-func (mm *MemoryManager) Core() *CoreMemory { return mm.core }
+// Core returns the in-context block-memory tier for compatibility and
+// read-only views. New read-modify-write callers must use ReadCoreBlock,
+// AddCoreBlock, ReplaceCoreBlock, and RemoveCoreBlock so the repository lock
+// spans the authoritative reload and atomic write.
+func (mm *MemoryManager) Core() *CoreMemory {
+	if mm == nil {
+		return nil
+	}
+	return mm.core
+}
+
+// Root returns the canonical repository root. Auto-memory and Dream must use
+// this exact path instead of independently resolving ~/.metis/memory.
+func (mm *MemoryManager) Root() string {
+	if mm == nil {
+		return ""
+	}
+	return mm.root
+}
 
 // Archival returns the long-term passage tier. Same rationale as
 // Core() — let downstream tools (Memory.add, Memory.search) hit the
 // canonical store instead of forking their own file scheme.
-func (mm *MemoryManager) Archival() *ArchivalMemory { return mm.archival }
+func (mm *MemoryManager) Archival() *ArchivalMemory {
+	if mm == nil {
+		return nil
+	}
+	return mm.archival
+}
 
-// AutoRetrieve runs BM25 against archival and returns the top-K
+// AutoRetrieve runs BM25 against the unified archival + topic corpus and returns the top-K
 // passages as a single <auto-retrieve>-wrapped string, ready to splice
 // into the system prompt. Empty query, empty archival, k<=0, or any
 // search error returns "" so the caller can unconditionally append.
@@ -1126,8 +1471,22 @@ func (mm *MemoryManager) Archival() *ArchivalMemory { return mm.archival }
 // verbatim (truncating risks corrupting the meaning); callers should
 // cap K, not per-passage bytes.
 func (mm *MemoryManager) AutoRetrieve(query string, k int) string {
+	if mm == nil {
+		return ""
+	}
 	hits := mm.AutoRetrieveCandidates(query, k)
+	_ = mm.MarkRetrieved(hits)
 	return FormatRetrieveSection(hits)
+}
+
+// PreviewAutoRetrieve formats the same BM25 selection as AutoRetrieve without
+// recording it as used. Token/context estimators must call this method because
+// their hypothetical prompt is never shown to a model.
+func (mm *MemoryManager) PreviewAutoRetrieve(query string, k int) string {
+	if mm == nil {
+		return ""
+	}
+	return FormatRetrieveSection(mm.AutoRetrieveCandidates(query, k))
 }
 
 // AutoRetrieveCandidates is the raw-passage variant of AutoRetrieve:
@@ -1138,25 +1497,10 @@ func (mm *MemoryManager) AutoRetrieve(query string, k int) string {
 // query is whitespace, mirroring AutoRetrieve's "fail soft" contract.
 // Caller can unconditionally pass the result to FormatRetrieveSection.
 func (mm *MemoryManager) AutoRetrieveCandidates(query string, k int) []Passage {
-	if mm == nil || mm.archival == nil {
+	if mm == nil {
 		return nil
 	}
-	if k <= 0 {
-		return nil
-	}
-	q := strings.TrimSpace(query)
-	if q == "" {
-		return nil
-	}
-	hits, err := mm.archival.Search(SearchOptions{
-		Query:  q,
-		SortBy: "relevance",
-		Limit:  k,
-	})
-	if err != nil {
-		return nil
-	}
-	return hits
+	return mm.SearchCandidates(query, k)
 }
 
 // FormatRetrieveSection wraps a passage list in the same
@@ -1182,48 +1526,37 @@ func FormatRetrieveSection(passages []Passage) string {
 
 // BuildContext builds the memory context for system prompt injection.
 //
-// Composition (in order):
-//
-//  1. Core memory (block-based) — frozen-ish snapshot, refreshes on
-//     UpdateBlock. The "current state" the agent should know.
-//  2. Recent daily-notes summary (last N days) — gives cross-session
-//     continuity. Pre-fix this was written but never read; the
-//     2026-04-30 audit caught Daily as a write-only tomb. We now
-//     prepend a "Recent sessions" block when daily store has entries
-//     within the cutoff window.
-//
-// Both wrapped in the same <memory-context> fence so the model knows
-// it's recall, not a fresh user turn.
+// Composition is deliberately compact and stable: Core blocks plus the short
+// topic manifest. Full topic/archive bodies and session history are not copied
+// into every system prompt; BM25 selects the relevant Top-K after the user
+// query arrives and the Loop appends that dynamic recall at the request tail.
+// This preserves cross-session recall without invalidating the stable prompt
+// cache prefix on every turn.
 func (mm *MemoryManager) BuildContext() string {
-	core := mm.core.Render()
-	if mm.daily == nil {
-		return core
-	}
-	// 7 days of recent context, capped at 4 KB so a chatty user
-	// doesn't push the system prompt past the model's effective
-	// budget. Tunable via NewMemoryManager options later.
-	const recentDays = 7
-	const recentMaxBytes = 4096
-	recent := mm.daily.RecentSummary(recentDays, recentMaxBytes)
-	if recent == "" {
-		return core
-	}
-	// Splice recent into the core block right before the closing tag.
-	// Always prepend the system note so the model knows this is
-	// recall, not a fresh user turn.
-	closingTag := "\n</memory-context>"
-	if strings.HasSuffix(core, closingTag) {
-		head := strings.TrimSuffix(core, closingTag)
-		return head + "\n\n[System note: 这是回忆起的最近对话上下文，不是新的用户输入。]\n\n" +
-			recent + closingTag
-	}
-	return core + "\n\n[System note: 这是回忆起的最近对话上下文，不是新的用户输入。]\n\n" + recent
+	return mm.buildContextCached()
 }
 
 // OnTurnEnd is called after each agent turn.
 func (mm *MemoryManager) OnTurnEnd(ctx context.Context, userMsg, asstMsg string) {
-	mm.recall.Add("user", truncate(userMsg, 500))
-	mm.recall.Add("assistant", truncate(asstMsg, 1000))
+	_ = mm.RecordTurn(ctx, "", "", userMsg, asstMsg)
+}
+
+// RecordTurn is the metadata-aware replacement for OnTurnEnd. It is
+// synchronous because a successful response must be durable before Desktop or
+// CLI switches sessions.
+func (mm *MemoryManager) RecordTurn(_ context.Context, sessionID, sourceMessageID, userMsg, asstMsg string) error {
+	if mm == nil || mm.recall == nil {
+		return nil
+	}
+	userMsg, err := sanitizePersistedText(userMsg)
+	if err != nil {
+		return err
+	}
+	asstMsg, err = sanitizePersistedText(asstMsg)
+	if err != nil {
+		return err
+	}
+	return mm.recall.AddTurn(truncate(userMsg, 500), truncate(asstMsg, 1000), sessionID, sourceMessageID, "session")
 }
 
 // DistillTurn extracts durable facts from one user/assistant exchange
@@ -1247,7 +1580,16 @@ func (mm *MemoryManager) OnTurnEnd(ctx context.Context, userMsg, asstMsg string)
 // LLM response shouldn't break the chat. Failures are returned so
 // callers can log; nothing more.
 func (mm *MemoryManager) DistillTurn(ctx context.Context, provider llm.Provider, userMsg, asstMsg string) error {
-	if provider == nil || mm.archival == nil {
+	if mm == nil {
+		return nil
+	}
+	return mm.DistillTurnWithMetadata(ctx, provider, "", "", userMsg, asstMsg)
+}
+
+// DistillTurnWithMetadata is the provenance-aware distillation entry point.
+// DistillTurn remains as a compatibility wrapper for older embedders.
+func (mm *MemoryManager) DistillTurnWithMetadata(ctx context.Context, provider llm.Provider, sessionID, sourceMessageID, userMsg, asstMsg string) error {
+	if mm == nil || provider == nil || mm.archival == nil {
 		return nil
 	}
 	if len(strings.TrimSpace(userMsg)) < 20 || len(strings.TrimSpace(asstMsg)) < 20 {
@@ -1269,17 +1611,27 @@ func (mm *MemoryManager) DistillTurn(ctx context.Context, provider llm.Provider,
 		return fmt.Errorf("distill: provider error: %w", err)
 	}
 	facts := parseDistilled(resp)
+	var errs []error
 	for _, f := range facts {
 		if f.Content == "" || !IsKnownType(f.Type) || f.Type == TypeContext {
 			continue
 		}
-		_ = mm.archival.Insert(Passage{
-			Content: f.Content,
-			Type:    f.Type,
-			Tags:    f.Tags,
-		})
+		if err := mm.archival.Insert(Passage{
+			Content:         f.Content,
+			Type:            f.Type,
+			Tags:            f.Tags,
+			Source:          "distillation",
+			SourceSessionID: strings.TrimSpace(sessionID),
+			SourceMessageID: strings.TrimSpace(sourceMessageID),
+			Scope:           scopedMemoryType(f.Type, "", mm.workspaceScope),
+		}); err != nil {
+			errs = append(errs, err)
+			if errors.Is(err, ErrSessionDeleted) {
+				break
+			}
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // distillModel returns the model id to use for distillation calls.
@@ -1356,12 +1708,18 @@ func buildDistillPrompt(userMsg, asstMsg string) string {
 
 // Save persists memory to disk via CoreMemory's atomic save.
 func (mm *MemoryManager) Save() error {
+	if mm == nil || mm.core == nil {
+		return nil
+	}
 	// Delegate to CoreMemory which handles locking and atomic writes
 	return mm.core.Save()
 }
 
 // Freshness returns the freshness of the oldest memory file across all memory types.
 func (mm *MemoryManager) Freshness() Freshness {
+	if mm == nil || mm.core == nil {
+		return Freshness{Status: "no_memory_yet"}
+	}
 	coreFresh := mm.core.Freshness()
 	if coreFresh.Status == "no_memory_yet" {
 		return coreFresh
@@ -1372,7 +1730,7 @@ func (mm *MemoryManager) Freshness() Freshness {
 // SaveDailyNote creates a new daily session note.
 // Triggered by /new or /reset commands.
 func (mm *MemoryManager) SaveDailyNote(sessionID, source, summary string) error {
-	if mm.daily == nil {
+	if mm == nil || mm.daily == nil {
 		return nil
 	}
 	return mm.daily.Save(sessionID, source, summary)
@@ -1380,7 +1738,7 @@ func (mm *MemoryManager) SaveDailyNote(sessionID, source, summary string) error 
 
 // ListDailyNotes returns recent daily notes sorted by date (newest first).
 func (mm *MemoryManager) ListDailyNotes(limit int) ([]DailyNote, error) {
-	if mm.daily == nil {
+	if mm == nil || mm.daily == nil {
 		return nil, nil
 	}
 	return mm.daily.List(limit)
@@ -1390,13 +1748,17 @@ func (mm *MemoryManager) ListDailyNotes(limit int) ([]DailyNote, error) {
 // Inspired by Claude Code's findRelevantMemories.ts pattern which uses a separate
 // LLM call to select up to N relevant memory files based on semantic similarity.
 func (mm *MemoryManager) FindRelevantMemories(ctx context.Context, provider llm.Provider, query string, limit int) ([]string, error) {
+	if mm == nil {
+		return nil, nil
+	}
 	if limit <= 0 {
 		limit = 5
 	}
 
-	// Retrieve candidate passages from archival memory
-	candidates, err := mm.archival.Search(SearchOptions{Limit: 20, SortBy: "relevance"})
-	if err != nil || len(candidates) == 0 {
+	// Retrieve candidate passages from the same cached archival + topic
+	// corpus used by per-turn AutoRetrieve.
+	candidates := mm.AutoRetrieveCandidates(query, 20)
+	if len(candidates) == 0 {
 		// Fallback to core memory if no archival
 		return mm.findRelevantCore(ctx, provider, query, limit)
 	}
@@ -1589,23 +1951,168 @@ func randomString(n int) string {
 }
 
 func truncate(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
 	if len(s) <= max {
 		return s
 	}
+	// Limits are byte-oriented for provider/persistence budgeting, but a raw
+	// byte slice can split a multi-byte Chinese/Japanese/Korean rune and leave
+	// invalid UTF-8 in recall JSON or a distillation prompt.
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
 	return s[:max]
+}
+
+// openAuthoritativeRoot opens and pins a canonical memory tier directory.
+// Lstat before and after OpenRoot prevents a path that was replaced by a
+// symlink (or another inode) from becoming the authority for the read.
+func openAuthoritativeRoot(root string) (*os.Root, string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil, "", errors.New("memory: empty authoritative root")
+	}
+	absRoot, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return nil, "", err
+	}
+	before, err := os.Lstat(absRoot)
+	if err != nil {
+		return nil, "", err
+	}
+	if before.Mode()&os.ModeSymlink != 0 {
+		return nil, "", fmt.Errorf("memory: authoritative root is a symlink: %s", absRoot)
+	}
+	if !before.IsDir() {
+		return nil, "", fmt.Errorf("memory: authoritative root is not a directory: %s", absRoot)
+	}
+	handle, err := os.OpenRoot(absRoot)
+	if err != nil {
+		return nil, "", err
+	}
+	after, err := handle.Lstat(".")
+	if err != nil {
+		handle.Close()
+		return nil, "", err
+	}
+	if !after.IsDir() || !os.SameFile(before, after) {
+		handle.Close()
+		return nil, "", fmt.Errorf("memory: authoritative root changed while opening: %s", absRoot)
+	}
+	return handle, absRoot, nil
+}
+
+// readAuthoritativeRegularFile reads one file without following any symlink
+// below the pinned tier root. Intermediate components must be directories and
+// the leaf must remain the same regular inode from Lstat through Open.
+func readAuthoritativeRegularFile(root, path string, maxBytes int64) ([]byte, os.FileInfo, error) {
+	handle, absRoot, err := openAuthoritativeRoot(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer handle.Close()
+
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return nil, nil, err
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil || rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		if err == nil {
+			err = fmt.Errorf("memory: authoritative path escapes root: %s", absPath)
+		}
+		return nil, nil, err
+	}
+
+	parts := strings.Split(rel, string(os.PathSeparator))
+	current := ""
+	var leafInfo os.FileInfo
+	for index, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, nil, fmt.Errorf("memory: invalid authoritative path component %q", part)
+		}
+		current = filepath.Join(current, part)
+		info, statErr := handle.Lstat(current)
+		if statErr != nil {
+			return nil, nil, statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, nil, fmt.Errorf("memory: authoritative path contains symlink: %s", absPath)
+		}
+		if index < len(parts)-1 {
+			if !info.IsDir() {
+				return nil, nil, fmt.Errorf("memory: authoritative parent is not a directory: %s", absPath)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return nil, nil, fmt.Errorf("memory: authoritative file is not regular: %s", absPath)
+		}
+		leafInfo = info
+	}
+	if maxBytes > 0 && leafInfo.Size() > maxBytes {
+		return nil, nil, fmt.Errorf("memory: authoritative file exceeds %d bytes: %s", maxBytes, absPath)
+	}
+
+	file, err := handle.Open(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(leafInfo, openedInfo) {
+		return nil, nil, fmt.Errorf("memory: authoritative file changed while opening: %s", absPath)
+	}
+
+	var reader io.Reader = file
+	if maxBytes > 0 {
+		reader = io.LimitReader(file, maxBytes+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return nil, nil, fmt.Errorf("memory: authoritative file exceeds %d bytes: %s", maxBytes, absPath)
+	}
+	return data, openedInfo, nil
 }
 
 // atomicWriteFile writes content to a temp file then atomically renames it.
 // Inspired by Hermes' _write_file() pattern.
 func atomicWriteFile(path, content string, perm os.FileMode) error {
 	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, "*.tmp")
 	if err != nil {
 		return err
 	}
 	tmpPath := tmp.Name()
+	// Apply the final private mode before any bytes are written. Rename keeps
+	// the temp inode, so there is no window where the destination exists with
+	// CreateTemp's platform-dependent permissions.
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
 
 	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		os.Remove(tmpPath)
 		return err
@@ -1621,7 +2128,7 @@ func atomicWriteFile(path, content string, perm os.FileMode) error {
 		return err
 	}
 
-	// Set permissions after rename (rename preserves src perms on some systems)
-	os.Chmod(path, perm)
-	return nil
+	// Defensively normalize an existing target on platforms with unusual
+	// rename semantics. Privacy was already guaranteed by chmod-before-write.
+	return os.Chmod(path, perm)
 }

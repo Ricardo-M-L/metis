@@ -67,6 +67,7 @@ type Server struct {
 	cancelTurn     context.CancelFunc
 	runningSession string
 	turnDone       chan struct{}
+	closing        bool
 
 	roster *agent.Roster
 
@@ -88,6 +89,10 @@ type Server struct {
 	activeProviderName string
 	activeModel        string
 	activePreset       string
+	activeWorkDir      string
+	freshWorkDir       string
+	memoryBinding      *rtpkg.WorkspaceMemoryBinding
+	memoryBindingErr   error
 
 	freshProviderName   string
 	freshModel          string
@@ -96,20 +101,29 @@ type Server struct {
 	freshPermissionMode permission.Mode
 	freshPreset         string
 
-	buildProvider   func(providerName, model string) (*rtpkg.ProviderBuild, error)
-	sessionBoundary func()
-	sessionSwitch   func(sessionID string)
-	openWorkspace   func(path string) error
-	openPath        func(path string) error
-	clipboardFiles  func() ([]desktop.ClipboardFile, error)
-	plugins         *rtpkg.PluginRegistry
-	pluginMarket    *pluginmarket.Manager
-	artifactStore   *artifact.Store
-	traceAdapter    *rtpkg.TraceAdapter
-	traceStore      *session.TraceStore
-	shutdownToken   string
-	shutdown        func()
-	shutdownOnce    sync.Once
+	buildProvider    func(providerName, model string) (*rtpkg.ProviderBuild, error)
+	sessionBoundary  func()
+	sessionSwitch    func(sessionID, workDir string)
+	openWorkspace    func(path string) error
+	openPath         func(path string) error
+	clipboardFiles   func() ([]desktop.ClipboardFile, error)
+	plugins          *rtpkg.PluginRegistry
+	pluginMarket     *pluginmarket.Manager
+	artifactStore    *artifact.Store
+	traceAdapter     *rtpkg.TraceAdapter
+	traceStore       *session.TraceStore
+	shutdownToken    string
+	shutdown         func()
+	shutdownOnce     sync.Once
+	desktopCloseOnce sync.Once
+	desktopCloseErr  error
+
+	// These lifecycle barriers default to the active Loop methods. Keeping the
+	// call sites explicit lets shutdown tests deterministically exercise timeout
+	// and provider-error paths without manufacturing private agent jobs.
+	flushPendingDistillation func(string) int
+	waitForDistillation      func(context.Context, string) error
+	waitAutoMemoryIdle       func(context.Context) error
 }
 
 // eventHub fans agent events out to zero or more SSE subscribers. The agent
@@ -242,7 +256,7 @@ type RuntimeBindings struct {
 	FreshPermissionMode permission.Mode
 	BuildProvider       func(providerName, model string) (*rtpkg.ProviderBuild, error)
 	SessionBoundary     func()
-	SessionSwitch       func(sessionID string)
+	SessionSwitch       func(sessionID, workDir string)
 	// OpenWorkspace starts an independent Desktop window rooted at path.
 	// A separate process avoids process-wide cwd races with active jobs.
 	OpenWorkspace func(path string) error
@@ -270,6 +284,13 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		binding = bindings[0]
 	}
 
+	launchWorkDir, _ := os.Getwd()
+	initialWorkDir := launchWorkDir
+	if store != nil && binding.InitialSessionID != "" {
+		if hdr, _, err := store.LoadHeader(binding.InitialSessionID); err == nil && hdr != nil && strings.TrimSpace(hdr.WorkDir) != "" {
+			initialWorkDir = hdr.WorkDir
+		}
+	}
 	server := &Server{
 		addr:                addr,
 		loop:                loop,
@@ -282,6 +303,8 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		activeSessionID:     binding.InitialSessionID,
 		activeProviderName:  binding.ProviderName,
 		activePreset:        binding.PresetName,
+		activeWorkDir:       initialWorkDir,
+		freshWorkDir:        launchWorkDir,
 		freshProviderName:   binding.ProviderName,
 		freshPermissionMode: binding.FreshPermissionMode,
 		freshPreset:         binding.PresetName,
@@ -299,6 +322,22 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		traceStore:          binding.TraceStore,
 	}
 	if loop != nil {
+		server.memoryBinding, server.memoryBindingErr = rtpkg.BindLoopWorkspaceMemory(loop, initialWorkDir)
+		if currentStateSnapshot := loop.CurrentStateSnapshot; currentStateSnapshot != nil {
+			loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+				state := currentStateSnapshot()
+				server.stateMu.RLock()
+				workDir := server.activeWorkDir
+				server.stateMu.RUnlock()
+				if strings.TrimSpace(workDir) != "" {
+					state.WorkingDirectory = workDir
+				}
+				return state
+			}
+		}
+		server.flushPendingDistillation = loop.FlushPendingDistillation
+		server.waitForDistillation = loop.WaitForDistillation
+		server.waitAutoMemoryIdle = loop.WaitAutoMemoryIdle
 		server.activeModel = loop.Model
 		server.freshModel = loop.Model
 		server.freshSystem = loop.System
@@ -323,6 +362,12 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 	if server.activePreset == "" {
 		server.activePreset = "standard"
 		server.freshPreset = "standard"
+	}
+	// setupRuntime constructs checkpoints from process cwd before Desktop reads
+	// its restored header. Publish the initial session workspace now so the very
+	// first resumed turn snapshots the same tree that its tools and Memory use.
+	if server.sessionSwitch != nil && binding.InitialSessionID != "" && strings.TrimSpace(initialWorkDir) != "" {
+		server.sessionSwitch(binding.InitialSessionID, initialWorkDir)
 	}
 	server.reconcilePersistedTraceUsage(binding.InitialSessionID)
 	if server.traceAdapter != nil {
@@ -453,7 +498,19 @@ func (s *Server) handler() http.Handler {
 
 const desktopShutdownTokenHeader = "X-Metis-Desktop-Token"
 
-const desktopTurnShutdownGrace = 3 * time.Second
+// Provider cancellation is normally immediate, but tools and custom provider
+// transports may need time to unwind and persist their final history/usage.
+// This remains shorter than the native shell's full three-minute durability
+// window, which also covers both background-memory barriers below.
+const desktopTurnShutdownGrace = 30 * time.Second
+
+const desktopDistillationShutdownGrace = 35 * time.Second
+
+// Auto Memory forks have their own 90 second provider timeout. Give the
+// filesystem hygiene/atomic-commit defer a small tail after that deadline so
+// shutdown and deletion never return while a private memory write is still in
+// flight.
+const desktopAutoMemoryShutdownGrace = 95 * time.Second
 
 // handleDesktopShutdown is a private control channel from the native Wails
 // shell to its loopback WebUI child. The route is registered only when the
@@ -472,6 +529,7 @@ func (s *Server) handleDesktopShutdown(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "invalid desktop shutdown token")
 		return
 	}
+	s.beginClosing()
 
 	w.WriteHeader(http.StatusAccepted)
 	if flusher, ok := w.(http.Flusher); ok {
@@ -481,36 +539,44 @@ func (s *Server) handleDesktopShutdown(w http.ResponseWriter, r *http.Request) {
 	// the active turn first so its handler can persist partial history, status,
 	// cost and timing instead of being abandoned when ListenAndServe returns.
 	go s.shutdownOnce.Do(func() {
-		s.cancelMu.Lock()
-		cancelTurn := s.cancelTurn
-		turnDone := s.turnDone
-		s.cancelMu.Unlock()
-		if cancelTurn != nil {
-			cancelTurn()
-		}
-		s.cancelPendingInteractions()
-		if turnDone != nil {
-			select {
-			case <-turnDone:
-			case <-time.After(desktopTurnShutdownGrace):
-			}
-		}
+		s.persistDesktopClose()
 		s.shutdown()
 	})
 }
 
 func (s *Server) Run(ctx context.Context) error {
 	server := &http.Server{Addr: s.addr, Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second}
+	return runHTTPServer(ctx, server, 5*time.Second, func() {
+		s.beginClosing()
+		// The native shutdown endpoint normally reaches this context through
+		// its cancellation callback, but embedders may cancel Run directly.
+		// Share one lifecycle guard so either path persists the final daily
+		// memory exactly once.
+		s.persistDesktopClose()
+	})
+}
+
+// runHTTPServer joins the graceful-drain goroutine before returning. Merely
+// observing http.ErrServerClosed is insufficient: ListenAndServe returns as
+// soon as listeners close, while Shutdown may still be waiting for handlers
+// that own turn/session persistence.
+func runHTTPServer(ctx context.Context, server *http.Server, shutdownGrace time.Duration, beforeShutdown func()) error {
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if beforeShutdown != nil {
+			beforeShutdown()
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
-	log.Printf("metis webui: listening on %s", s.addr)
-	fmt.Fprintf(os.Stderr, "Metis Desktop: http://%s\n", s.addr)
+	log.Printf("metis webui: listening on %s", server.Addr)
+	fmt.Fprintf(os.Stderr, "Metis Desktop: http://%s\n", server.Addr)
 	err := server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
+		<-shutdownDone
 		return nil
 	}
 	return err
@@ -1061,6 +1127,35 @@ func (s *Server) createFreshSessionForDelete() (*session.Header, error) {
 
 func (s *Server) deleteSessionData(id, workDir string, ownedJobOutputs []string) error {
 	var err error
+	if s.loop != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), desktopDistillationShutdownGrace)
+		waitErr := s.loop.CancelAndWaitForDistillation(ctx, id)
+		cancel()
+		if waitErr != nil {
+			err = errors.Join(err, fmt.Errorf("stop memory distillation for session %s: %w", id, waitErr))
+		}
+	}
+	if s.loop != nil && s.loop.Memory != nil {
+		// Conversation deletion includes memory rows attributed to this
+		// session. Shared/unattributed user preferences remain intact; the
+		// repository owns that scope decision. DeleteSession writes its durable
+		// tombstone before cleaning tiers, so even a stubborn distillation or
+		// already-running Auto Memory fork cannot resurrect the session.
+		err = errors.Join(err, s.loop.Memory.DeleteSession(id))
+	}
+	if s.loop != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), desktopAutoMemoryShutdownGrace)
+		waitErr := s.loop.WaitAutoMemoryIdle(ctx)
+		cancel()
+		if waitErr != nil {
+			err = errors.Join(err, fmt.Errorf("stop auto memory for session %s: %w", id, waitErr))
+		} else if s.loop.Memory != nil {
+			// A fork may have committed between the first cleanup and observing
+			// the tombstone. Its normal defer also sweeps, while this idempotent
+			// second pass makes the destructive boundary explicit and testable.
+			err = errors.Join(err, s.loop.Memory.DeleteSession(id))
+		}
+	}
 	if workDir != "" {
 		pointer, pointerErr := session.ReadPointer(workDir)
 		err = errors.Join(err, pointerErr)
@@ -1245,8 +1340,40 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+	// Reserve the foreground-turn slot atomically with the closing check.
+	// Shutdown holds the same cancelMu while setting closing and snapshotting
+	// this handle, so it cannot miss a turn between preflight and registration.
+	turnCtx, cancel := context.WithCancel(r.Context())
+	turnDone := make(chan struct{})
+	s.cancelMu.Lock()
+	if s.closing {
+		s.cancelMu.Unlock()
+		cancel()
+		writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
+		return
+	}
+	s.cancelTurn = cancel
+	s.runningSession = body.SessionID
+	s.turnDone = turnDone
+	s.cancelMu.Unlock()
+	defer func() {
+		s.cancelMu.Lock()
+		if s.turnDone == turnDone {
+			s.cancelTurn = nil
+			s.runningSession = ""
+			s.turnDone = nil
+		}
+		s.cancelMu.Unlock()
+		close(turnDone)
+		cancel()
+	}()
 	if body.SessionID == "" {
 		body.SessionID = s.store.NewSessionID()
+		s.cancelMu.Lock()
+		if s.turnDone == turnDone {
+			s.runningSession = body.SessionID
+		}
+		s.cancelMu.Unlock()
 		cwd, _ := os.Getwd()
 		if err := s.store.WriteHeaderFull(session.Header{
 			ID:       body.SessionID,
@@ -1275,6 +1402,13 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "failed to activate session: "+err.Error())
 		return
 	}
+	// Tool execution must follow the activated session workspace, not the
+	// Desktop process launch directory. Snapshot it once for this serialized
+	// turn so a later read-only navigation cannot alter an in-flight tool.
+	s.stateMu.RLock()
+	turnWorkDir := s.activeWorkDir
+	s.stateMu.RUnlock()
+	turnCtx = agent.WithCwd(turnCtx, turnWorkDir)
 	activateMs := time.Since(t0).Milliseconds()
 	if loadMs > 100 || activateMs > 100 {
 		log.Printf("turn pre-request: history load=%dms activate=%dms (session %s, %d msgs)", loadMs, activateMs, body.SessionID, len(history))
@@ -1329,9 +1463,6 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	finalStatus := "failed"
 	defer func() { _ = s.store.WriteHeaderFull(session.Header{ID: body.SessionID, Status: finalStatus}) }()
 
-	// Run under a cancellable context so the stop button can interrupt a
-	// long turn (the model may stream for minutes before first token).
-	turnCtx, cancel := context.WithCancel(r.Context())
 	turnCtx, traceOrigin := rtpkg.BindTraceTurn(turnCtx, body.SessionID)
 	if traceOrigin.Turn > 0 {
 		// RecordUserMessage opened this exact trace turn immediately above.
@@ -1340,23 +1471,6 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		// turn key identical to the trace observer's immutable origin.
 		messageMetric.Turn = traceOrigin.Turn
 	}
-	turnDone := make(chan struct{})
-	s.cancelMu.Lock()
-	s.cancelTurn = cancel
-	s.runningSession = body.SessionID
-	s.turnDone = turnDone
-	s.cancelMu.Unlock()
-	defer func() {
-		s.cancelMu.Lock()
-		if s.turnDone == turnDone {
-			s.cancelTurn = nil
-			s.runningSession = ""
-			s.turnDone = nil
-		}
-		s.cancelMu.Unlock()
-		close(turnDone)
-		cancel()
-	}()
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
@@ -1598,17 +1712,54 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	activeProviderName := s.activeProviderName
 	activeModel := s.activeModel
 	s.stateMu.RUnlock()
+	targetWorkDir := strings.TrimSpace(hdr.WorkDir)
+	if targetWorkDir == "" {
+		// Headers written before WorkDir existed must not inherit whichever
+		// workspace happened to be viewed immediately before them. Their stable
+		// fallback is the process launch workspace captured by NewServer.
+		targetWorkDir = strings.TrimSpace(s.freshWorkDir)
+	}
+	var preparedMemory *rtpkg.WorkspaceMemoryRebind
+	if s.memoryBinding != nil {
+		if targetWorkDir == "" {
+			return errors.New("memory workspace unavailable: launch working directory is empty")
+		}
+		var err error
+		preparedMemory, err = s.memoryBinding.PrepareWorkspace(targetWorkDir)
+		if err != nil {
+			return fmt.Errorf("memory workspace preflight: %w", err)
+		}
+		if preparedMemory == nil && s.memoryBindingErr != nil {
+			return fmt.Errorf("memory workspace unavailable: %w", s.memoryBindingErr)
+		}
+	}
 
 	// Re-reading the active transcript is not a top-level boundary. It repairs
 	// the in-memory view after a prior failed turn without clearing permission
 	// state or session-scoped loop guards that still belong to this session.
 	if activeID == id {
+		if preparedMemory != nil {
+			if err := s.flushAndWaitPendingDistillation(activeID, desktopDistillationShutdownGrace); err != nil {
+				return err
+			}
+			if err := s.cancelAndWaitForBackgroundAgents(desktopTurnShutdownGrace); err != nil {
+				return err
+			}
+			if err := s.waitForAutoMemoryBoundary(desktopAutoMemoryShutdownGrace); err != nil {
+				return err
+			}
+			s.memoryBinding.CommitWorkspace(preparedMemory)
+			s.memoryBindingErr = nil
+		}
 		s.loop.Restore(history)
 		s.loop.SetEffort(effortFromHeader(hdr.Effort))
 		s.loop.TimingSink = s.store.NewTimingRecorder(id).Record
 		s.stateMu.Lock()
 		if hdr.Preset != "" {
 			s.activePreset = hdr.Preset
+		}
+		if targetWorkDir != "" {
+			s.activeWorkDir = targetWorkDir
 		}
 		s.stateMu.Unlock()
 		provider, _, _ := s.loop.ProviderModelSnapshot()
@@ -1671,11 +1822,30 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		}
 	}
 
-	if err := s.persistActiveSessionState(); err != nil {
+	if err := s.flushAndWaitPendingDistillation(activeID, desktopDistillationShutdownGrace); err != nil {
+		return err
+	}
+	// Every top-level session boundary changes provenance routers even when
+	// both conversations share a workspace. Join detached source agents before
+	// SessionSwitch publishes the target session id, otherwise a late Memory
+	// archive can be stored under the wrong conversation and evade deletion.
+	if err := s.cancelAndWaitForBackgroundAgents(desktopTurnShutdownGrace); err != nil {
+		return err
+	}
+	if preparedMemory != nil {
+		if err := s.waitForAutoMemoryBoundary(desktopAutoMemoryShutdownGrace); err != nil {
+			return err
+		}
+	}
+	if err := s.persistActiveSessionBoundary("desktop-switch"); err != nil {
 		return err
 	}
 	if s.sessionBoundary != nil {
 		s.sessionBoundary()
+	}
+	if preparedMemory != nil {
+		s.memoryBinding.CommitWorkspace(preparedMemory)
+		s.memoryBindingErr = nil
 	}
 
 	mode := s.freshPermissionMode
@@ -1719,11 +1889,38 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	s.activeProviderName = targetProviderName
 	s.activeModel = targetModel
 	s.activePreset = targetPreset
+	if targetWorkDir != "" {
+		s.activeWorkDir = targetWorkDir
+	}
 	s.stateMu.Unlock()
 	if s.sessionSwitch != nil {
-		s.sessionSwitch(id)
+		s.sessionSwitch(id, targetWorkDir)
 	}
 	s.reconcilePersistedTraceUsage(id)
+	return nil
+}
+
+func (s *Server) cancelAndWaitForBackgroundAgents(timeout time.Duration) error {
+	if s == nil || s.roster == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := s.roster.CancelAndWait(ctx); err != nil {
+		return fmt.Errorf("join background agents before workspace switch: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) waitForAutoMemoryBoundary(timeout time.Duration) error {
+	if s == nil || s.waitAutoMemoryIdle == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := s.waitAutoMemoryIdle(ctx); err != nil {
+		return fmt.Errorf("join auto memory before workspace switch: %w", err)
+	}
 	return nil
 }
 
@@ -1741,6 +1938,205 @@ func (s *Server) persistActiveSessionState() error {
 	return s.writeActiveSessionState(
 		id, providerName, model, preset, runtimeState.System, s.loop.EffortValue(),
 	)
+}
+
+// persistActiveSessionBoundary saves both the resumable session header and
+// the daily memory associated with leaving the chat. The header is the
+// authoritative durability boundary: a Daily note must never claim a clean
+// switch/close when that resumable state could not be persisted.
+func (s *Server) persistActiveSessionBoundary(source string) error {
+	if s == nil || s.loop == nil || s.store == nil {
+		return nil
+	}
+	if err := s.persistActiveSessionState(); err != nil {
+		return err
+	}
+	s.stateMu.RLock()
+	id := s.activeSessionID
+	s.stateMu.RUnlock()
+	if id != "" && s.loop.Memory != nil {
+		if err := s.loop.Memory.SaveDailyNote(id, source, summarizeMemoryHistory(s.loop.History())); err != nil {
+			return fmt.Errorf("persist active session %s daily memory (%s): %w", id, source, err)
+		}
+	}
+	return nil
+}
+
+// flushAndWaitPendingDistillation turns every completed-but-not-yet-distilled
+// exchange into a registered background job before waiting. Registering first
+// closes the short-session gap: a session switch/new boundary can no longer
+// strand successful turns merely because the normal cadence was not reached.
+func (s *Server) flushAndWaitPendingDistillation(sessionID string, timeout time.Duration) error {
+	if s == nil {
+		return nil
+	}
+	if s.flushPendingDistillation != nil {
+		s.flushPendingDistillation(sessionID)
+	}
+	if s.waitForDistillation == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := s.waitForDistillation(ctx, sessionID); err != nil {
+		return fmt.Errorf("flush pending memory distillation for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// persistDesktopClose is shared by the authenticated native endpoint and
+// Server.Run's context-cancellation path. A native close triggers both paths,
+// so the once guard prevents duplicate turn cancellation, background-memory
+// joins, and final daily saves.
+type desktopCloseTimeouts struct {
+	turn         time.Duration
+	distillation time.Duration
+	autoMemory   time.Duration
+}
+
+var defaultDesktopCloseTimeouts = desktopCloseTimeouts{
+	turn:         desktopTurnShutdownGrace,
+	distillation: desktopDistillationShutdownGrace,
+	autoMemory:   desktopAutoMemoryShutdownGrace,
+}
+
+func (s *Server) persistDesktopClose() error {
+	return s.persistDesktopCloseWithTimeouts(defaultDesktopCloseTimeouts)
+}
+
+func (s *Server) persistDesktopCloseWithTimeouts(timeouts desktopCloseTimeouts) error {
+	if s == nil {
+		return nil
+	}
+	s.desktopCloseOnce.Do(func() {
+		var closeErr error
+		s.cancelMu.Lock()
+		cancelTurn := s.cancelTurn
+		turnDone := s.turnDone
+		s.cancelMu.Unlock()
+		if cancelTurn != nil {
+			cancelTurn()
+		}
+		s.cancelPendingInteractions()
+		if turnDone != nil {
+			if !waitForTurnShutdown(turnDone, timeouts.turn) {
+				// Do not take a Daily snapshot or join memory against a turn that
+				// can still append history. The server owner will finish its
+				// bounded shutdown without claiming this was a clean boundary.
+				closeErr = fmt.Errorf("active turn did not stop within %s; skip final memory boundary", timeouts.turn)
+				s.desktopCloseErr = closeErr
+				log.Printf("desktop close: %v", closeErr)
+				return
+			}
+		}
+		if s.flushPendingDistillation != nil {
+			s.flushPendingDistillation("")
+		}
+		if s.waitForDistillation != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), timeouts.distillation)
+			err := s.waitForDistillation(ctx, "")
+			cancel()
+			if err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("wait for memory distillation: %w", err))
+			}
+		}
+		if s.waitAutoMemoryIdle != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), timeouts.autoMemory)
+			err := s.waitAutoMemoryIdle(ctx)
+			cancel()
+			if err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("wait for auto memory: %w", err))
+			}
+		}
+		if err := s.persistActiveSessionBoundary("desktop-close"); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+		s.desktopCloseErr = closeErr
+		if closeErr != nil {
+			log.Printf("desktop close completed with durability errors: %v", closeErr)
+		}
+	})
+	return s.desktopCloseErr
+}
+
+// waitForTurnShutdown never reports success while the turn handler can still
+// append history or enqueue Auto Memory. The complete bounded close budget is
+// 30s turn + 35s distillation + 95s Auto Memory + HTTP drain; the native shell
+// waits four minutes before its platform-specific hard-kill fallback.
+func waitForTurnShutdown(done <-chan struct{}, grace time.Duration) bool {
+	if done == nil {
+		return true
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *Server) beginClosing() {
+	if s == nil {
+		return
+	}
+	s.cancelMu.Lock()
+	s.closing = true
+	s.cancelMu.Unlock()
+}
+
+func summarizeMemoryHistory(history []llm.Message) string {
+	if len(history) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(history))
+	for _, message := range history {
+		var parts []string
+		for _, block := range message.Content {
+			if block.Type != "text" || block.Synthetic {
+				continue
+			}
+			text := strings.TrimSpace(block.Text)
+			if message.Role == llm.RoleUser {
+				text = transcriptpkg.VisibleUserText(text)
+			}
+			if text != "" {
+				parts = append(parts, text)
+			}
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		text := truncateRunes(strings.Join(parts, "\n"), 300)
+		lines = append(lines, string(message.Role)+": "+text)
+	}
+	return truncateRunesTail(strings.Join(lines, "\n"), 2000)
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
+}
+
+func truncateRunesTail(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	if limit == 1 {
+		return "…"
+	}
+	return "…" + string(runes[len(runes)-limit+1:])
 }
 
 func (s *Server) writeActiveSessionState(id, providerName, model, preset, system string, effort llm.Effort) error {

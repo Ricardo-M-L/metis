@@ -12,9 +12,11 @@ package agent
 // or peer-messaging delivery silently regresses.
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestRoster_CapacityRejects — the G.0 fork-bomb safety net. Capacity
@@ -211,5 +213,53 @@ func TestRoster_ConcurrentSafe(t *testing.T) {
 	wg.Wait()
 	if r.Count() != 100 {
 		t.Errorf("100 concurrent registers should yield Count=100; got %d", r.Count())
+	}
+}
+
+func TestRosterCancelAndWaitJoinsRunner(t *testing.T) {
+	r := NewRoster(2)
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	teammate := &Teammate{Name: "background"}
+	teammate.Cancel = func() {
+		select {
+		case <-canceled:
+		default:
+			close(canceled)
+		}
+	}
+	if err := r.Register(teammate); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-canceled
+		<-release
+		r.UnregisterTeammate(teammate)
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- r.CancelAndWait(context.Background()) }()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("roster did not cancel the runner")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("CancelAndWait returned before runner exit: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := r.Register(&Teammate{Name: "late"}); !errors.Is(err, ErrRosterResetting) {
+		t.Fatalf("register during join error = %v, want %v", err, ErrRosterResetting)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("CancelAndWait: %v", err)
+	}
+	if r.Count() != 0 || len(r.List()) != 0 {
+		t.Fatalf("joined roster not empty: count=%d list=%+v", r.Count(), r.List())
+	}
+	if err := r.Register(&Teammate{Name: "next-session"}); err != nil {
+		t.Fatalf("roster not reusable after join: %v", err)
 	}
 }

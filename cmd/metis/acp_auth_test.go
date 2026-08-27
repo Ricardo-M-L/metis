@@ -4,11 +4,55 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
+
+type blockingACPServerLifecycle struct {
+	closed   chan struct{}
+	waitDone chan struct{}
+	once     sync.Once
+}
+
+func newBlockingACPServerLifecycle() *blockingACPServerLifecycle {
+	return &blockingACPServerLifecycle{closed: make(chan struct{}), waitDone: make(chan struct{})}
+}
+
+func (s *blockingACPServerLifecycle) Wait() { <-s.waitDone }
+
+func (s *blockingACPServerLifecycle) Close() error {
+	s.once.Do(func() {
+		close(s.closed)
+		close(s.waitDone)
+	})
+	return nil
+}
+
+func TestWaitForACPServerClosesOnStdioSignal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := newBlockingACPServerLifecycle()
+	done := make(chan error, 1)
+	go func() { done <- waitForACPServer(ctx, srv) }()
+
+	cancel()
+	select {
+	case <-srv.closed:
+	case <-time.After(time.Second):
+		t.Fatal("stdio context cancellation did not close ACP server")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitForACPServer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stdio signal path did not return after closing ACP server")
+	}
+}
 
 func TestPrepareACPLoopDefersMissingCredentialUntilPrompt(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())

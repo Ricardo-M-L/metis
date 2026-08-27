@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/memdir"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 )
 
 // handleMemoryCommand parses args and dispatches. Always returns a
@@ -90,12 +91,14 @@ func memoryRm(root, name string) string {
 	if !memdir.IsAutoMemPath(root, path) {
 		return fmt.Sprintf("(memory rm: %q is outside the memdir root — refusing)", name)
 	}
-	if err := os.Remove(path); err != nil {
-		return fmt.Sprintf("(memory rm: %v)", err)
+	repository, err := memory.NewMemoryManager(root)
+	if err != nil {
+		return fmt.Sprintf("(memory rm: initialize repository: %v)", err)
 	}
-	// Regenerate index so MEMORY.md doesn't reference a missing file.
-	if files, err := memdir.ScanMemoryFiles(context.Background(), root); err == nil {
-		_ = memdir.WriteIndex(root, files)
+	// Empty sourceSessionID is the explicit user-admin path. Auto Memory uses
+	// a non-empty source and cannot delete another session's topic.
+	if err := repository.RemoveTopic(context.Background(), path, ""); err != nil {
+		return fmt.Sprintf("(memory rm: %v)", err)
 	}
 	return fmt.Sprintf("(memory rm: deleted %s)", filepath.Base(path))
 }

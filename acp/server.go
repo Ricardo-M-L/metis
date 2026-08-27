@@ -7,15 +7,20 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
+
+const acpPromptDistillationGrace = 35 * time.Second
 
 // Server runs an ACP endpoint backed by a single agent.Loop.
 // Per-connection state (active prompts, pending permission asks) lives on session.
@@ -24,11 +29,17 @@ type Server struct {
 	Addr      string
 	SessionID string
 
-	ln    net.Listener
-	wg    sync.WaitGroup
-	mu    sync.Mutex
-	done  bool
-	conns map[net.Conn]struct{} // active TCP connections to close on shutdown
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	ln        net.Listener
+	wg        sync.WaitGroup
+	mu        sync.Mutex
+	done      bool
+	closeOnce sync.Once
+	conns     map[net.Conn]struct{} // active TCP connections to close on shutdown
+	stdioIn   io.ReadCloser
+	stdioOut  io.Writer
 }
 
 func NewServer(loop *agent.Loop, addr string) *Server {
@@ -39,7 +50,22 @@ func NewServer(loop *agent.Loop, addr string) *Server {
 // this ACP server. Keeping the session explicit avoids attributing concurrent
 // or late trace events through ambient process-global selection state.
 func NewServerForSession(loop *agent.Loop, addr, sessionID string) *Server {
-	return &Server{Loop: loop, Addr: addr, SessionID: sessionID, conns: make(map[net.Conn]struct{})}
+	return NewServerForSessionContext(context.Background(), loop, addr, sessionID)
+}
+
+// NewServerForSessionContext binds the lifetime of every prompt to parent.
+// Server.Close also cancels this derived context, so both a command signal and
+// an explicit service shutdown terminate providers before Cleanup tears down
+// their runtime dependencies.
+func NewServerForSessionContext(parent context.Context, loop *agent.Loop, addr, sessionID string) *Server {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &Server{
+		Loop: loop, Addr: addr, SessionID: sessionID,
+		ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
+	}
 }
 
 // Listen starts serving. Stdio mode runs in a goroutine and Listen returns
@@ -47,10 +73,23 @@ func NewServerForSession(loop *agent.Loop, addr, sessionID string) *Server {
 // Wait blocks until Close is called.
 func (s *Server) Listen() error {
 	if s.Addr == "stdio" || s.Addr == "" {
+		s.mu.Lock()
+		if s.done {
+			s.mu.Unlock()
+			return errors.New("ACP server is closed")
+		}
+		if s.stdioIn == nil {
+			s.stdioIn = os.Stdin
+		}
+		if s.stdioOut == nil {
+			s.stdioOut = os.Stdout
+		}
+		in, out := s.stdioIn, s.stdioOut
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
-			s.serveConn(os.Stdin, os.Stdout)
+			s.serveConn(in, out)
 		}()
 		return nil
 	}
@@ -58,8 +97,15 @@ func (s *Server) Listen() error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return errors.New("ACP server is closed")
+	}
 	s.ln = ln
 	s.wg.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer s.wg.Done()
 		for {
@@ -69,9 +115,14 @@ func (s *Server) Listen() error {
 			}
 			wc := conn
 			s.mu.Lock()
+			if s.done {
+				s.mu.Unlock()
+				_ = wc.Close()
+				return
+			}
 			s.conns[wc] = struct{}{}
-			s.mu.Unlock()
 			s.wg.Add(1)
+			s.mu.Unlock()
 			go func() {
 				defer s.wg.Done()
 				defer wc.Close()
@@ -91,22 +142,28 @@ func (s *Server) Listen() error {
 func (s *Server) Wait() { s.wg.Wait() }
 
 func (s *Server) Close() error {
-	s.mu.Lock()
-	if s.done {
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.mu.Lock()
+		s.done = true
+		if s.ln != nil {
+			_ = s.ln.Close()
+		}
+		// Force-close active connections so their serveConn goroutines unblock
+		// from json.Decode and active prompt contexts can observe cancellation.
+		for c := range s.conns {
+			_ = c.Close()
+		}
+		// Stdio has no net.Conn to close. Closing the command-owned stdin is
+		// what releases a decoder blocked in Read after SIGINT/SIGTERM.
+		if s.stdioIn != nil {
+			_ = s.stdioIn.Close()
+		}
 		s.mu.Unlock()
-		return nil
-	}
-	s.done = true
-	if s.ln != nil {
-		s.ln.Close()
-	}
-	// Force-close active connections so their serveConn goroutines unblock
-	// from json.Decode and the wg.Wait below actually returns.
-	for c := range s.conns {
-		c.Close()
-	}
-	s.mu.Unlock()
-	s.wg.Wait()
+		s.wg.Wait()
+	})
 	return nil
 }
 
@@ -153,7 +210,13 @@ func (s *Server) serveConn(r io.Reader, w io.Writer) {
 			}
 			return
 		}
+		s.mu.Lock()
+		if s.done {
+			s.mu.Unlock()
+			return
+		}
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func(req Request) {
 			defer s.wg.Done()
 			sn.handle(&req)
@@ -208,6 +271,9 @@ type PermissionReplyParams struct {
 
 func (sn *session) handle(req *Request) {
 	ctx := context.Background()
+	if sn.server != nil && sn.server.ctx != nil {
+		ctx = sn.server.ctx
+	}
 	switch req.Method {
 	case "initialize":
 		var p InitializeParams
@@ -381,7 +447,37 @@ func (sn *session) handlePrompt(ctx context.Context, id any, p PromptParams) {
 		sn.write(Response{JSONRPC: "2.0", ID: id, Error: &ResponseError{Code: -32000, Message: err.Error()}})
 		return
 	}
+	// A successful prompt is the protocol's durability boundary for both stdio
+	// and TCP. Persist here, before the success response, rather than at process
+	// shutdown: TCP servers may stay alive indefinitely and each prompt must
+	// flush only its explicitly bound session. The fresh grace context prevents
+	// a late abort/disconnect from erasing work that Loop.Run already completed.
+	if err := sn.persistPromptMemoryBoundary(); err != nil {
+		sn.write(Response{JSONRPC: "2.0", ID: id, Error: &ResponseError{Code: -32000, Message: err.Error()}})
+		return
+	}
 	sn.write(Response{JSONRPC: "2.0", ID: id, Result: map[string]any{"done": true}})
+}
+
+func (sn *session) persistPromptMemoryBoundary() error {
+	if sn == nil || sn.server == nil || sn.server.Loop == nil {
+		return nil
+	}
+	sessionID := strings.TrimSpace(sn.server.SessionID)
+	if sessionID == "" {
+		// An empty ID means "all sessions" to Loop. ACP must never widen one
+		// request's boundary that way; embedders without an owning session keep
+		// the legacy no-memory-boundary behavior.
+		return nil
+	}
+	sn.server.Loop.FlushPendingDistillation(sessionID)
+	waitCtx, cancel := context.WithTimeout(context.Background(), acpPromptDistillationGrace)
+	err := sn.server.Loop.WaitForDistillation(waitCtx, sessionID)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("ACP prompt: join memory distillation for %s: %w", sessionID, err)
+	}
+	return nil
 }
 
 func (sn *session) handleAbort(id any, p AbortParams) {

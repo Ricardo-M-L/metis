@@ -213,7 +213,7 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// (e.g. `metis tools` informational listing), the tool registers
 	// with nil and Execute returns a clear error so the capability
 	// shows up in /tools but isn't usable.
-	reg.Register(builtin.NewMemory(opts.Gate, opts.MemoryManager))
+	reg.Register(builtin.NewMemory(opts.Gate, opts.MemoryManager).WithSourceSessionIDFn(CurrentSessionID))
 	// History tool: searches the FULL on-disk session transcript,
 	// including messages auto-compaction has summarized away from the
 	// live context. The loadFn closure reads the session JSONL fresh on

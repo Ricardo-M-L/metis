@@ -137,7 +137,7 @@ func (d *DreamLock) TryAcquire() (priorMtime time.Time, ok bool, err error) {
 	priorMtime = d.LastSuccessAt()
 
 	pid := strconv.Itoa(os.Getpid())
-	if err := os.WriteFile(d.path, []byte(pid), 0o644); err != nil {
+	if err := os.WriteFile(d.path, []byte(pid), 0o600); err != nil {
 		return priorMtime, false, fmt.Errorf("dream-lock: write %s: %w", d.path, err)
 	}
 
@@ -170,7 +170,7 @@ func (d *DreamLock) TryAcquire() (priorMtime time.Time, ok bool, err error) {
 // non-fatal: even if the truncate fails the mtime is correct, which
 // is the load-bearing part for the time gate.
 func (d *DreamLock) Release() error {
-	if err := os.WriteFile(d.path, []byte{}, 0o644); err != nil {
+	if err := os.WriteFile(d.path, []byte{}, 0o600); err != nil {
 		return fmt.Errorf("dream-lock: release %s: %w", d.path, err)
 	}
 	return nil

@@ -54,13 +54,10 @@ type AgentProfile struct {
 	Skills          []string // extra skills to load
 	OmitClaudeMd    bool     // skip ~/.metis/system.md addendum
 	SystemPrompt    string   // markdown body
-	// MemorySnapshot — G.10 (2026-05-12). When set, the agent.Store
-	// associated with this run RestoreSnapshot(name)'s the named
-	// snapshot before the first turn so the sub-agent picks up
-	// where a prior run of the same profile left off. The snapshot
-	// is taken with Store.Snapshot(name) by a separate flow
-	// (typically the user typing /memory snapshot <name> after a
-	// productive sub-agent session). Empty = no restore.
+	// MemorySnapshot is parsed only for backwards compatibility with legacy
+	// profiles. The old agent.Store snapshot format is deprecated and no
+	// production runtime restores it; durable state now flows through the
+	// unified memory.Repository and provenance-aware session recall.
 	MemorySnapshot string
 }
 

@@ -2,7 +2,6 @@ package builtin
 
 import (
 	"os"
-	"path/filepath"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -45,11 +44,11 @@ func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *per
 		disabled[n] = true
 	}
 	os.MkdirAll(skillDir, 0o755)
-	os.MkdirAll(memoryDir, 0o755)
-
-	// Memory dir for Memory tool
-	memDir := filepath.Join(memoryDir, "..", "memories")
-	os.MkdirAll(memDir, 0o755)
+	// memoryDir is the private session store root, not a second memory
+	// repository. Older builds also created ../memories here even though no
+	// production writer used it; the canonical Repository now owns all memory
+	// paths, so boot must not recreate that abandoned tree.
+	os.MkdirAll(memoryDir, 0o700)
 
 	// Per-session ReadFileState shared by Read/Write/Edit so
 	// stale-write detection works across them.

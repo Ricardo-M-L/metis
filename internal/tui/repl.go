@@ -125,7 +125,8 @@ type REPL struct {
 	// REPL-owned tracker is updated directly.
 	ResetTokenUsageAfterCompaction func()
 
-	shouldQuit bool
+	shouldQuit            bool
+	sessionBoundaryClosed bool
 }
 
 // BgTurnState is the snapshot returned by BgTurnSnapshot for cmdBg.
@@ -209,6 +210,10 @@ func (r *REPL) ConfigureSandbox(manager *sandbox.Manager) {
 func (r *REPL) Run(ctx context.Context) (runErr error) {
 	defer func() {
 		if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.providerName, r.model, r.Loop.System); err != nil {
+			runErr = errors.Join(runErr, err)
+			return
+		}
+		if err := r.leaveActiveSession("cli-close", true); err != nil {
 			runErr = errors.Join(runErr, err)
 		}
 	}()
@@ -309,11 +314,6 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 			case slash.SignalCompact:
 				fmt.Fprintln(r.out, cmdCompact(r, args))
 			case slash.SignalNew:
-				// Save daily note before starting new session
-				if r.Loop.Memory != nil {
-					summary := r.summarizeHistory()
-					_ = r.Loop.Memory.SaveDailyNote(r.SessionID, "new", summary)
-				}
 				newID, err := r.startFreshSession()
 				if err != nil {
 					fmt.Fprintln(r.out, r.Styles.Err.Render("new session: "+err.Error()))

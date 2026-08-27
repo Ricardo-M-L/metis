@@ -29,6 +29,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/config"
 )
 
 // ENTRYPOINT_NAME is the index file name. It is NOT a memory itself —
@@ -37,19 +39,18 @@ import (
 // as a "saved memory" in extractMemories.
 const ENTRYPOINT_NAME = "MEMORY.md"
 
-// DefaultRoot is the canonical memdir root: ~/.metis/memory/.
+// DefaultRoot is the canonical memdir root: $METIS_HOME/memory (falling back
+// to ~/.metis/memory). It deliberately delegates to config.Home so Desktop,
+// CLI, tests, and auto-memory cannot split their state across two roots.
 //
 // Returning an error rather than silently using a temp dir makes
 // startup-path config bugs loud (HOME unset in containers, e.g.).
 func DefaultRoot() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	home := config.Home()
+	if strings.TrimSpace(home) == "" {
+		return "", errors.New("memdir: METIS home is empty")
 	}
-	if home == "" {
-		return "", errors.New("memdir: HOME is empty")
-	}
-	return filepath.Join(home, ".metis", "memory"), nil
+	return filepath.Join(home, "memory"), nil
 }
 
 // EnsureRoot creates the memdir if missing. Idempotent. Permissions
@@ -60,7 +61,43 @@ func EnsureRoot(root string) error {
 	if root == "" {
 		return errors.New("memdir: empty root")
 	}
-	return os.MkdirAll(root, 0o700)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	return SecurePermissions(root)
+}
+
+// SecurePermissions normalizes the memory tree to private POSIX modes:
+// directories 0700 and regular files 0600. It resolves a symlinked root but
+// never follows symlink entries inside the tree. Calling it repeatedly is
+// safe and also upgrades installations created by older 0755/0644 code.
+func SecurePermissions(root string) error {
+	if root == "" {
+		return errors.New("memdir: empty root")
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	return filepath.WalkDir(resolved, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0o700)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			return os.Chmod(path, 0o600)
+		}
+		return nil
+	})
 }
 
 // IndexPath returns the MEMORY.md path under root.

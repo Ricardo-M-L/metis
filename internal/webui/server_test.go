@@ -19,10 +19,12 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 )
 
 type activationTestProvider struct {
@@ -157,6 +159,61 @@ func (t turnTailMarkerTool) Execute(context.Context, map[string]any) (*tools.Res
 		}
 	}
 	return &tools.Result{Output: "persisted marker"}, nil
+}
+
+type cwdCaptureProvider struct {
+	activationTestProvider
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *cwdCaptureProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 1 {
+		return &composerSummaryStream{events: []llm.StreamEvent{
+			{Type: "tool_use_start", ToolUseID: "capture-cwd-1", ToolName: "CaptureCwd"},
+			{Type: "tool_input_delta", ToolUseID: "capture-cwd-1", InputDelta: `{}`},
+			{Type: "tool_use_stop", ToolUseID: "capture-cwd-1", InputDelta: `{}`},
+			{Type: "message_delta", StopReason: "tool_use"},
+			{Type: "message_stop"},
+		}}, nil
+	}
+	return &composerSummaryStream{events: []llm.StreamEvent{
+		{Type: "message_stop", StopReason: "end_turn"},
+	}}, nil
+}
+
+type cwdCaptureTool struct {
+	tools.BaseTool
+	mu  sync.Mutex
+	cwd string
+}
+
+func (*cwdCaptureTool) Name() string        { return "CaptureCwd" }
+func (*cwdCaptureTool) Description() string { return "capture the effective tool working directory" }
+func (*cwdCaptureTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (*cwdCaptureTool) Concurrency(map[string]any) tools.Concurrency {
+	return tools.ConcurrencySafe
+}
+func (*cwdCaptureTool) CanUse(context.Context, map[string]any) (tools.Permission, string) {
+	return tools.PermissionAllow, ""
+}
+func (t *cwdCaptureTool) Execute(ctx context.Context, _ map[string]any) (*tools.Result, error) {
+	t.mu.Lock()
+	t.cwd = agent.CwdFromContext(ctx)
+	t.mu.Unlock()
+	return &tools.Result{Output: "captured"}, nil
+}
+
+func (t *cwdCaptureTool) captured() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.cwd
 }
 
 func testServer(t *testing.T) (*Server, *session.Store) {
@@ -648,6 +705,179 @@ func TestSessionDeletePreservesRecoveryPointerOwnedByAnotherSession(t *testing.T
 	}
 }
 
+func TestSessionDeleteRemovesOnlyAttributedMemory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("METIS_HOME", home)
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const target = "delete-memory-session"
+	if err := store.WriteHeaderFull(session.Header{ID: target}); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := memory.NewMemoryManager(filepath.Join(home, "memory"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SaveDailyNote(target, "desktop-switch", "owned daily fact"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SaveDailyNote("keep-memory-session", "desktop-switch", "shared daily fact"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Archival().Insert(memory.Passage{Content: "owned archive fact", SourceSessionID: target}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Archival().Insert(memory.Passage{Content: "shared archive fact", SourceSessionID: "keep-memory-session"}); err != nil {
+		t.Fatal(err)
+	}
+	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Memory = manager
+	s := NewServer("127.0.0.1:0", loop, store)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+target, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rr.Code, rr.Body.String())
+	}
+	notes, err := manager.ListDailyNotes(10)
+	if err != nil || len(notes) != 1 || notes[0].SessionID != "keep-memory-session" {
+		t.Fatalf("daily memory deletion crossed scope: notes=%+v err=%v", notes, err)
+	}
+	hits, err := manager.Archival().Search(memory.SearchOptions{SortBy: "recent"})
+	if err != nil || len(hits) != 1 || hits[0].SourceSessionID != "keep-memory-session" {
+		t.Fatalf("archival memory deletion crossed scope: hits=%+v err=%v", hits, err)
+	}
+}
+
+func TestSessionDeleteMemoryFailurePreservesTranscript(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("METIS_HOME", home)
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const target = "delete-memory-partial-failure"
+	if err := store.WriteHeaderFull(session.Header{ID: target}); err != nil {
+		t.Fatal(err)
+	}
+	managerRoot := filepath.Join(home, "memory")
+	manager, err := memory.NewMemoryManager(managerRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make one memory tier fail deterministically. DeleteSession may have
+	// already removed rows from other tiers when it returns this error, so the
+	// Desktop must leave the canonical transcript visible for a safe retry.
+	dailyRoot := filepath.Join(managerRoot, "daily")
+	if err := os.RemoveAll(dailyRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dailyRoot, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Memory = manager
+	s := NewServer("127.0.0.1:0", loop, store)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+target, nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("delete status = %d, want %d: %s", rr.Code, http.StatusInternalServerError, rr.Body.String())
+	}
+	var response struct {
+		Partial bool `json:"partial"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil || !response.Partial {
+		t.Fatalf("partial delete response = %+v, err=%v", response, err)
+	}
+	if hdr, _, err := store.Load(target); err != nil || hdr == nil || hdr.ID != target {
+		t.Fatalf("transcript disappeared after partial memory failure: header=%+v err=%v", hdr, err)
+	}
+}
+
+func TestDesktopSessionSwitchPersistsVisibleDailyMemory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("METIS_HOME", home)
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const current = "daily-current"
+	const next = "daily-next"
+	for _, id := range []string{current, next} {
+		if err := store.WriteHeaderFull(session.Header{ID: id, Provider: "wire", Model: "model", System: "system", Mode: "ask"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Model = "model"
+	manager, err := memory.NewMemoryManager(filepath.Join(home, "memory"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop.Memory = manager
+	loop.Restore([]llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			{Type: "text", Text: "remember the visible preference"},
+			{Type: "text", Text: "<auto-retrieve>hidden old memory</auto-retrieve>", Synthetic: true},
+		}},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "visible answer"}}},
+	})
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: current,
+		ProviderName:     "wire",
+	})
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/sessions/activate", bytes.NewBufferString(`{"id":"`+next+`"}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("activate: %d %s", rr.Code, rr.Body.String())
+	}
+	notes, err := manager.ListDailyNotes(10)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("daily notes=%+v err=%v", notes, err)
+	}
+	if notes[0].SessionID != current || notes[0].Source != "desktop-switch" ||
+		!strings.Contains(notes[0].Summary, "visible preference") || !strings.Contains(notes[0].Summary, "visible answer") {
+		t.Fatalf("daily note missing Desktop history metadata: %+v", notes[0])
+	}
+	if strings.Contains(notes[0].Summary, "hidden old memory") {
+		t.Fatalf("synthetic recall leaked into daily memory: %+v", notes[0])
+	}
+}
+
+func TestSummarizeMemoryHistoryKeepsRecentTail(t *testing.T) {
+	history := make([]llm.Message, 0, 12)
+	for i := 0; i < 11; i++ {
+		history = append(history, llm.Message{
+			Role: llm.RoleAssistant,
+			Content: []llm.ContentBlock{{
+				Type: "text",
+				Text: fmt.Sprintf("OLD-MARKER-%02d %s", i, strings.Repeat("旧", 320)),
+			}},
+		})
+	}
+	history = append(history, llm.Message{
+		Role:    llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: "text", Text: "RECENT-MARKER keep this newest fact"}},
+	})
+
+	summary := summarizeMemoryHistory(history)
+	if !strings.Contains(summary, "RECENT-MARKER") {
+		t.Fatalf("recent history was truncated: %q", summary)
+	}
+	if strings.Contains(summary, "OLD-MARKER-00") {
+		t.Fatalf("summary retained the oldest prefix instead of the recent tail: %q", summary)
+	}
+	if !strings.HasPrefix(summary, "…") {
+		t.Fatalf("truncated history should advertise the omitted prefix: %q", summary)
+	}
+}
+
 func TestSessionDeleteActiveSessionCrossesToFreshRuntime(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -674,7 +904,7 @@ func TestSessionDeleteActiveSessionCrossesToFreshRuntime(t *testing.T) {
 		ProviderName:        "wire",
 		FreshPermissionMode: permission.ModeAsk,
 		SessionBoundary:     func() { boundaryCalls++ },
-		SessionSwitch:       func(id string) { switchedID = id },
+		SessionSwitch:       func(id, _ string) { switchedID = id },
 	})
 
 	rr := httptest.NewRecorder()
@@ -1197,7 +1427,7 @@ func TestActivateSessionRestoresHeaderStateAndRebindsSidecars(t *testing.T) {
 			return &rtpkg.ProviderBuild{Provider: targetProvider, Model: targetProvider.model}, nil
 		},
 		SessionBoundary: func() { boundaryCalls++ },
-		SessionSwitch:   func(id string) { switchedID = id },
+		SessionSwitch:   func(id, _ string) { switchedID = id },
 	})
 
 	hdr, history, err := store.Load("target")
@@ -1251,6 +1481,662 @@ func TestActivateSessionRestoresHeaderStateAndRebindsSidecars(t *testing.T) {
 	}
 }
 
+func TestActivateSessionRebindsWorkspaceMemoryAcrossLoopToolAndAutoMemory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	workspaceA := filepath.Join(home, "workspace-a")
+	workspaceB := filepath.Join(home, "workspace-b")
+	for _, dir := range []string{workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root := filepath.Join(home, "memory")
+	managerA, err := memory.NewMemoryManagerForWorkspace(root, workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerB, err := memory.NewMemoryManagerForWorkspace(root, workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managerA.Archival().Insert(memory.Passage{Content: "alpha-only-recall", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerB.Archival().Insert(memory.Passage{Content: "beta-only-recall", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "source", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceA},
+		{ID: "target", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceB},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gate := permission.New(permission.ModeBypass)
+	registry := tools.NewRegistry()
+	registry.Register(builtin.NewMemory(gate, managerA))
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, registry, gate, nil, "system", 2)
+	loop.Model = "model"
+	loop.Memory = managerA
+	loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+		return agent.RuntimeStateSnapshot{WorkingDirectory: workspaceA}
+	}
+	switchedWorkDir := ""
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source",
+		ProviderName:     "wire",
+		SessionSwitch: func(_, workDir string) {
+			switchedWorkDir = workDir
+		},
+	})
+	autoMemoryJoined := false
+	server.waitAutoMemoryIdle = func(context.Context) error {
+		autoMemoryJoined = true
+		return nil
+	}
+
+	hdr, history, err := store.Load("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.activateSession("target", hdr, history); err != nil {
+		t.Fatalf("activate target: %v", err)
+	}
+	if !autoMemoryJoined {
+		t.Fatal("workspace switch did not join the source Auto Memory extractor before rebinding")
+	}
+	if state := loop.CurrentStateSnapshot(); state.WorkingDirectory != workspaceB {
+		t.Fatalf("runtime workspace = %q, want target %q", state.WorkingDirectory, workspaceB)
+	}
+	if switchedWorkDir != workspaceB {
+		t.Fatalf("session switch workDir = %q, want target %q", switchedWorkDir, workspaceB)
+	}
+	if hits := loop.Memory.SearchCandidates("beta-only-recall", 10); len(hits) == 0 {
+		t.Fatal("target workspace memory was not recalled after session activation")
+	}
+	for _, hit := range loop.Memory.SearchCandidates("alpha-only-recall", 10) {
+		if strings.Contains(hit.Content, "alpha-only-recall") {
+			t.Fatalf("source workspace memory leaked after activation: %+v", hit)
+		}
+	}
+
+	memoryTool, ok := registry.Get("Memory")
+	if !ok {
+		t.Fatal("Memory tool disappeared during workspace activation")
+	}
+	result, err := memoryTool.Execute(context.Background(), map[string]any{
+		"action": "add", "target": "working", "content": "beta-tool-write",
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("Memory tool write after activation: result=%+v err=%v", result, err)
+	}
+	blockB, err := managerB.ReadCoreBlock("working")
+	if err != nil || !strings.Contains(blockB.Content, "beta-tool-write") {
+		t.Fatalf("Memory tool did not write through target workspace repository: block=%+v err=%v", blockB, err)
+	}
+	blockA, err := managerA.ReadCoreBlock("working")
+	if err == nil && strings.Contains(blockA.Content, "beta-tool-write") {
+		t.Fatalf("Memory tool write leaked into source workspace: %+v", blockA)
+	}
+}
+
+func TestWorkspaceSwitchWaitsForBackgroundAgentMemoryWriter(t *testing.T) {
+	home := t.TempDir()
+	workspaceA := filepath.Join(home, "workspace-a")
+	workspaceB := filepath.Join(home, "workspace-b")
+	for _, dir := range []string{workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root := filepath.Join(home, "memory")
+	managerA, err := memory.NewMemoryManagerForWorkspace(root, workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerB, err := memory.NewMemoryManagerForWorkspace(root, workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "source", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceA},
+		{ID: "target", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceB},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gate := permission.New(permission.ModeBypass)
+	registry := tools.NewRegistry()
+	registry.Register(builtin.NewMemory(gate, managerA))
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, registry, gate, nil, "system", 2)
+	loop.Model = "model"
+	loop.Memory = managerA
+	roster := agent.NewRoster(2)
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source",
+		ProviderName:     "wire",
+		Roster:           roster,
+	})
+	memoryTool, ok := registry.Get("Memory")
+	if !ok {
+		t.Fatal("Memory tool unavailable after workspace binding")
+	}
+
+	canceled := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writerDone := make(chan error, 1)
+	var cancelOnce sync.Once
+	teammate := &agent.Teammate{
+		Name: "source-memory-writer",
+		Cancel: func() {
+			cancelOnce.Do(func() { close(canceled) })
+		},
+	}
+	if err := roster.Register(teammate); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-canceled
+		<-releaseWriter
+		result, executeErr := memoryTool.Execute(context.Background(), map[string]any{
+			"action": "archive", "content": "source-agent-after-cancel", "memory_type": "project",
+		})
+		if executeErr == nil && (result == nil || result.IsError) {
+			executeErr = fmt.Errorf("memory result: %+v", result)
+		}
+		roster.UnregisterTeammate(teammate)
+		writerDone <- executeErr
+	}()
+
+	hdr, history, err := store.Load("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateDone := make(chan error, 1)
+	go func() { activateDone <- server.activateSession("target", hdr, history) }()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("workspace switch did not cancel the source background agent")
+	}
+	select {
+	case err := <-activateDone:
+		t.Fatalf("workspace switch committed before source writer exited: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseWriter)
+	if err := <-writerDone; err != nil {
+		t.Fatalf("source background writer: %v", err)
+	}
+	if err := <-activateDone; err != nil {
+		t.Fatalf("activate target: %v", err)
+	}
+	if hits := managerA.SearchCandidates("source-agent-after-cancel", 10); len(hits) == 0 {
+		t.Fatal("canceled source writer did not finish against source workspace")
+	}
+	for _, hit := range managerB.SearchCandidates("source-agent-after-cancel", 10) {
+		if strings.Contains(hit.Content, "source-agent-after-cancel") {
+			t.Fatalf("source background writer leaked into target workspace: %+v", hit)
+		}
+	}
+}
+
+func TestSameWorkspaceSwitchKeepsCanceledAgentMemoryProvenance(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := memory.NewMemoryManagerForWorkspace(filepath.Join(home, "memory"), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"source", "target"} {
+		if err := store.WriteHeaderFull(session.Header{
+			ID: id, Provider: "wire", Model: "model", System: "system", WorkDir: workspace,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldSessionID := rtpkg.CurrentSessionID()
+	rtpkg.SetCurrentSessionID("source")
+	t.Cleanup(func() { rtpkg.SetCurrentSessionID(oldSessionID) })
+
+	gate := permission.New(permission.ModeBypass)
+	registry := tools.NewRegistry()
+	registry.Register(builtin.NewMemory(gate, manager))
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, registry, gate, nil, "system", 2)
+	loop.Model = "model"
+	loop.Memory = manager
+	roster := agent.NewRoster(2)
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source",
+		ProviderName:     "wire",
+		Roster:           roster,
+		SessionSwitch: func(id, _ string) {
+			rtpkg.SetCurrentSessionID(id)
+		},
+	})
+	memoryTool, ok := registry.Get("Memory")
+	if !ok {
+		t.Fatal("Memory tool unavailable after binding")
+	}
+	canceled := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writerDone := make(chan error, 1)
+	var cancelOnce sync.Once
+	teammate := &agent.Teammate{Name: "source-provenance-writer", Cancel: func() {
+		cancelOnce.Do(func() { close(canceled) })
+	}}
+	if err := roster.Register(teammate); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-canceled
+		<-releaseWriter
+		result, executeErr := memoryTool.Execute(context.Background(), map[string]any{
+			"action": "archive", "content": "same-workspace-source-fact", "memory_type": "project",
+		})
+		if executeErr == nil && (result == nil || result.IsError) {
+			executeErr = fmt.Errorf("memory result: %+v", result)
+		}
+		roster.UnregisterTeammate(teammate)
+		writerDone <- executeErr
+	}()
+
+	hdr, history, err := store.Load("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateDone := make(chan error, 1)
+	go func() { activateDone <- server.activateSession("target", hdr, history) }()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("same-workspace switch did not cancel source agent")
+	}
+	select {
+	case err := <-activateDone:
+		t.Fatalf("same-workspace switch changed provenance before writer exit: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseWriter)
+	if err := <-writerDone; err != nil {
+		t.Fatalf("source provenance writer: %v", err)
+	}
+	if err := <-activateDone; err != nil {
+		t.Fatalf("activate target: %v", err)
+	}
+	if got := rtpkg.CurrentSessionID(); got != "target" {
+		t.Fatalf("target provenance router = %q", got)
+	}
+	found := false
+	for _, hit := range manager.SearchCandidates("same-workspace-source-fact", 10) {
+		if strings.Contains(hit.Content, "same-workspace-source-fact") {
+			found = true
+			if hit.SourceSessionID != "source" {
+				t.Fatalf("late source fact attributed to %q, want source", hit.SourceSessionID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("same-workspace source fact was not archived")
+	}
+}
+
+func TestTurnToolsUseActivatedSessionWorkspace(t *testing.T) {
+	home := t.TempDir()
+	workspaceA := filepath.Join(home, "workspace-a")
+	workspaceB := filepath.Join(home, "workspace-b")
+	for _, dir := range []string{workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "source", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceA},
+		{ID: "target", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceB},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	provider := &cwdCaptureProvider{activationTestProvider: activationTestProvider{name: "wire", model: "model"}}
+	capture := &cwdCaptureTool{}
+	registry := tools.NewRegistry()
+	registry.Register(capture)
+	loop := agent.NewLoop(provider, registry, permission.New(permission.ModeBypassPermissions), nil, "system", 4)
+	loop.Model = "model"
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source",
+		ProviderName:     "wire",
+	})
+
+	rr := httptest.NewRecorder()
+	server.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(
+		`{"sessionId":"target","input":"capture cwd"}`,
+	)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("turn status = %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := capture.captured(); got != workspaceB {
+		t.Fatalf("tool cwd = %q, want activated session workspace %q", got, workspaceB)
+	}
+}
+
+func TestNewServerBindsInitialHeaderWorkspaceBeforeFirstTurn(t *testing.T) {
+	home := t.TempDir()
+	workspaceA := filepath.Join(home, "launch-cwd-a")
+	workspaceB := filepath.Join(home, "restored-session-b")
+	for _, dir := range []string{workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root := filepath.Join(home, "memory")
+	managerA, err := memory.NewMemoryManagerForWorkspace(root, workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerB, err := memory.NewMemoryManagerForWorkspace(root, workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managerA.Archival().Insert(memory.Passage{Content: "startup-alpha-only", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerB.Archival().Insert(memory.Passage{Content: "startup-beta-only", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(session.Header{
+		ID: "restored", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceB,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gate := permission.New(permission.ModeBypass)
+	registry := tools.NewRegistry()
+	registry.Register(builtin.NewMemory(gate, managerA))
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, registry, gate, nil, "system", 2)
+	loop.Memory = managerA
+	initialSwitchWorkDir := ""
+	_ = NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "restored",
+		ProviderName:     "wire",
+		SessionSwitch: func(_, workDir string) {
+			initialSwitchWorkDir = workDir
+		},
+	})
+	if initialSwitchWorkDir != workspaceB {
+		t.Fatalf("initial session switch workDir = %q, want %q", initialSwitchWorkDir, workspaceB)
+	}
+
+	if hits := loop.Memory.SearchCandidates("startup-beta-only", 10); len(hits) == 0 {
+		t.Fatal("initial restored workspace memory was not bound before the first turn")
+	}
+	for _, hit := range loop.Memory.SearchCandidates("startup-alpha-only", 10) {
+		if strings.Contains(hit.Content, "startup-alpha-only") {
+			t.Fatalf("launch cwd memory leaked into restored initial session: %+v", hit)
+		}
+	}
+	memoryTool, ok := registry.Get("Memory")
+	if !ok {
+		t.Fatal("Memory tool unavailable after initial workspace binding")
+	}
+	result, err := memoryTool.Execute(context.Background(), map[string]any{
+		"action": "add", "target": "working", "content": "startup-beta-tool-write",
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("initial workspace Memory write: result=%+v err=%v", result, err)
+	}
+	blockB, err := managerB.ReadCoreBlock("working")
+	if err != nil || !strings.Contains(blockB.Content, "startup-beta-tool-write") {
+		t.Fatalf("initial Memory tool did not target restored workspace: block=%+v err=%v", blockB, err)
+	}
+}
+
+func TestActivateLegacyEmptyWorkDirFallsBackToLaunchWorkspace(t *testing.T) {
+	home := t.TempDir()
+	workspaceA := filepath.Join(home, "launch-workspace-a")
+	workspaceB := filepath.Join(home, "workspace-b")
+	for _, dir := range []string{workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldWorkDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workspaceA); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWorkDir) }()
+
+	root := filepath.Join(home, "memory")
+	managerA, err := memory.NewMemoryManagerForWorkspace(root, workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerB, err := memory.NewMemoryManagerForWorkspace(root, workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managerA.Archival().Insert(memory.Passage{Content: "legacy-fallback-alpha", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerB.Archival().Insert(memory.Passage{Content: "legacy-fallback-beta", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "source", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceA},
+		{ID: "workspace-b", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceB},
+		{ID: "legacy-empty", Provider: "wire", Model: "model", System: "system"},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gate := permission.New(permission.ModeBypass)
+	registry := tools.NewRegistry()
+	registry.Register(builtin.NewMemory(gate, managerA))
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, registry, gate, nil, "system", 2)
+	loop.Model = "model"
+	loop.Memory = managerA
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source",
+		ProviderName:     "wire",
+	})
+	for _, id := range []string{"workspace-b", "legacy-empty"} {
+		hdr, history, err := store.Load(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := server.activateSession(id, hdr, history); err != nil {
+			t.Fatalf("activate %s: %v", id, err)
+		}
+	}
+	if hits := loop.Memory.SearchCandidates("legacy-fallback-alpha", 10); len(hits) == 0 {
+		t.Fatal("legacy empty WorkDir did not fall back to the launch workspace")
+	}
+	for _, hit := range loop.Memory.SearchCandidates("legacy-fallback-beta", 10) {
+		if strings.Contains(hit.Content, "legacy-fallback-beta") {
+			t.Fatalf("previous workspace remained bound for legacy empty WorkDir: %+v", hit)
+		}
+	}
+}
+
+func TestNewServerInitialWorkspaceRebindFailureFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	workspaceA := filepath.Join(home, "workspace-a")
+	if err := os.MkdirAll(workspaceA, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	badWorkspace := filepath.Join(home, "workspace-loop")
+	if err := os.Symlink(badWorkspace, badWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(home, "memory")
+	managerA, err := memory.NewMemoryManagerForWorkspace(root, workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managerA.Archival().Insert(memory.Passage{Content: "must-not-leak-from-a", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(session.Header{
+		ID: "restored", Provider: "wire", Model: "model", System: "system", WorkDir: badWorkspace,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gate := permission.New(permission.ModeBypass)
+	registry := tools.NewRegistry()
+	registry.Register(builtin.NewMemory(gate, managerA))
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, registry, gate, nil, "system", 2)
+	loop.Model = "model"
+	loop.Memory = managerA
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "restored",
+		ProviderName:     "wire",
+	})
+	hdr, history, err := store.Load("restored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.activateSession("restored", hdr, history); err == nil || !strings.Contains(err.Error(), "memory workspace") {
+		t.Fatalf("initial workspace binding error was not propagated: %v", err)
+	}
+	for _, hit := range loop.Memory.SearchCandidates("must-not-leak-from-a", 10) {
+		if strings.Contains(hit.Content, "must-not-leak-from-a") {
+			t.Fatalf("failed initial binding leaked the launch repository: %+v", hit)
+		}
+	}
+	memoryTool, ok := registry.Get("Memory")
+	if !ok {
+		t.Fatal("Memory tool unavailable after fail-closed binding")
+	}
+	result, err := memoryTool.Execute(context.Background(), map[string]any{
+		"action": "read", "target": "working",
+	})
+	if err != nil || result == nil || !result.IsError || !strings.Contains(result.Output, "unavailable") {
+		t.Fatalf("failed initial binding did not disable Memory tool: result=%+v err=%v", result, err)
+	}
+	archiveResult, err := memoryTool.Execute(context.Background(), map[string]any{
+		"action": "archive", "content": "must-not-report-success", "memory_type": "project",
+	})
+	if err != nil || archiveResult == nil || !archiveResult.IsError || !strings.Contains(archiveResult.Output, "unavailable") {
+		t.Fatalf("failed initial binding archive did not fail closed: result=%+v err=%v", archiveResult, err)
+	}
+}
+
+func TestActivateSessionMemoryJoinFailureKeepsSourceWorkspaceBound(t *testing.T) {
+	home := t.TempDir()
+	workspaceA := filepath.Join(home, "workspace-a")
+	workspaceB := filepath.Join(home, "workspace-b")
+	for _, dir := range []string{workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root := filepath.Join(home, "memory")
+	managerA, err := memory.NewMemoryManagerForWorkspace(root, workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerB, err := memory.NewMemoryManagerForWorkspace(root, workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "source", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceA},
+		{ID: "target", Provider: "wire", Model: "model", System: "system", WorkDir: workspaceB},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gate := permission.New(permission.ModeBypass)
+	registry := tools.NewRegistry()
+	registry.Register(builtin.NewMemory(gate, managerA))
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, registry, gate, nil, "system", 2)
+	loop.Model = "model"
+	loop.Memory = managerA
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source",
+		ProviderName:     "wire",
+	})
+	waitErr := errors.New("auto memory still writing")
+	server.waitAutoMemoryIdle = func(context.Context) error { return waitErr }
+	hdr, history, err := store.Load("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.activateSession("target", hdr, history); !errors.Is(err, waitErr) {
+		t.Fatalf("activate error = %v, want %v", err, waitErr)
+	}
+
+	memoryTool, ok := registry.Get("Memory")
+	if !ok {
+		t.Fatal("Memory tool unavailable after failed activation")
+	}
+	result, err := memoryTool.Execute(context.Background(), map[string]any{
+		"action": "add", "target": "working", "content": "source-after-failed-switch",
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("source Memory tool after failed activation: result=%+v err=%v", result, err)
+	}
+	blockA, err := managerA.ReadCoreBlock("working")
+	if err != nil || !strings.Contains(blockA.Content, "source-after-failed-switch") {
+		t.Fatalf("source workspace was no longer bound: block=%+v err=%v", blockA, err)
+	}
+	blockB, err := managerB.ReadCoreBlock("working")
+	if err == nil && strings.Contains(blockB.Content, "source-after-failed-switch") {
+		t.Fatalf("failed activation leaked Memory tool write into target workspace: %+v", blockB)
+	}
+}
+
 func TestActivateSessionProviderFailureLeavesCurrentSessionUntouched(t *testing.T) {
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
@@ -1287,8 +2173,9 @@ func TestActivateSessionProviderFailureLeavesCurrentSessionUntouched(t *testing.
 			return nil, errors.New("profile is not configured")
 		},
 		SessionBoundary: func() { boundaryCalls++ },
-		SessionSwitch:   func(string) { switchCalls++ },
+		SessionSwitch:   func(string, string) { switchCalls++ },
 	})
+	initialSwitchCalls := switchCalls
 	hdr, history, err := store.Load("target")
 	if err != nil {
 		t.Fatal(err)
@@ -1306,7 +2193,7 @@ func TestActivateSessionProviderFailureLeavesCurrentSessionUntouched(t *testing.
 	if got := loop.History(); len(got) != 1 || got[0].Content[0].Text != "source" {
 		t.Fatalf("failed preflight mutated transcript: %+v", got)
 	}
-	if boundaryCalls != 0 || switchCalls != 0 {
+	if boundaryCalls != 0 || switchCalls != initialSwitchCalls {
 		t.Fatalf("failed preflight fired boundary callbacks: boundary=%d switch=%d", boundaryCalls, switchCalls)
 	}
 	loop.TimingSink("Read", time.Millisecond, false)

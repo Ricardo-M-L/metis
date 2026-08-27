@@ -67,17 +67,19 @@ func runWebUIStartHelper(args []string) int {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		if marker := os.Getenv("METIS_WEBUI_HELPER_STOPPED"); marker != "" {
-			if err := os.WriteFile(marker, []byte("stopped"), 0o600); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
 		w.WriteHeader(http.StatusAccepted)
 		shutdown <- struct{}{}
 	})
 	go func() {
 		<-shutdown
+		if delayText := os.Getenv("METIS_WEBUI_HELPER_SHUTDOWN_DELAY"); delayText != "" {
+			if delay, err := time.ParseDuration(delayText); err == nil {
+				time.Sleep(delay)
+			}
+		}
+		if marker := os.Getenv("METIS_WEBUI_HELPER_STOPPED"); marker != "" {
+			_ = os.WriteFile(marker, []byte("stopped"), 0o600)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
@@ -228,6 +230,68 @@ func TestStopWebUIAllowsBackendGracefulCleanup(t *testing.T) {
 	if cmd.ProcessState == nil || !cmd.ProcessState.Success() {
 		t.Fatalf("backend was not reaped after graceful exit: state=%v", cmd.ProcessState)
 	}
+}
+
+func TestStopWebUIWaitsForAcceptedDelayedCleanup(t *testing.T) {
+	dir := t.TempDir()
+	stopped := filepath.Join(dir, "stopped-after-delay")
+	port, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "test-delayed-native-shutdown-token"
+	cmd := exec.Command(os.Args[0], "desktop", "--web", "--port", strconv.Itoa(port))
+	cmd.Env = append(os.Environ(),
+		"GO_WANT_METIS_WEBUI_START_HELPER=1",
+		"METIS_DESKTOP_FRAME_TOKEN="+token,
+		"METIS_WEBUI_HELPER_STOPPED="+stopped,
+		"METIS_WEBUI_HELPER_SHUTDOWN_DELAY=120ms",
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+		close(done)
+	}()
+	waitForHelperHealth(t, port, cmd, done)
+
+	stopWebUIProcessWithPolicy(cmd, done, port, token, webUIStopPolicy{
+		shutdownGrace: 3 * time.Second,
+		signalGrace:   100 * time.Millisecond,
+		killWait:      100 * time.Millisecond,
+	})
+
+	if _, err := os.Stat(stopped); err != nil {
+		t.Fatalf("delayed cleanup marker missing; accepted shutdown was interrupted too early: %v", err)
+	}
+	if cmd.ProcessState == nil || !cmd.ProcessState.Success() {
+		t.Fatalf("delayed backend was not allowed to exit cleanly: state=%v", cmd.ProcessState)
+	}
+}
+
+func waitForHelperHealth(t *testing.T, port int, cmd *exec.Cmd, done <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		response, err := http.Get("http://127.0.0.1:" + strconv.Itoa(port) + "/api/health")
+		if err == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("helper exited before health check: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+	t.Fatal("helper did not become ready")
 }
 
 func TestWebUIChildHelper(t *testing.T) {

@@ -4,10 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/Ricardo-M-L/metis/internal/agent"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
@@ -59,26 +57,7 @@ func cmdDaemon(ctx context.Context, args []string) error {
 		// One non-interactive turn per task. Reuses the same Loop
 		// (so memory + history persist across tasks); reset between
 		// tasks would defeat the long-running point.
-		rt.loop.AppendUser(prompt)
-		var sb strings.Builder
-		eventCh := make(chan agent.Event, 64)
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
-				return rt.loop.Run(turnCtx, eventCh)
-			})
-		}()
-		for ev := range eventCh {
-			switch ev.Kind {
-			case agent.EventTextDelta:
-				sb.WriteString(ev.TextDelta)
-			case agent.EventLoopDone:
-				return sb.String(), <-errCh
-			case agent.EventError:
-				return sb.String(), ev.Err
-			}
-		}
-		return sb.String(), <-errCh
+		return runHeadlessOneShot(ctx, rt, prompt, "metis daemon task")
 	}
 
 	distillHandler := func(ctx context.Context) error {
@@ -86,20 +65,13 @@ func cmdDaemon(ctx context.Context, args []string) error {
 		// into long-lived memory. Reuses the existing Loop's
 		// distillation hook (auto-distillation runs via loop.maybeDistill
 		// every N turns; we trigger one extra here on idle).
-		rt.loop.AppendUser("Please summarize the most recent task results into a few key durable facts and update memory accordingly. Reply with 'done' when finished.")
-		eventCh := make(chan agent.Event, 64)
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
-				return rt.loop.Run(turnCtx, eventCh)
-			})
-		}()
-		for ev := range eventCh {
-			if ev.Kind == agent.EventLoopDone || ev.Kind == agent.EventError {
-				return <-errCh
-			}
-		}
-		return <-errCh
+		_, err := runHeadlessOneShot(
+			ctx,
+			rt,
+			"Please summarize the most recent task results into a few key durable facts and update memory accordingly. Reply with 'done' when finished.",
+			"metis daemon idle distillation",
+		)
+		return err
 	}
 
 	return rtpkg.RunDaemon(ctx, cfg, taskHandler, distillHandler)

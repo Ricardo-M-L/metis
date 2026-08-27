@@ -3,6 +3,7 @@ package memdir
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseFile_HappyPath(t *testing.T) {
@@ -84,7 +85,7 @@ func TestFrontmatter_Validate(t *testing.T) {
 }
 
 func TestMemoryType_IsValid(t *testing.T) {
-	for _, ok := range []MemoryType{TypeUser, TypeFeedback, TypeProject, TypeReference} {
+	for _, ok := range []MemoryType{TypeUser, TypeFeedback, TypeProject, TypeContext, TypeReference} {
 		if !ok.IsValid() {
 			t.Errorf("%q should be valid", ok)
 		}
@@ -95,10 +96,18 @@ func TestMemoryType_IsValid(t *testing.T) {
 }
 
 func TestRenderFile_RoundTrip(t *testing.T) {
+	now := time.Date(2026, 8, 28, 1, 2, 3, 0, time.UTC)
 	fm := &Frontmatter{
-		Name:        "feedback_chinese",
-		Description: "Reply in Chinese",
-		Type:        TypeFeedback,
+		Name:            "feedback_chinese",
+		Description:     "Reply in Chinese",
+		Type:            TypeFeedback,
+		OriginSessionID: "session-1",
+		SourceMessageID: "message-2",
+		Scope:           "user",
+		UpdatedAt:       now.Format(time.RFC3339),
+		LastUsedAt:      now.Format(time.RFC3339),
+		UseCount:        3,
+		Confidence:      0.85,
 	}
 	raw, err := RenderFile(fm, "Body content here.")
 	if err != nil {
@@ -110,6 +119,11 @@ func TestRenderFile_RoundTrip(t *testing.T) {
 	}
 	if got.Name != fm.Name || got.Description != fm.Description || got.Type != fm.Type {
 		t.Fatalf("round-trip mismatch: %+v vs %+v", got, fm)
+	}
+	if got.OriginSessionID != fm.OriginSessionID || got.SourceMessageID != fm.SourceMessageID ||
+		got.Scope != fm.Scope || got.UpdatedAt != fm.UpdatedAt || got.LastUsedAt != fm.LastUsedAt ||
+		got.UseCount != fm.UseCount || got.Confidence != fm.Confidence {
+		t.Fatalf("metadata round-trip mismatch: %+v vs %+v", got, fm)
 	}
 	if !strings.Contains(string(body), "Body content here") {
 		t.Fatalf("body missing: %q", body)

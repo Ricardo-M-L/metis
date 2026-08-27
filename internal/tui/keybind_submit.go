@@ -775,28 +775,18 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.messages = append(m.messages, Message{Role: "error", Content: "new session: " + err.Error(), Timestamp: time.Now()})
 				break
 			}
-			var noteErr error
-			if m.loop != nil && m.loop.Memory != nil {
-				noteErr = m.loop.Memory.SaveDailyNote(m.sessionID, "new", m.summarizeHistory())
-			}
 			newID, hdr, err := m.createFreshSession()
 			if err != nil {
 				m.messages = append(m.messages, Message{Role: "error", Content: "new session: " + err.Error(), Timestamp: time.Now()})
 				break
 			}
-			if err := m.activateSession(newID, hdr, nil, false); err != nil {
+			if err := m.activateCreatedSession(newID, hdr, nil); err != nil {
 				m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning("new session activation", err), Timestamp: time.Now()})
-				if noteErr != nil {
-					m.messages = append(m.messages, Message{Role: "warning", Content: "failed to save previous session note: " + noteErr.Error(), Timestamp: time.Now()})
-				}
 				break
 			}
 			m.firstRender = true
 			m.showBanner = true
 			m.messages = append(m.messages, Message{Role: "success", Content: "started new session: " + shortID(newID), Timestamp: time.Now()})
-			if noteErr != nil {
-				m.messages = append(m.messages, Message{Role: "warning", Content: "failed to save previous session note: " + noteErr.Error(), Timestamp: time.Now()})
-			}
 		case slash.SignalUndo:
 			// Prefill behaviour: pop the last turn AND drop the user's
 			// original text into the input box so they can edit-and-resend
@@ -865,7 +855,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					m.messages = append(m.messages, Message{Role: "error", Content: "branch: " + err.Error(), Timestamp: time.Now()})
 					break
 				}
-				if err := m.activateSession(newID, hdr, m.loop.History(), false); err != nil {
+				if err := m.activateCreatedSession(newID, hdr, m.loop.History()); err != nil {
 					m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning("branch activation", err), Timestamp: time.Now()})
 					break
 				}

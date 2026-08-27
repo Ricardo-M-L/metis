@@ -109,6 +109,21 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 				sections = append(sections, section)
 			}
 		}
+		// Preserve the exact cache-critical order used by buildRequest:
+		// base/static -> memory index -> plan overlay -> runtime state. A fork
+		// that permutes byte-identical sections forfeits the parent's provider
+		// prefix cache even though none of their contents changed.
+		if loop.Memory != nil {
+			memCtx := loop.turnMemoryContext
+			if !loop.turnMemoryPrepared {
+				memCtx = loop.Memory.BuildContext()
+			}
+			if memCtx != "" {
+				sections = append(sections, llm.SystemSection{
+					Name: "memory_index", Body: memCtx, Cache: true,
+				})
+			}
+		}
 		if loop.planMode && loop.PlanSystemPrompt != "" {
 			sections = append(sections, llm.SystemSection{
 				Name: "plan_mode", Body: loop.PlanSystemPrompt, Volatile: true,
@@ -119,13 +134,6 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 				Name: "runtime_state", Body: state.body, Cache: true,
 			})
 		}
-		if loop.Memory != nil {
-			if memCtx := loop.Memory.BuildContext(); memCtx != "" {
-				sections = append(sections, llm.SystemSection{
-					Name: "memory", Body: memCtx, Volatile: true,
-				})
-			}
-		}
 	} else {
 		if loop.planMode && loop.PlanSystemPrompt != "" {
 			system += "\n\n" + loop.PlanSystemPrompt
@@ -134,7 +142,11 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 			system += "\n\n" + state.body
 		}
 		if loop.Memory != nil {
-			if memCtx := loop.Memory.BuildContext(); memCtx != "" {
+			memCtx := loop.turnMemoryContext
+			if !loop.turnMemoryPrepared {
+				memCtx = loop.Memory.BuildContext()
+			}
+			if memCtx != "" {
 				system += "\n\n" + memCtx
 			}
 		}
@@ -224,7 +236,7 @@ type ForkedAgentParams struct {
 	// Currently unused (extractMemories writes files via tools); kept
 	// for future autoDream that may directly edit the in-process Core
 	// block.
-	Memory *memory.MemoryManager
+	Memory memory.Repository
 }
 
 // ForkedResult is what RunForkedAgent returns.

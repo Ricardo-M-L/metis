@@ -289,7 +289,7 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 				m.messages = append(m.messages, Message{Role: "error", Content: "fresh session failed: " + err.Error(), Timestamp: time.Now()})
 				return nil
 			}
-			if err := m.activateSession(newID, hdr, nil, false); err != nil {
+			if err := m.activateCreatedSession(newID, hdr, nil); err != nil {
 				m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning("fresh session activation", err), Timestamp: time.Now()})
 				return nil
 			}
@@ -343,8 +343,14 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			label = "forked"
 			failureAction = "fork activation"
 		}
-		if err := m.activateSession(sid, hdr, msgs, action == screen.ResumeActionResume); err != nil {
-			m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning(failureAction, err), Timestamp: time.Now()})
+		var activationErr error
+		if action == screen.ResumeActionFork {
+			activationErr = m.activateCreatedSession(sid, hdr, msgs)
+		} else {
+			activationErr = m.activateSession(sid, hdr, msgs, true)
+		}
+		if activationErr != nil {
+			m.messages = append(m.messages, Message{Role: "warning", Content: m.sessionActivationWarning(failureAction, activationErr), Timestamp: time.Now()})
 			return nil
 		}
 		m.messages = append(m.messages, Message{

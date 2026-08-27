@@ -3,6 +3,8 @@ package tui
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
@@ -540,6 +543,866 @@ func TestREPLFreshAndBranchRebindSessionState(t *testing.T) {
 	}
 }
 
+func attachLifecycleMemory(t *testing.T, loop *agent.Loop) *memory.MemoryManager {
+	t.Helper()
+	repository, err := memory.NewMemoryManager(filepath.Join(t.TempDir(), "memory"))
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	loop.Memory = repository
+	loop.ResetSession([]llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "remember lifecycle source"}}},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "lifecycle source remembered"}}},
+	})
+	return repository
+}
+
+func assertDailySource(t *testing.T, repository *memory.MemoryManager, sessionID, wantSource string) {
+	t.Helper()
+	notes, err := repository.ListDailyNotes(20)
+	if err != nil {
+		t.Fatalf("ListDailyNotes: %v", err)
+	}
+	for _, note := range notes {
+		if note.SessionID == sessionID {
+			if note.Source != wantSource {
+				t.Fatalf("daily source for %q = %q, want %q", sessionID, note.Source, wantSource)
+			}
+			return
+		}
+	}
+	t.Fatalf("no daily note persisted for session %q: %+v", sessionID, notes)
+}
+
+func TestModelSessionLifecyclePersistsDailySourceMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantSource string
+		activate   func(t *testing.T, m *Model, store *session.Store) error
+	}{
+		{
+			name:       "new",
+			wantSource: "cli-new",
+			activate: func(t *testing.T, m *Model, _ *session.Store) error {
+				id, hdr, err := m.createFreshSession()
+				if err != nil {
+					return err
+				}
+				return m.activateSession(id, hdr, nil, false)
+			},
+		},
+		{
+			name:       "branch",
+			wantSource: "cli-branch",
+			activate: func(t *testing.T, m *Model, _ *session.Store) error {
+				history := m.loop.History()
+				id, hdr, err := m.forkSession(m.sessionID, history)
+				if err != nil {
+					return err
+				}
+				return m.activateSession(id, hdr, history, false)
+			},
+		},
+		{
+			name:       "resume",
+			wantSource: "cli-resume",
+			activate: func(t *testing.T, m *Model, store *session.Store) error {
+				const id = "resume-target"
+				hdr := &session.Header{ID: id, Model: "test-model", System: "base-system", Mode: "ask"}
+				if err := store.WriteHeaderFull(*hdr); err != nil {
+					return err
+				}
+				return m.activateSession(id, hdr, nil, true)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeAsk)
+			repository := attachLifecycleMemory(t, m.loop)
+			if err := tt.activate(t, m, store); err != nil {
+				t.Fatalf("activate: %v", err)
+			}
+			assertDailySource(t, repository, "source", tt.wantSource)
+		})
+	}
+}
+
+func TestModelSessionPickerLifecyclePersistsDailySourceMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantSource string
+		pick       func(*Model)
+	}{
+		{
+			name:       "sessions picker resumes",
+			wantSource: "cli-resume",
+			pick: func(m *Model) {
+				picker := screen.NewPickerScreen("/sessions", "", []screen.PickerItem{{Key: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+				m.applyScreenResult(picker)
+			},
+		},
+		{
+			name:       "resume picker starts fresh",
+			wantSource: "cli-new",
+			pick: func(m *Model) {
+				picker := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: 'n'})
+				m.applyScreenResult(picker)
+			},
+		},
+		{
+			name:       "resume picker resumes",
+			wantSource: "cli-resume",
+			pick: func(m *Model) {
+				picker := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+				m.applyScreenResult(picker)
+			},
+		},
+		{
+			name:       "resume picker forks",
+			wantSource: "cli-branch",
+			pick: func(m *Model) {
+				picker := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: 'f'})
+				m.applyScreenResult(picker)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeAsk)
+			repository := attachLifecycleMemory(t, m.loop)
+			if err := store.WriteHeaderFull(session.Header{ID: "target", Model: "test-model", System: "base-system", Mode: "ask"}); err != nil {
+				t.Fatal(err)
+			}
+
+			tt.pick(m)
+
+			if m.sessionID == "source" {
+				t.Fatalf("picker did not switch the source session: messages=%+v", m.messages)
+			}
+			assertDailySource(t, repository, "source", tt.wantSource)
+		})
+	}
+}
+
+func TestREPLSessionLifecyclePersistsDailySourceMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantSource string
+		run        func(*REPL) error
+	}{
+		{name: "new", wantSource: "cli-new", run: func(r *REPL) error { _, err := r.startFreshSession(); return err }},
+		{name: "branch", wantSource: "cli-branch", run: func(r *REPL) error { _, err := r.branchSession(); return err }},
+		{name: "close", wantSource: "cli-close", run: func(r *REPL) error {
+			r.stdin = strings.NewReader("/quit\n")
+			r.out = &bytes.Buffer{}
+			return r.Run(context.Background())
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeAsk)
+			repository := attachLifecycleMemory(t, m.loop)
+			r, err := NewREPL(m.loop, nil, store, "source", false, false, m.gate, "test-model", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tt.run(r); err != nil {
+				t.Fatalf("lifecycle: %v", err)
+			}
+			assertDailySource(t, repository, "source", tt.wantSource)
+		})
+	}
+}
+
+func TestModelSessionBoundaryIsOncePerLiveSessionGeneration(t *testing.T) {
+	m, _ := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	boundaryCalls := 0
+	m.ext.SessionBoundary = func() { boundaryCalls++ }
+
+	if err := m.leaveActiveSession("cli-close", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.leaveActiveSession("cli-close", true); err != nil {
+		t.Fatal(err)
+	}
+	if boundaryCalls != 1 {
+		t.Fatalf("boundary calls = %d, want exactly one", boundaryCalls)
+	}
+	assertDailySource(t, repository, "source", "cli-close")
+
+	id, hdr, err := m.createFreshSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.activateSession(id, hdr, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	m.loop.ResetSession([]llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "new generation"}}}})
+	if err := m.leaveActiveSession("cli-close", true); err != nil {
+		t.Fatal(err)
+	}
+	if boundaryCalls != 2 {
+		t.Fatalf("boundary calls after rebind = %d, want two generations", boundaryCalls)
+	}
+	assertDailySource(t, repository, id, "cli-close")
+}
+
+type failingDailyRepository struct {
+	memory.Repository
+}
+
+func (failingDailyRepository) SaveDailyNote(string, string, string) error {
+	return errors.New("daily disk unavailable")
+}
+
+func listedSessionIDs(t *testing.T, store *session.Store) map[string]bool {
+	t.Helper()
+	entries, err := store.List(0)
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	ids := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		ids[entry.ID] = true
+	}
+	return ids
+}
+
+func assertSessionIDsEqual(t *testing.T, got, want map[string]bool) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("session IDs = %v, want %v", got, want)
+	}
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("session IDs = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestModelSessionSwitchKeepsSourceActiveWhenDailyPersistenceFails(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	m.loop.Memory = failingDailyRepository{Repository: repository}
+	boundaryCalls := 0
+	m.ext.SessionBoundary = func() { boundaryCalls++ }
+	target := &session.Header{ID: "daily-failure-target", Model: "test-model", System: "base-system", Mode: "ask"}
+	if err := store.WriteHeaderFull(*target); err != nil {
+		t.Fatal(err)
+	}
+
+	err := m.activateSession(target.ID, target, nil, true)
+	if err == nil || !strings.Contains(err.Error(), "daily disk unavailable") {
+		t.Fatalf("activateSession error = %v, want Daily persistence failure", err)
+	}
+	if m.sessionID != "source" || boundaryCalls != 0 || m.sessionBoundaryClosed {
+		t.Fatalf("failed boundary changed live session: id=%q releases=%d closed=%v", m.sessionID, boundaryCalls, m.sessionBoundaryClosed)
+	}
+}
+
+func TestCreatedSessionActivationFailureDoesNotLeaveGhostSession(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*Model)
+	}{
+		{name: "slash new", run: func(m *Model) { m.input.SetValue("/new"); m.handleSubmit() }},
+		{name: "slash branch", run: func(m *Model) { m.input.SetValue("/branch"); m.handleSubmit() }},
+		{name: "resume picker fresh", run: func(m *Model) {
+			picker := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+			picker.Update(tea.KeyPressMsg{Code: 'n'})
+			m.applyScreenResult(picker)
+		}},
+		{name: "resume picker fork", run: func(m *Model) {
+			picker := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+			picker.Update(tea.KeyPressMsg{Code: 'f'})
+			m.applyScreenResult(picker)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeAsk)
+			repository := attachLifecycleMemory(t, m.loop)
+			m.loop.Memory = failingDailyRepository{Repository: repository}
+			if err := store.WriteHeaderFull(session.Header{ID: "target", Model: "test-model", System: "base-system", Mode: "ask"}); err != nil {
+				t.Fatal(err)
+			}
+			reg := slash.NewRegistry()
+			slash.RegisterAll(reg, nil)
+			m.slash = reg
+			beforeIDs := listedSessionIDs(t, store)
+			beforeMessages := len(m.messages)
+
+			tt.run(m)
+
+			if m.sessionID != "source" || m.sessionBoundaryClosed {
+				t.Fatalf("failed activation changed live source: id=%q closed=%v", m.sessionID, m.sessionBoundaryClosed)
+			}
+			assertSessionIDsEqual(t, listedSessionIDs(t, store), beforeIDs)
+			found := false
+			for _, msg := range m.messages[beforeMessages:] {
+				if msg.Role == "warning" && strings.Contains(msg.Content, "daily disk unavailable") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("activation failure was not surfaced: %+v", m.messages[beforeMessages:])
+			}
+		})
+	}
+}
+
+func TestREPLCreatedSessionFailureDoesNotLeaveGhostSession(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*REPL) (string, error)
+	}{
+		{name: "new", run: (*REPL).startFreshSession},
+		{name: "branch", run: (*REPL).branchSession},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeAsk)
+			repository := attachLifecycleMemory(t, m.loop)
+			m.loop.Memory = failingDailyRepository{Repository: repository}
+			r, err := NewREPL(m.loop, nil, store, "source", false, false, m.gate, "test-model", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeIDs := listedSessionIDs(t, store)
+
+			if _, err := tt.run(r); err == nil || !strings.Contains(err.Error(), "daily disk unavailable") {
+				t.Fatalf("switch error = %v, want Daily persistence failure", err)
+			}
+			if r.SessionID != "source" || r.sessionBoundaryClosed {
+				t.Fatalf("failed switch changed live source: id=%q closed=%v", r.SessionID, r.sessionBoundaryClosed)
+			}
+			assertSessionIDsEqual(t, listedSessionIDs(t, store), beforeIDs)
+		})
+	}
+}
+
+func TestRunTUIClosePersistsDailyMemory(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// A canceled program context gives the test a deterministic, non-interactive
+	// Bubble Tea exit while still exercising RunTUI's real shutdown tail.
+	_ = RunTUI(
+		ctx,
+		m.loop,
+		nil,
+		slash.NewRegistry(),
+		store,
+		"source",
+		m.gate,
+		"test-model",
+		"",
+		"",
+		&config.Config{},
+		false,
+	)
+	assertDailySource(t, repository, "source", "cli-close")
+}
+
+func TestStopForegroundTurnForCloseWaitsForDoneBeforePersisting(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	m.loop.AppendUser("foreground tail must survive close")
+	m.turnActive = true
+	m.spinnerActive = true
+	m.doneCh = make(chan error, 1)
+	cancelled := make(chan struct{})
+	m.turnCancel = func() { close(cancelled) }
+	done := make(chan error, 1)
+	go func() { done <- m.stopForegroundTurnForClose() }()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("foreground cancel was not requested")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("close returned before foreground turn completed: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	_, beforeMessages, err := store.Load("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeMessages) != 0 {
+		t.Fatalf("foreground tail persisted before the turn completed: %+v", beforeMessages)
+	}
+
+	m.doneCh <- context.Canceled
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stopForegroundTurnForClose: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not continue after foreground turn completed")
+	}
+	if m.turnActive || m.spinnerActive {
+		t.Fatalf("foreground state still active: turn=%v spinner=%v", m.turnActive, m.spinnerActive)
+	}
+	_, messages, err := store.Load("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].Role != llm.RoleUser || messages[0].Content[0].Text != "foreground tail must survive close" {
+		t.Fatalf("persisted foreground tail = %+v", messages)
+	}
+}
+
+func TestStopForegroundTurnForCloseFailsClosedWhenTailCannotPersist(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	m.loop.AppendUser("foreground tail cannot be dropped")
+	m.turnActive = true
+	m.spinnerActive = true
+	m.doneCh = make(chan error, 1)
+	m.doneCh <- context.Canceled
+	blockActiveSessionWrites(t, store, "source")
+
+	err := m.stopForegroundTurnForClose()
+	if err == nil || !strings.Contains(err.Error(), "persist foreground turn") {
+		t.Fatalf("stop error = %v, want foreground persistence failure", err)
+	}
+	if m.turnActive || m.spinnerActive {
+		t.Fatalf("completed foreground state remained active: turn=%v spinner=%v", m.turnActive, m.spinnerActive)
+	}
+}
+
+func TestRunTUICloseSkipsDailyWhenSourceStateCannotPersist(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	blockActiveSessionWrites(t, store, "source")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := RunTUI(
+		ctx,
+		m.loop,
+		nil,
+		slash.NewRegistry(),
+		store,
+		"source",
+		m.gate,
+		"test-model",
+		"",
+		"",
+		&config.Config{},
+		false,
+	); err == nil {
+		t.Fatal("RunTUI succeeded despite source persistence failure")
+	}
+	notes, err := repository.ListDailyNotes(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range notes {
+		if note.SessionID == "source" {
+			t.Fatalf("Daily note was written after source persistence failed: %+v", note)
+		}
+	}
+}
+
+type lifecycleBlockingProvider struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*lifecycleBlockingProvider) Name() string          { return "lifecycle-blocking" }
+func (*lifecycleBlockingProvider) ModelID() string       { return "test-model" }
+func (*lifecycleBlockingProvider) MaxContextTokens() int { return 200_000 }
+func (p *lifecycleBlockingProvider) Complete(ctx context.Context, _ llm.Request) (*llm.Response, error) {
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-p.release:
+		return &llm.Response{Content: []llm.ContentBlock{{Type: "text", Text: "done"}}, StopReason: "end_turn"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (*lifecycleBlockingProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return nil, errors.New("stream not used")
+}
+
+func TestModelSessionSwitchDoesNotWaitForFrozenAutoMemory(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	provider := &lifecycleBlockingProvider{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	m.loop.RebindProviderRuntime(provider, "test-model", 1024, m.loop.System, m.loop.SystemSections)
+	m.loop.AutoMemory = true
+	extractor, err := agent.NewAutoMemoryExtractor(m.loop, repository.Root(), filepath.Join(t.TempDir(), "skills"))
+	if err != nil {
+		t.Fatalf("NewAutoMemoryExtractor: %v", err)
+	}
+	sessionsDir := filepath.Join(t.TempDir(), "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"one", "two", "three", "four"} {
+		if err := os.WriteFile(filepath.Join(sessionsDir, id+".jsonl"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	extractor.SetSessionsDir(sessionsDir)
+	extractor.OnLoopEnd(context.Background(), "end_turn")
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Auto Memory provider did not start")
+	}
+
+	target := &session.Header{ID: "target-after-memory", Model: "test-model", System: "base-system", Mode: "ask"}
+	if err := store.WriteHeaderFull(*target); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.activateSession(target.ID, target, nil, true) }()
+	release := func() {
+		select {
+		case <-provider.release:
+		default:
+			close(provider.release)
+		}
+	}
+	t.Cleanup(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("activateSession: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		release()
+		<-done
+		t.Fatal("session switch blocked on an immutable Auto Memory snapshot")
+	}
+	if m.sessionID != target.ID {
+		t.Fatalf("active session = %q, want %q", m.sessionID, target.ID)
+	}
+	busyCtx, cancelBusy := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	busyErr := m.loop.WaitAutoMemoryIdle(busyCtx)
+	cancelBusy()
+	if !errors.Is(busyErr, context.DeadlineExceeded) {
+		t.Fatalf("Auto Memory unexpectedly stopped at session switch: %v", busyErr)
+	}
+	assertDailySource(t, repository, "source", "cli-resume")
+
+	release()
+	idleCtx, cancelIdle := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelIdle()
+	if err := m.loop.WaitAutoMemoryIdle(idleCtx); err != nil {
+		t.Fatalf("wait for frozen Auto Memory snapshot: %v", err)
+	}
+}
+
+type lifecycleDistillProvider struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*lifecycleDistillProvider) Name() string          { return "lifecycle-distill" }
+func (*lifecycleDistillProvider) ModelID() string       { return "test-model" }
+func (*lifecycleDistillProvider) MaxContextTokens() int { return 200_000 }
+func (p *lifecycleDistillProvider) Complete(ctx context.Context, _ llm.Request) (*llm.Response, error) {
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-p.release:
+		return &llm.Response{Content: []llm.ContentBlock{{
+			Type: "text",
+			Text: `[{"type":"user","content":"The user's TUI boundary codename is Citrine Lark.","tags":["tui","boundary","codename"]}]`,
+		}}, StopReason: "end_turn"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (*lifecycleDistillProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return &lifecycleTextStream{}, nil
+}
+
+type lifecycleTextStream struct{ step int }
+
+func (*lifecycleTextStream) Close() error { return nil }
+func (s *lifecycleTextStream) Recv() (llm.StreamEvent, error) {
+	s.step++
+	switch s.step {
+	case 1:
+		return llm.StreamEvent{Type: "message_start", InputTokens: 1}, nil
+	case 2:
+		return llm.StreamEvent{Type: "text_delta", TextDelta: "I will remember this sufficiently long lifecycle answer for later."}, nil
+	case 3:
+		return llm.StreamEvent{Type: "message_delta", StopReason: "end_turn", OutputTokens: 1}, nil
+	case 4:
+		return llm.StreamEvent{Type: "message_stop", StopReason: "end_turn"}, nil
+	default:
+		return llm.StreamEvent{}, io.EOF
+	}
+}
+
+func TestModelSessionSwitchWaitsForDistillationBeforeDaily(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	provider := &lifecycleDistillProvider{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	m.loop.RebindProviderRuntime(provider, "test-model", 1024, m.loop.System, m.loop.SystemSections)
+	m.loop.DistillEvery = 1
+	m.loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+		return agent.RuntimeStateSnapshot{SessionID: "source"}
+	}
+	m.loop.ResetSession([]llm.Message{{
+		Role: llm.RoleUser,
+		Content: []llm.ContentBlock{{
+			Type: "text", Text: "Please remember this sufficiently long lifecycle fact for future sessions.",
+		}},
+	}})
+	if err := m.loop.Run(context.Background(), make(chan agent.Event, 32)); err != nil {
+		t.Fatalf("Loop.Run: %v", err)
+	}
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("distillation provider did not start")
+	}
+
+	target := &session.Header{ID: "target-after-distill", Model: "test-model", System: "base-system", Mode: "ask"}
+	if err := store.WriteHeaderFull(*target); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.activateSession(target.ID, target, nil, true) }()
+	release := func() {
+		select {
+		case <-provider.release:
+		default:
+			close(provider.release)
+		}
+	}
+	t.Cleanup(release)
+	select {
+	case err := <-done:
+		t.Fatalf("session switch completed before source distillation was durable: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+	if m.sessionID != "source" || m.sessionBoundaryClosed {
+		t.Fatalf("blocked switch changed source state: id=%q closed=%v", m.sessionID, m.sessionBoundaryClosed)
+	}
+	notes, err := repository.ListDailyNotes(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range notes {
+		if note.SessionID == "source" {
+			t.Fatalf("Daily was written before distillation completed: %+v", note)
+		}
+	}
+
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("activateSession after distillation release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session switch did not finish after distillation became durable")
+	}
+	if m.sessionID != target.ID {
+		t.Fatalf("active session = %q, want %q", m.sessionID, target.ID)
+	}
+	assertDailySource(t, repository, "source", "cli-resume")
+}
+
+func runLifecycleOneTurn(t *testing.T, m *Model, provider llm.Provider, prompt string) {
+	t.Helper()
+	m.loop.RebindProviderRuntime(provider, "test-model", 1024, m.loop.System, m.loop.SystemSections)
+	m.loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+		return agent.RuntimeStateSnapshot{SessionID: "source"}
+	}
+	m.loop.ResetSession([]llm.Message{{
+		Role: llm.RoleUser,
+		Content: []llm.ContentBlock{{
+			Type: "text", Text: prompt,
+		}},
+	}})
+	if err := m.loop.Run(context.Background(), make(chan agent.Event, 32)); err != nil {
+		t.Fatalf("Loop.Run: %v", err)
+	}
+}
+
+func TestModelOneTurnSessionSwitchFlushesResidualDistillation(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	release := make(chan struct{})
+	close(release)
+	provider := &lifecycleDistillProvider{entered: make(chan struct{}, 1), release: release}
+	runLifecycleOneTurn(
+		t,
+		m,
+		provider,
+		"Please remember that my TUI boundary codename is Citrine Lark in future sessions.",
+	)
+	if got := m.loop.DistillEvery; got != agent.DefaultDistillEvery {
+		t.Fatalf("DistillEvery=%d, want default %d", got, agent.DefaultDistillEvery)
+	}
+	select {
+	case <-provider.entered:
+		t.Fatal("one-turn session distilled before a durability boundary")
+	default:
+	}
+
+	target := &session.Header{ID: "target-after-residual", Model: "test-model", System: "base-system", Mode: "ask"}
+	if err := store.WriteHeaderFull(*target); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.activateSession(target.ID, target, nil, true); err != nil {
+		t.Fatalf("activateSession: %v", err)
+	}
+	select {
+	case <-provider.entered:
+	default:
+		t.Fatal("session switch did not flush the one-turn residual distillation")
+	}
+	hits, err := repository.Archival().Search(memory.SearchOptions{Query: "Citrine Lark"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].SourceSessionID != "source" ||
+		!strings.HasPrefix(hits[0].SourceMessageID, "source/message/") {
+		t.Fatalf("boundary-distilled memory/provenance = %+v", hits)
+	}
+	assertDailySource(t, repository, "source", "cli-resume")
+}
+
+func TestModelSessionSwitchDistillEveryZeroIsNoOp(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	release := make(chan struct{})
+	close(release)
+	provider := &lifecycleDistillProvider{entered: make(chan struct{}, 1), release: release}
+	m.loop.DistillEvery = 0
+	runLifecycleOneTurn(
+		t,
+		m,
+		provider,
+		"This successful exchange must not be distilled because the feature is explicitly disabled.",
+	)
+	target := &session.Header{ID: "target-distillation-disabled", Model: "test-model", System: "base-system", Mode: "ask"}
+	if err := store.WriteHeaderFull(*target); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.activateSession(target.ID, target, nil, true); err != nil {
+		t.Fatalf("activateSession: %v", err)
+	}
+	select {
+	case <-provider.entered:
+		t.Fatal("DistillEvery=0 invoked the distillation provider at a session boundary")
+	default:
+	}
+	hits, err := repository.Archival().Search(memory.SearchOptions{Query: "explicitly disabled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("DistillEvery=0 persisted archival memory: %+v", hits)
+	}
+	assertDailySource(t, repository, "source", "cli-resume")
+}
+
+type blockingResidualRepository struct {
+	memory.Repository
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingResidualRepository) DistillTurnWithMetadata(
+	_ context.Context,
+	_ llm.Provider,
+	_, _, _, _ string,
+) error {
+	select {
+	case r.entered <- struct{}{}:
+	default:
+	}
+	<-r.release // Deliberately model a provider/repository that ignores context.
+	return nil
+}
+
+func TestMemoryBoundaryWaitFailureIsFailClosedButCloseStillWritesDaily(t *testing.T) {
+	m, _ := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
+	blocking := &blockingResidualRepository{
+		Repository: repository,
+		entered:    make(chan struct{}, 1),
+		release:    make(chan struct{}),
+	}
+	m.loop.Memory = blocking
+	providerRelease := make(chan struct{})
+	close(providerRelease)
+	provider := &lifecycleDistillProvider{entered: make(chan struct{}, 1), release: providerRelease}
+	runLifecycleOneTurn(
+		t,
+		m,
+		provider,
+		"Remember this one-turn fact even when the boundary join initially times out.",
+	)
+	release := func() {
+		select {
+		case <-blocking.release:
+		default:
+			close(blocking.release)
+		}
+	}
+	t.Cleanup(release)
+
+	err := persistMemoryBoundaryWithGrace(
+		m.loop, "source", "cli-resume", "source summary", false, 15*time.Millisecond, time.Second,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("switch boundary error = %v, want deadline exceeded", err)
+	}
+	notes, err := repository.ListDailyNotes(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range notes {
+		if note.SessionID == "source" {
+			t.Fatalf("failed switch wrote a Daily note: %+v", note)
+		}
+	}
+
+	err = persistMemoryBoundaryWithGrace(
+		m.loop, "source", "cli-close", "final source summary", true, 15*time.Millisecond, time.Second,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close boundary error = %v, want aggregated deadline exceeded", err)
+	}
+	assertDailySource(t, repository, "source", "cli-close")
+	stillRunning, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	err = m.loop.WaitForDistillation(stillRunning, "source")
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close boundary canceled freshly flushed distillation: %v", err)
+	}
+	release()
+	joined, cancelJoined := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoined()
+	if err := m.loop.WaitForDistillation(joined, "source"); err != nil {
+		t.Fatalf("join residual after release: %v", err)
+	}
+}
+
 func blockActiveSessionWrites(t *testing.T, store *session.Store, id string) {
 	t.Helper()
 	path := filepath.Join(store.Dir, id+".jsonl")
@@ -642,6 +1505,7 @@ func TestSessionSwitchUISurfacesPersistenceFailure(t *testing.T) {
 
 func TestREPLRunReturnsFinalPersistenceFailure(t *testing.T) {
 	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	repository := attachLifecycleMemory(t, m.loop)
 	r, err := NewREPL(m.loop, nil, store, "source", false, false, m.gate, "test-model", "")
 	if err != nil {
 		t.Fatal(err)
@@ -651,6 +1515,15 @@ func TestREPLRunReturnsFinalPersistenceFailure(t *testing.T) {
 	blockActiveSessionWrites(t, store, "source")
 	if err := r.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "persist session source state") {
 		t.Fatalf("Run error = %v, want final persistence failure", err)
+	}
+	notes, err := repository.ListDailyNotes(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range notes {
+		if note.SessionID == "source" {
+			t.Fatalf("Daily note was written after source persistence failed: %+v", note)
+		}
 	}
 }
 

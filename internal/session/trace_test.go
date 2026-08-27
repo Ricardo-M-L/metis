@@ -296,6 +296,83 @@ func TestTraceTree(t *testing.T) {
 	}
 }
 
+func TestTraceTreeSeparatesRepeatedToolUseIDOccurrences(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewTraceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Some providers restart their public tool IDs for every model response
+	// (Gemini commonly emits gem_1 again). Legacy trace files do not carry a
+	// TraceCallID, so the tree builder must still pair each result with the
+	// corresponding occurrence instead of putting every result under the first
+	// tool_start that used the raw provider ID.
+	for _, ev := range []*TraceEvent{
+		{SessionID: "repeated", Turn: 1, Kind: "tool_start", ToolName: "Bash", ToolUseID: "gem_1", Text: "first input"},
+		{SessionID: "repeated", Turn: 1, Kind: "tool_result", ToolName: "Bash", ToolUseID: "gem_1", ParentID: "gem_1", Text: "first result"},
+		{SessionID: "repeated", Turn: 1, Kind: "tool_start", ToolName: "Read", ToolUseID: "gem_1", Text: "second input"},
+		{SessionID: "repeated", Turn: 1, Kind: "tool_result", ToolName: "Read", ToolUseID: "gem_1", ParentID: "gem_1", Text: "second result"},
+	} {
+		if err := store.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertRepeatedLegacyOccurrences(t, store.Trace("repeated"))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening proves the fallback is computed from the stable legacy fields;
+	// it does not rely on process-local state or rewrite the persisted JSONL.
+	reopened, err := NewTraceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	assertRepeatedLegacyOccurrences(t, reopened.Trace("repeated"))
+}
+
+func assertRepeatedLegacyOccurrences(t *testing.T, nodes []TracedNode) {
+	t.Helper()
+	wantKind := []string{"tool_start", "tool_result", "tool_start", "tool_result"}
+	wantText := []string{"first input", "first result", "second input", "second result"}
+	wantDepth := []int{0, 1, 0, 1}
+	if len(nodes) != len(wantKind) {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	for i := range nodes {
+		if nodes[i].Event.Kind != wantKind[i] || nodes[i].Event.Text != wantText[i] || nodes[i].Depth != wantDepth[i] {
+			t.Fatalf("node %d = %+v, want kind=%q text=%q depth=%d", i, nodes[i], wantKind[i], wantText[i], wantDepth[i])
+		}
+	}
+}
+
+func TestTraceTreeRepeatedToolUseIDCannotCrossTurns(t *testing.T) {
+	store, err := NewTraceStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// A partial first turn must not claim an ownerless result from a later
+	// turn just because the provider reused the same public ID.
+	for _, ev := range []*TraceEvent{
+		{SessionID: "cross-turn", Turn: 1, Kind: "tool_start", ToolName: "Bash", ToolUseID: "gem_1"},
+		{SessionID: "cross-turn", Turn: 2, Kind: "tool_result", ToolName: "Read", ToolUseID: "gem_1", ParentID: "gem_1", Text: "orphaned later result"},
+	} {
+		if err := store.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	nodes := store.Trace("cross-turn")
+	if len(nodes) != 2 || nodes[0].Depth != 0 || nodes[1].Depth != 0 {
+		t.Fatalf("cross-turn nodes = %+v", nodes)
+	}
+}
+
 func TestTraceTreeArgsDeltaCannotStealToolResult(t *testing.T) {
 	store, err := NewTraceStore(t.TempDir())
 	if err != nil {

@@ -6,18 +6,17 @@ package memdir
 // contributions/agentmemory/src/functions/consolidation-pipeline.ts
 // lines 23-35 for the original).
 //
-// Why decay instead of a hard TTL: auto-memory's extractor keeps
-// rewriting load-bearing facts (each rewrite resets LastAccessed),
-// so genuinely useful memos stay fresh indefinitely. A noise memo
-// (one-off detail the extractor happened to pull out) stops getting
-// touched and naturally fades out. A TTL would either be too short
-// (kill useful facts) or too long (keep noise around forever).
+// Why decay instead of a hard TTL: durable user facts/preferences are kept by
+// policy, while short-lived project state gets a use-sensitive curve. Each
+// rewrite/retrieval resets LastUsedAt and increments UseCount, so genuinely
+// reused project state stays longer and one-off noise naturally fades out.
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -49,6 +48,21 @@ const (
 	// DefaultStrength is the strength assigned to newly-written
 	// memos. 1.0 = freshly learned. Same baseline agentmemory uses.
 	DefaultStrength = 1.0
+
+	// DefaultConfidence is assigned when the extractor did not provide
+	// an explicit confidence. Auto-memory facts are useful but inferred,
+	// so the default is deliberately below certainty.
+	DefaultConfidence = 0.8
+
+	// ReferencePruneThreshold is lower than the project cutoff. External
+	// pointers are cheap and often useful after long gaps, so they decay
+	// conservatively instead of following short-lived project state.
+	ReferencePruneThreshold = 0.025
+
+	// HighConfidenceRetentionThreshold protects explicitly high-confidence
+	// memories from an irreversible age-only sweep. Default inferred memories
+	// use 0.8, so ordinary project/context state still expires when abandoned.
+	HighConfidenceRetentionThreshold = 0.9
 )
 
 // CurrentStrength returns the decayed strength as of `now`.
@@ -71,11 +85,8 @@ func (fm *Frontmatter) CurrentStrength(now time.Time) float64 {
 	if base == 0 {
 		base = DefaultStrength
 	}
-	if fm.LastAccessed == "" {
-		return clamp01(base)
-	}
-	ts, err := time.Parse(time.RFC3339, fm.LastAccessed)
-	if err != nil {
+	ts, ok := fm.lastActivityTime()
+	if !ok {
 		return clamp01(base)
 	}
 	elapsed := now.Sub(ts).Hours() / 24.0
@@ -97,16 +108,120 @@ func (fm *Frontmatter) CurrentStrength(now time.Time) float64 {
 	return clamp01(v)
 }
 
-// MarkAccessed sets LastAccessed=now and Strength=DefaultStrength.
-// Use this on every memdir write so the freshness clock resets when
-// the extractor rewrites a memo. Caller is responsible for
-// persisting via RenderFile.
+// MarkAccessed records a retrieval/reuse without claiming the content was
+// edited. LastAccessed is maintained as a compatibility alias for older
+// readers; new retention decisions prefer LastUsedAt.
 func (fm *Frontmatter) MarkAccessed(now time.Time) {
 	if fm == nil {
 		return
 	}
+	stamp := now.UTC().Format(time.RFC3339)
 	fm.Strength = DefaultStrength
-	fm.LastAccessed = now.UTC().Format(time.RFC3339)
+	fm.LastAccessed = stamp
+	fm.LastUsedAt = stamp
+	fm.UseCount++
+	if fm.Confidence <= 0 {
+		fm.Confidence = DefaultConfidence
+	} else {
+		fm.Confidence = clamp01(fm.Confidence)
+	}
+}
+
+// MarkUpdated records a content rewrite and its accompanying reuse. New
+// memos and edits both flow through this method during post-processing.
+func (fm *Frontmatter) MarkUpdated(now time.Time) {
+	if fm == nil {
+		return
+	}
+	fm.MarkAccessed(now)
+	fm.UpdatedAt = now.UTC().Format(time.RFC3339)
+}
+
+// ShouldPrune applies the type-aware retention policy:
+//   - user facts and feedback/preferences are durable by default;
+//   - project/context state uses the legacy strength curve, reinforced by reuse;
+//   - references use a lower threshold and therefore decay conservatively;
+//   - unknown legacy types retain the prior uniform policy.
+func (fm *Frontmatter) ShouldPrune(now time.Time) bool {
+	if fm == nil {
+		return false
+	}
+	// Pinned is intentionally an extension field: Frontmatter preserves
+	// unknown YAML keys so existing `pinned: true` memories do not need a
+	// migration. High-confidence memories are likewise protected because a
+	// decay sweep is destructive and cannot re-derive a forgotten fact.
+	if fm.retentionPinned() || fm.Confidence >= HighConfidenceRetentionThreshold {
+		return false
+	}
+	switch fm.Type {
+	case TypeUser, TypeFeedback:
+		return false
+	case TypeReference:
+		// References are cheap pointers and may be used seasonally. Keep
+		// them for at least a year before even considering decay.
+		if last, ok := fm.lastActivityTime(); ok && now.Sub(last) < 365*24*time.Hour {
+			return false
+		}
+	}
+	strength := fm.CurrentStrength(now)
+	// Each reuse contributes 4%, capped at 80%. This is enough for a
+	// repeatedly consulted project decision to outlive a one-off note while
+	// still allowing genuinely abandoned state to expire eventually.
+	uses := fm.UseCount
+	if uses < 0 {
+		uses = 0
+	}
+	if uses > 20 {
+		uses = 20
+	}
+	strength *= 1 + float64(uses)*0.04
+	threshold := PruneThreshold
+	if fm.Type == TypeReference {
+		threshold = ReferencePruneThreshold
+	}
+	return strength < threshold
+}
+
+// lastActivityTime returns the newest valid retrieval/access/update stamp.
+// Picking the newest (rather than blindly preferring LastUsedAt) prevents a
+// recently rewritten memory with older legacy usage metadata from being
+// deleted on its first sweep.
+func (fm *Frontmatter) lastActivityTime() (time.Time, bool) {
+	if fm == nil {
+		return time.Time{}, false
+	}
+	var newest time.Time
+	for _, stamp := range []string{fm.LastUsedAt, fm.LastAccessed, fm.UpdatedAt} {
+		if stamp == "" {
+			continue
+		}
+		if parsed, err := time.Parse(time.RFC3339, stamp); err == nil {
+			if newest.IsZero() || parsed.After(newest) {
+				newest = parsed
+			}
+		}
+	}
+	return newest, !newest.IsZero()
+}
+
+func (fm *Frontmatter) retentionPinned() bool {
+	if fm == nil || fm.Extra == nil {
+		return false
+	}
+	raw, ok := fm.Extra["pinned"]
+	if !ok {
+		return false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+	}
+	return false
 }
 
 // SweepResult summarises a DecayAndPrune pass. Used by the dream
@@ -150,7 +265,7 @@ func DecayAndPrune(ctx context.Context, root string, now time.Time) (SweepResult
 		// address so CurrentStrength's nil guard still works for
 		// any future caller that DOES pass a nil ptr.
 		fm := &files[i].Frontmatter
-		if fm.CurrentStrength(now) >= PruneThreshold {
+		if !fm.ShouldPrune(now) {
 			res.Kept++
 			continue
 		}

@@ -26,7 +26,7 @@ type Threat struct {
 
 // Injection patterns to detect.
 var injectionPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)ignore\s+(previous|all)\s+(instructions?|commands?)`),
+	regexp.MustCompile(`(?i)ignore\s+(?:(?:previous|all)\s+){1,2}(instructions?|commands?)`),
 	regexp.MustCompile(`(?i)disregard\s+(your|their)\s+(rules?|instructions?)`),
 	regexp.MustCompile(`(?i)forget\s+everything`),
 	regexp.MustCompile(`(?i)new\s+instructions?`),

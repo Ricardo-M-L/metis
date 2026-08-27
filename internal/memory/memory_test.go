@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -581,6 +582,13 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
+func TestTruncatePreservesUTF8Boundary(t *testing.T) {
+	got := truncate("你好世界", 5)
+	if got != "你" || !utf8.ValidString(got) {
+		t.Fatalf("truncate split UTF-8: %q valid=%t", got, utf8.ValidString(got))
+	}
+}
+
 func TestRecallMemory_ShouldSummarize(t *testing.T) {
 	dir := tempDir(t)
 	rm, _ := NewRecallMemory(dir, 5)
@@ -1049,7 +1057,7 @@ func TestDailyStore_RecentSummary(t *testing.T) {
 // — calling MemoryManager.BuildContext after writing daily notes
 // produces a system-prompt fragment that contains the recent summary.
 // Pre-fix the daily store was a write-only tomb (Phase 2 Plan).
-func TestBuildContext_IncludesDailyRecentSummary(t *testing.T) {
+func TestBuildContext_DoesNotIncludeDailyBodies(t *testing.T) {
 	dir := tempDir(t)
 	mm, err := NewMemoryManager(dir)
 	if err != nil {
@@ -1060,11 +1068,8 @@ func TestBuildContext_IncludesDailyRecentSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := mm.BuildContext()
-	if !strings.Contains(ctx, "metis daily reverse load test") {
-		t.Errorf("BuildContext didn't pick up the daily note we just saved:\n%s", ctx)
-	}
-	if !strings.Contains(ctx, "Recent sessions") {
-		t.Errorf("BuildContext should advertise the daily section header; got:\n%s", ctx)
+	if strings.Contains(ctx, "metis daily reverse load test") || strings.Contains(ctx, "Recent sessions") {
+		t.Errorf("BuildContext should keep daily bodies out of the stable prompt prefix; got:\n%s", ctx)
 	}
 }
 

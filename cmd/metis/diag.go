@@ -93,7 +93,7 @@ Exit codes: 0 ok / 1 hard fail / 2 flag error`)
 
 	// --- filesystem --------------------------------------------------------
 	d.section("filesystem")
-	for _, sub := range []string{"sessions", "skills", "memories", "agents", "cache"} {
+	for _, sub := range []string{"sessions", "skills", "memory", "agents", "cache"} {
 		p := filepath.Join(config.Home(), sub)
 		st, err := os.Stat(p)
 		switch {
@@ -103,7 +103,7 @@ Exit codes: 0 ok / 1 hard fail / 2 flag error`)
 			d.fail(p, "exists but not a directory")
 		default:
 			tmp := filepath.Join(p, ".diag-write-probe")
-			if e := os.WriteFile(tmp, []byte("ok"), 0o644); e != nil {
+			if e := os.WriteFile(tmp, []byte("ok"), 0o600); e != nil {
 				d.fail(p, "not writable: "+e.Error())
 			} else {
 				_ = os.Remove(tmp)

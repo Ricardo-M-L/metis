@@ -158,6 +158,47 @@ func TestRuntimeRebindSessionUpdatesCrashRecoveryPointer(t *testing.T) {
 	}
 }
 
+func TestRuntimeRebindSessionAtUsesDesktopTargetWorkspace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	workspaceA := t.TempDir()
+	workspaceB := t.TempDir()
+	targetFile := filepath.Join(workspaceB, "target-only.txt")
+	if err := os.WriteFile(targetFile, []byte("target workspace"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WritePointer("session-a", workspaceA); err != nil {
+		t.Fatal(err)
+	}
+	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 3)
+	rt := &runtime{loop: loop, sessionPointerCwd: workspaceA}
+	rt.rebindSessionAt("session-b", workspaceB)
+
+	if loop.Checkpointer == nil {
+		t.Fatal("Desktop target workspace did not install a checkpointer")
+	}
+	states, err := loop.Checkpointer.CapturePathStates([]string{targetFile})
+	if err != nil {
+		t.Fatalf("capture target workspace path: %v", err)
+	}
+	if _, ok := states["target-only.txt"]; !ok {
+		t.Fatalf("checkpointer is not rooted at target workspace: %+v", states)
+	}
+	pointerB, err := session.ReadPointer(workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pointerB == nil || pointerB.SessionID != "session-b" || pointerB.CWD != workspaceB {
+		t.Fatalf("target workspace pointer = %+v", pointerB)
+	}
+	pointerA, err := session.ReadPointer(workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pointerA != nil {
+		t.Fatalf("source workspace pointer remained after Desktop switch: %+v", pointerA)
+	}
+}
+
 func TestRuntimeReleaseSessionWorkCancelsRosterAndIsNilSafe(t *testing.T) {
 	cancelled := 0
 	roster := agent.NewRoster(1)

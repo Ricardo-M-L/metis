@@ -29,6 +29,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -155,6 +156,13 @@ func (s TeammateStatus) String() string {
 // makes the SubAgentOutput tool a synchronous read instead of disk I/O.
 type Teammate struct {
 	mu sync.RWMutex // guards Status / Output / Result / EndTime / ExitErr
+
+	// done closes only when the runner has fully unwound and called the
+	// identity-aware roster unregister path. Session workspace switches wait
+	// on this lifecycle edge after cancellation before publishing a new shared
+	// Memory repository binding.
+	done     chan struct{}
+	doneOnce sync.Once
 
 	// Name is what callers pass via `Agent({name: ...})`. Anonymous
 	// sub-agents get an auto-generated `_anon-<8hex>` prefix so the
@@ -361,6 +369,7 @@ func (r *Roster) Summary() RosterSummary {
 type Roster struct {
 	mu        sync.RWMutex
 	teammates map[string]*Teammate
+	resetting bool
 	// recentlyFinished is the keep-around list of teammates whose
 	// sub-loop has exited but whose Output/Status the parent may
 	// still want to read. Append-only with size cap; oldest evicted
@@ -443,6 +452,11 @@ var ErrCapacityExceeded = errors.New("sub-agent capacity exceeded")
 // or wait for the prior one to finish.
 var ErrNameInUse = errors.New("teammate name already in use")
 
+// ErrRosterResetting prevents a canceled source-session agent from spawning
+// more detached work while a top-level session boundary is joining the old
+// roster generation.
+var ErrRosterResetting = errors.New("sub-agent roster is resetting")
+
 // Register places t in the Roster. Returns ErrCapacityExceeded when
 // the capacity cap is hit. If t.Name is empty an anonymous name is
 // auto-generated and t.Name overwritten in place.
@@ -463,6 +477,9 @@ var ErrNameInUse = errors.New("teammate name already in use")
 func (r *Roster) Register(t *Teammate) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.resetting {
+		return ErrRosterResetting
+	}
 
 	// Determine the kind FIRST so the cap check below picks the
 	// right side. Empty-name → anon; explicit non-empty name → named
@@ -527,6 +544,8 @@ func (r *Roster) Register(t *Teammate) error {
 	if t.Started.IsZero() {
 		t.Started = time.Now()
 	}
+	t.done = make(chan struct{})
+	t.doneOnce = sync.Once{}
 	r.teammates[t.Name] = t
 	return nil
 }
@@ -549,6 +568,7 @@ func (r *Roster) UnregisterTeammate(t *Teammate) {
 	if t == nil {
 		return
 	}
+	defer t.signalDone()
 	r.unregister(t.Name, t)
 }
 
@@ -559,12 +579,22 @@ func (r *Roster) unregister(name string, expected *Teammate) {
 	if !ok || (expected != nil && t != expected) {
 		return
 	}
+	if expected == nil {
+		defer t.signalDone()
+	}
 	delete(r.teammates, name)
 	r.recentlyFinished = append(r.recentlyFinished, t)
 	// LRU evict: drop the oldest entries when over cap.
 	if over := len(r.recentlyFinished) - RosterFinishedKeep; over > 0 {
 		r.recentlyFinished = r.recentlyFinished[over:]
 	}
+}
+
+func (t *Teammate) signalDone() {
+	if t == nil || t.done == nil {
+		return
+	}
+	t.doneOnce.Do(func() { close(t.done) })
 }
 
 // Count returns the number of currently-registered teammates.
@@ -706,6 +736,55 @@ func (r *Roster) CancelAll() {
 		}
 	}
 	r.teammates = make(map[string]*Teammate)
+}
+
+// CancelAndWait cancels the current roster generation and waits until every
+// runner has fully unwound. Register is rejected during the join so a source
+// agent cannot race the boundary by spawning another detached child. On a
+// timeout the live entries remain addressable and a later boundary may retry;
+// the caller must not publish session-scoped resources meanwhile.
+func (r *Roster) CancelAndWait(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.mu.Lock()
+	r.resetting = true
+	live := make([]*Teammate, 0, len(r.teammates))
+	for _, teammate := range r.teammates {
+		live = append(live, teammate)
+	}
+	r.mu.Unlock()
+
+	for _, teammate := range live {
+		if teammate.Cancel != nil {
+			teammate.Cancel()
+		}
+	}
+	joined := false
+	defer func() {
+		r.mu.Lock()
+		r.resetting = false
+		if joined {
+			r.teammates = make(map[string]*Teammate)
+			r.recentlyFinished = nil
+		}
+		r.mu.Unlock()
+	}()
+	for _, teammate := range live {
+		if teammate.done == nil {
+			continue
+		}
+		select {
+		case <-teammate.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	joined = true
+	return nil
 }
 
 // Reset cancels live teammates and forgets both live and recently-finished

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Ricardo-M-L/metis/internal/agent"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
@@ -105,26 +104,7 @@ func cmdCoordinator(ctx context.Context, args []string) error {
 // pattern; kept inline because cross-file Go helpers in cmd/ would
 // require a third file just to share two ten-line functions.
 func runOneShotForCoordinator(ctx context.Context, rt *runtime, prompt string) (string, error) {
-	rt.loop.AppendUser(prompt)
-	var sb strings.Builder
-	eventCh := make(chan agent.Event, 64)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
-			return rt.loop.Run(turnCtx, eventCh)
-		})
-	}()
-	for ev := range eventCh {
-		switch ev.Kind {
-		case agent.EventTextDelta:
-			sb.WriteString(ev.TextDelta)
-		case agent.EventLoopDone:
-			return sb.String(), <-errCh
-		case agent.EventError:
-			return sb.String(), ev.Err
-		}
-	}
-	return sb.String(), <-errCh
+	return runHeadlessOneShot(ctx, rt, prompt, "metis coordinator worker task")
 }
 
 const coordinatorHelp = `metis coordinator — minimum-viable multi-agent orchestration

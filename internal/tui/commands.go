@@ -532,7 +532,7 @@ func cmdMemory(r *REPL, args string) string {
 	// Earlier this returned only a usage hint, which felt like the
 	// command was broken. The Memory tool (called by the LLM) handles
 	// CRUD; this slash is the read-only "what's in memory right now"
-	// view, equivalent to opening ~/.metis/memories/MEMORY.md by hand.
+	// view, equivalent to opening ~/.metis/memory/MEMORY.md by hand.
 	if r.Loop == nil || r.Loop.Memory == nil {
 		return "memory: not initialized (this is a metis bug — please report)"
 	}

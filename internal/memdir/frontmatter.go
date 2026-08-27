@@ -9,7 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// MemoryType is the four-way classifier copied from Claude Code's auto-
+// MemoryType is the classifier copied from Claude Code's auto-
 // memory taxonomy. Each type has different lifetime and use-case:
 //
 //   - User: durable facts about who the user is (role, expertise,
@@ -19,6 +19,8 @@ import (
 //   - Project: in-flight initiatives, deadlines, decisions. Decay fast;
 //     a "Why" line lets future-you decide whether the memory is still
 //     load-bearing.
+//   - Context: short-lived operational context imported from legacy stores.
+//     New extractor output should normally use Project instead.
 //   - Reference: pointers into external systems (Linear projects, slack
 //     channels, dashboards). Stable but external; verify before recommending.
 //
@@ -31,16 +33,17 @@ const (
 	TypeUser      MemoryType = "user"
 	TypeFeedback  MemoryType = "feedback"
 	TypeProject   MemoryType = "project"
+	TypeContext   MemoryType = "context"
 	TypeReference MemoryType = "reference"
 )
 
-// IsValid reports whether t is one of the four canonical types.
+// IsValid reports whether t is one of the five canonical types.
 // Unknown types are still allowed (we don't reject the file), but the
 // extractor prompt steers towards these four — the Manifest renderer
 // flags unknowns so the model can fix them on the next pass.
 func (t MemoryType) IsValid() bool {
 	switch t {
-	case TypeUser, TypeFeedback, TypeProject, TypeReference:
+	case TypeUser, TypeFeedback, TypeProject, TypeContext, TypeReference:
 		return true
 	}
 	return false
@@ -50,13 +53,15 @@ func (t MemoryType) IsValid() bool {
 // name / description / type are required for a "good" memory;
 // originSessionId is informational (which session first wrote this).
 //
-// Strength + LastAccessed implement Ebbinghaus-style soft expiration
+// Strength + LastUsedAt (with LastAccessed as a legacy alias) implement
+// type-aware soft expiration
 // (2026-05-20, adapted from rohitg00/agentmemory's consolidation
 // pipeline). The pair lets a periodic sweep prune stale memos
 // without a hard TTL: a memo that keeps getting rewritten/touched
-// stays fresh; one untouched for months decays past the prune
-// threshold and is deleted. Existing files without these fields
-// are treated as "fresh as of file mtime" — see CurrentStrength.
+// stays fresh; one-off project/context state can decay past the prune
+// threshold and be deleted. User facts and feedback are durable by default.
+// Existing files without these fields are treated as fresh — see
+// CurrentStrength.
 //
 // Unknown fields are preserved in Extra so the extractor can round-trip
 // frontmatter without losing custom keys (e.g. team-memory's
@@ -66,6 +71,22 @@ type Frontmatter struct {
 	Description     string     `yaml:"description"`
 	Type            MemoryType `yaml:"type"`
 	OriginSessionID string     `yaml:"originSessionId,omitempty"`
+	// SourceMessageID identifies the source message when the calling
+	// surface has stable message IDs. Older transcripts do not, so this
+	// remains optional and round-trips cleanly when absent.
+	SourceMessageID string `yaml:"source_message_id,omitempty"`
+	// Scope records where the memory is authoritative (normally "user"
+	// for the global root or "project" for a workspace-local root).
+	Scope string `yaml:"scope,omitempty"`
+	// UpdatedAt records the last content rewrite. LastUsedAt and UseCount
+	// track retrieval/reuse independently so retention can distinguish a
+	// forgotten one-off project note from a frequently reused one.
+	UpdatedAt  string `yaml:"updated_at,omitempty"`
+	LastUsedAt string `yaml:"last_used_at,omitempty"`
+	UseCount   int    `yaml:"use_count,omitempty"`
+	// Confidence is in [0,1]. Zero means "not recorded" for backwards
+	// compatibility and is defaulted by MarkUpdated/MarkAccessed.
+	Confidence float64 `yaml:"confidence,omitempty"`
 	// Strength is the recorded retention coefficient at LastAccessed,
 	// in (0, 1]. New writes default to 1.0. Subsequent reads compute
 	// the *current* decayed value via CurrentStrength(now); the

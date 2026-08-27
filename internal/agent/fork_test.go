@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
@@ -414,6 +416,41 @@ func TestSnapshotForFork_HappyPath(t *testing.T) {
 	snap.SystemSections[0].Body = "child-only mutation"
 	if loop.SystemSections[0].Body != "you are helpful" {
 		t.Fatal("fork snapshot shares mutable SystemSections with parent")
+	}
+}
+
+func TestSnapshotForForkPreservesParentSystemSectionOrder(t *testing.T) {
+	repository, err := memory.NewMemoryManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.AddCoreBlock("user", "fork cache order needle"); err != nil {
+		t.Fatal(err)
+	}
+	loop := NewLoop(&scriptedProvider{}, newRegistryWith(t), nil, nil, "base", 3)
+	loop.SystemSections = []llm.SystemSection{{Name: "base", Body: "base", Cache: true}}
+	loop.Memory = repository
+	loop.PlanSystemPrompt = "plan overlay"
+	loop.planMode = true
+	loop.CurrentStateSnapshot = func() RuntimeStateSnapshot {
+		return RuntimeStateSnapshot{SessionID: "fork-order-session"}
+	}
+
+	parent := loop.buildRequest(nil)
+	fork := SnapshotForFork(loop)
+	if fork == nil {
+		t.Fatal("SnapshotForFork returned nil")
+	}
+	parentNames := make([]string, 0, len(parent.SystemSections))
+	for _, section := range parent.SystemSections {
+		parentNames = append(parentNames, section.Name)
+	}
+	forkNames := make([]string, 0, len(fork.SystemSections))
+	for _, section := range fork.SystemSections {
+		forkNames = append(forkNames, section.Name)
+	}
+	if !slices.Equal(parentNames, forkNames) {
+		t.Fatalf("fork reordered cache-critical system sections: parent=%v fork=%v", parentNames, forkNames)
 	}
 }
 

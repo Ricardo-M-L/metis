@@ -3,13 +3,17 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/budget"
@@ -90,7 +94,7 @@ type Loop struct {
 
 	// Memory provides persistent memory for system prompt injection.
 	// When set, BuildContext() is called to inject memory into each request.
-	Memory *memory.MemoryManager
+	Memory memory.Repository
 
 	// AutoRetrieveK > 0 enables per-turn BM25 retrieval from archival
 	// memory: buildRequest looks up the most recent user message, ranks
@@ -114,6 +118,17 @@ type Loop struct {
 	// false = disabled (default). Opt-in via METIS_AUTO_RETRIEVE_RERANK=1.
 	// Has no effect when AutoRetrieveK == 0.
 	AutoRetrieveRerank bool
+
+	// turnMemory* freezes the repository snapshot and query-specific recall
+	// once at the start of a user turn. Tool iterations then reuse the exact
+	// same bytes instead of re-reading Daily/topic files or rebuilding BM25
+	// while l.mu is held. The recall block is attached to the originating user
+	// message (Synthetic=true), not the system prompt, so the next request can
+	// reuse the complete prior conversation prefix.
+	turnMemoryContext        string
+	turnMemoryRecall         string
+	turnMemoryPrepared       bool
+	turnMemoryRecallAttached bool
 
 	// PlanMode keeps read-only exploration available while plan-control tools
 	// execute normally and potentially mutating tools receive denied results.
@@ -302,6 +317,25 @@ type Loop struct {
 	// per-turn distillation noise dominates the actual work).
 	DistillEvery int
 
+	// distillJobs owns the background auto-distillation lifecycle. A session
+	// delete or process shutdown can cancel and join these jobs before removing
+	// session-owned memory, so a late provider response cannot recreate data
+	// after deletion. The provider, repository, provenance and exchange are
+	// captured before a job is registered; no goroutine reads mutable Loop
+	// routing/history state after a session switch.
+	distillMu     sync.Mutex
+	distillNextID uint64
+	distillJobs   map[uint64]*distillJob
+	// distillPending retains immutable successful exchanges until either the
+	// normal cadence or a session durability boundary launches them. The
+	// source-message key is the idempotency watermark: repeated boundaries can
+	// neither launch an in-flight exchange nor re-distill one that completed.
+	distillPending   map[string]distillSnapshot
+	distillInFlight  map[string]struct{}
+	distillWatermark map[string]struct{}
+	distillFailures  map[string]error
+	distillSlots     chan struct{}
+
 	// ContextWindow is the model's input cap, fed in by BuildAgentLoop
 	// from the provider's MaxContextTokens. Used as the denominator
 	// for the auto-mode lazy-tool trigger (see lazy_tools.go). 0 means
@@ -439,6 +473,32 @@ type Loop struct {
 	contract contractTracker
 }
 
+type distillJob struct {
+	sessionID string
+	cancel    context.CancelFunc
+	done      chan struct{}
+}
+
+type distillSnapshot struct {
+	repository      memory.Repository
+	provider        llm.Provider
+	sessionID       string
+	sourceMessageID string
+	userMsg         string
+	assistantMsg    string
+	turn            int
+}
+
+// DefaultDistillEvery is deliberately installed by NewLoop. Zero has one
+// unambiguous contract everywhere else: disable both cadence and residual
+// boundary distillation.
+const DefaultDistillEvery = 5
+
+// maxConcurrentDistillations prevents a long or retried session boundary from
+// turning into an unbounded provider-call burst. At the default cadence this
+// still lets the complete five-exchange batch make progress together.
+const maxConcurrentDistillations = DefaultDistillEvery
+
 const agentPlanSystemPromptFallback = `# Plan mode
 
 Use read-only tools to inspect the current state, but do not edit files, run
@@ -469,6 +529,7 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 		PlanSystemPrompt:            agentPlanSystemPromptFallback,
 		MaxIters:                    maxIter,
 		GraceCalls:                  1,
+		DistillEvery:                DefaultDistillEvery,
 		lastTimeBasedMicrocompactAt: time.Now(),
 		subAgentNotify:              make(chan SubAgentNotification, 64),
 		ckptSnappedAt:               -1,
@@ -485,6 +546,9 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 func (l *Loop) AppendUser(text string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// The previous turn's frozen index/recall must never be reused by context
+	// estimation or direct request inspection after a new prompt is appended.
+	l.clearTurnMemoryLocked()
 	content := []llm.ContentBlock{{Type: "text", Text: text}}
 	if shouldInjectPlanTrigger(text, detectPlanModeEntered(l.Messages)) {
 		content = []llm.ContentBlock{
@@ -512,6 +576,7 @@ func (l *Loop) AppendUserBlocks(blocks []llm.ContentBlock) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.clearTurnMemoryLocked()
 	// Concatenate text-only blocks for trigger detection.
 	var textBuf strings.Builder
 	for _, b := range blocks {
@@ -594,6 +659,87 @@ func (l *Loop) stopAcceptingSteer() []string {
 	l.steerBuf = nil
 	l.mu.Unlock()
 	return discarded
+}
+
+func (l *Loop) clearTurnMemoryLocked() {
+	l.turnMemoryContext = ""
+	l.turnMemoryRecall = ""
+	l.turnMemoryPrepared = false
+	l.turnMemoryRecallAttached = false
+}
+
+// prepareTurnMemory snapshots stable memory and performs query recall before
+// the provider iteration loop starts. Filesystem reads, BM25 construction and
+// optional LLM reranking therefore happen without l.mu, remain cancellable,
+// and run at most once for the person's submitted turn.
+func (l *Loop) prepareTurnMemory(ctx context.Context) {
+	if l == nil {
+		return
+	}
+	l.mu.RLock()
+	manager := l.Memory
+	k := l.AutoRetrieveK
+	rerank := l.AutoRetrieveRerank
+	provider := l.Provider
+	query := lastUserTextLocked(l.Messages)
+	revision := l.historyRevision
+	l.mu.RUnlock()
+
+	memBody, retrieveBody := "", ""
+	var picked []memory.Passage
+	if manager != nil {
+		memBody = manager.BuildContext()
+		if k > 0 && query != "" {
+			candidates := manager.AutoRetrieveCandidates(query, k)
+			if rerank && provider != nil {
+				candidates = manager.AutoRetrieveCandidates(query, k*3)
+				picked = rerankAutoRetrieve(ctx, provider, query, candidates, k)
+			} else {
+				picked = candidates
+			}
+			retrieveBody = memory.FormatRetrieveSection(picked)
+		}
+	}
+
+	l.mu.Lock()
+	// A top-level history replacement won the race while recall was being
+	// built. Do not attach data selected for the previous session/query.
+	if l.historyRevision != revision {
+		l.clearTurnMemoryLocked()
+		l.mu.Unlock()
+		return
+	}
+	l.turnMemoryContext = memBody
+	l.turnMemoryRecall = retrieveBody
+	l.turnMemoryPrepared = true
+	if retrieveBody == "" {
+		l.mu.Unlock()
+		return
+	}
+	idx := transcript.LastPlainUserIndex(l.Messages)
+	if idx < 0 || messageContainsAutoRetrieve(l.Messages[idx]) {
+		l.mu.Unlock()
+		return
+	}
+	l.Messages[idx].Content = append(l.Messages[idx].Content, llm.ContentBlock{
+		Type: "text", Text: retrieveBody, Synthetic: true,
+	})
+	l.turnMemoryRecallAttached = true
+	l.mu.Unlock()
+
+	// Retrieval candidates and token estimates are previews, not memory use.
+	// Persist usage only after the exact Top-K has survived the session/history
+	// revision check and was attached to the request-bound user message.
+	_ = manager.MarkRetrieved(picked)
+}
+
+func messageContainsAutoRetrieve(message llm.Message) bool {
+	for _, block := range message.Content {
+		if block.Type == "text" && strings.Contains(block.Text, "<auto-retrieve") {
+			return true
+		}
+	}
+	return false
 }
 
 // emitAssistantReentryBoundary flushes a completed user-facing assistant
@@ -706,6 +852,10 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	memoryManager := l.Memory
 	autoRetrieveK := l.AutoRetrieveK
 	query := lastUserTextLocked(l.Messages)
+	turnMemoryPrepared := l.turnMemoryPrepared
+	turnMemoryContext := l.turnMemoryContext
+	turnMemoryRecall := l.turnMemoryRecall
+	turnMemoryRecallAttached := l.turnMemoryRecallAttached
 	currentStateSnapshot := l.CurrentStateSnapshot
 	currentStateSections := l.CurrentStateSections
 	runtimeModel := l.Model
@@ -717,13 +867,16 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	rescueWithoutTools := l.rescueNoTools
 	l.mu.RUnlock()
 
-	memBody, retrieveBody := "", ""
-	if memoryManager != nil {
+	memBody, retrieveBody := turnMemoryContext, turnMemoryRecall
+	if turnMemoryRecallAttached {
+		retrieveBody = ""
+	}
+	if !turnMemoryPrepared && memoryManager != nil {
 		memBody = memoryManager.BuildContext()
 		if autoRetrieveK > 0 {
 			// Preflight deliberately uses the local BM25 path even when live
 			// requests enable reranking. Estimation must never spend tokens.
-			retrieveBody = memoryManager.AutoRetrieve(query, autoRetrieveK)
+			retrieveBody = memoryManager.PreviewAutoRetrieve(query, autoRetrieveK)
 		}
 	}
 	dynamic := []llm.SystemSection(nil)
@@ -753,17 +906,17 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 			}
 			requestSections = append(requestSections, section)
 		}
+		if memBody != "" {
+			requestSections = append(requestSections, llm.SystemSection{
+				Name: "memory_index", Body: memBody, Cache: true,
+			})
+		}
 		if planMode && planPrompt != "" {
 			requestSections = append(requestSections, llm.SystemSection{
 				Name: "plan_mode", Body: planPrompt, Cache: false, Volatile: true,
 			})
 		}
 		requestSections = append(requestSections, dynamic...)
-		if memBody != "" {
-			requestSections = append(requestSections, llm.SystemSection{
-				Name: "memory", Body: memBody, Cache: false, Volatile: true,
-			})
-		}
 		if retrieveBody != "" {
 			requestSections = append(requestSections, llm.SystemSection{
 				Name: "auto-retrieve", Body: retrieveBody, Cache: false, Volatile: true,
@@ -1050,6 +1203,7 @@ func (l *Loop) Reset() {
 	l.autoCompactSessionGeneration++
 	l.clearAutoCompactPressureLocked()
 	l.invalidateRuntimeStateLocked()
+	l.clearTurnMemoryLocked()
 	l.compactCircuitNoticeSent = false
 	l.contract.reset()
 	if ownsCompact {
@@ -1146,6 +1300,7 @@ func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
 	l.autoCompactSessionGeneration++
 	l.clearAutoCompactPressureLocked()
 	l.invalidateRuntimeStateLocked()
+	l.clearTurnMemoryLocked()
 }
 
 // ResetSession crosses a top-level chat-session boundary. Unlike Restore,
@@ -1385,6 +1540,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	if l.subAgentNotify != nil {
 		ctx = WithSubAgentNotify(ctx, l.subAgentNotify)
 	}
+
+	// Freeze stable memory + Top-K recall before any request is assembled.
+	// This deliberately runs outside l.mu; a slow disk or optional reranker
+	// must not freeze Desktop status, stop, or session-navigation paths.
+	l.prepareTurnMemory(ctx)
 
 	tc := HookContext{Model: l.Model, Turn: l.turnIdx}
 	l.Hooks.EmitSessionStart(ctx, tc, l.System, l.Model)
@@ -1757,12 +1917,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			if l.Detector != nil {
 				l.Detector.RecordProgress()
 			}
-			// Auto-distillation: every N turns, extract durable facts
-			// from the most recent user/assistant exchange and write
-			// to archival memory. Fire-and-forget goroutine —
-			// distillation is "nice to have", a slow / failing LLM
-			// call shouldn't block turn completion.
-			l.maybeDistill()
+			// Auto-distillation: every N turns, extract durable facts from
+			// the most recent user/assistant exchange and write to archival
+			// memory. The registered background job does not block turn
+			// completion, but session deletion/shutdown can cancel and join it.
+			completed, err := l.recordCompletedTurn(ctx)
+			if err != nil {
+				emit(ctx, out, Event{Kind: EventInfo, Info: "memory recall persistence failed: " + err.Error()})
+			}
+			l.maybeDistillSnapshot(completed)
 			l.Hooks.EmitLoopEnd(ctx, tc, stop)
 			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: stop})
 			return nil
@@ -2346,12 +2509,11 @@ func (l *Loop) compactForSecondWind(ctx context.Context, out chan<- Event) bool 
 // buildRequest assembles the per-iteration LLM Request under l.mu so the
 // snapshot of Messages and System+Memory composition is consistent.
 //
-// SystemSections wiring: when l.SystemSections is populated (the new
-// path from runtime.AssembleSystemPromptSections), we emit memory
-// context as its OWN section flagged Volatile=true. That lets the
-// Anthropic provider keep base + addendum cached even when memory
-// updates per turn — without sectioning, a single memory write would
-// invalidate every cache breakpoint downstream of it.
+// SystemSections wiring: when l.SystemSections is populated (the new path
+// from runtime.AssembleSystemPromptSections), the compact Core/topic index is
+// a stable cacheable section. Query-specific Top-K recall is attached to the
+// latest user message before the provider loop, preserving the system-prefix
+// cache while keeping recalled bodies close to the query that selected them.
 func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 	req, _ := l.buildRequestWithContext(specs)
 	return req
@@ -2366,28 +2528,34 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 	defer l.mu.Unlock()
 	system := l.System
 	var sections []llm.SystemSection
-	var memBody string
-	if l.Memory != nil {
+	memBody := l.turnMemoryContext
+	retrieveBody := l.turnMemoryRecall
+	if l.turnMemoryRecallAttached {
+		retrieveBody = ""
+	}
+	if !l.turnMemoryPrepared && l.Memory != nil {
 		memBody = l.Memory.BuildContext()
 	}
-	// Per-turn auto retrieval: BM25 the latest user message against
-	// archival and append the top-K passages as their own section.
-	// Off by default (AutoRetrieveK == 0); typically toggled via
-	// METIS_AUTO_RETRIEVE=K at runtime.BuildAgentLoop wiring time.
+	// Per-turn auto retrieval: BM25 the latest user message against archival
+	// and topic memory. Runtime defaults to Top-5; AutoRetrieveK == 0 disables
+	// it. This branch is only a side-effect-free compatibility fallback for
+	// direct buildRequest callers because normal Run calls prepareTurnMemory.
 	//
 	// AutoRetrieveRerank, when on, fetches BM25 top K*3 candidates and
 	// asks the provider to LLM-rerank them down to the final K — more
 	// accurate than raw BM25 score, costs one Complete() call per turn.
 	// Falls back to BM25 ordering on any failure.
-	var retrieveBody string
-	if l.Memory != nil && l.AutoRetrieveK > 0 {
+	if !l.turnMemoryPrepared && l.Memory != nil && l.AutoRetrieveK > 0 {
 		query := lastUserTextLocked(l.Messages)
 		if l.AutoRetrieveRerank && l.Provider != nil {
 			candidates := l.Memory.AutoRetrieveCandidates(query, l.AutoRetrieveK*3)
-			picked := rerankAutoRetrieve(context.Background(), l.Provider, query, candidates, l.AutoRetrieveK)
+			// Compatibility path for embedders that call buildRequest directly
+			// without Run/prepareTurnMemory. Live turns always use the cancellable
+			// precomputed path above and never rerank while l.mu is held.
+			picked := capPassages(candidates, l.AutoRetrieveK)
 			retrieveBody = memory.FormatRetrieveSection(picked)
 		} else {
-			retrieveBody = l.Memory.AutoRetrieve(query, l.AutoRetrieveK)
+			retrieveBody = l.Memory.PreviewAutoRetrieve(query, l.AutoRetrieveK)
 		}
 	}
 	// Resolve the plan overlay body from the explicit runtime injection, or
@@ -2430,6 +2598,11 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 				sections = append(sections, section)
 			}
 		}
+		if memBody != "" {
+			sections = append(sections, llm.SystemSection{
+				Name: "memory_index", Body: memBody, Cache: true,
+			})
+		}
 		if l.planMode && planPrompt != "" {
 			sections = append(sections, llm.SystemSection{
 				Name: "plan_mode", Body: planPrompt, Cache: false, Volatile: true,
@@ -2441,14 +2614,6 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 		if state, ok := l.currentRuntimeStateSectionLocked(); ok {
 			sections = append(sections, llm.SystemSection{
 				Name: "runtime_state", Body: state.body, Cache: true,
-			})
-		}
-		if memBody != "" {
-			sections = append(sections, llm.SystemSection{
-				Name:     "memory",
-				Body:     memBody,
-				Cache:    false,
-				Volatile: true,
 			})
 		}
 		if retrieveBody != "" {
@@ -2574,41 +2739,423 @@ func (l *Loop) buildRequestForRetryWithContext(specs []llm.ToolSpec, withoutTool
 	return l.buildRequestWithContext(specs)
 }
 
-// maybeDistill runs auto-distillation on the most recent user/asst
-// exchange when the turn counter hits the configured cadence. Spawns
-// a background goroutine so it never blocks the agent loop's return
-// — distillation is a "nice to have" and a slow LLM call shouldn't
-// stall the user's next prompt.
+// maybeDistill runs auto-distillation on the most recent user/asst exchange
+// when the turn counter hits the configured cadence. Distillation remains
+// asynchronous, but it is not fire-and-forget: launchDistillation registers a
+// cancellable job before this method returns, allowing session deletion and
+// process shutdown to join the writer before removing session-owned memory.
 //
-// Uses a fresh background context (NOT the request context that's
-// about to be cancelled when Run returns). 30s timeout so a hung
-// provider doesn't leak goroutines.
+// Every mutable input is frozen before the goroutine starts. In particular,
+// switching Desktop sessions or rebinding a provider cannot make a completed
+// exchange from session A use session B's repository, provider or provenance.
 func (l *Loop) maybeDistill() {
-	if l.Memory == nil || l.Provider == nil {
+	if l == nil {
 		return
 	}
+	l.mu.RLock()
+	snapshot := distillSnapshot{
+		repository: l.Memory,
+		provider:   l.Provider,
+		turn:       transcript.CountTurns(l.Messages),
+	}
+	snapshot.userMsg, snapshot.assistantMsg = lastExchangeLocked(l.Messages)
+	sessionGeneration := l.autoCompactSessionGeneration
+	l.mu.RUnlock()
+	if snapshot.repository == nil || snapshot.provider == nil || snapshot.turn == 0 ||
+		strings.TrimSpace(snapshot.userMsg) == "" || strings.TrimSpace(snapshot.assistantMsg) == "" {
+		return
+	}
+	if l.CurrentStateSnapshot != nil {
+		snapshot.sessionID = strings.TrimSpace(l.CurrentStateSnapshot().SessionID)
+	}
+	l.mu.RLock()
+	stillCurrentSession := l.autoCompactSessionGeneration == sessionGeneration
+	l.mu.RUnlock()
+	if !stillCurrentSession {
+		// ResetSession won while the runtime-state callback was resolving. The
+		// exchange belongs to the prior generation; do not attribute it to the
+		// newly active session.
+		return
+	}
+	if snapshot.sessionID != "" {
+		snapshot.sourceMessageID = snapshot.sessionID + "/message/" + uuid.NewString()
+	}
+	l.maybeDistillSnapshot(&snapshot)
+}
+
+// maybeDistillSnapshot launches one completed exchange when it lands on the
+// configured cadence. A nil snapshot is a no-op. Zero is an explicit disable;
+// NewLoop installs DefaultDistillEvery for normal runtime construction.
+func (l *Loop) maybeDistillSnapshot(snapshot *distillSnapshot) {
+	if l == nil || snapshot == nil {
+		return
+	}
+	l.mu.RLock()
 	cadence := l.DistillEvery
-	if cadence <= 0 {
-		// Default 5 turns — small enough to keep memory current,
-		// large enough to amortize the LLM cost across multiple
-		// turns. Caller can override via Loop.DistillEvery.
-		cadence = 5
-	}
-	l.mu.Lock()
-	turn := l.turnIdx
-	l.mu.Unlock()
-	if turn == 0 || turn%cadence != 0 {
+	l.mu.RUnlock()
+	if cadence <= 0 || snapshot.turn == 0 || snapshot.turn%cadence != 0 {
 		return
 	}
-	userMsg, asstMsg := l.lastExchange()
-	if userMsg == "" || asstMsg == "" {
+	if snapshot.sourceMessageID != "" {
+		l.queuePendingDistillation(*snapshot)
+		// Cadence is a checkpoint for every successful exchange since the prior
+		// checkpoint, not merely the Nth exchange. This keeps a long-running
+		// session's residual boundary bounded to at most cadence-1 snapshots.
+		l.FlushPendingDistillation(snapshot.sessionID)
 		return
 	}
+	l.launchDistillation(*snapshot)
+}
+
+func distillationSourceKey(sessionID, sourceMessageID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	sourceMessageID = strings.TrimSpace(sourceMessageID)
+	if sessionID == "" || sourceMessageID == "" {
+		return ""
+	}
+	return sessionID + "\x00" + sourceMessageID
+}
+
+func (l *Loop) queuePendingDistillation(snapshot distillSnapshot) bool {
+	if l == nil || snapshot.repository == nil || snapshot.provider == nil ||
+		strings.TrimSpace(snapshot.userMsg) == "" || strings.TrimSpace(snapshot.assistantMsg) == "" {
+		return false
+	}
+	key := distillationSourceKey(snapshot.sessionID, snapshot.sourceMessageID)
+	if key == "" {
+		return false
+	}
+	l.distillMu.Lock()
+	defer l.distillMu.Unlock()
+	if _, ok := l.distillWatermark[key]; ok {
+		return false
+	}
+	if _, ok := l.distillInFlight[key]; ok {
+		return false
+	}
+	if l.distillPending == nil {
+		l.distillPending = make(map[string]distillSnapshot)
+	}
+	if _, ok := l.distillPending[key]; ok {
+		return false
+	}
+	l.distillPending[key] = snapshot
+	return true
+}
+
+// FlushPendingDistillation registers every successful exchange for sessionID
+// that has not yet reached the normal cadence. Registration is synchronous;
+// provider calls remain cancellable background jobs. A durability boundary
+// invokes this method and then WaitForDistillation before replacing history or
+// closing provider/repository dependencies. Repeated calls are idempotent by
+// the session/source-message watermark. It returns the number of new jobs.
+func (l *Loop) FlushPendingDistillation(sessionID string) int {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	disabled := l.DistillEvery <= 0
+	l.mu.RUnlock()
+	if disabled {
+		return 0
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	l.distillMu.Lock()
+	pending := make([]distillSnapshot, 0, len(l.distillPending))
+	for key, snapshot := range l.distillPending {
+		if sessionID != "" && strings.TrimSpace(snapshot.sessionID) != sessionID {
+			continue
+		}
+		if _, done := l.distillWatermark[key]; done {
+			continue
+		}
+		if _, running := l.distillInFlight[key]; running {
+			continue
+		}
+		pending = append(pending, snapshot)
+	}
+	l.distillMu.Unlock()
+	sort.SliceStable(pending, func(i, j int) bool {
+		if pending[i].turn != pending[j].turn {
+			return pending[i].turn < pending[j].turn
+		}
+		return pending[i].sourceMessageID < pending[j].sourceMessageID
+	})
+
+	launched := 0
+	for _, snapshot := range pending {
+		if l.launchDistillation(snapshot) {
+			launched++
+		}
+	}
+	return launched
+}
+
+// launchDistillation registers the job synchronously, then performs the
+// provider call in the background. Register-before-launch closes the boundary
+// race where a DELETE arriving immediately after Run returned could observe no
+// writer and remove the session while a goroutine was about to start.
+func (l *Loop) launchDistillation(snapshot distillSnapshot) bool {
+	if l == nil || snapshot.repository == nil || snapshot.provider == nil ||
+		strings.TrimSpace(snapshot.userMsg) == "" || strings.TrimSpace(snapshot.assistantMsg) == "" {
+		return false
+	}
+	sourceKey := distillationSourceKey(snapshot.sessionID, snapshot.sourceMessageID)
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &distillJob{
+		sessionID: strings.TrimSpace(snapshot.sessionID),
+		cancel:    cancel,
+		done:      make(chan struct{}),
+	}
+
+	l.distillMu.Lock()
+	if sourceKey != "" {
+		if _, done := l.distillWatermark[sourceKey]; done {
+			l.distillMu.Unlock()
+			cancel()
+			return false
+		}
+		if _, running := l.distillInFlight[sourceKey]; running {
+			l.distillMu.Unlock()
+			cancel()
+			return false
+		}
+		if l.distillInFlight == nil {
+			l.distillInFlight = make(map[string]struct{})
+		}
+		// A retry supersedes the prior attempt's error. If it fails again the
+		// goroutine stores the fresh error for the boundary waiter.
+		delete(l.distillFailures, sourceKey)
+		l.distillInFlight[sourceKey] = struct{}{}
+	}
+	if l.distillJobs == nil {
+		l.distillJobs = make(map[uint64]*distillJob)
+	}
+	if l.distillSlots == nil {
+		l.distillSlots = make(chan struct{}, maxConcurrentDistillations)
+	}
+	slots := l.distillSlots
+	l.distillNextID++
+	jobID := l.distillNextID
+	l.distillJobs[jobID] = job
+	l.distillMu.Unlock()
+
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = l.Memory.DistillTurn(ctx, l.Provider, userMsg, asstMsg)
+		var err error
+		defer func() {
+			cancel()
+			l.distillMu.Lock()
+			if sourceKey != "" {
+				delete(l.distillInFlight, sourceKey)
+				if err == nil {
+					if l.distillWatermark == nil {
+						l.distillWatermark = make(map[string]struct{})
+					}
+					l.distillWatermark[sourceKey] = struct{}{}
+					delete(l.distillPending, sourceKey)
+					delete(l.distillFailures, sourceKey)
+				} else if !errors.Is(err, context.Canceled) {
+					if l.distillFailures == nil {
+						l.distillFailures = make(map[string]error)
+					}
+					l.distillFailures[sourceKey] = err
+				}
+			}
+			delete(l.distillJobs, jobID)
+			close(job.done)
+			l.distillMu.Unlock()
+		}()
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+		case <-ctx.Done():
+			err = ctx.Err()
+			return
+		}
+		providerCtx, timeout := context.WithTimeout(ctx, 30*time.Second)
+		defer timeout()
+		err = snapshot.repository.DistillTurnWithMetadata(
+			providerCtx,
+			snapshot.provider,
+			snapshot.sessionID,
+			snapshot.sourceMessageID,
+			snapshot.userMsg,
+			snapshot.assistantMsg,
+		)
 	}()
+	return true
+}
+
+// CancelDistillation requests cancellation for all in-flight distillation jobs
+// attributed to sessionID. An empty sessionID means every job (shutdown). This
+// method is non-blocking; destructive callers must follow it with
+// WaitForDistillation or use CancelAndWaitForDistillation so providers that
+// ignore context cannot write after cleanup.
+func (l *Loop) CancelDistillation(sessionID string) {
+	if l == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	l.distillMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(l.distillJobs))
+	for _, job := range l.distillJobs {
+		if sessionID == "" || job.sessionID == sessionID {
+			cancels = append(cancels, job.cancel)
+		}
+	}
+	l.distillMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// WaitForDistillation waits until every currently registered job for
+// sessionID exits. An empty sessionID waits for all jobs. It loops after each
+// snapshot so a job registered concurrently at the boundary is not missed;
+// callers are still expected to stop foreground turns before invoking it.
+func (l *Loop) WaitForDistillation(ctx context.Context, sessionID string) error {
+	if l == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	for {
+		l.distillMu.Lock()
+		done := make([]<-chan struct{}, 0, len(l.distillJobs))
+		for _, job := range l.distillJobs {
+			if sessionID == "" || job.sessionID == sessionID {
+				done = append(done, job.done)
+			}
+		}
+		if len(done) == 0 {
+			var failures []error
+			for key, err := range l.distillFailures {
+				keySession, _, _ := strings.Cut(key, "\x00")
+				if sessionID == "" || keySession == sessionID {
+					failures = append(failures, err)
+					delete(l.distillFailures, key)
+				}
+			}
+			l.distillMu.Unlock()
+			return errors.Join(failures...)
+		}
+		l.distillMu.Unlock()
+		for _, jobDone := range done {
+			select {
+			case <-jobDone:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+// discardDistillationState removes frozen conversation content and completed
+// source-message watermarks for one session after a destructive boundary has
+// joined all of its jobs. An empty sessionID discards every session.
+func (l *Loop) discardDistillationState(sessionID string) {
+	if l == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	l.distillMu.Lock()
+	defer l.distillMu.Unlock()
+	for key, snapshot := range l.distillPending {
+		if sessionID == "" || strings.TrimSpace(snapshot.sessionID) == sessionID {
+			delete(l.distillPending, key)
+			delete(l.distillInFlight, key)
+		}
+	}
+	for key := range l.distillWatermark {
+		keySession, _, _ := strings.Cut(key, "\x00")
+		if sessionID == "" || keySession == sessionID {
+			delete(l.distillWatermark, key)
+			delete(l.distillInFlight, key)
+		}
+	}
+	for key := range l.distillFailures {
+		keySession, _, _ := strings.Cut(key, "\x00")
+		if sessionID == "" || keySession == sessionID {
+			delete(l.distillFailures, key)
+		}
+	}
+}
+
+// CancelAndWaitForDistillation is the destructive-boundary helper used by
+// session deletion and shutdown: request cancellation, then join even a
+// stubborn provider before the repository is swept. Once joined, it also
+// drops frozen pending content so a later catch-all flush cannot send deleted
+// conversation text to the provider.
+func (l *Loop) CancelAndWaitForDistillation(ctx context.Context, sessionID string) error {
+	if l == nil {
+		return nil
+	}
+	l.CancelDistillation(sessionID)
+	waitErr := l.WaitForDistillation(ctx, sessionID)
+	// A live wait timeout means a provider may still hold the frozen snapshot;
+	// retain state and force the destructive caller to fail closed. A completed
+	// provider error, by contrast, must not make a user's delete impossible:
+	// discard the pending snapshot and its error once every job has exited.
+	if ctx != nil && ctx.Err() != nil {
+		return waitErr
+	}
+	l.discardDistillationState(sessionID)
+	return nil
+}
+
+// recordCompletedTurn durably connects successful Loop turns to RecallMemory.
+// It intentionally runs only on the clean final-answer path: cancelled,
+// provider-error, loop-detected and max-iteration exits can contain partial or
+// repaired assistant output that should not become remembered conversation.
+func (l *Loop) recordCompletedTurn(ctx context.Context) (*distillSnapshot, error) {
+	if l == nil {
+		return nil, nil
+	}
+	l.mu.RLock()
+	snapshot := &distillSnapshot{
+		repository: l.Memory,
+		provider:   l.Provider,
+		turn:       transcript.CountTurns(l.Messages),
+	}
+	snapshot.userMsg, snapshot.assistantMsg = lastExchangeLocked(l.Messages)
+	sessionGeneration := l.autoCompactSessionGeneration
+	l.mu.RUnlock()
+	if snapshot.repository == nil || strings.TrimSpace(snapshot.userMsg) == "" || strings.TrimSpace(snapshot.assistantMsg) == "" {
+		return nil, nil
+	}
+	if l.CurrentStateSnapshot != nil {
+		snapshot.sessionID = strings.TrimSpace(l.CurrentStateSnapshot().SessionID)
+	}
+	l.mu.RLock()
+	stillCurrentSession := l.autoCompactSessionGeneration == sessionGeneration
+	l.mu.RUnlock()
+	if !stillCurrentSession {
+		return nil, nil
+	}
+	if snapshot.sessionID != "" {
+		// A UUID remains stable in the frozen snapshot and unique after transcript
+		// compaction, /undo, session resume, or process restart. CountTurns is UI
+		// state, not a durable identity and can move backwards at those boundaries.
+		snapshot.sourceMessageID = snapshot.sessionID + "/message/" + uuid.NewString()
+	}
+	if err := snapshot.repository.RecordTurn(
+		ctx,
+		snapshot.sessionID,
+		snapshot.sourceMessageID,
+		snapshot.userMsg,
+		snapshot.assistantMsg,
+	); err != nil {
+		return nil, err
+	}
+	l.mu.RLock()
+	distillationEnabled := l.DistillEvery > 0
+	l.mu.RUnlock()
+	if distillationEnabled {
+		l.queuePendingDistillation(*snapshot)
+	}
+	return snapshot, nil
 }
 
 // lastExchange walks the message history backwards to find the most
@@ -2621,14 +3168,21 @@ func (l *Loop) maybeDistill() {
 func (l *Loop) lastExchange() (userMsg, asstMsg string) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	for i := len(l.Messages) - 1; i >= 0; i-- {
-		m := l.Messages[i]
+	return lastExchangeLocked(l.Messages)
+}
+
+func lastExchangeLocked(messages []llm.Message) (userMsg, asstMsg string) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
 		if m.Role == llm.RoleAssistant && asstMsg == "" {
 			asstMsg = textOf(m)
 			continue
 		}
 		if m.Role == llm.RoleUser && asstMsg != "" {
-			userMsg = textOf(m)
+			userMsg = visibleTextOf(m)
+			if userMsg == "" {
+				continue
+			}
 			return
 		}
 	}
@@ -2856,13 +3410,30 @@ func lastUserTextLocked(messages []llm.Message) string {
 		if m.Role != llm.RoleUser {
 			continue
 		}
-		t := textOf(m)
+		t := visibleTextOf(m)
 		if t == "" {
 			continue
 		}
 		return t
 	}
 	return ""
+}
+
+// visibleTextOf returns only person-authored text. Runtime attachments such
+// as <auto-retrieve> are persisted in user-role history for provider-prefix
+// caching, but must never recursively become the next retrieval query or a
+// newly distilled memory.
+func visibleTextOf(m llm.Message) string {
+	var parts []string
+	for _, b := range m.Content {
+		if b.Type != "text" || b.Text == "" || b.Synthetic {
+			continue
+		}
+		if text := transcript.VisibleUserText(b.Text); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // textOf concatenates all text-type ContentBlocks in a message,

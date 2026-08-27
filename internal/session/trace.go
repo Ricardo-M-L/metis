@@ -319,115 +319,160 @@ func (s *TraceStore) Events(sid string) []TraceEvent {
 // (event, depth) pairs.
 func (s *TraceStore) Trace(sid string) []TracedNode {
 	evs := s.Events(sid)
-	invocationOwners := make(map[string]TraceEvent)
-	callOwners := make(map[string]struct{})
-	for _, ev := range evs {
-		if isTraceInvocationOwnerStart(ev) {
-			invocationOwners[ev.TraceInvocationID] = ev
-		}
-		if isTraceToolOwnerStart(ev) && ev.TraceCallID != "" {
-			callOwners[ev.TraceCallID] = struct{}{}
-		}
+	if len(evs) == 0 {
+		return nil
 	}
-	byInvocation := map[string][]TraceEvent{}
-	byCall := map[string][]TraceEvent{}
-	byParent := map[string][]TraceEvent{}     // ParentID -> children
-	bySubAgentOf := map[string][]TraceEvent{} // SubAgentOf -> children
-	var roots []TraceEvent
-	for _, ev := range evs {
-		if isTraceInvocationOwnerStart(ev) {
-			if _, ok := invocationOwners[ev.TraceParentInvocationID]; ok {
-				byInvocation[ev.TraceParentInvocationID] = append(byInvocation[ev.TraceParentInvocationID], ev)
+
+	// New traces carry process-unique invocation/call IDs. Older persisted
+	// traces only have the provider's ToolUseID, which is not an identity:
+	// Gemini, for example, can emit gem_1 again in every model response. Build
+	// parent links against concrete start-event occurrences so a later reuse
+	// cannot move its result under the first occurrence.
+	invocationOwner := make(map[string]int)
+	callOwner := make(map[string]int)
+	latestLegacyOwner := make(map[string]int)
+	pendingLegacyOwners := make(map[string][]int)
+	legacyScopeByOwner := make(map[int]string)
+	children := make([][]int, len(evs))
+	parents := make([]int, len(evs))
+	for i := range parents {
+		parents[i] = -1
+	}
+
+	removePending := func(scope string, owner int) {
+		pending := pendingLegacyOwners[scope]
+		for i, candidate := range pending {
+			if candidate != owner {
+				continue
+			}
+			pending = append(pending[:i], pending[i+1:]...)
+			if len(pending) == 0 {
+				delete(pendingLegacyOwners, scope)
 			} else {
-				roots = append(roots, ev)
+				pendingLegacyOwners[scope] = pending
 			}
-			continue
-		}
-		if owner, ok := invocationOwners[ev.TraceInvocationID]; ok && isTraceInvocationOwnerResult(ev, owner) {
-			byInvocation[ev.TraceInvocationID] = append(byInvocation[ev.TraceInvocationID], ev)
-			continue
-		}
-		if ev.Kind == "tool_result" && ev.TraceCallID != "" {
-			if _, ok := callOwners[ev.TraceCallID]; ok {
-				byCall[ev.TraceCallID] = append(byCall[ev.TraceCallID], ev)
-				continue
-			}
-		}
-		if ev.TraceInvocationID != "" {
-			if _, ok := invocationOwners[ev.TraceInvocationID]; ok {
-				byInvocation[ev.TraceInvocationID] = append(byInvocation[ev.TraceInvocationID], ev)
-				continue
-			}
-		}
-		if ev.ParentID != "" {
-			key := traceParentKey(ev.TraceInvocationID, ev.ParentID)
-			byParent[key] = append(byParent[key], ev)
-		} else if ev.SubAgentOf != "" {
-			bySubAgentOf[ev.SubAgentOf] = append(bySubAgentOf[ev.SubAgentOf], ev)
-		} else {
-			roots = append(roots, ev)
-		}
-	}
-	var nodes []TracedNode
-	visited := make(map[string]struct{}, len(evs))
-	var walk func(ev TraceEvent, depth int)
-	walk = func(ev TraceEvent, depth int) {
-		key := traceEventKey(ev)
-		if _, ok := visited[key]; ok {
 			return
 		}
-		visited[key] = struct{}{}
-		nodes = append(nodes, TracedNode{Event: ev, Depth: depth})
+	}
+	oldestPending := func(scope string) (int, bool) {
+		pending := pendingLegacyOwners[scope]
+		if len(pending) > 0 {
+			return pending[0], true
+		}
+		owner, ok := latestLegacyOwner[scope]
+		return owner, ok
+	}
+
+	for i, ev := range evs {
+		parent := -1
+		resultOccurrence := -1
+
+		// Invocation owners must be classified before registering the current
+		// start, otherwise an owner would become its own parent.
 		if isTraceInvocationOwnerStart(ev) {
-			kids := byInvocation[ev.TraceInvocationID]
-			delete(byInvocation, ev.TraceInvocationID)
-			for _, child := range kids {
-				walk(child, depth+1)
+			if owner, ok := invocationOwner[ev.TraceParentInvocationID]; ok {
+				parent = owner
 			}
-			for _, child := range byCall[ev.TraceCallID] {
-				walk(child, depth+1)
+		} else if owner, ok := invocationOwner[ev.TraceInvocationID]; ok && isTraceInvocationOwnerResult(ev, evs[owner]) {
+			parent = owner
+			resultOccurrence = owner
+		} else if ev.Kind == "tool_result" && ev.TraceCallID != "" {
+			if owner, ok := callOwner[ev.TraceCallID]; ok {
+				parent = owner
+				resultOccurrence = owner
 			}
-			delete(byCall, ev.TraceCallID)
-			for _, child := range bySubAgentOf[ev.ToolUseID] {
-				walk(child, depth+1)
+		}
+
+		// Events produced by a child execution belong to that invocation even
+		// when their public ParentID is absent. This is the authoritative path
+		// for current trace files.
+		if parent < 0 && !isTraceInvocationOwnerStart(ev) && ev.TraceInvocationID != "" {
+			if owner, ok := invocationOwner[ev.TraceInvocationID]; ok {
+				parent = owner
 			}
-			delete(bySubAgentOf, ev.ToolUseID)
+		}
+
+		// Maintain an occurrence-aware fallback for old JSONL rows (and for a
+		// partially upgraded/crash-recovered call missing its internal IDs).
+		// Results consume starts FIFO, while other child events follow the most
+		// recent occurrence. The turn and invocation are part of the scope so a
+		// raw provider ID cannot cross either boundary.
+		legacyParentID := ev.ParentID
+		if legacyParentID == "" {
+			legacyParentID = ev.SubAgentOf
+		}
+		if legacyParentID == "" && ev.Kind == "tool_result" {
+			legacyParentID = ev.ToolUseID
+		}
+		legacyScope := ""
+		if legacyParentID != "" {
+			legacyScope = traceLegacyOccurrenceScope(ev, legacyParentID)
+		}
+		if ev.Kind == "tool_result" && legacyScope != "" && resultOccurrence < 0 {
+			if owner, ok := oldestPending(legacyScope); ok {
+				resultOccurrence = owner
+			}
+		}
+		if parent < 0 && legacyScope != "" {
+			if ev.Kind == "tool_result" && resultOccurrence >= 0 {
+				parent = resultOccurrence
+			} else if owner, ok := latestLegacyOwner[legacyScope]; ok {
+				parent = owner
+			}
+		}
+		if resultOccurrence >= 0 {
+			if scope := legacyScopeByOwner[resultOccurrence]; scope != "" {
+				removePending(scope, resultOccurrence)
+			}
+		}
+
+		parents[i] = parent
+		if parent >= 0 && parent < i {
+			children[parent] = append(children[parent], i)
+		} else {
+			// Malformed/partial persisted traces remain visible at root rather
+			// than being hidden by a missing or forward-pointing owner.
+			parents[i] = -1
+		}
+
+		if isTraceToolOwnerStart(ev) {
+			scope := traceLegacyOccurrenceScope(ev, ev.ToolUseID)
+			if scope != "" {
+				latestLegacyOwner[scope] = i
+				pendingLegacyOwners[scope] = append(pendingLegacyOwners[scope], i)
+				legacyScopeByOwner[i] = scope
+			}
+			if ev.TraceCallID != "" {
+				callOwner[ev.TraceCallID] = i
+			}
+		}
+		if isTraceInvocationOwnerStart(ev) {
+			invocationOwner[ev.TraceInvocationID] = i
+		}
+	}
+
+	var nodes []TracedNode
+	visited := make([]bool, len(evs))
+	var walk func(index, depth int)
+	walk = func(index, depth int) {
+		if index < 0 || index >= len(evs) || visited[index] {
 			return
 		}
-		// Only a tool_start owns children. Streaming tool_args and the
-		// eventual tool_result share its ToolUseID, but neither is a parent;
-		// letting an earlier args delta consume the key detaches the result
-		// from the actual call and can create a self-cycle on tool_result.
-		parentKey := ""
-		if isTraceToolOwnerStart(ev) {
-			for _, child := range byCall[ev.TraceCallID] {
-				walk(child, depth+1)
-			}
-			delete(byCall, ev.TraceCallID)
-			parentKey = traceParentKey(ev.TraceInvocationID, ev.ToolUseID)
-		}
-		kids := byParent[parentKey]
-		if parentKey != "" {
-			delete(byParent, parentKey)
-		}
-		for _, child := range kids {
-			walk(child, depth+1)
-		}
-		legacyParentKey := ev.ToolUseID
-		kids2 := bySubAgentOf[legacyParentKey]
-		delete(bySubAgentOf, legacyParentKey)
-		for _, child := range kids2 {
+		visited[index] = true
+		nodes = append(nodes, TracedNode{Event: evs[index], Depth: depth})
+		for _, child := range children[index] {
 			walk(child, depth+1)
 		}
 	}
-	for _, r := range roots {
-		walk(r, 0)
+	for i, parent := range parents {
+		if parent < 0 {
+			walk(i, 0)
+		}
 	}
-	// A partial/legacy trace can be missing an owner start (for example the
-	// process crashed after persisting a result). Never hide such rows from the
-	// trajectory; render every unconsumed event once at root depth.
-	for _, ev := range evs {
-		walk(ev, 0)
+	// Defensive compatibility for any malformed graph that escaped root
+	// classification: every persisted row is rendered exactly once.
+	for i := range evs {
+		walk(i, 0)
 	}
 	return nodes
 }
@@ -459,18 +504,11 @@ func isTraceChildToolName(name string) bool {
 	}
 }
 
-func traceParentKey(invocationID, toolUseID string) string {
+func traceLegacyOccurrenceScope(ev TraceEvent, toolUseID string) string {
 	if toolUseID == "" {
 		return ""
 	}
-	return invocationID + "\x00" + toolUseID
-}
-
-func traceEventKey(ev TraceEvent) string {
-	if ev.ID != "" {
-		return ev.ID
-	}
-	return fmt.Sprintf("%s\x00%d\x00%d\x00%s\x00%s", ev.SessionID, ev.Turn, ev.Sequence, ev.Kind, ev.ToolUseID)
+	return fmt.Sprintf("%s\x00%d\x00%s\x00%s", ev.SessionID, ev.Turn, ev.TraceInvocationID, toolUseID)
 }
 
 // TracedNode couples an event with its nesting depth in the trace tree.

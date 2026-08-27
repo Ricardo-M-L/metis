@@ -275,7 +275,7 @@ func renderDoctor(m *Model) string {
 		{Key: "mode", Value: string(m.gate.Mode())},
 		{Key: "tools", Value: fmt.Sprintf("%d registered", len(m.loop.Registry.All()))},
 	}
-	memDir := filepath.Join(config.Home(), "memories")
+	memDir := filepath.Join(config.Home(), "memory")
 	mems := "missing"
 	if entries, err := os.ReadDir(memDir); err == nil {
 		mems = fmt.Sprintf("%d files", len(entries))

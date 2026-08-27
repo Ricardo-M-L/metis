@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,24 +18,52 @@ type DailyNote struct {
 	Source    string `json:"source"`     // Command source (new/reset)
 	Summary   string `json:"summary"`    // Conversation summary
 	CreatedAt string `json:"created_at"` // RFC3339
+	UpdatedAt string `json:"updated_at"` // RFC3339
 }
 
 // DailyStore manages daily session notes.
 type DailyStore struct {
 	root string
+	mu   sync.RWMutex
 }
 
 // NewDailyStore creates a new DailyStore.
 func NewDailyStore(root string) (*DailyStore, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(root, 0o700)
 	return &DailyStore{root: root}, nil
 }
 
 // Save creates a new daily note file.
 // Filename format: YYYY-MM-DD-{slug}.md
 func (ds *DailyStore) Save(sessionID, source, summary string) error {
+	if ds == nil {
+		return nil
+	}
+	sanitizedSummary, err := sanitizePersistedText(summary)
+	if err != nil {
+		return err
+	}
+	// Session identity and lifecycle source are control metadata rather than
+	// prose. Never mutate them with a redaction marker: reject a credential-like
+	// value so deletion/tombstone identity remains exact.
+	if err := validatePersistedMetadata(sessionID, source); err != nil {
+		return err
+	}
+	repositoryRoot := repositoryRootForTier(ds.root, "daily")
+	return withRepositoryLock(repositoryRoot, func() error {
+		if err := rejectDeletedSessionLocked(repositoryRoot, sessionID); err != nil {
+			return err
+		}
+		ds.mu.Lock()
+		defer ds.mu.Unlock()
+		return ds.saveLocked(sessionID, source, sanitizedSummary)
+	})
+}
+
+func (ds *DailyStore) saveLocked(sessionID, source, summary string) error {
 	now := time.Now().UTC()
 	dateStr := now.Format("2006-01-02")
 	timeStr := now.Format("15:04:05")
@@ -44,11 +73,23 @@ func (ds *DailyStore) Save(sessionID, source, summary string) error {
 
 	filename := dateStr + "-" + slug + ".md"
 	path := filepath.Join(ds.root, filename)
+	createdAt := now.Format(time.RFC3339Nano)
+	// Desktop may persist the same live session at switch, shutdown, and
+	// process-exit boundaries. Upsert by session ID so those lifecycle hooks
+	// update one note instead of manufacturing duplicates.
+	if strings.TrimSpace(sessionID) != "" {
+		if existingPath, existing, ok := ds.findBySessionID(sessionID); ok {
+			path = existingPath
+			if existing.CreatedAt != "" {
+				createdAt = existing.CreatedAt
+			}
+		}
+	}
 	// Uniqueness guard: two saves in the same minute with the same/empty
 	// summary produce the same slug → the same filename → the second
 	// silently overwrote the first (losing a session's daily note). If the
 	// path is taken, disambiguate with the HHMMSS time, then a counter.
-	if _, err := os.Stat(path); err == nil {
+	if _, err := os.Stat(path); err == nil && !ds.pathBelongsToSession(path, sessionID) {
 		alt := dateStr + "-" + slug + "-" + strings.ReplaceAll(timeStr, ":", "") + ".md"
 		path = filepath.Join(ds.root, alt)
 		for i := 2; ; i++ {
@@ -71,6 +112,12 @@ func (ds *DailyStore) Save(sessionID, source, summary string) error {
 	sb.WriteString("\n")
 	sb.WriteString("- **Source**: ")
 	sb.WriteString(source)
+	sb.WriteString("\n")
+	sb.WriteString("- **Created At**: ")
+	sb.WriteString(createdAt)
+	sb.WriteString("\n")
+	sb.WriteString("- **Updated At**: ")
+	sb.WriteString(now.Format(time.RFC3339Nano))
 	sb.WriteString("\n\n")
 
 	if summary != "" {
@@ -79,8 +126,44 @@ func (ds *DailyStore) Save(sessionID, source, summary string) error {
 		sb.WriteString("\n")
 	}
 
-	return atomicWriteFile(path, sb.String(), 0o644)
+	return atomicWriteFile(path, sb.String(), 0o600)
 }
+
+func (ds *DailyStore) findBySessionID(sessionID string) (string, DailyNote, bool) {
+	entries, err := os.ReadDir(ds.root)
+	if err != nil {
+		return "", DailyNote{}, false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		path := filepath.Join(ds.root, entry.Name())
+		note, err := parseDailyNoteFile(path, entry)
+		if err == nil && note.SessionID == sessionID {
+			return path, note, true
+		}
+	}
+	return "", DailyNote{}, false
+}
+
+func (ds *DailyStore) pathBelongsToSession(path, sessionID string) bool {
+	if strings.TrimSpace(sessionID) == "" {
+		return false
+	}
+	entryInfo, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	entry := fileInfoDirEntry{entryInfo}
+	note, err := parseDailyNoteFile(path, entry)
+	return err == nil && note.SessionID == sessionID
+}
+
+type fileInfoDirEntry struct{ os.FileInfo }
+
+func (entry fileInfoDirEntry) Type() os.FileMode          { return entry.Mode().Type() }
+func (entry fileInfoDirEntry) Info() (os.FileInfo, error) { return entry.FileInfo, nil }
 
 // generateSlugFromSummary creates a URL-safe slug from summary text.
 // Falls back to HHMM timestamp if summary is empty or slug would be too long.
@@ -134,6 +217,8 @@ func cleanSlugWord(word string) string {
 
 // List returns all daily notes sorted by date (newest first).
 func (ds *DailyStore) List(limit int) ([]DailyNote, error) {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
 	entries, err := os.ReadDir(ds.root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -147,30 +232,10 @@ func (ds *DailyStore) List(limit int) ([]DailyNote, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
 		}
-		// Parse filename: YYYY-MM-DD-slug.md
-		name := strings.TrimSuffix(entry.Name(), ".md")
-		parts := strings.SplitN(name, "-", 4)
-		if len(parts) < 4 {
-			continue
+		note, err := parseDailyNoteFile(filepath.Join(ds.root, entry.Name()), entry)
+		if err == nil {
+			notes = append(notes, note)
 		}
-		// First 3 parts are date (YYYY-MM-DD), rest is slug
-		date := parts[0] + "-" + parts[1] + "-" + parts[2]
-		slug := parts[3]
-
-		info, _ := entry.Info()
-		var createdAt string
-		if info != nil {
-			createdAt = info.ModTime().Format(time.RFC3339)
-		}
-
-		notes = append(notes, DailyNote{
-			Date:      date,
-			Slug:      slug,
-			SessionID: "",
-			Source:    "",
-			Summary:   "",
-			CreatedAt: createdAt,
-		})
 	}
 
 	// Sort by date descending (newest first)
@@ -189,6 +254,48 @@ func (ds *DailyStore) List(limit int) ([]DailyNote, error) {
 		notes = notes[:limit]
 	}
 	return notes, nil
+}
+
+func parseDailyNoteFile(path string, entry os.DirEntry) (DailyNote, error) {
+	name := strings.TrimSuffix(entry.Name(), ".md")
+	parts := strings.SplitN(name, "-", 4)
+	if len(parts) < 4 {
+		return DailyNote{}, fmt.Errorf("invalid daily filename: %s", entry.Name())
+	}
+	note := DailyNote{Date: parts[0] + "-" + parts[1] + "-" + parts[2], Slug: parts[3]}
+	if info, err := entry.Info(); err == nil {
+		note.CreatedAt = info.ModTime().UTC().Format(time.RFC3339)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return DailyNote{}, err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	inSummary := false
+	var summary []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if inSummary {
+			summary = append(summary, line)
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "- **Session ID**:"):
+			note.SessionID = strings.TrimSpace(strings.TrimPrefix(trimmed, "- **Session ID**:"))
+		case strings.HasPrefix(trimmed, "- **Source**:"):
+			note.Source = strings.TrimSpace(strings.TrimPrefix(trimmed, "- **Source**:"))
+		case strings.HasPrefix(trimmed, "- **Created At**:"):
+			if value := strings.TrimSpace(strings.TrimPrefix(trimmed, "- **Created At**:")); value != "" {
+				note.CreatedAt = value
+			}
+		case strings.HasPrefix(trimmed, "- **Updated At**:"):
+			note.UpdatedAt = strings.TrimSpace(strings.TrimPrefix(trimmed, "- **Updated At**:"))
+		case trimmed == "## Conversation Summary":
+			inSummary = true
+		}
+	}
+	note.Summary = strings.TrimSpace(strings.Join(summary, "\n"))
+	return note, nil
 }
 
 // RecentSummary returns a single concatenated summary of the last

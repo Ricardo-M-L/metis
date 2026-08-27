@@ -383,5 +383,11 @@ func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt stri
 	if err := <-done; err != nil {
 		return "", err
 	}
+	// Each MCP request owns a fresh serialized runtime. Scope the durability
+	// barrier to that request's session ID so it can never join or flush a
+	// different request if the process serves multiple calls over its lifetime.
+	if err := rt.persistHeadlessMemoryBoundary("metis mcp-serve run_task", runtimeDistillationShutdownGrace); err != nil {
+		return "", err
+	}
 	return strings.TrimSpace(sb.String()), nil
 }

@@ -25,6 +25,30 @@ import (
 // passing.
 var exitFunc = os.Exit
 
+func (m *Model) armHardExitFallback() {
+	timer := time.NewTimer(800 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		resetTerminal(m.savedTermios)
+		exitFunc(0)
+	case <-m.hardExitCancel:
+		// Bubble Tea returned normally. RunTUI now owns the durability barrier;
+		// do not kill it while it joins/flushes memory workers.
+	}
+}
+
+func (m *Model) cancelHardExitFallback() {
+	if m == nil || m.hardExitCancel == nil {
+		return
+	}
+	select {
+	case <-m.hardExitCancel:
+	default:
+		close(m.hardExitCancel)
+	}
+}
+
 // expandableToolEventIDs returns chronological targets whose collapsed row
 // contains hidden diagnostics. Group rows expose one representative member ID;
 // buildChatItems expands the whole group when that ID is selected.
@@ -249,12 +273,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// otherwise the next mouse motion in the shell echoes raw
 		// `<col;row;buttonM` SGR reports (image bug 2026-05-15).
 		if !m.turnActive {
-			savedTermios := m.savedTermios
-			go func() {
-				time.Sleep(800 * time.Millisecond)
-				resetTerminal(savedTermios)
-				exitFunc(0)
-			}()
+			go m.armHardExitFallback()
 			return m, tea.Quit
 		}
 		// During an active turn, Ctrl-C cancels the turn (so the
@@ -289,12 +308,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.turnCancel()
 				m.turnCancel = nil
 			}
-			savedTermios := m.savedTermios
-			go func() {
-				time.Sleep(800 * time.Millisecond)
-				resetTerminal(savedTermios)
-				exitFunc(0)
-			}()
+			go m.armHardExitFallback()
 			return m, tea.Quit
 		}
 		m.lastCtrlC = time.Now()

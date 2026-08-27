@@ -73,6 +73,20 @@ func TestCurrentStrength_FutureLastAccessedNoBoost(t *testing.T) {
 	}
 }
 
+func TestCurrentStrength_UsesNewestActivityTimestamp(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	fm := &Frontmatter{
+		Strength:     1,
+		LastUsedAt:   now.Add(-2 * 365 * 24 * time.Hour).Format(time.RFC3339),
+		LastAccessed: "not-a-timestamp",
+		UpdatedAt:    now.Add(-24 * time.Hour).Format(time.RFC3339),
+	}
+	got := fm.CurrentStrength(now)
+	if got < 0.98 {
+		t.Fatalf("recent update lost to stale LastUsedAt: strength=%v, want near 1", got)
+	}
+}
+
 // TestMarkAccessed_ResetsBothFields — writing a memo should set
 // Strength=1.0 and LastAccessed=now, so the decay clock restarts.
 func TestMarkAccessed_ResetsBothFields(t *testing.T) {
@@ -87,7 +101,8 @@ func TestMarkAccessed_ResetsBothFields(t *testing.T) {
 	}
 }
 
-// TestDecayAndPrune_KeepsFreshDeletesStale — end-to-end:
+// TestDecayAndPrune_KeepsFreshDeletesStale — end-to-end for short-lived
+// project memory:
 //   - file A: just-written → kept
 //   - file B: 6 months untouched → pruned (decayed to ~0.05)
 //   - file C: 4 weeks untouched → kept (0.9^4 = 0.656)
@@ -100,7 +115,7 @@ func TestDecayAndPrune_KeepsFreshDeletesStale(t *testing.T) {
 		fm := &Frontmatter{
 			Name:         name,
 			Description:  "test " + name,
-			Type:         TypeFeedback,
+			Type:         TypeProject,
 			Strength:     1.0,
 			LastAccessed: lastAccessed.Format(time.RFC3339),
 		}
@@ -132,6 +147,137 @@ func TestDecayAndPrune_KeepsFreshDeletesStale(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "ancient.md")); !os.IsNotExist(err) {
 		t.Errorf("ancient.md should be deleted; stat err = %v", err)
+	}
+}
+
+func TestDecayAndPrune_DurableUserPreferenceSurvives(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	for _, typ := range []MemoryType{TypeUser, TypeFeedback} {
+		fm := &Frontmatter{
+			Name:         string(typ),
+			Description:  "durable " + string(typ),
+			Type:         typ,
+			Strength:     0.001,
+			LastAccessed: now.Add(-3 * 365 * 24 * time.Hour).Format(time.RFC3339),
+			LastUsedAt:   now.Add(-3 * 365 * 24 * time.Hour).Format(time.RFC3339),
+		}
+		out, err := RenderFile(fm, "keep this")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, string(typ)+".md"), out, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := DecayAndPrune(context.Background(), root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Pruned) != 0 || res.Kept != 2 {
+		t.Fatalf("durable memories must survive by default: %+v", res)
+	}
+}
+
+func TestDecayAndPrune_ProjectUsesLastUseAndUseCount(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	write := func(name string, useCount int) {
+		t.Helper()
+		fm := &Frontmatter{
+			Name:         name,
+			Description:  name,
+			Type:         TypeProject,
+			Strength:     1,
+			LastUsedAt:   now.Add(-180 * 24 * time.Hour).Format(time.RFC3339),
+			LastAccessed: now.Add(-180 * 24 * time.Hour).Format(time.RFC3339),
+			UseCount:     useCount,
+		}
+		out, _ := RenderFile(fm, name)
+		if err := os.WriteFile(filepath.Join(root, name+".md"), out, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("one_off", 1)
+	write("reused", 20)
+
+	res, err := DecayAndPrune(context.Background(), root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Pruned) != 1 || filepath.Base(res.Pruned[0]) != "one_off.md" {
+		t.Fatalf("expected only one-off project memo pruned, got %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(root, "reused.md")); err != nil {
+		t.Fatalf("frequently reused project memo should survive: %v", err)
+	}
+}
+
+func TestDecayAndPrune_ReferenceIsConservative(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	fm := &Frontmatter{
+		Name: "dashboard", Description: "external dashboard", Type: TypeReference,
+		Strength: 0.001, LastUsedAt: now.Add(-364 * 24 * time.Hour).Format(time.RFC3339),
+	}
+	out, _ := RenderFile(fm, "https://example.invalid")
+	if err := os.WriteFile(filepath.Join(root, "reference_dashboard.md"), out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := DecayAndPrune(context.Background(), root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Kept != 1 || len(res.Pruned) != 0 {
+		t.Fatalf("reference should be retained conservatively: %+v", res)
+	}
+}
+
+func TestDecayAndPrune_ContextExpiresLikeProjectState(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	fm := &Frontmatter{
+		Name: "old context", Description: "one-off operational state", Type: TypeContext,
+		Strength: 1, LastUsedAt: now.Add(-180 * 24 * time.Hour).Format(time.RFC3339), UseCount: 1,
+	}
+	out, _ := RenderFile(fm, "temporary state")
+	path := filepath.Join(root, "context_old.md")
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := DecayAndPrune(context.Background(), root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Pruned) != 1 || filepath.Base(res.Pruned[0]) != filepath.Base(path) {
+		t.Fatalf("stale context should expire like project state: %+v", res)
+	}
+}
+
+func TestDecayAndPrune_PinnedAndHighConfidenceSurvive(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	ancient := now.Add(-3 * 365 * 24 * time.Hour).Format(time.RFC3339)
+	tests := []struct {
+		name       string
+		extra      map[string]any
+		confidence float64
+		wantPrune  bool
+	}{
+		{name: "boolean pinned", extra: map[string]any{"pinned": true}, wantPrune: false},
+		{name: "string pinned", extra: map[string]any{"pinned": "ON"}, wantPrune: false},
+		{name: "high confidence", confidence: HighConfidenceRetentionThreshold, wantPrune: false},
+		{name: "ordinary abandoned project", confidence: DefaultConfidence, wantPrune: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fm := &Frontmatter{
+				Name: "project", Description: "project", Type: TypeProject,
+				Strength: 0.001, LastUsedAt: ancient, Confidence: tt.confidence, Extra: tt.extra,
+			}
+			if got := fm.ShouldPrune(now); got != tt.wantPrune {
+				t.Fatalf("ShouldPrune() = %v, want %v", got, tt.wantPrune)
+			}
+		})
 	}
 }
 

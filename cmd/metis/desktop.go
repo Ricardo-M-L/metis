@@ -41,7 +41,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		return launchNativeDesktop(cwd)
 	}
 
-	flags := &cliFlags{}
+	flags := &cliFlags{autoMemoryStartup: autoMemoryStartupDesktop}
 	presetName := "standard"
 	if prefs, prefErr := webui.LoadDesktopLaunchPreferences(); prefErr != nil {
 		fmt.Fprintf(os.Stderr, "metis desktop: preferences: %v (using Standard preset)\n", prefErr)
@@ -74,7 +74,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 			return rtpkg.BuildProvider(cfg, providerName, model)
 		},
 		SessionBoundary: rt.releaseSessionWork,
-		SessionSwitch:   rt.rebindSession,
+		SessionSwitch:   rt.rebindSessionAt,
 		OpenWorkspace:   launchNativeDesktop,
 		OpenPath:        desktop.OpenPath,
 		Plugins:         rt.plugins,

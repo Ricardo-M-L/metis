@@ -554,6 +554,18 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// pre-G.0 behavior used by unit tests that construct Agent directly.
 	runInBackground, _ := in["run_in_background"].(bool)
 	var teammate *agent.Teammate
+	// Execute owns roster cleanup from the instant Register succeeds until a
+	// child runner has actually started. This includes background setup: profile
+	// lookup and the remaining sub-loop construction can still fail after the
+	// slot is consumed, and no goroutine exists yet to unregister it. The
+	// ownership guard prevents those early returns from leaking a live teammate
+	// (and its done channel) forever.
+	rosterCleanupOwnedByExecute := false
+	defer func() {
+		if rosterCleanupOwnedByExecute && a.roster != nil {
+			a.roster.UnregisterTeammate(teammate)
+		}
+	}()
 	if a.roster != nil {
 		// G.4 — resumed sub-agents keep their original AgentID so the
 		// transcript file path is stable across resume cycles.
@@ -608,12 +620,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			}
 			return &tools.Result{Output: err.Error(), IsError: true}, nil
 		}
-		// Background sub-agents detach from Execute's lifetime; the
-		// spawned goroutine takes ownership of Unregister. Foreground
-		// callers unregister here when Execute returns.
-		if !runInBackground {
-			defer a.roster.UnregisterTeammate(teammate)
-		}
+		rosterCleanupOwnedByExecute = true
 	}
 
 	// Sub-loop construction is identical in both paths.
@@ -926,7 +933,19 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// as soon as the parent tool_result arrives.
 	agent.TraceInvocationStarted(ctx)
 	if runInBackground {
-		return a.executeBackground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk, parentNotify)
+		return a.executeBackground(
+			sub,
+			childCtx,
+			cancel,
+			parentOut,
+			parentToolUseID,
+			teammate,
+			timeout,
+			transcript,
+			persistedOnDisk,
+			parentNotify,
+			func() { rosterCleanupOwnedByExecute = false },
+		)
 	}
 	return a.executeForeground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
 }
@@ -1145,6 +1164,7 @@ func (a Agent) executeBackground(
 	transcript *agent.SubAgentTranscript,
 	persistedOnDisk int,
 	parentNotify chan<- agent.SubAgentNotification,
+	onRunnerStarted func(),
 ) (*tools.Result, error) {
 	if teammate == nil {
 		// No Roster wired — graceful fallback to foreground so callers
@@ -1230,6 +1250,12 @@ func (a Agent) executeBackground(
 		}
 		notifyParent(parentNotify, teammate, time.Since(startedAt))
 	}()
+	// The detached runner now owns teammate cleanup. Handoff only after the
+	// goroutine exists, so any panic or return before this point leaves cleanup
+	// with Execute's guard instead of leaking (or double-unregistering) the slot.
+	if onRunnerStarted != nil {
+		onRunnerStarted()
+	}
 
 	return &tools.Result{
 		Output: fmt.Sprintf(

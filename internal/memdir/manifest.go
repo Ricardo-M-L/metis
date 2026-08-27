@@ -45,7 +45,7 @@ func FormatManifest(root string, files []MemoryFile) string {
 		}
 		t := f.Frontmatter.Type
 		switch t {
-		case TypeUser, TypeFeedback, TypeProject, TypeReference:
+		case TypeUser, TypeFeedback, TypeProject, TypeContext, TypeReference:
 			buckets[t] = append(buckets[t], f)
 		default:
 			unclass = append(unclass, f)
@@ -54,7 +54,7 @@ func FormatManifest(root string, files []MemoryFile) string {
 
 	var sb strings.Builder
 	totalKnown := len(buckets[TypeUser]) + len(buckets[TypeFeedback]) +
-		len(buckets[TypeProject]) + len(buckets[TypeReference])
+		len(buckets[TypeProject]) + len(buckets[TypeContext]) + len(buckets[TypeReference])
 	fmt.Fprintf(&sb, "%s: %d memories", root, len(files))
 	parts := []string{}
 	if n := len(buckets[TypeUser]); n > 0 {
@@ -65,6 +65,9 @@ func FormatManifest(root string, files []MemoryFile) string {
 	}
 	if n := len(buckets[TypeProject]); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d project", n))
+	}
+	if n := len(buckets[TypeContext]); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d context", n))
 	}
 	if n := len(buckets[TypeReference]); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d reference", n))
@@ -80,7 +83,7 @@ func FormatManifest(root string, files []MemoryFile) string {
 	}
 	sb.WriteString("\n\n")
 
-	order := []MemoryType{TypeUser, TypeFeedback, TypeProject, TypeReference}
+	order := []MemoryType{TypeUser, TypeFeedback, TypeProject, TypeContext, TypeReference}
 	for _, t := range order {
 		section := buckets[t]
 		if len(section) == 0 {

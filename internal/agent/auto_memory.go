@@ -34,6 +34,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,9 +45,11 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
+	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memdir"
 	"github.com/Ricardo-M-L/metis/internal/memory"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // AutoMemoryEvery legacy constant — kept so the v1 callers compile,
@@ -102,6 +106,40 @@ type DreamNotification struct {
 	Err          error
 }
 
+// AutoMemorySource is provenance supplied by the surface that owns the
+// session. SessionID/MessageID are optional because older transcripts do not
+// expose stable message IDs. Scope normally is "user" or "project".
+type AutoMemorySource struct {
+	SessionID  string
+	MessageID  string
+	Scope      string
+	Confidence float64
+}
+
+// autoMemoryRun is the immutable payload queued at a LoopEnd boundary.
+// Desktop reuses one Loop while switching sessions, so background work must
+// never consult that live Loop for history, provider settings, or provenance
+// after OnLoopEnd returns.
+type autoMemoryRun struct {
+	cache                 *CacheSafeParams
+	source                AutoMemorySource
+	history               []llm.Message
+	historyLen            int
+	registry              *tools.Registry
+	hooks                 *HookRegistry
+	memory                memory.Repository
+	shortToolDescriptions bool
+}
+
+// MemoryInvalidation describes on-disk topic changes after privacy,
+// retention, index regeneration, and permission normalization have finished.
+// Callers can use this to invalidate a cached short index without importing
+// the repository package here.
+type MemoryInvalidation struct {
+	Root    string
+	Changed []string
+}
+
 // AutoMemoryExtractor is the long-lived helper attached to a Loop. It
 // owns the cursor + in-flight + pending state that openclaude calls
 // "closure-scoped state" — keeping it on the Loop (not module-global)
@@ -121,10 +159,28 @@ type AutoMemoryExtractor struct {
 	// during a fork stashes its context as `pending` and runs once the
 	// current one finishes (trailing run pattern).
 	inProgress bool
+	// idleCh is open for exactly one continuous busy interval and closed when
+	// its final (including trailing) extraction has finished every disk write.
+	// WaitIdle snapshots this channel so Desktop shutdown/session deletion can
+	// join background auto-memory without polling extractor internals.
+	idleCh chan struct{}
 
 	// pending is the latest stashed turn awaiting a trailing run.
-	// nil when nothing's queued.
+	// false when nothing is queued.
 	pending bool
+	// pendingRun owns the frozen request/session snapshot for pending. A bool
+	// alone is unsafe because the live Loop may be rebound before the trailing
+	// extraction starts.
+	pendingRun *autoMemoryRun
+	// flushPending is set by the lifecycle join path. It bypasses only the
+	// in-memory time throttle (never the safety/dream gates) so the last frozen
+	// completed turn is durable before Desktop/CLI shutdown returns.
+	flushPending bool
+
+	// processedBySession keeps extraction cursors session-scoped. The public
+	// lastProcessedIdx remains the most recently completed cursor for /dream
+	// status, but must not be reused after Desktop switches conversations.
+	processedBySession map[string]int
 
 	// lastFiredAt rate-limits extractions even when the user fires
 	// turns rapidly — without this an "ok / ok / ok" exchange would
@@ -196,6 +252,12 @@ type AutoMemoryExtractor struct {
 	// the three-stage gate and goes straight to the in-memory throttle
 	// + inProgress check. Set via setDreamGateBypass.
 	dreamGateBypass bool
+
+	// source is optional provenance for files created or refreshed by the
+	// next dream cycle. invalidate is called only after disk post-processing
+	// completes and is never invoked while e.mu is held.
+	source     AutoMemorySource
+	invalidate func(MemoryInvalidation)
 }
 
 // NewAutoMemoryExtractor wires an extractor to a loop. memdirRoot
@@ -225,11 +287,15 @@ func NewAutoMemoryExtractor(loop *Loop, memdirRoot, skillsDir string) (*AutoMemo
 	if skillsDir == "" {
 		skillsDir = userSkillsDirDefault()
 	}
-	return &AutoMemoryExtractor{
+	ext := &AutoMemoryExtractor{
 		loop:       loop,
 		memdirRoot: memdirRoot,
 		skillsDir:  skillsDir,
-	}, nil
+	}
+	loop.mu.Lock()
+	loop.autoMemExtractor = ext
+	loop.mu.Unlock()
+	return ext, nil
 }
 
 // MemdirRoot returns the resolved memdir path the extractor writes
@@ -243,6 +309,25 @@ func (e *AutoMemoryExtractor) MemdirRoot() string { return e.memdirRoot }
 func (e *AutoMemoryExtractor) SetDreamNotify(ch chan<- DreamNotification) {
 	e.mu.Lock()
 	e.dreamNotify = ch
+	e.mu.Unlock()
+}
+
+// SetSourceMetadata supplies provenance for subsequent extraction cycles.
+// Passing a zero value clears explicit provenance; the extractor will still
+// derive SessionID from CurrentStateSnapshot and default to project scope for
+// repository-side binding to the active workspace.
+func (e *AutoMemoryExtractor) SetSourceMetadata(source AutoMemorySource) {
+	e.mu.Lock()
+	e.source = source
+	e.mu.Unlock()
+}
+
+// SetInvalidationHook registers a repository/cache invalidation callback.
+// The callback must return promptly. Panics are recovered so a consumer bug
+// cannot wedge the dream lifecycle or leave its cross-process lock held.
+func (e *AutoMemoryExtractor) SetInvalidationHook(hook func(MemoryInvalidation)) {
+	e.mu.Lock()
+	e.invalidate = hook
 	e.mu.Unlock()
 }
 
@@ -305,6 +390,103 @@ func (e *AutoMemoryExtractor) Stats() ExtractorStats {
 	}
 }
 
+// WaitIdle flushes the latest throttled pending snapshot, then blocks until the
+// running extraction and every trailing run complete their full filesystem
+// lifecycle. This is the Desktop/CLI shutdown durability boundary: a natural
+// final turn must not be discarded merely because it landed inside the normal
+// conversational rate-limit window.
+func (e *AutoMemoryExtractor) WaitIdle(ctx context.Context) error {
+	if e == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		var start *autoMemoryRun
+		e.mu.Lock()
+		if !e.inProgress {
+			if e.pending && e.pendingRun != nil {
+				start = e.pendingRun
+				e.pending = false
+				e.pendingRun = nil
+				e.flushPending = false
+				if e.mainAgentTouchedMemdirSinceLocked(start) {
+					e.advanceCursorLocked(start)
+					e.mu.Unlock()
+					continue
+				}
+				e.markInProgressLocked()
+				e.lastFiredAt = time.Now()
+			} else {
+				e.mu.Unlock()
+				return nil
+			}
+		} else if e.pending && e.pendingRun != nil {
+			// The current run's defer consumes the exact frozen pendingRun even
+			// when AutoMemoryMinInterval has not elapsed.
+			e.flushPending = true
+		}
+		if e.idleCh == nil {
+			e.idleCh = make(chan struct{})
+		}
+		idle := e.idleCh
+		e.mu.Unlock()
+		if start != nil {
+			incInflight()
+			go func(run *autoMemoryRun) {
+				defer decInflight()
+				e.runOnceWithEvents(context.Background(), nil, run)
+			}(start)
+		}
+
+		select {
+		case <-idle:
+			// Re-check under the lock: a trailing run deliberately keeps one
+			// busy interval, while a brand-new extraction may have started.
+			continue
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// WaitAutoMemoryIdle is the Loop-level lifecycle API used by Desktop/CLI
+// owners that do not retain the extractor returned during startup.
+func (l *Loop) WaitAutoMemoryIdle(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.RLock()
+	ext := l.autoMemExtractor
+	l.mu.RUnlock()
+	if ext == nil {
+		return nil
+	}
+	return ext.WaitIdle(ctx)
+}
+
+func (e *AutoMemoryExtractor) markInProgressLocked() {
+	if e.inProgress {
+		return
+	}
+	e.inProgress = true
+	if e.idleCh == nil {
+		e.idleCh = make(chan struct{})
+	}
+}
+
+func (e *AutoMemoryExtractor) markIdleLocked() {
+	if !e.inProgress {
+		return
+	}
+	e.inProgress = false
+	if e.idleCh != nil {
+		close(e.idleCh)
+		e.idleCh = nil
+	}
+}
+
 // OnLoopEnd is the hook entry point — wire it onto Loop.Hooks via
 // pubhook.LoopEndHandler so it fires at every natural turn boundary.
 //
@@ -325,10 +507,31 @@ func (e *AutoMemoryExtractor) OnLoopEnd(ctx context.Context, stop string) {
 		return
 	}
 
-	// Three-stage dream gate (Phase A, 2026-05-16). Runs BEFORE the
-	// in-memory inProgress / lastFiredAt throttle because those are
-	// per-process; the dream lock + time gate are durable across
-	// process restarts and multi-window sessions. Order is intentional:
+	// Freeze the complete fork request and its provenance on the foreground
+	// LoopEnd boundary before consulting the durable dream schedule. An active
+	// extraction has already moved .dream-lock's mtime to "now", so evaluating
+	// the durable time gate first would return "too-soon" and discard this
+	// completed turn instead of preserving it for the active run's trailing
+	// extraction. Desktop may also ResetSession immediately after this method
+	// returns; no asynchronous path below may read history or source identity
+	// from the rebound Loop.
+	run := e.captureRun()
+
+	e.mu.Lock()
+	if e.inProgress {
+		// An in-flight extraction takes precedence over the durable scheduling
+		// gates: stash the latest immutable snapshot for its trailing run. This
+		// does not permit a new independent launch to bypass those gates.
+		e.pending = true
+		e.pendingRun = run
+		e.mu.Unlock()
+		return
+	}
+	e.mu.Unlock()
+
+	// Three-stage dream gate (Phase A, 2026-05-16). New independent
+	// launches pass through the cross-process dream lock + durable time gate
+	// before the per-process lastFiredAt throttle. Order is intentional:
 	//   1. mtime stat (~free) → time gate
 	//   2. in-mem timestamp compare → scan throttle
 	//   3. ReadDir walk → session count gate
@@ -354,18 +557,27 @@ func (e *AutoMemoryExtractor) OnLoopEnd(ctx context.Context, stop string) {
 		if decision.Scanned {
 			e.lastScanAt = time.Now()
 		}
-		e.mu.Unlock()
-
 		if !decision.Fire {
+			// Another LoopEnd can start an extraction while this caller is
+			// evaluating the filesystem-backed gate. Preserve this caller's
+			// already-frozen turn if that happened; otherwise this is a true
+			// independent launch and the durable gate remains authoritative.
+			if e.inProgress {
+				e.pending = true
+				e.pendingRun = run
+			}
+			e.mu.Unlock()
 			return
 		}
+		e.mu.Unlock()
 	}
 
 	e.mu.Lock()
 	if e.inProgress {
 		// Stash and bail — the in-flight extractor will pick up our
-		// changes via its trailing run.
+		// latest immutable snapshot via its trailing run.
 		e.pending = true
+		e.pendingRun = run
 		e.mu.Unlock()
 		return
 	}
@@ -375,22 +587,25 @@ func (e *AutoMemoryExtractor) OnLoopEnd(ctx context.Context, stop string) {
 		// chances forever just because they fired turns fast early on.
 		// We mark pending so the next post-throttle turn flushes.
 		e.pending = true
+		e.pendingRun = run
 		e.mu.Unlock()
 		return
 	}
-	if e.mainAgentTouchedMemdirSinceLocked() {
+	if e.mainAgentTouchedMemdirSinceLocked(run) {
 		// Mutual exclusion: when the main agent (the user driving the
 		// session, with a model that may have memdir-aware system
 		// prompts) wrote to memdir directly, skip the fork to avoid
 		// double-writing the same insight in two flavours. Advance
 		// the cursor so future runs only consider messages after this
 		// point.
-		e.advanceCursorLocked()
+		e.advanceCursorLocked(run)
 		e.mu.Unlock()
 		return
 	}
-	e.inProgress = true
+	e.markInProgressLocked()
 	e.lastFiredAt = time.Now()
+	e.pending = false
+	e.pendingRun = nil
 	e.mu.Unlock()
 
 	// Detach: the hook return must not be blocked by the fork. The
@@ -412,7 +627,7 @@ func (e *AutoMemoryExtractor) OnLoopEnd(ctx context.Context, stop string) {
 	incInflight()
 	go func() {
 		defer decInflight()
-		e.runOnceWithEvents(ctx, eventOut)
+		e.runOnceWithEvents(ctx, eventOut, run)
 	}()
 }
 
@@ -430,15 +645,15 @@ func (e *AutoMemoryExtractor) OnLoopEnd(ctx context.Context, stop string) {
 // (extracted from the parent ctx before detach() strips values).
 // Backwards-compatible runOnce wrapper kept for tests that haven't
 // migrated yet.
-func (e *AutoMemoryExtractor) runOnceWithEvents(parentCtx context.Context, eventOut chan<- Event) {
-	e.runOnceInner(parentCtx, eventOut)
+func (e *AutoMemoryExtractor) runOnceWithEvents(parentCtx context.Context, eventOut chan<- Event, run *autoMemoryRun) {
+	e.runOnceInner(parentCtx, eventOut, run)
 }
 
 func (e *AutoMemoryExtractor) runOnce(parentCtx context.Context) {
-	e.runOnceInner(parentCtx, EventOutFromContext(parentCtx))
+	e.runOnceInner(parentCtx, EventOutFromContext(parentCtx), e.captureRun())
 }
 
-func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut chan<- Event) {
+func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut chan<- Event, run *autoMemoryRun) {
 	// Phase C — announce dreaming start on the TUI channel. Spinner
 	// override pins to "Dreaming..." in the TUI's handler.
 	if eventOut != nil {
@@ -464,6 +679,10 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	if dl != nil {
 		var err error
 		priorMtime, lockHeld, err = dl.TryAcquire()
+		// DreamLock predates private memory-tree permissions and creates
+		// the marker as 0644. Normalize it immediately even when another
+		// process wins the advisory race and this extractor returns early.
+		_ = os.Chmod(dl.Path(), 0o600)
 		if err != nil || !lockHeld {
 			if os.Getenv("METIS_AUTO_MEMORY_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "[auto-memory] lock-acquire failed: held=%v err=%v\n", lockHeld, err)
@@ -472,7 +691,7 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 			// rather than stuck behind an inProgress=true that never
 			// clears.
 			e.mu.Lock()
-			e.inProgress = false
+			e.markIdleLocked()
 			e.mu.Unlock()
 			return
 		}
@@ -483,7 +702,11 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// Use Background — the scan is filesystem-only and ms-fast, and
 	// we don't want parentCtx cancellation to leave us with a
 	// half-computed diff that wrongly attributes files as "touched".
-	pre, _ := snapshotMemdirNames(context.Background(), e.memdirRoot)
+	pre, _ := snapshotMemdirState(context.Background(), e.memdirRoot)
+	source := AutoMemorySource{}
+	if run != nil {
+		source = run.source
+	}
 	// Phase B/C — snapshot the user skills dir too so the dream-end
 	// summary can announce "+N skills" (SkillSynth writes here, not
 	// into memdir). Empty preSkills when the dir doesn't exist —
@@ -517,8 +740,8 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	defer finishDreamLock()
 	defer func() {
 		duration := time.Since(startedAt)
-		post, _ := snapshotMemdirNames(context.Background(), e.memdirRoot)
-		touched := diffMemdirNames(pre, post)
+		post, _ := snapshotMemdirState(context.Background(), e.memdirRoot)
+		touched := diffMemdirState(pre, post)
 
 		// Post-extraction hygiene pass (2026-05-20):
 		//
@@ -540,14 +763,36 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 		// e.lastErr but don't abort the dream cycle.
 		processedRoot := e.memdirRoot
 		if processedRoot != "" {
-			fixupTouchedMemos(processedRoot, touched)
-			if sweep, err := memdir.DecayAndPrune(context.Background(), processedRoot, time.Now()); err == nil {
-				// Treat pruned files as "touched" so the
-				// summary reflects them — user sees "memos: 2
-				// rewritten, 1 pruned" instead of an opaque
-				// gap.
-				touched = append(touched, sweep.Pruned...)
+			if run != nil && run.memory != nil {
+				maintenance, err := run.memory.MaintainTopics(context.Background(), memory.TopicMaintenanceRequest{
+					Touched: touched,
+					Source:  autoMemoryTopicSource(source),
+					Now:     time.Now(),
+				})
+				if err != nil {
+					runErr = errors.Join(runErr, err)
+				}
+				for _, path := range maintenance.Pruned {
+					touched = append(touched, filepath.Base(path))
+				}
+			} else {
+				// Nil-repository fallback is retained for isolated unit tests. Every
+				// production runtime provides the canonical repository so privacy,
+				// decay, index updates, and deletion share one durable transaction.
+				fixupTouchedMemosWithMetadata(processedRoot, touched, source)
+				if sweep, err := memdir.DecayAndPrune(context.Background(), processedRoot, time.Now()); err == nil {
+					// Treat pruned files as "touched" so the
+					// summary reflects them — user sees "memos: 2
+					// rewritten, 1 pruned" instead of an opaque
+					// gap.
+					for _, path := range sweep.Pruned {
+						touched = append(touched, filepath.Base(path))
+					}
+				}
+				_ = regenerateIndex(context.Background(), processedRoot)
 			}
+			touched = uniqueSortedNames(touched)
+			_ = memdir.SecurePermissions(processedRoot)
 		}
 
 		// 3. Skills-side mirror of the memdir decay above. SkillSynth
@@ -566,14 +811,23 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 		// tests can use the idle transition as a real lifecycle barrier rather
 		// than racing TempDir cleanup against .dream-lock Release/Rollback.
 		finishDreamLock()
+		e.notifyInvalidation(touched)
 
 		e.mu.Lock()
-		e.inProgress = false
 		e.phase = DreamPhaseDone
 		e.lastDuration = duration
 		e.lastFilesTouched = touched
-		shouldTrail := e.pending
-		e.pending = false
+		var trailing *autoMemoryRun
+		if e.pending && e.pendingRun != nil && (e.flushPending || time.Since(e.lastFiredAt) >= AutoMemoryMinInterval) {
+			trailing = e.pendingRun
+			e.pending = false
+			e.pendingRun = nil
+			e.flushPending = false
+			e.lastFiredAt = time.Now()
+		}
+		if trailing == nil {
+			e.markIdleLocked()
+		}
 		notifyCh := e.dreamNotify
 		sessionCount := e.totalExtractions
 		e.mu.Unlock()
@@ -610,13 +864,11 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 			}
 		}
 
-		if shouldTrail {
-			// Re-enter synchronously on a fresh background ctx. OnLoopEnd
-			// itself remains non-blocking and starts a fork goroutine only
-			// when the gates allow it. Keeping the handoff in this goroutine
-			// prevents an orphan scheduler goroutine from starting after an
-			// observer has already seen both idle state and zero inflight forks.
-			e.OnLoopEnd(context.Background(), "end_turn")
+		if trailing != nil {
+			// Re-enter synchronously with the exact pending LoopEnd snapshot.
+			// Re-reading the live Loop here would splice a newly-selected Desktop
+			// session into the earlier queued extraction.
+			e.runOnceInner(context.Background(), eventOut, trailing)
 		}
 	}()
 
@@ -625,7 +877,10 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	ctx, cancel := context.WithTimeout(detach(parentCtx), 90*time.Second)
 	defer cancel()
 
-	snap := SnapshotForFork(e.loop)
+	var snap *CacheSafeParams
+	if run != nil {
+		snap = run.cache
+	}
 	if snap == nil {
 		runErr = fmt.Errorf("snapshot returned nil")
 		return
@@ -643,7 +898,12 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// runtime through Loop would be invasive; newly-synthesized skills
 	// become visible on the next metis launch. Acceptable for Phase B.
 	userSkillsDir := e.skillsDir
-	dreamReg := buildDreamRegistry(e.loop.Registry, userSkillsDir, nil)
+	dreamReg := buildDreamRegistry(run.registry, userSkillsDir, nil)
+	// The general-purpose Write/Edit tools commit before auto-memory's deferred
+	// privacy pass. Replace them inside this fork only so complete memos are
+	// redacted, threat-checked, validated, and atomically written as 0600. The
+	// skills-side SkillSynth tool remains unchanged.
+	dreamReg = secureAutoMemoryRegistry(dreamReg, e.memdirRoot, source, run.memory)
 
 	// CRITICAL (Phase B fix 2026-05-16): the fork's LLM request reads
 	// p.Cache.ToolSpecs as the tool *schema list* it shows the model;
@@ -653,8 +913,8 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// which is exactly what we observed in the first end-to-end run
 	// (memory was written, ~/.metis/skills/ stayed empty). Rebuild
 	// the specs from dreamReg so the schema list matches the registry.
-	if dreamReg != e.loop.Registry {
-		snap.ToolSpecs = toolSpecsFromRegistry(dreamReg, e.loop.ShortToolDescriptions)
+	if dreamReg != run.registry {
+		snap.ToolSpecs = toolSpecsFromRegistry(dreamReg, run.shortToolDescriptions)
 	}
 
 	// List user skills NOW (Orient phase input) so the prompt can show
@@ -681,9 +941,9 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 		CanUseTool: gate,
 		Registry:   dreamReg,
 		MaxTurns:   MaxExtractorTurns,
-		Hooks:      e.loop.Hooks,
+		Hooks:      run.hooks,
 		ForkLabel:  "extract_memories",
-		Memory:     e.loop.Memory,
+		Memory:     run.memory,
 	})
 	if os.Getenv("METIS_AUTO_MEMORY_DEBUG") == "1" {
 		if err != nil {
@@ -708,7 +968,7 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	e.setPhase(DreamPhaseWriting)
 	e.mu.Lock()
 	e.totalExtractions++
-	e.advanceCursorLocked()
+	e.advanceCursorLocked(run)
 	e.mu.Unlock()
 
 	// Refresh the index AFTER the fork wrote any new files. The model
@@ -716,9 +976,15 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// memdir, including the index), but regenerating from disk gives
 	// us a canonical, sorted, dedup'd version that's robust to the
 	// model writing `* foo` instead of `- [foo](foo.md)`.
-	if err := regenerateIndex(ctx, e.memdirRoot); err != nil {
+	var refreshErr error
+	if run != nil && run.memory != nil {
+		refreshErr = run.memory.RefreshTopics(ctx)
+	} else {
+		refreshErr = regenerateIndex(ctx, e.memdirRoot)
+	}
+	if refreshErr != nil {
 		// Non-fatal: the next extraction will retry.
-		_ = err
+		_ = refreshErr
 	}
 
 	// Optional: stamp the result for analytics. logEvent isn't wired
@@ -737,33 +1003,286 @@ func (e *AutoMemoryExtractor) setPhase(p DreamPhase) {
 	e.mu.Unlock()
 }
 
-// snapshotMemdirNames returns the set of `.md` basenames under root
-// at the time of the call. Used by runOnce to compute which files
-// the fork touched (created / modified). Filenames only — we don't
-// keep mtimes because the diff cares about presence, and Edit can
-// rewrite a file with identical content.
-func snapshotMemdirNames(ctx context.Context, root string) (map[string]struct{}, error) {
+// prepareAutoMemoryPrefix removes provider-facing runtime attachments before
+// the transcript is shown to the extraction fork. In the normal path these
+// attachments are flagged Synthetic, while VisibleUserText also protects
+// restored histories written before that flag existed (or mixed text blocks
+// containing both the person's prompt and an <auto-retrieve> suffix).
+func prepareAutoMemoryPrefix(messages []llm.Message) []llm.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]llm.Message, 0, len(messages))
+	for _, message := range messages {
+		cloned := message
+		cloned.Content = make([]llm.ContentBlock, 0, len(message.Content))
+		for _, block := range message.Content {
+			if block.Synthetic {
+				continue
+			}
+			block = cloneAutoMemoryContentBlock(block)
+			if message.Role == llm.RoleUser && block.Type == "text" {
+				block.Text = transcript.VisibleUserText(block.Text)
+				if block.Text == "" {
+					continue
+				}
+			}
+			cloned.Content = append(cloned.Content, block)
+		}
+		if len(cloned.Content) == 0 {
+			continue
+		}
+		out = append(out, cloned)
+	}
+	return out
+}
+
+func cloneAutoMemoryMessages(messages []llm.Message) []llm.Message {
+	if messages == nil {
+		return nil
+	}
+	out := make([]llm.Message, len(messages))
+	for i, message := range messages {
+		out[i] = message
+		out[i].Content = make([]llm.ContentBlock, len(message.Content))
+		for j, block := range message.Content {
+			out[i].Content[j] = cloneAutoMemoryContentBlock(block)
+		}
+	}
+	return out
+}
+
+func cloneAutoMemoryContentBlock(block llm.ContentBlock) llm.ContentBlock {
+	block.ToolInput = cloneAutoMemoryMap(block.ToolInput)
+	block.Presentation = cloneAutoMemoryMap(block.Presentation)
+	if block.ProviderHint != nil {
+		block.ProviderHint = cloneStringMap(block.ProviderHint)
+	}
+	if block.ToolResultBlocks != nil {
+		children := make([]llm.ContentBlock, len(block.ToolResultBlocks))
+		for i, child := range block.ToolResultBlocks {
+			children[i] = cloneAutoMemoryContentBlock(child)
+		}
+		block.ToolResultBlocks = children
+	}
+	return block
+}
+
+func cloneAutoMemoryMap(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		switch typed := value.(type) {
+		case map[string]any:
+			out[key] = cloneAutoMemoryMap(typed)
+		case []any:
+			items := make([]any, len(typed))
+			for i, item := range typed {
+				if child, ok := item.(map[string]any); ok {
+					items[i] = cloneAutoMemoryMap(child)
+				} else {
+					items[i] = item
+				}
+			}
+			out[key] = items
+		default:
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]string, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func (e *AutoMemoryExtractor) captureRun() *autoMemoryRun {
+	snap := SnapshotForFork(e.loop)
+	run := &autoMemoryRun{cache: snap}
+	if snap != nil {
+		run.history = cloneAutoMemoryMessages(snap.PrefixMessages)
+		run.historyLen = len(snap.PrefixMessages)
+		// Runtime recall is provider-facing synthetic user content, not user
+		// evidence. Filter it now, before this snapshot is handed to a
+		// background goroutine or the parent history can be rebound/mutated.
+		snap.PrefixMessages = prepareAutoMemoryPrefix(run.history)
+	}
+
+	if e.loop != nil {
+		e.loop.mu.RLock()
+		run.registry = e.loop.Registry
+		run.hooks = e.loop.Hooks
+		run.memory = e.loop.Memory
+		run.shortToolDescriptions = e.loop.ShortToolDescriptions
+		e.loop.mu.RUnlock()
+	}
+	e.mu.Lock()
+	run.source = e.source
+	e.mu.Unlock()
+	if run.source.SessionID == "" {
+		run.source.SessionID = sessionIDFromForkSnapshot(snap)
+	}
+	if run.source.MessageID == "" && run.source.SessionID != "" {
+		turn := transcript.CountTurns(run.history)
+		if turn < 1 {
+			turn = 1
+		}
+		run.source.MessageID = fmt.Sprintf("%s/turn/%d", run.source.SessionID, turn)
+	}
+	applyAutoMemorySourceDefaults(&run.source)
+	return run
+}
+
+func sessionIDFromForkSnapshot(snap *CacheSafeParams) string {
+	if snap == nil {
+		return ""
+	}
+	for i := len(snap.SystemSections) - 1; i >= 0; i-- {
+		if snap.SystemSections[i].Name == "runtime_state" {
+			if id := runtimeStateField(snap.SystemSections[i].Body, "session_id"); id != "" {
+				return id
+			}
+		}
+	}
+	return runtimeStateField(snap.System, "session_id")
+}
+
+func runtimeStateField(body, name string) string {
+	start := strings.LastIndex(body, "<runtime_state>")
+	if start < 0 {
+		return ""
+	}
+	state := body[start+len("<runtime_state>"):]
+	if end := strings.Index(state, "</runtime_state>"); end >= 0 {
+		state = state[:end]
+	}
+	prefix := name + ":"
+	for _, line := range strings.Split(state, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+func (e *AutoMemoryExtractor) currentSource() AutoMemorySource {
+	e.mu.Lock()
+	source := e.source
+	e.mu.Unlock()
+	if source.SessionID == "" && e.loop != nil && e.loop.CurrentStateSnapshot != nil {
+		source.SessionID = e.loop.CurrentStateSnapshot().SessionID
+	}
+	if source.MessageID == "" && source.SessionID != "" && e.loop != nil {
+		e.loop.mu.RLock()
+		turn := transcript.CountTurns(e.loop.Messages)
+		e.loop.mu.RUnlock()
+		if turn < 1 {
+			turn = 1
+		}
+		source.MessageID = fmt.Sprintf("%s/turn/%d", source.SessionID, turn)
+	}
+	applyAutoMemorySourceDefaults(&source)
+	return source
+}
+
+func applyAutoMemorySourceDefaults(source *AutoMemorySource) {
+	if source.Scope == "" {
+		// Auto Memory writes into one canonical repository shared by every
+		// workspace. The repository binds this project marker to the active
+		// workspace at its durable commit boundary. User/feedback topic types
+		// remain globally visible by repository policy.
+		source.Scope = "project"
+	}
+	if source.Confidence <= 0 {
+		source.Confidence = memdir.DefaultConfidence
+	}
+}
+
+func (e *AutoMemoryExtractor) notifyInvalidation(changed []string) {
+	if len(changed) == 0 {
+		return
+	}
+	e.mu.Lock()
+	hook := e.invalidate
+	e.mu.Unlock()
+	if hook == nil {
+		return
+	}
+	change := MemoryInvalidation{Root: e.memdirRoot, Changed: append([]string(nil), changed...)}
+	func() {
+		defer func() { _ = recover() }()
+		hook(change)
+	}()
+}
+
+func uniqueSortedNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = filepath.Base(name)
+		if name == "" || name == "." {
+			continue
+		}
+		seen[name] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// memdirFileState captures both metadata and content. A filename-only set
+// misses the common Edit case where an existing memo is rewritten in place;
+// mtime alone can also be preserved by atomic copy/restore workflows.
+type memdirFileState struct {
+	ModTimeUnixNano int64
+	Size            int64
+	Digest          [sha256.Size]byte
+}
+
+func snapshotMemdirState(ctx context.Context, root string) (map[string]memdirFileState, error) {
 	files, err := memdir.ScanMemoryFiles(ctx, root)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]struct{}, len(files))
+	out := make(map[string]memdirFileState, len(files))
 	for _, f := range files {
-		out[filepath.Base(f.Path)] = struct{}{}
+		raw, err := os.ReadFile(f.Path)
+		if err != nil {
+			return out, err
+		}
+		out[filepath.Base(f.Path)] = memdirFileState{
+			ModTimeUnixNano: f.ModTime.UnixNano(),
+			Size:            int64(len(raw)),
+			Digest:          sha256.Sum256(raw),
+		}
 	}
 	return out, nil
 }
 
-// diffMemdirNames returns the basenames of every file that's either
-// in `post` but not `pre` (newly written) or in `pre` but not `post`
-// (deleted). Sorted for stable rendering in /dream status output.
-func diffMemdirNames(pre, post map[string]struct{}) []string {
+// diffMemdirState returns files created, deleted, or modified in place.
+func diffMemdirState(pre, post map[string]memdirFileState) []string {
 	if pre == nil && post == nil {
 		return nil
 	}
 	seen := make(map[string]struct{})
-	for k := range pre {
-		if _, ok := post[k]; !ok {
+	for k, before := range pre {
+		after, ok := post[k]
+		if !ok || before != after {
 			seen[k] = struct{}{}
 		}
 	}
@@ -783,24 +1302,73 @@ func diffMemdirNames(pre, post map[string]struct{}) []string {
 	return out
 }
 
-// advanceCursorLocked moves lastProcessedIdx to the current
-// Loop.Messages length so the next extraction only considers new
-// messages.
-func (e *AutoMemoryExtractor) advanceCursorLocked() {
-	e.loop.mu.RLock()
-	e.lastProcessedIdx = len(e.loop.Messages)
-	e.loop.mu.RUnlock()
+// snapshotMemdirNames is the filename-only compatibility helper used by
+// older diagnostics. Extraction itself uses snapshotMemdirState so in-place
+// edits are not lost.
+func snapshotMemdirNames(ctx context.Context, root string) (map[string]struct{}, error) {
+	state, err := snapshotMemdirState(ctx, root)
+	out := make(map[string]struct{}, len(state))
+	for name := range state {
+		out[name] = struct{}{}
+	}
+	return out, err
 }
 
-// mainAgentTouchedMemdirSinceLocked scans Loop.Messages from
-// lastProcessedIdx forward, looking for an Edit/Write tool_use whose
+// diffMemdirNames retains the old set-diff helper for diagnostics/tests.
+func diffMemdirNames(pre, post map[string]struct{}) []string {
+	if pre == nil && post == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for name := range pre {
+		if _, ok := post[name]; !ok {
+			seen[name] = struct{}{}
+		}
+	}
+	for name := range post {
+		if _, ok := pre[name]; !ok {
+			seen[name] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// advanceCursorLocked records the exact history boundary that was frozen for
+// this run. Reading len(e.loop.Messages) here would advance session B's cursor
+// when a session-A extraction finishes after Desktop has switched chats.
+func (e *AutoMemoryExtractor) advanceCursorLocked(run *autoMemoryRun) {
+	if run == nil {
+		return
+	}
+	if e.processedBySession == nil {
+		e.processedBySession = make(map[string]int)
+	}
+	e.processedBySession[autoMemorySessionKey(run.source)] = run.historyLen
+	e.lastProcessedIdx = run.historyLen
+}
+
+// mainAgentTouchedMemdirSinceLocked scans the frozen history from this
+// session's cursor forward, looking for an Edit/Write tool_use whose
 // file_path lies inside memdirRoot. If found, the main agent already
 // did the extractor's job — we should defer to it.
-func (e *AutoMemoryExtractor) mainAgentTouchedMemdirSinceLocked() bool {
-	e.loop.mu.RLock()
-	defer e.loop.mu.RUnlock()
-	for i := e.lastProcessedIdx; i < len(e.loop.Messages); i++ {
-		m := e.loop.Messages[i]
+func (e *AutoMemoryExtractor) mainAgentTouchedMemdirSinceLocked(run *autoMemoryRun) bool {
+	if run == nil {
+		return false
+	}
+	start := 0
+	if e.processedBySession != nil {
+		start = e.processedBySession[autoMemorySessionKey(run.source)]
+	}
+	if start < 0 || start > len(run.history) {
+		start = 0
+	}
+	for i := start; i < len(run.history); i++ {
+		m := run.history[i]
 		if m.Role != llm.RoleAssistant {
 			continue
 		}
@@ -821,6 +1389,13 @@ func (e *AutoMemoryExtractor) mainAgentTouchedMemdirSinceLocked() bool {
 		}
 	}
 	return false
+}
+
+func autoMemorySessionKey(source AutoMemorySource) string {
+	if source.SessionID != "" {
+		return source.SessionID
+	}
+	return "<unknown-session>"
 }
 
 // regenerateIndex rebuilds MEMORY.md from the current set of memdir
@@ -1095,19 +1670,22 @@ func (l *Loop) MaybeExtractMemory(ctx context.Context) int {
 	if l == nil || !l.AutoMemory {
 		return 0
 	}
-	if l.autoMemExtractor == nil {
+	l.mu.RLock()
+	ext := l.autoMemExtractor
+	l.mu.RUnlock()
+	if ext == nil {
 		// Lazy path (runtime didn't pre-wire an extractor): the Loop
 		// carries no configured skill dir, so fall back to the default
 		// (config.SkillsDir()). Identical to cfg.Session.SkillDir unless
 		// [session] skill_dir is overridden — the runtime path below
 		// (cmd/metis) passes the configured dir explicitly for that case.
-		ext, err := NewAutoMemoryExtractor(l, "", "")
+		var err error
+		ext, err = NewAutoMemoryExtractor(l, "", "")
 		if err != nil {
 			return 0
 		}
-		l.autoMemExtractor = ext
 	}
-	l.autoMemExtractor.OnLoopEnd(ctx, "end_turn")
+	ext.OnLoopEnd(ctx, "end_turn")
 	return 0
 }
 
@@ -1130,7 +1708,7 @@ func (l *Loop) MaybeExtractMemory(ctx context.Context) int {
 // retained.
 //
 // `root` is the memdir root, `touched` is a list of basenames the
-// snapshot diff identified — these come from snapshotMemdirNames
+// snapshot diff identified — these come from snapshotMemdirState
 // which calls filepath.Base(f.Path), so they ALREADY include the
 // .md suffix. We deliberately don't re-add it (the original implementation
 // did, leading to xxx.md.md paths that silently never matched — bug
@@ -1141,6 +1719,10 @@ func (l *Loop) MaybeExtractMemory(ctx context.Context) int {
 // file, not a memo; ScanMemoryFiles already excludes it but defensive
 // here too.
 func fixupTouchedMemos(root string, touched []string) {
+	fixupTouchedMemosWithMetadata(root, touched, AutoMemorySource{})
+}
+
+func fixupTouchedMemosWithMetadata(root string, touched []string, source AutoMemorySource) {
 	if root == "" || len(touched) == 0 {
 		return
 	}
@@ -1154,28 +1736,96 @@ func fixupTouchedMemos(root string, touched []string) {
 		if err != nil {
 			continue
 		}
-		fm, body, err := memdir.ParseFile(raw)
-		if err != nil {
-			// Unparseable YAML — leave the file alone; the
-			// extractor's next pass can fix it.
-			continue
-		}
-		// Privacy filter first; if it rejects, delete the file
-		// outright. Doing this before MarkAccessed avoids
-		// rewriting a memo we're about to nuke.
-		res := memdir.Redact(string(body))
+		// Redact the complete file, not just its body. This covers a model
+		// accidentally placing a credential in description/custom YAML and
+		// guarantees privacy still runs when the frontmatter is malformed.
+		res := memdir.Redact(string(raw))
 		if res.Reject {
 			_ = os.Remove(path)
 			continue
 		}
-		fm.MarkAccessed(now)
-		out, err := memdir.RenderFile(fm, res.Redacted)
+		fm, body, parseErr := memdir.ParseFile([]byte(res.Redacted))
+		if fm == nil {
+			fm = &memdir.Frontmatter{}
+		}
+		if parseErr != nil {
+			// ParseFile still returns the body after a malformed YAML header.
+			// Discard the corrupt header and rebuild minimal canonical metadata
+			// rather than leaving an unredacted/unindexed file behind.
+			fm = &memdir.Frontmatter{}
+			if strings.TrimSpace(string(body)) == "" {
+				body = []byte(res.Redacted)
+			}
+		}
+		normalizeTouchedFrontmatter(fm, name, string(body))
+		if fm.OriginSessionID == "" && source.SessionID != "" {
+			fm.OriginSessionID = source.SessionID
+		}
+		if source.MessageID != "" {
+			fm.SourceMessageID = source.MessageID
+		}
+		if source.Scope != "" {
+			fm.Scope = source.Scope
+		}
+		if source.Confidence > 0 {
+			fm.Confidence = source.Confidence
+		}
+		fm.MarkUpdated(now)
+		out, err := memdir.RenderFile(fm, string(body))
 		if err != nil {
 			continue
 		}
 		// 0o600 mirrors auth.json — these are local-only artifacts
 		// the user controls; world-readable would be a regression
 		// against the same privacy goal Redact() enforces.
-		_ = os.WriteFile(path, out, 0o600)
+		if err := os.WriteFile(path, out, 0o600); err == nil {
+			_ = os.Chmod(path, 0o600)
+		}
+	}
+}
+
+func autoMemoryTopicSource(source AutoMemorySource) memory.TopicSource {
+	return memory.TopicSource{
+		SessionID:  source.SessionID,
+		MessageID:  source.MessageID,
+		Scope:      source.Scope,
+		Confidence: source.Confidence,
+	}
+}
+
+func normalizeTouchedFrontmatter(fm *memdir.Frontmatter, filename, body string) {
+	stem := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	if fm.Name == "" {
+		fm.Name = strings.TrimSpace(strings.ReplaceAll(stem, "_", " "))
+	}
+	if fm.Name == "" {
+		fm.Name = "memory"
+	}
+	if fm.Description == "" {
+		for _, line := range strings.Split(body, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			const maxDescriptionRunes = 160
+			runes := []rune(line)
+			if len(runes) > maxDescriptionRunes {
+				line = string(runes[:maxDescriptionRunes]) + "…"
+			}
+			fm.Description = line
+			break
+		}
+		if fm.Description == "" {
+			fm.Description = fm.Name
+		}
+	}
+	if !fm.Type.IsValid() {
+		prefix := strings.ToLower(strings.SplitN(stem, "_", 2)[0])
+		switch memdir.MemoryType(prefix) {
+		case memdir.TypeUser, memdir.TypeFeedback, memdir.TypeProject, memdir.TypeContext, memdir.TypeReference:
+			fm.Type = memdir.MemoryType(prefix)
+		default:
+			fm.Type = memdir.TypeContext
+		}
 	}
 }

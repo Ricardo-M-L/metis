@@ -7,6 +7,70 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.35] - 2026-08-28
+
+### Added
+
+- A single canonical `MemoryRepository` now serves Core, topic, archival,
+  recall, Daily, Dream, CLI, and Desktop memory from the same managed root,
+  with migration from the previous split layouts.
+- Completed turns carry source-session/message provenance and are available to
+  a new session through BM25 retrieval; a session boundary flushes the final
+  one to four turns that have not reached the normal five-turn cadence.
+- Memory records track scope, confidence, update/use timestamps, and retrieval
+  usage so durable preferences and short-lived project state can follow
+  different retention policies.
+- End-to-end coverage now exercises a real Loop session writing a unique fact,
+  a fresh manager and session retrieving it, Desktop/CLI session boundaries,
+  deletion tombstones, migration, and concurrent process access.
+
+### Changed
+
+- Stable memory indexes are assembled once per turn as a cacheable system
+  section, while query-specific recall is attached to the requesting user
+  message so dynamic retrieval does not invalidate the stable prompt prefix.
+- Auto Memory is enabled by default for interactive CLI and Desktop sessions;
+  non-interactive runs remain opt-in to avoid unexpected background API cost.
+- Memory cleanup considers type, confidence, references, and last use instead
+  of applying one hard decay rule to every record. User preferences remain
+  durable while stale project context may expire.
+- Legacy `internal/agent.Store` and the unused third memory directory have been
+  removed; the Memory tool, `/memory`, Dream, forks, and runtime injection all
+  use the repository contract.
+
+### Fixed
+
+- One-to-four-turn conversations no longer disappear from cross-session
+  recall, and failed residual distillation is returned to the boundary and
+  retained for retry instead of being silently marked complete.
+- Successful one-shot, ACP, MCP, daemon, coordinator, and cron boundaries now
+  persist their final residual turns before cleanup; ACP shutdown also cancels
+  active prompts instead of hanging behind an open connection.
+- Desktop and TUI session switches wait for source-session memory before
+  replacing history; header/Daily writes are fail-closed, shutdown joins
+  background writers, and session deletion cannot be undone by a late write.
+- Desktop session activation now joins detached agents, then rebinds memory,
+  tool execution, checkpoints, and crash recovery to the target workspace as
+  one boundary; legacy sessions without a saved directory fall back to the
+  launch workspace, and failed rebinds cannot expose another workspace's
+  memory.
+- Workspace-scoped Core and topic memories no longer leak into another
+  project, while global user preferences remain shared intentionally.
+- Core memory reloads external process updates without accepting unsafe edits,
+  and forked requests preserve the parent's typed system-section order.
+- Reused provider tool IDs such as Gemini's repeated `gem_1` are grouped by
+  concrete trace occurrence rather than being attached to an older call.
+
+### Security
+
+- Canonical memory directories and files use private `0700`/`0600`
+  permissions, persisted content and metadata are validated and redacted, and
+  malformed or symlinked deletion tombstones are replaced by a fail-closed
+  blocking sentinel.
+- Long-lived processes revalidate Core, topic, archival, and recall files on
+  every authoritative read, rejecting post-startup symlink swaps, non-regular
+  files, unsafe frontmatter, and injected or sensitive external edits.
+
 ## [0.4.34] - 2026-08-28
 
 ### Added
@@ -1105,7 +1169,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.34...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.35...HEAD
+[0.4.35]: https://github.com/Ricardo-M-L/metis/compare/v0.4.34...v0.4.35
 [0.4.34]: https://github.com/Ricardo-M-L/metis/compare/v0.4.33...v0.4.34
 [0.4.33]: https://github.com/Ricardo-M-L/metis/compare/v0.4.32...v0.4.33
 [0.4.32]: https://github.com/Ricardo-M-L/metis/compare/v0.4.31...v0.4.32

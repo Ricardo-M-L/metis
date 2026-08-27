@@ -4,13 +4,17 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memdir"
+	"github.com/Ricardo-M-L/metis/internal/memory"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 func newTestExtractor(t *testing.T, prov llm.Provider, root string) (*Loop, *AutoMemoryExtractor) {
@@ -152,6 +156,121 @@ func TestAutoMemoryExtractor_RateLimitsRapidLoopEnds(t *testing.T) {
 	}
 }
 
+func TestWaitAutoMemoryIdleFlushesThrottledPendingRun(t *testing.T) {
+	provider := &scriptedProvider{resps: []*llm.Response{
+		{Content: []llm.ContentBlock{{Type: "text", Text: "first"}}, StopReason: "end_turn"},
+		{Content: []llm.ContentBlock{{Type: "text", Text: "second"}}, StopReason: "end_turn"},
+	}}
+	loop, ext := newTestExtractor(t, provider, t.TempDir())
+	ext.setDreamGateBypass(true)
+	loop.AppendUser("first completed turn")
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := loop.WaitAutoMemoryIdle(ctx); err != nil {
+		t.Fatalf("join first extraction: %v", err)
+	}
+
+	loop.AppendUser("latest turn inside throttle window")
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	if stats := ext.Stats(); !stats.Pending || stats.InProgress {
+		t.Fatalf("second turn was not pending-only: %+v", stats)
+	}
+	if err := loop.WaitAutoMemoryIdle(ctx); err != nil {
+		t.Fatalf("flush pending extraction: %v", err)
+	}
+	if stats := ext.Stats(); stats.Pending || stats.InProgress || stats.TotalExtractions != 2 {
+		t.Fatalf("shutdown join dropped pending extraction: %+v", stats)
+	}
+}
+
+func TestWaitAutoMemoryIdleForcesTrailingRunUnderThrottle(t *testing.T) {
+	provider := &blockingProvider{release: make(chan struct{})}
+	loop, ext := newTestExtractor(t, provider, t.TempDir())
+	ext.setDreamGateBypass(true)
+	loop.AppendUser("first turn")
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	waitFor(t, time.Second, func() bool { return ext.Stats().InProgress })
+
+	loop.AppendUser("latest turn while first extraction runs")
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	if !ext.Stats().Pending {
+		t.Fatal("latest frozen turn was not queued")
+	}
+	done := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { done <- loop.WaitAutoMemoryIdle(ctx) }()
+	waitFor(t, time.Second, func() bool {
+		ext.mu.Lock()
+		defer ext.mu.Unlock()
+		return ext.flushPending
+	})
+	close(provider.release)
+	if err := <-done; err != nil {
+		t.Fatalf("join forced trailing extraction: %v", err)
+	}
+	if stats := ext.Stats(); stats.Pending || stats.InProgress || stats.TotalExtractions != 2 {
+		t.Fatalf("throttled trailing extraction was lost: %+v", stats)
+	}
+}
+
+func TestAutoMemoryExtractor_InProgressStashesBeforeDurableDreamGate(t *testing.T) {
+	provider := &gateOrderingProvider{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	loop, ext := newTestExtractor(t, provider, t.TempDir())
+	// Deliberately do not call setDreamGateBypass: this regression must use
+	// the production DreamLock path that moves its mtime to now while the
+	// first extraction is in flight.
+	loop.AppendUser("first completed turn")
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	select {
+	case <-provider.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first extraction did not reach provider")
+	}
+	waitFor(t, time.Second, func() bool {
+		return ext.Stats().InProgress && !ext.Stats().Pending
+	})
+
+	const latest = "LATEST_PENDING_TURN_BEFORE_DURABLE_GATE"
+	loop.AppendUser(latest)
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	if stats := ext.Stats(); !stats.InProgress || !stats.Pending {
+		t.Fatalf("latest turn was dropped by the durable gate: %+v", stats)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- loop.WaitAutoMemoryIdle(ctx) }()
+	waitFor(t, time.Second, func() bool {
+		ext.mu.Lock()
+		defer ext.mu.Unlock()
+		return ext.flushPending
+	})
+	close(provider.release)
+	if err := <-done; err != nil {
+		t.Fatalf("flush pending extraction: %v", err)
+	}
+	if stats := ext.Stats(); stats.Pending || stats.InProgress || stats.TotalExtractions != 2 {
+		t.Fatalf("pending production-gated extraction did not complete: %+v", stats)
+	}
+
+	requests := provider.requestsSnapshot()
+	if len(requests) != 2 {
+		t.Fatalf("provider requests = %d, want first run plus trailing run", len(requests))
+	}
+	if requestContainsText(requests[0], latest) {
+		t.Fatal("first frozen extraction unexpectedly contains the later turn")
+	}
+	if !requestContainsText(requests[1], latest) {
+		t.Fatal("trailing extraction did not receive the latest frozen turn")
+	}
+}
+
 func TestAutoMemoryExtractor_StashesPendingDuringInProgress(t *testing.T) {
 	// No prior test's detached fork may be part of this test's completion
 	// boundary. Package tests are serial, so this drains earlier async work.
@@ -199,6 +318,118 @@ func TestAutoMemoryExtractor_StashesPendingDuringInProgress(t *testing.T) {
 	}
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
 		t.Fatalf("extractor temp root still exists after idle cleanup: %v", err)
+	}
+}
+
+func TestAutoMemoryExtractor_OnLoopEndFreezesSessionHistoryAndProvenance(t *testing.T) {
+	root := t.TempDir()
+	memoPath := filepath.Join(root, "user_frozen_session.md")
+	memo, err := memdir.RenderFile(&memdir.Frontmatter{
+		Name: "frozen session", Description: "fact from session A", Type: memdir.TypeUser,
+	}, "A_ONLY prefers frozen extraction snapshots.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &sessionSwitchProvider{
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+		memoPath: memoPath,
+		memo:     string(memo),
+	}
+	loop, ext := newTestExtractor(t, provider, root)
+	loop.Registry.Register(autoMemoryWriteTool{})
+	ext.setDreamGateBypass(true)
+
+	var sessionID atomic.Value
+	sessionID.Store("session-a")
+	loop.CurrentStateSnapshot = func() RuntimeStateSnapshot {
+		return RuntimeStateSnapshot{SessionID: sessionID.Load().(string)}
+	}
+	loop.AppendUser("A_ONLY history must be extracted")
+	loop.mu.Lock()
+	loop.Messages = append(loop.Messages, llm.Message{
+		Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "A_ONLY acknowledged"}},
+	})
+	loop.mu.Unlock()
+
+	// Keep the caller on one P until the session replacement is published. The
+	// extractor is deliberately asynchronous, so this makes the historical bug
+	// deterministic: a goroutine that snapshots after OnLoopEnd returns sees B.
+	previousProcs := runtime.GOMAXPROCS(1)
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	loop.ResetSession([]llm.Message{{
+		Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "B_ONLY unrelated history"}},
+	}})
+	sessionID.Store("session-b")
+	runtime.GOMAXPROCS(previousProcs)
+
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("extractor provider was not called")
+	}
+	// Queue B while A is blocked, then replace the live loop with C before A
+	// finishes. A trailing run must consume the frozen B payload, never C.
+	ext.OnLoopEnd(context.Background(), "end_turn")
+	if !ext.Stats().Pending {
+		t.Fatal("session B LoopEnd was not queued while A was in progress")
+	}
+	ext.mu.Lock()
+	ext.lastFiredAt = time.Now().Add(-2 * AutoMemoryMinInterval)
+	ext.mu.Unlock()
+	loop.ResetSession([]llm.Message{{
+		Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "C_ONLY later history"}},
+	}})
+	sessionID.Store("session-c")
+	close(provider.release)
+	waitFor(t, 2*time.Second, func() bool {
+		return ext.Stats().TotalExtractions == 2 && !ext.Stats().InProgress && ForkInflight() == 0
+	})
+
+	request := provider.firstRequest(t)
+	var requestText strings.Builder
+	for _, message := range request.Messages {
+		for _, block := range message.Content {
+			requestText.WriteString(block.Text)
+		}
+	}
+	if got := requestText.String(); !strings.Contains(got, "A_ONLY") || strings.Contains(got, "B_ONLY") {
+		t.Fatalf("extraction request crossed sessions: %q", got)
+	}
+	pendingRequest := provider.requestAt(t, 2)
+	requestText.Reset()
+	for _, message := range pendingRequest.Messages {
+		for _, block := range message.Content {
+			requestText.WriteString(block.Text)
+		}
+	}
+	if got := requestText.String(); !strings.Contains(got, "B_ONLY") || strings.Contains(got, "C_ONLY") {
+		t.Fatalf("pending extraction crossed sessions: %q", got)
+	}
+
+	raw, err := os.ReadFile(memoPath)
+	if err != nil {
+		t.Fatalf("read extracted memo: %v", err)
+	}
+	fm, body, err := memdir.ParseFile(raw)
+	if err != nil {
+		t.Fatalf("parse extracted memo: %v", err)
+	}
+	if !strings.Contains(string(body), "A_ONLY") || strings.Contains(string(body), "B_ONLY") {
+		t.Fatalf("memo content crossed sessions: %q", body)
+	}
+	if fm.OriginSessionID != "session-a" || fm.SourceMessageID != "session-a/turn/1" {
+		t.Fatalf("memo provenance crossed sessions: %+v", fm)
+	}
+	// A brand-new repository instance models the next Desktop/CLI process.
+	// Auto Memory output must be part of the same retrieval corpus rather than
+	// remaining visible only to the Dream subsystem that created it.
+	restarted, err := memory.NewMemoryManager(root)
+	if err != nil {
+		t.Fatalf("restart repository: %v", err)
+	}
+	if recalled := restarted.PreviewAutoRetrieve("A_ONLY frozen extraction snapshot", 5); !strings.Contains(recalled, "A_ONLY") {
+		t.Fatalf("fresh session did not recall Auto Memory topic: %q", recalled)
 	}
 }
 
@@ -268,6 +499,217 @@ func TestAutoMemoryExtractor_RegeneratesIndex(t *testing.T) {
 	}
 }
 
+func TestAutoMemoryExtractor_ExistingMemoEditIsDetectedAndFixedUp(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "feedback_language.md")
+	original, err := memdir.RenderFile(&memdir.Frontmatter{
+		Name: "language", Description: "reply language", Type: memdir.TypeFeedback,
+	}, "Reply in Chinese.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pre, err := snapshotMemdirState(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the filename and mtime stable: content hashing must still notice
+	// this in-place Edit and route it through privacy + metadata fixup.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modified, err := memdir.RenderFile(&memdir.Frontmatter{
+		Name: "language", Description: "reply language", Type: memdir.TypeFeedback,
+	}, "Reply in Chinese. OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, modified, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	post, err := snapshotMemdirState(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	touched := diffMemdirState(pre, post)
+	if len(touched) != 1 || touched[0] != filepath.Base(path) {
+		t.Fatalf("in-place edit not detected: %v", touched)
+	}
+	fixupTouchedMemosWithMetadata(root, touched, AutoMemorySource{
+		SessionID: "session-a", MessageID: "message-b", Scope: "user", Confidence: 0.9,
+	})
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm, body, err := memdir.ParseFile(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "sk-proj-") || !strings.Contains(string(body), "[REDACTED:") {
+		t.Fatalf("privacy fixup did not redact existing memo: %s", body)
+	}
+	if fm.OriginSessionID != "session-a" || fm.SourceMessageID != "message-b" || fm.Scope != "user" {
+		t.Fatalf("source metadata not refreshed: %+v", fm)
+	}
+	if fm.UpdatedAt == "" || fm.LastUsedAt == "" || fm.UseCount != 1 || fm.Confidence != 0.9 {
+		t.Fatalf("retention metadata not refreshed: %+v", fm)
+	}
+	mode, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mode.Mode().Perm(); got != 0o600 {
+		t.Fatalf("memo mode = %o, want 600", got)
+	}
+}
+
+func TestFixupTouchedMemos_RepairsUnframedMemoAndAlwaysRedacts(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "project_release.md")
+	if err := os.WriteFile(path, []byte(
+		"Release coordination. OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fixupTouchedMemosWithMetadata(root, []string{filepath.Base(path)}, AutoMemorySource{
+		SessionID: "session-a", Scope: "project",
+	})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm, body, err := memdir.ParseFile(raw)
+	if err != nil {
+		t.Fatalf("unframed memo was not repaired: %v\n%s", err, raw)
+	}
+	if err := fm.Validate(); err != nil {
+		t.Fatalf("repaired metadata is invalid: %v (%+v)", err, fm)
+	}
+	if fm.Type != memdir.TypeProject || fm.Scope != "project" || fm.UpdatedAt == "" {
+		t.Fatalf("repaired metadata = %+v", fm)
+	}
+	if strings.Contains(string(body), "sk-proj-") || !strings.Contains(string(body), "[REDACTED:") {
+		t.Fatalf("privacy pass did not run on unframed memo: %s", body)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("repaired memo mode = %o, want 600", got)
+	}
+}
+
+func TestAutoMemoryCurrentSourceDerivesSessionAndHistoryMessageID(t *testing.T) {
+	loop := &Loop{Messages: []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "first"}}},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "answer"}}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "second"}}},
+	}}
+	loop.CurrentStateSnapshot = func() RuntimeStateSnapshot {
+		return RuntimeStateSnapshot{SessionID: "session-derived"}
+	}
+	extractor := &AutoMemoryExtractor{loop: loop, memdirRoot: t.TempDir()}
+	source := extractor.currentSource()
+	if source.SessionID != "session-derived" || source.MessageID != "session-derived/turn/2" {
+		t.Fatalf("derived source identity = %+v", source)
+	}
+	if source.Scope == "" || source.Confidence <= 0 {
+		t.Fatalf("derived source defaults missing: %+v", source)
+	}
+}
+
+func TestAutoMemoryCanonicalRootDefaultsToProjectScope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if _, err := memdir.DefaultRoot(); err != nil {
+		t.Fatal(err)
+	}
+	source := AutoMemorySource{}
+	applyAutoMemorySourceDefaults(&source)
+	if source.Scope != "project" {
+		t.Fatalf("canonical auto-memory scope = %q, want project so the repository can bind it to the active workspace", source.Scope)
+	}
+}
+
+func TestAutoMemoryExtractor_InvalidationHookIsolatedAndPanicSafe(t *testing.T) {
+	ext := &AutoMemoryExtractor{memdirRoot: "/tmp/memory"}
+	var got MemoryInvalidation
+	ext.SetInvalidationHook(func(change MemoryInvalidation) {
+		got = change
+		change.Changed[0] = "consumer-mutated.md"
+	})
+	changed := []string{"project_a.md"}
+	ext.notifyInvalidation(changed)
+	if got.Root != "/tmp/memory" || len(got.Changed) != 1 {
+		t.Fatalf("unexpected invalidation: %+v", got)
+	}
+	if changed[0] != "project_a.md" {
+		t.Fatalf("callback mutated extractor-owned slice: %v", changed)
+	}
+	// A bad consumer must not panic through dream finalization.
+	ext.SetInvalidationHook(func(MemoryInvalidation) { panic("consumer bug") })
+	ext.notifyInvalidation([]string{"project_b.md"})
+}
+
+func TestPrepareAutoMemoryPrefix_StripsSyntheticRecallWithoutMutatingParent(t *testing.T) {
+	parent := []llm.Message{
+		{
+			Role: llm.RoleUser,
+			Content: []llm.ContentBlock{
+				{Type: "text", Text: "remember that I prefer concise replies"},
+				{Type: "text", Text: "<auto-retrieve>old duplicated preference</auto-retrieve>", Synthetic: true},
+			},
+		},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "understood"}}},
+		{
+			Role: llm.RoleUser,
+			Content: []llm.ContentBlock{{
+				Type: "text",
+				Text: "next question\n<auto-retrieve>legacy recalled project state</auto-retrieve>",
+			}},
+		},
+		{
+			Role: llm.RoleUser,
+			Content: []llm.ContentBlock{{
+				Type: "text", Text: "<auto-retrieve>synthetic-only recall</auto-retrieve>", Synthetic: true,
+			}},
+		},
+	}
+
+	got := prepareAutoMemoryPrefix(parent)
+	if len(got) != 3 {
+		t.Fatalf("filtered prefix length = %d, want 3: %+v", len(got), got)
+	}
+	var allText strings.Builder
+	for _, message := range got {
+		for _, block := range message.Content {
+			allText.WriteString(block.Text)
+		}
+	}
+	if text := allText.String(); strings.Contains(text, "auto-retrieve") ||
+		strings.Contains(text, "duplicated preference") ||
+		strings.Contains(text, "recalled project state") {
+		t.Fatalf("synthetic recall leaked into extraction prefix: %q", text)
+	}
+	if got[2].Content[0].Text != "next question" {
+		t.Fatalf("mixed legacy block was not reduced to visible text: %+v", got[2].Content)
+	}
+	if parent[0].Content[1].Text != "<auto-retrieve>old duplicated preference</auto-retrieve>" ||
+		parent[2].Content[0].Text == "next question" {
+		t.Fatal("filter mutated parent transcript")
+	}
+}
+
 func TestBuildExtractorPrompt_ConsolidationGated(t *testing.T) {
 	// No overlaps → no consolidation section (the common case).
 	noOverlap := buildExtractorPrompt("/tmp/x", "m", []string{"a"}, nil)
@@ -317,6 +759,140 @@ func (p *blockingProvider) Complete(ctx context.Context, req llm.Request) (*llm.
 }
 func (p *blockingProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
 	return nil, nil
+}
+
+type gateOrderingProvider struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+
+	mu       sync.Mutex
+	requests []llm.Request
+}
+
+func (p *gateOrderingProvider) Name() string          { return "gate-ordering" }
+func (p *gateOrderingProvider) MaxContextTokens() int { return 200_000 }
+func (p *gateOrderingProvider) ModelID() string       { return "test" }
+func (p *gateOrderingProvider) Complete(ctx context.Context, req llm.Request) (*llm.Response, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	call := len(p.requests)
+	p.mu.Unlock()
+	if call == 1 {
+		p.once.Do(func() { close(p.entered) })
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return &llm.Response{
+		Content:    []llm.ContentBlock{{Type: "text", Text: "no memory changes"}},
+		StopReason: "end_turn",
+	}, nil
+}
+func (p *gateOrderingProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return nil, nil
+}
+func (p *gateOrderingProvider) requestsSnapshot() []llm.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]llm.Request(nil), p.requests...)
+}
+
+func requestContainsText(req llm.Request, needle string) bool {
+	for _, message := range req.Messages {
+		for _, block := range message.Content {
+			if strings.Contains(block.Text, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type sessionSwitchProvider struct {
+	entered  chan struct{}
+	release  chan struct{}
+	memoPath string
+	memo     string
+
+	mu    sync.Mutex
+	calls []llm.Request
+}
+
+func (p *sessionSwitchProvider) Name() string          { return "session-switch" }
+func (p *sessionSwitchProvider) MaxContextTokens() int { return 200_000 }
+func (p *sessionSwitchProvider) ModelID() string       { return "test" }
+func (p *sessionSwitchProvider) Complete(ctx context.Context, req llm.Request) (*llm.Response, error) {
+	p.mu.Lock()
+	p.calls = append(p.calls, req)
+	call := len(p.calls)
+	p.mu.Unlock()
+	if call == 1 {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &llm.Response{
+			Content: []llm.ContentBlock{{
+				Type: "tool_use", ToolUseID: "write-frozen", ToolName: "Write",
+				ToolInput: map[string]any{"file_path": p.memoPath, "content": p.memo},
+			}},
+			StopReason: "tool_use",
+		}, nil
+	}
+	return &llm.Response{
+		Content:    []llm.ContentBlock{{Type: "text", Text: "saved frozen memory"}},
+		StopReason: "end_turn",
+	}, nil
+}
+func (p *sessionSwitchProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return nil, nil
+}
+func (p *sessionSwitchProvider) firstRequest(t *testing.T) llm.Request {
+	return p.requestAt(t, 0)
+}
+func (p *sessionSwitchProvider) requestAt(t *testing.T, index int) llm.Request {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.calls) {
+		t.Fatalf("provider request %d unavailable; calls=%d", index, len(p.calls))
+	}
+	return p.calls[index]
+}
+
+type autoMemoryWriteTool struct{}
+
+func (autoMemoryWriteTool) Name() string        { return "Write" }
+func (autoMemoryWriteTool) Description() string { return "write an auto-memory test file" }
+func (autoMemoryWriteTool) IsEnabled() bool     { return true }
+func (autoMemoryWriteTool) InputSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"file_path": map[string]any{"type": "string"},
+			"content":   map[string]any{"type": "string"},
+		},
+		"required": []string{"file_path", "content"},
+	}
+}
+func (autoMemoryWriteTool) Concurrency(map[string]any) pubtool.Concurrency {
+	return pubtool.ConcurrencyExclusive
+}
+func (autoMemoryWriteTool) CanUse(context.Context, map[string]any) (pubtool.Permission, string) {
+	return pubtool.PermissionAllow, ""
+}
+func (autoMemoryWriteTool) Execute(_ context.Context, input map[string]any) (*pubtool.Result, error) {
+	path, _ := input["file_path"].(string)
+	content, _ := input["content"].(string)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return nil, err
+	}
+	return &pubtool.Result{Output: "written"}, nil
 }
 
 // waitFor polls cond until true or timeout. Doesn't drift like sleep
