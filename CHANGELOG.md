@@ -7,6 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.33] - 2026-08-27
+
+### Added
+
+- Desktop message metadata now shows the full local date and time together
+  with the UTC offset and detected IANA timezone.
+- Per-turn duration, first-token latency, output rate, and timestamps are
+  persisted and restored after switching sessions or restarting Desktop.
+- CLI and Desktop runtime prompts now expose the detected local timezone and
+  unambiguous UTC offset to the model.
+
+### Changed
+
+- Any workspace, including the one open in the current window, can be removed
+  from the sidebar without deleting its sessions; removed workspaces and their
+  sessions stay hidden until the workspace is added again.
+- The unimplemented workspace "Open in new window" action has been removed.
+
+### Fixed
+
+- Deleting a session now also removes its persisted per-message metrics
+  sidecar.
+
 ## [0.4.32] - 2026-08-27
 
 ### Changed

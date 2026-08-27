@@ -272,6 +272,19 @@ func (s *TraceStore) NextTurn(sid string) int {
 	return s.turned[sid]
 }
 
+// CurrentTurn returns the highest persisted turn for sid without advancing
+// it. Desktop uses this to keep message-footer sidecar numbering stable even
+// after conversation compaction has reduced the visible transcript length.
+func (s *TraceStore) CurrentTurn(sid string) int {
+	if !validTraceSessionID(sid) {
+		return 0
+	}
+	s.ensureLoaded(sid)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.turned[sid]
+}
+
 // Events returns all trace events for a session, in order.
 func (s *TraceStore) Events(sid string) []TraceEvent {
 	if !validTraceSessionID(sid) {

@@ -108,8 +108,14 @@ func TestWorkspaceRegistryLifecyclePersistsWithoutDeletingSessions(t *testing.T)
 		t.Fatalf("remove: %d %s", rr.Code, rr.Body.String())
 	}
 	rr = workspaceRequest(t, h, http.MethodGet, "/api/workspaces", "")
-	if bytes.Contains(rr.Body.Bytes(), []byte(secondView.ID)) {
-		t.Fatalf("removed workspace still listed: %s", rr.Body.String())
+	listed.Workspaces = nil
+	if err := json.Unmarshal(rr.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	for _, view := range listed.Workspaces {
+		if view.ID == secondView.ID {
+			t.Fatalf("removed workspace still listed: %s", rr.Body.String())
+		}
 	}
 	if _, messages, err := store.Load("workspace-session"); err != nil || len(messages) != 1 {
 		t.Fatalf("workspace removal changed session: messages=%d err=%v", len(messages), err)
@@ -126,8 +132,58 @@ func TestWorkspaceRegistryLifecyclePersistsWithoutDeletingSessions(t *testing.T)
 	// A fresh Server sees the same registry: persistence is global rather
 	// than tied to the random loopback port used by the Wails window.
 	rr = workspaceRequest(t, base.handler(), http.MethodGet, "/api/workspaces", "")
-	if !bytes.Contains(rr.Body.Bytes(), []byte(firstView.ID)) || bytes.Contains(rr.Body.Bytes(), []byte(secondView.ID)) {
+	listed.Workspaces = nil
+	if err := json.Unmarshal(rr.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	foundFirst, foundSecond := false, false
+	for _, view := range listed.Workspaces {
+		foundFirst = foundFirst || view.ID == firstView.ID
+		foundSecond = foundSecond || view.ID == secondView.ID
+	}
+	if !foundFirst || foundSecond {
 		t.Fatalf("registry did not persist across servers: %s", rr.Body.String())
+	}
+}
+
+func TestWorkspaceRemoveAllowsTheWorkspaceOpenInThisWindow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	active := t.TempDir()
+	t.Chdir(active)
+
+	s, _ := testServer(t)
+	h := s.handler()
+	body, _ := json.Marshal(map[string]string{"path": active, "name": "Active workspace"})
+	rr := workspaceRequest(t, h, http.MethodPost, "/api/workspaces", string(body))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("add active workspace: %d %s", rr.Code, rr.Body.String())
+	}
+	var added workspaceView
+	if err := json.Unmarshal(rr.Body.Bytes(), &added); err != nil {
+		t.Fatal(err)
+	}
+
+	removeBody, _ := json.Marshal(map[string]string{"id": added.ID})
+	rr = workspaceRequest(t, h, http.MethodPost, "/api/workspaces/remove", string(removeBody))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("remove active workspace: %d %s", rr.Code, rr.Body.String())
+	}
+
+	rr = workspaceRequest(t, h, http.MethodGet, "/api/workspaces", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list workspaces: %d %s", rr.Code, rr.Body.String())
+	}
+	var listed struct {
+		Workspaces []workspaceView `json:"workspaces"`
+		ActiveID   string          `json:"activeId"`
+		RemovedIDs []string        `json:"removedIds"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Workspaces) != 0 || listed.ActiveID != added.ID || len(listed.RemovedIDs) != 1 || listed.RemovedIDs[0] != added.ID {
+		t.Fatalf("removed active workspace response = %+v, want hidden id %q", listed, added.ID)
 	}
 }
 

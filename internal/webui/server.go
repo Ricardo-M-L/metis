@@ -24,6 +24,7 @@ import (
 	"unicode"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	transcriptpkg "github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/artifact"
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -1157,6 +1158,10 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		log.Printf("turn pre-request: history load=%dms activate=%dms (session %s, %d msgs)", loadMs, activateMs, body.SessionID, len(history))
 	}
 	input := strings.TrimSpace(body.Input)
+	messageMetric := session.MessageMetric{
+		Turn:      s.nextMessageMetricTurn(body.SessionID, history),
+		StartedAt: time.Now(),
+	}
 	// Trajectory anchor: USER row + per-turn TTFT (first assistant text
 	// minus this timestamp). No-op when tracing is disabled.
 	rtpkg.RecordUserMessage(body.SessionID, input)
@@ -1224,6 +1229,8 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	done := make(chan error, 1)
 	go func() { done <- s.loop.Run(turnCtx, events); close(events) }()
 	var text strings.Builder
+	var firstTokenAt time.Time
+	var outputTokens int64
 	for ev := range events {
 		// Permission requests are published by their case below (with the
 		// request id); everything else broadcasts here.
@@ -1232,7 +1239,16 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 		switch ev.Kind {
 		case agent.EventTextDelta:
+			if firstTokenAt.IsZero() && ev.TextDelta != "" {
+				firstTokenAt = time.Now()
+			}
 			text.WriteString(ev.TextDelta)
+		case agent.EventThinkingDelta, agent.EventRedactedThinking:
+			if firstTokenAt.IsZero() {
+				firstTokenAt = time.Now()
+			}
+		case agent.EventTokens:
+			outputTokens += int64(ev.OutputTokens)
 		case agent.EventPermissionRequest:
 			if ev.PermissionReply != nil {
 				id := uuid.NewString()
@@ -1277,6 +1293,18 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	runErr := <-done
+	messageMetric.CompletedAt = time.Now()
+	messageMetric.DurationMS = messageMetric.CompletedAt.Sub(messageMetric.StartedAt).Milliseconds()
+	messageMetric.OutputTokens = outputTokens
+	if !firstTokenAt.IsZero() && firstTokenAt.After(messageMetric.StartedAt) {
+		messageMetric.TTFTMS = firstTokenAt.Sub(messageMetric.StartedAt).Milliseconds()
+		if outputTokens > 0 && messageMetric.CompletedAt.After(firstTokenAt) {
+			messageMetric.TokPerSec = float64(outputTokens) / messageMetric.CompletedAt.Sub(firstTokenAt).Seconds()
+		}
+	}
+	if err := s.store.AppendMessageMetric(body.SessionID, messageMetric); err != nil {
+		log.Printf("persist message metrics for %s turn %d: %v", body.SessionID, messageMetric.Turn, err)
+	}
 	if errors.Is(runErr, context.Canceled) {
 		finalStatus = "stopped"
 	}
@@ -1301,6 +1329,44 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	finalStatus = "completed"
 	writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text.String()})
+}
+
+func displayTurnCount(history []llm.Message) int {
+	turns := 0
+	for _, message := range history {
+		if message.Role != llm.RoleUser {
+			continue
+		}
+		for _, block := range message.Content {
+			if block.Type != "text" {
+				continue
+			}
+			visible := transcriptpkg.VisibleUserText(block.Text)
+			if visible == "" || strings.HasPrefix(visible, "[user steer mid-turn] ") {
+				continue
+			}
+			turns++
+			break
+		}
+	}
+	return turns
+}
+
+func (s *Server) nextMessageMetricTurn(sessionID string, history []llm.Message) int {
+	maxTurn := displayTurnCount(history)
+	if persisted, err := s.store.ReadMessageMetrics(sessionID); err == nil {
+		for _, metric := range persisted {
+			if metric.Turn > maxTurn {
+				maxTurn = metric.Turn
+			}
+		}
+	}
+	if traceStore := rtpkg.CurrentTraceStore(); traceStore != nil {
+		if traceTurn := traceStore.CurrentTurn(sessionID); traceTurn > maxTurn {
+			maxTurn = traceTurn
+		}
+	}
+	return maxTurn + 1
 }
 
 // activateSession moves the long-lived web runtime to id. A transcript-only
@@ -2738,6 +2804,90 @@ type traceStats struct {
 	TtftAverageMs int64   `json:"ttftAverageMs"`
 }
 
+// traceTurnMetricView is the durable message-footer metadata for one user
+// turn. The live chat computes the same values while streaming; exposing the
+// persisted trace summary lets a resumed Desktop session reconstruct the
+// footer instead of losing everything except a newly fabricated timestamp.
+type traceTurnMetricView struct {
+	Turn         int     `json:"turn"`
+	StartedAt    string  `json:"startedAt"`
+	CompletedAt  string  `json:"completedAt"`
+	DurationMs   int64   `json:"durationMs"`
+	TtftMs       int64   `json:"ttftMs,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	TokPerSec    float64 `json:"tokPerSec,omitempty"`
+}
+
+func traceTurnMetrics(nodes []session.TracedNode) []traceTurnMetricView {
+	type turnMetric struct {
+		first        time.Time
+		last         time.Time
+		firstToken   time.Time
+		outputTokens int64
+		completed    bool
+		timingExact  bool
+	}
+	turns := make(map[int]*turnMetric)
+	for _, node := range nodes {
+		ev := node.Event
+		if ev.Turn <= 0 || ev.TS.IsZero() {
+			continue
+		}
+		metric := turns[ev.Turn]
+		if metric == nil {
+			metric = &turnMetric{}
+			turns[ev.Turn] = metric
+		}
+		if metric.first.IsZero() || ev.TS.Before(metric.first) {
+			metric.first = ev.TS
+		}
+		if metric.last.IsZero() || ev.TS.After(metric.last) {
+			metric.last = ev.TS
+		}
+		if ev.Kind == "text" || ev.Kind == "thinking" {
+			if metric.firstToken.IsZero() || ev.TS.Before(metric.firstToken) {
+				metric.firstToken = ev.TS
+				metric.timingExact = ev.ElapsedMs > 0
+			}
+		}
+		if ev.Kind == "tokens" {
+			var in, out, cacheWrite, cacheRead int64
+			fmt.Sscanf(ev.Text, "input=%d output=%d cache_write=%d cache_read=%d", &in, &out, &cacheWrite, &cacheRead)
+			metric.outputTokens += out
+		}
+		if ev.Kind == "loop_done" {
+			metric.completed = true
+		}
+	}
+
+	turnNumbers := make([]int, 0, len(turns))
+	for turn, metric := range turns {
+		if metric.completed && !metric.first.IsZero() && !metric.last.Before(metric.first) {
+			turnNumbers = append(turnNumbers, turn)
+		}
+	}
+	sort.Ints(turnNumbers)
+	out := make([]traceTurnMetricView, 0, len(turnNumbers))
+	for _, turn := range turnNumbers {
+		metric := turns[turn]
+		view := traceTurnMetricView{
+			Turn:         turn,
+			StartedAt:    metric.first.Format(time.RFC3339),
+			CompletedAt:  metric.last.Format(time.RFC3339),
+			DurationMs:   metric.last.Sub(metric.first).Milliseconds(),
+			OutputTokens: metric.outputTokens,
+		}
+		if metric.timingExact && !metric.firstToken.IsZero() && metric.firstToken.After(metric.first) {
+			view.TtftMs = metric.firstToken.Sub(metric.first).Milliseconds()
+		}
+		if metric.timingExact && metric.outputTokens > 0 && !metric.firstToken.IsZero() && metric.last.After(metric.firstToken) {
+			view.TokPerSec = float64(metric.outputTokens) / metric.last.Sub(metric.firstToken).Seconds()
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
 // activeTraceDuration sums the recorded wall time inside each conversation
 // turn. Time between turns is user idle time and must not be reported as LLM
 // latency when a session is resumed hours or days later.
@@ -2911,6 +3061,36 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		source = "history"
 	}
 	nodes = coalesceTraceToolArgs(nodes)
+	turnMetrics := []traceTurnMetricView{}
+	if source == "live" {
+		turnMetrics = traceTurnMetrics(nodes)
+	}
+	if persisted, err := s.store.ReadMessageMetrics(sid); err == nil && len(persisted) > 0 {
+		byTurn := make(map[int]traceTurnMetricView, len(turnMetrics)+len(persisted))
+		for _, metric := range turnMetrics {
+			byTurn[metric.Turn] = metric
+		}
+		for _, metric := range persisted {
+			byTurn[metric.Turn] = traceTurnMetricView{
+				Turn:         metric.Turn,
+				StartedAt:    metric.StartedAt.Format(time.RFC3339),
+				CompletedAt:  metric.CompletedAt.Format(time.RFC3339),
+				DurationMs:   metric.DurationMS,
+				TtftMs:       metric.TTFTMS,
+				OutputTokens: metric.OutputTokens,
+				TokPerSec:    metric.TokPerSec,
+			}
+		}
+		turnNumbers := make([]int, 0, len(byTurn))
+		for turn := range byTurn {
+			turnNumbers = append(turnNumbers, turn)
+		}
+		sort.Ints(turnNumbers)
+		turnMetrics = turnMetrics[:0]
+		for _, turn := range turnNumbers {
+			turnMetrics = append(turnMetrics, byTurn[turn])
+		}
+	}
 	pageEnd := len(nodes)
 	if cursorEnd >= 0 {
 		if cursorEnd > len(nodes) {
@@ -3006,6 +3186,7 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		"source":      source,
 		"events":      pageEvents,
 		"stats":       &stats,
+		"turnMetrics": turnMetrics,
 		"totalEvents": len(events),
 		"hasMore":     pageStart > 0,
 		"nextCursor":  nextCursor,

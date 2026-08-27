@@ -166,6 +166,147 @@ func TestTraceEndpointServesTreeAndStats(t *testing.T) {
 	}
 }
 
+func TestTraceEndpointServesPerTurnMessageMetrics(t *testing.T) {
+	oldAdapter := rtpkg.CurrentTraceAdapter()
+	defer rtpkg.SetTraceAdapter(oldAdapter)
+
+	adapter := rtpkg.InstallTrace(t.TempDir())
+	if adapter == nil {
+		t.Fatal("InstallTrace returned nil adapter")
+	}
+	defer func() {
+		if store := rtpkg.CurrentTraceStore(); store != nil {
+			_ = store.Close()
+		}
+	}()
+
+	const sessionID = "sess-message-metrics"
+	base := time.Date(2026, time.August, 27, 15, 28, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	store := rtpkg.CurrentTraceStore()
+	for _, event := range []session.TraceEvent{
+		{SessionID: sessionID, Turn: 1, Kind: "user", TS: base, Text: "hello"},
+		{SessionID: sessionID, Turn: 1, Kind: "thinking", TS: base.Add(2 * time.Second), Text: "reason", ElapsedMs: 1},
+		{SessionID: sessionID, Turn: 1, Kind: "tokens", TS: base.Add(7 * time.Second), Text: "input=100 output=30 cache_write=0 cache_read=80"},
+		{SessionID: sessionID, Turn: 1, Kind: "tokens", TS: base.Add(9 * time.Second), Text: "input=40 output=50 cache_write=0 cache_read=20"},
+		{SessionID: sessionID, Turn: 1, Kind: "text", TS: base.Add(9 * time.Second), Text: "answer"},
+		{SessionID: sessionID, Turn: 1, Kind: "loop_done", TS: base.Add(10 * time.Second)},
+	} {
+		if err := store.Append(&event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/api/trace?sessionId="+sessionID, nil))
+	if rr.Code != 200 {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		TurnMetrics []struct {
+			Turn         int     `json:"turn"`
+			StartedAt    string  `json:"startedAt"`
+			CompletedAt  string  `json:"completedAt"`
+			DurationMs   int64   `json:"durationMs"`
+			TtftMs       int64   `json:"ttftMs"`
+			OutputTokens int64   `json:"outputTokens"`
+			TokPerSec    float64 `json:"tokPerSec"`
+		} `json:"turnMetrics"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.TurnMetrics) != 1 {
+		t.Fatalf("turn metrics = %+v, want one completed turn", payload.TurnMetrics)
+	}
+	got := payload.TurnMetrics[0]
+	if got.Turn != 1 || got.StartedAt != base.Format(time.RFC3339) || got.CompletedAt != base.Add(10*time.Second).Format(time.RFC3339) {
+		t.Fatalf("turn identity/timestamps = %+v", got)
+	}
+	if got.DurationMs != 10_000 || got.TtftMs != 2_000 || got.OutputTokens != 80 || got.TokPerSec != 10 {
+		t.Fatalf("turn metrics = %+v", got)
+	}
+}
+
+func TestTraceEndpointPrefersPersistedMessageMetrics(t *testing.T) {
+	oldAdapter := rtpkg.CurrentTraceAdapter()
+	defer rtpkg.SetTraceAdapter(oldAdapter)
+	adapter := rtpkg.InstallTrace(t.TempDir())
+	if adapter == nil {
+		t.Fatal("InstallTrace returned nil adapter")
+	}
+	defer func() {
+		if store := rtpkg.CurrentTraceStore(); store != nil {
+			_ = store.Close()
+		}
+	}()
+
+	const sessionID = "sess-persisted-message-metrics"
+	base := time.Date(2026, time.August, 27, 15, 28, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	traceStore := rtpkg.CurrentTraceStore()
+	for _, event := range []session.TraceEvent{
+		{SessionID: sessionID, Turn: 1, Kind: "user", TS: base, Text: "hello"},
+		// Legacy coalesced traces timestamp text at the end of generation and
+		// would therefore produce a bogus near-zero generation interval.
+		{SessionID: sessionID, Turn: 1, Kind: "text", TS: base.Add(10 * time.Second), Text: "answer"},
+		{SessionID: sessionID, Turn: 1, Kind: "tokens", TS: base.Add(10 * time.Second), Text: "input=100 output=80 cache_write=0 cache_read=80"},
+		{SessionID: sessionID, Turn: 1, Kind: "loop_done", TS: base.Add(10 * time.Second)},
+	} {
+		if err := traceStore.Append(&event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s, sessionStore := testServer(t)
+	want := session.MessageMetric{
+		Turn: 1, StartedAt: base, CompletedAt: base.Add(10 * time.Second),
+		DurationMS: 10_000, TTFTMS: 2_000, OutputTokens: 80, TokPerSec: 10,
+	}
+	if err := sessionStore.AppendMessageMetric(sessionID, want); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/api/trace?sessionId="+sessionID+"&limit=1", nil))
+	var payload struct {
+		TurnMetrics []struct {
+			Turn       int     `json:"turn"`
+			TtftMs     int64   `json:"ttftMs"`
+			TokPerSec  float64 `json:"tokPerSec"`
+			DurationMs int64   `json:"durationMs"`
+		} `json:"turnMetrics"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.TurnMetrics) != 1 || payload.TurnMetrics[0].TtftMs != 2_000 || payload.TurnMetrics[0].TokPerSec != 10 || payload.TurnMetrics[0].DurationMs != 10_000 {
+		t.Fatalf("trace endpoint did not prefer persisted metrics: %+v", payload.TurnMetrics)
+	}
+}
+
+func TestDisplayTurnCountSkipsRuntimeAndSteeringMessages(t *testing.T) {
+	history := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "first prompt"}}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "[user steer mid-turn] correction"}}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "<system-reminder>private</system-reminder>"}}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "tool_result", ToolUseID: "t1", ToolResult: "done"}}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "<system-reminder>plan</system-reminder>\nsecond prompt"}}},
+	}
+	if got := displayTurnCount(history); got != 2 {
+		t.Fatalf("display turn count = %d, want 2", got)
+	}
+
+	s, store := testServer(t)
+	started := time.Date(2026, time.August, 27, 15, 28, 0, 0, time.UTC)
+	if err := store.AppendMessageMetric("next-metric-turn", session.MessageMetric{
+		Turn: 5, StartedAt: started, CompletedAt: started.Add(time.Second), DurationMS: 1_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.nextMessageMetricTurn("next-metric-turn", history); got != 6 {
+		t.Fatalf("next metric turn = %d, want durable max + 1", got)
+	}
+}
+
 func TestActiveTraceDurationExcludesIdleTimeBetweenTurns(t *testing.T) {
 	start := time.Date(2026, time.August, 19, 10, 0, 0, 0, time.UTC)
 	nodes := []session.TracedNode{

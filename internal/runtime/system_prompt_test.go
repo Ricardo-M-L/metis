@@ -21,6 +21,24 @@ func TestAssembleSystemPrompt_NoFileAddsEnvBlock(t *testing.T) {
 	if !strings.Contains(got, "Working directory:") || !strings.Contains(got, "Home directory:") {
 		t.Errorf("env block content missing; got %q", got)
 	}
+	if !strings.Contains(got, "Local date and time:") || !strings.Contains(got, "Local timezone:") || !strings.Contains(got, "UTC") {
+		t.Errorf("env block must expose the detected local time and UTC offset; got %q", got)
+	}
+}
+
+func TestFormatUTCOffset(t *testing.T) {
+	for _, tc := range []struct {
+		seconds int
+		want    string
+	}{
+		{seconds: 8 * 60 * 60, want: "UTC+08:00"},
+		{seconds: -(3*60*60 + 30*60), want: "UTC-03:30"},
+		{seconds: 0, want: "UTC+00:00"},
+	} {
+		if got := formatUTCOffset(tc.seconds); got != tc.want {
+			t.Errorf("formatUTCOffset(%d) = %q, want %q", tc.seconds, got, tc.want)
+		}
+	}
 }
 
 func TestAssembleSystemPrompt_AppendsFileContent(t *testing.T) {

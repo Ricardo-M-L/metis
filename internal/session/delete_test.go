@@ -20,6 +20,7 @@ func TestDeleteRemovesOwnedFilesAndPreservesPrefixCollisions(t *testing.T) {
 
 	owned := []string{
 		store.timingPath(id),
+		store.messageMetricsPath(id),
 		store.costPath(id),
 		store.costPath(id) + ".tmp",
 		store.archivePath(id),
@@ -40,6 +41,7 @@ func TestDeleteRemovesOwnedFilesAndPreservesPrefixCollisions(t *testing.T) {
 
 	unrelated := []string{
 		store.timingPath("sess-extra"),
+		store.messageMetricsPath("sess-extra"),
 		store.costPath("sess-extra"),
 		store.archivePath("sess-extra"),
 		filepath.Join(dir, "tags", "sess-extra.txt"),

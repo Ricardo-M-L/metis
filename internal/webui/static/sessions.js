@@ -10,6 +10,7 @@ let sessionsLoading = false;
 let sessionSearchTimer = null;
 let sessionDeleteDialog = null;
 let sessionRenameDialog = null;
+let removedWorkspaceIDs = new Set();
 
 async function loadWorkspaces() {
   try {
@@ -17,10 +18,12 @@ async function loadWorkspaces() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'workspaces: ' + res.status);
     workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
+    removedWorkspaceIDs = new Set(Array.isArray(data.removedIds) ? data.removedIds : []);
     activeWorkspaceId = data.activeId || '';
     renderSessions();
   } catch (e) {
     workspaces = [];
+    removedWorkspaceIDs = new Set();
     showToast('Unable to load workspaces: ' + e.message);
   }
 }
@@ -773,12 +776,11 @@ function renderWorkspaceHeader(ws, count, index) {
     </button>
     <button type="button" class="ws-more" aria-label="Workspace actions for ${escAttr(ws.name)}" aria-expanded="false" onclick="event.stopPropagation();toggleWorkspaceMenu(this)">&#8943;</button>
     <div class="workspace-menu" style="display:none">
-      <button type="button" onclick="event.stopPropagation();openWorkspace('${escOnclick(ws.id)}')"${active || unavailable ? ' disabled' : ''}>Open in new window</button>
       <button type="button" onclick="event.stopPropagation();renameWorkspace('${escOnclick(ws.id)}')">Rename</button>
       <button type="button" onclick="event.stopPropagation();moveWorkspace('${escOnclick(ws.id)}',-1)"${index === 0 ? ' disabled' : ''}>Move up</button>
       <button type="button" onclick="event.stopPropagation();moveWorkspace('${escOnclick(ws.id)}',1)"${index === workspaces.length - 1 ? ' disabled' : ''}>Move down</button>
       <div class="session-menu-sep"></div>
-      <button type="button" class="danger" onclick="event.stopPropagation();removeWorkspace('${escOnclick(ws.id)}')"${active ? ' disabled' : ''}>Remove from list</button>
+      <button type="button" class="danger" onclick="event.stopPropagation();removeWorkspace('${escOnclick(ws.id)}')">Remove from list</button>
     </div>
   </div>`;
 }
@@ -860,6 +862,7 @@ function renderSessions() {
   }
   const visibleWorkspaceIDs = workspaces.length ? new Set(workspaces.map(w => w.id)) : null;
   const sorted = sortSessionItems(sessions.filter(s => {
+    if (s.workspaceId && removedWorkspaceIDs.has(s.workspaceId)) return false;
     if (visibleWorkspaceIDs && s.workspaceId && !visibleWorkspaceIDs.has(s.workspaceId)) return false;
     return sessionMatches(s);
   }));

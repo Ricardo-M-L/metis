@@ -27,8 +27,77 @@ type TimingStep struct {
 	IsError   bool      `json:"is_error,omitempty"`
 }
 
+// MessageMetric is the user-visible footer for one completed conversation
+// turn. Unlike tool timing and cumulative cost, these values must be kept per
+// turn so Desktop can restore "duration / first token / tok/s" after a session
+// switch or application restart.
+type MessageMetric struct {
+	Turn         int       `json:"turn"`
+	StartedAt    time.Time `json:"started_at"`
+	CompletedAt  time.Time `json:"completed_at"`
+	DurationMS   int64     `json:"duration_ms"`
+	TTFTMS       int64     `json:"ttft_ms,omitempty"`
+	OutputTokens int64     `json:"output_tokens,omitempty"`
+	TokPerSec    float64   `json:"tok_per_sec,omitempty"`
+}
+
 func (s *Store) timingPath(id string) string {
 	return filepath.Join(s.Dir, filepath.Base(id)+".timing.jsonl")
+}
+
+func (s *Store) messageMetricsPath(id string) string {
+	return filepath.Join(s.Dir, filepath.Base(id)+".message-metrics.jsonl")
+}
+
+// AppendMessageMetric durably appends one completed turn's footer metadata.
+// Turns are serialized by the runtime, but Store.mu also protects callers that
+// share a Store outside the WebUI.
+func (s *Store) AppendMessageMetric(id string, metric MessageMetric) error {
+	if s == nil || metric.Turn <= 0 || metric.StartedAt.IsZero() || metric.CompletedAt.Before(metric.StartedAt) {
+		return os.ErrInvalid
+	}
+	raw, err := json.Marshal(metric)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.OpenFile(s.messageMetricsPath(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(append(raw, '\n')); err == nil {
+		err = s.syncOpenFile(f)
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+// ReadMessageMetrics returns every valid persisted turn in append order.
+// A malformed/torn line is ignored so diagnostic metadata can never make the
+// canonical conversation unreadable.
+func (s *Store) ReadMessageMetrics(id string) ([]MessageMetric, error) {
+	data, err := os.ReadFile(s.messageMetricsPath(id))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []MessageMetric
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var metric MessageMetric
+		if json.Unmarshal(line, &metric) == nil && metric.Turn > 0 && !metric.StartedAt.IsZero() && !metric.CompletedAt.Before(metric.StartedAt) {
+			out = append(out, metric)
+		}
+	}
+	return out, nil
 }
 
 // TimingRecorder appends per-step timing to a session's sidecar. The agent

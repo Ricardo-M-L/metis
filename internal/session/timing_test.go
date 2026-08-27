@@ -54,6 +54,34 @@ func TestNilTimingRecorder_IsNoop(t *testing.T) {
 	// must not panic
 }
 
+func TestMessageMetricSidecar_RoundTrip(t *testing.T) {
+	store, _ := NewStore(t.TempDir())
+	started := time.Date(2026, time.August, 27, 15, 28, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	want := MessageMetric{
+		Turn:         3,
+		StartedAt:    started,
+		CompletedAt:  started.Add(10 * time.Second),
+		DurationMS:   10_000,
+		TTFTMS:       2_000,
+		OutputTokens: 80,
+		TokPerSec:    10,
+	}
+	if err := store.AppendMessageMetric("message-metrics", want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ReadMessageMetrics("message-metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Turn != want.Turn || !got[0].StartedAt.Equal(want.StartedAt) || !got[0].CompletedAt.Equal(want.CompletedAt) ||
+		got[0].DurationMS != want.DurationMS || got[0].TTFTMS != want.TTFTMS || got[0].OutputTokens != want.OutputTokens || got[0].TokPerSec != want.TokPerSec {
+		t.Fatalf("message metrics = %+v, want %+v", got, want)
+	}
+	if missing, err := store.ReadMessageMetrics("missing"); err != nil || len(missing) != 0 {
+		t.Fatalf("missing metrics = %+v, %v", missing, err)
+	}
+}
+
 func TestCostSidecar_RoundTrip(t *testing.T) {
 	store, _ := NewStore(t.TempDir())
 	id := store.NewSessionID()

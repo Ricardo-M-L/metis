@@ -43,8 +43,9 @@ func DefaultBasePrompt() string {
 func SimpleBasePrompt(model string) string {
 	_ = model // model is intentionally not surfaced in the prompt
 	cwd, _ := os.Getwd()
-	return fmt.Sprintf("You are metis, a fast local-first agent CLI. CWD: %s. Date: %s.",
-		cwd, time.Now().Format("2006-01-02"))
+	now := time.Now()
+	return fmt.Sprintf("You are metis, a fast local-first agent CLI. CWD: %s. Date: %s. Local timezone: %s.",
+		cwd, now.Format("2006-01-02 15:04:05"), localTimezoneLabel(now))
 }
 
 // IsSimpleMode returns true when the user opted into the simple-prompt
@@ -638,6 +639,7 @@ func detectInjectionPatterns(body string) []string {
 // so we do it on every chat boot rather than caching — that way a
 // /clear after `cd otherproj` picks up the new cwd.
 func buildEnvBlock() string {
+	now := time.Now()
 	cwd, _ := os.Getwd()
 	home, _ := os.UserHomeDir()
 	uname := ""
@@ -661,12 +663,59 @@ func buildEnvBlock() string {
 		fmt.Fprintf(&b, "Hostname: %s\n", host)
 	}
 	fmt.Fprintf(&b, "Platform: %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
+	fmt.Fprintf(&b, "Today's date: %s\n", now.Format("2006-01-02"))
+	fmt.Fprintf(&b, "Local date and time: %s\n", now.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "Local timezone: %s\n", localTimezoneLabel(now))
 	if branch := currentGitBranch(); branch != "" {
 		fmt.Fprintf(&b, "Git branch: %s\n", branch)
 	}
 	b.WriteString("</env>")
 	return b.String()
+}
+
+// localTimezoneLabel exposes both the user's best-effort IANA timezone and
+// the unambiguous UTC offset. Go reports time.Local as the literal name
+// "Local" on some platforms (including macOS), so fall back to the operating
+// system's zoneinfo link before using the short abbreviation.
+func localTimezoneLabel(now time.Time) string {
+	_, offsetSeconds := now.Zone()
+	return detectLocalTimezoneName(now) + " (" + formatUTCOffset(offsetSeconds) + ")"
+}
+
+func detectLocalTimezoneName(now time.Time) string {
+	if name := strings.TrimPrefix(strings.TrimSpace(os.Getenv("TZ")), ":"); name != "" && name != "Local" {
+		return name
+	}
+	if loc := now.Location().String(); loc != "" && loc != "Local" {
+		return loc
+	}
+	if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
+		const marker = "/zoneinfo/"
+		if i := strings.LastIndex(filepath.ToSlash(target), marker); i >= 0 {
+			if name := strings.TrimSpace(filepath.ToSlash(target)[i+len(marker):]); name != "" {
+				return name
+			}
+		}
+	}
+	if data, err := os.ReadFile("/etc/timezone"); err == nil {
+		if name := strings.TrimSpace(string(data)); name != "" {
+			return name
+		}
+	}
+	if name, _ := now.Zone(); name != "" {
+		return name
+	}
+	return "Local"
+}
+
+func formatUTCOffset(offsetSeconds int) string {
+	sign := "+"
+	if offsetSeconds < 0 {
+		sign = "-"
+		offsetSeconds = -offsetSeconds
+	}
+	totalMinutes := offsetSeconds / 60
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, totalMinutes/60, totalMinutes%60)
 }
 
 // currentGitBranch returns the active branch name, or "" when the cwd

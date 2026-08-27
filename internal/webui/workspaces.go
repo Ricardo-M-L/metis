@@ -277,6 +277,17 @@ func (s *Server) workspaceViews(reg workspaceRegistry) ([]workspaceView, string)
 	return views, activeID
 }
 
+func removedWorkspaceIDs(reg workspaceRegistry) []string {
+	ids := make([]string, 0)
+	for _, record := range reg.Workspaces {
+		if record.Removed {
+			ids = append(ids, record.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func maxWorkspaceOrder(reg workspaceRegistry) int {
 	maxOrder := -1
 	for _, record := range reg.Workspaces {
@@ -325,7 +336,11 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		views, activeID := s.workspaceViews(reg)
-		writeJSON(w, http.StatusOK, map[string]any{"workspaces": views, "activeId": activeID})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"workspaces": views,
+			"activeId":   activeID,
+			"removedIds": removedWorkspaceIDs(reg),
+		})
 	case http.MethodPost:
 		var body struct {
 			Path string `json:"path"`
@@ -429,10 +444,6 @@ func (s *Server) handleWorkspaceRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil || body.ID == "" {
 		writeError(w, http.StatusBadRequest, "workspace id is required")
-		return
-	}
-	if body.ID == workspaceIDForPath(mustCurrentWorkspace()) {
-		writeError(w, http.StatusConflict, "cannot remove the workspace open in this window")
 		return
 	}
 	reg, err := loadWorkspaceRegistry()

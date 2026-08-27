@@ -27,6 +27,7 @@ func (s *Store) Delete(id string) error {
 	}
 
 	remove("timing", s.timingPath(id))
+	remove("message metrics", s.messageMetricsPath(id))
 	remove("cost", s.costPath(id))
 	remove("cost temp", s.costPath(id)+".tmp")
 	remove("archive marker", s.archivePath(id))

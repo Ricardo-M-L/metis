@@ -495,7 +495,7 @@ function showTurnStatsLine() {
     const area = document.getElementById('chatArea');
     const rows = area.querySelectorAll('.message-assistant .msg-actions');
     const actions = rows.length ? rows[rows.length - 1] : null;
-    const metrics = `<span class="msg-metrics"><span class="msg-sep">\u00B7</span><span>${uiText('Ran for ', '用时 ')}${fmtRunDur(ms)}</span>${ttft ? `<span class="msg-sep">\u00B7</span><span>${uiText('First token ', '首 token ')}${fmtMs(ttft)}</span>` : ''}${tps ? `<span class="msg-sep">\u00B7</span><span>${tps} tok/s</span>` : ''}</span>`;
+    const metrics = turnMetricsMarkup({ durationMs: ms, ttftMs: ttft, tokPerSec: tps });
     if (actions) {
       const previous = actions.querySelector('.msg-metrics');
       if (previous) previous.remove();
@@ -1829,10 +1829,40 @@ function messageActionButton(icon, label, onclick) {
   return `<button type="button" class="msg-btn" data-icon="${icon}" onclick="${onclick}" title="${escAttr(label)}" aria-label="${escAttr(label)}">${MESSAGE_ACTION_ICONS[icon]}</button>`;
 }
 
+const MESSAGE_TIME_ZONE = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
+  } catch (_) {
+    return 'Local';
+  }
+})();
+
+function messageUTCOffset(date) {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absolute = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(absolute / 60)).padStart(2, '0');
+  const minutes = String(absolute % 60).padStart(2, '0');
+  return `UTC${sign}${hours}:${minutes}`;
+}
+
 function messageActionTime(date = new Date()) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
   const lang = resolvedLanguage(desktopPreferences.language);
-  const options = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
-  return new Intl.DateTimeFormat(lang === 'en' ? 'en-US' : 'zh-CN', options).format(date);
+  const options = {
+    year: 'numeric', month: lang === 'en' ? 'short' : 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  };
+  const localDateTime = new Intl.DateTimeFormat(lang === 'en' ? 'en-US' : 'zh-CN', options).format(date);
+  return `${localDateTime} · ${messageUTCOffset(date)} · ${MESSAGE_TIME_ZONE}`;
+}
+
+function turnMetricsMarkup(metric) {
+  const durationMs = Number(metric && metric.durationMs) || 0;
+  const ttftMs = Number(metric && metric.ttftMs) || 0;
+  const tokPerSec = Math.round(Number(metric && metric.tokPerSec) || 0);
+  if (durationMs <= 0 && ttftMs <= 0 && tokPerSec <= 0) return '';
+  return `<span class="msg-metrics"><span class="msg-sep">\u00B7</span><span>${uiText('Ran for ', '用时 ')}${fmtRunDur(durationMs)}</span>${ttftMs ? `<span class="msg-sep">\u00B7</span><span>${uiText('First token ', '首 token ')}${fmtMs(ttftMs)}</span>` : ''}${tokPerSec ? `<span class="msg-sep">\u00B7</span><span>${tokPerSec} tok/s</span>` : ''}</span>`;
 }
 
 function messageActionsMarkup(role, date = new Date()) {
@@ -1842,28 +1872,33 @@ function messageActionsMarkup(role, date = new Date()) {
   const ratings = role === 'assistant'
     ? messageActionButton('up', uiText('Good reply', '回答很好'), "rateMessage(this,'up')") + messageActionButton('down', uiText('Bad reply', '回答不好'), "rateMessage(this,'down')")
     : '';
-  return `<div class="msg-actions">${copy}${ratings}${branch}${feedback}<span class="msg-time">${escHtml(messageActionTime(date))}</span></div>`;
+  const time = date instanceof Date && !Number.isNaN(date.getTime())
+    ? `<span class="msg-time">${escHtml(messageActionTime(date))}</span>`
+    : '';
+  return `<div class="msg-actions">${copy}${ratings}${branch}${feedback}${time}</div>`;
 }
 
-function addMessage(role, content, remember = true, idx = -1) {
-  if (remember) messages.push({ role, content, time: new Date() });
+function addMessage(role, content, remember = true, idx = -1, historyTurn = 0) {
+  const now = remember ? new Date() : null;
+  if (remember) messages.push({ role, content, time: now });
   const index = idx >= 0 ? idx : (remember ? messages.length - 1 : -1);
   const area = document.getElementById('chatArea');
   const idxAttr = index >= 0 ? ` data-idx="${index}"` : '';
+  const turnAttr = historyTurn > 0 ? ` data-history-turn="${historyTurn}"` : '';
 
   if (role === 'user') {
     area.insertAdjacentHTML('beforeend', `
-      <div class="message message-user"${idxAttr}>
+      <div class="message message-user"${idxAttr}${turnAttr}>
         <div class="message-bubble">${escHtml(content)}</div>
-        ${messageActionsMarkup('user')}
+        ${messageActionsMarkup('user', now)}
       </div>`);
   } else {
     area.insertAdjacentHTML('beforeend', `
-      <div class="message message-assistant"${idxAttr}>
+      <div class="message message-assistant"${idxAttr}${turnAttr}>
         <div class="message-avatar">M</div>
         <div class="message-body">
           <div class="message-content">${formatContent(content)}</div>
-          ${messageActionsMarkup('assistant')}
+          ${messageActionsMarkup('assistant', now)}
         </div>
       </div>`);
   }
@@ -1993,18 +2028,24 @@ function renderHistoryMessages(history) {
   followOutput = false;
   area.innerHTML = '';
   let i = 0;
+  let historyTurn = 0;
   (history || []).forEach(m => {
     const role = m.role === 'user' ? 'user' : 'assistant';
     const blocks = Array.isArray(m.content)
       ? m.content
       : (m.content != null ? [{ type: 'text', text: String(m.content) }] : []);
+    if (role === 'user' && blocks.some(b => {
+      if (!b || b.type !== 'text') return false;
+      const text = String(b.text || '');
+      return text.trim() && !text.startsWith('[user steer mid-turn] ') && visibleTranscriptText(text).trim();
+    })) historyTurn++;
     blocks.forEach(b => {
       if (!b || typeof b !== 'object') return;
       if (b.type === 'text' && (b.text || '').trim()) {
         const rawShown = role === 'user' && String(b.text).startsWith('[user steer mid-turn] ')
           ? String(b.text).slice('[user steer mid-turn] '.length) : b.text;
         const shown = visibleTranscriptText(rawShown);
-        if (shown.trim()) addMessage(role, shown, false, i++);
+        if (shown.trim()) addMessage(role, shown, false, i++, historyTurn);
       } else if (role === 'assistant' && b.type === 'thinking' && (b.text || '').trim()) {
         try {
           appendThinkingRow(b.text);
@@ -2039,6 +2080,43 @@ function renderHistoryMessages(history) {
   });
   updateEmptyLayout();
   resumeAutoScroll();
+  void restoreHistoryMessageMetadata(currentSessionId);
+}
+
+async function restoreHistoryMessageMetadata(sessionId) {
+  if (!sessionId) return;
+  try {
+    const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(sessionId) + '&limit=1');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (currentSessionId !== sessionId) return;
+    (data.turnMetrics || []).forEach(metric => {
+      const turn = Number(metric.turn) || 0;
+      if (turn <= 0) return;
+
+      const userActions = document.querySelector(`.message-user[data-history-turn="${turn}"] .msg-actions`);
+      const startedAt = new Date(metric.startedAt || '');
+      if (userActions && !Number.isNaN(startedAt.getTime())) {
+        userActions.querySelector('.msg-time')?.remove();
+        userActions.insertAdjacentHTML('beforeend', `<span class="msg-time">${escHtml(messageActionTime(startedAt))}</span>`);
+      }
+
+      const assistantRows = document.querySelectorAll(`.message-assistant[data-history-turn="${turn}"] .msg-actions`);
+      const assistantActions = assistantRows.length ? assistantRows[assistantRows.length - 1] : null;
+      if (!assistantActions) return;
+      assistantActions.querySelector('.msg-time')?.remove();
+      assistantActions.querySelector('.msg-metrics')?.remove();
+      const completedAt = new Date(metric.completedAt || '');
+      if (!Number.isNaN(completedAt.getTime())) {
+        assistantActions.insertAdjacentHTML('beforeend', `<span class="msg-time">${escHtml(messageActionTime(completedAt))}</span>`);
+      }
+      const metrics = turnMetricsMarkup(metric);
+      if (metrics) {
+        assistantActions.insertAdjacentHTML('beforeend', metrics);
+        assistantActions.classList.add('with-metrics');
+      }
+    });
+  } catch (_) {}
 }
 
 function showError(text) {

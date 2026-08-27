@@ -44,7 +44,7 @@ func TestStaticAssetsServed(t *testing.T) {
 	scriptChecks := map[string][]string{
 		"app.js":       {"escHtml", "escAttr", "DOMContentLoaded", "detectProject", "contextMeter", "initDesktopPreferences", "renderStatusPopover", "renderStatusSnapshot", "openRailSearch", "applyLanguage", "data-i18n-label", "data-i18n-title", "syncApprovalChip(approvalMode)", "requestNative", "checkDesktopUpdate", "openDesktopUpdateDialog", "installDesktopUpdate", "From idea to done", "从想法，到完成", "METIS Desktop"},
 		"sessions.js":  {"loadSessions", "loadMoreSessions", "renderSessions", "resumeSession", "archiveSession", "restoreSession", "openSessionDeleteDialog", "confirmSessionDeletion", "closeSessionDeleteDialog", `role="alertdialog"`, "requestAnimationFrame(() => cancel.focus())", "method: 'DELETE'", "setSessionPreference", "workspaceLabel", "sessionItemKeydown", "loadWorkspaces", "addWorkspace", "requestNative('choose-workspace')", "openWorkspace", "renameWorkspace", "removeWorkspace", "moveWorkspace", "moveSession", "showSessionDetail", "Plan session completed"},
-		"chat.js":      {"connectEvents", "acceptLiveEvent", "sendMessage", "handleTextDelta", "showReconnectBanner", "endStreamingMessage", "openAttachmentPicker", "initAttachmentDrop", "pasteClipboardFilePaths", "pasteAllClipboardFilePaths", "/api/clipboard/files", "selectionStart", "COMPOSER_COMMANDS", "COMPOSER_ADD_ACTIONS", "toggleComposerAddMenu", "getBoundingClientRect().top - 12", "runComposerAddAction", "openComposerActionDialog", "/api/compact", "/api/goals", "/api/feedback", "submitBusyInput", "drainQueuedTurns", "filterSettings", "loadProviders", "saveCustomProvider", "deleteProvider", "validateProvider", "probeProvider", "loadEffort", "loadPresets", "loadPlugins", "loadPluginCatalog", "refreshPluginCatalog", "installPlugin", "removePlugin", "openPluginActionDialog", "pluginEcosystemGrid", "choosePluginEcosystem", "renderPluginEcosystems", "Ecosystem compatibility", "生态兼容层", "/api/plugins/catalog", "/api/plugins/install", "/api/plugins/remove", "loadRouting", "chooseLanguage", "ROUTING_ZH", "appendThinkingRow", "thinkRowKeydown", "REDACTED_THINKING_PLACEHOLDER", "MESSAGE_ACTION_ICONS", "messageActionsMarkup", "msg-metrics"},
+		"chat.js":      {"connectEvents", "acceptLiveEvent", "sendMessage", "handleTextDelta", "showReconnectBanner", "endStreamingMessage", "openAttachmentPicker", "initAttachmentDrop", "pasteClipboardFilePaths", "pasteAllClipboardFilePaths", "/api/clipboard/files", "selectionStart", "COMPOSER_COMMANDS", "COMPOSER_ADD_ACTIONS", "toggleComposerAddMenu", "getBoundingClientRect().top - 12", "runComposerAddAction", "openComposerActionDialog", "/api/compact", "/api/goals", "/api/feedback", "submitBusyInput", "drainQueuedTurns", "filterSettings", "loadProviders", "saveCustomProvider", "deleteProvider", "validateProvider", "probeProvider", "loadEffort", "loadPresets", "loadPlugins", "loadPluginCatalog", "refreshPluginCatalog", "installPlugin", "removePlugin", "openPluginActionDialog", "pluginEcosystemGrid", "choosePluginEcosystem", "renderPluginEcosystems", "Ecosystem compatibility", "生态兼容层", "/api/plugins/catalog", "/api/plugins/install", "/api/plugins/remove", "loadRouting", "chooseLanguage", "ROUTING_ZH", "appendThinkingRow", "thinkRowKeydown", "REDACTED_THINKING_PLACEHOLDER", "MESSAGE_ACTION_ICONS", "messageActionsMarkup", "restoreHistoryMessageMetadata", "turnMetrics", "msg-metrics"},
 		"trace.js":     {"loadTrace", "renderTrace", "switchView", "selectTraceRow", "renderTraceInspector", "toggleFoldTurns", "partialArgs", "mergeTraceEvents", "traceNextCursor", "closeTraceInspector(false)", "thinking_redacted", "k-thinking"},
 		"artifacts.js": {"renderArtifactPresentation", "loadArtifactsForSession", "openArtifactsPanel", "previewArtifactByID", "safeArtifactURL", "confirmArtifactDeletion", "/api/artifacts"},
 	}
@@ -70,6 +70,23 @@ func TestStaticAssetsServed(t *testing.T) {
 	deleteMenuCall := "openSessionDeleteDialog('${escOnclick(s.id)}','',this)"
 	if got := strings.Count(sessionsScript, deleteMenuCall); got != 2 {
 		t.Fatalf("sessions.js delete menu entries = %d, want active + archived", got)
+	}
+	if strings.Contains(sessionsScript, ">Open in new window</button>") {
+		t.Fatal("workspace context menu still contains the retired Open in new window action")
+	}
+	for _, want := range []string{"removedWorkspaceIDs", "data.removedIds", ">Remove from list</button>"} {
+		if !strings.Contains(sessionsScript, want) {
+			t.Fatalf("sessions.js missing workspace removal behavior %q", want)
+		}
+	}
+	if strings.Contains(sessionsScript, `removeWorkspace('${escOnclick(ws.id)}')"${active ? ' disabled' : ''}`) {
+		t.Fatal("active workspace removal is still disabled")
+	}
+	_, _, chatScript := get("/chat.js")
+	for _, want := range []string{"MESSAGE_TIME_ZONE", "resolvedOptions().timeZone", "year: 'numeric'", "UTC${sign}"} {
+		if !strings.Contains(chatScript, want) {
+			t.Fatalf("chat.js missing full timestamp/timezone behavior %q", want)
+		}
 	}
 
 	// index.html: markup stays, logic is external.
