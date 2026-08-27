@@ -227,6 +227,11 @@ type Loop struct {
 	compactMu sync.Mutex
 	mu        sync.RWMutex
 	Messages  []llm.Message
+	// compactorResetPending is set when a reset/session replacement happens
+	// inside a compaction callback and therefore cannot acquire compactMu. The
+	// current compactMu owner clears mutable summary/circuit state before
+	// releasing the transaction. Protected by mu.
+	compactorResetPending bool
 	// estTokens caches the last context-token estimate so the TUI can read
 	// it WITHOUT taking l.mu (see EstimateContextTokens). Keeping this cache
 	// avoids making render frames contend with request/history assembly.
@@ -235,6 +240,11 @@ type Loop struct {
 	// (system/state/memory/tool schemas). Render paths add this without doing
 	// filesystem reads, memory retrieval or registry hydration every frame.
 	requestOverheadTokens atomic.Int64
+	// activeContext is the provider-authoritative active-window snapshot from
+	// the most recently completed response. Unlike EventTokens/Budget usage it
+	// is replaced, never accumulated. Protected by mu; estTokens remains the
+	// non-blocking render fallback while mu is busy.
+	activeContext activeContextSnapshot
 	// autoCompactPressurePinned remembers the history size immediately after an
 	// automatic compaction that could not bring the full request below the
 	// trigger because non-history overhead was already too large. Until the
@@ -248,8 +258,13 @@ type Loop struct {
 	// count toward re-arming) from a manual/overflow/second-wind replacement
 	// (which must establish a new baseline). autoCompactSessionGeneration keeps
 	// a CompactNow result from re-arming state after Reset/Restore won the race.
-	autoCompactHistoryRevision   uint64
-	historyRevision              uint64
+	autoCompactHistoryRevision uint64
+	historyRevision            uint64
+	// routingRevision advances whenever provider/model runtime binding changes.
+	// Long-running compaction transactions capture it before calling the
+	// summarizer and refuse to install a checkpoint produced by an obsolete
+	// provider after a concurrent model switch.
+	routingRevision              uint64
 	historyReplacementTokens     int
 	autoCompactSessionGeneration uint64
 	turnIdx                      int
@@ -607,15 +622,11 @@ func (l *Loop) History() []llm.Message {
 	return transcript.Snapshot(l.Messages)
 }
 
-// EstimateContextTokens returns a rough byte-derived estimate of the current
-// provider request: Messages plus the last preflighted system/state/memory/tool
-// overhead. Used as a STABLE floor for
-// the status bar so providers that under-report cache hits (some
-// Anthropic-compat gateways do) don't make the displayed
-// context-usage number swing down between turns. The status bar renders
-// `max(provider-reported, this estimate)` until the unified compaction
-// pipeline publishes its smaller checkpoint. Exposing the same estimator on
-// the public surface keeps the TUI from duplicating request accounting.
+// EstimateContextTokens returns the active provider context plus any local
+// messages appended since the last response and the latest request-overhead
+// delta. Providers that do not report usable prompt usage fall back to the
+// full-history byte estimate. Exposing the same estimator on the public
+// surface keeps TUI/Desktop status and compaction pressure aligned.
 func (l *Loop) EstimateContextTokens() int {
 	// TryRLock, NOT a blocking lock: the TUI calls this every render frame.
 	// maybeCompact holds l.mu (the write lock) across an entire compaction
@@ -626,7 +637,13 @@ func (l *Loop) EstimateContextTokens() int {
 	// deadlock that spins the spinner for hours (observed: the 6h "stuck"
 	// session). Falling back to the cached estimate keeps the UI draining.
 	if l.mu.TryRLock() {
-		v := estimateTokens(l.Messages) + int(l.requestOverheadTokens.Load())
+		overhead := int(l.requestOverheadTokens.Load())
+		v := 0
+		if base, ok := l.activeContextBaseLocked(); ok {
+			v = max(base+overhead, 0)
+		} else {
+			v = estimateActiveHistoryTokens(l.Messages) + overhead
+		}
 		l.mu.RUnlock()
 		l.estTokens.Store(int64(v))
 		return v
@@ -642,9 +659,10 @@ func (l *Loop) storeContextEstimateFromHistory(historyTokens int) {
 	// history (including CompactNow's temporary/final/rollback installations).
 	// Ordinary appends intentionally do not advance the revision: their token
 	// growth is what re-arms a pressure-pinned automatic checkpoint.
+	l.invalidateActiveContextLocked()
 	l.historyRevision++
 	l.historyReplacementTokens = historyTokens
-	l.estTokens.Store(int64(historyTokens) + l.requestOverheadTokens.Load())
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
 }
 
 // EstimateRequestContextTokens preflights the input that the next provider
@@ -658,6 +676,7 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 
 	l.mu.RLock()
 	historyTokens := estimateTokens(l.Messages)
+	activeBase, hasActiveSnapshot := l.activeContextBaseLocked()
 	system := l.System
 	sections := append([]llm.SystemSection(nil), l.SystemSections...)
 	planMode := l.planMode
@@ -687,7 +706,14 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	memoryManager := l.Memory
 	autoRetrieveK := l.AutoRetrieveK
 	query := lastUserTextLocked(l.Messages)
-	currentState := l.CurrentStateSections
+	currentStateSnapshot := l.CurrentStateSnapshot
+	currentStateSections := l.CurrentStateSections
+	runtimeModel := l.Model
+	runtimeProviderName, runtimeProviderModel := "", ""
+	if l.Provider != nil {
+		runtimeProviderName = l.Provider.Name()
+		runtimeProviderModel = l.Provider.ModelID()
+	}
 	rescueWithoutTools := l.rescueNoTools
 	l.mu.RUnlock()
 
@@ -701,53 +727,79 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 		}
 	}
 	dynamic := []llm.SystemSection(nil)
-	if currentState != nil {
-		dynamic = currentState()
+	if currentStateSnapshot != nil {
+		state := currentStateSnapshot()
+		state.PlanMode = planMode
+		if state.Model == "" {
+			state.Model = runtimeModel
+		}
+		if state.Provider == "" {
+			state.Provider = runtimeProviderName
+		}
+		if state.Model == "" {
+			state.Model = runtimeProviderModel
+		}
+		dynamic = []llm.SystemSection{{Name: "runtime_state", Body: state.Render(), Cache: true}}
+	} else if currentStateSections != nil {
+		dynamic = currentStateSections()
 	}
 
-	overhead := 0
+	requestSections := []llm.SystemSection(nil)
 	if len(sections) > 0 {
+		requestSections = make([]llm.SystemSection, 0, len(sections)+len(dynamic)+3)
 		for _, section := range sections {
 			if section.Name == "plan_mode" {
 				continue
 			}
-			overhead += 4 + estimateStringTokens(section.Body)
+			requestSections = append(requestSections, section)
 		}
 		if planMode && planPrompt != "" {
-			overhead += 4 + estimateStringTokens(planPrompt)
+			requestSections = append(requestSections, llm.SystemSection{
+				Name: "plan_mode", Body: planPrompt, Cache: false, Volatile: true,
+			})
 		}
+		requestSections = append(requestSections, dynamic...)
 		if memBody != "" {
-			overhead += 4 + estimateStringTokens(memBody)
+			requestSections = append(requestSections, llm.SystemSection{
+				Name: "memory", Body: memBody, Cache: false, Volatile: true,
+			})
 		}
 		if retrieveBody != "" {
-			overhead += 4 + estimateStringTokens(retrieveBody)
-		}
-		for _, section := range dynamic {
-			overhead += 4 + estimateStringTokens(section.Body)
+			requestSections = append(requestSections, llm.SystemSection{
+				Name: "auto-retrieve", Body: retrieveBody, Cache: false, Volatile: true,
+			})
 		}
 	} else {
+		for _, section := range dynamic {
+			if strings.TrimSpace(section.Body) != "" {
+				system += "\n\n" + section.Body
+			}
+		}
 		if memBody != "" {
 			system += "\n\n" + memBody
 		}
 		if retrieveBody != "" {
 			system += "\n\n" + retrieveBody
 		}
-		for _, section := range dynamic {
-			if strings.TrimSpace(section.Body) != "" {
-				system += "\n\n" + section.Body
-			}
-		}
-		overhead += estimateStringTokens(system)
 	}
-	if !rescueWithoutTools {
-		for _, spec := range specs {
-			overhead += estimateSpecTokens(spec)
-		}
+	requestTools := specs
+	if rescueWithoutTools {
+		requestTools = nil
 	}
+	overhead := estimateRequestOverhead(llm.Request{
+		System: system, SystemSections: requestSections, Tools: requestTools,
+	})
 
 	l.requestOverheadTokens.Store(int64(overhead))
 	total := historyTokens + overhead
-	l.estTokens.Store(int64(total))
+	if hasActiveSnapshot {
+		total = max(activeBase+overhead, 0)
+	}
+	displayTotal := estimateActiveHistoryTokens(l.Messages) + overhead
+	if hasActiveSnapshot {
+		displayTotal = max(activeBase+overhead, 0)
+	}
+	l.estTokens.Store(int64(displayTotal))
 	return total
 }
 
@@ -813,6 +865,118 @@ func (l *Loop) SetEffort(e llm.Effort) {
 	l.effortMu.Unlock()
 }
 
+// ProviderRuntimeSnapshot is a coherent copy of the provider-controlled
+// request state. It is used by transactional switch surfaces to roll back a
+// failed metadata commit without reconstructing the old binding piecemeal.
+type ProviderRuntimeSnapshot struct {
+	Provider        llm.Provider
+	Model           string
+	ContextWindow   int
+	MaxOutputTokens int
+	System          string
+	SystemSections  []llm.SystemSection
+}
+
+// RebindProviderModel atomically swaps the provider/model/window tuple while
+// preserving the current output budget and system prompt. String-only/test
+// switches use this compatibility surface; production provider rebuilds use
+// RebindProviderRuntime so target-provider limits and hints change together.
+func (l *Loop) RebindProviderModel(provider llm.Provider, model string) {
+	l.rebindProviderRuntime(provider, model, 0, false, "", nil, false)
+}
+
+// RebindProviderRuntime atomically installs a complete provider runtime:
+// routing identity, model window, target output budget, and provider-managed
+// prompt sections. This prevents a request from observing a new transport with
+// an old provider hint (or old compaction reservation).
+func (l *Loop) RebindProviderRuntime(provider llm.Provider, model string, maxOutputTokens int, system string, sections []llm.SystemSection) {
+	l.rebindProviderRuntime(provider, model, maxOutputTokens, true, system, sections, true)
+}
+
+func (l *Loop) rebindProviderRuntime(provider llm.Provider, model string, maxOutputTokens int, replaceOutput bool, system string, sections []llm.SystemSection, replacePrompt bool) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	window := 0
+	if provider != nil {
+		window = provider.MaxContextTokens()
+	}
+	if old := l.Compactor; old != nil && provider != nil {
+		outputBudget := old.MaxOutputTokens
+		if replaceOutput {
+			outputBudget = max(maxOutputTokens, 0)
+		}
+		next := NewCompactor(old.Config, model, window, provider)
+		next.MaxOutputTokens = outputBudget
+		next.ApplyWindowTier(window - outputBudget)
+		l.Compactor = next
+	} else if provider == nil {
+		l.Compactor = nil
+	}
+	l.Provider = provider
+	l.Model = model
+	l.ContextWindow = window
+	if replacePrompt {
+		l.System = system
+		l.SystemSections = append([]llm.SystemSection(nil), sections...)
+	}
+	l.routingRevision++
+	l.invalidateActiveContextLocked()
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
+}
+
+// ProviderRuntimeState returns an immutable provider/runtime binding snapshot.
+func (l *Loop) ProviderRuntimeState() ProviderRuntimeSnapshot {
+	if l == nil {
+		return ProviderRuntimeSnapshot{}
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	snapshot := ProviderRuntimeSnapshot{
+		Provider:       l.Provider,
+		Model:          l.Model,
+		ContextWindow:  l.ContextWindow,
+		System:         l.System,
+		SystemSections: append([]llm.SystemSection(nil), l.SystemSections...),
+	}
+	if l.Compactor != nil {
+		snapshot.MaxOutputTokens = l.Compactor.MaxOutputTokens
+	}
+	return snapshot
+}
+
+// ProviderModelSnapshot returns a coherent routing tuple for callers that
+// need to rebuild prompts or persist selector state without racing a switch.
+func (l *Loop) ProviderModelSnapshot() (llm.Provider, string, int) {
+	if l == nil {
+		return nil, "", 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.Provider, l.Model, l.ContextWindow
+}
+
+// ContextStatusSnapshot exposes immutable status values under the loop lock.
+// The active token estimate is computed separately through
+// EstimateContextTokens so render paths retain its non-blocking TryRLock
+// behavior while a long compaction owns the history lock.
+func (l *Loop) ContextStatusSnapshot() (window int, threshold float64, trigger int) {
+	if l == nil {
+		return 0, 0, 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	window = l.ContextWindow
+	if l.Compactor != nil {
+		threshold = l.Compactor.Config.Threshold
+		trigger = l.Compactor.TriggerTokens()
+	}
+	return window, threshold, trigger
+}
+
 // FastEnabled returns the live quick-output preference. The setting can be
 // read concurrently by provider request assembly and TUI rendering.
 func (l *Loop) FastEnabled() bool {
@@ -870,9 +1034,16 @@ func (l *Loop) SetCheckpointer(manager *checkpoint.Manager) {
 
 // Reset clears the conversation.
 func (l *Loop) Reset() {
+	if l == nil {
+		return
+	}
+	// Reset is allowed from CompactNow callbacks. TryLock keeps that re-entry
+	// non-blocking; when a transaction is active, history changes immediately
+	// and its owner performs the deferred circuit/summary reset on release.
+	ownsCompact := l.compactMu.TryLock()
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.Messages = nil
+	l.invalidateActiveContextLocked()
 	l.turnIdx = 0
 	l.iterIdx = 0
 	l.historyRevision++
@@ -881,11 +1052,26 @@ func (l *Loop) Reset() {
 	l.invalidateRuntimeStateLocked()
 	l.compactCircuitNoticeSent = false
 	l.contract.reset()
-	if l.Compactor != nil {
-		l.Compactor.ResetCircuit()
+	if ownsCompact {
+		if l.Compactor != nil {
+			l.Compactor.ResetCircuit()
+		}
+		l.compactorResetPending = false
+	} else {
+		l.compactorResetPending = true
 	}
 	l.requestOverheadTokens.Store(0)
 	l.estTokens.Store(0)
+	// Releasing compactMu while mu is still held closes the hand-off gap: a
+	// reset that just failed TryLock cannot publish pending state after an owner
+	// has already performed its final pending-state check.
+	if ownsCompact {
+		l.compactMu.Unlock()
+	}
+	l.mu.Unlock()
+	if !ownsCompact {
+		l.flushPendingCompactorResetIfIdle()
+	}
 }
 
 // Restore replaces the conversation history with the supplied messages.
@@ -947,6 +1133,7 @@ func (l *Loop) FirePostCompactHook(ctx context.Context, trigger, tier string,
 }
 
 func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
+	l.invalidateActiveContextLocked()
 	if messages == nil {
 		l.Messages = nil
 	} else {
@@ -969,6 +1156,10 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	if l == nil {
 		return
 	}
+	// Session replacement is also legal from a lifecycle/persistence callback.
+	// Publish it immediately and defer only mutable Compactor state when the
+	// active transaction owns compactMu.
+	ownsCompact := l.compactMu.TryLock()
 	l.mu.Lock()
 	l.restoreMessagesLocked(messages)
 	l.estTokens.Store(0)
@@ -986,10 +1177,20 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	l.discoveredMCP = nil
 	l.discoveredMCPHydrated = false
 	l.contract.reset()
+	if ownsCompact {
+		if l.Compactor != nil {
+			l.Compactor.ResetCircuit()
+		}
+		l.compactorResetPending = false
+	} else {
+		l.compactorResetPending = true
+	}
+	if ownsCompact {
+		l.compactMu.Unlock()
+	}
 	l.mu.Unlock()
-
-	if l.Compactor != nil {
-		l.Compactor.ResetCircuit()
+	if !ownsCompact {
+		l.flushPendingCompactorResetIfIdle()
 	}
 	if l.Budget != nil {
 		l.Budget.Reset()
@@ -1014,6 +1215,31 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	drainSubAgentNotifications(l.subAgentNotify)
 	l.subAgentNotify = make(chan SubAgentNotification, 64)
 	drainJobNotifications(l.JobNotify)
+}
+
+// finishCompactorCriticalSection is the only release path for a compactMu
+// owner that can overlap Reset/ResetSession. It applies any deferred reset to
+// the currently installed Compactor, then releases compactMu while still
+// holding mu so a failed TryLock cannot miss the final pending-state check.
+func (l *Loop) finishCompactorCriticalSection() {
+	l.mu.Lock()
+	if l.compactorResetPending {
+		if l.Compactor != nil {
+			l.Compactor.ResetCircuit()
+		}
+		l.compactorResetPending = false
+	}
+	l.compactMu.Unlock()
+	l.mu.Unlock()
+}
+
+// flushPendingCompactorResetIfIdle handles the narrow case where Reset lost
+// TryLock to an owner that released before Reset could publish the pending
+// bit. If another owner still exists, its finish path is responsible.
+func (l *Loop) flushPendingCompactorResetIfIdle() {
+	if l.compactMu.TryLock() {
+		l.finishCompactorCriticalSection()
+	}
 }
 
 func drainSubAgentNotifications(ch <-chan SubAgentNotification) {
@@ -1067,6 +1293,7 @@ func (l *Loop) UndoLastTurnWithPrefill() (prefill string, ok bool) {
 		return "", false
 	}
 	l.Messages = out
+	l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
 	return p, true
 }
 
@@ -1314,9 +1541,13 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		pressureTokens := l.EstimateRequestContextTokens(specs)
 		l.maybeCompactWithPressure(ctx, out, pressureTokens)
 		requestWithoutTools := l.rescueNoToolsSnapshot()
-		req := l.buildRequest(specs)
+		req, contextAnchor := l.buildRequestWithContext(specs)
+		provider := contextAnchor.provider
+		if provider == nil {
+			provider = l.Provider
+		}
 
-		stream, err := l.Provider.Stream(ctx, req)
+		stream, err := provider.Stream(ctx, req)
 		if err != nil {
 			// Classify before deciding the recovery path. Mirrors
 			// hermes' error_classifier — the loop now picks the
@@ -1326,8 +1557,12 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			switch class.Recovery() {
 			case RecoveryCompactRetry:
 				if l.tryRecoverOverflow(ctx, err, out) {
-					req = l.buildRequestForRetry(specs, requestWithoutTools)
-					stream, err = l.Provider.Stream(ctx, req)
+					req, contextAnchor = l.buildRequestForRetryWithContext(specs, requestWithoutTools)
+					provider = contextAnchor.provider
+					if provider == nil {
+						provider = l.Provider
+					}
+					stream, err = provider.Stream(ctx, req)
 				}
 			case RecoveryFailUser:
 				// Surface a clean, actionable message for billing /
@@ -1343,7 +1578,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				// that return a plain transient error still retain this one
 				// loop-level recovery attempt.
 				if !transport.IsRetryExhausted(err) {
-					stream, err = l.Provider.Stream(ctx, req)
+					stream, err = provider.Stream(ctx, req)
 				}
 			}
 			if err != nil {
@@ -1373,6 +1608,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 
 		l.mu.Lock()
 		l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
+		l.storeActiveContextSnapshotLocked(usage, contextAnchor)
 		l.mu.Unlock()
 
 		// Provider stop-reason defense (2026-05-18, session 8cfc076b).
@@ -2007,7 +2243,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		//   3. Final-summary rescue (one tool-less iter that forces text).
 		//   4. Real abort.
 		if runIter >= l.MaxIters {
-			if !compactedAtCap && l.Compactor != nil {
+			if !compactedAtCap && l.compactorAvailable(false) {
 				compactedAtCap = true
 				if l.compactForSecondWind(ctx, out) {
 					runIter = 0
@@ -2076,7 +2312,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 // in which case the caller falls through to the bounded grace→rescue→stop
 // path. CompactNow keeps provider work, hooks and persistence outside l.mu.
 func (l *Loop) compactForSecondWind(ctx context.Context, out chan<- Event) bool {
-	if l.Compactor == nil || l.Compactor.Provider == nil {
+	if !l.compactorAvailable(true) {
 		return false
 	}
 	sessionGeneration := l.autoCompactGenerationSnapshot()
@@ -2104,6 +2340,15 @@ func (l *Loop) compactForSecondWind(ctx context.Context, out chan<- Event) bool 
 // updates per turn — without sectioning, a single memory write would
 // invalidate every cache breakpoint downstream of it.
 func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
+	req, _ := l.buildRequestWithContext(specs)
+	return req
+}
+
+// buildRequestWithContext couples the request with the exact history,
+// provider and header identity that produced it. Run retains the anchor until
+// the response is appended so a concurrent session/model replacement cannot
+// publish stale provider usage as the new active-context value.
+func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, contextRequestAnchor) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	system := l.System
@@ -2288,7 +2533,7 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 			req.MaxTokens = 4096
 		}
 	}
-	return req
+	return req, l.contextRequestAnchorLocked(l.Provider, req)
 }
 
 func (l *Loop) rescueNoToolsSnapshot() bool {
@@ -2305,10 +2550,15 @@ func (l *Loop) rescueNoToolsSnapshot() bool {
 // consumes its one-shot flag on the first request, so a compact-and-retry must
 // keep using an empty schema list explicitly.
 func (l *Loop) buildRequestForRetry(specs []llm.ToolSpec, withoutTools bool) llm.Request {
+	req, _ := l.buildRequestForRetryWithContext(specs, withoutTools)
+	return req
+}
+
+func (l *Loop) buildRequestForRetryWithContext(specs []llm.ToolSpec, withoutTools bool) (llm.Request, contextRequestAnchor) {
 	if withoutTools {
 		specs = nil
 	}
-	return l.buildRequest(specs)
+	return l.buildRequestWithContext(specs)
 }
 
 // maybeDistill runs auto-distillation on the most recent user/asst

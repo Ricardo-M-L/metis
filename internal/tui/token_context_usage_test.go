@@ -18,29 +18,21 @@ func TestTokenTracker_ContextUsage_NoCache(t *testing.T) {
 	}
 }
 
-// TestTokenTracker_ContextUsage_WithCache — 2026-05-18 contract change:
-// cache_read is NO LONGER included in ContextUsage because some
-// Anthropic-compatible gateways (MiniMax caught in the wild, user
-// image #8) over-report cache_read by reposting the full cached
-// chunk size each turn instead of the hit-this-call bytes. Result
-// was 99%+ context-load alarms on a barely-used 192k window.
-//
-// Numerator is now input + cache_creation (genuine fresh-this-turn
-// tokens). The render layer floors the displayed number with
-// EstimateContextTokens() so cache-hit-only turns still show
-// realistic context size from the local message-bytes count.
+// Provider adapters expose mutually-exclusive input/cache buckets, so the
+// active prompt is their sum. OpenAI-family adapters subtract cached tokens
+// from their inclusive prompt_tokens before tokenTracker sees the event.
 func TestTokenTracker_ContextUsage_WithCache(t *testing.T) {
 	var tt tokenTracker
 	// Realistic Anthropic shape: small input_tokens (only the new
 	// uncached delta), big cache_read (the bulk of the context).
 	tt.add(500, 200, 1000, 30000)
-	want := 500 + 1000 // cache_read intentionally excluded
+	want := 500 + 1000 + 30000
 	if got := tt.ContextUsage(); got != want {
-		t.Errorf("ContextUsage = %d, want %d (input + cache_create, cache_read excluded post-2026-05-18)", got, want)
+		t.Errorf("ContextUsage = %d, want %d (disjoint input + cache_create + cache_read)", got, want)
 	}
-	// LastTotal stays per-turn (input + output, NO cache).
-	if got := tt.LastTotal(); got != 700 {
-		t.Errorf("LastTotal should NOT include cache: got %d, want 700", got)
+	// Per-call total includes every mutually-exclusive billed bucket.
+	if got := tt.LastTotal(); got != 31_700 {
+		t.Errorf("LastTotal should include full prompt + output: got %d, want 31700", got)
 	}
 }
 
@@ -50,12 +42,12 @@ func TestTokenTracker_ContextUsage_WithCache(t *testing.T) {
 func TestTokenTracker_ContextUsage_OverwrittenEachCall(t *testing.T) {
 	var tt tokenTracker
 	tt.add(10000, 100, 0, 5000)
-	if got := tt.ContextUsage(); got != 10000 {
-		t.Fatalf("after first call: %d, want 10000 (input only, cache_read excluded)", got)
+	if got := tt.ContextUsage(); got != 15000 {
+		t.Fatalf("after first call: %d, want 15000", got)
 	}
 	tt.add(20000, 200, 1000, 8000)
-	if got := tt.ContextUsage(); got != 21000 {
-		t.Errorf("after second call ContextUsage should reflect ONLY 2nd call (20000+1000=21000), got %d", got)
+	if got := tt.ContextUsage(); got != 29000 {
+		t.Errorf("after second call ContextUsage should reflect ONLY 2nd call (20000+1000+8000=29000), got %d", got)
 	}
 	// Session cumulative still grows.
 	if tt.in != 30000 {
@@ -63,19 +55,14 @@ func TestTokenTracker_ContextUsage_OverwrittenEachCall(t *testing.T) {
 	}
 }
 
-// TestTokenTracker_ContextUsage_ImmuneToOverreportedCacheRead pins the
-// 2026-05-18 fix: a buggy upstream (MiniMax anthropic-compat layer
-// observed on user image #8) over-reports cache_read on every turn.
-// Pre-fix the right-side status-bar showed 301682 tokens (99%+) on a
-// barely-used 192k window. Post-fix the inflated cache_read is
-// IGNORED so ContextUsage stays grounded to reality.
-func TestTokenTracker_ContextUsage_ImmuneToOverreportedCacheRead(t *testing.T) {
+// tokenTracker intentionally trusts the provider-neutral contract. Wire-level
+// inclusive totals and malformed cache counts are normalized in the provider
+// adapter, where the transport semantics are known.
+func TestTokenTracker_ContextUsage_CountsNormalizedBucketsOnce(t *testing.T) {
 	var tt tokenTracker
-	// Provider claims absurd cache_read; input + cache_creation are
-	// realistic.
-	tt.add(2_000, 500, 500, 300_000)
-	if got := tt.ContextUsage(); got != 2_500 {
-		t.Errorf("ContextUsage with inflated cache_read = %d, want 2500 (cache_read excluded)", got)
+	tt.add(334, 500, 0, 900)
+	if got := tt.ContextUsage(); got != 1_234 {
+		t.Errorf("ContextUsage normalized OpenAI buckets = %d, want 1234", got)
 	}
 }
 

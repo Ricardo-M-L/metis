@@ -36,7 +36,7 @@ func (l *Loop) maybeCompact(ctx context.Context, out chan<- Event) {
 }
 
 func (l *Loop) maybeCompactWithPressure(ctx context.Context, out chan<- Event, pressureTokens int) {
-	if l.Compactor == nil {
+	if !l.compactorAvailable(false) {
 		return
 	}
 	if l.deferRepeatedAutoCompact(pressureTokens) {
@@ -56,14 +56,49 @@ func (l *Loop) maybeCompactWithPressure(ctx context.Context, out chan<- Event, p
 	if err != nil {
 		// CompactNow already emitted the lifecycle error. The circuit notice is
 		// deliberately separate and one-shot so users know how to recover.
-		if l.Compactor.CircuitTripped() && !l.compactCircuitNoticeSent {
-			l.compactCircuitNoticeSent = true
+		if l.takeCompactCircuitNotice() {
 			emit(ctx, out, Event{
 				Kind: EventInfo,
 				Info: fmt.Sprintf("auto-compaction disabled after %d failures — /clear to reset", MaxConsecutiveCompactFailures),
 			})
 		}
 	}
+}
+
+// compactorAvailable snapshots the replaceable Compactor pointer under the
+// same lock used by RebindProviderRuntime. Compactor instances are immutable
+// with respect to their provider/config binding after installation; runtime
+// summary/circuit state is serialized separately by compactMu.
+func (l *Loop) compactorAvailable(requireProvider bool) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.Compactor != nil && (!requireProvider || l.Compactor.Provider != nil)
+}
+
+// takeCompactCircuitNotice atomically observes the current compactor's mutable
+// circuit state and claims the one-shot notice. The lock order intentionally
+// matches CompactNow (compactMu, then mu), so a provider/model rebind cannot
+// race the pointer read and another compaction cannot race circuit mutation.
+// Do not wait behind a different slow compaction merely to render a notice;
+// this also keeps an event callback that re-enters an auto gate non-blocking.
+func (l *Loop) takeCompactCircuitNotice() bool {
+	if l == nil {
+		return false
+	}
+	if !l.compactMu.TryLock() {
+		return false
+	}
+	defer l.finishCompactorCriticalSection()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.Compactor == nil || !l.Compactor.CircuitTripped() || l.compactCircuitNoticeSent {
+		return false
+	}
+	l.compactCircuitNoticeSent = true
+	return true
 }
 
 func autoCompactRearmGrowthTokens(trigger int) int {
@@ -82,13 +117,16 @@ func autoCompactRearmGrowthTokens(trigger int) int {
 // overflow and manual compaction bypass this gate through their direct
 // CompactNow calls.
 func (l *Loop) deferRepeatedAutoCompact(pressureTokens int) bool {
-	if l == nil || l.Compactor == nil {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.Compactor == nil {
 		return false
 	}
 	trigger := l.Compactor.TriggerTokens()
 	requiredGrowth := autoCompactRearmGrowthTokens(trigger)
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if !l.autoCompactPressurePinned {
 		return false
 	}
@@ -142,21 +180,23 @@ func (l *Loop) deferRepeatedAutoCompact(pressureTokens int) bool {
 // boundary. That is the irreducible-overhead case; ordinary compactions that
 // return below the boundary retain the normal percentage trigger behavior.
 func (l *Loop) noteAutoCompactPressure(result CompactResult, pressureTokens int, sessionGeneration uint64) {
-	if l == nil || l.Compactor == nil || !result.Applied {
+	if l == nil || !result.Applied {
 		return
 	}
 	overheadTokens := pressureTokens - result.BeforeTokens
 	if overheadTokens < 0 {
 		overheadTokens = 0
 	}
-	postPressure := result.AfterTokens + overheadTokens
-	pinned := postPressure >= l.Compactor.TriggerTokens()
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.Compactor == nil {
+		return
+	}
 	if l.autoCompactSessionGeneration != sessionGeneration || !historyHasPrefix(l.Messages, result.History) {
 		return
 	}
+	postPressure := result.AfterTokens + overheadTokens
+	pinned := postPressure >= l.Compactor.TriggerTokens()
 	l.autoCompactPressurePinned = pinned
 	if pinned {
 		l.autoCompactHistoryTokens = result.AfterTokens
@@ -212,7 +252,7 @@ func sameSlice(a, b []llm.Message) bool {
 // checkpoint cannot make progress, while retaining the same hooks,
 // persistence and event ordering as every other trigger.
 func (l *Loop) tryRecoverOverflow(ctx context.Context, err error, out chan<- Event) bool {
-	if l.Compactor == nil || err == nil {
+	if err == nil || !l.compactorAvailable(false) {
 		return false
 	}
 	if ClassifyError(err) != ErrContextOverflow {

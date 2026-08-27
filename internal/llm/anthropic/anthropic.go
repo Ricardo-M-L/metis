@@ -254,6 +254,14 @@ func (a *Anthropic) MaxContextTokens() int {
 
 func (a *Anthropic) Name() string { return "anthropic" }
 
+// ContextIncludesAssistantBlock mirrors ToRequest: ordinary thinking text is
+// retained in the transcript for the user but cannot be replayed without its
+// Anthropic signature. Redacted thinking carries its own opaque payload and is
+// replayed.
+func (a *Anthropic) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
+	return block.Type != "thinking" && (block.Type != "redacted_thinking" || block.Data != "")
+}
+
 // --- request shapes (Anthropic-native) ---
 
 type anthropicMessage struct {

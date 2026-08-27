@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -165,19 +167,73 @@ func TestSummaryPayloadPreservesToolIdentityInputAndResultTail(t *testing.T) {
 	}
 }
 
-type maxTokensSummaryProvider struct{}
+type maxTokensSummaryProvider struct {
+	streamCalls   int
+	completeCalls int
+}
+
+type finalEventEOFStream struct {
+	next int
+}
+
+func (s *finalEventEOFStream) Recv() (llm.StreamEvent, error) {
+	s.next++
+	if s.next == 1 {
+		return llm.StreamEvent{Type: "text_delta", TextDelta: "ONE_PASS_SUMMARY"}, nil
+	}
+	return llm.StreamEvent{Type: "message_stop"}, io.EOF
+}
+
+func (*finalEventEOFStream) Close() error { return nil }
+
+type finalEventEOFProvider struct {
+	streamCalls   int
+	completeCalls int
+}
+
+func (*finalEventEOFProvider) Name() string          { return "final-event-eof" }
+func (*finalEventEOFProvider) MaxContextTokens() int { return 100_000 }
+func (*finalEventEOFProvider) ModelID() string       { return "" }
+func (p *finalEventEOFProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	p.streamCalls++
+	return &finalEventEOFStream{}, nil
+}
+func (p *finalEventEOFProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	p.completeCalls++
+	return nil, errors.New("Complete must not run after terminal message_stop + EOF")
+}
+
+func TestSummarizeAcceptsTerminalEventReturnedWithEOF(t *testing.T) {
+	p := &finalEventEOFProvider{}
+	c := newCompactorForV2(p)
+	c.MaxSummaryRetries = 3
+
+	got, err := c.summarize(context.Background(), []llm.Message{msg(llm.RoleUser, "important state")}, "")
+	if err != nil {
+		t.Fatalf("summarize rejected terminal event + EOF: %v", err)
+	}
+	if got != "ONE_PASS_SUMMARY" {
+		t.Fatalf("summary = %q, want ONE_PASS_SUMMARY", got)
+	}
+	if p.streamCalls != 1 || p.completeCalls != 0 {
+		t.Fatalf("successful stream triggered retries: stream=%d complete=%d, want 1/0", p.streamCalls, p.completeCalls)
+	}
+}
 
 func (*maxTokensSummaryProvider) Name() string          { return "max-tokens-summary" }
 func (*maxTokensSummaryProvider) MaxContextTokens() int { return 100_000 }
 func (*maxTokensSummaryProvider) ModelID() string       { return "" }
-func (*maxTokensSummaryProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+
+func (p *maxTokensSummaryProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	p.streamCalls++
 	return &fakeStream{events: []llm.StreamEvent{
 		{Type: "text_delta", TextDelta: "TRUNCATED_BUT_NONEMPTY"},
 		{Type: "message_delta", StopReason: "max_tokens"},
 		{Type: "message_stop"},
 	}}, nil
 }
-func (*maxTokensSummaryProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+func (p *maxTokensSummaryProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	p.completeCalls++
 	return &llm.Response{
 		Content:    []llm.ContentBlock{{Type: "text", Text: "TRUNCATED_FALLBACK"}},
 		StopReason: "max_tokens",
@@ -185,14 +241,18 @@ func (*maxTokensSummaryProvider) Complete(context.Context, llm.Request) (*llm.Re
 }
 
 func TestSummarizeRejectsMaxTokensStopReason(t *testing.T) {
-	c := newCompactorForV2(&maxTokensSummaryProvider{})
-	c.MaxSummaryRetries = 0
+	p := &maxTokensSummaryProvider{}
+	c := newCompactorForV2(p)
+	c.MaxSummaryRetries = 3
 	_, err := c.summarize(context.Background(), []llm.Message{msg(llm.RoleUser, "important state")}, "")
 	if err == nil {
 		t.Fatal("summarize accepted a max_tokens-truncated checkpoint")
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "max_tokens") {
 		t.Fatalf("summarize error = %v, want max_tokens diagnostic", err)
+	}
+	if p.streamCalls != 1 || p.completeCalls != 0 {
+		t.Fatalf("deterministic truncation retried: stream=%d complete=%d, want 1/0", p.streamCalls, p.completeCalls)
 	}
 }
 

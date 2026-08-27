@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -226,14 +227,21 @@ func TestCompactWithInstructions_IsRequestLocalAndDelimited(t *testing.T) {
 }
 
 func TestNormalizeCompactInstructions_BoundsRunesWithoutBreakingUTF8(t *testing.T) {
-	in := strings.Repeat("界", maxCompactInstructionRunes+10)
+	in := "HEAD" + strings.Repeat("界", maxCompactInstructionRunes+10) + "TAIL"
 	got := normalizeCompactInstructions(in)
 	if !strings.Contains(got, "[additional compact instructions truncated]") {
 		t.Fatal("long instructions were not marked truncated")
 	}
-	prefix, _, _ := strings.Cut(got, "\n[additional")
-	if len([]rune(prefix)) != maxCompactInstructionRunes {
-		t.Fatalf("bounded prefix runes = %d, want %d", len([]rune(prefix)), maxCompactInstructionRunes)
+	marker := "\n[additional compact instructions truncated]\n"
+	parts := strings.Split(got, marker)
+	if len(parts) != 2 {
+		t.Fatalf("normalized instructions do not contain exactly one marker: %q", got)
+	}
+	if contentRunes := len([]rune(parts[0])) + len([]rune(parts[1])); contentRunes != maxCompactInstructionRunes {
+		t.Fatalf("bounded content runes = %d, want %d", contentRunes, maxCompactInstructionRunes)
+	}
+	if !strings.HasPrefix(got, "HEAD") || !strings.HasSuffix(got, "TAIL") {
+		t.Fatalf("normalization did not preserve both instruction ends")
 	}
 	if !utf8.ValidString(got) {
 		t.Fatal("normalization produced invalid UTF-8")
@@ -468,16 +476,16 @@ func TestShouldCompact_AccountsForMaxTokens(t *testing.T) {
 	}
 }
 
-// TestEffectiveInputCap_DefaultsSafely covers the degenerate config:
-// max_tokens accidentally set bigger than context_window. We don't want
-// effectiveInputCap to go negative or zero (would compact every turn).
+// TestEffectiveInputCapRejectsInvalidReservation covers the degenerate config:
+// max_tokens accidentally set bigger than context_window. Returning the full
+// window would hide an invalid request and allow an overflow.
 func TestEffectiveInputCap_DefaultsSafely(t *testing.T) {
 	c := &Compactor{
 		MaxContextTokens: 1000,
 		MaxOutputTokens:  2000, // user mis-config
 	}
-	if got := c.effectiveInputCap(); got != 1000 {
-		t.Errorf("oversized MaxOutputTokens should fall back to full window; got %d", got)
+	if got := c.effectiveInputCap(); got != 0 {
+		t.Errorf("oversized MaxOutputTokens should produce no usable input cap; got %d", got)
 	}
 }
 
@@ -872,25 +880,164 @@ func TestDefaultCompactionConfig_KeepsMinimumTokensZero(t *testing.T) {
 }
 
 // TestDefaultCompactionConfig_SetsMaxSummarizeInputTokens — locks in
-// the 2026-07-27 default. 200K keeps any single summarize() call
-// under ~60s on slow providers (~3K tok/s input), regardless of
-// how large the parent context window is. Setting this to 0 would
+// the bounded default. 96K keeps prefill near 32s on a ~3K tok/s
+// provider while leaving time to generate the checkpoint. Setting this to 0 would
 // re-enable the "1M-context Compact eats the whole middle in one
 // call" path that produced the 2026-07-26 "compaction stuck at
 // 950K tokens" report.
 func TestDefaultCompactionConfig_SetsMaxSummarizeInputTokens(t *testing.T) {
 	cfg := DefaultCompactionConfig()
-	if cfg.MaxSummarizeInputTokens != 200_000 {
-		t.Errorf("DefaultCompactionConfig().MaxSummarizeInputTokens = %d, want 200_000", cfg.MaxSummarizeInputTokens)
+	if cfg.MaxSummarizeInputTokens != 96_000 {
+		t.Errorf("DefaultCompactionConfig().MaxSummarizeInputTokens = %d, want 96_000", cfg.MaxSummarizeInputTokens)
+	}
+	if cfg.MaxSummaryTokens != 8_192 {
+		t.Errorf("DefaultCompactionConfig().MaxSummaryTokens = %d, want 8192", cfg.MaxSummaryTokens)
+	}
+	if cfg.SummaryTimeoutSeconds != 180 {
+		t.Errorf("DefaultCompactionConfig().SummaryTimeoutSeconds = %d, want 180", cfg.SummaryTimeoutSeconds)
+	}
+	if cfg.MaxSummaryRetries != 1 {
+		t.Errorf("DefaultCompactionConfig().MaxSummaryRetries = %d, want 1", cfg.MaxSummaryRetries)
+	}
+}
+
+func TestSummaryWireLimitsShrinkForSmallModelWindow(t *testing.T) {
+	tests := []struct {
+		name       string
+		window     int
+		wantInput  int
+		wantOutput int
+	}{
+		{name: "unknown", window: 0, wantInput: 96_000, wantOutput: 8_192},
+		{name: "one-token", window: 1, wantInput: 1, wantOutput: 0},
+		{name: "2k", window: 2_048, wantInput: 1_434, wantOutput: 512},
+		{name: "below-4k", window: 4_095, wantInput: 2_868, wantOutput: 1_023},
+		{name: "4k", window: 4_096, wantInput: 2_868, wantOutput: 1_024},
+		{name: "16k", window: 16_000, wantInput: 11_488, wantOutput: 4_000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultCompactionConfig()
+			c := NewCompactor(cfg, "small-window", tt.window, &fakeSummarizer{})
+			input, output := c.summaryWireLimits()
+			if input != tt.wantInput || output != tt.wantOutput {
+				t.Fatalf("summary limits = (%d, %d), want (%d, %d)", input, output, tt.wantInput, tt.wantOutput)
+			}
+			if tt.window > 0 {
+				safety := tt.window / 20
+				if safety > maxSummarySafetyTokens {
+					safety = maxSummarySafetyTokens
+				}
+				if input+output+safety > tt.window {
+					t.Fatalf("summary limits exceed window: input=%d output=%d safety=%d window=%d", input, output, safety, tt.window)
+				}
+			}
+		})
+	}
+}
+
+func TestSummarizeRequestFitsTwoKModelWindow(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	cfg.SummaryTimeoutSeconds = 0
+	p := &fakeSummarizer{}
+	c := NewCompactor(cfg, "tiny-window", 2_048, p)
+	messages := []llm.Message{
+		msg(llm.RoleUser, strings.Repeat("large transcript ", 20_000)),
+		msg(llm.RoleAssistant, strings.Repeat("large result ", 20_000)),
+	}
+	if _, err := c.summarizeWithInstructions(context.Background(), messages, "", ""); err != nil {
+		t.Fatalf("summarizeWithInstructions: %v", err)
+	}
+	inputCap, outputCap := c.summaryWireLimits()
+	fed := estimateStringTokens(p.lastReq.System) + estimateTokens(p.lastReq.Messages)
+	if fed > inputCap {
+		t.Fatalf("summary request input = %d, cap %d", fed, inputCap)
+	}
+	if p.lastReq.MaxTokens != outputCap {
+		t.Fatalf("summary max_tokens = %d, want %d", p.lastReq.MaxTokens, outputCap)
+	}
+	const safety = 2_048 / 20
+	if fed+p.lastReq.MaxTokens+safety > 2_048 {
+		t.Fatalf("summary request exceeds window: input=%d output=%d safety=%d", fed, p.lastReq.MaxTokens, safety)
+	}
+}
+
+func TestCompactHardFitsTwoKAndFourKWindows(t *testing.T) {
+	for _, window := range []int{2_048, 4_096} {
+		t.Run(fmt.Sprintf("%d", window), func(t *testing.T) {
+			cfg := DefaultCompactionConfig()
+			cfg.SummaryTimeoutSeconds = 0
+			provider := &fakeSummarizer{}
+			compactor := NewCompactor(cfg, "small-window", window, provider)
+			messages := make([]llm.Message, 0, 15)
+			for i := 0; i < 15; i++ {
+				messages = append(messages, msg(llm.RoleUser,
+					fmt.Sprintf("request-%02d %s", i, strings.Repeat("x", 4_000))))
+			}
+
+			out, err := compactor.Compact(context.Background(), messages)
+			if err != nil {
+				t.Fatalf("Compact: %v", err)
+			}
+			historyCap, constrained, err := compactor.postCompactHistoryCap(0)
+			if err != nil || !constrained {
+				t.Fatalf("postCompactHistoryCap: constrained=%v err=%v", constrained, err)
+			}
+			if got := estimateTokens(out); got >= historyCap {
+				t.Fatalf("compact installed %d tokens into exclusive history cap %d", got, historyCap)
+			}
+			if provider.calls != 1 {
+				t.Fatalf("summary calls=%d, want one deterministic request", provider.calls)
+			}
+		})
+	}
+}
+
+func TestSummarizeRejectsZeroOutputBudgetBeforeProviderCall(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	cfg.SummaryTimeoutSeconds = 0
+	provider := &fakeSummarizer{}
+	compactor := NewCompactor(cfg, "one-token", 1, provider)
+	_, err := compactor.summarizeWithInstructions(context.Background(), []llm.Message{
+		msg(llm.RoleUser, "hello"),
+	}, "", "")
+	if err == nil || !strings.Contains(err.Error(), "no positive output budget") {
+		t.Fatalf("zero output budget should fail clearly, got %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider received MaxTokens=0 request: calls=%d", provider.calls)
+	}
+}
+
+func TestSummarizeRequestFitsActualSmallModelWindow(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	cfg.SummaryTimeoutSeconds = 0
+	p := &fakeSummarizer{}
+	c := NewCompactor(cfg, "small-window", 10_000, p)
+	messages := []llm.Message{
+		msg(llm.RoleUser, strings.Repeat("large transcript ", 20_000)),
+		msg(llm.RoleAssistant, strings.Repeat("large result ", 20_000)),
+	}
+	if _, err := c.summarizeWithInstructions(context.Background(), messages, "", ""); err != nil {
+		t.Fatalf("summarizeWithInstructions: %v", err)
+	}
+	inputCap, outputCap := c.summaryWireLimits()
+	fed := estimateStringTokens(p.lastReq.System) + estimateTokens(p.lastReq.Messages)
+	if fed > inputCap {
+		t.Fatalf("summary request input = %d, cap %d", fed, inputCap)
+	}
+	if p.lastReq.MaxTokens != outputCap {
+		t.Fatalf("summary max_tokens = %d, want %d", p.lastReq.MaxTokens, outputCap)
+	}
+	if fed+p.lastReq.MaxTokens+10_000/20 > 10_000 {
+		t.Fatalf("summary request exceeds window: input=%d output=%d safety=%d", fed, p.lastReq.MaxTokens, 10_000/20)
 	}
 }
 
 // TestCompact_RespectsMaxSummarizeInputTokens — when the pending
-// middle slice exceeds MaxSummarizeInputTokens, Compact must invoke
-// CollapseMiddle repeatedly to fold the oldest history first, and
-// only call the final summarize() on a middle that fits the budget.
-// Locks in the "summarize input has a ceiling" behaviour added
-// 2026-07-27.
+// middle slice exceeds MaxSummarizeInputTokens, Compact must fit the
+// transcript locally and make exactly one provider request. This locks out
+// the old up-to-eight CollapseMiddle request chain.
 func TestCompact_RespectsMaxSummarizeInputTokens(t *testing.T) {
 	// Build a long conversation: system + many user/assistant text
 	// pairs, each ~1000 estimated tokens (4000 ASCII chars / 4).
@@ -901,9 +1048,8 @@ func TestCompact_RespectsMaxSummarizeInputTokens(t *testing.T) {
 		msgs = append(msgs, msg(llm.RoleAssistant, big))
 	}
 	// Total ≈ 1 + 60 messages, each ~1000 tokens → ~60K middle.
-	// Cap the summarize input at 5K so Compact MUST fold at least
-	// a few times before the final summarize. CollapseFoldWindow=10
-	// folds 10 messages (~10K tokens) per pass, so 5+ folds needed.
+	// Cap the summarize input at 5K so Compact must select evidence from
+	// the oversized history before making its one summary request.
 
 	cfg := DefaultCompactionConfig()
 	cfg.ProtectFirst = 1
@@ -929,36 +1075,337 @@ func TestCompact_RespectsMaxSummarizeInputTokens(t *testing.T) {
 	// plus a generous slack for the system prompt + iterative seed
 	// text (which aren't part of the budget but do land in the
 	// request).
-	if p.calls == 0 {
-		t.Fatal("expected summarize to be called at least once")
+	if p.calls != 1 {
+		t.Fatalf("summarize calls = %d, want exactly 1", p.calls)
 	}
 	lastReq := p.lastReq
 	var fedMessages []llm.Message
 	for _, m := range lastReq.Messages {
 		fedMessages = append(fedMessages, m)
 	}
-	fed := estimateTokens(fedMessages)
-	// The budget guards the middle slice; the assembled prompt also
-	// carries the system instruction + optional priorSummary seed,
-	// so we allow 4x slack before flagging a regression.
-	if fed > cfg.MaxSummarizeInputTokens*4 {
-		t.Errorf("final summarize() prompt estimate = %d tokens, want ≤ ~%d (4x slack over budget %d)",
-			fed, cfg.MaxSummarizeInputTokens*4, cfg.MaxSummarizeInputTokens)
+	fed := estimateStringTokens(lastReq.System) + estimateTokens(fedMessages)
+	if fed > cfg.MaxSummarizeInputTokens {
+		t.Errorf("final summarize() wire prompt estimate = %d tokens, want ≤ %d",
+			fed, cfg.MaxSummarizeInputTokens)
 	}
 }
 
-// TestCompact_NoSummarizeWhenCollapseConsumesAll — boundary case:
-// when CollapseMiddle folds everything except ProtectFirst +
-// ProtectLast, Compact must skip the final summarize call entirely
-// (no middle left to summarize). Guards against a wasted LLM call
-// and against recordCompactResult(false) firing on a successful
-// collapse-only pass.
-func TestCompact_NoSummarizeWhenCollapseConsumesAll(t *testing.T) {
+func TestBuildSummaryTranscript_PreservesAnchorsUsersAndNewestEvidence(t *testing.T) {
+	msgs := []llm.Message{msg(llm.RoleAssistant, "EARLIEST_ANCHOR "+strings.Repeat("h", 4_000))}
+	for i := 0; i < 24; i++ {
+		msgs = append(msgs,
+			msg(llm.RoleAssistant, strings.Repeat("old assistant evidence ", 400)),
+			msg(llm.RoleUser, "older request "+istr(i)+" "+strings.Repeat("u", 1_000)),
+		)
+	}
+	msgs = append(msgs,
+		msg(llm.RoleUser, "CRITICAL_USER_REQUEST "+strings.Repeat("c", 2_000)),
+		msg(llm.RoleAssistant, "LATEST_EVIDENCE "+strings.Repeat("z", 8_000)),
+	)
+
+	const budget = 1_200
+	got := buildSummaryTranscript(msgs, false, budget)
+	if tokens := estimateStringTokens(got); tokens > budget {
+		t.Fatalf("fitted transcript = %d tokens, budget %d", tokens, budget)
+	}
+	for _, want := range []string{"Transcript locally fitted", "EARLIEST_ANCHOR", "CRITICAL_USER_REQUEST", "LATEST_EVIDENCE"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fitted transcript lost %q", want)
+		}
+	}
+}
+
+func TestBuildSummaryTranscript_ReservesToolAndErrorEvidence(t *testing.T) {
+	failed := toolResultMsg("critical-call", "CRITICAL_TOOL_ERROR "+strings.Repeat("failure details ", 1_000))
+	failed.Content[0].IsError = true
+	msgs := []llm.Message{
+		msg(llm.RoleUser, "original task"),
+		toolUseMsg("critical-call", "BuildVerifier"),
+		failed,
+	}
+	for i := 0; i < 40; i++ {
+		msgs = append(msgs, msg(llm.RoleAssistant, strings.Repeat("routine success output ", 500)))
+	}
+	msgs = append(msgs, msg(llm.RoleAssistant, "LATEST_RESULT "+strings.Repeat("z", 4_000)))
+
+	got := buildSummaryTranscript(msgs, false, 1_500)
+	for _, want := range []string{"BuildVerifier", "critical-call", "CRITICAL_TOOL_ERROR", "LATEST_RESULT"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fitted transcript lost reserved evidence %q", want)
+		}
+	}
+}
+
+func TestBuildSummaryTranscript_ReservesSuccessfulToolTransaction(t *testing.T) {
+	use := toolUseMsg("verified-build", "Bash")
+	use.Content[1].ToolInput = map[string]any{"command": "go test ./..."}
+	result := toolResultMsg(
+		"verified-build",
+		"VERIFIED_BUILD_HEAD\n"+strings.Repeat("successful compiler output ", 2_000)+"\nVERIFIED_BUILD_TAIL exit=0",
+	)
+	msgs := []llm.Message{
+		msg(llm.RoleAssistant, "ANCIENT_BULK "+strings.Repeat("old output ", 8_000)),
+		msg(llm.RoleUser, "fix the compaction implementation"),
+		use,
+		result,
+		msg(llm.RoleAssistant, "unrelated middle status"),
+		msg(llm.RoleAssistant, "LATEST_EVIDENCE "+strings.Repeat("newest output ", 8_000)),
+	}
+
+	got := buildSummaryTranscript(msgs, false, 1_200)
+	if tokens := estimateStringTokens(got); tokens > 1_200 {
+		t.Fatalf("fitted transcript = %d tokens, budget 1200", tokens)
+	}
+	for _, want := range []string{
+		"verified-build",
+		"go test ./...",
+		"VERIFIED_BUILD_HEAD",
+		"VERIFIED_BUILD_TAIL exit=0",
+		"omitted",
+		"transcript evidence",
+		"LATEST_EVIDENCE",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fitted transcript lost successful transaction evidence %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestBuildSummaryTranscript_ReservesParallelSuccessfulToolTransactions(t *testing.T) {
+	parallelUses := llm.Message{
+		Role: llm.RoleAssistant,
+		Content: []llm.ContentBlock{
+			{Type: "tool_use", ToolUseID: "build-call", ToolName: "Bash", ToolInput: map[string]any{"command": "go build ./..."}},
+			{Type: "tool_use", ToolUseID: "vet-call", ToolName: "Bash", ToolInput: map[string]any{"command": "go vet ./..."}},
+			{Type: "tool_use", ToolUseID: "test-call", ToolName: "Bash", ToolInput: map[string]any{"command": "go test -race ./..."}},
+		},
+	}
+	// Providers return parallel tool results in one user message. Make each
+	// result large enough that fitting the whole message head+tail would retain
+	// the first and last results while silently erasing the middle transaction.
+	parallelResults := llm.Message{
+		Role: llm.RoleUser,
+		Content: []llm.ContentBlock{
+			{
+				Type:       "tool_result",
+				ToolUseID:  "build-call",
+				ToolResult: "BUILD_RESULT_HEAD\n" + strings.Repeat("build success output ", 3_000) + "\nBUILD_RESULT_TAIL exit=0",
+			},
+			{
+				Type:       "tool_result",
+				ToolUseID:  "vet-call",
+				ToolResult: "VET_RESULT_HEAD\n" + strings.Repeat("vet success output ", 3_000) + "\nVET_RESULT_TAIL exit=0",
+			},
+			{
+				Type:       "tool_result",
+				ToolUseID:  "test-call",
+				ToolResult: "TEST_RESULT_HEAD\n" + strings.Repeat("test success output ", 3_000) + "\nTEST_RESULT_TAIL exit=0",
+			},
+		},
+	}
+	msgs := []llm.Message{
+		msg(llm.RoleAssistant, "ANCIENT_BULK "+strings.Repeat("old output ", 8_000)),
+		msg(llm.RoleUser, "verify build, vet, and race tests"),
+		parallelUses,
+		parallelResults,
+		msg(llm.RoleAssistant, "LATEST_BULK "+strings.Repeat("bulk ", 20_000)),
+	}
+
+	got := buildSummaryTranscript(msgs, false, 1_500)
+	if tokens := estimateStringTokens(got); tokens > 1_500 {
+		t.Fatalf("fitted transcript = %d tokens, budget 1500", tokens)
+	}
+	var missing []string
+	for _, want := range []string{
+		"build-call",
+		"go build ./...",
+		"BUILD_RESULT_HEAD",
+		"BUILD_RESULT_TAIL exit=0",
+		"vet-call",
+		"go vet ./...",
+		"VET_RESULT_HEAD",
+		"VET_RESULT_TAIL exit=0",
+		"test-call",
+		"go test -race ./...",
+		"TEST_RESULT_HEAD",
+		"TEST_RESULT_TAIL exit=0",
+	} {
+		if !strings.Contains(got, want) {
+			missing = append(missing, want)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("parallel successful transactions were not retained as units; missing %q:\n%s", missing, got)
+	}
+}
+
+func TestBuildSummaryTranscript_TinyBudgetKeepsSuccessfulTransactionAtomic(t *testing.T) {
+	use := toolUseMsg("tiny-atomic", "Bash")
+	use.Content[1].ToolInput = map[string]any{"command": "TINY_ATOMIC_COMMAND"}
+	msgs := []llm.Message{
+		msg(llm.RoleAssistant, "ANCIENT_BULK "+strings.Repeat("old output ", 4_000)),
+		msg(llm.RoleUser, "keep the successful transaction atomic"),
+		use,
+		toolResultMsg(
+			"tiny-atomic",
+			"TINY_ATOMIC_RESULT_HEAD\n"+strings.Repeat("successful result detail ", 2_000)+"\nTINY_ATOMIC_RESULT_TAIL exit=0",
+		),
+	}
+
+	const budget = 160
+	got := buildSummaryTranscript(msgs, false, budget)
+	if tokens := estimateStringTokens(got); tokens > budget {
+		t.Fatalf("fitted transcript = %d tokens, budget %d", tokens, budget)
+	}
+	hasUse := strings.Contains(got, `ASSISTANT tool_use id="tiny-atomic"`)
+	hasResult := strings.Contains(got, `USER tool_result id="tiny-atomic"`)
+	if hasUse != hasResult {
+		t.Fatalf("successful transaction was split at tiny budget: has use=%t result=%t\n%s", hasUse, hasResult, got)
+	}
+	if !hasUse && !strings.Contains(got, "omitted tool transactions success=1") {
+		t.Fatalf("atomic omission was not reported explicitly:\n%s", got)
+	}
+}
+
+func TestFitSummaryTranscriptSegment_TransactionSkeletonIsAllOrNone(t *testing.T) {
+	txn := summaryToolTransaction{
+		key: "id:boundary-atomic", id: "boundary-atomic", latest: 1,
+		toolName: "Bash", hasUse: true, hasResult: true,
+		atoms: []summaryToolAtom{
+			{
+				order: 0, kind: "tool_use",
+				text:    "ASSISTANT tool_use id=\"boundary-atomic\" name=\"Bash\" input={\"command\":\"go test ./...\"}\n",
+				minimum: "ASSISTANT tool_use id=\"boundary-atomic\" name=\"Bash\" input={\"command\":\"go test ./...\"}\n",
+			},
+			{
+				order: 1, kind: "tool_result",
+				text:    "USER tool_result id=\"boundary-atomic\" is_error=false: PASS exit=0\n",
+				minimum: "USER tool_result id=\"boundary-atomic\" is_error=false: PASS exit=0\n",
+			},
+		},
+	}
+	seg := buildSummaryToolTransaction(txn)
+	minimumCost := estimateStringTokens(seg.minimum)
+	if minimumCost < 2 {
+		t.Fatalf("unexpected transaction skeleton cost %d", minimumCost)
+	}
+	if got := fitSummaryTranscriptSegment(seg, minimumCost-1); got != "" {
+		t.Fatalf("budget below skeleton retained a partial transaction:\n%s", got)
+	}
+	got := fitSummaryTranscriptSegment(seg, minimumCost)
+	for _, want := range []string{`tool_use id="boundary-atomic"`, `tool_result id="boundary-atomic"`, "PASS exit=0"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("exact skeleton budget lost %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestBuildSummaryTranscript_ManyGapMarkersDoNotEraseSuccessfulTransaction(t *testing.T) {
+	msgs := []llm.Message{
+		msg(llm.RoleAssistant, "MANY_GAPS_EARLIEST "+strings.Repeat("anchor ", 2_000)),
+	}
+	for i := 0; i < 80; i++ {
+		msgs = append(msgs,
+			msg(llm.RoleAssistant, "UNSELECTED_FILLER_"+istr(i)+" "+strings.Repeat("bulk ", 2_000)),
+		)
+		if i == 40 {
+			use := toolUseMsg("many-gaps-success", "Bash")
+			use.Content[1].ToolInput = map[string]any{"command": "MANY_GAPS_SUCCESS_COMMAND"}
+			msgs = append(msgs,
+				use,
+				toolResultMsg("many-gaps-success", "MANY_GAPS_SUCCESS_RESULT exit=0"),
+			)
+		}
+		// These short, semantically reserved user messages are deliberately
+		// non-contiguous, so rendering the selected set needs many gap markers.
+		msgs = append(msgs, msg(llm.RoleUser, fmt.Sprintf("user-%03d", i)))
+	}
+	msgs = append(msgs, msg(llm.RoleAssistant, "MANY_GAPS_LATEST "+strings.Repeat("latest ", 2_000)))
+
+	const budget = 1_000
+	got := buildSummaryTranscript(msgs, false, budget)
+	if tokens := estimateStringTokens(got); tokens > budget {
+		t.Fatalf("fitted transcript = %d tokens, budget %d", tokens, budget)
+	}
+	missing := make([]string, 0, 4)
+	for _, want := range []string{
+		`ASSISTANT tool_use id="many-gaps-success"`,
+		"MANY_GAPS_SUCCESS_COMMAND",
+		`USER tool_result id="many-gaps-success"`,
+		"MANY_GAPS_SUCCESS_RESULT exit=0",
+	} {
+		if !strings.Contains(got, want) {
+			missing = append(missing, want)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("gap-marker fitting erased successful transaction evidence %q:\n%s", missing, got)
+	}
+}
+
+func TestBuildSummaryTranscript_BudgetsSuccessfulAndFailedTransactionsIndependently(t *testing.T) {
+	failed := toolResultMsg("failed-check", "FAILED_CHECK_EVIDENCE exit=1")
+	failed.Content[0].IsError = true
+	msgs := []llm.Message{
+		msg(llm.RoleAssistant, "ANCIENT_BULK "+strings.Repeat("old output ", 8_000)),
+		msg(llm.RoleUser, "preserve both positive and negative verification"),
+		toolUseMsg("successful-check", "Bash"),
+		toolResultMsg("successful-check", "SUCCESSFUL_CHECK_EVIDENCE exit=0"),
+		toolUseMsg("failed-check", "Bash"),
+		failed,
+		msg(llm.RoleAssistant, "LATEST_BULK "+strings.Repeat("bulk ", 20_000)),
+	}
+
+	got := buildSummaryTranscript(msgs, false, 1_500)
+	for _, want := range []string{
+		"successful-check",
+		"SUCCESSFUL_CHECK_EVIDENCE exit=0",
+		"failed-check",
+		"FAILED_CHECK_EVIDENCE exit=1",
+		"is_error=true",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("success/error evidence pools did not both survive; missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestSummarizeInputBudgetIncludesSystemPriorAndInstructions(t *testing.T) {
+	cfg := DefaultCompactionConfig()
+	cfg.MaxSummarizeInputTokens = 3_000
+	cfg.SummaryTimeoutSeconds = 0
+	p := &fakeSummarizer{}
+	c := NewCompactor(cfg, "test", 100_000, p)
+	prior := "PRIOR_START " + strings.Repeat("prior context ", 8_000) + " PRIOR_END"
+	instructions := normalizeCompactInstructions("INSTRUCTION_START " + strings.Repeat("be precise ", 2_000) + " INSTRUCTION_END")
+	messages := []llm.Message{
+		msg(llm.RoleUser, "important request "+strings.Repeat("u", 20_000)),
+		msg(llm.RoleAssistant, "important result "+strings.Repeat("a", 20_000)),
+	}
+	if _, err := c.summarizeWithInstructions(context.Background(), messages, prior, instructions); err != nil {
+		t.Fatalf("summarizeWithInstructions: %v", err)
+	}
+	fed := estimateStringTokens(p.lastReq.System) + estimateTokens(p.lastReq.Messages)
+	if fed > cfg.MaxSummarizeInputTokens {
+		t.Fatalf("system + prior + instructions + transcript = %d tokens, cap %d", fed, cfg.MaxSummarizeInputTokens)
+	}
+	payload := p.lastReq.Messages[0].Content[0].Text
+	for _, want := range []string{"PRIOR_START", "PRIOR_END", "INSTRUCTION_START", "INSTRUCTION_END"} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("budgeted prompt lost %q", want)
+		}
+	}
+}
+
+// TestCompact_TinyInputBudgetStillUsesOneSummaryRequest guards the extreme
+// fitting path. CollapseFoldWindow must no longer affect the number of paid
+// requests made by full compaction.
+func TestCompact_TinyInputBudgetStillUsesOneSummaryRequest(t *testing.T) {
 	big := strings.Repeat("y", 4000) // ~1000 tokens each
 	// 1 system + 10 user/assistant pairs + 4 tail messages = 25 msgs.
 	// ProtectFirst=1 + ProtectLast=5 → middle is 19 messages.
-	// CollapseFoldWindow=25 makes CollapseMiddle eat the entire
-	// middle in one pass, leaving nothing for the final summarize.
+	// A historical CollapseFoldWindow large enough to consume the old middle
+	// must not re-enable preliminary LLM folds.
 	msgs := []llm.Message{msg(llm.RoleSystem, "sys")}
 	for i := 0; i < 10; i++ {
 		msgs = append(msgs, msg(llm.RoleUser, big))
@@ -972,7 +1419,7 @@ func TestCompact_NoSummarizeWhenCollapseConsumesAll(t *testing.T) {
 	cfg.ProtectFirst = 1
 	cfg.ProtectLast = 5
 	cfg.CollapseFoldWindow = 25
-	cfg.MaxSummarizeInputTokens = 1_000 // tiny: forces the pre-fold loop
+	cfg.MaxSummarizeInputTokens = 1_000 // tiny: forces deterministic local fitting
 
 	p := &fakeSummarizer{}
 	c := NewCompactor(cfg, "test", 100_000, p)
@@ -986,11 +1433,11 @@ func TestCompact_NoSummarizeWhenCollapseConsumesAll(t *testing.T) {
 	if len(out) >= len(msgs) {
 		t.Errorf("expected progress: in=%d out=%d", len(msgs), len(out))
 	}
-	// CollapseMiddle called summarize once for its own fold; the
-	// FINAL Compact summarize must NOT have fired (no middle left).
-	// So total calls should be exactly 1 (the collapse fold).
 	if p.calls != callsBefore+1 {
-		t.Errorf("summarize calls = %d, want %d (collapse only, no final summarize)",
+		t.Errorf("summarize calls = %d, want %d (one fitted final summary)",
 			p.calls, callsBefore+1)
+	}
+	if !strings.Contains(p.lastReq.Messages[0].Content[0].Text, "Transcript locally fitted") {
+		t.Fatal("oversized summary prompt did not report deterministic local fitting")
 	}
 }

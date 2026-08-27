@@ -118,8 +118,8 @@ func TestFromOpenAIChoice_PopulatesCacheReadField(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	resp := fromOpenAIChoice(r.Choices[0], r.Usage)
-	if resp.InputTokens != 1234 {
-		t.Errorf("InputTokens: got %d want 1234", resp.InputTokens)
+	if resp.InputTokens != 334 {
+		t.Errorf("InputTokens: got %d want 334", resp.InputTokens)
 	}
 	if resp.CacheReadInputTokens != 900 {
 		t.Errorf("CacheReadInputTokens: got %d want 900", resp.CacheReadInputTokens)
@@ -149,8 +149,8 @@ func TestOpenAIStream_EmitsCacheReadOnUsageFrame(t *testing.T) {
 			if ev.CacheReadInputTokens != 1800 {
 				t.Errorf("message_delta CacheReadInputTokens: got %d want 1800", ev.CacheReadInputTokens)
 			}
-			if ev.InputTokens != 2000 {
-				t.Errorf("message_delta InputTokens: got %d want 2000", ev.InputTokens)
+			if ev.InputTokens != 200 {
+				t.Errorf("message_delta InputTokens: got %d want 200", ev.InputTokens)
 			}
 			sawDelta = true
 		}
@@ -163,5 +163,12 @@ func TestOpenAIStream_EmitsCacheReadOnUsageFrame(t *testing.T) {
 	}
 	if !sawDelta {
 		t.Error("never saw a message_delta event with usage")
+	}
+}
+
+func TestNormalizeInputUsage_CachedExceedsTotal(t *testing.T) {
+	input, cached := normalizeInputUsage(10, 12)
+	if input != 0 || cached != 10 {
+		t.Fatalf("normalizeInputUsage(10, 12) = (%d, %d), want (0, 10)", input, cached)
 	}
 }

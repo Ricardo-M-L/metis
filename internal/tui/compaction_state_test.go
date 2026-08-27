@@ -7,6 +7,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
 // TestContextCompactedDropsPreCompactUsage reproduces the user's 500k →
@@ -38,8 +39,8 @@ func TestContextCompactedDropsPreCompactUsage(t *testing.T) {
 	if got := m.totalTokens.ContextUsage(); got != 0 {
 		t.Fatalf("pre-compact ContextUsage survived success: got %d", got)
 	}
-	if m.totalTokens.Input() != 0 || m.totalTokens.Output() != 0 {
-		t.Fatalf("/cost counters must restart at compact boundary: in=%d out=%d",
+	if m.totalTokens.Input() != 500_393 || m.totalTokens.Output() != 11_000 {
+		t.Fatalf("compaction erased cumulative /cost: in=%d out=%d",
 			m.totalTokens.Input(), m.totalTokens.Output())
 	}
 
@@ -52,6 +53,37 @@ func TestContextCompactedDropsPreCompactUsage(t *testing.T) {
 	}
 	if strings.Contains(bar, "99%+") || strings.Contains(bar, "(100%)") {
 		t.Fatalf("small post-compact history rendered as full:\n%s", bar)
+	}
+}
+
+func TestCompactionPreservesPersistedCostSnapshot(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "compaction-cost"
+	want := session.CostSnapshot{
+		InputTokens: 10_000, OutputTokens: 500, CacheCreateTokens: 2_000, CacheReadTokens: 8_000,
+	}
+	if err := store.WriteCost(sessionID, want); err != nil {
+		t.Fatal(err)
+	}
+	var tokens tokenTracker
+	tokens.add(want.InputTokens, want.OutputTokens, want.CacheCreateTokens, want.CacheReadTokens)
+	resetTokenUsageAfterCompaction(&tokens, store, sessionID)
+
+	if tokens.ContextUsage() != 0 || tokens.LastTotal() != 0 {
+		t.Fatalf("last-call fields survived compaction: context=%d last=%d", tokens.ContextUsage(), tokens.LastTotal())
+	}
+	if tokens.PromptTokens() != want.InputTokens+want.CacheCreateTokens+want.CacheReadTokens || tokens.Output() != want.OutputTokens {
+		t.Fatalf("cumulative counters changed: prompt=%d output=%d", tokens.PromptTokens(), tokens.Output())
+	}
+	got, ok, err := store.ReadCost(sessionID)
+	if err != nil || !ok {
+		t.Fatalf("ReadCost: ok=%v err=%v", ok, err)
+	}
+	if got != want {
+		t.Fatalf("persisted cost changed across compaction: got=%+v want=%+v", got, want)
 	}
 }
 

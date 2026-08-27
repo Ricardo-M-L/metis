@@ -91,10 +91,16 @@ type CacheSafeParams struct {
 // idempotency guards in both Compactor.Snip and EnforcePostCompactBudget
 // leave the fork's snipped slices alone on subsequent passes.
 func SnapshotForFork(loop *Loop) *CacheSafeParams {
-	if loop == nil || loop.Provider == nil {
+	if loop == nil {
 		return nil
 	}
 	loop.mu.Lock()
+	provider := loop.Provider
+	compactor := loop.Compactor
+	if provider == nil {
+		loop.mu.Unlock()
+		return nil
+	}
 	system := loop.System
 	sections := make([]llm.SystemSection, 0, len(loop.SystemSections)+3)
 	if len(loop.SystemSections) > 0 {
@@ -145,8 +151,8 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 	// a 5MB grep dump from the parent. Idempotent (already-capped
 	// blocks are skipped via the marker check inside
 	// EnforcePostCompactBudget). Cheap when the prefix is small.
-	if loop.Compactor != nil {
-		prefix = loop.Compactor.EnforcePostCompactBudget(prefix)
+	if compactor != nil {
+		prefix = compactor.EnforcePostCompactBudget(prefix)
 	}
 
 	return &CacheSafeParams{
@@ -156,7 +162,7 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 		PrefixMessages: prefix,
 		Model:          model,
 		Effort:         effort,
-		Provider:       loop.Provider,
+		Provider:       provider,
 	}
 }
 

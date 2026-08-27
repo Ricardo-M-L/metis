@@ -71,6 +71,12 @@ func NewResponses(apiKey, baseURL, model string, maxTokens int, timeout time.Dur
 func (r *Responses) Name() string    { return "openai-responses" }
 func (r *Responses) ModelID() string { return r.Model }
 
+// The Responses request wire has no history item for Metis reasoning blocks;
+// both plaintext and redacted thinking are skipped by toResponsesRequest.
+func (r *Responses) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
+	return block.Type != "thinking" && block.Type != "redacted_thinking"
+}
+
 func (r *Responses) MaxContextTokens() int {
 	if r.ContextWindow > 0 {
 		return r.ContextWindow
@@ -380,11 +386,15 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			ev := provider.StreamEvent{Type: "message_delta", StopReason: "end_turn"}
 			if env.Response != nil {
 				if env.Response.Usage != nil {
-					ev.OutputTokens = env.Response.Usage.OutputTokens
-					ev.InputTokens = env.Response.Usage.InputTokens
+					cacheRead := 0
 					if env.Response.Usage.InputTokensDetails != nil {
-						ev.CacheReadInputTokens = env.Response.Usage.InputTokensDetails.CachedTokens
+						cacheRead = env.Response.Usage.InputTokensDetails.CachedTokens
 					}
+					ev.InputTokens, ev.CacheReadInputTokens = normalizeInputUsage(
+						env.Response.Usage.InputTokens,
+						cacheRead,
+					)
+					ev.OutputTokens = env.Response.Usage.OutputTokens
 				}
 				if hasFunctionCall(env.Response.Output) {
 					ev.StopReason = "tool_use"
@@ -398,11 +408,15 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 				ev.StopReason = "stop_sequence"
 			}
 			if env.Response != nil && env.Response.Usage != nil {
-				ev.OutputTokens = env.Response.Usage.OutputTokens
-				ev.InputTokens = env.Response.Usage.InputTokens
+				cacheRead := 0
 				if env.Response.Usage.InputTokensDetails != nil {
-					ev.CacheReadInputTokens = env.Response.Usage.InputTokensDetails.CachedTokens
+					cacheRead = env.Response.Usage.InputTokensDetails.CachedTokens
 				}
+				ev.InputTokens, ev.CacheReadInputTokens = normalizeInputUsage(
+					env.Response.Usage.InputTokens,
+					cacheRead,
+				)
+				ev.OutputTokens = env.Response.Usage.OutputTokens
 			}
 			s.pending = append(s.pending, ev)
 			s.done = true
@@ -620,11 +634,15 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 	}
 	result.StopReason = stop
 	if out.Usage != nil {
-		result.InputTokens = out.Usage.InputTokens
-		result.OutputTokens = out.Usage.OutputTokens
+		cacheRead := 0
 		if out.Usage.InputTokensDetails != nil {
-			result.CacheReadInputTokens = out.Usage.InputTokensDetails.CachedTokens
+			cacheRead = out.Usage.InputTokensDetails.CachedTokens
 		}
+		result.InputTokens, result.CacheReadInputTokens = normalizeInputUsage(
+			out.Usage.InputTokens,
+			cacheRead,
+		)
+		result.OutputTokens = out.Usage.OutputTokens
 	}
 	return result, nil
 }

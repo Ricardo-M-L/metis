@@ -47,6 +47,30 @@ func TestEffortAPIIsCapabilityGatedAndPersistsSessionChoice(t *testing.T) {
 		t.Fatalf("persisted effort = %q err=%v", hdr.Effort, err)
 	}
 
+	// A turn/model/session transaction owns runMu. Effort must not validate
+	// against the old model and then land after a concurrent runtime switch.
+	s.runMu.Lock()
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/effort", bytes.NewBufferString(`{"effort":"low"}`)))
+	s.runMu.Unlock()
+	if rr.Code != http.StatusConflict || loop.EffortValue() != llm.EffortHigh {
+		t.Fatalf("busy effort update = %d %s value=%q", rr.Code, rr.Body.String(), loop.EffortValue())
+	}
+
+	// Persistence is the commit point: a disk failure must leave the live
+	// request preference untouched rather than creating a resume-time split.
+	if err := os.RemoveAll(store.Dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.Dir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/effort", bytes.NewBufferString(`{"effort":"medium"}`)))
+	if rr.Code != http.StatusInternalServerError || loop.EffortValue() != llm.EffortHigh {
+		t.Fatalf("failed effort persistence = %d %s value=%q", rr.Code, rr.Body.String(), loop.EffortValue())
+	}
+
 	unsupported := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{ProviderName: "gemini"})
 	unsupported.stateMu.Lock()
 	unsupported.activeProviderName = "gemini"

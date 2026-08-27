@@ -7,6 +7,35 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.32] - 2026-08-27
+
+### Changed
+
+- Context compaction now makes at most one summary request and locally fits up
+  to 96K tokens while reserving independent evidence budgets for user intent,
+  failed tools, successful tools, pending calls, and recent transcript state.
+- Tool calls and results are compacted as atomic `ToolUseID` transactions,
+  including real parallel batches, explicit omission markers, head-and-tail
+  evidence, and compact structured or multimodal result metadata.
+- Context pressure uses the active provider request snapshot, effective model
+  window, reserved output, system/tool overhead, and provider cache-token
+  telemetry instead of stale or UI-derived percentages.
+
+### Fixed
+
+- Automatic compaction no longer performs unnecessary summary calls when local
+  cleanup has already relieved pressure, and small model windows remain inside
+  their actual wire limits.
+- Session reset, model rebinding, overflow recovery, and re-entrant compaction
+  callbacks no longer race or allow an obsolete summary to replace a newer
+  conversation.
+- TUI and Desktop compaction indicators now follow the authoritative lifecycle,
+  report elapsed time consistently, and keep displayed context usage bounded
+  without discarding the underlying token counts.
+- Streaming terminal events and provider-specific usage metadata now finalize
+  consistently across OpenAI-compatible, Anthropic, Bedrock, Gemini, Vertex,
+  and Azure transports.
+
 ## [0.4.31] - 2026-08-26
 
 ### Added

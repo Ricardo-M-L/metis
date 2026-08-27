@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -46,6 +47,32 @@ type forkFakeTool struct {
 	name        string
 	desc        string
 	concurrency pubtool.Concurrency
+}
+
+type blockingForkSchemaTool struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (t *blockingForkSchemaTool) Name() string { return "blocking-schema" }
+func (t *blockingForkSchemaTool) Description() string {
+	return "blocks while its schema is snapshotted"
+}
+func (t *blockingForkSchemaTool) IsEnabled() bool { return true }
+func (t *blockingForkSchemaTool) InputSchema() map[string]any {
+	t.once.Do(func() { close(t.entered) })
+	<-t.release
+	return map[string]any{"type": "object"}
+}
+func (t *blockingForkSchemaTool) Concurrency(map[string]any) pubtool.Concurrency {
+	return pubtool.ConcurrencySafe
+}
+func (t *blockingForkSchemaTool) CanUse(context.Context, map[string]any) (pubtool.Permission, string) {
+	return pubtool.PermissionAllow, ""
+}
+func (t *blockingForkSchemaTool) Execute(context.Context, map[string]any) (*pubtool.Result, error) {
+	return &pubtool.Result{Output: "ok"}, nil
 }
 
 func (t forkFakeTool) Name() string                { return t.name }
@@ -387,6 +414,54 @@ func TestSnapshotForFork_HappyPath(t *testing.T) {
 	snap.SystemSections[0].Body = "child-only mutation"
 	if loop.SystemSections[0].Body != "you are helpful" {
 		t.Fatal("fork snapshot shares mutable SystemSections with parent")
+	}
+}
+
+func TestSnapshotForFork_KeepsOneProviderRuntimeAcrossConcurrentRebind(t *testing.T) {
+	oldProvider := &scriptedProvider{}
+	newProvider := &scriptedProvider{}
+	blockingTool := &blockingForkSchemaTool{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	loop := NewLoop(oldProvider, newRegistryWith(t, blockingTool), nil, nil, "old system", 10)
+	loop.Model = "old-model"
+	loop.Compactor = NewCompactor(DefaultCompactionConfig(), "old-model", oldProvider.MaxContextTokens(), oldProvider)
+	loop.AppendUser("hello")
+
+	done := make(chan *CacheSafeParams, 1)
+	go func() { done <- SnapshotForFork(loop) }()
+	<-blockingTool.entered
+
+	// SnapshotForFork has released Loop.mu and is assembling tool schemas. A
+	// model switch here must not splice the new provider into the old model,
+	// prompt and history snapshot.
+	rebound := make(chan struct{})
+	go func() {
+		loop.RebindProviderModel(newProvider, "new-model")
+		close(rebound)
+	}()
+	select {
+	case <-rebound:
+	case <-time.After(2 * time.Second):
+		close(blockingTool.release)
+		<-rebound
+		t.Fatal("provider rebind blocked while fork tool schemas were assembled")
+	}
+	close(blockingTool.release)
+
+	var snap *CacheSafeParams
+	select {
+	case snap = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SnapshotForFork did not finish after schema release")
+	}
+	if snap == nil {
+		t.Fatal("SnapshotForFork returned nil")
+	}
+	if snap.Provider != oldProvider || snap.Model != "old-model" || snap.System != "old system" {
+		t.Fatalf("fork mixed provider runtimes: provider=%p old=%p model=%q system=%q",
+			snap.Provider, oldProvider, snap.Model, snap.System)
 	}
 }
 

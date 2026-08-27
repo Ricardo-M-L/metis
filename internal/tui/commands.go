@@ -406,8 +406,9 @@ func switchREPLModel(r *REPL, newModel string) error {
 	}
 	if r.cfg == nil {
 		r.model = newModel
-		r.Loop.Model = newModel
-		runtime.RebindLoopRuntime(r.Loop, r.Loop.Provider, newModel, r.Loop.System, r.SessionID)
+		provider, _, _ := r.Loop.ProviderModelSnapshot()
+		r.Loop.RebindProviderModel(provider, newModel)
+		runtime.RebindLoopRuntime(r.Loop, provider, newModel, r.Loop.System, r.SessionID)
 		return nil // string-only swap (test path)
 	}
 	// `/model <provider>/<model>` is unambiguous for custom profiles. For a
@@ -433,8 +434,9 @@ func switchREPLModel(r *REPL, newModel string) error {
 	}
 	if newProvName == "" {
 		r.model = newModel
-		r.Loop.Model = newModel
-		runtime.RebindLoopRuntime(r.Loop, r.Loop.Provider, newModel, r.Loop.System, r.SessionID)
+		provider, _, _ := r.Loop.ProviderModelSnapshot()
+		r.Loop.RebindProviderModel(provider, newModel)
+		runtime.RebindLoopRuntime(r.Loop, provider, newModel, r.Loop.System, r.SessionID)
 		return nil // no profile to rebuild against
 	}
 	pb, err := runtime.BuildProvider(r.cfg, newProvName, newModel)
@@ -450,27 +452,13 @@ func switchREPLModel(r *REPL, newModel string) error {
 	newBaseSystem, newBaseSections := runtime.RebindProviderPrompt(
 		r.baseSystem, r.baseSystemSections, newProvName, pb.Model,
 	)
-	r.Loop.Provider = pb.Provider
-	r.Loop.Model = pb.Model
-	r.Loop.ContextWindow = pb.Provider.MaxContextTokens()
-	r.Loop.System = newSystem
-	r.Loop.SystemSections = newSections
+	r.Loop.RebindProviderRuntime(pb.Provider, pb.Model, pb.MaxOutputTokens, newSystem, newSections)
 	r.model = pb.Model
 	r.providerName = newProvName
 	r.baseSystem = newBaseSystem
 	r.baseSystemSections = newBaseSections
 	runtime.RebindLoopRuntime(r.Loop, pb.Provider, pb.Model, newSystem, r.SessionID)
 	getModelState().AddRecent(pb.Model)
-	if r.Loop.Compactor != nil {
-		oldCfg := r.Loop.Compactor.Config
-		oldMaxOut := r.Loop.Compactor.MaxOutputTokens
-		r.Loop.Compactor = agent.NewCompactor(oldCfg, pb.Model,
-			pb.Provider.MaxContextTokens(), pb.Provider)
-		r.Loop.Compactor.MaxOutputTokens = oldMaxOut
-		r.Loop.Compactor.ApplyWindowTier(
-			pb.Provider.MaxContextTokens() - oldMaxOut,
-		)
-	}
 	return nil
 }
 
@@ -506,12 +494,14 @@ func cmdFiles(r *REPL, args string) string {
 // cmdContext shows current context-window usage. Calculates percent
 // of max-context tokens consumed by current history + system prompt.
 func cmdContext(r *REPL, args string) string {
-	// Use LastIn (the input tokens of the most recent API call) rather
-	// than session-cumulative total. Context-window pressure is about
-	// what was *just* sent to the LLM (system + history + current msg),
-	// NOT API spend across the whole session — the latter conflates two
-	// different concepts and produces nonsensical percentages like 200%.
-	used := r.totalTokens.LastIn()
+	// Use the loop's canonical active-context snapshot when available. It is
+	// anchored to the latest provider response and includes local messages
+	// appended after that response exactly once. tokenTracker remains the
+	// headless fallback; its session-cumulative counters are reserved for /cost.
+	used := r.totalTokens.ContextUsage()
+	if r.Loop != nil {
+		used = r.Loop.EstimateContextTokens()
+	}
 	maxCtx := 1_000_000
 	if r.Loop != nil && r.Loop.Provider != nil {
 		if cap := r.Loop.Provider.MaxContextTokens(); cap > 0 {
@@ -519,8 +509,11 @@ func cmdContext(r *REPL, args string) string {
 		}
 	}
 	pct := float64(used) / float64(maxCtx) * 100
+	if pct > 100 {
+		pct = 100
+	}
 	rows := []infoRow{
-		{Key: "in last call", Value: fmtThousands(used) + " tokens"},
+		{Key: "active prompt", Value: fmtThousands(used) + " tokens"},
 		{Key: "max", Value: "~" + fmtThousands(maxCtx) + " tokens"},
 		{Key: "utilization", Value: fmt.Sprintf("%.1f%%", pct)},
 	}
@@ -1756,13 +1749,14 @@ func cmdCost(r *REPL, args string) string {
 	out := r.totalTokens.out
 	cacheCreate := r.totalTokens.CacheCreate()
 	cacheRead := r.totalTokens.CacheRead()
-	total := in + out
+	total := r.totalTokens.PromptTokens() + out
 	priceIn, priceOut := guessPriceUSDPerM(r.Loop.Model)
 	// Cache reads bill at 10% of fresh input on Anthropic; cache_create
 	// at 125%. Estimate the savings: (read × 0.9 × priceIn) is how much
 	// cheaper this session was versus paying full input rate. Useful
 	// to show users "your /memory + addendum sectioning earned you $X".
-	costUSD := float64(in)*priceIn/1_000_000 + float64(out)*priceOut/1_000_000
+	costUSD := (float64(in)+float64(cacheCreate)*1.25+float64(cacheRead)*0.10)*priceIn/1_000_000 +
+		float64(out)*priceOut/1_000_000
 	cacheSavingsUSD := float64(cacheRead) * 0.9 * priceIn / 1_000_000
 	rows := []infoRow{
 		{Key: "input tokens", Value: fmtThousands(in)},
@@ -1844,14 +1838,15 @@ func (r *REPL) handleSkillSearch(query string) string {
 
 // tokenTracker tracks token usage with two distinct concepts:
 //
-//   - Session cumulative (in / out) — for `/cost` billing summaries.
+//   - Session cumulative (fresh in / cache / out) — for `/cost` billing
+//     summaries.
 //     Every API call adds to these; they only grow.
 //
 //   - Most-recent API call (lastIn / lastOut / lastCacheCreate /
 //     lastCacheRead) — overwritten on every API call. Two distinct
 //     status displays read from these:
 //
-//     (a) Spinner row "↓ 38123 tokens"  →  LastTotal() == lastIn + lastOut
+//     (a) Spinner row "↓ 38123 tokens"  →  LastTotal() == full prompt + lastOut
 //     This is the per-turn cost: what the most recent round trip
 //     actually consumed (input + output).
 //
@@ -1863,9 +1858,8 @@ func (r *REPL) handleSkillSearch(query string) string {
 //     https://code.claude.com/docs/en/statusline.md). Output is
 //     NOT included — it isn't part of the in-flight context.
 //
-// The two numbers diverge in two ways:
-//   - ContextUsage adds cache (CC parity); LastTotal does not.
-//   - LastTotal adds output; ContextUsage does not.
+// The two numbers diverge only because LastTotal adds output while
+// ContextUsage is input-side context pressure.
 //
 // `dispIn/dispOut` are smoothed values for animation.
 type tokenTracker struct {
@@ -1952,53 +1946,56 @@ func (t *tokenTracker) LastCacheHitRate() float64 {
 	return float64(t.lastCacheRead) / float64(denom)
 }
 
-// LastTotal is the most recent API call's input+output combined — the
+// LastTotal is the most recent API call's full prompt+output combined — the
 // per-turn cost. Spinner row uses this to surface what the just-finished
 // round trip consumed.
-func (t *tokenTracker) LastTotal() int { return t.lastIn + t.lastOut }
+func (t *tokenTracker) LastTotal() int { return t.LastPromptTokens() + t.lastOut }
+
+// PromptTokens and LastPromptTokens add the mutually-exclusive fresh,
+// cache-create and cache-read input buckets exactly once. OpenAI-compatible
+// adapters normalize cached input out of `in` before events reach this type.
+func (t *tokenTracker) PromptTokens() int {
+	return t.in + t.cacheCreate + t.cacheRead
+}
+
+func (t *tokenTracker) LastPromptTokens() int {
+	return t.lastIn + t.lastCacheCreate + t.lastCacheRead
+}
 
 // ContextUsage is the most recent API call's input-side total including
 // prompt-cache tokens. Bottom-right status bar uses this to show
 // context-window load — distinct from per-turn cost (which still
 // includes output).
 //
-// 2026-05-18 — REMOVED lastCacheRead from the sum. Some Anthropic-
-// compatible gateways (MiniMax's anthropic endpoint caught in the
-// wild on user image #8) over-report cache_read by recounting the
-// full system+memory+tools cached chunk on EVERY turn instead of
-// reporting the actual hit-this-call bytes. Result: a 2k-token chat
-// reported 301682 tokens / 99%+ context load on a 192k window,
-// alarming the user and triggering compact prompts when nothing was
-// actually full.
-//
-// Lower bound is now `input + cache_creation` (genuine fresh-this-
-// turn tokens). The render layer in render_chrome.go takes
-// max(ContextUsage(), EstimateContextTokens()) so the displayed
-// number still reflects the real conversation size for cache-hit-
-// only turns where lastIn would otherwise be ~0.
-//
-// Trade-off: when a provider DOES accurately report cache_read (the
-// Anthropic-native path does), we now technically under-report —
-// but the byte-estimate floor recovers the right magnitude for
-// every long session, and the >100%-from-cache-bug failure mode is
-// the more user-hostile of the two.
+// Provider adapters normalize wire usage before it reaches this tracker:
+// OpenAI/DeepSeek prompt_tokens includes cached input, so that adapter emits
+// `input = prompt - cached`; Anthropic already reports the buckets separately.
+// Summing the three normalized buckets here therefore counts each prompt token
+// exactly once. This fixes the real >100% cause instead of hiding it by
+// discarding cache_read or only clamping the rendered percentage.
 func (t *tokenTracker) ContextUsage() int {
-	return t.lastIn + t.lastCacheCreate
+	return t.LastPromptTokens()
 }
 
-// Reset zeroes both raw and displayed counters. Called by /clear, /new and a
-// successful compaction so pre-boundary API usage cannot masquerade as the
-// current context size. /cost intentionally restarts at a compact boundary;
-// /usage points to the provider's authoritative usage surface.
+// ResetLast invalidates only the latest-call/context display fields. A
+// compaction rewrites active history but does not refund tokens already spent,
+// so cumulative /cost counters and their smoothed display values remain.
+func (t *tokenTracker) ResetLast() {
+	t.lastIn = 0
+	t.lastOut = 0
+	t.lastCacheCreate = 0
+	t.lastCacheRead = 0
+}
+
+// Reset zeroes both raw and displayed counters. Called by /clear, /new and
+// session switches; successful compaction uses ResetLast so historical spend
+// remains visible.
 func (t *tokenTracker) Reset() {
 	t.in = 0
 	t.out = 0
 	t.cacheCreate = 0
 	t.cacheRead = 0
-	t.lastIn = 0
-	t.lastOut = 0
-	t.lastCacheCreate = 0
-	t.lastCacheRead = 0
+	t.ResetLast()
 	t.dispIn = 0
 	t.dispOut = 0
 }

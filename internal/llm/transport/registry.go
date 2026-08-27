@@ -48,13 +48,19 @@ type BuildOpts struct {
 	ContextWindow int
 }
 
+// DefaultMaxOutputTokens is the effective transport reservation when a
+// profile omits max_tokens. Constructors and runtime metadata must share this
+// value; otherwise the wire reserves 8192 while compaction incorrectly sees 0.
+const DefaultMaxOutputTokens = 8192
+
 // Result wraps the built provider plus the resolved model id (after
 // the provider's internal default-fill). Callers mostly want the
 // provider client; some downstream paths (compactor, agent loop) also
 // need the resolved model.
 type Result struct {
-	Provider provider.Provider
-	Model    string
+	Provider        provider.Provider
+	Model           string
+	MaxOutputTokens int
 }
 
 // Constructor is the signature every transport registers under its

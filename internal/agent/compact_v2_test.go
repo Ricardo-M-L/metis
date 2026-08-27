@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 )
 
 // --- helpers ---------------------------------------------------------------
@@ -99,7 +100,9 @@ func (f *flakyProvider) Complete(_ context.Context, _ llm.Request) (*llm.Respons
 type alwaysFailStreamProvider struct {
 	streamCalls   int
 	completeCalls int
+	streamErr     error
 	completeText  string
+	completeErr   error
 }
 
 func (a *alwaysFailStreamProvider) Name() string          { return "always-fail-stream" }
@@ -107,10 +110,16 @@ func (a *alwaysFailStreamProvider) MaxContextTokens() int { return 100_000 }
 func (a *alwaysFailStreamProvider) ModelID() string       { return "" }
 func (a *alwaysFailStreamProvider) Stream(_ context.Context, _ llm.Request) (llm.StreamReader, error) {
 	a.streamCalls++
+	if a.streamErr != nil {
+		return nil, a.streamErr
+	}
 	return nil, errors.New("alwaysFailStreamProvider: SSE broken")
 }
 func (a *alwaysFailStreamProvider) Complete(_ context.Context, _ llm.Request) (*llm.Response, error) {
 	a.completeCalls++
+	if a.completeErr != nil {
+		return nil, a.completeErr
+	}
 	text := a.completeText
 	if text == "" {
 		text = "FALLBACK_COMPLETE_SUMMARY"
@@ -144,17 +153,18 @@ func longMiddle() []llm.Message {
 	return out
 }
 
-// --- #1: structured summary prompt (8 sections, CC-aligned 2026-06-13) ------
+// --- #1: structured summary prompt (9 sections, evidence-preserving) --------
 
 func TestSummary_InitialPromptHasAllSections(t *testing.T) {
-	// 8 sections: the crush-5 plus the Claude-Code-aligned additions
-	// (Primary Request & Intent, Errors & Fixes, Pending Tasks).
+	// 9 sections: the prior eight plus Verified Outcomes, which keeps successful
+	// tool evidence distinct from attempted or merely claimed work.
 	want := []string{
 		"## Primary Request & Intent",
 		"## Current State",
 		"## Files & Changes",
 		"## Technical Context",
 		"## Errors & Fixes",
+		"## Verified Outcomes",
 		"## Pending Tasks",
 		"## Strategy & Approach",
 		"## Exact Next Steps",
@@ -171,6 +181,11 @@ func TestSummary_InitialPromptHasAllSections(t *testing.T) {
 	// latest user ask (the CC anti-drift property).
 	if !strings.Contains(SummarySystemPromptInitial, "VERBATIM") {
 		t.Error("Next Steps should require quoting the latest user request verbatim (drift guard)")
+	}
+	for _, proof := range []string{"exit status", "pass count", "artifact path", "hash", "version"} {
+		if !strings.Contains(SummarySystemPromptInitial, proof) {
+			t.Errorf("Verified Outcomes should preserve compact proof %q", proof)
+		}
 	}
 }
 
@@ -532,6 +547,31 @@ func TestSummarize_FallsBackToCompleteWhenAllStreamsFail(t *testing.T) {
 	}
 }
 
+func TestSummarizeFailsFastOnPermanentAndExhaustedErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "auth", err: errors.New("401 Unauthorized: invalid API key")},
+		{name: "retry exhausted", err: &transport.RetryExhaustedError{Err: errors.New("503 service unavailable"), Attempts: 3}},
+		{name: "context overflow", err: errors.New("prompt is too long for context window")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prov := &alwaysFailStreamProvider{streamErr: tt.err}
+			c := newCompactorForV2(prov)
+			c.MaxSummaryRetries = 4
+			_, err := c.Compact(context.Background(), longMiddle())
+			if err == nil {
+				t.Fatal("permanent summary error unexpectedly succeeded")
+			}
+			if prov.streamCalls != 1 || prov.completeCalls != 0 {
+				t.Fatalf("permanent error multiplied calls: stream=%d complete=%d, want 1/0", prov.streamCalls, prov.completeCalls)
+			}
+		})
+	}
+}
+
 func TestSummarize_RespectsCtxCancelDuringBackoff(t *testing.T) {
 	flaky := &flakyProvider{failsBeforeOK: 10} // fail forever
 	c := newCompactorForV2(flaky)
@@ -543,6 +583,23 @@ func TestSummarize_RespectsCtxCancelDuringBackoff(t *testing.T) {
 	_, err := c.Compact(ctx, longMiddle())
 	if err == nil {
 		t.Fatalf("expected error from cancelled ctx")
+	}
+	if flaky.calls != 0 {
+		t.Fatalf("cancelled compaction started %d provider calls, want 0", flaky.calls)
+	}
+}
+
+func TestSummarize_PreservesCompleteFallbackCancellationIdentity(t *testing.T) {
+	prov := &alwaysFailStreamProvider{completeErr: context.DeadlineExceeded}
+	c := newCompactorForV2(prov)
+	c.MaxSummaryRetries = 0
+
+	_, err := c.Compact(context.Background(), longMiddle())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fallback deadline identity lost: %v", err)
+	}
+	if prov.streamCalls != 1 || prov.completeCalls != 1 {
+		t.Fatalf("provider calls = stream %d / complete %d, want 1/1", prov.streamCalls, prov.completeCalls)
 	}
 }
 

@@ -170,11 +170,11 @@ type SystemSection struct {
 // Type is one of: "text_delta", "tool_use_start", "tool_input_delta",
 // "tool_use_stop", "message_stop", "error".
 //
-// CacheCreationInputTokens / CacheReadInputTokens mirror Anthropic's
-// prompt-caching usage fields. Providers without prompt caching leave
-// them at 0; consumers that compute "context-window load" (status bar
-// percentage) must add them to InputTokens — this is what claude-code's
-// statusline does (used = input + cache_creation + cache_read).
+// InputTokens / CacheCreationInputTokens / CacheReadInputTokens are disjoint
+// prompt-usage buckets. InputTokens excludes cached input even when an
+// upstream wire format reports a total that includes it; providers without
+// prompt caching leave both cache fields at 0. Consumers that compute
+// context-window load add the three buckets exactly once.
 type StreamEvent struct {
 	Type                     string
 	TextDelta                string
@@ -230,6 +230,20 @@ type Provider interface {
 	Stream(ctx context.Context, req Request) (StreamReader, error)
 	MaxContextTokens() int
 	ModelID() string
+}
+
+// ContextHistoryPolicy is an optional provider capability used when turning a
+// completed response into the next request's active-context estimate. Some
+// transports persist reasoning for the UI but deliberately do not send those
+// blocks back on the wire (Anthropic without signatures and OpenAI Responses
+// are the common cases). Billing output_tokens still includes that reasoning,
+// so treating every output token as future context can overstate the window by
+// tens of thousands of tokens.
+//
+// Providers that do not implement this interface are assumed to replay every
+// assistant block, preserving the historical/output-token fast path.
+type ContextHistoryPolicy interface {
+	ContextIncludesAssistantBlock(ContentBlock) bool
 }
 
 // StreamReader is a typed iterator over StreamEvents. Close releases

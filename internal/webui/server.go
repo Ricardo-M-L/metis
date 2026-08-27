@@ -1334,7 +1334,8 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 			s.activePreset = hdr.Preset
 		}
 		s.stateMu.Unlock()
-		rtpkg.RebindLoopRuntime(s.loop, s.loop.Provider, activeModel, s.loop.System, id)
+		provider, _, _ := s.loop.ProviderModelSnapshot()
+		rtpkg.RebindLoopRuntime(s.loop, provider, activeModel, s.loop.System, id)
 		return nil
 	}
 
@@ -1362,7 +1363,9 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		targetPreset = "standard"
 	}
 
-	provider := s.loop.Provider
+	runtimeState := s.loop.ProviderRuntimeState()
+	provider := runtimeState.Provider
+	targetMaxOutputTokens := runtimeState.MaxOutputTokens
 	needsProviderBuild := provider == nil || targetProviderName != activeProviderName || targetModel != activeModel
 	if !needsProviderBuild && provider != nil && targetModel != "" {
 		// ModelID is the transport truth. An empty value is permitted for
@@ -1371,7 +1374,6 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 			needsProviderBuild = true
 		}
 	}
-	providerRebuilt := false
 	if needsProviderBuild {
 		if s.buildProvider == nil {
 			return fmt.Errorf("stored provider/model %q/%q does not match live runtime %q/%q",
@@ -1385,10 +1387,10 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 			return errors.New("provider/model preflight returned no provider")
 		}
 		provider = built.Provider
+		targetMaxOutputTokens = built.MaxOutputTokens
 		if built.Model != "" {
 			targetModel = built.Model
 		}
-		providerRebuilt = true
 	}
 
 	if err := s.persistActiveSessionState(); err != nil {
@@ -1412,27 +1414,20 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		})
 	}
 
-	s.loop.Provider = provider
-	s.loop.Model = targetModel
-	if provider != nil {
-		s.loop.ContextWindow = provider.MaxContextTokens()
+	canonicalTargetSystem, canonicalTargetSections := rtpkg.RebindProviderPrompt(
+		s.freshSystem, s.freshSystemSections, targetProviderName, targetModel,
+	)
+	targetSections := []llm.SystemSection(nil)
+	if targetSystem == s.freshSystem || targetSystem == canonicalTargetSystem {
+		// Model switches persist the flattened, provider-rebound prompt for
+		// backwards-compatible session files. Recognize that canonical form on
+		// resume and restore the typed sections too; otherwise the next switch
+		// cannot remove the old provider_hint without flattening custom text.
+		targetSystem = canonicalTargetSystem
+		targetSections = canonicalTargetSections
 	}
-	if providerRebuilt && s.loop.Compactor != nil {
-		oldCfg := s.loop.Compactor.Config
-		oldMaxOut := s.loop.Compactor.MaxOutputTokens
-		s.loop.Compactor = agent.NewCompactor(oldCfg, targetModel, provider.MaxContextTokens(), provider)
-		s.loop.Compactor.MaxOutputTokens = oldMaxOut
-		s.loop.Compactor.ApplyWindowTier(provider.MaxContextTokens() - oldMaxOut)
-	}
-	s.loop.System = targetSystem
+	s.loop.RebindProviderRuntime(provider, targetModel, targetMaxOutputTokens, targetSystem, targetSections)
 	s.loop.SetEffort(targetEffort)
-	if targetSystem == s.freshSystem {
-		s.loop.SystemSections = append([]llm.SystemSection(nil), s.freshSystemSections...)
-	} else {
-		// Persisted free-form prompts have no typed-section representation.
-		// Clearing prevents sections from the source session overriding it.
-		s.loop.SystemSections = nil
-	}
 	if s.loop.Gate != nil {
 		s.loop.Gate.ResetSessionState(mode, resumedRules)
 	}
@@ -1463,6 +1458,13 @@ func (s *Server) persistActiveSessionState() error {
 	model := s.activeModel
 	preset := s.activePreset
 	s.stateMu.RUnlock()
+	runtimeState := s.loop.ProviderRuntimeState()
+	return s.writeActiveSessionState(
+		id, providerName, model, preset, runtimeState.System, s.loop.EffortValue(),
+	)
+}
+
+func (s *Server) writeActiveSessionState(id, providerName, model, preset, system string, effort llm.Effort) error {
 	if id == "" {
 		return nil
 	}
@@ -1471,8 +1473,8 @@ func (s *Server) persistActiveSessionState() error {
 		ID:       id,
 		Provider: providerName,
 		Model:    model,
-		System:   s.loop.System,
-		Effort:   effortHeaderValue(s.loop.EffortValue()),
+		System:   system,
+		Effort:   effortHeaderValue(effort),
 		Preset:   preset,
 	}
 	if s.loop.Gate != nil {
@@ -2032,6 +2034,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			"current": map[string]string{"provider": curProvider, "model": curModel},
 		})
 	case http.MethodPost:
+		if !s.runMu.TryLock() {
+			writeError(w, http.StatusConflict, "cannot switch model while a turn is running")
+			return
+		}
+		defer s.runMu.Unlock()
+		if s.loop == nil {
+			writeError(w, http.StatusServiceUnavailable, "agent loop unavailable")
+			return
+		}
 		var body struct {
 			Provider string `json:"provider"`
 			Model    string `json:"model"`
@@ -2064,24 +2075,41 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "provider build failed: "+err.Error())
 			return
 		}
-		if s.loop != nil {
-			s.loop.Provider = built.Provider
-			s.loop.Model = body.Model
-			if built.Model != "" {
-				s.loop.Model = built.Model
-			}
-			s.loop.ContextWindow = built.Provider.MaxContextTokens()
+		selectedModel := body.Model
+		if built.Model != "" {
+			selectedModel = built.Model
 		}
-		capability := reasoningEffortCapability(cfg, body.Provider, s.loop.Model)
+		previousRuntime := s.loop.ProviderRuntimeState()
+		newSystem, newSections := rtpkg.RebindProviderPrompt(
+			previousRuntime.System, previousRuntime.SystemSections, body.Provider, selectedModel,
+		)
+		capability := reasoningEffortCapability(cfg, body.Provider, selectedModel)
+		selectedEffort := s.loop.EffortValue()
 		if !capability.Supported {
-			s.loop.SetEffort(llm.EffortDefault)
+			selectedEffort = llm.EffortDefault
 		}
-		if err := s.commitActiveModelSelection(body.Provider, s.loop.Model); err != nil {
+		// Persist the desired metadata before mutating the live runtime. A disk
+		// failure therefore leaves provider, prompt, effort and selector exactly
+		// as they were instead of requiring a lossy provider reconstruction.
+		if err := s.commitActiveModelSelectionState(
+			body.Provider, selectedModel, newSystem, selectedEffort,
+		); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		s.loop.RebindProviderRuntime(
+			built.Provider, selectedModel, built.MaxOutputTokens, newSystem, newSections,
+		)
+		s.loop.SetEffort(selectedEffort)
+		s.stateMu.RLock()
+		activeSessionID := s.activeSessionID
+		s.stateMu.RUnlock()
+		// Built-in Agent/Fork tools and the lazy pricing resolver capture the
+		// active provider. Keep them on the same atomic model boundary as the
+		// main loop instead of leaving child work on the old transport.
+		rtpkg.RebindLoopRuntime(s.loop, built.Provider, selectedModel, newSystem, activeSessionID)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"provider": body.Provider, "model": s.loop.Model,
+			"provider": body.Provider, "model": selectedModel,
 			"effortSupported": capability.Supported, "effortReason": capability.Reason,
 		})
 	default:
@@ -2092,13 +2120,24 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // commitActiveModelSelection keeps the live selector and durable resume
 // metadata in sync after a successful provider rebuild.
 func (s *Server) commitActiveModelSelection(providerName, model string) error {
+	runtimeState := s.loop.ProviderRuntimeState()
+	return s.commitActiveModelSelectionState(
+		providerName, model, runtimeState.System, s.loop.EffortValue(),
+	)
+}
+
+func (s *Server) commitActiveModelSelectionState(providerName, model, system string, effort llm.Effort) error {
+	s.stateMu.RLock()
+	id := s.activeSessionID
+	preset := s.activePreset
+	s.stateMu.RUnlock()
+	if err := s.writeActiveSessionState(id, providerName, model, preset, system, effort); err != nil {
+		return fmt.Errorf("persist model selection: %w", err)
+	}
 	s.stateMu.Lock()
 	s.activeProviderName = providerName
 	s.activeModel = model
 	s.stateMu.Unlock()
-	if err := s.persistActiveSessionState(); err != nil {
-		return fmt.Errorf("persist model selection: %w", err)
-	}
 	return nil
 }
 
@@ -2172,17 +2211,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	toolNames := make([]string, 0)
 	if s.loop != nil {
 		contextUsed = s.loop.EstimateContextTokens()
-		contextWindow = s.loop.ContextWindow
+		contextWindow, compactThreshold, compactAtTokens = s.loop.ContextStatusSnapshot()
 		if s.loop.Registry != nil {
 			for _, tool := range s.loop.Registry.All() {
 				if tool != nil {
 					toolNames = append(toolNames, tool.Name())
 				}
 			}
-		}
-		if s.loop.Compactor != nil {
-			compactThreshold = s.loop.Compactor.Config.Threshold
-			compactAtTokens = s.loop.Compactor.TriggerTokens()
 		}
 	}
 	s.cancelMu.Lock()
@@ -2916,7 +2951,7 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		case "tokens":
 			var in, out, cw, cr int64
 			fmt.Sscanf(ev.Text, "input=%d output=%d cache_write=%d cache_read=%d", &in, &out, &cw, &cr)
-			stats.InputTokens += in + cr
+			stats.InputTokens += in + cw + cr
 			stats.OutputTokens += out
 			stats.CacheRead += cr
 			stats.CacheWrite += cw

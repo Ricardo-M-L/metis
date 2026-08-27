@@ -46,6 +46,13 @@ type CompactResult struct {
 	History        []llm.Message
 }
 
+// ErrCompactionInProgress is returned when a second compaction reaches the
+// same Loop while an existing transaction still owns its summarizer state.
+// Returning immediately is important for event, hook and persistence
+// callbacks: waiting on a non-reentrant mutex from inside the active
+// transaction would self-deadlock forever.
+var ErrCompactionInProgress = errors.New("compact: compaction already in progress")
+
 // CompactNow is the sole Loop-level context replacement pipeline. It owns
 // threshold/force policy, hooks, progress lifecycle, final budget guards
 // (inside Compactor.Compact), durable commit ordering and live installation.
@@ -64,9 +71,13 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 
 	// Compactor carries iterative-summary and circuit-breaker state, so two
 	// compactions must never overlap even though the slow/external portions of
-	// this transaction deliberately run without Loop.mu.
-	l.compactMu.Lock()
-	defer l.compactMu.Unlock()
+	// this transaction deliberately run without Loop.mu. Do not queue here:
+	// Emit/hooks/Persist are user callbacks and may synchronously re-enter this
+	// method. A blocking mutex would make that callback self-deadlock.
+	if !l.compactMu.TryLock() {
+		return result, ErrCompactionInProgress
+	}
+	defer l.finishCompactorCriticalSection()
 
 	l.mu.Lock()
 	compactor := l.Compactor
@@ -77,6 +88,8 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	hooks := l.Hooks
 	checkpoint := l.CompactionCheckpoint
 	model, turn := l.Model, l.turnIdx
+	routingRevision := l.routingRevision
+	requestOverhead := int(l.requestOverheadTokens.Load())
 
 	result.BeforeMessages = len(l.Messages)
 	result.BeforeTokens = estimateTokens(l.Messages)
@@ -122,7 +135,8 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	beforeStillCurrent := func() bool {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		return sameHistoryIdentity(l.Messages, beforeIdentity)
+		return sameHistoryIdentity(l.Messages, beforeIdentity) &&
+			l.routingRevision == routingRevision && l.Compactor == compactor
 	}
 
 	// Hooks may inspect Loop.History, so never invoke them under l.mu.
@@ -190,7 +204,9 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 
 	// Provider summarization may take seconds and may itself call back into the
 	// loop. compactMu protects Compactor state while Loop.mu remains available.
-	candidate, compactErr := compactor.CompactWithInstructions(compactCtx, before, opts.Instructions)
+	candidate, compactErr := compactor.compactWithRequestOverhead(
+		compactCtx, before, opts.Instructions, requestOverhead, decisionTokens, opts.Force,
+	)
 	// Drain all provider progress callbacks before the history CAS. Otherwise a
 	// queued callback could mutate history between the check and installation.
 	closeProgress()
@@ -204,11 +220,14 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		// attempt, not summarizer health. CompactWithInstructions records every
 		// error uniformly, so restore the breaker only for context termination;
 		// genuine provider/summary failures keep their accumulated count.
-		contextTerminated := errors.Is(compactErr, context.Canceled) ||
-			errors.Is(compactErr, context.DeadlineExceeded) ||
-			errors.Is(ctx.Err(), context.Canceled) ||
+		// Only the caller's lifetime is neutral to summarizer health. A provider
+		// watchdog or the compactor's own SummaryTimeout also returns
+		// DeadlineExceeded, but that is a real failed attempt and must advance the
+		// circuit breaker; otherwise an over-threshold session can pay another
+		// full timeout on every agent iteration forever.
+		callerTerminated := errors.Is(ctx.Err(), context.Canceled) ||
 			errors.Is(ctx.Err(), context.DeadlineExceeded)
-		if contextTerminated {
+		if callerTerminated {
 			compactor.consecutiveFailures = priorFailures
 		}
 		return result, compactErr
@@ -232,11 +251,16 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	// observe the same post-summary state as the historical auto path. Any
 	// persistence failure below rolls this back before returning.
 	l.mu.Lock()
-	if !sameHistoryIdentity(l.Messages, beforeIdentity) {
+	if !sameHistoryIdentity(l.Messages, beforeIdentity) ||
+		l.routingRevision != routingRevision || l.Compactor != compactor {
 		live := cloneMessages(l.Messages)
+		routingChanged := l.routingRevision != routingRevision || l.Compactor != compactor
 		l.mu.Unlock()
 		restoreCompactorState()
 		setResultHistory(live)
+		if routingChanged {
+			return result, fmt.Errorf("compact: provider/model changed while summary was being generated")
+		}
 		return result, fmt.Errorf("compact: history changed while summary was being generated")
 	}
 	l.Messages = candidate
@@ -285,6 +309,20 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	}
 	final = append(final, postHookSuffix...)
 	rollbackBase := append(cloneMessages(before), postHookSuffix...)
+	if historyCap, constrained, budgetErr := compactor.postCompactHistoryCap(requestOverhead); budgetErr != nil ||
+		(constrained && estimateTokens(final) >= historyCap) {
+		if budgetErr == nil {
+			budgetErr = fmt.Errorf("compact: post-compact hook/suffix exceeds effective history budget (%d >= %d tokens; request overhead=%d)",
+				estimateTokens(final), historyCap, requestOverhead)
+		}
+		l.Messages = rollbackBase
+		live := cloneMessages(l.Messages)
+		l.storeContextEstimateFromHistory(estimateTokens(live))
+		l.mu.Unlock()
+		restoreCompactorState()
+		setResultHistory(live)
+		return result, budgetErr
+	}
 	l.Messages = final
 	result.AfterMessages = len(final)
 	result.AfterTokens = estimateTokens(final)

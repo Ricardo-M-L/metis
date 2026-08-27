@@ -64,6 +64,39 @@ func TestEstimateRequestContextTokensIncludesStateAndTools(t *testing.T) {
 	}
 }
 
+func TestEstimateRequestContextTokensIncludesStructuredRuntimeStateAndExactAnchor(t *testing.T) {
+	provider := &fakeSummarizer{}
+	plan := strings.Repeat("plan step ", 20)
+	loop := &Loop{
+		Provider: provider,
+		Model:    "test-model",
+		SystemSections: []llm.SystemSection{
+			{Name: "base", Body: "base prompt", Cache: true},
+		},
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "continue"}}}},
+		CurrentStateSnapshot: func() RuntimeStateSnapshot {
+			return RuntimeStateSnapshot{PermissionMode: "ask", CurrentPlan: plan}
+		},
+	}
+	specs := []llm.ToolSpec{{Name: "Read", Description: "read a file", InputSchema: map[string]any{"type": "object"}}}
+
+	small := loop.EstimateRequestContextTokens(specs)
+	plan = strings.Repeat("expanded plan step ", 800)
+	large := loop.EstimateRequestContextTokens(specs)
+	if large <= small+1_000 {
+		t.Fatalf("structured runtime-state growth missing from preflight: small=%d large=%d", small, large)
+	}
+
+	req, anchor := loop.buildRequestWithContext(specs)
+	wantOverhead := estimateRequestOverhead(req)
+	if anchor.requestOverhead != wantOverhead {
+		t.Fatalf("anchor inherited stale overhead: got=%d want exact=%d", anchor.requestOverhead, wantOverhead)
+	}
+	if cached := int(loop.requestOverheadTokens.Load()); cached != wantOverhead {
+		t.Fatalf("request overhead cache=%d, want concrete request=%d", cached, wantOverhead)
+	}
+}
+
 func TestEstimateRequestContextTokensRescueOmitsToolsWithoutConsumingFlag(t *testing.T) {
 	loop := &Loop{
 		System:        strings.Repeat("system ", 80),
@@ -139,7 +172,7 @@ func newIrreduciblePressureLoop() (*Loop, *fakeSummarizer, *Compactor) {
 	cfg.RetainTokens = 24
 	cfg.RetainMinMessages = 5
 	cfg.RetainMinUserMessages = 1
-	c := NewCompactor(cfg, "test", 1_000, p)
+	c := NewCompactor(cfg, "test", 4_000, p)
 
 	messages := make([]llm.Message, 0, 16)
 	for i := 0; i < 8; i++ {
@@ -150,7 +183,7 @@ func newIrreduciblePressureLoop() (*Loop, *fakeSummarizer, *Compactor) {
 	}
 	loop := &Loop{
 		Compactor: c,
-		System:    strings.Repeat("fixed-overhead ", 220),
+		System:    strings.Repeat("fixed-overhead ", 500),
 		Messages:  messages,
 	}
 	return loop, p, c
@@ -198,7 +231,7 @@ func TestMaybeCompactMaterialOverheadGrowthRearmsPressureWatermark(t *testing.T)
 		t.Fatalf("first pressure pass made %d summary calls, want 1", p.calls)
 	}
 
-	loop.System += strings.Repeat("new-runtime-overhead ", 2_000)
+	loop.System += strings.Repeat("new-runtime-overhead ", 200)
 	loop.maybeCompact(context.Background(), nil)
 	if p.calls != 2 {
 		t.Fatalf("material overhead growth did not permit one retry: calls=%d want=2", p.calls)

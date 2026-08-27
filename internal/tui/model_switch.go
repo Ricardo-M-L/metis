@@ -15,7 +15,6 @@ package tui
 import (
 	"fmt"
 
-	"github.com/Ricardo-M-L/metis/internal/agent"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
@@ -47,8 +46,9 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 
 	if m.cfg == nil {
 		m.model = newModel
-		m.loop.Model = newModel
-		rtpkg.RebindLoopRuntime(m.loop, m.loop.Provider, newModel, m.loop.System, m.sessionID)
+		provider, _, _ := m.loop.ProviderModelSnapshot()
+		m.loop.RebindProviderModel(provider, newModel)
+		rtpkg.RebindLoopRuntime(m.loop, provider, newModel, m.loop.System, m.sessionID)
 		return nil // string-only swap; cfg not wired (test path)
 	}
 
@@ -61,8 +61,9 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 	}
 	if provName == "" {
 		m.model = newModel
-		m.loop.Model = newModel
-		rtpkg.RebindLoopRuntime(m.loop, m.loop.Provider, newModel, m.loop.System, m.sessionID)
+		provider, _, _ := m.loop.ProviderModelSnapshot()
+		m.loop.RebindProviderModel(provider, newModel)
+		rtpkg.RebindLoopRuntime(m.loop, provider, newModel, m.loop.System, m.sessionID)
 		return nil // no provider profile to rebuild against
 	}
 
@@ -81,39 +82,13 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 		m.baseSystem, m.baseSystemSections, provName, pb.Model,
 	)
 
-	// Swap in the new Provider. From this point on the loop's next
-	// request uses the new transport + auth + window.
-	m.loop.Provider = pb.Provider
-	m.loop.Model = pb.Model
-	m.loop.ContextWindow = pb.Provider.MaxContextTokens()
-	m.loop.System = newSystem
-	m.loop.SystemSections = newSections
+	// Swap provider, model, window and compactor math as one loop snapshot.
+	m.loop.RebindProviderRuntime(pb.Provider, pb.Model, pb.MaxOutputTokens, newSystem, newSections)
 	m.model = pb.Model
 	m.providerName = provName
 	m.baseSystem = newBaseSystem
 	m.baseSystemSections = newBaseSections
 	rtpkg.RebindLoopRuntime(m.loop, pb.Provider, pb.Model, newSystem, m.sessionID)
 
-	// Rebuild Compactor so ShouldCompact / threshold math uses the
-	// new provider's MaxContextTokens. Preserve the existing Config
-	// (Threshold, MinimumTokens, MicrocompactDir, IdleMaxSeconds, …)
-	// so the user's session-level overrides survive the swap; the only
-	// inputs that change are the per-provider cap and the per-provider
-	// per-request output budget.
-	if m.loop.Compactor != nil {
-		oldCfg := m.loop.Compactor.Config
-		oldMaxOut := m.loop.Compactor.MaxOutputTokens
-		m.loop.Compactor = agent.NewCompactor(oldCfg, pb.Model,
-			pb.Provider.MaxContextTokens(), pb.Provider)
-		// Carry max_tokens forward from before. providerMaxTokens(cfg)
-		// reads cfg.Provider.Default which may not match the new
-		// profile — so we use the previous value as a conservative
-		// approximation. Mismatches cause the trigger to fire slightly
-		// early/late but never produce a wire-cap violation.
-		m.loop.Compactor.MaxOutputTokens = oldMaxOut
-		m.loop.Compactor.ApplyWindowTier(
-			pb.Provider.MaxContextTokens() - oldMaxOut,
-		)
-	}
 	return nil
 }

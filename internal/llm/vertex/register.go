@@ -26,7 +26,7 @@ func build(opts transport.BuildOpts) (*transport.Result, error) {
 	}
 	maxTokens := opts.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = 8192
+		maxTokens = transport.DefaultMaxOutputTokens
 	}
 	if opts.Extra == nil {
 		return nil, errors.New("vertex_anthropic: extra fields required (service_account_file, project, region)")
@@ -50,5 +50,5 @@ func build(opts transport.BuildOpts) (*transport.Result, error) {
 	if opts.ContextWindow > 0 {
 		p.ContextWindow = opts.ContextWindow
 	}
-	return &transport.Result{Provider: p, Model: opts.Model}, nil
+	return &transport.Result{Provider: p, Model: opts.Model, MaxOutputTokens: maxTokens}, nil
 }

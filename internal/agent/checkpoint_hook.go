@@ -319,15 +319,25 @@ func (l *Loop) SummarizeFromTurn(ctx context.Context, turn int) (RewindResult, e
 // PrepareSummarizeFromTurn captures the cheap validation and CAS baseline on
 // the caller goroutine. It never invokes the provider.
 func (l *Loop) PrepareSummarizeFromTurn(turn int) (*RewindSummaryPlan, error) {
-	if l == nil || l.Compactor == nil {
+	if l == nil {
 		return nil, ErrSummarizerUnavailable
 	}
-	history := l.History()
+	// Capture the replaceable compactor binding and its matching history under
+	// one lock. A concurrent model rebind may retire this compactor after the
+	// snapshot, but the immutable provider/config binding remains valid for the
+	// prepared operation and cannot be mixed with a different history read.
+	l.mu.Lock()
+	compactor := l.Compactor
+	history := transcript.Snapshot(l.Messages)
+	l.mu.Unlock()
+	if compactor == nil {
+		return nil, ErrSummarizerUnavailable
+	}
 	messageIndex, prompt, ok := rewindTarget(history, turn)
 	if !ok {
 		return nil, ErrInvalidRewindPoint
 	}
-	return &RewindSummaryPlan{history: history, messageIndex: messageIndex, turn: turn, prompt: prompt, compactor: l.Compactor}, nil
+	return &RewindSummaryPlan{history: history, messageIndex: messageIndex, turn: turn, prompt: prompt, compactor: compactor}, nil
 }
 
 // GenerateRewindSummary is provider-only work and is safe to run in a

@@ -123,6 +123,12 @@ func (b *Bedrock) VisionCapability() provider.VisionCapability {
 }
 func (b *Bedrock) MaxContextTokens() int { return b.ContextWindow }
 
+// Bedrock uses the shared Anthropic request encoder, which cannot replay
+// unsigned plaintext thinking blocks.
+func (b *Bedrock) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
+	return block.Type != "thinking" && (block.Type != "redacted_thinking" || block.Data != "")
+}
+
 // invokeURL is the synchronous Bedrock Runtime endpoint. Returns the
 // streaming variant when streaming=true (kept for the future when
 // metis grows an event-stream parser).

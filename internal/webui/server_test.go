@@ -72,9 +72,14 @@ func (p *statusTestProvider) Stream(ctx context.Context, _ llm.Request) (llm.Str
 
 type autoCompactPersistenceProvider struct{}
 
-func (*autoCompactPersistenceProvider) Name() string          { return "auto-compact-persistence" }
-func (*autoCompactPersistenceProvider) ModelID() string       { return "auto-compact-persistence" }
-func (*autoCompactPersistenceProvider) MaxContextTokens() int { return 128 }
+func (*autoCompactPersistenceProvider) Name() string    { return "auto-compact-persistence" }
+func (*autoCompactPersistenceProvider) ModelID() string { return "auto-compact-persistence" }
+
+// Keep the window small enough to force this fixture's 1% auto-compaction
+// threshold, but large enough to hold the real structured summary prompt.
+// A synthetic 128-token window is now correctly rejected by the wire-budget
+// guard and therefore cannot exercise persistence semantics.
+func (*autoCompactPersistenceProvider) MaxContextTokens() int { return 8_000 }
 func (*autoCompactPersistenceProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
 	return nil, errors.New("test provider expects streaming")
 }

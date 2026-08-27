@@ -17,6 +17,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	pubprov "github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
@@ -96,6 +97,21 @@ func TestBuildProvider_Custom_OpenAITransport(t *testing.T) {
 	if pb.Provider.Name() != "openai" {
 		t.Errorf("provider.Name() = %q, want openai", pb.Provider.Name())
 	}
+	if pb.MaxOutputTokens != transport.DefaultMaxOutputTokens {
+		t.Errorf("effective default max_tokens = %d, want %d", pb.MaxOutputTokens, transport.DefaultMaxOutputTokens)
+	}
+}
+
+func TestBuildProviderRejectsOutputBudgetAtOrAboveWindow(t *testing.T) {
+	t.Setenv("FAKE_KEY", "sk-test")
+	cfg := newCfgWithCustom("bad-window", config.ProviderRaw{
+		Transport: "openai_chat", APIKeyEnv: "FAKE_KEY", Model: "small-model",
+		ContextWindow: 4_096, MaxTokens: 4_096,
+	})
+	_, err := BuildProvider(cfg, "bad-window", "")
+	if err == nil || !strings.Contains(err.Error(), "must be smaller than context_window") {
+		t.Fatalf("invalid max_tokens/window should fail clearly, got %v", err)
+	}
 }
 
 func TestBuildProvider_CustomVisionOverride(t *testing.T) {
@@ -123,6 +139,54 @@ func TestBuildProvider_CustomVisionOverride(t *testing.T) {
 			}
 			if got := pubprov.ProviderSupportsVision(pb.Provider); got != tt.override {
 				t.Fatalf("ProviderSupportsVision(%q) = %v, want override %v", tt.model, got, tt.override)
+			}
+		})
+	}
+}
+
+func TestBuildProvider_CustomVisionOverridePreservesOptionalHistoryPolicy(t *testing.T) {
+	t.Setenv("FAKE_KEY", "sk-test")
+	tests := []struct {
+		name         string
+		transport    string
+		wantPolicy   bool
+		wantThinking bool
+	}{
+		{
+			name:         "chat provider does not gain history policy",
+			transport:    "openai_chat",
+			wantPolicy:   false,
+			wantThinking: true,
+		},
+		{
+			name:         "responses provider retains history policy",
+			transport:    "openai_responses",
+			wantPolicy:   true,
+			wantThinking: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newCfgWithCustom("custom-provider", config.ProviderRaw{
+				Transport:      tt.transport,
+				APIKeyEnv:      "FAKE_KEY",
+				BaseURL:        "https://api.example.invalid/v1",
+				Model:          "vendor-private-model",
+				SupportsVision: boolPtr(true),
+			})
+			pb, err := BuildProvider(cfg, "custom-provider", "")
+			if err != nil {
+				t.Fatalf("BuildProvider: %v", err)
+			}
+			policy, gotPolicy := pb.Provider.(pubprov.ContextHistoryPolicy)
+			if gotPolicy != tt.wantPolicy {
+				t.Fatalf("ContextHistoryPolicy implemented = %v, want %v", gotPolicy, tt.wantPolicy)
+			}
+			if gotPolicy {
+				gotThinking := policy.ContextIncludesAssistantBlock(pubprov.ContentBlock{Type: "thinking"})
+				if gotThinking != tt.wantThinking {
+					t.Fatalf("thinking replay policy = %v, want %v", gotThinking, tt.wantThinking)
+				}
 			}
 		})
 	}

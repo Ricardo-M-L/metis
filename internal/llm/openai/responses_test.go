@@ -190,7 +190,7 @@ func TestResponses_StreamTextAndToolFlow(t *testing.T) {
 	if stop.StopReason != "tool_use" {
 		t.Fatalf("stop reason = %q, want tool_use", stop.StopReason)
 	}
-	if stop.InputTokens != 10 || stop.OutputTokens != 20 || stop.CacheReadInputTokens != 4 {
+	if stop.InputTokens != 6 || stop.OutputTokens != 20 || stop.CacheReadInputTokens != 4 {
 		t.Fatalf("usage mapping wrong: %+v", stop)
 	}
 }
@@ -313,7 +313,7 @@ func TestResponses_CompleteToolUseAndThinking(t *testing.T) {
 	if res.StopReason != "tool_use" {
 		t.Fatalf("stop = %q", res.StopReason)
 	}
-	if res.InputTokens != 7 || res.OutputTokens != 9 || res.CacheReadInputTokens != 2 {
+	if res.InputTokens != 5 || res.OutputTokens != 9 || res.CacheReadInputTokens != 2 {
 		t.Fatalf("usage = %+v", res)
 	}
 }

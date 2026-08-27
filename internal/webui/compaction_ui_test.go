@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,10 +10,35 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+type activeContextStatusProvider struct {
+	calls int
+}
+
+func (*activeContextStatusProvider) Name() string          { return "active-context-status" }
+func (*activeContextStatusProvider) ModelID() string       { return "active-context-status-model" }
+func (*activeContextStatusProvider) MaxContextTokens() int { return 128_000 }
+func (*activeContextStatusProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, errors.New("active-context status test expects streaming")
+}
+func (p *activeContextStatusProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	p.calls++
+	input, cacheCreate, cacheRead, output, text := 600, 100, 200, 50, "first response"
+	if p.calls == 2 {
+		input, cacheCreate, cacheRead, output, text = 900, 150, 300, 75, "second response"
+	}
+	return &composerSummaryStream{events: []llm.StreamEvent{
+		{Type: "message_start", InputTokens: input, CacheCreationInputTokens: cacheCreate, CacheReadInputTokens: cacheRead},
+		{Type: "text_delta", TextDelta: text},
+		{Type: "message_delta", StopReason: "end_turn", OutputTokens: output},
+		{Type: "message_stop"},
+	}}, nil
+}
 
 func decodeHubEventPayload(t *testing.T, body string) map[string]any {
 	t.Helper()
@@ -95,6 +121,42 @@ func TestStatusIncludesAuthoritativeCompactionTriggerTokens(t *testing.T) {
 	}
 	if want := loop.Compactor.TriggerTokens(); payload.CompactAtTokens != want {
 		t.Fatalf("compactAtTokens = %d, want authoritative trigger %d", payload.CompactAtTokens, want)
+	}
+}
+
+func TestStatusContextUsedReportsActiveRatherThanCumulativeUsage(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &activeContextStatusProvider{}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeBypass), nil, "system", 2)
+	loop.Model = provider.ModelID()
+	loop.ContextWindow = provider.MaxContextTokens()
+	for _, prompt := range []string{"first question", "second question"} {
+		loop.AppendUser(prompt)
+		out := make(chan agent.Event, 32)
+		if err := loop.Run(context.Background(), out); err != nil {
+			t.Fatalf("Run(%q): %v", prompt, err)
+		}
+	}
+
+	s := NewServer("127.0.0.1:0", loop, store)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		ContextUsed int `json:"contextUsed"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	first := 600 + 100 + 200 + 50
+	second := 900 + 150 + 300 + 75
+	if payload.ContextUsed != second {
+		t.Fatalf("contextUsed = %d, want latest active context %d (not cumulative %d)", payload.ContextUsed, second, first+second)
 	}
 }
 

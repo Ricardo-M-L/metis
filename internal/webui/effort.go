@@ -95,6 +95,16 @@ func (s *Server) handleEffort(w http.ResponseWriter, r *http.Request) {
 	}
 	s.effortMu.Lock()
 	defer s.effortMu.Unlock()
+	// Effort capability is model-specific. Serialize POST with turns, model
+	// switches and session activation so validation, persistence and the live
+	// update all describe one provider runtime. GET remains non-blocking.
+	if r.Method == http.MethodPost {
+		if !s.runMu.TryLock() {
+			writeError(w, http.StatusConflict, "cannot change effort while a turn or runtime switch is running")
+			return
+		}
+		defer s.runMu.Unlock()
+	}
 	cfg, _, err := config.Load()
 	if err != nil || cfg == nil {
 		writeError(w, http.StatusInternalServerError, "config unreadable")
@@ -131,13 +141,13 @@ func (s *Server) handleEffort(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "effort must be default, low, medium, or high")
 			return
 		}
-		s.loop.SetEffort(effort)
 		if sessionID != "" && s.store != nil {
 			if err := s.store.WriteHeaderFull(session.Header{ID: sessionID, Effort: effortHeaderValue(effort)}); err != nil {
-				writeError(w, http.StatusInternalServerError, "effort changed in memory but session persistence failed")
+				writeError(w, http.StatusInternalServerError, "effort persistence failed; live effort was not changed")
 				return
 			}
 		}
+		s.loop.SetEffort(effort)
 		writeJSON(w, http.StatusOK, map[string]any{"effort": effortHeaderValue(effort), "supported": true, "applies": "next model request"})
 	default:
 		w.Header().Set("Allow", "GET, POST")

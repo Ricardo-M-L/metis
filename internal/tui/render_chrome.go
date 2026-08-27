@@ -216,7 +216,21 @@ func clampBlock(block string, width int) string {
 // All bracketed parts are conditional. The leading "Verb" is shimmered
 // from 3s onward so quick replies don't flicker the dimming animation.
 func renderSpinnerStatus(m *Model) string {
-	elapsed := time.Since(m.spinnerStartedAt)
+	// A compaction is a nested activity within a (potentially very long) turn.
+	// Its clock, animation phase and token counter must all start at
+	// EventCompactionStart; otherwise a turn that began hours ago renders a new
+	// compaction as `9h 16m` and carries the previous request's token count into
+	// the compaction row. This is display-state isolation only: the normal turn
+	// clock remains untouched and resumes after EventCompactionEnd.
+	compacting := strings.HasPrefix(m.spinnerOverride, "Compacting conversation")
+	activityStartedAt := m.spinnerStartedAt
+	if compacting && !m.compactionStartedAt.IsZero() {
+		activityStartedAt = m.compactionStartedAt
+	}
+	elapsed := time.Duration(0)
+	if !activityStartedAt.IsZero() {
+		elapsed = time.Since(activityStartedAt)
+	}
 	// Glyph advance is **time-gated**, not tick-gated. claude-code's
 	// spinner advances one frame every 120ms via
 	// `Math.floor(time / 120)`; we do the same so a faster TUI tick
@@ -236,7 +250,7 @@ func renderSpinnerStatus(m *Model) string {
 	// trivial `cd` ran for an hour, when in fact the turn had been
 	// looping for an hour and the tool itself just started.
 	elapsedDisplay := elapsed
-	if m.spinnerSub != "" {
+	if !compacting && m.spinnerSub != "" {
 		for i := len(m.toolEvents) - 1; i >= 0; i-- {
 			if m.toolEvents[i].Kind == "start" {
 				elapsedDisplay = time.Since(m.toolEvents[i].StartTime)
@@ -259,33 +273,42 @@ func renderSpinnerStatus(m *Model) string {
 	// SpinnerAnimationRow.tsx). When unset (legacy callers / tests
 	// that don't drive events) fall back to the firstStreamAt + buffer
 	// heuristic so historical behavior holds.
-	var receiving bool
-	switch m.spinnerPhase {
-	case "thinking", "responding", "tool", "tool-input", "tool-use":
-		receiving = true
-	case "requesting":
-		receiving = false
-	default:
-		receiving = !m.firstStreamAt.IsZero() && (m.streamingText != "" || m.thinkingText != "")
-	}
-	if receiving {
-		// Live estimate: chars/4 ≈ tokens (rough). Beats waiting for
-		// EventTokens to fire at end of stream, which leaves the
-		// counter visibly stuck mid-stream.
-		out := m.totalTokens.LastOut()
-		if est := (len(m.streamingText) + len(m.thinkingText)) / 4; est > out {
-			out = est
+	if compacting {
+		// EventCompactionProgress carries cumulative UTF-8 output bytes, not
+		// provider token usage. Surface a clearly approximate summary-output
+		// count instead of leaking LastIn/LastOut from the parent turn.
+		if summaryTokens := m.spinnerCompactionBytes / 4; summaryTokens > 0 {
+			parts = append(parts, fmt.Sprintf("↓ ≈%s summary tokens", formatTokens(summaryTokens)))
 		}
-		if out > 0 {
-			parts = append(parts, fmt.Sprintf("↓ %s tokens", formatTokens(out)))
+	} else {
+		var receiving bool
+		switch m.spinnerPhase {
+		case "thinking", "responding", "tool", "tool-input", "tool-use":
+			receiving = true
+		case "requesting":
+			receiving = false
+		default:
+			receiving = !m.firstStreamAt.IsZero() && (m.streamingText != "" || m.thinkingText != "")
 		}
-	} else if in := m.totalTokens.LastIn(); in > 0 {
-		parts = append(parts, fmt.Sprintf("↑ %s tokens", formatTokens(in)))
-	}
-	if !m.firstStreamAt.IsZero() {
-		thought := m.firstStreamAt.Sub(m.spinnerStartedAt)
-		if thought >= time.Second {
-			parts = append(parts, fmt.Sprintf("thought for %ds", int(thought.Seconds())))
+		if receiving {
+			// Live estimate: chars/4 ≈ tokens (rough). Beats waiting for
+			// EventTokens to fire at end of stream, which leaves the
+			// counter visibly stuck mid-stream.
+			out := m.totalTokens.LastOut()
+			if est := (len(m.streamingText) + len(m.thinkingText)) / 4; est > out {
+				out = est
+			}
+			if out > 0 {
+				parts = append(parts, fmt.Sprintf("↓ %s tokens", formatTokens(out)))
+			}
+		} else if in := m.totalTokens.LastIn(); in > 0 {
+			parts = append(parts, fmt.Sprintf("↑ %s tokens", formatTokens(in)))
+		}
+		if !m.firstStreamAt.IsZero() {
+			thought := m.firstStreamAt.Sub(m.spinnerStartedAt)
+			if thought >= time.Second {
+				parts = append(parts, fmt.Sprintf("thought for %ds", int(thought.Seconds())))
+			}
 		}
 	}
 
@@ -568,15 +591,13 @@ func renderStatusBar(m *Model) string {
 
 	publishBridgeSnapshot(m)
 
-	// Right side: **context-window load** for the most recent API call
-	// — input + cache (no output), as a percentage of the model's max
-	// context. Mirrors claude-code's statusline `used_percentage`
-	// (https://code.claude.com/docs/en/statusline.md): numerator is
-	// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`,
-	// denominator is `context_window_size`.
+	// Right side: active context-window load. The loop anchors it to the latest
+	// successful response's disjoint input/cache/output usage, then estimates
+	// only local tool/user messages appended after that response. This follows
+	// Codex/Claude's active-snapshot model instead of session-cumulative spend.
 	//
-	// Distinct from the spinner row's "↓ N tokens" (LastTotal — input+
-	// output, per-turn cost) and from /cost (session-cumulative billing).
+	// Distinct from the spinner row's "↓ N tokens" (the latest call's cost)
+	// and from /cost (session-cumulative billing).
 	// Three different numbers serving three different questions:
 	//   spinner    → "what did the just-finished turn cost?"
 	//   right side → "how full is my context window?"
@@ -586,33 +607,13 @@ func renderStatusBar(m *Model) string {
 	// matches claude-code's statusline rendering.
 	var right string
 	used := m.totalTokens.ContextUsage()
-	if used == 0 {
-		// Fallback when the most-recent-API-call counters are still
-		// zero (very first turn before the first usage event lands).
-		// Use session-cumulative input as a placeholder so the right
-		// side isn't completely blank during the cold-start window.
-		// Feedback 2026-05-05: "the token count sometimes doesn't
-		// show during running". Better to show an approximate
-		// (cumulative-so-far) than to flicker from blank → number.
-		used = m.totalTokens.in + m.totalTokens.cacheCreate + m.totalTokens.cacheRead
-	}
-	// History-bytes floor: take the larger of (API-reported context
-	// usage, on-disk history estimate). Without this, a provider that
-	// under-reports cache_read_input_tokens (some Anthropic-compat
-	// gateways — MiniMax does this inconsistently) makes the
-	// displayed number SWING DOWN between turns, which looks like
-	// "context shrank" to users expecting monotone growth.
-	//
-	// estimateTokens counts every serialized byte in Loop.Messages so
-	// it only drops when real compaction fires — and compaction ALSO
-	// emits a "[info] context snipped: ~N → ~M tokens" event, so a
-	// drop without that event is the signal of a provider bug, not a
-	// metis-side context change. User reported:
-	//   "第3轮 5w token, 第4轮 3w, 还降低了" — this fixes that.
+	// Loop owns the canonical active-context value: a validated latest usage
+	// snapshot plus only the messages appended after it. Do not max this with
+	// raw tokenTracker data. A malformed compatibility gateway may report an
+	// impossible cache count; the loop deliberately rejects it, and letting the
+	// raw tracker win here would resurrect the >100% bug in the status bar.
 	if m.loop != nil {
-		if est := m.loop.EstimateContextTokens(); est > used {
-			used = est
-		}
+		used = m.loop.EstimateContextTokens()
 	}
 	if used > 0 {
 		right = formatTokensRaw(used) + " tokens"

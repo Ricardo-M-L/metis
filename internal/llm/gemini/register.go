@@ -18,11 +18,11 @@ func build(opts transport.BuildOpts) (*transport.Result, error) {
 	}
 	maxTokens := opts.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = 8192
+		maxTokens = transport.DefaultMaxOutputTokens
 	}
 	p := New(opts.APIKey, opts.BaseURL, opts.Model, maxTokens, timeout, 0)
 	if opts.ContextWindow > 0 {
 		p.ContextWindow = opts.ContextWindow
 	}
-	return &transport.Result{Provider: p, Model: p.Model}, nil
+	return &transport.Result{Provider: p, Model: p.Model, MaxOutputTokens: maxTokens}, nil
 }

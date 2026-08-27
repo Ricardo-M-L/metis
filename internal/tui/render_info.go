@@ -94,7 +94,7 @@ func renderCost(m *Model) string {
 	out := m.totalTokens.Output()
 	cc := m.totalTokens.CacheCreate()
 	cr := m.totalTokens.CacheRead()
-	total := in + out
+	total := m.totalTokens.PromptTokens() + out
 	priceIn, priceOut := guessPriceUSDPerM(m.model)
 	// Anthropic's cache pricing: cache_create ≈ 1.25× input, cache_read
 	// ≈ 0.10× input. Heuristic — treat as "input" for non-Anthropic.
@@ -131,13 +131,13 @@ func renderCost(m *Model) string {
 				Hint: "vs no-cache cost on the same reads",
 			})
 		}
-		// Cache hit rate = cache_read / (cache_read + input). High
+		// Cache hit rate = cache_read / full prompt input. High
 		// rate = lots of stable prefix; low = mostly fresh content.
-		if cr+in > 0 {
-			rate := float64(cr) * 100 / float64(cr+in)
+		if m.totalTokens.PromptTokens() > 0 {
+			rate := m.totalTokens.CacheHitRate() * 100
 			rows = append(rows, infoRow{
 				Key: "cache hit rate", Value: fmt.Sprintf("%.1f%%", rate),
-				Hint: "cache_read / (cache_read + input)",
+				Hint: "cache_read / full prompt input",
 			})
 		}
 	}
@@ -687,11 +687,12 @@ func renderContext(m *Model) string {
 		cap = m.loop.Provider.MaxContextTokens()
 	}
 	used := m.totalTokens.ContextUsage()
-	if used == 0 {
-		// Fallback to session-cumulative for the very first turn
-		// before usage events land. Same logic as the bottom-right
-		// status bar.
-		used = m.totalTokens.in + m.totalTokens.cacheCreate + m.totalTokens.cacheRead
+	if m.loop != nil {
+		// Keep the rich /context view on the same canonical source as the
+		// status bar and Desktop: latest provider snapshot plus only the local
+		// messages appended after that snapshot. This must never fall back to
+		// session-cumulative spend, which grows across calls and caused >100%.
+		used = m.loop.EstimateContextTokens()
 	}
 
 	// Per-category estimates (chars/4 ≈ tokens, the same heuristic
@@ -770,6 +771,9 @@ func renderContext(m *Model) string {
 	pct := 0
 	if cap > 0 {
 		pct = used * 100 / cap
+		if pct > 100 {
+			pct = 100
+		}
 	}
 	annotations[2] = fmt.Sprintf("%s/%s tokens (%d%%)", fmtThousands(used), fmtThousands(cap), pct)
 

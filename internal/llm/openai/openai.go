@@ -614,6 +614,28 @@ func cacheReadTokens(u oaiUsage) int {
 	return 0
 }
 
+// normalizeInputUsage converts an OpenAI-family total-input count into the
+// provider-neutral disjoint usage buckets. OpenAI Chat Completions and
+// Responses both include cached prefix tokens in prompt_tokens/input_tokens;
+// exposing that total as InputTokens while also exposing cacheRead would count
+// the cached prefix twice. Malformed upstream usage where cached exceeds total
+// is clamped at zero uncached input rather than producing a negative bucket.
+func normalizeInputUsage(total, cacheRead int) (inputTokens, cacheReadInputTokens int) {
+	if total < 0 {
+		total = 0
+	}
+	if cacheRead < 0 {
+		cacheRead = 0
+	}
+	// The wire contract says cached input is a subset of total input. Keep a
+	// malformed compatibility gateway from manufacturing prompt occupancy by
+	// reporting a cached count larger than its own total.
+	if cacheRead > total {
+		cacheRead = total
+	}
+	return max(total-cacheRead, 0), cacheRead
+}
+
 type oaiResp struct {
 	Choices []oaiChoice `json:"choices"`
 	Usage   oaiUsage    `json:"usage"`
@@ -850,11 +872,15 @@ func marshalToolArguments(input map[string]any) string {
 }
 
 func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
+	inputTokens, cacheReadInputTokens := normalizeInputUsage(
+		usage.PromptTokens,
+		cacheReadTokens(usage),
+	)
 	out := &Response{
 		StopReason:           mapOAIStop(c.FinishReason),
-		InputTokens:          usage.PromptTokens,
+		InputTokens:          inputTokens,
 		OutputTokens:         usage.CompletionTokens,
-		CacheReadInputTokens: cacheReadTokens(usage),
+		CacheReadInputTokens: cacheReadInputTokens,
 	}
 	// Reasoning is emitted before visible text/tool calls. Preserving that
 	// chronology lets the shared stream consumer persist [thinking, text, tool]
@@ -1424,25 +1450,35 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 				s.flushToolStops()
 				ev := StreamEvent{Type: "message_delta", StopReason: mapOAIStop(ch.FinishReason)}
 				if env.Usage != nil {
-					ev.InputTokens = env.Usage.PromptTokens
+					ev.InputTokens, ev.CacheReadInputTokens = normalizeInputUsage(
+						env.Usage.PromptTokens,
+						cacheReadTokens(*env.Usage),
+					)
 					ev.OutputTokens = env.Usage.CompletionTokens
-					ev.CacheReadInputTokens = cacheReadTokens(*env.Usage)
 				}
 				s.pending = append(s.pending, ev)
 			} else if env.Usage != nil {
+				inputTokens, cacheReadInputTokens := normalizeInputUsage(
+					env.Usage.PromptTokens,
+					cacheReadTokens(*env.Usage),
+				)
 				s.pending = append(s.pending, StreamEvent{
 					Type:                 "message_delta",
-					InputTokens:          env.Usage.PromptTokens,
+					InputTokens:          inputTokens,
 					OutputTokens:         env.Usage.CompletionTokens,
-					CacheReadInputTokens: cacheReadTokens(*env.Usage),
+					CacheReadInputTokens: cacheReadInputTokens,
 				})
 			}
 		} else if env.Usage != nil {
+			inputTokens, cacheReadInputTokens := normalizeInputUsage(
+				env.Usage.PromptTokens,
+				cacheReadTokens(*env.Usage),
+			)
 			s.pending = append(s.pending, StreamEvent{
 				Type:                 "message_delta",
-				InputTokens:          env.Usage.PromptTokens,
+				InputTokens:          inputTokens,
 				OutputTokens:         env.Usage.CompletionTokens,
-				CacheReadInputTokens: cacheReadTokens(*env.Usage),
+				CacheReadInputTokens: cacheReadInputTokens,
 			})
 		}
 

@@ -135,13 +135,12 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 	}
 	for {
 		ev, err := s.Recv()
-		if errors.Is(err, io.EOF) {
-			flushThinking()
-			flushText()
-			flushTools()
-			return blocks, stopReas, &usage, nil
-		}
-		if err != nil {
+		eof := errors.Is(err, io.EOF)
+		// StreamReader follows the same contract as other Go iterators: a
+		// provider may return its final value together with io.EOF. Process that
+		// value before honoring EOF so a terminal message_stop does not lose its
+		// stop reason or provider-authoritative usage.
+		if err != nil && !eof {
 			return nil, "", nil, err
 		}
 		switch ev.Type {
@@ -280,12 +279,38 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 				usage.cacheRead = ev.CacheReadInputTokens
 			}
 		case "message_stop":
+			// Bedrock's synthetic stream and some Anthropic-compatible readers put
+			// all final metadata on message_stop rather than message_start /
+			// message_delta. Treat non-zero terminal counters as authoritative,
+			// while preserving earlier counters when a provider emits a metadata-
+			// free message_stop.
+			if ev.StopReason != "" {
+				stopReas = ev.StopReason
+			}
+			if ev.InputTokens > 0 {
+				usage.in = ev.InputTokens
+			}
+			if ev.OutputTokens > 0 {
+				usage.out = ev.OutputTokens
+			}
+			if ev.CacheCreationInputTokens > 0 {
+				usage.cacheCreate = ev.CacheCreationInputTokens
+			}
+			if ev.CacheReadInputTokens > 0 {
+				usage.cacheRead = ev.CacheReadInputTokens
+			}
 			flushThinking()
 			flushText()
 			flushTools()
 			return blocks, stopReas, &usage, nil
 		case "error":
 			return nil, "", nil, ev.Err
+		}
+		if eof {
+			flushThinking()
+			flushText()
+			flushTools()
+			return blocks, stopReas, &usage, nil
 		}
 	}
 }

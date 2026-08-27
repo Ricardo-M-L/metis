@@ -47,13 +47,31 @@ func isAnthropicOrigin(baseURL string) bool {
 // often need both the provider client AND the chosen model, so we return
 // them together rather than letting setupRuntime re-derive the model.
 type ProviderBuild struct {
-	Provider llm.Provider
-	Model    string
+	Provider        llm.Provider
+	Model           string
+	MaxOutputTokens int
 }
 
-// visionOverrideProvider preserves the complete Provider contract while
-// replacing only the optional vision capability decision. Custom gateways
-// frequently use private model ids that a public catalog cannot identify.
+func finalizeProviderBuild(provider llm.Provider, model string, maxOutputTokens int) (*ProviderBuild, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("provider %q: constructor returned nil", model)
+	}
+	if maxOutputTokens <= 0 {
+		maxOutputTokens = transport.DefaultMaxOutputTokens
+	}
+	if window := provider.MaxContextTokens(); window > 0 && maxOutputTokens >= window {
+		return nil, fmt.Errorf("provider %q: max_tokens (%d) must be smaller than context_window (%d)",
+			model, maxOutputTokens, window)
+	}
+	return &ProviderBuild{Provider: provider, Model: model, MaxOutputTokens: maxOutputTokens}, nil
+}
+
+// visionOverrideProvider preserves the core Provider contract while replacing
+// only the optional vision capability decision. Keep optional interfaces off
+// this base wrapper: claiming a capability that the wrapped provider does not
+// implement changes agent behavior (for example, active-context accounting).
+// Custom gateways frequently use private model ids that a public catalog
+// cannot identify.
 type visionOverrideProvider struct {
 	llm.Provider
 	supportsVision bool
@@ -65,6 +83,29 @@ func (p visionOverrideProvider) VisionCapability() llm.VisionCapability {
 		return llm.VisionSupported
 	}
 	return llm.VisionUnsupported
+}
+
+// visionOverrideHistoryProvider is selected only when the wrapped provider
+// really implements ContextHistoryPolicy. This preserves that optional
+// capability without making every vision override appear policy-aware.
+type visionOverrideHistoryProvider struct {
+	visionOverrideProvider
+	historyPolicy llm.ContextHistoryPolicy
+}
+
+func (p visionOverrideHistoryProvider) ContextIncludesAssistantBlock(block llm.ContentBlock) bool {
+	return p.historyPolicy.ContextIncludesAssistantBlock(block)
+}
+
+func withVisionOverride(provider llm.Provider, supportsVision bool) llm.Provider {
+	base := visionOverrideProvider{Provider: provider, supportsVision: supportsVision}
+	if policy, ok := provider.(llm.ContextHistoryPolicy); ok {
+		return visionOverrideHistoryProvider{
+			visionOverrideProvider: base,
+			historyPolicy:          policy,
+		}
+	}
+	return base
 }
 
 // ProviderHasCredentials reports whether a configured provider has the
@@ -197,7 +238,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		// "instant first reply" instead of "spinner sits there before
 		// the first token arrives".
 		Preconnect(cfg.Provider.Anthropic.BaseURL)
-		return &ProviderBuild{Provider: prov, Model: model}, nil
+		return finalizeProviderBuild(prov, model, cfg.Provider.Anthropic.MaxTokens)
 	case "openai":
 		key, err := cfg.ResolveAPIKey("openai")
 		if err != nil {
@@ -218,7 +259,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			)
 			prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
 			Preconnect(cfg.Provider.OpenAI.BaseURL)
-			return &ProviderBuild{Provider: prov, Model: model}, nil
+			return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
 		}
 		prov := openai.New(
 			key,
@@ -230,7 +271,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		)
 		prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
 		Preconnect(cfg.Provider.OpenAI.BaseURL)
-		return &ProviderBuild{Provider: prov, Model: model}, nil
+		return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
 	case "gemini", "google":
 		// Accept "google" as an alias since users sometimes type the
 		// brand instead of the model family. Same provider either way.
@@ -252,7 +293,7 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		)
 		prov.ContextWindow = cfg.Provider.Gemini.ContextWindow
 		Preconnect(cfg.Provider.Gemini.BaseURL)
-		return &ProviderBuild{Provider: prov, Model: model}, nil
+		return finalizeProviderBuild(prov, model, cfg.Provider.Gemini.MaxTokens)
 	}
 	// Custom provider profiles. Users define unlimited entries under
 	// [provider.custom.<id>] in config.toml, picking a transport
@@ -328,8 +369,8 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		if *raw.SupportsVision && (transportName == "gemini_native" || transportName == "gemini") {
 			return nil, fmt.Errorf("provider %q: supports_vision=true is not available for transport %q", id, transportName)
 		}
-		provider = visionOverrideProvider{Provider: provider, supportsVision: *raw.SupportsVision}
+		provider = withVisionOverride(provider, *raw.SupportsVision)
 	}
 	Preconnect(raw.BaseURL)
-	return &ProviderBuild{Provider: provider, Model: res.Model}, nil
+	return finalizeProviderBuild(provider, res.Model, res.MaxOutputTokens)
 }
