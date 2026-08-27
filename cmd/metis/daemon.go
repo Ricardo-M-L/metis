@@ -63,7 +63,11 @@ func cmdDaemon(ctx context.Context, args []string) error {
 		var sb strings.Builder
 		eventCh := make(chan agent.Event, 64)
 		errCh := make(chan error, 1)
-		go func() { errCh <- rt.loop.Run(ctx, eventCh) }()
+		go func() {
+			errCh <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
+				return rt.loop.Run(turnCtx, eventCh)
+			})
+		}()
 		for ev := range eventCh {
 			switch ev.Kind {
 			case agent.EventTextDelta:
@@ -85,7 +89,11 @@ func cmdDaemon(ctx context.Context, args []string) error {
 		rt.loop.AppendUser("Please summarize the most recent task results into a few key durable facts and update memory accordingly. Reply with 'done' when finished.")
 		eventCh := make(chan agent.Event, 64)
 		errCh := make(chan error, 1)
-		go func() { errCh <- rt.loop.Run(ctx, eventCh) }()
+		go func() {
+			errCh <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
+				return rt.loop.Run(turnCtx, eventCh)
+			})
+		}()
 		for ev := range eventCh {
 			if ev.Kind == agent.EventLoopDone || ev.Kind == agent.EventError {
 				return <-errCh

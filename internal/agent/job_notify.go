@@ -30,7 +30,7 @@ import (
 // No-op when JobNotify is nil (sub-agents, headless tests) or when
 // the channel is empty (the common case — most iterations don't
 // have any finished jobs to report).
-func (l *Loop) injectJobNotifications(out chan<- Event) {
+func (l *Loop) injectJobNotifications(ctx context.Context, out chan<- Event) {
 	if l.JobNotify == nil {
 		return
 	}
@@ -42,7 +42,7 @@ func (l *Loop) injectJobNotifications(out chan<- Event) {
 	// Surface to the TUI too so the user sees the same notification
 	// banner the model is reacting to (helps explain why the model
 	// suddenly says "I see job bg_xxx finished, ...").
-	emit(context.Background(), out, Event{
+	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[job pool] %d notification(s) injected", len(notifs)),
 	})

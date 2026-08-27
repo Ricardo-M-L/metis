@@ -792,7 +792,9 @@ func (r *REPL) runTurn(ctx context.Context) error {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- r.Loop.Run(ctx, events)
+		done <- runtime.RunWithTraceTurn(ctx, r.SessionID, func(turnCtx context.Context) error {
+			return r.Loop.Run(turnCtx, events)
+		})
 		close(events)
 	}()
 

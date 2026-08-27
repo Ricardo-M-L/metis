@@ -280,11 +280,10 @@ owns one live Loop and serializes turns because the transcript is not safe for
 simultaneous conversations.
 
 Stable tag releases publish checksummed Wails Desktop archives alongside the
-CLI assets: a universal macOS DMG installer plus the ZIP retained for atomic
-in-app updates, one Linux amd64 binary and one
-Windows amd64 executable. The native launcher and updater resolve those exact
-release artifacts; they are application archives rather than OS-native package
-manager formats.
+CLI assets: a universal macOS ZIP used for both installation and atomic
+in-app updates, one Linux amd64 binary archive and one Windows amd64 executable
+archive. The native launcher and updater resolve those exact release artifacts;
+they are application archives rather than OS-native package manager formats.
 
 ### Chat channels
 

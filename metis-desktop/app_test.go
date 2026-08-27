@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -59,7 +60,29 @@ func runWebUIStartHelper(args []string) int {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
-	if err := http.ListenAndServe("127.0.0.1:"+port, mux); err != nil {
+	server := &http.Server{Addr: "127.0.0.1:" + port, Handler: mux}
+	shutdown := make(chan struct{}, 1)
+	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.Header.Get("X-Metis-Desktop-Token") != os.Getenv("METIS_DESKTOP_FRAME_TOKEN") {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if marker := os.Getenv("METIS_WEBUI_HELPER_STOPPED"); marker != "" {
+			if err := os.WriteFile(marker, []byte("stopped"), 0o600); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+		shutdown <- struct{}{}
+	})
+	go func() {
+		<-shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, "simulated webui listen failure:", err)
 		return 23
 	}
@@ -149,6 +172,61 @@ func TestShutdownStopsWebUIChild(t *testing.T) {
 	}
 	if app.webuiCmd != nil || app.webuiDone != nil || app.webuiPort != 0 {
 		t.Fatalf("web UI state not cleared: cmd=%v done=%v port=%d", app.webuiCmd, app.webuiDone, app.webuiPort)
+	}
+}
+
+func TestStopWebUIAllowsBackendGracefulCleanup(t *testing.T) {
+	dir := t.TempDir()
+	stopped := filepath.Join(dir, "stopped")
+	port, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "test-native-shutdown-token"
+	cmd := exec.Command(os.Args[0], "desktop", "--web", "--port", strconv.Itoa(port))
+	cmd.Env = append(os.Environ(),
+		"GO_WANT_METIS_WEBUI_START_HELPER=1",
+		"METIS_DESKTOP_FRAME_TOKEN="+token,
+		"METIS_WEBUI_HELPER_STOPPED="+stopped,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+		close(done)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		response, probeErr := http.Get("http://127.0.0.1:" + strconv.Itoa(port) + "/api/health")
+		if probeErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if time.Now().After(deadline) {
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatal("graceful child did not become ready")
+	}
+
+	// The native control channel must remain local even when the user's shell
+	// exports a proxy that would reject the request.
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+	t.Setenv("NO_PROXY", "")
+	app := &App{webuiCmd: cmd, webuiDone: done, webuiPort: port, webuiToken: token}
+	app.stopWebUI()
+
+	if _, err := os.Stat(stopped); err != nil {
+		t.Fatalf("backend cleanup marker missing; desktop likely killed it before Cleanup: %v", err)
+	}
+	if cmd.ProcessState == nil || !cmd.ProcessState.Success() {
+		t.Fatalf("backend was not reaped after graceful exit: state=%v", cmd.ProcessState)
 	}
 }
 

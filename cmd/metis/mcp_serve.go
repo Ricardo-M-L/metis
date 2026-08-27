@@ -19,8 +19,9 @@ package main
 //     (METIS_RUN_MAX_SECONDS env override).
 //  3. Heartbeat goroutine — setupRuntime receives the per-call context so
 //     the heartbeat is reaped when the call finishes, not at process exit.
-//  4. Process-wide singletons — side-effect of fix 3; per-call context
-//     ensures singleton writes are isolated to the sequential call window.
+//  4. Process-wide singletons — run_task owns one process-wide runtime
+//     window at a time, preventing concurrent setup/Cleanup from replacing
+//     another call's trace hook, adapter, or tool trace store.
 //  5. notifications/cancelled — scanner runs in a goroutine; per-call
 //     cancel map lets incoming cancellations reach in-flight loop.Run.
 //  6. req.ID null check — mcpIDPresent handles json.RawMessage("null").
@@ -45,10 +46,47 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
 const mcpProtoVersion = "2024-11-05"
+
+// mcpRuntimeRunGate serializes the part of run_task that owns process-wide
+// runtime wiring. setupRuntime installs global trace hooks/adapters and
+// Cleanup flushes through those same globals, so overlapping runtimes would
+// replace or flush one another's trace. The stdio scanner and all non-run MCP
+// methods remain concurrent; only setupRuntime -> loop.Run -> Cleanup is gated.
+//
+// A channel is used instead of sync.Mutex so notifications/cancelled can stop
+// a call while it is queued behind another long-running task.
+type mcpRuntimeRunGate struct {
+	token chan struct{}
+}
+
+func newMCPRuntimeRunGate() *mcpRuntimeRunGate {
+	return &mcpRuntimeRunGate{token: make(chan struct{}, 1)}
+}
+
+func (g *mcpRuntimeRunGate) run(ctx context.Context, fn func() (string, error)) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	select {
+	case g.token <- struct{}{}:
+		defer func() { <-g.token }()
+		// Cancellation and gate release can become ready together. Recheck so a
+		// cancelled queued request never boots a runtime after winning the select.
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return fn()
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+var mcpRuntimeRuns = newMCPRuntimeRunGate()
 
 // mcpMsg is a single JSON-RPC 2.0 envelope used for both inbound requests
 // and outbound responses. Fields not relevant to the direction are zero-valued
@@ -291,6 +329,14 @@ func mcpRunTaskSchema() map[string]any {
 // TODO: replace per-call setupRuntime with a single init + loop.Reset()
 // between calls to avoid the full cold-boot cost on every invocation.
 func mcpDoRunTask(callCtx context.Context, flags *cliFlags, prompt string) (string, error) {
+	return mcpRuntimeRuns.run(callCtx, func() (string, error) {
+		return mcpDoRunTaskExclusive(callCtx, flags, prompt)
+	})
+}
+
+// mcpDoRunTaskExclusive owns the process-wide runtime wiring for the duration
+// of one MCP call. Call only through mcpRuntimeRuns.
+func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt string) (string, error) {
 	// setupRuntime receives callCtx so the heartbeat goroutine it spawns
 	// is reaped when callCtx is cancelled (at call end), not at process exit.
 	rt, err := setupRuntime(callCtx, flags)
@@ -308,7 +354,9 @@ func mcpDoRunTask(callCtx context.Context, flags *cliFlags, prompt string) (stri
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
-		done <- rt.loop.Run(callCtx, events)
+		done <- rtpkg.RunWithTraceTurn(callCtx, rt.sessionID, func(turnCtx context.Context) error {
+			return rt.loop.Run(turnCtx, events)
+		})
 		close(events)
 	}()
 

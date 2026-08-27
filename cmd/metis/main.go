@@ -485,6 +485,11 @@ func (r *runtime) releaseSessionWork() {
 // Cleanup closes any subprocesses or connections owned by the runtime.
 // Safe to call multiple times.
 func (r *runtime) Cleanup() {
+	// Persist the last buffered trajectory before waiting on any dependency.
+	// Desktop shutdown is bounded, so a slow MCP/plugin close must never make
+	// the final assistant/tool events disappear from the resumed session.
+	rtpkg.FlushTrace()
+
 	// Stop session-owned work before closing the provider/MCP dependencies it
 	// may still be using. This is idempotent, so it is safe after an in-process
 	// session boundary already released the prior session's workers.
@@ -518,7 +523,8 @@ func (r *runtime) Cleanup() {
 		_ = r.plugins.Close()
 		r.plugins = nil
 	}
-	// Flush buffered trace events to disk so the final trajectory is not lost.
+	// Session workers may emit terminal events while being stopped above. The
+	// trace flush is idempotent, so capture that tail as well.
 	rtpkg.FlushTrace()
 	if r.sandbox != nil {
 		_ = r.sandbox.Close()
@@ -1526,6 +1532,11 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// internal/tasks package (not runtime) to break an otherwise
 	// circular import (tools/builtin → runtime → tools/builtin).
 	taskstore.SetCurrentTaskStore(rt.sessionID)
+	// InstallTrace runs before the initial session is resolved. Bind the
+	// adapter now just like an in-process /new, /resume or /branch does;
+	// otherwise every event from the first session is silently discarded
+	// because TraceAdapter has no active session ID yet.
+	rtpkg.RebindTrace(rt.sessionID)
 	// Crash-recovery pointer (#27 / claude-code-sourcemap bridgePointer):
 	// write a per-cwd pointer file ~/.metis/session-pointers/<sha8(cwd)>.json
 	// so a future startup can detect "you had a session live N minutes ago,
@@ -1869,7 +1880,12 @@ func cmdRun(ctx context.Context, args []string) error {
 
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
-	go func() { done <- rt.loop.Run(ctx, events); close(events) }()
+	go func() {
+		done <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
+			return rt.loop.Run(turnCtx, events)
+		})
+		close(events)
+	}()
 
 	// Streamlined output mode (Task #86, CC parity mechanism 4).
 	// Activated via [ui] streamlined_output toml OR --streamlined CLI flag.
@@ -2206,7 +2222,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		for attempt := 1; verr != nil && attempt <= rtpkg.MaxSchemaRetries; attempt++ {
 			fmt.Fprintf(os.Stderr, "[schema] output invalid (%v) — correction %d/%d\n", verr, attempt, rtpkg.MaxSchemaRetries)
 			rt.loop.AppendUser(schemaEnforcer.RetryMessage(verr))
-			finalText, err = rtpkg.RunLoopCollectText(ctx, rt.loop)
+			finalText, err = rtpkg.RunLoopCollectText(ctx, rt.loop, rt.sessionID)
 			if err != nil {
 				return err
 			}
@@ -2304,13 +2320,13 @@ func (p *acpAuthRequiredProvider) Stream(context.Context, llm.Request) (llm.Stre
 func (p *acpAuthRequiredProvider) MaxContextTokens() int { return 200_000 }
 func (p *acpAuthRequiredProvider) ModelID() string       { return p.model }
 
-func prepareACPLoop(ctx context.Context, flags *cliFlags) (*agent.Loop, func(), error) {
+func prepareACPLoop(ctx context.Context, flags *cliFlags) (*agent.Loop, string, func(), error) {
 	rt, err := setupRuntime(ctx, flags)
 	if err == nil {
-		return rt.loop, rt.Cleanup, nil
+		return rt.loop, rt.sessionID, rt.Cleanup, nil
 	}
 	if !errors.Is(err, config.ErrMissingAPIKey) {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 	providerName := flags.provider
 	if providerName == "" {
@@ -2319,7 +2335,7 @@ func prepareACPLoop(ctx context.Context, flags *cliFlags) (*agent.Loop, func(), 
 	provider := &acpAuthRequiredProvider{name: providerName, model: flags.model, err: err}
 	gate := permission.New(permission.ModeDontAsk)
 	loop := agent.NewLoop(provider, tools.NewRegistry(), gate, nil, "", 1)
-	return loop, func() {}, nil
+	return loop, "", func() {}, nil
 }
 
 func cmdACP(ctx context.Context, args []string) error {
@@ -2340,7 +2356,7 @@ func cmdACP(ctx context.Context, args []string) error {
 	// ACP is a protocol service, not an interactive auth surface. It must be
 	// ready to answer initialize even when the client has not configured a key.
 	flags.noAuthWizard = true
-	loop, cleanup, err := prepareACPLoop(ctx, flags)
+	loop, sessionID, cleanup, err := prepareACPLoop(ctx, flags)
 	if err != nil {
 		return err
 	}
@@ -2348,7 +2364,7 @@ func cmdACP(ctx context.Context, args []string) error {
 	// Tell the ACP layer what version to advertise in InitializeResult
 	// so clients see the same version as `metis --version`.
 	acp.SetServerVersion(version.Version)
-	srv := acp.NewServer(loop, addr)
+	srv := acp.NewServerForSession(loop, addr, sessionID)
 	if err := srv.Listen(); err != nil {
 		return err
 	}
@@ -2840,7 +2856,12 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
-	go func() { done <- rt.loop.Run(ctx, events); close(events) }()
+	go func() {
+		done <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
+			return rt.loop.Run(turnCtx, events)
+		})
+		close(events)
+	}()
 
 	// Counts tool calls this fire that were denied for lack of pre-
 	// authorization, so we can nudge the user once at the end ("N blocked,

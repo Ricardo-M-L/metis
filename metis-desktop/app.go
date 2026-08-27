@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -108,6 +109,8 @@ func (a *App) stopWebUI() {
 	a.webuiMu.Lock()
 	cmd := a.webuiCmd
 	done := a.webuiDone
+	port := a.webuiPort
+	token := a.webuiToken
 	a.webuiCmd = nil
 	a.webuiDone = nil
 	a.webuiPort = 0
@@ -117,12 +120,85 @@ func (a *App) stopWebUI() {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
+	stopWebUIProcess(cmd, done, port, token)
+}
+
+const (
+	desktopShutdownTokenHeader  = "X-Metis-Desktop-Token"
+	webUIShutdownRequestTimeout = time.Second
+	webUIShutdownGrace          = 5 * time.Second
+	webUISignalGrace            = 2 * time.Second
+	webUIKillWait               = 2 * time.Second
+)
+
+// stopWebUIProcess first uses the authenticated loopback control channel. It
+// works on Windows as well as Unix and lets cmdDesktop return normally through
+// runtime.Cleanup. Interrupt and hard kill remain bounded fallbacks for an
+// older or unresponsive child.
+func stopWebUIProcess(cmd *exec.Cmd, done <-chan error, port int, token string) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if waitForWebUIProcess(done, 0) {
+		return
+	}
+	if requestWebUIShutdown(port, token) && waitForWebUIProcess(done, webUIShutdownGrace) {
+		return
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err == nil {
+		if waitForWebUIProcess(done, webUISignalGrace) {
+			return
+		}
+	}
 	_ = cmd.Process.Kill()
-	if done != nil {
+	_ = waitForWebUIProcess(done, webUIKillWait)
+}
+
+func requestWebUIShutdown(port int, token string) bool {
+	if port < 1 || strings.TrimSpace(token) == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), webUIShutdownRequestTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(port)+"/api/shutdown", http.NoBody)
+	if err != nil {
+		return false
+	}
+	request.Header.Set(desktopShutdownTokenHeader, token)
+	// Never route the privileged loopback control request through an ambient
+	// HTTP(S)_PROXY. This client exists only for the child bound to 127.0.0.1.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	response, err := client.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	return response.StatusCode == http.StatusAccepted
+}
+
+func waitForWebUIProcess(done <-chan error, timeout time.Duration) bool {
+	if done == nil {
+		return false
+	}
+	if timeout <= 0 {
 		select {
 		case <-done:
-		case <-time.After(2 * time.Second):
+			return true
+		default:
+			return false
 		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -328,7 +404,7 @@ func freePort() (int, error) {
 }
 
 func (a *App) GetVersion() string {
-	return "0.4.33"
+	return "0.4.34"
 }
 
 // ChooseWorkspaceDirectory is the native half of the iframe bridge. The web

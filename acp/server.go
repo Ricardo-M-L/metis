@@ -14,13 +14,15 @@ import (
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
 // Server runs an ACP endpoint backed by a single agent.Loop.
 // Per-connection state (active prompts, pending permission asks) lives on session.
 type Server struct {
-	Loop *agent.Loop
-	Addr string
+	Loop      *agent.Loop
+	Addr      string
+	SessionID string
 
 	ln    net.Listener
 	wg    sync.WaitGroup
@@ -30,7 +32,14 @@ type Server struct {
 }
 
 func NewServer(loop *agent.Loop, addr string) *Server {
-	return &Server{Loop: loop, Addr: addr, conns: make(map[net.Conn]struct{})}
+	return NewServerForSession(loop, addr, "")
+}
+
+// NewServerForSession binds every prompt run to the runtime session that owns
+// this ACP server. Keeping the session explicit avoids attributing concurrent
+// or late trace events through ambient process-global selection state.
+func NewServerForSession(loop *agent.Loop, addr, sessionID string) *Server {
+	return &Server{Loop: loop, Addr: addr, SessionID: sessionID, conns: make(map[net.Conn]struct{})}
 }
 
 // Listen starts serving. Stdio mode runs in a goroutine and Listen returns
@@ -352,7 +361,9 @@ func (sn *session) handlePrompt(ctx context.Context, id any, p PromptParams) {
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
-		done <- sn.server.Loop.Run(pctx, events)
+		done <- rtpkg.RunWithTraceTurn(pctx, sn.server.SessionID, func(turnCtx context.Context) error {
+			return sn.server.Loop.Run(turnCtx, events)
+		})
 		close(events)
 	}()
 

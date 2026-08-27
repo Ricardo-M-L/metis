@@ -21,7 +21,7 @@ import (
 // Multiple matches collapse into one message — same rationale as
 // formatJobNotifications: the model gets one prompt addition per
 // turn boundary, not one per match.
-func (l *Loop) injectMonitorEvents(out chan<- Event) {
+func (l *Loop) injectMonitorEvents(ctx context.Context, out chan<- Event) {
 	if l.Monitors == nil {
 		return
 	}
@@ -30,7 +30,7 @@ func (l *Loop) injectMonitorEvents(out chan<- Event) {
 		return
 	}
 	l.appendInjectedMessage(formatMonitorEvents(events))
-	emit(context.Background(), out, Event{
+	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[monitor] %d match(es) injected", len(events)),
 	})

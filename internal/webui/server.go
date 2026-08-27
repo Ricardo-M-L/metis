@@ -3,6 +3,7 @@ package webui
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -104,6 +105,11 @@ type Server struct {
 	plugins         *rtpkg.PluginRegistry
 	pluginMarket    *pluginmarket.Manager
 	artifactStore   *artifact.Store
+	traceAdapter    *rtpkg.TraceAdapter
+	traceStore      *session.TraceStore
+	shutdownToken   string
+	shutdown        func()
+	shutdownOnce    sync.Once
 }
 
 // eventHub fans agent events out to zero or more SSE subscribers. The agent
@@ -242,7 +248,17 @@ type RuntimeBindings struct {
 	OpenWorkspace func(path string) error
 	// OpenPath reveals a local directory in the platform file manager.
 	OpenPath func(path string) error
-	Plugins  *rtpkg.PluginRegistry
+	// ShutdownToken and Shutdown are set only by the native Desktop shell.
+	// Browser mode intentionally leaves them empty so a normal WebUI process
+	// cannot be terminated through HTTP.
+	ShutdownToken string
+	Shutdown      func()
+	Plugins       *rtpkg.PluginRegistry
+	// TraceAdapter/TraceStore are passed explicitly by runtime assembly so the
+	// Desktop installs exactly one resolved-event observer without discovering
+	// or replacing unrelated process-global test/embedded trace state.
+	TraceAdapter *rtpkg.TraceAdapter
+	TraceStore   *session.TraceStore
 	// Roster exposes the live sub-agent registry so the status bar can
 	// show "N sub-agents ~ M background tasks" like the harness GUI.
 	Roster *agent.Roster
@@ -274,9 +290,13 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		sessionSwitch:       binding.SessionSwitch,
 		openWorkspace:       binding.OpenWorkspace,
 		openPath:            binding.OpenPath,
+		shutdownToken:       binding.ShutdownToken,
+		shutdown:            binding.Shutdown,
 		clipboardFiles:      desktop.ClipboardFiles,
 		plugins:             binding.Plugins,
 		pluginMarket:        pluginmarket.NewManager(),
+		traceAdapter:        binding.TraceAdapter,
+		traceStore:          binding.TraceStore,
 	}
 	if loop != nil {
 		server.activeModel = loop.Model
@@ -304,7 +324,58 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		server.activePreset = "standard"
 		server.freshPreset = "standard"
 	}
+	server.reconcilePersistedTraceUsage(binding.InitialSessionID)
+	if server.traceAdapter != nil {
+		server.traceAdapter.SetResolvedEventObserver(server.observeResolvedTraceEvent)
+	}
 	return server
+}
+
+func (s *Server) observeResolvedTraceEvent(resolved rtpkg.ResolvedTraceEvent) {
+	if s == nil || s.store == nil || resolved.Event.Kind != agent.EventTokens ||
+		!validSessionID(resolved.SessionID) || resolved.Turn <= 0 {
+		return
+	}
+	usage := resolved.CumulativeUsage
+	_, err := s.store.ReconcileMessageMetric(resolved.SessionID, session.MessageMetric{
+		Turn:              resolved.Turn,
+		InputTokens:       int64(usage.InputTokens),
+		OutputTokens:      int64(usage.OutputTokens),
+		CacheCreateTokens: int64(usage.CacheCreateTokens),
+		CacheReadTokens:   int64(usage.CacheReadTokens),
+	})
+	if err != nil {
+		log.Printf("persist resolved trace usage for %s turn %d: %v", resolved.SessionID, resolved.Turn, err)
+	}
+}
+
+// reconcilePersistedTraceUsage lazily repairs one opened session after a
+// restart. It deliberately does not scan every trace at boot. Absolute sums
+// feed the same idempotent Store ledger as live resolved events, so repeated
+// activation is free of double-counting and can repair a missing metric row.
+func (s *Server) reconcilePersistedTraceUsage(sessionID string) {
+	if s == nil || s.store == nil || s.traceStore == nil || !validSessionID(sessionID) {
+		return
+	}
+	byTurn := make(map[int]session.CostSnapshot)
+	for _, ev := range s.traceStore.Events(sessionID) {
+		if ev.Turn <= 0 || ev.Kind != "tokens" {
+			continue
+		}
+		var in, out, cacheWrite, cacheRead int
+		if _, err := fmt.Sscanf(ev.Text, "input=%d output=%d cache_write=%d cache_read=%d", &in, &out, &cacheWrite, &cacheRead); err != nil {
+			continue
+		}
+		usage := byTurn[ev.Turn]
+		usage.InputTokens += in
+		usage.OutputTokens += out
+		usage.CacheCreateTokens += cacheWrite
+		usage.CacheReadTokens += cacheRead
+		byTurn[ev.Turn] = usage
+	}
+	if err := s.store.ReconcileTraceUsageSnapshot(sessionID, byTurn); err != nil {
+		log.Printf("repair persisted trace usage for %s: %v", sessionID, err)
+	}
 }
 
 func (s *Server) handler() http.Handler {
@@ -369,12 +440,63 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/config/file", s.handleConfigFile)
 	mux.HandleFunc("/api/clipboard/files", s.handleClipboardFiles)
 	mux.HandleFunc("/api/health", s.handleHealth)
+	if s.shutdownToken != "" && s.shutdown != nil {
+		mux.HandleFunc("/api/shutdown", s.handleDesktopShutdown)
+	}
 	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/api/steer", s.handleSteer)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/models", s.handleModels)
 	mux.HandleFunc("/api/events", s.handleEvents)
 	return s.securityHeaders(s.sameOriginOnly(mux))
+}
+
+const desktopShutdownTokenHeader = "X-Metis-Desktop-Token"
+
+const desktopTurnShutdownGrace = 3 * time.Second
+
+// handleDesktopShutdown is a private control channel from the native Wails
+// shell to its loopback WebUI child. The route is registered only when the
+// shell supplied both a fresh launch token and a cancellation callback.
+func (s *Server) handleDesktopShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !isLoopbackHost(r.Host) {
+		writeError(w, http.StatusForbidden, "non-local request denied")
+		return
+	}
+	provided := r.Header.Get(desktopShutdownTokenHeader)
+	if len(provided) != len(s.shutdownToken) || subtle.ConstantTimeCompare([]byte(provided), []byte(s.shutdownToken)) != 1 {
+		writeError(w, http.StatusForbidden, "invalid desktop shutdown token")
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	// Commit the response before cancellation starts draining the server. Stop
+	// the active turn first so its handler can persist partial history, status,
+	// cost and timing instead of being abandoned when ListenAndServe returns.
+	go s.shutdownOnce.Do(func() {
+		s.cancelMu.Lock()
+		cancelTurn := s.cancelTurn
+		turnDone := s.turnDone
+		s.cancelMu.Unlock()
+		if cancelTurn != nil {
+			cancelTurn()
+		}
+		s.cancelPendingInteractions()
+		if turnDone != nil {
+			select {
+			case <-turnDone:
+			case <-time.After(desktopTurnShutdownGrace):
+			}
+		}
+		s.shutdown()
+	})
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -1158,8 +1280,10 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		log.Printf("turn pre-request: history load=%dms activate=%dms (session %s, %d msgs)", loadMs, activateMs, body.SessionID, len(history))
 	}
 	input := strings.TrimSpace(body.Input)
+	nextMetricTurn := s.nextMessageMetricTurn(body.SessionID, history)
+	alignTraceTurnFloor(body.SessionID, nextMetricTurn)
 	messageMetric := session.MessageMetric{
-		Turn:      s.nextMessageMetricTurn(body.SessionID, history),
+		Turn:      nextMetricTurn,
 		StartedAt: time.Now(),
 	}
 	// Trajectory anchor: USER row + per-turn TTFT (first assistant text
@@ -1208,6 +1332,14 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	// Run under a cancellable context so the stop button can interrupt a
 	// long turn (the model may stream for minutes before first token).
 	turnCtx, cancel := context.WithCancel(r.Context())
+	turnCtx, traceOrigin := rtpkg.BindTraceTurn(turnCtx, body.SessionID)
+	if traceOrigin.Turn > 0 {
+		// RecordUserMessage opened this exact trace turn immediately above.
+		// Pinning the root loop context prevents a later session switch from
+		// reassigning terminal/background usage, and keeps the durable footer's
+		// turn key identical to the trace observer's immutable origin.
+		messageMetric.Turn = traceOrigin.Turn
+	}
 	turnDone := make(chan struct{})
 	s.cancelMu.Lock()
 	s.cancelTurn = cancel
@@ -1227,10 +1359,15 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}()
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
-	go func() { done <- s.loop.Run(turnCtx, events); close(events) }()
+	go func() {
+		err := s.loop.Run(turnCtx, events)
+		rtpkg.EndTraceTurn(turnCtx)
+		done <- err
+		close(events)
+	}()
 	var text strings.Builder
 	var firstTokenAt time.Time
-	var outputTokens int64
+	var turnCost session.CostSnapshot
 	for ev := range events {
 		// Permission requests are published by their case below (with the
 		// request id); everything else broadcasts here.
@@ -1248,7 +1385,14 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 				firstTokenAt = time.Now()
 			}
 		case agent.EventTokens:
-			outputTokens += int64(ev.OutputTokens)
+			// One user turn may contain multiple provider iterations (tool
+			// round-trips, retries, sub-plans). Persist their sum rather than
+			// only the final model response so Desktop's resumed stats match
+			// the CLI's cumulative accounting.
+			turnCost.InputTokens += ev.InputTokens
+			turnCost.OutputTokens += ev.OutputTokens
+			turnCost.CacheCreateTokens += ev.CacheCreationInputTokens
+			turnCost.CacheReadTokens += ev.CacheReadInputTokens
 		case agent.EventPermissionRequest:
 			if ev.PermissionReply != nil {
 				id := uuid.NewString()
@@ -1293,16 +1437,29 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	runErr := <-done
+	// agent.emit deliberately notifies the trace hook even when a cancelled
+	// context wins its channel-send select. Recover that provider-authoritative
+	// terminal usage here so clicking Stop at the exact end of a response cannot
+	// make Desktop lose cost data that the provider already delivered.
+	if traced, ok := traceTurnCost(body.SessionID, messageMetric.Turn); ok {
+		turnCost.InputTokens = max(turnCost.InputTokens, traced.InputTokens)
+		turnCost.OutputTokens = max(turnCost.OutputTokens, traced.OutputTokens)
+		turnCost.CacheCreateTokens = max(turnCost.CacheCreateTokens, traced.CacheCreateTokens)
+		turnCost.CacheReadTokens = max(turnCost.CacheReadTokens, traced.CacheReadTokens)
+	}
 	messageMetric.CompletedAt = time.Now()
 	messageMetric.DurationMS = messageMetric.CompletedAt.Sub(messageMetric.StartedAt).Milliseconds()
-	messageMetric.OutputTokens = outputTokens
+	messageMetric.InputTokens = int64(turnCost.InputTokens)
+	messageMetric.OutputTokens = int64(turnCost.OutputTokens)
+	messageMetric.CacheCreateTokens = int64(turnCost.CacheCreateTokens)
+	messageMetric.CacheReadTokens = int64(turnCost.CacheReadTokens)
 	if !firstTokenAt.IsZero() && firstTokenAt.After(messageMetric.StartedAt) {
 		messageMetric.TTFTMS = firstTokenAt.Sub(messageMetric.StartedAt).Milliseconds()
-		if outputTokens > 0 && messageMetric.CompletedAt.After(firstTokenAt) {
-			messageMetric.TokPerSec = float64(outputTokens) / messageMetric.CompletedAt.Sub(firstTokenAt).Seconds()
+		if turnCost.OutputTokens > 0 && messageMetric.CompletedAt.After(firstTokenAt) {
+			messageMetric.TokPerSec = float64(turnCost.OutputTokens) / messageMetric.CompletedAt.Sub(firstTokenAt).Seconds()
 		}
 	}
-	if err := s.store.AppendMessageMetric(body.SessionID, messageMetric); err != nil {
+	if _, err := s.store.ReconcileMessageMetric(body.SessionID, messageMetric); err != nil {
 		log.Printf("persist message metrics for %s turn %d: %v", body.SessionID, messageMetric.Turn, err)
 	}
 	if errors.Is(runErr, context.Canceled) {
@@ -1361,12 +1518,66 @@ func (s *Server) nextMessageMetricTurn(sessionID string, history []llm.Message) 
 			}
 		}
 	}
+	if ledgerTurn, err := s.store.MaxAccountedTurn(sessionID); err == nil && ledgerTurn > maxTurn {
+		maxTurn = ledgerTurn
+	}
 	if traceStore := rtpkg.CurrentTraceStore(); traceStore != nil {
 		if traceTurn := traceStore.CurrentTurn(sessionID); traceTurn > maxTurn {
 			maxTurn = traceTurn
 		}
 	}
 	return maxTurn + 1
+}
+
+// alignTraceTurnFloor keeps the trace allocator behind the same durable turn
+// floor selected for message metrics. Cost/message sidecars are fsynced before
+// the presentation row and can therefore survive a crash even when the trace
+// file is missing or empty. Without this alignment, RecordUserMessage would
+// reopen trace turn 1 and BindTraceTurn would overwrite nextMetricTurn with
+// that stale value, merging a new provider bill into an old ledger row.
+//
+// handleTurn holds runMu while this runs, so no other Desktop prompt can
+// advance the process-global trace store between CurrentTurn and NextTurn.
+func alignTraceTurnFloor(sessionID string, nextMetricTurn int) {
+	traceStore := rtpkg.CurrentTraceStore()
+	if traceStore == nil || sessionID == "" || nextMetricTurn <= 1 {
+		return
+	}
+	floor := nextMetricTurn - 1
+	for current := traceStore.CurrentTurn(sessionID); current < floor; current = traceStore.CurrentTurn(sessionID) {
+		if advanced := traceStore.NextTurn(sessionID); advanced <= current {
+			return
+		}
+	}
+}
+
+// traceTurnCost returns the actual provider usage recorded for one Desktop
+// turn. TraceAdapter runs synchronously from agent.emit after the event's
+// cancellation-aware channel send, so this is also the durable fallback for
+// a terminal EventTokens that the WebUI channel did not receive.
+func traceTurnCost(sessionID string, turn int) (session.CostSnapshot, bool) {
+	store := rtpkg.CurrentTraceStore()
+	if store == nil || sessionID == "" || turn <= 0 {
+		return session.CostSnapshot{}, false
+	}
+	var cost session.CostSnapshot
+	found := false
+	for _, node := range store.Trace(sessionID) {
+		ev := node.Event
+		if ev.Turn != turn || ev.Kind != "tokens" {
+			continue
+		}
+		var in, out, cacheWrite, cacheRead int
+		if _, err := fmt.Sscanf(ev.Text, "input=%d output=%d cache_write=%d cache_read=%d", &in, &out, &cacheWrite, &cacheRead); err != nil {
+			continue
+		}
+		cost.InputTokens += in
+		cost.OutputTokens += out
+		cost.CacheCreateTokens += cacheWrite
+		cost.CacheReadTokens += cacheRead
+		found = true
+	}
+	return cost, found
 }
 
 // activateSession moves the long-lived web runtime to id. A transcript-only
@@ -1402,6 +1613,7 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		s.stateMu.Unlock()
 		provider, _, _ := s.loop.ProviderModelSnapshot()
 		rtpkg.RebindLoopRuntime(s.loop, provider, activeModel, s.loop.System, id)
+		s.reconcilePersistedTraceUsage(id)
 		return nil
 	}
 
@@ -1511,6 +1723,7 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	if s.sessionSwitch != nil {
 		s.sessionSwitch(id)
 	}
+	s.reconcilePersistedTraceUsage(id)
 	return nil
 }
 
@@ -2290,6 +2503,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	runningSessionID := s.runningSession
 	turnRunning := s.turnDone != nil && runningSessionID != ""
 	s.cancelMu.Unlock()
+	s.stateMu.RLock()
+	activeSessionID := s.activeSessionID
+	s.stateMu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
 		"agents": agentDetails, "jobs": jobDetails,
@@ -2297,7 +2513,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"contextUsed": contextUsed, "contextWindow": contextWindow, "compactThreshold": compactThreshold,
 		"compactAtTokens": compactAtTokens,
 		"turnRunning":     turnRunning, "runningSessionId": runningSessionID,
-		"build": s.buildVersion,
+		"activeSessionId": activeSessionID,
+		"build":           s.buildVersion,
 	})
 }
 
@@ -2809,23 +3026,29 @@ type traceStats struct {
 // persisted trace summary lets a resumed Desktop session reconstruct the
 // footer instead of losing everything except a newly fabricated timestamp.
 type traceTurnMetricView struct {
-	Turn         int     `json:"turn"`
-	StartedAt    string  `json:"startedAt"`
-	CompletedAt  string  `json:"completedAt"`
-	DurationMs   int64   `json:"durationMs"`
-	TtftMs       int64   `json:"ttftMs,omitempty"`
-	OutputTokens int64   `json:"outputTokens,omitempty"`
-	TokPerSec    float64 `json:"tokPerSec,omitempty"`
+	Turn              int     `json:"turn"`
+	StartedAt         string  `json:"startedAt"`
+	CompletedAt       string  `json:"completedAt"`
+	DurationMs        int64   `json:"durationMs"`
+	TtftMs            int64   `json:"ttftMs,omitempty"`
+	InputTokens       int64   `json:"inputTokens,omitempty"`
+	OutputTokens      int64   `json:"outputTokens,omitempty"`
+	CacheCreateTokens int64   `json:"cacheCreateTokens,omitempty"`
+	CacheReadTokens   int64   `json:"cacheReadTokens,omitempty"`
+	TokPerSec         float64 `json:"tokPerSec,omitempty"`
 }
 
 func traceTurnMetrics(nodes []session.TracedNode) []traceTurnMetricView {
 	type turnMetric struct {
-		first        time.Time
-		last         time.Time
-		firstToken   time.Time
-		outputTokens int64
-		completed    bool
-		timingExact  bool
+		first             time.Time
+		last              time.Time
+		firstToken        time.Time
+		inputTokens       int64
+		outputTokens      int64
+		cacheCreateTokens int64
+		cacheReadTokens   int64
+		completed         bool
+		timingExact       bool
 	}
 	turns := make(map[int]*turnMetric)
 	for _, node := range nodes {
@@ -2853,9 +3076,16 @@ func traceTurnMetrics(nodes []session.TracedNode) []traceTurnMetricView {
 		if ev.Kind == "tokens" {
 			var in, out, cacheWrite, cacheRead int64
 			fmt.Sscanf(ev.Text, "input=%d output=%d cache_write=%d cache_read=%d", &in, &out, &cacheWrite, &cacheRead)
+			metric.inputTokens += in
 			metric.outputTokens += out
+			metric.cacheCreateTokens += cacheWrite
+			metric.cacheReadTokens += cacheRead
 		}
-		if ev.Kind == "loop_done" {
+		// A child loop has its own LoopDone/Error, but either is only a nested
+		// event in the parent user's turn. Only a root terminal may mark the
+		// Desktop turn complete. EventError is terminal too: Loop.Run returns
+		// immediately after emitting it and does not add a later LoopDone.
+		if (ev.Kind == "loop_done" || ev.Kind == "error") && node.Depth == 0 && ev.SubAgentOf == "" && ev.ParentID == "" {
 			metric.completed = true
 		}
 	}
@@ -2871,11 +3101,14 @@ func traceTurnMetrics(nodes []session.TracedNode) []traceTurnMetricView {
 	for _, turn := range turnNumbers {
 		metric := turns[turn]
 		view := traceTurnMetricView{
-			Turn:         turn,
-			StartedAt:    metric.first.Format(time.RFC3339),
-			CompletedAt:  metric.last.Format(time.RFC3339),
-			DurationMs:   metric.last.Sub(metric.first).Milliseconds(),
-			OutputTokens: metric.outputTokens,
+			Turn:              turn,
+			StartedAt:         metric.first.Format(time.RFC3339),
+			CompletedAt:       metric.last.Format(time.RFC3339),
+			DurationMs:        metric.last.Sub(metric.first).Milliseconds(),
+			InputTokens:       metric.inputTokens,
+			OutputTokens:      metric.outputTokens,
+			CacheCreateTokens: metric.cacheCreateTokens,
+			CacheReadTokens:   metric.cacheReadTokens,
 		}
 		if metric.timingExact && !metric.firstToken.IsZero() && metric.firstToken.After(metric.first) {
 			view.TtftMs = metric.firstToken.Sub(metric.first).Milliseconds()
@@ -3002,6 +3235,45 @@ func activeTraceToolDuration(nodes []session.TracedNode) int64 {
 	return total
 }
 
+// persistedTimingToolDuration reconstructs tool wall time from the durable
+// timing sidecar. Intervals are merged so parallel tool calls are not billed
+// twice, and Agent orchestration containers are excluded for the same reason
+// as activeTraceToolDuration.
+func persistedTimingToolDuration(steps []session.TimingStep) int64 {
+	type interval struct {
+		start time.Time
+		end   time.Time
+	}
+	intervals := make([]interval, 0, len(steps))
+	for _, step := range steps {
+		if step.TS.IsZero() || step.ElapsedMS <= 0 || strings.EqualFold(step.Tool, "Agent") {
+			continue
+		}
+		intervals = append(intervals, interval{
+			start: step.TS.Add(-time.Duration(step.ElapsedMS) * time.Millisecond),
+			end:   step.TS,
+		})
+	}
+	if len(intervals) == 0 {
+		return 0
+	}
+	sort.Slice(intervals, func(i, j int) bool { return intervals[i].start.Before(intervals[j].start) })
+	current := intervals[0]
+	var total int64
+	for _, next := range intervals[1:] {
+		if !next.start.After(current.end) {
+			if next.end.After(current.end) {
+				current.end = next.end
+			}
+			continue
+		}
+		total += current.end.Sub(current.start).Milliseconds()
+		current = next
+	}
+	total += current.end.Sub(current.start).Milliseconds()
+	return total
+}
+
 // handleTrace serves the recorded trajectory of a session as a nested
 // event tree plus aggregate stats (duration, turns, tool calls, token
 // totals). Mirrors the harness GUI's trajectory pane.
@@ -3071,15 +3343,44 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 			byTurn[metric.Turn] = metric
 		}
 		for _, metric := range persisted {
-			byTurn[metric.Turn] = traceTurnMetricView{
-				Turn:         metric.Turn,
-				StartedAt:    metric.StartedAt.Format(time.RFC3339),
-				CompletedAt:  metric.CompletedAt.Format(time.RFC3339),
-				DurationMs:   metric.DurationMS,
-				TtftMs:       metric.TTFTMS,
-				OutputTokens: metric.OutputTokens,
-				TokPerSec:    metric.TokPerSec,
+			// Token usage can be committed before the HTTP turn has finalized
+			// its wall-clock timestamps (for example a background child emits
+			// while the parent handler is still unwinding). Keep that partial row
+			// as a cost ledger, but never surface year-1 timestamps or a fake
+			// zero-duration footer. If live trace timing exists, merge only the
+			// monotonic usage buckets into it until finalization fills the row.
+			if metric.StartedAt.IsZero() || metric.CompletedAt.IsZero() || metric.CompletedAt.Before(metric.StartedAt) {
+				if existing, ok := byTurn[metric.Turn]; ok {
+					existing.InputTokens = max(existing.InputTokens, metric.InputTokens)
+					existing.OutputTokens = max(existing.OutputTokens, metric.OutputTokens)
+					existing.CacheCreateTokens = max(existing.CacheCreateTokens, metric.CacheCreateTokens)
+					existing.CacheReadTokens = max(existing.CacheReadTokens, metric.CacheReadTokens)
+					byTurn[metric.Turn] = existing
+				}
+				continue
 			}
+			view := traceTurnMetricView{
+				Turn:              metric.Turn,
+				StartedAt:         metric.StartedAt.Format(time.RFC3339),
+				CompletedAt:       metric.CompletedAt.Format(time.RFC3339),
+				DurationMs:        metric.DurationMS,
+				TtftMs:            metric.TTFTMS,
+				InputTokens:       metric.InputTokens,
+				OutputTokens:      metric.OutputTokens,
+				CacheCreateTokens: metric.CacheCreateTokens,
+				CacheReadTokens:   metric.CacheReadTokens,
+				TokPerSec:         metric.TokPerSec,
+			}
+			// v0.4.33 message metrics did not include input/cache fields.
+			// Preserve any live trace values for that turn instead of letting
+			// legacy zero values erase telemetry that is still available.
+			if existing, ok := byTurn[metric.Turn]; ok {
+				view.InputTokens = max(view.InputTokens, existing.InputTokens)
+				view.OutputTokens = max(view.OutputTokens, existing.OutputTokens)
+				view.CacheCreateTokens = max(view.CacheCreateTokens, existing.CacheCreateTokens)
+				view.CacheReadTokens = max(view.CacheReadTokens, existing.CacheReadTokens)
+			}
+			byTurn[metric.Turn] = view
 		}
 		turnNumbers := make([]int, 0, len(byTurn))
 		for turn := range byTurn {
@@ -3152,13 +3453,70 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	stats.ToolMs = activeTraceToolDuration(nodes)
+	// The final per-turn map already de-duplicates live and persisted
+	// message metrics by turn, so summing it cannot count the same provider
+	// call twice. The larger cumulative value wins when one source is only a
+	// partial trace (for example after a hard-killed older Desktop process).
+	var metricDuration, metricInput, metricOutput, metricCacheCreate, metricCacheRead int64
+	var measuredRateTokens int64
+	var measuredGenerationSeconds float64
+	for _, metric := range turnMetrics {
+		stats.Turns = max(stats.Turns, metric.Turn)
+		metricDuration += metric.DurationMs
+		metricInput += metric.InputTokens + metric.CacheCreateTokens + metric.CacheReadTokens
+		metricOutput += metric.OutputTokens
+		metricCacheCreate += metric.CacheCreateTokens
+		metricCacheRead += metric.CacheReadTokens
+		if metric.OutputTokens > 0 && metric.TokPerSec > 0 {
+			measuredRateTokens += metric.OutputTokens
+			measuredGenerationSeconds += float64(metric.OutputTokens) / metric.TokPerSec
+		}
+	}
+	stats.DurationMs = max(stats.DurationMs, metricDuration)
+	stats.InputTokens = max(stats.InputTokens, metricInput)
+	stats.OutputTokens = max(stats.OutputTokens, metricOutput)
+	stats.CacheWrite = max(stats.CacheWrite, metricCacheCreate)
+	stats.CacheRead = max(stats.CacheRead, metricCacheRead)
+
+	if s.store != nil {
+		if cumulative, ok, err := s.store.ReadCost(sid); err == nil && ok {
+			// CostSnapshot keeps raw input and cache buckets separate while
+			// traceStats.InputTokens is the total provider prompt load.
+			persistedInput := int64(cumulative.InputTokens + cumulative.CacheCreateTokens + cumulative.CacheReadTokens)
+			stats.InputTokens = max(stats.InputTokens, persistedInput)
+			stats.OutputTokens = max(stats.OutputTokens, int64(cumulative.OutputTokens))
+			stats.CacheWrite = max(stats.CacheWrite, int64(cumulative.CacheCreateTokens))
+			stats.CacheRead = max(stats.CacheRead, int64(cumulative.CacheReadTokens))
+		}
+		if timing, err := s.store.ReadTiming(sid); err == nil && len(timing) > 0 {
+			stats.ToolCalls = max(stats.ToolCalls, len(timing))
+			stats.ToolMs = max(stats.ToolMs, persistedTimingToolDuration(timing))
+			timingErrors := 0
+			for _, step := range timing {
+				if step.IsError {
+					timingErrors++
+				}
+			}
+			stats.Errors = max(stats.Errors, timingErrors)
+		}
+	}
+	// A persisted tool interval is proof that the session was active for at
+	// least that long. Legacy partial sidecars can lack the surrounding turn
+	// duration; use the tool time as a conservative lower bound rather than
+	// returning an impossible toolMs > durationMs pair.
+	stats.DurationMs = max(stats.DurationMs, stats.ToolMs)
 	if stats.DurationMs > stats.ToolMs {
 		stats.LlmMs = stats.DurationMs - stats.ToolMs
 	}
 	if denom := stats.InputTokens; denom > 0 {
 		stats.CacheHitRate = float64(stats.CacheRead) / float64(denom) * 100
 	}
-	if stats.LlmMs > 0 {
+	// Per-turn generation rates cover exactly the output tokens and duration
+	// used to calculate them. Prefer their output-weighted aggregate over a
+	// rate made from a broader legacy cost file divided by a partial duration.
+	if measuredRateTokens > 0 && measuredGenerationSeconds > 0 {
+		stats.TokPerSec = float64(measuredRateTokens) / measuredGenerationSeconds
+	} else if stats.LlmMs > 0 && (metricOutput == 0 || stats.OutputTokens == metricOutput) {
 		stats.TokPerSec = float64(stats.OutputTokens) / (float64(stats.LlmMs) / 1000)
 	}
 	// Per-turn time-to-first-token: first provider-visible reasoning or
@@ -3169,6 +3527,21 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 	for turn, firstToken := range turnFirstToken {
 		if start, ok := turnFirst[turn]; ok && firstToken.After(start) {
 			ttftTotal += firstToken.Sub(start).Milliseconds()
+			ttftCount++
+		}
+	}
+	if ttftCount > 0 {
+		stats.TtftAverageMs = ttftTotal / int64(ttftCount)
+	}
+	// Durable message metrics are authoritative for TTFT because older trace
+	// writers coalesced text at the end of generation. They are already
+	// de-duplicated by turn above; zero means that turn did not record TTFT,
+	// not an instant provider response.
+	ttftTotal = 0
+	ttftCount = 0
+	for _, metric := range turnMetrics {
+		if metric.TtftMs > 0 {
+			ttftTotal += metric.TtftMs
 			ttftCount++
 		}
 	}

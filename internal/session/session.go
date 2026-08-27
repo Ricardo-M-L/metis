@@ -179,6 +179,11 @@ type Store struct {
 	// means (*os.File).Sync. It is deliberately private so production callers
 	// cannot weaken checkpoint durability.
 	syncFile func(*os.File) error
+
+	// syncTelemetryDir is an injectable post-rename directory durability seam.
+	// Nil uses the platform default. It only applies to telemetry sidecars; the
+	// canonical conversation checkpoint keeps its existing durability path.
+	syncTelemetryDir func(string) error
 }
 
 func NewStore(dir string) (*Store, error) {

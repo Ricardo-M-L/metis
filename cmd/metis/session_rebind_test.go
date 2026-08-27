@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +52,88 @@ func TestRuntimeRebindSessionMovesGlobalRouters(t *testing.T) {
 	if loop.Checkpointer == firstCheckpointer {
 		t.Fatal("working-tree checkpointer was not replaced at session boundary")
 	}
+}
+
+func TestSetupRuntimeBindsInitialTraceSession(t *testing.T) {
+	isolateResumeRuntimeTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rt, err := setupRuntime(ctx, &cliFlags{
+		newSessionID: "initial-trace-session",
+		bare:         true,
+		noAuthWizard: true,
+	})
+	if err != nil {
+		t.Fatalf("setupRuntime: %v", err)
+	}
+	adapter := rtpkg.CurrentTraceAdapter()
+	store := rtpkg.CurrentTraceStore()
+	t.Cleanup(func() {
+		rt.Cleanup()
+		agent.SetTraceHook(nil)
+		rtpkg.SetTraceAdapter(nil)
+		if store != nil {
+			_ = store.Close()
+		}
+	})
+	if adapter == nil || store == nil {
+		t.Fatal("setupRuntime did not install the process trace")
+	}
+
+	adapter.OnEvent(agent.Event{Kind: agent.EventLoopDone, StopReason: "test"})
+	events := store.Events(rt.sessionID)
+	if len(events) != 1 || events[0].Kind != "loop_done" {
+		t.Fatalf("initial session trace was not bound: session=%q events=%+v", rt.sessionID, events)
+	}
+}
+
+func TestRuntimeCleanupFlushesTraceBeforeWaitingForDependencies(t *testing.T) {
+	oldAdapter := rtpkg.CurrentTraceAdapter()
+	traceDir := t.TempDir()
+	store, err := session.NewTraceStore(traceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := rtpkg.NewTraceAdapter(store)
+	adapter.SetSession("shutdown-trace")
+	rtpkg.SetTraceAdapter(adapter)
+	t.Cleanup(func() {
+		rtpkg.SetTraceAdapter(oldAdapter)
+		_ = store.Close()
+	})
+
+	adapter.OnEvent(agent.Event{Kind: agent.EventTextDelta, TextDelta: "last partial response"})
+	launcherDone := make(chan struct{})
+	rt := &runtime{mcpLauncherDone: launcherDone}
+	cleanupDone := make(chan struct{})
+	go func() {
+		rt.Cleanup()
+		close(cleanupDone)
+	}()
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	tracePath := filepath.Join(traceDir, "shutdown-trace.jsonl")
+	for {
+		raw, readErr := os.ReadFile(tracePath)
+		if readErr == nil && strings.Contains(string(raw), "last partial response") {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(launcherDone)
+			<-cleanupDone
+			t.Fatalf("trace was not flushed before dependency wait; path=%s err=%v contents=%q", tracePath, readErr, raw)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	select {
+	case <-cleanupDone:
+		t.Fatal("Cleanup returned before the simulated dependency launcher finished")
+	default:
+	}
+	close(launcherDone)
+	<-cleanupDone
 }
 
 func TestRuntimeRebindSessionUpdatesCrashRecoveryPointer(t *testing.T) {

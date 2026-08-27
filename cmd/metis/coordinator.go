@@ -109,7 +109,11 @@ func runOneShotForCoordinator(ctx context.Context, rt *runtime, prompt string) (
 	var sb strings.Builder
 	eventCh := make(chan agent.Event, 64)
 	errCh := make(chan error, 1)
-	go func() { errCh <- rt.loop.Run(ctx, eventCh) }()
+	go func() {
+		errCh <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
+			return rt.loop.Run(turnCtx, eventCh)
+		})
+	}()
 	for ev := range eventCh {
 		switch ev.Kind {
 		case agent.EventTextDelta:

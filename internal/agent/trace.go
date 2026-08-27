@@ -12,7 +12,10 @@ package agent
 // never cleared. Sub-agent loops emit with their own ParentID, so the
 // trace captures the full spawn-tree across agents.
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 var (
 	traceHookMu sync.RWMutex
@@ -40,4 +43,30 @@ func notifyTraceHook(ev Event) {
 	if fn != nil {
 		fn(ev)
 	}
+}
+
+// TraceInvocationStarted/Ended mark the actual child-execution lifetime of an
+// Agent, Fork, or Ralph call. They intentionally bypass the user-facing event
+// channel: the signals exist solely so the trace adapter can retain an origin
+// across either ordering of (a) a background tool_result handshake and (b) the
+// child's eventual completion, while immediately cleaning up permission/hook
+// short-circuits that never started a child.
+func TraceInvocationStarted(ctx context.Context) {
+	notifyTraceInvocationLifecycle(ctx, EventTraceInvocationStart)
+}
+
+func TraceInvocationEnded(ctx context.Context) {
+	notifyTraceInvocationLifecycle(ctx, EventTraceInvocationEnd)
+}
+
+func notifyTraceInvocationLifecycle(ctx context.Context, kind EventKind) {
+	id := TraceInvocationIDFromContext(ctx)
+	if id == "" {
+		return
+	}
+	notifyTraceHook(Event{
+		Kind:              kind,
+		TraceInvocationID: id,
+		SubAgentParentID:  ParentToolUseIDFromContext(ctx),
+	})
 }

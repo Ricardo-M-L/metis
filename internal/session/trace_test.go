@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -61,6 +62,159 @@ func TestTracePersistenceRoundtrip(t *testing.T) {
 	}
 	if events[2].Sequence != 3 {
 		t.Fatalf("want sequence 3, got %d", events[2].Sequence)
+	}
+}
+
+func TestTraceSyncSessionFlushesBelowPeriodicThreshold(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewTraceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Append(&TraceEvent{SessionID: "short", Kind: "loop_done", Text: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncSession("short"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "short.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"kind":"loop_done"`) {
+		t.Fatalf("short trace was not flushed: %q", raw)
+	}
+}
+
+func TestTraceSeparatesRepeatedProviderIDsByInvocation(t *testing.T) {
+	store, err := NewTraceStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for _, ev := range []*TraceEvent{
+		{SessionID: "repeat", Turn: 1, Kind: "tool_start", ToolName: "Agent", ToolUseID: "duplicate", TraceInvocationID: "inv-1", TraceCallID: "call-agent-1"},
+		{SessionID: "repeat", Turn: 1, Kind: "text", Text: "first child", SubAgentOf: "duplicate", TraceInvocationID: "inv-1"},
+		{SessionID: "repeat", Turn: 1, Kind: "tool_result", ToolUseID: "duplicate", ParentID: "duplicate", TraceInvocationID: "inv-1", TraceCallID: "call-agent-1"},
+		{SessionID: "repeat", Turn: 1, Kind: "tool_start", ToolName: "Agent", ToolUseID: "duplicate", TraceInvocationID: "inv-2", TraceCallID: "call-agent-2"},
+		{SessionID: "repeat", Turn: 1, Kind: "text", Text: "second child", SubAgentOf: "duplicate", TraceInvocationID: "inv-2"},
+		{SessionID: "repeat", Turn: 1, Kind: "tool_result", ToolUseID: "duplicate", ParentID: "duplicate", TraceInvocationID: "inv-2", TraceCallID: "call-agent-2"},
+	} {
+		if err := store.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	nodes := store.Trace("repeat")
+	if len(nodes) != 6 {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	wantText := []string{"", "first child", "", "", "second child", ""}
+	wantDepth := []int{0, 1, 1, 0, 1, 1}
+	for i := range nodes {
+		if nodes[i].Event.Text != wantText[i] || nodes[i].Depth != wantDepth[i] {
+			t.Fatalf("node %d = %+v, want text %q depth %d", i, nodes[i], wantText[i], wantDepth[i])
+		}
+	}
+}
+
+func TestTraceNestsInvocationOwnerUnderParentInvocation(t *testing.T) {
+	store, err := NewTraceStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for _, ev := range []*TraceEvent{
+		{SessionID: "nested", Turn: 1, Kind: "tool_start", ToolName: "Agent", ToolUseID: "parent", TraceInvocationID: "inv-parent"},
+		{SessionID: "nested", Turn: 1, Kind: "tool_start", ToolName: "Fork", ToolUseID: "child", TraceInvocationID: "inv-child", TraceParentInvocationID: "inv-parent"},
+		{SessionID: "nested", Turn: 1, Kind: "text", Text: "grandchild", SubAgentOf: "child", TraceInvocationID: "inv-child"},
+	} {
+		if err := store.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nodes := store.Trace("nested")
+	if len(nodes) != 3 || nodes[0].Depth != 0 || nodes[1].Depth != 1 || nodes[2].Depth != 2 {
+		t.Fatalf("nested nodes = %+v", nodes)
+	}
+}
+
+func TestTraceDoesNotTreatOrdinaryToolAsInvocationOwner(t *testing.T) {
+	store, err := NewTraceStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for _, ev := range []*TraceEvent{
+		{SessionID: "ordinary", Turn: 1, Kind: "tool_start", ToolName: "Agent", ToolUseID: "agent", TraceInvocationID: "inv-agent", TraceCallID: "call-agent"},
+		{SessionID: "ordinary", Turn: 1, Kind: "tool_start", ToolName: "Bash", ToolUseID: "bash", TraceInvocationID: "inv-agent", TraceCallID: "call-bash"},
+		{SessionID: "ordinary", Turn: 1, Kind: "tool_result", ToolName: "Bash", ToolUseID: "bash", ParentID: "bash", TraceInvocationID: "inv-agent", TraceCallID: "call-bash"},
+		{SessionID: "ordinary", Turn: 1, Kind: "text", Text: "child answer", SubAgentOf: "agent", TraceInvocationID: "inv-agent"},
+		{SessionID: "ordinary", Turn: 1, Kind: "tool_result", ToolName: "Agent", ToolUseID: "agent", ParentID: "agent", TraceInvocationID: "inv-agent", TraceCallID: "call-agent"},
+	} {
+		if err := store.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nodes := store.Trace("ordinary")
+	wantDepth := []int{0, 1, 2, 1, 1}
+	if len(nodes) != len(wantDepth) {
+		t.Fatalf("ordinary nodes = %+v", nodes)
+	}
+	for i, want := range wantDepth {
+		if nodes[i].Depth != want {
+			t.Fatalf("node %d = %+v, want depth %d", i, nodes[i], want)
+		}
+	}
+}
+
+func TestTraceSeparatesRepeatedOrdinaryToolIDsByCallAfterReload(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewTraceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range []*TraceEvent{
+		{SessionID: "ordinary-repeat", Turn: 1, Kind: "tool_start", ToolName: "Agent", ToolUseID: "agent", TraceInvocationID: "inv-agent", TraceCallID: "call-agent"},
+		{SessionID: "ordinary-repeat", Turn: 1, Kind: "tool_start", ToolName: "Bash", ToolUseID: "provider-reused", TraceInvocationID: "inv-agent", TraceCallID: "call-one"},
+		{SessionID: "ordinary-repeat", Turn: 1, Kind: "tool_result", ToolName: "Bash", ToolUseID: "provider-reused", ParentID: "provider-reused", Text: "first", TraceInvocationID: "inv-agent", TraceCallID: "call-one"},
+		{SessionID: "ordinary-repeat", Turn: 1, Kind: "tool_start", ToolName: "Bash", ToolUseID: "provider-reused", TraceInvocationID: "inv-agent", TraceCallID: "call-two"},
+		{SessionID: "ordinary-repeat", Turn: 1, Kind: "tool_result", ToolName: "Bash", ToolUseID: "provider-reused", ParentID: "provider-reused", Text: "second", TraceInvocationID: "inv-agent", TraceCallID: "call-two"},
+		{SessionID: "ordinary-repeat", Turn: 1, Kind: "tool_result", ToolName: "Agent", ToolUseID: "agent", ParentID: "agent", TraceInvocationID: "inv-agent", TraceCallID: "call-agent"},
+	} {
+		if err := store.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertRepeatedOrdinaryTrace(t, store.Trace("ordinary-repeat"))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewTraceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertRepeatedOrdinaryTrace(t, reopened.Trace("ordinary-repeat"))
+}
+
+func assertRepeatedOrdinaryTrace(t *testing.T, nodes []TracedNode) {
+	t.Helper()
+	wantKind := []string{"tool_start", "tool_start", "tool_result", "tool_start", "tool_result", "tool_result"}
+	wantDepth := []int{0, 1, 2, 1, 2, 1}
+	wantText := []string{"", "", "first", "", "second", ""}
+	if len(nodes) != len(wantKind) {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	for i := range nodes {
+		if nodes[i].Event.Kind != wantKind[i] || nodes[i].Depth != wantDepth[i] || nodes[i].Event.Text != wantText[i] {
+			t.Fatalf("node %d = %+v, want kind=%q depth=%d text=%q", i, nodes[i], wantKind[i], wantDepth[i], wantText[i])
+		}
 	}
 }
 

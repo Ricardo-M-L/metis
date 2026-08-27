@@ -26,7 +26,7 @@ import (
 // No-op when PeerInbox is nil (top-level user loop, headless tests)
 // or when the channel is empty (no peer told us anything since the
 // last drain).
-func (l *Loop) injectPeerMessages(out chan<- Event) {
+func (l *Loop) injectPeerMessages(ctx context.Context, out chan<- Event) {
 	if l.PeerInbox == nil {
 		return
 	}
@@ -35,7 +35,7 @@ func (l *Loop) injectPeerMessages(out chan<- Event) {
 		return
 	}
 	l.appendInjectedMessage(formatPeerMessages(msgs))
-	emit(context.Background(), out, Event{
+	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[peer messaging] %d message(s) delivered", len(msgs)),
 	})

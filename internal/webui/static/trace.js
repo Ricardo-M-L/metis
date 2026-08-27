@@ -19,6 +19,7 @@ let traceTab = 'summary';
 let traceNextCursor = '';
 let traceTotalEvents = 0;
 let traceLoadingOlder = false;
+let traceLoadGeneration = 0;
 const TRACE_REDACTED_THINKING_PLACEHOLDER = 'Reasoning redacted by provider';
 
 // DSH kind palette: tag label, tag color class, timeline lane.
@@ -66,8 +67,14 @@ function switchView(view) {
     document.querySelector('.main').classList.remove('empty');
     loadTrace();
   } else {
+    invalidateTraceLoads();
     updateEmptyLayout();
   }
+}
+
+function invalidateTraceLoads() {
+  traceLoadGeneration++;
+  traceLoadingOlder = false;
 }
 
 function fmtMs(ms) {
@@ -394,23 +401,29 @@ function mergeTraceEvents(older, current) {
   return merged;
 }
 
-async function loadTrace(loadOlder = false) {
+async function loadTrace(loadOlder = false, sessionId = currentSessionId, shouldApply = () => true) {
   if (loadOlder && (!traceNextCursor || traceLoadingOlder)) return;
+  const requestedSessionId = String(sessionId || '');
+  const generation = loadOlder ? traceLoadGeneration : ++traceLoadGeneration;
+  const requestedCursor = loadOlder ? traceNextCursor : '';
+  const isLatest = () => generation === traceLoadGeneration &&
+    shouldApply() && requestedSessionId === String(currentSessionId || '');
   const body = document.getElementById('traceBody');
   const track = document.getElementById('traceTrack');
-  if (!loadOlder) {
-    traceNextCursor = '';
-    traceTotalEvents = 0;
-  }
   traceLoadingOlder = loadOlder;
   try {
     const params = new URLSearchParams({ limit: '500' });
-    if (currentSessionId) params.set('sessionId', currentSessionId);
-    if (loadOlder) params.set('cursor', traceNextCursor);
+    if (requestedSessionId) params.set('sessionId', requestedSessionId);
+    if (loadOlder) params.set('cursor', requestedCursor);
     const url = '/api/trace?' + params.toString();
     const res = await fetch(url);
     if (!res.ok) throw new Error('trace: ' + res.status);
     const data = await res.json();
+    if (!isLatest()) return;
+    if (!loadOlder) {
+      traceNextCursor = '';
+      traceTotalEvents = 0;
+    }
     if (!data.enabled) {
       track.innerHTML = '';
       body.innerHTML = '<tr><td colspan="2"><div class="tt-empty">Session tracing is not enabled for this process.</div></td></tr>';
@@ -427,11 +440,12 @@ async function loadTrace(loadOlder = false) {
     traceSelectedReq = -1;
     renderTrace();
   } catch (e) {
+    if (!isLatest()) return;
     track.innerHTML = '';
     body.innerHTML = '<tr><td colspan="2"><div class="tt-empty">Failed to load trajectory: ' + escHtml(e.message) + '</div></td></tr>';
     closeTraceInspector(false);
   } finally {
-    traceLoadingOlder = false;
+    if (generation === traceLoadGeneration) traceLoadingOlder = false;
   }
 }
 

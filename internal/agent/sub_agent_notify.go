@@ -24,7 +24,7 @@ import (
 // No-op when subAgentNotify is nil (shouldn't happen post-NewLoop, but
 // handles headless tests that build Loop manually) or when the channel
 // is empty.
-func (l *Loop) injectSubAgentNotifications(out chan<- Event) {
+func (l *Loop) injectSubAgentNotifications(ctx context.Context, out chan<- Event) {
 	if l.subAgentNotify == nil {
 		return
 	}
@@ -33,7 +33,7 @@ func (l *Loop) injectSubAgentNotifications(out chan<- Event) {
 		return
 	}
 	l.appendInjectedMessage(formatSubAgentNotifications(notifs))
-	emit(context.Background(), out, Event{
+	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[sub-agent idle] %d background sub-agent(s) finished", len(notifs)),
 	})

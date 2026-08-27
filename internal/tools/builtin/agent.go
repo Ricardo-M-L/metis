@@ -920,6 +920,11 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}
 	}
 
+	// Signal only after every validation/setup step succeeded and immediately
+	// before handing control to the child runner. A denied or short-circuited
+	// Agent therefore has no start signal and its trace owner can be discarded
+	// as soon as the parent tool_result arrives.
+	agent.TraceInvocationStarted(ctx)
 	if runInBackground {
 		return a.executeBackground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk, parentNotify)
 	}
@@ -1022,6 +1027,11 @@ func (a Agent) executeForeground(
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
+		// executeForeground may return as soon as its parent context is
+		// cancelled, before the child Run goroutine has unwound. Keep the trace
+		// owner alive until the actual child loop exits so its terminal/error and
+		// deferred cleanup events cannot be dropped after the parent tool_result.
+		defer agent.TraceInvocationEnded(childCtx)
 		done <- sub.Run(childCtx, events)
 		close(events)
 	}()
@@ -1165,6 +1175,12 @@ func (a Agent) executeBackground(
 		events := make(chan agent.Event, 64)
 		done := make(chan error, 1)
 		go func() {
+			// The trace owner belongs to the actual child Loop.Run lifetime,
+			// not the detached event-consumer wrapper. EventError is delivered
+			// to events before the trace hook returns, so the consumer may exit
+			// while Loop.Run is still unwinding. Ending here prevents late error
+			// and cleanup events from losing their immutable origin.
+			defer agent.TraceInvocationEnded(childCtx)
 			done <- sub.Run(childCtx, events)
 			close(events)
 		}()

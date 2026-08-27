@@ -31,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -163,6 +164,8 @@ func (r Ralph) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return &tools.Result{Output: "Ralph: cannot create run dir: " + err.Error(), IsError: true}, nil
 	}
+	agent.TraceInvocationStarted(ctx)
+	defer agent.TraceInvocationEnded(ctx)
 
 	type roundLog struct {
 		Round  int    `json:"round"`

@@ -15,6 +15,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	sessionpkg "github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -201,6 +203,66 @@ func TestACP_PromptHappyPath(t *testing.T) {
 	}
 
 	w.Close()
+}
+
+func TestACP_PromptTraceUsesExplicitServerSessionAcrossTurns(t *testing.T) {
+	traceStore, err := sessionpkg.NewTraceStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = traceStore.Close() })
+
+	oldAdapter := rtpkg.CurrentTraceAdapter()
+	adapter := rtpkg.NewTraceAdapter(traceStore)
+	rtpkg.SetTraceAdapter(adapter)
+	agent.SetTraceHook(adapter.OnEvent)
+	t.Cleanup(func() {
+		rtpkg.SetTraceAdapter(oldAdapter)
+		if oldAdapter != nil {
+			agent.SetTraceHook(oldAdapter.OnEvent)
+		} else {
+			agent.SetTraceHook(nil)
+		}
+	})
+	adapter.SetSession("selected-other-session")
+
+	reg := tools.NewRegistry()
+	gate := permission.New(permission.ModeBypass)
+	loop := agent.NewLoop(helloProvider(), reg, gate, agent.NewHookRegistry(), "system", 5)
+	loop.Model = "fake-model"
+	const sessionID = "acp-owned-session"
+	srv := NewServerForSession(loop, "stdio", sessionID)
+	sn := &session{
+		enc:     json.NewEncoder(io.Discard),
+		server:  srv,
+		prompts: make(map[string]context.CancelFunc),
+		perms:   make(map[string]chan agent.PermissionDecision),
+	}
+
+	sn.handlePrompt(context.Background(), 1, PromptParams{Prompt: "first"})
+	sn.handlePrompt(context.Background(), 2, PromptParams{Prompt: "second"})
+
+	events := traceStore.Events(sessionID)
+	if len(events) == 0 {
+		t.Fatal("ACP prompts produced no trace events")
+	}
+	sawTurn1, sawTurn2 := false, false
+	for _, event := range events {
+		switch event.Turn {
+		case 1:
+			sawTurn1 = true
+		case 2:
+			sawTurn2 = true
+		default:
+			t.Fatalf("trace event has unexpected turn: %+v", event)
+		}
+	}
+	if !sawTurn1 || !sawTurn2 {
+		t.Fatalf("ACP trace turns: saw turn1=%v turn2=%v events=%+v", sawTurn1, sawTurn2, events)
+	}
+	if leaked := traceStore.Events("selected-other-session"); len(leaked) != 0 {
+		t.Fatalf("ACP trace leaked into selected session: %+v", leaked)
+	}
 }
 
 func TestACP_UnknownMethod(t *testing.T) {

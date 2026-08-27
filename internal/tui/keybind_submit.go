@@ -1333,7 +1333,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// in finalizeTurn when doneCh fires.
 	turnCtx, cancel := context.WithCancel(turnRunCtx)
 	m.turnCancel = cancel
-	go runTurnAsync(turnCtx, cancel, m.loop, m.eventCh, m.doneCh)
+	go runTurnAsync(turnCtx, cancel, m.loop, m.sessionID, m.eventCh, m.doneCh)
 	// Critical: must return tickCmd here so spinnerTick events start flowing,
 	// otherwise the "thinking" frame and elapsed timer freeze at 0s and the
 	// UI looks dead until the LLM replies.

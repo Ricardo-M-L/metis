@@ -152,7 +152,7 @@ func TestAutoMemoryExtractor_FilesTouchedTracked(t *testing.T) {
 func TestInjectDreamNotifications_NoOpWhenNilChannel(t *testing.T) {
 	loop := &Loop{}
 	before := len(loop.Messages)
-	loop.injectDreamNotifications(nil)
+	loop.injectDreamNotifications(context.Background(), nil)
 	if len(loop.Messages) != before {
 		t.Errorf("nil DreamNotify must not append messages; got %d (was %d)",
 			len(loop.Messages), before)
@@ -180,7 +180,7 @@ func TestInjectDreamNotifications_AppendsEnvelope(t *testing.T) {
 	before := len(loop.Messages)
 
 	out := make(chan Event, 4) // captures EventInfo so emit() doesn't block
-	loop.injectDreamNotifications(out)
+	loop.injectDreamNotifications(context.Background(), out)
 
 	if got := len(loop.Messages); got != before+1 {
 		t.Fatalf("expected 1 new message; got %d (was %d)", got, before)

@@ -276,10 +276,15 @@ func jsonTypeName(v any) string {
 // are denied, AskUser is dismissed — same posture as cmdRun's main
 // event loop, minus metrics (a correction turn is expected to be a
 // single text-only reply).
-func RunLoopCollectText(ctx context.Context, loop *agent.Loop) (string, error) {
+func RunLoopCollectText(ctx context.Context, loop *agent.Loop, sessionID string) (string, error) {
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
-	go func() { done <- loop.Run(ctx, events); close(events) }()
+	go func() {
+		done <- RunWithTraceTurn(ctx, sessionID, func(turnCtx context.Context) error {
+			return loop.Run(turnCtx, events)
+		})
+		close(events)
+	}()
 	var b strings.Builder
 	for ev := range events {
 		switch ev.Kind {

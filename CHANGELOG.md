@@ -7,6 +7,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.34] - 2026-08-28
+
+### Added
+
+- Desktop now persists cumulative token/cache telemetry and per-turn timing so
+  the rich footer survives session switches, restarts, stopped turns, and
+  short traces that never reach the periodic trace flush threshold.
+- The native Desktop shell now shuts down its WebUI child through an
+  authenticated loopback control channel before using bounded process
+  termination fallbacks on macOS, Windows, or Linux.
+
+### Changed
+
+- Workspace rename and removal use native-styled, keyboard-accessible dialogs;
+  removal only hides the workspace list entry and keeps files, sessions, traces,
+  and artifacts on disk.
+- Release documentation now matches the actual Desktop archives: a universal
+  macOS ZIP, Windows amd64 ZIP, and Linux amd64 tarball with SHA-256 sidecars.
+- MCP `run_task` calls serialize only the process-wide runtime ownership window,
+  preventing concurrent calls from replacing one another's trace wiring while
+  queued cancellation and all non-run MCP methods remain responsive.
+
+### Fixed
+
+- Restored conversations immediately report a nonzero context estimate, values
+  below one percent display as `<1%`, and blank or inactive views no longer
+  inherit another session's context percentage.
+- Rapid session changes cannot let stale history, compaction, effort, status,
+  artifact, statistics, or trajectory responses overwrite the selected view.
+- Initial sessions are bound to trace storage, terminal events are flushed, and
+  canceled provider usage is retained for resumed Desktop telemetry.
+- Multi-agent terminal events no longer prematurely close the parent trace turn
+  or double-count overlapping tool timing.
+- Quitting Desktop cancels active turns and pending interactions before runtime
+  dependencies close, preventing orphan processes and lost final telemetry.
+
 ## [0.4.33] - 2026-08-27
 
 ### Added
@@ -63,9 +99,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
-- The macOS Desktop release now includes a Developer ID signed and Apple
-  notarized DMG with an Applications shortcut; the verified ZIP remains
-  available for atomic in-app updates.
+- The macOS Desktop release provides a verified universal ZIP suitable for
+  installation and atomic in-app updates.
 
 ### Changed
 
@@ -1070,7 +1105,12 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.29...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.34...HEAD
+[0.4.34]: https://github.com/Ricardo-M-L/metis/compare/v0.4.33...v0.4.34
+[0.4.33]: https://github.com/Ricardo-M-L/metis/compare/v0.4.32...v0.4.33
+[0.4.32]: https://github.com/Ricardo-M-L/metis/compare/v0.4.31...v0.4.32
+[0.4.31]: https://github.com/Ricardo-M-L/metis/compare/v0.4.30...v0.4.31
+[0.4.30]: https://github.com/Ricardo-M-L/metis/compare/v0.4.29...v0.4.30
 [0.4.29]: https://github.com/Ricardo-M-L/metis/compare/v0.4.28...v0.4.29
 [0.4.28]: https://github.com/Ricardo-M-L/metis/compare/v0.4.27...v0.4.28
 [0.4.27]: https://github.com/Ricardo-M-L/metis/compare/v0.4.26...v0.4.27

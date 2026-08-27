@@ -10,7 +10,17 @@ let sessionsLoading = false;
 let sessionSearchTimer = null;
 let sessionDeleteDialog = null;
 let sessionRenameDialog = null;
+let workspaceRenameDialog = null;
+let workspaceRemoveDialog = null;
+let resumeSessionGeneration = 0;
+let sessionStatsGeneration = 0;
 let removedWorkspaceIDs = new Set();
+
+function invalidateSessionAsyncLoads() {
+  resumeSessionGeneration++;
+  sessionStatsGeneration++;
+  if (typeof invalidateTraceLoads === 'function') invalidateTraceLoads();
+}
 
 async function loadWorkspaces() {
   try {
@@ -78,8 +88,7 @@ async function openWorkspace(id) {
 
 function toggleWorkspaceMenu(btn) {
   if (openWorkspaceMenuBtn && openWorkspaceMenuBtn !== btn) {
-    const old = openWorkspaceMenuBtn.parentElement.querySelector('.workspace-menu');
-    if (old) old.style.display = 'none';
+    closeWorkspaceMenu(false);
   }
   const menu = btn.parentElement.querySelector('.workspace-menu');
   const show = menu && menu.style.display === 'none';
@@ -88,43 +97,252 @@ function toggleWorkspaceMenu(btn) {
   openWorkspaceMenuBtn = show ? btn : null;
 }
 
-async function renameWorkspace(id) {
+function closeWorkspaceMenu(restoreFocus) {
+  if (!openWorkspaceMenuBtn) return;
+  const button = openWorkspaceMenuBtn;
+  const row = button.parentElement;
+  const menu = row && row.querySelector('.workspace-menu');
+  if (menu) menu.style.display = 'none';
+  button.setAttribute('aria-expanded', 'false');
+  openWorkspaceMenuBtn = null;
+  if (restoreFocus && button.isConnected) button.focus();
+}
+
+function trapWorkspaceDialogFocus(dialog, event) {
+  if (event.key !== 'Tab') return;
+  const focusable = Array.from(dialog.querySelectorAll('button:not(:disabled), input:not(:disabled)'));
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function closeWorkspaceRenameDialog(force) {
+  if (!workspaceRenameDialog || workspaceRenameDialog.pending && !force) return;
+  const state = workspaceRenameDialog;
+  workspaceRenameDialog = null;
+  state.overlay.remove();
+  if (state.trigger && state.trigger.isConnected) state.trigger.focus();
+}
+
+function openWorkspaceRenameDialog(id, name, trigger) {
+  if (workspaceRenameDialog) {
+    if (workspaceRenameDialog.pending) return;
+    closeWorkspaceRenameDialog(false);
+  }
+  if (workspaceRemoveDialog) {
+    if (workspaceRemoveDialog.pending) return;
+    closeWorkspaceRemoveDialog(false);
+  }
+  const current = String(name || '').trim();
+  closeWorkspaceMenu(false);
+
+  const overlay = document.createElement('div');
+  overlay.className = 'workspace-dialog-overlay';
+  overlay.innerHTML = `
+    <div class="workspace-dialog workspace-rename-dialog" role="dialog" aria-modal="true" aria-labelledby="workspaceRenameTitle">
+      <div class="workspace-dialog-heading">
+        <h2 id="workspaceRenameTitle">${uiText('Rename workspace', '\u91cd\u547d\u540d\u5de5\u4f5c\u533a')}</h2>
+        <button type="button" class="workspace-dialog-close" aria-label="${uiText('Close rename dialog', '\u5173\u95ed\u91cd\u547d\u540d\u5f39\u7a97')}">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <form class="workspace-rename-form">
+        <input class="workspace-dialog-input workspace-rename-input" type="text" maxlength="120" autocomplete="off" spellcheck="false" value="${escAttr(current)}" aria-label="${uiText('Workspace name', '\u5de5\u4f5c\u533a\u540d\u79f0')}">
+        <p class="workspace-dialog-error workspace-rename-error" role="alert" aria-live="assertive" hidden></p>
+        <div class="workspace-dialog-actions">
+          <button type="button" class="workspace-rename-cancel">${uiText('Cancel', '\u53d6\u6d88')}</button>
+          <button type="submit" class="workspace-rename-confirm">${uiText('Rename', '\u91cd\u547d\u540d')}</button>
+        </div>
+      </form>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const state = { id, current, trigger, overlay, pending: false };
+  workspaceRenameDialog = state;
+  const dialog = overlay.querySelector('.workspace-dialog');
+  const form = overlay.querySelector('.workspace-rename-form');
+  const input = overlay.querySelector('.workspace-rename-input');
+  const close = overlay.querySelector('.workspace-dialog-close');
+  const cancel = overlay.querySelector('.workspace-rename-cancel');
+  const confirm = overlay.querySelector('.workspace-rename-confirm');
+  const syncConfirm = () => { confirm.disabled = !input.value.trim(); };
+  input.addEventListener('input', syncConfirm);
+  input.addEventListener('keydown', event => {
+    if ((event.isComposing || event.keyCode === 229) && event.key === 'Enter') event.preventDefault();
+  });
+  close.addEventListener('click', () => closeWorkspaceRenameDialog(false));
+  cancel.addEventListener('click', () => closeWorkspaceRenameDialog(false));
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    submitWorkspaceRename(state);
+  });
+  overlay.addEventListener('click', event => {
+    if (event.target === overlay) closeWorkspaceRenameDialog(false);
+  });
+  dialog.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeWorkspaceRenameDialog(false);
+      return;
+    }
+    trapWorkspaceDialogFocus(dialog, event);
+  });
+  syncConfirm();
+  requestAnimationFrame(() => {
+    input.focus();
+    input.select();
+  });
+}
+
+function renameWorkspace(id) {
   const ws = workspaces.find(w => w.id === id);
   if (!ws) return;
-  const name = prompt('Rename workspace', ws.name || '');
-  if (!name || !name.trim() || name.trim() === ws.name) return;
+  openWorkspaceRenameDialog(id, ws.name || '', openWorkspaceMenuBtn);
+}
+
+async function submitWorkspaceRename(state) {
+  if (!state || workspaceRenameDialog !== state || state.pending) return;
+  const input = state.overlay.querySelector('.workspace-rename-input');
+  const error = state.overlay.querySelector('.workspace-rename-error');
+  const confirm = state.overlay.querySelector('.workspace-rename-confirm');
+  const controls = Array.from(state.overlay.querySelectorAll('button, input'));
+  const name = input.value.trim();
+  if (!name) return;
+  if (name === state.current) {
+    closeWorkspaceRenameDialog(false);
+    return;
+  }
+  state.pending = true;
+  controls.forEach(control => { control.disabled = true; });
+  confirm.textContent = uiText('Renaming…', '\u6b63\u5728\u91cd\u547d\u540d…');
+  error.hidden = true;
+  error.textContent = '';
   try {
     const res = await fetch('/api/workspaces/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id, name: name.trim() })
+      body: JSON.stringify({ id: state.id, name: name })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'rename workspace: ' + res.status);
+    closeWorkspaceRenameDialog(true);
     await loadWorkspaces();
-    showToast('Workspace renamed');
+    showToast(uiText('Workspace renamed', '\u5de5\u4f5c\u533a\u5df2\u91cd\u547d\u540d'));
   } catch (e) {
-    showToast('Rename workspace failed: ' + e.message);
+    state.pending = false;
+    controls.forEach(control => { control.disabled = false; });
+    confirm.textContent = uiText('Rename', '\u91cd\u547d\u540d');
+    error.textContent = e.message || uiText('Unable to rename this workspace.', '\u65e0\u6cd5\u91cd\u547d\u540d\u8be5\u5de5\u4f5c\u533a\u3002');
+    error.hidden = false;
+    input.focus();
+    input.select();
   }
 }
 
-async function removeWorkspace(id) {
+function closeWorkspaceRemoveDialog(force) {
+  if (!workspaceRemoveDialog || workspaceRemoveDialog.pending && !force) return;
+  const state = workspaceRemoveDialog;
+  workspaceRemoveDialog = null;
+  state.overlay.remove();
+  if (state.trigger && state.trigger.isConnected) state.trigger.focus();
+}
+
+function openWorkspaceRemoveDialog(id, name, trigger) {
+  if (workspaceRemoveDialog) {
+    if (workspaceRemoveDialog.pending) return;
+    closeWorkspaceRemoveDialog(false);
+  }
+  if (workspaceRenameDialog) {
+    if (workspaceRenameDialog.pending) return;
+    closeWorkspaceRenameDialog(false);
+  }
+  closeWorkspaceMenu(false);
+
+  const overlay = document.createElement('div');
+  overlay.className = 'workspace-dialog-overlay';
+  overlay.innerHTML = `
+    <div class="workspace-dialog workspace-remove-dialog" role="alertdialog" aria-modal="true" aria-labelledby="workspaceRemoveTitle" aria-describedby="workspaceRemoveDescription">
+      <div class="workspace-remove-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M5 7h14M9 7V4h6v3m2 0-.8 13H7.8L7 7m3.5 4v5m3-5v5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="workspace-remove-copy">
+        <h2 id="workspaceRemoveTitle">${uiText('Remove workspace from the list?', '\u4ece\u5217\u8868\u4e2d\u79fb\u9664\u5de5\u4f5c\u533a\uff1f')}</h2>
+        <p class="workspace-remove-name">${escHtml(name || uiText('Untitled workspace', '\u672a\u547d\u540d\u5de5\u4f5c\u533a'))}</p>
+        <p id="workspaceRemoveDescription">${uiText('Only the Desktop list entry is removed. Project files, conversations, traces, and other session data stay on disk.', '\u53ea\u4f1a\u79fb\u9664 Desktop \u5217\u8868\u9879\u3002\u9879\u76ee\u6587\u4ef6\u3001\u4f1a\u8bdd\u3001\u8f68\u8ff9\u53ca\u5176\u4ed6\u4f1a\u8bdd\u6570\u636e\u90fd\u4f1a\u4fdd\u7559\u5728\u78c1\u76d8\u4e0a\u3002')}</p>
+        <p class="workspace-dialog-error workspace-remove-error" role="alert" aria-live="assertive" hidden></p>
+      </div>
+      <div class="workspace-dialog-actions workspace-remove-actions">
+        <button type="button" class="workspace-remove-cancel">${uiText('Cancel', '\u53d6\u6d88')}</button>
+        <button type="button" class="workspace-remove-confirm">${uiText('Remove from list', '\u4ece\u5217\u8868\u79fb\u9664')}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const state = { id, name, trigger, overlay, pending: false };
+  workspaceRemoveDialog = state;
+  const dialog = overlay.querySelector('.workspace-dialog');
+  const cancel = overlay.querySelector('.workspace-remove-cancel');
+  const confirm = overlay.querySelector('.workspace-remove-confirm');
+  cancel.addEventListener('click', () => closeWorkspaceRemoveDialog(false));
+  confirm.addEventListener('click', () => submitWorkspaceRemoval(state));
+  overlay.addEventListener('click', event => {
+    if (event.target === overlay) closeWorkspaceRemoveDialog(false);
+  });
+  dialog.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeWorkspaceRemoveDialog(false);
+      return;
+    }
+    trapWorkspaceDialogFocus(dialog, event);
+  });
+  requestAnimationFrame(() => cancel.focus());
+}
+
+function removeWorkspace(id) {
   const ws = workspaces.find(w => w.id === id);
   if (!ws) return;
-  if (!confirm('Remove "' + ws.name + '" from the Desktop list? Project files and sessions will not be deleted.')) return;
+  openWorkspaceRemoveDialog(id, ws.name || '', openWorkspaceMenuBtn);
+}
+
+async function submitWorkspaceRemoval(state) {
+  if (!state || workspaceRemoveDialog !== state || state.pending) return;
+  state.pending = true;
+  const cancel = state.overlay.querySelector('.workspace-remove-cancel');
+  const confirm = state.overlay.querySelector('.workspace-remove-confirm');
+  const error = state.overlay.querySelector('.workspace-remove-error');
+  cancel.disabled = true;
+  confirm.disabled = true;
+  confirm.textContent = uiText('Removing…', '\u6b63\u5728\u79fb\u9664…');
+  error.hidden = true;
+  error.textContent = '';
   try {
     const res = await fetch('/api/workspaces/remove', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id })
+      body: JSON.stringify({ id: state.id })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'remove workspace: ' + res.status);
+    closeWorkspaceRemoveDialog(true);
     await loadWorkspaces();
     await loadSessions();
-    showToast('Workspace removed from the list; no files or sessions were deleted');
+    showToast(uiText('Workspace removed from the list; no files or sessions were deleted', '\u5de5\u4f5c\u533a\u5df2\u4ece\u5217\u8868\u79fb\u9664\uff1b\u6ca1\u6709\u5220\u9664\u4efb\u4f55\u6587\u4ef6\u6216\u4f1a\u8bdd'));
   } catch (e) {
-    showToast('Remove workspace failed: ' + e.message);
+    state.pending = false;
+    cancel.disabled = false;
+    confirm.disabled = false;
+    confirm.textContent = uiText('Remove from list', '\u4ece\u5217\u8868\u79fb\u9664');
+    error.textContent = e.message || uiText('Unable to remove this workspace.', '\u65e0\u6cd5\u79fb\u9664\u8be5\u5de5\u4f5c\u533a\u3002');
+    error.hidden = false;
+    confirm.focus();
   }
 }
 
@@ -188,10 +406,7 @@ document.addEventListener('click', e => {
   if (!openWorkspaceMenuBtn) return;
   const row = openWorkspaceMenuBtn.parentElement;
   if (row && row.contains(e.target)) return;
-  const menu = row && row.querySelector('.workspace-menu');
-  if (menu) menu.style.display = 'none';
-  openWorkspaceMenuBtn.setAttribute('aria-expanded', 'false');
-  openWorkspaceMenuBtn = null;
+  closeWorkspaceMenu(false);
 });
 
 async function loadSessions(append) {
@@ -681,11 +896,20 @@ function renderSessionStatsbar(data) {
   bar.style.display = 'block';
 }
 
-async function loadSessionStatsbar() {
-  if (!currentSessionId) return;
+async function loadSessionStatsbar(sessionId = currentSessionId) {
+  const normalizedSession = String(sessionId || '');
+  const generation = ++sessionStatsGeneration;
+  const bar = document.getElementById('sessionStatsbar');
+  if (bar) {
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    bar.removeAttribute('aria-label');
+  }
+  if (!normalizedSession) return;
   try {
-    const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(currentSessionId));
+    const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(normalizedSession));
     const data = await res.json();
+    if (generation !== sessionStatsGeneration || normalizedSession !== String(currentSessionId || '')) return;
     if (res.ok) renderSessionStatsbar(data);
   } catch (_) { /* stats are best-effort */ }
 }
@@ -951,6 +1175,8 @@ function toggleSessionsExpand() {
 }
 
 async function resumeSession(id) {
+  const generation = ++resumeSessionGeneration;
+  const isLatest = () => generation === resumeSessionGeneration;
   try {
     let viewOnly = typeof turnRunning !== 'undefined' && turnRunning;
     if (viewOnly && id !== currentSessionId && currentSessionId === runningSessionId) {
@@ -963,11 +1189,13 @@ async function resumeSession(id) {
       ? { method: 'GET' }
       : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) };
     let res = await fetch(endpoint, options);
+    if (!isLatest()) return;
     // The status poll/SSE can race a click by a few milliseconds. If the
     // backend already owns a running turn, fall back to the transcript-only
     // endpoint instead of reviving the old "stop before switching" bug.
     if (!viewOnly && res.status === 409) {
       const conflict = await res.json().catch(() => ({}));
+      if (!isLatest()) return;
       if (conflict.turnRunning) {
         const active = String(conflict.runningSessionId || currentSessionId || '');
         if (typeof setTurnRunning === 'function') setTurnRunning(true, active);
@@ -976,27 +1204,38 @@ async function resumeSession(id) {
         endpoint = '/api/sessions/' + encodeURIComponent(id);
         options = { method: 'GET' };
         res = await fetch(endpoint, options);
+        if (!isLatest()) return;
       }
     }
     if (!res.ok) throw new Error(`resume: ${res.status}`);
     const data = await res.json();
+    if (!isLatest()) return;
     currentSessionId = id;
-    if (currentView === 'trace') loadTrace();
-    loadSessionStatsbar();
+    if (currentView === 'trace') loadTrace(false, id, isLatest);
+    loadSessionStatsbar(id);
     messages = [];
     streamedTextThisTurn = false;
     renderHistoryMessages(data.messages);
-    await restoreCompactionHistory();
+    await restoreCompactionHistory(id, isLatest);
+    if (!isLatest()) return;
     if (typeof loadArtifactsForSession === 'function') {
-      await loadArtifactsForSession(currentSessionId, { rebuildCards: true });
+      await loadArtifactsForSession(id, { rebuildCards: true });
+      if (!isLatest()) return;
     }
-	if (typeof loadEffort === 'function') await loadEffort();
+	if (typeof loadEffort === 'function') {
+      await loadEffort(isLatest);
+      if (!isLatest()) return;
+    }
+    if (typeof pollStatus === 'function') {
+      await pollStatus(isLatest);
+      if (!isLatest()) return;
+    }
     if (typeof syncTurnControls === 'function') syncTurnControls();
     renderSessions();
     if (!turnRunning && queuedTurns.length && (!queuedSessionId || queuedSessionId === currentSessionId)) {
       setTimeout(drainQueuedTurns, 0);
     }
   } catch (e) {
-    showError('Unable to resume this session.');
+    if (isLatest()) showError('Unable to resume this session.');
   }
 }

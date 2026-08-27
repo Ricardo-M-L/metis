@@ -20,6 +20,7 @@ let streamingEl = null;
 let streamingText = '';
 let streamedTextThisTurn = false;
 let effortState = { supported: false, effort: 'default', options: [] };
+let effortRequestGeneration = 0;
 const CHAT_BOTTOM_THRESHOLD = 56;
 let followOutput = true;
 let programmaticChatScroll = false;
@@ -79,11 +80,13 @@ function connectEvents() {
   });
 }
 
-async function loadEffort() {
+async function loadEffort(shouldApply = () => true) {
+  const generation = ++effortRequestGeneration;
   try {
     const res = await fetch('/api/effort');
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'effort: ' + res.status);
+    if (generation !== effortRequestGeneration || !shouldApply()) return;
     effortState = data;
     const btn = document.getElementById('effortBtn');
     if (!btn) return;
@@ -93,6 +96,7 @@ async function loadEffort() {
     if (label) label.textContent = data.effort === 'default' ? 'Default effort' : data.effort.charAt(0).toUpperCase() + data.effort.slice(1);
     paintEffortMenu();
   } catch (_) {
+    if (generation !== effortRequestGeneration || !shouldApply()) return;
     const btn = document.getElementById('effortBtn');
     if (btn) btn.style.display = 'none';
   }
@@ -624,12 +628,14 @@ function toggleContextRow(head) {
   head.querySelector('.context-chevron').textContent = open ? '\u25BE' : '\u25B8';
 }
 
-async function restoreCompactionHistory() {
-  if (!currentSessionId || typeof coalesceTraceCompactions !== 'function') return;
+async function restoreCompactionHistory(sessionId = currentSessionId, shouldApply = () => true) {
+  const requestedSessionId = String(sessionId || '');
+  if (!requestedSessionId || typeof coalesceTraceCompactions !== 'function') return;
   try {
-    const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(currentSessionId) + '&limit=2000');
+    const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(requestedSessionId) + '&limit=2000');
     if (!res.ok) return;
     const data = await res.json();
+    if (!shouldApply() || requestedSessionId !== String(currentSessionId || '')) return;
     const completed = coalesceTraceCompactions(data.events || []).filter(ev => ev.kind === 'context_compacted');
     compactionStatusEl = null;
     for (const ev of completed) {
@@ -1429,6 +1435,7 @@ function newChat() {
     showToast('Stop the current turn before starting a new session');
     return;
   }
+  if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();
   currentSessionId = null;
   if (typeof resetArtifactsForSession === 'function') resetArtifactsForSession();
   queuedTurns = [];

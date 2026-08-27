@@ -136,6 +136,19 @@ func shortToolDesc(full string) string {
 	return strings.TrimSpace(full)
 }
 
+// isTraceChildTool identifies tools that execute one or more nested agent
+// loops. Their provider-facing tool_use_id is public presentation metadata,
+// not a safe process-wide owner key; dispatch assigns a separate invocation ID
+// before emitting ToolStart and propagates it through the Execute context.
+func isTraceChildTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "agent", "fork", "ralph":
+		return true
+	default:
+		return false
+	}
+}
+
 // executeBatch runs every tool_use in toolUses, returning the matching
 // tool_result blocks. Three phases:
 //
@@ -159,12 +172,15 @@ func shortToolDesc(full string) string {
 func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, out chan<- Event, tc HookContext) ([]llm.ContentBlock, error) {
 	results := make([]llm.ContentBlock, len(toolUses))
 	type job struct {
-		idx       int
-		blk       llm.ContentBlock
-		t         tools.Tool
-		early     *llm.ContentBlock // set when pre-check decided result
-		ready     bool              // true once pre-checks all pass
-		startedAt time.Time         // set when EventToolStart is emitted; used to populate Event.Elapsed on result
+		idx                     int
+		blk                     llm.ContentBlock
+		t                       tools.Tool
+		early                   *llm.ContentBlock // set when pre-check decided result
+		ready                   bool              // true once pre-checks all pass
+		startedAt               time.Time         // set when EventToolStart is emitted; used to populate Event.Elapsed on result
+		traceInvocationID       string
+		traceParentInvocationID string
+		traceCallID             string
 	}
 	jobs := make([]*job, len(toolUses))
 
@@ -174,6 +190,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	// before launching any goroutine.
 	asks := make([]*job, 0)
 	for i, b := range toolUses {
+		traceCallID := NewTraceInvocationID()
 		// Synthetic ToolSearch (lazy-MCP-schema feature, Task #72) is
 		// not in the Registry — handle it inline.
 		if b.ToolName == "ToolSearch" {
@@ -181,8 +198,9 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			results[i] = handleToolSearch(l, b)
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
-				ToolResult: &ToolResult{Output: results[i].ToolResult, IsError: results[i].IsError},
-				Elapsed:    time.Since(tsStart),
+				ToolResult:  &ToolResult{Output: results[i].ToolResult, IsError: results[i].IsError},
+				Elapsed:     time.Since(tsStart),
+				TraceCallID: traceCallID,
 			})
 			continue
 		}
@@ -194,17 +212,25 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			}
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
-				ToolResult: &ToolResult{Output: "unknown tool", IsError: true},
+				ToolResult:  &ToolResult{Output: "unknown tool", IsError: true},
+				TraceCallID: traceCallID,
 			})
 			continue
 		}
 
-		j := &job{idx: i, blk: b, t: t}
+		j := &job{idx: i, blk: b, t: t, traceCallID: traceCallID}
+		if isTraceChildTool(b.ToolName) {
+			j.traceInvocationID = NewTraceInvocationID()
+			j.traceParentInvocationID = TraceInvocationIDFromContext(ctx)
+		}
 		jobs[i] = j
 
 		emit(ctx, out, Event{
 			Kind: EventToolStart, ToolUseID: b.ToolUseID,
 			ToolName: b.ToolName, ToolInput: b.ToolInput,
+			TraceInvocationID:       j.traceInvocationID,
+			TraceParentInvocationID: j.traceParentInvocationID,
+			TraceCallID:             j.traceCallID,
 		})
 
 		// PreToolUse hook can short-circuit (Output), rewrite input
@@ -234,8 +260,11 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 					}
 					emit(ctx, out, Event{
 						Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
-						ToolResult: &ToolResult{Output: mod.Output.Content, IsError: mod.Output.IsError},
-						Elapsed:    time.Since(hookStart),
+						ToolResult:              &ToolResult{Output: mod.Output.Content, IsError: mod.Output.IsError},
+						Elapsed:                 time.Since(hookStart),
+						TraceInvocationID:       j.traceInvocationID,
+						TraceParentInvocationID: j.traceParentInvocationID,
+						TraceCallID:             j.traceCallID,
 					})
 					j.early = &blkOut
 					continue
@@ -270,7 +299,10 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			}
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
-				ToolResult: &ToolResult{Output: tuiMsg, IsError: true},
+				ToolResult:              &ToolResult{Output: tuiMsg, IsError: true},
+				TraceInvocationID:       j.traceInvocationID,
+				TraceParentInvocationID: j.traceParentInvocationID,
+				TraceCallID:             j.traceCallID,
 			})
 			j.early = &blkOut
 			continue
@@ -291,6 +323,15 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		ar := l.askPermissionPending(ctx, j.blk, out, remaining)
 		if !ar.proceed {
 			j.early = ar.earlyReturn
+			if j.early != nil {
+				emit(ctx, out, Event{
+					Kind: EventToolResult, ToolUseID: j.blk.ToolUseID, ToolName: j.blk.ToolName,
+					ToolResult:              &ToolResult{Output: j.early.ToolResult, IsError: j.early.IsError},
+					TraceInvocationID:       j.traceInvocationID,
+					TraceParentInvocationID: j.traceParentInvocationID,
+					TraceCallID:             j.traceCallID,
+				})
+			}
 			continue
 		}
 		j.ready = true
@@ -321,7 +362,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		wg.Add(1)
 		go func(j *job) {
 			defer wg.Done()
-			blk := l.runExecute(ctx, j.t, j.blk, out, tc)
+			blk := l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 			mu.Lock()
 			results[j.idx] = blk
 			mu.Unlock()
@@ -337,7 +378,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		go func() {
 			defer wg.Done()
 			for _, j := range queueJobs {
-				blk := l.runExecute(ctx, j.t, j.blk, out, tc)
+				blk := l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 				mu.Lock()
 				results[j.idx] = blk
 				mu.Unlock()
@@ -368,7 +409,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	// graph readable and lets future scheduling policy hook in here
 	// (e.g., rate-limiting background spawns).
 	for _, j := range bgJobs {
-		results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc)
+		results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 	}
 
 	wg.Wait()
@@ -387,7 +428,10 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		for _, j := range exclJobs {
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: j.blk.ToolUseID, ToolName: j.blk.ToolName,
-				ToolResult: &ToolResult{Output: "skipped: turn interrupted before this tool ran", IsError: true},
+				ToolResult:              &ToolResult{Output: "skipped: turn interrupted before this tool ran", IsError: true},
+				TraceInvocationID:       j.traceInvocationID,
+				TraceParentInvocationID: j.traceParentInvocationID,
+				TraceCallID:             j.traceCallID,
 			})
 			results[j.idx] = llm.ContentBlock{
 				Type: "tool_result", ToolUseID: j.blk.ToolUseID,
@@ -396,7 +440,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		}
 	} else {
 		for _, j := range exclJobs {
-			results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc)
+			results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 		}
 	}
 
@@ -455,7 +499,7 @@ func safeToolExecute(ctx context.Context, t tools.Tool, in map[string]any) (res 
 //
 // Returns the matching tool_result block. All error paths produce a
 // well-formed block so the LLM never sees a missing tool_result.
-func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBlock, out chan<- Event, tc HookContext) llm.ContentBlock {
+func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBlock, out chan<- Event, tc HookContext, traceInvocationID, traceParentInvocationID, traceCallID string) llm.ContentBlock {
 	// Tag ctx with the parent's event out-channel so sub-tools (Agent)
 	// can forward intermediate events for live UI updates.
 	toolCtx := WithEventOut(ctx, out)
@@ -487,6 +531,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// TUI can attribute progress to the right SubAgentInfo pill when
 	// multiple sub-agents run in parallel. Other tools ignore it.
 	toolCtx = WithParentToolUseID(toolCtx, blk.ToolUseID)
+	toolCtx = WithTraceInvocationID(toolCtx, traceInvocationID)
 
 	// Honor InterruptBlock: tools that declare InterruptBlock want to
 	// finish their current invocation even if the parent ctx gets
@@ -578,8 +623,11 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		s := err.Error()
 		emit(ctx, out, Event{
 			Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
-			ToolResult: &ToolResult{Output: s, IsError: true},
-			Elapsed:    execElapsed,
+			ToolResult:              &ToolResult{Output: s, IsError: true},
+			Elapsed:                 execElapsed,
+			TraceInvocationID:       traceInvocationID,
+			TraceParentInvocationID: traceParentInvocationID,
+			TraceCallID:             traceCallID,
 		})
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: blk.ToolUseID,
@@ -603,7 +651,10 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 			Display:      res.Display,
 			Presentation: clonePresentation(res.Presentation),
 		},
-		Elapsed: execElapsed,
+		Elapsed:                 execElapsed,
+		TraceInvocationID:       traceInvocationID,
+		TraceParentInvocationID: traceParentInvocationID,
+		TraceCallID:             traceCallID,
 	})
 
 	// Ingestion-time spill (claude-code's maxResultSizeChars, Tool.ts:456):

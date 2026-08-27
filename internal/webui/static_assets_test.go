@@ -155,6 +155,28 @@ func TestDesktopChromeOmitsRetiredBrandAndSessionMetadata(t *testing.T) {
 	}
 }
 
+func TestContextMeterDistinguishesSmallAndInactiveContexts(t *testing.T) {
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/app.js", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /app.js = %d", rr.Code)
+	}
+	app := rr.Body.String()
+	for _, want := range []string{
+		"const viewingNoSession = !selectedSessionId;",
+		"if (viewingNoSession)",
+		"const viewingInactiveSession =",
+		"meter.textContent = dict.context + ' —';",
+		"used > 0 && fraction < 0.01",
+		"'<1%'",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("app.js missing context-meter behavior %q", want)
+		}
+	}
+}
+
 func TestComposerAddMenuPreservesAttachmentAndKeepsSlashCommandsIndependent(t *testing.T) {
 	s, _ := testServer(t)
 	get := func(path string) string {
@@ -456,7 +478,7 @@ func TestCompactionPresentationUsesOnePersistentRow(t *testing.T) {
 		"function upsertCompactionRow(",
 		"upsertCompactionRow(uiText('Compacting context…', '正在压缩上下文…')",
 		"compactionStatusEl.classList.add('complete');",
-		"async function restoreCompactionHistory()",
+		"async function restoreCompactionHistory(sessionId = currentSessionId, shouldApply = () => true)",
 	} {
 		if !strings.Contains(chat, want) {
 			t.Fatalf("chat.js missing persistent compaction presentation %q", want)
@@ -464,7 +486,7 @@ func TestCompactionPresentationUsesOnePersistentRow(t *testing.T) {
 	}
 
 	sessions := get("/sessions.js")
-	if !strings.Contains(sessions, "await restoreCompactionHistory();") {
+	if !strings.Contains(sessions, "await restoreCompactionHistory(id, isLatest);") {
 		t.Fatal("resuming a saved session does not restore its compaction disclosure rows")
 	}
 
@@ -532,6 +554,97 @@ func TestSessionRenameUsesStyledDialogAndExpandControlIsTextOnly(t *testing.T) {
 	for _, want := range []string{"border: 0;", "background: transparent;", "box-shadow: none;"} {
 		if !strings.Contains(expandRule, want) {
 			t.Fatalf("session expand/collapse control is not text-only at line %d; missing %q in %q", strings.Count(style[:expandStart], "\n")+1, want, expandRule)
+		}
+	}
+}
+
+func TestWorkspaceActionsUseStyledDialogsAndResumeRefreshesStatus(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	sessions := get("/sessions.js")
+	for _, want := range []string{
+		"let workspaceRenameDialog = null;",
+		"let workspaceRemoveDialog = null;",
+		"function openWorkspaceRenameDialog(",
+		"async function submitWorkspaceRename(",
+		"function openWorkspaceRemoveDialog(",
+		"async function submitWorkspaceRemoval(",
+		`class="workspace-dialog workspace-rename-dialog" role="dialog"`,
+		`class="workspace-dialog workspace-remove-dialog" role="alertdialog"`,
+		`workspace-rename-error" role="alert"`,
+		`workspace-remove-error" role="alert"`,
+		"await pollStatus(isLatest);",
+	} {
+		if !strings.Contains(sessions, want) {
+			t.Fatalf("sessions.js missing workspace-dialog/status-refresh contract %q", want)
+		}
+	}
+	if strings.Contains(sessions, "prompt('Rename workspace'") {
+		t.Fatal("workspace rename still relies on window.prompt, which is unavailable in the embedded WebView")
+	}
+	if strings.Contains(sessions, "confirm('Remove \"") {
+		t.Fatal("workspace removal still relies on window.confirm, which is unavailable in the embedded WebView")
+	}
+
+	style := get("/style.css")
+	for _, want := range []string{
+		".workspace-dialog-overlay {",
+		".workspace-dialog {",
+		".workspace-dialog-input {",
+		".workspace-remove-confirm {",
+	} {
+		if !strings.Contains(style, want) {
+			t.Fatalf("style.css missing workspace dialog style %q", want)
+		}
+	}
+}
+
+func TestSessionResumeIgnoresStaleAsyncResponses(t *testing.T) {
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions.js", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /sessions.js = %d", rr.Code)
+	}
+	sessions := rr.Body.String()
+	for _, want := range []string{
+		"let resumeSessionGeneration = 0;",
+		"function invalidateSessionAsyncLoads()",
+		"const generation = ++resumeSessionGeneration;",
+		"const isLatest = () => generation === resumeSessionGeneration;",
+		"if (!isLatest()) return;",
+		"loadTrace(false, id, isLatest);",
+		"await restoreCompactionHistory(id, isLatest);",
+		"await loadEffort(isLatest);",
+		"await pollStatus(isLatest);",
+		"await loadArtifactsForSession(id, { rebuildCards: true });",
+		"bar.removeAttribute('aria-label');",
+		"if (isLatest()) showError('Unable to resume this session.');",
+	} {
+		if !strings.Contains(sessions, want) {
+			t.Fatalf("sessions.js missing stale-resume guard %q", want)
+		}
+	}
+	if got := strings.Count(sessions, "if (!isLatest()) return;"); got < 7 {
+		t.Fatalf("resumeSession has %d stale-response guards, want at least 7 async boundaries", got)
+	}
+	for asset, want := range map[string]string{
+		"/app.js":   "generation !== statusRequestGeneration || !shouldApply()",
+		"/chat.js":  "if (!shouldApply() || requestedSessionId !== String(currentSessionId || '')) return;",
+		"/trace.js": "async function loadTrace(loadOlder = false, sessionId = currentSessionId, shouldApply = () => true)",
+	} {
+		rr = httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, asset, nil))
+		if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), want) {
+			t.Fatalf("%s missing guarded session async helper %q", asset, want)
 		}
 	}
 }

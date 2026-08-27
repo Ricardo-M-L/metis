@@ -7,6 +7,7 @@ package agent
 // reminders.
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ import (
 func TestInjectPeerMessages_NilInboxIsNoOp(t *testing.T) {
 	l := &Loop{}
 	before := len(l.Messages)
-	l.injectPeerMessages(nil)
+	l.injectPeerMessages(context.Background(), nil)
 	if len(l.Messages) != before {
 		t.Errorf("nil PeerInbox should not modify Messages; before=%d after=%d", before, len(l.Messages))
 	}
@@ -34,7 +35,7 @@ func TestInjectPeerMessages_EmptyDrainIsNoOp(t *testing.T) {
 	ch := make(chan PeerMessage, 4)
 	l := &Loop{PeerInbox: ch}
 	before := len(l.Messages)
-	l.injectPeerMessages(nil)
+	l.injectPeerMessages(context.Background(), nil)
 	if len(l.Messages) != before {
 		t.Errorf("empty drain should not modify Messages; before=%d after=%d", before, len(l.Messages))
 	}
@@ -47,7 +48,7 @@ func TestInjectPeerMessages_SingleMessage(t *testing.T) {
 	ch := make(chan PeerMessage, 4)
 	ch <- PeerMessage{From: "alice", Body: "found the bug", Sent: time.Now()}
 	l := &Loop{PeerInbox: ch}
-	l.injectPeerMessages(nil)
+	l.injectPeerMessages(context.Background(), nil)
 
 	if len(l.Messages) != 1 {
 		t.Fatalf("expected 1 injected message; got %d", len(l.Messages))
@@ -77,7 +78,7 @@ func TestInjectPeerMessages_MultipleMessagesCollapse(t *testing.T) {
 	ch <- PeerMessage{From: "bob", Body: "msg-2", Sent: time.Now()}
 	ch <- PeerMessage{From: "carol", Body: "msg-3", Sent: time.Now()}
 	l := &Loop{PeerInbox: ch}
-	l.injectPeerMessages(nil)
+	l.injectPeerMessages(context.Background(), nil)
 
 	if len(l.Messages) != 1 {
 		t.Fatalf("3 peer messages should collapse to 1 user message; got %d", len(l.Messages))
@@ -95,5 +96,24 @@ func TestInjectPeerMessages_MultipleMessagesCollapse(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body should include payload %q; got %q", want, body)
 		}
+	}
+}
+
+func TestInjectPeerMessagesPreservesChildTraceOrigin(t *testing.T) {
+	ch := make(chan PeerMessage, 1)
+	ch <- PeerMessage{From: "alice", Body: "done", Sent: time.Now()}
+	out := make(chan Event, 1)
+	l := &Loop{PeerInbox: ch}
+	ctx := WithParentToolUseID(context.Background(), "agent-public-id")
+	ctx = WithTraceInvocationID(ctx, "agent-internal-id")
+
+	l.injectPeerMessages(ctx, out)
+
+	ev := <-out
+	if ev.SubAgentParentID != "agent-public-id" {
+		t.Fatalf("public parent = %q, want agent-public-id", ev.SubAgentParentID)
+	}
+	if ev.TraceInvocationID != "agent-internal-id" {
+		t.Fatalf("trace invocation = %q, want agent-internal-id", ev.TraceInvocationID)
 	}
 }

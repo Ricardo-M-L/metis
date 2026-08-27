@@ -1070,13 +1070,19 @@ func runTurnAsync(
 	turnCtx context.Context,
 	cancel context.CancelFunc,
 	loop *agent.Loop,
+	sessionID string,
 	eventCh chan<- agent.Event,
 	doneCh chan<- error,
 ) {
 	defer cancel()
 	events := make(chan agent.Event, eventBufferSize())
 	done := make(chan error, 1)
-	go func() { done <- loop.Run(turnCtx, events); close(events) }()
+	go func() {
+		done <- runtime.RunWithTraceTurn(turnCtx, sessionID, func(boundCtx context.Context) error {
+			return loop.Run(boundCtx, events)
+		})
+		close(events)
+	}()
 	for ev := range events {
 		// Forward to the TUI, but never wedge here on a full eventCh: if the
 		// consumer (bubbletea Update) has stopped draining — frozen, quitting,

@@ -1162,8 +1162,12 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	ownsCompact := l.compactMu.TryLock()
 	l.mu.Lock()
 	l.restoreMessagesLocked(messages)
-	l.estTokens.Store(0)
 	l.requestOverheadTokens.Store(0)
+	// ResetSession can be followed immediately by a non-blocking status poll.
+	// Prime the fallback from the restored history while mu is held so a
+	// concurrent compaction/lifecycle write lock cannot make a real session
+	// appear to have an empty context window.
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)))
 	l.todoWriteIter = 0
 	l.todoReminderIter = 0
 	l.todoReconciledThisTurn = false
@@ -1492,15 +1496,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// The model sees these as system-reminders telling it which
 		// jobs finished (and whether to BashOutput-read the result),
 		// matching claude-code's <task_notification> envelope.
-		l.injectJobNotifications(out)
-		l.injectPeerMessages(out)
-		l.injectSubAgentNotifications(out)
-		l.injectDreamNotifications(out)
+		l.injectJobNotifications(ctx, out)
+		l.injectPeerMessages(ctx, out)
+		l.injectSubAgentNotifications(ctx, out)
+		l.injectDreamNotifications(ctx, out)
 		// Same pattern for Monitor pattern-matches — pulls every
 		// MonitorEvent buffered since last iter and injects them as
 		// <monitor_event> system-reminders. Cheap when no Monitor is
 		// active (nil registry → instant return).
-		l.injectMonitorEvents(out)
+		l.injectMonitorEvents(ctx, out)
 		// Re-surface the todo list when it's gone untouched for a while
 		// with incomplete items — claude-code's todo_reminder mechanism,
 		// the thing that actually keeps tasks from being left stuck
@@ -1849,9 +1853,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				const reason = "skipped: EnterPlanMode was denied or did not activate plan mode; sibling execution was refused"
 				skipped := make([]llm.ContentBlock, len(otherTools))
 				for i, toolUse := range otherTools {
+					traceCallID := NewTraceInvocationID()
 					emit(ctx, out, Event{
 						Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
 						ToolName: toolUse.ToolName, ToolInput: toolUse.ToolInput,
+						TraceCallID: traceCallID,
 					})
 					skipped[i] = llm.ContentBlock{
 						Type: "tool_result", ToolUseID: toolUse.ToolUseID,
@@ -1859,7 +1865,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					}
 					emit(ctx, out, Event{
 						Kind: EventToolResult, ToolUseID: toolUse.ToolUseID, ToolName: toolUse.ToolName,
-						ToolResult: &ToolResult{Output: reason, IsError: true},
+						ToolResult:  &ToolResult{Output: reason, IsError: true},
+						TraceCallID: traceCallID,
 					})
 				}
 				mergeBatchResults(originalToolUses, otherTools, skipped, resultSlots, resultFilled)
@@ -1940,9 +1947,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				const reason = "skipped: ExitPlanMode is an approval boundary; sibling tool calls from the pre-approval batch were not executed and must be reissued after the approval result"
 				results := make([]llm.ContentBlock, len(approvalBoundarySiblings))
 				for i, toolUse := range approvalBoundarySiblings {
+					traceCallID := NewTraceInvocationID()
 					emit(ctx, out, Event{
 						Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
 						ToolName: toolUse.ToolName, ToolInput: toolUse.ToolInput,
+						TraceCallID: traceCallID,
 					})
 					results[i] = llm.ContentBlock{
 						Type: "tool_result", ToolUseID: toolUse.ToolUseID,
@@ -1950,7 +1959,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					}
 					emit(ctx, out, Event{
 						Kind: EventToolResult, ToolUseID: toolUse.ToolUseID, ToolName: toolUse.ToolName,
-						ToolResult: &ToolResult{Output: reason, IsError: true},
+						ToolResult:  &ToolResult{Output: reason, IsError: true},
+						TraceCallID: traceCallID,
 					})
 				}
 				mergeBatchResults(originalToolUses, approvalBoundarySiblings, results, resultSlots, resultFilled)
@@ -1982,9 +1992,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					results := make([]llm.ContentBlock, len(writeTools))
 					for i, toolUse := range writeTools {
 						const reason = "denied: plan mode has no permission gate; refusing to execute a potentially mutating tool"
+						traceCallID := NewTraceInvocationID()
 						emit(ctx, out, Event{
 							Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
 							ToolName: toolUse.ToolName, ToolInput: toolUse.ToolInput,
+							TraceCallID: traceCallID,
 						})
 						results[i] = llm.ContentBlock{
 							Type: "tool_result", ToolUseID: toolUse.ToolUseID,
@@ -1992,7 +2004,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 						}
 						emit(ctx, out, Event{
 							Kind: EventToolResult, ToolUseID: toolUse.ToolUseID, ToolName: toolUse.ToolName,
-							ToolResult: &ToolResult{Output: reason, IsError: true},
+							ToolResult:  &ToolResult{Output: reason, IsError: true},
+							TraceCallID: traceCallID,
 						})
 					}
 					mergeBatchResults(originalToolUses, writeTools, results, resultSlots, resultFilled)
@@ -2883,6 +2896,13 @@ func emit(ctx context.Context, ch chan<- Event, ev Event) {
 	if ev.SubAgentParentID == "" {
 		ev.SubAgentParentID = ParentToolUseIDFromContext(ctx)
 	}
+	// Internal trace ownership is independent of the provider tool_use_id.
+	// Child loops inherit this process-unique value through context, so their
+	// late tokens/text cannot be reassigned when Desktop switches sessions or
+	// when another provider response reuses the same public ID.
+	if ev.TraceInvocationID == "" {
+		ev.TraceInvocationID = TraceInvocationIDFromContext(ctx)
+	}
 	if ch == nil {
 		return
 	}
@@ -2890,9 +2910,33 @@ func emit(ctx context.Context, ch chan<- Event, ev Event) {
 		ch <- ev
 		return
 	}
+	// Usage is durable accounting, not an expendable rendering delta. If the
+	// provider completed just as Stop canceled the turn, both a writable send
+	// and ctx.Done can be ready; a single select would choose randomly and can
+	// make Desktop miss the usage that the trace hook still records. Prefer an
+	// immediately writable consumer without ever delaying cancellation.
+	if ev.Kind == EventTokens && tryEmitEvent(ch, ev) {
+		notifyTraceHook(ev)
+		return
+	}
 	select {
 	case ch <- ev:
 	case <-ctx.Done():
+		// The consumer may have freed capacity concurrently with cancellation.
+		// Make one final best-effort delivery for usage only; a full or absent
+		// receiver must never hold up cancellation.
+		if ev.Kind == EventTokens {
+			tryEmitEvent(ch, ev)
+		}
 	}
 	notifyTraceHook(ev)
+}
+
+func tryEmitEvent(ch chan<- Event, ev Event) bool {
+	select {
+	case ch <- ev:
+		return true
+	default:
+		return false
+	}
 }

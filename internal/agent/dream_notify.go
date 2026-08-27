@@ -27,7 +27,7 @@ import (
 //
 // No-op when DreamNotify is nil (sub-agents, headless tests, auto-
 // memory disabled) or empty.
-func (l *Loop) injectDreamNotifications(out chan<- Event) {
+func (l *Loop) injectDreamNotifications(ctx context.Context, out chan<- Event) {
 	if l.DreamNotify == nil {
 		return
 	}
@@ -38,7 +38,7 @@ func (l *Loop) injectDreamNotifications(out chan<- Event) {
 	l.appendInjectedMessage(formatDreamNotifications(notifs))
 	// Mirror surface to the TUI so the user sees the same "memory
 	// updated" banner the model is reacting to.
-	emit(context.Background(), out, Event{
+	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[auto-memory] %d consolidation(s) completed", len(notifs)),
 	})

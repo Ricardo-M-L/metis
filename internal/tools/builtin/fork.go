@@ -228,9 +228,15 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	sub.AppendUser(buildForkDirective(directive))
 
 	childCtx := context.WithValue(ctx, forkDepthKey{}, depth+1)
+	agent.TraceInvocationStarted(ctx)
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
+		// Execute returns as soon as it consumes EventError, but Loop.Run may
+		// still be unwinding hooks and deferred cleanup on this goroutine. Keep
+		// the trace owner alive for that actual child lifetime so terminal child
+		// events cannot be orphaned behind an already-finished Fork result.
+		defer agent.TraceInvocationEnded(childCtx)
 		done <- sub.Run(childCtx, events)
 		close(events)
 	}()

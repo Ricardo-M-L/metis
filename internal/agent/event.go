@@ -2,10 +2,13 @@ package agent
 
 import (
 	"context"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/budget"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/google/uuid"
 )
 
 // EventKind enumerates the event types emitted by the agent loop.
@@ -147,6 +150,14 @@ const (
 	// Appended here (rather than beside EventCompactionStart) to preserve
 	// the numeric values of existing EventKind constants.
 	EventCompactionEnd
+
+	// Internal trace-invocation lifecycle. These events are delivered only to
+	// the process trace hook (never to the user-facing event channel) and let
+	// the trace adapter distinguish a child that really started from an Agent /
+	// Fork / Ralph call that permission or a hook short-circuited. Keep them at
+	// the end so every externally consumed EventKind value remains stable.
+	EventTraceInvocationStart
+	EventTraceInvocationEnd
 )
 
 // agentNameKey carries the current agent's team identity (the `name` param
@@ -277,6 +288,46 @@ func WithCwd(ctx context.Context, dir string) context.Context {
 // process of elimination — wrong as soon as two sub-agents run in
 // parallel.
 type parentToolUseIDKey struct{}
+
+// traceInvocationIDKey is the process-unique execution identity of the child
+// invocation whose events a context emits. It is deliberately independent of
+// the provider's tool_use_id: providers may reuse IDs across sessions, turns,
+// retries, Ralph rounds, or even parallel responses in one process.
+type traceInvocationIDKey struct{}
+
+var traceInvocationSequence atomic.Uint64
+var traceInvocationProcessPrefix = uuid.NewString()
+
+// NewTraceInvocationID returns an identifier unique for this process. The
+// trace adapter is process-local too, so an atomic sequence is sufficient and
+// avoids randomness/error handling in the tool-dispatch hot path.
+func NewTraceInvocationID() string {
+	return "trace-inv-" + traceInvocationProcessPrefix + "-" + strconv.FormatUint(traceInvocationSequence.Add(1), 10)
+}
+
+// WithTraceInvocationID pins child events emitted through ctx to one internal
+// trace invocation. Public UI attribution continues to use
+// SubAgentParentID/ParentToolUseID; this value is observability-only.
+func WithTraceInvocationID(ctx context.Context, id string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, traceInvocationIDKey{}, id)
+}
+
+// TraceInvocationIDFromContext returns the internal trace identity, if any.
+func TraceInvocationIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(traceInvocationIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // WithParentToolUseID stamps ctx with the parent tool_use_id. dispatch.go
 // calls this in runExecute right before tool.Execute. Tools that don't
@@ -523,6 +574,20 @@ type Event struct {
 	//
 	// Empty means "this event came from the main loop, not a sub-agent."
 	SubAgentParentID string
+
+	// TraceInvocationID is a process-unique internal execution identity. It
+	// MUST NOT be rendered as the public sub-agent parent: SubAgentParentID
+	// remains the provider tool_use_id used by the UI. TraceParentInvocationID
+	// links a nested Agent/Fork/Ralph ToolStart to the invocation of the loop
+	// that emitted it, allowing the trace adapter to inherit an immutable
+	// session+turn without consulting whichever Desktop session is active now.
+	TraceInvocationID       string
+	TraceParentInvocationID string
+	// TraceCallID uniquely identifies this specific tool-call occurrence.
+	// Provider tool_use_id values can repeat across responses and process
+	// restarts; persistence uses this durable-in-session key to pair one
+	// tool_start with its own result without merging later calls.
+	TraceCallID string
 }
 
 // ToolCall represents a tool the model wants to invoke.

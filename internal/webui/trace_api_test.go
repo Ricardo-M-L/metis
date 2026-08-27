@@ -228,6 +228,45 @@ func TestTraceEndpointServesPerTurnMessageMetrics(t *testing.T) {
 	}
 }
 
+func TestTraceTurnMetricsRequireTopLevelLoopDone(t *testing.T) {
+	base := time.Date(2026, time.August, 27, 16, 0, 0, 0, time.UTC)
+	nodes := []session.TracedNode{
+		{Event: session.TraceEvent{Turn: 1, Kind: "user", TS: base}},
+		{Event: session.TraceEvent{Turn: 1, Kind: "tokens", TS: base.Add(time.Second), Text: "input=10 output=2 cache_write=0 cache_read=8", SubAgentOf: "agent-1"}, Depth: 1},
+		{Event: session.TraceEvent{Turn: 1, Kind: "loop_done", TS: base.Add(2 * time.Second), SubAgentOf: "agent-1"}, Depth: 1},
+	}
+	if got := traceTurnMetrics(nodes); len(got) != 0 {
+		t.Fatalf("child LoopDone completed a top-level turn: %+v", got)
+	}
+
+	nodes = append(nodes, session.TracedNode{Event: session.TraceEvent{
+		Turn: 1, Kind: "loop_done", TS: base.Add(3 * time.Second),
+	}})
+	got := traceTurnMetrics(nodes)
+	if len(got) != 1 || got[0].Turn != 1 || got[0].InputTokens != 10 || got[0].OutputTokens != 2 {
+		t.Fatalf("top-level completion metrics = %+v", got)
+	}
+}
+
+func TestTraceTurnMetricsTreatOnlyTopLevelErrorAsTerminal(t *testing.T) {
+	base := time.Date(2026, time.August, 27, 16, 30, 0, 0, time.UTC)
+	nodes := []session.TracedNode{
+		{Event: session.TraceEvent{Turn: 1, Kind: "user", TS: base}},
+		{Event: session.TraceEvent{Turn: 1, Kind: "error", TS: base.Add(time.Second), SubAgentOf: "agent-1"}, Depth: 1},
+	}
+	if got := traceTurnMetrics(nodes); len(got) != 0 {
+		t.Fatalf("child error completed a top-level turn: %+v", got)
+	}
+
+	nodes = append(nodes, session.TracedNode{Event: session.TraceEvent{
+		Turn: 1, Kind: "error", TS: base.Add(2 * time.Second), Text: "provider failed",
+	}})
+	got := traceTurnMetrics(nodes)
+	if len(got) != 1 || got[0].Turn != 1 || got[0].CompletedAt != base.Add(2*time.Second).Format(time.RFC3339) {
+		t.Fatalf("top-level error terminal metrics = %+v", got)
+	}
+}
+
 func TestTraceEndpointPrefersPersistedMessageMetrics(t *testing.T) {
 	oldAdapter := rtpkg.CurrentTraceAdapter()
 	defer rtpkg.SetTraceAdapter(oldAdapter)

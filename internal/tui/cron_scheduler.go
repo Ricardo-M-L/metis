@@ -116,6 +116,6 @@ func (m *Model) beginTurn(text string) tea.Cmd {
 
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.turnCancel = cancel
-	go runTurnAsync(turnCtx, cancel, m.loop, m.eventCh, m.doneCh)
+	go runTurnAsync(turnCtx, cancel, m.loop, m.sessionID, m.eventCh, m.doneCh)
 	return tickCmd
 }

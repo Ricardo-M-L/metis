@@ -17,11 +17,14 @@ func TestPrepareACPLoopDefersMissingCredentialUntilPrompt(t *testing.T) {
 	t.Setenv("GEMINI_API_KEY", "")
 	t.Setenv("GOOGLE_API_KEY", "")
 
-	loop, cleanup, err := prepareACPLoop(context.Background(), &cliFlags{bare: true, noAuthWizard: true})
+	loop, sessionID, cleanup, err := prepareACPLoop(context.Background(), &cliFlags{bare: true, noAuthWizard: true})
 	if err != nil {
 		t.Fatalf("ACP bootstrap should allow credential-free initialize: %v", err)
 	}
 	defer cleanup()
+	if sessionID != "" {
+		t.Fatalf("auth-required fallback sessionID = %q, want empty", sessionID)
+	}
 	if loop == nil || loop.Provider == nil {
 		t.Fatal("ACP bootstrap returned no loop/provider")
 	}
@@ -34,7 +37,7 @@ func TestPrepareACPLoopDefersMissingCredentialUntilPrompt(t *testing.T) {
 
 func TestPrepareACPLoopDoesNotHideInvalidProvider(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
-	_, _, err := prepareACPLoop(context.Background(), &cliFlags{
+	_, _, _, err := prepareACPLoop(context.Background(), &cliFlags{
 		bare: true, noAuthWizard: true, provider: "not-a-provider", providerSet: true,
 	})
 	if err == nil || errors.Is(err, config.ErrMissingAPIKey) || !strings.Contains(err.Error(), "unknown provider") {

@@ -11,6 +11,7 @@ let activeWorkspaceId = '';
 let currentSessionId = null;
 let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN' };
 let lastStatusSnapshot = null;
+let statusRequestGeneration = 0;
 
 // The browser UI lives in a loopback iframe inside the Wails shell. This
 // narrow request bridge intentionally exposes three named native actions;
@@ -294,11 +295,13 @@ function showToast(msg) {
 
 // Live task progress chip ("N sub-agents ~ M background tasks"),
 // polled every 3s like the harness GUI status bar.
-async function pollStatus() {
+async function pollStatus(shouldApply = () => true) {
+  const generation = ++statusRequestGeneration;
   try {
     const res = await fetch('/api/status');
     if (!res.ok) return;
     const d = await res.json();
+    if (generation !== statusRequestGeneration || !shouldApply()) return;
     lastStatusSnapshot = d;
     renderStatusSnapshot(d);
   } catch (_) { /* status is best-effort */ }
@@ -325,19 +328,38 @@ function renderStatusSnapshot(d) {
     if (meter) {
       const used = Number(d.contextUsed) || 0;
       const limit = Number(d.contextWindow) || 0;
-      if (limit > 0) {
+      const activeSessionId = String(d.activeSessionId || '');
+      const selectedSessionId = String(currentSessionId || (turnRunning ? runningSessionId : '') || '');
+      const viewingNoSession = !selectedSessionId;
+      const viewingInactiveSession = !!(selectedSessionId && activeSessionId && selectedSessionId !== activeSessionId);
+      if (viewingNoSession) {
+        // The blank new-session composer does not own the backend Loop's
+        // previous context. Keep the meter hidden until a turn starts or the
+        // user selects a saved transcript.
+        meter.style.display = 'none';
+        meter.classList.remove('warn');
+      } else if (viewingInactiveSession) {
+        // /api/status reports the one active Loop. Do not attribute that
+        // background session's pressure to a different transcript that the
+        // user is only viewing.
+        meter.style.display = '';
+        meter.textContent = dict.context + ' —';
+        meter.title = dict.context;
+        meter.classList.remove('warn');
+      } else if (limit > 0) {
         const fraction = used / limit;
         // Context pressure can temporarily estimate above the provider limit
         // while compaction is running or when fixed tool/system overhead is
         // irreducible. A progress badge must remain a percentage, not display
         // values such as 318%; preserve the raw token counts in the tooltip.
         const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+        const percentLabel = used > 0 && fraction < 0.01 ? '<1%' : percent + '%';
         const compactAtTokens = Number(d.compactAtTokens) || 0;
         const compactAt = compactAtTokens > 0
           ? compactAtTokens / limit
           : Number(d.compactThreshold) || 0;
         meter.style.display = '';
-        meter.textContent = dict.context + ' ' + percent + '%';
+        meter.textContent = dict.context + ' ' + percentLabel;
         meter.title = dict.context + ' ' + fmtTokens(used) + ' / ' + fmtTokens(limit) + ' tokens' +
           (compactAtTokens > 0
             ? ' \u00B7 ' + dict.autoCompactAt + ' ' + fmtTokens(compactAtTokens) + ' tokens (' + Math.round(compactAt * 100) + '%)'

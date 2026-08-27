@@ -46,6 +46,18 @@ type TraceEvent struct {
 	IsError    bool      `json:"is_error,omitempty"`
 	ElapsedMs  int64     `json:"elapsed_ms,omitempty"`
 	SubAgentOf string    `json:"subagent_of,omitempty"` // parent's tool_use_id when forwarded from a sub-agent
+	// TraceInvocationID is the process-unique execution identity used to
+	// disambiguate provider tool_use_id values that can repeat across responses.
+	// TraceParentInvocationID links a nested Agent/Fork/Ralph owner to its
+	// parent invocation. Both fields are optional for backward compatibility
+	// with trace files written before v0.4.34.
+	TraceInvocationID       string `json:"trace_invocation_id,omitempty"`
+	TraceParentInvocationID string `json:"trace_parent_invocation_id,omitempty"`
+	// TraceCallID identifies one concrete tool-call occurrence. Provider
+	// tool_use_id values are presentation metadata and may be reused by a
+	// later response, so they cannot safely pair starts with results on their
+	// own. Empty preserves compatibility with traces written before v0.4.34.
+	TraceCallID string `json:"trace_call_id,omitempty"`
 }
 
 // traceWriter pairs a session's buffered writer with its underlying
@@ -307,12 +319,49 @@ func (s *TraceStore) Events(sid string) []TraceEvent {
 // (event, depth) pairs.
 func (s *TraceStore) Trace(sid string) []TracedNode {
 	evs := s.Events(sid)
+	invocationOwners := make(map[string]TraceEvent)
+	callOwners := make(map[string]struct{})
+	for _, ev := range evs {
+		if isTraceInvocationOwnerStart(ev) {
+			invocationOwners[ev.TraceInvocationID] = ev
+		}
+		if isTraceToolOwnerStart(ev) && ev.TraceCallID != "" {
+			callOwners[ev.TraceCallID] = struct{}{}
+		}
+	}
+	byInvocation := map[string][]TraceEvent{}
+	byCall := map[string][]TraceEvent{}
 	byParent := map[string][]TraceEvent{}     // ParentID -> children
 	bySubAgentOf := map[string][]TraceEvent{} // SubAgentOf -> children
 	var roots []TraceEvent
 	for _, ev := range evs {
+		if isTraceInvocationOwnerStart(ev) {
+			if _, ok := invocationOwners[ev.TraceParentInvocationID]; ok {
+				byInvocation[ev.TraceParentInvocationID] = append(byInvocation[ev.TraceParentInvocationID], ev)
+			} else {
+				roots = append(roots, ev)
+			}
+			continue
+		}
+		if owner, ok := invocationOwners[ev.TraceInvocationID]; ok && isTraceInvocationOwnerResult(ev, owner) {
+			byInvocation[ev.TraceInvocationID] = append(byInvocation[ev.TraceInvocationID], ev)
+			continue
+		}
+		if ev.Kind == "tool_result" && ev.TraceCallID != "" {
+			if _, ok := callOwners[ev.TraceCallID]; ok {
+				byCall[ev.TraceCallID] = append(byCall[ev.TraceCallID], ev)
+				continue
+			}
+		}
+		if ev.TraceInvocationID != "" {
+			if _, ok := invocationOwners[ev.TraceInvocationID]; ok {
+				byInvocation[ev.TraceInvocationID] = append(byInvocation[ev.TraceInvocationID], ev)
+				continue
+			}
+		}
 		if ev.ParentID != "" {
-			byParent[ev.ParentID] = append(byParent[ev.ParentID], ev)
+			key := traceParentKey(ev.TraceInvocationID, ev.ParentID)
+			byParent[key] = append(byParent[key], ev)
 		} else if ev.SubAgentOf != "" {
 			bySubAgentOf[ev.SubAgentOf] = append(bySubAgentOf[ev.SubAgentOf], ev)
 		} else {
@@ -320,16 +369,42 @@ func (s *TraceStore) Trace(sid string) []TracedNode {
 		}
 	}
 	var nodes []TracedNode
+	visited := make(map[string]struct{}, len(evs))
 	var walk func(ev TraceEvent, depth int)
 	walk = func(ev TraceEvent, depth int) {
+		key := traceEventKey(ev)
+		if _, ok := visited[key]; ok {
+			return
+		}
+		visited[key] = struct{}{}
 		nodes = append(nodes, TracedNode{Event: ev, Depth: depth})
+		if isTraceInvocationOwnerStart(ev) {
+			kids := byInvocation[ev.TraceInvocationID]
+			delete(byInvocation, ev.TraceInvocationID)
+			for _, child := range kids {
+				walk(child, depth+1)
+			}
+			for _, child := range byCall[ev.TraceCallID] {
+				walk(child, depth+1)
+			}
+			delete(byCall, ev.TraceCallID)
+			for _, child := range bySubAgentOf[ev.ToolUseID] {
+				walk(child, depth+1)
+			}
+			delete(bySubAgentOf, ev.ToolUseID)
+			return
+		}
 		// Only a tool_start owns children. Streaming tool_args and the
 		// eventual tool_result share its ToolUseID, but neither is a parent;
 		// letting an earlier args delta consume the key detaches the result
 		// from the actual call and can create a self-cycle on tool_result.
 		parentKey := ""
-		if ev.Kind == "tool_start" || ev.Kind == "subagent_start" {
-			parentKey = ev.ToolUseID
+		if isTraceToolOwnerStart(ev) {
+			for _, child := range byCall[ev.TraceCallID] {
+				walk(child, depth+1)
+			}
+			delete(byCall, ev.TraceCallID)
+			parentKey = traceParentKey(ev.TraceInvocationID, ev.ToolUseID)
 		}
 		kids := byParent[parentKey]
 		if parentKey != "" {
@@ -338,10 +413,9 @@ func (s *TraceStore) Trace(sid string) []TracedNode {
 		for _, child := range kids {
 			walk(child, depth+1)
 		}
-		kids2 := bySubAgentOf[parentKey]
-		if parentKey != "" {
-			delete(bySubAgentOf, parentKey)
-		}
+		legacyParentKey := ev.ToolUseID
+		kids2 := bySubAgentOf[legacyParentKey]
+		delete(bySubAgentOf, legacyParentKey)
 		for _, child := range kids2 {
 			walk(child, depth+1)
 		}
@@ -349,7 +423,54 @@ func (s *TraceStore) Trace(sid string) []TracedNode {
 	for _, r := range roots {
 		walk(r, 0)
 	}
+	// A partial/legacy trace can be missing an owner start (for example the
+	// process crashed after persisting a result). Never hide such rows from the
+	// trajectory; render every unconsumed event once at root depth.
+	for _, ev := range evs {
+		walk(ev, 0)
+	}
 	return nodes
+}
+
+func isTraceInvocationOwnerStart(ev TraceEvent) bool {
+	return ev.Kind == "tool_start" && ev.TraceInvocationID != "" && isTraceChildToolName(ev.ToolName)
+}
+
+func isTraceInvocationOwnerResult(ev, owner TraceEvent) bool {
+	if ev.Kind != "tool_result" || ev.TraceInvocationID == "" || ev.TraceInvocationID != owner.TraceInvocationID {
+		return false
+	}
+	if owner.TraceCallID != "" && ev.TraceCallID != "" {
+		return owner.TraceCallID == ev.TraceCallID
+	}
+	return ev.ToolUseID != "" && ev.ToolUseID == owner.ToolUseID
+}
+
+func isTraceToolOwnerStart(ev TraceEvent) bool {
+	return ev.Kind == "tool_start" || ev.Kind == "subagent_start"
+}
+
+func isTraceChildToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "agent", "fork", "ralph":
+		return true
+	default:
+		return false
+	}
+}
+
+func traceParentKey(invocationID, toolUseID string) string {
+	if toolUseID == "" {
+		return ""
+	}
+	return invocationID + "\x00" + toolUseID
+}
+
+func traceEventKey(ev TraceEvent) string {
+	if ev.ID != "" {
+		return ev.ID
+	}
+	return fmt.Sprintf("%s\x00%d\x00%d\x00%s\x00%s", ev.SessionID, ev.Turn, ev.Sequence, ev.Kind, ev.ToolUseID)
 }
 
 // TracedNode couples an event with its nesting depth in the trace tree.
@@ -448,6 +569,30 @@ func (s *TraceStore) Sync() error {
 	for sid, w := range s.writers {
 		if err := w.w.Flush(); err != nil {
 			return fmt.Errorf("trace: flush %s: %w", sid, err)
+		}
+		if err := w.f.Sync(); err != nil {
+			return fmt.Errorf("trace: sync %s: %w", sid, err)
+		}
+	}
+	return nil
+}
+
+// SyncSession flushes buffered events for one session while keeping its append
+// file open. Terminal turn events call this so short traces do not
+// depend on reaching the periodic 200-event flush threshold or process-wide
+// shutdown.
+func (s *TraceStore) SyncSession(sessionID string) error {
+	if !validTraceSessionID(sessionID) {
+		return fmt.Errorf("trace: invalid session_id %q", sessionID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w := s.writers[sessionID]; w != nil {
+		if err := w.w.Flush(); err != nil {
+			return fmt.Errorf("trace: flush %s: %w", sessionID, err)
+		}
+		if err := w.f.Sync(); err != nil {
+			return fmt.Errorf("trace: sync %s: %w", sessionID, err)
 		}
 	}
 	return nil

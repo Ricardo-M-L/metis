@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/desktop"
@@ -57,7 +58,10 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	defer rt.Cleanup()
 
 	addr := "127.0.0.1:" + opts.port
-	srv := webui.NewServer(addr, rt.loop, rt.store, webui.RuntimeBindings{
+	serverCtx, cancelServer := context.WithCancel(ctx)
+	defer cancelServer()
+	shutdownToken := strings.TrimSpace(os.Getenv("METIS_DESKTOP_FRAME_TOKEN"))
+	bindings := webui.RuntimeBindings{
 		InitialSessionID:    rt.sessionID,
 		ProviderName:        rt.providerName,
 		PresetName:          presetName,
@@ -75,11 +79,21 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		OpenPath:        desktop.OpenPath,
 		Plugins:         rt.plugins,
 		Roster:          rt.subAgentRoster,
-	})
+		TraceAdapter:    rtpkg.CurrentTraceAdapter(),
+		TraceStore:      rtpkg.CurrentTraceStore(),
+	}
+	// A regular `metis desktop --web` browser session has no frame token and
+	// therefore no HTTP shutdown capability. The native shell supplies a fresh
+	// high-entropy token per child launch and may cancel this server context.
+	if shutdownToken != "" {
+		bindings.ShutdownToken = shutdownToken
+		bindings.Shutdown = cancelServer
+	}
+	srv := webui.NewServer(addr, rt.loop, rt.store, bindings)
 	fmt.Fprintf(os.Stderr, "metis desktop --web: starting web UI on %s\n", addr)
 	fmt.Fprintf(os.Stderr, "Open http://%s in your browser\n", addr)
 
-	return srv.Run(ctx)
+	return srv.Run(serverCtx)
 }
 
 type desktopOptions struct {

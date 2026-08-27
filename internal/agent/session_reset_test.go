@@ -78,7 +78,11 @@ func TestResetSessionClearsSessionScopedState(t *testing.T) {
 	if got := loop.History(); len(got) != len(target) || got[0].Content[0].ToolUseID != "search-target" {
 		t.Fatalf("target history was not restored: %+v", got)
 	}
-	if loop.estTokens.Load() != 0 || loop.todoWriteIter != 0 || loop.todoReminderIter != 0 || loop.todoReconciledThisTurn {
+	wantEstimate := int64(estimateActiveHistoryTokens(loop.History()))
+	if got := loop.estTokens.Load(); got != wantEstimate {
+		t.Errorf("restored context estimate = %d, want %d", got, wantEstimate)
+	}
+	if loop.todoWriteIter != 0 || loop.todoReminderIter != 0 || loop.todoReconciledThisTurn {
 		t.Errorf("turn-derived counters leaked: est=%d todo=(%d,%d,%v)", loop.estTokens.Load(), loop.todoWriteIter, loop.todoReminderIter, loop.todoReconciledThisTurn)
 	}
 	if loop.haltRequested || loop.haltReason != "" || len(loop.steerBuf) != 0 || loop.BypassNextCache {
@@ -134,5 +138,31 @@ func TestResetSessionClearsSessionScopedState(t *testing.T) {
 	discovered := loop.snapshotDiscoveredMCP()
 	if discovered["mcp__old"] || !discovered["mcp__target"] || len(discovered) != 1 {
 		t.Errorf("MCP discovery was not rebuilt from target history: %v", discovered)
+	}
+}
+
+func TestResetSessionPrimesContextEstimateForLockContentionFallback(t *testing.T) {
+	loop := NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 5)
+	history := []llm.Message{{
+		Role: llm.RoleUser,
+		Content: []llm.ContentBlock{{
+			Type: "text",
+			Text: "non-empty restored conversation",
+		}},
+	}}
+	loop.ResetSession(history)
+	want := estimateActiveHistoryTokens(history)
+	if want <= 0 {
+		t.Fatalf("test history estimate = %d, want positive", want)
+	}
+
+	// Simulate the status poll landing while compaction or another lifecycle
+	// operation owns the history lock. EstimateContextTokens must then use the
+	// cache primed by ResetSession instead of reporting a false zero.
+	loop.mu.Lock()
+	got := loop.EstimateContextTokens()
+	loop.mu.Unlock()
+	if got != want {
+		t.Fatalf("contended context estimate = %d, want %d", got, want)
 	}
 }
