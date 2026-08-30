@@ -146,14 +146,20 @@ func TestWebBrowseChromiumUsesIsolatedProfileAndGuardedProxy(t *testing.T) {
 	capturedArgs := filepath.Join(dir, "captured-args")
 	browser := filepath.Join(dir, "chromium")
 	script := fmt.Sprintf(`#!/bin/sh
+mode_of() {
+  case "$(uname -s)" in
+    Darwin) stat -f '%%Lp' "$1" ;;
+    *) stat -c '%%a' "$1" ;;
+  esac
+}
 printf '%%s' "$HOME" > %q
-(stat -f '%%Lp' "$HOME" 2>/dev/null || stat -c '%%a' "$HOME") > %q
+mode_of "$HOME" > %q
 for arg in "$@"; do
   case "$arg" in
     --user-data-dir=*) profile="${arg#*=}" ;;
   esac
 done
-(stat -f '%%Lp' "$profile" 2>/dev/null || stat -c '%%a' "$profile") > %q
+mode_of "$profile" > %q
 printf '%%s|%%s' "${HTTP_PROXY-unset}" "${NO_PROXY-unset}" > %q
 printf '%%s\n' "$@" > %q
 printf '<html><body>isolated child</body></html>'
