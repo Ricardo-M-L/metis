@@ -78,6 +78,9 @@ func TestLoadConfigHooks_PreToolUseHaltViaExit49(t *testing.T) {
 	if res == nil || !res.Halt {
 		t.Fatalf("exit 49 should raise Halt; got %+v", res)
 	}
+	if res.Output == nil || !res.Output.IsError {
+		t.Fatalf("exit 49 must also block the current tool, got %+v", res)
+	}
 	if res.HaltReason == "" {
 		t.Error("exit-49 path should set a default HaltReason for the transcript")
 	}

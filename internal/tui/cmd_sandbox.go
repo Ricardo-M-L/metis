@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
@@ -54,6 +55,9 @@ func cmdSandbox(r *REPL, args string) string {
 	case "doctor":
 		return sandboxDoctor(manager)
 	case "reset", "config":
+		if replRequiresCredentialIsolation(r) {
+			return "sandbox: cannot clear the runtime boundary while bypassPermissions is active; switch permission mode first"
+		}
 		manager.ClearRuntimeMode()
 		return fmt.Sprintf("sandbox: runtime override cleared; effective mode is %q from [tools.bash.sandbox]", manager.EffectiveMode())
 	}
@@ -61,6 +65,9 @@ func cmdSandbox(r *REPL, args string) string {
 	canonical, ok := interactiveSandboxMode(arg)
 	if !ok {
 		return fmt.Sprintf("sandbox: unknown mode %q. usage: /sandbox [status | doctor | reset | off | permissions | auto-allow]", arg)
+	}
+	if canonical == sandbox.ModeOff && replRequiresCredentialIsolation(r) {
+		return "sandbox: cannot disable credential isolation while bypassPermissions is active; switch permission mode first"
 	}
 	if canonical != sandbox.ModeOff {
 		diagnostic := manager.Doctor()
@@ -72,9 +79,24 @@ func cmdSandbox(r *REPL, args string) string {
 		return "sandbox: mode unchanged: " + err.Error()
 	}
 	return fmt.Sprintf(
-		"sandbox: mode set to %q for this runtime (effective immediately for Bash, Workflow, Git, Skill and custom-command shell calls)\n  • bypassPermissions does not disable this boundary\n  • persist with [tools.bash.sandbox] mode = %q in ~/.metis/config.toml",
+		"sandbox: mode set to %q for this runtime (effective immediately for all model-controlled subprocesses: Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use, Skills and custom commands)\n  • bypassPermissions does not disable this boundary\n  • persist with [tools.bash.sandbox] mode = %q in ~/.metis/config.toml",
 		canonical, canonical,
 	)
+}
+
+func replRequiresCredentialIsolation(r *REPL) bool {
+	if r == nil || r.Gate == nil {
+		return false
+	}
+	mode := r.Gate.Mode()
+	if mode == permission.ModeBypassPermissions {
+		return true
+	}
+	if mode != permission.ModePlan || r.Loop == nil {
+		return false
+	}
+	previous, ok := permission.ParseMode(r.Loop.PrePlanMode())
+	return ok && previous == permission.ModeBypassPermissions
 }
 
 func interactiveSandboxMode(arg string) (sandbox.Mode, bool) {
@@ -100,6 +122,9 @@ func sandboxStatus(manager *sandbox.Manager) string {
 	} else {
 		b.WriteString(" (from [tools.bash.sandbox])")
 	}
+	if state.CredentialIsolationRequired {
+		b.WriteString("\n  • credential isolation: enforced by bypassPermissions")
+	}
 	fmt.Fprintf(&b, "\n  • backend: %s on %s", diagnostic.Backend, diagnostic.Platform)
 	if diagnostic.Available {
 		fmt.Fprintf(&b, " (%s)", diagnostic.Executable)
@@ -114,6 +139,7 @@ func sandboxStatus(manager *sandbox.Manager) string {
 		fmt.Fprintf(&b, "\n  • private temp: %s", temp)
 	}
 	b.WriteString("\n  • writable: effective cwd/worktree + private temp; Metis control files and Git hooks/config stay protected")
+	b.WriteString("\n  • coverage: Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use, Skills and custom-command subprocesses")
 	if sandboxCwdIsHome() && state.Effective != sandbox.ModeOff {
 		b.WriteString("\n  ⚠ workspace root is your home directory, so the writable boundary is broad; start Metis inside the project directory for tighter isolation")
 	}
@@ -177,5 +203,7 @@ The setting applies to new commands in this runtime. To persist it:
   network = "block"
 
 bypassPermissions only changes approval prompts; it does not disable an
-enabled OS sandbox.`)
+enabled OS sandbox. The boundary covers all model-controlled subprocesses,
+including Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use,
+Skills, and custom commands.`)
 }

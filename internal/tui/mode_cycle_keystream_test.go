@@ -27,6 +27,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
 // pressShiftTab injects a Shift+Tab keypress through Model.Update,
@@ -50,10 +51,20 @@ func pressShiftTab(t *testing.T, m *Model) {
 // cycling. startTime is backdated past modeCycleStartupGrace so the
 // first Shift+Tab isn't swallowed by the "alt-screen escape burst"
 // guard; permission gate starts at the documented default.
-func modeCycleTestModel() *Model {
+func modeCycleTestModel(t *testing.T) *Model {
+	t.Helper()
+	if !sandbox.Available() {
+		t.Skip("bypassPermissions requires an available OS sandbox")
+	}
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
 	return &Model{
 		gate:      permission.New(permission.ModeAsk),
 		startTime: time.Now().Add(-time.Hour),
+		ext:       ExternalHooks{Sandbox: manager},
 	}
 }
 
@@ -62,7 +73,7 @@ func modeCycleTestModel() *Model {
 // Locks both the order AND the wraparound. A future refactor that
 // drops a mode, reorders, or breaks the wrap will trip immediately.
 func TestModeCycle_FullKeystreamWalk(t *testing.T) {
-	m := modeCycleTestModel()
+	m := modeCycleTestModel(t)
 	want := []permission.Mode{
 		permission.ModeAcceptEdits,       // default → acceptEdits
 		permission.ModePlan,              // acceptEdits → plan
@@ -85,7 +96,7 @@ func TestModeCycle_FullKeystreamWalk(t *testing.T) {
 // stops keying off m.gate.Mode() — or if the cycle walks but the
 // display doesn't update — this fires.
 func TestModeCycle_HintsReflectEachStep(t *testing.T) {
-	m := modeCycleTestModel()
+	m := modeCycleTestModel(t)
 
 	type step struct {
 		expectMode permission.Mode
@@ -124,7 +135,7 @@ func TestModeCycle_HintsReflectEachStep(t *testing.T) {
 // to return empty for bypass). Without the glyph the user has no
 // visual cue they've entered the dangerous mode.
 func TestModeCycle_BypassCarriesWarningGlyph(t *testing.T) {
-	m := modeCycleTestModel()
+	m := modeCycleTestModel(t)
 	// default → acceptEdits → plan → bypassPermissions (3 presses).
 	for i := 0; i < 3; i++ {
 		pressShiftTab(t, m)
@@ -144,7 +155,7 @@ func TestModeCycle_BypassCarriesWarningGlyph(t *testing.T) {
 // escape pair as two keypresses" failure mode. Without the gate this
 // would walk past the user's intended mode.
 func TestModeCycle_DebounceBlocksDoublePress(t *testing.T) {
-	m := modeCycleTestModel()
+	m := modeCycleTestModel(t)
 	// First press advances: default → acceptEdits.
 	msg := tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
 	updated, _ := m.Update(msg)

@@ -1481,6 +1481,231 @@ func TestActivateSessionRestoresHeaderStateAndRebindsSidecars(t *testing.T) {
 	}
 }
 
+func TestActivateSessionRebuildsPersistedManagedDefaultPrompt(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	promptSections := rtpkg.AssembleSystemPromptSectionsCtx(rtpkg.PromptCtx{
+		ProviderName: "wire",
+		Model:        "model",
+		EnabledTools: map[string]bool{"Read": true},
+	}, rtpkg.AssembleOptions{SkipEnv: true})
+	freshSystem := rtpkg.RenderSections(promptSections)
+	loopSections := make([]llm.SystemSection, 0, len(promptSections))
+	for _, section := range promptSections {
+		loopSections = append(loopSections, llm.SystemSection{
+			Name: section.Name, Body: section.Body, Cache: section.Cache, Volatile: section.Volatile,
+		})
+	}
+	for _, hdr := range []session.Header{
+		{ID: "source-managed", Provider: "wire", Model: "model", System: freshSystem, SystemPromptKind: session.SystemPromptKindDefault},
+		{ID: "target-managed", Provider: "wire", Model: "model", System: "stale default with WebSearch", SystemPromptKind: session.SystemPromptKindDefault},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeDefault), nil, freshSystem, 2)
+	loop.Model = "model"
+	loop.SystemSections = loopSections
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source-managed", ProviderName: "wire", FreshPermissionMode: permission.ModeDefault,
+	})
+	target, history, err := store.Load("target-managed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.activateSession(target.ID, target, history); err != nil {
+		t.Fatal(err)
+	}
+	if loop.System != freshSystem || strings.Contains(loop.System, "stale default") {
+		t.Fatalf("managed prompt was not rebuilt from fresh typed sections:\n%s", loop.System)
+	}
+	if len(loop.SystemSections) == 0 {
+		t.Fatal("managed prompt activation lost typed sections")
+	}
+}
+
+func TestSessionViewDuringActiveTurnDoesNotRebindScopeUntilActivation(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	sourceDir := t.TempDir()
+	targetDir := t.TempDir()
+	allowed := rtpkg.NewAllowedDirs(nil)
+	if err := allowed.RebindCWD(sourceDir); err != nil {
+		t.Fatal(err)
+	}
+	gate := permission.New(permission.ModeDefault)
+	gate.SetPathScopeHook(allowed.Contains)
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "scope-source", Provider: "wire", Model: "model", WorkDir: sourceDir, Mode: string(permission.ModeDefault)},
+		{ID: "scope-target", Provider: "wire", Model: "model", WorkDir: targetDir, Mode: string(permission.ModeDefault)},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, tools.NewRegistry(), gate, nil, "system", 2)
+	loop.Model = "model"
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "scope-source", ProviderName: "wire", FreshPermissionMode: permission.ModeDefault,
+		SessionSwitch: func(_ string, workDir string) {
+			if err := allowed.RebindCWD(workDir); err != nil {
+				t.Fatalf("rebind scope: %v", err)
+			}
+		},
+	})
+
+	s.runMu.Lock() // model an active turn owned by the source session
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/scope-target", nil))
+	s.runMu.Unlock()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("read-only session view = %d: %s", rr.Code, rr.Body.String())
+	}
+	if !allowed.Contains(filepath.Join(sourceDir, "source.txt")) || allowed.Contains(filepath.Join(targetDir, "target.txt")) {
+		t.Fatalf("read-only view changed live scope: %v", allowed.Scope())
+	}
+
+	rr = httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/sessions/activate", bytes.NewBufferString(`{"id":"scope-target"}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("activate target = %d: %s", rr.Code, rr.Body.String())
+	}
+	if !allowed.Contains(filepath.Join(targetDir, "target.txt")) || allowed.Contains(filepath.Join(sourceDir, "source.txt")) {
+		t.Fatalf("activation did not atomically move live scope: %v", allowed.Scope())
+	}
+}
+
+func TestActivateSessionWorkspacePreflightFailureLeavesSourceStateAtomic(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	sourceDir := filepath.Join(home, "source-workspace")
+	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	missingTargetDir := filepath.Join(home, "deleted-target-workspace")
+	allowed := rtpkg.NewAllowedDirs(nil)
+	if err := allowed.RebindCWD(sourceDir); err != nil {
+		t.Fatal(err)
+	}
+
+	memoryManager, err := memory.NewMemoryManagerForWorkspace(filepath.Join(home, "memory"), sourceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := memoryManager.Archival().Insert(memory.Passage{Content: "source-memory-sentinel", Type: memory.TypeProject}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "atomic-source", Provider: "wire", Model: "model", System: "system", WorkDir: sourceDir},
+		{ID: "atomic-target", Provider: "wire", Model: "model", System: "system", WorkDir: missingTargetDir},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sourceMessage := llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "source-history-sentinel"}}}
+	targetMessage := llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "target-history-must-not-load"}}}
+	if err := store.AppendMessage("atomic-source", sourceMessage); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessage("atomic-target", targetMessage); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := permission.New(permission.ModeDefault)
+	gate.SetPathScopeHook(allowed.Contains)
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, tools.NewRegistry(), gate, nil, "system", 2)
+	loop.Model = "model"
+	loop.Memory = memoryManager
+	loop.Restore([]llm.Message{sourceMessage})
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "atomic-source",
+		ProviderName:     "wire",
+		PrepareSessionSwitch: func(_ string, workDir string) (string, func(), error) {
+			prepared, prepareErr := allowed.PrepareRebindCWD(workDir)
+			if prepareErr != nil {
+				return "", nil, prepareErr
+			}
+			return prepared.CanonicalPath(), prepared.Commit, nil
+		},
+	})
+	targetHeader, targetHistory, err := store.Load("atomic-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.activateSession("atomic-target", targetHeader, targetHistory); err == nil || !strings.Contains(err.Error(), "workspace permission preflight") {
+		t.Fatalf("activation error = %v, want workspace preflight failure", err)
+	}
+
+	server.stateMu.RLock()
+	activeID, activeWorkDir := server.activeSessionID, server.activeWorkDir
+	server.stateMu.RUnlock()
+	if activeID != "atomic-source" || activeWorkDir != sourceDir {
+		t.Fatalf("failed activation changed active state: id=%q workDir=%q", activeID, activeWorkDir)
+	}
+	if history := loop.History(); len(history) != 1 || history[0].Content[0].Text != "source-history-sentinel" {
+		t.Fatalf("failed activation changed history: %+v", history)
+	}
+	if !allowed.Contains(filepath.Join(sourceDir, "still-authorized.txt")) || allowed.Contains(filepath.Join(missingTargetDir, "must-not-authorize.txt")) {
+		t.Fatalf("failed activation changed allowed roots: %v", allowed.Scope())
+	}
+	if hits := loop.Memory.SearchCandidates("source-memory-sentinel", 5); len(hits) == 0 {
+		t.Fatal("failed activation changed source workspace memory binding")
+	}
+}
+
+func TestActivateSessionUsesGateModeAfterListenerDowngrade(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(session.Header{ID: "source", Provider: "wire", Model: "model", Mode: string(permission.ModeDefault)}); err != nil {
+		t.Fatal(err)
+	}
+	target := &session.Header{
+		ID: "target-plan-downgrade", Provider: "wire", Model: "model",
+		Mode: string(permission.ModePlan), PrePlanMode: string(permission.ModeDefault),
+	}
+	if err := store.WriteHeaderFull(*target); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := permission.New(permission.ModeDefault)
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), gate, nil, "system", 2)
+	loop.Model = "model"
+	gate.SetModeChangeListener(func(mode permission.Mode) {
+		loop.SetPlanMode(mode == permission.ModePlan)
+		if mode == permission.ModePlan {
+			gate.SetMode(permission.ModeDontAsk)
+		}
+	})
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source", ProviderName: "wire", FreshPermissionMode: permission.ModeDefault,
+	})
+
+	if err := s.activateSession(target.ID, target, nil); err != nil {
+		t.Fatal(err)
+	}
+	if gate.Mode() != permission.ModeDontAsk || loop.IsPlanMode() {
+		t.Fatalf("restored permission state diverged: gate=%q plan=%v", gate.Mode(), loop.IsPlanMode())
+	}
+	if got := loop.PrePlanMode(); got != "" {
+		t.Fatalf("failed-closed switch retained pre-plan lineage %q", got)
+	}
+}
+
 func TestActivateSessionRebindsWorkspaceMemoryAcrossLoopToolAndAutoMemory(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
@@ -1845,6 +2070,89 @@ func TestTurnToolsUseActivatedSessionWorkspace(t *testing.T) {
 	}
 	if got := capture.captured(); got != workspaceB {
 		t.Fatalf("tool cwd = %q, want activated session workspace %q", got, workspaceB)
+	}
+}
+
+func TestTurnPublishesPreparedCanonicalWorkspaceWhenAliasRetargets(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, "source")
+	workspaceA := filepath.Join(home, "workspace-a")
+	workspaceB := filepath.Join(home, "workspace-b")
+	for _, dir := range []string{source, workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(home, "workspace-link")
+	if err := os.Symlink(workspaceA, alias); err != nil {
+		t.Fatal(err)
+	}
+	wantCanonical, err := filepath.EvalSymlinks(workspaceA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.NewStore(filepath.Join(home, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []session.Header{
+		{ID: "source", Provider: "wire", Model: "model", System: "system", WorkDir: source},
+		{ID: "target", Provider: "wire", Model: "model", System: "system", WorkDir: alias},
+	} {
+		if err := store.WriteHeaderFull(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	allowed := rtpkg.NewAllowedDirs(nil)
+	if err := allowed.RebindCWD(source); err != nil {
+		t.Fatal(err)
+	}
+	provider := &cwdCaptureProvider{activationTestProvider: activationTestProvider{name: "wire", model: "model"}}
+	capture := &cwdCaptureTool{}
+	registry := tools.NewRegistry()
+	registry.Register(capture)
+	loop := agent.NewLoop(provider, registry, permission.New(permission.ModeBypassPermissions), nil, "system", 4)
+	loop.Model = "model"
+	server := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source",
+		ProviderName:     "wire",
+		PrepareSessionSwitch: func(sessionID, workDir string) (string, func(), error) {
+			prepared, prepareErr := allowed.PrepareRebindCWD(workDir)
+			if prepareErr != nil {
+				return "", nil, prepareErr
+			}
+			if sessionID == "target" {
+				if err := os.Remove(alias); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(workspaceB, alias); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return prepared.CanonicalPath(), prepared.Commit, nil
+		},
+	})
+
+	rr := httptest.NewRecorder()
+	server.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(
+		`{"sessionId":"target","input":"capture cwd"}`,
+	)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("turn status = %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := capture.captured(); got != wantCanonical {
+		t.Fatalf("tool cwd = %q, want prepared canonical workspace %q", got, wantCanonical)
+	}
+	server.stateMu.RLock()
+	activeWorkDir := server.activeWorkDir
+	server.stateMu.RUnlock()
+	if activeWorkDir != wantCanonical {
+		t.Fatalf("activeWorkDir = %q, want prepared canonical workspace %q", activeWorkDir, wantCanonical)
+	}
+	if !allowed.Contains(filepath.Join(workspaceA, "a.txt")) || allowed.Contains(filepath.Join(workspaceB, "b.txt")) {
+		t.Fatalf("allowed roots followed retargeted alias: %v", allowed.Scope())
 	}
 }
 

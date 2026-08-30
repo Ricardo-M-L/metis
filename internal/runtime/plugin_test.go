@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
@@ -181,19 +182,29 @@ url = "https://example.invalid/mcp"
 	}
 
 	var captured []mcp.ServerEntry
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	var capturedManager *sandbox.Manager
 	original := launchPluginMCPServer
-	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, _ *tools.Registry) (*mcptools.Server, error) {
+	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, _ *tools.Registry, gotManager *sandbox.Manager) (*mcptools.Server, error) {
 		captured = append(captured, entry)
+		capturedManager = gotManager
 		return nil, nil
 	}
 	t.Cleanup(func() { launchPluginMCPServer = original })
 
-	reg, errs := LoadPlugins(context.Background(), tools.NewRegistry())
+	reg, errs := LoadPluginsWithSandbox(context.Background(), tools.NewRegistry(), manager)
 	if len(errs) != 0 {
 		t.Fatalf("load translated plugin: %v", errs)
 	}
 	if len(reg.All()) != 1 || len(captured) != 2 {
 		t.Fatalf("plugins=%d captured=%+v", len(reg.All()), captured)
+	}
+	if capturedManager != manager {
+		t.Fatalf("plugin MCP sandbox = %p, want shared manager %p", capturedManager, manager)
 	}
 	if captured[0].Name != "plugin:codex-bridge:alpha" || captured[0].WorkingDir != dir || !strings.HasSuffix(captured[0].Command, filepath.Join("bin", "server-a")) {
 		t.Fatalf("stdio entry = %+v", captured[0])

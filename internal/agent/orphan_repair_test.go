@@ -121,24 +121,92 @@ func TestRepairOrphanedToolUses_EmptyAndNil(t *testing.T) {
 }
 
 // Stale tool_result from a prior turn must not satisfy a later orphan
-// with the same id. (Defensive — same-id collision is unlikely in
-// practice but the comparison must respect chronology.)
-//
-// We model "stale result" by placing the result BEFORE the tool_use.
-// Current implementation does a global satisfied-set sweep so this
-// case is intentionally tolerant; verify the documented behavior.
-func TestRepairOrphanedToolUses_StaleResultBeforeUse_Tolerated(t *testing.T) {
+// with the same id. (Defensive — providers should issue unique ids,
+// but transcript repair must still respect chronology when they do not.)
+func TestRepairOrphanedToolUses_StaleResultBeforeUseDoesNotSatisfy(t *testing.T) {
 	t.Parallel()
 	in := []llm.Message{
 		{Role: llm.RoleUser, Content: []llm.ContentBlock{mkToolResult("id-A", "stale", false)}},
 		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{mkToolUse("id-A", "Read")}},
 	}
 	out := RepairOrphanedToolUses(in)
-	// Current contract: any matching id satisfies. If a future
-	// implementation tightens this to require ordering, update the
-	// test to match.
-	if len(out) != len(in) {
-		t.Errorf("global-satisfied-set semantics expected; got len=%d", len(out))
+	if len(out) != len(in)+1 {
+		t.Fatalf("stale result must not satisfy a later use: in=%d out=%d", len(in), len(out))
+	}
+	stub := out[len(out)-1].Content
+	if len(stub) != 1 || stub[0].ToolUseID != "id-A" {
+		t.Fatalf("expected one id-A repair result; got %+v", stub)
+	}
+}
+
+func TestRepairOrphanedToolUses_ReusedIDNeedsNewResult(t *testing.T) {
+	t.Parallel()
+	in := []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{mkToolUse("provider-reused-id", "Read")}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{mkToolResult("provider-reused-id", "first result", false)}},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{mkToolUse("provider-reused-id", "Read")}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{mkText("continue")}},
+	}
+
+	out := RepairOrphanedToolUses(in)
+	if len(out) != len(in)+1 {
+		t.Fatalf("the consumed first-turn result must not satisfy the reused id: in=%d out=%d", len(in), len(out))
+	}
+	stub := out[len(out)-1].Content
+	if len(stub) != 1 || stub[0].ToolUseID != "provider-reused-id" {
+		t.Fatalf("expected one repair result for the second use; got %+v", stub)
+	}
+	if twice := RepairOrphanedToolUses(out); len(twice) != len(out) {
+		t.Fatalf("repair of a reused id must remain idempotent: once=%d twice=%d", len(out), len(twice))
+	}
+}
+
+func TestRepairOrphanedToolUses_RepairsEveryDuplicateUse(t *testing.T) {
+	t.Parallel()
+	in := []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+			mkToolUse("provider-duplicate-id", "Read"),
+			mkToolUse("provider-duplicate-id", "Read"),
+		}},
+	}
+
+	out := RepairOrphanedToolUses(in)
+	if len(out) != len(in)+1 {
+		t.Fatalf("expected one synthetic user message; in=%d out=%d", len(in), len(out))
+	}
+	stub := out[len(out)-1].Content
+	if len(stub) != 2 {
+		t.Fatalf("each unmatched use needs its own result; got %d blocks", len(stub))
+	}
+	for i, block := range stub {
+		if block.ToolUseID != "provider-duplicate-id" {
+			t.Errorf("stub[%d].tool_use_id=%q want provider-duplicate-id", i, block.ToolUseID)
+		}
+	}
+	if twice := RepairOrphanedToolUses(out); len(twice) != len(out) {
+		t.Fatalf("duplicate-id repair must remain idempotent: once=%d twice=%d", len(out), len(twice))
+	}
+}
+
+func TestRepairOrphanedToolUses_ResultIsConsumedOnce(t *testing.T) {
+	t.Parallel()
+	in := []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+			mkToolUse("provider-duplicate-id", "Read"),
+			mkToolUse("provider-duplicate-id", "Read"),
+		}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			mkToolResult("provider-duplicate-id", "one result", false),
+		}},
+	}
+
+	out := RepairOrphanedToolUses(in)
+	if len(out) != len(in)+1 {
+		t.Fatalf("one result must satisfy only one use: in=%d out=%d", len(in), len(out))
+	}
+	stub := out[len(out)-1].Content
+	if len(stub) != 1 || stub[0].ToolUseID != "provider-duplicate-id" {
+		t.Fatalf("expected one remaining duplicate-id repair result; got %+v", stub)
 	}
 }
 

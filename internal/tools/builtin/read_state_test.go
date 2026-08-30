@@ -187,6 +187,34 @@ func TestRead_RecordsFullOnSmallFile(t *testing.T) {
 	}
 }
 
+func TestRead_ExactlyLimitLinesIsFullButLimitPlusOneIsPartial(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		content     string
+		wantPartial bool
+	}{
+		{name: "exactly limit", content: "one\ntwo\nthree\n", wantPartial: false},
+		{name: "limit plus one", content: "one\ntwo\nthree\nfour\n", wantPartial: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "lines.txt")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			state := NewReadFileState()
+			result, err := (Read{gate: permission.New(permission.ModeBypassPermissions), state: state}).Execute(
+				context.Background(), map[string]any{"path": path, "limit": 3})
+			if err != nil || result == nil || result.IsError {
+				t.Fatalf("Read = %+v, %v", result, err)
+			}
+			entry, ok := state.Get(path)
+			if !ok || entry.IsPartialView != tc.wantPartial {
+				t.Fatalf("entry = %+v, %v; want partial=%v", entry, ok, tc.wantPartial)
+			}
+		})
+	}
+}
+
 // TestEdit_AllowsTargetedEditAfterPartialView pins the Codex-style targeted
 // patch contract: a unique old string may be replaced after a partial Read.
 // Read captured the full-file hash internally, so stale external changes are

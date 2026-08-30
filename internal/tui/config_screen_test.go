@@ -9,6 +9,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -155,6 +157,66 @@ func TestConfigScreenApplyFailureKeepsMemoryAndDisk(t *testing.T) {
 	}
 	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != "error" {
 		t.Fatalf("failed save did not surface an error: %+v", m.messages)
+	}
+}
+
+func TestConfigScreenSaveFailureRestoresPlanLineage(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	path := filepath.Join(home, "config.toml")
+
+	m := newSlashTestModel(t)
+	m.cfg = &config.Config{Permission: config.Permission{Mode: string(permission.ModePlan)}}
+	m.gate.SetMode(permission.ModePlan)
+	m.loop.SetPlanMode(true)
+	m.loop.SetPrePlanMode(string(permission.ModeDefault))
+	m.openConfigScreen()
+	w := m.activeScreen.(*screen.ConfigScreen)
+	w.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // plan -> acceptEdits
+	w.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	// Fail only after the live preview has been staged. A directory at the
+	// config-file path makes the transactional read fail portably.
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	m.applyScreenResult(w)
+
+	if got := m.gate.Mode(); got != permission.ModePlan || !m.loop.IsPlanMode() {
+		t.Fatalf("failed save did not restore plan posture: gate=%q plan=%v", got, m.loop.IsPlanMode())
+	}
+	if got := m.loop.PrePlanMode(); got != string(permission.ModeDefault) {
+		t.Fatalf("failed save rewrote plan lineage to %q", got)
+	}
+}
+
+func TestConfigScreenRejectedBypassIsNotPersisted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	m := newSlashTestModel(t)
+	m.cfg = &config.Config{Permission: config.Permission{Mode: "default"}}
+	m.gate.SetMode(permission.ModeDefault)
+	manager, err := sandbox.NewManagerWithOptions(sandbox.Options{Mode: "off", TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m.ext.Sandbox = manager
+	m.openConfigScreen()
+	w := m.activeScreen.(*screen.ConfigScreen)
+	w.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // default wraps to bypassPermissions
+	w.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m.applyScreenResult(w)
+
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("rejected bypass changed gate to %s", got)
+	}
+	if _, err := os.Stat(filepath.Join(home, "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("rejected bypass persisted config: %v", err)
+	}
+	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != "error" || !strings.Contains(m.messages[len(m.messages)-1].Content, "unchanged") {
+		t.Fatalf("rejected bypass did not surface an error: %+v", m.messages)
 	}
 }
 

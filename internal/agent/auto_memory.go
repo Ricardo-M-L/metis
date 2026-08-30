@@ -8,7 +8,7 @@ package agent
 //     model's most recent reply contains no further tool_use, i.e. the
 //     query loop naturally finished — same boundary openclaude uses.
 //   - Runs RunForkedAgent (not a one-shot Complete). The fork has
-//     Read/Grep/Glob/Bash(read-only)/Edit/Write(memdir) so it can
+//     Read/Grep/Glob/Edit/Write(memdir) so it can
 //     inspect existing memos, dedup, and write per-topic .md files
 //     itself.
 //   - Cursor + mutual-exclusion: tracks the last message index processed,
@@ -914,7 +914,8 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	// (memory was written, ~/.metis/skills/ stayed empty). Rebuild
 	// the specs from dreamReg so the schema list matches the registry.
 	if dreamReg != run.registry {
-		snap.ToolSpecs = toolSpecsFromRegistry(dreamReg, run.shortToolDescriptions)
+		preserve := discoveredDeferredFromSpecs(snap.ToolSpecs)
+		snap.ToolSpecs = toolSpecsFromRegistry(dreamReg, run.shortToolDescriptions, snap.ContextWindow, preserve)
 	}
 
 	// List user skills NOW (Orient phase input) so the prompt can show

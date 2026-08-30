@@ -2,6 +2,7 @@ package bash
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -114,14 +115,59 @@ func TestBashCanUse_BypassAllowsCanonicalSkillInstallCommands(t *testing.T) {
 	}
 }
 
-func TestBashCanUse_BypassStillAsksForDirectClaudeSkillWrite(t *testing.T) {
+func TestBashCanUse_BypassSilentlyDeniesDestructiveSystemMutation(t *testing.T) {
+	t.Parallel()
+	gate := permission.New(permission.ModeBypassPermissions)
+	tool := New(gate, config.ToolBashSettings{})
+	for _, command := range []string{
+		`sudo -n /usr/bin/apt-get remove openssh-server`,
+		`echo ready && kubectl delete namespace production`,
+		`command env LANG=C docker system prune -af`,
+	} {
+		got, source := tool.CanUse(context.Background(), map[string]any{"command": command})
+		if got != tools.PermissionDeny || !strings.Contains(source, "destructive system mutation") {
+			t.Fatalf("destructive command %q = %v (%s), want silent deny", command, got, source)
+		}
+	}
+}
+
+func TestBashCanUse_BypassAllowsScopedDockerAndKubectlOperations(t *testing.T) {
+	t.Parallel()
+	gate := permission.New(permission.ModeBypassPermissions)
+	tool := New(gate, config.ToolBashSettings{})
+	for _, command := range []string{
+		`docker build -t local/test .`,
+		`docker container rm stopped-container`,
+		`kubectl apply -f deployment.yaml`,
+		`kubectl delete pod one-broken-pod`,
+	} {
+		got, source := tool.CanUse(context.Background(), map[string]any{"command": command})
+		if got != tools.PermissionAllow || source != "mode:bypassPermissions" {
+			t.Fatalf("scoped command %q = %v (%s), want bypass allow", command, got, source)
+		}
+	}
+}
+
+func TestBashCanUse_BypassSilentlyDeniesDirectClaudeSkillWrite(t *testing.T) {
 	t.Parallel()
 	gate := permission.New(permission.ModeBypassPermissions)
 	tool := New(gate, config.ToolBashSettings{})
 	const command = `mkdir -p ~/.claude/skills/untrusted`
 
 	got, source := tool.CanUse(context.Background(), map[string]any{"command": command})
-	if got != tools.PermissionAsk || source != "safety_check:bypass_immune" {
-		t.Fatalf("direct Claude skill write = %v (%s), want ask safety_check:bypass_immune", got, source)
+	if got != tools.PermissionDeny || source != "safety_check:bypass_immune" {
+		t.Fatalf("direct Claude skill write = %v (%s), want deny safety_check:bypass_immune", got, source)
+	}
+}
+
+func TestBashCanUse_BypassSensitiveDenyCannotBePromotedBySandboxAutoAllow(t *testing.T) {
+	t.Parallel()
+	gate := permission.New(permission.ModeBypassPermissions)
+	tool := autoAllowBashForTest(t, gate)
+	const command = `echo pwned > ~/.metis/config.toml`
+
+	got, source := tool.CanUse(context.Background(), map[string]any{"command": command})
+	if got != tools.PermissionDeny || source != "safety_check:bypass_immune" {
+		t.Fatalf("bypass sensitive write + sandbox auto-allow = %v (%s), want deny safety_check:bypass_immune", got, source)
 	}
 }

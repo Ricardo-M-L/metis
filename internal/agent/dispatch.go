@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
@@ -19,12 +21,12 @@ import (
 // toolSpecs builds the per-request `tools[]` array given to the LLM, by
 // asking each registered tool for its name + description + input schema.
 //
-// Tools are emitted in cache-stable order via Registry.SortedForCache():
-// built-ins sorted by name first, then MCP tools sorted by name. This
-// keeps the Anthropic prompt-cache breakpoint placed after the last
-// built-in valid across MCP server churn — claude-code's tools.ts:354-366.
+// Tools are emitted in cache-stable exposure order via
+// Registry.ModelEntriesForCache(): Direct tools first, then Deferred, with
+// each segment sorted. Anthropic marks the end of the Direct segment as its
+// stable tool cache boundary, so deferred discovery does not invalidate it.
 //
-// When lazy mode fires, mcp__-prefixed tools have their schemas
+// When lazy mode fires, Deferred tools have their schemas
 // stripped and a synthetic ToolSearch tool is appended. Saves
 // ~10K+ tokens per iteration for MCP-heavy sessions; see lazy_tools.go
 // for the trade-off discussion and the env-var match table.
@@ -34,8 +36,8 @@ import (
 // openclaude). Three branches:
 //
 //   - Standard → no rewrite, full schemas always sent.
-//   - Always   → strip every mcp__* schema unconditionally.
-//   - Auto     → strip only when the deferred MCP token estimate
+//   - Always   → strip every unresolved Deferred schema unconditionally.
+//   - Auto     → strip only when the Deferred token estimate
 //     exceeds `ContextWindow * percentage / 100`.
 //
 // Auto without a known ContextWindow falls back to "standard" rather
@@ -53,13 +55,21 @@ func (l *Loop) ToolSpecsSnapshot() []llm.ToolSpec {
 }
 
 func (l *Loop) toolSpecs() []llm.ToolSpec {
-	all := l.Registry.SortedForCache()
+	all := l.Registry.ModelEntriesForCache()
 	out := make([]llm.ToolSpec, 0, len(all))
-	for _, t := range all {
+	deferred := make(map[string]bool)
+	for _, entry := range all {
+		t := entry.Tool
 		desc := descriptionForTool(t, l.ShortToolDescriptions)
 		out = append(out, llm.ToolSpec{
-			Name: t.Name(), Description: desc, InputSchema: t.InputSchema(),
+			Name:        t.Name(),
+			Description: desc,
+			InputSchema: t.InputSchema(),
+			Exposure:    string(entry.Exposure),
 		})
+		if entry.Exposure == tools.ToolExposureDeferred {
+			deferred[t.Name()] = true
+		}
 	}
 	mode, pct := parseEnableToolSearch(os.Getenv("ENABLE_TOOL_SEARCH"))
 	// preserve = MCP tools whose schemas the model has already fetched
@@ -72,14 +82,28 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 	case LazyModeStandard:
 		return out
 	case LazyModeAlways:
-		return stripAndAppendToolSearchWithPreserve(out, preserve)
+		return stripAndAppendToolSearchWithExposure(out, deferred, preserve)
 	case LazyModeAuto:
 		if l.ContextWindow <= 0 {
 			return out
 		}
-		return applyLazySchemaByTokensWithPreserve(out, l.ContextWindow, pct, preserve)
+		return applyLazySchemaByTokensWithExposure(out, l.ContextWindow, pct, deferred, preserve)
 	}
 	return out
+}
+
+// deferredSchemaPending reports whether the exact tool is currently present
+// only as a lazy placeholder. It derives the answer from the same toolSpecs
+// projection sent to the provider, so Auto/Always mode and discovery state
+// cannot drift from the execution gate.
+func (l *Loop) deferredSchemaPending(name string) bool {
+	for _, spec := range l.toolSpecs() {
+		if spec.Name != name {
+			continue
+		}
+		return isLazyPlaceholderSpec(spec)
+	}
+	return false
 }
 
 // descriptionForTool picks the right description for a tool given the
@@ -175,6 +199,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		idx                     int
 		blk                     llm.ContentBlock
 		t                       tools.Tool
+		presentationInput       map[string]any    // redacted clone; never used for execution
 		early                   *llm.ContentBlock // set when pre-check decided result
 		ready                   bool              // true once pre-checks all pass
 		startedAt               time.Time         // set when EventToolStart is emitted; used to populate Event.Elapsed on result
@@ -204,7 +229,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			})
 			continue
 		}
-		t, ok := l.Registry.Get(b.ToolName)
+		entry, ok := l.Registry.GetModelEntry(b.ToolName)
 		if !ok {
 			results[i] = llm.ContentBlock{
 				Type: "tool_result", ToolUseID: b.ToolUseID,
@@ -217,8 +242,22 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			})
 			continue
 		}
+		t := entry.Tool
+		if entry.Exposure == tools.ToolExposureDeferred && l.deferredSchemaPending(t.Name()) {
+			results[i] = llm.ContentBlock{
+				Type: "tool_result", ToolUseID: b.ToolUseID,
+				ToolResult: fmt.Sprintf("error: tool %q is deferred; call ToolSearch with select:%s before invoking it", t.Name(), t.Name()),
+				IsError:    true,
+			}
+			emit(ctx, out, Event{
+				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+				ToolResult:  &ToolResult{Output: "deferred tool schema not loaded; call ToolSearch first", IsError: true},
+				TraceCallID: traceCallID,
+			})
+			continue
+		}
 
-		j := &job{idx: i, blk: b, t: t, traceCallID: traceCallID}
+		j := &job{idx: i, blk: b, t: t, traceCallID: traceCallID, presentationInput: redactedToolInput(b.ToolInput)}
 		if isTraceChildTool(b.ToolName) {
 			j.traceInvocationID = NewTraceInvocationID()
 			j.traceParentInvocationID = TraceInvocationIDFromContext(ctx)
@@ -227,7 +266,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 
 		emit(ctx, out, Event{
 			Kind: EventToolStart, ToolUseID: b.ToolUseID,
-			ToolName: b.ToolName, ToolInput: b.ToolInput,
+			ToolName: b.ToolName, ToolInput: clonePresentation(j.presentationInput),
 			TraceInvocationID:       j.traceInvocationID,
 			TraceParentInvocationID: j.traceParentInvocationID,
 			TraceCallID:             j.traceCallID,
@@ -271,7 +310,52 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 				}
 				if mod.ModifiedInput != nil {
 					j.blk.ToolInput = mod.ModifiedInput
+					if mod.PresentationInput != nil {
+						// PresentationInput may already mask exact hook-env values,
+						// but it still crosses an untrusted UI/persistence boundary.
+						// Apply the structural credential-key redactor as a final
+						// defense instead of trusting every hook author to remember it.
+						j.presentationInput = redactedToolInput(mod.PresentationInput)
+					} else {
+						j.presentationInput = redactedToolInput(mod.ModifiedInput)
+					}
 				}
+			}
+		}
+
+		// An unattended caller such as cron must authorize every
+		// side-effecting invocation, including tools (notably MCP) whose own
+		// CanUse implementation returns ALLOW unconditionally. Evaluate only
+		// after hooks have finalized the exact execution arguments and before
+		// CanUse/Execute. Read-only tools preserve their existing auto-run
+		// semantics.
+		if admission := toolAdmissionPolicyFromContext(ctx); admission != nil && !tools.IsReadOnly(t, j.blk.ToolInput) {
+			allow, admissionReason := admission(t.Name(), clonePresentation(j.blk.ToolInput))
+			if !allow {
+				admissionReason = security.RedactSubprocessText(admissionReason)
+				ev := permissionRequestEvent(j.blk, j.presentationInput, 0)
+				ev.PermissionReason = admissionReason
+				emit(ctx, out, ev)
+
+				modelMsg := "denied by unattended admission policy"
+				tuiMsg := modelMsg
+				if admissionReason != "" {
+					modelMsg += ": " + admissionReason
+					tuiMsg += ": " + admissionReason
+				}
+				blkOut := llm.ContentBlock{
+					Type: "tool_result", ToolUseID: b.ToolUseID,
+					ToolResult: modelMsg, IsError: true,
+				}
+				emit(ctx, out, Event{
+					Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+					ToolResult:              &ToolResult{Output: tuiMsg, IsError: true},
+					TraceInvocationID:       j.traceInvocationID,
+					TraceParentInvocationID: j.traceParentInvocationID,
+					TraceCallID:             j.traceCallID,
+				})
+				j.early = &blkOut
+				continue
 			}
 		}
 
@@ -285,7 +369,56 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		// 2026-05-18 bench6 review — 1–3 mystery denies per run that
 		// no one could debug without source-diving. Surface the reason
 		// in BOTH outbound channels so future denies are debuggable.
-		perm, reason := t.CanUse(ctx, j.blk.ToolInput)
+		// Bind path preparation to this exact call. Provider tool_use_id is
+		// presentation metadata and can be reused; traceCallID is generated once
+		// per job and is propagated unchanged to Execute below.
+		permissionCtx := tools.WithInvocationID(ctx, j.traceCallID)
+		perm, reason := t.CanUse(permissionCtx, j.blk.ToolInput)
+		// Policy markers are control data, not credential values. Record this
+		// before redaction because the generic assignment scrubber intentionally
+		// treats a value after `secret_read:` as sensitive. The model/UI still
+		// receive only the redacted reason below.
+		bypassImmuneReason := strings.Contains(reason, "bypass_immune")
+		reason = security.RedactSubprocessText(reason)
+		if bypassImmuneReason && !strings.Contains(reason, "bypass_immune") {
+			reason = "bypass_immune policy"
+		}
+		// Final runtime backstop for third-party/plugin tools that do not use
+		// METIS's Gate. In bypassPermissions tools normally return ALLOW directly.
+		// A remaining ASK is upgraded only when the tool explicitly opts into the
+		// public BypassAutoAllowAware contract; legacy plugin ASK semantics stay
+		// fail-closed. Interactive and bypass-immune calls are always denied.
+		bypassUnattended := l.Gate != nil && l.Gate.Mode() == permission.ModeBypassPermissions
+		if !bypassUnattended && l.Gate != nil && l.Gate.Mode() == permission.ModePlan {
+			previous, ok := permission.ParseMode(l.PrePlanMode())
+			bypassUnattended = ok && previous == permission.ModeBypassPermissions
+		}
+		if bypassUnattended {
+			if tools.RequiresUserInteraction(t) {
+				perm = tools.PermissionDeny
+				reason = "interactive tool unavailable in bypassPermissions unattended mode"
+			} else if perm == tools.PermissionAsk {
+				// Built-ins that delegate to Gate return the bypass-immune marker
+				// in their reason. This matters while a bypass session is
+				// temporarily in plan mode: Gate correctly returns ASK for a
+				// credential read, but the live mode alone no longer converts it
+				// to DENY. Never upgrade that policy ASK back to ALLOW here.
+				if bypassImmuneReason {
+					perm = tools.PermissionDeny
+				} else if immune, immuneReason := tools.IsBypassImmune(t, j.blk.ToolInput); immune {
+					perm = tools.PermissionDeny
+					if immuneReason != "" {
+						reason = immuneReason
+					}
+				} else if tools.CanAutoAllowInBypass(t, j.blk.ToolInput) {
+					perm = tools.PermissionAllow
+					reason = "mode:bypassPermissions"
+				} else {
+					perm = tools.PermissionDeny
+					reason = "tool requested approval and has not opted into bypassPermissions auto-execution"
+				}
+			}
+		}
 		if perm == tools.PermissionDeny {
 			modelMsg := "denied by permission policy"
 			tuiMsg := "denied"
@@ -320,7 +453,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	// rather than letting Execute interleave between asks.
 	for ai, j := range asks {
 		remaining := len(asks) - ai - 1
-		ar := l.askPermissionPending(ctx, j.blk, out, remaining)
+		ar := l.askPermissionPending(ctx, j.blk, j.presentationInput, out, remaining)
 		if !ar.proceed {
 			j.early = ar.earlyReturn
 			if j.early != nil {
@@ -532,6 +665,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// multiple sub-agents run in parallel. Other tools ignore it.
 	toolCtx = WithParentToolUseID(toolCtx, blk.ToolUseID)
 	toolCtx = WithTraceInvocationID(toolCtx, traceInvocationID)
+	toolCtx = tools.WithInvocationID(toolCtx, traceCallID)
 
 	// Honor InterruptBlock: tools that declare InterruptBlock want to
 	// finish their current invocation even if the parent ctx gets
@@ -776,16 +910,79 @@ func clonePresentationValue(value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		return clonePresentation(typed)
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, item := range typed {
+			out[key] = item
+		}
+		return out
 	case []any:
 		out := make([]any, len(typed))
 		for i, item := range typed {
 			out[i] = clonePresentationValue(item)
 		}
 		return out
+	case []string:
+		return append([]string(nil), typed...)
 	default:
 		// Presentation is documented as JSON-shaped. JSON scalar values are
 		// immutable, so retaining them is safe; tools should express nested
 		// collections as map[string]any / []any.
+		return value
+	}
+}
+
+// redactedToolInput creates the event/UI copy of model- or hook-controlled
+// arguments. The returned graph never aliases the execution input. Config
+// hooks additionally provide PresentationInput so exact environment secrets
+// (including values without a recognizable token prefix) are already removed.
+func redactedToolInput(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		if security.IsCredentialFieldName(key) {
+			// A field name supplies the context an arbitrary value such as
+			// "hunter2" lacks. Mask the complete value (including nested
+			// objects/arrays) so no child metadata can escape by shape.
+			out[key] = "[REDACTED]"
+			continue
+		}
+		out[key] = redactedToolInputValue(value)
+	}
+	return out
+}
+
+func redactedToolInputValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return security.RedactSubprocessText(typed)
+	case map[string]any:
+		return redactedToolInput(typed)
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, item := range typed {
+			if security.IsCredentialFieldName(key) {
+				out[key] = "[REDACTED]"
+			} else {
+				out[key] = security.RedactSubprocessText(item)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = redactedToolInputValue(item)
+		}
+		return out
+	case []string:
+		out := make([]string, len(typed))
+		for i, item := range typed {
+			out[i] = security.RedactSubprocessText(item)
+		}
+		return out
+	default:
 		return value
 	}
 }

@@ -241,6 +241,9 @@ func (r *REPL) setPermissionMode(mode permission.Mode, label string) {
 		fmt.Fprintln(r.out, "mode: permission gate unavailable")
 		return
 	}
-	r.Gate.SetMode(mode)
+	if err := applyREPLPermissionMode(r, mode); err != nil {
+		fmt.Fprintln(r.out, "mode unchanged: "+err.Error())
+		return
+	}
 	fmt.Fprintln(r.out, "(mode set: "+label+")")
 }

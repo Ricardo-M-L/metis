@@ -9,13 +9,30 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 type LS struct {
 	tools.BaseTool
-	gate *permission.Gate
+	gate    *permission.Gate
+	sandbox *sandbox.Manager
 }
+
+// NewLS preserves the legacy unsandboxed construction path used by tests and
+// embedders. Runtime registration uses NewLSWithSandbox.
+func NewLS(gate *permission.Gate) LS { return LS{gate: gate} }
+
+func NewLSWithSandbox(gate *permission.Gate, manager *sandbox.Manager) LS {
+	return LS{gate: gate, sandbox: manager}
+}
+
+func (l LS) WithSandbox(manager *sandbox.Manager) LS {
+	l.sandbox = manager
+	return l
+}
+
+func (l LS) SandboxManager() *sandbox.Manager { return l.sandbox }
 
 func (LS) Name() string { return "LS" }
 func (LS) Description() string {
@@ -38,13 +55,14 @@ func (LS) InputSchema() map[string]any {
 	}
 }
 func (LS) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
-func (l LS) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
+func (l LS) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
 	path := strFromAny(in["path"])
-	d, src := l.gate.CheckPath(context.Background(), "LS", path, path)
+	target := resolvePathAgainstAgentCWD(ctx, path)
+	d, src := l.gate.CheckPath(ctx, "LS", path, target)
 	return mapDecision(d), src
 }
 
-func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (l LS) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	path, _ := in["path"].(string)
 	if path == "" {
 		// 2026-05-22: rich error replacing bare errors.New short-
@@ -63,6 +81,7 @@ func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 			IsError: true,
 		}, nil
 	}
+	path = resolvePathAgainstAgentCWD(ctx, path)
 	// Resolve relative paths against cwd. Earlier this hard-failed with
 	// "absolute path required", which forced the LLM into a retry loop
 	// any time it produced something like "src/" — observed in the
@@ -124,7 +143,7 @@ func (LS) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
 	// Inside a worktree we trust the user picked a project dir and
 	// return everything. See scope.go.
 	truncated := 0
-	if _, items := walkBudget(path); items > 0 && len(rows) > items {
+	if _, items := walkBudgetWithSandbox(ctx, path, l.sandbox); items > 0 && len(rows) > items {
 		truncated = len(rows) - items
 		rows = rows[:items]
 	}

@@ -14,21 +14,27 @@ package mcp
 //	~/.metis/mcp-cache/<server-name>.json
 //
 //	{
+//	  "version":     3,
 //	  "fingerprint": "sha256:abc…",
 //	  "cached_at":   "2026-05-11T06:30:00Z",
 //	  "tools":       [{name, description, input_schema}, ...]
 //	}
 //
-// Fingerprint covers (command, args, url, headers) — anything that
+// Fingerprint covers every ServerEntry field that affects launch or the
+// model-visible schema (command/args/url/headers/env/auth/working directory,
+// enable/disable filters and disabled state) — anything that
 // changes the server identity invalidates the cache automatically. If
 // the user edits mcp.toml to point a server at a new binary, the next
 // startup spawns it fresh and rewrites the cache.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -48,9 +54,28 @@ type CachedTool struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-// Cache is the on-disk envelope. Loose fields (cached_at, version)
-// are informational — the load path only uses Fingerprint + Tools.
+const (
+	// cacheFormatVersion invalidates schema snapshots written before MCP
+	// model-facing metadata was credential-redacted. Old files may contain a
+	// server-echoed token in a description or input schema and must not be
+	// reloaded.
+	cacheFormatVersion = 3
+
+	// Cache files are untrusted local input: MCP servers populate their model-
+	// visible schemas, and users can edit the JSON directly. These limits keep
+	// startup memory bounded while remaining far above normal MCP catalogs.
+	maxCacheFileBytes             = 16 << 20
+	maxCachedTools                = 1024
+	maxCachedToolNameBytes        = 256
+	maxCachedToolDescriptionBytes = 64 << 10
+	maxCachedToolSchemaBytes      = 1 << 20
+	maxCacheDecodedBytes          = 12 << 20
+)
+
+// Cache is the on-disk envelope. Version is enforced so security-boundary
+// changes can invalidate snapshots that are unsafe to expose to the model.
 type Cache struct {
+	Version     int          `json:"version"`
 	Fingerprint string       `json:"fingerprint"`
 	CachedAt    string       `json:"cached_at"`
 	Tools       []CachedTool `json:"tools"`
@@ -63,16 +88,110 @@ func CacheDir() string {
 	return filepath.Join(config.Home(), "mcp-cache")
 }
 
-// CachePath returns the full path for one server's cache file.
-// File name is the literal server name; mcp.toml constrains the legal
-// charset (no `/` etc.) since the same string lands in `mcp__<name>__*`
-// tool prefixes the LLM sees.
+// CachePath returns the full path for one server's cache file. Invalid names
+// return an empty string so even direct callers cannot turn this convenience
+// helper into a traversal primitive. LoadCache and SaveCache return the
+// detailed validation error before calling it.
 func CachePath(serverName string) string {
+	if validateServerName(serverName) != nil {
+		return ""
+	}
 	return filepath.Join(CacheDir(), serverName+".json")
 }
 
+func validateCache(cache *Cache) error {
+	if cache == nil {
+		return errors.New("nil cache")
+	}
+	if len(cache.Tools) > maxCachedTools {
+		return fmt.Errorf("tool count %d exceeds limit %d", len(cache.Tools), maxCachedTools)
+	}
+
+	total := len(cache.Fingerprint) + len(cache.CachedAt)
+	if total > maxCacheDecodedBytes {
+		return fmt.Errorf("decoded payload exceeds limit %d bytes", maxCacheDecodedBytes)
+	}
+	for i := range cache.Tools {
+		tool := &cache.Tools[i]
+		if tool.Name == "" {
+			return fmt.Errorf("tool[%d] has an empty name", i)
+		}
+		if len(tool.Name) > maxCachedToolNameBytes {
+			return fmt.Errorf("tool[%d] name exceeds limit %d bytes", i, maxCachedToolNameBytes)
+		}
+		if len(tool.Description) > maxCachedToolDescriptionBytes {
+			return fmt.Errorf(
+				"tool[%d] description exceeds limit %d bytes",
+				i, maxCachedToolDescriptionBytes,
+			)
+		}
+		schema, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			return fmt.Errorf("tool[%d] schema is not valid JSON: %w", i, err)
+		}
+		if len(schema) > maxCachedToolSchemaBytes {
+			return fmt.Errorf("tool[%d] schema exceeds limit %d bytes", i, maxCachedToolSchemaBytes)
+		}
+		part := len(tool.Name) + len(tool.Description) + len(schema)
+		if part > maxCacheDecodedBytes-total {
+			return fmt.Errorf("decoded payload exceeds limit %d bytes", maxCacheDecodedBytes)
+		}
+		total += part
+	}
+	return nil
+}
+
+// decodeCacheEnvelope avoids unmarshalling an attacker-controlled tools array
+// directly into a slice. The raw file cap bounds bytes, while the streaming
+// loop rejects the 1025th tool before allocating another CachedTool/schema.
+func decodeCacheEnvelope(raw []byte) (*Cache, error) {
+	var envelope struct {
+		Version     int             `json:"version"`
+		Fingerprint string          `json:"fingerprint"`
+		CachedAt    string          `json:"cached_at"`
+		Tools       json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, err
+	}
+	cache := &Cache{
+		Version:     envelope.Version,
+		Fingerprint: envelope.Fingerprint,
+		CachedAt:    envelope.CachedAt,
+	}
+	if cache.Version != cacheFormatVersion {
+		return cache, nil
+	}
+	toolsRaw := bytes.TrimSpace(envelope.Tools)
+	if len(toolsRaw) == 0 || bytes.Equal(toolsRaw, []byte("null")) {
+		return cache, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(toolsRaw))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '[' {
+		return nil, errors.New("tools must be a JSON array")
+	}
+	for decoder.More() {
+		if len(cache.Tools) >= maxCachedTools {
+			return nil, fmt.Errorf("tool count exceeds limit %d", maxCachedTools)
+		}
+		var tool CachedTool
+		if err := decoder.Decode(&tool); err != nil {
+			return nil, err
+		}
+		cache.Tools = append(cache.Tools, tool)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	return cache, nil
+}
+
 // FingerprintEntry computes a SHA-256 over the entry's launch identity.
-// Covers (command, args, url, headers) so any edit to mcp.toml that
+// Covers every launch/schema-affecting ServerEntry field so any edit to mcp.toml that
 // would actually change which process gets spawned invalidates the
 // cache. `name` is NOT part of the fingerprint — file name covers that
 // dimension, and rename-without-change should still hit the cache.
@@ -88,15 +207,36 @@ func FingerprintEntry(e ServerEntry) string {
 		fmt.Fprintf(h, "arg:%s\n", a)
 	}
 	fmt.Fprintf(h, "url:%s\n", e.URL)
-	keys := make([]string, 0, len(e.Headers))
-	for k := range e.Headers {
-		keys = append(keys, k)
+	fmt.Fprintf(h, "auth:%s\n", strings.ToLower(strings.TrimSpace(e.Auth)))
+	fmt.Fprintf(h, "disabled:%t\n", e.Disabled)
+	fingerprintMap(h, "hdr", e.Headers)
+	fingerprintMap(h, "env", e.Env)
+	fingerprintSet(h, "enabled_tool", e.EnabledTools)
+	fingerprintSet(h, "disabled_tool", e.DisabledTools)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+type stringWriter interface {
+	Write([]byte) (int, error)
+}
+
+func fingerprintMap(h stringWriter, prefix string, values map[string]string) {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(h, "hdr:%s=%s\n", k, e.Headers[k])
+	for _, key := range keys {
+		fmt.Fprintf(h, "%s:%s=%s\n", prefix, key, values[key])
 	}
-	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+func fingerprintSet(h stringWriter, prefix string, values []string) {
+	sorted := append([]string(nil), values...)
+	sort.Strings(sorted)
+	for _, value := range sorted {
+		fmt.Fprintf(h, "%s:%s\n", prefix, value)
+	}
 }
 
 // LoadCache reads the cache for one server. Returns (nil, nil) on
@@ -104,19 +244,36 @@ func FingerprintEntry(e ServerEntry) string {
 // rather than a hard error. Malformed JSON is a hard error so we
 // don't silently downgrade to no-cache when something has gone wrong.
 func LoadCache(serverName string) (*Cache, error) {
+	if err := validateServerName(serverName); err != nil {
+		return nil, fmt.Errorf("mcp cache: %w", err)
+	}
 	p := CachePath(serverName)
-	raw, err := os.ReadFile(p)
+	f, err := openRegularCacheFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", p, err)
 	}
-	var c Cache
-	if err := json.Unmarshal(raw, &c); err != nil {
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxCacheFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", p, err)
+	}
+	if len(raw) > maxCacheFileBytes {
+		return nil, fmt.Errorf("read %s: cache exceeds limit %d bytes", p, maxCacheFileBytes)
+	}
+	c, err := decodeCacheEnvelope(raw)
+	if err != nil {
 		return nil, fmt.Errorf("decode %s: %w", p, err)
 	}
-	return &c, nil
+	if c.Version != cacheFormatVersion {
+		return nil, nil
+	}
+	if err := validateCache(c); err != nil {
+		return nil, fmt.Errorf("decode %s: unsafe cache: %w", p, err)
+	}
+	return c, nil
 }
 
 // SaveCache writes (or overwrites) the cache for one server.
@@ -126,19 +283,29 @@ func LoadCache(serverName string) (*Cache, error) {
 // Save: 0o600 because cached schemas may reflect tool params that
 // reference paths or argv shapes worth keeping out of broad reads.
 func SaveCache(serverName string, c *Cache) error {
+	if err := validateServerName(serverName); err != nil {
+		return fmt.Errorf("mcp cache: %w", err)
+	}
 	if c == nil {
 		return fmt.Errorf("mcp_cache: nil cache for %q", serverName)
-	}
-	dir := CacheDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	if c.CachedAt == "" {
 		c.CachedAt = time.Now().UTC().Format(time.RFC3339)
 	}
+	c.Version = cacheFormatVersion
+	if err := validateCache(c); err != nil {
+		return fmt.Errorf("mcp_cache: unsafe cache for %q: %w", serverName, err)
+	}
 	raw, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode cache for %q: %w", serverName, err)
+	}
+	if len(raw) > maxCacheFileBytes {
+		return fmt.Errorf("encode cache for %q: cache exceeds limit %d bytes", serverName, maxCacheFileBytes)
+	}
+	dir := CacheDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	final := CachePath(serverName)
 	tmp, err := os.CreateTemp(dir, "."+serverName+".*.json")

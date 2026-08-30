@@ -259,9 +259,8 @@ func EventOutFromContext(ctx context.Context) chan<- Event {
 // cwdKey carries a per-sub-agent effective working directory through
 // context (Phase G.2, 2026-05-12). The Agent tool stamps this when
 // the caller passes `cwd:"<abs path>"` or `isolation:"worktree"`;
-// tools that care about cwd (Bash sets cmd.Dir from it; future
-// Glob/LS could resolve relative roots against it) read it via
-// CwdFromContext.
+// tools that care about cwd (including Bash, Git, Glob, Grep, LS, and
+// ViewImage) read it via CwdFromContext.
 //
 // Tools that don't read it default to the process-wide os.Getwd(),
 // which is the parent agent's cwd — matching pre-G.2 behavior so
@@ -521,10 +520,24 @@ type Event struct {
 	ToolCalls []ToolCall
 
 	// Permission events: consumer writes PermissionDecision to PermissionReply.
-	PermissionTool   string
-	PermissionInput  map[string]any
-	PermissionReason string
-	PermissionReply  chan PermissionDecision // buffered, size 1
+	PermissionTool string
+	// PermissionInput is the redacted presentation copy. It is the ONLY
+	// permission argument map that may be rendered, logged, traced, sent over
+	// ACP/WebUI, audited, or persisted.
+	PermissionInput map[string]any
+	// permissionPolicyInput is an exact deep-cloned snapshot of the arguments
+	// that will be executed. It exists solely so an unattended in-process
+	// policy consumer (currently cron) authorizes the same bytes the tool sees.
+	//
+	// Keep this field private: it must never be rendered, logged, traced, sent
+	// over ACP/WebUI, audited, or persisted. Call
+	// PermissionPolicyInputForAuthorization only at the policy decision point.
+	// Store the snapshot behind an accessor closure instead of as a map field.
+	// Besides keeping it package-private, this prevents an accidental generic
+	// fmt dump of Event from printing the raw values.
+	permissionPolicyInput func() map[string]any
+	PermissionReason      string
+	PermissionReply       chan PermissionDecision // buffered, size 1
 
 	// PermissionPending is the count of additional ASK requests in the
 	// SAME tool batch that are still queued behind this one. Lets the
@@ -588,6 +601,57 @@ type Event struct {
 	// restarts; persistence uses this durable-in-session key to pair one
 	// tool_start with its own result without merging later calls.
 	TraceCallID string
+}
+
+// PermissionPolicyInputForAuthorization returns a fresh defensive copy of
+// the exact tool arguments captured for an EventPermissionRequest. This is a
+// deliberately narrow escape hatch for in-process authorization policy. The
+// returned value must never be rendered, logged, traced, audited, persisted,
+// or sent over ACP/WebUI; all presentation code must use PermissionInput.
+func (e Event) PermissionPolicyInputForAuthorization() (map[string]any, bool) {
+	if e.permissionPolicyInput == nil {
+		return nil, false
+	}
+	return e.permissionPolicyInput(), true
+}
+
+// capturePermissionPolicyInput freezes one JSON-shaped argument graph and
+// returns defensive copies to the sole policy accessor. The closure also keeps
+// raw values out of generic Event formatting and serialization surfaces.
+func capturePermissionPolicyInput(input map[string]any) func() map[string]any {
+	snapshot := clonePresentation(input)
+	return func() map[string]any { return clonePresentation(snapshot) }
+}
+
+// PresentationCopy returns a detached event suitable for UI replay, wire
+// adapters, and other presentation-only consumers. Authorization-only state
+// is deliberately removed so a replay buffer cannot extend the lifetime of
+// raw credential-bearing tool arguments after the decision point.
+//
+// Presentation maps are redacted again and deep-cloned here. Producers are
+// expected to emit presentation-safe values already, but enforcing that
+// boundary at the storage handoff keeps a future producer mistake from
+// turning into a long-lived UI or replay leak.
+func (e Event) PresentationCopy() Event {
+	e.permissionPolicyInput = nil
+	e.PermissionReply = nil
+	e.AskUserReply = nil
+
+	e.ToolInput = redactedToolInput(e.ToolInput)
+	e.PermissionInput = redactedToolInput(e.PermissionInput)
+	if e.ToolResult != nil {
+		result := *e.ToolResult
+		result.Presentation = redactedToolInput(result.Presentation)
+		e.ToolResult = &result
+	}
+	if len(e.ToolCalls) > 0 {
+		e.ToolCalls = append([]ToolCall(nil), e.ToolCalls...)
+		for i := range e.ToolCalls {
+			e.ToolCalls[i].Input = redactedToolInput(e.ToolCalls[i].Input)
+		}
+	}
+	e.AskUserOptions = append([]string(nil), e.AskUserOptions...)
+	return e
 }
 
 // ToolCall represents a tool the model wants to invoke.

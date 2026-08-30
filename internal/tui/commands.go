@@ -17,6 +17,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/mcpoauth"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
@@ -24,6 +25,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/themes"
+	"github.com/Ricardo-M-L/metis/internal/tools"
+	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
@@ -222,7 +225,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "skills", Aliases: []string{"sk"}, Description: "skills: list | install | remove | info | edit | enable | disable | create | search (local)", Handler: cmdSkills})
 
 	// === MCP ===
-	r.Register(REPLCommand{Name: "mcp", Description: "MCP ops: list | add | remove | start | enable | disable | edit | test | logs | reload", Handler: cmdMCP})
+	r.Register(REPLCommand{Name: "mcp", Description: "MCP ops: list | add | remove | start | login | enable | disable | edit | test | logs | reload", Handler: cmdMCP})
 	r.Register(REPLCommand{Name: "cu", Description: "computer-use (metis-cu) ops: enable | disable | status", Handler: cmdCU})
 
 	// === Session ===
@@ -457,7 +460,9 @@ func switchREPLModel(r *REPL, newModel string) error {
 	r.providerName = newProvName
 	r.baseSystem = newBaseSystem
 	r.baseSystemSections = newBaseSections
-	runtime.RebindLoopRuntime(r.Loop, pb.Provider, pb.Model, newSystem, r.SessionID)
+	runtime.RebindLoopRuntime(r.Loop, pb.Provider, pb.Model, newSystem, r.SessionID, runtime.LoopRuntimeRebindOptions{
+		ProviderName: newProvName,
+	})
 	getModelState().AddRecent(pb.Model)
 	return nil
 }
@@ -1245,6 +1250,18 @@ func cmdSkill(r *REPL, args string) string {
 // MCP
 // =============================================================================
 
+// ensureMCPToken is a narrow test seam around the credential side effect. The
+// only production call that passes interactive=true is handleMCPLogin, reached
+// when the user explicitly enters `/mcp login <name>`. Autonomous startup and
+// lazy tool execution remain in runtime/mcp and always pass interactive=false.
+var ensureMCPToken = func(ctx context.Context, serverKey, serverURL string, interactive bool) (string, error) {
+	store := mcpoauth.NewTokenStore()
+	if interactive {
+		return store.Login(ctx, serverKey, serverURL)
+	}
+	return store.EnsureToken(ctx, serverKey, serverURL, false)
+}
+
 func cmdMCP(r *REPL, args string) string {
 	args = strings.TrimSpace(args)
 	if args == "" {
@@ -1276,6 +1293,11 @@ func cmdMCP(r *REPL, args string) string {
 			return "usage: mcp start <name>"
 		}
 		return r.handleMCPStart(parts[1])
+	case "login":
+		if len(parts) < 2 {
+			return "usage: mcp login <name>"
+		}
+		return r.handleMCPLogin(parts[1])
 	case "enable":
 		if len(parts) < 2 {
 			return "usage: mcp enable <name>"
@@ -1309,7 +1331,74 @@ func cmdMCP(r *REPL, args string) string {
 		return r.handleMCPReload()
 	}
 	return "mcp: unknown '" + sub + "'. usage: mcp list | add <name> <cmd> [args] | remove <name> |\n" +
-		"  start <name> | enable <name> | disable <name> | edit [<name>] | test <name> | logs <name> | reload"
+		"  start <name> | login <name> | enable <name> | disable <name> | edit [<name>] | test <name> | logs <name> | reload"
+}
+
+// handleMCPLogin is the sole interactive OAuth entry point for MCP servers.
+// Loading and validating the on-disk entry before starting the browser flow
+// keeps `/mcp login` explicit and prevents stdio/static-header entries from
+// accidentally entering OAuth.
+func (r *REPL) handleMCPLogin(name string) string {
+	base := context.Background()
+	if r != nil && r.ctx != nil {
+		base = r.ctx
+	}
+	ctx, cancel := context.WithTimeout(base, mcpLoginTimeout)
+	defer cancel()
+	return r.handleMCPLoginContext(ctx, base, name)
+}
+
+func (r *REPL) handleMCPLoginContext(ctx, lifecycleCtx context.Context, name string) string {
+	target, err := resolveMCPLoginTarget(name)
+	if err != nil {
+		return redactMCPLoginError(err)
+	}
+	var registry *tools.Registry
+	if r != nil && r.Loop != nil {
+		registry = r.Loop.Registry
+	}
+	launch, err := runMCPLogin(ctx, lifecycleCtx, target, registry)
+	if err != nil {
+		return "mcp login " + name + ": " + redactMCPLoginError(err)
+	}
+	if err := ctx.Err(); err != nil {
+		closeMCPLoginLaunch(launch)
+		return "mcp login " + name + ": " + redactMCPLoginError(err)
+	}
+	var adopt func(*mcptools.Server, []tools.Tool) bool
+	if r != nil {
+		adopt = r.AdoptMCPServer
+	}
+	toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(registry, name, launch, adopt)
+	if r != nil && ownsServer {
+		r.mcpLoginServers = append(r.mcpLoginServers, launch.server)
+	}
+	if registry != nil {
+		return fmt.Sprintf("(MCP server %q OAuth login complete · %d tools available now)", name, toolCount)
+	}
+	return fmt.Sprintf("(MCP server %q OAuth login complete)", name)
+}
+
+func resolveMCPLoginTarget(name string) (mcpLoginTarget, error) {
+	reg, err := mcp.Load()
+	if err != nil {
+		return mcpLoginTarget{}, fmt.Errorf("mcp login: %w", err)
+	}
+	entry := mcp.FindServer(reg, name)
+	if entry == nil {
+		return mcpLoginTarget{}, fmt.Errorf("no MCP server named: %s", name)
+	}
+	expanded, err := mcp.ExpandServerEntry(*entry)
+	if err != nil {
+		return mcpLoginTarget{}, fmt.Errorf("mcp login %s: %w", name, err)
+	}
+	if expanded.URL == "" {
+		return mcpLoginTarget{}, fmt.Errorf("mcp login %s: server is not an HTTP server", name)
+	}
+	if !strings.EqualFold(strings.TrimSpace(expanded.Auth), "oauth") {
+		return mcpLoginTarget{}, fmt.Errorf("mcp login %s: server does not use OAuth (set auth = \"oauth\" in mcp.toml)", name)
+	}
+	return mcpLoginTarget{name: expanded.Name, url: expanded.URL}, nil
 }
 
 func (r *REPL) handleMCPList() string {
@@ -1440,24 +1529,33 @@ func (r *REPL) handleMCPRemove(name string) string {
 
 // handleMCPStart launches a registered MCP server and grafts its tools onto
 // the live registry. Returned tools are visible to the LLM on the next turn.
-//
-// We intentionally don't track the spawned *Server pointer here — REPL has
-// no shutdown hook today; future Round can plumb cleanup via the runtime
-// struct that owns mcp child processes. For now, the OS reaps subprocesses
-// on metis exit.
 func (r *REPL) handleMCPStart(name string) string {
 	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	base := context.Background()
+	if r != nil && r.ctx != nil {
+		base = r.ctx
+	}
+	ctx, cancel := context.WithTimeout(base, 30*time.Second)
 	defer cancel()
-	srv, err := mcp.LaunchServer(ctx, reg, name, r.Loop.Registry)
+	staged := tools.NewRegistry()
+	srv, err := launchMCPServerWithLifecycle(ctx, base, func(liveCtx context.Context) (*mcptools.Server, error) {
+		return mcp.LaunchServerWithSandbox(liveCtx, reg, name, staged, r.sandbox)
+	})
 	if err != nil {
 		return "mcp start: " + err.Error()
 	}
-	tools := srv.Tools()
-	return fmt.Sprintf("(MCP server %q started · %d tools registered)", name, len(tools))
+	discovered := staged.All()
+	toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(
+		r.Loop.Registry, name,
+		mcpLoginLaunch{server: srv, tools: discovered}, r.AdoptMCPServer,
+	)
+	if ownsServer {
+		r.mcpLoginServers = append(r.mcpLoginServers, srv)
+	}
+	return fmt.Sprintf("(MCP server %q started · %d tools registered)", name, toolCount)
 }
 
 // =============================================================================
@@ -1500,7 +1598,9 @@ func cmdMode(r *REPL, args string) string {
 	if !ok {
 		return "unknown mode: " + args + " (want default|acceptEdits|plan|dontAsk|bypassPermissions)"
 	}
-	r.Gate.SetMode(mode)
+	if err := applyREPLPermissionMode(r, mode); err != nil {
+		return "mode unchanged: " + err.Error()
+	}
 	return "mode set to: " + string(mode)
 }
 

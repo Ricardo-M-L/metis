@@ -118,7 +118,7 @@ func (r *REPL) handleMCPTest(name string) string {
 	// expansion + the URL/stdio branching, so route through LaunchMCPServer
 	// with a discard registry.
 	probe := tools.NewRegistry()
-	srv, err := mcp.LaunchServer(ctx, reg, name, probe)
+	srv, err := mcp.LaunchServerWithSandbox(ctx, reg, name, probe, r.sandbox)
 	if err != nil {
 		return "mcp test: " + err.Error()
 	}

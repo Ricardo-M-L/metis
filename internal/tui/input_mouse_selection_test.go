@@ -436,15 +436,18 @@ func TestInputMouseSelection_CtrlCPrecedesActiveTurnCancellation(t *testing.T) {
 	*writes = nil
 
 	cancelled := 0
+	oauthCancelled := 0
 	m.turnActive = true
 	m.turnCancel = func() { cancelled++ }
+	m.mcpLoginPending = true
+	m.mcpLoginCancel = func() { oauthCancelled++ }
 	_, firstCmd := m.handleKey(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
-	if firstCmd != nil || cancelled != 0 || len(*writes) != 1 || (*writes)[0] != "copy" {
-		t.Fatalf("first Ctrl+C: cmd=%v cancelled=%d writes=%#v; want copy only", firstCmd, cancelled, *writes)
+	if firstCmd != nil || cancelled != 0 || oauthCancelled != 0 || len(*writes) != 1 || (*writes)[0] != "copy" {
+		t.Fatalf("first Ctrl+C: cmd=%v turn=%d oauth=%d writes=%#v; want copy only", firstCmd, cancelled, oauthCancelled, *writes)
 	}
 	_, secondCmd := m.handleKey(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
-	if secondCmd != nil || cancelled != 1 {
-		t.Fatalf("second Ctrl+C: cmd=%v cancelled=%d; want turn cancellation", secondCmd, cancelled)
+	if secondCmd != nil || cancelled != 1 || oauthCancelled != 1 {
+		t.Fatalf("second Ctrl+C: cmd=%v turn=%d oauth=%d; want both cancellations", secondCmd, cancelled, oauthCancelled)
 	}
 }
 

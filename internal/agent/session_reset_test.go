@@ -68,7 +68,7 @@ func TestResetSessionClearsSessionScopedState(t *testing.T) {
 		}}},
 		{Role: llm.RoleUser, Content: []llm.ContentBlock{{
 			Type: "tool_result", ToolUseID: "search-target",
-			ToolResult: `{"matches":[{"name":"mcp__target"}]}`,
+			ToolResult: `{"matches":[{"name":"mcp__target","input_schema":{"type":"object"}}]}`,
 		}}},
 	}
 

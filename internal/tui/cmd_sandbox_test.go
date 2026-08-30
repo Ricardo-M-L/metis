@@ -39,6 +39,16 @@ func TestCmdSandbox_NoArgsShowsStatus(t *testing.T) {
 	}
 }
 
+func TestCmdSandboxStatusNamesWholeSubprocessBoundary(t *testing.T) {
+	r, _ := sandboxTestREPL(t, "")
+	out := cmdSandbox(r, "status")
+	for _, want := range []string{"RunCode", "LSP", "Monitor", "MCP/Computer Use"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status omits sandboxed subprocess family %q: %s", want, out)
+		}
+	}
+}
+
 func TestCmdSandbox_SetsRuntimeOverride(t *testing.T) {
 	for _, mode := range []string{"off", "permissions", "auto-allow"} {
 		t.Run(mode, func(t *testing.T) {
@@ -115,6 +125,24 @@ func TestCmdSandbox_StatusAndResetUsePerRuntimeManager(t *testing.T) {
 	}
 	if _, set := manager.RuntimeMode(); set {
 		t.Fatal("reset left runtime override active")
+	}
+}
+
+func TestCmdSandboxCannotDisableBypassCredentialBoundary(t *testing.T) {
+	r, manager := sandboxTestREPL(t, "permissions")
+	r.Gate = permission.New(permission.ModeBypassPermissions)
+	r.sandbox = manager
+	if err := manager.SetRuntimeMode("auto-allow"); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"off", "reset"} {
+		out := cmdSandbox(r, command)
+		if !strings.Contains(out, "cannot") || !strings.Contains(out, "bypassPermissions") {
+			t.Fatalf("/sandbox %s output = %q", command, out)
+		}
+		if got, set := manager.RuntimeMode(); !set || got != sandbox.ModeAutoAllow {
+			t.Fatalf("/sandbox %s changed runtime override to %q, %v", command, got, set)
+		}
 	}
 }
 

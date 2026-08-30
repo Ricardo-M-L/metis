@@ -5,6 +5,7 @@ package permission
 
 import (
 	"context"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -668,9 +669,9 @@ func (g *Gate) PopRules(n int) {
 //     bypass-immune safety/secret checks before they are auto-allowed.
 //  2. Explicit ASK/DENY rules win. An explicit ALLOW remains subject to the
 //     bypass-immune safety checks below.
-//  3. Safety-check writes (.git/, .ssh/, ~/.bashrc, ...) → ASK even in
-//     Bypass mode. Read-only Bash operations are distinguished from writes,
-//     while credential reads retain their own bypass-immune check.
+//  3. Safety-check writes (.git/, .ssh/, ~/.bashrc, ...) and credential
+//     reads are bypass-immune. Interactive modes ASK; bypassPermissions
+//     silently DENIES because that mode must never open an approval UI.
 //  4. Denial-fallback breaker: if the gate has been denying repeatedly
 //     (consecutive ≥3 OR total ≥20), force ASK so a human breaks the
 //     auto-deny loop.
@@ -685,12 +686,72 @@ func (g *Gate) Check(ctx context.Context, tool, stringInput string) (Decision, s
 // its Edit/Write/NotebookEdit denial cannot be overridden by a scope grant.
 func (g *Gate) CheckPath(ctx context.Context, tool, stringInput, path string) (Decision, string) {
 	enforced, inScope := g.pathInScope(path)
-	return g.check(ctx, tool, stringInput, enforced && !inScope)
+	outOfScope := enforced && !inScope
+	if tool == "Grep" {
+		if secret, covered := metisSecretCoveredByRoot(path); covered {
+			stringInput += "\n" + secret
+		}
+	}
+	// Resolve the nearest existing ancestor before the secret-path check. The
+	// leaf itself may not exist yet, but Read/Grep and future file creation still
+	// follow a symlinked parent at execution time.
+	if abs, resolved, ok := resolvePathThroughExistingParents(path); ok && resolved != abs {
+		stringInput += "\n" + resolved
+		// Scope must be checked against the path the OS will actually touch.
+		// A workspace-local symlink to an outside directory is otherwise an
+		// implicit escape from cwd/--add-dir for both reads and writes.
+		if resolvedEnforced, resolvedInScope := g.pathInScope(resolved); resolvedEnforced && !resolvedInScope {
+			outOfScope = true
+		}
+		if tool == "Grep" {
+			if secret, covered := metisSecretCoveredByRoot(resolved); covered {
+				stringInput += "\n" + secret
+			}
+		}
+	}
+	return g.check(ctx, tool, stringInput, outOfScope)
 }
 
-func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope bool) (Decision, string) {
+// resolvePathThroughExistingParents resolves symlinks as far as the filesystem
+// permits, then reattaches any missing suffix. filepath.EvalSymlinks requires
+// the full path to exist and therefore cannot by itself protect a missing
+// credential leaf under a symlinked METIS_HOME alias.
+func resolvePathThroughExistingParents(path string) (abs, resolved string, ok bool) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", false
+	}
+	cursor := filepath.Clean(abs)
+	var missing []string
+	for {
+		if existing, err := filepath.EvalSymlinks(cursor); err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				existing = filepath.Join(existing, missing[i])
+			}
+			return abs, filepath.Clean(existing), true
+		}
+		parent := filepath.Dir(cursor)
+		if parent == cursor {
+			return abs, abs, true
+		}
+		missing = append(missing, filepath.Base(cursor))
+		cursor = parent
+	}
+}
+
+func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope bool) (decision Decision, source string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// bypassPermissions is an unattended posture: absolutely no decision may
+	// escape as ASK. Ordinary calls reach the explicit bypass ALLOW branch
+	// below; ASK here therefore means a higher-priority policy, secret/safety
+	// boundary, or denial-breaker result. Preserve its diagnostic source but
+	// fail closed without surfacing a modal prompt.
+	defer func() {
+		if g.mode == ModeBypassPermissions && decision == DecisionAsk {
+			decision = DecisionDeny
+		}
+	}()
 
 	// Plan is applied BEFORE rules so leftover allow rules cannot punch
 	// a state-changing hole through the read-only planning boundary.
@@ -752,7 +813,7 @@ func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope boo
 			// (for example `cat ~/.ssh/config`). Likewise, Read can leak a
 			// private key. Plan mode must not skip those checks merely because
 			// its hard boundary is evaluated before normal rules.
-			if isFileTouchingTool(tool) && matchesSafetyPath(stringInput) {
+			if isBypassImmuneSafetyAttempt(tool, stringInput) {
 				return DecisionAsk, "safety_check:bypass_immune"
 			}
 			if isSecretReadAttempt(tool, stringInput) {
@@ -798,13 +859,14 @@ func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope boo
 	}
 
 	// Safety-check paths: bypass-immune via path pattern. Applies only
-	// to tools that touch the filesystem / shell. Even in mode=Bypass,
-	// writing to .ssh/ or .git/config gets a human in the loop. Unlike
+	// to tools that touch the filesystem / shell. In interactive modes,
+	// writing to .ssh/ or .git/config gets a human in the loop; bypass
+	// converts the resulting ASK to a silent DENY. Unlike
 	// the old path-substring-only check, a Bash command that merely reads
 	// a sensitive agent directory can pass in bypass mode; Claude Code's
 	// Bash path validation makes the same read/write operation distinction.
-	safetyPathHit := isFileTouchingTool(tool) && matchesSafetyPath(stringInput)
-	readOnlyBypassBash := g.mode == ModeBypassPermissions && tool == "Bash" && IsReadOnlyBashSafetyOperation(stringInput)
+	safetyPathHit := isBypassImmuneSafetyAttempt(tool, stringInput)
+	readOnlyBypassBash := g.mode == ModeBypassPermissions && tool == "Bash" && IsReadOnlyBashSafetyOperation(expandKnownCredentialRoots(stringInput))
 	if safetyPathHit && !readOnlyBypassBash {
 		// Don't recordDenial here — safety ASK is informational, not
 		// a "rule denied" signal. Repeated touches of .git/ shouldn't
@@ -817,8 +879,8 @@ func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope boo
 	}
 	// Reading a credential file leaks the secret into the model context /
 	// transcript / provider request. Read of a secret path (~/.ssh/id_*,
-	// ~/.aws/credentials, …) is gated to ASK even in ask / acceptEdits /
-	// bypass modes, where read-only tools are otherwise auto-allowed below.
+	// ~/.aws/credentials, …) is gated to ASK in interactive modes and a
+	// silent DENY in bypass, where read-only tools are otherwise auto-allowed.
 	if isSecretReadAttempt(tool, stringInput) {
 		if g.mode == ModeDontAsk {
 			g.recordDenial()
@@ -1016,7 +1078,8 @@ func (g *Gate) bestMatchingRuleLocked(tool, stringInput string) (int, bool) {
 }
 
 // applyBreaker downgrades DENY → ASK when the denial-tracking breaker
-// is hot. Idempotent for ALLOW / ASK.
+// is hot. The check-level bypass invariant converts that ASK back to a
+// silent DENY, so an unattended session can never be forced into a modal.
 func (g *Gate) applyBreaker(verb Decision, src string, breakerActive bool) (Decision, string) {
 	switch verb {
 	case DecisionDeny:

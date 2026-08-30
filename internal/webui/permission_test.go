@@ -9,6 +9,8 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
 // The browser approval cards resolve through POST /api/permission; the
@@ -205,5 +207,44 @@ func TestForkEndpoint(t *testing.T) {
 		bytes.NewBufferString(`{"sessionId":"`+created.ID+`","messageIndex":99}`)))
 	if rr.Code != 400 {
 		t.Fatalf("bad index should 400, got %d", rr.Code)
+	}
+}
+
+func TestForkEndpointStartsFreshPermissionLifetime(t *testing.T) {
+	s, store := testServer(t)
+	s.freshPermissionMode = permission.ModeDefault
+	parent := session.Header{
+		ID: "fork-permission-parent", Provider: "test", Model: "test-model",
+		Mode: string(permission.ModePlan), PrePlanMode: string(permission.ModeBypassPermissions),
+		AlwaysAllow: []session.SavedRule{{Tool: "Bash", Match: "*", Verb: int(permission.DecisionAllow), Source: "interactive"}},
+	}
+	if err := store.WriteHeaderFull(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessage(parent.ID, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "fork me"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest("POST", "/api/fork",
+		bytes.NewBufferString(`{"sessionId":"`+parent.ID+`","messageIndex":0}`)))
+	if rr.Code != 200 {
+		t.Fatalf("fork: %d %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	hdr, _, err := store.Load(out.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode != string(permission.ModeDefault) || hdr.PrePlanMode != "" || len(hdr.AlwaysAllow) != 0 {
+		t.Fatalf("branch inherited permission lifetime: %+v", hdr)
+	}
+	if hdr.ForkedFrom == nil || hdr.ForkedFrom.SessionID != parent.ID || hdr.ForkedFrom.MessageCount != 1 {
+		t.Fatalf("branch lineage = %+v, want parent %q at message 1", hdr.ForkedFrom, parent.ID)
 	}
 }

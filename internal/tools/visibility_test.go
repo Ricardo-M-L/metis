@@ -141,6 +141,29 @@ func TestApplyToolVisibility_MCPWildcardWipesAllMCP(t *testing.T) {
 	}
 }
 
+func TestApplyToolVisibilityPersistsForLateRegistrationAndReplacePrefix(t *testing.T) {
+	r := newRegWith("Read", "Bash", "mcp__blocked__initial")
+	ApplyToolVisibility(r, nil, []string{"mcp__blocked", "Bash"})
+
+	// Dynamic MCP/IDE publication happens after startup filtering. The policy
+	// must therefore be applied by the registry to future writes, not only to
+	// the snapshot that happened to exist when ApplyToolVisibility ran.
+	r.Register(fakeTool{name: "mcp__blocked__late_register"})
+	r.Replace(fakeTool{name: "Bash"})
+	r.ReplacePrefix("mcp__blocked__", []Tool{
+		fakeTool{name: "mcp__blocked__late_replace"},
+	})
+
+	for _, name := range []string{"mcp__blocked__late_register", "mcp__blocked__late_replace", "Bash"} {
+		if _, ok := r.Get(name); ok {
+			t.Fatalf("late tool %q bypassed the persistent visibility policy", name)
+		}
+	}
+	if _, ok := r.Get("Read"); !ok {
+		t.Fatal("unrelated visible tool was removed")
+	}
+}
+
 func TestSplitCSV(t *testing.T) {
 	cases := []struct {
 		in   string

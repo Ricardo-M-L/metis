@@ -121,6 +121,7 @@ func (m *Model) buildPlainTranscript() string {
 // fields without each one duplicating the bridge.
 func (m *Model) asREPL() *REPL {
 	r := &REPL{
+		ctx:          m.ctx,
 		Loop:         m.loop,
 		Gate:         m.gate,
 		Slash:        m.slash,
@@ -139,6 +140,7 @@ func (m *Model) asREPL() *REPL {
 		SessionSwitch:       m.ext.SessionSwitch,
 		SessionBoundary:     m.ext.SessionBoundary,
 		FreshPermissionMode: m.ext.FreshPermissionMode,
+		AdoptMCPServer:      m.ext.AdoptMCPServer,
 		sandbox:             m.ext.Sandbox,
 		UseMarkdown:         normalizeOutputStyle(m.outputStyle) != outputStyleMinimal,
 		outputStyle:         normalizeOutputStyle(m.outputStyle),

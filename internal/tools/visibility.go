@@ -18,10 +18,55 @@ package tools
 //   "mcp__"              matches every mcp__* tool (MCP wildcard)
 //   "mcp__*"             alias of "mcp__"
 //
-// Patterns that match nothing are dropped silently — typing
-// `--disallow-tools NoSuchTool` shouldn't crash a real session.
+// Patterns that match nothing in the current snapshot remain installed: a
+// later plugin or MCP reconnect with that name must still be filtered.
 
 import "strings"
+
+type toolVisibilityPolicy struct {
+	allow    []string
+	disallow []string
+}
+
+// toolNameMatchesPattern evaluates the visibility grammar without consulting
+// the current registry. This is what makes policies durable for tools that are
+// registered later by plugins, IDE bridges or an MCP reconnect.
+func toolNameMatchesPattern(name, raw string) bool {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return false
+	}
+	if p == "mcp__" || p == "mcp__*" {
+		return strings.HasPrefix(name, "mcp__")
+	}
+	if strings.HasPrefix(p, "mcp__") && !strings.Contains(p[len("mcp__"):], "__") {
+		return strings.HasPrefix(name, p+"__")
+	}
+	return name == p
+}
+
+func matchesAnyToolPattern(name string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if toolNameMatchesPattern(name, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// permitsToolNameLocked applies every installed layer as an intersection.
+// Caller holds Registry.mu.
+func (r *Registry) permitsToolNameLocked(name string) bool {
+	for _, policy := range r.visibilityPolicies {
+		if len(policy.allow) > 0 && !matchesAnyToolPattern(name, policy.allow) {
+			return false
+		}
+		if matchesAnyToolPattern(name, policy.disallow) {
+			return false
+		}
+	}
+	return true
+}
 
 // ExpandToolPatterns resolves user-supplied patterns against the
 // current registry into the concrete set of registered tool names they
@@ -45,32 +90,8 @@ func ExpandToolPatterns(reg *Registry, patterns []string) map[string]struct{} {
 		if p == "" {
 			continue
 		}
-		// MCP global wildcard — "mcp__" or "mcp__*" mute every MCP tool.
-		if p == "mcp__" || p == "mcp__*" {
-			for _, n := range names {
-				if strings.HasPrefix(n, "mcp__") {
-					out[n] = struct{}{}
-				}
-			}
-			continue
-		}
-		// MCP server prefix — "mcp__<server>" with no trailing "__" in
-		// the server portion means "every tool that server exposes".
-		// MCP tool names are always three segments: mcp__<server>__<tool>,
-		// so a pattern lacking the third segment is unambiguously a
-		// server-level pattern, never a literal tool name.
-		if strings.HasPrefix(p, "mcp__") && !strings.Contains(p[len("mcp__"):], "__") {
-			prefix := p + "__"
-			for _, n := range names {
-				if strings.HasPrefix(n, prefix) {
-					out[n] = struct{}{}
-				}
-			}
-			continue
-		}
-		// Exact tool name.
 		for _, n := range names {
-			if n == p {
+			if toolNameMatchesPattern(n, p) {
 				out[n] = struct{}{}
 			}
 		}
@@ -78,10 +99,12 @@ func ExpandToolPatterns(reg *Registry, patterns []string) map[string]struct{} {
 	return out
 }
 
-// ApplyToolVisibility shrinks reg in place to the intersection of:
-//   - tools currently registered
+// ApplyToolVisibility installs a durable policy and shrinks the current
+// registry to the intersection of:
 //   - tools matched by `allow` (skipped when allow is empty)
 //   - tools NOT matched by `disallow`
+//
+// Future Register/Replace/ReplacePrefix calls pass through the same policy.
 //
 // Both `allow` and `disallow` use the ExpandToolPatterns grammar. No-op
 // when both are empty.
@@ -97,33 +120,23 @@ func ApplyToolVisibility(reg *Registry, allow, disallow []string) {
 		return
 	}
 
-	current := reg.All()
-	keep := make([]string, 0, len(current))
-	for _, t := range current {
-		keep = append(keep, t.Name())
+	policy := toolVisibilityPolicy{
+		allow:    append([]string(nil), allow...),
+		disallow: append([]string(nil), disallow...),
 	}
-
-	if len(allow) > 0 {
-		allowSet := ExpandToolPatterns(reg, allow)
-		filtered := keep[:0]
-		for _, n := range keep {
-			if _, ok := allowSet[n]; ok {
-				filtered = append(filtered, n)
-			}
+	reg.mu.Lock()
+	reg.visibilityPolicies = append(reg.visibilityPolicies, policy)
+	order := reg.order[:0]
+	for _, name := range reg.order {
+		if reg.permitsToolNameLocked(name) {
+			order = append(order, name)
+			continue
 		}
-		keep = filtered
+		reg.clearAliasesOf(name)
+		delete(reg.tools, name)
 	}
-	if len(disallow) > 0 {
-		denySet := ExpandToolPatterns(reg, disallow)
-		filtered := keep[:0]
-		for _, n := range keep {
-			if _, ok := denySet[n]; !ok {
-				filtered = append(filtered, n)
-			}
-		}
-		keep = filtered
-	}
-	reg.Restrict(keep)
+	reg.order = order
+	reg.mu.Unlock()
 }
 
 // SplitCSV splits a comma- or whitespace-separated list of tool

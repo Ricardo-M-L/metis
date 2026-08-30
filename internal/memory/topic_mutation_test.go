@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -167,6 +168,101 @@ func TestTopicEditRevisionConflict(t *testing.T) {
 	if !errors.Is(err, ErrTopicConflict) {
 		t.Fatalf("stale edit error=%v, want ErrTopicConflict", err)
 	}
+}
+
+func TestTopicCommitRejectsRootReplacementWithSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, "memory")
+	manager, err := NewMemoryManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(base, "memory-original")
+	if err := os.Rename(root, original); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, root); err != nil {
+		t.Fatal(err)
+	}
+	err = manager.CommitTopic(context.Background(), TopicMutation{
+		Path: filepath.Join(root, "escaped.md"), Content: topicTestMemo("escaped", "must not escape"),
+		Source: TopicSource{SessionID: "owner"},
+	})
+	if err == nil {
+		t.Fatal("topic commit accepted a replaced symlink root")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "escaped.md")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("topic write escaped through replaced root: %v", statErr)
+	}
+}
+
+func TestTopicCommitRejectsSymlinkParentAndLeaf(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	t.Run("parent", func(t *testing.T) {
+		root := t.TempDir()
+		manager, err := NewMemoryManager(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		originalParent := filepath.Join(root, "topics")
+		if err := os.Mkdir(originalParent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(originalParent, filepath.Join(root, "topics-original")); err != nil {
+			t.Fatal(err)
+		}
+		outside := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(root, "topics")); err != nil {
+			t.Fatal(err)
+		}
+		err = manager.CommitTopic(context.Background(), TopicMutation{
+			Path: filepath.Join(root, "topics", "escaped.md"), Content: topicTestMemo("escaped", "must not escape"),
+			Source: TopicSource{SessionID: "owner"},
+		})
+		if err == nil {
+			t.Fatal("topic commit accepted a symlink parent")
+		}
+		if _, statErr := os.Stat(filepath.Join(outside, "escaped.md")); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("topic write escaped through parent symlink: %v", statErr)
+		}
+	})
+	t.Run("leaf", func(t *testing.T) {
+		root := t.TempDir()
+		manager, err := NewMemoryManager(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf := filepath.Join(root, "escaped.md")
+		if err := manager.CommitTopic(context.Background(), TopicMutation{
+			Path: leaf, Content: topicTestMemo("escaped", "original safe value"),
+			Source: TopicSource{SessionID: "owner"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(leaf, leaf+".original"); err != nil {
+			t.Fatal(err)
+		}
+		outside := filepath.Join(t.TempDir(), "outside.md")
+		if err := os.Symlink(outside, leaf); err != nil {
+			t.Fatal(err)
+		}
+		err = manager.CommitTopic(context.Background(), TopicMutation{
+			Path: leaf, Content: topicTestMemo("escaped", "must not escape"),
+			Source: TopicSource{SessionID: "owner"},
+		})
+		if err == nil {
+			t.Fatal("topic commit accepted a dangling leaf symlink")
+		}
+		if _, statErr := os.Stat(outside); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("topic write followed leaf symlink: %v", statErr)
+		}
+	})
 }
 
 func TestTopicTwoManagersWriteDeleteRaceNeverResurrects(t *testing.T) {

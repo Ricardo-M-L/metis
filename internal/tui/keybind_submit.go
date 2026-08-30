@@ -712,6 +712,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			// `/mcp login <name>` opens a browser and can wait for up to two
+			// minutes. Never execute that synchronous REPL handler on Bubble
+			// Tea's Update goroutine: dispatch a typed tea.Cmd result instead.
+			if cmd.Name == "mcp" {
+				parts := strings.Fields(args)
+				if len(parts) >= 2 && strings.EqualFold(parts[0], "login") {
+					return m, m.startMCPLogin(parts[1])
+				}
+			}
 			repl := m.asREPL()
 			output := cmd.Handler(repl, args)
 			// asREPL is a value bridge. Model/provider switches mutate the
@@ -1031,7 +1040,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				display = ""
 			}
 		case slash.SignalPlan:
-			wasPlan := activatePlanMode(m.gate, m.loop)
+			wasPlan, err := activatePlanMode(m.gate, m.loop, m.ext.Sandbox)
+			if err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "plan: " + err.Error(), Timestamp: time.Now()})
+				return m, nil
+			}
 			planArg := strings.TrimSpace(args)
 			switch {
 			case strings.EqualFold(planArg, "open"):
@@ -1066,17 +1079,29 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				submitPlanPrompt = true
 			}
 		case slash.SignalAcceptEdits:
-			m.gate.SetMode(permission.ModeAcceptEdits)
-			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: acceptEdits — file edits are accepted; other state changes may still ask)", Timestamp: time.Now()})
+			if err := applyModelPermissionMode(m, permission.ModeAcceptEdits); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				m.messages = append(m.messages, Message{Role: "success", Content: "(mode: acceptEdits — file edits are accepted; other state changes may still ask)", Timestamp: time.Now()})
+			}
 		case slash.SignalBypassPermissions:
-			m.gate.SetMode(permission.ModeBypassPermissions)
-			m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: bypassPermissions — tool calls auto-approved; use /default to restore prompts)", Timestamp: time.Now()})
+			if err := applyModelPermissionMode(m, permission.ModeBypassPermissions); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: bypassPermissions — tool calls auto-approved within the enforced credential boundary; use /default to restore prompts)", Timestamp: time.Now()})
+			}
 		case slash.SignalDefault:
-			m.gate.SetMode(permission.ModeDefault)
-			m.messages = append(m.messages, Message{Role: "success", Content: "(mode: default — ask before state changes)", Timestamp: time.Now()})
+			if err := applyModelPermissionMode(m, permission.ModeDefault); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				m.messages = append(m.messages, Message{Role: "success", Content: "(mode: default — ask before state changes)", Timestamp: time.Now()})
+			}
 		case slash.SignalDontAsk:
-			m.gate.SetMode(permission.ModeDontAsk)
-			m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: dontAsk — actions requiring approval will be denied)", Timestamp: time.Now()})
+			if err := applyModelPermissionMode(m, permission.ModeDontAsk); err != nil {
+				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+			} else {
+				m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: dontAsk — actions requiring approval will be denied)", Timestamp: time.Now()})
+			}
 		case slash.SignalRetry:
 			// A retry replaces the prior user→assistant exchange, then submits
 			// the same user prompt immediately. Merely prefilling the editor

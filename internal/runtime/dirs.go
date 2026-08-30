@@ -17,17 +17,49 @@ import (
 // equivalent for the metis "--add-dir" feature).
 const dirsFileName = "additional-dirs.json"
 
-// AllowedDirs is the filesystem scope granted to one Metis process. The launch
-// cwd is always in scope; dirs contains the additional roots explicitly opted
+// AllowedDirs is the filesystem scope granted to one Metis process. The active
+// workspace cwd is always in scope; dirs contains the additional roots explicitly opted
 // into through --add-dir, /add-dir, or the persisted local list.
 //
 // Concurrency: list is rebuilt as a fresh slice on each Add/Remove, so
 // readers can hold the slice without further locking.
 type AllowedDirs struct {
 	mu        sync.RWMutex
-	cwd       string   // canonical launch cwd; implicit and never persisted
+	cwd       string   // canonical active workspace cwd; implicit and never persisted
 	dirs      []string // absolute, deduped, sorted
 	persistTo string   // ~/.metis/additional-dirs.json
+}
+
+// PreparedCWDRebind is the validated half of a workspace-scope transition.
+// PrepareRebindCWD performs every fallible filesystem operation up front;
+// Commit only swaps the already-canonical root under the AllowedDirs lock.
+// Keeping the root private prevents callers from committing an unvalidated
+// path while still letting a higher-level session switch stage several
+// fallible resources before publishing any of them.
+type PreparedCWDRebind struct {
+	dirs *AllowedDirs
+	root string
+}
+
+// CanonicalPath returns the validated workspace root captured during prepare.
+// Higher-level two-phase session switches must publish this value, rather than
+// reusing the caller's potentially retargetable symlink spelling.
+func (p *PreparedCWDRebind) CanonicalPath() string {
+	if p == nil {
+		return ""
+	}
+	return p.root
+}
+
+// Commit publishes a previously validated cwd rebind. It is intentionally
+// infallible so callers can place it inside an atomic session-state commit.
+func (p *PreparedCWDRebind) Commit() {
+	if p == nil || p.dirs == nil {
+		return
+	}
+	p.dirs.mu.Lock()
+	p.dirs.cwd = p.root
+	p.dirs.mu.Unlock()
 }
 
 // NewAllowedDirs constructs an instance backed by ~/.metis/additional-dirs.json.
@@ -86,8 +118,36 @@ func (d *AllowedDirs) Scope() []string {
 	return out
 }
 
-// Contains reports whether path resolves under the launch cwd or an explicit
-// additional root. Relative paths are rooted at the launch cwd. Resolution is
+// RebindCWD moves the implicit filesystem root to a newly activated workspace.
+// Normalization completes before the lock is taken, so a failed rebind leaves
+// the previous permission boundary intact. Gate's path-scope hook points at
+// Contains, which observes this swap under the same mutex.
+func (d *AllowedDirs) RebindCWD(path string) error {
+	prepared, err := d.PrepareRebindCWD(path)
+	if err != nil {
+		return err
+	}
+	prepared.Commit()
+	return nil
+}
+
+// PrepareRebindCWD validates and canonicalizes a prospective active workspace
+// without changing the live permission boundary. The returned commit is the
+// only mutating half of the transition and cannot fail.
+func (d *AllowedDirs) PrepareRebindCWD(path string) (*PreparedCWDRebind, error) {
+	if d == nil {
+		return nil, fmt.Errorf("allowed directories unavailable")
+	}
+	root, err := normalizeDir(path)
+	if err != nil {
+		return nil, err
+	}
+	return &PreparedCWDRebind{dirs: d, root: root}, nil
+}
+
+// Contains reports whether path resolves under the active workspace cwd or an
+// explicit additional root. Relative paths are rooted at that active cwd,
+// which RebindCWD updates when a frontend activates another workspace. Resolution is
 // symlink-aware even for not-yet-created write targets: each existing path
 // component is lstat'd and a dangling symlink's lexical target is followed, so
 // `cwd/link -> /outside/new-file` cannot masquerade as an in-scope path.

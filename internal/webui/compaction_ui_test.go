@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,6 +20,24 @@ import (
 type activeContextStatusProvider struct {
 	calls int
 }
+
+type statusExposureTool struct {
+	tools.BaseTool
+	name     string
+	exposure tools.ToolExposure
+}
+
+func (t statusExposureTool) Name() string                               { return t.name }
+func (statusExposureTool) Description() string                          { return "status test tool" }
+func (statusExposureTool) InputSchema() map[string]any                  { return map[string]any{"type": "object"} }
+func (statusExposureTool) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (statusExposureTool) CanUse(context.Context, map[string]any) (tools.Permission, string) {
+	return tools.PermissionAllow, ""
+}
+func (statusExposureTool) Execute(context.Context, map[string]any) (*tools.Result, error) {
+	return &tools.Result{Output: "ok"}, nil
+}
+func (t statusExposureTool) ToolExposure() tools.ToolExposure { return t.exposure }
 
 func (*activeContextStatusProvider) Name() string          { return "active-context-status" }
 func (*activeContextStatusProvider) ModelID() string       { return "active-context-status-model" }
@@ -121,6 +140,33 @@ func TestStatusIncludesAuthoritativeCompactionTriggerTokens(t *testing.T) {
 	}
 	if want := loop.Compactor.TriggerTokens(); payload.CompactAtTokens != want {
 		t.Fatalf("compactAtTokens = %d, want authoritative trigger %d", payload.CompactAtTokens, want)
+	}
+}
+
+func TestStatusOmitsHiddenTools(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := tools.NewRegistry()
+	reg.Register(statusExposureTool{name: "Visible", exposure: tools.ToolExposureDirect})
+	reg.Register(statusExposureTool{name: "InternalOnly", exposure: tools.ToolExposureHidden})
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, reg, permission.New(permission.ModeAsk), nil, "system", 2)
+
+	s := NewServer("127.0.0.1:0", loop, store)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		Tools []string `json:"tools"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(payload.Tools, "Visible") || slices.Contains(payload.Tools, "InternalOnly") {
+		t.Fatalf("model-facing status tools = %v", payload.Tools)
 	}
 }
 

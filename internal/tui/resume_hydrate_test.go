@@ -192,6 +192,41 @@ func TestHydrateFromLoopHistory_ToolUseAndResult(t *testing.T) {
 	}
 }
 
+func TestHydrateFromLoopHistory_RedactsToolArgumentsOnlyForPresentation(t *testing.T) {
+	t.Parallel()
+	secret := "ghp_" + strings.Repeat("s", 36)
+	hist := []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+			{
+				Type: "tool_use", ToolUseID: "secret-tool", ToolName: "Bash",
+				ToolInput: map[string]any{
+					"api_key": "hunter2",
+					"command": "curl https://example.test/?token=" + secret,
+					"safe":    "keep",
+				},
+			},
+		}},
+	}
+	m := &Model{loop: makeLoopWithHistory(t, hist), sessionID: "redacted-resume"}
+	m.hydrateFromLoopHistory()
+
+	if len(m.toolEvents) != 1 {
+		t.Fatalf("tool events = %#v", m.toolEvents)
+	}
+	input := m.toolEvents[0].Input
+	if input["api_key"] != "[REDACTED]" || strings.Contains(input["command"].(string), secret) || input["safe"] != "keep" {
+		t.Fatalf("hydrated presentation input = %#v", input)
+	}
+	canonical := m.loop.History()[0].Content[0].ToolInput
+	if canonical["api_key"] != "hunter2" || !strings.Contains(canonical["command"].(string), secret) {
+		t.Fatalf("hydrate mutated provider history: %#v", canonical)
+	}
+	input["safe"] = "presentation-only"
+	if canonical["safe"] != "keep" {
+		t.Fatalf("hydrated presentation aliases provider history: %#v", canonical)
+	}
+}
+
 func TestHydrateFromLoopHistory_ToolUseWithoutResult_StaysStart(t *testing.T) {
 	t.Parallel()
 	// A tool call that never got a result (interrupted / killed mid-turn)

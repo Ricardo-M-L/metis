@@ -65,6 +65,16 @@ func PrepareResume(store *session.Store, sessionID string) (*PreparedResume, err
 	if err := session.CheckResumeHistorySize(sessionID, msgs); err != nil {
 		return nil, err
 	}
+	if hdr != nil {
+		mode, prePlan, hasMode, stateErr := ValidateRestoredPermissionState(hdr.Mode, hdr.PrePlanMode, permission.ModeDefault)
+		if stateErr != nil {
+			return nil, fmt.Errorf("resume %s: %w", sessionID, stateErr)
+		}
+		if hasMode {
+			hdr.Mode = string(mode)
+			hdr.PrePlanMode = prePlan
+		}
+	}
 	return &PreparedResume{SessionID: sessionID, Header: hdr, messages: msgs}, nil
 }
 
@@ -106,12 +116,17 @@ func ApplyPreparedResume(prepared *PreparedResume, loop *agent.Loop,
 	if warnOut == nil {
 		warnOut = os.Stderr
 	}
-	loop.Restore(prepared.messages)
 	hdr := prepared.Header
 	if hdr != nil {
 		mode := gate.Mode()
-		if hdr.Mode != "" {
-			mode = permission.Mode(hdr.Mode)
+		prePlan := ""
+		validatedMode, validatedPrePlan, hasMode, err := ValidateRestoredPermissionState(hdr.Mode, hdr.PrePlanMode, mode)
+		if err != nil {
+			return nil, fmt.Errorf("resume %s: %w", prepared.SessionID, err)
+		}
+		if hasMode {
+			mode = validatedMode
+			prePlan = validatedPrePlan
 		}
 		resumedRules := make([]permission.Rule, 0, len(hdr.AlwaysAllow))
 		for _, r := range hdr.AlwaysAllow {
@@ -129,7 +144,9 @@ func ApplyPreparedResume(prepared *PreparedResume, loop *agent.Loop,
 				Source: permission.ResumedSessionSource(r.Source),
 			})
 		}
+		loop.SetPrePlanMode(prePlan)
 		gate.ResetSessionState(mode, resumedRules)
+		SynchronizeRestoredPermissionState(gate, loop, prePlan)
 		if hdr.WorkDir != "" {
 			if cwd, _ := os.Getwd(); cwd != "" && cwd != hdr.WorkDir {
 				fmt.Fprintf(warnOut,
@@ -138,6 +155,7 @@ func ApplyPreparedResume(prepared *PreparedResume, loop *agent.Loop,
 			}
 		}
 	}
+	loop.Restore(prepared.messages)
 	return &ResumeResult{SessionID: prepared.SessionID}, nil
 }
 
@@ -164,13 +182,21 @@ func validResumeSessionID(id string) bool {
 // "either resume an existing session or write a new one" branch in
 // setupRuntime stays one line per case.
 func WriteFreshHeader(store *session.Store, sessionID, provider, model, system, mode string) error {
+	return WriteFreshHeaderWithPromptKind(store, sessionID, provider, model, system, "", mode)
+}
+
+// WriteFreshHeaderWithPromptKind persists prompt ownership alongside the
+// flattened prompt. Managed defaults may be rebuilt on resume, while custom
+// and legacy-unknown prompts remain opaque.
+func WriteFreshHeaderWithPromptKind(store *session.Store, sessionID, provider, model, system, promptKind, mode string) error {
 	cwd, _ := os.Getwd()
 	return store.WriteHeaderFull(session.Header{
-		ID:       sessionID,
-		Provider: provider,
-		Model:    model,
-		System:   system,
-		WorkDir:  cwd,
-		Mode:     mode,
+		ID:               sessionID,
+		Provider:         provider,
+		Model:            model,
+		System:           system,
+		SystemPromptKind: promptKind,
+		WorkDir:          cwd,
+		Mode:             mode,
 	})
 }

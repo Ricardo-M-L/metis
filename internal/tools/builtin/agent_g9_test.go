@@ -7,9 +7,8 @@ package builtin
 //
 //   1. Default path (no permission_mode arg) — sub-agent inherits the
 //      parent's mode via the clone.
-//   2. `permission_mode: "bypassPermissions"` arg — sub-agent's gate is in
-//      bypassPermissions even when parent is in default.
-//   3. Override doesn't leak back to the parent gate.
+//   2. A child cannot elevate a default parent to bypassPermissions.
+//   3. A bypass parent is inherited without leaking mode changes back.
 
 import (
 	"context"
@@ -48,10 +47,7 @@ func TestAgentExecute_DefaultModeInherits(t *testing.T) {
 	}
 }
 
-// TestAgentExecute_PermissionModeOverridesChild — passing
-// permission_mode="bypassPermissions" flips ONLY the sub-agent's gate; the
-// parent stays in default.
-func TestAgentExecute_PermissionModeOverridesChild(t *testing.T) {
+func TestAgentExecute_RejectsPermissionEscalationAboveParent(t *testing.T) {
 	dir := t.TempDir()
 	gate := permission.New(permission.ModeAsk)
 	roster := agent.NewRoster(0)
@@ -63,6 +59,29 @@ func TestAgentExecute_PermissionModeOverridesChild(t *testing.T) {
 		"prompt":          "x",
 		"permission_mode": "bypassPermissions",
 	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res == nil || !res.IsError || !strings.Contains(res.Output, "cannot be more permissive") {
+		t.Fatalf("permission escalation result = %+v", res)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, agent.SubAgentTranscriptDirname)); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected child created transcript state: %v", statErr)
+	}
+	if gate.Mode() != permission.ModeAsk {
+		t.Errorf("parent gate leaked override: now %q", gate.Mode())
+	}
+}
+
+func TestAgentExecute_BypassParentChildRunsWithoutEscalation(t *testing.T) {
+	dir := t.TempDir()
+	gate := permission.New(permission.ModeBypassPermissions)
+	roster := agent.NewRoster(0)
+	tool := NewAgent(gate, helloProvider(), tools.NewRegistry(), "m", "s").
+		WithRoster(roster).
+		WithSessionPersistence(dir, "parent")
+
+	res, err := tool.Execute(context.Background(), map[string]any{"prompt": "x"})
 	if err != nil || res.IsError {
 		t.Fatalf("Execute: err=%v res=%+v", err, res)
 	}
@@ -72,11 +91,7 @@ func TestAgentExecute_PermissionModeOverridesChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	if snap.Header.Mode != "bypassPermissions" {
-		t.Errorf("override sub-agent mode = %q, want bypassPermissions", snap.Header.Mode)
-	}
-	// Parent gate unchanged.
-	if gate.Mode() != permission.ModeAsk {
-		t.Errorf("parent gate leaked override: now %q", gate.Mode())
+		t.Fatalf("inherited child mode = %q, want bypassPermissions", snap.Header.Mode)
 	}
 }
 

@@ -14,7 +14,10 @@ import (
 
 const maxNestedShellDepth = 8
 
-var ErrProcessTermination = errors.New("raw process termination commands are disabled; use BashKill(job_id) for Metis-owned background jobs")
+var (
+	ErrProcessTermination = errors.New("raw process termination commands are disabled; use BashKill(job_id) for Metis-owned background jobs")
+	ErrSystemMutation     = errors.New("destructive system mutation is disabled")
+)
 
 // Check parses command as Bash and rejects kill-family executables in command
 // position, including pipelines, command substitutions, wrappers, xargs /
@@ -59,7 +62,19 @@ func inspectCall(call *syntax.CallExpr, depth int) error {
 	words := make([]shellWord, 0, len(call.Args))
 	for _, word := range call.Args {
 		value, ok := staticWord(word)
-		words = append(words, shellWord{value: value, static: ok})
+		singleArg := wordStaysSingleArg(word)
+		// `[` is the POSIX test command. A lone opening bracket is not a
+		// syntactically valid glob and every supported shell therefore keeps it
+		// as one literal argv entry. The general cardinality guard must stay
+		// conservative for real command-position patterns such as `k[il]l`.
+		if ok && value == "[" {
+			singleArg = true
+		}
+		words = append(words, shellWord{
+			value:     value,
+			static:    ok,
+			singleArg: singleArg,
+		})
 	}
 	if len(words) == 0 {
 		return nil
@@ -68,20 +83,24 @@ func inspectCall(call *syntax.CallExpr, depth int) error {
 }
 
 type shellWord struct {
-	value  string
-	static bool
+	value     string
+	static    bool
+	singleArg bool
 }
 
 func inspectWords(words []shellWord, depth int) error {
 	if len(words) == 0 {
 		return nil
 	}
-	if !words[0].static || strings.TrimSpace(words[0].value) == "" {
+	if !words[0].static || !words[0].singleArg || strings.TrimSpace(words[0].value) == "" {
 		return blocked("dynamic command position cannot be inspected safely")
 	}
 	cmd := commandBase(words[0].value)
 	if isKillCommand(cmd) {
 		return blocked("blocked " + cmd)
+	}
+	if reason, deny := destructiveSystemMutation(cmd, words[1:]); deny {
+		return blockedSystem(reason)
 	}
 
 	switch cmd {
@@ -179,6 +198,561 @@ func blocked(reason string) error {
 	return fmt.Errorf("%w (%s)", ErrProcessTermination, reason)
 }
 
+func blockedSystem(reason string) error {
+	return fmt.Errorf("%w (%s)", ErrSystemMutation, reason)
+}
+
+// destructiveSystemMutation recognizes the narrow set of machine- or
+// cluster-wide changes that must never turn into an approval prompt. The
+// caller invokes it after parsing a real command position, so quoted prose is
+// still data and compound commands are checked one call at a time by the AST
+// walk. Wrappers (sudo/command/env/etc.) recurse through inspectWords.
+func destructiveSystemMutation(cmd string, words []shellWord) (string, bool) {
+	switch cmd {
+	case "apt", "apt-get", "dnf", "yum", "apk", "zypper", "snap", "flatpak", "dpkg", "rpm":
+		return destructivePackageMutation(cmd, words)
+	case "pacman":
+		return destructivePacmanMutation(words)
+	case "useradd", "adduser", "userdel", "deluser", "usermod",
+		"groupadd", "addgroup", "groupdel", "delgroup", "groupmod",
+		"chpasswd", "gpasswd", "newusers", "vipw", "vigr":
+		return "account database management via " + cmd, true
+	case "passwd":
+		return destructivePasswdMutation(words)
+	case "chage":
+		return destructiveChageMutation(words)
+	case "dscl":
+		return destructiveDSCLMutation(words)
+	case "sysadminctl":
+		return destructiveSysadminctlMutation(words)
+	case "net":
+		return destructiveNetAccountMutation(words)
+	case "iptables", "ip6tables", "ebtables", "arptables":
+		return destructiveIPTablesMutation(cmd, words)
+	case "iptables-restore", "ip6tables-restore", "ebtables-restore", "arptables-restore":
+		return "firewall ruleset replacement via " + cmd, true
+	case "nft":
+		return destructiveNFTMutation(words)
+	case "ufw":
+		return destructiveUFWMutation(words)
+	case "firewall-cmd":
+		return destructiveFirewallCmdMutation(words)
+	case "pfctl":
+		return destructivePFCTLMutation(words)
+	case "systemctl":
+		return destructiveSystemctlMutation(words)
+	case "service":
+		return destructiveServiceMutation(words)
+	case "launchctl":
+		return destructiveLaunchctlMutation(words)
+	case "docker":
+		return destructiveDockerMutation(words)
+	case "kubectl", "oc":
+		return destructiveKubectlMutation(words)
+	case "crontab":
+		return destructiveCrontabMutation(words)
+	default:
+		return "", false
+	}
+}
+
+func staticValues(words []shellWord) ([]string, bool) {
+	values := make([]string, 0, len(words))
+	for _, word := range words {
+		if !word.static {
+			return nil, false
+		}
+		values = append(values, word.value)
+	}
+	return values, true
+}
+
+func lowerSet(values ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		out[strings.ToLower(value)] = struct{}{}
+	}
+	return out
+}
+
+func containsLower(set map[string]struct{}, value string) bool {
+	_, ok := set[strings.ToLower(value)]
+	return ok
+}
+
+// firstOperand skips global options and their known values, returning the
+// command's first positional action. Unknown options are treated as flags; a
+// dynamic option/action is deliberately reported as uninspectable.
+func firstOperand(words []shellWord, valueOptions map[string]struct{}) (string, int, bool) {
+	for i := 0; i < len(words); i++ {
+		if !words[i].static || !words[i].singleArg {
+			return "", -1, false
+		}
+		value := words[i].value
+		if value == "--" {
+			if i+1 < len(words) {
+				if !words[i+1].static || !words[i+1].singleArg {
+					return "", -1, false
+				}
+				return strings.ToLower(words[i+1].value), i + 1, true
+			}
+			return "", -1, true
+		}
+		if strings.HasPrefix(value, "-") && value != "-" {
+			name, inline := optionName(value)
+			if _, needsValue := valueOptions[strings.ToLower(name)]; needsValue && !inline {
+				i++
+				if i >= len(words) || !words[i].singleArg {
+					return "", -1, false
+				}
+			}
+			continue
+		}
+		return strings.ToLower(value), i, true
+	}
+	return "", -1, true
+}
+
+var packageOptionValues = lowerSet(
+	"-o", "--option", "-c", "--config", "--config-file", "--root", "--installroot",
+	"--releasever", "--repo", "--repository", "--from-repo", "--cache-dir", "--cachedir",
+	"--target", "--admindir", "--instdir", "--dbpath", "--rcfile",
+)
+
+var packageMutationActions = map[string]map[string]struct{}{
+	"apt":     lowerSet("install", "remove", "purge", "upgrade", "full-upgrade", "dist-upgrade", "autoremove", "update", "reinstall", "satisfy"),
+	"apt-get": lowerSet("install", "remove", "purge", "upgrade", "full-upgrade", "dist-upgrade", "dselect-upgrade", "autoremove", "update", "reinstall", "satisfy"),
+	"dnf":     lowerSet("install", "remove", "erase", "upgrade", "update", "downgrade", "reinstall", "swap", "distro-sync", "groupinstall", "groupremove", "groupupgrade", "autoremove", "module"),
+	"yum":     lowerSet("install", "remove", "erase", "upgrade", "update", "downgrade", "reinstall", "swap", "distro-sync", "groupinstall", "groupremove", "groupupdate", "autoremove"),
+	"apk":     lowerSet("add", "del", "upgrade", "fix"),
+	"zypper":  lowerSet("install", "in", "remove", "rm", "update", "up", "dist-upgrade", "dup", "patch", "modifyrepo", "addrepo", "removerepo"),
+	"snap":    lowerSet("install", "remove", "refresh", "revert", "enable", "disable", "connect", "disconnect", "alias", "unalias", "set", "unset"),
+	"flatpak": lowerSet("install", "uninstall", "update", "repair", "mask", "pin", "remote-add", "remote-delete", "remote-modify", "override"),
+	"dpkg":    lowerSet("--install", "-i", "--unpack", "--configure", "--remove", "-r", "--purge", "-p", "--update-avail", "--merge-avail", "--clear-avail"),
+	"rpm":     lowerSet("--install", "-i", "--upgrade", "-u", "--freshen", "-f", "--erase", "-e", "--rebuilddb", "--initdb", "--setperms", "--setugids"),
+}
+
+func destructivePackageMutation(cmd string, words []shellWord) (string, bool) {
+	if cmd == "dpkg" || cmd == "rpm" {
+		values, static := staticValues(words)
+		if !static {
+			return "dynamic " + cmd + " action cannot be inspected safely", true
+		}
+		for _, value := range values {
+			name, _ := optionName(value)
+			if containsLower(packageMutationActions[cmd], strings.ToLower(name)) {
+				return "system package mutation via " + cmd + " " + name, true
+			}
+			if strings.HasPrefix(value, "-") && !strings.HasPrefix(value, "--") && len(value) > 1 {
+				if cmd == "dpkg" && strings.ContainsAny(value[1:], "irp") {
+					return "system package mutation via dpkg " + value, true
+				}
+				if cmd == "rpm" && strings.ContainsRune("iUFe", rune(value[1])) {
+					return "system package mutation via rpm " + value, true
+				}
+			}
+		}
+	}
+	action, _, static := firstOperand(words, packageOptionValues)
+	if !static {
+		return "dynamic " + cmd + " action cannot be inspected safely", true
+	}
+	if containsLower(packageMutationActions[cmd], action) {
+		if (cmd == "dnf" || cmd == "yum") && action == "module" {
+			values, static := staticValues(words)
+			if !static {
+				return "dynamic " + cmd + " module action cannot be inspected safely", true
+			}
+			for i, value := range values {
+				if strings.EqualFold(value, "module") && i+1 < len(values) {
+					subaction := strings.ToLower(values[i+1])
+					if !containsLower(lowerSet("enable", "disable", "install", "remove", "reset", "switch-to"), subaction) {
+						return "", false
+					}
+				}
+			}
+		}
+		return "system package mutation via " + cmd + " " + action, true
+	}
+	return "", false
+}
+
+func destructivePasswdMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic passwd action cannot be inspected safely", true
+	}
+	statusOnly := false
+	for _, value := range values {
+		if !strings.HasPrefix(value, "-") || value == "-" {
+			continue
+		}
+		if value == "-S" || strings.EqualFold(value, "--status") {
+			statusOnly = true
+			continue
+		}
+		return "account database management via passwd", true
+	}
+	if statusOnly {
+		return "", false
+	}
+	return "account database management via passwd", true
+}
+
+func destructiveChageMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic chage action cannot be inspected safely", true
+	}
+	listOnly := false
+	for _, value := range values {
+		if !strings.HasPrefix(value, "-") || value == "-" {
+			continue
+		}
+		if value == "-l" || strings.EqualFold(value, "--list") {
+			listOnly = true
+			continue
+		}
+		return "account database management via chage", true
+	}
+	if listOnly {
+		return "", false
+	}
+	return "account database management via chage", true
+}
+
+func destructivePacmanMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic pacman action cannot be inspected safely", true
+	}
+	syncMode := false
+	queryOnly := false
+	for _, value := range values {
+		lower := strings.ToLower(value)
+		switch lower {
+		case "--remove", "--upgrade", "--sysupgrade", "--refresh", "--clean", "--database":
+			return "system package mutation via pacman " + lower, true
+		case "--sync":
+			syncMode = true
+		case "--search", "--info", "--list", "--groups", "--print":
+			queryOnly = true
+		}
+		if len(lower) >= 2 && lower[0] == '-' && lower[1] != '-' {
+			flags := strings.TrimPrefix(lower, "-")
+			if strings.ContainsAny(flags, "ru") {
+				return "system package mutation via pacman -" + flags, true
+			}
+			if strings.ContainsRune(flags, 's') {
+				syncMode = true
+				if strings.ContainsAny(flags, "silgp") && len(flags) > 1 {
+					queryOnly = true
+				}
+				if strings.ContainsAny(flags, "yuc") {
+					return "system package mutation via pacman -" + flags, true
+				}
+			}
+		}
+	}
+	if syncMode && !queryOnly {
+		return "system package mutation via pacman sync", true
+	}
+	return "", false
+}
+
+func destructiveDSCLMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic dscl action cannot be inspected safely", true
+	}
+	mutations := lowerSet("-create", "-createpl", "-delete", "-append", "-merge", "-change", "-changei", "-passwd")
+	for _, value := range values {
+		if containsLower(mutations, value) {
+			return "account database mutation via dscl", true
+		}
+	}
+	return "", false
+}
+
+func destructiveSysadminctlMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic sysadminctl action cannot be inspected safely", true
+	}
+	mutations := lowerSet("-adduser", "-deleteuser", "-resetpasswordfor", "-securetokenon", "-securetokenoff", "-autologin", "-guestaccount")
+	for _, value := range values {
+		if containsLower(mutations, value) {
+			return "account database mutation via sysadminctl", true
+		}
+	}
+	return "", false
+}
+
+func destructiveNetAccountMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic net account action cannot be inspected safely", true
+	}
+	if len(values) == 0 || (strings.ToLower(values[0]) != "user" && strings.ToLower(values[0]) != "localgroup") {
+		return "", false
+	}
+	for _, value := range values[1:] {
+		lower := strings.ToLower(value)
+		if lower == "/add" || lower == "/delete" || strings.HasPrefix(lower, "/active:") || strings.HasPrefix(lower, "/passwordchg:") {
+			return "account database mutation via net " + strings.ToLower(values[0]), true
+		}
+	}
+	return "", false
+}
+
+func destructiveIPTablesMutation(cmd string, words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic firewall action cannot be inspected safely", true
+	}
+	shortMutations := map[string]struct{}{
+		"-A": {}, "-D": {}, "-I": {}, "-R": {}, "-F": {}, "-Z": {},
+		"-N": {}, "-X": {}, "-P": {}, "-E": {},
+	}
+	longMutations := lowerSet("--append", "--delete", "--insert", "--replace", "--flush", "--zero", "--new-chain", "--delete-chain", "--policy", "--rename-chain")
+	for _, value := range values {
+		name, _ := optionName(value)
+		_, shortMutation := shortMutations[name]
+		if shortMutation || containsLower(longMutations, strings.ToLower(name)) {
+			return "firewall mutation via " + cmd + " " + name, true
+		}
+	}
+	return "", false
+}
+
+func destructiveNFTMutation(words []shellWord) (string, bool) {
+	action, _, static := firstOperand(words, lowerSet("-I", "--includepath", "-d", "--debug"))
+	if !static {
+		return "dynamic nft action cannot be inspected safely", true
+	}
+	if action == "" {
+		return "", false
+	}
+	if action == "-f" || action == "--file" || containsLower(lowerSet("add", "delete", "insert", "replace", "flush", "reset", "rename", "import"), action) {
+		return "firewall mutation via nft " + action, true
+	}
+	values, _ := staticValues(words)
+	for _, value := range values {
+		if value == "-f" || strings.HasPrefix(value, "--file") {
+			return "firewall ruleset replacement via nft", true
+		}
+	}
+	return "", false
+}
+
+func destructiveUFWMutation(words []shellWord) (string, bool) {
+	action, _, static := firstOperand(words, nil)
+	if !static {
+		return "dynamic ufw action cannot be inspected safely", true
+	}
+	mutations := lowerSet("enable", "disable", "reset", "reload", "allow", "deny", "reject", "limit", "delete", "insert", "route", "default", "logging", "app")
+	if containsLower(mutations, action) {
+		return "firewall mutation via ufw " + action, true
+	}
+	return "", false
+}
+
+func destructiveFirewallCmdMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic firewall-cmd action cannot be inspected safely", true
+	}
+	for _, value := range values {
+		lower := strings.ToLower(value)
+		if lower == "--reload" || lower == "--complete-reload" || lower == "--runtime-to-permanent" || lower == "--panic-on" || lower == "--panic-off" ||
+			strings.HasPrefix(lower, "--add-") || strings.HasPrefix(lower, "--remove-") || strings.HasPrefix(lower, "--change-") ||
+			strings.HasPrefix(lower, "--set-") || strings.HasPrefix(lower, "--new-") || strings.HasPrefix(lower, "--delete-") || strings.HasPrefix(lower, "--load-") {
+			return "firewall mutation via firewall-cmd " + lower, true
+		}
+		if lower == "--state" || lower == "--help" || lower == "--version" || lower == "--check-config" || lower == "--permanent" ||
+			strings.HasPrefix(lower, "--zone") || strings.HasPrefix(lower, "--policy") || strings.HasPrefix(lower, "--service") ||
+			strings.HasPrefix(lower, "--get-") || strings.HasPrefix(lower, "--list-") || strings.HasPrefix(lower, "--query-") || strings.HasPrefix(lower, "--info-") {
+			continue
+		}
+		if strings.HasPrefix(lower, "-") {
+			return "firewall mutation via firewall-cmd " + lower, true
+		}
+	}
+	return "", false
+}
+
+func destructivePFCTLMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic pfctl action cannot be inspected safely", true
+	}
+	for _, value := range values {
+		if value == "-e" || value == "-d" || value == "-f" || value == "-F" || strings.HasPrefix(value, "-f") || strings.HasPrefix(value, "-F") || strings.HasPrefix(value, "-x") {
+			return "firewall mutation via pfctl " + value, true
+		}
+	}
+	return "", false
+}
+
+func destructiveSystemctlMutation(words []shellWord) (string, bool) {
+	for _, word := range words {
+		if word.static && strings.EqualFold(word.value, "--user") {
+			// Per-user units are part of ordinary local development and cannot
+			// mutate the machine-wide service manager.
+			return "", false
+		}
+	}
+	action, _, static := firstOperand(words, lowerSet("--root", "--image", "--host", "-H", "--machine", "-M", "--type", "-t", "--state", "--property", "-p", "--signal", "-s"))
+	if !static {
+		return "dynamic systemctl action cannot be inspected safely", true
+	}
+	mutations := lowerSet("start", "stop", "restart", "try-restart", "reload", "reload-or-restart", "enable", "disable", "reenable", "preset", "preset-all", "mask", "unmask", "link", "revert", "set-default", "isolate", "daemon-reload", "edit", "set-property", "kill", "reset-failed", "add-wants", "add-requires")
+	if containsLower(mutations, action) {
+		return "service manager mutation via systemctl " + action, true
+	}
+	return "", false
+}
+
+func destructiveServiceMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic service action cannot be inspected safely", true
+	}
+	if len(values) < 2 {
+		return "", false
+	}
+	action := strings.ToLower(values[1])
+	if containsLower(lowerSet("start", "stop", "restart", "reload", "force-reload", "enable", "disable"), action) {
+		return "service manager mutation via service " + action, true
+	}
+	return "", false
+}
+
+func destructiveLaunchctlMutation(words []shellWord) (string, bool) {
+	action, _, static := firstOperand(words, nil)
+	if !static {
+		return "dynamic launchctl action cannot be inspected safely", true
+	}
+	if containsLower(lowerSet("bootstrap", "bootout", "load", "unload", "enable", "disable", "kickstart", "kill", "remove", "submit", "setenv", "unsetenv"), action) {
+		return "service manager mutation via launchctl " + action, true
+	}
+	return "", false
+}
+
+func destructiveDockerMutation(words []shellWord) (string, bool) {
+	action, index, static := firstOperand(words, lowerSet("--config", "--context", "-c", "--host", "-h", "--log-level"))
+	if !static {
+		return "dynamic docker action cannot be inspected safely", true
+	}
+	if action != "system" {
+		return "", false
+	}
+	if index+1 >= len(words) {
+		return "", false
+	}
+	if !words[index+1].static {
+		return "dynamic docker system action cannot be inspected safely", true
+	}
+	if strings.EqualFold(words[index+1].value, "prune") {
+		return "machine-wide Docker cleanup via docker system prune", true
+	}
+	return "", false
+}
+
+var kubectlOptionValues = lowerSet(
+	"--context", "--namespace", "-n", "--kubeconfig", "--kuberc", "--cluster", "--user", "--server", "-s",
+	"--request-timeout", "--proxy-url", "--cache-dir", "--as", "--as-group", "--as-uid", "--as-user-extra", "--token",
+	"--certificate-authority", "--client-certificate", "--client-key", "--tls-server-name",
+	"--username", "--password", "--profile", "--profile-output", "--vmodule",
+	"--storage-driver-buffer-duration", "--storage-driver-db", "--storage-driver-host",
+	"--storage-driver-password", "--storage-driver-table", "--storage-driver-user",
+	"--log-flush-frequency", "--loglevel", "--v", "-v",
+)
+
+var clusterScopedResources = lowerSet(
+	"namespace", "namespaces", "ns", "node", "nodes", "no",
+	"clusterrole", "clusterroles", "clusterrolebinding", "clusterrolebindings",
+	"customresourcedefinition", "customresourcedefinitions", "crd", "crds",
+	"persistentvolume", "persistentvolumes", "pv", "pvs",
+	"storageclass", "storageclasses", "sc",
+	"volumeattachment", "volumeattachments", "csidriver", "csidrivers", "csinode", "csinodes",
+	"mutatingwebhookconfiguration", "mutatingwebhookconfigurations",
+	"validatingwebhookconfiguration", "validatingwebhookconfigurations",
+	"validatingadmissionpolicy", "validatingadmissionpolicies",
+	"validatingadmissionpolicybinding", "validatingadmissionpolicybindings",
+	"apiservice", "apiservices",
+	"certificatesigningrequest", "certificatesigningrequests", "csr",
+	"clustertrustbundle", "clustertrustbundles",
+	"ingressclass", "ingressclasses", "ipaddress", "ipaddresses", "servicecidr", "servicecidrs",
+	"runtimeclass", "runtimeclasses", "podsecuritypolicy", "podsecuritypolicies", "psp",
+	"priorityclass", "priorityclasses", "pc",
+	"flowschema", "flowschemas", "prioritylevelconfiguration", "prioritylevelconfigurations",
+	"deviceclass", "deviceclasses", "resourceslice", "resourceslices",
+)
+
+func destructiveKubectlMutation(words []shellWord) (string, bool) {
+	verb, index, static := firstOperand(words, kubectlOptionValues)
+	if !static {
+		return "dynamic kubectl action cannot be inspected safely", true
+	}
+	if verb == "drain" || verb == "cordon" {
+		return "cluster node disruption via kubectl " + verb, true
+	}
+	if verb != "delete" {
+		return "", false
+	}
+	values, _ := staticValues(words)
+	if values == nil {
+		return "dynamic kubectl delete resource cannot be inspected safely", true
+	}
+	for _, value := range values[index+1:] {
+		lower := strings.ToLower(value)
+		name, _ := optionName(lower)
+		if name == "-f" || name == "--filename" || name == "-k" || name == "--kustomize" ||
+			(strings.HasPrefix(lower, "-f") && !strings.HasPrefix(lower, "--")) ||
+			(strings.HasPrefix(lower, "-k") && !strings.HasPrefix(lower, "--")) {
+			// The manifest can contain Namespace, ClusterRole, CRD, or any
+			// other cluster-scoped resource. Its target cannot be proven safe
+			// from the shell command alone, so delete-by-manifest fails closed.
+			return "manifest-driven kubectl delete cannot be inspected safely", true
+		}
+		if lower == "--all-namespaces" || lower == "-a" ||
+			(strings.HasPrefix(lower, "--all-namespaces=") && !strings.HasSuffix(lower, "=false")) ||
+			(strings.HasPrefix(lower, "-a=") && !strings.HasSuffix(lower, "=false")) {
+			return "cluster-wide kubectl delete", true
+		}
+	}
+	resource, _, inspectable := firstOperand(words[index+1:], lowerSet("-f", "--filename", "-k", "--kustomize", "-l", "--selector", "--field-selector", "--grace-period", "--timeout", "--cascade", "--wait"))
+	if !inspectable {
+		return "dynamic kubectl delete resource cannot be inspected safely", true
+	}
+	if resource == "" {
+		return "", false
+	}
+	resource = strings.SplitN(resource, "/", 2)[0]
+	resource = strings.SplitN(resource, ".", 2)[0]
+	for _, candidate := range strings.Split(resource, ",") {
+		if containsLower(clusterScopedResources, candidate) {
+			return "cluster-scoped kubectl delete of " + candidate, true
+		}
+	}
+	return "", false
+}
+
+func destructiveCrontabMutation(words []shellWord) (string, bool) {
+	values, static := staticValues(words)
+	if !static {
+		return "dynamic crontab action cannot be inspected safely", true
+	}
+	for _, value := range values {
+		lower := strings.ToLower(value)
+		if lower == "--remove" || (strings.HasPrefix(lower, "-") && !strings.HasPrefix(lower, "--") && strings.ContainsRune(lower[1:], 'r')) {
+			return "destructive crontab removal", true
+		}
+	}
+	return "", false
+}
+
 func staticWord(word *syntax.Word) (string, bool) {
 	var b strings.Builder
 	for _, part := range word.Parts {
@@ -203,6 +777,58 @@ func staticWord(word *syntax.Word) (string, bool) {
 		}
 	}
 	return b.String(), true
+}
+
+// wordStaysSingleArg classifies argv cardinality independently from staticWord.
+// Quoted dynamic values such as "$context" remain one argv entry, while
+// unquoted expansions and literal glob/brace patterns may expand into multiple
+// entries and inject the action firstOperand is trying to identify.
+func wordStaysSingleArg(word *syntax.Word) bool {
+	if word == nil {
+		return false
+	}
+	for _, part := range word.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			// A literal adjacent to a quoted expansion is still one word unless
+			// it introduces an unquoted glob/brace expansion.
+			if strings.ContainsAny(p.Value, "*?[]{}") {
+				return false
+			}
+		case *syntax.SglQuoted:
+			// Literal and single-quoted parts cannot change argv cardinality.
+		case *syntax.DblQuoted:
+			if !doubleQuotedStaysSingleArg(p) {
+				return false
+			}
+		default:
+			// Unquoted parameter/command/arithmetic expansions may split.
+			return false
+		}
+	}
+	return true
+}
+
+func doubleQuotedStaysSingleArg(quoted *syntax.DblQuoted) bool {
+	if quoted == nil {
+		return false
+	}
+	for _, part := range quoted.Parts {
+		switch p := part.(type) {
+		case *syntax.ParamExp:
+			// "$@", arrays, and name enumeration are the exceptions where a
+			// double-quoted parameter expansion can still yield multiple argv
+			// entries. Plain scalar parameters remain exactly one entry.
+			if p.Param == nil || p.Param.Value == "@" || p.Index != nil || p.Names != 0 || p.Flags != nil || p.NestedParam != nil {
+				return false
+			}
+		case *syntax.DblQuoted:
+			if !doubleQuotedStaysSingleArg(p) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // mvdan preserves shell escapes in Lit.Value. Resolve only the escapes that

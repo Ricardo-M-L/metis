@@ -33,10 +33,11 @@ import (
 
 // blockedArgRule encodes one (cmd, subcmd-prefix, required-flags) rule.
 type blockedArgRule struct {
-	Cmd    string
-	Sub    []string // subcommand tokens that must appear in order at the start of args
-	Flags  []string // flags that must all be present somewhere
-	Reason string
+	Cmd        string
+	Sub        []string // subcommand tokens that must appear in order at the start of args
+	Flags      []string // flags that must all be present somewhere
+	Reason     string
+	Bypassable bool // persistent install: hard-block normally, allow only in explicit bypassPermissions
 }
 
 // blockedArgRules is metis's canonical list. Add new entries with a
@@ -50,24 +51,27 @@ var blockedArgRules = []blockedArgRule{
 	// Global package installs pollute the user's environment outside
 	// the project root and persist across sessions. Block; the model
 	// can use a project-local install (npm install lodash, etc.).
-	{Cmd: "npm", Sub: []string{"install"}, Flags: []string{"--global"}, Reason: "global npm install pollutes user env"},
-	{Cmd: "npm", Sub: []string{"install"}, Flags: []string{"-g"}, Reason: "global npm install pollutes user env"},
-	{Cmd: "npm", Sub: []string{"i"}, Flags: []string{"--global"}, Reason: "global npm install pollutes user env"},
-	{Cmd: "npm", Sub: []string{"i"}, Flags: []string{"-g"}, Reason: "global npm install pollutes user env"},
-	{Cmd: "pnpm", Sub: []string{"add"}, Flags: []string{"--global"}, Reason: "global pnpm add pollutes user env"},
-	{Cmd: "pnpm", Sub: []string{"add"}, Flags: []string{"-g"}, Reason: "global pnpm add pollutes user env"},
-	{Cmd: "yarn", Sub: []string{"global", "add"}, Reason: "yarn global add pollutes user env"},
-	{Cmd: "pip", Sub: []string{"install"}, Flags: []string{"--user"}, Reason: "user-site pip install affects all projects"},
-	{Cmd: "pip3", Sub: []string{"install"}, Flags: []string{"--user"}, Reason: "user-site pip install affects all projects"},
+	{Cmd: "npm", Sub: []string{"install"}, Flags: []string{"--global"}, Reason: "global npm install pollutes user env", Bypassable: true},
+	{Cmd: "npm", Sub: []string{"install"}, Flags: []string{"-g"}, Reason: "global npm install pollutes user env", Bypassable: true},
+	{Cmd: "npm", Sub: []string{"i"}, Flags: []string{"--global"}, Reason: "global npm install pollutes user env", Bypassable: true},
+	{Cmd: "npm", Sub: []string{"i"}, Flags: []string{"-g"}, Reason: "global npm install pollutes user env", Bypassable: true},
+	{Cmd: "pnpm", Sub: []string{"add"}, Flags: []string{"--global"}, Reason: "global pnpm add pollutes user env", Bypassable: true},
+	{Cmd: "pnpm", Sub: []string{"add"}, Flags: []string{"-g"}, Reason: "global pnpm add pollutes user env", Bypassable: true},
+	{Cmd: "yarn", Sub: []string{"global", "add"}, Reason: "yarn global add pollutes user env", Bypassable: true},
+	{Cmd: "pip", Sub: []string{"install"}, Flags: []string{"--user"}, Reason: "user-site pip install affects all projects", Bypassable: true},
+	{Cmd: "pip3", Sub: []string{"install"}, Flags: []string{"--user"}, Reason: "user-site pip install affects all projects", Bypassable: true},
 
 	// `go install` / `cargo install` / `gem install` / `brew install`
 	// drop binaries onto $PATH — same persistence concern.
-	{Cmd: "go", Sub: []string{"install"}, Reason: "go install drops persistent binary"},
-	{Cmd: "cargo", Sub: []string{"install"}, Reason: "cargo install drops persistent binary"},
-	{Cmd: "gem", Sub: []string{"install"}, Reason: "gem install drops persistent binary"},
-	{Cmd: "brew", Sub: []string{"install"}, Reason: "brew install changes user env outside project"},
+	{Cmd: "go", Sub: []string{"install"}, Reason: "go install drops persistent binary", Bypassable: true},
+	{Cmd: "cargo", Sub: []string{"install"}, Reason: "cargo install drops persistent binary", Bypassable: true},
+	{Cmd: "gem", Sub: []string{"install"}, Reason: "gem install drops persistent binary", Bypassable: true},
+	{Cmd: "brew", Sub: []string{"install"}, Reason: "brew install changes user env outside project", Bypassable: true},
 
 	// System package managers — by definition affect the whole machine.
+	// Keep system package managers hard-blocked even in bypass because they
+	// typically require privilege escalation and mutate the whole OS rather
+	// than the user's explicitly selected workspace/toolchain.
 	{Cmd: "apt", Sub: []string{"install"}, Reason: "apt install requires sudo and modifies system"},
 	{Cmd: "apt-get", Sub: []string{"install"}, Reason: "apt-get install requires sudo and modifies system"},
 	{Cmd: "dnf", Sub: []string{"install"}, Reason: "dnf install requires sudo and modifies system"},
@@ -85,12 +89,23 @@ var blockedArgRules = []blockedArgRule{
 // so the cost is O(rules × tokens) — small for a 20-rule list and
 // short commands.
 func applyBashArgsBlocker(cmd string) error {
+	return applyBashArgsBlockerForBypass(cmd, false)
+}
+
+// applyBashArgsBlockerForBypass keeps exploit-shape rules hard in every mode
+// while allowing ordinary persistent package installs only after the user has
+// explicitly selected bypassPermissions. Policy deny-lists and the optional OS
+// sandbox still run independently and may reject the command.
+func applyBashArgsBlockerForBypass(cmd string, bypass bool) error {
 	tokens := tokeniseShellCommand(cmd)
 	if len(tokens) == 0 {
 		return nil
 	}
 	for _, r := range blockedArgRules {
 		if r.matches(tokens) {
+			if bypass && r.Bypassable {
+				continue
+			}
 			reason := r.Reason
 			if reason == "" {
 				reason = "policy"

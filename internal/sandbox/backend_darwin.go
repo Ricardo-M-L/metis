@@ -130,9 +130,11 @@ func buildDarwinProfile(cwd, tempDir, home, metisHome string, network NetworkPol
 		credentialFiles := []string{
 			"auth.json",
 			"mcp-oauth.json",
+			"mcp.toml",
 			"credentials.json",
 			"secrets.json",
 			"config.toml", // may contain legacy inline api_key values
+			"config.local.toml",
 		}
 		for _, name := range credentialFiles {
 			rules = append(rules,

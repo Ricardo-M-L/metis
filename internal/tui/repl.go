@@ -26,20 +26,31 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/tools"
+	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
 type REPL struct {
-	Loop        *agent.Loop
-	Gate        *permission.Gate
-	Slash       *slash.Registry
-	Session     *session.Store
-	SessionID   string
-	Styles      *Styles
-	Markdown    *glamour.TermRenderer
-	UseMarkdown bool
-	ShowTokens  bool
-	model       string
+	// ctx owns process/session-scoped background work started by commands. The
+	// plain REPL installs its Run context; the Bubble Tea bridge installs the
+	// Model context. Command-specific waits must still derive their own timeout
+	// instead of using this lifecycle context directly.
+	ctx context.Context
+	// mcpLoginServers owns servers started by synchronous `/mcp login` until
+	// the plain REPL exits. The TUI bridge is short-lived and never uses this
+	// slice; its Model owns async login servers instead.
+	mcpLoginServers []mcpLoginServer
+	Loop            *agent.Loop
+	Gate            *permission.Gate
+	Slash           *slash.Registry
+	Session         *session.Store
+	SessionID       string
+	Styles          *Styles
+	Markdown        *glamour.TermRenderer
+	UseMarkdown     bool
+	ShowTokens      bool
+	model           string
 	// providerName tracks which provider profile the running Loop.Provider
 	// was built against — required for cmdModel to call rtpkg.BuildProvider
 	// on the right profile when the user does /model <id> mid-session.
@@ -74,6 +85,9 @@ type REPL struct {
 	DirAdd    func(path string, persist bool) error
 	DirRemove func(path string) error
 	DirList   func() []string
+	// AdoptMCPServer mirrors ExternalHooks.AdoptMCPServer for the plain REPL.
+	// Embedders that leave it nil retain local ownership until REPL shutdown.
+	AdoptMCPServer func(server *mcptools.Server, discoveredTools []tools.Tool) bool
 
 	stdin io.Reader
 	out   io.Writer
@@ -208,8 +222,12 @@ func (r *REPL) ConfigureSandbox(manager *sandbox.Manager) {
 }
 
 func (r *REPL) Run(ctx context.Context) (runErr error) {
+	r.ctx = ctx
 	defer func() {
-		if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.providerName, r.model, r.Loop.System); err != nil {
+		if err := r.closeMCPLoginServers(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close live MCP login servers: %w", err))
+		}
+		if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.Loop, r.providerName, r.model, r.Loop.System); err != nil {
 			runErr = errors.Join(runErr, err)
 			return
 		}
@@ -464,7 +482,11 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 					fmt.Fprintln(r.out, "(tagged: "+strings.TrimSpace(args)+")")
 				}
 			case slash.SignalPlan:
-				wasPlan := activatePlanMode(r.Gate, r.Loop)
+				wasPlan, err := activatePlanMode(r.Gate, r.Loop, r.sandbox)
+				if err != nil {
+					fmt.Fprintln(r.out, r.Styles.Err.Render("plan: "+err.Error()))
+					break
+				}
 				planArg := strings.TrimSpace(args)
 				switch {
 				case strings.EqualFold(planArg, "open"):

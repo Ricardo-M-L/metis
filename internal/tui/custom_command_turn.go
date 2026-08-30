@@ -132,7 +132,7 @@ func customCommandAllowRules(cmd *slash.Cmd, loop *agent.Loop) ([]permission.Rul
 				warnings = append(warnings, fmt.Sprintf("/%s: cannot apply allowed-tools entry %q because the tool registry is unavailable", cmd.Name, raw))
 				continue
 			}
-			tool, ok := loop.Registry.Get(toolName)
+			tool, ok := loop.Registry.GetForModel(toolName)
 			if !ok {
 				warnings = append(warnings, fmt.Sprintf("/%s: ignored unknown allowed-tools entry %q", cmd.Name, raw))
 				continue

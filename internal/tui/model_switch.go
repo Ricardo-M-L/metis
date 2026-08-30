@@ -88,7 +88,9 @@ func (m *Model) switchModel(newModel, newProvName string) error {
 	m.providerName = provName
 	m.baseSystem = newBaseSystem
 	m.baseSystemSections = newBaseSections
-	rtpkg.RebindLoopRuntime(m.loop, pb.Provider, pb.Model, newSystem, m.sessionID)
+	rtpkg.RebindLoopRuntime(m.loop, pb.Provider, pb.Model, newSystem, m.sessionID, rtpkg.LoopRuntimeRebindOptions{
+		ProviderName: provName,
+	})
 
 	return nil
 }

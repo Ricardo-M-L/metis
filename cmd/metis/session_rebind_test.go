@@ -162,7 +162,11 @@ func TestRuntimeRebindSessionAtUsesDesktopTargetWorkspace(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	workspaceA := t.TempDir()
 	workspaceB := t.TempDir()
-	targetFile := filepath.Join(workspaceB, "target-only.txt")
+	canonicalWorkspaceB, err := filepath.EvalSymlinks(workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetFile := filepath.Join(canonicalWorkspaceB, "target-only.txt")
 	if err := os.WriteFile(targetFile, []byte("target workspace"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -183,11 +187,11 @@ func TestRuntimeRebindSessionAtUsesDesktopTargetWorkspace(t *testing.T) {
 	if _, ok := states["target-only.txt"]; !ok {
 		t.Fatalf("checkpointer is not rooted at target workspace: %+v", states)
 	}
-	pointerB, err := session.ReadPointer(workspaceB)
+	pointerB, err := session.ReadPointer(canonicalWorkspaceB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pointerB == nil || pointerB.SessionID != "session-b" || pointerB.CWD != workspaceB {
+	if pointerB == nil || pointerB.SessionID != "session-b" || pointerB.CWD != canonicalWorkspaceB {
 		t.Fatalf("target workspace pointer = %+v", pointerB)
 	}
 	pointerA, err := session.ReadPointer(workspaceA)

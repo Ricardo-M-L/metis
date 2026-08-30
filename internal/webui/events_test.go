@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,36 @@ func TestEventHubPublishCarriesSession(t *testing.T) {
 		}
 	default:
 		t.Fatal("subscriber should receive the published event")
+	}
+}
+
+func TestEventHubStoresDetachedPresentationEvents(t *testing.T) {
+	h := newEventHub()
+	ch := h.subscribe()
+	defer h.unsubscribe(ch)
+
+	input := map[string]any{"api_key": "raw-secret", "safe": "keep"}
+	h.publish("sess-1", agent.Event{
+		Kind:            agent.EventPermissionRequest,
+		ToolInput:       input,
+		PermissionInput: input,
+		PermissionReply: make(chan agent.PermissionDecision, 1),
+		AskUserReply:    make(chan string, 1),
+	})
+	input["safe"] = "changed-after-publish"
+
+	he := <-ch
+	if he.ev.PermissionReply != nil || he.ev.AskUserReply != nil {
+		t.Fatal("subscriber event retained an interactive reply channel")
+	}
+	if he.ev.ToolInput["api_key"] != "[REDACTED]" || he.ev.PermissionInput["api_key"] != "[REDACTED]" {
+		t.Fatalf("subscriber event was not redacted: %#v", he.ev)
+	}
+	if he.ev.ToolInput["safe"] != "keep" {
+		t.Fatalf("subscriber event aliases source input: %#v", he.ev.ToolInput)
+	}
+	if len(h.replay) != 1 || h.replay[0].ev.ToolInput["safe"] != "keep" {
+		t.Fatalf("replay event aliases source input: %#v", h.replay)
 	}
 }
 
@@ -67,6 +98,25 @@ func TestEventHubReplaysAfterCursorAndDetectsExpiredWindow(t *testing.T) {
 	defer h.unsubscribe(old)
 	if !reset {
 		t.Fatal("cursor older than bounded replay window should request reset")
+	}
+}
+
+func TestEventHubForgetSessionClearsRemovedSlots(t *testing.T) {
+	h := newEventHub()
+	h.publish("remove", agent.Event{Kind: agent.EventInfo, Info: "sensitive-old-event"})
+	h.publish("keep", agent.Event{Kind: agent.EventInfo, Info: "keep-1"})
+	h.publish("keep", agent.Event{Kind: agent.EventInfo, Info: "keep-2"})
+	oldLen := len(h.replay)
+
+	h.forgetSession("remove")
+	if len(h.replay) != 2 {
+		t.Fatalf("replay len = %d, want 2", len(h.replay))
+	}
+	backing := h.replay[:oldLen]
+	for i := len(h.replay); i < oldLen; i++ {
+		if !reflect.DeepEqual(backing[i], hubEvent{}) {
+			t.Fatalf("removed replay slot %d retained event state: %#v", i, backing[i])
+		}
 	}
 }
 

@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -28,13 +30,67 @@ func TestAutoMemGate_AllowsReadGrepGlob(t *testing.T) {
 	}
 }
 
-func TestAutoMemGate_BashReadOnlyAllowed(t *testing.T) {
+func TestAutoMemGate_DeniesCredentialReadsAcrossReadAndGrep(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("METIS_HOME", root)
+	gate := CreateAutoMemCanUseTool(t.TempDir(), tools.NewRegistry())
+	secret := filepath.Join(root, "auth.json")
+
+	for _, tc := range []struct {
+		name  string
+		input map[string]any
+	}{
+		{name: "Read", input: map[string]any{"path": secret}},
+		{name: "Grep", input: map[string]any{"root": root, "pattern": "token"}},
+	} {
+		ok, reason := gate(context.Background(), tc.name, tc.input)
+		if ok || !strings.Contains(reason, "credential") {
+			t.Errorf("%s credential read = (%v, %q), want credential-boundary deny", tc.name, ok, reason)
+		}
+	}
+}
+
+func TestAutoMemGate_GrepWithoutRootUsesCredentialCWD(t *testing.T) {
+	root, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("METIS_HOME", root)
+
+	gate := CreateAutoMemCanUseTool(t.TempDir(), tools.NewRegistry())
+	ok, reason := gate(context.Background(), "Grep", map[string]any{"pattern": "token"})
+	if ok || !strings.Contains(reason, "credential") {
+		t.Fatalf("no-root Grep in METIS_HOME = (%v, %q), want credential-boundary deny", ok, reason)
+	}
+}
+
+func TestAutoMemGate_ReadResolvesCredentialSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	root := t.TempDir()
+	t.Setenv("METIS_HOME", root)
+	secret := filepath.Join(root, "mcp-oauth.json")
+	if err := os.WriteFile(secret, []byte(`{"token":"opaque"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "notes.json")
+	if err := os.Symlink(secret, alias); err != nil {
+		t.Fatal(err)
+	}
+	gate := CreateAutoMemCanUseTool(t.TempDir(), tools.NewRegistry())
+	if ok, reason := gate(context.Background(), "Read", map[string]any{"path": alias}); ok || !strings.Contains(reason, "credential") {
+		t.Fatalf("credential symlink read = (%v, %q), want deny", ok, reason)
+	}
+}
+
+func TestAutoMemGate_BashReadOnlyStillDenied(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.Register(fakeBashTool{forkFakeTool: forkFakeTool{name: "Bash"}, readOnly: true})
 	gate := CreateAutoMemCanUseTool(t.TempDir(), reg)
 	ok, reason := gate(context.Background(), "Bash", map[string]any{"command": "ls"})
-	if !ok {
-		t.Fatalf("read-only Bash should be allowed, got: %s", reason)
+	if ok || !strings.Contains(reason, "shell tools are disabled") {
+		t.Fatalf("read-only Bash = (%v, %q), want fail-closed shell denial", ok, reason)
 	}
 }
 
@@ -46,8 +102,8 @@ func TestAutoMemGate_BashWriteDenied(t *testing.T) {
 	if ok {
 		t.Fatalf("write Bash should be denied")
 	}
-	if !strings.Contains(reason, "read-only") {
-		t.Errorf("reason missing 'read-only': %q", reason)
+	if !strings.Contains(reason, "shell tools are disabled") {
+		t.Errorf("reason missing shell denial: %q", reason)
 	}
 }
 
@@ -57,8 +113,27 @@ func TestAutoMemGate_BashUnregisteredDenied(t *testing.T) {
 	if ok {
 		t.Fatalf("unregistered Bash should fail closed")
 	}
-	if !strings.Contains(reason, "not registered") {
-		t.Errorf("reason should mention not-registered: %q", reason)
+	if !strings.Contains(reason, "shell tools are disabled") {
+		t.Errorf("reason should mention shell denial: %q", reason)
+	}
+}
+
+func TestAutoMemGate_NilRegistryFailsClosed(t *testing.T) {
+	gate := CreateAutoMemCanUseTool(t.TempDir(), nil)
+	ok, reason := gate(context.Background(), "Bash", map[string]any{"command": "ls"})
+	if ok || !strings.Contains(reason, "shell tools are disabled") {
+		t.Fatalf("nil registry Bash = (%v, %q), want fail-closed", ok, reason)
+	}
+}
+
+func TestAutoMemGate_DeniesMCPResourcesByDefault(t *testing.T) {
+	gate := CreateAutoMemCanUseTool(t.TempDir(), tools.NewRegistry())
+	ok, reason := gate(context.Background(), "ReadMcpResource", map[string]any{
+		"server": "private-vault",
+		"uri":    "secret://provider/token",
+	})
+	if ok || !strings.Contains(reason, "not memory-safe") {
+		t.Fatalf("ReadMcpResource = (%v, %q), want default deny", ok, reason)
 	}
 }
 
@@ -70,7 +145,7 @@ func TestAutoMemGate_BashNoReadOnlyImpl(t *testing.T) {
 	if ok {
 		t.Fatalf("Bash without ReadOnlyAware should fail closed")
 	}
-	if !strings.Contains(reason, "fail-closed") {
+	if !strings.Contains(reason, "shell tools are disabled") {
 		t.Errorf("got %q", reason)
 	}
 }
@@ -110,6 +185,23 @@ func TestAutoMemGate_WriteOutsideMemdirDenied(t *testing.T) {
 	}
 	if !strings.Contains(reason, "outside memdir root") {
 		t.Errorf("reason missing scope info: %q", reason)
+	}
+}
+
+func TestAutoMemGate_WriteViaSymlinkedMissingParentDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	root := t.TempDir()
+	outside := t.TempDir()
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(outside, alias); err != nil {
+		t.Fatal(err)
+	}
+	gate := CreateAutoMemCanUseTool(root, tools.NewRegistry())
+	target := filepath.Join(alias, "missing", "memory.md")
+	if ok, reason := gate(context.Background(), "Write", map[string]any{"file_path": target}); ok || !strings.Contains(reason, "outside memdir") {
+		t.Fatalf("symlink escape = (%v, %q), want outside-memdir deny", ok, reason)
 	}
 }
 

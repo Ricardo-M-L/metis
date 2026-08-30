@@ -11,6 +11,8 @@ package agent
 // (2026-05-16) — partner of internal/agent/skills/synth.go.
 
 import (
+	"os"
+
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -59,15 +61,44 @@ func buildDreamRegistry(parent *tools.Registry, skillsDir string, loader *skills
 // surface SkillSynth in the request schema (without this override
 // the fork inherits the parent's specs, which lack SkillSynth, and
 // the model never knows the tool exists).
-func toolSpecsFromRegistry(reg *tools.Registry, shortDesc bool) []llm.ToolSpec {
-	all := reg.SortedForCache()
+func toolSpecsFromRegistry(reg *tools.Registry, shortDesc bool, contextWindow int, preserve map[string]bool) []llm.ToolSpec {
+	all := reg.ModelEntriesForCache()
 	out := make([]llm.ToolSpec, 0, len(all))
-	for _, t := range all {
+	deferred := make(map[string]bool)
+	for _, entry := range all {
+		t := entry.Tool
 		out = append(out, llm.ToolSpec{
 			Name:        t.Name(),
 			Description: descriptionForTool(t, shortDesc),
 			InputSchema: t.InputSchema(),
+			Exposure:    string(entry.Exposure),
 		})
+		if entry.Exposure == tools.ToolExposureDeferred {
+			deferred[t.Name()] = true
+		}
+	}
+	mode, percentage := parseEnableToolSearch(os.Getenv("ENABLE_TOOL_SEARCH"))
+	switch mode {
+	case LazyModeAlways:
+		return stripAndAppendToolSearchWithExposure(out, deferred, preserve)
+	case LazyModeAuto:
+		if contextWindow > 0 {
+			return applyLazySchemaByTokensWithExposure(out, contextWindow, percentage, deferred, preserve)
+		}
+	}
+	return out
+}
+
+func discoveredDeferredFromSpecs(specs []llm.ToolSpec) map[string]bool {
+	var out map[string]bool
+	for _, spec := range specs {
+		if spec.Name == "ToolSearch" || spec.Exposure != string(tools.ToolExposureDeferred) || isLazyPlaceholderSpec(spec) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[spec.Name] = true
 	}
 	return out
 }

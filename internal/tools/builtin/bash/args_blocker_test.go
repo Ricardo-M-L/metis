@@ -82,6 +82,24 @@ func TestApplyBashArgsBlocker_FlagsWithEqualsSign(t *testing.T) {
 	}
 }
 
+func TestApplyBashArgsBlocker_BypassAllowsPersistentInstallsButNotExploitShapes(t *testing.T) {
+	for _, command := range []string{
+		"brew install --cask cmux",
+		"npm install --global typescript",
+		"pip install --user requests",
+	} {
+		if err := applyBashArgsBlockerForBypass(command, true); err != nil {
+			t.Errorf("bypass should allow ordinary persistent install %q: %v", command, err)
+		}
+	}
+	if err := applyBashArgsBlockerForBypass(`go test -exec "rm -rf /"`, true); err == nil {
+		t.Fatal("bypass must not allow go test -exec arbitrary-command escape")
+	}
+	if err := applyBashArgsBlockerForBypass("apt install nginx", true); err == nil {
+		t.Fatal("bypass must not claim system package installs can execute")
+	}
+}
+
 func TestTokeniseShellCommand(t *testing.T) {
 	cases := []struct {
 		in   string

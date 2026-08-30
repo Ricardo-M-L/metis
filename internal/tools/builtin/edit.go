@@ -5,16 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 type Edit struct {
 	tools.BaseTool
-	gate  *permission.Gate
-	state *ReadFileState
+	gate         *permission.Gate
+	state        *ReadFileState
+	authorizer   *invocationAuthorizer[approvedExistingPath]
+	afterOpen    func()
+	beforeCommit func()
 }
 
 func (Edit) Name() string { return "Edit" }
@@ -105,9 +110,30 @@ func (Edit) Concurrency(map[string]any) tools.Concurrency { return tools.Concurr
 // fragment.
 func (Edit) IsDestructive(map[string]any) bool { return true }
 
-func (e Edit) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
+func (e Edit) PrepareAuthorizedInvocation(ctx context.Context, in map[string]any) error {
 	path := strFromAny(in["path"])
-	d, src := e.gate.CheckPath(context.Background(), "Edit", path, path)
+	binding, err := prepareExistingPath(path, false)
+	if err != nil {
+		return err
+	}
+	if !binding.matchesCurrent(binding.targetInfo) {
+		return errors.New("Edit target changed during permission preparation")
+	}
+	e.authorizer.record(ctx, binding)
+	return nil
+}
+
+func (e Edit) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	path := strFromAny(in["path"])
+	d, src := permission.DecisionAllow, ""
+	if e.gate != nil {
+		d, src = e.gate.CheckPath(ctx, "Edit", path, path)
+	}
+	if d != permission.DecisionDeny {
+		if err := e.PrepareAuthorizedInvocation(ctx, in); err != nil {
+			return tools.PermissionDeny, security.RedactSubprocessText(err.Error())
+		}
+	}
 	return mapDecision(d), src
 }
 
@@ -127,7 +153,10 @@ const FileUnexpectedlyModified = "file unexpectedly modified after last read; re
 // Write would replace unseen regions and therefore remains blocked.
 const FilePartialViewNotEditable = "file was Read with offset/limit (partial view); re-Read the full file before overwriting"
 
-func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (e Edit) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	path, _ := in["path"].(string)
 	old, _ := in["old"].(string)
 	newS, _ := in["new"].(string)
@@ -138,48 +167,69 @@ func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	if old == newS {
 		return nil, errors.New("old and new are identical")
 	}
-
-	// Size guard up-front so we don't read GB into RAM only to fail.
-	st, err := os.Stat(path)
+	if !filepath.IsAbs(path) {
+		return &tools.Result{Output: "Edit: `path` must be absolute", IsError: true}, nil
+	}
+	binding, hasInvocationID, foundBinding := e.authorizer.consume(ctx)
+	if hasInvocationID && !foundBinding {
+		if _, prepErr := prepareExistingPath(path, false); prepErr != nil {
+			if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+				return &tools.Result{Output: fmt.Sprintf("%s is a directory, not a file. Edit operates on file contents — use LS to list entries, Read to view a specific file, then Edit it.", path), IsError: true}, nil
+			}
+			return nil, prepErr
+		}
+		return &tools.Result{Output: "Edit denied: permission binding missing for this invocation", IsError: true}, nil
+	}
+	if !hasInvocationID {
+		var prepErr error
+		binding, prepErr = prepareExistingPath(path, false)
+		if prepErr != nil {
+			if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+				return &tools.Result{Output: fmt.Sprintf("%s is a directory, not a file. Edit operates on file contents — use LS to list entries, Read to view a specific file, then Edit it.", path), IsError: true}, nil
+			}
+			return nil, prepErr
+		}
+		if e.gate != nil {
+			decision, source := e.gate.CheckPath(ctx, "Edit", path, path)
+			if decision != permission.DecisionAllow {
+				return &tools.Result{Output: "Edit denied: " + source, IsError: true}, nil
+			}
+		}
+	}
+	requestedAbs, absErr := filepath.Abs(filepath.Clean(path))
+	if absErr != nil || requestedAbs != binding.rawPath {
+		return &tools.Result{Output: "Edit denied: invocation input changed after permission check", IsError: true}, nil
+	}
+	f, _, err := openApprovedExisting(binding, os.O_RDWR, e.afterOpen)
+	if err != nil {
+		return &tools.Result{Output: "Edit denied: approved target changed before execution", IsError: true}, nil
+	}
+	defer f.Close()
+	bs, _, err := readPinnedFile(f, MaxEditFileSize)
 	if err != nil {
 		return nil, err
 	}
-	if st.IsDir() {
-		return &tools.Result{
-			Output:  fmt.Sprintf("%s is a directory, not a file. Edit operates on file contents — use LS to list entries, Read to view a specific file, then Edit it.", path),
-			IsError: true,
-		}, nil
-	}
-	if st.Size() > MaxEditFileSize {
-		return &tools.Result{
-			Output:  fmt.Sprintf("file too large: %d bytes exceeds %d byte edit cap", st.Size(), MaxEditFileSize),
-			IsError: true,
-		}, nil
-	}
-
-	// === Atomic stale-check + write critical section starts here. ===
-	// claude-code FileEditTool.ts:443 explicit warning:
-	//   "Please avoid async operations between here and writing to
-	//    disk to preserve atomicity."
-	// In Go we hold no locks but rely on the syscalls being
-	// synchronous and Edit being ConcurrencyExclusive in the
-	// dispatch tier — no concurrent intra-batch reader can interleave.
-	bs, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+	statePath := binding.resolvedPath
+	preservePartialView := false
+	partialOffset, partialLimit := 1, 0
 
 	// Staleness check: if a Read of this path was recorded earlier
 	// this session and either the mtime or content differs from the
 	// last-seen state, refuse — the model's mental snapshot is stale.
 	//
-	// Skipped when state is nil (test wiring without state) or when
-	// no Read entry exists (model is editing blind, which we still
-	// allow — first-edit-without-read is valid for model-authored
-	// new files routed through Write originally, but matched as edit
-	// here would be a misuse the model corrects on the next turn).
+	// Skipped only when state is nil (test/embedding compatibility). With a
+	// session state, an existing file must have a matching Read/Write snapshot;
+	// otherwise a path alias or blind Edit could manufacture full Write authority.
 	if e.state != nil {
-		if entry, ok := e.state.Get(path); ok {
+		if entry, ok := e.state.getFixed(statePath); ok {
+			preservePartialView = entry.IsPartialView
+			partialOffset, partialLimit = entry.Offset, entry.Limit
+			if entry.IsPartialView && all {
+				return &tools.Result{
+					Output:  "Edit refused: all=true is unavailable after a partial or redacted Read; use one exact unique replacement",
+					IsError: true,
+				}, nil
+			}
 			// The content hash is the precise signal: if it changed, the file
 			// was modified out-of-band since we Read it → refuse (stale write).
 			// The old `&&` also required mtime to differ, so a content change
@@ -194,6 +244,11 @@ func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 					IsError: true,
 				}, nil
 			}
+		} else {
+			return &tools.Result{
+				Output:  "Edit refused: " + path + " has not been Read this session — call Read first",
+				IsError: true,
+			}, nil
 		}
 	}
 
@@ -211,14 +266,29 @@ func (e Edit) Execute(_ context.Context, in map[string]any) (*tools.Result, erro
 	} else {
 		out = strings.Replace(body, old, newS, 1)
 	}
-	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+	if e.beforeCommit != nil {
+		e.beforeCommit()
+	}
+	if _, err := verifyPinnedContent(f, hashBytes(bs), MaxEditFileSize); err != nil {
+		return &tools.Result{Output: FileUnexpectedlyModified + ": " + path, IsError: true}, nil
+	}
+	postInfo, err := replacePinnedFile(f, []byte(out))
+	if err != nil {
 		return nil, err
 	}
-	// Re-record post-write so a follow-up Edit on the same path
-	// won't false-positive on the staleness check.
+	// Re-record post-write so a follow-up Edit on the same path does not
+	// false-positive on staleness. A targeted Edit must not upgrade a partial
+	// or redacted Read into whole-file Write authority: the model still has not
+	// seen every byte that the edit preserved.
 	if e.state != nil {
-		if st2, serr := os.Stat(path); serr == nil {
-			e.state.Record(path, st2.ModTime(), []byte(out))
+		if binding.matchesCurrent(postInfo) {
+			if preservePartialView {
+				e.state.recordPartialFixed(statePath, postInfo.ModTime(), []byte(out), partialOffset, partialLimit)
+			} else {
+				e.state.recordFixed(statePath, postInfo.ModTime(), []byte(out))
+			}
+		} else {
+			e.state.deleteFixed(statePath)
 		}
 	}
 	return &tools.Result{Output: fmt.Sprintf("edited %s (%d replacements)", path, ifelse(all, count, 1))}, nil

@@ -177,12 +177,5 @@ func WriteIndex(root string, files []MemoryFile) error {
 		}
 	}
 
-	tmp := IndexPath(root) + ".tmp"
-	if err := os.WriteFile(tmp, []byte(sb.String()), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, IndexPath(root)); err != nil {
-		return err
-	}
-	return os.Chmod(IndexPath(root), 0o600)
+	return AtomicWritePrivateFile(root, ENTRYPOINT_NAME, []byte(sb.String()), 0o600)
 }

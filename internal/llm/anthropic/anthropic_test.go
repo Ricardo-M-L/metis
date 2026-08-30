@@ -189,6 +189,49 @@ func TestToAnthropic_LastToolGetsCacheControl(t *testing.T) {
 	}
 }
 
+func TestToAnthropic_ExposureMarksStableDirectPrefix(t *testing.T) {
+	req := Request{
+		System: "test",
+		Tools: []ToolSpec{
+			{Name: "Bash", Exposure: "direct", InputSchema: map[string]any{}},
+			{Name: "Read", Exposure: "direct", InputSchema: map[string]any{}},
+			{Name: "mcp__docs__query", Exposure: "deferred", InputSchema: map[string]any{}},
+			{Name: "ToolSearch", Exposure: "deferred", InputSchema: map[string]any{}},
+		},
+	}
+	out := toAnthropic(req, "claude-sonnet-4", 1024)
+	if len(out.Tools) != 4 {
+		t.Fatalf("tool count mismatch: got %d", len(out.Tools))
+	}
+	if out.Tools[0].CacheControl != nil {
+		t.Fatalf("first direct tool must not carry boundary: %+v", out.Tools[0].CacheControl)
+	}
+	if out.Tools[1].CacheControl == nil || out.Tools[1].CacheControl.Type != "ephemeral" {
+		t.Fatalf("last direct tool must carry stable-prefix boundary: %+v", out.Tools[1].CacheControl)
+	}
+	for i := 2; i < len(out.Tools); i++ {
+		if out.Tools[i].CacheControl != nil {
+			t.Fatalf("deferred tool %q must stay after the cache boundary", out.Tools[i].Name)
+		}
+	}
+}
+
+func TestToAnthropic_AllDeferredToolsHaveNoToolCacheBoundary(t *testing.T) {
+	req := Request{
+		System: "test",
+		Tools: []ToolSpec{
+			{Name: "mcp__docs__query", Exposure: "deferred", InputSchema: map[string]any{}},
+			{Name: "ToolSearch", Exposure: "deferred", InputSchema: map[string]any{}},
+		},
+	}
+	out := toAnthropic(req, "claude-sonnet-4", 1024)
+	for i, tool := range out.Tools {
+		if tool.CacheControl != nil {
+			t.Fatalf("all-deferred tool[%d] %q must not define an unstable cache boundary", i, tool.Name)
+		}
+	}
+}
+
 // TestToAnthropic_NoToolsNoCacheMarker — zero tools means no cache
 // breakpoint on the tools level. The system block path still works
 // (verified above) but we must not crash.

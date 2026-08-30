@@ -533,6 +533,7 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 		lastTimeBasedMicrocompactAt: time.Now(),
 		subAgentNotify:              make(chan SubAgentNotification, 64),
 		ckptSnappedAt:               -1,
+		CacheStats:                  NewCacheStatsRing(0),
 	}
 }
 
@@ -1760,6 +1761,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		}
 		if usage != nil {
 			runOutputTokens += usage.out
+			if l.CacheStats != nil {
+				l.CacheStats.Add(CacheStat{
+					Turn:        runIter,
+					Input:       usage.in,
+					Output:      usage.out,
+					CacheCreate: usage.cacheCreate,
+					CacheRead:   usage.cacheRead,
+					Fingerprint: FingerprintRequest(req),
+				})
+			}
 			emit(ctx, out, Event{
 				Kind:                     EventTokens,
 				InputTokens:              usage.in,
@@ -2019,7 +2030,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					traceCallID := NewTraceInvocationID()
 					emit(ctx, out, Event{
 						Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
-						ToolName: toolUse.ToolName, ToolInput: toolUse.ToolInput,
+						ToolName: toolUse.ToolName, ToolInput: redactedToolInput(toolUse.ToolInput),
 						TraceCallID: traceCallID,
 					})
 					skipped[i] = llm.ContentBlock{
@@ -2113,7 +2124,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					traceCallID := NewTraceInvocationID()
 					emit(ctx, out, Event{
 						Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
-						ToolName: toolUse.ToolName, ToolInput: toolUse.ToolInput,
+						ToolName: toolUse.ToolName, ToolInput: redactedToolInput(toolUse.ToolInput),
 						TraceCallID: traceCallID,
 					})
 					results[i] = llm.ContentBlock{
@@ -2158,7 +2169,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 						traceCallID := NewTraceInvocationID()
 						emit(ctx, out, Event{
 							Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
-							ToolName: toolUse.ToolName, ToolInput: toolUse.ToolInput,
+							ToolName: toolUse.ToolName, ToolInput: redactedToolInput(toolUse.ToolInput),
 							TraceCallID: traceCallID,
 						})
 						results[i] = llm.ContentBlock{

@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+type stubIPResolver struct {
+	addrs []net.IPAddr
+	err   error
+}
+
+func (s stubIPResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
+	return s.addrs, s.err
+}
+
 // ─── IsBlockedIP — IPv4 ──────────────────────────────────────────
 
 func TestIsBlockedIP_LoopbackAllowed(t *testing.T) {
@@ -250,5 +259,24 @@ func TestGuardedDialContext_RejectsBadAddress(t *testing.T) {
 	_, err := GuardedDialContext(context.Background(), "tcp", "this-is-not-an-addr")
 	if err == nil {
 		t.Error("bad addr should error from net.SplitHostPort")
+	}
+}
+
+func TestGuardedDialContext_BlocksMixedPublicPrivateDNSWithoutDialing(t *testing.T) {
+	resolver := stubIPResolver{addrs: []net.IPAddr{
+		{IP: net.ParseIP("93.184.216.34")},
+		{IP: net.ParseIP("169.254.169.254")},
+	}}
+	called := false
+	_, err := guardedDialContext(context.Background(), "tcp", "rebind.example:80", resolver,
+		func(context.Context, string, string) (net.Conn, error) {
+			called = true
+			return nil, errors.New("must not dial")
+		})
+	if !errors.Is(err, ErrBlocked) {
+		t.Fatalf("mixed public/private DNS response must be blocked, got %v", err)
+	}
+	if called {
+		t.Fatal("dialer was called after a private rebinding candidate was resolved")
 	}
 }

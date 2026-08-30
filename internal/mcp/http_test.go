@@ -210,16 +210,22 @@ func TestHTTPClient_Resources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListResources: %v", err)
 	}
-	if len(res) != 1 || res[0].URI != "file:///x.md" || res[0].MimeType != "text/markdown" {
+	if len(res) != 1 || !strings.HasPrefix(res[0].URI, resourceHandlePrefix) || res[0].MimeType != "text/markdown" {
 		t.Fatalf("unexpected resources: %#v", res)
 	}
+	if strings.Contains(res[0].URI, "file:///x.md") {
+		t.Fatalf("raw resource URI leaked through list: %q", res[0].URI)
+	}
 
-	rr, err := c.ReadResource(ctx, "file:///x.md")
+	rr, err := c.ReadResource(ctx, res[0].URI)
 	if err != nil {
 		t.Fatalf("ReadResource: %v", err)
 	}
-	if len(rr.Contents) != 1 || rr.Contents[0].Text != "hello from file:///x.md" {
+	if len(rr.Contents) != 1 || rr.Contents[0].Text != "hello from [REDACTED]" {
 		t.Fatalf("unexpected contents: %#v", rr.Contents)
+	}
+	if !strings.HasPrefix(rr.Contents[0].URI, resourceHandlePrefix) || strings.Contains(rr.Contents[0].URI, "file:///x.md") {
+		t.Fatalf("resource content URI leaked instead of using a handle: %#v", rr.Contents)
 	}
 }
 

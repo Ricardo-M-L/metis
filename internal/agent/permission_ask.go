@@ -26,7 +26,7 @@ type askResult struct {
 // independently testable. The runtime caller uses an EventPermissionRequest
 // reply channel to deliver the user's decision.
 func (l *Loop) askPermission(ctx context.Context, blk llm.ContentBlock, out chan<- Event) askResult {
-	return l.askPermissionPending(ctx, blk, out, 0)
+	return l.askPermissionPending(ctx, blk, redactedToolInput(blk.ToolInput), out, 0)
 }
 
 // askPermissionPending is the same as askPermission but sets
@@ -34,22 +34,19 @@ func (l *Loop) askPermission(ctx context.Context, blk llm.ContentBlock, out chan
 // "1 of N pending approvals". Used by executeBatch's batched ASK
 // phase. pending is the number of additional ASKs still queued
 // behind this one in the same batch.
-func (l *Loop) askPermissionPending(ctx context.Context, blk llm.ContentBlock, out chan<- Event, pending int) askResult {
-	reply := make(chan PermissionDecision, 1)
-	emit(ctx, out, Event{
-		Kind:              EventPermissionRequest,
-		ToolUseID:         blk.ToolUseID,
-		ToolName:          blk.ToolName,
-		ToolInput:         blk.ToolInput,
-		PermissionTool:    blk.ToolName,
-		PermissionInput:   blk.ToolInput,
-		PermissionReply:   reply,
-		PermissionPending: pending,
-	})
+func (l *Loop) askPermissionPending(
+	ctx context.Context,
+	blk llm.ContentBlock,
+	presentationInput map[string]any,
+	out chan<- Event,
+	pending int,
+) askResult {
+	ev := permissionRequestEvent(blk, presentationInput, pending)
+	emit(ctx, out, ev)
 
 	var decision PermissionDecision
 	select {
-	case decision = <-reply:
+	case decision = <-ev.PermissionReply:
 	case <-ctx.Done():
 		// Treat as a soft failure — return a tool_result block so the
 		// LLM sees the cancellation as a structured error rather than
@@ -83,4 +80,22 @@ func (l *Loop) askPermissionPending(ctx context.Context, blk llm.ContentBlock, o
 		})
 	}
 	return askResult{proceed: true}
+}
+
+// permissionRequestEvent creates the sole event shape used for both an
+// interactive ASK and an unattended admission denial. The execution snapshot
+// stays behind Event's private policy accessor; every public argument map is a
+// separately-owned redacted presentation copy.
+func permissionRequestEvent(blk llm.ContentBlock, presentationInput map[string]any, pending int) Event {
+	return Event{
+		Kind:                  EventPermissionRequest,
+		ToolUseID:             blk.ToolUseID,
+		ToolName:              blk.ToolName,
+		ToolInput:             clonePresentation(presentationInput),
+		PermissionTool:        blk.ToolName,
+		PermissionInput:       clonePresentation(presentationInput),
+		permissionPolicyInput: capturePermissionPolicyInput(blk.ToolInput),
+		PermissionReply:       make(chan PermissionDecision, 1),
+		PermissionPending:     pending,
+	}
 }

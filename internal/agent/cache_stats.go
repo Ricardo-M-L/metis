@@ -23,7 +23,9 @@ package agent
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -43,7 +45,7 @@ type CacheStat struct {
 	// CacheRead is the cached prefix billed at ~10% (Anthropic) /
 	// `cached_tokens` field on OpenAI-flavoured providers.
 	CacheRead int
-	// Fingerprint is sha256(model | system | tool_names | effort).
+	// Fingerprint is sha256(model | system sections | tool schemas | effort).
 	// Comparing fingerprints across turns identifies which input
 	// changed when the cache breaks unexpectedly.
 	Fingerprint string
@@ -155,7 +157,7 @@ func (r *CacheStatsRing) LastBreak() (oldFP, newFP string) {
 //
 //	model — Loop.Model (the resolved id)
 //	system — the assembled system prompt at the time of the call
-//	tools — the tool spec list ([]llm.ToolSpec); only Name participates
+//	tools — the exact tool spec list ([]llm.ToolSpec)
 //	effort — Loop.EffortValue()
 //
 // Output: hex-encoded sha256, first 12 chars (full hash is overkill
@@ -168,11 +170,33 @@ func FingerprintFor(model, system string, tools []llm.ToolSpec, effort llm.Effor
 	// likely large (KBs), and the fingerprint just needs identity.
 	fmt.Fprintln(h, "system_hash:", sha256Hex(system))
 	for _, t := range tools {
-		fmt.Fprintln(h, "tool:", t.Name)
+		fmt.Fprintln(h, "tool_name:", t.Name)
+		fmt.Fprintln(h, "tool_exposure:", t.Exposure)
+		fmt.Fprintln(h, "tool_description_hash:", sha256Hex(t.Description))
+		if schema, err := json.Marshal(t.InputSchema); err == nil {
+			fmt.Fprintln(h, "tool_schema_hash:", sha256Hex(string(schema)))
+		} else {
+			fmt.Fprintln(h, "tool_schema_error:", err)
+		}
 	}
 	fmt.Fprintln(h, "effort:", effort)
 	sum := h.Sum(nil)
 	return fmt.Sprintf("%x", sum[:6])
+}
+
+// FingerprintRequest hashes the exact cache-relevant request projection. It
+// includes typed system sections because providers such as Anthropic ignore
+// the flattened System string whenever sections are present.
+func FingerprintRequest(req llm.Request) string {
+	system := req.System
+	if len(req.SystemSections) > 0 {
+		var b strings.Builder
+		for _, section := range req.SystemSections {
+			fmt.Fprintf(&b, "section:%s cache=%t volatile=%t\n%s\n", section.Name, section.Cache, section.Volatile, section.Body)
+		}
+		system = b.String()
+	}
+	return FingerprintFor(req.Model, system, req.Tools, req.Effort)
 }
 
 func sha256Hex(s string) string {

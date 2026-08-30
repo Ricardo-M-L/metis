@@ -27,11 +27,10 @@ func (m *mockStream) Recv() (llm.StreamEvent, error) {
 
 func (m *mockStream) Close() error { return nil }
 
-// TestConsumeStream_EmitsToolArgsDelta — driving consumeStream with
-// tool_input_delta wire events should now produce per-chunk
-// EventToolArgsDelta on the out channel (T12). Before this change the
-// chunks were silently accumulated until tool_use_stop; the UI saw
-// the args only after the full tool_use block closed.
+// TestConsumeStream_EmitsToolArgsDelta — provider argument chunks are held
+// until tool_use_stop, then surfaced to the UI as one complete redacted JSON
+// snapshot. Emitting raw chunks is unsafe because a credential field name and
+// value can span multiple chunks and therefore cannot be classified locally.
 func TestConsumeStream_EmitsToolArgsDelta(t *testing.T) {
 	stream := &mockStream{events: []llm.StreamEvent{
 		{Type: "message_start", InputTokens: 100},
@@ -61,15 +60,54 @@ func TestConsumeStream_EmitsToolArgsDelta(t *testing.T) {
 		}
 	}
 
-	if len(argsDeltas) != 3 {
-		t.Errorf("expected 3 EventToolArgsDelta events; got %d (%v)",
+	if len(argsDeltas) != 1 {
+		t.Errorf("expected 1 EventToolArgsDelta event; got %d (%v)",
 			len(argsDeltas), argsDeltas)
 	}
-	if joined := strings.Join(argsDeltas, ""); joined != `{"path":"/tmp/foo.go"}` {
-		t.Errorf("concatenated deltas should reassemble the full JSON; got %q", joined)
+	if snapshot := strings.Join(argsDeltas, ""); snapshot != `{"path":"/tmp/foo.go"}` {
+		t.Errorf("args snapshot should contain the full JSON object; got %q", snapshot)
 	}
 	if argsDeltaTool != "Read" {
 		t.Errorf("EventToolArgsDelta should carry ToolName; got %q", argsDeltaTool)
+	}
+}
+
+func TestConsumeStream_ToolArgsDeltaDoesNotLeakSplitCredentials(t *testing.T) {
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "Bash"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `{"api_`},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `key":"hunter`},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `2","nested":{"pass`},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `word":"sword`},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `fish"},"command":"echo ok"}`},
+		{Type: "tool_use_stop", ToolUseID: "t1"},
+		{Type: "message_stop"},
+	}}
+
+	out := make(chan Event, 32)
+	go func() {
+		_, _, _, _ = (&Loop{}).consumeStream(context.Background(), stream, out)
+		close(out)
+	}()
+
+	var snapshots []string
+	for ev := range out {
+		if ev.Kind != EventToolArgsDelta {
+			continue
+		}
+		if strings.Contains(ev.TextDelta, "hunter2") || strings.Contains(ev.TextDelta, "swordfish") {
+			t.Fatalf("tool args event leaked a split credential: %q", ev.TextDelta)
+		}
+		snapshots = append(snapshots, ev.TextDelta)
+	}
+
+	if len(snapshots) != 1 {
+		t.Fatalf("got %d tool argument events, want one sanitized snapshot: %q", len(snapshots), snapshots)
+	}
+	const want = `{"api_key":"[REDACTED]","command":"echo ok","nested":{"password":"[REDACTED]"}}`
+	if snapshots[0] != want {
+		t.Fatalf("sanitized tool argument snapshot = %q, want %q", snapshots[0], want)
 	}
 }
 
@@ -126,7 +164,7 @@ func TestConsumeStream_InterleavedParallelTools(t *testing.T) {
 	if got, _ := blocks[1].ToolInput["root"].(string); got != "/tmp" {
 		t.Errorf("grep root missing: got %q (%+v)", got, blocks[1].ToolInput)
 	}
-	if strings.Join(deltaIDs, ",") != "read-a,grep-b,read-a,grep-b" {
+	if strings.Join(deltaIDs, ",") != "grep-b,read-a" {
 		t.Errorf("args delta attribution = %v", deltaIDs)
 	}
 }

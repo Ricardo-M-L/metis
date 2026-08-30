@@ -48,6 +48,8 @@ type TopicMaintenanceResult struct {
 	Pruned []string
 }
 
+const maxTopicFileBytes = 64 * 1024 * 1024
+
 // TopicContentSHA256 returns the revision token used by TopicMutation.
 func TopicContentSHA256(content []byte) string {
 	sum := sha256.Sum256(content)
@@ -84,14 +86,18 @@ func (mm *MemoryManager) CommitTopic(ctx context.Context, mutation TopicMutation
 		if err := rejectDeletedSessionLocked(mm.root, mutation.Source.SessionID); err != nil {
 			return err
 		}
-		if err := checkTopicRevisionAndOwner(target, mutation); err != nil {
+		pinnedRoot, relative, err := pinnedTopicPath(mm.root, target)
+		if err != nil {
+			return err
+		}
+		if err := checkTopicRevisionAndOwner(pinnedRoot, relative, mutation); err != nil {
 			return err
 		}
 		prepared, err := prepareTopicContent(mutation.Content, mutation.Source, time.Now())
 		if err != nil {
 			return err
 		}
-		if err := atomicWriteFile(target, string(prepared), 0o600); err != nil {
+		if err := memdir.AtomicWritePrivateFile(pinnedRoot, relative, prepared, 0o600); err != nil {
 			return err
 		}
 		if err := refreshTopicIndexesLocked(ctx, mm.root); err != nil {
@@ -124,15 +130,19 @@ func (mm *MemoryManager) RemoveTopic(ctx context.Context, path, sourceSessionID 
 		if err != nil {
 			return err
 		}
+		pinnedRoot, relative, err := pinnedTopicPath(mm.root, target)
+		if err != nil {
+			return err
+		}
 		if sourceSessionID != "" {
 			if err := rejectDeletedSessionLocked(mm.root, sourceSessionID); err != nil {
 				return err
 			}
-			if err := requireTopicOwner(target, sourceSessionID); err != nil {
+			if err := requireTopicOwner(pinnedRoot, relative, sourceSessionID); err != nil {
 				return err
 			}
 		}
-		if err := os.Remove(target); err != nil {
+		if err := memdir.RemovePrivateRegularFile(pinnedRoot, relative); err != nil {
 			return err
 		}
 		if err := refreshTopicIndexesLocked(ctx, mm.root); err != nil {
@@ -262,8 +272,8 @@ func validateTopicSource(source TopicSource) error {
 	return nil
 }
 
-func checkTopicRevisionAndOwner(path string, mutation TopicMutation) error {
-	raw, err := os.ReadFile(path)
+func checkTopicRevisionAndOwner(root, relative string, mutation TopicMutation) error {
+	raw, err := memdir.ReadPrivateRegularFile(root, relative, maxTopicFileBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		if mutation.ExpectedSHA256 != "" {
 			return ErrTopicConflict
@@ -279,8 +289,8 @@ func checkTopicRevisionAndOwner(path string, mutation TopicMutation) error {
 	return requireTopicOwnerBytes(raw, mutation.Source.SessionID)
 }
 
-func requireTopicOwner(path, sourceSessionID string) error {
-	raw, err := os.ReadFile(path)
+func requireTopicOwner(root, relative, sourceSessionID string) error {
+	raw, err := memdir.ReadPrivateRegularFile(root, relative, maxTopicFileBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -428,6 +438,40 @@ func normalizeTopicFrontmatter(fm *memdir.Frontmatter, filename, body string) {
 	}
 }
 
+// pinnedTopicPath maps a validated absolute topic path back to the real root
+// that os.Root must pin. It rejects a symlink at the configured root itself,
+// while still tolerating platform aliases in ancestors (macOS /var ->
+// /private/var).
+func pinnedTopicPath(root, target string) (string, string, error) {
+	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", "", err
+	}
+	rootInfo, err := os.Lstat(rootAbs)
+	if err != nil {
+		return "", "", err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return "", "", fmt.Errorf("memory topic root is not a real directory: %s", rootAbs)
+	}
+	targetAbs, err := filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return "", "", err
+	}
+	if relative, relErr := memdir.RootRelativePath(rootAbs, targetAbs); relErr == nil {
+		return rootAbs, relative, nil
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", "", err
+	}
+	relative, err := memdir.RootRelativePath(resolvedRoot, targetAbs)
+	if err != nil {
+		return "", "", err
+	}
+	return resolvedRoot, relative, nil
+}
+
 func resolveTopicTargetLocked(root, candidate string) (string, error) {
 	if strings.TrimSpace(candidate) == "" {
 		return "", errors.New("memory topic path is empty")
@@ -479,20 +523,11 @@ func resolveTopicTargetLocked(root, candidate string) (string, error) {
 	parent := filepath.Join(resolvedRoot, dirRel)
 	if dirRel != "." {
 		info, statErr := os.Lstat(parent)
-		if errors.Is(statErr, os.ErrNotExist) {
-			if err := os.Mkdir(parent, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-				return "", err
-			}
-			info, statErr = os.Lstat(parent)
-		}
-		if statErr != nil {
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 			return "", statErr
 		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		if statErr == nil && (info.Mode()&os.ModeSymlink != 0 || !info.IsDir()) {
 			return "", fmt.Errorf("memory topic parent %q is not a private directory", parent)
-		}
-		if err := os.Chmod(parent, 0o700); err != nil {
-			return "", err
 		}
 	}
 	target = filepath.Join(resolvedRoot, cleanRel)

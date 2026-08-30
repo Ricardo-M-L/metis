@@ -86,15 +86,67 @@ func isManagedBasePromptSection(name string) bool {
 	}
 }
 
+// RebindToolAwarePrompt refreshes only the default-prompt sections whose body
+// depends on the model-visible tool registry. Explicit --system/simple prompts
+// use a single "base" section and are deliberately left byte-for-byte intact.
+// The remaining default sections (provider hint, overlays, project context,
+// addendum and env) retain their original order and cache metadata.
+func RebindToolAwarePrompt(system string, sections []SystemPromptSection, ctx PromptCtx) (string, []SystemPromptSection) {
+	if len(sections) == 0 {
+		return system, nil
+	}
+	managed := false
+	for _, section := range sections {
+		if isManagedBasePromptSection(section.Name) {
+			managed = true
+			break
+		}
+	}
+	if !managed {
+		return system, append([]SystemPromptSection(nil), sections...)
+	}
+
+	computerUse := ComputerUseSection(ctx)
+	toolRedirects := ToolRedirectsSection(ctx)
+	out := make([]SystemPromptSection, 0, len(sections)+2)
+	for _, section := range sections {
+		switch section.Name {
+		case "computer_use", "tool_redirects":
+			// Drop the provisional copy. The canonical replacement is inserted
+			// below even when the provisional section was absent.
+			continue
+		}
+		out = append(out, section)
+		if section.Name == "language" && computerUse.Name != "" {
+			out = append(out, computerUse)
+		}
+		if section.Name == "style" && toolRedirects.Name != "" {
+			out = append(out, toolRedirects)
+		}
+	}
+	return RenderSections(out), out
+}
+
 // RebindLoopRuntime refreshes provider/session state captured by built-in
 // tools and by the lazy pricing resolver after an in-process /model, /resume,
 // /branch or /new boundary. The existing registry stays intact so dynamic MCP
 // and plugin tools are not discarded.
-func RebindLoopRuntime(loop *agent.Loop, provider llm.Provider, model, system, parentSessionID string) {
+type LoopRuntimeRebindOptions struct {
+	ProviderName     string
+	WorkingDirectory string
+}
+
+func RebindLoopRuntime(loop *agent.Loop, provider llm.Provider, model, system, parentSessionID string, options ...LoopRuntimeRebindOptions) {
 	if loop == nil {
 		return
 	}
-	builtin.RebindProviderTools(loop.Registry, provider, model, system, parentSessionID)
+	promptState := builtin.AgentRuntimePromptState{}
+	if len(options) > 0 {
+		latest := options[len(options)-1]
+		promptState.ProviderName = latest.ProviderName
+		promptState.WorkingDirectory = latest.WorkingDirectory
+	}
+	builtin.RebindProviderTools(loop.Registry, provider, model, system, parentSessionID, promptState)
 	if loop.Budget != nil {
 		loop.Budget.SetRatesResolver(modelRatesResolver(model))
 	}

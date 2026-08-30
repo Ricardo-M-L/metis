@@ -142,22 +142,20 @@ func TestTokenEnvFallback(t *testing.T) {
 	}
 }
 
-// TestTokenGhFallback locks the gh-CLI fallback path: when neither
-// env var is set, Token() shells out to `gh auth token`. We can't
-// assume gh is logged in on every CI runner, so the assertion is
-// conditional — when gh is absent / unauthenticated the result is
-// "" (which is the legitimate "no token available" state).
+// TestTokenGhFallback locks the gh-CLI fallback path without consulting the
+// developer machine's credential store. Unit tests must never invoke a real
+// `gh auth token`: on macOS that can open a Keychain dialog.
 func TestTokenGhFallback(t *testing.T) {
 	t.Setenv("METIS_GITHUB_TOKEN", "")
 	t.Setenv("GITHUB_TOKEN", "")
+	oldRunner := ghAuthTokenRunner
+	ghAuthTokenRunner = func(context.Context) (string, error) {
+		return "gho_test-token-that-never-leaves-the-test", nil
+	}
+	t.Cleanup(func() { ghAuthTokenRunner = oldRunner })
 	resetGhTokenCache()
-	got := Token()
-	// On a CI machine without gh, this is "". On a dev machine with
-	// `gh auth login` already done, it's a real token. Either is fine
-	// — what matters is the function doesn't panic and the lookup
-	// terminates within the 2s ghAuthToken timeout.
-	if got != "" && len(got) < 20 {
-		t.Errorf("gh token suspiciously short: %q (len=%d)", got, len(got))
+	if got := Token(); got != "gho_test-token-that-never-leaves-the-test" {
+		t.Fatalf("Token() = %q, want mocked gh token", got)
 	}
 }
 

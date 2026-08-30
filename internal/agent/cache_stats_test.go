@@ -120,3 +120,49 @@ func TestFingerprintFor_Length(t *testing.T) {
 		t.Errorf("fingerprint length = %d; want 12", len(fp))
 	}
 }
+
+func TestFingerprintForChangesWhenToolSchemaHydrates(t *testing.T) {
+	placeholder := []llm.ToolSpec{{
+		Name:        "mcp__docs__search",
+		Description: "search docs [schema lazy]",
+		InputSchema: map[string]any{"type": "object", "description": "schema deferred"},
+	}}
+	hydrated := []llm.ToolSpec{{
+		Name:        "mcp__docs__search",
+		Description: "search docs",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"query": map[string]any{"type": "string"}},
+		},
+	}}
+	if FingerprintFor("model", "system", placeholder, "low") == FingerprintFor("model", "system", hydrated, "low") {
+		t.Fatal("tool schema hydration changed the provider prefix but not the cache fingerprint")
+	}
+}
+
+func TestFingerprintForChangesWhenToolExposureMovesCacheBoundary(t *testing.T) {
+	direct := []llm.ToolSpec{{Name: "Remote", Exposure: "direct", InputSchema: map[string]any{"type": "object"}}}
+	deferred := []llm.ToolSpec{{Name: "Remote", Exposure: "deferred", InputSchema: map[string]any{"type": "object"}}}
+	if FingerprintFor("model", "system", direct, "low") == FingerprintFor("model", "system", deferred, "low") {
+		t.Fatal("cache fingerprint ignored exposure/cache-boundary change")
+	}
+}
+
+func TestFingerprintRequestIncludesTypedSystemSections(t *testing.T) {
+	base := llm.Request{
+		Model: "model", Effort: "low",
+		SystemSections: []llm.SystemSection{{Name: "base", Body: "stable", Cache: true}},
+	}
+	changed := base
+	changed.SystemSections = []llm.SystemSection{{Name: "base", Body: "changed", Cache: true}}
+	if FingerprintRequest(base) == FingerprintRequest(changed) {
+		t.Fatal("typed system-section change was invisible to the request fingerprint")
+	}
+}
+
+func TestNewLoopEnablesCacheStatsTracking(t *testing.T) {
+	loop := NewLoop(nil, nil, nil, nil, "system", 1)
+	if loop.CacheStats == nil {
+		t.Fatal("production loops should record provider cache telemetry")
+	}
+}

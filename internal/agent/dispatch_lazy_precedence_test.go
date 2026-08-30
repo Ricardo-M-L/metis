@@ -31,6 +31,12 @@ type fatTool struct {
 	schemaPad int // bytes of padding to inject into the schema's "description" field
 }
 
+type explicitlyDeferredFatTool struct{ *fatTool }
+
+func (explicitlyDeferredFatTool) ToolExposure() tools.ToolExposure {
+	return tools.ToolExposureDeferred
+}
+
 func (f *fatTool) Name() string        { return f.name }
 func (f *fatTool) Description() string { return f.desc }
 func (f *fatTool) InputSchema() map[string]any {
@@ -84,6 +90,33 @@ func TestDispatchToolSpecs_EnvTrueAlwaysFires(t *testing.T) {
 	if !hasToolSearchSpec(l.toolSpecs()) {
 		t.Errorf("ENABLE_TOOL_SEARCH=true must always fire even for tiny tools on huge windows")
 	}
+}
+
+func TestDispatchToolSpecsUsesExposureForNonMCPDeferredTool(t *testing.T) {
+	t.Setenv("ENABLE_TOOL_SEARCH", "true")
+	reg := tools.NewRegistry()
+	reg.Register(explicitlyDeferredFatTool{&fatTool{name: "RemoteDocumentSearch", schemaPad: 2000}})
+	l := &Loop{Registry: reg, ContextWindow: 200_000}
+	specs := l.toolSpecs()
+	if !hasToolSearchSpec(specs) {
+		t.Fatal("explicit Deferred tool did not activate ToolSearch")
+	}
+	for _, spec := range specs {
+		if spec.Name == "RemoteDocumentSearch" {
+			if spec.Exposure != string(tools.ToolExposureDeferred) {
+				t.Fatalf("provider metadata exposure = %q, want deferred", spec.Exposure)
+			}
+			desc, _ := spec.InputSchema["description"].(string)
+			if !strings.Contains(desc, "deferred") {
+				t.Fatalf("deferred tool kept its full schema: %#v", spec.InputSchema)
+			}
+			return
+		}
+		if spec.Name == "ToolSearch" && spec.Exposure != string(tools.ToolExposureDeferred) {
+			t.Fatalf("ToolSearch exposure = %q, want deferred", spec.Exposure)
+		}
+	}
+	t.Fatal("deferred tool missing from lazy catalog")
 }
 
 // TestDispatchToolSpecs_EnvTrueIgnoresUnknownWindow — always-mode

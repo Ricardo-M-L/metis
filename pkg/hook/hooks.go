@@ -97,7 +97,11 @@ type PreToolUse struct {
 type ModifiedPreToolUse struct {
 	Output        *Output
 	ModifiedInput map[string]any
-	Halt          bool
+	// PresentationInput is a redacted deep clone of ModifiedInput for approval
+	// UIs and event consumers. Execution must continue to use ModifiedInput;
+	// presentation surfaces must never receive hook-injected credentials.
+	PresentationInput map[string]any
+	Halt              bool
 	// HaltReason explains why the turn is being halted, surfaced via
 	// the loop's stop reason channel. Optional — defaults to
 	// "halted by PreToolUse hook" when blank.

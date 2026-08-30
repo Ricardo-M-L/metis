@@ -93,6 +93,41 @@ func (m *Model) expandableToolEventIDs() []string {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Ctrl-C copies a composer selection before it acquires any cancellation
+	// meaning. Keep this check ahead of both OAuth and foreground-turn handling
+	// so selecting text never accidentally stops background work.
+	if m.inputSelection.HasSelection(m.input.Value()) {
+		switch msg.String() {
+		case "ctrl+c", "ctrl+shift+c", "super+c":
+			selected := m.inputSelection.SelectedText(m.input.Value())
+			m.inputSelection.Clear()
+			if selected != "" {
+				writeInputSelectionClipboard(selected)
+			}
+			return m, nil
+		}
+	}
+
+	// Explicit MCP OAuth is independent lifecycle work (not an agent turn).
+	// Cancel it alongside a foreground turn rather than returning early: one
+	// Esc/Ctrl-C must not leave the other operation running.
+	oauthCanceled := (msg.String() == "esc" || msg.String() == "ctrl+c") && m.cancelMCPLogin()
+	if oauthCanceled {
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   "(canceling MCP OAuth login…)",
+			Timestamp: time.Now(),
+		})
+		m.dismissPalette()
+		m.showSearch = false
+		m.atActive = false
+		if msg.String() == "esc" {
+			m.inputSelection.Clear()
+		}
+		if m.turnCancel == nil {
+			return m, nil
+		}
+	}
 	// 2026-05-26: ESC during a running turn must always cancel the turn,
 	// taking priority over every overlay-dismissal handler below. User
 	// screenshot showed a slash-command palette open while a python3
@@ -146,13 +181,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// the normal editor/shortcut path.
 	if m.inputSelection.HasSelection(m.input.Value()) {
 		switch msg.String() {
-		case "ctrl+c", "ctrl+shift+c", "super+c":
-			selected := m.inputSelection.SelectedText(m.input.Value())
-			m.inputSelection.Clear()
-			if selected != "" {
-				writeInputSelectionClipboard(selected)
-			}
-			return m, nil
 		case "esc":
 			m.inputSelection.Clear()
 			return m, nil

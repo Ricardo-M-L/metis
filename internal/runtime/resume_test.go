@@ -69,6 +69,39 @@ func TestApplyResume_RestoresMessagesAndMode(t *testing.T) {
 	}
 }
 
+func TestApplyPreparedResumeUsesGateModeAfterListenerDowngrade(t *testing.T) {
+	store := newResumeStore(t)
+	const id = "resume-listener-downgrade"
+	if err := store.WriteHeaderFull(session.Header{
+		ID: id, Mode: string(permission.ModePlan), PrePlanMode: string(permission.ModeDefault),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := PrepareResume(store, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate := permission.New(permission.ModeDefault)
+	loop := agent.NewLoop(nil, tools.NewRegistry(), gate, nil, "sys", 5)
+	gate.SetModeChangeListener(func(mode permission.Mode) {
+		loop.SetPlanMode(mode == permission.ModePlan)
+		if mode == permission.ModePlan {
+			gate.SetMode(permission.ModeDontAsk)
+		}
+	})
+
+	if _, err := ApplyPreparedResume(prepared, loop, gate, nil); err != nil {
+		t.Fatal(err)
+	}
+	if gate.Mode() != permission.ModeDontAsk || loop.IsPlanMode() {
+		t.Fatalf("restored permission state diverged: gate=%q plan=%v", gate.Mode(), loop.IsPlanMode())
+	}
+	if got := loop.PrePlanMode(); got != "" {
+		t.Fatalf("failed-closed restore retained pre-plan lineage %q", got)
+	}
+}
+
 func TestPrepareResume_ExposesProviderModelAndSystemBeforeApply(t *testing.T) {
 	store := newResumeStore(t)
 	const id = "session-prepare-header"

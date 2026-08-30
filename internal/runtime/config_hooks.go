@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/jobs"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
@@ -26,8 +29,9 @@ import (
 // type="prompt" are accepted in the schema but skipped here — adding
 // them later is a non-breaking change.
 //
-// Failures (parse errors, missing commands) are logged to stderr but do
-// not block startup; chat works even if a user's hook is broken.
+// Registration failures do not block startup. Once registered, a failing
+// PreToolUse policy hook fails the evaluated tool closed; observer hooks only
+// log their failure and let the session continue.
 func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 	if cfg == nil || reg == nil {
 		return
@@ -50,12 +54,17 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"tool_input":      in.Input,
 			}
 			out, code, err := runHookCommandWithCode(ctx, spec, payload)
+			// Parse the control channel before redacting model-visible text.
+			// A trusted hook may intentionally inject a credential into
+			// modifiedInput for the tool to consume internally; mutating the raw
+			// JSON first would replace that value and silently break the tool.
+			mod, responseOK := parsePreToolUseResponseChecked(out)
+			redactPreToolUseResponse(mod, hookCommandEnv(payload))
 			// Claude-code parity: exit code 49 means "halt the turn",
 			// regardless of stdout. A user can `exit 49` from a one-line
 			// shell hook without bothering to emit JSON. Honor it
 			// whether or not stdout has additional structure.
 			if code == 49 {
-				mod := parsePreToolUseResponse(out)
 				if mod == nil {
 					mod = &pubhook.ModifiedPreToolUse{}
 				}
@@ -63,13 +72,27 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				if mod.HaltReason == "" {
 					mod.HaltReason = "halted by hook (exit 49)"
 				}
-				return mod
+				return forcePreToolUseDeny(mod, mod.HaltReason)
+			}
+			// Exit 2 is the documented blocking-error convention. Any other
+			// non-zero exit (including timeout/start failure) also fails closed:
+			// PreToolUse is a policy boundary, so a broken policy program must
+			// never accidentally authorize the tool it was evaluating.
+			if code == 2 {
+				return forcePreToolUseDeny(mod, "blocked by hook (exit 2)")
 			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hook PreToolUse %s: %v\n", spec.Command, err)
-				return nil
+				logHookCommandError("PreToolUse", spec, payload, err)
+				reason := "PreToolUse hook failed closed"
+				if code != 0 {
+					reason = fmt.Sprintf("PreToolUse hook failed closed (exit %d)", code)
+				}
+				return forcePreToolUseDeny(mod, reason)
 			}
-			return parsePreToolUseResponse(out)
+			if !responseOK {
+				return forcePreToolUseDeny(nil, "PreToolUse hook returned malformed or unknown JSON")
+			}
+			return mod
 		}))
 	}
 	for _, h := range cfg.PostToolUse {
@@ -92,7 +115,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"is_error":        in.IsError,
 			}
 			if _, err := runHookCommand(ctx, spec, payload); err != nil {
-				fmt.Fprintf(os.Stderr, "hook PostToolUse %s: %v\n", spec.Command, err)
+				logHookCommandError("PostToolUse", spec, payload, err)
 			}
 		}))
 	}
@@ -110,7 +133,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"working_directory": cwdOrEmpty(),
 			}
 			if _, err := runHookCommand(ctx, spec, payload); err != nil {
-				fmt.Fprintf(os.Stderr, "hook SessionStart %s: %v\n", spec.Command, err)
+				logHookCommandError("SessionStart", spec, payload, err)
 			}
 		}))
 	}
@@ -128,7 +151,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"stop_reason":     stopReason,
 			}
 			if _, err := runHookCommand(ctx, spec, payload); err != nil {
-				fmt.Fprintf(os.Stderr, "hook SessionEnd %s: %v\n", spec.Command, err)
+				logHookCommandError("SessionEnd", spec, payload, err)
 			}
 		}))
 	}
@@ -146,7 +169,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 			}
 			out, err := runHookCommand(ctx, spec, payload)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hook UserPromptSubmit %s: %v\n", spec.Command, err)
+				logHookCommandError("UserPromptSubmit", spec, payload, err)
 				return nil
 			}
 			return parseUserPromptResponse(out)
@@ -165,7 +188,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"message":         n.Message,
 			}
 			if _, err := runHookCommand(ctx, spec, payload); err != nil {
-				fmt.Fprintf(os.Stderr, "hook Notification %s: %v\n", spec.Command, err)
+				logHookCommandError("Notification", spec, payload, err)
 			}
 		}))
 	}
@@ -184,7 +207,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 			}
 			out, err := runHookCommand(ctx, spec, payload)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hook PermissionRequest %s: %v\n", spec.Command, err)
+				logHookCommandError("PermissionRequest", spec, payload, err)
 				return nil
 			}
 			return parsePermissionResponse(out)
@@ -204,7 +227,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"reason":          p.Reason,
 			}
 			if _, err := runHookCommand(ctx, spec, payload); err != nil {
-				fmt.Fprintf(os.Stderr, "hook PermissionDenied %s: %v\n", spec.Command, err)
+				logHookCommandError("PermissionDenied", spec, payload, err)
 			}
 		}))
 	}
@@ -221,7 +244,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"new_cwd":         c.NewCwd,
 			}
 			if _, err := runHookCommand(ctx, spec, payload); err != nil {
-				fmt.Fprintf(os.Stderr, "hook CwdChanged %s: %v\n", spec.Command, err)
+				logHookCommandError("CwdChanged", spec, payload, err)
 			}
 		}))
 	}
@@ -240,7 +263,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 				"estimated_tokens": p.EstimatedTokens,
 			}
 			if _, err := runHookCommand(ctx, spec, payload); err != nil {
-				fmt.Fprintf(os.Stderr, "hook PreCompact %s: %v\n", spec.Command, err)
+				logHookCommandError("PreCompact", spec, payload, err)
 			}
 		}))
 	}
@@ -263,7 +286,7 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 			}
 			out, err := runHookCommand(ctx, spec, payload)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hook PostCompact %s: %v\n", spec.Command, err)
+				logHookCommandError("PostCompact", spec, payload, err)
 				return nil
 			}
 			// stdout may carry context to re-inject after the compact
@@ -401,13 +424,83 @@ func cwdOrEmpty() string {
 // polluting the JSON return channel.
 func runHookCommand(ctx context.Context, spec config.HookSpec, payload map[string]any) ([]byte, error) {
 	out, _, err := runHookCommandWithCode(ctx, spec, payload)
-	return out, err
+	return redactStructuredHookOutput(out, hookCommandEnv(payload)), err
 }
 
-// runHookCommandWithCode is runHookCommand plus an exit-code channel.
+func hookCommandEnv(payload map[string]any) []string {
+	event, _ := payload["hook_event_name"].(string)
+	// Hook commands are executable policy, but they are still subprocesses of
+	// a model-facing application. Do not inherit provider keys, connector
+	// tokens, auth-agent sockets, or arbitrary ambient credentials. User hooks
+	// retain the ordinary process/toolchain environment plus the explicit event
+	// marker; credentials must be obtained by a purpose-built trusted helper.
+	return security.RestrictedSubprocessEnv(os.Environ(), "METIS_HOOK_EVENT="+event)
+}
+
+// redactStructuredHookOutput protects the JSON control channel without
+// rewriting its encoded representation in-place. Exact environment secrets
+// may contain quotes, backslashes, or newlines; their JSON form is escaped and
+// therefore cannot be found reliably in the raw byte stream. Decode first,
+// recursively sanitize string values, then re-encode a valid document.
+//
+// Non-JSON stdout is never accepted by a structured response parser, but it is
+// still returned by this low-level helper for compatibility. Redact that plain
+// text directly so a future caller cannot accidentally surface a credential.
+func redactStructuredHookOutput(out []byte, env []string) []byte {
+	trimmed := trimBOM(out)
+	if len(strings.TrimSpace(string(trimmed))) == 0 {
+		return trimmed
+	}
+	var decoded any
+	if err := json.Unmarshal(trimmed, &decoded); err != nil {
+		return []byte(security.RedactSubprocessTextWithEnv(string(out), env))
+	}
+	redactDecodedHookStrings(decoded, env)
+	redacted, err := json.Marshal(decoded)
+	if err != nil {
+		// json.Unmarshal only produces JSON-marshalable values. Keep a defensive
+		// fail-safe in case that invariant changes in a future decoder wrapper.
+		return []byte(security.RedactSubprocessTextWithEnv(string(out), env))
+	}
+	return redacted
+}
+
+func redactDecodedHookStrings(value any, env []string) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			if text, ok := child.(string); ok {
+				v[key] = security.RedactSubprocessTextWithEnv(text, env)
+				continue
+			}
+			redactDecodedHookStrings(child, env)
+		}
+	case []any:
+		for i, child := range v {
+			if text, ok := child.(string); ok {
+				v[i] = security.RedactSubprocessTextWithEnv(text, env)
+				continue
+			}
+			redactDecodedHookStrings(child, env)
+		}
+	}
+}
+
+func logHookCommandError(event string, spec config.HookSpec, payload map[string]any, err error) {
+	fmt.Fprint(os.Stderr, formatHookCommandError(event, spec, payload, err))
+}
+
+func formatHookCommandError(event string, spec config.HookSpec, payload map[string]any, err error) string {
+	env := hookCommandEnv(payload)
+	command := security.RedactSubprocessTextWithEnv(spec.Command, env)
+	errText := security.RedactSubprocessTextWithEnv(err.Error(), env)
+	return fmt.Sprintf("hook %s %s: %s\n", event, command, errText)
+}
+
+// runHookCommandWithCode is the raw-stdout variant plus an exit-code channel.
 // Used by the PreToolUse path to catch the claude-code "exit 49 =
-// halt" convention (a hook script can `exit 49` without bothering to
-// emit JSON, and we still treat it as a turn-halt signal).
+// halt" and "exit 2 = block" conventions. Its caller must parse the raw
+// control JSON before redacting display fields.
 func runHookCommandWithCode(ctx context.Context, spec config.HookSpec, payload map[string]any) ([]byte, int, error) {
 	timeout := time.Duration(spec.Timeout) * time.Second
 	if timeout <= 0 {
@@ -420,27 +513,119 @@ func runHookCommandWithCode(ctx context.Context, spec config.HookSpec, payload m
 	if err != nil {
 		return nil, 0, err
 	}
-	cmd := exec.CommandContext(cctx, "sh", "-c", spec.Command) //nolint:gosec — user-configured by design
+	if err := cctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	shell, shellArgs := hookShellCommand(spec.Command)
+	cmd := exec.Command(shell, shellArgs...) //nolint:gosec — user-configured by design
 	cmd.Stdin = strings.NewReader(string(body))
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
-		"METIS_HOOK_EVENT="+payload["hook_event_name"].(string),
-	)
-	out, err := cmd.Output()
+	var stdout cappedHookStdout
+	var stderr cappedHookStderr
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// Hooks run with the same restricted child-process environment as other
+	// Metis subprocesses. In particular, provider/API credentials never cross
+	// this boundary through ambient environment inheritance.
+	cmd.Env = hookCommandEnv(payload)
+	// Hooks may spawn grandchildren. Killing only the direct shell leaves those
+	// descendants alive and can leave Wait blocked forever on inherited output
+	// pipes. Own a process group/tree and cancel the whole tree explicitly.
+	jobs.ApplyProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		return nil, 0, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err = <-done:
+	case <-cctx.Done():
+		// taskkill can itself hang on Windows. Keep tree termination off this
+		// goroutine so the hook timeout remains a real upper bound.
+		go jobs.KillProcessGroup(cmd.Process)
+		select {
+		case <-done:
+			err = cctx.Err()
+		case <-time.After(2 * time.Second):
+			return nil, 0, fmt.Errorf("hook process tree did not exit after cancellation: %w", cctx.Err())
+		}
+	}
+	out := []byte(stdout.String())
 	exitCode := 0
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			exitCode = ee.ExitCode()
-			// Exit codes 49 and the documented "block tool" 2 are
-			// signals, not failures — strip the err so callers
-			// process them as data.
-			if exitCode == 49 || exitCode == 2 {
-				return out, exitCode, nil
-			}
 		}
 	}
+	if stdout.Truncated() {
+		// A partial control document is unsafe to interpret. Force policy hooks
+		// to fail closed and make observer-hook misconfiguration visible.
+		err = errors.New("hook stdout exceeded 1 MiB limit")
+	}
+	if stderr.Len() > 0 || stderr.Truncated() {
+		_, _ = fmt.Fprint(os.Stderr, security.RedactSubprocessTextWithEnv(stderr.String(), cmd.Env))
+	}
 	return out, exitCode, err
+}
+
+const maxHookStderrBytes = 256 * 1024
+const maxHookStdoutBytes = 1 << 20
+
+type cappedHookStdout struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *cappedHookStdout) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := maxHookStdoutBytes - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+			b.truncated = true
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return n, nil
+}
+
+func (b *cappedHookStdout) Truncated() bool { return b.truncated }
+func (b *cappedHookStdout) String() string  { return b.buf.String() }
+
+// cappedHookStderr prevents a noisy or wedged hook from retaining unbounded
+// stderr while still returning len(p), as required by exec.Cmd's Writer
+// contract. The truncation marker is added only when output is rendered.
+type cappedHookStderr struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *cappedHookStderr) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := maxHookStderrBytes - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+			b.truncated = true
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return n, nil
+}
+
+func (b *cappedHookStderr) Len() int        { return b.buf.Len() }
+func (b *cappedHookStderr) Truncated() bool { return b.truncated }
+func (b *cappedHookStderr) String() string {
+	if !b.truncated {
+		return b.buf.String()
+	}
+	return b.buf.String() + "\n[hook stderr truncated]\n"
 }
 
 // parsePreToolUseResponse parses a PreToolUse subprocess hook's stdout.
@@ -470,12 +655,22 @@ func runHookCommandWithCode(ctx context.Context, spec config.HookSpec, payload m
 // handled at the caller (runHookCommand returns the exit code so we
 // can flip the same signal there).
 //
-// Unknown / malformed JSON is treated as "proceed unchanged" so a
-// misbehaving hook doesn't accidentally block the agent.
+// The checked parser distinguishes a recognized no-op from malformed or
+// unknown non-empty JSON so the PreToolUse policy boundary can fail closed.
 func parsePreToolUseResponse(out []byte) *pubhook.ModifiedPreToolUse {
+	mod, _ := parsePreToolUseResponseChecked(out)
+	return mod
+}
+
+// parsePreToolUseResponseChecked separates a recognized no-op such as an
+// empty response or {"decision":"allow"} from a malformed/unknown non-empty
+// policy response. The runtime must fail the latter closed; a nil pointer alone
+// cannot carry that distinction because valid allow responses intentionally
+// produce no modification.
+func parsePreToolUseResponseChecked(out []byte) (*pubhook.ModifiedPreToolUse, bool) {
 	out = trimBOM(out)
 	if len(strings.TrimSpace(string(out))) == 0 {
-		return nil
+		return nil, true
 	}
 	// Claude-code envelope first — the field is a discriminator the
 	// flat form can't accidentally collide with.
@@ -489,7 +684,10 @@ func parsePreToolUseResponse(out []byte) *pubhook.ModifiedPreToolUse {
 	}
 	if err := json.Unmarshal(out, &envelope); err == nil && envelope.HookSpecificOutput != nil {
 		hso := envelope.HookSpecificOutput
-		return preToolFromDecision(hso.PermissionDecision, hso.PermissionDecisionReason, hso.ModifiedInput, false)
+		if !validPreToolDecision(hso.PermissionDecision) && hso.ModifiedInput == nil {
+			return nil, false
+		}
+		return preToolFromDecision(hso.PermissionDecision, hso.PermissionDecisionReason, hso.ModifiedInput, false), true
 	}
 	// Fall through to the flat form.
 	var flat struct {
@@ -499,9 +697,76 @@ func parsePreToolUseResponse(out []byte) *pubhook.ModifiedPreToolUse {
 		Halt          bool           `json:"halt"`
 	}
 	if err := json.Unmarshal(out, &flat); err != nil {
+		return nil, false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(out, &fields); err != nil || fields == nil {
+		return nil, false
+	}
+	_, hasDecision := fields["decision"]
+	_, hasModifiedInput := fields["modified_input"]
+	_, hasHalt := fields["halt"]
+	if (!hasDecision || !validPreToolDecision(flat.Decision)) && !hasModifiedInput && !hasHalt {
+		return nil, false
+	}
+	if hasDecision && !validPreToolDecision(flat.Decision) {
+		return nil, false
+	}
+	return preToolFromDecision(flat.Decision, flat.Reason, flat.ModifiedInput, flat.Halt), true
+}
+
+func validPreToolDecision(decision string) bool {
+	switch strings.ToLower(strings.TrimSpace(decision)) {
+	case "allow", "deny", "ask", "halt":
+		return true
+	default:
+		return false
+	}
+}
+
+// redactPreToolUseResponse sanitizes only fields that can be rendered into
+// the transcript/model context. ModifiedInput is intentionally untouched: it
+// is the hook's internal tool-control payload and may contain a credential the
+// hook injected specifically so the tool, rather than the model, can use it.
+func redactPreToolUseResponse(mod *pubhook.ModifiedPreToolUse, env []string) {
+	if mod == nil {
+		return
+	}
+	if mod.Output != nil {
+		mod.Output.Content = security.RedactSubprocessTextWithEnv(mod.Output.Content, env)
+	}
+	mod.HaltReason = security.RedactSubprocessTextWithEnv(mod.HaltReason, env)
+	if mod.ModifiedInput != nil {
+		mod.PresentationInput = redactedHookInput(mod.ModifiedInput, env)
+	}
+}
+
+func redactedHookInput(input map[string]any, env []string) map[string]any {
+	if input == nil {
 		return nil
 	}
-	return preToolFromDecision(flat.Decision, flat.Reason, flat.ModifiedInput, flat.Halt)
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return nil
+	}
+	var cloned map[string]any
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		return nil
+	}
+	redactDecodedHookStrings(cloned, env)
+	return cloned
+}
+
+func forcePreToolUseDeny(mod *pubhook.ModifiedPreToolUse, fallback string) *pubhook.ModifiedPreToolUse {
+	if mod == nil {
+		mod = &pubhook.ModifiedPreToolUse{}
+	}
+	if mod.Output == nil || !mod.Output.IsError {
+		mod.Output = &pubhook.Output{Content: fallback, IsError: true}
+	} else if strings.TrimSpace(mod.Output.Content) == "" {
+		mod.Output.Content = fallback
+	}
+	return mod
 }
 
 // preToolFromDecision is the shared decision-to-ModifiedPreToolUse
@@ -510,7 +775,7 @@ func parsePreToolUseResponse(out []byte) *pubhook.ModifiedPreToolUse {
 // rules so both shapes behave identically.
 func preToolFromDecision(decision, reason string, modifiedInput map[string]any, haltFlag bool) *pubhook.ModifiedPreToolUse {
 	mod := &pubhook.ModifiedPreToolUse{}
-	switch strings.ToLower(decision) {
+	switch strings.ToLower(strings.TrimSpace(decision)) {
 	case "deny":
 		r := reason
 		if r == "" {

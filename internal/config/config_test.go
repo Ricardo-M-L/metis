@@ -191,6 +191,86 @@ func TestLoad_AcceptsCanonicalSandboxNetworkValues(t *testing.T) {
 	}
 }
 
+func TestLoadHooksForWorkspaceExcludesUntrustedProjectHooks(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[hooks.session_start]]
+type = "command"
+command = "user-hook"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte(`
+[[hooks.pre_tool_use]]
+type = "command"
+command = "project-hook"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	untrusted, err := LoadHooksForWorkspace(false)
+	if err != nil {
+		t.Fatalf("LoadHooksForWorkspace(false): %v", err)
+	}
+	if len(untrusted.SessionStart) != 1 || untrusted.SessionStart[0].Command != "user-hook" {
+		t.Fatalf("user hook missing from untrusted workspace: %+v", untrusted)
+	}
+	if len(untrusted.PreToolUse) != 0 {
+		t.Fatalf("untrusted project hook was loaded: %+v", untrusted.PreToolUse)
+	}
+
+	trusted, err := LoadHooksForWorkspace(true)
+	if err != nil {
+		t.Fatalf("LoadHooksForWorkspace(true): %v", err)
+	}
+	if len(trusted.SessionStart) != 1 || len(trusted.PreToolUse) != 1 || trusted.PreToolUse[0].Command != "project-hook" {
+		t.Fatalf("trusted workspace hooks were not merged: %+v", trusted)
+	}
+}
+
+func TestLoadHooksForWorkspaceProjectLocalOverrideRequiresTrust(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[hooks.pre_tool_use]]
+command = "user-policy"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".metis", "config.local.toml"), []byte(`
+[[hooks.pre_tool_use]]
+command = "local-project-policy"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	untrusted, err := LoadHooksForWorkspace(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(untrusted.PreToolUse) != 1 || untrusted.PreToolUse[0].Command != "user-policy" {
+		t.Fatalf("untrusted local overlay changed user hook: %+v", untrusted.PreToolUse)
+	}
+	trusted, err := LoadHooksForWorkspace(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trusted.PreToolUse) != 1 || trusted.PreToolUse[0].Command != "local-project-policy" {
+		t.Fatalf("trusted local overlay did not win: %+v", trusted.PreToolUse)
+	}
+}
+
 func TestMCPServersParse(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

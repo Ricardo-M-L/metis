@@ -26,7 +26,7 @@ func renderToolsList(loop *agent.Loop) string {
 	if loop == nil || loop.Registry == nil {
 		return "(tools: registry not available)"
 	}
-	tools := loop.Registry.All()
+	tools := loop.Registry.ModelToolsForCache()
 	if len(tools) == 0 {
 		return "(no tools registered)"
 	}

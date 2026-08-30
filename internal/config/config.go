@@ -908,6 +908,40 @@ func searchPaths() []string {
 	return out
 }
 
+// LoadHooksForWorkspace resolves lifecycle hooks with an explicit workspace
+// trust decision. User hooks under METIS_HOME are always eligible; project
+// hooks in .metis/config.toml and .metis/config.local.toml are ignored until
+// the current workspace has been recorded as trusted by the startup gate.
+//
+// Hook commands are executable configuration, unlike ordinary UI/model
+// settings. Keeping this source-aware pass separate prevents an untrusted
+// checkout from gaining code execution merely because Load merged its TOML
+// overlay before a Desktop or non-interactive frontend started.
+func LoadHooksForWorkspace(projectTrusted bool) (HooksConfig, error) {
+	var scoped struct {
+		Hooks HooksConfig `toml:"hooks"`
+	}
+	for i, path := range searchPaths() {
+		// searchPaths is ordered user first, then project and project-local.
+		// Fail closed if that ordering changes: only the exact user config path
+		// is implicitly trusted for executable hooks.
+		isUserConfig := i == 0 && filepath.Clean(path) == filepath.Clean(filepath.Join(Home(), "config.toml"))
+		if !isUserConfig && !projectTrusted {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return HooksConfig{}, fmt.Errorf("load hooks %s: %w", path, err)
+		}
+		if _, err := toml.DecodeFile(path, &scoped); err != nil {
+			return HooksConfig{}, fmt.Errorf("load hooks %s: %w", path, err)
+		}
+	}
+	return scoped.Hooks, nil
+}
+
 // PolicyPath is where the machine-managed policy file lives —
 // claude-code's policySettings equivalent. Permission rules loaded
 // from here carry the "policy:" source prefix, the highest authority

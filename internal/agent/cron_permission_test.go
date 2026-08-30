@@ -12,6 +12,7 @@ func TestEvaluateCronPermission(t *testing.T) {
 	cases := []struct {
 		name       string
 		allow      []string
+		disabled   []string
 		tool       string
 		input      map[string]any
 		wantAllow  bool
@@ -62,6 +63,14 @@ func TestEvaluateCronPermission(t *testing.T) {
 			wantAllow: false, wantReason: "unauthorized",
 		},
 		{
+			name:      "disabled tool overrides wildcard allow",
+			allow:     []string{"*"},
+			disabled:  []string{"RemoteExec"},
+			tool:      "RemoteExec",
+			input:     map[string]any{"operation": "mutate"},
+			wantAllow: false, wantReason: "disabled_tool:",
+		},
+		{
 			// A prefix rule must not be ridden by a chained command.
 			name:      "chained command not covered by prefix rule",
 			allow:     []string{"Bash(echo:*)"},
@@ -73,7 +82,7 @@ func TestEvaluateCronPermission(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			job := &CronJob{AllowTools: c.allow}
+			job := &CronJob{AllowTools: c.allow, DisabledTools: c.disabled}
 			allow, reason := EvaluateCronPermission(job, c.tool, c.input)
 			if allow != c.wantAllow {
 				t.Errorf("allow = %v, want %v (reason %q)", allow, c.wantAllow, reason)
@@ -94,6 +103,36 @@ func TestEvaluateCronPermissionNilJob(t *testing.T) {
 	if _, reason := EvaluateCronPermission(nil, "Bash", map[string]any{"command": "rm -rf /"}); !strings.HasPrefix(reason, "dangerous_pattern:") {
 		t.Errorf("nil job + dangerous cmd should report dangerous_pattern, got %q", reason)
 	}
+}
+
+func TestEvaluateCronPermissionRequiresExecutionInputNotRedactedPresentation(t *testing.T) {
+	t.Run("dangerous text hidden inside credential assignment stays denied", func(t *testing.T) {
+		job := &CronJob{AllowTools: []string{"*"}}
+		raw := map[string]any{"command": `PASSWORD='rm -rf /' remote-exec`}
+		redacted := map[string]any{"command": `PASSWORD='[REDACTED]' remote-exec`}
+
+		if allow, reason := EvaluateCronPermission(job, "RemoteExec", raw); allow || !strings.HasPrefix(reason, "dangerous_pattern:") {
+			t.Fatalf("raw dangerous policy input = allow %v, reason %q; want dangerous denial", allow, reason)
+		}
+		// Lock down the regression shape: presentation redaction removes the
+		// dangerous bytes, so using it for policy would incorrectly allow "*".
+		if allow, reason := EvaluateCronPermission(job, "RemoteExec", redacted); !allow {
+			t.Fatalf("redacted control input = allow %v, reason %q; regression fixture no longer distinguishes inputs", allow, reason)
+		}
+	})
+
+	t.Run("scoped allow rule matches exact execution bytes", func(t *testing.T) {
+		job := &CronJob{AllowTools: []string{"RemoteExec(deploy-token-for-cron)"}}
+		raw := map[string]any{"command": `API_KEY='deploy-token-for-cron' deploy production`}
+		redacted := map[string]any{"command": `API_KEY='[REDACTED]' deploy production`}
+
+		if allow, reason := EvaluateCronPermission(job, "RemoteExec", raw); !allow || !strings.HasPrefix(reason, "allow:") {
+			t.Fatalf("raw scoped policy input = allow %v, reason %q; want allow", allow, reason)
+		}
+		if allow, reason := EvaluateCronPermission(job, "RemoteExec", redacted); allow || reason != "unauthorized" {
+			t.Fatalf("redacted control input = allow %v, reason %q; want unauthorized", allow, reason)
+		}
+	})
 }
 
 func TestSuggestCronRule(t *testing.T) {

@@ -238,9 +238,12 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 
 // applyPermissionMode keeps the permission gate and the Loop plan controller
 // on one state transition. Desktop settings and /plan both use this path.
-func (s *Server) applyPermissionMode(mode permission.Mode) {
+func (s *Server) applyPermissionMode(mode permission.Mode) error {
 	if s == nil || s.loop == nil || s.loop.Gate == nil {
-		return
+		return nil
+	}
+	if s.setPermissionMode != nil {
+		return s.setPermissionMode(mode)
 	}
 	previous := s.loop.Gate.Mode()
 	if mode == permission.ModePlan {
@@ -249,11 +252,12 @@ func (s *Server) applyPermissionMode(mode permission.Mode) {
 		}
 		s.loop.Gate.SetMode(mode)
 		s.loop.SetPlanMode(true)
-		return
+		return nil
 	}
 	s.loop.Gate.SetMode(mode)
 	s.loop.SetPlanMode(false)
 	if previous == permission.ModePlan {
 		s.loop.SetPrePlanMode("")
 	}
+	return nil
 }

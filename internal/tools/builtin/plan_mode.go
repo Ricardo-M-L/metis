@@ -51,6 +51,31 @@ func NewEnterPlanModeWithGate(g *permission.Gate) EnterPlanMode {
 	return EnterPlanMode{gate: g}
 }
 
+// isBypassUnattendedLineage recognizes both a live bypass gate and the plan
+// mode descended from it. EnterPlanMode necessarily changes Gate.Mode to plan,
+// so checking only the current mode would re-enable AskUser until ExitPlanMode
+// restored the saved posture.
+func isBypassUnattendedLineage(ctx context.Context, gate *permission.Gate) bool {
+	if gate == nil {
+		return false
+	}
+	if gate.Mode() == permission.ModeBypassPermissions {
+		return true
+	}
+	// A pre-plan snapshot is lineage only while plan mode is still live. A
+	// manual mode change must immediately restore interactive behavior even if
+	// an older UI forgot to clear the snapshot.
+	if gate.Mode() != permission.ModePlan {
+		return false
+	}
+	ctrl := agent.PlanControllerFromContext(ctx)
+	if ctrl == nil {
+		return false
+	}
+	previous, ok := permission.ParseMode(ctrl.PrePlanMode())
+	return ok && previous == permission.ModeBypassPermissions
+}
+
 func (EnterPlanMode) Name() string { return "EnterPlanMode" }
 
 func (EnterPlanMode) Description() string {
@@ -58,9 +83,10 @@ func (EnterPlanMode) Description() string {
 		"available, including the Agent tool (its child inherits the plan " +
 		"gate), while edits and commands that change state are blocked. " +
 		"Use this when the user asked for a proposal before action. When " +
-		"the plan is complete, call ExitPlanMode with the final markdown; " +
-		"it presents a blocking approval prompt before implementation can " +
-		"start. For requirements clarification during planning, use AskUser."
+		"the plan is complete, call ExitPlanMode with the final markdown. " +
+		"Interactive modes present an approval prompt; bypassPermissions " +
+		"uses its unattended preset and continues automatically. For " +
+		"requirements clarification during interactive planning, use AskUser."
 }
 
 func (EnterPlanMode) InputSchema() map[string]any {
@@ -86,6 +112,9 @@ func (EnterPlanMode) Concurrency(map[string]any) tools.Concurrency {
 func (e EnterPlanMode) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	if e.gate != nil && e.gate.Mode() == permission.ModePlan {
 		return tools.PermissionAllow, "already in plan mode"
+	}
+	if e.gate != nil && e.gate.Mode() == permission.ModeBypassPermissions {
+		return tools.PermissionAllow, "bypassPermissions unattended plan policy"
 	}
 	return tools.PermissionAsk, "entering plan mode requires user approval"
 }
@@ -132,8 +161,9 @@ func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Re
 // flips the loop out of plan mode so subsequent tool calls execute
 // normally.
 //
-// Like Claude Code, the production path blocks on user approval before
-// changing permission mode. Rejection and headless execution remain in plan.
+// Interactive production paths block on user approval before changing
+// permission mode. A bypass-origin plan uses its unattended preset and returns
+// directly to bypass; rejection and other headless execution remain in plan.
 type ExitPlanMode struct {
 	tools.BaseTool
 	gate *permission.Gate // optional; production wires via NewExitPlanModeWithGate
@@ -154,8 +184,10 @@ func (ExitPlanMode) Description() string {
 	return "Leave plan mode and surface the final plan to the user. " +
 		"Required argument `plan` is the markdown body of your " +
 		"proposed work — bullet points, file paths, exact commands, " +
-		"expected outcomes. This call blocks until the user approves " +
-		"implementation or chooses to keep planning.\n\n" +
+		"expected outcomes. Interactive modes block until the user " +
+		"approves implementation or chooses to keep planning; a " +
+		"bypassPermissions-origin plan is auto-approved by its preset " +
+		"and continues without an interaction.\n\n" +
 		"Important: this is the right tool when you want to PROPOSE " +
 		"a multi-step plan and request approval. It is NOT the right tool when you " +
 		"need a structured pick-one-of-N answer — use `AskUser` for " +
@@ -171,7 +203,7 @@ func (ExitPlanMode) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"plan": map[string]any{
 				"type":        "string",
-				"description": "Final plan markdown — what you'll do, in what order, with what side effects. Will be shown to the user for review.",
+				"description": "Final plan markdown — what you'll do, in what order, with what side effects. Shown for review in interactive modes; recorded and auto-accepted under the bypassPermissions preset.",
 			},
 		},
 	}
@@ -213,21 +245,37 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 		ctrl.SetPrePlanMode("")
 		return &tools.Result{Output: "Plan surfaced for review. Plan mode disabled by the controller-only fallback."}, nil
 	}
-	// Match Claude Code's approval boundary: exiting plan mode is a real
-	// blocking user interaction, not an informational message followed by
-	// automatic execution. Headless callers cannot approve, so they remain in
-	// plan mode and receive a structured error instead of silently proceeding.
+	if e.gate.Mode() != permission.ModePlan {
+		// The user already left plan mode through another surface. A stale
+		// snapshot must never make ExitPlanMode silently restore bypass.
+		ctrl.SetPrePlanMode("")
+		return &tools.Result{
+			Output:  "ExitPlanMode: plan mode is not active; stale plan state was cleared",
+			IsError: true,
+		}, nil
+	}
+	restore := permission.ModeDefault
+	if prev, ok := permission.ParseMode(ctrl.PrePlanMode()); ok && prev != permission.ModePlan {
+		restore = prev
+	}
+	// bypassPermissions is explicitly unattended. EnterPlanMode is allowed to
+	// organize a complex task, but ExitPlanMode must not turn that session back
+	// into an approval workflow. Use the preset policy: approve the plan and
+	// restore bypass without emitting EventAskUser.
+	if restore == permission.ModeBypassPermissions {
+		e.gate.SetMode(permission.ModeBypassPermissions)
+		ctrl.SetPrePlanMode("")
+		return &tools.Result{Output: "Plan accepted by the bypassPermissions unattended policy. Continue implementation in bypassPermissions mode."}, nil
+	}
+
+	// Interactive modes keep the blocking approval boundary. Headless callers
+	// cannot approve, so they remain in plan mode with a structured error.
 	out := agent.EventOutFromContext(ctx)
 	if out == nil {
 		return &tools.Result{
 			Output:  "ExitPlanMode: no interactive UI is available to approve this plan; remaining in plan mode",
 			IsError: true,
 		}, nil
-	}
-
-	restore := permission.ModeDefault
-	if prev, ok := permission.ParseMode(ctrl.PrePlanMode()); ok && prev != permission.ModePlan {
-		restore = prev
 	}
 	primaryLabel := "Yes, auto-accept edits"
 	primaryMode := permission.ModeAcceptEdits

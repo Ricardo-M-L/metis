@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/security"
 )
 
 // Status is the lifecycle stage of a Job. Changes are monotonic except
@@ -389,7 +391,7 @@ func (r *Registry) waitAndComplete(j *Job, waitResult <-chan error) {
 		Status:   j.Status,
 		ExitCode: j.ExitCode,
 		Elapsed:  j.EndTime.Sub(j.StartTime),
-		Command:  j.Command,
+		Command:  security.RedactSubprocessText(j.Command),
 	}
 	generation := j.generation
 	r.mu.Unlock()
@@ -563,7 +565,7 @@ func (r *Registry) Stop(id string, grace time.Duration) error {
 		Status:   StatusKilled,
 		ExitCode: -1,
 		Elapsed:  elapsed,
-		Command:  command,
+		Command:  security.RedactSubprocessText(command),
 	})
 	return nil
 }

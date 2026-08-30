@@ -20,6 +20,13 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/mcp"
 )
 
+type countingCloseTransport struct{ closes atomic.Int32 }
+
+func (t *countingCloseTransport) Close() error {
+	t.closes.Add(1)
+	return nil
+}
+
 // TestNewLazyServer_DoesNotSpawn — registering tools must not run the
 // spawn closure. Verified by tracking call count and asserting it
 // stays at zero through construction + Tools() + FilteredTools() +
@@ -60,6 +67,59 @@ func TestLazyServer_CloseNoOpWhenUnspawned(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 0 {
 		t.Errorf("Close should not invoke spawn; got %d calls", got)
+	}
+}
+
+func TestLazyServerCloseCancelsAndRejectsInFlightSpawn(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	transport := &countingCloseTransport{}
+	srv := NewLazyServer("closing", nil, func(context.Context) (*mcp.Client, error) {
+		close(started)
+		<-release // Simulate a launcher that returns after Close won the race.
+		return mcp.NewClient(context.Background(), transport), nil
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- srv.ensureClient(context.Background()) }()
+	<-started
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, errMCPServerClosed) {
+		t.Fatalf("in-flight spawn after Close returned %v, want server closed", err)
+	}
+	if got := transport.closes.Load(); got != 1 {
+		t.Fatalf("late client Close count = %d, want 1", got)
+	}
+	if srv.IsSpawned() {
+		t.Fatal("late client was published after Server.Close")
+	}
+}
+
+// TestServerClientSnapshotRejectsCloseBetweenEnsureAndUse deterministically
+// models the shutdown interleaving that used to panic in Execute, GetPrompt,
+// and ReadResource: ensureClient succeeds, Close clears s.client, then the
+// operation snapshots the client. The snapshot must fail normally rather than
+// return a nil client that the caller would dereference.
+func TestServerClientSnapshotRejectsCloseBetweenEnsureAndUse(t *testing.T) {
+	transport := &countingCloseTransport{}
+	client := mcp.NewClient(context.Background(), transport)
+	srv := &Server{client: client, name: "closing", tools: make(map[string]*MCPTool)}
+
+	if err := srv.ensureClient(context.Background()); err != nil {
+		t.Fatalf("ensure eager client: %v", err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatalf("close server: %v", err)
+	}
+	got, err := srv.clientSnapshot()
+	if got != nil || !errors.Is(err, errMCPServerClosed) {
+		t.Fatalf("snapshot after Close = (%p, %v), want (nil, server closed)", got, err)
+	}
+	if transport.closes.Load() != 1 {
+		t.Fatalf("transport Close count = %d, want 1", transport.closes.Load())
 	}
 }
 

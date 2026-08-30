@@ -71,5 +71,5 @@ func (a mcpResourceAdapter) ReadResource(ctx context.Context, server, uri string
 	if server != "" {
 		return "", fmt.Errorf("no connected MCP server named %q", server)
 	}
-	return "", fmt.Errorf("no connected MCP server has resource %q", uri)
+	return "", fmt.Errorf("no connected MCP server accepted this resource handle; list resources again")
 }

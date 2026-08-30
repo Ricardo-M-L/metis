@@ -209,7 +209,7 @@ func TestEnsureDiscoveredHydrated_RunsOnce(t *testing.T) {
 				{Type: "tool_use", ToolUseID: "tu-1", ToolName: "ToolSearch"},
 			}},
 			{Role: llm.RoleUser, Content: []llm.ContentBlock{
-				{Type: "tool_result", ToolUseID: "tu-1", ToolResult: `{"matches":[{"name":"mcp__rehydrated"}]}`},
+				{Type: "tool_result", ToolUseID: "tu-1", ToolResult: `{"matches":[{"name":"mcp__rehydrated","input_schema":{"type":"object"}}]}`},
 			}},
 		},
 	}
@@ -224,7 +224,7 @@ func TestEnsureDiscoveredHydrated_RunsOnce(t *testing.T) {
 			{Type: "tool_use", ToolUseID: "tu-2", ToolName: "ToolSearch"},
 		}},
 		llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{
-			{Type: "tool_result", ToolUseID: "tu-2", ToolResult: `{"matches":[{"name":"mcp__post_hydration"}]}`},
+			{Type: "tool_result", ToolUseID: "tu-2", ToolResult: `{"matches":[{"name":"mcp__post_hydration","input_schema":{"type":"object"}}]}`},
 		}},
 	)
 	got := l.snapshotDiscoveredMCP()
@@ -233,6 +233,22 @@ func TestEnsureDiscoveredHydrated_RunsOnce(t *testing.T) {
 	}
 	if !got["mcp__rehydrated"] {
 		t.Errorf("initially-hydrated entry should remain; got %v", got)
+	}
+}
+
+func TestRebuildDiscoveredMCPFromMessages_KeywordMatchDoesNotHydrate(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+			{Type: "tool_use", ToolUseID: "keyword-1", ToolName: "ToolSearch"},
+		}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			{Type: "tool_result", ToolUseID: "keyword-1", ToolResult: `{"matches":[{"name":"mcp__docs__query","description":"search docs"}]}`},
+		}},
+	}
+	set := make(map[string]bool)
+	rebuildDiscoveredMCPFromMessages(set, msgs)
+	if len(set) != 0 {
+		t.Fatalf("keyword-only matches must not unlock schemas: %v", set)
 	}
 }
 
@@ -337,9 +353,9 @@ func TestParseMCPNamesFromResult_HandlesMalformed(t *testing.T) {
 // ignored; only mcp__ names track schema deferral.
 func TestParseMCPNamesFromResult_OnlyMCPPrefixed(t *testing.T) {
 	body := `{"matches":[
-		{"name":"mcp__fs__read"},
+		{"name":"mcp__fs__read","input_schema":{}},
 		{"name":"Read"},
-		{"name":"mcp__http__get"},
+		{"name":"mcp__http__get","input_schema":{}},
 		{"name":"Bash"}
 	]}`
 	set := make(map[string]bool)

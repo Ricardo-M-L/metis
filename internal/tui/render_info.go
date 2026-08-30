@@ -273,7 +273,7 @@ func renderDoctor(m *Model) string {
 		{Key: "metis dir", Value: config.Home()},
 		{Key: "model", Value: m.model},
 		{Key: "mode", Value: string(m.gate.Mode())},
-		{Key: "tools", Value: fmt.Sprintf("%d registered", len(m.loop.Registry.All()))},
+		{Key: "tools", Value: fmt.Sprintf("%d model-visible", len(m.loop.Registry.ModelToolsForCache()))},
 	}
 	memDir := filepath.Join(config.Home(), "memory")
 	mems := "missing"

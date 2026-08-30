@@ -41,6 +41,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
@@ -52,7 +53,10 @@ func (m *Model) hydrateFromLoopHistory() {
 	if m.loop == nil {
 		return
 	}
-	history := m.loop.History()
+	// loop.History remains canonical provider/session state. Hydration renders
+	// only a detached presentation copy so raw credentials in historical tool
+	// arguments cannot enter the TUI's ToolEvent store.
+	history := agent.PresentationHistory(m.loop.History())
 	if len(history) == 0 {
 		return
 	}

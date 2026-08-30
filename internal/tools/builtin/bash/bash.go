@@ -17,6 +17,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/shellguard"
 	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -408,7 +409,8 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// `go test -exec "..."` and `npm install --global`. Hardcoded;
 	// not configurable via permission prompt because the model could
 	// rationalise away "yes please install --global, it's needed".
-	if err := applyBashArgsBlocker(cmd); err != nil {
+	bypass := b.gate != nil && b.gate.Mode() == permission.ModeBypassPermissions
+	if err := applyBashArgsBlockerForBypass(cmd, bypass); err != nil {
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 
@@ -426,12 +428,11 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			IsError: true,
 		}, nil
 	}
-	if class.Class == ClassSystem {
-		return &tools.Result{
-			Output:  "[system command] " + class.Reason,
-			IsError: false,
-		}, nil
-	}
+	// ClassSystem is a permission/risk classification, not an execution
+	// substitute.  The permission gate has already decided whether this
+	// invocation may run; returning a synthetic success here made commands
+	// such as docker, kubectl, journalctl, and env appear successful without
+	// ever starting a process.
 
 	// Reject bare-sleep patterns that would just sit around blocking
 	// the foreground turn for nothing useful. Mirrors claude-code's
@@ -594,6 +595,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		}
 		out, truncated := cappedBuf.snapshot()
 		out = normalizeCapturedOutput(out)
+		out = security.RedactSubprocessText(out)
 		if truncated {
 			out += "\n\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}
@@ -642,13 +644,14 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 			// Adoption failed — let the cmd finish in the foreground
 			// after all. Drain the wait we already started.
 			err2 := <-waitCh
-			out := cappedBuf.preview()
+			out := security.RedactSubprocessText(cappedBuf.preview())
 			res := &tools.Result{Output: out, IsError: err2 != nil}
 			return res, nil
 		}
 		canceled = true // Adopt owns the cancel now
 		preview, truncated := cappedBuf.snapshot()
 		preview = normalizeCapturedOutput(preview)
+		preview = security.RedactSubprocessText(preview)
 		if truncated {
 			preview += "\n... [output truncated at " + bytesString(maxBytes) + "] ..."
 		}

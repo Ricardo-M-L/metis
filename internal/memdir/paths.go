@@ -117,31 +117,20 @@ func IsAutoMemPath(root, candidate string) bool {
 	if root == "" || candidate == "" {
 		return false
 	}
-	rootAbs, err := filepath.Abs(root)
-	if err != nil {
+	_, rootAbs, ok := resolveThroughExistingParents(root)
+	if !ok {
 		return false
 	}
-	// Resolve symlinks on the root once; the candidate may not exist
-	// yet (extractor about to Write a new file), so don't EvalSymlinks
-	// it — Abs is enough for the equality check below.
-	if eval, err := filepath.EvalSymlinks(rootAbs); err == nil {
-		rootAbs = eval
-	}
-	candAbs, err := filepath.Abs(candidate)
-	if err != nil {
+	_, candAbs, ok := resolveThroughExistingParents(candidate)
+	if !ok {
 		return false
-	}
-	// If the candidate's directory exists, resolve symlinks on it so
-	// that `~/.metis/memory -> /tmp/x/memory` aliases match.
-	if eval, err := filepath.EvalSymlinks(filepath.Dir(candAbs)); err == nil {
-		candAbs = filepath.Join(eval, filepath.Base(candAbs))
 	}
 	rel, err := filepath.Rel(rootAbs, candAbs)
 	if err != nil {
 		return false
 	}
 	// Reject "..": that escapes the root.
-	if strings.HasPrefix(rel, "..") || rel == ".." {
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
 	// Direct match (the directory itself, no file) is not an
@@ -150,6 +139,34 @@ func IsAutoMemPath(root, candidate string) bool {
 		return false
 	}
 	return true
+}
+
+// resolveThroughExistingParents resolves every symlink the OS will traverse,
+// even when the final file or one or more parent directories do not yet exist.
+// Write creates missing parents, so checking only filepath.Dir(candidate) when
+// it already exists permits `memory/alias -> /outside` followed by a write to
+// `memory/alias/newdir/file`.
+func resolveThroughExistingParents(path string) (abs, resolved string, ok bool) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", false
+	}
+	cursor := filepath.Clean(abs)
+	var missing []string
+	for {
+		if existing, err := filepath.EvalSymlinks(cursor); err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				existing = filepath.Join(existing, missing[i])
+			}
+			return abs, filepath.Clean(existing), true
+		}
+		parent := filepath.Dir(cursor)
+		if parent == cursor {
+			return abs, abs, true
+		}
+		missing = append(missing, filepath.Base(cursor))
+		cursor = parent
+	}
 }
 
 // IsEntrypoint reports whether basename(path) is MEMORY.md. Useful

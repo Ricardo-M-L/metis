@@ -10,21 +10,21 @@ import (
 // TestSafetyCheck_BypassImmuneOnSensitivePaths verifies that path-aware
 // safetyCheck wins over mode=Bypass — even if the user opted into
 // "approve everything", writes to .git/config / .ssh/ / ~/.bashrc
-// must still ASK.
+// must still be denied without prompting.
 func TestSafetyCheck_BypassImmuneOnSensitivePaths(t *testing.T) {
 	cases := []struct {
 		tool string
 		path string
 		want Decision
 	}{
-		{"Edit", "/Users/x/proj/normal.go", DecisionAllow},           // bypass passes
-		{"Edit", "/Users/x/proj/.git/config", DecisionAsk},           // bypass-immune
-		{"Edit", "/Users/x/proj/.git/hooks/pre-commit", DecisionAsk}, // immune
-		{"Write", "/Users/x/.ssh/authorized_keys", DecisionAsk},      // immune
-		{"Write", "/Users/x/.bashrc", DecisionAsk},                   // immune
-		{"Bash", "echo foo > ~/.zshrc", DecisionAsk},                 // immune
-		{"Bash", "ls /Users/x/proj", DecisionAllow},                  // bypass ok
-		{"Read", "/Users/x/.bashrc", DecisionAllow},                  // Read isn't file-touching
+		{"Edit", "/Users/x/proj/normal.go", DecisionAllow},            // bypass passes
+		{"Edit", "/Users/x/proj/.git/config", DecisionDeny},           // bypass-immune
+		{"Edit", "/Users/x/proj/.git/hooks/pre-commit", DecisionDeny}, // immune
+		{"Write", "/Users/x/.ssh/authorized_keys", DecisionDeny},      // immune
+		{"Write", "/Users/x/.bashrc", DecisionDeny},                   // immune
+		{"Bash", "echo foo > ~/.zshrc", DecisionDeny},                 // immune
+		{"Bash", "ls /Users/x/proj", DecisionAllow},                   // bypass ok
+		{"Read", "/Users/x/.bashrc", DecisionAllow},                   // Read isn't file-touching
 	}
 	for _, tc := range cases {
 		g := New(ModeBypass)

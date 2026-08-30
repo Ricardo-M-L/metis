@@ -39,15 +39,12 @@ func withRepositoryLock(root string, fn func() error) (err error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		return err
-	}
 	value, _ := repositoryProcessLocks.LoadOrStore(root, &sync.Mutex{})
 	processLock := value.(*sync.Mutex)
 	processLock.Lock()
 	defer processLock.Unlock()
 
-	file, err := os.OpenFile(filepath.Join(root, repositoryLockName), os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := memdir.OpenPrivateRegularFile(root, repositoryLockName, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -56,9 +53,6 @@ func withRepositoryLock(root string, fn func() error) (err error) {
 			err = closeErr
 		}
 	}()
-	if err := file.Chmod(0o600); err != nil {
-		return err
-	}
 	if err := lockRepositoryFile(file); err != nil {
 		return err
 	}
@@ -97,7 +91,11 @@ func sessionDeletedLocked(root, sessionID string) (bool, error) {
 		return false, nil
 	}
 	path := tombstonePath(root, sessionID)
-	raw, err := os.ReadFile(path)
+	relative, err := memdir.RootRelativePath(root, path)
+	if err != nil {
+		return true, fmt.Errorf("resolve session tombstone: %w", err)
+	}
+	raw, err := memdir.ReadPrivateRegularFile(root, relative, 1024*1024)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -115,13 +113,6 @@ func sessionDeletedLocked(root, sessionID string) (bool, error) {
 }
 
 func markSessionDeletedLocked(root, sessionID string) error {
-	dir := filepath.Join(root, tombstoneDirName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
-	}
 	deleted, err := sessionDeletedLocked(root, sessionID)
 	if deleted {
 		return err
@@ -133,7 +124,12 @@ func markSessionDeletedLocked(root, sessionID string) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(tombstonePath(root, sessionID), string(append(data, '\n')), 0o600)
+	path := tombstonePath(root, sessionID)
+	relative, err := memdir.RootRelativePath(root, path)
+	if err != nil {
+		return err
+	}
+	return memdir.AtomicWritePrivateFile(root, relative, append(data, '\n'), 0o600)
 }
 
 func rejectDeletedSessionLocked(root, sessionID string) error {

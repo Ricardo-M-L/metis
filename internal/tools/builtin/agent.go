@@ -87,6 +87,34 @@ type AgentProfileSpec struct {
 // install). Errors are reserved for parse/IO failures.
 type AgentProfileLoader func(name string) (*AgentProfileSpec, error)
 
+// AgentPromptBuildContext is the runtime state needed to assemble the base
+// prompt for a cold Agent invocation. Registry is the final child registry,
+// after profile and invocation allow/deny filters and child-gate wrapping have
+// all been applied.
+type AgentPromptBuildContext struct {
+	Registry         *tools.Registry
+	Provider         llm.Provider
+	ProviderName     string
+	Model            string
+	WorkingDirectory string
+}
+
+// AgentMinimalPromptBuilder lets the runtime package assemble a minimal
+// sub-agent prompt without creating an import cycle back from builtin to
+// runtime. The builder is called at Execute time with the final child registry,
+// not when the parent Agent tool is first registered.
+type AgentMinimalPromptBuilder func(AgentPromptBuildContext) string
+
+// AgentRuntimePromptState carries the runtime-owned inputs used by the prompt
+// builder. It is accepted as an optional argument by the rebind helpers so old
+// embedders keep source compatibility while the CLI/Desktop paths can publish
+// their exact configured provider name and active workspace.
+type AgentRuntimePromptState struct {
+	ProviderName         string
+	WorkingDirectory     string
+	MinimalPromptBuilder AgentMinimalPromptBuilder
+}
+
 // bundledProfileSlugs is the back-compat fallback set: when the
 // model passes `name` (no `subagent_type`) and the name matches one of
 // these, we treat it as if subagent_type was set. Kept in sync with
@@ -142,15 +170,21 @@ const defaultMaxAgentDepth = 1
 // foreground path so existing tests + minimal embeddings still work.
 type Agent struct {
 	tools.BaseTool
-	gate           *permission.Gate
-	provider       llm.Provider
-	registry       *tools.Registry
-	roster         *agent.Roster
-	jobsPool       *jobs.Registry // optional; when set, run_in_background works
-	model          string
-	system         string
-	minimalSystem  string // optional; preferred for sub-agent loops to save tokens
-	defaultTimeout time.Duration
+	gate          *permission.Gate
+	provider      llm.Provider
+	registry      *tools.Registry
+	roster        *agent.Roster
+	jobsPool      *jobs.Registry // optional; when set, run_in_background works
+	model         string
+	system        string
+	minimalSystem string // optional; preferred for sub-agent loops to save tokens
+	// minimalPromptBuilder reassembles the minimal base against the final child
+	// registry at invocation time. The adjacent provider/workdir fields are
+	// runtime labels rather than values inferred from process-global state.
+	minimalPromptBuilder AgentMinimalPromptBuilder
+	promptProviderName   string
+	promptWorkDir        string
+	defaultTimeout       time.Duration
 	// sessionDir is the on-disk directory where sub-agent transcripts
 	// are persisted for `/agents resume` + the `resume_from` schema
 	// field (G.4, 2026-05-12). Empty = persistence disabled — used by
@@ -185,6 +219,37 @@ func (a Agent) effectiveMaxDepth() int {
 		return a.MaxDepth
 	}
 	return defaultMaxAgentDepth
+}
+
+// minimalPromptFor returns the per-invocation base prompt. The preassembled
+// minimal/full strings remain the compatibility fallback for embedders that do
+// not wire a runtime builder.
+func (a Agent) minimalPromptFor(reg *tools.Registry, workDir string) string {
+	base := a.system
+	if a.minimalSystem != "" {
+		base = a.minimalSystem
+	}
+	if a.minimalPromptBuilder == nil {
+		return base
+	}
+	if workDir == "" {
+		workDir = a.promptWorkDir
+	}
+	providerName := a.promptProviderName
+	if providerName == "" && a.provider != nil {
+		providerName = a.provider.Name()
+	}
+	built := a.minimalPromptBuilder(AgentPromptBuildContext{
+		Registry:         reg,
+		Provider:         a.provider,
+		ProviderName:     providerName,
+		Model:            a.model,
+		WorkingDirectory: workDir,
+	})
+	if strings.TrimSpace(built) == "" {
+		return base
+	}
+	return built
 }
 
 // NewAgent constructs the Agent tool. Caller wires it into the registry
@@ -444,6 +509,9 @@ func (a Agent) CanUse(ctx context.Context, in map[string]any) (tools.Permission,
 	if a.gate == nil {
 		return tools.PermissionDeny, "Agent tool has no permission gate"
 	}
+	if err := validateAgentPermissionOverride(a.gate.Mode(), in); err != nil {
+		return tools.PermissionDeny, err.Error()
+	}
 	d, src := a.gate.Check(ctx, "Agent", marshalAgentToolInput(in))
 	return mapDecision(d), src
 }
@@ -470,6 +538,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}, nil
 	}
 	if err := validatePlanAgentInput(parentWasPlan, in); err != nil {
+		return &tools.Result{Output: err.Error(), IsError: true}, nil
+	}
+	if err := validateAgentPermissionOverride(a.gate.Mode(), in); err != nil {
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 	requestedMode, hasRequestedMode, err := requestedAgentPermissionMode(in)
@@ -685,31 +756,6 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		profile = p
 	}
 
-	base := a.system
-	if a.minimalSystem != "" {
-		base = a.minimalSystem
-	}
-	// 2026-05-15 fix — profile body goes into ProfileSystemPrompt,
-	// NOT replacing base. Pre-fix the profile fully replaced base,
-	// which dropped the parent's <env> section (Working directory,
-	// Today's date, Git branch). Sub-agents then had no idea what
-	// cwd they were in and either guessed wrong absolute paths
-	// (/internal/..., /home/user/code/..., /workspace/...) or used
-	// relative paths that the path-strict Read tool rejected. The
-	// 200-iter long-Wall test showed 110+ such errors. Keeping base
-	// preserves env; ProfileSystemPrompt adds the role-specific
-	// guidance after it.
-	profileBody := ""
-	if profile != nil {
-		profileBody = profile.SystemPrompt
-	}
-	subSystem := agent.BuildSubPrompt(agent.SubPromptInputs{
-		Mode:                subPromptMode,
-		Base:                base,
-		TeammateName:        teammateName,
-		ProfileSystemPrompt: profileBody,
-	})
-
 	// G.9 (2026-05-12) — give the sub-agent its OWN gate so a
 	// child's permission-mode flip doesn't leak back into the parent
 	// (and so the sub-agent's denial-streak counter doesn't bleed
@@ -757,6 +803,36 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// children additionally lose permission-control, nested-agent, and Skill
 	// invocation surfaces entirely.
 	subRegistry := agentChildRegistry(filteredRegistry, subGate, planLocked)
+
+	// Assemble the cold Agent base only after every profile/invocation filter
+	// and child-gate restriction has produced the registry the child will
+	// actually receive. A runtime-supplied builder can therefore keep tool-aware
+	// guidance, provider labels, and the workspace env in lockstep with reality.
+	promptWorkDir := subCwd
+	if promptWorkDir == "" {
+		promptWorkDir = agent.CwdFromContext(ctx)
+	}
+	base := a.minimalPromptFor(subRegistry, promptWorkDir)
+	// 2026-05-15 fix — profile body goes into ProfileSystemPrompt,
+	// NOT replacing base. Pre-fix the profile fully replaced base,
+	// which dropped the parent's <env> section (Working directory,
+	// Today's date, Git branch). Sub-agents then had no idea what
+	// cwd they were in and either guessed wrong absolute paths
+	// (/internal/..., /home/user/code/..., /workspace/...) or used
+	// relative paths that the path-strict Read tool rejected. The
+	// 200-iter long-Wall test showed 110+ such errors. Keeping base
+	// preserves env; ProfileSystemPrompt adds the role-specific
+	// guidance after it.
+	profileBody := ""
+	if profile != nil {
+		profileBody = profile.SystemPrompt
+	}
+	subSystem := agent.BuildSubPrompt(agent.SubPromptInputs{
+		Mode:                subPromptMode,
+		Base:                base,
+		TeammateName:        teammateName,
+		ProfileSystemPrompt: profileBody,
+	})
 	if planLocked {
 		subSystem += "\n\n<plan_subagent_boundary>\nYou are a read-only planning and investigation sub-agent. Inspect with the available read-only tools, then return your findings or proposed plan directly to the parent. Do not implement changes and do not attempt to call EnterPlanMode or ExitPlanMode; only the parent can request plan approval and begin a fresh implementation turn.\n</plan_subagent_boundary>"
 	}

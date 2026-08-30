@@ -2,16 +2,14 @@ package agent
 
 // auto_mem_gate.go — the CanUseToolFn for the auto-memory forked
 // extractor. Mirrors openclaude's createAutoMemCanUseTool. Inside the
-// fork, the model has freedom to read anywhere it likes (the parent
-// context already trusts the user with file access), but writing is
-// pinned to the memdir root — a wandering extractor can't accidentally
-// edit the user's actual code.
+// fork, reads use structured path-aware tools and writes are pinned to the
+// memdir root. Shell commands stay disabled: a lexical command classifier
+// cannot reliably resolve every symlink/quoting alias to a credential path.
 //
 // The gate's verdicts:
 //
 //   Read / Grep / Glob          → allow (read-only by construction).
-//   Bash with isReadOnly=true   → allow (ls, cat, find, stat, head, tail, …).
-//   Bash with isReadOnly=false  → deny.
+//   Bash / shell tools          → deny (use the structured read tools).
 //   Edit / Write to memdir/*    → allow.
 //   Edit / Write elsewhere      → deny.
 //   Anything else               → deny.
@@ -23,28 +21,45 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/memdir"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
-	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 // CreateAutoMemCanUseTool returns a CanUseToolFn that gates the
 // forked extractor. memoryDir is the root the fork is allowed to
-// write to; reg is the same registry the fork uses to look up the
-// tool (so we can ask Bash specifically for IsReadOnly without
-// hard-coding a string-match list of safe binaries).
+// write to. reg is retained for API compatibility with existing callers;
+// shell execution is deliberately not delegated to it.
 //
 // The returned closure is safe to share across forks of the same
 // memdir root.
-func CreateAutoMemCanUseTool(memoryDir string, reg *tools.Registry) CanUseToolFn {
+func CreateAutoMemCanUseTool(memoryDir string, _ *tools.Registry) CanUseToolFn {
+	// Reuse the main permission package's credential-read boundary instead of
+	// maintaining a second list in the memory extractor. Bypass mode is chosen
+	// deliberately: ordinary reads pass without interaction while credential
+	// reads become a silent DENY.
+	credentialGate := permission.New(permission.ModeBypassPermissions)
 	return func(ctx context.Context, toolName string, input map[string]any) (bool, string) {
 		switch toolName {
-		case "Read", "Grep", "Glob", "ReadMcpResource", "ReadDir", "Find":
+		case "Read", "Grep":
+			if ok, reason := autoMemCredentialReadAllowed(ctx, credentialGate, toolName, input); !ok {
+				return false, reason
+			}
 			return true, ""
+		case "Glob", "ReadDir", "Find":
+			return true, ""
+		case "ReadMcpResource":
+			// MCP resources are provider-controlled payloads, not ordinary local
+			// files. The fork deliberately skips each tool's own CanUse method,
+			// so a blanket allow here would let background memory extraction read
+			// private resources and persist/send them without the parent boundary.
+			return false, "auto-memory fork: MCP resources are not memory-safe by default"
 		case "Bash", "BashOutput", "ShellCommand":
-			return canUseBashReadOnly(ctx, reg, toolName, input)
+			return false, "auto-memory fork: shell tools are disabled; use Read, Grep, Glob, ReadDir, or Find"
 		case "Edit", "Write", "MultiEdit":
 			return canUseEditOrWrite(memoryDir, input)
 		case "SkillSynth":
@@ -56,33 +71,66 @@ func CreateAutoMemCanUseTool(memoryDir string, reg *tools.Registry) CanUseToolFn
 		}
 		// Default deny — keeps the fork safely scoped no matter what
 		// future tools land in the registry.
-		return false, fmt.Sprintf("auto-memory fork: tool %q not in whitelist (allowed: Read/Grep/Glob, read-only Bash, Edit/Write within %s)", toolName, memoryDir)
+		return false, fmt.Sprintf("auto-memory fork: tool %q not in whitelist (allowed: Read/Grep/Glob/ReadDir/Find, Edit/Write within %s)", toolName, memoryDir)
 	}
 }
 
-// canUseBashReadOnly asks the registered Bash tool whether the
-// proposed command is read-only. We don't reimplement the safe-list —
-// the Bash tool already maintains it (`isReadOnlyCommand` in
-// internal/tools/builtin/bash.go), and wiring through ReadOnlyAware
-// keeps the two in lock-step automatically when Bash gets new safe
-// binaries.
-//
-// If the tool isn't registered, or doesn't implement ReadOnlyAware,
-// we fail closed (deny). That's safe even if it means the extractor
-// can't shell out — it can still use Read/Grep/Glob.
-func canUseBashReadOnly(_ context.Context, reg *tools.Registry, name string, input map[string]any) (bool, string) {
-	t, ok := reg.Get(name)
-	if !ok {
-		return false, fmt.Sprintf("auto-memory fork: %s not registered", name)
+func autoMemCredentialReadAllowed(ctx context.Context, gate *permission.Gate, toolName string, input map[string]any) (bool, string) {
+	stringInput := autoMemPermissionInput(toolName, input)
+	var decision permission.Decision
+	var source string
+	switch toolName {
+	case "Read":
+		path := stringField(input, "file_path")
+		if path == "" {
+			path = stringField(input, "path")
+		}
+		decision, source = gate.CheckPath(ctx, "Read", stringInput, path)
+	case "Grep":
+		root := stringField(input, "root")
+		if strings.TrimSpace(root) == "" {
+			// Match the real Grep tool: an omitted root means the current
+			// directory, not "no filesystem target". This is security-relevant
+			// when METIS was launched from its credential directory.
+			root = "."
+		}
+		decision, source = gate.CheckPath(ctx, "Grep", stringInput, root)
+	default:
+		decision, source = gate.Check(ctx, "Bash", stringInput)
 	}
-	ro, ok := t.(pubtool.ReadOnlyAware)
-	if !ok {
-		return false, fmt.Sprintf("auto-memory fork: %s has no ReadOnlyAware impl — fail-closed", name)
-	}
-	if !ro.IsReadOnly(input) {
-		return false, "auto-memory fork: only read-only shell commands (ls, find, grep, cat, stat, wc, head, tail, …) are allowed"
+	if decision != permission.DecisionAllow {
+		return false, fmt.Sprintf("auto-memory fork: credential boundary denied %s (%s)", toolName, source)
 	}
 	return true, ""
+}
+
+func autoMemPermissionInput(toolName string, input map[string]any) string {
+	if toolName == "Bash" || toolName == "BashOutput" || toolName == "ShellCommand" {
+		if command := stringField(input, "command"); command != "" {
+			return command
+		}
+		b, _ := json.Marshal(input)
+		return string(b)
+	}
+	if toolName == "Read" {
+		if path := stringField(input, "file_path"); path != "" {
+			return path
+		}
+		return stringField(input, "path")
+	}
+	if toolName == "Grep" {
+		root := stringField(input, "root")
+		if strings.TrimSpace(root) == "" {
+			root = "."
+		}
+		pattern := stringField(input, "pattern")
+		if root != "" {
+			return strings.TrimRight(root, "/\\") + "/\n" + pattern
+		}
+		return pattern
+	}
+	b, _ := json.Marshal(input)
+	return string(b)
 }
 
 // canUseEditOrWrite scopes file mutation to the memdir root. The

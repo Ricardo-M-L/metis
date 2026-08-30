@@ -4,9 +4,37 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
+	"path/filepath"
 	"sync"
 	"time"
 )
+
+// readStatePathKey folds lexical and stable symlink aliases onto one session
+// state key. Callers compute it once per operation and reuse it for Get/Record
+// so a path swap cannot make those two steps resolve different targets.
+func readStatePathKey(path string) string {
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		absPath = filepath.Clean(path)
+	}
+	current := absPath
+	var missing []string
+	for {
+		if resolved, resolveErr := filepath.EvalSymlinks(current); resolveErr == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+	return filepath.Clean(absPath)
+}
 
 // ReadFileState records, per session, when a file was last seen by a
 // reading tool (Read, NotebookEdit's read pass) so subsequent writing
@@ -92,7 +120,11 @@ func NewReadFileState() *ReadFileState {
 // Evicts the least-recently-recorded entry if the LRU exceeds
 // ReadStateMaxEntries.
 func (s *ReadFileState) Record(path string, mtime time.Time, content []byte) {
-	s.recordEntry(path, ReadEntry{
+	s.recordFixed(readStatePathKey(path), mtime, content)
+}
+
+func (s *ReadFileState) recordFixed(key string, mtime time.Time, content []byte) {
+	s.recordEntry(filepath.Clean(key), ReadEntry{
 		MTime:         mtime,
 		Hash:          hashBytes(content),
 		ReadAt:        time.Now(),
@@ -111,7 +143,11 @@ func (s *ReadFileState) Record(path string, mtime time.Time, content []byte) {
 // content here is still the FULL file bytes (used for the hash
 // staleness check); offset/limit describe what the LLM was shown.
 func (s *ReadFileState) RecordPartial(path string, mtime time.Time, content []byte, offset, limit int) {
-	s.recordEntry(path, ReadEntry{
+	s.recordPartialFixed(readStatePathKey(path), mtime, content, offset, limit)
+}
+
+func (s *ReadFileState) recordPartialFixed(key string, mtime time.Time, content []byte, offset, limit int) {
+	s.recordEntry(filepath.Clean(key), ReadEntry{
 		MTime:         mtime,
 		Hash:          hashBytes(content),
 		ReadAt:        time.Now(),
@@ -149,16 +185,34 @@ func (s *ReadFileState) recordEntry(path string, entry ReadEntry) {
 // position — Record is the natural "I just touched this" signal, and
 // stale-check Gets shouldn't keep dead entries warm.
 func (s *ReadFileState) Get(path string) (ReadEntry, bool) {
+	return s.getFixed(readStatePathKey(path))
+}
+
+func (s *ReadFileState) getFixed(key string) (ReadEntry, bool) {
 	if s == nil {
 		return ReadEntry{}, false
 	}
+	key = filepath.Clean(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	el, ok := s.entries[path]
+	el, ok := s.entries[key]
 	if !ok {
 		return ReadEntry{}, false
 	}
 	return el.Value.(*readNode).entry, true
+}
+
+func (s *ReadFileState) deleteFixed(key string) {
+	if s == nil {
+		return
+	}
+	key = filepath.Clean(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if el, ok := s.entries[key]; ok {
+		s.order.Remove(el)
+		delete(s.entries, key)
+	}
 }
 
 // Reset clears all entries. Called at session boundary so the next

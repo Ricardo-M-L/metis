@@ -1,12 +1,14 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -289,7 +291,7 @@ func TestExchangeCodeForTokenFull_NoAccessTokenIsError(t *testing.T) {
 // ─── runOAuthManual paste-flow ───────────────────────────────────
 
 func TestRunOAuthManual_PasteCodeFlow(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // sandbox auth.json writes
+	t.Setenv("METIS_HOME", t.TempDir()) // sandbox auth.json writes
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		if r.Form.Get("code") != "PASTED-CODE" {
@@ -325,6 +327,41 @@ func TestRunOAuthManual_PasteCodeFlow(t *testing.T) {
 	}
 	if tok.AccessToken != "manual-AT" {
 		t.Errorf("token: %q", tok.AccessToken)
+	}
+	stored, err := Get(p.Name)
+	if err != nil {
+		t.Fatalf("read default OAuth persistence: %v", err)
+	}
+	if stored != "manual-AT" {
+		t.Fatalf("default OAuth persistence = %q, want %q", stored, "manual-AT")
+	}
+}
+
+func TestRunOAuthManual_SkipPersistReturnsTokenWithoutWritingAuthJSON(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"access_token":"mcp-only","refresh_token":"refresh-only"}`)
+	}))
+	defer srv.Close()
+
+	p := OAuthProvider{
+		Name: "mcp:test", TokenURL: srv.URL, AuthURL: "https://example.com/auth",
+		ManualRedirectURL: "https://example.com/manual", UsePKCE: true,
+	}
+	tok, err := runOAuthManual(p, "verifier", "challenge", "STATE", OAuthOptions{
+		Manual:      true,
+		SkipPersist: true,
+		PasteCode:   func(string) (string, error) { return "PASTED-CODE", nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccessToken != "mcp-only" || tok.RefreshToken != "refresh-only" {
+		t.Fatalf("returned rich token = %+v", tok)
+	}
+	if _, err := os.Stat(Path()); !os.IsNotExist(err) {
+		t.Fatalf("SkipPersist wrote auth.json: stat error = %v", err)
 	}
 }
 
@@ -438,5 +475,73 @@ func TestOAuthLogin_StillReturnsString(t *testing.T) {
 	_, err := OAuthLogin("does-not-exist")
 	if err == nil {
 		t.Error("unknown provider should error")
+	}
+}
+
+func TestRunOAuthAutomaticContext_CancelStopsCallbackWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	opened := make(chan struct{}, 1)
+	p := OAuthProvider{
+		Name: "cancel-test", AuthURL: "https://example.test/authorize",
+		TokenURL: "https://example.test/token", ClientID: "client", UsePKCE: true,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := runOAuthAutomaticContext(ctx, p, "verifier", "challenge", "state", OAuthOptions{
+			AuthURLHandler: func(string) error {
+				opened <- struct{}{}
+				return nil
+			},
+		})
+		done <- err
+	}()
+
+	select {
+	case <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("OAuth flow did not reach callback wait")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled OAuth error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled OAuth callback wait did not return")
+	}
+}
+
+func TestExchangeCodeForTokenFullContext_CancelStopsHTTPRequest(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		requestStarted <- struct{}{}
+		<-releaseHandler
+	}))
+	defer srv.Close()
+	defer close(releaseHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := exchangeCodeForTokenFullContext(ctx, OAuthProvider{TokenURL: srv.URL}, "code", "redirect", "verifier")
+		done <- err
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("token exchange request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled token exchange error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled token exchange did not return")
 	}
 }

@@ -64,12 +64,15 @@ type WebSearch struct {
 func (WebSearch) Name() string { return "WebSearch" }
 
 func (WebSearch) Description() string {
-	return "Search the web for up-to-date information. Returns titles, snippets, and URLs for the top results. " +
+	return "Search the web by keywords for discovery, current information, or topics not tied to one known URL. " +
+		"Not for fetching a known URL; use WebFetch for that. Returns titles, snippets, and URLs for the top results. " +
 		"Works without any API key (DuckDuckGo fallback). For richer snippets and quotas, set one of: " +
 		"TAVILY_API_KEY (1k/mo free, tavily.com), BRAVE_SEARCH_API_KEY (2k/mo free, brave.com), " +
 		"or SERPER_API_KEY (paid Google SERP). Backends are tried in that priority order; " +
 		"the output footer always reports which backend served the request."
 }
+
+func (WebSearch) SearchHint() string { return "search web keywords current information" }
 
 func (WebSearch) InputSchema() map[string]any {
 	return map[string]any{
@@ -78,7 +81,7 @@ func (WebSearch) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"query": map[string]any{
 				"type":        "string",
-				"description": "The search query.",
+				"description": "Keywords or a natural-language search query; do not pass a URL to fetch.",
 			},
 			"max_results": map[string]any{
 				"type":        "integer",

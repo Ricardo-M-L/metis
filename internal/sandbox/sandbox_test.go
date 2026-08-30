@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseModeStrict(t *testing.T) {
@@ -88,6 +89,42 @@ func TestManagerRuntimeOverrideAndAutoAllow(t *testing.T) {
 	assertState(State{Configured: ModePermissions, Effective: ModePermissions})
 	if err := m.SetConfiguredMode("auto"); !errors.Is(err, ErrInvalidMode) {
 		t.Fatalf("SetConfiguredMode(auto) error = %v, want ErrInvalidMode", err)
+	}
+}
+
+func TestCredentialIsolationFloorRestoresUserSandboxSelection(t *testing.T) {
+	if !Available() {
+		t.Skipf("sandbox unavailable: %v", Doctor().Err)
+	}
+	m, err := NewManagerWithOptions(Options{Mode: "off", TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	if err := m.RequireCredentialIsolation(true); err != nil {
+		t.Fatal(err)
+	}
+	state := m.State()
+	if !state.CredentialIsolationRequired || state.Effective != ModePermissions {
+		t.Fatalf("isolation floor state = %+v, want required permissions", state)
+	}
+
+	// A user runtime override remains recorded, but cannot lower the bypass
+	// credential boundary while the floor is active.
+	if err := m.SetRuntimeMode("off"); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.State(); got.RuntimeOverride != ModeOff || got.Effective != ModePermissions {
+		t.Fatalf("runtime off bypassed isolation floor: %+v", got)
+	}
+
+	if err := m.RequireCredentialIsolation(false); err != nil {
+		t.Fatal(err)
+	}
+	state = m.State()
+	if state.CredentialIsolationRequired || state.Effective != ModeOff || !state.HasRuntimeOverride {
+		t.Fatalf("removing floor did not restore user override: %+v", state)
 	}
 }
 
@@ -208,6 +245,75 @@ func TestManagerOwnsPrivateTempDir(t *testing.T) {
 	}
 }
 
+func TestManagerCloseWaitsForActiveProcessLease(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	m, err := NewManagerWithOptions(Options{TempRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempDir := m.TempDir()
+	wrapped, release, err := m.Acquire(exec.Command("ignored"), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrapped == nil || release == nil {
+		t.Fatal("Acquire returned an incomplete lease")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- m.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before the active process lease was released: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := os.Stat(tempDir); err != nil {
+		t.Fatalf("manager temp directory disappeared while leased: %v", err)
+	}
+	if _, secondRelease, err := m.Acquire(exec.Command("ignored"), Request{}); !errors.Is(err, ErrManagerClosed) || secondRelease != nil {
+		t.Fatalf("Acquire during Close = (release=%v, err=%v), want nil ErrManagerClosed", secondRelease != nil, err)
+	}
+
+	release()
+	release() // idempotent: callers may converge on multiple cleanup paths.
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after releasing the process lease")
+	}
+	if _, err := os.Stat(tempDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manager temp directory still exists after lease drain: %v", err)
+	}
+}
+
+func TestPathWithinRootUsesPathBoundaries(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "manager")
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "root", path: root, want: true},
+		{name: "descendant", path: filepath.Join(root, "runcode", "work"), want: true},
+		{name: "prefix sibling", path: root + "-other", want: false},
+		{name: "parent", path: filepath.Dir(root), want: false},
+		{name: "empty root", path: "", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pathWithinRoot(root, tc.path); got != tc.want {
+				t.Fatalf("pathWithinRoot(%q, %q) = %v, want %v", root, tc.path, got, tc.want)
+			}
+		})
+	}
+	if pathWithinRoot("", root) {
+		t.Fatal("empty root unexpectedly owns a path")
+	}
+}
+
 func TestWrapOffPassesThroughEveryCommandField(t *testing.T) {
 	t.Parallel()
 	m, err := NewManagerWithOptions(Options{TempRoot: t.TempDir()})
@@ -243,6 +349,39 @@ func TestWrapOffPassesThroughEveryCommandField(t *testing.T) {
 	}
 	if cmd.Dir != dir || cmd.Stdin != stdin || cmd.Stdout != stdout || cmd.Stderr != stderr {
 		t.Fatal("off mode changed dir or stdio")
+	}
+}
+
+func TestRequestMinimumModeActivatesAvailableSandbox(t *testing.T) {
+	if !Available() {
+		t.Skipf("sandbox unavailable: %v", Doctor().Err)
+	}
+	m, err := NewManagerWithOptions(Options{Mode: string(ModeOff), TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	cwd := t.TempDir()
+	cmd := exec.Command("/bin/true")
+	originalPath := cmd.Path
+	wrapped, err := m.Wrap(cmd, Request{Cwd: cwd, MinimumMode: ModePermissions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrapped.Path == originalPath {
+		t.Fatalf("minimum permissions request left command unsandboxed: %q", wrapped.Path)
+	}
+}
+
+func TestRequestRejectsInvalidMinimumMode(t *testing.T) {
+	m, err := NewManagerWithOptions(Options{Mode: string(ModeOff), TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	_, err = m.Wrap(exec.Command("ignored"), Request{MinimumMode: Mode("invalid")})
+	if !errors.Is(err, ErrInvalidMode) {
+		t.Fatalf("invalid minimum mode error = %v, want ErrInvalidMode", err)
 	}
 }
 

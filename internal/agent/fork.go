@@ -23,6 +23,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -54,10 +55,14 @@ type CacheSafeParams struct {
 	SystemSections []llm.SystemSection
 
 	// ToolSpecs is the parent's tool list at fork time. Order matters —
-	// metis already sorts via Registry.SortedForCache(), but if the
-	// parent stripped MCP schemas via lazy mode, the fork must too. We
+	// metis sorts the Direct and Deferred exposure segments separately, but if
+	// the parent stripped Deferred schemas via lazy mode, the fork must too. We
 	// snapshot what was actually sent.
 	ToolSpecs []llm.ToolSpec
+	// ContextWindow preserves the parent's effective configured window (which
+	// may override the provider default) so derived Dream/Fork projections can
+	// make the same Auto ToolSearch decision.
+	ContextWindow int
 
 	// PrefixMessages is the parent's full Messages slice at fork time.
 	// The fork prepends its own user prompt after this prefix. Caller
@@ -153,6 +158,7 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 	}
 	prefix := append([]llm.Message(nil), loop.Messages...)
 	model := loop.Model
+	contextWindow := loop.ContextWindow
 	// Effort has its own lock and may change while the parent snapshot is
 	// assembled; capture one valid value for the fork.
 	effort := loop.EffortValue()
@@ -171,6 +177,7 @@ func SnapshotForFork(loop *Loop) *CacheSafeParams {
 		System:         system,
 		SystemSections: append([]llm.SystemSection(nil), sections...),
 		ToolSpecs:      loop.toolSpecs(), // already cache-stable order
+		ContextWindow:  contextWindow,
 		PrefixMessages: prefix,
 		Model:          model,
 		Effort:         effort,
@@ -303,11 +310,10 @@ func (r *ForkedResult) LastAssistantText() string {
 //     IsError=true; the agent loop continues. Provider-level errors
 //     (network, 4xx) abort the fork and are returned.
 //
-// The fork doesn't consult the parent's permission.Gate — it has its
-// own CanUseToolFn. Tools' CanUse method IS called (it's part of the
-// Tool contract and may do cheap input validation), but a Permission
-// of Ask is treated as Deny in the fork (you can't surface a UI prompt
-// from a background extraction).
+// The fork doesn't consult the parent's permission.Gate — it has its own
+// CanUseToolFn. After that gate allows, path-aware built-ins may prepare a
+// narrow per-invocation binding (for example a pinned inode) without re-running
+// the parent gate. Background forks never surface an approval prompt.
 func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, error) {
 	if p.Prompt == "" {
 		return nil, fmt.Errorf("forkedAgent: empty prompt")
@@ -344,6 +350,7 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 
 	prefixLen := len(p.Cache.PrefixMessages)
 	result := &ForkedResult{}
+	toolSpecs := append([]llm.ToolSpec(nil), p.Cache.ToolSpecs...)
 
 	defer func() {
 		result.Duration = time.Since(start)
@@ -368,7 +375,7 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 			Model:          p.Cache.Model,
 			System:         p.Cache.System,
 			SystemSections: append([]llm.SystemSection(nil), p.Cache.SystemSections...),
-			Tools:          p.Cache.ToolSpecs,
+			Tools:          toolSpecs,
 			Messages:       append([]llm.Message(nil), msgs...),
 			Effort:         p.Cache.Effort,
 			MaxTokens:      p.MaxTokens,
@@ -418,7 +425,7 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 		// Run each tool through the gate, collect results.
 		results := make([]llm.ContentBlock, 0, len(toolUses))
 		for _, tu := range toolUses {
-			block := executeForkTool(ctx, p, tu)
+			block := executeForkTool(ctx, p, tu, toolSpecs)
 			results = append(results, block)
 		}
 		msgs = append(msgs, llm.Message{
@@ -436,9 +443,20 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 // block (success or error) — never panics, never returns from the fork
 // on tool failure (a memo extraction shouldn't blow up because one
 // Glob errored).
-func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlock) llm.ContentBlock {
+func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlock, toolSpecs []llm.ToolSpec) llm.ContentBlock {
 	id := tu.ToolUseID
 	name := tu.ToolName
+
+	// ToolSearch is synthetic and therefore has no Registry entry. Forks can
+	// inherit lazy placeholders from the parent, so they must support the same
+	// schema-discovery handshake as the main loop.
+	if name == "ToolSearch" {
+		result := handleToolSearch(&Loop{Registry: p.Registry}, tu)
+		if !result.IsError {
+			hydrateForkToolSpecs(toolSpecs, p.Registry, result.ToolResult)
+		}
+		return result
+	}
 
 	// 1. CanUseTool gate (caller-supplied).
 	allow, reason := p.CanUseTool(ctx, name, tu.ToolInput)
@@ -450,11 +468,18 @@ func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlo
 	}
 
 	// 2. Registry lookup.
-	t, ok := p.Registry.Get(name)
+	t, ok := p.Registry.GetForModel(name)
 	if !ok {
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: id, IsError: true,
 			ToolResult: fmt.Sprintf("unknown tool %q in fork registry", name),
+		}
+	}
+	entry, _ := p.Registry.GetModelEntry(name)
+	if entry.Exposure == tools.ToolExposureDeferred && forkDeferredSchemaPending(toolSpecs, t.Name()) {
+		return llm.ContentBlock{
+			Type: "tool_result", ToolUseID: id, IsError: true,
+			ToolResult: fmt.Sprintf("tool %q is deferred; call ToolSearch with select:%s before invoking it", t.Name(), t.Name()),
 		}
 	}
 
@@ -467,10 +492,23 @@ func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlo
 	//    write rule would block the fork's whole point.
 	//
 	//    This mirrors openclaude: forkedAgent runs with its OWN
-	//    canUseTool, not the parent's permission flow.
+	//    canUseTool, not the parent's permission flow. Path-aware built-ins
+	//    still require a per-invocation inode binding, so prepare that binding
+	//    after the fork gate has allowed the call. This capability is narrow:
+	//    plugins and other tools keep their historical direct Execute behavior.
+	execCtx := ctx
+	if preparer, ok := t.(tools.InvocationPreparer); ok {
+		execCtx = tools.WithInvocationID(ctx, NewTraceInvocationID())
+		if err := preparer.PrepareAuthorizedInvocation(execCtx, tu.ToolInput); err != nil {
+			return llm.ContentBlock{
+				Type: "tool_result", ToolUseID: id, IsError: true,
+				ToolResult: fmt.Sprintf("prepare authorized invocation: %v", err),
+			}
+		}
+	}
 
 	// 4. Execute. Any error becomes a tool_result with is_error=true.
-	res, err := t.Execute(ctx, tu.ToolInput)
+	res, err := t.Execute(execCtx, tu.ToolInput)
 	if err != nil {
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: id, IsError: true,
@@ -486,6 +524,48 @@ func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlo
 	return llm.ContentBlock{
 		Type: "tool_result", ToolUseID: id,
 		ToolResult: res.Output, IsError: res.IsError,
+	}
+}
+
+func forkDeferredSchemaPending(specs []llm.ToolSpec, name string) bool {
+	for _, spec := range specs {
+		if spec.Name == name {
+			return isLazyPlaceholderSpec(spec)
+		}
+	}
+	return false
+}
+
+// hydrateForkToolSpecs upgrades only schemas actually returned by a select:
+// ToolSearch result. Keyword matches intentionally lack input_schema and do
+// not unlock deferred execution.
+func hydrateForkToolSpecs(specs []llm.ToolSpec, registry *tools.Registry, body string) {
+	var payload struct {
+		Matches []struct {
+			Name        string         `json:"name"`
+			InputSchema map[string]any `json:"input_schema"`
+		} `json:"matches"`
+	}
+	if json.Unmarshal([]byte(body), &payload) != nil {
+		return
+	}
+	for _, match := range payload.Matches {
+		if match.Name == "" || match.InputSchema == nil {
+			continue
+		}
+		entry, ok := registry.GetModelEntry(match.Name)
+		if !ok || entry.Exposure != tools.ToolExposureDeferred {
+			continue
+		}
+		for i := range specs {
+			if specs[i].Name != entry.Tool.Name() {
+				continue
+			}
+			specs[i].Description = entry.Tool.Description()
+			specs[i].InputSchema = entry.Tool.InputSchema()
+			specs[i].Exposure = string(entry.Exposure)
+			break
+		}
 	}
 }
 

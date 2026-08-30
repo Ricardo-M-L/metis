@@ -368,6 +368,7 @@ type runtime struct {
 	showTok               bool
 	model                 string
 	providerName          string          // resolved provider profile name (cfg.Provider.Default OR --provider). Threaded to the TUI so mid-session /model switches know which profile to rebuild against.
+	systemPromptKind      string          // generated default vs opaque custom/legacy prompt provenance
 	defaultPermissionMode permission.Mode // invocation-resolved baseline for in-process /new and /branch
 	// mcpServers collects handles to live MCP server subprocesses for
 	// Cleanup. Written from the background-launch goroutine kicked off
@@ -375,6 +376,21 @@ type runtime struct {
 	// mutex. The slice is also read by /mcp prompts (CollectMCPPrompts).
 	mcpServers   []*mcptools.Server
 	mcpServersMu sync.Mutex
+	// mcpClosing is set before Cleanup cancels/waits for the async launcher.
+	// It prevents a late handshake from publishing a server after the runtime
+	// has already drained its owned handles. mcpLauncherCancel terminates
+	// in-flight stdio/HTTP handshakes before the shared sandbox is closed.
+	mcpClosing        bool
+	mcpLauncherCancel context.CancelFunc
+	// Prompt discovery is asynchronous and may be using a live MCP client.
+	// Cleanup first cancels and joins these tasks, then closes the clients.
+	mcpPromptCtx    context.Context
+	mcpPromptCancel context.CancelFunc
+	mcpPromptWG     sync.WaitGroup
+	// mcpExplicitServers records names replaced by an explicit `/mcp login`.
+	// A slower startup launcher must never overwrite that fresh connection
+	// after the user deliberately reauthenticated.
+	mcpExplicitServers map[string]struct{}
 	// mcpLauncherDone closes when the background MCP launcher finishes
 	// (or right away when --bare). Cleanup waits on it so we never tear
 	// down the parent process while a handshake goroutine is still
@@ -404,9 +420,11 @@ const (
 )
 
 func promptContextFromRuntime(model, providerName, mode string, mcpReg *mcp.Registry, hasSkills bool) rtpkg.PromptCtx {
+	workingDirectory, _ := os.Getwd()
 	return rtpkg.PromptCtx{
 		Model:                model,
 		ProviderName:         providerName,
+		WorkingDirectory:     workingDirectory,
 		EnabledTools:         nil, // built-ins use legacy defaults until the live registry exists
 		ComputerUseAvailable: mcpReg.HasEnabledServer(mcp.ReservedComputerUseName),
 		HasSkills:            hasSkills,
@@ -455,7 +473,10 @@ func (r *runtime) rebindSession(sessionID string) {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	r.rebindSessionAt(sessionID, cwd)
+	// Terminal /new and /branch stay in the already-active workspace. Keep its
+	// established pointer spelling stable; Desktop's cross-workspace path goes
+	// through rebindSessionAt and publishes the prepared canonical target.
+	r.commitSessionRebindAt(sessionID, cwd)
 }
 
 // rebindSessionAt is the Desktop-aware session router. Unlike the terminal
@@ -463,24 +484,79 @@ func (r *runtime) rebindSession(sessionID string) {
 // checkpoints and crash recovery follow the workspace actually shown and used
 // by that Desktop turn rather than the process launch directory.
 func (r *runtime) rebindSessionAt(sessionID, workDir string) {
-	if r == nil || sessionID == "" {
+	_, commit, err := r.prepareSessionRebindAt(sessionID, workDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "metis: rebind session: %v\n", err)
 		return
+	}
+	commit()
+}
+
+// prepareSessionRebindAt performs the fallible workspace validation before a
+// Desktop activation publishes any session state. The returned closure only
+// performs infallible in-process swaps, so webui can commit AllowedDirs and the
+// process-owned session routers at the same serialized boundary as history and
+// workspace memory.
+func (r *runtime) prepareSessionRebindAt(sessionID, workDir string) (string, func(), error) {
+	if r == nil {
+		return "", nil, errors.New("runtime unavailable")
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return "", nil, errors.New("session id is empty")
 	}
 	workDir = strings.TrimSpace(workDir)
 	if workDir == "" {
 		workDir, _ = os.Getwd()
 	}
+	if workDir == "" {
+		return "", nil, errors.New("workspace is empty")
+	}
+	var preparedDirs *rtpkg.PreparedCWDRebind
+	canonicalWorkDir := workDir
+	// The gate's path-scope hook closes over AllowedDirs.Contains. Swapping the
+	// implicit cwd here therefore moves AllowedDirs and the live gate boundary
+	// together, and only on an actual activation callback (never a read-only
+	// Desktop session view during another session's active turn).
+	if r.allowedDirs != nil {
+		var err error
+		preparedDirs, err = r.allowedDirs.PrepareRebindCWD(workDir)
+		if err != nil {
+			return "", nil, fmt.Errorf("workspace permission scope: %w", err)
+		}
+		canonicalWorkDir = preparedDirs.CanonicalPath()
+	} else {
+		abs, err := filepath.Abs(workDir)
+		if err != nil {
+			return "", nil, fmt.Errorf("workspace canonical path: %w", err)
+		}
+		canonicalWorkDir, err = filepath.EvalSymlinks(abs)
+		if err != nil {
+			return "", nil, fmt.Errorf("workspace canonical path: %w", err)
+		}
+		info, err := os.Stat(canonicalWorkDir)
+		if err != nil {
+			return "", nil, fmt.Errorf("workspace canonical path: %w", err)
+		}
+		if !info.IsDir() {
+			return "", nil, fmt.Errorf("workspace canonical path: not a directory: %s", canonicalWorkDir)
+		}
+	}
+	return canonicalWorkDir, func() {
+		preparedDirs.Commit()
+		r.commitSessionRebindAt(sessionID, canonicalWorkDir)
+	}, nil
+}
+
+func (r *runtime) commitSessionRebindAt(sessionID, workDir string) {
 	r.sessionID = sessionID
 	rtpkg.SetCurrentSessionID(sessionID)
 	transport.SetSessionID(sessionID)
 	taskstore.SetCurrentTaskStore(sessionID)
 	rtpkg.RebindTrace(sessionID)
-	if r.loop != nil && workDir != "" {
+	if r.loop != nil {
 		r.loop.SetCheckpointer(checkpoint.NewManager(sessionID, workDir, ""))
 	}
-	if workDir != "" {
-		r.rebindRecoveryPointer(sessionID, workDir)
-	}
+	r.rebindRecoveryPointer(sessionID, workDir)
 }
 
 func (r *runtime) rebindRecoveryPointer(sessionID, workDir string) {
@@ -492,7 +568,13 @@ func (r *runtime) rebindRecoveryPointer(sessionID, workDir string) {
 	}
 	oldWorkDir := r.sessionPointerCwd
 	r.stopSessionHeartbeat()
-	if oldWorkDir != "" && oldWorkDir != workDir {
+	sameWorkspace := oldWorkDir == workDir
+	if !sameWorkspace && oldWorkDir != "" {
+		oldCanonical, oldErr := filepath.EvalSymlinks(oldWorkDir)
+		newCanonical, newErr := filepath.EvalSymlinks(workDir)
+		sameWorkspace = oldErr == nil && newErr == nil && oldCanonical == newCanonical
+	}
+	if oldWorkDir != "" && !sameWorkspace {
 		_ = session.ClearPointer(oldWorkDir)
 	}
 	r.sessionPointerCwd = workDir
@@ -602,19 +684,33 @@ func (r *runtime) Cleanup() {
 	// in practice goroutines have already unwound by the time we get
 	// here on a normal exit; the 1 s mostly covers a launch that's
 	// still in the npm-resolve phase.
+	r.mcpServersMu.Lock()
+	r.mcpClosing = true
+	cancelLauncher := r.mcpLauncherCancel
+	r.mcpLauncherCancel = nil
+	cancelPrompts := r.mcpPromptCancel
+	r.mcpPromptCancel = nil
+	r.mcpServersMu.Unlock()
+	if cancelLauncher != nil {
+		cancelLauncher()
+	}
+	if cancelPrompts != nil {
+		cancelPrompts()
+	}
 	if r.mcpLauncherDone != nil {
 		select {
 		case <-r.mcpLauncherDone:
 		case <-time.After(1 * time.Second):
 		}
-		r.mcpLauncherDone = nil
 	}
+	r.mcpPromptWG.Wait()
 	r.mcpServersMu.Lock()
-	for _, s := range r.mcpServers {
-		_ = s.Close()
-	}
+	servers := append([]*mcptools.Server(nil), r.mcpServers...)
 	r.mcpServers = nil
 	r.mcpServersMu.Unlock()
+	for _, s := range servers {
+		_ = s.Close()
+	}
 	if r.plugins != nil {
 		_ = r.plugins.Close()
 		r.plugins = nil
@@ -1015,6 +1111,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		model = preparedResume.Header.Model
 	}
 	mode := cfg.Permission.Mode
+	profileModeSet := agentProf != nil && strings.TrimSpace(agentProf.PermissionMode) != ""
+	if profileModeSet && flags.mode == "" && !flags.dangerouslySkipPerms {
+		mode = agentProf.PermissionMode
+	}
 	if flags.mode != "" {
 		mode = flags.mode
 	}
@@ -1023,11 +1123,20 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.dangerouslySkipPerms {
 		mode = string(permission.ModeBypassPermissions)
 	}
+	freshMode := mode
 	// Auto is internal-only in Claude Code and is not one of the five
-	// external permission modes Metis exposes.
-	if mode == "auto" {
+	// external permission modes Metis exposes. Preserve the existing migration
+	// error before canonicalizing legacy public aliases below.
+	if freshMode == "auto" {
 		return nil, errors.New("permission mode \"auto\" has been removed.\n" +
 			"Use one of Claude Code's public modes: default, acceptEdits, plan, dontAsk, bypassPermissions.")
+	}
+	// Preserve the invocation-resolved posture separately from a resumed
+	// session's mutable state. In-process /new and /branch must return to this
+	// baseline rather than inheriting the session restored at startup.
+	freshPermissionMode, ok := permission.ParseMode(freshMode)
+	if !ok {
+		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions)", mode)
 	}
 	// Profile-on-CLI merge.
 	mergedModel, mergedMode, mergedEffort, mergedMaxIter :=
@@ -1038,7 +1147,22 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions)", mode)
 	}
-	mode = string(canonicalMode)
+	invocationPermissionState := permissionStateForMode(canonicalMode)
+	permissionOverrideSet := flags.mode != "" || flags.dangerouslySkipPerms || profileModeSet
+	startupPermissionState, err := resolveStartupPermissionState(invocationPermissionState, preparedResume, permissionOverrideSet)
+	if err != nil {
+		return nil, err
+	}
+	startupRequiresCredentialIsolation := permissionStateRequiresCredentialIsolation(startupPermissionState)
+	canonicalMode = startupPermissionState.Mode
+	mode = string(startupPermissionState.Mode)
+	if preparedResume != nil && preparedResume.Header != nil {
+		// ApplyPreparedResume restores transcript and session rules later. Point
+		// its in-memory header at the already-resolved final permission snapshot
+		// so the Gate is never switched through a lower-priority stored posture.
+		preparedResume.Header.Mode = string(startupPermissionState.Mode)
+		preparedResume.Header.PrePlanMode = startupPermissionState.PrePlanMode
+	}
 	if flags.effort == "" {
 		flags.effort = mergedEffort
 	}
@@ -1046,8 +1170,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		flags.maxIter = mergedMaxIter
 	}
 
-	// First-run auth gate: launches the wizard when no key is resolvable
-	// AND stderr is interactive AND the user hasn't passed --no-auth-wizard.
+	// First-run auth gate: launches the wizard only in interactive permission
+	// postures. bypassPermissions is explicitly unattended, so a missing
+	// credential returns the normal configuration error instead of opening a
+	// wizard or browser.
 	providerBeforeAuth := provName
 	cfgBeforeAuth := cfg
 	// The first-run wizard may create or update the user config while this
@@ -1055,9 +1181,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// baseline so the brand-new provider profile is not immediately reported
 	// as an external mid-session edit.
 	cfg, provName, err = rtpkg.EnsureAPIKey(cfg, provName, rtpkg.AuthGateOptions{
-		NoWizard:  flags.noAuthWizard,
-		IsTTY:     func() bool { return term.IsTerminal(int(os.Stderr.Fd())) },
-		RunWizard: wizardAdapter,
+		NoWizard:  disableAuthWizard(flags.noAuthWizard, canonicalMode) || startupRequiresCredentialIsolation,
+		IsTTY:     authGateIsTTY,
+		RunWizard: authGateRunWizard,
 		Stderr:    os.Stderr,
 	})
 	if err != nil {
@@ -1073,6 +1199,15 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// than being silently incorporated halfway through setup.
 	cfg, snap, err = refreshConfigSnapshotAfterAuth(cfg, snap, authReloadedConfig)
 	if err != nil {
+		return nil, err
+	}
+	// Hooks are executable configuration, so their source has a stricter trust
+	// boundary than ordinary model/UI settings. User hooks remain available in
+	// every frontend; project and project-local hooks are included only after
+	// the workspace trust gate has persisted this directory. Desktop and
+	// non-interactive/headless startup never prompt here and therefore fail
+	// closed for a previously unseen checkout.
+	if err := applyWorkspaceHookPolicy(cfg, flags.bare); err != nil {
 		return nil, err
 	}
 
@@ -1093,8 +1228,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		networkPolicy = sandbox.NetworkBlock
 	}
 	sandboxMgr, err := sandbox.NewManagerWithOptions(sandbox.Options{
-		Mode:    cfg.Tools.Bash.Sandbox.Mode,
-		Network: networkPolicy,
+		Mode:      cfg.Tools.Bash.Sandbox.Mode,
+		Network:   networkPolicy,
+		MetisHome: config.Home(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sandbox configuration: %w", err)
@@ -1105,6 +1241,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			_ = sandboxMgr.Close()
 		}
 	}()
+	if err := startupRequireCredentialIsolation(sandboxMgr, startupRequiresCredentialIsolation); err != nil {
+		return nil, fmt.Errorf("permission mode %q is unavailable: %w", canonicalMode, err)
+	}
 
 	// Tool registry: built-ins + Agent + SendMessage in one go. Channel
 	// adapter assembly happens inside BuildToolRegistry's caller; we pass
@@ -1146,9 +1285,24 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	//   1. --system flag overrides entirely (user-supplied prompt).
 	//   2. METIS_SIMPLE=1 / --simple → one-sentence stub for CI use.
 	//   3. Default → section registry assembled with promptCtx.
+	promptKind := session.SystemPromptKindDefault
+	if systemSet || rtpkg.IsSimpleMode() {
+		promptKind = session.SystemPromptKindCustom
+	}
 	var resumedSystem string
 	if preparedResume != nil && !systemSet {
-		resumedSystem = preparedResume.Header.System
+		promptKind = preparedResume.Header.SystemPromptKind
+		if promptKind == "" && preparedResume.Header.System == "" {
+			promptKind = session.SystemPromptKindDefault
+		}
+		if promptKind != session.SystemPromptKindDefault {
+			// Legacy prompt ownership is unknowable. Treat an empty provenance
+			// marker as opaque so upgrades never rewrite user-authored text.
+			resumedSystem = preparedResume.Header.System
+		}
+	}
+	if rtpkg.IsSimpleMode() && resumedSystem == "" {
+		promptKind = session.SystemPromptKindCustom
 	}
 	var system string
 	switch {
@@ -1176,6 +1330,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// empty (frontmatter-only profiles still customize tools/model).
 	if agentProf != nil && agentProf.SystemPrompt != "" && !systemSet && resumedSystem == "" {
 		system = agentProf.SystemPrompt
+		promptKind = session.SystemPromptKindCustom
 	}
 	// Append user's optional ~/.metis/system.md addendum (claude-code-style
 	// global system prompt). No-op when the file doesn't exist or the
@@ -1258,6 +1413,14 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// downstream gets initialised. Per-section markers (=== N: Name
 	// [cache?] ===) so a token-counter can split + budget per section.
 	if flags.dumpPrompt {
+		// Prompt dump short-circuits before the production registry is built,
+		// but its conditional guidance must still reflect the same profile and
+		// CLI/config visibility layers. A built-ins-only diagnostic registry is
+		// sufficient here: every prompt section that branches on tool names is
+		// about a built-in capability.
+		promptReg := buildPromptVisibilityRegistry(cfg, agentProf, flags.tools, flags.disallowTools)
+		promptCtx.EnabledTools = promptEnabledToolSet(promptReg)
+		system, systemSections = rtpkg.RebindToolAwarePrompt(system, systemSections, promptCtx)
 		printPromptDump(systemSections, system)
 		return nil, errPromptDumpComplete
 	}
@@ -1411,11 +1574,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// profile's allowlist / disallowed_tools cover dynamically-loaded MCP
 	// tools too. No-op when no profile is loaded.
 	if agentProf != nil && (len(agentProf.Tools) > 0 || len(agentProf.DisallowedTools) > 0) {
-		all := make([]string, 0, len(reg.All()))
-		for _, t := range reg.All() {
-			all = append(all, t.Name())
-		}
-		reg.Restrict(agentProf.FilterToolNames(all))
+		tools.ApplyToolVisibility(reg, agentProf.Tools, agentProf.DisallowedTools)
 	}
 
 	// Plugins (MCP-bundle style): each ~/.metis/plugins/<name>/plugin.toml
@@ -1426,7 +1585,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		// EnsureBundledPlugins already ran inside setupRuntime so the
 		// extracted plugin tree is on disk by the time we get here.
 		var pluginErrs []error
-		pluginReg, pluginErrs = rtpkg.LoadPlugins(ctx, reg)
+		pluginReg, pluginErrs = rtpkg.LoadPluginsWithSandbox(ctx, reg, sandboxMgr)
 		for _, e := range pluginErrs {
 			fmt.Fprintf(os.Stderr, "metis: plugin load: %v\n", e)
 		}
@@ -1462,6 +1621,28 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	denyVis := append([]string(nil), cfg.Tools.Disallowed...)
 	denyVis = append(denyVis, tools.SplitCSV(flags.disallowTools)...)
 	tools.ApplyToolVisibility(reg, allowVis, denyVis)
+
+	// Prompt assembly starts before the registry because Agent itself captures
+	// the prompt during registry construction. Close that bootstrap cycle now:
+	// the final model-visible registry is authoritative for conditional prompt
+	// sections, then publish the same parent/minimal pair to Loop and Agent.
+	promptCtx.EnabledTools = promptEnabledToolSet(reg)
+	system, systemSections = rtpkg.RebindToolAwarePrompt(system, systemSections, promptCtx)
+	minimalSystem, _ = rtpkg.AssembleMinimalSubAgentPrompt(promptCtx)
+	minimalPromptBuilder := func(buildCtx builtin.AgentPromptBuildContext) string {
+		childCtx := promptCtx
+		childCtx.Model = buildCtx.Model
+		childCtx.ProviderName = buildCtx.ProviderName
+		childCtx.WorkingDirectory = buildCtx.WorkingDirectory
+		childCtx.EnabledTools = promptEnabledToolSet(buildCtx.Registry)
+		childSystem, _ := rtpkg.AssembleMinimalSubAgentPrompt(childCtx)
+		return childSystem
+	}
+	builtin.RebindAgentPrompts(reg, system, minimalSystem, builtin.AgentRuntimePromptState{
+		ProviderName:         provName,
+		WorkingDirectory:     promptCtx.WorkingDirectory,
+		MinimalPromptBuilder: minimalPromptBuilder,
+	})
 
 	maxIter := flags.maxIter
 	if maxIter == 0 {
@@ -1514,11 +1695,20 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Shift+Tab) converge on the same code path.
 	gate.SetModeChangeListener(func(m permission.Mode) {
 		loop.SetPlanMode(m == permission.ModePlan)
+		if err := startupReconcilePermissionSandbox(sandboxMgr, loop, m); err != nil {
+			// Internal Gate.SetMode callers (session restore and plan tools) do
+			// not return an error. Fail closed to dontAsk instead of leaving a
+			// visible bypass posture without its credential boundary.
+			fmt.Fprintf(os.Stderr, "metis: permission mode %q rejected: %v\n", m, err)
+			if m != permission.ModeDontAsk {
+				gate.SetMode(permission.ModeDontAsk)
+			}
+		}
 	})
-	// Apply once at boot so a session started in plan mode (via
-	// `metis --mode plan` or `[permissions] mode = "plan"` in config)
-	// has Loop.PlanMode aligned before the first user turn.
-	loop.SetPlanMode(gate.Mode() == permission.ModePlan)
+	// Apply the already-resolved startup snapshot once at boot. Plan is an
+	// overlay, so its exit target must be live before plugins or MCP processes
+	// can observe the runtime's sandbox posture.
+	rtpkg.SynchronizeRestoredPermissionState(gate, loop, startupPermissionState.PrePlanMode)
 
 	// G.5 — stash the auto-memory extractor on this var so the
 	// `rt` struct below can pick it up for /dream status. Declared
@@ -1572,12 +1762,16 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		}
 	}
 
+	mcpPromptCtx, cancelMCPPrompts := context.WithCancel(ctx)
 	rt := &runtime{
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, cronSvc: cronSvc, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
-		defaultPermissionMode: canonicalMode,
+		defaultPermissionMode: freshPermissionMode,
+		systemPromptKind:      promptKind,
 		mcpLauncherDone:       mcpLauncherDoneCh,
+		mcpPromptCtx:          mcpPromptCtx,
+		mcpPromptCancel:       cancelMCPPrompts,
 		plugins:               pluginReg,
 		allowedDirs:           allowedDirs,
 		autoMemExtractor:      pendingExtractor,
@@ -1602,25 +1796,32 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			diag = debugLogFile
 		}
 		lazyMode := mcp.ParseLazyMode(os.Getenv("METIS_LAZY_MCP"))
-		go func(reg *tools.Registry, mcpReg *mcp.Registry, mode mcp.LazyMode) {
+		mcpLaunchCtx, cancelMCPLaunch := context.WithCancel(ctx)
+		rt.mcpServersMu.Lock()
+		rt.mcpLauncherCancel = cancelMCPLaunch
+		rt.mcpServersMu.Unlock()
+		go func(launchCtx context.Context, reg *tools.Registry, mcpReg *mcp.Registry, mode mcp.LazyMode) {
 			defer close(mcpLauncherDoneCh)
-			servers, errs := mcp.LaunchAllLazy(ctx, mcpReg, reg, mode)
+			// Launch into a staging registry. Publication and process ownership
+			// move together below, so an explicit re-login that wins the race
+			// cannot be overwritten by a late startup client.
+			staged := tools.NewRegistry()
+			servers, errs := mcp.LaunchAllLazyWithSandbox(launchCtx, mcpReg, staged, mode, sandboxMgr)
 			for _, e := range errs {
 				if diag != nil {
 					fmt.Fprintf(diag, "metis: MCP launch: %v\n", e)
 				}
 			}
-			rt.mcpServersMu.Lock()
-			rt.mcpServers = append(rt.mcpServers, servers...)
-			rt.mcpServersMu.Unlock()
+			for _, server := range servers {
+				rt.adoptMCPServer(server, mcpToolsForServer(staged, server.Name()), false)
+			}
 			// Attach to a running IDE's MCP server if one advertises a
 			// matching workspace via ~/.metis/ide/*.lock (best-effort).
-			if ide := connectIDE(ctx, reg, diag); ide != nil {
-				rt.mcpServersMu.Lock()
-				rt.mcpServers = append(rt.mcpServers, ide)
-				rt.mcpServersMu.Unlock()
+			ideStaged := tools.NewRegistry()
+			if ide := connectIDE(launchCtx, ideStaged, diag); ide != nil {
+				rt.adoptMCPServer(ide, mcpToolsForServer(ideStaged, ide.Name()), false)
 			}
-		}(reg, mcpReg, lazyMode)
+		}(mcpLaunchCtx, reg, mcpReg, lazyMode)
 	}
 
 	if preparedResume != nil {
@@ -1630,11 +1831,6 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 			return nil, err
 		}
 		rt.sessionID = res.SessionID
-		// An explicit CLI mode is an invocation override. ApplyResume restores
-		// the stored posture first; the command-line choice wins last.
-		if flags.mode != "" || flags.dangerouslySkipPerms {
-			gate.SetMode(permission.Mode(mode))
-		}
 	} else {
 		if flags.newSessionID != "" {
 			if !validExplicitSessionID(flags.newSessionID) {
@@ -1649,7 +1845,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		} else {
 			rt.sessionID = store.NewSessionID()
 		}
-		if err := persistFreshSessionHeader(store, rt.sessionID, provName, model, system, mode); err != nil {
+		if err := persistFreshSessionHeader(store, rt.sessionID, provName, model, system, promptKind, mode); err != nil {
 			rt.Cleanup()
 			return nil, err
 		}
@@ -1731,6 +1927,78 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	sandboxOwned = false
 	return rt, nil
+}
+
+func permissionStateForMode(mode permission.Mode) rtpkg.PermissionModeState {
+	state := rtpkg.PermissionModeState{Mode: mode}
+	if mode == permission.ModePlan {
+		state.PrePlanMode = string(permission.ModeDefault)
+	}
+	return state
+}
+
+// resolveStartupPermissionState applies startup priority before any auth,
+// sandbox, plugin, or MCP side effect: an explicit invocation posture wins;
+// otherwise a stored posture wins when the session actually persisted one.
+// Legacy headers without Mode inherit the complete invocation snapshot, which
+// includes Plan's safe default lineage rather than an empty restored lineage.
+func resolveStartupPermissionState(invocation rtpkg.PermissionModeState, prepared *rtpkg.PreparedResume, invocationOverride bool) (rtpkg.PermissionModeState, error) {
+	if prepared == nil || prepared.Header == nil || invocationOverride {
+		return invocation, nil
+	}
+	mode, prePlan, hasMode, err := rtpkg.ValidateRestoredPermissionState(
+		prepared.Header.Mode,
+		prepared.Header.PrePlanMode,
+		invocation.Mode,
+	)
+	if err != nil {
+		return rtpkg.PermissionModeState{}, fmt.Errorf("resume %s: %w", prepared.SessionID, err)
+	}
+	if !hasMode {
+		return invocation, nil
+	}
+	return rtpkg.PermissionModeState{Mode: mode, PrePlanMode: prePlan}, nil
+}
+
+func permissionStateRequiresCredentialIsolation(state rtpkg.PermissionModeState) bool {
+	if state.Mode == permission.ModeBypassPermissions {
+		return true
+	}
+	return state.Mode == permission.ModePlan && state.PrePlanMode == string(permission.ModeBypassPermissions)
+}
+
+func applyWorkspaceHookPolicy(cfg *config.Config, bare bool) error {
+	if cfg == nil {
+		return errors.New("cannot apply hook trust policy to nil config")
+	}
+	if bare {
+		cfg.Hooks = config.HooksConfig{}
+		return nil
+	}
+	cwd, err := os.Getwd()
+	projectTrusted := err == nil && isTrustedDir(cwd)
+	hooks, err := config.LoadHooksForWorkspace(projectTrusted)
+	if err != nil {
+		return err
+	}
+	cfg.Hooks = hooks
+	return nil
+}
+
+// Indirections keep the startup ordering testable without actually opening a
+// browser or terminal wizard. Production values are immutable by convention;
+// tests that replace them restore them before returning.
+var (
+	authGateIsTTY                     = func() bool { return term.IsTerminal(int(os.Stderr.Fd())) }
+	authGateRunWizard                 = wizardAdapter
+	startupRequireCredentialIsolation = func(manager *sandbox.Manager, required bool) error {
+		return manager.RequireCredentialIsolation(required)
+	}
+	startupReconcilePermissionSandbox = rtpkg.ReconcilePermissionSandbox
+)
+
+func disableAuthWizard(explicit bool, mode permission.Mode) bool {
+	return explicit || mode == permission.ModeBypassPermissions
 }
 
 // resolveResumeTarget selects the session before provider and prompt
@@ -1840,6 +2108,10 @@ func cmdChat(ctx context.Context, args []string) error {
 		}
 	}()
 	sl := buildSlash(rt)
+	// buildSlash can run before the asynchronous MCP launcher has finished.
+	// Reconcile prompts again at the launcher boundary so prompt/resource-only
+	// servers are not omitted merely because they expose no tools at boot.
+	rt.scheduleMCPPromptsAfterLaunch(sl)
 	// Late-register the SlashCommand tool now that both the tool registry
 	// (rt.registry) and the slash registry (sl) exist — the tool lets the
 	// model invoke user-authored custom commands. Registered here rather
@@ -1868,6 +2140,13 @@ func cmdChat(ctx context.Context, args []string) error {
 	}
 
 	if useTUI {
+		adoptExplicitMCP := func(server *mcptools.Server, discovered []tools.Tool) bool {
+			if !rt.adoptMCPServer(server, discovered, true) {
+				return false
+			}
+			rt.scheduleLiveMCPPrompts(sl, server)
+			return true
+		}
 		hooks := tui.ExternalHooks{
 			DirAdd:              rt.allowedDirs.Add,
 			DirRemove:           rt.allowedDirs.Remove,
@@ -1877,6 +2156,7 @@ func cmdChat(ctx context.Context, args []string) error {
 			SessionSwitch:       rt.rebindSession,
 			SessionBoundary:     rt.releaseSessionWork,
 			Sandbox:             rt.sandbox,
+			AdoptMCPServer:      adoptExplicitMCP,
 			ReloadCatalog: func() (string, error) {
 				skillCount := 0
 				if rt.registry != nil {
@@ -1908,6 +2188,13 @@ func cmdChat(ctx context.Context, args []string) error {
 	}
 	repl.ConfigureProviderSwitch(rt.cfg, rt.providerName)
 	repl.ConfigureSandbox(rt.sandbox)
+	repl.AdoptMCPServer = func(server *mcptools.Server, discovered []tools.Tool) bool {
+		if !rt.adoptMCPServer(server, discovered, true) {
+			return false
+		}
+		rt.scheduleLiveMCPPrompts(sl, server)
+		return true
+	}
 	repl.DirAdd = rt.allowedDirs.Add
 	repl.DirRemove = rt.allowedDirs.Remove
 	repl.DirList = rt.allowedDirs.All
@@ -2896,8 +3183,9 @@ func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) erro
 	}
 	// Force ModeDefault regardless of cfg.Permission.Mode — see cmdCronStart
 	// for the full rationale: a cron fire is governed by its allow-list,
-	// not the operator's ambient mode, and only ModeDefault routes ask-tier
-	// tool calls through executeCronJob's EvaluateCronPermission handler.
+	// not the operator's ambient mode. The execution admission check applies
+	// before CanUse; ModeDefault then preserves ordinary tool-level denials and
+	// ASK handling for calls that passed pre-authorization.
 	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeDefault)})
 	if err != nil {
 		return err
@@ -2914,14 +3202,10 @@ func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) erro
 func cmdCronStart(ctx context.Context, svc *agent.CronService) error {
 	// Force ModeDefault regardless of cfg.Permission.Mode. A durable cron
 	// fire's permission model is its pre-authorization allow-list
-	// (enforced in executeCronJob's EventPermissionRequest handler via
-	// EvaluateCronPermission), NOT the operator's ambient interactive
-	// mode. If the daemon host's config is bypass/acceptEdits, the gate
-	// would auto-allow state-changing tools WITHOUT ever emitting
-	// EventPermissionRequest, so the allow-list is silently never
-	// consulted and the job runs every (non-dangerous-pattern) tool the
-	// model emits. ModeDefault routes every ask-tier call through the handler
-	// so the allow-list — and its dangerous-pattern floor — always govern.
+	// (enforced by executeCronJob's context-scoped admission callback via
+	// EvaluateCronPermission), NOT the operator's ambient interactive mode.
+	// Admission covers even MCP/tools that return ALLOW without consulting the
+	// Gate; ModeDefault keeps subsequent tool-level ASK/DENY behavior strict.
 	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeDefault)})
 	if err != nil {
 		return err
@@ -2958,6 +3242,30 @@ func sessionModeOrDefault(j *agent.CronJob) string {
 		return agent.SessionModeIsolated
 	}
 	return j.SessionMode
+}
+
+// evaluateCronPermissionEvent deliberately authorizes against the private
+// execution snapshot, never the redacted presentation input. A request that
+// did not originate from the agent's permission path is missing that snapshot
+// and fails closed.
+func evaluateCronPermissionEvent(job *agent.CronJob, ev agent.Event) (bool, string) {
+	policyInput, ok := ev.PermissionPolicyInputForAuthorization()
+	if !ok {
+		return false, "missing_policy_input"
+	}
+	return agent.EvaluateCronPermission(job, ev.PermissionTool, policyInput)
+}
+
+// cronDenialFromPermissionEvent builds the durable review record exclusively
+// from the presentation-safe input. Policy input may contain credentials and
+// must never cross this persistence/audit boundary.
+func cronDenialFromPermissionEvent(ev agent.Event, reason string) agent.CronDenial {
+	return agent.CronDenial{
+		Tool:    ev.PermissionTool,
+		Input:   agent.FlattenToolInput(ev.PermissionInput),
+		Reason:  reason,
+		Suggest: agent.SuggestCronRule(ev.PermissionTool, ev.PermissionInput),
+	}
 }
 
 func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
@@ -3040,6 +3348,14 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	done := make(chan error, 1)
 	go func() {
 		done <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
+			// CanUse is not itself a complete unattended authorization
+			// boundary: MCP tools intentionally return ALLOW and otherwise
+			// never reach EventPermissionRequest. Scope the cron job's
+			// pre-authorization policy to this turn so dispatch evaluates the
+			// hook-finalized raw arguments before every side-effecting Execute.
+			turnCtx = agent.WithToolAdmissionPolicy(turnCtx, func(tool string, input map[string]any) (bool, string) {
+				return agent.EvaluateCronPermission(job, tool, input)
+			})
 			return rt.loop.Run(turnCtx, events)
 		})
 		close(events)
@@ -3112,17 +3428,12 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 			// `cron add --allow` / `cron allow`, those run; everything else is
 			// denied and recorded so the user can review and extend the list.
 			// Dangerous-pattern commands stay denied even if allow-listed.
-			if allow, reason := agent.EvaluateCronPermission(job, ev.PermissionTool, ev.PermissionInput); allow {
+			if allow, reason := evaluateCronPermissionEvent(job, ev); allow {
 				ev.PermissionReply <- agent.PermissionDecisionAllow
 			} else {
 				ev.PermissionReply <- agent.PermissionDecisionDeny
 				cronDeniedCount++
-				_ = agent.RecordCronDenial(cronRoot, job.ID, agent.CronDenial{
-					Tool:    ev.PermissionTool,
-					Input:   agent.FlattenToolInput(ev.PermissionInput),
-					Reason:  reason,
-					Suggest: agent.SuggestCronRule(ev.PermissionTool, ev.PermissionInput),
-				})
+				_ = agent.RecordCronDenial(cronRoot, job.ID, cronDenialFromPermissionEvent(ev, reason))
 				if auditW != nil {
 					auditW.Append(agent.AuditEntry{
 						Kind:    "denied",
@@ -3339,7 +3650,7 @@ func cmdTools(args []string) error {
 		return err
 	}
 	reg := buildListingRegistry(cfg, allowFlag, denyFlag)
-	for _, t := range reg.All() {
+	for _, t := range reg.ModelToolsForCache() {
 		fmt.Printf("%-15s  %s\n", t.Name(), t.Description())
 	}
 	return nil
@@ -3381,6 +3692,39 @@ func buildListingRegistry(cfg *config.Config, allowFlag, denyFlag string) *tools
 	return reg
 }
 
+// buildPromptVisibilityRegistry is the no-runtime diagnostic counterpart of
+// the production registry path. It intentionally registers only built-ins:
+// ToolRedirectsSection and ComputerUseSection are the sole prompt sections
+// conditioned on concrete tool names, and their local names originate here.
+func buildPromptVisibilityRegistry(cfg *config.Config, profile *rtpkg.AgentProfile, allowFlag, denyFlag string) *tools.Registry {
+	gate := permission.New(permission.ModeDefault)
+	reg := tools.NewRegistry()
+	builtin.Register(reg, cfg, gate)
+	rtpkg.FilterRegistryInPlace(reg)
+	if profile != nil && (len(profile.Tools) > 0 || len(profile.DisallowedTools) > 0) {
+		tools.ApplyToolVisibility(reg, profile.Tools, profile.DisallowedTools)
+	}
+	allow := tools.SplitCSV(allowFlag)
+	if len(allow) == 0 {
+		allow = cfg.Tools.Allowed
+	}
+	deny := append([]string(nil), cfg.Tools.Disallowed...)
+	deny = append(deny, tools.SplitCSV(denyFlag)...)
+	tools.ApplyToolVisibility(reg, allow, deny)
+	return reg
+}
+
+func promptEnabledToolSet(reg *tools.Registry) map[string]bool {
+	enabled := make(map[string]bool)
+	if reg == nil {
+		return enabled
+	}
+	for _, tool := range reg.ModelToolsForCache() {
+		enabled[tool.Name()] = true
+	}
+	return enabled
+}
+
 // cmdSchema prints the machine-readable tool contract — every tool's name,
 // description, and JSON-Schema input — as one JSON document. This is metis'
 // analogue of Claude Code's generated sdk-tools.d.ts: the stable, typed
@@ -3407,8 +3751,9 @@ func cmdSchema(args []string) error {
 		Description string         `json:"description"`
 		InputSchema map[string]any `json:"input_schema"`
 	}
-	out := make([]toolContract, 0, len(reg.All()))
-	for _, t := range reg.All() {
+	visible := reg.ModelToolsForCache()
+	out := make([]toolContract, 0, len(visible))
+	for _, t := range visible {
 		out = append(out, toolContract{
 			Name:        t.Name(),
 			Description: t.Description(),
@@ -3943,7 +4288,9 @@ func buildSlash(rt *runtime) *slash.Registry {
 		if !ok {
 			return "unknown mode: " + arg + " (want default|acceptEdits|plan|dontAsk|bypassPermissions)", slash.SignalNone
 		}
-		rt.gate.SetMode(mode)
+		if err := applyRuntimePermissionMode(rt, mode); err != nil {
+			return "mode unchanged: " + err.Error(), slash.SignalNone
+		}
 		return "mode set to " + string(mode), slash.SignalNone
 	}})
 	// /dream — DreamTask (auto-memory) status (G.5, 2026-05-12).
@@ -4010,6 +4357,13 @@ func buildSlash(rt *runtime) *slash.Registry {
 		}
 	}
 	return r
+}
+
+func applyRuntimePermissionMode(rt *runtime, mode permission.Mode) error {
+	if rt == nil || rt.gate == nil {
+		return errors.New("permission gate is unavailable")
+	}
+	return rtpkg.ApplyPermissionMode(rt.gate, rt.loop, rt.sandbox, mode)
 }
 
 // formatAgentsCommand renders the /agents slash output (G.11 + G.17,

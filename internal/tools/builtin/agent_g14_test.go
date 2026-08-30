@@ -16,9 +16,13 @@ package builtin
 
 import (
 	"context"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -178,5 +182,88 @@ func TestAgentExecute_AllowedToolsSchemaPath(t *testing.T) {
 	}
 	if res.IsError {
 		t.Errorf("schema-path Execute should not be IsError: %s", res.Output)
+	}
+}
+
+type childPromptCaptureProvider struct {
+	mu      sync.Mutex
+	request llm.Request
+}
+
+func (*childPromptCaptureProvider) Name() string          { return "wire-provider" }
+func (*childPromptCaptureProvider) ModelID() string       { return "wire-model" }
+func (*childPromptCaptureProvider) MaxContextTokens() int { return 100_000 }
+func (*childPromptCaptureProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, nil
+}
+func (p *childPromptCaptureProvider) Stream(_ context.Context, req llm.Request) (llm.StreamReader, error) {
+	p.mu.Lock()
+	p.request = req
+	p.mu.Unlock()
+	return &fakeStream{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: "done"},
+		{Type: "message_delta", StopReason: "end_turn", OutputTokens: 1},
+		{Type: "message_stop"},
+	}}, nil
+}
+
+func (p *childPromptCaptureProvider) lastRequest() llm.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.request
+}
+
+func TestAgentExecute_MinimalPromptBuilderUsesFinalChildRegistry(t *testing.T) {
+	reg := buildParentRegistry(t, "Read", "Bash", "Write")
+	gate := permission.New(permission.ModeBypass)
+	provider := &childPromptCaptureProvider{}
+	reg.Register(NewAgentWithMinimal(gate, provider, reg, "model-v2", "full", "stale-minimal").
+		WithProfileLoader(func(string) (*AgentProfileSpec, error) {
+			return &AgentProfileSpec{
+				Name:            "restricted",
+				SystemPrompt:    "PROFILE-BODY",
+				Tools:           []string{"Read", "Bash"},
+				DisallowedTools: []string{"Bash"},
+			}, nil
+		}))
+
+	RebindAgentPrompts(reg, "full", "parent-minimal", AgentRuntimePromptState{
+		ProviderName:     "configured-profile",
+		WorkingDirectory: "/workspace/current",
+		MinimalPromptBuilder: func(ctx AgentPromptBuildContext) string {
+			return fmt.Sprintf(
+				"provider=%s model=%s cwd=%s tools=%s",
+				ctx.ProviderName,
+				ctx.Model,
+				ctx.WorkingDirectory,
+				strings.Join(registryNames(ctx.Registry), ","),
+			)
+		},
+	})
+
+	agentTool, ok := reg.Get("Agent")
+	if !ok {
+		t.Fatal("Agent disappeared during prompt setup")
+	}
+	result, err := agentTool.(Agent).Execute(context.Background(), map[string]any{
+		"prompt":           "inspect only",
+		"subagent_type":    "restricted",
+		"allowed_tools":    []any{"Read", "Bash", "Write"},
+		"disallowed_tools": []any{"Write"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute returned tool error: %s", result.Output)
+	}
+
+	request := provider.lastRequest()
+	want := "provider=configured-profile model=model-v2 cwd=/workspace/current tools=Read"
+	if !strings.Contains(request.System, want) {
+		t.Fatalf("child system prompt did not use final registry/runtime state:\n%s\nwant substring: %s", request.System, want)
+	}
+	if strings.Contains(request.System, "tools=Read,Bash") || strings.Contains(request.System, "tools=Read,Write") {
+		t.Fatalf("child system prompt leaked filtered tools: %s", request.System)
 	}
 }

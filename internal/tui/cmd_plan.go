@@ -9,12 +9,13 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	runtimepkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
 // activatePlanMode keeps the permission gate and loop controller in sync even
 // in lightweight embedders that do not install the production Gate listener.
 // It returns whether the session was already planning before this command.
-func activatePlanMode(gate *permission.Gate, loop *agent.Loop) bool {
+func activatePlanMode(gate *permission.Gate, loop *agent.Loop, manager *sandbox.Manager) (bool, error) {
 	already := false
 	if gate != nil && gate.Mode() == permission.ModePlan {
 		already = true
@@ -22,16 +23,13 @@ func activatePlanMode(gate *permission.Gate, loop *agent.Loop) bool {
 	if loop != nil && loop.IsPlanMode() {
 		already = true
 	}
-	if !already && loop != nil && gate != nil {
-		loop.SetPrePlanMode(string(gate.Mode()))
+	if already {
+		return true, nil
 	}
-	if gate != nil {
-		gate.SetMode(permission.ModePlan)
+	if err := applyPermissionMode(gate, loop, manager, permission.ModePlan); err != nil {
+		return false, err
 	}
-	if loop != nil {
-		loop.SetPlanMode(true)
-	}
-	return already
+	return false, nil
 }
 
 func updateCurrentPlanDraft(sessionID, description string) error {

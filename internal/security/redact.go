@@ -45,7 +45,7 @@ import (
 // (?s) lets `.` cross newlines — some servers pretty-print bodies with
 // `\n` between key and value. \s* matches the optional whitespace JSON
 // allows around `:`.
-var sensitiveTokenRE = regexp.MustCompile(`"(access_token|refresh_token|id_token|assertion|subject_token|client_secret|client_assertion)"\s*:\s*"[^"]*"`)
+var sensitiveTokenRE = regexp.MustCompile(`"(access_token|refresh_token|id_token|assertion|subject_token|client_secret|client_assertion)"\s*:\s*"(?:\\.|[^"\\\r\n])*"`)
 
 // secretRule is one gitleaks-derived pattern. capturing=true means the
 // pattern's group 1 is the secret span (and surrounding boundary
@@ -161,24 +161,34 @@ func Redact(s string) string {
 	if s == "" {
 		return s
 	}
-	compileOnce.Do(compileRules)
+	hasSensitiveField := mayContainSensitiveTokenField(s)
+	hasHighConfidenceShape := mayContainHighConfidenceSecret(s)
+	if !hasSensitiveField && !hasHighConfidenceShape {
+		return s
+	}
 
 	// Layer 1: JSON token-key matcher. Replace value-only, keep key.
-	s = sensitiveTokenRE.ReplaceAllStringFunc(s, func(match string) string {
-		// match looks like `"access_token":"abc"` — find the key by
-		// re-matching to extract group 1. ReplaceAllString with
-		// `"$1":"[REDACTED]"` is shorter but ReplaceAllStringFunc
-		// makes the boundary handling explicit.
-		sub := sensitiveTokenRE.FindStringSubmatch(match)
-		if len(sub) < 2 {
-			return `"[REDACTED]":"[REDACTED]"` // defensive
-		}
-		return `"` + sub[1] + `":"[REDACTED]"`
-	})
+	if hasSensitiveField {
+		s = sensitiveTokenRE.ReplaceAllStringFunc(s, func(match string) string {
+			// match looks like `"access_token":"abc"` — find the key by
+			// re-matching to extract group 1. ReplaceAllString with
+			// `"$1":"[REDACTED]"` is shorter but ReplaceAllStringFunc
+			// makes the boundary handling explicit.
+			sub := sensitiveTokenRE.FindStringSubmatch(match)
+			if len(sub) < 2 {
+				return `"[REDACTED]":"[REDACTED]"` // defensive
+			}
+			return `"` + sub[1] + `":"[REDACTED]"`
+		})
+	}
 
 	// Layer 2: gitleaks-derived bare credential patterns. For
 	// capturing rules, replace only group 1 so word-boundary chars
 	// (spaces, quotes) outside the group survive.
+	if !hasHighConfidenceShape {
+		return s
+	}
+	compileOnce.Do(compileRules)
 	for _, r := range compiledList {
 		if !r.re.MatchString(s) {
 			continue
@@ -202,6 +212,113 @@ func Redact(s string) string {
 		}
 	}
 	return s
+}
+
+func mayContainSensitiveTokenField(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		for _, name := range []string{
+			"access_token", "refresh_token", "id_token", "assertion",
+			"subject_token", "client_secret", "client_assertion",
+		} {
+			if hasStringPrefixAt(s, i+1, name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func mayContainHighConfidenceSecret(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch lowerASCIIByte(s[i]) {
+		case 'a':
+			for _, prefix := range []string{"a3t", "akia", "asia", "abia", "acca", "aiza"} {
+				if hasASCIIFoldPrefixAt(s, i, prefix) {
+					return true
+				}
+			}
+		case 'b':
+			if hasASCIIFoldPrefixAt(s, i, "bearer") {
+				return true
+			}
+		case 'd':
+			for _, prefix := range []string{"dop_v1_", "doo_v1_", "dapi"} {
+				if hasStringPrefixAt(s, i, prefix) {
+					return true
+				}
+			}
+		case 'g':
+			for _, prefix := range []string{
+				"ghp_", "github_pat_", "ghu_", "ghs_", "gho_", "ghr_",
+				"glpat-", "gldt-", "glc_", "glsa_",
+			} {
+				if hasStringPrefixAt(s, i, prefix) {
+					return true
+				}
+			}
+		case 'h':
+			if hasStringPrefixAt(s, i, "hf_") {
+				return true
+			}
+		case 'n':
+			if hasStringPrefixAt(s, i, "npm_") {
+				return true
+			}
+		case 'p':
+			if hasStringPrefixAt(s, i, "pypi-") || hasStringPrefixAt(s, i, "pul-") {
+				return true
+			}
+		case 'r':
+			if hasStringPrefixAt(s, i, "rk_") {
+				return true
+			}
+		case 's':
+			for _, prefix := range []string{"sk-", "sk_", "sg.", "shpat_", "shpss_", "sntryu_"} {
+				if hasASCIIFoldPrefixAt(s, i, prefix) {
+					return true
+				}
+			}
+			// Twilio keys use uppercase SK followed by 32 hex digits.
+			if s[i] == 'S' && hasStringPrefixAt(s, i, "SK") {
+				return true
+			}
+		case 'x':
+			if hasStringPrefixAt(s, i, "xox") {
+				return true
+			}
+		case '-':
+			if hasStringPrefixAt(s, i, "-----BEGIN") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasStringPrefixAt(s string, start int, prefix string) bool {
+	return start >= 0 && start+len(prefix) <= len(s) && s[start:start+len(prefix)] == prefix
+}
+
+func hasASCIIFoldPrefixAt(s string, start int, prefix string) bool {
+	if start < 0 || start+len(prefix) > len(s) {
+		return false
+	}
+	for i := range prefix {
+		if lowerASCIIByte(s[start+i]) != lowerASCIIByte(prefix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCIIByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
 }
 
 // indexByteSeq is a tiny helper for "find first occurrence of needle

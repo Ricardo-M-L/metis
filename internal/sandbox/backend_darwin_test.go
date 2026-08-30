@@ -77,6 +77,8 @@ func TestDarwinProfilePolicy(t *testing.T) {
 		`(deny file-write* (subpath "/Users/test/.metis"))`,
 		`(deny file-read* (literal "/Users/test/.metis/auth.json"))`,
 		`(deny file-read* (literal "/Users/test/.metis/mcp-oauth.json"))`,
+		`(deny file-read* (literal "/Users/test/.metis/mcp.toml"))`,
+		`(deny file-read* (literal "/Users/test/.metis/config.local.toml"))`,
 		`(deny file-read* (subpath "/Users/test/.ssh"))`,
 		`(deny file-write* (subpath "/Users/test/.aws"))`,
 		`(deny file-read* (subpath "/Users/test/.config/gcloud"))`,
@@ -207,6 +209,12 @@ func TestDarwinSandboxE2E(t *testing.T) {
 	}
 	if err := run(`cat "$SECRET" >/dev/null`, "SECRET="+authPath); err == nil {
 		t.Fatal("sandbox allowed reading ~/.metis/auth.json")
+	}
+	// The command deliberately contains no contiguous `.metis/auth.json`
+	// fragment. The OS boundary must still reject the dynamically assembled
+	// path; string inspection alone cannot enforce the credential invariant.
+	if err := run(`d=.me"tis"; f=auth."json"; cat "$HOME/$d/$f" >/dev/null`); err == nil {
+		t.Fatal("sandbox allowed dynamically assembled Metis credential read")
 	}
 	if err := run(`cat "$SECRET" >/dev/null`, "SECRET="+sshKeyPath); err == nil {
 		t.Fatal("sandbox allowed reading ~/.ssh private key")

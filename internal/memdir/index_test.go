@@ -2,6 +2,8 @@ package memdir
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +127,36 @@ func TestWriteIndex_GroupsByType(t *testing.T) {
 	pIdx := strings.Index(gotS, "project_x")
 	if !(uIdx < fIdx && fIdx < pIdx) {
 		t.Errorf("expected user < feedback < project, got %d, %d, %d", uIdx, fIdx, pIdx)
+	}
+}
+
+func TestWriteIndexDoesNotFollowLegacyFixedTempSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside-index")
+	legacyTemp := IndexPath(root) + ".tmp"
+	if err := os.Symlink(outside, legacyTemp); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	files := []MemoryFile{{
+		Path: filepath.Join(root, "safe.md"), Name: "safe",
+		Frontmatter: Frontmatter{Name: "safe", Description: "safe", Type: TypeProject},
+	}}
+	if err := WriteIndex(root, files); err != nil {
+		t.Fatalf("WriteIndex: %v", err)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("fixed temp symlink target was created: %v", err)
+	}
+	if info, err := os.Lstat(legacyTemp); err != nil {
+		t.Fatalf("legacy dangling symlink was unexpectedly consumed: %v", err)
+	} else if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("legacy temp is no longer a symlink: mode=%v", info.Mode())
+	}
+	if raw, err := os.ReadFile(IndexPath(root)); err != nil || !strings.Contains(string(raw), "safe.md") {
+		t.Fatalf("index was not committed safely: %q err=%v", raw, err)
 	}
 }
 

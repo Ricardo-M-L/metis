@@ -51,6 +51,14 @@ type forkFakeTool struct {
 	concurrency pubtool.Concurrency
 }
 
+type hiddenForkTool struct{ forkFakeTool }
+
+func (hiddenForkTool) ToolExposure() tools.ToolExposure { return tools.ToolExposureHidden }
+
+type deferredForkTool struct{ forkFakeTool }
+
+func (deferredForkTool) ToolExposure() tools.ToolExposure { return tools.ToolExposureDeferred }
+
 type blockingForkSchemaTool struct {
 	entered chan struct{}
 	release chan struct{}
@@ -241,6 +249,107 @@ func TestRunForkedAgent_UnknownToolBecomesIsError(t *testing.T) {
 	}
 	if !strings.Contains(tr.Content[0].ToolResult, "unknown tool") {
 		t.Errorf("expected 'unknown tool' in result: %q", tr.Content[0].ToolResult)
+	}
+}
+
+func TestRunForkedAgent_HiddenToolBecomesUnknown(t *testing.T) {
+	prov := &scriptedProvider{
+		resps: []*llm.Response{
+			{Content: []llm.ContentBlock{{
+				Type: "tool_use", ToolUseID: "hidden-1", ToolName: "internal_admin",
+				ToolInput: map[string]any{},
+			}}, StopReason: "tool_use"},
+			{Content: []llm.ContentBlock{{Type: "text", Text: "stop"}}, StopReason: "end_turn"},
+		},
+	}
+	reg := newRegistryWith(t, hiddenForkTool{forkFakeTool{name: "internal_admin"}})
+	res, err := RunForkedAgent(context.Background(), ForkedAgentParams{
+		Cache:      CacheSafeParams{Provider: prov, Model: "test"},
+		Prompt:     "go",
+		CanUseTool: AllowAll,
+		Registry:   reg,
+		MaxTurns:   5,
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	tr := res.NewMessages[2]
+	if !tr.Content[0].IsError || !strings.Contains(tr.Content[0].ToolResult, "unknown tool") {
+		t.Fatalf("hidden tool must fail closed as unknown: %+v", tr.Content[0])
+	}
+}
+
+func TestRunForkedAgent_ToolSearchHydratesDeferredSchema(t *testing.T) {
+	t.Setenv("ENABLE_TOOL_SEARCH", "true")
+	prov := &scriptedProvider{
+		resps: []*llm.Response{
+			{Content: []llm.ContentBlock{{
+				Type: "tool_use", ToolUseID: "search-1", ToolName: "ToolSearch",
+				ToolInput: map[string]any{"query": "select:remote_docs"},
+			}}, StopReason: "tool_use"},
+			{Content: []llm.ContentBlock{{
+				Type: "tool_use", ToolUseID: "call-1", ToolName: "remote_docs",
+				ToolInput: map[string]any{},
+			}}, StopReason: "tool_use"},
+			{Content: []llm.ContentBlock{{Type: "text", Text: "done"}}, StopReason: "end_turn"},
+		},
+	}
+	reg := newRegistryWith(t, deferredForkTool{forkFakeTool{name: "remote_docs", desc: "remote docs"}})
+	baseSpecs := toolSpecsFromRegistry(reg, false, 200_000, nil)
+	if !containsName(baseSpecs, "ToolSearch") {
+		t.Fatalf("test setup did not produce lazy ToolSearch specs: %+v", baseSpecs)
+	}
+	res, err := RunForkedAgent(context.Background(), ForkedAgentParams{
+		Cache: CacheSafeParams{
+			Provider:  prov,
+			Model:     "test",
+			ToolSpecs: baseSpecs,
+		},
+		Prompt:     "go",
+		CanUseTool: AllowAll,
+		Registry:   reg,
+		MaxTurns:   5,
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if got := res.LastAssistantText(); got != "done" {
+		t.Fatalf("fork did not complete after deferred tool call: %q", got)
+	}
+	if len(prov.calls) < 2 {
+		t.Fatalf("provider calls = %d, want at least 2", len(prov.calls))
+	}
+	var hydrated bool
+	for _, spec := range prov.calls[1].Tools {
+		if spec.Name == "remote_docs" {
+			hydrated = !isLazyPlaceholderSpec(spec)
+		}
+	}
+	if !hydrated {
+		t.Fatal("selected deferred schema was not hydrated for the next fork turn")
+	}
+}
+
+func TestRunForkedAgent_DeferredToolRequiresToolSearch(t *testing.T) {
+	t.Setenv("ENABLE_TOOL_SEARCH", "true")
+	prov := &scriptedProvider{resps: []*llm.Response{
+		{Content: []llm.ContentBlock{{
+			Type: "tool_use", ToolUseID: "call-before-select", ToolName: "remote_docs",
+			ToolInput: map[string]any{},
+		}}, StopReason: "tool_use"},
+		{Content: []llm.ContentBlock{{Type: "text", Text: "stop"}}, StopReason: "end_turn"},
+	}}
+	reg := newRegistryWith(t, deferredForkTool{forkFakeTool{name: "remote_docs", desc: "remote docs"}})
+	res, err := RunForkedAgent(context.Background(), ForkedAgentParams{
+		Cache:  CacheSafeParams{Provider: prov, Model: "test", ToolSpecs: toolSpecsFromRegistry(reg, false, 200_000, nil)},
+		Prompt: "go", CanUseTool: AllowAll, Registry: reg, MaxTurns: 3,
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	result := res.NewMessages[2].Content[0]
+	if !result.IsError || !strings.Contains(result.ToolResult, "call ToolSearch") {
+		t.Fatalf("deferred fork tool bypassed schema discovery: %+v", result)
 	}
 }
 

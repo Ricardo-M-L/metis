@@ -2,6 +2,9 @@ package permission
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +126,46 @@ func TestGate_PathScopeOnlyAppliesToCheckPathAndClones(t *testing.T) {
 	clone := g.Clone()
 	if got, source := clone.CheckPath(context.Background(), "Read", "/outside/file", "/outside/file"); got != DecisionAsk || source != "scope:outside" {
 		t.Fatalf("clone lost scope hook: %v (%s)", got, source)
+	}
+}
+
+func TestGate_PathScopeChecksResolvedSymlinkTarget(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(workspace, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("create scope escape symlink: %v", err)
+	}
+
+	inWorkspace := func(path string) bool {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return false
+		}
+		rel, err := filepath.Rel(workspace, abs)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+
+	for _, tc := range []struct {
+		tool string
+		path string
+	}{
+		{tool: "Read", path: filepath.Join(link, "secret.txt")},
+		{tool: "Write", path: filepath.Join(link, "new.txt")},
+	} {
+		g := New(ModeAcceptEdits)
+		g.SetPathScopeHook(inWorkspace)
+		g.SetReadOnlyHook(func(tool, _ string) bool { return tool == "Read" })
+		got, source := g.CheckPath(context.Background(), tc.tool, tc.path, tc.path)
+		if got != DecisionAsk || source != "scope:outside" {
+			t.Errorf("%s through workspace symlink = %v (%s), want scope ASK", tc.tool, got, source)
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,25 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
+
+type deferredAutoMemoryWriteTool struct{ autoMemoryWriteTool }
+
+func (deferredAutoMemoryWriteTool) ToolExposure() tools.ToolExposure {
+	return tools.ToolExposureDeferred
+}
+
+func TestSecureAutoMemoryWrapperPreservesExposure(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.Register(deferredAutoMemoryWriteTool{})
+	secured := secureAutoMemoryRegistry(reg, t.TempDir(), AutoMemorySource{}, nil)
+	write, ok := secured.Get("Write")
+	if !ok {
+		t.Fatal("secured Write is missing")
+	}
+	if got := tools.EffectiveExposure(write); got != tools.ToolExposureDeferred {
+		t.Fatalf("secured Write exposure = %q, want deferred", got)
+	}
+}
 
 func TestSecureAutoMemoryWriteRedactsBeforePrivateAtomicCommit(t *testing.T) {
 	root := t.TempDir()
@@ -114,6 +134,74 @@ func TestSecureAutoMemoryEditValidatesCompleteReplacement(t *testing.T) {
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("edited memo mode=%o, want 600", got)
 	}
+}
+
+func TestSecureAutoMemoryEditUsesBoundedPinnedRead(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "oversize.md")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxSecureAutoMemoryBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reg := tools.NewRegistry()
+	reg.Register(autoMemoryEditTool{})
+	edit, _ := secureAutoMemoryRegistry(reg, root, AutoMemorySource{}, nil).Get("Edit")
+	if _, err := edit.Execute(context.Background(), map[string]any{
+		"path": path, "old": "old", "new": "new",
+	}); err == nil || !strings.Contains(err.Error(), "byte limit") {
+		t.Fatalf("oversize pinned Edit error=%v, want bounded-read rejection", err)
+	}
+}
+
+func TestSecureAutoMemoryWriteRejectsRootAndLeafSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	newWrite := func(root string) tools.Tool {
+		reg := tools.NewRegistry()
+		reg.Register(autoMemoryWriteTool{})
+		write, _ := secureAutoMemoryRegistry(reg, root, AutoMemorySource{}, nil).Get("Write")
+		return write
+	}
+	memo := "---\nname: Safe\ndescription: safe\ntype: project\n---\n\nsafe body\n"
+	t.Run("root", func(t *testing.T) {
+		realRoot := t.TempDir()
+		alias := filepath.Join(t.TempDir(), "memory")
+		if err := os.Symlink(realRoot, alias); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newWrite(alias).Execute(context.Background(), map[string]any{
+			"path": filepath.Join(alias, "escaped.md"), "content": memo,
+		}); err == nil {
+			t.Fatal("secure auto-memory accepted a symlink root")
+		}
+		if _, err := os.Stat(filepath.Join(realRoot, "escaped.md")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("write escaped through root symlink: %v", err)
+		}
+	})
+	t.Run("leaf", func(t *testing.T) {
+		root := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "outside.md")
+		leaf := filepath.Join(root, "escaped.md")
+		if err := os.Symlink(outside, leaf); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newWrite(root).Execute(context.Background(), map[string]any{
+			"path": leaf, "content": memo,
+		}); err == nil {
+			t.Fatal("secure auto-memory accepted a dangling leaf symlink")
+		}
+		if _, err := os.Stat(outside); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("write followed dangling leaf symlink: %v", err)
+		}
+	})
 }
 
 func TestSecureAutoMemoryToolsEnforceSingleSessionTopicOwnership(t *testing.T) {

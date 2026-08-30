@@ -23,6 +23,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -110,8 +111,8 @@ func (l List) Execute(_ context.Context, _ map[string]any) (*tools.Result, error
 		r := row{
 			ID:          j.ID,
 			Status:      j.Status.String(),
-			Command:     j.Command,
-			Description: j.Description,
+			Command:     security.RedactSubprocessText(j.Command),
+			Description: security.RedactSubprocessText(j.Description),
 			StartTime:   j.StartTime.Format(time.RFC3339),
 			Elapsed:     end.Sub(j.StartTime).Truncate(time.Second).String(),
 		}
@@ -194,11 +195,11 @@ func (o Output) Execute(_ context.Context, in map[string]any) (*tools.Result, er
 	body, err := jobs.ReadJobOutput(j.OutputPath, tailMax)
 	if err != nil {
 		return &tools.Result{
-			Output:  fmt.Sprintf("[failed to read output for %s: %v]", id, err),
+			Output:  fmt.Sprintf("[failed to read output for %s: %s]", id, security.RedactSubprocessText(err.Error())),
 			IsError: true,
 		}, nil
 	}
-	body = normalizeCapturedOutput(body)
+	body = security.RedactSubprocessText(normalizeCapturedOutput(body))
 	end := j.EndTime
 	if end.IsZero() {
 		end = time.Now()

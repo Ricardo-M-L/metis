@@ -79,6 +79,26 @@ func validatePlanAgentInput(parentWasPlan bool, in map[string]any) error {
 	return nil
 }
 
+// validateAgentPermissionOverride prevents a child from manufacturing a more
+// permissive posture than the runtime boundary its parent already owns. In
+// particular, a default parent cannot safely request a bypass child: the
+// concrete tools and shared subprocess sandbox still belong to the parent
+// runtime. Users who want unattended multi-agent execution must enter bypass
+// at the top level first; children then inherit it without another prompt.
+func validateAgentPermissionOverride(parent permission.Mode, in map[string]any) error {
+	requested, hasRequested, err := requestedAgentPermissionMode(in)
+	if err != nil || !hasRequested {
+		return err
+	}
+	if agentPermissionModeEscalates(parent, requested) {
+		return fmt.Errorf(
+			"Agent permission_mode=%q cannot be more permissive than parent mode %q; change the top-level permission mode first",
+			requested, permission.CanonicalMode(string(parent)),
+		)
+	}
+	return nil
+}
+
 // planChildBlockedTool prevents a read-only planning child from changing its
 // own permission posture, invoking trusted Skill shell expansions, or
 // creating another agent whose permission context would be harder to audit.
@@ -134,23 +154,82 @@ func (t agentPermissionBoundTool) Concurrency(in map[string]any) tools.Concurren
 
 func (t agentPermissionBoundTool) IsEnabled() bool { return t.inner.IsEnabled() }
 
+func (t agentPermissionBoundTool) ToolExposure() tools.ToolExposure {
+	return tools.EffectiveExposure(t.inner)
+}
+
 func (t agentPermissionBoundTool) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	outerDecision := tools.PermissionAllow
+	outerSource := ""
 	if t.gate != nil {
 		decision, source := t.gate.Check(ctx, t.Name(), marshalAgentToolInput(in))
-		if decision != permission.DecisionAllow {
-			if source == "" {
-				source = "child permission gate"
-			} else {
-				source = "child permission gate: " + source
-			}
-			return mapDecision(decision), source
+		outerDecision = mapDecision(decision)
+		if outerDecision != tools.PermissionAllow {
+			outerSource = childPermissionReason(source)
+		}
+		if outerDecision == tools.PermissionDeny {
+			return outerDecision, outerSource
 		}
 	}
-	return t.inner.CanUse(ctx, in)
+
+	// ASK is not terminal here. Path-aware built-ins prepare their one-shot
+	// invocation binding inside CanUse; skipping the inner call means the user can
+	// approve the outer ASK only for Execute to fail with "permission binding
+	// missing". Run both policy layers, let either DENY win, and collapse one or
+	// two ASK decisions into the dispatcher's single approval prompt.
+	innerDecision, innerSource := t.inner.CanUse(ctx, in)
+	if innerDecision == tools.PermissionDeny {
+		return innerDecision, innerPermissionReason(innerSource)
+	}
+	if outerDecision == tools.PermissionAsk || innerDecision == tools.PermissionAsk {
+		return tools.PermissionAsk, combinePermissionReasons(outerSource, innerSource)
+	}
+	return tools.PermissionAllow, innerSource
+}
+
+func childPermissionReason(source string) string {
+	if strings.TrimSpace(source) == "" {
+		return "child permission gate"
+	}
+	return "child permission gate: " + source
+}
+
+func innerPermissionReason(source string) string {
+	if strings.TrimSpace(source) == "" {
+		return "tool permission gate"
+	}
+	return source
+}
+
+func combinePermissionReasons(outer, inner string) string {
+	outer = strings.TrimSpace(outer)
+	inner = strings.TrimSpace(inner)
+	switch {
+	case outer == "":
+		return inner
+	case inner == "":
+		return outer
+	case outer == inner:
+		return outer
+	default:
+		return outer + "; tool: " + inner
+	}
 }
 
 func (t agentPermissionBoundTool) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	return t.inner.Execute(ctx, in)
+}
+
+// PrepareAuthorizedInvocation delegates the structural, one-shot binding
+// needed by path-aware built-ins. A fork has already applied its own immutable
+// child gate before calling this method, so this must not re-enter either the
+// child or parent permission policy.
+func (t agentPermissionBoundTool) PrepareAuthorizedInvocation(ctx context.Context, in map[string]any) error {
+	preparer, ok := t.inner.(tools.InvocationPreparer)
+	if !ok {
+		return nil
+	}
+	return preparer.PrepareAuthorizedInvocation(ctx, in)
 }
 
 func marshalAgentToolInput(in map[string]any) string {
@@ -179,6 +258,10 @@ func (t agentPermissionBoundTool) IsBypassImmune(in map[string]any) (bool, strin
 	return tools.IsBypassImmune(t.inner, in)
 }
 
+func (t agentPermissionBoundTool) CanAutoAllowInBypass(in map[string]any) bool {
+	return tools.CanAutoAllowInBypass(t.inner, in)
+}
+
 func (t agentPermissionBoundTool) InterruptBehavior() tools.InterruptBehavior {
 	return tools.GetInterruptBehavior(t.inner)
 }
@@ -186,6 +269,8 @@ func (t agentPermissionBoundTool) InterruptBehavior() tools.InterruptBehavior {
 func (t agentPermissionBoundTool) MaxResultSizeChars() int {
 	return tools.MaxResultSizeChars(t.inner)
 }
+
+func (t agentPermissionBoundTool) TimeoutMs() int { return tools.TimeoutMs(t.inner) }
 
 func (t agentPermissionBoundTool) Aliases() []string { return pubtool.Aliases(t.inner) }
 

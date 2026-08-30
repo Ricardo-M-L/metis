@@ -84,7 +84,11 @@ func IsBlockedIP(ip net.IP) (bool, string) {
 	if v4 := ip.To4(); v4 != nil {
 		return isBlockedV4(v4)
 	}
-	return isBlockedV6(ip.To16())
+	v6 := ip.To16()
+	if v6 == nil {
+		return true, "invalid-ip"
+	}
+	return isBlockedV6(v6)
 }
 
 func isBlockedV4(ip net.IP) (bool, string) {
@@ -131,8 +135,8 @@ func isBlockedV6(ip net.IP) (bool, string) {
 // GuardedDialContext is a drop-in DialContext for *http.Transport that
 // resolves the hostname through Go's standard resolver, validates EVERY
 // returned IP against IsBlockedIP, and dials only the allowed ones.
-// On a fully-blocked hostname (every resolved IP in a private range)
-// it returns *BlockedError.
+// If any resolved address is blocked, it returns *BlockedError rather than
+// allowing a mixed public/private answer to become a rebinding path.
 //
 // IP literals in the address are validated directly without DNS — this
 // closes the "model passes 169.254.169.254 directly" hole.
@@ -141,6 +145,25 @@ func isBlockedV6(ip net.IP) (bool, string) {
 // no window between "resolver said it's public" and "socket connects to
 // some private IP" because we hand the literal IP to net.Dial.
 func GuardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return guardedDialContext(ctx, network, addr, net.DefaultResolver, netDial)
+}
+
+type ipAddrResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+type dialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+// guardedDialContext contains the resolver-to-dial binding used by
+// GuardedDialContext. Keeping the resolver and dialer explicit here lets tests
+// prove that a mixed public/private DNS answer is rejected before any socket
+// is opened; production always supplies net.DefaultResolver and netDial.
+func guardedDialContext(
+	ctx context.Context,
+	network, addr string,
+	resolver ipAddrResolver,
+	dial dialContextFunc,
+) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -150,7 +173,7 @@ func GuardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 		if blocked, why := IsBlockedIP(ip); blocked {
 			return nil, &BlockedError{Hostname: host, Address: ip.String(), Reason: why}
 		}
-		return netDial(ctx, network, net.JoinHostPort(ip.String(), port))
+		return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
 	// Hostname: resolve and validate every result. Use the default
 	// resolver (respects /etc/hosts, NSS, mDNS), then dial the first
@@ -158,7 +181,7 @@ func GuardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	// http.Transport default behaviour.
 	rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
 	defer rcancel()
-	addrs, err := net.DefaultResolver.LookupIPAddr(rctx, host)
+	addrs, err := resolver.LookupIPAddr(rctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +203,7 @@ func GuardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	if strings.Contains(first, ":") {
 		first = "[" + first + "]"
 	}
-	return netDial(ctx, network, first+":"+port)
+	return dial(ctx, network, first+":"+port)
 }
 
 // netDial is split out so tests can stub it. Default just calls

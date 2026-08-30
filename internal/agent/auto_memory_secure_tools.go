@@ -39,6 +39,10 @@ func (t secureAutoMemoryTool) ShortDescription() string {
 	return tools.DescriptionFor(t.Tool, true)
 }
 
+func (t secureAutoMemoryTool) ToolExposure() tools.ToolExposure {
+	return tools.EffectiveExposure(t.Tool)
+}
+
 func (t secureAutoMemoryTool) IsDestructive(map[string]any) bool { return true }
 
 func (t secureAutoMemoryTool) Execute(ctx context.Context, input map[string]any) (*tools.Result, error) {
@@ -63,7 +67,7 @@ func (t secureAutoMemoryTool) Execute(ctx context.Context, input map[string]any)
 			return nil, fmt.Errorf("Write: content too large: %d bytes exceeds %d byte cap", len(content), maxSecureAutoMemoryBytes)
 		}
 	case "Edit":
-		content, expectedSHA256, err = secureAutoMemoryEditContent(target, input)
+		content, expectedSHA256, err = secureAutoMemoryEditContent(t.root, target, input)
 		if err != nil {
 			return nil, err
 		}
@@ -94,7 +98,11 @@ func (t secureAutoMemoryTool) Execute(ctx context.Context, input map[string]any)
 		if prepareErr != nil {
 			return nil, fmt.Errorf("%s %s: %w", t.Name(), target, prepareErr)
 		}
-		if err := atomicWritePrivateMemo(target, prepared); err != nil {
+		relative, relativeErr := memdir.RootRelativePath(t.root, target)
+		if relativeErr != nil {
+			return nil, fmt.Errorf("%s %s: %w", t.Name(), target, relativeErr)
+		}
+		if err := memdir.AtomicWritePrivateFile(t.root, relative, prepared, 0o600); err != nil {
 			return nil, err
 		}
 	}
@@ -127,7 +135,7 @@ func secureAutoMemoryRegistry(reg *tools.Registry, root string, source AutoMemor
 	return secured
 }
 
-func secureAutoMemoryEditContent(path string, input map[string]any) (string, string, error) {
+func secureAutoMemoryEditContent(root, path string, input map[string]any) (string, string, error) {
 	old := autoMemoryStringField(input, "old", "old_string")
 	newValue := autoMemoryStringField(input, "new", "new_string")
 	if old == "" {
@@ -136,17 +144,11 @@ func secureAutoMemoryEditContent(path string, input map[string]any) (string, str
 	if old == newValue {
 		return "", "", errors.New("Edit: old and new are identical")
 	}
-	info, err := os.Stat(path)
+	relative, err := memdir.RootRelativePath(root, path)
 	if err != nil {
 		return "", "", err
 	}
-	if !info.Mode().IsRegular() {
-		return "", "", fmt.Errorf("Edit: %s is not a regular file", path)
-	}
-	if info.Size() > maxSecureAutoMemoryBytes {
-		return "", "", fmt.Errorf("Edit: file too large: %d bytes exceeds %d byte cap", info.Size(), maxSecureAutoMemoryBytes)
-	}
-	raw, err := os.ReadFile(path)
+	raw, err := memdir.ReadPrivateRegularFile(root, relative, maxSecureAutoMemoryBytes)
 	if err != nil {
 		return "", "", err
 	}
@@ -220,44 +222,9 @@ func prepareSecureAutoMemoryMemo(content string, source AutoMemorySource) ([]byt
 	return memdir.RenderFile(fm, string(body))
 }
 
-func atomicWritePrivateMemo(path string, content []byte) (err error) {
-	dir := filepath.Dir(path)
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".auto-memory-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	// Apply the final permission before writing even the first byte. The rename
-	// preserves this inode, so neither temp nor destination is ever 0644.
-	if err := tmp.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := tmp.Write(content); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	return os.Chmod(path, 0o600)
-}
-
-// secureAutoMemoryTarget resolves the configured root once, then walks any
-// nested parent one component at a time. Symlink components and non-regular
-// existing targets are rejected so a memory-only writer cannot be redirected
-// into another part of the user's filesystem.
+// secureAutoMemoryTarget performs only the model-visible path validation.
+// The authoritative read/write subsequently walks and pins each directory via
+// os.Root, rejecting symlink components and leaf replacements at use time.
 func secureAutoMemoryTarget(root, candidate string) (string, error) {
 	if strings.TrimSpace(root) == "" || strings.TrimSpace(candidate) == "" {
 		return "", errors.New("auto-memory: empty root or target")
@@ -265,25 +232,25 @@ func secureAutoMemoryTarget(root, candidate string) (string, error) {
 	if !filepath.IsAbs(candidate) {
 		return "", errors.New("auto-memory: target path must be absolute")
 	}
-	if err := memdir.EnsureRoot(root); err != nil {
-		return "", err
-	}
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(rootAbs)
+	if err := os.MkdirAll(rootAbs, 0o700); err != nil {
+		return "", err
+	}
+	rootInfo, err := os.Lstat(rootAbs)
 	if err != nil {
 		return "", err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return "", fmt.Errorf("auto-memory: root is not a real directory: %s", rootAbs)
 	}
 	candidateAbs, err := filepath.Abs(candidate)
 	if err != nil {
 		return "", err
 	}
 	rel, ok := relativeMemoryTarget(rootAbs, candidateAbs)
-	if !ok {
-		rel, ok = relativeMemoryTarget(resolvedRoot, candidateAbs)
-	}
 	if !ok || rel == "." {
 		return "", fmt.Errorf("auto-memory: target %q is outside memory root", candidate)
 	}
@@ -294,31 +261,7 @@ func secureAutoMemoryTarget(root, candidate string) (string, error) {
 		return "", errors.New("auto-memory: MEMORY.md is generated and cannot be written directly")
 	}
 
-	parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
-	parent := resolvedRoot
-	for _, part := range parts[:len(parts)-1] {
-		if part == "" || part == "." || part == ".." {
-			return "", errors.New("auto-memory: invalid target path component")
-		}
-		parent = filepath.Join(parent, part)
-		info, statErr := os.Lstat(parent)
-		if errors.Is(statErr, os.ErrNotExist) {
-			if err := os.Mkdir(parent, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-				return "", err
-			}
-			info, statErr = os.Lstat(parent)
-		}
-		if statErr != nil {
-			return "", statErr
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return "", fmt.Errorf("auto-memory: target parent %s is not a private directory", parent)
-		}
-		if err := os.Chmod(parent, 0o700); err != nil {
-			return "", err
-		}
-	}
-	target := filepath.Join(resolvedRoot, rel)
+	target := filepath.Join(rootAbs, rel)
 	if info, statErr := os.Lstat(target); statErr == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return "", fmt.Errorf("auto-memory: target %s is not a regular file", target)

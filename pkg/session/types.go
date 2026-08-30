@@ -13,6 +13,15 @@ package session
 
 import "time"
 
+const (
+	// SystemPromptKindDefault marks a Metis-managed prompt that may be safely
+	// rebuilt when provider, workspace, or model-visible tools change.
+	SystemPromptKindDefault = "default"
+	// SystemPromptKindCustom marks an opaque prompt supplied by a user, simple
+	// mode, or an agent profile. Runtime prompt rebinding must preserve it.
+	SystemPromptKindCustom = "custom"
+)
+
 // Header is the session-level metadata persisted as the first entry of
 // every JSONL session file. Subsequent SetTitle calls append a partial
 // header; the on-load merge is documented in internal/session.
@@ -22,8 +31,18 @@ type Header struct {
 	Provider  string    `json:"provider,omitempty"`
 	Model     string    `json:"model"`
 	System    string    `json:"system,omitempty"`
-	WorkDir   string    `json:"work_dir,omitempty"`
-	Mode      string    `json:"mode,omitempty"`
+	// SystemPromptKind records whether System is a generated default or opaque
+	// user/profile text. Empty means a legacy/unknown prompt and is treated as
+	// custom so upgrades never rewrite user-authored content heuristically.
+	SystemPromptKind string `json:"system_prompt_kind,omitempty"`
+	WorkDir          string `json:"work_dir,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	// PrePlanMode records the canonical permission posture that must be
+	// restored when a persisted plan-mode session exits plan mode. It is only
+	// meaningful when Mode is "plan"; resume rejects any other combination so
+	// a hand-edited session file cannot smuggle a stale bypass lineage into a
+	// non-plan session.
+	PrePlanMode string `json:"pre_plan_mode,omitempty"`
 	// Effort stores the reasoning dial for faithful Desktop resume. The
 	// literal "default" represents the provider default; using a non-empty
 	// sentinel lets a later header clear a previously selected low/high value.

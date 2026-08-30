@@ -1,9 +1,60 @@
 package security
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestRedactFastPathCoversEverySecretRule(t *testing.T) {
+	samples := map[string]string{
+		"aws-access-token":              "AKIA" + strings.Repeat("A", 16),
+		"gcp-api-key":                   "AIza" + strings.Repeat("a", 35),
+		"digitalocean-pat":              "dop_v1_" + strings.Repeat("a", 64),
+		"digitalocean-access-token":     "doo_v1_" + strings.Repeat("b", 64),
+		"anthropic-api-key":             "sk-ant-api03-" + strings.Repeat("A", 93) + "AA",
+		"anthropic-admin-api-key":       "sk-ant-admin01-" + strings.Repeat("B", 93) + "AA",
+		"openai-api-key":                "sk-proj-" + strings.Repeat("A", 74) + "T3BlbkFJ" + strings.Repeat("B", 74),
+		"openai-legacy-api-key":         "sk-" + strings.Repeat("a", 20) + "T3BlbkFJ" + strings.Repeat("b", 20),
+		"huggingface-access-token":      "hf_" + strings.Repeat("a", 34),
+		"github-pat":                    "ghp_" + strings.Repeat("a", 36),
+		"github-fine-grained-pat":       "github_pat_" + strings.Repeat("A", 82),
+		"github-app-token":              "ghu_" + strings.Repeat("a", 36),
+		"github-oauth":                  "gho_" + strings.Repeat("a", 36),
+		"github-refresh-token":          "ghr_" + strings.Repeat("a", 36),
+		"gitlab-pat":                    "glpat-" + strings.Repeat("a", 20),
+		"gitlab-deploy-token":           "gldt-" + strings.Repeat("a", 20),
+		"slack-bot-token":               "xoxb-1234567890-1234567890-abcdef",
+		"slack-user-token":              "xoxp-1234567890-1234567890-1234567890-" + strings.Repeat("a", 28),
+		"twilio-api-key":                "SK" + strings.Repeat("a", 32),
+		"sendgrid-api-token":            "SG." + strings.Repeat("a", 66),
+		"npm-access-token":              "npm_" + strings.Repeat("a", 36),
+		"pypi-upload-token":             "pypi-AgEIcHlwaS5vcmc" + strings.Repeat("a", 50),
+		"databricks-api-token":          "dapi" + strings.Repeat("a", 32),
+		"pulumi-api-token":              "pul-" + strings.Repeat("a", 40),
+		"grafana-cloud-api-token":       "glc_" + strings.Repeat("A", 32),
+		"grafana-service-account-token": "glsa_" + strings.Repeat("A", 32) + "_" + strings.Repeat("a", 8),
+		"sentry-user-token":             "sntryu_" + strings.Repeat("a", 64),
+		"stripe-access-token":           "sk_test_" + strings.Repeat("a", 20),
+		"shopify-access-token":          "shpat_" + strings.Repeat("a", 32),
+		"shopify-shared-secret":         "shpss_" + strings.Repeat("a", 32),
+		"bearer-token":                  "Bearer " + strings.Repeat("A", 20),
+		"private-key-pem":               "-----BEGIN PRIVATE KEY-----\n" + strings.Repeat("A", 64) + "\n-----END PRIVATE KEY-----",
+	}
+
+	for _, rule := range secretRules {
+		sample, ok := samples[rule.id]
+		if !ok {
+			t.Fatalf("missing representative sample for rule %q", rule.id)
+		}
+		if !regexp.MustCompile(rule.source).MatchString(sample) {
+			t.Fatalf("sample for %q does not match its rule", rule.id)
+		}
+		if got := Redact(sample); got == sample {
+			t.Fatalf("Redact fast path skipped rule %q", rule.id)
+		}
+	}
+}
 
 // ─── Layer 1: SENSITIVE_TOKEN_RE (JSON token-key matcher) ────────
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -107,6 +108,66 @@ func TestPermissionSettingKeepsPlanGateAndLoopInSync(t *testing.T) {
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewBufferString(`{"changes":[{"key":"ui.thinking_display","value":"show"}]}`)))
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"ui.thinking_display"`)) {
 		t.Fatalf("thinking display = %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPermissionSettingRejectsBypassWhenRuntimeBoundaryUnavailable(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	gate := permission.New(permission.ModeDefault)
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, tools.NewRegistry(), gate, nil, "system", 2)
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		SetPermissionMode: func(mode permission.Mode) error {
+			if mode == permission.ModeBypassPermissions {
+				return errors.New("credential isolation unavailable")
+			}
+			gate.SetMode(mode)
+			return nil
+		},
+	})
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewBufferString(`{"changes":[{"key":"permission.mode","value":"bypassPermissions"}]}`)))
+	if rr.Code != http.StatusConflict || gate.Mode() != permission.ModeDefault {
+		t.Fatalf("bypass rejection = %d gate=%q body=%s", rr.Code, gate.Mode(), rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	if rr.Code != http.StatusOK || bytes.Contains(rr.Body.Bytes(), []byte(`"value":"bypassPermissions"`)) {
+		t.Fatalf("rejected bypass was persisted: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPermissionSettingSaveFailureRestoresPlanLineage(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := os.Mkdir(filepath.Join(home, "config.toml"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := permission.New(permission.ModePlan)
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, tools.NewRegistry(), gate, nil, "system", 2)
+	loop.SetPlanMode(true)
+	loop.SetPrePlanMode(string(permission.ModeDefault))
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewBufferString(`{"changes":[{"key":"permission.mode","value":"acceptEdits"}]}`)))
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("save status = %d, want 500: %s", rr.Code, rr.Body.String())
+	}
+	if gate.Mode() != permission.ModePlan || !loop.IsPlanMode() {
+		t.Fatalf("failed save did not restore plan posture: gate=%q plan=%v", gate.Mode(), loop.IsPlanMode())
+	}
+	if got := loop.PrePlanMode(); got != string(permission.ModeDefault) {
+		t.Fatalf("failed save rewrote plan lineage to %q", got)
 	}
 }
 

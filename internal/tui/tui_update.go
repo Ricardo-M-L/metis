@@ -161,6 +161,13 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		m.handleUpdateCheckResult(result)
 		return m, nil
 	}
+	// OAuth completion is lifecycle state, not modal input. Handle it before
+	// activeScreen so opening help/settings while the browser is up cannot
+	// swallow the result and leave the pending/cancel guard stuck.
+	if result, ok := msg.(mcpLoginResultMsg); ok {
+		m.handleMCPLoginResult(result)
+		return m, nil
+	}
 
 	// Active full-window screen (e.g. /history) takes over input + view.
 	// We still let WindowSizeMsg reach the main chat so the underlying

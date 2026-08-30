@@ -7,6 +7,7 @@ package mcp
 // mcp_lazy_test.go where we can mock the spawn closure cleanly.
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -65,7 +66,8 @@ func TestFingerprintEntry_StableForIdenticalInput(t *testing.T) {
 func TestFingerprintEntry_ChangesOnAnyField(t *testing.T) {
 	base := ServerEntry{
 		Command: "a", Args: []string{"x"}, URL: "u",
-		Headers: map[string]string{"h": "1"},
+		Headers: map[string]string{"h": "1"}, Env: map[string]string{"E": "1"},
+		Auth: "static", EnabledTools: []string{"one"}, DisabledTools: []string{"two"},
 	}
 	baseFP := FingerprintEntry(base)
 	mutants := []struct {
@@ -77,6 +79,12 @@ func TestFingerprintEntry_ChangesOnAnyField(t *testing.T) {
 		{"args-additional", func(e *ServerEntry) { e.Args = []string{"x", "extra"} }},
 		{"url", func(e *ServerEntry) { e.URL = "v" }},
 		{"working directory", func(e *ServerEntry) { e.WorkingDir = "plugin-root" }},
+		{"auth", func(e *ServerEntry) { e.Auth = "oauth" }},
+		{"env-value", func(e *ServerEntry) { e.Env = map[string]string{"E": "2"} }},
+		{"env-key", func(e *ServerEntry) { e.Env = map[string]string{"F": "1"} }},
+		{"enabled-tools", func(e *ServerEntry) { e.EnabledTools = []string{"other"} }},
+		{"disabled-tools", func(e *ServerEntry) { e.DisabledTools = []string{"other"} }},
+		{"disabled", func(e *ServerEntry) { e.Disabled = true }},
 		{"header-value", func(e *ServerEntry) { e.Headers = map[string]string{"h": "2"} }},
 		{"header-key", func(e *ServerEntry) { e.Headers = map[string]string{"j": "1"} }},
 		{"header-extra", func(e *ServerEntry) { e.Headers = map[string]string{"h": "1", "k": "2"} }},
@@ -100,6 +108,24 @@ func TestFingerprintEntry_NameNotIncluded(t *testing.T) {
 	b := ServerEntry{Name: "new", Command: "c"}
 	if FingerprintEntry(a) != FingerprintEntry(b) {
 		t.Errorf("rename shouldn't change fingerprint")
+	}
+}
+
+func TestFingerprintEntry_MapAndFilterOrderDoesNotMatter(t *testing.T) {
+	a := ServerEntry{
+		Command:      "server",
+		Headers:      map[string]string{"A": "1", "B": "2"},
+		Env:          map[string]string{"C": "3", "D": "4"},
+		EnabledTools: []string{"one", "two"}, DisabledTools: []string{"three", "four"},
+	}
+	b := ServerEntry{
+		Command:      "server",
+		Headers:      map[string]string{"B": "2", "A": "1"},
+		Env:          map[string]string{"D": "4", "C": "3"},
+		EnabledTools: []string{"two", "one"}, DisabledTools: []string{"four", "three"},
+	}
+	if got, want := FingerprintEntry(a), FingerprintEntry(b); got != want {
+		t.Fatalf("equivalent map/set ordering changed fingerprint:\n%s\n%s", got, want)
 	}
 }
 
@@ -136,6 +162,25 @@ func TestLoadMCPCache_MalformedJSONErrors(t *testing.T) {
 	}
 }
 
+func TestLoadMCPCache_RejectsLegacyUnredactedVersion(t *testing.T) {
+	dir := setMetisHome(t)
+	cacheDir := filepath.Join(dir, "mcp-cache")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":2,"fingerprint":"sha256:legacy","tools":[{"name":"x","description":"possibly-secret"}]}`
+	if err := os.WriteFile(CachePath("legacy"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadCache("legacy")
+	if err != nil {
+		t.Fatalf("load legacy cache: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("legacy cache without current redaction version was accepted: %+v", got)
+	}
+}
+
 // TestSaveLoadMCPCache_RoundTrip — write + read returns the same
 // data. Tests both the JSON shape stays stable and the file
 // permissions / location are correct.
@@ -153,6 +198,9 @@ func TestSaveLoadMCPCache_RoundTrip(t *testing.T) {
 	}
 	if want.CachedAt == "" {
 		t.Errorf("SaveCache should populate CachedAt; got empty")
+	}
+	if want.Version != cacheFormatVersion {
+		t.Errorf("SaveCache version = %d, want %d", want.Version, cacheFormatVersion)
 	}
 	got, err := LoadCache("svr")
 	if err != nil {
@@ -253,5 +301,137 @@ func TestParseLazyMCPMode(t *testing.T) {
 		if got := ParseLazyMode(c.in); got != c.want {
 			t.Errorf("ParseLazyMode(%q) = %d, want %d", c.in, got, c.want)
 		}
+	}
+}
+
+func writeCacheFixture(t *testing.T, serverName string, cache *Cache) {
+	t.Helper()
+	if err := os.MkdirAll(CacheDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(CachePath(serverName), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCacheAPIsRejectUnsafeServerNames(t *testing.T) {
+	home := setMetisHome(t)
+	outside := filepath.Join(home, "escape.json")
+	legacyTraversalTarget := &Cache{
+		Version: cacheFormatVersion,
+		Tools:   []CachedTool{{Name: "must-not-load"}},
+	}
+	raw, err := json.Marshal(legacyTraversalTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"../escape", `..\\escape`, "contains space", "line\nbreak", "中文", ".", ".."} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := LoadCache(name); err == nil || got != nil {
+				t.Fatalf("LoadCache(%q) = (%+v, %v), want rejection", name, got, err)
+			}
+			if err := SaveCache(name, &Cache{}); err == nil {
+				t.Fatalf("SaveCache(%q) unexpectedly succeeded", name)
+			}
+		})
+	}
+}
+
+func TestCachePathFailsClosedForUnsafeServerName(t *testing.T) {
+	setMetisHome(t)
+	if got := CachePath("../escape"); got != "" {
+		t.Fatalf("CachePath returned traversable path %q for unsafe server name", got)
+	}
+}
+
+func TestLoadCacheRejectsOversizedFile(t *testing.T) {
+	setMetisHome(t)
+	if err := os.MkdirAll(CacheDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oversized := bytes.Repeat([]byte("x"), maxCacheFileBytes+1)
+	if err := os.WriteFile(CachePath("oversized"), oversized, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadCache("oversized"); err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("oversized cache error = %v, want explicit size-limit rejection", err)
+	}
+}
+
+func TestCacheRejectsTooManyToolsOnLoadAndSave(t *testing.T) {
+	setMetisHome(t)
+	cache := &Cache{Version: cacheFormatVersion, Tools: make([]CachedTool, maxCachedTools+1)}
+	for i := range cache.Tools {
+		cache.Tools[i] = CachedTool{Name: "tool", InputSchema: map[string]any{"type": "object"}}
+	}
+	writeCacheFixture(t, "many-tools", cache)
+	if _, err := LoadCache("many-tools"); err == nil {
+		t.Fatal("cache with too many tools unexpectedly loaded")
+	}
+	if err := SaveCache("many-tools-save", cache); err == nil {
+		t.Fatal("cache with too many tools unexpectedly saved")
+	}
+}
+
+func TestCacheRejectsOversizedDescriptionOnLoadAndSave(t *testing.T) {
+	setMetisHome(t)
+	cache := &Cache{Version: cacheFormatVersion, Tools: []CachedTool{{
+		Name:        "tool",
+		Description: strings.Repeat("d", maxCachedToolDescriptionBytes+1),
+		InputSchema: map[string]any{"type": "object"},
+	}}}
+	writeCacheFixture(t, "large-description", cache)
+	if _, err := LoadCache("large-description"); err == nil {
+		t.Fatal("cache with oversized description unexpectedly loaded")
+	}
+	if err := SaveCache("large-description-save", cache); err == nil {
+		t.Fatal("cache with oversized description unexpectedly saved")
+	}
+}
+
+func TestCacheRejectsOversizedSchemaOnLoadAndSave(t *testing.T) {
+	setMetisHome(t)
+	cache := &Cache{Version: cacheFormatVersion, Tools: []CachedTool{{
+		Name: "tool",
+		InputSchema: map[string]any{
+			"type": "object",
+			"blob": strings.Repeat("s", maxCachedToolSchemaBytes+1),
+		},
+	}}}
+	writeCacheFixture(t, "large-schema", cache)
+	if _, err := LoadCache("large-schema"); err == nil {
+		t.Fatal("cache with oversized schema unexpectedly loaded")
+	}
+	if err := SaveCache("large-schema-save", cache); err == nil {
+		t.Fatal("cache with oversized schema unexpectedly saved")
+	}
+}
+
+func TestCacheRejectsOversizedDecodedPayloadOnLoadAndSave(t *testing.T) {
+	setMetisHome(t)
+	cache := &Cache{Version: cacheFormatVersion, Fingerprint: "sha256:test"}
+	for i := 0; i < (maxCacheDecodedBytes/maxCachedToolSchemaBytes)+1; i++ {
+		cache.Tools = append(cache.Tools, CachedTool{
+			Name: "tool",
+			InputSchema: map[string]any{
+				"type": "object",
+				"blob": strings.Repeat("t", maxCachedToolSchemaBytes-256),
+			},
+		})
+	}
+	writeCacheFixture(t, "large-total", cache)
+	if _, err := LoadCache("large-total"); err == nil {
+		t.Fatal("cache with oversized decoded payload unexpectedly loaded")
+	}
+	if err := SaveCache("large-total-save", cache); err == nil {
+		t.Fatal("cache with oversized decoded payload unexpectedly saved")
 	}
 }

@@ -14,7 +14,41 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+func TestAskUser_CanUseBypassIsSilentlyDenied(t *testing.T) {
+	tool := AskUser{gate: permission.New(permission.ModeBypassPermissions)}
+	got, reason := tool.CanUse(context.Background(), map[string]any{"question": "pick one"})
+	if got != tools.PermissionDeny {
+		t.Fatalf("CanUse = %v (%s), want DENY in bypassPermissions", got, reason)
+	}
+}
+
+func TestAskUser_BypassPlanLineageIsSilentlyDenied(t *testing.T) {
+	gate := permission.New(permission.ModePlan)
+	tool := AskUser{gate: gate}
+	ctrl := &stubPlanController{on: true, pre: string(permission.ModeBypassPermissions)}
+	ctx := agent.WithPlanController(context.Background(), ctrl)
+
+	got, reason := tool.CanUse(ctx, map[string]any{"question": "pick one"})
+	if got != tools.PermissionDeny {
+		t.Fatalf("CanUse = %v (%s), want DENY for bypass-origin plan", got, reason)
+	}
+
+	events := make(chan agent.Event, 1)
+	ctx = agent.WithEventOut(ctx, events)
+	res, err := tool.Execute(ctx, map[string]any{"question": "pick one"})
+	if err != nil || res == nil || !res.IsError {
+		t.Fatalf("Execute = (%+v, %v), want structured unattended error", res, err)
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("bypass-origin plan must not emit UI event: %+v", ev)
+	default:
+	}
+}
 
 func TestAskUser_HeadlessReturnsStructuredError(t *testing.T) {
 	tool := AskUser{}

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -54,6 +55,57 @@ func TestBuildDreamRegistry_EmptySkillsDirReturnsParent(t *testing.T) {
 	}
 	if _, ok := dream.Get("SkillSynth"); ok {
 		t.Errorf("SkillSynth must not appear when skillsDir is empty")
+	}
+}
+
+type deferredDreamTool struct{ *stubTool }
+
+func (deferredDreamTool) ToolExposure() tools.ToolExposure { return tools.ToolExposureDeferred }
+
+func TestToolSpecsFromRegistryPreservesExposureAndLazyProjection(t *testing.T) {
+	t.Setenv("ENABLE_TOOL_SEARCH", "true")
+	reg := tools.NewRegistry()
+	reg.Register(&stubTool{name: "Read"})
+	reg.Register(deferredDreamTool{&stubTool{name: "remote_docs"}})
+
+	specs := toolSpecsFromRegistry(reg, false, 200_000, nil)
+	var directOK, deferredOK, searchOK bool
+	for _, spec := range specs {
+		switch spec.Name {
+		case "Read":
+			directOK = spec.Exposure == string(tools.ToolExposureDirect)
+		case "remote_docs":
+			deferredOK = spec.Exposure == string(tools.ToolExposureDeferred) && isLazyPlaceholderSpec(spec)
+		case "ToolSearch":
+			searchOK = spec.Exposure == string(tools.ToolExposureDeferred)
+		}
+	}
+	if !directOK || !deferredOK || !searchOK {
+		t.Fatalf("dream tool projection mismatch: %+v", specs)
+	}
+}
+
+type fatDeferredDreamTool struct{ *stubTool }
+
+func (fatDeferredDreamTool) ToolExposure() tools.ToolExposure { return tools.ToolExposureDeferred }
+func (fatDeferredDreamTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object", "description": strings.Repeat("x", 4000)}
+}
+
+func TestToolSpecsFromRegistryAutoUsesParentContextWindow(t *testing.T) {
+	t.Setenv("ENABLE_TOOL_SEARCH", "auto:1")
+	reg := tools.NewRegistry()
+	reg.Register(&stubTool{name: "Read"})
+	reg.Register(fatDeferredDreamTool{&stubTool{name: "remote_docs"}})
+
+	specs := toolSpecsFromRegistry(reg, false, 16_000, nil)
+	if !containsName(specs, "ToolSearch") {
+		t.Fatalf("Auto projection ignored parent context window: %+v", specs)
+	}
+	for _, spec := range specs {
+		if spec.Name == "remote_docs" && !isLazyPlaceholderSpec(spec) {
+			t.Fatalf("Auto projection republished full deferred schema: %+v", spec.InputSchema)
+		}
 	}
 }
 

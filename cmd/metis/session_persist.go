@@ -7,10 +7,10 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
-var writeFreshSessionHeader = rtpkg.WriteFreshHeader
+var writeFreshSessionHeader = rtpkg.WriteFreshHeaderWithPromptKind
 
-func persistFreshSessionHeader(store *session.Store, sessionID, provider, model, system, mode string) error {
-	if err := writeFreshSessionHeader(store, sessionID, provider, model, system, mode); err != nil {
+func persistFreshSessionHeader(store *session.Store, sessionID, provider, model, system, promptKind, mode string) error {
+	if err := writeFreshSessionHeader(store, sessionID, provider, model, system, promptKind, mode); err != nil {
 		return fmt.Errorf("persist fresh session header for %s: %w", sessionID, err)
 	}
 	return nil

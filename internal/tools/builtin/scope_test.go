@@ -9,6 +9,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // resetScopeCache clears the per-dir worktree-detection cache so a
@@ -114,6 +119,113 @@ func TestWalkBudget_InWorktreeReturnsZeroes(t *testing.T) {
 func TestInsideGitWorktree_EmptyDirReturnsFalse(t *testing.T) {
 	if insideGitWorktree("") {
 		t.Errorf("empty dir should not be reported as inside a worktree")
+	}
+}
+
+func TestNewScopeGitCommandUsesRestrictedEnvironmentAndBoundedCancellation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Setenv("OPENAI_API_KEY", "scope-must-not-inherit-this")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd, err := newScopeGitCommand(ctx, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(cmd.Env, "\n")
+	if strings.Contains(joined, "OPENAI_API_KEY=") || strings.Contains(joined, "scope-must-not-inherit-this") {
+		t.Fatalf("scope git inherited provider credentials: %s", joined)
+	}
+	for _, want := range []string{"AGENT=metis", "AI_AGENT=metis", "METIS=1"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("scope git env missing %q: %v", want, cmd.Env)
+		}
+	}
+	if cmd.Cancel == nil {
+		t.Fatal("scope git command has no process-tree cancellation hook")
+	}
+	if cmd.WaitDelay != scopeProcessWaitLimit {
+		t.Fatalf("scope git WaitDelay = %s, want %s", cmd.WaitDelay, scopeProcessWaitLimit)
+	}
+}
+
+func TestInsideGitWorktreeSandboxWrapFailureFailsClosed(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	resetScopeCache(t)
+	dir := t.TempDir()
+	if err := exec.Command("git", "-C", dir, "init", "--quiet").Run(); err != nil {
+		t.Skipf("git init failed: %v", err)
+	}
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if insideGitWorktreeWithSandbox(dir, manager) {
+		t.Fatal("closed sandbox manager must fail closed instead of running git unsandboxed")
+	}
+}
+
+func TestScopeToolsRetainSandboxManager(t *testing.T) {
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	gate := permission.New(permission.ModeBypassPermissions)
+
+	checks := []struct {
+		name string
+		got  *sandbox.Manager
+	}{
+		{name: "NewLSWithSandbox", got: NewLSWithSandbox(gate, manager).SandboxManager()},
+		{name: "LS.WithSandbox", got: NewLS(gate).WithSandbox(manager).SandboxManager()},
+		{name: "NewGlobWithSandbox", got: NewGlobWithSandbox(gate, manager).SandboxManager()},
+		{name: "Glob.WithSandbox", got: NewGlob(gate).WithSandbox(manager).SandboxManager()},
+		{name: "NewGrepWithSandbox", got: NewGrepWithSandbox(gate, manager).SandboxManager()},
+		{name: "Grep.WithSandbox", got: NewGrep(gate).WithSandbox(manager).SandboxManager()},
+	}
+	for _, check := range checks {
+		if check.got != manager {
+			t.Errorf("%s manager = %p, want %p", check.name, check.got, manager)
+		}
+	}
+}
+
+func TestRegisterWithSandboxInjectsManagerIntoScopeTools(t *testing.T) {
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	cfg := &config.Config{}
+	cfg.Session.SkillDir = filepath.Join(t.TempDir(), "skills")
+	cfg.Session.Dir = filepath.Join(t.TempDir(), "session")
+	registry := tools.NewRegistry()
+	RegisterWithSandbox(registry, cfg, permission.New(permission.ModeBypassPermissions), manager)
+
+	checks := []struct {
+		name string
+		get  func(tools.Tool) *sandbox.Manager
+	}{
+		{name: "LS", get: func(tool tools.Tool) *sandbox.Manager { return tool.(LS).SandboxManager() }},
+		{name: "Glob", get: func(tool tools.Tool) *sandbox.Manager { return tool.(Glob).SandboxManager() }},
+		{name: "Grep", get: func(tool tools.Tool) *sandbox.Manager { return tool.(Grep).SandboxManager() }},
+	}
+	for _, check := range checks {
+		registered, ok := registry.Get(check.name)
+		if !ok {
+			t.Fatalf("%s was not registered", check.name)
+		}
+		if got := check.get(registered); got != manager {
+			t.Errorf("registered %s manager = %p, want %p", check.name, got, manager)
+		}
 	}
 }
 

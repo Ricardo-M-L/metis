@@ -41,6 +41,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tasks"
 	tui "github.com/Ricardo-M-L/metis/internal/tui"
 	metisversion "github.com/Ricardo-M-L/metis/internal/version"
+	pubsess "github.com/Ricardo-M-L/metis/pkg/session"
 	"github.com/google/uuid"
 )
 
@@ -84,39 +85,44 @@ type Server struct {
 	askMu        sync.Mutex
 	pendingAsks  map[string]*askPending
 
-	stateMu            sync.RWMutex
-	activeSessionID    string
-	activeProviderName string
-	activeModel        string
-	activePreset       string
-	activeWorkDir      string
-	freshWorkDir       string
-	memoryBinding      *rtpkg.WorkspaceMemoryBinding
-	memoryBindingErr   error
+	stateMu                sync.RWMutex
+	activeSessionID        string
+	activeProviderName     string
+	activeModel            string
+	activePreset           string
+	activeSystemPromptKind string
+	activeWorkDir          string
+	freshWorkDir           string
+	memoryBinding          *rtpkg.WorkspaceMemoryBinding
+	memoryBindingErr       error
 
-	freshProviderName   string
-	freshModel          string
-	freshSystem         string
-	freshSystemSections []llm.SystemSection
-	freshPermissionMode permission.Mode
-	freshPreset         string
+	freshProviderName     string
+	freshModel            string
+	freshSystem           string
+	freshSystemSections   []llm.SystemSection
+	freshSystemPromptKind string
+	freshPermissionMode   permission.Mode
+	freshPreset           string
 
-	buildProvider    func(providerName, model string) (*rtpkg.ProviderBuild, error)
-	sessionBoundary  func()
-	sessionSwitch    func(sessionID, workDir string)
-	openWorkspace    func(path string) error
-	openPath         func(path string) error
-	clipboardFiles   func() ([]desktop.ClipboardFile, error)
-	plugins          *rtpkg.PluginRegistry
-	pluginMarket     *pluginmarket.Manager
-	artifactStore    *artifact.Store
-	traceAdapter     *rtpkg.TraceAdapter
-	traceStore       *session.TraceStore
-	shutdownToken    string
-	shutdown         func()
-	shutdownOnce     sync.Once
-	desktopCloseOnce sync.Once
-	desktopCloseErr  error
+	buildProvider           func(providerName, model string) (*rtpkg.ProviderBuild, error)
+	setPermissionMode       func(permission.Mode) error
+	preflightPermissionMode func(permission.Mode, string) error
+	sessionBoundary         func()
+	prepareSessionSwitch    func(sessionID, workDir string) (canonicalWorkDir string, commit func(), err error)
+	sessionSwitch           func(sessionID, workDir string)
+	openWorkspace           func(path string) error
+	openPath                func(path string) error
+	clipboardFiles          func() ([]desktop.ClipboardFile, error)
+	plugins                 *rtpkg.PluginRegistry
+	pluginMarket            *pluginmarket.Manager
+	artifactStore           *artifact.Store
+	traceAdapter            *rtpkg.TraceAdapter
+	traceStore              *session.TraceStore
+	shutdownToken           string
+	shutdown                func()
+	shutdownOnce            sync.Once
+	desktopCloseOnce        sync.Once
+	desktopCloseErr         error
 
 	// These lifecycle barriers default to the active Loop methods. Keeping the
 	// call sites explicit lets shutdown tests deterministically exercise timeout
@@ -198,7 +204,10 @@ func (h *eventHub) unsubscribe(ch chan hubEvent) {
 }
 
 func (h *eventHub) publish(sessionID string, ev agent.Event, extra ...map[string]any) {
-	he := hubEvent{session: sessionID, ev: ev}
+	// The hub is a presentation/replay boundary, never an authorization
+	// consumer. Store only a detached presentation copy so raw permission
+	// inputs and reply channels cannot survive in replay or subscriber queues.
+	he := hubEvent{session: sessionID, ev: ev.PresentationCopy()}
 	if len(extra) > 0 {
 		he.extra = extra[0]
 	}
@@ -206,11 +215,13 @@ func (h *eventHub) publish(sessionID string, ev agent.Event, extra ...map[string
 	defer h.mu.Unlock()
 	h.nextID++
 	he.sequence = h.nextID
-	he.ev.PermissionReply = nil
-	he.ev.AskUserReply = nil
 	h.replay = append(h.replay, he)
 	if len(h.replay) > h.replayCap {
+		oldLen := len(h.replay)
 		copy(h.replay, h.replay[len(h.replay)-h.replayCap:])
+		for i := h.replayCap; i < oldLen; i++ {
+			h.replay[i] = hubEvent{}
+		}
 		h.replay = h.replay[:h.replayCap]
 	}
 	for ch := range h.subs {
@@ -229,11 +240,15 @@ func (h *eventHub) forgetSession(sessionID string) {
 		return
 	}
 	h.mu.Lock()
+	oldLen := len(h.replay)
 	kept := h.replay[:0]
 	for _, event := range h.replay {
 		if event.session != sessionID {
 			kept = append(kept, event)
 		}
+	}
+	for i := len(kept); i < oldLen; i++ {
+		h.replay[i] = hubEvent{}
 	}
 	h.replay = kept
 	h.mu.Unlock()
@@ -252,11 +267,28 @@ type RuntimeBindings struct {
 	ProviderName     string
 	// PresetName is "standard" or the agent profile loaded before the tool
 	// registry was built. It is displayed and persisted with new sessions.
-	PresetName          string
-	FreshPermissionMode permission.Mode
-	BuildProvider       func(providerName, model string) (*rtpkg.ProviderBuild, error)
-	SessionBoundary     func()
-	SessionSwitch       func(sessionID, workDir string)
+	PresetName string
+	// FreshSystemPromptKind distinguishes the generated default prompt from an
+	// opaque --system/simple/profile prompt for newly-created Desktop sessions.
+	FreshSystemPromptKind string
+	FreshPermissionMode   permission.Mode
+	BuildProvider         func(providerName, model string) (*rtpkg.ProviderBuild, error)
+	// SetPermissionMode performs the runtime-owned atomic gate/sandbox
+	// transition. Desktop must not independently claim bypassPermissions while
+	// model-controlled subprocesses still lack credential isolation.
+	SetPermissionMode func(permission.Mode) error
+	// PreflightPermissionMode verifies a restored mode and plan lineage before
+	// the active session is closed. It must not mutate runtime state.
+	PreflightPermissionMode func(permission.Mode, string) error
+	SessionBoundary         func()
+	// PrepareSessionSwitch validates every fallible process-owned workspace
+	// transition and returns an infallible commit closure. Desktop uses this
+	// two-phase form so a bad/missing target workspace cannot leave UI history
+	// and Memory on session B while AllowedDirs still authorizes session A.
+	PrepareSessionSwitch func(sessionID, workDir string) (canonicalWorkDir string, commit func(), err error)
+	// SessionSwitch is the legacy, commit-only callback for reduced embedders.
+	// Production Desktop supplies PrepareSessionSwitch instead.
+	SessionSwitch func(sessionID, workDir string)
 	// OpenWorkspace starts an independent Desktop window rooted at path.
 	// A separate process avoids process-wide cwd races with active jobs.
 	OpenWorkspace func(path string) error
@@ -292,34 +324,51 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		}
 	}
 	server := &Server{
-		addr:                addr,
-		loop:                loop,
-		store:               store,
-		hub:                 newEventHub(),
-		pendingPerms:        make(map[string]*permissionPending),
-		buildVersion:        strconv.FormatInt(time.Now().UnixNano(), 36),
-		roster:              binding.Roster,
-		pendingAsks:         make(map[string]*askPending),
-		activeSessionID:     binding.InitialSessionID,
-		activeProviderName:  binding.ProviderName,
-		activePreset:        binding.PresetName,
-		activeWorkDir:       initialWorkDir,
-		freshWorkDir:        launchWorkDir,
-		freshProviderName:   binding.ProviderName,
-		freshPermissionMode: binding.FreshPermissionMode,
-		freshPreset:         binding.PresetName,
-		buildProvider:       binding.BuildProvider,
-		sessionBoundary:     binding.SessionBoundary,
-		sessionSwitch:       binding.SessionSwitch,
-		openWorkspace:       binding.OpenWorkspace,
-		openPath:            binding.OpenPath,
-		shutdownToken:       binding.ShutdownToken,
-		shutdown:            binding.Shutdown,
-		clipboardFiles:      desktop.ClipboardFiles,
-		plugins:             binding.Plugins,
-		pluginMarket:        pluginmarket.NewManager(),
-		traceAdapter:        binding.TraceAdapter,
-		traceStore:          binding.TraceStore,
+		addr:                    addr,
+		loop:                    loop,
+		store:                   store,
+		hub:                     newEventHub(),
+		pendingPerms:            make(map[string]*permissionPending),
+		buildVersion:            strconv.FormatInt(time.Now().UnixNano(), 36),
+		roster:                  binding.Roster,
+		pendingAsks:             make(map[string]*askPending),
+		activeSessionID:         binding.InitialSessionID,
+		activeProviderName:      binding.ProviderName,
+		activePreset:            binding.PresetName,
+		activeSystemPromptKind:  binding.FreshSystemPromptKind,
+		activeWorkDir:           initialWorkDir,
+		freshWorkDir:            launchWorkDir,
+		freshProviderName:       binding.ProviderName,
+		freshPermissionMode:     binding.FreshPermissionMode,
+		freshSystemPromptKind:   binding.FreshSystemPromptKind,
+		freshPreset:             binding.PresetName,
+		buildProvider:           binding.BuildProvider,
+		setPermissionMode:       binding.SetPermissionMode,
+		preflightPermissionMode: binding.PreflightPermissionMode,
+		sessionBoundary:         binding.SessionBoundary,
+		prepareSessionSwitch:    binding.PrepareSessionSwitch,
+		sessionSwitch:           binding.SessionSwitch,
+		openWorkspace:           binding.OpenWorkspace,
+		openPath:                binding.OpenPath,
+		shutdownToken:           binding.ShutdownToken,
+		shutdown:                binding.Shutdown,
+		clipboardFiles:          desktop.ClipboardFiles,
+		plugins:                 binding.Plugins,
+		pluginMarket:            pluginmarket.NewManager(),
+		traceAdapter:            binding.TraceAdapter,
+		traceStore:              binding.TraceStore,
+	}
+	var initialSessionCommit func()
+	var initialSessionSwitchErr error
+	if binding.InitialSessionID != "" && strings.TrimSpace(initialWorkDir) != "" {
+		initialWorkDir, initialSessionCommit, initialSessionSwitchErr = server.prepareSessionSwitchCommit(binding.InitialSessionID, initialWorkDir)
+		if initialSessionSwitchErr != nil {
+			// Keep every process-owned workspace binding on the launch root. The
+			// first turn reloads the header and returns the same preflight error;
+			// until then no Memory/AllowedDirs split state is published.
+			initialWorkDir = launchWorkDir
+			server.activeWorkDir = launchWorkDir
+		}
 	}
 	if loop != nil {
 		server.memoryBinding, server.memoryBindingErr = rtpkg.BindLoopWorkspaceMemory(loop, initialWorkDir)
@@ -342,6 +391,15 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		server.freshModel = loop.Model
 		server.freshSystem = loop.System
 		server.freshSystemSections = append([]llm.SystemSection(nil), loop.SystemSections...)
+		if server.freshSystemPromptKind == "" {
+			for _, section := range loop.SystemSections {
+				if section.Name == "identity" {
+					server.freshSystemPromptKind = session.SystemPromptKindDefault
+					server.activeSystemPromptKind = server.freshSystemPromptKind
+					break
+				}
+			}
+		}
 		if loop.Provider != nil {
 			if server.activeProviderName == "" {
 				server.activeProviderName = loop.Provider.Name()
@@ -366,8 +424,13 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 	// setupRuntime constructs checkpoints from process cwd before Desktop reads
 	// its restored header. Publish the initial session workspace now so the very
 	// first resumed turn snapshots the same tree that its tools and Memory use.
-	if server.sessionSwitch != nil && binding.InitialSessionID != "" && strings.TrimSpace(initialWorkDir) != "" {
-		server.sessionSwitch(binding.InitialSessionID, initialWorkDir)
+	if initialSessionSwitchErr != nil {
+		// NewServer cannot return an error. Keep the existing permission and
+		// memory roots unchanged; the first turn/activation retries and returns a
+		// user-visible conflict instead of running with split scope.
+		log.Printf("initial session workspace preflight: %v", initialSessionSwitchErr)
+	} else if initialSessionCommit != nil {
+		initialSessionCommit()
 	}
 	server.reconcilePersistedTraceUsage(binding.InitialSessionID)
 	if server.traceAdapter != nil {
@@ -953,16 +1016,17 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		createdAt := time.Now()
 		cwd, _ := os.Getwd()
 		if err := s.store.WriteHeaderFull(session.Header{
-			ID:        id,
-			CreatedAt: createdAt,
-			Provider:  s.freshProviderName,
-			Model:     model,
-			System:    s.freshSystem,
-			WorkDir:   cwd,
-			Mode:      string(s.freshPermissionMode),
-			Effort:    effortHeaderValue(s.loop.EffortValue()),
-			Preset:    s.freshPreset,
-			Status:    "idle",
+			ID:               id,
+			CreatedAt:        createdAt,
+			Provider:         s.freshProviderName,
+			Model:            model,
+			System:           s.freshSystem,
+			SystemPromptKind: s.freshSystemPromptKind,
+			WorkDir:          cwd,
+			Mode:             string(s.freshPermissionMode),
+			Effort:           effortHeaderValue(s.loop.EffortValue()),
+			Preset:           s.freshPreset,
+			Status:           "idle",
 		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create session")
 			return
@@ -998,7 +1062,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		ID: id, Title: hdr.Title, Model: hdr.Model, WorkDir: hdr.WorkDir, WorkspaceID: workspaceIDForPath(hdr.WorkDir), Mode: hdr.Mode,
 		Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status,
 		Archived: s.store.IsArchived(id), CreatedAt: hdr.CreatedAt,
-	}, "messages": messages})
+	}, "messages": agent.PresentationHistory(messages)})
 }
 
 // handleSessionDelete permanently removes one session and every Metis-owned
@@ -1108,16 +1172,17 @@ func (s *Server) createFreshSessionForDelete() (*session.Header, error) {
 	id := s.store.NewSessionID()
 	cwd, _ := os.Getwd()
 	hdr := &session.Header{
-		ID:        id,
-		CreatedAt: time.Now(),
-		Provider:  s.freshProviderName,
-		Model:     s.freshModel,
-		System:    s.freshSystem,
-		WorkDir:   cwd,
-		Mode:      string(s.freshPermissionMode),
-		Effort:    effortHeaderValue(s.loop.EffortValue()),
-		Preset:    s.freshPreset,
-		Status:    "idle",
+		ID:               id,
+		CreatedAt:        time.Now(),
+		Provider:         s.freshProviderName,
+		Model:            s.freshModel,
+		System:           s.freshSystem,
+		SystemPromptKind: s.freshSystemPromptKind,
+		WorkDir:          cwd,
+		Mode:             string(s.freshPermissionMode),
+		Effort:           effortHeaderValue(s.loop.EffortValue()),
+		Preset:           s.freshPreset,
+		Status:           "idle",
 	}
 	if err := s.store.WriteHeaderFull(*hdr); err != nil {
 		return nil, err
@@ -1286,7 +1351,7 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"session": sessionItem{
 		ID: body.ID, Title: hdr.Title, Model: hdr.Model, WorkDir: hdr.WorkDir, WorkspaceID: workspaceIDForPath(hdr.WorkDir),
 		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt,
-	}, "messages": history})
+	}, "messages": agent.PresentationHistory(history)})
 }
 
 func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
@@ -1376,15 +1441,16 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		s.cancelMu.Unlock()
 		cwd, _ := os.Getwd()
 		if err := s.store.WriteHeaderFull(session.Header{
-			ID:       body.SessionID,
-			Provider: s.freshProviderName,
-			Model:    s.freshModel,
-			System:   s.freshSystem,
-			WorkDir:  cwd,
-			Mode:     string(s.freshPermissionMode),
-			Effort:   effortHeaderValue(s.loop.EffortValue()),
-			Preset:   s.freshPreset,
-			Status:   "idle",
+			ID:               body.SessionID,
+			Provider:         s.freshProviderName,
+			Model:            s.freshModel,
+			System:           s.freshSystem,
+			SystemPromptKind: s.freshSystemPromptKind,
+			WorkDir:          cwd,
+			Mode:             string(s.freshPermissionMode),
+			Effort:           effortHeaderValue(s.loop.EffortValue()),
+			Preset:           s.freshPreset,
+			Status:           "idle",
 		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create session")
 			return
@@ -1719,6 +1785,10 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		// fallback is the process launch workspace captured by NewServer.
 		targetWorkDir = strings.TrimSpace(s.freshWorkDir)
 	}
+	targetWorkDir, commitSessionSwitch, err := s.prepareSessionSwitchCommit(id, targetWorkDir)
+	if err != nil {
+		return fmt.Errorf("workspace permission preflight: %w", err)
+	}
 	var preparedMemory *rtpkg.WorkspaceMemoryRebind
 	if s.memoryBinding != nil {
 		if targetWorkDir == "" {
@@ -1751,6 +1821,7 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 			s.memoryBinding.CommitWorkspace(preparedMemory)
 			s.memoryBindingErr = nil
 		}
+		commitSessionSwitch()
 		s.loop.Restore(history)
 		s.loop.SetEffort(effortFromHeader(hdr.Effort))
 		s.loop.TimingSink = s.store.NewTimingRecorder(id).Record
@@ -1763,7 +1834,9 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		}
 		s.stateMu.Unlock()
 		provider, _, _ := s.loop.ProviderModelSnapshot()
-		rtpkg.RebindLoopRuntime(s.loop, provider, activeModel, s.loop.System, id)
+		rtpkg.RebindLoopRuntime(s.loop, provider, activeModel, s.loop.System, id, rtpkg.LoopRuntimeRebindOptions{
+			ProviderName: activeProviderName, WorkingDirectory: targetWorkDir,
+		})
 		s.reconcilePersistedTraceUsage(id)
 		return nil
 	}
@@ -1783,8 +1856,10 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		targetModel = activeModel
 	}
 	targetSystem := s.freshSystem
+	targetSystemPromptKind := s.freshSystemPromptKind
 	if hdr.System != "" {
 		targetSystem = hdr.System
+		targetSystemPromptKind = hdr.SystemPromptKind
 	}
 	targetEffort := effortFromHeader(hdr.Effort)
 	targetPreset := hdr.Preset
@@ -1822,6 +1897,35 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		}
 	}
 
+	mode, prePlanMode, hasStoredMode, err := rtpkg.ValidateRestoredPermissionState(
+		hdr.Mode,
+		hdr.PrePlanMode,
+		s.freshPermissionMode,
+	)
+	if err != nil {
+		return fmt.Errorf("permission-state preflight: %w", err)
+	}
+	if mode == permission.ModePlan && prePlanMode == "" {
+		prePlanMode = string(permission.ModeDefault)
+		if !hasStoredMode {
+			if previous, ok := permission.ParseMode(s.loop.PrePlanMode()); ok && previous != permission.ModePlan {
+				prePlanMode = string(previous)
+			}
+		}
+	}
+	if !hasStoredMode {
+		// A legacy header without permission state inherits the already-active
+		// invocation posture; setupRuntime preflighted that posture before the
+		// Desktop server started. Only an explicit stored mode can introduce a
+		// new credential-isolation requirement at this boundary.
+	} else if s.preflightPermissionMode != nil {
+		if err := s.preflightPermissionMode(mode, prePlanMode); err != nil {
+			return fmt.Errorf("permission-boundary preflight: %w", err)
+		}
+	} else if err := rtpkg.PreflightRestoredPermissionState(nil, mode, prePlanMode); err != nil {
+		return fmt.Errorf("permission-boundary preflight: %w", err)
+	}
+
 	if err := s.flushAndWaitPendingDistillation(activeID, desktopDistillationShutdownGrace); err != nil {
 		return err
 	}
@@ -1847,11 +1951,8 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		s.memoryBinding.CommitWorkspace(preparedMemory)
 		s.memoryBindingErr = nil
 	}
+	commitSessionSwitch()
 
-	mode := s.freshPermissionMode
-	if hdr.Mode != "" {
-		mode = permission.Mode(hdr.Mode)
-	}
 	resumedRules := make([]permission.Rule, 0, len(hdr.AlwaysAllow))
 	for _, rule := range hdr.AlwaysAllow {
 		resumedRules = append(resumedRules, permission.Rule{
@@ -1866,38 +1967,70 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		s.freshSystem, s.freshSystemSections, targetProviderName, targetModel,
 	)
 	targetSections := []llm.SystemSection(nil)
-	if targetSystem == s.freshSystem || targetSystem == canonicalTargetSystem {
+	if hdr.SystemPromptKind == session.SystemPromptKindDefault || targetSystem == s.freshSystem || targetSystem == canonicalTargetSystem {
 		// Model switches persist the flattened, provider-rebound prompt for
 		// backwards-compatible session files. Recognize that canonical form on
 		// resume and restore the typed sections too; otherwise the next switch
 		// cannot remove the old provider_hint without flattening custom text.
 		targetSystem = canonicalTargetSystem
 		targetSections = canonicalTargetSections
+		if s.freshSystemPromptKind != "" {
+			targetSystemPromptKind = s.freshSystemPromptKind
+		} else {
+			targetSystemPromptKind = session.SystemPromptKindDefault
+		}
 	}
 	s.loop.RebindProviderRuntime(provider, targetModel, targetMaxOutputTokens, targetSystem, targetSections)
 	s.loop.SetEffort(targetEffort)
+	s.loop.SetPrePlanMode(prePlanMode)
 	if s.loop.Gate != nil {
 		s.loop.Gate.ResetSessionState(mode, resumedRules)
+		rtpkg.SynchronizeRestoredPermissionState(s.loop.Gate, s.loop, prePlanMode)
+	} else {
+		s.loop.SetPrePlanMode("")
+		s.loop.SetPlanMode(false)
 	}
-	s.loop.SetPrePlanMode("")
 	s.loop.ResetSession(history)
 	s.loop.TimingSink = s.store.NewTimingRecorder(id).Record
-	rtpkg.RebindLoopRuntime(s.loop, provider, targetModel, targetSystem, id)
+	rtpkg.RebindLoopRuntime(s.loop, provider, targetModel, targetSystem, id, rtpkg.LoopRuntimeRebindOptions{
+		ProviderName: targetProviderName, WorkingDirectory: targetWorkDir,
+	})
 
 	s.stateMu.Lock()
 	s.activeSessionID = id
 	s.activeProviderName = targetProviderName
 	s.activeModel = targetModel
 	s.activePreset = targetPreset
+	s.activeSystemPromptKind = targetSystemPromptKind
 	if targetWorkDir != "" {
 		s.activeWorkDir = targetWorkDir
 	}
 	s.stateMu.Unlock()
-	if s.sessionSwitch != nil {
-		s.sessionSwitch(id, targetWorkDir)
-	}
 	s.reconcilePersistedTraceUsage(id)
 	return nil
+}
+
+// prepareSessionSwitchCommit adapts both the production two-phase binding and
+// the historical commit-only callback to one activation contract. Once this
+// method returns successfully, invoking commit cannot report a late failure.
+func (s *Server) prepareSessionSwitchCommit(sessionID, workDir string) (string, func(), error) {
+	if s != nil && s.prepareSessionSwitch != nil {
+		canonicalWorkDir, commit, err := s.prepareSessionSwitch(sessionID, workDir)
+		if err != nil {
+			return "", nil, err
+		}
+		if strings.TrimSpace(canonicalWorkDir) == "" {
+			return "", nil, errors.New("prepared workspace canonical path is empty")
+		}
+		if commit == nil {
+			commit = func() {}
+		}
+		return canonicalWorkDir, commit, nil
+	}
+	if s != nil && s.sessionSwitch != nil {
+		return workDir, func() { s.sessionSwitch(sessionID, workDir) }, nil
+	}
+	return workDir, func() {}, nil
 }
 
 func (s *Server) cancelAndWaitForBackgroundAgents(timeout time.Duration) error {
@@ -2144,16 +2277,27 @@ func (s *Server) writeActiveSessionState(id, providerName, model, preset, system
 		return nil
 	}
 
+	s.stateMu.RLock()
+	promptKind := s.activeSystemPromptKind
+	s.stateMu.RUnlock()
 	hdr := session.Header{
-		ID:       id,
-		Provider: providerName,
-		Model:    model,
-		System:   system,
-		Effort:   effortHeaderValue(effort),
-		Preset:   preset,
+		ID:               id,
+		Provider:         providerName,
+		Model:            model,
+		System:           system,
+		SystemPromptKind: promptKind,
+		Effort:           effortHeaderValue(effort),
+		Preset:           preset,
 	}
 	if s.loop.Gate != nil {
 		hdr.Mode = string(s.loop.Gate.Mode())
+		if s.loop.Gate.Mode() == permission.ModePlan {
+			previous, ok := permission.ParseMode(s.loop.PrePlanMode())
+			if !ok || previous == permission.ModePlan {
+				return fmt.Errorf("persist active session %s: invalid pre-plan permission mode %q", id, s.loop.PrePlanMode())
+			}
+			hdr.PrePlanMode = string(previous)
+		}
 		for _, rule := range s.loop.Gate.Snapshot() {
 			if rule.Source != "interactive" && !strings.HasPrefix(rule.Source, "session:") {
 				continue
@@ -2494,6 +2638,14 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	newHeader := *hdr
 	newHeader.ID = newID
 	newHeader.CreatedAt = time.Now()
+	// A branch copies conversation/model lineage, not the parent's permission
+	// lifetime. Start it from the invocation baseline and clear plan ancestry
+	// plus every session-scoped always-allow grant.
+	newHeader.Mode = string(s.freshPermissionMode)
+	newHeader.PrePlanMode = ""
+	newHeader.AlwaysAllow = nil
+	newHeader.ClearAlwaysAllow = false // new file has no earlier grant to tombstone
+	newHeader.ForkedFrom = &pubsess.ForkRef{SessionID: body.SessionID, MessageCount: body.MessageIndex + 1}
 	if err := s.store.WriteHeaderFull(newHeader); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2619,6 +2771,7 @@ func traceFromHistory(s *Server, sid string) []session.TracedNode {
 	if err != nil {
 		return nil
 	}
+	messages = agent.PresentationHistory(messages)
 	var nodes []session.TracedNode
 	turn := 0
 	seq := int64(0)
@@ -2778,11 +2931,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		s.loop.SetEffort(selectedEffort)
 		s.stateMu.RLock()
 		activeSessionID := s.activeSessionID
+		activeWorkDir := s.activeWorkDir
 		s.stateMu.RUnlock()
 		// Built-in Agent/Fork tools and the lazy pricing resolver capture the
 		// active provider. Keep them on the same atomic model boundary as the
 		// main loop instead of leaving child work on the old transport.
-		rtpkg.RebindLoopRuntime(s.loop, built.Provider, selectedModel, newSystem, activeSessionID)
+		rtpkg.RebindLoopRuntime(s.loop, built.Provider, selectedModel, newSystem, activeSessionID, rtpkg.LoopRuntimeRebindOptions{
+			ProviderName: body.Provider, WorkingDirectory: activeWorkDir,
+		})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"provider": body.Provider, "model": selectedModel,
 			"effortSupported": capability.Supported, "effortReason": capability.Reason,
@@ -2888,7 +3044,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		contextUsed = s.loop.EstimateContextTokens()
 		contextWindow, compactThreshold, compactAtTokens = s.loop.ContextStatusSnapshot()
 		if s.loop.Registry != nil {
-			for _, tool := range s.loop.Registry.All() {
+			for _, tool := range s.loop.Registry.ModelToolsForCache() {
 				if tool != nil {
 					toolNames = append(toolNames, tool.Name())
 				}
@@ -3335,8 +3491,43 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		settings = append(settings, config.UserSetting{Key: c.Key, Value: c.Value})
 	}
+	// Preflight and commit the live permission boundary before persisting an
+	// unattended default. If the OS sandbox is unavailable, Desktop keeps both
+	// the current runtime mode and config unchanged instead of advertising a
+	// bypass posture that cannot protect credentials.
+	var previousPermissionState rtpkg.PermissionModeState
+	permissionApplied := false
+	for _, c := range body.Changes {
+		if c.Key != "permission.mode" || s.loop == nil || s.loop.Gate == nil {
+			continue
+		}
+		if !permissionApplied {
+			var err error
+			previousPermissionState, err = rtpkg.CapturePermissionModeState(s.loop.Gate, s.loop)
+			if err != nil {
+				writeError(w, http.StatusConflict, "permission mode unchanged: "+err.Error())
+				return
+			}
+		}
+		if err := s.applyPermissionMode(permission.CanonicalMode(c.Value)); err != nil {
+			if permissionApplied {
+				_ = rtpkg.RestorePermissionModeState(previousPermissionState, s.applyPermissionMode)
+			}
+			writeError(w, http.StatusConflict, "permission mode unchanged: "+err.Error())
+			return
+		}
+		permissionApplied = true
+	}
 	if _, err := config.SaveUserSettingsAndLoad(settings); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		var rollbackErr error
+		if permissionApplied {
+			rollbackErr = rtpkg.RestorePermissionModeState(previousPermissionState, s.applyPermissionMode)
+		}
+		message := err.Error()
+		if rollbackErr != nil {
+			message += "; permission rollback failed: " + rollbackErr.Error()
+		}
+		writeError(w, http.StatusInternalServerError, message)
 		return
 	}
 	var live, restart []string
@@ -3344,7 +3535,6 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		switch c.Key {
 		case "permission.mode":
 			if s.loop != nil && s.loop.Gate != nil {
-				s.applyPermissionMode(permission.CanonicalMode(c.Value))
 				live = append(live, c.Key)
 			} else {
 				restart = append(restart, c.Key)

@@ -8,7 +8,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -77,8 +79,24 @@ const (
 
 type Glob struct {
 	tools.BaseTool
-	gate *permission.Gate
+	gate    *permission.Gate
+	sandbox *sandbox.Manager
 }
+
+// NewGlob preserves the legacy unsandboxed construction path used by tests
+// and embedders. Runtime registration uses NewGlobWithSandbox.
+func NewGlob(gate *permission.Gate) Glob { return Glob{gate: gate} }
+
+func NewGlobWithSandbox(gate *permission.Gate, manager *sandbox.Manager) Glob {
+	return Glob{gate: gate, sandbox: manager}
+}
+
+func (g Glob) WithSandbox(manager *sandbox.Manager) Glob {
+	g.sandbox = manager
+	return g
+}
+
+func (g Glob) SandboxManager() *sandbox.Manager { return g.sandbox }
 
 func (Glob) Name() string { return "Glob" }
 func (Glob) Description() string {
@@ -137,15 +155,16 @@ func (Glob) InputSchema() map[string]any {
 	}
 }
 func (Glob) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
-func (g Glob) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
+func (g Glob) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
 	// Include the search root in the permission payload. Pattern-only checks
 	// let a rule denying a sensitive directory be bypassed simply by moving
 	// that directory from the glob pattern into `root`.
-	d, src := g.gate.CheckPath(context.Background(), "Glob", searchPermissionInput(in), searchScopePath(in))
+	root := resolvePathAgainstAgentCWD(ctx, searchScopePath(in))
+	d, src := g.gate.CheckPath(ctx, "Glob", searchPermissionInput(in), root)
 	return mapDecision(d), src
 }
 
-func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	pattern, _ := in["pattern"].(string)
 	if pattern == "" {
 		// Richer error message — "pattern required" alone was too
@@ -180,6 +199,9 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	if root == "" {
 		root = "."
 	}
+	logicalRoot := root
+	root = resolvePathAgainstAgentCWD(ctx, root)
+	contextualRoot := root != logicalRoot
 	limit := intArg(in, "limit", 500)
 
 	// Resolve absolute root for depth calculation. WalkDir uses the
@@ -202,7 +224,7 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	if home != "" && rootClean == filepath.Clean(home) {
 		defaultDepth = defaultGlobMaxDepthHome
 	}
-	if d, items := walkBudget(rootClean); d > 0 {
+	if d, items := walkBudgetWithSandbox(ctx, rootClean, g.sandbox); d > 0 {
 		if d < defaultDepth {
 			defaultDepth = d
 		}
@@ -261,7 +283,13 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 			}
 			return nil
 		}
-		matched, _ := doublestarMatch(pattern, path)
+		logicalPath := path
+		if contextualRoot {
+			if rel, relErr := filepath.Rel(rootClean, filepath.Clean(path)); relErr == nil {
+				logicalPath = filepath.Join(logicalRoot, rel)
+			}
+		}
+		matched, _ := doublestarMatch(pattern, logicalPath)
 		if !matched {
 			return nil
 		}
@@ -269,7 +297,7 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 		if err != nil {
 			return nil
 		}
-		hits = append(hits, hit{path: path, mod: info.ModTime().UnixNano()})
+		hits = append(hits, hit{path: logicalPath, mod: info.ModTime().UnixNano()})
 		return nil
 	})
 	if err != nil {
@@ -288,6 +316,21 @@ func (Glob) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 		return &tools.Result{Output: "(no matches)"}, nil
 	}
 	return &tools.Result{Output: b.String()}, nil
+}
+
+// resolvePathAgainstAgentCWD keeps path-aware tools independent of the
+// process-global cwd. Desktop sessions and sub-agents carry their effective
+// workspace on the tool context; resolving before both CanUse and Execute
+// ensures the permission target is the exact path later touched by I/O.
+// Callers without an override retain the legacy process-cwd behavior.
+func resolvePathAgainstAgentCWD(ctx context.Context, path string) string {
+	if path == "" || filepath.IsAbs(path) || ctx == nil {
+		return path
+	}
+	if cwd := agent.CwdFromContext(ctx); cwd != "" {
+		return filepath.Clean(filepath.Join(cwd, path))
+	}
+	return path
 }
 
 // doublestarMatch is a minimal ** glob: ** matches across path separators,

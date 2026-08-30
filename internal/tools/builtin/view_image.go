@@ -100,18 +100,19 @@ func (ViewImage) Concurrency(map[string]any) tools.Concurrency {
 	return tools.ConcurrencySafe
 }
 
-func (v ViewImage) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
+func (v ViewImage) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
 	path := strFromAny(in["path"])
-	d, src := v.gate.CheckPath(context.Background(), "ViewImage", path, path)
+	target := resolvePathAgainstAgentCWD(ctx, path)
+	d, src := v.gate.CheckPath(ctx, "ViewImage", path, target)
 	return mapDecision(d), src
 }
 
-func (ViewImage) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (ViewImage) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	rawPath, _ := in["path"].(string)
 	if rawPath == "" {
 		return nil, errors.New("path required")
 	}
-	abs := rawPath
+	abs := resolvePathAgainstAgentCWD(ctx, rawPath)
 	if !filepath.IsAbs(abs) {
 		if resolved, err := filepath.Abs(abs); err == nil {
 			abs = resolved

@@ -34,6 +34,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/tools"
+	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
 	"github.com/Ricardo-M-L/metis/internal/tui/overlay"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
@@ -163,6 +165,11 @@ type ExternalHooks struct {
 	// ReloadCatalog refreshes disk-backed skills and custom slash commands
 	// without rebuilding the active Loop or discarding conversation history.
 	ReloadCatalog func() (string, error)
+	// AdoptMCPServer transfers an explicitly reauthenticated MCP connection to
+	// the process runtime. The callback must atomically publish discoveredTools
+	// and replace/close any prior server with the same logical name. Returning
+	// true means the runtime owns server; false leaves ownership with the TUI.
+	AdoptMCPServer func(server *mcptools.Server, discoveredTools []tools.Tool) bool
 }
 
 type Model struct {
@@ -604,6 +611,16 @@ type Model struct {
 	updateCheckPending bool
 	updateCheckSeq     uint64
 	updateCheckRunner  updateCheckRunner
+	// MCP OAuth is an explicit, potentially two-minute browser flow. It runs
+	// as a tea.Cmd so Update remains responsive; this cancel handle lets
+	// Esc/Ctrl-C and application shutdown stop its callback listener and HTTP.
+	mcpLoginPending bool
+	mcpLoginSeq     uint64
+	mcpLoginCancel  context.CancelFunc
+	// Servers launched by successful `/mcp login` are explicit Model-owned
+	// resources; retaining and closing them avoids leaking the HTTP/SSE client
+	// when the Bubble Tea program exits.
+	mcpLoginServers []mcpLoginServer
 
 	eventCh chan agent.Event
 	doneCh  chan error
@@ -983,11 +1000,8 @@ func RunTUI(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, s
 
 	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
-	turnStopped := true
-	if turnErr := m.stopForegroundTurnForClose(); turnErr != nil {
-		turnStopped = false
-		err = errors.Join(err, turnErr)
-	}
+	turnStopped, liveErr := shutdownTUILiveWork(m)
+	err = errors.Join(err, liveErr)
 	// The user-visible foreground turn is now gone, so disarm the force-exit
 	// fallback before entering the (potentially slower) memory durability
 	// barrier. If the provider ignored cancellation above, a double Ctrl-C keeps
@@ -1020,6 +1034,29 @@ func RunTUI(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, s
 		printResumeHint(m.session, m.sessionID)
 	}
 	return err
+}
+
+// shutdownTUILiveWork preserves the dependency order required by an active
+// turn: stop a pending login, cancel and join the foreground agent, and only
+// then close MCP clients that the turn may still be executing through.
+func shutdownTUILiveWork(m *Model) (bool, error) {
+	if m == nil {
+		return true, nil
+	}
+	// tea.WithContext normally cancels commands when the caller context closes,
+	// but an ordinary UI quit can happen first. Explicitly stop the OAuth child
+	// so its callback listener cannot outlive the application shutdown path.
+	m.cancelMCPLogin()
+	turnStopped := true
+	var joined error
+	if turnErr := m.stopForegroundTurnForClose(); turnErr != nil {
+		turnStopped = false
+		joined = errors.Join(joined, turnErr)
+	}
+	if closeErr := m.closeMCPLoginServers(); closeErr != nil {
+		joined = errors.Join(joined, fmt.Errorf("close live MCP login servers: %w", closeErr))
+	}
+	return turnStopped, joined
 }
 
 // printResumeHint surfaces a dim "next time, run this" hint after a

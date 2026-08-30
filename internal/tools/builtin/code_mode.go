@@ -1,7 +1,7 @@
 package builtin
 
-// code_mode.go — RunCode tool: execute code in a sandboxed runtime
-// without the shell interpreter overhead of Bash. Mirrors harness's
+// code_mode.go — RunCode tool: execute code under the configured sandbox
+// policy without the shell interpreter overhead of Bash. Mirrors harness's
 // code-runtime-worker-thread concept: for short code snippets, this
 // avoids the shell spawn + interpreter cold-start penalty.
 //
@@ -19,11 +19,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -46,7 +48,7 @@ var languageMap = map[string]languageConfig{
 	"php":        {Extension: ".php", Command: "php", Args: nil},
 }
 
-// RunCode executes a code snippet in a sandboxed runtime.
+// RunCode executes a code snippet using the configured sandbox policy.
 type RunCode struct {
 	tools.BaseTool
 	gate    *permission.Gate
@@ -64,7 +66,7 @@ func NewRunCodeWithSandbox(gate *permission.Gate, m *sandbox.Manager) RunCode {
 func (RunCode) Name() string { return "RunCode" }
 
 func (RunCode) Description() string {
-	return `Execute code in a sandboxed runtime. Preferred over Bash for running code snippets — it avoids shell interpreter overhead and quoting issues.
+	return `Execute a code snippet using the configured sandbox policy. When the OS sandbox is disabled, the process still receives a credential-filtered environment but is not filesystem-sandboxed. Preferred over Bash for running code snippets — it avoids shell interpreter overhead and quoting issues.
 
 Supported languages: python, go, javascript, typescript, bash, ruby, r, perl, php.
 
@@ -101,16 +103,24 @@ func (RunCode) InputSchema() map[string]any {
 }
 
 func (RunCode) Concurrency(map[string]any) tools.Concurrency {
-	return tools.ConcurrencySafe
+	// Arbitrary user/model supplied code can mutate the workspace, access the
+	// network allowed by the active sandbox policy, and spawn child processes.
+	// It must therefore be serialized with other mutating tools.
+	return tools.ConcurrencyExclusive
 }
 
-func (r RunCode) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
+func (r RunCode) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
 	code, _ := in["code"].(string)
-	d, src := r.gate.Check(context.Background(), "RunCode", truncate(code, 80))
+	if r.gate == nil {
+		return tools.PermissionAsk, "RunCode requires a permission gate"
+	}
+	// Pass the complete snippet: a credential path after an import/header must
+	// not evade the secret-read boundary merely because it appears after byte 80.
+	d, src := r.gate.Check(ctx, "RunCode", code)
 	return mapDecision(d), src
 }
 
-func (r RunCode) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (r RunCode) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	code, _ := in["code"].(string)
 	code = strings.TrimSpace(code)
 	if code == "" {
@@ -132,7 +142,14 @@ func (r RunCode) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	// Write code to temp file
-	tmpDir, err := os.MkdirTemp("", "metis-runcode-")
+	tmpRoot := ""
+	if r.manager != nil {
+		tmpRoot = r.manager.TempDir()
+		if tmpRoot == "" {
+			return nil, fmt.Errorf("RunCode: create temp dir: %w", sandbox.ErrManagerClosed)
+		}
+	}
+	tmpDir, err := os.MkdirTemp(tmpRoot, "metis-runcode-")
 	if err != nil {
 		return nil, fmt.Errorf("RunCode: create temp dir: %w", err)
 	}
@@ -150,6 +167,13 @@ func (r RunCode) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 
 	cmd := exec.Command(cfg.Command, args...)
 	cmd.Dir = tmpDir
+	cmd.Env = security.RestrictedSubprocessEnv(os.Environ())
+	if r.manager != nil {
+		// Language runtimes frequently need their own scratch files. The Linux
+		// sandbox exposes only the Manager temp root and command cwd as writable,
+		// so normalize TMPDIR to that same manager-owned boundary.
+		cmd.Env = r.manager.FilterEnv(cmd.Env, false)
+	}
 	// Own process group so a timeout kills the WHOLE tree: `go run` and
 	// `npx tsx` spawn real interpreters that outlive the wrapper kill.
 	jobs.ApplyProcessGroup(cmd)
@@ -166,16 +190,20 @@ func (r RunCode) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 		cmd = wrapped
 	}
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr cappedRunCodeBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	// Run with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	// Derive the timeout from the invocation context so stopping a turn or
+	// switching sessions cancels the interpreter and its entire process group.
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
+	if err := runCtx.Err(); err != nil {
+		return &tools.Result{Output: "RunCode: cancelled before process start", IsError: true}, nil
+	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("RunCode: start: %w", err)
+		return nil, fmt.Errorf("RunCode: start: %s", security.RedactSubprocessText(err.Error()))
 	}
 
 	done := make(chan error, 1)
@@ -187,24 +215,33 @@ func (r RunCode) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
 				return &tools.Result{
-					Output:  fmt.Sprintf("exit code %d\nstderr:\n%s\nstdout:\n%s", exitErr.ExitCode(), strings.TrimSpace(stderr.String()), strings.TrimSpace(stdout.String())),
+					Output: fmt.Sprintf("exit code %d\nstderr:\n%s\nstdout:\n%s",
+						exitErr.ExitCode(),
+						security.RedactSubprocessText(strings.TrimSpace(stderr.String())),
+						security.RedactSubprocessText(strings.TrimSpace(stdout.String()))),
 					IsError: true,
 				}, nil
 			}
-			return nil, fmt.Errorf("RunCode: execute: %w", err)
+			return nil, fmt.Errorf("RunCode: execute: %s", security.RedactSubprocessText(err.Error()))
 		}
-	case <-ctx.Done():
-		jobs.KillProcessGroup(cmd.Process)
-		<-done
+	case <-runCtx.Done():
+		stopRunCodeProcess(cmd, done, runCodeKillWait)
+		prefix := fmt.Sprintf("timed out after %ds", timeoutSec)
+		if ctx.Err() != nil {
+			prefix = "cancelled by caller"
+		}
 		return &tools.Result{
-			Output:  fmt.Sprintf("timed out after %ds\nstdout:\n%s\nstderr:\n%s", timeoutSec, strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String())),
+			Output: fmt.Sprintf("%s\nstdout:\n%s\nstderr:\n%s",
+				prefix,
+				security.RedactSubprocessText(strings.TrimSpace(stdout.String())),
+				security.RedactSubprocessText(strings.TrimSpace(stderr.String()))),
 			IsError: true,
 		}, nil
 	}
 
-	out := strings.TrimSpace(stdout.String())
+	out := security.RedactSubprocessText(strings.TrimSpace(stdout.String()))
 	if stderr.Len() > 0 {
-		errOut := strings.TrimSpace(stderr.String())
+		errOut := security.RedactSubprocessText(strings.TrimSpace(stderr.String()))
 		if out != "" {
 			out = fmt.Sprintf("stdout:\n%s\n\nstderr:\n%s", out, errOut)
 		} else {
@@ -213,4 +250,99 @@ func (r RunCode) Execute(_ context.Context, in map[string]any) (*tools.Result, e
 	}
 
 	return &tools.Result{Output: out}, nil
+}
+
+const runCodeKillWait = 2 * time.Second
+
+var runCodeKillProcessTree = jobs.KillProcessGroup
+
+// stopRunCodeProcess makes cancellation best-effort but bounded. The process
+// group kill handles interpreter wrappers and their descendants. A direct
+// Process.Kill is deliberately attempted as a second line of defence because
+// the Windows taskkill helper (or a Unix process-group kill) can fail. We must
+// not then wait on cmd.Wait forever and wedge the entire agent turn.
+func stopRunCodeProcess(cmd *exec.Cmd, done <-chan error, wait time.Duration) {
+	if wait <= 0 {
+		if cmd != nil && cmd.Process != nil {
+			treeKiller := runCodeKillProcessTree
+			go treeKiller(cmd.Process)
+			_ = cmd.Process.Kill()
+		}
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	if cmd != nil && cmd.Process != nil {
+		treeDone := make(chan struct{})
+		treeKiller := runCodeKillProcessTree
+		go func() {
+			treeKiller(cmd.Process)
+			close(treeDone)
+		}()
+		select {
+		case <-treeDone:
+			// The platform tree killer completed; still kill the leader directly
+			// in case it could not enumerate or signal the process tree.
+		case <-done:
+			return
+		case <-timer.C:
+			_ = cmd.Process.Kill()
+			return
+		}
+		_ = cmd.Process.Kill()
+	}
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
+const maxRunCodeOutputBytes = 1 << 20
+
+// cappedRunCodeBuffer keeps stdout/stderr from consuming unbounded memory.
+// os/exec expects Writer.Write to report the full input length even when the
+// retained prefix is capped, otherwise it treats truncation as an I/O error.
+type cappedRunCodeBuffer struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *cappedRunCodeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(p)
+	remaining := maxRunCodeOutputBytes - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+			b.truncated = true
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return n, nil
+}
+
+func (b *cappedRunCodeBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *cappedRunCodeBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
+}
+
+func (b *cappedRunCodeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.truncated {
+		return b.buf.String()
+	}
+	return b.buf.String() + "\n[RunCode output truncated]\n"
 }

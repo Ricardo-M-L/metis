@@ -4,11 +4,15 @@ package mcp_tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
 	"strings"
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/mcp"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
@@ -51,11 +55,15 @@ type Server struct {
 	// calls return it immediately rather than retrying (a kimi-cli-
 	// style flapping spawn would otherwise hammer a broken binary
 	// once per tool call).
-	spawn     func(context.Context) (*mcp.Client, error)
-	spawnOnce sync.Once
-	spawnErr  error
-	mu        sync.RWMutex
+	spawn       func(context.Context) (*mcp.Client, error)
+	spawnOnce   sync.Once
+	spawnErr    error
+	spawnCancel context.CancelFunc
+	closed      bool
+	mu          sync.RWMutex
 }
+
+var errMCPServerClosed = errors.New("MCP server is closed")
 
 type MCPTool struct {
 	tools.BaseTool // default IsEnabled() = true; MCP tools are always exposed once their server is registered
@@ -65,8 +73,9 @@ type MCPTool struct {
 	server         *Server
 }
 
-func (t *MCPTool) Name() string        { return "mcp__" + t.server.name + "__" + t.name }
-func (t *MCPTool) Description() string { return "[MCP] " + t.description }
+func (t *MCPTool) Name() string                     { return "mcp__" + t.server.name + "__" + t.name }
+func (t *MCPTool) Description() string              { return "[MCP] " + t.description }
+func (t *MCPTool) ToolExposure() tools.ToolExposure { return tools.ToolExposureDeferred }
 func (t *MCPTool) InputSchema() map[string]any {
 	if t.inputSchema == nil {
 		return map[string]any{"type": "object", "properties": map[string]any{}}
@@ -80,22 +89,23 @@ func (t *MCPTool) CanUse(_ context.Context, in map[string]any) (tools.Permission
 }
 
 func (t *MCPTool) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
-	if err := t.server.ensureClient(ctx); err != nil {
+	client, err := t.server.clientForCall(ctx)
+	if err != nil {
 		// First-spawn failure for a lazy server. Surface as a tool
 		// error so the model sees a clean message rather than a
 		// nil-pointer panic from t.server.client below.
-		return &tools.Result{
+		return redactMCPToolResult(nil, &tools.Result{
 			Output:  fmt.Sprintf("MCP server %q failed to start: %v", t.server.name, err),
 			IsError: true,
-		}, nil
+		}), nil
 	}
 	args := make(map[string]any)
 	for k, v := range in {
 		args[k] = v
 	}
-	result, err := t.server.client.CallTool(ctx, t.name, args)
+	result, err := client.CallTool(ctx, t.name, args)
 	if err != nil {
-		return &tools.Result{Output: friendlyMCPError(t.server.name, err), IsError: true}, nil
+		return redactMCPToolResult(client, &tools.Result{Output: friendlyMCPError(t.server.name, err), IsError: true}), nil
 	}
 	// MCP tool responses follow a structured envelope
 	//   {"content": [{"type":"text","text":"..."},
@@ -113,7 +123,7 @@ func (t *MCPTool) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	//     text payload the model needs to recover
 	parsed, ok := parseMCPResponse(result)
 	if ok {
-		return parsed, nil
+		return redactMCPToolResult(client, parsed), nil
 	}
 	// Fallback for non-standard / malformed responses: best-effort
 	// pretty-print. Same behaviour as pre-fix — keeps weird providers
@@ -121,9 +131,24 @@ func (t *MCPTool) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	var pretty json.RawMessage
 	if json.Unmarshal(result, &pretty) == nil {
 		b, _ := json.MarshalIndent(pretty, "", "  ")
-		return &tools.Result{Output: string(b)}, nil
+		return redactMCPToolResult(client, &tools.Result{Output: string(b)}), nil
 	}
-	return &tools.Result{Output: string(result)}, nil
+	return redactMCPToolResult(client, &tools.Result{Output: string(result)}), nil
+}
+
+// redactMCPToolResult is the final model-facing boundary for MCP tool text.
+// Only Output is rewritten; binary image attachments must remain byte-for-byte
+// unchanged so screenshots and other media stay valid.
+func redactMCPToolResult(client *mcp.Client, result *tools.Result) *tools.Result {
+	if result == nil {
+		return nil
+	}
+	if client == nil {
+		result.Output = security.RedactSubprocessText(result.Output)
+		return result
+	}
+	result.Output = client.RedactText(result.Output)
+	return result
 }
 
 // mcpContent is the wire shape an MCP tool emits for a single content
@@ -179,9 +204,13 @@ func parseMCPResponse(raw []byte) (*tools.Result, bool) {
 			if c.Data == "" {
 				continue
 			}
-			mt := c.MimeType
-			if mt == "" {
-				mt = "image/png" // MCP-spec default for missing mimeType
+			mt, ok := normalizeMCPImageMIME(c.MimeType)
+			if !ok {
+				// MIME is model-visible metadata and later becomes part of a data:
+				// URL. Never forward arbitrary or credential-bearing values. Keep
+				// the base64 bytes out of text and omit only this unsafe attachment.
+				textParts = append(textParts, "[MCP image omitted: unsupported image MIME type]")
+				continue
 			}
 			images = append(images, pubtool.ImageAttachment{
 				MediaType: mt, Data: c.Data,
@@ -201,6 +230,23 @@ func parseMCPResponse(raw []byte) (*tools.Result, bool) {
 	}, true
 }
 
+func normalizeMCPImageMIME(raw string) (string, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return "image/png", true // MCP-compatible default for missing mimeType
+	}
+	mediaType, params, err := mime.ParseMediaType(raw)
+	if err != nil || len(params) != 0 {
+		return "", false
+	}
+	mediaType = strings.ToLower(mediaType)
+	switch mediaType {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		return mediaType, true
+	default:
+		return "", false
+	}
+}
+
 // NewServer connects to a stdio MCP server (subprocess) and returns a
 // Server with its tools registered as Metis tools.
 func NewServer(ctx context.Context, name, command string, args ...string) (*Server, error) {
@@ -208,8 +254,9 @@ func NewServer(ctx context.Context, name, command string, args ...string) (*Serv
 }
 
 // NewServerWithEnv is the env-aware variant. `extraEnv` (KEY=VAL strings)
-// is appended onto os.Environ() for the spawned subprocess so values
-// like `FIRECRAWL_API_KEY = "fc-..."` from mcp.toml reach the server.
+// augments the MCP client's sanitized launch environment so explicitly
+// configured values such as `FIRECRAWL_API_KEY = "fc-..."` from mcp.toml
+// reach this server without exposing unrelated METIS process variables.
 func NewServerWithEnv(ctx context.Context, name, command string, extraEnv []string, args ...string) (*Server, error) {
 	return NewServerWithEnvAndDir(ctx, name, command, extraEnv, "", args...)
 }
@@ -217,7 +264,21 @@ func NewServerWithEnv(ctx context.Context, name, command string, extraEnv []stri
 // NewServerWithEnvAndDir preserves a plugin package's working-directory
 // contract while keeping the stdio process isolated from the METIS process.
 func NewServerWithEnvAndDir(ctx context.Context, name, command string, extraEnv []string, workingDir string, args ...string) (*Server, error) {
-	client, err := mcp.NewStdioClientWithEnvAndDir(ctx, command, extraEnv, workingDir, args...)
+	return NewServerWithEnvAndDirAndSandbox(ctx, name, command, extraEnv, workingDir, nil, args...)
+}
+
+// NewServerWithEnvAndDirAndSandbox launches a stdio MCP server through the
+// runtime-owned process sandbox. The manager is shared infrastructure and is
+// not closed by Server.Close.
+func NewServerWithEnvAndDirAndSandbox(ctx context.Context, name, command string, extraEnv []string, workingDir string, manager *sandbox.Manager, args ...string) (*Server, error) {
+	return NewServerWithEnvAndDirAndSandboxProfile(ctx, name, command, extraEnv, workingDir, manager, mcp.StdioSandboxProfileGeneric, args...)
+}
+
+// NewServerWithEnvAndDirAndSandboxProfile carries a host-selected stdio
+// capability profile through the eager server wrapper. Generic callers remain
+// on the least-privilege profile through NewServerWithEnvAndDirAndSandbox.
+func NewServerWithEnvAndDirAndSandboxProfile(ctx context.Context, name, command string, extraEnv []string, workingDir string, manager *sandbox.Manager, profile mcp.StdioSandboxProfile, args ...string) (*Server, error) {
+	client, err := mcp.NewStdioClientWithEnvAndDirAndSandboxProfile(ctx, command, extraEnv, workingDir, manager, profile, args...)
 	if err != nil {
 		return nil, fmt.Errorf("MCP server %q: %w", name, err)
 	}
@@ -313,6 +374,10 @@ func NewLazyServer(name string, cachedTools []mcp.Tool, spawn func(context.Conte
 // user can edit mcp.toml and restart metis to retry.
 func (s *Server) ensureClient(ctx context.Context) error {
 	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return errMCPServerClosed
+	}
 	if s.client != nil {
 		s.mu.RUnlock()
 		return nil
@@ -327,18 +392,69 @@ func (s *Server) ensureClient(ctx context.Context) error {
 		return prevErr
 	}
 	s.spawnOnce.Do(func() {
-		client, err := s.spawn(ctx)
+		spawnCtx, cancel := context.WithCancel(ctx)
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if err != nil {
-			s.spawnErr = err
+		if s.closed {
+			s.spawnErr = errMCPServerClosed
+			s.mu.Unlock()
+			cancel()
 			return
 		}
-		s.client = client
+		s.spawnCancel = cancel
+		s.mu.Unlock()
+
+		client, err := s.spawn(spawnCtx)
+		cancel()
+		var closeClient *mcp.Client
+		s.mu.Lock()
+		s.spawnCancel = nil
+		switch {
+		case s.closed:
+			s.spawnErr = errMCPServerClosed
+			closeClient = client
+		case err != nil:
+			s.spawnErr = err
+		default:
+			s.client = client
+		}
+		s.mu.Unlock()
+		if closeClient != nil {
+			_ = closeClient.Close()
+		}
 	})
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.closed {
+		return errMCPServerClosed
+	}
 	return s.spawnErr
+}
+
+// clientForCall returns a stable, non-nil client reference for one operation.
+// Close deliberately clears s.client under the same mutex, so callers must not
+// split ensureClient and the client snapshot into separate unguarded steps: a
+// concurrent Close could otherwise win between them and turn the subsequent
+// method call into a nil-pointer panic.
+//
+// The returned Client remains a valid Go object even if Close starts after the
+// snapshot. Client.Close is concurrency-safe and cancels in-flight transport
+// work, so the operation then returns a normal transport-closed error.
+func (s *Server) clientForCall(ctx context.Context) (*mcp.Client, error) {
+	if err := s.ensureClient(ctx); err != nil {
+		return nil, err
+	}
+	return s.clientSnapshot()
+}
+
+func (s *Server) clientSnapshot() (*mcp.Client, error) {
+	s.mu.RLock()
+	c := s.client
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed || c == nil {
+		return nil, errMCPServerClosed
+	}
+	return c, nil
 }
 
 // IsSpawned reports whether the lazy server has connected its client
@@ -423,9 +539,23 @@ func (s *Server) FilteredTools(enabled, disabled []string) []tools.Tool {
 // including deferred ones; a "you never started this" error would be
 // noise.)
 func (s *Server) Close() error {
-	s.mu.RLock()
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
 	c := s.client
-	s.mu.RUnlock()
+	s.client = nil
+	cancel := s.spawnCancel
+	s.spawnCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if c == nil {
 		return nil
 	}
@@ -459,10 +589,11 @@ func (s *Server) ListPrompts(ctx context.Context) ([]mcp.Prompt, error) {
 // Forces the lazy server to spawn first, since rendering a prompt is
 // an explicit user action (a slash command invocation).
 func (s *Server) GetPrompt(ctx context.Context, name string, args map[string]string) (*mcp.GetPromptResult, error) {
-	if err := s.ensureClient(ctx); err != nil {
+	c, err := s.clientForCall(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return s.client.GetPrompt(ctx, name, args)
+	return c.GetPrompt(ctx, name, args)
 }
 
 // ListResources surfaces the underlying client's resources/list. Servers
@@ -478,13 +609,15 @@ func (s *Server) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 	return c.ListResources(ctx)
 }
 
-// ReadResource fetches one resource by URI. Forces a lazy server to spawn
-// first, since reading a resource is an explicit model action.
+// ReadResource fetches one resource by the opaque handle returned from
+// ListResources. Forces a lazy server to spawn first, since reading a resource
+// is an explicit model action.
 func (s *Server) ReadResource(ctx context.Context, uri string) (*mcp.ReadResourceResult, error) {
-	if err := s.ensureClient(ctx); err != nil {
+	c, err := s.clientForCall(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return s.client.ReadResource(ctx, uri)
+	return c.ReadResource(ctx, uri)
 }
 
 // friendlyMCPError wraps raw transport errors with actionable guidance

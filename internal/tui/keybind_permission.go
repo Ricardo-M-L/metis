@@ -141,7 +141,14 @@ func (m *Model) cyclePermissionMode() {
 			break
 		}
 	}
-	m.gate.SetMode(modes[nextIdx])
+	nextMode := modes[nextIdx]
+	if err := applyModelPermissionMode(m, nextMode); err != nil {
+		m.messages = append(m.messages, Message{
+			Role:      "error",
+			Content:   "permission mode unchanged: " + err.Error(),
+			Timestamp: now,
+		})
+	}
 	// Mode change is shown in the footer ("· plan mode on (shift+tab to
 	// cycle)"). We deliberately don't append a chat message — every
 	// Shift+Tab press would otherwise pollute history.

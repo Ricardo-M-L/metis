@@ -2,9 +2,12 @@ package builtin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,13 +16,42 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 type Grep struct {
 	tools.BaseTool
-	gate *permission.Gate
+	gate       *permission.Gate
+	sandbox    *sandbox.Manager
+	authorizer *invocationAuthorizer[grepPathBinding]
+	// Test seams used to make path swaps deterministic.
+	afterRootOpen func()
+	afterFileOpen func(string)
 }
+
+type grepPathBinding struct {
+	target      approvedExistingPath
+	inputDigest string
+}
+
+// NewGrep preserves the legacy unsandboxed construction path used by tests
+// and embedders. Runtime registration uses NewGrepWithSandbox.
+func NewGrep(gate *permission.Gate) Grep {
+	return Grep{gate: gate, authorizer: newInvocationAuthorizer[grepPathBinding]()}
+}
+
+func NewGrepWithSandbox(gate *permission.Gate, manager *sandbox.Manager) Grep {
+	return Grep{gate: gate, sandbox: manager, authorizer: newInvocationAuthorizer[grepPathBinding]()}
+}
+
+func (g Grep) WithSandbox(manager *sandbox.Manager) Grep {
+	g.sandbox = manager
+	return g
+}
+
+func (g Grep) SandboxManager() *sandbox.Manager { return g.sandbox }
 
 func (Grep) Name() string { return "Grep" }
 func (Grep) Description() string {
@@ -71,9 +103,48 @@ func (Grep) Concurrency(map[string]any) tools.Concurrency { return tools.Concurr
 // IsReadOnly: Grep never writes. Tags the tool_result for Snip.
 func (Grep) IsReadOnly(map[string]any) bool { return true }
 
-func (g Grep) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := g.gate.CheckPath(context.Background(), "Grep", searchPermissionInput(in), searchScopePath(in))
+func (g Grep) PrepareAuthorizedInvocation(ctx context.Context, in map[string]any) error {
+	root := resolvePathAgainstAgentCWD(ctx, searchScopePath(in))
+	target, err := prepareExistingPath(root, true)
+	if err != nil {
+		return err
+	}
+	if !target.matchesCurrent(target.targetInfo) {
+		return errors.New("Grep target changed during permission preparation")
+	}
+	g.authorizer.record(ctx, grepPathBinding{target: target, inputDigest: grepApprovalKey(in, root)})
+	return nil
+}
+
+func (g Grep) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	root := resolvePathAgainstAgentCWD(ctx, searchScopePath(in))
+	d, src := permission.DecisionAllow, ""
+	if g.gate != nil {
+		d, src = g.gate.CheckPath(ctx, "Grep", searchPermissionInput(in), root)
+	}
+	if d != permission.DecisionDeny {
+		if err := g.PrepareAuthorizedInvocation(ctx, in); err != nil {
+			return tools.PermissionDeny, security.RedactSubprocessText(err.Error())
+		}
+	}
 	return mapDecision(d), src
+}
+
+func grepApprovalKey(in map[string]any, effectiveRoot string) string {
+	// Keep abandoned approval records bounded even when an untrusted pattern or
+	// glob is huge. Length-prefix strings so distinct tuples cannot collide via
+	// separators, and include dynamic types for numeric input fidelity.
+	h := sha256.New()
+	writeString := func(s string) {
+		_, _ = fmt.Fprintf(h, "%d:", len(s))
+		_, _ = h.Write([]byte(s))
+	}
+	writeString(effectiveRoot)
+	writeString(searchScopePath(in))
+	writeString(strFromAny(in["pattern"]))
+	writeString(strFromAny(in["glob"]))
+	_, _ = fmt.Fprintf(h, "\x00%T:%v\x00%T:%v", in["max"], in["max"], in["offset"], in["offset"])
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func searchScopePath(in map[string]any) string {
@@ -116,7 +187,7 @@ const grepMaxFileSize = 5 << 20 // 5 MiB
 // when the context has no deadline.
 const grepWalkTimeout = 20 * time.Second
 
-func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	if ctx == nil {
 		ctx = context.Background() // defensive: ctx.Done() below must not panic
 	}
@@ -144,6 +215,8 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 	if root == "" {
 		root = "."
 	}
+	logicalRoot := root
+	root = resolvePathAgainstAgentCWD(ctx, root)
 	// max=0 → unlimited (escape hatch). Unset → DefaultGrepLimit.
 	maxRaw, hasMax := in["max"]
 	max := DefaultGrepLimit
@@ -162,6 +235,38 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 	if err != nil {
 		return nil, fmt.Errorf("bad regex: %w", err)
 	}
+	binding, hasInvocationID, foundBinding := g.authorizer.consume(ctx)
+	if hasInvocationID && !foundBinding {
+		if _, prepErr := prepareExistingPath(root, true); prepErr != nil {
+			return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(prepErr.Error()), IsError: true}, nil
+		}
+		return &tools.Result{Output: "Grep denied: permission binding missing for this invocation", IsError: true}, nil
+	}
+	if !hasInvocationID {
+		target, prepErr := prepareExistingPath(root, true)
+		if prepErr != nil {
+			return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(prepErr.Error()), IsError: true}, nil
+		}
+		binding = grepPathBinding{target: target, inputDigest: grepApprovalKey(in, root)}
+		if g.gate != nil {
+			decision, source := g.gate.CheckPath(ctx, "Grep", searchPermissionInput(in), root)
+			if decision != permission.DecisionAllow {
+				return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(source), IsError: true}, nil
+			}
+		}
+	}
+	if binding.inputDigest != grepApprovalKey(in, root) {
+		return &tools.Result{Output: "Grep denied: invocation input changed after permission check", IsError: true}, nil
+	}
+	rootHandle, resolvedRoot, err := openPinnedReadRoot(root, g.afterRootOpen)
+	if err != nil {
+		return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(err.Error()), IsError: true}, nil
+	}
+	defer rootHandle.Close()
+	openedRootInfo, statErr := rootHandle.Stat(".")
+	if statErr != nil || resolvedRoot != binding.target.resolvedPath || !os.SameFile(binding.target.targetInfo, openedRootInfo) {
+		return &tools.Result{Output: "Grep denied: search root changed after permission check", IsError: true}, nil
+	}
 
 	var b strings.Builder
 	skipped := 0   // matches skipped to honour `offset`
@@ -175,17 +280,24 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 	// cached file under ~/Library. (Pre-2026-06: only depth was honored — the
 	// item cap was discarded — so a low-hit search from $HOME walked the whole
 	// home tree for hours.)
-	rootAbs, _ := filepath.Abs(root)
-	rootClean := filepath.Clean(rootAbs)
-	walkDepthCap, walkItemCap := walkBudget(rootClean)
+	rootClean := resolvedRoot
+	walkDepthCap, walkItemCap := walkBudgetWithSandbox(ctx, rootClean, g.sandbox)
 
 	deadline := time.Now().Add(grepWalkTimeout)
 	filesScanned := 0
 	budgetHit := false
+	credentialFilesSkipped := 0
+	var pathChangedErr error
 
-	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(rootHandle.FS(), ".", func(relPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
+		}
+		path := logicalRoot
+		actualPath := root
+		if relPath != "." {
+			path = filepath.Join(logicalRoot, filepath.FromSlash(relPath))
+			actualPath = filepath.Join(root, filepath.FromSlash(relPath))
 		}
 		// Cancellable + time-bounded. The callback runs per entry, so this is
 		// the natural place to honor cancellation and the wall-clock budget —
@@ -207,14 +319,10 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 				return filepath.SkipDir
 			}
 			if walkDepthCap > 0 {
-				abs, aerr := filepath.Abs(path)
-				if aerr == nil {
-					rel, rerr := filepath.Rel(rootClean, filepath.Clean(abs))
-					if rerr == nil && rel != "." {
-						depth := strings.Count(rel, string(filepath.Separator)) + 1
-						if depth >= walkDepthCap {
-							return filepath.SkipDir
-						}
+				if relPath != "." {
+					depth := strings.Count(filepath.FromSlash(relPath), string(filepath.Separator)) + 1
+					if depth >= walkDepthCap {
+						return filepath.SkipDir
 					}
 				}
 			}
@@ -224,6 +332,13 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 		// device files — os.Open on a FIFO blocks forever waiting for a
 		// writer, which is the other way Grep used to hang.
 		if !d.Type().IsRegular() {
+			return nil
+		}
+		// A broad project Grep must not accidentally surface .env/package
+		// registry/cloud credentials merely because the caller named the parent
+		// directory rather than the sensitive file itself.
+		if permission.IsSecretReadPath(actualPath) {
+			credentialFilesSkipped++
 			return nil
 		}
 		if globPat != "" {
@@ -243,20 +358,59 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 		}
 		// Skip oversized files (logs / databases / binaries). Line-scanning a
 		// multi-GB file is slow and pollutes results with binary noise.
-		if info, ierr := d.Info(); ierr == nil && info.Size() > grepMaxFileSize {
+		info, ierr := d.Info()
+		if ierr != nil || !info.Mode().IsRegular() || info.Size() > grepMaxFileSize {
 			return nil
 		}
-		f, err := os.Open(path)
+		f, err := rootHandle.Open(relPath)
 		if err != nil {
 			return nil
 		}
-		defer f.Close()
-		sc := bufio.NewScanner(f)
+		if g.afterFileOpen != nil {
+			g.afterFileOpen(actualPath)
+		}
+		openedInfo, openErr := f.Stat()
+		afterInfo, afterErr := rootHandle.Lstat(relPath)
+		if openErr != nil || afterErr != nil || !openedInfo.Mode().IsRegular() ||
+			!os.SameFile(info, openedInfo) || !os.SameFile(openedInfo, afterInfo) {
+			_ = f.Close()
+			pathChangedErr = fmt.Errorf("search file changed while opening: %s", path)
+			return filepath.SkipAll
+		}
+		// Read the already size-bounded, pinned descriptor once. The source-aware
+		// redactor below uses the complete snapshot to retain credential context
+		// that a line-only Grep result would otherwise lose.
+		data, readErr := io.ReadAll(io.LimitReader(f, grepMaxFileSize+1))
+		openedAfter, statErr := f.Stat()
+		_ = f.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if statErr != nil || !os.SameFile(openedInfo, openedAfter) || openedInfo.Size() != openedAfter.Size() ||
+			!openedInfo.ModTime().Equal(openedAfter.ModTime()) {
+			pathChangedErr = fmt.Errorf("search file changed while reading: %s", path)
+			return filepath.SkipAll
+		}
+		if len(data) > grepMaxFileSize {
+			return nil
+		}
+		fileRedactor := security.NewFileCredentialRedactor(data)
+
+		sc := bufio.NewScanner(bytes.NewReader(data))
 		sc.Buffer(make([]byte, 1<<20), 1<<22)
 		lineno := 0
+		sourceLineStart := 0
 		for sc.Scan() {
 			lineno++
 			line := sc.Text()
+			currentLineStart := sourceLineStart
+			sourceLineStart += len(sc.Bytes())
+			if sourceLineStart < len(data) && data[sourceLineStart] == '\r' {
+				sourceLineStart++
+			}
+			if sourceLineStart < len(data) && data[sourceLineStart] == '\n' {
+				sourceLineStart++
+			}
 			if !re.MatchString(line) {
 				continue
 			}
@@ -269,15 +423,22 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 				limitHit = true
 				return filepath.SkipAll
 			}
-			fmt.Fprintf(&b, "%s:%d:%s\n", path, lineno, line)
+			line = fileRedactor.RedactLineAt(currentLineStart, line)
+			fmt.Fprintf(&b, "%s:%d:%s\n", path, lineno, security.RedactSubprocessText(line))
 			hits++
 		}
-		return nil
+		return sc.Err()
 	})
+	if pathChangedErr != nil {
+		return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(pathChangedErr.Error()), IsError: true}, nil
+	}
 	if err != nil && !errors.Is(err, filepath.SkipAll) {
 		return nil, err
 	}
 	if hits == 0 && skipped == 0 {
+		if credentialFilesSkipped > 0 {
+			return &tools.Result{Output: fmt.Sprintf("(no matches; %d credential file(s) skipped)", credentialFilesSkipped)}, nil
+		}
 		if budgetHit {
 			return &tools.Result{Output: "(no matches; search stopped early by the walk budget — pass a narrower `root` inside your project, this looks like an out-of-worktree / $HOME search)"}, nil
 		}
@@ -293,7 +454,52 @@ func (Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 	} else if offset > 0 && hits == 0 {
 		fmt.Fprintf(&b, "\n[offset %d past end of %d total matches]\n", offset, totalSeen)
 	}
-	return &tools.Result{Output: b.String()}, nil
+	if credentialFilesSkipped > 0 {
+		fmt.Fprintf(&b, "\n[%d credential file(s) skipped]\n", credentialFilesSkipped)
+	}
+	return &tools.Result{Output: security.RedactSubprocessText(b.String())}, nil
+}
+
+func openPinnedReadRoot(path string, afterOpen func()) (*os.Root, string, error) {
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return nil, "", err
+	}
+	lexicalBefore, err := os.Lstat(absPath)
+	if err != nil {
+		return nil, "", err
+	}
+	resolvedBefore, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, "", err
+	}
+	targetBefore, err := os.Stat(absPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if !targetBefore.IsDir() {
+		return nil, "", fmt.Errorf("search root is not a directory: %s", path)
+	}
+	root, err := os.OpenRoot(absPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if afterOpen != nil {
+		afterOpen()
+	}
+	openedInfo, openErr := root.Stat(".")
+	lexicalAfter, lexicalErr := os.Lstat(absPath)
+	resolvedAfter, resolvedErr := filepath.EvalSymlinks(absPath)
+	targetAfter, targetErr := os.Stat(absPath)
+	if openErr != nil || lexicalErr != nil || resolvedErr != nil || targetErr != nil ||
+		!openedInfo.IsDir() || !os.SameFile(targetBefore, openedInfo) ||
+		!os.SameFile(lexicalBefore, lexicalAfter) || !os.SameFile(openedInfo, targetAfter) ||
+		filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) {
+		_ = root.Close()
+		return nil, "", errors.Join(openErr, lexicalErr, resolvedErr, targetErr,
+			fmt.Errorf("search root changed while opening: %s", path))
+	}
+	return root, filepath.Clean(resolvedAfter), nil
 }
 
 // numberInt accepts both float64 (JSON default) and int representations.

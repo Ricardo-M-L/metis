@@ -20,7 +20,7 @@ func TestBypassPermissions_ReadOnlySensitivePathCommandAllows(t *testing.T) {
 	}
 }
 
-func TestBypassPermissions_SensitivePathWritesStillAsk(t *testing.T) {
+func TestBypassPermissions_SensitivePathWritesAreSilentlyDenied(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name string
@@ -40,6 +40,10 @@ func TestBypassPermissions_SensitivePathWritesStillAsk(t *testing.T) {
 		{name: "git textconv helper", tool: "Bash", cmd: `git show --textconv HEAD:.git/config`},
 		{name: "claude direct write", tool: "Write", cmd: `/Users/x/.claude/settings.json`},
 		{name: "git direct edit", tool: "Edit", cmd: `/work/project/.git/hooks/pre-commit`},
+		{name: "future metis command", tool: "Write", cmd: `/work/project/.metis/commands/unsafe.md`},
+		{name: "mixed case ssh write", tool: "Write", cmd: `/Users/x/.SSH/authorized_keys`},
+		{name: "mixed case metis edit", tool: "Edit", cmd: `/Users/x/.MeTiS/config.toml`},
+		{name: "mixed case git write", tool: "Write", cmd: `/work/project/.GiT/config`},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -47,8 +51,8 @@ func TestBypassPermissions_SensitivePathWritesStillAsk(t *testing.T) {
 			t.Parallel()
 			g := New(ModeBypassPermissions)
 			decision, source := g.Check(context.Background(), tc.tool, tc.cmd)
-			if decision != DecisionAsk || source != "safety_check:bypass_immune" {
-				t.Fatalf("%s(%q) = %v (%s), want ask safety_check:bypass_immune", tc.tool, tc.cmd, decision, source)
+			if decision != DecisionDeny || source != "safety_check:bypass_immune" {
+				t.Fatalf("%s(%q) = %v (%s), want deny safety_check:bypass_immune", tc.tool, tc.cmd, decision, source)
 			}
 		})
 	}
@@ -87,19 +91,20 @@ func TestSafetyPathProtectedDirectoryBoundary(t *testing.T) {
 	}
 }
 
-func TestBypassPermissions_SecretBashReadsStillAsk(t *testing.T) {
+func TestBypassPermissions_SecretBashReadsAreSilentlyDenied(t *testing.T) {
 	t.Parallel()
 	for _, cmd := range []string{
 		`cat ~/.ssh/id_ed25519`,
 		`cat ~/.aws/credentials 2>/dev/null || echo missing`,
+		`cat /work/project/.env.development.local`,
 	} {
 		cmd := cmd
 		t.Run(cmd, func(t *testing.T) {
 			t.Parallel()
 			g := New(ModeBypassPermissions)
 			decision, source := g.Check(context.Background(), "Bash", cmd)
-			if decision != DecisionAsk || source != "secret_read:bypass_immune" {
-				t.Fatalf("secret Bash read %q = %v (%s), want ask secret_read:bypass_immune", cmd, decision, source)
+			if decision != DecisionDeny || source != "secret_read:bypass_immune" {
+				t.Fatalf("secret Bash read %q = %v (%s), want deny secret_read:bypass_immune", cmd, decision, source)
 			}
 		})
 	}
@@ -126,8 +131,12 @@ func TestBypassPermissions_ExplicitAskAndDenyPrecedeReadOnlyExemption(t *testing
 				Source: tc.source,
 			})
 			decision, source := g.Check(context.Background(), "Bash", screenshotClaudeSkillsCommand)
-			if decision != tc.verb || source != tc.source {
-				t.Fatalf("explicit %s rule = %v (%s), want %v (%s)", tc.name, decision, source, tc.verb, tc.source)
+			want := tc.verb
+			if want == DecisionAsk {
+				want = DecisionDeny
+			}
+			if decision != want || source != tc.source {
+				t.Fatalf("explicit %s rule = %v (%s), want %v (%s)", tc.name, decision, source, want, tc.source)
 			}
 		})
 	}
@@ -140,7 +149,24 @@ func TestBypassPermissions_ExplicitAllowCannotOverrideSensitiveWrite(t *testing.
 	g.AppendRules(Rule{Tool: "Bash", Match: command, Verb: DecisionAllow, Source: "interactive"})
 
 	decision, source := g.Check(context.Background(), "Bash", command)
-	if decision != DecisionAsk || source != "safety_check:bypass_immune" {
-		t.Fatalf("explicit allow for sensitive write = %v (%s), want ask safety_check:bypass_immune", decision, source)
+	if decision != DecisionDeny || source != "safety_check:bypass_immune" {
+		t.Fatalf("explicit allow for sensitive write = %v (%s), want deny safety_check:bypass_immune", decision, source)
+	}
+}
+
+func TestBypassPermissions_DenialBreakerNeverPromotesDenyToAsk(t *testing.T) {
+	t.Parallel()
+	g := New(ModeBypassPermissions)
+	g.AppendRules(Rule{Tool: "Bash", Verb: DecisionDeny, Source: "policy:deny"})
+
+	for i := 0; i < 6; i++ {
+		decision, source := g.Check(context.Background(), "Bash", "echo blocked")
+		if decision != DecisionDeny {
+			t.Fatalf("call %d after breaker activity = %v (%s), want deny", i+1, decision, source)
+		}
+	}
+	_, _, fallback := g.DenialState()
+	if !fallback {
+		t.Fatal("test prerequisite: denial breaker did not enter fallback state")
 	}
 }

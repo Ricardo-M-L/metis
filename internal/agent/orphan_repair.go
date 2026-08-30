@@ -13,8 +13,8 @@
 // user message ("你这是停止了吗") with no tool_result in between. On
 // resume the API would 400; the model couldn't recover.
 //
-// The repair walks the messages, builds the set of tool_use_ids
-// that lack a downstream tool_result, and synthesizes a stub
+// The repair walks the messages, pairs tool_use occurrences with
+// downstream tool_results, and synthesizes a stub
 // `(tool_use never completed — turn interrupted)` user message
 // containing one tool_result per orphan. Always idempotent — a
 // fully-paired history is returned unchanged.
@@ -36,58 +36,60 @@ const orphanRepairMessage = "(tool_use never completed — turn was interrupted 
 // slice. Safe to call on nil or empty input. Idempotent: calling
 // twice produces the same result as calling once.
 //
-// "Matching" = same tool_use_id appears in any tool_result block of
-// any user-role message strictly after the assistant message that
-// emitted the tool_use. Order matters because a hypothetical message
-// chain like:
+// "Matching" is one-to-one and chronological: a tool_result consumes
+// one earlier, still-unmatched tool_use with the same id. Order matters
+// because a hypothetical message chain like:
 //
 //	user(tool_result id=A)  ← stale, from prior turn
 //	assistant(tool_use id=A) ← orphan; the result above is unrelated
 //
-// should still flag A as orphaned. The pre-scan therefore only counts
-// tool_results that appear AFTER each tool_use's position.
+// should still flag A as orphaned. A result consumed by an earlier use
+// likewise cannot satisfy a later provider reuse of the same id.
 func RepairOrphanedToolUses(messages []llm.Message) []llm.Message {
 	if len(messages) == 0 {
 		return messages
 	}
 
-	// Walk in order; for each tool_use, remember its index. When we
-	// see a tool_result with matching id, mark satisfied. At the end,
-	// any unsatisfied id is an orphan.
+	// Walk in order. Each id owns a queue of unmatched tool_use
+	// occurrences; a downstream result consumes the oldest occurrence,
+	// preserving message order even when a provider reuses an id.
 	type pending struct {
-		id  string
-		idx int // index of the assistant msg that emitted it
+		id      string
+		matched bool
 	}
 	var open []pending
-	satisfied := make(map[string]struct{})
+	pendingByID := make(map[string][]int)
 
-	for i, m := range messages {
+	for _, m := range messages {
 		for _, b := range m.Content {
 			switch b.Type {
 			case "tool_use":
 				if b.ToolUseID != "" {
-					open = append(open, pending{id: b.ToolUseID, idx: i})
+					idx := len(open)
+					open = append(open, pending{id: b.ToolUseID})
+					pendingByID[b.ToolUseID] = append(pendingByID[b.ToolUseID], idx)
 				}
 			case "tool_result":
-				if b.ToolUseID != "" {
-					satisfied[b.ToolUseID] = struct{}{}
+				queue := pendingByID[b.ToolUseID]
+				if b.ToolUseID == "" || len(queue) == 0 {
+					continue
+				}
+				open[queue[0]].matched = true
+				if len(queue) == 1 {
+					delete(pendingByID, b.ToolUseID)
+				} else {
+					pendingByID[b.ToolUseID] = queue[1:]
 				}
 			}
 		}
 	}
 
-	// Filter open → only those whose id never appeared in any
-	// tool_result block. Preserve order (== order of emission).
+	// Preserve occurrence order, including repeated provider ids.
 	var orphans []string
-	seenOrphan := make(map[string]struct{})
 	for _, p := range open {
-		if _, ok := satisfied[p.id]; ok {
+		if p.matched {
 			continue
 		}
-		if _, dup := seenOrphan[p.id]; dup {
-			continue
-		}
-		seenOrphan[p.id] = struct{}{}
 		orphans = append(orphans, p.id)
 	}
 	if len(orphans) == 0 {

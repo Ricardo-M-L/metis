@@ -65,10 +65,18 @@ func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *per
 	bashTool := bash.New(gate, cfg.Tools.Bash)
 	gitTool := NewGit(gate)
 	runCode := NewRunCode(gate)
+	lspTool := NewLSP(gate)
+	lsTool := NewLS(gate)
+	globTool := NewGlob(gate)
+	grepTool := NewGrep(gate)
 	if manager != nil {
 		bashTool = bash.NewWithSandbox(gate, cfg.Tools.Bash, manager)
 		gitTool = NewGitWithSandbox(gate, manager)
 		runCode = NewRunCodeWithSandbox(gate, manager)
+		lspTool = NewLSPWithSandbox(gate, manager)
+		lsTool = NewLSWithSandbox(gate, manager)
+		globTool = NewGlobWithSandbox(gate, manager)
+		grepTool = NewGrepWithSandbox(gate, manager)
 	}
 	goalCreate := NewGoalCreate(gate)
 	goalUpdate := NewGoalUpdate(gate)
@@ -80,13 +88,13 @@ func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *per
 
 	all := []tools.Tool{
 		NewArtifact(gate),
-		Read{gate: gate, state: sessionReadState},
-		Write{gate: gate, state: sessionReadState},
-		Edit{gate: gate, state: sessionReadState},
+		Read{gate: gate, state: sessionReadState, authorizer: newReadPathAuthorizer()},
+		Write{gate: gate, state: sessionReadState, authorizer: newInvocationAuthorizer[approvedWriteTarget]()},
+		Edit{gate: gate, state: sessionReadState, authorizer: newInvocationAuthorizer[approvedExistingPath]()},
 		bashTool,
-		LS{gate: gate},
-		Glob{gate: gate},
-		Grep{gate: gate},
+		lsTool,
+		globTool,
+		grepTool,
 		WebFetch{gate: gate},
 		WebBrowse{gate: gate},
 		ViewImage{gate: gate},
@@ -102,7 +110,7 @@ func RegisterWithDirsAndSandbox(r *tools.Registry, cfg *config.Config, gate *per
 		TaskUpdate{gate: gate},
 		TaskOutput{gate: gate},
 		TaskStop{gate: gate},
-		LSP{gate: gate},
+		lspTool,
 		&runCode,
 		&goalCreate,
 		&goalUpdate,

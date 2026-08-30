@@ -168,6 +168,16 @@ type parentGateBoundBoundaryTool struct {
 	gate *permission.Gate
 }
 
+type boundaryOptionalCapabilitiesTool struct {
+	parentGateBoundBoundaryTool
+}
+
+func (boundaryOptionalCapabilitiesTool) CanAutoAllowInBypass(map[string]any) bool { return true }
+func (boundaryOptionalCapabilitiesTool) TimeoutMs() int                           { return 4321 }
+func (boundaryOptionalCapabilitiesTool) ToolExposure() tools.ToolExposure {
+	return tools.ToolExposureDeferred
+}
+
 func (t parentGateBoundBoundaryTool) Name() string        { return t.name }
 func (t parentGateBoundBoundaryTool) Description() string { return "boundary test tool" }
 func (t parentGateBoundBoundaryTool) InputSchema() map[string]any {
@@ -218,5 +228,29 @@ func TestAgentPlanChildRegistryFreezesGateAndRemovesEscapeTools(t *testing.T) {
 	}
 	if got, reason := read.CanUse(context.Background(), map[string]any{"path": "/tmp/x"}); got != tools.PermissionAllow {
 		t.Fatalf("Read after parent mode drift = (%v, %q), want allow", got, reason)
+	}
+}
+
+func TestAgentChildRegistryPreservesBypassAndTimeoutCapabilities(t *testing.T) {
+	gate := permission.New(permission.ModeBypassPermissions)
+	parent := tools.NewRegistry()
+	parent.Register(boundaryOptionalCapabilitiesTool{parentGateBoundBoundaryTool{
+		name: "OptionalCapabilities",
+		gate: gate,
+	}})
+
+	child := agentChildRegistry(parent, gate.Clone(), false)
+	wrapped, ok := child.Get("OptionalCapabilities")
+	if !ok {
+		t.Fatal("child registry lost optional-capabilities tool")
+	}
+	if !tools.CanAutoAllowInBypass(wrapped, map[string]any{"value": "test"}) {
+		t.Fatal("child wrapper lost CanAutoAllowInBypass opt-in")
+	}
+	if got := tools.TimeoutMs(wrapped); got != 4321 {
+		t.Fatalf("child wrapper TimeoutMs = %d, want 4321", got)
+	}
+	if got := tools.EffectiveExposure(wrapped); got != tools.ToolExposureDeferred {
+		t.Fatalf("child wrapper exposure = %q, want deferred", got)
 	}
 }

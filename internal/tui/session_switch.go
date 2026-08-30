@@ -213,14 +213,14 @@ func (m *Model) persistActiveSessionState() error {
 	if m == nil || m.session == nil || m.gate == nil || m.loop == nil || m.sessionID == "" {
 		return nil
 	}
-	return persistSessionState(m.session, m.sessionID, m.gate, m.providerName, m.model, m.loop.System)
+	return persistSessionState(m.session, m.sessionID, m.gate, m.loop, m.providerName, m.model, m.loop.System)
 }
 
 func persistPermissionState(store *session.Store, sessionID string, gate *permission.Gate) error {
-	return persistSessionState(store, sessionID, gate, "", "", "")
+	return persistSessionState(store, sessionID, gate, nil, "", "", "")
 }
 
-func persistSessionState(store *session.Store, sessionID string, gate *permission.Gate, providerName, model, system string) error {
+func persistSessionState(store *session.Store, sessionID string, gate *permission.Gate, controller rtpkg.PermissionPlanController, providerName, model, system string) error {
 	if store == nil || gate == nil || sessionID == "" {
 		return nil
 	}
@@ -233,18 +233,39 @@ func persistSessionState(store *session.Store, sessionID string, gate *permissio
 			Tool: rule.Tool, Match: rule.Match, Verb: int(rule.Verb), Source: rule.Source,
 		})
 	}
+	prePlanMode := ""
+	if gate.Mode() == permission.ModePlan {
+		prePlanMode = string(permission.ModeDefault)
+		if controller != nil {
+			previous, ok := permission.ParseMode(controller.PrePlanMode())
+			if !ok || previous == permission.ModePlan {
+				return fmt.Errorf("persist session %s: invalid pre-plan permission mode %q", sessionID, controller.PrePlanMode())
+			}
+			prePlanMode = string(previous)
+		}
+	}
 	if err := store.WriteHeaderFull(session.Header{
 		ID:               sessionID,
 		Provider:         providerName,
 		Model:            model,
 		System:           system,
 		Mode:             string(gate.Mode()),
+		PrePlanMode:      prePlanMode,
 		AlwaysAllow:      rules,
 		ClearAlwaysAllow: len(rules) == 0,
 	}); err != nil {
 		return fmt.Errorf("persist session %s state: %w", sessionID, err)
 	}
 	return nil
+}
+
+func systemPromptKindForSections(sections []llm.SystemSection) string {
+	for _, section := range sections {
+		if section.Name == "identity" {
+			return session.SystemPromptKindDefault
+		}
+	}
+	return session.SystemPromptKindCustom
 }
 
 func (r *REPL) freshPermissionMode() permission.Mode {
@@ -263,8 +284,14 @@ func (r *REPL) rebindFreshSession(id string) {
 		r.historyCursor.Mark(r.Loop.History())
 	}
 	rtpkg.RebindLoopRuntime(r.Loop, r.Loop.Provider, r.model, r.Loop.System, id)
-	r.Gate.ResetSessionState(r.freshPermissionMode(), nil)
-	r.Loop.SetPrePlanMode("")
+	mode := r.freshPermissionMode()
+	prePlanMode := ""
+	if mode == permission.ModePlan {
+		prePlanMode = string(permission.ModeDefault)
+	}
+	r.Loop.SetPrePlanMode(prePlanMode)
+	r.Gate.ResetSessionState(mode, nil)
+	rtpkg.SynchronizeRestoredPermissionState(r.Gate, r.Loop, prePlanMode)
 	r.Loop.TimingSink = r.Session.NewTimingRecorder(id).Record
 	r.totalTokens.Reset()
 	if r.SessionSwitch != nil {
@@ -277,14 +304,15 @@ func (r *REPL) startFreshSession() (string, error) {
 	if r == nil || r.Session == nil || r.Loop == nil || r.Gate == nil {
 		return "", fmt.Errorf("session runtime unavailable")
 	}
-	if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.providerName, r.model, r.Loop.System); err != nil {
+	if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.Loop, r.providerName, r.model, r.Loop.System); err != nil {
 		return "", err
 	}
 	id := r.Session.NewSessionID()
 	system := r.baseSystem
 	cwd, _ := os.Getwd()
 	if err := r.Session.WriteHeaderFull(session.Header{
-		ID: id, Provider: r.providerName, Model: r.model, System: system, WorkDir: cwd,
+		ID: id, Provider: r.providerName, Model: r.model, System: system,
+		SystemPromptKind: systemPromptKindForSections(r.baseSystemSections), WorkDir: cwd,
 		Mode: string(r.freshPermissionMode()),
 	}); err != nil {
 		return "", err
@@ -303,7 +331,7 @@ func (r *REPL) branchSession() (string, error) {
 	if r == nil || r.Session == nil || r.Loop == nil || r.Gate == nil || r.SessionID == "" {
 		return "", fmt.Errorf("session runtime unavailable")
 	}
-	if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.providerName, r.model, r.Loop.System); err != nil {
+	if err := persistSessionState(r.Session, r.SessionID, r.Gate, r.Loop, r.providerName, r.model, r.Loop.System); err != nil {
 		return "", err
 	}
 	id, err := r.Session.Branch(r.SessionID, r.Loop.History())
@@ -337,7 +365,8 @@ func (m *Model) createFreshSession() (string, *session.Header, error) {
 	system := m.baseSystem
 	cwd, _ := os.Getwd()
 	hdr := &session.Header{
-		ID: id, Provider: m.providerName, Model: m.model, System: system, WorkDir: cwd,
+		ID: id, Provider: m.providerName, Model: m.model, System: system,
+		SystemPromptKind: systemPromptKindForSections(m.baseSystemSections), WorkDir: cwd,
 		Mode: string(m.freshPermissionMode()),
 	}
 	if err := m.session.WriteHeaderFull(*hdr); err != nil {
@@ -401,6 +430,20 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	sourceBaseSystem := m.baseSystem
 	sourceBaseSections := append([]llm.SystemSection(nil), m.baseSystemSections...)
 	sourceSessionID := m.sessionID
+	restoreSourceRuntime := func() {
+		m.loop.RebindProviderRuntime(
+			sourceRuntime.Provider,
+			sourceRuntime.Model,
+			sourceRuntime.MaxOutputTokens,
+			sourceRuntime.System,
+			sourceRuntime.SystemSections,
+		)
+		m.model = sourceModel
+		m.providerName = sourceProviderName
+		m.baseSystem = sourceBaseSystem
+		m.baseSystemSections = sourceBaseSections
+		rtpkg.RebindLoopRuntime(m.loop, sourceRuntime.Provider, sourceRuntime.Model, sourceRuntime.System, sourceSessionID)
+	}
 
 	// Provider/model preflight must happen before any other live state changes.
 	// switchModel itself is atomic on BuildProvider failure. Session activation
@@ -435,19 +478,34 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	// switch so leaving plan mode actually removes the old static restriction.
 	destinationSystem := ""
 	if hdr != nil {
-		destinationSystem = rtpkg.RemoveLegacyPlanOverlay(hdr.System)
+		if hdr.SystemPromptKind == session.SystemPromptKindDefault {
+			destinationSystem = m.baseSystem
+		} else {
+			destinationSystem = rtpkg.RemoveLegacyPlanOverlay(hdr.System)
+		}
 		if destinationSystem != hdr.System && destinationSystem != "" {
 			if err := m.session.WriteHeaderFull(session.Header{ID: id, System: destinationSystem}); err != nil {
+				restoreSourceRuntime()
 				return fmt.Errorf("clean legacy plan overlay from session %s: %w", shortID(id), err)
 			}
 		}
 	}
 
 	mode := m.freshPermissionMode()
+	prePlanMode := ""
+	if mode == permission.ModePlan {
+		prePlanMode = string(permission.ModeDefault)
+	}
 	var resumedRules []permission.Rule
 	if restorePermissions && hdr != nil {
-		if hdr.Mode != "" {
-			mode = permission.Mode(hdr.Mode)
+		validatedMode, validatedPrePlan, hasMode, err := rtpkg.ValidateRestoredPermissionState(hdr.Mode, hdr.PrePlanMode, mode)
+		if err != nil {
+			restoreSourceRuntime()
+			return fmt.Errorf("restore permission state for %s: %w", shortID(id), err)
+		}
+		if hasMode {
+			mode = validatedMode
+			prePlanMode = validatedPrePlan
 		}
 		resumedRules = make([]permission.Rule, 0, len(hdr.AlwaysAllow))
 		for _, rule := range hdr.AlwaysAllow {
@@ -458,6 +516,10 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 			})
 		}
 	}
+	if err := rtpkg.PreflightRestoredPermissionState(m.ext.Sandbox, mode, prePlanMode); err != nil {
+		restoreSourceRuntime()
+		return fmt.Errorf("restore permission boundary for %s: %w", shortID(id), err)
+	}
 
 	// The destination preflight has passed. Flush/join source distillation and
 	// save its Daily note before the source ID/history can be replaced. Auto
@@ -467,18 +529,7 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 		// preflight. A later durability failure must still leave the source
 		// completely usable, so restore that coherent runtime snapshot before
 		// reporting the failed switch.
-		m.loop.RebindProviderRuntime(
-			sourceRuntime.Provider,
-			sourceRuntime.Model,
-			sourceRuntime.MaxOutputTokens,
-			sourceRuntime.System,
-			sourceRuntime.SystemSections,
-		)
-		m.model = sourceModel
-		m.providerName = sourceProviderName
-		m.baseSystem = sourceBaseSystem
-		m.baseSystemSections = sourceBaseSections
-		rtpkg.RebindLoopRuntime(m.loop, sourceRuntime.Provider, sourceRuntime.Model, sourceRuntime.System, sourceSessionID)
+		restoreSourceRuntime()
 		return fmt.Errorf("persist source session memory: %w", err)
 	}
 	// Ephemeral cron jobs belong to the session being left. Keeping them in
@@ -487,10 +538,11 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	if m.cronSvc != nil {
 		m.cronSvc.ClearEphemeral()
 	}
+	m.loop.SetPrePlanMode(prePlanMode)
 	m.gate.ResetSessionState(mode, resumedRules)
-	m.loop.SetPrePlanMode("")
+	rtpkg.SynchronizeRestoredPermissionState(m.gate, m.loop, prePlanMode)
 
-	if hdr != nil && hdr.System != "" {
+	if hdr != nil && (hdr.System != "" || hdr.SystemPromptKind == session.SystemPromptKindDefault) {
 		m.loop.System = destinationSystem
 		if destinationSystem == m.baseSystem {
 			m.loop.SystemSections = append([]llm.SystemSection(nil), m.baseSystemSections...)

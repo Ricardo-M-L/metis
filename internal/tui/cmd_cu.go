@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
+	"github.com/Ricardo-M-L/metis/internal/tools"
+	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
 
 // cuServerName is the MCP-side name we hardcode. It mirrors Anthropic's
@@ -83,19 +85,29 @@ func cuEnable(r *REPL) string {
 	// Hot-load into the live registry so tools are usable this turn.
 	// Use the same 30s timeout as /mcp start; metis-cu spawns
 	// near-instantly so this is a generous upper bound.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	base := context.Background()
+	if r != nil && r.ctx != nil {
+		base = r.ctx
+	}
+	ctx, cancel := context.WithTimeout(base, 30*time.Second)
 	defer cancel()
 	if r != nil && r.Loop != nil && r.Loop.Registry != nil {
-		srv, err := mcp.LaunchServer(ctx, reg, cuServerName, r.Loop.Registry)
+		staged := tools.NewRegistry()
+		srv, err := launchMCPServerWithLifecycle(ctx, base, func(liveCtx context.Context) (*mcptools.Server, error) {
+			return mcp.LaunchServerWithSandbox(liveCtx, reg, cuServerName, staged, r.sandbox)
+		})
 		if err != nil {
 			// Persistence already succeeded — the next metis start
 			// will spawn it. Surface the live-load error so the user
 			// knows tools won't appear until restart.
 			return fmt.Sprintf("cu: enabled in mcp.toml but live-load failed: %v\n  (tools will appear on next metis start)", err)
 		}
-		toolCount := 0
-		if srv != nil {
-			toolCount = len(srv.Tools())
+		toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(
+			r.Loop.Registry, cuServerName,
+			mcpLoginLaunch{server: srv, tools: staged.All()}, r.AdoptMCPServer,
+		)
+		if ownsServer {
+			r.mcpLoginServers = append(r.mcpLoginServers, srv)
 		}
 		verb := "enabled"
 		if existed {

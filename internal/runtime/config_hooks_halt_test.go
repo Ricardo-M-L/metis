@@ -39,6 +39,17 @@ func TestParsePreTool_HaltDecision(t *testing.T) {
 	}
 }
 
+func TestParsePreTool_DecisionWhitespaceIsCanonicalized(t *testing.T) {
+	deny := parsePreToolUseResponse([]byte(`{"decision":" deny ","reason":"policy"}`))
+	if deny == nil || deny.Output == nil || !deny.Output.IsError {
+		t.Fatalf("whitespace-padded deny failed open: %#v", deny)
+	}
+	halt := parsePreToolUseResponse([]byte(`{"decision":" halt ","reason":"policy"}`))
+	if halt == nil || !halt.Halt || halt.Output == nil || !halt.Output.IsError {
+		t.Fatalf("whitespace-padded halt failed open: %#v", halt)
+	}
+}
+
 func TestParsePreTool_HaltFlagAlongsideDeny(t *testing.T) {
 	got := parsePreToolUseResponse([]byte(`{"decision":"deny","reason":"no","halt":true}`))
 	if got == nil || !got.Halt {

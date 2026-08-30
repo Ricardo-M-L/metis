@@ -44,13 +44,13 @@ func TestSearchCanUse_IncludesRootInRuleMatching(t *testing.T) {
 	}
 }
 
-func TestGrepCanUse_SecretRootStillAsksInBypass(t *testing.T) {
+func TestGrepCanUse_SecretRootIsSilentlyDeniedInBypass(t *testing.T) {
 	gate := permission.New(permission.ModeBypass)
 	tool := Grep{gate: gate}
 	got, source := tool.CanUse(context.Background(), map[string]any{
 		"root": "/Users/alice/.ssh", "pattern": "PRIVATE KEY",
 	})
-	if got != tools.PermissionAsk || source != "secret_read:bypass_immune" {
-		t.Fatalf("Grep secret root = %v (%s), want bypass-immune ask", got, source)
+	if got != tools.PermissionDeny || source != "secret_read:bypass_immune" {
+		t.Fatalf("Grep secret root = %v (%s), want bypass-immune deny", got, source)
 	}
 }

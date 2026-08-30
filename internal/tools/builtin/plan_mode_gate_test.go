@@ -57,6 +57,16 @@ func TestEnterPlanMode_CanUseRequiresApproval(t *testing.T) {
 	}
 }
 
+func TestEnterPlanMode_CanUseBypassDoesNotAsk(t *testing.T) {
+	g := permission.New(permission.ModeBypassPermissions)
+	tool := NewEnterPlanModeWithGate(g)
+
+	perm, reason := tool.CanUse(context.Background(), nil)
+	if perm != tools.PermissionAllow {
+		t.Fatalf("CanUse permission = %v (%s), want ALLOW in bypassPermissions", perm, reason)
+	}
+}
+
 func TestEnterPlanMode_CanUseAlreadyPlanningIsIdempotent(t *testing.T) {
 	g := permission.New(permission.ModePlan)
 	tool := NewEnterPlanModeWithGate(g)
@@ -111,6 +121,45 @@ func TestExitPlanMode_WithGate_RestoresPrePlanMode(t *testing.T) {
 	}
 	if ctrl.PrePlanMode() != "" {
 		t.Errorf("PrePlanMode should be cleared after restore; got %q", ctrl.PrePlanMode())
+	}
+}
+
+func TestExitPlanMode_BypassPrePlanModeAutoApprovesWithoutUI(t *testing.T) {
+	g := permission.New(permission.ModePlan)
+	tool := NewExitPlanModeWithGate(g)
+	ctrl := &stubPlanController{pre: string(permission.ModeBypassPermissions)}
+	ctx := agent.WithPlanController(context.Background(), ctrl)
+
+	res, err := tool.Execute(ctx, map[string]any{"plan": "step 1: do X"})
+	if err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	if res == nil || res.IsError {
+		t.Fatalf("bypass plan exit should auto-approve, got %+v", res)
+	}
+	if g.Mode() != permission.ModeBypassPermissions {
+		t.Fatalf("Gate mode = %q, want bypassPermissions", g.Mode())
+	}
+	if ctrl.PrePlanMode() != "" {
+		t.Fatalf("pre-plan snapshot = %q, want cleared", ctrl.PrePlanMode())
+	}
+}
+
+func TestBypassPlanLineageEndsAfterManualModeChange(t *testing.T) {
+	g := permission.New(permission.ModeDefault)
+	ctrl := &stubPlanController{pre: string(permission.ModeBypassPermissions)}
+	ctx := agent.WithPlanController(context.Background(), ctrl)
+
+	if isBypassUnattendedLineage(ctx, g) {
+		t.Fatal("stale pre-plan snapshot treated default mode as unattended")
+	}
+	exit := NewExitPlanModeWithGate(g)
+	res, err := exit.Execute(ctx, map[string]any{"plan": "step 1"})
+	if err != nil || res == nil || !res.IsError {
+		t.Fatalf("stale ExitPlanMode = (%+v, %v), want structured error", res, err)
+	}
+	if ctrl.PrePlanMode() != "" || g.Mode() != permission.ModeDefault {
+		t.Fatalf("stale plan state not cleared: pre=%q mode=%q", ctrl.PrePlanMode(), g.Mode())
 	}
 }
 

@@ -30,14 +30,22 @@ type WebFetch struct {
 
 func (WebFetch) Name() string { return "WebFetch" }
 func (WebFetch) Description() string {
-	return "Fetch a URL and return the response body (truncated). HTML is returned as-is; caller is expected to extract relevant info."
+	return "Fetch a known absolute URL and return its static response body (truncated). " +
+		"Does not execute JavaScript. Not for keyword search; use WebSearch for discovery, " +
+		"or WebBrowse only when this fetch is insufficient for a JavaScript-rendered page."
 }
+
+func (WebFetch) SearchHint() string { return "fetch known absolute url static content" }
+
 func (WebFetch) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"url"},
 		"properties": map[string]any{
-			"url":        map[string]any{"type": "string"},
+			"url": map[string]any{
+				"type":        "string",
+				"description": "Known absolute http(s) URL to fetch; not a keyword query.",
+			},
 			"max_bytes":  map[string]any{"type": "integer"},
 			"timeout_ms": map[string]any{"type": "integer"},
 		},

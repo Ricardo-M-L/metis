@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -75,6 +76,11 @@ type Request struct {
 	// Network defaults to allow. Block asks the OS backend to remove network
 	// access rather than relying on proxy environment variables.
 	Network NetworkPolicy
+	// MinimumMode can raise an otherwise-off command to the permissions
+	// sandbox. It never weakens the Manager's effective mode and deliberately
+	// does not accept auto-allow, because prompt policy is runtime state rather
+	// than a per-process property.
+	MinimumMode Mode
 }
 
 // Options configures a Manager.
@@ -98,22 +104,34 @@ type State struct {
 	Configured         Mode
 	RuntimeOverride    Mode
 	HasRuntimeOverride bool
-	Effective          Mode
-	AutoAllow          bool
+	// CredentialIsolationRequired is a security floor installed by
+	// bypassPermissions. It is independent from the user's configured/runtime
+	// sandbox selection so leaving bypass restores that selection exactly.
+	CredentialIsolationRequired bool
+	Effective                   Mode
+	AutoAllow                   bool
 }
 
 // Manager owns sandbox state for one runtime. It is safe for concurrent use.
 // Call Close after the runtime and all commands it started have stopped.
 type Manager struct {
 	mu sync.RWMutex
+	// leases tracks long-lived subprocesses that may still be using tempDir.
+	// Close rejects new leases first, then waits for existing owners before
+	// deleting the directory. A plain Wrap remains suitable for short-lived
+	// callers whose enclosing runtime already guarantees shutdown ordering.
+	leases    sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 
-	configured         Mode
-	network            NetworkPolicy
-	runtimeOverride    Mode
-	hasRuntimeOverride bool
-	tempDir            string
-	metisHome          string
-	closed             bool
+	configured                  Mode
+	network                     NetworkPolicy
+	runtimeOverride             Mode
+	hasRuntimeOverride          bool
+	credentialIsolationRequired bool
+	tempDir                     string
+	metisHome                   string
+	closed                      bool
 }
 
 // NewManager creates a per-runtime manager using the default temporary root.
@@ -166,26 +184,33 @@ func (m *Manager) Close() error {
 	if m == nil {
 		return nil
 	}
-	m.mu.Lock()
-	if m.closed {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		tempDir := m.tempDir
 		m.mu.Unlock()
-		return nil
-	}
-	m.closed = true
-	tempDir := m.tempDir
-	m.tempDir = ""
-	m.mu.Unlock()
-	if tempDir == "" {
-		return nil
-	}
-	if err := os.RemoveAll(tempDir); err != nil {
-		return fmt.Errorf("sandbox: remove private temp directory: %w", err)
-	}
-	return nil
+
+		// No Acquire can increment the WaitGroup after closed is published:
+		// Acquire performs its closed check and Add while holding m.mu. This
+		// makes Wait safe even when Close races with process construction.
+		m.leases.Wait()
+
+		m.mu.Lock()
+		m.tempDir = ""
+		m.mu.Unlock()
+		if tempDir != "" {
+			if err := os.RemoveAll(tempDir); err != nil {
+				m.closeErr = fmt.Errorf("sandbox: remove private temp directory: %w", err)
+			}
+		}
+	})
+	return m.closeErr
 }
 
 // TempDir returns the private directory writable by sandboxed commands. It is
-// empty after Close. Runtimes may set TMPDIR to this value before Wrap.
+// empty after Close returns. Active Acquire leases keep it available while a
+// concurrent Close is draining subprocesses. Runtimes may set TMPDIR to this
+// value before Wrap.
 func (m *Manager) TempDir() string {
 	if m == nil {
 		return ""
@@ -253,6 +278,54 @@ func (m *Manager) ClearRuntimeMode() {
 // ClearRuntimeOverride is an explicit-name alias for ClearRuntimeMode.
 func (m *Manager) ClearRuntimeOverride() { m.ClearRuntimeMode() }
 
+// RequireCredentialIsolation installs or removes the filesystem-isolation
+// floor used by bypassPermissions. Enabling the floor is fail-closed: the
+// permission posture must not change to unattended on a platform where Metis
+// cannot enforce its credential boundary. Removing it restores the user's
+// configured/runtime sandbox selection without clobbering either value.
+func (m *Manager) RequireCredentialIsolation(required bool) error {
+	if m == nil {
+		return ErrManagerClosed
+	}
+	if required {
+		if err := m.PreflightCredentialIsolation(); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
+	m.credentialIsolationRequired = required
+	return nil
+}
+
+// PreflightCredentialIsolation verifies that the current runtime can enforce
+// the filesystem boundary required by bypassPermissions without mutating
+// manager state. Session switching uses this before it closes the source
+// session, so a destination that cannot be restored safely never becomes the
+// active session and is never reported as a successful resume.
+func (m *Manager) PreflightCredentialIsolation() error {
+	if m == nil {
+		return ErrManagerClosed
+	}
+	m.mu.RLock()
+	closed := m.closed
+	m.mu.RUnlock()
+	if closed {
+		return ErrManagerClosed
+	}
+	diagnostic := Doctor()
+	if !diagnostic.Available {
+		if diagnostic.Err != nil {
+			return fmt.Errorf("sandbox: bypassPermissions credential isolation is unavailable: %w", diagnostic.Err)
+		}
+		return fmt.Errorf("sandbox: bypassPermissions credential isolation is unavailable on %s", diagnostic.Platform)
+	}
+	return nil
+}
+
 // RuntimeMode reports the current session override and whether one is active.
 func (m *Manager) RuntimeMode() (Mode, bool) {
 	state := m.State()
@@ -288,17 +361,29 @@ func (m *Manager) State() State {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	effective := m.effectiveModeLocked()
+	return State{
+		Configured:                  m.configured,
+		RuntimeOverride:             m.runtimeOverride,
+		HasRuntimeOverride:          m.hasRuntimeOverride,
+		CredentialIsolationRequired: m.credentialIsolationRequired,
+		Effective:                   effective,
+		AutoAllow:                   effective == ModeAutoAllow,
+	}
+}
+
+// effectiveModeLocked returns the current policy while m.mu is held for read
+// or write. Credential isolation is a floor, not a replacement for an
+// explicitly stronger auto-allow sandbox selection.
+func (m *Manager) effectiveModeLocked() Mode {
 	effective := m.configured
 	if m.hasRuntimeOverride {
 		effective = m.runtimeOverride
 	}
-	return State{
-		Configured:         m.configured,
-		RuntimeOverride:    m.runtimeOverride,
-		HasRuntimeOverride: m.hasRuntimeOverride,
-		Effective:          effective,
-		AutoAllow:          effective == ModeAutoAllow,
+	if m.credentialIsolationRequired && effective == ModeOff {
+		return ModePermissions
 	}
+	return effective
 }
 
 // Wrap changes only the executable path and argv needed to enter the platform
@@ -322,9 +407,15 @@ func (m *Manager) Wrap(cmd *exec.Cmd, req Request) (*exec.Cmd, error) {
 	// releasing the lock before wrapPlatform would let Close remove tempDir and
 	// a concurrent Wrap recreate it after the Manager had become closed.
 	defer m.mu.RUnlock()
-	mode := m.configured
-	if m.hasRuntimeOverride {
-		mode = m.runtimeOverride
+	mode := m.effectiveModeLocked()
+	switch req.MinimumMode {
+	case "", ModeOff:
+	case ModePermissions:
+		if mode == ModeOff {
+			mode = ModePermissions
+		}
+	default:
+		return nil, fmt.Errorf("%w minimum %q (want off or permissions)", ErrInvalidMode, req.MinimumMode)
 	}
 	tempDir := m.tempDir
 	metisHome := m.metisHome
@@ -356,16 +447,61 @@ func (m *Manager) Wrap(cmd *exec.Cmd, req Request) (*exec.Cmd, error) {
 	}
 
 	if err := wrapPlatform(cmd, platformRequest{
-		mode:      mode,
-		cwd:       cwd,
-		tempDir:   tempDir,
-		network:   network,
-		home:      home,
-		metisHome: metisHome,
+		mode:                        mode,
+		cwd:                         cwd,
+		tempDir:                     tempDir,
+		managerOwnedCwd:             pathWithinRoot(tempDir, cwd),
+		credentialIsolationRequired: m.credentialIsolationRequired,
+		network:                     network,
+		home:                        home,
+		metisHome:                   metisHome,
 	}); err != nil {
 		return nil, err
 	}
 	return cmd, nil
+}
+
+// Acquire wraps cmd and retains the Manager's private filesystem resources
+// until the returned release function is called. Long-lived subprocess owners
+// must use Acquire rather than Wrap so Manager.Close cannot remove tempDir
+// while a child is still running. The release function is idempotent.
+func (m *Manager) Acquire(cmd *exec.Cmd, req Request) (*exec.Cmd, func(), error) {
+	if m == nil {
+		return nil, nil, ErrManagerClosed
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, nil, ErrManagerClosed
+	}
+	m.leases.Add(1)
+	m.mu.Unlock()
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(m.leases.Done)
+	}
+	wrapped, err := m.Wrap(cmd, req)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return wrapped, release, nil
+}
+
+// pathWithinRoot reports whether path is root itself or one of its
+// descendants. Wrap resolves both the Manager temp root and command cwd before
+// calling this helper, so lexical traversal and symlink aliases cannot make a
+// persistent directory look manager-owned.
+func pathWithinRoot(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func effectiveCwd(cmd *exec.Cmd, requested string) (string, error) {
@@ -515,12 +651,19 @@ func policyPathVariants(path string) []string {
 }
 
 type platformRequest struct {
-	mode               Mode
-	cwd                string
-	tempDir            string
-	network            NetworkPolicy
-	home               string
-	metisHome          string
+	mode            Mode
+	cwd             string
+	tempDir         string
+	managerOwnedCwd bool
+	cwdReadOnly     bool // Linux fail-closed fallback; ignored elsewhere.
+	// credentialIsolationRequired distinguishes unattended bypass from an
+	// ordinary permissions sandbox. Linux may need a stricter cwd fallback
+	// when bubblewrap cannot mask a protected path that does not yet exist.
+	credentialIsolationRequired bool
+	network                     NetworkPolicy
+	home                        string
+	metisHome                   string
+
 	blockedUnixSockets []string // Linux network=block hardening; ignored elsewhere
 }
 

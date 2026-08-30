@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
 // makeModelForGateTest builds a minimal Model just exercising the Shift+Tab
@@ -87,6 +88,15 @@ func TestCyclePermissionMode_DebouncesRapidPresses(t *testing.T) {
 
 func TestCyclePermissionMode_AllowsCycleAfterDebounceWindow(t *testing.T) {
 	m := makeModelForGateTest()
+	if !sandbox.Available() {
+		t.Skip("bypassPermissions requires an available OS sandbox")
+	}
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	m.ext.Sandbox = manager
 	m.cyclePermissionMode() // acceptEdits → plan
 	// Pretend the debounce window has elapsed.
 	m.lastModeCycle = time.Now().Add(-modeCycleDebounce - 10*time.Millisecond)

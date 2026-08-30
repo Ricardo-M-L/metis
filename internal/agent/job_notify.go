@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/jobs"
+	"github.com/Ricardo-M-L/metis/internal/security"
 )
 
 // injectJobNotifications drains every pending notification on
@@ -62,12 +63,13 @@ func formatJobNotifications(notifs []jobs.Notification) string {
 		fmt.Fprintf(&b, "%d background bash jobs finished:\n", len(notifs))
 	}
 	for _, n := range notifs {
+		command := security.RedactSubprocessText(n.Command)
 		fmt.Fprintf(&b, "  • %s — %s — exit=%d — elapsed=%s — `%s`\n",
 			n.JobID,
 			n.Status,
 			n.ExitCode,
 			n.Elapsed.Truncate(time.Second),
-			truncateOneLine(n.Command, 60),
+			truncateOneLine(command, 60),
 		)
 	}
 	b.WriteString("Use BashOutput to read the captured output, BashList to see all jobs.\n")

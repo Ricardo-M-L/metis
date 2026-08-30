@@ -2,20 +2,32 @@ package builtin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 type Read struct {
 	tools.BaseTool
-	gate  *permission.Gate
-	state *ReadFileState
+	gate       *permission.Gate
+	state      *ReadFileState
+	authorizer *invocationAuthorizer[approvedExistingPath]
+	// afterOpen is a test seam for deterministic path-swap regression tests.
+	// Production constructors leave it nil.
+	afterOpen func()
+}
+
+func newReadPathAuthorizer() *invocationAuthorizer[approvedExistingPath] {
+	return newInvocationAuthorizer[approvedExistingPath]()
 }
 
 func (Read) Name() string { return "Read" }
@@ -107,9 +119,30 @@ func (Read) IsReadOnly(map[string]any) bool { return true }
 // (toolResultStorage.ts::getPersistenceThreshold).
 func (Read) MaxResultSizeChars() int { return tools.ResultSizeUnlimited }
 
-func (r Read) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
+func (r Read) PrepareAuthorizedInvocation(ctx context.Context, in map[string]any) error {
 	path := strFromAny(in["path"])
-	d, src := r.gate.CheckPath(context.Background(), "Read", path, path)
+	binding, err := prepareExistingPath(path, false)
+	if err != nil {
+		return err
+	}
+	if !binding.matchesCurrent(binding.targetInfo) {
+		return errors.New("Read target changed during permission preparation")
+	}
+	r.authorizer.record(ctx, binding)
+	return nil
+}
+
+func (r Read) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	path := strFromAny(in["path"])
+	d, src := permission.DecisionAllow, ""
+	if r.gate != nil {
+		d, src = r.gate.CheckPath(ctx, "Read", path, path)
+	}
+	if d != permission.DecisionDeny {
+		if err := r.PrepareAuthorizedInvocation(ctx, in); err != nil {
+			return tools.PermissionDeny, security.RedactSubprocessText(err.Error())
+		}
+	}
 	return mapDecision(d), src
 }
 
@@ -167,79 +200,106 @@ func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			IsError: true,
 		}, nil
 	}
-	offset := intArg(in, "offset", 1)
-	limit := intArg(in, "limit", 2000)
-
-	// Stat first: cheap, lets us reject GB-sized files before
-	// allocating, and gives us the mtime for ReadFileState.
-	st, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if st.IsDir() {
-		// Symmetric with LS's regular-file rescue: a model that
-		// passes a directory path to Read gets a confusing
-		// "is a directory" syscall error and tends to re-call
-		// Read with the same path. Steer to LS instead.
-		return &tools.Result{
-			Output:  fmt.Sprintf("%s is a directory, not a file. Use LS to list its entries, then Read individual files.", path),
-			IsError: true,
-		}, nil
-	}
-	if st.Size() > MaxReadFileSize {
-		return &tools.Result{
-			Output:  fmt.Sprintf("file too large: %d bytes exceeds %d byte cap (use Bash with head/tail to inspect)", st.Size(), MaxReadFileSize),
-			IsError: true,
-		}, nil
-	}
-
-	// 2026-05-23: FILE_UNCHANGED_STUB short-circuit. If sessionReadState
-	// already has a FULL snapshot of this path AND the on-disk file
-	// hasn't drifted (mtime equal — fast path; hash equal — slow path
-	// covering touch / cloud-sync that bumps mtime without changing
-	// content), return a short stub instead of re-emitting the full
-	// content. Mirrors claude-code's FILE_UNCHANGED_STUB
-	// (tools/FileReadTool/FileReadTool.ts). Cuts ~30% Read tokens on
-	// runs where parent + sub-agents repeatedly Read the same files
-	// (the kimi-cli-go porting test 2026-05-23 hit this hard: 186
-	// Reads, ~half on files already in state).
-	//
-	// Skip the stub for partial reads (offset / limit set) — the
-	// caller is explicitly asking for a slice, not a re-read of the
-	// whole file. Also skip on partial-view prior entries (Edit would
-	// reject those anyway, but a full Read should pull the actual
-	// content so the model can edit it).
-	if r.state != nil && offset == 1 && limit == 2000 {
-		if prior, ok := r.state.Get(path); ok && !prior.IsPartialView {
-			if prior.MTime.Equal(st.ModTime()) {
-				return &tools.Result{Output: fileUnchangedStub}, nil
-			}
-			// mtime drifted — verify hash before claiming unchanged.
-			if data, rerr := os.ReadFile(path); rerr == nil {
-				if hashBytes(data) == prior.Hash {
-					// Content unchanged; just refresh mtime so
-					// next call hits the fast path.
-					r.state.Record(path, st.ModTime(), data)
-					return &tools.Result{Output: fileUnchangedStub}, nil
-				}
-			}
-			// Drift detected — fall through, do a real Read.
+	if r.gate != nil && r.gate.Mode() == permission.ModeBypassPermissions {
+		credentialPath := path
+		if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+			credentialPath = resolved
+		}
+		if permission.IsSecretReadPath(path) || permission.IsSecretReadPath(credentialPath) {
+			return &tools.Result{
+				Output:  "Read denied: credential files are unavailable in bypassPermissions",
+				IsError: true,
+			}, nil
 		}
 	}
+	offset := intArg(in, "offset", 1)
+	limit := intArg(in, "limit", 2000)
+	binding, hasInvocationID, foundBinding := r.authorizer.consume(ctx)
+	if hasInvocationID && !foundBinding {
+		if _, prepErr := prepareExistingPath(path, false); prepErr != nil {
+			if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+				return &tools.Result{Output: fmt.Sprintf("%s is a directory, not a file. Use LS to list its entries, then Read individual files.", path), IsError: true}, nil
+			}
+			return nil, prepErr
+		}
+		return &tools.Result{Output: "Read denied: permission binding missing for this invocation", IsError: true}, nil
+	}
+	if !hasInvocationID {
+		var prepErr error
+		binding, prepErr = prepareExistingPath(path, false)
+		if prepErr != nil {
+			if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+				return &tools.Result{Output: fmt.Sprintf("%s is a directory, not a file. Use LS to list its entries, then Read individual files.", path), IsError: true}, nil
+			}
+			return nil, prepErr
+		}
+		if r.gate != nil {
+			decision, source := r.gate.CheckPath(ctx, "Read", path, path)
+			if decision != permission.DecisionAllow {
+				return &tools.Result{Output: "Read denied: " + security.RedactSubprocessText(source), IsError: true}, nil
+			}
+		}
+	}
+	requestedAbs, absErr := filepath.Abs(filepath.Clean(path))
+	if absErr != nil || requestedAbs != binding.rawPath {
+		return &tools.Result{Output: "Read denied: invocation input changed after permission check", IsError: true}, nil
+	}
 
-	f, err := os.Open(path)
+	// Open first, then verify the lexical and resolved path still identify the
+	// opened inode. Every byte below comes from this pinned descriptor; no
+	// post-authorization os.ReadFile(path) can be redirected by a symlink swap.
+	f, st, resolvedPath, err := openPinnedReadFile(path, MaxReadFileSize, r.afterOpen)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if st != nil && st.IsDir() {
+			return &tools.Result{
+				Output:  fmt.Sprintf("%s is a directory, not a file. Use LS to list its entries, then Read individual files.", path),
+				IsError: true,
+			}, nil
+		}
+		return &tools.Result{Output: "Read denied: " + security.RedactSubprocessText(err.Error()), IsError: true}, nil
+	}
+	defer f.Close()
+	statePath := filepath.Clean(resolvedPath)
+	if resolvedPath != binding.resolvedPath || !os.SameFile(binding.targetInfo, st) {
+		return &tools.Result{Output: "Read denied: source path changed after permission check", IsError: true}, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(f, MaxReadFileSize+1))
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	if len(data) > MaxReadFileSize {
+		return &tools.Result{Output: fmt.Sprintf("file too large: exceeds %d byte cap", MaxReadFileSize), IsError: true}, nil
+	}
+	stAfter, err := f.Stat()
+	if err != nil || !os.SameFile(st, stAfter) || st.Size() != stAfter.Size() || !st.ModTime().Equal(stAfter.ModTime()) {
+		return &tools.Result{Output: "Read denied: source changed while reading", IsError: true}, nil
+	}
+	// Locate only credential values whose key/marker context spans source
+	// lines. offset/limit can remove that context, so these source byte ranges
+	// are applied to the rendered page before the ordinary final redactor.
+	fileRedactor := security.NewFileCredentialRedactor(data)
 
 	var b strings.Builder
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 1<<20), 1<<22)
 	lineno := 0
 	emitted := 0
+	truncated := false
+	sourceLineStart := 0
 	for sc.Scan() {
 		lineno++
+		line := sc.Text()
+		currentLineStart := sourceLineStart
+		sourceLineStart += len(sc.Bytes())
+		if sourceLineStart < len(data) && data[sourceLineStart] == '\r' {
+			sourceLineStart++
+		}
+		if sourceLineStart < len(data) && data[sourceLineStart] == '\n' {
+			sourceLineStart++
+		}
 		// Honor cancellation so a huge-file scan (up to the 256 MiB cap) or
 		// a slow/blocking read can't pin this goroutine after the parent
 		// turn is cancelled or times out. Cheap: a non-blocking select every
@@ -255,21 +315,41 @@ func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			continue
 		}
 		if emitted >= limit {
+			// Scanner reached one more source line, so this is genuine
+			// truncation. Merely emitting exactly limit lines at EOF is a full
+			// view and must not permanently block a later whole-file Write.
+			truncated = true
 			break
 		}
-		fmt.Fprintf(&b, "%6d\t%s\n", lineno, sc.Text())
+		fmt.Fprintf(&b, "%6d\t%s\n", lineno, fileRedactor.RedactLineAt(currentLineStart, line))
 		emitted++
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
+	output := b.String()
+	finalOutput := security.RedactSubprocessText(output)
+	viewRedacted := fileRedactor.HasRedactions() || finalOutput != output
+
+	// FILE_UNCHANGED_STUB is safe only when a prior full view and the current
+	// rendered view both contain every source byte. A redacted view must remain
+	// partial so it cannot grant whole-file Write authority.
+	if r.state != nil && offset == 1 && limit == 2000 && !viewRedacted {
+		if prior, ok := r.state.Get(statePath); ok && !prior.IsPartialView {
+			if prior.MTime.Equal(st.ModTime()) {
+				return &tools.Result{Output: fileUnchangedStub}, nil
+			}
+			if hashBytes(data) == prior.Hash {
+				r.state.Record(statePath, st.ModTime(), data)
+				return &tools.Result{Output: fileUnchangedStub}, nil
+			}
+		}
+	}
 
 	// Record in ReadFileState so a subsequent Edit/Write on this path
-	// can detect out-of-band mtime drift (file changed between Read
-	// and Edit). We re-stat + re-read after the user-facing scan so
-	// writers that updated the file during the scan are caught — the
-	// mtime/hash we want is the last-known on-disk state, not what we
-	// saw mid-stream.
+	// can detect out-of-band drift between Read and Edit. data and st came
+	// from one pinned descriptor, and the post-read descriptor check above
+	// rejected size/mtime changes during the snapshot.
 	//
 	// The view classifier flags partial reads (offset != 1, or hit the
 	// limit before EOF). A full-file Write refuses partial-view entries;
@@ -278,22 +358,63 @@ func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// record is over the FULL file — what the LLM saw is partial, but the
 	// staleness check needs whole-file ground truth.
 	if r.state != nil {
-		if data, rerr := os.ReadFile(path); rerr == nil {
-			if st2, serr := os.Stat(path); serr == nil {
-				partial := offset != 1 || emitted >= limit
-				if partial {
-					r.state.RecordPartial(path, st2.ModTime(), data, offset, limit)
-				} else {
-					r.state.Record(path, st2.ModTime(), data)
-				}
-			}
+		partial := offset != 1 || truncated || viewRedacted
+		if partial {
+			r.state.RecordPartial(statePath, st.ModTime(), data, offset, limit)
+		} else {
+			r.state.Record(statePath, st.ModTime(), data)
 		}
 	}
 
 	if emitted == 0 {
 		return &tools.Result{Output: "(file is empty or offset past end)"}, nil
 	}
-	return &tools.Result{Output: b.String()}, nil
+	return &tools.Result{Output: finalOutput}, nil
+}
+
+func openPinnedReadFile(path string, maxBytes int64, afterOpen func()) (*os.File, os.FileInfo, string, error) {
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return nil, nil, "", err
+	}
+	lexicalBefore, err := os.Lstat(absPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	resolvedBefore, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	targetBefore, err := os.Stat(absPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if !targetBefore.Mode().IsRegular() {
+		return nil, targetBefore, filepath.Clean(resolvedBefore), fmt.Errorf("%s is not a regular file", path)
+	}
+	if maxBytes > 0 && targetBefore.Size() > maxBytes {
+		return nil, targetBefore, filepath.Clean(resolvedBefore), fmt.Errorf("file too large: %d bytes exceeds %d byte cap", targetBefore.Size(), maxBytes)
+	}
+	file, err := os.Open(absPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if afterOpen != nil {
+		afterOpen()
+	}
+	openedInfo, openErr := file.Stat()
+	lexicalAfter, lexicalErr := os.Lstat(absPath)
+	resolvedAfter, resolvedErr := filepath.EvalSymlinks(absPath)
+	targetAfter, targetErr := os.Stat(absPath)
+	if openErr != nil || lexicalErr != nil || resolvedErr != nil || targetErr != nil ||
+		!openedInfo.Mode().IsRegular() || !os.SameFile(targetBefore, openedInfo) ||
+		!os.SameFile(lexicalBefore, lexicalAfter) || !os.SameFile(openedInfo, targetAfter) ||
+		filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) {
+		file.Close()
+		return nil, nil, "", errors.Join(openErr, lexicalErr, resolvedErr, targetErr,
+			fmt.Errorf("source path changed while opening: %s", path))
+	}
+	return file, openedInfo, filepath.Clean(resolvedAfter), nil
 }
 
 // readMisuseHint inspects the input bag when `path` is empty and

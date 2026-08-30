@@ -392,7 +392,7 @@ func (m MetisInfo) writeTools(b *strings.Builder) {
 	if m.reg == nil {
 		return
 	}
-	all := m.reg.All()
+	all := m.reg.ModelToolsForCache()
 	if len(all) == 0 {
 		return
 	}

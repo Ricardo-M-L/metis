@@ -115,3 +115,38 @@ func TestBashExecuteReturnsNoMatchAsSuccessfulSemanticResult(t *testing.T) {
 		t.Fatalf("exit 1 no-match result = %#v, want successful semantic result", res)
 	}
 }
+
+func TestBashExecuteRunsAllowedSystemClassCommand(t *testing.T) {
+	tool := New(permission.New(permission.ModeBypassPermissions), config.ToolBashSettings{
+		Shell:          "/bin/sh",
+		TimeoutSeconds: 5,
+		MaxOutputBytes: 4096,
+	})
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"command":     "env printf system-command-ran",
+		"description": "verify system-class commands execute after permission approval",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.IsError || !strings.Contains(res.Output, "system-command-ran") {
+		t.Fatalf("system-class command result = %#v, want real command output", res)
+	}
+}
+
+func TestBashExecuteRedactsCredentialsFromOutput(t *testing.T) {
+	tool := New(permission.New(permission.ModeBypassPermissions), config.ToolBashSettings{
+		Shell:          "/bin/sh",
+		TimeoutSeconds: 5,
+		MaxOutputBytes: 4096,
+	})
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"command": `printf 'CUSTOM_API_KEY=opaque-secret-value'`,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.IsError || strings.Contains(res.Output, "opaque-secret-value") || !strings.Contains(res.Output, "[REDACTED]") {
+		t.Fatalf("credential-bearing command result = %#v, want redacted successful output", res)
+	}
+}

@@ -16,7 +16,7 @@ import (
 func (l *Loop) emitPlan(ctx context.Context, toolUses []llm.ContentBlock, out chan<- Event) {
 	calls := make([]ToolCall, len(toolUses))
 	for i, b := range toolUses {
-		calls[i] = ToolCall{ID: b.ToolUseID, Name: b.ToolName, Input: b.ToolInput}
+		calls[i] = ToolCall{ID: b.ToolUseID, Name: b.ToolName, Input: redactedToolInput(b.ToolInput)}
 	}
 	emit(ctx, out, Event{Kind: EventPlan, ToolCalls: calls})
 	emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "plan_mode"})

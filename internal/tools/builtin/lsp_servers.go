@@ -2,10 +2,9 @@ package builtin
 
 // lsp_servers.go — per-language LSP server registry. Maps a detected
 // language to the binary metis spawns and the JSON-RPC handshake it
-// speaks (via lsp_client.go). Go is intentionally absent here: gopls has
-// a mature CLI (`gopls definition`, …) that lsp.go drives directly, so
-// it never needs the stdio client. Everything else (python / typescript
-// / javascript / rust) only speaks LSP over stdio, hence this table.
+// speaks (via lsp_client.go). Go also uses stdio: didOpen lets Metis send the
+// bytes from the exact descriptor authorized for this invocation instead of
+// asking the gopls CLI to reopen a raceable pathname.
 
 import "os/exec"
 
@@ -25,10 +24,15 @@ type lspServer struct {
 	rootMarkers []string
 }
 
-// stdioLSPServers is the table of stdio-only language servers. Order
-// doesn't matter — lookup is by language. gopls is deliberately excluded
-// (driven via CLI in lsp.go).
+// stdioLSPServers is the language-server table. Order doesn't matter — lookup
+// is by language.
 var stdioLSPServers = []lspServer{
+	{
+		lang:        "go",
+		cmd:         "gopls",
+		languageID:  "go",
+		rootMarkers: []string{"go.work", "go.mod", ".git"},
+	},
 	{
 		lang:        "python",
 		cmd:         "pyright-langserver",
@@ -77,12 +81,9 @@ func (s lspServer) available() bool {
 }
 
 // anyLSPServerAvailable reports whether at least one LSP backend metis
-// supports is installed — gopls (Go, CLI path) or any stdio server. Used
+// supports is installed. Used
 // by LSP.IsEnabled so the tool is hidden only when NO backend exists.
 func anyLSPServerAvailable() bool {
-	if _, err := exec.LookPath("gopls"); err == nil {
-		return true
-	}
 	for _, s := range stdioLSPServers {
 		if s.available() {
 			return true

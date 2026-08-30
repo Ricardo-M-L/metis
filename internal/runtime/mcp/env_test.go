@@ -268,44 +268,52 @@ func TestSetReservedComputerUseServer_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestMaybeInjectCUEnv_AddsTierForMetisCu — 2026-05-26: every metis-cu
-// MCP spawn should auto-set METIS_CU_HOST_TERMINAL_TIER=full so the
-// frontmost-app tier gate (terminal app = TierClick) doesn't reject
-// `open_application` and friends. Covers basename detection across
-// bare command, absolute path, and Windows .exe.
-func TestMaybeInjectCUEnv_AddsTierForMetisCu(t *testing.T) {
-	for _, cmd := range []string{
-		"metis-cu",
-		"/Users/ricardo/.local/bin/metis-cu",
-		"C:\\bin\\metis-cu.exe",
-		"Metis-Cu.exe", // case-insensitive
+func TestMaybeInjectCUEnv_ReservedServerGetsOnlyRequiredDesktopEnv(t *testing.T) {
+	t.Setenv("DISPLAY", ":77")
+	t.Setenv("XAUTHORITY", "/tmp/test-xauthority")
+	t.Setenv("WAYLAND_DISPLAY", "wayland-9")
+	t.Setenv("XDG_RUNTIME_DIR", "/tmp/test-runtime")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/test-bus")
+
+	out, computerUse := maybeInjectCUEnv(ReservedComputerUseName, ReservedComputerUseBinary, nil)
+	if !computerUse {
+		t.Fatal("reserved computer-use launch did not receive its dedicated profile")
+	}
+	for key, want := range map[string]string{
+		"METIS_CU_HOST_TERMINAL_TIER": "full",
+		"DISPLAY":                     ":77",
+		"XAUTHORITY":                  "/tmp/test-xauthority",
 	} {
-		out := maybeInjectCUEnv(cmd, nil)
-		if got := out["METIS_CU_HOST_TERMINAL_TIER"]; got != "full" {
-			t.Errorf("cmd=%q: tier env = %q, want full", cmd, got)
+		if got := out[key]; got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	for _, key := range []string{"WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"} {
+		if _, ok := out[key]; ok {
+			t.Errorf("reserved computer-use unexpectedly inherited %s", key)
 		}
 	}
 }
 
-// TestMaybeInjectCUEnv_LeavesOthersAlone — only metis-cu spawns
-// should pick up the override. Defensive: a regression here would
-// silently inject the env into unrelated MCP servers (firecrawl,
-// playwright, office-word, ...) and could break their config.
-func TestMaybeInjectCUEnv_LeavesOthersAlone(t *testing.T) {
-	for _, cmd := range []string{
-		"npx",
-		"uvx",
-		"python3",
-		"/usr/local/bin/firecrawl-mcp",
-		"playwright-mcp",
-	} {
-		out := maybeInjectCUEnv(cmd, map[string]string{"FOO": "bar"})
-		if _, set := out["METIS_CU_HOST_TERMINAL_TIER"]; set {
-			t.Errorf("cmd=%q: must NOT inject tier env into non-metis-cu spawns", cmd)
+func TestMaybeInjectCUEnv_RejectsMasqueradingServers(t *testing.T) {
+	t.Setenv("DISPLAY", ":77")
+	tests := []struct{ name, command string }{
+		{"ordinary", ReservedComputerUseBinary},
+		{ReservedComputerUseName, "/usr/local/bin/metis-cu"},
+		{ReservedComputerUseName, `C:\\bin\\metis-cu.exe`},
+		{"Computer-Use", ReservedComputerUseBinary},
+		{ReservedComputerUseName, "Metis-Cu"},
+	}
+	for _, tc := range tests {
+		out, computerUse := maybeInjectCUEnv(tc.name, tc.command, map[string]string{"FOO": "bar"})
+		if computerUse {
+			t.Errorf("name=%q command=%q received computer-use capability", tc.name, tc.command)
 		}
-		// Existing entries must round-trip untouched.
+		if _, set := out["DISPLAY"]; set {
+			t.Errorf("name=%q command=%q inherited DISPLAY", tc.name, tc.command)
+		}
 		if out["FOO"] != "bar" {
-			t.Errorf("cmd=%q: existing env dropped; got %v", cmd, out)
+			t.Errorf("name=%q command=%q lost existing env: %v", tc.name, tc.command, out)
 		}
 	}
 }
@@ -315,10 +323,20 @@ func TestMaybeInjectCUEnv_LeavesOthersAlone(t *testing.T) {
 // win over our default. The user might want "read" for a paranoid
 // sandboxed run, or "click" to opt back into the historical default.
 func TestMaybeInjectCUEnv_RespectsUserOverride(t *testing.T) {
-	in := map[string]string{"METIS_CU_HOST_TERMINAL_TIER": "click"}
-	out := maybeInjectCUEnv("metis-cu", in)
+	in := map[string]string{
+		"METIS_CU_HOST_TERMINAL_TIER": "click",
+		"DISPLAY":                     ":explicit",
+		"XAUTHORITY":                  "/tmp/explicit-xauthority",
+	}
+	out, computerUse := maybeInjectCUEnv(ReservedComputerUseName, ReservedComputerUseBinary, in)
+	if !computerUse {
+		t.Fatal("reserved computer-use launch did not receive its dedicated profile")
+	}
 	if got := out["METIS_CU_HOST_TERMINAL_TIER"]; got != "click" {
 		t.Errorf("user-set tier should be preserved; got %q want click", got)
+	}
+	if out["DISPLAY"] != ":explicit" || out["XAUTHORITY"] != "/tmp/explicit-xauthority" {
+		t.Fatalf("explicit desktop settings were overwritten: %v", out)
 	}
 }
 
@@ -331,7 +349,10 @@ func TestMaybeInjectCUEnv_NilInputSafe(t *testing.T) {
 			t.Fatalf("nil env caused panic: %v", r)
 		}
 	}()
-	out := maybeInjectCUEnv("metis-cu", nil)
+	out, computerUse := maybeInjectCUEnv(ReservedComputerUseName, ReservedComputerUseBinary, nil)
+	if !computerUse {
+		t.Fatal("reserved computer-use launch did not receive its dedicated profile")
+	}
 	if out["METIS_CU_HOST_TERMINAL_TIER"] != "full" {
 		t.Errorf("nil env case lost the tier injection")
 	}

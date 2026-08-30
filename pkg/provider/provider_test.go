@@ -68,6 +68,18 @@ func TestRequest_EffortFieldUsesPkgLLM(t *testing.T) {
 	}
 }
 
+func TestToolSpecExposureIsNotSerialized(t *testing.T) {
+	raw, err := json.Marshal(ToolSpec{
+		Name: "Remote", Description: "remote tool", InputSchema: map[string]any{"type": "object"}, Exposure: "deferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"name":"Remote","description":"remote tool","input_schema":{"type":"object"}}` {
+		t.Fatalf("provider-only routing metadata leaked into JSON: %s", raw)
+	}
+}
+
 func TestRoleConstants(t *testing.T) {
 	if RoleSystem == RoleUser || RoleAssistant == RoleTool {
 		t.Error("role constants must be distinct")

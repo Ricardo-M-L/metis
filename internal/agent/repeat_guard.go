@@ -194,7 +194,7 @@ func (g *RepeatGuard) RecordStep(toolUses []llm.ContentBlock) string {
 // canonical argument preview. The preview ends "… (+<n> more chars)" when
 // the full canonical string exceeds argumentsPreviewChars.
 func (g *RepeatGuard) detailedReminder(tool string, count int, in map[string]any) string {
-	full := canonicalArgs(in)
+	full := canonicalArgs(redactedToolInput(in))
 	preview := full
 	omitted := 0
 	if len(preview) > g.argumentsPreviewChars {

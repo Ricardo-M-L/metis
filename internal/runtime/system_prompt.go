@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -235,7 +236,7 @@ func AssembleSystemPromptSectionsCtx(ctx PromptCtx, opts AssembleOptions) []Syst
 		}
 	}
 	if !opts.SkipEnv {
-		secs = append(secs, SystemPromptSection{Name: "env", Body: buildEnvBlock(), Cache: false, Volatile: true})
+		secs = append(secs, SystemPromptSection{Name: "env", Body: buildEnvBlockFor(ctx.WorkingDirectory), Cache: false, Volatile: true})
 		secs = appendGitContextSection(secs, mode)
 	}
 	return secs
@@ -639,8 +640,15 @@ func detectInjectionPatterns(body string) []string {
 // so we do it on every chat boot rather than caching — that way a
 // /clear after `cd otherproj` picks up the new cwd.
 func buildEnvBlock() string {
+	return buildEnvBlockFor("")
+}
+
+func buildEnvBlockFor(workingDirectory string) string {
 	now := time.Now()
-	cwd, _ := os.Getwd()
+	cwd := strings.TrimSpace(workingDirectory)
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
 	home, _ := os.UserHomeDir()
 	uname := ""
 	if u, err := user.Current(); err == nil {
@@ -666,7 +674,7 @@ func buildEnvBlock() string {
 	fmt.Fprintf(&b, "Today's date: %s\n", now.Format("2006-01-02"))
 	fmt.Fprintf(&b, "Local date and time: %s\n", now.Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(&b, "Local timezone: %s\n", localTimezoneLabel(now))
-	if branch := currentGitBranch(); branch != "" {
+	if branch := currentGitBranchAt(cwd); branch != "" {
 		fmt.Fprintf(&b, "Git branch: %s\n", branch)
 	}
 	b.WriteString("</env>")
@@ -724,8 +732,22 @@ func formatUTCOffset(offsetSeconds int) string {
 // gc-ing monorepo can't hang chat boot — pre-2026-06-11 this was a
 // bare exec.Command with no deadline.
 func currentGitBranch() string {
+	cwd, _ := os.Getwd()
+	return currentGitBranchAt(cwd)
+}
+
+func currentGitBranchAt(workDir string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), gitContextTimeout)
 	defer cancel()
+	if strings.TrimSpace(workDir) != "" {
+		cmd := exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "HEAD")
+		cmd.Dir = workDir
+		out, err := cmd.Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
 	return gitOut(ctx, "rev-parse", "--abbrev-ref", "HEAD")
 }
 

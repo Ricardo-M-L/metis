@@ -33,6 +33,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
@@ -104,17 +105,23 @@ func handleSelectQuery(l *Loop, toolUseID, body string) llm.ContentBlock {
 	names := strings.Split(body, ",")
 	matches := make([]map[string]any, 0, len(names))
 	var missing []string
+	seen := make(map[string]struct{}, len(names))
 	for _, raw := range names {
 		name := strings.TrimSpace(raw)
 		if name == "" {
 			continue
 		}
-		t, ok := l.Registry.Get(name)
+		entry, ok := l.Registry.GetModelEntry(name)
 		if !ok {
 			missing = append(missing, name)
 			continue
 		}
-		if strings.HasPrefix(t.Name(), "mcp__") {
+		t := entry.Tool
+		if _, duplicate := seen[t.Name()]; duplicate {
+			continue
+		}
+		seen[t.Name()] = struct{}{}
+		if entry.Exposure == tools.ToolExposureDeferred {
 			matches = append(matches, map[string]any{
 				"name":         t.Name(),
 				"description":  t.Description(),
@@ -123,7 +130,7 @@ func handleSelectQuery(l *Loop, toolUseID, body string) llm.ContentBlock {
 			// Cross-compaction stability: once we hand the deferred MCP
 			// schema to the model, the next toolSpecs() build keeps it
 			// intact instead of forcing another ToolSearch round-trip.
-			l.markMCPDiscovered(t.Name())
+			l.markDeferredDiscovered(t.Name())
 			continue
 		}
 		// Built-ins are already present in the live tools array. Repeating
@@ -162,12 +169,10 @@ func handleSelectQuery(l *Loop, toolUseID, body string) llm.ContentBlock {
 	}
 }
 
-// handleKeywordSearch runs searchToolsWithKeywords across the
-// registry's deferred (mcp__) tools, returning the top-N matches as
-// name+description pairs (NO schemas). The model follows up with a
-// `select:<name>` call once it picks a winner — keeps the search-
-// result body small and lets the model use cheap text to rank
-// alternatives before paying the schema-fetch round-trip.
+// handleKeywordSearch runs searchToolsWithKeywords across the complete
+// model-facing capability catalog. Direct results are marked
+// already_available so the model invokes them immediately; Deferred results
+// omit the marker and are resolved with select:<name>.
 func handleKeywordSearch(l *Loop, toolUseID, query string, maxResults int) llm.ContentBlock {
 	matches := searchToolsWithKeywords(l, query, maxResults)
 	if len(matches) == 0 {
@@ -190,11 +195,8 @@ func handleKeywordSearch(l *Loop, toolUseID, query string, maxResults int) llm.C
 	}
 }
 
-// searchToolsWithKeywords ranks deferred MCP tools plus Agent against a
-// free-text query, returning the top-N as ordered {name, description} pairs.
-// Other built-ins already have live schemas and stay out of the deferred-tool
-// catalog; Agent remains discoverable because models may search for the
-// orchestration capability before attempting their first parallel dispatch.
+// searchToolsWithKeywords ranks every model-facing Direct or Deferred tool.
+// Hidden tools are filtered by Registry.ModelEntriesForCache before scoring.
 //
 // Query syntax (mirrors claude-code-sourcemap's
 // ToolSearchTool.ts:186-302 `searchToolsWithKeywords`):
@@ -228,16 +230,15 @@ func searchToolsWithKeywords(l *Loop, query string, maxResults int) []map[string
 	type scored struct {
 		name        string
 		description string
+		exposure    tools.ToolExposure
 		score       int
 	}
 
-	all := l.Registry.SortedForCache()
+	all := l.Registry.ModelEntriesForCache()
 	results := make([]scored, 0, len(all))
-	for _, t := range all {
+	for _, entry := range all {
+		t := entry.Tool
 		name := t.Name()
-		if name != "Agent" && !strings.HasPrefix(name, "mcp__") {
-			continue
-		}
 		nameLower := strings.ToLower(name)
 		descLower := strings.ToLower(t.Description())
 		hintLower := strings.ToLower(pubtool.SearchHint(t))
@@ -266,6 +267,7 @@ func searchToolsWithKeywords(l *Loop, query string, maxResults int) []map[string
 		results = append(results, scored{
 			name:        name,
 			description: t.Description(),
+			exposure:    entry.Exposure,
 			score:       score,
 		})
 	}
@@ -281,10 +283,14 @@ func searchToolsWithKeywords(l *Loop, query string, maxResults int) []map[string
 	}
 	out := make([]map[string]any, 0, len(results))
 	for _, r := range results {
-		out = append(out, map[string]any{
+		match := map[string]any{
 			"name":        r.name,
 			"description": r.description,
-		})
+		}
+		if r.exposure == tools.ToolExposureDirect {
+			match["already_available"] = true
+		}
+		out = append(out, match)
 	}
 	return out
 }
@@ -471,21 +477,28 @@ func stripAndAppendToolSearch(specs []llm.ToolSpec) []llm.ToolSpec {
 // lazy_tools_discovered.go).
 //
 // The rewrite:
-//   - For each mcp__ tool NOT in preserve, replace InputSchema with
+//   - For each Deferred tool NOT in preserve, replace InputSchema with
 //     the lazy placeholder.
-//   - For each mcp__ tool IN preserve, keep the original schema.
+//   - For each Deferred tool IN preserve, keep the original schema.
 //   - Append the synthetic ToolSearch entry IFF any stripping
 //     happened — if preserve covers all mcp__ tools, the meta-tool is
 //     pointless and would just add a confusing entry to tools[].
 //
-// Non-MCP tools (built-ins) are always passed through verbatim. The
-// core Read/Edit/Bash etc. have small, well-known schemas; deferring
-// them would cost a round-trip for zero benefit.
+// Direct tools are always passed through verbatim. The core Read/Edit/Bash
+// capabilities have small, well-known schemas and remain Direct.
 func stripAndAppendToolSearchWithPreserve(specs []llm.ToolSpec, preserve map[string]bool) []llm.ToolSpec {
+	return stripAndAppendToolSearchWithExposure(specs, legacyDeferredNames(specs), preserve)
+}
+
+// stripAndAppendToolSearchWithExposure is the metadata-driven rewrite used by
+// the live registry. The legacy wrapper above preserves behavior for callers
+// that only have []ToolSpec and older tests/transcripts that identify MCP by
+// name prefix.
+func stripAndAppendToolSearchWithExposure(specs []llm.ToolSpec, deferred map[string]bool, preserve map[string]bool) []llm.ToolSpec {
 	out := make([]llm.ToolSpec, 0, len(specs)+1)
 	stripped := false
 	for _, s := range specs {
-		if !strings.HasPrefix(s.Name, "mcp__") {
+		if !deferred[s.Name] {
 			out = append(out, s)
 			continue
 		}
@@ -501,14 +514,15 @@ func stripAndAppendToolSearchWithPreserve(specs []llm.ToolSpec, preserve map[str
 			Name:        s.Name,
 			Description: stripDescriptionForLazy(s.Description),
 			InputSchema: lazyPlaceholderSchema(),
+			Exposure:    s.Exposure,
 		})
 	}
 	if !stripped {
-		// Either no mcp__ tools at all, or every mcp__ tool is already
+		// Either no Deferred tools exist, or every Deferred tool is already
 		// preserved. Nothing to defer → don't append ToolSearch.
 		return specs
 	}
-	out = append(out, toolSearchSpec(specs))
+	out = append(out, toolSearchSpecWithExposure(specs, deferred))
 	return out
 }
 
@@ -538,12 +552,16 @@ func applyLazySchemaByTokens(specs []llm.ToolSpec, contextWindow, percentage int
 // tools keep their schemas. Used by dispatch.go::toolSpecs once it
 // has a Loop handle to read snapshotDiscoveredMCP() from.
 func applyLazySchemaByTokensWithPreserve(specs []llm.ToolSpec, contextWindow, percentage int, preserve map[string]bool) []llm.ToolSpec {
+	return applyLazySchemaByTokensWithExposure(specs, contextWindow, percentage, legacyDeferredNames(specs), preserve)
+}
+
+func applyLazySchemaByTokensWithExposure(specs []llm.ToolSpec, contextWindow, percentage int, deferred map[string]bool, preserve map[string]bool) []llm.ToolSpec {
 	if contextWindow <= 0 || percentage <= 0 || percentage >= 100 {
 		return specs
 	}
 	deferredTokens := 0
 	for _, s := range specs {
-		if strings.HasPrefix(s.Name, "mcp__") {
+		if deferred[s.Name] {
 			deferredTokens += estimateSpecTokens(s)
 		}
 	}
@@ -551,7 +569,17 @@ func applyLazySchemaByTokensWithPreserve(specs []llm.ToolSpec, contextWindow, pe
 	if deferredTokens < budget {
 		return specs
 	}
-	return stripAndAppendToolSearchWithPreserve(specs, preserve)
+	return stripAndAppendToolSearchWithExposure(specs, deferred, preserve)
+}
+
+func legacyDeferredNames(specs []llm.ToolSpec) map[string]bool {
+	out := make(map[string]bool)
+	for _, spec := range specs {
+		if strings.HasPrefix(spec.Name, "mcp__") {
+			out[spec.Name] = true
+		}
+	}
+	return out
 }
 
 // estimateSpecTokens — cheap token estimate for a single ToolSpec, used
@@ -638,6 +666,11 @@ func lazyPlaceholderSchema() map[string]any {
 	}
 }
 
+func isLazyPlaceholderSpec(spec llm.ToolSpec) bool {
+	description, _ := spec.InputSchema["description"].(string)
+	return strings.Contains(description, "schema deferred")
+}
+
 // toolSearchSpec — the meta-tool definition the model invokes to
 // resolve deferred (mcp__) schemas. Matches claude-code-sourcemap's
 // ToolSearchTool.ts:304 spec shape: a single `query` string + optional
@@ -651,9 +684,13 @@ func lazyPlaceholderSchema() map[string]any {
 // description = syntax help only; per-tool placeholder entries =
 // names + short hint.
 func toolSearchSpec(allSpecs []llm.ToolSpec) llm.ToolSpec {
+	return toolSearchSpecWithExposure(allSpecs, legacyDeferredNames(allSpecs))
+}
+
+func toolSearchSpecWithExposure(allSpecs []llm.ToolSpec, deferredNames map[string]bool) llm.ToolSpec {
 	deferred := 0
 	for _, s := range allSpecs {
-		if strings.HasPrefix(s.Name, "mcp__") {
+		if deferredNames[s.Name] {
 			deferred++
 		}
 	}
@@ -661,19 +698,24 @@ func toolSearchSpec(allSpecs []llm.ToolSpec) llm.ToolSpec {
 		"Fetches full schema definitions for deferred tools so they can be called.\n\n"+
 			"Deferred tools appear by name in the tools list with '[schema lazy]' in their description "+
 			"but no parameter schema. Call this BEFORE invoking such a tool — otherwise the tool call "+
-			"will fail with an invalid-params error. Currently %d MCP tool(s) are deferred.\n\n"+
+			"will fail with an invalid-params error. Currently %d tool(s) are deferred.\n\n"+
 			"Query forms:\n"+
 			"  \"select:Read,Edit,Grep\" — fetch these exact tools by name\n"+
 			"  \"notebook jupyter\" — keyword search, up to max_results best matches\n"+
 			"  \"+slack send\" — require \"slack\" in the name, rank by remaining terms\n\n"+
 			"Result format:\n"+
 			"  select: form returns {matches:[{name,description,input_schema},...], missing:[...]}\n"+
-			"  keyword form returns {matches:[{name,description},...]} — follow up with select:<name>",
+			"  keyword form returns {matches:[{name,description,already_available?},...]}\n"+
+			"  already_available:true means call that tool directly; otherwise follow up with select:<name>",
 		deferred,
 	)
 	return llm.ToolSpec{
 		Name:        "ToolSearch",
 		Description: desc,
+		// ToolSearch follows the potentially changing Deferred catalog. Marking
+		// it Deferred keeps Anthropic's cache boundary on the stable Direct
+		// prefix instead of moving whenever deferred schemas hydrate.
+		Exposure: string(tools.ToolExposureDeferred),
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

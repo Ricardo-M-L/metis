@@ -78,6 +78,7 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			return
 		}
 		tool.finished = true
+		validInput := true
 		if tool.json != "" {
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(tool.json), &parsed); err == nil {
@@ -102,7 +103,25 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 				// structural guard.
 				blocks[tool.blockIndex].ToolInput = argsunwrap.Unwrap(parsed)
 			} else {
+				validInput = false
 				blocks[tool.blockIndex].ToolInput = map[string]any{"_raw": tool.json}
+			}
+		}
+		// Never surface provider argument fragments directly: credentials may be
+		// split across chunks (for example `{"api_` + `key":"secret"}`), so
+		// no chunk can be classified safely in isolation. Once the complete JSON
+		// object is available, emit one detached, key-aware redacted snapshot for
+		// the live UI. Invalid JSON deliberately has no preview; exposing `_raw`
+		// would reintroduce the same credential-boundary problem.
+		if validInput {
+			block := blocks[tool.blockIndex]
+			if snapshot, err := json.Marshal(redactedToolInput(block.ToolInput)); err == nil {
+				emit(ctx, out, Event{
+					Kind:      EventToolArgsDelta,
+					ToolUseID: block.ToolUseID,
+					ToolName:  block.ToolName,
+					TextDelta: string(snapshot),
+				})
 			}
 		}
 	}
@@ -222,20 +241,6 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			tool := lookupTool(ev.ToolUseID)
 			if tool != nil {
 				tool.json += ev.InputDelta
-			}
-			// Forward the partial JSON chunk to the UI so the user sees
-			// tool args appear as they're generated — kimi-cli's
-			// streamingjson behavior, claude-code parity. ToolUseID lets
-			// the UI route the delta to the right in-flight row when
-			// multiple tools are spawning in parallel.
-			if tool != nil {
-				block := blocks[tool.blockIndex]
-				emit(ctx, out, Event{
-					Kind:      EventToolArgsDelta,
-					ToolUseID: block.ToolUseID,
-					ToolName:  block.ToolName,
-					TextDelta: ev.InputDelta,
-				})
 			}
 		case "tool_use_stop":
 			// Provider-side authoritative resync: both anthropic.go and

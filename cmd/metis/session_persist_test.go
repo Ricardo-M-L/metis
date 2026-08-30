@@ -15,7 +15,7 @@ func TestSetupRuntimeReturnsFreshHeaderWriteError(t *testing.T) {
 	isolateResumeRuntimeTest(t)
 	const id = "blocked-fresh-header"
 	oldWrite := writeFreshSessionHeader
-	writeFreshSessionHeader = func(*session.Store, string, string, string, string, string) error {
+	writeFreshSessionHeader = func(*session.Store, string, string, string, string, string, string) error {
 		return errors.New("disk full")
 	}
 	t.Cleanup(func() { writeFreshSessionHeader = oldWrite })

@@ -2,6 +2,8 @@ package builtin
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -10,13 +12,21 @@ import (
 
 func TestPathAwareToolsPassConcreteTargetToGate(t *testing.T) {
 	t.Parallel()
+	outsideDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outsideDir, "file")
+	if err := os.WriteFile(outsideFile, []byte("test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name     string
 		wantPath string
 		call     func(*permission.Gate) (tools.Permission, string)
 	}{
-		{name: "Read", wantPath: "/outside/file", call: func(g *permission.Gate) (tools.Permission, string) {
-			return (Read{gate: g}).CanUse(context.Background(), map[string]any{"path": "/outside/file"})
+		{name: "Read", wantPath: outsideFile, call: func(g *permission.Gate) (tools.Permission, string) {
+			return (Read{gate: g}).CanUse(context.Background(), map[string]any{"path": outsideFile})
 		}},
 		{name: "LS", wantPath: "/outside/dir", call: func(g *permission.Gate) (tools.Permission, string) {
 			return (LS{gate: g}).CanUse(context.Background(), map[string]any{"path": "/outside/dir"})
@@ -24,11 +34,11 @@ func TestPathAwareToolsPassConcreteTargetToGate(t *testing.T) {
 		{name: "Glob default root", wantPath: ".", call: func(g *permission.Gate) (tools.Permission, string) {
 			return (Glob{gate: g}).CanUse(context.Background(), map[string]any{"pattern": "**/*.go"})
 		}},
-		{name: "Grep explicit root", wantPath: "/outside/tree", call: func(g *permission.Gate) (tools.Permission, string) {
-			return (Grep{gate: g}).CanUse(context.Background(), map[string]any{"root": "/outside/tree", "pattern": "token"})
+		{name: "Grep explicit root", wantPath: outsideDir, call: func(g *permission.Gate) (tools.Permission, string) {
+			return (Grep{gate: g}).CanUse(context.Background(), map[string]any{"root": outsideDir, "pattern": "token"})
 		}},
-		{name: "Edit", wantPath: "/outside/file", call: func(g *permission.Gate) (tools.Permission, string) {
-			return (Edit{gate: g}).CanUse(context.Background(), map[string]any{"path": "/outside/file"})
+		{name: "Edit", wantPath: outsideFile, call: func(g *permission.Gate) (tools.Permission, string) {
+			return (Edit{gate: g}).CanUse(context.Background(), map[string]any{"path": outsideFile})
 		}},
 		{name: "Write", wantPath: "/outside/file", call: func(g *permission.Gate) (tools.Permission, string) {
 			return (Write{gate: g}).CanUse(context.Background(), map[string]any{"path": "/outside/file"})

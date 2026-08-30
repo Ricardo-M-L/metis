@@ -86,7 +86,19 @@ var (
 	ghAuthTokenCached    string
 	ghAuthTokenLookedUp  bool
 	ghAuthTokenLookupErr error
+	ghAuthTokenRunner    = runGhAuthToken
 )
+
+func runGhAuthToken(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out.String()), nil
+}
 
 // ghAuthToken returns the gh CLI's stored token, or "" if gh isn't
 // installed / not logged in / the keyring lookup failed. Failures
@@ -100,15 +112,12 @@ func ghAuthToken() string {
 	ghAuthTokenLookedUp = true
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = io.Discard
-	if err := cmd.Run(); err != nil {
+	token, err := ghAuthTokenRunner(ctx)
+	if err != nil {
 		ghAuthTokenLookupErr = err
 		return ""
 	}
-	ghAuthTokenCached = strings.TrimSpace(out.String())
+	ghAuthTokenCached = strings.TrimSpace(token)
 	return ghAuthTokenCached
 }
 

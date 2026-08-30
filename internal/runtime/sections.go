@@ -40,6 +40,11 @@ type PromptCtx struct {
 	// specific hint inclusion at the assembler level.
 	ProviderName string
 
+	// WorkingDirectory overrides the process cwd in volatile env guidance.
+	// Long-lived Desktop sessions and cold sub-agents use it after a workspace
+	// switch so prompts agree with the cwd carried by tool execution context.
+	WorkingDirectory string
+
 	// EnabledTools is the set of registered tool names. Empty / nil =
 	// "assume all tools available" (legacy behavior). When non-nil,
 	// sections like tool_redirects skip themselves if Bash isn't
@@ -144,20 +149,18 @@ func LanguageSection(_ PromptCtx) SystemPromptSection {
 // - the guidance is cu-specific (left_click / type / key /
 // find_text_on_screen language).
 func ComputerUseSection(ctx PromptCtx) SystemPromptSection {
-	if ctx.ComputerUseAvailable {
+	if ctx.EnabledTools == nil {
+		// Before a live registry exists, the configured capability is the
+		// best available signal. Once EnabledTools is non-nil, that final
+		// model-visible set is authoritative and may deliberately exclude CU.
+		if !ctx.ComputerUseAvailable {
+			return SystemPromptSection{}
+		}
 		return SystemPromptSection{
 			Name:  "computer_use",
 			Body:  readSection("01b_computer_use.md"),
 			Cache: true,
 		}
-	}
-	if ctx.EnabledTools == nil {
-		// nil = "assume all available" legacy path. Keep silent here
-		// to avoid leaking cu guidance to runs that genuinely have no
-		// cu tools but happen to pass nil. Callers that DO load cu
-		// will be populating EnabledTools as part of the same boot
-		// flow, so the explicit-present case always lights up.
-		return SystemPromptSection{}
 	}
 	cuPresent := false
 	for name := range ctx.EnabledTools {
@@ -196,24 +199,62 @@ func StyleSection(_ PromptCtx) SystemPromptSection {
 }
 
 // ToolRedirectsSection - fires when any of the tools the redirects
-// table covers (Bash, LS, Read) is enabled. Used to be Bash-gated
-// only, but the table now includes the LS↔Read "directory vs file"
+// table covers (Bash, LS, Read, WebSearch, WebFetch, WebBrowse) is enabled.
+// Used to be Bash-gated only, but the table now includes the LS↔Read "directory vs file"
 // pair which is just as useful for sub-agents that have file I/O
 // tools without Bash (image #31 repro 2026-05-21: a read-only
 // sub-agent with LS+Read kept calling LS on file paths because the
 // guard was hiding the table from it).
 func ToolRedirectsSection(ctx PromptCtx) SystemPromptSection {
+	hasWebTool := true
 	if ctx.EnabledTools != nil {
-		anyRelevant := ctx.EnabledTools["Bash"] || ctx.EnabledTools["LS"] || ctx.EnabledTools["Read"]
+		hasWebTool = ctx.EnabledTools["WebSearch"] || ctx.EnabledTools["WebFetch"] || ctx.EnabledTools["WebBrowse"]
+		anyRelevant := ctx.EnabledTools["Bash"] || ctx.EnabledTools["LS"] || ctx.EnabledTools["Read"] ||
+			hasWebTool
 		if !anyRelevant {
 			return SystemPromptSection{}
 		}
 	}
 	return SystemPromptSection{
 		Name:  "tool_redirects",
-		Body:  readSection("04_tool_redirects.md"),
+		Body:  renderWebRoutingBlock(readSection("04_tool_redirects.md"), hasWebTool),
 		Cache: true,
 	}
+}
+
+const (
+	webRoutingBlockStart = "<!-- metis:web-routing:start -->"
+	webRoutingBlockEnd   = "<!-- metis:web-routing:end -->"
+)
+
+// renderWebRoutingBlock keeps the stable tool-selection section relevant to
+// the actual registry. Web-only agents still receive the routing contract,
+// while filesystem-only sub-agents do not spend prompt budget on unavailable
+// Web tools. Markers are always removed before the prompt reaches the model.
+func renderWebRoutingBlock(body string, include bool) string {
+	for {
+		start := strings.Index(body, webRoutingBlockStart)
+		if start < 0 {
+			break
+		}
+		endRel := strings.Index(body[start+len(webRoutingBlockStart):], webRoutingBlockEnd)
+		if endRel < 0 {
+			// A malformed embedded prompt is a programmer error, but keeping the
+			// unmarked body is safer than silently discarding all later guidance.
+			body = strings.ReplaceAll(body, webRoutingBlockStart, "")
+			break
+		}
+		end := start + len(webRoutingBlockStart) + endRel
+		if include {
+			body = body[:start] + body[start+len(webRoutingBlockStart):end] + body[end+len(webRoutingBlockEnd):]
+		} else {
+			body = body[:start] + body[end+len(webRoutingBlockEnd):]
+		}
+	}
+	for strings.Contains(body, "\n\n\n") {
+		body = strings.ReplaceAll(body, "\n\n\n", "\n\n")
+	}
+	return strings.TrimRight(body, "\n")
 }
 
 // WorkingEfficientlySection - TodoWrite + parallel reads + Agent for

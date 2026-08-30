@@ -14,6 +14,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 	pubplugin "github.com/Ricardo-M-L/metis/pkg/plugin"
@@ -39,8 +40,8 @@ type Plugin struct {
 
 // launchPluginMCPServer is a narrow seam for proving ecosystem manifest
 // translation without spawning test subprocesses.
-var launchPluginMCPServer = func(ctx context.Context, entry mcp.ServerEntry, registry *tools.Registry) (*mcptools.Server, error) {
-	return mcp.LaunchServer(ctx, &mcp.Registry{Servers: []mcp.ServerEntry{entry}}, entry.Name, registry)
+var launchPluginMCPServer = func(ctx context.Context, entry mcp.ServerEntry, registry *tools.Registry, manager *sandbox.Manager) (*mcptools.Server, error) {
+	return mcp.LaunchServerWithSandbox(ctx, &mcp.Registry{Servers: []mcp.ServerEntry{entry}}, entry.Name, registry, manager)
 }
 
 // Name implements the loader's PluginSkillSource contract.
@@ -120,6 +121,13 @@ func (r *PluginRegistry) Close() error {
 // plugin are collected and returned alongside the registry — bad plugins
 // don't block startup; the user sees them on stderr or via `metis plugin list`.
 func LoadPlugins(ctx context.Context, registry *tools.Registry) (*PluginRegistry, []error) {
+	return LoadPluginsWithSandbox(ctx, registry, nil)
+}
+
+// LoadPluginsWithSandbox starts plugin-contributed stdio MCP servers through
+// the shared runtime sandbox. The caller owns manager and closes it only after
+// the returned PluginRegistry has been closed.
+func LoadPluginsWithSandbox(ctx context.Context, registry *tools.Registry, manager *sandbox.Manager) (*PluginRegistry, []error) {
 	dir := PluginsDir()
 	reg := &PluginRegistry{}
 
@@ -142,7 +150,7 @@ func LoadPlugins(ctx context.Context, registry *tools.Registry) (*PluginRegistry
 			continue // not a plugin dir
 		}
 
-		p, perr := loadOne(ctx, root, e.Name(), registry)
+		p, perr := loadOne(ctx, root, e.Name(), registry, manager)
 		if perr != nil {
 			errs = append(errs, fmt.Errorf("plugin %s: %w", e.Name(), perr))
 			continue
@@ -156,7 +164,7 @@ func LoadPlugins(ctx context.Context, registry *tools.Registry) (*PluginRegistry
 
 // loadOne reads + validates one plugin's manifest, spawns its MCP server
 // (if any), and prefetches its skill files.
-func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.Registry) (*Plugin, error) {
+func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.Registry, manager *sandbox.Manager) (*Plugin, error) {
 	manifestPath := filepath.Join(rootDir, "plugin.toml")
 	var m pubplugin.Manifest
 	if _, err := toml.DecodeFile(manifestPath, &m); err != nil {
@@ -202,7 +210,7 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 			WorkingDir: workingDir, EnabledTools: append([]string(nil), spec.EnabledTools...),
 			DisabledTools: append([]string(nil), spec.DisabledTools...),
 		}
-		srv, err := launchPluginMCPServer(ctx, entry, registry)
+		srv, err := launchPluginMCPServer(ctx, entry, registry, manager)
 		if err != nil {
 			return nil, fmt.Errorf("mcp server %s: %w", serverName, err)
 		}

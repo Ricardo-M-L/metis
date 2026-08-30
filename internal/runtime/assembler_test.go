@@ -74,7 +74,7 @@ func TestAssembleMinimalSubAgentPrompt_OmitsMainOnlySections(t *testing.T) {
 	_, sections := AssembleMinimalSubAgentPrompt(PromptCtx{
 		Model:                "test-model",
 		ProviderName:         "test-provider",
-		EnabledTools:         map[string]bool{"Read": true, "Grep": true},
+		EnabledTools:         map[string]bool{"Read": true, "Grep": true, "mcp__computer-use__screenshot": true},
 		HasSkills:            true,
 		ComputerUseAvailable: true,
 	})
@@ -92,6 +92,18 @@ func TestAssembleMinimalSubAgentPrompt_OmitsMainOnlySections(t *testing.T) {
 		if !got[name] {
 			t.Errorf("minimal sub-agent prompt should include %q; got %v", name, sectionNames(sections))
 		}
+	}
+}
+
+func TestAssembleMinimalSubAgentPromptUsesExplicitWorkingDirectory(t *testing.T) {
+	workspace := t.TempDir()
+	system, _ := AssembleMinimalSubAgentPrompt(PromptCtx{
+		Model:            "model",
+		WorkingDirectory: workspace,
+		EnabledTools:     map[string]bool{"Read": true},
+	})
+	if !strings.Contains(system, "Working directory: "+workspace) {
+		t.Fatalf("minimal prompt did not use rebound workspace %q:\n%s", workspace, system)
 	}
 }
 

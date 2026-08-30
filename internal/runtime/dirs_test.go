@@ -132,6 +132,65 @@ func TestAllowedDirs_ContainsLaunchCWDAndAdditionalRoots(t *testing.T) {
 	}
 }
 
+func TestAllowedDirs_PreparedRebindDoesNotPublishBeforeCommit(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	source := t.TempDir()
+	target := t.TempDir()
+	d := newAllowedDirs(source, nil)
+
+	prepared, err := d.PrepareRebindCWD(target)
+	if err != nil {
+		t.Fatalf("PrepareRebindCWD: %v", err)
+	}
+	if !d.Contains(filepath.Join(source, "source.txt")) || d.Contains(filepath.Join(target, "target.txt")) {
+		t.Fatalf("prepare changed live scope: %v", d.Scope())
+	}
+
+	prepared.Commit()
+	if !d.Contains(filepath.Join(target, "target.txt")) || d.Contains(filepath.Join(source, "source.txt")) {
+		t.Fatalf("commit did not atomically replace cwd scope: %v", d.Scope())
+	}
+}
+
+func TestAllowedDirs_PreparedRebindExposesPinnedCanonicalPath(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	parent := t.TempDir()
+	target := filepath.Join(parent, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "workspace-link")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := newAllowedDirs(parent, nil).PrepareRebindCWD(alias)
+	if err != nil {
+		t.Fatalf("PrepareRebindCWD: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := prepared.CanonicalPath(); got != want {
+		t.Fatalf("CanonicalPath() = %q, want %q", got, want)
+	}
+}
+
+func TestAllowedDirs_FailedPreparedRebindLeavesScopeUnchanged(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	source := t.TempDir()
+	d := newAllowedDirs(source, nil)
+	missing := filepath.Join(t.TempDir(), "deleted-workspace")
+
+	if prepared, err := d.PrepareRebindCWD(missing); err == nil || prepared != nil {
+		t.Fatalf("missing workspace prepare = (%v, %v), want nil,error", prepared, err)
+	}
+	if !d.Contains(filepath.Join(source, "still-authorized.txt")) {
+		t.Fatalf("failed prepare changed source scope: %v", d.Scope())
+	}
+}
+
 func TestAllowedDirs_ContainsRejectsDotDotAndPrefixSibling(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
 	parent := t.TempDir()

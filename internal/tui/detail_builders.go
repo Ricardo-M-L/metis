@@ -78,10 +78,8 @@ func (m *Model) toolDetailScreen(name string) *screen.DetailScreen {
 	if m.loop == nil || m.loop.Registry == nil {
 		return nil
 	}
-	for _, t := range m.loop.Registry.All() {
-		if t.Name() != name {
-			continue
-		}
+	if entry, ok := m.loop.Registry.GetModelEntry(name); ok {
+		t := entry.Tool
 		sections := []screen.DetailSection{
 			{
 				Heading: "Description",

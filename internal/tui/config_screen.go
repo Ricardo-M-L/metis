@@ -10,6 +10,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -96,9 +97,38 @@ func (m *Model) applyConfigScreen(w *screen.ConfigScreen) tea.Cmd {
 	for i, change := range changes {
 		settings[i] = config.UserSetting{Key: change.Key, Value: change.Value}
 	}
+	var previousPermissionState rtpkg.PermissionModeState
+	permissionApplied := false
+	for _, change := range changes {
+		if change.Key != "permission.mode" || m.gate == nil {
+			continue
+		}
+		var err error
+		previousPermissionState, err = rtpkg.CapturePermissionModeState(m.gate, m.loop)
+		if err != nil {
+			m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+			return nil
+		}
+		if err := applyModelPermissionMode(m, permission.CanonicalMode(change.Value)); err != nil {
+			m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+			return nil
+		}
+		permissionApplied = true
+		break
+	}
 	loaded, err := config.SaveUserSettingsAndLoad(settings)
 	if err != nil {
-		m.messages = append(m.messages, Message{Role: "error", Content: "config save failed: " + err.Error(), Timestamp: time.Now()})
+		var rollbackErr error
+		if permissionApplied {
+			rollbackErr = rtpkg.RestorePermissionModeState(previousPermissionState, func(mode permission.Mode) error {
+				return applyModelPermissionMode(m, mode)
+			})
+		}
+		message := "config save failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; permission rollback failed: " + rollbackErr.Error()
+		}
+		m.messages = append(m.messages, Message{Role: "error", Content: message, Timestamp: time.Now()})
 		return nil
 	}
 	live := m.applyLiveConfigChanges(loaded, changes)
@@ -128,10 +158,14 @@ func (m *Model) applyLiveConfigChanges(candidate *config.Config, changes []scree
 	for _, change := range changes {
 		switch change.Key {
 		case "permission.mode":
-			m.cfg.Permission.Mode = candidate.Permission.Mode
-			if m.gate != nil {
-				m.gate.SetMode(permission.CanonicalMode(candidate.Permission.Mode))
+			mode := permission.CanonicalMode(candidate.Permission.Mode)
+			if m.gate != nil && m.gate.Mode() != mode {
+				if err := applyModelPermissionMode(m, mode); err != nil {
+					m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+					continue
+				}
 			}
+			m.cfg.Permission.Mode = candidate.Permission.Mode
 			live++
 		case "ui.thinking_display":
 			m.cfg.UI.ThinkingDisplay = candidate.UI.ThinkingDisplay

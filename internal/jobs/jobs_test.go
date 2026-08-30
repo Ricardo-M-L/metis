@@ -113,6 +113,31 @@ func TestSpawn_NotificationFires(t *testing.T) {
 	}
 }
 
+func TestSpawn_NotificationRedactsCredentialBearingCommand(t *testing.T) {
+	r := quickRegistry(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "true")
+	_, err := r.Spawn(SpawnArgs{
+		Command: `OPENAI_API_KEY=background-super-secret command true`,
+		Cmd:     cmd,
+		Cancel:  cancel,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	select {
+	case n := <-r.Notify():
+		if strings.Contains(n.Command, "background-super-secret") {
+			t.Fatalf("notification leaked command credential: %q", n.Command)
+		}
+		if !strings.Contains(n.Command, "[REDACTED]") {
+			t.Fatalf("notification command was not visibly redacted: %q", n.Command)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("notification never fired")
+	}
+}
+
 // TestSpawn_FailedExit — non-zero exit lands StatusFailed with the
 // real exit code. Distinct from StatusKilled (which the model needs
 // to differentiate so it doesn't pretend a kill was a real error).
@@ -178,6 +203,39 @@ func TestStop_TerminalStateIsKilled(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("kill cleanup never landed")
+}
+
+func TestStop_NotificationRedactsCredentialBearingCommand(t *testing.T) {
+	r := quickRegistry(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "sleep 30")
+	j, err := r.Spawn(SpawnArgs{
+		Command: `CUSTOM_API_KEY=stopped-job-super-secret sleep 30`,
+		Cmd:     cmd,
+		Cancel:  cancel,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := r.Stop(j.ID, 0); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case n := <-r.Notify():
+		if strings.Contains(n.Command, "stopped-job-super-secret") || !strings.Contains(n.Command, "[REDACTED]") {
+			t.Fatalf("stop notification command was not redacted: %q", n.Command)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("kill notification never fired")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.CleanedUp(j.ID) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("killed credential-bearing job was not cleaned up")
 }
 
 // TestStop_UnknownIDError — Stop on a non-existent ID returns a clear

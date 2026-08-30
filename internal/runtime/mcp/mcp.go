@@ -27,6 +27,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/config"
 	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/mcpoauth"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
 )
@@ -41,30 +42,113 @@ type Registry struct {
 	Servers []ServerEntry `toml:"servers"`
 }
 
+const maxMCPServerNameBytes = 128
+
+// validateServerName keeps server identifiers safe for every place they are
+// reused: qualified tool names, OAuth lookup keys, logs, and cache filenames.
+// MCP configurations in the wild commonly use dots, underscores, and hyphens,
+// so those remain supported; path separators, whitespace, Unicode, and control
+// characters are rejected rather than normalized to an ambiguous alias.
+func validateServerName(name string) error {
+	if name == "" {
+		return errors.New("mcp: invalid server name: name is required")
+	}
+	if len(name) > maxMCPServerNameBytes {
+		return fmt.Errorf("mcp: invalid server name %q: exceeds %d bytes", name, maxMCPServerNameBytes)
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("mcp: invalid server name %q: path components are not allowed", name)
+	}
+	if strings.HasSuffix(name, ".") {
+		return fmt.Errorf("mcp: invalid server name %q: trailing dots are not portable", name)
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9') || b == '.' || b == '_' || b == '-' {
+			continue
+		}
+		return fmt.Errorf(
+			"mcp: invalid server name %q: only ASCII letters, digits, '.', '_', and '-' are allowed",
+			name,
+		)
+	}
+	if isWindowsReservedServerName(name) {
+		return fmt.Errorf("mcp: invalid server name %q: reserved filesystem name", name)
+	}
+	return nil
+}
+
+func isWindowsReservedServerName(name string) bool {
+	base := name
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		base = base[:dot]
+	}
+	base = strings.ToUpper(base)
+	switch base {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(base) == 4 && base[3] >= '1' && base[3] <= '9' {
+		return strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")
+	}
+	return false
+}
+
+func validateRegistryServerNames(reg *Registry) error {
+	if reg == nil {
+		return nil
+	}
+	for i := range reg.Servers {
+		if err := validateServerName(reg.Servers[i].Name); err != nil {
+			return fmt.Errorf("mcp: servers[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // resolveAuthHeaders returns the HTTP headers to use for a server,
 // injecting a freshly-ensured OAuth Bearer token when the entry declares
-// auth="oauth". On any OAuth failure it logs to stderr and falls back to
-// the static Headers, so a broken auth setup degrades to "connect without
-// the token" (the server then returns its own 401) rather than hard-
-// failing the whole launch. No-op for stdio entries.
-func resolveAuthHeaders(ctx context.Context, e ServerEntry) map[string]string {
+// auth="oauth". OAuth is explicit configuration, so token acquisition
+// failures are terminal: autonomous launch paths must neither connect without
+// authentication nor start an interactive login flow. No-op for stdio entries
+// and HTTP entries that use no auth or static Headers.
+func resolveAuthHeaders(ctx context.Context, e ServerEntry) (map[string]string, error) {
 	if e.URL == "" || !strings.EqualFold(e.Auth, "oauth") {
-		return e.Headers
+		return e.Headers, nil
 	}
 	// interactive=false: an autonomous connect (startup / lazy tool call)
-	// must not block on a browser flow. Missing token → connect without
-	// (server returns 401); the user runs an explicit login to authorize.
+	// must not block on a browser flow. A missing or unusable token fails
+	// closed and directs the user to the explicit login command.
 	tok, err := mcpoauth.NewTokenStore().EnsureToken(ctx, e.Name, e.URL, false)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "mcp: oauth for %q: %v\n", e.Name, err)
-		return e.Headers
+		switch {
+		case errors.Is(err, mcpoauth.ErrCredentialMissing):
+			return nil, fmt.Errorf(
+				"mcp: OAuth credential is not configured for server %q; explicit login is required: run `/mcp login %s`: %w",
+				e.Name, e.Name, err,
+			)
+		case errors.Is(err, mcpoauth.ErrCredentialReauthRequired):
+			return nil, fmt.Errorf(
+				"mcp: OAuth credential for server %q is no longer usable; explicit re-login is required: run `/mcp login %s`: %w",
+				e.Name, e.Name, err,
+			)
+		default:
+			return nil, fmt.Errorf("mcp: resolve OAuth credential for server %q: %w", e.Name, err)
+		}
+	}
+	if strings.TrimSpace(tok) == "" {
+		return nil, fmt.Errorf(
+			"mcp: OAuth credential for server %q resolved to an empty access token; explicit re-login is required: run `/mcp login %s`",
+			e.Name, e.Name,
+		)
 	}
 	out := make(map[string]string, len(e.Headers)+1)
 	for k, v := range e.Headers {
 		out[k] = v
 	}
 	out["Authorization"] = "Bearer " + tok
-	return out
+	return out, nil
 }
 
 // ServerEntry mirrors config.MCPServer but lives in this package so the
@@ -135,6 +219,9 @@ func Load() (*Registry, error) {
 	if _, err := toml.DecodeFile(p, &r); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", p, err)
 	}
+	if err := validateRegistryServerNames(&r); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", p, err)
+	}
 	return &r, nil
 }
 
@@ -145,6 +232,9 @@ func Load() (*Registry, error) {
 func Save(reg *Registry) error {
 	if reg == nil {
 		reg = &Registry{}
+	}
+	if err := validateRegistryServerNames(reg); err != nil {
+		return err
 	}
 	dir := config.Home()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -236,8 +326,8 @@ func AddServer(reg *Registry, name, command string, args []string) error {
 // for shell-resolved secrets — the expansion happens at LaunchServer
 // time via expandEnvVarsInEntry.
 func AddServerWithEnv(reg *Registry, name, command string, args []string, env map[string]string) error {
-	if name == "" {
-		return errors.New("mcp: name required")
+	if err := validateServerName(name); err != nil {
+		return err
 	}
 	if command == "" {
 		return errors.New("mcp: command required")
@@ -369,6 +459,16 @@ func FindServer(reg *Registry, name string) *ServerEntry {
 // Authorization header (which the server then rejects with an opaque
 // 401, hiding the actual root cause).
 func LaunchServer(ctx context.Context, reg *Registry, name string, registry *tools.Registry) (*mcptools.Server, error) {
+	return LaunchServerWithSandbox(ctx, reg, name, registry, nil)
+}
+
+// LaunchServerWithSandbox launches local stdio servers through manager while
+// leaving remote HTTP transports unchanged. manager is runtime-owned and must
+// outlive the returned server.
+func LaunchServerWithSandbox(ctx context.Context, reg *Registry, name string, registry *tools.Registry, manager *sandbox.Manager) (*mcptools.Server, error) {
+	if err := validateServerName(name); err != nil {
+		return nil, err
+	}
 	entry := FindServer(reg, name)
 	if entry == nil {
 		return nil, fmt.Errorf("mcp: no server named %q", name)
@@ -376,11 +476,9 @@ func LaunchServer(ctx context.Context, reg *Registry, name string, registry *too
 	if entry.Disabled {
 		return nil, fmt.Errorf("mcp: server %q is disabled", name)
 	}
-	expanded, missing := expandEnvVarsInEntry(*entry)
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("mcp: server %q references unset env vars: %s "+
-			"(use ${VAR:-default} for an inline fallback)",
-			name, strings.Join(missing, ", "))
+	expanded, err := ExpandServerEntry(*entry)
+	if err != nil {
+		return nil, err
 	}
 	// Windows-on-npx footgun: spawning `npx some-mcp` directly fails
 	// on Windows with "exec: \"npx\": file does not exist" because npx
@@ -406,14 +504,18 @@ func LaunchServer(ctx context.Context, reg *Registry, name string, registry *too
 	// wins when both are set so a user converting an entry from stdio
 	// to HTTP doesn't have to clear Command first.
 	var srv *mcptools.Server
-	var err error
 	switch {
 	case expanded.URL != "":
-		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, resolveAuthHeaders(ctx, expanded))
+		headers, authErr := resolveAuthHeaders(ctx, expanded)
+		if authErr != nil {
+			return nil, authErr
+		}
+		srv, err = mcptools.NewHTTPServer(ctx, expanded.Name, expanded.URL, headers)
 	case expanded.Command != "":
-		srv, err = mcptools.NewServerWithEnvAndDir(
+		stdioEnv, stdioProfile := stdioLaunchEnvAndProfile(expanded)
+		srv, err = mcptools.NewServerWithEnvAndDirAndSandboxProfile(
 			ctx, expanded.Name, expanded.Command,
-			envSliceFromMap(maybeInjectCUEnv(expanded.Command, expanded.Env)), expanded.WorkingDir,
+			stdioEnv, expanded.WorkingDir, manager, stdioProfile,
 			expanded.Args...)
 	default:
 		return nil, fmt.Errorf("mcp: server %q has neither command nor url", name)
@@ -429,6 +531,15 @@ func LaunchServer(ctx context.Context, reg *Registry, name string, registry *too
 		registry.Register(t)
 	}
 	return srv, nil
+}
+
+func stdioLaunchEnvAndProfile(entry ServerEntry) ([]string, mcpsdk.StdioSandboxProfile) {
+	env, computerUse := maybeInjectCUEnv(entry.Name, entry.Command, entry.Env)
+	profile := mcpsdk.StdioSandboxProfileGeneric
+	if computerUse {
+		profile = mcpsdk.StdioSandboxProfileComputerUse
+	}
+	return envSliceFromMap(env), profile
 }
 
 // LaunchAll starts every enabled server in the registry and returns the
@@ -449,8 +560,17 @@ func LaunchServer(ctx context.Context, reg *Registry, name string, registry *too
 // Result-collection still happens under a mutex so the returned slices
 // have stable ordering matching reg.Servers.
 func LaunchAll(ctx context.Context, reg *Registry, registry *tools.Registry) ([]*mcptools.Server, []error) {
+	return LaunchAllWithSandbox(ctx, reg, registry, nil)
+}
+
+// LaunchAllWithSandbox is LaunchAll with a runtime-owned sandbox shared by
+// every stdio server started during this launch.
+func LaunchAllWithSandbox(ctx context.Context, reg *Registry, registry *tools.Registry, manager *sandbox.Manager) ([]*mcptools.Server, []error) {
 	if reg == nil {
 		return nil, nil
+	}
+	if err := validateRegistryServerNames(reg); err != nil {
+		return nil, []error{err}
 	}
 	type launchResult struct {
 		idx int
@@ -467,7 +587,7 @@ func LaunchAll(ctx context.Context, reg *Registry, registry *tools.Registry) ([]
 		wg.Add(1)
 		go func(idx int, name string) {
 			defer wg.Done()
-			srv, err := LaunchServer(ctx, reg, name, registry)
+			srv, err := LaunchServerWithSandbox(ctx, reg, name, registry, manager)
 			mu.Lock()
 			results = append(results, launchResult{idx: idx, srv: srv, err: err})
 			mu.Unlock()
@@ -507,11 +627,20 @@ func LaunchAll(ctx context.Context, reg *Registry, registry *tools.Registry) ([]
 // registered (whether spawned or deferred); errs []error collects the
 // per-server failures so setupRuntime can warn-but-keep-going.
 func LaunchAllLazy(ctx context.Context, reg *Registry, registry *tools.Registry, mode LazyMode) ([]*mcptools.Server, []error) {
+	return LaunchAllLazyWithSandbox(ctx, reg, registry, mode, nil)
+}
+
+// LaunchAllLazyWithSandbox is LaunchAllLazy with a runtime-owned sandbox
+// captured by both eager and deferred stdio spawn paths.
+func LaunchAllLazyWithSandbox(ctx context.Context, reg *Registry, registry *tools.Registry, mode LazyMode, manager *sandbox.Manager) ([]*mcptools.Server, []error) {
 	if reg == nil {
 		return nil, nil
 	}
+	if err := validateRegistryServerNames(reg); err != nil {
+		return nil, []error{err}
+	}
 	if mode == LazyMCPModeNever {
-		return LaunchAll(ctx, reg, registry)
+		return LaunchAllWithSandbox(ctx, reg, registry, manager)
 	}
 	// Parallel launch — same rationale as LaunchAll above. Cache-hit
 	// entries are near-instant (no subprocess), but cache-miss entries
@@ -532,7 +661,7 @@ func LaunchAllLazy(ctx context.Context, reg *Registry, registry *tools.Registry,
 		wg.Add(1)
 		go func(idx int, e ServerEntry) {
 			defer wg.Done()
-			srv, err := launchOneMCPLazy(ctx, e, registry, mode)
+			srv, err := launchOneMCPLazyWithSandbox(ctx, e, registry, mode, manager)
 			mu.Lock()
 			results = append(results, launchResult{idx: idx, srv: srv, err: err})
 			mu.Unlock()
@@ -557,6 +686,13 @@ func LaunchAllLazy(ctx context.Context, reg *Registry, registry *tools.Registry,
 // LaunchAllLazy. Loads the cache, decides between deferred /
 // eager spawn, registers tools, returns the resulting Server.
 func launchOneMCPLazy(ctx context.Context, entry ServerEntry, registry *tools.Registry, mode LazyMode) (*mcptools.Server, error) {
+	return launchOneMCPLazyWithSandbox(ctx, entry, registry, mode, nil)
+}
+
+func launchOneMCPLazyWithSandbox(ctx context.Context, entry ServerEntry, registry *tools.Registry, mode LazyMode, manager *sandbox.Manager) (*mcptools.Server, error) {
+	if err := validateServerName(entry.Name); err != nil {
+		return nil, err
+	}
 	// Step 1: env-var expansion happens up-front so the fingerprint
 	// reflects the actual launch identity (the same way an eager
 	// LaunchServer would see it).
@@ -572,11 +708,17 @@ func launchOneMCPLazy(ctx context.Context, entry ServerEntry, registry *tools.Re
 
 	// Cache hit? Register stub tools + defer spawn.
 	if cache != nil && cache.Fingerprint == wantFP && len(cache.Tools) > 0 {
-		srv := buildLazyServer(expanded, entry, cache.Tools)
-		for _, t := range srv.FilteredTools(entry.EnabledTools, entry.DisabledTools) {
-			registry.Register(t)
+		liveShape := CachedToolsToMCPTools(cache.Tools)
+		liveShape = mcpsdk.SanitizeToolsForExplicitConfig(
+			liveShape, expanded.Env, expanded.Headers, expanded.URL,
+		)
+		if len(liveShape) > 0 {
+			srv := buildLazyServerWithSandbox(expanded, entry, MCPToolsToCached(liveShape), manager)
+			for _, t := range srv.FilteredTools(entry.EnabledTools, entry.DisabledTools) {
+				registry.Register(t)
+			}
+			return srv, nil
 		}
-		return srv, nil
 	}
 
 	// Cache miss / fingerprint stale / empty cache.
@@ -586,7 +728,7 @@ func launchOneMCPLazy(ctx context.Context, entry ServerEntry, registry *tools.Re
 		// can't invoke anything until the cache exists, but the entry
 		// is recognized so /mcp surface lists it. The first manual
 		// `/mcp reload` (or the next session's startup) will repair.
-		srv := buildLazyServer(expanded, entry, nil)
+		srv := buildLazyServerWithSandbox(expanded, entry, nil, manager)
 		// No tools to register here — registry stays empty for this
 		// server. Surface a warning to the caller.
 		return srv, fmt.Errorf("mcp: server %q has no cache and METIS_LAZY_MCP=always — "+
@@ -598,7 +740,7 @@ func launchOneMCPLazy(ctx context.Context, entry ServerEntry, registry *tools.Re
 	// register THIS session, AND seed the cache for next time. This is
 	// the "first-run" cost: identical to legacy LaunchAll for new
 	// servers, but cheaper for every subsequent run.
-	srv, err := LaunchServer(ctx, &Registry{Servers: []ServerEntry{entry}}, entry.Name, registry)
+	srv, err := LaunchServerWithSandbox(ctx, &Registry{Servers: []ServerEntry{entry}}, entry.Name, registry, manager)
 	if err != nil {
 		return nil, err
 	}
@@ -613,13 +755,22 @@ func launchOneMCPLazy(ctx context.Context, entry ServerEntry, registry *tools.Re
 // the first Execute fires the same code path an eager launch would
 // have used at startup.
 func buildLazyServer(expanded, original ServerEntry, cachedTools []CachedTool) *mcptools.Server {
+	return buildLazyServerWithSandbox(expanded, original, cachedTools, nil)
+}
+
+func buildLazyServerWithSandbox(expanded, original ServerEntry, cachedTools []CachedTool, manager *sandbox.Manager) *mcptools.Server {
 	spawn := func(ctx context.Context) (*mcpsdk.Client, error) {
 		switch {
 		case expanded.URL != "":
-			return mcpsdk.NewHTTPClient(ctx, expanded.URL, resolveAuthHeaders(ctx, expanded))
+			headers, err := resolveAuthHeaders(ctx, expanded)
+			if err != nil {
+				return nil, err
+			}
+			return mcpsdk.NewHTTPClient(ctx, expanded.URL, headers)
 		case expanded.Command != "":
-			return mcpsdk.NewStdioClientWithEnv(ctx, expanded.Command,
-				envSliceFromMap(maybeInjectCUEnv(expanded.Command, expanded.Env)),
+			stdioEnv, stdioProfile := stdioLaunchEnvAndProfile(expanded)
+			return mcpsdk.NewStdioClientWithEnvAndDirAndSandboxProfile(ctx, expanded.Command,
+				stdioEnv, expanded.WorkingDir, manager, stdioProfile,
 				expanded.Args...)
 		default:
 			return nil, fmt.Errorf("mcp: server %q has neither command nor url", expanded.Name)

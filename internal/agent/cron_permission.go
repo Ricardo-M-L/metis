@@ -24,7 +24,11 @@ package agent
 // runtime's default mode a dangerous command would otherwise arrive here
 // as a plain ASK.
 
-import "github.com/Ricardo-M-L/metis/internal/permission"
+import (
+	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/permission"
+)
 
 // FlattenToolInput renders a tool input map into the same canonical
 // string form the gate sees (Bash's command, Edit's path, …). Exported so
@@ -43,6 +47,15 @@ func EvaluateCronPermission(job *CronJob, tool string, input map[string]any) (al
 	}
 	if job == nil {
 		return false, "unauthorized"
+	}
+	// DisabledTools is a hard per-job blacklist. It must be enforced here as
+	// well as in the Gate because MCP and third-party tools may return ALLOW
+	// without consulting that Gate at all.
+	for _, disabled := range job.DisabledTools {
+		disabled = strings.TrimSpace(disabled)
+		if disabled == "*" || disabled == tool {
+			return false, "disabled_tool:" + disabled
+		}
 	}
 	for _, raw := range job.AllowTools {
 		rt, rc := permission.ParseToolRule(raw)

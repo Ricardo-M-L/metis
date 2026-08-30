@@ -35,6 +35,11 @@ type (
 	SavedRule = pubsess.SavedRule
 )
 
+const (
+	SystemPromptKindDefault = pubsess.SystemPromptKindDefault
+	SystemPromptKindCustom  = pubsess.SystemPromptKindCustom
+)
+
 // FeedbackEntry is a log-only human remark (DSH command-feedback parity):
 // it is appended to the session JSONL under type "feedback", never enters
 // model context, and Load ignores it (no history effect). Kinds: "remark"
@@ -517,11 +522,18 @@ func mergeHeader(dst *Header, src *Header) {
 	if src.System != "" {
 		dst.System = src.System
 	}
+	if src.SystemPromptKind != "" {
+		dst.SystemPromptKind = src.SystemPromptKind
+	}
 	if src.WorkDir != "" {
 		dst.WorkDir = src.WorkDir
 	}
 	if src.Mode != "" {
 		dst.Mode = src.Mode
+		// A permission-state header is a complete mode snapshot. Assigning the
+		// companion field even when empty is the append-only tombstone that
+		// clears a previous plan lineage after ExitPlanMode.
+		dst.PrePlanMode = src.PrePlanMode
 	}
 	if src.Effort != "" {
 		dst.Effort = src.Effort
@@ -803,13 +815,14 @@ func (s *Store) Branch(id string, messages []llm.Message) (string, error) {
 	}
 	newID := s.NewSessionID()
 	newHdr := Header{
-		ID:       newID,
-		Provider: hdr.Provider,
-		Model:    hdr.Model,
-		System:   hdr.System,
-		Effort:   hdr.Effort,
-		Preset:   hdr.Preset,
-		Status:   "idle",
+		ID:               newID,
+		Provider:         hdr.Provider,
+		Model:            hdr.Model,
+		System:           hdr.System,
+		SystemPromptKind: hdr.SystemPromptKind,
+		Effort:           hdr.Effort,
+		Preset:           hdr.Preset,
+		Status:           "idle",
 		ForkedFrom: &pubsess.ForkRef{
 			SessionID:    id,
 			MessageCount: len(messages),

@@ -169,6 +169,30 @@ func TestBashOutput_ReadsRunningJob(t *testing.T) {
 	}
 }
 
+func TestBashOutput_RedactsCredentialBearingJobLog(t *testing.T) {
+	pool, gate := jobPoolFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "printf 'CUSTOM_API_KEY=background-secret-value'")
+	j, err := pool.Spawn(jobs.SpawnArgs{Command: "credential output test", Cmd: cmd, Cancel: cancel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap, ok := pool.Snapshot(j.ID); ok && snap.Status == jobs.StatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	res, err := (Output{gate: gate, pool: pool}).Execute(context.Background(), map[string]any{"job_id": j.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError || strings.Contains(res.Output, "background-secret-value") || !strings.Contains(res.Output, "[REDACTED]") {
+		t.Fatalf("credential-bearing job output = %#v, want redacted successful output", res)
+	}
+}
+
 func TestBashListAndOutputReadSnapshotsDuringCompletion(t *testing.T) {
 	pool, gate := jobPoolFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())

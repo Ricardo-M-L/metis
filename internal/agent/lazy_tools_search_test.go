@@ -215,10 +215,11 @@ func TestHandleToolSearch_KeywordMaxResults(t *testing.T) {
 	}
 }
 
-// TestHandleToolSearch_KeywordNoMCPMatchesEmpty — non-MCP tools must
-// NOT match keyword search. Builtins are always in tools[] anyway —
-// returning them here would be noise.
-func TestHandleToolSearch_KeywordExcludesNonMCP(t *testing.T) {
+// TestHandleToolSearch_KeywordIncludesDirectTools — ToolSearch is the
+// capability catalog, not an MCP-only list. Direct tools are returned with an
+// availability marker so the model invokes them immediately instead of
+// requesting a duplicate schema.
+func TestHandleToolSearch_KeywordIncludesDirectTools(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.Register(mcpFake("Read", "read a file"))             // not mcp__
 	reg.Register(mcpFake("mcp__fs__read", "read remote fs")) // is mcp__
@@ -228,8 +229,43 @@ func TestHandleToolSearch_KeywordExcludesNonMCP(t *testing.T) {
 		t.Fatalf("expected success; got: %v", parsed)
 	}
 	got := matchNames(t, parsed)
-	if len(got) != 1 || got[0] != "mcp__fs__read" {
-		t.Errorf("non-mcp tool should NOT appear in keyword results; got %v", got)
+	if len(got) != 2 {
+		t.Fatalf("direct and deferred matches should both be returned; got %v", got)
+	}
+	foundDirect := false
+	for _, raw := range parsed["matches"].([]any) {
+		match := raw.(map[string]any)
+		if match["name"] == "Read" {
+			foundDirect = true
+			if match["already_available"] != true {
+				t.Fatalf("direct tool should be marked already_available: %v", match)
+			}
+		}
+		if match["name"] == "mcp__fs__read" {
+			if _, exists := match["already_available"]; exists {
+				t.Fatalf("deferred tool should not carry a false availability field: %v", match)
+			}
+		}
+	}
+	if !foundDirect {
+		t.Fatalf("direct Read tool missing from keyword matches: %v", got)
+	}
+}
+
+func TestHandleToolSearchSelectDeduplicatesNames(t *testing.T) {
+	l := newLoopWithTools(
+		mcpFake("Read", "read a local file"),
+		mcpFake("mcp__fs__read", "read a remote file"),
+	)
+	parsed, isErr := invokeSearch(t, l, map[string]any{
+		"query": "select:Read,mcp__fs__read,Read,mcp__fs__read",
+	})
+	if isErr {
+		t.Fatalf("expected success: %v", parsed)
+	}
+	got := matchNames(t, parsed)
+	if len(got) != 2 || got[0] != "Read" || got[1] != "mcp__fs__read" {
+		t.Fatalf("select should de-duplicate while preserving first order; got %v", got)
 	}
 }
 

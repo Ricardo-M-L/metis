@@ -2,18 +2,25 @@ package builtin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 type Write struct {
 	tools.BaseTool
-	gate  *permission.Gate
-	state *ReadFileState
+	gate           *permission.Gate
+	state          *ReadFileState
+	authorizer     *invocationAuthorizer[approvedWriteTarget]
+	afterOpen      func()
+	beforeCommit   func()
+	afterDirectory func(string)
+	beforeLeaf     func()
 }
 
 func (Write) Name() string { return "Write" }
@@ -67,9 +74,30 @@ func (Write) Concurrency(map[string]any) tools.Concurrency { return tools.Concur
 // without backup.
 func (Write) IsDestructive(map[string]any) bool { return true }
 
-func (w Write) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
+func (w Write) PrepareAuthorizedInvocation(ctx context.Context, in map[string]any) error {
 	path := strFromAny(in["path"])
-	d, src := w.gate.CheckPath(context.Background(), "Write", path, path)
+	binding, err := prepareWriteTarget(path)
+	if err != nil {
+		return err
+	}
+	if !binding.stillPrepared() {
+		return errors.New("Write target changed during permission preparation")
+	}
+	w.authorizer.record(ctx, binding)
+	return nil
+}
+
+func (w Write) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	path := strFromAny(in["path"])
+	d, src := permission.DecisionAllow, ""
+	if w.gate != nil {
+		d, src = w.gate.CheckPath(ctx, "Write", path, path)
+	}
+	if d != permission.DecisionDeny {
+		if err := w.PrepareAuthorizedInvocation(ctx, in); err != nil {
+			return tools.PermissionDeny, security.RedactSubprocessText(err.Error())
+		}
+	}
 	return mapDecision(d), src
 }
 
@@ -78,7 +106,10 @@ func (w Write) CanUse(_ context.Context, in map[string]any) (tools.Permission, s
 // should have streamed.
 const MaxWriteContentBytes = 64 * 1024 * 1024
 
-func (w Write) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (w Write) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	path, _ := in["path"].(string)
 	content, _ := in["content"].(string)
 	if path == "" {
@@ -104,65 +135,101 @@ func (w Write) Execute(_ context.Context, in map[string]any) (*tools.Result, err
 			IsError: true,
 		}, nil
 	}
-
-	// Staleness check on overwrite: if file exists and Read recorded
-	// a different content/mtime than what's there now, refuse so the
-	// model re-Reads first.
-	if st, statErr := os.Stat(path); statErr == nil {
-		if st.IsDir() {
-			// Same Crush-style guard as Read/Edit: trying to Write
-			// to a directory path is almost always "model meant
-			// path/file.ext" — call it out instead of letting the
-			// underlying os.WriteFile fail with a less actionable
-			// syscall message.
-			return &tools.Result{
-				Output:  fmt.Sprintf("%s is a directory, not a file. Write needs an absolute file path; pick a filename inside the directory.", path),
-				IsError: true,
-			}, nil
+	binding, hasInvocationID, foundBinding := w.authorizer.consume(ctx)
+	if hasInvocationID && !foundBinding {
+		if _, prepErr := prepareWriteTarget(path); prepErr != nil {
+			if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+				return &tools.Result{Output: fmt.Sprintf("%s is a directory, not a file. Write needs an absolute file path; pick a filename inside the directory.", path), IsError: true}, nil
+			}
+			return nil, prepErr
 		}
-		if w.state != nil {
-			if entry, ok := w.state.Get(path); ok {
-				if entry.IsPartialView {
-					return &tools.Result{
-						Output:  FilePartialViewNotEditable + ": " + path,
-						IsError: true,
-					}, nil
-				}
-				if data, rerr := os.ReadFile(path); rerr == nil {
-					// Content hash is the precise stale-write signal; the old
-					// `&&` mtime requirement let a content change with a
-					// preserved mtime slip through and clobber on-disk edits.
-					currentHash := hashBytes(data)
-					if currentHash != entry.Hash {
-						return &tools.Result{
-							Output:  FileUnexpectedlyModified + ": " + path,
-							IsError: true,
-						}, nil
-					}
-				}
-			} else {
-				// File exists, no Read in this session → require it.
-				// Skipping this rule lets the model clobber files
-				// blindly, which is the bug Write's docstring warns
-				// against. Skipped only if state is nil (test bypass).
-				return &tools.Result{
-					Output:  "Write refused: " + path + " exists but has not been Read this session — call Read first to confirm intent",
-					IsError: true,
-				}, nil
+		return &tools.Result{Output: "Write denied: permission binding missing for this invocation", IsError: true}, nil
+	}
+	if !hasInvocationID {
+		var prepErr error
+		binding, prepErr = prepareWriteTarget(path)
+		if prepErr != nil {
+			if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+				return &tools.Result{Output: fmt.Sprintf("%s is a directory, not a file. Write needs an absolute file path; pick a filename inside the directory.", path), IsError: true}, nil
+			}
+			return nil, prepErr
+		}
+		if w.gate != nil {
+			decision, source := w.gate.CheckPath(ctx, "Write", path, path)
+			if decision != permission.DecisionAllow {
+				return &tools.Result{Output: "Write denied: " + source, IsError: true}, nil
 			}
 		}
 	}
+	requestedAbs, absErr := filepath.Abs(filepath.Clean(path))
+	if absErr != nil || (binding.existing != nil && requestedAbs != binding.existing.rawPath) ||
+		(binding.newPath != nil && requestedAbs != binding.newPath.rawPath) {
+		return &tools.Result{Output: "Write denied: invocation input changed after permission check", IsError: true}, nil
+	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return nil, err
-	}
-	if w.state != nil {
-		if st, serr := os.Stat(path); serr == nil {
-			w.state.Record(path, st.ModTime(), []byte(content))
+	if binding.existing != nil {
+		approved := *binding.existing
+		f, _, openErr := openApprovedExisting(approved, os.O_RDWR, w.afterOpen)
+		if openErr != nil {
+			// An approved existing file may never degrade into create semantics.
+			return &tools.Result{Output: "Write denied: approved existing target changed or disappeared", IsError: true}, nil
 		}
+		defer f.Close()
+		data, _, readErr := readPinnedFile(f, MaxReadFileSize)
+		if readErr != nil {
+			return nil, readErr
+		}
+		statePath := approved.resolvedPath
+		if w.state != nil {
+			entry, ok := w.state.getFixed(statePath)
+			if !ok {
+				return &tools.Result{Output: "Write refused: " + path + " exists but has not been Read this session — call Read first to confirm intent", IsError: true}, nil
+			}
+			if entry.IsPartialView {
+				return &tools.Result{Output: FilePartialViewNotEditable + ": " + path, IsError: true}, nil
+			}
+			if hashBytes(data) != entry.Hash {
+				return &tools.Result{Output: FileUnexpectedlyModified + ": " + path, IsError: true}, nil
+			}
+		}
+		if w.beforeCommit != nil {
+			w.beforeCommit()
+		}
+		if _, verifyErr := verifyPinnedContent(f, hashBytes(data), MaxReadFileSize); verifyErr != nil {
+			return &tools.Result{Output: FileUnexpectedlyModified + ": " + path, IsError: true}, nil
+		}
+		postInfo, writeErr := replacePinnedFile(f, []byte(content))
+		if writeErr != nil {
+			return nil, writeErr
+		}
+		if w.state != nil {
+			if approved.matchesCurrent(postInfo) {
+				w.state.recordFixed(statePath, postInfo.ModTime(), []byte(content))
+			} else {
+				w.state.deleteFixed(statePath)
+			}
+		}
+	} else if binding.newPath != nil {
+		approved := *binding.newPath
+		f, createErr := createApprovedNewFile(approved, w.afterDirectory, w.beforeLeaf, w.afterOpen)
+		if createErr != nil {
+			// An approved-new file may never upgrade into overwrite semantics.
+			return &tools.Result{Output: "Write denied: approved-new target or parent changed before creation", IsError: true}, nil
+		}
+		defer f.Close()
+		postInfo, writeErr := replacePinnedFile(f, []byte(content))
+		if writeErr != nil {
+			return nil, writeErr
+		}
+		if w.state != nil {
+			if newPathMatchesCurrent(approved, postInfo) {
+				w.state.recordFixed(approved.stateKey, postInfo.ModTime(), []byte(content))
+			} else {
+				w.state.deleteFixed(approved.stateKey)
+			}
+		}
+	} else {
+		return &tools.Result{Output: "Write denied: invalid empty target binding", IsError: true}, nil
 	}
 	return &tools.Result{Output: "wrote " + path}, nil
 }

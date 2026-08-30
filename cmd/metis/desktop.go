@@ -9,6 +9,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/desktop"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/webui"
 )
@@ -62,10 +63,17 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	defer cancelServer()
 	shutdownToken := strings.TrimSpace(os.Getenv("METIS_DESKTOP_FRAME_TOKEN"))
 	bindings := webui.RuntimeBindings{
-		InitialSessionID:    rt.sessionID,
-		ProviderName:        rt.providerName,
-		PresetName:          presetName,
-		FreshPermissionMode: rt.defaultPermissionMode,
+		InitialSessionID:      rt.sessionID,
+		ProviderName:          rt.providerName,
+		PresetName:            presetName,
+		FreshSystemPromptKind: rt.systemPromptKind,
+		FreshPermissionMode:   rt.defaultPermissionMode,
+		SetPermissionMode: func(mode permission.Mode) error {
+			return applyRuntimePermissionMode(rt, mode)
+		},
+		PreflightPermissionMode: func(mode permission.Mode, prePlan string) error {
+			return rtpkg.PreflightRestoredPermissionState(rt.sandbox, mode, prePlan)
+		},
 		BuildProvider: func(providerName, model string) (*rtpkg.ProviderBuild, error) {
 			cfg, _, err := config.Load()
 			if err != nil {
@@ -73,14 +81,14 @@ func cmdDesktop(ctx context.Context, args []string) error {
 			}
 			return rtpkg.BuildProvider(cfg, providerName, model)
 		},
-		SessionBoundary: rt.releaseSessionWork,
-		SessionSwitch:   rt.rebindSessionAt,
-		OpenWorkspace:   launchNativeDesktop,
-		OpenPath:        desktop.OpenPath,
-		Plugins:         rt.plugins,
-		Roster:          rt.subAgentRoster,
-		TraceAdapter:    rtpkg.CurrentTraceAdapter(),
-		TraceStore:      rtpkg.CurrentTraceStore(),
+		SessionBoundary:      rt.releaseSessionWork,
+		PrepareSessionSwitch: rt.prepareSessionRebindAt,
+		OpenWorkspace:        launchNativeDesktop,
+		OpenPath:             desktop.OpenPath,
+		Plugins:              rt.plugins,
+		Roster:               rt.subAgentRoster,
+		TraceAdapter:         rtpkg.CurrentTraceAdapter(),
+		TraceStore:           rtpkg.CurrentTraceStore(),
 	}
 	// A regular `metis desktop --web` browser session has no frame token and
 	// therefore no HTTP shutdown capability. The native shell supplies a fresh

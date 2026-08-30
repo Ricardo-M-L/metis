@@ -275,6 +275,25 @@ func (r *Registry) RemoveCustom() {
 	r.rebuildIndexLocked()
 }
 
+// RemoveSource drops every command contributed by one runtime source. MCP
+// reconnect uses this before registering the newly discovered prompt set so a
+// removed prompt cannot retain a closure to the closed prior server.
+func (r *Registry) RemoveSource(source string) {
+	if strings.TrimSpace(source) == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := make([]Cmd, 0, len(r.cmds))
+	for _, cmd := range r.cmds {
+		if cmd.Source != source {
+			kept = append(kept, cmd)
+		}
+	}
+	r.cmds = kept
+	r.rebuildIndexLocked()
+}
+
 // Parse returns (true, output, signal, args) if input is a slash command,
 // (false, "", SignalNone, "") otherwise. `args` is whatever followed the
 // command name on the input line — the runtime needs it for signals like

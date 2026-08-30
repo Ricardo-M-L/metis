@@ -123,6 +123,22 @@ func TestIsAutoMemPath_FollowsRootSymlink(t *testing.T) {
 	}
 }
 
+func TestIsAutoMemPath_RejectsSymlinkEscapeWithMissingParents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	root := t.TempDir()
+	outside := t.TempDir()
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(outside, alias); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(alias, "missing", "memory.md")
+	if IsAutoMemPath(root, candidate) {
+		t.Fatalf("symlink escape with missing parent accepted: %s", candidate)
+	}
+}
+
 func TestIsEntrypoint(t *testing.T) {
 	if !IsEntrypoint("/some/path/MEMORY.md") {
 		t.Fatalf("MEMORY.md should be entrypoint")

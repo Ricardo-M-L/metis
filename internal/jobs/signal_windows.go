@@ -3,11 +3,18 @@
 package jobs
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strconv"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/security"
 )
+
+const windowsTaskkillLimit = 2 * time.Second
+
+var taskkillCommandContext = exec.CommandContext
 
 // ApplyProcessGroup is a no-op on Windows. We rely on taskkill /T to
 // walk the descendant tree at kill time instead of grouping at spawn
@@ -62,7 +69,23 @@ func killTreeStaged(p *os.Process, grace time.Duration, done chan<- struct{}) {
 // runTaskkill is intentionally lightweight — no stderr capture, no
 // retries. taskkill is fast and idempotent for our needs.
 func runTaskkill(args []string) error {
-	c := exec.Command("taskkill", args...)
+	return runTaskkillWithLimit(args, windowsTaskkillLimit)
+}
+
+// runTaskkillWithLimit gives the OS helper its own deadline. Callers such as
+// RunCode cancellation invoke KillProcessGroup synchronously; without this
+// bound a wedged taskkill process can wedge the whole agent turn forever.
+func runTaskkillWithLimit(args []string, limit time.Duration) error {
+	if limit <= 0 {
+		limit = windowsTaskkillLimit
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	c := taskkillCommandContext(ctx, "taskkill", args...)
+	c.Env = security.RestrictedSubprocessEnv(os.Environ())
+	// If taskkill or one of its inherited handles ignores cancellation, let
+	// os/exec close any pipes and finish its wait path within the same bound.
+	c.WaitDelay = limit
 	return c.Run()
 }
 

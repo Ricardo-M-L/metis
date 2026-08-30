@@ -37,7 +37,7 @@ func TestStablePromptGoldenSnapshots(t *testing.T) {
 		{
 			name: "main-computer-use",
 			ctx: PromptCtx{
-				EnabledTools:         map[string]bool{"Bash": true},
+				EnabledTools:         map[string]bool{"Bash": true, "mcp__computer-use__screenshot": true},
 				HasSkills:            true,
 				ComputerUseAvailable: true,
 			},
@@ -48,6 +48,18 @@ func TestStablePromptGoldenSnapshots(t *testing.T) {
 			ctx: PromptCtx{
 				EnabledTools: map[string]bool{"Bash": true},
 				HasSkills:    false,
+			},
+			mode: PromptFull,
+		},
+		{
+			name: "web-only",
+			ctx: PromptCtx{
+				EnabledTools: map[string]bool{
+					"WebSearch": true,
+					"WebFetch":  true,
+					"WebBrowse": true,
+				},
+				HasSkills: false,
 			},
 			mode: PromptFull,
 		},
@@ -102,7 +114,7 @@ func TestPromptSizeBudgets(t *testing.T) {
 	}
 
 	withComputerUse := AssembleBaseString(PromptCtx{
-		EnabledTools:         map[string]bool{"Bash": true},
+		EnabledTools:         map[string]bool{"Bash": true, "mcp__computer-use__screenshot": true},
 		HasSkills:            true,
 		ComputerUseAvailable: true,
 	})

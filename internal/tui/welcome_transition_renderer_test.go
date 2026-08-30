@@ -107,7 +107,12 @@ type lockedOutput struct {
 // drain still runs before the otherwise-unhandled message falls through.
 type rendererProbeMsg struct{}
 
-const rendererTestTimeout = 5 * time.Second
+// Race instrumentation plus a concurrently compiling package can delay both
+// Bubble Tea's command goroutine and the renderer's frame ticker well beyond a
+// normal 40 ms frame. Keep this integration timeout generous; the synchronous
+// Update contract is asserted separately below, so a longer deadline does not
+// weaken the behavior under test.
+const rendererTestTimeout = 15 * time.Second
 
 func (o *lockedOutput) Write(p []byte) (int, error) {
 	o.mu.Lock()
@@ -448,6 +453,40 @@ func TestRequestingToProviderEOFDoesNotScrollFullscreen(t *testing.T) {
 	if matches := unsafeVertical.FindAllString(suffix, -1); len(matches) != 0 {
 		t.Fatalf("provider EOF transition emitted %d scroll-capable movements %q; output=%q",
 			len(matches), matches, suffix)
+	}
+}
+
+func TestRequestingToProviderEOFSchedulesClearBookendSynchronously(t *testing.T) {
+	m := newActiveTransitionRendererModel(t, "requesting")
+	m.doneCh <- io.EOF
+
+	_, cmd := m.Update(spinnerTick{})
+	if m.turnActive || m.spinnerActive {
+		t.Fatalf("provider EOF did not synchronously finalize the turn: active=%v spinner=%v",
+			m.turnActive, m.spinnerActive)
+	}
+	if phase := m.currentFrameGeometryPhase(); phase != frameGeometryIdle {
+		t.Fatalf("provider EOF phase = %v, want idle", phase)
+	}
+	foundError := false
+	for _, message := range m.messages {
+		if strings.Contains(message.Content, "API Error: EOF") {
+			foundError = true
+			break
+		}
+	}
+	if !foundError {
+		t.Fatal("provider EOF did not append the API error before Update returned")
+	}
+	if cmd == nil {
+		t.Fatal("requesting -> idle transition did not schedule a clear bookend")
+	}
+	sequence := reflect.ValueOf(cmd())
+	if sequence.Kind() != reflect.Slice {
+		t.Fatalf("redraw command kind = %s, want a two-command clear bookend", sequence.Kind())
+	}
+	if sequence.Len() != 2 {
+		t.Fatalf("redraw command length = %d, want two-command clear bookend", sequence.Len())
 	}
 }
 

@@ -57,6 +57,72 @@ func TestRepeatGuard_LaterThresholdDetailed(t *testing.T) {
 	}
 }
 
+func TestRepeatGuard_DetailedReminderRedactsPresentationWithoutMutatingSource(t *testing.T) {
+	g := NewRepeatGuard(RepeatGuardConfig{})
+	input := map[string]any{
+		"path":    "safe/file.go",
+		"api_key": "sk-live-repeat-guard-secret",
+		"command": "curl -H 'Authorization: Bearer repeat-command-token' https://example.test",
+		"nested": map[string]any{
+			"password": "hunter2",
+			"label":    "safe-label",
+		},
+	}
+
+	var reminder string
+	for i := 0; i < 5; i++ {
+		if got := g.RecordStep([]llm.ContentBlock{gb("Bash", input)}); got != "" {
+			reminder = got
+		}
+	}
+	if reminder == "" {
+		t.Fatal("expected a detailed reminder at count 5")
+	}
+	for _, secret := range []string{"sk-live-repeat-guard-secret", "repeat-command-token", "hunter2"} {
+		if strings.Contains(reminder, secret) {
+			t.Fatalf("detailed reminder leaked %q:\n%s", secret, reminder)
+		}
+	}
+	for _, want := range []string{
+		"- tool: Bash",
+		"- consecutive_calls: 5",
+		"safe/file.go",
+		"safe-label",
+		"[REDACTED]",
+	} {
+		if !strings.Contains(reminder, want) {
+			t.Fatalf("detailed reminder missing safe presentation value %q:\n%s", want, reminder)
+		}
+	}
+
+	if got := input["api_key"]; got != "sk-live-repeat-guard-secret" {
+		t.Fatalf("redaction mutated source api_key: %v", got)
+	}
+	if got := input["command"]; got != "curl -H 'Authorization: Bearer repeat-command-token' https://example.test" {
+		t.Fatalf("redaction mutated source command: %v", got)
+	}
+	nested, ok := input["nested"].(map[string]any)
+	if !ok || nested["password"] != "hunter2" || nested["label"] != "safe-label" {
+		t.Fatalf("redaction mutated nested source: %#v", input["nested"])
+	}
+}
+
+func TestRepeatGuard_SecretOnlyDifferenceResetsRawCanonicalChain(t *testing.T) {
+	g := NewRepeatGuard(RepeatGuardConfig{Thresholds: []int{2}})
+	a := gb("Bash", map[string]any{"path": "safe/file.go", "api_key": "sk-secret-a"})
+	b := gb("Bash", map[string]any{"path": "safe/file.go", "api_key": "sk-secret-b"})
+
+	if got := g.RecordStep([]llm.ContentBlock{a}); got != "" {
+		t.Fatalf("first call unexpectedly triggered reminder: %q", got)
+	}
+	if got := g.RecordStep([]llm.ContentBlock{b}); got != "" {
+		t.Fatalf("secret-only argument difference must reset the raw chain, got %q", got)
+	}
+	if got := g.RecordStep([]llm.ContentBlock{b}); got == "" {
+		t.Fatal("second identical raw call after reset should reach threshold 2")
+	}
+}
+
 func TestRepeatGuard_DifferentArgsResetsChain(t *testing.T) {
 	g := NewRepeatGuard(RepeatGuardConfig{})
 	got := feed(g, []llm.ContentBlock{

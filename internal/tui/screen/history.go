@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tui/list"
@@ -74,6 +75,7 @@ func (i *historyItem) Render(width int) string {
 // NewHistoryScreen builds a screen ready to View(). messages is the snapshot
 // to render; mutating it after construction has no effect.
 func NewHistoryScreen(messages []llm.Message, width, height int) *HistoryScreen {
+	messages = agent.PresentationHistory(messages)
 	l := list.NewList()
 	l.SetSize(width, contentHeight(height))
 	// Single-row gap between turns — same visual rhythm the previous
@@ -184,7 +186,7 @@ func (s *HistoryScreen) View() string {
 // Useful for non-screen contexts (e.g. the readline REPL fallback prints it
 // directly) so the formatting stays consistent across UIs.
 func RenderHistoryBody(messages []llm.Message, width int) string {
-	return renderHistory(messages, width)
+	return renderHistory(agent.PresentationHistory(messages), width)
 }
 
 // renderHistory turns a transcript into a static body string. Used by the

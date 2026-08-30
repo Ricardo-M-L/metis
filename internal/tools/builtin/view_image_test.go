@@ -13,7 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // writeTinyPNG writes a 2x2 RGBA PNG to dir/name and returns the full
@@ -96,6 +98,44 @@ func TestViewImage_RelativePathResolved(t *testing.T) {
 	}
 	if !strings.HasPrefix(res.Output, "ViewImage: /") {
 		t.Errorf("Output should embed absolute path; got %q", res.Output)
+	}
+}
+
+func TestViewImage_RelativePathUsesAgentWorkspaceForPermissionAndRead(t *testing.T) {
+	workspaceA := t.TempDir()
+	workspaceB := t.TempDir()
+	t.Chdir(workspaceA)
+	wantPath := writeTinyPNG(t, workspaceB, "active.png")
+
+	gate := permission.New(permission.ModeDefault)
+	gate.SetReadOnlyHook(func(tool, _ string) bool { return tool == "ViewImage" })
+	wantCanonical, err := filepath.EvalSymlinks(wantPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", wantPath, err)
+	}
+	var authorizedPath string
+	gate.SetPathScopeHook(func(path string) bool {
+		authorizedPath = path
+		gotCanonical, resolveErr := filepath.EvalSymlinks(path)
+		return resolveErr == nil && filepath.Clean(gotCanonical) == filepath.Clean(wantCanonical)
+	})
+	v := ViewImage{gate: gate}
+	ctx := agent.WithCwd(context.Background(), workspaceB)
+	input := map[string]any{"path": "active.png"}
+
+	got, source := v.CanUse(ctx, input)
+	if got != tools.PermissionAllow {
+		t.Fatalf("permission = %v (%s), want allow", got, source)
+	}
+	if filepath.Clean(authorizedPath) != filepath.Clean(wantCanonical) {
+		t.Fatalf("authorized path = %q, want %q", authorizedPath, wantPath)
+	}
+	result, err := v.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(result.Output, wantPath) {
+		t.Fatalf("output = %q, want active-workspace path %q", result.Output, wantPath)
 	}
 }
 

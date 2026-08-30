@@ -75,7 +75,7 @@ func (m *Model) toolsPickerItems() []screen.PickerItem {
 	if m.loop == nil || m.loop.Registry == nil {
 		return nil
 	}
-	tools := m.loop.Registry.All()
+	tools := m.loop.Registry.ModelToolsForCache()
 	out := make([]screen.PickerItem, 0, len(tools))
 	for _, t := range tools {
 		out = append(out, screen.PickerItem{

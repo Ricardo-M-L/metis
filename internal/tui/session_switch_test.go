@@ -153,6 +153,33 @@ func TestActivateSessionRebindsAllSessionScopedState(t *testing.T) {
 	}
 }
 
+func TestActivateSessionUsesGateModeAfterListenerDowngrade(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeDefault)
+	target := session.Header{
+		ID: "target-plan-downgrade", Model: "test-model", System: "target-system",
+		Mode: string(permission.ModePlan), PrePlanMode: string(permission.ModeDefault),
+	}
+	if err := store.WriteHeaderFull(target); err != nil {
+		t.Fatal(err)
+	}
+	m.gate.SetModeChangeListener(func(mode permission.Mode) {
+		m.loop.SetPlanMode(mode == permission.ModePlan)
+		if mode == permission.ModePlan {
+			m.gate.SetMode(permission.ModeDontAsk)
+		}
+	})
+
+	if err := m.activateSession(target.ID, &target, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.gate.Mode() != permission.ModeDontAsk || m.loop.IsPlanMode() {
+		t.Fatalf("restored permission state diverged: gate=%q plan=%v", m.gate.Mode(), m.loop.IsPlanMode())
+	}
+	if got := m.loop.PrePlanMode(); got != "" {
+		t.Fatalf("failed-closed switch retained pre-plan lineage %q", got)
+	}
+}
+
 func TestActivateSessionRemovesAndPersistsLegacyPlanOverlay(t *testing.T) {
 	m, store := newSessionSwitchModel(t, permission.ModeAsk)
 	const id = "legacy-plan-resume"
@@ -540,6 +567,38 @@ func TestREPLFreshAndBranchRebindSessionState(t *testing.T) {
 	}
 	if len(r.Loop.History()) != 0 {
 		t.Fatalf("fresh session retained history: %+v", r.Loop.History())
+	}
+}
+
+func TestREPLPlanFreshSessionKeepsLineageAcrossRepeatedNew(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModePlan)
+	m.loop.SetPrePlanMode(string(permission.ModeDefault))
+	m.loop.SetPlanMode(true)
+	r, err := NewREPL(m.loop, nil, store, "source", false, false, m.gate, "test-model", "")
+	if err != nil {
+		t.Fatalf("NewREPL: %v", err)
+	}
+	r.FreshPermissionMode = permission.ModePlan
+
+	firstID, err := r.startFreshSession()
+	if err != nil {
+		t.Fatalf("first /new: %v", err)
+	}
+	if got := r.Loop.PrePlanMode(); got != string(permission.ModeDefault) {
+		t.Fatalf("first /new pre-plan mode = %q, want %q", got, permission.ModeDefault)
+	}
+	secondID, err := r.startFreshSession()
+	if err != nil {
+		t.Fatalf("second /new after %s: %v", firstID, err)
+	}
+	if secondID == firstID {
+		t.Fatalf("second /new reused session ID %q", secondID)
+	}
+	if r.Gate.Mode() != permission.ModePlan || !r.Loop.IsPlanMode() {
+		t.Fatalf("second /new permission state = gate %q, plan %v", r.Gate.Mode(), r.Loop.IsPlanMode())
+	}
+	if got := r.Loop.PrePlanMode(); got != string(permission.ModeDefault) {
+		t.Fatalf("second /new pre-plan mode = %q, want %q", got, permission.ModeDefault)
 	}
 }
 

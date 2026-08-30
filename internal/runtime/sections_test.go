@@ -28,7 +28,7 @@ func TestIdentitySection_NoModelStillOmitsClause(t *testing.T) {
 	}
 }
 
-func TestToolRedirectsSection_FiresForBashOrReadOrLS(t *testing.T) {
+func TestToolRedirectsSection_FiresForFilesystemShellOrWebTools(t *testing.T) {
 	// EnabledTools nil → legacy "assume all" → section present.
 	if got := ToolRedirectsSection(PromptCtx{}); got.Name == "" {
 		t.Error("legacy nil EnabledTools should fire the section")
@@ -47,10 +47,39 @@ func TestToolRedirectsSection_FiresForBashOrReadOrLS(t *testing.T) {
 	if got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"LS": true, "Grep": true}}); got.Name == "" {
 		t.Error("LS-only set should fire tool_redirects")
 	}
+	for _, name := range []string{"WebSearch", "WebFetch", "WebBrowse"} {
+		if got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{name: true}}); got.Name == "" {
+			t.Errorf("%s-only set should fire tool_redirects for web routing guidance", name)
+		}
+	}
 	// Truly Bash/Read/LS-less set → section omitted (e.g. a memory-
 	// only sub-agent that only has Memory + MetisInfo).
 	if got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"Grep": true, "Memory": true}}); got.Name != "" {
 		t.Errorf("set with no Bash/Read/LS should omit tool_redirects; got Name=%q", got.Name)
+	}
+}
+
+func TestToolRedirectsSection_DefinesStableWebRouting(t *testing.T) {
+	got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"WebSearch": true}})
+	for _, phrase := range []string{
+		"Keyword, topic, discovery, or current-information search",
+		"Fetch a known complete URL",
+		"`WebFetch` is insufficient because the page requires JavaScript",
+		"Z.ai `webReader`",
+		"last-resort provider fallback",
+	} {
+		if !strings.Contains(got.Body, phrase) {
+			t.Errorf("tool_redirects missing %q; got:\n%s", phrase, got.Body)
+		}
+	}
+}
+
+func TestToolRedirectsSection_OmitsWebRoutingWhenNoWebToolIsEnabled(t *testing.T) {
+	got := ToolRedirectsSection(PromptCtx{EnabledTools: map[string]bool{"Read": true}})
+	for _, phrase := range []string{"WebSearch", "WebFetch", "WebBrowse", "webReader"} {
+		if strings.Contains(got.Body, phrase) {
+			t.Errorf("read-only tool set should not receive unavailable %s guidance; got:\n%s", phrase, got.Body)
+		}
 	}
 }
 
@@ -117,6 +146,16 @@ func TestComputerUseSection_FiresForConfiguredCapability(t *testing.T) {
 	got := ComputerUseSection(PromptCtx{ComputerUseAvailable: true})
 	if got.Name != "computer_use" {
 		t.Fatalf("configured computer-use capability should fire section; got %q", got.Name)
+	}
+}
+
+func TestComputerUseSection_FinalToolSetOverridesConfiguredCapability(t *testing.T) {
+	got := ComputerUseSection(PromptCtx{
+		ComputerUseAvailable: true,
+		EnabledTools:         map[string]bool{"Read": true},
+	})
+	if got.Name != "" {
+		t.Fatalf("final registry excludes computer-use, but section = %q", got.Name)
 	}
 }
 

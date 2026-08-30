@@ -65,12 +65,28 @@ func (AskUser) InputSchema() map[string]any {
 	}
 }
 func (AskUser) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencyExclusive }
-func (a AskUser) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, _ := a.gate.Check(context.Background(), "AskUser", strFromAny(in["question"]))
+func (a AskUser) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	if isBypassUnattendedLineage(ctx, a.gate) {
+		return tools.PermissionDeny, "AskUser unavailable in bypassPermissions unattended mode"
+	}
+	if a.gate == nil {
+		return tools.PermissionAsk, "interactive"
+	}
+	d, _ := a.gate.Check(ctx, "AskUser", strFromAny(in["question"]))
 	return mapDecision(d), "interactive"
 }
 
-func (AskUser) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+func (a AskUser) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	// CanUse normally rejects this before dispatch. Keep the same invariant in
+	// Execute for direct callers and for a bypass session that temporarily
+	// switched its live Gate to plan mode: the pre-plan lineage is still
+	// unattended and must never emit EventAskUser.
+	if isBypassUnattendedLineage(ctx, a.gate) {
+		return &tools.Result{
+			Output:  "AskUser: unavailable in bypassPermissions unattended mode; apply the configured default policy and continue",
+			IsError: true,
+		}, nil
+	}
 	question, _ := in["question"].(string)
 	question = strings.TrimSpace(question)
 	if question == "" {

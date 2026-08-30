@@ -36,6 +36,8 @@ func (m *Manager) FilterEnv(environ []string, inheritSecrets bool) []string {
 	out = replaceEnv(out, "METIS", "1")
 	if temp := m.TempDir(); temp != "" {
 		out = replaceEnv(out, "TMPDIR", temp)
+		out = replaceEnv(out, "TMP", temp)
+		out = replaceEnv(out, "TEMP", temp)
 	}
 	return out
 }

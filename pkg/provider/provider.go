@@ -117,6 +117,10 @@ type ToolSpec struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"input_schema"`
+	// Exposure is request-local routing metadata used to keep provider cache
+	// boundaries aligned with the registry's stable Direct prefix. It is not
+	// part of any provider wire format or persisted transcript.
+	Exposure string `json:"-"`
 }
 
 // Request is a complete chat completion request.

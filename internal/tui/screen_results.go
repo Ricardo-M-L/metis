@@ -152,7 +152,14 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			})
 			return nil
 		}
-		m.gate.SetMode(permission.Mode(applied))
+		if err := applyModelPermissionMode(m, permission.Mode(applied)); err != nil {
+			m.messages = append(m.messages, Message{
+				Role:      "error",
+				Content:   "permission mode unchanged: " + err.Error(),
+				Timestamp: time.Now(),
+			})
+			return nil
+		}
 		m.messages = append(m.messages, Message{
 			Role:      "success",
 			Content:   "permission mode: " + applied,

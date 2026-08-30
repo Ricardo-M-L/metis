@@ -22,16 +22,33 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-// markMCPDiscovered records that a specific MCP tool's schema has
-// been delivered to the model in this session. Idempotent — safe to
-// call repeatedly with the same name. Only mcp__ names are tracked;
-// builtins always have schemas in tools[] anyway.
-func (l *Loop) markMCPDiscovered(name string) {
-	if !strings.HasPrefix(name, "mcp__") {
+// markDeferredDiscovered records that a Deferred tool's schema has been
+// delivered to the model. Exposure metadata is authoritative; the mcp__ name
+// fallback lives in Registry for compatibility with older plugin tools.
+func (l *Loop) markDeferredDiscovered(name string) {
+	if l == nil || l.Registry == nil {
 		return
 	}
+	entry, ok := l.Registry.GetModelEntry(name)
+	if !ok || entry.Exposure != tools.ToolExposureDeferred {
+		return
+	}
+	l.markDiscoveredName(name)
+}
+
+// markMCPDiscovered is retained for internal compatibility while callers move
+// to exposure terminology.
+func (l *Loop) markMCPDiscovered(name string) {
+	if l == nil || !strings.HasPrefix(name, "mcp__") {
+		return
+	}
+	l.markDiscoveredName(name)
+}
+
+func (l *Loop) markDiscoveredName(name string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.discoveredMCP == nil {
@@ -87,7 +104,14 @@ func (l *Loop) ensureDiscoveredHydrated() {
 	if l.discoveredMCP == nil {
 		l.discoveredMCP = make(map[string]bool, 4)
 	}
-	rebuildDiscoveredMCPFromMessages(l.discoveredMCP, l.Messages)
+	candidates := make(map[string]bool)
+	rebuildDiscoveredToolNamesFromMessages(candidates, l.Messages)
+	for name := range candidates {
+		entry, ok := l.Registry.GetModelEntry(name)
+		if (ok && entry.Exposure == tools.ToolExposureDeferred) || (!ok && strings.HasPrefix(name, "mcp__")) {
+			l.discoveredMCP[name] = true
+		}
+	}
 }
 
 // rebuildDiscoveredMCPFromMessages walks one pass of a message slice
@@ -105,6 +129,16 @@ func (l *Loop) ensureDiscoveredHydrated() {
 // Malformed JSON is also skipped silently — the original turn would
 // have errored out for the model, so there's no schema to preserve.
 func rebuildDiscoveredMCPFromMessages(set map[string]bool, msgs []llm.Message) {
+	candidates := make(map[string]bool)
+	rebuildDiscoveredToolNamesFromMessages(candidates, msgs)
+	for name := range candidates {
+		if strings.HasPrefix(name, "mcp__") {
+			set[name] = true
+		}
+	}
+}
+
+func rebuildDiscoveredToolNamesFromMessages(set map[string]bool, msgs []llm.Message) {
 	if len(msgs) == 0 {
 		return
 	}
@@ -133,7 +167,7 @@ func rebuildDiscoveredMCPFromMessages(set map[string]bool, msgs []llm.Message) {
 			if !ok || res.IsError {
 				continue
 			}
-			parseMCPNamesFromResult(set, res.ToolResult)
+			parseDeferredNamesFromResult(set, res.ToolResult)
 		}
 	}
 }
@@ -142,19 +176,33 @@ func rebuildDiscoveredMCPFromMessages(set map[string]bool, msgs []llm.Message) {
 // tool_result body. Accepts both the new {matches:[...]} envelope and
 // any future variations that still nest the names under "matches".
 func parseMCPNamesFromResult(set map[string]bool, body string) {
-	if body == "" || !strings.Contains(body, "mcp__") {
+	candidates := make(map[string]bool)
+	parseDeferredNamesFromResult(candidates, body)
+	for name := range candidates {
+		if strings.HasPrefix(name, "mcp__") {
+			set[name] = true
+		}
+	}
+}
+
+func parseDeferredNamesFromResult(set map[string]bool, body string) {
+	if body == "" {
 		return
 	}
 	var parsed struct {
 		Matches []struct {
-			Name string `json:"name"`
+			Name             string         `json:"name"`
+			AlreadyAvailable bool           `json:"already_available"`
+			InputSchema      map[string]any `json:"input_schema"`
 		} `json:"matches"`
 	}
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
 		return
 	}
 	for _, m := range parsed.Matches {
-		if strings.HasPrefix(m.Name, "mcp__") {
+		// Keyword search returns names and descriptions only. A tool becomes
+		// discovered only after select: actually delivered its schema.
+		if m.Name != "" && !m.AlreadyAvailable && m.InputSchema != nil {
 			set[m.Name] = true
 		}
 	}

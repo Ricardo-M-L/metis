@@ -95,6 +95,30 @@ func TestHistoryScreen_RendersToolCallAndResult(t *testing.T) {
 	}
 }
 
+func TestHistoryPresentationRedactsToolArgumentsWithoutChangingSource(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("t", 36)
+	messages := []llm.Message{assistantToolUse("Bash", map[string]any{
+		"password": "hunter2",
+		"command":  "curl https://example.test/?token=" + secret,
+		"safe":     "echo ok",
+	})}
+
+	view := NewHistoryScreen(messages, 120, 24).View()
+	static := RenderHistoryBody(messages, 120)
+	for name, output := range map[string]string{"screen": view, "static": static} {
+		if strings.Contains(output, "hunter2") || strings.Contains(output, secret) {
+			t.Fatalf("%s history leaked raw tool arguments: %s", name, output)
+		}
+		if !strings.Contains(output, "[REDACTED]") || !strings.Contains(output, "echo ok") {
+			t.Fatalf("%s history lost redaction/safe context: %s", name, output)
+		}
+	}
+	input := messages[0].Content[0].ToolInput
+	if input["password"] != "hunter2" || !strings.Contains(input["command"].(string), secret) {
+		t.Fatalf("history renderer mutated source: %#v", input)
+	}
+}
+
 func TestHistoryScreen_RendersErrorTag(t *testing.T) {
 	s := NewHistoryScreen([]llm.Message{
 		userMsg("read missing"),

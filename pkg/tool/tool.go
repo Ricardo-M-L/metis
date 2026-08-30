@@ -201,6 +201,42 @@ func DescriptionFor(t Tool, short bool) string {
 	return t.Description()
 }
 
+// ToolExposure declares how a tool participates in the model-facing catalog.
+// It is deliberately metadata rather than part of Tool's required interface,
+// so existing third-party plugins remain source and binary compatible.
+//
+//   - Direct: publish the complete schema in every request.
+//   - Deferred: publish on demand through ToolSearch (the runtime may use a
+//     compact placeholder while migrating older providers).
+//   - Hidden: keep available for trusted internal orchestration, but never
+//     reveal it to ToolSearch or accept a model-originated call by name.
+type ToolExposure string
+
+const (
+	ToolExposureDirect   ToolExposure = "direct"
+	ToolExposureDeferred ToolExposure = "deferred"
+	ToolExposureHidden   ToolExposure = "hidden"
+)
+
+// ExposureAware is the optional capability implemented by tools that are not
+// directly exposed. Tools that do not implement it remain Direct.
+type ExposureAware interface {
+	ToolExposure() ToolExposure
+}
+
+// ExposureOf returns a normalized exposure value. Invalid values fail open to
+// Direct for SDK compatibility; the internal registry may add migration rules
+// (for example legacy mcp__ tools) before presenting the catalog to a model.
+func ExposureOf(t Tool) ToolExposure {
+	if aware, ok := t.(ExposureAware); ok {
+		switch exposure := aware.ToolExposure(); exposure {
+		case ToolExposureDirect, ToolExposureDeferred, ToolExposureHidden:
+			return exposure
+		}
+	}
+	return ToolExposureDirect
+}
+
 // SearchHinter lets a tool publish a curated 3-10 word capability
 // summary consumed by the lazy-tools keyword ranker (ToolSearch). A
 // hint match scores between a name match and a description match:
@@ -325,12 +361,23 @@ type RequiresUserInteractive interface {
 // BypassImmuneAware lets a tool declare per-input that its Deny/Ask
 // decision must NOT be upgraded to Allow by mode=bypass. Used for
 // safety-check paths (.git/config, .ssh/, ~/.bashrc) that should
-// always prompt regardless of bypass posture. Returns reason for UI.
+// require human approval in interactive modes and fail closed without a
+// prompt in bypassPermissions. Returns a diagnostic reason for UI/logging.
 //
 // Mirrors claude-code's safetyCheck flow in permissions.ts:1144-1152
 // and 1252-1260.
 type BypassImmuneAware interface {
 	IsBypassImmune(input map[string]any) (immune bool, reason string)
+}
+
+// BypassAutoAllowAware is an explicit compatibility/safety opt-in for a tool
+// whose CanUse still returns PermissionAsk in bypassPermissions. The public
+// Tool contract historically promises that Ask triggers a human prompt, so
+// the runtime must not silently reinterpret an older third-party plugin's Ask
+// as approval. Built-ins normally consult Gate and return PermissionAllow
+// directly in bypass; only tools with an intentional legacy Ask path need this.
+type BypassAutoAllowAware interface {
+	CanAutoAllowInBypass(input map[string]any) bool
 }
 
 // Interruptible lets a tool override the default InterruptCancel.
@@ -398,6 +445,16 @@ func IsBypassImmune(t Tool, input map[string]any) (bool, string) {
 		return b.IsBypassImmune(input)
 	}
 	return false, ""
+}
+
+// CanAutoAllowInBypass reports the tool's explicit opt-in to upgrading its
+// PermissionAsk result under the unattended bypass preset. Default false keeps
+// existing plugin SDK semantics fail-closed.
+func CanAutoAllowInBypass(t Tool, input map[string]any) bool {
+	if b, ok := t.(BypassAutoAllowAware); ok {
+		return b.CanAutoAllowInBypass(input)
+	}
+	return false
 }
 
 // GetInterruptBehavior returns t's interrupt policy. Default is

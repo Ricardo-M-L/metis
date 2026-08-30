@@ -90,7 +90,10 @@ func TestMonitorUsesAgentContextCwdAndSandboxFilteredEnv(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		body, err = os.ReadFile(probe)
-		if err == nil {
+		// The shell creates the file before all three printf fields have been
+		// flushed. Wait for the complete record, not merely for path existence,
+		// otherwise the full package suite can observe a transient 1–2 line file.
+		if err == nil && len(strings.Split(strings.TrimSpace(string(body)), "\n")) == 3 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)

@@ -9,6 +9,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,6 +17,19 @@ import (
 
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
+
+// InvocationPreparer is an optional capability for tools whose Execute path
+// consumes a one-shot filesystem or other authorization binding. Callers that
+// already applied their own permission boundary (for example a forked agent)
+// may prepare that binding without re-running a gate captured by the concrete
+// tool. The same invocation ID must be present in ctx for preparation and
+// execution.
+//
+// This deliberately is not part of the public Tool interface: ordinary tools
+// and third-party plugins preserve their existing CanUse/Execute lifecycle.
+type InvocationPreparer interface {
+	PrepareAuthorizedInvocation(ctx context.Context, in map[string]any) error
+}
 
 // Aliases for the public API surface in pkg/tool. Existing call sites
 // keep using `tools.Tool`, `tools.PermissionAllow` etc. — these aliases
@@ -26,6 +40,8 @@ type (
 	Result            = pubtool.Result
 	Tool              = pubtool.Tool
 	BaseTool          = pubtool.BaseTool
+	ToolExposure      = pubtool.ToolExposure
+	ExposureAware     = pubtool.ExposureAware
 	InterruptBehavior = pubtool.InterruptBehavior
 )
 
@@ -37,6 +53,9 @@ const (
 	ConcurrencyExclusive  = pubtool.ConcurrencyExclusive
 	ConcurrencyQueue      = pubtool.ConcurrencyQueue
 	ConcurrencyBackground = pubtool.ConcurrencyBackground
+	ToolExposureDirect    = pubtool.ToolExposureDirect
+	ToolExposureDeferred  = pubtool.ToolExposureDeferred
+	ToolExposureHidden    = pubtool.ToolExposureHidden
 	InterruptCancel       = pubtool.InterruptCancel
 	InterruptBlock        = pubtool.InterruptBlock
 )
@@ -49,8 +68,10 @@ var (
 	IsDestructive           = pubtool.IsDestructive
 	RequiresUserInteraction = pubtool.RequiresUserInteraction
 	IsBypassImmune          = pubtool.IsBypassImmune
+	CanAutoAllowInBypass    = pubtool.CanAutoAllowInBypass
 	GetInterruptBehavior    = pubtool.GetInterruptBehavior
 	DescriptionFor          = pubtool.DescriptionFor
+	ExposureOf              = pubtool.ExposureOf
 	MaxResultSizeChars      = pubtool.MaxResultSizeChars
 	TimeoutMs               = pubtool.TimeoutMs
 )
@@ -76,6 +97,18 @@ type Registry struct {
 	// appear in All()/SortedForCache(), so the LLM sees one name while
 	// old transcripts and configs using a prior name keep resolving.
 	aliases map[string]string
+	// visibilityPolicies are durable, intersecting allow/deny layers. They are
+	// retained so tools published after startup (plugins, MCP reconnects and IDE
+	// bridges) cannot bypass a policy that was applied to the initial snapshot.
+	visibilityPolicies []toolVisibilityPolicy
+}
+
+// ToolEntry is the canonical model-facing catalog record. Exposure is
+// resolved once per snapshot so schema construction, ToolSearch and dispatch
+// can make the same decision without inferring policy from a name prefix.
+type ToolEntry struct {
+	Tool     Tool
+	Exposure ToolExposure
 }
 
 // global registry; built-in packages register themselves into it via init().
@@ -93,9 +126,15 @@ func NewRegistry() *Registry {
 func (r *Registry) Register(t Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if t == nil {
+		panic("cannot register a nil tool")
+	}
 	name := t.Name()
 	if _, exists := r.tools[name]; exists {
 		panic(fmt.Sprintf("tool %q already registered", name))
+	}
+	if !r.acceptToolLocked(t) {
+		return
 	}
 	r.tools[name] = t
 	r.order = append(r.order, name)
@@ -147,7 +186,14 @@ func (r *Registry) indexAliases(t Tool) {
 func (r *Registry) Replace(t Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if t == nil {
+		return
+	}
 	name := t.Name()
+	if !r.acceptToolLocked(t) {
+		r.removeLocked(name)
+		return
+	}
 	if _, exists := r.tools[name]; !exists {
 		// First-time install — fall through to the order-appending path.
 		r.tools[name] = t
@@ -161,6 +207,61 @@ func (r *Registry) Replace(t Tool) {
 	r.clearAliasesOf(name)
 	r.tools[name] = t
 	r.indexAliases(t)
+}
+
+// ReplacePrefix atomically replaces every tool whose canonical name starts
+// with prefix. It is used when a live MCP server reconnects: the newly
+// discovered namespace must replace the prior client's complete surface, not
+// merely overwrite names that happen to still exist. Otherwise removed tools
+// keep pointers to a closed/sticky-failed server.
+func (r *Registry) ReplacePrefix(prefix string, replacements []Tool) {
+	if prefix == "" {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	wanted := make(map[string]Tool, len(replacements))
+	for _, t := range replacements {
+		if t == nil || !strings.HasPrefix(t.Name(), prefix) || !r.acceptToolLocked(t) {
+			continue
+		}
+		wanted[t.Name()] = t
+	}
+
+	order := make([]string, 0, len(r.order)+len(wanted))
+	seen := make(map[string]struct{}, len(wanted))
+	for _, name := range r.order {
+		if !strings.HasPrefix(name, prefix) {
+			order = append(order, name)
+			continue
+		}
+		r.clearAliasesOf(name)
+		if t, ok := wanted[name]; ok {
+			r.tools[name] = t
+			r.indexAliases(t)
+			order = append(order, name)
+			seen[name] = struct{}{}
+		} else {
+			delete(r.tools, name)
+		}
+	}
+	for _, t := range replacements {
+		if t == nil || !strings.HasPrefix(t.Name(), prefix) || !r.acceptToolLocked(t) {
+			continue
+		}
+		name := t.Name()
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		replacement := wanted[name]
+		r.tools[name] = replacement
+		r.indexAliases(replacement)
+		order = append(order, name)
+		seen[name] = struct{}{}
+	}
+	r.order = order
 }
 
 // Get looks up a tool by name, falling back to declared aliases
@@ -179,6 +280,35 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	return nil, false
 }
 
+// GetModelEntry resolves aliases and returns only tools a model is allowed to
+// know about. Hidden tools remain reachable through Get for internal runtime
+// composition, but guessed model calls and ToolSearch cannot cross this gate.
+func (r *Registry) GetModelEntry(name string) (ToolEntry, bool) {
+	if r == nil {
+		return ToolEntry{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	t, ok := r.lookupLocked(name)
+	if !ok || t == nil || !t.IsEnabled() {
+		return ToolEntry{}, false
+	}
+	exposure := effectiveExposure(t)
+	if exposure == ToolExposureHidden {
+		return ToolEntry{}, false
+	}
+	return ToolEntry{Tool: t, Exposure: exposure}, true
+}
+
+// GetForModel is the compact form used by model-originated execution paths.
+func (r *Registry) GetForModel(name string) (Tool, bool) {
+	entry, ok := r.GetModelEntry(name)
+	if !ok {
+		return nil, false
+	}
+	return entry.Tool, true
+}
+
 // All returns tools in registration order.
 func (r *Registry) All() []Tool {
 	r.mu.RLock()
@@ -186,6 +316,45 @@ func (r *Registry) All() []Tool {
 	out := make([]Tool, 0, len(r.order))
 	for _, name := range r.order {
 		out = append(out, r.tools[name])
+	}
+	return out
+}
+
+// ModelEntriesForCache returns Direct tools first and Deferred tools second,
+// each segment sorted by canonical name. Hidden/disabled tools are omitted.
+// The stable Direct prefix is the prompt-cache anchor; deferred churn cannot
+// reorder it.
+func (r *Registry) ModelEntriesForCache() []ToolEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	direct := make([]ToolEntry, 0, len(r.order))
+	deferred := make([]ToolEntry, 0, len(r.order))
+	for _, name := range r.order {
+		t := r.tools[name]
+		if t == nil || !t.IsEnabled() {
+			continue
+		}
+		entry := ToolEntry{Tool: t, Exposure: effectiveExposure(t)}
+		switch entry.Exposure {
+		case ToolExposureHidden:
+			continue
+		case ToolExposureDeferred:
+			deferred = append(deferred, entry)
+		default:
+			direct = append(direct, entry)
+		}
+	}
+	sort.Slice(direct, func(i, j int) bool { return direct[i].Tool.Name() < direct[j].Tool.Name() })
+	sort.Slice(deferred, func(i, j int) bool { return deferred[i].Tool.Name() < deferred[j].Tool.Name() })
+	return append(direct, deferred...)
+}
+
+// ModelToolsForCache is the Tool-only compatibility projection.
+func (r *Registry) ModelToolsForCache() []Tool {
+	entries := r.ModelEntriesForCache()
+	out := make([]Tool, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.Tool)
 	}
 	return out
 }
@@ -202,39 +371,20 @@ func (r *Registry) Filter(keep func(string) bool) []Tool {
 	return out
 }
 
-// SortedForCache returns tools as: [built-ins sorted by name] then [MCP
-// tools sorted by name]. The order is stable across MCP server churn so
-// the Anthropic prompt cache breakpoint placed after the built-in
-// prefix stays valid.
+// SortedForCache is the legacy Tool-only form of ModelToolsForCache. It
+// returns the model-visible Direct segment followed by Deferred, with each
+// segment sorted by canonical name. Hidden and disabled tools are omitted.
 //
 // Why this matters: Anthropic caches the request prefix; if the tools
-// list changes shape (an MCP tool sorts between two built-ins, or the
-// MCP set grows / shrinks across sessions), every cache entry past the
-// shape change is invalidated. By keeping built-ins as a contiguous
-// alphabetically-sorted prefix and MCP as a contiguous suffix, only
-// the MCP region varies — the breakpoint after the last built-in still
-// hits cache for the system+tools prefix.
+// list changes shape, every cache entry past the shape change is invalidated.
+// The explicit exposure segments keep stable Direct capabilities contiguous
+// while Deferred plugins/MCP tools can grow, shrink or hydrate independently.
 //
 // Mirrors claude-code's assembleToolPool() in tools.ts:345-367.
 //
-// MCP tools are identified by the `mcp__` prefix that
-// internal/tools/mcp/server.go applies to every imported MCP tool.
+// Legacy mcp__ tools are treated as Deferred until they adopt ExposureAware.
 func (r *Registry) SortedForCache() []Tool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	builtins := make([]Tool, 0, len(r.order))
-	mcps := make([]Tool, 0, len(r.order))
-	for _, name := range r.order {
-		t := r.tools[name]
-		if strings.HasPrefix(name, "mcp__") {
-			mcps = append(mcps, t)
-		} else {
-			builtins = append(builtins, t)
-		}
-	}
-	sort.Slice(builtins, func(i, j int) bool { return builtins[i].Name() < builtins[j].Name() })
-	sort.Slice(mcps, func(i, j int) bool { return mcps[i].Name() < mcps[j].Name() })
-	return append(builtins, mcps...)
+	return r.ModelToolsForCache()
 }
 
 // Restrict mutates the registry in place to keep only tools whose names
@@ -255,7 +405,60 @@ func (r *Registry) Restrict(keep []string) {
 			newOrder = append(newOrder, n)
 			continue
 		}
+		r.clearAliasesOf(n)
 		delete(r.tools, n)
 	}
 	r.order = newOrder
 }
+
+func (r *Registry) lookupLocked(name string) (Tool, bool) {
+	if t, ok := r.tools[name]; ok {
+		return t, true
+	}
+	canonical, ok := r.aliases[name]
+	if !ok {
+		return nil, false
+	}
+	t, ok := r.tools[canonical]
+	return t, ok
+}
+
+func (r *Registry) acceptToolLocked(t Tool) bool {
+	return t != nil && t.IsEnabled() && r.permitsToolNameLocked(t.Name())
+}
+
+func (r *Registry) removeLocked(name string) {
+	if _, ok := r.tools[name]; !ok {
+		return
+	}
+	r.clearAliasesOf(name)
+	delete(r.tools, name)
+	order := r.order[:0]
+	for _, current := range r.order {
+		if current != name {
+			order = append(order, current)
+		}
+	}
+	r.order = order
+}
+
+// effectiveExposure keeps old MCP/plugin tools deferred during the migration
+// even if they predate ExposureAware. New tools should implement the optional
+// interface explicitly; all other legacy tools remain Direct.
+func effectiveExposure(t Tool) ToolExposure {
+	if t == nil {
+		return ToolExposureHidden
+	}
+	if _, explicit := t.(pubtool.ExposureAware); explicit {
+		return pubtool.ExposureOf(t)
+	}
+	if strings.HasPrefix(t.Name(), "mcp__") {
+		return ToolExposureDeferred
+	}
+	return ToolExposureDirect
+}
+
+// EffectiveExposure is the internal compatibility resolver wrappers should
+// forward. Unlike pkg/tool.ExposureOf it includes the temporary mcp__ fallback
+// for third-party tools compiled before ExposureAware existed.
+func EffectiveExposure(t Tool) ToolExposure { return effectiveExposure(t) }

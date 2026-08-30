@@ -8,6 +8,8 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
@@ -71,6 +73,62 @@ func TestSetupRuntime_ResumeRestoresHeaderProviderModelAndSystem(t *testing.T) {
 	}
 	if len(rt.loop.Messages) != 1 || rt.loop.Messages[0].Content[0].Text != "stored turn" {
 		t.Fatalf("messages not restored: %+v", rt.loop.Messages)
+	}
+}
+
+func TestSetupRuntime_ResumeManagedDefaultRebindsFinalToolRegistry(t *testing.T) {
+	isolateResumeRuntimeTest(t)
+	const id = "resume-managed-default-tools"
+	store, err := session.NewStore(filepath.Join(config.Home(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(session.Header{
+		ID: id, Provider: "openai", Model: "stored-model",
+		System:           "stale managed prompt with WebSearch routing",
+		SystemPromptKind: session.SystemPromptKindDefault,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt, err := setupRuntime(context.Background(), &cliFlags{
+		resumeID: id, bare: true, noAuthWizard: true, tools: "Read",
+	})
+	if err != nil {
+		t.Fatalf("setupRuntime: %v", err)
+	}
+	defer rt.Cleanup()
+	if strings.Contains(rt.loop.System, "stale managed prompt") || strings.Contains(rt.loop.System, "WebSearch") {
+		t.Fatalf("managed default was not rebuilt from final Read-only registry:\n%s", rt.loop.System)
+	}
+	if len(rt.loop.SystemSections) == 0 {
+		t.Fatal("managed default resume lost typed prompt sections")
+	}
+}
+
+func TestSetupRuntime_ResumeModeDoesNotChangeFreshSessionBaseline(t *testing.T) {
+	isolateResumeRuntimeTest(t)
+	const id = "resume-mode-fresh-baseline"
+	store, err := session.NewStore(filepath.Join(config.Home(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(session.Header{
+		ID: id, Provider: "openai", Model: "stored-model", Mode: string(permission.ModeAcceptEdits),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt, err := setupRuntime(context.Background(), &cliFlags{resumeID: id, bare: true, noAuthWizard: true})
+	if err != nil {
+		t.Fatalf("setupRuntime: %v", err)
+	}
+	defer rt.Cleanup()
+	if got := rt.gate.Mode(); got != permission.ModeAcceptEdits {
+		t.Fatalf("restored active mode = %q, want acceptEdits", got)
+	}
+	if got := rt.defaultPermissionMode; got != permission.ModeDefault {
+		t.Fatalf("fresh-session baseline = %q, want invocation default", got)
 	}
 }
 
@@ -144,5 +202,43 @@ func TestParseFlags_TracksExplicitResumeOverrides(t *testing.T) {
 	}
 	if !flags.providerSet || !flags.modelSet || !flags.systemSet {
 		t.Fatalf("explicit markers not recorded: %+v", flags)
+	}
+}
+
+func TestSetupRuntime_ResumeBypassNeverStartsAuthWizard(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	store, err := session.NewStore(filepath.Join(config.Home(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "resume-bypass-no-auth-ui"
+	if err := store.WriteHeaderFull(session.Header{
+		ID: id, Provider: "openai", Model: "stored-model", Mode: "bypassPermissions",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTTY, oldWizard := authGateIsTTY, authGateRunWizard
+	t.Cleanup(func() {
+		authGateIsTTY, authGateRunWizard = oldTTY, oldWizard
+	})
+	authGateIsTTY = func() bool { return true }
+	wizardCalls := 0
+	authGateRunWizard = func() (*rtpkg.WizardResult, error) {
+		wizardCalls++
+		return nil, rtpkg.ErrWizardCancelled
+	}
+
+	rt, err := setupRuntime(context.Background(), &cliFlags{resumeID: id, bare: true})
+	if rt != nil {
+		rt.Cleanup()
+	}
+	if err == nil {
+		t.Fatal("missing credential unexpectedly allowed startup")
+	}
+	if wizardCalls != 0 {
+		t.Fatalf("stored bypass session launched auth wizard %d times", wizardCalls)
 	}
 }

@@ -19,3 +19,17 @@ func TestUnsupportedPlatformFailsClosedWhenEnabled(t *testing.T) {
 		t.Fatalf("Wrap error = %v, want ErrUnsupportedPlatform", err)
 	}
 }
+
+func TestUnsupportedPlatformRefusesBypassCredentialIsolation(t *testing.T) {
+	m, err := NewManagerWithOptions(Options{Mode: "off", TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	if err := m.RequireCredentialIsolation(true); !errors.Is(err, ErrUnsupportedPlatform) {
+		t.Fatalf("RequireCredentialIsolation error = %v, want ErrUnsupportedPlatform", err)
+	}
+	if state := m.State(); state.CredentialIsolationRequired || state.Effective != ModeOff {
+		t.Fatalf("failed isolation request changed state: %+v", state)
+	}
+}

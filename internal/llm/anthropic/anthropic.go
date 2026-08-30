@@ -500,16 +500,34 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 	if clientDecoys {
 		out.DecoyToolsArchive = clientSideDecoyTools()
 	}
-	// Mark the LAST tool with cache_control. Anthropic semantics: a
-	// cache_control marker is a "cache breakpoint" — everything BEFORE
-	// it (including the marker block itself) gets cached together. So
-	// marking the last tool caches the ENTIRE tools array (typically the
-	// largest token block in any agent request — 5–10K tokens for a
-	// 30-tool registry). The static system prefix is also under this
-	// breakpoint via the buildSystemBlocks split below. claude-code's
-	// `services/api/claude.ts:buildSystemPromptBlocks` does the same.
+	// Mark the stable Direct-tool prefix with cache_control. Anthropic
+	// semantics cache everything through the marker. Registry ordering is
+	// Direct first, then Deferred, so schema hydration or late MCP discovery
+	// no longer invalidates the large built-in prefix. Requests produced by
+	// older callers do not carry Exposure metadata; retain the legacy
+	// last-tool marker for those requests.
 	if n := len(out.Tools); n > 0 {
-		out.Tools[n-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+		breakpoint := n - 1
+		hasExposure := false
+		lastDirect := -1
+		for i, spec := range req.Tools {
+			if spec.Exposure != "" {
+				hasExposure = true
+			}
+			if spec.Exposure == "direct" {
+				lastDirect = i
+			}
+		}
+		if hasExposure {
+			if lastDirect < 0 {
+				breakpoint = -1
+			} else {
+				breakpoint = lastDirect
+			}
+		}
+		if breakpoint >= 0 {
+			out.Tools[breakpoint].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+		}
 	}
 	for _, m := range req.Messages {
 		am := anthropicMessage{Role: string(m.Role)}
