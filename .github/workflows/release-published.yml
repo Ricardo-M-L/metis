@@ -1,0 +1,142 @@
+name: Verify Published Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    name: Verify immutable asset inventory
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and verify all release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid stable release tag: $TAG" >&2
+            exit 1
+          fi
+
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+
+          expected_assets=(
+            metis-darwin-amd64.tar.gz
+            metis-darwin-amd64.tar.gz.sha256
+            metis-darwin-arm64.tar.gz
+            metis-darwin-arm64.tar.gz.sha256
+            metis-desktop-darwin-universal.dmg
+            metis-desktop-darwin-universal.dmg.sha256
+            metis-desktop-darwin-universal.zip
+            metis-desktop-darwin-universal.zip.sha256
+            metis-desktop-linux-amd64.tar.gz
+            metis-desktop-linux-amd64.tar.gz.sha256
+            metis-desktop-windows-amd64.zip
+            metis-desktop-windows-amd64.zip.sha256
+            metis-linux-amd64.tar.gz
+            metis-linux-amd64.tar.gz.sha256
+            metis-linux-arm64.tar.gz
+            metis-linux-arm64.tar.gz.sha256
+            metis-windows-amd64.zip
+            metis-windows-amd64.zip.sha256
+            metis-windows-arm64.zip
+            metis-windows-arm64.zip.sha256
+          )
+          mapfile -t actual_assets < <(find dist -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          if ! diff -u <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${actual_assets[@]}"); then
+            echo "published release must contain exactly the 20 immutable assets" >&2
+            exit 1
+          fi
+
+          for sidecar in dist/*.sha256; do
+            sidecar_name=${sidecar#dist/}
+            (cd dist && shasum -a 256 -c "$sidecar_name")
+          done
+
+  install-smoke-unix:
+    name: Anonymous install smoke (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install without a GitHub token
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          install_dir="$RUNNER_TEMP/metis-bin"
+          env -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN \
+            METIS_VERSION="$TAG" METIS_INSTALL_DIR="$install_dir" \
+            bash install/install.sh
+          reported=$("$install_dir/metis" version | awk 'NR == 1 { print $1 }')
+          test "$reported" = "$TAG"
+
+  install-smoke-windows:
+    name: Anonymous install smoke (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install without a GitHub token
+        shell: pwsh
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          $installDir = Join-Path $env:RUNNER_TEMP "metis-bin"
+          & ./install/install.ps1 -Version $env:TAG -InstallDir $installDir
+          $output = @(& (Join-Path $installDir "metis.exe") version)
+          if ($LASTEXITCODE -ne 0) { throw "installed metis.exe version failed" }
+          $reported = ($output[0] -split '\s+')[0]
+          if ($reported -ne $env:TAG) {
+            throw "installed metis.exe reports $reported instead of $env:TAG"
+          }
+
+  macos-trust:
+    name: Verify macOS signing, notarization, and Gatekeeper
+    runs-on: macos-latest
+    steps:
+      - name: Download official macOS assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'metis-desktop-darwin-universal.*' --dir dist
+
+      - name: Verify checksums and Apple trust chain
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 -c metis-desktop-darwin-universal.zip.sha256)
+          (cd dist && shasum -a 256 -c metis-desktop-darwin-universal.dmg.sha256)
+          hdiutil verify dist/metis-desktop-darwin-universal.dmg
+
+          mkdir unpacked
+          ditto -x -k dist/metis-desktop-darwin-universal.zip unpacked
+          app=unpacked/metis-desktop.app
+          test -d "$app"
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleShortVersionString)" = "${TAG#v}"
+
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | grep -q '^Authority=Developer ID Application:'
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+
+          codesign --verify --verbose=2 dist/metis-desktop-darwin-universal.dmg
+          xcrun stapler validate dist/metis-desktop-darwin-universal.dmg
+          spctl --assess --type open --context context:primary-signature --verbose=2 \
+            dist/metis-desktop-darwin-universal.dmg

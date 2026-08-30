@@ -7,6 +7,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.38] - 2026-08-30
+
+### Changed
+
+- Tag builds now stage only verified CLI, Linux Desktop, and Windows Desktop
+  assets in a draft Release. The CI-only ad-hoc-signed macOS archive is kept as
+  a workflow artifact and can no longer become an official download.
+- A draft is published only after the final Developer ID signed, Apple
+  notarized, stapled macOS ZIP and DMG plus their SHA-256 sidecars have been
+  added and the complete 20-asset inventory has been verified.
+
+### Fixed
+
+- Published releases now trigger independent Linux and Windows anonymous
+  install smoke tests plus macOS checksum, version, Developer ID, notarization,
+  staple, and Gatekeeper validation.
+- CI statically rejects release workflow changes that auto-publish tag builds,
+  stage the temporary macOS artifact, or remove the immutable-release trust
+  gates.
+
 ## [0.4.35] - 2026-08-28
 
 ### Added
@@ -1169,7 +1189,10 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.35...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.38...HEAD
+[0.4.38]: https://github.com/Ricardo-M-L/metis/compare/v0.4.37...v0.4.38
+[0.4.37]: https://github.com/Ricardo-M-L/metis/compare/v0.4.36...v0.4.37
+[0.4.36]: https://github.com/Ricardo-M-L/metis/compare/v0.4.35...v0.4.36
 [0.4.35]: https://github.com/Ricardo-M-L/metis/compare/v0.4.34...v0.4.35
 [0.4.34]: https://github.com/Ricardo-M-L/metis/compare/v0.4.33...v0.4.34
 [0.4.33]: https://github.com/Ricardo-M-L/metis/compare/v0.4.32...v0.4.33

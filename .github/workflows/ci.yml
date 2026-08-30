@@ -24,6 +24,9 @@ jobs:
       - name: Build and verify all release assets
         run: make verify-dist
 
+      - name: Verify immutable release policy
+        run: scripts/verify-release-policy.sh
+
   test:
     name: Build & test
     runs-on: ${{ matrix.os }}

@@ -68,6 +68,7 @@ jobs:
       - name: Run root release gates
         working-directory: source
         run: |
+          ../release-tools/scripts/verify-release-policy.sh
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
             echo "gofmt found unformatted files:" >&2
@@ -285,8 +286,8 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  publish:
-    name: Publish only after artifact smoke tests
+  stage-draft:
+    name: Stage immutable release draft
     if: >-
       always() &&
       needs.build.result == 'success' &&
@@ -303,15 +304,25 @@ jobs:
           name: metis-release-${{ needs.build.outputs.tag }}
           path: dist
 
-      - name: Download Desktop artifacts
+      # The macOS runner artifact is an ad-hoc-signed CI smoke artifact only.
+      # Official macOS ZIP/DMG assets must be Developer ID signed, notarized,
+      # and stapled locally before the draft is made public, so never stage the
+      # runner-produced macOS archive in the GitHub Release.
+      - name: Download Linux Desktop artifact
         if: github.event_name == 'push'
         uses: actions/download-artifact@v4
         with:
-          pattern: metis-desktop-*-${{ needs.build.outputs.tag }}
+          name: metis-desktop-linux-amd64-${{ needs.build.outputs.tag }}
           path: dist
-          merge-multiple: true
 
-      - name: Require a draft, upload all assets, then publish
+      - name: Download Windows Desktop artifact
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v4
+        with:
+          name: metis-desktop-windows-amd64-${{ needs.build.outputs.tag }}
+          path: dist
+
+      - name: Require a draft and stage verified non-macOS assets
         env:
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -319,7 +330,7 @@ jobs:
         run: |
           mapfile -t assets < <(find dist -mindepth 1 -maxdepth 1 -type f -print | sort)
           expected=12
-          if [ "$EVENT_NAME" = "push" ]; then expected=18; fi
+          if [ "$EVENT_NAME" = "push" ]; then expected=16; fi
           if [ "${#assets[@]}" -ne "$expected" ]; then
             echo "expected exactly $expected verified assets, found ${#assets[@]}" >&2
             exit 1
@@ -339,51 +350,14 @@ jobs:
           fi
 
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
 
-  install-smoke-unix:
-    name: Anonymous install smoke (Linux)
-    if: github.event_name == 'push'
-    needs: [build, publish]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.build.outputs.tag }}
-
-      - name: Install without a GitHub token
+      - name: Record finalization gate
         env:
           TAG: ${{ needs.build.outputs.tag }}
         run: |
-          install_dir="$RUNNER_TEMP/metis-bin"
-          env -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN \
-            METIS_VERSION="$TAG" METIS_INSTALL_DIR="$install_dir" \
-            bash install/install.sh
-          reported=$("$install_dir/metis" version | awk 'NR == 1 { print $1 }')
-          test "$reported" = "$TAG"
-
-  install-smoke-windows:
-    name: Anonymous install smoke (Windows)
-    if: github.event_name == 'push'
-    needs: [build, publish]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.build.outputs.tag }}
-
-      - name: Install without a GitHub token
-        shell: pwsh
-        env:
-          TAG: ${{ needs.build.outputs.tag }}
-        run: |
-          Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
-          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
-          $installDir = Join-Path $env:RUNNER_TEMP "metis-bin"
-          & ./install/install.ps1 -Version $env:TAG -InstallDir $installDir
-          $output = @(& (Join-Path $installDir "metis.exe") version)
-          if ($LASTEXITCODE -ne 0) { throw "installed metis.exe version failed" }
-          $reported = ($output[0] -split '\s+')[0]
-          if ($reported -ne $env:TAG) {
-            throw "installed metis.exe reports $reported instead of $env:TAG"
-          }
+          {
+            echo "### Draft staged for $TAG"
+            echo
+            echo "The draft intentionally omits the four official macOS files."
+            echo "Add the Developer ID signed, notarized, stapled ZIP/DMG and their SHA-256 sidecars, verify all 20 assets, then publish the draft exactly once."
+          } >> "$GITHUB_STEP_SUMMARY"
