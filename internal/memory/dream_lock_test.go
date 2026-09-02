@@ -1,9 +1,13 @@
 package memory
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -174,37 +178,40 @@ func TestDreamLock_LivePIDLockTreatedAsInflight(t *testing.T) {
 // memdir both TryAcquire; exactly one should win. The losing acquire
 // must return ok=false, err=nil so the caller can bail cleanly.
 //
-// Sequential rather than parallel to keep the test deterministic: the
-// second acquire happens after the first finishes writing but the
-// re-read sees the second's PID, not the first's — so the first call
-// returns ok=false. (Real two-process race: kernel scheduling decides
-// the winner. We exercise the same code path.)
+// The competing writer waits until it has observed the first acquire's
+// PID on disk before overwriting it. This tests the verification path
+// without guessing how quickly a loaded CI runner will schedule l1.
 func TestDreamLock_ConcurrentAcquire(t *testing.T) {
 	dir := t.TempDir()
 	l1 := NewDreamLock(dir)
 	l2 := NewDreamLock(dir)
 
-	// l1 writes its PID, sleeps inside TryAcquire (20ms settle window),
-	// then re-reads. We race a competing write that overwrites l1's
-	// PID before l1 verifies. The settle window must be big enough that
-	// under CI load (busy GitHub-Actions runners) we reliably get the
-	// competing write in BEFORE the verifier reads.
-	done := make(chan struct{})
-	var l1ok, l2ok bool
-	var l1err, l2err error
+	// TryAcquire sleeps after writing its PID. Observe that write, then
+	// replace it while TryAcquire is sleeping so its verification must
+	// report that it lost the race.
+	overwriteDone := make(chan error, 1)
 	go func() {
-		_, l1ok, l1err = l1.TryAcquire()
-		close(done)
+		want := strconv.Itoa(os.Getpid())
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			body, err := os.ReadFile(l1.Path())
+			if err == nil && strings.TrimSpace(string(body)) == want {
+				overwriteDone <- os.WriteFile(l1.Path(), []byte("1"), 0o600)
+				return
+			}
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				overwriteDone <- fmt.Errorf("observe first writer: %w", err)
+				return
+			}
+			runtime.Gosched()
+		}
+		overwriteDone <- fmt.Errorf("timed out waiting to observe first writer PID")
 	}()
-	// Inject the competing write ~halfway into the 20ms settle window —
-	// far enough after l1's WriteFile to ensure it happened first, far
-	// enough before re-read to be visible. "1" is a fake PID clearly
-	// different from os.Getpid().
-	time.Sleep(10 * time.Millisecond)
-	if err := os.WriteFile(l1.Path(), []byte("1"), 0o644); err != nil {
-		t.Fatalf("race-write: %v", err)
+
+	_, l1ok, l1err := l1.TryAcquire()
+	if err := <-overwriteDone; err != nil {
+		t.Fatalf("competing write: %v", err)
 	}
-	<-done
 	if l1err != nil {
 		t.Fatalf("l1.TryAcquire err: %v", l1err)
 	}
@@ -213,7 +220,7 @@ func TestDreamLock_ConcurrentAcquire(t *testing.T) {
 	}
 
 	// l2 acquires cleanly on a fresh ground.
-	_, l2ok, l2err = l2.TryAcquire()
+	_, l2ok, l2err := l2.TryAcquire()
 	if l2err != nil || !l2ok {
 		t.Fatalf("l2 follow-up acquire: ok=%v err=%v", l2ok, l2err)
 	}

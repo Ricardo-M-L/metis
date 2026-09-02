@@ -7,6 +7,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.41] - 2026-09-02
+
+### Fixed
+
+- Made concurrency and Desktop restart tests synchronize on observable state
+  and tolerate loaded runners instead of relying on fragile scheduler timing.
+
 ## [0.4.40] - 2026-09-02
 
 ### Fixed
@@ -1247,7 +1254,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.40...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.41...HEAD
+[0.4.41]: https://github.com/Ricardo-M-L/metis/compare/v0.4.40...v0.4.41
 [0.4.40]: https://github.com/Ricardo-M-L/metis/compare/v0.4.39...v0.4.40
 [0.4.39]: https://github.com/Ricardo-M-L/metis/compare/v0.4.38...v0.4.39
 [0.4.38]: https://github.com/Ricardo-M-L/metis/compare/v0.4.37...v0.4.38

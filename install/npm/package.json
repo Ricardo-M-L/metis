@@ -1,6 +1,6 @@
 {
   "name": "metis-cli",
-  "version": "0.4.40",
+  "version": "0.4.41",
   "description": "metis — fast, local-first agent CLI (npm wrapper, downloads native binary on install)",
   "private": true,
   "bin": {

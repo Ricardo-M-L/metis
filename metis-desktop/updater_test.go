@@ -82,7 +82,7 @@ func TestRestartDesktopCommandWaitsForParentExitBeforeLaunching(t *testing.T) {
 		if err != nil {
 			t.Fatalf("restart helper failed: %v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("restart helper did not launch Desktop after old process exited")
 	}
 	cmd.Process = nil
