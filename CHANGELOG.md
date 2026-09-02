@@ -7,6 +7,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.40] - 2026-09-02
+
+### Fixed
+
+- Made macOS Desktop self-update handoff wait for the old Wails process to
+  exit before LaunchServices starts the updated application bundle.
+
+### Changed
+
+- Removed the white icon plate and its visible Dock shadow, leaving the
+  blue/cyan/purple METIS mark on a genuinely transparent background.
+
 ## [0.4.39] - 2026-09-02
 
 ### Fixed
@@ -1235,7 +1247,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.39...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.40...HEAD
+[0.4.40]: https://github.com/Ricardo-M-L/metis/compare/v0.4.39...v0.4.40
 [0.4.39]: https://github.com/Ricardo-M-L/metis/compare/v0.4.38...v0.4.39
 [0.4.38]: https://github.com/Ricardo-M-L/metis/compare/v0.4.37...v0.4.38
 [0.4.37]: https://github.com/Ricardo-M-L/metis/compare/v0.4.36...v0.4.37

@@ -10,11 +10,92 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestRestartDesktopCommandWaitsForParentExitBeforeLaunching(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("restart handoff test requires POSIX process signals")
+	}
+
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "restart-args.txt")
+	opener := filepath.Join(dir, "open")
+	if err := os.WriteFile(opener, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$METIS_RESTART_TEST_MARKER\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := exec.Command("/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do /bin/sleep 1; done")
+	if err := parent.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if parent.Process != nil {
+			_ = parent.Process.Kill()
+			_ = parent.Wait()
+		}
+	}()
+
+	cmd, err := restartDesktopCommand(
+		"darwin",
+		parent.Process.Pid,
+		"/Applications/Metis Test.app",
+		"/tmp/work space",
+		"/tmp/metis bin",
+		opener,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Env = append(os.Environ(), "METIS_RESTART_TEST_MARKER="+marker)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("new Desktop launched before old process exited: stat error = %v", err)
+	}
+
+	if err := parent.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	parent.Process = nil
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("restart helper failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("restart helper did not launch Desktop after old process exited")
+	}
+	cmd.Process = nil
+
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "-n\n-a\n/Applications/Metis Test.app\n--args\n--workspace\n/tmp/work space\n--metis-bin\n/tmp/metis bin\n"
+	if string(got) != want {
+		t.Fatalf("restart arguments = %q, want %q", got, want)
+	}
+}
 
 func TestDesktopAssetName(t *testing.T) {
 	for _, tc := range []struct {

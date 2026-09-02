@@ -693,18 +693,56 @@ func currentDesktopPath() (string, error) {
 }
 
 func restartDesktopProcess(appPath, workspace, metisBin string) error {
+	cmd, err := restartDesktopCommand(runtime.GOOS, os.Getpid(), appPath, workspace, metisBin, "/usr/bin/open")
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
+func restartDesktopCommand(goos string, parentPID int, appPath, workspace, metisBin, opener string) (*exec.Cmd, error) {
 	args := []string{"--workspace", workspace}
 	if strings.TrimSpace(metisBin) != "" {
 		args = append(args, "--metis-bin", metisBin)
 	}
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
-		return exec.Command("open", append([]string{"-n", "-a", appPath, "--args"}, args...)...).Start()
+		if parentPID <= 0 {
+			return nil, errors.New("Desktop restart parent process is invalid")
+		}
+		if strings.TrimSpace(opener) == "" {
+			opener = "/usr/bin/open"
+		}
+		// LaunchServices can absorb an open request into the still-running old
+		// bundle instance. Keep the handoff in a detached helper and wait until
+		// the old Wails process is gone before asking macOS to start the updated
+		// bundle. Values are positional parameters rather than shell text so
+		// paths containing spaces or shell metacharacters remain data.
+		const script = `
+parent_pid=$1
+app_path=$2
+workspace=$3
+metis_bin=$4
+opener=$5
+while kill -0 "$parent_pid" 2>/dev/null; do
+  /bin/sleep 0.1
+done
+if [ -n "$metis_bin" ]; then
+  exec "$opener" -n -a "$app_path" --args --workspace "$workspace" --metis-bin "$metis_bin"
+fi
+exec "$opener" -n -a "$app_path" --args --workspace "$workspace"
+`
+		return exec.Command(
+			"/bin/sh", "-c", script, "metis-desktop-restart",
+			strconv.Itoa(parentPID), appPath, workspace, metisBin, opener,
+		), nil
 	case "linux":
-		cmd := exec.Command(appPath, args...)
-		return cmd.Start()
+		return exec.Command(appPath, args...), nil
 	default:
-		return errors.New("automatic Desktop restart is not supported on this platform yet")
+		return nil, errors.New("automatic Desktop restart is not supported on this platform yet")
 	}
 }
 
