@@ -222,6 +222,14 @@ func TestCmdSandboxFullAccessDoesNotClaimOverrideIsEffective(t *testing.T) {
 	if !strings.Contains(out, "fullAccess keeps the effective process sandbox off") {
 		t.Fatalf("fullAccess override response is misleading: %q", out)
 	}
+	if !manager.Available() {
+		if _, set := manager.RuntimeMode(); set {
+			t.Fatalf("unavailable backend changed the runtime override: %q", out)
+		}
+		if !strings.Contains(out, "mode unchanged") {
+			t.Fatalf("unavailable backend did not disclose that the override was rejected: %q", out)
+		}
+	}
 	if manager.EffectiveMode() != sandbox.ModeOff {
 		t.Fatalf("fullAccess override changed effective mode to %q", manager.EffectiveMode())
 	}

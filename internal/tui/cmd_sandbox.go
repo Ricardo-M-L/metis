@@ -73,6 +73,13 @@ func cmdSandbox(r *REPL, args string) string {
 	if canonical != sandbox.ModeOff {
 		diagnostic := manager.Doctor()
 		if !diagnostic.Available {
+			if manager.State().FullAccessRequired {
+				return fmt.Sprintf(
+					"sandbox: cannot set runtime override to %q: %v (fail-closed; mode unchanged); fullAccess keeps the effective process sandbox off",
+					canonical,
+					diagnostic.Err,
+				)
+			}
 			return fmt.Sprintf("sandbox: cannot enable %q: %v (fail-closed; mode unchanged)", canonical, diagnostic.Err)
 		}
 	}
