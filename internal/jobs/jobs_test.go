@@ -247,6 +247,56 @@ func TestStop_UnknownIDError(t *testing.T) {
 	}
 }
 
+func TestKillStageCanceledBeforeStartSkipsSideEffects(t *testing.T) {
+	stage := newKillStage()
+	stage.RequestCancel()
+	called := false
+	if stage.Start(func() context.CancelFunc {
+		called = true
+		return func() {}
+	}) {
+		t.Fatal("canceled stage started")
+	}
+	if called {
+		t.Fatal("canceled-before-start stage executed its first side effect")
+	}
+}
+
+func TestKillStageStartOrdersFirstSideEffectBeforeCancel(t *testing.T) {
+	stage := newKillStage()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	startDone := make(chan struct{})
+	go func() {
+		stage.Start(func() context.CancelFunc {
+			close(entered)
+			<-release
+			return func() {}
+		})
+		close(startDone)
+	}()
+	<-entered
+	cancelStarted := make(chan struct{})
+	cancelDone := make(chan struct{})
+	go func() {
+		close(cancelStarted)
+		stage.RequestCancel()
+		close(cancelDone)
+	}()
+	<-cancelStarted
+	select {
+	case <-cancelDone:
+		t.Fatal("cancel overtook an in-flight first side effect")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	<-startDone
+	<-cancelDone
+	if !stage.CancelRequested() {
+		t.Fatal("cancel request was lost after stage start")
+	}
+}
+
 // TestStop_AlreadyTerminalIsNoOp — Stop on a job that already
 // completed is a silent success. This is the common race when both
 // the model and the user (Ctrl+B equivalent) try to act on the same

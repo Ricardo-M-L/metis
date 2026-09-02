@@ -63,14 +63,17 @@ these guarantees.
 
 ## Other design invariants
 
-- The verification contract applies only after substantial work: at least
-  five direct `Write`/`Edit`/`MultiEdit` calls or ten `Agent` dispatches.
+- The verification contract applies only after risk-based substantial work:
+  mutation volume/scope, potentially writable Agent profiles, opaque Bash file
+  mutations, and high-impact external commands contribute to the threshold.
   `METIS_CONTRACT_DISABLE=1` disables it, `OVERRIDE CONTRACT:` is the audited
   escape hatch, and each dispatch/verdict gate is capped at two attempts.
-- A verify result is parsed from the last `VERDICT: PASS|FAIL|PARTIAL` marker.
-  A missing marker becomes `MISSING`; for a triggered contract, only `PASS`
-  releases the verdict gate before its retry cap. The required verifier
-  prompt is `internal/runtime/builtin_profiles/verify.md`.
+- A verify result is accepted only from a successful `Agent` call whose
+  `subagent_type` is `verify` and whose final non-empty line is exactly one of
+  `VERDICT: PASS`, `VERDICT: FAIL`, or `VERDICT: PARTIAL`. Anything else becomes
+  `MISSING`; for a triggered contract, only `PASS` releases the verdict gate
+  before its retry cap. The required verifier prompt is
+  `internal/runtime/builtin_profiles/verify.md`.
 - The CLI classifies `diminishing_returns`, `max_iterations`,
   `loop_detected`, `stuck_after_reset`, `turn_wall_clock`, and `budget_usd`
   as incomplete outcomes and maps them to `exitcode.Incomplete`. When adding

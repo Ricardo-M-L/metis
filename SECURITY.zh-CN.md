@@ -43,7 +43,9 @@ Metis 处于 `0.x` 阶段，仅最新发布版本接收安全修复。当前发�
 
 **不在范围**（请勿提交）：
 
-- 用户自己设置 `--mode bypassPermissions` 并运行危险命令 —— 该模式已声明「自负责任」
+- 用户主动设置 `--mode fullAccess`（或
+  `--dangerously-bypass-approvals-and-sandbox`），并允许命令使用宿主账号权限运行
+  —— 该模式明确关闭审批和进程沙箱
 - 上游 LLM provider API 的问题
 - 巨大输入导致的拒绝服务（Metis 是本地 CLI，请用 ulimit）
 - 用户自己以明文写进 config 文件的敏感数据

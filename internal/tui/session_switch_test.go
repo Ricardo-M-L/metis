@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -68,7 +69,144 @@ func newSessionSwitchModel(t *testing.T, mode permission.Mode) (*Model, *session
 	loop.Model = "test-model"
 	m := NewModel(context.Background(), loop, nil, nil, store, "source", gate, "test-model", "", "", &config.Config{})
 	m.ext.FreshPermissionMode = permission.ModeAsk
+	m.ext.TrustSessionPermissions = true
 	return m, store
+}
+
+func TestActivateSessionFiltersPermissionsFromUntrustedStore(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        permission.Mode
+		prePlan     string
+		wantMode    permission.Mode
+		wantPrePlan string
+	}{
+		{
+			name: "direct full access",
+			mode: permission.ModeFullAccess, wantMode: permission.ModeAsk,
+		},
+		{
+			name: "plan full access lineage",
+			mode: permission.ModePlan, prePlan: string(permission.ModeFullAccess),
+			wantMode: permission.ModePlan, wantPrePlan: string(permission.ModeAsk),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeAsk)
+			m.ext.TrustSessionPermissions = false
+			target := &session.Header{
+				ID: "untrusted-target", Model: "test-model", System: "target-system",
+				Mode: string(tt.mode), PrePlanMode: tt.prePlan,
+				AlwaysAllow: []session.SavedRule{{
+					Tool: "Bash", Verb: int(permission.DecisionAllow), Source: "interactive",
+				}},
+			}
+			if err := store.WriteHeaderFull(*target); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := m.activateSession(target.ID, target, nil, true); err != nil {
+				t.Fatal(err)
+			}
+			if got := m.gate.Mode(); got != tt.wantMode {
+				t.Fatalf("restored mode = %q, want %q", got, tt.wantMode)
+			}
+			if got := m.loop.PrePlanMode(); got != tt.wantPrePlan {
+				t.Fatalf("restored pre-plan mode = %q, want %q", got, tt.wantPrePlan)
+			}
+			if rules := m.gate.Snapshot(); len(rules) != 0 {
+				t.Fatalf("untrusted session rules restored: %+v", rules)
+			}
+		})
+	}
+}
+
+func TestActiveTurnRejectsStaleSessionScreenResults(t *testing.T) {
+	tests := []struct {
+		name  string
+		build func() screen.Screen
+	}{
+		{
+			name: "sessions picker resume",
+			build: func() screen.Screen {
+				picker := screen.NewPickerScreen("/sessions", "", []screen.PickerItem{{Key: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+				return picker
+			},
+		},
+		{
+			name: "resume screen resume",
+			build: func() screen.Screen {
+				resume := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				resume.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+				return resume
+			},
+		},
+		{
+			name: "resume screen fork",
+			build: func() screen.Screen {
+				resume := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				resume.Update(tea.KeyPressMsg{Code: 'f', Text: "f"})
+				return resume
+			},
+		},
+		{
+			name: "resume screen fresh",
+			build: func() screen.Screen {
+				resume := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				resume.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})
+				return resume
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeFullAccess)
+			sourceHistory := []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "source prompt"}}}}
+			m.loop.Restore(sourceHistory)
+			m.loop.SetPrePlanMode(string(permission.ModeDefault))
+			m.gate.AppendRules(permission.Rule{Tool: "Read", Verb: permission.DecisionAllow, Source: "interactive"})
+			if err := store.WriteHeaderFull(session.Header{ID: "target", Model: "test-model", System: "target-system", Mode: string(permission.ModeAsk)}); err != nil {
+				t.Fatal(err)
+			}
+
+			beforeID := m.sessionID
+			beforeMode := m.gate.Mode()
+			beforeRules := m.gate.Snapshot()
+			beforeHistory := m.loop.History()
+			beforePrePlan := m.loop.PrePlanMode()
+			beforeEntries, err := store.List(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.turnActive = true // Picker opened while idle; the turn began before selection landed.
+
+			m.applyScreenResult(tt.build())
+
+			if m.sessionID != beforeID {
+				t.Fatalf("stale selection changed session: got %q, want %q", m.sessionID, beforeID)
+			}
+			if m.gate.Mode() != beforeMode || !reflect.DeepEqual(m.gate.Snapshot(), beforeRules) {
+				t.Fatalf("stale selection changed gate: mode=%q rules=%+v", m.gate.Mode(), m.gate.Snapshot())
+			}
+			if !reflect.DeepEqual(m.loop.History(), beforeHistory) || m.loop.PrePlanMode() != beforePrePlan {
+				t.Fatalf("stale selection changed loop: history=%+v prePlan=%q", m.loop.History(), m.loop.PrePlanMode())
+			}
+			afterEntries, err := store.List(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(afterEntries) != len(beforeEntries) {
+				t.Fatalf("stale selection created a session: before=%d after=%d", len(beforeEntries), len(afterEntries))
+			}
+			if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "stop or cancel") {
+				t.Fatalf("stale selection did not explain refusal: %+v", m.messages)
+			}
+		})
+	}
 }
 
 func TestActivateSessionRebindsAllSessionScopedState(t *testing.T) {
@@ -419,6 +557,67 @@ func TestSessionPickerProviderFailureWarnsWithoutSuccess(t *testing.T) {
 	}
 }
 
+func TestTurnActiveStaleSessionPickersCannotRebindLoop(t *testing.T) {
+	tests := []struct {
+		name string
+		pick func(*Model)
+	}{
+		{
+			name: "sessions picker",
+			pick: func(m *Model) {
+				picker := screen.NewPickerScreen("/sessions", "", []screen.PickerItem{{Key: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+				m.applyScreenResult(picker)
+			},
+		},
+		{
+			name: "resume picker",
+			pick: func(m *Model) {
+				picker := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+				m.applyScreenResult(picker)
+			},
+		},
+		{
+			name: "fresh picker action",
+			pick: func(m *Model) {
+				picker := screen.NewResumeScreen([]screen.SessionEntry{{ID: "target"}})
+				picker.Update(tea.KeyPressMsg{Code: 'n'})
+				m.applyScreenResult(picker)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, store := newSessionSwitchModel(t, permission.ModeAsk)
+			if err := store.WriteHeaderFull(session.Header{
+				ID: "target", Provider: "wire", Model: "target-model", System: "target-system", Mode: string(permission.ModeFullAccess),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			m.loop.ResetSession([]llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "source sentinel"}}}})
+			beforeProvider := m.loop.Provider
+			beforeHistory := m.loop.History()
+			beforeMode := m.gate.Mode()
+			beforePrePlan := m.loop.PrePlanMode()
+			m.turnActive = true
+
+			tt.pick(m)
+
+			if m.sessionID != "source" || m.loop.Provider != beforeProvider || m.gate.Mode() != beforeMode || m.loop.PrePlanMode() != beforePrePlan {
+				t.Fatalf("stale picker rebound live turn: session=%q providerChanged=%v mode=%q prePlan=%q",
+					m.sessionID, m.loop.Provider != beforeProvider, m.gate.Mode(), m.loop.PrePlanMode())
+			}
+			if got := m.loop.History(); !reflect.DeepEqual(got, beforeHistory) {
+				t.Fatalf("stale picker replaced live history: got=%+v want=%+v", got, beforeHistory)
+			}
+			if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "can't switch sessions mid-turn") {
+				t.Fatalf("stale picker did not surface refusal: %+v", m.messages)
+			}
+		})
+	}
+}
+
 func TestFreshAndForkStartNewPermissionLifetime(t *testing.T) {
 	m, store := newSessionSwitchModel(t, permission.ModeBypass)
 	m.gate.AppendRules(permission.Rule{Tool: "Bash", Verb: permission.DecisionAllow, Source: "interactive"})
@@ -489,6 +688,43 @@ func TestPersistActiveSessionStateOnlySavesSessionRules(t *testing.T) {
 	if hdr.Provider != "openai" || hdr.Model != "gpt-current" || hdr.System != "current-system" ||
 		hdr.Mode != "acceptEdits" || len(hdr.AlwaysAllow) != 1 || hdr.AlwaysAllow[0].Tool != "Edit" {
 		t.Errorf("persisted header = %+v, want live provider/model/system + only interactive Edit approval", hdr)
+	}
+}
+
+func TestPersistSessionStateWaitsForCompletePermissionSnapshot(t *testing.T) {
+	m, store := newSessionSwitchModel(t, permission.ModeFullAccess)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	transitionDone := make(chan error, 1)
+	go func() {
+		transitionDone <- m.gate.RunModeTransition(func() error {
+			m.loop.SetPrePlanMode(string(permission.ModeFullAccess))
+			close(entered)
+			<-release
+			m.gate.SetMode(permission.ModePlan)
+			m.loop.SetPlanMode(true)
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission transition did not reach its in-flight snapshot")
+	}
+	time.AfterFunc(100*time.Millisecond, func() { close(release) })
+
+	if err := persistSessionState(store, "source", m.gate, m.loop, "wire", "model", "system"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-transitionDone; err != nil {
+		t.Fatal(err)
+	}
+	hdr, _, err := store.LoadHeader("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode != string(permission.ModePlan) || hdr.PrePlanMode != string(permission.ModeFullAccess) {
+		t.Fatalf("persisted permission snapshot = mode %q pre-plan %q", hdr.Mode, hdr.PrePlanMode)
 	}
 }
 

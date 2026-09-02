@@ -136,6 +136,9 @@ func (w Workflow) CanUse(ctx context.Context, in map[string]any) (tools.Permissi
 		return tools.PermissionAllow, ""
 	}
 	for _, command := range cmds {
+		if w.fullAccess() {
+			continue
+		}
 		if err := shellguard.Check(command); err != nil {
 			return tools.PermissionDeny, err.Error()
 		}
@@ -195,7 +198,7 @@ func (w Workflow) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		if err != nil {
 			return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
 		}
-		if err := preflightWorkflow(wf); err != nil {
+		if err := preflightWorkflow(wf, w.fullAccess()); err != nil {
 			return blockedWorkflowResult(err), nil
 		}
 		return w.execSaveWorkflow(wf, in)
@@ -204,7 +207,7 @@ func (w Workflow) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		if err != nil {
 			return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
 		}
-		if err := preflightWorkflow(wf); err != nil {
+		if err := preflightWorkflow(wf, w.fullAccess()); err != nil {
 			return blockedWorkflowResult(err), nil
 		}
 		return w.execRun(ctx, wf, in), nil
@@ -217,7 +220,7 @@ func (w Workflow) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		if err != nil {
 			return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
 		}
-		if err := preflightWorkflow(wf); err != nil {
+		if err := preflightWorkflow(wf, w.fullAccess()); err != nil {
 			return blockedWorkflowResult(err), nil
 		}
 		return w.execRun(ctx, wf, in), nil
@@ -226,13 +229,20 @@ func (w Workflow) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	}
 }
 
-func preflightWorkflow(wf workflow.Workflow) error {
+func preflightWorkflow(wf workflow.Workflow, skipDangerousCommandCheck bool) error {
+	if skipDangerousCommandCheck {
+		return nil
+	}
 	for _, step := range wf.Steps {
 		if err := shellguard.Check(step.Command); err != nil {
 			return fmt.Errorf("step %q: %w", step.Name, err)
 		}
 	}
 	return nil
+}
+
+func (w Workflow) fullAccess() bool {
+	return w.gate != nil && w.gate.Mode() == permission.ModeFullAccess
 }
 
 func blockedWorkflowResult(err error) *tools.Result {
@@ -248,7 +258,12 @@ func (w Workflow) execRun(ctx context.Context, wf workflow.Workflow, in map[stri
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	results := workflow.Run(ctx, wf, workflow.RunOptions{Cwd: cwd, StopOnError: stop, Sandbox: w.sandbox})
+	results := workflow.Run(ctx, wf, workflow.RunOptions{
+		Cwd:                       cwd,
+		StopOnError:               stop,
+		Sandbox:                   w.sandbox,
+		SkipDangerousCommandCheck: w.fullAccess(),
+	})
 
 	var b strings.Builder
 	label := wf.Name
@@ -283,7 +298,7 @@ func (w Workflow) execSave(in map[string]any) (*tools.Result, error) {
 	if err != nil {
 		return &tools.Result{Output: "Workflow: " + err.Error(), IsError: true}, nil
 	}
-	if err := preflightWorkflow(wf); err != nil {
+	if err := preflightWorkflow(wf, w.fullAccess()); err != nil {
 		return blockedWorkflowResult(err), nil
 	}
 	return w.execSaveWorkflow(wf, in)

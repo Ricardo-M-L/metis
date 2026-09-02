@@ -191,10 +191,10 @@ const estimatedNativeVisionTokensPerImage = 1_600
 
 // estimateActiveHistoryTokens is the display/active-window fallback. Image
 // bytes are sent as native image parts and billed by pixels/tiles, not by
-// tokenizing their base64 transport encoding. Keep the more conservative
-// base64 estimate in compaction's wire-size guard, but use a bounded native
-// vision allowance here so a screenshot cannot manufacture a 300% context
-// meter before the provider's authoritative usage arrives.
+// tokenizing their base64 transport encoding. Use a bounded native vision
+// allowance for both the visible meter and request-pressure decisions so a
+// screenshot cannot manufacture a 300% context window before the provider's
+// authoritative usage arrives. HTTP request-size limits guard transport bytes.
 func estimateActiveHistoryTokens(messages []llm.Message) int {
 	total := 0
 	for _, message := range messages {

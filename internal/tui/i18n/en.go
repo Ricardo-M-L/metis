@@ -12,6 +12,7 @@ var en = map[string]string{
 	"mode.default":           "default",
 	"mode.acceptEdits":       "acceptEdits",
 	"mode.bypassPermissions": "bypassPermissions",
+	"mode.fullAccess":        "fullAccess",
 	"mode.plan":              "plan",
 	"mode.dontAsk":           "dontAsk",
 	"mode.cycle_hint":        "shift+tab to cycle",

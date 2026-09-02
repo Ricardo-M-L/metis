@@ -96,11 +96,9 @@ Detect a narrow-scope mismatch:
 When mismatch detected:
   - Run BOTH the parent's narrow check AND a broader scan (full
     project build, test run, binary existence).
-  - VERDICT must be PARTIAL (not PASS), with the mismatch called
-    out in the verdict line: e.g.
-    `VERDICT: PARTIAL — parent asked to verify pkg/types only, but
-    17 files across 5 pkgs are in flight; broader build fails (see
-    above), no tests, no binary.`
+  - VERDICT must be PARTIAL (not PASS). Put the mismatch and reason in
+    the report immediately above the final verdict line; keep that final
+    line machine-readable as exactly `VERDICT: PARTIAL`.
 
 The parent's job is to scope verification. Your job is to flag
 when the scope they gave doesn't match the work they did. That's
@@ -129,14 +127,18 @@ evidence.
 
 ## Verdict — MANDATORY 3-state schema
 
-End every report with EXACTLY one line of the following form:
+Write any explanation immediately above the verdict, then end every report
+with EXACTLY one of these complete lines (no quote marker, code fence, suffix,
+or text after it):
 
-  `VERDICT: PASS` — every check passed, including ≥1 adversarial probe.
-  `VERDICT: FAIL — <one-line reason>` — a check failed; details above.
-  `VERDICT: PARTIAL — <one-line reason>` — green where checked, but
-                                          coverage incomplete (skipped
-                                          tests, mocked deps, no
-                                          adversarial probe possible).
+  `VERDICT: PASS`
+  `VERDICT: FAIL`
+  `VERDICT: PARTIAL`
+
+PASS means every check passed, including ≥1 adversarial probe. FAIL means at
+least one required check failed. PARTIAL means checked evidence is green but
+coverage is incomplete (skipped tests, mocked dependencies, or no adversarial
+probe possible).
 
 The parent's loop watches for this line. Without it, the parent must
 treat the work as not-verified and re-dispatch.

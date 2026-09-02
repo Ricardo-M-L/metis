@@ -41,6 +41,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tasks"
 	tui "github.com/Ricardo-M-L/metis/internal/tui"
 	metisversion "github.com/Ricardo-M-L/metis/internal/version"
+	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
 	pubsess "github.com/Ricardo-M-L/metis/pkg/session"
 	"github.com/google/uuid"
 )
@@ -96,13 +97,14 @@ type Server struct {
 	memoryBinding          *rtpkg.WorkspaceMemoryBinding
 	memoryBindingErr       error
 
-	freshProviderName     string
-	freshModel            string
-	freshSystem           string
-	freshSystemSections   []llm.SystemSection
-	freshSystemPromptKind string
-	freshPermissionMode   permission.Mode
-	freshPreset           string
+	freshProviderName       string
+	freshModel              string
+	freshSystem             string
+	freshSystemSections     []llm.SystemSection
+	freshSystemPromptKind   string
+	freshPermissionMode     permission.Mode
+	freshPreset             string
+	trustSessionPermissions bool
 
 	buildProvider           func(providerName, model string) (*rtpkg.ProviderBuild, error)
 	setPermissionMode       func(permission.Mode) error
@@ -272,7 +274,11 @@ type RuntimeBindings struct {
 	// opaque --system/simple/profile prompt for newly-created Desktop sessions.
 	FreshSystemPromptKind string
 	FreshPermissionMode   permission.Mode
-	BuildProvider         func(providerName, model string) (*rtpkg.ProviderBuild, error)
+	// TrustSessionPermissions allows persisted Mode/PrePlanMode/AlwaysAllow to
+	// cross a Desktop session switch. False is the secure default for session
+	// directories supplied by an untrusted project config.
+	TrustSessionPermissions bool
+	BuildProvider           func(providerName, model string) (*rtpkg.ProviderBuild, error)
 	// SetPermissionMode performs the runtime-owned atomic gate/sandbox
 	// transition. Desktop must not independently claim bypassPermissions while
 	// model-controlled subprocesses still lack credential isolation.
@@ -342,6 +348,7 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		freshPermissionMode:     binding.FreshPermissionMode,
 		freshSystemPromptKind:   binding.FreshSystemPromptKind,
 		freshPreset:             binding.PresetName,
+		trustSessionPermissions: binding.TrustSessionPermissions,
 		buildProvider:           binding.BuildProvider,
 		setPermissionMode:       binding.SetPermissionMode,
 		preflightPermissionMode: binding.PreflightPermissionMode,
@@ -1402,7 +1409,6 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid session id")
 		return
 	}
-
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 	// Reserve the foreground-turn slot atomically with the closing check.
@@ -1467,6 +1473,17 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	if err := s.activateSession(body.SessionID, hdr, history); err != nil {
 		writeError(w, http.StatusConflict, "failed to activate session: "+err.Error())
 		return
+	}
+	// Capability must be checked against the provider activated for the target
+	// session, not whichever session happened to own the shared Loop while the
+	// request was being decoded. Keep this inside runMu as well so a concurrent
+	// model/session switch cannot invalidate the decision before Loop.Run.
+	if len(imgBlocks) > 0 {
+		provider, _, _ := s.loop.ProviderModelSnapshot()
+		if pubprovider.ProviderVisionCapability(provider) == pubprovider.VisionUnsupported {
+			writeError(w, http.StatusBadRequest, "current model does not support image attachments; switch to a vision-capable model")
+			return
+		}
 	}
 	// Tool execution must follow the activated session workspace, not the
 	// Desktop process launch directory. Snapshot it once for this serialized
@@ -1897,10 +1914,11 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		}
 	}
 
-	mode, prePlanMode, hasStoredMode, err := rtpkg.ValidateRestoredPermissionState(
+	mode, prePlanMode, hasStoredMode, err := rtpkg.ValidateRestoredPermissionStateFromSource(
 		hdr.Mode,
 		hdr.PrePlanMode,
 		s.freshPermissionMode,
+		s.trustSessionPermissions,
 	)
 	if err != nil {
 		return fmt.Errorf("permission-state preflight: %w", err)
@@ -1953,14 +1971,17 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	}
 	commitSessionSwitch()
 
-	resumedRules := make([]permission.Rule, 0, len(hdr.AlwaysAllow))
-	for _, rule := range hdr.AlwaysAllow {
-		resumedRules = append(resumedRules, permission.Rule{
-			Tool:   rule.Tool,
-			Match:  rule.Match,
-			Verb:   permission.Decision(rule.Verb),
-			Source: permission.ResumedSessionSource(rule.Source),
-		})
+	var resumedRules []permission.Rule
+	if s.trustSessionPermissions {
+		resumedRules = make([]permission.Rule, 0, len(hdr.AlwaysAllow))
+		for _, rule := range hdr.AlwaysAllow {
+			resumedRules = append(resumedRules, permission.Rule{
+				Tool:   rule.Tool,
+				Match:  rule.Match,
+				Verb:   permission.Decision(rule.Verb),
+				Source: permission.ResumedSessionSource(rule.Source),
+			})
+		}
 	}
 
 	canonicalTargetSystem, canonicalTargetSections := rtpkg.RebindProviderPrompt(
@@ -1982,10 +2003,12 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	}
 	s.loop.RebindProviderRuntime(provider, targetModel, targetMaxOutputTokens, targetSystem, targetSections)
 	s.loop.SetEffort(targetEffort)
-	s.loop.SetPrePlanMode(prePlanMode)
 	if s.loop.Gate != nil {
-		s.loop.Gate.ResetSessionState(mode, resumedRules)
-		rtpkg.SynchronizeRestoredPermissionState(s.loop.Gate, s.loop, prePlanMode)
+		s.loop.Gate.ResetSessionStateAndWait(mode, resumedRules, func() {
+			s.loop.SetPrePlanMode(prePlanMode)
+		}, func() {
+			rtpkg.SynchronizeRestoredPermissionState(s.loop.Gate, s.loop, prePlanMode)
+		})
 	} else {
 		s.loop.SetPrePlanMode("")
 		s.loop.SetPlanMode(false)
@@ -2290,14 +2313,12 @@ func (s *Server) writeActiveSessionState(id, providerName, model, preset, system
 		Preset:           preset,
 	}
 	if s.loop.Gate != nil {
-		hdr.Mode = string(s.loop.Gate.Mode())
-		if s.loop.Gate.Mode() == permission.ModePlan {
-			previous, ok := permission.ParseMode(s.loop.PrePlanMode())
-			if !ok || previous == permission.ModePlan {
-				return fmt.Errorf("persist active session %s: invalid pre-plan permission mode %q", id, s.loop.PrePlanMode())
-			}
-			hdr.PrePlanMode = string(previous)
+		permissionState, err := rtpkg.CapturePermissionModeState(s.loop.Gate, s.loop)
+		if err != nil {
+			return fmt.Errorf("persist active session %s permission state: %w", id, err)
 		}
+		hdr.Mode = string(permissionState.Mode)
+		hdr.PrePlanMode = permissionState.PrePlanMode
 		for _, rule := range s.loop.Gate.Snapshot() {
 			if rule.Source != "interactive" && !strings.HasPrefix(rule.Source, "session:") {
 				continue
@@ -3430,7 +3451,7 @@ func (s *Server) listSettings(w http.ResponseWriter) {
 	}
 	items := []webSetting{
 		{Key: "permission.mode", Label: "Permission mode", Description: "Default tool approval policy (applies immediately)", Type: "enum",
-			Value: permValue, Options: []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}},
+			Value: permValue, Options: []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "fullAccess"}},
 		{Key: "ui.theme", Label: "Theme", Description: "Web UI color scheme (applies immediately)", Type: "enum",
 			Value: cfg.UI.Theme, Options: []string{"auto", "dark", "light", "dark-daltonized", "nord", "solarized-dark"}},
 		{Key: "ui.thinking_display", Label: "Thinking display", Description: "Provider reasoning rows: show, hide, or auto (applies after restart)", Type: "enum",
@@ -3471,6 +3492,24 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	if len(body.Changes) == 0 {
 		writeError(w, http.StatusBadRequest, "no changes")
 		return
+	}
+	permissionSettingChange := false
+	for _, change := range body.Changes {
+		if change.Key == "permission.mode" {
+			permissionSettingChange = true
+			break
+		}
+	}
+	// A permission boundary must not change underneath tools already admitted
+	// for the active foreground turn. Keep the lock through live apply, durable
+	// config persistence, and any rollback so the next turn observes one
+	// complete boundary. Unrelated settings remain editable while a turn runs.
+	if permissionSettingChange {
+		if !s.runMu.TryLock() {
+			writeError(w, http.StatusConflict, "cannot change permission mode while a turn is running; stop the current turn first")
+			return
+		}
+		defer s.runMu.Unlock()
 	}
 	var settings []config.UserSetting
 	for _, c := range body.Changes {

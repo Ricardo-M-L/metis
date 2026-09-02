@@ -307,7 +307,11 @@ func fallbackVisionCapability(m string) provider.VisionCapability {
 		strings.HasPrefix(m, "kimi-latest"),
 		strings.HasPrefix(m, "kimi-vl"),
 		strings.HasPrefix(m, "moonshot-v1-vision"),
-		strings.HasPrefix(m, "glm-5"),
+		strings.HasPrefix(m, "glm-5.1"),
+		strings.HasPrefix(m, "glm-5v"),
+		strings.HasPrefix(m, "glm-4.6v"),
+		strings.HasPrefix(m, "glm-4.5v"),
+		strings.HasPrefix(m, "glm-4.1v"),
 		strings.HasPrefix(m, "glm-4v"),
 		strings.HasPrefix(m, "qwen-vl"),
 		strings.HasPrefix(m, "qwen2.5-vl"):
@@ -327,6 +331,8 @@ func fallbackVisionCapability(m string) provider.VisionCapability {
 		strings.HasPrefix(m, "deepseek-reasoner"),
 		strings.HasPrefix(m, "ark-code"),
 		strings.HasPrefix(m, "kimi-k1.5"),
+		strings.HasPrefix(m, "glm-5.2"),
+		strings.HasPrefix(m, "glm-5.3"),
 		strings.HasPrefix(m, "glm-4-flash"),
 		strings.HasPrefix(m, "minimax-m"):
 		return provider.VisionUnsupported
@@ -897,14 +903,16 @@ func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
 	toolIDPrefix := ""
 	for i, tc := range c.Message.ToolCalls {
 		input := map[string]any{}
+		malformed := false
 		if raw := strings.TrimSpace(tc.Function.Arguments); raw != "" && raw != "null" {
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(raw), &parsed); err == nil && parsed != nil {
 				input = parsed
 			} else if err != nil {
-				// Match the streaming path: retain malformed bytes for a useful
-				// tool-side error instead of collapsing the whole input to nil.
-				input["_raw"] = tc.Function.Arguments
+				// Match the streaming path: retain only the parse-failure fact for
+				// a useful tool-side error, never the potentially sensitive bytes.
+				input = map[string]any{}
+				malformed = true
 			}
 		}
 		id := tc.ID
@@ -914,9 +922,14 @@ func fromOpenAIChoice(c oaiChoice, usage oaiUsage) *Response {
 			}
 			id = syntheticToolUseID(toolIDPrefix, i)
 		}
-		out.Content = append(out.Content, ContentBlock{
-			Type: "tool_use", ToolUseID: id, ToolName: tc.Function.Name, ToolInput: input,
-		})
+		block := ContentBlock{
+			Type:               "tool_use",
+			ToolUseID:          id,
+			ToolName:           tc.Function.Name,
+			ToolInput:          input,
+			ToolInputMalformed: malformed,
+		}
+		out.Content = append(out.Content, block)
 	}
 	return out
 }

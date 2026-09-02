@@ -116,8 +116,10 @@ func (Git) IsReadOnly(map[string]any) bool { return false }
 // matching Claude Code's normal no-extra-prompt spawn behavior. An explicit
 // permission override is still a parent-boundary concern: a more permissive
 // child posture is not read-only and must go through the parent's normal
-// approval flow. Worktree isolation is never read-only because its setup
-// changes git metadata before the child runs.
+// approval flow. A lower mode requested beneath fullAccess is also not
+// read-only because that runtime cannot restore its disabled process sandbox.
+// Worktree isolation is never read-only because its setup changes git metadata
+// before the child runs.
 //
 // 2026-07-27: when the parent is itself in ModePlan, Agent is NO LONGER
 // advertised as read-only — even though the spawned child would be locked
@@ -149,7 +151,7 @@ func (a Agent) IsReadOnly(in map[string]any) bool {
 	if !hasRequested {
 		return true
 	}
-	return !agentPermissionModeEscalates(parentMode, requested)
+	return agentPermissionModeOverrideAllowed(parentMode, requested)
 }
 
 // Fork is the warm-start variant of Agent — same caveat applies:

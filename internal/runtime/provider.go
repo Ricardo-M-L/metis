@@ -257,6 +257,14 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 				time.Duration(cfg.Provider.OpenAI.TimeoutSecs)*time.Second,
 				cfg.Provider.OpenAI.Temperature,
 			)
+			if err := prov.ConfigureStateMode(cfg.Provider.OpenAI.ResponsesStateMode); err != nil {
+				return nil, err
+			}
+			if err := prov.ConfigureCapabilityProfile(cfg.Provider.OpenAI.ResponsesProfile); err != nil {
+				return nil, err
+			}
+			prov.PromptCacheKey = strings.TrimSpace(cfg.Provider.OpenAI.PromptCacheKey)
+			prov.HostedTools = append([]string(nil), cfg.Provider.OpenAI.HostedTools...)
 			prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
 			Preconnect(cfg.Provider.OpenAI.BaseURL)
 			return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
@@ -354,6 +362,10 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 			"service_account_file": raw.ServiceAccountFile,
 			"project":              raw.Project,
 			"region":               raw.Region,
+			"responses_state_mode": strings.ToLower(strings.TrimSpace(raw.ResponsesStateMode)),
+			"responses_profile":    strings.ToLower(strings.TrimSpace(raw.ResponsesProfile)),
+			"prompt_cache_key":     strings.TrimSpace(raw.PromptCacheKey),
+			"hosted_tools":         strings.Join(raw.HostedTools, ","),
 		},
 	}
 

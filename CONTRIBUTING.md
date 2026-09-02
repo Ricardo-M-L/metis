@@ -34,7 +34,7 @@ internal/tui/              bubbletea chat surface (split by concern,
                            single Model)
 internal/tui/screen/       full-screen overlays (help/history/…)
 internal/slash/            slash-command registry + handlers
-internal/permission/       5-mode cascading gate (default/acceptEdits/plan/dontAsk/bypassPermissions)
+internal/permission/       cascading gate (default/acceptEdits/plan/dontAsk/bypassPermissions/fullAccess)
 internal/exitcode/         typed errors → shell exit codes
 internal/jobs/             background process pool for the Bash family
 internal/channels/         chat-platform adapters (Slack/DingTalk/…)

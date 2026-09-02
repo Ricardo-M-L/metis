@@ -131,6 +131,18 @@ func ClassifyError(err error) ErrorClass {
 		return ErrCancelled
 	}
 
+	// Tool/function argument failures are payload errors, even when a
+	// compatibility provider appends its overloaded numeric code `(2013)`.
+	// Classify the semantic phrase before the generic MiniMax overflow-code
+	// matcher below; compacting history cannot repair malformed arguments and
+	// used to turn the provider's bounded two retries into another irrelevant
+	// compaction retry.
+	if strings.Contains(msg, "invalid function arguments") ||
+		strings.Contains(msg, "invalid tool arguments") ||
+		strings.Contains(msg, "invalid function call arguments") {
+		return ErrInvalidRequest
+	}
+
 	// Context overflow — Anthropic's "prompt is too long",
 	// MiniMax error code 2013 (multiple wire formats), OpenAI's
 	// "exceeds context length", catch-all "too many tokens".

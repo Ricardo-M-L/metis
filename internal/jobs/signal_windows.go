@@ -31,6 +31,19 @@ func KillProcessGroup(p *os.Process) {
 	_ = runTaskkill([]string{"/F", "/T", "/PID", strconv.Itoa(p.Pid)})
 }
 
+// Windows has no stable process-group identity comparable to a Unix PGID.
+// The staged reset path still joins taskkill /T; passive post-leader tracking
+// would require owning a Job Object from spawn time.
+func isProcessTreeAlive(_ *os.Process) bool { return false }
+
+func watchProcessTree(_ *os.Process, done chan<- struct{}) context.CancelFunc {
+	_, cancel := context.WithCancel(context.Background())
+	if done != nil {
+		close(done)
+	}
+	return cancel
+}
+
 // killTree dispatches to taskkill /T (single signal: best effort
 // graceful, no /F). On Unix this is SIGTERM-to-pgid; the equivalent
 // here is taskkill without /F which sends WM_CLOSE to the leader and
@@ -45,25 +58,34 @@ func killTree(p *os.Process, _ os.Signal) error {
 // killTreeStaged: graceful taskkill, wait grace, then taskkill /F /T.
 // Same semantics as the Unix path; we just route through the
 // platform's tree-kill primitive.
-func killTreeStaged(p *os.Process, grace time.Duration, done chan<- struct{}) {
+func killTreeStaged(p *os.Process, grace time.Duration, done chan<- struct{}) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
 	if p == nil {
 		if done != nil {
 			close(done)
 		}
-		return
+		return cancel
 	}
 	_ = killTree(p, nil)
 	go func() {
 		if done != nil {
 			defer close(done)
 		}
-		if grace > 0 {
-			time.Sleep(grace)
+		if grace < 0 {
+			grace = 0
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
 		}
 		// Force-kill regardless of liveness — taskkill /F /T on a dead
 		// PID is a harmless ERROR_NOT_FOUND.
 		_ = runTaskkill([]string{"/F", "/T", "/PID", strconv.Itoa(p.Pid)})
 	}()
+	return cancel
 }
 
 // runTaskkill is intentionally lightweight — no stderr capture, no

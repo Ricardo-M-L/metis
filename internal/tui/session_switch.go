@@ -224,6 +224,10 @@ func persistSessionState(store *session.Store, sessionID string, gate *permissio
 	if store == nil || gate == nil || sessionID == "" {
 		return nil
 	}
+	permissionState, err := rtpkg.CapturePermissionModeState(gate, controller)
+	if err != nil {
+		return fmt.Errorf("persist session %s permission state: %w", sessionID, err)
+	}
 	rules := make([]session.SavedRule, 0)
 	for _, rule := range gate.Snapshot() {
 		if rule.Source != "interactive" && !strings.HasPrefix(rule.Source, "session:") {
@@ -233,24 +237,13 @@ func persistSessionState(store *session.Store, sessionID string, gate *permissio
 			Tool: rule.Tool, Match: rule.Match, Verb: int(rule.Verb), Source: rule.Source,
 		})
 	}
-	prePlanMode := ""
-	if gate.Mode() == permission.ModePlan {
-		prePlanMode = string(permission.ModeDefault)
-		if controller != nil {
-			previous, ok := permission.ParseMode(controller.PrePlanMode())
-			if !ok || previous == permission.ModePlan {
-				return fmt.Errorf("persist session %s: invalid pre-plan permission mode %q", sessionID, controller.PrePlanMode())
-			}
-			prePlanMode = string(previous)
-		}
-	}
 	if err := store.WriteHeaderFull(session.Header{
 		ID:               sessionID,
 		Provider:         providerName,
 		Model:            model,
 		System:           system,
-		Mode:             string(gate.Mode()),
-		PrePlanMode:      prePlanMode,
+		Mode:             string(permissionState.Mode),
+		PrePlanMode:      permissionState.PrePlanMode,
 		AlwaysAllow:      rules,
 		ClearAlwaysAllow: len(rules) == 0,
 	}); err != nil {
@@ -289,9 +282,11 @@ func (r *REPL) rebindFreshSession(id string) {
 	if mode == permission.ModePlan {
 		prePlanMode = string(permission.ModeDefault)
 	}
-	r.Loop.SetPrePlanMode(prePlanMode)
-	r.Gate.ResetSessionState(mode, nil)
-	rtpkg.SynchronizeRestoredPermissionState(r.Gate, r.Loop, prePlanMode)
+	r.Gate.ResetSessionStateAndWait(mode, nil, func() {
+		r.Loop.SetPrePlanMode(prePlanMode)
+	}, func() {
+		rtpkg.SynchronizeRestoredPermissionState(r.Gate, r.Loop, prePlanMode)
+	})
 	r.Loop.TimingSink = r.Session.NewTimingRecorder(id).Record
 	r.totalTokens.Reset()
 	if r.SessionSwitch != nil {
@@ -498,7 +493,9 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	}
 	var resumedRules []permission.Rule
 	if restorePermissions && hdr != nil {
-		validatedMode, validatedPrePlan, hasMode, err := rtpkg.ValidateRestoredPermissionState(hdr.Mode, hdr.PrePlanMode, mode)
+		validatedMode, validatedPrePlan, hasMode, err := rtpkg.ValidateRestoredPermissionStateFromSource(
+			hdr.Mode, hdr.PrePlanMode, mode, m.ext.TrustSessionPermissions,
+		)
 		if err != nil {
 			restoreSourceRuntime()
 			return fmt.Errorf("restore permission state for %s: %w", shortID(id), err)
@@ -507,13 +504,15 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 			mode = validatedMode
 			prePlanMode = validatedPrePlan
 		}
-		resumedRules = make([]permission.Rule, 0, len(hdr.AlwaysAllow))
-		for _, rule := range hdr.AlwaysAllow {
-			resumedRules = append(resumedRules, permission.Rule{
-				Tool: rule.Tool, Match: rule.Match,
-				Verb:   permission.Decision(rule.Verb),
-				Source: permission.ResumedSessionSource(rule.Source),
-			})
+		if m.ext.TrustSessionPermissions {
+			resumedRules = make([]permission.Rule, 0, len(hdr.AlwaysAllow))
+			for _, rule := range hdr.AlwaysAllow {
+				resumedRules = append(resumedRules, permission.Rule{
+					Tool: rule.Tool, Match: rule.Match,
+					Verb:   permission.Decision(rule.Verb),
+					Source: permission.ResumedSessionSource(rule.Source),
+				})
+			}
 		}
 	}
 	if err := rtpkg.PreflightRestoredPermissionState(m.ext.Sandbox, mode, prePlanMode); err != nil {
@@ -538,9 +537,11 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	if m.cronSvc != nil {
 		m.cronSvc.ClearEphemeral()
 	}
-	m.loop.SetPrePlanMode(prePlanMode)
-	m.gate.ResetSessionState(mode, resumedRules)
-	rtpkg.SynchronizeRestoredPermissionState(m.gate, m.loop, prePlanMode)
+	m.gate.ResetSessionStateAndWait(mode, resumedRules, func() {
+		m.loop.SetPrePlanMode(prePlanMode)
+	}, func() {
+		rtpkg.SynchronizeRestoredPermissionState(m.gate, m.loop, prePlanMode)
+	})
 
 	if hdr != nil && (hdr.System != "" || hdr.SystemPromptKind == session.SystemPromptKindDefault) {
 		m.loop.System = destinationSystem

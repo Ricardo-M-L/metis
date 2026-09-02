@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/mcp"
 )
@@ -72,10 +73,13 @@ func TestLazyServer_CloseNoOpWhenUnspawned(t *testing.T) {
 
 func TestLazyServerCloseCancelsAndRejectsInFlightSpawn(t *testing.T) {
 	started := make(chan struct{})
+	cancelled := make(chan struct{})
 	release := make(chan struct{})
 	transport := &countingCloseTransport{}
-	srv := NewLazyServer("closing", nil, func(context.Context) (*mcp.Client, error) {
+	srv := NewLazyServer("closing", nil, func(ctx context.Context) (*mcp.Client, error) {
 		close(started)
+		<-ctx.Done()
+		close(cancelled)
 		<-release // Simulate a launcher that returns after Close won the race.
 		return mcp.NewClient(context.Background(), transport), nil
 	})
@@ -83,10 +87,36 @@ func TestLazyServerCloseCancelsAndRejectsInFlightSpawn(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- srv.ensureClient(context.Background()) }()
 	<-started
-	if err := srv.Close(); err != nil {
-		t.Fatal(err)
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- srv.Close() }()
+	<-cancelled
+	select {
+	case err := <-closeDone:
+		close(release)
+		<-done
+		t.Fatalf("Close returned before the in-flight spawn exited: %v", err)
+	case <-time.After(25 * time.Millisecond):
+		// Close must remain joined to the spawn even after cancellation. A late
+		// client owns a process/transport that has to be closed before the
+		// permission-boundary transition may return.
+	}
+	secondCloseDone := make(chan error, 1)
+	go func() { secondCloseDone <- srv.Close() }()
+	select {
+	case err := <-secondCloseDone:
+		close(release)
+		<-closeDone
+		<-done
+		t.Fatalf("concurrent Close returned before the in-flight spawn exited: %v", err)
+	case <-time.After(25 * time.Millisecond):
 	}
 	close(release)
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondCloseDone; err != nil {
+		t.Fatal(err)
+	}
 	if err := <-done; !errors.Is(err, errMCPServerClosed) {
 		t.Fatalf("in-flight spawn after Close returned %v, want server closed", err)
 	}

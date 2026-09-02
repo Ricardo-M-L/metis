@@ -218,6 +218,47 @@ func TestSetMode_ConcurrentCallbacksFinishAtLatestMode(t *testing.T) {
 	}
 }
 
+// A committed mode is not safe to use until its listener has reconciled the
+// runtime posture (sandbox, plan overlay, and related lifecycle state). While
+// that callback drain is in flight, both ordinary and path-aware checks must
+// fail closed instead of authorizing against a half-applied mode.
+func TestResetSessionState_DeniesChecksUntilListenerDrain(t *testing.T) {
+	g := New(ModeFullAccess)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	g.SetModeChangeListener(func(mode Mode) {
+		if mode == ModeBypassPermissions {
+			close(entered)
+			<-release
+		}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		g.ResetSessionState(ModeBypassPermissions, nil)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reset listener did not start")
+	}
+
+	if decision, source := g.Check(context.Background(), "Bash", "echo ok"); decision != DecisionDeny || source != "mode:transition" {
+		t.Fatalf("Check during reset = %v (%s), want deny mode:transition", decision, source)
+	}
+	if decision, source := g.CheckPath(context.Background(), "Read", "/tmp/value", "/tmp/value"); decision != DecisionDeny || source != "mode:transition" {
+		t.Fatalf("CheckPath during reset = %v (%s), want deny mode:transition", decision, source)
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reset did not finish after listener release")
+	}
+}
+
 // TestSetMode_ListenerNoDeadlock — listener fires AFTER releasing the
 // lock so listeners that call back into Gate (e.g., to read current
 // state) don't deadlock. Regression for the "listener-induced

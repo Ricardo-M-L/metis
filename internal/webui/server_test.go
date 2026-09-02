@@ -41,6 +41,29 @@ func (p *activationTestProvider) Stream(context.Context, llm.Request) (llm.Strea
 	return nil, errors.New("stream not used by activation tests")
 }
 
+type noVisionTurnProvider struct {
+	activationTestProvider
+	mu    sync.Mutex
+	calls int
+}
+
+func (*noVisionTurnProvider) VisionCapability() llm.VisionCapability {
+	return llm.VisionUnsupported
+}
+
+func (p *noVisionTurnProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	return nil, errors.New("unsupported image reached provider")
+}
+
+func (p *noVisionTurnProvider) streamCalls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
 type statusTestStream struct {
 	ctx     context.Context
 	started chan struct{}
@@ -1037,6 +1060,80 @@ func TestTurnRequiresRuntimeAndInput(t *testing.T) {
 	}
 }
 
+func TestTurnRejectsImageBeforeMutationWhenProviderDoesNotSupportVision(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &noVisionTurnProvider{activationTestProvider: activationTestProvider{name: "wire", model: "text-only"}}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Model = provider.ModelID()
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{ProviderName: provider.Name()})
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(
+		`{"input":"describe this","images":[{"mediaType":"image/png","data":"aGVsbG8="}]}`,
+	)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("turn status = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rr.Body.String()), "does not support image") {
+		t.Fatalf("turn error does not explain vision capability: %s", rr.Body.String())
+	}
+	if calls := provider.streamCalls(); calls != 0 {
+		t.Fatalf("unsupported image reached provider %d time(s)", calls)
+	}
+	if history := loop.History(); len(history) != 0 {
+		t.Fatalf("rejected image mutated live history: %#v", history)
+	}
+}
+
+func TestTurnChecksImageCapabilityAfterActivatingTargetSession(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(session.Header{
+		ID: "target", Provider: "target-profile", Model: "text-only", System: "target-system", Mode: string(permission.ModeDefault),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceProvider := &activationTestProvider{name: "source-wire", model: "vision-unknown"}
+	targetProvider := &noVisionTurnProvider{activationTestProvider: activationTestProvider{name: "target-wire", model: "text-only"}}
+	loop := agent.NewLoop(sourceProvider, tools.NewRegistry(), permission.New(permission.ModeDefault), nil, "source-system", 2)
+	loop.Model = sourceProvider.ModelID()
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		ProviderName: "source-profile",
+		BuildProvider: func(providerName, model string) (*rtpkg.ProviderBuild, error) {
+			if providerName != "target-profile" || model != "text-only" {
+				t.Fatalf("provider build = %q/%q, want target-profile/text-only", providerName, model)
+			}
+			return &rtpkg.ProviderBuild{Provider: targetProvider, Model: targetProvider.ModelID()}, nil
+		},
+	})
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(
+		`{"sessionId":"target","input":"describe this","images":[{"mediaType":"image/png","data":"aGVsbG8="}]}`,
+	)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("turn status = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rr.Body.String()), "does not support image") {
+		t.Fatalf("turn error does not explain target vision capability: %s", rr.Body.String())
+	}
+	if loop.Provider != targetProvider {
+		t.Fatalf("turn did not activate target provider before capability check: %T", loop.Provider)
+	}
+	if calls := targetProvider.streamCalls(); calls != 0 {
+		t.Fatalf("unsupported target provider received %d stream call(s)", calls)
+	}
+	if history := loop.History(); len(history) != 0 {
+		t.Fatalf("rejected target image mutated live history: %#v", history)
+	}
+}
+
 func TestFailedTurnPersistsDurableSessionStatus(t *testing.T) {
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
@@ -1419,9 +1516,10 @@ func TestActivateSessionRestoresHeaderStateAndRebindsSidecars(t *testing.T) {
 	var buildProviderName, buildModel, switchedID string
 	boundaryCalls := 0
 	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
-		InitialSessionID:    "source",
-		ProviderName:        "source-profile",
-		FreshPermissionMode: permission.ModeAsk,
+		InitialSessionID:        "source",
+		ProviderName:            "source-profile",
+		FreshPermissionMode:     permission.ModeAsk,
+		TrustSessionPermissions: true,
 		BuildProvider: func(providerName, model string) (*rtpkg.ProviderBuild, error) {
 			buildProviderName, buildModel = providerName, model
 			return &rtpkg.ProviderBuild{Provider: targetProvider, Model: targetProvider.model}, nil
@@ -1478,6 +1576,69 @@ func TestActivateSessionRestoresHeaderStateAndRebindsSidecars(t *testing.T) {
 		persistedSource.System != "source-system" || len(persistedSource.AlwaysAllow) != 1 ||
 		persistedSource.AlwaysAllow[0].Tool != "Edit" {
 		t.Fatalf("source session state not persisted before switch: %+v", persistedSource)
+	}
+}
+
+func TestActivateSessionFiltersPermissionsFromUntrustedStore(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderFull(session.Header{
+		ID: "source", Provider: "wire", Model: "model", Mode: string(permission.ModeAsk),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provider := &activationTestProvider{name: "wire", model: "model"}
+	gate := permission.New(permission.ModeAsk)
+	loop := agent.NewLoop(provider, tools.NewRegistry(), gate, nil, "system", 2)
+	loop.Model = "model"
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{
+		InitialSessionID: "source", ProviderName: "wire", FreshPermissionMode: permission.ModeAsk,
+		// TrustSessionPermissions intentionally remains false: this models a
+		// session directory selected by an untrusted project config.
+	})
+
+	tests := []struct {
+		name        string
+		mode        permission.Mode
+		prePlan     string
+		wantMode    permission.Mode
+		wantPrePlan string
+	}{
+		{name: "direct full access", mode: permission.ModeFullAccess, wantMode: permission.ModeAsk},
+		{
+			name: "plan full access lineage", mode: permission.ModePlan,
+			prePlan: string(permission.ModeFullAccess), wantMode: permission.ModePlan,
+			wantPrePlan: string(permission.ModeAsk),
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := fmt.Sprintf("untrusted-target-%d", i)
+			hdr := &session.Header{
+				ID: id, Provider: "wire", Model: "model", System: "system",
+				Mode: string(tt.mode), PrePlanMode: tt.prePlan,
+				AlwaysAllow: []session.SavedRule{{
+					Tool: "Bash", Verb: int(permission.DecisionAllow), Source: "interactive",
+				}},
+			}
+			if err := store.WriteHeaderFull(*hdr); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.activateSession(id, hdr, nil); err != nil {
+				t.Fatal(err)
+			}
+			if got := gate.Mode(); got != tt.wantMode {
+				t.Fatalf("restored mode = %q, want %q", got, tt.wantMode)
+			}
+			if got := loop.PrePlanMode(); got != tt.wantPrePlan {
+				t.Fatalf("restored pre-plan mode = %q, want %q", got, tt.wantPrePlan)
+			}
+			if rules := gate.Snapshot(); len(rules) != 0 {
+				t.Fatalf("untrusted session rules restored: %+v", rules)
+			}
+		})
 	}
 }
 
@@ -1703,6 +1864,49 @@ func TestActivateSessionUsesGateModeAfterListenerDowngrade(t *testing.T) {
 	}
 	if got := loop.PrePlanMode(); got != "" {
 		t.Fatalf("failed-closed switch retained pre-plan lineage %q", got)
+	}
+}
+
+func TestWriteActiveSessionStateWaitsForCompletePermissionSnapshot(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := permission.New(permission.ModeFullAccess)
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, tools.NewRegistry(), gate, nil, "system", 2)
+	s := NewServer("127.0.0.1:0", loop, store)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	transitionDone := make(chan error, 1)
+	go func() {
+		transitionDone <- gate.RunModeTransition(func() error {
+			loop.SetPrePlanMode(string(permission.ModeFullAccess))
+			close(entered)
+			<-release
+			gate.SetMode(permission.ModePlan)
+			loop.SetPlanMode(true)
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission transition did not reach its in-flight snapshot")
+	}
+	time.AfterFunc(100*time.Millisecond, func() { close(release) })
+
+	if err := s.writeActiveSessionState("permission-snapshot", "wire", "model", "", "system", llm.EffortDefault); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-transitionDone; err != nil {
+		t.Fatal(err)
+	}
+	hdr, _, err := store.LoadHeader("permission-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode != string(permission.ModePlan) || hdr.PrePlanMode != string(permission.ModeFullAccess) {
+		t.Fatalf("persisted permission snapshot = mode %q pre-plan %q", hdr.Mode, hdr.PrePlanMode)
 	}
 }
 

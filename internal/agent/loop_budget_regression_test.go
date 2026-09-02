@@ -40,6 +40,16 @@ func textStream(text string) llm.StreamReader {
 	}}
 }
 
+func toolUseStream(id, name, input string) llm.StreamReader {
+	return &loopRegressionStream{events: []llm.StreamEvent{
+		{Type: "tool_use_start", ToolUseID: id, ToolName: name},
+		{Type: "tool_input_delta", ToolUseID: id, InputDelta: input},
+		{Type: "tool_use_stop", ToolUseID: id, InputDelta: input},
+		{Type: "message_delta", StopReason: "tool_use"},
+		{Type: "message_stop"},
+	}}
+}
+
 // gatedRegressionStream lets a test inject steering only after Run is
 // genuinely blocked inside StreamReader.Recv, reproducing the final-token
 // race instead of preloading steer before Run starts.
@@ -156,6 +166,16 @@ func (lowOutputTool) CanUse(context.Context, map[string]any) (tools.Permission, 
 }
 func (lowOutputTool) Execute(context.Context, map[string]any) (*tools.Result, error) {
 	return &tools.Result{Output: "tiny"}, nil
+}
+
+type contractBashTool struct{ lowOutputTool }
+
+func (contractBashTool) Name() string { return "Bash" }
+func (contractBashTool) InputSchema() map[string]any {
+	return map[string]any{
+		"type": "object", "required": []string{"command"},
+		"properties": map[string]any{"command": map[string]any{"type": "string"}},
+	}
 }
 
 func requestContains(req llm.Request, needle string) bool {
@@ -434,11 +454,13 @@ func TestLoopRun_DiscardsArtificialStaleSteerAtRunStart(t *testing.T) {
 func TestLoopRun_ContractTextReentryEmitsAssistantBoundary(t *testing.T) {
 	t.Setenv(contractDisableEnvVar, "0")
 	provider := &queuedStreamProvider{streams: []llm.StreamReader{
+		toolUseStream("bash-risk", "Bash", `{"command":"git push"}`),
 		textStream("implementation complete"),
 		textStream("OVERRIDE CONTRACT: verification does not apply to this fixture"),
 	}}
-	loop := NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
-	loop.contract.highImpactAction = true
+	registry := tools.NewRegistry()
+	registry.Register(contractBashTool{})
+	loop := NewLoop(provider, registry, permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.AppendUser("finish")
 	out := make(chan Event, 64)
 	if err := loop.Run(context.Background(), out); err != nil {
@@ -452,10 +474,13 @@ func TestLoopRun_ContractTextReentryEmitsAssistantBoundary(t *testing.T) {
 			turnEnds++
 		}
 	}
-	if turnEnds != 1 {
-		t.Fatalf("contract text re-entry EventTurnEnd=%d, want 1", turnEnds)
+	// One boundary closes the Bash tool-use assistant segment; the second
+	// closes the model's attempted final text before the contract reminder
+	// re-enters it. The final override ends the Run normally.
+	if turnEnds != 2 {
+		t.Fatalf("contract text re-entry EventTurnEnd=%d, want 2", turnEnds)
 	}
-	if len(provider.capturedRequests()) != 2 {
+	if len(provider.capturedRequests()) != 3 {
 		t.Fatal("contract gate did not re-enter the provider exactly once")
 	}
 }

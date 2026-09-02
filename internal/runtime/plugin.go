@@ -90,30 +90,56 @@ func (r *PluginRegistry) SkillSources() []skills.PluginSkillSource {
 	return out
 }
 
-// Close terminates every spawned MCP server. Safe to call multiple times.
-func (r *PluginRegistry) Close() error {
+// CloseMCPServers terminates and detaches every plugin-contributed MCP
+// connection while preserving plugin metadata and skill sources. A runtime
+// uses this narrower boundary when leaving fullAccess: processes started while
+// the sandbox was disabled must not survive, but file-backed skills remain
+// safe and useful. Reconnecting plugin MCP servers requires a runtime restart.
+func (r *PluginRegistry) CloseMCPServers() error {
+	if r == nil {
+		return nil
+	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	var errs []error
+	servers := make([]*mcptools.Server, 0)
 	for _, p := range r.plugins {
-		for _, server := range p.MCPServers {
-			if server != nil {
-				if err := server.Close(); err != nil {
-					errs = append(errs, err)
-				}
-			}
+		if p == nil {
+			continue
 		}
-		if len(p.MCPServers) == 0 && p.MCP != nil {
-			if err := p.MCP.Close(); err != nil {
+		if len(p.MCPServers) > 0 {
+			servers = append(servers, p.MCPServers...)
+		} else if p.MCP != nil {
+			servers = append(servers, p.MCP)
+		}
+		p.MCP = nil
+		p.MCPServers = nil
+	}
+	r.mu.Unlock()
+
+	var errs []error
+	for _, server := range servers {
+		if server != nil {
+			if err := server.Close(); err != nil {
 				errs = append(errs, err)
 			}
 		}
 	}
-	r.plugins = nil
 	if len(errs) > 0 {
 		return fmt.Errorf("plugin close: %d error(s); first: %w", len(errs), errs[0])
 	}
 	return nil
+}
+
+// Close terminates spawned MCP servers and releases all plugin metadata. Safe
+// to call multiple times.
+func (r *PluginRegistry) Close() error {
+	if r == nil {
+		return nil
+	}
+	err := r.CloseMCPServers()
+	r.mu.Lock()
+	r.plugins = nil
+	r.mu.Unlock()
+	return err
 }
 
 // LoadPlugins scans ~/.metis/plugins/, validates each manifest, spawns any
@@ -164,7 +190,7 @@ func LoadPluginsWithSandbox(ctx context.Context, registry *tools.Registry, manag
 
 // loadOne reads + validates one plugin's manifest, spawns its MCP server
 // (if any), and prefetches its skill files.
-func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.Registry, manager *sandbox.Manager) (*Plugin, error) {
+func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.Registry, manager *sandbox.Manager) (_ *Plugin, retErr error) {
 	manifestPath := filepath.Join(rootDir, "plugin.toml")
 	var m pubplugin.Manifest
 	if _, err := toml.DecodeFile(manifestPath, &m); err != nil {
@@ -175,6 +201,26 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 	}
 
 	p := &Plugin{Manifest: m, RootDir: rootDir}
+	// Until the caller receives p, loadOne owns every MCP handle and tool
+	// namespace it creates. A later server/working-directory/skill failure keeps
+	// the plugin out of PluginRegistry, so the normal registry shutdown path can
+	// never reclaim those resources. Roll the partial load back as one ownership
+	// transaction; the success path transfers ownership by clearing owned.
+	owned := true
+	ownedMCPNamespaces := make([]string, 0, len(m.MCPServers)+1)
+	defer func() {
+		if !owned {
+			return
+		}
+		if cleanupErr := releasePartialPluginMCP(p, registry, ownedMCPNamespaces); cleanupErr != nil {
+			cleanupErr = fmt.Errorf("cleanup partial MCP load: %w", cleanupErr)
+			if retErr == nil {
+				retErr = cleanupErr
+			} else {
+				retErr = errors.Join(retErr, cleanupErr)
+			}
+		}
+	}()
 
 	// Spawn every declared MCP server. The singular form remains the legacy
 	// default; ecosystem adapters use the named list so a Codex package keeps
@@ -210,13 +256,19 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 			WorkingDir: workingDir, EnabledTools: append([]string(nil), spec.EnabledTools...),
 			DisabledTools: append([]string(nil), spec.DisabledTools...),
 		}
+		// Record the namespace before launch. The production launcher registers
+		// tools only after a successful handshake, but this also cleans up a future
+		// launcher that publishes some tools before returning an error.
+		ownedMCPNamespaces = append(ownedMCPNamespaces, entry.Name)
 		srv, err := launchPluginMCPServer(ctx, entry, registry, manager)
+		if srv != nil {
+			p.MCPServers = append(p.MCPServers, srv)
+			if p.MCP == nil {
+				p.MCP = srv
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("mcp server %s: %w", serverName, err)
-		}
-		p.MCPServers = append(p.MCPServers, srv)
-		if p.MCP == nil {
-			p.MCP = srv
 		}
 	}
 
@@ -240,7 +292,53 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 		p.Skills = append(p.Skills, *sk)
 	}
 
+	owned = false
 	return p, nil
+}
+
+func releasePartialPluginMCP(p *Plugin, registry *tools.Registry, namespaces []string) error {
+	// Remove model-visible tools even if closing a transport fails. Otherwise a
+	// failed plugin leaves callable wrappers pointing at an orphaned/closed MCP
+	// client for the remainder of the session.
+	if registry != nil {
+		seenNamespaces := make(map[string]struct{}, len(namespaces))
+		for _, name := range namespaces {
+			if name == "" {
+				continue
+			}
+			if _, seen := seenNamespaces[name]; seen {
+				continue
+			}
+			seenNamespaces[name] = struct{}{}
+			registry.ReplacePrefix("mcp__"+name+"__", nil)
+		}
+	}
+
+	if p == nil {
+		return nil
+	}
+	servers := append([]*mcptools.Server(nil), p.MCPServers...)
+	if len(servers) == 0 && p.MCP != nil {
+		servers = append(servers, p.MCP)
+	}
+	p.MCP = nil
+	p.MCPServers = nil
+
+	var cleanupErr error
+	seenServers := make(map[*mcptools.Server]struct{}, len(servers))
+	for _, server := range servers {
+		if server == nil {
+			continue
+		}
+		if _, seen := seenServers[server]; seen {
+			continue
+		}
+		seenServers[server] = struct{}{}
+		if err := server.Close(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close MCP server %q: %w", server.Name(), err))
+		}
+	}
+	return cleanupErr
 }
 
 // validateManifest enforces the must-haves: manifest_version supported,

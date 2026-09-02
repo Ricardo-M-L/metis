@@ -125,6 +125,44 @@ func TestWorkflowTool_ProcessGuardPreflightsAllSteps(t *testing.T) {
 	}
 }
 
+func TestWorkflowTool_FullAccessExecutesProcessGuardCommand(t *testing.T) {
+	w := NewWorkflow(permission.New(permission.ModeFullAccess), nil)
+	in := map[string]any{
+		"operation": "run",
+		"steps": inlineSteps(
+			// Signal 0 only probes the workflow shell's existence. shellguard
+			// classifies the raw kill command, but executing it is harmless.
+			[2]string{"probe", "kill -0 $$"},
+			[2]string{"after", "printf full-access-workflow"},
+		),
+	}
+
+	if got, source := w.CanUse(context.Background(), in); got != tools.PermissionAllow {
+		t.Fatalf("CanUse = %v (%q), want fullAccess allow", got, source)
+	}
+	res, err := w.Execute(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.IsError || !strings.Contains(res.Output, "[ok] probe") || !strings.Contains(res.Output, "full-access-workflow") {
+		t.Fatalf("Execute = %+v, want guarded command and following step to run", res)
+	}
+}
+
+func TestWorkflowTool_FullAccessStillValidatesInlineWorkflow(t *testing.T) {
+	w := NewWorkflow(permission.New(permission.ModeFullAccess), nil)
+	res, err := w.Execute(context.Background(), map[string]any{
+		"operation": "run",
+		"steps":     inlineSteps([2]string{"invalid", "   "}),
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !res.IsError || !strings.Contains(res.Output, "empty command") {
+		t.Fatalf("Execute = %+v, want argument validation error", res)
+	}
+}
+
 func TestWorkflowTool_NamedUnavailableWithoutStore(t *testing.T) {
 	w := NewWorkflow(permission.New(permission.ModeBypass), nil)
 	res, _ := w.Execute(context.Background(), map[string]any{"operation": "run_named", "name": "x"})

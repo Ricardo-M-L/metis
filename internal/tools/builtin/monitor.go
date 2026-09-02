@@ -158,8 +158,11 @@ func (m Monitor) CanUse(ctx context.Context, in map[string]any) (tools.Permissio
 	if cmd == "" {
 		return tools.PermissionDeny, "Monitor: empty command"
 	}
-	if err := shellguard.Check(cmd); err != nil {
-		return tools.PermissionDeny, "Monitor: " + err.Error()
+	fullAccess := m.gate != nil && m.gate.Mode() == permission.ModeFullAccess
+	if !fullAccess {
+		if err := shellguard.Check(cmd); err != nil {
+			return tools.PermissionDeny, "Monitor: " + err.Error()
+		}
 	}
 	if m.gate != nil {
 		decision, src := m.gate.Check(ctx, "Bash", cmd)
@@ -182,8 +185,11 @@ func (m Monitor) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 	if cmd == "" {
 		return &tools.Result{Output: "Monitor: command required", IsError: true}, nil
 	}
-	if err := shellguard.Check(cmd); err != nil {
-		return &tools.Result{Output: "Monitor: " + err.Error(), IsError: true}, nil
+	fullAccess := m.gate != nil && m.gate.Mode() == permission.ModeFullAccess
+	if !fullAccess {
+		if err := shellguard.Check(cmd); err != nil {
+			return &tools.Result{Output: "Monitor: " + err.Error(), IsError: true}, nil
+		}
 	}
 	if desc == "" {
 		desc = "(no description)"

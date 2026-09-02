@@ -130,7 +130,7 @@ func TestAgentTool_Schema(t *testing.T) {
 	props, _ := schema["properties"].(map[string]any)
 	modeSchema, _ := props["permission_mode"].(map[string]any)
 	gotModes, _ := modeSchema["enum"].([]string)
-	wantModes := []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+	wantModes := []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "fullAccess"}
 	if strings.Join(gotModes, ",") != strings.Join(wantModes, ",") {
 		t.Errorf("permission_mode enum = %v, want %v", gotModes, wantModes)
 	}

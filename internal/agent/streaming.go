@@ -104,7 +104,11 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 				blocks[tool.blockIndex].ToolInput = argsunwrap.Unwrap(parsed)
 			} else {
 				validInput = false
-				blocks[tool.blockIndex].ToolInput = map[string]any{"_raw": tool.json}
+				// Keep only the parse-failure fact. Storing tool.json here used to
+				// put arbitrary malformed bytes (including credentials) into the
+				// assistant transcript before dispatch had a chance to reject them.
+				blocks[tool.blockIndex].ToolInput = map[string]any{}
+				blocks[tool.blockIndex].ToolInputMalformed = true
 			}
 		}
 		// Never surface provider argument fragments directly: credentials may be
@@ -152,6 +156,17 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		}
 		return nil
 	}
+	partialBlocks := func() []llm.ContentBlock {
+		flushThinking()
+		flushText()
+		partial := blocks[:0]
+		for _, block := range blocks {
+			if block.Type != "tool_use" {
+				partial = append(partial, block)
+			}
+		}
+		return partial
+	}
 	for {
 		ev, err := s.Recv()
 		eof := errors.Is(err, io.EOF)
@@ -160,7 +175,10 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 		// value before honoring EOF so a terminal message_stop does not lose its
 		// stop reason or provider-authoritative usage.
 		if err != nil && !eof {
-			return nil, "", nil, err
+			// Preserve content already delivered to the user. Incomplete tool
+			// calls are deliberately discarded: replaying an assistant tool_use
+			// without a matching result would corrupt the next provider request.
+			return partialBlocks(), stopReas, &usage, err
 		}
 		switch ev.Type {
 		case "message_start":
@@ -203,10 +221,16 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// chronological ordering [thinking, redacted_thinking, ...].
 			flushThinking()
 			blocks = append(blocks, llm.ContentBlock{
-				Type: "redacted_thinking",
-				Data: ev.TextDelta, // base64 cipher text
+				Type:         "redacted_thinking",
+				Data:         ev.TextDelta, // base64 cipher text
+				ProviderHint: ev.ProviderHint,
 			})
 			emit(ctx, out, Event{Kind: EventRedactedThinking, TextDelta: ev.TextDelta})
+		case "provider_state":
+			// Opaque, non-presentational state needed by transports such as
+			// Responses API previous_response_id. It is persisted in canonical
+			// history but never shown to the user or sent to unrelated providers.
+			blocks = append(blocks, llm.ContentBlock{Type: "provider_state", ProviderHint: ev.ProviderHint})
 		case "tool_use_start":
 			// Same chronology argument as text_delta — a tool call
 			// means reasoning has resolved into an action; persist
@@ -309,7 +333,10 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			flushTools()
 			return blocks, stopReas, &usage, nil
 		case "error":
-			return nil, "", nil, ev.Err
+			if ev.Err == nil {
+				ev.Err = errors.New("provider stream failed")
+			}
+			return partialBlocks(), stopReas, &usage, ev.Err
 		}
 		if eof {
 			flushThinking()

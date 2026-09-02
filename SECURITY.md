@@ -47,8 +47,10 @@ In scope (we want to know):
 
 Out of scope (please don't report):
 
-- The user voluntarily setting `--mode bypassPermissions` and running unsafe commands —
-  that mode is documented as "you are on your own"
+- The user voluntarily setting `--mode fullAccess` (or
+  `--dangerously-bypass-approvals-and-sandbox`) and allowing a command to run
+  with the host account's access — that mode explicitly disables approvals and
+  the process sandbox
 - Issues in upstream LLM provider APIs
 - Denial of service via giant inputs (Metis is a local CLI; use ulimit)
 - Sensitive data the user themselves wrote to a config file in plain text

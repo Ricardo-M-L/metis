@@ -84,6 +84,20 @@ func TestParseFlags_DangerouslySkipPerms(t *testing.T) {
 	}
 }
 
+func TestParseFlags_DangerouslyBypassApprovalsAndSandbox(t *testing.T) {
+	for _, arg := range []string{"--dangerously-bypass-approvals-and-sandbox"} {
+		t.Run(arg, func(t *testing.T) {
+			flags, _, err := parseFlags([]string{arg})
+			if err != nil {
+				t.Fatalf("parse %s: %v", arg, err)
+			}
+			if !flags.dangerouslyBypassApprovalsAndSandbox {
+				t.Fatalf("%s did not select fullAccess", arg)
+			}
+		})
+	}
+}
+
 func TestParseFlags_Scope(t *testing.T) {
 	flags, _, err := parseFlags([]string{"-s", "user"})
 	if err != nil {

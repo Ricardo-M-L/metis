@@ -7,9 +7,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [0.4.38] - 2026-08-30
+## [0.4.38] - 2026-09-02
+
+### Added
+
+- Added an explicit `fullAccess` permission mode for trusted, unattended work.
+  It has dedicated CLI and Desktop controls, a two-step interactive warning,
+  and a strict teardown boundary when returning to a sandboxed mode.
+- Added first-class OpenAI Responses support for image input, structured
+  outputs, local or provider-managed conversation state, encrypted reasoning
+  continuation, prompt-cache affinity, and supported provider-hosted tools.
+- Added schema-backed tool argument validation, malformed-call recovery, and
+  risk-based implementation/verification contracts for delegated agents.
 
 ### Changed
+
+- Replaced the Desktop icon with a high-contrast METIS mark on a flat pure
+  white plate and regenerated the Windows multi-resolution icon from it.
+- `ToolSearch` can now return matching built-in tools, while keyword research
+  prefers `WebSearch` and URL readers remain a fetch/browse fallback.
+- Long foreground Bash commands move into the managed job pool instead of
+  encouraging deliberate sleeps or polling; job, sub-agent, MCP, and Computer
+  Use ownership now follows permission and session lifecycle boundaries.
 
 - Tag builds now stage only verified CLI, Linux Desktop, and Windows Desktop
   assets in a draft Release. The CI-only ad-hoc-signed macOS archive is kept as
@@ -20,12 +39,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Fixed Responses-compatible gateway failures around stale
+  `previous_response_id` recovery, tool call IDs, refusal/error events,
+  explicit text-only models, and replay of unsupported encrypted reasoning.
+- Kept volatile runtime/retrieval context at the request tail for local replay
+  and in replaceable per-request instructions for provider-managed Responses
+  state, preserving cache prefixes without accumulating stale dynamic rules.
+- Fixed concurrent permission transitions, session switches, background-agent
+  completion, and Unix process-tree cleanup so work admitted by an older
+  authority cannot escape a later boundary.
+- Fixed Desktop/Web UI provider activation, cross-session image capability
+  checks, permission controls, turn history/status rendering, and several TUI
+  confirmation and usage-layout regressions.
 - Published releases now trigger independent Linux and Windows anonymous
   install smoke tests plus macOS checksum, version, Developer ID, notarization,
   staple, and Gatekeeper validation.
 - CI statically rejects release workflow changes that auto-publish tag builds,
   stage the temporary macOS artifact, or remove the immutable-release trust
   gates.
+
+### Security
+
+- `fullAccess` cannot be silently enabled by untrusted project configuration;
+  credential-bearing files remain protected in sandboxed unattended modes.
+- Tool failures and subprocess output are normalized and redacted before they
+  can be persisted or returned to a model.
 
 ## [0.4.35] - 2026-08-28
 

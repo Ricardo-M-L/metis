@@ -800,6 +800,8 @@ func modeIcon(mode string) (glyph string, c color.Color) {
 		// red to telegraph "this one is dangerous". Matches the source
 		// exactly now that we removed the old ⏩ stand-in.
 		return "⏵⏵", lipgloss.Color("#e57373")
+	case "fullAccess":
+		return "!!", lipgloss.Color("#ff5252")
 	case "plan":
 		return "⏸ ", lipgloss.Color("#81c784")
 	case "dontAsk":

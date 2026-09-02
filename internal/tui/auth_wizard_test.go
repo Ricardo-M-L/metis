@@ -368,7 +368,7 @@ func TestAuthWizardPickerDoesNotOfferIncompleteCompatPresets(t *testing.T) {
 }
 
 func TestAuthWizardCustomTransportPickerSupportsAllTransports(t *testing.T) {
-	wants := []string{"openai_chat", "anthropic_messages", "gemini_native"}
+	wants := []string{"openai_chat", "openai_responses", "anthropic_messages", "gemini_native"}
 	for index, want := range wants {
 		t.Run(want, func(t *testing.T) {
 			m := newAuthModel()

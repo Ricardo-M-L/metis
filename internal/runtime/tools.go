@@ -166,6 +166,10 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 			DisallowedTools: prof.DisallowedTools,
 		}, nil
 	})
+	// Publish the same built-in/project/user profile catalog as a JSON Schema
+	// enum. InputSchema is rebuilt by the agent loop, so adding a custom profile
+	// becomes visible on the next provider request without restarting METIS.
+	agentTool = agentTool.WithProfileNames(AvailableAgentProfileNames)
 	reg.Register(agentTool)
 	// SubAgent reader tools (G.1, 2026-05-12) — SubAgentList /
 	// SubAgentOutput / SubAgentStop. Mirrors AttachJobsRegistry for

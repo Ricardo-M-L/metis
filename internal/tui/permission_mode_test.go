@@ -1,12 +1,55 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
+
+func TestApplyModelPermissionModeRejectsActiveTurnWithoutChangingPosture(t *testing.T) {
+	if !sandbox.Available() {
+		t.Skipf("sandbox unavailable: %v", sandbox.Doctor().Err)
+	}
+	manager, err := sandbox.NewManagerWithOptions(sandbox.Options{Mode: "off", TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	m := &Model{
+		gate: permission.New(permission.ModeDefault),
+		loop: &agent.Loop{},
+		ext:  ExternalHooks{Sandbox: manager},
+	}
+	if err := applyModelPermissionMode(m, permission.ModeFullAccess); err != nil {
+		t.Fatalf("enter fullAccess test posture: %v", err)
+	}
+	m.turnActive = true
+
+	beforeMode := m.gate.Mode()
+	beforePlan := m.loop.IsPlanMode()
+	beforePrePlan := m.loop.PrePlanMode()
+	beforeSandbox := manager.State()
+	err = applyModelPermissionMode(m, permission.ModeDefault)
+	if err == nil || !strings.Contains(err.Error(), "running turn is active") {
+		t.Fatalf("active-turn permission transition error = %v, want explicit running-turn refusal", err)
+	}
+	if got := m.gate.Mode(); got != beforeMode {
+		t.Fatalf("active-turn refusal changed gate mode: got %q, want %q", got, beforeMode)
+	}
+	if got := m.loop.IsPlanMode(); got != beforePlan {
+		t.Fatalf("active-turn refusal changed plan state: got %v, want %v", got, beforePlan)
+	}
+	if got := m.loop.PrePlanMode(); got != beforePrePlan {
+		t.Fatalf("active-turn refusal changed pre-plan lineage: got %q, want %q", got, beforePrePlan)
+	}
+	if got := manager.State(); got != beforeSandbox {
+		t.Fatalf("active-turn refusal changed sandbox posture: got %+v, want %+v", got, beforeSandbox)
+	}
+}
 
 func TestApplyPermissionModeDoesNotReuseStaleBypassPlanLineage(t *testing.T) {
 	gate := permission.New(permission.ModeBypassPermissions)

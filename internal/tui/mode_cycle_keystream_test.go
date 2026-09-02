@@ -89,6 +89,45 @@ func TestModeCycle_FullKeystreamWalk(t *testing.T) {
 	}
 }
 
+func TestModeCycle_FromFullAccessReturnsToDefault(t *testing.T) {
+	m := modeCycleTestModel(t)
+	if err := applyModelPermissionMode(m, permission.ModeFullAccess); err != nil {
+		t.Fatal(err)
+	}
+	if !m.ext.Sandbox.State().FullAccessRequired {
+		t.Fatal("test setup did not enter fullAccess sandbox posture")
+	}
+
+	pressShiftTab(t, m)
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("Shift+Tab from fullAccess = %q, want safe default", got)
+	}
+	if m.ext.Sandbox.State().FullAccessRequired {
+		t.Fatal("leaving fullAccess through Shift+Tab left the sandbox bypass active")
+	}
+}
+
+func TestModeCycle_TurnActivePreservesFullAccessPosture(t *testing.T) {
+	m := modeCycleTestModel(t)
+	if err := applyModelPermissionMode(m, permission.ModeFullAccess); err != nil {
+		t.Fatal(err)
+	}
+	m.turnActive = true
+	beforeSandbox := m.ext.Sandbox.State()
+
+	pressShiftTab(t, m)
+
+	if got := m.gate.Mode(); got != permission.ModeFullAccess {
+		t.Fatalf("active-turn Shift+Tab changed mode to %q, want fullAccess", got)
+	}
+	if got := m.ext.Sandbox.State(); got != beforeSandbox {
+		t.Fatalf("active-turn Shift+Tab changed sandbox posture: got %+v, want %+v", got, beforeSandbox)
+	}
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "running turn is active") {
+		t.Fatalf("active-turn Shift+Tab did not surface a refusal: %+v", m.messages)
+	}
+}
+
 // TestModeCycle_HintsReflectEachStep — every Shift+Tab must produce
 // a renderHints output that names the new mode (or, for ask, omits
 // the badge entirely per claude-code parity). Pins the integration

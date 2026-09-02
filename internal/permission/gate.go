@@ -1,6 +1,7 @@
 // Package permission implements cascading permission rules inspired by
 // Claude Code's settings precedence (CLI > local > project > user > policy).
-// Modes mirror Claude Code's five public permission modes.
+// Modes include Claude Code's public permission modes plus METIS fullAccess,
+// the Codex-style no-approval/no-sandbox posture.
 package permission
 
 import (
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,6 +21,7 @@ const (
 	ModeDefault           Mode = "default"           // allow read-only tools; ask before state changes
 	ModeAcceptEdits       Mode = "acceptEdits"       // auto-allow edits; ask for other state changes
 	ModeBypassPermissions Mode = "bypassPermissions" // approve tool calls (dangerous; explicit opt-in)
+	ModeFullAccess        Mode = "fullAccess"        // no approval prompts and no process sandbox
 	ModePlan              Mode = "plan"              // read-only exploration until the plan is approved
 	ModeDontAsk           Mode = "dontAsk"           // allow what is already allowed; deny instead of prompting
 
@@ -31,15 +34,15 @@ const (
 	ModeDeny   = ModeDontAsk
 )
 
-// Modes is the canonical five-mode public set, in the same order Claude
-// Code exposes in settings. Shift+Tab intentionally uses CycleModes below:
-// dontAsk exists for headless/policy workflows but Claude does not put it in
-// the interactive cycle.
+// Modes is the canonical public set. Shift+Tab intentionally uses CycleModes
+// below: dontAsk and fullAccess remain explicit selections so an accidental
+// keypress cannot enter either non-interactive or host-unrestricted posture.
 var Modes = []Mode{
 	ModeAcceptEdits,
 	ModeBypassPermissions,
 	ModeDefault,
 	ModeDontAsk,
+	ModeFullAccess,
 	ModePlan,
 }
 
@@ -62,6 +65,8 @@ func ParseMode(raw string) (Mode, bool) {
 		return ModeAcceptEdits, true
 	case "bypassPermissions", "bypass":
 		return ModeBypassPermissions, true
+	case "fullAccess", "full":
+		return ModeFullAccess, true
 	case "plan":
 		return ModePlan, true
 	case "dontAsk", "deny":
@@ -210,6 +215,26 @@ type Gate struct {
 	mu    sync.RWMutex
 	mode  Mode
 	rules []Rule
+	// modeTransitionMu serializes complete runtime-owned transitions (Gate,
+	// sandbox posture, and plan controller). Direct SetMode calls remain
+	// non-blocking behind an in-flight listener; they supersede the requested
+	// mode and are observed by the transition owner after the listener drain.
+	modeTransitionMu sync.RWMutex
+	// modeTransitionWriters closes the declaration-to-Lock race for TryRLock:
+	// once a writer announces intent, a new tool batch must not barge in even
+	// if it reaches TryRLock just before the writer goroutine calls Lock.
+	modeTransitionWriters atomic.Int64
+	// transitionHolds keeps Check fail-closed across work that lives outside
+	// this package, such as applying the matching sandbox posture. The
+	// notification bit separately covers plain SetMode/ResetSessionState calls
+	// until every coalesced listener callback has finished.
+	transitionHolds      int
+	modeNotifyTransition bool
+	// transitionEpoch invalidates dispatcher work prepared under an older
+	// permission posture. A current transition bit alone is insufficient: a
+	// mode change can start and finish while a slow hook or CanUse call is
+	// running, leaving that call with a stale ALLOW from the previous mode.
+	transitionEpoch uint64
 	// nextScopedRuleID gives each temporary rule set an identity that can be
 	// removed precisely. A simple AppendRules + PopRules pair is unsafe across
 	// an agent turn: an interactive "always allow" may be appended while the
@@ -227,6 +252,7 @@ type Gate struct {
 	modeNotifyMu      sync.Mutex
 	modeNotifyRunning bool
 	modeNotifyPending bool
+	modeNotifySettled chan struct{}
 	// remembered "ask once, apply forever this session"
 	memoAllow map[string]bool
 
@@ -494,26 +520,149 @@ func (g *Gate) Clone() *Gate {
 
 func (g *Gate) SetMode(m Mode) {
 	m = CanonicalMode(string(m))
-	g.mu.Lock()
-	g.mode = m
-	g.mu.Unlock()
-	g.notifyModeChange()
+	g.commitModeChange(func() {
+		g.mode = m
+	})
 }
 
-// notifyModeChange delivers the latest committed mode in commit order. Calls
-// made while another callback is running are coalesced; every sequential call
-// still fires synchronously, while concurrent/re-entrant updates are guaranteed
-// to finish with the listener observing the final Gate.mode.
-func (g *Gate) notifyModeChange() {
-	g.modeNotifyMu.Lock()
-	if g.modeNotifyRunning {
-		g.modeNotifyPending = true
-		g.modeNotifyMu.Unlock()
+// SetModeAndWait commits m and waits until the ordered listener drain has
+// settled. It is intended for the runtime transition coordinator, which must
+// not apply a fallback sandbox posture based on a mode that a concurrent or
+// re-entrant listener already superseded. Ordinary callers should use SetMode:
+// waiting from inside a mode listener would wait on the listener itself.
+func (g *Gate) SetModeAndWait(m Mode) {
+	if g == nil {
 		return
 	}
+	m = CanonicalMode(string(m))
+	settled := g.commitModeChange(func() {
+		g.mode = m
+	})
+	<-settled
+}
+
+// RunModeTransition serializes a complete Gate-owned permission transition
+// and keeps tool checks fail-closed until fn has also reconciled external
+// state such as the process sandbox. SetMode remains independently usable and
+// may supersede fn's requested mode; fn must verify Gate.Mode after waiting for
+// its listener drain. RunModeTransition is intentionally not re-entrant: code
+// already running inside fn must use the raw SetMode/SetModeAndWait primitives
+// instead of trying to acquire the write-side coordinator again.
+func (g *Gate) RunModeTransition(fn func() error) error {
+	if g == nil {
+		if fn == nil {
+			return nil
+		}
+		return fn()
+	}
+	g.modeTransitionWriters.Add(1)
+	g.modeTransitionMu.Lock()
+	g.modeTransitionWriters.Add(-1)
+	defer g.modeTransitionMu.Unlock()
+
+	g.mu.Lock()
+	g.transitionHolds++
+	g.transitionEpoch++
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.transitionHolds--
+		g.mu.Unlock()
+	}()
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
+
+// TryAcquireToolDispatchLease admits one complete dispatcher batch on the
+// read side of the permission-transition barrier. RunModeTransition owns the
+// write side. TryRLock is deliberate: if a transition is active or merely
+// queued behind an older batch, a new batch fails closed immediately instead
+// of reader-barging ahead of the waiting writer.
+//
+// The caller must hold the returned lease through schema, hooks, CanUse, ASK,
+// Execute, and PostToolUse. A nil Gate is admitted for reduced embedders.
+func (g *Gate) TryAcquireToolDispatchLease() (release func(), allowed bool, reason string) {
+	if g == nil {
+		return func() {}, true, ""
+	}
+	if g.modeTransitionWriters.Load() > 0 {
+		return nil, false, "mode:transition"
+	}
+	if !g.modeTransitionMu.TryRLock() {
+		return nil, false, "mode:transition"
+	}
+	if g.modeTransitionWriters.Load() > 0 {
+		g.modeTransitionMu.RUnlock()
+		return nil, false, "mode:transition"
+	}
+	g.mu.RLock()
+	transitioning := g.modeNotifyTransition || g.transitionHolds > 0
+	g.mu.RUnlock()
+	if transitioning {
+		g.modeTransitionMu.RUnlock()
+		return nil, false, "mode:transition"
+	}
+	return g.modeTransitionMu.RUnlock, true, ""
+}
+
+// commitModeChange atomically marks the Gate transitional and mutates its mode
+// state under g.mu, then joins or starts the ordered callback drain. Registering
+// the commit under modeNotifyMu closes the old race where a new mode could land
+// after the drainer decided it was idle but before it cleared the fail-closed
+// marker.
+func (g *Gate) commitModeChange(commit func()) <-chan struct{} {
+	g.modeNotifyMu.Lock()
+	g.mu.Lock()
+	g.modeNotifyTransition = true
+	g.transitionEpoch++
+	commit()
+	g.mu.Unlock()
+	if g.modeNotifyRunning {
+		g.modeNotifyPending = true
+		settled := g.modeNotifySettled
+		g.modeNotifyMu.Unlock()
+		return settled
+	}
 	g.modeNotifyRunning = true
+	g.modeNotifySettled = make(chan struct{})
+	settled := g.modeNotifySettled
 	g.modeNotifyMu.Unlock()
 
+	g.drainModeChanges()
+	return settled
+}
+
+// drainModeChanges delivers the latest committed mode in commit order. Calls
+// made while another callback is running are coalesced; every sequential call
+// still fires synchronously, while concurrent/re-entrant updates return
+// promptly and are guaranteed to finish with the listener observing the final
+// Gate.mode. The transition guard is cleared only while modeNotifyMu excludes
+// a new unregistered commit.
+func (g *Gate) drainModeChanges() {
+	// A runtime listener is trusted composition code, but a panic must not leave
+	// every future tool dispatch denied and every SetModeAndWait blocked forever.
+	// Restore the notifier invariants, wake all callers joined to this drain, and
+	// then re-panic so the caller's normal crash boundary still observes the
+	// original failure. Keep the admission marker fail-closed: the listener may
+	// have panicked before it reconciled an external sandbox, so admitting tools
+	// against the newly committed Gate mode could expose a torn posture. A later
+	// successful transition notifies the listener again and clears the marker.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			g.modeNotifyMu.Lock()
+			g.modeNotifyPending = false
+			g.modeNotifyRunning = false
+			settled := g.modeNotifySettled
+			g.modeNotifySettled = nil
+			if settled != nil {
+				close(settled)
+			}
+			g.modeNotifyMu.Unlock()
+			panic(recovered)
+		}
+	}()
 	for {
 		g.mu.RLock()
 		mode := g.mode
@@ -529,7 +678,13 @@ func (g *Gate) notifyModeChange() {
 			g.modeNotifyMu.Unlock()
 			continue
 		}
+		g.mu.Lock()
+		g.modeNotifyTransition = false
+		g.mu.Unlock()
 		g.modeNotifyRunning = false
+		settled := g.modeNotifySettled
+		g.modeNotifySettled = nil
+		close(settled)
 		g.modeNotifyMu.Unlock()
 		return
 	}
@@ -546,33 +701,95 @@ func (g *Gate) notifyModeChange() {
 // discard them again. The replacement is committed under one lock, preventing
 // a concurrent permission check from observing a half-cleared rule stack.
 func (g *Gate) ResetSessionState(mode Mode, resumedRules []Rule) {
+	_ = g.resetSessionState(mode, resumedRules)
+}
+
+// ResetSessionStateAndWait performs the same atomic session-state replacement
+// as ResetSessionState and additionally waits for the shared ordered listener
+// drain to settle. Session activation boundaries should use this form before
+// exposing the destination session to tool dispatch. beforeCommit runs under
+// the same transition coordinator immediately before
+// the Gate commit; callers use it to install plan lineage that the mode
+// listener needs while reconciling a restored Plan posture. afterSettled runs
+// under that same coordinator after the complete listener drain has settled,
+// but before the write-side transition lease is released. This lets callers
+// repair controller state after a listener fail-closed downgrade without
+// exposing a torn Gate/lineage snapshot to a queued persistence writer.
+//
+// Ordinary callers retain ResetSessionState's compatibility behavior: a reset
+// that joins an already running listener drain returns promptly. Like
+// SetModeAndWait, this method must not be called from inside the mode listener
+// itself.
+func (g *Gate) ResetSessionStateAndWait(mode Mode, resumedRules []Rule, beforeCommit, afterSettled func()) {
 	if g == nil {
 		return
 	}
-	g.mu.Lock()
-	kept := g.rules[:0]
-	for _, rule := range g.rules {
-		if isSessionRuleSource(rule.Source) {
-			continue
+	_ = g.RunModeTransition(func() error {
+		if beforeCommit != nil {
+			beforeCommit()
 		}
-		kept = append(kept, rule)
-	}
-	// Detach from the old backing array before appending destination rules.
-	// Besides making the ownership boundary explicit, this prevents a caller's
-	// later mutation of resumedRules from changing the live Gate.
-	g.rules = append([]Rule(nil), kept...)
-	g.rules = append(g.rules, resumedRules...)
-	mode = CanonicalMode(string(mode))
-	g.mode = mode
-	g.memoAllow = make(map[string]bool)
-	g.consecutiveDenials = 0
-	g.totalDenials = 0
-	g.denialFallbackUntil = time.Time{}
-	g.mu.Unlock()
+		settled := g.resetSessionState(mode, resumedRules)
+		if settled != nil {
+			<-settled
+		}
+		if afterSettled != nil {
+			afterSettled()
+		}
+		return nil
+	})
+}
 
-	// Match SetMode's ordered callback contract. The listener runs outside mu,
-	// so it may safely inspect Gate state or request another mode change.
-	g.notifyModeChange()
+func (g *Gate) resetSessionState(mode Mode, resumedRules []Rule) <-chan struct{} {
+	if g == nil {
+		return nil
+	}
+	mode = CanonicalMode(string(mode))
+	return g.commitModeChange(func() {
+		kept := g.rules[:0]
+		for _, rule := range g.rules {
+			if isSessionRuleSource(rule.Source) {
+				continue
+			}
+			kept = append(kept, rule)
+		}
+		// Detach from the old backing array before appending destination rules.
+		// Besides making the ownership boundary explicit, this prevents a caller's
+		// later mutation of resumedRules from changing the live Gate.
+		g.rules = append([]Rule(nil), kept...)
+		g.rules = append(g.rules, resumedRules...)
+		g.mode = mode
+		g.memoAllow = make(map[string]bool)
+		g.consecutiveDenials = 0
+		g.totalDenials = 0
+		g.denialFallbackUntil = time.Time{}
+	})
+}
+
+// ToolDispatchAdmission returns a stable permission-transition epoch and
+// whether a dispatcher may currently enter an untrusted tool boundary. A
+// dispatcher must capture the epoch before consulting tool schema or hooks,
+// then require the same epoch before CanUse and Execute. This rejects both an
+// active transition and an ALLOW prepared under a transition that started and
+// settled while an earlier boundary was running.
+//
+// The nil receiver is intentionally admitted for reduced embedders that do not
+// install a Gate.
+func (g *Gate) ToolDispatchAdmission() (epoch uint64, allowed bool, reason string) {
+	if g == nil {
+		return 0, true, ""
+	}
+	if g.modeTransitionWriters.Load() > 0 {
+		g.mu.RLock()
+		epoch = g.transitionEpoch
+		g.mu.RUnlock()
+		return epoch, false, "mode:transition"
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.modeNotifyTransition || g.transitionHolds > 0 {
+		return g.transitionEpoch, false, "mode:transition"
+	}
+	return g.transitionEpoch, true, ""
 }
 
 // isSessionRuleSource identifies grants whose lifetime is one interactive
@@ -742,13 +959,15 @@ func resolvePathThroughExistingParents(path string) (abs, resolved string, ok bo
 func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope bool) (decision Decision, source string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	// bypassPermissions is an unattended posture: absolutely no decision may
-	// escape as ASK. Ordinary calls reach the explicit bypass ALLOW branch
-	// below; ASK here therefore means a higher-priority policy, secret/safety
-	// boundary, or denial-breaker result. Preserve its diagnostic source but
-	// fail closed without surfacing a modal prompt.
+	if g.modeNotifyTransition || g.transitionHolds > 0 {
+		return DecisionDeny, "mode:transition"
+	}
+	// Both unattended postures guarantee that no decision escapes as ASK.
+	// bypassPermissions converts secret/safety prompts to DENY; fullAccess skips
+	// those implicit boundaries below but still honors an explicit ask/deny rule
+	// as a silent refusal.
 	defer func() {
-		if g.mode == ModeBypassPermissions && decision == DecisionAsk {
+		if (g.mode == ModeBypassPermissions || g.mode == ModeFullAccess) && decision == DecisionAsk {
 			decision = DecisionDeny
 		}
 	}()
@@ -856,6 +1075,16 @@ func (g *Gate) check(_ context.Context, tool, stringInput string, outOfScope boo
 			return DecisionDeny, "mode:dontAsk:" + source
 		}
 		return decision, source
+	}
+
+	// fullAccess is the Codex-style combination of approval=never and an
+	// unrestricted process sandbox. It deliberately skips METIS's implicit
+	// protected-path, credential-read, workspace-scope, dangerous-pattern, and
+	// classifier checks. Explicit policy/user rules above and tool/hook errors
+	// still apply; this mode changes authorization, not argument validity.
+	if g.mode == ModeFullAccess {
+		g.recordAllow()
+		return DecisionAllow, "mode:fullAccess"
 	}
 
 	// Safety-check paths: bypass-immune via path pattern. Applies only

@@ -144,9 +144,11 @@ func ApplyPreparedResume(prepared *PreparedResume, loop *agent.Loop,
 				Source: permission.ResumedSessionSource(r.Source),
 			})
 		}
-		loop.SetPrePlanMode(prePlan)
-		gate.ResetSessionState(mode, resumedRules)
-		SynchronizeRestoredPermissionState(gate, loop, prePlan)
+		gate.ResetSessionStateAndWait(mode, resumedRules, func() {
+			loop.SetPrePlanMode(prePlan)
+		}, func() {
+			SynchronizeRestoredPermissionState(gate, loop, prePlan)
+		})
 		if hdr.WorkDir != "" {
 			if cwd, _ := os.Getwd(); cwd != "" && cwd != hdr.WorkDir {
 				fmt.Fprintf(warnOut,

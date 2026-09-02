@@ -3,6 +3,7 @@ package webui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -245,19 +246,35 @@ func (s *Server) applyPermissionMode(mode permission.Mode) error {
 	if s.setPermissionMode != nil {
 		return s.setPermissionMode(mode)
 	}
-	previous := s.loop.Gate.Mode()
-	if mode == permission.ModePlan {
-		if previous != permission.ModePlan {
-			s.loop.SetPrePlanMode(string(previous))
+	return s.loop.Gate.RunModeTransition(func() error {
+		previous := s.loop.Gate.Mode()
+		if mode == permission.ModePlan {
+			if previous != permission.ModePlan {
+				s.loop.SetPrePlanMode(string(previous))
+			}
+			s.loop.Gate.SetModeAndWait(mode)
+			if committed := s.loop.Gate.Mode(); committed != mode {
+				if committed != permission.ModePlan {
+					s.loop.SetPrePlanMode("")
+				}
+				s.loop.SetPlanMode(committed == permission.ModePlan)
+				return fmt.Errorf("permission mode %s was superseded by %s", mode, committed)
+			}
+			s.loop.SetPlanMode(true)
+			return nil
 		}
-		s.loop.Gate.SetMode(mode)
-		s.loop.SetPlanMode(true)
+		if previous == permission.ModePlan {
+			s.loop.SetPrePlanMode("")
+		}
+		s.loop.Gate.SetModeAndWait(mode)
+		if committed := s.loop.Gate.Mode(); committed != mode {
+			s.loop.SetPlanMode(committed == permission.ModePlan)
+			if committed != permission.ModePlan {
+				s.loop.SetPrePlanMode("")
+			}
+			return fmt.Errorf("permission mode %s was superseded by %s", mode, committed)
+		}
+		s.loop.SetPlanMode(false)
 		return nil
-	}
-	s.loop.Gate.SetMode(mode)
-	s.loop.SetPlanMode(false)
-	if previous == permission.ModePlan {
-		s.loop.SetPrePlanMode("")
-	}
-	return nil
+	})
 }

@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -47,7 +48,7 @@ type AgentProfile struct {
 	Model           string   // empty = inherit
 	Tools           []string // allowlist; empty = inherit (no filter)
 	DisallowedTools []string // blocklist applied after allowlist
-	PermissionMode  string   // default | acceptEdits | plan | dontAsk | bypassPermissions; empty = inherit
+	PermissionMode  string   // default | acceptEdits | plan | dontAsk | bypassPermissions | fullAccess; empty = inherit
 	Effort          string   // low | medium | high; empty = inherit
 	MaxTurns        int      // 0 = inherit
 	InitialPrompt   string   // prepended to first user message
@@ -59,6 +60,56 @@ type AgentProfile struct {
 	// production runtime restores it; durable state now flows through the
 	// unified memory.Repository and provenance-aware session recall.
 	MemorySnapshot string
+	// Source identifies which trust layer supplied this profile. It is runtime
+	// provenance, not frontmatter: project profiles may customize behavior but
+	// must not silently elevate a top-level runtime to fullAccess before the
+	// workspace trust gate has accepted that checkout.
+	Source AgentProfileSource
+}
+
+type AgentProfileSource string
+
+const (
+	AgentProfileSourceProject AgentProfileSource = "project"
+	AgentProfileSourceUser    AgentProfileSource = "user"
+	AgentProfileSourceBuiltin AgentProfileSource = "builtin"
+)
+
+// AvailableAgentProfileNames returns every profile slug that the runtime can
+// resolve: bundled profiles plus project and user-defined markdown profiles.
+// The result is sorted and deduplicated so the generated tool schema is stable
+// across requests (important for provider-side prompt caching).
+func AvailableAgentProfileNames() []string {
+	seen := make(map[string]struct{})
+	for _, name := range BuiltinProfileNames() {
+		if validAgentName(name) {
+			seen[name] = struct{}{}
+		}
+	}
+	for _, dir := range []string{
+		filepath.Join(".metis", "agents"),
+		filepath.Join(config.Home(), "agents"),
+	} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+				continue
+			}
+			name := strings.TrimSuffix(entry.Name(), ".md")
+			if validAgentName(name) {
+				seen[name] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for name := range seen {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // LoadAgentProfile resolves NAME to a markdown file and parses it.
@@ -81,37 +132,46 @@ func LoadAgentProfile(name string) (*AgentProfile, error) {
 	if !validAgentName(name) {
 		return nil, fmt.Errorf("invalid agent name %q (use [a-zA-Z0-9._-])", name)
 	}
-	candidates := []string{
-		filepath.Join(".metis", "agents", name+".md"),
-		filepath.Join(config.Home(), "agents", name+".md"),
+	candidates := []struct {
+		path   string
+		source AgentProfileSource
+	}{
+		{path: filepath.Join(".metis", "agents", name+".md"), source: AgentProfileSourceProject},
+		{path: filepath.Join(config.Home(), "agents", name+".md"), source: AgentProfileSourceUser},
 	}
-	for _, p := range candidates {
-		b, err := os.ReadFile(p)
+	for _, candidate := range candidates {
+		b, err := os.ReadFile(candidate.path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("read %s: %w", p, err)
+			return nil, fmt.Errorf("read %s: %w", candidate.path, err)
 		}
 		prof, err := parseAgentProfile(string(b))
 		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", p, err)
+			return nil, fmt.Errorf("parse %s: %w", candidate.path, err)
 		}
 		if prof.Name == "" {
 			prof.Name = name
 		}
+		prof.Source = candidate.source
 		return prof, nil
 	}
 	// Fallback to bundled (G.7). Not finding a user file is the
 	// common case — most users only customize a couple of profiles
 	// and rely on the bundled set for the rest.
 	if prof, err := LoadBuiltinProfile(name); err == nil {
+		prof.Source = AgentProfileSourceBuiltin
 		return prof, nil
 	} else if !errors.Is(err, ErrBuiltinProfileNotFound) {
 		// Bundled profile exists but parse failed — surface that.
 		return nil, err
 	}
-	return nil, fmt.Errorf("agent profile %q not found (looked in %s, then bundled)", name, strings.Join(candidates, ", "))
+	paths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		paths = append(paths, candidate.path)
+	}
+	return nil, fmt.Errorf("agent profile %q not found (looked in %s, then bundled)", name, strings.Join(paths, ", "))
 }
 
 func validAgentName(s string) bool {

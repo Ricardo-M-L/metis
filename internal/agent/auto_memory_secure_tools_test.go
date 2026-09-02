@@ -136,6 +136,101 @@ func TestSecureAutoMemoryEditValidatesCompleteReplacement(t *testing.T) {
 	}
 }
 
+func TestSecureAutoMemoryEditDirectExecuteRequiresTypedNewButAllowsEmptyDeletion(t *testing.T) {
+	const originalMemo = "---\nname: Style\ndescription: Reply style\ntype: feedback\n---\n\nKeep replies concise. Remove obsolete note.\n"
+	tests := []struct {
+		name       string
+		newField   any
+		includeNew bool
+		wantErr    string
+	}{
+		{name: "missing new", wantErr: "new is required"},
+		{name: "wrong type new", newField: 42, includeNew: true, wantErr: "new must be a string"},
+		{name: "explicit empty deletes", newField: "", includeNew: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "feedback_style.md")
+			if err := os.WriteFile(path, []byte(originalMemo), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reg := tools.NewRegistry()
+			reg.Register(autoMemoryEditTool{})
+			edit, _ := secureAutoMemoryRegistry(reg, root, AutoMemorySource{}, nil).Get("Edit")
+			input := map[string]any{
+				"path": path,
+				"old":  " Remove obsolete note.",
+			}
+			if tt.includeNew {
+				input["new"] = tt.newField
+			}
+
+			_, err := edit.Execute(context.Background(), input)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Execute error = %v, want %q", err, tt.wantErr)
+				}
+				raw, readErr := os.ReadFile(path)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(raw) != originalMemo {
+					t.Fatalf("rejected direct Edit changed file: %q", raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("explicit empty replacement: %v", err)
+			}
+			raw, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			_, body, parseErr := memdir.ParseFile(raw)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if got := strings.TrimSpace(string(body)); got != "Keep replies concise." {
+				t.Fatalf("empty replacement did not delete old text: %q", got)
+			}
+		})
+	}
+}
+
+func TestSecureAutoMemoryEditRejectsInvalidNewBeforeCreatingRoot(t *testing.T) {
+	tests := []struct {
+		name     string
+		newField any
+		include  bool
+	}{
+		{name: "missing"},
+		{name: "wrong type", newField: 42, include: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "memory-root-must-not-be-created")
+			reg := tools.NewRegistry()
+			reg.Register(autoMemoryEditTool{})
+			edit, _ := secureAutoMemoryRegistry(reg, root, AutoMemorySource{}, nil).Get("Edit")
+			input := map[string]any{
+				"path": filepath.Join(root, "feedback.md"),
+				"old":  "obsolete",
+			}
+			if tt.include {
+				input["new"] = tt.newField
+			}
+
+			if _, err := edit.Execute(context.Background(), input); err == nil {
+				t.Fatal("invalid new unexpectedly succeeded")
+			}
+			if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid new created memory root before rejection: %v", err)
+			}
+		})
+	}
+}
+
 func TestSecureAutoMemoryEditUsesBoundedPinnedRead(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "oversize.md")

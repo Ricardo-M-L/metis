@@ -337,7 +337,7 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		// A broad project Grep must not accidentally surface .env/package
 		// registry/cloud credentials merely because the caller named the parent
 		// directory rather than the sensitive file itself.
-		if permission.IsSecretReadPath(actualPath) {
+		if (g.gate == nil || g.gate.Mode() != permission.ModeFullAccess) && permission.IsSecretReadPath(actualPath) {
 			credentialFilesSkipped++
 			return nil
 		}

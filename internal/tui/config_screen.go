@@ -43,7 +43,7 @@ func (m *Model) configSettingsSnapshot() []screen.ConfigSetting {
 	}
 
 	settings := []screen.ConfigSetting{
-		{Key: "permission.mode", Label: "Permission mode", Description: "Default tool approval policy", Value: permissionValue, EffectiveValue: permissionValue, Options: []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}},
+		{Key: "permission.mode", Label: "Permission mode", Description: "Default tool approval policy (use /permissions for fullAccess)", Value: permissionValue, EffectiveValue: permissionValue, Options: []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}},
 		{Key: "ui.thinking_display", Label: "Thinking display", Description: "Show, summarize, or hide provider reasoning", Value: configuredThinkingDisplay(running), EffectiveValue: m.thinkingDisplay, Options: []string{"show", "auto", "hide"}},
 		{Key: "ui.permission_timeout_seconds", Label: "Permission timeout", Description: "Seconds before an unanswered prompt denies (next launch)", Value: strconv.Itoa(configured.UI.PermissionTimeoutSeconds), EffectiveValue: strconv.Itoa(running.UI.PermissionTimeoutSeconds), RestartRequired: true},
 		{Key: "session.auto_compact_threshold", Label: "Auto-compact threshold", Description: "Context fraction that triggers compaction on next launch", Value: strconv.FormatFloat(configured.Session.AutoCompactThreshold, 'g', -1, 64), EffectiveValue: strconv.FormatFloat(running.Session.AutoCompactThreshold, 'g', -1, 64), RestartRequired: true},

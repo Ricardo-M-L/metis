@@ -278,6 +278,89 @@ func TestSession_ImportPreferredID(t *testing.T) {
 	}
 }
 
+func TestSession_ImportStripsPersistedPermissionState(t *testing.T) {
+	src, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.WriteHeaderFull(Header{
+		ID:               "external",
+		CreatedAt:        time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
+		Provider:         "openai",
+		Model:            "gpt-test",
+		System:           "keep this custom system prompt",
+		SystemPromptKind: SystemPromptKindCustom,
+		WorkDir:          "/tmp/imported-project",
+		Mode:             "plan",
+		PrePlanMode:      "fullAccess",
+		Effort:           "high",
+		Preset:           "custom-preset",
+		AlwaysAllow: []SavedRule{{
+			Tool:   "Bash",
+			Match:  "*",
+			Verb:   1,
+			Source: "interactive",
+		}},
+		ClearAlwaysAllow: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.AppendMessage("external", llm.Message{
+		Role:    llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: "text", Text: "preserve me"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var exported bytes.Buffer
+	if err := src.Export("external", &exported); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	importedID, err := dst.Import(&exported, "sanitized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, msgs, err := dst.Load(importedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode != "" || hdr.PrePlanMode != "" || len(hdr.AlwaysAllow) != 0 || hdr.ClearAlwaysAllow {
+		t.Fatalf("import retained permission state: mode=%q pre_plan_mode=%q always_allow=%+v clear_always_allow=%v",
+			hdr.Mode, hdr.PrePlanMode, hdr.AlwaysAllow, hdr.ClearAlwaysAllow)
+	}
+	if hdr.Provider != "openai" || hdr.Model != "gpt-test" ||
+		hdr.System != "keep this custom system prompt" || hdr.SystemPromptKind != SystemPromptKindCustom ||
+		hdr.WorkDir != "/tmp/imported-project" || hdr.Effort != "high" || hdr.Preset != "custom-preset" {
+		t.Fatalf("import lost ordinary session metadata: %+v", hdr)
+	}
+	if len(msgs) != 1 || msgs[0].Content[0].Text != "preserve me" {
+		t.Fatalf("import lost conversation content: %+v", msgs)
+	}
+}
+
+func TestSession_ImportStripsDirectFullAccessMode(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := `{"type":"header","header":{"id":"external","created_at":"2026-09-02T12:00:00Z","model":"gpt-test","mode":"fullAccess","pre_plan_mode":"bypassPermissions","always_allow":[{"tool":"Bash","match":"*","verb":1}],"clear_always_allow":true}}` + "\n"
+	importedID, err := store.Import(strings.NewReader(input), "direct-full-access")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, _, err := store.LoadHeader(importedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode != "" || hdr.PrePlanMode != "" || len(hdr.AlwaysAllow) != 0 || hdr.ClearAlwaysAllow {
+		t.Fatalf("import retained direct authority: %+v", hdr)
+	}
+}
+
 func TestSession_ImportRejectsExistingID(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewStore(dir)

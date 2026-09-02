@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // MaxSchemaRetries bounds the correction turns after invalid output.
@@ -57,6 +58,20 @@ func NewOutputSchemaEnforcer(path string) (*OutputSchemaEnforcer, error) {
 func (e *OutputSchemaEnforcer) Instruction() string {
 	return "<system-reminder>Your FINAL message must be a single JSON value conforming to this JSON Schema — no prose, no markdown fences, just the JSON:\n" +
 		e.raw + "\n</system-reminder>"
+}
+
+// ResponseFormat exposes the same contract to providers that support native
+// JSON Schema output. The prompt instruction and local validator remain in
+// place as a compatibility and correctness fallback.
+func (e *OutputSchemaEnforcer) ResponseFormat() *provider.ResponseFormat {
+	if e == nil {
+		return nil
+	}
+	return &provider.ResponseFormat{
+		Name:       "metis_output",
+		JSONSchema: e.schema,
+		Strict:     true,
+	}
 }
 
 // RetryMessage tells the model exactly what failed validation.

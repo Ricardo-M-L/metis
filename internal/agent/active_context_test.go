@@ -234,10 +234,10 @@ func TestContextFallbackUsesNativeVisionAllowanceInsteadOfBase64Tokens(t *testin
 		},
 	}}
 
-	if pressure := loop.EstimateRequestContextTokens(nil); pressure < 500_000 {
-		t.Fatalf("compaction pressure lost conservative wire guard: %d", pressure)
-	}
 	want := estimateActiveHistoryTokens(loop.History())
+	if pressure := loop.EstimateRequestContextTokens(nil); pressure != want {
+		t.Fatalf("request pressure=%d, want native vision estimate %d", pressure, want)
+	}
 	if got := loop.EstimateContextTokens(); got != want {
 		t.Fatalf("active fallback=%d, want native vision estimate %d", got, want)
 	}

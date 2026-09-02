@@ -365,11 +365,28 @@ func TestComposerSuppressesRootHorizontalScrollAndExplainsPermissionModes(t *tes
 	for _, want := range []string{
 		"dontAsk: 'Never prompt: allow pre-approved and read-only work, deny the rest'",
 		"bypassPermissions: 'Auto-approve ordinary tool calls; critical destructive checks remain'",
+		"fullAccess: 'Run without approval prompts or process sandboxing; unrestricted file and network access'",
 		"dontAsk: '从不弹窗：只执行已允许和只读操作，其余直接拒绝'",
 		"bypassPermissions: '普通工具调用自动执行，严重破坏性操作仍会拦截'",
+		"fullAccess: '不弹出审批且关闭进程沙箱，可访问任意文件和网络'",
+		"if (mode === 'fullAccess' && approvalMode !== 'fullAccess')",
+		"confirmFullAccessMode(trigger)",
+		"role=\"alertdialog\"",
+		"Full Access is saved as the default permission mode until you change it.",
+		"\\u5b8c\\u5168\\u8bbf\\u95ee\\u4f1a\\u4fdd\\u5b58\\u4e3a\\u9ed8\\u8ba4\\u6743\\u9650\\u6a21\\u5f0f",
+		"if (key === 'permission.mode')",
+		"await setPermissionMode(value, el)",
 	} {
 		if !strings.Contains(chat, want) {
 			t.Fatalf("chat.js missing accurate permission explanation %q", want)
+		}
+	}
+	if strings.Contains(chat, "window.confirm") {
+		t.Fatal("permission mode changes still rely on window.confirm, which is unreliable in the embedded WebView")
+	}
+	for _, want := range []string{".full-access-confirm-warning {", ".composer-action-confirm.danger"} {
+		if !strings.Contains(style, want) {
+			t.Fatalf("style.css missing in-app Full Access confirmation styling %q", want)
 		}
 	}
 }

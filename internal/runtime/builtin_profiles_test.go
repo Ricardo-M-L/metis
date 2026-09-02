@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -99,6 +100,20 @@ func TestBuiltinProfile_GeneralHasNoToolFilter(t *testing.T) {
 	}
 	if len(prof.Tools) != 0 {
 		t.Errorf("general profile should have empty Tools (inherit); got %v", prof.Tools)
+	}
+	if strings.Contains(prof.SystemPrompt, "Never wait with `sleep`") {
+		t.Fatal("general profile still tells the model to reject one-time waits before Bash can redirect them")
+	}
+	for _, want := range []string{
+		"issue it once",
+		"completion notification",
+		"Do not retry with a shorter sleep",
+		"native structured tool-call interface",
+		"text is not execution",
+	} {
+		if !strings.Contains(prof.SystemPrompt, want) {
+			t.Fatalf("general profile is missing wait-redirection guidance %q", want)
+		}
 	}
 }
 

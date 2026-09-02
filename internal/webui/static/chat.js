@@ -2364,6 +2364,7 @@ const COMPOSER_COMMANDS = [
   { name: '/acceptEdits', label: 'Accept edits', hint: 'Allow file edits; ask for other state changes', category: 'Mode' },
   { name: '/dontAsk', label: 'Do not ask', hint: 'Deny actions that would require approval', category: 'Mode' },
   { name: '/bypassPermissions', label: 'Bypass permissions', hint: 'Run without approval prompts — use with care', category: 'Mode' },
+  { name: '/fullAccess', label: 'Full access', hint: 'Disable approval prompts and the process sandbox', category: 'Mode' },
   { name: '/model', label: 'Choose model', hint: 'Switch the model used by this session', category: 'Model' },
   { name: '/effort', label: 'Reasoning effort', hint: 'Choose default, low, medium, or high', category: 'Model' },
   { name: '/providers', label: 'Model providers', hint: 'Open provider configuration', category: 'Model' },
@@ -2406,6 +2407,7 @@ let commandMatches = [];
 let commandSelection = 0;
 let commandTotalMatches = 0;
 let composerActionDialog = null;
+let fullAccessConfirmDialog = null;
 
 function composerActionIcon(action) {
   const paths = {
@@ -2649,6 +2651,8 @@ async function executeComposerCommand(text) {
     case '/acceptedits': await setPermissionMode('acceptEdits'); break;
     case '/dontask': await setPermissionMode('dontAsk'); break;
     case '/bypasspermissions': await setPermissionMode('bypassPermissions'); break;
+    case '/fullaccess':
+    case '/full': await setPermissionMode('fullAccess'); break;
     case '/model': toggleModelMenu(); break;
     case '/effort':
       if (input) await chooseEffort(input.toLowerCase());
@@ -2876,14 +2880,79 @@ async function createComposerGoal(objective, priority) {
 
 function normalizedPermissionMode(value) {
   const key = String(value || '').trim().replace(/[\s_-]/g, '').toLowerCase();
-  return ({ default: 'default', ask: 'default', acceptedits: 'acceptEdits', plan: 'plan', dontask: 'dontAsk', bypass: 'bypassPermissions', bypasspermissions: 'bypassPermissions' })[key] || '';
+  return ({ default: 'default', ask: 'default', acceptedits: 'acceptEdits', plan: 'plan', dontask: 'dontAsk', bypass: 'bypassPermissions', bypasspermissions: 'bypassPermissions', full: 'fullAccess', fullaccess: 'fullAccess' })[key] || '';
 }
 
-async function setPermissionMode(value) {
+function closeFullAccessConfirmDialog(accepted) {
+  if (!fullAccessConfirmDialog) return;
+  const state = fullAccessConfirmDialog;
+  fullAccessConfirmDialog = null;
+  state.overlay.remove();
+  state.resolve(Boolean(accepted));
+  requestAnimationFrame(() => {
+    if (state.trigger && state.trigger.isConnected) state.trigger.focus();
+  });
+}
+
+function fullAccessConfirmDialogKeydown(event) {
+  if (!fullAccessConfirmDialog) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeFullAccessConfirmDialog(false);
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = Array.from(fullAccessConfirmDialog.overlay.querySelectorAll('button:not(:disabled)'));
+  if (!focusable.length) return;
+  const first = focusable[0], last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function confirmFullAccessMode(trigger) {
+  if (fullAccessConfirmDialog) return fullAccessConfirmDialog.promise;
+  const overlay = document.createElement('div');
+  overlay.className = 'composer-action-overlay full-access-confirm-overlay';
+  overlay.innerHTML = '<form class="composer-action-dialog full-access-confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="fullAccessConfirmTitle" aria-describedby="fullAccessConfirmDescription">' +
+    '<div class="composer-action-heading"><span class="composer-action-symbol full-access-confirm-symbol">!</span><div><h2 id="fullAccessConfirmTitle">' + uiText('Enable Full Access?', '\u542f\u7528\u5b8c\u5168\u8bbf\u95ee\uff1f') + '</h2><p id="fullAccessConfirmDescription">' + uiText('METIS will run without approval prompts or process sandboxing and may access any file or the network.', 'METIS \u5c06\u4e0d\u518d\u5f39\u51fa\u5ba1\u6279\uff0c\u4e5f\u4e0d\u4f7f\u7528\u8fdb\u7a0b\u6c99\u7bb1\uff0c\u5e76\u53ef\u4ee5\u8bbf\u95ee\u4efb\u610f\u6587\u4ef6\u548c\u7f51\u7edc\u3002') + '</p></div></div>' +
+    '<div class="full-access-confirm-warning"><strong>' + uiText('This setting persists', '\u8be5\u8bbe\u7f6e\u4f1a\u6301\u4e45\u4fdd\u5b58') + '</strong><span>' + uiText('Full Access is saved as the default permission mode until you change it.', '\u5b8c\u5168\u8bbf\u95ee\u4f1a\u4fdd\u5b58\u4e3a\u9ed8\u8ba4\u6743\u9650\u6a21\u5f0f\uff0c\u76f4\u5230\u4f60\u518d\u6b21\u4fee\u6539\u3002') + '</span></div>' +
+    '<div class="composer-action-buttons"><button type="button" class="full-access-confirm-cancel">' + uiText('Cancel', '\u53d6\u6d88') + '</button><button type="submit" class="composer-action-confirm danger">' + uiText('Enable Full Access', '\u542f\u7528\u5b8c\u5168\u8bbf\u95ee') + '</button></div></form>';
+  document.body.appendChild(overlay);
+  let resolveDialog;
+  const promise = new Promise(resolve => { resolveDialog = resolve; });
+  fullAccessConfirmDialog = {
+    overlay,
+    promise,
+    resolve: resolveDialog,
+    trigger: trigger || document.activeElement
+  };
+  overlay.querySelector('.full-access-confirm-cancel').addEventListener('click', () => closeFullAccessConfirmDialog(false));
+  overlay.querySelector('form').addEventListener('submit', event => {
+    event.preventDefault();
+    closeFullAccessConfirmDialog(true);
+  });
+  overlay.addEventListener('click', event => {
+    if (event.target === overlay) closeFullAccessConfirmDialog(false);
+  });
+  overlay.addEventListener('keydown', fullAccessConfirmDialogKeydown);
+  requestAnimationFrame(() => overlay.querySelector('.full-access-confirm-cancel').focus());
+  return promise;
+}
+
+async function setPermissionMode(value, trigger) {
   const mode = normalizedPermissionMode(value);
   if (!mode) {
     showToast(uiText('Unknown permission mode.', '\u672a\u77e5\u7684\u6743\u9650\u6a21\u5f0f\u3002'));
     return false;
+  }
+  if (mode === 'fullAccess' && approvalMode !== 'fullAccess') {
+    const accepted = await confirmFullAccessMode(trigger);
+    if (!accepted) return null;
   }
   try {
     const res = await fetch('/api/settings', {
@@ -2917,7 +2986,7 @@ function composerActionDialogMarkup(kind) {
       '<label class="composer-action-field"><span>' + uiText('Priority', '\u4f18\u5148\u7ea7') + '</span><select id="composerActionPriority"><option value="high">' + uiText('High', '\u9ad8') + '</option><option value="medium" selected>' + uiText('Medium', '\u4e2d') + '</option><option value="low">' + uiText('Low', '\u4f4e') + '</option></select></label>';
   }
   if (kind === 'permission') {
-    const modes = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
+    const modes = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions', 'fullAccess'];
     const labels = document.documentElement.lang === 'zh-CN' ? PERMISSION_LABELS_ZH : PERMISSION_LABELS;
     const descs = document.documentElement.lang === 'zh-CN' ? PERMISSION_DESCS_ZH : PERMISSION_DESCS;
     return '<div class="composer-action-heading"><span class="composer-action-symbol">' + composerActionIcon('permission') + '</span><div><h2 id="composerActionTitle">' + uiText('Permission mode', '\u6743\u9650\u6a21\u5f0f') + '</h2><p id="composerActionDescription">' + uiText('Choose what METIS may execute without asking.', '\u9009\u62e9 METIS \u54ea\u4e9b\u64cd\u4f5c\u53ef\u4ee5\u4e0d\u8be2\u95ee\u76f4\u63a5\u6267\u884c\u3002') + '</p></div></div><div class="composer-permission-options">' + modes.map(mode =>
@@ -3005,6 +3074,11 @@ async function confirmComposerAction(event) {
   else {
     const selected = state.overlay.querySelector('input[name="composerPermission"]:checked');
     ok = await setPermissionMode(selected ? selected.value : approvalMode);
+  }
+  if (ok === null) {
+    state.pending = false;
+    buttons.forEach(button => { button.disabled = false; });
+    return;
   }
   if (ok) {
     closeComposerActionDialog(true);
@@ -3117,7 +3191,7 @@ async function switchModel(provider, model) {
 }
 
 async function toggleApproval() {
-  const modes = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
+  const modes = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions', 'fullAccess'];
   const next = modes[(modes.indexOf(approvalMode) + 1) % modes.length];
   await setPermissionMode(next);
 }
@@ -3308,6 +3382,7 @@ const PERMISSION_LABELS = {
   plan: 'Plan Mode',
   dontAsk: "Don't Ask",
   bypassPermissions: 'Bypass Permissions',
+  fullAccess: 'Full Access',
 };
 const PERMISSION_DESCS = {
   default: 'Allow read-only work; ask before changes',
@@ -3315,9 +3390,10 @@ const PERMISSION_DESCS = {
   plan: 'Explore and plan first; no changes without approval',
   dontAsk: 'Never prompt: allow pre-approved and read-only work, deny the rest',
   bypassPermissions: 'Auto-approve ordinary tool calls; critical destructive checks remain',
+  fullAccess: 'Run without approval prompts or process sandboxing; unrestricted file and network access',
 };
 const PERMISSION_LABELS_ZH = {
-  default: '默认确认', acceptEdits: '自动接受编辑', plan: '计划模式', dontAsk: '不询问', bypassPermissions: '跳过权限检查',
+  default: '默认确认', acceptEdits: '自动接受编辑', plan: '计划模式', dontAsk: '不询问', bypassPermissions: '跳过权限检查', fullAccess: '完全访问',
 };
 const PERMISSION_DESCS_ZH = {
   default: '只读操作直接执行，修改前询问',
@@ -3325,6 +3401,7 @@ const PERMISSION_DESCS_ZH = {
   plan: '先探索和规划，未经确认不修改',
   dontAsk: '从不弹窗：只执行已允许和只读操作，其余直接拒绝',
   bypassPermissions: '普通工具调用自动执行，严重破坏性操作仍会拦截',
+  fullAccess: '不弹出审批且关闭进程沙箱，可访问任意文件和网络',
 };
 
 function syncApprovalChip(mode) {
@@ -3449,6 +3526,7 @@ function renderProvidersTab() {
       <label>${uiText('Provider ID', '提供商 ID')}<input id="providerId" required pattern="[a-z0-9][a-z0-9_-]*" placeholder="my-provider" autocomplete="username"></label>
       <label>${uiText('Transport', '传输协议')}<select id="providerTransport" required>
         <option value="openai_chat">OpenAI Chat</option>
+        <option value="openai_responses">OpenAI Responses</option>
         <option value="anthropic_messages">Anthropic Messages</option>
         <option value="gemini_native">Gemini Native</option>
       </select></label>
@@ -4242,17 +4320,22 @@ async function saveSettingValue(key, value) {
   }
 }
 
-function chooseEnum(el) {
+async function chooseEnum(el) {
   if (el.classList.contains('locked')) return;
   const key = el.dataset.key;
   const value = el.dataset.value;
+  if (key === 'permission.mode') {
+    await setPermissionMode(value, el);
+    renderSettingsTab();
+    return;
+  }
   document.querySelectorAll('.radio-card[data-key="' + escAttr(key) + '"]').forEach(c => {
     c.classList.remove('selected');
     c.setAttribute('aria-pressed', 'false');
   });
   el.classList.add('selected');
   el.setAttribute('aria-pressed', 'true');
-  saveSettingValue(key, value);
+  await saveSettingValue(key, value);
 }
 
 function saveSetting(input) {

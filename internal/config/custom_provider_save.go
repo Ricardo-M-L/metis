@@ -197,7 +197,7 @@ type userSettingSpec struct {
 }
 
 var editableUserSettings = map[string]userSettingSpec{
-	"permission.mode":                     {table: "permission", field: "mode", kind: userSettingString, validate: oneOf("default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")},
+	"permission.mode":                     {table: "permission", field: "mode", kind: userSettingString, validate: oneOf("default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "fullAccess")},
 	"ui.theme":                            {table: "ui", field: "theme", kind: userSettingString, validate: oneOf("auto", "dark", "light", "dark-daltonized", "nord", "solarized-dark")},
 	"ui.markdown":                         {table: "ui", field: "markdown", kind: userSettingBool},
 	"ui.show_tokens":                      {table: "ui", field: "show_tokens", kind: userSettingBool},
@@ -653,7 +653,7 @@ func validateCustomProviderSpec(spec CustomProviderSpec) error {
 		return fmt.Errorf("custom provider id %q conflicts with a built-in provider", spec.ID)
 	}
 	switch spec.Transport {
-	case "openai_chat", "anthropic_messages", "gemini_native":
+	case "openai_chat", "openai_responses", "anthropic_messages", "gemini_native":
 	default:
 		return fmt.Errorf("unsupported custom provider transport %q", spec.Transport)
 	}

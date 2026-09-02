@@ -38,6 +38,8 @@ func TestFallbackVisionCapability(t *testing.T) {
 		{"kimi-vl-thinking", true},
 		{"moonshot-v1-vision-preview", true},
 		{"glm-5.1", true},
+		{"glm-5v-turbo", true},
+		{"glm-4.6v", true},
 		{"glm-4v-plus", true},
 		{"glm-4v-flash", true},
 		{"qwen-vl-max", true},
@@ -53,6 +55,8 @@ func TestFallbackVisionCapability(t *testing.T) {
 		{"deepseek-chat", false},
 		{"ark-code-latest", false},
 		{"kimi-k1.5", false},
+		{"glm-5.2", false},
+		{"glm-5.3", false},
 		{"glm-4-flash", false},
 		// minimax-m* routes via the anthropic transport, not openai — keep false here.
 		{"minimax-m2.7", false},
@@ -75,8 +79,8 @@ func TestCatalogFactPrecedesBroadFallback(t *testing.T) {
 	if got := visionCapabilityWithCatalog("glm-5.1", "glm-5.1", cli); got != provider.VisionUnsupported {
 		t.Fatalf("catalog text-only fact = %v, want VisionUnsupported", got)
 	}
-	if got := visionCapabilityWithCatalog("glm-5.2", "glm-5.2", cli); got != provider.VisionSupported {
-		t.Fatalf("catalog miss should use offline fallback; got %v", got)
+	if got := visionCapabilityWithCatalog("glm-5.2", "glm-5.2", cli); got != provider.VisionUnsupported {
+		t.Fatalf("catalog miss should use confirmed text-only fallback; got %v", got)
 	}
 }
 

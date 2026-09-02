@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
@@ -108,6 +109,49 @@ func TestPermissionSettingKeepsPlanGateAndLoopInSync(t *testing.T) {
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewBufferString(`{"changes":[{"key":"ui.thinking_display","value":"show"}]}`)))
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"ui.thinking_display"`)) {
 		t.Fatalf("thinking display = %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPermissionSettingRefusesWhileTurnRunsWithoutBlockingOtherSettings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	gate := permission.New(permission.ModeDefault)
+	loop := agent.NewLoop(&activationTestProvider{name: "wire", model: "model"}, tools.NewRegistry(), gate, nil, "system", 2)
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store)
+	h := s.handler()
+
+	s.runMu.Lock()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewBufferString(`{"changes":[{"key":"permission.mode","value":"acceptEdits"}]}`)))
+	if rr.Code != http.StatusConflict {
+		s.runMu.Unlock()
+		t.Fatalf("permission save while turn runs = %d, want 409: %s", rr.Code, rr.Body.String())
+	}
+	if gate.Mode() != permission.ModeDefault {
+		s.runMu.Unlock()
+		t.Fatalf("busy permission save changed Gate to %q", gate.Mode())
+	}
+
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewBufferString(`{"changes":[{"key":"ui.theme","value":"nord"}]}`)))
+	s.runMu.Unlock()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("non-permission save while turn runs = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+
+	cfg, _, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Permission.Mode != string(permission.ModeDefault) {
+		t.Fatalf("busy permission save persisted mode %q", cfg.Permission.Mode)
+	}
+	if cfg.UI.Theme != "nord" {
+		t.Fatalf("non-permission save did not persist theme: %q", cfg.UI.Theme)
 	}
 }
 

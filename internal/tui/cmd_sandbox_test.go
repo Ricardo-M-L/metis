@@ -183,3 +183,46 @@ func TestSandboxStatusDisclosesLinuxUnixSocketLimit(t *testing.T) {
 		t.Fatalf("Linux network limitation not disclosed: %q", out)
 	}
 }
+
+func TestSandboxStatusDisclosesFullAccessBypass(t *testing.T) {
+	manager, err := sandbox.NewManagerWithOptions(sandbox.Options{
+		Mode: string(sandbox.ModePermissions), TempRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if err := manager.SetPermissionPosture(false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	out := sandboxStatus(manager)
+	for _, want := range []string{
+		"sandbox: off",
+		"fullAccess forces the process sandbox off",
+		"run directly on the host",
+		"unrestricted by the process sandbox",
+		"coverage: bypassed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("fullAccess status missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestCmdSandboxFullAccessDoesNotClaimOverrideIsEffective(t *testing.T) {
+	r, manager := sandboxTestREPL(t, "permissions")
+	r.Gate = permission.New(permission.ModeFullAccess)
+	r.sandbox = manager
+	if err := manager.SetPermissionPosture(false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	out := cmdSandbox(r, "auto-allow")
+	if !strings.Contains(out, "fullAccess keeps the effective process sandbox off") {
+		t.Fatalf("fullAccess override response is misleading: %q", out)
+	}
+	if manager.EffectiveMode() != sandbox.ModeOff {
+		t.Fatalf("fullAccess override changed effective mode to %q", manager.EffectiveMode())
+	}
+}

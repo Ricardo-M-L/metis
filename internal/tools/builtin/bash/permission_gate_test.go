@@ -171,3 +171,13 @@ func TestBashCanUse_BypassSensitiveDenyCannotBePromotedBySandboxAutoAllow(t *tes
 		t.Fatalf("bypass sensitive write + sandbox auto-allow = %v (%s), want deny safety_check:bypass_immune", got, source)
 	}
 }
+
+func TestBashCanUse_FullAccessSkipsImplicitDangerChecks(t *testing.T) {
+	gate := permission.New(permission.ModeFullAccess)
+	tool := New(gate, config.ToolBashSettings{})
+	// CanUse only: never execute this regression-test command.
+	got, source := tool.CanUse(context.Background(), map[string]any{"command": `rm -rf /`})
+	if got != tools.PermissionAllow || source != "mode:fullAccess" {
+		t.Fatalf("fullAccess dangerous command admission = %v (%s), want allow mode:fullAccess", got, source)
+	}
+}

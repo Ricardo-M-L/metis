@@ -10,6 +10,9 @@ func TestDisableAuthWizardForBypassPermissions(t *testing.T) {
 	if !disableAuthWizard(false, permission.ModeBypassPermissions) {
 		t.Fatal("bypassPermissions must never launch the credential wizard")
 	}
+	if !disableAuthWizard(false, permission.ModeFullAccess) {
+		t.Fatal("fullAccess must never launch the credential wizard")
+	}
 	if disableAuthWizard(false, permission.ModeDefault) {
 		t.Fatal("interactive default mode should retain first-run wizard behavior")
 	}

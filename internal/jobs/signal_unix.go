@@ -3,6 +3,8 @@
 package jobs
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -82,7 +84,71 @@ func isProcessGroupAlive(p *os.Process) bool {
 	if p == nil || p.Pid <= 0 {
 		return false
 	}
-	return syscall.Kill(-p.Pid, 0) == nil
+	err := syscall.Kill(-p.Pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func isProcessTreeAlive(p *os.Process) bool {
+	return isProcessGroupAlive(p)
+}
+
+const processGroupPollInterval = 10 * time.Millisecond
+
+func waitForProcessGroupExit(ctx context.Context, p *os.Process, limit time.Duration) bool {
+	if !isProcessGroupAlive(p) {
+		return true
+	}
+	if limit <= 0 {
+		return false
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	ticker := time.NewTicker(processGroupPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+			if !isProcessGroupAlive(p) {
+				return true
+			}
+		}
+	}
+}
+
+func waitForProcessGroupGone(ctx context.Context, p *os.Process) {
+	if !isProcessGroupAlive(p) {
+		return
+	}
+	ticker := time.NewTicker(processGroupPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !isProcessGroupAlive(p) {
+				return
+			}
+		}
+	}
+}
+
+// watchProcessTree passively retains lifecycle ownership after a leader exits
+// while members of its process group remain. It never signals the tree; Reset
+// cancels this watcher only after publishing a replacement kill stage.
+func watchProcessTree(p *os.Process, done chan<- struct{}) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		if done != nil {
+			defer close(done)
+		}
+		waitForProcessGroupGone(ctx, p)
+	}()
+	return cancel
 }
 
 // killTreeStaged is the two-stage protocol: SIGTERM the group, wait
@@ -92,25 +158,37 @@ func isProcessGroupAlive(p *os.Process) bool {
 //
 // `done` is signalled when both stages finish OR the group has died on
 // its own. Optional — pass nil if you don't care.
-func killTreeStaged(p *os.Process, grace time.Duration, done chan<- struct{}) {
+func killTreeStaged(p *os.Process, grace time.Duration, done chan<- struct{}) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
 	if p == nil {
 		if done != nil {
 			close(done)
 		}
-		return
+		return cancel
 	}
 	_ = killTree(p, syscall.SIGTERM)
 	go func() {
 		if done != nil {
 			defer close(done)
 		}
-		if grace > 0 {
-			time.Sleep(grace)
+		if grace < 0 {
+			grace = 0
+		}
+		if waitForProcessGroupExit(ctx, p, grace) {
+			return
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		if isProcessGroupAlive(p) {
 			_ = killTree(p, syscall.SIGKILL)
 		}
+		// Signal delivery is not process-tree completion. Keep ownership until
+		// the kernel reports that the PGID has no remaining members (including
+		// the leader/descendant exit window that motivated ResetAndWait).
+		waitForProcessGroupGone(ctx, p)
 	}()
+	return cancel
 }
 
 // sigTerm is kept for compatibility with the existing call sites that

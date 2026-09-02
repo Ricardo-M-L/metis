@@ -1,6 +1,9 @@
 package tui
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestClassifyREPLOutput — table-driven coverage of the role heuristic
 // so future contributors can add a confirmation phrase + see it
@@ -45,5 +48,18 @@ func TestClassifyREPLOutput(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("classifyREPLOutput(%q) = %q, want %q", tc.out, got, tc.want)
 		}
+	}
+}
+
+func TestClassifyREPLOutputDoesNotPromoteInformationalBoxByBodyText(t *testing.T) {
+	out := renderInfoBox("Usage", []infoRow{
+		{Key: "provider", Value: "sensenova"},
+		{Key: "dashboard", Value: "(unknown — check your provider's console)"},
+	})
+	if got := classifyREPLOutput(out); got != "info" {
+		t.Fatalf("boxed usage role = %q, want info", got)
+	}
+	if !strings.Contains(stripANSI(out), "unknown") {
+		t.Fatal("test precondition: usage box lost unknown dashboard hint")
 	}
 }

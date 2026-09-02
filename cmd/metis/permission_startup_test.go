@@ -5,9 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
@@ -19,10 +21,12 @@ func TestSetupRuntimeFreshPermissionStateIsCoherent(t *testing.T) {
 		mode        permission.Mode
 		wantPlan    bool
 		wantPrePlan string
+		wantFull    bool
 	}{
 		{mode: permission.ModeDefault},
 		{mode: permission.ModeDontAsk},
 		{mode: permission.ModeBypassPermissions},
+		{mode: permission.ModeFullAccess, wantFull: true},
 		{mode: permission.ModePlan, wantPlan: true, wantPrePlan: string(permission.ModeDefault)},
 	}
 
@@ -48,6 +52,194 @@ func TestSetupRuntimeFreshPermissionStateIsCoherent(t *testing.T) {
 			}
 			if got := rt.loop.PrePlanMode(); got != tt.wantPrePlan {
 				t.Fatalf("pre-plan mode = %q, want %q", got, tt.wantPrePlan)
+			}
+			state := rt.sandbox.State()
+			if state.FullAccessRequired != tt.wantFull {
+				t.Fatalf("sandbox fullAccess = %v, want %v (state=%+v)", state.FullAccessRequired, tt.wantFull, state)
+			}
+			if tt.wantFull && (state.Effective != sandbox.ModeOff || state.CredentialIsolationRequired || !state.AutoAllow) {
+				t.Fatalf("fullAccess sandbox posture = %+v", state)
+			}
+		})
+	}
+}
+
+func TestSetupRuntimeDangerousFullAccessFlagWinsOtherModeFlags(t *testing.T) {
+	isolateResumeRuntimeTest(t)
+	rt, err := setupRuntime(context.Background(), &cliFlags{
+		mode:                                 string(permission.ModeDontAsk),
+		dangerouslySkipPerms:                 true,
+		dangerouslyBypassApprovalsAndSandbox: true,
+		bare:                                 true,
+		noAuthWizard:                         true,
+	})
+	if err != nil {
+		t.Fatalf("setupRuntime: %v", err)
+	}
+	defer rt.Cleanup()
+	if rt.gate.Mode() != permission.ModeFullAccess {
+		t.Fatalf("gate mode = %q, want fullAccess", rt.gate.Mode())
+	}
+	state := rt.sandbox.State()
+	if !state.FullAccessRequired || state.Effective != sandbox.ModeOff || state.CredentialIsolationRequired {
+		t.Fatalf("fullAccess flag sandbox posture = %+v", state)
+	}
+}
+
+func TestSetupRuntimeUntrustedProjectConfigCannotEnableFullAccess(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		trusted bool
+		want    permission.Mode
+	}{
+		{name: "untrusted", want: permission.ModeDefault},
+		{name: "trusted", trusted: true, want: permission.ModeFullAccess},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			isolateResumeRuntimeTest(t)
+			project := t.TempDir()
+			t.Chdir(project)
+			if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte("[permission]\nmode = \"fullAccess\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tt.trusted {
+				if err := addTrustedDir(project); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			rt, err := setupRuntime(context.Background(), &cliFlags{bare: true, noAuthWizard: true})
+			if err != nil {
+				t.Fatalf("setupRuntime: %v", err)
+			}
+			defer rt.Cleanup()
+			if got := rt.gate.Mode(); got != tt.want {
+				t.Fatalf("gate mode = %q, want %q", got, tt.want)
+			}
+			if got := rt.sandbox.State().FullAccessRequired; got != (tt.want == permission.ModeFullAccess) {
+				t.Fatalf("sandbox fullAccess = %v, want %v", got, tt.want == permission.ModeFullAccess)
+			}
+		})
+	}
+}
+
+func TestSetupRuntimeUntrustedProjectProfileNeedsExplicitFullAccess(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		explicitMode string
+		trusted      bool
+		want         permission.Mode
+	}{
+		{name: "profile alone is constrained", want: permission.ModeDefault},
+		{name: "explicit mode remains authoritative", explicitMode: "fullAccess", want: permission.ModeFullAccess},
+		{name: "trusted project profile may select fullAccess", trusted: true, want: permission.ModeFullAccess},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			isolateResumeRuntimeTest(t)
+			project := t.TempDir()
+			t.Chdir(project)
+			agentDir := filepath.Join(project, ".metis", "agents")
+			if err := os.MkdirAll(agentDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			profile := "---\nname: explore\npermission_mode: fullAccess\n---\nProject explorer."
+			if err := os.WriteFile(filepath.Join(agentDir, "explore.md"), []byte(profile), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tt.trusted {
+				if err := addTrustedDir(project); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			rt, err := setupRuntime(context.Background(), &cliFlags{
+				agentProfile: "explore", mode: tt.explicitMode, bare: true, noAuthWizard: true,
+			})
+			if err != nil {
+				t.Fatalf("setupRuntime: %v", err)
+			}
+			defer rt.Cleanup()
+			if got := rt.gate.Mode(); got != tt.want {
+				t.Fatalf("gate mode = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetupRuntimeProjectSessionDirCannotForgeFullAccess(t *testing.T) {
+	tests := []struct {
+		name         string
+		useContinue  bool
+		trusted      bool
+		explicitMode string
+		wantMode     permission.Mode
+		wantRules    int
+	}{
+		{name: "resume untrusted", wantMode: permission.ModeDefault},
+		{name: "continue untrusted", useContinue: true, wantMode: permission.ModeDefault},
+		{name: "resume explicitly authorized", explicitMode: "fullAccess", wantMode: permission.ModeFullAccess, wantRules: 1},
+		{name: "resume trusted store", trusted: true, wantMode: permission.ModeFullAccess, wantRules: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isolateResumeRuntimeTest(t)
+			project := t.TempDir()
+			t.Chdir(project)
+			sessionDir := filepath.Join(project, "forged-sessions")
+			if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			projectConfig := "[session]\ndir = " + strconv.Quote(sessionDir) + "\n"
+			if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte(projectConfig), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := session.NewStore(sessionDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const id = "forged-project-session"
+			if err := store.WriteHeaderFull(session.Header{
+				ID: id, Provider: "anthropic", Model: "claude-opus-4-7",
+				Mode: string(permission.ModeFullAccess),
+				AlwaysAllow: []session.SavedRule{{
+					Tool: "Bash", Verb: int(permission.DecisionAllow), Source: "interactive",
+				}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AppendMessage(id, llm.Message{
+				Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "forged history"}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if tt.trusted {
+				if err := addTrustedDir(project); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			flags := &cliFlags{resumeID: id, bare: true, noAuthWizard: true, mode: tt.explicitMode}
+			if tt.useContinue {
+				flags.resumeID = ""
+				flags.cont = true
+			}
+			rt, err := setupRuntime(context.Background(), flags)
+			if err != nil {
+				t.Fatalf("setupRuntime: %v", err)
+			}
+			defer rt.Cleanup()
+			if got := rt.gate.Mode(); got != tt.wantMode {
+				t.Fatalf("gate mode = %q, want %q", got, tt.wantMode)
+			}
+			if got := len(rt.gate.Snapshot()); got != tt.wantRules {
+				t.Fatalf("restored rules = %d, want %d: %+v", got, tt.wantRules, rt.gate.Snapshot())
+			}
+			if got := rt.sandbox.State().FullAccessRequired; got != (tt.wantMode == permission.ModeFullAccess) {
+				t.Fatalf("sandbox fullAccess = %v, want %v", got, tt.wantMode == permission.ModeFullAccess)
 			}
 		})
 	}

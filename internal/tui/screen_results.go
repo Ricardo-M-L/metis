@@ -160,11 +160,20 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			})
 			return nil
 		}
-		m.messages = append(m.messages, Message{
-			Role:      "success",
-			Content:   "permission mode: " + applied,
-			Timestamp: time.Now(),
-		})
+		if applied == string(permission.ModeFullAccess) {
+			m.messages = append(m.messages, Message{
+				Role: "warning",
+				Content: "DANGER: fullAccess enabled — approval prompts and the process sandbox are disabled. " +
+					"Model-controlled tools now run with all access granted to your OS account.",
+				Timestamp: time.Now(),
+			})
+		} else {
+			m.messages = append(m.messages, Message{
+				Role:      "success",
+				Content:   "permission mode: " + applied,
+				Timestamp: time.Now(),
+			})
+		}
 
 	case *screen.HelpScreen:
 		// User pressed Enter on a /help command row → dispatch that
@@ -220,6 +229,18 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 		}
 		switch w.Command() {
 		case "/sessions":
+			// A picker can outlive the state under which it was opened. Even
+			// though /sessions is rejected by the mid-turn command classifier,
+			// re-check at the commit boundary so a stale overlay cannot rebind
+			// the provider, history and permission gate underneath a live Run.
+			if m.turnActive {
+				m.messages = append(m.messages, Message{
+					Role:      "info",
+					Content:   "(can't switch sessions mid-turn — stop or cancel the running turn first)",
+					Timestamp: time.Now(),
+				})
+				return nil
+			}
 			// Resume the picked session — switch the active session ID
 			// and reload its history.
 			if m.session == nil {
@@ -278,6 +299,17 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			m.messages = append(m.messages, Message{
 				Role:      "info",
 				Content:   "(resume dialog dismissed)",
+				Timestamp: time.Now(),
+			})
+			return nil
+		}
+		// Defense in depth for a ResumeScreen opened before the current turn
+		// started. Session resume/fork/fresh all replace Loop-owned runtime state
+		// and therefore cannot commit while that Loop is running.
+		if m.turnActive {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(can't switch sessions mid-turn — stop or cancel the running turn first)",
 				Timestamp: time.Now(),
 			})
 			return nil

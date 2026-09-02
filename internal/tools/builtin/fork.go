@@ -228,6 +228,14 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	sub.AppendUser(buildForkDirective(directive))
 
 	childCtx := context.WithValue(ctx, forkDepthKey{}, depth+1)
+	// Like a cold Agent child, a fork owns an internal progress channel but no
+	// human reply consumer. Without this explicit boundary fullAccess would let
+	// AskUser execute and block forever waiting on the fork's private event loop.
+	// The marker is child-scoped, so the parent TUI remains fully interactive.
+	childCtx = agent.WithUserInteractionUnavailable(
+		childCtx,
+		"interactive tool unavailable in forked child execution; choose a reasonable default or return the question to the parent as text",
+	)
 	agent.TraceInvocationStarted(ctx)
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
@@ -272,6 +280,10 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			// child gets the denial as a tool_result and decides
 			// how to recover.
 			ev.PermissionReply <- agent.PermissionDecisionDeny
+		case agent.EventAskUser:
+			// Defensive fallback for legacy/plugin tools that emit AskUser
+			// without declaring RequiresUserInteraction.
+			dismissSubAgentAskUser(ev)
 		case agent.EventLoopDone:
 			stopReason = ev.StopReason
 		case agent.EventError:

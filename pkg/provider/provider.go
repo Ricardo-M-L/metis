@@ -60,13 +60,19 @@ const (
 // Only attachments uploaded inline are supported here; URL-based image
 // references would need a separate Source field.
 type ContentBlock struct {
-	Type       string         `json:"type"`
-	Text       string         `json:"text,omitempty"`
-	ToolUseID  string         `json:"tool_use_id,omitempty"`
-	ToolName   string         `json:"name,omitempty"`
-	ToolInput  map[string]any `json:"input,omitempty"`
-	ToolResult string         `json:"content,omitempty"`
-	IsError    bool           `json:"is_error,omitempty"`
+	Type      string         `json:"type"`
+	Text      string         `json:"text,omitempty"`
+	ToolUseID string         `json:"tool_use_id,omitempty"`
+	ToolName  string         `json:"name,omitempty"`
+	ToolInput map[string]any `json:"input,omitempty"`
+	// ToolInputMalformed is an in-memory parse-failure marker. Providers and
+	// the stream consumer set it when function arguments are not valid JSON.
+	// It is deliberately not persisted or sent back over provider wires: raw
+	// malformed arguments may contain credentials, while the dispatcher only
+	// needs the boolean fact in order to return a safe INVALID_JSON result.
+	ToolInputMalformed bool   `json:"-"`
+	ToolResult         string `json:"content,omitempty"`
+	IsError            bool   `json:"is_error,omitempty"`
 	// Display and Presentation are Metis UI metadata for tool_result blocks.
 	// Provider adapters intentionally ignore them when constructing provider
 	// wire payloads, while session JSON keeps them for faithful history replay.
@@ -123,6 +129,16 @@ type ToolSpec struct {
 	Exposure string `json:"-"`
 }
 
+// ResponseFormat asks providers with native structured-output support to
+// constrain the final text to a JSON Schema. Providers that do not implement
+// it may ignore the field; callers should still validate the result locally.
+type ResponseFormat struct {
+	Name        string
+	Description string
+	JSONSchema  map[string]any
+	Strict      bool
+}
+
 // Request is a complete chat completion request.
 //
 // MaxTokens, when non-zero, overrides the per-provider default; the agent
@@ -155,6 +171,7 @@ type Request struct {
 	Stream         bool
 	StopSequences  []string
 	Effort         llm.Effort
+	ResponseFormat *ResponseFormat
 }
 
 // SystemSection mirrors anthropic.SystemSection at the public-API

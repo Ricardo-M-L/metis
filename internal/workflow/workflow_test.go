@@ -70,6 +70,27 @@ func TestRun_ContinuesWhenStopOnErrorFalse(t *testing.T) {
 	}
 }
 
+func TestRun_ProcessGuardDefaultAndExplicitOptOut(t *testing.T) {
+	wf := Workflow{Steps: []Step{{Name: "probe", Command: "kill -0 $$"}}}
+
+	t.Run("default blocks", func(t *testing.T) {
+		results := Run(context.Background(), wf, RunOptions{StopOnError: true})
+		if len(results) != 1 || results[0].Status != StatusFailed || !strings.Contains(results[0].Output, "BashKill(job_id)") {
+			t.Fatalf("Run = %+v, want process-guard failure", results)
+		}
+	})
+
+	t.Run("explicit opt-out executes", func(t *testing.T) {
+		results := Run(context.Background(), wf, RunOptions{
+			StopOnError:               true,
+			SkipDangerousCommandCheck: true,
+		})
+		if len(results) != 1 || results[0].Status != StatusOK {
+			t.Fatalf("Run = %+v, want harmless guarded command to execute", results)
+		}
+	})
+}
+
 func TestCapOutput_KeepsErrorTail(t *testing.T) {
 	head := strings.Repeat("progress line\n", 200)
 	full := head + "\nFATAL: the build exploded"

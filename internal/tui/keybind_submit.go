@@ -72,6 +72,16 @@ func (m *Model) openBodyScreen(command, body string) {
 	m.activeScreen = s
 }
 
+// openFullAccessConfirmation funnels every interactive TUI request for host-
+// unrestricted execution through PermissionsScreen's second-Enter boundary.
+// Startup flags and the plain readline REPL intentionally do not use this UI
+// helper; their explicit non-interactive semantics remain unchanged.
+func (m *Model) openFullAccessConfirmation() {
+	s := screen.NewFullAccessConfirmationScreen(string(m.gate.Mode()), m.permRulesSnapshot())
+	s.Resize(m.width, m.height)
+	m.activeScreen = s
+}
+
 // modalCommands is the set of REPLCommand names whose output should
 // open as a full-window modal overlay (BodyScreen) rather than appending
 // inline into the chat scroll. Information-dense commands benefit from
@@ -721,6 +731,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					return m, m.startMCPLogin(parts[1])
 				}
 			}
+			// /mode is REPL-backed even in the Bubble Tea frontend. Keep its
+			// normal modes on that shared backend, but never let the fullAccess
+			// argument bypass the interactive second-Enter safety boundary.
+			if cmd.Name == "mode" {
+				if requested, ok := permission.ParseMode(args); ok && requested == permission.ModeFullAccess && m.gate.Mode() != permission.ModeFullAccess {
+					m.openFullAccessConfirmation()
+					return m, nil
+				}
+			}
 			repl := m.asREPL()
 			output := cmd.Handler(repl, args)
 			// asREPL is a value bridge. Model/provider switches mutate the
@@ -768,7 +787,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// Prompt-rewriting signals consume display as model input below. Echoing
 		// it here first exposes internal /review instructions in the transcript
 		// (and duplicates user-authored custom-command bodies).
-		if display != "" && sig != slash.SignalCustomPrompt && sig != slash.SignalBatch && sig != slash.SignalPlan {
+		if display != "" && sig != slash.SignalCustomPrompt && sig != slash.SignalBatch && sig != slash.SignalPlan && sig != slash.SignalFullAccess {
 			m.messages = append(m.messages, Message{Role: "info", Content: display, Timestamp: time.Now()})
 		}
 		_ = args // many signals don't need it; the ones that do read below
@@ -1089,6 +1108,12 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
 			} else {
 				m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: bypassPermissions — tool calls auto-approved within the enforced credential boundary; use /default to restore prompts)", Timestamp: time.Now()})
+			}
+		case slash.SignalFullAccess:
+			if m.gate.Mode() == permission.ModeFullAccess {
+				m.messages = append(m.messages, Message{Role: "info", Content: "(mode already fullAccess)", Timestamp: time.Now()})
+			} else {
+				m.openFullAccessConfirmation()
 			}
 		case slash.SignalDefault:
 			if err := applyModelPermissionMode(m, permission.ModeDefault); err != nil {

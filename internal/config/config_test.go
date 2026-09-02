@@ -234,6 +234,129 @@ command = "project-hook"
 	}
 }
 
+func TestLoadPermissionModeForWorkspaceRejectsOnlyUntrustedProjectFullAccess(t *testing.T) {
+	tests := []struct {
+		name           string
+		userMode       string
+		projectMode    string
+		projectTrusted bool
+		want           string
+	}{
+		{
+			name:     "untrusted project fullAccess keeps user default",
+			userMode: "default", projectMode: "fullAccess", want: "default",
+		},
+		{
+			name:     "untrusted project full alias keeps trusted user fullAccess",
+			userMode: "fullAccess", projectMode: "full", want: "fullAccess",
+		},
+		{
+			name:     "untrusted project may choose a safer mode",
+			userMode: "fullAccess", projectMode: "plan", want: "plan",
+		},
+		{
+			name:     "trusted project may choose fullAccess",
+			userMode: "default", projectMode: "fullAccess", projectTrusted: true, want: "fullAccess",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			project := t.TempDir()
+			t.Setenv("METIS_HOME", home)
+			t.Chdir(project)
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[permission]\nmode = \""+tt.userMode+"\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte("[permission]\nmode = \""+tt.projectMode+"\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := LoadPermissionModeForWorkspace(tt.projectTrusted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("permission mode = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadPermissionModeForWorkspaceRejectsUntrustedProjectLocalFullAccess(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[permission]\nmode = \"dontAsk\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".metis", "config.local.toml"), []byte("[permission]\nmode = \"fullAccess\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadPermissionModeForWorkspace(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "dontAsk" {
+		t.Fatalf("permission mode = %q, want trusted user mode dontAsk", got)
+	}
+}
+
+func TestSessionPermissionStateTrustedForWorkspaceTracksSessionDirSource(t *testing.T) {
+	tests := []struct {
+		name           string
+		userSessionDir bool
+		projectConfig  string
+		projectTrusted bool
+		want           bool
+	}{
+		{name: "default session store is trusted", want: true},
+		{name: "user session store is trusted", userSessionDir: true, want: true},
+		{name: "untrusted project without session override keeps trusted store", projectConfig: "[permission]\nmode = \"plan\"\n", want: true},
+		{name: "untrusted project session override is untrusted", projectConfig: "[session]\ndir = \"project-sessions\"\n", want: false},
+		{name: "trusted project session override is trusted", projectConfig: "[session]\ndir = \"project-sessions\"\n", projectTrusted: true, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			project := t.TempDir()
+			t.Setenv("METIS_HOME", home)
+			t.Chdir(project)
+			if tt.userSessionDir {
+				if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[session]\ndir = \"user-sessions\"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.projectConfig != "" {
+				if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte(tt.projectConfig), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got, err := SessionPermissionStateTrustedForWorkspace(tt.projectTrusted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("session permission trust = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadHooksForWorkspaceProjectLocalOverrideRequiresTrust(t *testing.T) {
 	home := t.TempDir()
 	project := t.TempDir()

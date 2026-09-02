@@ -59,6 +59,12 @@ func cmdCU(r *REPL, args string) string {
 // rather than an error so the user can re-enable without first
 // disabling.
 func cuEnable(r *REPL) string {
+	base := context.Background()
+	if r != nil && r.ctx != nil {
+		base = r.ctx
+	}
+	ticket := r.beginMCPLaunchTicket(base)
+	defer ticket.Finish()
 	binPath, lookErr := exec.LookPath(cuBinaryName)
 	if lookErr != nil {
 		return fmt.Sprintf("cu: %s not in PATH — install via: cd metis-cu && make install\n  (or: go install github.com/Ricardo-M-L/metis-cu@latest)", cuBinaryName)
@@ -85,16 +91,12 @@ func cuEnable(r *REPL) string {
 	// Hot-load into the live registry so tools are usable this turn.
 	// Use the same 30s timeout as /mcp start; metis-cu spawns
 	// near-instantly so this is a generous upper bound.
-	base := context.Background()
-	if r != nil && r.ctx != nil {
-		base = r.ctx
-	}
-	ctx, cancel := context.WithTimeout(base, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ticket.Context(), 30*time.Second)
 	defer cancel()
 	if r != nil && r.Loop != nil && r.Loop.Registry != nil {
 		staged := tools.NewRegistry()
-		srv, err := launchMCPServerWithLifecycle(ctx, base, func(liveCtx context.Context) (*mcptools.Server, error) {
-			return mcp.LaunchServerWithSandbox(liveCtx, reg, cuServerName, staged, r.sandbox)
+		srv, err := launchMCPServerWithLifecycle(ctx, ticket.Context(), func(liveCtx context.Context) (*mcptools.Server, error) {
+			return launchConfiguredMCPServer(liveCtx, reg, cuServerName, staged, r.sandbox)
 		})
 		if err != nil {
 			// Persistence already succeeded — the next metis start
@@ -104,7 +106,7 @@ func cuEnable(r *REPL) string {
 		}
 		toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(
 			r.Loop.Registry, cuServerName,
-			mcpLoginLaunch{server: srv, tools: staged.All()}, r.AdoptMCPServer,
+			mcpLoginLaunch{server: srv, tools: staged.All()}, ticket.Adopt,
 		)
 		if ownsServer {
 			r.mcpLoginServers = append(r.mcpLoginServers, srv)

@@ -68,6 +68,18 @@ func TestSaveUserCustomProvider_CreatesMinimalPrivateConfig(t *testing.T) {
 	}
 }
 
+func TestValidateCustomProviderAcceptsOpenAIResponses(t *testing.T) {
+	err := validateCustomProviderSpec(CustomProviderSpec{
+		ID:        "responses-provider",
+		Transport: "openai_responses",
+		BaseURL:   "https://api.example.test/v1",
+		Model:     "example-model",
+	})
+	if err != nil {
+		t.Fatalf("openai_responses should be accepted: %v", err)
+	}
+}
+
 func TestSaveUserCustomProvider_UpdatesSimpleTablesAndPreservesOtherText(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)

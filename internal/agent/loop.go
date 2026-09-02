@@ -26,6 +26,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
+var errTurnWallClockDeadline = fmt.Errorf("turn wall-clock deadline: %w", context.DeadlineExceeded)
+
 // Loop drives the message → tools → message cycle.
 //
 // Design (synthesized from reference projects):
@@ -56,6 +58,13 @@ type Loop struct {
 	TimingSink func(tool string, elapsed time.Duration, isError bool)
 
 	System string
+	// RecoverTextToolCalls enables one safe compatibility retry when a model
+	// returns a whole XML-like tool call as plain assistant text. The retry never
+	// executes or parses the text arguments; it asks the provider to re-emit the
+	// call through its native structured interface. Production enables this only
+	// for isolated sub-agents, where some compatible models otherwise end the
+	// child turn with literal <tool_call> markup.
+	RecoverTextToolCalls bool
 	// SystemSections is the typed-section form of the system prompt.
 	// When non-empty, buildRequest passes it through llm.Request so the
 	// Anthropic provider can emit per-section cache_control. Memory
@@ -78,8 +87,11 @@ type Loop struct {
 	runtimeStateReady    bool
 	runtimeStateRevision uint64
 	Model                string
-	MaxIters             int
-	GraceCalls           int
+	// ResponseFormat is an optional provider-native JSON Schema constraint.
+	// Headless callers also validate locally so providers may ignore it safely.
+	ResponseFormat *llm.ResponseFormat
+	MaxIters       int
+	GraceCalls     int
 
 	// rescueNoTools forces the NEXT buildRequest to omit the tool list,
 	// guaranteeing a text-only iteration. Set by the final-summary rescue
@@ -822,7 +834,11 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	}
 
 	l.mu.RLock()
-	historyTokens := estimateTokens(l.Messages)
+	// Images are native multimodal parts whose context cost is determined by
+	// pixels/tiles, not by tokenizing their base64 transport bytes. Counting
+	// base64 here can turn one screenshot into more than a million fake tokens
+	// and trigger destructive compaction before the provider sees the image.
+	historyTokens := estimateActiveHistoryTokens(l.Messages)
 	activeBase, hasActiveSnapshot := l.activeContextBaseLocked()
 	system := l.System
 	sections := append([]llm.SystemSection(nil), l.SystemSections...)
@@ -1511,6 +1527,12 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	l.haltRequested = false
 	l.haltReason = ""
 	l.todoReconciledThisTurn = false
+	// Verification obligations and verdicts belong to one user turn. Keeping
+	// them across Run calls lets a PASS from an earlier task satisfy a later
+	// unrelated high-risk task, or makes old mutations inflate the new risk
+	// score. Reset at the actual turn boundary while preserving it across every
+	// model/tool iteration inside this Run.
+	l.contract.reset()
 	l.steerClosed = false
 	l.mu.Unlock()
 	if discardedStaleSteers > 0 {
@@ -1570,13 +1592,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 	specs := l.toolSpecs()
 	graceUsed := 0
 	emptyStopRescued := false // see empty_stop_rescue.go — at most one rescue per turn
+	textToolCallRescued := false
 	finalSummaryRescued := false
 	compactedAtCap := false // at most one forced-compaction "second wind" per turn
 	diminishingRescued := false
 	nudgeFired := make([]bool, len(iterNudges)) // see iter_nudge.go
 	progress := newProgressDetector()           // see progress_detector.go
 	stuckDet := &stuckDetector{}                // see stuck_detector.go — Phase C-mini
-	runIter := 0                                // MaxIters is per Run, not cumulative session history
+	awaitedBackgroundJobs := make(map[string]struct{})
+	runIter := 0 // MaxIters is per Run, not cumulative session history
 
 	// 2026-05-23: cumulative output tokens this Run() so the iter
 	// nudge formatter can include "you've also used N output tokens"
@@ -1657,7 +1681,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// The model sees these as system-reminders telling it which
 		// jobs finished (and whether to BashOutput-read the result),
 		// matching claude-code's <task_notification> envelope.
-		l.injectJobNotifications(ctx, out)
+		clearCompletedBackgroundJobs(awaitedBackgroundJobs, l.injectJobNotificationsForAwaited(ctx, out, awaitedBackgroundJobs))
 		l.injectPeerMessages(ctx, out)
 		l.injectSubAgentNotifications(ctx, out)
 		l.injectDreamNotifications(ctx, out)
@@ -1755,6 +1779,18 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		assistant, stop, usage, err := l.consumeStream(ctx, stream, out)
 		stream.Close()
 		if err != nil {
+			if len(assistant) > 0 {
+				for i := range assistant {
+					if assistant[i].ProviderHint == nil {
+						assistant[i].ProviderHint = map[string]string{}
+					}
+					assistant[i].ProviderHint["metis.partial"] = "true"
+				}
+				l.mu.Lock()
+				l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
+				l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
+				l.mu.Unlock()
+			}
 			l.Hooks.EmitError(ctx, tc, err)
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
@@ -1806,6 +1842,19 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				Info: fmt.Sprintf("(provider reported stop_reason=%q while emitting tool_use blocks — treating as tool_use)", stop),
 			})
 			stop = "tool_use"
+		}
+
+		if stop != "tool_use" && l.RecoverTextToolCalls && !textToolCallRescued {
+			if toolName, ok := recoverableTextToolCallName(assistant, l.Registry); ok {
+				textToolCallRescued = true
+				l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
+				l.appendInjectedMessage(textToolCallRecoveryMessage(toolName))
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: fmt.Sprintf("(plain-text tool call for %s was not executed — requesting one native structured retry)", toolName),
+				})
+				continue
+			}
 		}
 
 		if stop != "tool_use" {
@@ -1871,7 +1920,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			// Override was used — log it once before releasing so the
 			// user sees the audit trail in the event stream rather
 			// than a silent release.
-			if l.contract.wasOverridden(assistantText(assistant)) && l.contract.thresholdMet() && !l.contract.verifyDispatched {
+			if l.contract.overrideBypassesGate(assistantText(assistant)) {
 				emit(ctx, out, Event{
 					Kind: EventInfo,
 					Info: "(contract override: model explicitly bypassed the verify gate)",
@@ -1899,6 +1948,37 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					emit(ctx, out, Event{
 						Kind: EventInfo,
 						Info: "[todo] open items at turn end — asking the model to reconcile before stopping",
+					})
+					continue
+				}
+			}
+
+			// Bash moves deliberate delays out of the foreground and marks only
+			// those jobs as await_completion. If the model ends by saying it is
+			// waiting, stay inside this Run until the matching completion event
+			// arrives, inject it, and re-enter the model for a real final answer.
+			// Long-lived servers/watchers are unmarked and never hold the turn.
+			if len(awaitedBackgroundJobs) > 0 {
+				l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
+				// Awaited jobs are outside executeBatch, so they must explicitly
+				// inherit the remaining Run wall-clock budget. This derived context
+				// never cancels the caller's context.
+				waitCtx, cancelWait := context.WithDeadlineCause(ctx, turnDeadline, errTurnWallClockDeadline)
+				completed, waitErr := l.waitForAwaitedJobNotifications(waitCtx, out, awaitedBackgroundJobs)
+				cancelWait()
+				if waitErr != nil {
+					// A deadline owned by this Run re-enters the loop so the existing
+					// turn_wall_clock path emits its stable stop reason/events. A caller
+					// cancellation remains a real Run error.
+					if errors.Is(waitErr, errTurnWallClockDeadline) {
+						continue
+					}
+					return waitErr
+				}
+				if completed {
+					emit(ctx, out, Event{
+						Kind: EventInfo,
+						Info: "awaited background job completed — continuing current turn",
 					})
 					continue
 				}
@@ -1950,6 +2030,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// writes across separate messages breaks strict OpenAI-compatible
 		// tool_calls -> tool_results adjacency.
 		originalToolUses := append([]llm.ContentBlock(nil), toolUses...)
+		// Contract accounting uses the arguments that actually reached the
+		// dispatcher after normalization and PreToolUse rewrites. Keep this copy
+		// separate from originalToolUses: the latter must remain byte-for-byte in
+		// provider order so tool_call/tool_result adjacency can be reconstructed.
+		contractToolUses := append([]llm.ContentBlock(nil), originalToolUses...)
 		resultSlots := make([]llm.ContentBlock, len(originalToolUses))
 		resultFilled := make([]bool, len(originalToolUses))
 		batchWasSplit := false
@@ -1962,11 +2047,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				break
 			}
 		}
-		// Dispatch-contract observation + mid-turn reminder. Count
-		// the batch the model just emitted (Write/Edit/MultiEdit/
-		// Agent), and if the threshold just crossed without a verify
-		// dispatch, queue a one-time heads-up reminder so the model
-		// can plan the verify step before it tries to end. The
+		// Dispatch-contract observation + mid-turn reminder. Observation happens
+		// after dispatch so PreToolUse-normalized/rewritten arguments, rather than
+		// the model's stale raw arguments, determine mutation and verifier state.
+		// If the threshold crossed without a verifier, queue a one-time heads-up
+		// so the model can plan the verify step before it tries to end. The
 		// reminder appears as an extra text block alongside the
 		// tool_results in the SAME user message the executeBatch
 		// loop will produce — see the `pendingContractReminder`
@@ -1983,14 +2068,18 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 		// the same user message via append-text-block keeps the
 		// tool_calls→tool_results adjacency the OpenAI dialect
 		// requires.
-		l.contract.observeToolUses(toolUses)
 		pendingContractReminder := ""
-		if body := l.contract.shouldFireMidTurnReminder(); body != "" {
-			pendingContractReminder = body
-			emit(ctx, out, Event{
-				Kind: EventInfo,
-				Info: "(contract reminder: substantial work in flight — plan for a verify subagent before claiming done)",
-			})
+		queueContractReminder := func() {
+			if pendingContractReminder != "" {
+				return
+			}
+			if body := l.contract.shouldFireMidTurnReminder(); body != "" {
+				pendingContractReminder = body
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: "(contract reminder: substantial work in flight — plan for a verify subagent before claiming done)",
+				})
+			}
 		}
 		if len(toolUses) == 0 {
 			stopReason = "no_tool_calls"
@@ -2013,6 +2102,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				emit(ctx, out, Event{Kind: EventError, Err: err})
 				return err
 			}
+			mergeEffectiveToolUses(contractToolUses, enterTools)
 			mergeBatchResults(originalToolUses, enterTools, results, resultSlots, resultFilled)
 			batchWasSplit = true
 			// Dispatch the rest through the plan-mode partition below. Any
@@ -2045,7 +2135,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				}
 				mergeBatchResults(originalToolUses, otherTools, skipped, resultSlots, resultFilled)
 				results = orderedBatchResults(originalToolUses, resultSlots, resultFilled)
-				l.contract.observeToolResults(originalToolUses, results)
+				l.contract.observeToolUses(contractToolUses)
+				l.contract.observeToolResults(contractToolUses, results)
+				queueContractReminder()
 				if steer := l.drainSteer(); steer != "" {
 					results = append(results, llm.ContentBlock{
 						Type: "text", Text: "[user steer mid-turn] " + steer,
@@ -2113,6 +2205,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					emit(ctx, out, Event{Kind: EventError, Err: err})
 					return err
 				}
+				mergeEffectiveToolUses(contractToolUses, metaTools)
 				mergeBatchResults(originalToolUses, metaTools, results, resultSlots, resultFilled)
 				batchWasSplit = true
 			}
@@ -2150,6 +2243,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 					emit(ctx, out, Event{Kind: EventError, Err: err})
 					return err
 				}
+				mergeEffectiveToolUses(contractToolUses, readTools)
 				mergeBatchResults(originalToolUses, readTools, results, resultSlots, resultFilled)
 				batchWasSplit = true
 			}
@@ -2190,6 +2284,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 						emit(ctx, out, Event{Kind: EventError, Err: err})
 						return err
 					}
+					mergeEffectiveToolUses(contractToolUses, writeTools)
 					mergeBatchResults(originalToolUses, writeTools, results, resultSlots, resultFilled)
 				}
 				batchWasSplit = true
@@ -2199,7 +2294,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			//    assistant's original tool_use blocks. Steering and contract
 			//    reminders are folded in once after every tool result.
 			results := orderedBatchResults(originalToolUses, resultSlots, resultFilled)
-			l.contract.observeToolResults(originalToolUses, results)
+			l.contract.observeToolUses(contractToolUses)
+			l.contract.observeToolResults(contractToolUses, results)
+			queueContractReminder()
 			if steer := l.drainSteer(); steer != "" {
 				results = append(results, llm.ContentBlock{
 					Type: "text", Text: "[user steer mid-turn] " + steer,
@@ -2226,11 +2323,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
+		mergeEffectiveToolUses(contractToolUses, toolUses)
 		if batchWasSplit {
 			mergeBatchResults(originalToolUses, toolUses, results, resultSlots, resultFilled)
 			results = orderedBatchResults(originalToolUses, resultSlots, resultFilled)
 			toolUses = originalToolUses
 		}
+		l.contract.observeToolUses(contractToolUses)
+		l.contract.observeToolResults(contractToolUses, results)
+		queueContractReminder()
+		recordAwaitedBackgroundJobs(results, awaitedBackgroundJobs)
 		// Sliding-window signature loop detection (crush parity).
 		// Feed (toolUses, results) into the detector so it can pair
 		// each call with its result and SHA-256 the batch. Triggers
@@ -2256,13 +2358,6 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 				Info: "repeat-tool-reminder: model is repeating an identical tool call",
 			})
 		}
-
-		// Phase B verdict tracking: scan results for verify-subagent
-		// VERDICT lines so the end-of-turn gate can refuse release on
-		// non-PASS verdicts. Must run AFTER executeBatch (need result
-		// bodies) and BEFORE the next iteration's shouldGateEnd check.
-		// See contract.go::observeToolResults for the extraction logic.
-		l.contract.observeToolResults(toolUses, results)
 
 		// Diminishing-returns is advisory, never a hard stop inside the
 		// tool loop. The old branch returned before appending `results`,
@@ -2701,7 +2796,8 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 		Stream:         true,
 		// Effort has a dedicated lock so the TUI can update it while the main
 		// request snapshot lock is busy assembling memory and messages.
-		Effort: l.EffortValue(),
+		Effort:         l.EffortValue(),
+		ResponseFormat: l.ResponseFormat,
 	}
 	// Final-summary rescue: the iter cap exhausted and the model was told to
 	// write the answer now. Strip the tool list so the provider can only
@@ -3278,6 +3374,39 @@ func splitEnterPlanModeTools(blocks []llm.ContentBlock) (enter, other []llm.Cont
 		}
 	}
 	return
+}
+
+// mergeEffectiveToolUses copies one dispatch phase's finalized arguments back
+// into the full assistant batch used by the verification contract. PreToolUse
+// hooks can rewrite inputs and plan mode can split one assistant batch across
+// several executeBatch calls, so observing either the raw batch or each phase
+// independently would produce the wrong risk/verifier epoch.
+func mergeEffectiveToolUses(all, batch []llm.ContentBlock) {
+	used := make([]bool, len(all))
+	for _, toolUse := range batch {
+		slot := -1
+		if toolUse.ToolUseID != "" {
+			for i, candidate := range all {
+				if !used[i] && candidate.ToolUseID == toolUse.ToolUseID {
+					slot = i
+					break
+				}
+			}
+		}
+		if slot < 0 {
+			for i, candidate := range all {
+				if !used[i] && candidate.ToolName == toolUse.ToolName {
+					slot = i
+					break
+				}
+			}
+		}
+		if slot < 0 {
+			continue
+		}
+		all[slot] = toolUse
+		used[slot] = true
+	}
 }
 
 // mergeBatchResults puts the results of one execution phase back into slots

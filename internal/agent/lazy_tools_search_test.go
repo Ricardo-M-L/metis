@@ -269,6 +269,46 @@ func TestHandleToolSearchSelectDeduplicatesNames(t *testing.T) {
 	}
 }
 
+func TestHandleToolSearchLegacyNameIsNormalizedBeforeValidation(t *testing.T) {
+	l := newLoopWithTools(mcpFake("Agent", "start a sub-agent"))
+	got := handleToolSearch(l, llm.ContentBlock{
+		Type: "tool_use", ToolUseID: "legacy", ToolName: "ToolSearch",
+		ToolInput: map[string]any{"name": "Agent"},
+	})
+	if got.IsError {
+		t.Fatalf("legacy ToolSearch alias rejected: %+v", got)
+	}
+	if !strings.Contains(got.ToolResult, `"name":"Agent"`) || !strings.Contains(got.ToolResult, `"already_available":true`) {
+		t.Fatalf("legacy result = %s", got.ToolResult)
+	}
+}
+
+func TestHandleToolSearchRejectsMalformedOrWrongTypedInput(t *testing.T) {
+	l := newLoopWithTools(mcpFake("Read", "read a file"), mcpFake("Agent", "start a sub-agent"))
+	for _, tc := range []struct {
+		name  string
+		input map[string]any
+		code  string
+	}{
+		{name: "malformed JSON", input: map[string]any{"_raw": `{"query":"secret`}, code: "INVALID_JSON"},
+		{name: "wrong query type", input: map[string]any{"query": 7}, code: "INVALID_TOOL_ARGS"},
+		{name: "empty query", input: map[string]any{"query": ""}, code: "INVALID_TOOL_ARGS"},
+		{name: "unknown property", input: map[string]any{"query": "select:Read", "unexpected": true}, code: "INVALID_TOOL_ARGS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := handleToolSearch(l, llm.ContentBlock{
+				Type: "tool_use", ToolUseID: "bad", ToolName: "ToolSearch", ToolInput: tc.input,
+			})
+			if !got.IsError || !strings.Contains(got.ToolResult, tc.code) {
+				t.Fatalf("result = %+v, want %s", got, tc.code)
+			}
+			if strings.Contains(got.ToolResult, "secret") {
+				t.Fatalf("raw malformed arguments leaked: %q", got.ToolResult)
+			}
+		})
+	}
+}
+
 // TestHandleToolSearch_KeywordNoMatchesReturnsHelpfulMessage — when
 // nothing matches, the body should suggest a fallback (broader query
 // or select:<exact-name>). Models tend to give up gracefully on an

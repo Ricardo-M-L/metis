@@ -85,8 +85,11 @@ type REPL struct {
 	DirAdd    func(path string, persist bool) error
 	DirRemove func(path string) error
 	DirList   func() []string
-	// AdoptMCPServer mirrors ExternalHooks.AdoptMCPServer for the plain REPL.
-	// Embedders that leave it nil retain local ownership until REPL shutdown.
+	// BeginMCPLaunch mirrors ExternalHooks.BeginMCPLaunch for the plain REPL and
+	// captures permission-generation ownership before a slow explicit launch.
+	BeginMCPLaunch func(lifecycle context.Context) *MCPLaunchTicket
+	// AdoptMCPServer is retained as a compatibility fallback for embedders that
+	// have not yet installed the generation-aware begin hook.
 	AdoptMCPServer func(server *mcptools.Server, discoveredTools []tools.Tool) bool
 
 	stdin io.Reader
@@ -524,6 +527,8 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 				r.setPermissionMode(permission.ModeAcceptEdits, "acceptEdits")
 			case slash.SignalBypassPermissions:
 				r.setPermissionMode(permission.ModeBypassPermissions, "bypassPermissions")
+			case slash.SignalFullAccess:
+				r.setPermissionMode(permission.ModeFullAccess, "fullAccess")
 			case slash.SignalDefault:
 				r.setPermissionMode(permission.ModeDefault, "default")
 			case slash.SignalDontAsk:

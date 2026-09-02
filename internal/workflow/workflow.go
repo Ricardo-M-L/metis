@@ -57,12 +57,13 @@ type StepResult struct {
 
 // RunOptions tunes a workflow run.
 type RunOptions struct {
-	Cwd            string        // working directory for every step
-	StopOnError    bool          // mark remaining steps skipped after a failure
-	PerStepTimeout time.Duration // 0 → DefaultStepTimeout
-	MaxOutputBytes int           // 0 → DefaultMaxOutputBytes; per-step output cap
-	Sandbox        *sandbox.Manager
-	Network        sandbox.NetworkPolicy // empty inherits Manager default (allow without one)
+	Cwd                       string        // working directory for every step
+	StopOnError               bool          // mark remaining steps skipped after a failure
+	PerStepTimeout            time.Duration // 0 → DefaultStepTimeout
+	MaxOutputBytes            int           // 0 → DefaultMaxOutputBytes; per-step output cap
+	Sandbox                   *sandbox.Manager
+	Network                   sandbox.NetworkPolicy // empty inherits Manager default (allow without one)
+	SkipDangerousCommandCheck bool                  // caller already authorized unrestricted command execution
 }
 
 const (
@@ -81,16 +82,18 @@ func Run(ctx context.Context, wf Workflow, opts RunOptions) []StepResult {
 	// Preflight the complete workflow before spawning step one. Model callers
 	// can reach this lower-level runner without the Workflow tool's CanUse, and
 	// discovering a blocked later step after earlier mutations is too late.
-	for blockedIndex, step := range wf.Steps {
-		if err := shellguard.Check(step.Command); err != nil {
-			results := make([]StepResult, len(wf.Steps))
-			for i, candidate := range wf.Steps {
-				results[i] = StepResult{Name: candidate.Name, Command: candidate.Command, Status: StatusSkipped}
+	if !opts.SkipDangerousCommandCheck {
+		for blockedIndex, step := range wf.Steps {
+			if err := shellguard.Check(step.Command); err != nil {
+				results := make([]StepResult, len(wf.Steps))
+				for i, candidate := range wf.Steps {
+					results[i] = StepResult{Name: candidate.Name, Command: candidate.Command, Status: StatusSkipped}
+				}
+				results[blockedIndex].Status = StatusFailed
+				results[blockedIndex].ExitCode = -1
+				results[blockedIndex].Output = "[blocked] " + err.Error()
+				return results
 			}
-			results[blockedIndex].Status = StatusFailed
-			results[blockedIndex].ExitCode = -1
-			results[blockedIndex].Output = "[blocked] " + err.Error()
-			return results
 		}
 	}
 	timeout := opts.PerStepTimeout

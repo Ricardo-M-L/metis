@@ -327,7 +327,9 @@ Usage:
 Flags (chat / run):
   -m, --model <id>      Override model
   -p, --provider <id>   Override provider (anthropic | openai | gemini | <custom>)
-      --mode <id>       Permission mode: default | acceptEdits | plan | dontAsk | bypassPermissions
+      --mode <id>       Permission mode: default | acceptEdits | plan | dontAsk | bypassPermissions | fullAccess
+      --dangerously-bypass-approvals-and-sandbox
+                        Run without approval prompts or process sandboxing
       --no-markdown     Disable markdown rendering of assistant output
       --max-iter <n>    Iteration cap per turn (default 100; overrides [session] max_iterations in config.toml)
       --max-budget-usd <x>  Stop the session once cumulative LLM spend reaches x USD (0 = unlimited; sub-agents draw from the same pool)
@@ -348,9 +350,13 @@ Env:
 // --- runtime wiring shared between chat and run ---
 
 type runtime struct {
-	cfg                    *config.Config
-	provider               llm.Provider
-	registry               *tools.Registry
+	cfg      *config.Config
+	provider llm.Provider
+	registry *tools.Registry
+	// slashRegistry is installed by buildSlash. It is retained so a
+	// permission-boundary revocation can remove MCP prompt closures that point
+	// at clients just closed alongside the model-facing tool namespace.
+	slashRegistry          *slash.Registry
 	gate                   *permission.Gate
 	store                  *session.Store
 	sessionID              string
@@ -370,6 +376,17 @@ type runtime struct {
 	providerName          string          // resolved provider profile name (cfg.Provider.Default OR --provider). Threaded to the TUI so mid-session /model switches know which profile to rebuild against.
 	systemPromptKind      string          // generated default vs opaque custom/legacy prompt provenance
 	defaultPermissionMode permission.Mode // invocation-resolved baseline for in-process /new and /branch
+	// allowStoredSessionPermissions is true only when [session].dir came from a
+	// trusted config source or this invocation explicitly authorized fullAccess.
+	// It gates Mode/PrePlanMode/AlwaysAllow restoration in long-lived frontends.
+	allowStoredSessionPermissions bool
+	// permissionMode is the last mode observed by the Gate listener. A
+	// fullAccess -> safer transition is a process-lifecycle boundary: commands
+	// already spawned without a sandbox cannot be made safe retroactively and
+	// therefore must be stopped. Kept separate from Gate's own lock so the
+	// listener never reaches back into Gate while holding runtime state.
+	permissionModeMu sync.Mutex
+	permissionMode   permission.Mode
 	// mcpServers collects handles to live MCP server subprocesses for
 	// Cleanup. Written from the background-launch goroutine kicked off
 	// in setupRuntime when phase-2 async MCP is enabled, hence the
@@ -382,6 +399,17 @@ type runtime struct {
 	// in-flight stdio/HTTP handshakes before the shared sandbox is closed.
 	mcpClosing        bool
 	mcpLauncherCancel context.CancelFunc
+	// mcpLaunchEpoch invalidates results from an asynchronous launcher that was
+	// cancelled during a permission-boundary change. The launcher may finish a
+	// handshake after context cancellation; an epoch mismatch consumes and
+	// closes that late server instead of republishing its tools.
+	mcpLaunchEpoch uint64
+	// mcpExplicitLaunches owns login/start/test/Computer Use handshakes until
+	// they either adopt a live server or return an error. Leaving fullAccess
+	// cancels and joins the captured generation before the safer transition can
+	// return, so an unsandboxed child cannot survive merely by delaying its
+	// handshake result.
+	mcpExplicitLaunches map[*explicitMCPLaunchTicket]struct{}
 	// Prompt discovery is asynchronous and may be using a live MCP client.
 	// Cleanup first cancels and joins these tasks, then closes the clients.
 	mcpPromptCtx    context.Context
@@ -620,25 +648,31 @@ func (r *runtime) stopSessionHeartbeat() {
 
 // releaseSessionWork stops process-owned work that must not cross a top-level
 // /new, /branch or /resume boundary. Each component is optional because tests,
-// embedders and reduced runtimes do not necessarily wire all three.
+// embedders and reduced runtimes do not necessarily wire every component.
 func (r *runtime) releaseSessionWork() {
 	if r == nil {
 		return
 	}
+	// MCP remains permission-listener-owned and is intentionally not touched by
+	// this helper. Cron and monitors stop before agent producers, matching the
+	// fullAccess revocation order.
 	if r.cronSvc != nil {
 		r.cronSvc.ClearEphemeral()
 	}
-	if r.subAgentRoster != nil {
-		r.subAgentRoster.Reset()
-	}
-	if r.loop == nil {
-		return
-	}
-	if r.loop.Monitors != nil {
+	if r.loop != nil && r.loop.Monitors != nil {
 		r.loop.Monitors.StopAll()
 	}
-	if r.loop.Jobs != nil {
-		r.loop.Jobs.Reset(0)
+
+	// Join every producer before cutting the jobs generation. This is strict in
+	// every permission mode: a canceled safe-mode sub-agent can still publish a
+	// final background job while its defer chain unwinds.
+	if r.subAgentRoster != nil {
+		if err := r.subAgentRoster.CancelAndWait(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "metis: stop sub-agent at session boundary: %v\n", err)
+		}
+	}
+	if r.loop != nil && r.loop.Jobs != nil {
+		r.loop.Jobs.ResetAndWait(0)
 	}
 }
 
@@ -688,6 +722,10 @@ func (r *runtime) Cleanup() {
 	r.mcpClosing = true
 	cancelLauncher := r.mcpLauncherCancel
 	r.mcpLauncherCancel = nil
+	explicitLaunches := make([]*explicitMCPLaunchTicket, 0, len(r.mcpExplicitLaunches))
+	for launch := range r.mcpExplicitLaunches {
+		explicitLaunches = append(explicitLaunches, launch)
+	}
 	cancelPrompts := r.mcpPromptCancel
 	r.mcpPromptCancel = nil
 	r.mcpServersMu.Unlock()
@@ -696,6 +734,12 @@ func (r *runtime) Cleanup() {
 	}
 	if cancelPrompts != nil {
 		cancelPrompts()
+	}
+	for _, launch := range explicitLaunches {
+		launch.Cancel()
+	}
+	for _, launch := range explicitLaunches {
+		launch.Wait()
 	}
 	if r.mcpLauncherDone != nil {
 		select {
@@ -785,6 +829,9 @@ type cliFlags struct {
 	// over --mode if both are set (the explicit --mode loses to the
 	// "yes I really mean it" wrapper).
 	dangerouslySkipPerms bool
+	// --dangerously-bypass-approvals-and-sandbox selects the
+	// Codex-style fullAccess posture: approval never + sandbox disabled.
+	dangerouslyBypassApprovalsAndSandbox bool
 
 	// --scope / -s: where mcp / skill / auth subcommands write. Three
 	// values (parity with Claude Code: local | user | project). Today
@@ -967,6 +1014,8 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	// Named to match Claude Code so muscle memory works.
 	f.BoolVar(&out.dangerouslySkipPerms, "dangerously-skip-permissions", false,
 		"equivalent to --mode bypassPermissions (no permission prompts; use with care)")
+	f.BoolVar(&out.dangerouslyBypassApprovalsAndSandbox, "dangerously-bypass-approvals-and-sandbox", false,
+		"equivalent to --mode fullAccess (no approval prompts or sandbox; isolated environments only)")
 	// --scope / -s: forward-compat for the per-scope mcp.toml / skills/
 	// layout that lands with the daemon work. Today only `user` is
 	// honored; anything else logs a warning at startup. Plumbed here
@@ -1032,6 +1081,20 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	projectTrusted := currentWorkspaceTrusted()
+	trustedPermissionMode, err := config.LoadPermissionModeForWorkspace(projectTrusted)
+	if err != nil {
+		return nil, err
+	}
+	// Config.Load intentionally merges ordinary project settings before the
+	// frontend-specific trust prompt. Replace just the security-sensitive mode
+	// with its source-aware value so an untrusted checkout cannot turn a normal
+	// headless/Desktop startup into host-unrestricted fullAccess.
+	cfg.Permission.Mode = trustedPermissionMode
+	sessionPermissionsTrusted, err := config.SessionPermissionStateTrustedForWorkspace(projectTrusted)
+	if err != nil {
+		return nil, err
+	}
 	if os.Getenv("METIS_DEBUG") == "1" {
 		fmt.Fprintln(os.Stderr, "metis: loaded config files:", loaded)
 	}
@@ -1078,6 +1141,15 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	if agentProf != nil && agentProf.Source == rtpkg.AgentProfileSourceProject &&
+		!projectTrusted && profileRequestsFullAccess(agentProf) && !explicitlyRequestsFullAccess(flags) {
+		// Keep the project profile's role/prompt/tool filters, but do not let its
+		// untrusted frontmatter cross the approval+sandbox boundary. An explicit
+		// invocation flag remains authoritative and the ordinary workspace trust
+		// flow makes the profile eligible on subsequent trusted launches.
+		fmt.Fprintf(os.Stderr, "metis: ignoring fullAccess from untrusted project agent profile %q; trust this workspace or pass an explicit fullAccess flag\n", agentProf.Name)
+		agentProf.PermissionMode = ""
+	}
 
 	// Phase B: --debug opens a long-lived debug log. Done early so
 	// every later step's stderr complaint is also captured. The log
@@ -1112,7 +1184,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	}
 	mode := cfg.Permission.Mode
 	profileModeSet := agentProf != nil && strings.TrimSpace(agentProf.PermissionMode) != ""
-	if profileModeSet && flags.mode == "" && !flags.dangerouslySkipPerms {
+	if profileModeSet && flags.mode == "" && !flags.dangerouslySkipPerms && !flags.dangerouslyBypassApprovalsAndSandbox {
 		mode = agentProf.PermissionMode
 	}
 	if flags.mode != "" {
@@ -1123,20 +1195,26 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.dangerouslySkipPerms {
 		mode = string(permission.ModeBypassPermissions)
 	}
+	// Codex-compatible full access is the strongest explicit invocation
+	// override and therefore wins over both --mode and the Claude-compatible
+	// --dangerously-skip-permissions alias.
+	if flags.dangerouslyBypassApprovalsAndSandbox {
+		mode = string(permission.ModeFullAccess)
+	}
 	freshMode := mode
-	// Auto is internal-only in Claude Code and is not one of the five
-	// external permission modes Metis exposes. Preserve the existing migration
+	// Auto is internal-only in Claude Code and is not one of the public
+	// permission modes Metis exposes. Preserve the existing migration
 	// error before canonicalizing legacy public aliases below.
 	if freshMode == "auto" {
 		return nil, errors.New("permission mode \"auto\" has been removed.\n" +
-			"Use one of Claude Code's public modes: default, acceptEdits, plan, dontAsk, bypassPermissions.")
+			"Use one of: default, acceptEdits, plan, dontAsk, bypassPermissions, fullAccess.")
 	}
 	// Preserve the invocation-resolved posture separately from a resumed
 	// session's mutable state. In-process /new and /branch must return to this
 	// baseline rather than inheriting the session restored at startup.
 	freshPermissionMode, ok := permission.ParseMode(freshMode)
 	if !ok {
-		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions)", mode)
+		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", mode)
 	}
 	// Profile-on-CLI merge.
 	mergedModel, mergedMode, mergedEffort, mergedMaxIter :=
@@ -1145,11 +1223,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	mode = mergedMode
 	canonicalMode, ok := permission.ParseMode(mode)
 	if !ok {
-		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions)", mode)
+		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", mode)
 	}
 	invocationPermissionState := permissionStateForMode(canonicalMode)
-	permissionOverrideSet := flags.mode != "" || flags.dangerouslySkipPerms || profileModeSet
-	startupPermissionState, err := resolveStartupPermissionState(invocationPermissionState, preparedResume, permissionOverrideSet)
+	permissionOverrideSet := flags.mode != "" || flags.dangerouslySkipPerms || flags.dangerouslyBypassApprovalsAndSandbox || profileModeSet
+	allowStoredSessionPermissions := sessionPermissionsTrusted || explicitlyRequestsFullAccess(flags)
+	startupPermissionState, err := resolveStartupPermissionState(invocationPermissionState, preparedResume, permissionOverrideSet, allowStoredSessionPermissions)
 	if err != nil {
 		return nil, err
 	}
@@ -1162,6 +1241,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		// so the Gate is never switched through a lower-priority stored posture.
 		preparedResume.Header.Mode = string(startupPermissionState.Mode)
 		preparedResume.Header.PrePlanMode = startupPermissionState.PrePlanMode
+		if !allowStoredSessionPermissions {
+			preparedResume.Header.AlwaysAllow = nil
+			preparedResume.Header.ClearAlwaysAllow = true
+		}
 	}
 	if flags.effort == "" {
 		flags.effort = mergedEffort
@@ -1242,6 +1325,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		}
 	}()
 	if err := startupRequireCredentialIsolation(sandboxMgr, startupRequiresCredentialIsolation); err != nil {
+		return nil, fmt.Errorf("permission mode %q is unavailable: %w", canonicalMode, err)
+	}
+	if err := startupRequireFullAccess(sandboxMgr, permissionStateRequiresFullAccess(startupPermissionState)); err != nil {
 		return nil, fmt.Errorf("permission mode %q is unavailable: %w", canonicalMode, err)
 	}
 
@@ -1693,18 +1779,6 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// which pushes the matching plan-mode flag onto Loop. Both
 	// directions (model-initiated EnterPlanMode and user-initiated
 	// Shift+Tab) converge on the same code path.
-	gate.SetModeChangeListener(func(m permission.Mode) {
-		loop.SetPlanMode(m == permission.ModePlan)
-		if err := startupReconcilePermissionSandbox(sandboxMgr, loop, m); err != nil {
-			// Internal Gate.SetMode callers (session restore and plan tools) do
-			// not return an error. Fail closed to dontAsk instead of leaving a
-			// visible bypass posture without its credential boundary.
-			fmt.Fprintf(os.Stderr, "metis: permission mode %q rejected: %v\n", m, err)
-			if m != permission.ModeDontAsk {
-				gate.SetMode(permission.ModeDontAsk)
-			}
-		}
-	})
 	// Apply the already-resolved startup snapshot once at boot. Plan is an
 	// overlay, so its exit target must be live before plugins or MCP processes
 	// can observe the runtime's sandbox posture.
@@ -1767,17 +1841,20 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, cronSvc: cronSvc, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
-		defaultPermissionMode: freshPermissionMode,
-		systemPromptKind:      promptKind,
-		mcpLauncherDone:       mcpLauncherDoneCh,
-		mcpPromptCtx:          mcpPromptCtx,
-		mcpPromptCancel:       cancelMCPPrompts,
-		plugins:               pluginReg,
-		allowedDirs:           allowedDirs,
-		autoMemExtractor:      pendingExtractor,
-		subAgentRoster:        subAgentRoster,
-		sandbox:               sandboxMgr,
+		defaultPermissionMode:         freshPermissionMode,
+		allowStoredSessionPermissions: allowStoredSessionPermissions,
+		systemPromptKind:              promptKind,
+		mcpLauncherDone:               mcpLauncherDoneCh,
+		mcpPromptCtx:                  mcpPromptCtx,
+		mcpPromptCancel:               cancelMCPPrompts,
+		plugins:                       pluginReg,
+		allowedDirs:                   allowedDirs,
+		autoMemExtractor:              pendingExtractor,
+		subAgentRoster:                subAgentRoster,
+		sandbox:                       sandboxMgr,
+		permissionMode:                gate.Mode(),
 	}
+	installRuntimePermissionListener(rt)
 
 	// Phase 2 MCP launch — kicked off only after `rt` is fully built so
 	// the goroutine can reach into rt.mcpServers / rt.mcpServersMu. Bare
@@ -1799,8 +1876,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		mcpLaunchCtx, cancelMCPLaunch := context.WithCancel(ctx)
 		rt.mcpServersMu.Lock()
 		rt.mcpLauncherCancel = cancelMCPLaunch
+		launchEpoch := rt.mcpLaunchEpoch
 		rt.mcpServersMu.Unlock()
-		go func(launchCtx context.Context, reg *tools.Registry, mcpReg *mcp.Registry, mode mcp.LazyMode) {
+		go func(launchCtx context.Context, reg *tools.Registry, mcpReg *mcp.Registry, mode mcp.LazyMode, epoch uint64) {
 			defer close(mcpLauncherDoneCh)
 			// Launch into a staging registry. Publication and process ownership
 			// move together below, so an explicit re-login that wins the race
@@ -1813,15 +1891,15 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 				}
 			}
 			for _, server := range servers {
-				rt.adoptMCPServer(server, mcpToolsForServer(staged, server.Name()), false)
+				rt.adoptMCPServerAtEpoch(server, mcpToolsForServer(staged, server.Name()), false, epoch)
 			}
 			// Attach to a running IDE's MCP server if one advertises a
 			// matching workspace via ~/.metis/ide/*.lock (best-effort).
 			ideStaged := tools.NewRegistry()
 			if ide := connectIDE(launchCtx, ideStaged, diag); ide != nil {
-				rt.adoptMCPServer(ide, mcpToolsForServer(ideStaged, ide.Name()), false)
+				rt.adoptMCPServerAtEpoch(ide, mcpToolsForServer(ideStaged, ide.Name()), false, epoch)
 			}
-		}(mcpLaunchCtx, reg, mcpReg, lazyMode)
+		}(mcpLaunchCtx, reg, mcpReg, lazyMode, launchEpoch)
 	}
 
 	if preparedResume != nil {
@@ -1942,14 +2020,15 @@ func permissionStateForMode(mode permission.Mode) rtpkg.PermissionModeState {
 // otherwise a stored posture wins when the session actually persisted one.
 // Legacy headers without Mode inherit the complete invocation snapshot, which
 // includes Plan's safe default lineage rather than an empty restored lineage.
-func resolveStartupPermissionState(invocation rtpkg.PermissionModeState, prepared *rtpkg.PreparedResume, invocationOverride bool) (rtpkg.PermissionModeState, error) {
+func resolveStartupPermissionState(invocation rtpkg.PermissionModeState, prepared *rtpkg.PreparedResume, invocationOverride, trustStoredPermissions bool) (rtpkg.PermissionModeState, error) {
 	if prepared == nil || prepared.Header == nil || invocationOverride {
 		return invocation, nil
 	}
-	mode, prePlan, hasMode, err := rtpkg.ValidateRestoredPermissionState(
+	mode, prePlan, hasMode, err := rtpkg.ValidateRestoredPermissionStateFromSource(
 		prepared.Header.Mode,
 		prepared.Header.PrePlanMode,
 		invocation.Mode,
+		trustStoredPermissions,
 	)
 	if err != nil {
 		return rtpkg.PermissionModeState{}, fmt.Errorf("resume %s: %w", prepared.SessionID, err)
@@ -1967,6 +2046,34 @@ func permissionStateRequiresCredentialIsolation(state rtpkg.PermissionModeState)
 	return state.Mode == permission.ModePlan && state.PrePlanMode == string(permission.ModeBypassPermissions)
 }
 
+func permissionStateRequiresFullAccess(state rtpkg.PermissionModeState) bool {
+	return state.Mode == permission.ModeFullAccess
+}
+
+func currentWorkspaceTrusted() bool {
+	cwd, err := os.Getwd()
+	return err == nil && isTrustedDir(cwd)
+}
+
+func explicitlyRequestsFullAccess(flags *cliFlags) bool {
+	if flags == nil {
+		return false
+	}
+	if flags.dangerouslyBypassApprovalsAndSandbox {
+		return true
+	}
+	mode, ok := permission.ParseMode(flags.mode)
+	return ok && mode == permission.ModeFullAccess
+}
+
+func profileRequestsFullAccess(profile *rtpkg.AgentProfile) bool {
+	if profile == nil {
+		return false
+	}
+	mode, ok := permission.ParseMode(strings.TrimSpace(profile.PermissionMode))
+	return ok && mode == permission.ModeFullAccess
+}
+
 func applyWorkspaceHookPolicy(cfg *config.Config, bare bool) error {
 	if cfg == nil {
 		return errors.New("cannot apply hook trust policy to nil config")
@@ -1975,9 +2082,7 @@ func applyWorkspaceHookPolicy(cfg *config.Config, bare bool) error {
 		cfg.Hooks = config.HooksConfig{}
 		return nil
 	}
-	cwd, err := os.Getwd()
-	projectTrusted := err == nil && isTrustedDir(cwd)
-	hooks, err := config.LoadHooksForWorkspace(projectTrusted)
+	hooks, err := config.LoadHooksForWorkspace(currentWorkspaceTrusted())
 	if err != nil {
 		return err
 	}
@@ -1994,11 +2099,14 @@ var (
 	startupRequireCredentialIsolation = func(manager *sandbox.Manager, required bool) error {
 		return manager.RequireCredentialIsolation(required)
 	}
+	startupRequireFullAccess = func(manager *sandbox.Manager, required bool) error {
+		return manager.RequireFullAccess(required)
+	}
 	startupReconcilePermissionSandbox = rtpkg.ReconcilePermissionSandbox
 )
 
 func disableAuthWizard(explicit bool, mode permission.Mode) bool {
-	return explicit || mode == permission.ModeBypassPermissions
+	return explicit || mode == permission.ModeBypassPermissions || mode == permission.ModeFullAccess
 }
 
 // resolveResumeTarget selects the session before provider and prompt
@@ -2138,25 +2246,33 @@ func cmdChat(ctx context.Context, args []string) error {
 		// Auto-detect TTY: use TUI when stdout is a terminal
 		useTUI = term.IsTerminal(int(os.Stdout.Fd()))
 	}
-
-	if useTUI {
-		adoptExplicitMCP := func(server *mcptools.Server, discovered []tools.Tool) bool {
-			if !rt.adoptMCPServer(server, discovered, true) {
+	beginExplicitMCP := func(lifecycle context.Context) *tui.MCPLaunchTicket {
+		runtimeTicket := rt.beginExplicitMCPLaunch(lifecycle)
+		adopt := func(server *mcptools.Server, discovered []tools.Tool) bool {
+			if !runtimeTicket.Adopt(server, discovered) {
 				return false
 			}
+			// A stale ticket is consumed and closed by the runtime. Scheduling is
+			// still safe: prompt discovery rechecks pointer identity under the same
+			// lifecycle lock and therefore publishes nothing for a rejected server.
 			rt.scheduleLiveMCPPrompts(sl, server)
 			return true
 		}
+		return tui.NewMCPLaunchTicket(runtimeTicket.Context(), adopt, runtimeTicket.Finish)
+	}
+
+	if useTUI {
 		hooks := tui.ExternalHooks{
-			DirAdd:              rt.allowedDirs.Add,
-			DirRemove:           rt.allowedDirs.Remove,
-			DirList:             rt.allowedDirs.All,
-			BtwAsk:              rt.askSideQuestion,
-			FreshPermissionMode: rt.defaultPermissionMode,
-			SessionSwitch:       rt.rebindSession,
-			SessionBoundary:     rt.releaseSessionWork,
-			Sandbox:             rt.sandbox,
-			AdoptMCPServer:      adoptExplicitMCP,
+			DirAdd:                  rt.allowedDirs.Add,
+			DirRemove:               rt.allowedDirs.Remove,
+			DirList:                 rt.allowedDirs.All,
+			BtwAsk:                  rt.askSideQuestion,
+			FreshPermissionMode:     rt.defaultPermissionMode,
+			TrustSessionPermissions: rt.allowStoredSessionPermissions,
+			SessionSwitch:           rt.rebindSession,
+			SessionBoundary:         rt.releaseSessionWork,
+			Sandbox:                 rt.sandbox,
+			BeginMCPLaunch:          beginExplicitMCP,
 			ReloadCatalog: func() (string, error) {
 				skillCount := 0
 				if rt.registry != nil {
@@ -2188,13 +2304,7 @@ func cmdChat(ctx context.Context, args []string) error {
 	}
 	repl.ConfigureProviderSwitch(rt.cfg, rt.providerName)
 	repl.ConfigureSandbox(rt.sandbox)
-	repl.AdoptMCPServer = func(server *mcptools.Server, discovered []tools.Tool) bool {
-		if !rt.adoptMCPServer(server, discovered, true) {
-			return false
-		}
-		rt.scheduleLiveMCPPrompts(sl, server)
-		return true
-	}
+	repl.BeginMCPLaunch = beginExplicitMCP
 	repl.DirAdd = rt.allowedDirs.Add
 	repl.DirRemove = rt.allowedDirs.Remove
 	repl.DirList = rt.allowedDirs.All
@@ -2269,6 +2379,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	if schemaEnforcer != nil {
 		llmPrompt = llmPrompt + "\n\n" + schemaEnforcer.Instruction()
+		rt.loop.ResponseFormat = schemaEnforcer.ResponseFormat()
 	}
 	historyCursor := session.NewHistoryCursor(rt.loop.History())
 	if rt.store != nil && rt.sessionID != "" {
@@ -4266,6 +4377,9 @@ func installSkill(name, destDir string) error {
 
 func buildSlash(rt *runtime) *slash.Registry {
 	r := slash.NewRegistry()
+	if rt != nil {
+		rt.slashRegistry = r
+	}
 	// Use the canonical command set defined in internal/slash/commands.go.
 	// Previously buildSlash hand-registered a 7-cmd stub which was a long-
 	// lived bug: 47 of the 54 commands the TUI submit handler dispatches
@@ -4280,13 +4394,20 @@ func buildSlash(rt *runtime) *slash.Registry {
 	// permission mode by string. Not in RegisterAll because the signal
 	// path already exposes individual mode shortcuts
 	// togglers; this is the catch-all "show me / set me" form.
-	r.Register(slash.Cmd{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions)", Handler: func(arg string) (string, slash.Signal) {
+	r.Register(slash.Cmd{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", Handler: func(arg string) (string, slash.Signal) {
 		if arg == "" {
 			return "mode: " + string(rt.gate.Mode()), slash.SignalNone
 		}
 		mode, ok := permission.ParseMode(arg)
 		if !ok {
-			return "unknown mode: " + arg + " (want default|acceptEdits|plan|dontAsk|bypassPermissions)", slash.SignalNone
+			return "unknown mode: " + arg + " (want default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", slash.SignalNone
+		}
+		// Keep parsing side-effect free for the one mode that requires an
+		// interactive danger confirmation. The Bubble Tea dispatcher funnels
+		// this signal into PermissionsScreen; plain REPL and startup flags use
+		// their explicit non-interactive paths and remain unchanged.
+		if mode == permission.ModeFullAccess {
+			return "", slash.SignalFullAccess
 		}
 		if err := applyRuntimePermissionMode(rt, mode); err != nil {
 			return "mode unchanged: " + err.Error(), slash.SignalNone
@@ -4364,6 +4485,39 @@ func applyRuntimePermissionMode(rt *runtime, mode permission.Mode) error {
 		return errors.New("permission gate is unavailable")
 	}
 	return rtpkg.ApplyPermissionMode(rt.gate, rt.loop, rt.sandbox, mode)
+}
+
+// installRuntimePermissionListener is the common lifecycle bridge for direct
+// UI transitions, model-driven plan mode, and restored session state. Gate's
+// ordered callback contract means onPermissionModeChanged always observes the
+// real transition sequence, including recursive fail-closed changes.
+func installRuntimePermissionListener(rt *runtime) {
+	if rt == nil || rt.gate == nil {
+		return
+	}
+	rt.gate.SetModeChangeListener(func(m permission.Mode) {
+		if rt.loop != nil {
+			rt.loop.SetPlanMode(m == permission.ModePlan)
+		}
+		// Record before reconciliation so a partially-failed fullAccess entry
+		// followed by recursive dontAsk still appears as a fullAccess exit.
+		// Actual cleanup runs after the new sandbox posture is installed, keeping
+		// the Gate->sandbox window as small as possible on a normal exit.
+		leavingFullAccess := rt.recordPermissionModeChange(m)
+		err := startupReconcilePermissionSandbox(rt.sandbox, rt.loop, m)
+		if leavingFullAccess {
+			rt.revokeFullAccessResources()
+		}
+		if err != nil {
+			// Internal Gate.SetMode callers (session restore and plan tools) do
+			// not return an error. Fail closed to dontAsk instead of leaving a
+			// visible bypass posture without its credential boundary.
+			fmt.Fprintf(os.Stderr, "metis: permission mode %q rejected: %v\n", m, err)
+			if m != permission.ModeDontAsk {
+				rt.gate.SetMode(permission.ModeDontAsk)
+			}
+		}
+	})
 }
 
 // formatAgentsCommand renders the /agents slash output (G.11 + G.17,
@@ -4524,7 +4678,7 @@ func renderAgentsStatus(roster *agent.Roster, id string) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderAgentsKill resolves the target and calls its Cancel func.
+// renderAgentsKill resolves the target and requests cancellation.
 // Returns a user-readable confirmation; the actual sub-loop cleanup
 // happens in the goroutine watching ctx.Done().
 func renderAgentsKill(roster *agent.Roster, id string) string {
@@ -4535,10 +4689,13 @@ func renderAgentsKill(roster *agent.Roster, id string) string {
 	if !ok {
 		return fmt.Sprintf("(agents kill: no teammate with name=%q or agent_id=%q)", id, id)
 	}
-	if tm.Cancel == nil {
-		return fmt.Sprintf("(agents kill: teammate %s has no cancel func — already finished)", tm.AgentID)
+	if snap := tm.Snapshot(); snap.Status != agent.StatusRunning {
+		return fmt.Sprintf("(agents kill: teammate %s already %s)", tm.AgentID, snap.Status)
 	}
-	tm.Cancel()
+	// The teammate becomes visible before Agent.Execute has finished creating
+	// its child context. RequestCancel latches the request across that setup
+	// window instead of racing a raw Cancel function-pointer assignment.
+	tm.RequestCancel()
 	return fmt.Sprintf("(agents: cancelled %s — will transition to killed shortly)", tm.AgentID)
 }
 
@@ -4599,7 +4756,7 @@ timeout_seconds = 120
 temperature = 1.0
 
 [permission]
-# default | acceptEdits | plan | dontAsk | bypassPermissions
+# default | acceptEdits | plan | dontAsk | bypassPermissions | fullAccess
 mode = "default"
 
 # Always allow these without prompting:

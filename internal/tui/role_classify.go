@@ -1,6 +1,10 @@
 package tui
 
-import "strings"
+import (
+	"strings"
+
+	xansi "github.com/charmbracelet/x/ansi"
+)
 
 // classifyREPLOutput maps a REPL command's plain-string output to the
 // best-fit Message.Role (info / command-result / success / warning / error). Phase B
@@ -22,7 +26,18 @@ import "strings"
 // the role decision here is far less churn than retrofitting (string,
 // Role) returns across the registry.
 func classifyREPLOutput(out string) string {
-	low := strings.ToLower(strings.TrimSpace(out))
+	plain := strings.TrimSpace(xansi.Strip(out))
+	// renderInfoBox already carries its own visual hierarchy and may contain
+	// neutral words such as "unknown" in a single field. Classifying the whole
+	// ANSI box by body text promotes the entire panel to warning/error and, more
+	// importantly, makes the transcript renderer prepend a status glyph to a
+	// bordered block. Keep structured informational panels in the info lane;
+	// individual handlers should return a plain error/warning when the command
+	// itself failed.
+	if isRenderedInfoBox(out) {
+		return "info"
+	}
+	low := strings.ToLower(plain)
 
 	// error markers (loudest tier — check first).
 	if strings.HasPrefix(low, "error:") ||
@@ -79,4 +94,12 @@ func classifyREPLOutput(out string) string {
 	}
 
 	return "info"
+}
+
+// isRenderedInfoBox recognizes renderInfoBox output after removing ANSI
+// styling. Bordered panels carry their own visual status and should not be
+// prefixed with a glyph whose ambiguous terminal width can skew only row one.
+func isRenderedInfoBox(out string) bool {
+	plain := strings.TrimSpace(xansi.Strip(out))
+	return strings.HasPrefix(plain, "╭") && strings.HasSuffix(plain, "╯")
 }

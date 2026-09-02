@@ -14,6 +14,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 type Read struct {
@@ -106,6 +107,13 @@ func (Read) InputSchema() map[string]any {
 		},
 	}
 }
+
+// NormalizeInput keeps restored transcripts that used Claude-style file_path
+// compatible with Metis' canonical path schema. It performs no type coercion.
+func (Read) NormalizeInput(input map[string]any) (map[string]any, error) {
+	return pubtool.NormalizeAliases(input, map[string]string{"file_path": "path"})
+}
+
 func (Read) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
 
 // IsReadOnly: Read never mutates filesystem state. Snip is allowed to

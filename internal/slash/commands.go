@@ -67,6 +67,7 @@ const (
 	SignalPlan
 	SignalAcceptEdits
 	SignalBypassPermissions
+	SignalFullAccess
 	SignalDefault
 	SignalDontAsk
 	SignalNew
@@ -584,8 +585,11 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "default", Aliases: []string{"ask"}, Description: "default mode (ask before state changes)", Handler: func(_ string) (string, Signal) {
 		return "(mode: default)", SignalDefault
 	}})
-	r.Register(Cmd{Name: "bypassPermissions", Aliases: []string{"bypass", "yolo"}, Description: "bypass permissions (dangerous; no approval prompts)", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "bypassPermissions", Aliases: []string{"bypass", "yolo"}, Description: "bypass ordinary approvals while keeping the credential boundary", Handler: func(_ string) (string, Signal) {
 		return "(mode: bypassPermissions — WARNING: approves tools)", SignalBypassPermissions
+	}})
+	r.Register(Cmd{Name: "fullAccess", Aliases: []string{"full"}, Description: "full host access (dangerous; no approvals or sandbox)", Handler: func(_ string) (string, Signal) {
+		return "(mode: fullAccess — WARNING: approvals and sandbox disabled)", SignalFullAccess
 	}})
 	r.Register(Cmd{Name: "dontAsk", Aliases: []string{"deny"}, Description: "deny actions that would otherwise prompt", Handler: func(_ string) (string, Signal) {
 		return "(mode: dontAsk)", SignalDontAsk

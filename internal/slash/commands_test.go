@@ -279,6 +279,28 @@ func TestParse_AcceptEditsShortcutEmitsModeSignal(t *testing.T) {
 	}
 }
 
+func TestParse_FullAccessAliasesEmitDedicatedSignal(t *testing.T) {
+	r := newRegistryWithBuiltins(t)
+	for _, input := range []string{"/fullAccess", "/full"} {
+		t.Run(input, func(t *testing.T) {
+			handled, display, sig, _ := r.Parse(input)
+			if !handled || sig != SignalFullAccess {
+				t.Fatalf("%s routed to handled=%v signal=%v, want SignalFullAccess", input, handled, sig)
+			}
+			if !strings.Contains(display, "approvals and sandbox disabled") {
+				t.Fatalf("%s warning = %q", input, display)
+			}
+		})
+	}
+	if canonical, ok := r.CanonicalName("yolo"); !ok || canonical != "bypassPermissions" {
+		t.Fatalf("legacy yolo canonical command = %q, %v; want bypassPermissions", canonical, ok)
+	}
+	handled, _, sig, _ := r.Parse("/yolo")
+	if !handled || sig != SignalBypassPermissions {
+		t.Fatalf("legacy /yolo routed to handled=%v signal=%v, want SignalBypassPermissions", handled, sig)
+	}
+}
+
 func TestIsCommandShape(t *testing.T) {
 	cases := []struct {
 		in   string

@@ -678,8 +678,10 @@ func TestMCPLoginOperationCancellationReachesLaunchServer(t *testing.T) {
 	operationCtx, cancelOperation := context.WithCancel(context.Background())
 	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
 	defer cancelLifecycle()
+	launchStarted := make(chan struct{})
 	launchCanceled := make(chan struct{})
 	stubMCPServerLaunch(t, func(ctx context.Context, _ *mcp.Registry, _ string, _ *tools.Registry) (mcpLoginServer, error) {
+		close(launchStarted)
 		<-ctx.Done()
 		close(launchCanceled)
 		return nil, ctx.Err()
@@ -690,6 +692,11 @@ func TestMCPLoginOperationCancellationReachesLaunchServer(t *testing.T) {
 		_, err := startMCPServerAfterLogin(operationCtx, lifecycleCtx, "secure", tools.NewRegistry())
 		resultCh <- err
 	}()
+	select {
+	case <-launchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live-start did not reach LaunchServer")
+	}
 	cancelOperation()
 	select {
 	case <-launchCanceled:
@@ -703,6 +710,62 @@ func TestMCPLoginOperationCancellationReachesLaunchServer(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("operation cancellation did not release live-start caller")
+	}
+}
+
+func TestMCPLoginCancellationJoinsLateLauncherBeforeReturning(t *testing.T) {
+	withTempMCPLoginHome(t)
+	seedOAuthMCP(t, mcp.ServerEntry{
+		Name: "secure", URL: "https://mcp.example.test/api", Auth: "oauth",
+	})
+	operationCtx, cancelOperation := context.WithCancel(context.Background())
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	launchStarted := make(chan struct{})
+	launchCanceled := make(chan struct{})
+	launchRelease := make(chan struct{})
+	testServer := &mcpLoginTestServer{}
+	stubMCPServerLaunch(t, func(ctx context.Context, _ *mcp.Registry, _ string, _ *tools.Registry) (mcpLoginServer, error) {
+		close(launchStarted)
+		<-ctx.Done()
+		close(launchCanceled)
+		<-launchRelease // emulate a cancellation-insensitive transport unwind
+		return testServer, nil
+	})
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := startMCPServerAfterLogin(operationCtx, lifecycleCtx, "secure", tools.NewRegistry())
+		resultCh <- err
+	}()
+	select {
+	case <-launchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live-start did not reach late launcher")
+	}
+	cancelOperation()
+	select {
+	case <-launchCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("operation cancellation did not reach late launcher")
+	}
+	select {
+	case err := <-resultCh:
+		close(launchRelease)
+		t.Fatalf("live-start returned before its late launcher unwound: %v", err)
+	default:
+	}
+	close(launchRelease)
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("late launcher cancellation = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live-start did not return after late launcher unwound")
+	}
+	if !testServer.closed.Load() {
+		t.Fatal("late launcher server was not closed before cancellation returned")
 	}
 }
 

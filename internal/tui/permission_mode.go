@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"errors"
+
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
@@ -19,6 +21,15 @@ func applyModelPermissionMode(m *Model, mode permission.Mode) error {
 	if m == nil {
 		return nil
 	}
+	// A foreground turn may already have admitted a tool under the current
+	// permission/sandbox posture. Changing that posture before the turn reaches
+	// its boundary would race the in-flight execution (most critically when
+	// leaving fullAccess and re-enabling the sandbox). Keep every TUI-owned
+	// entry point fail-closed; model-owned Enter/ExitPlanMode tools do not call
+	// this helper and retain their exclusive dispatcher semantics.
+	if m.turnActive {
+		return errors.New("running turn is active; stop or cancel it before changing permission mode")
+	}
 	if err := applyPermissionMode(m.gate, m.loop, m.ext.Sandbox, mode); err != nil {
 		return err
 	}
@@ -27,7 +38,7 @@ func applyModelPermissionMode(m *Model, mode permission.Mode) error {
 	// blocked on UI that the new mode promises never to show. Reject the stale
 	// request (rather than silently granting it) and let the loop continue under
 	// the newly committed posture.
-	if mode == permission.ModeBypassPermissions && m.permActive {
+	if (mode == permission.ModeBypassPermissions || mode == permission.ModeFullAccess) && m.permActive {
 		m.executePermission("n")
 	}
 	return nil

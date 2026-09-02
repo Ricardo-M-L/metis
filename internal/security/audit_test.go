@@ -93,6 +93,25 @@ func TestRun_BypassModeIsCritical(t *testing.T) {
 	}
 }
 
+func TestRun_FullAccessModeHasDistinctCriticalFinding(t *testing.T) {
+	for _, mode := range []string{"fullAccess", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := minimalCfg()
+			cfg.Permission.Mode = mode
+			rep := Run(cfg, tools.NewRegistry())
+			if !rep.HasCritical() {
+				t.Error("fullAccess mode should produce a critical finding")
+			}
+			if !findingHasCode(rep, "PERMISSION_FULL_ACCESS") {
+				t.Errorf("expected PERMISSION_FULL_ACCESS code; findings=%+v", rep.Findings)
+			}
+			if findingHasCode(rep, "PERMISSION_BYPASS") {
+				t.Errorf("fullAccess should not be reported as bypassPermissions; findings=%+v", rep.Findings)
+			}
+		})
+	}
+}
+
 func TestRun_ToolSchemaWrongTopLevel(t *testing.T) {
 	cfg := minimalCfg()
 	reg := tools.NewRegistry()

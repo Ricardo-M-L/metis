@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -51,6 +52,113 @@ func TestPermissionsWidget_ApplyChangesMode(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected success-role 'permission mode: ...' confirmation; got: %+v", messageContents(m))
+	}
+}
+
+func TestPermissionsWidget_FullAccessShowsDangerWarning(t *testing.T) {
+	m := newSlashTestModel(t)
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	m.ext.Sandbox = manager
+	m.gate.SetMode(permission.ModeDefault)
+
+	picker := screen.NewPermissionsScreen(string(permission.ModeDefault), nil)
+	for range 5 { // default -> acceptEdits -> plan -> dontAsk -> bypass -> fullAccess
+		_, _ = picker.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	}
+	_, _ = picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if picker.Done() {
+		t.Fatal("first Enter must only arm the fullAccess confirmation")
+	}
+	_, _ = picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m.applyScreenResult(picker)
+
+	if m.gate.Mode() != permission.ModeFullAccess {
+		t.Fatalf("permission mode = %q, want fullAccess", m.gate.Mode())
+	}
+	if !manager.State().FullAccessRequired {
+		t.Fatal("fullAccess did not force the runtime sandbox posture off")
+	}
+	found := false
+	for _, msg := range m.messages {
+		if msg.Role == "warning" && strings.Contains(msg.Content, "DANGER: fullAccess enabled") && strings.Contains(msg.Content, "process sandbox") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected prominent fullAccess warning; messages=%+v", messageContents(m))
+	}
+}
+
+func TestFullAccessSlashCommandsRequireConfirmation(t *testing.T) {
+	for _, input := range []string{"/fullAccess", "/mode fullAccess"} {
+		t.Run(input, func(t *testing.T) {
+			m := newSlashTestModel(t)
+			manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = manager.Close() })
+			m.ext.Sandbox = manager
+			m.gate.SetMode(permission.ModeDefault)
+
+			m.input.SetValue(input)
+			pressEnter(t, m)
+
+			if got := m.gate.Mode(); got != permission.ModeDefault {
+				t.Fatalf("single submission changed permission mode to %q", got)
+			}
+			if manager.State().FullAccessRequired {
+				t.Fatal("single submission disabled the process sandbox")
+			}
+			picker, ok := m.activeScreen.(*screen.PermissionsScreen)
+			if !ok {
+				t.Fatalf("single submission should open the shared fullAccess confirmation; got %T", m.activeScreen)
+			}
+			view := stripANSI(picker.View())
+			if !strings.Contains(view, "DANGER:") || !strings.Contains(view, "Enter confirm fullAccess") {
+				t.Fatalf("fullAccess confirmation is missing the danger prompt:\n%s", view)
+			}
+
+			updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+			*m = *(updated.(*Model))
+			if got := m.gate.Mode(); got != permission.ModeFullAccess {
+				t.Fatalf("confirmed permission mode = %q, want fullAccess", got)
+			}
+			if !manager.State().FullAccessRequired {
+				t.Fatal("confirmed fullAccess did not disable the process sandbox")
+			}
+		})
+	}
+}
+
+func TestModeCommandLeavesFullAccessWithoutDangerConfirmation(t *testing.T) {
+	m := newSlashTestModel(t)
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	m.ext.Sandbox = manager
+	if err := applyModelPermissionMode(m, permission.ModeFullAccess); err != nil {
+		t.Fatal(err)
+	}
+
+	m.input.SetValue("/mode default")
+	pressEnter(t, m)
+
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("leaving fullAccess set mode %q, want default", got)
+	}
+	if m.activeScreen != nil {
+		t.Fatalf("leaving fullAccess unexpectedly opened confirmation screen %T", m.activeScreen)
+	}
+	if manager.State().FullAccessRequired {
+		t.Fatal("leaving fullAccess did not restore the process sandbox boundary")
 	}
 }
 

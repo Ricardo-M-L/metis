@@ -55,8 +55,8 @@ func TestPermissionsScreen_EmptyRulesShowsHint(t *testing.T) {
 
 // TestPermissionsScreen_InitialModeCursor — cursor seeded by `currentMode`.
 func TestPermissionsScreen_InitialModeCursor(t *testing.T) {
-	// Cursor seeded by currentMode. The widget exposes all five external
-	// modes; dontAsk is intentionally not in the Shift+Tab cycle.
+	// Cursor seeded by currentMode. The widget exposes all six external
+	// modes; dontAsk and fullAccess are intentionally not in the Shift+Tab cycle.
 	cases := []struct {
 		current string
 		want    int
@@ -66,6 +66,7 @@ func TestPermissionsScreen_InitialModeCursor(t *testing.T) {
 		{"plan", 2},
 		{"dontAsk", 3},
 		{"bypassPermissions", 4},
+		{"fullAccess", 5},
 		{"unknown", 0}, // fallback to default
 	}
 	for _, tc := range cases {
@@ -81,13 +82,59 @@ func TestPermissionsScreen_ModeCyclesWraparound(t *testing.T) {
 	s := NewPermissionsScreen("default", nil) // cursor=0
 	s.Resize(100, 20)
 
-	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // wrap to 4 (bypassPermissions)
+	s.Update(tea.KeyPressMsg{Code: tea.KeyLeft}) // safe wrap to 4 (bypassPermissions)
 	if s.modeCursor != 4 {
 		t.Errorf("Left at 0 should wrap to 4; got %d", s.modeCursor)
 	}
+	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // explicit move to fullAccess
+	if s.modeCursor != 5 {
+		t.Errorf("Right at 4 should select fullAccess; got %d", s.modeCursor)
+	}
 	s.Update(tea.KeyPressMsg{Code: tea.KeyRight}) // wrap back to 0
 	if s.modeCursor != 0 {
-		t.Errorf("Right at 4 should wrap to 0; got %d", s.modeCursor)
+		t.Errorf("Right at 5 should wrap to 0; got %d", s.modeCursor)
+	}
+}
+
+func TestPermissionsScreen_FullAccessRequiresSecondEnter(t *testing.T) {
+	s := NewPermissionsScreen("default", nil)
+	s.Resize(100, 20)
+	for range 5 {
+		s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	}
+
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if s.Done() || s.Applied() != "" {
+		t.Fatalf("first Enter unexpectedly applied fullAccess: done=%v applied=%q", s.Done(), s.Applied())
+	}
+	if out := stripANSIEffort(s.View()); !strings.Contains(out, "DANGER:") || !strings.Contains(out, "press Enter again") {
+		t.Fatalf("first Enter did not show the fullAccess confirmation:\n%s", out)
+	}
+
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if !s.Done() || s.Applied() != "fullAccess" {
+		t.Fatalf("second Enter did not apply fullAccess: done=%v applied=%q", s.Done(), s.Applied())
+	}
+}
+
+func TestPermissionsScreen_FullAccessConfirmationHintWinsWhenRulesScroll(t *testing.T) {
+	rules := make([]PermRule, 12)
+	for i := range rules {
+		rules[i] = PermRule{Verb: "allow", Match: "Read", Source: "session"}
+	}
+	s := NewPermissionsScreen("default", rules)
+	s.Resize(100, 10)
+	for range 5 {
+		s.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	}
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	out := stripANSIEffort(s.View())
+	if !strings.Contains(out, "Enter confirm fullAccess") {
+		t.Fatalf("scrollable confirmation lost its second-Enter hint:\n%s", out)
+	}
+	if strings.Contains(out, "Enter apply") {
+		t.Fatalf("scrollable confirmation exposed the generic apply hint:\n%s", out)
 	}
 }
 

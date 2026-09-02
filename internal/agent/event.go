@@ -190,6 +190,36 @@ func AgentNameFromContext(ctx context.Context) string {
 	return "main"
 }
 
+// toolLifecycleContextKey carries a sub-agent's own lifecycle cancellation
+// through InterruptBlock dispatch. InterruptBlock normally detaches the
+// current turn's cancellation so a first Ctrl+C cannot interrupt an atomic
+// file write or foreground command. A detached background sub-agent still
+// needs SubAgentStop, timeout, and roster shutdown to be authoritative,
+// however, so Agent stamps its private lifecycle context under this key.
+//
+// Top-level loops deliberately do not stamp this value. Their historical
+// first-Ctrl+C InterruptBlock semantics therefore remain unchanged.
+type toolLifecycleContextKey struct{}
+
+// WithToolLifecycleContext stamps lifecycle onto ctx. lifecycle must be the
+// cancelable context owned by the sub-agent runner, not a parent turn context.
+func WithToolLifecycleContext(ctx, lifecycle context.Context) context.Context {
+	if ctx == nil || lifecycle == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, toolLifecycleContextKey{}, lifecycle)
+}
+
+// ToolLifecycleContextFromContext returns a sub-agent lifecycle context when
+// one was explicitly stamped, or nil for ordinary top-level dispatch.
+func ToolLifecycleContextFromContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	lifecycle, _ := ctx.Value(toolLifecycleContextKey{}).(context.Context)
+	return lifecycle
+}
+
 // subAgentNotifyKey carries the parent loop's sub-agent notification
 // channel send end down to the Agent tool so background sub-agents can
 // signal completion without the parent polling SubAgentList. Mirrors

@@ -10,6 +10,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 type Write struct {
@@ -68,6 +69,13 @@ func (Write) InputSchema() map[string]any {
 		},
 	}
 }
+
+// NormalizeInput preserves the historical file_path spelling while keeping
+// path as the sole schema and permission-boundary key.
+func (Write) NormalizeInput(input map[string]any) (map[string]any, error) {
+	return pubtool.NormalizeAliases(input, map[string]string{"file_path": "path"})
+}
+
 func (Write) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencyExclusive }
 
 // IsDestructive: Write overwrites whatever was at path. Hard to undo
@@ -110,8 +118,18 @@ func (w Write) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	path, _ := in["path"].(string)
-	content, _ := in["content"].(string)
+	path, pathOK := in["path"].(string)
+	content, contentOK := in["content"].(string)
+	if !pathOK {
+		return &tools.Result{Output: "Write: `path` must be a string", IsError: true}, nil
+	}
+	// Empty content is a valid explicit request (truncate/create an empty
+	// file); a missing or non-string content field is not. Do not silently turn
+	// malformed arguments into a destructive empty-file write even when a
+	// caller invokes the Tool directly and bypasses the central dispatcher.
+	if !contentOK {
+		return &tools.Result{Output: "Write: required `content` field must be a string", IsError: true}, nil
+	}
 	if path == "" {
 		// 2026-05-22: unify with Read/Glob/LS error style — soft
 		// Result{IsError:true} + redirect hint instead of bare

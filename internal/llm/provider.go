@@ -34,6 +34,7 @@ type (
 	ContentBlock         = pubprov.ContentBlock
 	Message              = pubprov.Message
 	ToolSpec             = pubprov.ToolSpec
+	ResponseFormat       = pubprov.ResponseFormat
 	Request              = pubprov.Request
 	SystemSection        = pubprov.SystemSection
 	Response             = pubprov.Response

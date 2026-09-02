@@ -3,6 +3,8 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -86,6 +88,7 @@ func TestParseAgentProfile_NoFrontmatter(t *testing.T) {
 func TestLoadAgentProfile_FromUserDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
+	t.Chdir(t.TempDir())
 	if err := os.MkdirAll(filepath.Join(home, "agents"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -104,6 +107,41 @@ You explore.`
 	if prof.Model != "claude-haiku-4-5" {
 		t.Errorf("Model = %q", prof.Model)
 	}
+	if prof.Source != AgentProfileSourceUser {
+		t.Errorf("Source = %q, want user", prof.Source)
+	}
+}
+
+func TestLoadAgentProfileRecordsProjectAndBuiltinProvenance(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+	projectAgents := filepath.Join(project, ".metis", "agents")
+	if err := os.MkdirAll(projectAgents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectAgents, "explore.md"), []byte("Project override"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectProfile, err := LoadAgentProfile("explore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projectProfile.Source != AgentProfileSourceProject {
+		t.Fatalf("project profile source = %q, want project", projectProfile.Source)
+	}
+	if err := os.Remove(filepath.Join(projectAgents, "explore.md")); err != nil {
+		t.Fatal(err)
+	}
+	builtinProfile, err := LoadAgentProfile("explore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if builtinProfile.Source != AgentProfileSourceBuiltin {
+		t.Fatalf("bundled profile source = %q, want builtin", builtinProfile.Source)
+	}
 }
 
 func TestLoadAgentProfile_MissingErrors(t *testing.T) {
@@ -120,6 +158,55 @@ func TestLoadAgentProfile_RejectsBadName(t *testing.T) {
 	}
 	if _, err := LoadAgentProfile("name with space"); err == nil {
 		t.Errorf("space in name should error")
+	}
+}
+
+func TestAvailableAgentProfileNamesMergesBuiltinProjectAndUser(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+
+	projectAgents := filepath.Join(project, ".metis", "agents")
+	userAgents := filepath.Join(home, "agents")
+	for _, dir := range []string{projectAgents, userAgents} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, body := range map[string]string{
+		filepath.Join(projectAgents, "project-scout.md"): "Project scout",
+		filepath.Join(projectAgents, "explore.md"):       "Project override",
+		filepath.Join(projectAgents, "ignored.txt"):      "not a profile",
+		filepath.Join(projectAgents, "bad name.md"):      "invalid slug",
+		filepath.Join(userAgents, "user-auditor.md"):     "User auditor",
+		filepath.Join(userAgents, "verify.md"):           "User override",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := AvailableAgentProfileNames()
+	for _, want := range []string{"explore", "general", "project-scout", "user-auditor", "verify"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("available profiles %v missing %q", got, want)
+		}
+	}
+	for _, unwanted := range []string{"research", "ignored", "bad name"} {
+		if slices.Contains(got, unwanted) {
+			t.Fatalf("available profiles %v unexpectedly contain %q", got, unwanted)
+		}
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Fatalf("available profiles are not sorted: %v", got)
+	}
+	seen := make(map[string]struct{}, len(got))
+	for _, name := range got {
+		if _, duplicate := seen[name]; duplicate {
+			t.Fatalf("available profiles contain duplicate %q: %v", name, got)
+		}
+		seen[name] = struct{}{}
 	}
 }
 

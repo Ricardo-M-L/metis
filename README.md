@@ -30,7 +30,8 @@ quirks. `Metis` aims for:
 - **MCP-native** — stdio + Streamable HTTP/SSE clients; tools auto-
   registered and namespaced.
 - **Permission-aware** — Claude Code's 5 public modes (`default` /
-  `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions`), cascading
+  `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions`) plus METIS
+  `fullAccess` (no approvals and no process sandbox), cascading
   authority from managed policy > CLI > in-session approvals > config >
   persisted approvals, plus an input-dependent bash classifier.
 - **Streaming-first** — text deltas + tool input deltas render as they
@@ -155,8 +156,9 @@ subcommand-specific help and `metis env` cover the detailed surfaces.
 |------|------|
 | `-m, --model <id>` | override model |
 | `-p, --provider <id>` | `anthropic` / `openai` / `gemini` / any custom |
-| `--mode <id>` | permission mode (`default` / `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions`) |
+| `--mode <id>` | permission mode (`default` / `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions` / `fullAccess`) |
 | `--dangerously-skip-permissions` | alias of `--mode bypassPermissions` |
+| `--dangerously-bypass-approvals-and-sandbox` | alias of `--mode fullAccess`; disables approval prompts and the process sandbox |
 | `-c, --continue` | resume the most recently modified session |
 | `-r, --resume [<id>]` | resume a session by full UUID OR any unambiguous prefix (e.g. the 12-char id the picker prints). Bare `-r` opens the picker; ambiguous prefix errors with the candidate list |
 | `-d, --debug` | mirror logs into `~/.metis/debug.log` |
@@ -250,6 +252,14 @@ A later source wins when two skills have the same name.
 | `!cmd` | bash mode — runs `cmd` in shell without invoking the LLM |
 | Enter mid-turn | queue input; runs as the next turn after the current one finishes |
 
+`fullAccess` is intentionally excluded from the `Shift+Tab` cycle. Select it
+explicitly with `/permissions`, `/fullAccess`, Desktop settings, or the
+dangerous CLI flag. Explicit policy denials, hooks, argument validation, OS
+permissions, timeouts, and tool/provider errors still apply. When leaving
+`fullAccess`, METIS stops background jobs and sub-agents and disconnects
+MCP/Computer Use processes because an already-running unsandboxed process
+cannot be made safe retroactively; reconnect those services if needed.
+
 Mouse capture defaults to cell-motion mode so Metis can scroll the transcript,
 copy clicked or dragged transcript text, open rendered links, and drag-select
 the input at Unicode grapheme boundaries. Input selection copies on mouse-up
@@ -286,6 +296,10 @@ timeout_seconds = 120
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o"
+# wire_protocol = "responses"          # use POST /responses instead of Chat Completions
+# responses_state_mode = "local"       # local | provider | auto
+# responses_profile = "openai"         # auto | openai | compatible
+# hosted_tools = ["web_search"]        # optional provider-hosted search
 
 [provider.gemini]
 api_key_env = "GEMINI_API_KEY"
@@ -296,7 +310,7 @@ model = "gemini-2.5-pro"
 # when a vendor exposes both Anthropic-compatible and OpenAI-compatible
 # endpoints (MiniMax, OpenRouter, GLM, …).
 [provider.custom.minimax-openai]
-transport   = "openai_chat"            # API-key transports: anthropic_messages | openai_chat | gemini_native
+transport   = "openai_chat"            # API-key transports: anthropic_messages | openai_chat | openai_responses | gemini_native
 api_key_env = "MINIMAX_API_KEY"
 base_url    = "https://api.minimaxi.com/v1"
 model       = "MiniMax-M2.7"
@@ -316,6 +330,16 @@ api_key_env = "DEEPSEEK_API_KEY"        # 1st preference: env var
 base_url    = "https://api.deepseek.com/v1"
 model       = "deepseek-chat"
 context_window = 1000000
+
+# GLM Coding Plan Responses API (validated with GLM 5.3). This endpoint is
+# Responses-only; use /api/coding/paas/v4 with openai_chat for Chat Completions.
+[provider.custom.bigmodel-responses]
+transport = "openai_responses"
+api_key_env = "BIGMODEL_API_KEY"
+base_url = "https://open.bigmodel.cn/api/v1"
+model = "glm-5.3"
+responses_state_mode = "auto"
+hosted_tools = ["web_search"]
 
 # Auth chain for both built-in (anthropic/openai/gemini) and custom
 # providers — first non-empty wins:

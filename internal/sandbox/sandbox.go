@@ -108,8 +108,13 @@ type State struct {
 	// bypassPermissions. It is independent from the user's configured/runtime
 	// sandbox selection so leaving bypass restores that selection exactly.
 	CredentialIsolationRequired bool
-	Effective                   Mode
-	AutoAllow                   bool
+	// FullAccessRequired is the session permission posture equivalent to
+	// Codex's danger-full-access sandbox. It disables the process sandbox and
+	// ignores per-tool minimum sandbox requests until the permission mode is
+	// changed again.
+	FullAccessRequired bool
+	Effective          Mode
+	AutoAllow          bool
 }
 
 // Manager owns sandbox state for one runtime. It is safe for concurrent use.
@@ -129,6 +134,7 @@ type Manager struct {
 	runtimeOverride             Mode
 	hasRuntimeOverride          bool
 	credentialIsolationRequired bool
+	fullAccessRequired          bool
 	tempDir                     string
 	metisHome                   string
 	closed                      bool
@@ -298,6 +304,52 @@ func (m *Manager) RequireCredentialIsolation(required bool) error {
 		return ErrManagerClosed
 	}
 	m.credentialIsolationRequired = required
+	if required {
+		m.fullAccessRequired = false
+	}
+	return nil
+}
+
+// RequireFullAccess installs or removes the process-local no-sandbox posture.
+// Enabling it also removes the incompatible credential-isolation floor.
+func (m *Manager) RequireFullAccess(required bool) error {
+	if m == nil {
+		return ErrManagerClosed
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
+	m.fullAccessRequired = required
+	if required {
+		m.credentialIsolationRequired = false
+	}
+	return nil
+}
+
+// SetPermissionPosture atomically coordinates the two permission-owned
+// sandbox overrides. They are mutually exclusive: bypassPermissions needs a
+// credential boundary, while fullAccess explicitly disables all sandboxing.
+func (m *Manager) SetPermissionPosture(credentialIsolationRequired, fullAccessRequired bool) error {
+	if m == nil {
+		return ErrManagerClosed
+	}
+	if credentialIsolationRequired && fullAccessRequired {
+		return errors.New("sandbox: credential isolation and full access are mutually exclusive")
+	}
+	if credentialIsolationRequired {
+		if err := m.PreflightCredentialIsolation(); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
+	m.credentialIsolationRequired = credentialIsolationRequired
+	m.fullAccessRequired = fullAccessRequired
 	return nil
 }
 
@@ -326,6 +378,24 @@ func (m *Manager) PreflightCredentialIsolation() error {
 	return nil
 }
 
+// PreflightFullAccess verifies that the manager can accept a no-sandbox
+// posture without changing it. Unlike credential isolation there is no
+// platform backend requirement; the only failure is a closed runtime. Keeping
+// this check separate lets the permission gate become fullAccess before the
+// sandbox is relaxed, so concurrent calls can only observe the safer
+// intermediate state.
+func (m *Manager) PreflightFullAccess() error {
+	if m == nil {
+		return ErrManagerClosed
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
+	return nil
+}
+
 // RuntimeMode reports the current session override and whether one is active.
 func (m *Manager) RuntimeMode() (Mode, bool) {
 	state := m.State()
@@ -348,6 +418,9 @@ func (m *Manager) NetworkPolicy() NetworkPolicy {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.fullAccessRequired {
+		return NetworkAllow
+	}
 	if m.network == "" {
 		return NetworkAllow
 	}
@@ -367,8 +440,9 @@ func (m *Manager) State() State {
 		RuntimeOverride:             m.runtimeOverride,
 		HasRuntimeOverride:          m.hasRuntimeOverride,
 		CredentialIsolationRequired: m.credentialIsolationRequired,
+		FullAccessRequired:          m.fullAccessRequired,
 		Effective:                   effective,
-		AutoAllow:                   effective == ModeAutoAllow,
+		AutoAllow:                   m.fullAccessRequired || effective == ModeAutoAllow,
 	}
 }
 
@@ -376,6 +450,9 @@ func (m *Manager) State() State {
 // or write. Credential isolation is a floor, not a replacement for an
 // explicitly stronger auto-allow sandbox selection.
 func (m *Manager) effectiveModeLocked() Mode {
+	if m.fullAccessRequired {
+		return ModeOff
+	}
 	effective := m.configured
 	if m.hasRuntimeOverride {
 		effective = m.runtimeOverride
@@ -408,20 +485,23 @@ func (m *Manager) Wrap(cmd *exec.Cmd, req Request) (*exec.Cmd, error) {
 	// a concurrent Wrap recreate it after the Manager had become closed.
 	defer m.mu.RUnlock()
 	mode := m.effectiveModeLocked()
-	switch req.MinimumMode {
-	case "", ModeOff:
-	case ModePermissions:
-		if mode == ModeOff {
-			mode = ModePermissions
+	fullAccess := m.fullAccessRequired
+	if !fullAccess {
+		switch req.MinimumMode {
+		case "", ModeOff:
+		case ModePermissions:
+			if mode == ModeOff {
+				mode = ModePermissions
+			}
+		default:
+			return nil, fmt.Errorf("%w minimum %q (want off or permissions)", ErrInvalidMode, req.MinimumMode)
 		}
-	default:
-		return nil, fmt.Errorf("%w minimum %q (want off or permissions)", ErrInvalidMode, req.MinimumMode)
 	}
 	tempDir := m.tempDir
 	metisHome := m.metisHome
 	defaultNetwork := m.network
 
-	if mode == ModeOff {
+	if fullAccess || mode == ModeOff {
 		return cmd, nil
 	}
 	requestedNetwork := req.Network

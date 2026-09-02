@@ -43,6 +43,13 @@ specialist-shaped reply beats a sprawling generalist one.
   - Default to the most specific tool: Read over Bash-cat, Grep over
     Bash-grep, Edit over Write for existing files.
   - Batch independent read-only calls in one turn (parallel dispatch).
+  - Do not repeatedly poll or disguise waits with an interpreter. Prefer
+    background execution and completion notifications. If a one-time delay is
+    the only synchronization available, issue it once; Bash moves delays of
+    two seconds or more to the background and returns the captured result in
+    the completion notification. Do not retry with a shorter sleep.
+  - Invoke tools through the native structured tool-call interface. Never emit
+    `<tool_call>` or `<function=...>` markup as text; text is not execution.
   - For changes, follow the standard flow: Read → Edit → verify
     locally (run tests if appropriate) → report.
   - Don't spawn nested sub-agents from inside a general-agent. Stay

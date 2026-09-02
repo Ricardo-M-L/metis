@@ -232,6 +232,10 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		}
 		return result, compactErr
 	}
+	// Provider-owned continuation IDs describe the exact pre-compaction
+	// transcript. Once the prefix is summarized/replaced, replaying any ID from
+	// that transcript can make a stateful Responses endpoint reject the turn.
+	candidate = stripProviderState(candidate)
 	result.AfterMessages = len(candidate)
 	result.AfterTokens = estimateTokens(candidate)
 	if opts.Emergency && result.AfterTokens >= result.BeforeTokens && result.AfterMessages >= result.BeforeMessages {
@@ -308,6 +312,7 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		})
 	}
 	final = append(final, postHookSuffix...)
+	final = stripProviderState(final)
 	rollbackBase := append(cloneMessages(before), postHookSuffix...)
 	if historyCap, constrained, budgetErr := compactor.postCompactHistoryCap(requestOverhead); budgetErr != nil ||
 		(constrained && estimateTokens(final) >= historyCap) {
@@ -461,6 +466,28 @@ func cloneMessages(messages []llm.Message) []llm.Message {
 		return nil
 	}
 	return append([]llm.Message(nil), messages...)
+}
+
+func stripProviderState(messages []llm.Message) []llm.Message {
+	out := cloneMessages(messages)
+	for i := range out {
+		out[i].Content = stripProviderStateBlocks(out[i].Content)
+	}
+	return out
+}
+
+func stripProviderStateBlocks(blocks []llm.ContentBlock) []llm.ContentBlock {
+	out := make([]llm.ContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type == "provider_state" {
+			continue
+		}
+		if len(block.ToolResultBlocks) > 0 {
+			block.ToolResultBlocks = stripProviderStateBlocks(block.ToolResultBlocks)
+		}
+		out = append(out, block)
+	}
+	return out
 }
 
 func historiesEqual(a, b []llm.Message) bool {

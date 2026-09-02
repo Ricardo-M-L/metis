@@ -23,6 +23,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -86,13 +87,80 @@ type Job struct {
 	// user-triggered termination paths. Held for the lifetime of the
 	// Job; cleared on transition out of StatusRunning so the GC can
 	// reap when Registry forgets the entry.
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	output *DiskOutput
+	cmd     *exec.Cmd
+	process *os.Process
+	cancel  context.CancelFunc
+	output  *DiskOutput
+	// done closes only after the Registry-owned cmd.Wait path has reaped the
+	// leader and every registered tree-kill stage has finished. ResetAndWait
+	// uses this lifecycle edge instead of treating either signal delivery or
+	// leader exit as proof that all descendants are gone.
+	done       chan struct{}
+	leaderDone bool
+	doneClosed bool
+	// killStages contains both running stages and stages registered under r.mu
+	// but not started yet. A reset installs its replacement before cancelling
+	// older stages, so there is never a zero-stage window while a process tree
+	// can still outlive the session boundary.
+	killStages map[*killStage]struct{}
 	// generation identifies the top-level session that registered the job.
 	// It is used only to suppress a completion notification that races a
 	// Registry.Reset boundary; public snapshots intentionally omit it.
 	generation uint64
+}
+
+// killStage has a cancellation latch because Stop can publish the stage under
+// Registry.mu, then race a Reset that supersedes it before killTreeStaged has
+// returned its cancellation function. The late SetCancel observes the request
+// and cancels immediately; no delayed killer is lost or left untracked.
+type killStage struct {
+	mu              sync.Mutex
+	cancel          context.CancelFunc
+	cancelRequested bool
+	done            chan struct{}
+}
+
+func newKillStage() *killStage {
+	return &killStage{done: make(chan struct{})}
+}
+
+// Start atomically orders the stage's first side effect against cancellation.
+// start runs with s.mu held because killTreeStaged sends its first signal
+// synchronously. A Reset that wins RequestCancel prevents every signal; one
+// that loses waits until the first signal has completed before proceeding.
+func (s *killStage) Start(start func() context.CancelFunc) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancelRequested {
+		return false
+	}
+	s.cancel = start()
+	return true
+}
+
+func (s *killStage) RequestCancel() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cancelRequested = true
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *killStage) CancelRequested() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelRequested
 }
 
 // Notification is published on Registry.Notify when a job leaves
@@ -118,14 +186,25 @@ type Notification struct {
 // state transitions take a write lock; reads (List / Get / Output)
 // take read locks.
 type Registry struct {
-	mu         sync.RWMutex
-	jobs       map[string]*Job
+	mu      sync.RWMutex
+	resetMu sync.Mutex // serializes Reset/ResetAndWait generation cuts
+	jobs    map[string]*Job
+	// draining owns jobs hidden by non-blocking Reset until cmd.Wait and every
+	// staged killer have finished. ResetAndWait includes this set so an ordinary
+	// session cleanup cannot make a later fullAccess revoke forget a process.
+	draining   map[*Job]struct{}
 	notify     chan Notification // buffered, drained by agent loop
 	generation uint64            // incremented whenever session state is reset
+	resetting  bool              // ResetAndWait admission fence
 
 	// dir overrides ~/.metis/jobs (used by tests).
 	dir string
 }
+
+// ErrRegistryResetting rejects new process ownership while ResetAndWait is
+// joining the prior generation. Spawn checks this before Cmd.Start; Adopt
+// leaves an already-running command with its caller when it returns this error.
+var ErrRegistryResetting = errors.New("jobs registry is resetting")
 
 // NewRegistry constructs an empty pool whose disk dir is
 // `<dir>/jobs/` — passing an empty string falls back to METIS_HOME or
@@ -143,6 +222,7 @@ func NewRegistryBuffered(dir string, notifyBuf int) *Registry {
 	}
 	return &Registry{
 		jobs:       make(map[string]*Job),
+		draining:   make(map[*Job]struct{}),
 		notify:     make(chan Notification, notifyBuf),
 		generation: 1,
 		dir:        filepath.Join(dir, "jobs"),
@@ -243,7 +323,18 @@ func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
 	// 'sleep 60 & sleep 60 & wait'`). No-op on Windows.
 	ApplyProcessGroup(a.Cmd)
 
+	// Admission and publication bracket Cmd.Start under the same lock as
+	// ResetAndWait's generation cut. Checking after Start would reject the map
+	// insertion but still leak a newly-started process across the boundary.
+	r.mu.Lock()
+	if r.resetting {
+		r.mu.Unlock()
+		_ = out.Close()
+		_ = os.Remove(outputPath)
+		return nil, ErrRegistryResetting
+	}
 	if err := a.Cmd.Start(); err != nil {
+		r.mu.Unlock()
 		_ = out.Close()
 		return nil, fmt.Errorf("jobs: start: %w", err)
 	}
@@ -257,12 +348,14 @@ func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
 		ExitCode:    -1,
 		OutputPath:  outputPath,
 		cmd:         a.Cmd,
+		process:     a.Cmd.Process,
 		cancel:      a.Cancel,
 		output:      out,
+		done:        make(chan struct{}),
+		killStages:  make(map[*killStage]struct{}),
 	}
 	snapshot := publicJobSnapshot(j)
 
-	r.mu.Lock()
 	j.generation = r.generation
 	r.jobs[id] = j
 	r.mu.Unlock()
@@ -309,14 +402,21 @@ func (r *Registry) Adopt(a AdoptArgs) (*Job, error) {
 		ExitCode:    -1,
 		OutputPath:  a.Output.Path(),
 		cmd:         a.Cmd,
+		process:     a.Cmd.Process,
 		cancel:      a.Cancel,
 		output:      a.Output,
+		done:        make(chan struct{}),
+		killStages:  make(map[*killStage]struct{}),
 	}
-	snapshot := publicJobSnapshot(j)
 
 	r.mu.Lock()
+	if r.resetting {
+		r.mu.Unlock()
+		return nil, ErrRegistryResetting
+	}
 	j.generation = r.generation
 	r.jobs[id] = j
+	snapshot := publicJobSnapshot(j)
 	r.mu.Unlock()
 
 	go r.waitAndComplete(j, a.WaitResult)
@@ -364,11 +464,18 @@ func (r *Registry) waitAndComplete(j *Job, waitResult <-chan error) {
 	if j.Status == StatusKilled {
 		// JobStop already set the terminal state. Don't overwrite
 		// (overwriting would race with the kill notifier).
-		_ = j.output.Close()
+		if j.output != nil {
+			_ = j.output.Close()
+		}
 		j.cmd = nil
-		j.cancel = nil
 		j.output = nil
+		j.leaderDone = true
+		watchStart := r.registerTreeWatchLocked(j)
+		r.maybeCloseLifecycleLocked(j)
 		r.mu.Unlock()
+		if watchStart != nil {
+			r.startTrackedTreeWatch(*watchStart)
+		}
 		return
 	}
 	j.EndTime = time.Now()
@@ -382,10 +489,12 @@ func (r *Registry) waitAndComplete(j *Job, waitResult <-chan error) {
 		j.Status = StatusFailed
 		j.ExitCode = -1
 	}
-	_ = j.output.Close()
+	if j.output != nil {
+		_ = j.output.Close()
+	}
 	j.cmd = nil
-	j.cancel = nil
 	j.output = nil
+	j.leaderDone = true
 	notif := Notification{
 		JobID:    j.ID,
 		Status:   j.Status,
@@ -394,9 +503,100 @@ func (r *Registry) waitAndComplete(j *Job, waitResult <-chan error) {
 		Command:  security.RedactSubprocessText(j.Command),
 	}
 	generation := j.generation
+	watchStart := r.registerTreeWatchLocked(j)
+	r.maybeCloseLifecycleLocked(j)
 	r.mu.Unlock()
 
+	if watchStart != nil {
+		r.startTrackedTreeWatch(*watchStart)
+	}
 	r.publish(generation, notif)
+}
+
+// maybeCloseLifecycleLocked linearizes the final ownership edge. A hidden job
+// remains in draining until its leader is reaped and every staged killer (and
+// its tracked context fallback) has returned.
+func (r *Registry) maybeCloseLifecycleLocked(j *Job) {
+	if j == nil || j.doneClosed || !j.leaderDone || len(j.killStages) != 0 {
+		return
+	}
+	j.doneClosed = true
+	j.process = nil
+	j.cancel = nil
+	delete(r.draining, j)
+	close(j.done)
+}
+
+type stagedKillStart struct {
+	job      *Job
+	stage    *killStage
+	process  *os.Process
+	grace    time.Duration
+	fallback context.CancelFunc
+}
+
+type stagedTreeWatchStart struct {
+	job     *Job
+	stage   *killStage
+	process *os.Process
+}
+
+// registerTreeWatchLocked preserves the process-group identity when a leader
+// exits naturally but same-group descendants remain. The watcher is passive:
+// it sends no signal, and merely keeps the lifecycle edge open so a later
+// Reset can atomically replace it with a terminating stage.
+func (r *Registry) registerTreeWatchLocked(j *Job) *stagedTreeWatchStart {
+	if j == nil || j.process == nil || len(j.killStages) != 0 || !isProcessTreeAlive(j.process) {
+		return nil
+	}
+	stage := newKillStage()
+	j.killStages[stage] = struct{}{}
+	return &stagedTreeWatchStart{job: j, stage: stage, process: j.process}
+}
+
+func (r *Registry) finishTrackedStage(j *Job, stage *killStage) {
+	r.mu.Lock()
+	if _, ok := j.killStages[stage]; ok {
+		delete(j.killStages, stage)
+		close(stage.done)
+	}
+	r.maybeCloseLifecycleLocked(j)
+	r.mu.Unlock()
+}
+
+// startTrackedKill starts a stage already registered in job.killStages. The
+// stage's raw goroutine owns its timer; waiting for rawDone therefore also
+// joins and releases that timer. Context cancellation is a tracked fallback,
+// invoked only after a non-superseded tree-kill stage completes.
+func (r *Registry) startTrackedKill(start stagedKillStart) {
+	rawDone := make(chan struct{})
+	if !start.stage.Start(func() context.CancelFunc {
+		return killTreeStaged(start.process, start.grace, rawDone)
+	}) {
+		r.finishTrackedStage(start.job, start.stage)
+		return
+	}
+	go func() {
+		<-rawDone
+		if !start.stage.CancelRequested() && start.fallback != nil {
+			start.fallback()
+		}
+		r.finishTrackedStage(start.job, start.stage)
+	}()
+}
+
+func (r *Registry) startTrackedTreeWatch(start stagedTreeWatchStart) {
+	rawDone := make(chan struct{})
+	if !start.stage.Start(func() context.CancelFunc {
+		return watchProcessTree(start.process, rawDone)
+	}) {
+		r.finishTrackedStage(start.job, start.stage)
+		return
+	}
+	go func() {
+		<-rawDone
+		r.finishTrackedStage(start.job, start.stage)
+	}()
 }
 
 // publish delivers a terminal notification only while the job still belongs
@@ -500,11 +700,24 @@ func (r *Registry) CleanedUp(id string) bool {
 	return j.cmd == nil && j.cancel == nil && j.output == nil
 }
 
+// ownsNaturallyCompletedTreeLocked identifies a terminal public Job whose
+// leader has been reaped but whose passive tree watcher still owns same-PGID
+// descendants. Status alone is not a lifecycle boundary for these jobs: Stop
+// and Shutdown must be able to replace the watcher with a terminating stage.
+// The caller must hold r.mu.
+func ownsNaturallyCompletedTreeLocked(j *Job) bool {
+	if j == nil || j.doneClosed || !j.leaderDone || j.process == nil || len(j.killStages) == 0 {
+		return false
+	}
+	return j.Status == StatusCompleted || j.Status == StatusFailed
+}
+
 // Stop terminates a job using a two-stage tree-kill: SIGTERM the
 // process group, wait `grace` for cooperative cleanup, then SIGKILL
 // anything still alive. Returns an error only if the job ID is
-// unknown — failed signal delivery on an already-exited process is
-// fine and reported as success.
+// unknown — failed signal delivery on an already-exited process is fine and
+// reported as success. A naturally terminal leader remains stoppable while a
+// passive watcher still owns live same-group descendants.
 //
 // Why "tree-kill" matters here: a `bash -c 'do-stuff & wait'` spawns
 // grandchildren that the bash leader doesn't forward signals to. A
@@ -527,37 +740,39 @@ func (r *Registry) Stop(id string, grace time.Duration) error {
 		r.mu.Unlock()
 		return fmt.Errorf("jobs: unknown id %q", id)
 	}
-	if j.Status != StatusRunning {
+	if j.Status != StatusRunning && !ownsNaturallyCompletedTreeLocked(j) {
 		r.mu.Unlock()
-		return nil // already terminal — no-op
+		return nil // terminal with no retained process-tree ownership — no-op
 	}
-	cmd := j.cmd
-	cancel := j.cancel
+	process := j.process
 	j.Status = StatusKilled
 	j.EndTime = time.Now()
 	j.ExitCode = -1
 	command := j.Command
 	elapsed := j.EndTime.Sub(j.StartTime)
 	generation := j.generation
-	r.mu.Unlock()
-
-	if cmd != nil && cmd.Process != nil {
+	var killStart *stagedKillStart
+	if process != nil {
 		// Two-stage tree kill. We deliberately don't wait for the
 		// goroutine here — the caller (BashKill tool) wants to return
 		// fast, and the wait goroutine watching cmd.Wait will observe
-		// the SIGKILL exit and clean up its own state.
-		killTreeStaged(cmd.Process, grace, nil)
-		// Belt-and-suspenders: cancel the context root too. If
-		// SIGKILL-to-group failed for some platform-specific reason,
-		// context cancellation drops cmd.Wait via the runtime's own
-		// kill path and we still get a clean state transition.
-		if cancel != nil {
-			// time.AfterFunc instead of a parked sleeping goroutine: same
-			// delayed belt-and-suspenders cancel, but the runtime timer is
-			// lighter and reclaimed when it fires (cancel is idempotent if
-			// the job already exited cleanly).
-			time.AfterFunc(grace+500*time.Millisecond, cancel)
+		// the SIGKILL exit and clean up its own state. Install ownership
+		// while holding r.mu so waitAndComplete cannot miss a newly-created
+		// delayed stage after cmd.Wait wins the race.
+		stage := newKillStage()
+		j.killStages[stage] = struct{}{}
+		killStart = &stagedKillStart{
+			job:      j,
+			stage:    stage,
+			process:  process,
+			grace:    grace,
+			fallback: j.cancel,
 		}
+	}
+	r.mu.Unlock()
+
+	if killStart != nil {
+		r.startTrackedKill(*killStart)
 	}
 
 	r.publish(generation, Notification{
@@ -570,29 +785,67 @@ func (r *Registry) Stop(id string, grace time.Duration) error {
 	return nil
 }
 
-// Reset terminates and forgets every job owned by the session being left.
-// Unlike Shutdown, Reset also clears completed entries and pending
-// notifications while keeping this Registry pointer reusable. The latter is
-// important because Bash/Agent tools and the main Loop all retain this same
-// pointer across in-process /new, /branch and /resume operations.
-func (r *Registry) Reset(grace time.Duration) {
-	type runningProcess struct {
-		cmd    *exec.Cmd
-		cancel context.CancelFunc
-	}
+// resetProcess carries one detached job's lifecycle edge plus the replacement
+// stage registered by the generation cut. Superseded stages remain tracked by
+// the Job until their goroutines exit; requesting cancellation never removes
+// their ownership record early.
+type resetProcess struct {
+	job         *Job
+	done        <-chan struct{}
+	replacement *stagedKillStart
+	superseded  []*killStage
+}
 
+// detachResetGeneration makes the old generation immediately invisible. It
+// snapshots both public jobs and jobs hidden by an earlier non-blocking Reset,
+// then installs every replacement stage in the same r.mu critical section.
+// Thus cmd.Wait cannot close a lifecycle edge between old-stage cancellation
+// and replacement publication.
+func (r *Registry) detachResetGeneration(grace time.Duration, holdAdmission bool) []resetProcess {
 	r.mu.Lock()
+	if holdAdmission {
+		r.resetting = true
+	}
 	r.generation++
-	running := make([]runningProcess, 0, len(r.jobs))
-	now := time.Now()
+	targets := make(map[*Job]struct{}, len(r.jobs)+len(r.draining))
 	for _, j := range r.jobs {
-		if j == nil || j.Status != StatusRunning {
+		if j != nil {
+			targets[j] = struct{}{}
+		}
+	}
+	for j := range r.draining {
+		if j != nil {
+			targets[j] = struct{}{}
+		}
+	}
+	running := make([]resetProcess, 0, len(targets))
+	now := time.Now()
+	for j := range targets {
+		if j.doneClosed {
 			continue
 		}
-		j.Status = StatusKilled
-		j.EndTime = now
-		j.ExitCode = -1
-		running = append(running, runningProcess{cmd: j.cmd, cancel: j.cancel})
+		if j.Status == StatusRunning {
+			j.Status = StatusKilled
+			j.EndTime = now
+			j.ExitCode = -1
+		}
+		r.draining[j] = struct{}{}
+		p := resetProcess{job: j, done: j.done}
+		for stage := range j.killStages {
+			p.superseded = append(p.superseded, stage)
+		}
+		if j.process != nil {
+			stage := newKillStage()
+			j.killStages[stage] = struct{}{}
+			p.replacement = &stagedKillStart{
+				job:      j,
+				stage:    stage,
+				process:  j.process,
+				grace:    grace,
+				fallback: j.cancel,
+			}
+		}
+		running = append(running, p)
 	}
 	r.jobs = make(map[string]*Job)
 
@@ -606,30 +859,74 @@ drainNotifications:
 		}
 	}
 	r.mu.Unlock()
+	return running
+}
 
-	// Process termination happens outside the registry lock. Reset already
-	// made the old entries invisible, and waitAndComplete sees StatusKilled
-	// on each detached Job so it only releases handles and never publishes.
-	for _, p := range running {
-		if p.cmd == nil || p.cmd.Process == nil {
-			continue
+func (r *Registry) startResetKills(running []resetProcess) {
+	// Replacements are already registered under r.mu. Cancel old stages before
+	// starting them so an old stage's first signal is either ordered before the
+	// replacement or suppressed entirely; it can never resume afterward and hit
+	// a reused PGID. Registry ownership remains continuous via the registered
+	// replacement even during this hand-off.
+	for i := range running {
+		for _, stage := range running[i].superseded {
+			stage.RequestCancel()
 		}
-		killTreeStaged(p.cmd.Process, grace, nil)
-		if p.cancel != nil {
-			time.AfterFunc(grace+500*time.Millisecond, p.cancel)
+	}
+	for i := range running {
+		if running[i].replacement != nil {
+			r.startTrackedKill(*running[i].replacement)
 		}
 	}
 }
 
-// Shutdown closes the notify channel and best-effort kills every
-// running job. Called from agent.Loop teardown so a metis-quit
-// doesn't orphan ~/.metis/jobs/<id>.out files for processes that are
-// still writing.
+// Reset terminates and forgets the current generation without waiting for
+// process exit. This compatibility API remains appropriate for UI-oriented
+// best-effort cleanup; security boundaries should use ResetAndWait.
+func (r *Registry) Reset(grace time.Duration) {
+	if r == nil {
+		return
+	}
+	r.resetMu.Lock()
+	running := r.detachResetGeneration(grace, false)
+	r.startResetKills(running)
+	r.resetMu.Unlock()
+}
+
+// ResetAndWait terminates and forgets the current generation, then waits for
+// every Registry-owned cmd.Wait path and staged killer to finish. Any return is
+// therefore a strong lifecycle boundary: no source-generation process remains
+// executing or unreaped, and no delayed killer can target a reused PID/PGID.
+func (r *Registry) ResetAndWait(grace time.Duration) {
+	if r == nil {
+		return
+	}
+	r.resetMu.Lock()
+	defer r.resetMu.Unlock()
+	running := r.detachResetGeneration(grace, true)
+	defer func() {
+		r.mu.Lock()
+		r.resetting = false
+		r.mu.Unlock()
+	}()
+	r.startResetKills(running)
+	for _, p := range running {
+		if p.done == nil {
+			continue
+		}
+		<-p.done
+	}
+}
+
+// Shutdown best-effort kills every running job and every naturally-terminal
+// leader whose passive watcher still owns descendants. Called from agent.Loop
+// teardown so a metis-quit doesn't orphan ~/.metis/jobs/<id>.out files or
+// process trees.
 func (r *Registry) Shutdown(grace time.Duration) {
 	r.mu.RLock()
 	ids := make([]string, 0, len(r.jobs))
 	for id, j := range r.jobs {
-		if j.Status == StatusRunning {
+		if j.Status == StatusRunning || ownsNaturallyCompletedTreeLocked(j) {
 			ids = append(ids, id)
 		}
 	}

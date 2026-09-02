@@ -26,7 +26,7 @@ func requestedAgentPermissionMode(in map[string]any) (permission.Mode, bool, err
 	}
 	mode, ok := permission.ParseMode(value)
 	if !ok {
-		return "", false, fmt.Errorf("unknown permission_mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions)", value)
+		return "", false, fmt.Errorf("unknown permission_mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", value)
 	}
 	return mode, true, nil
 }
@@ -49,17 +49,35 @@ func agentPermissionModeEscalates(parent, requested permission.Mode) bool {
 	case permission.ModeDontAsk:
 		return requested == permission.ModeDefault ||
 			requested == permission.ModeAcceptEdits ||
-			requested == permission.ModeBypassPermissions
+			requested == permission.ModeBypassPermissions ||
+			requested == permission.ModeFullAccess
 	case permission.ModeDefault:
 		return requested == permission.ModeAcceptEdits ||
-			requested == permission.ModeBypassPermissions
+			requested == permission.ModeBypassPermissions ||
+			requested == permission.ModeFullAccess
 	case permission.ModeAcceptEdits:
-		return requested == permission.ModeBypassPermissions
+		return requested == permission.ModeBypassPermissions || requested == permission.ModeFullAccess
 	case permission.ModeBypassPermissions:
+		return requested == permission.ModeFullAccess
+	case permission.ModeFullAccess:
 		return false
 	default:
 		return true
 	}
+}
+
+// agentPermissionModeOverrideAllowed reports whether the child posture can be
+// enforced by the current runtime boundary. Besides ordinary escalation, a
+// fullAccess parent cannot truthfully create a lower-permission child: the
+// process sandbox was disabled at parent construction and concrete tools in
+// the shared registry remain bound to the parent's fullAccess gate.
+func agentPermissionModeOverrideAllowed(parent, requested permission.Mode) bool {
+	parent = permission.CanonicalMode(string(parent))
+	requested = permission.CanonicalMode(string(requested))
+	if parent == permission.ModeFullAccess && requested != permission.ModeFullAccess {
+		return false
+	}
+	return !agentPermissionModeEscalates(parent, requested)
 }
 
 func validatePlanAgentInput(parentWasPlan bool, in map[string]any) error {
@@ -79,16 +97,22 @@ func validatePlanAgentInput(parentWasPlan bool, in map[string]any) error {
 	return nil
 }
 
-// validateAgentPermissionOverride prevents a child from manufacturing a more
-// permissive posture than the runtime boundary its parent already owns. In
-// particular, a default parent cannot safely request a bypass child: the
-// concrete tools and shared subprocess sandbox still belong to the parent
-// runtime. Users who want unattended multi-agent execution must enter bypass
-// at the top level first; children then inherit it without another prompt.
+// validateAgentPermissionOverride prevents a child from claiming a posture the
+// runtime boundary cannot enforce. A child cannot escalate above its parent;
+// nor can a fullAccess parent claim to reduce a child, because the shared
+// concrete tools remain parent-bound and the process sandbox is already off.
+// Omitted permission_mode still inherits the parent's exact posture.
 func validateAgentPermissionOverride(parent permission.Mode, in map[string]any) error {
 	requested, hasRequested, err := requestedAgentPermissionMode(in)
 	if err != nil || !hasRequested {
 		return err
+	}
+	parent = permission.CanonicalMode(string(parent))
+	if parent == permission.ModeFullAccess && requested != permission.ModeFullAccess {
+		return fmt.Errorf(
+			"Agent permission_mode=%q cannot safely reduce a fullAccess parent; child agents reuse parent-bound tools and the parent's disabled process sandbox. Omit permission_mode to inherit fullAccess or start the parent in a lower mode",
+			requested,
+		)
 	}
 	if agentPermissionModeEscalates(parent, requested) {
 		return fmt.Errorf(
@@ -156,6 +180,12 @@ func (t agentPermissionBoundTool) IsEnabled() bool { return t.inner.IsEnabled() 
 
 func (t agentPermissionBoundTool) ToolExposure() tools.ToolExposure {
 	return tools.EffectiveExposure(t.inner)
+}
+
+// NormalizeInput preserves the inner tool's compatibility contract across the
+// child permission wrapper. Normalization still happens before either gate.
+func (t agentPermissionBoundTool) NormalizeInput(input map[string]any) (map[string]any, error) {
+	return pubtool.NormalizeToolInput(t.inner, input)
 }
 
 func (t agentPermissionBoundTool) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {

@@ -118,6 +118,21 @@ func filterRegistry(src *tools.Registry, allow, deny []string) *tools.Registry {
 	return dst
 }
 
+// copyToolRegistry returns a new registry with the same tool values and order.
+// Stateful tool implementations are intentionally shared until a caller
+// explicitly replaces one; Agent uses this before rebinding a child's Bash job
+// tools so the process-wide parent registry is never mutated.
+func copyToolRegistry(src *tools.Registry) *tools.Registry {
+	dst := tools.NewRegistry()
+	if src == nil {
+		return dst
+	}
+	for _, tool := range src.All() {
+		dst.Register(tool)
+	}
+	return dst
+}
+
 // intersectAllow combines two allowlists with intersection semantics:
 // only names present in BOTH lists survive. Either list being empty
 // is treated as "no restriction from this side" — the other list

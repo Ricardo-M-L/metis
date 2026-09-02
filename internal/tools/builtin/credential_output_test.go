@@ -48,6 +48,32 @@ func TestBypassGrepRedactsSingleLineCredentialInInnocuousFile(t *testing.T) {
 	}
 }
 
+func TestFullAccessGrepDoesNotSkipCredentialFiles(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, ".env")
+	if err := os.WriteFile(path, []byte("MODEL=glm-test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewGrep(permission.New(permission.ModeFullAccess)).Execute(
+		context.Background(), map[string]any{"root": root, "pattern": "glm-test"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.IsError || !strings.Contains(result.Output, path) || strings.Contains(result.Output, "credential file(s) skipped") {
+		t.Fatalf("fullAccess credential-path grep = %+v, want included .env match", result)
+	}
+}
+
+func TestFullAccessLSPCredentialDecisionAllowsWithoutPrompt(t *testing.T) {
+	decision, source, protected := lspCredentialDecision(
+		permission.New(permission.ModeFullAccess), "/tmp/.env", "/tmp/.env",
+	)
+	if !protected || decision != permission.DecisionAllow || source != "mode:fullAccess" {
+		t.Fatalf("fullAccess LSP credential decision = %v (%q, protected=%v)", decision, source, protected)
+	}
+}
+
 func TestGrepDoesNotExposePEMBodyFromInnocuousFile(t *testing.T) {
 	for _, mode := range []permission.Mode{permission.ModeDefault, permission.ModeBypassPermissions} {
 		mode := mode

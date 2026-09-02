@@ -67,6 +67,16 @@ func TestEnterPlanMode_CanUseBypassDoesNotAsk(t *testing.T) {
 	}
 }
 
+func TestEnterPlanMode_CanUseFullAccessDoesNotAsk(t *testing.T) {
+	g := permission.New(permission.ModeFullAccess)
+	tool := NewEnterPlanModeWithGate(g)
+
+	perm, reason := tool.CanUse(context.Background(), nil)
+	if perm != tools.PermissionAllow {
+		t.Fatalf("CanUse permission = %v (%s), want ALLOW in fullAccess", perm, reason)
+	}
+}
+
 func TestEnterPlanMode_CanUseAlreadyPlanningIsIdempotent(t *testing.T) {
 	g := permission.New(permission.ModePlan)
 	tool := NewEnterPlanModeWithGate(g)
@@ -139,6 +149,27 @@ func TestExitPlanMode_BypassPrePlanModeAutoApprovesWithoutUI(t *testing.T) {
 	}
 	if g.Mode() != permission.ModeBypassPermissions {
 		t.Fatalf("Gate mode = %q, want bypassPermissions", g.Mode())
+	}
+	if ctrl.PrePlanMode() != "" {
+		t.Fatalf("pre-plan snapshot = %q, want cleared", ctrl.PrePlanMode())
+	}
+}
+
+func TestExitPlanMode_FullAccessPrePlanModeAutoApprovesWithoutUI(t *testing.T) {
+	g := permission.New(permission.ModePlan)
+	tool := NewExitPlanModeWithGate(g)
+	ctrl := &stubPlanController{pre: string(permission.ModeFullAccess)}
+	ctx := agent.WithPlanController(context.Background(), ctrl)
+
+	res, err := tool.Execute(ctx, map[string]any{"plan": "step 1: do X"})
+	if err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	if res == nil || res.IsError {
+		t.Fatalf("fullAccess plan exit should auto-approve, got %+v", res)
+	}
+	if g.Mode() != permission.ModeFullAccess {
+		t.Fatalf("Gate mode = %q, want fullAccess", g.Mode())
 	}
 	if ctrl.PrePlanMode() != "" {
 		t.Fatalf("pre-plan snapshot = %q, want cleared", ctrl.PrePlanMode())

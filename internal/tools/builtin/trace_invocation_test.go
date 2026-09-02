@@ -21,8 +21,10 @@ type traceCapture struct {
 }
 
 type gatedCancelProvider struct {
-	observed chan struct{}
-	release  chan struct{}
+	started   chan struct{}
+	observed  chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
 }
 
 type forkLifecycleErrorProvider struct {
@@ -46,6 +48,7 @@ func (p *gatedCancelProvider) Complete(context.Context, llm.Request) (*llm.Respo
 	return nil, nil
 }
 func (p *gatedCancelProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamReader, error) {
+	p.startOnce.Do(func() { close(p.started) })
 	return &gatedCancelStream{ctx: ctx, observed: p.observed, release: p.release}, nil
 }
 
@@ -129,7 +132,11 @@ func TestForegroundTraceInvocationEndsOnlyAfterChildRunExits(t *testing.T) {
 	agent.SetTraceHook(capture.add)
 	t.Cleanup(func() { agent.SetTraceHook(nil) })
 
-	provider := &gatedCancelProvider{observed: make(chan struct{}), release: make(chan struct{})}
+	provider := &gatedCancelProvider{
+		started:  make(chan struct{}),
+		observed: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
 	tool := NewAgent(permission.New(permission.ModeBypass), provider, tools.NewRegistry(), "model", "system")
 	ctx, cancel := context.WithCancel(traceInvocationContext("cancel-internal", "cancel-public"))
 	result := make(chan *tools.Result, 1)
@@ -137,6 +144,11 @@ func TestForegroundTraceInvocationEndsOnlyAfterChildRunExits(t *testing.T) {
 		res, _ := tool.Execute(ctx, map[string]any{"prompt": "wait"})
 		result <- res
 	}()
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child provider did not start")
+	}
 	cancel()
 	select {
 	case <-provider.observed:
@@ -144,9 +156,9 @@ func TestForegroundTraceInvocationEndsOnlyAfterChildRunExits(t *testing.T) {
 		t.Fatal("child provider did not observe cancellation")
 	}
 	select {
-	case <-result:
-	case <-time.After(2 * time.Second):
-		t.Fatal("foreground Agent did not return while child unwound")
+	case res := <-result:
+		t.Fatalf("foreground Agent returned before child Run unwound: %+v", res)
+	case <-time.After(100 * time.Millisecond):
 	}
 	for _, ev := range capture.snapshot() {
 		if ev.Kind == agent.EventTraceInvocationEnd && ev.TraceInvocationID == "cancel-internal" {
@@ -154,6 +166,14 @@ func TestForegroundTraceInvocationEndsOnlyAfterChildRunExits(t *testing.T) {
 		}
 	}
 	close(provider.release)
+	select {
+	case res := <-result:
+		if res == nil || !res.IsError {
+			t.Fatalf("cancelled foreground Agent result = %+v, want IsError", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreground Agent did not return after child Run exited")
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, ev := range capture.snapshot() {

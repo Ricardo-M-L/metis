@@ -2,8 +2,9 @@ package tui
 
 // /sandbox manages the per-runtime OS sandbox shared by every
 // model-controlled command entry point. Permission mode and sandbox mode are
-// deliberately orthogonal: bypassPermissions can remove approval prompts, but
-// it never disables an enabled kernel sandbox.
+// deliberately orthogonal for ordinary modes: bypassPermissions can remove
+// approval prompts, but it never disables an enabled kernel sandbox.
+// fullAccess is the explicit exception and forces direct host execution.
 
 import (
 	"fmt"
@@ -78,6 +79,12 @@ func cmdSandbox(r *REPL, args string) string {
 	if err := manager.SetRuntimeMode(string(canonical)); err != nil {
 		return "sandbox: mode unchanged: " + err.Error()
 	}
+	if manager.State().FullAccessRequired {
+		return fmt.Sprintf(
+			"sandbox: runtime override set to %q, but fullAccess keeps the effective process sandbox off; switch permission mode to reactivate this boundary",
+			canonical,
+		)
+	}
 	return fmt.Sprintf(
 		"sandbox: mode set to %q for this runtime (effective immediately for all model-controlled subprocesses: Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use, Skills and custom commands)\n  • bypassPermissions does not disable this boundary\n  • persist with [tools.bash.sandbox] mode = %q in ~/.metis/config.toml",
 		canonical, canonical,
@@ -125,6 +132,9 @@ func sandboxStatus(manager *sandbox.Manager) string {
 	if state.CredentialIsolationRequired {
 		b.WriteString("\n  • credential isolation: enforced by bypassPermissions")
 	}
+	if state.FullAccessRequired {
+		b.WriteString("\n  ⚠ full access: fullAccess forces the process sandbox off; model-controlled subprocesses run directly on the host")
+	}
 	fmt.Fprintf(&b, "\n  • backend: %s on %s", diagnostic.Backend, diagnostic.Platform)
 	if diagnostic.Available {
 		fmt.Fprintf(&b, " (%s)", diagnostic.Executable)
@@ -138,8 +148,13 @@ func sandboxStatus(manager *sandbox.Manager) string {
 	if temp := manager.TempDir(); temp != "" {
 		fmt.Fprintf(&b, "\n  • private temp: %s", temp)
 	}
-	b.WriteString("\n  • writable: effective cwd/worktree + private temp; Metis control files and Git hooks/config stay protected")
-	b.WriteString("\n  • coverage: Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use, Skills and custom-command subprocesses")
+	if state.FullAccessRequired {
+		b.WriteString("\n  • writable: unrestricted by the process sandbox (host OS permissions still apply)")
+		b.WriteString("\n  • coverage: bypassed for Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use, Skills and custom-command subprocesses")
+	} else {
+		b.WriteString("\n  • writable: effective cwd/worktree + private temp; Metis control files and Git hooks/config stay protected")
+		b.WriteString("\n  • coverage: Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use, Skills and custom-command subprocesses")
+	}
 	if sandboxCwdIsHome() && state.Effective != sandbox.ModeOff {
 		b.WriteString("\n  ⚠ workspace root is your home directory, so the writable boundary is broad; start Metis inside the project directory for tighter isolation")
 	}
@@ -205,5 +220,6 @@ The setting applies to new commands in this runtime. To persist it:
 bypassPermissions only changes approval prompts; it does not disable an
 enabled OS sandbox. The boundary covers all model-controlled subprocesses,
 including Bash, RunCode, Workflow, Git/scope, LSP, Monitor, MCP/Computer Use,
-Skills, and custom commands.`)
+Skills, and custom commands. fullAccess is the explicit exception: it forces
+the effective process sandbox off until you switch permission mode.`)
 }

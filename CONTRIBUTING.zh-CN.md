@@ -31,7 +31,7 @@ internal/runtime/mcp/      MCP 注册表 + 缓存 + prompts 收集器
 internal/tui/              bubbletea 聊天界面（按职责拆分，单 Model）
 internal/tui/screen/       全屏 overlay（help/history/…）
 internal/slash/            slash 命令注册表 + handler
-internal/permission/       5 模式级联权限网关（default/acceptEdits/plan/dontAsk/bypassPermissions）
+internal/permission/       级联权限网关（default/acceptEdits/plan/dontAsk/bypassPermissions/fullAccess）
 internal/exitcode/         typed 错误 → shell 退出码
 internal/jobs/             Bash 家族的后台进程池
 internal/channels/         聊天平台 adapter（Slack/DingTalk/…）

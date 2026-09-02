@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -108,6 +109,38 @@ func TestConsumeStream_ToolArgsDeltaDoesNotLeakSplitCredentials(t *testing.T) {
 	const want = `{"api_key":"[REDACTED]","command":"echo ok","nested":{"password":"[REDACTED]"}}`
 	if snapshots[0] != want {
 		t.Fatalf("sanitized tool argument snapshot = %q, want %q", snapshots[0], want)
+	}
+}
+
+func TestConsumeStream_MalformedToolArgumentsKeepOnlyNonPersistentFlag(t *testing.T) {
+	const secret = "do-not-persist-this-secret"
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "tool_use_start", ToolUseID: "bad-json", ToolName: "Write"},
+		{Type: "tool_input_delta", ToolUseID: "bad-json", InputDelta: `{"path":"/tmp/a","api_key":"` + secret + `"`},
+		{Type: "tool_use_stop", ToolUseID: "bad-json"},
+		{Type: "message_delta", StopReason: "tool_use"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = (&Loop{}).consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+	if len(blocks) != 1 || !blocks[0].ToolInputMalformed || len(blocks[0].ToolInput) != 0 {
+		t.Fatalf("malformed block = %+v", blocks)
+	}
+	persisted, err := json.Marshal(blocks[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), secret) || strings.Contains(string(persisted), "ToolInputMalformed") {
+		t.Fatalf("malformed argument details leaked into persistence: %s", persisted)
 	}
 }
 

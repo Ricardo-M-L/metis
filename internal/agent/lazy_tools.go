@@ -62,19 +62,35 @@ const DefaultToolSearchResults = 5
 // rewrite still work — costs nothing and avoids breaking sessions that
 // crossed the upgrade boundary mid-flight.
 func handleToolSearch(l *Loop, b llm.ContentBlock) llm.ContentBlock {
-	query := stringField(b.ToolInput, "query")
-	if query == "" {
-		if name := stringField(b.ToolInput, "name"); name != "" {
-			query = "select:" + name
-		}
+	if hasMalformedToolJSON(b) {
+		return malformedToolJSONBlock("ToolSearch", b.ToolUseID)
 	}
-	if query == "" {
-		return llm.ContentBlock{
-			Type: "tool_result", ToolUseID: b.ToolUseID,
-			ToolResult: "error: ToolSearch requires {\"query\":\"...\"} — use \"select:<name>\" for exact lookup or keywords to search (e.g. \"screenshot\", \"+slack send\")",
-			IsError:    true,
-		}
+	input := make(map[string]any, len(b.ToolInput)+1)
+	for key, value := range b.ToolInput {
+		input[key] = value
 	}
+	if alias, present := input["name"]; present {
+		query, validQuery := input["query"].(string)
+		validQuery = validQuery && strings.TrimSpace(query) != ""
+		if !validQuery {
+			name, ok := alias.(string)
+			if !ok || strings.TrimSpace(name) == "" {
+				return invalidToolArgumentsBlock("ToolSearch", b.ToolUseID, &pubtool.ValidationError{
+					Path: "$.name", Keyword: "type", Message: "legacy name alias must be a non-empty string",
+				})
+			}
+			input["query"] = "select:" + name
+		}
+		// Preserve the historical precedence: a valid canonical query wins when
+		// both forms are present. Removing the alias makes the canonical object
+		// satisfy the strict public schema without breaking restored transcripts.
+		delete(input, "name")
+	}
+	if verr := pubtool.ValidateInput(toolSearchSpec(nil).InputSchema, input); verr != nil {
+		return invalidToolArgumentsBlock("ToolSearch", b.ToolUseID, verr)
+	}
+	b.ToolInput = input
+	query := stringField(input, "query")
 
 	maxResults := DefaultToolSearchResults
 	switch n := b.ToolInput["max_results"].(type) {
@@ -717,14 +733,18 @@ func toolSearchSpecWithExposure(allSpecs []llm.ToolSpec, deferredNames map[strin
 		// prefix instead of moving whenever deferred schemas hydrate.
 		Exposure: string(tools.ToolExposureDeferred),
 		InputSchema: map[string]any{
-			"type": "object",
+			"type":                 "object",
+			"additionalProperties": false,
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
+					"minLength":   1,
 					"description": "Query to find deferred tools. Use \"select:<tool_name>\" for direct selection, or keywords to search.",
 				},
 				"max_results": map[string]any{
-					"type":        "number",
+					"type":        "integer",
+					"minimum":     1,
+					"maximum":     MaxToolSearchResults,
 					"description": fmt.Sprintf("Maximum number of results to return (default: %d)", DefaultToolSearchResults),
 				},
 			},

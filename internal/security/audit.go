@@ -124,11 +124,22 @@ func checkAPIKeyHardcoded(cfg *config.Config, r *Report) {
 
 func checkPermissionMode(cfg *config.Config, r *Report) {
 	mode, ok := permission.ParseMode(cfg.Permission.Mode)
-	if ok && mode == permission.ModeBypassPermissions {
+	if !ok {
+		return
+	}
+	switch mode {
+	case permission.ModeBypassPermissions:
 		r.Findings = append(r.Findings, Finding{
 			Severity: SeverityCritical,
 			Code:     "PERMISSION_BYPASS",
 			Message:  "permission mode = bypassPermissions; tools execute without ordinary confirmation",
+			Resource: "config.toml [permission]",
+		})
+	case permission.ModeFullAccess:
+		r.Findings = append(r.Findings, Finding{
+			Severity: SeverityCritical,
+			Code:     "PERMISSION_FULL_ACCESS",
+			Message:  "permission mode = fullAccess; approvals and the process sandbox are disabled, so tools run with the host user's access",
 			Resource: "config.toml [permission]",
 		})
 	}

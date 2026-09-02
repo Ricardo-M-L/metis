@@ -277,6 +277,8 @@ func lspCredentialDecision(gate *permission.Gate, lexical, resolved string) (per
 		return permission.DecisionDeny, "secret_read:bypass_immune", true
 	}
 	switch gate.Mode() {
+	case permission.ModeFullAccess:
+		return permission.DecisionAllow, "mode:fullAccess", true
 	case permission.ModeBypassPermissions, permission.ModeDontAsk:
 		return permission.DecisionDeny, "secret_read:bypass_immune", true
 	default:

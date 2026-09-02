@@ -11,8 +11,76 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
+
+func TestTurnActive_PermissionSlashCannotChangeMode(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	beforeMode := m.gate.Mode()
+	beforePlan := m.loop.IsPlanMode()
+	beforePrePlan := m.loop.PrePlanMode()
+	m.input.SetValue("/default")
+
+	pressEnter(t, m)
+
+	if got := m.gate.Mode(); got != beforeMode || got != permission.ModeAcceptEdits {
+		t.Fatalf("mid-turn /default changed gate mode: got %q, want %q", got, beforeMode)
+	}
+	if got := m.loop.IsPlanMode(); got != beforePlan {
+		t.Fatalf("mid-turn /default changed plan state: got %v, want %v", got, beforePlan)
+	}
+	if got := m.loop.PrePlanMode(); got != beforePrePlan {
+		t.Fatalf("mid-turn /default changed plan lineage: got %q, want %q", got, beforePrePlan)
+	}
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "running turn is active") {
+		t.Fatalf("mid-turn /default did not surface a refusal: %+v", m.messages)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("mid-turn /default leaked into model steering: %q", got)
+	}
+}
+
+func TestTurnActive_SessionsSlashCannotOpenPickerOrSteer(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	m.input.SetValue("/sessions")
+
+	pressEnter(t, m)
+
+	if m.activeScreen != nil {
+		t.Fatalf("mid-turn /sessions opened a session picker: %T", m.activeScreen)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("mid-turn /sessions leaked into model steering: %q", got)
+	}
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "can't /sessions mid-turn") {
+		t.Fatalf("mid-turn /sessions did not surface a refusal: %+v", m.messages)
+	}
+}
+
+func TestTurnActive_SessionSwitchCommandsAreRefused(t *testing.T) {
+	for _, command := range []string{"/sessions", "/resume"} {
+		t.Run(command, func(t *testing.T) {
+			m := newSlashTestModel(t)
+			m.turnActive = true
+			m.input.SetValue(command)
+
+			pressEnter(t, m)
+
+			if m.activeScreen != nil {
+				t.Fatalf("active-turn %s opened %T", command, m.activeScreen)
+			}
+			if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "can't "+command+" mid-turn") {
+				t.Fatalf("active-turn %s refusal = %+v", command, m.messages)
+			}
+			if got := m.loop.SteerInjectDrainForTest(); got != "" {
+				t.Fatalf("active-turn %s leaked into model steering: %q", command, got)
+			}
+		})
+	}
+}
 
 func TestTurnActive_ExportRunsLocallyOnce(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())

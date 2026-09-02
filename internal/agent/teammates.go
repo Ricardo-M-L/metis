@@ -155,7 +155,7 @@ func (s TeammateStatus) String() string {
 // to bash (no `tail -f /var/log` style firehose) and the simpler model
 // makes the SubAgentOutput tool a synchronous read instead of disk I/O.
 type Teammate struct {
-	mu sync.RWMutex // guards Status / Output / Result / EndTime / ExitErr
+	mu sync.RWMutex // guards status/output fields and cancellation publication
 
 	// done closes only when the runner has fully unwound and called the
 	// identity-aware roster unregister path. Session workspace switches wait
@@ -201,8 +201,15 @@ type Teammate struct {
 	Mailbox chan PeerMessage
 
 	// Cancel terminates the sub-agent's context. Called by /agents kill
-	// and by the Roster when parent ctx is cancelled.
+	// and by the Roster when parent ctx is cancelled. Once a teammate is
+	// published in a Roster, callers must use SetCancel and RequestCancel so a
+	// strict lifecycle boundary cannot miss a runner whose callback is still
+	// being constructed.
 	Cancel func()
+	// cancelRequested latches a boundary request that arrived after Register
+	// but before Agent finished installing Cancel. SetCancel observes the latch
+	// and fires the callback immediately, outside mu.
+	cancelRequested bool
 
 	// Status / Output / Result / EndTime / ExitErr — set by the
 	// sub-loop's runner goroutine; read via Snapshot() under the mutex
@@ -230,6 +237,42 @@ func (t *Teammate) IsNamed() bool {
 		return false
 	}
 	return !t.Anonymous
+}
+
+// SetCancel publishes the runner's cancellation callback. If a stop or
+// lifecycle boundary already requested cancellation while the runner was
+// still being constructed, the callback is invoked immediately after it is
+// installed. The callback runs outside t.mu because cancellation may unwind
+// code that takes the roster or teammate locks again.
+func (t *Teammate) SetCancel(cancel func()) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.Cancel = cancel
+	requested := t.cancelRequested
+	t.mu.Unlock()
+	if requested && cancel != nil {
+		cancel()
+	}
+}
+
+// RequestCancel records an authoritative cancellation request and invokes the
+// installed callback when one is already available. A false return means the
+// request was safely latched for a future SetCancel, not that it was dropped.
+func (t *Teammate) RequestCancel() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	t.cancelRequested = true
+	cancel := t.Cancel
+	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		return true
+	}
+	return false
 }
 
 // AppendText is the streaming-text accumulator. Called by the
@@ -370,6 +413,20 @@ type Roster struct {
 	mu        sync.RWMutex
 	teammates map[string]*Teammate
 	resetting bool
+	// resetToken gives strict lifecycle joins a single owner. A channel token,
+	// rather than sync.Mutex, lets a queued CancelAndWait honor its own context.
+	// strictResetters is incremented before a caller waits for the token, so
+	// Register stays closed
+	// across the hand-off from a timed-out owner to an already-queued waiter.
+	// Without that announcement window, a fresh runner could enter between two
+	// CancelAndWait calls and then be forgotten by the second caller.
+	resetToken      chan struct{}
+	strictResetters int
+	// draining retains runners hidden by a legacy non-blocking Reset or
+	// CancelAll until their identity-aware finalizer signals done. A later
+	// strict boundary must still be able to cancel and join those runners even
+	// though the public live roster has already advanced to a new generation.
+	draining map[*Teammate]struct{}
 	// recentlyFinished is the keep-around list of teammates whose
 	// sub-loop has exited but whose Output/Status the parent may
 	// still want to read. Append-only with size cap; oldest evicted
@@ -436,10 +493,28 @@ func NewRoster(capNamed int, capAnon ...int) *Roster {
 		anon = capAnon[0]
 	}
 	return &Roster{
-		teammates: make(map[string]*Teammate),
-		capNamed:  capNamed,
-		capAnon:   anon,
+		teammates:  make(map[string]*Teammate),
+		resetToken: newRosterResetToken(),
+		capNamed:   capNamed,
+		capAnon:    anon,
 	}
+}
+
+func newRosterResetToken() chan struct{} {
+	token := make(chan struct{}, 1)
+	token <- struct{}{}
+	return token
+}
+
+// lifecycleResetToken returns the single-owner token, lazily initializing it
+// so a zero-value Roster remains usable by reduced embedders and tests.
+func (r *Roster) lifecycleResetToken() chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.resetToken == nil {
+		r.resetToken = newRosterResetToken()
+	}
+	return r.resetToken
 }
 
 // ErrCapacityExceeded is returned by Register when the Roster is full.
@@ -568,19 +643,26 @@ func (r *Roster) UnregisterTeammate(t *Teammate) {
 	if t == nil {
 		return
 	}
-	defer t.signalDone()
+	// Publish full runner completion before removing a retired handle. A
+	// concurrent strict snapshot may then either observe t and an already-closed
+	// done channel, or miss it because there is no work left to join.
+	t.signalDone()
 	r.unregister(t.Name, t)
 }
 
 func (r *Roster) unregister(name string, expected *Teammate) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if expected != nil {
+		delete(r.draining, expected)
+	}
 	t, ok := r.teammates[name]
 	if !ok || (expected != nil && t != expected) {
 		return
 	}
 	if expected == nil {
-		defer t.signalDone()
+		t.signalDone()
+		delete(r.draining, t)
 	}
 	delete(r.teammates, name)
 	r.recentlyFinished = append(r.recentlyFinished, t)
@@ -724,18 +806,12 @@ func (r *Roster) List() []*Teammate {
 	return out
 }
 
-// CancelAll fires every teammate's Cancel func and clears the
-// registry. Used during shutdown so orphan sub-agents don't keep
-// burning tokens past parent termination.
+// CancelAll requests cancellation for every live teammate and hides the
+// current generation. Retired handles remain joinable by a later strict
+// CancelAndWait so a compatibility reset cannot make resource ownership
+// disappear.
 func (r *Roster) CancelAll() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, t := range r.teammates {
-		if t.Cancel != nil {
-			t.Cancel()
-		}
-	}
-	r.teammates = make(map[string]*Teammate)
+	r.cancelAndMaybeForget(false)
 }
 
 // CancelAndWait cancels the current roster generation and waits until every
@@ -750,28 +826,68 @@ func (r *Roster) CancelAndWait(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Announce before waiting for the single-flight owner. A queued strict reset
+	// is itself an admission barrier; the previous owner must not reopen
+	// Register merely because its own context expires. Initialize the token
+	// under this same lock so zero-value Rosters preserve that ordering too.
 	r.mu.Lock()
+	if r.resetToken == nil {
+		r.resetToken = newRosterResetToken()
+	}
+	token := r.resetToken
+	r.strictResetters++
 	r.resetting = true
-	live := make([]*Teammate, 0, len(r.teammates))
+	r.mu.Unlock()
+
+	select {
+	case <-token:
+		// This caller now owns the destructive generation boundary.
+		if err := ctx.Err(); err != nil {
+			r.mu.Lock()
+			r.strictResetters--
+			if r.strictResetters == 0 {
+				r.resetting = false
+			}
+			r.mu.Unlock()
+			token <- struct{}{}
+			return err
+		}
+	case <-ctx.Done():
+		r.mu.Lock()
+		r.strictResetters--
+		if r.strictResetters == 0 {
+			r.resetting = false
+		}
+		r.mu.Unlock()
+		return ctx.Err()
+	}
+	r.mu.Lock()
+	live := make([]*Teammate, 0, len(r.teammates)+len(r.draining))
 	for _, teammate := range r.teammates {
+		live = append(live, teammate)
+	}
+	for teammate := range r.draining {
 		live = append(live, teammate)
 	}
 	r.mu.Unlock()
 
 	for _, teammate := range live {
-		if teammate.Cancel != nil {
-			teammate.Cancel()
-		}
+		teammate.RequestCancel()
 	}
 	joined := false
 	defer func() {
 		r.mu.Lock()
-		r.resetting = false
 		if joined {
 			r.teammates = make(map[string]*Teammate)
+			r.draining = nil
 			r.recentlyFinished = nil
 		}
+		r.strictResetters--
+		if r.strictResetters == 0 {
+			r.resetting = false
+		}
 		r.mu.Unlock()
+		token <- struct{}{}
 	}()
 	for _, teammate := range live {
 		if teammate.done == nil {
@@ -792,15 +908,66 @@ func (r *Roster) CancelAndWait(ctx context.Context) error {
 // because Agent/SubAgent tools retain this pointer across in-process /new,
 // /branch and /resume operations.
 func (r *Roster) Reset() {
+	r.cancelAndMaybeForget(true)
+}
+
+// cancelAndMaybeForget preserves the legacy signal-and-forget behavior of
+// Reset and CancelAll when no strict lifecycle join is active. If a strict
+// caller owns (or has already announced intent for) the roster generation,
+// the non-blocking operation may repeat cancellation but must retain every
+// handle for that caller to join. Non-blocking token acquisition is
+// deliberate: Reset remains a compatibility API even when CancelAndWait is
+// waiting on a slow runner.
+func (r *Roster) cancelAndMaybeForget(clearFinished bool) {
+	if r == nil {
+		return
+	}
+	token := r.lifecycleResetToken()
+	select {
+	case <-token:
+		defer func() { token <- struct{}{} }()
+	default:
+		r.cancelLiveTeammates()
+		return
+	}
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, t := range r.teammates {
-		if t.Cancel != nil {
-			t.Cancel()
+	live := make([]*Teammate, 0, len(r.teammates))
+	for _, teammate := range r.teammates {
+		live = append(live, teammate)
+	}
+	if !r.resetting {
+		if r.draining == nil {
+			r.draining = make(map[*Teammate]struct{}, len(live))
+		}
+		for _, teammate := range live {
+			r.draining[teammate] = struct{}{}
+		}
+		r.teammates = make(map[string]*Teammate)
+		if clearFinished {
+			r.recentlyFinished = nil
 		}
 	}
-	r.teammates = make(map[string]*Teammate)
-	r.recentlyFinished = nil
+	r.mu.Unlock()
+
+	for _, teammate := range live {
+		teammate.RequestCancel()
+	}
+}
+
+// cancelLiveTeammates is the signal-only fallback used while another
+// lifecycle operation owns resetToken. It intentionally leaves both maps
+// intact.
+func (r *Roster) cancelLiveTeammates() {
+	r.mu.RLock()
+	live := make([]*Teammate, 0, len(r.teammates))
+	for _, teammate := range r.teammates {
+		live = append(live, teammate)
+	}
+	r.mu.RUnlock()
+	for _, teammate := range live {
+		teammate.RequestCancel()
+	}
 }
 
 // ListNamed returns a snapshot of all currently-registered named

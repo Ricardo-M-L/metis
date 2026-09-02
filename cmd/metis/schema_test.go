@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 // TestBuildListingRegistry_ContractShape locks the invariant `metis schema`
@@ -34,6 +35,13 @@ func TestBuildListingRegistry_ContractShape(t *testing.T) {
 		// properties) — what an SDK client needs to build a typed call.
 		if sch["type"] != "object" && sch["properties"] == nil {
 			t.Errorf("tool %q InputSchema is not an object schema: %v", tool.Name(), sch)
+		}
+		// The runtime dispatcher now compiles every advertised schema before
+		// permission or execution. Validate the complete built-in catalog here so
+		// an invalid schema cannot silently ship and make a tool unavailable.
+		if validationErr := pubtool.ValidateInput(sch, map[string]any{}); validationErr != nil &&
+			validationErr.Code == pubtool.ValidationCodeSchemaInvalid {
+			t.Errorf("tool %q publishes an invalid InputSchema: %v", tool.Name(), validationErr)
 		}
 	}
 

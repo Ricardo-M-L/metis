@@ -24,6 +24,16 @@ Reserve shell commands for work that genuinely needs a shell. Do not use shell
 output commands to communicate with the user, and do not use fragile shell
 rewrites when a structured edit tool fits.
 
+Do not poll or disguise waits with an interpreter. Run long work in the
+background and rely on its completion notification. If a one-time delay is the
+only synchronization, issue it once: Bash backgrounds delays of at least two
+seconds and resumes you with captured output. Never retry with a shorter sleep
+or wrapper. Use `Output` only for needed interim logs and `Monitor` for a
+specific event. Sub-two-second rate pacing may stay foreground.
+
+Use native structured tool calls. Printed `<tool_call>` / `<function=...>`
+markup is text, not execution.
+
 Batch independent reads or searches in one turn when supported. Keep dependent
 or state-changing operations ordered. If a preferred tool is unavailable, use
 the safest equivalent that preserves the user's requested scope.

@@ -19,6 +19,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	memorysecurity "github.com/Ricardo-M-L/metis/internal/memory/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 const maxSecureAutoMemoryBytes = 64 * 1024 * 1024
@@ -45,6 +46,49 @@ func (t secureAutoMemoryTool) ToolExposure() tools.ToolExposure {
 
 func (t secureAutoMemoryTool) IsDestructive(map[string]any) bool { return true }
 
+// NormalizeInput keeps the secure memory boundary compatible with restored
+// Write/Edit calls. Embedding tools.Tool does not promote optional interfaces,
+// so this wrapper must explicitly preserve normalization itself.
+func (t secureAutoMemoryTool) NormalizeInput(input map[string]any) (map[string]any, error) {
+	normalized, err := pubtool.NormalizeToolInput(t.Tool, input)
+	if err != nil {
+		return nil, err
+	}
+	switch t.Name() {
+	case "Write":
+		return normalizeAutoMemoryAliasesForSchema(normalized, t.InputSchema(), map[string]string{"file_path": "path"})
+	case "Edit":
+		return normalizeAutoMemoryAliasesForSchema(normalized, t.InputSchema(), map[string]string{
+			"file_path":   "path",
+			"old_string":  "old",
+			"new_string":  "new",
+			"replace_all": "all",
+		})
+	default:
+		return normalized, nil
+	}
+}
+
+// normalizeAutoMemoryAliasesForSchema follows the wrapped tool's actual
+// contract. Production Write/Edit use path/old/new/all, while restored test or
+// plugin tools may still publish file_path/old_string/new_string/replace_all.
+// Keeping a legacy key when the schema explicitly declares only that key
+// avoids turning a compatible restored invocation into a false required-field
+// failure before the secure executor sees it.
+func normalizeAutoMemoryAliasesForSchema(input, schema map[string]any, aliases map[string]string) (map[string]any, error) {
+	properties, _ := schema["properties"].(map[string]any)
+	selected := make(map[string]string, len(aliases))
+	for legacy, canonical := range aliases {
+		_, schemaHasLegacy := properties[legacy]
+		_, schemaHasCanonical := properties[canonical]
+		if schemaHasLegacy && !schemaHasCanonical {
+			continue
+		}
+		selected[legacy] = canonical
+	}
+	return pubtool.NormalizeAliases(input, selected)
+}
+
 func (t secureAutoMemoryTool) Execute(ctx context.Context, input map[string]any) (*tools.Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -52,6 +96,14 @@ func (t secureAutoMemoryTool) Execute(ctx context.Context, input map[string]any)
 	path := autoMemoryStringField(input, "path", "file_path")
 	if path == "" {
 		return nil, fmt.Errorf("%s: path is required", t.Name())
+	}
+	if t.Name() == "Edit" {
+		// Validate presence and type before secureAutoMemoryTarget can create the
+		// memory root. Direct Execute callers bypass schema validation, and an
+		// invalid replacement must have no filesystem side effects.
+		if _, err := autoMemoryEditReplacement(input); err != nil {
+			return nil, err
+		}
 	}
 	target, err := secureAutoMemoryTarget(t.root, path)
 	if err != nil {
@@ -137,9 +189,12 @@ func secureAutoMemoryRegistry(reg *tools.Registry, root string, source AutoMemor
 
 func secureAutoMemoryEditContent(root, path string, input map[string]any) (string, string, error) {
 	old := autoMemoryStringField(input, "old", "old_string")
-	newValue := autoMemoryStringField(input, "new", "new_string")
 	if old == "" {
 		return "", "", errors.New("Edit: old is required")
+	}
+	newValue, err := autoMemoryEditReplacement(input)
+	if err != nil {
+		return "", "", err
 	}
 	if old == newValue {
 		return "", "", errors.New("Edit: old and new are identical")
@@ -169,6 +224,23 @@ func secureAutoMemoryEditContent(root, path string, input map[string]any) (strin
 		return strings.ReplaceAll(body, old, newValue), expected, nil
 	}
 	return strings.Replace(body, old, newValue, 1), expected, nil
+}
+
+func autoMemoryEditReplacement(input map[string]any) (string, error) {
+	for _, name := range []string{"new", "new_string"} {
+		raw, present := input[name]
+		if !present {
+			continue
+		}
+		value, ok := raw.(string)
+		if !ok {
+			return "", fmt.Errorf("Edit: %s must be a string", name)
+		}
+		// Presence, rather than non-emptiness, is the contract here: an explicit
+		// empty replacement is a valid deletion while omission is invalid.
+		return value, nil
+	}
+	return "", errors.New("Edit: new is required")
 }
 
 // prepareSecureAutoMemoryMemo operates entirely in memory. No filesystem

@@ -43,6 +43,97 @@ type mcpLoginServer interface {
 	Close() error
 }
 
+// MCPLaunchTicket captures both the runtime's adoption generation and an
+// in-flight lifecycle lease before an explicit operation starts. Context is
+// canceled when fullAccess is revoked; Finish releases the runtime join edge
+// only after the launcher has returned and any unadopted server is closed.
+type MCPLaunchTicket struct {
+	ctx    context.Context
+	adopt  func(*mcptools.Server, []tools.Tool) bool
+	finish func()
+	once   sync.Once
+}
+
+func NewMCPLaunchTicket(ctx context.Context, adopt func(*mcptools.Server, []tools.Tool) bool, finish func()) *MCPLaunchTicket {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &MCPLaunchTicket{ctx: ctx, adopt: adopt, finish: finish}
+}
+
+func (t *MCPLaunchTicket) Context() context.Context {
+	if t == nil || t.ctx == nil {
+		return context.Background()
+	}
+	return t.ctx
+}
+
+func (t *MCPLaunchTicket) Adopt(server *mcptools.Server, discovered []tools.Tool) bool {
+	if t == nil || t.adopt == nil {
+		return false
+	}
+	return t.adopt(server, discovered)
+}
+
+func (t *MCPLaunchTicket) Finish() {
+	if t == nil {
+		return
+	}
+	t.once.Do(func() {
+		if t.finish != nil {
+			t.finish()
+		}
+	})
+}
+
+func beginMCPLaunchTicket(lifecycle context.Context, begin func(context.Context) *MCPLaunchTicket, legacy func(*mcptools.Server, []tools.Tool) bool) *MCPLaunchTicket {
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
+	if begin != nil {
+		if ticket := begin(lifecycle); ticket != nil {
+			return ticket
+		}
+	}
+	return NewMCPLaunchTicket(lifecycle, legacy, nil)
+}
+
+func (m *Model) beginMCPLaunchTicket(lifecycle context.Context) *MCPLaunchTicket {
+	if m == nil {
+		return NewMCPLaunchTicket(lifecycle, nil, nil)
+	}
+	return beginMCPLaunchTicket(lifecycle, m.ext.BeginMCPLaunch, m.ext.AdoptMCPServer)
+}
+
+func (r *REPL) beginMCPLaunchTicket(lifecycle context.Context) *MCPLaunchTicket {
+	if r == nil {
+		return NewMCPLaunchTicket(lifecycle, nil, nil)
+	}
+	return beginMCPLaunchTicket(lifecycle, r.BeginMCPLaunch, r.AdoptMCPServer)
+}
+
+// mcpLaunchOperationContext follows both a bounded command operation and its
+// runtime launch lease. The returned context preserves operation values and
+// deadlines while permission revocation can still cancel OAuth/token work
+// before the live-server handoff begins.
+func mcpLaunchOperationContext(operation, lifecycle context.Context) (context.Context, context.CancelFunc) {
+	if operation == nil {
+		operation = context.Background()
+	}
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
+	ctx, cancel := context.WithCancel(operation)
+	stop := context.AfterFunc(lifecycle, cancel)
+	if lifecycle.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
 // mcpLoginLaunchLease owns a successfully launched server between the
 // background tea.Cmd and the Bubble Tea Update goroutine. A normal result
 // claims the lease before publishing tools. Cancellation or application exit
@@ -50,10 +141,80 @@ type mcpLoginServer interface {
 // This closes the otherwise unavoidable "launch succeeded while tea.Quit was
 // draining" ownership gap.
 type mcpLoginLaunchLease struct {
-	mu      sync.Mutex
-	launch  mcpLoginLaunch
-	aborted bool
-	claimed bool
+	mu              sync.Mutex
+	launch          mcpLoginLaunch
+	ticket          *MCPLaunchTicket
+	stopLifecycle   func() bool
+	producerStarted bool
+	producerDone    bool
+	ticketFinished  bool
+	aborted         bool
+	claimed         bool
+}
+
+func (l *mcpLoginLaunchLease) bindLifecycle(ctx context.Context) {
+	if l == nil || ctx == nil {
+		return
+	}
+	stop := context.AfterFunc(ctx, l.abort)
+	l.mu.Lock()
+	if l.ticketFinished {
+		l.mu.Unlock()
+		stop()
+		return
+	}
+	l.stopLifecycle = stop
+	l.mu.Unlock()
+}
+
+func (l *mcpLoginLaunchLease) finishTicket() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.ticketFinished {
+		l.mu.Unlock()
+		return
+	}
+	l.ticketFinished = true
+	stop := l.stopLifecycle
+	l.stopLifecycle = nil
+	ticket := l.ticket
+	l.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	if ticket != nil {
+		ticket.Finish()
+	}
+}
+
+// startProducer transfers the launch lease from the queued tea.Cmd to its
+// worker. Cancellation that wins before this point may release the runtime
+// ticket immediately because no launcher can exist; cancellation after this
+// point must wait for fail/stage to prove the worker and its resources have
+// unwound.
+func (l *mcpLoginLaunchLease) startProducer() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.aborted || l.claimed || l.ticketFinished {
+		return false
+	}
+	l.producerStarted = true
+	return true
+}
+
+func (l *mcpLoginLaunchLease) fail() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.producerDone = true
+	l.mu.Unlock()
+	l.finishTicket()
 }
 
 func (l *mcpLoginLaunchLease) stage(launch mcpLoginLaunch) bool {
@@ -62,9 +223,11 @@ func (l *mcpLoginLaunchLease) stage(launch mcpLoginLaunch) bool {
 		return false
 	}
 	l.mu.Lock()
+	l.producerDone = true
 	if l.aborted || l.claimed {
 		l.mu.Unlock()
 		closeMCPLoginLaunch(launch)
+		l.finishTicket()
 		return false
 	}
 	l.launch = launch
@@ -99,8 +262,13 @@ func (l *mcpLoginLaunchLease) abort() {
 	l.aborted = true
 	launch := l.launch
 	l.launch = mcpLoginLaunch{}
+	producerStarted := l.producerStarted
+	producerDone := l.producerDone
 	l.mu.Unlock()
 	closeMCPLoginLaunch(launch)
+	if !producerStarted || producerDone {
+		l.finishTicket()
+	}
 }
 
 func closeMCPLoginLaunch(launch mcpLoginLaunch) {
@@ -121,6 +289,16 @@ func launchMCPServerWithLifecycle(
 ) (*mcptools.Server, error) {
 	if launch == nil {
 		return nil, errors.New("MCP launcher is unavailable")
+	}
+	if operationCtx != nil {
+		if err := operationCtx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if lifecycleCtx != nil {
+		if err := lifecycleCtx.Err(); err != nil {
+			return nil, err
+		}
 	}
 	handoff := newMCPLoginLaunchContext(operationCtx, lifecycleCtx)
 	server, err := launch(handoff)
@@ -272,6 +450,11 @@ var launchMCPServerAfterLogin = func(ctx context.Context, reg *mcp.Registry, nam
 	return mcp.LaunchServer(ctx, reg, name, registry)
 }
 
+// launchConfiguredMCPServer is the common launch seam for synchronous
+// `/mcp start` and `/cu enable`. Both entry points capture an MCPLaunchTicket
+// before invoking it and use that same ticket for the eventual adoption.
+var launchConfiguredMCPServer = mcp.LaunchServerWithSandbox
+
 // startMCPServerAfterLogin is a test seam around the slow live-server launch.
 // It stages discovered tools in a private registry; handleMCPLoginResult owns
 // the only TUI-side publication into the live registry.
@@ -301,6 +484,15 @@ var startMCPServerAfterLogin = func(operationCtx, lifecycleCtx context.Context, 
 	if lifecycleCtx == nil {
 		lifecycleCtx = context.Background()
 	}
+	if operationCtx == nil {
+		operationCtx = context.Background()
+	}
+	if err := operationCtx.Err(); err != nil {
+		return mcpLoginLaunch{}, err
+	}
+	if err := lifecycleCtx.Err(); err != nil {
+		return mcpLoginLaunch{}, err
+	}
 
 	// Stage registration privately so cancellation cannot publish half-started
 	// tools. The handoff context follows the operation during the handshake and
@@ -321,20 +513,20 @@ var startMCPServerAfterLogin = func(operationCtx, lifecycleCtx context.Context, 
 	var result launchResult
 	select {
 	case <-operationCtx.Done():
-		go func() {
-			late := <-resultCh
-			if late.server != nil {
-				_ = late.server.Close()
-			}
-		}()
+		// Join the launcher before releasing the runtime ticket. A launcher
+		// that notices cancellation late may still own a just-spawned process or
+		// HTTP client; fire-and-forget cleanup would let it cross a permission
+		// boundary after revoke had already returned.
+		late := <-resultCh
+		if late.server != nil {
+			_ = late.server.Close()
+		}
 		return mcpLoginLaunch{}, operationCtx.Err()
 	case <-lifecycleCtx.Done():
-		go func() {
-			late := <-resultCh
-			if late.server != nil {
-				_ = late.server.Close()
-			}
-		}()
+		late := <-resultCh
+		if late.server != nil {
+			_ = late.server.Close()
+		}
 		return mcpLoginLaunch{}, lifecycleCtx.Err()
 	case result = <-resultCh:
 	}
@@ -379,6 +571,9 @@ func liveMCPToolCount(registry *tools.Registry, serverName string) int {
 func runMCPLogin(ctx, lifecycleCtx context.Context, target mcpLoginTarget, registry *tools.Registry) (mcpLoginLaunch, error) {
 	if ctx == nil {
 		return mcpLoginLaunch{}, errors.New("OAuth context is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return mcpLoginLaunch{}, err
 	}
 	if _, err := ensureMCPToken(ctx, target.name, target.url, true); err != nil {
 		return mcpLoginLaunch{}, err
@@ -485,18 +680,21 @@ func (m *Model) startMCPLogin(name string) tea.Cmd {
 		})
 		return nil
 	}
-	target, err := resolveMCPLoginTarget(name)
-	if err != nil {
-		m.messages = append(m.messages, Message{Role: "error", Content: redactMCPLoginError(err), Timestamp: time.Now()})
-		return nil
-	}
-
 	base := m.ctx
 	if base == nil {
 		base = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(base, mcpLoginTimeout)
-	lease := &mcpLoginLaunchLease{}
+	ticket := m.beginMCPLaunchTicket(base)
+	target, err := resolveMCPLoginTarget(name)
+	if err != nil {
+		ticket.Finish()
+		m.messages = append(m.messages, Message{Role: "error", Content: redactMCPLoginError(err), Timestamp: time.Now()})
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ticket.Context(), mcpLoginTimeout)
+	lease := &mcpLoginLaunchLease{ticket: ticket}
+	lease.bindLifecycle(ticket.Context())
 	m.mcpLoginSeq++
 	requestID := m.mcpLoginSeq
 	m.mcpLoginPending = true
@@ -518,8 +716,16 @@ func (m *Model) startMCPLogin(name string) tea.Cmd {
 		registry = m.loop.Registry
 	}
 	return func() tea.Msg {
-		launch, err := runMCPLogin(ctx, base, target, registry)
-		if err == nil && !lease.stage(launch) {
+		if !lease.startProducer() {
+			return mcpLoginResultMsg{
+				requestID: requestID, name: name, registry: registry,
+				lease: lease, err: context.Canceled,
+			}
+		}
+		launch, err := runMCPLogin(ctx, ticket.Context(), target, registry)
+		if err != nil {
+			lease.fail()
+		} else if !lease.stage(launch) {
 			err = context.Canceled
 		}
 		return mcpLoginResultMsg{
@@ -543,6 +749,7 @@ func (m *Model) handleMCPLoginResult(msg mcpLoginResultMsg) {
 		msg.lease.abort()
 		return
 	}
+	defer msg.lease.finishTicket()
 	var launch mcpLoginLaunch
 	if msg.err == nil {
 		var claimed bool
@@ -572,7 +779,7 @@ func (m *Model) handleMCPLoginResult(msg mcpLoginResultMsg) {
 		m.messages = append(m.messages, Message{Role: role, Content: content, Timestamp: time.Now()})
 		return
 	}
-	toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(msg.registry, msg.name, launch, m.ext.AdoptMCPServer)
+	toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(msg.registry, msg.name, launch, msg.lease.ticket.Adopt)
 	if ownsServer {
 		m.mcpLoginServers = append(m.mcpLoginServers, launch.server)
 	}

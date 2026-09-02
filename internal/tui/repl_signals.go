@@ -48,6 +48,7 @@ func classifyPlainREPLSignal(sig slash.Signal) plainREPLSignalClass {
 		slash.SignalPlan,
 		slash.SignalAcceptEdits,
 		slash.SignalBypassPermissions,
+		slash.SignalFullAccess,
 		slash.SignalDefault,
 		slash.SignalDontAsk,
 		slash.SignalNew,

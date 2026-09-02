@@ -72,6 +72,11 @@ var customAuthTransports = []authTransportOption{
 		note:  "Metis appends /chat/completions to the base URL",
 	},
 	{
+		id:    "openai_responses",
+		label: "OpenAI-compatible Responses",
+		note:  "Metis appends /responses to the base URL",
+	},
+	{
 		id:    "anthropic_messages",
 		label: "Anthropic-compatible Messages",
 		note:  "Metis sends Anthropic Messages API requests",
@@ -290,6 +295,8 @@ func (m authModel) updateCustomTransport(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 		switch m.customTransport {
 		case "openai_chat":
 			m.customBaseURL.Placeholder = "https://api.example.com/v1"
+		case "openai_responses":
+			m.customBaseURL.Placeholder = "https://api.example.com/v1"
 		case "anthropic_messages":
 			m.customBaseURL.Placeholder = "https://api.example.com"
 		case "gemini_native":
@@ -415,6 +422,13 @@ func validateAndNormalizeCustomBaseURL(transport, raw string) (string, error) {
 		if strings.HasSuffix(u.Path, "/chat/completions") {
 			u.Path = strings.TrimSuffix(u.Path, "/chat/completions")
 		}
+	case "openai_responses":
+		if u.RawQuery != "" || u.ForceQuery {
+			return "", errors.New("base URL must not contain a query string or fragment")
+		}
+		if strings.HasSuffix(u.Path, "/responses") {
+			u.Path = strings.TrimSuffix(u.Path, "/responses")
+		}
 	case "anthropic_messages":
 		if u.RawQuery != "" || u.ForceQuery {
 			return "", errors.New("base URL must not contain a query string or fragment")
@@ -532,6 +546,8 @@ func (m authModel) View() tea.View {
 		switch m.customTransport {
 		case "openai_chat":
 			b.WriteString(authMuted.Render("You may paste either .../v1 or the full .../v1/chat/completions endpoint.") + "\n")
+		case "openai_responses":
+			b.WriteString(authMuted.Render("You may paste either .../v1 or the full .../v1/responses endpoint.") + "\n")
 		case "anthropic_messages":
 			b.WriteString(authMuted.Render("You may paste the API origin or a full .../v1/messages endpoint.") + "\n")
 		case "gemini_native":

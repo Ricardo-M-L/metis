@@ -41,6 +41,13 @@ type Responses struct {
 	Model       string
 	MaxTokens   int
 	Temperature float64
+	StateMode   ResponsesStateMode
+	// PromptCacheKey overrides the stable key derived from the non-volatile
+	// system prefix and function schema. It is sent only when the endpoint's
+	// capability profile allows prompt caching.
+	PromptCacheKey string
+	Capabilities   ResponsesCapabilities
+	HostedTools    []string
 	// ContextWindow, when > 0, overrides the default in MaxContextTokens().
 	ContextWindow int
 	httpClient    *http.Client
@@ -59,22 +66,47 @@ func NewResponses(apiKey, baseURL, model string, maxTokens int, timeout time.Dur
 		maxTokens = 4096
 	}
 	return &Responses{
-		APIKey:      apiKey,
-		BaseURL:     strings.TrimRight(baseURL, "/"),
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
-		httpClient:  transport.NewHTTPClient(timeout, "openai-responses"),
+		APIKey:       apiKey,
+		BaseURL:      strings.TrimRight(baseURL, "/"),
+		Model:        model,
+		MaxTokens:    maxTokens,
+		Temperature:  temperature,
+		StateMode:    ResponsesStateLocal,
+		Capabilities: detectResponsesCapabilities(baseURL),
+		httpClient:   transport.NewHTTPClient(timeout, "openai-responses"),
 	}
 }
 
 func (r *Responses) Name() string    { return "openai-responses" }
 func (r *Responses) ModelID() string { return r.Model }
 
-// The Responses request wire has no history item for Metis reasoning blocks;
-// both plaintext and redacted thinking are skipped by toResponsesRequest.
+// VisionCapability combines endpoint-level support with model-level facts.
+// Compatibility gateways remain Unknown when neither layer has a declaration,
+// so callers may still let the upstream API adjudicate new model ids.
+func (r *Responses) VisionCapability() provider.VisionCapability {
+	modelCapability := VisionCapabilityForModel(r.Model)
+	if modelCapability != provider.VisionUnknown {
+		return modelCapability
+	}
+	if r.Capabilities.Images {
+		return provider.VisionSupported
+	}
+	return provider.VisionUnknown
+}
+
+// Plaintext reasoning summaries are display-only. Encrypted reasoning is part
+// of the next request only in local/ZDR mode; provider-managed state refers to
+// it through previous_response_id instead. Opaque provider_state markers are
+// local bookkeeping and never occupy the upstream context window.
 func (r *Responses) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
-	return block.Type != "thinking" && block.Type != "redacted_thinking"
+	switch block.Type {
+	case "thinking", "provider_state":
+		return false
+	case "redacted_thinking":
+		return r.effectiveStateMode() == ResponsesStateLocal && r.Capabilities.EncryptedReasoning
+	default:
+		return true
+	}
 }
 
 func (r *Responses) MaxContextTokens() int {
@@ -88,14 +120,15 @@ func (r *Responses) MaxContextTokens() int {
 
 type responsesTool struct {
 	Type        string         `json:"type"`
-	Name        string         `json:"name"`
+	Name        string         `json:"name,omitempty"`
 	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 type responsesInputItem struct {
 	Type string `json:"type"`
 	Role string `json:"role,omitempty"`
+	ID   string `json:"id,omitempty"`
 	// message item
 	Content []responsesContentPart `json:"content,omitempty"`
 	// function_call item
@@ -104,23 +137,42 @@ type responsesInputItem struct {
 	Arguments string `json:"arguments,omitempty"`
 	// function_call_output item
 	Output string `json:"output,omitempty"`
+	// reasoning item (stateless/ZDR replay)
+	EncryptedContent string `json:"encrypted_content,omitempty"`
 }
 
 type responsesContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
 }
 
 type responsesRequest struct {
-	Model           string               `json:"model"`
-	Instructions    string               `json:"instructions,omitempty"`
-	Input           []responsesInputItem `json:"input"`
-	Tools           []responsesTool      `json:"tools,omitempty"`
-	MaxOutputTokens int                  `json:"max_output_tokens,omitempty"`
-	Temperature     float64              `json:"temperature,omitempty"`
-	Stream          bool                 `json:"stream,omitempty"`
-	Reasoning       *responsesReasoning  `json:"reasoning,omitempty"`
-	Store           bool                 `json:"store"`
+	Model              string               `json:"model"`
+	Instructions       string               `json:"instructions,omitempty"`
+	Input              []responsesInputItem `json:"input"`
+	Tools              []responsesTool      `json:"tools,omitempty"`
+	MaxOutputTokens    int                  `json:"max_output_tokens,omitempty"`
+	Temperature        float64              `json:"temperature,omitempty"`
+	Stream             bool                 `json:"stream,omitempty"`
+	Reasoning          *responsesReasoning  `json:"reasoning,omitempty"`
+	Store              bool                 `json:"store"`
+	Include            []string             `json:"include,omitempty"`
+	PreviousResponseID string               `json:"previous_response_id,omitempty"`
+	PromptCacheKey     string               `json:"prompt_cache_key,omitempty"`
+	Text               *responsesTextConfig `json:"text,omitempty"`
+}
+
+type responsesTextConfig struct {
+	Format responsesTextFormat `json:"format"`
+}
+
+type responsesTextFormat struct {
+	Type        string         `json:"type"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Schema      map[string]any `json:"schema"`
+	Strict      bool           `json:"strict"`
 }
 
 type responsesReasoning struct {
@@ -132,13 +184,25 @@ type responsesReasoning struct {
 // `function_call` items; user tool_result blocks become
 // `function_call_output` items; text blocks become message items.
 func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesRequest, error) {
+	return r.buildResponsesRequestWithVolatilePlacement(
+		req,
+		r.effectiveStateMode() == ResponsesStateProvider,
+	)
+}
+
+func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Request, volatileInInstructions bool) (*responsesRequest, error) {
+	stateMode := r.effectiveStateMode()
+	var volatile []responsesContentPart
 	out := &responsesRequest{
 		Model:           r.Model,
 		Instructions:    req.System,
 		MaxOutputTokens: r.MaxTokens,
 		Temperature:     r.Temperature,
 		Stream:          req.Stream,
-		Store:           false,
+		Store:           stateMode == ResponsesStateProvider,
+	}
+	if stateMode == ResponsesStateLocal && r.Capabilities.EncryptedReasoning {
+		out.Include = []string{"reasoning.encrypted_content"}
 	}
 	if req.MaxTokens > 0 {
 		out.MaxOutputTokens = req.MaxTokens
@@ -152,6 +216,10 @@ func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesReque
 			if sec.Body == "" {
 				continue
 			}
+			if sec.Volatile {
+				volatile = append(volatile, responsesContentPart{Type: "input_text", Text: sec.Body})
+				continue
+			}
 			if sb.Len() > 0 {
 				sb.WriteString("\n\n")
 			}
@@ -159,8 +227,32 @@ func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesReque
 		}
 		out.Instructions = sb.String()
 	}
+	if r.Capabilities.PromptCaching {
+		out.PromptCacheKey = r.PromptCacheKey
+		if out.PromptCacheKey == "" {
+			out.PromptCacheKey = stablePromptCacheKey(r.Model, out.Instructions, req.Tools)
+		}
+	}
+	if req.ResponseFormat != nil && r.Capabilities.StructuredOutputs {
+		name := strings.TrimSpace(req.ResponseFormat.Name)
+		if name == "" {
+			name = "metis_output"
+		}
+		if len(req.ResponseFormat.JSONSchema) == 0 {
+			return nil, errors.New("responses structured output requires a non-empty JSON schema")
+		}
+		out.Text = &responsesTextConfig{Format: responsesTextFormat{
+			Type:        "json_schema",
+			Name:        name,
+			Description: req.ResponseFormat.Description,
+			Schema:      req.ResponseFormat.JSONSchema,
+			Strict:      req.ResponseFormat.Strict,
+		}}
+	}
+	var messages []provider.Message
+	out.PreviousResponseID, messages = r.previousResponse(req.Messages)
 
-	for _, m := range req.Messages {
+	for _, m := range messages {
 		switch m.Role {
 		case provider.RoleSystem:
 			// System messages are folded into instructions (defensive:
@@ -199,10 +291,13 @@ func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesReque
 						Output: b.ToolResult,
 					})
 				case "image":
-					// Responses speaks `input_image` parts; metis images ride
-					// image blocks with base64 data. Pass through as-is.
+					// Responses image parts use a different discriminant and field
+					// than Chat Completions: input_image + image_url.
 					if b.MediaType != "" && b.Data != "" {
-						parts = append(parts, responsesContentPart{Type: "image", Text: "data:" + b.MediaType + ";base64," + b.Data})
+						parts = append(parts, responsesContentPart{
+							Type:     "input_image",
+							ImageURL: "data:" + b.MediaType + ";base64," + b.Data,
+						})
 					}
 				}
 			}
@@ -236,11 +331,38 @@ func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesReque
 						Arguments: args,
 					})
 				case "thinking", "redacted_thinking":
-					// Reasoning history does not round-trip on the Responses
-					// wire (no reasoning item type); it is skipped.
+					if b.Type == "redacted_thinking" && b.Data != "" &&
+						stateMode == ResponsesStateLocal && r.Capabilities.EncryptedReasoning {
+						flushParts()
+						out.Input = append(out.Input, responsesInputItem{
+							Type:             "reasoning",
+							ID:               b.ProviderHint[responsesHintItemID],
+							EncryptedContent: b.Data,
+						})
+					}
 				}
 			}
 			flushParts()
+		}
+	}
+	if len(volatile) > 0 {
+		if volatileInInstructions {
+			// Responses does not carry instructions forward when a request uses
+			// previous_response_id. Sending dynamic state here therefore replaces
+			// (or removes) it on every turn instead of storing it in the response's
+			// input chain, where it would accumulate across continuations.
+			for _, part := range volatile {
+				if out.Instructions != "" {
+					out.Instructions += "\n\n"
+				}
+				out.Instructions += part.Text
+			}
+		} else {
+			// In local/ZDR mode the full conversation is replayed on every call.
+			// Dynamic retrieval/env state belongs at its tail: this keeps the
+			// conversation as a stable cache prefix and preserves function-call /
+			// output adjacency required by strict compatible gateways.
+			out.Input = append(out.Input, responsesInputItem{Type: "message", Role: "developer", Content: volatile})
 		}
 	}
 
@@ -255,6 +377,21 @@ func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesReque
 			Description: t.Description,
 			Parameters:  schema,
 		})
+	}
+	for _, hosted := range r.HostedTools {
+		hosted = strings.ToLower(strings.TrimSpace(hosted))
+		if hosted == "" {
+			continue
+		}
+		if !r.Capabilities.HostedTools {
+			return nil, fmt.Errorf("responses hosted tool %q is not enabled by this endpoint capability profile", hosted)
+		}
+		switch hosted {
+		case "web_search":
+			out.Tools = append(out.Tools, responsesTool{Type: hosted})
+		default:
+			return nil, fmt.Errorf("responses hosted tool %q is not supported by Metis; supported: web_search", hosted)
+		}
 	}
 	return out, nil
 }
@@ -271,11 +408,20 @@ func (r *Responses) setHeaders(h *http.Request) {
 // StreamEvent vocabulary; pending events queue when one frame maps to
 // several (e.g. output_item.done also flushes tool_use_stop).
 type responsesStream struct {
-	sse     *sse.Reader
-	body    io.Closer
-	pending []provider.StreamEvent
-	done    bool
-	sentEnd bool
+	sse        *sse.Reader
+	body       io.Closer
+	pending    []provider.StreamEvent
+	done       bool
+	sentEnd    bool
+	responseID string
+	stateKey   string
+	emitState  bool
+	// Function-argument delta events identify the output item (fc_*), while
+	// function_call_output uses the distinct call_id (call_*). Retain the
+	// mapping learned from output_item.added so all provider-neutral events use
+	// the executable call id.
+	toolCallIDs    map[string]string
+	refusalStarted map[string]bool
 }
 
 func (s *responsesStream) Close() error { return s.body.Close() }
@@ -297,10 +443,11 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 		frame, err := s.sse.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				if !s.sentEnd {
-					s.sentEnd = true
-					return provider.StreamEvent{Type: "message_stop"}, io.EOF
-				}
+				// A valid Responses stream has an explicit terminal event. Treat a
+				// clean socket close without completed/incomplete/failed as
+				// truncation; otherwise partial answers would be persisted as if the
+				// model had finished normally.
+				return provider.StreamEvent{Type: "error", Err: io.ErrUnexpectedEOF}, io.ErrUnexpectedEOF
 			}
 			if !errors.Is(err, io.EOF) {
 				return provider.StreamEvent{Type: "error", Err: err}, err
@@ -311,17 +458,22 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			continue
 		}
 		var env struct {
-			Type     string `json:"type"`
-			Sequence string `json:"sequence_number"`
-			Delta    string `json:"delta"`
-			ItemID   string `json:"item_id"`
-			Item     struct {
-				Type      string `json:"type"`
-				CallID    string `json:"call_id"`
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
+			Type    string `json:"type"`
+			Delta   string `json:"delta"`
+			Refusal string `json:"refusal"`
+			ItemID  string `json:"item_id"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Item    struct {
+				ID               string `json:"id"`
+				Type             string `json:"type"`
+				CallID           string `json:"call_id"`
+				Name             string `json:"name"`
+				Arguments        string `json:"arguments"`
+				EncryptedContent string `json:"encrypted_content"`
 			} `json:"item"`
 			Response *struct {
+				ID     string `json:"id"`
 				Status string `json:"status"`
 				Error  *struct {
 					Code    string `json:"code"`
@@ -354,37 +506,79 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			continue // non-JSON keep-alive line
 		}
 		switch env.Type {
+		case "response.created":
+			if env.Response != nil && env.Response.ID != "" {
+				s.responseID = env.Response.ID
+			}
 		case "response.output_item.added":
 			if env.Item.Type == "function_call" {
+				callID := env.Item.CallID
+				if callID == "" {
+					callID = env.Item.ID
+				}
+				if env.Item.ID != "" {
+					s.toolCallIDs[env.Item.ID] = callID
+				}
 				s.pending = append(s.pending, provider.StreamEvent{
 					Type:      "tool_use_start",
-					ToolUseID: env.Item.CallID,
+					ToolUseID: callID,
 					ToolName:  env.Item.Name,
 				})
 			}
 		case "response.function_call_arguments.delta":
 			if env.Delta != "" {
-				s.pending = append(s.pending, provider.StreamEvent{Type: "tool_input_delta", ToolUseID: env.ItemID, InputDelta: env.Delta})
+				callID := s.toolCallIDs[env.ItemID]
+				if callID == "" {
+					// Compatibility endpoints sometimes use call_id as item_id.
+					callID = env.ItemID
+				}
+				s.pending = append(s.pending, provider.StreamEvent{Type: "tool_input_delta", ToolUseID: callID, InputDelta: env.Delta})
 			}
 		case "response.output_item.done":
 			if env.Item.Type == "function_call" {
+				callID := env.Item.CallID
+				if callID == "" {
+					callID = s.toolCallIDs[env.Item.ID]
+				}
+				if callID == "" {
+					callID = env.Item.ID
+				}
 				s.pending = append(s.pending, provider.StreamEvent{
 					Type:       "tool_use_stop",
-					ToolUseID:  env.Item.CallID,
+					ToolUseID:  callID,
 					InputDelta: env.Item.Arguments, // full args resync (authoritative)
+				})
+				delete(s.toolCallIDs, env.Item.ID)
+			} else if env.Item.Type == "reasoning" && env.Item.EncryptedContent != "" {
+				s.pending = append(s.pending, provider.StreamEvent{
+					Type:         "redacted_thinking",
+					TextDelta:    env.Item.EncryptedContent,
+					ProviderHint: map[string]string{responsesHintItemID: env.Item.ID},
 				})
 			}
 		case "response.output_text.delta":
 			if env.Delta != "" {
 				s.pending = append(s.pending, provider.StreamEvent{Type: "text_delta", TextDelta: env.Delta})
 			}
-		case "response.reasoning_summary_text.delta":
+		case "response.refusal.delta":
+			if env.Delta != "" {
+				s.refusalStarted[env.ItemID] = true
+				s.pending = append(s.pending, provider.StreamEvent{Type: "text_delta", TextDelta: env.Delta})
+			}
+		case "response.refusal.done":
+			if env.Refusal != "" && !s.refusalStarted[env.ItemID] {
+				s.pending = append(s.pending, provider.StreamEvent{Type: "text_delta", TextDelta: env.Refusal})
+			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 			if env.Delta != "" {
 				s.pending = append(s.pending, provider.StreamEvent{Type: "thinking_delta", TextDelta: env.Delta})
 			}
 		case "response.completed":
 			ev := provider.StreamEvent{Type: "message_delta", StopReason: "end_turn"}
 			if env.Response != nil {
+				if env.Response.ID != "" {
+					s.responseID = env.Response.ID
+				}
 				if env.Response.Usage != nil {
 					cacheRead := 0
 					if env.Response.Usage.InputTokensDetails != nil {
@@ -400,23 +594,40 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 					ev.StopReason = "tool_use"
 				}
 			}
+			if s.emitState && s.responseID != "" {
+				s.pending = append(s.pending, provider.StreamEvent{Type: "provider_state", ProviderHint: map[string]string{
+					responsesHintResponseID: s.responseID,
+					responsesHintStateKey:   s.stateKey,
+				}})
+			}
 			s.pending = append(s.pending, ev)
 			s.done = true
 		case "response.incomplete":
 			ev := provider.StreamEvent{Type: "message_delta", StopReason: "max_tokens"}
-			if env.Response != nil && env.Response.IncompleteDetails != nil && env.Response.IncompleteDetails.Reason == "content_filter" {
-				ev.StopReason = "stop_sequence"
-			}
-			if env.Response != nil && env.Response.Usage != nil {
-				cacheRead := 0
-				if env.Response.Usage.InputTokensDetails != nil {
-					cacheRead = env.Response.Usage.InputTokensDetails.CachedTokens
+			if env.Response != nil {
+				if env.Response.ID != "" {
+					s.responseID = env.Response.ID
 				}
-				ev.InputTokens, ev.CacheReadInputTokens = normalizeInputUsage(
-					env.Response.Usage.InputTokens,
-					cacheRead,
-				)
-				ev.OutputTokens = env.Response.Usage.OutputTokens
+				if env.Response.IncompleteDetails != nil && env.Response.IncompleteDetails.Reason == "content_filter" {
+					ev.StopReason = "stop_sequence"
+				}
+				if env.Response.Usage != nil {
+					cacheRead := 0
+					if env.Response.Usage.InputTokensDetails != nil {
+						cacheRead = env.Response.Usage.InputTokensDetails.CachedTokens
+					}
+					ev.InputTokens, ev.CacheReadInputTokens = normalizeInputUsage(
+						env.Response.Usage.InputTokens,
+						cacheRead,
+					)
+					ev.OutputTokens = env.Response.Usage.OutputTokens
+				}
+			}
+			if s.emitState && s.responseID != "" {
+				s.pending = append(s.pending, provider.StreamEvent{Type: "provider_state", ProviderHint: map[string]string{
+					responsesHintResponseID: s.responseID,
+					responsesHintStateKey:   s.stateKey,
+				}})
 			}
 			s.pending = append(s.pending, ev)
 			s.done = true
@@ -430,9 +641,12 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New(msg)})
 			s.done = true
 		case "error":
-			msg := "responses stream error"
-			if env.Error != nil && env.Error.Message != "" {
+			msg := env.Message
+			if msg == "" && env.Error != nil && env.Error.Message != "" {
 				msg = env.Error.Message
+			}
+			if msg == "" {
+				msg = "responses stream error"
 			}
 			s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New(msg)})
 			s.done = true
@@ -475,9 +689,9 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 	}
 	var resp *http.Response
 	var lastBody string
-	err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
+	post := func(payload []byte) error {
 		lastBody = ""
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(buf))
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(payload))
 		if err != nil {
 			return err
 		}
@@ -496,16 +710,37 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 			return fmt.Errorf("responses %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
 		}
 		return nil
-	})
+	}
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return post(buf) })
+	if err != nil && body.PreviousResponseID != "" && isMissingPreviousResponse(lastBody) {
+		recovery, recoveryErr := r.buildStateRecoveryRequest(req)
+		if recoveryErr != nil {
+			return nil, recoveryErr
+		}
+		recovery.Stream = body.Stream
+		recoveryBuf, recoveryErr := json.Marshal(recovery)
+		if recoveryErr != nil {
+			return nil, recoveryErr
+		}
+		err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return post(recoveryBuf) })
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &responsesStream{sse: sse.NewReader(resp.Body), body: resp.Body}, nil
+	return &responsesStream{
+		sse:            sse.NewReader(resp.Body),
+		body:           resp.Body,
+		stateKey:       r.stateKey(),
+		emitState:      r.effectiveStateMode() == ResponsesStateProvider,
+		toolCallIDs:    make(map[string]string),
+		refusalStarted: make(map[string]bool),
+	}, nil
 }
 
 // ---------- non-streamed completion ----------
 
 type responsesComplete struct {
+	ID     string                `json:"id"`
 	Output []responsesOutputItem `json:"output"`
 	Usage  *struct {
 		InputTokens        int `json:"input_tokens"`
@@ -524,14 +759,17 @@ type responsesComplete struct {
 }
 
 type responsesOutputItem struct {
-	Type      string `json:"type"`
-	CallID    string `json:"call_id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-	Output    string `json:"output"`
-	Content   []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+	ID               string `json:"id"`
+	Type             string `json:"type"`
+	CallID           string `json:"call_id"`
+	Name             string `json:"name"`
+	Arguments        string `json:"arguments"`
+	Output           string `json:"output"`
+	EncryptedContent string `json:"encrypted_content"`
+	Content          []struct {
+		Type    string `json:"type"`
+		Text    string `json:"text"`
+		Refusal string `json:"refusal"`
 	} `json:"content"`
 	Summary []struct {
 		Type string `json:"type"`
@@ -556,22 +794,41 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(buf))
+	post := func(payload []byte) ([]byte, int, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(payload))
+		if err != nil {
+			return nil, 0, err
+		}
+		r.setHeaders(httpReq)
+		resp, err := r.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, 0, err
+		}
+		raw, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return raw, resp.StatusCode, readErr
+	}
+	raw, statusCode, err := post(buf)
 	if err != nil {
 		return nil, err
 	}
-	r.setHeaders(httpReq)
-	resp, err := r.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
+	if statusCode >= 400 && body.PreviousResponseID != "" && isMissingPreviousResponse(string(raw)) {
+		recovery, recoveryErr := r.buildStateRecoveryRequest(req)
+		if recoveryErr != nil {
+			return nil, recoveryErr
+		}
+		recovery.Stream = false
+		recoveryBuf, recoveryErr := json.Marshal(recovery)
+		if recoveryErr != nil {
+			return nil, recoveryErr
+		}
+		raw, statusCode, err = post(recoveryBuf)
+		if err != nil {
+			return nil, err
+		}
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("responses %d: %s", resp.StatusCode, transport.Truncate(string(raw), 500))
+	if statusCode >= 400 {
+		return nil, fmt.Errorf("responses %d: %s", statusCode, transport.Truncate(string(raw), 500))
 	}
 	var out responsesComplete
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -596,31 +853,68 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 		switch item.Type {
 		case "message":
 			for _, part := range item.Content {
-				if part.Type == "output_text" {
+				switch part.Type {
+				case "output_text":
 					textParts = append(textParts, responsesContentPart{Type: "output_text", Text: part.Text})
+				case "refusal":
+					text := part.Refusal
+					if text == "" {
+						text = part.Text
+					}
+					if text != "" {
+						textParts = append(textParts, responsesContentPart{Type: "output_text", Text: text})
+					}
 				}
 			}
 		case "reasoning":
+			flushText()
 			for _, part := range item.Summary {
 				if part.Type == "summary_text" && part.Text != "" {
 					result.Content = append(result.Content, provider.ContentBlock{Type: "thinking", Text: part.Text})
 				}
 			}
+			if item.EncryptedContent != "" {
+				result.Content = append(result.Content, provider.ContentBlock{
+					Type: "redacted_thinking",
+					Data: item.EncryptedContent,
+					ProviderHint: map[string]string{
+						responsesHintItemID: item.ID,
+					},
+				})
+			}
 		case "function_call":
 			flushText()
 			input := map[string]any{}
+			malformed := false
 			if item.Arguments != "" {
-				_ = json.Unmarshal([]byte(item.Arguments), &input)
+				if err := json.Unmarshal([]byte(item.Arguments), &input); err != nil {
+					// Preserve only a non-persistent marker. The dispatcher turns it
+					// into INVALID_JSON without presenting or echoing raw arguments.
+					input = map[string]any{}
+					malformed = true
+				} else if input == nil {
+					input = map[string]any{}
+				}
 			}
 			result.Content = append(result.Content, provider.ContentBlock{
-				Type:      "tool_use",
-				ToolUseID: item.CallID,
-				ToolName:  item.Name,
-				ToolInput: input,
+				Type:               "tool_use",
+				ToolUseID:          item.CallID,
+				ToolName:           item.Name,
+				ToolInput:          input,
+				ToolInputMalformed: malformed,
 			})
 		}
 	}
 	flushText()
+	if r.effectiveStateMode() == ResponsesStateProvider && out.ID != "" {
+		result.Content = append(result.Content, provider.ContentBlock{
+			Type: "provider_state",
+			ProviderHint: map[string]string{
+				responsesHintResponseID: out.ID,
+				responsesHintStateKey:   r.stateKey(),
+			},
+		})
+	}
 
 	stop := "end_turn"
 	for _, item := range out.Output {

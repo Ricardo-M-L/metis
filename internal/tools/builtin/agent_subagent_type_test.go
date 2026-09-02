@@ -18,14 +18,31 @@ package builtin
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+type streamCountingProvider struct {
+	*fakeProvider
+	streamCalls atomic.Int32
+}
+
+func (p *streamCountingProvider) Stream(ctx context.Context, req llm.Request) (llm.StreamReader, error) {
+	p.streamCalls.Add(1)
+	return p.fakeProvider.Stream(ctx, req)
+}
 
 func TestAgentTool_SubagentType_BackgroundSetupFailureReleasesRoster(t *testing.T) {
 	tests := []struct {
@@ -85,6 +102,191 @@ func TestAgentTool_SubagentType_BackgroundSetupFailureReleasesRoster(t *testing.
 				t.Fatalf("CancelAndWait should return immediately after setup failure: %v", err)
 			}
 		})
+	}
+}
+
+func TestAgentTool_SubagentType_WorktreeProfileFailureCleansIsolation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git unavailable: %v", err)
+	}
+
+	repo := t.TempDir()
+	runAgentTestGit(t, repo, "init", "--quiet")
+	runAgentTestGit(t, repo, "config", "user.name", "Metis Agent Test")
+	runAgentTestGit(t, repo, "config", "user.email", "metis-agent-test@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatalf("write repository fixture: %v", err)
+	}
+	runAgentTestGit(t, repo, "add", "README.md")
+	runAgentTestGit(t, repo, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "initial fixture")
+
+	// resolveIsolation's nesting guard compares the exact current directory
+	// against registered worktree roots. Run from a normal repository subdir so
+	// this exercises Spawn + Cleanup rather than the guard's root-path refusal.
+	workDir := filepath.Join(repo, "source")
+	if err := os.Mkdir(workDir, 0o700); err != nil {
+		t.Fatalf("create repository subdir: %v", err)
+	}
+	previousCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get cwd: %v", err)
+	}
+	if err := os.Chdir(workDir); err != nil {
+		t.Fatalf("chdir repository subdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previousCwd) })
+
+	metisHome := filepath.Join(t.TempDir(), "metis-home")
+	t.Setenv("METIS_HOME", metisHome)
+	roster := agent.NewRoster(0)
+	tool := NewAgent(
+		permission.New(permission.ModeBypass),
+		helloProvider(),
+		tools.NewRegistry(),
+		"model",
+		"PARENT-SYSTEM",
+	).WithRoster(roster).WithProfileLoader(func(string) (*AgentProfileSpec, error) {
+		return nil, errors.New("profile store unavailable")
+	})
+
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"prompt":            "fail after creating an isolated worktree",
+		"subagent_type":     "explore",
+		"isolation":         "worktree",
+		"run_in_background": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute returned transport error: %v", err)
+	}
+	if res == nil || !res.IsError || !strings.Contains(res.Output, "profile store unavailable") {
+		t.Fatalf("expected profile setup error, got %+v", res)
+	}
+	if got := roster.Count(); got != 0 {
+		t.Fatalf("profile setup failure leaked %d live roster entries; want 0", got)
+	}
+
+	worktreesDir := filepath.Join(metisHome, "worktrees")
+	entries, readErr := os.ReadDir(worktreesDir)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatalf("read worktree directory after Execute returned: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("worktree directory still contains %d entries after Execute returned: %v", len(entries), entries)
+	}
+	worktreeList := runAgentTestGit(t, repo, "worktree", "list", "--porcelain")
+	if strings.Contains(worktreeList, worktreesDir) {
+		t.Fatalf("git worktree registration leaked under %s:\n%s", worktreesDir, worktreeList)
+	}
+	if got := strings.Count(worktreeList, "worktree "); got != 1 {
+		t.Fatalf("git worktree list contains %d registrations after cleanup, want only the main repository:\n%s", got, worktreeList)
+	}
+
+	joinCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if err := roster.CancelAndWait(joinCtx); err != nil {
+		t.Fatalf("CancelAndWait should observe completed setup cleanup: %v", err)
+	}
+}
+
+func runAgentTestGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+func TestAgentTool_StrictBoundaryDuringSetupNeverStartsRunner(t *testing.T) {
+	roster := agent.NewRoster(0)
+	provider := &streamCountingProvider{fakeProvider: helloProvider().(*fakeProvider)}
+	loaderEntered := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseLoader:
+		default:
+			close(releaseLoader)
+		}
+	}()
+	tool := NewAgent(
+		permission.New(permission.ModeBypass),
+		provider,
+		tools.NewRegistry(),
+		"model",
+		"PARENT-SYSTEM",
+	).WithRoster(roster).WithProfileLoader(func(name string) (*AgentProfileSpec, error) {
+		close(loaderEntered)
+		<-releaseLoader
+		return &AgentProfileSpec{Name: name, SystemPrompt: "SETUP-RACE"}, nil
+	})
+
+	type executeResult struct {
+		result *tools.Result
+		err    error
+	}
+	executeDone := make(chan executeResult, 1)
+	go func() {
+		result, err := tool.Execute(context.Background(), map[string]any{
+			"prompt":            "must not start after strict revocation",
+			"name":              "constructing",
+			"subagent_type":     "explore",
+			"run_in_background": true,
+		})
+		executeDone <- executeResult{result: result, err: err}
+	}()
+
+	select {
+	case <-loaderEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Agent did not reach the post-Register setup window")
+	}
+	teammate, ok := roster.Lookup("constructing")
+	if !ok {
+		t.Fatal("post-Register setup window has no live roster entry")
+	}
+	// Install an observation callback before the real child context exists.
+	// CancelAndWait must latch the request, then Agent.SetCancel must replay it
+	// against the real callback when setup resumes.
+	cancelObserved := make(chan struct{})
+	teammate.SetCancel(func() { close(cancelObserved) })
+	joinCtx, cancelJoin := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelJoin()
+	joinDone := make(chan error, 1)
+	go func() { joinDone <- roster.CancelAndWait(joinCtx) }()
+	select {
+	case <-cancelObserved:
+	case <-time.After(time.Second):
+		t.Fatal("strict boundary did not request cancellation during setup")
+	}
+	close(releaseLoader)
+
+	select {
+	case got := <-executeDone:
+		if got.err != nil {
+			t.Fatalf("Execute returned transport error: %v", got.err)
+		}
+		if got.result == nil || !got.result.IsError || !strings.Contains(got.result.Output, context.Canceled.Error()) {
+			t.Fatalf("Execute result = %+v, want canceled tool result", got.result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent Execute did not leave the canceled setup window")
+	}
+	select {
+	case err := <-joinDone:
+		if err != nil {
+			t.Fatalf("CancelAndWait: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelAndWait did not join the canceled setup path")
+	}
+	if got := provider.streamCalls.Load(); got != 0 {
+		t.Fatalf("provider Stream calls = %d, want 0 after pre-start revocation", got)
+	}
+	if got := roster.Count(); got != 0 {
+		t.Fatalf("joined roster count = %d, want 0", got)
 	}
 }
 
@@ -307,5 +509,34 @@ func TestAgentTool_Schema_HasSubagentTypeField(t *testing.T) {
 				t.Error("subagent_type must be optional, not required")
 			}
 		}
+	}
+}
+
+func TestAgentTool_Schema_SubagentTypeUsesDynamicEnum(t *testing.T) {
+	tool := Agent{}.WithProfileNames(func() []string {
+		return []string{"verify", "explore", "verify", "", "  general  "}
+	})
+	schema := tool.InputSchema()
+	props := schema["properties"].(map[string]any)
+	subagentType := props["subagent_type"].(map[string]any)
+	got, ok := subagentType["enum"].([]string)
+	if !ok {
+		t.Fatalf("subagent_type enum type = %T, want []string", subagentType["enum"])
+	}
+	want := []string{"explore", "general", "verify"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("subagent_type enum = %v, want %v", got, want)
+	}
+	if slices.Contains(got, "research") {
+		t.Fatal("dynamic enum unexpectedly contains nonexistent research profile")
+	}
+}
+
+func TestAgentTool_Schema_OmitsEnumWithoutProfileCatalog(t *testing.T) {
+	schema := (Agent{}).InputSchema()
+	props := schema["properties"].(map[string]any)
+	subagentType := props["subagent_type"].(map[string]any)
+	if _, ok := subagentType["enum"]; ok {
+		t.Fatal("headless Agent without a profile catalog should not publish an empty enum")
 	}
 }

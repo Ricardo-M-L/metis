@@ -206,7 +206,12 @@ func TestRuntimeRebindSessionAtUsesDesktopTargetWorkspace(t *testing.T) {
 func TestRuntimeReleaseSessionWorkCancelsRosterAndIsNilSafe(t *testing.T) {
 	cancelled := 0
 	roster := agent.NewRoster(1)
-	if err := roster.Register(&agent.Teammate{Name: "worker", Cancel: func() { cancelled++ }}); err != nil {
+	worker := &agent.Teammate{Name: "worker"}
+	worker.SetCancel(func() {
+		cancelled++
+		roster.UnregisterTeammate(worker)
+	})
+	if err := roster.Register(worker); err != nil {
 		t.Fatal(err)
 	}
 	finished := &agent.Teammate{Name: "finished", AgentID: "agt-old-finished"}
@@ -310,4 +315,85 @@ func TestRuntimeReleaseSessionWorkCancelsRosterAndIsNilSafe(t *testing.T) {
 	(&runtime{}).releaseSessionWork()
 	var nilRuntime *runtime
 	nilRuntime.releaseSessionWork()
+}
+
+func TestRuntimeDefaultSessionBoundaryJoinsLateProducerBeforeResettingJobs(t *testing.T) {
+	roster := agent.NewRoster(1)
+	jobRegistry := jobs.NewRegistry(t.TempDir())
+	cancelObserved := make(chan struct{})
+	teammate := &agent.Teammate{
+		Name: "default-session-runner",
+		Cancel: func() {
+			select {
+			case <-cancelObserved:
+			default:
+				close(cancelObserved)
+			}
+		},
+	}
+	if err := roster.Register(teammate); err != nil {
+		t.Fatal(err)
+	}
+
+	jobCtx, cancelJob := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		roster.UnregisterTeammate(teammate)
+		cancelJob()
+		jobRegistry.ResetAndWait(0)
+	})
+
+	rt := &runtime{
+		loop:           &agent.Loop{Jobs: jobRegistry},
+		subAgentRoster: roster,
+		permissionMode: permission.ModeDefault,
+	}
+	boundaryDone := make(chan struct{})
+	go func() {
+		rt.releaseSessionWork()
+		close(boundaryDone)
+	}()
+
+	select {
+	case <-cancelObserved:
+	case <-time.After(time.Second):
+		t.Fatal("default session boundary did not cancel its producer")
+	}
+	// A strict roster join retains the source generation while the canceled
+	// runner unwinds. The former Reset path deterministically moved it out of
+	// the live map before invoking Cancel, allowing the boundary to return and
+	// a late job registration to escape the following generation cut.
+	if got := roster.Count(); got != 1 {
+		t.Fatalf("default session boundary forgot its producer before join: count=%d", got)
+	}
+
+	command := exec.CommandContext(jobCtx, os.Args[0], "-test.run=^TestRuntimeLifecycleBlockingJobHelper$")
+	command.Env = append(os.Environ(), "METIS_TEST_BLOCKING_LIFECYCLE_JOB=1")
+	job, err := jobRegistry.Spawn(jobs.SpawnArgs{
+		Command: "late-default-session-job",
+		Cmd:     command,
+		Cancel:  cancelJob,
+	})
+	if err != nil {
+		t.Fatalf("canceled source runner could not publish its final job: %v", err)
+	}
+	select {
+	case <-boundaryDone:
+		t.Fatal("default session boundary returned before its producer unregistered")
+	default:
+	}
+
+	// Model the producer's real defer order: its final Spawn can occur while
+	// cancellation is unwinding, then Unregister publishes runner completion.
+	roster.UnregisterTeammate(teammate)
+	select {
+	case <-boundaryDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("default session boundary did not finish after its producer unregistered")
+	}
+	if command.ProcessState == nil {
+		t.Fatal("default session boundary returned before reaping the late job")
+	}
+	if _, ok := jobRegistry.Get(job.ID); ok {
+		t.Fatal("default session boundary retained the late source-session job")
+	}
 }

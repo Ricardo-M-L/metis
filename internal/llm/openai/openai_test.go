@@ -417,6 +417,26 @@ func TestFromOpenAIChoice_EmptyOrNullToolArgumentsBecomeObject(t *testing.T) {
 	}
 }
 
+func TestFromOpenAIChoice_MalformedToolArgumentsKeepOnlyFlag(t *testing.T) {
+	choice := oaiChoice{FinishReason: "tool_calls"}
+	choice.Message.ToolCalls = make([]oaiToolCall, 1)
+	choice.Message.ToolCalls[0].ID = "bad"
+	choice.Message.ToolCalls[0].Function.Name = "Write"
+	choice.Message.ToolCalls[0].Function.Arguments = `{"path":"/tmp/a","api_key":"do-not-persist"`
+
+	got := fromOpenAIChoice(choice, oaiUsage{})
+	if len(got.Content) != 1 || !got.Content[0].ToolInputMalformed || len(got.Content[0].ToolInput) != 0 {
+		t.Fatalf("malformed tool block = %+v", got.Content)
+	}
+	persisted, err := json.Marshal(got.Content[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), "do-not-persist") {
+		t.Fatalf("malformed raw arguments leaked into persistence: %s", persisted)
+	}
+}
+
 // Regression for session 64fd6e14: a sixth, output-truncated Write was
 // persisted without input. Every later user message rebuilt it as
 // function.arguments="null", and the OpenAI-compatible provider returned

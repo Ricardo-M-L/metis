@@ -34,6 +34,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 // CacheSafeParams are the cache-critical inputs that must be IDENTICAL
@@ -446,6 +447,9 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlock, toolSpecs []llm.ToolSpec) llm.ContentBlock {
 	id := tu.ToolUseID
 	name := tu.ToolName
+	if tu.ToolInputMalformed {
+		return malformedToolJSONBlock(name, id)
+	}
 
 	// ToolSearch is synthetic and therefore has no Registry entry. Forks can
 	// inherit lazy placeholders from the parent, so they must support the same
@@ -458,28 +462,47 @@ func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlo
 		return result
 	}
 
-	// 1. CanUseTool gate (caller-supplied).
-	allow, reason := p.CanUseTool(ctx, name, tu.ToolInput)
-	if !allow {
-		return llm.ContentBlock{
-			Type: "tool_result", ToolUseID: id, IsError: true,
-			ToolResult: fmt.Sprintf("denied by fork canUseTool: %s", reason),
-		}
-	}
-
-	// 2. Registry lookup.
+	// 1. Registry lookup and local Schema validation. Forked agents have a
+	// separate execution loop, so they must enforce the same pre-permission
+	// argument boundary as the main dispatcher rather than bypassing it.
 	t, ok := p.Registry.GetForModel(name)
 	if !ok {
+		if hasMalformedToolJSON(tu) {
+			return malformedToolJSONBlock(name, id)
+		}
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: id, IsError: true,
 			ToolResult: fmt.Sprintf("unknown tool %q in fork registry", name),
 		}
+	}
+	if hasMalformedToolJSONForSchema(tu, t.InputSchema()) {
+		return malformedToolJSONBlock(name, id)
 	}
 	entry, _ := p.Registry.GetModelEntry(name)
 	if entry.Exposure == tools.ToolExposureDeferred && forkDeferredSchemaPending(toolSpecs, t.Name()) {
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: id, IsError: true,
 			ToolResult: fmt.Sprintf("tool %q is deferred; call ToolSearch with select:%s before invoking it", t.Name(), t.Name()),
+		}
+	}
+	normalizedInput, normalizeErr := pubtool.NormalizeToolInput(t, tu.ToolInput)
+	if normalizeErr != nil {
+		return invalidToolArgumentsBlock(t.Name(), id, normalizationValidationError())
+	}
+	tu.ToolInput = normalizedInput
+	if hasMalformedToolJSONForSchema(tu, t.InputSchema()) {
+		return malformedToolJSONBlock(name, id)
+	}
+	if verr := pubtool.ValidateInput(t.InputSchema(), tu.ToolInput); verr != nil {
+		return invalidToolArgumentsBlock(t.Name(), id, verr)
+	}
+
+	// 2. CanUseTool gate (caller-supplied).
+	allow, reason := p.CanUseTool(ctx, name, tu.ToolInput)
+	if !allow {
+		return llm.ContentBlock{
+			Type: "tool_result", ToolUseID: id, IsError: true,
+			ToolResult: fmt.Sprintf("denied by fork canUseTool: %s", reason),
 		}
 	}
 
@@ -508,7 +531,7 @@ func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlo
 	}
 
 	// 4. Execute. Any error becomes a tool_result with is_error=true.
-	res, err := t.Execute(execCtx, tu.ToolInput)
+	res, err := safeToolExecute(execCtx, t, tu.ToolInput)
 	if err != nil {
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: id, IsError: true,
@@ -517,8 +540,8 @@ func executeForkTool(ctx context.Context, p ForkedAgentParams, tu llm.ContentBlo
 	}
 	if res == nil {
 		return llm.ContentBlock{
-			Type: "tool_result", ToolUseID: id,
-			ToolResult: "(no output)",
+			Type: "tool_result", ToolUseID: id, IsError: true,
+			ToolResult: "execute error: tool returned no result",
 		}
 	}
 	return llm.ContentBlock{

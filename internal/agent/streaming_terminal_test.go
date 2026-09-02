@@ -2,10 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // terminalEOFStream models readers that return their final event and io.EOF
@@ -34,6 +37,74 @@ func (s *terminalEOFStream) Recv() (llm.StreamEvent, error) {
 }
 
 func (*terminalEOFStream) Close() error { return nil }
+
+type providerErrorEventStream struct {
+	step int
+}
+
+func (s *providerErrorEventStream) Recv() (llm.StreamEvent, error) {
+	s.step++
+	switch s.step {
+	case 1:
+		return llm.StreamEvent{Type: "text_delta", TextDelta: "partial answer"}, nil
+	case 2:
+		return llm.StreamEvent{Type: "error", Err: errors.New("provider failed")}, nil
+	default:
+		return llm.StreamEvent{}, io.EOF
+	}
+}
+
+func (*providerErrorEventStream) Close() error { return nil }
+
+func TestConsumeStreamReturnsProviderErrorEvent(t *testing.T) {
+	blocks, _, _, err := (&Loop{}).consumeStream(
+		context.Background(),
+		&providerErrorEventStream{},
+		make(chan Event, 2),
+	)
+	if err == nil || err.Error() != "provider failed" {
+		t.Fatalf("consumeStream error = %v, want provider failed", err)
+	}
+	if len(blocks) != 1 || blocks[0].Type != "text" || blocks[0].Text != "partial answer" {
+		t.Fatalf("blocks = %#v, want preserved partial text", blocks)
+	}
+}
+
+type partialErrorProvider struct{}
+
+func (partialErrorProvider) Name() string          { return "partial-error" }
+func (partialErrorProvider) ModelID() string       { return "partial-error-model" }
+func (partialErrorProvider) MaxContextTokens() int { return 100_000 }
+func (partialErrorProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, errors.New("Complete should not be called")
+}
+func (partialErrorProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return &providerErrorEventStream{}, nil
+}
+
+func TestLoopPersistsPartialAssistantAfterStreamFailure(t *testing.T) {
+	loop := NewLoop(
+		partialErrorProvider{},
+		tools.NewRegistry(),
+		permission.New(permission.ModeBypassPermissions),
+		nil,
+		"system",
+		2,
+	)
+	loop.AppendUser("hello")
+	err := loop.Run(context.Background(), make(chan Event, 16))
+	if err == nil || err.Error() != "provider failed" {
+		t.Fatalf("Run error = %v", err)
+	}
+	history := loop.History()
+	if len(history) != 2 || history[1].Role != llm.RoleAssistant || len(history[1].Content) != 1 {
+		t.Fatalf("history = %#v", history)
+	}
+	partial := history[1].Content[0]
+	if partial.Text != "partial answer" || partial.ProviderHint["metis.partial"] != "true" {
+		t.Fatalf("partial block = %#v", partial)
+	}
+}
 
 func TestConsumeStreamProcessesTerminalEventBeforeEOF(t *testing.T) {
 	stream := &terminalEOFStream{}

@@ -144,6 +144,115 @@ func TestManagerDefaultNetworkPolicy(t *testing.T) {
 	}
 }
 
+func TestFullAccessPostureBypassesMinimumSandboxAndRestoresConfiguration(t *testing.T) {
+	m, err := NewManagerWithOptions(Options{Mode: "permissions", Network: NetworkBlock, TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	if err := m.SetPermissionPosture(false, true); err != nil {
+		t.Fatal(err)
+	}
+	state := m.State()
+	if !state.FullAccessRequired || state.CredentialIsolationRequired || state.Effective != ModeOff || !state.AutoAllow {
+		t.Fatalf("full access state = %+v", state)
+	}
+	if got := m.NetworkPolicy(); got != NetworkAllow {
+		t.Fatalf("full access network = %q, want allow", got)
+	}
+	cmd := exec.Command("echo", "ok")
+	wrapped, err := m.Wrap(cmd, Request{MinimumMode: ModePermissions, Network: NetworkBlock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrapped != cmd {
+		t.Fatal("full access unexpectedly replaced command with sandbox wrapper")
+	}
+
+	if err := m.SetPermissionPosture(false, false); err != nil {
+		t.Fatal(err)
+	}
+	state = m.State()
+	if state.FullAccessRequired || state.Effective != ModePermissions || m.NetworkPolicy() != NetworkBlock {
+		t.Fatalf("restored sandbox state = %+v network=%s", state, m.NetworkPolicy())
+	}
+	if err := m.SetPermissionPosture(true, true); err == nil {
+		t.Fatal("expected incompatible permission posture to fail")
+	}
+}
+
+func TestConcurrentPostureCompatibilitySettersDoNotRestoreStaleState(t *testing.T) {
+	m, err := NewManagerWithOptions(Options{Mode: "off", TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	// Both operations only remove their own posture flag. Regardless of their
+	// linearization order, starting from full access must end with both flags
+	// disabled. The compatibility setters used to snapshot the other flag and
+	// later write both flags, which could restore full access from a stale read.
+	for iteration := 0; iteration < 10_000; iteration++ {
+		if err := m.SetPermissionPosture(false, true); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		go func() {
+			<-start
+			errs <- m.RequireCredentialIsolation(false)
+		}()
+		go func() {
+			<-start
+			errs <- m.RequireFullAccess(false)
+		}()
+		close(start)
+		if err := <-errs; err != nil {
+			t.Fatalf("iteration %d: compatibility setter failed: %v", iteration, err)
+		}
+		if err := <-errs; err != nil {
+			t.Fatalf("iteration %d: compatibility setter failed: %v", iteration, err)
+		}
+		state := m.State()
+		if state.CredentialIsolationRequired || state.FullAccessRequired {
+			t.Fatalf("iteration %d: concurrent removals restored stale posture: %+v", iteration, state)
+		}
+	}
+}
+
+func TestPostureCompatibilitySettersRejectClosedManager(t *testing.T) {
+	m, err := NewManagerWithOptions(Options{Mode: "off", TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RequireCredentialIsolation(false); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("RequireCredentialIsolation(false) = %v, want ErrManagerClosed", err)
+	}
+	if err := m.RequireFullAccess(false); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("RequireFullAccess(false) = %v, want ErrManagerClosed", err)
+	}
+}
+
+func TestPreflightFullAccessRejectsClosedManagerWithoutMutation(t *testing.T) {
+	m, err := NewManager(string(ModePermissions))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.PreflightFullAccess(); err != nil {
+		t.Fatalf("open manager preflight: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.PreflightFullAccess(); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("closed manager preflight = %v, want ErrManagerClosed", err)
+	}
+}
+
 func TestMetisControlRootsIncludesCustomAndDefault(t *testing.T) {
 	home := t.TempDir()
 	custom := filepath.Join(t.TempDir(), "custom-metis")

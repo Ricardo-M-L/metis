@@ -41,18 +41,19 @@ type PermissionsScreen struct {
 	rules       []PermRule
 	rulesScroll int
 
-	width   int
-	height  int
-	done    bool
-	applied string // chosen mode name, empty if cancelled
+	width             int
+	height            int
+	done              bool
+	applied           string // chosen mode name, empty if cancelled
+	confirmFullAccess bool
 }
 
 // NewPermissionsScreen builds the widget. `currentMode` is the active
 // permission mode; rules is a snapshot of the gate's rules.
 func NewPermissionsScreen(currentMode string, rules []PermRule) *PermissionsScreen {
-	// All five Claude Code external modes. dontAsk is selectable here but,
-	// matching Claude, intentionally absent from the Shift+Tab cycle.
-	modes := []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+	// fullAccess is an explicit selector entry but intentionally remains absent
+	// from Shift+Tab so a stray keypress cannot disable the host sandbox.
+	modes := []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "fullAccess"}
 	cur := 0 // default
 	for i, m := range modes {
 		if m == currentMode {
@@ -66,6 +67,22 @@ func NewPermissionsScreen(currentMode string, rules []PermRule) *PermissionsScre
 		initialMode: currentMode,
 		rules:       rules,
 	}
+}
+
+// NewFullAccessConfirmationScreen enters the same confirmation state used
+// after selecting fullAccess inside /permissions. The command submission is
+// the first deliberate action; the screen still requires a separate Enter
+// before Applied reports fullAccess.
+func NewFullAccessConfirmationScreen(currentMode string, rules []PermRule) *PermissionsScreen {
+	s := NewPermissionsScreen(currentMode, rules)
+	for i, mode := range s.modes {
+		if mode == "fullAccess" {
+			s.modeCursor = i
+			break
+		}
+	}
+	s.confirmFullAccess = true
+	return s
 }
 
 // Applied returns the chosen mode (Enter), or empty if cancelled (Esc).
@@ -112,21 +129,37 @@ func (s *PermissionsScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		// v2: collapsed two switches into one .String() match.
 		switch m.String() {
 		case "esc", "ctrl+c", "q":
+			if s.confirmFullAccess {
+				s.confirmFullAccess = false
+				return s, nil
+			}
 			s.done = true
 			return s, nil
 		case "enter":
+			if s.modes[s.modeCursor] == "fullAccess" && !s.confirmFullAccess {
+				s.confirmFullAccess = true
+				return s, nil
+			}
 			s.applied = s.modes[s.modeCursor]
 			s.done = true
 			return s, nil
 		case "left", "h":
 			if n := len(s.modes); n > 0 {
-				s.modeCursor = (s.modeCursor - 1 + n) % n
+				if s.modeCursor == 0 && n > 1 {
+					// Do not make a single accidental Left from the default
+					// selection land on the host-unrestricted mode.
+					s.modeCursor = n - 2
+				} else {
+					s.modeCursor = (s.modeCursor - 1 + n) % n
+				}
 			}
+			s.confirmFullAccess = false
 			return s, nil
 		case "right", "l":
 			if n := len(s.modes); n > 0 {
 				s.modeCursor = (s.modeCursor + 1) % n
 			}
+			s.confirmFullAccess = false
 			return s, nil
 		case "up", "k":
 			s.rulesScroll--
@@ -170,6 +203,11 @@ func (s *PermissionsScreen) View() string {
 	// Header stripe.
 	out.WriteString(infoHeaderStripe.Render("/permissions"))
 	out.WriteString("\n\n")
+	if s.confirmFullAccess {
+		out.WriteString("  ")
+		out.WriteString(permVerbDeny.Render("DANGER: press Enter again to disable approval prompts and the process sandbox"))
+		out.WriteString("\n\n")
+	}
 
 	// Mode row — interactive cycle.
 	out.WriteString("  ")
@@ -245,6 +283,12 @@ func (s *PermissionsScreen) View() string {
 	hint := "← / →  change mode  ·  Enter apply  ·  Esc close"
 	if len(s.rules) > s.rulesViewportHeight() {
 		hint = "← / →  mode  ·  ↑/↓  scroll rules  ·  Enter apply  ·  Esc close"
+	}
+	if s.confirmFullAccess {
+		// Confirmation is the active interaction even when the rules list is
+		// scrollable; never let the generic scrolling hint hide the second-Enter
+		// safety boundary.
+		hint = "Enter confirm fullAccess  ·  Esc cancel confirmation"
 	}
 	out.WriteString(permFooterStyle.Render("  " + hint))
 

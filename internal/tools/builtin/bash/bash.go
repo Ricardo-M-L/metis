@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,7 +71,7 @@ func (Bash) Name() string { return "Bash" }
 // model gets at least one tool-redirect hint even when the full
 // `# Tool selection` table from base.md is skipped.
 func (Bash) ShortDescription() string {
-	return `Execute a shell command. stdout+stderr merge, truncated at a byte cap; cwd persists across calls in a turn, env vars do NOT. Prefer dedicated tools where possible (Read NOT cat, Glob NOT find, Grep NOT grep -r, Edit NOT sed). Pass run_in_background=true for dev servers, watchers, long builds.`
+	return `Execute a shell command. stdout+stderr merge, truncated at a byte cap; cwd persists across calls in a turn, env vars do NOT. Prefer dedicated tools where possible (Read NOT cat, Glob NOT find, Grep NOT grep -r, Edit NOT sed). Never sleep or poll for completion; use run_in_background=true and wait for its notification.`
 }
 
 func (Bash) Description() string {
@@ -105,7 +106,7 @@ Safety:
   - Never pass --no-verify, --no-gpg-sign, --force-with-lease without explicit user consent; never 'git push --force' to main/master.
   - Never 'rm -rf' or pipe to /dev/sd*; never run a command whose effect you can't reverse without asking first.
 
-Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and can poll via Output or stop via Kill. Note: 'sleep N' is detected and auto-rejected from background mode — pick a real command.
+Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and a completion notification later. Continue other useful work instead of sleeping or polling. Use Output only when interim logs are actually needed, and Kill to stop the job. A leading delay of two seconds or more is automatically moved to the background so it cannot block the turn.
 
 Always pass description: a 5-10 word phrase like "run tests" or "git status before commit". It's shown in the audit trail and helps the user see why each shell call exists.`
 }
@@ -128,7 +129,7 @@ func (Bash) InputSchema() map[string]any {
 			},
 			"run_in_background": map[string]any{
 				"type":        "boolean",
-				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately; read output with Output, terminate with Kill. 'sleep N' is auto-rejected — pick a real command.",
+				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately and sends a completion notification. Continue other work; use Output only for needed interim logs and Kill to stop.",
 			},
 		},
 	}
@@ -333,16 +334,19 @@ func splitOnAny(s string, seps []string) []string {
 }
 func (b Bash) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
 	cmd, _ := in["command"].(string)
-	if err := shellguard.Check(cmd); err != nil {
-		return tools.PermissionDeny, err.Error()
-	}
-	// CC-style adversarial-input checks (Task #73): IFS injection,
-	// /proc/environ exfil, zero-width unicode spoofing, etc. These
-	// run BEFORE the user-permission gate because no permission level
-	// (even bypass) should let an obviously-adversarial command run —
-	// the model has been jailbroken or got prompt-injected upstream.
-	if r := CheckCommand(cmd); !r.Allow {
-		return tools.PermissionDeny, securityDenyReason(r)
+	fullAccess := b.gate != nil && b.gate.Mode() == permission.ModeFullAccess
+	if !fullAccess {
+		if err := shellguard.Check(cmd); err != nil {
+			return tools.PermissionDeny, err.Error()
+		}
+		// CC-style adversarial-input checks (Task #73): IFS injection,
+		// /proc/environ exfil, zero-width unicode spoofing, etc. These
+		// run BEFORE the user-permission gate because no permission level
+		// (even bypass) should let an obviously-adversarial command run —
+		// the model has been jailbroken or got prompt-injected upstream.
+		if r := CheckCommand(cmd); !r.Allow {
+			return tools.PermissionDeny, securityDenyReason(r)
+		}
 	}
 	// Always consult the gate before applying sandbox auto-allow. Plan and
 	// dontAsk are hard denials, and explicit deny rules must not be bypassed
@@ -379,8 +383,11 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	}
 	// Execute repeats the non-bypassable process guard because Fork and other
 	// internal callers may intentionally skip Tool.CanUse.
-	if err := shellguard.Check(cmd); err != nil {
-		return &tools.Result{Output: "[blocked] " + err.Error(), IsError: true}, nil
+	fullAccess := b.gate != nil && b.gate.Mode() == permission.ModeFullAccess
+	if !fullAccess {
+		if err := shellguard.Check(cmd); err != nil {
+			return &tools.Result{Output: "[blocked] " + err.Error(), IsError: true}, nil
+		}
 	}
 
 	timeout := time.Duration(b.settings.TimeoutSeconds) * time.Second
@@ -409,14 +416,16 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// `go test -exec "..."` and `npm install --global`. Hardcoded;
 	// not configurable via permission prompt because the model could
 	// rationalise away "yes please install --global, it's needed".
-	bypass := b.gate != nil && b.gate.Mode() == permission.ModeBypassPermissions
-	if err := applyBashArgsBlockerForBypass(cmd, bypass); err != nil {
-		return &tools.Result{Output: err.Error(), IsError: true}, nil
+	if !fullAccess {
+		bypass := b.gate != nil && b.gate.Mode() == permission.ModeBypassPermissions
+		if err := applyBashArgsBlockerForBypass(cmd, bypass); err != nil {
+			return &tools.Result{Output: err.Error(), IsError: true}, nil
+		}
 	}
 
 	// Classify command and flag dangerous operations.
 	class := b.classifierFor().Classify(cmd)
-	if class.Class == ClassDangerous {
+	if !fullAccess && class.Class == ClassDangerous {
 		return &tools.Result{
 			// Human prose only (claude-code parity): the old message
 			// leaked the raw regex ("dangerous flag detected:
@@ -434,32 +443,34 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// such as docker, kubectl, journalctl, and env appear successful without
 	// ever starting a process.
 
-	// Reject bare-sleep patterns that would just sit around blocking
-	// the foreground turn for nothing useful. Mirrors claude-code's
-	// detectBlockedSleepPattern (BashTool.tsx:322): standalone `sleep
-	// N` (N≥10) and `sleep N && check` are both treated as polling. Short
-	// waits such as `sleep 3` are useful for bounded process start-up and match
-	// Codex CLI behaviour; longer waits should use job/event notifications.
-	// Sub-10s sleeps and sleeps inside pipelines / subshells are fine.
-	if blocked := detectBlockedSleepPattern(cmd); blocked != "" {
-		return &tools.Result{
-			Output: fmt.Sprintf(
-				"[blocked sleep pattern] %s\n\n"+
-					"Bare `sleep N` (N ≥ 10 seconds) is rejected as a polling primitive. "+
-					"Better alternatives: "+
-					"(1) use the Monitor tool to watch a file/log for a specific pattern — "+
-					"its event arrives the moment the condition fires, not on a polling tick; "+
-					"(2) for a long-running command, pass run_in_background=true and check progress via Output; "+
-					"(3) for deliberate sub-second pacing, `sleep 0.5` etc. is allowed.",
-				blocked,
-			),
-			IsError: true,
-		}, nil
-	}
-
 	wantBackground := false
 	if v, ok := in["run_in_background"].(bool); ok {
 		wantBackground = v
+	}
+
+	// A deliberate delay is valid shell semantics, but it must not occupy the
+	// foreground agent turn. Move it to the same event-driven job path used by
+	// long builds instead of returning a verbose policy error. This also closes
+	// the common retry loop where a model changes `sleep 12` to `sleep 9` or
+	// wraps time.sleep in Python after the first refusal.
+	if !wantBackground {
+		if wait := detectBlockingWaitPattern(cmd); wait != "" {
+			if b.Jobs == nil {
+				return &tools.Result{
+					Output:  "[blocked] foreground waiting is disabled and background jobs are unavailable",
+					IsError: true,
+				}, nil
+			}
+			res, err := b.executeBackground(ctx, cmd)
+			if err == nil && res != nil && !res.IsError {
+				if res.Presentation == nil {
+					res.Presentation = map[string]any{}
+				}
+				res.Presentation["await_completion"] = true
+				res.Presentation["wait_pattern"] = wait
+			}
+			return res, err
+		}
 	}
 
 	// Explicit run_in_background=true: skip the foreground race and
@@ -527,6 +538,13 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	// no-op when the cmd never gets adopted — but cheap enough to do
 	// universally rather than guess at adoption time.
 	jobs.ApplyProcessGroup(exe)
+	// exec.CommandContext's default Cancel kills only the direct shell. Replace
+	// it after sandbox wrapping so lifecycle cancellation reaches the final
+	// wrapper and every descendant in its isolated process group.
+	exe.Cancel = func() error {
+		jobs.KillProcessGroup(exe.Process)
+		return nil
+	}
 
 	maxBytes := b.settings.MaxOutputBytes
 	if maxBytes <= 0 {
@@ -642,8 +660,14 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		})
 		if err != nil {
 			// Adoption failed — let the cmd finish in the foreground
-			// after all. Drain the wait we already started.
+			// after all. Drain the wait we already started, then reclaim the
+			// disk writer whose ownership never transferred to Registry. This
+			// is especially important when a strict generation cut rejects
+			// Adopt with ErrRegistryResetting.
 			err2 := <-waitCh
+			if diskOut != nil {
+				b.Jobs.CleanupOrphan(diskOut)
+			}
 			out := security.RedactSubprocessText(cappedBuf.preview())
 			res := &tools.Result{Output: out, IsError: err2 != nil}
 			return res, nil
@@ -657,13 +681,20 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		}
 		msg := fmt.Sprintf(
 			"[command moved to background after %s — still running, job_id=%s]\n"+
-				"Use Output {job_id: %q} to read more output, Kill {job_id: %q} to stop.\n"+
+				"You'll receive a completion notification; continue other work without sleeping or polling. "+
+				"Use Output {job_id: %q} only for needed interim logs, Kill {job_id: %q} to stop.\n"+
 				"Output captured in foreground:\n%s",
 			AutoBackgroundThreshold, jb.ID, jb.ID, jb.ID, preview,
 		)
 		// IsError=false: this is a normal flow, not an error. The
 		// model should treat the job_id as the way forward.
-		return &tools.Result{Output: msg}, nil
+		return &tools.Result{
+			Output: msg,
+			Presentation: map[string]any{
+				"kind":   "background_job",
+				"job_id": jb.ID,
+			},
+		}, nil
 	}
 }
 
@@ -697,8 +728,6 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	if cwd := agent.CwdFromContext(ctx); cwd != "" {
 		exe.Dir = cwd
 	}
-	jobs.ApplyProcessGroup(exe)
-
 	// Sandbox the background subprocess the same way the foreground
 	// path does. Background jobs outlive the foreground turn but the
 	// sandbox restrictions don't expire with the context, so the
@@ -711,6 +740,13 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 		}, nil
 	} else {
 		exe = wrapped
+	}
+	// Apply process ownership to the final sandbox wrapper, not the pre-wrap
+	// command which may never be started.
+	jobs.ApplyProcessGroup(exe)
+	exe.Cancel = func() error {
+		jobs.KillProcessGroup(exe.Process)
+		return nil
 	}
 
 	jb, err := b.Jobs.Spawn(jobs.SpawnArgs{
@@ -725,80 +761,70 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 	return &tools.Result{
 		Output: fmt.Sprintf(
 			"[command running in background, job_id=%s]\n"+
-				"Use Output {job_id: %q} to read its output, Kill {job_id: %q} to stop.\n"+
-				"You'll receive a <job_notification> when the command exits.",
+				"You'll receive a <job_notification> when it exits; continue other work without sleeping or polling.\n"+
+				"Use Output {job_id: %q} only for needed interim logs, Kill {job_id: %q} to stop.",
 			jb.ID, jb.ID, jb.ID,
 		),
+		Presentation: map[string]any{
+			"kind":   "background_job",
+			"job_id": jb.ID,
+		},
 	}, nil
 }
 
-// blockedSleepRE matches a leading `sleep N` segment (N integer ≥ 1)
-// at the start of a command. We deliberately don't treat float sleeps
-// (sleep 0.5) the same way — those are legitimate pacing patterns.
-var blockedSleepRE = regexp.MustCompile(`^\s*sleep\s+(\d+)\s*(.*)$`)
+var (
+	leadingSleepRE = regexp.MustCompile(`(?i)^\s*(?:command\s+)?(?:(?:/usr)?/bin/)?sleep\s+([0-9]+(?:\.[0-9]+)?)\b(.*)$`)
+	pythonSleepRE  = regexp.MustCompile(`(?i)(?:\btime\.)?\bsleep\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)`)
+	scriptSleepRE  = regexp.MustCompile(`(?i)\bsleep\s*(?:\(\s*)?([0-9]+(?:\.[0-9]+)?)`)
+)
 
-const blockedSleepMinimumSeconds = 10
+const blockingWaitMinimumSeconds = 2
 
-// detectBlockedSleepPattern returns a non-empty diagnostic when cmd
-// is a bare `sleep N` (N ≥ 10) or `sleep N && rest` / `sleep N; rest`
-// pattern. Returns "" when the sleep is fine to execute (sub-10s, in a
-// pipeline, in a subshell, in a script).
-//
-// Why we reject these specifically: they're the model's "polling
-// pattern" — a sign it's waiting for something it should be watching
-// instead. Catching the polite cases (`sleep 30 && check_status`) at
-// the tool boundary forces a redirect to the job-notification or
-// file-watch path, which is more responsive AND doesn't burn the
-// foreground turn.
-func detectBlockedSleepPattern(cmd string) string {
+// detectBlockingWaitPattern returns a short diagnostic for a leading delay
+// that should run through the background-job notification path. It recognizes
+// both ordinary shell sleep and the small interpreter wrappers models tend to
+// use to evade a shell-only matcher. Sleeps inside loops, pipelines, subshells,
+// or larger scripts are left alone; those commands have their own useful work
+// and the normal auto-background threshold still applies.
+func detectBlockingWaitPattern(cmd string) string {
 	cmd = strings.TrimSpace(cmd)
-	// for / while loop with embedded sleep is a real script
-	// (polling with structure), not the bare-sleep anti-pattern.
-	if strings.Contains(cmd, "for ") || strings.Contains(cmd, "while ") {
-		return ""
-	}
-	// Sleep INSIDE a subshell or heredoc is allowed (real script).
-	// We check by looking at the FIRST non-whitespace token: only
-	// reject when `sleep` IS the leading command. Previous version
-	// rejected via ContainsAny(cmd, "|()<>") which over-matched —
-	// `sleep 60 && find ... | wc -l` got passed because the `|`
-	// belonged to the *trailing* find pipeline, not the leading
-	// sleep (image #50 session 5d9a38e5 repro 2026-05-21). The
-	// post-chain pipeline doesn't change the fact that the model
-	// is polling on `sleep N &&`.
 	if strings.HasPrefix(cmd, "(") || strings.HasPrefix(cmd, "{") {
 		return ""
 	}
-	m := blockedSleepRE.FindStringSubmatch(cmd)
-	if m == nil {
+	if m := leadingSleepRE.FindStringSubmatch(cmd); m != nil {
+		if secs, ok := blockingWaitSeconds(m[1]); ok {
+			return fmt.Sprintf("leading sleep %.3gs", secs)
+		}
+	}
+
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
 		return ""
 	}
-	secs := 0
-	for _, c := range m[1] {
-		secs = secs*10 + int(c-'0')
+	program := strings.ToLower(fields[0])
+	if slash := strings.LastIndexByte(program, '/'); slash >= 0 {
+		program = program[slash+1:]
 	}
-	if secs < blockedSleepMinimumSeconds {
+	var match []string
+	switch {
+	case strings.HasPrefix(program, "python") || strings.HasPrefix(program, "pypy"):
+		match = pythonSleepRE.FindStringSubmatch(cmd)
+	case program == "ruby" || program == "perl":
+		match = scriptSleepRE.FindStringSubmatch(cmd)
+	default:
 		return ""
 	}
-	rest := strings.TrimSpace(m[2])
-	if rest == "" {
-		return fmt.Sprintf("standalone `sleep %d`", secs)
+	if len(match) >= 2 {
+		if secs, ok := blockingWaitSeconds(match[1]); ok {
+			return fmt.Sprintf("%s sleep %.3gs", program, secs)
+		}
 	}
-	// `sleep N && check` / `sleep N; check` — explicit chain. The
-	// chained tail can have anything (pipelines, redirects); the
-	// rejection is about the LEADING sleep, not the tail.
-	if strings.HasPrefix(rest, "&&") || strings.HasPrefix(rest, ";") || strings.HasPrefix(rest, "||") {
-		return fmt.Sprintf("`sleep %d` followed by chained command", secs)
-	}
-	// `sleep 5 | something` — also a polling-then-pipe pattern. The
-	// `|` immediately after sleep is the same anti-pattern (model
-	// waits then processes); we reject so the model picks a real
-	// signal instead.
-	if strings.HasPrefix(rest, "|") {
-		return fmt.Sprintf("`sleep %d` piped into another command", secs)
-	}
-	// e.g. `sleep 5 anything-else` (rare); reject to be safe.
-	return fmt.Sprintf("`sleep %d` with trailing args", secs)
+	return ""
+}
+
+func blockingWaitSeconds(raw string) (float64, bool) {
+	secs, err := strconv.ParseFloat(raw, 64)
+	return secs, err == nil && secs >= blockingWaitMinimumSeconds
 }
 
 // cappedWriter bounds an in-memory output preview to `max` bytes, but

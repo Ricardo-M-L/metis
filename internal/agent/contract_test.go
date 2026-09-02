@@ -7,11 +7,14 @@ package agent
 // gate-attempt cap, env disable, etc.).
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // makeToolUse — tiny helper. Tests construct tool_use blocks by
@@ -150,18 +153,28 @@ func TestContract_MidTurnReminder_FiresOnceAtThreshold(t *testing.T) {
 
 func TestContract_MidTurnReminder_QuietIfVerifyAlreadyDispatched(t *testing.T) {
 	var ct contractTracker
-	uses := []llm.ContentBlock{
-		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
-	}
+	var uses []llm.ContentBlock
 	for i := 0; i < 3; i++ {
 		uses = append(uses, makeToolUse("Agent", map[string]any{"subagent_type": "general"}))
 	}
 	ct.observeToolUses(uses)
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "verify"})})
 	if !ct.thresholdMet() {
 		t.Fatalf("test premise: risk threshold should be met; score=%d", ct.riskScore())
 	}
 	if body := ct.shouldFireMidTurnReminder(); body != "" {
 		t.Errorf("reminder should stay quiet when verify already dispatched; got: %q", body)
+	}
+}
+
+func TestContract_VerifierInSameBatchCannotVerifyConcurrentFreshWork(t *testing.T) {
+	var ct contractTracker
+	ct.observeToolUses([]llm.ContentBlock{
+		makeToolUse("Agent", map[string]any{"subagent_type": "general"}),
+		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
+	})
+	if ct.verifyDispatched {
+		t.Fatal("same-batch verifier was treated as evidence after concurrent implementation")
 	}
 }
 
@@ -197,6 +210,56 @@ func TestContract_GateEnd_CapsAtTwoAttempts(t *testing.T) {
 	}
 	if body := ct.shouldGateEnd("done a third time"); body != "" {
 		t.Errorf("attempt 3 should release silently; got: %q", body)
+	}
+}
+
+func TestContract_MutationAfterPassRequiresFreshVerification(t *testing.T) {
+	var ct contractTracker
+	observeIndependentRisk(&ct)
+	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{verifyUse})
+	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{{
+		Type: "tool_result", ToolResult: "checks complete\nVERDICT: PASS",
+	}})
+	if body := ct.shouldGateEnd("done"); body != "" {
+		t.Fatalf("precondition: PASS should release gate: %q", body)
+	}
+
+	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"path": "after-pass.go"})})
+	if ct.verifyDispatched || ct.lastVerifyVerdict != "" {
+		t.Fatalf("post-PASS mutation retained stale verification: %+v", ct)
+	}
+	if body := ct.shouldGateEnd("done after another edit"); body == "" {
+		t.Fatal("post-PASS mutation did not require re-verification")
+	}
+}
+
+func TestLoopRunClearsContractStateFromPreviousUserTurn(t *testing.T) {
+	provider := &queuedStreamProvider{}
+	loop := NewLoop(
+		provider,
+		tools.NewRegistry(),
+		permission.New(permission.ModeBypassPermissions),
+		NewHookRegistry(),
+		"system",
+		4,
+	)
+	loop.contract = contractTracker{
+		mainWrites:          9,
+		highImpactAction:    true,
+		shellMutationAction: true,
+		verifyDispatched:    true,
+		lastVerifyVerdict:   "PASS",
+		gateAttempts:        contractMaxGateAttempts,
+	}
+	loop.AppendUser("fresh unrelated turn")
+	if err := loop.Run(context.Background(), make(chan Event, 32)); err != nil {
+		t.Fatalf("Loop.Run: %v", err)
+	}
+	if loop.contract.mainWrites != 0 || loop.contract.highImpactAction || loop.contract.shellMutationAction ||
+		loop.contract.verifyDispatched || loop.contract.lastVerifyVerdict != "" ||
+		loop.contract.gateAttempts != 0 {
+		t.Fatalf("previous turn contract leaked through Run boundary: %+v", loop.contract)
 	}
 }
 
@@ -307,12 +370,12 @@ func TestExtractVerdict_AllShapes(t *testing.T) {
 		want string
 	}{
 		{"pass at end", "did some work\nVERDICT: PASS\n", "PASS"},
-		{"fail at end", "found bugs\nVERDICT: FAIL — 2 tests failed\n", "FAIL"},
-		{"partial at end", "covered half\nVERDICT: PARTIAL — only ran unit tests\n", "PARTIAL"},
+		{"fail at end", "found bugs\nVERDICT: FAIL\n", "FAIL"},
+		{"partial at end", "covered half\nVERDICT: PARTIAL\n", "PARTIAL"},
 		{"no verdict line", "subagent forgot to summarize", "MISSING"},
 		{"verdict mid-body, then pass at end", "VERDICT: FAIL\nactually wait, fixed it\nVERDICT: PASS\n", "PASS"},
 		{"unknown verdict word", "VERDICT: UNCLEAR\n", "MISSING"},
-		{"verdict with tab", "VERDICT:\tPASS\n", "PASS"},
+		{"verdict with tab", "VERDICT:\tPASS\n", "MISSING"},
 		{"empty body", "", "MISSING"},
 	}
 	for _, c := range cases {
@@ -332,7 +395,7 @@ func TestObserveToolResults_SetsVerdictFromVerifyOnly(t *testing.T) {
 	}
 	results := []llm.ContentBlock{
 		makeToolResult("plan report\nVERDICT: PASS\n"), // verdict in non-verify result must be ignored
-		makeToolResult("verify report\nVERDICT: FAIL — broken\n"),
+		makeToolResult("verify report\nVERDICT: FAIL\n"),
 	}
 	ct.observeToolResults(uses, results)
 	if ct.lastVerifyVerdict != "FAIL" {
@@ -346,7 +409,7 @@ func TestGateEnd_VerdictGate_FailHolds(t *testing.T) {
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
-		makeToolResult("findings\nVERDICT: FAIL — 3 tests failed\n"),
+		makeToolResult("findings\nVERDICT: FAIL\n"),
 	})
 	body := ct.shouldGateEnd("done")
 	if body == "" {
@@ -363,7 +426,7 @@ func TestGateEnd_VerdictGate_PartialHolds(t *testing.T) {
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
-		makeToolResult("VERDICT: PARTIAL — only ran half the tests\n"),
+		makeToolResult("only ran half the tests\nVERDICT: PARTIAL\n"),
 	})
 	if body := ct.shouldGateEnd("done"); body == "" {
 		t.Error("PARTIAL verdict must hold the end gate")
@@ -402,11 +465,34 @@ func TestGateEnd_VerdictGate_OverrideReleases(t *testing.T) {
 	verifyUse := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, []llm.ContentBlock{
-		makeToolResult("VERDICT: FAIL — test was wrong, not the code\n"),
+		makeToolResult("test was wrong, not the code\nVERDICT: FAIL\n"),
 	})
 	override := "OVERRIDE CONTRACT: verifier mis-scoped, test expects old API"
 	if body := ct.shouldGateEnd(override); body != "" {
 		t.Errorf("OVERRIDE CONTRACT phrase must release even on FAIL verdict; got: %q", body)
+	}
+	if !ct.overrideBypassesGate(override) {
+		t.Error("FAIL-verdict override must be reported to the audit event path")
+	}
+}
+
+func TestOverrideBypassesGate_OnlyReportsActualObligations(t *testing.T) {
+	override := "OVERRIDE CONTRACT: intentional exception"
+
+	var small contractTracker
+	if small.overrideBypassesGate(override) {
+		t.Fatal("low-risk override text was reported without a contract obligation")
+	}
+
+	var missingVerifier contractTracker
+	observeIndependentRisk(&missingVerifier)
+	if !missingVerifier.overrideBypassesGate(override) {
+		t.Fatal("dispatch-gate override was not reported")
+	}
+
+	passed := contractTracker{verifyDispatched: true, lastVerifyVerdict: "PASS", shellMutationAction: true}
+	if passed.overrideBypassesGate(override) {
+		t.Fatal("override text after a PASS was reported as bypassing a gate")
 	}
 }
 

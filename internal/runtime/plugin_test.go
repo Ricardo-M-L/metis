@@ -2,15 +2,19 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/agent/skills"
+	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
+	pubplugin "github.com/Ricardo-M-L/metis/pkg/plugin"
 )
 
 // writePluginManifest builds a plugin dir with the given TOML content.
@@ -211,5 +215,178 @@ url = "https://example.invalid/mcp"
 	}
 	if captured[1].Name != "plugin:codex-bridge:beta" || captured[1].URL != "https://example.invalid/mcp" {
 		t.Fatalf("http entry = %+v", captured[1])
+	}
+}
+
+func TestPluginRegistryCloseMCPServersPreservesPluginSkills(t *testing.T) {
+	server := mcptools.NewLazyServer("plugin:test:server", nil, func(context.Context) (*mcpsdk.Client, error) {
+		return nil, context.Canceled
+	})
+	plugin := &Plugin{
+		Manifest: pubplugin.Manifest{Name: "test"},
+		MCP:      server,
+		MCPServers: []*mcptools.Server{
+			server,
+		},
+		Skills: []skills.Skill{{Name: "test:skill"}},
+	}
+	registry := &PluginRegistry{plugins: []*Plugin{plugin}}
+
+	if err := registry.CloseMCPServers(); err != nil {
+		t.Fatalf("CloseMCPServers: %v", err)
+	}
+	all := registry.All()
+	if len(all) != 1 || all[0] != plugin {
+		t.Fatalf("plugin metadata was discarded: %#v", all)
+	}
+	if plugin.MCP != nil || len(plugin.MCPServers) != 0 {
+		t.Fatalf("plugin retained MCP handles: MCP=%p servers=%#v", plugin.MCP, plugin.MCPServers)
+	}
+	if got := registry.SkillSources(); len(got) != 1 || len(got[0].Skills()) != 1 {
+		t.Fatalf("plugin skills disappeared after MCP revocation: %#v", got)
+	}
+}
+
+func TestLoadPluginsClosesPartialMCPServersWhenLaterLaunchFails(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	writePluginManifest(t, "partial-mcp", `manifest_version = 1
+name = "partial-mcp"
+version = "0.1.0"
+description = "partial MCP launch failure"
+
+[[mcp_servers]]
+name = "first"
+command = "first-server"
+
+[[mcp_servers]]
+name = "second"
+command = "second-server"
+`)
+
+	toolRegistry := tools.NewRegistry()
+	var first *mcptools.Server
+	spawnCalls := 0
+	launchCalls := 0
+	original := launchPluginMCPServer
+	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, registry *tools.Registry, _ *sandbox.Manager) (*mcptools.Server, error) {
+		launchCalls++
+		if launchCalls == 2 {
+			return nil, errors.New("second launch failed")
+		}
+		first = newPartialLoadTestServer(entry.Name, registry, &spawnCalls)
+		return first, nil
+	}
+	t.Cleanup(func() { launchPluginMCPServer = original })
+
+	plugins, errs := LoadPlugins(context.Background(), toolRegistry)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "second launch failed") {
+		t.Fatalf("load errors = %v, want second launch failure", errs)
+	}
+	if got := len(plugins.All()); got != 0 {
+		t.Fatalf("loaded plugins = %d, want 0", got)
+	}
+	assertPartialLoadServerReleased(t, first, toolRegistry, &spawnCalls)
+}
+
+func TestLoadPluginsClosesPartialMCPServersWhenSkillLoadFails(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	writePluginManifest(t, "partial-skill", `manifest_version = 1
+name = "partial-skill"
+version = "0.1.0"
+description = "skill load failure after MCP launch"
+skills = ["missing.md"]
+
+[mcp_server]
+command = "first-server"
+`)
+
+	toolRegistry := tools.NewRegistry()
+	var started *mcptools.Server
+	spawnCalls := 0
+	original := launchPluginMCPServer
+	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, registry *tools.Registry, _ *sandbox.Manager) (*mcptools.Server, error) {
+		started = newPartialLoadTestServer(entry.Name, registry, &spawnCalls)
+		return started, nil
+	}
+	t.Cleanup(func() { launchPluginMCPServer = original })
+
+	plugins, errs := LoadPlugins(context.Background(), toolRegistry)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "missing.md") {
+		t.Fatalf("load errors = %v, want missing skill failure", errs)
+	}
+	if got := len(plugins.All()); got != 0 {
+		t.Fatalf("loaded plugins = %d, want 0", got)
+	}
+	assertPartialLoadServerReleased(t, started, toolRegistry, &spawnCalls)
+}
+
+func TestLoadPluginsClosesServerReturnedWithLaunchError(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	writePluginManifest(t, "partial-return", `manifest_version = 1
+name = "partial-return"
+version = "0.1.0"
+description = "launcher returned both a server and an error"
+
+[mcp_server]
+command = "partial-server"
+`)
+
+	toolRegistry := tools.NewRegistry()
+	var partial *mcptools.Server
+	spawnCalls := 0
+	original := launchPluginMCPServer
+	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, registry *tools.Registry, _ *sandbox.Manager) (*mcptools.Server, error) {
+		partial = newPartialLoadTestServer(entry.Name, registry, &spawnCalls)
+		return partial, errors.New("launch failed after allocation")
+	}
+	t.Cleanup(func() { launchPluginMCPServer = original })
+
+	plugins, errs := LoadPlugins(context.Background(), toolRegistry)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "launch failed after allocation") {
+		t.Fatalf("load errors = %v, want partial launch failure", errs)
+	}
+	if got := len(plugins.All()); got != 0 {
+		t.Fatalf("loaded plugins = %d, want 0", got)
+	}
+	assertPartialLoadServerReleased(t, partial, toolRegistry, &spawnCalls)
+}
+
+func newPartialLoadTestServer(name string, registry *tools.Registry, spawnCalls *int) *mcptools.Server {
+	server := mcptools.NewLazyServer(name, []mcpsdk.Tool{{
+		Name:        "probe",
+		Description: "partial-load lifecycle probe",
+		InputSchema: map[string]any{"type": "object"},
+	}}, func(context.Context) (*mcpsdk.Client, error) {
+		(*spawnCalls)++
+		return nil, errors.New("test server unexpectedly spawned")
+	})
+	for _, tool := range server.Tools() {
+		registry.Register(tool)
+	}
+	return server
+}
+
+func assertPartialLoadServerReleased(t *testing.T, server *mcptools.Server, registry *tools.Registry, spawnCalls *int) {
+	t.Helper()
+	if server == nil {
+		t.Fatal("first MCP server was not launched")
+	}
+	toolName := "mcp__" + server.Name() + "__probe"
+	if _, ok := registry.Get(toolName); ok {
+		t.Fatalf("partial-load tool namespace still contains %q", toolName)
+	}
+	serverTools := server.Tools()
+	if len(serverTools) != 1 {
+		t.Fatalf("server tools = %d, want 1", len(serverTools))
+	}
+	result, err := serverTools[0].Execute(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("execute closed server probe: %v", err)
+	}
+	if result == nil || !result.IsError || !strings.Contains(result.Output, "MCP server is closed") {
+		t.Fatalf("server was not closed after partial load: result=%#v", result)
+	}
+	if *spawnCalls != 0 {
+		t.Fatalf("closed server invoked lazy spawn %d time(s), want 0", *spawnCalls)
 	}
 }

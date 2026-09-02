@@ -57,6 +57,7 @@ type Server struct {
 	// once per tool call).
 	spawn       func(context.Context) (*mcp.Client, error)
 	spawnOnce   sync.Once
+	spawnWG     sync.WaitGroup
 	spawnErr    error
 	spawnCancel context.CancelFunc
 	closed      bool
@@ -401,7 +402,13 @@ func (s *Server) ensureClient(ctx context.Context) error {
 			return
 		}
 		s.spawnCancel = cancel
+		// Register the in-flight spawn while holding the same lock Close uses to
+		// publish closed. This makes Add happen-before any matching Wait: either
+		// Close sees this owner and joins it, or closed is already true and no
+		// spawn owner is added.
+		s.spawnWG.Add(1)
 		s.mu.Unlock()
+		defer s.spawnWG.Done()
 
 		client, err := s.spawn(spawnCtx)
 		cancel()
@@ -545,6 +552,10 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		// Another caller may own the close while a lazy spawn is still in
+		// flight. Its transport error belongs to that first caller, but every
+		// Close must still honor the process-exit boundary.
+		s.spawnWG.Wait()
 		return nil
 	}
 	s.closed = true
@@ -556,10 +567,16 @@ func (s *Server) Close() error {
 	if cancel != nil {
 		cancel()
 	}
-	if c == nil {
-		return nil
+	var err error
+	if c != nil {
+		err = c.Close()
 	}
-	return c.Close()
+	// Cancellation only asks an in-flight lazy launcher to stop. Join it so a
+	// late client is closed (above in ensureClient) before this lifecycle
+	// boundary returns; otherwise an unsandboxed child can overlap the safer
+	// permission mode that triggered Close.
+	s.spawnWG.Wait()
+	return err
 }
 
 // Name returns the server's logical name (the `mcp__<name>__*` prefix).

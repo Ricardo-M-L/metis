@@ -34,6 +34,22 @@ func TestBypassReadRedactsPEMWhenPageContainsOnlyBody(t *testing.T) {
 	}
 }
 
+func TestFullAccessReadOpensCredentialPathWithoutApproval(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte("MODEL=glm-test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (Read{gate: permission.New(permission.ModeFullAccess)}).Execute(
+		context.Background(), map[string]any{"path": path},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.IsError || !strings.Contains(result.Output, "MODEL=glm-test") {
+		t.Fatalf("fullAccess credential-path read = %+v, want successful content", result)
+	}
+}
+
 func TestDefaultReadRedactsPEMWhenPageContainsOnlyBody(t *testing.T) {
 	privateKeyBody := strings.Repeat("B", 64)
 	path := filepath.Join(t.TempDir(), "ordinary-notes.txt")

@@ -95,6 +95,66 @@ func TestAgentExecute_BypassParentChildRunsWithoutEscalation(t *testing.T) {
 	}
 }
 
+func TestAgentFullAccessParentRejectsExplicitLowerMode(t *testing.T) {
+	for _, childMode := range []permission.Mode{
+		permission.ModeDefault,
+		permission.ModeAcceptEdits,
+		permission.ModePlan,
+		permission.ModeDontAsk,
+		permission.ModeBypassPermissions,
+	} {
+		t.Run(string(childMode), func(t *testing.T) {
+			dir := t.TempDir()
+			gate := permission.New(permission.ModeFullAccess)
+			tool := NewAgent(gate, helloProvider(), tools.NewRegistry(), "m", "s").
+				WithRoster(agent.NewRoster(0)).
+				WithSessionPersistence(dir, "parent")
+			in := map[string]any{
+				"prompt":          "x",
+				"permission_mode": string(childMode),
+			}
+
+			if got, reason := tool.CanUse(context.Background(), in); got != tools.PermissionDeny || !strings.Contains(reason, "cannot safely reduce a fullAccess parent") {
+				t.Fatalf("CanUse = (%v, %q), want explicit false-downgrade denial", got, reason)
+			}
+			res, err := tool.Execute(context.Background(), in)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if res == nil || !res.IsError || !strings.Contains(res.Output, "cannot safely reduce a fullAccess parent") {
+				t.Fatalf("Execute result = %+v, want explicit false-downgrade error", res)
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, agent.SubAgentTranscriptDirname)); !os.IsNotExist(statErr) {
+				t.Fatalf("rejected child created transcript state: %v", statErr)
+			}
+			if gate.Mode() != permission.ModeFullAccess {
+				t.Fatalf("parent gate changed to %q", gate.Mode())
+			}
+		})
+	}
+}
+
+func TestAgentExecute_FullAccessParentInheritsWhenModeOmitted(t *testing.T) {
+	dir := t.TempDir()
+	gate := permission.New(permission.ModeFullAccess)
+	tool := NewAgent(gate, helloProvider(), tools.NewRegistry(), "m", "s").
+		WithRoster(agent.NewRoster(0)).
+		WithSessionPersistence(dir, "parent")
+
+	res, err := tool.Execute(context.Background(), map[string]any{"prompt": "x"})
+	if err != nil || res.IsError {
+		t.Fatalf("Execute: err=%v res=%+v", err, res)
+	}
+	agentID := mustOneTranscript(t, dir)
+	snap, err := agent.LoadSubAgentSnapshot(dir, agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Header.Mode != string(permission.ModeFullAccess) {
+		t.Fatalf("inherited child mode = %q, want fullAccess", snap.Header.Mode)
+	}
+}
+
 // mustOneTranscript reads the SubAgentTranscriptDirname under dir and
 // returns the basename (without .jsonl) of the single transcript
 // expected. Fails the test loudly when 0 or >1 exist.

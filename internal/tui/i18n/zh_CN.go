@@ -12,6 +12,7 @@ var zhCN = map[string]string{
 	"mode.default":           "默认询问",
 	"mode.acceptEdits":       "接受编辑",
 	"mode.bypassPermissions": "绕过权限",
+	"mode.fullAccess":        "完全访问",
 	"mode.plan":              "计划",
 	"mode.dontAsk":           "不询问",
 	"mode.cycle_hint":        "shift+tab 切换",

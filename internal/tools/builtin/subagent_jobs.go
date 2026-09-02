@@ -181,9 +181,9 @@ func (s SubAgentOutput) Execute(_ context.Context, in map[string]any) (*tools.Re
 
 // SubAgentStop — terminate a running sub-agent.
 //
-// Calls the teammate's stored Cancel func which cascades through
-// ctx → sub-loop → tools. The sub-agent transitions to StatusKilled
-// and finishes its accumulated output snapshot for one last
+// Records a cancellation request which cascades through ctx → sub-loop →
+// tools as soon as the child callback is installed. The sub-agent transitions
+// to StatusKilled and finishes its accumulated output snapshot for one last
 // SubAgentOutput read.
 type SubAgentStop struct {
 	tools.BaseTool
@@ -238,9 +238,10 @@ func (s SubAgentStop) Execute(_ context.Context, in map[string]any) (*tools.Resu
 	if snap.Status != agent.StatusRunning {
 		return &tools.Result{Output: fmt.Sprintf("sub-agent %s already %s", snap.AgentID, snap.Status)}, nil
 	}
-	if t.Cancel != nil {
-		t.Cancel()
-	}
+	// RequestCancel is deliberately safe even while Agent.Execute is still
+	// constructing the child context. A direct read of t.Cancel would race its
+	// publication and could lose a stop request in that short setup window.
+	t.RequestCancel()
 	return &tools.Result{Output: fmt.Sprintf("sub-agent %s (name=%s) cancellation requested", snap.AgentID, snap.Name)}, nil
 }
 

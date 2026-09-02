@@ -158,6 +158,11 @@ type ExternalHooks struct {
 	// overrides. A fresh/forked session must use this baseline, not inherit a
 	// resumed session's bypass/deny posture.
 	FreshPermissionMode permission.Mode
+	// TrustSessionPermissions allows Mode, PrePlanMode and AlwaysAllow from
+	// persisted headers to cross an in-process resume boundary. Production sets
+	// it only for a trusted session-dir source (or an explicitly authorized
+	// fullAccess launch); false is the secure default for embedders.
+	TrustSessionPermissions bool
 	// Sandbox is passed as runtime infrastructure, not discovered through the
 	// Bash tool registry: a disabled/hidden Bash tool must not turn local !cmd
 	// into an unsandboxed execution path.
@@ -165,10 +170,14 @@ type ExternalHooks struct {
 	// ReloadCatalog refreshes disk-backed skills and custom slash commands
 	// without rebuilding the active Loop or discarding conversation history.
 	ReloadCatalog func() (string, error)
-	// AdoptMCPServer transfers an explicitly reauthenticated MCP connection to
-	// the process runtime. The callback must atomically publish discoveredTools
-	// and replace/close any prior server with the same logical name. Returning
-	// true means the runtime owns server; false leaves ownership with the TUI.
+	// BeginMCPLaunch captures the process runtime's launch generation before an
+	// explicit login/start operation begins. The returned ticket must atomically
+	// publish discoveredTools or consume+close a result invalidated by a later
+	// permission transition.
+	BeginMCPLaunch func(lifecycle context.Context) *MCPLaunchTicket
+	// AdoptMCPServer is the legacy completion-time ownership hook. New runtime
+	// embedders should use BeginMCPLaunch so a slow fullAccess launch cannot be
+	// adopted after the process has entered a safer mode.
 	AdoptMCPServer func(server *mcptools.Server, discoveredTools []tools.Tool) bool
 }
 

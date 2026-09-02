@@ -20,6 +20,7 @@ package builtin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -84,8 +85,8 @@ func (EnterPlanMode) Description() string {
 		"gate), while edits and commands that change state are blocked. " +
 		"Use this when the user asked for a proposal before action. When " +
 		"the plan is complete, call ExitPlanMode with the final markdown. " +
-		"Interactive modes present an approval prompt; bypassPermissions " +
-		"uses its unattended preset and continues automatically. For " +
+		"Interactive modes present an approval prompt; bypassPermissions and " +
+		"fullAccess use their unattended presets and continue automatically. For " +
 		"requirements clarification during interactive planning, use AskUser."
 }
 
@@ -113,8 +114,8 @@ func (e EnterPlanMode) CanUse(_ context.Context, _ map[string]any) (tools.Permis
 	if e.gate != nil && e.gate.Mode() == permission.ModePlan {
 		return tools.PermissionAllow, "already in plan mode"
 	}
-	if e.gate != nil && e.gate.Mode() == permission.ModeBypassPermissions {
-		return tools.PermissionAllow, "bypassPermissions unattended plan policy"
+	if e.gate != nil && (e.gate.Mode() == permission.ModeBypassPermissions || e.gate.Mode() == permission.ModeFullAccess) {
+		return tools.PermissionAllow, string(e.gate.Mode()) + " unattended plan policy"
 	}
 	return tools.PermissionAsk, "entering plan mode requires user approval"
 }
@@ -137,11 +138,23 @@ func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Re
 	// stuck in plan and the next turn would re-trigger deny-storm
 	// for every write tool).
 	if e.gate != nil {
+		// Enter/ExitPlanMode are split by Loop into isolated, plan-control-only
+		// exclusive batches. The dispatcher holds the Gate's shared admission
+		// lease for that whole batch, so external transitions and Capture cannot
+		// observe the lineage/mode pair between these ordered writes. Do not call
+		// RunModeTransition here: upgrading that read lease to the write side
+		// would self-deadlock.
 		prev := e.gate.Mode()
 		if prev != permission.ModePlan {
 			ctrl.SetPrePlanMode(string(prev))
+			e.gate.SetModeAndWait(permission.ModePlan)
 		}
-		e.gate.SetMode(permission.ModePlan)
+		if committed := e.gate.Mode(); committed != permission.ModePlan {
+			// A listener may fail closed to a non-plan mode. Do not leave
+			// lineage attached to a mode from which ExitPlanMode cannot run.
+			ctrl.SetPrePlanMode("")
+			return &tools.Result{Output: fmt.Sprintf("EnterPlanMode: plan mode was superseded by %s", committed), IsError: true}, nil
+		}
 		return &tools.Result{
 			Output: "Plan mode active. Read-only exploration and Agent delegation remain available; state-changing tools are denied. When ready, call ExitPlanMode with a `plan` argument containing the markdown plan body for user approval.",
 		}, nil
@@ -186,7 +199,7 @@ func (ExitPlanMode) Description() string {
 		"proposed work — bullet points, file paths, exact commands, " +
 		"expected outcomes. Interactive modes block until the user " +
 		"approves implementation or chooses to keep planning; a " +
-		"bypassPermissions-origin plan is auto-approved by its preset " +
+		"bypassPermissions- or fullAccess-origin plan is auto-approved by its preset " +
 		"and continues without an interaction.\n\n" +
 		"Important: this is the right tool when you want to PROPOSE " +
 		"a multi-step plan and request approval. It is NOT the right tool when you " +
@@ -203,7 +216,7 @@ func (ExitPlanMode) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"plan": map[string]any{
 				"type":        "string",
-				"description": "Final plan markdown — what you'll do, in what order, with what side effects. Shown for review in interactive modes; recorded and auto-accepted under the bypassPermissions preset.",
+				"description": "Final plan markdown — what you'll do, in what order, with what side effects. Shown for review in interactive modes; recorded and auto-accepted under the bypassPermissions and fullAccess presets.",
 			},
 		},
 	}
@@ -215,6 +228,42 @@ func (ExitPlanMode) Concurrency(map[string]any) tools.Concurrency {
 
 func (ExitPlanMode) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	return tools.PermissionAllow, ""
+}
+
+// snapshotPlanRestore reads the Gate mode and its pre-plan lineage while the
+// dispatcher's shared batch lease excludes external transitions. It also
+// clears stale lineage before the isolated ExitPlanMode batch returns.
+func snapshotPlanRestore(gate *permission.Gate, ctrl agent.PlanController) (permission.Mode, bool) {
+	restore := permission.ModeDefault
+	if gate.Mode() != permission.ModePlan {
+		ctrl.SetPrePlanMode("")
+		return restore, false
+	}
+	if prev, ok := permission.ParseMode(ctrl.PrePlanMode()); ok && prev != permission.ModePlan {
+		restore = prev
+	}
+	return restore, true
+}
+
+// restorePlanMode commits the target mode and clears its lineage as one
+// capture-atomic sequence under the dispatcher's shared batch lease. The
+// listener drain is settled before returning so the caller never reports
+// approval while sandbox/plan observers are pending.
+func restorePlanMode(gate *permission.Gate, ctrl agent.PlanController, target permission.Mode) error {
+	if gate.Mode() != permission.ModePlan {
+		ctrl.SetPrePlanMode("")
+		return errors.New("plan mode is not active; stale plan state was cleared")
+	}
+	previousPrePlan := ctrl.PrePlanMode()
+	ctrl.SetPrePlanMode("")
+	gate.SetModeAndWait(target)
+	if committed := gate.Mode(); committed != target {
+		if committed == permission.ModePlan {
+			ctrl.SetPrePlanMode(previousPrePlan)
+		}
+		return fmt.Errorf("plan exit to %s was superseded by %s", target, committed)
+	}
+	return nil
 }
 
 func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
@@ -245,27 +294,30 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 		ctrl.SetPrePlanMode("")
 		return &tools.Result{Output: "Plan surfaced for review. Plan mode disabled by the controller-only fallback."}, nil
 	}
-	if e.gate.Mode() != permission.ModePlan {
-		// The user already left plan mode through another surface. A stale
-		// snapshot must never make ExitPlanMode silently restore bypass.
-		ctrl.SetPrePlanMode("")
+	restore, active := snapshotPlanRestore(e.gate, ctrl)
+	if !active {
+		// The user already left plan mode through another surface. The snapshot
+		// helper cleared stale lineage under the same coordinator as Capture.
 		return &tools.Result{
 			Output:  "ExitPlanMode: plan mode is not active; stale plan state was cleared",
 			IsError: true,
 		}, nil
-	}
-	restore := permission.ModeDefault
-	if prev, ok := permission.ParseMode(ctrl.PrePlanMode()); ok && prev != permission.ModePlan {
-		restore = prev
 	}
 	// bypassPermissions is explicitly unattended. EnterPlanMode is allowed to
 	// organize a complex task, but ExitPlanMode must not turn that session back
 	// into an approval workflow. Use the preset policy: approve the plan and
 	// restore bypass without emitting EventAskUser.
 	if restore == permission.ModeBypassPermissions {
-		e.gate.SetMode(permission.ModeBypassPermissions)
-		ctrl.SetPrePlanMode("")
+		if err := restorePlanMode(e.gate, ctrl, permission.ModeBypassPermissions); err != nil {
+			return &tools.Result{Output: "ExitPlanMode: " + err.Error(), IsError: true}, nil
+		}
 		return &tools.Result{Output: "Plan accepted by the bypassPermissions unattended policy. Continue implementation in bypassPermissions mode."}, nil
+	}
+	if restore == permission.ModeFullAccess {
+		if err := restorePlanMode(e.gate, ctrl, permission.ModeFullAccess); err != nil {
+			return &tools.Result{Output: "ExitPlanMode: " + err.Error(), IsError: true}, nil
+		}
+		return &tools.Result{Output: "Plan accepted by the fullAccess unattended policy. Continue implementation in fullAccess mode."}, nil
 	}
 
 	// Interactive modes keep the blocking approval boundary. Headless callers
@@ -297,20 +349,14 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 	case answer := <-reply:
 		switch strings.TrimSpace(answer) {
 		case primaryLabel:
-			if e.gate != nil {
-				e.gate.SetMode(primaryMode)
-			} else {
-				ctrl.SetPlanMode(false)
+			if err := restorePlanMode(e.gate, ctrl, primaryMode); err != nil {
+				return &tools.Result{Output: "ExitPlanMode: " + err.Error(), IsError: true}, nil
 			}
-			ctrl.SetPrePlanMode("")
 			return &tools.Result{Output: "User approved the plan. Continue implementation in " + string(primaryMode) + " mode."}, nil
 		case manualLabel:
-			if e.gate != nil {
-				e.gate.SetMode(permission.ModeDefault)
-			} else {
-				ctrl.SetPlanMode(false)
+			if err := restorePlanMode(e.gate, ctrl, permission.ModeDefault); err != nil {
+				return &tools.Result{Output: "ExitPlanMode: " + err.Error(), IsError: true}, nil
 			}
-			ctrl.SetPrePlanMode("")
 			return &tools.Result{Output: "User approved the plan. Continue implementation in default mode; state-changing tools require approval."}, nil
 		default:
 			return &tools.Result{Output: "User chose to keep planning. Remain in plan mode and revise the proposal before calling ExitPlanMode again."}, nil

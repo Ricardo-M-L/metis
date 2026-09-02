@@ -63,11 +63,12 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	defer cancelServer()
 	shutdownToken := strings.TrimSpace(os.Getenv("METIS_DESKTOP_FRAME_TOKEN"))
 	bindings := webui.RuntimeBindings{
-		InitialSessionID:      rt.sessionID,
-		ProviderName:          rt.providerName,
-		PresetName:            presetName,
-		FreshSystemPromptKind: rt.systemPromptKind,
-		FreshPermissionMode:   rt.defaultPermissionMode,
+		InitialSessionID:        rt.sessionID,
+		ProviderName:            rt.providerName,
+		PresetName:              presetName,
+		FreshSystemPromptKind:   rt.systemPromptKind,
+		FreshPermissionMode:     rt.defaultPermissionMode,
+		TrustSessionPermissions: rt.allowStoredSessionPermissions,
 		SetPermissionMode: func(mode permission.Mode) error {
 			return applyRuntimePermissionMode(rt, mode)
 		},

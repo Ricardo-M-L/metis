@@ -103,3 +103,14 @@ func TestInstructionCarriesSchema(t *testing.T) {
 		t.Errorf("instruction missing schema body: %s", ins)
 	}
 }
+
+func TestOutputSchemaEnforcerExposesNativeResponseFormat(t *testing.T) {
+	e := newEnforcer(t, `{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}`)
+	format := e.ResponseFormat()
+	if format == nil || format.Name != "metis_output" || !format.Strict {
+		t.Fatalf("format = %#v", format)
+	}
+	if format.JSONSchema["type"] != "object" {
+		t.Fatalf("schema = %#v", format.JSONSchema)
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -314,14 +315,24 @@ type ProviderOpenAI struct {
 	// (/v1/responses). DeepSeek's official API only serves chat, so
 	// "responses" targets OpenAI/xAI/other Responses origins.
 	WireProtocol string `toml:"wire_protocol"`
+	// ResponsesStateMode controls Responses API conversation ownership:
+	// local (default), provider (store + previous_response_id), or auto.
+	ResponsesStateMode string   `toml:"responses_state_mode"`
+	ResponsesProfile   string   `toml:"responses_profile"`
+	PromptCacheKey     string   `toml:"prompt_cache_key"`
+	HostedTools        []string `toml:"hosted_tools"`
 }
 
 type ProviderRaw struct {
 	// Transport picks the wire format. Recognized values:
 	//   anthropic_messages | openai_chat | openai_responses | gemini_native  (HTTP+API key)
 	//   azure_openai      | vertex_anthropic | bedrock_anthropic            (cloud auth)
-	Transport string `toml:"transport"`
-	APIKeyEnv string `toml:"api_key_env"`
+	Transport          string   `toml:"transport"`
+	ResponsesStateMode string   `toml:"responses_state_mode"`
+	ResponsesProfile   string   `toml:"responses_profile"`
+	PromptCacheKey     string   `toml:"prompt_cache_key"`
+	HostedTools        []string `toml:"hosted_tools"`
+	APIKeyEnv          string   `toml:"api_key_env"`
 	// APIKey — inline credential, lowest-priority fallback (after
 	// env + auth.json). Discouraged for shared / committed configs
 	// since it puts the secret in plaintext in config.toml. Useful
@@ -906,6 +917,92 @@ func searchPaths() []string {
 		out = append(out, filepath.Join(cwd, ".metis", "config.local.toml"))
 	}
 	return out
+}
+
+// LoadPermissionModeForWorkspace resolves the permission mode with the same
+// source-aware workspace trust boundary used for executable hooks. Ordinary
+// project permission modes remain valid before trust, but an untrusted project
+// (including config.local.toml) may not silently select fullAccess and disable
+// both approvals and the process sandbox. In that case the last trusted value
+// (defaults or the user config) remains in force.
+func LoadPermissionModeForWorkspace(projectTrusted bool) (string, error) {
+	mode := defaults().Permission.Mode
+	userConfigPath := filepath.Clean(filepath.Join(Home(), "config.toml"))
+	for i, path := range searchPaths() {
+		isUserConfig := i == 0 && filepath.Clean(path) == userConfigPath
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("load permission mode %s: %w", path, err)
+		}
+
+		var scoped struct {
+			Permission struct {
+				Mode string `toml:"mode"`
+			} `toml:"permission"`
+		}
+		metadata, err := toml.DecodeFile(path, &scoped)
+		if err != nil {
+			return "", fmt.Errorf("load permission mode %s: %w", path, err)
+		}
+		if !metadata.IsDefined("permission", "mode") {
+			continue
+		}
+		candidate := scoped.Permission.Mode
+		if !isUserConfig && !projectTrusted && isFullAccessPermissionMode(candidate) {
+			continue
+		}
+		mode = candidate
+	}
+	return mode, nil
+}
+
+func isFullAccessPermissionMode(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case "fullAccess", "full":
+		return true
+	default:
+		return false
+	}
+}
+
+// SessionPermissionStateTrustedForWorkspace reports whether the configuration
+// source that selected [session].dir is allowed to supply persisted permission
+// grants. Session transcripts are ordinary data, but Mode, PrePlanMode and
+// AlwaysAllow in their headers are authorization state. A project may keep its
+// own history directory before workspace trust; it may not use that directory
+// to silently cross the fullAccess boundary or forge approval rules.
+//
+// Defaults and the user config are trusted. A project/project-local override
+// becomes trusted only after the workspace trust decision has been persisted.
+func SessionPermissionStateTrustedForWorkspace(projectTrusted bool) (bool, error) {
+	trusted := true
+	userConfigPath := filepath.Clean(filepath.Join(Home(), "config.toml"))
+	for i, path := range searchPaths() {
+		isUserConfig := i == 0 && filepath.Clean(path) == userConfigPath
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, fmt.Errorf("load session directory provenance %s: %w", path, err)
+		}
+
+		var scoped struct {
+			Session struct {
+				Dir string `toml:"dir"`
+			} `toml:"session"`
+		}
+		metadata, err := toml.DecodeFile(path, &scoped)
+		if err != nil {
+			return false, fmt.Errorf("load session directory provenance %s: %w", path, err)
+		}
+		if !metadata.IsDefined("session", "dir") {
+			continue
+		}
+		trusted = isUserConfig || projectTrusted
+	}
+	return trusted, nil
 }
 
 // LoadHooksForWorkspace resolves lifecycle hooks with an explicit workspace

@@ -96,6 +96,12 @@ func (r *REPL) handleMCPEdit(name string) string {
 // tools state. We don't graft the tools onto r.Loop.Registry — this is
 // a probe, not a launch.
 func (r *REPL) handleMCPTest(name string) string {
+	base := context.Background()
+	if r != nil && r.ctx != nil {
+		base = r.ctx
+	}
+	ticket := r.beginMCPLaunchTicket(base)
+	defer ticket.Finish()
 	reg, err := mcp.Load()
 	if err != nil {
 		return "mcp: " + err.Error()
@@ -110,15 +116,18 @@ func (r *REPL) handleMCPTest(name string) string {
 	// 15s probe timeout — long enough for `npx` to fetch a package on
 	// a slow link, short enough that a misconfigured URL doesn't hang
 	// the chat surface.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(ticket.Context(), 15*time.Second)
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return "mcp test: " + err.Error()
+	}
 	// Use a throwaway tools.Registry; mcp.LaunchServer registers
 	// onto whatever we pass, but we want the count, not the side effect.
 	// The simpler `srv, err := mcptools.NewServer(...)` would skip env
 	// expansion + the URL/stdio branching, so route through LaunchMCPServer
 	// with a discard registry.
 	probe := tools.NewRegistry()
-	srv, err := mcp.LaunchServerWithSandbox(ctx, reg, name, probe, r.sandbox)
+	srv, err := launchConfiguredMCPServer(ctx, reg, name, probe, r.sandbox)
 	if err != nil {
 		return "mcp test: " + err.Error()
 	}

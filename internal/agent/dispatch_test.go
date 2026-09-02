@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -127,6 +128,60 @@ func (t *legacyApprovalTool) CanUse(context.Context, map[string]any) (tools.Perm
 	return tools.PermissionAsk, "legacy plugin requires approval"
 }
 
+func TestDetachInterruptBlockContextPreservesTurnDetachAndHardLifecycle(t *testing.T) {
+	t.Run("top-level turn cancellation stays detached", func(t *testing.T) {
+		turnCtx, cancelTurn := context.WithCancel(context.Background())
+		detached, cleanup := detachInterruptBlockContext(turnCtx)
+		defer cleanup()
+		cancelTurn()
+
+		select {
+		case <-detached.Done():
+			t.Fatalf("top-level InterruptBlock context inherited ordinary turn cancellation: %v", detached.Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+	})
+
+	t.Run("sub-agent hard lifecycle remains attached", func(t *testing.T) {
+		turnCtx, cancelTurn := context.WithCancel(context.Background())
+		hardCtx, cancelHard := context.WithCancel(context.Background())
+		stamped := WithToolLifecycleContext(turnCtx, hardCtx)
+		detached, cleanup := detachInterruptBlockContext(stamped)
+		defer cleanup()
+
+		cancelTurn()
+		select {
+		case <-detached.Done():
+			t.Fatalf("ordinary turn cancellation crossed the InterruptBlock boundary: %v", detached.Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+
+		cancelHard()
+		select {
+		case <-detached.Done():
+			if !errors.Is(detached.Err(), context.Canceled) {
+				t.Fatalf("hard lifecycle error = %v, want context.Canceled", detached.Err())
+			}
+		case <-time.After(time.Second):
+			t.Fatal("hard lifecycle cancellation did not reach InterruptBlock context")
+		}
+	})
+
+	t.Run("already-cancelled hard lifecycle fails closed", func(t *testing.T) {
+		hardCtx, cancelHard := context.WithCancel(context.Background())
+		cancelHard()
+		detached, cleanup := detachInterruptBlockContext(
+			WithToolLifecycleContext(context.Background(), hardCtx),
+		)
+		defer cleanup()
+		select {
+		case <-detached.Done():
+		case <-time.After(time.Second):
+			t.Fatal("pre-cancelled hard lifecycle was lost during detach")
+		}
+	})
+}
+
 func (f *presentationTool) Execute(context.Context, map[string]any) (*tools.Result, error) {
 	return &tools.Result{
 		Output:       "Artifact updated",
@@ -241,6 +296,31 @@ func TestDispatch_BypassSilentlyDeniesLegacyPluginAskWithoutOptIn(t *testing.T) 
 		ev := <-out
 		if ev.Kind == EventPermissionRequest || ev.Kind == EventAskUser {
 			t.Fatalf("bypass emitted interactive event %v", ev.Kind)
+		}
+	}
+}
+
+func TestDispatch_FullAccessRunsLegacyPluginAskWithoutPermissionEvent(t *testing.T) {
+	started := &atomic.Int64{}
+	reg := tools.NewRegistry()
+	reg.Register(&legacyApprovalTool{fakeTool: fakeTool{
+		name: "LegacySensitivePlugin", conc: tools.ConcurrencyExclusive, starts: started,
+	}})
+	loop := &Loop{Registry: reg, Gate: permission.New(permission.ModeFullAccess)}
+	out := make(chan Event, 16)
+	results, err := loop.executeBatch(context.Background(), []llm.ContentBlock{{
+		Type: "tool_use", ToolUseID: "legacy-full-access", ToolName: "LegacySensitivePlugin",
+	}}, out, HookContext{})
+	if err != nil {
+		t.Fatalf("executeBatch: %v", err)
+	}
+	if started.Load() != 1 || len(results) != 1 || results[0].IsError {
+		t.Fatalf("fullAccess legacy ASK execution: starts=%d results=%+v", started.Load(), results)
+	}
+	for len(out) > 0 {
+		ev := <-out
+		if ev.Kind == EventPermissionRequest {
+			t.Fatalf("fullAccess emitted approval event: %+v", ev)
 		}
 	}
 }

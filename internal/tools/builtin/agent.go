@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -15,6 +17,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	bashbuiltin "github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
 )
 
@@ -210,6 +213,11 @@ type Agent struct {
 	// "team identity" role from the "which profile to apply" role
 	// that name was silently overloading.)
 	profileLoader AgentProfileLoader
+	// profileNames supplies the currently available profile slugs for the
+	// subagent_type JSON Schema enum. It is kept separate from profileLoader so
+	// schema generation never has to probe profiles one-by-one. nil preserves
+	// compatibility for headless embedders that do not expose a catalog.
+	profileNames func() []string
 }
 
 // effectiveMaxDepth returns the cap to enforce — instance override
@@ -326,6 +334,14 @@ func (a Agent) WithProfileLoader(loader AgentProfileLoader) Agent {
 	return a
 }
 
+// WithProfileNames wires the catalog published as subagent_type's JSON Schema
+// enum. The callback is evaluated whenever InputSchema is requested so newly
+// added project/user profiles become visible without rebuilding the registry.
+func (a Agent) WithProfileNames(names func() []string) Agent {
+	a.profileNames = names
+	return a
+}
+
 func (Agent) Name() string { return "Agent" }
 
 // ShortDescription — see Bash.ShortDescription for the rationale.
@@ -413,11 +429,11 @@ Other knobs:
   - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
   - ` + "`cwd`" + ` runs the sub-agent in a specific directory (mutually exclusive with ` + "`isolation`" + `).
   - ` + "`run_in_background: true`" + ` → returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
-  - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. constrain a worker to "plan" while the parent stays in "default"). A Plan parent may only inherit Plan or explicitly request "plan"; approving a plan starts a fresh implementation turn instead of upgrading an already-running child.
+  - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. constrain a worker to "plan" while the parent stays in "default"). A Plan parent may only inherit Plan or explicitly request "plan"; approving a plan starts a fresh implementation turn instead of upgrading an already-running child. A fullAccess parent must omit this field (inherit fullAccess) or explicitly keep fullAccess: its disabled process sandbox and parent-bound tool instances cannot safely enforce a lower child mode.
   - ` + "`allowed_tools`" + ` / ` + "`disallowed_tools`" + ` narrow the sub-agent's tool view; combine with the profile's filters as INTERSECTION (allow) + UNION (deny).`
 }
-func (Agent) InputSchema() map[string]any {
-	return map[string]any{
+func (a Agent) InputSchema() map[string]any {
+	schema := map[string]any{
 		"type":     "object",
 		"required": []string{"prompt"},
 		"properties": map[string]any{
@@ -464,8 +480,8 @@ func (Agent) InputSchema() map[string]any {
 			},
 			"permission_mode": map[string]any{
 				"type":        "string",
-				"enum":        []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"},
-				"description": "Override the permission mode for this sub-agent's gate using a Claude Code public mode. The parent's gate is unchanged; the sub-agent gets a clone with its own mode + a fresh denial-streak counter. Omit to inherit the parent's current mode. While the parent is in Plan, this must be omitted or set to `plan`; an existing Plan child is never upgraded after plan approval.",
+				"enum":        []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "fullAccess"},
+				"description": "Override the permission mode for this sub-agent's gate using a Claude Code public mode. The parent's gate is unchanged; the sub-agent gets a clone with its own mode + a fresh denial-streak counter. Omit to inherit the parent's current mode. While the parent is in Plan, this must be omitted or set to `plan`; an existing Plan child is never upgraded after plan approval. While the parent is in fullAccess, this must be omitted or set to `fullAccess` because a child cannot restore the disabled process sandbox or replace parent-bound tool instances.",
 			},
 			"allowed_tools": map[string]any{
 				"type":        "array",
@@ -479,6 +495,30 @@ func (Agent) InputSchema() map[string]any {
 			},
 		},
 	}
+	if a.profileNames != nil {
+		if names := normalizedProfileNames(a.profileNames()); len(names) > 0 {
+			properties := schema["properties"].(map[string]any)
+			subagentType := properties["subagent_type"].(map[string]any)
+			subagentType["enum"] = names
+		}
+	}
+	return schema
+}
+
+func normalizedProfileNames(names []string) []string {
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			seen[name] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for name := range seen {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // Concurrency is input-aware (Phase G.1, 2026-05-12): a foreground
@@ -559,6 +599,15 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	if isoErr != nil {
 		return &tools.Result{Output: isoErr.Error(), IsError: true}, nil
 	}
+	// resolveIsolation may already have created a worktree. Keep ownership in
+	// Execute until the child finalizer is installed; every validation/setup
+	// error in between must still remove it.
+	worktreeCleanupOwnedByExecute := worktreeInfo != nil
+	defer func() {
+		if worktreeCleanupOwnedByExecute {
+			_ = worktreepkg.Cleanup(worktreeInfo)
+		}
+	}()
 
 	// G.3 (2026-05-12) — `name` field for named teammates. Validated
 	// before any roster work so a bad name fails fast without
@@ -634,6 +683,13 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	rosterCleanupOwnedByExecute := false
 	defer func() {
 		if rosterCleanupOwnedByExecute && a.roster != nil {
+			// UnregisterTeammate closes the strict lifecycle join edge. On
+			// pre-run setup failures there is no runner finalizer yet, so finish
+			// worktree cleanup here before publishing that the teammate is done.
+			if worktreeCleanupOwnedByExecute {
+				_ = worktreepkg.Cleanup(worktreeInfo)
+				worktreeCleanupOwnedByExecute = false
+			}
 			a.roster.UnregisterTeammate(teammate)
 		}
 	}()
@@ -802,6 +858,18 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// parent's Gate pointer. The outer wrapper freezes the child policy; Plan
 	// children additionally lose permission-control, nested-agent, and Skill
 	// invocation surfaces entirely.
+	// A child must not consume the process-wide job notification channel: with
+	// multiple agents, whichever loop reads first would steal another loop's
+	// completion. Clone the filtered registry, rebind only its existing Bash
+	// job tools to a private pool, then wrap them with the immutable child gate.
+	// This also preserves profile/per-call tool filters (Rebind never adds a
+	// missing BashOutput/BashList/BashKill tool).
+	var childJobs *jobs.Registry
+	if a.jobsPool != nil {
+		filteredRegistry = copyToolRegistry(filteredRegistry)
+		childJobs = jobs.NewRegistry("")
+		bashbuiltin.RebindJobsRegistry(filteredRegistry, childJobs, subGate)
+	}
 	subRegistry := agentChildRegistry(filteredRegistry, subGate, planLocked)
 
 	// Assemble the cold Agent base only after every profile/invocation filter
@@ -839,6 +907,11 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 
 	sub := agent.NewLoop(a.provider, subRegistry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
+	sub.RecoverTextToolCalls = true
+	if childJobs != nil {
+		sub.JobNotify = childJobs.Notify()
+		sub.Jobs = childJobs
+	}
 	// Agent is allowed as read-only delegation during plan mode. Keep the
 	// child loop's live PlanMode in sync with its cloned gate so NewLoop's
 	// fallback Plan prompt is attached and mutating child calls are returned as
@@ -923,6 +996,16 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			}
 		}
 	}
+	// Keep transcript ownership in Execute until a foreground/background
+	// runner has accepted it. Today no ordinary return exists in the remaining
+	// setup block, but this guard also closes the descriptor if a future setup
+	// validation or panic is added before the runner finalizer is installed.
+	transcriptCleanupOwnedByExecute := transcript != nil
+	defer func() {
+		if transcriptCleanupOwnedByExecute {
+			_ = transcript.Close()
+		}
+	}()
 
 	// G.0 timeout — wall-clock cap. Caller-provided `timeout_seconds`
 	// wins; else config default; 0 disables.
@@ -952,6 +1035,15 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		agent.WithCwd(context.WithValue(ctx, agentDepthKey{}, depth+1), subCwd),
 		nil,
 	)
+	// A child loop owns an internal events channel, but it has no human reply
+	// consumer. Mark that distinction explicitly: EventOut != nil alone only
+	// means the loop can stream progress, not that AskUser can safely block.
+	// The marker is scoped to this child context, so the parent's real TUI keeps
+	// its ordinary AskUser behavior even when both loops share fullAccess.
+	baseCtx = agent.WithUserInteractionUnavailable(
+		baseCtx,
+		"interactive tool unavailable in sub-agent execution; choose a reasonable default or return the question to the parent as text",
+	)
 	// Stamp the teammate's roster name so the child's tools (especially
 	// MessageTeammate) can read the correct sender identity via
 	// AgentNameFromContext instead of falling back to "main".
@@ -974,33 +1066,73 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// orphaning the first cancel (lostcancel: a leaked cancelCtx registered on
 	// baseCtx until the parent turn ends — one per timed sub-agent spawn).
 	var childCtx context.Context
-	var cancel context.CancelFunc
+	var cancelRun context.CancelFunc
+	var lifecycleCtx context.Context
+	var cancelLifecycle context.CancelFunc
+	// InterruptBlock must ignore an ordinary first-Ctrl+C inherited through
+	// baseCtx, but not an explicit teammate stop, session revoke, or the child's
+	// own timeout. Give it a distinct hard-lifecycle root detached from the turn.
+	hardBaseCtx := context.WithoutCancel(baseCtx)
 	if timeout > 0 {
-		childCtx, cancel = context.WithTimeout(baseCtx, timeout)
+		childCtx, cancelRun = context.WithTimeout(baseCtx, timeout)
+		lifecycleCtx, cancelLifecycle = context.WithTimeout(hardBaseCtx, timeout)
 	} else {
-		childCtx, cancel = context.WithCancel(baseCtx)
+		childCtx, cancelRun = context.WithCancel(baseCtx)
+		lifecycleCtx, cancelLifecycle = context.WithCancel(hardBaseCtx)
 	}
+	signalCancel := func() {
+		cancelRun()
+		cancelLifecycle()
+	}
+	// InterruptBlock dispatch detaches ordinary turn cancellation. Stamp the
+	// child's own cancelable lifetime so SubAgentStop / timeout / roster reset
+	// can still stop a foreground Bash process tree immediately.
+	childCtx = agent.WithToolLifecycleContext(childCtx, lifecycleCtx)
 	if teammate != nil {
-		teammate.Cancel = cancel
+		// External stop is signal-only. Strict resource cleanup must run after
+		// sub.Run has stopped producing work, otherwise a final tool call can
+		// spawn into an already-reset private job registry. SetCancel also
+		// observes a stop request that raced the post-Register setup window.
+		teammate.SetCancel(signalCancel)
 	}
 
 	parentOut := agent.EventOutFromContext(ctx)
 	parentToolUseID := agent.ParentToolUseIDFromContext(ctx)
 
-	// G.2 — wrap cancel so the worktree cleanup happens on every
-	// exit path (parent ctx cancel, sub-agent natural end, panic in
-	// the background goroutine). Foreground path runs cleanup via
-	// `defer cancel()` in executeForeground; background path runs it
-	// in the goroutine's defer chain.
-	if worktreeInfo != nil {
-		origCancel := cancel
-		cancel = func() {
-			origCancel()
-			_ = worktreepkg.Cleanup(worktreeInfo)
+	// The runner finalizer is an idempotent join boundary. First stop the
+	// producer, then (after executeForeground/Background has joined sub.Run)
+	// reap every private Bash job, and only then remove its worktree. sync.Once
+	// also makes the Execute setup guard and runner defers safe to overlap.
+	var finalizeOnce sync.Once
+	finalizeDone := make(chan struct{})
+	finalize := func() {
+		finalizeOnce.Do(func() {
+			defer close(finalizeDone)
+			signalCancel()
+			if childJobs != nil {
+				childJobs.ResetAndWait(100 * time.Millisecond)
+			}
+			if worktreeInfo != nil {
+				_ = worktreepkg.Cleanup(worktreeInfo)
+			}
+		})
+		<-finalizeDone
+	}
+	worktreeCleanupOwnedByExecute = false
+	runnerCleanupOwnedByExecute := true
+	defer func() {
+		if runnerCleanupOwnedByExecute {
+			finalize()
 		}
-		if teammate != nil {
-			teammate.Cancel = cancel
-		}
+	}()
+	// A strict session/permission boundary can see the roster entry while the
+	// profile and child loop are still being built. SetCancel above converts
+	// that previously-lost request into childCtx cancellation. Do not publish a
+	// trace start or launch the runner after the boundary has already revoked
+	// this child; Execute's guards close the transcript, unregister the roster
+	// entry, and join private resources synchronously.
+	if err := childCtx.Err(); err != nil {
+		return wrapTimeoutErr(err, timeout), nil
 	}
 
 	// Signal only after every validation/setup step succeeded and immediately
@@ -1012,7 +1144,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		return a.executeBackground(
 			sub,
 			childCtx,
-			cancel,
+			finalize,
 			parentOut,
 			parentToolUseID,
 			teammate,
@@ -1020,10 +1152,16 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			transcript,
 			persistedOnDisk,
 			parentNotify,
-			func() { rosterCleanupOwnedByExecute = false },
+			func() {
+				rosterCleanupOwnedByExecute = false
+				runnerCleanupOwnedByExecute = false
+				transcriptCleanupOwnedByExecute = false
+			},
 		)
 	}
-	return a.executeForeground(sub, childCtx, cancel, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
+	runnerCleanupOwnedByExecute = false
+	transcriptCleanupOwnedByExecute = false
+	return a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
 }
 
 // resolveIsolation handles the `isolation` + `cwd` schema fields
@@ -1091,7 +1229,7 @@ func (a Agent) resolveIsolation(isolation, cwdArg string) (string, *worktreepkg.
 func (a Agent) executeForeground(
 	sub *agent.Loop,
 	childCtx context.Context,
-	cancel context.CancelFunc,
+	finalize func(),
 	parentOut chan<- agent.Event,
 	parentToolUseID string,
 	teammate *agent.Teammate,
@@ -1099,8 +1237,8 @@ func (a Agent) executeForeground(
 	transcript *agent.SubAgentTranscript,
 	persistedOnDisk int,
 ) (resultRet *tools.Result, errRet error) {
-	defer cancel()
 	defer transcript.Close()
+	defer finalize()
 	// G.15 (2026-05-12) — panic recovery for the foreground path.
 	// The background path already handles this; the foreground was
 	// silently bubbling a panic up to the dispatcher (which would
@@ -1122,13 +1260,14 @@ func (a Agent) executeForeground(
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
-		// executeForeground may return as soon as its parent context is
-		// cancelled, before the child Run goroutine has unwound. Keep the trace
-		// owner alive until the actual child loop exits so its terminal/error and
-		// deferred cleanup events cannot be dropped after the parent tool_result.
 		defer agent.TraceInvocationEnded(childCtx)
+		defer close(events)
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("sub-agent run panic: %v", r)
+			}
+		}()
 		done <- sub.Run(childCtx, events)
-		close(events)
 	}()
 
 	var output strings.Builder
@@ -1139,26 +1278,18 @@ func (a Agent) executeForeground(
 	// Bumped on each EventTurnEnd so each turn's new messages get
 	// appended exactly once.
 	persistedMsgCount := persistedOnDisk
-	// G.15 (2026-05-12) — select on childCtx.Done() so a parent
-	// cancellation tears the drain down even if the sub-loop's
-	// event channel deadlocks. Without this guard, a buggy sub-loop
-	// could pin the parent turn indefinitely.
+	// Cancellation is recorded immediately, but we keep draining until sub.Run
+	// closes events and then join done. Returning at childCtx.Done used to close
+	// the roster edge while an InterruptBlock Bash process was still alive.
+	var lifecycleErr error
+	var eventErr error
+	ctxDone := childCtx.Done()
 drainLoop:
 	for {
 		select {
-		case <-childCtx.Done():
-			persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
-			err := childCtx.Err()
-			if teammate != nil {
-				status := agent.StatusKilled
-				hint := "cancelled"
-				if errors.Is(err, context.DeadlineExceeded) && timeout > 0 {
-					status = agent.StatusFailed
-					hint = fmt.Sprintf("timeout %s", timeout)
-				}
-				teammate.Finish(status, strings.TrimSpace(output.String()), err, hint)
-			}
-			return wrapTimeoutErr(err, timeout), nil
+		case <-ctxDone:
+			lifecycleErr = childCtx.Err()
+			ctxDone = nil
 		case ev, ok := <-events:
 			if !ok {
 				break drainLoop
@@ -1174,22 +1305,47 @@ drainLoop:
 				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 			case agent.EventPermissionRequest:
 				ev.PermissionReply <- agent.PermissionDecisionDeny
+			case agent.EventAskUser:
+				dismissSubAgentAskUser(ev)
 			case agent.EventLoopDone:
 				stopReason = ev.StopReason
 				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 			case agent.EventError:
-				if ev.Err != nil {
-					persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
-					return wrapTimeoutErr(ev.Err, timeout), nil
+				if ev.Err != nil && eventErr == nil {
+					eventErr = ev.Err
 				}
 			}
 		}
 	}
-	if err := <-done; err != nil {
-		return wrapTimeoutErr(err, timeout), nil
+	runErr := <-done
+	persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
+	_ = persistedMsgCount
+	finalErr := lifecycleErr
+	if finalErr == nil {
+		finalErr = eventErr
 	}
+	if finalErr == nil {
+		finalErr = runErr
+	}
+	// Completion is not externally visible until private jobs and worktree
+	// resources are gone. The deferred call remains as the panic safety net.
+	finalize()
 
 	out := strings.TrimSpace(output.String())
+	if finalErr != nil {
+		if teammate != nil {
+			status := agent.StatusFailed
+			hint := stopReason
+			if errors.Is(finalErr, context.DeadlineExceeded) && timeout > 0 {
+				hint = fmt.Sprintf("timeout %s", timeout)
+			} else if errors.Is(finalErr, context.Canceled) {
+				status = agent.StatusKilled
+				hint = "cancelled"
+			}
+			teammate.Finish(status, out, finalErr, hint)
+		}
+		return wrapTimeoutErr(finalErr, timeout), nil
+	}
 	if out == "" {
 		out = fmt.Sprintf("(sub-agent finished without text output; stop_reason=%s)", stopReason)
 	}
@@ -1232,7 +1388,7 @@ func persistNewMessages(t *agent.SubAgentTranscript, sub *agent.Loop, idx int) i
 func (a Agent) executeBackground(
 	sub *agent.Loop,
 	childCtx context.Context,
-	cancel context.CancelFunc,
+	finalize func(),
 	parentOut chan<- agent.Event,
 	parentToolUseID string,
 	teammate *agent.Teammate,
@@ -1246,23 +1402,26 @@ func (a Agent) executeBackground(
 		// No Roster wired — graceful fallback to foreground so callers
 		// that opt into run_in_background on a Roster-less embedding
 		// still get a useful result (just synchronously).
-		return a.executeForeground(sub, childCtx, cancel, parentOut, parentToolUseID, nil, timeout, transcript, persistedOnDisk)
+		return a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, nil, timeout, transcript, persistedOnDisk)
 	}
 
 	go func() {
 		startedAt := time.Now()
-		defer cancel()
-		defer transcript.Close()
+		// Unregister closes teammate.done. Declare it first so it executes last,
+		// after sub.Run, private jobs, transcript, and worktree have all joined.
 		defer func() {
 			if a.roster != nil {
 				a.roster.UnregisterTeammate(teammate)
 			}
 		}()
+		defer transcript.Close()
+		defer finalize()
 		// panic recovery — a background sub-agent that panics should
 		// land in StatusFailed with a captured error string, not crash
 		// the parent process.
 		defer func() {
 			if r := recover(); r != nil {
+				finalize()
 				teammate.Finish(agent.StatusFailed, "", fmt.Errorf("panic: %v", r), "panic")
 				notifyParent(parentNotify, teammate, time.Since(startedAt))
 			}
@@ -1271,18 +1430,19 @@ func (a Agent) executeBackground(
 		events := make(chan agent.Event, 64)
 		done := make(chan error, 1)
 		go func() {
-			// The trace owner belongs to the actual child Loop.Run lifetime,
-			// not the detached event-consumer wrapper. EventError is delivered
-			// to events before the trace hook returns, so the consumer may exit
-			// while Loop.Run is still unwinding. Ending here prevents late error
-			// and cleanup events from losing their immutable origin.
 			defer agent.TraceInvocationEnded(childCtx)
+			defer close(events)
+			defer func() {
+				if r := recover(); r != nil {
+					done <- fmt.Errorf("sub-agent run panic: %v", r)
+				}
+			}()
 			done <- sub.Run(childCtx, events)
-			close(events)
 		}()
 
 		stopReason := ""
 		persistedMsgCount := persistedOnDisk
+		var eventErr error
 		for ev := range events {
 			forwardSubAgentEvent(parentOut, parentToolUseID, ev)
 			switch ev.Kind {
@@ -1292,37 +1452,40 @@ func (a Agent) executeBackground(
 				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 			case agent.EventPermissionRequest:
 				ev.PermissionReply <- agent.PermissionDecisionDeny
+			case agent.EventAskUser:
+				dismissSubAgentAskUser(ev)
 			case agent.EventLoopDone:
 				stopReason = ev.StopReason
 				persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
 			case agent.EventError:
-				if ev.Err != nil {
-					persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
-					status := agent.StatusFailed
-					hint := stopReason
-					if errors.Is(ev.Err, context.DeadlineExceeded) && timeout > 0 {
-						hint = fmt.Sprintf("timeout %s", timeout)
-					} else if errors.Is(ev.Err, context.Canceled) {
-						status = agent.StatusKilled
-						hint = "cancelled"
-					}
-					teammate.Finish(status, teammateSnapshotOutput(teammate), ev.Err, hint)
-					notifyParent(parentNotify, teammate, time.Since(startedAt))
-					return
+				if ev.Err != nil && eventErr == nil {
+					eventErr = ev.Err
 				}
 			}
 		}
-		err := <-done
+		runErr := <-done
+		persistedMsgCount = persistNewMessages(transcript, sub, persistedMsgCount)
+		_ = persistedMsgCount
+		finalErr := childCtx.Err()
+		if finalErr == nil {
+			finalErr = eventErr
+		}
+		if finalErr == nil {
+			finalErr = runErr
+		}
+		// Resource cleanup is part of completion, not an asynchronous tail.
+		// Parent notifications and teammate.done must never precede it.
+		finalize()
 		final := teammateSnapshotOutput(teammate)
 		switch {
-		case err == nil:
+		case finalErr == nil:
 			teammate.Finish(agent.StatusCompleted, final, nil, stopReason)
-		case errors.Is(err, context.DeadlineExceeded) && timeout > 0:
-			teammate.Finish(agent.StatusFailed, final, err, fmt.Sprintf("timeout %s", timeout))
-		case errors.Is(err, context.Canceled):
-			teammate.Finish(agent.StatusKilled, final, err, "cancelled")
+		case errors.Is(finalErr, context.DeadlineExceeded) && timeout > 0:
+			teammate.Finish(agent.StatusFailed, final, finalErr, fmt.Sprintf("timeout %s", timeout))
+		case errors.Is(finalErr, context.Canceled):
+			teammate.Finish(agent.StatusKilled, final, finalErr, "cancelled")
 		default:
-			teammate.Finish(agent.StatusFailed, final, err, stopReason)
+			teammate.Finish(agent.StatusFailed, final, finalErr, stopReason)
 		}
 		notifyParent(parentNotify, teammate, time.Since(startedAt))
 	}()
@@ -1344,6 +1507,23 @@ func (a Agent) executeBackground(
 			"background": true,
 		},
 	}, nil
+}
+
+// dismissSubAgentAskUser is a defensive fallback for an interaction event
+// emitted by a legacy/plugin tool that does not declare
+// RequiresUserInteraction. Native interactive tools are rejected by dispatch
+// before Execute. Never forward this event to the parent UI: the parent did not
+// invoke AskUser and cannot safely attribute the reply to a detached child.
+func dismissSubAgentAskUser(ev agent.Event) {
+	if ev.AskUserReply == nil {
+		return
+	}
+	select {
+	case ev.AskUserReply <- "":
+	default:
+		// A full or already-resolved channel means the producer no longer needs
+		// our fallback. Do not let a malformed plugin event block the consumer.
+	}
 }
 
 // forwardSubAgentEvent forwards selected sub-agent events to the

@@ -272,28 +272,34 @@ func TestBashKillCanUseChecksRealToolAndJobID(t *testing.T) {
 	}
 }
 
-// TestDetectBlockedSleepPattern — pin the sleep blacklist matrix:
-// bare integer sleeps ≥ 10s and `sleep N && rest` are blocked,
-// short waits and pipeline / subshell forms are allowed.
-func TestDetectBlockedSleepPattern(t *testing.T) {
+// TestDetectBlockingWaitPattern pins the foreground-wait classifier. Delays
+// of two seconds or more must leave the foreground turn, including the
+// interpreter form models commonly use after a shell sleep is redirected.
+func TestDetectBlockingWaitPattern(t *testing.T) {
 	cases := []struct {
 		in   string
 		want bool // true → expected blocked
 	}{
-		{"sleep 3", false},
-		{"sleep 5", false},
-		{"sleep 9", false},
+		{"sleep 1", false},
+		{"sleep 1.5", false},
+		{"sleep 2", true},
+		{"sleep 3", true},
+		{"sleep 5", true},
+		{"sleep 9", true},
 		{"sleep 10", true},
 		{"sleep 30", true},
 		{"sleep 10 && echo done", true},
 		{"sleep 10; echo done", true},
-		{"sleep 1", false},                        // short wait allowed
-		{"sleep 0.5", false},                      // float allowed (regex matches integer only)
-		{"echo a | sleep 5", false},               // sleep at TAIL of pipe → allowed
-		{"(sleep 5; echo b)", false},              // in subshell → allowed
-		{"{ sleep 5; echo done; }", false},        // brace group → allowed
-		{"for i in 1 2; do sleep 5; done", false}, // in for-loop → allowed
-		{"while true; do sleep 5; done", false},   // in while-loop → allowed
+		{"sleep 0.5", false}, // sub-two-second pacing is allowed
+		{"echo a | sleep 5", false},
+		{"(sleep 5; echo b)", false},
+		{"{ sleep 5; echo done; }", false},
+		{"for i in 1 2; do sleep 5; done", false},
+		{"while true; do sleep 5; done", false},
+		{`python3 -c "import time; time.sleep(45); print('done')"`, true},
+		{`python -c "from time import sleep; sleep(9)"`, true},
+		{`ruby -e 'sleep 12; puts :done'`, true},
+		{`perl -e 'sleep 12; print qq(done)'`, true},
 		{"echo no-sleep-here", false},
 		// 2026-05-21 image #50 / session 5d9a38e5 regression:
 		// `sleep N && find ... 2>/dev/null | wc -l` got PAST the
@@ -312,13 +318,132 @@ func TestDetectBlockedSleepPattern(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {
-			got := detectBlockedSleepPattern(c.in)
+			got := detectBlockingWaitPattern(c.in)
 			if c.want && got == "" {
-				t.Errorf("detectBlockedSleepPattern(%q) should be blocked; got empty", c.in)
+				t.Errorf("detectBlockingWaitPattern(%q) should be redirected; got empty", c.in)
 			}
 			if !c.want && got != "" {
-				t.Errorf("detectBlockedSleepPattern(%q) should be allowed; got blocked: %s", c.in, got)
+				t.Errorf("detectBlockingWaitPattern(%q) should stay foreground; got %s", c.in, got)
 			}
 		})
+	}
+}
+
+func TestBlockingWaitIsAutomaticallyBackgrounded(t *testing.T) {
+	pool, gate := jobPoolFixture(t)
+	t.Cleanup(func() { pool.Shutdown(0) })
+	tool := Bash{gate: gate, Jobs: pool}
+
+	started := time.Now()
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"command":     "sleep 2; printf done",
+		"description": "verify wait redirection",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("blocking wait held foreground for %s", elapsed)
+	}
+	if res == nil || res.IsError {
+		t.Fatalf("wait redirection result = %+v", res)
+	}
+	if !strings.Contains(res.Output, "job_id=") || strings.Contains(res.Output, "Bare `sleep") {
+		t.Fatalf("wait redirection output = %q", res.Output)
+	}
+	if res.Presentation["kind"] != "background_job" ||
+		res.Presentation["await_completion"] != true ||
+		res.Presentation["job_id"] == "" {
+		t.Fatalf("wait redirection presentation = %#v", res.Presentation)
+	}
+	listed := pool.List()
+	if len(listed) != 1 {
+		t.Fatalf("background jobs = %+v, want one", listed)
+	}
+	_ = pool.Stop(listed[0].ID, 0)
+}
+
+func TestExplicitBackgroundBlockingWaitDoesNotAwaitCompletion(t *testing.T) {
+	pool, gate := jobPoolFixture(t)
+	t.Cleanup(func() { pool.Shutdown(0) })
+	tool := Bash{gate: gate, Jobs: pool}
+
+	started := time.Now()
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"command":           "sleep 2; printf done",
+		"description":       "verify explicit background semantics",
+		"run_in_background": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("explicit background command held foreground for %s", elapsed)
+	}
+	if res == nil || res.IsError {
+		t.Fatalf("explicit background result = %+v", res)
+	}
+	if res.Presentation["kind"] != "background_job" || res.Presentation["job_id"] == "" {
+		t.Fatalf("explicit background presentation = %#v", res.Presentation)
+	}
+	if _, ok := res.Presentation["await_completion"]; ok {
+		t.Fatalf("explicit background command was rewritten as awaited: %#v", res.Presentation)
+	}
+	if _, ok := res.Presentation["wait_pattern"]; ok {
+		t.Fatalf("explicit background command was tagged as an automatic wait: %#v", res.Presentation)
+	}
+
+	listed := pool.List()
+	if len(listed) != 1 {
+		t.Fatalf("background jobs = %+v, want one", listed)
+	}
+	_ = pool.Stop(listed[0].ID, 0)
+}
+
+func TestRebindJobsRegistryUsesPrivatePoolWithoutAddingFilteredTools(t *testing.T) {
+	parentPool, gate := jobPoolFixture(t)
+	childPool := jobs.NewRegistry(t.TempDir())
+	t.Cleanup(func() {
+		parentPool.Shutdown(0)
+		childPool.Shutdown(0)
+	})
+
+	registry := tools.NewRegistry()
+	registry.Register(Bash{gate: gate, Jobs: parentPool})
+	registry.Register(Output{gate: gate, pool: parentPool})
+	RebindJobsRegistry(registry, childPool, gate)
+
+	boundBash, ok := registry.Get("Bash")
+	if !ok || boundBash.(Bash).Jobs != childPool {
+		t.Fatal("Bash was not rebound to the child pool")
+	}
+	boundOutput, ok := registry.Get("BashOutput")
+	if !ok || boundOutput.(Output).pool != childPool {
+		t.Fatal("BashOutput was not rebound to the child pool")
+	}
+	for _, absent := range []string{"BashList", "BashKill"} {
+		if _, ok := registry.Get(absent); ok {
+			t.Fatalf("RebindJobsRegistry re-added filtered tool %s", absent)
+		}
+	}
+
+	res, err := boundBash.Execute(context.Background(), map[string]any{
+		"command": "sleep 2; printf CHILD_POOL_MARKER",
+	})
+	if err != nil || res == nil || res.IsError {
+		t.Fatalf("child Bash Execute = (%+v, %v)", res, err)
+	}
+	select {
+	case notification := <-childPool.Notify():
+		if notification.Status != jobs.StatusCompleted {
+			t.Fatalf("child notification = %#v", notification)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("private child pool did not receive completion")
+	}
+	select {
+	case notification := <-parentPool.Notify():
+		t.Fatalf("parent pool stole child notification: %#v", notification)
+	default:
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"charm.land/glamour/v2"
 	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
+	"charm.land/lipgloss/v2"
 	xansi "github.com/charmbracelet/x/ansi"
 )
 
@@ -34,6 +35,22 @@ import (
 // window (thinkingLiveWindow in chat_items.go) so the visual density
 // is consistent pre/post finalization.
 const thinkingHistoryWindow = 4
+
+// writeStatusLines renders a status glyph only on the first line while
+// keeping every continuation line at the same content column. This matters
+// for bordered multi-line payloads: prefixing the complete string once shifts
+// only the top border and leaves the vertical/bottom borders behind.
+func writeStatusLines(dst *strings.Builder, style lipgloss.Style, prefix, content string) {
+	indent := strings.Repeat(" ", lipgloss.Width(prefix))
+	for i, line := range strings.Split(content, "\n") {
+		if i == 0 {
+			dst.WriteString(style.Render(prefix + line))
+		} else {
+			dst.WriteString(style.Render(indent + line))
+		}
+		dst.WriteString("\n")
+	}
+}
 
 // renderMessagePlain keeps the ordinary transcript chrome but bypasses
 // glamour for assistant text. It is the TUI half of /output-style minimal:
@@ -74,6 +91,17 @@ func renderMessage(msg Message, width int, expand bool) string {
 		return ""
 	}
 	var s strings.Builder
+	if isRenderedInfoBox(msg.Content) {
+		switch msg.Role {
+		case "info", "warning", "success", "error":
+			// Bordered panels carry their own title/status hierarchy. Use an
+			// ASCII-only gutter on every row instead of prefixing row one with
+			// ·/⚠/✓/✗: ambiguous-width glyphs can occupy two cells in CJK
+			// terminals and visually shear the top border away from the rest.
+			writeStatusLines(&s, styleMuted, "    ", msg.Content)
+			return s.String()
+		}
+	}
 	switch msg.Role {
 	case "user":
 		// User prompt opens a new turn — leading blank above and
@@ -223,8 +251,7 @@ func renderMessage(msg Message, width int, expand bool) string {
 		s.WriteString(styleDim.Render("recap: " + msg.Content))
 		s.WriteString("\n")
 	case "error":
-		s.WriteString(styleErr.Render("  ✗ " + msg.Content))
-		s.WriteString("\n")
+		writeStatusLines(&s, styleErr, "  ✗ ", msg.Content)
 	case "error-hint":
 		// Recovery hint sits one line under the red error in dim
 		// secondary so the user reads "what went wrong" then "what
@@ -237,8 +264,7 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// (saved, exported, branched, undid). Distinct from neutral
 		// "info" — the user wants visible feedback that an action
 		// landed, not just another grey line in the scroll.
-		s.WriteString(styleSuccess.Render("  ✓ " + msg.Content))
-		s.WriteString("\n")
+		writeStatusLines(&s, styleSuccess, "  ✓ ", msg.Content)
 	case "command-result":
 		// Slash-command completion in Claude Code's result lane. Export uses
 		// this instead of the generic green success row so the live TUI reads:
@@ -255,8 +281,7 @@ func renderMessage(msg Message, width int, expand bool) string {
 	case "warning":
 		// ⚠ in yellow for soft warnings (no session store, deprecated
 		// usage). Visible without screaming like "error".
-		s.WriteString(styleWarn.Render("  ⚠ " + msg.Content))
-		s.WriteString("\n")
+		writeStatusLines(&s, styleWarn, "  ⚠ ", msg.Content)
 	case "bash", "bash-error":
 		// `!ls` mode output. First line ($ <cmd>) gets accent so the
 		// user can spot their own shell invocation against the dim
@@ -291,14 +316,7 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// alignment (only line 1 used to get the "  · " prefix). Indent
 		// continuation lines by the same 4-column width as the prefix so a
 		// box stays square.
-		for i, line := range strings.Split(msg.Content, "\n") {
-			if i == 0 {
-				s.WriteString(styleMuted.Render("  · " + line))
-			} else {
-				s.WriteString(styleMuted.Render("    " + line))
-			}
-			s.WriteString("\n")
-		}
+		writeStatusLines(&s, styleMuted, "  · ", msg.Content)
 	case "plan-proposal":
 		// ExitPlanMode emits the full plan markdown as EventInfo with
 		// a "[plan proposal]\n..." prefix. Before 2026-05-21 it

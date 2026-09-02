@@ -898,7 +898,7 @@ func (s *Store) Import(r io.Reader, preferredID string) (string, error) {
 	if headerEntry.Type != "header" || headerEntry.Header == nil {
 		return "", errors.New("import: first line must be a header entry")
 	}
-	headerEntry.Header.ID = newID
+	headerEntry.Header = sanitizeImportedHeader(headerEntry.Header, newID)
 	if err := s.append(newID, headerEntry); err != nil {
 		return "", err
 	}
@@ -926,6 +926,34 @@ func (s *Store) Import(r io.Reader, preferredID string) (string, error) {
 		return "", err
 	}
 	return newID, nil
+}
+
+// sanitizeImportedHeader copies only non-authority-bearing session metadata.
+// Import accepts JSONL from outside the local trust boundary, so persisted
+// permission state must never become an ambient grant merely because the user
+// made the transcript resumable. Keep this as an allowlist: when Header gains
+// another security-sensitive field it is denied by default until Import makes
+// an explicit decision about it.
+func sanitizeImportedHeader(src *Header, newID string) *Header {
+	if src == nil {
+		return nil
+	}
+	return &Header{
+		ID:               newID,
+		CreatedAt:        src.CreatedAt,
+		Provider:         src.Provider,
+		Model:            src.Model,
+		System:           src.System,
+		SystemPromptKind: src.SystemPromptKind,
+		WorkDir:          src.WorkDir,
+		Effort:           src.Effort,
+		Preset:           src.Preset,
+		Status:           src.Status,
+		Title:            src.Title,
+		ForkedFrom:       src.ForkedFrom,
+		SubAgentOf:       src.SubAgentOf,
+		TeammateName:     src.TeammateName,
+	}
 }
 
 // ListSnapshots returns available snapshots for a session.

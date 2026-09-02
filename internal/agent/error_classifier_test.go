@@ -14,6 +14,7 @@ func TestClassifyError(t *testing.T) {
 		{"nil", nil, ErrUnknown},
 		{"context overflow anthropic", errors.New("prompt is too long: 250000 tokens > 200000"), ErrContextOverflow},
 		{"context overflow minimax", errors.New("server returned error: code 2013"), ErrContextOverflow},
+		{"invalid function arguments 2013", errors.New("invalid function arguments (2013)"), ErrInvalidRequest},
 		// MiniMax user-facing format from image #9 (2026-05-10):
 		// "invalid params, request entity too large (2013) (invalid_request_error)".
 		// Used to be misclassified as ErrInvalidRequest because the

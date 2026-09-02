@@ -19,8 +19,10 @@ func TestClassifyMidTurn_Destructive(t *testing.T) {
 		SignalRetry,
 		SignalBranch,
 		SignalResume,
+		SignalSessions,
 		SignalBatch,
 		SignalPlan,
+		SignalFullAccess,
 	}
 	for _, s := range destructive {
 		if got := ClassifyMidTurn(s); got != MidTurnDestructive {
@@ -49,7 +51,6 @@ func TestClassifyMidTurn_DefaultsToSafe(t *testing.T) {
 		SignalCost,
 		SignalContext,
 		SignalTools,
-		SignalSessions,
 		SignalStatus,
 		SignalVersion,
 		SignalEffort,

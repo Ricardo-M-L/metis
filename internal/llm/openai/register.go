@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
@@ -38,6 +39,20 @@ func buildResponses(opts transport.BuildOpts) (*transport.Result, error) {
 		maxTokens = transport.DefaultMaxOutputTokens
 	}
 	p := NewResponses(opts.APIKey, opts.BaseURL, opts.Model, maxTokens, timeout, 0)
+	if opts.Extra != nil {
+		if err := p.ConfigureStateMode(opts.Extra["responses_state_mode"]); err != nil {
+			return nil, err
+		}
+		if err := p.ConfigureCapabilityProfile(opts.Extra["responses_profile"]); err != nil {
+			return nil, err
+		}
+		p.PromptCacheKey = strings.TrimSpace(opts.Extra["prompt_cache_key"])
+		for _, tool := range strings.Split(opts.Extra["hosted_tools"], ",") {
+			if tool = strings.TrimSpace(tool); tool != "" {
+				p.HostedTools = append(p.HostedTools, tool)
+			}
+		}
+	}
 	if opts.ContextWindow > 0 {
 		p.ContextWindow = opts.ContextWindow
 	}

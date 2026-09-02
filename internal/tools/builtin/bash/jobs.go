@@ -56,6 +56,32 @@ func AttachJobsRegistry(reg *tools.Registry, pool *jobs.Registry, gate *permissi
 	reg.Replace(Kill{gate: gate, pool: pool})
 }
 
+// RebindJobsRegistry switches only the background-job tools already present
+// in reg to pool. Unlike AttachJobsRegistry it never adds missing tools. This
+// matters for Agent child registries: profile/per-call tool filters must stay
+// authoritative, while each child still needs a private notification channel
+// rather than competing with its parent or sibling for job completions.
+func RebindJobsRegistry(reg *tools.Registry, pool *jobs.Registry, gate *permission.Gate) {
+	if reg == nil || pool == nil {
+		return
+	}
+	if existing, ok := reg.Get("Bash"); ok {
+		if b, ok := existing.(Bash); ok {
+			b.Jobs = pool
+			reg.Replace(b)
+		}
+	}
+	if _, ok := reg.Get("BashList"); ok {
+		reg.Replace(List{gate: gate, pool: pool})
+	}
+	if _, ok := reg.Get("BashOutput"); ok {
+		reg.Replace(Output{gate: gate, pool: pool})
+	}
+	if _, ok := reg.Get("BashKill"); ok {
+		reg.Replace(Kill{gate: gate, pool: pool})
+	}
+}
+
 // ───────────────────────────────────────────────────────────────────
 // List — "what background jobs are currently in flight?"
 // ───────────────────────────────────────────────────────────────────

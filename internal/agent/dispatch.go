@@ -16,6 +16,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 // toolSpecs builds the per-request `tools[]` array given to the LLM, by
@@ -173,6 +174,77 @@ func isTraceChildTool(name string) bool {
 	}
 }
 
+type userInteractionUnavailableKey struct{}
+
+// WithUserInteractionUnavailable marks a loop context as having no human
+// reply consumer. Agent-created child loops use this even when the parent has
+// a TUI: child EventAskUser values are progress events, not prompts owned by
+// that UI. Keeping the marker context-scoped avoids changing a top-level
+// interactive Loop that happens to use the same registry and permission gate.
+func WithUserInteractionUnavailable(ctx context.Context, reason string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "interactive tool unavailable in this unattended execution context"
+	}
+	return context.WithValue(ctx, userInteractionUnavailableKey{}, reason)
+}
+
+func userInteractionUnavailableReason(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	reason, ok := ctx.Value(userInteractionUnavailableKey{}).(string)
+	return reason, ok && strings.TrimSpace(reason) != ""
+}
+
+// beginToolDispatchAdmission snapshots the Gate's permission-transition epoch
+// before the dispatcher touches any untrusted tool boundary. Every later
+// boundary validates the same epoch so a mode change that starts and finishes
+// inside a slow hook or CanUse call still invalidates the old authorization.
+func (l *Loop) beginToolDispatchAdmission() (uint64, bool, string) {
+	if l == nil || l.Gate == nil {
+		return 0, true, ""
+	}
+	return l.Gate.ToolDispatchAdmission()
+}
+
+func (l *Loop) validateToolDispatchAdmission(epoch uint64) (bool, string) {
+	if l == nil || l.Gate == nil {
+		return true, ""
+	}
+	current, allowed, reason := l.Gate.ToolDispatchAdmission()
+	if !allowed {
+		return false, reason
+	}
+	if current != epoch {
+		return false, "mode:transition"
+	}
+	return true, ""
+}
+
+func emitToolDispatchDenial(ctx context.Context, out chan<- Event, blk llm.ContentBlock, reason, traceInvocationID, traceParentInvocationID, traceCallID string) llm.ContentBlock {
+	if reason == "" {
+		reason = "mode:transition"
+	}
+	modelMsg := "denied by permission policy: " + reason
+	tuiMsg := "denied: " + reason
+	result := llm.ContentBlock{
+		Type: "tool_result", ToolUseID: blk.ToolUseID,
+		ToolResult: modelMsg, IsError: true,
+	}
+	emit(ctx, out, Event{
+		Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
+		ToolResult:              &ToolResult{Output: tuiMsg, IsError: true},
+		TraceInvocationID:       traceInvocationID,
+		TraceParentInvocationID: traceParentInvocationID,
+		TraceCallID:             traceCallID,
+	})
+	return result
+}
+
 // executeBatch runs every tool_use in toolUses, returning the matching
 // tool_result blocks. Three phases:
 //
@@ -195,11 +267,33 @@ func isTraceChildTool(name string) bool {
 // shouldn't run in parallel with each other.
 func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, out chan<- Event, tc HookContext) ([]llm.ContentBlock, error) {
 	results := make([]llm.ContentBlock, len(toolUses))
+	releaseBatch, batchAllowed, batchReason := l.Gate.TryAcquireToolDispatchLease()
+	if !batchAllowed {
+		for i, blk := range toolUses {
+			results[i] = emitToolDispatchDenial(ctx, out, blk, batchReason, "", "", NewTraceInvocationID())
+		}
+		return results, nil
+	}
+	defer releaseBatch()
+	emitMalformed := func(i int, b llm.ContentBlock, traceCallID string) {
+		results[i] = malformedToolJSONBlock(b.ToolName, b.ToolUseID)
+		emit(ctx, out, Event{
+			Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+			ToolResult: &ToolResult{
+				Output:       results[i].ToolResult,
+				IsError:      true,
+				Presentation: clonePresentation(results[i].Presentation),
+			},
+			TraceCallID: traceCallID,
+		})
+	}
 	type job struct {
 		idx                     int
 		blk                     llm.ContentBlock
 		t                       tools.Tool
+		dispatchEpoch           uint64
 		presentationInput       map[string]any    // redacted clone; never used for execution
+		presentationExplicit    bool              // true when a hook supplied a separately masked view
 		early                   *llm.ContentBlock // set when pre-check decided result
 		ready                   bool              // true once pre-checks all pass
 		startedAt               time.Time         // set when EventToolStart is emitted; used to populate Event.Elapsed on result
@@ -208,6 +302,39 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		traceCallID             string
 	}
 	jobs := make([]*job, len(toolUses))
+	rejectTransitionJob := func(j *job, reason string) {
+		blkOut := emitToolDispatchDenial(ctx, out, j.blk, reason, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
+		j.early = &blkOut
+	}
+	rejectIfTransitioned := func(j *job) bool {
+		allowed, reason := l.validateToolDispatchAdmission(j.dispatchEpoch)
+		if allowed {
+			return false
+		}
+		rejectTransitionJob(j, reason)
+		return true
+	}
+	rejectMalformedJob := func(j *job, b llm.ContentBlock) {
+		blkOut := malformedToolJSONBlock(j.t.Name(), b.ToolUseID)
+		emit(ctx, out, Event{
+			Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+			ToolResult: &ToolResult{
+				Output:       blkOut.ToolResult,
+				IsError:      true,
+				Presentation: clonePresentation(blkOut.Presentation),
+			},
+			TraceInvocationID:       j.traceInvocationID,
+			TraceParentInvocationID: j.traceParentInvocationID,
+			TraceCallID:             j.traceCallID,
+		})
+		if l.Hooks != nil {
+			l.Hooks.EmitPostToolUseFailure(ctx, tc, &pubhook.PostToolUseFailure{
+				Context: tc, Tool: b.ToolName, Input: map[string]any{},
+				Output: blkOut.ToolResult, Error: blkOut.ToolResult, Attempt: 1,
+			})
+		}
+		j.early = &blkOut
+	}
 
 	// Phase 0a: per-tool pre-checks. ToolSearch and unknown tools are
 	// resolved inline (no permission flow needed). Others run their
@@ -216,14 +343,31 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	asks := make([]*job, 0)
 	for i, b := range toolUses {
 		traceCallID := NewTraceInvocationID()
+		dispatchEpoch, allowed, reason := l.beginToolDispatchAdmission()
+		if !allowed {
+			results[i] = emitToolDispatchDenial(ctx, out, b, reason, "", "", traceCallID)
+			continue
+		}
 		// Synthetic ToolSearch (lazy-MCP-schema feature, Task #72) is
 		// not in the Registry — handle it inline.
 		if b.ToolName == "ToolSearch" {
+			if hasMalformedToolJSON(b) {
+				emitMalformed(i, b, traceCallID)
+				continue
+			}
+			if allowed, reason := l.validateToolDispatchAdmission(dispatchEpoch); !allowed {
+				results[i] = emitToolDispatchDenial(ctx, out, b, reason, "", "", traceCallID)
+				continue
+			}
 			tsStart := time.Now()
 			results[i] = handleToolSearch(l, b)
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
-				ToolResult:  &ToolResult{Output: results[i].ToolResult, IsError: results[i].IsError},
+				ToolResult: &ToolResult{
+					Output:       results[i].ToolResult,
+					IsError:      results[i].IsError,
+					Presentation: clonePresentation(results[i].Presentation),
+				},
 				Elapsed:     time.Since(tsStart),
 				TraceCallID: traceCallID,
 			})
@@ -231,6 +375,12 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		}
 		entry, ok := l.Registry.GetModelEntry(b.ToolName)
 		if !ok {
+			// An unknown target has no schema capable of declaring _raw, so
+			// retain the safe legacy malformed-JSON classification.
+			if hasMalformedToolJSON(b) {
+				emitMalformed(i, b, traceCallID)
+				continue
+			}
 			results[i] = llm.ContentBlock{
 				Type: "tool_result", ToolUseID: b.ToolUseID,
 				ToolResult: fmt.Sprintf("error: unknown tool %q", b.ToolName), IsError: true,
@@ -243,6 +393,31 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			continue
 		}
 		t := entry.Tool
+		j := &job{
+			idx: i, blk: b, t: t, dispatchEpoch: dispatchEpoch,
+			traceCallID: traceCallID, presentationInput: redactedToolInput(b.ToolInput),
+		}
+		if isTraceChildTool(b.ToolName) {
+			j.traceInvocationID = NewTraceInvocationID()
+			j.traceParentInvocationID = TraceInvocationIDFromContext(ctx)
+		}
+		jobs[i] = j
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		// ToolInputMalformed is authoritative. A sole {_raw: string} is only a
+		// legacy parse sentinel when this tool does not explicitly publish _raw.
+		// Reject before hooks, permission, EventToolStart, or presentation can
+		// observe potentially sensitive malformed bytes.
+		initialSchema := t.InputSchema()
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		if hasMalformedToolJSONForSchema(b, initialSchema) {
+			emitMalformed(i, b, traceCallID)
+			jobs[i] = nil
+			continue
+		}
 		if entry.Exposure == tools.ToolExposureDeferred && l.deferredSchemaPending(t.Name()) {
 			results[i] = llm.ContentBlock{
 				Type: "tool_result", ToolUseID: b.ToolUseID,
@@ -256,13 +431,54 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			})
 			continue
 		}
-
-		j := &job{idx: i, blk: b, t: t, traceCallID: traceCallID, presentationInput: redactedToolInput(b.ToolInput)}
-		if isTraceChildTool(b.ToolName) {
-			j.traceInvocationID = NewTraceInvocationID()
-			j.traceParentInvocationID = TraceInvocationIDFromContext(ctx)
+		if rejectIfTransitioned(j) {
+			continue
 		}
-		jobs[i] = j
+
+		// Normalize provider input before any hook, audit, presentation, or
+		// permission boundary observes it. Otherwise a compatibility spelling
+		// such as file_path could bypass a hook that correctly inspects the
+		// canonical path field, then become path only after the hook returned.
+		normalizedInitialInput, normalizeErr := pubtool.NormalizeToolInput(t, j.blk.ToolInput)
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		if normalizeErr != nil {
+			blkOut := invalidToolArgumentsBlock(t.Name(), b.ToolUseID, normalizationValidationError())
+			emit(ctx, out, Event{
+				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+				ToolResult: &ToolResult{
+					Output:       blkOut.ToolResult,
+					IsError:      true,
+					Presentation: clonePresentation(blkOut.Presentation),
+				},
+				TraceInvocationID:       j.traceInvocationID,
+				TraceParentInvocationID: j.traceParentInvocationID,
+				TraceCallID:             j.traceCallID,
+			})
+			if l.Hooks != nil {
+				l.Hooks.EmitPostToolUseFailure(ctx, tc, &pubhook.PostToolUseFailure{
+					Context: tc, Tool: b.ToolName, Input: map[string]any{},
+					Output: blkOut.ToolResult, Error: blkOut.ToolResult, Attempt: 1,
+				})
+			}
+			j.early = &blkOut
+			continue
+		}
+		j.blk.ToolInput = normalizedInitialInput
+		initialSchema = t.InputSchema()
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		if hasMalformedToolJSONForSchema(j.blk, initialSchema) {
+			rejectMalformedJob(j, b)
+			continue
+		}
+		toolUses[j.idx] = j.blk
+		j.presentationInput = redactedToolInput(normalizedInitialInput)
+		if rejectIfTransitioned(j) {
+			continue
+		}
 
 		emit(ctx, out, Event{
 			Kind: EventToolStart, ToolUseID: b.ToolUseID,
@@ -282,8 +498,11 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		if l.Hooks != nil {
 			hookStart := time.Now()
 			mod := l.Hooks.EmitPreToolUse(ctx, tc, &PreToolUseHook{
-				Context: tc, Tool: b.ToolName, Input: b.ToolInput,
+				Context: tc, Tool: b.ToolName, Input: j.blk.ToolInput,
 			})
+			if rejectIfTransitioned(j) {
+				continue
+			}
 			if mod != nil {
 				if mod.Halt {
 					reason := mod.HaltReason
@@ -316,11 +535,91 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 						// Apply the structural credential-key redactor as a final
 						// defense instead of trusting every hook author to remember it.
 						j.presentationInput = redactedToolInput(mod.PresentationInput)
+						j.presentationExplicit = true
 					} else {
 						j.presentationInput = redactedToolInput(mod.ModifiedInput)
 					}
 				}
 			}
+		}
+
+		// Normalize again because PreToolUse may have replaced the input, then
+		// enforce the provider-facing schema locally before permission/admission.
+		// This prevents malformed calls from prompting the user or reaching
+		// side-effecting Execute implementations, and prevents a hook from
+		// rewriting a valid input into an invalid one.
+		normalizedInput, normalizeErr := pubtool.NormalizeToolInput(t, j.blk.ToolInput)
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		if normalizeErr != nil {
+			blkOut := invalidToolArgumentsBlock(t.Name(), b.ToolUseID, normalizationValidationError())
+			emit(ctx, out, Event{
+				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+				ToolResult: &ToolResult{
+					Output:       blkOut.ToolResult,
+					IsError:      true,
+					Presentation: clonePresentation(blkOut.Presentation),
+				},
+				TraceInvocationID:       j.traceInvocationID,
+				TraceParentInvocationID: j.traceParentInvocationID,
+				TraceCallID:             j.traceCallID,
+			})
+			if l.Hooks != nil {
+				l.Hooks.EmitPostToolUseFailure(ctx, tc, &pubhook.PostToolUseFailure{
+					Context: tc, Tool: b.ToolName, Input: map[string]any{},
+					Output: blkOut.ToolResult, Error: blkOut.ToolResult, Attempt: 1,
+				})
+			}
+			j.early = &blkOut
+			continue
+		}
+		j.blk.ToolInput = normalizedInput
+		finalSchema := t.InputSchema()
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		if hasMalformedToolJSONForSchema(j.blk, finalSchema) {
+			rejectMalformedJob(j, b)
+			continue
+		}
+		toolUses[j.idx] = j.blk
+		if j.presentationExplicit {
+			if normalizedPresentation, err := pubtool.NormalizeToolInput(t, j.presentationInput); err == nil {
+				j.presentationInput = redactedToolInput(normalizedPresentation)
+			}
+		} else {
+			j.presentationInput = redactedToolInput(normalizedInput)
+		}
+
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		finalSchema = t.InputSchema()
+		if rejectIfTransitioned(j) {
+			continue
+		}
+		if verr := pubtool.ValidateInput(finalSchema, j.blk.ToolInput); verr != nil {
+			blkOut := invalidToolArgumentsBlock(t.Name(), b.ToolUseID, verr)
+			emit(ctx, out, Event{
+				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+				ToolResult: &ToolResult{
+					Output:       blkOut.ToolResult,
+					IsError:      true,
+					Presentation: clonePresentation(blkOut.Presentation),
+				},
+				TraceInvocationID:       j.traceInvocationID,
+				TraceParentInvocationID: j.traceParentInvocationID,
+				TraceCallID:             j.traceCallID,
+			})
+			if l.Hooks != nil {
+				l.Hooks.EmitPostToolUseFailure(ctx, tc, &pubhook.PostToolUseFailure{
+					Context: tc, Tool: b.ToolName, Input: j.blk.ToolInput,
+					Output: blkOut.ToolResult, Error: blkOut.ToolResult, Attempt: 1,
+				})
+			}
+			j.early = &blkOut
+			continue
 		}
 
 		// An unattended caller such as cron must authorize every
@@ -331,6 +630,9 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		// semantics.
 		if admission := toolAdmissionPolicyFromContext(ctx); admission != nil && !tools.IsReadOnly(t, j.blk.ToolInput) {
 			allow, admissionReason := admission(t.Name(), clonePresentation(j.blk.ToolInput))
+			if rejectIfTransitioned(j) {
+				continue
+			}
 			if !allow {
 				admissionReason = security.RedactSubprocessText(admissionReason)
 				ev := permissionRequestEvent(j.blk, j.presentationInput, 0)
@@ -372,8 +674,24 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		// Bind path preparation to this exact call. Provider tool_use_id is
 		// presentation metadata and can be reused; traceCallID is generated once
 		// per job and is propagated unchanged to Execute below.
+		if rejectIfTransitioned(j) {
+			continue
+		}
 		permissionCtx := tools.WithInvocationID(ctx, j.traceCallID)
-		perm, reason := t.CanUse(permissionCtx, j.blk.ToolInput)
+		var perm tools.Permission
+		if unavailableReason, unavailable := userInteractionUnavailableReason(ctx); unavailable && tools.RequiresUserInteraction(t) {
+			// A child/headless loop may still have an internal event channel, but
+			// nobody owns the reply side of an EventAskUser. Reject before CanUse
+			// and Execute so fullAccess cannot upgrade the call to ALLOW and wait
+			// forever on a reply that will never exist.
+			perm = tools.PermissionDeny
+			reason = unavailableReason
+		} else {
+			perm, reason = t.CanUse(permissionCtx, j.blk.ToolInput)
+		}
+		if rejectIfTransitioned(j) {
+			continue
+		}
 		// Policy markers are control data, not credential values. Record this
 		// before redaction because the generic assignment scrubber intentionally
 		// treats a value after `secret_read:` as sensitive. The model/UI still
@@ -389,11 +707,18 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		// public BypassAutoAllowAware contract; legacy plugin ASK semantics stay
 		// fail-closed. Interactive and bypass-immune calls are always denied.
 		bypassUnattended := l.Gate != nil && l.Gate.Mode() == permission.ModeBypassPermissions
+		fullAccess := l.Gate != nil && l.Gate.Mode() == permission.ModeFullAccess
 		if !bypassUnattended && l.Gate != nil && l.Gate.Mode() == permission.ModePlan {
 			previous, ok := permission.ParseMode(l.PrePlanMode())
 			bypassUnattended = ok && previous == permission.ModeBypassPermissions
 		}
-		if bypassUnattended {
+		if fullAccess && perm == tools.PermissionAsk {
+			// fullAccess is approval=never + sandbox disabled. A plugin that
+			// retains legacy ASK semantics must not reopen an approval modal;
+			// explicit PermissionDeny and hook failures remain authoritative.
+			perm = tools.PermissionAllow
+			reason = "mode:fullAccess"
+		} else if bypassUnattended {
 			if tools.RequiresUserInteraction(t) {
 				perm = tools.PermissionDeny
 				reason = "interactive tool unavailable in bypassPermissions unattended mode"
@@ -467,6 +792,9 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			}
 			continue
 		}
+		if rejectIfTransitioned(j) {
+			continue
+		}
 		j.ready = true
 	}
 
@@ -495,7 +823,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		wg.Add(1)
 		go func(j *job) {
 			defer wg.Done()
-			blk := l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
+			blk := l.runExecute(ctx, j.t, j.blk, out, tc, j.dispatchEpoch, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 			mu.Lock()
 			results[j.idx] = blk
 			mu.Unlock()
@@ -511,7 +839,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		go func() {
 			defer wg.Done()
 			for _, j := range queueJobs {
-				blk := l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
+				blk := l.runExecute(ctx, j.t, j.blk, out, tc, j.dispatchEpoch, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 				mu.Lock()
 				results[j.idx] = blk
 				mu.Unlock()
@@ -542,7 +870,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	// graph readable and lets future scheduling policy hook in here
 	// (e.g., rate-limiting background spawns).
 	for _, j := range bgJobs {
-		results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
+		results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.dispatchEpoch, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 	}
 
 	wg.Wait()
@@ -573,7 +901,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		}
 	} else {
 		for _, j := range exclJobs {
-			results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
+			results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.dispatchEpoch, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
 		}
 	}
 
@@ -632,7 +960,15 @@ func safeToolExecute(ctx context.Context, t tools.Tool, in map[string]any) (res 
 //
 // Returns the matching tool_result block. All error paths produce a
 // well-formed block so the LLM never sees a missing tool_result.
-func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBlock, out chan<- Event, tc HookContext, traceInvocationID, traceParentInvocationID, traceCallID string) llm.ContentBlock {
+func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBlock, out chan<- Event, tc HookContext, dispatchEpoch uint64, traceInvocationID, traceParentInvocationID, traceCallID string) llm.ContentBlock {
+	// Permission and execution are separated by ASK batching and concurrency
+	// scheduling. Revalidate at the final chokepoint before even checkpoint or
+	// timeout capabilities can observe the call. This catches transitions that
+	// began during CanUse as well as completed transitions that invalidated the
+	// epoch under which the tool was authorized.
+	if allowed, reason := l.validateToolDispatchAdmission(dispatchEpoch); !allowed {
+		return emitToolDispatchDenial(ctx, out, blk, reason, traceInvocationID, traceParentInvocationID, traceCallID)
+	}
 	// Tag ctx with the parent's event out-channel so sub-tools (Agent)
 	// can forward intermediate events for live UI updates.
 	toolCtx := WithEventOut(ctx, out)
@@ -673,13 +1009,15 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// SendMessage mid-flight). Detach the cancel signal — values from
 	// ctx still flow through.
 	//
-	// Caveat: a malicious / runaway InterruptBlock tool could ignore
-	// shutdown forever. Mitigation lives at the layer that issues the
-	// cancel: the TUI's double-Ctrl+C path can hard-kill via the loop
-	// owner. This detach only protects against the FIRST Ctrl+C.
+	// Top-level dispatch preserves the historical first-Ctrl+C behavior. A
+	// sub-agent additionally carries its private lifecycle context; reattach
+	// only that cancellation so SubAgentStop, its timeout, and roster shutdown
+	// remain hard boundaries even while an InterruptBlock tool is running.
+	interruptCleanup := func() {}
 	if tools.GetInterruptBehavior(t) == tools.InterruptBlock {
-		toolCtx = context.WithoutCancel(toolCtx)
+		toolCtx, interruptCleanup = detachInterruptBlockContext(toolCtx)
 	}
+	defer interruptCleanup()
 	// 2026-05-23: measure wall-clock around Execute so EventToolResult
 	// carries the authoritative duration. forwardSubAgentEvent
 	// preserves Event.Elapsed via shallow copy, so the parent TUI
@@ -689,6 +1027,9 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// file-mutating tool of this turn, so /rewind can restore files +
 	// conversation together. Best-effort, once per turn, no-op when
 	// checkpointing is off. See checkpoint_hook.go.
+	if allowed, reason := l.validateToolDispatchAdmission(dispatchEpoch); !allowed {
+		return emitToolDispatchDenial(ctx, out, blk, reason, traceInvocationID, traceParentInvocationID, traceCallID)
+	}
 	l.snapPreEdit(blk.ToolName, blk.ToolInput)
 
 	execStart := time.Now()
@@ -703,12 +1044,19 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	if timeoutMs := tools.TimeoutMs(t); timeoutMs > 0 {
 		var cancel context.CancelFunc
 		toolCtx, cancel = context.WithTimeout(toolCtx, time.Duration(timeoutMs)*time.Millisecond)
+		if allowed, reason := l.validateToolDispatchAdmission(dispatchEpoch); !allowed {
+			cancel()
+			return emitToolDispatchDenial(ctx, out, blk, reason, traceInvocationID, traceParentInvocationID, traceCallID)
+		}
 		res, err = safeToolExecute(toolCtx, t, blk.ToolInput)
 		cancel()
 		if err == nil && toolCtx.Err() == context.DeadlineExceeded {
 			res = &tools.Result{Output: fmt.Sprintf("Error: tool call timed out after %dms", timeoutMs), IsError: true}
 		}
 	} else {
+		if allowed, reason := l.validateToolDispatchAdmission(dispatchEpoch); !allowed {
+			return emitToolDispatchDenial(ctx, out, blk, reason, traceInvocationID, traceParentInvocationID, traceCallID)
+		}
 		res, err = safeToolExecute(toolCtx, t, blk.ToolInput)
 	}
 	l.recordCheckpointMutation(blk.ToolName, blk.ToolInput, res, err)
@@ -887,6 +1235,30 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		IsError:      res.IsError,
 		Display:      res.Display,
 		Presentation: clonePresentation(res.Presentation),
+	}
+}
+
+// detachInterruptBlockContext removes ordinary turn cancellation while
+// preserving an explicitly-stamped sub-agent lifecycle. context.AfterFunc
+// avoids a watcher goroutine that could outlive a naturally completed tool.
+// The returned cleanup is always safe to call exactly once via defer.
+func detachInterruptBlockContext(ctx context.Context) (context.Context, func()) {
+	detached := context.WithoutCancel(ctx)
+	lifecycle := ToolLifecycleContextFromContext(detached)
+	if lifecycle == nil {
+		return detached, func() {}
+	}
+
+	lifecycleCtx, cancel := context.WithCancel(detached)
+	stop := context.AfterFunc(lifecycle, cancel)
+	// Close the narrow race where lifecycle completed immediately before the
+	// AfterFunc registration became observable.
+	if lifecycle.Err() != nil {
+		cancel()
+	}
+	return lifecycleCtx, func() {
+		stop()
+		cancel()
 	}
 }
 

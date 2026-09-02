@@ -436,6 +436,7 @@ func TestNormalizeApprovalMode(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"auto", "acceptEdits"}, {"acceptEdits", "acceptEdits"}, {"ask", "default"},
 		{"plan", "plan"}, {"deny", "dontAsk"}, {"bypass", "bypassPermissions"},
+		{"fullAccess", "fullAccess"}, {"full", "fullAccess"},
 		{"unexpected", "acceptEdits"}, {"", "acceptEdits"},
 	} {
 		if got := normalizeApprovalMode(tc.in); got != tc.want {
@@ -476,6 +477,19 @@ func TestSendMessageExistingSessionCLIArgs(t *testing.T) {
 		"--mode", "plan", "--", "continue",
 	}
 	assertSingleCall(t, fake, workDir, want)
+}
+
+func TestSendMessageFullAccessCLIArgs(t *testing.T) {
+	workDir := t.TempDir()
+	app, fake := newFakeApp(t, workDir, fakeCLIResult{stdout: "continued"})
+	response := app.SendMessage("continue", "session_full", "fullAccess")
+	if response.Error != "" || response.ThreadID != "session_full" {
+		t.Fatalf("response = %+v", response)
+	}
+	assertSingleCall(t, fake, workDir, []string{
+		"run", "--no-auth-wizard", "--resume", "session_full",
+		"--mode", "fullAccess", "--", "continue",
+	})
 }
 
 func TestGetSessionsParsesJSONAndFiltersWorkspaceAndIDs(t *testing.T) {

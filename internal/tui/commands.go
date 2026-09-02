@@ -235,7 +235,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "export", Description: "export the current conversation to a readable text file", Handler: cmdExport})
 
 	// === Permissions ===
-	r.Register(REPLCommand{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions)", Handler: cmdMode})
+	r.Register(REPLCommand{Name: "mode", Description: "show or set permission mode (default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", Handler: cmdMode})
 	r.Register(REPLCommand{Name: "allow", Description: "allow a tool permanently (e.g. allow Bash)", Handler: cmdAllow})
 	r.Register(REPLCommand{Name: "sandbox", Description: "OS command sandbox: status | doctor | reset | off | permissions | auto-allow", Handler: cmdSandbox})
 
@@ -1349,6 +1349,10 @@ func (r *REPL) handleMCPLogin(name string) string {
 }
 
 func (r *REPL) handleMCPLoginContext(ctx, lifecycleCtx context.Context, name string) string {
+	ticket := r.beginMCPLaunchTicket(lifecycleCtx)
+	defer ticket.Finish()
+	operationCtx, cancelOperation := mcpLaunchOperationContext(ctx, ticket.Context())
+	defer cancelOperation()
 	target, err := resolveMCPLoginTarget(name)
 	if err != nil {
 		return redactMCPLoginError(err)
@@ -1357,19 +1361,15 @@ func (r *REPL) handleMCPLoginContext(ctx, lifecycleCtx context.Context, name str
 	if r != nil && r.Loop != nil {
 		registry = r.Loop.Registry
 	}
-	launch, err := runMCPLogin(ctx, lifecycleCtx, target, registry)
+	launch, err := runMCPLogin(operationCtx, ticket.Context(), target, registry)
 	if err != nil {
 		return "mcp login " + name + ": " + redactMCPLoginError(err)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := operationCtx.Err(); err != nil {
 		closeMCPLoginLaunch(launch)
 		return "mcp login " + name + ": " + redactMCPLoginError(err)
 	}
-	var adopt func(*mcptools.Server, []tools.Tool) bool
-	if r != nil {
-		adopt = r.AdoptMCPServer
-	}
-	toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(registry, name, launch, adopt)
+	toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(registry, name, launch, ticket.Adopt)
 	if r != nil && ownsServer {
 		r.mcpLoginServers = append(r.mcpLoginServers, launch.server)
 	}
@@ -1530,19 +1530,21 @@ func (r *REPL) handleMCPRemove(name string) string {
 // handleMCPStart launches a registered MCP server and grafts its tools onto
 // the live registry. Returned tools are visible to the LLM on the next turn.
 func (r *REPL) handleMCPStart(name string) string {
-	reg, err := mcp.Load()
-	if err != nil {
-		return "mcp: " + err.Error()
-	}
 	base := context.Background()
 	if r != nil && r.ctx != nil {
 		base = r.ctx
 	}
-	ctx, cancel := context.WithTimeout(base, 30*time.Second)
+	ticket := r.beginMCPLaunchTicket(base)
+	defer ticket.Finish()
+	reg, err := mcp.Load()
+	if err != nil {
+		return "mcp: " + err.Error()
+	}
+	ctx, cancel := context.WithTimeout(ticket.Context(), 30*time.Second)
 	defer cancel()
 	staged := tools.NewRegistry()
-	srv, err := launchMCPServerWithLifecycle(ctx, base, func(liveCtx context.Context) (*mcptools.Server, error) {
-		return mcp.LaunchServerWithSandbox(liveCtx, reg, name, staged, r.sandbox)
+	srv, err := launchMCPServerWithLifecycle(ctx, ticket.Context(), func(liveCtx context.Context) (*mcptools.Server, error) {
+		return launchConfiguredMCPServer(liveCtx, reg, name, staged, r.sandbox)
 	})
 	if err != nil {
 		return "mcp start: " + err.Error()
@@ -1550,7 +1552,7 @@ func (r *REPL) handleMCPStart(name string) string {
 	discovered := staged.All()
 	toolCount, ownsServer := adoptOrPublishMCPLoginLaunch(
 		r.Loop.Registry, name,
-		mcpLoginLaunch{server: srv, tools: discovered}, r.AdoptMCPServer,
+		mcpLoginLaunch{server: srv, tools: discovered}, ticket.Adopt,
 	)
 	if ownsServer {
 		r.mcpLoginServers = append(r.mcpLoginServers, srv)
@@ -1596,7 +1598,7 @@ func cmdMode(r *REPL, args string) string {
 	}
 	mode, ok := permission.ParseMode(args)
 	if !ok {
-		return "unknown mode: " + args + " (want default|acceptEdits|plan|dontAsk|bypassPermissions)"
+		return "unknown mode: " + args + " (want default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)"
 	}
 	if err := applyREPLPermissionMode(r, mode); err != nil {
 		return "mode unchanged: " + err.Error()
@@ -1900,7 +1902,7 @@ func cmdUsage(r *REPL, args string) string {
 		rows = append(rows, infoRow{Key: "dashboard", Value: "(unknown — check your provider's console)"})
 	}
 	rows = append(rows,
-		infoRow{Key: "── session totals ──", Value: ""},
+		infoRow{Key: "", Value: "── session totals ──"},
 		infoRow{Key: "input", Value: fmtThousands(t.Input())},
 		infoRow{Key: "output", Value: fmtThousands(t.Output())},
 		infoRow{Key: "cache_create", Value: fmtThousands(t.CacheCreate())},

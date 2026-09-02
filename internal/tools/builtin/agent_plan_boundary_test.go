@@ -30,7 +30,7 @@ func planAgentForBoundaryTest(gate *permission.Gate, reg *tools.Registry) Agent 
 }
 
 func TestAgentPlanBoundaryRejectsPermissionEscalation(t *testing.T) {
-	for _, mode := range []string{"default", "acceptEdits", "dontAsk", "bypassPermissions"} {
+	for _, mode := range []string{"default", "acceptEdits", "dontAsk", "bypassPermissions", "fullAccess"} {
 		t.Run(mode, func(t *testing.T) {
 			gate := permission.New(permission.ModePlan)
 			tool := planAgentForBoundaryTest(gate, tools.NewRegistry())
@@ -96,20 +96,27 @@ func TestAgentIsReadOnlyPermissionEscalationMatrix(t *testing.T) {
 			permission.ModeAcceptEdits:       true,
 			permission.ModeDontAsk:           true,
 			permission.ModeBypassPermissions: true,
+			permission.ModeFullAccess:        true,
 		},
 		permission.ModeDontAsk: {
 			permission.ModeDefault:           true,
 			permission.ModeAcceptEdits:       true,
 			permission.ModeBypassPermissions: true,
+			permission.ModeFullAccess:        true,
 		},
 		permission.ModeDefault: {
 			permission.ModeAcceptEdits:       true,
 			permission.ModeBypassPermissions: true,
+			permission.ModeFullAccess:        true,
 		},
 		permission.ModeAcceptEdits: {
 			permission.ModeBypassPermissions: true,
+			permission.ModeFullAccess:        true,
 		},
-		permission.ModeBypassPermissions: {},
+		permission.ModeBypassPermissions: {
+			permission.ModeFullAccess: true,
+		},
+		permission.ModeFullAccess: {},
 	}
 
 	for _, parent := range permission.Modes {
@@ -154,8 +161,14 @@ func TestAgentIsReadOnlyPermissionEscalationMatrix(t *testing.T) {
 					}
 					continue
 				}
-				if gotReadOnly == wantEscalation {
-					t.Errorf("IsReadOnly parent=%s requested=%s = %v, want %v", parent, requested, gotReadOnly, !wantEscalation)
+				wantReadOnly := !wantEscalation
+				if parent == permission.ModeFullAccess && requested != permission.ModeFullAccess {
+					// A lower child gate cannot restore the sandbox disabled by
+					// fullAccess or replace parent-bound concrete tools.
+					wantReadOnly = false
+				}
+				if gotReadOnly != wantReadOnly {
+					t.Errorf("IsReadOnly parent=%s requested=%s = %v, want %v", parent, requested, gotReadOnly, wantReadOnly)
 				}
 			}
 		})

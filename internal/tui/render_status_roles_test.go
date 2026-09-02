@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"charm.land/lipgloss/v2"
 )
 
 // TestRender_SuccessRoleAddsCheckGlyph — Phase B introduces "success"
@@ -28,6 +30,34 @@ func TestRender_WarningRoleAddsWarnGlyph(t *testing.T) {
 	out := stripANSI(renderMessage(msg, 80, false))
 	if !strings.Contains(out, "⚠") {
 		t.Errorf("warning role should render with ⚠ glyph; got: %q", out)
+	}
+}
+
+func TestRender_MultilineWarningKeepsBoxBorderAligned(t *testing.T) {
+	box := renderInfoBox("Usage", []infoRow{{Key: "provider", Value: "sensenova"}})
+	out := stripANSI(renderMessage(Message{Role: "warning", Content: box, Timestamp: time.Now()}, 100, false))
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("rendered warning too short: %q", out)
+	}
+	if !strings.HasPrefix(lines[0], "    ╭") {
+		t.Fatalf("warning top border prefix = %q", lines[0])
+	}
+	if strings.Contains(lines[0], "⚠") {
+		t.Fatalf("bordered panel must not carry an ambiguous-width status glyph: %q", lines[0])
+	}
+	wantWidth := lipgloss.Width(lines[0])
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "    ") {
+			t.Fatalf("box line %d is not aligned with top border: %q", i, line)
+		}
+		border := strings.IndexAny(line, "╭│╰")
+		if border < 0 || lipgloss.Width(line[:border]) != 4 {
+			t.Fatalf("box line %d left-border column is not exactly 4: %q", i, line)
+		}
+		if gotWidth := lipgloss.Width(line); gotWidth != wantWidth {
+			t.Fatalf("box line %d width = %d, want %d: %q", i, gotWidth, wantWidth, line)
+		}
 	}
 }
 

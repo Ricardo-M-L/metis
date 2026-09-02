@@ -147,3 +147,54 @@ func TestMonitorProcessGuardRejectsInCanUseAndExecute(t *testing.T) {
 		t.Fatal("Monitor spawned a background job after process-guard denial")
 	}
 }
+
+func TestMonitorFullAccessExecutesProcessGuardCommand(t *testing.T) {
+	pool := jobs.NewRegistry(t.TempDir())
+	t.Cleanup(func() { pool.Shutdown(0) })
+	watches := agent.NewMonitorRegistry(1)
+	t.Cleanup(watches.StopAll)
+	monitor := NewMonitor(pool, watches, permission.New(permission.ModeFullAccess), config.ToolBashSettings{Shell: "/bin/sh"})
+	in := map[string]any{
+		// Signal 0 is an existence probe, so this safely exercises Execute
+		// without terminating the process that runs the test.
+		"command":     "kill -0 $$",
+		"description": "probe shell process directly",
+	}
+
+	if got, source := monitor.CanUse(context.Background(), in); got != tools.PermissionAllow {
+		t.Fatalf("CanUse = %v (%q), want fullAccess allow", got, source)
+	}
+	res, err := monitor.Execute(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Execute returned Go error: %v", err)
+	}
+	if res.IsError || !strings.Contains(res.Output, "[monitor active") {
+		t.Fatalf("Execute = %+v, want monitor to start", res)
+	}
+	if len(pool.List()) != 1 {
+		t.Fatalf("registered jobs = %d, want 1", len(pool.List()))
+	}
+}
+
+func TestMonitorFullAccessStillValidatesPatterns(t *testing.T) {
+	pool := jobs.NewRegistry(t.TempDir())
+	t.Cleanup(func() { pool.Shutdown(0) })
+	watches := agent.NewMonitorRegistry(1)
+	t.Cleanup(watches.StopAll)
+	monitor := NewMonitor(pool, watches, permission.New(permission.ModeFullAccess), config.ToolBashSettings{Shell: "/bin/sh"})
+
+	res, err := monitor.Execute(context.Background(), map[string]any{
+		"command":        "kill -0 $$",
+		"description":    "invalid pattern must fail before spawn",
+		"watch_patterns": []any{"["},
+	})
+	if err != nil {
+		t.Fatalf("Execute returned Go error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(res.Output, "watch_patterns[0]") {
+		t.Fatalf("Execute = %+v, want regex validation error", res)
+	}
+	if len(pool.List()) != 0 {
+		t.Fatal("Monitor spawned a background job after pattern validation failed")
+	}
+}

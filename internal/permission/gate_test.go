@@ -11,10 +11,12 @@ func TestParseMode_CanonicalAndLegacyAliases(t *testing.T) {
 		"default":           ModeDefault,
 		"acceptEdits":       ModeAcceptEdits,
 		"bypassPermissions": ModeBypassPermissions,
+		"fullAccess":        ModeFullAccess,
 		"plan":              ModePlan,
 		"dontAsk":           ModeDontAsk,
 		"ask":               ModeDefault,
 		"bypass":            ModeBypassPermissions,
+		"full":              ModeFullAccess,
 		"deny":              ModeDontAsk,
 	}
 	for raw, want := range cases {
@@ -29,6 +31,27 @@ func TestParseMode_CanonicalAndLegacyAliases(t *testing.T) {
 	}
 	if got, ok := ParseMode("auto"); ok || got != "" {
 		t.Fatalf("removed mode auto must be rejected, got %q, %v", got, ok)
+	}
+}
+
+func TestGateFullAccessSkipsImplicitBoundariesButHonorsExplicitRules(t *testing.T) {
+	g := New(ModeFullAccess)
+	g.SetPathScopeHook(func(string) bool { return false })
+
+	if got, source := g.CheckPath(context.Background(), "Read", "/tmp/.env", "/tmp/.env"); got != DecisionAllow || source != "mode:fullAccess" {
+		t.Fatalf("fullAccess secret/out-of-scope read = %v (%s), want allow", got, source)
+	}
+	if got, source := g.Check(context.Background(), "Bash", "rm -rf /"); got != DecisionAllow || source != "mode:fullAccess" {
+		t.Fatalf("fullAccess dangerous-pattern command = %v (%s), want allow", got, source)
+	}
+
+	g.AppendRules(Rule{Tool: "Bash", Match: "rm -rf /", Verb: DecisionDeny, Source: "policy:deny"})
+	if got, source := g.Check(context.Background(), "Bash", "rm -rf /"); got != DecisionDeny || source != "policy:deny" {
+		t.Fatalf("fullAccess explicit deny = %v (%s), want deny policy:deny", got, source)
+	}
+	g.AppendRules(Rule{Tool: "Write", Verb: DecisionAsk, Source: "policy:ask"})
+	if got, source := g.Check(context.Background(), "Write", "/tmp/file"); got != DecisionDeny || source != "policy:ask" {
+		t.Fatalf("fullAccess explicit ask = %v (%s), want silent deny policy:ask", got, source)
 	}
 }
 

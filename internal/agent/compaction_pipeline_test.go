@@ -135,6 +135,40 @@ func TestCompactNow_AllTriggersShareOneRetentionPipeline(t *testing.T) {
 	}
 }
 
+func TestCompactNow_StripsProviderStateFromReplacement(t *testing.T) {
+	p := &fakeSummarizer{}
+	cfg := DefaultCompactionConfig()
+	cfg.MaxSummarizeInputTokens = 0
+	history := unifiedPipelineHistory()
+	history[len(history)-1].Content = append(history[len(history)-1].Content, llm.ContentBlock{
+		Type: "provider_state",
+		ProviderHint: map[string]string{
+			"openai.responses.response_id": "resp_from_old_prefix",
+			"openai.responses.state_key":   "old-state-key",
+		},
+	})
+	loop := &Loop{
+		Compactor: NewCompactor(cfg, "test", 2_000, p),
+		Model:     "test",
+		Messages:  history,
+	}
+
+	result, err := loop.CompactNow(context.Background(), CompactOptions{Trigger: "manual", Force: true})
+	if err != nil {
+		t.Fatalf("CompactNow: %v", err)
+	}
+	if !result.Applied {
+		t.Fatal("forced compaction did not apply")
+	}
+	for _, message := range result.History {
+		for _, block := range message.Content {
+			if block.Type == "provider_state" {
+				t.Fatalf("compacted replacement retained provider state from the old prefix: %#v", block.ProviderHint)
+			}
+		}
+	}
+}
+
 func TestCompactNow_InvalidatesRuntimeSnapshotAfterAppliedReplacement(t *testing.T) {
 	p := &fakeSummarizer{}
 	cfg := DefaultCompactionConfig()

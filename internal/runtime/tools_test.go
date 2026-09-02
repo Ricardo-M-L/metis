@@ -1,6 +1,9 @@
 package runtime
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -67,6 +70,47 @@ func TestBuildToolRegistry_AgentToolHasModelAndSystem(t *testing.T) {
 	}
 	if agent.Description() == "" {
 		t.Error("Agent tool description should be non-empty")
+	}
+}
+
+func TestBuildToolRegistry_AgentSchemaPublishesAvailableProfileEnum(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+	projectAgents := filepath.Join(project, ".metis", "agents")
+	if err := os.MkdirAll(projectAgents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectAgents, "custom-scout.md"), []byte("Custom scout"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := BuildToolRegistry(ToolRegistryOptions{
+		Cfg:             &config.Config{},
+		Gate:            permission.New(permission.ModeAcceptEdits),
+		Provider:        &stubProvider{maxCtx: 100_000},
+		Model:           "claude-x",
+		System:          "sys",
+		ChannelRegistry: channels.NewRegistry(),
+	})
+	agentTool, ok := reg.Get("Agent")
+	if !ok {
+		t.Fatal("Agent tool should be registered")
+	}
+	properties := agentTool.InputSchema()["properties"].(map[string]any)
+	profileSchema := properties["subagent_type"].(map[string]any)
+	profiles, ok := profileSchema["enum"].([]string)
+	if !ok {
+		t.Fatalf("subagent_type enum type = %T, want []string", profileSchema["enum"])
+	}
+	for _, want := range []string{"custom-scout", "explore", "general", "verify"} {
+		if !slices.Contains(profiles, want) {
+			t.Fatalf("Agent profile enum %v missing %q", profiles, want)
+		}
+	}
+	if slices.Contains(profiles, "research") {
+		t.Fatalf("Agent profile enum unexpectedly advertises unavailable profile research: %v", profiles)
 	}
 }
 

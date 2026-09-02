@@ -11,6 +11,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 type Edit struct {
@@ -103,6 +104,19 @@ func (Edit) InputSchema() map[string]any {
 		},
 	}
 }
+
+// NormalizeInput maps the finite set of historical Edit spellings to the
+// canonical schema before validation and authorization. An explicit empty new
+// string remains a valid deletion request.
+func (Edit) NormalizeInput(input map[string]any) (map[string]any, error) {
+	return pubtool.NormalizeAliases(input, map[string]string{
+		"file_path":   "path",
+		"old_string":  "old",
+		"new_string":  "new",
+		"replace_all": "all",
+	})
+}
+
 func (Edit) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencyExclusive }
 
 // IsDestructive: Edit is irreversible (writes to disk). Drives stricter
@@ -157,9 +171,21 @@ func (e Edit) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	path, _ := in["path"].(string)
-	old, _ := in["old"].(string)
-	newS, _ := in["new"].(string)
+	path, pathOK := in["path"].(string)
+	old, oldOK := in["old"].(string)
+	newS, newOK := in["new"].(string)
+	if !pathOK {
+		return &tools.Result{Output: "Edit: `path` must be a string", IsError: true}, nil
+	}
+	if !oldOK {
+		return &tools.Result{Output: "Edit: required `old` field must be a string", IsError: true}, nil
+	}
+	// An explicitly empty replacement is a valid deletion. Missing/wrong-type
+	// `new` must not be coerced to that destructive operation when Execute is
+	// called outside the dispatcher.
+	if !newOK {
+		return &tools.Result{Output: "Edit: required `new` field must be a string", IsError: true}, nil
+	}
 	all, _ := in["all"].(bool)
 	if path == "" || old == "" {
 		return nil, errors.New("path and old are required")
