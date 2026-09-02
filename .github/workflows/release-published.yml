@@ -3,6 +3,12 @@ name: Verify Published Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag to verify
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -15,7 +21,7 @@ jobs:
       - name: Download and verify all release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -57,7 +63,9 @@ jobs:
 
           for sidecar in dist/*.sha256; do
             sidecar_name=${sidecar#dist/}
-            (cd dist && shasum -a 256 -c "$sidecar_name")
+            # PowerShell-authored checksum files may use CRLF. Validate the
+            # manifest content without treating the trailing CR as a filename.
+            (cd dist && sed 's/\r$//' "$sidecar_name" | shasum -a 256 -c -)
           done
 
   install-smoke-unix:
@@ -66,11 +74,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Install without a GitHub token
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           install_dir="$RUNNER_TEMP/metis-bin"
           env -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN \
@@ -85,12 +93,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Install without a GitHub token
         shell: pwsh
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
           Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
@@ -110,7 +118,7 @@ jobs:
       - name: Download official macOS assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           mkdir dist
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
@@ -118,7 +126,7 @@ jobs:
 
       - name: Verify checksums and Apple trust chain
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           (cd dist && shasum -a 256 -c metis-desktop-darwin-universal.zip.sha256)

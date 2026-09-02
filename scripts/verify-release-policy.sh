@@ -22,6 +22,8 @@ grep -q 'Stage immutable release draft' "$stage_workflow" || fail "tag workflow 
 grep -q 'expected=16' "$stage_workflow" || fail "draft inventory is not the 16 non-macOS assets"
 grep -q 'metis-desktop-linux-amd64-' "$stage_workflow" || fail "Linux Desktop asset is not staged"
 grep -q 'metis-desktop-windows-amd64-' "$stage_workflow" || fail "Windows Desktop asset is not staged"
+grep -Fq '[System.IO.File]::WriteAllText' "$stage_workflow" || \
+	fail "Windows Desktop checksum sidecar is not written with explicit LF encoding"
 
 if grep -q 'gh release edit .*--draft=false' "$stage_workflow"; then
 	fail "tag workflow must not publish a draft"
@@ -31,7 +33,9 @@ if grep -A8 'name: Download.*Desktop artifact' "$stage_workflow" | grep -q 'darw
 fi
 
 grep -q 'types: \[published\]' "$verify_workflow" || fail "published-release verification trigger is missing"
+grep -q 'workflow_dispatch:' "$verify_workflow" || fail "published-release manual recheck trigger is missing"
 grep -q 'exactly the 20 immutable assets' "$verify_workflow" || fail "published inventory guard is missing"
+grep -Fq "sed 's/\\r\$//'" "$verify_workflow" || fail "checksum verification is not CRLF-safe"
 grep -q 'Authority=Developer ID Application:' "$verify_workflow" || fail "Developer ID verification is missing"
 grep -q 'xcrun stapler validate' "$verify_workflow" || fail "staple verification is missing"
 grep -q 'spctl --assess' "$verify_workflow" || fail "Gatekeeper verification is missing"

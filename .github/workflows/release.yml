@@ -276,7 +276,12 @@ jobs:
             throw "Desktop archive does not contain metis-desktop.exe"
           }
           $digest = (Get-FileHash -Algorithm SHA256 "release-dist/$asset").Hash.ToLowerInvariant()
-          "$digest  $asset" | Set-Content "release-dist/$asset.sha256"
+          $sidecar = Join-Path (Get-Location) "release-dist/$asset.sha256"
+          [System.IO.File]::WriteAllText(
+            $sidecar,
+            "$digest  $asset`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
 
       - uses: actions/upload-artifact@v4
         with:
