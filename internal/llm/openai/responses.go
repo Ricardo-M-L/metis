@@ -603,13 +603,13 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			s.pending = append(s.pending, ev)
 			s.done = true
 		case "response.incomplete":
-			ev := provider.StreamEvent{Type: "message_delta", StopReason: "max_tokens"}
+			ev := provider.StreamEvent{Type: "message_delta", StopReason: "provider_incomplete"}
 			if env.Response != nil {
 				if env.Response.ID != "" {
 					s.responseID = env.Response.ID
 				}
-				if env.Response.IncompleteDetails != nil && env.Response.IncompleteDetails.Reason == "content_filter" {
-					ev.StopReason = "stop_sequence"
+				if env.Response.IncompleteDetails != nil {
+					ev.StopReason = mapResponsesIncompleteReason(env.Response.IncompleteDetails.Reason)
 				}
 				if env.Response.Usage != nil {
 					cacheRead := 0
@@ -923,8 +923,11 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 			break
 		}
 	}
-	if out.Status == "incomplete" && out.IncompleteDetails != nil && out.IncompleteDetails.Reason == "max_output_tokens" {
-		stop = "max_tokens"
+	if out.Status == "incomplete" {
+		stop = "provider_incomplete"
+		if out.IncompleteDetails != nil {
+			stop = mapResponsesIncompleteReason(out.IncompleteDetails.Reason)
+		}
 	}
 	result.StopReason = stop
 	if out.Usage != nil {
@@ -939,4 +942,15 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 		result.OutputTokens = out.Usage.OutputTokens
 	}
 	return result, nil
+}
+
+func mapResponsesIncompleteReason(reason string) string {
+	switch reason {
+	case "max_output_tokens":
+		return "max_tokens"
+	case "content_filter":
+		return "content_filter"
+	default:
+		return "provider_incomplete"
+	}
 }

@@ -886,7 +886,11 @@ func (r *REPL) runTurn(ctx context.Context) error {
 			r.flushTextBeforeTool(turnStartedText)
 			r.persistTail()
 			fmt.Fprintln(r.out)
-			return <-done
+			runErr := <-done
+			if runErr == nil && agent.IsIncompleteStopReason(ev.StopReason) {
+				return fmt.Errorf("task incomplete: %s", ev.StopReason)
+			}
+			return runErr
 		case agent.EventError:
 			fmt.Fprintln(r.out, r.Styles.Err.Render("error: "+ev.Err.Error()))
 		case agent.EventInfo:

@@ -77,6 +77,7 @@ func collectHeadlessEvents(run func(events chan<- agent.Event) error) (string, e
 
 	var text strings.Builder
 	var eventErr error
+	var incompleteReason string
 	for event := range events {
 		switch event.Kind {
 		case agent.EventTextDelta:
@@ -85,10 +86,17 @@ func collectHeadlessEvents(run func(events chan<- agent.Event) error) (string, e
 			if eventErr == nil {
 				eventErr = event.Err
 			}
+		case agent.EventLoopDone:
+			if agent.IsIncompleteStopReason(event.StopReason) {
+				incompleteReason = event.StopReason
+			}
 		}
 	}
 	if err := <-done; err != nil {
 		return text.String(), err
+	}
+	if eventErr == nil && incompleteReason != "" {
+		eventErr = fmt.Errorf("task incomplete: %s", incompleteReason)
 	}
 	return text.String(), eventErr
 }

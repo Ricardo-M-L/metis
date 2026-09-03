@@ -433,7 +433,11 @@ func (sn *session) handlePrompt(ctx context.Context, id any, p PromptParams) {
 		close(events)
 	}()
 
+	var incompleteReason string
 	for ev := range events {
+		if ev.Kind == agent.EventLoopDone && agent.IsIncompleteStopReason(ev.StopReason) {
+			incompleteReason = ev.StopReason
+		}
 		// Register permission asks so the next permission_reply can route to it.
 		if ev.Kind == agent.EventPermissionRequest && ev.ToolUseID != "" {
 			sn.permsMu.Lock()
@@ -445,6 +449,10 @@ func (sn *session) handlePrompt(ctx context.Context, id any, p PromptParams) {
 
 	if err := <-done; err != nil {
 		sn.write(Response{JSONRPC: "2.0", ID: id, Error: &ResponseError{Code: -32000, Message: err.Error()}})
+		return
+	}
+	if incompleteReason != "" {
+		sn.write(Response{JSONRPC: "2.0", ID: id, Error: &ResponseError{Code: -32000, Message: "task incomplete: " + incompleteReason}})
 		return
 	}
 	// A successful prompt is the protocol's durability boundary for both stdio
@@ -617,6 +625,7 @@ func eventToMap(ev agent.Event) map[string]any {
 		}
 	case agent.EventLoopDone:
 		m["stop_reason"] = ev.StopReason
+		m["incomplete"] = agent.IsIncompleteStopReason(ev.StopReason)
 	case agent.EventTokens:
 		m["input_tokens"] = ev.InputTokens
 		m["output_tokens"] = ev.OutputTokens

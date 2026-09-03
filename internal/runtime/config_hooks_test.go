@@ -132,6 +132,17 @@ func TestStructuredModelVisibleHookParsersReceiveRedactedStrings(t *testing.T) {
 				return mod.AdditionalContext
 			},
 		},
+		{
+			name: "post_tool_context",
+			body: map[string]any{"additional_context": "context " + secret},
+			extract: func(out []byte) string {
+				mod := parsePostToolUseResponse(out)
+				if mod == nil {
+					t.Fatal("post-tool response did not parse")
+				}
+				return mod.AdditionalContext
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

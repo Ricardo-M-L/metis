@@ -480,6 +480,35 @@ func TestToOpenAI_LegacyNilToolInputDoesNotPoisonLaterTurns(t *testing.T) {
 	}
 }
 
+func TestToOpenAI_SkipsAssistantStateWithNoChatWireContent(t *testing.T) {
+	req := Request{Messages: []Message{
+		{Role: RoleUser, Content: []ContentBlock{{Type: "text", Text: "before"}}},
+		{Role: RoleAssistant},
+		{Role: RoleAssistant, Content: []ContentBlock{{
+			Type: "provider_state", ProviderHint: map[string]string{"openai.responses.response_id": "resp-legacy"},
+		}}},
+		{Role: RoleAssistant, Content: []ContentBlock{{Type: "redacted_thinking", Data: "opaque"}}},
+		{Role: RoleUser, Content: []ContentBlock{{Type: "text", Text: "after"}}},
+	}}
+
+	wire := toOpenAI(req, "glm-compatible", 4096)
+	if len(wire.Messages) != 2 {
+		t.Fatalf("wire messages = %+v, want only the two user messages", wire.Messages)
+	}
+	for _, message := range wire.Messages {
+		if message.Role == "assistant" {
+			t.Fatalf("state-only assistant became an empty chat message: %+v", message)
+		}
+	}
+	body, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"role":"assistant","content":""`) {
+		t.Fatalf("wire contains poisoned empty assistant: %s", body)
+	}
+}
+
 func TestMarshalToolArguments_MarshalFailureFallsBackToObject(t *testing.T) {
 	got := marshalToolArguments(map[string]any{"unsupported": func() {}})
 	if got != "{}" {

@@ -1346,6 +1346,16 @@ drainLoop:
 		}
 		return wrapTimeoutErr(finalErr, timeout), nil
 	}
+	if agent.IsIncompleteStopReason(stopReason) {
+		if out == "" || isEmptyFinalStopReason(stopReason) {
+			out = fmt.Sprintf("(sub-agent finished without text output; stop_reason=%s)", stopReason)
+		}
+		incompleteErr := fmt.Errorf("sub-agent incomplete: %s", stopReason)
+		if teammate != nil {
+			teammate.Finish(agent.StatusFailed, out, incompleteErr, stopReason)
+		}
+		return &tools.Result{Output: out, IsError: true}, nil
+	}
 	if out == "" {
 		out = fmt.Sprintf("(sub-agent finished without text output; stop_reason=%s)", stopReason)
 	}
@@ -1477,6 +1487,12 @@ func (a Agent) executeBackground(
 		// Parent notifications and teammate.done must never precede it.
 		finalize()
 		final := teammateSnapshotOutput(teammate)
+		if finalErr == nil && agent.IsIncompleteStopReason(stopReason) {
+			if final == "" || isEmptyFinalStopReason(stopReason) {
+				final = fmt.Sprintf("(sub-agent finished without text output; stop_reason=%s)", stopReason)
+			}
+			finalErr = fmt.Errorf("sub-agent incomplete: %s", stopReason)
+		}
 		switch {
 		case finalErr == nil:
 			teammate.Finish(agent.StatusCompleted, final, nil, stopReason)
@@ -1605,6 +1621,10 @@ func notifyParent(ch chan<- agent.SubAgentNotification, t *agent.Teammate, dur t
 	}:
 	default:
 	}
+}
+
+func isEmptyFinalStopReason(stopReason string) bool {
+	return stopReason == "empty_final_answer" || stopReason == "provider_protocol_error"
 }
 
 // wrapTimeoutErr converts a sub-loop error into a user-readable

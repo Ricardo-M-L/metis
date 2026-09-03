@@ -301,6 +301,7 @@ func RunLoopCollectText(ctx context.Context, loop *agent.Loop, sessionID string)
 		close(events)
 	}()
 	var b strings.Builder
+	var incompleteReason string
 	for ev := range events {
 		switch ev.Kind {
 		case agent.EventTextDelta:
@@ -315,7 +316,15 @@ func RunLoopCollectText(ctx context.Context, loop *agent.Loop, sessionID string)
 			}
 		case agent.EventError:
 			// drain remaining events; the error also lands on done.
+		case agent.EventLoopDone:
+			if agent.IsIncompleteStopReason(ev.StopReason) {
+				incompleteReason = ev.StopReason
+			}
 		}
 	}
-	return b.String(), <-done
+	err := <-done
+	if err == nil && incompleteReason != "" {
+		err = &agent.IncompleteRunError{Reason: incompleteReason}
+	}
+	return b.String(), err
 }

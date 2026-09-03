@@ -2335,7 +2335,8 @@ func cmdRun(ctx context.Context, args []string) error {
 	// hits are always safe to replay verbatim.
 	var cacheKey string
 	cacheTTL := rtpkg.ParseRunCacheTTL(flags.runCacheTTL)
-	if flags.runCache || os.Getenv("METIS_RUN_CACHE") == "1" {
+	cacheRequested := flags.runCache || os.Getenv("METIS_RUN_CACHE") == "1"
+	if shouldUseRunCache(cacheRequested, flags.outputSchema) {
 		cacheKey = rtpkg.RunCacheKey(rt.model, rt.cfg.Provider.Default, rt.loop.System, prompt)
 		if hit, _ := rtpkg.LookupRunCache(cacheKey); hit != nil {
 			fmt.Print(hit.Response)
@@ -2344,6 +2345,12 @@ func cmdRun(ctx context.Context, args []string) error {
 				time.Since(hit.CreatedAt).Round(time.Second))
 			return nil
 		}
+	} else if cacheRequested {
+		// A schema changes both the request contract and the definition of a
+		// valid response. The legacy cache key contains neither, and correction
+		// turns can replace the first candidate, so bypass caching rather than
+		// replaying or persisting unvalidated text.
+		fmt.Fprintln(os.Stderr, "[cache] disabled with --output-schema (schema-constrained responses are not replay-safe)")
 	}
 
 	// 2026-05-22: wait for MCP launcher to settle BEFORE we hand the
@@ -2706,18 +2713,17 @@ func cmdRun(ctx context.Context, args []string) error {
 			if finalStop == "" {
 				finalStop = "done"
 			}
-			// Phase A — incomplete classification. These three abort
+			// Incomplete classification. These abort
 			// reasons mean the loop stopped before the model confirmed
 			// the task was done; pre-fix the wrapper saw exit 0 here.
 			// "halted_by_hook" is NOT in this list because hooks are
 			// user/operator-installed and a halt is intentional, not
 			// a failure signal. "plan_mode" is also a deliberate stop,
-			// not an abort. Keep this switch explicit (not a default
+			// not an abort. Keep the shared classifier explicit (not a default
 			// branch) — silently flagging unknown reasons as incomplete
 			// would block legitimate provider-side stop reasons we
 			// haven't enumerated yet.
-			switch finalStop {
-			case "diminishing_returns", "max_iterations", "loop_detected", "stuck_after_reset", "turn_wall_clock", "budget_usd":
+			if agent.IsIncompleteStopReason(finalStop) {
 				incompleteReason = finalStop
 				incompleteDetail = lastInfoText
 			}
@@ -2762,6 +2768,20 @@ func cmdRun(ctx context.Context, args []string) error {
 		}
 	}
 	err = <-done
+	// Abort before schema correction or cache persistence. A provider failure
+	// is not a malformed candidate answer: asking for schema retries wastes
+	// calls, and caching the local fallback would convert the next invocation
+	// into a false cache-hit success.
+	if err == nil && incompleteReason != "" {
+		fmt.Fprintf(os.Stderr, "\n[metis] TASK INCOMPLETE — reason: %s\n", incompleteReason)
+		if incompleteDetail != "" {
+			fmt.Fprintf(os.Stderr, "[metis] detail: %s\n", incompleteDetail)
+		}
+		return runTerminalError(incompleteReason, incompleteDetail)
+	}
+	if err != nil {
+		return err
+	}
 
 	// --output-schema: validate the final reply; invalid output buys
 	// the model up to MaxSchemaRetries correction turns carrying the
@@ -2776,6 +2796,10 @@ func cmdRun(ctx context.Context, args []string) error {
 			rt.loop.AppendUser(schemaEnforcer.RetryMessage(verr))
 			finalText, err = rtpkg.RunLoopCollectText(ctx, rt.loop, rt.sessionID)
 			if err != nil {
+				var incompleteErr *agent.IncompleteRunError
+				if errors.As(err, &incompleteErr) {
+					return runTerminalError(incompleteErr.Reason, "schema correction stopped before a complete response")
+				}
 				return err
 			}
 			validated, verr = schemaEnforcer.Validate(finalText)
@@ -2793,7 +2817,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	// cache would re-emit observations of a world that may have
 	// changed since. Errors during save go to stderr but don't break
 	// the run (cache is best-effort).
-	if cacheKey != "" && err == nil && !usedToolsThisRun && cacheTextBuf.Len() > 0 {
+	if cacheKey != "" && err == nil && incompleteReason == "" && !usedToolsThisRun && cacheTextBuf.Len() > 0 {
 		ttlSecs := int(cacheTTL.Seconds())
 		entry := &rtpkg.RunCacheEntry{
 			PromptHash: cacheKey,
@@ -2823,26 +2847,21 @@ func cmdRun(ctx context.Context, args []string) error {
 	if rt.autoMemExtractor != nil {
 		waitForkInflight(120 * time.Second)
 	}
-	// Phase A — surface incomplete aborts to wrapper scripts via the
-	// process exit code. Only overrides the success path: if a real
-	// error already fired (err != nil from the goroutine), keep that
-	// one — it carries more diagnostic info than the bare incomplete
-	// reason. Stderr lines use a stable "[metis] TASK INCOMPLETE"
-	// marker so CI greps can match without parsing the detail.
-	if err == nil && incompleteReason != "" {
-		fmt.Fprintf(os.Stderr, "\n[metis] TASK INCOMPLETE — reason: %s\n", incompleteReason)
-		if incompleteDetail != "" {
-			fmt.Fprintf(os.Stderr, "[metis] detail: %s\n", incompleteDetail)
-		}
-		return &exitcode.IncompleteError{Reason: incompleteReason, Detail: incompleteDetail}
-	}
-	if err != nil {
-		return err
-	}
 	// A clean one-shot run is a durability boundary. Successful exchanges
 	// below the normal cadence are still only pending at this point; register
 	// and join them before Cleanup destructively cancels residual jobs.
 	return rt.persistHeadlessMemoryBoundary("metis run", runtimeDistillationShutdownGrace)
+}
+
+func shouldUseRunCache(requested bool, outputSchema string) bool {
+	return requested && strings.TrimSpace(outputSchema) == ""
+}
+
+func runTerminalError(reason, detail string) error {
+	if agent.IsContentFilterStopReason(reason) {
+		return fmt.Errorf("content_filter: provider stopped generation (%s)", reason)
+	}
+	return &exitcode.IncompleteError{Reason: reason, Detail: detail}
 }
 
 // waitForkInflight blocks until agent.ForkInflight() returns 0 or the
@@ -3476,6 +3495,7 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	// authorization, so we can nudge the user once at the end ("N blocked,
 	// run `cron denied`") instead of staying silent like the old auto-deny.
 	cronDeniedCount := 0
+	loopStopReason := ""
 
 	for ev := range events {
 		switch ev.Kind {
@@ -3562,6 +3582,7 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 				ev.AskUserReply <- ""
 			}
 		case agent.EventLoopDone:
+			loopStopReason = ev.StopReason
 			if !job.Silent {
 				fmt.Println()
 			}
@@ -3576,6 +3597,9 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 		}
 	}
 	runErr := <-done
+	if runErr == nil && agent.IsIncompleteStopReason(loopStopReason) {
+		runErr = &exitcode.IncompleteError{Reason: loopStopReason}
+	}
 	if runErr == nil {
 		runErr = rt.persistHeadlessMemoryBoundary("cron job "+job.ID, runtimeDistillationShutdownGrace)
 	}

@@ -360,27 +360,8 @@ func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt stri
 		close(events)
 	}()
 
-	var sb strings.Builder
-	for ev := range events {
-		switch ev.Kind {
-		case agent.EventTextDelta:
-			sb.WriteString(ev.TextDelta)
-
-		case agent.EventPermissionRequest:
-			// No interactive approval is possible in MCP server context.
-			// Auto-deny to unblock the loop. Under the default bypass mode
-			// this branch is never reached; it guards explicit --mode ask/acceptEdits.
-			ev.PermissionReply <- agent.PermissionDecisionDeny
-
-		case agent.EventAskUser:
-			// Return empty answer so AskUser tool completes without hanging.
-			if ev.AskUserReply != nil {
-				ev.AskUserReply <- ""
-			}
-		}
-	}
-
-	if err := <-done; err != nil {
+	result, err := collectMCPTaskEvents(events, done)
+	if err != nil {
 		return "", err
 	}
 	// Each MCP request owns a fresh serialized runtime. Scope the durability
@@ -389,5 +370,37 @@ func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt stri
 	if err := rt.persistHeadlessMemoryBoundary("metis mcp-serve run_task", runtimeDistillationShutdownGrace); err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(sb.String()), nil
+	return result, nil
+}
+
+func collectMCPTaskEvents(events <-chan agent.Event, done <-chan error) (string, error) {
+	var text strings.Builder
+	var incompleteReason string
+	for ev := range events {
+		switch ev.Kind {
+		case agent.EventTextDelta:
+			text.WriteString(ev.TextDelta)
+		case agent.EventLoopDone:
+			if agent.IsIncompleteStopReason(ev.StopReason) {
+				incompleteReason = ev.StopReason
+			}
+		case agent.EventPermissionRequest:
+			// No interactive approval is possible in MCP server context.
+			// Auto-deny to unblock the loop. Under the default bypass mode
+			// this branch is never reached; it guards explicit --mode ask/acceptEdits.
+			ev.PermissionReply <- agent.PermissionDecisionDeny
+		case agent.EventAskUser:
+			// Return empty answer so AskUser tool completes without hanging.
+			if ev.AskUserReply != nil {
+				ev.AskUserReply <- ""
+			}
+		}
+	}
+	if err := <-done; err != nil {
+		return "", err
+	}
+	if incompleteReason != "" {
+		return "", fmt.Errorf("task incomplete: %s", incompleteReason)
+	}
+	return strings.TrimSpace(text.String()), nil
 }

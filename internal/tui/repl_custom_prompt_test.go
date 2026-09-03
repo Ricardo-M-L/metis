@@ -48,6 +48,15 @@ func TestPlainREPL_CustomPromptRunsWithoutEchoingExpandedBody(t *testing.T) {
 	}
 }
 
+func TestPlainREPL_EmptyFinalReturnsIncomplete(t *testing.T) {
+	r, _ := newPromptTestREPL("", slash.NewRegistry())
+	r.Loop.AppendUser("produce an answer")
+	err := r.runTurn(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "task incomplete: empty_final_answer") {
+		t.Fatalf("runTurn error = %v, want empty_final_answer", err)
+	}
+}
+
 func TestPlainREPL_ReviewKeepsInternalFrameOutOfStdoutAndExport(t *testing.T) {
 	registry := slash.NewRegistry()
 	slash.RegisterAll(registry, &config.Config{})

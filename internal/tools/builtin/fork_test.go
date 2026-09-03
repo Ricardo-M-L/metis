@@ -105,6 +105,28 @@ func TestFork_InheritsAndReturnsText(t *testing.T) {
 	}
 }
 
+func TestFork_EmptyFinalIsError(t *testing.T) {
+	provider := &fakeProvider{events: []llm.StreamEvent{
+		{Type: "message_delta", StopReason: "end_turn"},
+		{Type: "message_stop"},
+	}}
+	tool := NewFork(permission.New(permission.ModeBypass), provider, tools.NewRegistry())
+	ctx := agent.WithParentSnapshot(context.Background(), agent.ParentSnapshot{
+		System: "test-system",
+		Model:  "test-model",
+		Messages: []llm.Message{
+			{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "hi"}}},
+		},
+	})
+	res, err := tool.Execute(ctx, map[string]any{"directive": "finish the task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Output, "without text output") {
+		t.Fatalf("empty fork completion must be an error result: %+v", res)
+	}
+}
+
 func TestFork_NestingLimitEnforced(t *testing.T) {
 	tool := NewFork(permission.New(permission.ModeBypass), helloForkProvider(), tools.NewRegistry())
 	ctx := agent.WithParentSnapshot(context.Background(), agent.ParentSnapshot{

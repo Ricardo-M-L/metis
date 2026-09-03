@@ -4,9 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/agent"
 )
+
+func TestCollectMCPTaskEventsRejectsIncompleteTerminal(t *testing.T) {
+	events := make(chan agent.Event, 2)
+	events <- agent.Event{Kind: agent.EventTextDelta, TextDelta: "partial"}
+	events <- agent.Event{Kind: agent.EventLoopDone, StopReason: "max_tokens"}
+	close(events)
+	done := make(chan error, 1)
+	done <- nil
+
+	result, err := collectMCPTaskEvents(events, done)
+	if err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("error = %v, want max_tokens incomplete", err)
+	}
+	if result != "" {
+		t.Fatalf("incomplete MCP result = %q, want no successful payload", result)
+	}
+}
 
 func TestMCPRuntimeRunGatePreventsTraceAdapterReplacement(t *testing.T) {
 	gate := newMCPRuntimeRunGate()

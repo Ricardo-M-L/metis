@@ -297,6 +297,12 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	}
 
 	out := strings.TrimSpace(output.String())
+	if agent.IsIncompleteStopReason(stopReason) {
+		if out == "" || isEmptyFinalStopReason(stopReason) {
+			out = fmt.Sprintf("(forked child finished without text output; stop_reason=%s)", stopReason)
+		}
+		return &tools.Result{Output: out, IsError: true}, nil
+	}
 	if out == "" {
 		out = fmt.Sprintf("(forked child finished without text output; stop_reason=%s)", stopReason)
 	}

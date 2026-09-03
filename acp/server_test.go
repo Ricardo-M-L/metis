@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -241,6 +242,43 @@ func TestACP_PromptHappyPath(t *testing.T) {
 		t.Error("expected loop_done notification")
 	}
 
+	w.Close()
+}
+
+func TestACP_PromptIncompleteReturnsJSONRPCError(t *testing.T) {
+	_, w, sc := newTestServer(t, &fakeProvider{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: "partial"},
+		{Type: "message_delta", StopReason: "max_tokens"},
+		{Type: "message_stop"},
+	}})
+
+	sendRequest(t, w, 9, "prompt", map[string]any{"prompt": "answer"})
+	var sawIncompleteEvent bool
+	for {
+		m := readJSON(t, sc, 3*time.Second)
+		if m["method"] == "session_update" {
+			params, _ := m["params"].(map[string]any)
+			if params["kind"] == "loop_done" && params["incomplete"] == true {
+				sawIncompleteEvent = true
+			}
+			continue
+		}
+		id, _ := m["id"].(float64)
+		if int(id) != 9 {
+			continue
+		}
+		errObj, ok := m["error"].(map[string]any)
+		if !ok || !strings.Contains(fmt.Sprint(errObj["message"]), "max_tokens") {
+			t.Fatalf("incomplete prompt response = %+v", m)
+		}
+		if m["result"] != nil {
+			t.Fatalf("incomplete prompt returned success result: %+v", m)
+		}
+		break
+	}
+	if !sawIncompleteEvent {
+		t.Fatal("ACP stream omitted incomplete loop_done metadata")
+	}
 	w.Close()
 }
 
@@ -647,5 +685,16 @@ func TestACP_EventToMapAllKinds(t *testing.T) {
 		if _, ok := m["kind"].(string); !ok {
 			t.Errorf("event %v: missing kind", ev.Kind)
 		}
+	}
+}
+
+func TestACP_LoopDoneMarksIncompleteOutcome(t *testing.T) {
+	failed := eventToMap(agent.Event{Kind: agent.EventLoopDone, StopReason: "empty_final_answer"})
+	if incomplete, ok := failed["incomplete"].(bool); !ok || !incomplete {
+		t.Fatalf("incomplete loop_done map = %+v", failed)
+	}
+	succeeded := eventToMap(agent.Event{Kind: agent.EventLoopDone, StopReason: "end_turn"})
+	if incomplete, ok := succeeded["incomplete"].(bool); !ok || incomplete {
+		t.Fatalf("successful loop_done map = %+v", succeeded)
 	}
 }

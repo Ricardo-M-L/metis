@@ -22,8 +22,9 @@ import (
 // registers each user-declared hook into the live HookRegistry. Mirrors
 // claude-code's settings.json hook model — each lifecycle event maps to
 // one or more shell commands that receive a JSON payload on stdin and
-// (for PreToolUse) can return a JSON response on stdout to short-circuit
-// or rewrite the tool call.
+// can return a JSON response on stdout. PreToolUse may short-circuit or
+// rewrite a call; PostToolUse and PostCompact may contribute model context.
+// PostToolUse feedback is additionally bounded by the public hook registry.
 //
 // First-pass scope: type="command" only. type="http", type="agent",
 // type="prompt" are accepted in the schema but skipped here — adding
@@ -100,23 +101,28 @@ func LoadConfigHooks(reg *pubhook.Registry, cfg *config.HooksConfig) {
 		if !isCommandType(spec.Type) {
 			continue
 		}
-		reg.Register(pubhook.PostToolUseHandler(func(ctx context.Context, tc pubhook.Context, in *pubhook.PostToolUse) {
+		reg.Register(pubhook.PostToolUseContextHandler(func(ctx context.Context, tc pubhook.Context, in *pubhook.PostToolUse) *pubhook.ModifiedPostToolUse {
 			if !matchTool(spec.If, in.Tool, in.Input) {
-				return
+				return nil
 			}
 			payload := map[string]any{
-				"hook_event_name": "PostToolUse",
-				"session_id":      tc.SessionID,
-				"model":           tc.Model,
-				"turn":            tc.Turn,
-				"tool_name":       in.Tool,
-				"tool_input":      in.Input,
-				"output":          in.Output,
-				"is_error":        in.IsError,
+				"hook_event_name":   "PostToolUse",
+				"session_id":        tc.SessionID,
+				"model":             tc.Model,
+				"turn":              tc.Turn,
+				"tool_use_id":       pubhook.PostToolUseIDFromContext(ctx),
+				"tool_name":         in.Tool,
+				"tool_input":        in.Input,
+				"output":            in.Output,
+				"is_error":          in.IsError,
+				"working_directory": cwdOrEmpty(),
 			}
-			if _, err := runHookCommand(ctx, spec, payload); err != nil {
+			out, err := runHookCommand(ctx, spec, payload)
+			if err != nil {
 				logHookCommandError("PostToolUse", spec, payload, err)
+				return nil
 			}
+			return parsePostToolUseResponse(out)
 		}))
 	}
 	for _, h := range cfg.SessionStart {
@@ -360,6 +366,41 @@ func parsePostCompactResponse(out []byte) *pubhook.ModifiedPostCompact {
 		return nil
 	}
 	return &pubhook.ModifiedPostCompact{AdditionalContext: v.AdditionalContext}
+}
+
+// parsePostToolUseResponse accepts both Metis' flat response and the
+// Claude-compatible hook envelope:
+//
+//	{"additional_context":"..."}
+//	{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}
+//
+// Empty or malformed output keeps the hook observer-only.
+func parsePostToolUseResponse(out []byte) *pubhook.ModifiedPostToolUse {
+	out = trimBOM(out)
+	if len(strings.TrimSpace(string(out))) == 0 {
+		return nil
+	}
+	var v struct {
+		AdditionalContext  string `json:"additional_context"`
+		HookSpecificOutput *struct {
+			HookEventName     string `json:"hookEventName"`
+			AdditionalContext string `json:"additionalContext"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal(out, &v); err != nil {
+		return nil
+	}
+	additionalContext := v.AdditionalContext
+	if v.HookSpecificOutput != nil {
+		if v.HookSpecificOutput.HookEventName != "" && v.HookSpecificOutput.HookEventName != "PostToolUse" {
+			return nil
+		}
+		additionalContext = v.HookSpecificOutput.AdditionalContext
+	}
+	if strings.TrimSpace(additionalContext) == "" {
+		return nil
+	}
+	return &pubhook.ModifiedPostToolUse{AdditionalContext: additionalContext}
 }
 
 func isCommandType(t string) bool {

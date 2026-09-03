@@ -1006,6 +1006,44 @@ func TestResponses_StreamIncompleteMaxTokens(t *testing.T) {
 	}
 }
 
+func TestResponses_StreamIncompleteContentFilterIsNotStopSequence(t *testing.T) {
+	h := newResponsesHarness(t, []string{
+		`{"type":"response.output_text.delta","delta":"partial"}`,
+		`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}`,
+	})
+	p := newResponsesClient(h)
+	stream, err := p.Stream(context.Background(), provider.Request{Stream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := drainStream(t, stream)
+	var stop string
+	for _, event := range events {
+		if event.Type == "message_delta" {
+			stop = event.StopReason
+		}
+	}
+	if stop != "content_filter" {
+		t.Fatalf("stop = %q, want content_filter; events=%+v", stop, events)
+	}
+}
+
+func TestResponses_CompleteIncompleteContentFilter(t *testing.T) {
+	h := newResponsesHarness(t, nil)
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}`))
+	})
+	p := newResponsesClient(h)
+	result, err := p.Complete(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StopReason != "content_filter" {
+		t.Fatalf("stop = %q, want content_filter", result.StopReason)
+	}
+}
+
 func TestResponses_StreamFailed(t *testing.T) {
 	h := newResponsesHarness(t, []string{
 		`{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"out of capacity"}}}`,

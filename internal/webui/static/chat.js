@@ -13,6 +13,7 @@ let turnRunning = false;
 let runningSessionId = null;
 let stopRequestPending = false;
 let runningTurnNeedsHistorySync = false;
+let runningTurnIncompleteReason = '';
 let queuedTurns = [];
 let queuedSessionId = null;
 let drainingQueuedTurns = false;
@@ -73,7 +74,11 @@ function connectEvents() {
   onLive('redacted_thinking', () => handleRedactedThinking());
   onLive('permission_request', handlePermissionRequest);
   onLive('turn_end', endStreamingMessage);
-  onLive('loop_done', finishUserTurn);
+  onLive('loop_done', d => {
+    runningTurnIncompleteReason = d.incomplete ? (d.stopReason || 'incomplete') : '';
+    if (runningTurnIncompleteReason) showToast('Turn incomplete: ' + runningTurnIncompleteReason);
+    finishUserTurn();
+  });
   onLive('agent_error', d => showToast('Agent error: ' + (d.message || 'request failed')));
   eventSource.addEventListener('error', () => {
     showReconnectBanner();
@@ -792,6 +797,7 @@ function finishUserTurn() {
 // Called at the start of each user turn to reset per-turn stream state.
 function beginUserTurn() {
   streamedTextThisTurn = false;
+  runningTurnIncompleteReason = '';
   // If the previous turn's turn_end never arrived (SSE drop/reconnect),
   // its streaming flag is still set and the next answer would stream INTO
   // the previous assistant bubble. Close it first - idempotent when the
@@ -805,6 +811,7 @@ function beginUserTurn() {
 // into the next (timer, pending question, tool details, thinking row).
 function resetTurnState() {
   clearTodoPlan();
+  runningTurnIncompleteReason = '';
   compactionInFlight = false;
   compactionStatusEl = null;
   endTurnStatus();
@@ -1730,12 +1737,14 @@ async function drainQueuedTurns() {
   drainingQueuedTurns = true;
   const item = queuedTurns.shift();
   renderQueuedTurns();
+  let succeeded = false;
   try {
-    await runTurnItem(item);
+    succeeded = await runTurnItem(item);
   } finally {
     drainingQueuedTurns = false;
     if (!queuedTurns.length) queuedSessionId = null;
-    else if (currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
+    else if (succeeded && currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
+    else if (!succeeded) showToast('Queued messages paused after an incomplete or failed turn');
   }
 }
 
@@ -1762,6 +1771,7 @@ async function runTurnItem(item) {
   const images = item.images || [];
   const turnSessionId = currentSessionId;
   let resolvedTurnSessionId = turnSessionId;
+  let turnSucceeded = false;
 
   // Hide welcome
   const welcome = document.getElementById('welcomeScreen');
@@ -1782,6 +1792,7 @@ async function runTurnItem(item) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
+    if (runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
     resolvedTurnSessionId = data.sessionId || turnSessionId;
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
     if (!currentSessionId || currentSessionId === turnSessionId) {
@@ -1803,6 +1814,7 @@ async function runTurnItem(item) {
     }
     if (viewingTurn && data.stopped) showToast('Turn stopped');
     await loadSessions();
+    turnSucceeded = true;
   } catch (e) {
     const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
     if (viewingTurn) showError(e.message || 'The request failed.');
@@ -1816,11 +1828,14 @@ async function runTurnItem(item) {
     runningTurnNeedsHistorySync = false;
     updateSendBtn();
     loadSessionStatsbar();
-    if (queuedTurns.length && !drainingQueuedTurns) {
+    if (turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
       if (!queuedSessionId || currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
       else showToast('Queued messages are waiting in the completed session');
+    } else if (!turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
+      showToast('Queued messages paused after an incomplete or failed turn');
     }
   }
+  return turnSucceeded;
 }
 
 const MESSAGE_ACTION_ICONS = {

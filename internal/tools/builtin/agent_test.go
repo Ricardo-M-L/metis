@@ -173,4 +173,7 @@ func TestAgentTool_EmptyOutputFallback(t *testing.T) {
 	if !strings.Contains(res.Output, "without text output") {
 		t.Errorf("expected fallback message, got %q", res.Output)
 	}
+	if !res.IsError {
+		t.Errorf("empty sub-agent completion must be an error result: %+v", res)
+	}
 }

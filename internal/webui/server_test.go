@@ -65,10 +65,11 @@ func (p *noVisionTurnProvider) streamCalls() int {
 }
 
 type statusTestStream struct {
-	ctx     context.Context
-	started chan struct{}
-	once    sync.Once
-	done    bool
+	ctx      context.Context
+	started  chan struct{}
+	once     sync.Once
+	sentText bool
+	done     bool
 }
 
 func (s *statusTestStream) Recv() (llm.StreamEvent, error) {
@@ -80,6 +81,10 @@ func (s *statusTestStream) Recv() (llm.StreamEvent, error) {
 	if s.done {
 		return llm.StreamEvent{}, io.EOF
 	}
+	if !s.sentText {
+		s.sentText = true
+		return llm.StreamEvent{Type: "text_delta", TextDelta: "done"}, nil
+	}
 	s.done = true
 	return llm.StreamEvent{Type: "message_stop", StopReason: "end_turn"}, nil
 }
@@ -89,6 +94,19 @@ func (s *statusTestStream) Close() error { return nil }
 type statusTestProvider struct {
 	activationTestProvider
 	started chan struct{}
+}
+
+type incompleteTurnProvider struct {
+	activationTestProvider
+	stopReason string
+}
+
+func (p *incompleteTurnProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return &composerSummaryStream{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: "partial answer"},
+		{Type: "message_delta", StopReason: p.stopReason},
+		{Type: "message_stop"},
+	}}, nil
 }
 
 func (p *statusTestProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamReader, error) {
@@ -205,6 +223,7 @@ func (p *cwdCaptureProvider) Stream(context.Context, llm.Request) (llm.StreamRea
 		}}, nil
 	}
 	return &composerSummaryStream{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: "workspace captured"},
 		{Type: "message_stop", StopReason: "end_turn"},
 	}}, nil
 }
@@ -1158,6 +1177,47 @@ func TestFailedTurnPersistsDurableSessionStatus(t *testing.T) {
 	}
 	if hdr.Status != "failed" {
 		t.Fatalf("durable status = %q, want failed", hdr.Status)
+	}
+}
+
+func TestIncompleteTurnReturnsFailureAndPersistsFailedStatus(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &incompleteTurnProvider{
+		activationTestProvider: activationTestProvider{name: "wire", model: "model"},
+		stopReason:             "max_tokens",
+	}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.Model = "model"
+	const id = "incomplete-turn-status"
+	if err := store.WriteHeaderFull(session.Header{ID: id, Provider: "wire", Model: "model", System: "system", Status: "idle"}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{ProviderName: "wire", InitialSessionID: id})
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/turns", bytes.NewBufferString(`{"sessionId":"incomplete-turn-status","input":"hello"}`)))
+	if rr.Code != http.StatusBadGateway || !strings.Contains(rr.Body.String(), "max_tokens") {
+		t.Fatalf("turn status = %d, want 502 max_tokens: %s", rr.Code, rr.Body.String())
+	}
+	hdr, _, err := store.LoadHeader(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Status != "failed" {
+		t.Fatalf("durable status = %q, want failed", hdr.Status)
+	}
+}
+
+func TestLoopDoneSSEMarksIncompleteReason(t *testing.T) {
+	w := httptest.NewRecorder()
+	(&Server{}).writeHubEvent(w, hubEvent{sequence: 1, session: "s", ev: agent.Event{
+		Kind: agent.EventLoopDone, StopReason: "content_filter",
+	}})
+	body := w.Body.String()
+	if !strings.Contains(body, `"stopReason":"content_filter"`) || !strings.Contains(body, `"incomplete":true`) {
+		t.Fatalf("loop_done SSE omitted incomplete terminal metadata: %s", body)
 	}
 }
 

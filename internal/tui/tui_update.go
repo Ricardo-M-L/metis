@@ -1097,7 +1097,11 @@ func runTurnAsync(
 		})
 		close(events)
 	}()
+	var incompleteReason string
 	for ev := range events {
+		if ev.Kind == agent.EventLoopDone && agent.IsIncompleteStopReason(ev.StopReason) {
+			incompleteReason = ev.StopReason
+		}
 		// Forward to the TUI, but never wedge here on a full eventCh: if the
 		// consumer (bubbletea Update) has stopped draining — frozen, quitting,
 		// or the turn was cancelled — a blocking `eventCh <- ev` would leak
@@ -1114,5 +1118,9 @@ func runTurnAsync(
 			// next iterations fall through the Err() drain above
 		}
 	}
-	doneCh <- <-done
+	runErr := <-done
+	if runErr == nil && incompleteReason != "" {
+		runErr = fmt.Errorf("task incomplete: %s", incompleteReason)
+	}
+	doneCh <- runErr
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -222,5 +223,19 @@ func TestCollectHeadlessEventsClosesAfterRunnerCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("headless event collector remained blocked after runner cancellation")
+	}
+}
+
+func TestCollectHeadlessEventsRejectsIncompleteTerminal(t *testing.T) {
+	text, err := collectHeadlessEvents(func(events chan<- agent.Event) error {
+		events <- agent.Event{Kind: agent.EventTextDelta, TextDelta: "partial"}
+		events <- agent.Event{Kind: agent.EventLoopDone, StopReason: "max_tokens"}
+		return nil
+	})
+	if text != "partial" {
+		t.Fatalf("text = %q, want partial", text)
+	}
+	if err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("error = %v, want max_tokens incomplete", err)
 	}
 }

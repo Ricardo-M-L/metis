@@ -57,6 +57,7 @@ func (p *cronPermissionProvider) Stream(context.Context, llm.Request) (llm.Strea
 		}}, nil
 	}
 	return &cronPermissionStream{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: "done"},
 		{Type: "message_delta", StopReason: "end_turn"},
 		{Type: "message_stop"},
 	}}, nil

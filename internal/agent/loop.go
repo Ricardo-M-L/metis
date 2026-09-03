@@ -1501,7 +1501,17 @@ func (l *Loop) IterIdx() int {
 //  7. executeBatch → results
 //  8. Append assistant + tool_results, emit TurnEnd
 //  9. Loop-detect / max-iter / grace-call checks
-func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
+func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
+	// A provider can finish at the same instant the caller cancels. Terminal
+	// events are cancellation-aware and may be dropped to avoid wedging a dead
+	// consumer, so the return value is the authoritative fail-closed boundary:
+	// never report success from a context that is already canceled.
+	defer func() {
+		if runErr == nil && ctx != nil && ctx.Err() != nil {
+			runErr = ctx.Err()
+		}
+	}()
+
 	// Custom-command `allowed-tools` are one-turn pre-approvals. Install them
 	// under a unique source and remove that exact source on every exit path;
 	// later interactive approvals must survive this cleanup.
@@ -1816,11 +1826,61 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			})
 			l.Budget.AddUsage(usage.in, usage.out, usage.cacheRead, usage.cacheCreate)
 		}
+		// A rescue request advertised no tools. If a provider nevertheless
+		// returns a tool_use block, never dispatch it: doing so would violate the
+		// request boundary and make the supposedly final rescue perform a new
+		// external effect. Preserve any visible prose, but strip the unexpected
+		// calls from provider-visible history.
+		if requestWithoutTools && containsToolUseBlock(assistant) {
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: "(provider emitted tool_use for a tool-less rescue request — refusing the calls)",
+			})
+			withoutTools := assistant[:0]
+			for _, block := range assistant {
+				// A provider-managed continuation marker for a response that
+				// contains an unaccepted call is poisoned too: replaying its
+				// previous_response_id would ask the server to continue an
+				// unresolved function call on the next user turn.
+				if block.Type != "tool_use" && block.Type != "provider_state" {
+					withoutTools = append(withoutTools, block)
+				}
+			}
+			assistant = withoutTools
+			stop = "provider_protocol_error"
+		}
+		// A filtered, truncated, or otherwise incomplete provider response does
+		// not authorize calls even if it happened to include well-formed tool_use
+		// blocks. Drop both the calls and provider-managed continuation marker so
+		// the next user turn cannot resume an unaccepted server-side call.
+		if IsIncompleteStopReason(stop) && containsToolUseBlock(assistant) {
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: fmt.Sprintf("(provider stopped with %s while emitting tool calls — refusing the calls)", stop),
+			})
+			withoutTools := assistant[:0]
+			for _, block := range assistant {
+				if block.Type != "tool_use" && block.Type != "provider_state" {
+					withoutTools = append(withoutTools, block)
+				}
+			}
+			assistant = withoutTools
+		}
 
-		l.mu.Lock()
-		l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
-		l.storeActiveContextSnapshotLocked(usage, contextAnchor)
-		l.mu.Unlock()
+		// Do not persist a truly empty, zero-block assistant message. Besides
+		// leaving a blank turn in local history, OpenAI-compatible serializers
+		// replay it as `content:""` in the rescue request; several gateways then
+		// return a second empty completion. Non-presentational blocks such as
+		// provider_state, thinking, and redacted_thinking remain essential for
+		// stateful continuation and must be retained even though they still trigger
+		// the user-facing-text rescue below.
+		retainAssistant := len(assistant) > 0
+		if retainAssistant {
+			l.mu.Lock()
+			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
+			l.storeActiveContextSnapshotLocked(usage, contextAnchor)
+			l.mu.Unlock()
+		}
 
 		// Provider stop-reason defense (2026-05-18, session 8cfc076b).
 		// MiniMax / some OpenAI-compatible gateways report
@@ -1843,8 +1903,44 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			})
 			stop = "tool_use"
 		}
+		// The inverse mismatch is unsafe too: a provider may claim tool_use but
+		// emit no structured call. Treat visible prose as an end_turn answer;
+		// otherwise stop with a distinct protocol failure rather than sending a
+		// follow-up that could restore tools after a malformed boundary.
+		if stop == "tool_use" && !containsToolUseBlock(assistant) {
+			emit(ctx, out, Event{
+				Kind: EventInfo,
+				Info: "(provider reported stop_reason=\"tool_use\" without a tool_use block)",
+			})
+			if hasUserFacingText(assistant) {
+				stop = "end_turn"
+			} else {
+				stop = "provider_protocol_error"
+			}
+		}
 
-		if stop != "tool_use" && l.RecoverTextToolCalls && !textToolCallRescued {
+		if requestWithoutTools && stop != "tool_use" && l.RecoverTextToolCalls {
+			if toolName, ok := recoverableTextToolCallName(assistant, l.Registry); ok {
+				stop = "provider_protocol_error"
+				emit(ctx, out, Event{
+					Kind: EventInfo,
+					Info: fmt.Sprintf("(provider emitted plain-text tool call for %s during a tool-less rescue — refusing the call)", toolName),
+				})
+			}
+		}
+		// Incomplete provider terminals are authoritative. Do not send rescue,
+		// contract, todo, or text-tool-recovery turns that could regain tools and
+		// perform effects after truncation or filtering. Partial prose already
+		// emitted remains visible, while every caller receives a non-success
+		// EventLoopDone reason.
+		if IsIncompleteStopReason(stop) {
+			stopReason = stop
+			l.Hooks.EmitLoopEnd(ctx, tc, stop)
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: stop})
+			return nil
+		}
+
+		if !requestWithoutTools && stop != "tool_use" && l.RecoverTextToolCalls && !textToolCallRescued {
 			if toolName, ok := recoverableTextToolCallName(assistant, l.Registry); ok {
 				textToolCallRescued = true
 				l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
@@ -1878,23 +1974,40 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			// Bug B rescue: model declared end_turn but emitted no
 			// user-facing text. See empty_stop_rescue.go for why this
 			// happens and the 2026-05-14 session that motivated it.
-			// One nudge per turn — if the rescue iteration ALSO emits
-			// empty text, accept the stop (something upstream is broken
-			// and looping costs tokens for no value).
-			if !emptyStopRescued && !hasUserFacingText(assistant) {
-				emptyStopRescued = true
-				nudge := llm.Message{
-					Role:    llm.RoleUser,
-					Content: []llm.ContentBlock{{Type: "text", Text: emptyStopRescueMessage}},
+			// One tool-less nudge per turn. A second empty stop is surfaced as
+			// an incomplete provider result instead of a successful blank turn.
+			if !hasUserFacingText(assistant) {
+				if !emptyStopRescued {
+					emptyStopRescued = true
+					l.mu.Lock()
+					l.Messages = append(l.Messages, llm.Message{
+						Role:    llm.RoleUser,
+						Content: []llm.ContentBlock{{Type: "text", Text: emptyStopRescueMessage}},
+					})
+					l.rescueNoTools = true
+					l.mu.Unlock()
+					emit(ctx, out, Event{
+						Kind: EventInfo,
+						Info: "(empty-final-answer rescue: requesting one tool-less summary)",
+					})
+					continue
 				}
+
+				stopReason = "empty_final_answer"
 				l.mu.Lock()
-				l.Messages = append(l.Messages, nudge)
+				l.Messages = append(l.Messages, llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: []llm.ContentBlock{{Type: "text", Text: emptyStopFallbackMessage}},
+				})
 				l.mu.Unlock()
+				emit(ctx, out, Event{Kind: EventTextDelta, TextDelta: emptyStopFallbackMessage})
 				emit(ctx, out, Event{
 					Kind: EventInfo,
-					Info: "(empty-final-answer rescue: nudging model to summarize)",
+					Info: fmt.Sprintf("(empty-final-answer failure: provider returned no user-facing text after one tool-less retry; stop_reason=%s)", stopReason),
 				})
-				continue
+				l.Hooks.EmitLoopEnd(ctx, tc, stopReason)
+				emit(ctx, out, Event{Kind: EventLoopDone, StopReason: stopReason})
+				return nil
 			}
 
 			// Dispatch-contract end-of-turn gate. See contract.go for
@@ -2003,6 +2116,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			}
 
 			stopReason = stop
+			// Provider truncation, filtering, and protocol failures may still
+			// carry partial prose. Preserve that prose in the transcript, but do
+			// not reset loop detectors or feed the exchange into recall/distilled
+			// memory: none of these terminal reasons establishes a completed turn.
+			if IsIncompleteStopReason(stop) {
+				l.Hooks.EmitLoopEnd(ctx, tc, stop)
+				emit(ctx, out, Event{Kind: EventLoopDone, StopReason: stop})
+				return nil
+			}
 			// Reset per-tool counters so the next user turn starts clean —
 			// otherwise `Read x5 → end_turn → Read x5` looks like 10 consecutive Reads.
 			if l.Detector != nil {
@@ -2082,9 +2204,19 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) error {
 			}
 		}
 		if len(toolUses) == 0 {
-			stopReason = "no_tool_calls"
-			l.Hooks.EmitLoopEnd(ctx, tc, "no_tool_calls")
-			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "no_tool_calls"})
+			// Defensive fallback: stop-reason reconciliation above should make
+			// this unreachable, but malformed provider output must never become a
+			// successful no-op.
+			stopReason = "provider_protocol_error"
+			l.mu.Lock()
+			l.Messages = append(l.Messages, llm.Message{
+				Role:    llm.RoleAssistant,
+				Content: []llm.ContentBlock{{Type: "text", Text: emptyStopFallbackMessage}},
+			})
+			l.mu.Unlock()
+			emit(ctx, out, Event{Kind: EventTextDelta, TextDelta: emptyStopFallbackMessage})
+			l.Hooks.EmitLoopEnd(ctx, tc, stopReason)
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: stopReason})
 			return nil
 		}
 

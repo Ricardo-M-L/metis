@@ -14,9 +14,10 @@ package agent
 // can return blockingErrors to force another iteration. metis has no
 // such hook; this detector + one-shot nudge is the equivalent.
 //
-// Strictly bounded: at most ONE nudge per turn. If the model stops
-// silently a second time we accept it (something is wrong upstream
-// and looping forever wastes tokens).
+// Strictly bounded: at most ONE nudge per turn. The rescue request is
+// tool-less so the model can only write a conclusion. If it stops
+// silently a second time, Metis emits a visible local fallback and an
+// incomplete stop reason instead of reporting an empty success.
 
 import (
 	"strings"
@@ -56,3 +57,8 @@ Summarize what you found / did in 1-3 lines and stop. Don't restart
 the investigation — answer with what you already know. A one-line
 "done — here's the result" is fine; an empty stop is not.
 </system-reminder>`
+
+// emptyStopFallbackMessage is rendered locally when the provider returns no
+// user-facing text even after the single bounded rescue. It is deliberately
+// explicit that this is a provider failure, not a successful model answer.
+const emptyStopFallbackMessage = "The model returned no final answer after one retry. No further tool calls were executed; retry the request or inspect the tool results above."

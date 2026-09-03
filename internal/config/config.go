@@ -149,8 +149,10 @@ type WechatChannel struct {
 // Mirrors claude-code's settings.json `hooks` model: each lifecycle event
 // gets a list of HookSpec, fired in order at the matching point. The
 // first MVP supports `type = "command"` only — a shell command that
-// receives the event JSON on stdin and (for PreToolUse) can return a
-// modified payload on stdout to short-circuit / rewrite the tool call.
+// receives the event JSON on stdin. PreToolUse can return a modified payload
+// to short-circuit / rewrite the tool call; PostToolUse and PostCompact can
+// return additional context for the next model request. PostToolUse context
+// is capped by the runtime before it enters provider-visible history.
 type HooksConfig struct {
 	PreToolUse        []HookSpec `toml:"pre_tool_use"`
 	PostToolUse       []HookSpec `toml:"post_tool_use"`

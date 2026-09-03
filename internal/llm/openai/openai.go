@@ -850,7 +850,15 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 				rc := thinking.String()
 				am.ReasoningContent = &rc
 			}
-			out.Messages = append(out.Messages, am)
+			// Restored sessions and cross-provider histories may contain a
+			// zero-block assistant or provider-only state that Chat Completions
+			// cannot encode. Do not turn it into `{role:"assistant",content:""}`:
+			// compatibility gateways can answer that poisoned turn with another
+			// empty completion. Thinking remains wire-visible through
+			// reasoning_content, and tool-call messages remain required.
+			if text.Len() > 0 || len(am.ToolCalls) > 0 || thinking.Len() > 0 {
+				out.Messages = append(out.Messages, am)
+			}
 		}
 	}
 	for _, t := range req.Tools {

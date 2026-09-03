@@ -24,6 +24,14 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"unicode/utf8"
+)
+
+const (
+	maxPostToolUseContextPerHandler = 16 * 1024
+	maxPostToolUseContextTotal      = 32 * 1024
+	postToolUseContextTruncated     = "\n...[hook context truncated]"
+	postToolUseContextOmitted       = "\n...[additional hook context omitted]"
 )
 
 // Event identifies a lifecycle event by name. Useful for logging and for
@@ -122,6 +130,25 @@ type PostToolUse struct {
 	Input   map[string]any
 	Output  string
 	IsError bool
+}
+
+type postToolUseIDContextKey struct{}
+
+// WithPostToolUseID binds the provider-issued call identifier to a
+// PostToolUse handler invocation without changing the public PostToolUse
+// struct layout (and therefore without breaking third-party unkeyed literals).
+func WithPostToolUseID(ctx context.Context, toolUseID string) context.Context {
+	return context.WithValue(ctx, postToolUseIDContextKey{}, toolUseID)
+}
+
+// PostToolUseIDFromContext returns the exact call identifier associated with a
+// PostToolUse handler invocation. Empty means the emitter did not provide one.
+func PostToolUseIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	toolUseID, _ := ctx.Value(postToolUseIDContextKey{}).(string)
+	return toolUseID
 }
 
 // ModifiedPostToolUse is what a PostToolUseContextHandler returns.
@@ -483,13 +510,63 @@ func (r *Registry) EmitPostToolUseContext(ctx context.Context, tc Context, in *P
 	r.mu.RLock()
 	handlers := r.postToolCtx
 	r.mu.RUnlock()
-	var parts []string
+	var result strings.Builder
+	overflow := false
 	for _, h := range handlers {
-		if mod := h(ctx, tc, in); mod != nil && mod.AdditionalContext != "" {
-			parts = append(parts, mod.AdditionalContext)
+		mod := h(ctx, tc, in)
+		if mod == nil || mod.AdditionalContext == "" {
+			continue
 		}
+
+		part := truncatePostToolUseContext(mod.AdditionalContext, maxPostToolUseContextPerHandler)
+		separatorBytes := 0
+		if result.Len() > 0 {
+			separatorBytes = 1
+		}
+		if result.Len()+separatorBytes+len(part) > maxPostToolUseContextTotal {
+			overflow = true
+			continue
+		}
+		if result.Len() > 0 {
+			result.WriteByte('\n')
+		}
+		result.WriteString(part)
 	}
-	return strings.Join(parts, "\n")
+	if overflow {
+		prefixLimit := maxPostToolUseContextTotal - len(postToolUseContextOmitted)
+		prefix := utf8SafePrefix(result.String(), prefixLimit)
+		result.Reset()
+		result.WriteString(prefix)
+		result.WriteString(postToolUseContextOmitted)
+	}
+	return result.String()
+}
+
+func truncatePostToolUseContext(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= len(postToolUseContextTruncated) {
+		return postToolUseContextTruncated[:limit]
+	}
+
+	return utf8SafePrefix(value, limit-len(postToolUseContextTruncated)) + postToolUseContextTruncated
+}
+
+func utf8SafePrefix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	for limit > 0 && !utf8.ValidString(value[:limit]) {
+		limit--
+	}
+	return value[:limit]
 }
 
 func (r *Registry) EmitSessionStart(ctx context.Context, tc Context, system, model string) {

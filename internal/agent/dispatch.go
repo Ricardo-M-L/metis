@@ -1059,6 +1059,12 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		}
 		res, err = safeToolExecute(toolCtx, t, blk.ToolInput)
 	}
+	if err == nil && res == nil {
+		// Normalize a broken (nil, nil) tool result before every observer sees
+		// it. PostToolUse, timing, checkpointing, and the provider-facing result
+		// must all agree that this execution failed.
+		res = &tools.Result{Output: "tool returned no result", IsError: true}
+	}
 	l.recordCheckpointMutation(blk.ToolName, blk.ToolInput, res, err)
 	execElapsed := time.Since(execStart)
 	// Persist per-step timing to the session sidecar (best-effort). This is
@@ -1083,13 +1089,14 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 			Context: tc, Tool: blk.ToolName, Input: blk.ToolInput,
 			Output: output, IsError: isErr,
 		}
-		l.Hooks.EmitPostToolUse(ctx, tc, post)
+		hookCtx := pubhook.WithPostToolUseID(ctx, blk.ToolUseID)
+		l.Hooks.EmitPostToolUse(hookCtx, tc, post)
 		// Feedback-capable variant: handlers can return
 		// AdditionalContext (lint diagnostics, format fixes) that gets
 		// appended to the tool_result as a <system-reminder> so the
 		// MODEL sees it next turn. Mirrors claude-code's PostToolUse
 		// additionalContext response field.
-		hookContext = l.Hooks.EmitPostToolUseContext(ctx, tc, post)
+		hookContext = l.Hooks.EmitPostToolUseContext(hookCtx, tc, post)
 		// Distinct PostToolUseFailure firing on tool errors so observers
 		// can subscribe to "only failures" without filtering by IsError
 		// inside every PostToolUse handler. Mirrors claude-code's split.
@@ -1102,10 +1109,14 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	}
 
 	if err != nil {
-		s := err.Error()
+		displayBody := err.Error()
+		modelBody := displayBody
+		if hookContext != "" {
+			modelBody += wrapAsSystemReminder(hookContext)
+		}
 		emit(ctx, out, Event{
 			Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
-			ToolResult:              &ToolResult{Output: s, IsError: true},
+			ToolResult:              &ToolResult{Output: displayBody, IsError: true},
 			Elapsed:                 execElapsed,
 			TraceInvocationID:       traceInvocationID,
 			TraceParentInvocationID: traceParentInvocationID,
@@ -1113,17 +1124,8 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		})
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: blk.ToolUseID,
-			ToolResult: s, IsError: true,
+			ToolResult: modelBody, IsError: true,
 		}
-	}
-	if res == nil {
-		// A tool returned (nil, nil) — valid by the (*tools.Result, error)
-		// signature but a bug (mock tools / a misbehaving MCP wrapper do it).
-		// Without this guard the res.Output deref below panics inside the
-		// fan-out goroutine, which has NO recover (safeToolExecute's recover
-		// only covers Execute), crashing the whole process. fork.go guards
-		// the same case; do it here too.
-		res = &tools.Result{Output: "tool returned no result", IsError: true}
 	}
 	emit(ctx, out, Event{
 		Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,

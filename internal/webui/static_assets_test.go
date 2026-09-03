@@ -281,7 +281,9 @@ func TestTurnStatusMatchesWholeAgentTurnLifecycle(t *testing.T) {
 	for _, want := range []string{
 		`<div class="turn-status" role="status" aria-live="polite">Deep diving...<span class="ts-clock"></span></div>`,
 		`onLive('turn_end', endStreamingMessage);`,
-		`onLive('loop_done', finishUserTurn);`,
+		`onLive('loop_done', d => {`,
+		`runningTurnIncompleteReason = d.incomplete`,
+		`Queued messages paused after an incomplete or failed turn`,
 		`function finishUserTurn()`,
 		`area.appendChild(turnStatusEl);`,
 	} {

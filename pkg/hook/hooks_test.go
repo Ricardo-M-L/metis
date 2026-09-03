@@ -3,9 +3,11 @@ package hook
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestRegistry_PreToolUse_Intercept(t *testing.T) {
@@ -54,6 +56,70 @@ func TestRegistry_PostToolUseFanOut(t *testing.T) {
 	r.EmitPostToolUse(context.Background(), Context{}, &PostToolUse{})
 	if n.Load() != 5 {
 		t.Errorf("expected 5 fan-outs, got %d", n.Load())
+	}
+}
+
+func TestRegistry_PostToolUseContextIsBoundedAndUTF8Safe(t *testing.T) {
+	r := NewRegistry()
+	r.Register(PostToolUseContextHandler(func(context.Context, Context, *PostToolUse) *ModifiedPostToolUse {
+		return &ModifiedPostToolUse{AdditionalContext: strings.Repeat("界", 20*1024)}
+	}))
+	r.Register(PostToolUseContextHandler(func(context.Context, Context, *PostToolUse) *ModifiedPostToolUse {
+		return &ModifiedPostToolUse{AdditionalContext: "SECOND_SENTINEL"}
+	}))
+	r.Register(PostToolUseContextHandler(func(context.Context, Context, *PostToolUse) *ModifiedPostToolUse {
+		return &ModifiedPostToolUse{AdditionalContext: strings.Repeat("x", 32*1024)}
+	}))
+
+	got := r.EmitPostToolUseContext(context.Background(), Context{}, &PostToolUse{})
+	if len(got) > maxPostToolUseContextTotal {
+		t.Fatalf("context has %d bytes, want at most %d", len(got), maxPostToolUseContextTotal)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("truncation split a UTF-8 sequence")
+	}
+	if !strings.Contains(got, postToolUseContextTruncated) {
+		t.Fatal("truncated context did not include a visible marker")
+	}
+	if strings.Count(got, "SECOND_SENTINEL") != 1 {
+		t.Fatalf("per-handler cap should preserve later feedback, got sentinel count %d", strings.Count(got, "SECOND_SENTINEL"))
+	}
+}
+
+func TestRegistry_PostToolUseContextMarksAggregateOverflowAndCallsAllHandlers(t *testing.T) {
+	r := NewRegistry()
+	var calls atomic.Int32
+	for _, value := range []string{
+		strings.Repeat("a", maxPostToolUseContextPerHandler),
+		strings.Repeat("b", maxPostToolUseContextTotal-maxPostToolUseContextPerHandler-1),
+		"LATE_SENTINEL",
+	} {
+		value := value
+		r.Register(PostToolUseContextHandler(func(context.Context, Context, *PostToolUse) *ModifiedPostToolUse {
+			calls.Add(1)
+			return &ModifiedPostToolUse{AdditionalContext: value}
+		}))
+	}
+
+	got := r.EmitPostToolUseContext(context.Background(), Context{}, &PostToolUse{})
+	if calls.Load() != 3 {
+		t.Fatalf("handlers called = %d, want 3", calls.Load())
+	}
+	if len(got) > maxPostToolUseContextTotal {
+		t.Fatalf("context has %d bytes, want at most %d", len(got), maxPostToolUseContextTotal)
+	}
+	if !strings.HasSuffix(got, postToolUseContextOmitted) {
+		t.Fatalf("aggregate overflow was silent: suffix=%q", got[max(0, len(got)-64):])
+	}
+}
+
+func TestPostToolUseIDContextRoundTrip(t *testing.T) {
+	if got := PostToolUseIDFromContext(nil); got != "" {
+		t.Fatalf("nil context ID = %q", got)
+	}
+	ctx := WithPostToolUseID(context.Background(), "call-42")
+	if got := PostToolUseIDFromContext(ctx); got != "call-42" {
+		t.Fatalf("context ID = %q, want call-42", got)
 	}
 }
 

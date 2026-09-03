@@ -1,10 +1,15 @@
 package runtime
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 func newEnforcer(t *testing.T, schema string) *OutputSchemaEnforcer {
@@ -112,5 +117,21 @@ func TestOutputSchemaEnforcerExposesNativeResponseFormat(t *testing.T) {
 	}
 	if format.JSONSchema["type"] != "object" {
 		t.Fatalf("schema = %#v", format.JSONSchema)
+	}
+}
+
+func TestRunLoopCollectTextRejectsIncompleteTerminal(t *testing.T) {
+	loop := agent.NewLoop(
+		&stubProvider{maxCtx: 100_000},
+		tools.NewRegistry(),
+		permission.New(permission.ModeAcceptEdits),
+		nil,
+		"sys",
+		10,
+	)
+	loop.AppendUser("return valid JSON")
+	text, err := RunLoopCollectText(context.Background(), loop, "")
+	if err == nil || !strings.Contains(err.Error(), "empty_final_answer") {
+		t.Fatalf("text=%q err=%v, want incomplete empty-final error", text, err)
 	}
 }

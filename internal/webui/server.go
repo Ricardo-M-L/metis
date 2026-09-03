@@ -730,6 +730,9 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 	case agent.EventTokens:
 		payload["inputTokens"] = he.ev.InputTokens
 		payload["outputTokens"] = he.ev.OutputTokens
+	case agent.EventLoopDone:
+		payload["stopReason"] = he.ev.StopReason
+		payload["incomplete"] = agent.IsIncompleteStopReason(he.ev.StopReason)
 	case agent.EventContextWarn, agent.EventCompactionStart:
 		payload["info"] = he.ev.Info
 	case agent.EventContextCompacted:
@@ -1565,6 +1568,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	var text strings.Builder
 	var firstTokenAt time.Time
 	var turnCost session.CostSnapshot
+	var incompleteReason string
 	for ev := range events {
 		// Permission requests are published by their case below (with the
 		// request id); everything else broadcasts here.
@@ -1590,6 +1594,10 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 			turnCost.OutputTokens += ev.OutputTokens
 			turnCost.CacheCreateTokens += ev.CacheCreationInputTokens
 			turnCost.CacheReadTokens += ev.CacheReadInputTokens
+		case agent.EventLoopDone:
+			if agent.IsIncompleteStopReason(ev.StopReason) {
+				incompleteReason = ev.StopReason
+			}
 		case agent.EventPermissionRequest:
 			if ev.PermissionReply != nil {
 				id := uuid.NewString()
@@ -1634,6 +1642,9 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	runErr := <-done
+	if runErr == nil && incompleteReason != "" {
+		runErr = fmt.Errorf("task incomplete: %s", incompleteReason)
+	}
 	// agent.emit deliberately notifies the trace hook even when a cancelled
 	// context wins its channel-send select. Recover that provider-authoritative
 	// terminal usage here so clicking Stop at the exact end of a response cannot
