@@ -276,6 +276,45 @@ func TestExtractDesktopZipRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractDesktopArchiveAcceptsCurrentAndLegacyMacBundleNames(t *testing.T) {
+	for _, bundleName := range []string{"METIS.app", "Metis.app", "metis-desktop.app"} {
+		t.Run(bundleName, func(t *testing.T) {
+			root := t.TempDir()
+			archivePath := filepath.Join(root, "desktop.zip")
+			if err := os.WriteFile(archivePath, makeDesktopZipWithBundleName(t, bundleName, "1.2.0", "build"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			extractRoot := filepath.Join(root, "extract")
+			if err := os.Mkdir(extractRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			candidate, err := extractDesktopArchive(archivePath, extractRoot, "darwin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(candidate, "Contents", "MacOS", "metis-desktop"))
+			if err != nil || string(data) != "build" {
+				t.Fatalf("extracted executable = %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestExtractDesktopArchiveRejectsUnknownMacBundleName(t *testing.T) {
+	root := t.TempDir()
+	archivePath := filepath.Join(root, "desktop.zip")
+	if err := os.WriteFile(archivePath, makeDesktopZipWithBundleName(t, "Other.app", "1.2.0", "build"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	extractRoot := filepath.Join(root, "extract")
+	if err := os.Mkdir(extractRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := extractDesktopArchive(archivePath, extractRoot, "darwin"); err == nil || !strings.Contains(err.Error(), "METIS.app") {
+		t.Fatalf("unknown bundle error = %v", err)
+	}
+}
+
 func TestDesktopUpdateLockExcludesConcurrentInstaller(t *testing.T) {
 	appPath := filepath.Join(t.TempDir(), "Metis.app")
 	release, err := acquireDesktopUpdateLock(appPath)
@@ -377,6 +416,10 @@ func TestActivateDesktopCandidateReplacesVerifiedRollback(t *testing.T) {
 }
 
 func makeDesktopZip(t *testing.T, version, executable string) []byte {
+	return makeDesktopZipWithBundleName(t, "METIS.app", version, executable)
+}
+
+func makeDesktopZipWithBundleName(t *testing.T, bundleName, version, executable string) []byte {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "desktop.zip")
@@ -386,8 +429,8 @@ func makeDesktopZip(t *testing.T, version, executable string) []byte {
 	}
 	zw := zip.NewWriter(f)
 	entries := map[string]string{
-		"metis-desktop.app/Contents/Info.plist":          "<key>CFBundleShortVersionString</key><string>" + version + "</string>",
-		"metis-desktop.app/Contents/MacOS/metis-desktop": executable,
+		bundleName + "/Contents/Info.plist":          "<key>CFBundleShortVersionString</key><string>" + version + "</string>",
+		bundleName + "/Contents/MacOS/metis-desktop": executable,
 	}
 	for name, content := range entries {
 		h := &zip.FileHeader{Name: name, Method: zip.Deflate}

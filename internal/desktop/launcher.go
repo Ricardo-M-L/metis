@@ -134,9 +134,11 @@ func (l launcher) findExistingAppPath() string {
 	case "darwin":
 		candidates = []string{
 			l.appOverride,
-			filepath.Join(l.cwd, "metis-desktop", "build", "bin", "metis-desktop.app"),
+			filepath.Join(l.cwd, "metis-desktop", "build", "bin", "METIS.app"),
+			"/Applications/METIS.app",
 			"/Applications/Metis.app",
 			"/Applications/metis-desktop.app",
+			filepath.Join(l.home, "Applications", "METIS.app"),
 			filepath.Join(l.home, "Applications", "Metis.app"),
 			filepath.Join(l.home, "Applications", "metis-desktop.app"),
 		}

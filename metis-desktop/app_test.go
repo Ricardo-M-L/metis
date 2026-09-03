@@ -354,11 +354,11 @@ func TestBundleMetadataUsesMetisDisplayNameAndSingleInstance(t *testing.T) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		t.Fatal(err)
 	}
-	if config.Name != "metis-desktop" || config.OutputFilename != "metis-desktop" {
-		t.Fatalf("internal bundle names = name:%q output:%q, release-compatible names must stay metis-desktop", config.Name, config.OutputFilename)
+	if config.Name != "METIS" || config.OutputFilename != "metis-desktop" {
+		t.Fatalf("bundle name/output = name:%q output:%q, want METIS.app with metis-desktop executable", config.Name, config.OutputFilename)
 	}
-	if config.Info.ProductName != "Metis" {
-		t.Fatalf("product display name = %q, want Metis", config.Info.ProductName)
+	if config.Info.ProductName != "METIS" {
+		t.Fatalf("product display name = %q, want METIS", config.Info.ProductName)
 	}
 	plist, err := os.ReadFile(filepath.Join("build", "darwin", "Info.plist"))
 	if err != nil {
@@ -366,7 +366,8 @@ func TestBundleMetadataUsesMetisDisplayNameAndSingleInstance(t *testing.T) {
 	}
 	metadata := string(plist)
 	for _, want := range []string{
-		"<key>CFBundleDisplayName</key>\n        <string>Metis</string>",
+		"<key>CFBundleName</key>\n        <string>METIS</string>",
+		"<key>CFBundleDisplayName</key>\n        <string>METIS</string>",
 		"<key>LSMultipleInstancesProhibited</key>\n        <true/>",
 	} {
 		if !strings.Contains(metadata, want) {

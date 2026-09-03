@@ -1,6 +1,6 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "metis-desktop",
+  "name": "METIS",
   "outputfilename": "metis-desktop",
   "frontend:install": "npm install",
   "frontend:build": "npm run build",
@@ -8,7 +8,7 @@
   "frontend:dev:serverUrl": "auto",
   "info": {
     "companyName": "Metis",
-    "productName": "Metis",
+    "productName": "METIS",
     "productVersion": "0.4.42",
     "copyright": "Copyright © 2026 Metis",
     "comments": "Metis — local AI coding agent"

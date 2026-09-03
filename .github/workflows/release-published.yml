@@ -135,9 +135,21 @@ jobs:
 
           mkdir unpacked
           ditto -x -k dist/metis-desktop-darwin-universal.zip unpacked
-          app=unpacked/metis-desktop.app
+          version=${TAG#v}
+          # One updater bridge release keeps the legacy ZIP root required by
+          # v0.4.42. Bundle metadata and the DMG name are already METIS.
+          if [ -d unpacked/metis-desktop.app ]; then
+            app=unpacked/metis-desktop.app
+          else
+            app=unpacked/Metis.app
+          fi
           test -d "$app"
-          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleShortVersionString)" = "${TAG#v}"
+          if [ "$version" != "0.4.42" ]; then
+            test "$(defaults read "$PWD/$app/Contents/Info" CFBundleName)" = "METIS"
+            test "$(defaults read "$PWD/$app/Contents/Info" CFBundleDisplayName)" = "METIS"
+          fi
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleExecutable)" = "metis-desktop"
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleShortVersionString)" = "$version"
 
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dv --verbose=4 "$app" 2>&1 | grep -q '^Authority=Developer ID Application:'

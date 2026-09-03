@@ -46,9 +46,9 @@ func TestOpenAppBuildsPlatformCommandsWithCLIOverride(t *testing.T) {
 		wantStart []commandCall
 	}{
 		{
-			goos: "darwin", appPath: "/Applications/Metis.app",
+			goos: "darwin", appPath: "/Applications/METIS.app",
 			wantRun: []commandCall{{name: "open", args: []string{
-				"-n", "-a", "/Applications/Metis.app", "--args",
+				"-n", "-a", "/Applications/METIS.app", "--args",
 				"--workspace", "/tmp/project with spaces", "--metis-bin", "/opt/metis/bin/metis",
 			}}},
 		},
@@ -115,7 +115,7 @@ func TestFindExistingAppPathOverrideAndLocalBuild(t *testing.T) {
 		want     string
 		fileMode os.FileMode
 	}{
-		{name: "mac override", goos: "darwin", override: "/custom/Metis.app", want: "/custom/Metis.app", fileMode: os.ModeDir},
+		{name: "mac override", goos: "darwin", override: "/custom/METIS.app", want: "/custom/METIS.app", fileMode: os.ModeDir},
 		{name: "linux override", goos: "linux", override: "/custom/metis-desktop", want: "/custom/metis-desktop", fileMode: 0o755},
 		{name: "windows override", goos: "windows", override: `C:\custom\metis.exe`, want: `C:\custom\metis.exe`, fileMode: 0o644},
 	}
@@ -135,7 +135,7 @@ func TestFindExistingAppPathOverrideAndLocalBuild(t *testing.T) {
 		name string
 		mode os.FileMode
 	}{
-		{goos: "darwin", name: "metis-desktop.app", mode: os.ModeDir},
+		{goos: "darwin", name: "METIS.app", mode: os.ModeDir},
 		{goos: "linux", name: "metis-desktop", mode: 0o755},
 		{goos: "windows", name: "metis-desktop.exe", mode: 0o644},
 	} {
@@ -145,6 +145,25 @@ func TestFindExistingAppPathOverrideAndLocalBuild(t *testing.T) {
 			l.stat = statOnly(local, tc.mode)
 			if got := l.findExistingAppPath(); got != local {
 				t.Fatalf("findExistingAppPath() = %q, want local build %q", got, local)
+			}
+		})
+	}
+}
+
+func TestFindExistingAppPathSupportsCurrentAndLegacyMacInstallNames(t *testing.T) {
+	for _, appPath := range []string{
+		"/Applications/METIS.app",
+		"/Applications/Metis.app",
+		"/Applications/metis-desktop.app",
+		filepath.Join("/home/tester", "Applications", "METIS.app"),
+		filepath.Join("/home/tester", "Applications", "Metis.app"),
+		filepath.Join("/home/tester", "Applications", "metis-desktop.app"),
+	} {
+		t.Run(appPath, func(t *testing.T) {
+			l, _, _ := testLauncher("darwin")
+			l.stat = statOnly(appPath, os.ModeDir)
+			if got := l.findExistingAppPath(); got != appPath {
+				t.Fatalf("findExistingAppPath() = %q, want %q", got, appPath)
 			}
 		})
 	}

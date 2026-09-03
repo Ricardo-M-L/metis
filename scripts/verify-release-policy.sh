@@ -39,5 +39,9 @@ grep -Fq "sed 's/\\r\$//'" "$verify_workflow" || fail "checksum verification is 
 grep -q 'Authority=Developer ID Application:' "$verify_workflow" || fail "Developer ID verification is missing"
 grep -q 'xcrun stapler validate' "$verify_workflow" || fail "staple verification is missing"
 grep -q 'spctl --assess' "$verify_workflow" || fail "Gatekeeper verification is missing"
+grep -q 'app=build/bin/METIS.app' "$stage_workflow" || fail "macOS build is not normalized to METIS.app"
+grep -q 'bridge_app=build/bin/metis-desktop.app' "$stage_workflow" || fail "v0.4.42 updater bridge is missing"
+grep -q 'app=unpacked/metis-desktop.app' "$verify_workflow" || fail "published updater ZIP bridge is not verified"
+grep -q 'CFBundleDisplayName).*METIS' "$verify_workflow" || fail "published macOS display name is not verified as METIS"
 
 printf '%s\n' 'verify-release-policy: immutable draft and published-release gates verified'

@@ -246,10 +246,30 @@ jobs:
           wails build -clean -s -trimpath -platform "$PLATFORM" $tags
           mkdir -p release-dist
           if [ "$RUNNER_OS" = "macOS" ]; then
-            codesign --force --deep --sign - build/bin/metis-desktop.app
-            codesign --verify --deep --strict build/bin/metis-desktop.app
+            # New sources build METIS.app. Keep historical-tag backfills
+            # verifiable under the bundle name declared by those old sources.
+            if [ -d build/bin/METIS.app ]; then
+              app=build/bin/METIS.app
+            elif [ -d build/bin/metis-desktop.app ]; then
+              app=build/bin/metis-desktop.app
+            else
+              echo "Wails did not create a supported macOS application bundle" >&2
+              exit 1
+            fi
+            codesign --force --deep --sign - "$app"
+            codesign --verify --deep --strict "$app"
+            # v0.4.42's updater only recognizes metis-desktop.app inside the
+            # updater ZIP. Keep one bridge generation while the source-built
+            # and user-facing DMG bundle is METIS.app. The new updater accepts
+            # both roots and installs into the existing application path.
+            if [ "$app" = build/bin/METIS.app ]; then
+              bridge_app=build/bin/metis-desktop.app
+              test ! -e "$bridge_app"
+              mv "$app" "$bridge_app"
+              app=$bridge_app
+            fi
             asset="metis-desktop-${ASSET}.zip"
-            ditto -c -k --sequesterRsrc --keepParent build/bin/metis-desktop.app "release-dist/$asset"
+            ditto -c -k --sequesterRsrc --keepParent "$app" "release-dist/$asset"
             unzip -tq "release-dist/$asset"
           else
             asset="metis-desktop-${ASSET}.tar.gz"

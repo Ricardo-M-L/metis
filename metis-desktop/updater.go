@@ -316,7 +316,20 @@ func extractDesktopArchive(archivePath, dest, goos string) (string, error) {
 	}
 	switch goos {
 	case "darwin":
-		return filepath.Join(dest, "metis-desktop.app"), nil
+		for _, bundleName := range []string{"METIS.app", "Metis.app", "metis-desktop.app"} {
+			candidate := filepath.Join(dest, bundleName)
+			info, err := os.Lstat(candidate)
+			if err == nil {
+				if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+					return candidate, nil
+				}
+				return "", fmt.Errorf("downloaded macOS bundle %s is not a directory", bundleName)
+			}
+			if !os.IsNotExist(err) {
+				return "", err
+			}
+		}
+		return "", errors.New("Desktop archive has no METIS.app application bundle")
 	case "windows":
 		return filepath.Join(dest, "metis-desktop.exe"), nil
 	default:
