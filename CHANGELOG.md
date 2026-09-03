@@ -7,6 +7,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.43] - 2026-09-03
+
+### Added
+
+- Added bounded `PostToolUse` feedback context for command hooks, including
+  exact tool-call identifiers and Claude-compatible hook response envelopes.
+
+### Changed
+
+- Renamed the macOS Desktop bundle to `METIS.app` while keeping the updater
+  compatible with the legacy bundle root used by existing installations.
+- Stabilized Desktop session controls, layout, restart handoff, and release
+  checksum verification across supported platforms.
+
+### Fixed
+
+- Empty, filtered, truncated, malformed, and tool-less provider responses now
+  terminate fail-closed instead of executing unaccepted calls or reporting a
+  successful blank answer.
+- CLI, TUI, WebUI, ACP, MCP, cron, daemon, and delegated-agent entry points now
+  agree on incomplete terminal states, including cancellation races.
+- Schema-constrained runs no longer reuse the legacy response cache, preventing
+  unvalidated output from becoming a later cache-hit success.
+
 ## [0.4.41] - 2026-09-02
 
 ### Fixed
