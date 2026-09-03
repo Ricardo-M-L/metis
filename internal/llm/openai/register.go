@@ -23,6 +23,7 @@ func build(opts transport.BuildOpts) (*transport.Result, error) {
 		maxTokens = transport.DefaultMaxOutputTokens
 	}
 	p := New(opts.APIKey, opts.BaseURL, opts.Model, maxTokens, timeout, 0)
+	p.CatalogProvider = opts.CatalogProvider
 	if opts.ContextWindow > 0 {
 		p.ContextWindow = opts.ContextWindow
 	}

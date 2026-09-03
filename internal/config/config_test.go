@@ -74,6 +74,25 @@ func TestProviderRawSupportsVisionIsTriState(t *testing.T) {
 	}
 }
 
+func TestProviderRawCatalogProviderParses(t *testing.T) {
+	var parsed struct {
+		Provider struct {
+			Custom map[string]ProviderRaw `toml:"custom"`
+		} `toml:"provider"`
+	}
+	input := `[provider.custom.bigmodel]
+transport = "openai_chat"
+model = "glm-5.3"
+catalog_provider = "zhipuai"
+`
+	if _, err := toml.Decode(input, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Provider.Custom["bigmodel"].CatalogProvider; got != "zhipuai" {
+		t.Fatalf("CatalogProvider = %q, want zhipuai", got)
+	}
+}
+
 func boolPtrConfig(v bool) *bool { return &v }
 
 // Regression: the security audit's three required denylist patterns must

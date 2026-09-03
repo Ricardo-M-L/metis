@@ -29,11 +29,32 @@ func (p *fakeContextProvider) Stream(context.Context, llm.Request) (llm.StreamRe
 	return nil, errors.New("not implemented")
 }
 
+type changingContextProvider struct {
+	calls int
+}
+
+func (p *changingContextProvider) Name() string    { return "changing" }
+func (p *changingContextProvider) ModelID() string { return "shared-model" }
+func (p *changingContextProvider) MaxContextTokens() int {
+	p.calls++
+	if p.calls%2 == 1 {
+		return 100_000
+	}
+	return 200_000
+}
+func (p *changingContextProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return nil, errors.New("not implemented")
+}
+func (p *changingContextProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return nil, errors.New("not implemented")
+}
+
 // minimalModel builds the smallest *Model that renderStatusBar needs.
 // Width is set wide enough that left + right + gap fit comfortably.
 func minimalModel(maxCtx int) *Model {
 	gate := permission.New(permission.ModeAcceptEdits)
 	loop := agent.NewLoop(&fakeContextProvider{maxCtx: maxCtx}, tools.NewRegistry(), gate, nil, "test", 5)
+	loop.ContextWindow = maxCtx
 	return &Model{
 		gate:  gate,
 		loop:  loop,
@@ -75,6 +96,25 @@ func TestStatusBar_RenderRawInteger(t *testing.T) {
 	}
 	if !strings.Contains(bar, "(19%)") {
 		t.Errorf("status bar missing '(19%%)'; got:\n%s", bar)
+	}
+}
+
+func TestStatusBarUsesSessionBoundContextWindowInsteadOfRequeryingProvider(t *testing.T) {
+	gate := permission.New(permission.ModeAcceptEdits)
+	provider := &changingContextProvider{}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), gate, nil, "test", 5)
+	loop.Model = provider.ModelID()
+	loop.ContextWindow = 100_000
+	m := &Model{gate: gate, loop: loop, model: provider.ModelID(), width: 120}
+	setCanonicalContextTokens(t, m, 10_000)
+
+	first := stripANSI(renderStatusBar(m))
+	second := stripANSI(renderStatusBar(m))
+	if !strings.Contains(first, "(10%)") || !strings.Contains(second, "(10%)") {
+		t.Fatalf("session-bound percentage changed across idle renders:\nfirst: %s\nsecond: %s", first, second)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("status render re-queried provider MaxContextTokens %d times", provider.calls)
 	}
 }
 

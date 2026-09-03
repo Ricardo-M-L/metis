@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
 	_ "image/png"
@@ -9,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestAppIconHasOneCanonicalTransparentAsset(t *testing.T) {
+func TestAppIconHasOneCanonicalPureWhiteBackgroundAsset(t *testing.T) {
 	for _, obsolete := range []string{
 		"build/appicon-generated-source.png",
 		"build/appicon-previous.png",
@@ -29,39 +31,58 @@ func TestAppIconHasOneCanonicalTransparentAsset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertPureWhiteIcon(t, icon)
+}
+
+func TestWindowsIconUsesTheSamePureWhiteBackground(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("build", "windows", "icon.ico"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < 22 || binary.LittleEndian.Uint16(raw[0:2]) != 0 || binary.LittleEndian.Uint16(raw[2:4]) != 1 || binary.LittleEndian.Uint16(raw[4:6]) != 1 {
+		t.Fatal("Windows icon must contain one ICO image")
+	}
+	size := int(binary.LittleEndian.Uint32(raw[14:18]))
+	offset := int(binary.LittleEndian.Uint32(raw[18:22]))
+	if size <= 0 || offset < 22 || offset > len(raw)-size {
+		t.Fatalf("invalid ICO payload: offset=%d size=%d file=%d", offset, size, len(raw))
+	}
+	icon, _, err := image.Decode(bytes.NewReader(raw[offset : offset+size]))
+	if err != nil {
+		t.Fatalf("decode embedded Windows icon: %v", err)
+	}
+	assertPureWhiteIcon(t, icon)
+}
+
+func assertPureWhiteIcon(t *testing.T, icon image.Image) {
+	t.Helper()
 	bounds := icon.Bounds()
 	points := [][2]float64{
-		{0.05, 0.05}, {0.50, 0.05}, {0.95, 0.05},
-		{0.05, 0.50}, {0.95, 0.50},
-		{0.05, 0.95}, {0.50, 0.95}, {0.95, 0.95},
+		{0.50, 0.10}, {0.15, 0.15}, {0.85, 0.15},
+		{0.10, 0.35}, {0.90, 0.35}, {0.10, 0.50},
+		{0.15, 0.85}, {0.85, 0.85},
+		{0.30, 0.88}, {0.70, 0.88}, {0.50, 0.95},
 	}
 	for _, point := range points {
 		x := bounds.Min.X + int(point[0]*float64(bounds.Dx()-1))
 		y := bounds.Min.Y + int(point[1]*float64(bounds.Dy()-1))
-		_, _, _, a := icon.At(x, y).RGBA()
-		if a != 0 {
-			t.Fatalf("app icon background at (%d,%d) is not transparent: alpha16=%d", x, y, a)
+		r, g, b, a := icon.At(x, y).RGBA()
+		if a != 0xffff || r != 0xffff || g != 0xffff || b != 0xffff {
+			t.Fatalf("app icon background at (%d,%d) is not opaque pure white: rgba16=(%d,%d,%d,%d)", x, y, r, g, b, a)
 		}
 	}
-	// A visible neutral pixel would reintroduce the white plate or gray shadow
-	// that macOS emphasizes after scaling the icon down in the Dock. Only the
-	// blue/cyan/purple mark is allowed to remain visible.
-	visiblePixels := 0
+	// The plate is intentionally flat white. A neutral non-white pixel would
+	// reintroduce the gray bevel/shadow that becomes especially visible after
+	// macOS scales the icon down in the Dock. Colored pixels belong to the mark.
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			pixel := color.NRGBAModel.Convert(icon.At(x, y)).(color.NRGBA)
-			if pixel.A == 0 {
-				continue
-			}
-			visiblePixels++
-			maxChannel := max(pixel.R, pixel.G, pixel.B)
-			minChannel := min(pixel.R, pixel.G, pixel.B)
-			if maxChannel-minChannel <= 2 {
-				t.Fatalf("app icon contains a visible neutral plate/shadow pixel at (%d,%d): nrgba8=%v", x, y, pixel)
+			// Colored antialiasing at the mark edge may be very pale cyan or
+			// purple; only exactly neutral non-white pixels belong to a gray
+			// background, bevel or shadow.
+			if pixel.A != 0 && pixel.R == pixel.G && pixel.G == pixel.B && pixel.R != 0xff {
+				t.Fatalf("app icon contains neutral gray at (%d,%d): nrgba8=%v", x, y, pixel)
 			}
 		}
-	}
-	if visiblePixels < bounds.Dx()*bounds.Dy()/10 {
-		t.Fatalf("app icon mark is unexpectedly sparse: %d visible pixels", visiblePixels)
 	}
 }

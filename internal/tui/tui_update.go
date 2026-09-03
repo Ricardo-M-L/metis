@@ -168,6 +168,13 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		m.handleMCPLoginResult(result)
 		return m, nil
 	}
+	// Permission transitions can wait behind an executing tool batch. Their
+	// completion is lifecycle state and must not be swallowed by a modal that
+	// the user opened while the transition was pending.
+	if result, ok := msg.(permissionModeTransitionResultMsg); ok {
+		m.handlePermissionModeTransitionResult(result)
+		return m, nil
+	}
 
 	// Active full-window screen (e.g. /history) takes over input + view.
 	// We still let WindowSizeMsg reach the main chat so the underlying

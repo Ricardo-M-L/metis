@@ -241,7 +241,11 @@ type ProviderAnthropic struct {
 	APIKey    string `toml:"api_key"` // direct (discouraged; prefer env)
 	BaseURL   string `toml:"base_url"`
 	Model     string `toml:"model"`
-	MaxTokens int    `toml:"max_tokens"`
+	// CatalogProvider identifies the exact models.dev provider whose model
+	// metadata applies to this route. Leave empty for automatic official-origin
+	// detection or provider-agnostic fallback.
+	CatalogProvider string `toml:"catalog_provider"`
+	MaxTokens       int    `toml:"max_tokens"`
 	// ContextWindow overrides the model-prefix lookup used for
 	// auto-compaction. Required for Anthropic-compatible third-party
 	// gateways (MiniMax, OpenRouter, ...) where the served model
@@ -305,7 +309,11 @@ type ProviderOpenAI struct {
 	APIKey    string `toml:"api_key"`
 	BaseURL   string `toml:"base_url"`
 	Model     string `toml:"model"`
-	MaxTokens int    `toml:"max_tokens"`
+	// CatalogProvider is the models.dev provider id for this route. It matters
+	// when several gateways publish the same wire-level model id with different
+	// context limits.
+	CatalogProvider string `toml:"catalog_provider"`
+	MaxTokens       int    `toml:"max_tokens"`
 	// ContextWindow overrides the model-prefix lookup. See ProviderAnthropic.
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
@@ -342,11 +350,15 @@ type ProviderRaw struct {
 	// always had — added 2026-05-09 to close the gap that made
 	// `[provider.custom.<id>] api_key = "..."` silently drop the
 	// secret in TOML parsing.
-	APIKey      string `toml:"api_key"`
-	BaseURL     string `toml:"base_url"`
-	Model       string `toml:"model"`
-	MaxTokens   int    `toml:"max_tokens"`
-	TimeoutSecs int    `toml:"timeout_seconds"`
+	APIKey  string `toml:"api_key"`
+	BaseURL string `toml:"base_url"`
+	Model   string `toml:"model"`
+	// CatalogProvider maps an arbitrary local profile name (for example
+	// "bigmodel") to the canonical models.dev provider id (for example
+	// "zhipuai"). Empty defaults to the custom profile id.
+	CatalogProvider string `toml:"catalog_provider"`
+	MaxTokens       int    `toml:"max_tokens"`
+	TimeoutSecs     int    `toml:"timeout_seconds"`
 	// SupportsVision overrides model-catalog inference for custom profiles.
 	// nil keeps automatic detection; true/false is an explicit operator
 	// declaration. This is intentionally custom-profile-only because gateway

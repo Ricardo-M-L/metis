@@ -47,14 +47,14 @@ func TestEffortAPIIsCapabilityGatedAndPersistsSessionChoice(t *testing.T) {
 		t.Fatalf("persisted effort = %q err=%v", hdr.Effort, err)
 	}
 
-	// A turn/model/session transaction owns runMu. Effort must not validate
-	// against the old model and then land after a concurrent runtime switch.
+	// A running turn owns runMu for its whole lifetime, but effort is a live
+	// preference: the next model request in that turn must observe the update.
 	s.runMu.Lock()
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/effort", bytes.NewBufferString(`{"effort":"low"}`)))
 	s.runMu.Unlock()
-	if rr.Code != http.StatusConflict || loop.EffortValue() != llm.EffortHigh {
-		t.Fatalf("busy effort update = %d %s value=%q", rr.Code, rr.Body.String(), loop.EffortValue())
+	if rr.Code != http.StatusOK || loop.EffortValue() != llm.EffortLow || !bytes.Contains(rr.Body.Bytes(), []byte(`"applies":"next model request"`)) {
+		t.Fatalf("running-turn effort update = %d %s value=%q", rr.Code, rr.Body.String(), loop.EffortValue())
 	}
 
 	// Persistence is the commit point: a disk failure must leave the live
@@ -67,7 +67,7 @@ func TestEffortAPIIsCapabilityGatedAndPersistsSessionChoice(t *testing.T) {
 	}
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/effort", bytes.NewBufferString(`{"effort":"medium"}`)))
-	if rr.Code != http.StatusInternalServerError || loop.EffortValue() != llm.EffortHigh {
+	if rr.Code != http.StatusInternalServerError || loop.EffortValue() != llm.EffortLow {
 		t.Fatalf("failed effort persistence = %d %s value=%q", rr.Code, rr.Body.String(), loop.EffortValue())
 	}
 

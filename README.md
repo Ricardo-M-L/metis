@@ -230,7 +230,7 @@ A later source wins when two skills have the same name.
 
 | Key | What |
 |------|------|
-| `Shift+Tab` | cycle permission mode (default → acceptEdits → plan → bypassPermissions) |
+| `Shift+Tab` | cycle permission mode (default → acceptEdits → plan → bypassPermissions → fullAccess) |
 | `Ctrl+T` | toggle todo overlay |
 | `Ctrl+O` | expand the last tool result |
 | `Ctrl+P` | session picker |
@@ -252,13 +252,17 @@ A later source wins when two skills have the same name.
 | `!cmd` | bash mode — runs `cmd` in shell without invoking the LLM |
 | Enter mid-turn | queue input; runs as the next turn after the current one finishes |
 
-`fullAccess` is intentionally excluded from the `Shift+Tab` cycle. Select it
-explicitly with `/permissions`, `/fullAccess`, Desktop settings, or the
+`fullAccess` is the final, red-marked step in the `Shift+Tab` cycle. It can also
+be selected with `/permissions`, `/fullAccess`, Desktop settings, or the
 dangerous CLI flag. Explicit policy denials, hooks, argument validation, OS
 permissions, timeouts, and tool/provider errors still apply. When leaving
 `fullAccess`, METIS stops background jobs and sub-agents and disconnects
 MCP/Computer Use processes because an already-running unsandboxed process
 cannot be made safe retroactively; reconnect those services if needed.
+Mode switching remains available while a turn is running. A tool already in
+`Execute` finishes under the posture that admitted it; the requested mode is
+applied atomically before the next tool batch and the TUI remains responsive
+while it waits for that boundary.
 
 Mouse capture defaults to cell-motion mode so Metis can scroll the transcript,
 copy clicked or dragged transcript text, open rendered links, and drag-select

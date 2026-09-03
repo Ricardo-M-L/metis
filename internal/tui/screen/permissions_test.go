@@ -56,7 +56,7 @@ func TestPermissionsScreen_EmptyRulesShowsHint(t *testing.T) {
 // TestPermissionsScreen_InitialModeCursor — cursor seeded by `currentMode`.
 func TestPermissionsScreen_InitialModeCursor(t *testing.T) {
 	// Cursor seeded by currentMode. The widget exposes all six external
-	// modes; dontAsk and fullAccess are intentionally not in the Shift+Tab cycle.
+	// modes; dontAsk is intentionally not in the Shift+Tab cycle.
 	cases := []struct {
 		current string
 		want    int

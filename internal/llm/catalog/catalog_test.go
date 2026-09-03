@@ -287,6 +287,59 @@ func TestLookupContextWindowByModelID_HitAfterFetch(t *testing.T) {
 	}
 }
 
+// TestLookupContextWindowByModelID_DuplicateRoutesAreAmbiguous covers models
+// that are re-published by several gateways with different advertised limits.
+// A model-only lookup must not silently pick one provider's value.
+func TestLookupContextWindowByModelID_DuplicateRoutesAreAmbiguous(t *testing.T) {
+	c := newClientFor(t, "http://invalid")
+	c.cached = Catalog{
+		"official": Provider{Models: map[string]Model{
+			"glm-5.3": {Limit: Limit{Context: 1_000_000}},
+		}},
+		"gateway-a": Provider{Models: map[string]Model{
+			"glm-5.3": {Limit: Limit{Context: 1_048_576}},
+		}},
+		"gateway-b": Provider{Models: map[string]Model{
+			"glm-5.3": {Limit: Limit{Context: 1_048_560}},
+		}},
+	}
+
+	if got, ok := c.LookupContextWindowByModelID("glm-5.3"); ok || got != 0 {
+		t.Fatalf("ambiguous model-only lookup: got (%d, %v), want (0, false)", got, ok)
+	}
+}
+
+func TestLookupContextWindow_UsesProviderAndModel(t *testing.T) {
+	c := newClientFor(t, "http://invalid")
+	c.cached = Catalog{
+		"zhipuai": Provider{Models: map[string]Model{
+			"glm-5.3": {Limit: Limit{Context: 1_000_000}},
+		}},
+		"gateway": Provider{Models: map[string]Model{
+			"glm-5.3": {Limit: Limit{Context: 1_048_576}},
+		}},
+	}
+
+	tests := []struct {
+		providerID string
+		modelID    string
+		want       int
+		wantOK     bool
+	}{
+		{providerID: "zhipuai", modelID: "glm-5.3", want: 1_000_000, wantOK: true},
+		{providerID: "gateway", modelID: "glm-5.3", want: 1_048_576, wantOK: true},
+		{providerID: "missing", modelID: "glm-5.3"},
+		{providerID: "zhipuai", modelID: "missing"},
+	}
+	for _, tt := range tests {
+		got, ok := c.LookupContextWindow(tt.providerID, tt.modelID)
+		if got != tt.want || ok != tt.wantOK {
+			t.Errorf("LookupContextWindow(%q, %q) = (%d, %v), want (%d, %v)",
+				tt.providerID, tt.modelID, got, ok, tt.want, tt.wantOK)
+		}
+	}
+}
+
 // TestLookupContextWindowByModelID_MissBeforeFetch — without a prior
 // Get(), the in-memory cache is nil and lookup must return ok=false
 // rather than panic or block. This is the cold-start path where the

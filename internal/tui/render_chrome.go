@@ -617,8 +617,13 @@ func renderStatusBar(m *Model) string {
 	}
 	if used > 0 {
 		right = formatTokensRaw(used) + " tokens"
-		if m.loop != nil && m.loop.Provider != nil {
-			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
+		if m.loop != nil {
+			// ContextWindow is part of the loop's provider/model runtime
+			// snapshot and is refreshed atomically on every session/model switch.
+			// Do not re-query the provider while painting an idle frame: besides
+			// wasting work, a catalog-backed implementation could observe a
+			// different route than the one bound to this session.
+			if _, _, cap := m.loop.ProviderModelSnapshot(); cap > 0 {
 				right = fmt.Sprintf("%s (%s)", right, formatContextPct(used, cap))
 			}
 		}
@@ -835,6 +840,10 @@ func renderHints(m *Model) string {
 		// saw the mode badge vanish, and read the screen as "frozen".
 		return styleWarn.Render("  ⏳ waiting for your permission decision above") +
 			styleMuted.Render(" · you can keep typing here") + "\n"
+	}
+	if m.permissionModePending {
+		return styleWarn.Render("  ⏳ permission mode → "+string(m.permissionModeTarget)) +
+			styleMuted.Render(" · waiting for the current tool boundary") + "\n"
 	}
 	mode := string(m.gate.Mode())
 	glyph, col := modeIcon(mode)

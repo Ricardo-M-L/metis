@@ -16,7 +16,9 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
 	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
+	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	pubprov "github.com/Ricardo-M-L/metis/pkg/provider"
 )
@@ -99,6 +101,70 @@ func TestBuildProvider_Custom_OpenAITransport(t *testing.T) {
 	}
 	if pb.MaxOutputTokens != transport.DefaultMaxOutputTokens {
 		t.Errorf("effective default max_tokens = %d, want %d", pb.MaxOutputTokens, transport.DefaultMaxOutputTokens)
+	}
+}
+
+func TestBuildProvider_CustomPropagatesCatalogProviderIdentity(t *testing.T) {
+	t.Setenv("FAKE_KEY", "sk-test")
+	tests := []struct {
+		name             string
+		transport        string
+		catalogProvider  string
+		want             string
+		assertProviderID func(t *testing.T, provider pubprov.Provider) string
+	}{
+		{
+			name: "explicit OpenAI-compatible catalog provider", transport: "openai_chat",
+			catalogProvider: "zhipuai", want: "zhipuai",
+			assertProviderID: func(t *testing.T, provider pubprov.Provider) string {
+				t.Helper()
+				p, ok := provider.(*openai.OpenAI)
+				if !ok {
+					t.Fatalf("provider type = %T, want *openai.OpenAI", provider)
+				}
+				return p.CatalogProvider
+			},
+		},
+		{
+			name: "explicit Anthropic-compatible catalog provider", transport: "anthropic_messages",
+			catalogProvider: "minimax", want: "minimax",
+			assertProviderID: func(t *testing.T, provider pubprov.Provider) string {
+				t.Helper()
+				p, ok := provider.(*anthropic.Anthropic)
+				if !ok {
+					t.Fatalf("provider type = %T, want *anthropic.Anthropic", provider)
+				}
+				return p.CatalogProvider
+			},
+		},
+		{
+			name: "profile id is the default catalog provider", transport: "openai_chat",
+			want: "profile-id",
+			assertProviderID: func(t *testing.T, provider pubprov.Provider) string {
+				t.Helper()
+				p, ok := provider.(*openai.OpenAI)
+				if !ok {
+					t.Fatalf("provider type = %T, want *openai.OpenAI", provider)
+				}
+				return p.CatalogProvider
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newCfgWithCustom("profile-id", config.ProviderRaw{
+				Transport: tt.transport, APIKeyEnv: "FAKE_KEY",
+				BaseURL: "https://api.example.invalid/v1", Model: "shared-model",
+				CatalogProvider: tt.catalogProvider,
+			})
+			pb, err := BuildProvider(cfg, "profile-id", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := tt.assertProviderID(t, pb.Provider); got != tt.want {
+				t.Fatalf("catalog provider = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

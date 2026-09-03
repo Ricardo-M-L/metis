@@ -275,21 +275,6 @@ func (c *Client) loadFromDisk() (Catalog, error) {
 	return cat, nil
 }
 
-// LookupContextWindowByModelID scans the in-memory catalog for any
-// provider that publishes a model with the given id and returns its
-// Limit.Context. ok=false when the cache hasn't been populated yet
-// (nobody called Get) or no provider lists this model.
-//
-// Synchronous + read-only — safe to call from provider.MaxContextTokens
-// hot paths. Never makes a network request; callers that need
-// fresh data must call Get explicitly before this.
-//
-// Model IDs in models.dev are globally unique enough that scanning
-// without a provider hint is fine (e.g. "deepseek-v4-pro" only
-// appears under the deepseek provider). The first hit wins; the only
-// realistic collision shape is a self-hosted re-publish of a hosted
-// model under a different provider name, which would carry the same
-// window anyway.
 // LookupVisionByModelID reports whether the given model accepts image
 // input, per the models.dev catalog's modalities.input array. Returns
 // (supported, found) — found=false when the model isn't in the catalog
@@ -343,18 +328,50 @@ func (c *Client) LookupReasoningByModelID(modelID string) (bool, bool) {
 	return false, found
 }
 
+// LookupContextWindow returns the context limit for one exact catalog
+// provider/model pair. Provider IDs are the top-level keys from models.dev,
+// not transport names such as "openai_chat".
+func (c *Client) LookupContextWindow(providerID, modelID string) (int, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || providerID == "" || modelID == "" {
+		return 0, false
+	}
+	p, ok := c.cached[providerID]
+	if !ok {
+		return 0, false
+	}
+	m, ok := p.Models[modelID]
+	if !ok || m.Limit.Context <= 0 {
+		return 0, false
+	}
+	return m.Limit.Context, true
+}
+
+// LookupContextWindowByModelID is the provider-agnostic compatibility
+// fallback. It succeeds only when every catalog route that publishes the
+// model agrees on the same positive limit. Conflicting routes are ambiguous
+// and return ok=false rather than guessing a provider or depending on Go map
+// iteration order.
 func (c *Client) LookupContextWindowByModelID(modelID string) (int, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.cached == nil || modelID == "" {
 		return 0, false
 	}
+	window := 0
 	for _, p := range c.cached {
 		if m, ok := p.Models[modelID]; ok && m.Limit.Context > 0 {
-			return m.Limit.Context, true
+			if window == 0 {
+				window = m.Limit.Context
+				continue
+			}
+			if window != m.Limit.Context {
+				return 0, false
+			}
 		}
 	}
-	return 0, false
+	return window, window > 0
 }
 
 // LookupCostByModelID scans every provider for a model whose key

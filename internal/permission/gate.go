@@ -35,8 +35,8 @@ const (
 )
 
 // Modes is the canonical public set. Shift+Tab intentionally uses CycleModes
-// below: dontAsk and fullAccess remain explicit selections so an accidental
-// keypress cannot enter either non-interactive or host-unrestricted posture.
+// below: dontAsk remains an explicit selection because cycling into a mode
+// that silently rejects otherwise interactive requests is surprising.
 var Modes = []Mode{
 	ModeAcceptEdits,
 	ModeBypassPermissions,
@@ -46,13 +46,15 @@ var Modes = []Mode{
 	ModePlan,
 }
 
-// CycleModes matches Claude Code's public Shift+Tab cycle when bypass mode is
-// available: default -> acceptEdits -> plan -> bypassPermissions -> default.
+// CycleModes is the interactive Shift+Tab sequence. fullAccess follows
+// bypassPermissions so the dedicated no-sandbox posture is reachable from the
+// same mode control that advertises itself in the footer.
 var CycleModes = []Mode{
 	ModeDefault,
 	ModeAcceptEdits,
 	ModePlan,
 	ModeBypassPermissions,
+	ModeFullAccess,
 }
 
 // ParseMode validates a user/session value and returns its canonical form.

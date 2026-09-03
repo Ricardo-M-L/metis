@@ -1,7 +1,9 @@
 package tui
 
 import (
-	"errors"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -21,15 +23,6 @@ func applyModelPermissionMode(m *Model, mode permission.Mode) error {
 	if m == nil {
 		return nil
 	}
-	// A foreground turn may already have admitted a tool under the current
-	// permission/sandbox posture. Changing that posture before the turn reaches
-	// its boundary would race the in-flight execution (most critically when
-	// leaving fullAccess and re-enabling the sandbox). Keep every TUI-owned
-	// entry point fail-closed; model-owned Enter/ExitPlanMode tools do not call
-	// this helper and retain their exclusive dispatcher semantics.
-	if m.turnActive {
-		return errors.New("running turn is active; stop or cancel it before changing permission mode")
-	}
 	if err := applyPermissionMode(m.gate, m.loop, m.ext.Sandbox, mode); err != nil {
 		return err
 	}
@@ -42,6 +35,87 @@ func applyModelPermissionMode(m *Model, mode permission.Mode) error {
 		m.executePermission("n")
 	}
 	return nil
+}
+
+type permissionModeTransitionResultMsg struct {
+	seq            uint64
+	mode           permission.Mode
+	err            error
+	successRole    string
+	successContent string
+}
+
+// requestModelPermissionMode applies idle transitions synchronously and queues
+// active-turn transitions in tea.Cmd. The runtime permission coordinator holds
+// the write side of Gate's dispatch barrier, so a tool that already entered
+// Execute completes with its original posture while every later batch waits
+// for the new Gate+Sandbox state to settle.
+func (m *Model) requestModelPermissionMode(mode permission.Mode, successRole, successContent string) tea.Cmd {
+	if m == nil {
+		return nil
+	}
+	mode = permission.CanonicalMode(string(mode))
+	if !m.turnActive {
+		if err := applyModelPermissionMode(m, mode); err != nil {
+			m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
+		} else if successContent != "" {
+			m.messages = append(m.messages, Message{Role: successRole, Content: successContent, Timestamp: time.Now()})
+		}
+		return nil
+	}
+	if m.permissionModePending {
+		return nil
+	}
+
+	// A visible Ask belongs to the old posture and keeps its dispatch lease
+	// until answered. Deny it before requesting the transition so the writer
+	// cannot deadlock behind a prompt that the operator just superseded.
+	if m.permActive {
+		m.executePermission("n")
+	}
+	m.permissionModeSeq++
+	seq := m.permissionModeSeq
+	m.permissionModePending = true
+	m.permissionModeTarget = mode
+	gate, loop, manager := m.gate, m.loop, m.ext.Sandbox
+	return func() tea.Msg {
+		err := applyPermissionMode(gate, loop, manager, mode)
+		return permissionModeTransitionResultMsg{
+			seq: seq, mode: mode, err: err,
+			successRole: successRole, successContent: successContent,
+		}
+	}
+}
+
+func (m *Model) handlePermissionModeTransitionResult(result permissionModeTransitionResultMsg) {
+	if m == nil || result.seq != m.permissionModeSeq {
+		return
+	}
+	m.permissionModePending = false
+	m.permissionModeTarget = ""
+	if result.err != nil {
+		m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + result.err.Error(), Timestamp: time.Now()})
+		return
+	}
+	if m.gate != nil {
+		committed := m.gate.Mode()
+		if committed == result.mode {
+			if result.successContent != "" {
+				m.messages = append(m.messages, Message{Role: result.successRole, Content: result.successContent, Timestamp: time.Now()})
+			}
+			return
+		}
+		m.messages = append(m.messages, Message{
+			Role: "info",
+			Content: "permission mode change to " + string(result.mode) +
+				" was superseded by " + string(committed),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+	if result.successContent != "" {
+		m.messages = append(m.messages, Message{Role: result.successRole, Content: result.successContent, Timestamp: time.Now()})
+	}
 }
 
 func applyREPLPermissionMode(r *REPL, mode permission.Mode) error {

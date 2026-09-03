@@ -2596,7 +2596,12 @@ html, body { font-size: var(--font-base); }
 /* ---- Chat content lane ---- */
 .chat-area { padding: 16px 16px 8px; scroll-behavior: auto; }
 .message { max-width: 736px; margin: 0 auto 16px; }
-.message-user { max-width: 736px; }
+.message-user {
+  max-width: 736px;
+  flex-direction: column;
+  align-items: flex-end;
+  margin-bottom: 8px;
+}
 .message-user .message-bubble {
   background: var(--surface-2);
   border: none;
@@ -2609,7 +2614,10 @@ html, body { font-size: var(--font-base); }
   box-shadow: none;
 }
 .message-avatar { display: none; }
-.message-assistant { gap: 0; }
+.message-assistant {
+  gap: 0;
+  margin-bottom: 32px;
+}
 .message-body { padding-left: 0; }
 .message-content { font-size: 16px; line-height: 24px; color: var(--fg-strong); }
 

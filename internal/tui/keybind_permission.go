@@ -120,18 +120,19 @@ func (m *Model) executePermission(key string) {
 	m.permArgs = ""
 }
 
-func (m *Model) cyclePermissionMode() {
+func (m *Model) cyclePermissionMode() tea.Cmd {
 	now := time.Now()
 	if now.Sub(m.startTime) < modeCycleStartupGrace {
-		return
+		return nil
 	}
 	if !m.lastModeCycle.IsZero() && now.Sub(m.lastModeCycle) < modeCycleDebounce {
-		return
+		return nil
 	}
 	m.lastModeCycle = now
 
-	// Claude Code's public cycle intentionally excludes dontAsk:
-	// default -> acceptEdits -> plan -> bypassPermissions -> default.
+	// dontAsk remains an explicit /permissions selection because landing in a
+	// silent-deny posture through a shortcut is surprising. fullAccess is part
+	// of the advertised cycle and renders a persistent red danger badge.
 	modes := permission.CycleModes
 	current := m.gate.Mode()
 	nextIdx := 0
@@ -142,14 +143,8 @@ func (m *Model) cyclePermissionMode() {
 		}
 	}
 	nextMode := modes[nextIdx]
-	if err := applyModelPermissionMode(m, nextMode); err != nil {
-		m.messages = append(m.messages, Message{
-			Role:      "error",
-			Content:   "permission mode unchanged: " + err.Error(),
-			Timestamp: now,
-		})
-	}
 	// Mode change is shown in the footer ("· plan mode on (shift+tab to
 	// cycle)"). We deliberately don't append a chat message — every
 	// Shift+Tab press would otherwise pollute history.
+	return m.requestModelPermissionMode(nextMode, "", "")
 }

@@ -32,11 +32,12 @@ import (
 // new field (e.g. context cancellation, logger) doesn't break every
 // constructor signature.
 type BuildOpts struct {
-	APIKey    string
-	BaseURL   string
-	Model     string
-	MaxTokens int
-	Timeout   int // seconds; 0 = use provider default
+	APIKey          string
+	BaseURL         string
+	Model           string
+	CatalogProvider string
+	MaxTokens       int
+	Timeout         int // seconds; 0 = use provider default
 	// Extra is a flat string/string bag for transport-specific
 	// settings (Azure api_version, Vertex project/region, Bedrock
 	// secret_key/session_token, etc.) — keeps the registry signature

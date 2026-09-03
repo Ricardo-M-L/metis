@@ -681,8 +681,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "shift+tab":
-		m.cyclePermissionMode()
-		return m, nil
+		return m, m.cyclePermissionMode()
 
 	case "pgup":
 		// User scrolled away from the live tail — claude-code's

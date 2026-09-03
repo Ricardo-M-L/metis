@@ -52,7 +52,7 @@ func ClassifyMidTurn(s Signal) MidTurnClass {
 	// destroy state the in-flight turn depends on.
 	case SignalQuit, SignalClear, SignalNew, SignalCompact,
 		SignalReload, SignalUndo, SignalRewind, SignalRetry, SignalBranch,
-		SignalResume, SignalSessions, SignalPlan, SignalFullAccess:
+		SignalResume, SignalSessions, SignalPlan:
 		return MidTurnDestructive
 	// Custom: handler returned resolved prompt text in display; we
 	// route that text through SteerInject instead of letting it

@@ -336,6 +336,53 @@ func TestExpandedThinkingRowCannotShrinkIntoFollowingMessage(t *testing.T) {
 	}
 }
 
+func TestUserMessageActionsAndConversationSpacingFollowTurnHierarchy(t *testing.T) {
+	s, _ := testServer(t)
+	get := func(path string) string {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	style := get("/style.css")
+	lastRule := func(selector string) string {
+		start := strings.LastIndex(style, selector+" {")
+		if start < 0 {
+			t.Fatalf("style.css missing canonical %s rule", selector)
+		}
+		end := strings.Index(style[start:], "\n}")
+		if end < 0 {
+			t.Fatalf("cannot isolate canonical %s rule", selector)
+		}
+		return style[start : start+end]
+	}
+
+	userRule := lastRule(".message-user")
+	for _, want := range []string{"flex-direction: column;", "align-items: flex-end;", "margin-bottom: 8px;"} {
+		if !strings.Contains(userRule, want) {
+			t.Fatalf("user messages do not keep their actions below the bubble or close to the reply; missing %q in %q", want, userRule)
+		}
+	}
+	assistantRule := lastRule(".message-assistant")
+	if !strings.Contains(assistantRule, "margin-bottom: 32px;") {
+		t.Fatalf("assistant replies do not separate completed turns; rule=%q", assistantRule)
+	}
+
+	chat := get("/chat.js")
+	userStart := strings.Index(chat, "if (role === 'user') {")
+	assistantStart := strings.Index(chat[userStart:], "} else {")
+	if userStart < 0 || assistantStart < 0 {
+		t.Fatal("cannot isolate user message markup")
+	}
+	userMarkup := chat[userStart : userStart+assistantStart]
+	if strings.Index(userMarkup, "message-bubble") >= strings.Index(userMarkup, "messageActionsMarkup('user'") {
+		t.Fatal("user message actions must be emitted after the bubble")
+	}
+}
+
 func TestComposerSuppressesRootHorizontalScrollAndExplainsPermissionModes(t *testing.T) {
 	s, _ := testServer(t)
 	get := func(path string) string {

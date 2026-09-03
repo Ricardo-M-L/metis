@@ -56,11 +56,14 @@ const (
 // We hand-roll the HTTP layer to keep the dependency footprint minimal
 // and to control SSE parsing precisely.
 type Anthropic struct {
-	APIKey    string
-	BaseURL   string
-	Model     string
-	MaxTokens int
-	Beta      string
+	APIKey  string
+	BaseURL string
+	Model   string
+	// CatalogProvider is the models.dev provider id for this concrete route.
+	// It is separate from Name(), which identifies the Anthropic wire format.
+	CatalogProvider string
+	MaxTokens       int
+	Beta            string
 	// ContextWindow, when > 0, overrides the model-prefix lookup in
 	// MaxContextTokens(). Lets users on Anthropic-compatible third-party
 	// gateways (MiniMax, OpenRouter, ...) declare the real window so
@@ -211,10 +214,18 @@ func (a *Anthropic) MaxContextTokens() int {
 	if a.ContextWindow > 0 {
 		return a.ContextWindow
 	}
-	// Tier 2 — models.dev catalog. Background-warmed singleton; nil-safe
-	// for CI env without HOME, miss-safe before the fetch completes.
+	// Tier 2 — exact catalog-provider + model lookup from the
+	// background-warmed models.dev cache. Without a provider identity, only an
+	// unambiguous model-only result is accepted.
 	if cli := catalog.Default(); cli != nil {
-		if w, ok := cli.LookupContextWindowByModelID(a.Model); ok {
+		var w int
+		var ok bool
+		if a.CatalogProvider != "" {
+			w, ok = cli.LookupContextWindow(a.CatalogProvider, a.Model)
+		} else {
+			w, ok = cli.LookupContextWindowByModelID(a.Model)
+		}
+		if ok {
 			return w
 		}
 	}

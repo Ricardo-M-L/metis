@@ -1789,6 +1789,12 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	if !validSessionID(id) || hdr == nil {
 		return errors.New("invalid session")
 	}
+	// Session activation may replace provider/model and always restores the
+	// persisted effort. Serialize that boundary with live /api/effort updates;
+	// unlike runMu this lock is released before Loop.Run starts, so reasoning
+	// effort remains selectable while a turn is executing.
+	s.effortMu.Lock()
+	defer s.effortMu.Unlock()
 
 	s.stateMu.RLock()
 	activeID := s.activeSessionID
@@ -2888,6 +2894,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer s.runMu.Unlock()
+		// A model switch can change whether effort is supported and can reset the
+		// live value. Keep it atomic with concurrent /api/effort updates.
+		s.effortMu.Lock()
+		defer s.effortMu.Unlock()
 		if s.loop == nil {
 			writeError(w, http.StatusServiceUnavailable, "agent loop unavailable")
 			return

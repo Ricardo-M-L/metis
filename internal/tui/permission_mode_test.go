@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -9,7 +8,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 )
 
-func TestApplyModelPermissionModeRejectsActiveTurnWithoutChangingPosture(t *testing.T) {
+func TestApplyModelPermissionModeAllowsActiveTurnAtToolBoundary(t *testing.T) {
 	if !sandbox.Available() {
 		t.Skipf("sandbox unavailable: %v", sandbox.Doctor().Err)
 	}
@@ -29,25 +28,21 @@ func TestApplyModelPermissionModeRejectsActiveTurnWithoutChangingPosture(t *test
 	}
 	m.turnActive = true
 
-	beforeMode := m.gate.Mode()
-	beforePlan := m.loop.IsPlanMode()
-	beforePrePlan := m.loop.PrePlanMode()
-	beforeSandbox := manager.State()
 	err = applyModelPermissionMode(m, permission.ModeDefault)
-	if err == nil || !strings.Contains(err.Error(), "running turn is active") {
-		t.Fatalf("active-turn permission transition error = %v, want explicit running-turn refusal", err)
+	if err != nil {
+		t.Fatalf("active-turn permission transition: %v", err)
 	}
-	if got := m.gate.Mode(); got != beforeMode {
-		t.Fatalf("active-turn refusal changed gate mode: got %q, want %q", got, beforeMode)
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("active-turn transition mode = %q, want default", got)
 	}
-	if got := m.loop.IsPlanMode(); got != beforePlan {
-		t.Fatalf("active-turn refusal changed plan state: got %v, want %v", got, beforePlan)
+	if m.loop.IsPlanMode() {
+		t.Fatal("active-turn transition unexpectedly enabled plan mode")
 	}
-	if got := m.loop.PrePlanMode(); got != beforePrePlan {
-		t.Fatalf("active-turn refusal changed pre-plan lineage: got %q, want %q", got, beforePrePlan)
+	if got := m.loop.PrePlanMode(); got != "" {
+		t.Fatalf("active-turn transition retained pre-plan lineage %q", got)
 	}
-	if got := manager.State(); got != beforeSandbox {
-		t.Fatalf("active-turn refusal changed sandbox posture: got %+v, want %+v", got, beforeSandbox)
+	if manager.State().FullAccessRequired {
+		t.Fatal("active-turn transition did not restore the process sandbox")
 	}
 }
 
@@ -120,5 +115,47 @@ func TestApplyModelBypassRejectsStalePermissionPrompt(t *testing.T) {
 	}
 	if m.permActive || m.permReply != nil || m.permQuestion != "" || m.permTool != "" || m.permArgs != "" {
 		t.Fatal("stale prompt state was not cleared")
+	}
+}
+
+func TestActiveTurnModeChangeRejectsOldPromptBeforeQueueingTransition(t *testing.T) {
+	if !sandbox.Available() {
+		t.Skipf("sandbox unavailable: %v", sandbox.Doctor().Err)
+	}
+	manager, err := sandbox.NewManagerWithOptions(sandbox.Options{Mode: "off", TempRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	reply := make(chan agent.PermissionDecision, 1)
+	m := &Model{
+		gate:       permission.New(permission.ModeDefault),
+		loop:       &agent.Loop{},
+		ext:        ExternalHooks{Sandbox: manager},
+		turnActive: true,
+		permActive: true,
+		permReply:  reply,
+	}
+	cmd := m.requestModelPermissionMode(permission.ModeBypassPermissions, "", "")
+	if cmd == nil {
+		t.Fatal("active-turn mode change did not queue a transition")
+	}
+	select {
+	case got := <-reply:
+		if got != agent.PermissionDecisionDeny {
+			t.Fatalf("superseded prompt decision = %v, want deny", got)
+		}
+	default:
+		t.Fatal("superseded prompt was not resolved before transition queued")
+	}
+	if m.permActive || m.permReply != nil {
+		t.Fatal("superseded prompt UI state was not cleared")
+	}
+
+	updated, _ := m.Update(cmd())
+	*m = *(updated.(*Model))
+	if got := m.gate.Mode(); got != permission.ModeBypassPermissions {
+		t.Fatalf("settled permission mode = %q, want bypassPermissions", got)
 	}
 }

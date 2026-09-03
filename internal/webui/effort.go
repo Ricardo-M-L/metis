@@ -95,16 +95,11 @@ func (s *Server) handleEffort(w http.ResponseWriter, r *http.Request) {
 	}
 	s.effortMu.Lock()
 	defer s.effortMu.Unlock()
-	// Effort capability is model-specific. Serialize POST with turns, model
-	// switches and session activation so validation, persistence and the live
-	// update all describe one provider runtime. GET remains non-blocking.
-	if r.Method == http.MethodPost {
-		if !s.runMu.TryLock() {
-			writeError(w, http.StatusConflict, "cannot change effort while a turn or runtime switch is running")
-			return
-		}
-		defer s.runMu.Unlock()
-	}
+	// Effort is a live preference, so a POST is allowed while Loop.Run owns
+	// runMu. buildRequest snapshots it behind Loop.effortMu and the following
+	// model request observes the new value. Model and session transitions take
+	// this same mutex, which keeps capability validation, persistence and the
+	// live update on one coherent provider runtime without blocking on a turn.
 	cfg, _, err := config.Load()
 	if err != nil || cfg == nil {
 		writeError(w, http.StatusInternalServerError, "config unreadable")

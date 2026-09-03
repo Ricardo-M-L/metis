@@ -41,6 +41,18 @@ func isAnthropicOrigin(baseURL string) bool {
 	return host == "api.anthropic.com" || strings.HasSuffix(host, ".anthropic.com")
 }
 
+func isOpenAIOrigin(baseURL string) bool {
+	if baseURL == "" {
+		return true
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "api.openai.com" || strings.HasSuffix(host, ".openai.com")
+}
+
 // ProviderBuild is the result of constructing an LLM provider client.
 // `Model` is the resolved model id (after applying flag overrides + cfg
 // defaults). Callers downstream — agent loop, compactor, builtin Agent —
@@ -218,6 +230,10 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			cfg.Provider.Anthropic.AnthropicBeta,
 		)
 		prov.ContextWindow = cfg.Provider.Anthropic.ContextWindow
+		prov.CatalogProvider = strings.ToLower(strings.TrimSpace(cfg.Provider.Anthropic.CatalogProvider))
+		if prov.CatalogProvider == "" && isAnthropicOrigin(cfg.Provider.Anthropic.BaseURL) {
+			prov.CatalogProvider = "anthropic"
+		}
 		prov.AntiDistillation = cfg.Provider.Anthropic.AntiDistillation
 		prov.ClientSideDecoys = cfg.Provider.Anthropic.ClientSideDecoys
 		// If the user enabled anti_distillation but is talking to a
@@ -278,6 +294,10 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			cfg.Provider.OpenAI.Temperature,
 		)
 		prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
+		prov.CatalogProvider = strings.ToLower(strings.TrimSpace(cfg.Provider.OpenAI.CatalogProvider))
+		if prov.CatalogProvider == "" && isOpenAIOrigin(cfg.Provider.OpenAI.BaseURL) {
+			prov.CatalogProvider = "openai"
+		}
 		Preconnect(cfg.Provider.OpenAI.BaseURL)
 		return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
 	case "gemini", "google":
@@ -346,12 +366,13 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 	}
 
 	opts := transport.BuildOpts{
-		APIKey:        key,
-		BaseURL:       raw.BaseURL,
-		Model:         model,
-		MaxTokens:     raw.MaxTokens,
-		Timeout:       raw.TimeoutSecs,
-		ContextWindow: raw.ContextWindow,
+		APIKey:          key,
+		BaseURL:         raw.BaseURL,
+		Model:           model,
+		CatalogProvider: strings.ToLower(strings.TrimSpace(raw.CatalogProvider)),
+		MaxTokens:       raw.MaxTokens,
+		Timeout:         raw.TimeoutSecs,
+		ContextWindow:   raw.ContextWindow,
 		Extra: map[string]string{
 			// Azure
 			"api_version": raw.APIVersion,
@@ -367,6 +388,9 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 			"prompt_cache_key":     strings.TrimSpace(raw.PromptCacheKey),
 			"hosted_tools":         strings.Join(raw.HostedTools, ","),
 		},
+	}
+	if opts.CatalogProvider == "" {
+		opts.CatalogProvider = id
 	}
 
 	res, err := transport.MustBuild(transportName, opts)

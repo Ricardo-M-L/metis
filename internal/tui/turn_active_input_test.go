@@ -15,30 +15,55 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
-func TestTurnActive_PermissionSlashCannotChangeMode(t *testing.T) {
+func TestTurnActive_PermissionSlashChangesModeWithoutSteering(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.turnActive = true
-	beforeMode := m.gate.Mode()
-	beforePlan := m.loop.IsPlanMode()
-	beforePrePlan := m.loop.PrePlanMode()
 	m.input.SetValue("/default")
 
-	pressEnter(t, m)
+	cmd := pressEnter(t, m)
+	if cmd == nil {
+		t.Fatal("mid-turn /default did not queue a permission transition")
+	}
+	updated, _ := m.Update(runCmd(t, cmd))
+	*m = *(updated.(*Model))
 
-	if got := m.gate.Mode(); got != beforeMode || got != permission.ModeAcceptEdits {
-		t.Fatalf("mid-turn /default changed gate mode: got %q, want %q", got, beforeMode)
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("mid-turn /default mode = %q, want default", got)
 	}
-	if got := m.loop.IsPlanMode(); got != beforePlan {
-		t.Fatalf("mid-turn /default changed plan state: got %v, want %v", got, beforePlan)
+	if m.loop.IsPlanMode() {
+		t.Fatal("mid-turn /default unexpectedly enabled plan mode")
 	}
-	if got := m.loop.PrePlanMode(); got != beforePrePlan {
-		t.Fatalf("mid-turn /default changed plan lineage: got %q, want %q", got, beforePrePlan)
-	}
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "running turn is active") {
-		t.Fatalf("mid-turn /default did not surface a refusal: %+v", m.messages)
+	if got := m.loop.PrePlanMode(); got != "" {
+		t.Fatalf("mid-turn /default retained plan lineage %q", got)
 	}
 	if got := m.loop.SteerInjectDrainForTest(); got != "" {
 		t.Fatalf("mid-turn /default leaked into model steering: %q", got)
+	}
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "mode: default") {
+		t.Fatalf("mid-turn /default confirmation missing: %+v", m.messages)
+	}
+}
+
+func TestTurnActive_ModeCommandChangesModeWithoutSteering(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.turnActive = true
+	m.input.SetValue("/mode default")
+
+	cmd := pressEnter(t, m)
+	if cmd == nil {
+		t.Fatal("mid-turn /mode default did not queue a permission transition")
+	}
+	updated, _ := m.Update(runCmd(t, cmd))
+	*m = *(updated.(*Model))
+
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("mid-turn /mode default mode = %q, want default", got)
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("mid-turn /mode default leaked into model steering: %q", got)
+	}
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "mode set to: default") {
+		t.Fatalf("mid-turn /mode confirmation missing: %+v", m.messages)
 	}
 }
 

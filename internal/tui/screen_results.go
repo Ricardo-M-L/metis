@@ -152,28 +152,15 @@ func (m *Model) applyScreenResult(s screen.Screen) tea.Cmd {
 			})
 			return nil
 		}
-		if err := applyModelPermissionMode(m, permission.Mode(applied)); err != nil {
-			m.messages = append(m.messages, Message{
-				Role:      "error",
-				Content:   "permission mode unchanged: " + err.Error(),
-				Timestamp: time.Now(),
-			})
-			return nil
-		}
 		if applied == string(permission.ModeFullAccess) {
-			m.messages = append(m.messages, Message{
-				Role: "warning",
-				Content: "DANGER: fullAccess enabled — approval prompts and the process sandbox are disabled. " +
+			return m.requestModelPermissionMode(
+				permission.ModeFullAccess,
+				"warning",
+				"DANGER: fullAccess enabled — approval prompts and the process sandbox are disabled. "+
 					"Model-controlled tools now run with all access granted to your OS account.",
-				Timestamp: time.Now(),
-			})
-		} else {
-			m.messages = append(m.messages, Message{
-				Role:      "success",
-				Content:   "permission mode: " + applied,
-				Timestamp: time.Now(),
-			})
+			)
 		}
+		return m.requestModelPermissionMode(permission.Mode(applied), "success", "permission mode: "+applied)
 
 	case *screen.HelpScreen:
 		// User pressed Enter on a /help command row → dispatch that

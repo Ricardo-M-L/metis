@@ -58,11 +58,14 @@ var dbgOpenAI = os.Getenv("METIS_DEBUG_OPENAI") == "1"
 // Compatible with any OpenAI-Chat-style endpoint (Together, Groq, Ollama, etc.)
 // by overriding BaseURL.
 type OpenAI struct {
-	APIKey      string
-	BaseURL     string
-	Model       string
-	MaxTokens   int
-	Temperature float64
+	APIKey  string
+	BaseURL string
+	Model   string
+	// CatalogProvider is the models.dev provider id for this concrete route.
+	// It is distinct from Name(), which reports the wire transport.
+	CatalogProvider string
+	MaxTokens       int
+	Temperature     float64
 	// ContextWindow, when > 0, overrides the model-prefix lookup in
 	// MaxContextTokens(). Useful for OpenAI-compatible gateways
 	// (Together, Groq, Ollama) where the served model is a fine-tune
@@ -207,9 +210,9 @@ func (o *OpenAI) noteRateSuccess() {
 //     ~/.metis/config.toml. Highest priority because a self-hosted
 //     gateway or capped account might serve a smaller slice than the
 //     public model card claims.
-//  2. models.dev catalog — synchronous read of the in-memory cache
-//     populated by the background warm-up (catalog.Default()). Covers
-//     117 providers' published windows; updates as new models ship.
+//  2. models.dev catalog — exact catalog-provider + model lookup from the
+//     background-warmed cache. A missing provider identity permits only an
+//     unambiguous model-only result; conflicting gateway limits are ignored.
 //  3. Hardcoded prefix table — vendor-published numbers for the
 //     models metis users actually run today. Belt to catalog's braces
 //     so a cold start / offline session still picks the right window
@@ -351,7 +354,14 @@ func (o *OpenAI) MaxContextTokens() int {
 	// when HOME is unset, e.g. CI minimal env) and miss-safe (returns
 	// false until the background fetch completes).
 	if cli := catalog.Default(); cli != nil {
-		if w, ok := cli.LookupContextWindowByModelID(o.Model); ok {
+		var w int
+		var ok bool
+		if o.CatalogProvider != "" {
+			w, ok = cli.LookupContextWindow(o.CatalogProvider, o.Model)
+		} else {
+			w, ok = cli.LookupContextWindowByModelID(o.Model)
+		}
+		if ok {
 			return w
 		}
 	}

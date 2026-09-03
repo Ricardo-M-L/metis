@@ -30,6 +30,7 @@ func build(opts transport.BuildOpts) (*transport.Result, error) {
 		beta = opts.Extra["beta"]
 	}
 	p := New(opts.APIKey, opts.BaseURL, opts.Model, maxTokens, timeout, beta)
+	p.CatalogProvider = opts.CatalogProvider
 	if opts.ContextWindow > 0 {
 		p.ContextWindow = opts.ContextWindow
 	}

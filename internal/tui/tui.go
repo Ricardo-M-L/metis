@@ -615,11 +615,17 @@ type Model struct {
 	rewindSummarySeq     uint64
 	// /diff collection runs in tea.Cmd. Only the matching typed result may
 	// install a viewer; this rejects duplicates and stale session results.
-	diffPending        bool
-	diffSeq            uint64
-	updateCheckPending bool
-	updateCheckSeq     uint64
-	updateCheckRunner  updateCheckRunner
+	diffPending bool
+	diffSeq     uint64
+	// Permission transitions may have to wait for an already-admitted tool
+	// batch to finish under its original posture. Run that wait in tea.Cmd so
+	// Shift+Tab and /permissions stay responsive while the turn is active.
+	permissionModePending bool
+	permissionModeSeq     uint64
+	permissionModeTarget  permission.Mode
+	updateCheckPending    bool
+	updateCheckSeq        uint64
+	updateCheckRunner     updateCheckRunner
 	// MCP OAuth is an explicit, potentially two-minute browser flow. It runs
 	// as a tea.Cmd so Update remains responsive; this cancel handle lets
 	// Esc/Ctrl-C and application shutdown stop its callback listener and HTTP.

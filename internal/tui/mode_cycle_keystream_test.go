@@ -14,10 +14,10 @@ package tui
 // only the bubbletea runtime + pty layer (which we know are
 // unreliable under tmux) are bypassed.
 //
-// The cycle being locked: default → acceptEdits → plan → bypassPermissions → default.
-// This is the order from keybind_permission.go::cyclePermissionMode
-// after the 2026-05-11 ModeAuto removal — must match claude-code's
-// getNextPermissionMode.ts:39.
+// The cycle being locked: default → acceptEdits → plan → bypassPermissions →
+// fullAccess → default.
+// The first four entries retain the Claude Code-aligned sequence; METIS adds
+// its separate fullAccess posture as the final red-marked step.
 
 import (
 	"strings"
@@ -42,8 +42,12 @@ func pressShiftTab(t *testing.T, m *Model) {
 	if got := msg.String(); got != "shift+tab" {
 		t.Fatalf("bubbletea encoding sanity check failed: KeyTab+ModShift → %q, want shift+tab (test won't reach cyclePermissionMode)", got)
 	}
-	updated, _ := m.Update(msg)
+	updated, cmd := m.Update(msg)
 	*m = *(updated.(*Model))
+	if cmd != nil {
+		updated, _ = m.Update(cmd())
+		*m = *(updated.(*Model))
+	}
 	m.lastModeCycle = time.Time{} // let the next press through
 }
 
@@ -68,7 +72,7 @@ func modeCycleTestModel(t *testing.T) *Model {
 	}
 }
 
-// TestModeCycle_FullKeystreamWalk — the headline E2E. Four Shift+Tab
+// TestModeCycle_FullKeystreamWalk — the headline E2E. Five Shift+Tab
 // presses must walk Claude Code's interactive cycle back to default.
 // Locks both the order AND the wraparound. A future refactor that
 // drops a mode, reorders, or breaks the wrap will trip immediately.
@@ -78,14 +82,29 @@ func TestModeCycle_FullKeystreamWalk(t *testing.T) {
 		permission.ModeAcceptEdits,       // default → acceptEdits
 		permission.ModePlan,              // acceptEdits → plan
 		permission.ModeBypassPermissions, // plan → bypassPermissions
-		permission.ModeDefault,           // bypassPermissions → default (wraparound)
+		permission.ModeFullAccess,        // bypassPermissions → fullAccess
+		permission.ModeDefault,           // fullAccess → default (wraparound)
 	}
 	for i, expected := range want {
 		pressShiftTab(t, m)
 		if got := m.gate.Mode(); got != expected {
-			t.Fatalf("step %d: gate.Mode() = %q, want %q (full sequence: default → acceptEdits → plan → bypassPermissions → default)",
+			t.Fatalf("step %d: gate.Mode() = %q, want %q (full sequence: default → acceptEdits → plan → bypassPermissions → fullAccess → default)",
 				i+1, got, expected)
 		}
+	}
+}
+
+func TestModeCycle_EnteringFullAccessDisablesSandbox(t *testing.T) {
+	m := modeCycleTestModel(t)
+	for range 4 { // default → acceptEdits → plan → bypassPermissions → fullAccess
+		pressShiftTab(t, m)
+	}
+
+	if got := m.gate.Mode(); got != permission.ModeFullAccess {
+		t.Fatalf("4 Shift+Tab from default = %q, want fullAccess", got)
+	}
+	if !m.ext.Sandbox.State().FullAccessRequired {
+		t.Fatal("entering fullAccess through Shift+Tab did not disable the process sandbox")
 	}
 }
 
@@ -107,24 +126,87 @@ func TestModeCycle_FromFullAccessReturnsToDefault(t *testing.T) {
 	}
 }
 
-func TestModeCycle_TurnActivePreservesFullAccessPosture(t *testing.T) {
+func TestModeCycle_TurnActiveCanLeaveFullAccess(t *testing.T) {
 	m := modeCycleTestModel(t)
 	if err := applyModelPermissionMode(m, permission.ModeFullAccess); err != nil {
 		t.Fatal(err)
 	}
 	m.turnActive = true
-	beforeSandbox := m.ext.Sandbox.State()
-
 	pressShiftTab(t, m)
 
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("active-turn Shift+Tab mode = %q, want default", got)
+	}
+	if m.ext.Sandbox.State().FullAccessRequired {
+		t.Fatal("active-turn Shift+Tab did not restore the process sandbox")
+	}
+	for _, msg := range m.messages {
+		if strings.Contains(msg.Content, "running turn is active") {
+			t.Fatalf("active-turn Shift+Tab still surfaced a refusal: %+v", m.messages)
+		}
+	}
+}
+
+func TestModeCycle_TurnActiveQueuesBehindExecutingToolWithoutBlockingUI(t *testing.T) {
+	m := modeCycleTestModel(t)
+	if err := applyModelPermissionMode(m, permission.ModeFullAccess); err != nil {
+		t.Fatal(err)
+	}
+	m.turnActive = true
+
+	releaseTool, allowed, reason := m.gate.TryAcquireToolDispatchLease()
+	if !allowed {
+		t.Fatalf("acquire simulated tool dispatch lease: %s", reason)
+	}
+	released := false
+	defer func() {
+		if !released {
+			releaseTool()
+		}
+	}()
+
+	key := tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
+	updated, cmd := m.Update(key)
+	*m = *(updated.(*Model))
+	if cmd == nil {
+		t.Fatal("active-turn Shift+Tab did not return an asynchronous transition command")
+	}
+	if !m.permissionModePending || m.permissionModeTarget != permission.ModeDefault {
+		t.Fatalf("pending transition = (%v, %q), want (true, default)", m.permissionModePending, m.permissionModeTarget)
+	}
 	if got := m.gate.Mode(); got != permission.ModeFullAccess {
-		t.Fatalf("active-turn Shift+Tab changed mode to %q, want fullAccess", got)
+		t.Fatalf("mode changed before executing tool boundary: got %q", got)
 	}
-	if got := m.ext.Sandbox.State(); got != beforeSandbox {
-		t.Fatalf("active-turn Shift+Tab changed sandbox posture: got %+v, want %+v", got, beforeSandbox)
+	if hint := stripANSI(renderHints(m)); !strings.Contains(hint, "permission mode → default") || !strings.Contains(hint, "tool boundary") {
+		t.Fatalf("pending transition hint missing: %q", hint)
 	}
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].Content, "running turn is active") {
-		t.Fatalf("active-turn Shift+Tab did not surface a refusal: %+v", m.messages)
+
+	resultCh := make(chan tea.Msg, 1)
+	go func() { resultCh <- cmd() }()
+	select {
+	case <-resultCh:
+		t.Fatal("permission transition crossed an executing tool boundary")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseTool()
+	released = true
+	var result tea.Msg
+	select {
+	case result = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission transition did not finish after tool boundary released")
+	}
+	updated, _ = m.Update(result)
+	*m = *(updated.(*Model))
+	if m.permissionModePending {
+		t.Fatal("permission transition remained pending after completion")
+	}
+	if got := m.gate.Mode(); got != permission.ModeDefault {
+		t.Fatalf("settled active-turn mode = %q, want default", got)
+	}
+	if m.ext.Sandbox.State().FullAccessRequired {
+		t.Fatal("settled active-turn transition did not restore the sandbox")
 	}
 }
 
@@ -146,6 +228,7 @@ func TestModeCycle_HintsReflectEachStep(t *testing.T) {
 		{permission.ModeAcceptEdits, "acceptEdits mode", ""},
 		{permission.ModePlan, "plan mode", ""},
 		{permission.ModeBypassPermissions, "bypassPermissions mode", ""},
+		{permission.ModeFullAccess, "fullAccess mode", ""},
 		// Wraparound back to ask: badge is suppressed (only "shift+tab"
 		// hint remains — the claude-code-parity move).
 		{permission.ModeDefault, "shift+tab", "default mode"},

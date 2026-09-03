@@ -358,6 +358,31 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		if raw == "" {
 			return m, nil
 		}
+		// /mode is REPL-owned rather than a slash Signal. Keep it local while
+		// a turn runs so it changes the runtime permission posture instead of
+		// leaking the literal command into model steering.
+		if strings.HasPrefix(raw, "/") && m.cmds != nil {
+			name, modeArg, _ := cut(raw[1:], " ")
+			if cmd := m.cmds.Resolve(name); cmd != nil && cmd.Name == "mode" {
+				modeArg = strings.TrimSpace(modeArg)
+				m.input.Reset()
+				m.dismissPalette()
+				if modeArg == "" {
+					m.messages = append(m.messages, Message{Role: "info", Content: "mode: " + string(m.gate.Mode()), Timestamp: time.Now()})
+					return m, nil
+				}
+				requested, ok := permission.ParseMode(modeArg)
+				if !ok {
+					m.messages = append(m.messages, Message{Role: "error", Content: "unknown mode: " + modeArg + " (want default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", Timestamp: time.Now()})
+					return m, nil
+				}
+				if requested == permission.ModeFullAccess && m.gate.Mode() != permission.ModeFullAccess {
+					m.openFullAccessConfirmation()
+					return m, nil
+				}
+				return m, m.requestModelPermissionMode(requested, "success", "mode set to: "+string(requested))
+			}
+		}
 		// /model is REPL-owned, so slash.Parse reports SignalNone and cannot
 		// classify its real behavior. Switching transport/model/compactor while
 		// Run snapshots them is unsafe; require a fresh-turn boundary explicitly.
@@ -1098,17 +1123,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				submitPlanPrompt = true
 			}
 		case slash.SignalAcceptEdits:
-			if err := applyModelPermissionMode(m, permission.ModeAcceptEdits); err != nil {
-				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
-			} else {
-				m.messages = append(m.messages, Message{Role: "success", Content: "(mode: acceptEdits — file edits are accepted; other state changes may still ask)", Timestamp: time.Now()})
-			}
+			return m, m.requestModelPermissionMode(permission.ModeAcceptEdits, "success", "(mode: acceptEdits — file edits are accepted; other state changes may still ask)")
 		case slash.SignalBypassPermissions:
-			if err := applyModelPermissionMode(m, permission.ModeBypassPermissions); err != nil {
-				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
-			} else {
-				m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: bypassPermissions — tool calls auto-approved within the enforced credential boundary; use /default to restore prompts)", Timestamp: time.Now()})
-			}
+			return m, m.requestModelPermissionMode(permission.ModeBypassPermissions, "warning", "(mode: bypassPermissions — tool calls auto-approved within the enforced credential boundary; use /default to restore prompts)")
 		case slash.SignalFullAccess:
 			if m.gate.Mode() == permission.ModeFullAccess {
 				m.messages = append(m.messages, Message{Role: "info", Content: "(mode already fullAccess)", Timestamp: time.Now()})
@@ -1116,17 +1133,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.openFullAccessConfirmation()
 			}
 		case slash.SignalDefault:
-			if err := applyModelPermissionMode(m, permission.ModeDefault); err != nil {
-				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
-			} else {
-				m.messages = append(m.messages, Message{Role: "success", Content: "(mode: default — ask before state changes)", Timestamp: time.Now()})
-			}
+			return m, m.requestModelPermissionMode(permission.ModeDefault, "success", "(mode: default — ask before state changes)")
 		case slash.SignalDontAsk:
-			if err := applyModelPermissionMode(m, permission.ModeDontAsk); err != nil {
-				m.messages = append(m.messages, Message{Role: "error", Content: "permission mode unchanged: " + err.Error(), Timestamp: time.Now()})
-			} else {
-				m.messages = append(m.messages, Message{Role: "warning", Content: "(mode: dontAsk — actions requiring approval will be denied)", Timestamp: time.Now()})
-			}
+			return m, m.requestModelPermissionMode(permission.ModeDontAsk, "warning", "(mode: dontAsk — actions requiring approval will be denied)")
 		case slash.SignalRetry:
 			// A retry replaces the prior user→assistant exchange, then submits
 			// the same user prompt immediately. Merely prefilling the editor

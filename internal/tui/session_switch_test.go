@@ -19,6 +19,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -288,6 +289,62 @@ func TestActivateSessionRebindsAllSessionScopedState(t *testing.T) {
 	sourceTiming, err := store.ReadTiming("source")
 	if err != nil || len(sourceTiming) != 0 {
 		t.Fatalf("source timing received destination event: %+v, err=%v", sourceTiming, err)
+	}
+}
+
+func TestActivateSessionRestoresProviderSpecificContextWindow(t *testing.T) {
+	t.Setenv("SESSION_ROUTE_KEY", "sk-test")
+	m, store := newSessionSwitchModel(t, permission.ModeAsk)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"route-small": {
+			Transport: "openai_chat", APIKeyEnv: "SESSION_ROUTE_KEY",
+			BaseURL: "http://127.0.0.1:1/v1", Model: "shared-model",
+			ContextWindow: 100_000, MaxTokens: 4_096,
+		},
+		"route-large": {
+			Transport: "openai_chat", APIKeyEnv: "SESSION_ROUTE_KEY",
+			BaseURL: "http://127.0.0.1:1/v1", Model: "shared-model",
+			ContextWindow: 240_000, MaxTokens: 4_096,
+		},
+	}
+
+	sourceBuild, err := rtpkg.BuildProvider(m.cfg, "route-small", "shared-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.loop.RebindProviderRuntime(sourceBuild.Provider, sourceBuild.Model, sourceBuild.MaxOutputTokens, m.loop.System, m.loop.SystemSections)
+	m.model = sourceBuild.Model
+	m.providerName = "route-small"
+	if err := store.WriteHeaderFull(session.Header{
+		ID: "source", Provider: "route-small", Model: "shared-model",
+		System: "base-system", Mode: string(permission.ModeAsk),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target := session.Header{
+		ID: "provider-window-target", Provider: "route-large", Model: "shared-model",
+		System: "base-system", Mode: string(permission.ModeAsk),
+	}
+	if err := store.WriteHeaderFull(target); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.activateSession(target.ID, &target, nil, true); err != nil {
+		t.Fatalf("activate large-window session: %v", err)
+	}
+	if _, model, window := m.loop.ProviderModelSnapshot(); m.providerName != "route-large" || model != "shared-model" || window != 240_000 {
+		t.Fatalf("large-window binding = provider %q model %q window %d", m.providerName, model, window)
+	}
+
+	sourceHeader, _, err := store.LoadHeader("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.activateSession("source", sourceHeader, nil, true); err != nil {
+		t.Fatalf("reactivate small-window session: %v", err)
+	}
+	if _, model, window := m.loop.ProviderModelSnapshot(); m.providerName != "route-small" || model != "shared-model" || window != 100_000 {
+		t.Fatalf("small-window binding = provider %q model %q window %d", m.providerName, model, window)
 	}
 }
 

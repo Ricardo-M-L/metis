@@ -51,8 +51,8 @@ type PermissionsScreen struct {
 // NewPermissionsScreen builds the widget. `currentMode` is the active
 // permission mode; rules is a snapshot of the gate's rules.
 func NewPermissionsScreen(currentMode string, rules []PermRule) *PermissionsScreen {
-	// fullAccess is an explicit selector entry but intentionally remains absent
-	// from Shift+Tab so a stray keypress cannot disable the host sandbox.
+	// dontAsk remains an explicit selector entry and is intentionally absent
+	// from Shift+Tab; fullAccess is also reachable from the keyboard cycle.
 	modes := []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "fullAccess"}
 	cur := 0 // default
 	for i, m := range modes {

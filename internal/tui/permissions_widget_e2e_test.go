@@ -136,6 +136,43 @@ func TestFullAccessSlashCommandsRequireConfirmation(t *testing.T) {
 	}
 }
 
+func TestFullAccessSlashCanConfirmWhileTurnIsActive(t *testing.T) {
+	m := newSlashTestModel(t)
+	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	m.ext.Sandbox = manager
+	m.gate.SetMode(permission.ModeDefault)
+	m.turnActive = true
+	m.input.SetValue("/fullAccess")
+
+	if cmd := pressEnter(t, m); cmd != nil {
+		t.Fatal("opening the mid-turn fullAccess confirmation unexpectedly started background work")
+	}
+	if _, ok := m.activeScreen.(*screen.PermissionsScreen); !ok {
+		t.Fatalf("mid-turn /fullAccess did not open confirmation; got %T", m.activeScreen)
+	}
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	*m = *(updated.(*Model))
+	if cmd == nil {
+		t.Fatal("confirming mid-turn fullAccess did not queue a permission transition")
+	}
+	updated, _ = m.Update(runCmd(t, cmd))
+	*m = *(updated.(*Model))
+	if got := m.gate.Mode(); got != permission.ModeFullAccess {
+		t.Fatalf("confirmed mid-turn permission mode = %q, want fullAccess", got)
+	}
+	if !manager.State().FullAccessRequired {
+		t.Fatal("confirmed mid-turn fullAccess did not disable the process sandbox")
+	}
+	if got := m.loop.SteerInjectDrainForTest(); got != "" {
+		t.Fatalf("mid-turn /fullAccess leaked into model steering: %q", got)
+	}
+}
+
 func TestModeCommandLeavesFullAccessWithoutDangerConfirmation(t *testing.T) {
 	m := newSlashTestModel(t)
 	manager, err := sandbox.NewManager(string(sandbox.ModeOff))
