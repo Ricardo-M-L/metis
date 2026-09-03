@@ -56,7 +56,7 @@ func smokeProvider(t *testing.T) llm.Provider {
 	t.Helper()
 	key := os.Getenv("GLM_KEY")
 	if key == "" {
-		key = "6ba62aa4117e44afba2a3899b68d3479.qV9oCtFiMf76DNlS"
+		t.Skip("GLM_KEY is required for the real-provider smoke test")
 	}
 	return openai.New(key, smokeProviderURL, smokeProviderModel, smokeMaxTokens, smokeRequestTimeout, 0.4)
 }
