@@ -54,6 +54,30 @@ func TestTaskCreate_WrapsStore(t *testing.T) {
 	}
 }
 
+func TestTaskCreate_AcceptsOwnerFromTeamPlan(t *testing.T) {
+	setupTaskTestEnv(t)
+	tool := TaskCreate{gate: permission.New(permission.ModeBypass)}
+	_, err := tool.Execute(context.Background(), map[string]any{
+		"subject":     "inspect cache policy",
+		"description": "compare the provider paths",
+		"owner":       "alice",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got, ok := taskstore.CurrentTaskStore().Get("1")
+	if !ok {
+		t.Fatal("task #1 not found")
+	}
+	if got.Owner != "alice" {
+		t.Fatalf("Owner = %q, want alice", got.Owner)
+	}
+	props := TaskCreate{}.InputSchema()["properties"].(map[string]any)
+	if _, ok := props["owner"]; !ok {
+		t.Fatal("TaskCreate schema does not publish owner")
+	}
+}
+
 func TestTaskCreate_RequiresSubject(t *testing.T) {
 	setupTaskTestEnv(t)
 	tool := TaskCreate{gate: permission.New(permission.ModeBypass)}
@@ -75,6 +99,25 @@ func TestTaskCreate_ErrorWhenNoStore(t *testing.T) {
 	})
 	if err == nil {
 		t.Errorf("Execute should error when no current store is set")
+	}
+}
+
+func TestTaskToolsPreferTurnSessionOverGlobalRouter(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	taskstore.SetCurrentTaskStore("viewed-session")
+	t.Cleanup(func() { taskstore.SetCurrentTaskStore("") })
+	ctx := taskstore.WithSessionID(context.Background(), "running-session")
+	tool := TaskCreate{gate: permission.New(permission.ModeBypass)}
+	if _, err := tool.Execute(ctx, map[string]any{
+		"subject": "stay with running turn", "description": "session isolation",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := taskstore.TaskStoreForSession("running-session").List(false); len(got) != 1 {
+		t.Fatalf("running session tasks = %d, want 1", len(got))
+	}
+	if got := taskstore.TaskStoreForSession("viewed-session").List(false); len(got) != 0 {
+		t.Fatalf("viewed session received %d leaked task(s)", len(got))
 	}
 }
 

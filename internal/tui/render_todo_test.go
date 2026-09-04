@@ -24,7 +24,7 @@ func TestRenderTodoSnapshot(t *testing.T) {
 	got := renderTodoSnapshotWith([]TaskItem{
 		{ID: "1", Status: "completed", Content: "Bump event channel buffers 64 → 256"},
 		{ID: "2", Status: "completed", Content: "Stream the compaction call"},
-		{ID: "3", Status: "in_progress", Content: "Add Google Gemini provider"},
+		{ID: "3", Status: "in_progress", Content: "Add Google Gemini provider", Owner: "alice"},
 		{ID: "4", Status: "pending", Content: "Write release notes"},
 	})
 
@@ -84,6 +84,7 @@ func TestRenderTodoSnapshot(t *testing.T) {
 		"Bump event channel buffers 64 → 256",
 		"Stream the compaction call",
 		"Add Google Gemini provider",
+		"@alice",
 		"Write release notes",
 	} {
 		if !strings.Contains(plain, content) {

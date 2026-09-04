@@ -304,6 +304,7 @@ async function pollStatus(shouldApply = () => true) {
     if (generation !== statusRequestGeneration || !shouldApply()) return;
     lastStatusSnapshot = d;
     renderStatusSnapshot(d);
+    if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d);
   } catch (_) { /* status is best-effort */ }
 }
 

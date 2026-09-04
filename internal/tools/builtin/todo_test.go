@@ -206,3 +206,24 @@ func TestTodoWrite_SingleTaskBackCompat(t *testing.T) {
 		t.Errorf("single-task upsert broken: %+v", tl.Items)
 	}
 }
+
+func TestTodoWritePrefersTurnSessionOverGlobalRouter(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	tasks.SetCurrentSessionID("viewed-session")
+	t.Cleanup(func() { tasks.SetCurrentSessionID("") })
+	ctx := tasks.WithSessionID(context.Background(), "running-session")
+	tool := Todo{gate: permission.New(permission.ModeBypass)}
+	if _, err := tool.Execute(ctx, map[string]any{
+		"content": "stay with running turn", "status": "in_progress",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	running, err := tasks.Load("running-session")
+	if err != nil || len(running.Items) != 1 {
+		t.Fatalf("running session tasks = %+v, err=%v", running.Items, err)
+	}
+	viewed, err := tasks.Load("viewed-session")
+	if err != nil || len(viewed.Items) != 0 {
+		t.Fatalf("viewed session received leaked tasks = %+v, err=%v", viewed.Items, err)
+	}
+}

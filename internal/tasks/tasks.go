@@ -7,6 +7,7 @@
 package tasks
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +43,7 @@ type Item struct {
 	Content   string    `json:"content"`
 	Status    string    `json:"status"`   // pending | in_progress | completed
 	Priority  string    `json:"priority"` // low | medium | high
+	Owner     string    `json:"owner,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -73,7 +75,13 @@ func Load(sessionID string) (*List, error) {
 		return nil, err
 	}
 	if err := json.Unmarshal(b, tl); err != nil {
-		return nil, fmt.Errorf("tasks: parse %s: %w", path(sessionID), err)
+		// Legacy builds and hand-edited fixtures may contain a bare array.
+		// Keep that format readable while every new Save uses the envelope.
+		var items []Item
+		if bareErr := json.Unmarshal(b, &items); bareErr != nil {
+			return nil, fmt.Errorf("tasks: parse %s: %w", path(sessionID), err)
+		}
+		tl.Items = items
 	}
 	if tl.SessionID == "" {
 		tl.SessionID = sessionID
@@ -304,6 +312,30 @@ var (
 	currMu  sync.RWMutex
 	current string
 )
+
+type sessionContextKey struct{}
+
+// WithSessionID pins task persistence to the session that owns a turn. The
+// process-level router remains as a compatibility fallback for callers that
+// do not execute inside an agent turn (status panes, legacy tests and CLI
+// helpers), but live tools must prefer this immutable context value.
+func WithSessionID(ctx context.Context, id string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sessionContextKey{}, strings.TrimSpace(id))
+}
+
+// SessionIDFromContext returns the turn-pinned session id when present and
+// otherwise falls back to the legacy process router.
+func SessionIDFromContext(ctx context.Context) string {
+	if ctx != nil {
+		if id, ok := ctx.Value(sessionContextKey{}).(string); ok && id != "" {
+			return id
+		}
+	}
+	return CurrentSessionID()
+}
 
 // SetCurrentSessionID is called by setupRuntime once a session id
 // exists (either freshly created or resumed). Empty input is allowed

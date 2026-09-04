@@ -36,7 +36,9 @@ time, each item {content, status, priority?}. This REPLACES the whole
 list, so you restate every task and its current status on each call —
 which is exactly what stops earlier tasks from being left half-done.
 Example: marking task 2 done → send all tasks, with task 1 completed,
-task 2 completed, task 3 pending. Keep exactly ONE task in_progress.
+task 2 completed, task 3 pending. Keep exactly ONE task in_progress for
+a serial plan. Independent parallel sub-agents may each own an in_progress
+task; never mark dependent steps active at the same time.
 
 (A single-task form — bare content+status — still works for one-off
 updates, but prefer the array: it's how you avoid forgetting to close
@@ -71,7 +73,8 @@ Skip when:
 
   - pending → in_progress when you start working on it
   - in_progress → completed when done
-  - Only ONE task should be in_progress at a time; finish (or push back to pending) before starting the next.
+  - Serial plan: only ONE task should be in_progress at a time.
+  - Parallel plan: independent tasks with distinct agent owners may be in_progress together.
 
 ## Examples
 
@@ -130,7 +133,7 @@ func (Todo) InputSchema() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"content":  map[string]any{"type": "string", "description": "Task description."},
-			"status":   map[string]any{"type": "string", "description": "pending | in_progress | completed. Keep exactly ONE in_progress."},
+			"status":   map[string]any{"type": "string", "description": "pending | in_progress | completed. One in_progress for serial work; multiple only for independent parallel agents."},
 			"priority": map[string]any{"type": "string", "description": "high | medium | low"},
 		},
 		"required": []string{"content", "status"},
@@ -168,7 +171,8 @@ func (t Todo) CanUse(_ context.Context, _ map[string]any) (tools.Permission, str
 	return tools.PermissionAllow, "task-tracker (no external side effects)"
 }
 
-func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (Todo) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	sessionID := tasks.SessionIDFromContext(ctx)
 	// Preferred path: a `todos` array IS the entire list (Claude Code
 	// semantics). Every major model is trained on this declarative form,
 	// and replacing the whole list each call means a task can never be
@@ -176,7 +180,7 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	// (2026-06-14 bug). Falls through to the legacy single-task upsert
 	// only when no array is given.
 	if raw, ok := in["todos"].([]any); ok && len(raw) > 0 {
-		return replaceTodoList(raw)
+		return replaceTodoList(sessionID, raw)
 	}
 
 	content, _ := in["content"].(string)
@@ -187,7 +191,7 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	status, _ := in["status"].(string)
 	priority, _ := in["priority"].(string)
 
-	saved, err := tasks.Upsert(tasks.CurrentSessionID(), tasks.Item{
+	saved, err := tasks.Upsert(sessionID, tasks.Item{
 		ID: id, Content: content, Status: status, Priority: priority,
 	})
 	if err != nil {
@@ -203,7 +207,7 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 	}
 	prioIcon := map[string]string{"high": "🔴", "medium": "🟡", "low": "🟢"}[saved.Priority]
 	out := fmt.Sprintf("%s %s [%s] %s", icon, prioIcon, saved.ID, saved.Content)
-	if nudge := todoVerifierNudge(saved.Status); nudge != "" {
+	if nudge := todoVerifierNudge(sessionID, saved.Status); nudge != "" {
 		out += "\n\n" + nudge
 	}
 	return &tools.Result{Output: out}, nil
@@ -212,7 +216,7 @@ func (Todo) Execute(_ context.Context, in map[string]any) (*tools.Result, error)
 // replaceTodoList handles the Claude-Code full-list form: parse the
 // todos array, replace the entire stored list, and render it back so
 // the model sees every task's resulting status in one place.
-func replaceTodoList(raw []any) (*tools.Result, error) {
+func replaceTodoList(sessionID string, raw []any) (*tools.Result, error) {
 	items := make([]tasks.Item, 0, len(raw))
 	for _, r := range raw {
 		m, ok := r.(map[string]any)
@@ -231,7 +235,7 @@ func replaceTodoList(raw []any) (*tools.Result, error) {
 	if len(items) == 0 {
 		return &tools.Result{Output: "TodoWrite: `todos` array had no items with content.", IsError: true}, nil
 	}
-	tl, err := tasks.ReplaceAll(tasks.CurrentSessionID(), items)
+	tl, err := tasks.ReplaceAll(sessionID, items)
 	if err != nil {
 		return &tools.Result{Output: "TodoWrite: " + err.Error(), IsError: true}, nil
 	}
@@ -242,7 +246,7 @@ func replaceTodoList(raw []any) (*tools.Result, error) {
 	out := strings.TrimRight(b.String(), "\n")
 	// Reuse the verify-step advisory: it reads the freshly-saved list,
 	// so it works identically for the full-list form.
-	if nudge := todoVerifierNudge("completed"); nudge != "" {
+	if nudge := todoVerifierNudge(sessionID, "completed"); nudge != "" {
 		out += "\n\n" + nudge
 	}
 	return &tools.Result{Output: out}, nil
@@ -277,11 +281,11 @@ func todoStatusIcon(status string) string {
 // verify/test/review/vet/lint/audit (case-insensitive). Cheaper
 // than the TaskStore version since `tasks.Item` has no separate
 // owner field.
-func todoVerifierNudge(justSetStatus string) string {
+func todoVerifierNudge(sessionID, justSetStatus string) string {
 	if justSetStatus != "completed" {
 		return ""
 	}
-	tl, err := tasks.Load(tasks.CurrentSessionID())
+	tl, err := tasks.Load(sessionID)
 	if err != nil || tl == nil {
 		return ""
 	}
@@ -340,12 +344,12 @@ func (TodoRead) InputSchema() map[string]any {
 func (t TodoRead) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	return tools.PermissionAllow, "read-only"
 }
-func (TodoRead) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
-	tl, err := tasks.Load(tasks.CurrentSessionID())
+func (TodoRead) Execute(ctx context.Context, _ map[string]any) (*tools.Result, error) {
+	items, err := tasks.PlanningItems(tasks.SessionIDFromContext(ctx))
 	if err != nil {
 		return &tools.Result{Output: "TodoRead: " + err.Error(), IsError: true}, nil
 	}
-	if len(tl.Items) == 0 {
+	if len(items) == 0 {
 		return &tools.Result{Output: "(no tasks yet — call TodoWrite to create one)"}, nil
 	}
 	// Format: `<icon> <status> <content>`. Matches claude-code's
@@ -358,7 +362,7 @@ func (TodoRead) Execute(_ context.Context, _ map[string]any) (*tools.Result, err
 	// historically tempted models to copy-paste rather than rely
 	// on content stability — and added visual noise.
 	var b strings.Builder
-	for _, it := range tl.Items {
+	for _, it := range items {
 		icon := "○"
 		switch it.Status {
 		case "completed":
@@ -366,7 +370,11 @@ func (TodoRead) Execute(_ context.Context, _ map[string]any) (*tools.Result, err
 		case "in_progress":
 			icon = "◐"
 		}
-		fmt.Fprintf(&b, "%s %-11s  %s\n", icon, it.Status, it.Content)
+		owner := ""
+		if it.Owner != "" {
+			owner = "  (owner: " + it.Owner + ")"
+		}
+		fmt.Fprintf(&b, "%s %-11s  %s%s\n", icon, it.Status, it.Content, owner)
 	}
 	return &tools.Result{Output: strings.TrimRight(b.String(), "\n")}, nil
 }

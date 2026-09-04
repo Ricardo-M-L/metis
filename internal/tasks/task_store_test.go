@@ -133,3 +133,56 @@ func TestTaskStore_OutputAppendsNewline(t *testing.T) {
 		t.Errorf("output should accumulate with newline: %q", got.Output)
 	}
 }
+
+func TestPlanningItemsUnifiesTodoAndStructuredTasks(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if _, err := Upsert("session-plan", Item{Content: "inspect existing code", Status: "completed"}); err != nil {
+		t.Fatal(err)
+	}
+	store := TaskStoreForSession("session-plan")
+	created, err := store.Create("implement independent module", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := "alice"
+	status := TaskInProgress
+	if _, err := store.Update(created.ID, TaskPatch{Owner: &owner, Status: &status}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := PlanningItems("session-plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("PlanningItems len = %d, want 2: %+v", len(items), items)
+	}
+	if items[1].Content != "implement independent module" || items[1].Status != "in_progress" || items[1].Owner != "alice" {
+		t.Fatalf("structured projection = %+v", items[1])
+	}
+}
+
+func TestPlanningItemsDeduplicatesEquivalentTaskNames(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if _, err := Upsert("session-dedup", Item{Content: "1. inspect cache policy", Status: "pending"}); err != nil {
+		t.Fatal(err)
+	}
+	store := TaskStoreForSession("session-dedup")
+	created, err := store.CreateOwned("inspect cache policy", "", "", "alice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := TaskInProgress
+	if _, err := store.Update(created.ID, TaskPatch{Status: &status}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := PlanningItems("session-dedup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("PlanningItems len = %d, want one merged task: %+v", len(items), items)
+	}
+	if items[0].Status != "in_progress" || items[0].Owner != "alice" {
+		t.Fatalf("merged task = %+v", items[0])
+	}
+}

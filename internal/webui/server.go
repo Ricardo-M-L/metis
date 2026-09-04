@@ -38,6 +38,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/processutil"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
+	"github.com/Ricardo-M-L/metis/internal/slash"
 	"github.com/Ricardo-M-L/metis/internal/tasks"
 	tui "github.com/Ricardo-M-L/metis/internal/tui"
 	metisversion "github.com/Ricardo-M-L/metis/internal/version"
@@ -1500,6 +1501,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		log.Printf("turn pre-request: history load=%dms activate=%dms (session %s, %d msgs)", loadMs, activateMs, body.SessionID, len(history))
 	}
 	input := strings.TrimSpace(body.Input)
+	modelInput := desktopModelInput(input)
 	nextMetricTurn := s.nextMessageMetricTurn(body.SessionID, history)
 	alignTraceTurnFloor(body.SessionID, nextMetricTurn)
 	messageMetric := session.MessageMetric{
@@ -1515,9 +1517,14 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	user.Content = append(user.Content, imgBlocks...)
 	if len(imgBlocks) > 0 {
-		s.loop.AppendUserBlocks(user.Content)
+		modelBlocks := make([]llm.ContentBlock, 0, len(user.Content))
+		if modelInput != "" {
+			modelBlocks = append(modelBlocks, llm.ContentBlock{Type: "text", Text: modelInput})
+		}
+		modelBlocks = append(modelBlocks, imgBlocks...)
+		s.loop.AppendUserBlocks(modelBlocks)
 	} else {
-		s.loop.AppendUser(input)
+		s.loop.AppendUser(modelInput)
 	}
 	if err := s.store.AppendMessage(body.SessionID, user); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to persist input")
@@ -1694,6 +1701,23 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	finalStatus = "completed"
 	writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text.String()})
+}
+
+// desktopModelInput keeps the user's compact /batch command in durable
+// history while giving the shared Loop the same orchestration contract as the
+// CLI/TUI command. Ordinary prompts are byte-for-byte unchanged.
+func desktopModelInput(input string) string {
+	trimmed := strings.TrimSpace(input)
+	const command = "/batch"
+	if len(trimmed) <= len(command) || !strings.EqualFold(trimmed[:len(command)], command) ||
+		!unicode.IsSpace(rune(trimmed[len(command)])) {
+		return input
+	}
+	task := strings.TrimSpace(trimmed[len(command):])
+	if task == "" {
+		return input
+	}
+	return slash.BatchPrompt(task)
 }
 
 func displayTurnCount(history []llm.Message) int {
@@ -3041,9 +3065,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	subAgents := 0
+	namedAgents := 0
 	agentDetails := make([]map[string]any, 0)
 	if s.roster != nil {
-		subAgents = s.roster.Summary().Total
+		summary := s.roster.Summary()
+		subAgents = summary.Total
+		namedAgents = summary.Named
 		for _, teammate := range s.roster.List() {
 			if teammate == nil {
 				continue
@@ -3100,6 +3127,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.stateMu.RLock()
 	activeSessionID := s.activeSessionID
 	s.stateMu.RUnlock()
+	planItems := []tasks.Item(nil)
+	if activeSessionID != "" {
+		planItems, _ = tasks.PlanningItems(activeSessionID)
+	}
+	executionStrategy := executionStrategyForStatus(len(planItems), subAgents, namedAgents)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
 		"agents": agentDetails, "jobs": jobDetails,
@@ -3107,9 +3139,24 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"contextUsed": contextUsed, "contextWindow": contextWindow, "compactThreshold": compactThreshold,
 		"compactAtTokens": compactAtTokens,
 		"turnRunning":     turnRunning, "runningSessionId": runningSessionID,
-		"activeSessionId": activeSessionID,
-		"build":           s.buildVersion,
+		"activeSessionId":   activeSessionID,
+		"planItems":         planItems,
+		"executionStrategy": executionStrategy,
+		"build":             s.buildVersion,
 	})
+}
+
+func executionStrategyForStatus(planItems, subAgents, namedAgents int) string {
+	switch {
+	case namedAgents >= 2:
+		return "coordinated_agent_team"
+	case subAgents >= 2:
+		return "parallel_sub_agents"
+	case planItems > 0:
+		return "planned_single_agent"
+	default:
+		return "direct"
+	}
 }
 
 // handleSteer folds a busy-composer message into the in-flight agent run.

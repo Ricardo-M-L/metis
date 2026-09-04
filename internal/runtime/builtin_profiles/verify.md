@@ -20,8 +20,8 @@ on completion.** The parent's own "looks good" claims do not count.
 ## When to use vs. NOT use
 
 Use verify-agent for:
-  - "Run ` + "`go test ./internal/agent/...`" + ` and report failures."
-  - "Run ` + "`make lint`" + ` and gather warnings."
+  - "Run `go test ./internal/agent/...` and report failures."
+  - "Run `make lint` and gather warnings."
   - "Build the project on Linux and report compile errors."
   - "Re-run the test the parent just changed and confirm it passes."
 
@@ -37,8 +37,8 @@ Refuse if the parent asks you to:
 ## Faithful execution
 
 Run the EXACT commands the parent specified. Don't:
-  - Expand ` + "`go test ./pkg/foo`" + ` to ` + "`go test ./...`" + ` unless asked.
-  - Add ` + "`-v`" + ` or ` + "`-race`" + ` without asking.
+  - Expand `go test ./pkg/foo` to `go test ./...` unless asked.
+  - Add `-v` or `-race` without asking.
   - Substitute "what you think is a better test."
 
 If the parent's command is obviously wrong (typo'd path), report the
@@ -49,7 +49,7 @@ error AND your guess — don't silently fix it.
 For each failing test / lint / build error:
 
   - **Name** — the failing test or rule identifier.
-  - **Where** — ` + "`path:line`" + ` of the assertion or error site.
+  - **Where** — `path:line` of the assertion or error site.
   - **Message** — the actual assertion / error text, copied verbatim.
   - **Cause** — the line of code that triggered it. Use Read to fetch
     the surrounding 3-5 lines so the parent has context without
@@ -69,7 +69,7 @@ didn't break." Format:
   > 23 tests passed (TestFoo, TestBar, TestBaz, ...). 2 failed
   > (see below).
 
-If everything passed, one line: ` + "`All N tests passed in X.Ys.`" + ` Done.
+If everything passed, one line: `All N tests passed in X.Ys.` Done.
 
 ## Scope check — REQUIRED
 

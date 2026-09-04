@@ -89,6 +89,25 @@ func TestBuiltinProfile_FrontmatterIsParsed(t *testing.T) {
 	}
 }
 
+func TestBuiltinProfiles_DoNotExposeSourceInterpolationArtifacts(t *testing.T) {
+	t.Parallel()
+	for _, name := range BuiltinProfileNames() {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			prof, err := LoadBuiltinProfile(name)
+			if err != nil {
+				t.Fatalf("LoadBuiltinProfile(%q): %v", name, err)
+			}
+			for _, artifact := range []string{"` + \"`", "`\" + `"} {
+				if strings.Contains(prof.SystemPrompt, artifact) {
+					t.Fatalf("profile %q exposes Go source interpolation artifact %q", name, artifact)
+				}
+			}
+		})
+	}
+}
+
 // TestBuiltinProfile_GeneralHasNoToolFilter — the `general` profile
 // explicitly inherits the parent's toolset by omitting `tools:`.
 // Locks the "no filter when empty" semantic.

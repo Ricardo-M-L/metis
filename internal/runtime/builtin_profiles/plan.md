@@ -38,8 +38,8 @@ Don't plan blind. Spend the first 3-5 turns on:
 ## Plan structure
 
 Output as a numbered list. Each step carries:
-  - **What** — one-sentence action ("Add ` + "`Foo.Validate()`" + ` method").
-  - **Where** — exact files with ` + "`path:line`" + ` anchors when known.
+  - **What** — one-sentence action ("Add `Foo.Validate()` method").
+  - **Where** — exact files with `path:line` anchors when known.
   - **Why** — the reason this step exists (constraint, test, downstream
     dependency). Skip "because we need it."
   - **Risk / dependency** — what could break, what must complete first.

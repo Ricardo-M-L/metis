@@ -20,8 +20,8 @@ import (
 // Mirrors claude-code's Task tools layout (one tool per CRUD operation).
 // All output is JSON so the LLM can parse + reason cheaply.
 
-func currentStoreOrErr() (*taskstore.TaskStore, error) {
-	s := taskstore.CurrentTaskStore()
+func currentStoreOrErr(ctx context.Context) (*taskstore.TaskStore, error) {
+	s := taskstore.TaskStoreFromContext(ctx)
 	if s == nil {
 		return nil, errors.New("no task store for the current session")
 	}
@@ -47,6 +47,7 @@ func (TaskCreate) InputSchema() map[string]any {
 			"subject":     map[string]any{"type": "string", "description": "brief title (imperative)"},
 			"description": map[string]any{"type": "string", "description": "what needs to be done"},
 			"activeForm":  map[string]any{"type": "string", "description": "present-continuous form for the spinner (e.g. \"Running tests\")"},
+			"owner":       map[string]any{"type": "string", "description": "optional teammate identity responsible for this task"},
 			"metadata":    map[string]any{"type": "object", "description": "arbitrary metadata"},
 		},
 	}
@@ -56,19 +57,20 @@ func (t TaskCreate) CanUse(_ context.Context, _ map[string]any) (tools.Permissio
 	d, src := t.gate.Check(context.Background(), "TaskCreate", "")
 	return mapDecision(d), src
 }
-func (t TaskCreate) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	store, err := currentStoreOrErr()
+func (t TaskCreate) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	store, err := currentStoreOrErr(ctx)
 	if err != nil {
 		return nil, err
 	}
 	subj, _ := in["subject"].(string)
 	desc, _ := in["description"].(string)
 	active, _ := in["activeForm"].(string)
+	owner, _ := in["owner"].(string)
 	var meta map[string]any
 	if m, ok := in["metadata"].(map[string]any); ok {
 		meta = m
 	}
-	tk, err := store.Create(subj, desc, active, meta)
+	tk, err := store.CreateOwned(subj, desc, active, owner, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +102,8 @@ func (t TaskGet) CanUse(_ context.Context, _ map[string]any) (tools.Permission, 
 	d, src := t.gate.Check(context.Background(), "TaskGet", "")
 	return mapDecision(d), src
 }
-func (t TaskGet) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	store, err := currentStoreOrErr()
+func (t TaskGet) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	store, err := currentStoreOrErr(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -160,8 +162,8 @@ func (t TaskList) CanUse(_ context.Context, _ map[string]any) (tools.Permission,
 	d, src := t.gate.Check(context.Background(), "TaskList", "")
 	return mapDecision(d), src
 }
-func (t TaskList) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	store, err := currentStoreOrErr()
+func (t TaskList) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	store, err := currentStoreOrErr(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -218,8 +220,8 @@ func (t TaskUpdate) CanUse(_ context.Context, _ map[string]any) (tools.Permissio
 	d, src := t.gate.Check(context.Background(), "TaskUpdate", "")
 	return mapDecision(d), src
 }
-func (t TaskUpdate) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	store, err := currentStoreOrErr()
+func (t TaskUpdate) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	store, err := currentStoreOrErr(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -361,8 +363,8 @@ func (t TaskOutput) CanUse(_ context.Context, _ map[string]any) (tools.Permissio
 	d, src := t.gate.Check(context.Background(), "TaskOutput", "")
 	return mapDecision(d), src
 }
-func (t TaskOutput) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	store, err := currentStoreOrErr()
+func (t TaskOutput) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	store, err := currentStoreOrErr(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -402,8 +404,8 @@ func (t TaskStop) CanUse(_ context.Context, _ map[string]any) (tools.Permission,
 	d, src := t.gate.Check(context.Background(), "TaskStop", "")
 	return mapDecision(d), src
 }
-func (t TaskStop) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	store, err := currentStoreOrErr()
+func (t TaskStop) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	store, err := currentStoreOrErr(ctx)
 	if err != nil {
 		return nil, err
 	}

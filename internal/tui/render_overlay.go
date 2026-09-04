@@ -130,7 +130,7 @@ func renderTaskPanel(m *Model) string {
 		}
 		s.WriteString(styleMuted.Render("  │ "))
 		s.WriteString(iconStyle.Render(icon + " "))
-		content := t.Content
+		content := taskItemLabel(t)
 		if len(content) > 40 {
 			content = content[:39] + "…"
 		}

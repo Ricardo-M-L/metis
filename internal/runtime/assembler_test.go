@@ -70,6 +70,23 @@ func TestAssembleBaseString_NonEmpty(t *testing.T) {
 	}
 }
 
+func TestWorkingEfficientlyDefinesAutomaticExecutionStrategies(t *testing.T) {
+	s := AssembleBaseString(PromptCtx{
+		EnabledTools: map[string]bool{"Agent": true, "TaskCreate": true, "TodoWrite": true},
+	})
+	for _, want := range []string{
+		"Direct execution",
+		"Planned single-agent",
+		"Parallel sub-agents",
+		"Coordinated agent team",
+		"Choose the lightest strategy",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("automatic execution policy is missing %q", want)
+		}
+	}
+}
+
 func TestAssembleMinimalSubAgentPrompt_OmitsMainOnlySections(t *testing.T) {
 	_, sections := AssembleMinimalSubAgentPrompt(PromptCtx{
 		Model:                "test-model",

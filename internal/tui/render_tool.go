@@ -1508,15 +1508,15 @@ func renderTaskItems(items []TaskItem) string {
 		case "completed":
 			glyph = glyphTaskCompleted
 			glyphStyle = completedGlyph
-			styled = strike.Render(it.Content)
+			styled = strike.Render(taskItemLabel(it))
 		case "in_progress":
 			glyph = glyphTaskInProgress
 			glyphStyle = inProgressGlyph
-			styled = current.Render(it.Content)
+			styled = current.Render(taskItemLabel(it))
 		default: // pending or unknown
 			glyph = glyphTaskPending
 			glyphStyle = pendingGlyph
-			styled = pending.Render(it.Content)
+			styled = pending.Render(taskItemLabel(it))
 		}
 		s.WriteString(styleMuted.Render(prefix))
 		s.WriteString(glyphStyle.Render(glyph + " "))

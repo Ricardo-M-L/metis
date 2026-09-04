@@ -1,11 +1,24 @@
 package tasks
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestSessionIDFromContextOverridesGlobalRouter(t *testing.T) {
+	SetCurrentSessionID("global-session")
+	t.Cleanup(func() { SetCurrentSessionID("") })
+	ctx := WithSessionID(context.Background(), "turn-session")
+	if got := SessionIDFromContext(ctx); got != "turn-session" {
+		t.Fatalf("SessionIDFromContext = %q, want turn-session", got)
+	}
+	if got := SessionIDFromContext(context.Background()); got != "global-session" {
+		t.Fatalf("fallback SessionIDFromContext = %q, want global-session", got)
+	}
+}
 
 func TestUpsert_NewTaskGetsID(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())

@@ -44,15 +44,15 @@ func (l *Loop) injectTodoReminder(ctx context.Context, out chan<- Event) {
 		return
 	}
 
-	tl, err := tasks.Load(tasks.CurrentSessionID())
-	if err != nil || tl == nil || len(tl.Items) == 0 {
+	items, err := tasks.PlanningItems(tasks.SessionIDFromContext(ctx))
+	if err != nil || len(items) == 0 {
 		return
 	}
-	if !hasIncompleteTodos(tl.Items) {
+	if !hasIncompleteTodos(items) {
 		return // all done → nothing to chase
 	}
 
-	l.appendInjectedMessage(formatTodoReminder(tl.Items))
+	l.appendInjectedMessage(formatTodoReminder(items))
 	l.mu.Lock()
 	l.todoReminderIter = cur
 	l.mu.Unlock()
@@ -74,15 +74,15 @@ func (l *Loop) noteTodoWriteActivity(cur int) {
 // incompleteTodos returns the current session's task list if it has any
 // non-completed item, else nil. Drives the end-of-turn reconciliation in
 // Run (loop.go no_tool_calls branch).
-func (l *Loop) incompleteTodos() []tasks.Item {
-	tl, err := tasks.Load(tasks.CurrentSessionID())
-	if err != nil || tl == nil || len(tl.Items) == 0 {
+func (l *Loop) incompleteTodos(ctx context.Context) []tasks.Item {
+	items, err := tasks.PlanningItems(tasks.SessionIDFromContext(ctx))
+	if err != nil || len(items) == 0 {
 		return nil
 	}
-	if !hasIncompleteTodos(tl.Items) {
+	if !hasIncompleteTodos(items) {
 		return nil
 	}
-	return tl.Items
+	return items
 }
 
 // endOfTurnTodoReminder is the nudge injected when the model tries to end a
@@ -97,7 +97,7 @@ func endOfTurnTodoReminder(items []tasks.Item) string {
 	b.WriteString("Call TodoWrite now to mark every task you've finished as completed (including any you just described as done). ")
 	b.WriteString("If an item genuinely isn't finished or is blocked on the user, leave it and briefly say so — but don't leave a finished task showing in_progress. ")
 	b.WriteString("Do NOT mention this reminder to the user.\n\n")
-	b.WriteString("Current task list:\n")
+	b.WriteString("Current unified task list:\n")
 	for i, it := range items {
 		fmt.Fprintf(&b, "%d. [%s] %s\n", i+1, it.Status, it.Content)
 	}
@@ -122,9 +122,9 @@ func formatTodoReminder(items []tasks.Item) string {
 	var b strings.Builder
 	b.WriteString("<system-reminder>\n")
 	b.WriteString("The TodoWrite tool hasn't been used in a while and your task list still has open items. ")
-	b.WriteString("Update it (mark finished tasks completed, keep exactly one in_progress) so it reflects reality — and finish the still-open items below before claiming the work is done. ")
+	b.WriteString("Update it (mark finished tasks completed; keep one in_progress for serial work, or one per independent owner for parallel work) so it reflects reality — and finish the still-open items below before claiming the work is done. ")
 	b.WriteString("Do NOT mention this reminder to the user.\n\n")
-	b.WriteString("Current task list:\n")
+	b.WriteString("Current unified task list:\n")
 	for i, it := range items {
 		fmt.Fprintf(&b, "%d. [%s] %s\n", i+1, it.Status, it.Content)
 	}

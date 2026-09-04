@@ -13,9 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -126,12 +124,19 @@ var (
 	tasksAt       time.Time
 )
 
-// TaskItem is the wire shape we read from ~/.metis/tasks/<sid>.json.
-// Mirrors the TodoWrite tool's persistence schema.
+// TaskItem is the UI projection shared by TodoWrite and structured Task*.
 type TaskItem struct {
 	ID      string `json:"id"`
 	Status  string `json:"status"`
 	Content string `json:"content"`
+	Owner   string `json:"owner,omitempty"`
+}
+
+func taskItemLabel(item TaskItem) string {
+	if owner := strings.TrimSpace(item.Owner); owner != "" {
+		return item.Content + "  · @" + owner
+	}
+	return item.Content
 }
 
 // tasksCurrentSessionIDImpl returns the runtime-set current session id.
@@ -147,47 +152,21 @@ func tasksCurrentSessionIDImpl() string {
 // graph going one direction (tui → tasks, not the reverse).
 var tasksRuntimeSessionID = func() string { return tasks.CurrentSessionID() }
 
-// tasksFullList reads ~/.metis/tasks/<sid>.json and returns every
-// todo (any status). Used by the rich task-panel UI; for the cheap
-// status-bar count, tasksRunningCount is faster (cached).
+// tasksFullList reads the canonical projection shared by TodoWrite and Task*
+// so a coordinated team's structured tasks appear in the same CLI panel.
 func tasksFullList(sessionID string) []TaskItem {
 	if sessionID == "" {
 		return nil
 	}
-	home := os.Getenv("METIS_HOME")
-	if home == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			return nil
-		}
-		home = filepath.Join(h, ".metis")
-	}
-	path := filepath.Join(home, "tasks", sessionID+".json")
-	data, err := os.ReadFile(path)
-	if err != nil {
+	items, err := tasks.PlanningItems(sessionID)
+	if err != nil || len(items) == 0 {
 		return nil
 	}
-	// On-disk shape from internal/tasks::TaskList is an object:
-	//   { "session": "...", "items": [ {id, content, status, …} ] }
-	// Earlier this function decoded into a bare []TaskItem, which
-	// silently failed json.Unmarshal and returned nil — that's why
-	// the Ctrl+T panel and TodoWrite tool-result body both rendered
-	// "no todos yet" even when ~/.metis/tasks/<sid>.json had real
-	// rows in it (image #1 user feedback 2026-05-10, found via tmux
-	// smoke test of TodoWrite render).
-	var envelope struct {
-		Items []TaskItem `json:"items"`
+	out := make([]TaskItem, 0, len(items))
+	for _, item := range items {
+		out = append(out, TaskItem{ID: item.ID, Status: item.Status, Content: item.Content, Owner: item.Owner})
 	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		// Fall back to the bare-array shape so a hand-edited file or
-		// a hypothetical legacy tasks store still loads.
-		var bare []TaskItem
-		if err2 := json.Unmarshal(data, &bare); err2 != nil {
-			return nil
-		}
-		return bare
-	}
-	return envelope.Items
+	return out
 }
 
 // currentInProgressTodoContent returns the Content of the first
@@ -195,9 +174,8 @@ func tasksFullList(sessionID string) []TaskItem {
 // exists. Mirrors claude-code Spinner.tsx:169 — `currentTodo.activeForm
 // ?? currentTodo.subject ?? randomVerb` — so the spinner reads
 // "Implementing OAuth refresh…" instead of a static "exploring…" once
-// the model has set a TodoWrite task in_progress. Caching lives in
-// tasksFullList (which itself reads the JSON every call — tiny file,
-// not hot enough to need its own cache).
+// the model has set a task in_progress. The canonical task projection is
+// intentionally small; the status-bar count has its own short cache.
 func currentInProgressTodoContent(sessionID string) string {
 	if sessionID == "" {
 		return ""
@@ -238,30 +216,13 @@ func tasksRunningCount(sessionID string) int {
 	tasksCheckSid = sessionID
 	tasksAt = time.Now()
 
-	home := os.Getenv("METIS_HOME")
-	if home == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			tasksCount = 0
-			return 0
-		}
-		home = filepath.Join(h, ".metis")
-	}
-	path := filepath.Join(home, "tasks", sessionID+".json")
-	data, err := os.ReadFile(path)
+	items, err := tasks.PlanningItems(sessionID)
 	if err != nil {
 		tasksCount = 0
 		return 0
 	}
-	var todos []struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(data, &todos); err != nil {
-		tasksCount = 0
-		return 0
-	}
 	n := 0
-	for _, t := range todos {
+	for _, t := range items {
 		if t.Status == "in_progress" || t.Status == "pending" {
 			n++
 		}

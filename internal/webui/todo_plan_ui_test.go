@@ -30,7 +30,11 @@ func TestDesktopTodoPlanProjectsComplexTaskProgress(t *testing.T) {
 	js := read("chat.js")
 	for _, want := range []string{
 		"function isTodoWriteTool(name)",
+		"function isPlanningTool(name)",
 		"function applyTodoSnapshot(name, input)",
+		"function applyStatusPlanSnapshot(status)",
+		"status.planItems",
+		"queueMicrotask(() => pollStatus())",
 		"function restoreTodoPlanFromHistory(history)",
 		"const failedToolUses = new Set()",
 		"function toggleTodoPlan()",

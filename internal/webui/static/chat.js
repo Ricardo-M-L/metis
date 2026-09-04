@@ -268,6 +268,11 @@ function isTodoWriteTool(name) {
   return normalized === 'todowrite';
 }
 
+function isPlanningTool(name) {
+  const normalized = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  return normalized === 'todowrite' || ['taskcreate', 'taskupdate', 'taskstop'].includes(normalized);
+}
+
 function normalizeTodoItems(value, base = todoPlanItems) {
   let parsed = value;
   if (typeof value === 'string') {
@@ -340,6 +345,7 @@ function renderTodoPlan() {
     <li class="todo-plan-item" data-status="${escAttr(item.status)}">
       <span class="todo-plan-glyph" aria-hidden="true"></span>
       <span class="todo-plan-item-text">${escHtml(item.content)}</span>
+      ${item.owner ? `<span class="todo-plan-owner">${escHtml(item.owner)}</span>` : ''}
     </li>`).join('');
   popover.hidden = !todoPlanOpen;
   trigger.setAttribute('aria-expanded', todoPlanOpen ? 'true' : 'false');
@@ -350,6 +356,21 @@ function applyTodoSnapshot(name, input) {
   if (!isTodoWriteTool(name)) return false;
   const next = normalizeTodoItems(input);
   if (!next) return false;
+  todoPlanItems = next;
+  renderTodoPlan();
+  return true;
+}
+
+function applyStatusPlanSnapshot(status) {
+  const activeSessionId = String((status && status.activeSessionId) || '');
+  const selectedSessionId = String(currentSessionId || (turnRunning ? runningSessionId : '') || '');
+  if (!activeSessionId || activeSessionId !== selectedSessionId) return false;
+  const raw = Array.isArray(status.planItems) ? status.planItems : [];
+  const next = raw.map(item => ({
+    content: String((item && item.content) || '').trim(),
+    status: String((item && item.status) || 'pending').toLowerCase(),
+    owner: String((item && item.owner) || '').trim(),
+  })).filter(item => item.content && ['pending', 'in_progress', 'completed'].includes(item.status));
   todoPlanItems = next;
   renderTodoPlan();
   return true;
@@ -1183,6 +1204,9 @@ function handleToolResult(d) {
     chip.setAttribute('data-state', ok ? 'ok' : 'error');
     if (ok && isTodoWriteTool(name)) {
       applyTodoSnapshot(name, chip.getAttribute('data-args') || '');
+    }
+    if (ok && isPlanningTool(name) && typeof pollStatus === 'function') {
+      queueMicrotask(() => pollStatus());
     }
     const leading = chip.querySelector('.tc-leading');
     if (!ok && leading) {
@@ -2388,6 +2412,7 @@ const COMPOSER_COMMANDS = [
   { name: '/skills', label: 'Skills', hint: 'Browse installed skill-providing plugins', category: 'Agent' },
   { name: '/plugins', label: 'Plugin marketplace', hint: 'Browse, install, or remove plugins', category: 'Agent' },
   { name: '/agents', label: 'Sub-agents', hint: 'Show active sub-agents and background work', category: 'Agent' },
+  { name: '/batch', label: 'Multi-agent batch', hint: 'Research, plan, then execute independent work in parallel', category: 'Agent' },
   { name: '/tasks', label: 'Background tasks', hint: 'Show active jobs for this session', category: 'Agent' },
   { name: '/todos', label: 'Session checklist', hint: 'Show task and checklist activity for this session', category: 'Agent' },
   { name: '/tools', label: 'Available tools', hint: 'Show tools registered in the active runtime', category: 'Agent' },
@@ -2676,6 +2701,10 @@ async function executeComposerCommand(text) {
     case '/skills':
     case '/plugins': await openPluginSettings(); break;
     case '/agents': showRuntimeSummary('agents'); break;
+    case '/batch':
+      if (!input) showToast('Usage: /batch <task description>');
+      else return false;
+      break;
     case '/tasks':
     case '/todos': showRuntimeSummary('tasks'); break;
     case '/tools': showRuntimeSummary('tools'); break;
@@ -2831,7 +2860,8 @@ function showRuntimeSummary(kind) {
   }
   if (kind === 'context') { showToast('Context: ' + fmtTokens(used) + (limit ? ' / ' + fmtTokens(limit) + ' tokens' : ' tokens')); return; }
   const contextPercent = limit ? Math.max(0, Math.min(100, Math.round(used / limit * 100))) : 0;
-  showToast((d.workspace || 'metis') + ' · ' + (d.subAgents || 0) + ' sub-agents · ' + (d.backgroundTasks || 0) + ' tasks' + (limit ? ' · context ' + contextPercent + '%' : ''));
+  const strategy = String(d.executionStrategy || 'direct').replaceAll('_', ' ');
+  showToast((d.workspace || 'metis') + ' · ' + strategy + ' · ' + (d.subAgents || 0) + ' sub-agents · ' + (d.backgroundTasks || 0) + ' tasks' + (limit ? ' · context ' + contextPercent + '%' : ''));
 }
 
 async function compactCurrentSession(instructions) {

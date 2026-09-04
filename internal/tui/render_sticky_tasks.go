@@ -153,13 +153,13 @@ func renderStickyTaskStrip(m *Model) string {
 	for _, t := range inProgress {
 		writeRow(
 			inProgStyle.Render(glyphTaskInProgress+" "),
-			contentInProg.Render(truncateTodoContent(t.Content)),
+			contentInProg.Render(truncateTodoContent(taskItemLabel(t))),
 		)
 	}
 	for _, t := range pending {
 		writeRow(
 			pendingStyle.Render(glyphTaskPending+" "),
-			contentPending.Render(truncateTodoContent(t.Content)),
+			contentPending.Render(truncateTodoContent(taskItemLabel(t))),
 		)
 	}
 	// Completed: claude-code-style inline rows with strikethrough on
@@ -168,7 +168,7 @@ func renderStickyTaskStrip(m *Model) string {
 	for _, t := range completed {
 		writeRow(
 			completedStyle.Render(glyphTaskCompleted+" "),
-			contentCompleted.Render(truncateTodoContent(t.Content)),
+			contentCompleted.Render(truncateTodoContent(taskItemLabel(t))),
 		)
 	}
 	if completedTrailer > 0 {

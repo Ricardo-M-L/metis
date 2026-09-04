@@ -10,6 +10,7 @@ package tasks
 //   - Task / TaskStore / TaskPatch      → structured Task* tools (here)
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -127,6 +128,12 @@ func (s *TaskStore) saveLocked() error {
 
 // Create adds a new pending task. Returns the generated id.
 func (s *TaskStore) Create(subject, description, activeForm string, metadata map[string]any) (*Task, error) {
+	return s.CreateOwned(subject, description, activeForm, "", metadata)
+}
+
+// CreateOwned atomically creates a task with an optional teammate owner. The
+// legacy Create wrapper remains for callers that do not coordinate a team.
+func (s *TaskStore) CreateOwned(subject, description, activeForm, owner string, metadata map[string]any) (*Task, error) {
 	subject = strings.TrimSpace(subject)
 	if subject == "" {
 		return nil, fmt.Errorf("subject is required")
@@ -145,6 +152,7 @@ func (s *TaskStore) Create(subject, description, activeForm string, metadata map
 		Description: description,
 		ActiveForm:  activeForm,
 		Status:      TaskPending,
+		Owner:       strings.TrimSpace(owner),
 		Metadata:    metadata,
 		CreatedAt:   now,
 		UpdatedAt:   now,
@@ -284,7 +292,30 @@ var (
 	activeStoreMu      sync.Mutex
 	currentTaskStore   *TaskStore
 	currentTaskSession string
+	taskStoresByPath   = make(map[string]*TaskStore)
 )
+
+func taskStoreForSessionLocked(sessionID string) *TaskStore {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	key := taskFilePath(sessionID)
+	if store := taskStoresByPath[key]; store != nil {
+		return store
+	}
+	store := NewTaskStore(sessionID)
+	taskStoresByPath[key] = store
+	return store
+}
+
+// TaskStoreForSession returns the shared store for one explicit session.
+// Keying by the resolved persistence path keeps tests with different
+// METIS_HOME values isolated while serializing concurrent tools in one turn.
+func TaskStoreForSession(sessionID string) *TaskStore {
+	activeStoreMu.Lock()
+	defer activeStoreMu.Unlock()
+	return taskStoreForSessionLocked(sessionID)
+}
 
 // SetCurrentTaskStore is called by the runtime as the chat session is
 // resolved so the Task* tools — which are stateless objects registered
@@ -300,7 +331,7 @@ func SetCurrentTaskStore(sessionID string) {
 	if currentTaskStore != nil && currentTaskSession == sessionID {
 		return
 	}
-	currentTaskStore = NewTaskStore(sessionID)
+	currentTaskStore = taskStoreForSessionLocked(sessionID)
 	currentTaskSession = sessionID
 }
 
@@ -309,6 +340,15 @@ func CurrentTaskStore() *TaskStore {
 	activeStoreMu.Lock()
 	defer activeStoreMu.Unlock()
 	return currentTaskStore
+}
+
+// TaskStoreFromContext resolves the immutable turn owner first, preventing a
+// Desktop session switch from redirecting an in-flight Task* call.
+func TaskStoreFromContext(ctx context.Context) *TaskStore {
+	if sessionID := SessionIDFromContext(ctx); sessionID != "" {
+		return TaskStoreForSession(sessionID)
+	}
+	return CurrentTaskStore()
 }
 
 // deleteStructured removes the per-session directory used by Task* tools.
@@ -325,6 +365,8 @@ func deleteStructured(sessionID string) error {
 		currentTaskStore = nil
 		currentTaskSession = ""
 	}
-	dir := filepath.Dir(taskFilePath(sessionID))
+	storePath := taskFilePath(sessionID)
+	delete(taskStoresByPath, storePath)
+	dir := filepath.Dir(storePath)
 	return os.RemoveAll(dir)
 }

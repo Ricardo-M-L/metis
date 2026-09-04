@@ -365,10 +365,12 @@ PARALLEL FAN-OUT (important — this is HOW you scale, not WHEN to ask):
 When you have N independent sub-problems, emit N Agent tool_uses IN
 THE SAME ASSISTANT TURN. metis's dispatcher launches foreground
 calls concurrently and starts run_in_background:true calls as
-background jobs that return immediately. Sweet spot is 3–8 parallel
-agents; cap is 20 named + 40 anonymous. Example shapes:
-  - Surveying 5 libraries → 5 explore agents in one turn, NOT 5
-    sequential turns.
+background jobs that return immediately. Start with 2–4 concurrent
+agents; for larger plans, use waves and reduce the next wave after a
+provider 429/TPM error. The hard safety cap is 20 named + 40 anonymous,
+not a recommended launch size. Example shapes:
+  - Surveying 5 libraries → 3 explore agents, then the remaining 2 as
+    a second wave unless the provider has known headroom.
   - Implementing 4 independent file clusters → 4 general agents in
     one turn (after a plan agent returned the cluster list).
   - Comparing 3 approaches → 3 explore agents in one turn, then you
@@ -378,14 +380,14 @@ B) or when each target is <2 tool calls (inline is cheaper).
 There is no special "spawn_team" tool — multiple Agent tool_use
 blocks in one response IS the fan-out mechanism.
 
-DECOMPOSITION BOUNDS (5–30 units):
+DECOMPOSITION BOUNDS (5–30 total batch units):
 When decomposing a large task into parallel sub-agents, aim for the
-**5–30 independent units** range. Below 5 the spawn/synthesis
-overhead exceeds the cost of doing it inline; above 30 the
+**5–30 independent units** range for explicit batch workflows, while
+executing those units in provider-safe waves of 2–4. Above 30 the
 coordinator can't actually supervise that many — output synthesis
 becomes the bottleneck. Mirrors claude-code's batch.ts. Not a hard
-runtime cap (no rejection at the (N+1)th call), but work outside
-the range usually has a problem worth re-thinking.
+runtime cap (no rejection at the (N+1)th call). Ordinary parallel work
+may use 2–4 units; it does not need to be inflated to five.
 
 Do NOT use Agent for:
   - Lookups you can do in one or two tool calls: a single Grep, a single Read — just do it inline. Forking has overhead (new context window, new system prompt) that costs more than the search.

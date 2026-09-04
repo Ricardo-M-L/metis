@@ -864,7 +864,7 @@ type cliFlags struct {
 	// name shown in /sessions) or sugar over existing surfaces (a /batch
 	// shortcut, a tmux launcher).
 	sessionName string // --name <text>: human-friendly session label
-	agentTeams  bool   // reserved compatibility flag; currently no runtime effect
+	agentTeams  bool   // explicit alias for coordinator/team-lead mode
 	tmuxOn      bool   // reserved compatibility flag; currently no runtime effect
 
 	// coordinator — Phase G.8 (2026-05-12). Flips the main loop into
@@ -1036,7 +1036,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.coordinator, "coordinator", false,
 		"team-lead mode: narrow tool palette to orchestration tools (Agent / Fork / SendMessage / SubAgent* / Read / Grep / ...) and overlay a coordinator system prompt. Equivalent to setting METIS_COORDINATOR_MODE=1.")
 	f.BoolVar(&out.agentTeams, "agent-teams", false,
-		"reserved compatibility flag (currently no runtime effect)")
+		"force coordinated agent-team mode (alias of --coordinator)")
 	f.BoolVar(&out.tmuxOn, "tmux", false,
 		"reserved compatibility flag (currently no runtime effect)")
 	// Auto-memory v2 — extractMemories on LoopEnd via forked agent.
@@ -1073,6 +1073,9 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 			out.systemSet = true
 		}
 	})
+	if out.agentTeams {
+		out.coordinator = true
+	}
 	return out, f.Args(), nil
 }
 

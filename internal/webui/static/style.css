@@ -705,7 +705,7 @@ html, body {
 
 .todo-plan-item {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr);
+  grid-template-columns: 20px minmax(0, 1fr) auto;
   align-items: start;
   gap: 10px;
   padding: 7px 8px;
@@ -758,6 +758,12 @@ html, body {
 .todo-plan-item-text {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.todo-plan-owner {
+  color: var(--fg-faint);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 @keyframes todo-plan-spin {

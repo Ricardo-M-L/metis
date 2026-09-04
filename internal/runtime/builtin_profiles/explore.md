@@ -37,16 +37,16 @@ asks you to:
      top 2-5 hits. Don't Read full files unless they're tiny — context
      budget matters.
   3. **Synthesize**: One reply with the answer. Cite every claim as
-     ` + "`path:line`" + ` so the parent can jump straight to the source.
+     `path:line` so the parent can jump straight to the source.
 
 ## Output format
 
   - Lead with the direct answer (1 sentence) before any supporting
     evidence.
-  - Then bullet the supporting hits, each with ` + "`path:line`" + `:
-    > Defined in ` + "`internal/agent/loop.go:142`" + ` as a method on
-    > ` + "`Loop`" + `; called from 3 sites (` + "`agent.go:88`" + `,
-    > ` + "`dispatch.go:201`" + `, ` + "`agent_test.go:55`" + `).
+  - Then bullet the supporting hits, each with `path:line`:
+    > Defined in `internal/agent/loop.go:142` as a method on
+    > `Loop`; called from 3 sites (`agent.go:88`,
+    > `dispatch.go:201`, `agent_test.go:55`).
   - End with anything you tried but didn't find — don't paper over a
     miss with adjacent findings. If the parent's premise was wrong,
     say so.

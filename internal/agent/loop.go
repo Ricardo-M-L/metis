@@ -23,6 +23,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -1502,6 +1503,11 @@ func (l *Loop) IterIdx() int {
 //  8. Append assistant + tool_results, emit TurnEnd
 //  9. Loop-detect / max-iter / grace-call checks
 func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
+	// Capture task ownership at the turn boundary. Desktop may let the user
+	// inspect another session while this turn or one of its sub-agents is still
+	// running; tool calls must continue writing to the originating session.
+	ctx = tasks.WithSessionID(ctx, tasks.SessionIDFromContext(ctx))
+
 	// A provider can finish at the same instant the caller cancels. Terminal
 	// events are cancellation-aware and may be dropped to avoid wedging a dead
 	// consumer, so the return value is the authoritative fail-closed boundary:
@@ -2052,7 +2058,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			// given). Mirrors the contract-gate re-entry above; once-per-turn
 			// so a stubborn model can't loop here.
 			if !l.todoReconciledThisTurn {
-				if items := l.incompleteTodos(); items != nil {
+				if items := l.incompleteTodos(ctx); items != nil {
 					l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
 					l.mu.Lock()
 					l.todoReconciledThisTurn = true
