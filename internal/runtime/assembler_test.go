@@ -80,6 +80,9 @@ func TestWorkingEfficientlyDefinesAutomaticExecutionStrategies(t *testing.T) {
 		"Parallel sub-agents",
 		"Coordinated agent team",
 		"Choose the lightest strategy",
+		"Explicit user orchestration instructions override automatic strategy selection",
+		"exactly N sub-agents",
+		"Never silently downgrade",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("automatic execution policy is missing %q", want)
