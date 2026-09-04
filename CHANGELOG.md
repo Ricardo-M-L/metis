@@ -7,6 +7,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.44] - 2026-09-04
+
+### Added
+
+- Added an automatic execution-strategy contract that lets the shared CLI and
+  Desktop runtime choose direct work, a serial plan, parallel sub-agents, or a
+  coordinated named-agent team according to task dependencies and ownership.
+- Added Desktop `/batch` parity and made `--agent-teams` an explicit alias for
+  coordinator mode instead of a no-op compatibility flag.
+
+### Changed
+
+- Unified TodoWrite and structured Task progress into one session-scoped UI
+  projection, including teammate owners in CLI and Desktop task views.
+- Limited recommended provider fan-out to waves of two to four agents, with
+  backoff after rate-limit or TPM failures.
+
+### Fixed
+
+- Pinned task writes to the originating turn so switching Desktop sessions no
+  longer redirects active TodoWrite or Task* updates into the viewed session.
+- Removed source-interpolation artifacts from bundled agent-profile prompts and
+  made TaskCreate persist its advertised owner field.
+
 ## [0.4.43] - 2026-09-03
 
 ### Added
