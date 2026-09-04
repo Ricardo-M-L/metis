@@ -1589,10 +1589,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Roster:          subAgentRoster,
 	})
 
-	// G.8 — coordinator mode replaces every non-whitelisted tool
-	// with a stub that errors when invoked. The user sees the names
-	// in /tools but the model can't accidentally Edit/Write/Bash; the
-	// system prompt overlay above tells it to dispatch sub-agents.
+	// G.8 — coordinator mode installs a durable allowlist. It removes
+	// non-whitelisted tools now and rejects later Skill/plugin/MCP
+	// registration, so the model cannot regain Edit/Write/Bash after
+	// startup. The system prompt tells it to dispatch sub-agents.
 	rtpkg.FilterRegistryInPlace(reg)
 
 	// Wire the gate's read-only resolver to the live registry now

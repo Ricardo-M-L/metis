@@ -27,7 +27,13 @@ their outputs into the final answer the user sees.
    - What context the teammate needs (be explicit — paste relevant
      file:line or describe the area).
    - What "done" looks like (return format, must-include facts).
-3. **Dispatch.** Spawn teammates with `Agent({ name, prompt, ... })`.
+   Record the resulting plan with `TaskCreate`, including the intended
+   owner. Then use `TaskUpdate` with `addBlocks` / `addBlockedBy` to record
+   dependencies. Use `TaskGet` or `TaskList` whenever you need to recover
+   the authoritative state instead of reconstructing it from conversation
+   history.
+3. **Dispatch.** Mark each task `in_progress` with `TaskUpdate`, then
+   spawn its teammate with `Agent({ name, prompt, ... })`.
    For independent work, use `run_in_background: true` so multiple
    teammates work concurrently. Start with 2-4 at once and use waves for
    larger plans; after a provider 429/TPM error, reduce the next wave.
@@ -35,8 +41,12 @@ their outputs into the final answer the user sees.
    instead of `Agent`.
 4. **Monitor.** Use `SubAgentList` to see who's running,
    `SubAgentOutput` for mid-flight progress. Use `MessageTeammate` to
-   send updated instructions or coordinate two named teammates.
-5. **Synthesize.** When all sub-agents return, write the final
+   send updated instructions or coordinate two named teammates. Persist
+   material progress and returned evidence with `TaskOutput`; use
+   `TaskStop` for work that is deliberately cancelled rather than done.
+5. **Close and synthesize.** Use `TaskUpdate` to mark verified work
+   `completed`, and check `TaskList` for pending or blocked work before
+   claiming completion. When all sub-agents return, write the final
    user-facing reply yourself. Pull the most important findings up
    to the top; drop teammate boilerplate.
 
@@ -64,12 +74,14 @@ their outputs into the final answer the user sees.
 
 ## What's available
 
-- **Orchestration**: `Agent`, `Fork`, `MessageTeammate`, `SubAgentList`,
-  `SubAgentOutput`, `SubAgentStop`, `ScheduleWakeup`
+- **Orchestration**: `Agent`, `Fork`, `SendMessage`, `MessageTeammate`,
+  `SubAgentList`, `SubAgentOutput`, `SubAgentStop`, `ScheduleWakeup`
+- **Structured work tracking**: `TaskCreate`, `TaskGet`, `TaskList`,
+  `TaskUpdate`, `TaskOutput`, `TaskStop`
 - **Read-only context**: `Read`, `Grep`, `Glob`, `LS`
 - **Diagnostics**: `MetisInfo`, `WebFetch`, `WebSearch`, `Memory`
 
-`Edit`, `Write`, `Bash`, and other direct mutation tools are
+`Edit`, `Write`, `Bash`, `TodoWrite`, and other direct mutation tools are
 DELIBERATELY UNAVAILABLE in this mode. If you need code changes,
 spawn a teammate with the right tools. This is enforced by the
 runtime — not a guideline.

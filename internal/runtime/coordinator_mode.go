@@ -5,8 +5,9 @@ package runtime
 // When the user launches metis with --coordinator (or
 // METIS_COORDINATOR_MODE=1), the main loop's role flips from
 // "individual assistant" to "team lead": it should plan work, dispatch
-// sub-agents (Agent / Fork / SendMessage), and coordinate their
-// results rather than do hands-on edits itself. Two mechanisms wire
+// sub-agents (Agent / Fork / SendMessage), track their work through
+// the structured Task* tools, and coordinate their results rather
+// than do hands-on edits itself. Two mechanisms wire
 // this:
 //
 //  1. CoordinatorOverlay() returns a SystemPromptSection that's
@@ -30,8 +31,6 @@ package runtime
 // recompiling.
 
 import (
-	"context"
-	"fmt"
 	"os"
 	"strings"
 
@@ -114,10 +113,13 @@ const defaultCoordinatorOverlay = `You are the team lead in a multi-agent workfl
 Your job is to PLAN and DISPATCH work to sub-agents (via the Agent
 and Fork tools), then SYNTHESIZE their results — not to do the
 hands-on edits yourself. Use Read/Grep/Glob only to gather enough
-context to delegate well; use SubAgentList / SubAgentOutput to track
-what each teammate is doing; use MessageTeammate to coordinate.
+context to delegate well. Use TaskCreate / TaskUpdate to assign and
+track structured work, TaskGet / TaskList to inspect it, TaskOutput
+to retain progress and results, and TaskStop to retire cancelled
+work. Use SubAgentList / SubAgentOutput to monitor execution and
+MessageTeammate to coordinate.
 
-Direct file mutation tools (Edit, Write) are unavailable in this
+Hands-on tools (Edit, Write, Bash, TodoWrite) are unavailable in this
 mode by design. If a task needs code changes, spawn a sub-agent and
 hand it the focused task. Quality of the lead's plan + delegation
 determines the team's output — not how much code the lead writes.`
@@ -129,6 +131,8 @@ determines the team's output — not how much code the lead writes.`
 //
 //   - Orchestration: Agent, Fork, SendMessage, MessageTeammate,
 //     ScheduleWakeup
+//   - Structured work: TaskCreate, TaskGet, TaskList, TaskUpdate,
+//     TaskOutput, TaskStop
 //   - Sub-agent monitoring: SubAgentList, SubAgentOutput, SubAgentStop
 //   - Read-only context-gathering: Read, Grep, Glob, LS
 //   - Diagnostics: MetisInfo (so /coordinator status can introspect)
@@ -145,6 +149,12 @@ var coordinatorAllowedTools = map[string]struct{}{
 	"SendMessage":     {},
 	"MessageTeammate": {},
 	"ScheduleWakeup":  {},
+	"TaskCreate":      {},
+	"TaskGet":         {},
+	"TaskList":        {},
+	"TaskUpdate":      {},
+	"TaskOutput":      {},
+	"TaskStop":        {},
 	"SubAgentList":    {},
 	"SubAgentOutput":  {},
 	"SubAgentStop":    {},
@@ -170,15 +180,7 @@ func CoordinatorToolFilter(all []string) []string {
 	if !IsCoordinatorMode() {
 		return all
 	}
-	extras := make(map[string]struct{})
-	if v := os.Getenv(CoordinatorExtraToolsEnvVar); v != "" {
-		for _, raw := range strings.Split(v, ",") {
-			name := strings.TrimSpace(raw)
-			if name != "" {
-				extras[name] = struct{}{}
-			}
-		}
-	}
+	extras := coordinatorExtraTools()
 	out := make([]string, 0, len(all))
 	for _, n := range all {
 		if _, ok := coordinatorAllowedTools[n]; ok {
@@ -192,68 +194,45 @@ func CoordinatorToolFilter(all []string) []string {
 	return out
 }
 
+func coordinatorExtraTools() map[string]struct{} {
+	extras := make(map[string]struct{})
+	for _, raw := range strings.Split(os.Getenv(CoordinatorExtraToolsEnvVar), ",") {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		// The general visibility grammar accepts broad MCP server prefixes,
+		// but this recovery hatch promises explicit tool names. Require a
+		// complete mcp__server__tool name so one opt-in cannot silently expose
+		// a server's future mutation tools.
+		if strings.HasPrefix(name, "mcp__") &&
+			(name == "mcp__" || name == "mcp__*" || !strings.Contains(name[len("mcp__"):], "__")) {
+			continue
+		}
+		extras[name] = struct{}{}
+	}
+	return extras
+}
+
 // FilterRegistryInPlace mutates the given registry to drop tools that
 // CoordinatorToolFilter excludes. Convenience for callers who hold a
 // *tools.Registry rather than a name slice. No-op when coordinator
 // mode isn't active.
 //
-// Implementation note: tools.Registry has no public Remove(name)
-// method, so we rebuild via Replace with a sentinel-blocking stub.
-// Since the use case is one-shot at startup, the cost is fine; if
-// it becomes hot we can plumb a real Remove in.
+// The visibility layer is durable: later Skill replacement, plugin
+// registration, MCP reconnects, and IDE bridges pass through the same
+// allowlist instead of escaping a one-time startup snapshot.
 func FilterRegistryInPlace(reg *tools.Registry) {
 	if !IsCoordinatorMode() || reg == nil {
 		return
 	}
-	all := reg.All()
-	names := make([]string, 0, len(all))
-	for _, t := range all {
-		names = append(names, t.Name())
+	extras := coordinatorExtraTools()
+	allow := make([]string, 0, len(coordinatorAllowedTools)+len(extras))
+	for name := range coordinatorAllowedTools {
+		allow = append(allow, name)
 	}
-	keep := CoordinatorToolFilter(names)
-	keepSet := make(map[string]struct{}, len(keep))
-	for _, n := range keep {
-		keepSet[n] = struct{}{}
+	for name := range extras {
+		allow = append(allow, name)
 	}
-	for _, n := range names {
-		if _, ok := keepSet[n]; ok {
-			continue
-		}
-		// Replace with a stub that always errors. The registry doesn't
-		// have a public delete, but the stub keeps the name visible
-		// in /tools while making attempts to invoke it surface a
-		// clear coordinator-mode error.
-		reg.Replace(coordinatorBlockedTool{name: n})
-	}
-}
-
-// coordinatorBlockedTool implements tools.Tool but errors on every
-// Execute. The CanUse return value is Deny so the gate never even
-// asks the user.
-type coordinatorBlockedTool struct {
-	tools.BaseTool
-	name string
-}
-
-func (t coordinatorBlockedTool) Name() string { return t.name }
-func (t coordinatorBlockedTool) Description() string {
-	return fmt.Sprintf("Disabled in coordinator mode. Add %q to %s if you need it back.", t.name, CoordinatorExtraToolsEnvVar)
-}
-func (t coordinatorBlockedTool) InputSchema() map[string]any {
-	return map[string]any{"type": "object"}
-}
-func (t coordinatorBlockedTool) Concurrency(map[string]any) tools.Concurrency {
-	return tools.ConcurrencyExclusive
-}
-func (t coordinatorBlockedTool) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
-	return tools.PermissionDeny, "coordinator-mode-disabled"
-}
-func (t coordinatorBlockedTool) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
-	return &tools.Result{
-		Output: fmt.Sprintf(
-			"%s is disabled in coordinator mode. Either dispatch a sub-agent that has the tool, or set %s=%s,... to opt it back in.",
-			t.name, CoordinatorExtraToolsEnvVar, t.name,
-		),
-		IsError: true,
-	}, nil
+	tools.ApplyToolVisibility(reg, allow, nil)
 }

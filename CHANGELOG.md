@@ -7,6 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.45] - 2026-09-04
+
+### Changed
+
+- Made the macOS release path reproducible from the repository with enforced
+  Developer ID signing, ZIP and DMG notarization, stapling, Gatekeeper checks,
+  and verified SHA-256 sidecars while keeping signing credentials outside the
+  source tree.
+- Added a release-policy guard that rejects provider-token-shaped values in
+  the currently tracked source tree without printing suspected credentials.
+
+### Fixed
+
+- Restored the complete structured `TaskCreate` through `TaskStop` lifecycle
+  in coordinator and `--agent-teams` mode, so team leads can assign, monitor,
+  retain output for, cancel, and complete delegated work.
+- Installed a durable coordinator allowlist across initial registration,
+  plugin Skill replacement, MCP reconnects, and other late tool publication;
+  `Edit`, `Write`, `Bash`, and `TodoWrite` remain unavailable to the
+  coordinator itself.
+
 ## [0.4.44] - 2026-09-04
 
 ### Added
