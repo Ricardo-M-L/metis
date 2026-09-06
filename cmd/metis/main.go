@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1019,6 +1020,21 @@ func shouldEnableAutoMemory(flags *cliFlags, lookupEnv func(string) (string, boo
 		flags.autoMemoryStartup == autoMemoryStartupDesktop
 }
 
+// writeAutoMemoryEnabledNotice keeps the successful Auto Memory startup quiet
+// during normal interactive and Desktop sessions. The extractor is enabled by
+// default on those paths, so repeating that fact on stderr only leaves noise
+// behind after the TUI restores the terminal. Operators can opt into the
+// diagnostic when investigating startup behaviour.
+func writeAutoMemoryEnabledNotice(w io.Writer, memdir string, lookupEnv func(string) (string, bool)) {
+	if w == nil || lookupEnv == nil {
+		return
+	}
+	if raw, ok := lookupEnv("METIS_AUTO_MEMORY_DEBUG"); !ok || raw != "1" {
+		return
+	}
+	fmt.Fprintf(w, "metis: auto-memory enabled (memdir: %s)\n", memdir)
+}
+
 // stringList accumulates repeated flag values: --add-dir A --add-dir B → [A,B].
 type stringList []string
 
@@ -1890,7 +1906,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 				fmt.Fprintf(os.Stderr, "metis: auto-memory init: %v (disabled)\n", err)
 			} else {
 				loop.AutoMemory = true
-				fmt.Fprintf(os.Stderr, "metis: auto-memory enabled (memdir: %s)\n", ext.MemdirRoot())
+				writeAutoMemoryEnabledNotice(os.Stderr, ext.MemdirRoot(), os.LookupEnv)
 				// G.5 (2026-05-12) — DreamTask completion channel.
 				// Buffered so the extractor never blocks on its
 				// notify-send if the model is still mid-turn; size 8

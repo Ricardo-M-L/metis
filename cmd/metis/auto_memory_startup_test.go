@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestShouldEnableAutoMemoryByStartupPath(t *testing.T) {
 	t.Parallel()
@@ -109,5 +112,44 @@ func TestParseFlagsKeepsAutoMemoryCompatibility(t *testing.T) {
 	}
 	if len(rest) != 1 || rest[0] != "prompt" {
 		t.Fatalf("remaining args = %q, want [prompt]", rest)
+	}
+}
+
+func TestWriteAutoMemoryEnabledNoticeRequiresDebugOptIn(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		value   string
+		present bool
+		want    string
+	}{
+		{name: "unset stays quiet"},
+		{name: "disabled stays quiet", value: "0", present: true},
+		{name: "boolean spelling stays quiet", value: "true", present: true},
+		{
+			name:    "debug one emits diagnostic",
+			value:   "1",
+			present: true,
+			want:    "metis: auto-memory enabled (memdir: /tmp/metis-memory)\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var stderr bytes.Buffer
+			lookup := func(key string) (string, bool) {
+				if key != "METIS_AUTO_MEMORY_DEBUG" {
+					t.Fatalf("unexpected environment lookup %q", key)
+				}
+				return tt.value, tt.present
+			}
+
+			writeAutoMemoryEnabledNotice(&stderr, "/tmp/metis-memory", lookup)
+			if got := stderr.String(); got != tt.want {
+				t.Fatalf("startup notice = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

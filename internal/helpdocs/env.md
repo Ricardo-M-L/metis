@@ -30,8 +30,8 @@ are kept in a separate section at the end.
 
 | Variable | Default | Description |
 |---|---|---|
-| `METIS_AUTO_MEMORY` | off | Set to `1` to run memory extraction at turn boundaries. Equivalent to `--auto-memory`. |
-| `METIS_AUTO_MEMORY_DEBUG` | off | Set to `1` to log extractor decisions and failures. Has practical value only with auto-memory enabled. |
+| `METIS_AUTO_MEMORY` | interactive/Desktop: on; headless: off | Set to `0`, `false`, or `off` to disable the interactive/Desktop default. Set to `1`, `true`, or `on` to enable every path. `--auto-memory` remains the headless opt-in. |
+| `METIS_AUTO_MEMORY_DEBUG` | off | Set to `1` to log the enabled memdir plus extractor decisions and failures. Has practical value only with auto-memory enabled. |
 | `METIS_AUTO_RETRIEVE` | off | Positive integer top-K for archival memory retrieval on every turn. Values above `50` are clamped to `50`; non-positive or non-numeric values leave retrieval off. |
 | `METIS_AUTO_RETRIEVE_RERANK` | off | Set to `1` or `true` to rerank the retrieved candidates with the active model. Adds one model call per retrieval. |
 | `METIS_DREAM_INTERVAL_HOURS` | `12` | Minimum hours between dream passes. Fractional values are accepted; `0` or a negative value disables dreaming. |
