@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -122,6 +123,95 @@ func TestOAuthCallbackWritesSuccessBeforePublishingResult(t *testing.T) {
 		t.Fatal("callback result was not published")
 	}
 	<-done
+}
+
+func TestOAuthCallbackInvalidRequestDoesNotConsumeLegitimateFlow(t *testing.T) {
+	resultCh := make(chan oauthCallbackResult, 1)
+	server := newCallbackServer("unguessable-state", resultCh)
+	for _, target := range []string{
+		"/callback?state=wrong&code=attacker",
+		"/callback?state=unguessable-state",
+		"/wrong?state=unguessable-state&code=attacker",
+	} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, target, nil)
+		server.Handler.ServeHTTP(recorder, request)
+		if recorder.Code < 400 {
+			t.Fatalf("invalid callback %q status = %d", target, recorder.Code)
+		}
+		select {
+		case result := <-resultCh:
+			t.Fatalf("invalid callback %q consumed flow: %+v", target, result)
+		default:
+		}
+	}
+	recorder := httptest.NewRecorder()
+	server.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/callback?state=unguessable-state&code=legitimate", nil))
+	result := <-resultCh
+	if result.err != nil || result.code != "legitimate" {
+		t.Fatalf("legitimate callback = %+v", result)
+	}
+}
+
+func TestOAuthCallbackProviderErrorWithValidStateCompletesSafely(t *testing.T) {
+	resultCh := make(chan oauthCallbackResult, 1)
+	server := newCallbackServer("state", resultCh)
+	recorder := httptest.NewRecorder()
+	server.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/callback?state=state&error=access_denied&error_description=remote+prose", nil))
+	result := <-resultCh
+	if result.err == nil || !strings.Contains(result.err.Error(), "access_denied") {
+		t.Fatalf("provider callback error = %+v", result)
+	}
+	if strings.Contains(result.err.Error(), "remote prose") {
+		t.Fatalf("provider prose leaked: %v", result.err)
+	}
+}
+
+func TestAnthropicTokenExchangeUsesJSONAndState(t *testing.T) {
+	provider := KnownProviders["anthropic"]
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q", got)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["state"] != "oauth-state" || body["code"] != "authorization-code" || body["code_verifier"] != "pkce-verifier" {
+			t.Errorf("JSON token request = %#v", body)
+		}
+		_, _ = fmt.Fprint(w, `{"access_token":"access","refresh_token":"refresh","expires_in":3600}`)
+	}))
+	t.Cleanup(server.Close)
+	provider.TokenURL = server.URL
+	if _, err := exchangeCodeForTokenFullWithStateContext(context.Background(), provider, "authorization-code", "oauth-state", provider.CallbackRedirectURL, "pkce-verifier"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAnthropicRefreshUsesJSONWithoutScope(t *testing.T) {
+	provider := KnownProviders["anthropic"]
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q", got)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["grant_type"] != "refresh_token" || body["refresh_token"] != "refresh" || body["client_id"] != provider.ClientID {
+			t.Errorf("JSON refresh request = %#v", body)
+		}
+		if _, ok := body["scope"]; ok {
+			t.Errorf("Anthropic refresh must omit scope: %#v", body)
+		}
+		_, _ = fmt.Fprint(w, `{"access_token":"access","refresh_token":"rotated","expires_in":3600}`)
+	}))
+	t.Cleanup(server.Close)
+	provider.TokenURL = server.URL
+	if _, err := RefreshTokenContext(context.Background(), provider, "refresh"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRunOAuthManualContextCancellationInterruptsPasteCallback(t *testing.T) {

@@ -8,6 +8,8 @@ package main
 // verb forward so dispatch routes to cmdRun(args[1:]) correctly.
 
 import (
+	"context"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +27,10 @@ func TestFindEarlySubcommand_RunAfterGlobals(t *testing.T) {
 		{"no subcommand (inline prompt)", []string{"-p", "minimax", "explain this code"}, 0, false},
 		{"empty", []string{}, 0, false},
 		{"only flags", []string{"-p", "minimax", "-m", "X"}, 0, false},
+		{"login is model value", []string{"--model", "login", "run", "hi"}, 2, true},
+		{"login is provider value", []string{"--provider", "login", "run", "hi"}, 2, true},
+		{"logout after provider", []string{"--provider", "openai", "logout"}, 2, true},
+		{"verb-looking model value without command", []string{"--model", "login"}, 0, false},
 		{"run as prompt fragment after another positional",
 			[]string{"-p", "minimax", "go", "run", "the", "tests"}, 0, false}, // "go" is positional, breaks the all-flag chain
 	}
@@ -41,20 +47,27 @@ func TestFindEarlySubcommand_RunAfterGlobals(t *testing.T) {
 	}
 }
 
-func TestLooksLikeFlagOrValue(t *testing.T) {
-	args := []string{"-p", "minimax", "-m", "MiniMax-M2.7", "run"}
-	cases := []struct {
-		idx  int
-		want bool
-	}{
-		{0, true}, // "-p" is a flag
-		{1, true}, // "minimax" is value of -p
-		{2, true}, // "-m" is a flag
-		{3, true}, // "MiniMax-M2.7" is value of -m
+func TestDispatchLeadingProviderLegacyAuthLogin(t *testing.T) {
+	// --help keeps this a non-interactive routing test. Before the fix dispatch
+	// hoisted the arguments to `auth --provider openai login --help`, and
+	// cmdAuth rejected --provider as an unknown subcommand.
+	err := dispatch(context.Background(), []string{"--provider", "openai", "auth", "login", "--help"})
+	if err != nil {
+		t.Fatalf("leading provider auth login dispatch: %v", err)
 	}
-	for _, c := range cases {
-		if got := looksLikeFlagOrValue(args, c.idx); got != c.want {
-			t.Errorf("looksLikeFlagOrValue(%q, %d) = %v, want %v", args[c.idx], c.idx, got, c.want)
-		}
+}
+
+func TestDispatchLeadingProviderLegacyAuthLogout(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	err := dispatch(context.Background(), []string{"--provider", "openai", "auth", "logout"})
+	if err != nil {
+		t.Fatalf("leading provider auth logout dispatch: %v", err)
+	}
+}
+
+func TestDispatchLeadingUnsupportedGlobalStillFailsClearlyForLegacyAuthLogin(t *testing.T) {
+	err := dispatch(context.Background(), []string{"--model", "gpt-test", "auth", "login", "--help"})
+	if err == nil || !strings.Contains(err.Error(), "not applicable") {
+		t.Fatalf("leading model auth login error = %v, want not-applicable error", err)
 	}
 }

@@ -106,6 +106,7 @@ type Server struct {
 	freshPermissionMode     permission.Mode
 	freshPreset             string
 	trustSessionPermissions bool
+	trustProviderConfig     bool
 
 	buildProvider           func(providerName, model string) (*rtpkg.ProviderBuild, error)
 	setPermissionMode       func(permission.Mode) error
@@ -279,7 +280,12 @@ type RuntimeBindings struct {
 	// cross a Desktop session switch. False is the secure default for session
 	// directories supplied by an untrusted project config.
 	TrustSessionPermissions bool
-	BuildProvider           func(providerName, model string) (*rtpkg.ProviderBuild, error)
+	// TrustProviderConfig allows project/project-local provider routing to be
+	// used by Desktop settings and model-switch operations. False keeps only
+	// defaults and the user-level provider configuration so an unseen checkout
+	// cannot redirect ambient credentials to its own endpoint.
+	TrustProviderConfig bool
+	BuildProvider       func(providerName, model string) (*rtpkg.ProviderBuild, error)
 	// SetPermissionMode performs the runtime-owned atomic gate/sandbox
 	// transition. Desktop must not independently claim bypassPermissions while
 	// model-controlled subprocesses still lack credential isolation.
@@ -350,6 +356,7 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		freshSystemPromptKind:   binding.FreshSystemPromptKind,
 		freshPreset:             binding.PresetName,
 		trustSessionPermissions: binding.TrustSessionPermissions,
+		trustProviderConfig:     binding.TrustProviderConfig,
 		buildProvider:           binding.BuildProvider,
 		setPermissionMode:       binding.SetPermissionMode,
 		preflightPermissionMode: binding.PreflightPermissionMode,
@@ -2729,10 +2736,22 @@ func (s *Server) handleConfigFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	userPath := filepath.Join(config.Home(), "config.toml")
+	home, err := config.VerifiedHome()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "verify metis home for config: "+err.Error())
+		return
+	}
+	userPath := filepath.Join(home, "config.toml")
 	userContent, _ := os.ReadFile(userPath)
 	projectPath := filepath.Join(".metis", "config.toml")
 	projectContent, _ := os.ReadFile(projectPath)
+	// Close the directory-replacement window around both reads. If the pinned
+	// root changed while this request was in flight, discard everything instead
+	// of returning bytes read through the replacement path.
+	if _, err := config.VerifiedHome(); err != nil {
+		writeError(w, http.StatusInternalServerError, "verify metis home after reading config: "+err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"userPath":       userPath,
 		"userContent":    redactSecrets(string(userContent)),
@@ -2908,7 +2927,7 @@ type webModel struct {
 // handleModels lists the configured models (GET) and switches the active
 // model (POST) by rebuilding the provider the same way activateSession does.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	cfg, _, err := config.Load()
+	cfg, err := s.loadProviderConfig()
 	if err != nil || cfg == nil {
 		writeError(w, http.StatusInternalServerError, "config unreadable")
 		return
@@ -3050,8 +3069,12 @@ func listConfiguredModels(cfg *config.Config) []webModel {
 	}
 	add("anthropic", cfg.Provider.Anthropic.Model)
 	add("openai", cfg.Provider.OpenAI.Model)
+	add("openai-codex", cfg.Provider.OpenAICodex.Model)
 	add("gemini", cfg.Provider.Gemini.Model)
 	for name, raw := range cfg.Provider.Custom {
+		if builtInProvider(name) {
+			continue
+		}
 		add(name, raw.Model)
 	}
 	return out

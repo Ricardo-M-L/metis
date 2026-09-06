@@ -2,7 +2,6 @@ package auth
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -139,11 +138,11 @@ func TestSearchKey_ValidatesInputs(t *testing.T) {
 // preferring the persistent store over shell rc is the perm bump;
 // regress on this and we silently lose the upgrade.
 func TestSearchKey_FilePermissionsAre0600(t *testing.T) {
-	dir := tempHomeSearch(t)
+	tempHomeSearch(t)
 	if err := SetSearchKey("tavily", "tvly-perm"); err != nil {
 		t.Fatalf("SetSearchKey: %v", err)
 	}
-	st, err := os.Stat(filepath.Join(dir, "auth.json"))
+	st, err := os.Stat(Path())
 	if err != nil {
 		t.Fatalf("stat auth.json: %v", err)
 	}

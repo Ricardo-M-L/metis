@@ -27,12 +27,13 @@ type usageTotals struct {
 // longest-running phase of a turn.
 func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<- Event) ([]llm.ContentBlock, string, *usageTotals, error) {
 	var (
-		blocks      []llm.ContentBlock
-		curText     string
-		curThinking string
-		textFilter  llm.LeadingBlankLineFilter
-		stopReas    string
-		usage       usageTotals
+		blocks       []llm.ContentBlock
+		curText      string
+		curThinking  string
+		thinkingHint map[string]string
+		textFilter   llm.LeadingBlankLineFilter
+		stopReas     string
+		usage        usageTotals
 	)
 	type streamedTool struct {
 		blockIndex int
@@ -65,13 +66,21 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 	// GLM, MiniMax) strip them on the send path — see
 	// internal/llm/openai/openai.go's request builder.
 	flushThinking := func() {
-		if curThinking != "" {
+		if curThinking != "" || len(thinkingHint) > 0 {
 			// Thinking sits BEFORE the text/tool blocks it produced —
 			// matches Anthropic's wire-format ordering and reads
 			// chronologically when persisted.
-			blocks = append(blocks, llm.ContentBlock{Type: "thinking", Text: curThinking})
+			blocks = append(blocks, llm.ContentBlock{
+				Type:         "thinking",
+				Text:         curThinking,
+				ProviderHint: thinkingHint,
+			})
 			curThinking = ""
 		}
+		// A signature authenticates exactly one thinking block. Clear it
+		// even if a malformed provider emitted metadata without text so it
+		// can never attach to a later block.
+		thinkingHint = nil
 	}
 	flushTool := func(tool *streamedTool) {
 		if tool == nil || tool.finished {
@@ -210,6 +219,12 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// "(thinking…)" preview working.
 			curThinking += ev.TextDelta
 			emit(ctx, out, Event{Kind: EventThinkingDelta, TextDelta: ev.TextDelta})
+		case "thinking_signature":
+			// Provider-only metadata: attach it to the exact reasoning
+			// block and close that block at the wire boundary. Never emit
+			// the opaque signature to the UI.
+			thinkingHint = ev.ProviderHint
+			flushThinking()
 		case "redacted_thinking":
 			// Anthropic's safety classifier replaced a chunk of the
 			// model's reasoning with opaque cipher text. We can't

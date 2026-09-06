@@ -227,10 +227,60 @@ func TestRedactSubprocessTextCoversAuthorizationDatabaseDSNsAndEscapedJSON(t *te
 }
 
 func TestRedactSubprocessTextPreservesOrdinaryMetadataAndValidJSON(t *testing.T) {
-	in := `{"decision":"deny","reason":"auth=required","author":"Alice","auth_status":"required","token_count":42}`
+	in := `{"decision":"deny","reason":"auth=required","author":"Alice","auth_status":"required","token_count":42,"access":"granted","refresh":"manual"}`
 	got := RedactSubprocessText(in)
 	if got != in {
 		t.Fatalf("ordinary metadata changed:\n got: %s\nwant: %s", got, in)
+	}
+}
+
+func TestSubprocessRedactionPreservesBusinessAccountIDs(t *testing.T) {
+	for _, in := range []string{
+		`{"event":"account_created","account_id":"fixture-account-123"}`,
+		`account_id=fixture-account-123`,
+		`{"account_id":` + "\n" + `"fixture-account-123"}`,
+	} {
+		if got := RedactSubprocessText(in); got != in {
+			t.Errorf("business account changed: got %q, want %q", got, in)
+		}
+		redactor := NewFileCredentialRedactor([]byte(in))
+		if redactor.HasRedactions() {
+			t.Errorf("business account marked as a file credential: %q", in)
+		}
+	}
+	if IsCredentialFieldName("account_id") {
+		t.Error("generic account_id classified as a credential")
+	}
+}
+
+func TestRedactSubprocessTextCoversOAuthAccountAndJWTFields(t *testing.T) {
+	jwt := "eyJ" + strings.Repeat("a", 16) + "." + strings.Repeat("b", 16) + "." + strings.Repeat("c", 16)
+	in := strings.Join([]string{
+		`{"access_token":"access-secret","refresh_token":"refresh-secret","chatgpt_account_id":"acct-secret"}`,
+		"Authorization: Bearer " + jwt,
+	}, "\n")
+	got := RedactSubprocessText(in)
+	for _, forbidden := range []string{"access-secret", "refresh-secret", "acct-secret", jwt} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("OAuth diagnostic leaked %q: %s", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, `"chatgpt_account_id":"[REDACTED]"`) ||
+		!strings.Contains(got, "Authorization: Bearer [REDACTED]") {
+		t.Fatalf("OAuth diagnostic was not selectively redacted: %s", got)
+	}
+}
+
+func TestCredentialFieldNamesKeepAccessAndRefreshNarrow(t *testing.T) {
+	for _, name := range []string{"access", "refresh", "access_mode", "refresh_interval", "account_id"} {
+		if IsCredentialFieldName(name) {
+			t.Errorf("ordinary field %q classified as a credential", name)
+		}
+	}
+	for _, name := range []string{"access_token", "refresh_token", "chatgpt_account_id", "Authorization"} {
+		if !IsCredentialFieldName(name) {
+			t.Errorf("credential field %q was not classified", name)
+		}
 	}
 }
 

@@ -123,10 +123,10 @@ func (b *Bedrock) VisionCapability() provider.VisionCapability {
 }
 func (b *Bedrock) MaxContextTokens() int { return b.ContextWindow }
 
-// Bedrock uses the shared Anthropic request encoder, which cannot replay
-// unsigned plaintext thinking blocks.
+// Bedrock uses the shared Anthropic request encoder. Plaintext thinking only
+// round-trips when its original Anthropic signature is present.
 func (b *Bedrock) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
-	return block.Type != "thinking" && (block.Type != "redacted_thinking" || block.Data != "")
+	return anthropic.CanReplayAssistantBlock(block)
 }
 
 // invokeURL is the synchronous Bedrock Runtime endpoint. Returns the
@@ -251,6 +251,17 @@ func newSyntheticStream(r *Response) *syntheticStream {
 		switch c.Type {
 		case "text":
 			s.pending = append(s.pending, StreamEvent{Type: "text_delta", TextDelta: c.Text})
+		case "thinking":
+			s.pending = append(s.pending,
+				StreamEvent{Type: "thinking_delta", TextDelta: c.Text},
+				StreamEvent{Type: "thinking_signature", ProviderHint: c.ProviderHint},
+			)
+		case "redacted_thinking":
+			if c.Data != "" {
+				s.pending = append(s.pending, StreamEvent{
+					Type: "redacted_thinking", TextDelta: c.Data, ProviderHint: c.ProviderHint,
+				})
+			}
 		case "tool_use":
 			// Anthropic-stream-equivalent 3-event sequence.
 			inputJSON, _ := json.Marshal(c.ToolInput)

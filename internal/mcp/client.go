@@ -580,7 +580,9 @@ func configuredSecretArgValues(args []string) []string {
 	var values []string
 	for i := 0; i < len(args); i++ {
 		flag, inlineValue, hasInlineValue := splitCredentialArg(args[i])
-		if !isCredentialArgFlag(flag) {
+		credentialFlag := isCredentialArgFlag(flag)
+		headerFlag := isHeaderArgFlag(flag)
+		if !credentialFlag && !headerFlag {
 			continue
 		}
 		value := inlineValue
@@ -591,7 +593,13 @@ func configuredSecretArgValues(args []string) []string {
 			i++
 			value = args[i]
 		}
-		values = appendCredentialRedactionValues(values, seen, value, true)
+		if credentialFlag {
+			values = appendCredentialRedactionValues(values, seen, value, true)
+			continue
+		}
+		for _, secret := range configuredSecretHeaderArgValues(value) {
+			values = appendCredentialRedactionValues(values, seen, secret, true)
+		}
 	}
 	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
 	return values
@@ -601,6 +609,12 @@ func splitCredentialArg(arg string) (flag, value string, hasValue bool) {
 	trimmed := strings.TrimSpace(arg)
 	if !strings.HasPrefix(trimmed, "-") && !strings.HasPrefix(trimmed, "/") {
 		return trimmed, "", false
+	}
+	// curl accepts the compact spelling `-HAuthorization: Bearer ...` in
+	// addition to `-H 'Authorization: Bearer ...'`. Split the short option
+	// before looking for ':' so the header name is not mistaken for the flag.
+	if strings.HasPrefix(trimmed, "-H") && len(trimmed) > len("-H") {
+		return "-H", strings.TrimSpace(trimmed[len("-H"):]), true
 	}
 	for _, separator := range []string{"=", ":"} {
 		if i := strings.Index(trimmed, separator); i > 0 {
@@ -613,12 +627,62 @@ func splitCredentialArg(arg string) (flag, value string, hasValue bool) {
 func isCredentialArgFlag(flag string) bool {
 	normalized := strings.ToLower(strings.TrimLeft(strings.TrimSpace(flag), "-/"))
 	normalized = strings.ReplaceAll(normalized, "_", "-")
+	if isCredentialEnvKey(strings.ReplaceAll(normalized, "-", "_")) {
+		return true
+	}
+	return normalized == "license"
+}
+
+func isHeaderArgFlag(flag string) bool {
+	normalized := strings.ToLower(strings.TrimLeft(strings.TrimSpace(flag), "-/"))
+	normalized = strings.ReplaceAll(normalized, "_", "-")
 	switch normalized {
-	case "api-key", "token", "secret", "password", "authorization", "credential", "license":
+	case "h", "header", "headers", "http-header", "request-header":
 		return true
 	default:
 		return false
 	}
+}
+
+// configuredSecretHeaderArgValues extracts credentials from curl-style
+// `-H 'Authorization: Bearer ...'` arguments and JSON maps accepted by some
+// MCP launchers via `--headers`. Redacting only the complete argv element is
+// insufficient because child processes commonly echo just the header value.
+func configuredSecretHeaderArgValues(raw string) []string {
+	seen := make(map[string]struct{})
+	values := make([]string, 0, 4)
+	addHeader := func(name, value string) {
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if !shouldRedactExplicitValue(strings.ReplaceAll(name, "-", "_"), value, true) {
+			return
+		}
+		values = appendCredentialRedactionValues(values, seen, value, true)
+	}
+
+	var object map[string]any
+	if json.Unmarshal([]byte(raw), &object) == nil {
+		for name, value := range object {
+			switch typed := value.(type) {
+			case string:
+				addHeader(name, typed)
+			case []any:
+				for _, item := range typed {
+					if text, ok := item.(string); ok {
+						addHeader(name, text)
+					}
+				}
+			}
+		}
+	} else {
+		for _, line := range strings.Split(raw, "\n") {
+			if name, value, ok := strings.Cut(line, ":"); ok {
+				addHeader(name, value)
+			}
+		}
+	}
+	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	return values
 }
 
 func configuredSecretHeaderValues(headers map[string]string) []string {
@@ -846,11 +910,12 @@ func credentialURLRedactionValues(raw string, includeWhole bool) []string {
 	}
 	if u.User != nil {
 		username := u.User.Username()
-		if len(username) >= minOpaqueExplicitValueBytes || looksOpaqueURLSegment(username) {
-			add(username)
-			add(url.QueryEscape(username))
-			add(url.PathEscape(username))
-		}
+		// Any URI userinfo is authentication material, including short
+		// username-only bearer identifiers. Do not apply the ordinary opaque
+		// value length heuristic at an explicit credential boundary.
+		add(username)
+		add(url.QueryEscape(username))
+		add(url.PathEscape(username))
 		if password, ok := u.User.Password(); ok {
 			add(password)
 			add(url.QueryEscape(password))

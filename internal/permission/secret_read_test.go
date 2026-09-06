@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/auth"
 )
 
 // Reading a credential file must be gated in modes that otherwise auto-allow
@@ -19,7 +21,17 @@ func TestGate_SecretReadGatedAcrossModes(t *testing.T) {
 		"/root/.kube/config",
 		"/Users/x/.gnupg/secring.gpg",
 		"/Users/x/.metis/auth.json",
+		"/Users/x/.metis/.credentials/auth.json",
+		"/Users/x/.metis/.credentials/future-secret.bin",
+		"/Users/x/.metis/llm-oauth.json",
+		"/Users/x/.metis/.llm-oauth.lock",
+		"/Users/x/.metis/.llm-oauth-refresh-0123456789abcdef.lock",
+		"/Users/x/.metis/.llm-oauth-session.tmp",
+		"/Users/x/.metis/.auth.json.session",
 		"/Users/x/.metis/mcp-oauth.json",
+		"/Users/x/.metis/.mcp-oauth.lock",
+		"/Users/x/.metis/.mcp-oauth-refresh-0123456789abcdef.lock",
+		"/Users/x/.metis/.mcp-oauth-session.tmp",
 		"/Users/x/.metis/mcp.toml",
 		"/Users/x/.metis/config.toml",
 		"/work/project/.metis/config.local.toml",
@@ -58,11 +70,22 @@ func TestGate_SecretReadGatedAcrossModes(t *testing.T) {
 func TestGate_MetisCredentialFilesProtectedFromReadGrepAndBash(t *testing.T) {
 	paths := []string{
 		"/Users/x/.metis/auth.json",
+		"/Users/x/.metis/llm-oauth.json",
+		"/Users/x/.metis/.llm-oauth.lock",
+		"/Users/x/.metis/.llm-oauth-refresh-0123456789abcdef.lock",
+		"/Users/x/.metis/.llm-oauth-session.tmp",
+		"/Users/x/.metis/.auth.json.session",
 		"/Users/x/.metis/mcp-oauth.json",
+		"/Users/x/.metis/.mcp-oauth.lock",
+		"/Users/x/.metis/.mcp-oauth-session.tmp",
 		"/Users/x/.metis/mcp.toml",
 		"/Users/x/.metis/config.toml",
 		"/work/project/.metis/config.local.toml",
 		`C:\Users\x\.metis\auth.json`,
+		`C:\Users\x\.metis\.credentials\auth.json`,
+		`C:\Users\x\.metis\.credentials\future-secret.bin`,
+		`C:\Users\x\.metis\llm-oauth.json`,
+		`C:\Users\x\.metis\.llm-oauth-refresh-0123456789abcdef.lock`,
 	}
 	for _, mode := range []Mode{ModeAsk, ModeBypassPermissions} {
 		want := DecisionAsk
@@ -89,6 +112,51 @@ func TestGate_MetisCredentialFilesProtectedFromReadGrepAndBash(t *testing.T) {
 						mode, tc.tool, tc.input, source)
 				}
 			}
+		}
+	}
+}
+
+func TestGate_PrivateCredentialDirectoryIsProtectedAsNamespace(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("METIS_HOME", root)
+	credentialDir := filepath.Join(root, ".credentials")
+	g := New(ModeBypassPermissions)
+	for _, tc := range []struct {
+		tool  string
+		input string
+	}{
+		{tool: "Read", input: filepath.Join(credentialDir, "auth.json")},
+		{tool: "Read", input: filepath.Join(credentialDir, "future-random-name.bin")},
+		{tool: "Grep", input: credentialDir},
+		{tool: "RunCode", input: `print(open("` + filepath.Join(credentialDir, "future-random-name.bin") + `").read())`},
+		{tool: "Bash", input: `cat "$METIS_HOME/.credentials/llm-oauth.json"`},
+		{tool: "Bash", input: `cat "$METIS_HOME/.credentials/.mcp-oauth-session.tmp"`},
+	} {
+		decision, source := g.Check(context.Background(), tc.tool, tc.input)
+		if decision != DecisionDeny || source != "secret_read:bypass_immune" {
+			t.Errorf("%s(%q) = %v (%s), want private-directory secret deny", tc.tool, tc.input, decision, source)
+		}
+	}
+}
+
+func TestGate_LLMOAuthSidecarMatchingIsNarrow(t *testing.T) {
+	g := New(ModeBypassPermissions)
+	for _, path := range []string{
+		"/Users/x/.metis/.llm-oauth.lock",
+		"/Users/x/.metis/.llm-oauth-refresh-0123456789abcdef.lock",
+		"/Users/x/.metis/.llm-oauth-session.tmp",
+	} {
+		if decision, source := g.Check(context.Background(), "Read", path); decision != DecisionDeny || source != "secret_read:bypass_immune" {
+			t.Errorf("Read(%q) = %v (%s), want silent credential deny", path, decision, source)
+		}
+	}
+	for _, path := range []string{
+		"/Users/x/project/.llm-oauth-session.tmp",
+		"/Users/x/.metis/.llm-oauth-notes.md",
+		"/Users/x/.metis/.llm-oauth-refresh-status.txt",
+	} {
+		if decision, source := g.Check(context.Background(), "Read", path); decision == DecisionDeny || source == "secret_read:bypass_immune" {
+			t.Errorf("ordinary Read(%q) unexpectedly treated as an OAuth credential: %v (%s)", path, decision, source)
 		}
 	}
 }
@@ -171,6 +239,12 @@ func TestGate_CustomMetisHomeShellVariablePathsRemainSecret(t *testing.T) {
 	g := New(ModeBypassPermissions)
 	for _, command := range []string{
 		`cat "$METIS_HOME/auth.json"`,
+		`cat "$METIS_HOME/llm-oauth.json"`,
+		`cat "$METIS_HOME/.llm-oauth.lock"`,
+		`cat "$METIS_HOME/.llm-oauth-refresh-0123456789abcdef.lock"`,
+		`cat "$METIS_HOME/.llm-oauth-session.tmp"`,
+		`Get-Content "$env:METIS_HOME\\llm-oauth.json"`,
+		`Get-Content "%METIS_HOME%\\.llm-oauth-session.tmp"`,
 		`cat "${METIS_HOME}/mcp-oauth.json"`,
 		`cat $METIS_HOME/config.toml`,
 		`cat "$env:METIS_HOME\\mcp.toml"`,
@@ -190,6 +264,24 @@ func TestGate_CustomMetisHomeShellVariablePathsRemainSecret(t *testing.T) {
 	}
 }
 
+func TestGate_DarwinPrivateAliasProtectsLLMOAuthSidecars(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("/private path aliases are specific to macOS")
+	}
+	t.Setenv("METIS_HOME", "/private/var/tmp/metis-private-state")
+	g := New(ModeBypassPermissions)
+	for _, path := range []string{
+		"/var/tmp/metis-private-state/llm-oauth.json",
+		"/var/tmp/metis-private-state/.llm-oauth-refresh-fixture.lock",
+		"/var/tmp/metis-private-state/.llm-oauth-fixture.tmp",
+	} {
+		decision, source := g.Check(context.Background(), "Read", path)
+		if decision != DecisionDeny || source != "secret_read:bypass_immune" {
+			t.Errorf("Read(%q) = %v (%s), want macOS alias credential deny", path, decision, source)
+		}
+	}
+}
+
 func TestGate_CustomMetisHomeWritesRemainBypassImmune(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("METIS_HOME", root)
@@ -199,6 +291,9 @@ func TestGate_CustomMetisHomeWritesRemainBypassImmune(t *testing.T) {
 		input string
 	}{
 		{tool: "Bash", input: `printf compromised > "$METIS_HOME//auth.json"`},
+		{tool: "Bash", input: `printf compromised > "$METIS_HOME/.llm-oauth-session.tmp"`},
+		{tool: "Write", input: filepath.Join(root, "llm-oauth.json")},
+		{tool: "Edit", input: filepath.Join(root, ".llm-oauth-refresh-0123456789abcdef.lock")},
 		{tool: "Write", input: filepath.Join(root, "mcp.toml")},
 		{tool: "Edit", input: filepath.Join(root, "config.local.toml")},
 	} {
@@ -262,5 +357,43 @@ func TestGate_SymlinkedMetisHomeCanonicalTargetDenied(t *testing.T) {
 		if decision != DecisionDeny || source != "secret_read:bypass_immune" {
 			t.Fatalf("%s canonical credential target = %v (%s), want silent deny; matched=%v paths=%q", tc.tool, decision, source, matchesSecretReadPath(secret), metisSecretReadPaths())
 		}
+	}
+}
+
+func TestGate_RetargetedMetisHomeStillProtectsFrozenCredentialRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	parent := t.TempDir()
+	first := filepath.Join(parent, "first")
+	second := filepath.Join(parent, "second")
+	if err := os.MkdirAll(first, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(second, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(parent, "current")
+	if err := os.Symlink(first, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("METIS_HOME", link)
+	if err := auth.Set("openai", "credential-must-remain-hidden"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, link); err != nil {
+		t.Fatal(err)
+	}
+	resolvedFirst, err := filepath.EvalSymlinks(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCredentialPath := filepath.Join(resolvedFirst, auth.CredentialDirectoryName, "auth.json")
+	decision, source := New(ModeBypassPermissions).Check(context.Background(), "Read", oldCredentialPath)
+	if decision != DecisionDeny || source != "secret_read:bypass_immune" {
+		t.Fatalf("Read(frozen credential root) = %v (%s), want silent deny", decision, source)
 	}
 }

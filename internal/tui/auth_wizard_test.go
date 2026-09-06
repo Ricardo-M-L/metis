@@ -75,6 +75,7 @@ func TestPersistAuthWizardResultRejectsBuiltInEndpointOverrideBeforeSavingKey(t 
 	}{
 		{provider: "anthropic", table: "provider.anthropic"},
 		{provider: "openai", table: "provider.openai"},
+		{provider: "gemini", table: "provider.gemini"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
@@ -84,6 +85,7 @@ func TestPersistAuthWizardResultRejectsBuiltInEndpointOverrideBeforeSavingKey(t 
 			t.Chdir(project)
 			t.Setenv("ANTHROPIC_API_KEY", "")
 			t.Setenv("OPENAI_API_KEY", "")
+			t.Setenv("GEMINI_API_KEY", "")
 			if err := os.Mkdir(filepath.Join(project, ".metis"), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -156,6 +158,75 @@ api_key_env = "SENSENOVA_API_KEY"
 	}
 }
 
+func TestBuiltInProviderHigherPriorityCredentialIncludesGoogleAPIKey(t *testing.T) {
+	t.Setenv("GOOGLE_API_KEY", "legacy-gemini-key")
+	if !builtInProviderHasHigherPriorityCredential(&config.Config{}, "gemini") {
+		t.Fatal("GOOGLE_API_KEY must block a wizard-managed Gemini key from becoming inert")
+	}
+}
+
+func TestPersistAuthWizardResultMigratesInlineAPIKeyToManagedStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "legacy-inline-secret"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistAuthWizardResult(AuthResult{
+		Provider: "openai", Method: AuthMethodAPIKey, Key: "managed-secret",
+	}); err != nil {
+		t.Fatalf("migrate inline API key: %v", err)
+	}
+	if key, err := auth.Get("openai"); err != nil || key != "managed-secret" {
+		t.Fatalf("managed key = %q, %v", key, err)
+	}
+	cfg, _, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key, err := cfg.ResolveAPIKey("openai"); err != nil || key != "managed-secret" {
+		t.Fatalf("effective key did not move to managed store: %q, %v", key, err)
+	}
+}
+
+func TestLoginProviderListExcludesCloudCredentialShapes(t *testing.T) {
+	providers := loginProviders([]ConfiguredLoginProvider{
+		{ID: "http-route", Transport: "openai_responses"},
+		{ID: "vertex-route", Transport: "vertex_anthropic"},
+		{ID: "bedrock-route", Transport: "bedrock_anthropic"},
+	})
+	if _, ok := findAuthProvider(providers, "http-route"); !ok {
+		t.Fatal("API-key custom provider missing from login picker")
+	}
+	for _, id := range []string{"vertex-route", "bedrock-route"} {
+		if _, ok := findAuthProvider(providers, id); ok {
+			t.Fatalf("cloud-auth provider %q must not appear as a single-key login", id)
+		}
+	}
+}
+
+func TestPersistAuthWizardResultMakesAPIKeyTheOnlyCredentialMethod(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Chdir(t.TempDir())
+	if err := auth.PutOAuth("anthropic", auth.OAuthCredential{AccessToken: "old-oauth"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistAuthWizardResult(AuthResult{Provider: "anthropic", Key: "new-api-key"}); err != nil {
+		t.Fatal(err)
+	}
+	if key, err := auth.Get("anthropic"); err != nil || key != "new-api-key" {
+		t.Fatalf("stored API key = %q err=%v", key, err)
+	}
+	if credential, err := auth.GetOAuth("anthropic"); err != nil || credential != nil {
+		t.Fatalf("superseded OAuth remains: present=%v err=%v", credential != nil, err)
+	}
+}
+
 func TestPersistAuthWizardResultRejectsOrphanCredentialBeforeCreatingProfile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
@@ -199,17 +270,22 @@ func TestBuiltInProviderUsesOfficialEndpoint(t *testing.T) {
 		{name: "openai official", provider: "openai", baseURL: "https://api.openai.com/v1", want: true},
 		{name: "openai TLS port", provider: "openai", baseURL: "https://api.openai.com:443/v1/", want: true},
 		{name: "openai extra path", provider: "openai", baseURL: "https://api.openai.com/v1/proxy", want: false},
+		{name: "gemini official", provider: "gemini", baseURL: "https://generativelanguage.googleapis.com", want: true},
+		{name: "gemini deceptive host", provider: "gemini", baseURL: "https://generativelanguage.googleapis.com.attacker.invalid", want: false},
 		{name: "unknown provider", provider: "other", baseURL: "https://api.openai.com/v1", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg.Provider.Anthropic.BaseURL = ""
 			cfg.Provider.OpenAI.BaseURL = ""
+			cfg.Provider.Gemini.BaseURL = ""
 			switch tt.provider {
 			case "anthropic":
 				cfg.Provider.Anthropic.BaseURL = tt.baseURL
 			case "openai":
 				cfg.Provider.OpenAI.BaseURL = tt.baseURL
+			case "gemini":
+				cfg.Provider.Gemini.BaseURL = tt.baseURL
 			}
 			if got := builtInProviderUsesOfficialEndpoint(cfg, tt.provider); got != tt.want {
 				t.Fatalf("builtInProviderUsesOfficialEndpoint() = %v, want %v", got, tt.want)
@@ -282,28 +358,321 @@ func TestAuthWizardPasteReachesEveryTextInput(t *testing.T) {
 	}
 }
 
-func TestAuthWizardKeyInputIsPlaintextAndEditableByDefault(t *testing.T) {
+func TestAuthWizardKeyInputIsMaskedEditableAndNeverRendered(t *testing.T) {
 	m := newAuthModel()
-	if got := m.keyInput.EchoMode; got != textinput.EchoNormal {
-		t.Fatalf("key input EchoMode = %v, want EchoNormal", got)
+	if got := m.keyInput.EchoMode; got != textinput.EchoPassword {
+		t.Fatalf("key input EchoMode = %v, want EchoPassword", got)
 	}
 
 	m.step = stepEnterKey
-	m.keyInput.SetValue("sk-test-visible")
+	m.chosen = builtInAuthProviders[0]
+	m.resultMethod = AuthMethodAPIKey
+	m.keyInput.SetValue("sk-test-secret")
 	m.keyInput.CursorEnd()
-	if got := ansi.Strip(m.keyInput.View()); !strings.Contains(got, "sk-test-visible") {
-		t.Fatalf("plaintext key is not present in rendered input: %q", got)
+	if got := ansi.Strip(m.keyInput.View()); strings.Contains(got, "sk-test-secret") {
+		t.Fatalf("plaintext key leaked in rendered input: %q", got)
 	}
 
 	m = driveAuthWizard(t, m, tea.KeyPressMsg{Code: tea.KeyBackspace})
 	m = driveAuthWizard(t, m, tea.KeyPressMsg{Code: 'x', Text: "x"})
-	if got, want := m.keyInput.Value(), "sk-test-visiblx"; got != want {
+	if got, want := m.keyInput.Value(), "sk-test-secrex"; got != want {
 		t.Fatalf("edited key = %q, want %q", got, want)
 	}
 
 	view := ansi.Strip(m.View().Content)
-	if strings.Contains(view, "Input is masked") {
-		t.Fatalf("wizard still claims the plaintext input is masked:\n%s", view)
+	if !strings.Contains(view, "Input is masked") || strings.Contains(view, "sk-test-secrex") {
+		t.Fatalf("wizard view did not keep the secret masked:\n%s", view)
+	}
+}
+
+func TestAuthWizardCompletedViewDoesNotLeakSubmittedKey(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Chdir(t.TempDir())
+	m, err := newLoginAuthModel(LoginOptions{Provider: "openai", Method: AuthMethodAPIKey}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "sk-never-render-this-value"
+	m.keyInput.SetValue(secret)
+	m = driveAuthWizard(t, m, authEnter())
+	if m.step != stepDone || m.err != nil {
+		t.Fatalf("submitted wizard = step %v err %v", m.step, m.err)
+	}
+	if view := ansi.Strip(m.View().Content); strings.Contains(view, secret) || strings.Contains(view, "sk-never") {
+		t.Fatalf("submitted key leaked in final view: %q", view)
+	}
+}
+
+func TestLoginWizardProviderAndMethodRouting(t *testing.T) {
+	tests := []struct {
+		name       string
+		options    LoginOptions
+		wantStep   authStep
+		wantMethod string
+		wantCount  int
+	}{
+		{name: "openai id is case insensitive", options: LoginOptions{Provider: "OPENAI"}, wantStep: stepPickMethod, wantCount: 1},
+		{name: "openai api key skips method", options: LoginOptions{Provider: "openai", Method: AuthMethodAPIKey}, wantStep: stepEnterKey, wantMethod: AuthMethodAPIKey, wantCount: 1},
+		{name: "openai oauth skips method", options: LoginOptions{Provider: "openai", Method: AuthMethodOAuth}, wantStep: stepDone, wantMethod: AuthMethodOAuth, wantCount: 1},
+		{name: "anthropic asks for method", options: LoginOptions{Provider: "Anthropic"}, wantStep: stepPickMethod, wantCount: 1},
+		{name: "anthropic oauth skips method", options: LoginOptions{Provider: "anthropic", Method: AuthMethodOAuth}, wantStep: stepDone, wantMethod: AuthMethodOAuth, wantCount: 1},
+		{name: "codex asks for oauth flow", options: LoginOptions{Provider: "openai-codex"}, wantStep: stepPickOAuthFlow, wantMethod: AuthMethodOAuth, wantCount: 1},
+		{name: "codex device flow skips picker", options: LoginOptions{Provider: "openai-codex", OAuthFlow: OAuthFlowDevice}, wantStep: stepDone, wantMethod: AuthMethodOAuth, wantCount: 1},
+		{name: "gemini has only api key", options: LoginOptions{Provider: "gemini"}, wantStep: stepEnterKey, wantMethod: AuthMethodAPIKey, wantCount: 1},
+		{name: "oauth filters provider picker", options: LoginOptions{Method: AuthMethodOAuth}, wantStep: stepPickProvider, wantCount: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := newLoginAuthModel(tt.options, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.step != tt.wantStep {
+				t.Fatalf("step = %v, want %v", m.step, tt.wantStep)
+			}
+			if m.resultMethod != tt.wantMethod {
+				t.Fatalf("method = %q, want %q", m.resultMethod, tt.wantMethod)
+			}
+			if len(m.providers) != tt.wantCount {
+				t.Fatalf("provider count = %d, want %d", len(m.providers), tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestLoginWizardProviderPickerHasOneOpenAIEntry(t *testing.T) {
+	for _, method := range []string{"", AuthMethodOAuth, AuthMethodAPIKey} {
+		t.Run("method="+method, func(t *testing.T) {
+			m, err := newLoginAuthModel(LoginOptions{Method: method}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			openAICount := 0
+			for _, provider := range m.providers {
+				if provider.id == "openai" {
+					openAICount++
+				}
+				if provider.id == "openai-codex" {
+					t.Fatal("regular provider picker duplicated OpenAI with the legacy Codex entry")
+				}
+			}
+			if openAICount != 1 {
+				t.Fatalf("OpenAI entries = %d, want 1; providers=%v", openAICount, authProviderIDs(m.providers))
+			}
+		})
+	}
+}
+
+func TestLoginWizardOpenAIAccountSelectionUsesBrowserWithoutKey(t *testing.T) {
+	m, err := newLoginAuthModel(LoginOptions{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, provider := range m.providers {
+		if provider.id == "openai" {
+			for j := 0; j < i; j++ {
+				m = driveAuthWizard(t, m, tea.KeyPressMsg{Code: tea.KeyDown})
+			}
+			break
+		}
+	}
+	m = driveAuthWizard(t, m, authEnter())
+	if m.chosen.id != "openai" || m.step != stepPickMethod {
+		t.Fatalf("OpenAI selection = provider %q step %v, want method picker", m.chosen.id, m.step)
+	}
+	if len(m.methods) != 2 || m.methods[0].id != AuthMethodOAuth || m.methods[1].id != AuthMethodAPIKey || m.methodCursor != 0 {
+		t.Fatalf("OpenAI methods = %#v cursor=%d, want account selected before API key", m.methods, m.methodCursor)
+	}
+	view := ansi.Strip(m.View().Content)
+	for _, want := range []string{"Sign in with ChatGPT", "browser", "no API key required"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("OpenAI method picker missing %q:\n%s", want, view)
+		}
+	}
+	m = driveAuthWizard(t, m, authEnter())
+	if m.step != stepDone || m.err != nil || m.validationErr != "" {
+		t.Fatalf("account login without key = step %v err=%v validation=%q", m.step, m.err, m.validationErr)
+	}
+	result := m.authResult()
+	if result.Provider != "openai-codex" || result.Method != AuthMethodOAuth || result.OAuthFlow != OAuthFlowBrowser || result.Key != "" || result.Custom != nil {
+		t.Fatalf("account result = %#v, want openai-codex/browser OAuth without API key", result)
+	}
+}
+
+func TestLoginWizardOpenAIAPIKeySelectionStaysMaskedAndUsesOpenAI(t *testing.T) {
+	m, err := newLoginAuthModel(LoginOptions{Provider: "openai"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.step != stepPickMethod {
+		t.Fatalf("step = %v, want method picker", m.step)
+	}
+	m = driveAuthWizard(t, m, tea.KeyPressMsg{Code: tea.KeyDown})
+	m = driveAuthWizard(t, m, authEnter())
+	if m.step != stepEnterKey || m.resultMethod != AuthMethodAPIKey {
+		t.Fatalf("API-key selection = step %v method %q", m.step, m.resultMethod)
+	}
+	if m.keyInput.EchoMode != textinput.EchoPassword {
+		t.Fatalf("API-key echo mode = %v, want EchoPassword", m.keyInput.EchoMode)
+	}
+	m = driveAuthWizard(t, m, authEnter())
+	if m.step != stepEnterKey || m.validationErr == "" {
+		t.Fatal("API-key login accepted an empty key")
+	}
+	const secret = "sk-openai-key-remains-masked"
+	m = driveAuthWizard(t, m, tea.PasteMsg{Content: secret})
+	if view := ansi.Strip(m.View().Content); strings.Contains(view, secret) || !strings.Contains(view, "Input is masked") {
+		t.Fatalf("API-key entry did not keep the secret masked:\n%s", view)
+	}
+	m = driveAuthWizard(t, m, authEnter())
+	if m.step != stepDone || m.err != nil {
+		t.Fatalf("API-key submission = step %v err=%v", m.step, m.err)
+	}
+	result := m.authResult()
+	if result.Provider != "openai" || result.Method != AuthMethodAPIKey || result.OAuthFlow != "" || result.Key != secret {
+		t.Fatalf("API-key result has provider=%q method=%q flow=%q key_match=%v", result.Provider, result.Method, result.OAuthFlow, result.Key == secret)
+	}
+}
+
+func TestLoginWizardOpenAIExplicitOAuthSelectsFlow(t *testing.T) {
+	for _, flow := range []string{"", OAuthFlowBrowser, OAuthFlowDevice} {
+		t.Run("flow="+flow, func(t *testing.T) {
+			m, err := newLoginAuthModel(LoginOptions{Provider: " OpenAI ", Method: AuthMethodOAuth, OAuthFlow: flow}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.step != stepDone {
+				t.Fatalf("explicit OAuth started at step %v, want ready to authorize", m.step)
+			}
+			wantFlow := flow
+			if wantFlow == "" {
+				wantFlow = OAuthFlowBrowser
+			}
+			result := m.authResult()
+			if result.Provider != "openai-codex" || result.Method != AuthMethodOAuth || result.OAuthFlow != wantFlow || result.Key != "" {
+				t.Fatalf("explicit OAuth result = %#v, want openai-codex/%s without API key", result, wantFlow)
+			}
+		})
+	}
+}
+
+func TestLoginWizardUsesConfiguredCustomProviderWithoutReenteringProfile(t *testing.T) {
+	profile := ConfiguredLoginProvider{
+		ID: "sensenova", Transport: "openai_chat",
+		BaseURL: "https://api.example.com/v1", Model: "deepseek-v4-pro",
+	}
+	m, err := newLoginAuthModel(LoginOptions{
+		Provider: "sensenova", ConfiguredProviders: []ConfiguredLoginProvider{profile},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.step != stepEnterKey || m.chosen.id != "sensenova" || !m.isCustom {
+		t.Fatalf("configured provider route = step %v chosen=%q custom=%v", m.step, m.chosen.id, m.isCustom)
+	}
+	m.keyInput.SetValue("opaque-test-key")
+	m = driveAuthWizard(t, m, authEnter())
+	result := m.authResult()
+	if result.Provider != "sensenova" || result.Custom == nil || !result.Custom.Existing || result.Custom.BaseURL != profile.BaseURL || result.Custom.Model != profile.Model {
+		t.Fatalf("configured provider result = %#v", result)
+	}
+}
+
+func TestLoginWizardShowsConfiguredEndpointBeforeKeyEntry(t *testing.T) {
+	profile := ConfiguredLoginProvider{
+		ID: "sensenova", Transport: "openai_chat",
+		BaseURL: "https://token.snova.example/v1", Model: "sensenova-test",
+	}
+	m, err := newLoginAuthModel(LoginOptions{
+		Provider: profile.ID, Method: AuthMethodAPIKey, ConfiguredProviders: []ConfiguredLoginProvider{profile},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.step != stepEnterKey {
+		t.Fatalf("configured provider started at step %v, want key entry", m.step)
+	}
+	view := m.View().Content
+	for _, want := range []string{"Transport: openai_chat", "Endpoint: https://token.snova.example/v1", "Model: sensenova-test"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("configured key screen missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestLoginWizardPickerIncludesConfiguredProvidersBeforeGenericCustom(t *testing.T) {
+	m, err := newLoginAuthModel(LoginOptions{ConfiguredProviders: []ConfiguredLoginProvider{
+		{ID: "sensenova", Transport: "openai_chat", BaseURL: "https://api.example.com/v1", Model: "model"},
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.providers) < 2 || m.providers[len(m.providers)-2].id != "sensenova" || m.providers[len(m.providers)-1].id != "custom" {
+		t.Fatalf("provider picker order = %#v", authProviderIDs(m.providers))
+	}
+}
+
+func TestLoginWizardOpenAICodexOffersBrowserAndDevice(t *testing.T) {
+	for _, flow := range []string{OAuthFlowBrowser, OAuthFlowDevice} {
+		t.Run(flow, func(t *testing.T) {
+			m, err := newLoginAuthModel(LoginOptions{Provider: "openai-codex"}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.step != stepPickOAuthFlow {
+				t.Fatalf("step = %v, want OAuth flow picker", m.step)
+			}
+			if len(m.oauthFlows) != 2 || m.oauthFlows[0].id != OAuthFlowBrowser || m.oauthFlows[1].id != OAuthFlowDevice {
+				t.Fatalf("OAuth flows = %#v, want browser then device-code", m.oauthFlows)
+			}
+			if flow == OAuthFlowDevice {
+				m = driveAuthWizard(t, m, tea.KeyPressMsg{Code: tea.KeyDown})
+			}
+			m = driveAuthWizard(t, m, authEnter())
+			result := m.authResult()
+			if m.step != stepDone || result.Provider != "openai-codex" || result.Method != AuthMethodOAuth || result.OAuthFlow != flow || result.Key != "" {
+				t.Fatalf("result = %#v at step %v, want openai-codex OAuth %s", result, m.step, flow)
+			}
+		})
+	}
+}
+
+func TestLoginWizardRejectsUnknownOrUnsupportedSelection(t *testing.T) {
+	if _, err := newLoginAuthModel(LoginOptions{Provider: "open-ai"}, false); err == nil || !strings.Contains(err.Error(), "choose one of") {
+		t.Fatalf("unknown provider error = %v", err)
+	}
+	if _, err := newLoginAuthModel(LoginOptions{Provider: "gemini", Method: AuthMethodOAuth}, false); err == nil || !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("unsupported method error = %v", err)
+	}
+	if _, err := newLoginAuthModel(LoginOptions{Method: "token"}, false); err == nil || !strings.Contains(err.Error(), "api-key or oauth") {
+		t.Fatalf("unknown method error = %v", err)
+	}
+}
+
+func TestStartupAuthWizardNeverOffersOAuth(t *testing.T) {
+	m := newAuthModel()
+	for _, provider := range m.providers {
+		if provider.id == "openai-codex" {
+			t.Fatal("startup authentication gate offered browser-only OAuth")
+		}
+		if !providerSupportsMethod(provider, AuthMethodAPIKey) {
+			t.Fatalf("startup provider %q does not support API keys", provider.id)
+		}
+	}
+	m.chosen = m.providers[0]
+	m.advanceAfterProvider()
+	if m.step != stepEnterKey || m.resultMethod != AuthMethodAPIKey {
+		t.Fatalf("startup provider advanced to step=%v method=%q, want API-key entry", m.step, m.resultMethod)
+	}
+	for _, method := range []string{"", AuthMethodOAuth} {
+		openAI, err := newLoginAuthModel(LoginOptions{Provider: "openai", Method: method}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if openAI.step != stepEnterKey || openAI.resultMethod != AuthMethodAPIKey || !openAI.persistOnSubmit {
+			t.Fatalf("startup OpenAI = step %v method %q persist=%v, want persisted API-key entry", openAI.step, openAI.resultMethod, openAI.persistOnSubmit)
+		}
 	}
 }
 
@@ -316,6 +685,8 @@ func TestAuthWizardCustomProviderIDValidation(t *testing.T) {
 		"sense nova",
 		"sense.nova",
 		"google",
+		"anthropic-claudeai",
+		"openai-codex",
 		"-sensenova",
 	}
 	for _, input := range invalid {
@@ -458,6 +829,17 @@ func TestAuthWizardCustomBaseURLNormalizationByTransport(t *testing.T) {
 				t.Fatalf("normalized URL = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAuthWizardCustomBaseURLRejectsRemotePlainHTTP(t *testing.T) {
+	if _, err := validateAndNormalizeCustomBaseURL("openai_chat", "http://api.example.test/v1"); err == nil || !strings.Contains(err.Error(), "HTTPS") {
+		t.Fatalf("remote plain HTTP endpoint was accepted: %v", err)
+	}
+	for _, raw := range []string{"http://localhost:11434/v1", "http://127.0.0.1:9000/v1", "http://[::1]:9000/v1"} {
+		if _, err := validateAndNormalizeCustomBaseURL("openai_chat", raw); err != nil {
+			t.Fatalf("loopback endpoint %q rejected: %v", raw, err)
+		}
 	}
 }
 

@@ -21,10 +21,10 @@ const (
 )
 
 type linuxMetisView struct {
-	dir            string
-	roots          []string
-	restoreCwd     bool
-	desktopSession bool
+	dir                string
+	roots              []string
+	restoreCwd         bool
+	maskDesktopSession bool
 }
 
 func doctorPlatform() Diagnostic {
@@ -66,13 +66,19 @@ func wrapPlatform(cmd *exec.Cmd, req platformRequest) error {
 	if err := os.MkdirAll(linuxEmptyDir(req), 0o500); err != nil {
 		return fmt.Errorf("sandbox: create bubblewrap credential mask: %w", err)
 	}
+	if err := ensureLinuxCredentialMaskTargets(req); err != nil {
+		return err
+	}
 	var metisView linuxMetisView
-	if stdioMCP {
-		metisView, err = prepareLinuxStdioMCPMetisView(req)
+	if stdioMCP || req.credentialIsolationRequired {
+		metisView, err = prepareLinuxMetisView(req)
 		if err != nil {
 			return err
 		}
-		metisView.desktopSession = profile == linuxStdioMCPDesktopSandboxProfile
+		// Only generic stdio MCP processes lose desktop/session IPC. Reusing the
+		// Metis-root view for bypassPermissions must not silently change the
+		// process's unrelated desktop access policy.
+		metisView.maskDesktopSession = profile == linuxStdioMCPSandboxProfile
 	}
 	// Container control sockets are host-escape capabilities, not ordinary
 	// network access, so mask them in every enabled sandbox mode (including
@@ -152,7 +158,7 @@ func buildLinuxArgsWithMetisView(req platformRequest, originalArgv []string, met
 	for _, path := range req.blockedUnixSockets {
 		args = append(args, "--ro-bind", "/dev/null", path)
 	}
-	if metisView.dir != "" && !metisView.desktopSession {
+	if metisView.dir != "" && metisView.maskDesktopSession {
 		// Generic stdio MCPs never receive host desktop/session IPC. Apply these
 		// masks after every cwd and Metis-root restore so a plugin installed under
 		// HOME cannot re-expose an Xauthority cookie or runtime socket. Directory
@@ -258,22 +264,33 @@ func linuxDBusSessionSocketPaths(address string) []string {
 	return existingUnixSockets(candidates)
 }
 
-// prepareLinuxStdioMCPMetisView constructs a host-private directory tree used
-// as the stdio MCP's complete view of each Metis control root. Every candidate
-// root is materialized before launch so a later OAuth login, including one
-// using the default root beside a custom METIS_HOME, cannot create a root
-// outside the namespace boundary. When cwd is strictly below a root, an empty
-// destination scaffold lets buildLinuxArgsWithMetisView rebind just that plugin
-// subtree afterwards.
-func prepareLinuxStdioMCPMetisView(req platformRequest) (linuxMetisView, error) {
+// prepareLinuxMetisView constructs a host-private directory tree used as the
+// complete view of each Metis control root by stdio MCPs and by the
+// bypassPermissions credential-isolation floor. Every candidate root is
+// materialized before launch so credentials created after namespace setup,
+// including legacy root-level stores and sidecars, remain invisible.
+//
+// A cwd equal to a control root cannot be restored without exposing that whole
+// root, and a cwd inside .credentials cannot be restored at all. Both cases
+// fail closed. A safe cwd strictly below a root receives a destination
+// scaffold so buildLinuxArgsWithMetisView can restore only that subtree and
+// then re-mask any nested control roots.
+func prepareLinuxMetisView(req platformRequest) (linuxMetisView, error) {
 	if req.metisHome == "" {
-		return linuxMetisView{}, fmt.Errorf("sandbox: stdio MCP credential isolation requires a Metis home")
+		return linuxMetisView{}, fmt.Errorf("sandbox: credential isolation requires a Metis home")
 	}
 	activeRoot := filepath.Clean(req.metisHome)
 	for _, root := range metisControlRoots(req.home, activeRoot) {
 		root = filepath.Clean(root)
 		if root == string(filepath.Separator) {
 			return linuxMetisView{}, fmt.Errorf("%w: refusing to use filesystem root as a Metis home", ErrUnsafeCwd)
+		}
+		if req.cwd == root {
+			return linuxMetisView{}, fmt.Errorf("%w: cwd %q is a Metis credential root", ErrUnsafeCwd, req.cwd)
+		}
+		privateDir := filepath.Join(root, metisCredentialDirectoryName)
+		if linuxPathWithin(privateDir, req.cwd) {
+			return linuxMetisView{}, fmt.Errorf("%w: cwd %q is inside private credential directory %q", ErrUnsafeCwd, req.cwd, privateDir)
 		}
 		if err := os.MkdirAll(root, 0o700); err != nil {
 			return linuxMetisView{}, fmt.Errorf("sandbox: create Metis credential boundary %q: %w", root, err)
@@ -302,7 +319,7 @@ func prepareLinuxStdioMCPMetisView(req platformRequest) (linuxMetisView, error) 
 
 	viewDir, err := os.MkdirTemp(req.tempDir, ".stdio-mcp-metis-")
 	if err != nil {
-		return linuxMetisView{}, fmt.Errorf("sandbox: create stdio MCP Metis view: %w", err)
+		return linuxMetisView{}, fmt.Errorf("sandbox: create private Metis view: %w", err)
 	}
 	view := linuxMetisView{dir: viewDir, roots: roots}
 	// Any root may be nested below another (for example custom METIS_HOME=$HOME
@@ -328,7 +345,7 @@ func prepareLinuxStdioMCPMetisView(req platformRequest) (linuxMetisView, error) 
 		}
 		if err := os.MkdirAll(filepath.Join(viewDir, rel), 0o700); err != nil {
 			_ = os.RemoveAll(viewDir)
-			return linuxMetisView{}, fmt.Errorf("sandbox: scaffold stdio MCP working directory: %w", err)
+			return linuxMetisView{}, fmt.Errorf("sandbox: scaffold isolated working directory: %w", err)
 		}
 		view.restoreCwd = true
 	}
@@ -455,22 +472,67 @@ func linuxProtectedReadFiles(req platformRequest) []string {
 	for _, root := range metisControlRoots(req.home, req.metisHome) {
 		files = append(files,
 			filepath.Join(root, "auth.json"),
+			filepath.Join(root, "llm-oauth.json"),
+			filepath.Join(root, ".llm-oauth.lock"),
 			filepath.Join(root, "mcp-oauth.json"),
+			filepath.Join(root, ".mcp-oauth.lock"),
 			filepath.Join(root, "mcp.toml"),
 			filepath.Join(root, "credentials.json"),
 			filepath.Join(root, "secrets.json"),
 			filepath.Join(root, "config.toml"),
 			filepath.Join(root, "config.local.toml"))
+		files = append(files, existingCredentialSidecars(root)...)
 	}
 	return existingRegularFiles(files)
+}
+
+func existingCredentialSidecars(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !isLegacyCredentialFilename(entry.Name()) {
+			continue
+		}
+		files = append(files, filepath.Join(root, entry.Name()))
+	}
+	return files
 }
 
 func linuxProtectedReadDirectories(req platformRequest) []string {
 	dirs := sensitiveHomeDirectories(req.home)
 	for _, root := range metisControlRoots(req.home, req.metisHome) {
-		dirs = append(dirs, filepath.Join(root, "ide"))
+		dirs = append(dirs,
+			filepath.Join(root, metisCredentialDirectoryName),
+			filepath.Join(root, "ide"))
 	}
 	return existingDirectories(dirs)
+}
+
+// Bubblewrap can only bind over an existing mountpoint. Pre-create the fixed
+// private credential directory before entering the namespace so one directory
+// mask also covers final stores, lock files, and random temp files created by
+// another METIS process later in the sandboxed command's lifetime.
+func ensureLinuxCredentialMaskTargets(req platformRequest) error {
+	for _, root := range metisControlRoots(req.home, req.metisHome) {
+		dir := filepath.Join(root, metisCredentialDirectoryName)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("sandbox: create credential isolation directory %q: %w", dir, err)
+		}
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return fmt.Errorf("sandbox: inspect credential isolation directory %q: %w", dir, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("sandbox: credential isolation path %q is not a real directory", dir)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("sandbox: secure credential isolation directory %q: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 func linuxEmptyDir(req platformRequest) string {

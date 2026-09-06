@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -23,13 +25,13 @@ func TestLoginSlash_OpensInfoModal(t *testing.T) {
 	// /login isn't in modalCommands so it should append inline.
 	found := false
 	for _, msg := range m.messages {
-		if strings.Contains(msg.Content, "metis auth login") {
+		if strings.Contains(msg.Content, "metis login") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("/login should surface 'metis auth login' instructions; got: %+v", messageContents(m))
+		t.Errorf("/login should surface 'metis login' instructions; got: %+v", messageContents(m))
 	}
 }
 
@@ -67,6 +69,85 @@ func TestLogoutSlash_RemovesCredentialDirectly(t *testing.T) {
 	}
 	if key, err := auth.Get("openai"); err != nil || key != "" {
 		t.Fatalf("credential remains after /logout: key=%q err=%v", key, err)
+	}
+}
+
+func TestLogoutSlash_RemovesOAuthCredentialDirectly(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.PutOAuth("openai-codex", auth.OAuthCredential{AccessToken: "test-oauth-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	got := cmdLogout(nil, "openai-codex")
+	if !strings.Contains(got, "removed stored credentials for openai-codex") {
+		t.Fatalf("cmdLogout output = %q", got)
+	}
+	if credential, err := auth.GetOAuth("openai-codex"); err != nil || credential != nil {
+		t.Fatalf("credential remains after /logout: present=%v err=%v", credential != nil, err)
+	}
+}
+
+func TestLogoutSlash_NormalizesProviderID(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.Set("anthropic", "test-secret"); err != nil {
+		t.Fatal(err)
+	}
+	got := cmdLogout(nil, " AnThRoPiC ")
+	if !strings.Contains(got, "removed stored credentials for anthropic") {
+		t.Fatalf("cmdLogout output = %q", got)
+	}
+	if key, err := auth.Get("anthropic"); err != nil || key != "" {
+		t.Fatalf("credential remains after mixed-case /logout: key=%q err=%v", key, err)
+	}
+}
+
+func TestLogoutSlash_DeprecatedAnthropicAliasRemovesCanonicalCredential(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.PutOAuth("anthropic", auth.OAuthCredential{AccessToken: "oauth-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	got := cmdLogout(nil, "anthropic-claudeai")
+	if !strings.Contains(got, "removed stored credentials for anthropic") {
+		t.Fatalf("cmdLogout output = %q", got)
+	}
+	if credential, err := auth.GetOAuth("anthropic"); err != nil || credential != nil {
+		t.Fatalf("canonical OAuth remains after alias /logout: present=%v err=%v", credential != nil, err)
+	}
+}
+
+func TestLogoutSlash_InvalidatesActiveCachedProvider(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.Set("openai", "test-secret"); err != nil {
+		t.Fatal(err)
+	}
+	m := newSlashTestModel(t)
+	m.providerName = "openai"
+	got := cmdLogout(m.asREPL(), "openai")
+	if !strings.Contains(got, "current session provider was disabled") {
+		t.Fatalf("cmdLogout output = %q", got)
+	}
+	provider, _, _ := m.loop.ProviderModelSnapshot()
+	if _, ok := provider.(*loggedOutProvider); !ok {
+		t.Fatalf("active provider = %T, want *loggedOutProvider", provider)
+	}
+	if _, err := provider.Complete(context.Background(), llm.Request{}); err == nil || !strings.Contains(err.Error(), "logged out") {
+		t.Fatalf("logged-out provider Complete error = %v", err)
+	}
+}
+
+func TestLogoutSlash_GeminiAliasInvalidatesActiveGoogleProvider(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.Set("gemini", "test-secret"); err != nil {
+		t.Fatal(err)
+	}
+	m := newSlashTestModel(t)
+	m.providerName = "google"
+	got := cmdLogout(m.asREPL(), "gemini")
+	if !strings.Contains(got, "current session provider was disabled") {
+		t.Fatalf("cmdLogout output = %q", got)
+	}
+	provider, _, _ := m.loop.ProviderModelSnapshot()
+	if _, ok := provider.(*loggedOutProvider); !ok {
+		t.Fatalf("active provider = %T, want *loggedOutProvider", provider)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -75,7 +76,12 @@ func TestDarwinProfilePolicy(t *testing.T) {
 		`(deny file-write* (subpath "/work/repo/.idea"))`,
 		`(deny file-write* (literal "/Users/test/.zshrc"))`,
 		`(deny file-write* (subpath "/Users/test/.metis"))`,
+		`(deny file-read* (subpath "/Users/test/.metis/.credentials"))`,
 		`(deny file-read* (literal "/Users/test/.metis/auth.json"))`,
+		`(deny file-read* (literal "/Users/test/.metis/llm-oauth.json"))`,
+		`(deny file-read* (literal "/Users/test/.metis/.llm-oauth.lock"))`,
+		`/Users/test/\.metis/\.llm-oauth-refresh-[^/]+\.lock`,
+		`/Users/test/\.metis/\.llm-oauth-[^/]+\.tmp`,
 		`(deny file-read* (literal "/Users/test/.metis/mcp-oauth.json"))`,
 		`(deny file-read* (literal "/Users/test/.metis/mcp.toml"))`,
 		`(deny file-read* (literal "/Users/test/.metis/config.local.toml"))`,
@@ -97,6 +103,37 @@ func TestDarwinProfilePolicy(t *testing.T) {
 	blocked := buildDarwinProfile(cwd, tempDir, home, filepath.Join(home, ".metis"), NetworkBlock)
 	if strings.Contains(blocked, "network*") {
 		t.Fatalf("network=block profile contains network permission:\n%s", blocked)
+	}
+}
+
+func TestDarwinProfileProtectsLLMOAuthInCustomAndDefaultHomes(t *testing.T) {
+	home := filepath.Join(string(filepath.Separator), "Users", "test")
+	custom := filepath.Join(string(filepath.Separator), "Volumes", "private", "metis-state")
+	profile := buildDarwinProfile("/work/repo", "/private/tmp/metis-sandbox", home, custom, NetworkAllow)
+	for _, root := range []string{filepath.Join(home, ".metis"), custom} {
+		privateDir := filepath.Join(root, metisCredentialDirectoryName)
+		wantPrivateDir := `(deny file-read* (subpath "` + privateDir + `"))`
+		if !strings.Contains(profile, wantPrivateDir) {
+			t.Errorf("profile missing private credential directory rule %q:\n%s", wantPrivateDir, profile)
+		}
+		for _, path := range []string{
+			filepath.Join(root, "llm-oauth.json"),
+			filepath.Join(root, ".llm-oauth.lock"),
+		} {
+			want := `(deny file-read* (literal "` + path + `"))`
+			if !strings.Contains(profile, want) {
+				t.Errorf("profile missing %q:\n%s", want, profile)
+			}
+		}
+		for _, suffix := range []string{
+			`\.llm-oauth-refresh-[^/]+\.lock`,
+			`\.llm-oauth-[^/]+\.tmp`,
+		} {
+			wantPattern := regexp.QuoteMeta(root+string(filepath.Separator)) + suffix
+			if !strings.Contains(profile, wantPattern) {
+				t.Errorf("profile missing LLM OAuth sidecar rule %q:\n%s", wantPattern, profile)
+			}
+		}
 	}
 }
 
@@ -148,8 +185,17 @@ func TestDarwinSandboxE2E(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(authPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(authPath, []byte("secret"), 0o600); err != nil {
-		t.Fatal(err)
+	metisCredentialPaths := []string{
+		authPath,
+		filepath.Join(home, ".metis", "llm-oauth.json"),
+		filepath.Join(home, ".metis", ".llm-oauth.lock"),
+		filepath.Join(home, ".metis", ".llm-oauth-refresh-fixture.lock"),
+		filepath.Join(home, ".metis", ".llm-oauth-fixture.tmp"),
+	}
+	for _, path := range metisCredentialPaths {
+		if err := os.WriteFile(path, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	sshKeyPath := filepath.Join(home, ".ssh", "id_ed25519")
 	if err := os.MkdirAll(filepath.Dir(sshKeyPath), 0o700); err != nil {
@@ -207,14 +253,19 @@ func TestDarwinSandboxE2E(t *testing.T) {
 			t.Errorf("protected file %s changed: %q, %v", path, got, err)
 		}
 	}
-	if err := run(`cat "$SECRET" >/dev/null`, "SECRET="+authPath); err == nil {
-		t.Fatal("sandbox allowed reading ~/.metis/auth.json")
+	for _, path := range metisCredentialPaths {
+		if err := run(`cat "$SECRET" >/dev/null`, "SECRET="+path); err == nil {
+			t.Errorf("sandbox allowed reading Metis credential %s", path)
+		}
 	}
 	// The command deliberately contains no contiguous `.metis/auth.json`
 	// fragment. The OS boundary must still reject the dynamically assembled
 	// path; string inspection alone cannot enforce the credential invariant.
 	if err := run(`d=.me"tis"; f=auth."json"; cat "$HOME/$d/$f" >/dev/null`); err == nil {
 		t.Fatal("sandbox allowed dynamically assembled Metis credential read")
+	}
+	if err := run(`d=.me"tis"; f=.llm-oauth-fixture."tmp"; cat "$HOME/$d/$f" >/dev/null`); err == nil {
+		t.Fatal("sandbox allowed dynamically assembled LLM OAuth temporary-file read")
 	}
 	if err := run(`cat "$SECRET" >/dev/null`, "SECRET="+sshKeyPath); err == nil {
 		t.Fatal("sandbox allowed reading ~/.ssh private key")

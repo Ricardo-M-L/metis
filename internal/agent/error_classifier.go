@@ -1,6 +1,11 @@
 package agent
 
-import "strings"
+import (
+	"errors"
+	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+)
 
 // error_classifier.go — semantic recovery routing for provider errors.
 // Mirrors hermes-agent's `agent/error_classifier.py:1-100`. The agent
@@ -120,6 +125,9 @@ func ClassifyError(err error) ErrorClass {
 	if err == nil {
 		return ErrUnknown
 	}
+	if errors.Is(err, transport.ErrNetwork) {
+		return ErrNetwork
+	}
 	msg := strings.ToLower(err.Error())
 
 	// Cancellation — check first because user-cancel often manifests
@@ -212,6 +220,8 @@ func ClassifyError(err error) ErrorClass {
 	// Network — connection-level issues. Check before 5xx so a
 	// connection-refused doesn't get bucketed as a server error.
 	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "no such host") ||
 		strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "tls handshake") ||
@@ -253,7 +263,7 @@ func UserFacingMessage(c ErrorClass, raw error) string {
 	case ErrBilling:
 		return "billing / quota exceeded — top up at your provider's dashboard, then retry"
 	case ErrAuth:
-		return "auth failed — token expired or invalid; re-run `metis auth login` for this provider"
+		return "auth failed — token expired or invalid; re-run `metis login` for this provider"
 	case ErrInvalidRequest:
 		if raw != nil {
 			return "provider rejected the request: " + raw.Error()

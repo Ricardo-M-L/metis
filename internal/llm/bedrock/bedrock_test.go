@@ -190,6 +190,32 @@ func TestSyntheticStream_TextOnly(t *testing.T) {
 	}
 }
 
+func TestSyntheticStream_ThinkingPreservesSignature(t *testing.T) {
+	const hintKey = "anthropic.thinking_signature"
+	s := newSyntheticStream(&Response{Content: []ContentBlock{{
+		Type: "thinking",
+		Text: "inspect the repository",
+		ProviderHint: map[string]string{
+			hintKey: "opaque-signature",
+		},
+	}}})
+
+	delta, err := s.Recv()
+	if err != nil {
+		t.Fatalf("Recv thinking delta: %v", err)
+	}
+	if delta.Type != "thinking_delta" || delta.TextDelta != "inspect the repository" {
+		t.Fatalf("thinking delta = %+v", delta)
+	}
+	signature, err := s.Recv()
+	if err != nil {
+		t.Fatalf("Recv thinking signature: %v", err)
+	}
+	if signature.Type != "thinking_signature" || signature.ProviderHint[hintKey] != "opaque-signature" {
+		t.Fatalf("thinking signature = %+v", signature)
+	}
+}
+
 func TestSyntheticStream_ToolUse_Expands3Events(t *testing.T) {
 	r := &Response{
 		Content: []ContentBlock{

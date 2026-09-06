@@ -80,6 +80,37 @@ func TestValidateCustomProviderAcceptsOpenAIResponses(t *testing.T) {
 	}
 }
 
+func TestValidateCustomProviderRejectsRemotePlainHTTP(t *testing.T) {
+	err := validateCustomProviderSpec(CustomProviderSpec{
+		ID:        "insecure-provider",
+		Transport: "openai_chat",
+		BaseURL:   "http://api.example.test/v1",
+		Model:     "example-model",
+	})
+	if err == nil || !strings.Contains(err.Error(), "HTTPS") {
+		t.Fatalf("remote plain HTTP endpoint was accepted: %v", err)
+	}
+	for _, baseURL := range []string{"http://localhost:11434/v1", "http://127.0.0.1:9000/v1", "http://[::1]:9000/v1"} {
+		if err := validateCustomProviderSpec(CustomProviderSpec{
+			ID: "local-provider", Transport: "openai_chat", BaseURL: baseURL, Model: "local-model",
+		}); err != nil {
+			t.Fatalf("loopback endpoint %q rejected: %v", baseURL, err)
+		}
+	}
+}
+
+func TestValidateCustomProviderRejectsCredentialNamespaceCollision(t *testing.T) {
+	err := validateCustomProviderSpec(CustomProviderSpec{
+		ID:        "github",
+		Transport: "openai_chat",
+		BaseURL:   "https://api.example.test/v1",
+		Model:     "example-model",
+	})
+	if err == nil || !strings.Contains(err.Error(), "built-in provider") {
+		t.Fatalf("reserved OAuth namespace was accepted as a custom provider: %v", err)
+	}
+}
+
 func TestSaveUserCustomProvider_UpdatesSimpleTablesAndPreservesOtherText(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
@@ -349,6 +380,46 @@ func TestSaveUserProviderDefault_CreatesParentBeforeChild(t *testing.T) {
 	}
 }
 
+func TestSaveUserProviderDefault_AcceptsOpenAICodex(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := SaveUserProviderDefault("openai-codex"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Default != "openai-codex" {
+		t.Fatalf("provider.default = %q", cfg.Provider.Default)
+	}
+	if cfg.Provider.OpenAICodex.Model == "" {
+		t.Fatal("OpenAI Codex built-in defaults were not retained")
+	}
+}
+
+func TestSaveUserCustomProvider_RejectsOpenAICodexBuiltinID(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	err := SaveUserCustomProvider(CustomProviderSpec{
+		ID: "openai-codex", Transport: "openai_responses",
+		BaseURL: "https://example.com/v1", Model: "gpt-test",
+	})
+	if err == nil || !strings.Contains(err.Error(), "built-in") {
+		t.Fatalf("SaveUserCustomProvider(openai-codex) error = %v", err)
+	}
+}
+
+func TestSaveUserCustomProvider_RejectsLegacyAnthropicOAuthAlias(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	err := SaveUserCustomProvider(CustomProviderSpec{
+		ID: "anthropic-claudeai", Transport: "anthropic_messages",
+		BaseURL: "https://example.com", Model: "claude-test",
+	})
+	if err == nil || !strings.Contains(err.Error(), "built-in") {
+		t.Fatalf("SaveUserCustomProvider(anthropic-claudeai) error = %v", err)
+	}
+}
+
 func TestSaveUserProviderDefault_RejectsUnsafeOrInvalidInput(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
@@ -470,5 +541,66 @@ model = "project-model"
 	}
 	if source, err := CustomProviderOverrideSource("other"); err != nil || source != "" {
 		t.Fatalf("unrelated custom source = %q, %v", source, err)
+	}
+}
+
+func TestProviderOverrideSourcesIgnoreUserConfigInWorkingDirectory(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, ".metis")
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(parent)
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "config.toml")
+	const original = `[provider]
+default = "sensenova"
+
+[provider.custom.sensenova]
+transport = "openai_chat"
+base_url = "https://example.com/v1"
+model = "example-model"
+
+[ui]
+theme = "dark"
+`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, check := range map[string]func() (string, error){
+		"provider default": ProviderDefaultOverrideSource,
+		"custom provider":  func() (string, error) { return CustomProviderOverrideSource("sensenova") },
+		"user setting":     func() (string, error) { return UserSettingOverrideSource("ui.theme") },
+	} {
+		if source, err := check(); err != nil || source != "" {
+			t.Fatalf("%s treated user config as project override: source=%q err=%v", name, source, err)
+		}
+	}
+	if err := SaveUserProviderDefault("openai-codex"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := SaveUserSettingsAndLoad([]UserSetting{{Key: "ui.theme", Value: "light"}})
+	if err != nil {
+		t.Fatalf("update user settings from the user config's parent: %v", err)
+	}
+	if cfg.Provider.Default != "openai-codex" || cfg.UI.Theme != "light" {
+		t.Fatalf("updated config has provider=%q theme=%q", cfg.Provider.Default, cfg.UI.Theme)
+	}
+
+	localPath := filepath.Join(home, "config.local.toml")
+	if err := os.WriteFile(localPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, check := range map[string]func() (string, error){
+		"provider default": ProviderDefaultOverrideSource,
+		"custom provider":  func() (string, error) { return CustomProviderOverrideSource("sensenova") },
+		"user setting":     func() (string, error) { return UserSettingOverrideSource("ui.theme") },
+	} {
+		if source, err := check(); err != nil || source != "project-local config (.metis/config.local.toml)" {
+			t.Fatalf("%s lost project-local override: source=%q err=%v", name, source, err)
+		}
+	}
+	if err := SaveUserSettings([]UserSetting{{Key: "ui.theme", Value: "nord"}}); err == nil || !strings.Contains(err.Error(), "project-local config") {
+		t.Fatalf("project-local setting should block a user edit, got %v", err)
 	}
 }

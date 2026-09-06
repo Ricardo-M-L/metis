@@ -3562,7 +3562,7 @@ function renderProvidersTab() {
   return `<h2>${uiText('Model Providers', '模型提供商')}</h2>
     <div class="settings-section">
       <div class="settings-section-title">${uiText('Configured providers', '已配置的提供商')}</div>
-      <div class="settings-section-desc">${uiText('Credentials are stored separately in auth.json and are never displayed. Validate checks local configuration only and sends no model request.', '凭据单独保存在 auth.json，绝不回显。“验证”只检查本地配置，不发送模型请求。')}</div>
+      <div class="settings-section-desc">${uiText('Credentials are stored in private credential stores and are never displayed. Validate checks local configuration only and sends no model request. OAuth sign-in is completed with metis login in a terminal.', '凭据单独保存在私有凭据存储中，绝不回显。“验证”只检查本地配置，不发送模型请求。OAuth 请在终端中用 metis login 登录。')}</div>
       <div id="providerList" class="provider-list"><div class="provider-empty">${uiText('Loading providers...', '正在加载提供商…')}</div></div>
       <button type="button" class="provider-add-btn" onclick="showProviderForm()">+ ${uiText('Add custom provider', '添加自定义提供商')}</button>
     </div>
@@ -3577,7 +3577,7 @@ function renderProvidersTab() {
       </select></label>
       <label>Base URL<input id="providerBaseUrl" required type="url" placeholder="https://api.example.com/v1" autocomplete="url"></label>
       <label>${uiText('Model', '模型')}<input id="providerModel" required placeholder="model-id" autocomplete="off"></label>
-      <label>${uiText('API key (optional)', 'API 密钥（可选）')}<input id="providerApiKey" type="password" autocomplete="new-password" placeholder="${uiText('Leave blank to keep the existing key', '留空以保留现有密钥')}"></label>
+      <label>${uiText('API key (optional)', 'API 密钥（可选）')}<input id="providerApiKey" type="password" autocomplete="new-password" placeholder="${uiText('Leave blank only when the endpoint is unchanged', '仅当端点未变更时可留空保留密钥')}"></label>
       <label class="provider-clear"><input id="providerClearCredential" type="checkbox"> ${uiText('Remove the saved credential', '移除已保存的凭据')}</label>
       <div class="provider-form-actions"><button type="button" onclick="hideProviderForm()">${uiText('Cancel', '取消')}</button><button type="submit" class="primary">${uiText('Save provider', '保存提供商')}</button></div>
     </form>`;
@@ -3600,21 +3600,42 @@ function paintProviders() {
   const list = document.getElementById('providerList');
   if (!list) return;
   const providers = providersCache || [];
-  list.innerHTML = providers.map(p => `<div class="provider-card">
+  list.innerHTML = providers.map(p => {
+    const oauth = p.credentialKind === 'oauth';
+    const probeable = p.credentialKind === 'api_key';
+    const editableCustom = p.custom && providerFormSupportsTransport(p.transport);
+    const credentialLabel = p.credentialConfigured
+      ? (oauth ? uiText('OAuth connected', 'OAuth 已登录') : uiText('Credential set', '已配置凭据'))
+      : (oauth ? uiText('OAuth not connected', 'OAuth 未登录') : uiText('No credential', '无凭据'));
+    const setupHint = !p.credentialConfigured && p.setupCommand
+      ? `<div class="provider-url">${uiText('Run', '请运行')} <code>${escHtml(p.setupCommand)}</code></div>`
+      : '';
+    const probeButton = probeable ? `<button type="button" onclick="probeProvider('${escOnclick(p.id)}')">${uiText('Test connection', '测试连接')}</button>` : '';
+    const editButton = !p.custom ? '' : editableCustom
+      ? `<button type="button" onclick="editProvider('${escOnclick(p.id)}')">${uiText('Edit', '编辑')}</button>`
+      : `<button type="button" disabled title="${uiText('This cloud provider must be edited in config.toml', '此云提供商需要在 config.toml 中编辑')}">${uiText('Edit in config', '在配置中编辑')}</button>`;
+    return `<div class="provider-card">
     <div class="provider-main"><div class="provider-title">${escHtml(p.id)}${p.default ? ' <span class="provider-badge">' + uiText('Default', '默认') + '</span>' : ''}</div>
       <div class="provider-meta">${escHtml(p.transport || uiText('unknown', '未知'))} · ${escHtml(p.model || uiText('model not set', '未设置模型'))}</div>
       <div class="provider-url">${escHtml(p.baseUrl || uiText('Default endpoint', '默认端点'))}</div>
+      ${setupHint}
     </div>
-    <span class="provider-credential ${p.credentialConfigured ? 'ready' : ''}">${p.credentialConfigured ? uiText('Credential set', '已配置凭据') : uiText('No credential', '无凭据')}</span>
+    <span class="provider-credential ${p.credentialConfigured ? 'ready' : ''}">${credentialLabel}</span>
     <div class="provider-actions">
       <button type="button" onclick="setDefaultProvider('${escOnclick(p.id)}')"${p.default ? ' disabled' : ''}>${uiText('Set default', '设为默认')}</button>
       <button type="button" onclick="validateProvider('${escOnclick(p.id)}')">${uiText('Validate', '验证')}</button>
-	  <button type="button" onclick="probeProvider('${escOnclick(p.id)}')">${uiText('Test connection', '测试连接')}</button>
-      ${p.custom ? `<button type="button" onclick="editProvider('${escOnclick(p.id)}')">${uiText('Edit', '编辑')}</button><button type="button" class="danger" onclick="deleteProvider('${escOnclick(p.id)}')"${p.default ? ' disabled title="' + uiText('Select another default first', '请先选择其他默认项') + '"' : ''}>${uiText('Delete', '删除')}</button>` : ''}
+      ${probeButton}
+      ${editButton}${p.custom ? `<button type="button" class="danger" onclick="deleteProvider('${escOnclick(p.id)}')"${p.default ? ' disabled title="' + uiText('Select another default first', '请先选择其他默认项') + '"' : ''}>${uiText('Delete', '删除')}</button>` : ''}
     </div>
-  </div>`).join('') || '<div class="provider-empty">' + uiText('No providers configured', '未配置提供商') + '</div>';
+  </div>`;
+  }).join('') || '<div class="provider-empty">' + uiText('No providers configured', '未配置提供商') + '</div>';
   const search = document.querySelector('.settings-search');
   if (search && search.value) filterSettings(search.value);
+}
+
+function providerFormSupportsTransport(transport) {
+  return ['openai_chat', 'openai_responses', 'anthropic_messages', 'gemini_native']
+    .includes(String(transport || '').trim().toLowerCase());
 }
 
 function showProviderForm(provider) {
@@ -3639,7 +3660,12 @@ function hideProviderForm() {
 
 function editProvider(id) {
   const provider = (providersCache || []).find(p => p.id === id && p.custom);
-  if (provider) showProviderForm(provider);
+  if (!provider) return;
+  if (!providerFormSupportsTransport(provider.transport)) {
+    showToast(uiText('Edit this cloud provider in config.toml', '请在 config.toml 中编辑此云提供商'), 'error');
+    return;
+  }
+  showProviderForm(provider);
 }
 
 async function saveCustomProvider(e) {

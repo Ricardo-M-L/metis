@@ -82,6 +82,73 @@ func drainStream(t *testing.T, r provider.StreamReader) []provider.StreamEvent {
 	}
 }
 
+func TestResponses_StreamForcesStreamTrue(t *testing.T) {
+	h := newResponsesHarness(t, []string{
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`,
+	})
+	p := newResponsesClient(h)
+
+	stream, err := p.Stream(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	defer stream.Close()
+
+	var body map[string]any
+	if err := json.Unmarshal(h.gotBody, &body); err != nil {
+		t.Fatalf("request body parse: %v\n%s", err, h.gotBody)
+	}
+	if got, ok := body["stream"].(bool); !ok || !got {
+		t.Fatalf("stream = %#v, want true; request=%s", body["stream"], h.gotBody)
+	}
+}
+
+func TestResponses_StreamAcceptsResponseDone(t *testing.T) {
+	h := newResponsesHarness(t, []string{
+		`{"type":"response.output_text.delta","delta":"done text"}`,
+		`{"type":"response.done","response":{"id":"resp_done","status":"completed","usage":{"input_tokens":3,"output_tokens":2}}}`,
+	})
+	p := newResponsesClient(h)
+	stream, err := p.Stream(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := drainStream(t, stream)
+	var text, stop string
+	for _, event := range events {
+		if event.Type == "text_delta" {
+			text += event.TextDelta
+		}
+		if event.Type == "message_delta" {
+			stop = event.StopReason
+		}
+	}
+	if text != "done text" || stop != "end_turn" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestResponses_StreamRejectsMalformedJSONBeforeTerminal(t *testing.T) {
+	h := newResponsesHarness(t, []string{
+		`{"type":"response.output_text.delta","delta":"partial"}`,
+		`{"type":"response.output_text.delta","delta":`,
+		`{"type":"response.completed","response":{"status":"completed"}}`,
+	})
+	p := newResponsesClient(h)
+	stream, err := p.Stream(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("first delta: %v", err)
+	}
+	event, err := stream.Recv()
+	if err == nil || event.Type != "error" || !strings.Contains(err.Error(), "malformed JSON") {
+		t.Fatalf("malformed frame result = event=%+v err=%v", event, err)
+	}
+}
+
 func TestResponses_RequestShape(t *testing.T) {
 	h := newResponsesHarness(t, []string{`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}`})
 	p := newResponsesClient(h)
@@ -897,7 +964,7 @@ func TestResponses_StreamPreservesTopLevelErrorMessage(t *testing.T) {
 	}
 	events := drainStream(t, r)
 	for _, event := range events {
-		if event.Type == "error" && event.Err != nil && event.Err.Error() == "try again later" {
+		if event.Type == "error" && event.Err != nil && strings.Contains(event.Err.Error(), "try again later") && strings.Contains(event.Err.Error(), "rate_limit_exceeded") {
 			return
 		}
 	}

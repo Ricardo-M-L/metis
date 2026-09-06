@@ -20,7 +20,33 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
 )
+
+// prepareChatWorkspace resolves --worktree before asking for trust, so the
+// confirmation applies to the directory from which runtime config is loaded.
+// New and reused worktrees both need their own confirmation; neither inherits
+// the source checkout's trust. A nil callback skips prompting, not the policy.
+func prepareChatWorkspace(flags *cliFlags, confirmTrust func() error) (*worktreepkg.Info, error) {
+	var info *worktreepkg.Info
+	if flags.worktree != "" || flags.worktreeOn {
+		var err error
+		info, err = worktreepkg.Spawn(flags.worktree)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Chdir(info.Path); err != nil {
+			return nil, fmt.Errorf("chdir to worktree %s: %w", info.Path, err)
+		}
+		fmt.Fprintf(os.Stderr, "(worktree: %s on branch %s)\n", info.Path, info.Branch)
+	}
+	if confirmTrust != nil {
+		if err := confirmTrust(); err != nil {
+			return nil, err
+		}
+	}
+	return info, nil
+}
 
 // ensureTrusted prompts the user to confirm the cwd before launching
 // the chat surface. Returns nil to proceed, error to abort. Skipped

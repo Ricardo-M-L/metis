@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -41,9 +42,41 @@ func CustomProviderOverrideSource(id string) (string, error) {
 	return providerOverrideSource([]string{"provider", "custom", id})
 }
 
+// CustomProviderCredentialOverrideSource identifies credential sources that
+// outrank the private API-key store at runtime. Interactive frontends must
+// reject a newly entered stored key while such a source is active, otherwise
+// they would claim success although requests keep using a different secret.
+func CustomProviderCredentialOverrideSource(raw ProviderRaw) string {
+	if envName := strings.TrimSpace(raw.APIKeyEnv); envName != "" && os.Getenv(envName) != "" {
+		return envName
+	}
+	// Inline api_key is intentionally not a blocker: ResolveAPIKey orders the
+	// managed credential store ahead of this legacy fallback. Accepting a new
+	// managed key is how users migrate plaintext config secrets into the
+	// private store.
+	return ""
+}
+
+// CustomProviderSupportsManagedAPIKey reports whether `metis login` can
+// fully configure the transport with its single hidden API-key prompt.
+// Ambient/cloud transports need a different credential shape and must not be
+// presented as a successful API-key login.
+func CustomProviderSupportsManagedAPIKey(raw ProviderRaw) bool {
+	switch strings.ToLower(strings.TrimSpace(raw.Transport)) {
+	case "", "anthropic_messages", "anthropic", "openai_chat", "openai", "openai_responses", "gemini_native", "gemini", "azure_openai", "azure":
+		return true
+	default:
+		return false
+	}
+}
+
 func providerOverrideSource(path []string) (string, error) {
+	paths, err := projectConfigPaths()
+	if err != nil {
+		return "", err
+	}
 	source := ""
-	for _, candidate := range projectConfigPaths() {
+	for _, candidate := range paths {
 		if _, err := os.Stat(candidate.path); errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
@@ -145,8 +178,12 @@ func userSettingOverrideSource(key string) (string, error) {
 		return "", fmt.Errorf("setting %q is not editable from /config", key)
 	}
 	path := append(strings.Split(spec.table, "."), spec.field)
+	paths, err := projectConfigPaths()
+	if err != nil {
+		return "", err
+	}
 	source := ""
-	for _, candidate := range projectConfigPaths() {
+	for _, candidate := range paths {
 		if _, err := os.Stat(candidate.path); errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
@@ -169,15 +206,22 @@ type projectConfigPath struct {
 	label string
 }
 
-func projectConfigPaths() []projectConfigPath {
-	cwd, err := os.Getwd()
+func projectConfigPaths() ([]projectConfigPath, error) {
+	// Share Load's source ordering and user/project deduplication. In the
+	// user's home directory, .metis/config.toml is the user layer itself.
+	paths, err := searchPaths()
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return []projectConfigPath{
-		{path: filepath.Join(cwd, ".metis", "config.toml"), label: "project config (.metis/config.toml)"},
-		{path: filepath.Join(cwd, ".metis", "config.local.toml"), label: "project-local config (.metis/config.local.toml)"},
+	projects := make([]projectConfigPath, 0, len(paths)-1)
+	for _, path := range paths[1:] {
+		label := "project config (.metis/config.toml)"
+		if filepath.Base(path) == "config.local.toml" {
+			label = "project-local config (.metis/config.local.toml)"
+		}
+		projects = append(projects, projectConfigPath{path: path, label: label})
 	}
+	return projects, nil
 }
 
 type userSettingKind uint8
@@ -391,7 +435,11 @@ func loadUserSettingsCandidate(userData []byte) (*Config, error) {
 			return nil, err
 		}
 	}
-	for _, candidate := range projectConfigPaths() {
+	paths, err := projectConfigPaths()
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range paths {
 		if _, err := os.Stat(candidate.path); errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
@@ -582,7 +630,7 @@ func DeleteUserCustomProvider(id string) error {
 		return err
 	}
 	switch id {
-	case "anthropic", "openai", "gemini", "google", "custom":
+	case "anthropic", "anthropic-claudeai", "openai", "openai-codex", "gemini", "google", "github", "custom":
 		return fmt.Errorf("provider %q is built in and cannot be deleted", id)
 	}
 	return withUserConfigWriteLock(func(path string) error {
@@ -649,7 +697,7 @@ func validateCustomProviderSpec(spec CustomProviderSpec) error {
 		return err
 	}
 	switch spec.ID {
-	case "anthropic", "openai", "gemini", "google", "custom":
+	case "anthropic", "anthropic-claudeai", "openai", "openai-codex", "gemini", "google", "github", "custom":
 		return fmt.Errorf("custom provider id %q conflicts with a built-in provider", spec.ID)
 	}
 	switch spec.Transport {
@@ -673,12 +721,38 @@ func validateCustomProviderSpec(spec CustomProviderSpec) error {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return errors.New("custom provider base_url must be an absolute HTTP(S) URL without credentials, query, or fragment")
 	}
+	if err := ValidateProviderEndpointTransport(spec.BaseURL); err != nil {
+		return err
+	}
 	for _, r := range spec.Model {
 		if r == ' ' || r == '\t' {
 			return errors.New("custom provider model must not contain whitespace")
 		}
 	}
 	return nil
+}
+
+// ValidateProviderEndpointTransport prevents credentials from crossing a
+// cleartext network hop. Plain HTTP remains available for loopback-only local
+// runtimes such as Ollama; every non-loopback provider endpoint must use TLS.
+func ValidateProviderEndpointTransport(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u == nil || u.Hostname() == "" {
+		return errors.New("provider base_url must be an absolute HTTP(S) URL")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+		if host == "localhost" {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return errors.New("provider base_url must use HTTPS; plain HTTP is allowed only for localhost or loopback IP addresses")
 }
 
 func validateProviderID(id string) error {

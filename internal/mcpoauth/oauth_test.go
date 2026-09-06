@@ -1,6 +1,7 @@
 package mcpoauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -61,6 +62,80 @@ func mockAS(t *testing.T) *httptest.Server {
 	return srv
 }
 
+func TestNewTokenStoreUsesFrozenCredentialRootForLegacyMigration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	parent := t.TempDir()
+	first := filepath.Join(parent, "first")
+	second := filepath.Join(parent, "second")
+	if err := os.MkdirAll(first, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(second, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(parent, "current")
+	if err := os.Symlink(first, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("METIS_HOME", link)
+	store := NewTokenStore()
+	resolvedFirst, err := filepath.EvalSymlinks(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLegacy := filepath.Join(resolvedFirst, "mcp-oauth.json")
+	if store.legacyPath != wantLegacy {
+		t.Fatalf("legacy path = %q, want %q", store.legacyPath, wantLegacy)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, link); err != nil {
+		t.Fatal(err)
+	}
+	if store.legacyPath != wantLegacy {
+		t.Fatalf("retargeted METIS_HOME changed MCP legacy path to %q", store.legacyPath)
+	}
+}
+
+func TestEmptyTokenStorePathFailsClosed(t *testing.T) {
+	store := &TokenStore{}
+	if _, err := store.GetEntry("server"); err == nil || !strings.Contains(err.Error(), "credential directory is unavailable") {
+		t.Fatalf("GetEntry error = %v", err)
+	}
+}
+
+func TestTokenStoreRejectsReplacedPrivateDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory replacement semantics differ on Windows")
+	}
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("METIS_HOME", home)
+	store := NewTokenStore()
+	if err := store.Put("first", &auth.Token{AccessToken: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	privateDir := auth.CredentialDirectory()
+	if err := os.Rename(privateDir, filepath.Join(home, "old-credentials")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put("second", &auth.Token{AccessToken: "must-not-be-written"}); err == nil || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("write after credential directory replacement error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(privateDir, "mcp-oauth.json")); !os.IsNotExist(err) {
+		t.Fatalf("token reached replacement private directory: %v", err)
+	}
+}
+
 func TestDiscover(t *testing.T) {
 	srv := mockAS(t)
 	p, err := Discover(context.Background(), srv.URL+"/mcp", []string{"http://127.0.0.1:7700/callback"})
@@ -102,7 +177,10 @@ func TestTokenStorePutForcesPrivatePermissions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	path := filepath.Join(home, "mcp-oauth.json")
+	path := filepath.Join(home, auth.CredentialDirectoryName, "mcp-oauth.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +208,14 @@ func TestTokenStorePutForcesPrivatePermissions(t *testing.T) {
 	if got := dirInfo.Mode().Perm(); got != 0o755 {
 		t.Fatalf("existing METIS_HOME permissions = %04o, want preserved 0755", got)
 	}
-	lockInfo, err := os.Stat(filepath.Join(home, tokenStoreLockFilename))
+	privateDirInfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := privateDirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("credential directory permissions = %04o, want 0700", got)
+	}
+	lockInfo, err := os.Stat(filepath.Join(filepath.Dir(path), tokenStoreLockFilename))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,16 +245,20 @@ func TestTokenStoreCreatesMissingHomePrivate(t *testing.T) {
 func TestTokenStorePutRejectsSymlink(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
+	store := NewTokenStore()
+	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	target := filepath.Join(home, "outside.json")
 	if err := os.WriteFile(target, []byte("do-not-touch"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(home, "mcp-oauth.json")
+	path := store.path
 	if err := os.Symlink(target, path); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	err := NewTokenStore().Put("srv", &auth.Token{AccessToken: "secret"})
+	err := store.Put("srv", &auth.Token{AccessToken: "secret"})
 	if err == nil {
 		t.Fatal("Put through a symlink unexpectedly succeeded")
 	}
@@ -246,7 +335,7 @@ func TestTokenStorePutIsAtomicForReaders(t *testing.T) {
 	if err := store.Put("initial", &auth.Token{AccessToken: "ready"}); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(home, "mcp-oauth.json")
+	path := store.path
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -278,7 +367,7 @@ func TestTokenStorePutIsAtomicForReaders(t *testing.T) {
 		}
 	}()
 
-	largeToken := strings.Repeat("x", 1<<20)
+	largeToken := strings.Repeat("x", 64<<10)
 	for i := 0; i < 20; i++ {
 		if err := store.Put(fmt.Sprintf("server-%02d", i), &auth.Token{AccessToken: largeToken}); err != nil {
 			t.Fatal(err)
@@ -289,6 +378,51 @@ func TestTokenStorePutIsAtomicForReaders(t *testing.T) {
 	case err := <-readerErr:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestTokenStoreRejectsOversizedFile(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	store := NewTokenStore()
+	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contents := append([]byte(`{"server":"`), bytes.Repeat([]byte("x"), tokenStoreMaxJSONBytes)...)
+	contents = append(contents, []byte(`"}`)...)
+	if err := os.WriteFile(store.path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetEntry("server"); err == nil || !strings.Contains(strings.ToLower(err.Error()), "too large") {
+		t.Fatalf("oversized token store error = %v", err)
+	}
+	got, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, contents) {
+		t.Fatal("failed oversized read mutated token store")
+	}
+}
+
+func TestTokenStoreRejectsTrailingJSONValue(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	store := NewTokenStore()
+	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contents := []byte("{}\n{}\n")
+	if err := os.WriteFile(store.path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetEntry("server"); err == nil || !strings.Contains(strings.ToLower(err.Error()), "trailing json value") {
+		t.Fatalf("trailing token-store JSON error = %v", err)
+	}
+	got, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, contents) {
+		t.Fatal("failed trailing-value read mutated token store")
 	}
 }
 

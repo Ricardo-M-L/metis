@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -61,12 +63,12 @@ func makePKCEFrom(verifier string) (string, string) {
 
 // ─── KnownProviders shape ────────────────────────────────────────
 
-func TestKnownProviders_AnthropicConsoleConfigured(t *testing.T) {
+func TestKnownProviders_AnthropicSubscriberConfigured(t *testing.T) {
 	p, ok := KnownProviders["anthropic"]
 	if !ok {
 		t.Fatal("anthropic provider must be registered in KnownProviders")
 	}
-	if !strings.Contains(p.AuthURL, "platform.claude.com/oauth/authorize") {
+	if p.AuthURL != "https://claude.ai/oauth/authorize" {
 		t.Errorf("anthropic AuthURL wrong: %q", p.AuthURL)
 	}
 	if !strings.Contains(p.TokenURL, "platform.claude.com/v1/oauth/token") {
@@ -81,19 +83,11 @@ func TestKnownProviders_AnthropicConsoleConfigured(t *testing.T) {
 	if p.ManualRedirectURL == "" {
 		t.Error("anthropic must have ManualRedirectURL for non-browser flow")
 	}
-}
-
-func TestKnownProviders_AnthropicClaudeAIConfigured(t *testing.T) {
-	p, ok := KnownProviders["anthropic-claudeai"]
-	if !ok {
-		t.Fatal("anthropic-claudeai provider must be registered")
+	if p.CallbackAddress != "127.0.0.1:53692" || p.CallbackRedirectURL != "http://localhost:53692/callback" || p.CallbackPath != "/callback" {
+		t.Errorf("anthropic fixed callback mismatch: %+v", p)
 	}
-	if !strings.Contains(p.AuthURL, "claude.com/cai/oauth/authorize") {
-		t.Errorf("anthropic-claudeai AuthURL wrong (should be the cai/ path): %q", p.AuthURL)
-	}
-	// Same token endpoint as console.
-	if !strings.Contains(p.TokenURL, "platform.claude.com/v1/oauth/token") {
-		t.Errorf("anthropic-claudeai TokenURL wrong: %q", p.TokenURL)
+	if !p.TokenRequestJSON || !p.IncludeStateInTokenRequest {
+		t.Error("anthropic token exchange must use JSON and include OAuth state")
 	}
 	// Has the inference scope so the token works against /v1/messages.
 	hasInference := false
@@ -103,7 +97,36 @@ func TestKnownProviders_AnthropicClaudeAIConfigured(t *testing.T) {
 		}
 	}
 	if !hasInference {
-		t.Errorf("anthropic-claudeai must request user:inference, got %v", p.Scopes)
+		t.Errorf("anthropic must request user:inference, got %v", p.Scopes)
+	}
+}
+
+func TestKnownProviders_OpenAICodexConfigured(t *testing.T) {
+	p, ok := KnownProviders["openai-codex"]
+	if !ok {
+		t.Fatal("openai-codex provider must be registered")
+	}
+	if p.AuthURL != "https://auth.openai.com/oauth/authorize" || p.TokenURL != "https://auth.openai.com/oauth/token" {
+		t.Fatalf("openai-codex endpoints mismatch: %+v", p)
+	}
+	if p.ClientID != "app_EMoamEEZ73f0CkXaXp7hrann" || !p.UsePKCE {
+		t.Fatal("openai-codex must use its public native-app client id with PKCE")
+	}
+	if p.CallbackAddress != "127.0.0.1:1455" || p.CallbackRedirectURL != "http://localhost:1455/auth/callback" || p.CallbackPath != "/auth/callback" {
+		t.Errorf("openai-codex fixed callback mismatch: %+v", p)
+	}
+	if p.TokenRequestJSON {
+		t.Error("OpenAI token exchange must use form encoding")
+	}
+}
+
+func TestKnownProviders_DeprecatedAnthropicAliasRemainsCanonical(t *testing.T) {
+	p, ok := KnownProviders["anthropic-claudeai"]
+	if !ok {
+		t.Fatal("deprecated anthropic-claudeai alias must remain available")
+	}
+	if p.Name != "anthropic" || canonicalOAuthProviderID("anthropic-claudeai") != "anthropic" {
+		t.Fatalf("deprecated alias is not canonical: %+v", p)
 	}
 }
 
@@ -130,8 +153,8 @@ func TestBuildAuthURL_ManualSetsCodeFlag(t *testing.T) {
 	}
 }
 
-func TestBuildAuthURL_AutomaticOmitsCodeFlag(t *testing.T) {
-	p := KnownProviders["anthropic"]
+func TestBuildAuthURL_AutomaticOmitsCodeFlagForGenericProvider(t *testing.T) {
+	p := OAuthProvider{AuthURL: "https://issuer.example.test/authorize", UsePKCE: true}
 	got := buildAuthURL(p, "http://localhost:7700/callback", "STATE", "CHALLENGE", false)
 	u, _ := url.Parse(got)
 	if u.Query().Get("code") == "true" {
@@ -312,8 +335,8 @@ func TestRunOAuthManual_PasteCodeFlow(t *testing.T) {
 		Manual: true,
 		PasteCode: func(authURL string) (string, error) {
 			pasteCalled = true
-			if !strings.Contains(authURL, "code=true") {
-				t.Errorf("manual auth URL should have code=true: %q", authURL)
+			if strings.Contains(authURL, "code=true") {
+				t.Errorf("generic providers must not receive Anthropic's code=true parameter: %q", authURL)
 			}
 			return "PASTED-CODE", nil
 		},
@@ -328,12 +351,15 @@ func TestRunOAuthManual_PasteCodeFlow(t *testing.T) {
 	if tok.AccessToken != "manual-AT" {
 		t.Errorf("token: %q", tok.AccessToken)
 	}
-	stored, err := Get(p.Name)
+	stored, err := GetOAuth(p.Name)
 	if err != nil {
 		t.Fatalf("read default OAuth persistence: %v", err)
 	}
-	if stored != "manual-AT" {
-		t.Fatalf("default OAuth persistence = %q, want %q", stored, "manual-AT")
+	if stored == nil || stored.AccessToken != "manual-AT" {
+		t.Fatalf("default OAuth persistence = %+v, want access token manual-AT", stored)
+	}
+	if key, err := Get(p.Name); err != nil || key != "" {
+		t.Fatalf("OAuth token was also exposed as an API key: key=%q err=%v", key, err)
 	}
 }
 
@@ -409,6 +435,39 @@ func TestRunOAuthManual_RejectsStateMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "state mismatch") {
 		t.Errorf("error should mention state mismatch: %v", err)
+	}
+}
+
+func TestRunOAuthManual_KnownFixedCallbackAcceptsBareCode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse token form: %v", err)
+		}
+		if got := r.Form.Get("code"); got != "code-without-state" {
+			t.Errorf("code = %q", got)
+		}
+		if got := r.Form.Get("state"); got != "" {
+			t.Errorf("OpenAI token exchange unexpectedly included state %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"access_token":"AT"}`)
+	}))
+	defer server.Close()
+
+	p := KnownProviders["openai-codex"]
+	p.TokenURL = server.URL
+	token, err := runOAuthManual(p, "verifier", "challenge", "EXPECTED-STATE", OAuthOptions{
+		Manual:         true,
+		PasteCode:      func(string) (string, error) { return "code-without-state", nil },
+		AuthURLHandler: func(string) error { return nil },
+		SkipPersist:    true,
+	})
+	if err != nil {
+		t.Fatalf("Pi-compatible bare authorization code failed: %v", err)
+	}
+	if token == nil || token.AccessToken != "AT" {
+		t.Fatalf("token = %#v", token)
 	}
 }
 
@@ -510,6 +569,140 @@ func TestRunOAuthAutomaticContext_CancelStopsCallbackWait(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("canceled OAuth callback wait did not return")
+	}
+}
+
+func TestRunOAuthAutomaticBusyPortFallsBackToPaste(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Form.Get("code"); got != "pasted-code" {
+			t.Errorf("code = %q, want pasted-code", got)
+		}
+		_, _ = io.WriteString(w, `{"access_token":"access","refresh_token":"refresh","expires_in":3600}`)
+	}))
+	defer tokenServer.Close()
+
+	callbackURL := "http://" + occupied.Addr().String() + "/callback"
+	p := OAuthProvider{
+		Name: "busy-port", AuthURL: "https://issuer.example.test/authorize",
+		TokenURL: tokenServer.URL, ClientID: "client", UsePKCE: true,
+		CallbackAddress: occupied.Addr().String(), CallbackRedirectURL: callbackURL,
+		CallbackPath: "/callback", ManualRedirectURL: callbackURL,
+	}
+	tok, err := runOAuthAutomaticContext(context.Background(), p, "verifier", "challenge", "state", OAuthOptions{
+		SkipPersist:    true,
+		AuthURLHandler: func(string) error { return nil },
+		PasteCodeContext: func(context.Context, string) (string, error) {
+			return "pasted-code#state", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccessToken != "access" || tok.RefreshToken != "refresh" {
+		t.Fatalf("token = %#v", tok)
+	}
+}
+
+func TestRunOAuthAutomaticAcceptsPastedRedirectAlongsideCallback(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"access_token":"pasted-access"}`)
+	}))
+	defer tokenServer.Close()
+	p := OAuthProvider{
+		Name: "paste-race", AuthURL: "https://issuer.example.test/authorize",
+		TokenURL: tokenServer.URL, ClientID: "client", UsePKCE: true,
+	}
+	tok, err := runOAuthAutomaticContext(context.Background(), p, "verifier", "challenge", "state", OAuthOptions{
+		SkipPersist:    true,
+		AuthURLHandler: func(string) error { return nil },
+		PasteCodeContext: func(context.Context, string) (string, error) {
+			return "pasted-code#state", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccessToken != "pasted-access" {
+		t.Fatalf("access token = %q, want pasted-access", tok.AccessToken)
+	}
+}
+
+func TestRunOAuthAutomaticCallbackCancelsAndJoinsPasteReader(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"access_token":"callback-access"}`)
+	}))
+	defer tokenServer.Close()
+	p := OAuthProvider{
+		Name: "callback-race", AuthURL: "https://issuer.example.test/authorize",
+		TokenURL: tokenServer.URL, ClientID: "client", UsePKCE: true,
+	}
+	authURLCh := make(chan string, 1)
+	pasteStarted := make(chan struct{})
+	pasteStopped := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := runOAuthAutomaticContext(context.Background(), p, "verifier", "challenge", "state", OAuthOptions{
+			SkipPersist: true,
+			AuthURLHandler: func(authURL string) error {
+				authURLCh <- authURL
+				return nil
+			},
+			PasteCodeContext: func(ctx context.Context, _ string) (string, error) {
+				close(pasteStarted)
+				<-ctx.Done()
+				close(pasteStopped)
+				return "", ctx.Err()
+			},
+		})
+		done <- runErr
+	}()
+
+	select {
+	case <-pasteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("automatic paste reader did not start")
+	}
+	authURL := <-authURLCh
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackURL := parsed.Query().Get("redirect_uri")
+	callback, err := url.Parse(callbackURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := callback.Query()
+	query.Set("code", "callback-code")
+	query.Set("state", "state")
+	callback.RawQuery = query.Encode()
+	resp, err := http.Get(callback.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OAuth callback did not complete")
+	}
+	select {
+	case <-pasteStopped:
+	case <-time.After(time.Second):
+		t.Fatal("callback winner left the paste reader running")
 	}
 }
 

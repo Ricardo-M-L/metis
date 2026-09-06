@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/session"
@@ -69,6 +74,44 @@ func TestConfigFileEndpoint(t *testing.T) {
 	body := rr.Body.String()
 	if !bytes.Contains(rr.Body.Bytes(), []byte("userPath")) {
 		t.Fatalf("missing userPath: %s", body)
+	}
+}
+
+func TestConfigFileEndpointRejectsReplacedMetisHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory replacement semantics differ on Windows")
+	}
+	parent := t.TempDir()
+	home := filepath.Join(parent, "metis-home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[ui]\nmarkdown = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("METIS_HOME", home)
+	if _, _, err := config.Load(); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := testServer(t)
+	if err := os.Rename(home, home+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const replacement = "[provider.openai]\napi_key = \"replacement-secret\"\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/api/config/file", nil))
+	if rr.Code != 500 {
+		t.Fatalf("config file after root replacement: %d %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "replacement-secret") {
+		t.Fatalf("replacement config was exposed: %s", rr.Body.String())
 	}
 }
 

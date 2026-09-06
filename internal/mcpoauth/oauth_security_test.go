@@ -157,3 +157,73 @@ func TestEnsureTokenConcurrentRefreshUsesSingleProcessLeaseAndRereads(t *testing
 		t.Fatalf("refresh endpoint requests = %d, want exactly one", got)
 	}
 }
+
+func TestRefreshDoesNotOverwriteConcurrentNewLogin(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(refreshStarted)
+		<-releaseRefresh
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "stale-refresh-access", "refresh_token": "stale-rotated-refresh", "expires_in": 3600,
+		})
+	}))
+	defer server.Close()
+
+	store := NewTokenStore()
+	expired := boundEntry(server.URL+"/mcp", &auth.Token{
+		AccessToken: "expired", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(-time.Hour),
+	})
+	expired.Issuer = server.URL
+	expired.AuthURL = server.URL + "/authorize"
+	expired.TokenURL = server.URL
+	if err := store.PutEntry("srv", expired); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		token string
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		token, err := store.EnsureToken(context.Background(), "srv", server.URL+"/mcp", false)
+		done <- result{token: token, err: err}
+	}()
+	select {
+	case <-refreshStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("refresh endpoint was not called")
+	}
+
+	newLogin := boundEntry(server.URL+"/mcp", &auth.Token{
+		AccessToken: "new-login-access", RefreshToken: "new-login-refresh", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	newLogin.Issuer = server.URL
+	newLogin.AuthURL = server.URL + "/authorize"
+	newLogin.TokenURL = server.URL
+	if err := store.PutEntry("srv", newLogin); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseRefresh)
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.token != "new-login-access" {
+			t.Fatalf("EnsureToken returned %q, want concurrent login token", got.token)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("EnsureToken did not complete")
+	}
+	stored, err := store.GetEntry("srv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.Token == nil || stored.Token.AccessToken != "new-login-access" || stored.Token.RefreshToken != "new-login-refresh" {
+		t.Fatalf("stale refresh overwrote concurrent login: %+v", stored)
+	}
+}

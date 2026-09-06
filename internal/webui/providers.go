@@ -13,6 +13,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
 type providerView struct {
@@ -23,7 +24,11 @@ type providerView struct {
 	Custom               bool   `json:"custom"`
 	Default              bool   `json:"default"`
 	CredentialConfigured bool   `json:"credentialConfigured"`
+	CredentialKind       string `json:"credentialKind,omitempty"`
+	SetupCommand         string `json:"setupCommand,omitempty"`
 }
+
+const openAICodexBaseURL = "https://chatgpt.com/backend-api/codex"
 
 func providerProbeTarget(view providerView) (string, string, error) {
 	base := strings.TrimRight(strings.TrimSpace(view.BaseURL), "/")
@@ -74,17 +79,43 @@ func configuredProviderViews(cfg *config.Config) []providerView {
 	if cfg == nil {
 		return nil
 	}
-	credential := func(id string) bool {
-		_, err := cfg.ResolveAPIKey(id)
-		return err == nil
+	credential := func(id string) (bool, string) {
+		if id == "openai-codex" {
+			return rtpkg.ProviderHasCredentials(cfg, id), "oauth"
+		}
+		if id == "anthropic" {
+			// API-key auth wins at runtime. Only label this OAuth when the
+			// runtime-aware check succeeds without an API key.
+			if _, err := cfg.ResolveAPIKey(id); err == nil {
+				return true, "api_key"
+			}
+			if rtpkg.ProviderHasCredentials(cfg, id) {
+				return true, "oauth"
+			}
+			return false, "api_key"
+		}
+		kind := "api_key"
+		if raw, custom := cfg.Provider.Custom[id]; custom {
+			switch strings.ToLower(strings.TrimSpace(raw.Transport)) {
+			case "vertex", "vertex_anthropic":
+				kind = "service_account"
+			case "bedrock", "bedrock_anthropic":
+				kind = "aws"
+			}
+		}
+		return rtpkg.ProviderHasCredentials(cfg, id), kind
 	}
 	views := []providerView{
 		{ID: "anthropic", Transport: "anthropic_messages", BaseURL: cfg.Provider.Anthropic.BaseURL, Model: cfg.Provider.Anthropic.Model},
 		{ID: "openai", Transport: "openai_chat", BaseURL: cfg.Provider.OpenAI.BaseURL, Model: cfg.Provider.OpenAI.Model},
+		{ID: "openai-codex", Transport: "openai_codex_responses", BaseURL: openAICodexBaseURL, Model: cfg.Provider.OpenAICodex.Model, SetupCommand: "metis login openai-codex"},
 		{ID: "gemini", Transport: "gemini_native", BaseURL: cfg.Provider.Gemini.BaseURL, Model: cfg.Provider.Gemini.Model},
 	}
 	customIDs := make([]string, 0, len(cfg.Provider.Custom))
 	for id := range cfg.Provider.Custom {
+		if builtInProvider(id) {
+			continue
+		}
 		customIDs = append(customIDs, id)
 	}
 	sort.Strings(customIDs)
@@ -94,9 +125,13 @@ func configuredProviderViews(cfg *config.Config) []providerView {
 			ID: id, Transport: raw.Transport, BaseURL: raw.BaseURL, Model: raw.Model, Custom: true,
 		})
 	}
+	defaultProvider := auth.CanonicalProviderID(cfg.Provider.Default)
 	for i := range views {
-		views[i].Default = views[i].ID == cfg.Provider.Default
-		views[i].CredentialConfigured = credential(views[i].ID)
+		views[i].Default = views[i].ID == defaultProvider
+		views[i].CredentialConfigured, views[i].CredentialKind = credential(views[i].ID)
+		if views[i].SetupCommand == "" && !views[i].Custom && !views[i].CredentialConfigured {
+			views[i].SetupCommand = "metis login " + views[i].ID
+		}
 	}
 	return views
 }
@@ -105,13 +140,32 @@ func providerExists(cfg *config.Config, id string) bool {
 	if cfg == nil {
 		return false
 	}
-	switch id {
-	case "anthropic", "openai", "gemini":
+	id = auth.CanonicalProviderID(id)
+	if builtInProvider(id) {
+		return true
+	}
+	_, ok := cfg.Provider.Custom[id]
+	return ok
+}
+
+func builtInProvider(id string) bool {
+	switch auth.CanonicalProviderID(id) {
+	case "anthropic", "openai", "openai-codex", "gemini":
 		return true
 	default:
-		_, ok := cfg.Provider.Custom[id]
-		return ok
+		return false
 	}
+}
+
+func (s *Server) loadProviderConfig() (*config.Config, error) {
+	cfg, _, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	if err := config.ApplyProviderPolicyForWorkspace(cfg, s != nil && s.trustProviderConfig); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -119,7 +173,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 	defer s.providersMu.Unlock()
 	switch r.Method {
 	case http.MethodGet:
-		cfg, _, err := config.Load()
+		cfg, err := s.loadProviderConfig()
 		if err != nil || cfg == nil {
 			writeError(w, http.StatusInternalServerError, "config unreadable")
 			return
@@ -138,6 +192,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid body")
 			return
 		}
+		if body.APIKey != "" && strings.TrimSpace(body.APIKey) == "" {
+			writeError(w, http.StatusBadRequest, "api key must not be blank")
+			return
+		}
 		if body.ClearCredential && body.APIKey != "" {
 			writeError(w, http.StatusBadRequest, "cannot set and clear a credential together")
 			return
@@ -146,29 +204,67 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 			ID: strings.TrimSpace(body.ID), Transport: strings.TrimSpace(body.Transport),
 			BaseURL: strings.TrimSpace(body.BaseURL), Model: strings.TrimSpace(body.Model),
 		}
-		if source, err := config.CustomProviderOverrideSource(spec.ID); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		} else if source != "" {
-			writeError(w, http.StatusConflict, "provider is controlled by "+source)
-			return
+		if s.trustProviderConfig {
+			if source, err := config.CustomProviderOverrideSource(spec.ID); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			} else if source != "" {
+				writeError(w, http.StatusConflict, "provider is controlled by "+source)
+				return
+			}
+		}
+		if body.APIKey != "" {
+			current, err := s.loadProviderConfig()
+			if err != nil || current == nil {
+				writeError(w, http.StatusInternalServerError, "config unreadable")
+				return
+			}
+			if raw, ok := current.Provider.Custom[spec.ID]; ok {
+				if source := config.CustomProviderCredentialOverrideSource(raw); source != "" {
+					writeError(w, http.StatusConflict, source+" currently takes precedence; remove or unset it before saving a managed key")
+					return
+				}
+			}
+		}
+		if body.APIKey == "" && !body.ClearCredential {
+			storedEndpoint, present, err := auth.StoredAPIKeyEndpoint(spec.ID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "stored credential metadata is unreadable")
+				return
+			}
+			if present {
+				desired, bindErr := auth.NormalizeEndpointBinding(spec.ID, spec.Transport, spec.BaseURL)
+				if bindErr != nil {
+					writeError(w, http.StatusBadRequest, bindErr.Error())
+					return
+				}
+				if storedEndpoint == nil {
+					writeError(w, http.StatusConflict, "the existing credential is not endpoint-bound; enter the API key again or remove it")
+					return
+				}
+				stored, bindErr := auth.NormalizeEndpointBinding(storedEndpoint.Provider, storedEndpoint.Transport, storedEndpoint.BaseURL)
+				if bindErr != nil || stored != desired {
+					writeError(w, http.StatusConflict, "transport or base URL changed; enter the API key again or remove it")
+					return
+				}
+			}
 		}
 		if err := config.SaveUserCustomProvider(spec); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if body.ClearCredential {
-			if err := auth.Remove(spec.ID); err != nil {
+			if err := auth.RemoveProviderCredentials(spec.ID); err != nil {
 				writeError(w, http.StatusInternalServerError, "provider saved but credential removal failed")
 				return
 			}
 		} else if body.APIKey != "" {
-			if err := auth.Set(spec.ID, body.APIKey); err != nil {
+			if err := auth.ActivateAPIKeyBound(spec.ID, body.APIKey, spec.Transport, spec.BaseURL); err != nil {
 				writeError(w, http.StatusInternalServerError, "provider saved but credential write failed")
 				return
 			}
 		}
-		cfg, _, err := config.Load()
+		cfg, err := s.loadProviderConfig()
 		if err != nil || cfg == nil {
 			writeError(w, http.StatusInternalServerError, "provider saved but config reload failed")
 			return
@@ -189,18 +285,20 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimSpace(body.ID)
-		if source, err := config.CustomProviderOverrideSource(id); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		} else if source != "" {
-			writeError(w, http.StatusConflict, "provider is controlled by "+source)
-			return
+		if s.trustProviderConfig {
+			if source, err := config.CustomProviderOverrideSource(id); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			} else if source != "" {
+				writeError(w, http.StatusConflict, "provider is controlled by "+source)
+				return
+			}
 		}
 		if err := config.DeleteUserCustomProvider(id); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
-		if err := auth.Remove(id); err != nil {
+		if err := auth.RemoveProviderCredentials(id); err != nil {
 			writeError(w, http.StatusInternalServerError, "provider deleted but credential cleanup failed")
 			return
 		}
@@ -226,18 +324,20 @@ func (s *Server) handleProviderDefault(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	body.ID = strings.TrimSpace(body.ID)
-	cfg, _, err := config.Load()
+	body.ID = auth.CanonicalProviderID(body.ID)
+	cfg, err := s.loadProviderConfig()
 	if err != nil || !providerExists(cfg, body.ID) {
 		writeError(w, http.StatusBadRequest, "unknown provider")
 		return
 	}
-	if source, err := config.ProviderDefaultOverrideSource(); err != nil {
-		writeError(w, http.StatusConflict, "provider default source is unreadable")
-		return
-	} else if source != "" {
-		writeError(w, http.StatusConflict, "provider.default is controlled by "+source)
-		return
+	if s.trustProviderConfig {
+		if source, err := config.ProviderDefaultOverrideSource(); err != nil {
+			writeError(w, http.StatusConflict, "provider default source is unreadable")
+			return
+		} else if source != "" {
+			writeError(w, http.StatusConflict, "provider.default is controlled by "+source)
+			return
+		}
 	}
 	if err := config.SaveUserProviderDefault(body.ID); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
@@ -259,16 +359,20 @@ func (s *Server) handleProviderValidate(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	body.ID = strings.TrimSpace(body.ID)
-	cfg, _, err := config.Load()
+	body.ID = auth.CanonicalProviderID(body.ID)
+	cfg, err := s.loadProviderConfig()
 	if err != nil || !providerExists(cfg, body.ID) {
 		writeError(w, http.StatusBadRequest, "unknown provider")
 		return
 	}
-	if _, err := cfg.ResolveAPIKey(body.ID); err != nil && !errors.Is(err, config.ErrMissingAPIKey) {
-		writeError(w, http.StatusBadRequest, "credential resolution failed")
-		return
-	} else if errors.Is(err, config.ErrMissingAPIKey) {
+	credentialConfigured := false
+	for _, view := range configuredProviderViews(cfg) {
+		if view.ID == body.ID {
+			credentialConfigured = view.CredentialConfigured
+			break
+		}
+	}
+	if !credentialConfigured {
 		writeError(w, http.StatusConflict, "credential is not configured")
 		return
 	}
@@ -319,15 +423,10 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "explicit network probe confirmation is required")
 		return
 	}
-	body.ID = strings.TrimSpace(body.ID)
-	cfg, _, err := config.Load()
+	body.ID = auth.CanonicalProviderID(body.ID)
+	cfg, err := s.loadProviderConfig()
 	if err != nil || !providerExists(cfg, body.ID) {
 		writeError(w, http.StatusBadRequest, "unknown provider")
-		return
-	}
-	key, err := cfg.ResolveAPIKey(body.ID)
-	if err != nil || strings.TrimSpace(key) == "" {
-		writeError(w, http.StatusConflict, "credential is not configured")
 		return
 	}
 	var view providerView
@@ -336,6 +435,15 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 			view = candidate
 			break
 		}
+	}
+	if view.CredentialKind != "api_key" {
+		writeError(w, http.StatusBadRequest, "this credential type does not support API-key metadata probes; use local validation")
+		return
+	}
+	key, err := cfg.ResolveAPIKey(body.ID)
+	if err != nil || strings.TrimSpace(key) == "" {
+		writeError(w, http.StatusConflict, "credential is not configured")
+		return
 	}
 	target, authKind, err := providerProbeTarget(view)
 	if err != nil || !validProbeURL(target) {

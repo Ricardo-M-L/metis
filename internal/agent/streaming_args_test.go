@@ -328,6 +328,71 @@ func TestConsumeStream_PersistsThinkingBlock(t *testing.T) {
 	}
 }
 
+func TestConsumeStream_PersistsThinkingSignatureOnExactBlock(t *testing.T) {
+	const hintKey = "anthropic.thinking_signature"
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "message_start"},
+		{Type: "thinking_delta", TextDelta: "inspect "},
+		{Type: "thinking_delta", TextDelta: "the repository"},
+		{Type: "thinking_signature", ProviderHint: map[string]string{hintKey: "opaque-signature"}},
+		{Type: "tool_use_start", ToolUseID: "t1", ToolName: "Read"},
+		{Type: "tool_input_delta", ToolUseID: "t1", InputDelta: `{"path":"README.md"}`},
+		{Type: "tool_use_stop", ToolUseID: "t1"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 32)
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = (&Loop{}).consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	if len(blocks) != 2 {
+		t.Fatalf("blocks = %+v, want thinking + tool_use", blocks)
+	}
+	if blocks[0].Type != "thinking" || blocks[0].Text != "inspect the repository" {
+		t.Fatalf("thinking block = %+v", blocks[0])
+	}
+	if blocks[0].ProviderHint[hintKey] != "opaque-signature" {
+		t.Fatalf("thinking signature was not persisted on its block: %+v", blocks[0].ProviderHint)
+	}
+	if blocks[1].Type != "tool_use" {
+		t.Fatalf("blocks[1] = %+v, want tool_use", blocks[1])
+	}
+}
+
+func TestConsumeStream_PersistsSignedEmptyThinkingBlock(t *testing.T) {
+	const hintKey = "anthropic.thinking_signature"
+	stream := &mockStream{events: []llm.StreamEvent{
+		{Type: "thinking_signature", ProviderHint: map[string]string{hintKey: "signature-for-empty-thinking"}},
+		{Type: "text_delta", TextDelta: "answer"},
+		{Type: "message_stop"},
+	}}
+	out := make(chan Event, 8)
+	var blocks []llm.ContentBlock
+	done := make(chan struct{})
+	go func() {
+		blocks, _, _, _ = (&Loop{}).consumeStream(context.Background(), stream, out)
+		close(out)
+		close(done)
+	}()
+	for range out {
+	}
+	<-done
+
+	if len(blocks) != 2 || blocks[0].Type != "thinking" || blocks[0].Text != "" {
+		t.Fatalf("blocks = %+v, want signed empty thinking + text", blocks)
+	}
+	if blocks[0].ProviderHint[hintKey] != "signature-for-empty-thinking" {
+		t.Fatalf("empty thinking signature missing: %+v", blocks[0])
+	}
+}
+
 // TestConsumeStream_ThinkingFlushedBeforeTool — thinking that resolves
 // into a tool call must persist BEFORE the tool_use block in the
 // assembled message. Mirrors Anthropic's chronology and lets the user

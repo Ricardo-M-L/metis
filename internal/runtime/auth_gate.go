@@ -29,7 +29,7 @@ type WizardFn func() (*WizardResult, error)
 
 // ErrWizardCancelled is the sentinel a WizardFn returns when the user
 // pressed Esc / Ctrl-C during the wizard. EnsureAPIKey turns it into a
-// caller-friendly error suggesting `metis auth login`.
+// caller-friendly error suggesting `metis login`.
 var ErrWizardCancelled = errors.New("wizard cancelled")
 
 // AuthGateOptions tunes EnsureAPIKey behavior. Any function field left
@@ -47,6 +47,12 @@ type AuthGateOptions struct {
 	// Stderr receives the "no API key found — launching first-run setup"
 	// banner. Defaults to os.Stderr when nil.
 	Stderr io.Writer
+	// ProjectTrusted controls whether provider routing from the current
+	// workspace may participate in the post-wizard config reload. The secure
+	// default is false: a standalone/headless caller that does not make an
+	// explicit trust decision must never pair user credentials with a
+	// repository-controlled endpoint.
+	ProjectTrusted bool
 }
 
 // EnsureAPIKey verifies cfg has the credentials required by `provName`.
@@ -80,11 +86,11 @@ func EnsureAPIKey(cfg *config.Config, provName string, opts AuthGateOptions) (*c
 	// have a wizard fn to call.
 	canWizard := !opts.NoWizard && opts.RunWizard != nil
 	if canWizard && opts.IsTTY != nil && opts.IsTTY() {
-		fmt.Fprintln(stderr, "metis: no API key found — launching first-run setup")
+		fmt.Fprintln(stderr, "metis: provider credentials missing — launching first-run setup")
 		res, werr := opts.RunWizard()
 		if werr != nil {
 			if errors.Is(werr, ErrWizardCancelled) {
-				return nil, "", errors.New("auth setup cancelled — re-run `metis auth login` or set the api_key_env env var")
+				return nil, "", errors.New("auth setup cancelled — configure the active provider's required credentials or run `metis login` to choose a supported API-key/OAuth provider")
 			}
 			return nil, "", werr
 		}
@@ -95,6 +101,9 @@ func EnsureAPIKey(cfg *config.Config, provName string, opts AuthGateOptions) (*c
 		newCfg, _, lerr := config.Load()
 		if lerr != nil {
 			return nil, "", fmt.Errorf("reload config after auth setup: %w", lerr)
+		}
+		if lerr := config.ApplyProviderPolicyForWorkspace(newCfg, opts.ProjectTrusted); lerr != nil {
+			return nil, "", fmt.Errorf("apply provider trust policy after auth setup: %w", lerr)
 		}
 		cfg = newCfg
 		if res == nil || res.Provider == "" {
@@ -115,6 +124,9 @@ func EnsureAPIKey(cfg *config.Config, provName string, opts AuthGateOptions) (*c
 }
 
 func missingProviderCredentialsError(cfg *config.Config, provName string) error {
+	if provName == "openai-codex" {
+		return errors.New("OpenAI Codex credentials not configured; run `metis login openai-codex`")
+	}
 	if cfg != nil {
 		if raw, ok := cfg.Provider.Custom[provName]; ok {
 			switch normalizedCustomTransport(raw) {
@@ -125,7 +137,7 @@ func missingProviderCredentialsError(cfg *config.Config, provName string) error 
 			}
 		}
 		if _, err := cfg.ResolveAPIKey(provName); err != nil {
-			return fmt.Errorf("%w: try `metis auth login` or export the api_key_env", err)
+			return fmt.Errorf("%w: try `metis login %s` or export the api_key_env", err, provName)
 		}
 	}
 	return fmt.Errorf("missing credentials for provider %q", provName)
@@ -139,7 +151,7 @@ func missingProviderCredentialsError(cfg *config.Config, provName string) error 
 // keeps its original choice.
 func IsKnownProvider(cfg *config.Config, id string) bool {
 	switch id {
-	case "anthropic", "openai", "gemini", "google":
+	case "anthropic", "openai", "openai-codex", "gemini", "google":
 		return true
 	}
 	if cfg == nil {

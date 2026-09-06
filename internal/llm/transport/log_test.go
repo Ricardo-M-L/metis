@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -151,6 +152,39 @@ func TestLoggingTransport_LogsErrorPath(t *testing.T) {
 	body, _ := os.ReadFile(filepath.Join(dir, "debug.log"))
 	if !strings.Contains(string(body), "ERR:") {
 		t.Errorf("error path should log ERR:; got %q", string(body))
+	}
+}
+
+func TestLoggingTransport_RedactsExactOpaqueRequestCredentialsFromErrors(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "debug.log")
+	t.Setenv("METIS_DEBUG_LOG", logPath)
+	t.Setenv("METIS_DEBUG", "1")
+	closeLogForTest()
+	t.Cleanup(closeLogForTest)
+
+	accessToken := "opaqueLogToken_94"
+	accountID := "opaqueLogAccount_37"
+	stub := &stubRT{err: errors.New("gateway echoed token " + accessToken + " for account " + accountID)}
+	req := newReq(t)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("ChatGPT-Account-ID", accountID)
+	_, returnedErr := WrapRoundTripper(stub, "openai-codex", nil).RoundTrip(req)
+	if returnedErr == nil {
+		t.Fatal("expected error pass-through")
+	}
+	closeLogForTest()
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal("failed to read debug log")
+	}
+	for _, value := range []string{accessToken, accountID} {
+		if strings.Contains(string(body), value) {
+			t.Fatal("debug log retained an exact request credential")
+		}
+	}
+	if !strings.Contains(string(body), "[REDACTED]") {
+		t.Fatal("debug log did not contain a redaction marker")
 	}
 }
 

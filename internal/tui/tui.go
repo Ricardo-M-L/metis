@@ -167,6 +167,11 @@ type ExternalHooks struct {
 	// Bash tool registry: a disabled/hidden Bash tool must not turn local !cmd
 	// into an unsandboxed execution path.
 	Sandbox *sandbox.Manager
+	// ProviderConfigLoader hot-reloads provider profiles through the same
+	// workspace-trust policy used at process startup. The Model's default
+	// loader ignores project provider tables, so embedders fail closed unless
+	// they explicitly supply a trusted loader.
+	ProviderConfigLoader func() (*config.Config, error)
 	// ReloadCatalog refreshes disk-backed skills and custom slash commands
 	// without rebuilding the active Loop or discarding conversation history.
 	ReloadCatalog func() (string, error)
@@ -969,6 +974,9 @@ func configuredThinkingDisplay(cfg *config.Config) string {
 // Safe to call before or after RunTUI; nil hooks degrade gracefully.
 func (m *Model) SetExternalHooks(h ExternalHooks) {
 	m.ext = h
+	if h.ProviderConfigLoader != nil {
+		m.providerConfigLoader = h.ProviderConfigLoader
+	}
 }
 
 // RunTUI starts the terminal UI. If hooks is non-nil it is attached to

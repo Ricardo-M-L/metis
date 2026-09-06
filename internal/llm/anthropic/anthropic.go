@@ -22,6 +22,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
@@ -39,6 +40,73 @@ type (
 	ToolSpec     = provider.ToolSpec
 	Effort       = pubLLM.Effort
 )
+
+// anthropicRedactedError is the public error boundary for transport and
+// upstream failures. It intentionally never unwraps to the original error,
+// because url.Error and gateway errors can contain credential-bearing text.
+// Only secret-free sentinel classifications are retained.
+type anthropicRedactedError struct {
+	message        string
+	classification error
+}
+
+func (e *anthropicRedactedError) Error() string { return e.message }
+func (e *anthropicRedactedError) Unwrap() error { return e.classification }
+
+func anthropicSafeClassification(err error) error {
+	var safe []error
+	if transport.IsNetworkError(err) {
+		safe = append(safe, transport.ErrNetwork)
+	}
+	for _, candidate := range []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		io.ErrClosedPipe,
+	} {
+		if errors.Is(err, candidate) {
+			safe = append(safe, candidate)
+		}
+	}
+	return errors.Join(safe...)
+}
+
+func redactAnthropicError(err error, exactValues ...string) error {
+	if err == nil {
+		return nil
+	}
+	safe := &anthropicRedactedError{
+		message:        security.RedactValues(err.Error(), exactValues...),
+		classification: anthropicSafeClassification(err),
+	}
+	var exhausted *transport.RetryExhaustedError
+	if errors.As(err, &exhausted) {
+		return &transport.RetryExhaustedError{Err: safe, Attempts: exhausted.Attempts}
+	}
+	return safe
+}
+
+func anthropicUpstreamError(message, errorType, fallback string, exactValues ...string) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = fallback
+	}
+	message = security.RedactValues(message, exactValues...)
+	errorType = strings.TrimSpace(security.RedactValues(errorType, exactValues...))
+	if errorType != "" {
+		return fmt.Errorf("%s (%s)", message, errorType)
+	}
+	return errors.New(message)
+}
+
+func anthropicHTTPBodyReadError(statusCode int, raw []byte, readErr error, exactValues ...string) error {
+	message := fmt.Sprintf("anthropic %d response body", statusCode)
+	if len(raw) > 0 {
+		message = fmt.Sprintf("anthropic %d: %s", statusCode, transport.Truncate(security.RedactValues(string(raw), exactValues...), 500))
+	}
+	return fmt.Errorf("%s: %w", message, redactAnthropicError(readErr, exactValues...))
+}
 
 const (
 	RoleSystem    = provider.RoleSystem
@@ -59,6 +127,13 @@ type Anthropic struct {
 	APIKey  string
 	BaseURL string
 	Model   string
+	// OAuthTokenSource resolves a current subscription OAuth token for each
+	// outbound HTTP attempt. It is deliberately a callback rather than a cached
+	// string: long-running CLI/Desktop sessions must be able to refresh an
+	// expired token without rebuilding the provider. APIKey and OAuth are
+	// mutually exclusive at construction time; callers must never infer the
+	// authentication mode from a token prefix.
+	OAuthTokenSource func(context.Context) (string, error)
 	// CatalogProvider is the models.dev provider id for this concrete route.
 	// It is separate from Name(), which identifies the Anthropic wire format.
 	CatalogProvider string
@@ -113,6 +188,17 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, be
 		Beta:       beta,
 		httpClient: transport.NewHTTPClient(timeout, "anthropic"),
 	}
+}
+
+// NewOAuth builds an Anthropic provider authenticated with a dynamically
+// resolved Claude subscription OAuth credential. The resolver is called for
+// every HTTP attempt so refreshes performed by the credential store take
+// effect immediately. It must return only the bearer access token; Metis never
+// logs or includes it in an error.
+func NewOAuth(baseURL, model string, maxTokens int, timeout time.Duration, beta string, tokenSource func(context.Context) (string, error)) *Anthropic {
+	a := New("", baseURL, model, maxTokens, timeout, beta)
+	a.OAuthTokenSource = tokenSource
+	return a
 }
 
 // MaxContextTokens returns the effective context window for compaction.
@@ -270,7 +356,7 @@ func (a *Anthropic) Name() string { return "anthropic" }
 // Anthropic signature. Redacted thinking carries its own opaque payload and is
 // replayed.
 func (a *Anthropic) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
-	return block.Type != "thinking" && (block.Type != "redacted_thinking" || block.Data != "")
+	return CanReplayAssistantBlock(block)
 }
 
 // --- request shapes (Anthropic-native) ---
@@ -283,6 +369,8 @@ type anthropicMessage struct {
 type anthropicContent struct {
 	Type         string                 `json:"type"`
 	Text         string                 `json:"text,omitempty"`
+	Thinking     string                 `json:"thinking,omitempty"`
+	Signature    string                 `json:"signature,omitempty"`
 	ID           string                 `json:"id,omitempty"`
 	Name         string                 `json:"name,omitempty"`
 	Input        map[string]any         `json:"input,omitempty"`
@@ -325,7 +413,22 @@ type anthropicImageSource struct {
 // `{}` so subsequent requests round-trip cleanly. Other content types
 // (text / tool_result) are passed through to the default marshaler.
 func (c anthropicContent) MarshalJSON() ([]byte, error) {
-	if c.Type != "tool_use" {
+	switch c.Type {
+	case "thinking":
+		// Anthropic accepts (and can produce) a signed thinking block with
+		// empty plaintext. Both fields are required on replay, so omitempty
+		// would corrupt that otherwise-valid block by dropping `thinking`.
+		type thinkingShape struct {
+			Type      string `json:"type"`
+			Thinking  string `json:"thinking"`
+			Signature string `json:"signature"`
+		}
+		return json.Marshal(thinkingShape{
+			Type: c.Type, Thinking: c.Thinking, Signature: c.Signature,
+		})
+	case "tool_use":
+		// Continue below: tool_use also needs one normally-omitted field.
+	default:
 		type alias anthropicContent
 		return json.Marshal(alias(c))
 	}
@@ -435,7 +538,11 @@ type anthropicResp struct {
 	Content    []anthropicContent `json:"content"`
 	StopReason string             `json:"stop_reason"`
 	Model      string             `json:"model"`
-	Usage      struct {
+	Error      *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+	Usage struct {
 		InputTokens              int `json:"input_tokens"`
 		OutputTokens             int `json:"output_tokens"`
 		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
@@ -591,17 +698,19 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 					},
 				})
 			case "thinking":
-				// Intentionally dropped on send. Anthropic's
-				// extended-thinking wire format requires the original
-				// `signature` field on round-trip — without it the API
-				// returns 400. metis currently captures the thinking
-				// text via streaming but discards signature deltas (see
-				// line 912 "signature_delta" — currently dropped), so
-				// we can't re-emit a faithful thinking block yet.
-				// Persisting the text in session jsonl + showing it in
-				// the TUI is the user-visible win; signature plumbing
-				// can come as a follow-up when extended-thinking gets
-				// flipped on by default.
+				// Anthropic signs each plaintext thinking block. The
+				// exact text + signature pair must be echoed back when a
+				// tool-use response continues; fabricating or omitting the
+				// signature makes the next Messages request invalid. Keep
+				// unsigned traces for local presentation, but never put
+				// them on the Anthropic wire.
+				if signature := c.ProviderHint[ThinkingSignatureHint]; signature != "" {
+					am.Content = append(am.Content, anthropicContent{
+						Type:      "thinking",
+						Thinking:  c.Text,
+						Signature: signature,
+					})
+				}
 			case "redacted_thinking":
 				// Unlike normal thinking, redacted_thinking carries its
 				// own opaque cipher text — there's no signature to
@@ -829,6 +938,16 @@ func fromAnthropic(resp anthropicResp) *Response {
 		switch c.Type {
 		case "text":
 			out.Content = append(out.Content, ContentBlock{Type: "text", Text: c.Text})
+		case "thinking":
+			block := ContentBlock{Type: "thinking", Text: c.Thinking}
+			if c.Signature != "" {
+				block.ProviderHint = map[string]string{ThinkingSignatureHint: c.Signature}
+			}
+			out.Content = append(out.Content, block)
+		case "redacted_thinking":
+			if c.Data != "" {
+				out.Content = append(out.Content, ContentBlock{Type: "redacted_thinking", Data: c.Data})
+			}
 		case "tool_use":
 			// MiniMax-style {"_": "<json-string>"} bundle gets
 			// unwrapped here; argsunwrap is a structural no-op for
@@ -846,8 +965,8 @@ func fromAnthropic(resp anthropicResp) *Response {
 // --- Provider impl ---
 
 func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error) {
-	if a.APIKey == "" {
-		return nil, fmt.Errorf("API key not configured. Set ANTHROPIC_API_KEY environment variable or configure in ~/.metis/config.toml")
+	if err := a.validateAuth(); err != nil {
+		return nil, err
 	}
 	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys, needsEmptySchemaPlaceholder(a.BaseURL))
 	body.Stream = false
@@ -857,6 +976,7 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 	// post-loop context-overflow recovery can inspect it without an
 	// extra round-trip. Mirrors CC's withRetry.ts pattern.
 	var lastBody string
+	var exactValues []string
 	doOnce := func(b anthropicReq) error {
 		buf, err := json.Marshal(b)
 		if err != nil {
@@ -867,23 +987,43 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 			if err != nil {
 				return err
 			}
-			a.setHeaders(httpReq)
+			requestValues, headerErr := a.setHeaders(ctx, httpReq)
+			exactValues = append(exactValues, requestValues...)
+			if headerErr != nil {
+				return headerErr
+			}
 			resp, err := a.httpClient.Do(httpReq)
 			if err != nil {
 				return err
 			}
 			defer resp.Body.Close()
-			rb, _ := io.ReadAll(resp.Body)
+			rb, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				lastBody = string(rb)
+				bodyErr := anthropicHTTPBodyReadError(resp.StatusCode, rb, readErr, exactValues...)
+				if transport.IsRetryableStatus(resp.StatusCode) {
+					return &transport.RetryableError{Err: bodyErr, After: transport.ParseRetryAfter(resp)}
+				}
+				return bodyErr
+			}
 			if resp.StatusCode >= 400 {
 				lastBody = string(rb)
-				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(security.RedactValues(lastBody, exactValues...), 500))
 				if transport.IsRetryableStatus(resp.StatusCode) {
 					return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 				}
 				return httpErr
 			}
+			ar = anthropicResp{}
 			if err := json.Unmarshal(rb, &ar); err != nil {
 				return fmt.Errorf("decode anthropic response: %w", err)
+			}
+			if ar.Type == "error" || ar.Error != nil {
+				message, errorType := "", ""
+				if ar.Error != nil {
+					message, errorType = ar.Error.Message, ar.Error.Type
+				}
+				return anthropicUpstreamError(message, errorType, "anthropic request failed", exactValues...)
 			}
 			return nil
 		})
@@ -917,14 +1057,14 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (*Response, error
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, redactAnthropicError(err, exactValues...)
 	}
 	return fromAnthropic(ar), nil
 }
 
 func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, error) {
-	if a.APIKey == "" {
-		return nil, fmt.Errorf("API key not configured. Set ANTHROPIC_API_KEY environment variable or configure in ~/.metis/config.toml")
+	if err := a.validateAuth(); err != nil {
+		return nil, err
 	}
 	body := toAnthropicWithFlags(req, a.Model, a.MaxTokens, a.AntiDistillation, a.ClientSideDecoys, needsEmptySchemaPlaceholder(a.BaseURL))
 	body.Stream = true
@@ -933,6 +1073,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 	// body we don't retry — partial SSE consumption can't be re-played.
 	var resp *http.Response
 	var lastBody string
+	var exactValues []string
 	openOnce := func(b anthropicReq) error {
 		buf, err := json.Marshal(b)
 		if err != nil {
@@ -943,17 +1084,28 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 			if err != nil {
 				return err
 			}
-			a.setHeaders(httpReq)
+			requestValues, headerErr := a.setHeaders(ctx, httpReq)
+			exactValues = append(exactValues, requestValues...)
+			if headerErr != nil {
+				return headerErr
+			}
 			resp, err = a.httpClient.Do(httpReq)
 			if err != nil {
 				return err
 			}
 			if resp.StatusCode >= 400 {
-				rb, _ := io.ReadAll(resp.Body)
+				rb, readErr := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				bodyStr := string(rb)
 				lastBody = bodyStr
-				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(bodyStr, 500))
+				if readErr != nil {
+					bodyErr := anthropicHTTPBodyReadError(resp.StatusCode, rb, readErr, exactValues...)
+					if transport.IsRetryableStatus(resp.StatusCode) {
+						return &transport.RetryableError{Err: bodyErr, After: transport.ParseRetryAfter(resp)}
+					}
+					return bodyErr
+				}
+				httpErr := fmt.Errorf("anthropic %d: %s", resp.StatusCode, transport.Truncate(security.RedactValues(bodyStr, exactValues...), 500))
 				// MiniMax-shim hints: when the upstream is MiniMax's
 				// `/anthropic` endpoint, the body almost always carries a
 				// `(NNNN)` business code. Translate the well-known ones to
@@ -1000,9 +1152,9 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (StreamReader, erro
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, redactAnthropicError(err, exactValues...)
 	}
-	return newAnthropicStream(resp.Body), nil
+	return newAnthropicStream(resp.Body, exactValues...), nil
 }
 
 // debugRetryArgs emits a one-line stderr breadcrumb on each
@@ -1146,13 +1298,69 @@ func emptySchemaPlaceholderProperty() map[string]any {
 	}
 }
 
-func (a *Anthropic) setHeaders(r *http.Request) {
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("x-api-key", a.APIKey)
-	r.Header.Set("anthropic-version", "2023-06-01")
-	if a.Beta != "" {
-		r.Header.Set("anthropic-beta", a.Beta)
+func (a *Anthropic) validateAuth() error {
+	if strings.TrimSpace(a.APIKey) != "" {
+		return nil
 	}
+	if a.OAuthTokenSource != nil {
+		return nil
+	}
+	return errors.New("Anthropic credentials not configured; run `metis login anthropic` or set ANTHROPIC_API_KEY")
+}
+
+func mergeHeaderValues(configured string, required ...string) string {
+	seen := make(map[string]struct{})
+	values := make([]string, 0, len(required)+1)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		values = append(values, value)
+	}
+	for _, value := range strings.Split(configured, ",") {
+		add(value)
+	}
+	for _, value := range required {
+		add(value)
+	}
+	return strings.Join(values, ",")
+}
+
+func (a *Anthropic) setHeaders(ctx context.Context, r *http.Request) ([]string, error) {
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("anthropic-version", "2023-06-01")
+	if strings.TrimSpace(a.APIKey) != "" {
+		r.Header.Set("x-api-key", a.APIKey)
+		if a.Beta != "" {
+			r.Header.Set("anthropic-beta", a.Beta)
+		}
+		return []string{a.APIKey}, nil
+	}
+	if a.OAuthTokenSource == nil {
+		return nil, errors.New("Anthropic credentials not configured; run `metis login anthropic` or set ANTHROPIC_API_KEY")
+	}
+	token, err := a.OAuthTokenSource(ctx)
+	if err != nil {
+		return []string{token}, fmt.Errorf("resolve Anthropic OAuth credential: %w", err)
+	}
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("Anthropic OAuth credential is missing an access token; run `metis login anthropic`")
+	}
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("anthropic-beta", mergeHeaderValues(a.Beta, "oauth-2025-04-20", "claude-code-20250219"))
+	r.Header.Set("anthropic-dangerous-direct-browser-access", "true")
+	// Be explicit and truthful about the calling application. Subscription
+	// OAuth needs its beta flags, but Metis must not impersonate Claude Code's
+	// user-agent or product identity.
+	r.Header.Set("User-Agent", "metis")
+	r.Header.Set("X-App", "cli")
+	return []string{token}, nil
 }
 
 // --- SSE stream ---
@@ -1160,6 +1368,10 @@ func (a *Anthropic) setHeaders(r *http.Request) {
 type anthropicStream struct {
 	body io.ReadCloser
 	sse  *sse.Reader
+	// exactValues holds the credentials used to establish this stream. SSE
+	// errors arrive after the HTTP request returns, so the per-request values
+	// must travel with the reader rather than being inferred from token shapes.
+	exactValues []string
 	// transient state for tool_use blocks (we accumulate input_json_delta)
 	currentBlocks map[int]*streamBlock
 }
@@ -1169,6 +1381,7 @@ type streamBlock struct {
 	ToolUseID string
 	ToolName  string
 	JSONBuf   strings.Builder
+	Signature strings.Builder
 
 	// Prefill captures the model's `input` field carried in
 	// content_block_start. Anthropic protocol allows the model to send
@@ -1182,28 +1395,45 @@ type streamBlock struct {
 	Prefill string
 }
 
-func newAnthropicStream(body io.ReadCloser) *anthropicStream {
+func newAnthropicStream(body io.ReadCloser, exactValues ...string) *anthropicStream {
 	return &anthropicStream{
 		body:          body,
 		sse:           sse.NewReader(body),
+		exactValues:   append([]string(nil), exactValues...),
 		currentBlocks: make(map[int]*streamBlock),
 	}
 }
 
-func (s *anthropicStream) Close() error { return s.body.Close() }
+func (s *anthropicStream) Close() error {
+	return redactAnthropicError(s.body.Close(), s.exactValues...)
+}
+
+func (s *anthropicStream) truncated(reason string) (StreamEvent, error) {
+	err := fmt.Errorf("anthropic SSE stream %s: %w", reason, io.ErrUnexpectedEOF)
+	safeErr := redactAnthropicError(err, s.exactValues...)
+	return StreamEvent{Type: "error", Err: safeErr}, safeErr
+}
+
+func (s *anthropicStream) terminate() (StreamEvent, error) {
+	if len(s.currentBlocks) != 0 {
+		return s.truncated(fmt.Sprintf("terminated with %d unclosed content block(s)", len(s.currentBlocks)))
+	}
+	return StreamEvent{Type: "message_stop"}, io.EOF
+}
 
 func (s *anthropicStream) Recv() (StreamEvent, error) {
 	for {
 		frame, err := s.sse.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return StreamEvent{Type: "message_stop"}, io.EOF
+				return s.truncated("ended before a protocol terminator")
 			}
-			return StreamEvent{Type: "error", Err: err}, err
+			safeErr := redactAnthropicError(err, s.exactValues...)
+			return StreamEvent{Type: "error", Err: safeErr}, safeErr
 		}
 		// Anthropic's `[DONE]` sentinel ends the stream cleanly.
 		if frame.Data == "[DONE]" {
-			return StreamEvent{Type: "message_stop"}, io.EOF
+			return s.terminate()
 		}
 
 		var env struct {
@@ -1244,10 +1474,12 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			}, nil
 		case "content_block_start":
 			var cb struct {
-				Type  string         `json:"type"`
-				ID    string         `json:"id"`
-				Name  string         `json:"name"`
-				Input map[string]any `json:"input"`
+				Type      string         `json:"type"`
+				ID        string         `json:"id"`
+				Name      string         `json:"name"`
+				Input     map[string]any `json:"input"`
+				Thinking  string         `json:"thinking"`
+				Signature string         `json:"signature"`
 				// Data carries the encrypted payload for atomic
 				// content blocks like `redacted_thinking` —
 				// Anthropic ships the full encrypted contents in the
@@ -1260,6 +1492,9 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			}
 			_ = json.Unmarshal(env.ContentBlock, &cb)
 			blk := &streamBlock{Type: cb.Type, ToolUseID: cb.ID, ToolName: cb.Name}
+			if cb.Type == "thinking" && cb.Signature != "" {
+				blk.Signature.WriteString(cb.Signature)
+			}
 			// Capture prefill: if the model sent the whole arguments
 			// object inline at block-start (instead of via deltas), we
 			// stash it in Prefill. content_block_stop falls back to
@@ -1279,6 +1514,12 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			if cb.Type == "redacted_thinking" {
 				return StreamEvent{Type: "redacted_thinking", TextDelta: cb.Data}, nil
 			}
+			// Native Anthropic starts thinking blocks empty and streams all
+			// text via deltas, but compatibility gateways may prefill the
+			// block. Preserve that text exactly when present.
+			if cb.Type == "thinking" && cb.Thinking != "" {
+				return StreamEvent{Type: "thinking_delta", TextDelta: cb.Thinking}, nil
+			}
 			continue
 		case "content_block_delta":
 			var d struct {
@@ -1286,6 +1527,7 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 				Text        string `json:"text"`
 				PartialJSON string `json:"partial_json"`
 				Thinking    string `json:"thinking"`
+				Signature   string `json:"signature"`
 			}
 			_ = json.Unmarshal(env.Delta, &d)
 			blk := s.currentBlocks[env.Index]
@@ -1295,12 +1537,15 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 			// Extended-thinking: Anthropic emits the reasoning trace as
 			// thinking_delta blocks separately from text. Forward them so
 			// the UI can render dim/italic alongside the final answer.
-			// Signature deltas (cryptographic block signature) are
-			// internal — drop them rather than streaming binary noise.
+			// Signature deltas are opaque provider state. Accumulate
+			// them on the current thinking block and emit only a
+			// provider-hint event at block stop; they must be persisted
+			// for the next tool-use round-trip, but never rendered.
 			if d.Type == "thinking_delta" {
 				return StreamEvent{Type: "thinking_delta", TextDelta: d.Thinking}, nil
 			}
-			if d.Type == "signature_delta" {
+			if d.Type == "signature_delta" && blk != nil && blk.Type == "thinking" {
+				blk.Signature.WriteString(d.Signature)
 				continue
 			}
 			if d.Type == "input_json_delta" && blk != nil {
@@ -1327,6 +1572,14 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 				delete(s.currentBlocks, env.Index)
 				return ev, nil
 			}
+			if blk != nil && blk.Type == "thinking" {
+				ev := StreamEvent{Type: "thinking_signature"}
+				if signature := blk.Signature.String(); signature != "" {
+					ev.ProviderHint = map[string]string{ThinkingSignatureHint: signature}
+				}
+				delete(s.currentBlocks, env.Index)
+				return ev, nil
+			}
 			delete(s.currentBlocks, env.Index)
 			continue
 		case "message_delta":
@@ -1350,9 +1603,9 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 				CacheReadInputTokens:     env.Usage.CacheReadInputTokens,
 			}, nil
 		case "message_stop":
-			return StreamEvent{Type: "message_stop"}, io.EOF
+			return s.terminate()
 		case "error":
-			return StreamEvent{Type: "error", Err: errors.New(frame.Data)}, nil
+			return StreamEvent{Type: "error", Err: errors.New(security.RedactValues(frame.Data, s.exactValues...))}, nil
 		}
 		// Unknown event type — keep reading.
 	}

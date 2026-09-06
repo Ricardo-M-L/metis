@@ -74,7 +74,7 @@ func TestPrepareACPLoopDefersMissingCredentialUntilPrompt(t *testing.T) {
 	}
 	if _, err := loop.Provider.Stream(context.Background(), llm.Request{}); err == nil {
 		t.Fatal("model request unexpectedly bypassed missing credentials")
-	} else if !errors.Is(err, config.ErrMissingAPIKey) || !strings.Contains(err.Error(), "metis auth login") {
+	} else if !errors.Is(err, config.ErrMissingAPIKey) || !strings.Contains(err.Error(), "metis login anthropic") {
 		t.Fatalf("model request error = %v, want actionable missing-key error", err)
 	}
 }

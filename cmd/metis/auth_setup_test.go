@@ -51,7 +51,7 @@ func TestRefreshConfigSnapshotAfterAuthOnlyReloadsWizardChanges(t *testing.T) {
 		t.Fatal("test setup did not make the original snapshot stale")
 	}
 
-	gotCfg, gotSnap, err := refreshConfigSnapshotAfterAuth(cfg, snap, false)
+	gotCfg, gotSnap, err := refreshConfigSnapshotAfterAuth(cfg, snap, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestRefreshConfigSnapshotAfterAuthOnlyReloadsWizardChanges(t *testing.T) {
 		t.Fatal("ordinary auth path absorbed an unrelated config edit")
 	}
 
-	gotCfg, gotSnap, err = refreshConfigSnapshotAfterAuth(cfg, snap, true)
+	gotCfg, gotSnap, err = refreshConfigSnapshotAfterAuth(cfg, snap, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,5 +68,40 @@ func TestRefreshConfigSnapshotAfterAuthOnlyReloadsWizardChanges(t *testing.T) {
 	}
 	if !gotSnap.Diff().Empty() {
 		t.Fatalf("wizard-auth refresh returned a stale baseline: %#v", gotSnap.Diff())
+	}
+}
+
+func TestRefreshConfigSnapshotAfterAuthReappliesProviderTrust(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[provider]\ndefault = \"openai\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte("[provider]\ndefault = \"gemini\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, snap, err := config.LoadWithSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	untrusted, _, err := refreshConfigSnapshotAfterAuth(cfg, snap, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if untrusted.Provider.Default != "openai" {
+		t.Fatalf("untrusted refresh provider = %q, want openai", untrusted.Provider.Default)
+	}
+	trusted, _, err := refreshConfigSnapshotAfterAuth(cfg, snap, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted.Provider.Default != "gemini" {
+		t.Fatalf("trusted refresh provider = %q, want gemini", trusted.Provider.Default)
 	}
 }

@@ -93,6 +93,10 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	reqID := req.Header.Get(HeaderRequestID)
 	tsStart := time.Now()
 	sessID := t.resolveSessID()
+	// Capture request-time values before the inner transport can mutate the
+	// headers. These are immutable for the response/SSE callbacks and let the
+	// dump scrub opaque credentials that no global token regex can recognize.
+	exactValues := sensitiveDumpValues(req.Header)
 
 	// 1. capture request body. Reading-and-restoring is the
 	// stdlib idiom: r.Body must be re-readable for the actual
@@ -117,8 +121,8 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		ReqID:     reqID,
 		Method:    req.Method,
 		URL:       safeURL(req),
-		Headers:   redactHeaders(req.Header),
-		Body:      jsonOrRaw(reqBody),
+		Headers:   redactHeaders(req.Header, exactValues...),
+		Body:      jsonOrRaw(reqBody, exactValues...),
 	})
 
 	// 3. dispatch.
@@ -133,7 +137,7 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			ReqID:     reqID,
 			Method:    req.Method,
 			URL:       safeURL(req),
-			Error:     err.Error(),
+			Error:     security.RedactValues(err.Error(), exactValues...),
 			ElapsedMS: time.Since(tsStart).Milliseconds(),
 		})
 		return resp, err
@@ -163,7 +167,7 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 					ReqID:     reqID,
 					Status:    resp.StatusCode,
 					Stream:    true,
-					Body:      sseChunksToJSON(buf.Bytes()),
+					Body:      sseChunksToJSON(buf.Bytes(), exactValues...),
 					ElapsedMS: time.Since(tsStart).Milliseconds(),
 				})
 			},
@@ -181,7 +185,7 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			Provider:  t.provider,
 			ReqID:     reqID,
 			Status:    resp.StatusCode,
-			Body:      jsonOrRaw(body),
+			Body:      jsonOrRaw(body, exactValues...),
 			ElapsedMS: time.Since(tsStart).Milliseconds(),
 		})
 	}
@@ -256,21 +260,83 @@ func safeURL(req *http.Request) string {
 
 // redactHeaders returns a copy of h with auth-bearing values replaced
 // by "[REDACTED]". The user might paste this into a bug report.
-func redactHeaders(h http.Header) map[string]any {
+func redactHeaders(h http.Header, exactValues ...string) map[string]any {
 	out := make(map[string]any, len(h))
 	for k, v := range h {
-		lk := strings.ToLower(k)
-		if lk == "authorization" || lk == "x-api-key" || lk == "x-goog-api-key" || lk == "anthropic-api-key" || lk == "api-key" || strings.Contains(lk, "token") || strings.Contains(lk, "secret") {
+		if isSensitiveDumpHeader(k) {
 			out[k] = "[REDACTED]"
 			continue
 		}
 		if len(v) == 1 {
-			out[k] = v[0]
+			out[k] = security.RedactValues(v[0], exactValues...)
 		} else {
-			out[k] = v
+			redacted := make([]string, len(v))
+			for i := range v {
+				redacted[i] = security.RedactValues(v[i], exactValues...)
+			}
+			out[k] = redacted
 		}
 	}
 	return out
+}
+
+// isSensitiveDumpHeader deliberately errs on the side of hiding metadata.
+// Prompt dumps are an opt-in debugging artifact that users often attach to
+// issues; account identifiers, cookies, signed values, and custom gateway
+// credential headers must therefore be treated like API keys even when their
+// values do not resemble a known token prefix.
+func isSensitiveDumpHeader(name string) bool {
+	normalized := strings.ToLower(strings.NewReplacer("-", "", "_", "", ".", "").Replace(name))
+	for _, marker := range []string{
+		"authorization", "apikey", "token", "secret", "password", "passwd",
+		"credential", "cookie", "signature", "signedurl", "privatekey",
+		"accesskey", "accountid",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return normalized == "key" || strings.HasSuffix(normalized, "key")
+}
+
+// sensitiveDumpValues returns an immutable set of exact values taken from
+// credential-bearing request headers. In addition to each full header value,
+// it records the payload of two-part schemes such as "Bearer <token>" so a
+// response that echoes only the opaque token is still safe to persist.
+func sensitiveDumpValues(headers http.Header) []string {
+	values := make([]string, 0, len(headers)*2)
+	seen := make(map[string]struct{}, len(headers)*2)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	for name, headerValues := range headers {
+		if !isSensitiveDumpHeader(name) {
+			continue
+		}
+		for _, value := range headerValues {
+			add(value)
+			if fields := strings.Fields(value); len(fields) == 2 {
+				add(fields[1])
+			}
+		}
+	}
+	return values
+}
+
+// redactDumpError removes both recognizable secrets and opaque values taken
+// from sensitive request headers. Network stacks sometimes repeat a request
+// header in their error string; generic token regexes cannot catch a short
+// account id or a vendor-specific credential in that situation.
+func redactDumpError(message string, headers http.Header) string {
+	return security.RedactValues(message, sensitiveDumpValues(headers)...)
 }
 
 // jsonOrRaw returns the body as parsed JSON (so jq users get a
@@ -280,11 +346,11 @@ func redactHeaders(h http.Header) map[string]any {
 // on disk in the clear. Redact preserves JSON structure — it only
 // rewrites string values and the surrounding bytes survive intact,
 // so json.Valid still answers true on the redacted form.
-func jsonOrRaw(b []byte) json.RawMessage {
+func jsonOrRaw(b []byte, exactValues ...string) json.RawMessage {
 	if len(b) == 0 {
 		return nil
 	}
-	red := security.Redact(string(b))
+	red := security.RedactValues(string(b), exactValues...)
 	if json.Valid([]byte(red)) {
 		return json.RawMessage(red)
 	}
@@ -297,7 +363,7 @@ func jsonOrRaw(b []byte) json.RawMessage {
 // raw bytes wrapped in a string. Each `data:` payload is run through
 // security.Redact so SSE-streamed bearer tokens (rare but possible —
 // some providers echo OAuth state in error events) don't leak to disk.
-func sseChunksToJSON(raw []byte) json.RawMessage {
+func sseChunksToJSON(raw []byte, exactValues ...string) json.RawMessage {
 	type chunk struct {
 		Event string          `json:"event,omitempty"`
 		Data  json.RawMessage `json:"data,omitempty"`
@@ -314,13 +380,14 @@ func sseChunksToJSON(raw []byte) json.RawMessage {
 				data = append(data, bytes.TrimSpace(line[len("data:"):])...)
 			}
 		}
+		event = security.RedactValues(event, exactValues...)
 		if len(data) == 0 && event == "" {
 			continue
 		}
 		// Redact before deciding json.Valid — Redact preserves JSON
 		// structure (only string values get rewritten), so the
 		// validity check still answers correctly.
-		dataS := security.Redact(string(data))
+		dataS := security.RedactValues(string(data), exactValues...)
 		// `data: [DONE]` is OpenAI's stream terminator — store as a
 		// string, not JSON, since [DONE] isn't valid JSON.
 		var raw json.RawMessage
@@ -334,7 +401,7 @@ func sseChunksToJSON(raw []byte) json.RawMessage {
 	}
 	out, err := json.Marshal(chunks)
 	if err != nil {
-		s, _ := json.Marshal(string(raw))
+		s, _ := json.Marshal(security.RedactValues(string(raw), exactValues...))
 		return json.RawMessage(s)
 	}
 	return json.RawMessage(out)

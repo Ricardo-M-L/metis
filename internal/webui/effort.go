@@ -40,6 +40,8 @@ func configuredTransport(cfg *config.Config, providerName string) string {
 		return "anthropic_messages"
 	case "openai":
 		return "openai_chat"
+	case "openai-codex":
+		return "openai_codex_responses"
 	case "gemini", "google":
 		return "gemini_native"
 	}
@@ -81,7 +83,7 @@ func reasoningEffortCapability(cfg *config.Config, providerName, model string) e
 		return effortCapability{Reason: "Reasoning effort is not advertised for this model"}
 	}
 	switch transport {
-	case "openai", "openai_chat", "openai_responses", "anthropic", "anthropic_messages", "bedrock", "bedrock_anthropic", "vertex", "vertex_anthropic":
+	case "openai", "openai_chat", "openai_responses", "openai_codex_responses", "anthropic", "anthropic_messages", "bedrock", "bedrock_anthropic", "vertex", "vertex_anthropic":
 		return effortCapability{Supported: true}
 	default:
 		return effortCapability{Reason: "The configured transport has no reasoning-effort mapping"}
@@ -100,7 +102,7 @@ func (s *Server) handleEffort(w http.ResponseWriter, r *http.Request) {
 	// model request observes the new value. Model and session transitions take
 	// this same mutex, which keeps capability validation, persistence and the
 	// live update on one coherent provider runtime without blocking on a turn.
-	cfg, _, err := config.Load()
+	cfg, err := s.loadProviderConfig()
 	if err != nil || cfg == nil {
 		writeError(w, http.StatusInternalServerError, "config unreadable")
 		return

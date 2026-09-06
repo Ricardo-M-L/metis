@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/auth"
 )
 
 const (
@@ -36,9 +38,9 @@ func withUserConfigWriteLockTimeout(timeout time.Duration, fn func(configPath st
 	userConfigWriteMu.Lock()
 	defer userConfigWriteMu.Unlock()
 
-	dir := Home()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create metis home: %w", err)
+	dir, err := auth.EnsureCredentialHome("")
+	if err != nil {
+		return fmt.Errorf("resolve metis home for user config: %w", err)
 	}
 	lock, err := acquireUserConfigFileLock(dir, timeout)
 	if err != nil {

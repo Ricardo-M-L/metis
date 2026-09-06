@@ -12,7 +12,31 @@ package anthropic
 // document the cross-package API surface explicitly without forcing
 // a rename across 700+ lines of anthropic.go.
 
-import "io"
+import (
+	"io"
+
+	"github.com/Ricardo-M-L/metis/pkg/provider"
+)
+
+// ThinkingSignatureHint is the provider-hint key used to persist Anthropic's
+// opaque extended-thinking signature beside the exact plaintext block it
+// authenticates. Other providers ignore this namespaced value.
+const ThinkingSignatureHint = "anthropic.thinking_signature"
+
+// CanReplayAssistantBlock reports whether the shared Anthropic wire encoder
+// will include a provider-neutral assistant block. Plaintext thinking is only
+// replayable with the original Anthropic signature; unsigned traces remain
+// locally visible but must stay off the wire.
+func CanReplayAssistantBlock(block provider.ContentBlock) bool {
+	switch block.Type {
+	case "thinking":
+		return block.ProviderHint[ThinkingSignatureHint] != ""
+	case "redacted_thinking":
+		return block.Data != ""
+	default:
+		return true
+	}
+}
 
 // Resp is the parsed response shape from Anthropic's Messages API
 // non-streaming endpoint. Vertex/Bedrock decode their JSON bodies

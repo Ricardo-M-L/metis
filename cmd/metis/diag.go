@@ -70,6 +70,12 @@ Exit codes: 0 ok / 1 hard fail / 2 flag error`)
 	if err != nil {
 		d.fail("load config", err.Error())
 	} else {
+		if err := config.ApplyProviderPolicyForWorkspace(cfg, currentWorkspaceTrusted()); err != nil {
+			d.fail("provider trust policy", err.Error())
+			cfg = nil
+		}
+	}
+	if cfg != nil {
 		d.ok("config files", strings.Join(loaded, ", "))
 		provName := cfg.Provider.Default
 		if provName == "" {
@@ -80,14 +86,58 @@ Exit codes: 0 ok / 1 hard fail / 2 flag error`)
 		if model != "" {
 			d.ok("model", model)
 		}
-		switch {
-		case keyEnv == "":
-			d.warn("api_key_env", "no api_key_env set in config — provider may use literal key")
-		case os.Getenv(keyEnv) == "":
-			d.fail(keyEnv, "env var unset — provider will fail to authenticate")
-		default:
-			v := os.Getenv(keyEnv)
-			d.ok(keyEnv, fmt.Sprintf("set, %d chars (%s…)", len(v), safePrefix(v, 6)))
+		if provName == "openai-codex" {
+			credential, oauthErr := auth.GetOAuth("openai-codex")
+			switch {
+			case oauthErr != nil:
+				d.fail("OAuth credential", "unavailable — credential store could not be read")
+			case credential == nil || strings.TrimSpace(credential.AccessToken) == "" ||
+				strings.TrimSpace(credential.RefreshToken) == "" || credential.ExpiresAt.IsZero() ||
+				strings.TrimSpace(credential.AccountID) == "":
+				d.fail("OAuth credential", "missing — run `metis login openai-codex`")
+			default:
+				// Credential values and routing metadata are deliberately never
+				// included in diagnostics; only presence is safe to report.
+				d.ok("OAuth credential", "configured")
+			}
+		} else if provName == "anthropic" {
+			// Match BuildProvider exactly: a configured API key wins, while a
+			// Claude subscription credential is accepted only for Anthropic's
+			// own HTTPS endpoint. Never print token/key prefixes in diagnostics.
+			if _, keyErr := cfg.ResolveAPIKey("anthropic"); keyErr == nil {
+				d.ok("API credential", "configured")
+			} else if credential, oauthErr := auth.GetOAuth("anthropic"); oauthErr != nil {
+				d.fail("OAuth credential", "unavailable — credential store could not be read")
+			} else if credential == nil || strings.TrimSpace(credential.AccessToken) == "" {
+				d.fail("credential", "missing — run `metis login anthropic` or set ANTHROPIC_API_KEY")
+			} else if !rtpkg.ProviderHasCredentials(cfg, "anthropic") {
+				d.fail("OAuth credential", "cannot be used with the configured non-Anthropic base_url; use an API key for this gateway")
+			} else {
+				d.ok("OAuth credential", "configured")
+			}
+		} else if raw, ok := cfg.Provider.Custom[provName]; ok && isVertexTransport(raw.Transport) {
+			if rtpkg.ProviderHasCredentials(cfg, provName) {
+				d.ok("Vertex service account", "configured")
+			} else {
+				d.fail("Vertex service account", "missing or unreadable — configure service_account_file, project, and region")
+			}
+		} else if raw, ok := cfg.Provider.Custom[provName]; ok && isBedrockTransport(raw.Transport) {
+			if rtpkg.ProviderHasCredentials(cfg, provName) {
+				d.ok("AWS credentials", "configured")
+			} else {
+				d.fail("AWS credentials", "missing — set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or api_key_env and secret_key_env)")
+			}
+		} else if rtpkg.ProviderHasCredentials(cfg, provName) {
+			d.ok("API credential", "configured")
+		} else {
+			switch {
+			case keyEnv == "":
+				d.fail("credential", "missing — run `metis login "+provName+"` or configure this provider's credential")
+			case os.Getenv(keyEnv) == "":
+				d.fail(keyEnv, "credential missing — run `metis login "+provName+"` or set the environment variable")
+			default:
+				d.ok("API credential", "configured")
+			}
 		}
 	}
 
@@ -185,16 +235,37 @@ Exit codes: 0 ok / 1 hard fail / 2 flag error`)
 	return nil
 }
 
+func isVertexTransport(transport string) bool {
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "vertex", "vertex_anthropic":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBedrockTransport(transport string) bool {
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "bedrock", "bedrock_anthropic":
+		return true
+	default:
+		return false
+	}
+}
+
 // providerKeyAndModel pulls (api_key_env, model) for the named provider.
 func providerKeyAndModel(cfg *config.Config, name string) (string, string) {
 	if cfg == nil {
 		return "", ""
 	}
+	name = auth.CanonicalProviderID(name)
 	switch name {
 	case "anthropic":
 		return cfg.Provider.Anthropic.APIKeyEnv, cfg.Provider.Anthropic.Model
 	case "openai":
 		return cfg.Provider.OpenAI.APIKeyEnv, cfg.Provider.OpenAI.Model
+	case "openai-codex":
+		return "", cfg.Provider.OpenAICodex.Model
 	case "gemini":
 		return cfg.Provider.Gemini.APIKeyEnv, cfg.Provider.Gemini.Model
 	}
@@ -301,13 +372,6 @@ func pingLLM(ctx context.Context, cfg *config.Config) (string, string) {
 	return "ok", "got non-empty completion"
 }
 
-func safePrefix(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
-
 // -----------------------------------------------------------------------------
 // accumulator
 // -----------------------------------------------------------------------------
@@ -373,16 +437,19 @@ func (d *diagAcc) reportWebSearchBackends() {
 			continue
 		}
 		// Precedence mirrors resolveSearchKey() in
-		// internal/tools/builtin/websearch.go — env wins, auth.json
+		// internal/tools/builtin/websearch.go — env wins, the private
+		// credential store is the persistent fallback.
 		// is the persistent fallback. Report which source actually
 		// supplied the key so debugging "why did metis use ddg
 		// instead of tavily" doesn't require re-deriving the rule.
 		if v := os.Getenv(b.env); v != "" {
-			d.ok(b.name, fmt.Sprintf("%s set via env, %d chars (%s…)", b.env, len(v), safePrefix(v, 6)))
+			// Diagnostic output is routinely pasted into issues and logs. Report
+			// only source and length; even a short prefix is credential material.
+			d.ok(b.name, fmt.Sprintf("%s set via env, %d chars", b.env, len(v)))
 			continue
 		}
 		if v, _ := auth.GetSearchKey(b.name); v != "" {
-			d.ok(b.name, fmt.Sprintf("set via auth.json (search:%s), %d chars (%s…)", b.name, len(v), safePrefix(v, 6)))
+			d.ok(b.name, fmt.Sprintf("set via credential store (search:%s), %d chars", b.name, len(v)))
 			continue
 		}
 		d.warn(b.name, fmt.Sprintf("%s unset — %s (%s; or `metis auth keys put %s <key>`)", b.env, b.tier, b.signup, b.name))

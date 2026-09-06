@@ -62,6 +62,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	serverCtx, cancelServer := context.WithCancel(ctx)
 	defer cancelServer()
 	shutdownToken := strings.TrimSpace(os.Getenv("METIS_DESKTOP_FRAME_TOKEN"))
+	workspaceTrusted := currentWorkspaceTrusted()
 	bindings := webui.RuntimeBindings{
 		InitialSessionID:        rt.sessionID,
 		ProviderName:            rt.providerName,
@@ -69,6 +70,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		FreshSystemPromptKind:   rt.systemPromptKind,
 		FreshPermissionMode:     rt.defaultPermissionMode,
 		TrustSessionPermissions: rt.allowStoredSessionPermissions,
+		TrustProviderConfig:     workspaceTrusted,
 		SetPermissionMode: func(mode permission.Mode) error {
 			return applyRuntimePermissionMode(rt, mode)
 		},
@@ -80,7 +82,13 @@ func cmdDesktop(ctx context.Context, args []string) error {
 			if err != nil {
 				return nil, err
 			}
-			return rtpkg.BuildProvider(cfg, providerName, model)
+			if err := config.ApplyProviderPolicyForWorkspace(cfg, workspaceTrusted); err != nil {
+				return nil, err
+			}
+			// Desktop has a separate, explicitly confirmed network Probe action.
+			// Keep provider construction local so the settings Validate action and
+			// model switching never emit an implicit HEAD request.
+			return rtpkg.BuildProviderWithoutPreconnect(cfg, providerName, model)
 		},
 		SessionBoundary:      rt.releaseSessionWork,
 		PrepareSessionSwitch: rt.prepareSessionRebindAt,

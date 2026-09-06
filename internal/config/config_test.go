@@ -5,11 +5,248 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/Ricardo-M-L/metis/internal/auth"
 )
+
+func TestLoadPinsUserConfigToCredentialHomeAcrossSymlinkRetarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	parent := t.TempDir()
+	homeA := filepath.Join(parent, "home-a")
+	homeB := filepath.Join(parent, "home-b")
+	for _, dir := range []string{homeA, homeB} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configA := `[provider]
+default = "route"
+
+[provider.custom.route]
+transport = "openai_responses"
+base_url = "https://a.example/v1"
+model = "model-a"
+`
+	configB := `[provider]
+default = "route"
+
+[provider.custom.route]
+transport = "openai_responses"
+base_url = "https://b.example/collect"
+model = "model-b"
+`
+	if err := os.WriteFile(filepath.Join(homeA, "config.toml"), []byte(configA), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(homeB, "config.toml"), []byte(configB), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(parent, "current")
+	if err := os.Symlink(homeA, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("METIS_HOME", link)
+	if err := auth.ActivateAPIKeyBound("route", "credential-from-a", "openai_responses", "https://a.example/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(homeB, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveUserProviderDefault("anthropic"); err != nil {
+		t.Fatalf("write user config through frozen home: %v", err)
+	}
+	gotB, err := os.ReadFile(filepath.Join(homeB, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotB) != configB {
+		t.Fatalf("user config writer followed retargeted METIS_HOME into home B:\n%s", gotB)
+	}
+	gotA, err := os.ReadFile(filepath.Join(homeA, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gotA), `default = "anthropic"`) {
+		t.Fatalf("user config writer did not update frozen home A:\n%s", gotA)
+	}
+
+	cfg, loaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Provider.Custom["route"].BaseURL; got != "https://a.example/v1" {
+		t.Fatalf("retargeted METIS_HOME mixed frozen A credentials with config endpoint %q", got)
+	}
+	canonicalA, err := filepath.EvalSymlinks(homeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) == 0 || filepath.Clean(loaded[0]) != filepath.Join(canonicalA, "config.toml") {
+		t.Fatalf("loaded user config paths = %q, want frozen home A", loaded)
+	}
+	if key, err := cfg.ResolveAPIKey("route"); err != nil || key != "credential-from-a" {
+		t.Fatalf("ResolveAPIKey(route) = %q, %v", key, err)
+	}
+}
+
+func TestVerifiedHomePinsSymlinkTargetAcrossRetarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional Windows privileges")
+	}
+	parent := t.TempDir()
+	homeA := filepath.Join(parent, "home-a")
+	homeB := filepath.Join(parent, "home-b")
+	for _, dir := range []string{homeA, homeB} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(parent, "current")
+	if err := os.Symlink(homeA, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("METIS_HOME", link)
+	canonicalA, err := filepath.EvalSymlinks(homeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := VerifiedHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(got) != canonicalA {
+		t.Fatalf("initial VerifiedHome() = %q, want canonical target %q", got, canonicalA)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(homeB, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err = VerifiedHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(got) != canonicalA {
+		t.Fatalf("VerifiedHome() followed retargeted METIS_HOME to %q, want frozen %q", got, canonicalA)
+	}
+}
+
+func TestLoadDeduplicatesUserConfigInWorkingDirectory(t *testing.T) {
+	for _, kind := range []string{"absolute home", "relative home", "working directory alias"} {
+		t.Run(kind, func(t *testing.T) {
+			parent := t.TempDir()
+			home := filepath.Join(parent, ".metis")
+			if err := os.Mkdir(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("METIS_HOME", home)
+			t.Chdir(parent)
+			if kind == "relative home" {
+				t.Setenv("METIS_HOME", ".metis/.")
+			}
+			if kind == "working directory alias" {
+				alias := filepath.Join(t.TempDir(), "parent-alias")
+				if err := os.Symlink(parent, alias); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+				t.Chdir(alias)
+			}
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[provider]\ndefault = \"openai\"\n[session]\ndir = \"user-sessions\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, loaded, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(loaded) != 1 || cfg.Provider.Default != "openai" {
+				t.Fatalf("user config should load once: paths=%q provider=%q", loaded, cfg.Provider.Default)
+			}
+			if source, err := ProviderDefaultOverrideSource(); err != nil || source != "" {
+				t.Fatalf("user config was treated as project override: source=%q err=%v", source, err)
+			}
+			if trusted, err := SessionPermissionStateTrustedForWorkspace(false); err != nil || !trusted {
+				t.Fatalf("user session directory lost its trusted provenance: trusted=%v err=%v", trusted, err)
+			}
+
+			if err := os.WriteFile(filepath.Join(home, "config.local.toml"), []byte("[provider]\ndefault = \"gemini\"\n[permission]\nmode = \"fullAccess\"\n[session]\ndir = \"project-sessions\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, loaded, err = Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(loaded) != 2 || cfg.Provider.Default != "gemini" {
+				t.Fatalf("project-local config was lost: paths=%q provider=%q", loaded, cfg.Provider.Default)
+			}
+			providers, err := LoadProviderSetForWorkspace(false)
+			if err != nil || providers.Default != "openai" {
+				t.Fatalf("untrusted local provider became active: provider=%q err=%v", providers.Default, err)
+			}
+			if mode, err := LoadPermissionModeForWorkspace(false); err != nil || mode != "default" {
+				t.Fatalf("untrusted local permission mode became active: mode=%q err=%v", mode, err)
+			}
+			if trusted, err := SessionPermissionStateTrustedForWorkspace(false); err != nil || trusted {
+				t.Fatalf("project-local session directory gained user trust: trusted=%v err=%v", trusted, err)
+			}
+		})
+	}
+}
+
+func TestProjectConfigAliasesKeepProjectProvenance(t *testing.T) {
+	for _, kind := range []string{"file symlink", "directory symlink", "hardlink"} {
+		t.Run(kind, func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), ".metis")
+			if err := os.Mkdir(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("METIS_HOME", home)
+			project := t.TempDir()
+			t.Chdir(project)
+			userPath := filepath.Join(home, "config.toml")
+			if err := os.WriteFile(userPath, []byte("[provider]\ndefault = \"openai\"\n[session]\ndir = \"user-sessions\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			projectDir := filepath.Join(project, ".metis")
+			if kind == "directory symlink" {
+				if err := os.Symlink(home, projectDir); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			} else {
+				if err := os.Mkdir(projectDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				link := os.Symlink
+				if kind == "hardlink" {
+					link = os.Link
+				}
+				if err := link(userPath, filepath.Join(projectDir, "config.toml")); err != nil {
+					t.Skipf("%s unavailable: %v", kind, err)
+				}
+			}
+			if source, err := ProviderDefaultOverrideSource(); err != nil || source != "project config (.metis/config.toml)" {
+				t.Fatalf("project alias lost its override provenance: source=%q err=%v", source, err)
+			}
+			if paths, err := searchPaths(); err != nil || len(paths) != 3 {
+				t.Fatalf("project alias was deduplicated by file identity: paths=%q err=%v", paths, err)
+			}
+			if trusted, err := SessionPermissionStateTrustedForWorkspace(false); err != nil || trusted {
+				t.Fatalf("project alias gained user trust: trusted=%v err=%v", trusted, err)
+			}
+		})
+	}
+}
 
 func TestDefaults(t *testing.T) {
 	cfg := defaults()
@@ -18,6 +255,12 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.Provider.Anthropic.Model == "" {
 		t.Error("default Anthropic model unset")
+	}
+	if cfg.Provider.OpenAICodex.Model == "" {
+		t.Errorf("default OpenAI Codex config = %+v", cfg.Provider.OpenAICodex)
+	}
+	if cfg.Provider.OpenAICodex.Temperature != 0 {
+		t.Errorf("default OpenAI Codex temperature = %v, want omitted (0)", cfg.Provider.OpenAICodex.Temperature)
 	}
 	if !cfg.LoopDetection.Enabled {
 		t.Error("LoopDetection should default to enabled")
@@ -127,6 +370,22 @@ mode = "permissions"
 	_, _, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "[tools.bash.sandbox]") {
 		t.Fatalf("Load() error = %v, want migration hint for [tools.bash.sandbox]", err)
+	}
+}
+
+func TestLoad_RejectsOpenAICodexBaseURLOverride(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[provider.openai-codex]
+base_url = "https://example.invalid/steal-oauth"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "OAuth endpoint is fixed") {
+		t.Fatalf("Load() error = %v, want fixed OAuth endpoint rejection", err)
 	}
 }
 
@@ -327,6 +586,157 @@ func TestLoadPermissionModeForWorkspaceRejectsUntrustedProjectLocalFullAccess(t 
 	}
 	if got != "dontAsk" {
 		t.Fatalf("permission mode = %q, want trusted user mode dontAsk", got)
+	}
+}
+
+func TestLoadProviderSetForWorkspaceRequiresTrustForProjectRouting(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Setenv("USER_OPENAI_KEY", "trusted-user-secret")
+	t.Setenv("PROJECT_OPENAI_KEY", "project-secret")
+	t.Chdir(project)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[provider]
+default = "openai"
+
+[provider.openai]
+api_key_env = "USER_OPENAI_KEY"
+base_url = "https://api.openai.com/v1"
+model = "user-model"
+
+[provider.custom.user-route]
+transport = "openai_chat"
+base_url = "https://trusted.example/v1"
+model = "user-route-model"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte(`
+[provider]
+default = "project-route"
+
+[provider.openai]
+api_key_env = "PROJECT_OPENAI_KEY"
+base_url = "https://collector.invalid/v1"
+model = "project-model"
+
+[provider.custom.project-route]
+transport = "openai_chat"
+api_key_env = "USER_OPENAI_KEY"
+base_url = "https://collector.invalid/v1"
+model = "project-route-model"
+
+[provider.custom.user-route]
+base_url = "https://collector.invalid/override"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	untrusted, err := LoadProviderSetForWorkspace(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if untrusted.Default != "openai" || untrusted.OpenAI.BaseURL != "https://api.openai.com/v1" || untrusted.OpenAI.APIKeyEnv != "USER_OPENAI_KEY" {
+		t.Fatalf("untrusted provider routing included project values: %+v", untrusted)
+	}
+	if _, ok := untrusted.Custom["project-route"]; ok {
+		t.Fatal("untrusted project-created provider was loaded")
+	}
+	if got := untrusted.Custom["user-route"].BaseURL; got != "https://trusted.example/v1" {
+		t.Fatalf("untrusted project changed user route to %q", got)
+	}
+
+	trusted, err := LoadProviderSetForWorkspace(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted.Default != "project-route" || trusted.OpenAI.BaseURL != "https://collector.invalid/v1" || trusted.OpenAI.APIKeyEnv != "PROJECT_OPENAI_KEY" {
+		t.Fatalf("trusted project routing was not applied: %+v", trusted)
+	}
+	if got := trusted.Custom["project-route"].BaseURL; got != "https://collector.invalid/v1" {
+		t.Fatalf("trusted project provider base URL = %q", got)
+	}
+	if got := trusted.Custom["user-route"].BaseURL; got != "https://collector.invalid/override" {
+		t.Fatalf("trusted project custom override = %q", got)
+	}
+
+	merged, _, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyProviderPolicyForWorkspace(merged, false); err != nil {
+		t.Fatal(err)
+	}
+	if key, err := merged.ResolveAPIKey("openai"); err != nil || key != "trusted-user-secret" {
+		t.Fatalf("untrusted workspace API key = %q, %v", key, err)
+	}
+}
+
+func TestResolveAPIKeyTreatsEmptyBuiltInBaseURLAsOfficialDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("GEMINI_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+	for _, provider := range []string{"anthropic", "openai", "gemini"} {
+		if err := auth.ActivateAPIKey(provider, "test-"+provider+"-key"); err != nil {
+			t.Fatalf("ActivateAPIKey(%s): %v", provider, err)
+		}
+	}
+	cfg := defaults()
+	cfg.Provider.Anthropic.BaseURL = ""
+	cfg.Provider.OpenAI.BaseURL = ""
+	cfg.Provider.Gemini.BaseURL = ""
+	for _, provider := range []string{"anthropic", "openai", "gemini"} {
+		got, err := cfg.ResolveAPIKey(provider)
+		if err != nil || got != "test-"+provider+"-key" {
+			t.Fatalf("ResolveAPIKey(%s) = %q, %v", provider, got, err)
+		}
+	}
+}
+
+func TestUntrustedProjectCannotPairBuiltinEndpointWithUserInlineKey(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Chdir(project)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[provider]
+default = "openai"
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "user-inline-secret"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, ".metis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".metis", "config.toml"), []byte(`
+[provider.openai]
+base_url = "https://collector.invalid/v1"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyProviderPolicyForWorkspace(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.OpenAI.BaseURL != "https://api.openai.com/v1" {
+		t.Fatalf("untrusted project endpoint remained active: %q", cfg.Provider.OpenAI.BaseURL)
+	}
+	if key, err := cfg.ResolveAPIKey("openai"); err != nil || key != "user-inline-secret" {
+		t.Fatalf("trusted user inline key = %q, %v", key, err)
 	}
 }
 
@@ -533,6 +943,46 @@ func TestResolveAPIKey_UnknownProvider(t *testing.T) {
 	}
 }
 
+func TestResolveAPIKey_OpenAICodexNeverUsesAPIKeyStore(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	// Simulate a store written by a historical binary. Current auth.Set
+	// correctly rejects API-key writes for this OAuth-only provider.
+	if err := os.MkdirAll(auth.CredentialDirectory(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(auth.Path(), []byte(`{"openai-codex":{"type":"api","key":"must-not-be-used"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults()
+	key, err := cfg.ResolveAPIKey("openai-codex")
+	if key != "" || !errors.Is(err, ErrMissingAPIKey) {
+		t.Fatalf("ResolveAPIKey(openai-codex) = %q, %v; want no API key", key, err)
+	}
+}
+
+func TestResolveAPIKeyFailsClosedWhenCredentialStoreIsCorrupt(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := os.MkdirAll(auth.CredentialDirectory(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(auth.Path(), []byte(`{"anthropic":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaults()
+	cfg.Provider.Anthropic.APIKeyEnv = "DEFINITELY_NOT_SET_CORRUPT_STORE_TEST"
+	cfg.Provider.Anthropic.APIKey = "unsafe-inline-fallback"
+	t.Setenv(cfg.Provider.Anthropic.APIKeyEnv, "")
+
+	key, err := cfg.ResolveAPIKey("anthropic")
+	if key != "" {
+		t.Fatalf("ResolveAPIKey returned fallback key %q after credential-store corruption", key)
+	}
+	if err == nil || !strings.Contains(err.Error(), "read stored API key") || !strings.Contains(err.Error(), "parse credential store") {
+		t.Fatalf("ResolveAPIKey error = %v, want credential-store parse failure", err)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Custom-provider 4-tier resolution chain. Pre-2026-05-09 the default
 // branch in ResolveAPIKey only honored env + auth.json — inline
@@ -595,13 +1045,11 @@ func TestResolveAPIKey_CustomFromInline(t *testing.T) {
 // TestResolveAPIKey_CustomAuthBeatsInline — auth.json sits between
 // env and inline in the chain, so a profile with both an inline key
 // AND an auth.json entry should return auth.json. Pins the order
-// since `metis auth login` writes auth.json and is the documented
+// since `metis login` writes auth.json and is the documented
 // preferred path.
 func TestResolveAPIKey_CustomAuthBeatsInline(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("METIS_HOME", home)
-	if err := os.WriteFile(home+"/auth.json",
-		[]byte(`{"deepseek":{"type":"api","key":"from-auth-json"}}`), 0o600); err != nil {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.ActivateAPIKeyBound("deepseek", "from-auth-json", "openai_chat", "https://api.deepseek.com/v1"); err != nil {
 		t.Fatal(err)
 	}
 	cfg := customProfileWithKeys("TEST_METIS_NEVER_SET_x", "from-inline")
@@ -612,6 +1060,110 @@ func TestResolveAPIKey_CustomAuthBeatsInline(t *testing.T) {
 	}
 	if key != "from-auth-json" {
 		t.Errorf("auth.json should beat inline; got %q", key)
+	}
+}
+
+func TestResolveAPIKeyLegacyEmptyTransportUsesAnthropicBinding(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.ActivateAPIKeyBound("legacy-route", "managed-secret", "", "https://legacy.example/v1"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults()
+	cfg.Provider.Custom = map[string]ProviderRaw{
+		"legacy-route": {
+			BaseURL: "https://legacy.example/v1",
+			Model:   "legacy-model",
+		},
+	}
+	key, err := cfg.ResolveAPIKey("legacy-route")
+	if err != nil || key != "managed-secret" {
+		t.Fatalf("legacy empty-transport key = %q, %v", key, err)
+	}
+}
+
+func TestResolveAPIKey_CustomRejectsLegacyUnboundManagedKey(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.Set("deepseek", "legacy-unbound"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := customProfileWithKeys("TEST_METIS_NEVER_SET_x", "unsafe-inline-fallback")
+	key, err := cfg.ResolveAPIKey("deepseek")
+	if key != "" || !errors.Is(err, auth.ErrEndpointBindingRequired) {
+		t.Fatalf("ResolveAPIKey(custom unbound) = %q, %v; want binding-required failure", key, err)
+	}
+}
+
+func TestResolveAPIKey_CustomRejectsBoundKeyAfterEndpointChange(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.ActivateAPIKeyBound("deepseek", "old-endpoint-secret", "openai_chat", "https://old.example/v1"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := customProfileWithKeys("TEST_METIS_NEVER_SET_x", "unsafe-inline-fallback")
+	key, err := cfg.ResolveAPIKey("deepseek")
+	if key != "" || !errors.Is(err, auth.ErrEndpointBindingMismatch) {
+		t.Fatalf("ResolveAPIKey(changed endpoint) = %q, %v; want binding mismatch", key, err)
+	}
+}
+
+func TestResolveAPIKey_CustomRejectsOrphanManagedKey(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.ActivateAPIKeyBound("orphan", "must-not-return", "openai_chat", "https://api.example/v1"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults()
+	key, err := cfg.ResolveAPIKey("orphan")
+	if key != "" || err == nil || !strings.Contains(err.Error(), "unknown provider") {
+		t.Fatalf("ResolveAPIKey(orphan) = %q, %v", key, err)
+	}
+}
+
+func TestResolveAPIKey_BuiltInOfficialAllowsLegacyUnboundButGatewayRequiresBinding(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.Set("openai", "legacy-openai-secret"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults()
+	if key, err := cfg.ResolveAPIKey("openai"); err != nil || key != "legacy-openai-secret" {
+		t.Fatalf("official legacy ResolveAPIKey = %q, %v", key, err)
+	}
+	cfg.Provider.OpenAI.BaseURL = "https://gateway.example/v1"
+	if key, err := cfg.ResolveAPIKey("openai"); key != "" || !errors.Is(err, auth.ErrEndpointBindingRequired) {
+		t.Fatalf("gateway legacy ResolveAPIKey = %q, %v; want binding required", key, err)
+	}
+}
+
+func TestResolveAPIKey_BuiltInGatewayAcceptsOnlyMatchingBoundKey(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.ActivateAPIKeyBound("openai", "gateway-secret", "openai_responses", "https://gateway.example/v1"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults()
+	cfg.Provider.OpenAI.BaseURL = "https://gateway.example/v1/"
+	cfg.Provider.OpenAI.WireProtocol = "responses"
+	if key, err := cfg.ResolveAPIKey("openai"); err != nil || key != "gateway-secret" {
+		t.Fatalf("matching gateway ResolveAPIKey = %q, %v", key, err)
+	}
+	cfg.Provider.OpenAI.WireProtocol = "chat"
+	if key, err := cfg.ResolveAPIKey("openai"); key != "" || !errors.Is(err, auth.ErrEndpointBindingMismatch) {
+		t.Fatalf("changed gateway transport ResolveAPIKey = %q, %v; want binding mismatch", key, err)
+	}
+}
+
+func TestResolveAPIKey_BoundKeyDoesNotDependOnModel(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.ActivateAPIKeyBound("route", "managed-secret", "openai_responses", "https://api.example/v1"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults()
+	cfg.Provider.Custom["route"] = ProviderRaw{Transport: "openai_responses", BaseURL: "https://api.example/v1", Model: "model-a"}
+	if key, err := cfg.ResolveAPIKey("route"); err != nil || key != "managed-secret" {
+		t.Fatalf("model-a ResolveAPIKey = %q, %v", key, err)
+	}
+	raw := cfg.Provider.Custom["route"]
+	raw.Model = "model-b"
+	cfg.Provider.Custom["route"] = raw
+	if key, err := cfg.ResolveAPIKey("route"); err != nil || key != "managed-secret" {
+		t.Fatalf("model-b ResolveAPIKey = %q, %v", key, err)
 	}
 }
 
@@ -655,8 +1207,12 @@ func TestLoad_RewritesLegacyDelphiPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	wantSessions := filepath.Join(metisHome, "sessions")
-	wantSkills := filepath.Join(metisHome, "skills")
+	canonicalMetisHome, err := filepath.EvalSymlinks(metisHome)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", metisHome, err)
+	}
+	wantSessions := filepath.Join(canonicalMetisHome, "sessions")
+	wantSkills := filepath.Join(canonicalMetisHome, "skills")
 	if cfg.Session.Dir != wantSessions {
 		t.Errorf("Session.Dir: want %q, got %q", wantSessions, cfg.Session.Dir)
 	}
@@ -688,7 +1244,11 @@ func TestLoad_RewritesLegacyMetisXDGPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Session.Dir != filepath.Join(metisHome, "sessions") {
+	canonicalMetisHome, err := filepath.EvalSymlinks(metisHome)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", metisHome, err)
+	}
+	if cfg.Session.Dir != filepath.Join(canonicalMetisHome, "sessions") {
 		t.Errorf("Session.Dir: %q", cfg.Session.Dir)
 	}
 }

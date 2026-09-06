@@ -76,7 +76,11 @@ func (m *Model) openExternalEditor() tea.Cmd {
 // user's editor. Running the editor synchronously inside handleSubmit corrupts
 // the alt-screen and used to report success even when the editor failed.
 func (m *Model) openConfigEditor() tea.Cmd {
-	path := filepath.Join(config.Home(), "config.toml")
+	home, err := config.VerifiedHome()
+	if err != nil {
+		return func() tea.Msg { return configEditorDoneMsg{err: fmt.Errorf("verify metis home: %w", err)} }
+	}
+	path := filepath.Join(home, "config.toml")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return func() tea.Msg { return configEditorDoneMsg{err: err} }
 	}

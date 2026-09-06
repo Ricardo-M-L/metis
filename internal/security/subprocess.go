@@ -488,7 +488,7 @@ func isASCIIIdentifierContinue(b byte) bool {
 func credentialNameMayMatch(name []byte) bool {
 	for _, marker := range []string{
 		"api", "token", "secret", "password", "passwd", "private", "credential",
-		"authorization", "bearer", "cookie", "assertion",
+		"authorization", "bearer", "cookie", "assertion", "account",
 	} {
 		if containsASCIIFoldBytes(name, marker) {
 			return true
@@ -504,6 +504,7 @@ func isCredentialFieldNameBytes(name []byte) bool {
 		"subject_token", "assertion", "client_assertion", "secret", "client_secret",
 		"password", "passwd", "private_key", "credential", "credentials",
 		"authorization", "bearer", "cookie", "pat",
+		"chatgpt_account_id",
 		"accesstoken", "refreshtoken", "idtoken", "subjecttoken", "clientsecret",
 		"clientassertion", "privatekey",
 	} {

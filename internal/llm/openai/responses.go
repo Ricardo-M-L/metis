@@ -13,6 +13,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
@@ -36,12 +37,20 @@ import (
 //	response.completed / response.incomplete         → message_delta (stop + usage)
 //	response.failed / error                          → error
 type Responses struct {
-	APIKey      string
-	BaseURL     string
-	Model       string
-	MaxTokens   int
-	Temperature float64
-	StateMode   ResponsesStateMode
+	APIKey  string
+	BaseURL string
+	Model   string
+	// OAuthTokenSource resolves a fresh bearer token and ChatGPT account id
+	// for OpenAI Codex subscription requests. It is invoked for every outbound
+	// HTTP attempt so a long-running provider observes credential refreshes
+	// without being rebuilt. A nil source keeps the existing API-key behavior.
+	OAuthTokenSource func(context.Context) (ResponsesOAuthCredential, error)
+	// ProviderName distinguishes the ChatGPT Codex backend from the public
+	// OpenAI Responses API while retaining the same wire encoder/parser.
+	ProviderName string
+	MaxTokens    int
+	Temperature  float64
+	StateMode    ResponsesStateMode
 	// PromptCacheKey overrides the stable key derived from the non-volatile
 	// system prefix and function schema. It is sent only when the endpoint's
 	// capability profile allows prompt caching.
@@ -51,6 +60,84 @@ type Responses struct {
 	// ContextWindow, when > 0, overrides the default in MaxContextTokens().
 	ContextWindow int
 	httpClient    *http.Client
+}
+
+// ResponsesOAuthCredential contains only the request-time fields needed by
+// the Codex transport. Persistence and refresh metadata stay in internal/auth
+// and are intentionally not copied into the LLM client.
+type ResponsesOAuthCredential struct {
+	AccessToken string
+	AccountID   string
+}
+
+// responsesRedactedError is the provider's public error boundary. Upstream
+// gateways and HTTP transports sometimes echo credentials in response bodies
+// or error strings, so the original error must not escape through Error or
+// Unwrap. Only a small set of secret-free sentinel classifications survives.
+type responsesRedactedError struct {
+	message        string
+	classification error
+}
+
+func (e *responsesRedactedError) Error() string { return e.message }
+func (e *responsesRedactedError) Unwrap() error { return e.classification }
+
+func responsesSafeClassification(err error) error {
+	var safe []error
+	if transport.IsNetworkError(err) {
+		safe = append(safe, transport.ErrNetwork)
+	}
+	for _, candidate := range []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		io.ErrClosedPipe,
+	} {
+		if errors.Is(err, candidate) {
+			safe = append(safe, candidate)
+		}
+	}
+	return errors.Join(safe...)
+}
+
+func redactResponsesError(err error, exactValues ...string) error {
+	if err == nil {
+		return nil
+	}
+	safe := &responsesRedactedError{
+		message:        security.RedactValues(err.Error(), exactValues...),
+		classification: responsesSafeClassification(err),
+	}
+	// Retry exhaustion is itself a control-flow classification used by the
+	// agent loop. Rebuild it around the safe error rather than exposing its
+	// original, potentially credential-bearing cause.
+	var exhausted *transport.RetryExhaustedError
+	if errors.As(err, &exhausted) {
+		return &transport.RetryExhaustedError{Err: safe, Attempts: exhausted.Attempts}
+	}
+	return safe
+}
+
+func responsesUpstreamError(message, code, fallback string, exactValues ...string) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = fallback
+	}
+	message = security.RedactValues(message, exactValues...)
+	code = strings.TrimSpace(security.RedactValues(code, exactValues...))
+	if code != "" {
+		return fmt.Errorf("%s (%s)", message, code)
+	}
+	return errors.New(message)
+}
+
+func responsesHTTPStatusError(statusCode int, raw []byte, exactValues ...string) error {
+	return fmt.Errorf("responses %d: %s", statusCode, transport.Truncate(security.RedactValues(string(raw), exactValues...), 500))
+}
+
+func responsesHTTPBodyReadError(statusCode int, raw []byte, readErr error, exactValues ...string) error {
+	return fmt.Errorf("%s: %w", responsesHTTPStatusError(statusCode, raw, exactValues...), redactResponsesError(readErr, exactValues...))
 }
 
 // NewResponses builds a Responses-API provider. baseURL must NOT include
@@ -69,6 +156,7 @@ func NewResponses(apiKey, baseURL, model string, maxTokens int, timeout time.Dur
 		APIKey:       apiKey,
 		BaseURL:      strings.TrimRight(baseURL, "/"),
 		Model:        model,
+		ProviderName: "openai-responses",
 		MaxTokens:    maxTokens,
 		Temperature:  temperature,
 		StateMode:    ResponsesStateLocal,
@@ -77,7 +165,30 @@ func NewResponses(apiKey, baseURL, model string, maxTokens int, timeout time.Dur
 	}
 }
 
-func (r *Responses) Name() string    { return "openai-responses" }
+// NewCodexResponses builds a Responses client for the ChatGPT Codex backend.
+// This is intentionally a separate provider from the public `openai` API-key
+// route: it uses subscription OAuth, an account header, and a different base
+// URL. The token source is resolved on every request/attempt.
+func NewCodexResponses(model string, maxTokens int, timeout time.Duration, temperature float64, tokenSource func(context.Context) (ResponsesOAuthCredential, error)) *Responses {
+	if strings.TrimSpace(model) == "" {
+		model = "gpt-5.5"
+	}
+	r := NewResponses("", "https://chatgpt.com/backend-api/codex", model, maxTokens, timeout, temperature)
+	r.ProviderName = "openai-codex"
+	r.OAuthTokenSource = tokenSource
+	// Codex requires store=false, but supports encrypted reasoning replay and
+	// image inputs on the Responses wire protocol.
+	r.StateMode = ResponsesStateLocal
+	r.Capabilities = ResponsesCapabilities{EncryptedReasoning: true, PromptCaching: true, Images: true}
+	return r
+}
+
+func (r *Responses) Name() string {
+	if r.ProviderName != "" {
+		return r.ProviderName
+	}
+	return "openai-responses"
+}
 func (r *Responses) ModelID() string { return r.Model }
 
 // VisionCapability combines endpoint-level support with model-level facts.
@@ -152,6 +263,8 @@ type responsesRequest struct {
 	Instructions       string               `json:"instructions,omitempty"`
 	Input              []responsesInputItem `json:"input"`
 	Tools              []responsesTool      `json:"tools,omitempty"`
+	ToolChoice         string               `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool                `json:"parallel_tool_calls,omitempty"`
 	MaxOutputTokens    int                  `json:"max_output_tokens,omitempty"`
 	Temperature        float64              `json:"temperature,omitempty"`
 	Stream             bool                 `json:"stream,omitempty"`
@@ -164,7 +277,8 @@ type responsesRequest struct {
 }
 
 type responsesTextConfig struct {
-	Format responsesTextFormat `json:"format"`
+	Format    *responsesTextFormat `json:"format,omitempty"`
+	Verbosity string               `json:"verbosity,omitempty"`
 }
 
 type responsesTextFormat struct {
@@ -176,7 +290,8 @@ type responsesTextFormat struct {
 }
 
 type responsesReasoning struct {
-	Effort string `json:"effort"`
+	Effort  string `json:"effort"`
+	Summary string `json:"summary,omitempty"`
 }
 
 // buildResponsesRequest flattens metis's Message/ContentBlock history into
@@ -204,11 +319,26 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 	if stateMode == ResponsesStateLocal && r.Capabilities.EncryptedReasoning {
 		out.Include = []string{"reasoning.encrypted_content"}
 	}
+	if r.Name() == "openai-codex" {
+		parallel := true
+		out.Store = false // the ChatGPT Codex endpoint rejects store=true
+		out.ToolChoice = "auto"
+		out.ParallelToolCalls = &parallel
+		out.Text = &responsesTextConfig{Verbosity: "low"}
+	}
 	if req.MaxTokens > 0 {
 		out.MaxOutputTokens = req.MaxTokens
 	}
+	if r.Name() == "openai-codex" {
+		// The ChatGPT Codex route does not accept the public Responses API's
+		// output-token limit. Apply this after per-request overrides as well.
+		out.MaxOutputTokens = 0
+	}
 	if req.Effort != "" {
 		out.Reasoning = &responsesReasoning{Effort: string(req.Effort)}
+		if r.Name() == "openai-codex" {
+			out.Reasoning.Summary = "auto"
+		}
 	}
 	if len(req.SystemSections) > 0 {
 		var sb strings.Builder
@@ -227,10 +357,17 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 		}
 		out.Instructions = sb.String()
 	}
+	if r.Name() == "openai-codex" && strings.TrimSpace(out.Instructions) == "" {
+		out.Instructions = "You are a helpful assistant."
+	}
 	if r.Capabilities.PromptCaching {
-		out.PromptCacheKey = r.PromptCacheKey
-		if out.PromptCacheKey == "" {
-			out.PromptCacheKey = stablePromptCacheKey(r.Model, out.Instructions, req.Tools)
+		if r.Name() == "openai-codex" && strings.TrimSpace(req.SessionID) != "" {
+			out.PromptCacheKey = strings.TrimSpace(req.SessionID)
+		} else {
+			out.PromptCacheKey = r.PromptCacheKey
+			if out.PromptCacheKey == "" {
+				out.PromptCacheKey = stablePromptCacheKey(r.Model, out.Instructions, req.Tools)
+			}
 		}
 	}
 	if req.ResponseFormat != nil && r.Capabilities.StructuredOutputs {
@@ -241,13 +378,16 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 		if len(req.ResponseFormat.JSONSchema) == 0 {
 			return nil, errors.New("responses structured output requires a non-empty JSON schema")
 		}
-		out.Text = &responsesTextConfig{Format: responsesTextFormat{
+		if out.Text == nil {
+			out.Text = &responsesTextConfig{}
+		}
+		out.Text.Format = &responsesTextFormat{
 			Type:        "json_schema",
 			Name:        name,
 			Description: req.ResponseFormat.Description,
 			Schema:      req.ResponseFormat.JSONSchema,
 			Strict:      req.ResponseFormat.Strict,
-		}}
+		}
 	}
 	var messages []provider.Message
 	out.PreviousResponseID, messages = r.previousResponse(req.Messages)
@@ -396,9 +536,48 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 	return out, nil
 }
 
-func (r *Responses) setHeaders(h *http.Request) {
+func (r *Responses) validateAuth() error {
+	if r.OAuthTokenSource != nil || strings.TrimSpace(r.APIKey) != "" {
+		return nil
+	}
+	if r.Name() == "openai-codex" {
+		return errors.New("OpenAI Codex credentials not configured; run `metis login openai-codex`")
+	}
+	return errors.New("OpenAI API key not configured; run `metis login openai` or set OPENAI_API_KEY")
+}
+
+func (r *Responses) setHeaders(ctx context.Context, h *http.Request, stream bool, sessionID string) ([]string, error) {
 	h.Header.Set("Content-Type", "application/json")
-	h.Header.Set("Authorization", "Bearer "+r.APIKey)
+	if r.OAuthTokenSource == nil {
+		if strings.TrimSpace(r.APIKey) == "" {
+			return nil, r.validateAuth()
+		}
+		h.Header.Set("Authorization", "Bearer "+r.APIKey)
+		return []string{r.APIKey}, nil
+	}
+	cred, err := r.OAuthTokenSource(ctx)
+	exactValues := []string{cred.AccessToken, cred.AccountID}
+	if err != nil {
+		return exactValues, fmt.Errorf("resolve OpenAI Codex OAuth credential: %w", err)
+	}
+	if strings.TrimSpace(cred.AccessToken) == "" || strings.TrimSpace(cred.AccountID) == "" {
+		return nil, errors.New("OpenAI Codex OAuth credential is incomplete; run `metis login openai-codex`")
+	}
+	h.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+	h.Header.Set("chatgpt-account-id", cred.AccountID)
+	h.Header.Set("originator", "metis")
+	h.Header.Set("User-Agent", "metis")
+	h.Header.Set("OpenAI-Beta", "responses=experimental")
+	if sessionID = strings.TrimSpace(sessionID); sessionID != "" && r.Name() == "openai-codex" {
+		h.Header.Set("session-id", sessionID)
+		h.Header.Set("x-client-request-id", sessionID)
+	}
+	if stream {
+		h.Header.Set("Accept", "text/event-stream")
+	} else {
+		h.Header.Set("Accept", "application/json")
+	}
+	return exactValues, nil
 }
 
 // ---------- streamed response parsing ----------
@@ -416,6 +595,10 @@ type responsesStream struct {
 	responseID string
 	stateKey   string
 	emitState  bool
+	// exactValues contains only credentials attached to this request. It is
+	// retained for the lifetime of the SSE reader so a late upstream error that
+	// echoes an opaque access token or account id is redacted before exposure.
+	exactValues []string
 	// Function-argument delta events identify the output item (fc_*), while
 	// function_call_output uses the distinct call_id (call_*). Retain the
 	// mapping learned from output_item.added so all provider-neutral events use
@@ -424,7 +607,37 @@ type responsesStream struct {
 	refusalStarted map[string]bool
 }
 
-func (s *responsesStream) Close() error { return s.body.Close() }
+type responsesStreamOutput struct {
+	Type      string `json:"type"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type responsesStreamResponse struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Error  *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	IncompleteDetails *struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
+	Usage *struct {
+		InputTokens        int `json:"input_tokens"`
+		OutputTokens       int `json:"output_tokens"`
+		TotalTokens        int `json:"total_tokens"`
+		InputTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"input_tokens_details"`
+	} `json:"usage"`
+	Output []responsesStreamOutput `json:"output"`
+}
+
+func (s *responsesStream) Close() error {
+	return redactResponsesError(s.body.Close(), s.exactValues...)
+}
 
 func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 	if len(s.pending) > 0 {
@@ -450,7 +663,8 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 				return provider.StreamEvent{Type: "error", Err: io.ErrUnexpectedEOF}, io.ErrUnexpectedEOF
 			}
 			if !errors.Is(err, io.EOF) {
-				return provider.StreamEvent{Type: "error", Err: err}, err
+				safeErr := redactResponsesError(err, s.exactValues...)
+				return provider.StreamEvent{Type: "error", Err: safeErr}, safeErr
 			}
 			return provider.StreamEvent{}, io.EOF
 		}
@@ -472,38 +686,15 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 				Arguments        string `json:"arguments"`
 				EncryptedContent string `json:"encrypted_content"`
 			} `json:"item"`
-			Response *struct {
-				ID     string `json:"id"`
-				Status string `json:"status"`
-				Error  *struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
-				IncompleteDetails *struct {
-					Reason string `json:"reason"`
-				} `json:"incomplete_details"`
-				Usage *struct {
-					InputTokens        int `json:"input_tokens"`
-					OutputTokens       int `json:"output_tokens"`
-					TotalTokens        int `json:"total_tokens"`
-					InputTokensDetails *struct {
-						CachedTokens int `json:"cached_tokens"`
-					} `json:"input_tokens_details"`
-				} `json:"usage"`
-				Output []struct {
-					Type      string `json:"type"`
-					CallID    string `json:"call_id"`
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"output"`
-			} `json:"response"`
-			Error *struct {
+			Response *responsesStreamResponse `json:"response"`
+			Error    *struct {
 				Message string `json:"message"`
 				Code    string `json:"code"`
 			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(frame.Data), &env); err != nil {
-			continue // non-JSON keep-alive line
+			parseErr := errors.New("responses stream contained malformed JSON")
+			return provider.StreamEvent{Type: "error", Err: parseErr}, parseErr
 		}
 		switch env.Type {
 		case "response.created":
@@ -574,81 +765,23 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 				s.pending = append(s.pending, provider.StreamEvent{Type: "thinking_delta", TextDelta: env.Delta})
 			}
 		case "response.completed":
-			ev := provider.StreamEvent{Type: "message_delta", StopReason: "end_turn"}
-			if env.Response != nil {
-				if env.Response.ID != "" {
-					s.responseID = env.Response.ID
-				}
-				if env.Response.Usage != nil {
-					cacheRead := 0
-					if env.Response.Usage.InputTokensDetails != nil {
-						cacheRead = env.Response.Usage.InputTokensDetails.CachedTokens
-					}
-					ev.InputTokens, ev.CacheReadInputTokens = normalizeInputUsage(
-						env.Response.Usage.InputTokens,
-						cacheRead,
-					)
-					ev.OutputTokens = env.Response.Usage.OutputTokens
-				}
-				if hasFunctionCall(env.Response.Output) {
-					ev.StopReason = "tool_use"
-				}
-			}
-			if s.emitState && s.responseID != "" {
-				s.pending = append(s.pending, provider.StreamEvent{Type: "provider_state", ProviderHint: map[string]string{
-					responsesHintResponseID: s.responseID,
-					responsesHintStateKey:   s.stateKey,
-				}})
-			}
-			s.pending = append(s.pending, ev)
-			s.done = true
+			s.enqueueTerminal(env.Response, "completed")
 		case "response.incomplete":
-			ev := provider.StreamEvent{Type: "message_delta", StopReason: "provider_incomplete"}
-			if env.Response != nil {
-				if env.Response.ID != "" {
-					s.responseID = env.Response.ID
-				}
-				if env.Response.IncompleteDetails != nil {
-					ev.StopReason = mapResponsesIncompleteReason(env.Response.IncompleteDetails.Reason)
-				}
-				if env.Response.Usage != nil {
-					cacheRead := 0
-					if env.Response.Usage.InputTokensDetails != nil {
-						cacheRead = env.Response.Usage.InputTokensDetails.CachedTokens
-					}
-					ev.InputTokens, ev.CacheReadInputTokens = normalizeInputUsage(
-						env.Response.Usage.InputTokens,
-						cacheRead,
-					)
-					ev.OutputTokens = env.Response.Usage.OutputTokens
-				}
-			}
-			if s.emitState && s.responseID != "" {
-				s.pending = append(s.pending, provider.StreamEvent{Type: "provider_state", ProviderHint: map[string]string{
-					responsesHintResponseID: s.responseID,
-					responsesHintStateKey:   s.stateKey,
-				}})
-			}
-			s.pending = append(s.pending, ev)
-			s.done = true
+			s.enqueueTerminal(env.Response, "incomplete")
 		case "response.failed":
-			msg := "responses request failed"
-			if env.Response != nil && env.Response.Error != nil {
-				if env.Response.Error.Message != "" {
-					msg = env.Response.Error.Message
-				}
-			}
-			s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New(msg)})
-			s.done = true
+			s.enqueueTerminal(env.Response, "failed")
+		case "response.done":
+			s.enqueueTerminal(env.Response, "")
 		case "error":
 			msg := env.Message
+			code := env.Code
 			if msg == "" && env.Error != nil && env.Error.Message != "" {
 				msg = env.Error.Message
 			}
-			if msg == "" {
-				msg = "responses stream error"
+			if code == "" && env.Error != nil {
+				code = env.Error.Code
 			}
-			s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New(msg)})
+			s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: responsesUpstreamError(msg, code, "responses stream error", s.exactValues...)})
 			s.done = true
 		}
 		if len(s.pending) > 0 {
@@ -659,12 +792,68 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 	}
 }
 
-func hasFunctionCall(output []struct {
-	Type      string `json:"type"`
-	CallID    string `json:"call_id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}) bool {
+func (s *responsesStream) enqueueTerminal(response *responsesStreamResponse, forcedStatus string) {
+	status := forcedStatus
+	if response != nil {
+		if response.ID != "" {
+			s.responseID = response.ID
+		}
+		if response.Status != "" {
+			status = response.Status
+		}
+	}
+	if status == "" {
+		status = "completed"
+	}
+	if status == "failed" || status == "cancelled" {
+		message := "responses request " + status
+		code := ""
+		if response != nil && response.Error != nil && response.Error.Message != "" {
+			message = response.Error.Message
+		}
+		if response != nil && response.Error != nil {
+			code = response.Error.Code
+		}
+		s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: responsesUpstreamError(message, code, "responses request "+status, s.exactValues...)})
+		s.done = true
+		return
+	}
+	if status != "completed" && status != "incomplete" {
+		message := security.RedactValues(fmt.Sprintf("responses request ended with unknown status %q", status), s.exactValues...)
+		s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New(message)})
+		s.done = true
+		return
+	}
+
+	stopReason := "end_turn"
+	if status == "incomplete" {
+		stopReason = "provider_incomplete"
+		if response != nil && response.IncompleteDetails != nil {
+			stopReason = mapResponsesIncompleteReason(response.IncompleteDetails.Reason)
+		}
+	} else if response != nil && hasFunctionCall(response.Output) {
+		stopReason = "tool_use"
+	}
+	event := provider.StreamEvent{Type: "message_delta", StopReason: stopReason}
+	if response != nil && response.Usage != nil {
+		cacheRead := 0
+		if response.Usage.InputTokensDetails != nil {
+			cacheRead = response.Usage.InputTokensDetails.CachedTokens
+		}
+		event.InputTokens, event.CacheReadInputTokens = normalizeInputUsage(response.Usage.InputTokens, cacheRead)
+		event.OutputTokens = response.Usage.OutputTokens
+	}
+	if s.emitState && s.responseID != "" {
+		s.pending = append(s.pending, provider.StreamEvent{Type: "provider_state", ProviderHint: map[string]string{
+			responsesHintResponseID: s.responseID,
+			responsesHintStateKey:   s.stateKey,
+		}})
+	}
+	s.pending = append(s.pending, event)
+	s.done = true
+}
+
+func hasFunctionCall(output []responsesStreamOutput) bool {
 	for _, o := range output {
 		if o.Type == "function_call" {
 			return true
@@ -676,26 +865,32 @@ func hasFunctionCall(output []struct {
 // Stream POSTs a streaming /v1/responses request and returns the event
 // reader. The body stays open until Close().
 func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.StreamReader, error) {
-	if r.APIKey == "" {
-		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY or configure in ~/.metis/config.toml")
+	if err := r.validateAuth(); err != nil {
+		return nil, err
 	}
 	body, err := r.buildResponsesRequest(req)
 	if err != nil {
 		return nil, err
 	}
+	body.Stream = true
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	var resp *http.Response
 	var lastBody string
+	var exactValues []string
 	post := func(payload []byte) error {
 		lastBody = ""
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(payload))
 		if err != nil {
 			return err
 		}
-		r.setHeaders(httpReq)
+		requestValues, headerErr := r.setHeaders(ctx, httpReq, true, req.SessionID)
+		exactValues = append(exactValues, requestValues...)
+		if headerErr != nil {
+			return headerErr
+		}
 		resp, err = r.httpClient.Do(httpReq)
 		if err != nil {
 			return err
@@ -704,10 +899,18 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 			rb, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if readErr != nil {
-				return readErr
+				bodyErr := responsesHTTPBodyReadError(resp.StatusCode, rb, readErr, exactValues...)
+				if transport.IsRetryableStatus(resp.StatusCode) {
+					return &transport.RetryableError{Err: bodyErr, After: transport.ParseRetryAfter(resp)}
+				}
+				return bodyErr
 			}
 			lastBody = string(rb)
-			return fmt.Errorf("responses %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
+			statusErr := responsesHTTPStatusError(resp.StatusCode, rb, exactValues...)
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				return &transport.RetryableError{Err: statusErr, After: transport.ParseRetryAfter(resp)}
+			}
+			return statusErr
 		}
 		return nil
 	}
@@ -725,13 +928,14 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 		err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return post(recoveryBuf) })
 	}
 	if err != nil {
-		return nil, err
+		return nil, redactResponsesError(err, exactValues...)
 	}
 	return &responsesStream{
 		sse:            sse.NewReader(resp.Body),
 		body:           resp.Body,
 		stateKey:       r.stateKey(),
 		emitState:      r.effectiveStateMode() == ResponsesStateProvider,
+		exactValues:    append([]string(nil), exactValues...),
 		toolCallIDs:    make(map[string]string),
 		refusalStarted: make(map[string]bool),
 	}, nil
@@ -754,6 +958,7 @@ type responsesComplete struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
 	Error *struct {
+		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
 }
@@ -782,8 +987,11 @@ type responsesOutputItem struct {
 // the chat/completions Complete, this is the aggregate view for callers
 // that don't consume the stream.
 func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provider.Response, error) {
-	if r.APIKey == "" {
-		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY or configure in ~/.metis/config.toml")
+	if r.Name() == "openai-codex" {
+		return r.completeCodexStream(ctx, req)
+	}
+	if err := r.validateAuth(); err != nil {
+		return nil, err
 	}
 	body, err := r.buildResponsesRequest(req)
 	if err != nil {
@@ -794,23 +1002,51 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 	if err != nil {
 		return nil, err
 	}
+	var exactValues []string
+	var retryAfter time.Duration
 	post := func(payload []byte) ([]byte, int, error) {
+		retryAfter = 0
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(payload))
 		if err != nil {
 			return nil, 0, err
 		}
-		r.setHeaders(httpReq)
+		requestValues, headerErr := r.setHeaders(ctx, httpReq, false, req.SessionID)
+		exactValues = append(exactValues, requestValues...)
+		if headerErr != nil {
+			return nil, 0, headerErr
+		}
 		resp, err := r.httpClient.Do(httpReq)
 		if err != nil {
 			return nil, 0, err
 		}
+		retryAfter = transport.ParseRetryAfter(resp)
 		raw, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		if readErr != nil {
+			bodyErr := responsesHTTPBodyReadError(resp.StatusCode, raw, readErr, exactValues...)
+			if transport.IsRetryableStatus(resp.StatusCode) {
+				bodyErr = &transport.RetryableError{Err: bodyErr, After: retryAfter}
+			}
+			return raw, resp.StatusCode, bodyErr
+		}
 		return raw, resp.StatusCode, readErr
 	}
-	raw, statusCode, err := post(buf)
+	var raw []byte
+	var statusCode int
+	postWithRetry := func(payload []byte) error {
+		var postErr error
+		raw, statusCode, postErr = post(payload)
+		if postErr != nil {
+			return postErr
+		}
+		if statusCode >= 400 && transport.IsRetryableStatus(statusCode) {
+			return &transport.RetryableError{Err: responsesHTTPStatusError(statusCode, raw, exactValues...), After: retryAfter}
+		}
+		return nil
+	}
+	err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return postWithRetry(buf) })
 	if err != nil {
-		return nil, err
+		return nil, redactResponsesError(err, exactValues...)
 	}
 	if statusCode >= 400 && body.PreviousResponseID != "" && isMissingPreviousResponse(string(raw)) {
 		recovery, recoveryErr := r.buildStateRecoveryRequest(req)
@@ -822,20 +1058,23 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 		if recoveryErr != nil {
 			return nil, recoveryErr
 		}
-		raw, statusCode, err = post(recoveryBuf)
+		err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return postWithRetry(recoveryBuf) })
 		if err != nil {
-			return nil, err
+			return nil, redactResponsesError(err, exactValues...)
 		}
 	}
 	if statusCode >= 400 {
-		return nil, fmt.Errorf("responses %d: %s", statusCode, transport.Truncate(string(raw), 500))
+		return nil, responsesHTTPStatusError(statusCode, raw, exactValues...)
 	}
 	var out responsesComplete
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("responses parse: %w", err)
 	}
-	if out.Error != nil && out.Error.Message != "" {
-		return nil, errors.New(out.Error.Message)
+	if out.Error != nil {
+		return nil, responsesUpstreamError(out.Error.Message, out.Error.Code, "responses request failed", exactValues...)
+	}
+	if strings.EqualFold(out.Status, "failed") || strings.EqualFold(out.Status, "cancelled") {
+		return nil, responsesUpstreamError("", "", "responses request "+strings.ToLower(out.Status), exactValues...)
 	}
 	result := &provider.Response{}
 	var textParts []responsesContentPart
@@ -942,6 +1181,121 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 		result.OutputTokens = out.Usage.OutputTokens
 	}
 	return result, nil
+}
+
+func (r *Responses) completeCodexStream(ctx context.Context, req provider.Request) (*provider.Response, error) {
+	stream, err := r.Stream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	result := &provider.Response{}
+	var text, thinking strings.Builder
+	type pendingTool struct {
+		index int
+		args  strings.Builder
+	}
+	tools := make(map[string]*pendingTool)
+	flushText := func() {
+		if text.Len() > 0 {
+			result.Content = append(result.Content, provider.ContentBlock{Type: "text", Text: text.String()})
+			text.Reset()
+		}
+	}
+	flushThinking := func() {
+		if thinking.Len() > 0 {
+			result.Content = append(result.Content, provider.ContentBlock{Type: "thinking", Text: thinking.String()})
+			thinking.Reset()
+		}
+	}
+	finishTool := func(id string, authoritative string) {
+		tool := tools[id]
+		if tool == nil {
+			return
+		}
+		raw := tool.args.String()
+		if len(authoritative) >= len(raw) {
+			raw = authoritative
+		}
+		input := map[string]any{}
+		if raw != "" {
+			if err := json.Unmarshal([]byte(raw), &input); err != nil || input == nil {
+				result.Content[tool.index].ToolInputMalformed = err != nil
+				input = map[string]any{}
+			}
+		}
+		result.Content[tool.index].ToolInput = input
+		delete(tools, id)
+	}
+
+	for {
+		event, recvErr := stream.Recv()
+		eof := errors.Is(recvErr, io.EOF)
+		if recvErr != nil && !eof {
+			return nil, recvErr
+		}
+		switch event.Type {
+		case "text_delta":
+			flushThinking()
+			text.WriteString(event.TextDelta)
+		case "thinking_delta":
+			flushText()
+			thinking.WriteString(event.TextDelta)
+		case "redacted_thinking":
+			flushText()
+			flushThinking()
+			result.Content = append(result.Content, provider.ContentBlock{Type: "redacted_thinking", Data: event.TextDelta, ProviderHint: event.ProviderHint})
+		case "provider_state":
+			flushText()
+			flushThinking()
+			result.Content = append(result.Content, provider.ContentBlock{Type: "provider_state", ProviderHint: event.ProviderHint})
+		case "tool_use_start":
+			flushText()
+			flushThinking()
+			index := len(result.Content)
+			result.Content = append(result.Content, provider.ContentBlock{Type: "tool_use", ToolUseID: event.ToolUseID, ToolName: event.ToolName, ToolInput: map[string]any{}, ProviderHint: event.ProviderHint})
+			tools[event.ToolUseID] = &pendingTool{index: index}
+		case "tool_input_delta":
+			if tool := tools[event.ToolUseID]; tool != nil {
+				tool.args.WriteString(event.InputDelta)
+			}
+		case "tool_use_stop":
+			finishTool(event.ToolUseID, event.InputDelta)
+		case "message_delta", "message_stop":
+			if event.StopReason != "" {
+				result.StopReason = event.StopReason
+			}
+			if event.InputTokens > 0 {
+				result.InputTokens = event.InputTokens
+			}
+			if event.OutputTokens > 0 {
+				result.OutputTokens = event.OutputTokens
+			}
+			if event.CacheCreationInputTokens > 0 {
+				result.CacheCreationInputTokens = event.CacheCreationInputTokens
+			}
+			if event.CacheReadInputTokens > 0 {
+				result.CacheReadInputTokens = event.CacheReadInputTokens
+			}
+		case "error":
+			if event.Err == nil {
+				event.Err = errors.New("responses stream failed")
+			}
+			return nil, event.Err
+		}
+		if eof {
+			flushThinking()
+			flushText()
+			for id := range tools {
+				finishTool(id, "")
+			}
+			if result.StopReason == "" {
+				result.StopReason = "end_turn"
+			}
+			return result, nil
+		}
+	}
 }
 
 func mapResponsesIncompleteReason(reason string) string {

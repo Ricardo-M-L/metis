@@ -135,6 +135,9 @@ stale source build from shadowing native automatic updates.
 ```sh
 metis                         # interactive chat (full bubbletea TUI)
 metis run "<prompt>"          # one-shot, prints reply, exits
+metis login                   # choose a provider and API-key/OAuth sign-in
+metis login openai            # choose ChatGPT browser sign-in or API key
+metis logout openai-codex     # remove stored credentials for a provider
 metis config show             # effective config + which files were read
 metis models [provider] [model] # browse models.dev and print config snippets
 metis sessions list           # recent saved sessions
@@ -150,12 +153,70 @@ metis help                    # complete current command surface
 Run `metis help` for the current top-level command and common-flag overview;
 subcommand-specific help and `metis env` cover the detailed surfaces.
 
+### Provider login
+
+`metis login [provider]` is the canonical credential setup command. With no
+provider it opens an interactive picker; when a provider supports more
+than one method it then asks for API key or subscription OAuth. You can skip
+those choices explicitly. Choose OpenAI, then **Sign in with ChatGPT** to open
+the OpenAI authorization page. After authorization, METIS saves the refreshable
+credential and selects `openai-codex` for subsequent chats; you do not need to
+enter an API key. The API key option continues to use the separate OpenAI
+Platform provider and billing. Model access and usage follow your account's
+available entitlements.
+
+```sh
+metis login anthropic --method api-key
+metis login anthropic --method oauth
+metis login openai                   # select Sign in with ChatGPT
+metis login openai --method oauth    # open browser sign-in directly
+metis login openai --device-code     # headless ChatGPT login
+metis login openai --method api-key  # OpenAI Platform API key
+metis login gemini                    # Google AI Studio API key
+metis login anthropic --method oauth --manual  # SSH/headless code-paste flow
+```
+
+The `metis login openai-codex` spelling remains supported, including its
+browser/device-code picker. After signing in, run `metis` or
+`metis run "Reply with hello"` to use the selected account.
+
+Anthropic subscription OAuth is experimental because Anthropic does not
+publish a compatibility contract for third-party CLIs. METIS uses its truthful
+application identity and does not copy Pi's Claude Code impersonation headers,
+system identity, or tool-name rewriting. Use an Anthropic API key when you need
+a supported production path. Pi also documents third-party harness traffic as
+per-token "extra usage" rather than Claude plan allowance; METIS has not
+independently verified that billing behavior, so check
+`https://claude.ai/settings/usage` before using this path.
+
+API-key input and manual OAuth codes are masked. Stored credentials are never
+printed by `metis auth list`; it reports only the configured provider and
+method. The older `metis auth login` and `metis auth oauth` spellings remain
+available for compatibility.
+
+Managed API keys for custom providers are bound to that provider's transport
+and normalized base URL. Changing either value makes the old key unavailable
+until you run `metis login <provider>` again; this prevents a stale credential
+from being sent to a newly configured endpoint. Model-only changes do not
+require another login.
+
+Provider routing is workspace-trust-sensitive. Until a project has been
+explicitly trusted, its `[provider]` tables are ignored by chat, `run`, login,
+Desktop switching/probing, and TUI provider hot reload; user-level routing
+remains active. `METIS_NO_TRUST_PROMPT=1` suppresses the prompt but does not
+grant that trust. Custom endpoints must use HTTPS, except loopback HTTP
+(`localhost`, `127.0.0.0/8`, or `::1`) for local runtimes such as Ollama.
+
+Before the first upgrade from a legacy release, quit older METIS CLI/Desktop
+processes so they cannot rewrite the retired credential files while the new
+process migrates them into `~/.metis/.credentials/`.
+
 ### Flags
 
 | Flag | What |
 |------|------|
 | `-m, --model <id>` | override model |
-| `-p, --provider <id>` | `anthropic` / `openai` / `gemini` / any custom |
+| `-p, --provider <id>` | `anthropic` / `openai` / `openai-codex` / `gemini` / any custom |
 | `--mode <id>` | permission mode (`default` / `acceptEdits` / `plan` / `dontAsk` / `bypassPermissions` / `fullAccess`) |
 | `--dangerously-skip-permissions` | alias of `--mode bypassPermissions` |
 | `--dangerously-bypass-approvals-and-sandbox` | alias of `--mode fullAccess`; disables approval prompts and the process sandbox |
@@ -283,7 +344,8 @@ Edit `~/.metis/config.toml`. Project-local `./.metis/config.toml` overrides.
 On first run, the interactive setup can also create a custom API-key profile:
 choose its wire protocol, paste either a base URL or a recognized full endpoint,
 then enter the model id and editable API key. The key is stored separately in
-`~/.metis/auth.json`, never in the generated provider block.
+`~/.metis/.credentials/auth.json`, never in the generated provider block.
+Older root-level credential files are migrated automatically on first use.
 
 ```toml
 [provider]
@@ -330,7 +392,7 @@ context_window = 192000
 [provider.custom.deepseek]
 transport   = "openai_chat"
 api_key_env = "DEEPSEEK_API_KEY"        # 1st preference: env var
-# api_key   = "sk-..."                  # 3rd preference: inline (lowest, after auth.json)
+# api_key   = "sk-..."                  # 3rd preference: inline (lowest, after the credential store)
 base_url    = "https://api.deepseek.com/v1"
 model       = "deepseek-chat"
 context_window = 1000000
@@ -348,7 +410,7 @@ hosted_tools = ["web_search"]
 # Auth chain for both built-in (anthropic/openai/gemini) and custom
 # providers — first non-empty wins:
 #   1. env var named in api_key_env
-#   2. ~/.metis/auth.json entry (`metis auth login <name>`)
+#   2. ~/.metis/.credentials/auth.json entry (`metis login <name>`)
 #   3. inline api_key field in this block
 
 # Switch profiles at run time:

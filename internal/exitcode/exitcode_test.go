@@ -13,7 +13,16 @@ import (
 	"os"
 	"syscall"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 )
+
+type testOAuthStatusError struct {
+	status int
+}
+
+func (e *testOAuthStatusError) Error() string        { return "oauth endpoint failed" }
+func (e *testOAuthStatusError) OAuthStatusCode() int { return e.status }
 
 func TestClassify_Nil(t *testing.T) {
 	if got := Classify(nil); got != OK {
@@ -65,6 +74,31 @@ func TestClassify_NetOpError(t *testing.T) {
 	op := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
 	if got := Classify(op); got != Network {
 		t.Errorf("net.OpError = %d, want %d", got, Network)
+	}
+}
+
+func TestClassify_RedactedNetworkMarker(t *testing.T) {
+	wrapper := fmt.Errorf("provider request failed: %w", transport.ErrNetwork)
+	if got := Classify(wrapper); got != Network {
+		t.Errorf("redacted network marker = %d, want %d", got, Network)
+	}
+}
+
+func TestClassify_TypedOAuthStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   int
+	}{
+		{status: 401, want: Auth},
+		{status: 403, want: Auth},
+		{status: 429, want: Quota},
+	} {
+		t.Run(fmt.Sprintf("status_%d", tc.status), func(t *testing.T) {
+			err := fmt.Errorf("login failed: %w", &testOAuthStatusError{status: tc.status})
+			if got := Classify(err); got != tc.want {
+				t.Errorf("OAuth status %d = %d, want %d", tc.status, got, tc.want)
+			}
+		})
 	}
 }
 

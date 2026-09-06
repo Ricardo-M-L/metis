@@ -35,7 +35,12 @@ type AgentLoopOptions struct {
 	// boundary-marker path on the System string.
 	SystemSections []SystemPromptSection
 	Model          string
-	MaxIter        int
+	// MaxOutputTokens is the resolved provider build's output allowance. The
+	// active provider may differ from cfg.Provider.Default because of CLI flags
+	// or a resumed session, so callers should pass ProviderBuild.MaxOutputTokens.
+	// Zero retains the config-based fallback for tests and older SDK callers.
+	MaxOutputTokens int
+	MaxIter         int
 	// MemoryManager is optional. When nil, BuildAgentLoop constructs
 	// one at the canonical user/project repository — keeps
 	// existing call-sites working. main.go now constructs it earlier
@@ -323,7 +328,11 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// `input + max_tokens > context_window` triggers a 4xx server-side.
 	// Without this, max_tokens=64k + context_window=192k threshold=0.85
 	// only triggers at 163k input — but the API rejects at 128k.
-	loop.Compactor.MaxOutputTokens = providerMaxTokens(cfg)
+	maxOutputTokens := opts.MaxOutputTokens
+	if maxOutputTokens <= 0 {
+		maxOutputTokens = providerMaxTokens(cfg)
+	}
+	loop.Compactor.MaxOutputTokens = maxOutputTokens
 
 	// Tier the compactor's per-block thresholds to the active provider's
 	// effective input cap. openclaude's `compressToolHistory.ts` insight:
@@ -334,7 +343,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// (DeepSeek-V2 16k, Ollama defaults) thrash on long sessions.
 	// Apply the tier AFTER MaxOutputTokens is set so the effective cap
 	// is correct.
-	loop.Compactor.ApplyWindowTier(opts.Provider.MaxContextTokens() - providerMaxTokens(cfg))
+	loop.Compactor.ApplyWindowTier(opts.Provider.MaxContextTokens() - maxOutputTokens)
 
 	// Microcompact cache dir (2026-05-15 wire-up). The Compactor.Microcompact
 	// path was implemented + tested but never reachable in production
@@ -446,6 +455,8 @@ func providerMaxTokens(cfg *config.Config) int {
 		return cfg.Provider.Anthropic.MaxTokens
 	case "openai":
 		return cfg.Provider.OpenAI.MaxTokens
+	case "openai-codex":
+		return cfg.Provider.OpenAICodex.MaxTokens
 	case "gemini", "google":
 		return cfg.Provider.Gemini.MaxTokens
 	}

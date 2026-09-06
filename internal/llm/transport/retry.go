@@ -19,6 +19,39 @@ import (
 	"time"
 )
 
+// ErrNetwork is a message-safe classification marker. Provider error
+// boundaries may expose it through errors.Is while deliberately refusing to
+// unwrap a credential-bearing net/url error.
+var ErrNetwork = errors.New("network transport error")
+
+// IsNetworkError recognizes typed transport failures without requiring a
+// caller to retain their potentially sensitive Error strings.
+func IsNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNetwork) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	// Provider SDKs and custom RoundTrippers may expose a private net.Error
+	// without wrapping it in net.OpError. Preserve the historical retry
+	// behaviour for those typed errors while exporting only ErrNetwork across
+	// credential-redaction boundaries.
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 // ParseRetryAfter extracts the HTTP Retry-After header (delta-seconds or an
 // HTTP-date) from a response, returning 0 when absent or unparseable.
 // Providers pass the result into RetryableError.After so RetryWithBackoff
@@ -164,31 +197,8 @@ func shouldRetry(err error) bool {
 	// and a truncated response body as UnexpectedEOF. Both are safe to retry
 	// at this layer because provider request bodies are replayable byte slices
 	// and WebFetch only opts in for idempotent GETs.
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
-		errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) ||
-		errors.Is(err, syscall.EPIPE) {
+	if IsNetworkError(err) {
 		return true
-	}
-	// A resolver's "no such host" can be a momentary local DNS outage (the
-	// user's SenseNova trace recovered on the next lookup). Treat DNS errors as
-	// transient here; attempts/context keep a genuinely bad hostname bounded.
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return true
-	}
-	var ne net.Error
-	if errors.As(err, &ne) {
-		if ne.Timeout() || ne.Temporary() {
-			return true
-		}
-		// Dial/read/write net.OpErrors such as "network is unreachable" and
-		// "connection reset by peer" are transient even when Timeout=false.
-		var opErr *net.OpError
-		if errors.As(err, &opErr) {
-			return true
-		}
 	}
 	msg := strings.ToLower(err.Error())
 	// Permanent quota/balance errors must NOT be retried — they fail

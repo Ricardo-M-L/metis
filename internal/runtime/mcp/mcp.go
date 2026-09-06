@@ -172,7 +172,7 @@ type ServerEntry struct {
 	// Auth selects an authentication strategy for an HTTP server. "oauth"
 	// runs the OAuth 2.0 (PKCE) flow against the server's discovered
 	// endpoints and attaches the resulting Bearer token; the token is
-	// cached + refreshed in ~/.metis/mcp-oauth.json. Empty = use Headers
+	// cached + refreshed in ~/.metis/.credentials/mcp-oauth.json. Empty = use Headers
 	// verbatim (static API key or none).
 	Auth string `toml:"auth,omitempty"`
 	// Env injects extra environment variables into a stdio subprocess

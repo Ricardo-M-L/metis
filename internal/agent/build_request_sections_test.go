@@ -169,6 +169,9 @@ func TestBuildRequest_ReusesStructuredRuntimeSnapshotUntilStateChanges(t *testin
 
 	first := l.buildRequest(nil)
 	second := l.buildRequest(nil)
+	if first.SessionID != "session-a" || second.SessionID != "session-a" {
+		t.Fatalf("request session ids = %q, %q; want session-a", first.SessionID, second.SessionID)
+	}
 	firstState := sectionNamed(t, first.SystemSections, "runtime_state")
 	secondState := sectionNamed(t, second.SystemSections, "runtime_state")
 	if calls != 2 {
@@ -188,7 +191,11 @@ func TestBuildRequest_ReusesStructuredRuntimeSnapshotUntilStateChanges(t *testin
 	}
 
 	state.PermissionMode = "bypassPermissions"
+	state.SessionID = "session-b"
 	third := l.buildRequest(nil)
+	if third.SessionID != "session-b" {
+		t.Fatalf("changed request session id = %q, want session-b", third.SessionID)
+	}
 	thirdState := sectionNamed(t, third.SystemSections, "runtime_state")
 	if l.runtimeStateRevision != 2 {
 		t.Fatalf("changed state revision = %d, want 2", l.runtimeStateRevision)

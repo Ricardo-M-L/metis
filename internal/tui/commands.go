@@ -156,7 +156,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 	r.Register(REPLCommand{Name: "theme", Description: "switch color theme: dark | light | dark-daltonized | nord | solarized-dark", Handler: cmdTheme})
 	r.Register(REPLCommand{Name: "vim", Description: "vim mode: on | off | toggle (modal input — hjkl in NORMAL)", Handler: cmdVim})
 	// /voice hidden from the palette 2026-05-23 — feature requires
-	// an OpenAI API key in ~/.metis/auth.json for Whisper transcription,
+	// an OpenAI API key in ~/.metis/.credentials/auth.json for Whisper transcription,
 	// and most users hit "voice: openai api key required..." on first
 	// use. Code (voice.go + cmdVoice handler) retained so we can re-
 	// enable cleanly once the alternative transcription paths land
@@ -270,7 +270,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 
 	// === Info ===
 	r.Register(REPLCommand{Name: "version", Aliases: []string{"v", "--version"}, Description: "show version", Handler: cmdVersion})
-	r.Register(REPLCommand{Name: "login", Description: "set up provider credentials (delegates to metis auth login)", Handler: cmdLogin})
+	r.Register(REPLCommand{Name: "login", Description: "set up provider credentials (delegates to metis login)", ArgumentHint: "[provider]", Handler: cmdLogin})
 	r.Register(REPLCommand{Name: "logout", Description: "remove a stored provider credential", Handler: cmdLogout})
 	r.Register(REPLCommand{Name: "init", Description: "create a starter CLAUDE.md for this repo (fallback handler)", Handler: cmdInit})
 	r.Register(REPLCommand{Name: "statusline", Description: "show + customize the bottom status line", Handler: cmdStatusLine})
@@ -1664,7 +1664,11 @@ func cmdCompact(r *REPL, args string) string {
 }
 
 func cmdConfig(r *REPL, args string) string {
-	cfgPath := filepath.Join(config.Home(), "config.toml")
+	home, err := config.VerifiedHome()
+	if err != nil {
+		return "config editor failed: " + err.Error()
+	}
+	cfgPath := filepath.Join(home, "config.toml")
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
 		editor = "vi"
@@ -1746,21 +1750,37 @@ func cmdVersion(r *REPL, args string) string {
 func cmdLogin(r *REPL, args string) string {
 	provider := strings.TrimSpace(args)
 	if provider == "" {
-		return "login: keep this chat open and run `metis auth login` in another terminal\n" +
-			"  · the interactive wizard selects a provider and stores its credential in " + auth.Path() + "\n" +
-			"  · browser OAuth: `metis auth oauth <provider>`"
+		return "login: keep this chat open and run `metis login` in another terminal\n" +
+			"  · the interactive wizard selects a provider and sign-in method\n" +
+			"  · API-key and subscription OAuth login are both supported"
 	}
 	return "login: inline provider selection is not supported while chat is active\n" +
-		"  · keep this chat open and run `metis auth login` in another terminal, then choose " + provider + "\n" +
-		"  · for OAuth providers, run `metis auth oauth " + provider + "`"
+		"  · keep this chat open and run `metis login " + provider + "` in another terminal\n" +
+		"  · that command will show the credential methods supported by this provider"
 }
 
 func cmdLogout(r *REPL, args string) string {
 	providers := strings.Fields(args)
-	stored, err := auth.List()
+	apiStored, err := auth.List()
 	if err != nil {
 		return "logout: could not read " + auth.Path() + ": " + err.Error()
 	}
+	oauthStored, err := auth.ListOAuth()
+	if err != nil {
+		return "logout: could not read OAuth credentials: " + err.Error()
+	}
+	storedSet := make(map[string]bool, len(apiStored)+len(oauthStored))
+	for _, provider := range apiStored {
+		storedSet[auth.CanonicalProviderID(provider)] = true
+	}
+	for _, provider := range oauthStored {
+		storedSet[auth.CanonicalProviderID(provider)] = true
+	}
+	stored := make([]string, 0, len(storedSet))
+	for provider := range storedSet {
+		stored = append(stored, provider)
+	}
+	sort.Strings(stored)
 	if len(providers) == 0 {
 		if len(stored) == 0 {
 			return "logout: no stored provider credentials in " + auth.Path()
@@ -1771,19 +1791,30 @@ func cmdLogout(r *REPL, args string) string {
 
 	known := make(map[string]bool, len(stored))
 	for _, provider := range stored {
-		known[provider] = true
+		known[auth.CanonicalProviderID(provider)] = true
 	}
 	removed := make([]string, 0, len(providers))
 	missing := make([]string, 0)
 	for _, provider := range providers {
+		provider = auth.CanonicalProviderID(provider)
 		if !known[provider] {
 			missing = append(missing, provider)
 			continue
 		}
-		if err := auth.Remove(provider); err != nil {
+		if err := auth.RemoveProviderCredentials(provider); err != nil {
 			return "logout: remove " + provider + ": " + err.Error()
 		}
 		removed = append(removed, provider)
+	}
+	activeInvalidated := false
+	if r != nil && r.Loop != nil && containsFoldedProvider(removed, r.providerName) {
+		snapshot := r.Loop.ProviderRuntimeState()
+		r.Loop.RebindProviderRuntime(&loggedOutProvider{
+			name:          strings.ToLower(strings.TrimSpace(r.providerName)),
+			model:         snapshot.Model,
+			contextWindow: snapshot.ContextWindow,
+		}, snapshot.Model, snapshot.MaxOutputTokens, snapshot.System, snapshot.SystemSections)
+		activeInvalidated = true
 	}
 	parts := make([]string, 0, 3)
 	if len(removed) > 0 {
@@ -1792,8 +1823,21 @@ func cmdLogout(r *REPL, args string) string {
 	if len(missing) > 0 {
 		parts = append(parts, "no stored credential for "+strings.Join(missing, ", "))
 	}
-	parts = append(parts, "environment variables are unchanged and may still authenticate the provider")
+	if activeInvalidated {
+		parts = append(parts, "the current session provider was disabled; sign in again, then switch back to it")
+	}
+	parts = append(parts, "environment variables and inline config are unchanged and may still authenticate the provider after a rebuild")
 	return strings.Join(parts, "\n")
+}
+
+func containsFoldedProvider(providers []string, want string) bool {
+	want = auth.CanonicalProviderID(want)
+	for _, provider := range providers {
+		if auth.CanonicalProviderID(provider) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // cmdInit scaffolds a CLAUDE.md in cwd for this project. Cross-tool

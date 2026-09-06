@@ -603,11 +603,24 @@ func (s *TokenStore) refreshStoredToken(ctx context.Context, serverKey, canonica
 		}
 		updated := cloneTokenEntry(entry)
 		updated.Token = refreshed
-		if err := s.PutEntry(serverKey, updated); err != nil {
+		resolved, err := s.compareAndSwapEntry(serverKey, entry, updated)
+		if err != nil {
 			fatalErr = fmt.Errorf("mcp oauth: persist refreshed credential for %q: %w", serverKey, err)
 			return nil
 		}
-		accessToken = refreshed.AccessToken
+		if resolved == nil {
+			reauthErr = errors.New("stored credential disappeared during refresh")
+			return nil
+		}
+		if !resolved.boundTo(canonicalServerURL) {
+			reauthErr = errors.New("stored credential binding changed during refresh")
+			return nil
+		}
+		if strings.TrimSpace(resolved.Token.AccessToken) == "" || resolved.Token.IsExpired() {
+			reauthErr = errors.New("stored credential changed during refresh and is not usable")
+			return nil
+		}
+		accessToken = resolved.Token.AccessToken
 		return nil
 	})
 	if err != nil {

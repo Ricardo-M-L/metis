@@ -46,7 +46,6 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tui"
 	"github.com/Ricardo-M-L/metis/internal/update"
 	"github.com/Ricardo-M-L/metis/internal/version"
-	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
 	pubhook "github.com/Ricardo-M-L/metis/pkg/hook"
 )
 
@@ -104,11 +103,47 @@ func dispatch(ctx context.Context, args []string) error {
 	// a known verb anywhere in args[0..2] and hoist it forward so the
 	// switch dispatches correctly.
 	if idx, found := findEarlySubcommand(args, 16); found {
-		hoisted := make([]string, 0, len(args))
-		hoisted = append(hoisted, args[idx])
-		hoisted = append(hoisted, args[:idx]...)
-		hoisted = append(hoisted, args[idx+1:]...)
-		args = hoisted
+		// `login` has its own `-m` spelling for --manual, while the global
+		// flag prefix uses `-m` for --model. Moving the prefix behind the
+		// verb would silently change `metis -m MODEL login` into a manual
+		// login for a provider named MODEL. Preserve the original boundary:
+		// translate the only meaningful leading global (`--provider`) and
+		// reject every other one before command-specific parsing.
+		if args[idx] == "login" {
+			loginArgs, err := loginArgsWithLeadingGlobals(args[:idx], args[idx+1:])
+			if err != nil {
+				return err
+			}
+			args = append([]string{"login"}, loginArgs...)
+		} else if args[idx] == "logout" {
+			logoutArgs, err := logoutArgsWithLeadingGlobals(args[:idx], args[idx+1:])
+			if err != nil {
+				return err
+			}
+			args = append([]string{"logout"}, logoutArgs...)
+		} else if args[idx] == "auth" && (len(args) == idx+1 || args[idx+1] == "login" || args[idx+1] == "logout") {
+			// Keep the legacy `auth login/logout` aliases equivalent to the
+			// canonical commands when global flags precede the verb. A generic
+			// hoist would produce `auth --provider ... login`, causing cmdAuth to
+			// misread --provider as the auth subcommand.
+			subcommand := "login"
+			commandArgs := []string(nil)
+			if len(args) > idx+1 {
+				subcommand = args[idx+1]
+				commandArgs = args[idx+2:]
+			}
+			translated, err := providerArgsWithLeadingGlobals(subcommand, args[:idx], commandArgs)
+			if err != nil {
+				return err
+			}
+			args = append([]string{"auth", subcommand}, translated...)
+		} else {
+			hoisted := make([]string, 0, len(args))
+			hoisted = append(hoisted, args[idx])
+			hoisted = append(hoisted, args[:idx]...)
+			hoisted = append(hoisted, args[idx+1:]...)
+			args = hoisted
+		}
 	}
 	switch args[0] {
 	case "chat":
@@ -157,6 +192,10 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdCron(ctx, args[1:])
 	case "auth":
 		return cmdAuth(ctx, args[1:])
+	case "login":
+		return cmdAuthLogin(ctx, args[1:])
+	case "logout":
+		return cmdAuthLogout(args[1:])
 	case "plugin", "plugins":
 		return cmdPlugin(ctx, args[1:])
 	case "audit":
@@ -210,48 +249,76 @@ func findEarlySubcommand(args []string, lookahead int) (int, bool) {
 		"models": true, "sessions": true, "artifact": true, "artifacts": true, "stats": true, "skills": true,
 		"acp": true, "daemon": true, "ps": true, "logs": true,
 		"kill": true, "attach": true, "coordinator": true, "cron": true,
-		"auth": true, "plugin": true, "plugins": true, "audit": true,
+		"auth": true, "login": true, "logout": true, "plugin": true, "plugins": true, "audit": true,
 		"desktop": true, "diag": true, "eval": true, "update": true, "version": true,
 		"dirs": true, "projects": true, "help": true,
 	}
 	if lookahead > len(args) {
 		lookahead = len(args)
 	}
-	// args[0] is already handled by the switch; we look at args[1..lookahead).
-	for i := 1; i < lookahead; i++ {
-		if verbs[args[i]] {
-			// Sanity: prior tokens must look like flags or flag values
-			// (no positional arg that would be a prompt fragment).
-			ok := true
-			for j := 0; j < i; j++ {
-				if !looksLikeFlagOrValue(args, j) {
-					ok = false
-					break
+	// Parse only the leading global-flag prefix. Knowing which flags consume a
+	// value matters: a perfectly valid model/provider id may itself be a verb
+	// (for example `--model login run ...`) and must not be hoisted.
+	for i := 0; i < lookahead; i++ {
+		tok := args[i]
+		if i == 0 && verbs[tok] {
+			return 0, false // already handled by dispatch's switch
+		}
+		if strings.HasPrefix(tok, "-") {
+			if tok == "--" {
+				return 0, false
+			}
+			name := tok
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				name = name[:eq]
+				if earlyGlobalFlagTakesValue(name) {
+					continue
 				}
 			}
-			if ok {
-				return i, true
+			if earlyGlobalFlagTakesValue(name) {
+				i++ // the next token is data, even when it spells a verb
+				continue
 			}
+			if earlyGlobalBoolFlag(name) {
+				continue
+			}
+			// Unknown arity: do not guess across it and risk turning user data
+			// into a command. The regular flag parser will report it later.
+			return 0, false
 		}
+		if verbs[tok] {
+			return i, true
+		}
+		// A positional token before a verb is prompt data, not a global flag.
+		return 0, false
 	}
 	return 0, false
 }
 
-// looksLikeFlagOrValue reports whether args[j] is plausibly a flag
-// or the value of a flag (i.e., not the start of a prompt fragment).
-// "-p" / "--mode" / "minimax" (when preceded by "-p") qualify; bare
-// strings like "explain this code" do not.
-func looksLikeFlagOrValue(args []string, j int) bool {
-	tok := args[j]
-	if strings.HasPrefix(tok, "-") {
+func earlyGlobalFlagTakesValue(name string) bool {
+	switch name {
+	case "-m", "--model", "-p", "--provider", "--mode",
+		"--max-iter", "--max-budget-usd", "--system", "-r", "--resume",
+		"--session-id", "--effort", "--add-dir", "--agent", "--worktree",
+		"-s", "--scope", "--input-format", "--output-format", "--output-schema",
+		"--name", "--cache-ttl", "--tools", "--disallow-tools", "--metrics-log":
 		return true
-	}
-	// Value of a flag — previous token must be a flag.
-	if j == 0 {
+	default:
 		return false
 	}
-	prev := args[j-1]
-	return strings.HasPrefix(prev, "-")
+}
+
+func earlyGlobalBoolFlag(name string) bool {
+	switch name {
+	case "--no-markdown", "--no-stream", "--streamlined", "-c", "--continue",
+		"--tui", "--no-auth-wizard", "--fast", "-W", "-d", "--debug", "--bare",
+		"--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox",
+		"--coordinator", "--agent-teams", "--tmux", "--auto-memory", "--cache",
+		"--prompt-dump", "--simple":
+		return true
+	default:
+		return false
+	}
 }
 
 // hasInteractiveIntentFlag reports whether args contain any of the
@@ -314,7 +381,9 @@ Usage:
   metis ps|logs|kill|attach      Inspect and control managed processes
   metis coordinator <dispatch|worker>  Use the filesystem coordinator MVP
   metis cron <list|add|rm|pause|resume|run|start|audit>  Manage scheduled prompts
-  metis auth <login|logout|list|oauth|keys>  Manage provider credentials
+  metis login [provider] [--method api-key|oauth]  Sign in to an LLM provider
+  metis logout <provider> [provider...]             Remove stored provider credentials
+  metis auth <login|logout|list|oauth|keys>  Manage credentials (legacy login alias supported)
   metis plugin <marketplace|search|install|list|info|remove>  Manage plugins
   metis audit           Print a security audit of the current configuration
   metis diag [--llm] [--tool-smoke] [--json]  Run a non-interactive health check
@@ -326,7 +395,7 @@ Usage:
 
 Flags (chat / run):
   -m, --model <id>      Override model
-  -p, --provider <id>   Override provider (anthropic | openai | gemini | <custom>)
+  -p, --provider <id>   Override provider (anthropic | openai | openai-codex | gemini | <custom>)
       --mode <id>       Permission mode: default | acceptEdits | plan | dontAsk | bypassPermissions | fullAccess
       --dangerously-bypass-approvals-and-sandbox
                         Run without approval prompts or process sandboxing
@@ -374,6 +443,7 @@ type runtime struct {
 	showTok               bool
 	model                 string
 	providerName          string          // resolved provider profile name (cfg.Provider.Default OR --provider). Threaded to the TUI so mid-session /model switches know which profile to rebuild against.
+	providerConfigTrusted bool            // startup workspace trust decision reused by TUI provider hot reloads
 	systemPromptKind      string          // generated default vs opaque custom/legacy prompt provenance
 	defaultPermissionMode permission.Mode // invocation-resolved baseline for in-process /new and /branch
 	// allowStoredSessionPermissions is true only when [session].dir came from a
@@ -1085,6 +1155,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		return nil, err
 	}
 	projectTrusted := currentWorkspaceTrusted()
+	if err := config.ApplyProviderPolicyForWorkspace(cfg, projectTrusted); err != nil {
+		return nil, fmt.Errorf("apply provider trust policy: %w", err)
+	}
 	trustedPermissionMode, err := config.LoadPermissionModeForWorkspace(projectTrusted)
 	if err != nil {
 		return nil, err
@@ -1267,13 +1340,17 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// baseline so the brand-new provider profile is not immediately reported
 	// as an external mid-session edit.
 	cfg, provName, err = rtpkg.EnsureAPIKey(cfg, provName, rtpkg.AuthGateOptions{
-		NoWizard:  disableAuthWizard(flags.noAuthWizard, canonicalMode) || startupRequiresCredentialIsolation,
-		IsTTY:     authGateIsTTY,
-		RunWizard: authGateRunWizard,
-		Stderr:    os.Stderr,
+		NoWizard:       disableAuthWizard(flags.noAuthWizard, canonicalMode) || startupRequiresCredentialIsolation,
+		IsTTY:          authGateIsTTY,
+		RunWizard:      authGateRunWizard,
+		Stderr:         os.Stderr,
+		ProjectTrusted: projectTrusted,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if err := config.ApplyProviderPolicyForWorkspace(cfg, projectTrusted); err != nil {
+		return nil, fmt.Errorf("apply provider trust policy after auth setup: %w", err)
 	}
 	authReloadedConfig := cfg != cfgBeforeAuth
 	_, wizardConfiguredCustom := cfg.Provider.Custom[provName]
@@ -1283,7 +1360,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Refresh the staleness baseline only for the latter: unrelated edits that
 	// happen during a normal startup must remain visible as config drift rather
 	// than being silently incorporated halfway through setup.
-	cfg, snap, err = refreshConfigSnapshotAfterAuth(cfg, snap, authReloadedConfig)
+	cfg, snap, err = refreshConfigSnapshotAfterAuth(cfg, snap, authReloadedConfig, projectTrusted)
 	if err != nil {
 		return nil, err
 	}
@@ -1741,7 +1818,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	loop := rtpkg.BuildAgentLoop(cfg, rtpkg.AgentLoopOptions{
 		Provider: prov, Registry: reg, Gate: gate,
 		System: system, SystemSections: systemSections,
-		Model: model, MaxIter: maxIter,
+		Model: model, MaxOutputTokens: pbuild.MaxOutputTokens, MaxIter: maxIter,
 		MemoryManager:         memoryMgr,
 		MemoryManagerProvided: true,
 		Jobs:                  jobsPool,
@@ -1844,6 +1921,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		cfg: cfg, provider: prov, registry: reg, gate: gate, store: store,
 		loop: loop, cronSvc: cronSvc, useMD: cfg.UI.Markdown && !flags.noMarkdown,
 		showTok: cfg.UI.ShowTokens, model: model, providerName: provName,
+		providerConfigTrusted:         projectTrusted,
 		defaultPermissionMode:         freshPermissionMode,
 		allowStoredSessionPermissions: allowStoredSessionPermissions,
 		systemPromptKind:              promptKind,
@@ -2172,33 +2250,18 @@ func cmdChat(ctx context.Context, args []string) error {
 		return err
 	}
 	flags.autoMemoryStartup = autoMemoryStartupInteractive
-	// Trust-this-folder safety check — claude-code's first-run dance.
-	// Skipped when stdin isn't a terminal (CI, expect-scripted) or
-	// when METIS_NO_TRUST_PROMPT=1. Persists answer to
-	// ~/.metis/trusted-dirs.json so it asks once per directory.
+	var confirmTrust func() error
 	if term.IsTerminal(int(os.Stdin.Fd())) {
-		if err := ensureTrusted(); err != nil {
-			return err
-		}
+		confirmTrust = ensureTrusted
+	}
+	worktreeInfo, err := prepareChatWorkspace(flags, confirmTrust)
+	if err != nil {
+		return err
+	}
+	if confirmTrust != nil {
 		if notice := maybeAutoUpdate(ctx); notice != "" {
 			tui.SetPendingUpdateNotice(notice)
 		}
-	}
-
-	// --worktree: spawn a git worktree first so config/CLAUDE.md/etc.
-	// load from the new cwd. The worktree info is stashed in a closure
-	// for cleanup at the end of cmdChat.
-	var worktreeInfo *worktreepkg.Info
-	if flags.worktree != "" || flags.worktreeOn {
-		info, err := worktreepkg.Spawn(flags.worktree)
-		if err != nil {
-			return err
-		}
-		if err := os.Chdir(info.Path); err != nil {
-			return fmt.Errorf("chdir to worktree %s: %w", info.Path, err)
-		}
-		worktreeInfo = info
-		fmt.Fprintf(os.Stderr, "(worktree: %s on branch %s)\n", info.Path, info.Branch)
 	}
 
 	rt, err := setupRuntime(ctx, flags)
@@ -2265,6 +2328,16 @@ func cmdChat(ctx context.Context, args []string) error {
 	}
 
 	if useTUI {
+		providerConfigLoader := func() (*config.Config, error) {
+			fresh, _, loadErr := config.Load()
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			if policyErr := config.ApplyProviderPolicyForWorkspace(fresh, rt.providerConfigTrusted); policyErr != nil {
+				return nil, policyErr
+			}
+			return fresh, nil
+		}
 		hooks := tui.ExternalHooks{
 			DirAdd:                  rt.allowedDirs.Add,
 			DirRemove:               rt.allowedDirs.Remove,
@@ -2275,6 +2348,7 @@ func cmdChat(ctx context.Context, args []string) error {
 			SessionSwitch:           rt.rebindSession,
 			SessionBoundary:         rt.releaseSessionWork,
 			Sandbox:                 rt.sandbox,
+			ProviderConfigLoader:    providerConfigLoader,
 			BeginMCPLaunch:          beginExplicitMCP,
 			ReloadCatalog: func() (string, error) {
 				skillCount := 0
@@ -4903,13 +4977,16 @@ func wizardAdapter() (*rtpkg.WizardResult, error) {
 	return &rtpkg.WizardResult{Provider: res.Provider, Key: res.Key}, nil
 }
 
-func refreshConfigSnapshotAfterAuth(cfg *config.Config, snap *config.Snapshot, authReloadedConfig bool) (*config.Config, *config.Snapshot, error) {
+func refreshConfigSnapshotAfterAuth(cfg *config.Config, snap *config.Snapshot, authReloadedConfig, projectTrusted bool) (*config.Config, *config.Snapshot, error) {
 	if !authReloadedConfig {
 		return cfg, snap, nil
 	}
 	reloaded, _, fresh, err := config.LoadWithSnapshot()
 	if err != nil {
 		return nil, nil, fmt.Errorf("reload config snapshot after auth setup: %w", err)
+	}
+	if err := config.ApplyProviderPolicyForWorkspace(reloaded, projectTrusted); err != nil {
+		return nil, nil, fmt.Errorf("apply provider trust policy after auth setup: %w", err)
 	}
 	return reloaded, fresh, nil
 }

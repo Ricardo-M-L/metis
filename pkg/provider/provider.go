@@ -81,10 +81,11 @@ type ContentBlock struct {
 
 	// ProviderHint carries opaque provider-specific blobs that must
 	// round-trip across requests. Gemini-3.5+ uses
-	// `gemini.thought_signature` — emitted by the model on parts
-	// containing a function_call and required to be echoed back on
-	// the corresponding history entry, else gemini rejects the next
-	// turn. Other providers ignore unknown keys.
+	// `gemini.thought_signature` on function calls; Anthropic uses
+	// `anthropic.thinking_signature` on extended-thinking blocks.
+	// Both must be echoed on the corresponding history entry or the
+	// provider may reject the next tool-use turn. Other providers
+	// ignore unknown keys.
 	ProviderHint map[string]string `json:"provider_hint,omitempty"`
 
 	// Synthetic marks a text block the loop injected (repeat-tool
@@ -151,6 +152,11 @@ type Request struct {
 	System   string
 	Messages []Message
 	Tools    []ToolSpec
+	// SessionID is the stable Metis conversation identity. Providers may use
+	// it for upstream session affinity and prompt-cache routing; it must never
+	// be synthesized per request. Providers that do not define such a wire
+	// contract ignore it.
+	SessionID string
 	// SystemSections is the typed-section form of System. When non-nil,
 	// providers that support per-section caching (Anthropic) prefer
 	// this over System and emit cache_control independently per
@@ -188,7 +194,8 @@ type SystemSection struct {
 }
 
 // StreamEvent is one chunk emitted while streaming a response.
-// Type is one of: "text_delta", "tool_use_start", "tool_input_delta",
+// Type is one of: "text_delta", "thinking_delta", "thinking_signature",
+// "redacted_thinking", "tool_use_start", "tool_input_delta",
 // "tool_use_stop", "message_stop", "error".
 //
 // InputTokens / CacheCreationInputTokens / CacheReadInputTokens are disjoint
@@ -211,8 +218,9 @@ type StreamEvent struct {
 	// ProviderHint propagates opaque provider-specific blobs from a
 	// streaming response back to ContentBlock.ProviderHint via the
 	// stream consumer (see internal/agent/loop.go::consumeStream).
-	// Currently used for gemini-3.5+ `thoughtSignature` on
-	// tool_use_start events. Other providers ignore it.
+	// Used for Gemini `thoughtSignature` on tool_use_start and Anthropic
+	// extended-thinking signatures on thinking_signature events. Other
+	// providers ignore it.
 	ProviderHint map[string]string
 }
 

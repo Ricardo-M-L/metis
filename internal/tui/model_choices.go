@@ -38,6 +38,7 @@ var builtinModelChoices = []screen.ModelChoice{
 	// OpenAI.
 	{ID: "gpt-4o", Description: "OpenAI flagship, multimodal", Provider: "openai"},
 	{ID: "gpt-4o-mini", Description: "cheap OpenAI, good for simple tasks", Provider: "openai"},
+	{ID: "gpt-5.5", Description: "ChatGPT subscription Codex", Provider: "openai-codex"},
 }
 
 // configuredModelChoices returns the concrete provider/model pairs present in
@@ -67,6 +68,7 @@ func configuredModelChoices(cfg *config.Config) []screen.ModelChoice {
 
 	add("anthropic", cfg.Provider.Anthropic.Model, "anthropic_messages")
 	add("openai", cfg.Provider.OpenAI.Model, "openai_chat")
+	add("openai-codex", cfg.Provider.OpenAICodex.Model, "openai_codex_responses")
 	add("gemini", cfg.Provider.Gemini.Model, "gemini_native")
 
 	ids := make([]string, 0, len(cfg.Provider.Custom))
@@ -125,6 +127,8 @@ func modelChoiceVisionCapability(cfg *config.Config, c screen.ModelChoice) pubpr
 		transport = "anthropic_messages"
 	case "openai":
 		transport = "openai_chat"
+	case "openai-codex":
+		transport = "openai_codex_responses"
 	case "gemini", "google":
 		// The native Gemini adapter does not encode image content blocks yet.
 		return pubprovider.VisionUnsupported
@@ -151,7 +155,7 @@ func modelChoiceVisionCapability(cfg *config.Config, c screen.ModelChoice) pubpr
 	}
 
 	switch transport {
-	case "openai_chat", "azure_openai":
+	case "openai_chat", "openai_responses", "openai_codex_responses", "azure_openai":
 		return openai.VisionCapabilityForModel(c.ID)
 	case "anthropic_messages", "bedrock_anthropic", "vertex_anthropic":
 		return anthropic.VisionCapabilityForModel(c.ID)
@@ -214,7 +218,13 @@ func (m *Model) modelPickerChoices(requireVision bool) []screen.ModelChoice {
 // provider's responsibility when the next request is sent.
 func defaultProviderConfigLoader() (*config.Config, error) {
 	cfg, _, err := config.Load()
-	return cfg, err
+	if err != nil {
+		return nil, err
+	}
+	if err := config.ApplyProviderPolicyForWorkspace(cfg, false); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func (m *Model) reloadProviderProfiles() error {
@@ -341,7 +351,7 @@ func splitConfiguredProviderModel(cfg *config.Config, input string) (providerNam
 	if !ok || providerName == "" || model == "" || cfg == nil {
 		return "", input
 	}
-	if providerName == "anthropic" || providerName == "openai" || providerName == "gemini" || providerName == "google" {
+	if providerName == "anthropic" || providerName == "openai" || providerName == "openai-codex" || providerName == "gemini" || providerName == "google" {
 		return providerName, model
 	}
 	if _, ok := cfg.Provider.Custom[providerName]; ok {

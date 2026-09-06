@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/auth"
 )
 
 const (
@@ -40,6 +43,9 @@ type tokenStoreFileLock struct {
 // a stable sidecar file: locking mcp-oauth.json itself would be incorrect
 // because atomic replacement changes that file's inode.
 func withTokenStoreLock(storePath string, timeout time.Duration, fn func() error) (err error) {
+	if strings.TrimSpace(storePath) == "" {
+		return errors.New("MCP OAuth credential directory is unavailable")
+	}
 	tokenStoreMu.Lock()
 	defer tokenStoreMu.Unlock()
 
@@ -56,17 +62,18 @@ func withTokenStoreLock(storePath string, timeout time.Duration, fn func() error
 			err = errors.Join(err, fmt.Errorf("release MCP OAuth token-store lock: %w", releaseErr))
 		}
 	}()
+	if err := ensurePrivateTokenStoreDir(dir); err != nil {
+		return err
+	}
 	return fn()
 }
 
 func ensurePrivateTokenStoreDir(dir string) error {
 	info, err := os.Lstat(dir)
-	created := false
 	if os.IsNotExist(err) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create MCP OAuth token-store directory: %w", err)
 		}
-		created = true
 		info, err = os.Lstat(dir)
 	}
 	if err != nil {
@@ -78,11 +85,16 @@ func ensurePrivateTokenStoreDir(dir string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("MCP OAuth token-store parent %q is not a directory", dir)
 	}
-	// METIS_HOME can deliberately point at a project/shared directory. Do not
-	// silently chmod an existing user-selected root. New roots are private by
-	// construction; credential and lock files receive their own 0600/current-
-	// SID protection regardless of the parent directory's visibility.
-	if created {
+	// The fixed .credentials directory is always a private boundary even when
+	// METIS_HOME itself intentionally points at a shared/project directory.
+	// Preserve the old behavior for tests/embedders that explicitly construct a
+	// TokenStore at another path.
+	if filepath.Base(dir) == auth.CredentialDirectoryName {
+		if canonical := auth.CredentialDirectory(); canonical != "" && filepath.Clean(canonical) == filepath.Clean(dir) {
+			if _, err := auth.EnsureCredentialDirectory(); err != nil {
+				return fmt.Errorf("pin MCP OAuth credential-store directory: %w", err)
+			}
+		}
 		if err := secureTokenStoreDirectory(dir); err != nil {
 			return fmt.Errorf("set MCP OAuth token-store directory permissions to 0700: %w", err)
 		}
@@ -145,6 +157,9 @@ func withTokenRefreshLease(ctx context.Context, storePath, serverKey string, fn 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if strings.TrimSpace(storePath) == "" {
+		return errors.New("MCP OAuth credential directory is unavailable")
+	}
 	processKey := storePath + "\x00" + serverKey
 	releaseProcess, err := acquireTokenRefreshProcessLock(ctx, processKey)
 	if err != nil {
@@ -167,6 +182,9 @@ func withTokenRefreshLease(ctx context.Context, storePath, serverKey string, fn 
 			err = errors.Join(err, fmt.Errorf("release MCP OAuth refresh lease: %w", releaseErr))
 		}
 	}()
+	if err := ensurePrivateTokenStoreDir(dir); err != nil {
+		return err
+	}
 	return fn()
 }
 

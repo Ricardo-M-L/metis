@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -86,19 +87,19 @@ func cmdUltraplan(r *REPL, args string) string {
 }
 
 // cmdOnboarding gives a structured first-run recap. claude-code has a
-// genuine setup wizard; metis has `metis auth login`, `metis config
+// genuine setup wizard; metis has `metis login`, `metis config
 // init`, etc. — this command stitches them into one bordered cheat
 // sheet so a new user knows where to start.
 func cmdOnboarding(r *REPL, args string) string {
 	cfgPath := filepath.Join(config.Home(), "config.toml")
-	authPath := filepath.Join(config.Home(), "auth.json")
+	authPath := auth.Path()
 	cwdPart := "/Users/<you>/<project>"
 	if cwd := getCwd(); cwd != "" {
 		cwdPart = cwd
 	}
 	rows := []infoRow{
-		{Key: "1. credentials", Value: "metis auth login [provider]"},
-		{Key: "", Value: "  stores key under " + authPath},
+		{Key: "1. credentials", Value: "metis login [provider]"},
+		{Key: "", Value: "  stores API keys under " + authPath + "; OAuth tokens separately"},
 		{Key: "", Value: ""},
 		{Key: "2. project doc", Value: "/init   (this chat)"},
 		{Key: "", Value: "  analyzes the repository and creates or improves CLAUDE.md"},

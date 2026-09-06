@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLinuxStdioMCPDesktopIPCProfiles(t *testing.T) {
@@ -119,6 +120,38 @@ func TestLinuxBubblewrapArgv(t *testing.T) {
 	}
 }
 
+func TestLinuxWrapPrecreatesAndMasksPrivateCredentialDirectories(t *testing.T) {
+	installFakeBubblewrap(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	custom := filepath.Join(t.TempDir(), "custom-metis")
+	manager, err := NewManagerWithOptions(Options{
+		Mode: string(ModePermissions), TempRoot: t.TempDir(), MetisHome: custom,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	wrapped, err := manager.Wrap(exec.Command("/bin/true"), Request{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := linuxEmptyDir(platformRequest{tempDir: manager.TempDir()})
+	for _, root := range []string{custom, filepath.Join(home, ".metis")} {
+		dir := filepath.Join(root, metisCredentialDirectoryName)
+		info, err := os.Lstat(dir)
+		if err != nil {
+			t.Fatalf("credential mask target %q: %v", dir, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+			t.Fatalf("credential mask target %q mode = %v", dir, info.Mode())
+		}
+		if !containsArgSequence(wrapped.Args, []string{"--ro-bind", empty, dir}) {
+			t.Errorf("bubblewrap argv does not mask credential directory %q: %v", dir, wrapped.Args)
+		}
+	}
+}
+
 func TestLinuxBubblewrapReprotectsControlFiles(t *testing.T) {
 	cwd := t.TempDir()
 	home := t.TempDir()
@@ -126,6 +159,10 @@ func TestLinuxBubblewrapReprotectsControlFiles(t *testing.T) {
 		filepath.Join(cwd, ".git", "config"),
 		filepath.Join(cwd, ".git", "hooks", "pre-commit"),
 		filepath.Join(home, ".metis", "auth.json"),
+		filepath.Join(home, ".metis", "llm-oauth.json"),
+		filepath.Join(home, ".metis", ".llm-oauth.lock"),
+		filepath.Join(home, ".metis", ".llm-oauth-refresh-fixture.lock"),
+		filepath.Join(home, ".metis", ".llm-oauth-fixture.tmp"),
 		filepath.Join(home, ".metis", "mcp.toml"),
 		filepath.Join(home, ".metis", "config.local.toml"),
 		filepath.Join(home, ".ssh", "id_ed25519"),
@@ -136,6 +173,9 @@ func TestLinuxBubblewrapReprotectsControlFiles(t *testing.T) {
 		filepath.Join(cwd, ".mcp.json"),
 		filepath.Join(cwd, ".vscode", "settings.json"),
 		filepath.Join(home, ".zshrc"),
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".metis", metisCredentialDirectoryName), 0o700); err != nil {
+		t.Fatal(err)
 	}
 	for _, path := range paths {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -152,6 +192,11 @@ func TestLinuxBubblewrapReprotectsControlFiles(t *testing.T) {
 		{"--ro-bind", filepath.Join(cwd, ".git", "hooks"), filepath.Join(cwd, ".git", "hooks")},
 		{"--ro-bind", filepath.Join(home, ".metis"), filepath.Join(home, ".metis")},
 		{"--ro-bind", "/dev/null", filepath.Join(home, ".metis", "auth.json")},
+		{"--ro-bind", filepath.Join(req.tempDir, ".empty-credentials"), filepath.Join(home, ".metis", metisCredentialDirectoryName)},
+		{"--ro-bind", "/dev/null", filepath.Join(home, ".metis", "llm-oauth.json")},
+		{"--ro-bind", "/dev/null", filepath.Join(home, ".metis", ".llm-oauth.lock")},
+		{"--ro-bind", "/dev/null", filepath.Join(home, ".metis", ".llm-oauth-refresh-fixture.lock")},
+		{"--ro-bind", "/dev/null", filepath.Join(home, ".metis", ".llm-oauth-fixture.tmp")},
 		{"--ro-bind", "/dev/null", filepath.Join(home, ".metis", "mcp.toml")},
 		{"--ro-bind", "/dev/null", filepath.Join(home, ".metis", "config.local.toml")},
 		{"--ro-bind", "/dev/null", filepath.Join(home, ".netrc")},
@@ -165,6 +210,31 @@ func TestLinuxBubblewrapReprotectsControlFiles(t *testing.T) {
 	} {
 		if !containsArgSequence(args, sequence) {
 			t.Fatalf("bubblewrap argv missing %v: %v", sequence, args)
+		}
+	}
+}
+
+func TestLinuxProtectedReadFilesIncludeCustomLLMOAuthStoreAndSidecars(t *testing.T) {
+	home := t.TempDir()
+	custom := filepath.Join(t.TempDir(), "custom-metis")
+	if err := os.MkdirAll(custom, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wants := []string{
+		filepath.Join(custom, "llm-oauth.json"),
+		filepath.Join(custom, ".llm-oauth.lock"),
+		filepath.Join(custom, ".llm-oauth-refresh-fixture.lock"),
+		filepath.Join(custom, ".llm-oauth-fixture.tmp"),
+	}
+	for _, path := range wants {
+		if err := os.WriteFile(path, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := linuxProtectedReadFiles(platformRequest{home: home, metisHome: custom})
+	for _, want := range wants {
+		if !containsString(got, want) {
+			t.Errorf("protected read files omitted custom OAuth path %q: %v", want, got)
 		}
 	}
 }
@@ -218,14 +288,14 @@ func TestLinuxStdioMCPProfileMasksMetisRootAndRestoresOnlyNestedCwd(t *testing.T
 	if restoreIndex <= maskIndex {
 		t.Fatalf("plugin cwd was not rebound after Metis root mask: mask=%d restore=%d argv=%v", maskIndex, restoreIndex, wrapper.Args)
 	}
-	for _, name := range []string{"auth.json", "mcp-oauth.json"} {
+	for _, name := range []string{"auth.json", "llm-oauth.json", ".llm-oauth.lock", "mcp-oauth.json"} {
 		if _, err := os.Lstat(filepath.Join(metisHome, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("sandbox materialized credential leaf %s: %v", name, err)
 		}
 	}
 }
 
-func TestLinuxStdioMCPProfileNeverRestoresWholeMetisRoot(t *testing.T) {
+func TestLinuxStdioMCPProfileRejectsCwdEqualToMetisRoot(t *testing.T) {
 	installFakeBubblewrap(t)
 	metisHome := filepath.Join(t.TempDir(), "custom-metis")
 	if err := os.MkdirAll(metisHome, 0o700); err != nil {
@@ -243,25 +313,9 @@ func TestLinuxStdioMCPProfileNeverRestoresWholeMetisRoot(t *testing.T) {
 
 	cmd := exec.Command("/bin/true")
 	cmd.Env = []string{linuxSandboxProfileEnvKey + "=" + linuxStdioMCPSandboxProfile}
-	wrapper, err := manager.Wrap(cmd, Request{Cwd: metisHome, MinimumMode: ModePermissions})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	maskIndex := -1
-	for i := 0; i+2 < len(wrapper.Args); i++ {
-		if wrapper.Args[i] == "--ro-bind" && wrapper.Args[i+2] == metisHome && strings.HasPrefix(wrapper.Args[i+1], manager.TempDir()+string(filepath.Separator)+".stdio-mcp-metis-") {
-			maskIndex = i
-			break
-		}
-	}
-	if maskIndex < 0 {
-		t.Fatalf("wrapped argv has no directory-level Metis mask: %v", wrapper.Args)
-	}
-	for i := maskIndex + 1; i+2 < len(wrapper.Args); i++ {
-		if wrapper.Args[i] == "--ro-bind" && wrapper.Args[i+1] == metisHome && wrapper.Args[i+2] == metisHome {
-			t.Fatalf("cwd equal to Metis root was rebound after the mask: %v", wrapper.Args)
-		}
+	_, err = manager.Wrap(cmd, Request{Cwd: metisHome, MinimumMode: ModePermissions})
+	if !errors.Is(err, ErrUnsafeCwd) {
+		t.Fatalf("Wrap error = %v, want ErrUnsafeCwd", err)
 	}
 }
 
@@ -313,7 +367,7 @@ func TestLinuxStdioMCPProfileRemasksNestedRootAfterCwdRestore(t *testing.T) {
 	}
 }
 
-func TestLinuxStdioMCPProfileEndsMaskedWhenCwdEqualsNestedRoot(t *testing.T) {
+func TestLinuxStdioMCPProfileRejectsCwdEqualToNestedRoot(t *testing.T) {
 	installFakeBubblewrap(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -334,19 +388,142 @@ func TestLinuxStdioMCPProfileEndsMaskedWhenCwdEqualsNestedRoot(t *testing.T) {
 
 	cmd := exec.Command("/bin/true")
 	cmd.Env = []string{linuxSandboxProfileEnvKey + "=" + linuxStdioMCPSandboxProfile}
-	wrapper, err := manager.Wrap(cmd, Request{Cwd: customMetisHome, MinimumMode: ModePermissions})
+	_, err = manager.Wrap(cmd, Request{Cwd: customMetisHome, MinimumMode: ModePermissions})
+	if !errors.Is(err, ErrUnsafeCwd) {
+		t.Fatalf("Wrap error = %v, want ErrUnsafeCwd", err)
+	}
+}
+
+func TestLinuxCredentialIsolationUsesSyntheticMetisView(t *testing.T) {
+	installFakeBubblewrap(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	defaultMetisHome := filepath.Join(home, ".metis")
+	pluginDir := filepath.Join(defaultMetisHome, "plugins", "fixture")
+	nestedMetisHome := filepath.Join(pluginDir, "state")
+	if err := os.MkdirAll(nestedMetisHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithOptions(Options{
+		Mode: string(ModeOff), TempRoot: t.TempDir(), MetisHome: nestedMetisHome,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if err := manager.RequireCredentialIsolation(true); err != nil {
+		t.Fatal(err)
+	}
 
-	lastSource := ""
+	wrapper, err := manager.Wrap(exec.Command("/bin/true"), Request{Cwd: pluginDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewPrefix := manager.TempDir() + string(filepath.Separator) + ".stdio-mcp-metis-"
+	rootMaskIndex := -1
+	restoreIndex := -1
+	nestedMaskIndex := -1
 	for i := 0; i+2 < len(wrapper.Args); i++ {
-		if wrapper.Args[i] == "--ro-bind" && wrapper.Args[i+2] == customMetisHome {
-			lastSource = wrapper.Args[i+1]
+		if wrapper.Args[i] != "--ro-bind" {
+			continue
+		}
+		source, destination := wrapper.Args[i+1], wrapper.Args[i+2]
+		if destination == defaultMetisHome && strings.HasPrefix(source, viewPrefix) {
+			rootMaskIndex = i
+		}
+		if source == pluginDir && destination == pluginDir {
+			restoreIndex = i
+		}
+		if destination == nestedMetisHome && strings.HasPrefix(source, viewPrefix) {
+			nestedMaskIndex = i
 		}
 	}
-	if !strings.HasPrefix(lastSource, manager.TempDir()+string(filepath.Separator)+".stdio-mcp-metis-") {
-		t.Fatalf("last mount on cwd/control root comes from %q, want private Metis view; argv=%v", lastSource, wrapper.Args)
+	if rootMaskIndex < 0 {
+		t.Fatalf("bypass credential isolation has no synthetic root mask: %v", wrapper.Args)
+	}
+	if restoreIndex <= rootMaskIndex {
+		t.Fatalf("safe cwd child was not restored after root mask: mask=%d restore=%d argv=%v", rootMaskIndex, restoreIndex, wrapper.Args)
+	}
+	if nestedMaskIndex <= restoreIndex {
+		t.Fatalf("nested Metis root was not re-masked after cwd restore: restore=%d mask=%d argv=%v", restoreIndex, nestedMaskIndex, wrapper.Args)
+	}
+}
+
+func TestLinuxSyntheticMetisViewRejectsUnsafeCredentialCwds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		profile string
+		bypass  bool
+	}{
+		{name: "bypass root", bypass: true},
+		{name: "bypass credential directory", bypass: true},
+		{name: "bypass credential directory child", bypass: true},
+		{name: "stdio root", profile: linuxStdioMCPSandboxProfile},
+		{name: "stdio credential directory", profile: linuxStdioMCPSandboxProfile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installFakeBubblewrap(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			metisHome := filepath.Join(home, ".metis")
+			credentialDir := filepath.Join(metisHome, metisCredentialDirectoryName)
+			credentialChild := filepath.Join(credentialDir, "nested")
+			if err := os.MkdirAll(credentialChild, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			manager, err := NewManagerWithOptions(Options{Mode: string(ModeOff), TempRoot: t.TempDir(), MetisHome: metisHome})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = manager.Close() })
+			if tc.bypass {
+				if err := manager.RequireCredentialIsolation(true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cwd := metisHome
+			switch tc.name {
+			case "bypass credential directory", "stdio credential directory":
+				cwd = credentialDir
+			case "bypass credential directory child":
+				cwd = credentialChild
+			}
+			cmd := exec.Command("/bin/true")
+			if tc.profile != "" {
+				cmd.Env = []string{linuxSandboxProfileEnvKey + "=" + tc.profile}
+			}
+			_, err = manager.Wrap(cmd, Request{Cwd: cwd, MinimumMode: ModePermissions})
+			if !errors.Is(err, ErrUnsafeCwd) {
+				t.Fatalf("Wrap error = %v, want ErrUnsafeCwd", err)
+			}
+		})
+	}
+}
+
+func TestLinuxNonIsolationCwdBehaviorDoesNotUseSyntheticMetisView(t *testing.T) {
+	installFakeBubblewrap(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	metisHome := filepath.Join(home, ".metis")
+	credentialDir := filepath.Join(metisHome, metisCredentialDirectoryName)
+	if err := os.MkdirAll(credentialDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithOptions(Options{Mode: string(ModePermissions), TempRoot: t.TempDir(), MetisHome: metisHome})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	for _, cwd := range []string{metisHome, credentialDir} {
+		wrapped, err := manager.Wrap(exec.Command("/bin/true"), Request{Cwd: cwd})
+		if err != nil {
+			t.Fatalf("ordinary permissions cwd %q changed behavior: %v", cwd, err)
+		}
+		for _, arg := range wrapped.Args {
+			if strings.Contains(arg, ".stdio-mcp-metis-") {
+				t.Fatalf("ordinary permissions unexpectedly used synthetic Metis view: %v", wrapped.Args)
+			}
+		}
 	}
 }
 
@@ -784,6 +961,109 @@ func TestLinuxMissingProtectedPathSandboxE2E(t *testing.T) {
 	}
 	if got, err := os.ReadFile(scratch); err != nil || string(got) != "ok" {
 		t.Fatalf("ephemeral write = %q, %v; want ok", got, err)
+	}
+}
+
+func TestLinuxCredentialIsolationHidesFutureLegacyCredentialFileE2E(t *testing.T) {
+	diagnostic := Doctor()
+	if !diagnostic.Available {
+		t.Skipf("bubblewrap unavailable: %v", diagnostic.Err)
+	}
+	probe := exec.Command(diagnostic.Executable,
+		"--die-with-parent", "--ro-bind", "/", "/", "--", "/bin/true")
+	if err := probe.Run(); err != nil {
+		t.Skipf("bubblewrap cannot create an unprivileged sandbox here: %v", err)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	metisHome := filepath.Join(home, ".metis")
+	if err := os.MkdirAll(metisHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithOptions(Options{
+		Mode: string(ModeOff), TempRoot: t.TempDir(), MetisHome: metisHome,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if err := manager.RequireCredentialIsolation(true); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := filepath.Join(manager.TempDir(), "future-legacy-ready")
+	resume := filepath.Join(manager.TempDir(), "future-legacy-resume")
+	future := filepath.Join(metisHome, ".llm-oauth-future.tmp")
+	cmd := exec.Command("/bin/sh", "-c", `
+		printf ready > "$READY"
+		while [ ! -e "$RESUME" ]; do sleep 0.01; done
+		test ! -e "$FUTURE"
+	`)
+	cmd.Env = append(os.Environ(), "READY="+ready, "RESUME="+resume, "FUTURE="+future)
+	wrapper, err := manager.Wrap(cmd, Request{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- wrapper.Wait() }()
+	finished := false
+	t.Cleanup(func() {
+		if finished {
+			return
+		}
+		_ = wrapper.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			finished = true
+			t.Fatalf("sandbox exited before readiness barrier: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			_ = wrapper.Process.Kill()
+			<-done
+			finished = true
+			t.Fatal("timed out waiting for sandbox readiness barrier")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := os.WriteFile(future, []byte("future-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resume, []byte("continue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		finished = true
+		if err != nil {
+			t.Fatalf("future legacy credential became visible inside sandbox: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = wrapper.Process.Kill()
+		<-done
+		finished = true
+		t.Fatal("timed out waiting for sandbox credential barrier probe")
+	}
+	if got, err := os.ReadFile(future); err != nil || string(got) != "future-secret" {
+		t.Fatalf("host future credential = %q, %v", got, err)
 	}
 }
 

@@ -95,7 +95,8 @@ Help the user diagnose an issue in this metis session.
 metis settings live in:
 - user config: ~/.metis/config.toml
 - project config: ./.metis/config.toml (when present)
-- permissions: ~/.metis/auth.json + trusted-dirs.json
+- protected credentials: ~/.metis/.credentials/
+- trusted directories: ~/.metis/trusted-dirs.json
 
 ## Instructions
 

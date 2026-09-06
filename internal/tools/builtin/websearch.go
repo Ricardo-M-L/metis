@@ -118,8 +118,8 @@ type webSearchBackend struct {
 //  1. Environment variable (b.envVar) — CI / shell-rc / one-shot
 //     overrides win. Matches how every other backend in the chain
 //     reads its key today and keeps CI workflows free of touching
-//     auth.json on the runner.
-//  2. ~/.metis/auth.json under "search:<name>" — the persistent
+//     credential files on the runner.
+//  2. ~/.metis/.credentials/auth.json under "search:<name>" — the persistent
 //     store written by `metis auth keys put <name> <value>`. 0o600
 //     perms enforced by internal/auth, so this is safer than
 //     stuffing keys in ~/.zshrc where every shell process inherits

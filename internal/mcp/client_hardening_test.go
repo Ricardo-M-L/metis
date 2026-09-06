@@ -99,6 +99,15 @@ func TestCredentialURLRedactionValuesIncludeUsernameOnlyUserinfo(t *testing.T) {
 	}
 }
 
+func TestCredentialURLRedactionValuesIncludeShortUsernameOnlyUserinfo(t *testing.T) {
+	const usernameToken = "abc123"
+	values := credentialURLRedactionValues("https://"+usernameToken+"@api.example.test/mcp", true)
+	got := redactSensitiveText("upstream echoed "+usernameToken, values)
+	if strings.Contains(got, usernameToken) {
+		t.Fatalf("short username-only userinfo credential leaked independently: %q", got)
+	}
+}
+
 func TestCredentialURLRedactionValuesIncludeValuelessOpaqueQueryToken(t *testing.T) {
 	const queryToken = "abcdefghijklmnopqrstuvwxyzABCDEF"
 	values := credentialURLRedactionValues("https://api.example.test/mcp?"+queryToken, true)

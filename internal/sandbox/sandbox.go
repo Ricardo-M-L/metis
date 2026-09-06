@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/Ricardo-M-L/metis/internal/auth"
 )
 
 // Mode controls whether commands are sandboxed and whether the sandbox may
@@ -21,6 +23,8 @@ const (
 	ModeOff         Mode = "off"
 	ModePermissions Mode = "permissions"
 	ModeAutoAllow   Mode = "auto-allow"
+
+	metisCredentialDirectoryName = auth.CredentialDirectoryName
 )
 
 // NetworkPolicy controls network access inside an enabled OS sandbox.
@@ -175,12 +179,12 @@ func NewManagerWithOptions(opts Options) (*Manager, error) {
 		}
 	}
 	if metisHome != "" {
-		if abs, absErr := filepath.Abs(metisHome); absErr == nil {
-			metisHome = filepath.Clean(abs)
-			if resolved, resolveErr := filepath.EvalSymlinks(metisHome); resolveErr == nil {
-				metisHome = filepath.Clean(resolved)
-			}
+		resolved, resolveErr := auth.ResolveCredentialHome(metisHome)
+		if resolveErr != nil {
+			_ = os.RemoveAll(tempDir)
+			return nil, fmt.Errorf("sandbox: resolve METIS_HOME credential boundary: %w", resolveErr)
 		}
+		metisHome = resolved
 	}
 	return &Manager{configured: mode, network: network, tempDir: resolvedTemp, metisHome: metisHome}, nil
 }
@@ -524,6 +528,9 @@ func (m *Manager) Wrap(cmd *exec.Cmd, req Request) (*exec.Cmd, error) {
 		if resolvedHome, resolveErr := resolveExistingPath(rawHome); resolveErr == nil {
 			home = resolvedHome
 		}
+	}
+	if err := validateCredentialTopology(home, metisHome); err != nil {
+		return nil, err
 	}
 
 	if err := wrapPlatform(cmd, platformRequest{

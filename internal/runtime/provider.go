@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -8,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	// Primary-profile providers — direct imports because BuildProvider
@@ -35,6 +38,18 @@ func isAnthropicOrigin(baseURL string) bool {
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "api.anthropic.com" || strings.HasSuffix(host, ".anthropic.com")
+}
+
+func isAnthropicOAuthOrigin(baseURL string) bool {
+	if baseURL == "" {
+		return true
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
@@ -139,10 +154,24 @@ func ProviderHasCredentials(cfg *config.Config, name string) bool {
 	if name == "google" {
 		name = "gemini"
 	}
+	if name == "openai-codex" {
+		credential, err := auth.GetOAuth("openai-codex")
+		return err == nil && openAICodexCredentialReady(credential)
+	}
 	raw, custom := cfg.Provider.Custom[name]
 	if !custom {
 		_, err := cfg.ResolveAPIKey(name)
-		return err == nil
+		if err == nil {
+			return true
+		}
+		// OAuth is a fallback only when an API key is genuinely absent. A
+		// corrupt or unreadable API-key store must fail closed, matching
+		// buildProvider, instead of being hidden by an unrelated OAuth entry.
+		if name == "anthropic" && errors.Is(err, config.ErrMissingAPIKey) && isAnthropicOAuthOrigin(cfg.Provider.Anthropic.BaseURL) {
+			has, oauthErr := auth.HasOAuth("anthropic")
+			return oauthErr == nil && has
+		}
+		return false
 	}
 
 	switch normalizedCustomTransport(raw) {
@@ -162,6 +191,14 @@ func ProviderHasCredentials(cfg *config.Config, name string) bool {
 	}
 }
 
+func openAICodexCredentialReady(credential *auth.OAuthCredential) bool {
+	return credential != nil &&
+		strings.TrimSpace(credential.AccessToken) != "" &&
+		strings.TrimSpace(credential.RefreshToken) != "" &&
+		!credential.ExpiresAt.IsZero() &&
+		strings.TrimSpace(credential.AccountID) != ""
+}
+
 func normalizedCustomTransport(raw config.ProviderRaw) string {
 	transportName := strings.ToLower(strings.TrimSpace(raw.Transport))
 	if transportName == "" {
@@ -179,8 +216,16 @@ func resolveCustomProviderAPIKey(cfg *config.Config, id string, raw config.Provi
 	case "vertex_anthropic", "vertex":
 		return "", nil
 	case "bedrock_anthropic", "bedrock":
-		if key, err := cfg.ResolveAPIKey(id); err == nil && strings.TrimSpace(key) != "" {
+		key, err := cfg.ResolveAPIKey(id)
+		if err == nil && strings.TrimSpace(key) != "" {
 			return key, nil
+		}
+		// Only the ordinary "not configured in the provider profile" case
+		// may fall back to AWS's conventional environment variable. A corrupt
+		// or unsafe credential store must fail closed instead of silently
+		// changing the authentication source.
+		if err != nil && !errors.Is(err, config.ErrMissingAPIKey) {
+			return "", err
 		}
 		if key := os.Getenv("AWS_ACCESS_KEY_ID"); strings.TrimSpace(key) != "" {
 			return key, nil
@@ -211,24 +256,73 @@ func bedrockSecretKey(raw config.ProviderRaw) string {
 //   - "gemini"     → /v1beta/models/<model>:streamGenerateContent
 //     (Google Generative Language API, native protocol)
 func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBuild, error) {
+	return buildProvider(cfg, name, modelOverride, true)
+}
+
+// BuildProviderWithoutPreconnect performs the same local construction and
+// validation as BuildProvider but deliberately avoids its anonymous HEAD
+// warm-up. Desktop uses this path because its Validate action promises not to
+// contact the configured endpoint; an explicit Probe action owns network
+// validation and user confirmation.
+func BuildProviderWithoutPreconnect(cfg *config.Config, name, modelOverride string) (*ProviderBuild, error) {
+	return buildProvider(cfg, name, modelOverride, false)
+}
+
+func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconnect bool) (*ProviderBuild, error) {
 	switch name {
 	case "anthropic":
-		key, err := cfg.ResolveAPIKey("anthropic")
-		if err != nil {
-			return nil, err
+		if err := validateCredentialEndpoint(cfg.Provider.Anthropic.BaseURL); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", name, err)
 		}
+		key, err := cfg.ResolveAPIKey("anthropic")
 		model := modelOverride
 		if model == "" {
 			model = cfg.Provider.Anthropic.Model
 		}
-		prov := anthropic.New(
-			key,
-			cfg.Provider.Anthropic.BaseURL,
-			model,
-			cfg.Provider.Anthropic.MaxTokens,
-			time.Duration(cfg.Provider.Anthropic.TimeoutSecs)*time.Second,
-			cfg.Provider.Anthropic.AnthropicBeta,
-		)
+		var prov *anthropic.Anthropic
+		if err == nil {
+			// API-key auth intentionally wins over a stored OAuth login so
+			// existing CI/env/config behavior remains unchanged.
+			prov = anthropic.New(
+				key,
+				cfg.Provider.Anthropic.BaseURL,
+				model,
+				cfg.Provider.Anthropic.MaxTokens,
+				time.Duration(cfg.Provider.Anthropic.TimeoutSecs)*time.Second,
+				cfg.Provider.Anthropic.AnthropicBeta,
+			)
+		} else {
+			if !errors.Is(err, config.ErrMissingAPIKey) {
+				return nil, fmt.Errorf("resolve Anthropic API key: %w", err)
+			}
+			hasOAuth, oauthErr := auth.HasOAuth("anthropic")
+			if oauthErr != nil {
+				return nil, fmt.Errorf("check Anthropic OAuth credential: %w", oauthErr)
+			}
+			if !hasOAuth {
+				return nil, fmt.Errorf("%w; run `metis login anthropic` or set ANTHROPIC_API_KEY", err)
+			}
+			if !isAnthropicOAuthOrigin(cfg.Provider.Anthropic.BaseURL) {
+				return nil, errors.New("refusing to send Anthropic OAuth credentials to a non-Anthropic base_url; use an API key for custom gateways")
+			}
+			prov = anthropic.NewOAuth(
+				cfg.Provider.Anthropic.BaseURL,
+				model,
+				cfg.Provider.Anthropic.MaxTokens,
+				time.Duration(cfg.Provider.Anthropic.TimeoutSecs)*time.Second,
+				cfg.Provider.Anthropic.AnthropicBeta,
+				func(ctx context.Context) (string, error) {
+					credential, resolveErr := auth.ResolveOAuthCredential(ctx, "anthropic")
+					if resolveErr != nil {
+						return "", resolveErr
+					}
+					if credential == nil || strings.TrimSpace(credential.AccessToken) == "" {
+						return "", errors.New("Anthropic OAuth credential is missing; run `metis login anthropic`")
+					}
+					return credential.AccessToken, nil
+				},
+			)
+		}
 		prov.ContextWindow = cfg.Provider.Anthropic.ContextWindow
 		prov.CatalogProvider = strings.ToLower(strings.TrimSpace(cfg.Provider.Anthropic.CatalogProvider))
 		if prov.CatalogProvider == "" && isAnthropicOrigin(cfg.Provider.Anthropic.BaseURL) {
@@ -253,9 +347,53 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		// 100-300ms on the first message — the user perceives this as
 		// "instant first reply" instead of "spinner sits there before
 		// the first token arrives".
-		Preconnect(cfg.Provider.Anthropic.BaseURL)
+		if allowPreconnect {
+			Preconnect(cfg.Provider.Anthropic.BaseURL)
+		}
 		return finalizeProviderBuild(prov, model, cfg.Provider.Anthropic.MaxTokens)
+	case "openai-codex":
+		storedCredential, err := auth.GetOAuth("openai-codex")
+		if err != nil {
+			return nil, fmt.Errorf("check OpenAI Codex OAuth credential: %w", err)
+		}
+		if !openAICodexCredentialReady(storedCredential) {
+			return nil, errors.New("OpenAI Codex credentials not configured; run `metis login openai-codex`")
+		}
+		model := strings.TrimSpace(modelOverride)
+		if model == "" {
+			model = strings.TrimSpace(cfg.Provider.OpenAICodex.Model)
+		}
+		if model == "" {
+			model = "gpt-5.5"
+		}
+		prov := openai.NewCodexResponses(
+			model,
+			cfg.Provider.OpenAICodex.MaxTokens,
+			time.Duration(cfg.Provider.OpenAICodex.TimeoutSecs)*time.Second,
+			cfg.Provider.OpenAICodex.Temperature,
+			func(ctx context.Context) (openai.ResponsesOAuthCredential, error) {
+				credential, resolveErr := auth.ResolveOAuthCredential(ctx, "openai-codex")
+				if resolveErr != nil {
+					return openai.ResponsesOAuthCredential{}, resolveErr
+				}
+				if credential == nil {
+					return openai.ResponsesOAuthCredential{}, errors.New("OpenAI Codex OAuth credential is missing; run `metis login openai-codex`")
+				}
+				return openai.ResponsesOAuthCredential{
+					AccessToken: credential.AccessToken,
+					AccountID:   credential.AccountID,
+				}, nil
+			},
+		)
+		prov.ContextWindow = cfg.Provider.OpenAICodex.ContextWindow
+		if allowPreconnect {
+			Preconnect(prov.BaseURL)
+		}
+		return finalizeProviderBuild(prov, model, cfg.Provider.OpenAICodex.MaxTokens)
 	case "openai":
+		if err := validateCredentialEndpoint(cfg.Provider.OpenAI.BaseURL); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", name, err)
+		}
 		key, err := cfg.ResolveAPIKey("openai")
 		if err != nil {
 			return nil, err
@@ -282,7 +420,9 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			prov.PromptCacheKey = strings.TrimSpace(cfg.Provider.OpenAI.PromptCacheKey)
 			prov.HostedTools = append([]string(nil), cfg.Provider.OpenAI.HostedTools...)
 			prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
-			Preconnect(cfg.Provider.OpenAI.BaseURL)
+			if allowPreconnect {
+				Preconnect(cfg.Provider.OpenAI.BaseURL)
+			}
 			return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
 		}
 		prov := openai.New(
@@ -298,9 +438,14 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 		if prov.CatalogProvider == "" && isOpenAIOrigin(cfg.Provider.OpenAI.BaseURL) {
 			prov.CatalogProvider = "openai"
 		}
-		Preconnect(cfg.Provider.OpenAI.BaseURL)
+		if allowPreconnect {
+			Preconnect(cfg.Provider.OpenAI.BaseURL)
+		}
 		return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
 	case "gemini", "google":
+		if err := validateCredentialEndpoint(cfg.Provider.Gemini.BaseURL); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", name, err)
+		}
 		// Accept "google" as an alias since users sometimes type the
 		// brand instead of the model family. Same provider either way.
 		key, err := cfg.ResolveAPIKey("gemini")
@@ -320,7 +465,9 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 			cfg.Provider.Gemini.Temperature,
 		)
 		prov.ContextWindow = cfg.Provider.Gemini.ContextWindow
-		Preconnect(cfg.Provider.Gemini.BaseURL)
+		if allowPreconnect {
+			Preconnect(cfg.Provider.Gemini.BaseURL)
+		}
 		return finalizeProviderBuild(prov, model, cfg.Provider.Gemini.MaxTokens)
 	}
 	// Custom provider profiles. Users define unlimited entries under
@@ -331,9 +478,9 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 	// vendor exposes both an Anthropic-compatible and OpenAI-compatible
 	// endpoint and one of them has a bug the other doesn't.
 	if raw, ok := cfg.Provider.Custom[name]; ok {
-		return buildCustomProvider(cfg, name, raw, modelOverride)
+		return buildCustomProvider(cfg, name, raw, modelOverride, allowPreconnect)
 	}
-	known := []string{"anthropic", "openai", "gemini"}
+	known := []string{"anthropic", "openai", "openai-codex", "gemini"}
 	for k := range cfg.Provider.Custom {
 		known = append(known, k)
 	}
@@ -348,7 +495,10 @@ func BuildProvider(cfg *config.Config, name, modelOverride string) (*ProviderBui
 // Adding a new transport is now "create internal/llm/<name>/, call
 // transport.Register in init(), blank-import it from this file" —
 // no need to grow the case list here.
-func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, modelOverride string) (*ProviderBuild, error) {
+func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, modelOverride string, allowPreconnect bool) (*ProviderBuild, error) {
+	if err := validateCredentialEndpoint(raw.BaseURL); err != nil {
+		return nil, fmt.Errorf("provider %q: %w", id, err)
+	}
 	key, err := resolveCustomProviderAPIKey(cfg, id, raw)
 	if err != nil {
 		return nil, err
@@ -407,6 +557,17 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		}
 		provider = withVisionOverride(provider, *raw.SupportsVision)
 	}
-	Preconnect(raw.BaseURL)
+	if allowPreconnect {
+		Preconnect(raw.BaseURL)
+	}
 	return finalizeProviderBuild(provider, res.Model, res.MaxOutputTokens)
+}
+
+func validateCredentialEndpoint(baseURL string) error {
+	if strings.TrimSpace(baseURL) == "" {
+		// Cloud-native transports can derive their endpoint from region/project.
+		// Their constructors perform transport-specific validation.
+		return nil
+	}
+	return config.ValidateProviderEndpointTransport(baseURL)
 }

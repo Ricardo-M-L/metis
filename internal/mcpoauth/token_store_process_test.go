@@ -252,14 +252,18 @@ func TestTokenStoreLockTimeoutIsDiagnosticAndDoesNotWrite(t *testing.T) {
 func TestTokenStoreRejectsSymlinkedLockFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
+	store := NewTokenStore()
+	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	target := filepath.Join(home, "outside-lock")
 	if err := os.WriteFile(target, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(target, filepath.Join(home, tokenStoreLockFilename)); err != nil {
+	if err := os.Symlink(target, filepath.Join(filepath.Dir(store.path), tokenStoreLockFilename)); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	err := NewTokenStore().Put("srv", &auth.Token{AccessToken: "secret"})
+	err := store.Put("srv", &auth.Token{AccessToken: "secret"})
 	if err == nil || !strings.Contains(err.Error(), "symlinked") {
 		t.Fatalf("symlinked lock error = %v", err)
 	}

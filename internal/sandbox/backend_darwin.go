@@ -126,10 +126,14 @@ func buildDarwinProfile(cwd, tempDir, home, metisHome string, network NetworkPol
 		// Metis is commonly launched with the user's home as cwd, whose write
 		// grant would otherwise include all persistent Metis state.
 		rules = append(rules,
-			fmt.Sprintf(`(deny file-write* (subpath %s))`, quote(root)))
+			fmt.Sprintf(`(deny file-write* (subpath %s))`, quote(root)),
+			fmt.Sprintf(`(deny file-read* (subpath %s))`, quote(filepath.Join(root, metisCredentialDirectoryName))))
 		credentialFiles := []string{
 			"auth.json",
+			"llm-oauth.json",
+			".llm-oauth.lock",
 			"mcp-oauth.json",
+			".mcp-oauth.lock",
 			"mcp.toml",
 			"credentials.json",
 			"secrets.json",
@@ -139,6 +143,17 @@ func buildDarwinProfile(cwd, tempDir, home, metisHome string, network NetworkPol
 		for _, name := range credentialFiles {
 			rules = append(rules,
 				fmt.Sprintf(`(deny file-read* (literal %s))`, quote(filepath.Join(root, name))))
+		}
+		llmOAuthPrefix := "^" + regexp.QuoteMeta(root+string(filepath.Separator))
+		for _, suffix := range []string{
+			`\.auth\.json\.[^/]+$`,
+			`\.llm-oauth-refresh-[^/]+\.lock$`,
+			`\.llm-oauth-[^/]+\.tmp$`,
+			`\.mcp-oauth-refresh-[^/]+\.lock$`,
+			`\.mcp-oauth-[^/]+\.tmp$`,
+		} {
+			rules = append(rules,
+				fmt.Sprintf(`(deny file-read* (regex %s))`, regex(llmOAuthPrefix+suffix)))
 		}
 		rules = append(rules,
 			fmt.Sprintf(`(deny file-read* (subpath %s))`, quote(filepath.Join(root, "ide"))))

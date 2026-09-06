@@ -8,10 +8,14 @@ package tui
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	textarea "charm.land/bubbles/v2/textarea"
+
+	"github.com/Ricardo-M-L/metis/internal/config"
 )
 
 func TestWriteDraftToTemp_RoundTrip(t *testing.T) {
@@ -70,5 +74,35 @@ func TestConfigSlashDoesNotReportSaveBeforePanelApply(t *testing.T) {
 		if strings.Contains(msg.Content, "config updated") || strings.Contains(msg.Content, "config saved") {
 			t.Fatalf("/config reported success before editor exited: %+v", msg)
 		}
+	}
+}
+
+func TestOpenConfigEditorRejectsReplacedMetisHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory replacement semantics differ on Windows")
+	}
+	parent := t.TempDir()
+	home := filepath.Join(parent, "metis-home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("METIS_HOME", home)
+	if _, _, err := config.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(home, home+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	msg := (&Model{}).openConfigEditor()()
+	done, ok := msg.(configEditorDoneMsg)
+	if !ok {
+		t.Fatalf("openConfigEditor after root replacement returned %T, want configEditorDoneMsg", msg)
+	}
+	if done.err == nil || !strings.Contains(done.err.Error(), "was replaced") {
+		t.Fatalf("openConfigEditor after root replacement error = %v", done.err)
 	}
 }

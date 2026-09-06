@@ -29,6 +29,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/security"
 )
 
 // HeaderRequestID is the wire header we set. Lowercased to match Go's
@@ -53,20 +55,24 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		reqID = newRequestID()
 		req.Header.Set(HeaderRequestID, reqID)
 	}
+	// Snapshot credential-bearing header values before dispatch. A custom
+	// RoundTripper may mutate req.Header, and its error can echo short opaque
+	// values that generic token-shape redaction cannot identify.
+	exactValues := sensitiveDumpValues(req.Header)
 
 	start := time.Now()
 	resp, err := t.inner.RoundTrip(req)
 	elapsed := time.Since(start)
 
 	if isDebugEnabled() {
-		writeLog(formatLogLine(t.provider, req, resp, err, reqID, elapsed))
+		writeLog(formatLogLine(t.provider, req, resp, err, reqID, elapsed, exactValues...))
 	}
 	return resp, err
 }
 
 // formatLogLine renders one line. Kept tiny — this lands in
 // ~/.metis/debug.log and users grep it.
-func formatLogLine(provider string, req *http.Request, resp *http.Response, err error, reqID string, elapsed time.Duration) string {
+func formatLogLine(provider string, req *http.Request, resp *http.Response, err error, reqID string, elapsed time.Duration, exactValues ...string) string {
 	pathOnly := req.URL.Path
 	if pathOnly == "" {
 		pathOnly = "/"
@@ -76,7 +82,9 @@ func formatLogLine(provider string, req *http.Request, resp *http.Response, err 
 		// Don't dump the full URL in the error path either — host can
 		// leak proxy/gateway hostnames. Status field carries the
 		// classification the user actually needs.
-		status = "ERR:" + truncErr(err.Error(), 80)
+		// Redact before truncation: truncating first can split a credential and
+		// leave an unrecognizable secret fragment in the log.
+		status = "ERR:" + truncErr(security.RedactValues(err.Error(), exactValues...), 80)
 	} else if resp != nil {
 		status = fmt.Sprintf("%d", resp.StatusCode)
 	}

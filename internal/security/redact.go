@@ -34,7 +34,11 @@ package security
 // https://github.com/gitleaks/gitleaks/blob/master/config/gitleaks.toml
 
 import (
+	"encoding/json"
 	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -45,7 +49,7 @@ import (
 // (?s) lets `.` cross newlines — some servers pretty-print bodies with
 // `\n` between key and value. \s* matches the optional whitespace JSON
 // allows around `:`.
-var sensitiveTokenRE = regexp.MustCompile(`"(access_token|refresh_token|id_token|assertion|subject_token|client_secret|client_assertion)"\s*:\s*"(?:\\.|[^"\\\r\n])*"`)
+var sensitiveTokenRE = regexp.MustCompile(`"(access_token|refresh_token|id_token|assertion|subject_token|client_secret|client_assertion|chatgpt_account_id)"\s*:\s*"(?:\\.|[^"\\\r\n])*"`)
 
 // secretRule is one gitleaks-derived pattern. capturing=true means the
 // pattern's group 1 is the secret span (and surrounding boundary
@@ -55,6 +59,11 @@ type secretRule struct {
 	id        string
 	source    string
 	capturing bool
+	// captureGroup defaults to 1 for capturing rules. It is configurable for
+	// patterns that must consume a leading boundary because Go's regexp engine
+	// intentionally does not implement look-behind.
+	captureGroup      int
+	base64URLBoundary bool
 }
 
 // secretRules — curated high-confidence subset of gitleaks rules.
@@ -121,6 +130,10 @@ var secretRules = []secretRule{
 	// surrounding match while clobbering the captured token. 20-char
 	// minimum tail rejects "Bearer X" prose mentions.
 	{id: "bearer-token", source: `(?i)(?:Bearer\s+)([A-Za-z0-9._\-=]{20,})`, capturing: true},
+	// Compact JWTs are frequently logged without an Authorization header. The
+	// encoded JSON header prefix plus three bounded base64url segments keeps
+	// this rule precise enough to avoid matching ordinary dotted identifiers.
+	{id: "jwt", source: `(eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,})`, capturing: true, base64URLBoundary: true},
 
 	// — Crypto private keys —
 	{id: "private-key-pem", source: `-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----`, capturing: false},
@@ -134,18 +147,26 @@ var (
 )
 
 type compiledRule struct {
-	id        string
-	re        *regexp.Regexp
-	capturing bool
+	id                string
+	re                *regexp.Regexp
+	capturing         bool
+	captureGroup      int
+	base64URLBoundary bool
 }
 
 func compileRules() {
 	compiledList = make([]compiledRule, 0, len(secretRules))
 	for _, r := range secretRules {
+		captureGroup := r.captureGroup
+		if r.capturing && captureGroup == 0 {
+			captureGroup = 1
+		}
 		compiledList = append(compiledList, compiledRule{
-			id:        r.id,
-			re:        regexp.MustCompile(r.source),
-			capturing: r.capturing,
+			id:                r.id,
+			re:                regexp.MustCompile(r.source),
+			capturing:         r.capturing,
+			captureGroup:      captureGroup,
+			base64URLBoundary: r.base64URLBoundary,
 		})
 	}
 }
@@ -194,24 +215,182 @@ func Redact(s string) string {
 			continue
 		}
 		if r.capturing {
-			s = r.re.ReplaceAllStringFunc(s, func(match string) string {
-				sub := r.re.FindStringSubmatch(match)
-				if len(sub) < 2 {
-					return "[REDACTED]"
-				}
-				// Boundary preservation: replace only sub[1] inside match.
-				out := match
-				idx := indexByteSeq(out, sub[1])
-				if idx < 0 {
-					return "[REDACTED]"
-				}
-				return out[:idx] + "[REDACTED]" + out[idx+len(sub[1]):]
-			})
+			s = redactCapturedMatches(s, r)
 		} else {
 			s = r.re.ReplaceAllString(s, "[REDACTED]")
 		}
 	}
 	return s
+}
+
+// RedactValues applies the high-confidence generic rules from Redact and then
+// removes the exact opaque values supplied by the caller. The second layer is
+// for credentials known only at request time (for example a vendor-specific
+// API key, an OAuth access token, or an account id) whose shape cannot be
+// recognized safely by a global regular expression.
+//
+// In plain text, exact values are first swapped for collision-free placeholders,
+// then Redact runs, and finally the placeholders become [REDACTED]. This keeps
+// the public ordering contract (generic rules, then exact-value markers) while
+// preventing a generic rule from partially consuming an exact value before it
+// can be removed. Longest-first matching also handles overlapping values.
+// Valid JSON is matched inside decoded string literals so alternate JSON
+// escapes cannot hide a credential or be mistaken for one. Unchanged literals
+// and all non-string JSON bytes are preserved.
+func RedactValues(s string, values ...string) string {
+	if s == "" || len(values) == 0 {
+		return Redact(s)
+	}
+
+	trimmed := strings.TrimSpace(s)
+	jsonInput := len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[' || trimmed[0] == '"') && json.Valid([]byte(s))
+	escapedJSON := jsonInput && strings.Contains(s, `\`)
+	unique := make(map[string]struct{}, len(values))
+	exact := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || value == "[REDACTED]" || (!escapedJSON && !strings.Contains(s, value)) {
+			continue
+		}
+		if _, ok := unique[value]; ok {
+			continue
+		}
+		unique[value] = struct{}{}
+		exact = append(exact, value)
+	}
+	if len(exact) == 0 {
+		return Redact(s)
+	}
+	sort.SliceStable(exact, func(i, j int) bool { return len(exact[i]) > len(exact[j]) })
+	if jsonInput {
+		return Redact(redactJSONExactValues(s, exact))
+	}
+
+	prefix := "\x00metis-exact-secret:"
+	for strings.Contains(s, prefix) {
+		prefix += "_"
+	}
+	maskPairs := make([]string, 0, len(exact)*2)
+	restorePairs := make([]string, 0, len(exact)*2)
+	for i, value := range exact {
+		placeholder := prefix + strconv.Itoa(i) + "\x00"
+		maskPairs = append(maskPairs, value, placeholder)
+		restorePairs = append(restorePairs, placeholder, "[REDACTED]")
+	}
+	masked := strings.NewReplacer(maskPairs...).Replace(s)
+	masked = Redact(masked)
+	return strings.NewReplacer(restorePairs...).Replace(masked)
+}
+
+// redactJSONExactValues receives valid JSON and rewrites only string literals
+// containing an exact value. It avoids decoding the document into maps, which
+// would reorder keys, collapse duplicates, and change number representations.
+func redactJSONExactValues(s string, exact []string) string {
+	pairs := make([]string, 0, 2*len(exact))
+	for _, value := range exact {
+		pairs = append(pairs, value, "[REDACTED]")
+	}
+	replacer := strings.NewReplacer(pairs...)
+	var out strings.Builder
+	last := 0
+	for pos := 0; pos < len(s); pos++ {
+		if s[pos] != '"' {
+			continue
+		}
+		start := pos
+		for pos++; pos < len(s); pos++ {
+			if s[pos] == '\\' {
+				pos++
+			} else if s[pos] == '"' {
+				break
+			}
+		}
+		literal := s[start : pos+1]
+		decoded := literal[1 : len(literal)-1]
+		if strings.Contains(decoded, `\`) {
+			if err := json.Unmarshal([]byte(literal), &decoded); err != nil {
+				continue // Defensive: the caller has already validated the JSON.
+			}
+		}
+		redacted := replacer.Replace(decoded)
+		if redacted == decoded {
+			continue
+		}
+		encoded, _ := json.Marshal(redacted)
+		out.WriteString(s[last:start])
+		out.Write(encoded)
+		last = pos + 1
+	}
+	if last == 0 {
+		return s
+	}
+	out.WriteString(s[last:])
+	return out.String()
+}
+
+func redactCapturedMatches(s string, rule compiledRule) string {
+	matches := rule.re.FindAllStringSubmatchIndex(s, -1)
+	if len(matches) == 0 {
+		return s
+	}
+	groupOffset := rule.captureGroup * 2
+	out := make([]byte, 0, len(s))
+	last := 0
+	redacted := false
+	for _, match := range matches {
+		if groupOffset <= 1 || groupOffset+1 >= len(match) {
+			continue
+		}
+		start, end := match[groupOffset], match[groupOffset+1]
+		if start < last || start < 0 || end < start {
+			continue
+		}
+		if rule.base64URLBoundary {
+			if start > 0 && isBase64URLByte(s[start-1]) {
+				continue
+			}
+			if end < len(s) && isBase64URLByte(s[end]) {
+				continue
+			}
+		}
+		out = append(out, s[last:start]...)
+		out = append(out, "[REDACTED]"...)
+		last = end
+		redacted = true
+	}
+	if !redacted {
+		return s
+	}
+	out = append(out, s[last:]...)
+	return string(out)
+}
+
+func isBase64URLByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') || b == '-' || b == '_'
+}
+
+func compiledRuleMatches(s string, rule compiledRule) bool {
+	if !rule.base64URLBoundary {
+		return rule.re.MatchString(s)
+	}
+	groupOffset := rule.captureGroup * 2
+	for _, match := range rule.re.FindAllStringSubmatchIndex(s, -1) {
+		if groupOffset <= 1 || groupOffset+1 >= len(match) {
+			continue
+		}
+		start, end := match[groupOffset], match[groupOffset+1]
+		if start < 0 || end < start {
+			continue
+		}
+		if start > 0 && isBase64URLByte(s[start-1]) {
+			continue
+		}
+		if end < len(s) && isBase64URLByte(s[end]) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func mayContainSensitiveTokenField(s string) bool {
@@ -222,6 +401,7 @@ func mayContainSensitiveTokenField(s string) bool {
 		for _, name := range []string{
 			"access_token", "refresh_token", "id_token", "assertion",
 			"subject_token", "client_secret", "client_assertion",
+			"chatgpt_account_id",
 		} {
 			if hasStringPrefixAt(s, i+1, name) {
 				return true
@@ -249,6 +429,10 @@ func mayContainHighConfidenceSecret(s string) bool {
 				if hasStringPrefixAt(s, i, prefix) {
 					return true
 				}
+			}
+		case 'e':
+			if hasASCIIFoldPrefixAt(s, i, "eyj") {
+				return true
 			}
 		case 'g':
 			for _, prefix := range []string{
@@ -321,21 +505,6 @@ func lowerASCIIByte(b byte) byte {
 	return b
 }
 
-// indexByteSeq is a tiny helper for "find first occurrence of needle
-// in haystack" — equivalent to strings.Index but avoiding the import
-// cycle if redact.go is ever inlined.
-func indexByteSeq(haystack, needle string) int {
-	if needle == "" || len(needle) > len(haystack) {
-		return -1
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return i
-		}
-	}
-	return -1
-}
-
 // SecretMatch — diagnostic shape returned by Scan. Useful in CLI
 // commands that warn about secrets without redacting them
 // (e.g. "your config contains 2 secret(s): GitHub PAT, OpenAI API
@@ -359,7 +528,7 @@ func Scan(s string) []SecretMatch {
 		if _, ok := seen[r.id]; ok {
 			continue
 		}
-		if r.re.MatchString(s) {
+		if compiledRuleMatches(s, r) {
 			seen[r.id] = struct{}{}
 			out = append(out, SecretMatch{
 				RuleID: r.id,

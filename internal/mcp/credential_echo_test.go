@@ -17,7 +17,11 @@ func TestStdioTransportRedactsConfiguredArgAndShortEnvCredentials(t *testing.T) 
 	if runtime.GOOS == "windows" {
 		t.Skip("uses /bin/sh to echo configured argv and environment values")
 	}
-	secrets := []string{"a1", "t2", "s3", "p4", "z5", "c6", "l7", "e8", "k9"}
+	secrets := []string{
+		"a1", "t2", "s3", "p4", "z5", "c6", "l7", "e8", "k9",
+		"access1", "auth2", "client3", "apikey4", "header5", "header6", "header7",
+		"header8",
+	}
 	transport, err := NewStdioTransportWithEnv(
 		context.Background(),
 		"/bin/sh",
@@ -32,6 +36,14 @@ func TestStdioTransportRedactsConfiguredArgAndShortEnvCredentials(t *testing.T) 
 		"--authorization=Bearer z5",
 		"--credential", "c6",
 		"--license=l7",
+		"--access-token=access1",
+		"--auth-token", "auth2",
+		"--client-secret=client3",
+		"--apikey", "apikey4",
+		"-H", "Authorization: Bearer header5",
+		"--header=X-API-Key: header6",
+		"--headers", `{"X-Session-Token":"header7","X-Mode":"dev"}`,
+		"-HAuthorization: Bearer header8",
 		"--mode=dev",
 	)
 	if err != nil {
@@ -48,10 +60,37 @@ func TestStdioTransportRedactsConfiguredArgAndShortEnvCredentials(t *testing.T) 
 			t.Fatalf("stdio echo leaked configured secret %q: %q", secret, got)
 		}
 	}
-	for _, ordinary := range []string{"ordinary=dev", "--mode=dev"} {
+	for _, ordinary := range []string{"ordinary=dev", "--mode=dev", `"X-Mode":"dev"`} {
 		if !strings.Contains(got, ordinary) {
 			t.Fatalf("ordinary short value was redacted (%q missing): %q", ordinary, got)
 		}
+	}
+}
+
+func TestConfiguredSecretArgValuesRecognizesCredentialAndHeaderAliases(t *testing.T) {
+	args := []string{
+		"--access-token", "access-token-value",
+		"--auth_token=auth-token-value",
+		"--client-secret", "client-secret-value",
+		"--apikey=apikey-value",
+		"-H", "Authorization: Bearer header-bearer-value",
+		"--header=X-API-Key: header-key-value",
+		"--headers", `{"Cookie":"session=header-cookie-value","X-Mode":"dev"}`,
+		"-HAuthorization: Bearer compact-header-value",
+	}
+	values := configuredSecretArgValues(args)
+	got := redactSensitiveText(strings.Join(args, "\n"), values)
+	for _, secret := range []string{
+		"access-token-value", "auth-token-value", "client-secret-value",
+		"apikey-value", "header-bearer-value", "header-key-value", "header-cookie-value",
+		"compact-header-value",
+	} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("credential argument %q leaked: %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, `"X-Mode":"dev"`) {
+		t.Fatalf("ordinary header value was redacted: %q", got)
 	}
 }
 

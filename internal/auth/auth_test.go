@@ -3,6 +3,7 @@ package auth
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -144,7 +145,7 @@ func TestSave_AtomicReplace(t *testing.T) {
 	}
 	// After the rewrite there must be exactly one auth.json (no .auth.json.*
 	// temp leftovers from a botched cleanup).
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(filepath.Dir(Path()))
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
 	}
@@ -157,10 +158,15 @@ func TestSave_AtomicReplace(t *testing.T) {
 			count++
 			continue
 		}
-		t.Errorf("unexpected leftover file: %s", e.Name())
+		if strings.HasPrefix(e.Name(), ".auth.json.") {
+			t.Errorf("unexpected auth tempfile leftover: %s", e.Name())
+		}
 	}
 	if count != 1 {
 		t.Errorf("auth.json count = %d, want 1", count)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auth.json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy root-level auth.json unexpectedly remains: %v", err)
 	}
 	got, _ := Get("anthropic")
 	if got != "sk-v2" {

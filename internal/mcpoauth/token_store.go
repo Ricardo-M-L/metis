@@ -1,6 +1,7 @@
 package mcpoauth
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,10 +13,12 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
-	"github.com/Ricardo-M-L/metis/internal/config"
 )
 
-const tokenEntryFormatVersion = 2
+const (
+	tokenEntryFormatVersion = 2
+	tokenStoreMaxJSONBytes  = 4 << 20
+)
 
 var (
 	// ErrCredentialMissing means no credential exists for the requested MCP
@@ -69,14 +72,25 @@ func (e *StoreError) Unwrap() error {
 	return e.Err
 }
 
-// TokenStore persists per-server OAuth entries to ~/.metis/mcp-oauth.json.
+// TokenStore persists per-server OAuth entries below the private
+// ~/.metis/.credentials directory.
 type TokenStore struct {
-	path string
+	path       string
+	legacyPath string
 }
 
 // NewTokenStore opens (lazily) the per-user token store.
 func NewTokenStore() *TokenStore {
-	return &TokenStore{path: filepath.Join(config.Home(), "mcp-oauth.json")}
+	credentialDir := auth.CredentialDirectory()
+	path, legacyPath := "", ""
+	if credentialDir != "" {
+		path = filepath.Join(credentialDir, "mcp-oauth.json")
+		legacyPath = filepath.Join(filepath.Dir(credentialDir), "mcp-oauth.json")
+	}
+	return &TokenStore{
+		path:       path,
+		legacyPath: legacyPath,
+	}
 }
 
 func canonicalOAuthURL(raw string) (string, error) {
@@ -222,33 +236,13 @@ func (s *TokenStore) PutEntry(server string, entry *TokenEntry) error {
 	if strings.TrimSpace(server) == "" {
 		return fmt.Errorf("mcp oauth: empty token-store server key")
 	}
-	if entry == nil || entry.Token == nil {
-		return fmt.Errorf("mcp oauth: nil token entry")
-	}
-	entry = cloneTokenEntry(entry)
-	entry.FormatVersion = tokenEntryFormatVersion
-	for label, value := range map[string]*string{
-		"server": &entry.ServerURL, "resource": &entry.ResourceURL,
-		"issuer": &entry.Issuer, "authorization endpoint": &entry.AuthURL,
-		"token endpoint": &entry.TokenURL,
-	} {
-		if strings.TrimSpace(*value) == "" {
-			continue
-		}
-		canonical, err := canonicalOAuthURL(*value)
-		if err != nil {
-			return fmt.Errorf("mcp oauth: invalid %s URL: %w", label, err)
-		}
-		*value = canonical
-	}
-	if entry.ServerURL != "" && entry.ResourceURL != "" && entry.ServerURL != entry.ResourceURL {
-		return fmt.Errorf(
-			"mcp oauth: resource URL %q does not match bound server URL %q",
-			entry.ResourceURL, entry.ServerURL,
-		)
+	var err error
+	entry, err = normalizeTokenEntry(entry)
+	if err != nil {
+		return err
 	}
 
-	err := withTokenStoreLock(s.path, tokenStoreLockTimeout, func() error {
+	err = withTokenStoreLock(s.path, tokenStoreLockTimeout, func() error {
 		entries, err := s.loadUnlocked()
 		if err != nil {
 			return err
@@ -262,47 +256,170 @@ func (s *TokenStore) PutEntry(server string, entry *TokenEntry) error {
 	return nil
 }
 
+func normalizeTokenEntry(entry *TokenEntry) (*TokenEntry, error) {
+	if entry == nil || entry.Token == nil {
+		return nil, fmt.Errorf("mcp oauth: nil token entry")
+	}
+	entry = cloneTokenEntry(entry)
+	entry.FormatVersion = tokenEntryFormatVersion
+	for label, value := range map[string]*string{
+		"server": &entry.ServerURL, "resource": &entry.ResourceURL,
+		"issuer": &entry.Issuer, "authorization endpoint": &entry.AuthURL,
+		"token endpoint": &entry.TokenURL,
+	} {
+		if strings.TrimSpace(*value) == "" {
+			continue
+		}
+		canonical, err := canonicalOAuthURL(*value)
+		if err != nil {
+			return nil, fmt.Errorf("mcp oauth: invalid %s URL: %w", label, err)
+		}
+		*value = canonical
+	}
+	if entry.ServerURL != "" && entry.ResourceURL != "" && entry.ServerURL != entry.ResourceURL {
+		return nil, fmt.Errorf(
+			"mcp oauth: resource URL %q does not match bound server URL %q",
+			entry.ResourceURL, entry.ServerURL,
+		)
+	}
+	return entry, nil
+}
+
+func tokenEntriesEqual(a, b *TokenEntry) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.FormatVersion != b.FormatVersion || a.ServerURL != b.ServerURL ||
+		a.ResourceURL != b.ResourceURL || a.Issuer != b.Issuer ||
+		a.ClientID != b.ClientID || a.AuthURL != b.AuthURL ||
+		a.TokenURL != b.TokenURL || a.legacy != b.legacy ||
+		len(a.Scopes) != len(b.Scopes) || (a.Token == nil) != (b.Token == nil) {
+		return false
+	}
+	for i := range a.Scopes {
+		if a.Scopes[i] != b.Scopes[i] {
+			return false
+		}
+	}
+	if a.Token == nil {
+		return true
+	}
+	return a.Token.AccessToken == b.Token.AccessToken &&
+		a.Token.RefreshToken == b.Token.RefreshToken &&
+		a.Token.ExpiresAt.Equal(b.Token.ExpiresAt) &&
+		a.Token.Scope == b.Token.Scope &&
+		a.Token.TokenType == b.Token.TokenType
+}
+
+// compareAndSwapEntry commits a refreshed credential only while the exact
+// record used to start the network refresh remains current. It returns the
+// winning record: replacement on success, a concurrent login's record on a
+// conflict, or nil when a concurrent logout removed it.
+func (s *TokenStore) compareAndSwapEntry(server string, expected, replacement *TokenEntry) (*TokenEntry, error) {
+	if strings.TrimSpace(server) == "" {
+		return nil, fmt.Errorf("mcp oauth: empty token-store server key")
+	}
+	if expected == nil || expected.Token == nil {
+		return nil, fmt.Errorf("mcp oauth: nil expected token entry")
+	}
+	replacement, err := normalizeTokenEntry(replacement)
+	if err != nil {
+		return nil, err
+	}
+	var resolved *TokenEntry
+	err = withTokenStoreLock(s.path, tokenStoreLockTimeout, func() error {
+		entries, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		current := entries[server]
+		if !tokenEntriesEqual(current, expected) {
+			resolved = cloneTokenEntry(current)
+			return nil
+		}
+		entries[server] = replacement
+		if err := s.writeUnlocked(entries); err != nil {
+			return err
+		}
+		resolved = cloneTokenEntry(replacement)
+		return nil
+	})
+	if err != nil {
+		return nil, &StoreError{Op: "compare-and-swap refresh", Path: s.path, Err: err}
+	}
+	return resolved, nil
+}
+
 func (s *TokenStore) loadUnlocked() (map[string]*TokenEntry, error) {
-	entries := map[string]*TokenEntry{}
-	info, err := os.Lstat(s.path)
-	if os.IsNotExist(err) {
+	if s == nil || strings.TrimSpace(s.path) == "" {
+		return nil, errors.New("MCP OAuth credential directory is unavailable")
+	}
+	entries, found, err := s.loadPathUnlocked(s.path)
+	if err != nil {
+		return nil, err
+	}
+	if s.legacyPath == "" || filepath.Clean(s.legacyPath) == filepath.Clean(s.path) {
 		return entries, nil
 	}
+	legacy, legacyFound, err := s.loadPathUnlocked(s.legacyPath)
 	if err != nil {
 		return nil, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("refusing symlink token store")
+	if !legacyFound {
+		return entries, nil
 	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("token store is not a regular file")
+	if !found {
+		entries = legacy
+	} else {
+		// Canonical records win conflicts, but preserve servers only known to an
+		// older concurrently installed client.
+		for server, entry := range legacy {
+			if _, exists := entries[server]; !exists {
+				entries[server] = entry
+			}
+		}
 	}
-	if err := secureTokenStoreFile(s.path); err != nil {
-		return nil, fmt.Errorf("secure token store for current user: %w", err)
+	if err := s.writeUnlocked(entries); err != nil {
+		return nil, fmt.Errorf("migrate legacy MCP OAuth token store: %w", err)
 	}
+	if err := removeLegacyTokenStore(s.legacyPath); err != nil {
+		return nil, fmt.Errorf("remove migrated legacy MCP OAuth token store: %w", err)
+	}
+	return entries, nil
+}
 
-	file, err := os.Open(s.path)
-	if err != nil {
-		return nil, err
+func (s *TokenStore) loadPathUnlocked(storePath string) (map[string]*TokenEntry, bool, error) {
+	entries := map[string]*TokenEntry{}
+	file, found, err := openTokenStoreFile(storePath, tokenStoreMaxJSONBytes)
+	if err != nil || !found {
+		return entries, found, err
 	}
 	defer file.Close()
-	openedInfo, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !os.SameFile(info, openedInfo) {
-		return nil, fmt.Errorf("token store changed while opening")
-	}
 
+	data, err := io.ReadAll(io.LimitReader(file, tokenStoreMaxJSONBytes+1))
+	if err != nil {
+		return nil, false, fmt.Errorf("read token store: %w", err)
+	}
+	if len(data) > tokenStoreMaxJSONBytes {
+		return nil, false, fmt.Errorf("token store is too large")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	var rawEntries map[string]json.RawMessage
-	if err := json.NewDecoder(file).Decode(&rawEntries); err != nil {
+	if err := decoder.Decode(&rawEntries); err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("decode token store: empty file")
+			return nil, false, fmt.Errorf("decode token store: empty file")
 		}
-		return nil, fmt.Errorf("decode token store: %w", err)
+		return nil, false, fmt.Errorf("decode token store: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, false, fmt.Errorf("decode token store: trailing JSON value")
+		}
+		return nil, false, fmt.Errorf("decode token store: %w", err)
 	}
 	if rawEntries == nil {
-		return nil, fmt.Errorf("decode token store: expected an object")
+		return nil, false, fmt.Errorf("decode token store: expected an object")
 	}
 	for server, raw := range rawEntries {
 		var probe struct {
@@ -311,15 +428,15 @@ func (s *TokenStore) loadUnlocked() (map[string]*TokenEntry, error) {
 			Token         json.RawMessage `json:"token"`
 		}
 		if err := json.Unmarshal(raw, &probe); err != nil {
-			return nil, fmt.Errorf("decode token entry %q: %w", server, err)
+			return nil, false, fmt.Errorf("decode token entry %q: %w", server, err)
 		}
 		if probe.FormatVersion != 0 || probe.ServerURL != "" || len(probe.Token) > 0 {
 			var entry TokenEntry
 			if err := json.Unmarshal(raw, &entry); err != nil {
-				return nil, fmt.Errorf("decode token entry %q: %w", server, err)
+				return nil, false, fmt.Errorf("decode token entry %q: %w", server, err)
 			}
 			if entry.Token == nil {
-				return nil, fmt.Errorf("decode token entry %q: missing token", server)
+				return nil, false, fmt.Errorf("decode token entry %q: missing token", server)
 			}
 			entries[server] = &entry
 			continue
@@ -330,11 +447,28 @@ func (s *TokenStore) loadUnlocked() (map[string]*TokenEntry, error) {
 		// binding, so EnsureToken requires an explicit login before use.
 		var token auth.Token
 		if err := json.Unmarshal(raw, &token); err != nil {
-			return nil, fmt.Errorf("decode legacy token entry %q: %w", server, err)
+			return nil, false, fmt.Errorf("decode legacy token entry %q: %w", server, err)
 		}
 		entries[server] = &TokenEntry{Token: &token, legacy: true}
 	}
-	return entries, nil
+	return entries, true, nil
+}
+
+func removeLegacyTokenStore(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("refusing to remove symlinked or non-regular legacy MCP OAuth token store")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncTokenStoreDir(filepath.Dir(path))
 }
 
 func (s *TokenStore) writeUnlocked(entries map[string]*TokenEntry) error {
@@ -342,7 +476,13 @@ func (s *TokenStore) writeUnlocked(entries map[string]*TokenEntry) error {
 	if err != nil {
 		return fmt.Errorf("encode token store: %w", err)
 	}
+	if len(bytes) > tokenStoreMaxJSONBytes {
+		return fmt.Errorf("encoded token store is too large")
+	}
 	dir := filepath.Dir(s.path)
+	if err := ensurePrivateTokenStoreDir(dir); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, ".mcp-oauth-*.tmp")
 	if err != nil {
 		return err
@@ -376,6 +516,9 @@ func (s *TokenStore) writeUnlocked(entries map[string]*TokenEntry) error {
 			return fmt.Errorf("token store is not a regular file")
 		}
 	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := ensurePrivateTokenStoreDir(dir); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, s.path); err != nil {

@@ -426,6 +426,18 @@ func TestBuildProvider_Custom_UnknownTransport(t *testing.T) {
 	}
 }
 
+func TestBuildProviderRejectsRemotePlainHTTPCredentialEndpoint(t *testing.T) {
+	cfg := newCfgWithCustom("insecure", config.ProviderRaw{
+		Transport: "openai_chat",
+		BaseURL:   "http://api.example.test/v1",
+		Model:     "example-model",
+		APIKey:    "test-only-key",
+	})
+	if _, err := BuildProviderWithoutPreconnect(cfg, "insecure", ""); err == nil || !strings.Contains(err.Error(), "HTTPS") {
+		t.Fatalf("remote plain HTTP endpoint was accepted: %v", err)
+	}
+}
+
 func TestBuildProvider_Custom_ModelOverride(t *testing.T) {
 	t.Setenv("FAKE_KEY", "sk-test")
 	cfg := newCfgWithCustom("ds", config.ProviderRaw{

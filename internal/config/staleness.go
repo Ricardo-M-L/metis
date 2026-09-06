@@ -151,6 +151,10 @@ func LoadWithSnapshot() (*Config, []string, *Snapshot, error) {
 	// Snapshot every path searchPaths considered, NOT just those that
 	// existed at load time — so a config.toml that's created
 	// mid-session shows up as NewlyAppeared on next Diff.
-	snap := NewSnapshot(searchPaths())
+	paths, err := searchPaths()
+	if err != nil {
+		return cfg, loaded, nil, err
+	}
+	snap := NewSnapshot(paths)
 	return cfg, loaded, snap, nil
 }

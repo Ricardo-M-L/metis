@@ -19,6 +19,8 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 )
 
 // Exit codes. Numbering matches the minimax-cli scheme (`src/cli/exit.ts`)
@@ -132,6 +134,19 @@ func Classify(err error) int {
 	if errors.As(err, &opErr) {
 		return Network
 	}
+	if errors.Is(err, transport.ErrNetwork) {
+		return Network
+	}
+
+	var oauthStatus interface{ OAuthStatusCode() int }
+	if errors.As(err, &oauthStatus) {
+		switch oauthStatus.OAuthStatusCode() {
+		case 401, 403:
+			return Auth
+		case 429:
+			return Quota
+		}
+	}
 
 	// Heuristic string layer (SDK errors / wrapped HTTP errors). Order
 	// matters: keep Network ahead of ContentFilter so "connection
@@ -141,13 +156,13 @@ func Classify(err error) int {
 	case containsAny(low, "usage:", "unknown flag", "unknown command", "flag provided but not defined",
 		"is required", "argument required", "expected argument"):
 		return Usage
-	case containsAny(low, "401 ", "403 ", "unauthorized", "missing api key", "invalid api key", "api key not found"):
+	case containsAny(low, "401 ", "403 ", "http 401", "http 403", "unauthorized", "missing api key", "invalid api key", "api key not found"):
 		return Auth
 	case containsAny(low, "429 ", "rate limit", "quota", "insufficient credits", "billing"):
 		return Quota
 	case containsAny(low, "timeout", "deadline exceeded", "context deadline"):
 		return Timeout
-	case containsAny(low, "no such host", "connection refused", "network is unreachable", "dial tcp", "tls:"):
+	case containsAny(low, "no such host", "connection refused", "connection reset", "broken pipe", "network is unreachable", "dial tcp", "read tcp", "tls:"):
 		return Network
 	case containsAny(low, "content_filter", "content policy", "safety", "refused on safety"):
 		return ContentFilter

@@ -170,7 +170,7 @@ func pickRecorder(outFile string) (*exec.Cmd, error) {
 func whisperTranscribe(audio []byte) (string, error) {
 	apiKey, err := auth.Get("openai")
 	if err != nil || apiKey == "" {
-		return "", fmt.Errorf("openai api key required for voice transcription — run `metis auth login`")
+		return "", fmt.Errorf("openai api key required for voice transcription — run `metis login openai`")
 	}
 
 	body := &bytes.Buffer{}

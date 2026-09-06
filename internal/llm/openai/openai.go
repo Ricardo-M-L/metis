@@ -24,6 +24,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
@@ -53,6 +54,57 @@ const (
 )
 
 var dbgOpenAI = os.Getenv("METIS_DEBUG_OPENAI") == "1"
+
+// chatRedactedError is the public error boundary for Chat Completions.
+// Compatible gateways sometimes echo the Authorization value in a response
+// body or transport error. Preserve only secret-free classifications when an
+// error leaves the provider so callers cannot recover the original text via
+// errors.Unwrap.
+type chatRedactedError struct {
+	message        string
+	classification error
+}
+
+func (e *chatRedactedError) Error() string { return e.message }
+func (e *chatRedactedError) Unwrap() error { return e.classification }
+
+func chatSafeClassification(err error) error {
+	var safe []error
+	if transport.IsNetworkError(err) {
+		safe = append(safe, transport.ErrNetwork)
+	}
+	for _, candidate := range []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		io.ErrClosedPipe,
+	} {
+		if errors.Is(err, candidate) {
+			safe = append(safe, candidate)
+		}
+	}
+	return errors.Join(safe...)
+}
+
+func redactChatError(err error, exactValues ...string) error {
+	if err == nil {
+		return nil
+	}
+	safe := &chatRedactedError{
+		message:        security.RedactValues(err.Error(), exactValues...),
+		classification: chatSafeClassification(err),
+	}
+	var exhausted *transport.RetryExhaustedError
+	if errors.As(err, &exhausted) {
+		return &transport.RetryExhaustedError{Err: safe, Attempts: exhausted.Attempts}
+	}
+	return safe
+}
+
+func chatHTTPStatusError(statusCode int, raw string, exactValues ...string) error {
+	return fmt.Errorf("openai %d: %s", statusCode, transport.Truncate(security.RedactValues(raw, exactValues...), 500))
+}
 
 // OpenAI implements Provider against /v1/chat/completions.
 // Compatible with any OpenAI-Chat-style endpoint (Together, Groq, Ollama, etc.)
@@ -1012,7 +1064,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 			}
 			if resp.StatusCode >= 400 {
 				lastBody = string(rb)
-				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
+				httpErr := chatHTTPStatusError(resp.StatusCode, lastBody, o.APIKey)
 				if transport.IsRetryableStatus(resp.StatusCode) {
 					after := transport.ParseRetryAfter(resp)
 					if resp.StatusCode == http.StatusTooManyRequests {
@@ -1047,7 +1099,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, redactChatError(err, o.APIKey)
 	}
 	if len(or.Choices) == 0 {
 		return nil, errors.New("openai: empty choices")
@@ -1095,7 +1147,7 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 					return o.responseBodyReadError(resp, readErr)
 				}
 				lastBody = string(rb)
-				httpErr := fmt.Errorf("openai %d: %s", resp.StatusCode, transport.Truncate(lastBody, 500))
+				httpErr := chatHTTPStatusError(resp.StatusCode, lastBody, o.APIKey)
 				if transport.IsRetryableStatus(resp.StatusCode) {
 					after := transport.ParseRetryAfter(resp)
 					if resp.StatusCode == http.StatusTooManyRequests {
@@ -1126,9 +1178,9 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 	}
 	if err != nil {
 		release()
-		return nil, err
+		return nil, redactChatError(err, o.APIKey)
 	}
-	return &requestSlotStream{StreamReader: newOpenAIStream(resp.Body), release: release}, nil
+	return &requestSlotStream{StreamReader: newOpenAIStream(resp.Body, o.APIKey), release: release}, nil
 }
 
 // requestSlotStream retains an OpenAI concurrency slot for the lifetime of a
@@ -1182,8 +1234,9 @@ func (o *OpenAI) responseBodyReadError(resp *http.Response, readErr error) error
 // --- SSE stream ---
 
 type openAIStream struct {
-	body io.ReadCloser
-	sse  *sse.Reader
+	body        io.ReadCloser
+	sse         *sse.Reader
+	exactValues []string
 	// toolIDPrefix is random for every response. Unlike a process-local
 	// counter, it cannot repeat merely because Metis restarted while old
 	// synthetic ids are still present in session history.
@@ -1220,10 +1273,11 @@ type oaiCallAccum struct {
 	JSONBuf     strings.Builder
 }
 
-func newOpenAIStream(body io.ReadCloser) *openAIStream {
+func newOpenAIStream(body io.ReadCloser, exactValues ...string) *openAIStream {
 	return &openAIStream{
 		body:         body,
 		sse:          sse.NewReader(body),
+		exactValues:  append([]string(nil), exactValues...),
 		toolIDPrefix: newSyntheticToolIDPrefix(),
 		calls:        make(map[int]*oaiCallAccum),
 		emittedStart: make(map[int]bool),
@@ -1250,7 +1304,9 @@ func syntheticToolUseID(prefix string, key int) string {
 	return fmt.Sprintf("metis_oai_%s_%d", prefix, key)
 }
 
-func (s *openAIStream) Close() error { return s.body.Close() }
+func (s *openAIStream) Close() error {
+	return redactChatError(s.body.Close(), s.exactValues...)
+}
 
 func (s *openAIStream) newCallKey(hasIndex, anonymous bool) int {
 	key := s.nextCallKey
@@ -1401,11 +1457,12 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 			if errors.Is(err, io.EOF) {
 				return StreamEvent{Type: "message_stop"}, io.EOF
 			}
-			return StreamEvent{Type: "error", Err: err}, err
+			safeErr := redactChatError(err, s.exactValues...)
+			return StreamEvent{Type: "error", Err: safeErr}, safeErr
 		}
 		payload := frame.Data
 		if dbgOpenAI {
-			fmt.Fprintf(os.Stderr, "[oai] raw=%s\n", payload)
+			fmt.Fprintf(os.Stderr, "[oai] raw=%s\n", security.RedactValues(payload, s.exactValues...))
 		}
 		if payload == "[DONE]" {
 			// flush any pending tool_use_stop, then enqueue message_stop.

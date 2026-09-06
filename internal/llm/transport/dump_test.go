@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -125,6 +126,10 @@ func TestDumpTransport_RedactsAuthHeader(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer sk-secret-DO-NOT-LEAK")
 	req.Header.Set("X-API-Key", "another-secret")
 	req.Header.Set("X-Goog-Api-Key", "gemini-secret-DO-NOT-LEAK")
+	req.Header.Set("ChatGPT-Account-ID", "acct-private-123")
+	req.Header.Set("X-Custom-Access-Token", "vendor-opaque-credential")
+	req.Header.Set("Cookie", "session=opaque-cookie")
+	req.Header.Set("X-Trace-ID", "trace-visible")
 	if _, err := rt.RoundTrip(req); err != nil {
 		t.Fatal(err)
 	}
@@ -142,6 +147,14 @@ func TestDumpTransport_RedactsAuthHeader(t *testing.T) {
 		}
 		if strings.Contains(string(raw), "gemini-secret-DO-NOT-LEAK") {
 			t.Errorf("X-Goog-Api-Key not redacted; headers=%s", raw)
+		}
+		for _, sensitive := range []string{"acct-private-123", "vendor-opaque-credential", "opaque-cookie"} {
+			if strings.Contains(string(raw), sensitive) {
+				t.Errorf("sensitive metadata %q not redacted; headers=%s", sensitive, raw)
+			}
+		}
+		if !strings.Contains(string(raw), "trace-visible") {
+			t.Errorf("ordinary diagnostic header unexpectedly redacted; headers=%s", raw)
 		}
 		if !strings.Contains(string(raw), "REDACTED") {
 			t.Errorf("expected [REDACTED] marker; headers=%s", raw)
@@ -351,6 +364,154 @@ func TestDumpTransport_ErrorEntry(t *testing.T) {
 	}
 	if !hadError {
 		t.Errorf("no error entry in dump; got %+v", entries)
+	}
+}
+
+func TestDumpTransport_ErrorEntryRedactsRecognizableAndOpaqueHeaderSecrets(t *testing.T) {
+	path := setupDumpTest(t)
+	jwt := "eyJ" + strings.Repeat("a", 12) + "." + strings.Repeat("b", 12) + "." + strings.Repeat("c", 11) + "-"
+	stub := &stubRT{err: errors.New("gateway account acct-short and credential vendor-opaque-secret; jwt=" + jwt)}
+	rt := WrapRoundTripper(stub, "p", nil)
+	req := newReq(t)
+	req.Header.Set("ChatGPT-Account-ID", "acct-short")
+	req.Header.Set("X-API-Key", "PrivateScheme vendor-opaque-secret")
+	if _, err := rt.RoundTrip(req); err == nil {
+		t.Fatal("expected error pass-through")
+	}
+	entries := drainDumpFile(t, path, 2)
+	for _, e := range entries {
+		if e.Type != "error" {
+			continue
+		}
+		for _, sensitive := range []string{"acct-short", "vendor-opaque-secret", jwt} {
+			if strings.Contains(e.Error, sensitive) {
+				t.Fatalf("dump error leaked %q: %s", sensitive, e.Error)
+			}
+		}
+		if !strings.Contains(e.Error, "[REDACTED]") {
+			t.Fatalf("dump error lacks redaction marker: %s", e.Error)
+		}
+		return
+	}
+	t.Fatal("no error entry in dump")
+}
+
+func TestDumpTransport_ResponseBodiesRedactExactRequestCredentials(t *testing.T) {
+	accessToken := "opaqueDumpToken_52"
+	accountID := "opaqueDumpAccount_61"
+	assertResponseDumpRedacted := func(t *testing.T, entries []dumpEntry) {
+		t.Helper()
+		for _, entry := range entries {
+			if entry.Type != "response" {
+				continue
+			}
+			body := string(entry.Body)
+			if strings.Contains(body, accessToken) || strings.Contains(body, accountID) {
+				t.Fatal("response dump retained an exact request credential")
+			}
+			if !strings.Contains(body, "[REDACTED]") {
+				t.Fatal("response dump did not contain a redaction marker")
+			}
+			return
+		}
+		t.Fatal("no response entry in dump")
+	}
+
+	newCredentialRequest := func(t *testing.T) *http.Request {
+		t.Helper()
+		req, err := http.NewRequestWithContext(context.Background(), "POST", "https://api.example.test/v1/responses", bytes.NewReader([]byte(`{"prompt":"safe"}`)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("ChatGPT-Account-ID", accountID)
+		return req
+	}
+
+	t.Run("json response", func(t *testing.T) {
+		path := setupDumpTest(t)
+		body := `{"error":{"message":"token ` + accessToken + ` account ` + accountID + `"}}`
+		stub := &stubRT{resp: &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}}
+		resp, err := WrapRoundTripper(stub, "openai-codex", nil).RoundTrip(newCredentialRequest(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		assertResponseDumpRedacted(t, drainDumpFile(t, path, 2))
+	})
+
+	t.Run("sse response", func(t *testing.T) {
+		path := setupDumpTest(t)
+		body := `data: {"type":"error","message":"token ` + accessToken + ` account ` + accountID + `"}` + "\n\n"
+		stub := &stubRT{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}}
+		resp, err := WrapRoundTripper(stub, "openai-codex", nil).RoundTrip(newCredentialRequest(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		assertResponseDumpRedacted(t, drainDumpFile(t, path, 2))
+	})
+}
+
+func TestDumpTransportRedactsJSONEncodedCredentials(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "json"
+		if stream {
+			name = "sse"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := setupDumpTest(t)
+			const secret = "opaque/vendor-test"
+			body := `{"error":{"message":"rejected op\u0061que\/vendor-test"}}`
+			contentType := "application/json"
+			if stream {
+				body = "data: " + body + "\n\n"
+				contentType = "text/event-stream"
+			}
+			stub := &stubRT{resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{contentType}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}}
+			req := newReq(t)
+			req.Header.Set("Authorization", "Bearer "+secret)
+			resp, err := WrapRoundTripper(stub, "openai", nil).RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wireBody, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr != nil || string(wireBody) != body {
+				t.Fatal("diagnostic redaction changed the provider response")
+			}
+			for _, entry := range drainDumpFile(t, path, 2) {
+				if entry.Type != "response" {
+					continue
+				}
+				var decoded any
+				if err := json.Unmarshal(entry.Body, &decoded); err != nil {
+					t.Fatal(err)
+				}
+				normalized, err := json.Marshal(decoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(string(normalized), secret) || !strings.Contains(string(normalized), "[REDACTED]") {
+					t.Fatalf("dump retained an encoded credential: %s", normalized)
+				}
+				return
+			}
+			t.Fatal("missing response dump")
+		})
 	}
 }
 

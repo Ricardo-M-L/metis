@@ -1,4 +1,5 @@
-// Package auth manages provider credentials persisted to ~/.metis/auth.json.
+// Package auth manages provider credentials persisted below
+// ~/.metis/.credentials.
 //
 // The file format and 0o600 perm match opencode's auth.json:
 //
@@ -9,7 +10,7 @@
 //
 // This is a deliberately separate file from config.toml. config.toml is meant
 // to be diffable / shareable; auth.json holds raw secrets and never should be.
-// Keeping them split also lets `metis auth login` rewrite credentials atomically
+// Keeping them split also lets `metis login` rewrite credentials atomically
 // without touching unrelated config.
 package auth
 
@@ -17,24 +18,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
-// home resolves the metis home directory the same way internal/config.Home() does.
-// We deliberately don't import config here — config consults auth.Get() inside
-// ResolveAPIKey, so importing back would form a cycle. Keeping a private copy is
-// fine because the rule (env METIS_HOME wins, else ~/.metis) is short and stable.
-func home() string {
-	if h := os.Getenv("METIS_HOME"); h != "" {
-		return h
-	}
-	hd, _ := os.UserHomeDir()
-	return filepath.Join(hd, ".metis")
-}
+const authStoreMaxJSONBytes = 4 << 20
 
-// File is the on-disk shape of ~/.metis/auth.json.
+// File is the on-disk shape of ~/.metis/.credentials/auth.json.
 // Keyed by provider id ("anthropic", "openai", "minimax", or any custom id).
 type File map[string]Entry
 
@@ -42,82 +35,178 @@ type File map[string]Entry
 // kept as a discriminator so future flows (oauth, instance creds) slot in
 // without a schema migration.
 type Entry struct {
-	Type string `json:"type"`
-	Key  string `json:"key"`
-}
-
-// Path returns the canonical location of auth.json under the metis home.
-func Path() string {
-	return filepath.Join(home(), "auth.json")
+	Type     string           `json:"type"`
+	Key      string           `json:"key"`
+	Endpoint *EndpointBinding `json:"endpoint,omitempty"`
 }
 
 // Load reads auth.json. A missing file is NOT an error — it returns an empty
 // map so callers can append-and-save without first checking existence.
 func Load() (File, error) {
-	p := Path()
-	// Permission hygiene: auth.json holds API keys. minimax-cli's
-	// `auth/credentials.ts` does the same check — if the file is
-	// world- or group-readable, warn the user and tighten it back to
-	// 0600 before reading. We don't refuse to load (that would brick
-	// users mid-session over a permission glitch), just self-heal +
-	// stderr warning. See `assertSecurePerms` below for the rule.
-	assertSecurePerms(p)
-	b, err := os.ReadFile(p)
+	layout, err := currentCredentialLayout()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return File{}, nil
-		}
-		return nil, fmt.Errorf("read %s: %w", p, err)
+		return nil, err
 	}
-	if len(b) == 0 {
-		return File{}, nil
-	}
-	var f File
-	if err := json.Unmarshal(b, &f); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", p, err)
-	}
-	if f == nil {
-		f = File{}
-	}
-	return f, nil
-}
-
-// assertSecurePerms checks that the auth.json file at `p` is readable
-// only by the owner. If group/other has any access bits set, we emit
-// a one-line warning to stderr and chmod the file back to 0600. No-op
-// when the file doesn't exist (Load handles that path itself).
-//
-// Skipped on Windows: NTFS perm bits don't translate to the Unix mask,
-// and the equivalent check would have to inspect ACLs — separate
-// codepath, file an issue if you actually run metis on Windows with
-// auth.json.
-var assertSecurePerms = assertSecurePermsUnix
-
-func assertSecurePermsUnix(p string) {
-	st, err := os.Stat(p)
+	var result File
+	err = withOAuthStoreLock(layout.auth, oauthStoreLockTimeout, func() error {
+		var loadErr error
+		result, loadErr = loadAuthStoreUnlocked(layout)
+		return loadErr
+	})
 	if err != nil {
-		return
+		return nil, fmt.Errorf("read %s: %w", layout.auth, err)
 	}
-	mode := st.Mode().Perm()
-	const ownerOnly = 0o600
-	if mode&^ownerOnly == 0 {
-		return // already tight enough
-	}
-	fmt.Fprintf(os.Stderr,
-		"metis: %s has loose perms %#o; tightening to 0600\n", p, mode)
-	if err := os.Chmod(p, ownerOnly); err != nil {
-		fmt.Fprintf(os.Stderr, "metis: chmod %s: %v\n", p, err)
-	}
+	return result, nil
 }
 
 // Save writes auth.json atomically with 0o600 perms.
 // Atomic = write to a sibling temp file then rename, so a crash mid-write
 // can't leave a half-truncated credentials file.
 func Save(f File) error {
-	dir := home()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
+	layout, err := currentCredentialLayout()
+	if err != nil {
+		return err
 	}
+	return withOAuthStoreLock(layout.auth, oauthStoreLockTimeout, func() error {
+		if err := writeAuthStoreUnlocked(layout.auth, f); err != nil {
+			return fmt.Errorf("write %s: %w", layout.auth, err)
+		}
+		return removeLegacyCredentialFile(layout.legacyAuth)
+	})
+}
+
+func loadAuthStoreUnlocked(layout credentialLayout) (File, error) {
+	file, found, err := readAuthStoreFile(layout.auth)
+	if err != nil {
+		return nil, err
+	}
+	discarded := stripMisclassifiedOAuthEntries(file)
+	legacy, legacyFound, err := readAuthStoreFile(layout.legacyAuth)
+	if err != nil {
+		return nil, err
+	}
+	discarded = append(discarded, stripMisclassifiedOAuthEntries(legacy)...)
+	if found {
+		if !legacyFound {
+			if len(discarded) > 0 {
+				if err := writeAuthStoreUnlocked(layout.auth, file); err != nil {
+					return nil, fmt.Errorf("remove misclassified OAuth credential: %w", err)
+				}
+				warnMisclassifiedOAuthEntries(discarded)
+			}
+			return file, nil
+		}
+		changed := len(discarded) > 0
+		for provider, entry := range legacy {
+			if _, exists := file[provider]; !exists {
+				file[provider] = entry
+				changed = true
+			}
+		}
+		if changed {
+			if err := writeAuthStoreUnlocked(layout.auth, file); err != nil {
+				return nil, fmt.Errorf("merge legacy auth store: %w", err)
+			}
+		}
+		if err := removeLegacyCredentialFile(layout.legacyAuth); err != nil {
+			return nil, fmt.Errorf("remove merged legacy auth store: %w", err)
+		}
+		warnMisclassifiedOAuthEntries(discarded)
+		return file, nil
+	}
+	if !legacyFound {
+		return File{}, nil
+	}
+	// Migrate only after the legacy file was parsed and secured. Writing the
+	// canonical copy first makes a crash leave at least one usable credential
+	// store; removing the old copy afterwards avoids retaining duplicate secrets.
+	if err := writeAuthStoreUnlocked(layout.auth, legacy); err != nil {
+		return nil, fmt.Errorf("migrate legacy auth store: %w", err)
+	}
+	if err := removeLegacyCredentialFile(layout.legacyAuth); err != nil {
+		return nil, fmt.Errorf("remove migrated legacy auth store: %w", err)
+	}
+	warnMisclassifiedOAuthEntries(discarded)
+	return legacy, nil
+}
+
+// stripMisclassifiedOAuthEntries removes access tokens written by historical
+// OAuth code into the API-key store. They must never be sent as x-api-key or
+// to a same-named custom LLM endpoint. Anthropic's old store omitted the
+// refresh token, so the safe recovery is an explicit fresh login rather than
+// pretending the access token is a durable API key.
+func stripMisclassifiedOAuthEntries(file File) []string {
+	var discarded []string
+	for provider, entry := range file {
+		if !isMisclassifiedOAuthEntry(provider, entry.Key) {
+			continue
+		}
+		delete(file, provider)
+		discarded = append(discarded, strings.ToLower(strings.TrimSpace(provider)))
+	}
+	sort.Strings(discarded)
+	return discarded
+}
+
+func isMisclassifiedOAuthEntry(provider, key string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	key = strings.ToLower(strings.TrimSpace(key))
+	switch provider {
+	case "anthropic", "anthropic-claudeai":
+		return strings.HasPrefix(key, "sk-ant-oat")
+	case "openai-codex":
+		// This provider is OAuth-only; no value is a valid platform API key.
+		return key != ""
+	case "github":
+		return strings.HasPrefix(key, "gho_")
+	default:
+		return false
+	}
+}
+
+func warnMisclassifiedOAuthEntries(providers []string) {
+	if len(providers) == 0 {
+		return
+	}
+	providers = append([]string(nil), providers...)
+	sort.Strings(providers)
+	unique := providers[:0]
+	for _, provider := range providers {
+		if len(unique) == 0 || unique[len(unique)-1] != provider {
+			unique = append(unique, provider)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "metis: discarded legacy OAuth access token(s) misclassified as API keys for %s; sign in again with `metis login`\n", strings.Join(unique, ", "))
+}
+
+func readAuthStoreFile(path string) (File, bool, error) {
+	file, found, err := openCredentialStoreFile(path, authStoreMaxJSONBytes, true)
+	if err != nil || !found {
+		return File{}, found, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(io.LimitReader(file, authStoreMaxJSONBytes+1))
+	var result File
+	if err := decoder.Decode(&result); err != nil {
+		if errors.Is(err, io.EOF) {
+			return File{}, true, nil
+		}
+		return nil, false, fmt.Errorf("parse credential store: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, false, errors.New("parse credential store: trailing JSON value")
+		}
+		return nil, false, fmt.Errorf("parse credential store: %w", err)
+	}
+	if result == nil {
+		result = File{}
+	}
+	return result, true, nil
+}
+
+func writeAuthStoreUnlocked(final string, f File) error {
 	// Stable key order so the file diffs cleanly across runs.
 	keys := make([]string, 0, len(f))
 	for k := range f {
@@ -132,8 +221,13 @@ func Save(f File) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-
-	final := Path()
+	if len(b) > authStoreMaxJSONBytes {
+		return errors.New("encoded credential store is too large")
+	}
+	dir := filepath.Dir(final)
+	if err := ensurePrivateOAuthStoreDir(dir); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, ".auth.json.*")
 	if err != nil {
 		return fmt.Errorf("tempfile: %w", err)
@@ -149,13 +243,57 @@ func Save(f File) error {
 		_ = tmp.Close()
 		return fmt.Errorf("chmod tempfile: %w", err)
 	}
+	if err := secureOAuthStoreFile(tmpPath); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("secure tempfile: %w", err)
+	}
+	// Flush the complete credential payload and its tightened metadata before
+	// publishing the temp file with an atomic rename. Without this fsync, a
+	// successful rename can still expose an empty or stale store after a crash.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync tempfile: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close tempfile: %w", err)
 	}
-	if err := os.Rename(tmpPath, final); err != nil {
+	if info, err := os.Lstat(final); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return errors.New("refusing symlinked or non-regular credential store")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := ensurePrivateOAuthStoreDir(dir); err != nil {
+		return err
+	}
+	if err := replaceOAuthStoreFile(tmpPath, final); err != nil {
 		return fmt.Errorf("rename %s -> %s: %w", tmpPath, final, err)
 	}
+	if err := secureOAuthStoreFile(final); err != nil {
+		return committedCredentialStoreWriteError(err)
+	}
+	if err := syncOAuthStoreDir(dir); err != nil {
+		return committedCredentialStoreWriteError(err)
+	}
 	return nil
+}
+
+func removeLegacyCredentialFile(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("refusing to remove symlinked or non-regular legacy credential store")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncOAuthStoreDir(filepath.Dir(path))
 }
 
 // Set stores a provider credential and persists immediately.
@@ -167,12 +305,12 @@ func Set(provider, key string) error {
 	if key == "" {
 		return errors.New("auth: key required")
 	}
-	f, err := Load()
-	if err != nil {
-		return err
+	if isMisclassifiedOAuthEntry(provider, key) {
+		return errors.New("auth: refusing to store an OAuth access token as an API key; use the OAuth credential store or run `metis login`")
 	}
-	f[provider] = Entry{Type: "api", Key: key}
-	return Save(f)
+	return updateAuthStore(func(f File) {
+		f[provider] = Entry{Type: "api", Key: key}
+	})
 }
 
 // Get returns the api key for the exact provider id. Empty string + nil error
@@ -194,17 +332,101 @@ func Get(provider string) (string, error) {
 	return "", nil
 }
 
+// GetAPIKeyForEndpoint returns a managed API key only when it belongs to the
+// requested provider endpoint. Unbound entries are accepted solely when the
+// caller has established that this is a built-in provider's official endpoint;
+// custom and third-party endpoints must be explicitly bound by a fresh login.
+func GetAPIKeyForEndpoint(provider, transport, baseURL string, allowLegacyOfficial bool) (string, error) {
+	provider, err := validateOAuthProviderID(provider)
+	if err != nil {
+		return "", err
+	}
+	f, err := Load()
+	if err != nil {
+		return "", err
+	}
+	entry, ok := f[provider]
+	if !ok {
+		return "", nil
+	}
+	if isNamespacedKey(provider) || entry.Type != "api" {
+		return "", errors.New("auth: stored credential is not an LLM API key")
+	}
+	binding, err := NormalizeEndpointBinding(provider, transport, baseURL)
+	if err != nil {
+		return "", err
+	}
+	if entry.Endpoint == nil {
+		if allowLegacyOfficial {
+			return entry.Key, nil
+		}
+		return "", fmt.Errorf("%w for provider %q; run `metis login %s` again", ErrEndpointBindingRequired, binding.Provider, binding.Provider)
+	}
+	stored, err := NormalizeEndpointBinding(entry.Endpoint.Provider, entry.Endpoint.Transport, entry.Endpoint.BaseURL)
+	if err != nil {
+		return "", fmt.Errorf("%w for provider %q: invalid stored endpoint metadata: %v", ErrEndpointBindingMismatch, binding.Provider, err)
+	}
+	if stored != binding {
+		return "", fmt.Errorf("%w for provider %q; run `metis login %s` again", ErrEndpointBindingMismatch, binding.Provider, binding.Provider)
+	}
+	return entry.Key, nil
+}
+
+// StoredAPIKeyEndpoint reports only endpoint metadata for a managed API key;
+// it never returns the secret itself. A nil binding with present=true denotes
+// a legacy unbound entry that must be re-authenticated before a custom
+// endpoint can safely retain it.
+func StoredAPIKeyEndpoint(provider string) (binding *EndpointBinding, present bool, err error) {
+	provider, err = validateOAuthProviderID(provider)
+	if err != nil {
+		return nil, false, err
+	}
+	f, err := Load()
+	if err != nil {
+		return nil, false, err
+	}
+	var entry Entry
+	found := false
+	for storedProvider, candidate := range f {
+		if canonicalOAuthProviderID(storedProvider) == provider {
+			entry, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		return nil, false, nil
+	}
+	if isNamespacedKey(provider) || entry.Type != "api" {
+		return nil, false, errors.New("auth: stored credential is not an LLM API key")
+	}
+	if entry.Endpoint == nil {
+		return nil, true, nil
+	}
+	copy := *entry.Endpoint
+	return &copy, true, nil
+}
+
 // Remove deletes a provider entry. No-op if it didn't exist.
 func Remove(provider string) error {
-	f, err := Load()
+	return updateAuthStore(func(f File) { delete(f, provider) })
+}
+
+func updateAuthStore(update func(File)) error {
+	layout, err := currentCredentialLayout()
 	if err != nil {
 		return err
 	}
-	if _, ok := f[provider]; !ok {
-		return nil
-	}
-	delete(f, provider)
-	return Save(f)
+	return withOAuthStoreLock(layout.auth, oauthStoreLockTimeout, func() error {
+		file, err := loadAuthStoreUnlocked(layout)
+		if err != nil {
+			return err
+		}
+		update(file)
+		if err := writeAuthStoreUnlocked(layout.auth, file); err != nil {
+			return err
+		}
+		return removeLegacyCredentialFile(layout.legacyAuth)
+	})
 }
 
 // List returns provider ids that have credentials, sorted. Excludes
@@ -271,12 +493,9 @@ func SetSearchKey(backend, key string) error {
 	if key == "" {
 		return errors.New("auth: key required")
 	}
-	f, err := Load()
-	if err != nil {
-		return err
-	}
-	f[searchKeyPrefix+backend] = Entry{Type: "search", Key: key}
-	return Save(f)
+	return updateAuthStore(func(f File) {
+		f[searchKeyPrefix+backend] = Entry{Type: "search", Key: key}
+	})
 }
 
 // RemoveSearchKey deletes a backend's stored key. No-op when absent.
@@ -284,16 +503,7 @@ func RemoveSearchKey(backend string) error {
 	if backend == "" {
 		return errors.New("auth: backend required")
 	}
-	f, err := Load()
-	if err != nil {
-		return err
-	}
-	full := searchKeyPrefix + backend
-	if _, ok := f[full]; !ok {
-		return nil
-	}
-	delete(f, full)
-	return Save(f)
+	return updateAuthStore(func(f File) { delete(f, searchKeyPrefix+backend) })
 }
 
 // ListSearchKeys returns the names of all WebSearch backends that

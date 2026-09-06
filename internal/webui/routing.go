@@ -3,7 +3,6 @@ package webui
 import (
 	"net/http"
 
-	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 )
 
@@ -27,7 +26,7 @@ func (s *Server) handleRouting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	cfg, _, err := config.Load()
+	cfg, err := s.loadProviderConfig()
 	if err != nil || cfg == nil {
 		writeError(w, http.StatusInternalServerError, "config unreadable")
 		return

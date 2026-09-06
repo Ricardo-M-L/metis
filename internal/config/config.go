@@ -212,11 +212,12 @@ type LoopDetection struct {
 }
 
 type ProviderSet struct {
-	Default   string                 `toml:"default"`
-	Anthropic ProviderAnthropic      `toml:"anthropic"`
-	OpenAI    ProviderOpenAI         `toml:"openai"`
-	Gemini    ProviderGemini         `toml:"gemini"`
-	Custom    map[string]ProviderRaw `toml:"custom"`
+	Default     string                 `toml:"default"`
+	Anthropic   ProviderAnthropic      `toml:"anthropic"`
+	OpenAI      ProviderOpenAI         `toml:"openai"`
+	OpenAICodex ProviderOpenAICodex    `toml:"openai-codex"`
+	Gemini      ProviderGemini         `toml:"gemini"`
+	Custom      map[string]ProviderRaw `toml:"custom"`
 }
 
 // ProviderGemini configures the Google Generative Language API (v1beta).
@@ -333,6 +334,19 @@ type ProviderOpenAI struct {
 	HostedTools        []string `toml:"hosted_tools"`
 }
 
+// ProviderOpenAICodex configures the ChatGPT subscription-backed Codex
+// Responses endpoint. It is deliberately separate from ProviderOpenAI:
+// OpenAI platform API keys must never be sent to the ChatGPT backend, and
+// ChatGPT OAuth access tokens must never be treated as ordinary API keys.
+// OAuth credentials live in the dedicated auth store managed by metis login.
+type ProviderOpenAICodex struct {
+	Model         string  `toml:"model"`
+	MaxTokens     int     `toml:"max_tokens"`
+	ContextWindow int     `toml:"context_window"`
+	TimeoutSecs   int     `toml:"timeout_seconds"`
+	Temperature   float64 `toml:"temperature"`
+}
+
 type ProviderRaw struct {
 	// Transport picks the wire format. Recognized values:
 	//   anthropic_messages | openai_chat | openai_responses | gemini_native  (HTTP+API key)
@@ -347,7 +361,7 @@ type ProviderRaw struct {
 	// env + auth.json). Discouraged for shared / committed configs
 	// since it puts the secret in plaintext in config.toml. Useful
 	// for one-off / personal setups where rotating an env var or
-	// running `metis auth login` is friction. Mirrors the inline
+	// running `metis login` is friction. Mirrors the inline
 	// path the built-in providers (anthropic / openai / gemini) have
 	// always had — added 2026-05-09 to close the gap that made
 	// `[provider.custom.<id>] api_key = "..."` silently drop the
@@ -629,15 +643,29 @@ type SandboxBashSettings struct {
 	Mode string `toml:"mode"`
 }
 
-// Home returns the directory metis treats as its single source of truth.
-// Override with $METIS_HOME for tests or sandboxed installs; default is
-// ~/.metis (claude-code style).
+// Home returns the configured lexical METIS directory. Override with
+// $METIS_HOME for tests or sandboxed installs; default is ~/.metis
+// (claude-code style). Callers that directly read or write security-sensitive
+// files must use VerifiedHome so a long-lived process cannot follow a
+// retargeted symlink or replacement directory.
 func Home() string {
 	if h := os.Getenv("METIS_HOME"); h != "" {
 		return h
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".metis")
+}
+
+// VerifiedHome returns the process-frozen canonical METIS root after checking
+// that it is still the same directory observed earlier in this process.
+// Security-sensitive direct file surfaces use this instead of Home so they do
+// not follow a retargeted symlink or a same-path directory replacement.
+func VerifiedHome() (string, error) {
+	home, err := auth.EnsureCredentialHome("")
+	if err != nil {
+		return "", fmt.Errorf("verify metis home: %w", err)
+	}
+	return home, nil
 }
 
 // SkillsDir is the canonical user-skills root: where the dreaming
@@ -678,6 +706,13 @@ func defaults() *Config {
 				MaxTokens:   16000,
 				TimeoutSecs: 120,
 				Temperature: 1.0,
+			},
+			OpenAICodex: ProviderOpenAICodex{
+				Model:         "gpt-5.5",
+				MaxTokens:     16000,
+				ContextWindow: 200000,
+				TimeoutSecs:   120,
+				Temperature:   0,
 			},
 			Gemini: ProviderGemini{
 				APIKeyEnv: "GEMINI_API_KEY",
@@ -815,12 +850,16 @@ func shellDefault() string {
 // home-dir consolidation it also auto-migrates legacy paths
 // (~/.config/metis + ~/.local/share/metis) into ~/.metis.
 func Load() (*Config, []string, error) {
-	migrateLegacyHome()
+	paths, err := searchPaths()
+	if err != nil {
+		return nil, nil, err
+	}
+	migrateLegacyHome(filepath.Dir(paths[0]))
 
 	cfg := defaults()
 	var loaded []string
 
-	for _, path := range searchPaths() {
+	for _, path := range paths {
 		if _, err := os.Stat(path); err != nil {
 			continue
 		}
@@ -836,6 +875,13 @@ func Load() (*Config, []string, error) {
 		// has no effect.
 		if md.IsDefined("bash") || md.IsDefined("bash", "sandbox") {
 			return nil, loaded, fmt.Errorf("load %s: [bash.sandbox] is not a valid table; use [tools.bash.sandbox]", path)
+		}
+		// Codex subscription OAuth credentials are valid only for OpenAI's
+		// fixed ChatGPT backend. A checkout-controlled endpoint override would
+		// exfiltrate the bearer token and account id on the next request, so do
+		// not silently ignore or accept a base_url at any config layer.
+		if md.IsDefined("provider", "openai-codex", "base_url") {
+			return nil, loaded, fmt.Errorf("load %s: provider.openai-codex.base_url cannot be overridden; the OAuth endpoint is fixed", path)
 		}
 		loaded = append(loaded, path)
 	}
@@ -891,12 +937,18 @@ func Load() (*Config, []string, error) {
 		}
 		for _, ld := range legacyDirs {
 			if cfg.Session.Dir == ld.oldSessions {
-				cfg.Session.Dir = filepath.Join(Home(), "sessions")
+				cfg.Session.Dir = filepath.Join(filepath.Dir(paths[0]), "sessions")
 			}
 			if cfg.Session.SkillDir == ld.oldSkills {
-				cfg.Session.SkillDir = filepath.Join(Home(), "skills")
+				cfg.Session.SkillDir = filepath.Join(filepath.Dir(paths[0]), "skills")
 			}
 		}
+	}
+	// Close the directory-replacement window around the file reads above. The
+	// first searchPaths call pins the root; this second guard rejects a rename
+	// or replacement that happened while decoding the layered configuration.
+	if _, err := auth.EnsureCredentialHome(""); err != nil {
+		return nil, loaded, fmt.Errorf("verify metis home after loading config: %w", err)
 	}
 	return cfg, loaded, nil
 }
@@ -919,18 +971,36 @@ func validSandboxNetwork(network string) bool {
 	}
 }
 
-func searchPaths() []string {
+func searchPaths() ([]string, error) {
+	// Use the credential layer's process-frozen resolver for the user config
+	// too. A raw Home() lookup here would let a retargeted METIS_HOME symlink
+	// combine credentials from its original target with provider endpoints
+	// from its new target.
+	home, err := auth.EnsureCredentialHome("")
+	if err != nil {
+		return nil, fmt.Errorf("resolve metis home for config: %w", err)
+	}
 	var out []string
-	out = append(out, filepath.Join(Home(), "config.toml"))
+	out = append(out, filepath.Join(home, "config.toml"))
 	if cwd, err := os.Getwd(); err == nil {
-		out = append(out, filepath.Join(cwd, ".metis", "config.toml"))
+		projectConfig := filepath.Join(cwd, ".metis", "config.toml")
+		comparisonPath := projectConfig
+		// Getwd may retain a logical PWD alias, such as /var on macOS.
+		// Resolve only cwd: project-controlled .metis/config.toml symlinks
+		// and hardlinks must retain their project provenance.
+		if canonicalCWD, err := filepath.EvalSymlinks(cwd); err == nil {
+			comparisonPath = filepath.Join(canonicalCWD, ".metis", "config.toml")
+		}
+		if comparisonPath != out[0] {
+			out = append(out, projectConfig)
+		}
 		// Per-checkout overrides that stay out of version control —
 		// claude-code's settings.local.json equivalent. Loaded after
 		// the shared project file so a developer's local tweaks win
 		// over the committed config without editing it.
 		out = append(out, filepath.Join(cwd, ".metis", "config.local.toml"))
 	}
-	return out
+	return out, nil
 }
 
 // LoadPermissionModeForWorkspace resolves the permission mode with the same
@@ -941,8 +1011,12 @@ func searchPaths() []string {
 // (defaults or the user config) remains in force.
 func LoadPermissionModeForWorkspace(projectTrusted bool) (string, error) {
 	mode := defaults().Permission.Mode
-	userConfigPath := filepath.Clean(filepath.Join(Home(), "config.toml"))
-	for i, path := range searchPaths() {
+	paths, err := searchPaths()
+	if err != nil {
+		return "", err
+	}
+	userConfigPath := filepath.Clean(paths[0])
+	for i, path := range paths {
 		isUserConfig := i == 0 && filepath.Clean(path) == userConfigPath
 		if _, err := os.Stat(path); err != nil {
 			if os.IsNotExist(err) {
@@ -972,6 +1046,60 @@ func LoadPermissionModeForWorkspace(projectTrusted bool) (string, error) {
 	return mode, nil
 }
 
+// LoadProviderSetForWorkspace resolves provider routing with an explicit
+// workspace trust boundary. Provider endpoints and credential-source names
+// are security-sensitive: an untrusted checkout must not be able to point a
+// shell/user credential at a repository-controlled host. User configuration
+// is always trusted; project and project-local provider tables become active
+// only after the workspace trust decision has been persisted.
+func LoadProviderSetForWorkspace(projectTrusted bool) (ProviderSet, error) {
+	cfg := defaults()
+	paths, err := searchPaths()
+	if err != nil {
+		return ProviderSet{}, err
+	}
+	for i, path := range paths {
+		if i > 0 && !projectTrusted {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return ProviderSet{}, fmt.Errorf("load provider configuration %s: %w", path, err)
+		}
+		scoped := struct {
+			Provider ProviderSet `toml:"provider"`
+		}{Provider: cfg.Provider}
+		metadata, err := toml.DecodeFile(path, &scoped)
+		if err != nil {
+			return ProviderSet{}, fmt.Errorf("load provider configuration %s: %w", path, err)
+		}
+		if metadata.IsDefined("provider", "openai-codex", "base_url") {
+			return ProviderSet{}, fmt.Errorf("load %s: provider.openai-codex.base_url cannot be overridden; the OAuth endpoint is fixed", path)
+		}
+		cfg.Provider = scoped.Provider
+	}
+	return cfg.Provider, nil
+}
+
+// ApplyProviderPolicyForWorkspace replaces the provider section of an already
+// loaded Config with the source-aware view above. Keeping this as an explicit
+// post-load step mirrors the hook and fullAccess policies: interactive startup
+// records trust before calling it, while headless and Desktop startup fail
+// closed for an unseen checkout.
+func ApplyProviderPolicyForWorkspace(cfg *Config, projectTrusted bool) error {
+	if cfg == nil {
+		return errors.New("cannot apply provider trust policy to nil config")
+	}
+	providers, err := LoadProviderSetForWorkspace(projectTrusted)
+	if err != nil {
+		return err
+	}
+	cfg.Provider = providers
+	return nil
+}
+
 func isFullAccessPermissionMode(mode string) bool {
 	switch strings.TrimSpace(mode) {
 	case "fullAccess", "full":
@@ -992,8 +1120,12 @@ func isFullAccessPermissionMode(mode string) bool {
 // becomes trusted only after the workspace trust decision has been persisted.
 func SessionPermissionStateTrustedForWorkspace(projectTrusted bool) (bool, error) {
 	trusted := true
-	userConfigPath := filepath.Clean(filepath.Join(Home(), "config.toml"))
-	for i, path := range searchPaths() {
+	paths, err := searchPaths()
+	if err != nil {
+		return false, err
+	}
+	userConfigPath := filepath.Clean(paths[0])
+	for i, path := range paths {
 		isUserConfig := i == 0 && filepath.Clean(path) == userConfigPath
 		if _, err := os.Stat(path); err != nil {
 			if os.IsNotExist(err) {
@@ -1032,11 +1164,15 @@ func LoadHooksForWorkspace(projectTrusted bool) (HooksConfig, error) {
 	var scoped struct {
 		Hooks HooksConfig `toml:"hooks"`
 	}
-	for i, path := range searchPaths() {
+	paths, err := searchPaths()
+	if err != nil {
+		return HooksConfig{}, err
+	}
+	for i, path := range paths {
 		// searchPaths is ordered user first, then project and project-local.
 		// Fail closed if that ordering changes: only the exact user config path
 		// is implicitly trusted for executable hooks.
-		isUserConfig := i == 0 && filepath.Clean(path) == filepath.Clean(filepath.Join(Home(), "config.toml"))
+		isUserConfig := i == 0 && filepath.Clean(path) == filepath.Clean(paths[0])
 		if !isUserConfig && !projectTrusted {
 			continue
 		}
@@ -1095,8 +1231,7 @@ func LoadPolicy() (*Config, error) {
 // We use os.Rename, which on Unix is atomic within the same filesystem
 // and fast for whole-directory moves. Across filesystems it falls back to
 // ENXIO — in that rare case we leave the legacy data alone.
-func migrateLegacyHome() {
-	dh := Home()
+func migrateLegacyHome(dh string) {
 	if entries, err := os.ReadDir(dh); err == nil && len(entries) > 0 {
 		return // already populated, nothing to do
 	}
@@ -1203,11 +1338,11 @@ func dirHasFiles(path string) bool {
 // ResolveAPIKey returns the API key for the given provider using a 3-tier chain:
 //
 //  1. Environment variable (api_key_env from config.toml)
-//  2. ~/.metis/auth.json   (written by `metis auth login`)
+//  2. ~/.metis/.credentials/auth.json   (written by `metis login`)
 //  3. config.toml api_key   (legacy / explicit)
 //
 // Env wins so existing CI / shell-export flows keep working without users having
-// to re-run the wizard. auth.json is the preferred place for hand-managed keys
+// to re-run the wizard. The private credential store is preferred for hand-managed keys
 // (0o600, opencode-style). config.toml api_key is kept for backward compat — new
 // users should never need to write it.
 //
@@ -1223,7 +1358,9 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 				return v, nil
 			}
 		}
-		if k, _ := auth.Get(provider); k != "" {
+		if k, err := storedAPIKey(provider, "anthropic_messages", c.Provider.Anthropic.BaseURL, isOfficialManagedEndpoint(provider, "anthropic_messages", c.Provider.Anthropic.BaseURL)); err != nil {
+			return "", err
+		} else if k != "" {
 			return k, nil
 		}
 		if c.Provider.Anthropic.APIKey != "" {
@@ -1235,12 +1372,23 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 				return v, nil
 			}
 		}
-		if k, _ := auth.Get(provider); k != "" {
+		transport := "openai_chat"
+		if strings.EqualFold(strings.TrimSpace(c.Provider.OpenAI.WireProtocol), "responses") {
+			transport = "openai_responses"
+		}
+		if k, err := storedAPIKey(provider, transport, c.Provider.OpenAI.BaseURL, isOfficialManagedEndpoint(provider, transport, c.Provider.OpenAI.BaseURL)); err != nil {
+			return "", err
+		} else if k != "" {
 			return k, nil
 		}
 		if c.Provider.OpenAI.APIKey != "" {
 			return c.Provider.OpenAI.APIKey, nil
 		}
+	case "openai-codex":
+		// ChatGPT Plus/Pro is OAuth-only. In particular, do not fall through
+		// to auth.Get: a legacy entry named openai-codex is still an API key
+		// and must never be sent to the ChatGPT Codex endpoint.
+		return "", fmt.Errorf("%w for provider %q; run `metis login openai-codex`", ErrMissingAPIKey, provider)
 	case "gemini":
 		// Both GEMINI_API_KEY (newer official name) and GOOGLE_API_KEY
 		// (legacy) are recognized — Google's own SDKs accept either, so
@@ -1253,7 +1401,9 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 		if v := os.Getenv("GOOGLE_API_KEY"); v != "" {
 			return v, nil
 		}
-		if k, _ := auth.Get(provider); k != "" {
+		if k, err := storedAPIKey(provider, "gemini_native", c.Provider.Gemini.BaseURL, isOfficialManagedEndpoint(provider, "gemini_native", c.Provider.Gemini.BaseURL)); err != nil {
+			return "", err
+		} else if k != "" {
 			return k, nil
 		}
 		if c.Provider.Gemini.APIKey != "" {
@@ -1262,11 +1412,9 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 	default:
 		raw, ok := c.Provider.Custom[provider]
 		if !ok {
-			// auth.json may carry a credential for a custom provider that
-			// isn't yet listed under [provider.custom] — let it through.
-			if k, _ := auth.Get(provider); k != "" {
-				return k, nil
-			}
+			// A managed credential without a provider profile has no endpoint
+			// identity. Never return this orphan key: doing so would let a later
+			// same-named profile redirect it to an unrelated host.
 			return "", fmt.Errorf("unknown provider %q", provider)
 		}
 		if raw.APIKeyEnv != "" {
@@ -1274,8 +1422,24 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 				return v, nil
 			}
 		}
-		if k, _ := auth.Get(provider); k != "" {
-			return k, nil
+		switch strings.ToLower(strings.TrimSpace(raw.Transport)) {
+		case "vertex", "vertex_anthropic":
+			// Vertex uses a service-account file, not a managed LLM API key.
+		case "bedrock", "bedrock_anthropic":
+			// Bedrock uses AWS credentials and SigV4. The stored value is an
+			// access-key ID rather than a bearer secret sent to BaseURL, so HTTP
+			// endpoint binding does not apply to this cloud-auth transport.
+			if k, err := storedCloudAccessKey(provider); err != nil {
+				return "", err
+			} else if k != "" {
+				return k, nil
+			}
+		default:
+			if k, err := storedAPIKey(provider, raw.Transport, raw.BaseURL, false); err != nil {
+				return "", err
+			} else if k != "" {
+				return k, nil
+			}
 		}
 		// Inline `api_key = "..."` in [provider.custom.<id>]. Same final
 		// fallback as the anthropic / openai / gemini cases above. Pre
@@ -1287,6 +1451,60 @@ func (c *Config) ResolveAPIKey(provider string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("%w for provider %q", ErrMissingAPIKey, provider)
+}
+
+func storedAPIKey(provider, transport, baseURL string, allowLegacyOfficial bool) (string, error) {
+	baseURL = effectiveManagedBaseURL(provider, baseURL)
+	key, err := auth.GetAPIKeyForEndpoint(provider, transport, baseURL, allowLegacyOfficial)
+	if err != nil {
+		return "", fmt.Errorf("read stored API key for provider %q: %w", provider, err)
+	}
+	return key, nil
+}
+
+func effectiveManagedBaseURL(provider, baseURL string) string {
+	if strings.TrimSpace(baseURL) != "" {
+		return baseURL
+	}
+	switch auth.CanonicalProviderID(provider) {
+	case "anthropic":
+		return "https://api.anthropic.com"
+	case "openai":
+		return "https://api.openai.com/v1"
+	case "gemini":
+		return "https://generativelanguage.googleapis.com"
+	default:
+		return baseURL
+	}
+}
+
+func storedCloudAccessKey(provider string) (string, error) {
+	key, err := auth.Get(provider)
+	if err != nil {
+		return "", fmt.Errorf("read stored cloud access key for provider %q: %w", provider, err)
+	}
+	return key, nil
+}
+
+func isOfficialManagedEndpoint(provider, transport, baseURL string) bool {
+	var officialTransport, officialBaseURL string
+	switch auth.CanonicalProviderID(provider) {
+	case "anthropic":
+		officialTransport, officialBaseURL = "anthropic_messages", "https://api.anthropic.com"
+	case "openai":
+		officialTransport, officialBaseURL = transport, "https://api.openai.com/v1"
+	case "gemini":
+		officialTransport, officialBaseURL = "gemini_native", "https://generativelanguage.googleapis.com"
+	default:
+		return false
+	}
+	baseURL = effectiveManagedBaseURL(provider, baseURL)
+	current, err := auth.NormalizeEndpointBinding(provider, transport, baseURL)
+	if err != nil {
+		return false
+	}
+	official, err := auth.NormalizeEndpointBinding(provider, officialTransport, officialBaseURL)
+	return err == nil && current == official
 }
 
 // PermissionTimeout returns the duration (with default fallback) to

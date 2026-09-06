@@ -1,8 +1,13 @@
 package runtime
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
 )
@@ -28,6 +33,35 @@ func configWithKey(t *testing.T, name, key, model string) *config.Config {
 		cfg.Provider.OpenAI.BaseURL = "https://api.openai.com/v1"
 	}
 	return cfg
+}
+
+func TestBuildProviderWithoutPreconnectStaysLocal(t *testing.T) {
+	requests := make(chan struct{}, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := configWithKey(t, "openai", "sk-local-validation", "gpt-test")
+	cfg.Provider.OpenAI.BaseURL = server.URL
+	if _, err := BuildProviderWithoutPreconnect(cfg, "openai", ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requests:
+		t.Fatal("local provider construction unexpectedly contacted the endpoint")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if _, err := BuildProvider(cfg, "openai", ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("regular provider construction no longer performs its warm-up")
+	}
 }
 
 func TestBuildProvider_AnthropicResolvesModelFromConfig(t *testing.T) {
@@ -89,5 +123,24 @@ func TestBuildProvider_PropagatesMissingKeyError(t *testing.T) {
 	_, err := BuildProvider(cfg, "anthropic", "")
 	if err == nil {
 		t.Error("missing key should error from BuildProvider")
+	}
+}
+
+func TestBedrockCredentialStoreFailureDoesNotFallBackToAWSEnv(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("METIS_HOME", home)
+	t.Setenv("AWS_ACCESS_KEY_ID", "must-not-be-used")
+	credentialDir := filepath.Join(home, ".credentials")
+	if err := os.MkdirAll(credentialDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialDir, "auth.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	raw := config.ProviderRaw{Transport: "bedrock_anthropic"}
+	cfg.Provider.Custom = map[string]config.ProviderRaw{"bedrock-claude": raw}
+	if _, err := resolveCustomProviderAPIKey(cfg, "bedrock-claude", raw); err == nil || !strings.Contains(err.Error(), "parse credential store") {
+		t.Fatalf("resolveCustomProviderAPIKey error = %v, want credential-store error", err)
 	}
 }

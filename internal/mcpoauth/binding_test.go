@@ -162,7 +162,7 @@ func TestRefreshReusesPersistedRegistrationWithoutDiscovery(t *testing.T) {
 func TestRefreshPropagatesPersistenceFailure(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
-	storePath := filepath.Join(home, "mcp-oauth.json")
+	storePath := NewTokenStore().path
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

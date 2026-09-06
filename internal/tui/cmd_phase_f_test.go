@@ -40,7 +40,7 @@ func TestOnboarding_RendersSetupSteps(t *testing.T) {
 	r := &REPL{}
 	out := cmdOnboarding(r, "")
 	for _, want := range []string{
-		"metis auth login",
+		"metis login",
 		"/init",
 		"config.toml",
 		"~/.metis/skills",

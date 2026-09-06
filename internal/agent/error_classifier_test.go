@@ -3,6 +3,8 @@ package agent
 import (
 	"errors"
 	"testing"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 )
 
 func TestClassifyError(t *testing.T) {
@@ -40,6 +42,7 @@ func TestClassifyError(t *testing.T) {
 		{"server overloaded", errors.New("model is overloaded, please retry"), ErrServerError},
 		{"network refused", errors.New("dial tcp 1.2.3.4:443: connection refused"), ErrNetwork},
 		{"network DNS", errors.New("no such host: api.example.com"), ErrNetwork},
+		{"redacted network marker", errors.Join(errors.New("provider request failed"), transport.ErrNetwork), ErrNetwork},
 		{"invalid request", errors.New("HTTP 400 bad request: invalid tool schema"), ErrInvalidRequest},
 		{"cancelled", errors.New("context canceled"), ErrCancelled},
 		{"unknown", errors.New("some weird thing happened"), ErrUnknown},

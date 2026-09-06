@@ -44,12 +44,15 @@ func TestLoad_TightensLoosePerms(t *testing.T) {
 	if !strings.Contains(stderr, "loose perms") {
 		t.Errorf("expected stderr warning about loose perms; got %q", stderr)
 	}
-	st, err := os.Stat(path)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("legacy auth.json was not removed after migration: %v", err)
+	}
+	st, err := os.Stat(Path())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := st.Mode().Perm(); got != 0o600 {
-		t.Errorf("Load should have chmod'd to 0600; got %#o", got)
+		t.Errorf("migrated auth.json should be 0600; got %#o", got)
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/auth"
 )
 
 var (
@@ -199,7 +201,11 @@ var secretReadPathFragments = []string{
 	// credentials in these files. They must never enter model context through
 	// Read/Grep or a read-only Bash command.
 	".metis/auth.json",
+	".metis/.credentials/",
+	".metis/llm-oauth.json",
+	".metis/.llm-oauth.lock",
 	".metis/mcp-oauth.json",
+	".metis/.mcp-oauth.lock",
 	".metis/mcp.toml",
 	// Inline provider keys are deprecated but still supported in user and
 	// project-local configuration, so treat both config variants as secret.
@@ -235,6 +241,9 @@ func matchesSecretReadPath(stringInput string) bool {
 	// A backslash means a directory separator to PowerShell, but removes the
 	// special meaning of the following byte in an unquoted POSIX shell token.
 	for _, low := range credentialMatchForms(expandedInput) {
+		if matchesDefaultMetisLLMOAuthSidecar(low) {
+			return true
+		}
 		for _, frag := range secretReadPathFragments {
 			if strings.Contains(low, frag) {
 				return true
@@ -254,6 +263,35 @@ func matchesSecretReadPath(stringInput string) bool {
 				}
 			}
 		}
+		if matchesDynamicMetisSecretPath(low) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesDefaultMetisLLMOAuthSidecar applies the dynamic filename classifier
+// to any conventional .metis directory, including another user's home in a
+// test/container path. The METIS_HOME-aware matcher below separately covers a
+// relocated root whose spelling no longer contains a .metis component.
+func matchesDefaultMetisLLMOAuthSidecar(input string) bool {
+	for searchFrom := 0; searchFrom < len(input); {
+		relative := strings.Index(input[searchFrom:], ".metis/")
+		if relative < 0 {
+			return false
+		}
+		marker := searchFrom + relative
+		if marker == 0 || isSafetyPathBoundary(input[marker-1]) {
+			end := marker + len(".metis/")
+			for end < len(input) && !strings.ContainsRune(" \t\r\n\"'`;|&(){}[]<>,", rune(input[end])) {
+				end++
+			}
+			candidate := path.Clean(input[marker:end])
+			if path.Dir(candidate) == ".metis" && isDynamicLLMOAuthFilename(path.Base(candidate)) {
+				return true
+			}
+		}
+		searchFrom = marker + len(".metis/")
 	}
 	return false
 }
@@ -379,11 +417,50 @@ func containsCredentialPathAfterLexicalClean(input, credential string) bool {
 }
 
 func metisSecretReadPaths() []string {
-	roots := []string{strings.TrimSpace(os.Getenv("METIS_HOME"))}
+	files := []string{
+		"auth.json",
+		"llm-oauth.json",
+		".llm-oauth.lock",
+		"mcp-oauth.json",
+		".mcp-oauth.lock",
+		"mcp.toml",
+		"config.toml",
+		"config.local.toml",
+	}
+	rootVariants := metisSecretRootVariants()
+	paths := make([]string, 0, len(rootVariants)*len(files))
+	seen := make(map[string]struct{}, cap(paths))
+	for _, root := range rootVariants {
+		credentialDir := filepath.Clean(filepath.Join(root, ".credentials"))
+		if _, ok := seen[credentialDir]; !ok {
+			seen[credentialDir] = struct{}{}
+			paths = append(paths, credentialDir)
+		}
+		for _, name := range files {
+			path := filepath.Clean(filepath.Join(root, name))
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func metisSecretRootVariants() []string {
+	configured := strings.TrimSpace(os.Getenv("METIS_HOME"))
+	roots := []string{configured}
+	// Credential storage freezes the canonical target of METIS_HOME for the
+	// process lifetime. Include that exact root even if a symlink is retargeted
+	// later, otherwise the in-process permission gate could expose the old
+	// still-active credential store while only protecting the new target.
+	if frozen, err := auth.ResolveCredentialHome(configured); err == nil {
+		roots = append(roots, frozen)
+	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		roots = append(roots, filepath.Join(home, ".metis"))
 	}
-	files := []string{"auth.json", "mcp-oauth.json", "mcp.toml", "config.toml", "config.local.toml"}
 	rootVariants := make([]string, 0, len(roots)*3)
 	rootSeen := make(map[string]struct{}, cap(rootVariants))
 	addRootVariant := func(candidate string) {
@@ -418,19 +495,66 @@ func metisSecretReadPaths() []string {
 			}
 		}
 	}
-	paths := make([]string, 0, len(rootVariants)*len(files))
-	seen := make(map[string]struct{}, cap(paths))
-	for _, root := range rootVariants {
-		for _, name := range files {
-			path := filepath.Clean(filepath.Join(root, name))
-			if _, ok := seen[path]; ok {
-				continue
+	return rootVariants
+}
+
+// matchesDynamicMetisSecretPath recognizes the bounded sidecar namespace used
+// by the LLM OAuth store. These files are credentials too: a temporary file
+// contains a complete not-yet-renamed store, while refresh/store lock files
+// are private coordination state and must not become a model-visible channel.
+// The check is rooted at METIS_HOME (and the default ~/.metis), so unrelated
+// files with a similar basename remain readable.
+func matchesDynamicMetisSecretPath(input string) bool {
+	for _, root := range metisSecretRootVariants() {
+		for _, normalized := range credentialMatchForms(filepath.Clean(root)) {
+			if containsDynamicMetisSecretBelowRoot(input, normalized) {
+				return true
 			}
-			seen[path] = struct{}{}
-			paths = append(paths, path)
 		}
 	}
-	return paths
+	return false
+}
+
+func containsDynamicMetisSecretBelowRoot(input, root string) bool {
+	if root == "" || root == "." {
+		return false
+	}
+	for searchFrom := 0; searchFrom < len(input); {
+		relative := strings.Index(input[searchFrom:], root)
+		if relative < 0 {
+			return false
+		}
+		start := searchFrom + relative
+		end := start + len(root)
+		for end < len(input) && !strings.ContainsRune(" \t\r\n\"'`;|&(){}[]<>,", rune(input[end])) {
+			end++
+		}
+		candidate := path.Clean(input[start:end])
+		if path.Dir(candidate) == root && isDynamicLLMOAuthFilename(path.Base(candidate)) {
+			return true
+		}
+		searchFrom = start + len(root)
+	}
+	return false
+}
+
+func isDynamicLLMOAuthFilename(name string) bool {
+	if strings.HasPrefix(name, ".auth.json.") {
+		return true
+	}
+	if name == ".llm-oauth.lock" {
+		return true
+	}
+	if name == ".mcp-oauth.lock" {
+		return true
+	}
+	if strings.HasPrefix(name, ".llm-oauth-refresh-") && strings.HasSuffix(name, ".lock") {
+		return true
+	}
+	if strings.HasPrefix(name, ".mcp-oauth-refresh-") && strings.HasSuffix(name, ".lock") {
+		return true
+	}
+	return (strings.HasPrefix(name, ".llm-oauth-") || strings.HasPrefix(name, ".mcp-oauth-")) && strings.HasSuffix(name, ".tmp")
 }
 
 // isSecretReadAttempt reports whether tool would read the content of a

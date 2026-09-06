@@ -2925,8 +2925,13 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 		}
 		l.BypassNextCache = false
 	}
+	requestSessionID := ""
+	if l.CurrentStateSnapshot != nil {
+		requestSessionID = strings.TrimSpace(l.runtimeStateSnapshot.SessionID)
+	}
 	req := llm.Request{
 		Model:          l.Model,
+		SessionID:      requestSessionID,
 		System:         system,
 		SystemSections: sections,
 		Messages:       append([]llm.Message(nil), l.Messages...),

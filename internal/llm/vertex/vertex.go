@@ -110,10 +110,10 @@ func (v *Vertex) VisionCapability() provider.VisionCapability {
 }
 func (v *Vertex) MaxContextTokens() int { return v.ContextWindow }
 
-// Vertex uses the shared Anthropic request encoder, which cannot replay
-// unsigned plaintext thinking blocks.
+// Vertex uses the shared Anthropic request encoder. Plaintext thinking only
+// round-trips when its original Anthropic signature is present.
 func (v *Vertex) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
-	return block.Type != "thinking" && (block.Type != "redacted_thinking" || block.Data != "")
+	return anthropic.CanReplayAssistantBlock(block)
 }
 
 // endpoint renders the Vertex predict URL. `streaming` chooses between

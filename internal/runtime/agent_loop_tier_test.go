@@ -126,3 +126,37 @@ func TestBuildAgentLoop_TierMaxOutputTokensEffect(t *testing.T) {
 		t.Errorf("eff-cap 12k: SnipMaxToolResultChars = %d, want 200 (tier-16k after max_tokens drop)", got)
 	}
 }
+
+func TestBuildAgentLoop_OpenAICodexReservesConfiguredOutputBudget(t *testing.T) {
+	cfg := defaultLoopCfg(t)
+	cfg.Provider.Default = "openai-codex"
+	cfg.Provider.OpenAICodex.MaxTokens = 16_000
+	loop := BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider: &stubProvider{maxCtx: 200_000},
+		Registry: tools.NewRegistry(),
+		Gate:     permission.New(permission.ModeAcceptEdits),
+		MaxIter:  10,
+	})
+	if got := loop.Compactor.MaxOutputTokens; got != 16_000 {
+		t.Fatalf("Codex MaxOutputTokens = %d, want 16000", got)
+	}
+}
+
+func TestBuildAgentLoop_ResolvedOutputBudgetOverridesConfigDefault(t *testing.T) {
+	cfg := defaultLoopCfg(t)
+	cfg.Provider.Default = "anthropic"
+	cfg.Provider.Anthropic.MaxTokens = 64_000
+	loop := BuildAgentLoop(cfg, AgentLoopOptions{
+		Provider:        &stubProvider{maxCtx: 32_000},
+		MaxOutputTokens: 20_000,
+		Registry:        tools.NewRegistry(),
+		Gate:            permission.New(permission.ModeAcceptEdits),
+		MaxIter:         10,
+	})
+	if got := loop.Compactor.MaxOutputTokens; got != 20_000 {
+		t.Fatalf("resolved MaxOutputTokens = %d, want 20000", got)
+	}
+	if got := loop.Compactor.SnipMaxToolResultChars; got != 200 {
+		t.Fatalf("resolved effective cap tier = %d chars, want 200", got)
+	}
+}
