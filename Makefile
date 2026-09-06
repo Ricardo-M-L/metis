@@ -61,8 +61,9 @@ verify-version:
 
 # ---- Version bumping (opt-in) -----------------------------------------------
 # Default behavior: build/install never advance the version. To bump, run one
-# of these explicitly. Each target rewrites VERSION + the source default in
-# internal/version/version.go + npm package.json so all three stay in sync.
+# of these explicitly. Each target rewrites VERSION, the Go source default,
+# npm package metadata, and both native Desktop version sources so all five
+# release version declarations stay in sync.
 #
 #   make bump-patch        0.1.0 -> 0.1.1
 #   make bump-minor        0.1.5 -> 0.2.0

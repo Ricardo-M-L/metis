@@ -7,6 +7,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.46] - 2026-09-06
+
+### Added
+
+- Added unified `metis login` and `metis logout` flows with provider-aware
+  API-key selection plus OpenAI ChatGPT browser and device-code sign-in.
+
+### Changed
+
+- Isolated managed credentials under `~/.metis/.credentials/`, bound custom
+  provider keys to their normalized transport and endpoint, and made project
+  provider routing respect workspace trust across CLI, TUI, and Desktop.
+- Hardened OAuth persistence, cross-process locking, platform permissions,
+  provider error handling, and sensitive-value redaction without exposing
+  stored credentials in diagnostics.
+
+### Fixed
+
+- Kept Gemini API keys out of metadata-probe URLs, redacted them from
+  upstream error bodies, and refused credential-bearing redirects.
+- Honored explicit requests for coordinated or delegated agent execution while
+  retaining the runtime's bounded task-lifecycle and authority rules.
+- Fixed login aliases, cancellation and device polling, legacy credential
+  migration, endpoint switching, and incomplete provider terminal states.
+
 ## [0.4.45] - 2026-09-04
 
 ### Changed
