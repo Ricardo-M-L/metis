@@ -7,6 +7,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.47] - 2026-09-06
+
+### Fixed
+
+- Kept Auto Memory enabled by default for interactive CLI and Desktop sessions
+  while suppressing its routine startup notice unless diagnostic logging is
+  explicitly enabled with `METIS_AUTO_MEMORY_DEBUG=1`.
+
 ## [0.4.46] - 2026-09-06
 
 ### Added
@@ -1348,7 +1356,12 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.41...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.47...HEAD
+[0.4.47]: https://github.com/Ricardo-M-L/metis/compare/v0.4.46...v0.4.47
+[0.4.46]: https://github.com/Ricardo-M-L/metis/compare/v0.4.45...v0.4.46
+[0.4.45]: https://github.com/Ricardo-M-L/metis/compare/v0.4.44...v0.4.45
+[0.4.44]: https://github.com/Ricardo-M-L/metis/compare/v0.4.43...v0.4.44
+[0.4.43]: https://github.com/Ricardo-M-L/metis/compare/v0.4.42...v0.4.43
 [0.4.41]: https://github.com/Ricardo-M-L/metis/compare/v0.4.40...v0.4.41
 [0.4.40]: https://github.com/Ricardo-M-L/metis/compare/v0.4.39...v0.4.40
 [0.4.39]: https://github.com/Ricardo-M-L/metis/compare/v0.4.38...v0.4.39
