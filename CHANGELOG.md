@@ -7,6 +7,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Matched CLI and Desktop model selection to provider authentication: one
+  ChatGPT login now exposes the complete curated GPT/Codex subscription
+  catalog, providers without usable credentials stay hidden, and Codex model
+  context and image capabilities follow model-specific limits.
+
 ## [0.4.48] - 2026-09-06
 
 ### Changed

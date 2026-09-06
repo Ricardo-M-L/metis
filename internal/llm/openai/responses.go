@@ -224,6 +224,11 @@ func (r *Responses) MaxContextTokens() int {
 	if r.ContextWindow > 0 {
 		return r.ContextWindow
 	}
+	if r.Name() == "openai-codex" {
+		if window, ok := CodexModelContextWindow(r.Model); ok {
+			return window
+		}
+	}
 	return 200_000 // Responses-served o-series / frontier models
 }
 

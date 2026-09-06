@@ -22,24 +22,38 @@ import (
 // Adding a new model: append to this slice. Removing: drop the entry.
 // Custom IDs not in this list are still settable via the inline form
 // `/model <id>` — the picker is just for browsing the curated set.
-var builtinModelChoices = []screen.ModelChoice{
-	// Anthropic — current generation.
-	{ID: "claude-opus-4-7", Description: "most capable, best for hard tasks", Provider: "anthropic"},
-	{ID: "claude-sonnet-4-6", Description: "fast + smart, balanced", Provider: "anthropic"},
-	{ID: "claude-haiku-4-5-20251001", Description: "cheapest, near-instant", Provider: "anthropic"},
+var builtinModelChoices = func() []screen.ModelChoice {
+	choices := []screen.ModelChoice{
+		// Anthropic — current generation.
+		{ID: "claude-opus-4-7", Description: "most capable, best for hard tasks", Provider: "anthropic"},
+		{ID: "claude-sonnet-4-6", Description: "fast + smart, balanced", Provider: "anthropic"},
+		{ID: "claude-haiku-4-5-20251001", Description: "cheapest, near-instant", Provider: "anthropic"},
 
-	// MiniMax via Anthropic-compatible gateway (yunwu.ai etc.).
-	{ID: "MiniMax-M2.7", Description: "open-weight, 192k window, low-cost", Provider: "minimax"},
+		// MiniMax via Anthropic-compatible gateway (yunwu.ai etc.).
+		{ID: "MiniMax-M2.7", Description: "open-weight, 192k window, low-cost", Provider: "minimax"},
 
-	// Gemini.
-	{ID: "gemini-2.5-pro", Description: "Google's flagship, 1M+ context", Provider: "gemini"},
-	{ID: "gemini-2.0-flash", Description: "fast Gemini for high-throughput", Provider: "gemini"},
+		// Gemini.
+		{ID: "gemini-2.5-pro", Description: "Google's flagship, 1M+ context", Provider: "gemini"},
+		{ID: "gemini-2.0-flash", Description: "fast Gemini for high-throughput", Provider: "gemini"},
 
-	// OpenAI.
-	{ID: "gpt-4o", Description: "OpenAI flagship, multimodal", Provider: "openai"},
-	{ID: "gpt-4o-mini", Description: "cheap OpenAI, good for simple tasks", Provider: "openai"},
-	{ID: "gpt-5.5", Description: "ChatGPT subscription Codex", Provider: "openai-codex"},
-}
+		// OpenAI Platform API-key models. ChatGPT OAuth models stay under the
+		// separate openai-codex provider appended below.
+		{ID: "gpt-4o", Description: "OpenAI flagship, multimodal", Provider: "openai"},
+		{ID: "gpt-4o-mini", Description: "cheap OpenAI, good for simple tasks", Provider: "openai"},
+	}
+	for _, model := range openai.CodexModels() {
+		description := "ChatGPT subscription"
+		if !model.SupportsImage {
+			description += " · text only"
+		}
+		choices = append(choices, screen.ModelChoice{
+			ID:          model.ID,
+			Description: description,
+			Provider:    "openai-codex",
+		})
+	}
+	return choices
+}()
 
 // configuredModelChoices returns the concrete provider/model pairs present in
 // config.toml. Unlike builtinModelChoices, every entry here has a real profile
@@ -181,26 +195,24 @@ func modelChoiceHasCredentials(cfg *config.Config, c screen.ModelChoice) bool {
 
 func (m *Model) modelPickerChoices(requireVision bool) []screen.ModelChoice {
 	configured := configuredModelChoices(m.cfg)
-	if requireVision {
-		out := make([]screen.ModelChoice, 0, len(configured))
-		for _, c := range configured {
-			capability := modelChoiceVisionCapability(m.cfg, c)
-			if capability != pubprovider.VisionUnsupported && modelChoiceHasCredentials(m.cfg, c) {
+	out := make([]screen.ModelChoice, 0, len(builtinModelChoices)+len(configured))
+	seen := make(map[string]struct{}, len(builtinModelChoices)+len(configured))
+	for _, group := range [][]screen.ModelChoice{builtinModelChoices, configured} {
+		for _, c := range group {
+			if !modelChoiceHasCredentials(m.cfg, c) {
+				continue
+			}
+			if requireVision {
+				capability := modelChoiceVisionCapability(m.cfg, c)
+				if capability == pubprovider.VisionUnsupported {
+					continue
+				}
 				if capability == pubprovider.VisionSupported {
 					c.Description = "configured vision model"
 				} else {
 					c.Description = "configured model · image support unverified"
 				}
-				out = append(out, c)
 			}
-		}
-		return out
-	}
-
-	out := make([]screen.ModelChoice, 0, len(builtinModelChoices)+len(configured))
-	seen := make(map[string]struct{}, len(builtinModelChoices)+len(configured))
-	for _, group := range [][]screen.ModelChoice{builtinModelChoices, configured} {
-		for _, c := range group {
 			key := modelChoiceKey(c)
 			if _, ok := seen[key]; ok {
 				continue
@@ -267,13 +279,16 @@ func (m *Model) providerPickerChoices() ([]screen.ModelChoice, error) {
 // openModelPicker opens either the ordinary model browser or the restricted
 // recovery picker used when a text-only model receives image attachments.
 // It returns false when no configured vision-capable profile exists.
-func (m *Model) openModelPicker(requireVision bool, recoveryImageCount int) bool {
+func (m *Model) openModelPicker(requireVision bool, recoveryImageCount int) (bool, error) {
 	if m == nil || m.turnActive || m.rewindSummaryPending {
 		if m != nil && requireVision {
 			m.imageRecoveryPending = false
 			m.imageRecoveryImageCount = 0
 		}
-		return false
+		return false, nil
+	}
+	if err := m.reloadProviderProfiles(); err != nil {
+		return false, err
 	}
 	choices := m.modelPickerChoices(requireVision)
 	if len(choices) == 0 {
@@ -281,7 +296,7 @@ func (m *Model) openModelPicker(requireVision bool, recoveryImageCount int) bool
 			m.imageRecoveryPending = false
 			m.imageRecoveryImageCount = 0
 		}
-		return false
+		return false, nil
 	}
 	for i := range choices {
 		choices[i].Recent = getModelState().IsRecent(choices[i].ID)
@@ -290,6 +305,8 @@ func (m *Model) openModelPicker(requireVision bool, recoveryImageCount int) bool
 	picker.SetCurrentProvider(m.providerName)
 	if requireVision {
 		picker.SetTitle("Choose a vision model · prompt and images are kept")
+	} else {
+		picker.SetTitle("Pick a model · configured credentials only")
 	}
 	picker.Resize(m.width, m.height)
 	m.activeScreen = picker
@@ -299,7 +316,7 @@ func (m *Model) openModelPicker(requireVision bool, recoveryImageCount int) bool
 	} else {
 		m.imageRecoveryImageCount = 0
 	}
-	return true
+	return true, nil
 }
 
 // openProviderPicker exposes configured, credential-ready provider profiles

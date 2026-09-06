@@ -340,8 +340,10 @@ type ProviderOpenAI struct {
 // ChatGPT OAuth access tokens must never be treated as ordinary API keys.
 // OAuth credentials live in the dedicated auth store managed by metis login.
 type ProviderOpenAICodex struct {
-	Model         string  `toml:"model"`
-	MaxTokens     int     `toml:"max_tokens"`
+	Model     string `toml:"model"`
+	MaxTokens int    `toml:"max_tokens"`
+	// ContextWindow overrides the model-specific Codex catalog limit. Zero
+	// keeps automatic 128k/272k selection when the active model changes.
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
 	Temperature   float64 `toml:"temperature"`
@@ -710,7 +712,7 @@ func defaults() *Config {
 			OpenAICodex: ProviderOpenAICodex{
 				Model:         "gpt-5.5",
 				MaxTokens:     16000,
-				ContextWindow: 200000,
+				ContextWindow: 0,
 				TimeoutSecs:   120,
 				Temperature:   0,
 			},

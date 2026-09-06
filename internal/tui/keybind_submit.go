@@ -627,7 +627,18 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		if cmd := m.cmds.Resolve(name); cmd != nil && strings.TrimSpace(args) == "" {
 			switch cmd.Name {
 			case "model":
-				m.openModelPicker(false, 0)
+				opened, err := m.openModelPicker(false, 0)
+				if err != nil {
+					m.messages = append(m.messages, Message{
+						Role: "warning", Content: "model: could not reload configuration; current profiles kept: " + err.Error(),
+						Timestamp: time.Now(),
+					})
+				} else if !opened {
+					m.messages = append(m.messages, Message{
+						Role: "info", Content: "model: no configured provider with usable credentials · add one with /login",
+						Timestamp: time.Now(),
+					})
+				}
 				return m, nil
 			case "provider":
 				opened, err := m.openProviderPicker()
@@ -1291,7 +1302,13 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			stripped, _ := splitOffImageBlocks(blocks)
 			if stripped > 0 {
 				m.input.SetValue(text)
-				if m.openModelPicker(true, stripped) {
+				opened, pickerErr := m.openModelPicker(true, stripped)
+				if pickerErr != nil {
+					m.appendImageWarningOnce(fmt.Sprintf(
+						"image not sent — current model (%s) is not recognized or configured as vision-capable. Prompt and %d image(s) are kept; model configuration reload failed: %v",
+						m.loop.Model, stripped, pickerErr,
+					))
+				} else if opened {
 					m.appendImageWarningOnce(fmt.Sprintf(
 						"image not sent — current model (%s) is not recognized or configured as vision-capable. Prompt and %d image(s) are kept; choose a vision model, then press Enter to send.",
 						m.loop.Model, stripped,

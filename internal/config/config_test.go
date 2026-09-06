@@ -262,6 +262,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.Provider.OpenAICodex.Temperature != 0 {
 		t.Errorf("default OpenAI Codex temperature = %v, want omitted (0)", cfg.Provider.OpenAICodex.Temperature)
 	}
+	if cfg.Provider.OpenAICodex.ContextWindow != 0 {
+		t.Errorf("default OpenAI Codex context window = %d, want model-specific lookup", cfg.Provider.OpenAICodex.ContextWindow)
+	}
 	if !cfg.LoopDetection.Enabled {
 		t.Error("LoopDetection should default to enabled")
 	}

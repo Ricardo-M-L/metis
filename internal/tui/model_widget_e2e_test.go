@@ -27,6 +27,7 @@ func configureModelWidgetAnthropic(m *Model) {
 // widget (claude-code parity for browseable model selection).
 func TestModelWidget_BareSlashOpensPicker(t *testing.T) {
 	m := newSlashTestModel(t)
+	configureModelWidgetAnthropic(m)
 	m.input.SetValue("/model")
 	pressEnter(t, m)
 
@@ -45,6 +46,7 @@ func TestModelWidget_BareSlashOpensPicker(t *testing.T) {
 // TestModelWidget_AliasOpensPicker — /m alias also opens the picker.
 func TestModelWidget_AliasOpensPicker(t *testing.T) {
 	m := newSlashTestModel(t)
+	configureModelWidgetAnthropic(m)
 	m.input.SetValue("/m")
 	pressEnter(t, m)
 	if _, ok := m.activeScreen.(*screen.ModelScreen); !ok {
@@ -54,6 +56,7 @@ func TestModelWidget_AliasOpensPicker(t *testing.T) {
 
 func TestModelWidget_OpenCodeModelsAliasOpensPicker(t *testing.T) {
 	m := newSlashTestModel(t)
+	configureModelWidgetAnthropic(m)
 	m.input.SetValue("/models")
 	pressEnter(t, m)
 
@@ -192,6 +195,34 @@ func TestProviderWidget_ReloadsProfilesAddedAfterStartup(t *testing.T) {
 	}
 }
 
+func TestModelWidget_ReloadsProfilesAddedAfterStartup(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	m := newSlashTestModel(t)
+	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"ark": {
+			Transport: "openai_chat", APIKey: "ark-test", BaseURL: "http://127.0.0.1:1", Model: "ark-default",
+		},
+	}
+	if err := config.SaveUserCustomProvider(config.CustomProviderSpec{
+		ID: "kimi", Transport: "openai_chat", BaseURL: "http://127.0.0.1:1", Model: "kimi-default",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.ActivateAPIKeyBound("kimi", "kimi-test-key", "openai_chat", "http://127.0.0.1:1"); err != nil {
+		t.Fatal(err)
+	}
+	m.providerConfigLoader = defaultProviderConfigLoader
+	m.input.SetValue("/model")
+	pressEnter(t, m)
+
+	if _, ok := m.cfg.Provider.Custom["kimi"]; !ok {
+		t.Fatal("fresh provider profile was not merged into the live config")
+	}
+	if view := m.activeScreen.View(); !strings.Contains(view, "kimi-default") {
+		t.Fatalf("fresh provider model missing from picker:\n%s", view)
+	}
+}
+
 func TestProviderWidget_DefaultReloadIgnoresUntrustedProjectRouting(t *testing.T) {
 	home := t.TempDir()
 	project := t.TempDir()
@@ -250,8 +281,8 @@ func TestModelWidget_ExplicitArgStaysInline(t *testing.T) {
 func TestModelWidget_ConfiguredCustomProfilesAppear(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.cfg.Provider.Custom = map[string]config.ProviderRaw{
-		"ark":  {Transport: "openai_chat", Model: "ark-code-latest"},
-		"kimi": {Transport: "openai_chat", Model: "kimi-k3"},
+		"ark":  {Transport: "openai_chat", APIKey: "ark-test", Model: "ark-code-latest"},
+		"kimi": {Transport: "openai_chat", APIKey: "kimi-test", Model: "kimi-k3"},
 	}
 	m.input.SetValue("/model")
 	pressEnter(t, m)
@@ -264,6 +295,20 @@ func TestModelWidget_ConfiguredCustomProfilesAppear(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("configured model/profile %q missing from picker:\n%s", want, view)
 		}
+	}
+}
+
+func TestModelWidget_NoCredentialsShowsLoginGuidance(t *testing.T) {
+	m := newSlashTestModel(t)
+	m.input.SetValue("/model")
+	pressEnter(t, m)
+
+	if m.activeScreen != nil {
+		t.Fatalf("credential-less model picker opened: %T", m.activeScreen)
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "info" || !strings.Contains(last.Content, "no configured provider") || !strings.Contains(last.Content, "/login") {
+		t.Fatalf("missing model login guidance: %+v", last)
 	}
 }
 

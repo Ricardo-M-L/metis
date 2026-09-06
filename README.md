@@ -163,7 +163,10 @@ the OpenAI authorization page. After authorization, METIS saves the refreshable
 credential and selects `openai-codex` for subsequent chats; you do not need to
 enter an API key. The API key option continues to use the separate OpenAI
 Platform provider and billing. Model access and usage follow your account's
-available entitlements.
+available entitlements. In `/model` and the Desktop model menu, one ChatGPT
+login unlocks the curated `openai-codex` GPT/Codex catalog, while models from
+providers without usable credentials remain hidden. OpenAI Platform API-key
+models stay separate.
 
 ```sh
 metis login anthropic --method api-key

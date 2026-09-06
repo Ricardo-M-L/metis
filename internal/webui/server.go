@@ -32,6 +32,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/desktop"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/pluginmarket"
@@ -3057,25 +3058,58 @@ func (s *Server) commitActiveModelSelectionState(providerName, model, system str
 	return nil
 }
 
-// listConfiguredModels enumerates switchable models: built-in providers with
-// a configured model, plus every custom profile.
+// listConfiguredModels enumerates the authenticated-provider union exposed by
+// the Desktop selector. A ChatGPT OAuth credential unlocks the complete curated
+// Codex catalog; API-key and custom providers remain separate and contribute
+// only their configured model. Provider/model pairs are de-duplicated so a
+// configured Codex default does not appear twice when it is also in the catalog.
 func listConfiguredModels(cfg *config.Config) []webModel {
-	var out []webModel
+	if cfg == nil {
+		return nil
+	}
+	out := make([]webModel, 0)
+	seen := make(map[string]struct{})
 	add := func(provider, model string) {
+		provider = strings.TrimSpace(provider)
+		model = strings.TrimSpace(model)
 		if provider == "" || model == "" {
 			return
 		}
+		key := strings.ToLower(provider) + "\x00" + strings.ToLower(model)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
 		out = append(out, webModel{Provider: provider, Model: model, Label: provider + " · " + model})
 	}
-	add("anthropic", cfg.Provider.Anthropic.Model)
-	add("openai", cfg.Provider.OpenAI.Model)
-	add("openai-codex", cfg.Provider.OpenAICodex.Model)
-	add("gemini", cfg.Provider.Gemini.Model)
-	for name, raw := range cfg.Provider.Custom {
+	addConfigured := func(provider, model string) {
+		if rtpkg.ProviderHasCredentials(cfg, provider) {
+			add(provider, model)
+		}
+	}
+
+	addConfigured("anthropic", cfg.Provider.Anthropic.Model)
+	addConfigured("openai", cfg.Provider.OpenAI.Model)
+	if rtpkg.ProviderHasCredentials(cfg, "openai-codex") {
+		for _, model := range openai.CodexModels() {
+			add("openai-codex", model.ID)
+		}
+		// Preserve an explicit model override that is not yet in the curated
+		// catalog, while de-duplicating the ordinary configured default.
+		add("openai-codex", cfg.Provider.OpenAICodex.Model)
+	}
+	addConfigured("gemini", cfg.Provider.Gemini.Model)
+
+	customIDs := make([]string, 0, len(cfg.Provider.Custom))
+	for name := range cfg.Provider.Custom {
 		if builtInProvider(name) {
 			continue
 		}
-		add(name, raw.Model)
+		customIDs = append(customIDs, name)
+	}
+	sort.Strings(customIDs)
+	for _, name := range customIDs {
+		addConfigured(name, cfg.Provider.Custom[name].Model)
 	}
 	return out
 }

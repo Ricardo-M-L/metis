@@ -15,8 +15,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -31,6 +33,51 @@ import (
 type switchTestProvider struct {
 	id     string
 	maxCtx int
+}
+
+func TestSwitchREPLModelRoutesEveryCodexCatalogModelThroughOAuthProvider(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	if err := auth.PutOAuth("openai-codex", auth.OAuthCredential{
+		AccessToken:  "test-access",
+		RefreshToken: "test-refresh",
+		AccountID:    "test-account",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		TokenType:    "Bearer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, choice := range builtinModelChoices {
+		if choice.Provider != "openai-codex" {
+			continue
+		}
+		t.Run(choice.ID, func(t *testing.T) {
+			oldProvider := &switchTestProvider{id: "old-wire", maxCtx: 100_000}
+			loop := agent.NewLoop(oldProvider, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "sys", 5)
+			loop.Compactor = agent.NewCompactor(agent.DefaultCompactionConfig(), "old-model", oldProvider.maxCtx, oldProvider)
+			r := &REPL{
+				Loop: loop, model: "old-model", providerName: "bigmodel-responses", cfg: &config.Config{},
+			}
+
+			if err := switchREPLModel(r, choice.ID); err != nil {
+				t.Fatalf("switchREPLModel: %v", err)
+			}
+			provider, model, _ := loop.ProviderModelSnapshot()
+			if r.providerName != "openai-codex" || r.model != choice.ID || model != choice.ID || provider.Name() != "openai-codex" {
+				t.Fatalf("Codex route mismatch: repl=%q/%q loop=%q provider=%q", r.providerName, r.model, model, provider.Name())
+			}
+			wantWindow := 272_000
+			if choice.ID == "gpt-5.3-codex-spark" {
+				wantWindow = 128_000
+			}
+			if got := provider.MaxContextTokens(); got != wantWindow {
+				t.Fatalf("context window = %d, want %d", got, wantWindow)
+			}
+			if loop.ContextWindow != wantWindow || loop.Compactor == nil || loop.Compactor.MaxContextTokens != wantWindow {
+				t.Fatalf("runtime window did not switch atomically: loop=%d compactor=%v want=%d", loop.ContextWindow, loop.Compactor, wantWindow)
+			}
+		})
+	}
 }
 
 func (p *switchTestProvider) Name() string          { return "switch-test" }

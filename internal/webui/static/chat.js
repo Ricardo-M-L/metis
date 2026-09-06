@@ -3201,14 +3201,24 @@ let modelMenuOpen = false;
 async function toggleModelMenu() {
   const menu = document.getElementById('modelMenu');
   if (modelMenuOpen) { menu.style.display = 'none'; modelMenuOpen = false; return; }
-  if (!modelList.length) {
-    try {
-      const res = await fetch('/api/models');
-      const d = await res.json();
-      if (res.ok) modelList = d.models || [];
-    } catch (_) {}
+  let activeSelection = {};
+  try {
+    // Credentials can be added or removed by another METIS process while the
+    // Desktop app remains open. Always refresh so stale unauthenticated choices
+    // cannot survive in this menu.
+    const res = await fetch('/api/models');
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || 'model catalog: ' + res.status);
+    modelList = d.models || [];
+    activeSelection = d.current || {};
+  } catch (_) {
+    modelList = [];
+    showToast('Could not refresh models');
+    return;
   }
-  if (modelList.length < 2) { showToast('No other models configured'); return; }
+  const hasAlternative = modelList.some(m =>
+    m.provider !== activeSelection.provider || m.model !== activeSelection.model);
+  if (!hasAlternative) { showToast('No other models configured'); return; }
   menu.innerHTML = modelList.map(m =>
     `<div class="model-option" onclick="switchModel('${escOnclick(m.provider)}','${escOnclick(m.model)}')">${escHtml(m.label)}</div>`).join('');
   menu.style.display = 'block';

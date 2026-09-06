@@ -12,8 +12,33 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
+
+func putWebCodexOAuth(t *testing.T) {
+	t.Helper()
+	if err := auth.PutOAuth("openai-codex", auth.OAuthCredential{
+		AccessToken: "test-access", RefreshToken: "test-refresh", AccountID: "test-account",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func isolatedWebProviderConfig(t *testing.T) *config.Config {
+	t.Helper()
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	for _, name := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"} {
+		t.Setenv(name, "")
+	}
+	cfg, _, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
 
 func TestOpenAICodexProviderUsesOAuthWithoutExposingAPIKeyEditing(t *testing.T) {
 	home := t.TempDir()
@@ -285,6 +310,7 @@ model = "claude-test"
 
 func TestOpenAICodexAppearsInDesktopModelAndEffortSurfaces(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
+	putWebCodexOAuth(t)
 	cfg, _, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -307,8 +333,99 @@ func TestOpenAICodexAppearsInDesktopModelAndEffortSurfaces(t *testing.T) {
 	}
 }
 
+func TestDesktopModelCatalogUsesAuthenticatedProviderUnion(t *testing.T) {
+	t.Run("no credentials hides built-in defaults", func(t *testing.T) {
+		cfg := isolatedWebProviderConfig(t)
+		if got := listConfiguredModels(cfg); len(got) != 0 {
+			t.Fatalf("unauthenticated models = %+v, want empty", got)
+		}
+	})
+
+	t.Run("one Codex OAuth unlocks exact catalog", func(t *testing.T) {
+		cfg := isolatedWebProviderConfig(t)
+		putWebCodexOAuth(t)
+		got := listConfiguredModels(cfg)
+		want := openai.CodexModels()
+		if len(got) != len(want) {
+			t.Fatalf("Desktop Codex models = %d, want %d: %+v", len(got), len(want), got)
+		}
+		for i, model := range want {
+			if got[i].Provider != "openai-codex" || got[i].Model != model.ID || got[i].Label != "openai-codex · "+model.ID {
+				t.Fatalf("Desktop Codex model[%d] = %+v, want %q", i, got[i], model.ID)
+			}
+		}
+		if err := auth.RemoveOAuth("openai-codex"); err != nil {
+			t.Fatal(err)
+		}
+		if afterLogout := listConfiguredModels(cfg); len(afterLogout) != 0 {
+			t.Fatalf("logged-out Codex models remained selectable: %+v", afterLogout)
+		}
+	})
+
+	t.Run("OpenAI API key stays separate", func(t *testing.T) {
+		cfg := isolatedWebProviderConfig(t)
+		cfg.Provider.OpenAI.APIKey = "test-platform-key"
+		got := listConfiguredModels(cfg)
+		if len(got) != 1 || got[0].Provider != "openai" || got[0].Model != cfg.Provider.OpenAI.Model {
+			t.Fatalf("OpenAI Platform catalog = %+v", got)
+		}
+		for _, model := range got {
+			if model.Provider == "openai-codex" {
+				t.Fatalf("OpenAI API key unlocked Codex OAuth model: %+v", model)
+			}
+		}
+	})
+
+	t.Run("custom profiles remain filtered sorted and distinct", func(t *testing.T) {
+		cfg := isolatedWebProviderConfig(t)
+		cfg.Provider.Custom = map[string]config.ProviderRaw{
+			"zeta":         {Transport: "openai_chat", Model: "shared-model", APIKey: "zeta-key"},
+			"alpha":        {Transport: "openai_chat", Model: "shared-model", APIKey: "alpha-key"},
+			"missing":      {Transport: "openai_chat", Model: "hidden-model"},
+			"openai-codex": {Transport: "openai_chat", Model: "shadow-model", APIKey: "shadow-key"},
+		}
+		got := listConfiguredModels(cfg)
+		if len(got) != 2 || got[0].Provider != "alpha" || got[1].Provider != "zeta" {
+			t.Fatalf("custom model order/filter = %+v", got)
+		}
+		if got[0].Model != "shared-model" || got[1].Model != "shared-model" {
+			t.Fatalf("provider/model dedupe collapsed distinct providers: %+v", got)
+		}
+	})
+}
+
+func TestDesktopModelsEndpointReturnsCompleteCodexCatalog(t *testing.T) {
+	isolatedWebProviderConfig(t)
+	putWebCodexOAuth(t)
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/models", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/models = %d: %s", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Models  []webModel        `json:"models"`
+		Current map[string]string `json:"current"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Models) != len(openai.CodexModels()) {
+		t.Fatalf("GET /api/models returned %d models, want %d: %s", len(response.Models), len(openai.CodexModels()), rr.Body.String())
+	}
+	for _, model := range response.Models {
+		if model.Provider != "openai-codex" {
+			t.Fatalf("unauthenticated provider returned by /api/models: %+v", model)
+		}
+	}
+	if response.Current == nil {
+		t.Fatal("GET /api/models dropped current response field")
+	}
+}
+
 func TestProviderListDoesNotLetLegacyCustomEntryShadowOpenAICodex(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
+	putWebCodexOAuth(t)
 	cfg, _, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -334,13 +451,13 @@ func TestProviderListDoesNotLetLegacyCustomEntryShadowOpenAICodex(t *testing.T) 
 	for _, model := range listConfiguredModels(cfg) {
 		if model.Provider == "openai-codex" {
 			modelCount++
-			if model.Model != cfg.Provider.OpenAICodex.Model {
+			if model.Model == "shadow-model" {
 				t.Fatalf("legacy custom entry shadowed built-in model: %+v", model)
 			}
 		}
 	}
-	if modelCount != 1 {
-		t.Fatalf("OpenAI Codex model count = %d, want 1", modelCount)
+	if modelCount != len(openai.CodexModels()) {
+		t.Fatalf("OpenAI Codex model count = %d, want %d", modelCount, len(openai.CodexModels()))
 	}
 }
 

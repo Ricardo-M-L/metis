@@ -124,6 +124,35 @@ func TestStaticAssetsServed(t *testing.T) {
 	}
 }
 
+func TestDesktopModelMenuRefreshesAuthenticatedCatalogEveryOpen(t *testing.T) {
+	js, err := staticFS.ReadFile("static/chat.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(js)
+	start := strings.Index(body, "async function toggleModelMenu()")
+	end := strings.Index(body, "\nasync function switchModel(")
+	if start < 0 || end <= start {
+		t.Fatal("cannot isolate Desktop model-menu implementation")
+	}
+	menu := body[start:end]
+	if strings.Contains(menu, "if (!modelList.length)") {
+		t.Fatal("Desktop model menu still reuses a stale credential/model cache")
+	}
+	for _, want := range []string{
+		"const res = await fetch('/api/models');",
+		"modelList = d.models || [];",
+		"activeSelection = d.current || {};",
+		"const hasAlternative = modelList.some",
+		"modelList = [];",
+		"showToast('Could not refresh models');",
+	} {
+		if !strings.Contains(menu, want) {
+			t.Fatalf("Desktop model refresh missing %q", want)
+		}
+	}
+}
+
 func TestDesktopChromeOmitsRetiredBrandAndSessionMetadata(t *testing.T) {
 	s, _ := testServer(t)
 	get := func(path string) string {

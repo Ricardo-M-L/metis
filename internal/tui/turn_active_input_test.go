@@ -491,7 +491,7 @@ func TestPendingRewindSummaryBlocksModelPickerAndSwitch(t *testing.T) {
 	if got := m.input.Value(); got != "/model replacement" {
 		t.Fatalf("pending-summary explicit model choice was not preserved: %q", got)
 	}
-	if m.openModelPicker(false, 0) {
+	if opened, err := m.openModelPicker(false, 0); err != nil || opened {
 		t.Fatal("pending rewind summary opened model picker directly")
 	}
 }

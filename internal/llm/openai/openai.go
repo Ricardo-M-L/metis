@@ -312,6 +312,9 @@ func SupportsVisionModel(model string) bool {
 // own API make the authoritative decision.
 func VisionCapabilityForModel(model string) provider.VisionCapability {
 	m := strings.ToLower(strings.TrimSpace(model))
+	if capability, ok := codexModelVisionCapability(m); ok {
+		return capability
+	}
 
 	// Vendor-confirmed exact ids take precedence over the shared catalog.
 	// SenseNova's authenticated /models metadata declares text+image input for
