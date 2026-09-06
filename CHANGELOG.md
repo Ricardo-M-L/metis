@@ -23,6 +23,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Joined headless error completion before checkpointing session history,
   recorded interrupted-turn metrics, and preserved useful timeout causes.
 - Saved partial MCP task history and compaction checkpoints on cancellation.
+- Preserved reasoning summary arrays when replaying encrypted Responses items,
+  including an explicit empty array for older history, fixing strict endpoints
+  rejecting the next request after a tool call with a missing `input[].summary`.
 
 ## [0.4.47] - 2026-09-06
 

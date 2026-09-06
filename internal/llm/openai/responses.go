@@ -205,8 +205,8 @@ func (r *Responses) VisionCapability() provider.VisionCapability {
 	return provider.VisionUnknown
 }
 
-// Plaintext reasoning summaries are display-only. Encrypted reasoning is part
-// of the next request only in local/ZDR mode; provider-managed state refers to
+// Standalone thinking blocks are display-only. Encrypted reasoning, including
+// its associated summary, is replayed only in local/ZDR mode; provider state refers to
 // it through previous_response_id instead. Opaque provider_state markers are
 // local bookkeeping and never occupy the upstream context window.
 func (r *Responses) ContextIncludesAssistantBlock(block provider.ContentBlock) bool {
@@ -249,7 +249,39 @@ type responsesInputItem struct {
 	// function_call_output item
 	Output string `json:"output,omitempty"`
 	// reasoning item (stateless/ZDR replay)
-	EncryptedContent string `json:"encrypted_content,omitempty"`
+	EncryptedContent string          `json:"encrypted_content,omitempty"`
+	Summary          json.RawMessage `json:"summary,omitempty"`
+}
+
+const responsesHintReasoningSummary = "openai.responses.reasoning_summary"
+
+type responsesSummaryPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+func responsesReasoningHints(id string, summary []responsesSummaryPart) map[string]string {
+	if summary == nil {
+		summary = []responsesSummaryPart{}
+	}
+	// Summary parts contain only strings, so marshaling cannot fail.
+	encoded, _ := json.Marshal(summary)
+	return map[string]string{
+		responsesHintItemID:           id,
+		responsesHintReasoningSummary: string(encoded),
+	}
+}
+
+func responsesReplaySummary(hints map[string]string) json.RawMessage {
+	raw := json.RawMessage(hints[responsesHintReasoningSummary])
+	var summary []responsesSummaryPart
+	if len(raw) > 0 && json.Unmarshal(raw, &summary) == nil && summary != nil {
+		return raw
+	}
+	// Responses requires an array even when there is no public summary. Older
+	// persisted encrypted blocks have no summary hint; nil would send null (or
+	// omit the required field), both of which strict endpoints reject.
+	return json.RawMessage(`[]`)
 }
 
 type responsesContentPart struct {
@@ -478,6 +510,7 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 							Type:             "reasoning",
 							ID:               b.ProviderHint[responsesHintItemID],
 							EncryptedContent: b.Data,
+							Summary:          responsesReplaySummary(b.ProviderHint),
 						})
 					}
 				}
@@ -679,12 +712,13 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 			Item    struct {
-				ID               string `json:"id"`
-				Type             string `json:"type"`
-				CallID           string `json:"call_id"`
-				Name             string `json:"name"`
-				Arguments        string `json:"arguments"`
-				EncryptedContent string `json:"encrypted_content"`
+				ID               string                 `json:"id"`
+				Type             string                 `json:"type"`
+				CallID           string                 `json:"call_id"`
+				Name             string                 `json:"name"`
+				Arguments        string                 `json:"arguments"`
+				EncryptedContent string                 `json:"encrypted_content"`
+				Summary          []responsesSummaryPart `json:"summary"`
 			} `json:"item"`
 			Response *responsesStreamResponse `json:"response"`
 			Error    *struct {
@@ -744,7 +778,7 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 				s.pending = append(s.pending, provider.StreamEvent{
 					Type:         "redacted_thinking",
 					TextDelta:    env.Item.EncryptedContent,
-					ProviderHint: map[string]string{responsesHintItemID: env.Item.ID},
+					ProviderHint: responsesReasoningHints(env.Item.ID, env.Item.Summary),
 				})
 			}
 		case "response.output_text.delta":
@@ -976,10 +1010,7 @@ type responsesOutputItem struct {
 		Text    string `json:"text"`
 		Refusal string `json:"refusal"`
 	} `json:"content"`
-	Summary []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"summary"`
+	Summary []responsesSummaryPart `json:"summary"`
 }
 
 // Complete issues a non-streamed /v1/responses call and folds the output
@@ -1114,11 +1145,9 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 			}
 			if item.EncryptedContent != "" {
 				result.Content = append(result.Content, provider.ContentBlock{
-					Type: "redacted_thinking",
-					Data: item.EncryptedContent,
-					ProviderHint: map[string]string{
-						responsesHintItemID: item.ID,
-					},
+					Type:         "redacted_thinking",
+					Data:         item.EncryptedContent,
+					ProviderHint: responsesReasoningHints(item.ID, item.Summary),
 				})
 			}
 		case "function_call":
