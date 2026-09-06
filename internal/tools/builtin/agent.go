@@ -1050,6 +1050,21 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// MessageTeammate) can read the correct sender identity via
 	// AgentNameFromContext instead of falling back to "main".
 	baseCtx = agent.WithAgentName(baseCtx, teammateName)
+	// Capture the shared execution deadline before detaching turn cancellation.
+	// Both the child loop and InterruptBlock tools must stop at the earlier of
+	// the parent's deadline and the child's own timeout. Derive one deadline so
+	// their clocks agree, without allocating intermediate timer contexts.
+	deadline, hasDeadline := baseCtx.Deadline()
+	if timeout > 0 {
+		childDeadline := time.Now().Add(timeout)
+		if !hasDeadline || childDeadline.Before(deadline) {
+			deadline, hasDeadline = childDeadline, true
+		} else {
+			timeout = time.Until(deadline)
+		}
+	} else if hasDeadline {
+		timeout = time.Until(deadline)
+	}
 	// Background sub-agents must outlive the parent turn. The TUI tears
 	// down each turn's context (cancel) and closes the turn's event
 	// channel the moment loop.Run returns; without detaching here, a
@@ -1058,8 +1073,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// even while the agent is still mid-tool-call. context.WithoutCancel
 	// keeps all context values (depth, cwd, budget, event-out key used by
 	// forwardSubAgentEvent) but severs the turn's cancellation chain so
-	// the sub-agent is session-scoped, killed only by its own timeout /
-	// SubAgentStop (teammate.Cancel) / Roster.CancelAll on exit.
+	// the sub-agent survives ordinary turn cancellation. The deadline captured
+	// above is restored below; its own timeout / SubAgentStop (teammate.Cancel) /
+	// Roster.CancelAll on exit also remain authoritative.
 	if runInBackground {
 		baseCtx = context.WithoutCancel(baseCtx)
 	}
@@ -1073,11 +1089,12 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	var cancelLifecycle context.CancelFunc
 	// InterruptBlock must ignore an ordinary first-Ctrl+C inherited through
 	// baseCtx, but not an explicit teammate stop, session revoke, or the child's
-	// own timeout. Give it a distinct hard-lifecycle root detached from the turn.
+	// own timeout or the shared execution deadline. Give it a distinct
+	// hard-lifecycle root detached from the turn.
 	hardBaseCtx := context.WithoutCancel(baseCtx)
-	if timeout > 0 {
-		childCtx, cancelRun = context.WithTimeout(baseCtx, timeout)
-		lifecycleCtx, cancelLifecycle = context.WithTimeout(hardBaseCtx, timeout)
+	if hasDeadline {
+		childCtx, cancelRun = context.WithDeadline(baseCtx, deadline)
+		lifecycleCtx, cancelLifecycle = context.WithDeadline(hardBaseCtx, deadline)
 	} else {
 		childCtx, cancelRun = context.WithCancel(baseCtx)
 		lifecycleCtx, cancelLifecycle = context.WithCancel(hardBaseCtx)
@@ -1637,7 +1654,7 @@ func wrapTimeoutErr(err error, timeout time.Duration) *tools.Result {
 	if errors.Is(err, context.DeadlineExceeded) && timeout > 0 {
 		return &tools.Result{
 			Output: fmt.Sprintf(
-				"sub-agent timed out after %s. Re-spawn with `timeout_seconds: <larger>` if the task legitimately needs more wall-clock budget; otherwise scope down the prompt.",
+				"sub-agent timed out after %s. Check the parent execution deadline and `timeout_seconds` if the task legitimately needs more wall-clock budget; otherwise scope down the prompt.",
 				timeout,
 			),
 			IsError: true,

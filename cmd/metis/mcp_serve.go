@@ -15,8 +15,8 @@ package main
 // Fixes applied vs v1:
 //  1. EventPermissionRequest/AskUser — auto-resolved so non-bypass modes
 //     never deadlock the event loop.
-//  2. Per-call wall-clock timeout — matches cmdRun's 30-min cap
-//     (METIS_RUN_MAX_SECONDS env override).
+//  2. Opt-in per-call wall-clock budget — shared with cmdRun;
+//     METIS_RUN_MAX_SECONDS unset/0 means unlimited.
 //  3. Heartbeat goroutine — setupRuntime receives the per-call context so
 //     the heartbeat is reaped when the call finishes, not at process exit.
 //  4. Process-wide singletons — run_task owns one process-wide runtime
@@ -35,9 +35,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,8 +46,11 @@ import (
 	"bufio"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
+	"github.com/Ricardo-M-L/metis/internal/session"
+	"github.com/Ricardo-M-L/metis/internal/timebudget"
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
@@ -113,13 +117,8 @@ func mcpIDPresent(id json.RawMessage) bool {
 }
 
 // mcpRunCap returns the per-call wall-clock limit, mirroring cmdRun.
-func mcpRunCap() time.Duration {
-	if s := os.Getenv("METIS_RUN_MAX_SECONDS"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return 30 * time.Minute
+func mcpRunCap() (time.Duration, error) {
+	return timebudget.FromEnv("METIS_RUN_MAX_SECONDS")
 }
 
 func cmdMCPServe(ctx context.Context, args []string) error {
@@ -135,10 +134,30 @@ func cmdMCPServe(ctx context.Context, args []string) error {
 	// Never show the interactive auth wizard on the MCP stdio transport —
 	// any wizard output written to stdout would corrupt the JSON-RPC stream.
 	flags.noAuthWizard = true
+	// Reject malformed budgets before starting the stdio server.
+	if _, err := mcpRunCap(); err != nil {
+		return err
+	}
+	return serveMCP(ctx, flags, os.Stdin, os.Stdout, mcpDoRunTask)
+}
+
+// serveMCP owns the request lifetime independently of the stdio transport.
+// Closing input or cancelling the server cancels every active/queued call and
+// waits for its runner to finish checkpointing and cleaning up before return.
+func serveMCP(ctx context.Context, flags *cliFlags, input io.Reader, output io.Writer,
+	runTask func(context.Context, *cliFlags, string) (string, error)) error {
+	ctx, cancelServer := context.WithCancel(ctx)
+	var activeCalls sync.WaitGroup
+	defer func() {
+		cancelServer()
+		// The dispatch loop has stopped, so no further Add can race this Wait.
+		// Never hold activeMu here: completing calls remove their cancel entry.
+		activeCalls.Wait()
+	}()
 
 	// Mutex-protected encoder: tools/call responses are sent from goroutines.
 	var outMu sync.Mutex
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(output)
 	enc.SetEscapeHTML(false)
 	send := func(id json.RawMessage, result any, mcpErr *mcpMsgError) {
 		outMu.Lock()
@@ -155,7 +174,7 @@ func cmdMCPServe(ctx context.Context, args []string) error {
 	scanCh := make(chan mcpMsg, 8)
 	go func() {
 		defer close(scanCh)
-		sc := bufio.NewScanner(os.Stdin)
+		sc := bufio.NewScanner(input)
 		sc.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
@@ -187,6 +206,9 @@ func cmdMCPServe(ctx context.Context, args []string) error {
 		case req, open := <-scanCh:
 			if !open {
 				return nil // stdin closed — client disconnected
+			}
+			if ctx.Err() != nil {
+				return nil
 			}
 
 			switch req.Method {
@@ -244,10 +266,14 @@ func cmdMCPServe(ctx context.Context, args []string) error {
 				callModel, _ := p.Arguments["model"].(string)
 
 				// Per-call context wires together:
-				//   — wall-clock timeout (matches cmdRun's 30 min cap)
+				//   — optional wall-clock budget (shared with cmdRun)
 				//   — notifications/cancelled (via activeCancels map)
 				//   — heartbeat goroutine lifetime (setupRuntime receives this ctx)
-				callCtx, callCancel := context.WithTimeout(ctx, mcpRunCap())
+				callCtx, callCancel, budgetErr := timebudget.WithEnv(ctx, "METIS_RUN_MAX_SECONDS")
+				if budgetErr != nil {
+					fail(req.ID, -32602, budgetErr.Error())
+					continue
+				}
 				reqIDStr := string(req.ID)
 				activeMu.Lock()
 				activeCancels[reqIDStr] = callCancel
@@ -255,7 +281,9 @@ func cmdMCPServe(ctx context.Context, args []string) error {
 
 				// Run in a goroutine so the scanner loop stays live and can
 				// receive notifications/cancelled during a long agent run.
+				activeCalls.Add(1)
 				go func(req mcpMsg, callCtx context.Context, reqIDStr string) {
+					defer activeCalls.Done()
 					defer func() {
 						callCancel()
 						activeMu.Lock()
@@ -272,10 +300,15 @@ func cmdMCPServe(ctx context.Context, args []string) error {
 						callFlags.model = callModel
 					}
 
-					text, runErr := mcpDoRunTask(callCtx, &callFlags, prompt)
+					text, runErr := runTask(callCtx, &callFlags, prompt)
+					// The transport is closing; finish local durability without
+					// attempting a final response to a disconnected client.
+					if ctx.Err() != nil {
+						return
+					}
 					if runErr != nil {
 						ok(req.ID, map[string]any{
-							"content": []any{map[string]any{"type": "text", "text": runErr.Error()}},
+							"content": []any{map[string]any{"type": "text", "text": timebudget.CauseError(callCtx, runErr).Error()}},
 							"isError": true,
 						})
 						return
@@ -336,7 +369,7 @@ func mcpDoRunTask(callCtx context.Context, flags *cliFlags, prompt string) (stri
 
 // mcpDoRunTaskExclusive owns the process-wide runtime wiring for the duration
 // of one MCP call. Call only through mcpRuntimeRuns.
-func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt string) (string, error) {
+func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt string) (result string, returnErr error) {
 	// setupRuntime receives callCtx so the heartbeat goroutine it spawns
 	// is reaped when callCtx is cancelled (at call end), not at process exit.
 	rt, err := setupRuntime(callCtx, flags)
@@ -349,6 +382,20 @@ func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt stri
 		fmt.Fprintln(os.Stderr, "metis mcp-serve: MCP servers still loading after 15s — continuing")
 	}
 
+	// Persist partial work even when an explicit budget or caller cancellation
+	// ends this request. Compaction checkpoints retain the logical resume state.
+	historyCursor := session.NewHistoryCursor(rt.loop.History())
+	if rt.store != nil && rt.sessionID != "" {
+		rt.loop.CompactionCheckpoint = func(before, after []llm.Message) error {
+			return rt.store.CheckpointCompaction(rt.sessionID, before, after, &historyCursor)
+		}
+		defer func() {
+			if err := rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("save MCP session checkpoint: %w", err))
+				result = ""
+			}
+		}()
+	}
 	rt.loop.AppendUser(prompt)
 
 	events := make(chan agent.Event, 64)
@@ -360,7 +407,7 @@ func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt stri
 		close(events)
 	}()
 
-	result, err := collectMCPTaskEvents(events, done)
+	result, err = collectMCPTaskEvents(events, done)
 	if err != nil {
 		return "", err
 	}

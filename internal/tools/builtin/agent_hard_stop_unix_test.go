@@ -131,6 +131,78 @@ func TestBackgroundAgentCancelAndWaitReapsBashProcessTree(t *testing.T) {
 	}
 }
 
+func TestAgentParentDeadlineReapsInterruptBlockBashProcessTree(t *testing.T) {
+	for _, background := range []bool{false, true} {
+		t.Run(fmt.Sprintf("agent_background_%t", background), func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("METIS_HOME", tmp)
+			leaderPath := filepath.Join(tmp, "leader.pid")
+			childPath := filepath.Join(tmp, "child.pid")
+			command := fmt.Sprintf(
+				`printf '%%s' "$$" > %q; tail -f /dev/null & child=$!; printf '%%s' "$child" > %q; wait`,
+				leaderPath, childPath,
+			)
+			gate := permission.New(permission.ModeFullAccess)
+			registry := tools.NewRegistry()
+			registry.Register(bashbuiltin.New(gate, config.ToolBashSettings{
+				Shell:          "/bin/bash",
+				TimeoutSeconds: 600,
+				MaxOutputBytes: 16 * 1024,
+			}))
+			roster := agent.NewRoster(0)
+			rootJobs := jobs.NewRegistry(tmp)
+			bashbuiltin.AttachJobsRegistry(registry, rootJobs, gate)
+			agentTool := NewAgent(gate, &hardStopBashProvider{command: command}, registry, "model", "system").
+				WithRoster(roster).
+				WithJobsPool(rootJobs)
+			t.Cleanup(func() {
+				cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = roster.CancelAndWait(cleanupCtx)
+				cancelCleanup()
+				if pid := readPIDFile(leaderPath); pid > 0 {
+					_ = syscall.Kill(-pid, syscall.SIGKILL)
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+				if pid := readPIDFile(childPath); pid > 0 {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+				rootJobs.ResetAndWait(0)
+			})
+			parentCtx, cancelParent := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancelParent()
+			executed := make(chan struct{})
+			go func() {
+				defer close(executed)
+				result, err := agentTool.Execute(parentCtx, map[string]any{
+					"prompt":            "run the command until the shared deadline",
+					"run_in_background": background,
+					"timeout_seconds":   3600,
+				})
+				if err != nil || result == nil || result.IsError == background {
+					t.Errorf("Execute = (%+v, %v), background=%t", result, err, background)
+				}
+			}()
+			leaderPID := waitForPIDFile(t, leaderPath, time.Second)
+			childPID := waitForPIDFile(t, childPath, time.Second)
+			// Ordinary turn cancellation must not interrupt the running Bash.
+			// The original parent deadline must still reap its full process tree.
+			cancelParent()
+			time.Sleep(50 * time.Millisecond)
+			if !processExists(leaderPID) || !processExists(childPID) {
+				t.Fatal("ordinary parent cancellation interrupted the Bash process tree")
+			}
+			waitForProcessExit(t, leaderPID, 4*time.Second)
+			waitForProcessExit(t, childPID, time.Second)
+			waitForRosterCount(t, roster, 0, time.Second)
+			select {
+			case <-executed:
+			case <-time.After(time.Second):
+				t.Fatal("Agent did not return after its process tree exited")
+			}
+		})
+	}
+}
+
 func waitForPIDFile(t *testing.T, path string, timeout time.Duration) int {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

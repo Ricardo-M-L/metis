@@ -93,10 +93,22 @@ are kept in a separate section at the end.
 | Variable | Default | Description |
 |---|---|---|
 | `METIS_RUN_CACHE` | off | Set exactly to `1` to enable the on-disk response cache for `metis run`. Equivalent to `--cache`; tool-use turns are not cached. |
-| `METIS_RUN_MAX_SECONDS` | `1800` | Whole-invocation wall-clock cap for `metis run` and Metis MCP tool calls. Only positive integers override the default. |
-| `METIS_TURN_MAX_SECONDS` | `2700` | Per-agent-turn wall-clock cap. It is checked between loop iterations; an in-flight operation is allowed to return first. |
+| `METIS_RUN_MAX_SECONDS` | `0` (unlimited) | Opt-in whole-invocation budget for `metis run` and Metis MCP tool calls, including setup and descendants. Unset/empty or `0` disables the local budget; positive integer seconds set it. Caller deadlines/cancellation still apply. Negative, malformed, or overflowing values are errors. |
+| `METIS_TURN_MAX_SECONDS` | `0` (unlimited) | Opt-in per-agent-turn budget, using the same unset/`0`/positive-integer rules. Checked between loop iterations and while awaiting background jobs; an in-flight operation may finish first. Earlier caller deadlines still apply. |
 | `METIS_HTTP_TIMEOUT_SECS` | `1200` | Whole-request timeout for model HTTP clients. Only positive integers override the default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables OTLP/HTTP JSON metrics export. A base endpoint gets `/v1/metrics` appended automatically. |
+
+Long-running tasks no longer need to override implicit 30/45-minute limits.
+For an explicit six-hour invocation budget, use
+`METIS_RUN_MAX_SECONDS=21600 metis run 'your task'` and leave
+`METIS_TURN_MAX_SECONDS` unset (or `0`). To restore the older time limits, set
+both to `1800` and `2700` respectively. Iteration/token or dollar budgets,
+request/tool timeouts, loop detection, and sub-agent-specific tool timeouts
+remain independent protections. Removing a total time cap does not force an
+agent to keep working after it finishes, and does not prove six-hour reliability.
+On cancellation, headless session history is flushed for `--resume`; an explicit
+invocation timeout preserves the `context.DeadlineExceeded` error and names the
+budget, so the CLI reports timeout exit code `5`.
 
 ## Updates
 

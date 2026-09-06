@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.48] - 2026-09-06
+
+### Changed
+
+- Made whole-invocation and per-turn wall-clock budgets opt-in: unset or zero
+  `METIS_RUN_MAX_SECONDS` / `METIS_TURN_MAX_SECONDS` no longer impose the former
+  30/45-minute limits. Positive integer budgets remain available; invalid,
+  negative, and overflowing values fail explicitly.
+
+### Fixed
+
+- Preserved explicit parent deadlines across background sub-agent and tool
+  lifecycle detachment, while retaining normal cross-turn background work.
+- Joined headless error completion before checkpointing session history,
+  recorded interrupted-turn metrics, and preserved useful timeout causes.
+- Saved partial MCP task history and compaction checkpoints on cancellation.
+
 ## [0.4.47] - 2026-09-06
 
 ### Fixed
@@ -1356,7 +1373,8 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.47...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.48...HEAD
+[0.4.48]: https://github.com/Ricardo-M-L/metis/compare/v0.4.47...v0.4.48
 [0.4.47]: https://github.com/Ricardo-M-L/metis/compare/v0.4.46...v0.4.47
 [0.4.46]: https://github.com/Ricardo-M-L/metis/compare/v0.4.45...v0.4.46
 [0.4.45]: https://github.com/Ricardo-M-L/metis/compare/v0.4.44...v0.4.45

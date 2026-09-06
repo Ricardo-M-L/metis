@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +22,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tasks"
+	"github.com/Ricardo-M-L/metis/internal/timebudget"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -1626,18 +1625,18 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// whether to keep exploring or wrap up.
 	var runOutputTokens int
 
-	// 2026-05-23: per-Run wall-clock cap. iter count is the primary
-	// budget but doesn't bound real time — a Run that hangs in 30
-	// iter could nominally take 60+ minutes if every iter triggers a
-	// long Bash + reads. Independent cap so a runaway turn surfaces
-	// instead of silently burning hours. Override via
-	// METIS_TURN_MAX_SECONDS for workflows that legitimately need
-	// longer turns (test runs, slow Docker builds, etc).
-	turnDeadline := time.Now().Add(45 * time.Minute)
-	if env := os.Getenv("METIS_TURN_MAX_SECONDS"); env != "" {
-		if n, err := strconv.Atoi(env); err == nil && n > 0 {
-			turnDeadline = time.Now().Add(time.Duration(n) * time.Second)
-		}
+	// A turn has no wall-clock cap unless METIS_TURN_MAX_SECONDS is a
+	// positive integer. Unset, empty, or zero leaves iteration and caller
+	// context budgets in control, including deliberate long-running waits.
+	turnBudget, err := timebudget.FromEnv("METIS_TURN_MAX_SECONDS")
+	if err != nil {
+		stopReason = "error"
+		emit(ctx, out, Event{Kind: EventError, Err: err})
+		return err
+	}
+	var turnDeadline time.Time
+	if turnBudget > 0 {
+		turnDeadline = time.Now().Add(turnBudget)
 	}
 
 	for {
@@ -1645,7 +1644,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// Checked at the top of each iter so an in-flight Bash /
 		// LLM call still finishes before we abort — same shape as
 		// the iter-cap branch farther down.
-		if time.Now().After(turnDeadline) {
+		if !turnDeadline.IsZero() && !time.Now().Before(turnDeadline) {
 			stopReason = "turn_wall_clock"
 			l.Hooks.EmitLoopEnd(ctx, tc, "turn_wall_clock")
 			emit(ctx, out, Event{
@@ -2080,9 +2079,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			if len(awaitedBackgroundJobs) > 0 {
 				l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
 				// Awaited jobs are outside executeBatch, so they must explicitly
-				// inherit the remaining Run wall-clock budget. This derived context
-				// never cancels the caller's context.
-				waitCtx, cancelWait := context.WithDeadlineCause(ctx, turnDeadline, errTurnWallClockDeadline)
+				// inherit any remaining Run wall-clock budget. With no local cap,
+				// wait directly on the caller's context so its cancellation or an
+				// earlier deadline still applies. Never derive a zero deadline.
+				waitCtx := ctx
+				cancelWait := func() {}
+				if !turnDeadline.IsZero() {
+					waitCtx, cancelWait = context.WithDeadlineCause(ctx, turnDeadline, errTurnWallClockDeadline)
+				}
 				completed, waitErr := l.waitForAwaitedJobNotifications(waitCtx, out, awaitedBackgroundJobs)
 				cancelWait()
 				if waitErr != nil {
@@ -2092,6 +2096,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					if errors.Is(waitErr, errTurnWallClockDeadline) {
 						continue
 					}
+					stopReason = "error"
 					return waitErr
 				}
 				if completed {

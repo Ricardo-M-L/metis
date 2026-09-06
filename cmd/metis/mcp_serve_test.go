@@ -2,14 +2,115 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 )
+
+func TestMCPServerShutdownJoinsRequestCleanup(t *testing.T) {
+	t.Setenv("METIS_RUN_MAX_SECONDS", "0")
+	for _, trigger := range []string{"parent cancellation", "input EOF"} {
+		t.Run(trigger, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				input, client := io.Pipe()
+				defer input.Close()
+				defer client.Close()
+				started := make(chan struct{}, 2)
+				cancelled := make(chan struct{}, 2)
+				cleaned := make(chan struct{}, 2)
+				releaseCleanup := make(chan struct{})
+				runTask := func(ctx context.Context, _ *cliFlags, _ string) (string, error) {
+					// Model the runner's checkpoint/Cleanup defer: cancellation
+					// has happened, but the request is not yet safe to abandon.
+					defer func() { cleaned <- struct{}{} }()
+					started <- struct{}{}
+					<-ctx.Done()
+					cancelled <- struct{}{}
+					<-releaseCleanup
+					return "", ctx.Err()
+				}
+				serverDone := make(chan error, 1)
+				go func() { serverDone <- serveMCP(ctx, &cliFlags{}, input, io.Discard, runTask) }()
+				for id := 1; id <= 2; id++ {
+					if _, err := fmt.Fprintf(client, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\",\"params\":{\"name\":\"run_task\",\"arguments\":{\"prompt\":\"test\"}}}\n", id); err != nil {
+						t.Fatal(err)
+					}
+					<-started
+				}
+				if trigger == "input EOF" {
+					if err := client.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					cancel()
+				}
+				synctest.Wait()
+				if len(cancelled) != 2 {
+					t.Fatalf("cancelled %d requests, want both", len(cancelled))
+				}
+				select {
+				case err := <-serverDone:
+					t.Fatalf("server returned before request cleanup: %v", err)
+				default:
+				}
+				close(releaseCleanup)
+				if err := <-serverDone; err != nil {
+					t.Fatal(err)
+				}
+				if len(cleaned) != 2 {
+					t.Fatalf("server returned with only %d requests cleaned up", len(cleaned))
+				}
+			})
+		})
+	}
+}
+
+func TestMCPServerCompletedRequestDoesNotBlockShutdown(t *testing.T) {
+	t.Setenv("METIS_RUN_MAX_SECONDS", "0")
+	synctest.Test(t, func(t *testing.T) {
+		input, client := io.Pipe()
+		defer input.Close()
+		defer client.Close()
+		responses, output := io.Pipe()
+		defer responses.Close()
+		defer output.Close()
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- serveMCP(context.Background(), &cliFlags{}, input, output,
+				func(_ context.Context, _ *cliFlags, prompt string) (string, error) { return prompt, nil })
+		}()
+		if _, err := io.WriteString(client, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"run_task\",\"arguments\":{\"prompt\":\"finished\"}}}\n"); err != nil {
+			t.Fatal(err)
+		}
+		var response struct {
+			Result struct {
+				Content []struct{ Text string }
+				IsError bool
+			}
+		}
+		if err := json.NewDecoder(responses).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Result.IsError || len(response.Result.Content) != 1 || response.Result.Content[0].Text != "finished" {
+			t.Fatalf("unexpected task response: %+v", response)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-serverDone; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
 
 func TestCollectMCPTaskEventsRejectsIncompleteTerminal(t *testing.T) {
 	events := make(chan agent.Event, 2)

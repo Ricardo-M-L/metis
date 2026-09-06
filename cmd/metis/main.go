@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,6 +40,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/slash"
 	taskstore "github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/telemetry"
+	"github.com/Ricardo-M-L/metis/internal/timebudget"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 	mcptools "github.com/Ricardo-M-L/metis/internal/tools/mcp"
@@ -2407,7 +2407,7 @@ func cmdChat(ctx context.Context, args []string) error {
 	return repl.Run(ctx)
 }
 
-func cmdRun(ctx context.Context, args []string) error {
+func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	flags, rest, err := parseFlags(args)
 	if err != nil {
 		return err
@@ -2416,6 +2416,27 @@ func cmdRun(ctx context.Context, args []string) error {
 		return errors.New("run: prompt is required")
 	}
 	prompt := joinSpaces(rest)
+	// One opt-in budget covers setup, the loop, descendants, and schema
+	// retries. The default/0 imposes no deadline, but still inherits callers.
+	ctx, cancelRunBudget, err := timebudget.WithEnv(ctx, "METIS_RUN_MAX_SECONDS")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		returnErr = timebudget.CauseError(ctx, returnErr)
+		cancelRunBudget()
+	}()
+	// Validate the metrics destination before runtime setup or model work.
+	// A bad path must not leave an unjoined producer racing history cleanup.
+	var metricsLogFile *os.File
+	if flags.metricsLog != "" {
+		f, err := os.OpenFile(flags.metricsLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("--metrics-log: %w", err)
+		}
+		metricsLogFile = f
+		defer metricsLogFile.Close()
+	}
 	rt, err := setupRuntime(ctx, flags)
 	if err != nil {
 		return err
@@ -2492,7 +2513,9 @@ func cmdRun(ctx context.Context, args []string) error {
 	// idempotent while preserving partial tool history on late failures.
 	defer func() {
 		if rt.store != nil && rt.sessionID != "" {
-			_ = rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor)
+			if err := rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("save headless session checkpoint: %w", err))
+			}
 		}
 	}()
 	rt.loop.AppendUser(llmPrompt)
@@ -2509,26 +2532,6 @@ func cmdRun(ctx context.Context, args []string) error {
 	_ = rtpkg.AppendHistory(rtpkg.HistoryEntry{
 		SessionID: rt.sessionID, Input: prompt, Source: "run",
 	})
-
-	// 2026-05-23: per-run wall-clock cap covers the WHOLE invocation
-	// (parent loop + every sub-agent / fork spawned under it). The
-	// existing per-turn wall-clock in loop.go (45 min default) only
-	// bounds ONE turn — a fanned-out run with 18 sub-agents each
-	// running 5-10 min easily blew past wall expectations even though
-	// no single turn was abnormally long (see kimi-cli-go porting
-	// test 2026-05-23 — 41 min on --max-iter 30, sub-agent budget
-	// wasn't inherited so each agent ran its own 100-iter default).
-	//
-	// Default: 30 min. Override via METIS_RUN_MAX_SECONDS for
-	// workflows that genuinely need longer.
-	runWallCap := 30 * time.Minute
-	if env := os.Getenv("METIS_RUN_MAX_SECONDS"); env != "" {
-		if n, err := strconv.Atoi(env); err == nil && n > 0 {
-			runWallCap = time.Duration(n) * time.Second
-		}
-	}
-	ctx, cancelRunCap := context.WithTimeout(ctx, runWallCap)
-	defer cancelRunCap()
 
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
@@ -2580,20 +2583,6 @@ func cmdRun(ctx context.Context, args []string) error {
 	// 60k-token cache hit looks cheap, not the same line item as
 	// 60k tokens of fresh input.
 	var totIn, totOut, totCacheRead, totCacheCreate int
-
-	// --metrics-log: open append-only JSONL sink for per-turn metrics.
-	// One line per round-trip (EventTurnEnd or final EventLoopDone).
-	// Created lazily so that a typo'd path errors loudly before the
-	// LLM call burns any tokens.
-	var metricsLogFile *os.File
-	if flags.metricsLog != "" {
-		f, ferr := os.OpenFile(flags.metricsLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if ferr != nil {
-			return fmt.Errorf("--metrics-log: %w", ferr)
-		}
-		metricsLogFile = f
-		defer metricsLogFile.Close()
-	}
 
 	// Per-turn metrics state. Reset on every EventTurnEnd; flushed
 	// on EventTurnEnd (mid-loop) and EventLoopDone (final).
@@ -2666,6 +2655,8 @@ func cmdRun(ctx context.Context, args []string) error {
 	// failed `go test` but `metis run … && echo ok` printed "ok".
 	var lastInfoText string
 	var incompleteReason, incompleteDetail string
+	var eventErr error
+	terminalMetricsWritten := false
 	for ev := range events {
 		switch ev.Kind {
 		case agent.EventTextDelta:
@@ -2821,6 +2812,7 @@ func cmdRun(ctx context.Context, args []string) error {
 				incompleteDetail = lastInfoText
 			}
 			emitMetrics(finalStop)
+			terminalMetricsWritten = true
 			// Token + duration metrics on stderr — picked up by the
 			// eval runner (internal/eval/runner.go::scrapeMetrics) and
 			// useful for scripts that want to log spend per call. One
@@ -2857,10 +2849,26 @@ func cmdRun(ctx context.Context, args []string) error {
 				_ = rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor)
 			}
 		case agent.EventError:
-			return ev.Err
+			// Join the producer before flushing history: cancellation can emit an
+			// error before Run's orphan-repair/session-end defers have finished.
+			if eventErr == nil {
+				eventErr = ev.Err
+			}
 		}
 	}
 	err = <-done
+	if err == nil {
+		err = eventErr
+	}
+	if err != nil && !terminalMetricsWritten {
+		stopReason := "error"
+		if errors.Is(err, context.DeadlineExceeded) {
+			stopReason = "deadline_exceeded"
+		} else if errors.Is(err, context.Canceled) {
+			stopReason = "canceled"
+		}
+		emitMetrics(stopReason)
+	}
 	// Abort before schema correction or cache persistence. A provider failure
 	// is not a malformed candidate answer: asking for schema retries wastes
 	// calls, and caching the local fallback would convert the next invocation
