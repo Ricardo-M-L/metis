@@ -19,6 +19,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	pubLLM "github.com/Ricardo-M-L/metis/pkg/llm"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
@@ -78,13 +79,21 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 	if maxTokens == 0 {
 		maxTokens = 32000
 	}
+	httpClient := transport.NewHTTPClient(timeout, "gemini")
+	// API keys travel in x-goog-api-key, which net/http treats as an
+	// ordinary header and may copy to a redirected host. Return the redirect
+	// response to the provider code without following it; Complete and Stream
+	// classify every non-2xx response as an error below.
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	return &Gemini{
 		APIKey:      apiKey,
 		BaseURL:     strings.TrimRight(baseURL, "/"),
 		Model:       model,
 		MaxTokens:   maxTokens,
 		Temperature: temperature,
-		httpClient:  transport.NewHTTPClient(timeout, "gemini"),
+		httpClient:  httpClient,
 	}
 }
 
@@ -427,8 +436,8 @@ func (g *Gemini) Complete(ctx context.Context, req Request) (*Response, error) {
 		}
 		defer resp.Body.Close()
 		rb, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 400 {
-			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(security.RedactValues(string(rb), g.APIKey), 500))
 			if transport.IsRetryableStatus(resp.StatusCode) {
 				return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 			}
@@ -466,10 +475,10 @@ func (g *Gemini) Stream(ctx context.Context, req Request) (StreamReader, error) 
 		if err != nil {
 			return err
 		}
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			rb, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(string(rb), 500))
+			httpErr := fmt.Errorf("gemini %d: %s", resp.StatusCode, transport.Truncate(security.RedactValues(string(rb), g.APIKey), 500))
 			if transport.IsRetryableStatus(resp.StatusCode) {
 				return &transport.RetryableError{Err: httpErr, After: transport.ParseRetryAfter(resp)}
 			}

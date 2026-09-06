@@ -100,14 +100,14 @@ func TestGemini_StreamText(t *testing.T) {
 
 	// Auth header forwarded to the server.
 	if fake.gotKey != "test-key" {
-		t.Errorf("x-goog-api-key not forwarded; got %q", fake.gotKey)
+		t.Errorf("x-goog-api-key did not match configured credential")
 	}
 	// SSE endpoint path resolved correctly.
 	if !strings.Contains(fake.gotPath, ":streamGenerateContent") || !strings.Contains(fake.gotPath, "alt=sse") {
-		t.Errorf("path mismatch; got %q", fake.gotPath)
+		t.Error("stream endpoint did not contain the expected operation and SSE selector")
 	}
 	if !strings.Contains(fake.gotPath, "gemini-2.5-pro") {
-		t.Errorf("model not in path; got %q", fake.gotPath)
+		t.Error("stream endpoint did not contain the configured model")
 	}
 }
 
@@ -195,6 +195,98 @@ func TestGemini_RequestBodyShape(t *testing.T) {
 	if !strings.Contains(body, `"role":"model"`) {
 		t.Errorf("expected role=model in body; got %s", body)
 	}
+}
+
+func TestGeminiErrorResponsesRedactAPIKey(t *testing.T) {
+	const apiKey = "gemini-error-redaction-canary"
+	tests := []struct {
+		name string
+		call func(*Gemini) error
+	}{
+		{
+			name: "complete",
+			call: func(g *Gemini) error {
+				_, err := g.Complete(context.Background(), Request{})
+				return err
+			},
+		},
+		{
+			name: "stream",
+			call: func(g *Gemini) error {
+				_, err := g.Stream(context.Background(), Request{})
+				return err
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("x-goog-api-key") != apiKey {
+					t.Error("x-goog-api-key did not match configured credential")
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream echoed ` + apiKey + `"}}`))
+			}))
+			defer server.Close()
+
+			g := New(apiKey, server.URL, "gemini-test", 0, 5*time.Second, 0)
+			err := tc.call(g)
+			if err == nil {
+				t.Fatal("expected a non-2xx response error")
+			}
+			message := err.Error()
+			if strings.Contains(message, apiKey) {
+				t.Fatal("Gemini response error exposed the configured API key")
+			}
+			if !strings.Contains(message, "[REDACTED]") {
+				t.Fatal("Gemini response error did not include a redaction marker")
+			}
+		})
+	}
+}
+
+func assertGeminiRejectsRedirect(t *testing.T, call func(*Gemini) error) {
+	t.Helper()
+	const apiKey = "gemini-redirect-canary"
+	targetRequests := make(chan bool, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests <- r.Header.Get("x-goog-api-key") != ""
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[]}`))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-goog-api-key") != apiKey {
+			t.Error("initial Gemini request did not carry the configured credential")
+		}
+		http.Redirect(w, r, target.URL+"/capture", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	g := New(apiKey, redirector.URL, "gemini-test", 0, 5*time.Second, 0)
+	if err := call(g); err == nil {
+		t.Fatal("Gemini call followed or accepted a redirect")
+	}
+	select {
+	case receivedKey := <-targetRequests:
+		t.Errorf("redirect target received a request; credential_header_present=%t", receivedKey)
+	default:
+	}
+}
+
+func TestGeminiCompleteRejectsRedirect(t *testing.T) {
+	assertGeminiRejectsRedirect(t, func(g *Gemini) error {
+		_, err := g.Complete(context.Background(), Request{})
+		return err
+	})
+}
+
+func TestGeminiStreamRejectsRedirect(t *testing.T) {
+	assertGeminiRejectsRedirect(t, func(g *Gemini) error {
+		_, err := g.Stream(context.Background(), Request{})
+		return err
+	})
 }
 
 // TestGemini_MaxContextTokens spot-checks the per-model window pick.

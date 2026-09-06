@@ -62,7 +62,7 @@ func providerProbeTarget(view providerView) (string, string, error) {
 
 func validProbeURL(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.Hostname() == "" {
+	if err != nil || u.User != nil || u.Hostname() == "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(raw, "#") {
 		return false
 	}
 	if u.Scheme == "https" {
@@ -450,13 +450,6 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "provider endpoint is not safe to probe")
 		return
 	}
-	if authKind == "gemini" {
-		u, _ := url.Parse(target)
-		query := u.Query()
-		query.Set("key", key)
-		u.RawQuery = query.Encode()
-		target = u.String()
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
@@ -471,6 +464,8 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 	case "anthropic":
 		req.Header.Set("x-api-key", key)
 		req.Header.Set("anthropic-version", "2023-06-01")
+	case "gemini":
+		req.Header.Set("x-goog-api-key", key)
 	}
 	client := &http.Client{
 		Timeout: 8 * time.Second,

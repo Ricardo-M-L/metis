@@ -492,12 +492,22 @@ func TestProviderAPIRejectsBlankAPIKeyBeforeSavingProfile(t *testing.T) {
 func TestProviderWebUICanonicalizesGoogleAlias(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
+	// ResolveAPIKey intentionally honors both names for Gemini credentials.
+	// Isolate the test from a developer or CI runner that already exports one
+	// of them so the endpoint-bound fixture below remains authoritative.
+	t.Setenv("GEMINI_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "")
 	t.Chdir(t.TempDir())
 	probeRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		probeRequests++
-		if r.URL.Path != "/v1beta/models" || r.URL.Query().Get("key") != "gemini-test-key" {
-			t.Errorf("Gemini alias probe URL = %q", r.URL.String())
+		pathMatches := r.URL.Path == "/v1beta/models"
+		keyMatches := r.Header.Get("x-goog-api-key") == "gemini-test-key"
+		queryEmpty := r.URL.RawQuery == ""
+		if !pathMatches || !keyMatches || !queryEmpty {
+			// Never print the auth header, full URL, or query values: they may
+			// contain credentials when this safety contract regresses.
+			t.Errorf("Gemini alias probe mismatch: path_matches=%t key_header_matches=%t query_empty=%t", pathMatches, keyMatches, queryEmpty)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"models":[]}`))
@@ -682,10 +692,10 @@ func TestProviderNetworkProbeRequiresConfirmationAndSendsNoPrompt(t *testing.T) 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		if r.URL.Path != "/v1/models" {
-			t.Errorf("probe path = %q", r.URL.Path)
+			t.Error("probe path did not match the configured metadata endpoint")
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer sk-probe-test" {
-			t.Errorf("authorization = %q", got)
+		if r.Header.Get("Authorization") != "Bearer sk-probe-test" {
+			t.Error("authorization header did not match configured credential")
 		}
 		if r.Method != http.MethodGet {
 			t.Errorf("probe method = %s", r.Method)
@@ -716,7 +726,26 @@ func TestProviderNetworkProbeRequiresConfirmationAndSendsNoPrompt(t *testing.T) 
 		t.Fatalf("confirmed probe = %d requests=%d: %s", rr.Code, requests, rr.Body.String())
 	}
 	if bytes.Contains(rr.Body.Bytes(), []byte("sk-probe-test")) {
-		t.Fatalf("probe response leaked credential: %s", rr.Body.String())
+		t.Fatal("probe response leaked credential")
+	}
+}
+
+func TestValidProbeURLRejectsQueryAndFragment(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "query", raw: "https://provider.example.test/v1/models?key=credential"},
+		{name: "empty query", raw: "https://provider.example.test/v1/models?"},
+		{name: "fragment", raw: "https://provider.example.test/v1/models#credential"},
+		{name: "empty fragment", raw: "https://provider.example.test/v1/models#"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if validProbeURL(tc.raw) {
+				t.Errorf("validProbeURL accepted a URL containing a %s", tc.name)
+			}
+		})
 	}
 }
 
