@@ -1223,6 +1223,9 @@ func TestRendererUpdates(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			r := NewTerminalRenderer(&buf, []string{"TERM=xterm-256color", "TTY_FORCE=1"})
+			// Keep this output-contract test independent of the host terminfo
+			// database, which may advertise TrueColor even for xterm-256color.
+			r.SetColorProfile(colorprofile.ANSI256)
 			t.Logf("Profile: %v", r.profile)
 			r.SetRelativeCursor(true) // Use absolute cursor movements since we're drawing fullscreen
 
