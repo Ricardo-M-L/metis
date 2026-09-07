@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import shlex
 import tempfile
 import unittest
 from unittest import mock
@@ -122,6 +123,31 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIs(plan["prerelease"], False)
         self.assertIs(plan["make_latest"], False)
         self.assertEqual(len(plan["assets"]), 12)
+
+    def publish_step(self):
+        workflow = (SCRIPT.parent.parent / ".github/workflows/release-cli-publish.yml").read_text()
+        return workflow.split("      - name: Publish registered CLI release without changing latest\n", 1)[1].split(
+            "\n  install-smoke-unix:", 1)[0]
+
+    def test_publish_patch_explicitly_preserves_validated_tag_and_source_identity(self):
+        step = self.publish_step()
+        before_patch, patch = step.split("gh api --method PATCH", 1)
+        # Each workflow step has its own shell: recompute the checked-out source
+        # SHA here and bind it to the already byte-verified build evidence.
+        self.assertIn('source_sha=$(git -C source rev-parse HEAD)', before_patch)
+        self.assertIn('test "$source_sha" = "$(jq -r .source_sha provenance-verified.json)"', before_patch)
+        arguments = shlex.split(patch.split(" > published.json", 1)[0].replace("\\\n", " "))
+        fields = {arguments[index + 1] for index, value in enumerate(arguments[:-1]) if value in ("-f", "-F")}
+        self.assertEqual(fields, {
+            "tag_name=$TAG", "target_commitish=$source_sha", "draft=false",
+            "prerelease=$prerelease", "make_latest=false",
+        })
+
+    def test_publish_response_must_keep_original_release_id(self):
+        after_patch = self.publish_step().split(" > published.json", 1)[1]
+        identity_guard = 'test "$(jq -r .id published.json)" = "$release_id"'
+        self.assertIn(identity_guard, after_patch)
+        self.assertLess(after_patch.index(identity_guard), after_patch.index("--metadata published.json"))
 
     def test_graphql_lookup_fields_use_gh_arguments_without_shell_or_rest_pagination(self):
         result = mock.Mock(returncode=0, stdout='{"data": {}}')

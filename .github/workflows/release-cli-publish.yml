@@ -131,8 +131,14 @@ jobs:
           [[ "$release_id" =~ ^[0-9]+$ ]]
           prerelease=$(jq -r .prerelease plan.json)
           [[ "$prerelease" = true || "$prerelease" = false ]]
+          # Preserve identity explicitly: partial draft updates can otherwise
+          # cause GitHub to replace tag_name with an untagged-* placeholder.
+          source_sha=$(git -C source rev-parse HEAD)
+          test "$source_sha" = "$(jq -r .source_sha provenance-verified.json)"
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -f tag_name="$TAG" -f target_commitish="$source_sha" \
             -F draft=false -F prerelease="$prerelease" -f make_latest=false > published.json
+          test "$(jq -r .id published.json)" = "$release_id"
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-after.json
           test "$(jq -r .tag_name latest-current.json)" = "$(jq -r .tag_name latest-after.json)"
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
