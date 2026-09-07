@@ -7,6 +7,49 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.53] - 2026-09-08
+
+Prepared as a formal CLI-only release (`prerelease=false`, `make_latest=false`)
+with no Desktop payload or shared latest promotion. Publication remains subject
+to exact-tag successful build provenance and complete asset verification.
+
+### Fixed
+
+- Responses API public summaries are now requested independently of reasoning
+  intensity and displayed whether they arrive as streaming deltas, item
+  snapshots, or only in the terminal response, instead of being dropped.
+- Headless runs preserve a task's successful status when optional memory
+  distillation misses its join deadline: the task reports
+  `task_status=completed` with `memory_status=incomplete` and an explicit
+  warning, rather than failing a finished task. Distillation provider errors
+  are distinguished from storage errors, and a timed-out distillation can be
+  cancelled instead of blocking shutdown.
+- CLI release publication pins `tag_name` and `target_commitish` explicitly
+  when converting the verified draft, so a partial update can no longer leave
+  an `untagged-*` placeholder, and the published release ID is re-checked.
+
+## [0.4.52] - 2026-09-07
+
+Formal CLI-only stable release; the CLI stable channel is now resolved
+independently of GitHub's shared CLI/Desktop `latest` pointer (which remains
+on the v0.4.47 full release).
+
+### Fixed
+
+- The CLI update hint, `metis update`, and default Bash/PowerShell installers
+  discover the highest complete stable CLI release under shared pagination,
+  asset, and fail-closed rules; incomplete releases, drafts, prereleases, and
+  interrupted scans can no longer silently fall back to the older Desktop
+  release.
+- Automatic and default updates reject downgrades; `metis update --force`
+  reinstalls the same stable version only. Deliberately pinned installer
+  versions remain supported. Installed v0.4.51 and earlier binaries need one
+  upgrade through the updated installer to adopt the new discovery protocol.
+- Publication checks verify anonymous default installation as well as pinned
+  installation against independent release metadata.
+- Preserved request cancellation when an OAuth refresh response is interrupted
+  during body decoding, instead of misreporting it as a provider rejection.
+
 ## [0.4.51] - 2026-09-07
 
 Prepared as a formal CLI-only release (`prerelease=false`, `make_latest=false`)

@@ -6,7 +6,7 @@ import "strings"
 // The defaults below are what `go install ./cmd/metis` produces when the
 // build doesn't go through `make`.
 var (
-	Version = "0.4.52"
+	Version = "0.4.53"
 	Commit  = ""
 	Date    = ""
 )

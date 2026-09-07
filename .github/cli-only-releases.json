@@ -24,6 +24,12 @@
       "prerelease": false,
       "make_latest": false,
       "reason": "Formal CLI-only release with independent stable discovery/default installation; Desktop/shared latest remains unchanged."
+    },
+    "v0.4.53": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "Formal CLI-only release of Responses summary display and completed-task-status preservation; Desktop/shared latest remains unchanged."
     }
   }
 }
