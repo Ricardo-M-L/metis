@@ -30,6 +30,7 @@ func TestPowerShellCLIChannelContract(t *testing.T) {
 		`$Cancellation.ThrowIfCancellationRequested()`,
 		`$releaseCount -lt 100`,
 		`Refusing to downgrade the installed CLI`,
+		`@((ConvertFrom-Json -InputObject $body))`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("PowerShell CLI channel lacks %q", want)
@@ -53,6 +54,10 @@ func powershellChannelCommand(t *testing.T) string {
 
 // Test only the actual resolver functions, never invoke installation or a CLI.
 func runPowerShellChannel(t *testing.T, shell, api, web, token, timeout string) (string, error) {
+	return runPowerShellChannelOperation(t, shell, api, web, token, timeout, "Resolve-ReleaseTag")
+}
+
+func runPowerShellChannelOperation(t *testing.T, shell, api, web, token, timeout, operation string) (string, error) {
 	t.Helper()
 	installer, err := os.ReadFile("install.ps1")
 	if err != nil {
@@ -68,7 +73,7 @@ func runPowerShellChannel(t *testing.T, shell, api, web, token, timeout string) 
 	if timeout != "" {
 		script += "$MetadataTimeout=[TimeSpan]::FromMilliseconds(" + timeout + ")\n"
 	}
-	script += "try { Resolve-ReleaseTag } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }\n"
+	script += "try { " + operation + " } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }\n"
 	path := filepath.Join(t.TempDir(), "resolve.ps1")
 	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
@@ -77,6 +82,38 @@ func runPowerShellChannel(t *testing.T, shell, api, web, token, timeout string) 
 	cmd.Env = withoutEnv(os.Environ(), "METIS_GITHUB_TOKEN", "GITHUB_TOKEN")
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+// Windows PowerShell 5.1 emits the entire decoded array as one pipeline item.
+// Assert the page boundary directly so a nested array cannot masquerade as a
+// one-release page and silently terminate pagination before candidate checking.
+func TestPowerShellCLIReleasePageArrayShape(t *testing.T) {
+	shell := powershellChannelCommand(t)
+	for _, count := range []int{0, 1, 2, 100} {
+		t.Run(fmt.Sprintf("releases_%d", count), func(t *testing.T) {
+			releases := []any{}
+			for len(releases) < count {
+				releases = append(releases, powershellCLIRelease("v0.4.51", "https://github.com"))
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(releases)
+			}))
+			defer server.Close()
+			operation := `$testClient=[System.Net.Http.HttpClient]::new(); $testCancellation=[System.Threading.CancellationTokenSource]::new(); try {
+                $page=Read-CLIReleasePage $testClient $ApiBase $testCancellation.Token
+                if ($page -isnot [Array]) { throw 'Decoded release page is not an array' }
+                foreach ($item in $page) {
+                    if ($item -isnot [System.Management.Automation.PSCustomObject]) { throw ('Decoded page item has wrong type: ' + $item.GetType().FullName) }
+                    if ($item.tag_name -cne 'v0.4.51' -or $item.assets -isnot [Array] -or $item.assets.Count -ne 12) { throw 'Decoded release item lost its shape' }
+                }
+                [Console]::WriteLine($page.Count)
+            } finally { $testCancellation.Dispose(); $testClient.Dispose() }`
+			out, err := runPowerShellChannelOperation(t, shell, server.URL, "https://github.com", "", "", operation)
+			if err != nil || out != fmt.Sprint(count) {
+				t.Fatalf("decoded page count=%q err=%v; want %d release objects", out, err, count)
+			}
+		})
+	}
 }
 
 func powershellCLIRelease(tag, web string) map[string]any {

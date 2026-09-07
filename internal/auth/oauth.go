@@ -979,6 +979,12 @@ func RefreshTokenContext(ctx context.Context, p OAuthProvider, refreshToken stri
 	defer resp.Body.Close()
 	tok, err := decodeOAuthTokenResponse(resp, operation, []string{refreshToken})
 	if err != nil {
+		// The response may win the HTTP round-trip race while cancellation
+		// happens during its body read. Preserve cancellation instead of
+		// misreporting the empty/interrupted body as a provider rejection.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	// Some providers omit refresh_token on refresh — keep the old one.

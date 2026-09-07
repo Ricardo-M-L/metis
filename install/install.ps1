@@ -129,9 +129,10 @@ function Read-CLIReleasePage(
     if (-not $body.StartsWith("[") -or -not $body.EndsWith("]")) {
         throw "CLI release metadata must be a JSON array"
     }
-    # Force an array after decoding so Windows PowerShell 5.1's pipeline
-    # unwrapping cannot turn a single-release page into a scalar object.
-    $decoded = @(ConvertFrom-Json -InputObject $body)
+    # Windows PowerShell 5.1 emits the whole decoded array as one pipeline
+    # item. Group the command first to enumerate that result; then @() preserves
+    # the empty/single/multiple release array across both PowerShell 5.1 and 7.
+    $decoded = @((ConvertFrom-Json -InputObject $body))
     $Cancellation.ThrowIfCancellationRequested()
     if ($decoded.Count -gt 100) {
         throw "CLI release metadata page is not an array of at most 100 releases"
