@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Published vX.Y.Z release tag to verify (registered CLI preview or full stable)
+        description: Published vX.Y.Z release tag to verify (registered CLI-only or full stable)
         required: true
         type: string
 
@@ -43,10 +43,10 @@ jobs:
           fi
 
           # Unregistered stable releases still require exactly the 20 immutable assets.
-          # Only repository-registered CLI-only prereleases use the 12-asset schema.
+          # Only repository-registered CLI-only releases use the 12-asset schema.
           python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > plan.json
           channel=$(jq -r .channel plan.json)
-          if [ "$channel" = cli-only-prerelease ]; then
+          if [ "$channel" != stable ]; then
             python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
               --registry source/.github/cli-only-releases.json > source-plan.json
             cmp plan.json source-plan.json
@@ -57,7 +57,7 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir source/dist
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata release.json --latest latest.json --dist source/dist
-          if [ "$channel" = cli-only-prerelease ]; then
+          if [ "$channel" != stable ]; then
             release-tools/scripts/verify-dist.sh --repo source --tag "$TAG"
           fi
           for sidecar in source/dist/*.sha256; do

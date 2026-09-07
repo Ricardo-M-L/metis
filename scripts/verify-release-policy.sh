@@ -141,8 +141,10 @@ grep -Fq -- '--registry source/.github/cli-only-releases.json' "$cli_workflow" |
 	fail "CLI publication does not cross-check tagged registry"
 grep -Fq 'cmp plan.json source-plan.json' "$cli_workflow" || \
 	fail "CLI publication may disagree with tagged registry"
-grep -Fq -- '-F draft=false -F prerelease=true -f make_latest=false' "$cli_workflow" || \
-	fail "CLI publication must explicitly remain prerelease and not latest"
+grep -Fq 'prerelease=$(jq -r .prerelease plan.json)' "$cli_workflow" || \
+	fail "CLI publication prerelease flag does not follow the trusted registry plan"
+grep -Fq -- '-F draft=false -F prerelease="$prerelease" -f make_latest=false' "$cli_workflow" || \
+	fail "CLI publication must explicitly use the registered prerelease flag and not latest"
 grep -Fq -- '--metadata draft-current.json --latest latest-current.json --phase draft --dist source/dist' "$cli_workflow" || \
 	fail "CLI publication does not recheck immutable draft/assets immediately before publish"
 grep -Fq -- 'test "$(jq -r .tag_name latest-current.json)" = "$(jq -r .tag_name latest-after.json)"' "$cli_workflow" || \
@@ -162,4 +164,4 @@ python3 "$release_contract" plan --tag v0.0.0 --registry "$cli_registry" >/dev/n
 python3 -B -m unittest discover -s "$script_dir" -p 'test_release_contract.py' || \
 	fail "release contract regression tests failed"
 
-printf '%s\n' 'verify-release-policy: immutable stable/CLI-preview draft and published-release gates verified'
+printf '%s\n' 'verify-release-policy: immutable full-stable/CLI-only draft and published-release gates verified'

@@ -1,10 +1,10 @@
-name: Publish CLI Prerelease
+name: Publish CLI Release
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.49); never stable/latest'
+        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.49); prerelease flag follows registry, never latest'
         required: true
         type: string
       build_run_id:
@@ -47,7 +47,10 @@ jobs:
           set -euo pipefail
           python3 -B -m unittest discover -s release-tools/scripts -p 'test_release_contract.py' -v
           python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > plan.json
-          test "$(jq -r .channel plan.json)" = cli-only-prerelease
+          case "$(jq -r .channel plan.json)" in
+            cli-only-prerelease|cli-only-stable) ;;
+            *) echo "not a registered CLI-only channel" >&2; exit 1 ;;
+          esac
           python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
             --registry source/.github/cli-only-releases.json > source-plan.json
           cmp plan.json source-plan.json
@@ -98,7 +101,7 @@ jobs:
             --workflow-dist verified-build --dist source/dist > provenance-verified.json
           release-tools/scripts/verify-dist.sh --repo source --tag "$TAG"
 
-      - name: Publish registered CLI preview without changing latest
+      - name: Publish registered CLI release without changing latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
@@ -116,14 +119,16 @@ jobs:
             <(jq -S "$asset_identity" draft-current.json)
           release_id=$(jq -r .id draft-current.json)
           [[ "$release_id" =~ ^[0-9]+$ ]]
+          prerelease=$(jq -r .prerelease plan.json)
+          [[ "$prerelease" = true || "$prerelease" = false ]]
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-            -F draft=false -F prerelease=true -f make_latest=false > published.json
+            -F draft=false -F prerelease="$prerelease" -f make_latest=false > published.json
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-after.json
           test "$(jq -r .tag_name latest-current.json)" = "$(jq -r .tag_name latest-after.json)"
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata published.json --latest latest-after.json --dist source/dist
           {
-            echo "Published opt-in CLI prerelease $TAG; stable latest is unchanged."
+            echo "Published registered CLI release $TAG (prerelease=$prerelease); shared latest is unchanged."
             echo "All 12 asset bytes match successful Release build run $BUILD_RUN_ID, artifact $(jq -r .artifact_id provenance-verified.json)."
             echo "No Desktop assets were released. Run Verify Published Release for all-platform anonymous installer checks."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -136,11 +141,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
-      - name: Install pinned preview without a GitHub token
+      - name: Install pinned CLI release without a GitHub token
         env:
           TAG: ${{ inputs.tag }}
         run: |
-          install_dir="$RUNNER_TEMP/metis-preview-bin"
+          install_dir="$RUNNER_TEMP/metis-cli-release-bin"
           env -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN \
             METIS_VERSION="$TAG" METIS_INSTALL_DIR="$install_dir" bash install/install.sh
           test "$("$install_dir/metis" version | awk 'NR == 1 { print $1 }')" = "$TAG"
@@ -153,14 +158,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
-      - name: Install pinned preview without a GitHub token
+      - name: Install pinned CLI release without a GitHub token
         shell: pwsh
         env:
           TAG: ${{ inputs.tag }}
         run: |
           Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
           Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
-          $installDir = Join-Path $env:RUNNER_TEMP "metis-preview-bin"
+          $installDir = Join-Path $env:RUNNER_TEMP "metis-cli-release-bin"
           & ./install/install.ps1 -Version $env:TAG -InstallDir $installDir
           $output = @(& (Join-Path $installDir "metis.exe") version)
           if ($LASTEXITCODE -ne 0) { throw "installed metis.exe version failed" }

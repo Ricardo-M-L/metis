@@ -63,6 +63,41 @@ class ReleaseContractTests(unittest.TestCase):
         contract.verify_release(self.registry, "v0.4.50", self.metadata("v0.4.50"),
                                 {"tag_name": "v0.4.50"}, phase="published")
 
+    def test_registered_cli_stable_has_twelve_assets_and_is_not_prerelease(self):
+        self.registry["releases"]["v0.4.49"].update(channel="cli-only-stable", prerelease=False)
+        plan = contract.release_plan(self.registry, "v0.4.49")
+        self.assertEqual(plan["channel"], "cli-only-stable")
+        self.assertEqual(len(plan["assets"]), 12)
+        self.assertIs(plan["prerelease"], False)
+        self.assertIs(plan["make_latest"], False)
+        self.verify()
+
+    def test_cli_stable_rejects_prerelease_metadata_or_latest_promotion(self):
+        self.registry["releases"]["v0.4.49"].update(channel="cli-only-stable", prerelease=False)
+        meta = self.metadata()
+        meta["prerelease"] = True
+        with self.assertRaisesRegex(ValueError, "prerelease"):
+            self.verify(meta)
+        with self.assertRaisesRegex(ValueError, "latest"):
+            self.verify(latest="v0.4.49")
+
+    def test_cli_stable_registry_rejects_prerelease_or_latest_flags(self):
+        for field in ("prerelease", "make_latest"):
+            registry = copy.deepcopy(self.registry)
+            entry = registry["releases"]["v0.4.49"]
+            entry.update(channel="cli-only-stable", prerelease=False)
+            entry[field] = True
+            with self.assertRaises(ValueError):
+                contract.release_plan(registry, "v0.4.49")
+
+    def test_repository_registers_v0449_as_cli_stable_only(self):
+        registry = contract.load_json(SCRIPT.parent.parent / ".github/cli-only-releases.json")
+        plan = contract.release_plan(registry, "v0.4.49")
+        self.assertEqual(plan["channel"], "cli-only-stable")
+        self.assertIs(plan["prerelease"], False)
+        self.assertIs(plan["make_latest"], False)
+        self.assertEqual(len(plan["assets"]), 12)
+
     def test_cli_cannot_be_promoted_to_stable(self):
         meta = self.metadata()
         meta["prerelease"] = False

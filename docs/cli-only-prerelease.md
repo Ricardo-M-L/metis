@@ -1,27 +1,29 @@
-# CLI-only prerelease protocol
+# CLI-only release protocol
 
-`v0.4.49` is an **opt-in CLI prerelease**, not a signed Desktop or stable-channel
-release. Its plain `vX.Y.Z` tag is needed by the existing pinned installers;
-GitHub's release metadata, not a version suffix, isolates it from `/releases/latest`.
-The CLI and Desktop automatic updaters must continue seeing the existing stable
-release. Updating the five source version declarations does not publish Desktop.
+`v0.4.49` is a **formal CLI-only release** with GitHub `prerelease=false`, not a
+signed Desktop release. Its plain `vX.Y.Z` tag works with existing pinned
+installers. Explicit `make_latest=false` keeps `/releases/latest` on the existing
+full CLI+Desktop stable release, so the shared automatic updaters do not offer
+Desktop users a CLI-only payload. Updating the five source version declarations
+does not publish Desktop. This document keeps its original filename for links.
 
 ## Registered contract
 
 - `.github/cli-only-releases.json` is the repository-reviewed allowlist. Only an
   exact registered tag may use the CLI-only path; a workflow input cannot opt an
   arbitrary stable tag into it. Both trusted tooling and tagged source must agree.
-- A registered release must have `prerelease=true`, must not be the response from
-  GitHub's independent `/releases/latest` endpoint, and must have exactly **12**
+- Registry channel `cli-only-stable` requires `prerelease=false` (the v0.4.49
+  setting); `cli-only-prerelease` requires `prerelease=true`. Both must not be
+  the response from GitHub's independent `/releases/latest` endpoint and require **12**
   assets: CLI archives for Darwin/Linux/Windows × amd64/arm64 and six SHA-256 files.
 - Publication explicitly sends `make_latest=false`. GitHub does not expose that
   field on release GET responses, so verification separately checks latest before
   and after publication. Never infer this setting from a release title/body.
 - Unregistered releases retain the **20-asset stable contract** and the existing
-  Developer ID, notarization, stapling, and Gatekeeper verification. CLI previews
-  do not waive those requirements for any Desktop/stable release.
-- Only drafts may be rebuilt/replaced. Once public, a preview is just as immutable
-  as a stable release; fixes need another version and an explicit registry review.
+  Developer ID, notarization, stapling, and Gatekeeper verification. CLI-only
+  registration does not waive those requirements for full CLI+Desktop releases.
+- Only drafts may be rebuilt/replaced. Once public, CLI-only releases are
+  immutable; fixes need another version and an explicit registry review.
 - The publication input must identify a successful `Release` workflow run from
   this same repository with a head SHA exactly equal to the tag commit. The
   verifier checks workflow path/ID, completed/success state, event, repository
@@ -49,7 +51,8 @@ Use the reviewed complete source commit, not a dirty-tree evaluation candidate.
    reviewed source and ordinary `v0.4.49` tag using the repository's owner process.
    The `Release` tag workflow runs root and patched-module tests, cross-builds
    all six CLI targets, checks archive shapes/checksums/version, and performs
-   Linux and Windows artifact smoke tests. It stages a **prerelease draft only**.
+   Linux and Windows artifact smoke tests. It stages a **draft only**, preserving
+   the registry's `prerelease=false` for v0.4.49.
    It does not build or upload Desktop assets for this registered tag.
 
    To retry an existing tag whose release remains a draft:
@@ -77,10 +80,10 @@ Use the reviewed complete source commit, not a dirty-tree evaluation candidate.
    ```
 
    This fails before writing if the release is already public, unregistered,
-   stable, latest, incomplete, has extra assets, has changed since download,
+   on the full CLI+Desktop channel, latest, incomplete, has extra assets, has changed since download,
    lacks exact successful-build provenance, or fails checksum/archive/version
    validation. It publishes exactly once with
-   `prerelease=true` and `make_latest=false`, checks latest remained unchanged,
+   the registered prerelease flag (`false` for v0.4.49) and `make_latest=false`, checks latest remained unchanged,
    then anonymously installs the pinned release on Linux and Windows.
 
 4. Explicitly dispatch the read-only published check and inspect its final result:
@@ -121,6 +124,6 @@ binary hash as well. Record workflow IDs and results whichever local route is
 used. Keep previous attempts unchanged. A 1-hour pilot is not proof of 6-hour
 autonomy; do not advertise the latter before it is measured.
 
-No Apple signing credentials are required for this CLI-only preview. No npm
+No Apple signing credentials are required for this CLI-only release. No npm
 registry package is published by these workflows. The updated npm version is
 installer source metadata only; `npm publish` remains outside this protocol.

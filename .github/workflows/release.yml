@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing vX.Y.Z tag to (re)build; only registered tags may be CLI previews'
+        description: 'Existing vX.Y.Z tag to (re)build; only registered tags may be CLI-only releases'
         required: true
         type: string
 
@@ -71,7 +71,7 @@ jobs:
         run: |
           python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > release-plan.json
           channel=$(jq -r .channel release-plan.json)
-          if [ "$channel" = cli-only-prerelease ]; then
+          if [ "$channel" != stable ]; then
             # The tagged source must opt in to the identical registry entry;
             # dispatching newer tooling cannot downgrade a historical stable.
             python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
@@ -339,7 +339,7 @@ jobs:
       needs.build.result == 'success' &&
       needs.smoke-unix-artifact.result == 'success' &&
       needs.smoke-windows-artifact.result == 'success' &&
-      (needs.build.outputs.channel == 'cli-only-prerelease' || github.event_name != 'push' || needs.desktop-build.result == 'success')
+      (needs.build.outputs.channel != 'stable' || github.event_name != 'push' || needs.desktop-build.result == 'success')
     needs: [build, smoke-unix-artifact, smoke-windows-artifact, desktop-build]
     runs-on: ubuntu-latest
     permissions:
@@ -396,14 +396,15 @@ jobs:
           else
             # If lookup failed for any reason other than absence, creation also
             # fails before upload. This keeps an existing public release intact.
-            preview_flags=()
-            if [ "$CHANNEL" = "cli-only-prerelease" ]; then preview_flags=(--prerelease --latest=false); fi
+            channel_flags=()
+            if [ "$CHANNEL" != "stable" ]; then channel_flags=(--latest=false); fi
+            if [ "$CHANNEL" = "cli-only-prerelease" ]; then channel_flags+=(--prerelease); fi
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --draft --title "${TAG#v}" --generate-notes "${preview_flags[@]}"
+              --verify-tag --draft --title "${TAG#v}" --generate-notes "${channel_flags[@]}"
           fi
 
           # Re-read immediately before any replacement. Public releases are
-          # immutable, including CLI-only prereleases; only drafts may retry.
+          # immutable, including CLI-only releases; only drafts may retry.
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata release.json --latest latest-before.json --phase draft --allow-partial-draft
@@ -411,7 +412,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-after.json
           verification_flags=(--allow-partial-draft)
-          if [ "$CHANNEL" = "cli-only-prerelease" ]; then verification_flags=(--dist dist); fi
+          if [ "$CHANNEL" != "stable" ]; then verification_flags=(--dist dist); fi
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata release.json --latest latest-after.json --phase draft "${verification_flags[@]}"
 
@@ -423,9 +424,9 @@ jobs:
           {
             echo "### Draft staged for $TAG"
             echo
-            if [ "$CHANNEL" = "cli-only-prerelease" ]; then
-              echo "Registered CLI preview: exactly 12 CLI assets, prerelease=true, make_latest=false."
-              echo "Run Publish CLI Prerelease after review; no Desktop release, no stable updater promotion."
+            if [ "$CHANNEL" != "stable" ]; then
+              echo "Registered $CHANNEL: exactly 12 CLI assets, registry-matched prerelease flag, make_latest=false."
+              echo "Run Publish CLI Release after review; no Desktop release, no shared latest/updater promotion."
             else
               echo "The draft intentionally omits the four official macOS files."
               echo "Add the Developer ID signed, notarized, stapled ZIP/DMG and their SHA-256 sidecars, verify all 20 assets, then publish the draft exactly once."

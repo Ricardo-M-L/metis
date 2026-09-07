@@ -2,10 +2,10 @@
   "schema_version": 1,
   "releases": {
     "v0.4.49": {
-      "channel": "cli-only-prerelease",
-      "prerelease": true,
+      "channel": "cli-only-stable",
+      "prerelease": false,
       "make_latest": false,
-      "reason": "Opt-in CLI long-run reliability evaluation; no Desktop binaries and no stable-channel promotion."
+      "reason": "User-authorized formal CLI-only release; no Desktop binaries and no shared latest/updater promotion."
     }
   }
 }

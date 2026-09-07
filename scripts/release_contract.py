@@ -4,7 +4,7 @@
 The registry is trusted repository release tooling, never a workflow input or a
 release-body claim. An absent entry means the full stable/20-asset contract.
 GitHub does not return make_latest on GET: callers must supply an independent
-/releases/latest response to prove that a CLI preview was not promoted.
+/releases/latest response to prove that a CLI-only release was not promoted.
 """
 
 import argparse
@@ -16,6 +16,7 @@ import sys
 
 
 TAG_RE = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
+CLI_CHANNELS = ("cli-only-prerelease", "cli-only-stable")
 CLI_ARCHIVES = (
     "metis-darwin-amd64.tar.gz", "metis-darwin-arm64.tar.gz",
     "metis-linux-amd64.tar.gz", "metis-linux-arm64.tar.gz",
@@ -48,17 +49,18 @@ def release_plan(registry, tag):
         validate_tag(registered_tag)
         require(isinstance(entry, dict) and set(entry) == {
             "channel", "prerelease", "make_latest", "reason"}, "invalid registry entry schema")
-        require(entry["channel"] == "cli-only-prerelease", "invalid registry channel")
-        require(entry["prerelease"] is True and entry["make_latest"] is False,
-                "CLI-only registry requires prerelease=true and make_latest=false")
+        require(entry["channel"] in CLI_CHANNELS, "invalid registry channel")
+        require(entry["prerelease"] is (entry["channel"] == "cli-only-prerelease") and
+                entry["make_latest"] is False,
+                "CLI-only registry requires channel-matched prerelease and make_latest=false")
         require(isinstance(entry["reason"], str) and entry["reason"].strip(), "missing registry reason")
-    preview = tag in releases
-    archives = CLI_ARCHIVES if preview else CLI_ARCHIVES + DESKTOP_ARCHIVES
+    cli_only = tag in releases
+    archives = CLI_ARCHIVES if cli_only else CLI_ARCHIVES + DESKTOP_ARCHIVES
     return {
         "tag": tag,
-        "channel": "cli-only-prerelease" if preview else "stable",
-        "prerelease": preview,
-        "make_latest": False if preview else None,
+        "channel": releases[tag]["channel"] if cli_only else "stable",
+        "prerelease": releases[tag]["prerelease"] if cli_only else False,
+        "make_latest": False if cli_only else None,
         "assets": sorted(name for archive in archives for name in (archive, archive + ".sha256")),
     }
 
@@ -73,8 +75,8 @@ def verify_release(registry, tag, metadata, latest, *, phase, complete=True):
     require(isinstance(latest, dict) and isinstance(latest.get("tag_name"), str),
             "missing independent latest release evidence")
     validate_tag(latest["tag_name"])
-    if plan["channel"] == "cli-only-prerelease":
-        require(latest["tag_name"] != tag, "CLI-only prerelease must not be latest")
+    if plan["channel"] in CLI_CHANNELS:
+        require(latest["tag_name"] != tag, "CLI-only release must not be latest")
     assets = metadata.get("assets")
     require(isinstance(assets, list), "missing release asset inventory")
     names = []
@@ -210,7 +212,7 @@ def main():
     registry = load_json(args.registry)
     plan = release_plan(registry, args.tag)
     if args.command == "provenance":
-        require(plan["channel"] == "cli-only-prerelease", "provenance publication requires registered CLI preview")
+        require(plan["channel"] in CLI_CHANNELS, "provenance publication requires registered CLI-only release")
         require(args.run and args.workflow and args.artifacts and args.repository and args.run_id and args.source_sha,
                 "provenance requires run/workflow/artifacts/repository/run-id/source-sha")
         require(not (args.metadata or args.latest or args.allow_partial_draft),

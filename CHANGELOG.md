@@ -9,10 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [0.4.49] - 2026-09-07
 
-This version is an opt-in **CLI-only GitHub prerelease**, not the stable/latest
-release. It includes six CLI platforms and SHA-256 sidecars; no Desktop binary
-is published. Desktop version declarations remain synchronized for source
-builds, not as a claim that a signed Desktop release exists.
+This version is a **formal CLI-only GitHub release** (`prerelease=false`). It
+is deliberately not the shared `latest` release, keeping Desktop automatic
+updates on the existing complete release. It includes six CLI platforms and
+SHA-256 sidecars; no Desktop binary is published. Desktop version declarations
+remain synchronized for source builds, not as a signed Desktop release claim.
 
 ### Added
 
@@ -23,7 +24,8 @@ builds, not as a claim that a signed Desktop release exists.
 - Added bounded transient Responses/Codex network recovery with explicit
   request/time budgets, without replaying already executed tools.
 - Added an explicit CLI-only release registry and draft-only, non-latest
-  prerelease publication. Unregistered stable releases still require all 20
+  publication with a strictly matched formal/prerelease flag. Unregistered
+  full stable releases still require all 20
   assets and the existing Apple signing/notarization/Gatekeeper gates.
 
 ### Fixed
