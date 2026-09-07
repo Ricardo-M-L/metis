@@ -159,6 +159,14 @@ grep -Fq 'actions/artifacts/$ARTIFACT_ID/zip' "$cli_workflow" || \
 	fail "CLI publication does not download the verified immutable artifact ID"
 grep -Fq -- '--workflow-dist verified-build --dist source/dist' "$cli_workflow" || \
 	fail "CLI publication does not compare all draft bytes to the verified build"
+for draft_workflow in "$stage_workflow" "$cli_workflow"; do
+	grep -Fq 'release_contract.py lookup' "$draft_workflow" || fail "draft lookup is not draft-aware"
+	if grep -Fq 'releases/tags/$TAG' "$draft_workflow"; then
+		fail "draft workflow uses published-only release tag endpoint"
+	fi
+done
+grep -Fq 'if [ "$lookup_status" -ne 4 ]; then exit "$lookup_status"; fi' "$stage_workflow" || \
+	fail "release staging treats non-absence lookup failures as missing releases"
 python3 "$release_contract" plan --tag v0.0.0 --registry "$cli_registry" >/dev/null || \
 	fail "invalid trusted CLI-only registry"
 python3 -B -m unittest discover -s "$script_dir" -p 'test_release_contract.py' || \

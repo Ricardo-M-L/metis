@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("release_contract.py")
@@ -97,6 +98,53 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIs(plan["prerelease"], False)
         self.assertIs(plan["make_latest"], False)
         self.assertEqual(len(plan["assets"]), 12)
+
+    def test_repository_registers_v0450_as_cli_stable(self):
+        registry = contract.load_json(SCRIPT.parent.parent / ".github/cli-only-releases.json")
+        plan = contract.release_plan(registry, "v0.4.50")
+        self.assertEqual(plan["channel"], "cli-only-stable")
+        self.assertIs(plan["prerelease"], False)
+        self.assertIs(plan["make_latest"], False)
+        self.assertEqual(len(plan["assets"]), 12)
+
+    def test_draft_lookup_uses_list_and_id_when_tag_endpoint_is_404(self):
+        draft = {"id": 383893785, "tag_name": "v0.4.49", "draft": True, "prerelease": False}
+        requests = []
+        def request(route, *, paginate=False):
+            requests.append((route, paginate))
+            if route == "repos/owner/metis/releases?per_page=100":
+                return [[{"id": 41, "tag_name": "v0.4.47"}], [draft]]
+            if route == "repos/owner/metis/releases/383893785":
+                return draft
+            raise ValueError("HTTP 404 tag endpoint")
+        with mock.patch.object(contract, "gh_api_json", side_effect=request):
+            self.assertEqual(contract.lookup_release("owner/metis", "v0.4.49"), draft)
+        self.assertEqual(requests, [("repos/owner/metis/releases?per_page=100", True),
+                                    ("repos/owner/metis/releases/383893785", False)])
+
+    def test_draft_lookup_absence_is_distinct_from_transport_failure(self):
+        with mock.patch.object(contract, "gh_api_json", return_value=[[]]):
+            with self.assertRaises(contract.ReleaseNotFound):
+                contract.lookup_release("owner/metis", "v0.4.50")
+        with mock.patch.object(contract, "gh_api_json", side_effect=ValueError("HTTP 403")):
+            with self.assertRaises(ValueError) as raised:
+                contract.lookup_release("owner/metis", "v0.4.50")
+            self.assertNotIsInstance(raised.exception, contract.ReleaseNotFound)
+
+    def test_draft_lookup_rejects_duplicate_tag_and_malformed_pages(self):
+        draft = {"id": 10, "tag_name": "v0.4.50"}
+        for pages in [[draft], [[draft, draft]], [], [[{"id": True, "tag_name": "v0.4.50"}]]]:
+            with mock.patch.object(contract, "gh_api_json", return_value=pages):
+                with self.assertRaises(ValueError) as raised:
+                    contract.lookup_release("owner/metis", "v0.4.50")
+                self.assertNotIsInstance(raised.exception, contract.ReleaseNotFound)
+
+    def test_draft_lookup_rejects_changed_id_or_tag_after_list(self):
+        draft = {"id": 10, "tag_name": "v0.4.50"}
+        for fetched in [{"id": 11, "tag_name": "v0.4.50"}, {"id": 10, "tag_name": "v0.4.49"}]:
+            with mock.patch.object(contract, "gh_api_json", side_effect=[[[draft]], fetched]):
+                with self.assertRaises(ValueError):
+                    contract.lookup_release("owner/metis", "v0.4.50")
 
     def test_cli_cannot_be_promoted_to_stable(self):
         meta = self.metadata()

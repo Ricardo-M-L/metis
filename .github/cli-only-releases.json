@@ -6,6 +6,12 @@
       "prerelease": false,
       "make_latest": false,
       "reason": "User-authorized formal CLI-only release; no Desktop binaries and no shared latest/updater promotion."
+    },
+    "v0.4.50": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "Formal CLI-only release with draft-aware release lookup; preserve the failed v0.4.49 tag/draft and shared latest."
     }
   }
 }

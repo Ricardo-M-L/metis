@@ -7,12 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.50] - 2026-09-07
+
+Formal CLI-only release (`prerelease=false`, `make_latest=false`); all six CLI
+platforms and checksum sidecars are required. The v0.4.49 tag and failed draft
+are retained unchanged; v0.4.49 did not complete publication.
+
+### Fixed
+
+- Resolved draft releases through the complete authenticated release listing
+  and numeric release ID, instead of the published-only release-tag endpoint.
+  A successfully created draft no longer causes the staging job to fail with
+  a misleading 404 on its next metadata read.
+- Distinguished confirmed release absence from authentication, transport, and
+  malformed-response failures before allowing release creation. Upload/download
+  resolution is checked against the validated draft ID; exact-source successful
+  build provenance and all existing immutable release gates remain enforced.
+
 ## [0.4.49] - 2026-09-07
 
-This version is a **formal CLI-only GitHub release** (`prerelease=false`). It
-is deliberately not the shared `latest` release, keeping Desktop automatic
-updates on the existing complete release. It includes six CLI platforms and
-SHA-256 sidecars; no Desktop binary is published. Desktop version declarations
+Prepared as a **formal CLI-only GitHub release** (`prerelease=false`), but
+publication did not complete; the tag and failed draft are retained unchanged.
+The intended release contained six CLI platforms and SHA-256 sidecars, no
+Desktop binary, and no shared `latest` promotion. Desktop version declarations
 remain synchronized for source builds, not as a signed Desktop release claim.
 
 ### Added

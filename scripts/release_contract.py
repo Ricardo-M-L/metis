@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed release-channel/inventory checks. No network or mutations.
+"""Fail-closed release-channel/inventory checks; lookup performs read-only gh API calls.
 
 The registry is trusted repository release tooling, never a workflow input or a
 release-body claim. An absent entry means the full stable/20-asset contract.
@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -35,6 +36,43 @@ def require(condition, message):
 
 def validate_tag(tag):
     require(isinstance(tag, str) and TAG_RE.fullmatch(tag), "invalid vX.Y.Z release tag")
+
+
+class ReleaseNotFound(ValueError):
+    """A successful complete release listing contained no exact tag."""
+
+
+def gh_api_json(route, *, paginate=False):
+    command = ["gh", "api"]
+    if paginate:
+        command += ["--paginate", "--slurp"]
+    result = subprocess.run(command + [route], capture_output=True, text=True, timeout=60)
+    require(result.returncode == 0, "GitHub release metadata lookup failed; refusing to assume absence")
+    return json.loads(result.stdout, object_pairs_hook=no_duplicate_keys)
+
+
+def lookup_release(repository, tag):
+    # REST /releases/tags/{tag} excludes drafts. Let gh paginate the authenticated
+    # release list, resolve exactly one tag, then bind all reads to its numeric ID.
+    validate_tag(tag)
+    require(isinstance(repository, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository),
+            "invalid release repository")
+    pages = gh_api_json(f"repos/{repository}/releases?per_page=100", paginate=True)
+    require(isinstance(pages, list) and pages and all(isinstance(page, list) for page in pages),
+            "invalid or incomplete release listing")
+    releases = [release for page in pages for release in page]
+    require(all(isinstance(release, dict) and isinstance(release.get("tag_name"), str) for release in releases),
+            "invalid release listing entry")
+    matches = [release for release in releases if release["tag_name"] == tag]
+    require(len(matches) <= 1, "multiple releases have the exact target tag")
+    if not matches:
+        raise ReleaseNotFound("release not found in complete authenticated listing: " + tag)
+    release_id = matches[0].get("id")
+    require(type(release_id) is int and release_id > 0, "invalid listed release ID")
+    release = gh_api_json(f"repos/{repository}/releases/{release_id}")
+    require(isinstance(release, dict) and release.get("id") == release_id and release.get("tag_name") == tag,
+            "release ID/tag changed after listing")
+    return release
 
 
 def release_plan(registry, tag):
@@ -192,7 +230,7 @@ def load_json(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "verify", "provenance"))
+    parser.add_argument("command", choices=("plan", "verify", "provenance", "lookup"))
     parser.add_argument("--registry", type=Path,
                         default=Path(__file__).resolve().parent.parent / ".github/cli-only-releases.json")
     parser.add_argument("--tag", required=True)
@@ -209,6 +247,12 @@ def main():
     parser.add_argument("--run-id", type=int)
     parser.add_argument("--source-sha")
     args = parser.parse_args()
+    if args.command == "lookup":
+        require(args.repository and not any((args.metadata, args.latest, args.allow_partial_draft,
+                args.dist, args.workflow_dist, args.run, args.workflow, args.artifacts, args.run_id, args.source_sha)),
+                "lookup requires only --tag and --repository")
+        print(json.dumps(lookup_release(args.repository, args.tag), sort_keys=True))
+        return
     registry = load_json(args.registry)
     plan = release_plan(registry, args.tag)
     if args.command == "provenance":
@@ -243,6 +287,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError) as error:
+    except ReleaseNotFound as error:
+        print("release-contract: " + str(error), file=sys.stderr)
+        sys.exit(4)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("release-contract: " + str(error), file=sys.stderr)
         sys.exit(1)

@@ -390,12 +390,15 @@ jobs:
           fi
 
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-before.json
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json 2>/dev/null; then
+          if python3 release-tools/scripts/release_contract.py lookup --tag "$TAG" \
+            --repository "$GITHUB_REPOSITORY" > release.json; then
             python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
               --metadata release.json --latest latest-before.json --phase draft --allow-partial-draft
           else
-            # If lookup failed for any reason other than absence, creation also
-            # fails before upload. This keeps an existing public release intact.
+            lookup_status=$?
+            # Only a successful complete list with no exact tag allows create.
+            # Transport/auth/JSON failures never masquerade as absence.
+            if [ "$lookup_status" -ne 4 ]; then exit "$lookup_status"; fi
             channel_flags=()
             if [ "$CHANNEL" != "stable" ]; then channel_flags=(--latest=false); fi
             if [ "$CHANNEL" = "cli-only-prerelease" ]; then channel_flags+=(--prerelease); fi
@@ -405,11 +408,16 @@ jobs:
 
           # Re-read immediately before any replacement. Public releases are
           # immutable, including CLI-only releases; only drafts may retry.
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json
+          python3 release-tools/scripts/release_contract.py lookup --tag "$TAG" \
+            --repository "$GITHUB_REPOSITORY" > release.json
+          release_id=$(jq -r .id release.json)
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata release.json --latest latest-before.json --phase draft --allow-partial-draft
+          # gh release upload/download share its draft-aware FetchRelease. Bind
+          # that resolution to the ID already validated before allowing writes.
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)" = "$release_id"
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > release.json
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-after.json
           verification_flags=(--allow-partial-draft)
           if [ "$CHANNEL" != "stable" ]; then verification_flags=(--dist dist); fi

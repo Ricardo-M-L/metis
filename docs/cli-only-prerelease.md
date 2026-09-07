@@ -1,6 +1,6 @@
 # CLI-only release protocol
 
-`v0.4.49` is a **formal CLI-only release** with GitHub `prerelease=false`, not a
+`v0.4.50` is a **formal CLI-only release** with GitHub `prerelease=false`, not a
 signed Desktop release. Its plain `vX.Y.Z` tag works with existing pinned
 installers. Explicit `make_latest=false` keeps `/releases/latest` on the existing
 full CLI+Desktop stable release, so the shared automatic updaters do not offer
@@ -12,7 +12,7 @@ does not publish Desktop. This document keeps its original filename for links.
 - `.github/cli-only-releases.json` is the repository-reviewed allowlist. Only an
   exact registered tag may use the CLI-only path; a workflow input cannot opt an
   arbitrary stable tag into it. Both trusted tooling and tagged source must agree.
-- Registry channel `cli-only-stable` requires `prerelease=false` (the v0.4.49
+- Registry channel `cli-only-stable` requires `prerelease=false` (the v0.4.50
   setting); `cli-only-prerelease` requires `prerelease=true`. Both must not be
   the response from GitHub's independent `/releases/latest` endpoint and require **12**
   assets: CLI archives for Darwin/Linux/Windows × amd64/arm64 and six SHA-256 files.
@@ -30,6 +30,11 @@ does not publish Desktop. This document keeps its original filename for links.
   identity, artifact ID and source SHA, then compares every draft asset byte hash
   against that immutable workflow artifact before executing or publishing it.
   A different binary with the same version string and a fresh sidecar is rejected.
+- Draft lookup uses the complete authenticated release list, resolves an exact
+  unique tag to its numeric ID, then reads by that ID. The tag REST endpoint
+  excludes drafts. Only confirmed absence (lookup exit 4) permits creation;
+  network/auth/JSON failures stop the workflow. `gh release view` must resolve
+  the same ID before its draft-aware upload/download commands run.
 
 ## Owner-run release sequence
 
@@ -40,25 +45,25 @@ Use the reviewed complete source commit, not a dirty-tree evaluation candidate.
 1. Confirm the exact new tag is absent and the stable latest tag is recorded:
 
    ```sh
-   git ls-remote --tags origin refs/tags/v0.4.49
+   git ls-remote --tags origin refs/tags/v0.4.50
    gh api repos/Ricardo-M-L/metis/releases/latest --jq .tag_name
    scripts/verify-release-policy.sh
-   scripts/verify-dist.sh --metadata-only --tag v0.4.49
+   scripts/verify-dist.sh --metadata-only --tag v0.4.50
    python3 -B -m unittest discover -s scripts -p 'test_release_contract.py' -v
    ```
 
 2. After separately reviewing/committing all intended CLI fixes, publish the
-   reviewed source and ordinary `v0.4.49` tag using the repository's owner process.
+   reviewed source and ordinary `v0.4.50` tag using the repository's owner process.
    The `Release` tag workflow runs root and patched-module tests, cross-builds
    all six CLI targets, checks archive shapes/checksums/version, and performs
    Linux and Windows artifact smoke tests. It stages a **draft only**, preserving
-   the registry's `prerelease=false` for v0.4.49.
+   the registry's `prerelease=false` for v0.4.50.
    It does not build or upload Desktop assets for this registered tag.
 
    To retry an existing tag whose release remains a draft:
 
    ```sh
-   gh workflow run release.yml --ref v0.4.49 -f tag=v0.4.49
+   gh workflow run release.yml --ref v0.4.50 -f tag=v0.4.50
    gh run list --workflow release.yml --limit 5
    ```
 
@@ -74,7 +79,7 @@ Use the reviewed complete source commit, not a dirty-tree evaluation candidate.
    while it is a draft. Then dispatch the bounded publication workflow:
 
    ```sh
-   gh workflow run release-cli-publish.yml --ref main -f tag=v0.4.49 \
+   gh workflow run release-cli-publish.yml --ref main -f tag=v0.4.50 \
      -f build_run_id=REVIEWED_SUCCESSFUL_RELEASE_RUN_ID
    gh run list --workflow release-cli-publish.yml --limit 5
    ```
@@ -83,15 +88,15 @@ Use the reviewed complete source commit, not a dirty-tree evaluation candidate.
    on the full CLI+Desktop channel, latest, incomplete, has extra assets, has changed since download,
    lacks exact successful-build provenance, or fails checksum/archive/version
    validation. It publishes exactly once with
-   the registered prerelease flag (`false` for v0.4.49) and `make_latest=false`, checks latest remained unchanged,
+   the registered prerelease flag (`false` for v0.4.50) and `make_latest=false`, checks latest remained unchanged,
    then anonymously installs the pinned release on Linux and Windows.
 
 4. Explicitly dispatch the read-only published check and inspect its final result:
 
    ```sh
-   gh workflow run release-published.yml --ref main -f tag=v0.4.49
+   gh workflow run release-published.yml --ref main -f tag=v0.4.50
    gh run list --workflow release-published.yml --limit 5
-   gh api repos/Ricardo-M-L/metis/releases/tags/v0.4.49 \
+   gh api repos/Ricardo-M-L/metis/releases/tags/v0.4.50 \
      --jq '{tag_name,draft,prerelease,assets:[.assets[].name]}'
    gh api repos/Ricardo-M-L/metis/releases/latest --jq .tag_name
    ```
@@ -114,7 +119,7 @@ Downloading the public artifact is an optional separate distribution check.
 The existing installer supports pinned semver tags; no updater change is needed:
 
 ```sh
-METIS_VERSION=v0.4.49 METIS_INSTALL_DIR=/absolute/new/evaluation/bin \
+METIS_VERSION=v0.4.50 METIS_INSTALL_DIR=/absolute/new/evaluation/bin \
   bash install/install.sh
 /absolute/new/evaluation/bin/metis version
 ```
@@ -127,3 +132,7 @@ autonomy; do not advertise the latter before it is measured.
 No Apple signing credentials are required for this CLI-only release. No npm
 registry package is published by these workflows. The updated npm version is
 installer source metadata only; `npm publish` remains outside this protocol.
+
+The v0.4.49 build/artifact smokes succeeded, but draft staging failed because
+the published-only tag endpoint returned 404 after creating the draft. Keep
+that tag/draft and its evidence unchanged; it is not a completed public release.

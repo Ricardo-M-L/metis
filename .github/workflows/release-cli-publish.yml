@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.49); prerelease flag follows registry, never latest'
+        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.50); prerelease flag follows registry, never latest'
         required: true
         type: string
       build_run_id:
@@ -63,11 +63,13 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --run-id "$BUILD_RUN_ID" --source-sha "$source_sha" \
             --run build-run.json --workflow release-workflow.json --artifacts build-artifacts.json > provenance.json
           echo "artifact_id=$(jq -r .artifact_id provenance.json)" >> "$GITHUB_OUTPUT"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft.json
+          python3 release-tools/scripts/release_contract.py lookup --tag "$TAG" \
+            --repository "$GITHUB_REPOSITORY" > draft.json
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-before.json
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata draft.json --latest latest-before.json --phase draft
           mkdir source/dist
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)" = "$(jq -r .id draft.json)"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir source/dist
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata draft.json --latest latest-before.json --phase draft --dist source/dist
@@ -109,7 +111,9 @@ jobs:
         run: |
           set -euo pipefail
           # Re-read under the same concurrency lock immediately before publish.
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft-current.json
+          release_id=$(jq -r .id draft.json)
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > draft-current.json
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-current.json
           python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
             --metadata draft-current.json --latest latest-current.json --phase draft --dist source/dist
