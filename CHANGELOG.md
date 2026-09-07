@@ -7,11 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.51] - 2026-09-07
+
+Prepared as a formal CLI-only release (`prerelease=false`, `make_latest=false`)
+with no Desktop payload or shared latest promotion. Publication remains subject
+to exact-tag successful build provenance and complete asset verification.
+
+### Fixed
+
+- Resolved pending release tags through GraphQL, matching GitHub CLI's
+  draft-aware route. Actions tokens can omit existing drafts from even complete
+  REST release lists; an empty REST list is no longer treated as absence.
+- Allowed draft creation only after an error-free GraphQL response for the
+  correct visible repository explicitly returns `release: null`; malformed,
+  unauthorized, incomplete, or contradictory metadata fails closed.
+- Made the `/retry` immediate-resubmission test wait for real provider dispatch
+  before inspecting history and cancel/join its mock turn afterward, removing
+  a scheduler-dependent assertion without changing production retry behavior.
+
 ## [0.4.50] - 2026-09-07
 
-Formal CLI-only release (`prerelease=false`, `make_latest=false`); all six CLI
-platforms and checksum sidecars are required. The v0.4.49 tag and failed draft
-are retained unchanged; v0.4.49 did not complete publication.
+Prepared as a formal CLI-only release (`prerelease=false`, `make_latest=false`),
+but publication did not complete: Actions-token REST listing omitted its draft.
+The v0.4.49/v0.4.50 tags, failed drafts, and evidence are retained unchanged.
 
 ### Fixed
 

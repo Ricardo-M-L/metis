@@ -396,7 +396,7 @@ jobs:
               --metadata release.json --latest latest-before.json --phase draft --allow-partial-draft
           else
             lookup_status=$?
-            # Only a successful complete list with no exact tag allows create.
+            # Only error-free GraphQL with explicit release:null allows create.
             # Transport/auth/JSON failures never masquerade as absence.
             if [ "$lookup_status" -ne 4 ]; then exit "$lookup_status"; fi
             channel_flags=()

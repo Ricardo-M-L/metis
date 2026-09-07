@@ -107,23 +107,51 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIs(plan["make_latest"], False)
         self.assertEqual(len(plan["assets"]), 12)
 
-    def test_draft_lookup_uses_list_and_id_when_tag_endpoint_is_404(self):
+    def test_repository_registers_v0451_as_cli_stable(self):
+        registry = contract.load_json(SCRIPT.parent.parent / ".github/cli-only-releases.json")
+        plan = contract.release_plan(registry, "v0.4.51")
+        self.assertEqual(plan["channel"], "cli-only-stable")
+        self.assertIs(plan["prerelease"], False)
+        self.assertIs(plan["make_latest"], False)
+        self.assertEqual(len(plan["assets"]), 12)
+
+    def test_graphql_lookup_fields_use_gh_arguments_without_shell_or_rest_pagination(self):
+        result = mock.Mock(returncode=0, stdout='{"data": {}}')
+        with mock.patch.object(contract.subprocess, "run", return_value=result) as run:
+            self.assertEqual(contract.gh_api_json("graphql", fields={"query": "$query", "tag": "v0.4.51"}), {"data": {}})
+        run.assert_called_once_with(["gh", "api", "graphql", "-f", "query=$query", "-f", "tag=v0.4.51"],
+                                    capture_output=True, text=True, timeout=60)
+
+    def test_graphql_http_failure_cannot_be_reported_as_release_absence(self):
+        with mock.patch.object(contract.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")):
+            with self.assertRaises(ValueError) as raised:
+                contract.lookup_release("owner/metis", "v0.4.51")
+        self.assertNotIsInstance(raised.exception, contract.ReleaseNotFound)
+
+    def graphql_release(self, release):
+        return {"data": {"repository": {"nameWithOwner": "owner/metis", "release": release}}}
+
+    def test_draft_lookup_uses_graphql_when_actions_token_rest_list_omits_draft(self):
         draft = {"id": 383893785, "tag_name": "v0.4.49", "draft": True, "prerelease": False}
         requests = []
-        def request(route, *, paginate=False):
-            requests.append((route, paginate))
+        def request(route, *, paginate=False, fields=None):
+            requests.append(route)
             if route == "repos/owner/metis/releases?per_page=100":
-                return [[{"id": 41, "tag_name": "v0.4.47"}], [draft]]
+                return [[{"id": 41, "tag_name": "v0.4.47"}]]
+            if route == "graphql":
+                self.assertEqual(fields["owner"], "owner")
+                self.assertEqual(fields["name"], "metis")
+                self.assertEqual(fields["tag"], "v0.4.49")
+                return self.graphql_release({"databaseId": 383893785, "tagName": "v0.4.49"})
             if route == "repos/owner/metis/releases/383893785":
                 return draft
             raise ValueError("HTTP 404 tag endpoint")
         with mock.patch.object(contract, "gh_api_json", side_effect=request):
             self.assertEqual(contract.lookup_release("owner/metis", "v0.4.49"), draft)
-        self.assertEqual(requests, [("repos/owner/metis/releases?per_page=100", True),
-                                    ("repos/owner/metis/releases/383893785", False)])
+        self.assertEqual(requests, ["graphql", "repos/owner/metis/releases/383893785"])
 
     def test_draft_lookup_absence_is_distinct_from_transport_failure(self):
-        with mock.patch.object(contract, "gh_api_json", return_value=[[]]):
+        with mock.patch.object(contract, "gh_api_json", return_value=self.graphql_release(None)):
             with self.assertRaises(contract.ReleaseNotFound):
                 contract.lookup_release("owner/metis", "v0.4.50")
         with mock.patch.object(contract, "gh_api_json", side_effect=ValueError("HTTP 403")):
@@ -131,18 +159,23 @@ class ReleaseContractTests(unittest.TestCase):
                 contract.lookup_release("owner/metis", "v0.4.50")
             self.assertNotIsInstance(raised.exception, contract.ReleaseNotFound)
 
-    def test_draft_lookup_rejects_duplicate_tag_and_malformed_pages(self):
-        draft = {"id": 10, "tag_name": "v0.4.50"}
-        for pages in [[draft], [[draft, draft]], [], [[{"id": True, "tag_name": "v0.4.50"}]]]:
-            with mock.patch.object(contract, "gh_api_json", return_value=pages):
+    def test_draft_lookup_rejects_graphql_errors_missing_fields_and_ambiguous_release(self):
+        draft = {"databaseId": 10, "tagName": "v0.4.50"}
+        for response in [[], {}, {"data": {"repository": None}},
+                         {"data": {"repository": {"nameWithOwner": "owner/metis"}}},
+                         {**self.graphql_release(None), "errors": [{"message": "FORBIDDEN"}]},
+                         self.graphql_release([draft, draft]),
+                         self.graphql_release({"databaseId": True, "tagName": "v0.4.50"}),
+                         self.graphql_release({"databaseId": 10, "tagName": "v0.4.49"})]:
+            with mock.patch.object(contract, "gh_api_json", return_value=response):
                 with self.assertRaises(ValueError) as raised:
                     contract.lookup_release("owner/metis", "v0.4.50")
                 self.assertNotIsInstance(raised.exception, contract.ReleaseNotFound)
 
-    def test_draft_lookup_rejects_changed_id_or_tag_after_list(self):
-        draft = {"id": 10, "tag_name": "v0.4.50"}
+    def test_draft_lookup_rejects_changed_id_or_tag_after_graphql(self):
+        draft = {"databaseId": 10, "tagName": "v0.4.50"}
         for fetched in [{"id": 11, "tag_name": "v0.4.50"}, {"id": 10, "tag_name": "v0.4.49"}]:
-            with mock.patch.object(contract, "gh_api_json", side_effect=[[[draft]], fetched]):
+            with mock.patch.object(contract, "gh_api_json", side_effect=[self.graphql_release(draft), fetched]):
                 with self.assertRaises(ValueError):
                     contract.lookup_release("owner/metis", "v0.4.50")
 

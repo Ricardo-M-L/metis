@@ -39,39 +39,44 @@ def validate_tag(tag):
 
 
 class ReleaseNotFound(ValueError):
-    """A successful complete release listing contained no exact tag."""
+    """An error-free GraphQL lookup explicitly returned release: null."""
 
 
-def gh_api_json(route, *, paginate=False):
-    command = ["gh", "api"]
-    if paginate:
-        command += ["--paginate", "--slurp"]
-    result = subprocess.run(command + [route], capture_output=True, text=True, timeout=60)
+def gh_api_json(route, *, fields=None):
+    command = ["gh", "api", route]
+    for name, value in (fields or {}).items():
+        command += ["-f", f"{name}={value}"]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     require(result.returncode == 0, "GitHub release metadata lookup failed; refusing to assume absence")
     return json.loads(result.stdout, object_pairs_hook=no_duplicate_keys)
 
 
 def lookup_release(repository, tag):
-    # REST /releases/tags/{tag} excludes drafts. Let gh paginate the authenticated
-    # release list, resolve exactly one tag, then bind all reads to its numeric ID.
+    # Like gh's FetchRelease: GraphQL can resolve drafts that GITHUB_TOKEN's
+    # REST list and /releases/tags/{tag} both omit. Never infer absence from REST.
     validate_tag(tag)
     require(isinstance(repository, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository),
             "invalid release repository")
-    pages = gh_api_json(f"repos/{repository}/releases?per_page=100", paginate=True)
-    require(isinstance(pages, list) and pages and all(isinstance(page, list) for page in pages),
-            "invalid or incomplete release listing")
-    releases = [release for page in pages for release in page]
-    require(all(isinstance(release, dict) and isinstance(release.get("tag_name"), str) for release in releases),
-            "invalid release listing entry")
-    matches = [release for release in releases if release["tag_name"] == tag]
-    require(len(matches) <= 1, "multiple releases have the exact target tag")
-    if not matches:
-        raise ReleaseNotFound("release not found in complete authenticated listing: " + tag)
-    release_id = matches[0].get("id")
-    require(type(release_id) is int and release_id > 0, "invalid listed release ID")
+    owner, name = repository.split("/")
+    response = gh_api_json("graphql", fields={
+        "query": "query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){nameWithOwner release(tagName:$tag){databaseId tagName}}}",
+        "owner": owner, "name": name, "tag": tag,
+    })
+    require(isinstance(response, dict) and response.get("errors") in (None, []), "GraphQL release lookup failed")
+    data = response.get("data")
+    require(isinstance(data, dict), "missing GraphQL release data")
+    repo = data.get("repository")
+    require(isinstance(repo, dict) and repo.get("nameWithOwner") == repository and "release" in repo,
+            "missing or mismatched GraphQL repository/release field")
+    resolved = repo["release"]
+    if resolved is None:
+        raise ReleaseNotFound("GraphQL explicitly reports no release for tag: " + tag)
+    require(isinstance(resolved, dict) and resolved.get("tagName") == tag, "GraphQL release tag mismatch")
+    release_id = resolved.get("databaseId")
+    require(type(release_id) is int and release_id > 0, "invalid GraphQL release ID")
     release = gh_api_json(f"repos/{repository}/releases/{release_id}")
     require(isinstance(release, dict) and release.get("id") == release_id and release.get("tag_name") == tag,
-            "release ID/tag changed after listing")
+            "release ID/tag changed after GraphQL resolution")
     return release
 
 

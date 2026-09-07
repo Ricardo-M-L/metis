@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.50); prerelease flag follows registry, never latest'
+        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.51); prerelease flag follows registry, never latest'
         required: true
         type: string
       build_run_id:
