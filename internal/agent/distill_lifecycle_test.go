@@ -190,6 +190,77 @@ func TestWaitForDistillationHonorsContext(t *testing.T) {
 	}
 }
 
+type failedDistillLifecycleRepository struct {
+	memory.Repository
+	release chan struct{}
+	err     error
+}
+
+func (r *failedDistillLifecycleRepository) DistillTurnWithMetadata(context.Context, llm.Provider, string, string, string, string) error {
+	<-r.release
+	return r.err
+}
+
+func TestWaitForDistillationTimeoutPreservesCompletedFailures(t *testing.T) {
+	for _, failureSession := range []string{"owned", "other"} {
+		t.Run(failureSession, func(t *testing.T) {
+			storageErr := errors.New("archival storage write failed")
+			provider := distillLifecycleProvider{name: "timeout-failure"}
+			loop := NewLoop(provider, nil, nil, nil, "", 3)
+			failed := &failedDistillLifecycleRepository{release: make(chan struct{}), err: storageErr}
+			if !loop.launchDistillation(distillSnapshot{
+				repository: failed, provider: provider, sessionID: failureSession,
+				sourceMessageID: "failed-message", userMsg: "durable user message", assistantMsg: "durable assistant message",
+			}) {
+				t.Fatal("failed job did not launch")
+			}
+			// Hold the real worker until its registered completion handle has
+			// been captured, then join it: the failure is definitely recorded
+			// before launching the second, still-running worker.
+			loop.distillMu.Lock()
+			var failedDone <-chan struct{}
+			for _, job := range loop.distillJobs {
+				failedDone = job.done
+			}
+			loop.distillMu.Unlock()
+			close(failed.release)
+			<-failedDone
+			blocked := newDistillLifecycleRepository()
+			if !loop.launchDistillation(distillSnapshot{
+				repository: blocked, provider: provider, sessionID: "owned",
+				sourceMessageID: "blocked-message", userMsg: "durable user message", assistantMsg: "durable assistant message",
+			}) {
+				t.Fatal("blocked job did not launch")
+			}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(blocked.release) }) }
+			defer release()
+			<-blocked.started
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			err := loop.WaitForDistillation(ctx, "owned")
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v, want deadline", err)
+			}
+			if got, want := errors.Is(err, storageErr), failureSession == "owned"; got != want {
+				t.Fatalf("storage failure present = %v, want %v; error = %v", got, want, err)
+			}
+			var waitErr *DistillationWaitError
+			if failureSession == "owned" && (!errors.As(err, &waitErr) || waitErr.WaitErr != ctx.Err() || !errors.Is(waitErr.CompletedErrors, storageErr)) {
+				t.Fatalf("explicit wait and completed-error provenance lost: %v", err)
+			}
+			release()
+			// A timeout snapshots but does not consume completed failures.
+			if err := loop.WaitForDistillation(context.Background(), failureSession); !errors.Is(err, storageErr) {
+				t.Fatalf("failure was consumed by timed-out wait: %v", err)
+			}
+			if err := loop.WaitForDistillation(context.Background(), "owned"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestMaybeDistillDropsSnapshotWhenSessionGenerationChanges(t *testing.T) {
 	repository := newDistillLifecycleRepository()
 	loop := NewLoop(distillLifecycleProvider{name: "provider"}, nil, nil, nil, "", 3)

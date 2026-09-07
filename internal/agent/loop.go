@@ -3326,6 +3326,23 @@ func (l *Loop) CancelDistillation(sessionID string) {
 	}
 }
 
+// DistillationWaitError preserves completed job failures when other jobs are
+// still running at a canceled/timed-out wait. The distinct wait cause lets a
+// success-only caller recognize its own join budget without reclassifying an
+// archival error that happens to wrap context.DeadlineExceeded.
+type DistillationWaitError struct {
+	WaitErr         error
+	CompletedErrors error
+}
+
+func (e *DistillationWaitError) Error() string {
+	return errors.Join(e.WaitErr, e.CompletedErrors).Error()
+}
+
+func (e *DistillationWaitError) Unwrap() []error {
+	return []error{e.WaitErr, e.CompletedErrors}
+}
+
 // WaitForDistillation waits until every currently registered job for
 // sessionID exits. An empty sessionID waits for all jobs. It loops after each
 // snapshot so a job registered concurrently at the boundary is not missed;
@@ -3363,7 +3380,22 @@ func (l *Loop) WaitForDistillation(ctx context.Context, sessionID string) error 
 			select {
 			case <-jobDone:
 			case <-ctx.Done():
-				return ctx.Err()
+				// A completed archival failure must not disappear behind a
+				// different job's timeout. Snapshot only this session, without
+				// consuming failures needed by the eventual joined waiter.
+				l.distillMu.Lock()
+				var failures []error
+				for key, err := range l.distillFailures {
+					keySession, _, _ := strings.Cut(key, "\x00")
+					if sessionID == "" || keySession == sessionID {
+						failures = append(failures, err)
+					}
+				}
+				l.distillMu.Unlock()
+				if len(failures) == 0 {
+					return ctx.Err()
+				}
+				return &DistillationWaitError{WaitErr: ctx.Err(), CompletedErrors: errors.Join(failures...)}
 			}
 		}
 	}

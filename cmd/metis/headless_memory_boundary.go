@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
@@ -17,6 +22,13 @@ type distillationBoundary interface {
 	FlushPendingDistillation(sessionID string) int
 	WaitForDistillation(ctx context.Context, sessionID string) error
 }
+
+// Only a timeout of our own bounded join gets this marker. A provider timeout
+// is marked by memory.DistillationProviderError; an archival/storage error
+// must not become optional merely because it unwraps to DeadlineExceeded.
+type headlessDistillationJoinTimeout struct{ error }
+
+func (e *headlessDistillationJoinTimeout) Unwrap() error { return e.error }
 
 // persistHeadlessMemoryBoundary turns residual successful exchanges into
 // registered distillation jobs and joins only the owning session before the
@@ -39,6 +51,15 @@ func persistHeadlessMemoryBoundary(
 	loop.FlushPendingDistillation(sessionID)
 	waitCtx, cancel := context.WithTimeout(context.Background(), grace)
 	err := loop.WaitForDistillation(waitCtx, sessionID)
+	// Loop.WaitForDistillation returns the wait context error directly only
+	// when the local join expires; completed job failures are errors.Join-ed.
+	if err != nil && err == waitCtx.Err() {
+		err = &headlessDistillationJoinTimeout{err}
+	} else if waitErr, ok := err.(*agent.DistillationWaitError); ok && waitErr.WaitErr != nil && waitErr.WaitErr == waitCtx.Err() {
+		// Preserve every completed job failure; only the explicitly separate
+		// local wait cause is optional. A mixed archival failure stays fatal.
+		err = errors.Join(&headlessDistillationJoinTimeout{waitErr.WaitErr}, waitErr.CompletedErrors)
+	}
 	cancel()
 	if err == nil {
 		return nil
@@ -58,7 +79,93 @@ func (r *runtime) persistHeadlessMemoryBoundary(source string, grace time.Durati
 	if r == nil || r.loop == nil || strings.TrimSpace(r.sessionID) == "" {
 		return nil
 	}
-	return persistHeadlessMemoryBoundary(r.loop, r.sessionID, source, grace)
+	return completeHeadlessMemoryBoundary(r.loop, r.sessionID, source, grace, os.Stderr)
+}
+
+// completeHeadlessMemoryBoundary preserves successful task status when only
+// optional provider enrichment failed. The low-level lifecycle join remains
+// strict, and every unknown, mixed or storage error remains fatal. This is not
+// proof of session durability: caller-owned checkpoint defers must still run
+// and retain their errors. Cleanup still cancels and joins remaining workers.
+func completeHeadlessMemoryBoundary(loop distillationBoundary, sessionID, source string, grace time.Duration, warnings io.Writer) error {
+	err := persistHeadlessMemoryBoundary(loop, sessionID, source, grace)
+	if err == nil {
+		return err
+	}
+	reason := "provider_error"
+	var joinTimeout *headlessDistillationJoinTimeout
+	if errors.As(err, &joinTimeout) {
+		reason = "join_timeout"
+		// Long-lived cron/daemon runtimes do not Cleanup after each task.
+		// Stop this session's enrichment work now; do not retry or extend the
+		// completed task's budget. Final Cleanup keeps its bounded join.
+		if canceler, ok := loop.(interface{ CancelDistillation(string) }); ok {
+			canceler.CancelDistillation(sessionID)
+		}
+	}
+	if !optionalHeadlessMemoryError(err) {
+		return err
+	}
+	// Do not serialize the provider error, task text, session ID, or arbitrary
+	// caller labels: they may contain credentials or private conversation data.
+	warning := struct {
+		Kind         string `json:"kind"`
+		Source       string `json:"source"`
+		TaskStatus   string `json:"task_status"`
+		MemoryStatus string `json:"memory_status"`
+		Reason       string `json:"reason"`
+		Message      string `json:"message"`
+	}{
+		Kind: "memory_enrichment_warning", Source: headlessMemorySource(source),
+		TaskStatus: "completed", MemoryStatus: "incomplete", Reason: reason,
+		Message: "Task completed; optional memory enrichment did not complete. Distilled memory is not confirmed saved.",
+	}
+	if warnings == nil {
+		warnings = os.Stderr
+	}
+	if err := json.NewEncoder(warnings).Encode(warning); err != nil {
+		return fmt.Errorf("write memory enrichment warning: %w", err)
+	}
+	return nil
+}
+
+func optionalHeadlessMemoryError(err error) bool {
+	switch err := err.(type) {
+	case *memory.DistillationProviderError, *headlessDistillationJoinTimeout:
+		return true
+	case interface{ Unwrap() []error }:
+		children := err.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !optionalHeadlessMemoryError(child) {
+				return false
+			}
+		}
+		return true
+	case interface{ Unwrap() error }:
+		return optionalHeadlessMemoryError(err.Unwrap())
+	default:
+		return false
+	}
+}
+
+func headlessMemorySource(source string) string {
+	switch {
+	case source == "metis run":
+		return "run"
+	case source == "metis mcp-serve run_task":
+		return "mcp"
+	case strings.HasPrefix(source, "cron job "):
+		return "cron"
+	case strings.HasPrefix(source, "metis daemon "):
+		return "daemon"
+	case strings.HasPrefix(source, "metis coordinator "):
+		return "coordinator"
+	default:
+		return "headless"
+	}
 }
 
 // collectHeadlessEvents owns the producer channel lifecycle. Loop.Run does not

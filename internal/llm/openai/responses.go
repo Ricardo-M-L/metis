@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -340,7 +341,7 @@ type responsesTextFormat struct {
 }
 
 type responsesReasoning struct {
-	Effort  string `json:"effort"`
+	Effort  string `json:"effort,omitempty"`
 	Summary string `json:"summary,omitempty"`
 }
 
@@ -386,9 +387,15 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 	}
 	if req.Effort != "" {
 		out.Reasoning = &responsesReasoning{Effort: string(req.Effort)}
-		if r.Name() == "openai-codex" {
-			out.Reasoning.Summary = "auto"
+	}
+	if r.Name() == "openai-codex" {
+		// Public summaries are opt-in independently of reasoning intensity.
+		// Keep the model's default effort when none was selected. Other
+		// Responses gateways may not support summary options at all.
+		if out.Reasoning == nil {
+			out.Reasoning = &responsesReasoning{}
 		}
+		out.Reasoning.Summary = "auto"
 	}
 	if len(req.SystemSections) > 0 {
 		var sb strings.Builder
@@ -657,13 +664,155 @@ type responsesStream struct {
 	// the executable call id.
 	toolCallIDs    map[string]string
 	refusalStarted map[string]bool
+	// A public summary may arrive as deltas, an item snapshot, or only in
+	// the terminal response. Track each item/summary part independently so
+	// snapshots fill missing suffixes without repeating already shown text.
+	reasoningByID      map[string]*responsesReasoningProgress
+	reasoningByOutput  map[int]*responsesReasoningProgress
+	anonymousReasoning *responsesReasoningProgress
+	summarySequence    int
 }
 
 type responsesStreamOutput struct {
-	Type      string `json:"type"`
-	CallID    string `json:"call_id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	CallID    string                 `json:"call_id"`
+	Name      string                 `json:"name"`
+	Arguments string                 `json:"arguments"`
+	Summary   []responsesSummaryPart `json:"summary"`
+}
+
+type responsesReasoningProgress struct {
+	parts        map[int]*responsesSummaryProgress
+	lastPart     int
+	lastSequence int
+}
+
+type responsesSummaryProgress struct {
+	text      strings.Builder
+	fragments []responsesSummaryFragment
+}
+
+type responsesSummaryFragment struct {
+	sequence int
+	text     string
+}
+
+func (s *responsesStream) reasoningProgress(itemID string, outputIndex *int) *responsesReasoningProgress {
+	progress := s.reasoningByID[itemID]
+	if outputIndex != nil {
+		indexed := s.reasoningByOutput[*outputIndex]
+		if progress == nil {
+			progress = indexed
+		} else if indexed != nil && indexed != progress {
+			// Some compatible streams omit one identifier on early deltas.
+			// Once a frame binds both identifiers, retain everything already
+			// displayed under either one in its original arrival order.
+			s.mergeReasoningProgress(progress, indexed)
+		}
+	}
+	if progress == nil && itemID == "" && outputIndex == nil {
+		progress = s.anonymousReasoning
+	}
+	if progress == nil {
+		progress = &responsesReasoningProgress{parts: make(map[int]*responsesSummaryProgress)}
+	}
+	if itemID != "" {
+		if s.reasoningByID == nil {
+			s.reasoningByID = make(map[string]*responsesReasoningProgress)
+		}
+		s.reasoningByID[itemID] = progress
+	}
+	if outputIndex != nil {
+		if s.reasoningByOutput == nil {
+			s.reasoningByOutput = make(map[int]*responsesReasoningProgress)
+		}
+		s.reasoningByOutput[*outputIndex] = progress
+	}
+	if itemID == "" && outputIndex == nil {
+		s.anonymousReasoning = progress
+	}
+	return progress
+}
+
+func (s *responsesStream) mergeReasoningProgress(dst, src *responsesReasoningProgress) {
+	for index, incoming := range src.parts {
+		part := dst.parts[index]
+		if part == nil {
+			dst.parts[index] = incoming
+			continue
+		}
+		part.fragments = append(part.fragments, incoming.fragments...)
+		sort.Slice(part.fragments, func(i, j int) bool { return part.fragments[i].sequence < part.fragments[j].sequence })
+		part.text.Reset()
+		for _, fragment := range part.fragments {
+			part.text.WriteString(fragment.text)
+		}
+	}
+	if src.lastSequence > dst.lastSequence {
+		dst.lastSequence, dst.lastPart = src.lastSequence, src.lastPart
+	}
+	for id, progress := range s.reasoningByID {
+		if progress == src {
+			s.reasoningByID[id] = dst
+		}
+	}
+	for index, progress := range s.reasoningByOutput {
+		if progress == src {
+			s.reasoningByOutput[index] = dst
+		}
+	}
+}
+
+func (s *responsesStream) enqueueSummaryText(itemID string, outputIndex *int, summaryIndex int, text string, snapshot bool) {
+	if text == "" {
+		return
+	}
+	progress := s.reasoningProgress(itemID, outputIndex)
+	part := progress.parts[summaryIndex]
+	if part == nil {
+		part = &responsesSummaryProgress{}
+		progress.parts[summaryIndex] = part
+	}
+	if snapshot {
+		// StreamEvents append text; they cannot edit an earlier paragraph.
+		// If a gateway starts another part before delivering the previous
+		// part's last delta, do not attach that late suffix to the new part.
+		if part.text.Len() > 0 && progress.lastPart != summaryIndex {
+			return
+		}
+		// A full snapshot can only extend what has already been displayed.
+		// Stale or conflicting snapshots cannot safely rewrite a live delta.
+		if !strings.HasPrefix(text, part.text.String()) {
+			return
+		}
+		text = text[part.text.Len():]
+		if text == "" {
+			return
+		}
+	}
+	display := text
+	if part.text.Len() == 0 {
+		for index, previous := range progress.parts {
+			if index != summaryIndex && previous.text.Len() > 0 {
+				display = "\n\n" + text
+				break
+			}
+		}
+	}
+	part.text.WriteString(text)
+	s.summarySequence++
+	part.fragments = append(part.fragments, responsesSummaryFragment{sequence: s.summarySequence, text: text})
+	progress.lastPart, progress.lastSequence = summaryIndex, s.summarySequence
+	s.pending = append(s.pending, provider.StreamEvent{Type: "thinking_delta", TextDelta: display})
+}
+
+func (s *responsesStream) enqueueSummarySnapshot(itemID string, outputIndex *int, summary []responsesSummaryPart) {
+	for index, part := range summary {
+		if part.Type == "summary_text" {
+			s.enqueueSummaryText(itemID, outputIndex, index, part.Text, true)
+		}
+	}
 }
 
 type responsesStreamResponse struct {
@@ -727,13 +876,15 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			continue
 		}
 		var env struct {
-			Type    string `json:"type"`
-			Delta   string `json:"delta"`
-			Refusal string `json:"refusal"`
-			ItemID  string `json:"item_id"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Item    struct {
+			Type         string `json:"type"`
+			Delta        string `json:"delta"`
+			Refusal      string `json:"refusal"`
+			ItemID       string `json:"item_id"`
+			OutputIndex  *int   `json:"output_index"`
+			SummaryIndex int    `json:"summary_index"`
+			Code         string `json:"code"`
+			Message      string `json:"message"`
+			Item         struct {
 				ID               string                 `json:"id"`
 				Type             string                 `json:"type"`
 				CallID           string                 `json:"call_id"`
@@ -758,7 +909,9 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 				s.responseID = env.Response.ID
 			}
 		case "response.output_item.added":
-			if env.Item.Type == "function_call" {
+			if env.Item.Type == "reasoning" {
+				s.reasoningProgress(env.Item.ID, env.OutputIndex)
+			} else if env.Item.Type == "function_call" {
 				callID := env.Item.CallID
 				if callID == "" {
 					callID = env.Item.ID
@@ -796,12 +949,15 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 					InputDelta: env.Item.Arguments, // full args resync (authoritative)
 				})
 				delete(s.toolCallIDs, env.Item.ID)
-			} else if env.Item.Type == "reasoning" && env.Item.EncryptedContent != "" {
-				s.pending = append(s.pending, provider.StreamEvent{
-					Type:         "redacted_thinking",
-					TextDelta:    env.Item.EncryptedContent,
-					ProviderHint: responsesReasoningHints(env.Item.ID, env.Item.Summary),
-				})
+			} else if env.Item.Type == "reasoning" {
+				s.enqueueSummarySnapshot(env.Item.ID, env.OutputIndex, env.Item.Summary)
+				if env.Item.EncryptedContent != "" {
+					s.pending = append(s.pending, provider.StreamEvent{
+						Type:         "redacted_thinking",
+						TextDelta:    env.Item.EncryptedContent,
+						ProviderHint: responsesReasoningHints(env.Item.ID, env.Item.Summary),
+					})
+				}
 			}
 		case "response.output_text.delta":
 			if env.Delta != "" {
@@ -816,7 +972,9 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			if env.Refusal != "" && !s.refusalStarted[env.ItemID] {
 				s.pending = append(s.pending, provider.StreamEvent{Type: "text_delta", TextDelta: env.Refusal})
 			}
-		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		case "response.reasoning_summary_text.delta":
+			s.enqueueSummaryText(env.ItemID, env.OutputIndex, env.SummaryIndex, env.Delta, false)
+		case "response.reasoning_text.delta":
 			if env.Delta != "" {
 				s.pending = append(s.pending, provider.StreamEvent{Type: "thinking_delta", TextDelta: env.Delta})
 			}
@@ -879,6 +1037,13 @@ func (s *responsesStream) enqueueTerminal(response *responsesStreamResponse, for
 		s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New(message)})
 		s.done = true
 		return
+	}
+	if response != nil {
+		for index, item := range response.Output {
+			if item.Type == "reasoning" {
+				s.enqueueSummarySnapshot(item.ID, &index, item.Summary)
+			}
+		}
 	}
 
 	stopReason := "end_turn"

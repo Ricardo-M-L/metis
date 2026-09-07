@@ -1608,7 +1608,7 @@ func (mm *MemoryManager) DistillTurnWithMetadata(ctx context.Context, provider l
 		MaxTokens: 400,
 	})
 	if err != nil {
-		return fmt.Errorf("distill: provider error: %w", err)
+		return &DistillationProviderError{Err: err}
 	}
 	facts := parseDistilled(resp)
 	var errs []error
