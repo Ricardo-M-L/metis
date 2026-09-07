@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       channel: ${{ steps.inventory.outputs.channel }}
+      default_channel_check: ${{ steps.inventory.outputs.default_channel_check }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +68,9 @@ jobs:
             (cd source/dist && sed 's/\r$//' "$sidecar_name" | shasum -a 256 -c -)
           done
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          default_channel_check=$(python3 release-tools/scripts/verify_cli_default_channel.py supports \
+            --tag "$TAG" --prerelease "$(jq -r .prerelease plan.json)")
+          echo "default_channel_check=$default_channel_check" >> "$GITHUB_OUTPUT"
 
   install-smoke-unix:
     name: Anonymous install smoke (Linux)
@@ -87,6 +91,23 @@ jobs:
             bash install/install.sh
           reported=$("$install_dir/metis" version | awk 'NR == 1 { print $1 }')
           test "$reported" = "$TAG"
+
+      - name: Verify anonymous default install follows independent CLI stable channel
+        if: needs.inventory.outputs.default_channel_check == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s scripts -p 'test_verify_cli_default_channel.py' -v
+          python3 scripts/verify_cli_default_channel.py snapshot --repository "$GITHUB_REPOSITORY" > cli-before.json
+          default_dir="$RUNNER_TEMP/metis-default-cli-bin"
+          env -u METIS_VERSION -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN -u GH_TOKEN \
+            METIS_INSTALL_DIR="$default_dir" bash install/install.sh
+          actual=$("$default_dir/metis" version | awk 'NR == 1 { print $1 }')
+          python3 scripts/verify_cli_default_channel.py snapshot --repository "$GITHUB_REPOSITORY" > cli-after.json
+          python3 scripts/verify_cli_default_channel.py verify --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" --actual "$actual" --before cli-before.json --after cli-after.json | tee cli-default-result.json
 
   install-smoke-windows:
     name: Anonymous install smoke (Windows)
@@ -112,6 +133,40 @@ jobs:
           if ($reported -ne $env:TAG) {
             throw "installed metis.exe reports $reported instead of $env:TAG"
           }
+
+      - uses: actions/setup-python@v5
+        if: needs.inventory.outputs.default_channel_check == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Verify anonymous default Windows install follows independent CLI stable channel
+        if: needs.inventory.outputs.default_channel_check == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          python -B -m unittest discover -s scripts -p 'test_verify_cli_default_channel.py' -v
+          if ($LASTEXITCODE -ne 0) { throw "default-channel oracle tests failed" }
+          python scripts/verify_cli_default_channel.py snapshot --repository $env:GITHUB_REPOSITORY > cli-before.json
+          if ($LASTEXITCODE -ne 0) { throw "before CLI channel snapshot failed" }
+          $snapshotToken = $env:GH_TOKEN
+          Remove-Item Env:METIS_VERSION -ErrorAction SilentlyContinue
+          Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          $defaultDir = Join-Path $env:RUNNER_TEMP "metis-default-cli-bin"
+          & ./install/install.ps1 -InstallDir $defaultDir
+          $output = @(& (Join-Path $defaultDir "metis.exe") version)
+          if ($LASTEXITCODE -ne 0) { throw "default-installed metis.exe version failed" }
+          $actual = ($output[0] -split '\s+')[0]
+          $env:GH_TOKEN = $snapshotToken
+          python scripts/verify_cli_default_channel.py snapshot --repository $env:GITHUB_REPOSITORY > cli-after.json
+          if ($LASTEXITCODE -ne 0) { throw "after CLI channel snapshot failed" }
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          python scripts/verify_cli_default_channel.py verify --repository $env:GITHUB_REPOSITORY `
+            --tag $env:TAG --actual $actual --before cli-before.json --after cli-after.json
+          if ($LASTEXITCODE -ne 0) { throw "default CLI install does not match independent latest" }
 
   macos-trust:
     name: Verify macOS signing, notarization, and Gatekeeper

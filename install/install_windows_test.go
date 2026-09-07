@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -311,12 +312,15 @@ func TestPowerShellInstallerSupportsAnonymousPublicRelease(t *testing.T) {
 		}
 	}
 	mux.HandleFunc("/Ricardo-M-L/metis/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		assertAnonymous(r)
-		http.Redirect(w, r, "/Ricardo-M-L/metis/releases/tag/v9.9.9", http.StatusFound)
+		t.Error("installer requested shared Desktop latest channel")
+		http.Error(w, "shared Desktop latest is not the CLI channel", http.StatusBadRequest)
 	})
-	mux.HandleFunc("/Ricardo-M-L/metis/releases/tag/v9.9.9", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/Ricardo-M-L/metis/releases", func(w http.ResponseWriter, r *http.Request) {
 		assertAnonymous(r)
-		_, _ = w.Write([]byte("test release"))
+		if r.URL.RawQuery != "per_page=100&page=1" {
+			t.Errorf("unexpected release pagination query %q", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode([]any{powershellCLIRelease("v9.9.9", server.URL), powershellCLIRelease("v0.4.47", server.URL)})
 	})
 	mux.HandleFunc("/Ricardo-M-L/metis/releases/download/", func(w http.ResponseWriter, r *http.Request) {
 		assertAnonymous(r)
@@ -616,6 +620,118 @@ func TestPowerShellInstallerSupportsAnonymousPublicRelease(t *testing.T) {
 	}
 	if !bytes.Equal(got, fakeContents) {
 		t.Fatal("non-Metis executable was overwritten")
+	}
+}
+
+func TestPowerShellInstallerCLIChannelFailurePreservesCurrentVersion(t *testing.T) {
+	for _, mode := range []string{"prerelease", "draft", "empty-assets", "page-error", "page-malformed", "rate-limit", "downgrade"} {
+		t.Run(mode, func(t *testing.T) {
+			arch := map[string]string{"amd64": "amd64", "arm64": "arm64"}[runtime.GOARCH]
+			if arch == "" {
+				t.Skip("unsupported Windows test architecture")
+			}
+			artifact := "metis-windows-" + arch + ".zip"
+			currentVersion := "0.4.47"
+			if mode == "downgrade" {
+				currentVersion = "0.4.53"
+			}
+			binary := "old-verified-cli-" + currentVersion
+			archive := makeWindowsArchive(t, []byte(binary))
+			sum := sha256.Sum256(archive)
+			var server *httptest.Server
+			var assetRequests atomic.Int32
+			server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/repos/Ricardo-M-L/metis/releases" {
+					if mode == "rate-limit" {
+						http.Error(w, "rate limited", http.StatusForbidden)
+						return
+					}
+					if strings.HasPrefix(mode, "page-") && r.URL.Query().Get("page") == "2" {
+						if mode == "page-error" {
+							http.Error(w, "page failed", http.StatusBadGateway)
+						} else {
+							fmt.Fprint(w, "{malformed-json")
+						}
+						return
+					}
+					release := powershellCLIRelease("v0.4.51", server.URL)
+					switch mode {
+					case "downgrade":
+						release = powershellCLIRelease("v0.4.52", server.URL)
+					case "prerelease":
+						release["prerelease"] = true
+					case "draft":
+						release["draft"] = true
+					case "empty-assets":
+						release["assets"] = []any{}
+					}
+					releases := []any{release}
+					if strings.HasPrefix(mode, "page-") {
+						for len(releases) < 100 {
+							releases = append(releases, powershellCLIRelease("v0.0.1-rc.1", server.URL))
+						}
+					}
+					_ = json.NewEncoder(w).Encode(releases)
+					return
+				}
+				if strings.Contains(r.URL.Path, "/releases/latest") {
+					t.Error("installer fell back to shared latest v0.4.47")
+					http.Redirect(w, r, "/Ricardo-M-L/metis/releases/tag/v0.4.47", http.StatusFound)
+					return
+				}
+				base := "/Ricardo-M-L/metis/releases/download/v" + currentVersion + "/" + artifact
+				pinBase := "/Ricardo-M-L/metis/releases/download/v0.4.52/" + artifact
+				if r.URL.Path == base || mode == "downgrade" && r.URL.Path == pinBase {
+					assetRequests.Add(1)
+					_, _ = w.Write(archive)
+					return
+				}
+				if r.URL.Path == base+".sha256" || mode == "downgrade" && r.URL.Path == pinBase+".sha256" {
+					assetRequests.Add(1)
+					fmt.Fprintf(w, "%s  %s\n", hex.EncodeToString(sum[:]), artifact)
+					return
+				}
+				t.Errorf("unexpected request %s", r.URL)
+				http.NotFound(w, r)
+			}))
+			server.Start()
+			defer server.Close()
+			root := t.TempDir()
+			installDir := filepath.Join(root, "bin")
+			run := func(version string) ([]byte, error) {
+				cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "install.ps1",
+					"-Version", version, "-InstallDir", installDir, "-Repo", "Ricardo-M-L/metis", "-ApiBase", server.URL, "-WebBase", server.URL, "-SkipVersionCheck")
+				cmd.Env = withoutEnv(os.Environ(), "METIS_GITHUB_TOKEN", "GITHUB_TOKEN")
+				return cmd.CombinedOutput()
+			}
+			if out, err := run("v" + currentVersion); err != nil {
+				t.Fatalf("seed synthetic CLI: %v\n%s", err, out)
+			}
+			assetRequests.Store(0)
+			if out, err := run("latest"); err == nil {
+				t.Fatalf("unsafe channel metadata installed a CLI: %s", out)
+			}
+			if assetRequests.Load() != 0 {
+				t.Errorf("unsafe metadata initiated %d asset downloads", assetRequests.Load())
+			}
+			launcher, err := os.ReadFile(filepath.Join(installDir, "metis.exe"))
+			if err != nil || string(launcher) != binary {
+				t.Fatalf("old verified launcher was changed: %q, %v", launcher, err)
+			}
+			marker, err := os.ReadFile(filepath.Join(root, "current-version"))
+			if err != nil || strings.TrimSpace(string(marker)) != currentVersion {
+				t.Fatalf("old version marker was changed: %q, %v", marker, err)
+			}
+			if mode == "downgrade" {
+				if out, err := run("v0.4.52"); err != nil {
+					t.Fatalf("explicit older version pin must remain supported: %v\n%s", err, out)
+				}
+				marker, err := os.ReadFile(filepath.Join(root, "current-version"))
+				if err != nil || strings.TrimSpace(string(marker)) != "0.4.52" {
+					t.Fatalf("explicit pin did not activate: marker=%q err=%v", marker, err)
+				}
+			}
+		})
 	}
 }
 

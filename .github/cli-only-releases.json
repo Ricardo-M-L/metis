@@ -18,6 +18,12 @@
       "prerelease": false,
       "make_latest": false,
       "reason": "Formal CLI-only release using GraphQL draft lookup for Actions tokens; earlier failed tags/drafts and shared latest remain unchanged."
+    },
+    "v0.4.52": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "Formal CLI-only release with independent stable discovery/default installation; Desktop/shared latest remains unchanged."
     }
   }
 }

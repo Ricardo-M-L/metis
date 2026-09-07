@@ -15,25 +15,29 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	goruntime "runtime"
 	"strings"
 	"time"
 )
 
 const (
-	defaultRepo           = "Ricardo-M-L/metis"
-	userAgent             = "metis-self-update"
-	checkTimeout          = 10 * time.Second
-	dlTimeout             = 5 * time.Minute
-	verifyTimeout         = 15 * time.Second
-	maxArchiveSize  int64 = 128 << 20
-	maxExpandedSize int64 = 128 << 20
-	maxVerifyOutput       = 64 << 10
+	defaultRepo               = "Ricardo-M-L/metis"
+	userAgent                 = "metis-self-update"
+	checkTimeout              = 10 * time.Second
+	dlTimeout                 = 5 * time.Minute
+	verifyTimeout             = 15 * time.Second
+	maxArchiveSize      int64 = 128 << 20
+	maxExpandedSize     int64 = 128 << 20
+	maxVerifyOutput           = 64 << 10
+	maxReleasePageBytes       = 8 << 20
+	maxReleasePages           = 10
+	releasesPerPage           = 100
 )
 
 // apiBase is the GitHub API root. A var (not const) so apply_test.go can
@@ -125,104 +129,201 @@ type asset struct {
 	ID                 int64  `json:"id"`
 	Name               string `json:"name"`
 	Size               int64  `json:"size"`
+	State              string `json:"state"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
 type release struct {
 	TagName    string  `json:"tag_name"`
 	Name       string  `json:"name"`
-	Draft      bool    `json:"draft"`
-	Prerelease bool    `json:"prerelease"`
+	Draft      *bool   `json:"draft"`
+	Prerelease *bool   `json:"prerelease"`
 	HTMLURL    string  `json:"html_url"`
 	Assets     []asset `json:"assets"`
 }
 
-// Latest fetches the latest non-draft release.
+// Latest discovers the highest fully published CLI stable release. Both
+// anonymous and authenticated checks use the same release-list contract; the
+// repository's shared /latest release may belong to Desktop and is not a CLI
+// channel. A partial list is never returned as a successful check.
 func Latest(ctx context.Context, token string) (*release, error) {
-	// Anonymous public updates intentionally avoid the shared-IP GitHub REST
-	// limit (60 requests/hour). The stable web redirect reveals the tag; Metis
-	// release asset names are deterministic, so no REST asset IDs are needed.
-	if strings.TrimSpace(token) == "" {
-		if r, err := latestFromPublicWeb(ctx); err == nil {
-			return r, nil
-		}
-		// Fall through to anonymous REST for GitHub-compatible mirrors that do
-		// not expose the standard web redirect.
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return latestFromAPI(ctx, token)
+	cctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+	client := &http.Client{}
+	var best *release
+	for page := 1; page <= maxReleasePages; page++ {
+		items, err := releasePage(cctx, client, token, page)
+		if err != nil {
+			return nil, fmt.Errorf("CLI stable release discovery page %d: %w", page, err)
+		}
+		for i := range items {
+			if err := cctx.Err(); err != nil {
+				return nil, err
+			}
+			r := &items[i]
+			if r.isCLIStable() && (best == nil || IsNewer(best.TagName, r.TagName)) {
+				best = r
+			}
+		}
+		if len(items) < releasesPerPage {
+			if err := cctx.Err(); err != nil {
+				return nil, err
+			}
+			if best == nil {
+				return nil, fmt.Errorf("no complete CLI stable release found for %s", Repo())
+			}
+			return best, nil
+		}
+	}
+	return nil, fmt.Errorf("CLI stable release discovery exceeded %d full pages; refusing a partial result", maxReleasePages)
 }
 
-func latestFromAPI(ctx context.Context, token string) (*release, error) {
-	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBase, Repo())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func releasePage(ctx context.Context, client *http.Client, token string, page int) ([]release, error) {
+	endpoint := fmt.Sprintf("%s/repos/%s/releases?per_page=%d&page=%d", strings.TrimRight(apiBase, "/"), Repo(), releasesPerPage, page)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	setAuth(req, token, "application/vnd.github+json")
-
-	client := &http.Client{Timeout: checkTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("github API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		// Do not echo untrusted response text: proxies may include request
+		// credentials in error bodies. Preserve the actionable HTTP status.
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("github API %d: access denied or rate limited; check GitHub credentials/quota and retry later", resp.StatusCode)
+		}
+		return nil, fmt.Errorf("github API %d", resp.StatusCode)
 	}
-	var r release
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return nil, err
+	if resp.ContentLength > maxReleasePageBytes {
+		return nil, fmt.Errorf("release page exceeds %d bytes", maxReleasePageBytes)
 	}
-	return &r, nil
-}
-
-func latestFromPublicWeb(ctx context.Context) (*release, error) {
-	latestURL := strings.TrimRight(webBase, "/") + "/" + strings.Trim(Repo(), "/") + "/releases/latest"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL, nil)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleasePageBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	setAuth(req, "", "text/html")
-	resp, err := (&http.Client{Timeout: checkTimeout}).Do(req)
-	if err != nil {
+	if len(body) > maxReleasePageBytes {
+		return nil, fmt.Errorf("release page exceeds %d bytes", maxReleasePageBytes)
+	}
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(body, &rawItems); err != nil {
+		return nil, fmt.Errorf("invalid release page JSON: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("github releases web %d", resp.StatusCode)
+	if rawItems == nil {
+		return nil, fmt.Errorf("release page must be a JSON array")
 	}
-	prefix := "/" + strings.Trim(Repo(), "/") + "/releases/tag/"
-	if !strings.HasPrefix(resp.Request.URL.Path, prefix) {
-		return nil, fmt.Errorf("latest release redirect did not resolve to a tag: %s", resp.Request.URL.Path)
+	if len(rawItems) > releasesPerPage {
+		return nil, fmt.Errorf("release page has more than %d entries", releasesPerPage)
 	}
-	escapedTag := strings.TrimPrefix(resp.Request.URL.Path, prefix)
-	tag, err := url.PathUnescape(escapedTag)
-	if err != nil || tag == "" || strings.Contains(tag, "/") {
-		return nil, fmt.Errorf("invalid latest release tag %q", escapedTag)
+	// Keep original page length: invalid candidates do not end pagination.
+	items := make([]release, len(rawItems))
+	for i, raw := range rawItems {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if r, err := decodeCLIRelease(raw); err == nil {
+			items[i] = r
+		}
 	}
-	if _, err := normalizeVersion(tag); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return deterministicPublicRelease(tag), nil
+	return items, nil
 }
 
-func deterministicPublicRelease(tag string) *release {
-	target := Target()
-	extension := ".tar.gz"
-	if strings.HasPrefix(target, "windows-") {
-		extension = ".zip"
+// decodeCLIRelease isolates invalid candidate metadata from valid candidates
+// in the same JSON page. Non-CLI assets are deliberately not validated.
+func decodeCLIRelease(raw json.RawMessage) (release, error) {
+	var metadata struct {
+		TagName    string            `json:"tag_name"`
+		Draft      *bool             `json:"draft"`
+		Prerelease *bool             `json:"prerelease"`
+		Assets     []json.RawMessage `json:"assets"`
 	}
-	name := "metis-" + target + extension
-	base := strings.TrimRight(webBase, "/") + "/" + strings.Trim(Repo(), "/") + "/releases/download/" + url.PathEscape(tag) + "/"
-	return &release{
-		TagName: tag,
-		HTMLURL: strings.TrimRight(webBase, "/") + "/" + strings.Trim(Repo(), "/") + "/releases/tag/" + url.PathEscape(tag),
-		Assets: []asset{
-			{Name: name, BrowserDownloadURL: base + url.PathEscape(name)},
-			{Name: name + ".sha256", BrowserDownloadURL: base + url.PathEscape(name+".sha256")},
-		},
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return release{}, err
 	}
+	r := release{TagName: metadata.TagName, Draft: metadata.Draft, Prerelease: metadata.Prerelease}
+	r.HTMLURL = strings.TrimRight(webBase, "/") + "/" + Repo() + "/releases/tag/" + metadata.TagName
+	for _, item := range metadata.Assets {
+		var name struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(item, &name); err != nil {
+			return release{}, err
+		}
+		if !isCLIAssetName(name.Name) {
+			continue
+		}
+		var a struct {
+			ID                 int64   `json:"id"`
+			Name               string  `json:"name"`
+			Size               float64 `json:"size"`
+			State              string  `json:"state"`
+			BrowserDownloadURL string  `json:"browser_download_url"`
+		}
+		if err := json.Unmarshal(item, &a); err != nil {
+			return release{}, err
+		}
+		// JSON 1.0 and 1e2 are integer values too. Guard conversion to int64.
+		if math.IsNaN(a.Size) || math.IsInf(a.Size, 0) || a.Size <= 0 || math.Trunc(a.Size) != a.Size || a.Size >= 0x1p63 {
+			return release{}, fmt.Errorf("invalid CLI asset size")
+		}
+		r.Assets = append(r.Assets, asset{ID: a.ID, Name: a.Name, Size: int64(a.Size), State: a.State, BrowserDownloadURL: a.BrowserDownloadURL})
+	}
+	return r, nil
+}
+
+func isCLIAssetName(name string) bool {
+	for _, archive := range []string{"metis-darwin-amd64.tar.gz", "metis-darwin-arm64.tar.gz", "metis-linux-amd64.tar.gz", "metis-linux-arm64.tar.gz", "metis-windows-amd64.zip", "metis-windows-arm64.zip"} {
+		if name == archive || name == archive+".sha256" {
+			return true
+		}
+	}
+	return false
+}
+
+var stableCLITag = regexp.MustCompile(`^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$`)
+
+func (r *release) isCLIStable() bool {
+	if !stableCLITag.MatchString(r.TagName) || r.Draft == nil || *r.Draft || r.Prerelease == nil || *r.Prerelease {
+		return false
+	}
+	base := strings.TrimRight(webBase, "/") + "/" + Repo() + "/releases/download/" + r.TagName + "/"
+	for _, platform := range []string{"darwin", "linux", "windows"} {
+		for _, arch := range []string{"amd64", "arm64"} {
+			ext := ".tar.gz"
+			if platform == "windows" {
+				ext = ".zip"
+			}
+			for _, suffix := range []string{"", ".sha256"} {
+				name := "metis-" + platform + "-" + arch + ext + suffix
+				count := 0
+				for _, a := range r.Assets {
+					if a.Name != name {
+						continue
+					}
+					count++
+					if a.Size <= 0 || a.State != "uploaded" || a.BrowserDownloadURL != base+name {
+						return false
+					}
+				}
+				if count != 1 {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // targetForTest overrides Target()'s platform tag in tests. Empty in
@@ -323,8 +424,31 @@ func apply(ctx context.Context, token, destPath string, r *release, skipCurrent 
 	}
 	// Another process may have completed this exact update while this caller
 	// waited for the cross-process lock.
-	if current, currentOK := resolveCurrentVersion(layout); skipCurrent && currentOK && current == version {
-		return false, cleanupManagedLocked(layout, time.Now())
+	current, currentOK := resolveCurrentVersion(layout)
+	if !currentOK {
+		// Flat installs are also active versions. Verify them while holding the
+		// same install lock, before downloading or migrating anything.
+		info, statErr := os.Lstat(layout.launcher)
+		if statErr == nil {
+			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return false, fmt.Errorf("refusing to replace unrecognized launcher %s", layout.launcher)
+			}
+			current, _, err = reportedBinaryVersion(ctx, layout.launcher)
+			if err != nil {
+				return false, fmt.Errorf("verify active launcher before update: %w", err)
+			}
+			currentOK = true
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return false, statErr
+		}
+	}
+	if currentOK {
+		if IsNewer(version, current) {
+			return false, fmt.Errorf("refusing to downgrade active CLI %s to %s", current, version)
+		}
+		if skipCurrent && !IsNewer(current, version) {
+			return false, cleanupManagedLocked(layout, time.Now())
+		}
 	}
 	target := Target()
 	binAsset, sumAsset, err := r.findAsset(target)
@@ -773,6 +897,9 @@ func setAuth(req *http.Request, token, accept string) {
 // to be semver-ish like "0.1.0", "v0.1.1", or "0.2.0-rc1". Non-numeric
 // segments compare lexicographically; that's enough for monotonic releases.
 func IsNewer(have, want string) bool {
+	// Build metadata (including local source-build slots) has no precedence.
+	have, _, _ = strings.Cut(have, "+")
+	want, _, _ = strings.Cut(want, "+")
 	have = strings.TrimPrefix(have, "v")
 	want = strings.TrimPrefix(want, "v")
 	if have == want {

@@ -17,6 +17,8 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $VersionRetentionCount = 2
 $StaleArtifactAge = [TimeSpan]::FromHours(1)
 $MetadataTimeout = [TimeSpan]::FromSeconds(30)
+$MaxMetadataBytes = 8MB
+$MaxReleasePages = 10
 $AssetTimeout = [TimeSpan]::FromSeconds(300)
 $MaxArchiveBytes = 128MB
 $MaxExpandedBytes = 128MB
@@ -41,50 +43,154 @@ function Resolve-Architecture {
     }
 }
 
+# The CLI has an independent stable channel: a non-draft, non-prerelease
+# strict numeric tag with the complete six-platform archive/checksum matrix.
+# GitHub's shared latest marker can intentionally remain on a Desktop release.
+function Test-CompleteCLIRelease($Release) {
+    if ($null -eq $Release -or $Release -isnot [System.Management.Automation.PSCustomObject]) {
+        return $false
+    }
+    foreach ($field in @("tag_name", "draft", "prerelease", "assets")) {
+        if ($null -eq $Release.PSObject.Properties[$field]) { return $false }
+    }
+    if ($Release.tag_name -isnot [string] -or $Release.tag_name -cnotmatch '^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z') {
+        return $false
+    }
+    if ($Release.draft -isnot [bool] -or $Release.draft -or $Release.prerelease -isnot [bool] -or $Release.prerelease) {
+        return $false
+    }
+    if ($Release.assets -isnot [Array]) { return $false }
+
+    $webRoot = $WebBase.TrimEnd("/")
+    foreach ($platform in @("darwin", "linux", "windows")) {
+        foreach ($arch in @("amd64", "arm64")) {
+            $extension = $(if ($platform -eq "windows") { ".zip" } else { ".tar.gz" })
+            $archive = "metis-$platform-$arch$extension"
+            foreach ($name in @($archive, "$archive.sha256")) {
+                # Only the expected CLI names belong to this channel. Additional
+                # Desktop assets are allowed and do not change CLI eligibility.
+                $matchingAssets = @($Release.assets | Where-Object {
+                    $null -ne $_ -and $_ -is [System.Management.Automation.PSCustomObject] -and
+                    $null -ne $_.PSObject.Properties["name"] -and $_.name -is [string] -and $_.name -ceq $name
+                })
+                if ($matchingAssets.Count -ne 1) { return $false }
+                $asset = $matchingAssets[0]
+                foreach ($field in @("size", "state", "browser_download_url")) {
+                    if ($null -eq $asset.PSObject.Properties[$field]) { return $false }
+                }
+                # JSON positive integer-valued numbers (including 1.0 / 1e2),
+                # never strings/bools/fractional values/NaN/infinity.
+                if ($asset.size -isnot [int] -and $asset.size -isnot [long] -and $asset.size -isnot [double] -and $asset.size -isnot [decimal]) { return $false }
+                $sizeValue = [double]$asset.size
+                if ([double]::IsNaN($sizeValue) -or [double]::IsInfinity($sizeValue) -or $sizeValue -le 0 -or [Math]::Truncate($sizeValue) -ne $sizeValue) { return $false }
+                if ($asset.state -isnot [string] -or $asset.state -cne "uploaded") { return $false }
+                $expectedURL = "$webRoot/$Repo/releases/download/$($Release.tag_name)/$name"
+                if ($asset.browser_download_url -isnot [string] -or $asset.browser_download_url -cne $expectedURL) { return $false }
+            }
+        }
+    }
+    return $true
+}
+
+function Read-CLIReleasePage(
+    [System.Net.Http.HttpClient]$Client,
+    [string]$Uri,
+    [System.Threading.CancellationToken]$Cancellation
+) {
+    $Cancellation.ThrowIfCancellationRequested()
+    $response = $Client.GetAsync($Uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $Cancellation).GetAwaiter().GetResult()
+    try {
+        $response.EnsureSuccessStatusCode() | Out-Null
+        $contentLength = $response.Content.Headers.ContentLength
+        if ($null -ne $contentLength -and [long]$contentLength -gt $MaxMetadataBytes) {
+            throw "CLI release metadata exceeds the $MaxMetadataBytes byte limit"
+        }
+        $input = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        try {
+            $output = [System.IO.MemoryStream]::new()
+            try {
+                $buffer = New-Object byte[] 65536
+                [long]$total = 0
+                while (($read = $input.ReadAsync($buffer, 0, $buffer.Length, $Cancellation).GetAwaiter().GetResult()) -gt 0) {
+                    $total += $read
+                    if ($total -gt $MaxMetadataBytes) { throw "CLI release metadata exceeds the $MaxMetadataBytes byte limit" }
+                    $output.Write($buffer, 0, $read)
+                }
+                $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+                $body = $utf8.GetString($output.ToArray()).Trim()
+            }
+            finally { $output.Dispose() }
+        }
+        finally { $input.Dispose() }
+    }
+    finally { $response.Dispose() }
+
+    $Cancellation.ThrowIfCancellationRequested()
+    if (-not $body.StartsWith("[") -or -not $body.EndsWith("]")) {
+        throw "CLI release metadata must be a JSON array"
+    }
+    # Force an array after decoding so Windows PowerShell 5.1's pipeline
+    # unwrapping cannot turn a single-release page into a scalar object.
+    $decoded = @(ConvertFrom-Json -InputObject $body)
+    $Cancellation.ThrowIfCancellationRequested()
+    if ($decoded.Count -gt 100) {
+        throw "CLI release metadata page is not an array of at most 100 releases"
+    }
+    return ,$decoded
+}
+
 function Resolve-ReleaseTag {
     if ($Version -ne "latest") {
         return $Version
     }
 
-    if ($Token) {
-        $headers = @{
-            Authorization = "Bearer $Token"
-            Accept = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-            "User-Agent" = "metis-installer"
-        }
-        $release = Invoke-RestMethod -UseBasicParsing -Headers $headers -TimeoutSec ([int]$MetadataTimeout.TotalSeconds) -Uri "$ApiBase/repos/$Repo/releases/latest"
-        if (-not $release.tag_name) {
-            throw "GitHub response did not contain tag_name"
-        }
-        return [string]$release.tag_name
-    }
-
-    # Avoid the anonymous GitHub REST rate limit. The public web redirect is
-    # enough to resolve the latest tag and requires no credentials.
     $handler = [System.Net.Http.HttpClientHandler]::new()
-    $handler.AllowAutoRedirect = $true
+    $handler.AllowAutoRedirect = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
+    $cancellation = [System.Threading.CancellationTokenSource]::new()
     try {
+        # One deadline covers every page and each streamed body; never return
+        # a partial candidate after throttling, truncation or pagination failure.
         $client.Timeout = $MetadataTimeout
         $client.DefaultRequestHeaders.UserAgent.ParseAdd("metis-installer")
-        $response = $client.GetAsync(
-            "$WebBase/$Repo/releases/latest",
-            [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
-        ).GetAwaiter().GetResult()
-        try {
-            $response.EnsureSuccessStatusCode() | Out-Null
-            $tag = [Uri]::UnescapeDataString($response.RequestMessage.RequestUri.Segments[-1].TrimEnd("/"))
-            if (-not $tag -or $tag -eq "latest") {
-                throw "Could not resolve the latest public release tag"
+        $client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json")
+        $client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28")
+        if ($Token) {
+            $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $Token)
+        }
+        $cancellation.CancelAfter($MetadataTimeout)
+        $apiRoot = $ApiBase.TrimEnd("/")
+        $bestTag = $null
+        $bestVersion = $null
+        for ($page = 1; $page -le $MaxReleasePages; $page++) {
+            $releases = Read-CLIReleasePage $client "$apiRoot/repos/$Repo/releases?per_page=100&page=$page" $cancellation.Token
+            $releaseCount = $releases.Count
+            foreach ($release in $releases) {
+                $cancellation.Token.ThrowIfCancellationRequested()
+                if (Test-CompleteCLIRelease $release) {
+                    $candidate = [Version]$release.tag_name.Substring(1)
+                    if ($null -eq $bestVersion -or $candidate.CompareTo($bestVersion) -gt 0) {
+                        $bestTag = [string]$release.tag_name
+                        $bestVersion = $candidate
+                    }
+                }
             }
-            return $tag
+            $cancellation.Token.ThrowIfCancellationRequested()
+            if ($releaseCount -lt 100) {
+                if ($null -eq $bestTag) { throw "No complete stable CLI release was found" }
+                return $bestTag
+            }
         }
-        finally {
-            $response.Dispose()
-        }
+        throw "CLI release discovery exceeded the $MaxReleasePages page limit"
+    }
+    catch {
+        if ($cancellation.IsCancellationRequested) { throw "CLI release discovery timed out after $([int]$MetadataTimeout.TotalSeconds) seconds" }
+        $failure = $_.Exception.Message
+        if ($Token) { $failure = $failure.Replace($Token, "[redacted]") }
+        throw "CLI release discovery failed: $failure"
     }
     finally {
+        $cancellation.Dispose()
         $client.Dispose()
         $handler.Dispose()
     }
@@ -1090,9 +1196,24 @@ try {
     # resolution so an interrupted install can be repaired while offline.
     $resolvedTag = Resolve-ReleaseTag
     $versionName = ConvertTo-VersionName $resolvedTag
+    if ($Version -eq "latest" -and (Test-Path -LiteralPath $currentVersionFile)) {
+        # Repair/Migrate above verified the marker, managed binary and visible
+        # launcher under this same install lock. An incomplete/stale server
+        # inventory must never turn a default install into a downgrade.
+        $installedVersion = Read-CurrentVersion $currentVersionFile
+        $installedCore = [regex]::Match($installedVersion, '^((0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8}))(?:[-+][0-9A-Za-z][0-9A-Za-z.+-]*)?\z')
+        if (-not $installedCore.Success) {
+            throw "Cannot compare installed CLI version '$installedVersion' safely; select an explicit -Version to proceed"
+        }
+        $installedNumericVersion = [Version]$installedCore.Groups[1].Value
+        $selectedNumericVersion = [Version]$versionName
+        if ($selectedNumericVersion.CompareTo($installedNumericVersion) -lt 0) {
+            throw "Refusing to downgrade the installed CLI v$installedVersion to $resolvedTag via latest; an older version requires explicit -Version"
+        }
+    }
     $artifact = "metis-windows-$architecture.zip"
     $checksumAsset = "$artifact.sha256"
-    $downloadBase = "$WebBase/$Repo/releases/download/$resolvedTag"
+    $downloadBase = "$($WebBase.TrimEnd('/'))/$Repo/releases/download/$resolvedTag"
     New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
     $zipPath = Join-Path $stageDir $artifact

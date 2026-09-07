@@ -16,11 +16,11 @@ func TestLatestSupportsAnonymousPublicRelease(t *testing.T) {
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	mux.HandleFunc("/repos/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/"+Repo()+"/releases", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Errorf("anonymous request sent Authorization header %q", got)
 		}
-		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
+		_ = json.NewEncoder(w).Encode([]any{completeCLIRelease("v9.9.9", webBase)})
 	})
 	mux.HandleFunc("/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/"+Repo()+"/releases/tag/v9.9.9", http.StatusFound)
@@ -49,11 +49,11 @@ func TestLatestUsesTokenWhenProvided(t *testing.T) {
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	mux.HandleFunc("/repos/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/"+Repo()+"/releases", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Errorf("Authorization = %q, want Bearer test-token", got)
 		}
-		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
+		_ = json.NewEncoder(w).Encode([]any{completeCLIRelease("v9.9.9", webBase)})
 	})
 
 	oldAPI := apiBase
@@ -74,8 +74,8 @@ func TestMaybeCheckSupportsAnonymousPublicRelease(t *testing.T) {
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	mux.HandleFunc("/repos/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(release{TagName: "v9.9.9"})
+	mux.HandleFunc("/repos/"+Repo()+"/releases", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]any{completeCLIRelease("v9.9.9", webBase)})
 	})
 	mux.HandleFunc("/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/"+Repo()+"/releases/tag/v9.9.9", http.StatusFound)
@@ -219,6 +219,8 @@ func TestMaybeCheck_WritesLatestVersionFromCache(t *testing.T) {
 	t.Setenv("METIS_GITHUB_TOKEN", "fake-token-for-throttle-path")
 	// Pre-populate state so MaybeCheck takes the throttle-cache branch.
 	saveState(statePath(dir), checkState{
+		Source:    cliStableSource,
+		SourceKey: cliStableSourceKey(),
 		LastCheck: time.Now().Add(-time.Minute), // within minInterval (30min)
 		LatestTag: "v0.2.0",
 		// Mark this tag as already-notified so we don't try to surface it.

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.51); prerelease flag follows registry, never latest'
+        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.52); prerelease flag follows registry, never shared latest'
         required: true
         type: string
       build_run_id:
@@ -23,6 +23,8 @@ jobs:
   publish:
     name: Verify complete CLI draft and publish once
     runs-on: ubuntu-latest
+    outputs:
+      default_channel_check: ${{ steps.provenance.outputs.default_channel_check }}
     permissions:
       contents: write
       actions: read
@@ -46,6 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B -m unittest discover -s release-tools/scripts -p 'test_release_contract.py' -v
+          python3 -B -m unittest discover -s release-tools/scripts -p 'test_verify_cli_default_channel.py' -v
           python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > plan.json
           case "$(jq -r .channel plan.json)" in
             cli-only-prerelease|cli-only-stable) ;;
@@ -54,6 +57,9 @@ jobs:
           python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
             --registry source/.github/cli-only-releases.json > source-plan.json
           cmp plan.json source-plan.json
+          default_channel_check=$(python3 release-tools/scripts/verify_cli_default_channel.py supports \
+            --tag "$TAG" --prerelease "$(jq -r .prerelease plan.json)")
+          echo "default_channel_check=$default_channel_check" >> "$GITHUB_OUTPUT"
           [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           source_sha=$(git -C source rev-parse HEAD)
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > build-run.json
@@ -154,6 +160,23 @@ jobs:
             METIS_VERSION="$TAG" METIS_INSTALL_DIR="$install_dir" bash install/install.sh
           test "$("$install_dir/metis" version | awk 'NR == 1 { print $1 }')" = "$TAG"
 
+      - name: Verify anonymous default install follows independent CLI stable channel
+        if: needs.publish.outputs.default_channel_check == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s scripts -p 'test_verify_cli_default_channel.py' -v
+          python3 scripts/verify_cli_default_channel.py snapshot --repository "$GITHUB_REPOSITORY" > cli-before.json
+          default_dir="$RUNNER_TEMP/metis-default-cli-bin"
+          env -u METIS_VERSION -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN -u GH_TOKEN \
+            METIS_INSTALL_DIR="$default_dir" bash install/install.sh
+          actual=$("$default_dir/metis" version | awk 'NR == 1 { print $1 }')
+          python3 scripts/verify_cli_default_channel.py snapshot --repository "$GITHUB_REPOSITORY" > cli-after.json
+          python3 scripts/verify_cli_default_channel.py verify --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" --actual "$actual" --before cli-before.json --after cli-after.json | tee cli-default-result.json
+
   install-smoke-windows:
     name: Anonymous published CLI install (Windows)
     needs: publish
@@ -174,3 +197,37 @@ jobs:
           $output = @(& (Join-Path $installDir "metis.exe") version)
           if ($LASTEXITCODE -ne 0) { throw "installed metis.exe version failed" }
           if (($output[0] -split '\s+')[0] -ne $env:TAG) { throw "installed CLI version mismatch" }
+
+      - uses: actions/setup-python@v5
+        if: needs.publish.outputs.default_channel_check == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Verify anonymous default Windows install follows independent CLI stable channel
+        if: needs.publish.outputs.default_channel_check == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          python -B -m unittest discover -s scripts -p 'test_verify_cli_default_channel.py' -v
+          if ($LASTEXITCODE -ne 0) { throw "default-channel oracle tests failed" }
+          python scripts/verify_cli_default_channel.py snapshot --repository $env:GITHUB_REPOSITORY > cli-before.json
+          if ($LASTEXITCODE -ne 0) { throw "before CLI channel snapshot failed" }
+          $snapshotToken = $env:GH_TOKEN
+          Remove-Item Env:METIS_VERSION -ErrorAction SilentlyContinue
+          Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          $defaultDir = Join-Path $env:RUNNER_TEMP "metis-default-cli-bin"
+          & ./install/install.ps1 -InstallDir $defaultDir
+          $output = @(& (Join-Path $defaultDir "metis.exe") version)
+          if ($LASTEXITCODE -ne 0) { throw "default-installed metis.exe version failed" }
+          $actual = ($output[0] -split '\s+')[0]
+          $env:GH_TOKEN = $snapshotToken
+          python scripts/verify_cli_default_channel.py snapshot --repository $env:GITHUB_REPOSITORY > cli-after.json
+          if ($LASTEXITCODE -ne 0) { throw "after CLI channel snapshot failed" }
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          python scripts/verify_cli_default_channel.py verify --repository $env:GITHUB_REPOSITORY `
+            --tag $env:TAG --actual $actual --before cli-before.json --after cli-after.json
+          if ($LASTEXITCODE -ne 0) { throw "default CLI install does not match independent latest" }

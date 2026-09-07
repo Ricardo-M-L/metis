@@ -1,0 +1,3438 @@
+{
+  "schema_version": 1,
+  "repo": "Ricardo-M-L/metis",
+  "web_base": "https://github.com",
+  "cases": [
+    {
+      "name": "integer-size-number-equivalence",
+      "releases": [
+        {
+          "tag_name": "v0.4.52",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 101.0,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 1.01e2,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 101.0,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 1.01e2,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 101.0,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 1.01e2,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 101.0,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 1.01e2,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 101.0,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 1.01e2,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 101.0,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 1.01e2,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.52"
+    },
+    {
+      "name": "reject-noninteger-size-candidates",
+      "releases": [
+        {
+          "tag_name": "v9.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 0.5,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v8.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": true,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v7.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": "100",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "reject-trailing-newline-tag",
+      "releases": [
+        {
+          "tag_name": "v9.0.0\n",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0\n/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "ignore-unrelated-assets",
+      "releases": [
+        {
+          "tag_name": "v0.4.52",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-arm64.zip.sha256"
+            },
+            {
+              "name": "notes.txt"
+            },
+            {
+              "name": "notes.txt"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.52"
+    },
+    {
+      "name": "shared-latest47-cli51",
+      "shared_latest": "v0.4.47",
+      "releases": [
+        {
+          "tag_name": "v0.4.47",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.47/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "numeric-unordered",
+      "releases": [
+        {
+          "tag_name": "v0.9.9",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.9/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.10.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.10.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.9.10",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.9.10/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.10.0"
+    },
+    {
+      "name": "skip-nonstable-and-draft",
+      "releases": [
+        {
+          "tag_name": "v9.0.0",
+          "draft": true,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v8.0.0",
+          "draft": false,
+          "prerelease": true,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v7.0.0-rc.1",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v7.0.0-rc.1/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v6.0.0+build.1",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v6.0.0+build.1/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "skip-incomplete",
+      "releases": [
+        {
+          "tag_name": "v9.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": []
+        },
+        {
+          "tag_name": "v8.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "skip-duplicate-asset",
+      "releases": [
+        {
+          "tag_name": "v8.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip.sha256"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "skip-wrong-url",
+      "releases": [
+        {
+          "tag_name": "v8.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://invalid.example/forged.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "skip-nonuploaded-and-empty",
+      "releases": [
+        {
+          "tag_name": "v9.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "new",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v8.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 0,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "allow-extra-desktop",
+      "releases": [
+        {
+          "tag_name": "v0.4.52",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-windows-arm64.zip.sha256"
+            },
+            {
+              "name": "metis-desktop-darwin-universal.zip",
+              "size": 100,
+              "state": "uploaded",
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52/metis-desktop-darwin-universal.zip"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.52"
+    },
+    {
+      "name": "invalid-and-leading-zero-tags",
+      "releases": [
+        {
+          "tag_name": "v09.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v09.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v9.00.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.00.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v9.0.00",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.00/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v1000000000.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v1000000000.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "9.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/9.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "../../v9.0.0",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/../../v9.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "missing-status-flags",
+      "releases": [
+        {
+          "tag_name": "v9.0.0",
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v9.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v8.0.0",
+          "draft": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v8.0.0/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.51/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        }
+      ],
+      "want_tag": "v0.4.51"
+    },
+    {
+      "name": "no-eligible-release",
+      "releases": [
+        {
+          "tag_name": "v0.4.52-rc.1",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "metis-darwin-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-darwin-amd64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-darwin-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-darwin-arm64.tar.gz"
+            },
+            {
+              "name": "metis-darwin-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-darwin-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-linux-amd64.tar.gz"
+            },
+            {
+              "name": "metis-linux-amd64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-linux-amd64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-linux-arm64.tar.gz"
+            },
+            {
+              "name": "metis-linux-arm64.tar.gz.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-linux-arm64.tar.gz.sha256"
+            },
+            {
+              "name": "metis-windows-amd64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-windows-amd64.zip"
+            },
+            {
+              "name": "metis-windows-amd64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-windows-amd64.zip.sha256"
+            },
+            {
+              "name": "metis-windows-arm64.zip",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-windows-arm64.zip"
+            },
+            {
+              "name": "metis-windows-arm64.zip.sha256",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.52-rc.1/metis-windows-arm64.zip.sha256"
+            }
+          ]
+        },
+        {
+          "tag_name": "v0.4.51",
+          "draft": false,
+          "prerelease": false,
+          "assets": []
+        }
+      ],
+      "want_tag": ""
+    }
+  ]
+}

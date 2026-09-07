@@ -24,7 +24,7 @@ func fakeExecutable(version, marker string) []byte {
 }
 
 // buildFakeRelease spins up an httptest server that mimics the GitHub
-// release-assets API surface Apply touches: /latest returns metadata with
+// release-assets API surface Apply touches: /releases returns metadata with
 // two assets (tarball + sha256), /assets/:id serves the bytes. Returns the
 // server and a *release pointing at it.
 func buildFakeRelease(t *testing.T, version, target string, binContent []byte) (*httptest.Server, *release) {
@@ -76,9 +76,9 @@ func buildFakeRelease(t *testing.T, version, target string, binContent []byte) (
 			t.Errorf("request sent an empty bearer token")
 		}
 	}
-	mux.HandleFunc("/repos/"+repo+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/"+repo+"/releases", func(w http.ResponseWriter, r *http.Request) {
 		assertNoEmptyBearer(r)
-		json.NewEncoder(w).Encode(rel)
+		json.NewEncoder(w).Encode([]any{completeCLIRelease("v"+version, webBase)})
 	})
 	mux.HandleFunc("/repos/"+repo+"/releases/assets/1", func(w http.ResponseWriter, r *http.Request) {
 		assertNoEmptyBearer(r)
@@ -286,27 +286,25 @@ func TestAnonymousLatestAndApplyAvoidGitHubAssetAPI(t *testing.T) {
 		t.Skip("Unix fake executable fixture")
 	}
 	oldTarget := targetForTest
-	targetForTest = "test-os-arch"
+	targetForTest = "linux-amd64"
 	t.Cleanup(func() { targetForTest = oldTarget })
-	archiveName := "metis-test-os-arch.tar.gz"
-	archive := makeTarArchive(t, "metis-test-os-arch", fakeExecutable("3.0.0", "web-fallback"), tar.TypeReg)
+	archiveName := "metis-linux-amd64.tar.gz"
+	archive := makeTarArchive(t, "metis-linux-amd64", fakeExecutable("3.0.0", "cli-channel"), tar.TypeReg)
 	sum := sha256.Sum256(archive)
 	var apiCalls int
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	mux.HandleFunc("/api/repos/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/repos/"+Repo()+"/releases", func(w http.ResponseWriter, r *http.Request) {
 		apiCalls++
-		http.Error(w, "shared IP rate limited", http.StatusForbidden)
-	})
-	mux.HandleFunc("/"+Repo()+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Errorf("anonymous latest sent Authorization %q", got)
 		}
-		http.Redirect(w, r, "/"+Repo()+"/releases/tag/v3.0.0", http.StatusFound)
+		_ = json.NewEncoder(w).Encode([]any{completeCLIRelease("v3.0.0", webBase)})
 	})
-	mux.HandleFunc("/"+Repo()+"/releases/tag/v3.0.0", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	mux.HandleFunc("/api/repos/"+Repo()+"/releases/assets/", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("anonymous download used asset API")
+		http.Error(w, "asset API forbidden", http.StatusForbidden)
 	})
 	mux.HandleFunc("/"+Repo()+"/releases/download/v3.0.0/"+archiveName, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "" {
@@ -323,17 +321,17 @@ func TestAnonymousLatestAndApplyAvoidGitHubAssetAPI(t *testing.T) {
 
 	rel, err := Latest(context.Background(), "")
 	if err != nil {
-		t.Fatalf("Latest anonymous web redirect: %v", err)
+		t.Fatalf("Latest anonymous CLI channel: %v", err)
 	}
 	launcher := filepath.Join(t.TempDir(), "bin", "metis")
 	if err := os.MkdirAll(filepath.Dir(launcher), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := Apply(context.Background(), "", launcher, rel); err != nil {
-		t.Fatalf("Apply anonymous deterministic assets: %v", err)
+		t.Fatalf("Apply anonymous verified browser asset URLs: %v", err)
 	}
-	if apiCalls != 0 {
-		t.Fatalf("anonymous flow made %d REST API calls", apiCalls)
+	if apiCalls != 1 {
+		t.Fatalf("anonymous flow made %d discovery REST API calls, want 1", apiCalls)
 	}
 }
 

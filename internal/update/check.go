@@ -2,6 +2,7 @@ package update
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,10 +26,13 @@ const (
 	// `current: v0.3.0 · latest: v0.2.8` (an inverted pair) stayed on
 	// screen for hours after a manual upgrade because the 24h-throttled
 	// cache hadn't refreshed yet.
-	minInterval = 30 * time.Minute
+	minInterval     = 30 * time.Minute
+	cliStableSource = "cli-stable-v1"
 )
 
 type checkState struct {
+	Source      string    `json:"source,omitempty"`
+	SourceKey   string    `json:"source_key,omitempty"`
 	LastCheck   time.Time `json:"last_check"`
 	LatestTag   string    `json:"latest_tag,omitempty"`
 	LastTagSeen string    `json:"last_tag_seen,omitempty"` // last tag we *notified* about
@@ -36,6 +40,13 @@ type checkState struct {
 }
 
 func statePath(home string) string { return filepath.Join(home, stateFile) }
+
+func cliStableSourceKey() string {
+	// Bind caches to the repository and effective API/download origins without
+	// storing configured URLs that might contain credentials in plaintext.
+	identity := strings.TrimRight(apiBase, "/") + "\x00" + strings.TrimRight(webBase, "/") + "\x00" + Repo()
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))
+}
 
 // latestVersionFile is the simple one-line cache the TUI's chrome row
 // reads to render "current: X · latest: Y". Lives next to the JSON
@@ -97,6 +108,14 @@ func MaybeCheck(ctx context.Context, configHome, currentVersion string) string {
 	token := Token()
 	sp := statePath(configHome)
 	st := loadState(sp)
+	// A pre-channel cache came from shared GitHub /latest (Desktop). A cache
+	// from another repo/origin is equally inapplicable: refresh immediately.
+	if st.Source != cliStableSource || st.SourceKey != cliStableSourceKey() {
+		st.LastCheck = time.Time{}
+		st.LatestTag = ""
+		st.LastTagSeen = ""
+		st.LastNotify = time.Time{}
+	}
 	// Stale-cache guard (2026-07-26): if the cached LatestTag is OLDER
 	// than the running binary, the cache is from a previous install
 	// (user upgraded by hand via `go install` / tarball / `metis update`)
@@ -132,6 +151,8 @@ func MaybeCheck(ctx context.Context, configHome, currentVersion string) string {
 		return ""
 	}
 	st.LastCheck = time.Now()
+	st.Source = cliStableSource
+	st.SourceKey = cliStableSourceKey()
 	st.LatestTag = r.TagName
 	saveState(sp, st)
 	// Mirror the freshly-seen tag into ~/.metis/latest_version so the

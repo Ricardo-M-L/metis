@@ -227,6 +227,21 @@ func TestAutoUpdateLoopDoesNotNotifyWhenAnotherProcessAlreadyInstalled(t *testin
 	}
 }
 
+func TestAutoUpdateLoopDoesNotNotifyWhenReleaseLookupRegresses(t *testing.T) {
+	downloads := mockUpdateChannel(t, "0.4.50", "v0.4.51")
+	var marks, notices int
+	runAutoUpdateLoop(context.Background(), autoUpdateDependencies{
+		check:        func(context.Context) string { return "v0.4.52" },
+		install:      tryAutoInstall,
+		markNotified: func(string) { marks++ },
+		notify:       func(string) { notices++ },
+		wait:         func(context.Context, time.Duration) bool { return false },
+	})
+	if *downloads != 0 || marks != 0 || notices != 0 {
+		t.Fatalf("regressed release must not install or notify: downloads=%d marks=%d notices=%d", *downloads, marks, notices)
+	}
+}
+
 func TestStartAutoUpdaterHonorsNoUpdateCheck(t *testing.T) {
 	t.Setenv("METIS_NO_UPDATE_CHECK", "1")
 	called := make(chan struct{}, 1)

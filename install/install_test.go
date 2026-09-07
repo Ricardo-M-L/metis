@@ -26,7 +26,7 @@ func TestInstallerSupportsAnonymousPublicRelease(t *testing.T) {
 
 	target := runtime.GOOS + "-" + runtime.GOARCH
 	artifact := "metis-" + target + ".tar.gz"
-	binary := []byte("#!/bin/sh\necho 'v9.9.9 (test)'\n")
+	binary := []byte("#!/bin/sh\necho 'v0.4.51 (test)'\n")
 
 	var archive bytes.Buffer
 	gz := gzip.NewWriter(&archive)
@@ -61,22 +61,30 @@ func TestInstallerSupportsAnonymousPublicRelease(t *testing.T) {
 			t.Errorf("anonymous request sent Authorization header %q", got)
 		}
 	}
+	mux.HandleFunc("/repos/Ricardo-M-L/metis/releases", func(w http.ResponseWriter, r *http.Request) {
+		assertAnonymous(t, r)
+		if r.URL.RawQuery != "per_page=100&page=1" {
+			t.Errorf("unexpected pagination query %q", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode([]any{unixCLIRelease("v0.4.47", server.URL), unixCLIRelease("v0.4.51", server.URL)})
+	})
 	mux.HandleFunc("/repos/Ricardo-M-L/metis/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "anonymous API rate limit exhausted", http.StatusForbidden)
+		t.Error("installer used shared API latest")
+		fmt.Fprint(w, `{"tag_name":"v0.4.47"}`)
 	})
 	mux.HandleFunc("/Ricardo-M-L/metis/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		assertAnonymous(t, r)
-		http.Redirect(w, r, "/Ricardo-M-L/metis/releases/tag/v9.9.9", http.StatusFound)
+		t.Error("installer used shared web latest")
+		http.Redirect(w, r, "/Ricardo-M-L/metis/releases/tag/v0.4.47", http.StatusFound)
 	})
-	mux.HandleFunc("/Ricardo-M-L/metis/releases/tag/v9.9.9", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/Ricardo-M-L/metis/releases/tag/v0.4.47", func(w http.ResponseWriter, r *http.Request) {
 		assertAnonymous(t, r)
 		fmt.Fprint(w, "test release")
 	})
-	mux.HandleFunc("/Ricardo-M-L/metis/releases/download/v9.9.9/"+artifact, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/Ricardo-M-L/metis/releases/download/v0.4.51/"+artifact, func(w http.ResponseWriter, r *http.Request) {
 		assertAnonymous(t, r)
 		_, _ = w.Write(archive.Bytes())
 	})
-	mux.HandleFunc("/Ricardo-M-L/metis/releases/download/v9.9.9/"+artifact+".sha256", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/Ricardo-M-L/metis/releases/download/v0.4.51/"+artifact+".sha256", func(w http.ResponseWriter, r *http.Request) {
 		assertAnonymous(t, r)
 		_, _ = w.Write([]byte(sumFile))
 	})
@@ -128,7 +136,7 @@ func TestInstallerSupportsAnonymousPublicRelease(t *testing.T) {
 		t.Fatalf("installed launcher is not a symlink: %v", info.Mode())
 	}
 
-	versioned := filepath.Join(baseDir, "share", "metis", "versions", "9.9.9", "metis")
+	versioned := filepath.Join(baseDir, "share", "metis", "versions", "0.4.51", "metis")
 	versioned, err = filepath.EvalSymlinks(versioned)
 	if err != nil {
 		t.Fatalf("resolve expected versioned binary: %v", err)
@@ -171,10 +179,10 @@ func TestInstallerSupportsAnonymousPublicRelease(t *testing.T) {
 		archiveMax  int
 		expandedMax int
 	}{
-		{name: "wrong-version", tag: "v9.9.8", wantErr: "reports v9.9.9, expected v9.9.8"},
+		{name: "wrong-version", tag: "v9.9.8", wantErr: "reports v0.4.51, expected v9.9.8"},
 		{name: "wrong-checksum", tag: "v9.9.7", wantErr: "SHA256 mismatch"},
-		{name: "archive-limit", tag: "v9.9.9", archiveMax: archive.Len() - 1, wantErr: "download exceeds"},
-		{name: "expanded-limit", tag: "v9.9.9", expandedMax: len(binary) - 1, wantErr: "expanded binary exceeds"},
+		{name: "archive-limit", tag: "v0.4.51", archiveMax: archive.Len() - 1, wantErr: "download exceeds"},
+		{name: "expanded-limit", tag: "v0.4.51", expandedMax: len(binary) - 1, wantErr: "expanded binary exceeds"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			failedBase := t.TempDir()

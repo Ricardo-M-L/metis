@@ -115,6 +115,14 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIs(plan["make_latest"], False)
         self.assertEqual(len(plan["assets"]), 12)
 
+    def test_repository_registers_v0452_as_cli_stable(self):
+        registry = contract.load_json(SCRIPT.parent.parent / ".github/cli-only-releases.json")
+        plan = contract.release_plan(registry, "v0.4.52")
+        self.assertEqual(plan["channel"], "cli-only-stable")
+        self.assertIs(plan["prerelease"], False)
+        self.assertIs(plan["make_latest"], False)
+        self.assertEqual(len(plan["assets"]), 12)
+
     def test_graphql_lookup_fields_use_gh_arguments_without_shell_or_rest_pagination(self):
         result = mock.Mock(returncode=0, stdout='{"data": {}}')
         with mock.patch.object(contract.subprocess, "run", return_value=result) as run:

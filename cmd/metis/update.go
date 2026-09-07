@@ -148,7 +148,7 @@ func waitForAutoUpdate(ctx context.Context, interval time.Duration) bool {
 	}
 }
 
-// tryAutoInstall downloads and installs the latest release without user
+// tryAutoInstall downloads and installs the latest CLI stable release without user
 // interaction. update.ApplyIfNeeded owns the cross-process install lock and
 // the platform-specific atomic switch; that keeps automatic and manual
 // updates on the same path, including Windows. The running process is left
@@ -169,6 +169,15 @@ func tryAutoInstall(ctx context.Context, tag string) (autoUpdateInstallResult, e
 	if err != nil {
 		return autoUpdateInstallResult{}, err
 	}
+	// Discovery is repeated here after the initial notification check. A
+	// changed channel must not downgrade this process or install a release
+	// older than the one that triggered this attempt.
+	if err := checkUpdateTarget(version.Version, rel.TagName, tag); err != nil {
+		return autoUpdateInstallResult{}, err
+	}
+	if !update.IsNewer(version.Version, rel.TagName) {
+		return autoUpdateInstallResult{}, nil
+	}
 	installed, err := update.ApplyIfNeeded(installCtx, token, self, rel)
 	if err != nil {
 		return autoUpdateInstallResult{}, err
@@ -186,19 +195,36 @@ func tryAutoInstall(ctx context.Context, tag string) (autoUpdateInstallResult, e
 	return autoUpdateInstallResult{installed: true, notice: notice}, nil
 }
 
+// checkUpdateTarget protects the running process version before installation.
+// The core updater separately rechecks the activated version under its lock,
+// since another process may have upgraded the launcher in the meantime.
+// announced is non-empty only for an automatic check-and-install pair.
+func checkUpdateTarget(running, target, announced string) error {
+	if update.IsNewer(target, running) {
+		return fmt.Errorf("refusing to downgrade metis %s to CLI stable release %s; --force only permits reinstalling the same version", running, target)
+	}
+	if announced != "" && update.IsNewer(target, announced) {
+		return fmt.Errorf("CLI stable release changed backwards from %s to %s; skipping this update attempt", announced, target)
+	}
+	return nil
+}
+
 func cmdUpdate(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	checkOnly := fs.Bool("check", false, "Only check for a newer release; don't install")
-	force := fs.Bool("force", false, "Reinstall even if already on the latest version")
+	checkOnly := fs.Bool("check", false, "Only check for a newer CLI stable release; don't install")
+	force := fs.Bool("force", false, "Allow reinstalling the same CLI stable version; never downgrade")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: metis update [--check] [--force]
 
-Self-update metis from the public GitHub release. No token is required.
+Self-update metis from the public CLI stable releases on GitHub.
+This channel is independent of the shared CLI/Desktop latest release.
+No token is required.
 METIS_GITHUB_TOKEN (or GITHUB_TOKEN) is optional for higher API rate limits.
 
 Flags:
-  --check    Only check whether a newer release exists
-  --force    Reinstall the latest release even if it matches the running version
+  --check    Only check whether a newer CLI stable release exists
+  --force    Reinstall the CLI stable release if it matches the running version;
+             never install a version older than the running version
 
 Other env:
   METIS_REPO              Override repo (default: Ricardo-M-L/metis)
@@ -213,22 +239,29 @@ Other env:
 
 	rel, err := update.Latest(ctx, token)
 	if err != nil {
-		return fmt.Errorf("check latest release: %w", err)
+		return fmt.Errorf("check CLI stable release: %w", err)
 	}
 	latest := strings.TrimPrefix(rel.TagName, "v")
 
-	switch {
-	case *checkOnly:
+	if *checkOnly {
 		if update.IsNewer(cur, rel.TagName) {
 			fmt.Printf("update available: %s -> %s\n", cur, latest)
 			fmt.Printf("  release: %s\n", rel.HTMLURL)
 			fmt.Printf("  run `metis update` to install\n")
 			return nil
 		}
-		fmt.Printf("metis %s is up to date\n", cur)
+		if update.IsNewer(rel.TagName, cur) {
+			fmt.Printf("metis %s is newer than the currently available CLI stable release %s; no downgrade will be installed\n", cur, latest)
+			return nil
+		}
+		fmt.Printf("metis %s matches the currently available CLI stable release\n", cur)
 		return nil
-	case !*force && !update.IsNewer(cur, rel.TagName):
-		fmt.Printf("metis %s is already the latest release\n", cur)
+	}
+	if err := checkUpdateTarget(cur, rel.TagName, ""); err != nil {
+		return err
+	}
+	if !*force && !update.IsNewer(cur, rel.TagName) {
+		fmt.Printf("metis %s matches the currently available CLI stable release\n", cur)
 		fmt.Printf("(use --force to reinstall)\n")
 		return nil
 	}

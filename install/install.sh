@@ -13,7 +13,7 @@
 # Env (all optional):
 #   METIS_GITHUB_TOKEN   GitHub PAT for a higher API rate limit
 #                        (GITHUB_TOKEN is also accepted as fallback)
-#   METIS_VERSION        Tag to install (default: latest release)
+#   METIS_VERSION        Tag to install (default: latest complete stable CLI release)
 #   METIS_INSTALL_DIR    Stable launcher directory (default: $HOME/.local/bin)
 #   METIS_REPO           Override repo (default: Ricardo-M-L/metis)
 #   METIS_GITHUB_API_BASE  Override GitHub API base (advanced)
@@ -30,6 +30,9 @@ readonly METIS_HARD_MAX_BYTES=$((128 * 1024 * 1024))
 readonly METIS_MAX_ARCHIVE_BYTES="${METIS_MAX_ARCHIVE_BYTES:-$METIS_HARD_MAX_BYTES}"
 readonly METIS_MAX_EXPANDED_BYTES="${METIS_MAX_EXPANDED_BYTES:-$METIS_HARD_MAX_BYTES}"
 readonly METIS_MAX_CHECKSUM_BYTES=$((64 * 1024))
+readonly METIS_MAX_RELEASE_PAGE_BYTES=$((8 * 1024 * 1024))
+readonly METIS_RELEASE_METADATA_SECONDS=30
+readonly METIS_MAX_RELEASE_PAGES=10
 
 # Token: prefer dedicated env var, fall back to GITHUB_TOKEN.
 TOKEN="${METIS_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
@@ -202,41 +205,90 @@ detect_target() {
     printf '%s-%s' "$os" "$arch"
 }
 
-# Fetch release metadata. Anonymous installs resolve "latest" through the
-# public web redirect instead, avoiding GitHub REST's low shared-IP limit.
-fetch_release_json() {
-    local tag="$1" url
-    if [ "$tag" = "latest" ]; then
-        url="${METIS_GITHUB_API_BASE}/repos/${METIS_REPO}/releases/latest"
+# Both anonymous and authenticated installs use the CLI asset inventory, never
+# GitHub's shared latest pointer (which may intentionally still target Desktop).
+# Emit page length and the numerically newest eligible tag, including prior pages.
+parse_cli_release_page() {
+    local parser="$1" page_file="$2" previous="$3"
+    local base="${METIS_GITHUB_WEB_BASE}/${METIS_REPO}/releases/download"
+    if [ "$parser" = jq ]; then
+        jq -ers --arg base "$base" --arg previous "$previous" '
+            def required_assets:
+                ["darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64", "windows-amd64", "windows-arm64"][]
+                | "metis-" + . + (if startswith("windows-") then ".zip" else ".tar.gz" end)
+                | ., . + ".sha256";
+            def version: ltrimstr("v") | split(".") | map(tonumber);
+            def eligible:
+                select(type == "object")
+                | select(.draft == false and .prerelease == false)
+                | select(.tag_name | type == "string")
+                | select(.tag_name | test("^v(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\z"))
+                | select(.assets | type == "array")
+                | . as $release
+                | select([
+                    required_assets as $name
+                    | [$release.assets[] | select(type == "object") | select(.name == $name)]
+                    | select(length == 1) | .[0]
+                    | select(.state == "uploaded")
+                    | select(.size | type == "number")
+                    | select(.size > 0 and (.size | floor) == .size and (.size | isinfinite | not))
+                    | select(.browser_download_url == ($base + "/" + $release.tag_name + "/" + $name))
+                  ] | length == 12);
+            if length != 1 then error("expected one JSON document") else .[0] end
+            | if type != "array" then error("expected a release array") else . end
+            | if length > 100 then error("release page exceeds 100 entries") else . end
+            | . as $page
+            | ([.[] | eligible | .tag_name] + (if $previous == "" then [] else [$previous] end))
+            | (sort_by(version) | last // "") as $best
+            | ($page | length | tostring) + "|" + $best
+        ' "$page_file"
     else
-        url="${METIS_GITHUB_API_BASE}/repos/${METIS_REPO}/releases/tags/${tag}"
-    fi
-    if [ -n "$TOKEN" ]; then
-        curl -fsSL \
-            --connect-timeout 10 --max-time 30 \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$url"
-    else
-        curl -fsSL \
-            --connect-timeout 10 --max-time 30 \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$url"
-    fi
-}
+        python3 - "$page_file" "$base" "$previous" <<'PY'
+import json
+import math
+import re
+import sys
 
-release_tag_from_json() {
-    local json="$1"
-    if command -v jq >/dev/null 2>&1; then
-        printf '%s' "$json" | jq -r '.tag_name'
-    else
-        printf '%s' "$json" \
-            | tr ',' '\n' \
-            | grep -E '"tag_name"' \
-            | head -n1 \
-            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+path, base, previous = sys.argv[1:]
+with open(path, encoding="utf-8") as source:
+    releases = json.load(source)
+if not isinstance(releases, list) or len(releases) > 100:
+    raise ValueError("expected a release array with at most 100 entries")
+stable = re.compile(r"v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
+required = []
+for target in ("darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64", "windows-amd64", "windows-arm64"):
+    name = "metis-" + target + (".zip" if target.startswith("windows-") else ".tar.gz")
+    required.extend((name, name + ".sha256"))
+
+def eligible(release):
+    if not isinstance(release, dict) or release.get("draft") is not False or release.get("prerelease") is not False:
+        return False
+    tag = release.get("tag_name")
+    if not isinstance(tag, str) or stable.fullmatch(tag) is None:
+        return False
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        return False
+    for name in required:
+        matches = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == name]
+        if len(matches) != 1:
+            return False
+        asset = matches[0]
+        size = asset.get("size")
+        if type(size) not in (int, float) or size <= 0 or asset.get("state") != "uploaded":
+            return False
+        if isinstance(size, float) and (not math.isfinite(size) or not size.is_integer()):
+            return False
+        if asset.get("browser_download_url") != base + "/" + tag + "/" + name:
+            return False
+    return True
+
+tags = [release["tag_name"] for release in releases if eligible(release)]
+if previous:
+    tags.append(previous)
+best = max(tags, key=lambda tag: tuple(map(int, tag[1:].split("."))), default="")
+print(str(len(releases)) + "|" + best)
+PY
     fi
 }
 
@@ -247,24 +299,46 @@ resolve_release_tag() {
         return
     fi
 
-    if [ -n "$TOKEN" ]; then
-        local json
-        json="$(fetch_release_json latest)"
-        release_tag_from_json "$json"
-        return
+    local parser
+    if command -v jq >/dev/null 2>&1; then
+        parser=jq
+    elif command -v python3 >/dev/null 2>&1; then
+        parser=python3
+    else
+        err "CLI release discovery requires jq or python3; install either, or set METIS_VERSION to an explicit release tag"
     fi
 
-    local latest_url resolved
-    latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
-        --connect-timeout 10 --max-time 30 \
-        "${METIS_GITHUB_WEB_BASE}/${METIS_REPO}/releases/latest")" \
-        || err "could not resolve the latest public release"
-    resolved="${latest_url##*/}"
-    resolved="${resolved%%\?*}"
-    resolved="${resolved%%#*}"
-    [ -n "$resolved" ] && [ "$resolved" != "latest" ] \
-        || err "could not resolve the latest public release tag"
-    printf '%s' "$resolved"
+    local page=1 best="" parsed count url remaining
+    local deadline=$((SECONDS + METIS_RELEASE_METADATA_SECONDS))
+    local page_file="${TMPDIR_PATH}/cli-releases.json"
+    # Keep this array nonempty: macOS Bash 3.2 treats an empty array as unset
+    # under nounset, even when expanding it with [@].
+    local headers=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+    if [ -n "$TOKEN" ]; then
+        headers+=(-H "Authorization: Bearer ${TOKEN}")
+    fi
+    while (( page <= METIS_MAX_RELEASE_PAGES )); do
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || err "CLI release discovery exceeded its ${METIS_RELEASE_METADATA_SECONDS}s metadata budget; set METIS_VERSION to an explicit release tag"
+        url="${METIS_GITHUB_API_BASE}/repos/${METIS_REPO}/releases?per_page=100&page=${page}"
+        if ! run_bounded_pipe "$METIS_MAX_RELEASE_PAGE_BYTES" "$page_file" curl -fsSL \
+            --connect-timeout 10 --max-time "$remaining" \
+            "${headers[@]}" "$url"; then
+            err "could not read the complete CLI release list (including possible GitHub rate limits); set METIS_GITHUB_TOKEN or METIS_VERSION to an explicit release tag"
+        fi
+        parsed="$(parse_cli_release_page "$parser" "$page_file" "$best")" \
+            || err "invalid CLI release metadata; refusing partial or shared-latest fallback"
+        (( SECONDS < deadline )) || err "CLI release discovery exceeded its ${METIS_RELEASE_METADATA_SECONDS}s metadata budget; set METIS_VERSION to an explicit release tag"
+        count="${parsed%%|*}"
+        best="${parsed#*|}"
+        if (( count < 100 )); then
+            [ -n "$best" ] || err "no complete stable CLI release found; set METIS_VERSION to an explicit release tag if required"
+            printf '%s' "$best"
+            return
+        fi
+        page=$((page + 1))
+    done
+    err "CLI release list exceeds ${METIS_MAX_RELEASE_PAGES} pages; refusing a partial result; set METIS_VERSION to an explicit release tag"
 }
 
 download_release_file() {
@@ -950,6 +1024,41 @@ launcher_is_safe_to_replace() {
     return 1
 }
 
+numeric_version_core() {
+    local version="${1#v}"
+    # A locally built or prerelease CLI can still be newer than the stable
+    # channel. Compare its numeric core, ignoring build/prerelease suffixes.
+    version="${version%%+*}"
+    version="${version%%-*}"
+    [[ "$version" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] || return 1
+    printf '%s' "$version"
+}
+
+refuse_default_cli_downgrade() {
+    local launcher="$1" versions_dir="$2" candidate="$3"
+    local output current current_core candidate_core
+    local current_major current_minor current_patch next_major next_minor next_patch
+    [ -e "$launcher" ] || [ -L "$launcher" ] || return 0
+    # main holds the existing installation lock here. Recheck the launcher and
+    # read the running binary, not a stale directory name or remote cache.
+    launcher_is_safe_to_replace "$launcher" "$versions_dir" \
+        || err "refusing to replace unmanaged launcher: ${launcher}"
+    output="$("$launcher" version 2>/dev/null)" \
+        || err "cannot verify installed CLI version; set METIS_VERSION explicitly to replace it intentionally"
+    current="$(printf '%s\n' "$output" | awk 'NR == 1 { print $1; exit }')"
+    current_core="$(numeric_version_core "$current")" \
+        || err "cannot compare installed CLI version ${current:-unknown}; set METIS_VERSION explicitly to replace it intentionally"
+    candidate_core="$(numeric_version_core "$candidate")" \
+        || err "cannot compare stable CLI release version ${candidate}"
+    IFS=. read -r current_major current_minor current_patch <<< "$current_core"
+    IFS=. read -r next_major next_minor next_patch <<< "$candidate_core"
+    if (( next_major < current_major \
+        || (next_major == current_major && next_minor < current_minor) \
+        || (next_major == current_major && next_minor == current_minor && next_patch < current_patch) )); then
+        err "refusing default CLI downgrade from ${current} to ${candidate}; set METIS_VERSION=${candidate} for an intentional downgrade"
+    fi
+}
+
 migrate_legacy_launcher() {
     local launcher="$1" versions_dir="$2" staging_root="$3"
     local output reported_version legacy_version legacy_dir legacy_bin staged_bin
@@ -1034,6 +1143,9 @@ main() {
 
     version="${resolved_tag#v}"
     validate_version_name "$version"
+    if [ "$METIS_VERSION" = latest ]; then
+        refuse_default_cli_downgrade "$launcher" "$versions_dir" "$resolved_tag"
+    fi
     artifact="metis-${target}.tar.gz"
     sumfile="${artifact}.sha256"
 
