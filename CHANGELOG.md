@@ -13,6 +13,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   ChatGPT login now exposes the complete curated GPT/Codex subscription
   catalog, providers without usable credentials stay hidden, and Codex model
   context and image capabilities follow model-specific limits.
+- Kept the required Responses `function_call_output.output` field for empty
+  successful or failed tool results, preventing a 400 after silent commands
+  while leaving unrelated message and reasoning items unchanged.
 
 ## [0.4.48] - 2026-09-06
 

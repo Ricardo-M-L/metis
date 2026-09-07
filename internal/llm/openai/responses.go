@@ -251,8 +251,9 @@ type responsesInputItem struct {
 	CallID    string `json:"call_id,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
-	// function_call_output item
-	Output string `json:"output,omitempty"`
+	// function_call_output requires output even when it is the empty string.
+	// A pointer distinguishes that value from unrelated items without output.
+	Output *string `json:"output,omitempty"`
 	// reasoning item (stateless/ZDR replay)
 	EncryptedContent string          `json:"encrypted_content,omitempty"`
 	Summary          json.RawMessage `json:"summary,omitempty"`
@@ -465,7 +466,7 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 					out.Input = append(out.Input, responsesInputItem{
 						Type:   "function_call_output",
 						CallID: b.ToolUseID,
-						Output: b.ToolResult,
+						Output: &b.ToolResult,
 					})
 				case "image":
 					// Responses image parts use a different discriminant and field
