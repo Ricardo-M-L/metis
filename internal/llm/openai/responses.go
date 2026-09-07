@@ -70,6 +70,10 @@ type ResponsesOAuthCredential struct {
 	AccountID   string
 }
 
+// ManagesRecoverySession lets the agent avoid wrapping provider-owned HTTP
+// recovery in a second retry loop. Wrappers must forward this optional marker.
+func (r *Responses) ManagesRecoverySession() bool { return true }
+
 // responsesRedactedError is the provider's public error boundary. Upstream
 // gateways and HTTP transports sometimes echo credentials in response bodies
 // or error strings, so the original error must not escape through Error or
@@ -84,6 +88,13 @@ func (e *responsesRedactedError) Unwrap() error { return e.classification }
 
 func responsesSafeClassification(err error) error {
 	var safe []error
+	var status *transport.HTTPStatusError
+	if errors.As(err, &status) {
+		// Preserve the authoritative numeric status without exposing the
+		// original error body. Aggregate/stream recovery after this boundary
+		// must not mistake a truncated 400/401 body for a transient EOF.
+		safe = append(safe, &transport.HTTPStatusError{StatusCode: status.StatusCode, Err: errors.New(http.StatusText(status.StatusCode))})
+	}
 	if transport.IsNetworkError(err) {
 		safe = append(safe, transport.ErrNetwork)
 	}
@@ -93,6 +104,7 @@ func responsesSafeClassification(err error) error {
 		io.EOF,
 		io.ErrUnexpectedEOF,
 		io.ErrClosedPipe,
+		transport.ErrRecoveryWindowExceeded,
 	} {
 		if errors.Is(err, candidate) {
 			safe = append(safe, candidate)
@@ -133,11 +145,11 @@ func responsesUpstreamError(message, code, fallback string, exactValues ...strin
 }
 
 func responsesHTTPStatusError(statusCode int, raw []byte, exactValues ...string) error {
-	return fmt.Errorf("responses %d: %s", statusCode, transport.Truncate(security.RedactValues(string(raw), exactValues...), 500))
+	return &transport.HTTPStatusError{StatusCode: statusCode, Err: fmt.Errorf("responses %d: %s", statusCode, transport.Truncate(security.RedactValues(string(raw), exactValues...), 500))}
 }
 
 func responsesHTTPBodyReadError(statusCode int, raw []byte, readErr error, exactValues ...string) error {
-	return fmt.Errorf("%s: %w", responsesHTTPStatusError(statusCode, raw, exactValues...), redactResponsesError(readErr, exactValues...))
+	return &transport.HTTPStatusError{StatusCode: statusCode, Err: fmt.Errorf("%s: %w", responsesHTTPStatusError(statusCode, raw, exactValues...), redactResponsesError(readErr, exactValues...))}
 }
 
 // NewResponses builds a Responses-API provider. baseURL must NOT include
@@ -626,6 +638,7 @@ func (r *Responses) setHeaders(ctx context.Context, h *http.Request, stream bool
 // StreamEvent vocabulary; pending events queue when one frame maps to
 // several (e.g. output_item.done also flushes tool_use_stop).
 type responsesStream struct {
+	release    func()
 	sse        *sse.Reader
 	body       io.Closer
 	pending    []provider.StreamEvent
@@ -675,6 +688,9 @@ type responsesStreamResponse struct {
 }
 
 func (s *responsesStream) Close() error {
+	if s.release != nil {
+		defer s.release()
+	}
 	return redactResponsesError(s.body.Close(), s.exactValues...)
 }
 
@@ -908,6 +924,13 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 	if err := r.validateAuth(); err != nil {
 		return nil, err
 	}
+	policy, err := transport.RecoveryPolicyForContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if policy.Enabled() && transport.RecoverySessionFromContext(ctx) == nil {
+		ctx = transport.WithRecoverySession(ctx, transport.NewRecoverySession(policy))
+	}
 	body, err := r.buildResponsesRequest(req)
 	if err != nil {
 		return nil, err
@@ -920,7 +943,7 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 	var resp *http.Response
 	var lastBody string
 	var exactValues []string
-	post := func(payload []byte) error {
+	post := func(ctx context.Context, payload []byte) error {
 		lastBody = ""
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(payload))
 		if err != nil {
@@ -940,21 +963,21 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 			_ = resp.Body.Close()
 			if readErr != nil {
 				bodyErr := responsesHTTPBodyReadError(resp.StatusCode, rb, readErr, exactValues...)
-				if transport.IsRetryableStatus(resp.StatusCode) {
+				if transport.IsRetryableStatus(resp.StatusCode) || policy.Enabled() && resp.StatusCode >= 500 && resp.StatusCode <= 599 {
 					return &transport.RetryableError{Err: bodyErr, After: transport.ParseRetryAfter(resp)}
 				}
 				return bodyErr
 			}
 			lastBody = string(rb)
 			statusErr := responsesHTTPStatusError(resp.StatusCode, rb, exactValues...)
-			if transport.IsRetryableStatus(resp.StatusCode) {
+			if transport.IsRetryableStatus(resp.StatusCode) || policy.Enabled() && resp.StatusCode >= 500 && resp.StatusCode <= 599 {
 				return &transport.RetryableError{Err: statusErr, After: transport.ParseRetryAfter(resp)}
 			}
 			return statusErr
 		}
 		return nil
 	}
-	err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return post(buf) })
+	release, err := transport.RetryWithRecovery(ctx, policy, func(attemptCtx context.Context) error { return post(attemptCtx, buf) })
 	if err != nil && body.PreviousResponseID != "" && isMissingPreviousResponse(lastBody) {
 		recovery, recoveryErr := r.buildStateRecoveryRequest(req)
 		if recoveryErr != nil {
@@ -965,12 +988,16 @@ func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.
 		if recoveryErr != nil {
 			return nil, recoveryErr
 		}
-		err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return post(recoveryBuf) })
+		release, err = transport.RetryWithRecovery(ctx, policy, func(attemptCtx context.Context) error { return post(attemptCtx, recoveryBuf) })
 	}
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		return nil, redactResponsesError(err, exactValues...)
 	}
 	return &responsesStream{
+		release:        release,
 		sse:            sse.NewReader(resp.Body),
 		body:           resp.Body,
 		stateKey:       r.stateKey(),
@@ -1030,6 +1057,13 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 	if err := r.validateAuth(); err != nil {
 		return nil, err
 	}
+	policy, err := transport.RecoveryPolicyForContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if policy.Enabled() && transport.RecoverySessionFromContext(ctx) == nil {
+		ctx = transport.WithRecoverySession(ctx, transport.NewRecoverySession(policy))
+	}
 	body, err := r.buildResponsesRequest(req)
 	if err != nil {
 		return nil, err
@@ -1041,7 +1075,7 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 	}
 	var exactValues []string
 	var retryAfter time.Duration
-	post := func(payload []byte) ([]byte, int, error) {
+	post := func(ctx context.Context, payload []byte) ([]byte, int, error) {
 		retryAfter = 0
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", r.BaseURL+"/responses", bytes.NewReader(payload))
 		if err != nil {
@@ -1061,7 +1095,7 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 		_ = resp.Body.Close()
 		if readErr != nil {
 			bodyErr := responsesHTTPBodyReadError(resp.StatusCode, raw, readErr, exactValues...)
-			if transport.IsRetryableStatus(resp.StatusCode) {
+			if transport.IsRetryableStatus(resp.StatusCode) || policy.Enabled() && resp.StatusCode >= 500 && resp.StatusCode <= 599 {
 				bodyErr = &transport.RetryableError{Err: bodyErr, After: retryAfter}
 			}
 			return raw, resp.StatusCode, bodyErr
@@ -1070,18 +1104,19 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 	}
 	var raw []byte
 	var statusCode int
-	postWithRetry := func(payload []byte) error {
+	postWithRetry := func(ctx context.Context, payload []byte) error {
 		var postErr error
-		raw, statusCode, postErr = post(payload)
+		raw, statusCode, postErr = post(ctx, payload)
 		if postErr != nil {
 			return postErr
 		}
-		if statusCode >= 400 && transport.IsRetryableStatus(statusCode) {
+		if transport.IsRetryableStatus(statusCode) || policy.Enabled() && statusCode >= 500 && statusCode <= 599 {
 			return &transport.RetryableError{Err: responsesHTTPStatusError(statusCode, raw, exactValues...), After: retryAfter}
 		}
 		return nil
 	}
-	err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return postWithRetry(buf) })
+	release, err := transport.RetryWithRecovery(ctx, policy, func(attemptCtx context.Context) error { return postWithRetry(attemptCtx, buf) })
+	defer release()
 	if err != nil {
 		return nil, redactResponsesError(err, exactValues...)
 	}
@@ -1095,7 +1130,8 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 		if recoveryErr != nil {
 			return nil, recoveryErr
 		}
-		err = transport.RetryWithBackoff(ctx, 3, 0, func() error { return postWithRetry(recoveryBuf) })
+		release, err = transport.RetryWithRecovery(ctx, policy, func(attemptCtx context.Context) error { return postWithRetry(attemptCtx, recoveryBuf) })
+		defer release()
 		if err != nil {
 			return nil, redactResponsesError(err, exactValues...)
 		}
@@ -1219,6 +1255,33 @@ func (r *Responses) Complete(ctx context.Context, req provider.Request) (*provid
 }
 
 func (r *Responses) completeCodexStream(ctx context.Context, req provider.Request) (*provider.Response, error) {
+	policy, err := transport.RecoveryPolicyForContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	session := transport.RecoverySessionFromContext(ctx)
+	if policy.Enabled() && session == nil {
+		session = transport.NewRecoverySession(policy)
+		ctx = transport.WithRecoverySession(ctx, session)
+	}
+	for {
+		response, err := r.completeCodexStreamAttempt(ctx, req)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err == nil || session == nil || !session.RecordFailure(err) {
+			return response, err
+		}
+		// Complete is an aggregate API: no partial draft or tool can escape
+		// to its caller. Rebuild from the identical input under the same
+		// dial/SSE budget; this also covers compaction calls outside Loop.
+		if err := session.WaitRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (r *Responses) completeCodexStreamAttempt(ctx context.Context, req provider.Request) (*provider.Response, error) {
 	stream, err := r.Stream(ctx, req)
 	if err != nil {
 		return nil, err

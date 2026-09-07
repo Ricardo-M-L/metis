@@ -105,6 +105,15 @@ type visionOverrideProvider struct {
 }
 
 func (p visionOverrideProvider) SupportsVision() bool { return p.supportsVision }
+
+// ManagesRecoverySession forwards only an explicit true marker. Unlike
+// capability-presence interfaces, its consumer checks this boolean, so the
+// wrapper does not accidentally claim provider-owned retries for other SDKs.
+func (p visionOverrideProvider) ManagesRecoverySession() bool {
+	managed, ok := p.Provider.(interface{ ManagesRecoverySession() bool })
+	return ok && managed.ManagesRecoverySession()
+}
+
 func (p visionOverrideProvider) VisionCapability() llm.VisionCapability {
 	if p.supportsVision {
 		return llm.VisionSupported

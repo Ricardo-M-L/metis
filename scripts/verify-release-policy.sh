@@ -14,6 +14,9 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 stage_workflow=$repo_root/.github/workflows/release.yml
 verify_workflow=$repo_root/.github/workflows/release-published.yml
+cli_workflow=$repo_root/.github/workflows/release-cli-publish.yml
+cli_registry=$repo_root/.github/cli-only-releases.json
+release_contract=$repo_root/scripts/release_contract.py
 package_script=$repo_root/scripts/package-macos-signed.sh
 
 provider_token_pattern='[0-9a-fA-F]{32}\.[A-Za-z0-9_-]{16,}'
@@ -43,6 +46,9 @@ esac
 
 [ -f "$stage_workflow" ] || fail "missing release.yml"
 [ -f "$verify_workflow" ] || fail "missing release-published.yml"
+[ -f "$cli_workflow" ] || fail "missing release-cli-publish.yml"
+[ -f "$cli_registry" ] || fail "missing CLI-only release registry"
+[ -f "$release_contract" ] || fail "missing release contract verifier"
 [ -f "$package_script" ] || fail "missing package-macos-signed.sh"
 [ -x "$package_script" ] || fail "package-macos-signed.sh is not executable"
 
@@ -125,4 +131,35 @@ grep -q 'bridge_app=build/bin/metis-desktop.app' "$stage_workflow" || fail "v0.4
 grep -q 'app=unpacked/metis-desktop.app' "$verify_workflow" || fail "published updater ZIP bridge is not verified"
 grep -q 'CFBundleDisplayName).*METIS' "$verify_workflow" || fail "published macOS display name is not verified as METIS"
 
-printf '%s\n' 'verify-release-policy: immutable draft and published-release gates verified'
+grep -Fq "needs.build.outputs.channel == 'stable'" "$stage_workflow" || \
+	fail "Desktop build is not restricted to the full stable channel"
+grep -Fq "needs.inventory.outputs.channel == 'stable'" "$verify_workflow" || \
+	fail "Apple trust verification is not retained for the full stable channel"
+grep -Fq 'release_contract.py verify' "$verify_workflow" || \
+	fail "published release does not verify the registered channel schema"
+grep -Fq -- '--registry source/.github/cli-only-releases.json' "$cli_workflow" || \
+	fail "CLI publication does not cross-check tagged registry"
+grep -Fq 'cmp plan.json source-plan.json' "$cli_workflow" || \
+	fail "CLI publication may disagree with tagged registry"
+grep -Fq -- '-F draft=false -F prerelease=true -f make_latest=false' "$cli_workflow" || \
+	fail "CLI publication must explicitly remain prerelease and not latest"
+grep -Fq -- '--metadata draft-current.json --latest latest-current.json --phase draft --dist source/dist' "$cli_workflow" || \
+	fail "CLI publication does not recheck immutable draft/assets immediately before publish"
+grep -Fq -- 'test "$(jq -r .tag_name latest-current.json)" = "$(jq -r .tag_name latest-after.json)"' "$cli_workflow" || \
+	fail "CLI publication does not verify latest was unchanged"
+grep -Fq 'Anonymous published CLI install (Windows)' "$cli_workflow" || \
+	fail "CLI publication omits Windows anonymous installation smoke"
+grep -Fq 'Anonymous published CLI install (Linux)' "$cli_workflow" || \
+	fail "CLI publication omits Linux anonymous installation smoke"
+grep -Fq 'build_run_id:' "$cli_workflow" || fail "CLI publication does not require a reviewed build run"
+grep -Fq 'actions: read' "$cli_workflow" || fail "CLI publication cannot inspect trusted build provenance"
+grep -Fq 'actions/artifacts/$ARTIFACT_ID/zip' "$cli_workflow" || \
+	fail "CLI publication does not download the verified immutable artifact ID"
+grep -Fq -- '--workflow-dist verified-build --dist source/dist' "$cli_workflow" || \
+	fail "CLI publication does not compare all draft bytes to the verified build"
+python3 "$release_contract" plan --tag v0.0.0 --registry "$cli_registry" >/dev/null || \
+	fail "invalid trusted CLI-only registry"
+python3 -B -m unittest discover -s "$script_dir" -p 'test_release_contract.py' || \
+	fail "release contract regression tests failed"
+
+printf '%s\n' 'verify-release-policy: immutable stable/CLI-preview draft and published-release gates verified'

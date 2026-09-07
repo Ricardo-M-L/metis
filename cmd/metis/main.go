@@ -404,6 +404,7 @@ Flags (chat / run):
       --max-iter <n>    Iteration cap per turn (default 100; overrides [session] max_iterations in config.toml)
       --max-budget-usd <x>  Stop the session once cumulative LLM spend reaches x USD (0 = unlimited; sub-agents draw from the same pool)
       --output-schema <file>  (run) Constrain the final reply to a JSON Schema — validated locally, 2 correction retries, then exit 11
+      --preflight-only  (run) Validate runtime and trusted verification; print capabilities without running the model
       --add-dir <path>  Add a directory to the agent's accessible scope (repeatable)
       --agent <name>    Load an agent profile from ~/.metis/agents/<name>.md
       --worktree <slug> Spawn chat in a fresh git worktree with this slug
@@ -990,7 +991,8 @@ type cliFlags struct {
 	// that turn. Designed for offline scrape — feeds the eval runner
 	// and ad-hoc spend analysis without forcing the user to parse
 	// stderr `[metrics]` lines or hook into the event stream.
-	metricsLog string
+	metricsLog    string
+	preflightOnly bool // run: validate and report capabilities before any model turn
 }
 
 // shouldEnableAutoMemory centralizes the product policy so every startup path
@@ -1000,7 +1002,7 @@ type cliFlags struct {
 // legacy --auto-memory flag; this gives launchers and users a reliable kill
 // switch without introducing a second CLI flag.
 func shouldEnableAutoMemory(flags *cliFlags, lookupEnv func(string) (string, bool)) bool {
-	if flags == nil {
+	if flags == nil || flags.preflightOnly {
 		return false
 	}
 	if lookupEnv != nil {
@@ -1146,6 +1148,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 		"blocklist: hide these tools from the model. Supports MCP server prefix: \"mcp__office-word\" mutes the whole server; \"mcp__\" mutes all MCP tools.")
 	f.StringVar(&out.metricsLog, "metrics-log", "",
 		"append per-turn JSONL metrics to <path> (turn_number, tokens.{in,out,cache_read,cache_create}, tool_calls, tool_errors, duration_ms, stop_reason, nudges_fired, rescue_fired)")
+	f.BoolVar(&out.preflightOnly, "preflight-only", false, "run: validate runtime and verification capabilities without a model turn")
 	if err := f.Parse(args); err != nil {
 		return nil, nil, err
 	}
@@ -2408,14 +2411,25 @@ func cmdChat(ctx context.Context, args []string) error {
 }
 
 func cmdRun(ctx context.Context, args []string) (returnErr error) {
+	invocationStarted := time.Now()
 	flags, rest, err := parseFlags(args)
 	if err != nil {
 		return err
 	}
-	if len(rest) == 0 {
+	if len(rest) == 0 && !flags.preflightOnly {
 		return errors.New("run: prompt is required")
 	}
+	if flags.preflightOnly {
+		flags.noAuthWizard = true
+	}
 	prompt := joinSpaces(rest)
+	verificationConfig, err := runVerificationFromEnv()
+	if err != nil {
+		return err
+	}
+	if _, err := transport.RecoveryPolicyFromEnv(); err != nil {
+		return err
+	}
 	// One opt-in budget covers setup, the loop, descendants, and schema
 	// retries. The default/0 imposes no deadline, but still inherits callers.
 	ctx, cancelRunBudget, err := timebudget.WithEnv(ctx, "METIS_RUN_MAX_SECONDS")
@@ -2448,8 +2462,18 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	// (and the dollars). Tool-use turns are never cached so cache
 	// hits are always safe to replay verbatim.
 	var cacheKey string
+	if err := wireRunVerification(ctx, rt, verificationConfig, invocationStarted); err != nil {
+		return err
+	}
+	if flags.preflightOnly {
+		return json.NewEncoder(os.Stdout).Encode(runPreflightReport(rt, verificationConfig))
+	}
 	cacheTTL := rtpkg.ParseRunCacheTTL(flags.runCacheTTL)
 	cacheRequested := flags.runCache || os.Getenv("METIS_RUN_CACHE") == "1"
+	if verificationConfig != nil && cacheRequested {
+		fmt.Fprintln(os.Stderr, "[cache] disabled with machine verification (current-source evidence cannot be replayed)")
+		cacheRequested = false
+	}
 	if shouldUseRunCache(cacheRequested, flags.outputSchema) {
 		cacheKey = rtpkg.RunCacheKey(rt.model, rt.cfg.Provider.Default, rt.loop.System, prompt)
 		if hit, _ := rtpkg.LookupRunCache(cacheKey); hit != nil {

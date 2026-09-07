@@ -1,0 +1,167 @@
+name: Publish CLI Prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Reviewed registered CLI-only draft tag (e.g. v0.4.49); never stable/latest'
+        required: true
+        type: string
+      build_run_id:
+        description: 'Successful Release workflow run ID whose head SHA equals this tag commit'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify complete CLI draft and publish once
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          path: source
+
+      - name: Verify registry, immutable draft, checksums, archive layout, and CLI
+        id: provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s release-tools/scripts -p 'test_release_contract.py' -v
+          python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > plan.json
+          test "$(jq -r .channel plan.json)" = cli-only-prerelease
+          python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
+            --registry source/.github/cli-only-releases.json > source-plan.json
+          cmp plan.json source-plan.json
+          [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          source_sha=$(git -C source rev-parse HEAD)
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > build-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml" > release-workflow.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/artifacts?per_page=100" > build-artifacts.json
+          python3 release-tools/scripts/release_contract.py provenance --tag "$TAG" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$BUILD_RUN_ID" --source-sha "$source_sha" \
+            --run build-run.json --workflow release-workflow.json --artifacts build-artifacts.json > provenance.json
+          echo "artifact_id=$(jq -r .artifact_id provenance.json)" >> "$GITHUB_OUTPUT"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft.json
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-before.json
+          python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
+            --metadata draft.json --latest latest-before.json --phase draft
+          mkdir source/dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir source/dist
+          python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
+            --metadata draft.json --latest latest-before.json --phase draft --dist source/dist
+
+      - name: Download immutable verified Release build artifact by ID
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_ID: ${{ steps.provenance.outputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > verified-build.zip
+          # Reject extra entries and traversal paths before extracting this
+          # immutable GitHub artifact; the exact 12 root names are predeclared.
+          unzip -Z1 verified-build.zip | LC_ALL=C sort > build-zip-entries.txt
+          jq -r '.assets[]' plan.json | LC_ALL=C sort > expected-zip-entries.txt
+          diff -u expected-zip-entries.txt build-zip-entries.txt
+          mkdir verified-build
+          unzip -qq verified-build.zip -d verified-build
+
+      - name: Compare all draft bytes to exact-source successful build before execution
+        env:
+          TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          source_sha=$(git -C source rev-parse HEAD)
+          python3 release-tools/scripts/release_contract.py provenance --tag "$TAG" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$BUILD_RUN_ID" --source-sha "$source_sha" \
+            --run build-run.json --workflow release-workflow.json --artifacts build-artifacts.json \
+            --workflow-dist verified-build --dist source/dist > provenance-verified.json
+          release-tools/scripts/verify-dist.sh --repo source --tag "$TAG"
+
+      - name: Publish registered CLI preview without changing latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          # Re-read under the same concurrency lock immediately before publish.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft-current.json
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-current.json
+          python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
+            --metadata draft-current.json --latest latest-current.json --phase draft --dist source/dist
+          # Asset metadata must still be the exact version we downloaded.
+          asset_identity='{id, tag_name, assets: [.assets[] | {id, name, size, state, updated_at, digest}]}'
+          diff -u <(jq -S "$asset_identity" draft.json) \
+            <(jq -S "$asset_identity" draft-current.json)
+          release_id=$(jq -r .id draft-current.json)
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false -F prerelease=true -f make_latest=false > published.json
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-after.json
+          test "$(jq -r .tag_name latest-current.json)" = "$(jq -r .tag_name latest-after.json)"
+          python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
+            --metadata published.json --latest latest-after.json --dist source/dist
+          {
+            echo "Published opt-in CLI prerelease $TAG; stable latest is unchanged."
+            echo "All 12 asset bytes match successful Release build run $BUILD_RUN_ID, artifact $(jq -r .artifact_id provenance-verified.json)."
+            echo "No Desktop assets were released. Run Verify Published Release for all-platform anonymous installer checks."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  install-smoke-unix:
+    name: Anonymous published CLI install (Linux)
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install pinned preview without a GitHub token
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          install_dir="$RUNNER_TEMP/metis-preview-bin"
+          env -u METIS_GITHUB_TOKEN -u GITHUB_TOKEN \
+            METIS_VERSION="$TAG" METIS_INSTALL_DIR="$install_dir" bash install/install.sh
+          test "$("$install_dir/metis" version | awk 'NR == 1 { print $1 }')" = "$TAG"
+
+  install-smoke-windows:
+    name: Anonymous published CLI install (Windows)
+    needs: publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install pinned preview without a GitHub token
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          Remove-Item Env:METIS_GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          $installDir = Join-Path $env:RUNNER_TEMP "metis-preview-bin"
+          & ./install/install.ps1 -Version $env:TAG -InstallDir $installDir
+          $output = @(& (Join-Path $installDir "metis.exe") version)
+          if ($LASTEXITCODE -ne 0) { throw "installed metis.exe version failed" }
+          if (($output[0] -split '\s+')[0] -ne $env:TAG) { throw "installed CLI version mismatch" }

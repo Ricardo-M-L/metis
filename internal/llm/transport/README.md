@@ -53,6 +53,52 @@ honors `Retry-After` up to 60 seconds. Exhaustion returns a typed
 `RetryExhaustedError`, preventing an outer agent loop from multiplying the
 same provider retry budget.
 
+Long-task recovery is **opt-in**. The Responses adapter and the agent's stream
+recovery gate share one `RecoverySession` per logical model response:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `METIS_RECOVERY_MAX_SECONDS` | `0` | Recovery disabled; positive integer enables a fault window measured from the first observed transient failure |
+| `METIS_RECOVERY_MAX_ATTEMPTS` | `30` | Responses: total HTTP attempts for that logical response, including the initial request, not extra rounds of three |
+| `METIS_RECOVERY_MAX_BACKOFF_SECONDS` | `30` | Positive exponential-backoff and `Retry-After` cap |
+
+Invalid, negative, fractional and overflowing values fail rather than silently
+falling back. Attempt/backoff values must be positive even when explicitly
+configured alongside a disabled window. Subsequent credential refresh, dial,
+HTTP work and backoff all consume the window. The initial failing request is
+still governed by the ordinary HTTP timeout until a fault is observed. Parent
+cancellation and task deadlines always win.
+
+Typed network failures, 429 and 5xx can recover. Known quota failures and
+400/401/403 are terminal, including a truncated error body after an authoritative
+4xx status. Header success stops the dial-recovery timer so a healthy live SSE
+stream is not killed by that timer; it does **not** reset the shared attempts or
+first-fault timestamp. Another interruption of that logical response uses only
+the remaining budget. Its normal HTTP stream timeout still applies.
+
+The agent discards interrupted drafts before replaying the same model request.
+It never executes a tool from a failed stream, nor reruns a previously completed
+tool to retry the following model response. Already displayed text deltas may
+appear again after the explicit discard notification. This is not an upstream
+exactly-once inference guarantee: ambiguous HTTP failures may incur extra model
+usage. Providers with their own recovery must forward `ManagesRecoverySession`;
+other providers returning an already-exhausted error retain that terminal
+boundary. Successful streaming callers release the attempt context on Close.
+
+The strict individual-HTTP-attempt cap is currently guaranteed for **Responses
+(including OpenAI Codex)**. For non-managed providers the agent wrapper counts
+`Provider.Stream` calls; their SDK/internal three-attempt behavior is unchanged
+and can issue more than one HTTP request per outer call. This work does not
+claim a universal per-HTTP cap or universal long-window recovery for those
+other providers. Their existing exhausted error does not receive another outer
+retry round.
+
+The optional `WithRecoveryObserver` callback and debug log expose only numeric
+attempt/window/delay fields and state labels, never payloads or credentials.
+Agent UI recovery notices are non-blocking, best-effort telemetry so a full
+event channel cannot extend the fault window. Required tool/permission events
+retain their existing delivery semantics.
+
 Overflow recovery is also provider-driven: provider code may parse a
 recognized context-length error with `ParseContextOverflow`, compute one
 smaller completion budget with `ComputeAdjustedMaxTokens`, and retry once. It

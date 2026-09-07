@@ -40,8 +40,9 @@ const (
 // decide whether the dispatch contract should fire. It lives on the Loop for
 // iteration-to-iteration continuity and is reset at every Run boundary.
 type contractTracker struct {
-	mainWrites           int // Write + Edit + MultiEdit tool_use counts
-	agentDispatches      int // Agent tool_use counts (any subagent_type)
+	verifyUnavailable    bool // runtime's filtered registry cannot dispatch Agent, or trusted checks replace it
+	mainWrites           int  // Write + Edit + MultiEdit tool_use counts
+	agentDispatches      int  // Agent tool_use counts (any subagent_type)
 	implementationAgents int
 	mutatedFiles         map[string]struct{}
 	validationObserved   bool
@@ -1022,7 +1023,7 @@ func (ct *contractTracker) thresholdMet() bool {
 // otherwise. Marks reminderFired on a non-empty return so the
 // caller doesn't need to track that bit separately.
 func (ct *contractTracker) shouldFireMidTurnReminder() string {
-	if contractDisabled() {
+	if contractDisabled() || ct.verifyUnavailable {
 		return ""
 	}
 	if !ct.thresholdMet() || ct.verifyDispatched || ct.reminderFired {
@@ -1066,7 +1067,7 @@ func (ct *contractTracker) shouldFireMidTurnReminder() string {
 //
 // Increments gateAttempts on a non-empty return so the cap holds.
 func (ct *contractTracker) shouldGateEnd(assistantText string) string {
-	if contractDisabled() {
+	if contractDisabled() || ct.verifyUnavailable {
 		return ""
 	}
 	// Override applies to BOTH the dispatch-gate (no verify yet) and
@@ -1166,6 +1167,9 @@ func (ct *contractTracker) wasOverridden(assistantText string) bool {
 // but returned a non-PASS verdict. Keeping this decision beside the gate state
 // prevents the Loop's audit event from silently missing verdict overrides.
 func (ct *contractTracker) overrideBypassesGate(assistantText string) bool {
+	if ct.verifyUnavailable {
+		return false
+	}
 	if !ct.wasOverridden(assistantText) {
 		return false
 	}

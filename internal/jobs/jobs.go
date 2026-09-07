@@ -785,6 +785,35 @@ func (r *Registry) Stop(id string, grace time.Duration) error {
 	return nil
 }
 
+// StopAndWait stops one owned job and joins its process/tree cleanup. Unlike
+// ResetAndWait it neither clears the registry nor affects unrelated jobs.
+// Context expiration limits the join, not cleanup: the registered kill stages
+// keep running after a caller stops waiting.
+func (r *Registry) StopAndWait(ctx context.Context, id string, grace time.Duration) error {
+	r.mu.RLock()
+	j, ok := r.jobs[id]
+	var done <-chan struct{}
+	if ok {
+		done = j.done
+	}
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("jobs: unknown id %q", id)
+	}
+	if err := r.Stop(id, grace); err != nil {
+		return err
+	}
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
 // resetProcess carries one detached job's lifecycle edge plus the replacement
 // stage registered by the generation cut. Superseded stages remain tracked by
 // the Job until their goroutines exit; requesting cancellation never removes

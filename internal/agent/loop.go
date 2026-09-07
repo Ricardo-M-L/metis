@@ -483,6 +483,10 @@ type Loop struct {
 	// gates mid-turn reminder + end-of-turn block when the model has
 	// done substantial work without spawning a verify subagent.
 	contract contractTracker
+
+	// MachineVerification optionally replaces prompt-only verifier dispatch with
+	// trusted, source-bound host checks. Configure before Run; nil is the default.
+	MachineVerification *MachineVerificationPolicy
 }
 
 type distillJob struct {
@@ -1605,6 +1609,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	}()
 
 	specs := l.toolSpecs()
+	l.contract.verifyUnavailable = !l.verifierDispatchAvailable()
+	verificationAttempts := 0
 	graceUsed := 0
 	emptyStopRescued := false // see empty_stop_rescue.go — at most one rescue per turn
 	textToolCallRescued := false
@@ -1615,6 +1621,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	progress := newProgressDetector()           // see progress_detector.go
 	stuckDet := &stuckDetector{}                // see stuck_detector.go — Phase C-mini
 	awaitedBackgroundJobs := make(map[string]struct{})
+	finiteJobs := &finiteJobTracker{pool: l.Jobs}
+	ctx = context.WithValue(ctx, finiteJobTrackerContextKey{}, finiteJobs)
+	defer func() {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancelCleanup()
+		if cleanupErr := finiteJobs.cleanup(cleanupCtx); cleanupErr != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("finite background job cleanup: %w", cleanupErr))
+		}
+	}()
 	runIter := 0 // MaxIters is per Run, not cumulative session history
 
 	// 2026-05-23: cumulative output tokens this Run() so the iter
@@ -1751,7 +1766,13 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			provider = l.Provider
 		}
 
-		stream, err := provider.Stream(ctx, req)
+		recoveryCtx, recoverySession, err := newRequestRecovery(ctx, out)
+		if err != nil {
+			l.Hooks.EmitError(ctx, tc, err)
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
+		stream, err := openStreamWithRecovery(recoveryCtx, provider, req, recoverySession)
 		if err != nil {
 			// Classify before deciding the recovery path. Mirrors
 			// hermes' error_classifier — the loop now picks the
@@ -1766,7 +1787,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					if provider == nil {
 						provider = l.Provider
 					}
-					stream, err = provider.Stream(ctx, req)
+					stream, err = openStreamWithRecovery(recoveryCtx, provider, req, recoverySession)
 				}
 			case RecoveryFailUser:
 				// Surface a clean, actionable message for billing /
@@ -1781,8 +1802,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				// into a second immediate three-attempt round. Custom providers
 				// that return a plain transient error still retain this one
 				// loop-level recovery attempt.
-				if !transport.IsRetryExhausted(err) {
-					stream, err = provider.Stream(ctx, req)
+				if recoverySession == nil && !transport.IsRetryExhausted(err) {
+					stream, err = openStreamWithRecovery(recoveryCtx, provider, req, recoverySession)
 				}
 			}
 			if err != nil {
@@ -1791,8 +1812,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				return err
 			}
 		}
-		assistant, stop, usage, err := l.consumeStream(ctx, stream, out)
-		stream.Close()
+		assistant, stop, usage, err := l.consumeStreamWithRecovery(recoveryCtx, provider, req, stream, out, recoverySession)
 		if err != nil {
 			if len(assistant) > 0 {
 				for i := range assistant {
@@ -2071,10 +2091,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				}
 			}
 
-			// Bash moves deliberate delays out of the foreground and marks only
-			// those jobs as await_completion. If the model ends by saying it is
-			// waiting, stay inside this Run until the matching completion event
-			// arrives, inject it, and re-enter the model for a real final answer.
+			// Bash marks deliberate delays and explicitly awaited finite jobs as
+			// await_completion. Keep this Run alive until their real completion
+			// events arrive, then re-enter the model with their exit/output evidence.
 			// Long-lived servers/watchers are unmarked and never hold the turn.
 			if len(awaitedBackgroundJobs) > 0 {
 				l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
@@ -2106,6 +2125,47 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					})
 					continue
 				}
+			}
+
+			if reason, detail := finiteJobs.completionStatus(); reason != "" {
+				stopReason = reason
+				emit(ctx, out, Event{Kind: EventInfo, Info: "[required background job] " + detail})
+				l.Hooks.EmitLoopEnd(ctx, tc, reason)
+				emit(ctx, out, Event{Kind: EventLoopDone, StopReason: reason})
+				return nil
+			}
+
+			// An opt-in host verifier owns acceptance, independently of model text,
+			// model-written results.json, and the prompt-only contract escape hatch.
+			if policy := l.MachineVerification; policy != nil {
+				verifyCtx := ctx
+				cancelVerify := func() {}
+				if !turnDeadline.IsZero() {
+					verifyCtx, cancelVerify = context.WithDeadlineCause(ctx, turnDeadline, errTurnWallClockDeadline)
+				}
+				reason, detail, verifyErr := policy.check(verifyCtx, assistantText(assistant))
+				cancelVerify()
+				if verifyErr != nil {
+					if errors.Is(verifyErr, errTurnWallClockDeadline) {
+						continue
+					}
+					stopReason = "error"
+					return verifyErr
+				}
+				if reason != "" {
+					if reason == "environment_blocked" || verificationAttempts >= policy.maxAttempts() || strings.Contains(assistantText(assistant), contractOverridePhrase) || machineVerificationIncompleteRequested(assistantText(assistant)) {
+						stopReason = reason
+						emit(ctx, out, Event{Kind: EventInfo, Info: "[machine verification] " + detail})
+						l.Hooks.EmitLoopEnd(ctx, tc, reason)
+						emit(ctx, out, Event{Kind: EventLoopDone, StopReason: reason})
+						return nil
+					}
+					verificationAttempts++
+					l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
+					l.appendInjectedMessage(fmt.Sprintf("<system-reminder>\nMACHINE VERIFICATION NOT PASSED (%d/%d corrective attempts): %s\nAddress the failing or missing checks, then request completion again. Do not claim acceptance passed. A model override cannot produce a pass. To stop honestly without a pass, write ACCEPTANCE_INCOMPLETE: followed by the blocker.\n</system-reminder>", verificationAttempts, policy.maxAttempts(), detail))
+					continue
+				}
+				emit(ctx, out, Event{Kind: EventInfo, Info: "[machine verification] required source-bound checks passed"})
 			}
 
 			// Close acceptance atomically with the last pending check. If a
@@ -2280,6 +2340,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				results = orderedBatchResults(originalToolUses, resultSlots, resultFilled)
 				l.contract.observeToolUses(contractToolUses)
 				l.contract.observeToolResults(contractToolUses, results)
+				finiteJobs.record(results, awaitedBackgroundJobs)
 				queueContractReminder()
 				if steer := l.drainSteer(); steer != "" {
 					results = append(results, llm.ContentBlock{
@@ -2439,6 +2500,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			results := orderedBatchResults(originalToolUses, resultSlots, resultFilled)
 			l.contract.observeToolUses(contractToolUses)
 			l.contract.observeToolResults(contractToolUses, results)
+			finiteJobs.record(results, awaitedBackgroundJobs)
 			queueContractReminder()
 			if steer := l.drainSteer(); steer != "" {
 				results = append(results, llm.ContentBlock{
@@ -2474,8 +2536,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		}
 		l.contract.observeToolUses(contractToolUses)
 		l.contract.observeToolResults(contractToolUses, results)
+		finiteJobs.record(results, awaitedBackgroundJobs)
 		queueContractReminder()
-		recordAwaitedBackgroundJobs(results, awaitedBackgroundJobs)
 		// Sliding-window signature loop detection (crush parity).
 		// Feed (toolUses, results) into the detector so it can pair
 		// each call with its result and SHA-256 the batch. Triggers

@@ -71,7 +71,7 @@ func (Bash) Name() string { return "Bash" }
 // model gets at least one tool-redirect hint even when the full
 // `# Tool selection` table from base.md is skipped.
 func (Bash) ShortDescription() string {
-	return `Execute a shell command. stdout+stderr merge, truncated at a byte cap; cwd persists across calls in a turn, env vars do NOT. Prefer dedicated tools where possible (Read NOT cat, Glob NOT find, Grep NOT grep -r, Edit NOT sed). Never sleep or poll for completion; use run_in_background=true and wait for its notification.`
+	return `Execute a shell command. stdout+stderr merge, truncated at a byte cap; cwd persists across calls in a turn, env vars do NOT. Prefer dedicated tools where possible (Read NOT cat, Glob NOT find, Grep NOT grep -r, Edit NOT sed). Never sleep or poll for completion; use run_in_background=true and wait for its notification. Mark finite acceptance checks required_for_completion=true; leave dev servers unmarked.`
 }
 
 func (Bash) Description() string {
@@ -108,6 +108,8 @@ Safety:
 
 Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and a completion notification later. Continue other useful work instead of sleeping or polling. Use Output only when interim logs are actually needed, and Kill to stop the job. A leading delay of two seconds or more is automatically moved to the background so it cannot block the turn.
 
+Finite completion checks: use await_completion=true when this task must wait for a finite background command to exit. Use required_for_completion=true for acceptance checks, test suites, or browser endurance checks that must also succeed before the task can be considered complete. required_for_completion implies await_completion, and either flag implies run_in_background. These finite jobs belong to the current task and are stopped if it is cancelled or reaches its deadline. Do not mark persistent dev servers, watchers, or log tails: their default background lifetime is unchanged.
+
 Always pass description: a 5-10 word phrase like "run tests" or "git status before commit". It's shown in the audit trail and helps the user see why each shell call exists.`
 }
 func (Bash) InputSchema() map[string]any {
@@ -130,6 +132,14 @@ func (Bash) InputSchema() map[string]any {
 			"run_in_background": map[string]any{
 				"type":        "boolean",
 				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately and sends a completion notification. Continue other work; use Output only for needed interim logs and Kill to stop.",
+			},
+			"await_completion": map[string]any{
+				"type":        "boolean",
+				"description": "Wait for this finite command to exit before ending the task; implies run_in_background. The job is stopped when the task exits or is cancelled. Default false; do not use for persistent dev servers or watchers.",
+			},
+			"required_for_completion": map[string]any{
+				"type":        "boolean",
+				"description": "Require this finite acceptance check or test to complete successfully before the task is considered complete. Implies await_completion and run_in_background. Default false; do not use for persistent services.",
 			},
 		},
 	}
@@ -447,6 +457,10 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	if v, ok := in["run_in_background"].(bool); ok {
 		wantBackground = v
 	}
+	awaitCompletion, _ := in["await_completion"].(bool)
+	requiredForCompletion, _ := in["required_for_completion"].(bool)
+	awaitCompletion = awaitCompletion || requiredForCompletion
+	wantBackground = wantBackground || awaitCompletion
 
 	// A deliberate delay is valid shell semantics, but it must not occupy the
 	// foreground agent turn. Move it to the same event-driven job path used by
@@ -461,7 +475,7 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 					IsError: true,
 				}, nil
 			}
-			res, err := b.executeBackground(ctx, cmd)
+			res, err := b.executeBackground(ctx, cmd, false)
 			if err == nil && res != nil && !res.IsError {
 				if res.Presentation == nil {
 					res.Presentation = map[string]any{}
@@ -478,7 +492,24 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// *exec.Cmd here (so the env / sandbox policy is applied
 	// uniformly) — Spawn just adopts what we built.
 	if wantBackground {
-		return b.executeBackground(ctx, cmd)
+		var completion []bool
+		if awaitCompletion {
+			completion = []bool{requiredForCompletion}
+		}
+		res, err := b.executeBackground(ctx, cmd, completion...)
+		if err == nil && res != nil && !res.IsError && awaitCompletion {
+			// The loop records these flags alongside this exact job ID. It
+			// owns finite-job completion and Run-exit cleanup; Execute's
+			// tool-call context is too short-lived to own the job itself.
+			res.Presentation["await_completion"] = true
+			if requiredForCompletion {
+				res.Presentation["required_for_completion"] = true
+				res.Output += "\nThis finite job is required for task completion. Wait for its successful exit and review its evidence before claiming completion."
+			} else {
+				res.Output += "\nThe task will await this finite job's completion notification before ending."
+			}
+		}
+		return res, err
 	}
 
 	return b.executeForegroundWithBgFallback(ctx, cmd, timeout)
@@ -702,18 +733,18 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 // foreground reply is just "running with job_id=X" and the model
 // uses Output / Kill to interact further. Used for the
 // explicit run_in_background=true path.
-func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Result, error) {
+func (b Bash) executeBackground(ctx context.Context, cmdStr string, completion ...bool) (*tools.Result, error) {
 	if b.Jobs == nil {
 		return &tools.Result{
 			Output:  "[run_in_background] not available: jobs registry not wired (build error?)",
 			IsError: true,
 		}, nil
 	}
-	// Fresh context — background jobs don't share the Execute ctx
-	// (which gets canceled when the foreground turn ends). The job
-	// outlives the turn intentionally.
+	// Fresh context — background jobs must not share the short-lived Execute
+	// tool context. Ordinary services outlive the turn intentionally; the
+	// agent Run separately owns and stops finite await/required jobs using
+	// their exact job IDs when the Run exits, is cancelled, or hits a deadline.
 	bgCtx, cancel := context.WithCancel(context.Background())
-	_ = ctx // intentionally not used; see comment above
 
 	shell := b.settings.Shell
 	if shell == "" {
@@ -749,11 +780,16 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string) (*tools.Resu
 		return nil
 	}
 
-	jb, err := b.Jobs.Spawn(jobs.SpawnArgs{
-		Command: cmdStr,
-		Cmd:     exe,
-		Cancel:  cancel,
-	})
+	spawn := func() (*jobs.Job, error) {
+		return b.Jobs.Spawn(jobs.SpawnArgs{Command: cmdStr, Cmd: exe, Cancel: cancel})
+	}
+	var jb *jobs.Job
+	var err error
+	if len(completion) > 0 {
+		jb, err = agent.StartFiniteBackgroundJob(ctx, b.Jobs, completion[0], spawn)
+	} else {
+		jb, err = spawn()
+	}
 	if err != nil {
 		cancel()
 		return nil, err

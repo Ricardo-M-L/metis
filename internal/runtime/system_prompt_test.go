@@ -24,6 +24,9 @@ func TestAssembleSystemPrompt_NoFileAddsEnvBlock(t *testing.T) {
 	if !strings.Contains(got, "Local date and time:") || !strings.Contains(got, "Local timezone:") || !strings.Contains(got, "UTC") {
 		t.Errorf("env block must expose the detected local time and UTC offset; got %q", got)
 	}
+	if !strings.Contains(got, "Session startup snapshot; not a live clock") {
+		t.Error("static environment time must not be presented as a live task clock")
+	}
 }
 
 func TestFormatUTCOffset(t *testing.T) {

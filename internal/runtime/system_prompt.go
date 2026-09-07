@@ -658,6 +658,7 @@ func buildEnvBlockFor(workingDirectory string) string {
 
 	var b strings.Builder
 	b.WriteString("<env>\n")
+	b.WriteString("Session startup snapshot; not a live clock. Read actual current time when evaluating elapsed time or task deadlines.\n")
 	if cwd != "" {
 		fmt.Fprintf(&b, "Working directory: %s\n", cwd)
 	}

@@ -40,6 +40,8 @@ func IsIncompleteStopReason(stopReason string) bool {
 		"pause_turn",
 		"other",
 		"empty_final_answer",
+		"acceptance_incomplete",
+		"environment_blocked",
 		"provider_protocol_error":
 		return true
 	default:

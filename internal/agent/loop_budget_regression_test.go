@@ -460,6 +460,7 @@ func TestLoopRun_ContractTextReentryEmitsAssistantBoundary(t *testing.T) {
 	}}
 	registry := tools.NewRegistry()
 	registry.Register(contractBashTool{})
+	registry.Register(contractAvailableAgentTool{})
 	loop := NewLoop(provider, registry, permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
 	loop.AppendUser("finish")
 	out := make(chan Event, 64)

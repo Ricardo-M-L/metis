@@ -7,8 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.49] - 2026-09-07
+
+This version is an opt-in **CLI-only GitHub prerelease**, not the stable/latest
+release. It includes six CLI platforms and SHA-256 sidecars; no Desktop binary
+is published. Desktop version declarations remain synchronized for source
+builds, not as a claim that a signed Desktop release exists.
+
+### Added
+
+- Added source-bound machine verification for headless long tasks, a trusted
+  isolated-browser check interface, a real task clock, and zero-model preflight
+  diagnostics. Required checks fail closed instead of accepting model-authored
+  completion claims.
+- Added bounded transient Responses/Codex network recovery with explicit
+  request/time budgets, without replaying already executed tools.
+- Added an explicit CLI-only release registry and draft-only, non-latest
+  prerelease publication. Unregistered stable releases still require all 20
+  assets and the existing Apple signing/notarization/Gatekeeper gates.
+
 ### Fixed
 
+- Preserved required finite background-job completion and bounded retry
+  diagnostics before allowing a successful headless exit.
 - Matched CLI and Desktop model selection to provider authentication: one
   ChatGPT login now exposes the complete curated GPT/Codex subscription
   catalog, providers without usable credentials stay hidden, and Codex model

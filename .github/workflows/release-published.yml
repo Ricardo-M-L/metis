@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Published stable release tag to verify
+        description: Published vX.Y.Z release tag to verify (registered CLI preview or full stable)
         required: true
         type: string
 
@@ -17,8 +17,21 @@ jobs:
   inventory:
     name: Verify immutable asset inventory
     runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.inventory.outputs.channel }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          path: source
+
       - name: Download and verify all release assets
+        id: inventory
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
@@ -29,47 +42,35 @@ jobs:
             exit 1
           fi
 
-          mkdir dist
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
-
-          expected_assets=(
-            metis-darwin-amd64.tar.gz
-            metis-darwin-amd64.tar.gz.sha256
-            metis-darwin-arm64.tar.gz
-            metis-darwin-arm64.tar.gz.sha256
-            metis-desktop-darwin-universal.dmg
-            metis-desktop-darwin-universal.dmg.sha256
-            metis-desktop-darwin-universal.zip
-            metis-desktop-darwin-universal.zip.sha256
-            metis-desktop-linux-amd64.tar.gz
-            metis-desktop-linux-amd64.tar.gz.sha256
-            metis-desktop-windows-amd64.zip
-            metis-desktop-windows-amd64.zip.sha256
-            metis-linux-amd64.tar.gz
-            metis-linux-amd64.tar.gz.sha256
-            metis-linux-arm64.tar.gz
-            metis-linux-arm64.tar.gz.sha256
-            metis-windows-amd64.zip
-            metis-windows-amd64.zip.sha256
-            metis-windows-arm64.zip
-            metis-windows-arm64.zip.sha256
-          )
-          mapfile -t actual_assets < <(find dist -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
-          mapfile -t expected_sorted < <(printf '%s\n' "${expected_assets[@]}" | sort)
-          if ! diff -u <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${actual_assets[@]}"); then
-            echo "published release must contain exactly the 20 immutable assets" >&2
-            exit 1
+          # Unregistered stable releases still require exactly the 20 immutable assets.
+          # Only repository-registered CLI-only prereleases use the 12-asset schema.
+          python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > plan.json
+          channel=$(jq -r .channel plan.json)
+          if [ "$channel" = cli-only-prerelease ]; then
+            python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
+              --registry source/.github/cli-only-releases.json > source-plan.json
+            cmp plan.json source-plan.json
           fi
-
-          for sidecar in dist/*.sha256; do
-            sidecar_name=${sidecar#dist/}
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest.json
+          mkdir source/dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir source/dist
+          python3 release-tools/scripts/release_contract.py verify --tag "$TAG" \
+            --metadata release.json --latest latest.json --dist source/dist
+          if [ "$channel" = cli-only-prerelease ]; then
+            release-tools/scripts/verify-dist.sh --repo source --tag "$TAG"
+          fi
+          for sidecar in source/dist/*.sha256; do
+            sidecar_name=${sidecar#source/dist/}
             # PowerShell-authored checksum files may use CRLF. Validate the
             # manifest content without treating the trailing CR as a filename.
-            (cd dist && sed 's/\r$//' "$sidecar_name" | shasum -a 256 -c -)
+            (cd source/dist && sed 's/\r$//' "$sidecar_name" | shasum -a 256 -c -)
           done
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
   install-smoke-unix:
     name: Anonymous install smoke (Linux)
+    needs: inventory
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -89,6 +90,7 @@ jobs:
 
   install-smoke-windows:
     name: Anonymous install smoke (Windows)
+    needs: inventory
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,6 +115,8 @@ jobs:
 
   macos-trust:
     name: Verify macOS signing, notarization, and Gatekeeper
+    needs: inventory
+    if: needs.inventory.outputs.channel == 'stable'
     runs-on: macos-latest
     steps:
       - name: Download official macOS assets
