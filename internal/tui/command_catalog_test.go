@@ -1,15 +1,18 @@
 package tui
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
 )
 
@@ -514,8 +517,45 @@ func TestRecapReturnsLatestStructuralRecap(t *testing.T) {
 	}
 }
 
+// retryDispatchProvider pins the assertion to actual dispatch, before any
+// response can mutate history. The generic fakeProvider finishes immediately.
+type retryDispatchProvider struct {
+	fakeProvider
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *retryDispatchProvider) Stream(ctx context.Context, req llm.Request) (llm.StreamReader, error) {
+	select {
+	case p.entered <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-p.release:
+		return p.fakeProvider.Stream(ctx, req)
+	}
+}
+
 func TestRetryReplacesPriorTurnAndImmediatelyResubmits(t *testing.T) {
 	m := newSlashTestModel(t)
+	provider := &retryDispatchProvider{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	m.loop = agent.NewLoop(provider, tools.NewRegistry(), m.gate, nil, "sys", 10)
+	m.eventCh = make(chan agent.Event, 256)
+	m.doneCh = make(chan error, 1)
+	t.Cleanup(func() {
+		if m.turnCancel == nil {
+			return
+		}
+		m.turnCancel()
+		select {
+		case <-m.doneCh:
+		case <-time.After(5 * time.Second):
+			t.Error("cancelled retry turn did not finish")
+		}
+	})
 	m.loop.Restore([]llm.Message{
 		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "try this again"}}},
 		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "old response"}}},
@@ -529,6 +569,13 @@ func TestRetryReplacesPriorTurnAndImmediatelyResubmits(t *testing.T) {
 
 	if cmd == nil || !m.turnActive {
 		t.Fatal("/retry did not immediately start a replacement turn")
+	}
+	// handleSubmit starts the agent goroutine directly, independently of cmd.
+	// Wait for real provider entry, not a scheduler-dependent history snapshot.
+	select {
+	case <-provider.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry did not dispatch the replacement prompt to the provider")
 	}
 	hist := m.loop.History()
 	if len(hist) != 1 || hist[0].Role != llm.RoleUser || hist[0].Content[0].Text != "try this again" {
