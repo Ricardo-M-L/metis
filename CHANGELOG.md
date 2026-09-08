@@ -7,6 +7,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.55] - 2026-09-08
+
+Prepared as a full CLI and Desktop release. Publication requires the complete
+20-asset set, including Developer ID signed, notarized, and stapled macOS
+Desktop ZIP/DMG installers. The existing v0.4.54 CLI-only release stays unchanged.
+
+### Fixed
+
+- Delivers the v0.4.54 background-job continuation fixes to native Desktop
+  users, together with the matching CLI runtime. Completed jobs can wake an
+  idle session without another user prompt, while cancellation and session
+  boundaries prevent abandoned work from restarting.
+
 ## [0.4.54] - 2026-09-08
 
 Prepared as a formal CLI-only release (`prerelease=false`, `make_latest=false`).
