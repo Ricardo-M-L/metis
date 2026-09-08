@@ -7,6 +7,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.56] - 2026-09-08
+
+Prepared as a full CLI and Desktop release with the complete 20-asset contract,
+including signed, notarized, and stapled macOS Desktop installers.
+
+### Fixed
+
+- Headless runs checkpoint complete tool-result boundaries before further
+  provider work, including compaction and correction turns. Checkpoint failures
+  stop continuation; durable history anchors no longer alias mutable messages.
+- Recover Responses tool calls supplied only by item-done or successful
+  terminal snapshots without dispatching the same call twice within a response.
+  Conflicting terminal states and unfinished calls fail closed. This is not
+  a crash-time exactly-once guarantee for external side effects.
+- Report synchronous Recall persistence failures separately from completed
+  task output, without exposing underlying private repository error text.
+- Preserve and report failed TUI history saves instead of silently continuing
+  across an unsuccessful persistence boundary.
+
 ## [0.4.55] - 2026-09-08
 
 Prepared as a full CLI and Desktop release. Publication requires the complete
