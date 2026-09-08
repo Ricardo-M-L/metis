@@ -562,6 +562,7 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	}
 
 	m.sessionID = id
+	m.backgroundResumeAllowed = false
 	rtpkg.RebindLoopRuntime(m.loop, m.loop.Provider, m.model, m.loop.System, id)
 	m.sessionTitle = ""
 	if hdr != nil {

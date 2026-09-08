@@ -14,6 +14,9 @@ let runningSessionId = null;
 let stopRequestPending = false;
 let runningTurnNeedsHistorySync = false;
 let runningTurnIncompleteReason = '';
+let backgroundContinuationGeneration = 0;
+const backgroundContinuationGenerations = new Map();
+let pendingForegroundRequest = null;
 let queuedTurns = [];
 let queuedSessionId = null;
 let drainingQueuedTurns = false;
@@ -74,6 +77,12 @@ function connectEvents() {
   onLive('redacted_thinking', () => handleRedactedThinking());
   onLive('permission_request', handlePermissionRequest);
   onLive('turn_end', endStreamingMessage);
+  // Runtime ownership is global even when the running session is offscreen.
+  // Only transcript rendering is filtered by the currently viewed session.
+  eventSource.addEventListener('info', e => {
+    if (!acceptLiveEvent(e)) return;
+    try { handleBackgroundContinuation(JSON.parse(e.data)); } catch (_) {}
+  });
   onLive('loop_done', d => {
     runningTurnIncompleteReason = d.incomplete ? (d.stopReason || 'incomplete') : '';
     if (runningTurnIncompleteReason) showToast('Turn incomplete: ' + runningTurnIncompleteReason);
@@ -83,6 +92,28 @@ function connectEvents() {
   eventSource.addEventListener('error', () => {
     showReconnectBanner();
   });
+}
+
+function handleBackgroundContinuation(d) {
+  if (d.backgroundContinuation === 'started') {
+    backgroundContinuationGeneration++;
+    backgroundContinuationGenerations.set(d.session, (backgroundContinuationGenerations.get(d.session) || 0) + 1);
+    if (sameSession(d)) beginUserTurn();
+    setTurnRunning(true, d.session);
+  } else if (d.backgroundContinuation === 'finished') {
+    if (sameSession(d)) finishUserTurn();
+    if (!runningSessionId || runningSessionId === d.session) {
+      const pendingSession = pendingForegroundRequest && pendingForegroundRequest.sessionId;
+      if (pendingSession && pendingSession !== d.session) {
+        if (sameSession({ session: pendingSession })) beginUserTurn();
+        setTurnRunning(true, pendingSession);
+      } else setTurnRunning(false);
+    }
+    updateSendBtn();
+    loadSessions();
+    if (sameSession(d)) loadSessionStatsbar();
+    if (d.succeeded && queuedTurns.length && !drainingQueuedTurns) setTimeout(drainQueuedTurns, 0);
+  }
 }
 
 async function loadEffort(shouldApply = () => true) {
@@ -1772,13 +1803,13 @@ async function drainQueuedTurns() {
   }
 }
 
-async function syncViewedSessionHistory(sessionId) {
-  if (!sessionId || currentSessionId !== sessionId) return false;
+async function syncViewedSessionHistory(sessionId, shouldApply = () => true) {
+  if (!sessionId || currentSessionId !== sessionId || !shouldApply()) return false;
   try {
     const res = await fetch('/api/sessions/' + encodeURIComponent(sessionId), { method: 'GET' });
     if (!res.ok) return false;
     const data = await res.json();
-    if (currentSessionId !== sessionId) return false;
+    if (currentSessionId !== sessionId || !shouldApply()) return false;
     messages = [];
     streamedTextThisTurn = false;
     renderHistoryMessages(data.messages);
@@ -1794,6 +1825,10 @@ async function runTurnItem(item) {
   const text = item.text || '';
   const images = item.images || [];
   const turnSessionId = currentSessionId;
+  const continuationGenerationAtSubmit = turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration;
+  const continuationUnchanged = () => continuationGenerationAtSubmit === (turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration);
+  const foregroundRequest = { sessionId: turnSessionId };
+  pendingForegroundRequest = foregroundRequest;
   let resolvedTurnSessionId = turnSessionId;
   let turnSucceeded = false;
 
@@ -1816,8 +1851,9 @@ async function runTurnItem(item) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
-    if (runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
+    if (continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
     resolvedTurnSessionId = data.sessionId || turnSessionId;
+    foregroundRequest.sessionId = resolvedTurnSessionId;
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
     if (!currentSessionId || currentSessionId === turnSessionId) {
       currentSessionId = resolvedTurnSessionId;
@@ -1830,10 +1866,12 @@ async function runTurnItem(item) {
     // fall back to the returned text only while still viewing this session.
     let historySynced = false;
     if (viewingTurn && runningTurnNeedsHistorySync) {
-      historySynced = await syncViewedSessionHistory(resolvedTurnSessionId);
-      if (historySynced) runningTurnNeedsHistorySync = false;
+      if (continuationUnchanged()) {
+        historySynced = await syncViewedSessionHistory(resolvedTurnSessionId, continuationUnchanged);
+        if (historySynced && continuationUnchanged()) runningTurnNeedsHistorySync = false;
+      }
     }
-    if (viewingTurn && !historySynced && !streamedTextThisTurn && data.text) {
+    if (viewingTurn && continuationUnchanged() && !historySynced && !streamedTextThisTurn && data.text) {
       addMessage('assistant', data.text);
     }
     if (viewingTurn && data.stopped) showToast('Turn stopped');
@@ -1844,12 +1882,15 @@ async function runTurnItem(item) {
     if (viewingTurn) showError(e.message || 'The request failed.');
     else showToast('Background turn failed: ' + (e.message || 'request failed'));
   } finally {
-    // The POST resolving is the definitive end-of-turn signal. Never let a
-    // background turn's cleanup mutate the transcript currently being viewed.
+    // A background completion can start a newer turn before this older POST
+    // response reaches the browser. Its SSE lifecycle now owns the controls.
     const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
-    if (viewingTurn) finishUserTurn();
-    setTurnRunning(false);
-    runningTurnNeedsHistorySync = false;
+    if (pendingForegroundRequest === foregroundRequest) pendingForegroundRequest = null;
+    if (continuationUnchanged()) {
+      if (viewingTurn) finishUserTurn();
+      setTurnRunning(false);
+      runningTurnNeedsHistorySync = false;
+    }
     updateSendBtn();
     loadSessionStatsbar();
     if (turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {

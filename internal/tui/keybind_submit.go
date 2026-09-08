@@ -857,6 +857,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// instead of retyping. Mirrors kimi-cli's /undo UX. Empty
 			// prefill (synthetic turn) preserves the input box untouched.
 			if prefill, ok := m.loop.UndoLastTurnWithPrefill(); ok {
+				m.backgroundResumeAllowed = false
 				persistErr := m.session.ReplaceHistoryAndMark(m.sessionID, m.loop.History(), &m.historyCursor)
 				m.messages = trimVisibleMessagesToLastUser(m.messages)
 				m.toolEvents = nil
@@ -1152,6 +1153,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			// the same user prompt immediately. Merely prefilling the editor
 			// created a duplicate turn and did not retry the response at all.
 			lastUser, ok := m.loop.UndoLastTurnWithPrefill()
+			if ok {
+				m.backgroundResumeAllowed = false
+			}
 			if !ok || strings.TrimSpace(lastUser) == "" {
 				m.messages = append(m.messages, Message{Role: "warning", Content: "(retry: no prior user prompt found in history)", Timestamp: time.Now()})
 			} else {
@@ -1357,6 +1361,13 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		SessionID: m.sessionID, Input: transcriptText, Source: "tui",
 	})
 	m.messages = append(m.messages, Message{Role: "user", Content: transcriptText, Timestamp: time.Now()})
+	return m, m.startAgentTurn(turnRunCtx)
+}
+
+// startAgentTurn is shared by user prompts, scheduled prompts and background
+// continuations. It deliberately does not touch the editor or append a user
+// message: a job completion is already delivered by Loop's notification drain.
+func (m *Model) startAgentTurn(turnRunCtx context.Context) tea.Cmd {
 	// 2026-05-25: do NOT wipe m.toolEvents on each new submit. Pre-fix
 	// behaviour cleared every prior turn's tool calls the moment the
 	// user typed a new prompt — the second turn collapsed to just the
@@ -1392,6 +1403,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.spinnerPhase = "requesting"
 	m.showBanner = false // Hide banner after first message
 	m.turnCancelledByUser = false
+	m.backgroundResumeAllowed = false // armed only by a normal EventLoopDone
 
 	// Snapshot what runTurnAsync needs BEFORE the `go` — see the
 	// comment on runTurnAsync for why. m.turnCancel must be written
@@ -1403,7 +1415,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// Critical: must return tickCmd here so spinnerTick events start flowing,
 	// otherwise the "thinking" frame and elapsed timer freeze at 0s and the
 	// UI looks dead until the LLM replies.
-	return m, tickCmd
+	return tickCmd
 }
 
 // slashName extracts the leading "/<name>" prefix from a raw input

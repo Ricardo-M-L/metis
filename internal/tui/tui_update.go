@@ -103,9 +103,9 @@ func (m *Model) Init() tea.Cmd {
 	// only (ephemeral) jobs into this live chat. No-op tick when cronSvc is
 	// nil (headless paths never reach RunTUI anyway).
 	if m.cronSvc != nil {
-		return tea.Batch(sizeTick, cronTickCmd())
+		return tea.Batch(sizeTick, cronTickCmd(), m.waitForBackgroundJob())
 	}
-	return sizeTick
+	return tea.Batch(sizeTick, m.waitForBackgroundJob())
 }
 
 func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
@@ -132,6 +132,14 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 	// Drain one agent event before ordinary input. spinnerTick adds a bounded
 	// batch below, sharing this counter so the whole Update stays capped.
 	agentEventsDrained := m.drainAgentEvents(1)
+	// Completion readiness is a lifecycle event, even while a picker is open.
+	// It never consumes the model's notification channel.
+	if ready, ok := msg.(backgroundJobReadyMsg); ok {
+		if m.loop == nil || ready.pool != m.loop.Jobs {
+			return m, m.waitForBackgroundJob()
+		}
+		return m, tea.Batch(m.waitForBackgroundJob(), m.resumeForBackgroundJob())
+	}
 
 	// Scheduler ticks are lifecycle messages, not screen input. Handle them
 	// before a full-window picker/modal gets first refusal; otherwise the first
@@ -146,7 +154,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 	// different modal while the command runs cannot swallow the completion.
 	if result, ok := msg.(rewindSummaryResultMsg); ok {
 		m.handleRewindSummaryResult(result)
-		return m, nil
+		return m, m.resumeForBackgroundJob()
 	}
 	// Diff collection is also lifecycle work. The command only reads Git and
 	// files; this handler is the sole place that mutates the active screen.
@@ -173,7 +181,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 	// the user opened while the transition was pending.
 	if result, ok := msg.(permissionModeTransitionResultMsg); ok {
 		m.handlePermissionModeTransitionResult(result)
-		return m, nil
+		return m, m.resumeForBackgroundJob()
 	}
 
 	// Active full-window screen (e.g. /history) takes over input + view.
@@ -787,7 +795,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 			m.queuePending = false
 			return m.handleSubmit()
 		}
-		return m, nil
+		// A readiness message may have arrived while turnActive was still true.
+		// Recheck after finalization so that edge cannot be lost.
+		return m, m.resumeForBackgroundJob()
 
 	case tick:
 		return m, tickCmd
@@ -812,6 +822,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 // the thought-summary + recap rows, log the turn for /lessons, and
 // persist the tail to disk.
 func (m *Model) finalizeTurn(err error) {
+	if err != nil || m.turnCancelledByUser {
+		m.backgroundResumeAllowed = false
+	}
 	userCancelled := m.turnCancelledByUser && isContextCancellation(err)
 	defer func() { m.turnCancelledByUser = false }()
 	// Phase F Ctrl+B (2026-05-12) — capture whether the turn was

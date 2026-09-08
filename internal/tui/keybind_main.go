@@ -144,6 +144,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// interrupt" — both imply ESC is the one true cancel key when a
 	// turn is in flight. Honour that BEFORE any overlay logic.
 	if m.turnCancel != nil && msg.String() == "esc" {
+		m.backgroundResumeAllowed = false
 		m.turnCancelledByUser = true
 		m.turnCancel()
 		m.turnCancel = nil
@@ -340,6 +341,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.lastCtrlC = time.Now()
+		m.backgroundResumeAllowed = false
 		if m.turnCancel != nil {
 			m.turnCancelledByUser = true
 			m.turnCancel()

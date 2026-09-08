@@ -57,6 +57,10 @@ func (m *Model) clearToolArgsStream(toolUseID string) {
 
 func (m *Model) handleAgentEvent(ev agent.Event) {
 	switch ev.Kind {
+	case agent.EventLoopDone:
+		// A nil Run error is not enough: hooks, limits and nonstandard provider
+		// stops must not be bypassed by a later background completion.
+		m.backgroundResumeAllowed = !m.turnCancelledByUser && ev.StopReason == "end_turn"
 	case agent.EventThinkingDelta:
 		// Extended-thinking trace — append live; rendered above the
 		// streaming text with dim italic style. Don't update

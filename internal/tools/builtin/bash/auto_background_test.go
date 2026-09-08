@@ -36,6 +36,7 @@ func TestAutoBackgroundPromotionHasSingleWaitOwner(t *testing.T) {
 	if res == nil || res.IsError || !strings.Contains(res.Output, "moved to background") {
 		t.Fatalf("promotion result = %+v", res)
 	}
+	assertBackgroundCompletionScope(t, res.Output)
 
 	listed := pool.List()
 	if len(listed) != 1 {

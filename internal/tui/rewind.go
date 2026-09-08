@@ -71,6 +71,7 @@ func (m *Model) applyLegacyRewind() {
 		return
 	}
 	m.trimVisibleRewindTurns(res.TurnsUndone)
+	m.backgroundResumeAllowed = false
 	m.toolEvents = nil
 	m.messages = append(m.messages, Message{
 		Role:      "success",
@@ -176,6 +177,7 @@ func (m *Model) handleRewindSummaryResult(msg rewindSummaryResultMsg) {
 }
 
 func (m *Model) applyRewindResult(action screen.RewindAction, turn int, result agent.RewindResult) {
+	m.backgroundResumeAllowed = false
 
 	conversationChanged := result.ConversationRestored || result.Summary != ""
 	if conversationChanged {

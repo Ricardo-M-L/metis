@@ -13,7 +13,6 @@ package tui
 // there's no double-fire even with a daemon running alongside the chat.
 
 import (
-	"context"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -101,21 +100,5 @@ func (m *Model) beginTurn(text string) tea.Cmd {
 	})
 	m.messages = append(m.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
 
-	m.streamingText = ""
-	m.turnToolEventStart = len(m.toolEvents)
-	m.turnActive = true
-	m.spinnerActive = true
-	m.spinnerFrame = 0
-	m.spinnerStartedAt = time.Now()
-	notify.SendProgress(notify.ProgressIndeterminate, 0)
-	m.firstStreamAt = time.Time{}
-	m.spinnerVerb = chooseSpinnerVerb(m.sessionID)
-	m.spinnerSub = ""
-	m.spinnerPhase = "requesting"
-	m.showBanner = false
-
-	turnCtx, cancel := context.WithCancel(m.ctx)
-	m.turnCancel = cancel
-	go runTurnAsync(turnCtx, cancel, m.loop, m.sessionID, m.eventCh, m.doneCh)
-	return tickCmd
+	return m.startAgentTurn(m.ctx)
 }

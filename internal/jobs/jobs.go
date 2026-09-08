@@ -194,6 +194,7 @@ type Registry struct {
 	// session cleanup cannot make a later fullAccess revoke forget a process.
 	draining   map[*Job]struct{}
 	notify     chan Notification // buffered, drained by agent loop
+	wakeup     chan struct{}     // coalesced hint for the session host; never consumes notify
 	generation uint64            // incremented whenever session state is reset
 	resetting  bool              // ResetAndWait admission fence
 
@@ -224,15 +225,43 @@ func NewRegistryBuffered(dir string, notifyBuf int) *Registry {
 		jobs:       make(map[string]*Job),
 		draining:   make(map[*Job]struct{}),
 		notify:     make(chan Notification, notifyBuf),
+		wakeup:     make(chan struct{}, 1),
 		generation: 1,
 		dir:        filepath.Join(dir, "jobs"),
 	}
 }
 
-// Notify returns the channel publishers can subscribe to. Receive-only
-// — Registry owns the send side and closes it on Shutdown.
+// Notify returns the completion envelopes consumed by the agent loop. Hosts
+// must use Wakeup instead of competing with the loop for these notifications.
+// Registry owns the send side; Shutdown leaves it open for pending readers.
 func (r *Registry) Notify() <-chan Notification {
 	return r.notify
+}
+
+// Wakeup returns a coalescing readiness hint for one session host. Receiving
+// does not consume a completion envelope. The signal is not a correctness
+// source or permission to resume a cancelled task: the host must serialize
+// against active Runs, recheck HasPendingNotifications after a Run ends, and
+// apply its current session/cancellation policy before starting a continuation.
+// The loop may already have consumed the notification when the hint is read.
+// Like Notify, this channel remains open through Reset and Shutdown.
+func (r *Registry) Wakeup() <-chan struct{} {
+	if r == nil {
+		return nil
+	}
+	return r.wakeup
+}
+
+// HasPendingNotifications reports whether Notify currently holds an envelope,
+// without taking one away from the agent loop. This is an instantaneous hint,
+// not a reservation: callers must coordinate Run ownership themselves.
+func (r *Registry) HasPendingNotifications() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.notify) > 0
 }
 
 // home resolves the metis data root. Mirrors internal/auth's home()
@@ -615,6 +644,12 @@ func (r *Registry) publish(generation uint64, notif Notification) {
 	// see the completed status via JobList/JobOutput.
 	select {
 	case r.notify <- notif:
+		// Only an enqueued current-generation envelope can wake the host. A
+		// single slot collapses bursts without stealing the loop's payload.
+		select {
+		case r.wakeup <- struct{}{}:
+		default:
+		}
 	default:
 	}
 }
@@ -885,6 +920,15 @@ drainNotifications:
 			continue
 		default:
 			break drainNotifications
+		}
+	}
+drainWakeups:
+	for {
+		select {
+		case <-r.wakeup:
+			continue
+		default:
+			break drainWakeups
 		}
 	}
 	r.mu.Unlock()

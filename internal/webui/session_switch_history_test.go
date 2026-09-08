@@ -15,9 +15,10 @@ func TestDetachedRunningSessionReconcilesAuthoritativeHistory(t *testing.T) {
 		"let runningTurnNeedsHistorySync = false;",
 		"function detachRunningTurnView()",
 		"runningTurnNeedsHistorySync = true;",
-		"async function syncViewedSessionHistory(sessionId)",
+		"async function syncViewedSessionHistory(sessionId, shouldApply = () => true)",
 		"if (viewingTurn && runningTurnNeedsHistorySync)",
-		"await syncViewedSessionHistory(resolvedTurnSessionId)",
+		"await syncViewedSessionHistory(resolvedTurnSessionId, continuationUnchanged)",
+		"if (currentSessionId !== sessionId || !shouldApply()) return false;",
 	} {
 		if !strings.Contains(source, want) {
 			t.Fatalf("chat.js missing detached-session history reconciliation contract %q", want)

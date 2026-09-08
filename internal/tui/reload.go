@@ -80,6 +80,7 @@ func (m *Model) Reload(opts ReloadOpts) error {
 	if m.loop != nil {
 		m.loop.Reset()
 	}
+	m.backgroundResumeAllowed = false
 	m.messages = nil
 	m.toolEvents = nil
 	m.turnToolEventStart = 0

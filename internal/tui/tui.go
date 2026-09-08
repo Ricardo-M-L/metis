@@ -287,6 +287,9 @@ type Model struct {
 	chatList      *list.List
 	turnActive    bool
 	streamingText string
+	// Only a successful live task may resume on background completion. Errors,
+	// interruption, and session switches revoke this until a new user turn.
+	backgroundResumeAllowed bool
 
 	spinnerActive    bool
 	spinnerFrame     int
@@ -982,6 +985,8 @@ func (m *Model) SetExternalHooks(h ExternalHooks) {
 // RunTUI starts the terminal UI. If hooks is non-nil it is attached to
 // the underlying Model before the program runs.
 func RunTUI(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, sl *slash.Registry, st *session.Store, sid string, gate *permission.Gate, model, providerName, skillDir string, cfg *config.Config, forceBanner bool, hooks ...ExternalHooks) error {
+	ctx, cancelUI := context.WithCancel(ctx)
+	defer cancelUI() // also releases the idle background-notification waiter
 	m := NewModel(ctx, loop, cronSvc, sl, st, sid, gate, model, providerName, skillDir, cfg)
 	if len(hooks) > 0 {
 		m.SetExternalHooks(hooks[0])

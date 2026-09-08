@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.54] - 2026-09-08
+
+Prepared as a formal CLI-only release (`prerelease=false`, `make_latest=false`).
+Desktop/WebUI source fixes are included, but no new Desktop installer is
+published and the shared Desktop latest channel remains unchanged.
+
+### Fixed
+
+- Live CLI (TUI) and Desktop sessions resume automatically when ordinary
+  background Bash jobs finish after the model's turn ends. Completion wakeups
+  do not consume model notifications or overlap active turns, and preserve
+  unsent input. Cancellation, failed/incomplete turns, and session/history
+  changes prevent old jobs from restarting abandoned work.
+- Clarified that plain readline and one-shot callers must explicitly use
+  `await_completion` for finite background work that must finish before return;
+  persistent servers still do not hold a turn open.
+
 ## [0.4.53] - 2026-09-08
 
 Prepared as a formal CLI-only release (`prerelease=false`, `make_latest=false`)

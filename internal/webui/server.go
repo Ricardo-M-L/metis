@@ -67,11 +67,14 @@ type Server struct {
 	// cancelMu guards the identity, cancel func, and completion signal for the
 	// in-flight turn. Keeping the session identity separate from the session
 	// being viewed lets Desktop browse other transcripts while work continues.
-	cancelMu       sync.Mutex
-	cancelTurn     context.CancelFunc
-	runningSession string
-	turnDone       chan struct{}
-	closing        bool
+	cancelMu             sync.Mutex
+	cancelTurn           context.CancelFunc
+	runningSession       string
+	turnDone             chan struct{}
+	closing              bool
+	backgroundCancel     context.CancelFunc
+	backgroundSession    string
+	backgroundGeneration uint64
 
 	roster *agent.Roster
 
@@ -1435,6 +1438,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
 		return
 	}
+	s.stopBackgroundContinuationLocked()
 	s.cancelTurn = cancel
 	s.runningSession = body.SessionID
 	s.turnDone = turnDone
@@ -1538,6 +1542,32 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to persist input")
 		return
 	}
+	if len(history) == 0 {
+		title := []rune(input)
+		if len(title) > 60 {
+			title = title[:60]
+		}
+		_ = s.store.SetTitle(body.SessionID, string(title))
+	}
+	text, runErr, status, mayContinue := s.runAndPersistTurn(turnCtx, body.SessionID, messageMetric)
+	if errors.Is(runErr, context.Canceled) {
+		writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text, "stopped": true})
+		return
+	}
+	if runErr != nil {
+		writeError(w, status, runErr.Error())
+		return
+	}
+	if mayContinue {
+		s.armBackgroundContinuation(turnCtx, body.SessionID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text})
+}
+
+// runAndPersistTurn is shared by explicit prompts and background-job resumptions.
+// The caller owns runMu and the registered cancellation slot. A resumption does
+// not invent a user message; Loop remains the sole job-notification consumer.
+func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, messageMetric session.MessageMetric) (string, error, int, bool) {
 	// The user-facing prompt written above can intentionally differ from the
 	// loop-only message (for example a synthetic plan reminder). Anchor the
 	// durable cursor to the live boundary so the normal append path preserves
@@ -1547,27 +1577,20 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	historyCursor := session.NewHistoryCursor(persistedBoundary)
 	previousCheckpoint := s.loop.CompactionCheckpoint
 	s.loop.CompactionCheckpoint = func(before, after []llm.Message) error {
-		return s.store.CheckpointCompaction(body.SessionID, before, after, &historyCursor)
+		return s.store.CheckpointCompaction(sessionID, before, after, &historyCursor)
 	}
 	defer func() { s.loop.CompactionCheckpoint = previousCheckpoint }()
-	if len(history) == 0 {
-		title := []rune(input)
-		if len(title) > 60 {
-			title = title[:60]
-		}
-		_ = s.store.SetTitle(body.SessionID, string(title))
-	}
-	if err := s.store.WriteHeaderFull(session.Header{ID: body.SessionID, Status: "running"}); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to persist running status")
-		return
+	if err := s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "running"}); err != nil {
+		return "", err, http.StatusInternalServerError, false
 	}
 	finalStatus := "failed"
-	defer func() { _ = s.store.WriteHeaderFull(session.Header{ID: body.SessionID, Status: finalStatus}) }()
+	defer func() { _ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: finalStatus}) }()
 
-	turnCtx, traceOrigin := rtpkg.BindTraceTurn(turnCtx, body.SessionID)
+	turnCtx, traceOrigin := rtpkg.BindTraceTurn(turnCtx, sessionID)
 	if traceOrigin.Turn > 0 {
-		// RecordUserMessage opened this exact trace turn immediately above.
-		// Pinning the root loop context prevents a later session switch from
+		// Explicit input opens a USER anchor; background resumption instead
+		// binds a fresh trace turn without inventing user text. Pinning this
+		// root loop context prevents a later session switch from
 		// reassigning terminal/background usage, and keeps the durable footer's
 		// turn key identical to the trace observer's immutable origin.
 		messageMetric.Turn = traceOrigin.Turn
@@ -1584,11 +1607,12 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	var firstTokenAt time.Time
 	var turnCost session.CostSnapshot
 	var incompleteReason string
+	var completionReason string
 	for ev := range events {
 		// Permission requests are published by their case below (with the
 		// request id); everything else broadcasts here.
 		if ev.Kind != agent.EventPermissionRequest && ev.Kind != agent.EventAskUser {
-			s.hub.publish(body.SessionID, ev)
+			s.hub.publish(sessionID, ev)
 		}
 		switch ev.Kind {
 		case agent.EventTextDelta:
@@ -1610,6 +1634,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 			turnCost.CacheCreateTokens += ev.CacheCreationInputTokens
 			turnCost.CacheReadTokens += ev.CacheReadInputTokens
 		case agent.EventLoopDone:
+			completionReason = ev.StopReason
 			if agent.IsIncompleteStopReason(ev.StopReason) {
 				incompleteReason = ev.StopReason
 			}
@@ -1628,7 +1653,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 				s.pendingPerms[id] = pending
 				s.permMu.Unlock()
 				// Broadcast the approval card; the reply arrives via /api/permission.
-				s.hub.publish(body.SessionID, ev, map[string]any{"permId": id})
+				s.hub.publish(sessionID, ev, map[string]any{"permId": id})
 				go func() {
 					time.Sleep(120 * time.Second)
 					s.permMu.Lock()
@@ -1648,7 +1673,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 				s.askMu.Lock()
 				s.pendingAsks[id] = &askPending{reply: ev.AskUserReply}
 				s.askMu.Unlock()
-				s.hub.publish(body.SessionID, ev, map[string]any{"askId": id})
+				s.hub.publish(sessionID, ev, map[string]any{"askId": id})
 				go func() {
 					time.Sleep(120 * time.Second)
 					s.timeoutAsk(id)
@@ -1657,6 +1682,9 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	runErr := <-done
+	if runErr == nil && turnCtx.Err() != nil {
+		runErr = turnCtx.Err()
+	}
 	if runErr == nil && incompleteReason != "" {
 		runErr = fmt.Errorf("task incomplete: %s", incompleteReason)
 	}
@@ -1664,7 +1692,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	// context wins its channel-send select. Recover that provider-authoritative
 	// terminal usage here so clicking Stop at the exact end of a response cannot
 	// make Desktop lose cost data that the provider already delivered.
-	if traced, ok := traceTurnCost(body.SessionID, messageMetric.Turn); ok {
+	if traced, ok := traceTurnCost(sessionID, messageMetric.Turn); ok {
 		turnCost.InputTokens = max(turnCost.InputTokens, traced.InputTokens)
 		turnCost.OutputTokens = max(turnCost.OutputTokens, traced.OutputTokens)
 		turnCost.CacheCreateTokens = max(turnCost.CacheCreateTokens, traced.CacheCreateTokens)
@@ -1682,8 +1710,8 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 			messageMetric.TokPerSec = float64(turnCost.OutputTokens) / messageMetric.CompletedAt.Sub(firstTokenAt).Seconds()
 		}
 	}
-	if _, err := s.store.ReconcileMessageMetric(body.SessionID, messageMetric); err != nil {
-		log.Printf("persist message metrics for %s turn %d: %v", body.SessionID, messageMetric.Turn, err)
+	if _, err := s.store.ReconcileMessageMetric(sessionID, messageMetric); err != nil {
+		log.Printf("persist message metrics for %s turn %d: %v", sessionID, messageMetric.Turn, err)
 	}
 	if errors.Is(runErr, context.Canceled) {
 		finalStatus = "stopped"
@@ -1694,21 +1722,18 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	// produced after it, while still falling back to history_replace for any
 	// other same-length prefix rewrite. Persist before handling Run errors so
 	// completed tool rounds and orphan repairs survive cancellation/failure.
-	persistErr := s.store.AppendHistoryTail(body.SessionID, updated, &historyCursor)
+	persistErr := s.store.AppendHistoryTail(sessionID, updated, &historyCursor)
 	if persistErr != nil {
-		writeError(w, http.StatusInternalServerError, "failed to persist turn history")
-		return
+		return text.String(), fmt.Errorf("failed to persist turn history: %w", persistErr), http.StatusInternalServerError, false
 	}
 	if errors.Is(runErr, context.Canceled) {
-		writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text.String(), "stopped": true})
-		return
+		return text.String(), runErr, http.StatusOK, false
 	}
 	if runErr != nil {
-		writeError(w, http.StatusBadGateway, runErr.Error())
-		return
+		return text.String(), runErr, http.StatusBadGateway, false
 	}
 	finalStatus = "completed"
-	writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text.String()})
+	return text.String(), nil, http.StatusOK, completionReason == "end_turn"
 }
 
 // desktopModelInput keeps the user's compact /batch command in durable
@@ -2011,6 +2036,9 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	if err := s.persistActiveSessionBoundary("desktop-switch"); err != nil {
 		return err
 	}
+	s.cancelMu.Lock()
+	s.stopBackgroundContinuationLocked()
+	s.cancelMu.Unlock()
 	if s.sessionBoundary != nil {
 		s.sessionBoundary()
 	}
@@ -2216,6 +2244,8 @@ func (s *Server) persistDesktopCloseWithTimeouts(timeouts desktopCloseTimeouts) 
 	s.desktopCloseOnce.Do(func() {
 		var closeErr error
 		s.cancelMu.Lock()
+		s.closing = true
+		s.stopBackgroundContinuationLocked()
 		cancelTurn := s.cancelTurn
 		turnDone := s.turnDone
 		s.cancelMu.Unlock()
@@ -2288,6 +2318,7 @@ func (s *Server) beginClosing() {
 	}
 	s.cancelMu.Lock()
 	s.closing = true
+	s.stopBackgroundContinuationLocked()
 	s.cancelMu.Unlock()
 }
 
@@ -3296,17 +3327,29 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	cancel := s.cancelTurn
 	runningSession := s.runningSession
 	done := s.turnDone
-	s.cancelMu.Unlock()
+	if cancel == nil && s.backgroundCancel != nil && (body.SessionID == "" || body.SessionID == s.backgroundSession) {
+		waitingSession := s.backgroundSession
+		s.stopBackgroundContinuationLocked()
+		s.cancelMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": waitingSession})
+		return
+	}
 	if cancel == nil {
+		s.cancelMu.Unlock()
 		writeError(w, http.StatusConflict, "no turn in progress")
 		return
 	}
 	if body.SessionID != "" && runningSession != "" && body.SessionID != runningSession {
+		s.cancelMu.Unlock()
 		writeError(w, http.StatusConflict, "requested session is not the running turn")
 		return
 	}
 
+	// Order cancellation and watcher invalidation with the arming check.
+	// Stop may arrive after Run ended but before its HTTP handler returned.
 	cancel()
+	s.stopBackgroundContinuationLocked()
+	s.cancelMu.Unlock()
 	s.cancelPendingInteractions()
 	if done != nil {
 		select {

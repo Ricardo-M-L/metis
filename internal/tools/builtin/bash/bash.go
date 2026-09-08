@@ -64,14 +64,12 @@ func (b *Bash) classifierFor() *BashClassifier {
 
 func (Bash) Name() string { return "Bash" }
 
-// ShortDescription is the curated 1-2 sentence form shipped to
+// ShortDescription is the curated compact form shipped to
 // sub-agents and METIS_SIMPLE boots in lieu of the full multi-section
-// Description(). Hand-tuned to fit ~250 chars while still naming the
-// two biggest tool-selection footguns (cat→Read, find→Glob) so the
-// model gets at least one tool-redirect hint even when the full
-// `# Tool selection` table from base.md is skipped.
+// Description(). It preserves tool-selection hints and background completion
+// ownership even when the full `# Tool selection` table from base.md is skipped.
 func (Bash) ShortDescription() string {
-	return `Execute a shell command. stdout+stderr merge, truncated at a byte cap; cwd persists across calls in a turn, env vars do NOT. Prefer dedicated tools where possible (Read NOT cat, Glob NOT find, Grep NOT grep -r, Edit NOT sed). Never sleep or poll for completion; use run_in_background=true and wait for its notification. Mark finite acceptance checks required_for_completion=true; leave dev servers unmarked.`
+	return `Execute a shell command. stdout+stderr merge, truncated at a byte cap; cwd persists across calls in a turn, env vars do NOT. Prefer dedicated tools (Read NOT cat, Glob NOT find, Grep NOT grep -r, Edit NOT sed). Use run_in_background=true instead of sleeping or polling. Live TUI/Desktop sessions can continue on completion; plain readline and one-shot callers need await_completion=true to wait before returning. Mark finite acceptance checks required_for_completion=true; never await persistent servers.`
 }
 
 func (Bash) Description() string {
@@ -106,7 +104,7 @@ Safety:
   - Never pass --no-verify, --no-gpg-sign, --force-with-lease without explicit user consent; never 'git push --force' to main/master.
   - Never 'rm -rf' or pipe to /dev/sd*; never run a command whose effect you can't reverse without asking first.
 
-Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and a completion notification later. Continue other useful work instead of sleeping or polling. Use Output only when interim logs are actually needed, and Kill to stop the job. A leading delay of two seconds or more is automatically moved to the background so it cannot block the turn.
+Long-running commands: anything that may exceed the timeout (dev server, file watcher, long build, log tail) MUST set run_in_background=true. You'll get a job_id back instantly and a completion notification later. Live interactive TUI/Desktop sessions can automatically continue on that notification when idle; cancellation, session changes, and process exit do not authorize a continuation. Plain readline and one-shot callers do not have an idle continuation host: use await_completion=true for finite work that must finish before the call returns. Continue other useful work instead of sleeping or polling. Use Output only when interim logs are actually needed, and Kill to stop the job. A leading delay of two seconds or more is automatically moved to the background so it cannot block the turn.
 
 Finite completion checks: use await_completion=true when this task must wait for a finite background command to exit. Use required_for_completion=true for acceptance checks, test suites, or browser endurance checks that must also succeed before the task can be considered complete. required_for_completion implies await_completion, and either flag implies run_in_background. These finite jobs belong to the current task and are stopped if it is cancelled or reaches its deadline. Do not mark persistent dev servers, watchers, or log tails: their default background lifetime is unchanged.
 
@@ -131,7 +129,7 @@ func (Bash) InputSchema() map[string]any {
 			},
 			"run_in_background": map[string]any{
 				"type":        "boolean",
-				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately and sends a completion notification. Continue other work; use Output only for needed interim logs and Kill to stop.",
+				"description": "True for commands that don't terminate quickly: dev servers, file watchers, long builds, log tails. Returns job_id immediately. Live TUI/Desktop sessions can continue on completion; plain readline and one-shot callers need await_completion=true for finite work before returning. Use Output only for needed interim logs and Kill to stop.",
 			},
 			"await_completion": map[string]any{
 				"type":        "boolean",
@@ -712,7 +710,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 		}
 		msg := fmt.Sprintf(
 			"[command moved to background after %s — still running, job_id=%s]\n"+
-				"You'll receive a completion notification; continue other work without sleeping or polling. "+
+				backgroundCompletionGuidance+"\n"+
 				"Use Output {job_id: %q} only for needed interim logs, Kill {job_id: %q} to stop.\n"+
 				"Output captured in foreground:\n%s",
 			AutoBackgroundThreshold, jb.ID, jb.ID, jb.ID, preview,
@@ -797,7 +795,7 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string, completion .
 	return &tools.Result{
 		Output: fmt.Sprintf(
 			"[command running in background, job_id=%s]\n"+
-				"You'll receive a <job_notification> when it exits; continue other work without sleeping or polling.\n"+
+				backgroundCompletionGuidance+"\n"+
 				"Use Output {job_id: %q} only for needed interim logs, Kill {job_id: %q} to stop.",
 			jb.ID, jb.ID, jb.ID,
 		),
@@ -807,6 +805,8 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string, completion .
 		},
 	}, nil
 }
+
+const backgroundCompletionGuidance = "Completion queues a <job_notification>. Live TUI/Desktop sessions can automatically continue when idle; cancelled or closed sessions do not resume. Plain readline and one-shot callers need await_completion=true when starting finite work that must finish before returning; use required_for_completion=true when success is required. Never await persistent servers. Continue other useful work without sleeping or polling."
 
 var (
 	leadingSleepRE = regexp.MustCompile(`(?i)^\s*(?:command\s+)?(?:(?:/usr)?/bin/)?sleep\s+([0-9]+(?:\.[0-9]+)?)\b(.*)$`)

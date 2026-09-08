@@ -30,6 +30,12 @@
       "prerelease": false,
       "make_latest": false,
       "reason": "Formal CLI-only release of Responses summary display and completed-task-status preservation; Desktop/shared latest remains unchanged."
+    },
+    "v0.4.54": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "Formal CLI-only release of background-job automatic continuation with cancellation and session-boundary protection; Desktop/shared latest remains unchanged."
     }
   }
 }

@@ -84,6 +84,9 @@ func (s *Server) handleSessionCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "history update failed: "+err.Error())
 		return
 	}
+	s.cancelMu.Lock()
+	s.stopBackgroundContinuationLocked()
+	s.cancelMu.Unlock()
 	s.loop.Restore(next)
 	response := map[string]any{"changed": true, "messages": next}
 	if command == "clear-history" {
