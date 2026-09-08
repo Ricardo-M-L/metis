@@ -168,6 +168,33 @@ func headlessMemorySource(source string) string {
 	}
 }
 
+type headlessMemoryReportError struct{ error }
+
+func (*headlessMemoryReportError) Error() string   { return "write memory persistence report failed" }
+func (e *headlessMemoryReportError) Unwrap() error { return e.error }
+
+// reportHeadlessRecallFailure is called on the run error path, before the
+// success-only distillation boundary. Returning the classified error prevents
+// daemon/coordinator from publishing a silent success; the JSON report keeps
+// the already completed task distinct from the failed memory hand-off.
+func reportHeadlessRecallFailure(err error, source string, warnings io.Writer) error {
+	var persistenceErr *memory.RecallPersistenceError
+	if !errors.As(err, &persistenceErr) {
+		return err
+	}
+	if warnings == nil {
+		warnings = os.Stderr
+	}
+	report := struct {
+		memory.RecallPersistenceStatus
+		Source string `json:"source"`
+	}{persistenceErr.Status(), headlessMemorySource(source)}
+	if writeErr := json.NewEncoder(warnings).Encode(report); writeErr != nil {
+		return errors.Join(err, &headlessMemoryReportError{writeErr})
+	}
+	return err
+}
+
 // collectHeadlessEvents owns the producer channel lifecycle. Loop.Run does not
 // close caller-owned channels; the wrapper must close after Run returns on
 // success, error or cancellation so range consumers cannot wait forever.
@@ -222,7 +249,7 @@ func runHeadlessOneShot(ctx context.Context, r *runtime, prompt, source string) 
 		})
 	})
 	if runErr != nil {
-		return text, runErr
+		return text, reportHeadlessRecallFailure(runErr, source, os.Stderr)
 	}
 	if err := r.persistHeadlessMemoryBoundary(source, runtimeDistillationShutdownGrace); err != nil {
 		return text, err

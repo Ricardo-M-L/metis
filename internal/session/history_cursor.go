@@ -1,8 +1,9 @@
 package session
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"reflect"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
@@ -16,8 +17,9 @@ import (
 // successfully appending messages (AppendHistoryTail), or explicitly mark an
 // already-persisted snapshot at a known session boundary (Mark).
 type HistoryCursor struct {
-	count int
-	last  *llm.Message
+	count    int
+	last     *llm.Message
+	lastJSON []byte
 }
 
 // NewHistoryCursor returns a cursor positioned after history. Use it when the
@@ -39,9 +41,25 @@ func (c *HistoryCursor) Mark(history []llm.Message) {
 	}
 	c.count = len(history)
 	c.last = nil
+	c.lastJSON = nil
 	if len(history) > 0 {
-		last := history[len(history)-1]
+		// An ordinary struct copy retains Content slices and nested maps. Those
+		// are mutated by compaction and provider-state cleanup, which would also
+		// mutate the supposed durable anchor. Snapshot the persisted form and
+		// compare that form below: JSON round trips can normalize numeric types,
+		// while in-memory-only fields intentionally never reached the ledger.
+		encoded, err := json.Marshal(history[len(history)-1])
+		if err != nil {
+			// Mark has no error return. An unencodable boundary cannot be trusted;
+			// a later append will try a replacement and surface serialization errors.
+			return
+		}
+		var last llm.Message
+		if err := json.Unmarshal(encoded, &last); err != nil {
+			return
+		}
 		c.last = &last
+		c.lastJSON = encoded
 	}
 }
 
@@ -52,10 +70,11 @@ func (c *HistoryCursor) Mark(history []llm.Message) {
 // A simple integer alone becomes stale when compaction or undo shortens or
 // rewrites loop history. When the durable anchor is no longer exactly at the
 // cursor boundary, appending a suffix cannot invalidate the old JSONL prefix;
-// write a full history_replace snapshot instead. The reverse DeepEqual search
+// write a full history_replace snapshot instead. The reverse anchor search
 // deliberately finds the last duplicate anchor: this prevents a repeated
 // message later in the new history from making us skip intervening unwritten
-// content.
+// content. Anchors are compared in their persisted JSON form so in-memory-only
+// metadata and numeric normalization do not cause spurious full replacements.
 func (s *Store) AppendHistoryTail(id string, history []llm.Message, cursor *HistoryCursor) error {
 	if s == nil || id == "" {
 		return nil
@@ -76,7 +95,8 @@ func (s *Store) appendHistoryTailLocked(id string, history []llm.Message, cursor
 	lastAnchor := -1
 	if cursor.last != nil {
 		for i := len(history) - 1; i >= 0; i-- {
-			if reflect.DeepEqual(history[i], *cursor.last) {
+			encoded, err := json.Marshal(history[i])
+			if err == nil && bytes.Equal(encoded, cursor.lastJSON) {
 				lastAnchor = i
 				break
 			}
@@ -92,8 +112,66 @@ func (s *Store) appendHistoryTailLocked(id string, history []llm.Message, cursor
 		if err := s.appendEntryLocked(id, Entry{Type: "message", Message: &message}, false); err != nil {
 			return err
 		}
-		cursor.count = i + 1
-		cursor.last = &message
+		cursor.Mark(history[:i+1])
+	}
+	return nil
+}
+
+// CheckpointHistory synchronously appends a completed iteration's unwritten
+// history and fsyncs it before the caller starts any further provider work.
+// Unpaired tool calls/results are rejected before any write; the caller must
+// supply actual completed results, never an in-flight tool-use snapshot.
+//
+// The existing per-message JSONL format is preserved. A failed append may leave
+// a visible successful prefix, and cursor tracks that prefix for a safe retry.
+// This is not a multi-message atomic transaction: the caller must stop on error
+// and retry persistence or use the existing resume repair before provider work.
+// A failed fsync also remains retryable, including when every line was already
+// appended: every successful call must cross the fsync barrier again.
+func (s *Store) CheckpointHistory(id string, history []llm.Message, cursor *HistoryCursor) error {
+	if cursor == nil {
+		return fmt.Errorf("checkpoint history: nil cursor")
+	}
+	if s == nil || id == "" {
+		return nil
+	}
+	if err := validateCheckpointToolPairs(history); err != nil {
+		return fmt.Errorf("checkpoint history: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.appendHistoryTailLocked(id, history, cursor); err != nil {
+		return fmt.Errorf("checkpoint history append: %w", err)
+	}
+	if err := s.syncLocked(id); err != nil {
+		return fmt.Errorf("checkpoint history sync: %w", err)
+	}
+	return nil
+}
+
+func validateCheckpointToolPairs(history []llm.Message) error {
+	pending := make(map[string]struct{})
+	for _, message := range history {
+		for _, block := range message.Content {
+			switch block.Type {
+			case "tool_use":
+				if block.ToolUseID == "" {
+					return fmt.Errorf("tool_use is missing its id")
+				}
+				if _, exists := pending[block.ToolUseID]; exists {
+					return fmt.Errorf("duplicate pending tool_use %q", block.ToolUseID)
+				}
+				pending[block.ToolUseID] = struct{}{}
+			case "tool_result":
+				if _, exists := pending[block.ToolUseID]; !exists {
+					return fmt.Errorf("tool_result %q has no pending tool_use", block.ToolUseID)
+				}
+				delete(pending, block.ToolUseID)
+			}
+		}
+	}
+	if len(pending) != 0 {
+		return fmt.Errorf("history contains %d unfinished tool call(s)", len(pending))
 	}
 	return nil
 }

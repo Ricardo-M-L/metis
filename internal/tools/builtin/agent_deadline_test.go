@@ -26,6 +26,112 @@ func (p *deadlineCaptureProvider) Stream(ctx context.Context, _ llm.Request) (ll
 	return &hangingStream{ctx: ctx}, nil
 }
 
+// Exercise the real child contexts while the provider remains in flight. An
+// immediately completed provider cannot detect a wrongly applied default cap.
+func TestAgentToolTimeoutDefaultAndExplicitZero(t *testing.T) {
+	for _, background := range []bool{false, true} {
+		for _, tc := range []struct {
+			name        string
+			input       any
+			omitted     bool
+			parentLimit time.Duration
+			wantLimit   time.Duration
+		}{
+			{name: "omitted_uses_default", omitted: true, parentLimit: 3 * time.Second, wantLimit: time.Second},
+			{name: "zero_disables_default", input: 0},
+			{name: "int64_zero_disables_default", input: int64(0)},
+			{name: "json_zero_disables_default", input: float64(0)},
+			{name: "zero_preserves_later_parent", input: 0, parentLimit: 3 * time.Second, wantLimit: 3 * time.Second},
+			{name: "zero_preserves_earlier_parent", input: 0, parentLimit: 500 * time.Millisecond, wantLimit: 500 * time.Millisecond},
+			{name: "positive_overrides_default", input: 2, wantLimit: 2 * time.Second},
+			// Dispatch rejects these types. Direct Execute callers keep the
+			// historical default instead of treating malformed input as zero.
+			{name: "null_keeps_default", wantLimit: time.Second},
+			{name: "string_keeps_default", input: "0", wantLimit: time.Second},
+			{name: "bool_keeps_default", input: false, wantLimit: time.Second},
+		} {
+			t.Run(fmt.Sprintf("background_%t/%s", background, tc.name), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					parentCtx := context.Background()
+					if tc.parentLimit > 0 {
+						var cancel context.CancelFunc
+						parentCtx, cancel = context.WithTimeout(parentCtx, tc.parentLimit)
+						defer cancel()
+					}
+					provider := &deadlineCaptureProvider{started: make(chan context.Context, 1)}
+					roster := agent.NewRoster(0)
+					defer func() {
+						roster.CancelAll()
+						synctest.Wait()
+					}()
+					tool := NewAgent(permission.New(permission.ModeBypass), provider, tools.NewRegistry(), "model", "system").
+						WithRoster(roster).WithDefaultTimeout(time.Second)
+					input := map[string]any{"prompt": "remain in flight across the default timeout", "run_in_background": background}
+					if !tc.omitted {
+						input["timeout_seconds"] = tc.input
+					}
+					finished := make(chan *tools.Result, 1)
+					startedAt := time.Now()
+					go func() {
+						result, err := tool.Execute(parentCtx, input)
+						if err != nil {
+							t.Errorf("Execute: %v", err)
+						}
+						finished <- result
+					}()
+					synctest.Wait()
+					var childCtx context.Context
+					select {
+					case childCtx = <-provider.started:
+					default:
+						t.Fatal("child did not reach the provider")
+					}
+					lifecycleCtx := agent.ToolLifecycleContextFromContext(childCtx)
+					if lifecycleCtx == nil {
+						t.Fatal("child has no hard lifecycle context")
+					}
+					for name, ctx := range map[string]context.Context{"child": childCtx, "hard_lifecycle": lifecycleCtx} {
+						deadline, ok := ctx.Deadline()
+						if tc.wantLimit == 0 {
+							if ok {
+								t.Fatalf("%s unexpectedly has a deadline %s after start", name, deadline.Sub(startedAt))
+							}
+						} else if !ok || !deadline.Equal(startedAt.Add(tc.wantLimit)) {
+							t.Fatalf("%s deadline = (%v, %t), want %v", name, deadline, ok, startedAt.Add(tc.wantLimit))
+						}
+					}
+					wait := 2 * time.Second // cross the configured 1 second cap
+					if tc.wantLimit > 0 {
+						wait = tc.wantLimit - time.Nanosecond
+					}
+					time.Sleep(wait)
+					synctest.Wait()
+					if childCtx.Err() != nil || lifecycleCtx.Err() != nil || roster.Count() != 1 {
+						t.Fatal("child stopped before its effective deadline")
+					}
+					if tc.wantLimit == 0 {
+						roster.CancelAll()
+					} else {
+						time.Sleep(time.Nanosecond)
+					}
+					synctest.Wait()
+					if childCtx.Err() == nil || lifecycleCtx.Err() == nil || roster.Count() != 0 {
+						t.Fatal("effective deadline or explicit stop did not settle child lifecycle")
+					}
+					select {
+					case result := <-finished:
+						if result == nil || result.IsError == background {
+							t.Fatalf("Execute result = %+v, background=%t", result, background)
+						}
+					default:
+						t.Fatal("Execute did not finish after child stopped")
+					}
+				})
+			})
+		}
+	}
+}
+
 func TestAgentToolParentAndChildDeadlines(t *testing.T) {
 	for _, background := range []bool{false, true} {
 		for _, tc := range []struct {

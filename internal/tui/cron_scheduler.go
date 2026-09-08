@@ -94,7 +94,9 @@ func (m *Model) beginTurn(text string) tea.Cmd {
 		return nil
 	}
 	m.loop.AppendUser(text)
-	m.persistTail()
+	if err := m.persistTail(); err != nil {
+		m.warnSessionSave(err)
+	}
 	_ = runtime.AppendHistory(runtime.HistoryEntry{
 		SessionID: m.sessionID, Input: text, Source: "cron",
 	})

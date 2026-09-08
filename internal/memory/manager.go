@@ -1556,7 +1556,11 @@ func (mm *MemoryManager) RecordTurn(_ context.Context, sessionID, sourceMessageI
 	if err != nil {
 		return err
 	}
-	return mm.recall.AddTurn(truncate(userMsg, 500), truncate(asstMsg, 1000), sessionID, sourceMessageID, "session")
+	err = mm.recall.AddTurn(truncate(userMsg, 500), truncate(asstMsg, 1000), sessionID, sourceMessageID, "session")
+	if err != nil && !IsRecallPolicyRejection(err) {
+		return &RecallPersistenceError{Err: err}
+	}
+	return err
 }
 
 // DistillTurn extracts durable facts from one user/assistant exchange

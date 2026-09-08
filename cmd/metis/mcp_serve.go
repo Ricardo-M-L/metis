@@ -409,7 +409,7 @@ func mcpDoRunTaskExclusive(callCtx context.Context, flags *cliFlags, prompt stri
 
 	result, err = collectMCPTaskEvents(events, done)
 	if err != nil {
-		return "", err
+		return "", reportHeadlessRecallFailure(err, "metis mcp-serve run_task", os.Stderr)
 	}
 	// Each MCP request owns a fresh serialized runtime. Scope the durability
 	// barrier to that request's session ID so it can never join or flush a

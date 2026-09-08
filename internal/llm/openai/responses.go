@@ -663,6 +663,8 @@ type responsesStream struct {
 	// mapping learned from output_item.added so all provider-neutral events use
 	// the executable call id.
 	toolCallIDs    map[string]string
+	toolCalls      map[string]*responsesToolProgress
+	sawToolCall    bool
 	refusalStarted map[string]bool
 	// A public summary may arrive as deltas, an item snapshot, or only in
 	// the terminal response. Track each item/summary part independently so
@@ -680,6 +682,70 @@ type responsesStreamOutput struct {
 	Name      string                 `json:"name"`
 	Arguments string                 `json:"arguments"`
 	Summary   []responsesSummaryPart `json:"summary"`
+}
+
+type responsesToolProgress struct {
+	started      bool
+	finished     bool
+	hasArguments bool
+}
+
+// Retain item-to-call aliases and completion state until the entire response
+// ends. A done snapshot or the terminal output can be the first full tool item
+// from a compatibility endpoint; downstream consumers require exactly one
+// start before its authoritative arguments, and must not see a second start
+// when the same call is repeated in the terminal snapshot.
+func (s *responsesStream) enqueueToolItem(itemID, callID, name, arguments string, finished bool) {
+	s.sawToolCall = true
+	if callID == "" {
+		callID = s.toolCallIDs[itemID]
+	}
+	if callID == "" {
+		callID = itemID
+	}
+	if callID == "" {
+		return // Do not invent an executable identity for an unidentifiable call.
+	}
+	if s.toolCallIDs == nil {
+		s.toolCallIDs = make(map[string]string)
+	}
+	if itemID != "" {
+		if previous := s.toolCallIDs[itemID]; previous != "" && previous != callID {
+			if prior := s.toolCalls[previous]; prior != nil && prior.started {
+				// Once a start escapes, changing its ID would orphan that call or
+				// create a duplicate. Fail closed instead of guessing a replay ID.
+				s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New("responses function call changed its call_id")})
+				s.done = true
+				return
+			}
+			// A metadata-only item has not published an identity yet. Its
+			// provisional state can be replaced by the complete call's ID.
+			delete(s.toolCalls, previous)
+		}
+		s.toolCallIDs[itemID] = callID
+	}
+	if s.toolCalls == nil {
+		s.toolCalls = make(map[string]*responsesToolProgress)
+	}
+	progress := s.toolCalls[callID]
+	if progress == nil {
+		progress = &responsesToolProgress{}
+		s.toolCalls[callID] = progress
+	}
+	if !progress.started {
+		if name == "" || finished && arguments == "" {
+			// Do not turn an incomplete recovery snapshot into an executable
+			// empty object. A later terminal may supply the missing name/args.
+			// Keep it pending so another complete call cannot hide this gap.
+			return
+		}
+		progress.started = true
+		s.pending = append(s.pending, provider.StreamEvent{Type: "tool_use_start", ToolUseID: callID, ToolName: name})
+	}
+	if finished && !progress.finished && (arguments != "" || progress.hasArguments) {
+		progress.finished = true
+		s.pending = append(s.pending, provider.StreamEvent{Type: "tool_use_stop", ToolUseID: callID, InputDelta: arguments})
+	}
 }
 
 type responsesReasoningProgress struct {
@@ -912,18 +978,7 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 			if env.Item.Type == "reasoning" {
 				s.reasoningProgress(env.Item.ID, env.OutputIndex)
 			} else if env.Item.Type == "function_call" {
-				callID := env.Item.CallID
-				if callID == "" {
-					callID = env.Item.ID
-				}
-				if env.Item.ID != "" {
-					s.toolCallIDs[env.Item.ID] = callID
-				}
-				s.pending = append(s.pending, provider.StreamEvent{
-					Type:      "tool_use_start",
-					ToolUseID: callID,
-					ToolName:  env.Item.Name,
-				})
+				s.enqueueToolItem(env.Item.ID, env.Item.CallID, env.Item.Name, env.Item.Arguments, false)
 			}
 		case "response.function_call_arguments.delta":
 			if env.Delta != "" {
@@ -932,23 +987,16 @@ func (s *responsesStream) Recv() (provider.StreamEvent, error) {
 					// Compatibility endpoints sometimes use call_id as item_id.
 					callID = env.ItemID
 				}
-				s.pending = append(s.pending, provider.StreamEvent{Type: "tool_input_delta", ToolUseID: callID, InputDelta: env.Delta})
+				if progress := s.toolCalls[callID]; progress == nil || !progress.finished {
+					if progress != nil {
+						progress.hasArguments = true
+					}
+					s.pending = append(s.pending, provider.StreamEvent{Type: "tool_input_delta", ToolUseID: callID, InputDelta: env.Delta})
+				}
 			}
 		case "response.output_item.done":
 			if env.Item.Type == "function_call" {
-				callID := env.Item.CallID
-				if callID == "" {
-					callID = s.toolCallIDs[env.Item.ID]
-				}
-				if callID == "" {
-					callID = env.Item.ID
-				}
-				s.pending = append(s.pending, provider.StreamEvent{
-					Type:       "tool_use_stop",
-					ToolUseID:  callID,
-					InputDelta: env.Item.Arguments, // full args resync (authoritative)
-				})
-				delete(s.toolCallIDs, env.Item.ID)
+				s.enqueueToolItem(env.Item.ID, env.Item.CallID, env.Item.Name, env.Item.Arguments, true)
 			} else if env.Item.Type == "reasoning" {
 				s.enqueueSummarySnapshot(env.Item.ID, env.OutputIndex, env.Item.Summary)
 				if env.Item.EncryptedContent != "" {
@@ -1013,6 +1061,14 @@ func (s *responsesStream) enqueueTerminal(response *responsesStreamResponse, for
 			s.responseID = response.ID
 		}
 		if response.Status != "" {
+			if forcedStatus != "" && forcedStatus != response.Status {
+				// A failed/incomplete event cannot authorize tools merely because
+				// its payload claims success (nor can a conflicting success event
+				// override a non-success payload). Reject the inconsistent boundary.
+				s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New("responses terminal event disagrees with response status")})
+				s.done = true
+				return
+			}
 			status = response.Status
 		}
 	}
@@ -1042,7 +1098,28 @@ func (s *responsesStream) enqueueTerminal(response *responsesStreamResponse, for
 		for index, item := range response.Output {
 			if item.Type == "reasoning" {
 				s.enqueueSummarySnapshot(item.ID, &index, item.Summary)
+			} else if status == "completed" && item.Type == "function_call" {
+				// Only a successful terminal authorizes recovering omitted calls.
+				// Incomplete/filtered output must retain its non-executable status.
+				s.enqueueToolItem(item.ID, item.CallID, item.Name, item.Arguments, true)
+				if s.done {
+					return
+				}
 			}
+		}
+	}
+	if status == "completed" {
+		unfinished := s.sawToolCall && len(s.toolCalls) == 0
+		for _, progress := range s.toolCalls {
+			unfinished = unfinished || !progress.finished
+		}
+		if unfinished {
+			// Added/delta events alone do not finalize an invocation, even if
+			// their bytes happen to parse as JSON. Require a done or complete
+			// terminal tool snapshot before any consumer can execute the batch.
+			s.pending = append(s.pending, provider.StreamEvent{Type: "error", Err: errors.New("responses completed before function call arguments were finalized")})
+			s.done = true
+			return
 		}
 	}
 
@@ -1052,7 +1129,7 @@ func (s *responsesStream) enqueueTerminal(response *responsesStreamResponse, for
 		if response != nil && response.IncompleteDetails != nil {
 			stopReason = mapResponsesIncompleteReason(response.IncompleteDetails.Reason)
 		}
-	} else if response != nil && hasFunctionCall(response.Output) {
+	} else if s.sawToolCall || response != nil && hasFunctionCall(response.Output) {
 		stopReason = "tool_use"
 	}
 	event := provider.StreamEvent{Type: "message_delta", StopReason: stopReason}

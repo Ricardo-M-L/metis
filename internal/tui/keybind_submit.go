@@ -1350,7 +1350,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// Persist through a durable history cursor. This records the initial
 	// prompt now, then persistTail at turn end records every assistant/tool
 	// message plus any user steering injected while the run was active.
-	m.persistTail()
+	if err := m.persistTail(); err != nil {
+		m.warnSessionSave(err)
+	}
 	// Mirror to ~/.metis/history.jsonl for cross-session prompt search.
 	// Fire-and-forget — disk hiccups must not block the chat.
 	transcriptText := text

@@ -20,7 +20,23 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 )
+
+// Keep local Recall persistence failures distinct from provider failures in
+// both streamed events and finalization, which may report the same error.
+// Use the typed error's safe message, never its private underlying cause.
+func formatTurnError(err error) (formatted, hint string) {
+	var persistenceErr *memory.RecallPersistenceError
+	if errors.As(err, &persistenceErr) {
+		return "Memory save error: " + persistenceErr.Error(), "The completed answer is retained. Check local memory storage and permissions before retrying the save."
+	}
+	if err == nil {
+		return "", ""
+	}
+	msg, hint := formatProviderError(err.Error())
+	return "API Error: " + msg, hint
+}
 
 // formatProviderError compresses a provider error message into a
 // transcript-friendly one-liner. Returns the error text plus an

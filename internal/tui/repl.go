@@ -589,7 +589,9 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 		} else {
 			r.Loop.AppendUser(text)
 		}
-		r.persistTail()
+		if err := r.persistTail(); err != nil {
+			fmt.Fprintln(r.out, r.Styles.Err.Render(err.Error()))
+		}
 		_ = runtime.AppendHistory(runtime.HistoryEntry{
 			SessionID: r.SessionID, Input: visibleInput, Source: "repl",
 		})
@@ -811,10 +813,13 @@ func historyFilePath() string {
 	return filepath.Join(dir, "history")
 }
 
-func (r *REPL) runTurn(ctx context.Context) error {
-	// EventLoopDone normally flushes eagerly below; the deferred retry covers
-	// provider errors/cancellation paths that close the event stream first.
-	defer r.persistTail()
+func (r *REPL) runTurn(ctx context.Context) (returnErr error) {
+	// Every exit joins the producer before saving. Keep a failed append in the
+	// result so Run displays it, while leaving the cursor and live transcript
+	// retryable at the next close/switch boundary.
+	defer func() {
+		returnErr = errors.Join(returnErr, r.persistTail())
+	}()
 	events := make(chan agent.Event, eventBufferSize())
 	done := make(chan error, 1)
 
@@ -884,7 +889,6 @@ func (r *REPL) runTurn(ctx context.Context) error {
 			r.resetTokenUsageAfterCompaction()
 		case agent.EventLoopDone:
 			r.flushTextBeforeTool(turnStartedText)
-			r.persistTail()
 			fmt.Fprintln(r.out)
 			runErr := <-done
 			if runErr == nil && agent.IsIncompleteStopReason(ev.StopReason) {
@@ -1004,15 +1008,18 @@ func (r *REPL) askPermission(ev agent.Event) agent.PermissionDecision {
 	}
 }
 
-func (r *REPL) persistTail() {
-	if r.Session == nil || r.SessionID == "" || r.Loop == nil {
-		return
+func (r *REPL) persistTail() error {
+	if r == nil || r.Session == nil || r.SessionID == "" || r.Loop == nil {
+		return nil
 	}
 	if r.historyCursor == nil {
 		cursor := session.NewHistoryCursor(nil)
 		r.historyCursor = &cursor
 	}
-	_ = r.Session.AppendHistoryTail(r.SessionID, r.Loop.History(), r.historyCursor)
+	if err := r.Session.AppendHistoryTail(r.SessionID, r.Loop.History(), r.historyCursor); err != nil {
+		return fmt.Errorf("save session %s transcript: %w", shortID(r.SessionID), err)
+	}
+	return nil
 }
 
 func (r *REPL) replaceHistory(history []llm.Message) error {

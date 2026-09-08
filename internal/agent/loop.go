@@ -194,6 +194,14 @@ type Loop struct {
 	// History). Recursive compaction is still unsupported.
 	CompactionCheckpoint func(before, after []llm.Message) error
 
+	// HistoryCheckpoint durably saves a complete conversation boundary before
+	// Run starts the next iteration, and again after orphan repair on exit.
+	// The producer calls it synchronously with an owned snapshot, without
+	// holding Loop.mu. A failure stops Run; no subsequent provider call may
+	// pass a failed checkpoint. Configure this before Run starts, and do not
+	// read live history from a consumer's EventTurnEnd notification instead.
+	HistoryCheckpoint func(history []llm.Message) error
+
 	// Budget enforces the session-level USD cap (claude-code's
 	// maxBudgetUsd). nil = no cap. Sub-agent loops receive the SAME
 	// tracker pointer as their parent, so child spend draws down one
@@ -783,6 +791,16 @@ func (l *Loop) History() []llm.Message {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return transcript.Snapshot(l.Messages)
+}
+
+func (l *Loop) checkpointHistory() error {
+	if l.HistoryCheckpoint == nil {
+		return nil
+	}
+	if err := l.HistoryCheckpoint(l.History()); err != nil {
+		return fmt.Errorf("checkpoint session history: %w", err)
+	}
+	return nil
 }
 
 // EstimateContextTokens returns the active provider context plus any local
@@ -1602,6 +1620,10 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	var stopReason string
 	defer func() {
 		l.repairOrphansInPlace()
+		if err := l.checkpointHistory(); err != nil {
+			runErr = errors.Join(runErr, err)
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+		}
 		l.mu.RLock()
 		msgCount := len(l.Messages)
 		l.mu.RUnlock()
@@ -1655,6 +1677,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	}
 
 	for {
+		// All tool-result messages and any re-entry steering from the previous
+		// iteration are now complete. The producer must cross this durability
+		// boundary before making another provider call; event consumers can lag
+		// behind and therefore cannot safely own this persistence cursor.
+		if err := l.checkpointHistory(); err != nil {
+			stopReason = "error"
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		// Per-turn wall-clock cap (see deadline computation above).
 		// Checked at the top of each iter so an in-flight Bash /
 		// LLM call still finishes before we abort — same shape as
@@ -1759,6 +1790,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		specs = l.toolSpecs()
 		pressureTokens := l.EstimateRequestContextTokens(specs)
 		l.maybeCompactWithPressure(ctx, out, pressureTokens)
+		// Automatic compaction may recover from a summarizer failure, but a
+		// surface's failed durable replacement must still stop the request.
+		// This also commits any pre-request injected messages as one boundary.
+		if err := l.checkpointHistory(); err != nil {
+			stopReason = "error"
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		requestWithoutTools := l.rescueNoToolsSnapshot()
 		req, contextAnchor := l.buildRequestWithContext(specs)
 		provider := contextAnchor.provider
@@ -1782,6 +1821,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			switch class.Recovery() {
 			case RecoveryCompactRetry:
 				if l.tryRecoverOverflow(ctx, err, out) {
+					if checkpointErr := l.checkpointHistory(); checkpointErr != nil {
+						stopReason = "error"
+						emit(ctx, out, Event{Kind: EventError, Err: checkpointErr})
+						return checkpointErr
+					}
 					req, contextAnchor = l.buildRequestForRetryWithContext(specs, requestWithoutTools)
 					provider = contextAnchor.provider
 					if provider == nil {
@@ -2207,7 +2251,22 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			// completion, but session deletion/shutdown can cancel and join it.
 			completed, err := l.recordCompletedTurn(ctx)
 			if err != nil {
-				emit(ctx, out, Event{Kind: EventInfo, Info: "memory recall persistence failed: " + err.Error()})
+				var persistenceErr *memory.RecallPersistenceError
+				if errors.As(err, &persistenceErr) {
+					// The answer is complete, but synchronous Recall storage is
+					// not optional enrichment. Preserve the answer/history and
+					// return the classified failure to every entry point. Wrap
+					// again to keep arbitrary outer repository text out of UIs.
+					err = &memory.RecallPersistenceError{Err: err}
+					l.Hooks.EmitLoopEnd(ctx, tc, stop)
+					emit(ctx, out, Event{Kind: EventError, Err: err})
+					return err
+				}
+				info := "recall memory not saved: unclassified repository error"
+				if memory.IsRecallPolicyRejection(err) {
+					info = "recall memory not saved: rejected by memory safety or session-deletion policy"
+				}
+				emit(ctx, out, Event{Kind: EventInfo, Info: info})
 			}
 			l.maybeDistillSnapshot(completed)
 			l.Hooks.EmitLoopEnd(ctx, tc, stop)
@@ -2355,6 +2414,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				l.mu.Lock()
 				l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
 				l.mu.Unlock()
+				if err := l.checkpointHistory(); err != nil {
+					stopReason = "error"
+					emit(ctx, out, Event{Kind: EventError, Err: err})
+					return err
+				}
 				l.Hooks.EmitTurnEnd(ctx, tc, l.turnIdx)
 				emit(ctx, out, Event{Kind: EventTurnEnd})
 				l.turnIdx++
@@ -2515,6 +2579,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			l.mu.Lock()
 			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
 			l.mu.Unlock()
+			if err := l.checkpointHistory(); err != nil {
+				stopReason = "error"
+				emit(ctx, out, Event{Kind: EventError, Err: err})
+				return err
+			}
 			l.Hooks.EmitTurnEnd(ctx, tc, l.turnIdx)
 			emit(ctx, out, Event{Kind: EventTurnEnd})
 			l.turnIdx++
@@ -2612,6 +2681,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			l.mu.Lock()
 			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
 			l.mu.Unlock()
+			if err := l.checkpointHistory(); err != nil {
+				stopReason = "error"
+				emit(ctx, out, Event{Kind: EventError, Err: err})
+				return err
+			}
 			l.Hooks.EmitTurnEnd(ctx, tc, l.turnIdx)
 			emit(ctx, out, Event{Kind: EventTurnEnd})
 			l.turnIdx++
@@ -2654,6 +2728,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
 			l.mu.Unlock()
 			stopReason = "halted_by_hook"
+			if err := l.checkpointHistory(); err != nil {
+				stopReason = "error"
+				emit(ctx, out, Event{Kind: EventError, Err: err})
+				return err
+			}
 			l.Hooks.EmitLoopEnd(ctx, tc, "halted_by_hook")
 			emit(ctx, out, Event{Kind: EventInfo, Info: "halt: " + hreason})
 			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "halted_by_hook"})
@@ -2688,6 +2767,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
 		l.mu.Unlock()
 
+		if err := l.checkpointHistory(); err != nil {
+			stopReason = "error"
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		l.Hooks.EmitTurnEnd(ctx, tc, l.turnIdx)
 		emit(ctx, out, Event{Kind: EventTurnEnd})
 		l.turnIdx++

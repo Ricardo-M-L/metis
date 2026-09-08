@@ -872,12 +872,20 @@ func (m *Model) finalizeTurn(err error) {
 		m.messages = append(m.messages, Message{Role: "assistant", Content: content, Timestamp: time.Now()})
 		m.streamingText = ""
 	}
+	// A completed model response is not yet a saved conversation. Surface a
+	// failed append before completion notifications, retain the live history
+	// and cursor for retry, and stop unattended continuation until the user
+	// can respond. Session close/switch retries this same tail independently.
+	persistErr := m.persistTail()
+	if persistErr != nil {
+		m.warnSessionSave(persistErr)
+	}
 	// Append claude-code-style turn-end thought summary
 	// ("✻ Cogitated for 1m 32s") so the user can see at a glance how
 	// long each turn ran. Skipped on errors — the error row already
 	// carries failure context, and stacking a summary below it reads
 	// as celebratory.
-	if err == nil && !m.spinnerStartedAt.IsZero() {
+	if err == nil && persistErr == nil && !m.spinnerStartedAt.IsZero() {
 		if d := time.Since(m.spinnerStartedAt); d >= time.Second {
 			m.messages = append(m.messages, Message{
 				Role:      "thought-summary",
@@ -923,7 +931,7 @@ func (m *Model) finalizeTurn(err error) {
 	// of duration / error — leaving it stuck would mislead a glance at
 	// the dock. Indicate failure with the Error variant first so the
 	// dock briefly shows red before clearing.
-	if err != nil && !userCancelled {
+	if (err != nil && !userCancelled) || persistErr != nil {
 		notify.SendProgress(notify.ProgressError, 0)
 	}
 	notify.SendProgress(notify.ProgressClear, 0)
@@ -982,7 +990,6 @@ func (m *Model) finalizeTurn(err error) {
 			Recap:      recap,
 		})
 	}
-	m.persistTail()
 	if err != nil && !userCancelled {
 		// finalizeTurn fires when the loop's done channel returns. Most
 		// of the time that error has ALREADY been surfaced via the
@@ -994,8 +1001,7 @@ func (m *Model) finalizeTurn(err error) {
 		// Fix: route through formatProviderError too, AND dedupe
 		// against the last error row so we don't double-print the
 		// same failure under two formats.
-		errMsg, _ := formatProviderError(err.Error())
-		formatted := "API Error: " + errMsg
+		formatted, _ := formatTurnError(err)
 		alreadyShown := false
 		for i := len(m.messages) - 1; i >= 0; i-- {
 			r := m.messages[i].Role
@@ -1024,7 +1030,7 @@ func (m *Model) finalizeTurn(err error) {
 	// parity). We only run on success: a turn that errored out
 	// leaves the queue intact so the user can retry or wipe via
 	// Ctrl+C.
-	if err == nil && len(m.queuedPrompts) > 0 {
+	if err == nil && persistErr == nil && len(m.queuedPrompts) > 0 {
 		nextText, batchN := m.drainNextQueuedBatch()
 		if batchN > 0 {
 			var notice string
@@ -1055,11 +1061,29 @@ func (m *Model) currentTurnToolEvents() []ToolEvent {
 	return m.toolEvents[start:]
 }
 
-func (m *Model) persistTail() {
-	if m.session == nil || m.sessionID == "" || m.loop == nil {
+func (m *Model) persistTail() error {
+	if m == nil || m.session == nil || m.sessionID == "" || m.loop == nil {
+		return nil
+	}
+	if err := m.session.AppendHistoryTail(m.sessionID, m.loop.History(), &m.historyCursor); err != nil {
+		return fmt.Errorf("save session %s transcript: %w", shortID(m.sessionID), err)
+	}
+	return nil
+}
+
+func (m *Model) warnSessionSave(err error) {
+	if m == nil || err == nil {
 		return
 	}
-	_ = m.session.AppendHistoryTail(m.sessionID, m.loop.History(), &m.historyCursor)
+	m.backgroundResumeAllowed = false
+	content := err.Error() + ". The conversation is still in memory; restore storage before closing or switching sessions."
+	if len(m.messages) > 0 {
+		last := m.messages[len(m.messages)-1]
+		if last.Role == "warning" && last.Content == content {
+			return
+		}
+	}
+	m.messages = append(m.messages, Message{Role: "warning", Content: content, Timestamp: time.Now()})
 }
 
 // runTurnAsync runs one agent turn in a goroutine. It is a FREE

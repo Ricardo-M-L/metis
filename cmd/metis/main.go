@@ -2526,32 +2526,26 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 		llmPrompt = llmPrompt + "\n\n" + schemaEnforcer.Instruction()
 		rt.loop.ResponseFormat = schemaEnforcer.ResponseFormat()
 	}
-	historyCursor := session.NewHistoryCursor(rt.loop.History())
-	if rt.store != nil && rt.sessionID != "" {
-		rt.loop.CompactionCheckpoint = func(before, after []llm.Message) error {
-			return rt.store.CheckpointCompaction(rt.sessionID, before, after, &historyCursor)
-		}
-	}
-	// Flush once more on every return path (including schema retries and
-	// errors). EventLoopDone also flushes eagerly; the cursor makes the defer
-	// idempotent while preserving partial tool history on late failures.
+	checkpoint := newHeadlessCheckpoint(rt.loop, rt.store, rt.sessionID)
+	// Flush once more after the producer has joined on every return path,
+	// including schema retries and errors. The same cursor is used by Run's
+	// synchronous checkpoints and compaction, so this final save is idempotent.
 	defer func() {
-		if rt.store != nil && rt.sessionID != "" {
-			if err := rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor); err != nil {
-				returnErr = errors.Join(returnErr, fmt.Errorf("save headless session checkpoint: %w", err))
-			}
+		if err := checkpoint.Save(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("save headless session checkpoint: %w", err))
 		}
 	}()
 	rt.loop.AppendUser(llmPrompt)
 	if rt.store != nil && rt.sessionID != "" {
 		if err := rt.store.AppendMessage(rt.sessionID, llm.Message{
 			Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: prompt}},
-		}); err == nil {
-			// The loop intentionally sees llmPrompt (subdir hints / schema
-			// contract), while the exported transcript keeps the raw prompt.
-			// Mark the corresponding in-memory position as durable.
-			historyCursor.Mark(rt.loop.History())
+		}); err != nil {
+			return fmt.Errorf("save headless session prompt: %w", err)
 		}
+		// The loop intentionally sees llmPrompt (subdir hints / schema
+		// contract), while the exported transcript keeps the raw prompt.
+		// The first producer checkpoint fsyncs this corresponding position.
+		checkpoint.MarkPrompt(llmPrompt, prompt)
 	}
 	_ = rtpkg.AppendHistory(rtpkg.HistoryEntry{
 		SessionID: rt.sessionID, Input: prompt, Source: "run",
@@ -2865,13 +2859,9 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 				"[metrics] tokens.in=%d tokens.out=%d tokens.cache_read=%d tokens.cache_create=%d cache_hit=%.1f%% duration_ms=%d stop_reason=%s\n",
 				totIn, totOut, totCacheRead, totCacheCreate, hitPct, time.Since(runStart).Milliseconds(), finalStop)
 
-			// Persist the full not-yet-durable history suffix. In particular,
-			// do not walk back to the last user text: a steering user message
-			// can appear after tool_use/tool_result blocks and would otherwise
-			// make session export silently drop those earlier blocks.
-			if rt.store != nil && rt.sessionID != "" {
-				_ = rt.store.AppendHistoryTail(rt.sessionID, rt.loop.History(), &historyCursor)
-			}
+			// Persistence belongs to the producer checkpoint, not this buffered
+			// notification: Run may still be repairing history or finishing its
+			// defers. The final save below runs only after the producer joins.
 		case agent.EventError:
 			// Join the producer before flushing history: cancellation can emit an
 			// error before Run's orphan-repair/session-end defers have finished.
@@ -2905,7 +2895,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 		return runTerminalError(incompleteReason, incompleteDetail)
 	}
 	if err != nil {
-		return err
+		return reportHeadlessRecallFailure(err, "metis run", os.Stderr)
 	}
 
 	// --output-schema: validate the final reply; invalid output buys
@@ -2925,7 +2915,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 				if errors.As(err, &incompleteErr) {
 					return runTerminalError(incompleteErr.Reason, "schema correction stopped before a complete response")
 				}
-				return err
+				return reportHeadlessRecallFailure(err, "metis run", os.Stderr)
 			}
 			validated, verr = schemaEnforcer.Validate(finalText)
 		}
@@ -3621,6 +3611,7 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	// run `cron denied`") instead of staying silent like the old auto-deny.
 	cronDeniedCount := 0
 	loopStopReason := ""
+	var eventErr error
 
 	for ev := range events {
 		switch ev.Kind {
@@ -3718,10 +3709,20 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 			if auditW != nil {
 				auditW.Append(agent.AuditEntry{Kind: "error", Text: ev.Err.Error(), IsError: true})
 			}
-			return ev.Err
+			// An error can precede Run's final checkpoint/session-end defers.
+			// Drain events and join the producer before cleanup or runtime reuse.
+			if eventErr == nil {
+				eventErr = ev.Err
+			}
 		}
 	}
 	runErr := <-done
+	if runErr == nil {
+		runErr = eventErr
+	}
+	if runErr != nil {
+		return reportHeadlessRecallFailure(runErr, "cron job "+job.ID, os.Stderr)
+	}
 	if runErr == nil && agent.IsIncompleteStopReason(loopStopReason) {
 		runErr = &exitcode.IncompleteError{Reason: loopStopReason}
 	}

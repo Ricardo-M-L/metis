@@ -112,6 +112,9 @@ func (r *REPL) leaveActiveSession(source string, closing bool) error {
 	if r == nil || r.sessionBoundaryClosed || r.SessionID == "" {
 		return nil
 	}
+	if err := r.persistTail(); err != nil {
+		return err
+	}
 	summary := ""
 	if r.Loop != nil {
 		summary = r.summarizeHistory()
@@ -129,6 +132,12 @@ func (r *REPL) leaveActiveSession(source string, closing bool) error {
 func (m *Model) leaveActiveSession(source string, closing bool) error {
 	if m == nil || m.sessionBoundaryClosed || m.sessionID == "" {
 		return nil
+	}
+	// Completion-time writes may have failed transiently. Do not replace the
+	// only live copy or claim a Daily hand-off until the remaining transcript
+	// has reached the session store, even if no foreground turn is active.
+	if err := m.persistTail(); err != nil {
+		return err
 	}
 	summary := ""
 	if m.loop != nil {
@@ -151,23 +160,24 @@ func (m *Model) leaveActiveSession(source string, closing bool) error {
 // dependencies, and lose the final transcript/Daily tail. An OS-level force
 // kill remains the explicit escape hatch for a provider that never returns.
 func (m *Model) stopForegroundTurnForClose() error {
-	if m == nil || !m.turnActive {
+	if m == nil {
 		return nil
 	}
-	if m.turnCancel != nil {
-		m.turnCancel()
-		m.turnCancel = nil
-	}
-	<-m.doneCh
-	var persistErr error
-	if m.session != nil && m.sessionID != "" && m.loop != nil {
-		if err := m.session.AppendHistoryTail(m.sessionID, m.loop.History(), &m.historyCursor); err != nil {
-			persistErr = fmt.Errorf("persist foreground turn for session %s: %w", shortID(m.sessionID), err)
+	if m.turnActive {
+		if m.turnCancel != nil {
+			m.turnCancel()
+			m.turnCancel = nil
 		}
+		<-m.doneCh
 	}
 	m.turnActive = false
 	m.spinnerActive = false
-	return persistErr
+	// An idle UI can still have an unsaved completed turn. Its cursor remains
+	// at the last successful write, so this retry also preserves partial writes.
+	if err := m.persistTail(); err != nil {
+		return fmt.Errorf("persist foreground turn for session %s: %w", shortID(m.sessionID), err)
+	}
+	return nil
 }
 
 // cleanupUnactivatedSession removes a fresh/fork destination whose activation
@@ -530,6 +540,12 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 		// reporting the failed switch.
 		restoreSourceRuntime()
 		return fmt.Errorf("persist source session memory: %w", err)
+	}
+	if restorePermissions && id == sourceSessionID {
+		// The picker loaded this same session before the source boundary
+		// retried its unsaved tail. That old destination snapshot must not
+		// replace the now-durable live history or reset its cursor backwards.
+		messages = m.loop.History()
 	}
 	// Ephemeral cron jobs belong to the session being left. Keeping them in
 	// the shared service would make an old reminder fire into the destination

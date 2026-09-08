@@ -148,27 +148,6 @@ func TestAgentTool_TimeoutFromDefaultConfig(t *testing.T) {
 	}
 }
 
-// TestAgentTool_TimeoutZeroDisabled — passing `timeout_seconds: 0`
-// explicitly should NOT cap the sub-agent. Otherwise users couldn't
-// opt out for legitimately long tasks. Verify by using a fast
-// helloProvider — if 0 wrongly triggered cancellation we'd see an
-// IsError.
-func TestAgentTool_TimeoutZeroDisabled(t *testing.T) {
-	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system").
-		WithDefaultTimeout(1 * time.Second)
-
-	res, err := tool.Execute(context.Background(), map[string]any{
-		"prompt":          "fast task",
-		"timeout_seconds": 0,
-	})
-	if err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-	if res.IsError {
-		t.Errorf("timeout_seconds=0 must disable the cap (override default); got IsError: %s", res.Output)
-	}
-}
-
 // hangingProvider is a Provider that simulates a hung network read —
 // Recv() blocks until the context is cancelled. Used to exercise the
 // timeout path without flaky real-network tests.

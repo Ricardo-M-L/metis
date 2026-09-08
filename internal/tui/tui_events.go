@@ -343,8 +343,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// recognize the failure class. Same error firing N times in a
 		// row collapses into one row with "(×N)" — image #62 had 4
 		// stacked context-window errors that filled the screen.
-		errMsg, errHint := formatProviderError(ev.Err.Error())
-		formatted := "API Error: " + errMsg
+		formatted, errHint := formatTurnError(ev.Err)
 		// Find the last error row WITH the same content (skip a possible
 		// trailing error-hint), so the dedupe still triggers even after
 		// we appended a hint last time.

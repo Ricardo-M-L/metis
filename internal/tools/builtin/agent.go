@@ -1009,12 +1009,14 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}
 	}()
 
-	// G.0 timeout — wall-clock cap. Caller-provided `timeout_seconds`
-	// wins; else config default; 0 disables.
-	timeoutSec := intArg(in, "timeout_seconds", 0)
-	timeout := time.Duration(timeoutSec) * time.Second
-	if timeoutSec == 0 && a.defaultTimeout > 0 {
-		timeout = a.defaultTimeout
+	// Only an explicit numeric value overrides the configured fallback. Zero
+	// disables this child's cap, not a deadline inherited from its parent.
+	// Unsupported types keep the fallback for direct Execute callers; normal
+	// dispatch rejects them through the tool's integer schema.
+	timeout := a.defaultTimeout
+	switch in["timeout_seconds"].(type) {
+	case int, int64, float64:
+		timeout = time.Duration(intArg(in, "timeout_seconds", 0)) * time.Second
 	}
 
 	// Extract the parent loop's sub-agent notification channel BEFORE
