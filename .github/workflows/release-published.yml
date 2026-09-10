@@ -20,6 +20,7 @@ jobs:
     outputs:
       channel: ${{ steps.inventory.outputs.channel }}
       default_channel_check: ${{ steps.inventory.outputs.default_channel_check }}
+      unsigned_macos: ${{ steps.inventory.outputs.unsigned_macos }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,6 +72,11 @@ jobs:
           default_channel_check=$(python3 release-tools/scripts/verify_cli_default_channel.py supports \
             --tag "$TAG" --prerelease "$(jq -r .prerelease plan.json)")
           echo "default_channel_check=$default_channel_check" >> "$GITHUB_OUTPUT"
+          unsigned_macos=false
+          if [ -f source/.github/unsigned-macos-releases.json ]; then
+            unsigned_macos=$(jq -r --arg tag "$TAG" 'has($tag)' source/.github/unsigned-macos-releases.json)
+          fi
+          echo "unsigned_macos=$unsigned_macos" >> "$GITHUB_OUTPUT"
 
   install-smoke-unix:
     name: Anonymous install smoke (Linux)
@@ -171,7 +177,7 @@ jobs:
   macos-trust:
     name: Verify macOS signing, notarization, and Gatekeeper
     needs: inventory
-    if: needs.inventory.outputs.channel == 'stable'
+    if: needs.inventory.outputs.channel == 'stable' && needs.inventory.outputs.unsigned_macos != 'true'
     runs-on: macos-latest
     steps:
       - name: Download official macOS assets
@@ -219,3 +225,46 @@ jobs:
           xcrun stapler validate dist/metis-desktop-darwin-universal.dmg
           spctl --assess --type open --context context:primary-signature --verbose=2 \
             dist/metis-desktop-darwin-universal.dmg
+
+  macos-adhoc:
+    name: Verify registered ad-hoc macOS Desktop
+    needs: inventory
+    if: needs.inventory.outputs.channel == 'stable' && needs.inventory.outputs.unsigned_macos == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Download registered ad-hoc macOS assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'metis-desktop-darwin-universal.*' --dir dist
+
+      - name: Verify checksums, bundle metadata, architecture, and ad-hoc signatures
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 -c metis-desktop-darwin-universal.zip.sha256)
+          (cd dist && shasum -a 256 -c metis-desktop-darwin-universal.dmg.sha256)
+          hdiutil verify dist/metis-desktop-darwin-universal.dmg
+
+          mkdir unpacked
+          ditto -x -k dist/metis-desktop-darwin-universal.zip unpacked
+          if [ -d unpacked/metis-desktop.app ]; then
+            app=unpacked/metis-desktop.app
+          else
+            app=unpacked/METIS.app
+          fi
+          test -d "$app"
+          version=${TAG#v}
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleName)" = "METIS"
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleDisplayName)" = "METIS"
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleExecutable)" = "metis-desktop"
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleShortVersionString)" = "$version"
+          lipo "$app/Contents/MacOS/metis-desktop" -verify_arch x86_64 arm64
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | grep -q '^Signature=adhoc$'
+          codesign --verify --verbose=2 dist/metis-desktop-darwin-universal.dmg
+          codesign -dv --verbose=4 dist/metis-desktop-darwin-universal.dmg 2>&1 | grep -q '^Signature=adhoc$'

@@ -7,6 +7,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.57] - 2026-09-11
+
+Prepared as a full CLI and Desktop release. The macOS Desktop artifacts in
+this release are ad-hoc signed and are not Apple-notarized; checksums, bundle
+metadata, architecture, launch behavior, and the shared Agent runtime are
+verified independently.
+
+### Fixed
+
+- Allow `Agent` calls to combine `cwd` with `isolation: "worktree"`, using
+  `cwd` to select the source repository even when METIS was launched elsewhere.
+- Distinguish a repository's main checkout from a linked worktree so launching
+  an isolated child from the repository root is no longer rejected as nesting.
+- Give non-Git worktree failures an actionable retry without isolation, and do
+  not count setup-rejected Agent calls as successful implementation dispatches.
+  This prevents the verification contract from amplifying a recoverable setup
+  error into repeated creator/verifier calls.
+
 ## [0.4.56] - 2026-09-08
 
 Prepared as a full CLI and Desktop release with the complete 20-asset contract,
