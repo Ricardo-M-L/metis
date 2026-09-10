@@ -23,6 +23,16 @@ func makeToolUse(name string, input map[string]any) llm.ContentBlock {
 	return llm.ContentBlock{Type: "tool_use", ToolName: name, ToolInput: input}
 }
 
+func observeSuccessfulAgent(ct *contractTracker, subagentType string) {
+	use := makeToolUse("Agent", map[string]any{"subagent_type": subagentType})
+	result := "completed"
+	if subagentType == "verify" {
+		result = "VERDICT: PASS"
+	}
+	ct.observeToolUses([]llm.ContentBlock{use})
+	ct.observeToolResults([]llm.ContentBlock{use}, []llm.ContentBlock{makeToolResult(result)})
+}
+
 func observeIndependentRisk(ct *contractTracker) {
 	for _, path := range []string{"internal/a.go", "internal/b.go", "internal/c.go"} {
 		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Edit", map[string]any{"file_path": path})})
@@ -46,12 +56,12 @@ func TestContract_ThresholdViaMutationScope(t *testing.T) {
 func TestContract_ThresholdViaImplementationAgents(t *testing.T) {
 	var ct contractTracker
 	for i := 0; i < 2; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "general"})})
+		observeSuccessfulAgent(&ct, "general")
 	}
 	if ct.thresholdMet() {
 		t.Fatalf("threshold should not yet be met at %d implementation agents", ct.implementationAgents)
 	}
-	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "general"})})
+	observeSuccessfulAgent(&ct, "general")
 	if !ct.thresholdMet() {
 		t.Errorf("threshold expected at %d implementation agents", ct.implementationAgents)
 	}
@@ -100,7 +110,7 @@ func TestContract_RiskHighImpactCommandRequiresIndependentVerifier(t *testing.T)
 func TestContract_RiskMultipleImplementersRequireIndependentVerifier(t *testing.T) {
 	var ct contractTracker
 	for i := 0; i < 3; i++ {
-		ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "general"})})
+		observeSuccessfulAgent(&ct, "general")
 	}
 	if !ct.thresholdMet() {
 		t.Fatal("several implementation agents should require independent verification")
@@ -109,16 +119,16 @@ func TestContract_RiskMultipleImplementersRequireIndependentVerifier(t *testing.
 
 func TestContract_VerifyDispatchedFlag(t *testing.T) {
 	var ct contractTracker
-	ct.observeToolUses([]llm.ContentBlock{
+	uses := []llm.ContentBlock{
 		makeToolUse("Agent", map[string]any{"subagent_type": "plan"}),
 		makeToolUse("Agent", map[string]any{"subagent_type": "general"}),
-	})
+	}
+	ct.observeToolUses(uses)
+	ct.observeToolResults(uses, []llm.ContentBlock{makeToolResult("planned"), makeToolResult("implemented")})
 	if ct.verifyDispatched {
 		t.Errorf("verifyDispatched should be false for non-verify subagent_types")
 	}
-	ct.observeToolUses([]llm.ContentBlock{
-		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
-	})
+	observeSuccessfulAgent(&ct, "verify")
 	if !ct.verifyDispatched {
 		t.Errorf("verifyDispatched should be true after a verify dispatch")
 	}
@@ -158,7 +168,8 @@ func TestContract_MidTurnReminder_QuietIfVerifyAlreadyDispatched(t *testing.T) {
 		uses = append(uses, makeToolUse("Agent", map[string]any{"subagent_type": "general"}))
 	}
 	ct.observeToolUses(uses)
-	ct.observeToolUses([]llm.ContentBlock{makeToolUse("Agent", map[string]any{"subagent_type": "verify"})})
+	ct.observeToolResults(uses, []llm.ContentBlock{makeToolResult("one"), makeToolResult("two"), makeToolResult("three")})
+	observeSuccessfulAgent(&ct, "verify")
 	if !ct.thresholdMet() {
 		t.Fatalf("test premise: risk threshold should be met; score=%d", ct.riskScore())
 	}
@@ -169,10 +180,12 @@ func TestContract_MidTurnReminder_QuietIfVerifyAlreadyDispatched(t *testing.T) {
 
 func TestContract_VerifierInSameBatchCannotVerifyConcurrentFreshWork(t *testing.T) {
 	var ct contractTracker
-	ct.observeToolUses([]llm.ContentBlock{
+	uses := []llm.ContentBlock{
 		makeToolUse("Agent", map[string]any{"subagent_type": "general"}),
 		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
-	})
+	}
+	ct.observeToolUses(uses)
+	ct.observeToolResults(uses, []llm.ContentBlock{makeToolResult("implemented"), makeToolResult("VERDICT: PASS")})
 	if ct.verifyDispatched {
 		t.Fatal("same-batch verifier was treated as evidence after concurrent implementation")
 	}
@@ -275,11 +288,49 @@ func TestContract_GateEnd_QuietBelowThreshold(t *testing.T) {
 func TestContract_GateEnd_QuietWhenVerifyDispatched(t *testing.T) {
 	var ct contractTracker
 	observeIndependentRisk(&ct)
-	ct.observeToolUses([]llm.ContentBlock{
-		makeToolUse("Agent", map[string]any{"subagent_type": "verify"}),
-	})
+	observeSuccessfulAgent(&ct, "verify")
 	if body := ct.shouldGateEnd("verified"); body != "" {
 		t.Errorf("gate should stay quiet when verify dispatched; got: %q", body)
+	}
+}
+
+func TestContract_FailedImplementationAgentDoesNotIncreaseRisk(t *testing.T) {
+	var ct contractTracker
+	use := makeToolUse("Agent", map[string]any{"subagent_type": "creator"})
+	for i := 0; i < 5; i++ {
+		ct.observeToolUses([]llm.ContentBlock{use})
+		ct.observeToolResults([]llm.ContentBlock{use}, []llm.ContentBlock{{Type: "tool_result", IsError: true, ToolResult: "invalid isolation"}})
+	}
+	if ct.agentDispatches != 0 || ct.implementationAgents != 0 || ct.thresholdMet() {
+		t.Fatalf("failed Agent calls created false implementation risk: %+v", ct)
+	}
+}
+
+func TestContract_StartedImplementationAgentFailureStillIncreasesRisk(t *testing.T) {
+	var ct contractTracker
+	use := makeToolUse("Agent", map[string]any{"subagent_type": "creator"})
+	result := llm.ContentBlock{
+		Type: "tool_result", IsError: true, ToolResult: "sub-agent timed out",
+		Presentation: map[string]any{AgentStartedPresentationKey: true},
+	}
+	ct.observeToolUses([]llm.ContentBlock{use})
+	ct.observeToolResults([]llm.ContentBlock{use}, []llm.ContentBlock{result})
+	if ct.agentDispatches != 1 || ct.implementationAgents != 1 {
+		t.Fatalf("started Agent failure was ignored: %+v", ct)
+	}
+}
+
+func TestContract_FailedVerifierDoesNotCountAsDispatched(t *testing.T) {
+	var ct contractTracker
+	observeIndependentRisk(&ct)
+	use := makeToolUse("Agent", map[string]any{"subagent_type": "verify"})
+	ct.observeToolUses([]llm.ContentBlock{use})
+	ct.observeToolResults([]llm.ContentBlock{use}, []llm.ContentBlock{{Type: "tool_result", IsError: true, ToolResult: "worktree spawn failed"}})
+	if ct.verifyDispatched || ct.lastVerifyVerdict != "" {
+		t.Fatalf("failed verifier was accepted as verification evidence: %+v", ct)
+	}
+	if body := ct.shouldGateEnd("done"); !strings.Contains(body, "CONTRACT GATE") {
+		t.Fatalf("failed verifier should request a fresh dispatch, got %q", body)
 	}
 }
 

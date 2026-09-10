@@ -428,8 +428,8 @@ Plan first (cold scout), then fan out — the 4 impl agents are independent so t
   - Back-compat: if you pass ` + "`name=\"explore\"`" + ` without ` + "`subagent_type`" + `, it's still treated as ` + "`subagent_type=\"explore\"`" + `. Explicit subagent_type is preferred — name should be a label like "alice", not a role like "explore".
 
 Other knobs:
-  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
-  - ` + "`cwd`" + ` runs the sub-agent in a specific directory (mutually exclusive with ` + "`isolation`" + `).
+  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a linked worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
+  - ` + "`cwd`" + ` runs the sub-agent in a specific directory. With ` + "`isolation: \"worktree\"`" + `, cwd selects the source Git repository; for a non-Git task, omit isolation and keep cwd. After an isolation error, change the arguments instead of retrying the same call.
   - ` + "`run_in_background: true`" + ` → returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
   - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. constrain a worker to "plan" while the parent stays in "default"). A Plan parent may only inherit Plan or explicitly request "plan"; approving a plan starts a fresh implementation turn instead of upgrading an already-running child. A fullAccess parent must omit this field (inherit fullAccess) or explicitly keep fullAccess: its disabled process sandbox and parent-bound tool instances cannot safely enforce a lower child mode.
   - ` + "`allowed_tools`" + ` / ` + "`disallowed_tools`" + ` narrow the sub-agent's tool view; combine with the profile's filters as INTERSECTION (allow) + UNION (deny).`
@@ -462,11 +462,11 @@ func (a Agent) InputSchema() map[string]any {
 			"isolation": map[string]any{
 				"type":        "string",
 				"enum":        []string{"worktree"},
-				"description": "Spawn this sub-agent in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). Mutually exclusive with `cwd`. Refuses when parent is already inside a worktree (no nesting) or when the parent is in Plan mode (worktree setup changes git metadata).",
+				"description": "Spawn this sub-agent in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). If `cwd` is also supplied, it selects the source Git repository. Refuses when the source is already inside a linked worktree (no nesting) or when the parent is in Plan mode (worktree setup changes git metadata).",
 			},
 			"cwd": map[string]any{
 				"type":        "string",
-				"description": "Absolute path to run the sub-agent in. Overrides the parent's working directory for all filesystem and shell operations within this sub-agent. Mutually exclusive with `isolation: \"worktree\"`.",
+				"description": "Absolute path to run the sub-agent in. Overrides the parent's working directory for all filesystem and shell operations within this sub-agent. With `isolation: \"worktree\"`, this path selects the source Git repository and the sub-agent runs in the newly created worktree.",
 			},
 			"name": map[string]any{
 				"type":        "string",
@@ -1190,11 +1190,10 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 // worktree info struct to clean up on exit, or a user-actionable
 // error.
 //
-// Validation rules (mutually-exclusive + nesting-safe + absolute-path):
+// Validation rules (repository-aware + nesting-safe + absolute-path):
 //
-//  1. `isolation` and `cwd` cannot both be set — the model has to
-//     pick one mode, otherwise we'd silently prefer one over the
-//     other and surprise the caller.
+//  1. With worktree isolation, cwd selects the source repository. This lets
+//     callers isolate a task even when the parent process started elsewhere.
 //  2. `isolation` only accepts "worktree" today; any other value is
 //     rejected with a clear hint (claude-code's schema lists
 //     "remote" too but that's CCR-only / ant-only, intentionally
@@ -1206,9 +1205,6 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 //     whatever cwd happens to be live at sub-loop start, which is
 //     racy when N teammates spawn in parallel.
 func (a Agent) resolveIsolation(isolation, cwdArg string) (string, *worktreepkg.Info, error) {
-	if isolation != "" && cwdArg != "" {
-		return "", nil, errors.New("`isolation` and `cwd` are mutually exclusive — pick one")
-	}
 	if isolation != "" && isolation != "worktree" {
 		return "", nil, fmt.Errorf("isolation=%q not supported; only \"worktree\" is recognized", isolation)
 	}
@@ -1221,22 +1217,34 @@ func (a Agent) resolveIsolation(isolation, cwdArg string) (string, *worktreepkg.
 		} else if !fi.IsDir() {
 			return "", nil, fmt.Errorf("cwd=%q is not a directory", cwdArg)
 		}
-		return cwdArg, nil, nil
 	}
 	if isolation == "worktree" {
 		// Refuse nesting — `metis -W feat1` already put us inside a
 		// worktree; an Agent({isolation:"worktree"}) here would
 		// create a worktree-of-a-worktree which neither git nor our
 		// cleanup story handles cleanly.
-		cwd, err := os.Getwd()
-		if err == nil && worktreepkg.InsideWorktree(cwd) {
-			return "", nil, fmt.Errorf("refusing to nest worktree: parent process is already inside a worktree at %s", cwd)
+		sourceDir := cwdArg
+		if sourceDir == "" {
+			var err error
+			sourceDir, err = os.Getwd()
+			if err != nil {
+				return "", nil, fmt.Errorf("get cwd for worktree isolation: %w", err)
+			}
 		}
-		info, err := worktreepkg.Spawn("") // auto-slug
+		if worktreepkg.InsideWorktree(sourceDir) {
+			return "", nil, fmt.Errorf("refusing to nest worktree: source is already inside a linked worktree at %s", sourceDir)
+		}
+		info, err := worktreepkg.SpawnFrom(sourceDir, "") // auto-slug
 		if err != nil {
+			if errors.Is(err, worktreepkg.ErrNotGitRepository) {
+				return "", nil, fmt.Errorf("worktree isolation requires an existing Git repository at or above cwd=%q. Retry Agent with cwd=%q and omit isolation, or choose a cwd inside an existing Git repository. Do not repeat the same isolation request", sourceDir, sourceDir)
+			}
 			return "", nil, fmt.Errorf("worktree spawn: %w", err)
 		}
 		return info.Path, info, nil
+	}
+	if cwdArg != "" {
+		return cwdArg, nil, nil
 	}
 	// No isolation requested → inherit parent cwd (return "" so the
 	// context key is left unset; tools fall back to os.Getwd()).
@@ -1258,6 +1266,18 @@ func (a Agent) executeForeground(
 	transcript *agent.SubAgentTranscript,
 	persistedOnDisk int,
 ) (resultRet *tools.Result, errRet error) {
+	// Reaching this function means setup completed and the child runner is about
+	// to start. Preserve that fact on error results so contract tracking does not
+	// confuse a runtime failure with a rejected spawn.
+	defer func() {
+		if resultRet == nil {
+			return
+		}
+		if resultRet.Presentation == nil {
+			resultRet.Presentation = make(map[string]any)
+		}
+		resultRet.Presentation[agent.AgentStartedPresentationKey] = true
+	}()
 	defer transcript.Close()
 	defer finalize()
 	// G.15 (2026-05-12) — panic recovery for the foreground path.

@@ -34,6 +34,10 @@ const (
 	contractOverridePhrase           = "OVERRIDE CONTRACT:"
 	contractDisableEnvVar            = "METIS_CONTRACT_DISABLE"
 	contractVerifySubagentID         = "verify"
+	// AgentStartedPresentationKey is internal tool-result metadata. It lets the
+	// contract distinguish setup rejection from a child that started and then
+	// failed after it may already have changed files.
+	AgentStartedPresentationKey = "metis.agent_started"
 )
 
 // contractTracker accumulates the side-effect signals one Loop.Run needs to
@@ -42,7 +46,7 @@ const (
 type contractTracker struct {
 	verifyUnavailable    bool // runtime's filtered registry cannot dispatch Agent, or trusted checks replace it
 	mainWrites           int  // Write + Edit + MultiEdit tool_use counts
-	agentDispatches      int  // Agent tool_use counts (any subagent_type)
+	agentDispatches      int  // successful Agent tool results (any subagent_type)
 	implementationAgents int
 	mutatedFiles         map[string]struct{}
 	validationObserved   bool
@@ -58,23 +62,20 @@ type contractTracker struct {
 	// back a FAIL verdict on parser tests, and end_turn'd anyway —
 	// the pre-fix shouldGateEnd only checked "did you dispatch?",
 	// not "did the verdict actually pass?". Empty string = no verify
-	// result observed yet; "MISSING" = verify errored or didn't emit
-	// an exact final VERDICT line; others are the literal verdict.
+	// result observed yet; "MISSING" = a completed verify call didn't emit
+	// an exact final VERDICT line; others are the literal verdict. A rejected
+	// or failed verify call creates no new evidence.
 	lastVerifyVerdict   string
 	verdictGateAttempts int // separate from gateAttempts so the verdict-gate budget doesn't share with the dispatch-gate budget
 }
 
-// observeToolUses tallies the batch the model just emitted. Counted
-// at request-time so the tracker reflects intent even if a tool
-// fails / is denied — the model still meant to do that work, and
-// the verify obligation tracks intent not just success.
+// observeToolUses tallies direct mutations at request-time. Agent calls are
+// counted by observeToolResults because a setup failure launches no agent and
+// must not create a false verification obligation.
 func (ct *contractTracker) observeToolUses(toolUses []llm.ContentBlock) {
-	freshWorkInBatch := false
-	verifyInBatch := false
 	for _, tu := range toolUses {
 		switch tu.ToolName {
 		case "Write", "Edit", "MultiEdit", "NotebookEdit":
-			freshWorkInBatch = true
 			ct.invalidateVerification()
 			ct.mainWrites++
 			ct.validationObserved = false
@@ -90,32 +91,11 @@ func (ct *contractTracker) observeToolUses(toolUses []llm.ContentBlock) {
 			highImpact := isHighImpactCommand(command)
 			shellMutation := isBashFileMutationCommand(command)
 			if highImpact || shellMutation {
-				freshWorkInBatch = true
 				ct.invalidateVerification()
 			}
 			ct.highImpactAction = ct.highImpactAction || highImpact
 			ct.shellMutationAction = ct.shellMutationAction || shellMutation
-		case "Agent":
-			ct.agentDispatches++
-			st, _ := tu.ToolInput["subagent_type"].(string)
-			if st == contractVerifySubagentID {
-				verifyInBatch = true
-				ct.verifyDispatched = true
-				ct.lastVerifyVerdict = ""
-			} else if isImplementationAgent(st) {
-				freshWorkInBatch = true
-				ct.invalidateVerification()
-				ct.implementationAgents++
-				ct.validationObserved = false
-			}
 		}
-	}
-	// Calls in one model tool batch may execute concurrently. A verifier emitted
-	// beside fresh mutations/implementation cannot attest that those siblings
-	// finished first, regardless of their array order. Require a later batch.
-	if freshWorkInBatch && verifyInBatch {
-		ct.verifyDispatched = false
-		ct.lastVerifyVerdict = ""
 	}
 }
 
@@ -920,36 +900,84 @@ func allASCIIDigits(value string) bool {
 //
 // VERDICT extraction:
 //   - Match only an exact `VERDICT: PASS|FAIL|PARTIAL` final non-empty line.
-//   - If verify errored or its final non-empty line is not an exact verdict,
-//     record "MISSING" so the gate holds (no valid verifier evidence).
+//   - If a completed verify call's final non-empty line is not an exact
+//     verdict, record "MISSING" so the gate holds.
+//   - A setup rejection is not a dispatch. A verifier that started and then
+//     failed is counted in agentDispatches, but supplies no verdict evidence.
 //   - Only set when subagent_type was exactly "verify"; other
 //     subagent types are out of scope for this gate.
 func (ct *contractTracker) observeToolResults(toolUses, results []llm.ContentBlock) {
 	batchVerdict := ""
+	successfulVerify := false
+	failedVerify := false
+	freshWorkInBatch := false
+	for _, tu := range toolUses {
+		switch tu.ToolName {
+		case "Write", "Edit", "MultiEdit", "NotebookEdit":
+			freshWorkInBatch = true
+		case "Bash":
+			command := toolInputString(tu.ToolInput, "command", "cmd")
+			freshWorkInBatch = freshWorkInBatch || isHighImpactCommand(command) || isBashFileMutationCommand(command)
+		}
+	}
 	for i, tu := range toolUses {
 		if tu.Type != "tool_use" || tu.ToolName != "Agent" {
 			continue
 		}
 		st, _ := tu.ToolInput["subagent_type"].(string)
-		if st != contractVerifySubagentID {
+		if i >= len(results) || (results[i].IsError && !agentResultStarted(results[i])) {
+			if st == contractVerifySubagentID {
+				failedVerify = true
+			}
 			continue
 		}
-		verdict := "MISSING"
-		if i < len(results) && !results[i].IsError {
-			verdict = extractVerdict(results[i].ToolResult)
-		} else if i < len(results) {
-			// A failed/denied Agent call cannot attest to the work, even when
-			// an error payload happens to contain a PASS-looking string.
+		ct.agentDispatches++
+		if results[i].IsError {
+			if st == contractVerifySubagentID {
+				failedVerify = true
+			} else if isImplementationAgent(st) {
+				freshWorkInBatch = true
+				ct.invalidateVerification()
+				ct.implementationAgents++
+				ct.validationObserved = false
+			}
+			continue
 		}
+		if st != contractVerifySubagentID {
+			if isImplementationAgent(st) {
+				freshWorkInBatch = true
+				ct.invalidateVerification()
+				ct.implementationAgents++
+				ct.validationObserved = false
+			}
+			continue
+		}
+		successfulVerify = true
+		verdict := extractVerdict(results[i].ToolResult)
 		// A batch is only PASS when every verifier in it passed. Keep the
 		// first non-PASS outcome so a later sibling cannot overwrite it.
 		if batchVerdict == "" || batchVerdict == "PASS" {
 			batchVerdict = verdict
 		}
 	}
-	if batchVerdict != "" {
-		ct.lastVerifyVerdict = batchVerdict
+	if !successfulVerify {
+		return
 	}
+	// Calls in one model tool batch may execute concurrently. A verifier emitted
+	// beside fresh mutations/implementation cannot attest that those siblings
+	// finished first. A partially failed verifier batch is also not evidence.
+	if freshWorkInBatch || failedVerify {
+		ct.verifyDispatched = false
+		ct.lastVerifyVerdict = ""
+		return
+	}
+	ct.verifyDispatched = true
+	ct.lastVerifyVerdict = batchVerdict
+}
+
+func agentResultStarted(result llm.ContentBlock) bool {
+	started, _ := result.Presentation[AgentStartedPresentationKey].(bool)
+	return started
 }
 
 // extractVerdict scans subagent body for the mandated VERDICT line.

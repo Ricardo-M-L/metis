@@ -120,19 +120,12 @@ func TestAgentTool_SubagentType_WorktreeProfileFailureCleansIsolation(t *testing
 	runAgentTestGit(t, repo, "add", "README.md")
 	runAgentTestGit(t, repo, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "initial fixture")
 
-	// resolveIsolation's nesting guard compares the exact current directory
-	// against registered worktree roots. Run from a normal repository subdir so
-	// this exercises Spawn + Cleanup rather than the guard's root-path refusal.
-	workDir := filepath.Join(repo, "source")
-	if err := os.Mkdir(workDir, 0o700); err != nil {
-		t.Fatalf("create repository subdir: %v", err)
-	}
 	previousCwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("get cwd: %v", err)
 	}
-	if err := os.Chdir(workDir); err != nil {
-		t.Fatalf("chdir repository subdir: %v", err)
+	if err := os.Chdir(repo); err != nil {
+		t.Fatalf("chdir repository root: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(previousCwd) })
 

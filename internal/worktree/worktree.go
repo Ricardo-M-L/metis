@@ -5,12 +5,16 @@
 // import cycle (builtin → runtime would loop because runtime already
 // imports builtin to wire the registry).
 //
-// Two entry points:
+// Main entry points:
 //
-//   - `Spawn(slug)` — the original `metis -W <slug>` entry, plus the
-//     new per-Agent-invocation entry (G.2) when an Agent call sets
-//     `isolation: "worktree"`. Reuses an existing worktree if the slug
-//     matches; refuses to clobber unrelated directories.
+//   - `Spawn(slug)` — the original `metis -W <slug>` entry using the
+//     process working directory.
+//
+//   - `SpawnFrom(dir, slug)` — the per-Agent entry that can select a
+//     source repository independently from the process working directory.
+//
+// Both reuse an existing worktree if the slug matches and refuse to clobber
+// unrelated directories.
 //
 //   - `Cleanup(info)` — `git worktree remove --force` + branch GC.
 //
@@ -32,6 +36,7 @@ package worktree
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,12 +56,15 @@ const (
 
 var slugSegmentRE = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
-// Info is what Spawn returns to the caller. The caller chdirs into
+var ErrNotGitRepository = errors.New("directory is not inside a git repository")
+
+// Info is what Spawn and SpawnFrom return to the caller. The caller chdirs into
 // Path before continuing setup.
 type Info struct {
-	Slug   string
-	Branch string
-	Path   string
+	Slug     string
+	Branch   string
+	Path     string
+	RepoRoot string
 	// Created is true when this invocation actually ran `git worktree add`,
 	// false when it reused an existing one. The teardown prompt only
 	// applies when Created is true (we don't ask permission to delete a
@@ -77,8 +85,22 @@ type Info struct {
 //   - Call Cleanup on shutdown if the worktree should be reaped
 //     (otherwise it stays on disk and is reusable next time).
 func Spawn(slug string) (*Info, error) {
-	if !insideGitRepo() {
-		return nil, fmt.Errorf("worktree spawn requires a git repository (cwd is not inside one)")
+	return SpawnFrom("", slug)
+}
+
+// SpawnFrom creates a linked worktree from the repository containing sourceDir.
+// An empty sourceDir preserves Spawn's process-cwd behavior.
+func SpawnFrom(sourceDir, slug string) (*Info, error) {
+	if sourceDir == "" {
+		var err error
+		sourceDir, err = os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("get cwd for worktree spawn: %w", err)
+		}
+	}
+	repoRoot, err := repositoryRoot(sourceDir)
+	if err != nil {
+		return nil, err
 	}
 	slug = strings.TrimSpace(slug)
 	if slug == "" {
@@ -91,13 +113,13 @@ func Spawn(slug string) (*Info, error) {
 	root := filepath.Join(config.Home(), worktreesDir, flat)
 
 	// GC abandoned siblings, best-effort.
-	_ = sweepStaleWorktrees()
+	_ = sweepStaleWorktrees(repoRoot)
 
 	if _, err := os.Stat(root); err == nil {
 		// Path already exists — reuse if it's a registered worktree, else
 		// refuse to clobber.
-		if isRegisteredWorktree(root) {
-			return &Info{Slug: slug, Branch: branchName(flat), Path: root, Created: false}, nil
+		if isRegisteredWorktree(repoRoot, root) {
+			return &Info{Slug: slug, Branch: branchName(flat), Path: root, RepoRoot: repoRoot, Created: false}, nil
 		}
 		return nil, fmt.Errorf("worktree path %s already exists and is not a registered worktree", root)
 	}
@@ -106,13 +128,13 @@ func Spawn(slug string) (*Info, error) {
 	}
 
 	branch := branchName(flat)
-	cmd := exec.Command("git", "worktree", "add", "-B", branch, root, defaultBaseRef)
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", "-B", branch, root, defaultBaseRef)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("git worktree add: %w", err)
 	}
-	return &Info{Slug: slug, Branch: branch, Path: root, Created: true}, nil
+	return &Info{Slug: slug, Branch: branch, Path: root, RepoRoot: repoRoot, Created: true}, nil
 }
 
 // Cleanup runs `git worktree remove --force <path>` and best-effort
@@ -122,7 +144,15 @@ func Cleanup(info *Info) error {
 	if info == nil {
 		return nil
 	}
-	cmd := exec.Command("git", "worktree", "remove", "--force", info.Path)
+	repoRoot := info.RepoRoot
+	if repoRoot == "" {
+		var err error
+		repoRoot, err = repositoryRoot(info.Path)
+		if err != nil {
+			return fmt.Errorf("resolve repository for worktree cleanup: %w", err)
+		}
+	}
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", info.Path)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("git worktree remove %s: %w", info.Path, err)
@@ -130,18 +160,29 @@ func Cleanup(info *Info) error {
 	// Best-effort: drop the throwaway branch too. Don't fail the whole
 	// teardown if branch deletion fails (user may have already merged it
 	// elsewhere).
-	_ = exec.Command("git", "branch", "-D", info.Branch).Run()
+	_ = exec.Command("git", "-C", repoRoot, "branch", "-D", info.Branch).Run()
 	return nil
 }
 
-// InsideWorktree reports whether the given absolute path is itself a
-// registered git worktree. Used by G.2's nested-worktree guard so an
+// InsideWorktree reports whether path belongs to a linked worktree rather
+// than the repository's main checkout. Used by G.2's nested-worktree guard so an
 // Agent({isolation:"worktree"}) call inside `metis -W feat1` produces
 // a clear "refusing nested worktree" tool error instead of cascading
 // branches.
 func InsideWorktree(path string) bool {
-	abs, _ := filepath.Abs(path)
-	return isRegisteredWorktree(abs)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	gitDir, err := gitOutput(abs, "rev-parse", "--path-format=absolute", "--absolute-git-dir")
+	if err != nil {
+		return false
+	}
+	commonDir, err := gitOutput(abs, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return false
+	}
+	return canonicalPath(gitDir) != canonicalPath(commonDir)
 }
 
 // AutoSlug returns a short, unique id for unattended worktree
@@ -177,23 +218,55 @@ func validateSlug(slug string) error {
 	return nil
 }
 
-func insideGitRepo() bool {
-	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
-	cmd.Stderr = nil
-	return cmd.Run() == nil
+func repositoryRoot(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree source %q: %w", path, err)
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("worktree source %q: %w", abs, err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("worktree source %q is not a directory", abs)
+	}
+	root, err := gitOutput(abs, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", ErrNotGitRepository, abs)
+	}
+	return canonicalPath(root), nil
 }
 
-func isRegisteredWorktree(path string) bool {
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+func gitOutput(dir string, args ...string) (string, error) {
+	gitArgs := append([]string{"-C", dir}, args...)
+	cmd := exec.Command("git", gitArgs...)
+	cmd.Stderr = nil
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func canonicalPath(path string) string {
+	abs, err := filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return filepath.Clean(strings.TrimSpace(path))
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(abs)
+}
+
+func isRegisteredWorktree(repoRoot, path string) bool {
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "list", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
-	abs, _ := filepath.Abs(path)
+	abs := canonicalPath(path)
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(line, "worktree ") {
 			p := strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
-			if pa, err := filepath.Abs(p); err == nil && pa == abs {
+			if canonicalPath(p) == abs {
 				return true
 			}
 		}
@@ -207,7 +280,7 @@ func branchName(flatSlug string) string {
 
 // sweepStaleWorktrees drops directories under ~/.metis/worktrees older
 // than staleWorktree. Best-effort — errors are logged to stderr.
-func sweepStaleWorktrees() error {
+func sweepStaleWorktrees(repoRoot string) error {
 	dir := filepath.Join(config.Home(), worktreesDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -224,11 +297,10 @@ func sweepStaleWorktrees() error {
 		}
 		if info.ModTime().Before(cutoff) {
 			full := filepath.Join(dir, e.Name())
-			// Use git first so the registration entry gets cleaned too;
-			// fall back to plain rm if git refuses (worktree might have
-			// been manually nuked already).
-			if err := exec.Command("git", "worktree", "remove", "--force", full).Run(); err != nil {
-				_ = os.RemoveAll(full)
+			// The global worktrees directory can contain checkouts from many
+			// repositories. Only sweep entries registered to this repository.
+			if isRegisteredWorktree(repoRoot, full) {
+				_ = exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", full).Run()
 			}
 		}
 	}

@@ -6,9 +6,8 @@ package builtin
 //
 // Five contracts pinned:
 //
-//   1. **Mutually exclusive**: `isolation` and `cwd` together → IsError.
-//      Without this the model picks "one or the other" silently and
-//      the operator can't tell which won.
+//   1. **Explicit repository**: `isolation: "worktree"` and `cwd`
+//      together spawn from the repository containing cwd.
 //
 //   2. **`isolation` enum**: any value other than "worktree" → IsError.
 //      Schema accepts only "worktree" today (claude-code's "remote"
@@ -23,11 +22,6 @@ package builtin
 //   5. **Backward compat**: no `isolation` and no `cwd` → no behavior
 //      change, sub-agent inherits parent cwd, no worktree spawn.
 //
-// The actual worktree spawn path requires a real git repo with
-// commits, which the unit-test environment doesn't guarantee — that
-// case is reserved for the tmux 10+ rounds verification (manual,
-// real repo).
-
 import (
 	"context"
 	"os"
@@ -39,25 +33,50 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-// TestAgentExecute_IsolationAndCwdMutuallyExclusive — both fields
-// set must reject. Critical contract: silently preferring one would
-// surprise the caller.
-func TestAgentExecute_IsolationAndCwdMutuallyExclusive(t *testing.T) {
-	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
+func TestAgentExecute_IsolationWithCwdUsesThatRepository(t *testing.T) {
+	repo := t.TempDir()
+	runAgentTestGit(t, repo, "init", "--quiet")
+	runAgentTestGit(t, repo, "config", "user.name", "Metis Agent Test")
+	runAgentTestGit(t, repo, "config", "user.email", "metis-agent-test@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runAgentTestGit(t, repo, "add", "README.md")
+	runAgentTestGit(t, repo, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
+	t.Setenv("METIS_HOME", filepath.Join(t.TempDir(), "metis-home"))
 
+	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
 	res, err := tool.Execute(context.Background(), map[string]any{
 		"prompt":    "x",
 		"isolation": "worktree",
-		"cwd":       "/tmp",
+		"cwd":       repo,
+	})
+	if err != nil {
+		t.Fatalf("Execute err: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("isolation+cwd should spawn from cwd's repository: %s", res.Output)
+	}
+}
+
+func TestAgentExecute_WorktreeOutsideGitExplainsHowToRecover(t *testing.T) {
+	nonRepo := t.TempDir()
+	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"prompt":    "x",
+		"isolation": "worktree",
+		"cwd":       nonRepo,
 	})
 	if err != nil {
 		t.Fatalf("Execute err: %v", err)
 	}
 	if !res.IsError {
-		t.Fatalf("isolation+cwd together must be IsError; got %+v", res)
+		t.Fatalf("non-git worktree request must fail: %+v", res)
 	}
-	if !strings.Contains(res.Output, "mutually exclusive") {
-		t.Errorf("error should name the conflict; got %q", res.Output)
+	for _, want := range []string{"existing Git repository", "omit isolation", "Do not repeat"} {
+		if !strings.Contains(res.Output, want) {
+			t.Errorf("recovery error missing %q: %s", want, res.Output)
+		}
 	}
 }
 

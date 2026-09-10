@@ -68,8 +68,8 @@ func TestContract_MultipleVerifierResultsAggregateConservatively(t *testing.T) {
 		{name: "partial then pass", results: []llm.ContentBlock{makeToolResult("VERDICT: PARTIAL"), makeToolResult("VERDICT: PASS")}, want: "PARTIAL", wantGate: true},
 		{name: "missing then pass", results: []llm.ContentBlock{makeToolResult("no verdict"), makeToolResult("VERDICT: PASS")}, want: "MISSING", wantGate: true},
 		{name: "pass then fail", results: []llm.ContentBlock{makeToolResult("VERDICT: PASS"), makeToolResult("VERDICT: FAIL")}, want: "FAIL", wantGate: true},
-		{name: "errored pass then pass", results: []llm.ContentBlock{{Type: "tool_result", ToolResult: "VERDICT: PASS", IsError: true}, makeToolResult("VERDICT: PASS")}, want: "MISSING", wantGate: true},
-		{name: "second result missing", results: []llm.ContentBlock{makeToolResult("VERDICT: PASS")}, want: "MISSING", wantGate: true},
+		{name: "errored pass then pass", results: []llm.ContentBlock{{Type: "tool_result", ToolResult: "VERDICT: PASS", IsError: true}, makeToolResult("VERDICT: PASS")}, want: "", wantGate: true},
+		{name: "second result missing", results: []llm.ContentBlock{makeToolResult("VERDICT: PASS")}, want: "", wantGate: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -272,8 +272,8 @@ func TestContract_MissingVerifierToolResultCannotReleaseGate(t *testing.T) {
 	ct.observeToolUses([]llm.ContentBlock{verifyUse})
 	ct.observeToolResults([]llm.ContentBlock{verifyUse}, nil)
 
-	if ct.lastVerifyVerdict != "MISSING" {
-		t.Fatalf("missing verifier tool result verdict = %q, want MISSING", ct.lastVerifyVerdict)
+	if ct.lastVerifyVerdict != "" || ct.verifyDispatched {
+		t.Fatalf("missing verifier tool result created verification evidence: %+v", ct)
 	}
 	if body := ct.shouldGateEnd("done"); body == "" {
 		t.Fatal("missing verifier tool result released the contract gate")

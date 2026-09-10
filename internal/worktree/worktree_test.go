@@ -1,6 +1,9 @@
 package worktree
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -46,4 +49,74 @@ func TestAutoSlugUnique(t *testing.T) {
 		}
 		seen[s] = true
 	}
+}
+
+func TestInsideWorktreeDistinguishesMainCheckoutFromLinkedWorktree(t *testing.T) {
+	repo := newWorktreeTestRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	runWorktreeTestGit(t, repo, "worktree", "add", "--detach", linked, "HEAD")
+	t.Cleanup(func() {
+		_ = exec.Command("git", "-C", repo, "worktree", "remove", "--force", linked).Run()
+	})
+
+	if InsideWorktree(repo) {
+		t.Fatal("main checkout must not be classified as a nested linked worktree")
+	}
+	if !InsideWorktree(linked) {
+		t.Fatal("linked checkout must be classified as a worktree")
+	}
+}
+
+func TestSpawnFromUsesExplicitRepository(t *testing.T) {
+	repo := newWorktreeTestRepo(t)
+	outside := t.TempDir()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(outside); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	t.Setenv("METIS_HOME", filepath.Join(t.TempDir(), "metis-home"))
+
+	info, err := SpawnFrom(repo, "explicit-repo")
+	if err != nil {
+		t.Fatalf("SpawnFrom: %v", err)
+	}
+	t.Cleanup(func() { _ = Cleanup(info) })
+	if info.RepoRoot != canonicalPath(repo) {
+		t.Fatalf("RepoRoot = %q, want %q", info.RepoRoot, canonicalPath(repo))
+	}
+	if !InsideWorktree(info.Path) {
+		t.Fatalf("spawned path %q is not recognized as a linked worktree", info.Path)
+	}
+	if err := Cleanup(info); err != nil {
+		t.Fatalf("Cleanup from unrelated process cwd: %v", err)
+	}
+}
+
+func newWorktreeTestRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	runWorktreeTestGit(t, repo, "init", "--quiet")
+	runWorktreeTestGit(t, repo, "config", "user.name", "Metis Worktree Test")
+	runWorktreeTestGit(t, repo, "config", "user.email", "metis-worktree@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runWorktreeTestGit(t, repo, "add", "README.md")
+	runWorktreeTestGit(t, repo, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
+	return repo
+}
+
+func runWorktreeTestGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
 }
