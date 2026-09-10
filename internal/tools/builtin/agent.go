@@ -428,8 +428,8 @@ Plan first (cold scout), then fan out — the 4 impl agents are independent so t
   - Back-compat: if you pass ` + "`name=\"explore\"`" + ` without ` + "`subagent_type`" + `, it's still treated as ` + "`subagent_type=\"explore\"`" + `. Explicit subagent_type is preferred — name should be a label like "alice", not a role like "explore".
 
 Other knobs:
-  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Refused if you're already inside a linked worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
-  - ` + "`cwd`" + ` runs the sub-agent in a specific directory. With ` + "`isolation: \"worktree\"`" + `, cwd selects the source Git repository; for a non-Git task, omit isolation and keep cwd. After an isolation error, change the arguments instead of retrying the same call.
+  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Use ` + "`isolation: \"none\"`" + ` to run directly in cwd; this explicit value lets strict Responses clients recover when worktree isolation is unavailable. Refused if you're already inside a linked worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
+  - ` + "`cwd`" + ` runs the sub-agent in a specific directory. With ` + "`isolation: \"worktree\"`" + `, cwd selects the source Git repository; for a non-Git task, use ` + "`isolation: \"none\"`" + ` and keep cwd. After an isolation error, change the arguments instead of retrying the same call.
   - ` + "`run_in_background: true`" + ` → returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
   - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. constrain a worker to "plan" while the parent stays in "default"). A Plan parent may only inherit Plan or explicitly request "plan"; approving a plan starts a fresh implementation turn instead of upgrading an already-running child. A fullAccess parent must omit this field (inherit fullAccess) or explicitly keep fullAccess: its disabled process sandbox and parent-bound tool instances cannot safely enforce a lower child mode.
   - ` + "`allowed_tools`" + ` / ` + "`disallowed_tools`" + ` narrow the sub-agent's tool view; combine with the profile's filters as INTERSECTION (allow) + UNION (deny).`
@@ -461,8 +461,8 @@ func (a Agent) InputSchema() map[string]any {
 			},
 			"isolation": map[string]any{
 				"type":        "string",
-				"enum":        []string{"worktree"},
-				"description": "Spawn this sub-agent in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). If `cwd` is also supplied, it selects the source Git repository. Refuses when the source is already inside a linked worktree (no nesting) or when the parent is in Plan mode (worktree setup changes git metadata).",
+				"enum":        []string{"none", "worktree"},
+				"description": "Isolation mode. Use `none` to run directly in cwd (also the recovery value when cwd is outside Git), or `worktree` to spawn in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). If `cwd` is also supplied, it selects the source Git repository. Worktree mode refuses when the source is already inside a linked worktree (no nesting) or when the parent is in Plan mode (worktree setup changes git metadata).",
 			},
 			"cwd": map[string]any{
 				"type":        "string",
@@ -596,6 +596,13 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// through the sub-loop ctx + an optional worktree info we'll
 	// clean up on exit.
 	isolation, _ := in["isolation"].(string)
+	// Codex Responses commonly serializes every tool property even when the
+	// source JSON schema does not require it. Give that strict-shaped call an
+	// explicit no-isolation value instead of forcing the enum's only former
+	// value ("worktree") on non-Git cwd recovery calls.
+	if isolation == "none" {
+		isolation = ""
+	}
 	cwdArg, _ := in["cwd"].(string)
 	subCwd, worktreeInfo, isoErr := a.resolveIsolation(isolation, cwdArg)
 	if isoErr != nil {
@@ -1194,10 +1201,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 //
 //  1. With worktree isolation, cwd selects the source repository. This lets
 //     callers isolate a task even when the parent process started elsewhere.
-//  2. `isolation` only accepts "worktree" today; any other value is
-//     rejected with a clear hint (claude-code's schema lists
-//     "remote" too but that's CCR-only / ant-only, intentionally
-//     dropped from Phase G).
+//  2. `isolation` accepts "none" (direct cwd) and "worktree"; any other
+//     value is rejected with a clear hint (claude-code's schema lists
+//     "remote" too but that's CCR-only / ant-only, intentionally dropped).
 //  3. Worktrees refuse to nest — if the parent process is itself
 //     inside a worktree, we error out instead of cascading
 //     branches that no one can clean up.
@@ -1206,7 +1212,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 //     racy when N teammates spawn in parallel.
 func (a Agent) resolveIsolation(isolation, cwdArg string) (string, *worktreepkg.Info, error) {
 	if isolation != "" && isolation != "worktree" {
-		return "", nil, fmt.Errorf("isolation=%q not supported; only \"worktree\" is recognized", isolation)
+		return "", nil, fmt.Errorf("isolation=%q not supported; only \"none\" and \"worktree\" are recognized", isolation)
 	}
 	if cwdArg != "" {
 		if !strings.HasPrefix(cwdArg, "/") {
@@ -1237,7 +1243,7 @@ func (a Agent) resolveIsolation(isolation, cwdArg string) (string, *worktreepkg.
 		info, err := worktreepkg.SpawnFrom(sourceDir, "") // auto-slug
 		if err != nil {
 			if errors.Is(err, worktreepkg.ErrNotGitRepository) {
-				return "", nil, fmt.Errorf("worktree isolation requires an existing Git repository at or above cwd=%q. Retry Agent with cwd=%q and omit isolation, or choose a cwd inside an existing Git repository. Do not repeat the same isolation request", sourceDir, sourceDir)
+				return "", nil, fmt.Errorf("worktree isolation requires an existing Git repository at or above cwd=%q. Retry Agent with cwd=%q and isolation=\"none\", or choose a cwd inside an existing Git repository. Do not repeat the same isolation request", sourceDir, sourceDir)
 			}
 			return "", nil, fmt.Errorf("worktree spawn: %w", err)
 		}

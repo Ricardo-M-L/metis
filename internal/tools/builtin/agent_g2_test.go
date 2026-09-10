@@ -9,9 +9,9 @@ package builtin
 //   1. **Explicit repository**: `isolation: "worktree"` and `cwd`
 //      together spawn from the repository containing cwd.
 //
-//   2. **`isolation` enum**: any value other than "worktree" → IsError.
-//      Schema accepts only "worktree" today (claude-code's "remote"
-//      is intentionally out of scope for Phase G).
+//   2. **`isolation` enum**: "none" explicitly selects direct cwd execution
+//      for strict Responses calls; values other than "none" / "worktree"
+//      are rejected (claude-code's "remote" is intentionally out of scope).
 //
 //   3. **`cwd` absolute-path requirement**: relative paths → IsError.
 //      Parallel teammates would race on os.Getwd() otherwise.
@@ -73,16 +73,51 @@ func TestAgentExecute_WorktreeOutsideGitExplainsHowToRecover(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("non-git worktree request must fail: %+v", res)
 	}
-	for _, want := range []string{"existing Git repository", "omit isolation", "Do not repeat"} {
+	for _, want := range []string{"existing Git repository", `isolation="none"`, "Do not repeat"} {
 		if !strings.Contains(res.Output, want) {
 			t.Errorf("recovery error missing %q: %s", want, res.Output)
 		}
 	}
 }
 
+func TestAgentInputSchema_IsolationCanExplicitlyDisableWorktree(t *testing.T) {
+	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
+	properties, ok := tool.InputSchema()["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("Agent schema properties missing")
+	}
+	isolation, ok := properties["isolation"].(map[string]any)
+	if !ok {
+		t.Fatal("Agent schema isolation missing")
+	}
+	values, ok := isolation["enum"].([]string)
+	if !ok {
+		t.Fatalf("Agent isolation enum = %#v", isolation["enum"])
+	}
+	if len(values) != 2 || values[0] != "none" || values[1] != "worktree" {
+		t.Fatalf("Agent isolation enum = %#v, want [none worktree]", values)
+	}
+}
+
+func TestAgentExecute_ExplicitNoIsolationRunsInNonGitCwd(t *testing.T) {
+	nonRepo := t.TempDir()
+	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
+	res, err := tool.Execute(context.Background(), map[string]any{
+		"prompt":    "x",
+		"cwd":       nonRepo,
+		"isolation": "none",
+	})
+	if err != nil {
+		t.Fatalf("Execute err: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("isolation=none in non-Git cwd should run directly: %s", res.Output)
+	}
+}
+
 // TestAgentExecute_UnknownIsolation — `isolation: "remote"` (ant-only
 // in claude-code) or any other string should reject with a hint
-// naming the valid value.
+// naming the valid values.
 func TestAgentExecute_UnknownIsolation(t *testing.T) {
 	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
 
@@ -99,8 +134,8 @@ func TestAgentExecute_UnknownIsolation(t *testing.T) {
 			if !res.IsError {
 				t.Errorf("isolation=%q must be IsError; got %+v", iso, res)
 			}
-			if !strings.Contains(res.Output, "only \"worktree\"") {
-				t.Errorf("error should name the only valid value; got %q", res.Output)
+			if !strings.Contains(res.Output, "only \"none\" and \"worktree\"") {
+				t.Errorf("error should name the valid values; got %q", res.Output)
 			}
 		})
 	}
