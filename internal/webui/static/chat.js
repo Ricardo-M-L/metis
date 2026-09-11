@@ -355,6 +355,13 @@ function renderTodoPlan() {
   if (!dock || !popover || !trigger || !step || !counts || !list) return;
 
   const metrics = todoPlanMetrics();
+  const finished = metrics.total > 0 && metrics.completed === metrics.total;
+  // Persisted plan status is not run liveness. A saved in_progress item may
+  // outlive an error/stop, or belong to a different session being viewed.
+  const running = metrics.total > 0 && !finished && turnRunning &&
+    (!currentSessionId || currentSessionId === runningSessionId);
+  dock.classList.toggle('is-complete', finished);
+  dock.classList.toggle('is-running', running);
   if (metrics.total === 0) {
     dock.hidden = true;
     popover.hidden = true;
@@ -363,13 +370,13 @@ function renderTodoPlan() {
   }
 
   dock.hidden = false;
-  const finished = metrics.completed === metrics.total;
   step.textContent = finished
     ? `已完成 ${metrics.completed} / ${metrics.total}`
-    : `第 ${metrics.current} / ${metrics.total} 步`;
+    : running ? `第 ${metrics.current} / ${metrics.total} 步`
+      : `未完成 ${metrics.completed} / ${metrics.total}`;
   counts.textContent = [
     metrics.completed ? `${metrics.completed} 已完成` : '',
-    metrics.active ? `${metrics.active} 进行中` : '',
+    metrics.active ? `${metrics.active} ${running ? '进行中' : '未完成'}` : '',
     metrics.pending ? `${metrics.pending} 待处理` : '',
   ].filter(Boolean).join(' · ');
   list.innerHTML = todoPlanItems.map(item => `
@@ -743,6 +750,7 @@ function setTurnRunning(running, sessionId) {
   }
   syncTurnControls();
   renderSessions();
+  renderTodoPlan();
 }
 
 // Detach transient DOM state when the user views another transcript. The

@@ -509,13 +509,12 @@ type Model struct {
 	// out of view. The one-at-a-time semantics above replace it.
 	expandedToolID string
 
-	// thinkingDisplay controls how Message{Role:"thinking"} +
-	// Message{Role:"redacted_thinking"} render in the transcript.
+	// thinkingDisplay controls public Message{Role:"thinking"} rendering.
+	// Opaque redacted_thinking blocks are never displayed.
 	// Three values, set via /thinking slash command:
-	//   "auto"   (default) — compact live/history preview,
-	//                        🔒 placeholder for redacted blocks
+	//   "auto"   (default) — compact live/history preview
 	//   "show"   — always expanded, never collapse
-	//   "hide"   — skip ALL thinking/redacted_thinking rows entirely
+	//   "hide"   — skip public thinking rows entirely
 	// Mirrors the spirit of CC's Ctrl+O transcript mode but exposed
 	// as an explicit user preference so the user picks how chatty
 	// the trace should be on EVERY turn, not per-press.

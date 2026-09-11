@@ -26,7 +26,7 @@ package tui
 //   - text block on a user message     → Message{Role: "user"}
 //   - text block on an assistant message → Message{Role: "assistant"}
 //   - thinking block (assistant)        → Message{Role: "thinking"}
-//   - redacted_thinking block           → opaque placeholder row
+//   - redacted_thinking block           → opaque state, omitted from rendering
 //   - tool_use block (assistant)         → ToolEvent{Kind: "start"}
 //   - tool_result block (user)           → upgrade matching ToolEvent
 //                                          to Kind "end" with output

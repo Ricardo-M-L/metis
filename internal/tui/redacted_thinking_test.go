@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -10,9 +11,9 @@ import (
 
 // TestRender_RedactedThinking_NeverShowsCipherText — the most
 // important contract: a Message{Role:"redacted_thinking"} carries
-// opaque cipher text in Content (needed for round-trip to Anthropic
+// opaque cipher text in Content (needed for round-trip to the provider
 // on the next turn), but rendering MUST NOT display that cipher text
-// to the user. Render the lock-glyph placeholder instead.
+// or a placeholder to the user.
 func TestRender_RedactedThinking_NeverShowsCipherText(t *testing.T) {
 	cipherText := "EuwBCkAGfXMSECRETKEY/abc+def=="
 	msg := Message{
@@ -29,25 +30,20 @@ func TestRender_RedactedThinking_NeverShowsCipherText(t *testing.T) {
 	}
 }
 
-// TestRender_RedactedThinking_ShowsLockGlyphAndExplanation — positive
-// check: the user must see SOMETHING that conveys "thinking was
-// redacted" so they know the row isn't empty. Without this they'd
-// see a phantom blank row mid-transcript.
-func TestRender_RedactedThinking_ShowsLockGlyphAndExplanation(t *testing.T) {
+// Opaque replay data has no user-facing text, including in expanded mode.
+func TestRender_RedactedThinking_HasNoPlaceholder(t *testing.T) {
 	msg := Message{Role: "redacted_thinking", Content: "OPAQUE", Timestamp: time.Now()}
-	out := renderMessage(msg, 80, false)
-	if !strings.Contains(out, "🔒") {
-		t.Errorf("expected lock glyph in rendered output (the visual marker that distinguishes redacted from normal thinking); got %q", out)
-	}
-	if !strings.Contains(out, "redacted") {
-		t.Errorf("expected the word 'redacted' so the user understands what happened; got %q", out)
+	for _, expand := range []bool{false, true} {
+		if out := renderMessage(msg, 80, expand); out != "" {
+			t.Errorf("encrypted reasoning must render nothing (expand=%v), got %q", expand, out)
+		}
 	}
 }
 
 // TestRender_RedactedThinking_ExpandFlagIgnored — the `expand` flag
 // (ctrl+o state) is meaningless for redacted blocks since there's no
 // plaintext to expand into. Rendered output must be identical whether
-// expand=true or expand=false — both show the same placeholder.
+// expand=true or expand=false — neither renders a row.
 func TestRender_RedactedThinking_ExpandFlagIgnored(t *testing.T) {
 	msg := Message{Role: "redacted_thinking", Content: "CIPHER", Timestamp: time.Now()}
 	collapsed := renderMessage(msg, 80, false)
@@ -60,8 +56,8 @@ func TestRender_RedactedThinking_ExpandFlagIgnored(t *testing.T) {
 // TestBuildChatItems_ThinkingDisplay_Hide_DropsBothRows — when the
 // user runs `/thinking hide`, both normal thinking and redacted_thinking
 // rows must be filtered out of the rendered transcript. The persisted
-// Messages stay (so /thinking show brings them back without a reload),
-// only the visible item list shrinks.
+// Messages stay (so /thinking show brings public thinking back without
+// a reload), only the visible item list shrinks.
 func TestBuildChatItems_ThinkingDisplay_Hide_DropsBothRows(t *testing.T) {
 	m := newTestModelForVisibility()
 	m.thinkingDisplay = "hide"
@@ -107,14 +103,8 @@ func TestBuildChatItems_ThinkingDisplay_Show_ForcesExpand(t *testing.T) {
 	}
 }
 
-// TestBuildChatItems_ThinkingDisplay_Auto_KeepsLegacyBehaviour — `auto`
-// (the default) preserves the collapsed-by-default semantics: thinking
-// renders collapsed, redacted_thinking renders as a placeholder, both
-// rows are kept in the item list.
-//
-// P0-1 (2026-08-02): expandToolOutputs is gone, so the test no longer
-// sets it; the assertion flips to "/thinking auto renders collapsed".
-func TestBuildChatItems_ThinkingDisplay_Auto_KeepsLegacyBehaviour(t *testing.T) {
+// Auto keeps public thinking compact and omits encrypted replay data.
+func TestBuildChatItems_ThinkingDisplay_Auto_KeepsPublicThinkingOnly(t *testing.T) {
 	m := newTestModelForVisibility()
 	m.thinkingDisplay = "auto"
 	m.messages = []Message{
@@ -141,8 +131,43 @@ func TestBuildChatItems_ThinkingDisplay_Auto_KeepsLegacyBehaviour(t *testing.T) 
 	if !thinkingKept {
 		t.Errorf("/thinking auto must keep thinking rows in the item list")
 	}
-	if !redactedKept {
-		t.Errorf("/thinking auto must keep redacted_thinking rows in the item list")
+	if redactedKept {
+		t.Errorf("/thinking auto must omit redacted_thinking rows from the item list")
+	}
+}
+
+func TestBuildChatItems_RedactedThinkingAlwaysHidden(t *testing.T) {
+	for _, display := range []string{"auto", "show", "hide"} {
+		for _, style := range []string{"", outputStyleFull, outputStyleStreamlined, outputStyleMinimal} {
+			t.Run(display+"/"+style, func(t *testing.T) {
+				m := newTestModelForVisibility()
+				m.thinkingDisplay = display
+				m.outputStyle = style
+				m.messages = []Message{
+					{Role: "user", Content: "question"},
+					{Role: "thinking", Content: "public summary"},
+					{Role: "redacted_thinking", Content: "CIPHER"},
+					{Role: "assistant", Content: "answer"},
+				}
+				before := append([]Message(nil), m.messages...)
+				var roles []string
+				for _, item := range m.buildChatItems() {
+					if mi, ok := item.(*messageItem); ok {
+						roles = append(roles, mi.msg.Role)
+					}
+				}
+				want := []string{"user", "assistant"}
+				if display != "hide" && normalizeOutputStyle(style) == outputStyleFull {
+					want = []string{"user", "thinking", "assistant"}
+				}
+				if !reflect.DeepEqual(roles, want) {
+					t.Errorf("visible message rows = %v, want %v (no encrypted or blank row)", roles, want)
+				}
+				if !reflect.DeepEqual(m.messages, before) {
+					t.Fatal("presentation filtering changed source messages")
+				}
+			})
+		}
 	}
 }
 

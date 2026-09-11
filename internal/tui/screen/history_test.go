@@ -62,20 +62,30 @@ func TestHistoryScreen_HidesInternalUserAttachments(t *testing.T) {
 }
 
 func TestHistoryScreen_RendersThinkingWithoutLeakingRedactedPayload(t *testing.T) {
-	s := NewHistoryScreen([]llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+	messages := []llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
 		{Type: "thinking", Text: "inspect the repository first"},
 		{Type: "redacted_thinking", Data: "SECRET-CIPHER-BYTES"},
 		{Type: "text", Text: "done"},
-	}}}, 80, 24)
+	}}}
+	s := NewHistoryScreen(messages, 80, 24)
 	view := s.View()
 	if !strings.Contains(view, "thinking") || !strings.Contains(view, "inspect the repository first") {
 		t.Fatalf("visible thinking missing: %s", view)
 	}
-	if !strings.Contains(view, "thinking redacted") {
-		t.Fatalf("redacted placeholder missing: %s", view)
+	if strings.Contains(view, "redacted") || strings.Contains(view, "🔒") {
+		t.Fatalf("encrypted placeholder must not appear: %s", view)
 	}
 	if strings.Contains(view, "SECRET-CIPHER-BYTES") {
 		t.Fatalf("redacted payload leaked: %s", view)
+	}
+	visibleOnly := []llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+		messages[0].Content[0], messages[0].Content[2],
+	}}}
+	if got, want := RenderHistoryBody(messages, 80), RenderHistoryBody(visibleOnly, 80); got != want {
+		t.Fatalf("encrypted block added transcript content or spacing: got %q, want %q", got, want)
+	}
+	if messages[0].Content[1].Data != "SECRET-CIPHER-BYTES" {
+		t.Fatal("history rendering changed encrypted replay data")
 	}
 }
 

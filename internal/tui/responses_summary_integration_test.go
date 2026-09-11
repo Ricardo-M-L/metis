@@ -68,6 +68,10 @@ func TestResponsesSummaryTerminalOnlyReachesChat(t *testing.T) {
 				t.Fatalf("loop failed: %v", err)
 			}
 			m.finalizeTurn(nil)
+			historyBefore, err := json.Marshal(loop.History())
+			if err != nil {
+				t.Fatal(err)
+			}
 			out := m.View().Content
 			if got := strings.Count(out, summary); got != 1 {
 				t.Fatalf("public summary rendered %d times, want once; view=%q", got, out)
@@ -78,10 +82,31 @@ func TestResponsesSummaryTerminalOnlyReachesChat(t *testing.T) {
 			if strings.Contains(out, cipher) {
 				t.Fatalf("encrypted reasoning leaked into rendered chat: %q", out)
 			}
+			if strings.Contains(out, "🔒") || strings.Contains(out, "redacted") {
+				t.Fatalf("encrypted reasoning placeholder appeared in chat: %q", out)
+			}
+			cipherBlocks := 0
+			for _, message := range loop.History() {
+				for _, block := range message.Content {
+					if block.Type == "redacted_thinking" && block.Data == cipher {
+						cipherBlocks++
+					}
+				}
+			}
+			if !terminalOnly && cipherBlocks != 1 {
+				t.Fatalf("encrypted replay blocks retained = %d, want 1", cipherBlocks)
+			}
 			m.thinkingDisplay = "hide"
 			m.renderCache.InvalidateAll()
 			if hidden := m.View().Content; strings.Contains(hidden, summary) || strings.Contains(hidden, cipher) {
 				t.Fatalf("hidden reasoning leaked into chat: %q", hidden)
+			}
+			historyAfter, err := json.Marshal(loop.History())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(historyAfter) != string(historyBefore) {
+				t.Fatal("presentation filtering changed provider history")
 			}
 		})
 	}

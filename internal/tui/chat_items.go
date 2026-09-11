@@ -711,10 +711,9 @@ func (m *Model) buildChatItems() []list.Item {
 	// every prior error payload 25 times per second.
 	recoveryPlans := m.cachedRecoveredErrorPlans(merged)
 	out := make([]list.Item, 0, len(merged)+2)
-	// thinkingDisplay = "hide" drops every reasoning row from the
-	// transcript and from the live-streaming preview. "show" forces
-	// expanded view regardless of ctrl+o state. "auto" (default) keeps
-	// the old collapsed-by-default-with-ctrl+o behaviour.
+	// thinkingDisplay controls public reasoning: "hide" omits it, "show"
+	// expands it, and "auto" keeps a compact preview. Opaque replay data
+	// is always omitted from the visible list without changing history.
 	style := normalizeOutputStyle(m.outputStyle)
 	hideThinking := m.thinkingDisplay == "hide" || style != outputStyleFull
 	forceExpandThinking := m.thinkingDisplay == "show"
@@ -761,7 +760,8 @@ func (m *Model) buildChatItems() []list.Item {
 			if it.msg.Role == "assistant" && strings.TrimSpace(it.msg.Content) == "" {
 				continue
 			}
-			if hideThinking && (it.msg.Role == "thinking" || it.msg.Role == "redacted_thinking") {
+			// Drop opaque blocks entirely so they leave no blank list row.
+			if it.msg.Role == "redacted_thinking" || (hideThinking && it.msg.Role == "thinking") {
 				continue
 			}
 			if style != outputStyleFull && it.msg.Role == "thought-summary" {

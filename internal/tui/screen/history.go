@@ -283,9 +283,8 @@ func renderAssistantMessage(b *strings.Builder, m llm.Message, width int) {
 			}
 		case "redacted_thinking":
 			// The encrypted payload is persisted for provider continuity but
-			// must never be printed into the transcript screen.
-			b.WriteString(indent(histDim.Render("🔒 thinking redacted by provider"), "  "))
-			b.WriteString("\n")
+			// contributes neither content nor a placeholder to the transcript.
+			continue
 		case "text":
 			if c.Text != "" {
 				b.WriteString(indent(histText.Render(wrap(c.Text, width-4)), "  "))

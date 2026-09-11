@@ -623,7 +623,7 @@ html, body {
   border-radius: 50%;
 }
 
-.todo-plan-trigger-ring {
+.todo-plan-dock.is-running .todo-plan-trigger-ring {
   border-color: rgba(86, 134, 254, 0.25);
   border-top-color: var(--accent);
   animation: todo-plan-spin 1s linear infinite;
@@ -728,7 +728,7 @@ html, body {
   color: var(--fg-strong);
 }
 
-.todo-plan-item[data-status="in_progress"] .todo-plan-glyph {
+.todo-plan-dock.is-running .todo-plan-item[data-status="in_progress"] .todo-plan-glyph {
   border-color: rgba(86, 134, 254, 0.28);
   border-top-color: var(--accent);
   animation: todo-plan-spin 1s linear infinite;
