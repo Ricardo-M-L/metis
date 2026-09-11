@@ -7,6 +7,38 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.58] - 2026-09-11
+
+Prepared as a full CLI and Desktop release. The macOS Desktop artifacts in
+this release are ad-hoc signed and are not Apple-notarized; checksums, bundle
+metadata, architecture, launch behavior, and the shared Agent runtime are
+verified independently.
+
+### Fixed
+
+- Preserve the stable Responses input prefix when memory and runtime state
+  change by placing fresh mutable context after conversation history. This
+  improves implicit prompt-cache reuse without persisting stale snapshots.
+- Recover recognized HTTP/2 stream resets and other transient response failures
+  within one finite 60-second, three-attempt default budget, while keeping
+  completed tools exactly once and treating unknown or authoritative failures
+  as terminal.
+- Bound checkpoint scans and Git subprocesses, stop them on turn cancellation,
+  and disable code rewind across an incomplete checkpoint instead of claiming
+  unsafe restore coverage. Bash mutations are attributed from actual file
+  changes.
+- Cancel foreground Bash process trees on Esc and wait for cleanup before
+  starting queued work. Detached jobs now fence cancellation at admission, and
+  focused panels consume their own first Esc without affecting the task.
+- Hide opaque encrypted reasoning rows while retaining provider replay state,
+  and stop the Desktop plan indicator from showing persisted incomplete work as
+  actively running after the turn ends.
+
+### Documentation
+
+- Record the deferred MCP protocol compatibility work separately from the
+  Responses, recovery, and cache changes in this release.
+
 ## [0.4.57] - 2026-09-11
 
 Prepared as a full CLI and Desktop release. The macOS Desktop artifacts in

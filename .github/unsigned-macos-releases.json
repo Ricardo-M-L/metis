@@ -1,5 +1,8 @@
 {
   "v0.4.57": {
     "reason": "Owner-authorized ad-hoc signed macOS Desktop release; no Developer ID or Apple notarization credentials are available."
+  },
+  "v0.4.58": {
+    "reason": "Owner-authorized ad-hoc signed macOS Desktop release; no Developer ID or Apple notarization credentials are available."
   }
 }
