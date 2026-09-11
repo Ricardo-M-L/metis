@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -32,6 +33,7 @@ type ckptEntry struct {
 	restoreToTurns int               // CountTurns() value the conversation should return to
 	label          string            // human label ("before turn 3")
 	managedPaths   map[string]string // cwd-relative path -> post-tool fingerprint
+	incomplete     bool              // never claim code restore across an unverified mutation
 }
 
 // mutatingTools are the tools whose execution can change the working
@@ -50,15 +52,22 @@ var mutatingTools = map[string]bool{
 // tool of the current turn. No-op when checkpointing is disabled, the
 // tool isn't mutating, or this turn was already snapped.
 func (l *Loop) snapPreEdit(toolName string, input map[string]any) {
+	_ = l.snapPreEditContext(context.Background(), toolName, input)
+}
+
+func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input map[string]any) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
 	if l.Checkpointer == nil || !mutatingTools[toolName] {
-		return
+		return nil
 	}
 	turns := l.CountTurns()
 	l.ckptMu.Lock()
 	already := l.ckptSnappedAt == turns
 	l.ckptMu.Unlock()
 	if already {
-		return
+		return nil
 	}
 
 	// Snap BEFORE marking the slot. A read-only Bash (cat/ls/git status)
@@ -67,9 +76,9 @@ func (l *Loop) snapPreEdit(toolName string, input map[string]any) {
 	// NOT mark the turn snapped — otherwise the real Edit that follows in
 	// the same turn early-returns and the turn loses its only rewind
 	// point. Only a real, non-empty snapshot consumes the slot.
-	hash, err := l.Checkpointer.Snap(toolName, argsHash(input), fmt.Sprintf("before turn %d", turns))
+	hash, err := l.Checkpointer.SnapContext(ctx, toolName, argsHash(input), fmt.Sprintf("before turn %d", turns))
 	if err != nil || hash == "" {
-		return
+		return err
 	}
 	l.ckptMu.Lock()
 	if l.ckptSnappedAt != turns { // re-check: another tool may have won the race
@@ -81,6 +90,60 @@ func (l *Loop) snapPreEdit(toolName string, input map[string]any) {
 		})
 	}
 	l.ckptMu.Unlock()
+	return nil
+}
+
+const checkpointStageBudget = 5 * time.Second
+
+// Automatic checkpointing is best-effort, but never an unbounded part of a
+// tool invocation. Use the original turn context even for atomic tools that
+// detach their own execution from Esc. A skipped stage must not look like a
+// successfully protected rewind point to the user.
+func (l *Loop) runCheckpointStage(ctx context.Context, out chan<- Event, phase, toolName string, run func(context.Context) error) {
+	if l.Checkpointer == nil || !mutatingTools[toolName] {
+		return
+	}
+	stageCtx, cancel := context.WithTimeout(ctx, checkpointStageBudget)
+	defer cancel()
+	if err := run(stageCtx); err != nil {
+		// Cancellation before execution means no new tool was started. A budget
+		// failure while the turn is live still permits execution, and therefore
+		// creates a real protection gap even if there is no baseline hash.
+		if phase == "after tool" || ctx.Err() == nil {
+			l.markCheckpointIncomplete()
+		}
+		warningCtx, cancelWarning := context.WithTimeout(context.WithoutCancel(ctx), 100*time.Millisecond)
+		defer cancelWarning()
+		emit(warningCtx, out, Event{Kind: EventInfo, Info: fmt.Sprintf(
+			"checkpoint %s skipped: %v; code rewind protection may be incomplete for this invocation", phase, err,
+		)})
+	}
+}
+
+func (l *Loop) markCheckpointIncomplete() {
+	turns := l.CountTurns()
+	l.ckptMu.Lock()
+	defer l.ckptMu.Unlock()
+	for index := len(l.ckptStack) - 1; index >= 0; index-- {
+		if l.ckptStack[index].restoreToTurns == turns-1 {
+			l.ckptStack[index].incomplete = true
+			l.ckptSnappedAt = turns
+			return
+		}
+	}
+	// An unavailable pre-snapshot must not be replaced later in the same turn
+	// by a post-mutation snapshot advertised as the original pre-turn state.
+	l.ckptStack = append(l.ckptStack, ckptEntry{restoreToTurns: turns - 1, label: fmt.Sprintf("before turn %d", turns), incomplete: true})
+	l.ckptSnappedAt = turns
+}
+
+func checkpointCompleteFromTurn(stack []ckptEntry, turn int) bool {
+	for _, entry := range stack {
+		if entry.restoreToTurns >= turn-1 && entry.incomplete {
+			return false
+		}
+	}
+	return true
 }
 
 // RewindResult describes what a Rewind did, for the UI to report.
@@ -133,6 +196,7 @@ type RewindSummaryPlan struct {
 var (
 	ErrInvalidRewindPoint    = errors.New("rewind: selected conversation point no longer exists")
 	ErrCheckpointUnavailable = errors.New("rewind: code checkpointing is unavailable")
+	ErrCheckpointIncomplete  = fmt.Errorf("%w: a checkpoint was cancelled or incomplete; conversation-only rewind remains available", ErrCheckpointUnavailable)
 	ErrConversationChanged   = errors.New("rewind: conversation changed while preparing the operation")
 	ErrSummarizerUnavailable = errors.New("rewind: conversation summarizer is unavailable")
 	ErrInvalidRewindScope    = errors.New("rewind: invalid restore scope")
@@ -169,7 +233,7 @@ func (l *Loop) RewindPoints() []RewindPoint {
 		// code state, so code restore is an available, proven no-op. With no
 		// snapshot history at all, absence is not evidence and remains
 		// unavailable.
-		codeAvailable := hash != "" || (latestEditTurn > 0 && turn > latestEditTurn)
+		codeAvailable := (hash != "" || (latestEditTurn > 0 && turn > latestEditTurn)) && checkpointCompleteFromTurn(stack, turn)
 		points = append(points, RewindPoint{
 			Turn:              turn,
 			Prompt:            prompt,
@@ -239,6 +303,9 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 		l.ckptMu.Lock()
 		stack := append([]ckptEntry(nil), l.ckptStack...)
 		l.ckptMu.Unlock()
+		if !checkpointCompleteFromTurn(stack, turn) {
+			return RewindResult{}, ErrCheckpointIncomplete
+		}
 		codeHash, codePaths = checkpointRestoreForTurn(stack, turn)
 		if codeHash == "" {
 			latestEditTurn := 0
@@ -499,38 +566,57 @@ func (l *Loop) discardCheckpointMappingsFrom(turn int) {
 	l.ckptMu.Lock()
 	defer l.ckptMu.Unlock()
 	keep := l.ckptStack[:0]
+	discardedIncomplete := false
 	for _, entry := range l.ckptStack {
 		if entry.restoreToTurns < turn-1 {
 			keep = append(keep, entry)
+		} else if entry.incomplete {
+			discardedIncomplete = true
 		}
+	}
+	// Conversation-only rewind/summary does not restore files. Do not let it
+	// erase a code-protection gap and make older checkpoints look complete.
+	// Carry the barrier at the last retained message boundary; new later turns
+	// may still establish a fresh baseline from the actual current files.
+	if discardedIncomplete && len(keep) > 0 {
+		keep = append(keep, ckptEntry{restoreToTurns: turn - 2, label: "incomplete code state after conversation rewind", incomplete: true})
 	}
 	l.ckptStack = keep
 	l.ckptSnappedAt = -1
 }
 
 // recordCheckpointMutation extends the deletion-safe managed-path union after
-// a direct file tool succeeds. Bash is intentionally excluded: its command
-// string is not a trustworthy, complete list of paths, so treating arbitrary
-// cwd contents as Bash-managed could delete user files during rewind.
+// a successful tool. Bash is attributed from the actual file delta, never by
+// guessing file names or read-only behavior from its command string.
 func (l *Loop) recordCheckpointMutation(toolName string, input map[string]any, res *tools.Result, err error) {
+	_ = l.recordCheckpointMutationContext(context.Background(), toolName, input, res, err)
+}
+
+func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName string, input map[string]any, res *tools.Result, err error) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
 	if l == nil || l.Checkpointer == nil || err != nil || (res != nil && res.IsError) {
-		return
+		return nil
 	}
 	l.ckptMu.Lock()
 	if len(l.ckptStack) == 0 {
 		l.ckptMu.Unlock()
-		return
+		return nil
 	}
 	entryIndex := len(l.ckptStack) - 1
 	entry := l.ckptStack[entryIndex]
 	l.ckptMu.Unlock()
+	if entry.incomplete || entry.hash == "" {
+		return ErrCheckpointIncomplete
+	}
 
 	var paths []string
 	switch toolName {
 	case "Bash":
-		changed, changedErr := l.Checkpointer.ChangedPaths(entry.hash)
+		changed, changedErr := l.Checkpointer.ChangedPathsContext(ctx, entry.hash)
 		if changedErr != nil {
-			return
+			return changedErr
 		}
 		paths = changed
 	case "Edit", "Write", "MultiEdit", "NotebookEdit":
@@ -540,19 +626,22 @@ func (l *Loop) recordCheckpointMutation(toolName string, input map[string]any, r
 			paths = append(paths, path)
 		}
 	default:
-		return
+		return nil
 	}
 	if len(paths) == 0 {
-		return
+		return nil
 	}
-	states, stateErr := l.Checkpointer.CapturePathStates(paths)
-	if stateErr != nil || len(states) == 0 || l.Checkpointer.RecordManagedPaths(paths) != nil {
-		return
+	states, stateErr := l.Checkpointer.CapturePathStatesContext(ctx, paths)
+	if stateErr != nil || len(states) == 0 {
+		return stateErr
+	}
+	if err := l.Checkpointer.RecordManagedPathsContext(ctx, paths); err != nil {
+		return err
 	}
 	l.ckptMu.Lock()
 	defer l.ckptMu.Unlock()
 	if entryIndex >= len(l.ckptStack) || l.ckptStack[entryIndex].hash != entry.hash {
-		return
+		return nil
 	}
 	if l.ckptStack[entryIndex].managedPaths == nil {
 		l.ckptStack[entryIndex].managedPaths = make(map[string]string)
@@ -560,6 +649,7 @@ func (l *Loop) recordCheckpointMutation(toolName string, input map[string]any, r
 	for path, state := range states {
 		l.ckptStack[entryIndex].managedPaths[path] = state
 	}
+	return nil
 }
 
 // Rewind restores the working tree to the most recent pre-edit snapshot

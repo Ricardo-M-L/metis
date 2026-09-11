@@ -1005,7 +1005,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 
 	// Honor InterruptBlock: tools that declare InterruptBlock want to
 	// finish their current invocation even if the parent ctx gets
-	// cancelled mid-call (Bash running `make install`, Edit mid-write,
+	// cancelled mid-call (Edit mid-write,
 	// SendMessage mid-flight). Detach the cancel signal — values from
 	// ctx still flow through.
 	//
@@ -1030,7 +1030,18 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	if allowed, reason := l.validateToolDispatchAdmission(dispatchEpoch); !allowed {
 		return emitToolDispatchDenial(ctx, out, blk, reason, traceInvocationID, traceParentInvocationID, traceCallID)
 	}
-	l.snapPreEdit(blk.ToolName, blk.ToolInput)
+	l.runCheckpointStage(ctx, out, "before tool", blk.ToolName, func(stageCtx context.Context) error {
+		return l.snapPreEditContext(stageCtx, blk.ToolName, blk.ToolInput)
+	})
+	// A cancelled pre-checkpoint must not start a not-yet-running atomic tool
+	// using the detached context. The checkpoint itself never owns execution.
+	if ctx.Err() != nil {
+		body := "skipped: turn interrupted before this tool ran (" + context.Cause(ctx).Error() + ")"
+		emit(ctx, out, Event{Kind: EventToolResult, ToolUseID: blk.ToolUseID, ToolName: blk.ToolName,
+			ToolResult: &ToolResult{Output: body, IsError: true}, TraceInvocationID: traceInvocationID,
+			TraceParentInvocationID: traceParentInvocationID, TraceCallID: traceCallID})
+		return llm.ContentBlock{Type: "tool_result", ToolUseID: blk.ToolUseID, ToolResult: body, IsError: true}
+	}
 
 	execStart := time.Now()
 	// Cooperative per-call timeout (DSH tool-call-timeout-policy parity):
@@ -1065,8 +1076,10 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		// must all agree that this execution failed.
 		res = &tools.Result{Output: "tool returned no result", IsError: true}
 	}
-	l.recordCheckpointMutation(blk.ToolName, blk.ToolInput, res, err)
 	execElapsed := time.Since(execStart)
+	l.runCheckpointStage(ctx, out, "after tool", blk.ToolName, func(stageCtx context.Context) error {
+		return l.recordCheckpointMutationContext(stageCtx, blk.ToolName, blk.ToolInput, res, err)
+	})
 	// Persist per-step timing to the session sidecar (best-effort). This is
 	// the single chokepoint every path's tool calls pass through, so one
 	// hook covers TUI / headless / cron / sub-agents.

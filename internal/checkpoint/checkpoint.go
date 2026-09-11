@@ -25,6 +25,7 @@ package checkpoint
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -42,13 +43,13 @@ import (
 
 // Manager owns one shadow repo for one session.
 type Manager struct {
-	mu        sync.Mutex
-	sessionID string
-	shadowDir string // ~/.metis/checkpoints/<session-id>
-	cwd       string // the working dir whose state we mirror
-	disabled  bool   // turns off all operations after a fatal init error
-	initOnce  sync.Once
-	initErr   error
+	mu          sync.Mutex
+	sessionID   string
+	shadowDir   string // ~/.metis/checkpoints/<session-id>
+	cwd         string // the working dir whose state we mirror
+	disabled    bool   // turns off all operations after a fatal init error
+	initialized bool
+	initErr     error
 }
 
 // NewManager constructs a Manager for the given session id.
@@ -125,33 +126,7 @@ func (m *Manager) Disabled() bool {
 // Called on first Snap. Errors mark the manager as disabled so
 // subsequent Snap calls fail-fast without re-attempting.
 func (m *Manager) initShadowRepo() error {
-	m.initOnce.Do(func() {
-		if err := os.MkdirAll(m.shadowDir, 0o700); err != nil {
-			m.initErr = fmt.Errorf("checkpoint: mkdir shadow: %w", err)
-			return
-		}
-		// Idempotent: if .git already exists we trust it.
-		gitDir := filepath.Join(m.shadowDir, ".git")
-		if _, err := os.Stat(gitDir); err == nil {
-			return
-		}
-		cmd := exec.Command("git", "init", "--quiet")
-		cmd.Dir = m.shadowDir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			m.initErr = fmt.Errorf("checkpoint: git init: %v: %s", err, string(out))
-			return
-		}
-		// Stamp identity so commits don't fail on a fresh box where
-		// `user.email` isn't set globally. Metis-as-author makes the
-		// log easy to recognise.
-		_ = m.git("config", "user.email", "metis@local")
-		_ = m.git("config", "user.name", "metis")
-	})
-	if m.initErr != nil {
-		m.disabled = true
-		return m.initErr
-	}
-	return nil
+	return m.initShadowRepoContext(context.Background())
 }
 
 // git runs a git command in the shadow dir. Returns combined output.
@@ -198,47 +173,7 @@ func (m *Manager) gitOutputBytes(args ...string) ([]byte, error) {
 // Errors are non-fatal — caller should log and continue. The
 // agent loop must not crash because checkpointing failed.
 func (m *Manager) Snap(toolName, argsHash, message string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.disabled {
-		return "", errors.New("checkpoint: disabled (prior init error)")
-	}
-	if err := m.initShadowRepo(); err != nil {
-		return "", err
-	}
-	if err := m.copyTree(); err != nil {
-		return "", err
-	}
-	if err := m.git("add", "-A"); err != nil {
-		return "", err
-	}
-	// An empty project's first pre-edit snapshot still needs a materialized
-	// commit: it is the only state capable of expressing "this file did not
-	// exist" when the first tool creates it. Later unchanged snapshots remain
-	// no-ops so the history does not fill with empty commits.
-	_, headErr := m.gitOutput("rev-parse", "--verify", "HEAD")
-	firstCommit := headErr != nil
-	if hasChanges, _ := m.gitOutput("diff", "--cached", "--name-only"); hasChanges == "" && !firstCommit {
-		return "", nil
-	}
-	commitMsg := fmt.Sprintf("%s|%s|%s|%s",
-		time.Now().UTC().Format(time.RFC3339),
-		toolName,
-		argsHash,
-		message,
-	)
-	commitArgs := []string{"commit", "-q", "-m", commitMsg}
-	if firstCommit {
-		commitArgs = append(commitArgs, "--allow-empty")
-	}
-	if err := m.git(commitArgs...); err != nil {
-		return "", err
-	}
-	out, err := m.gitOutput("rev-parse", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	return out, nil
+	return m.SnapContext(context.Background(), toolName, argsHash, message)
 }
 
 // skipDirs are the cwd subtrees we never copy into the shadow.
@@ -279,12 +214,19 @@ const maxFileBytes = 1 << 20
 // are recreated. Files removed from m.cwd between snaps are removed
 // from the shadow too (handled by `git add -A` on the shadow side).
 func (m *Manager) copyTree() error {
+	return m.copyTreeContext(context.Background())
+}
+
+func (m *Manager) copyTreeContext(ctx context.Context) error {
 	// Inventory the eligible live tree before mutating the mirror. This makes
 	// path-type replacement deterministic and ensures a walk/read failure
 	// aborts Snap instead of committing a mixture of old and new files.
 	liveFiles := make(map[string]string)
 	liveDirs := make([]string, 0)
 	if err := filepath.Walk(m.cwd, func(path string, info os.FileInfo, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
 		if walkErr != nil {
 			return fmt.Errorf("checkpoint: walk %s: %w", path, walkErr)
 		}
@@ -330,13 +272,16 @@ func (m *Manager) copyTree() error {
 	// Remove shadow-worktree files that disappeared from the live tree before
 	// copying current contents. `git add -A` can only stage a deletion after
 	// the stale mirror file itself is gone.
-	tracked := exec.Command("git", "ls-files", "-z")
-	tracked.Dir = m.shadowDir
-	trackedPaths, err := tracked.Output()
+	// Include untracked mirror files left by a cancelled copy before git add.
+	// Otherwise a deleted live file could reappear in the next snapshot.
+	trackedPaths, err := m.gitOutputBytesContext(ctx, "ls-files", "--cached", "--others", "-z")
 	if err != nil {
 		return fmt.Errorf("checkpoint: enumerate shadow files: %w", err)
 	}
 	for _, rel := range strings.Split(string(trackedPaths), "\x00") {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
 		if rel == "" {
 			continue
 		}
@@ -353,6 +298,9 @@ func (m *Manager) copyTree() error {
 
 	// Resolve file→directory conflicts in parent-before-child order.
 	for _, rel := range liveDirs {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
 		dst := filepath.Join(m.shadowDir, filepath.FromSlash(rel))
 		if info, err := os.Lstat(dst); err == nil && !info.IsDir() {
 			if err := os.RemoveAll(dst); err != nil {
@@ -367,6 +315,9 @@ func (m *Manager) copyTree() error {
 	}
 
 	for rel, path := range liveFiles {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
 		dst := filepath.Join(m.shadowDir, filepath.FromSlash(rel))
 		// Resolve directory→file (and any non-regular) conflicts explicitly.
 		if info, err := os.Lstat(dst); err == nil && !info.Mode().IsRegular() {
@@ -382,6 +333,9 @@ func (m *Manager) copyTree() error {
 		body, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("checkpoint: read %s: %w", rel, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
 		}
 		if err := os.WriteFile(dst, body, 0o600); err != nil {
 			return fmt.Errorf("checkpoint: write %s: %w", rel, err)
@@ -415,12 +369,18 @@ func (m *Manager) RecordManagedPath(path string) error {
 // Paths may be absolute or cwd-relative; symlink escapes, skipped trees,
 // non-regular payloads, and oversized files are ignored.
 func (m *Manager) RecordManagedPaths(paths []string) error {
-	m.mu.Lock()
+	return m.RecordManagedPathsContext(context.Background(), paths)
+}
+
+func (m *Manager) RecordManagedPathsContext(ctx context.Context, paths []string) error {
+	if err := m.lockContext(ctx); err != nil {
+		return err
+	}
 	defer m.mu.Unlock()
 	if m.disabled {
 		return errors.New("checkpoint: disabled")
 	}
-	if err := m.initShadowRepo(); err != nil {
+	if err := m.initShadowRepoContext(ctx); err != nil {
 		return err
 	}
 	managed, err := m.loadManagedPathStates()
@@ -429,6 +389,9 @@ func (m *Manager) RecordManagedPaths(paths []string) error {
 	}
 	changed := false
 	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
 		rel, ok := m.managedRelativePath(path)
 		if !ok {
 			continue
@@ -445,6 +408,9 @@ func (m *Manager) RecordManagedPaths(paths []string) error {
 	if !changed {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
 	return m.writeManagedPathStates(managed)
 }
 
@@ -452,16 +418,25 @@ func (m *Manager) RecordManagedPaths(paths []string) error {
 // and fingerprints their current post-tool state. Restore later refuses to
 // overwrite/delete a path whose state changed independently in the meantime.
 func (m *Manager) CapturePathStates(paths []string) (map[string]string, error) {
-	m.mu.Lock()
+	return m.CapturePathStatesContext(context.Background(), paths)
+}
+
+func (m *Manager) CapturePathStatesContext(ctx context.Context, paths []string) (map[string]string, error) {
+	if err := m.lockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.mu.Unlock()
 	if m.disabled {
 		return nil, errors.New("checkpoint: disabled")
 	}
-	if err := m.initShadowRepo(); err != nil {
+	if err := m.initShadowRepoContext(ctx); err != nil {
 		return nil, err
 	}
 	states := make(map[string]string)
 	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, context.Cause(ctx)
+		}
 		rel, ok := m.managedRelativePath(path)
 		if !ok {
 			continue
@@ -471,6 +446,9 @@ func (m *Manager) CapturePathStates(paths []string) (map[string]string, error) {
 			continue
 		}
 		states[rel] = state
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, context.Cause(ctx)
 	}
 	return states, nil
 }
@@ -634,83 +612,7 @@ func (m *Manager) treePaths(ref string) (map[string]struct{}, error) {
 // (and other mutating tools) to attribute creates, edits, deletes and renames
 // without granting restore permission to unrelated snapshot contents.
 func (m *Manager) ChangedPaths(hash string) ([]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.disabled {
-		return nil, errors.New("checkpoint: disabled")
-	}
-	if err := m.initShadowRepo(); err != nil {
-		return nil, err
-	}
-	target, err := m.treePaths(hash)
-	if err != nil {
-		return nil, err
-	}
-	live := make(map[string]string)
-	err = filepath.Walk(m.cwd, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return fmt.Errorf("checkpoint: inspect live delta %s: %w", path, walkErr)
-		}
-		if info == nil {
-			return fmt.Errorf("checkpoint: inspect live delta %s: missing file info", path)
-		}
-		if info.IsDir() {
-			if path != m.cwd && skipDirs[info.Name()] {
-				return filepath.SkipDir
-			}
-			if m.shadowDir != "" && (path == m.shadowDir || strings.HasPrefix(path, m.shadowDir+string(os.PathSeparator))) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !info.Mode().IsRegular() || info.Size() > maxFileBytes {
-			return nil
-		}
-		rel, relErr := filepath.Rel(m.cwd, path)
-		if relErr != nil {
-			return relErr
-		}
-		if normalized, ok := m.validRelativePath(rel); ok {
-			live[normalized] = path
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	candidates := make(map[string]struct{}, len(target)+len(live))
-	for rel := range target {
-		candidates[rel] = struct{}{}
-	}
-	for rel := range live {
-		candidates[rel] = struct{}{}
-	}
-	changed := make([]string, 0)
-	for rel := range candidates {
-		_, inTarget := target[rel]
-		livePath, inLive := live[rel]
-		if inTarget != inLive {
-			changed = append(changed, rel)
-			continue
-		}
-		if !inTarget {
-			continue
-		}
-		before, blobErr := m.gitOutputBytes("show", hash+":"+rel)
-		if blobErr != nil {
-			return nil, blobErr
-		}
-		after, readErr := os.ReadFile(livePath)
-		if readErr != nil {
-			return nil, fmt.Errorf("checkpoint: read changed path %s: %w", rel, readErr)
-		}
-		if !bytes.Equal(before, after) {
-			changed = append(changed, rel)
-		}
-	}
-	sort.Strings(changed)
-	return changed, nil
+	return m.ChangedPathsContext(context.Background(), hash)
 }
 
 // Checkpoint is one entry in the shadow log.
