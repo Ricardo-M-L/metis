@@ -125,7 +125,7 @@ var modalCommands = map[string]bool{
 // arrow navigation first writes the chosen canonical name into the input; a
 // bare ambiguous prefix such as /s must not silently become /share.
 func (m *Model) promotePaletteSelection(text string) string {
-	if !m.showPalette || len(m.palMatched) == 0 || !strings.HasPrefix(text, "/") {
+	if !m.paletteVisible() || !strings.HasPrefix(text, "/") {
 		return text
 	}
 
@@ -182,10 +182,13 @@ func (m *Model) refuseModelSwitch(text, blocker string) {
 			name = parsed
 		}
 	}
+	content := fmt.Sprintf("(can't /%s while %s is active — wait for it to finish or cancel it first)", name, blocker)
+	if m.turnActive && m.turnCancelledByUser {
+		content = fmt.Sprintf("(can't /%s yet — previous turn is canceling; wait for current work to stop, then submit again)", name)
+	}
 	m.messages = append(m.messages, Message{
-		Role: "info",
-		Content: fmt.Sprintf("(can't /%s while %s is active — wait for it to finish or cancel it first)",
-			name, blocker),
+		Role:      "info",
+		Content:   content,
 		Timestamp: time.Now(),
 	})
 	// Keep an explicit provider/model choice in the editor so the user can
@@ -199,6 +202,21 @@ func (m *Model) refuseModelSwitch(text, blocker string) {
 		m.input.CursorEnd()
 	}
 	m.dismissPalette()
+}
+
+// Cancellation is a distinct lifecycle phase: turnActive must remain true
+// until Run returns, but that does not make the dying Run a valid steering
+// target. Esc already discarded the old queue, so these are newly authorized
+// follow-ups. finalizeTurn may start them only after cleanup actually finishes.
+func (m *Model) queuePromptAfterCancellation(text string, priority QueuePriority) {
+	m.enqueueQueuedItem(text, priority)
+	m.input.Reset()
+	m.dismissPalette()
+	m.messages = append(m.messages, Message{
+		Role:      "info",
+		Content:   "(previous turn is canceling — prompt queued for a new turn after current work stops; Esc clears the queue)",
+		Timestamp: time.Now(),
+	})
 }
 
 func isThinkingDisplayCommand(text string) bool {
@@ -405,9 +423,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			m.queuePending = false
 			m.input.Reset()
 			m.dismissPalette()
-			msg := "interrupted"
+			msg := "canceling · waiting for current work to stop"
 			if queueCleared > 0 {
-				msg = fmt.Sprintf("interrupted · queue cleared (%d dropped)", queueCleared)
+				msg += fmt.Sprintf(" · queue cleared (%d dropped)", queueCleared)
 			}
 			m.messages = append(m.messages, Message{Role: "info", Content: msg, Timestamp: time.Now()})
 			return m, nil
@@ -440,6 +458,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				m.input.Reset()
 				return m, nil
 			}
+			if m.turnCancelledByUser {
+				m.queuePromptAfterCancellation(body, prio)
+				return m, nil
+			}
 			m.enqueueQueuedItem(body, prio)
 			m.input.Reset()
 			return m, nil
@@ -451,6 +473,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				switch slash.ClassifyMidTurn(sig) {
 				case slash.MidTurnDestructive:
 					name, _, _ := strings.Cut(raw[1:], " ")
+					if m.turnCancelledByUser {
+						m.messages = append(m.messages, Message{
+							Role:      "info",
+							Content:   "(can't /" + name + " yet — previous turn is canceling; command kept in the editor, submit it after current work stops)",
+							Timestamp: time.Now(),
+						})
+						m.dismissPalette()
+						return m, nil
+					}
 					m.messages = append(m.messages, Message{
 						Role:      "info",
 						Content:   "(can't /" + name + " mid-turn — press Esc to cancel the running turn first)",
@@ -483,6 +514,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 						}
 					}
 					if display == "" {
+						return m, nil
+					}
+					if m.turnCancelledByUser {
+						// Keep the invocation, not expanded text: a template body
+						// beginning with "/" is still model input, not a local
+						// command. The fresh-turn dispatcher resolves it once with
+						// the command's current permissions/model requirements.
+						m.queuePromptAfterCancellation(raw, QueuePriorityNext)
 						return m, nil
 					}
 					if !m.loop.SteerInject(display) {
@@ -522,6 +561,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		// turn. Keep the submitted text visible in the transcript so
 		// users can see that it landed; /later remains the explicit way
 		// to defer a message to the next turn.
+		if m.turnCancelledByUser {
+			m.queuePromptAfterCancellation(raw, QueuePriorityNext)
+			return m, nil
+		}
 		if !m.loop.SteerInject(raw) {
 			m.enqueueQueuedItem(raw, QueuePriorityNext)
 			m.messages = append(m.messages, Message{

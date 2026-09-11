@@ -210,40 +210,38 @@ func teaKeyEsc() tea.KeyMsg {
 	return tea.KeyPressMsg{Code: tea.KeyEscape}
 }
 
-// TestEsc_CancelsTurnEvenWhenPaletteOpen — 2026-05-26 regression for
-// user screenshot #75: with the slash-command palette open AND a turn
-// in flight (long-running python3 tool call), pressing ESC went to
-// the palette-dismiss path and the turn kept running. The fix moved
-// the turn-cancel branch to the very top of handleKey so it runs
-// BEFORE every overlay-intercept handler. This test pins that the
-// single ESC during a turn now (a) calls turnCancel, (b) clears the
-// palette state, (c) drops the queued prompts, regardless of whether
-// any overlay is open.
-func TestEsc_CancelsTurnEvenWhenPaletteOpen(t *testing.T) {
+// Panel dismissal is separate from task interruption: the first Esc closes
+// completion, and only a subsequent Esc on the chat surface cancels the turn.
+func TestEsc_PaletteClosesBeforeTurnCancellation(t *testing.T) {
 	cancelled := false
-	m := makeModelForGateTest()
+	m := newSlashTestModel(t)
 	m.turnActive = true
 	m.turnCancel = func() { cancelled = true }
 	m.showPalette = true
 	m.palFilter = "exp"
+	m.matchCommands()
 	m.queuedPrompts = []queuedItem{{Text: "queued one"}, {Text: "queued two"}}
 
 	_, _ = m.handleKey(teaKeyEsc())
 
-	if !cancelled {
-		t.Error("ESC with turn in flight should call turnCancel — palette open must NOT swallow it")
+	if cancelled {
+		t.Error("closing the palette must not cancel the running turn")
 	}
-	if m.turnCancel != nil {
-		t.Error("turnCancel should be cleared after firing")
+	if m.turnCancel == nil {
+		t.Error("turnCancel should remain available after closing the palette")
 	}
 	if m.showPalette {
-		t.Error("palette should be dismissed by the turn-cancel branch so user lands at a clean prompt")
+		t.Error("palette should be dismissed so the next Esc targets the task")
 	}
 	if m.palFilter != "" {
 		t.Errorf("palFilter should be cleared; got %q", m.palFilter)
 	}
-	if len(m.queuedPrompts) != 0 {
-		t.Errorf("queued prompts should be dropped on cancel; got %v", m.queuedPrompts)
+	if len(m.queuedPrompts) != 2 {
+		t.Errorf("closing the palette must keep queued prompts; got %v", m.queuedPrompts)
+	}
+	_, _ = m.handleKey(teaKeyEsc())
+	if !cancelled || m.turnCancel != nil || len(m.queuedPrompts) != 0 {
+		t.Fatal("Esc with the palette closed must cancel the task and clear its queue")
 	}
 }
 

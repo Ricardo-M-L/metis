@@ -36,6 +36,31 @@ func isContextCancellation(err error) bool {
 		strings.Contains(strings.ToLower(err.Error()), "context canceled")
 }
 
+// Automatic follow-up requires a clean cancellation, not merely an error
+// that mentions cancellation. In particular errors.Join(Canceled, cleanupErr)
+// must leave queued work paused rather than running through a failed cleanup.
+func isOnlyContextCancellation(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !isOnlyContextCancellation(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return isOnlyContextCancellation(wrapped)
+	}
+	return errors.Is(err, context.Canceled)
+}
+
 // A bounded drain that hit its budget schedules a near-immediate continuation
 // rather than waiting for the normal animation interval. The small delay gives
 // terminal input already queued by Bubble Tea a chance to run between bursts.
@@ -825,7 +850,7 @@ func (m *Model) finalizeTurn(err error) {
 	if err != nil || m.turnCancelledByUser {
 		m.backgroundResumeAllowed = false
 	}
-	userCancelled := m.turnCancelledByUser && isContextCancellation(err)
+	userCancelled := m.turnCancelledByUser && isOnlyContextCancellation(err)
 	defer func() { m.turnCancelledByUser = false }()
 	// Phase F Ctrl+B (2026-05-12) — capture whether the turn was
 	// running in background mode BEFORE we reset the flag below, so
@@ -837,6 +862,13 @@ func (m *Model) finalizeTurn(err error) {
 	m.backgroundedAt = time.Time{}
 	m.turnActive = false
 	m.spinnerActive = false
+	if m.turnCancelledByUser {
+		m.messages = append(m.messages, Message{
+			Role:      "info",
+			Content:   "interrupted · previous turn has ended",
+			Timestamp: time.Now(),
+		})
+	}
 	// Clear spinnerSub on turn end so a stale sub-label doesn't leak
 	// into the NEXT turn's first spinner frame. Pre-2026-08-01 the
 	// label survived finalizeTurn; the elapsed-display branch then
@@ -1027,10 +1059,25 @@ func (m *Model) finalizeTurn(err error) {
 	// it as the next user turn. Multi-item batches join with blank
 	// lines so the model sees one merged message instead of N
 	// round-trips (claude-code messageQueueManager `dequeueAllMatching`
-	// parity). We only run on success: a turn that errored out
-	// leaves the queue intact so the user can retry or wipe via
-	// Ctrl+C.
-	if err == nil && persistErr == nil && len(m.queuedPrompts) > 0 {
+	// parity). A clean user cancellation can also drain: Esc cleared the old
+	// queue, and input submitted during cleanup explicitly authorized new work.
+	// Other failures keep the queue intact. Never reuse the cancelled turn ctx.
+	canDrainQueue := err == nil || (m.turnCancelledByUser && isOnlyContextCancellation(err))
+	if m.ctx != nil && m.ctx.Err() != nil {
+		canDrainQueue = false
+	}
+	if canDrainQueue && persistErr == nil && len(m.queuedPrompts) > 0 {
+		// A user may already be composing a different prompt during cleanup.
+		// Do not overwrite that draft, or attach its images to an older queued
+		// text. The normal next user submission will resume queue processing.
+		if strings.TrimSpace(m.input.Value()) != "" || len(m.imagePaste) > 0 {
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   "(queued prompts paused — your draft and images are kept; submit the draft to continue, or press Esc to clear the queue)",
+				Timestamp: time.Now(),
+			})
+			return
+		}
 		nextText, batchN := m.drainNextQueuedBatch()
 		if batchN > 0 {
 			var notice string

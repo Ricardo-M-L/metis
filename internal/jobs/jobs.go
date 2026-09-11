@@ -280,6 +280,9 @@ func home() string {
 // so bash.go can build it once and pass through, instead of growing a
 // 7-arg signature.
 type SpawnArgs struct {
+	// AdmissionContext optionally cancels admission before Cmd.Start. It does
+	// not control the lifetime of a successfully started detached job.
+	AdmissionContext context.Context
 	// Command is the shell line to run (already passes safe-allowlist
 	// or permission gate by the time we get here).
 	Command string
@@ -330,14 +333,26 @@ type AdoptArgs struct {
 // Concurrent calls are safe: Spawn uses a write lock to insert into
 // the map and assign a unique ID.
 func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
+	if a.AdmissionContext != nil {
+		if err := a.AdmissionContext.Err(); err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(r.dir, 0o700); err != nil {
 		return nil, fmt.Errorf("jobs: mkdir %s: %w", r.dir, err)
 	}
 	id := newJobID()
 	outputPath := filepath.Join(r.dir, id+".out")
-	out, err := newDiskOutput(outputPath)
+	// A rejected admission removes this output. Exclusive creation ensures
+	// that cleanup can never remove an older job's file on an ID collision.
+	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("jobs: open output %s: %w", outputPath, err)
+	}
+	out := &DiskOutput{f: f, path: outputPath}
+	discardOutput := func() {
+		_ = out.Close()
+		_ = os.Remove(outputPath)
 	}
 
 	desc := a.Description
@@ -355,12 +370,23 @@ func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
 	// Admission and publication bracket Cmd.Start under the same lock as
 	// ResetAndWait's generation cut. Checking after Start would reject the map
 	// insertion but still leak a newly-started process across the boundary.
-	r.mu.Lock()
+	if err := r.lockAdmission(a.AdmissionContext); err != nil {
+		discardOutput()
+		return nil, err
+	}
 	if r.resetting {
 		r.mu.Unlock()
-		_ = out.Close()
-		_ = os.Remove(outputPath)
+		discardOutput()
 		return nil, ErrRegistryResetting
+	}
+	// Recheck under the actual admission lock, after resource preparation and
+	// any contention. An earlier Bash-side check cannot fence a late Esc.
+	if a.AdmissionContext != nil {
+		if err := a.AdmissionContext.Err(); err != nil {
+			r.mu.Unlock()
+			discardOutput()
+			return nil, err
+		}
 	}
 	if err := a.Cmd.Start(); err != nil {
 		r.mu.Unlock()
@@ -395,6 +421,34 @@ func (r *Registry) Spawn(a SpawnArgs) (*Job, error) {
 	go r.waitAndComplete(j, nil)
 
 	return snapshot, nil
+}
+
+// lockAdmission avoids making a cancelled admission wait behind unrelated
+// registry work. It never starts a detached mutex-waiter goroutine, so cancellation
+// cannot leave an abandoned waiter that later acquires and strands the lock.
+func (r *Registry) lockAdmission(ctx context.Context) error {
+	if ctx == nil {
+		r.mu.Lock()
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.mu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if r.mu.TryLock() {
+				return nil
+			}
+		}
+	}
 }
 
 // Adopt registers an already-running foreground cmd as a background

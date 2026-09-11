@@ -301,7 +301,7 @@ func (m *Model) View() tea.View {
 			// the mode reminder belongs adjacent to it. Status bar (with
 			// tokens / version on the right) is a separate, lower band.
 			s.WriteString(renderHints(m))
-			if m.showPalette {
+			if m.paletteVisible() {
 				s.WriteString(renderPalette(m))
 			}
 			if m.showHistory {
@@ -410,11 +410,20 @@ func (m *Model) View() tea.View {
 		// users (image #1 feedback 2026-05-20) consistently missed —
 		// they thought Enter had silently dropped their message.
 		lower.WriteString(renderQueuedPreview(m))
-		if m.showPalette {
+		if m.paletteVisible() {
 			lower.WriteString(renderPalette(m))
 		}
 		if m.showSearch {
 			lower.WriteString(renderTranscriptSearch(m))
+		}
+		// These panels own input in ordinary chat too, not just on the
+		// welcome page. Include them before sizing the chat viewport so
+		// their rows stay visible while a task is running.
+		if m.showHistory {
+			lower.WriteString(renderHistorySearch(m))
+		}
+		if m.atActive && len(m.atMatched) > 0 {
+			lower.WriteString(renderAtMention(m))
 		}
 		// 2026-05-24: stripOffsetInLower records newlines in `lower` BEFORE
 		// the strip is appended. The actual Y in the final View is computed

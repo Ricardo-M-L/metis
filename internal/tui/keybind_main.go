@@ -108,6 +108,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Esc dismisses one focused panel before acquiring cancellation meaning.
+	// This path must not touch the running task, its queued input, or OAuth.
+	// Ctrl-C deliberately keeps its existing routing and cancellation policy.
+	if msg.String() == "esc" {
+		if model, cmd, handled := m.dismissEscapePanel(msg); handled {
+			m.lastEsc = time.Time{}
+			return model, cmd
+		}
+	}
+
 	// Explicit MCP OAuth is independent lifecycle work (not an agent turn).
 	// Cancel it alongside a foreground turn rather than returning early: one
 	// Esc/Ctrl-C must not leave the other operation running.
@@ -128,26 +138,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
-	// 2026-05-26: ESC during a running turn must always cancel the turn,
-	// taking priority over every overlay-dismissal handler below. User
-	// screenshot showed a slash-command palette open while a python3
-	// tool call was executing; pressing ESC twice failed to stop the
-	// task because:
-	//   1st ESC → palette intercept (line ~58) closed palette + reset
-	//             input, never reached the turnCancel branch
-	//   2nd ESC → palette already closed, finally reached turnCancel,
-	//             but by then the user perception is "two ESCs and
-	//             it's still running" (the model may have already
-	//             emitted the next tool call by the time the second
-	//             ESC arrives)
-	// claude-code's contract — and the spinner hint "press esc to
-	// interrupt" — both imply ESC is the one true cancel key when a
-	// turn is in flight. Honour that BEFORE any overlay logic.
-	if m.turnCancel != nil && msg.String() == "esc" {
+	// With no focused panel left, Esc cancels the turn. Keep turnActive until
+	// Run really returns so the next prompt cannot overlap unfinished cleanup.
+	if msg.String() == "esc" && (m.turnCancel != nil || (m.turnActive && m.turnCancelledByUser)) {
 		m.backgroundResumeAllowed = false
 		m.turnCancelledByUser = true
-		m.turnCancel()
-		m.turnCancel = nil
+		if m.turnCancel != nil {
+			m.turnCancel()
+			m.turnCancel = nil
+		}
 		// Stop the spinner immediately for instant "cancel registered"
 		// feedback. turnActive stays set until the goroutine unwinds and
 		// finalizeTurn runs (so a new submit can't race the dying turn);
@@ -162,9 +161,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		queueCleared := len(m.queuedPrompts)
 		m.queuedPrompts = nil
 		m.queuePending = false
-		msg2 := "interrupted (esc)"
+		msg2 := "canceling (esc) · waiting for current work to stop"
 		if queueCleared > 0 {
-			msg2 = fmt.Sprintf("interrupted (esc) · dropped %d queued", queueCleared)
+			msg2 += fmt.Sprintf(" · dropped %d queued", queueCleared)
 		}
 		m.messages = append(m.messages, Message{
 			Role:      "info",
@@ -224,7 +223,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// it intercepts only navigation keys (Up/Down/Tab/Esc) and lets every
 	// other key fall through to the main input handler so the user keeps
 	// typing into inputBuffer naturally. claude-code does the same.
-	if m.showPalette {
+	if m.paletteVisible() {
 		// v2: KeyMsg is interface, .Type gone. Match by .String().
 		switch msg.String() {
 		case "up", "down", "tab", "esc":
@@ -355,9 +354,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		queueCleared := len(m.queuedPrompts)
 		m.queuedPrompts = nil
 		m.queuePending = false
-		msg2 := "interrupted · Ctrl-C again to exit"
+		msg2 := "canceling · waiting for current work to stop · Ctrl-C again to exit"
 		if queueCleared > 0 {
-			msg2 = fmt.Sprintf("interrupted · queue cleared (%d dropped) · Ctrl-C again to exit", queueCleared)
+			msg2 += fmt.Sprintf(" · queue cleared (%d dropped)", queueCleared)
 		}
 		m.messages = append(m.messages, Message{
 			Role:      "info",
@@ -587,25 +586,28 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "esc":
-		// Overlay stack takes priority — if any overlay's Update
-		// consumes the Esc, we stop here. Otherwise fall through to
-		// the existing palette / vim / double-tap-clear handlers.
-		if m.overlays.Active() {
-			cmd, consumed := m.overlays.Update(msg)
-			if consumed {
-				return m, cmd
-			}
-		}
 		// Vim mode hijack: ESC in INSERT mode goes to NORMAL.
 		if vimModeState == vimInsert {
 			vimModeState = vimNormal
 			return m, nil
 		}
-		// Turn-in-flight ESC cancel was moved to the very top of
-		// handleKey on 2026-05-26 so overlay handlers (palette,
-		// askUser, search, at-mention) can no longer swallow it. If
-		// we reach this case branch it means no turn is running, so
-		// we only do palette-dismiss + double-tap-clear here.
+		// A cancellation/error can leave follow-ups paused while the user
+		// edits a draft. Esc clears that queue without discarding the draft;
+		// the usual second-Esc editor clear remains a separate action.
+		if !m.turnActive && (len(m.queuedPrompts) > 0 || m.queuePending) {
+			queueCleared := len(m.queuedPrompts)
+			m.queuedPrompts = nil
+			m.queuePending = false
+			m.messages = append(m.messages, Message{
+				Role:      "info",
+				Content:   fmt.Sprintf("queue cleared (%d dropped) · draft kept", queueCleared),
+				Timestamp: time.Now(),
+			})
+			m.lastEsc = time.Time{}
+			return m, nil
+		}
+		// Panel dismissal and active-turn cancellation were handled above.
+		// At the idle prompt, retain the separate double-tap-clear behavior.
 		// Single ESC: dismiss palette / pending state, leave typed
 		// input alone. Double-tap (within doubleEscWindow): clear the
 		// input completely. Mirrors claude-code's "double tap esc to

@@ -13,7 +13,8 @@ import "github.com/Ricardo-M-L/metis/internal/tools"
 func (List) IsReadOnly(map[string]any) bool   { return true }
 func (Output) IsReadOnly(map[string]any) bool { return true }
 
-// InterruptBehavior: Bash uses InterruptBlock — a half-finished
-// `make install` mid-Ctrl+C usually leaves things worse than letting
-// it finish. The user can ^C^C double-tap if they really mean it.
-func (Bash) InterruptBehavior() tools.InterruptBehavior { return tools.InterruptBlock }
+// Foreground commands must observe an explicit turn cancellation (Esc/Ctrl+C)
+// so the caller can join their owned process group before starting a new turn.
+// Finite background jobs are joined by the owning Run; explicitly detached
+// services keep their separate job-registry lifecycle after successful spawn.
+func (Bash) InterruptBehavior() tools.InterruptBehavior { return tools.InterruptCancel }

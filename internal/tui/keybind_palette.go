@@ -12,6 +12,13 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/slash"
 )
 
+// paletteVisible is shared by rendering, hints, and key routing. showPalette
+// tracks slash completion intent even when filtering produces no rows; that
+// empty state must not claim navigation keys or consume task cancellation.
+func (m *Model) paletteVisible() bool {
+	return m.showPalette && len(m.palMatched) > 0
+}
+
 // dismissPalette clears both the visible dropdown and its cached selection.
 // Clearing only showPalette/palFilter leaves the previous match slice/cursor
 // alive, which can be painted again by the same Enter key update after a

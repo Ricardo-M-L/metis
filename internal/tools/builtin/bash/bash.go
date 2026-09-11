@@ -385,6 +385,9 @@ func securityDenyReason(r SecurityRuleResult) string {
 }
 
 func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cmd, _ := in["command"].(string)
 	if strings.TrimSpace(cmd) == "" {
 		return nil, errors.New("command is required")
@@ -779,7 +782,12 @@ func (b Bash) executeBackground(ctx context.Context, cmdStr string, completion .
 	}
 
 	spawn := func() (*jobs.Job, error) {
-		return b.Jobs.Spawn(jobs.SpawnArgs{Command: cmdStr, Cmd: exe, Cancel: cancel})
+		// A detached job may outlive Execute, but a turn already cancelled
+		// before admission must never create new work.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return b.Jobs.Spawn(jobs.SpawnArgs{Command: cmdStr, Cmd: exe, Cancel: cancel, AdmissionContext: ctx})
 	}
 	var jb *jobs.Job
 	var err error

@@ -168,9 +168,8 @@ func (AskUser) RequiresUserInteraction() bool { return true }
 
 // --- interrupt behaviour -----------------------------------------------
 
-// Bash defaults to InterruptBlock: a half-finished `make install`
-// is worse than a fully-finished one. The user asks for cancel via
-// ^C^C double-tap if they really mean it.
+// Bash observes turn cancellation and joins its owned foreground process tree;
+// its capability declaration lives in the bash package.
 
 // SendMessage is unrecallable; if it's already in-flight to the
 // channel adapter, we can't yank it back. Block for completion so

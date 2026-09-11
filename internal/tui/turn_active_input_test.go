@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -600,7 +601,9 @@ func TestTurnActive_AbortCancelsInsteadOfSteering(t *testing.T) {
 			m.showPalette, m.palFilter, m.palCursor, len(m.palMatched))
 	}
 
-	cancelErr := errors.Join(errors.New("provider request failed"), context.Canceled)
+	// A contextual wrapper is still pure cancellation. An independent error
+	// joined with Canceled is a real failure and must be shown at completion.
+	cancelErr := fmt.Errorf("provider request failed: %w", context.Canceled)
 	m.handleAgentEvent(agent.Event{Kind: agent.EventError, Err: cancelErr})
 	m.finalizeTurn(cancelErr)
 	for _, msg := range m.messages {

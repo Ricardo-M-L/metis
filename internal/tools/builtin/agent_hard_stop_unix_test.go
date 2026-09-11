@@ -61,7 +61,7 @@ func TestBackgroundAgentCancelAndWaitReapsBashProcessTree(t *testing.T) {
 			leaderPath := filepath.Join(tmp, "leader.pid")
 			childPath := filepath.Join(tmp, "child.pid")
 			// tail keeps a real descendant alive without triggering Bash's
-			// deliberate-sleep detector, so false covers foreground InterruptBlock.
+			// deliberate-sleep detector, so false covers foreground cancellation.
 			command := fmt.Sprintf(
 				`printf '%%s' "$$" > %q; tail -f /dev/null & child=$!; printf '%%s' "$child" > %q; wait`,
 				leaderPath, childPath,
@@ -131,9 +131,18 @@ func TestBackgroundAgentCancelAndWaitReapsBashProcessTree(t *testing.T) {
 	}
 }
 
-func TestAgentParentDeadlineReapsInterruptBlockBashProcessTree(t *testing.T) {
-	for _, background := range []bool{false, true} {
-		t.Run(fmt.Sprintf("agent_background_%t", background), func(t *testing.T) {
+func TestAgentParentCancellationAndDeadlineReapBashProcessTree(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		background  bool
+		cancelEarly bool
+	}{
+		{name: "foreground_deadline"},
+		{name: "foreground_cancel", cancelEarly: true},
+		{name: "background_retains_deadline", background: true, cancelEarly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			background := tc.background
 			tmp := t.TempDir()
 			t.Setenv("METIS_HOME", tmp)
 			leaderPath := filepath.Join(tmp, "leader.pid")
@@ -168,7 +177,11 @@ func TestAgentParentDeadlineReapsInterruptBlockBashProcessTree(t *testing.T) {
 				}
 				rootJobs.ResetAndWait(0)
 			})
-			parentCtx, cancelParent := context.WithTimeout(context.Background(), 2*time.Second)
+			parentTimeout := 2 * time.Second
+			if tc.cancelEarly && !background {
+				parentTimeout = 30 * time.Second // Cancellation, not the deadline, must end this case.
+			}
+			parentCtx, cancelParent := context.WithTimeout(context.Background(), parentTimeout)
 			defer cancelParent()
 			executed := make(chan struct{})
 			go func() {
@@ -184,15 +197,25 @@ func TestAgentParentDeadlineReapsInterruptBlockBashProcessTree(t *testing.T) {
 			}()
 			leaderPID := waitForPIDFile(t, leaderPath, time.Second)
 			childPID := waitForPIDFile(t, childPath, time.Second)
-			// Ordinary turn cancellation must not interrupt the running Bash.
-			// The original parent deadline must still reap its full process tree.
-			cancelParent()
-			time.Sleep(50 * time.Millisecond)
-			if !processExists(leaderPID) || !processExists(childPID) {
-				t.Fatal("ordinary parent cancellation interrupted the Bash process tree")
+			if tc.cancelEarly {
+				cancelParent()
 			}
-			waitForProcessExit(t, leaderPID, 4*time.Second)
-			waitForProcessExit(t, childPID, time.Second)
+			// Only explicitly background agents outlive ordinary parent turn
+			// cancellation. Foreground agents must respond to Esc promptly;
+			// both retain the parent's deadline as an authoritative hard stop.
+			if background {
+				time.Sleep(50 * time.Millisecond)
+				if !processExists(leaderPID) || !processExists(childPID) {
+					t.Fatal("ordinary parent cancellation interrupted the detached agent")
+				}
+			}
+			if tc.cancelEarly && !background {
+				waitForProcessExit(t, leaderPID, time.Second)
+				waitForProcessExit(t, childPID, time.Second)
+			} else {
+				waitForProcessExit(t, leaderPID, 4*time.Second)
+				waitForProcessExit(t, childPID, time.Second)
+			}
 			waitForRosterCount(t, roster, 0, time.Second)
 			select {
 			case <-executed:

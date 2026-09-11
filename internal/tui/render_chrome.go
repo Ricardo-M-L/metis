@@ -859,7 +859,7 @@ func renderHints(m *Model) string {
 		s.WriteString(modeStyle.Render(glyph + " " + mode + " mode"))
 		s.WriteString(styleMuted.Render(" on (shift+tab to cycle)"))
 	}
-	if m.showPalette {
+	if m.paletteVisible() {
 		s.WriteString(styleMuted.Render(" · ↑↓/Tab to navigate · Esc to close"))
 	}
 	s.WriteString("\n")
