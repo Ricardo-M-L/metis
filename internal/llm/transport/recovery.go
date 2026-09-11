@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-// RecoveryPolicy is an explicit, opt-in replacement for the normal three
-// provider attempts, not an additional outer retry loop. MaxAttempts includes
+// RecoveryPolicy bounds one logical response, including interrupted streams;
+// it is not an additional outer retry loop. MaxAttempts includes
 // the initial request. The window starts when its first transient failure is
 // observed and includes all later waits, credential refreshes and HTTP work.
 type RecoveryPolicy struct {
@@ -25,10 +25,17 @@ type RecoveryPolicy struct {
 func (p RecoveryPolicy) Enabled() bool { return p.MaxDuration > 0 }
 
 // RecoveryPolicyFromEnv validates configuration without echoing raw values.
-// Disabled mode retains the historical three-attempt policy. Optional knobs
+// The default is a short three-attempt recovery window. Explicit zero disables
+// stream recovery and retains the historical three-attempt policy. Optional knobs
 // are still validated when present so configuration errors are never hidden.
 func RecoveryPolicyFromEnv() (RecoveryPolicy, error) {
-	p := RecoveryPolicy{MaxAttempts: 30, MaxBackoff: 30 * time.Second}
+	p := RecoveryPolicy{MaxDuration: time.Minute, MaxAttempts: 3, MaxBackoff: 8 * time.Second}
+	if strings.TrimSpace(os.Getenv("METIS_RECOVERY_MAX_SECONDS")) != "" {
+		// Preserve the defaults of existing explicit long-recovery policies.
+		// A user who previously configured only 600 seconds still gets the
+		// same 30 attempts / 30-second backoff; explicit zero remains disabled.
+		p = RecoveryPolicy{MaxAttempts: 30, MaxBackoff: 30 * time.Second}
+	}
 	for _, field := range []struct {
 		name      string
 		dst       *time.Duration

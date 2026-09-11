@@ -30,6 +30,9 @@ func IsNetworkError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if retryableHTTP2StreamError(err) {
+		return true
+	}
 	if errors.Is(err, ErrNetwork) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENETUNREACH) ||

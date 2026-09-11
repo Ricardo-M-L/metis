@@ -21,6 +21,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"golang.org/x/net/http2"
 )
 
 // recoveryTestProvider deliberately does not perform provider-level retries:
@@ -112,6 +113,142 @@ func configureStreamRecoveryTest(t *testing.T, enabled bool) {
 	t.Setenv("METIS_RECOVERY_MAX_ATTEMPTS", "3")
 	t.Setenv("METIS_RECOVERY_MAX_BACKOFF_SECONDS", "1")
 	t.Setenv("METIS_TURN_MAX_SECONDS", "0")
+}
+
+func configureDefaultStreamRecoveryTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("METIS_RECOVERY_MAX_SECONDS", "")
+	t.Setenv("METIS_RECOVERY_MAX_ATTEMPTS", "")
+	t.Setenv("METIS_RECOVERY_MAX_BACKOFF_SECONDS", "")
+	t.Setenv("METIS_TURN_MAX_SECONDS", "0")
+}
+
+func TestLoopDefaultStreamRecoveryHTTP2KeepsToolsExactlyOnce(t *testing.T) {
+	for _, closedTool := range []bool{false, true} {
+		t.Run(fmt.Sprintf("closed_tool_%t", closedTool), func(t *testing.T) {
+			configureDefaultStreamRecoveryTest(t)
+			synctest.Test(t, func(t *testing.T) {
+				probe := &recoveryTestTool{}
+				p := &recoveryTestProvider{t: t}
+				p.stream = func(_ context.Context, call int) (llm.StreamReader, error) {
+					switch call {
+					case 1:
+						return toolUseStream("completed-before-reset", "RecoveryProbe", `{"value":"once"}`), nil
+					case 2:
+						cut := incompleteRecoveryToolStream(closedTool)
+						cut.err = http2.StreamError{StreamID: 1, Code: http2.ErrCodeInternal}
+						return cut, nil
+					case 3:
+						return textStream("completed tool result acknowledged"), nil
+					default:
+						return nil, errors.New("unexpected request")
+					}
+				}
+				loop := newStreamRecoveryTestLoop(p, probe)
+				if err := loop.Run(context.Background(), make(chan Event, 128)); err != nil {
+					t.Fatalf("default HTTP/2 recovery failed: %v", err)
+				}
+				if len(p.requests) != 3 || probe.calls.Load() != 1 {
+					t.Fatalf("unexpected calls: requests=%d tools=%d", len(p.requests), probe.calls.Load())
+				}
+				if !reflect.DeepEqual(p.requests[1], p.requests[2]) {
+					t.Fatal("recovery must replay only the model request, including the completed tool result")
+				}
+				assertNoUncommittedRecoveryHistory(t, loop.History())
+			})
+		})
+	}
+}
+
+func TestLoopDefaultStreamRecoveryHTTP2HasOneAttemptBudget(t *testing.T) {
+	configureDefaultStreamRecoveryTest(t)
+	synctest.Test(t, func(t *testing.T) {
+		probe := &recoveryTestTool{}
+		p := &recoveryTestProvider{t: t, stream: func(context.Context, int) (llm.StreamReader, error) {
+			cut := incompleteRecoveryToolStream(true)
+			cut.err = http2.StreamError{StreamID: 1, Code: http2.ErrCodeInternal}
+			return cut, nil
+		}}
+		loop := newStreamRecoveryTestLoop(p, probe)
+		err := loop.Run(context.Background(), make(chan Event, 256))
+		var exhausted *transport.RetryExhaustedError
+		if !errors.As(err, &exhausted) || exhausted.Attempts != 3 || len(p.requests) != 3 || probe.calls.Load() != 0 {
+			t.Fatalf("default recovery must stop after three total attempts: requests=%d tools=%d error=%v", len(p.requests), probe.calls.Load(), err)
+		}
+	})
+}
+
+func TestLoopDefaultStreamRecoveryHTTP2CancellationInterruptsBackoff(t *testing.T) {
+	configureDefaultStreamRecoveryTest(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		probe := &recoveryTestTool{}
+		p := &recoveryTestProvider{t: t, stream: func(context.Context, int) (llm.StreamReader, error) {
+			cut := incompleteRecoveryToolStream(true)
+			cut.err = http2.StreamError{StreamID: 1, Code: http2.ErrCodeInternal}
+			return cut, nil
+		}}
+		cancelDone := make(chan struct{})
+		go func() { defer close(cancelDone); time.Sleep(100 * time.Millisecond); cancel() }()
+		start := time.Now()
+		err := newStreamRecoveryTestLoop(p, probe).Run(ctx, make(chan Event, 128))
+		elapsed := time.Since(start)
+		<-cancelDone
+		if !errors.Is(err, context.Canceled) || elapsed != 100*time.Millisecond || len(p.requests) != 1 || probe.calls.Load() != 0 {
+			t.Fatalf("cancellation did not immediately stop recovery: elapsed=%s requests=%d tools=%d error=%v", elapsed, len(p.requests), probe.calls.Load(), err)
+		}
+	})
+}
+
+func TestLoopDefaultStreamRecoveryCustomProviderRetainsTransientRouting(t *testing.T) {
+	configureDefaultStreamRecoveryTest(t)
+	synctest.Test(t, func(t *testing.T) {
+		probe := &recoveryTestTool{}
+		p := &recoveryTestProvider{t: t, stream: func(_ context.Context, call int) (llm.StreamReader, error) {
+			if call == 1 {
+				return nil, errors.New("dial tcp: connection refused")
+			}
+			return textStream("recovered"), nil
+		}}
+		if err := newStreamRecoveryTestLoop(p, probe).Run(context.Background(), make(chan Event, 128)); err != nil || len(p.requests) != 2 {
+			t.Fatalf("custom provider lost its existing transient routing: requests=%d error=%v", len(p.requests), err)
+		}
+	})
+}
+
+func TestLoopDefaultStreamRecoveryTerminalBoundaries(t *testing.T) {
+	reset := http2.StreamError{StreamID: 1, Code: http2.ErrCodeInternal}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"unknown", errors.New("unknown provider error")},
+		{"cancelled", context.Canceled},
+		{"exhausted", &transport.RetryExhaustedError{Err: reset, Attempts: 3}},
+		{"bad_request_reset", &transport.HTTPStatusError{StatusCode: 400, Err: reset}},
+		{"auth_reset", &transport.HTTPStatusError{StatusCode: 401, Err: reset}},
+		{"quota", &transport.RetryableError{Err: errors.New("insufficient_quota")}},
+	} {
+		for _, afterHeaders := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s_after_headers_%t", tc.name, afterHeaders), func(t *testing.T) {
+				configureDefaultStreamRecoveryTest(t)
+				probe := &recoveryTestTool{}
+				p := &recoveryTestProvider{t: t, stream: func(context.Context, int) (llm.StreamReader, error) {
+					if !afterHeaders {
+						return nil, tc.err
+					}
+					cut := incompleteRecoveryToolStream(true)
+					cut.err = tc.err
+					return cut, nil
+				}}
+				err := newStreamRecoveryTestLoop(p, probe).Run(context.Background(), make(chan Event, 128))
+				if !errors.Is(err, tc.err) || len(p.requests) != 1 || probe.calls.Load() != 0 {
+					t.Fatalf("terminal failure retried or dispatched tools: requests=%d tools=%d error=%v", len(p.requests), probe.calls.Load(), err)
+				}
+			})
+		}
+	}
 }
 
 func newStreamRecoveryTestLoop(p *recoveryTestProvider, probe *recoveryTestTool) *Loop {

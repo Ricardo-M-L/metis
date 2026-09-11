@@ -6,13 +6,24 @@ These mechanisms support testing long tasks; they are not proof that a build has
 
 `METIS_RUN_MAX_SECONDS` and `METIS_TURN_MAX_SECONDS` are unlimited when absent, empty or `0`. Positive values impose explicit budgets. Parent cancellation remains authoritative. Individual tools and HTTP requests retain their own limits.
 
-Transient recovery is opt-in. A recommended evaluation policy is:
+Short transient recovery is enabled by default: a 60-second fault window, three
+total attempts per logical response, and an eight-second maximum backoff. This
+also covers interrupted model streams, including recognized HTTP/2
+`INTERNAL_ERROR` / `REFUSED_STREAM` resets. Unknown errors are not automatically
+retried. Explicit `METIS_RECOVERY_MAX_SECONDS=0` disables stream recovery and
+retains legacy short request retries.
+
+A longer, still bounded evaluation policy is:
 
 ```text
 METIS_RECOVERY_MAX_SECONDS=600
 METIS_RECOVERY_MAX_ATTEMPTS=30
 METIS_RECOVERY_MAX_BACKOFF_SECONDS=30
 ```
+
+For compatibility, explicitly setting a positive recovery window without the
+other knobs retains the prior opt-in defaults of 30 attempts and 30-second
+maximum backoff. Set all three values to make an evaluation's policy explicit.
 
 The window begins at the first transient failure of a logical response. Responses/Codex HTTP attempts, SSE restarts and previous-response fallback share that window and attempt counter. Complete tool calls from an interrupted response are not executed. Already executed tools are not replayed. A final failed draft retains only plain text for auditing, not incomplete tool arguments or provider state. Successful responses begin a new logical-response budget. Normal active streams are not cancelled merely because a past recovery window's timer expires; ordinary request and parent deadlines still apply.
 

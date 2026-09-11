@@ -57,6 +57,13 @@ func openStreamWithRecovery(ctx context.Context, p llm.Provider, req llm.Request
 			_ = stream.Close()
 			stream = nil
 		}
+		if callErr != nil && !transport.IsRetryExhausted(callErr) && ClassifyError(callErr).Recovery() == RecoveryRetry {
+			// A custom provider may return the same plain transient error that
+			// the legacy agent routed through ClassifyError. Preserve that known
+			// routing inside this one bounded session instead of bypassing its
+			// budget with an outer retry. Unknown errors remain terminal.
+			callErr = &transport.RetryableError{Err: callErr}
+		}
 		return callErr
 	})
 	if err != nil {

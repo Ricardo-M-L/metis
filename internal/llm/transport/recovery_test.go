@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -34,8 +35,30 @@ func TestRecoveryPolicyEnvironment(t *testing.T) {
 			if err != nil && strings.Contains(err.Error(), "secret-value") {
 				t.Fatal("invalid raw config echoed")
 			}
-			if tc.name == "default" && (p.Enabled() || p.MaxAttempts != 30 || p.MaxBackoff != 30*time.Second) {
+			if tc.name == "default" && (p.MaxDuration != time.Minute || p.MaxAttempts != 3 || p.MaxBackoff != 8*time.Second) {
 				t.Fatalf("defaults=%+v", p)
+			}
+		})
+	}
+}
+
+func TestRecoveryPolicyExplicitWindowPreservesLegacyBudgets(t *testing.T) {
+	for _, tc := range []struct {
+		seconds, attempts, backoff string
+		want                       RecoveryPolicy
+	}{
+		{"0", "", "", RecoveryPolicy{0, 30, 30 * time.Second}},
+		{"600", "", "", RecoveryPolicy{600 * time.Second, 30, 30 * time.Second}},
+		{"600", "7", "12", RecoveryPolicy{600 * time.Second, 7, 12 * time.Second}},
+		{"", "5", "2", RecoveryPolicy{time.Minute, 5, 2 * time.Second}},
+	} {
+		t.Run(fmt.Sprintf("seconds_%s_attempts_%s_backoff_%s", tc.seconds, tc.attempts, tc.backoff), func(t *testing.T) {
+			t.Setenv("METIS_RECOVERY_MAX_SECONDS", tc.seconds)
+			t.Setenv("METIS_RECOVERY_MAX_ATTEMPTS", tc.attempts)
+			t.Setenv("METIS_RECOVERY_MAX_BACKOFF_SECONDS", tc.backoff)
+			got, err := RecoveryPolicyFromEnv()
+			if err != nil || got != tc.want {
+				t.Fatalf("policy=%+v error=%v, want %+v", got, err, tc.want)
 			}
 		})
 	}

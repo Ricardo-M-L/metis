@@ -403,7 +403,13 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 			if sec.Body == "" {
 				continue
 			}
-			if sec.Volatile {
+			// Cache marks an explicit-cache boundary for other transports;
+			// it does not make memory/plan/permission snapshots immutable.
+			// In local Responses replay, put these snapshots after history so
+			// updates do not invalidate the entire conversation prefix. Keep
+			// provider-managed (including recovery) placement unchanged: its
+			// stored input chain must not accumulate old runtime snapshots.
+			if sec.Volatile || (!volatileInInstructions && (sec.Name == "memory_index" || sec.Name == "runtime_state")) {
 				volatile = append(volatile, responsesContentPart{Type: "input_text", Text: sec.Body})
 				continue
 			}

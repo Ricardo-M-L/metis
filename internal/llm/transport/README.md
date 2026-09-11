@@ -13,6 +13,8 @@ in sibling packages such as `anthropic`, `openai`, and `gemini`.
 | `registry.go` | Mutex-protected transport-name → constructor registry and `MustBuild` error reporting |
 | `httpclient.go` | HTTP transport wrapping, response-header timeout, whole-request hard cap, and session-id plumbing |
 | `retry.go` | Explicit context-aware retry loop, retryable error types, network classification, jitter, and `Retry-After` parsing |
+| `http2_error.go` | Exact Go HTTP/2 stream-error type and transient-code classification, before credential redaction |
+| `recovery.go` | One bounded fault window shared by HTTP attempts and interrupted model streams |
 | `dump.go` | Opt-in redacted request/response JSONL dumps, including streaming-safe SSE capture |
 | `log.go` | Request-id injection and opt-in method/path/status/latency debug lines |
 | `overflow.go` | Parsing provider context-length errors and computing a one-shot adjusted `max_tokens` budget or actionable hint |
@@ -53,14 +55,22 @@ honors `Retry-After` up to 60 seconds. Exhaustion returns a typed
 `RetryExhaustedError`, preventing an outer agent loop from multiplying the
 same provider retry budget.
 
-Long-task recovery is **opt-in**. The Responses adapter and the agent's stream
-recovery gate share one `RecoverySession` per logical model response:
+Short stream recovery is **enabled by default**, for interactive and headless
+tasks. The Responses adapter and the agent's stream recovery gate share one
+`RecoverySession` per logical model response:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `METIS_RECOVERY_MAX_SECONDS` | `0` | Recovery disabled; positive integer enables a fault window measured from the first observed transient failure |
-| `METIS_RECOVERY_MAX_ATTEMPTS` | `30` | Responses: total HTTP attempts for that logical response, including the initial request, not extra rounds of three |
-| `METIS_RECOVERY_MAX_BACKOFF_SECONDS` | `30` | Positive exponential-backoff and `Retry-After` cap |
+| `METIS_RECOVERY_MAX_SECONDS` | `60` | Fault window measured from the first observed transient failure; explicit `0` disables stream recovery and retains the legacy short request retries |
+| `METIS_RECOVERY_MAX_ATTEMPTS` | `3` | Responses: total HTTP attempts for that logical response, including the initial request, not extra rounds of three |
+| `METIS_RECOVERY_MAX_BACKOFF_SECONDS` | `8` | Positive exponential-backoff and `Retry-After` cap |
+
+For compatibility, explicitly setting a positive recovery window (for example
+`METIS_RECOVERY_MAX_SECONDS=600`) retains the previous opt-in defaults of **30
+attempts and 30 seconds backoff**, unless those knobs are also set explicitly.
+The short 60/3/8 defaults apply when the window is absent or empty. A server's
+`Retry-After` is capped by the selected backoff limit; repeated failures still
+stop at the shared attempt/window budget, rather than retrying indefinitely.
 
 Invalid, negative, fractional and overflowing values fail rather than silently
 falling back. Attempt/backoff values must be positive even when explicitly
@@ -69,7 +79,12 @@ HTTP work and backoff all consume the window. The initial failing request is
 still governed by the ordinary HTTP timeout until a fault is observed. Parent
 cancellation and task deadlines always win.
 
-Typed network failures, 429 and 5xx can recover. Known quota failures and
+Typed network failures, 429 and 5xx can recover. HTTP/2 `INTERNAL_ERROR` and
+`REFUSED_STREAM` resets are recognized from the exact standard-library or
+`x/net/http2` stream-error types, including wrapped errors; arbitrary matching
+text, protocol/security errors, and HTTP/2 `CANCEL` are not newly classified as
+recoverable. Provider redaction preserves only the safe network marker, not a
+possibly credential-bearing underlying error. Known quota failures and
 400/401/403 are terminal, including a truncated error body after an authoritative
 4xx status. Header success stops the dial-recovery timer so a healthy live SSE
 stream is not killed by that timer; it does **not** reset the shared attempts or
@@ -83,7 +98,10 @@ appear again after the explicit discard notification. This is not an upstream
 exactly-once inference guarantee: ambiguous HTTP failures may incur extra model
 usage. Providers with their own recovery must forward `ManagesRecoverySession`;
 other providers returning an already-exhausted error retain that terminal
-boundary. Successful streaming callers release the attempt context on Close.
+boundary. Non-managed custom providers retain the agent's existing routing of
+explicitly recognized transient errors, within this same finite budget; unknown
+errors are not retried. Successful streaming callers release the attempt
+context on Close.
 
 The strict individual-HTTP-attempt cap is currently guaranteed for **Responses
 (including OpenAI Codex)**. For non-managed providers the agent wrapper counts

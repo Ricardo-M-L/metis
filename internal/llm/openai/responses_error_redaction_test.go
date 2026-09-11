@@ -571,6 +571,9 @@ func TestResponsesHTTPBodyReadFailureStillRetriesRetryableStatus(t *testing.T) {
 func (*responsesPartialErrorReadCloser) Close() error { return nil }
 
 func TestResponsesHTTPBodyReadErrorKeepsStatusCodeAndIOClassification(t *testing.T) {
+	// Exercise the retained legacy policy explicitly. The default bounded
+	// recovery mode correctly treats an authoritative 400 as terminal.
+	t.Setenv("METIS_RECOVERY_MAX_SECONDS", "0")
 	for _, stream := range []bool{false, true} {
 		t.Run(map[bool]string{false: "complete", true: "stream"}[stream], func(t *testing.T) {
 			attempts := 0
