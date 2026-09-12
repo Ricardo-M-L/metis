@@ -1211,6 +1211,7 @@ async function resumeSession(id) {
     const data = await res.json();
     if (!isLatest()) return;
     currentSessionId = id;
+    if (typeof renderQueuedTurns === 'function') renderQueuedTurns();
     if (currentView === 'trace') loadTrace(false, id, isLatest);
     loadSessionStatsbar(id);
     messages = [];

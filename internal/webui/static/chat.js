@@ -20,6 +20,8 @@ let pendingForegroundRequest = null;
 let queuedTurns = [];
 let queuedSessionId = null;
 let drainingQueuedTurns = false;
+let queuedTurnMenuIndex = -1;
+let queuedTurnPendingItem = null;
 let streamingEl = null;
 let streamingText = '';
 let streamedTextThisTurn = false;
@@ -791,6 +793,7 @@ async function stopTurn() {
     const dropped = queuedTurns.length;
     queuedTurns = [];
     queuedSessionId = null;
+    queuedTurnMenuIndex = -1;
     renderQueuedTurns();
     if (dropped) showToast('Stopped; cleared ' + dropped + ' queued message' + (dropped === 1 ? '' : 's'));
   } catch (e) {
@@ -1509,6 +1512,9 @@ function newChat() {
   currentSessionId = null;
   if (typeof resetArtifactsForSession === 'function') resetArtifactsForSession();
   queuedTurns = [];
+  queuedSessionId = null;
+  queuedTurnMenuIndex = -1;
+  queuedTurnPendingItem = null;
   renderQueuedTurns();
   resetTurnState();
   messages = [];
@@ -1773,31 +1779,222 @@ async function submitBusyInput(item, behavior) {
   renderQueuedTurns();
 }
 
+function queuedTurnIcon(name, className) {
+  return '<img class="queued-icon' + (className ? ' ' + escAttr(className) : '') + '" src="/icons/lucide/' + escAttr(name) + '.svg" alt="" aria-hidden="true">';
+}
+
+function queuedTurnPreview(item) {
+  const text = String(item && item.text || '').trim().replace(/\s+/g, ' ');
+  const imageCount = Array.isArray(item && item.images) ? item.images.length : 0;
+  const imageLabel = imageCount
+    ? uiText(imageCount + ' image' + (imageCount === 1 ? '' : 's'), imageCount + ' 张图片')
+    : '';
+  if (text && imageLabel) return text + ' · ' + imageLabel;
+  return text || imageLabel || uiText('Queued message', '排队消息');
+}
+
+function queuedTurnCanSteer(item) {
+  return !!(turnRunning && runningSessionId && (!queuedSessionId || queuedSessionId === runningSessionId)
+    && item && (!Array.isArray(item.images) || item.images.length === 0));
+}
+
 function renderQueuedTurns() {
   const wrap = document.getElementById('queuedTurns');
   if (!wrap) return;
-  if (!queuedTurns.length) {
+  const visibleForSession = !queuedSessionId || !currentSessionId || queuedSessionId === currentSessionId;
+  if (!queuedTurns.length || !visibleForSession) {
     wrap.style.display = 'none';
     wrap.innerHTML = '';
     return;
   }
   wrap.style.display = 'flex';
-  wrap.innerHTML = '<span class="queued-count">Queued ' + queuedTurns.length + '</span>' + queuedTurns.map((item, i) => {
-    const preview = item.text || (item.images.length + ' image' + (item.images.length === 1 ? '' : 's'));
-    return '<span class="queued-item"><span>' + escHtml(preview) + '</span><button type="button" aria-label="Remove queued message" onclick="removeQueuedTurn(' + i + ')">\u00D7</button></span>';
+  wrap.setAttribute('aria-label', uiText(queuedTurns.length + ' queued message' + (queuedTurns.length === 1 ? '' : 's'), queuedTurns.length + ' 条排队消息'));
+  wrap.innerHTML = queuedTurns.map((item, i) => {
+    const preview = queuedTurnPreview(item);
+    const menuOpen = queuedTurnMenuIndex === i;
+    const pending = queuedTurnPendingItem === item;
+    const canSteer = queuedTurnCanSteer(item) && !pending;
+    const steerTitle = item.images && item.images.length
+      ? uiText('Image messages stay queued for the next turn', '图片消息会保留到下一轮发送')
+      : (!turnRunning ? uiText('No turn is running', '当前没有正在运行的任务') : uiText('Send this to the running turn', '立即发送给当前任务'));
+    return '<article class="queued-card' + (pending ? ' is-pending' : '') + (menuOpen ? ' is-menu-open' : '') + '" data-queued-index="' + i + '">' +
+      '<span class="queued-card-mark">' + queuedTurnIcon('list-start') + '</span>' +
+      '<span class="queued-card-copy" title="' + escAttr(preview) + '">' + escHtml(preview) + '</span>' +
+      '<button type="button" class="queued-steer" onclick="steerQueuedTurn(event,' + i + ')" title="' + escAttr(steerTitle) + '" aria-label="' + escAttr(uiText('Steer the current turn with this message', '用这条消息调整当前任务方向')) + '"' + (canSteer ? '' : ' disabled') + '>' +
+        queuedTurnIcon('corner-down-left') + '<span>' + escHtml(uiText('Steer now', '调整方向')) + '</span></button>' +
+      '<button type="button" class="queued-icon-button queued-remove" onclick="removeQueuedTurn(' + i + ')" title="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '" aria-label="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('trash-2') + '</button>' +
+      '<button type="button" class="queued-icon-button queued-more' + (menuOpen ? ' is-open' : '') + '" onclick="toggleQueuedTurnMenu(event,' + i + ')" title="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-label="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-haspopup="menu" aria-expanded="' + (menuOpen ? 'true' : 'false') + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('ellipsis') + '</button>' +
+      (menuOpen ? '<div class="queued-menu" role="menu" aria-label="' + escAttr(uiText('Queued message actions', '排队消息操作')) + '">' +
+        '<button type="button" role="menuitem" onclick="editQueuedTurn(event,' + i + ')">' + queuedTurnIcon('pen-line') + '<span>' + escHtml(uiText('Edit message', '编辑消息')) + '</span></button>' +
+        '<button type="button" role="menuitem" onclick="openQueuedTurnInSideChat(event,' + i + ')">' + queuedTurnIcon('message-circle-plus') + '<span>' + escHtml(uiText('Open in side chat', '在侧边聊天中打开')) + '</span></button>' +
+        '<button type="button" role="menuitem" onclick="clearQueuedTurns(event)">' + queuedTurnIcon('list-end') + '<span>' + escHtml(uiText('Close queue', '关闭排队')) + '</span></button>' +
+      '</div>' : '') +
+    '</article>';
   }).join('');
+  if (queuedTurnMenuIndex >= 0) positionQueuedTurnMenu(queuedTurnMenuIndex);
 }
 
 function removeQueuedTurn(index) {
+  if (queuedTurnPendingItem || index < 0 || index >= queuedTurns.length) return;
   queuedTurns.splice(index, 1);
+  queuedTurnMenuIndex = -1;
   if (!queuedTurns.length) queuedSessionId = null;
   renderQueuedTurns();
 }
+
+function toggleQueuedTurnMenu(event, index) {
+  if (event) event.stopPropagation();
+  if (queuedTurnPendingItem || index < 0 || index >= queuedTurns.length) return;
+  queuedTurnMenuIndex = queuedTurnMenuIndex === index ? -1 : index;
+  renderQueuedTurns();
+}
+
+function positionQueuedTurnMenu(index) {
+  if (typeof window === 'undefined') return;
+  const card = document.querySelector('.queued-card[data-queued-index="' + index + '"]');
+  const menu = card && card.querySelector('.queued-menu');
+  if (!card || !menu || typeof card.getBoundingClientRect !== 'function') return;
+  menu.classList.remove('opens-up');
+  const cardRect = card.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const wouldClipBelow = cardRect.bottom + menuRect.height > window.innerHeight - 12;
+  const fitsAbove = cardRect.top - menuRect.height >= 12;
+  menu.classList.toggle('opens-up', wouldClipBelow && fitsAbove);
+}
+
+function closeQueuedTurnMenu(restoreFocus) {
+  const index = queuedTurnMenuIndex;
+  if (index < 0) return;
+  queuedTurnMenuIndex = -1;
+  renderQueuedTurns();
+  if (restoreFocus) {
+    const button = document.querySelector('.queued-card[data-queued-index="' + index + '"] .queued-more');
+    if (button) button.focus();
+  }
+}
+
+function replaceComposerWithQueuedTurn(index) {
+  const item = queuedTurns[index];
+  const input = document.getElementById('inputField');
+  if (!item || !input) return false;
+  const draft = { text: input.value, images: attachments.slice() };
+  const hasDraft = !!(String(draft.text || '').trim() || draft.images.length);
+  queuedTurns.splice(index, 1);
+  if (hasDraft) queuedTurns.splice(index, 0, draft);
+  if (!queuedTurns.length) queuedSessionId = null;
+  input.value = item.text || '';
+  attachments = Array.isArray(item.images) ? item.images.slice() : [];
+  renderAttachments();
+  onComposerInput(input);
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  queuedTurnMenuIndex = -1;
+  renderQueuedTurns();
+  return true;
+}
+
+function editQueuedTurn(event, index) {
+  if (event) event.stopPropagation();
+  if (replaceComposerWithQueuedTurn(index)) showToast(uiText('Queued message moved to the composer', '排队消息已移回输入框'));
+}
+
+function clearQueuedTurns(event) {
+  if (event) event.stopPropagation();
+  if (queuedTurnPendingItem) return;
+  const count = queuedTurns.length;
+  queuedTurns = [];
+  queuedSessionId = null;
+  queuedTurnMenuIndex = -1;
+  renderQueuedTurns();
+  if (count) showToast(uiText('Queue closed', '已关闭排队'));
+}
+
+async function steerQueuedTurn(event, index) {
+  if (event) event.stopPropagation();
+  const item = queuedTurns[index];
+  const targetSessionId = queuedSessionId || runningSessionId;
+  if (!item || queuedTurnPendingItem || !queuedTurnCanSteer(item) || !targetSessionId) return;
+  queuedTurnPendingItem = item;
+  queuedTurnMenuIndex = -1;
+  renderQueuedTurns();
+  try {
+    const res = await fetch('/api/steer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: targetSessionId, input: item.text })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'steer: ' + res.status);
+    const liveIndex = queuedTurns.indexOf(item);
+    if (liveIndex >= 0) queuedTurns.splice(liveIndex, 1);
+    if (!queuedTurns.length) queuedSessionId = null;
+    if (currentSessionId === targetSessionId) addMessage('user', item.text);
+    showToast(uiText('Sent to the current turn', '已发送给当前任务'));
+    await loadSessions();
+  } catch (error) {
+    showToast(uiText('Unable to steer; the message remains queued: ', '调整方向失败，消息仍在队列中：') + error.message);
+  } finally {
+    queuedTurnPendingItem = null;
+    renderQueuedTurns();
+  }
+}
+
+async function openQueuedTurnInSideChat(event, index) {
+  if (event) event.stopPropagation();
+  const item = queuedTurns[index];
+  const sourceSessionId = queuedSessionId || runningSessionId || currentSessionId;
+  if (!item || queuedTurnPendingItem || !sourceSessionId) return;
+  queuedTurnPendingItem = item;
+  queuedTurnMenuIndex = -1;
+  renderQueuedTurns();
+  try {
+    const res = await fetch('/api/fork', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: sourceSessionId, messageIndex: -1 })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'fork: ' + res.status);
+    await loadSessions();
+    await resumeSession(data.sessionId);
+    if (currentSessionId !== data.sessionId) throw new Error(uiText('the branched session did not open', '分支会话未能打开'));
+    const liveIndex = queuedTurns.indexOf(item);
+    if (liveIndex >= 0) queuedTurns.splice(liveIndex, 1);
+    if (!queuedTurns.length) queuedSessionId = null;
+    const input = document.getElementById('inputField');
+    if (input) {
+      input.value = item.text || '';
+      attachments = Array.isArray(item.images) ? item.images.slice() : [];
+      renderAttachments();
+      onComposerInput(input);
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+    showToast(uiText('Opened in a branched side chat', '已在分支侧边会话中打开'));
+  } catch (error) {
+    showToast(uiText('Unable to open side chat: ', '无法打开侧边会话：') + error.message);
+  } finally {
+    queuedTurnPendingItem = null;
+    renderQueuedTurns();
+  }
+}
+
+document.addEventListener('click', event => {
+  if (queuedTurnMenuIndex < 0 || event.target.closest('.queued-menu') || event.target.closest('.queued-more')) return;
+  closeQueuedTurnMenu(false);
+});
+
+document.addEventListener('keydown', event => {
+  if (queuedTurnMenuIndex < 0 || event.key !== 'Escape') return;
+  event.preventDefault();
+  closeQueuedTurnMenu(true);
+});
 
 async function drainQueuedTurns() {
   if (turnRunning || drainingQueuedTurns || pendingAsk || !queuedTurns.length) return;
   if (queuedSessionId && currentSessionId !== queuedSessionId) return;
   drainingQueuedTurns = true;
+  queuedTurnMenuIndex = -1;
   const item = queuedTurns.shift();
   renderQueuedTurns();
   let succeeded = false;

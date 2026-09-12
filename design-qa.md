@@ -1,44 +1,53 @@
-# METIS Desktop message layout QA
+# Metis queued-message card design QA
 
-- Source visual truth: `/var/folders/gm/w8ft20ns0w1fkv83pkrvj80jylj1v8/T/codex-clipboard-2b445ca1-99e1-4ef7-a648-da0488df4335.png`
-- Implementation screenshot: `/var/folders/gm/w8ft20ns0w1fkv83pkrvj80jylj1v8/T/com.openai.sky.CUAService/METIS-QA Screenshot 2026-09-03 at 6.04.34 PM.jpeg`
-- Viewport: maximized macOS native Wails window
-- Source pixels: 2536 x 1464; implementation pixels: 1296 x 768
-- CSS size and density normalization: the source is a Retina-density capture and the implementation is a native screen capture. They were compared proportionally at their full captured sizes in one comparison input; no pixel-level measurement was inferred across densities.
-- State: dark theme, the same `你好 (branch)` history session, with user bubbles, assistant replies, action metadata, and the native title bar visible.
+## Evidence
 
-## Full-view comparison evidence
+- Source visual truth: `/var/folders/gm/w8ft20ns0w1fkv83pkrvj80jylj1v8/T/codex-clipboard-e87ae15c-3651-437b-979b-8dd7fe53e358.png`
+- Source pixels: 920 × 310
+- Default implementation screenshot: `/tmp/metis-design-qa/queue-default-full.png`
+- Default viewport and screenshot pixels: 1280 × 720, device scale 1
+- Focused implementation crop: `/tmp/metis-design-qa/queue-default-component-v2.png`
+- Focused implementation pixels: 800 × 305
+- Narrow implementation screenshot: `/tmp/metis-design-qa/queue-narrow-full.png`
+- Narrow viewport and screenshot pixels: 600 × 720, device scale 1
+- Combined comparison: `/tmp/metis-design-qa/queue-comparison.png`
+- Comparison normalization: source and focused implementation were scaled to the same 310 px comparison height. The combined PNG was encoded at Retina 2×, with both sides scaled equally.
+- State: dark theme, one text-only queued message, running turn, actions menu open.
 
-The repaired build preserves the existing sidebar, transcript width, typography, colors, bubbles, tool rows, composer, and status bar. The previously missing native zoom control is present as the third macOS traffic-light button and its native `zoom the window` action successfully maximizes the window.
+## Findings
 
-## Focused comparison evidence
+- No actionable P0, P1, or P2 differences remain in the queued-message component.
+- Fonts and typography: the card uses the product's existing system font stack, 16 px semibold message text, and 15 px semibold menu actions. The hierarchy matches the reference while staying consistent with Metis Desktop.
+- Spacing and layout rhythm: the queue is now a full-width 62 px card with a 24 px radius, leading queue mark, flexible message column, steer action, delete action, and circular overflow action. The 152 px menu keeps the same three-action rhythm as the reference.
+- Colors and visual tokens: the component uses Metis surface, border, foreground, hover, focus, and shadow tokens. Contrast remains consistent in dark mode.
+- Image and icon fidelity: all new icons are standalone Lucide assets with round strokes; no placeholder, emoji, CSS drawing, or handcrafted inline icon is used.
+- Copy and content: Chinese actions match the reference: “调整方向”, “编辑消息”, “在侧边聊天中打开”, and “关闭排队”. English labels are provided through the existing language switch.
+- Expected product differences: Metis keeps its compact composer and existing 780 px conversation width. When the default-height viewport cannot fit the menu below the card, the menu opens upward to remain fully visible; at the narrow tested viewport it opens downward and remains inside the viewport.
 
-The title-bar controls and the transcript region were inspected at full resolution because their icons and spacing are too small for a reduced overview. User action metadata now sits below the bubble and shares its right edge. The effective rhythm is 8px after a user message and 32px after an assistant message, making one prompt/reply group visibly tighter than the gap before the next prompt.
+## Interaction verification
 
-## Findings and comparison history
+- Queue rendering: verified with a real running Desktop turn.
+- Adjust direction: verified against `/api/steer`; the queued card was removed and the user correction appeared in the active transcript.
+- Edit message: verified; the text moved back into the composer and the queue card disappeared. The automated harness also verifies that an existing composer draft is swapped into the queue instead of being lost.
+- Delete: verified; the selected queued message disappeared.
+- Open in side chat: verified against `/api/fork`; a `(branch)` session opened and the queued text appeared as its composer draft.
+- Close queue: verified; all queued messages were cleared.
+- Menu placement: verified at 1280 × 720 and 600 × 720.
+- Browser console: 0 warnings and 0 errors during the final run.
 
-### Initial findings
+## Comparison history
 
-- P1: macOS zoom/maximize control was disabled because Wails received no explicit macOS options.
-- P1: user action metadata was a horizontal sibling of the bubble, so it rendered to the bubble's right.
-- P2: user and assistant rows both used the same 16px bottom margin, so completed turns had no grouping hierarchy.
+1. Initial default-height capture found a P1 menu overflow: the downward menu extended below the viewport. Fixed by measuring the rendered card and menu and opening upward only when the menu would clip and there is room above. Post-fix evidence: `queue-default-full.png`.
+2. Initial 600 px capture found a P2 responsive wrap: the overflow button occupied an unintended second grid row, expanding the card to 100 px. Fixed the narrow layout to retain all five grid tracks and hide only the “调整方向” text label. Post-fix evidence: `queue-narrow-full.png`; measured card height is 62 px.
 
-### Fixes made
+## Implementation checklist
 
-- Added explicit macOS window options with zoom enabled while retaining resizing.
-- Changed the canonical user row to a right-aligned column so actions render below the bubble.
-- Set an 8px prompt-to-reply gap and a 32px completed-turn gap.
-
-### Post-fix evidence
-
-- The native accessibility tree exposes close, full-screen/zoom, and minimize controls; invoking the zoom action maximized the window.
-- The implementation screenshot shows user actions and the timestamp beneath the user bubble.
-- The implementation screenshot shows a larger gap after the assistant response than after the following user prompt.
-- Fonts and typography: unchanged from the existing METIS design system; no wrapping or hierarchy regression observed.
-- Colors and tokens: unchanged; the dark theme and semantic error/tool colors remain consistent.
-- Image and asset quality: no image assets changed in this fix.
-- Copy and content: unchanged; existing Chinese messages and timestamps remain intact.
-
-No actionable P0, P1, or P2 visual findings remain.
+- [x] Replace the old count-and-pill queue presentation.
+- [x] Match the Codex card hierarchy and menu styling.
+- [x] Wire every visible primary action to working behavior.
+- [x] Preserve drafts and image attachments during edit/branch flows.
+- [x] Keep menus inside the viewport.
+- [x] Verify the narrow breakpoint.
+- [x] Run browser interaction and console checks.
 
 final result: passed
