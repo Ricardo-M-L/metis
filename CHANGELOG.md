@@ -7,6 +7,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.59] - 2026-09-12
+
+Prepared as a full CLI and Desktop release. Publication requires the complete
+20-asset set, including Developer ID signed, notarized, and stapled macOS
+Desktop ZIP/DMG installers.
+
+### Changed
+
+- Redesign queued Desktop/WebUI messages as cards with actions to steer the
+  running turn, edit or delete a message, open it in a side chat, and clear the
+  queue. Editing preserves an existing composer draft instead of discarding it.
+- Keep queued-message menus inside the viewport and preserve the compact card
+  layout on narrow windows, with English and Simplified Chinese action labels.
+
 ## [0.4.58] - 2026-09-11
 
 Prepared as a full CLI and Desktop release. The macOS Desktop artifacts in
