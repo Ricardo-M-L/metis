@@ -29,7 +29,7 @@ func (l *Loop) injectMonitorEvents(ctx context.Context, out chan<- Event) {
 	if len(events) == 0 {
 		return
 	}
-	l.appendInjectedMessage(formatMonitorEvents(events))
+	l.appendInjectedMessage(ctx, out, "monitor", formatMonitorEvents(events))
 	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[monitor] %d match(es) injected", len(events)),

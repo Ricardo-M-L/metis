@@ -46,10 +46,14 @@ var errTurnWallClockDeadline = fmt.Errorf("turn wall-clock deadline: %w", contex
 //   - compaction_check.go maybeCompact
 //   - plan_emit.go        emitPlan
 type Loop struct {
-	Provider llm.Provider
-	Registry *tools.Registry
-	Gate     *permission.Gate
-	Hooks    *HookRegistry
+	// OnRunFinished is runtime-owned resource cleanup, distinct from model
+	// hooks: it runs on every return, including cancellation/provider failures.
+	// Set once during assembly; sub-agent loops do not inherit this callback.
+	OnRunFinished func()
+	Provider      llm.Provider
+	Registry      *tools.Registry
+	Gate          *permission.Gate
+	Hooks         *HookRegistry
 
 	// TimingSink, when set, is called with each tool's measured execution
 	// time (name, elapsed, isError). The runtime wires it to the session's
@@ -629,6 +633,14 @@ func (l *Loop) AppendUserBlocks(blocks []llm.ContentBlock) {
 //
 // Empty / whitespace input is dropped. Safe to call from any goroutine.
 func (l *Loop) SteerInject(text string) bool {
+	return l.SteerInjectWithAccepted(text, nil)
+}
+
+// SteerInjectWithAccepted invokes accepted after accepting input but before
+// the loop can consume it. Submission surfaces use this to record a USER row
+// on the current turn before a fast model response can close that turn. The
+// callback must not call back into Loop: it runs under the history mutex.
+func (l *Loop) SteerInjectWithAccepted(text string, accepted func()) bool {
 	t := strings.TrimSpace(text)
 	if t == "" {
 		return false
@@ -639,6 +651,9 @@ func (l *Loop) SteerInject(text string) bool {
 		return false
 	}
 	l.steerBuf = append(l.steerBuf, t)
+	if accepted != nil {
+		accepted()
+	}
 	return true
 }
 
@@ -1524,6 +1539,11 @@ func (l *Loop) IterIdx() int {
 //  8. Append assistant + tool_results, emit TurnEnd
 //  9. Loop-detect / max-iter / grace-call checks
 func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
+	finish := func() {}
+	if l.OnRunFinished != nil {
+		finish = sync.OnceFunc(l.OnRunFinished)
+	}
+	defer finish() // covers early returns before session finalizers are installed
 	// Capture task ownership at the turn boundary. Desktop may let the user
 	// inspect another session while this turn or one of its sub-agents is still
 	// running; tool calls must continue writing to the originating session.
@@ -1582,13 +1602,19 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		if discarded := l.stopAcceptingSteer(); len(discarded) > 0 {
 			// The Run commonly exits because ctx was cancelled; detach only the
 			// cancellation signal so the loss notice itself is not dropped.
-			emit(context.WithoutCancel(ctx), out, Event{
+			notice := Event{
 				Kind: EventInfo,
 				Info: fmt.Sprintf(
 					"current turn ended before %d accepted steering message(s) could be applied; please resend",
 					len(discarded),
 				),
-			})
+			}
+			// No consumer may remain after cancellation. Diagnostics must not
+			// hold native-input cleanup or process shutdown hostage.
+			select {
+			case out <- notice:
+			default:
+			}
 		}
 	}()
 
@@ -1630,6 +1656,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		l.Hooks.EmitSessionEnd(ctx, tc, msgCount, stopReason)
 	}()
 
+	defer finish() // release native input before persistence/user-hook finalizers
 	specs := l.toolSpecs()
 	l.contract.verifyUnavailable = !l.verifierDispatchAvailable()
 	verificationAttempts := 0
@@ -1718,12 +1745,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// reply the model produced without seeing it, corrupting
 		// transcript order (caught by 2026-06-11 review).
 		if warn := l.Budget.TakeWarning(); warn != "" {
-			l.mu.Lock()
-			l.Messages = append(l.Messages, llm.Message{
-				Role:    llm.RoleUser,
-				Content: []llm.ContentBlock{{Type: "text", Text: warn}},
-			})
-			l.mu.Unlock()
+			l.appendInjectedMessage(ctx, out, "budget", warn)
 			emit(ctx, out, Event{
 				Kind: EventInfo,
 				Info: fmt.Sprintf("(budget nudge: $%.4f spent — model asked to wrap up)", l.Budget.SpentUSD()),
@@ -1772,12 +1794,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			if idx == 1 {
 				progress.Reset()
 			}
-			l.mu.Lock()
-			l.Messages = append(l.Messages, llm.Message{
-				Role:    llm.RoleUser,
-				Content: []llm.ContentBlock{{Type: "text", Text: body}},
-			})
-			l.mu.Unlock()
+			l.appendInjectedMessage(ctx, out, "budget", body)
 			emit(ctx, out, Event{
 				Kind: EventInfo,
 				Info: fmt.Sprintf("(iter nudge %d%% — model asked to pace itself)", int(iterNudges[idx].pct*100)),
@@ -2013,7 +2030,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			if toolName, ok := recoverableTextToolCallName(assistant, l.Registry); ok {
 				textToolCallRescued = true
 				l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
-				l.appendInjectedMessage(textToolCallRecoveryMessage(toolName))
+				l.appendInjectedMessage(ctx, out, "recovery", textToolCallRecoveryMessage(toolName))
 				emit(ctx, out, Event{
 					Kind: EventInfo,
 					Info: fmt.Sprintf("(plain-text tool call for %s was not executed — requesting one native structured retry)", toolName),
@@ -2055,6 +2072,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					})
 					l.rescueNoTools = true
 					l.mu.Unlock()
+					emit(ctx, out, Event{Kind: EventContextInjected, Source: "recovery", ContextText: emptyStopRescueMessage})
 					emit(ctx, out, Event{
 						Kind: EventInfo,
 						Info: "(empty-final-answer rescue: requesting one tool-less summary)",
@@ -2087,12 +2105,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			// either spawn the verifier or write OVERRIDE CONTRACT:.
 			if body := l.contract.shouldGateEnd(assistantText(assistant)); body != "" {
 				l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
-				l.mu.Lock()
-				l.Messages = append(l.Messages, llm.Message{
-					Role:    llm.RoleUser,
-					Content: []llm.ContentBlock{{Type: "text", Text: body}},
-				})
-				l.mu.Unlock()
+				l.appendInjectedMessage(ctx, out, "contract", body)
 				emit(ctx, out, Event{
 					Kind: EventInfo,
 					Info: "(contract gate: forced re-entry to spawn verify; model can override by writing OVERRIDE CONTRACT: <reason>)",
@@ -2126,7 +2139,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					l.mu.Lock()
 					l.todoReconciledThisTurn = true
 					l.mu.Unlock()
-					l.appendInjectedMessage(endOfTurnTodoReminder(items))
+					l.appendInjectedMessage(ctx, out, "todo", endOfTurnTodoReminder(items))
 					emit(ctx, out, Event{
 						Kind: EventInfo,
 						Info: "[todo] open items at turn end — asking the model to reconcile before stopping",
@@ -2206,7 +2219,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					}
 					verificationAttempts++
 					l.emitAssistantReentryBoundary(ctx, out, tc, assistant)
-					l.appendInjectedMessage(fmt.Sprintf("<system-reminder>\nMACHINE VERIFICATION NOT PASSED (%d/%d corrective attempts): %s\nAddress the failing or missing checks, then request completion again. Do not claim acceptance passed. A model override cannot produce a pass. To stop honestly without a pass, write ACCEPTANCE_INCOMPLETE: followed by the blocker.\n</system-reminder>", verificationAttempts, policy.maxAttempts(), detail))
+					l.appendInjectedMessage(ctx, out, "verification", fmt.Sprintf("<system-reminder>\nMACHINE VERIFICATION NOT PASSED (%d/%d corrective attempts): %s\nAddress the failing or missing checks, then request completion again. Do not claim acceptance passed. A model override cannot produce a pass. To stop honestly without a pass, write ACCEPTANCE_INCOMPLETE: followed by the blocker.\n</system-reminder>", verificationAttempts, policy.maxAttempts(), detail))
 					continue
 				}
 				emit(ctx, out, Event{Kind: EventInfo, Info: "[machine verification] required source-bound checks passed"})
@@ -2843,6 +2856,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				// dangling tool_use whose results nobody summarizes.
 				l.rescueNoTools = true
 				l.mu.Unlock()
+				emit(ctx, out, Event{Kind: EventContextInjected, Source: "recovery", ContextText: finalSummaryRescueMessage})
 				emit(ctx, out, Event{
 					Kind: EventInfo,
 					Info: fmt.Sprintf("(iter cap reached at %d — one rescue iteration for final summary)", l.MaxIters),
@@ -3927,6 +3941,9 @@ func textOf(m llm.Message) string {
 // EventPermissionRequest (the consumer holds the only reply channel) and
 // truncate text/tool deltas under load. ctx==nil is treated as background.
 func emit(ctx context.Context, ch chan<- Event, ev Event) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Stamp sub-agent events at the source: the trace hook must see the
 	// parent's tool_use_id on the child's OWN events (the forwarded copy
 	// alone bypassed the hook, so the recorded spawn-tree never linked).
@@ -3940,11 +3957,14 @@ func emit(ctx context.Context, ch chan<- Event, ev Event) {
 	if ev.TraceInvocationID == "" {
 		ev.TraceInvocationID = TraceInvocationIDFromContext(ctx)
 	}
-	if ch == nil {
-		return
+	// Context is already in model history. Record it synchronously even when
+	// there is no UI consumer or cancellation prevents channel delivery, and
+	// before a full channel can delay the corresponding trace row.
+	if ev.Kind == EventContextInjected {
+		ev = ev.PresentationCopy()
+		notifyTraceHook(ev)
 	}
-	if ctx == nil {
-		ch <- ev
+	if ch == nil {
 		return
 	}
 	// Usage is durable accounting, not an expendable rendering delta. If the
@@ -3966,7 +3986,9 @@ func emit(ctx context.Context, ch chan<- Event, ev Event) {
 			tryEmitEvent(ch, ev)
 		}
 	}
-	notifyTraceHook(ev)
+	if ev.Kind != EventContextInjected {
+		notifyTraceHook(ev)
+	}
 }
 
 func tryEmitEvent(ch chan<- Event, ev Event) bool {

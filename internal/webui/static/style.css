@@ -58,6 +58,10 @@
   --code-head-bg: #2c2c2e;  /* 850 */
   --code-head-fg: #adb2b8;
 
+  /* Chrome controls that need a filled secondary surface in every theme. */
+  --new-session-bg: #43454a;
+  --new-session-hover: #353638;
+
   /* radius scale (DSH: 12px cards, 16px chips, 999px pills) */
   --radius-xs: 6px;
   --radius-sm: 8px;
@@ -77,6 +81,7 @@
   --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
   --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'PingFang SC', monospace;
   --font-base: 16px;
+  --font-reading: 14px; /* Shared by conversation text and sidebar session names. */
 
   /* legacy aliases */
   --bg-primary: var(--bg);
@@ -361,6 +366,7 @@ html, body {
 }
 
 /* === Main Content === */
+/* Session file workspace styles live in session_files.css. */
 .main {
   flex: 1;
   display: flex;
@@ -1062,6 +1068,31 @@ html, body {
   color: var(--text-secondary);
   margin-top: 2px;
 }
+
+.computer-use-settings .settings-card-row { gap: 16px; }
+.computer-use-value { font-size: 13px; text-align: right; overflow-wrap: anywhere; }
+.computer-use-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 24px; }
+.computer-use-button {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.computer-use-button:hover { background: var(--bg-hover); }
+.computer-use-button.primary { background: var(--accent-dim); border-color: var(--accent); }
+.computer-use-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.computer-use-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.computer-use-status, .computer-use-note, .computer-use-error { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.computer-use-status:empty { display: none; }
+.computer-use-note { color: var(--text-secondary); }
+.computer-use-error { color: var(--red); }
+.computer-use-location { margin-top: 16px; color: var(--text-secondary); font-size: 12px; }
+.computer-use-location summary { cursor: pointer; }
+.computer-use-location code { display: block; margin-top: 8px; overflow-wrap: anywhere; }
 
 /* Toggle Switch */
 .toggle {
@@ -1853,6 +1884,8 @@ html, body {
   --code-border: #232a36;
   --code-head-bg: #161b22;
   --code-head-fg: #8b95a6;
+  --new-session-bg: #e4e8f0;
+  --new-session-hover: #dde3ee;
   --shadow-pop: 0 4px 14px rgba(30, 40, 60, 0.12);
   --shadow-card: 0 12px 40px rgba(30, 40, 60, 0.18);
   --shadow-focus: 0 0 0 3px rgba(31, 127, 224, 0.18);
@@ -2614,7 +2647,7 @@ html, body { font-size: var(--font-base); }
   border-radius: 22px;
   padding: 10px 16px;
   max-width: min(525px, 82%);
-  font-size: 16px;
+  font-size: var(--font-reading);
   line-height: 24px;
   color: var(--fg-strong);
   box-shadow: none;
@@ -2625,7 +2658,7 @@ html, body { font-size: var(--font-base); }
   margin-bottom: 32px;
 }
 .message-body { padding-left: 0; }
-.message-content { font-size: 16px; line-height: 24px; color: var(--fg-strong); }
+.message-content { font-size: var(--font-reading); line-height: 24px; color: var(--fg-strong); }
 
 /* ---- Welcome hero (DSH empty state) ---- */
 .welcome { gap: 12px; padding: 40px 24px; max-width: 736px; margin: 0 auto; }
@@ -3783,14 +3816,14 @@ html, body { font-size: var(--font-base); }
   gap: 6px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: #43454a;
+  background: var(--new-session-bg);
   color: var(--fg-strong);
   font-size: 14px;
   font-weight: 500;
   line-height: 22px;
   cursor: pointer;
 }
-.new-session-btn:hover { background: #353638; }
+.new-session-btn:hover { background: var(--new-session-hover); }
 .ns-icon { flex: none; width: 14px; height: 14px; }
 .sidebar-header {
   display: flex;
@@ -3901,7 +3934,7 @@ html, body { font-size: var(--font-base); }
   padding: 0 8px;
   gap: 0;
   border-radius: 8px;
-  font-size: 14px;
+  font-size: var(--font-reading);
   line-height: 20px;
   color: var(--fg-mid);
 }

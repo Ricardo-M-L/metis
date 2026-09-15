@@ -2,7 +2,7 @@
 """Fail-closed release-channel/inventory checks; lookup performs read-only gh API calls.
 
 The registry is trusted repository release tooling, never a workflow input or a
-release-body claim. An absent entry means the full stable/20-asset contract.
+release-body claim. An absent entry means the full stable/24-asset contract.
 GitHub does not return make_latest on GET: callers must supply an independent
 /releases/latest response to prove that a CLI-only release was not promoted.
 """
@@ -26,6 +26,9 @@ CLI_ARCHIVES = (
 DESKTOP_ARCHIVES = (
     "metis-desktop-darwin-universal.dmg", "metis-desktop-darwin-universal.zip",
     "metis-desktop-linux-amd64.tar.gz", "metis-desktop-windows-amd64.zip",
+)
+COMPUTER_USE_ARCHIVES = (
+    "metis-cu-darwin-arm64.tar.gz", "metis-cu-darwin-amd64.tar.gz",
 )
 
 
@@ -98,7 +101,7 @@ def release_plan(registry, tag):
                 "CLI-only registry requires channel-matched prerelease and make_latest=false")
         require(isinstance(entry["reason"], str) and entry["reason"].strip(), "missing registry reason")
     cli_only = tag in releases
-    archives = CLI_ARCHIVES if cli_only else CLI_ARCHIVES + DESKTOP_ARCHIVES
+    archives = CLI_ARCHIVES if cli_only else CLI_ARCHIVES + DESKTOP_ARCHIVES + COMPUTER_USE_ARCHIVES
     return {
         "tag": tag,
         "channel": releases[tag]["channel"] if cli_only else "stable",

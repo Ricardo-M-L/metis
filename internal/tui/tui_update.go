@@ -818,7 +818,11 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		// without re-entering the just-finalized turn.
 		if m.queuePending {
 			m.queuePending = false
-			return m.handleSubmit()
+			userInput := m.queuePendingInput
+			cronInput := m.queuePendingContext
+			m.queuePendingInput = nil
+			m.queuePendingContext = nil
+			return m.handleSubmitWithUserInput(userInput, cronInput)
 		}
 		// A readiness message may have arrived while turnActive was still true.
 		// Recheck after finalization so that edge cannot be lost.

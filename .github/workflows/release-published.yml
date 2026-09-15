@@ -44,7 +44,7 @@ jobs:
             exit 1
           fi
 
-          # Unregistered stable releases still require exactly the 20 immutable assets.
+          # Unregistered stable releases still require exactly the 24 immutable assets.
           # Only repository-registered CLI-only releases use the 12-asset schema.
           python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > plan.json
           channel=$(jq -r .channel plan.json)

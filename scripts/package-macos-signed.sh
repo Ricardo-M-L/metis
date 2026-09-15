@@ -14,18 +14,25 @@ fail() {
 
 usage() {
 	cat >&2 <<'EOF'
-usage: scripts/package-macos-signed.sh [--notary-profile PROFILE]
+usage: scripts/package-macos-signed.sh [--notary-profile PROFILE] [--computer-use-artifact-dir DIR]
 EOF
 	exit 2
 }
 
 notary_profile=metis-notary
+computer_use_artifact_dir=
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--notary-profile)
 		[ "$#" -ge 2 ] || usage
 		[ -n "$2" ] || usage
 		notary_profile=$2
+		shift 2
+		;;
+	--computer-use-artifact-dir)
+		[ "$#" -ge 2 ] || usage
+		[ -n "$2" ] || usage
+		computer_use_artifact_dir=$2
 		shift 2
 		;;
 	-h | --help)
@@ -52,7 +59,7 @@ if git -C "$repo_root" ls-files --error-unmatch "$credentials_rel" >/dev/null 2>
 	fail "$credentials_rel is tracked by Git; refusing to package"
 fi
 
-for command_name in wails codesign security ditto hdiutil shasum unzip xcrun spctl; do
+for command_name in wails codesign security ditto hdiutil shasum unzip xcrun spctl python3; do
 	command -v "$command_name" >/dev/null 2>&1 || fail "missing required command: $command_name"
 done
 xcrun --find notarytool >/dev/null 2>&1 || fail "missing required Xcode tool: notarytool"
@@ -89,6 +96,14 @@ printf '%s\n' "Building METIS Desktop for darwin/universal..."
 	wails build -clean -s -trimpath -skipbindings -platform darwin/universal
 )
 [ -d "$app_path" ] || fail "Wails did not create $app_path"
+# Exact signed helper archives remain opaque resources: the outer app signer
+# must not rewrite their bytes. The compiled catalog, never a supplied manifest,
+# is the authority for both native targets. An empty catalog blocks production.
+if [ -n "$computer_use_artifact_dir" ]; then
+	python3 "$repo_root/scripts/bundle-computer-use.py" --app "$app_path" --artifact-dir "$computer_use_artifact_dir"
+else
+	python3 "$repo_root/scripts/bundle-computer-use.py" --app "$app_path"
+fi
 if find "$app_path" \( -type d -name .private -o -type f -name teamid.txt -o \
 	-type f -name '*.p12' -o -type f -name '*.p8' \) -print -quit | grep -q .; then
 	fail "application bundle contains forbidden signing material"

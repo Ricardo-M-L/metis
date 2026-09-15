@@ -57,10 +57,10 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertFalse(any("desktop" in name for name in plan["assets"]))
         self.verify()
 
-    def test_unregistered_versions_keep_twenty_asset_stable_contract(self):
+    def test_unregistered_versions_keep_twenty_four_asset_stable_contract(self):
         plan = contract.release_plan(self.registry, "v0.4.50")
         self.assertEqual(plan["channel"], "stable")
-        self.assertEqual(len(plan["assets"]), 20)
+        self.assertEqual(len(plan["assets"]), 24)
         self.assertFalse(plan["prerelease"])
         contract.verify_release(self.registry, "v0.4.50", self.metadata("v0.4.50"),
                                 {"tag_name": "v0.4.50"}, phase="published")

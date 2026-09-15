@@ -34,4 +34,6 @@ export function SaveSettings(arg1:string):Promise<void>;
 
 export function SendMessage(arg1:string,arg2:string,arg3:string):Promise<main.MessageResponse>;
 
+export function SetNativeTheme(arg1:string):Promise<void>;
+
 export function StartWebUI():Promise<string>;

@@ -8,6 +8,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/budget"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/google/uuid"
 )
 
@@ -158,6 +159,10 @@ const (
 	// the end so every externally consumed EventKind value remains stable.
 	EventTraceInvocationStart
 	EventTraceInvocationEnd
+
+	// EventContextInjected records runtime-provided text added to the model's
+	// conversation. It is not a human submission and does not start a user turn.
+	EventContextInjected
 )
 
 // agentNameKey carries the current agent's team identity (the `name` param
@@ -526,6 +531,11 @@ type Event struct {
 	// Text events
 	TextDelta string
 
+	// ContextText contains the complete display-safe injected envelope. Source
+	// is a fixed category (job, peer, etc.), never a job name or arbitrary text.
+	ContextText string
+	Source      string
+
 	// Tool events
 	ToolUseID  string
 	ToolName   string
@@ -666,6 +676,10 @@ func (e Event) PresentationCopy() Event {
 	e.permissionPolicyInput = nil
 	e.PermissionReply = nil
 	e.AskUserReply = nil
+	if e.Kind == EventContextInjected {
+		e.ContextText = security.RedactSubprocessText(e.ContextText)
+		e.Source = NormalizeContextSource(e.Source)
+	}
 
 	e.ToolInput = redactedToolInput(e.ToolInput)
 	e.PermissionInput = redactedToolInput(e.PermissionInput)
@@ -682,6 +696,18 @@ func (e Event) PresentationCopy() Event {
 	}
 	e.AskUserOptions = append([]string(nil), e.AskUserOptions...)
 	return e
+}
+
+// NormalizeContextSource prevents dynamic labels (including credentials or
+// URLs) from becoming persistent context provenance. Unknown integrations
+// retain their payload under the generic context category.
+func NormalizeContextSource(source string) string {
+	switch source {
+	case "job", "peer", "dream", "monitor", "subagent", "todo", "recovery", "verification", "budget", "contract", "hook", "cron", "context":
+		return source
+	default:
+		return "context"
+	}
 }
 
 // ToolCall represents a tool the model wants to invoke.

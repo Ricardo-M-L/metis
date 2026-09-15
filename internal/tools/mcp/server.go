@@ -9,6 +9,7 @@ import (
 	"mime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
@@ -55,13 +56,16 @@ type Server struct {
 	// calls return it immediately rather than retrying (a kimi-cli-
 	// style flapping spawn would otherwise hammer a broken binary
 	// once per tool call).
-	spawn       func(context.Context) (*mcp.Client, error)
-	spawnOnce   sync.Once
-	spawnWG     sync.WaitGroup
-	spawnErr    error
-	spawnCancel context.CancelFunc
-	closed      bool
-	mu          sync.RWMutex
+	spawn              func(context.Context) (*mcp.Client, error)
+	spawnOnce          sync.Once
+	spawnWG            sync.WaitGroup
+	spawnErr           error
+	spawnCancel        context.CancelFunc
+	closed             bool
+	closeDone          chan struct{}
+	closeErr           error
+	managedComputerUse bool
+	mu                 sync.RWMutex
 }
 
 var errMCPServerClosed = errors.New("MCP server is closed")
@@ -164,8 +168,9 @@ type mcpContent struct {
 }
 
 type mcpEnvelope struct {
-	Content []mcpContent `json:"content"`
-	IsError bool         `json:"isError"`
+	Content           []mcpContent    `json:"content"`
+	IsError           bool            `json:"isError"`
+	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
 }
 
 // parseMCPResponse extracts text + image parts from the standard
@@ -222,6 +227,9 @@ func parseMCPResponse(raw []byte) (*tools.Result, bool) {
 			b, _ := json.Marshal(c)
 			textParts = append(textParts, string(b))
 		}
+	}
+	if outcome := renderMCPActionOutcome(env.StructuredContent); outcome != "" {
+		textParts = append(textParts, outcome)
 	}
 	out := strings.Join(textParts, "\n\n")
 	return &tools.Result{
@@ -474,6 +482,41 @@ func (s *Server) IsSpawned() bool {
 	return s.client != nil
 }
 
+// NotifyLive delivers lifecycle control only to an already connected server.
+// Stopping an unused lazy component must never start a new process.
+func (s *Server) NotifyLive(ctx context.Context, method string, params any) error {
+	client, err := s.clientSnapshot()
+	if err != nil {
+		return err
+	}
+	return client.Notify(ctx, method, params)
+}
+
+// MarkManagedComputerUse opts a verified helper into native input cleanup.
+// A matching server name or executable basename alone never grants this role.
+// Runtime assembly calls this only after the managed helper handshake succeeds.
+func (s *Server) MarkManagedComputerUse() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.managedComputerUse = true
+	}
+}
+
+func (s *Server) ComputerUseControl(ctx context.Context, action string) error {
+	s.mu.RLock()
+	managed := s.managedComputerUse
+	s.mu.RUnlock()
+	if !managed {
+		return fmt.Errorf("not a managed Computer Use server")
+	}
+	client, err := s.clientSnapshot()
+	if err != nil {
+		return err
+	}
+	return client.ComputerUseControl(ctx, action)
+}
+
 // truncateDescription clamps a tool description to maxToolDescriptionBytes,
 // appending an ellipsis marker so the LLM (and the human reading logs)
 // can tell content was elided rather than just sentence-ending mid-word.
@@ -551,15 +594,22 @@ func (s *Server) Close() error {
 	}
 	s.mu.Lock()
 	if s.closed {
+		done := s.closeDone
 		s.mu.Unlock()
-		// Another caller may own the close while a lazy spawn is still in
-		// flight. Its transport error belongs to that first caller, but every
-		// Close must still honor the process-exit boundary.
-		s.spawnWG.Wait()
-		return nil
+		// Every caller observes the same native ACK, transport-exit and lazy-
+		// spawn boundary, including the first closer's cleanup failure.
+		if done != nil {
+			<-done
+		}
+		s.mu.RLock()
+		err := s.closeErr
+		s.mu.RUnlock()
+		return err
 	}
 	s.closed = true
+	s.closeDone = make(chan struct{})
 	c := s.client
+	managedComputerUse := s.managedComputerUse
 	s.client = nil
 	cancel := s.spawnCancel
 	s.spawnCancel = nil
@@ -569,13 +619,22 @@ func (s *Server) Close() error {
 	}
 	var err error
 	if c != nil {
-		err = c.Close()
+		if managedComputerUse {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = c.ComputerUseControl(ctx, "stop")
+			cancel()
+		}
+		err = errors.Join(err, c.Close())
 	}
 	// Cancellation only asks an in-flight lazy launcher to stop. Join it so a
 	// late client is closed (above in ensureClient) before this lifecycle
 	// boundary returns; otherwise an unsandboxed child can overlap the safer
 	// permission mode that triggered Close.
 	s.spawnWG.Wait()
+	s.mu.Lock()
+	s.closeErr = err
+	close(s.closeDone)
+	s.mu.Unlock()
 	return err
 }
 

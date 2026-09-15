@@ -35,7 +35,7 @@ func (l *Loop) injectDreamNotifications(ctx context.Context, out chan<- Event) {
 	if len(notifs) == 0 {
 		return
 	}
-	l.appendInjectedMessage(formatDreamNotifications(notifs))
+	l.appendInjectedMessage(ctx, out, "dream", formatDreamNotifications(notifs))
 	// Mirror surface to the TUI so the user sees the same "memory
 	// updated" banner the model is reacting to.
 	emit(ctx, out, Event{

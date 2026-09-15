@@ -52,7 +52,7 @@ func (l *Loop) injectTodoReminder(ctx context.Context, out chan<- Event) {
 		return // all done → nothing to chase
 	}
 
-	l.appendInjectedMessage(formatTodoReminder(items))
+	l.appendInjectedMessage(ctx, out, "todo", formatTodoReminder(items))
 	l.mu.Lock()
 	l.todoReminderIter = cur
 	l.mu.Unlock()

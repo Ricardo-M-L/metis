@@ -142,6 +142,7 @@ func (m *Model) asREPL() *REPL {
 		FreshPermissionMode: m.ext.FreshPermissionMode,
 		BeginMCPLaunch:      m.ext.BeginMCPLaunch,
 		AdoptMCPServer:      m.ext.AdoptMCPServer,
+		ComputerUse:         m.ext.ComputerUse,
 		sandbox:             m.ext.Sandbox,
 		UseMarkdown:         normalizeOutputStyle(m.outputStyle) != outputStyleMinimal,
 		outputStyle:         normalizeOutputStyle(m.outputStyle),

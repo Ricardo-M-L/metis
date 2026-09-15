@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/computeruse"
 	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
@@ -120,23 +121,32 @@ func TestExplicitMCPEntryPointsRetainLaunchTicketAcrossRevocation(t *testing.T) 
 	})
 
 	t.Run("computer use", func(t *testing.T) {
-		withTempCuEnv(t)
+		withTempMCPLoginHome(t)
 		m := newSlashTestModel(t)
 		r := m.asREPL()
 		h := &explicitLaunchTicketHarness{epoch: 19}
 		r.BeginMCPLaunch = h.begin
 		r.AdoptMCPServer = h.legacy
-		server := explicitTicketTestServer(cuServerName)
-		stubConfiguredMCPLaunch(t, func(_ context.Context, _ *mcp.Registry, _ string, staged *tools.Registry, _ *sandbox.Manager) (*mcptools.Server, error) {
-			for _, tool := range server.Tools() {
-				staged.Register(tool)
-			}
-			h.epoch++
-			return server, nil
+		stubConfiguredMCPLaunch(t, func(context.Context, *mcp.Registry, string, *tools.Registry, *sandbox.Manager) (*mcptools.Server, error) {
+			t.Fatal("managed Computer Use must not use the generic MCP launcher")
+			return nil, errors.New("unexpected unmanaged launch")
 		})
-
-		_ = cuEnable(r)
-		assertStaleExplicitLaunchRejected(t, r.Loop.Registry, server, h)
+		calls := 0
+		r.ComputerUse = func(_ context.Context, action string) (computeruse.Status, error) {
+			calls++
+			if action != "enable" {
+				t.Fatalf("unexpected managed action: %s", action)
+			}
+			// The shared service owns launch revocation and returns the result
+			// directly; the UI must not retry through its legacy launcher.
+			return computeruse.Status{}, context.Canceled
+		}
+		if got := cmdCU(r, "enable"); got != "cu: context canceled" || calls != 1 {
+			t.Fatalf("managed cancellation: %q calls=%d", got, calls)
+		}
+		if h.beginCalls != 0 || h.adoptCalls != 0 || h.legacyCalls != 0 || h.finishCalls != 0 {
+			t.Fatalf("managed Computer Use touched legacy launch tickets: %+v", h)
+		}
 	})
 
 	t.Run("test probe", func(t *testing.T) {
@@ -304,13 +314,6 @@ func TestBlockingExplicitMCPEntryPointsJoinBeforeTicketFinish(t *testing.T) {
 			},
 			run: func(r *REPL) string { return r.handleMCPTest("secure") },
 		},
-		{
-			name: "computer use",
-			setup: func(t *testing.T) {
-				withTempCuEnv(t)
-			},
-			run: cuEnable,
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -399,13 +402,6 @@ func TestRejectedMCPLaunchTicketDoesNotCallLauncher(t *testing.T) {
 				}
 			},
 			run: func(r *REPL) string { return r.handleMCPTest("secure") },
-		},
-		{
-			name: "computer use",
-			setup: func(t *testing.T) {
-				withTempCuEnv(t)
-			},
-			run: cuEnable,
 		},
 	}
 	for _, tt := range tests {

@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/computeruse"
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/security"
 )
@@ -88,9 +90,10 @@ const (
 	// deadline exceeded" into the chat after each user turn (image
 	// #7 / user report 2026-05-18 noon). 30s is the safe default;
 	// raise via MCP_CONNECT_TIMEOUT=Xs for truly cold caches.
-	defaultConnectTimeout = 30 * time.Second
-	defaultRequestTimeout = 60 * time.Second
-	defaultToolTimeout    = 100_000 * time.Second // ~27.8 h
+	defaultConnectTimeout     = 30 * time.Second
+	defaultRequestTimeout     = 60 * time.Second
+	defaultToolTimeout        = 100_000 * time.Second // ~27.8 h
+	computerUseControlTimeout = 5 * time.Second
 )
 
 // ConnectTimeout returns the per-server connect+handshake budget.
@@ -159,8 +162,46 @@ type StdioSandboxProfile uint8
 
 const (
 	StdioSandboxProfileGeneric StdioSandboxProfile = iota
+	// ComputerUse preserves legacy desktop environment compatibility only.
 	StdioSandboxProfileComputerUse
+	// ManagedComputerUse additionally requires component verification before
+	// fixed native input-ownership and app-approval paths can be granted.
+	StdioSandboxProfileManagedComputerUse
 )
+
+func isComputerUseStdioProfile(profile StdioSandboxProfile) bool {
+	return profile == StdioSandboxProfileComputerUse || profile == StdioSandboxProfileManagedComputerUse
+}
+
+func stdioSandboxRequest(workingDir string, profile StdioSandboxProfile) sandbox.Request {
+	return sandbox.Request{
+		Cwd:                       workingDir,
+		ComputerUseInputOwnership: profile == StdioSandboxProfileManagedComputerUse,
+		ComputerUseAppGrants:      profile == StdioSandboxProfileManagedComputerUse,
+	}
+}
+
+func verifyManagedComputerUseLaunch(ctx context.Context, command string, args []string, resolve func(context.Context) (string, error)) error {
+	if !filepath.IsAbs(command) || filepath.Clean(command) != command || len(args) != 0 {
+		return errors.New("managed Computer Use requires a verified absolute executable with no custom arguments")
+	}
+	verified, err := resolve(ctx)
+	if err != nil {
+		return fmt.Errorf("verify managed Computer Use executable: %w", err)
+	}
+	if command != verified {
+		return errors.New("managed Computer Use command does not match the verified installed component")
+	}
+	return nil
+}
+
+func resolveManagedComputerUseExecutable(ctx context.Context) (string, error) {
+	home, err := config.VerifiedHome()
+	if err != nil {
+		return "", err
+	}
+	return computeruse.New(home).Resolve(ctx)
+}
 
 func readBoundedJSONRPC(r io.Reader) ([]byte, error) {
 	limited := &io.LimitedReader{R: r, N: maxMCPMessageBytes + 1}
@@ -245,8 +286,15 @@ func NewStdioTransportWithEnvAndDirAndSandboxProfile(ctx context.Context, comman
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if profile != StdioSandboxProfileGeneric && profile != StdioSandboxProfileComputerUse {
+	if profile != StdioSandboxProfileGeneric && !isComputerUseStdioProfile(profile) {
 		return nil, fmt.Errorf("mcp: invalid stdio sandbox profile %d", profile)
+	}
+	// Enforce provenance at the lowest constructor so direct Client/Transport/
+	// tool-wrapper callers cannot acquire the grant by selecting an enum alone.
+	if profile == StdioSandboxProfileManagedComputerUse {
+		if err := verifyManagedComputerUseLaunch(ctx, command, args, resolveManagedComputerUseExecutable); err != nil {
+			return nil, err
+		}
 	}
 	// Process lifetime is owned by StdioTransport.Close, not by the bounded
 	// launch/handshake context. Slash commands and lazy first-tool spawns use
@@ -267,7 +315,7 @@ func NewStdioTransportWithEnvAndDirAndSandboxProfile(ctx context.Context, comman
 		// explicitly configured server credentials while normalizing TMPDIR and
 		// non-interactive markers to the shared sandbox boundary.
 		cmd.Env = manager.FilterEnv(cmd.Env, true)
-		req := sandbox.Request{Cwd: workingDir}
+		req := stdioSandboxRequest(workingDir, profile)
 		// On supported hosts, local MCP and Computer Use processes always get
 		// the credential-read boundary even when the user's ordinary sandbox
 		// mode is off. This also makes a later switch to bypassPermissions safe:
@@ -278,7 +326,7 @@ func NewStdioTransportWithEnvAndDirAndSandboxProfile(ctx context.Context, comman
 			req.MinimumMode = sandbox.ModePermissions
 			if runtime.GOOS == "linux" {
 				marker := linuxStdioMCPSandboxProfile
-				if profile == StdioSandboxProfileComputerUse {
+				if isComputerUseStdioProfile(profile) {
 					marker = linuxStdioMCPDesktopSandboxProfile
 				}
 				cmd.Env = append(cmd.Env, marker)
@@ -510,7 +558,7 @@ func sanitizedStdioEnvForProfile(extraEnv []string, workingDir string, profile S
 			// Even explicit generic MCP configuration cannot inherit the host
 			// desktop/session bus. The dedicated Computer Use profile needs only
 			// X11 display selection and its authorization cookie.
-			if profile != StdioSandboxProfileComputerUse || (upperKey != "DISPLAY" && upperKey != "XAUTHORITY") {
+			if !isComputerUseStdioProfile(profile) || (upperKey != "DISPLAY" && upperKey != "XAUTHORITY") {
 				return
 			}
 		}
@@ -1874,6 +1922,81 @@ func (c *Client) initialize(ctx context.Context) error {
 	}
 	// Best-effort initialized notification; servers don't reply to it.
 	return c.sendNotification(ctx, "notifications/initialized", nil)
+}
+
+// Notify is the host-side lifecycle channel. It is not exposed as a model tool.
+func (c *Client) Notify(ctx context.Context, method string, params any) error {
+	return c.runLifecycleRequest(ctx, RequestTimeout(), func(ctx context.Context) error {
+		return c.sendNotification(ctx, method, params)
+	})
+}
+
+// runLifecycleRequest bounds the entire operation, including waiting for
+// writeMu and writing into a full stdin pipe. send's response select alone
+// cannot bound either. On cancellation, Client.Close (not Server.Close)
+// breaks stdio writes and then we join the worker so no blocked sender remains.
+func (c *Client) runLifecycleRequest(ctx context.Context, timeout time.Duration, operation func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- operation(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil && ctx.Err() != nil {
+			return errors.Join(ctx.Err(), c.Close())
+		}
+		return err
+	case <-ctx.Done():
+		closeErr := c.Close()
+		<-done
+		return errors.Join(ctx.Err(), closeErr)
+	}
+}
+
+// ComputerUseControl waits for the helper's cleanup acknowledgement. Closing
+// a generic MCP transport kills its process group, so it must not race native
+// input release. Only the host lifecycle can call this, never the model.
+func (c *Client) ComputerUseControl(ctx context.Context, action string) error {
+	if action != "stop" && action != "end-turn" {
+		return fmt.Errorf("invalid Computer Use control action")
+	}
+	err := c.runLifecycleRequest(ctx, computerUseControlTimeout, func(ctx context.Context) error {
+		return c.computerUseControl(ctx, action)
+	})
+	if err != nil {
+		return fmt.Errorf("Computer Use input cleanup unconfirmed: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) computerUseControl(ctx context.Context, action string) error {
+	response, err := c.send(ctx, "metis-cu/"+action, nil)
+	if err != nil {
+		return err
+	}
+	if response.Error != nil {
+		return c.mcpResponseError(response.Error)
+	}
+	var ack struct {
+		Stopped bool `json:"stopped"`
+		Cleaned bool `json:"cleaned"`
+	}
+	if err := json.Unmarshal(response.Result, &ack); err != nil {
+		return fmt.Errorf("invalid Computer Use cleanup acknowledgement: %w", err)
+	}
+	if !ack.Cleaned {
+		return fmt.Errorf("Computer Use input cleanup was not confirmed")
+	}
+	if action == "stop" && !ack.Stopped {
+		return fmt.Errorf("Computer Use stop was not confirmed")
+	}
+	return nil
 }
 
 // sendNotification writes a fire-and-forget JSON-RPC notification (no id,

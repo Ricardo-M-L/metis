@@ -60,7 +60,7 @@ func (m *Model) handleCronTick(now time.Time) (tea.Model, tea.Cmd) {
 		notify.SendNotification("metis", "scheduled task fired: "+label)
 
 		if m.turnActive {
-			m.enqueueQueuedItem(job.Prompt, QueuePriorityNext)
+			m.enqueueQueuedItemWithOrigin(job.Prompt, QueuePriorityNext, false)
 		} else {
 			cmds = append(cmds, m.beginTurn(job.Prompt)) // sets turnActive=true
 		}
@@ -94,6 +94,7 @@ func (m *Model) beginTurn(text string) tea.Cmd {
 		return nil
 	}
 	m.loop.AppendUser(text)
+	runtime.RecordContextInput(m.sessionID, "cron", text)
 	if err := m.persistTail(); err != nil {
 		m.warnSessionSave(err)
 	}

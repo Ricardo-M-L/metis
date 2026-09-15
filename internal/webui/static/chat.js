@@ -1510,6 +1510,7 @@ function newChat() {
   }
   if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();
   currentSessionId = null;
+  if (typeof resetSessionFiles === 'function') resetSessionFiles();
   if (typeof resetArtifactsForSession === 'function') resetArtifactsForSession();
   queuedTurns = [];
   queuedSessionId = null;
@@ -2064,6 +2065,7 @@ async function runTurnItem(item) {
       currentSessionId = resolvedTurnSessionId;
     }
     const viewingTurn = currentSessionId === resolvedTurnSessionId;
+    if (viewingTurn && typeof loadSessionFiles === 'function') void loadSessionFiles(resolvedTurnSessionId);
     if (viewingTurn && typeof loadArtifactsForSession === 'function') {
       await loadArtifactsForSession(resolvedTurnSessionId, { rebuildCards: true, silent: true });
     }
@@ -2223,26 +2225,13 @@ function copyMessage(btn) {
 
 // Feedback (DSH command-feedback parity): records a log-only remark on
 // the session. Never enters model context — it lands in the JSONL as a
-// "feedback" entry the resume path ignores.
+// "feedback" entry the resume path ignores. Use the app dialog instead of
+// window.prompt because embedded WebViews may not implement JavaScript prompts.
 async function feedbackMessage(btn) {
   if (!currentSessionId) { showToast('Start a session before leaving feedback'); return; }
   const msg = btn.closest('.message');
   const idx = msg ? msg.dataset.idx : '';
-  const text = (window.prompt('\u53cd\u9988\u5907\u6ce8\uFF08\u4ec5\u8bb0\u5f55\uFF0C\u4e0d\u53d1\u7ed9\u6a21\u578b\uFF09:', '') || '').trim();
-  if (!text) return;
-  try {
-    const res = await fetch('/api/feedback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: currentSessionId, kind: 'remark', text: (idx ? '(msg ' + idx + ') ' : '') + text }),
-    });
-    if (!res.ok) throw new Error('feedback: ' + res.status);
-    btn.innerHTML = MESSAGE_ACTION_ICONS.done;
-    setTimeout(() => { btn.innerHTML = MESSAGE_ACTION_ICONS.feedback; }, 1200);
-    showToast('Feedback recorded');
-  } catch (e) {
-    showToast('Feedback failed: ' + e.message);
-  }
+  openComposerActionDialog('feedback', btn, { messageIndex: idx, sessionId: currentSessionId });
 }
 
 // rateMessage records a message-level 👍/👎 (DSH message-feedback parity).
@@ -2313,6 +2302,7 @@ function visibleTranscriptText(value) {
 // tool_use_id, name, input} blocks; the following user message carries
 // {type:'tool_result', tool_use_id, content, is_error?} blocks.
 function renderHistoryMessages(history) {
+  if (typeof loadSessionFiles === 'function') void loadSessionFiles(currentSessionId);
   queueMicrotask(() => restoreTodoPlanFromHistory(history));
   const area = document.getElementById('chatArea');
   // Avoid forcing a layout/scroll for every reconstructed history block. The
@@ -2551,6 +2541,13 @@ function inlineMd(s) {
     codeStash.push(code);
     return 'CODESPAN' + (codeStash.length - 1) + 'XQ';
   });
+  const localLinks = [];
+  out = out.replace(/\[([^\]\n]+)\]\((?:<([^>\n]+)>|([^\s)]+))\)/g, (whole, label, angled, plain) => {
+    const path = angled || plain;
+    if (typeof sessionFilePathFromLink !== 'function' || !sessionFilePathFromLink(path)) return whole;
+    localLinks.push({ label, path });
+    return 'LOCALFILELINK' + (localLinks.length - 1) + 'XQ';
+  });
   const stash = [];
   // \( ... \) backslash delimiters (DSH parity: "inline dollar and backslash")
   out = out.replace(/\\\((.+?)\\\)/g, (_m, tex) => {
@@ -2577,6 +2574,10 @@ function inlineMd(s) {
   }
   for (let i = 0; i < stash.length; i++) {
     out = out.split('MATHINLINE' + i + 'ZQ').join(renderMathInline(stash[i]));
+  }
+  for (let i = 0; i < localLinks.length; i++) {
+    const link = localLinks[i];
+    out = out.split('LOCALFILELINK' + i + 'XQ').join('<button type="button" class="session-file-link" disabled data-session-file-path="' + escAttr(link.path) + '">' + escHtml(link.label) + '</button>');
   }
   return out;
 }
@@ -3133,15 +3134,17 @@ async function compactCurrentSession(instructions) {
   }
 }
 
-async function recordComposerFeedback(text) {
-  if (!currentSessionId) {
+async function recordComposerFeedback(text, messageIndex, sessionId) {
+  const targetSessionId = sessionId || currentSessionId;
+  if (!targetSessionId) {
     showToast(uiText('Open a session before recording feedback.', '\u8bf7\u5148\u6253\u5f00\u4e00\u4e2a\u4f1a\u8bdd\u518d\u8bb0\u5f55\u53cd\u9988\u3002'));
     return false;
   }
   try {
+    const prefix = messageIndex !== undefined && messageIndex !== '' ? '(msg ' + messageIndex + ') ' : '';
     const res = await fetch('/api/feedback', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: currentSessionId, kind: 'remark', text: String(text || '').trim() })
+      body: JSON.stringify({ sessionId: targetSessionId, kind: 'remark', text: prefix + String(text || '').trim() })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'feedback: ' + res.status);
@@ -3284,19 +3287,30 @@ function composerActionDialogMarkup(kind) {
       '<label class="composer-permission-option"><input type="radio" name="composerPermission" value="' + mode + '"' + (approvalMode === mode ? ' checked' : '') + '><span><strong>' + escHtml(labels[mode]) + '</strong><small>' + escHtml(descs[mode]) + '</small></span></label>'
     ).join('') + '</div>';
   }
+  if (kind === 'provider-probe') {
+    return '<div class="composer-action-heading"><span class="composer-action-symbol">' + composerActionIcon('model') + '</span><div><h2 id="composerActionTitle">' + uiText('Test provider connection', '测试提供商连接') + '</h2><p id="composerActionDescription">' + uiText('This sends the saved credential to the provider metadata endpoint only. No prompt or model request is sent.', '这只会使用已保存的凭据访问提供商元数据接口，不会发送提示词，也不会调用模型。') + '</p></div></div>';
+  }
   return '<div class="composer-action-heading"><span class="composer-action-symbol">' + composerActionIcon('feedback') + '</span><div><h2 id="composerActionTitle">' + uiText('Session feedback', '\u4f1a\u8bdd\u53cd\u9988') + '</h2><p id="composerActionDescription">' + uiText('This note is saved to the session log and is not sent to the model.', '\u8fd9\u6761\u5907\u6ce8\u53ea\u4fdd\u5b58\u5230\u4f1a\u8bdd\u65e5\u5fd7\uff0c\u4e0d\u4f1a\u53d1\u9001\u7ed9\u6a21\u578b\u3002') + '</p></div></div>' +
     '<label class="composer-action-field"><span>' + uiText('Feedback', '\u53cd\u9988') + '</span><textarea id="composerActionInput" maxlength="2000" rows="5" placeholder="' + escAttr(uiText('What should be recorded about this session?', '\u9700\u8981\u4e3a\u672c\u4f1a\u8bdd\u8bb0\u5f55\u4ec0\u4e48\uff1f')) + '"></textarea></label>';
 }
 
-function openComposerActionDialog(kind, trigger) {
+function openComposerActionDialog(kind, trigger, options) {
   closeComposerActionDialog(true);
   const overlay = document.createElement('div');
   overlay.className = 'composer-action-overlay';
   overlay.innerHTML = '<form class="composer-action-dialog" role="dialog" aria-modal="true" aria-labelledby="composerActionTitle" aria-describedby="composerActionDescription">' + composerActionDialogMarkup(kind) +
-    '<p class="composer-action-error" role="alert" hidden></p><div class="composer-action-buttons"><button type="button" class="composer-action-cancel">' + uiText('Cancel', '\u53d6\u6d88') + '</button><button type="submit" class="composer-action-confirm">' + (kind === 'permission' ? uiText('Apply mode', '\u5e94\u7528\u6a21\u5f0f') : kind === 'goal' ? uiText('Create goal', '\u521b\u5efa\u76ee\u6807') : uiText('Save feedback', '\u4fdd\u5b58\u53cd\u9988')) + '</button></div></form>';
+    '<p class="composer-action-error" role="alert" hidden></p><div class="composer-action-buttons"><button type="button" class="composer-action-cancel">' + uiText('Cancel', '\u53d6\u6d88') + '</button><button type="submit" class="composer-action-confirm">' + (kind === 'permission' ? uiText('Apply mode', '\u5e94\u7528\u6a21\u5f0f') : kind === 'goal' ? uiText('Create goal', '\u521b\u5efa\u76ee\u6807') : kind === 'provider-probe' ? uiText('Test connection', '\u6d4b\u8bd5\u8fde\u63a5') : uiText('Save feedback', '\u4fdd\u5b58\u53cd\u9988')) + '</button></div></form>';
   document.body.appendChild(overlay);
   const fallback = document.getElementById('attachmentBtn');
-  composerActionDialog = { kind, trigger: trigger && !trigger.closest('.composer-add-menu') ? trigger : fallback, overlay, pending: false };
+  composerActionDialog = {
+    kind,
+    trigger: trigger && !trigger.closest('.composer-add-menu') ? trigger : fallback,
+    messageIndex: options && options.messageIndex !== undefined ? String(options.messageIndex) : '',
+    sessionId: options && options.sessionId !== undefined ? String(options.sessionId) : '',
+    providerId: options && options.providerId !== undefined ? String(options.providerId) : '',
+    overlay,
+    pending: false,
+  };
   overlay.querySelector('.composer-action-cancel').addEventListener('click', () => closeComposerActionDialog(false));
   overlay.querySelector('form').addEventListener('submit', confirmComposerAction);
   overlay.addEventListener('click', event => { if (event.target === overlay) closeComposerActionDialog(false); });
@@ -3350,7 +3364,7 @@ async function confirmComposerAction(event) {
   const input = state.overlay.querySelector('#composerActionInput');
   const value = input ? input.value.trim() : '';
   const error = state.overlay.querySelector('.composer-action-error');
-  if (state.kind !== 'permission' && !value) {
+  if (state.kind !== 'permission' && state.kind !== 'provider-probe' && !value) {
     error.hidden = false;
     error.textContent = uiText('Enter a value first.', '\u8bf7\u5148\u8f93\u5165\u5185\u5bb9\u3002');
     input.focus();
@@ -3361,7 +3375,8 @@ async function confirmComposerAction(event) {
   buttons.forEach(button => { button.disabled = true; });
   let ok = false;
   if (state.kind === 'goal') ok = await createComposerGoal(value, state.overlay.querySelector('#composerActionPriority').value);
-  else if (state.kind === 'feedback') ok = await recordComposerFeedback(value);
+  else if (state.kind === 'feedback') ok = await recordComposerFeedback(value, state.messageIndex, state.sessionId);
+  else if (state.kind === 'provider-probe') ok = await runProviderProbe(state.providerId);
   else {
     const selected = state.overlay.querySelector('input[name="composerPermission"]:checked');
     ok = await setPermissionMode(selected ? selected.value : approvalMode);
@@ -3372,6 +3387,12 @@ async function confirmComposerAction(event) {
     return;
   }
   if (ok) {
+    if (state.kind === 'feedback' && state.trigger && state.trigger.dataset.icon === 'feedback') {
+      state.trigger.innerHTML = MESSAGE_ACTION_ICONS.done;
+      setTimeout(() => {
+        if (state.trigger && state.trigger.isConnected) state.trigger.innerHTML = MESSAGE_ACTION_ICONS.feedback;
+      }, 1200);
+    }
     closeComposerActionDialog(true);
     return;
   }
@@ -3600,6 +3621,12 @@ function applyTheme(theme) {
     resolved = themeMedia.matches ? 'light' : 'dark';
   }
   document.documentElement.dataset.theme = resolved;
+  // The browser UI is embedded in the native Wails shell for Desktop. Keep
+  // the native macOS titlebar appearance in step with the iframe palette;
+  // standalone browser sessions simply ignore this bridge request.
+  if (typeof requestNative === 'function') {
+    requestNative('set-theme', { theme: resolved }).catch(() => {});
+  }
 }
 
 // Boot hook: fetch settings once so the persisted theme applies on page
@@ -3629,6 +3656,7 @@ function renderSettingsTab() {
     case 'providers': content.innerHTML = renderProvidersTab(); loadProviders(); break;
     case 'presets': content.innerHTML = renderPresetsTab(); loadPresets(); break;
     case 'plugins': content.innerHTML = renderPluginsTab(); loadPlugins(); loadPluginCatalog(); break;
+    case 'computer-use': content.innerHTML = renderComputerUseTab(); loadComputerUse(); break;
     case 'routing': content.innerHTML = renderRoutingTab(); loadRouting(); break;
     case 'config': content.innerHTML = renderConfigTab(); fillConfigFiles(); break;
   }
@@ -3866,7 +3894,7 @@ function paintProviders() {
     const setupHint = !p.credentialConfigured && p.setupCommand
       ? `<div class="provider-url">${uiText('Run', '请运行')} <code>${escHtml(p.setupCommand)}</code></div>`
       : '';
-    const probeButton = probeable ? `<button type="button" onclick="probeProvider('${escOnclick(p.id)}')">${uiText('Test connection', '测试连接')}</button>` : '';
+    const probeButton = probeable ? `<button type="button" onclick="probeProvider('${escOnclick(p.id)}', this)">${uiText('Test connection', '测试连接')}</button>` : '';
     const editButton = !p.custom ? '' : editableCustom
       ? `<button type="button" onclick="editProvider('${escOnclick(p.id)}')">${uiText('Edit', '编辑')}</button>`
       : `<button type="button" disabled title="${uiText('This cloud provider must be edited in config.toml', '此云提供商需要在 config.toml 中编辑')}">${uiText('Edit in config', '在配置中编辑')}</button>`;
@@ -3963,21 +3991,26 @@ async function validateProvider(id) {
     const res = await fetch('/api/providers/validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'validate: ' + res.status);
-    showToast('Provider configuration is valid; no model request was sent');
+    showToast(uiText('Provider configuration is valid; no model request was sent', '提供商配置有效；未发送模型请求'));
   } catch (e) {
-    showToast('Provider validation failed: ' + e.message);
+    showToast(uiText('Provider validation failed: ', '提供商验证失败：') + e.message);
   }
 }
 
-async function probeProvider(id) {
-  if (!confirm('Test the metadata connection for "' + id + '"? This sends its credential to the configured provider endpoint, but sends no prompt and uses no model tokens.')) return;
+function probeProvider(id, trigger) {
+  openComposerActionDialog('provider-probe', trigger, { providerId: id });
+}
+
+async function runProviderProbe(id) {
   try {
     const res = await fetch('/api/providers/probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, confirm: true }) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'connection probe: ' + res.status);
-    showToast('Provider metadata endpoint is reachable; no model request was sent');
+    showToast(uiText('Provider metadata endpoint is reachable; no model request was sent', '提供商元数据接口可访问；未发送模型请求'));
+    return true;
   } catch (e) {
-    showToast('Connection test failed: ' + e.message);
+    showToast(uiText('Connection test failed: ', '连接测试失败：') + e.message);
+    return null;
   }
 }
 

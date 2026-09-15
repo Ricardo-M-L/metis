@@ -295,6 +295,67 @@ func TestComposerAddMenuPreservesAttachmentAndKeepsSlashCommandsIndependent(t *t
 	}
 }
 
+func TestMessageFeedbackUsesNativeComposerDialog(t *testing.T) {
+	js, err := staticFS.ReadFile("static/chat.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(js)
+	feedbackStart := strings.Index(source, "async function feedbackMessage(btn)")
+	feedbackEnd := strings.Index(source[feedbackStart:], "// rateMessage records")
+	if feedbackStart < 0 || feedbackEnd < 0 {
+		t.Fatal("chat.js missing message feedback handler")
+	}
+	feedbackBody := source[feedbackStart : feedbackStart+feedbackEnd]
+	if strings.Contains(feedbackBody, "window.prompt(") {
+		t.Fatal("message feedback still depends on unsupported window.prompt")
+	}
+	for _, want := range []string{
+		"openComposerActionDialog('feedback', btn, { messageIndex: idx, sessionId: currentSessionId });",
+		"async function recordComposerFeedback(text, messageIndex, sessionId)",
+		"const targetSessionId = sessionId || currentSessionId;",
+		"body: JSON.stringify({ sessionId: targetSessionId",
+		"messageIndex: options && options.messageIndex !== undefined",
+		"sessionId: options && options.sessionId !== undefined",
+		"recordComposerFeedback(value, state.messageIndex, state.sessionId)",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("chat.js missing message-feedback dialog contract %q", want)
+		}
+	}
+}
+
+func TestProviderProbeUsesNativeComposerDialog(t *testing.T) {
+	js, err := staticFS.ReadFile("static/chat.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(js)
+	probeStart := strings.Index(source, "function probeProvider(id, trigger)")
+	if probeStart < 0 {
+		t.Fatal("chat.js missing provider probe handler")
+	}
+	probeEnd := strings.Index(source[probeStart:], "async function deleteProvider")
+	if probeEnd < 0 {
+		t.Fatal("chat.js missing provider probe handler")
+	}
+	probeBody := source[probeStart : probeStart+probeEnd]
+	if strings.Contains(probeBody, "confirm(") || strings.Contains(probeBody, "window.confirm(") {
+		t.Fatal("provider probe still depends on unsupported native confirm")
+	}
+	for _, want := range []string{
+		"openComposerActionDialog('provider-probe', trigger, { providerId: id });",
+		"async function runProviderProbe(id)",
+		"state.kind === 'provider-probe'",
+		"providerId: options && options.providerId !== undefined",
+		"onclick=\"probeProvider('",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("chat.js missing provider-probe dialog contract %q", want)
+		}
+	}
+}
+
 func TestTurnStatusMatchesWholeAgentTurnLifecycle(t *testing.T) {
 	s, _ := testServer(t)
 	get := func(path string) string {
@@ -411,6 +472,48 @@ func TestUserMessageActionsAndConversationSpacingFollowTurnHierarchy(t *testing.
 	userMarkup := chat[userStart : userStart+assistantStart]
 	if strings.Index(userMarkup, "message-bubble") >= strings.Index(userMarkup, "messageActionsMarkup('user'") {
 		t.Fatal("user message actions must be emitted after the bubble")
+	}
+}
+
+func TestConversationTextMatchesSidebarSessionNameSize(t *testing.T) {
+	css, err := staticFS.ReadFile("static/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	style := string(css)
+	lastRule := func(selector string) string {
+		start := strings.LastIndex(style, "\n"+selector+" {")
+		if start < 0 {
+			t.Fatalf("style.css missing canonical %s rule", selector)
+		}
+		start += strings.Index(style[start:], "{") + 1
+		end := strings.Index(style[start:], "}")
+		if end < 0 {
+			t.Fatalf("cannot isolate canonical %s rule", selector)
+		}
+		return style[start : start+end]
+	}
+	lastDeclaration := func(rule, property string) string {
+		value := ""
+		for _, declaration := range strings.Split(rule, ";") {
+			name, candidate, ok := strings.Cut(declaration, ":")
+			if ok && strings.TrimSpace(name) == property {
+				value = strings.TrimSpace(candidate)
+			}
+		}
+		return value
+	}
+	if got := lastDeclaration(lastRule(":root"), "--font-reading"); got != "14px" {
+		t.Fatalf("shared conversation/session-name font size = %q, want 14px", got)
+	}
+	for _, selector := range []string{".session-item", ".message-content", ".message-user .message-bubble"} {
+		rule := lastRule(selector)
+		if got := lastDeclaration(rule, "font-size"); got != "var(--font-reading)" {
+			t.Errorf("final %s font size = %q, want var(--font-reading)", selector, got)
+		}
+		if shorthand := lastDeclaration(rule, "font"); shorthand != "" {
+			t.Errorf("final %s font shorthand can override its shared size: %q", selector, shorthand)
+		}
 	}
 }
 

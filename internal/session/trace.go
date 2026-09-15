@@ -43,6 +43,7 @@ type TraceEvent struct {
 	ToolName   string    `json:"tool_name,omitempty"`
 	ToolUseID  string    `json:"tool_use_id,omitempty"`
 	Text       string    `json:"text,omitempty"`
+	Source     string    `json:"source,omitempty"` // fixed context provenance category; absent in legacy rows
 	IsError    bool      `json:"is_error,omitempty"`
 	ElapsedMs  int64     `json:"elapsed_ms,omitempty"`
 	SubAgentOf string    `json:"subagent_of,omitempty"` // parent's tool_use_id when forwarded from a sub-agent

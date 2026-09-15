@@ -27,6 +27,8 @@ import (
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 )
@@ -207,6 +209,45 @@ func EndTraceTurn(ctx context.Context) {
 // time-to-first-token (first assistant text minus the user message). The
 // adapter owns turn numbering, so this shares its lock and turn state.
 func RecordUserMessage(sessionID, text string) {
+	RecordUserInput(sessionID, []llm.ContentBlock{{Type: "text", Text: text}})
+}
+
+// RecordUserInput records an explicit human submission. Call at the submitting
+// surface, before RunWithTraceTurn, never from a background loop continuation.
+// Attachment payloads and provider hints are omitted from this display trace.
+func RecordUserInput(sessionID string, blocks []llm.ContentBlock) {
+	var parts []string
+	for _, block := range blocks {
+		if block.Synthetic {
+			continue
+		}
+		switch block.Type {
+		case "text":
+			if text := strings.TrimSpace(block.Text); text != "" {
+				parts = append(parts, text)
+			}
+		case "image", "image_url", "input_image":
+			parts = append(parts, "[image attachment]")
+		case "document", "file", "input_file":
+			parts = append(parts, "[document attachment]")
+		case "audio", "input_audio":
+			parts = append(parts, "[audio attachment]")
+		case "video":
+			parts = append(parts, "[video attachment]")
+		}
+	}
+	text := strings.Join(parts, "\n")
+	recordSubmittedTraceInput(sessionID, "user", "", text)
+}
+
+// RecordContextInput records an explicit automatic prompt (for example a cron
+// fire) at its submission boundary. This opens execution ownership for the
+// upcoming Run without claiming that a person submitted the prompt.
+func RecordContextInput(sessionID, source, text string) {
+	recordSubmittedTraceInput(sessionID, "context", source, text)
+}
+
+func recordSubmittedTraceInput(sessionID, kind, source, text string) {
 	adapterMu.RLock()
 	a := currentTraceAdapter
 	adapterMu.RUnlock()
@@ -219,10 +260,14 @@ func RecordUserMessage(sessionID, text string) {
 		return
 	}
 	origin := traceOrigin{sessionID: sessionID, turn: a.ensureTurnLocked(sessionID)}
-	a.appendLocked(origin, "user", agent.Event{Kind: agent.EventChannelInbound}, TraceExtra{Text: strings.TrimSpace(text)})
+	a.flushBurstLocked()
+	a.appendLocked(origin, kind, agent.Event{Source: source}, TraceExtra{Text: strings.TrimSpace(text)})
 }
 
 func (a *TraceAdapter) OnEvent(ev agent.Event) {
+	if ev.Kind == agent.EventContextInjected {
+		ev = ev.PresentationCopy()
+	}
 	var resolved *ResolvedTraceEvent
 	a.mu.Lock()
 	defer func() {
@@ -386,6 +431,9 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 	case agent.EventContextWarn, agent.EventContextCompacted, agent.EventCompactionStart, agent.EventCompactionProgress, agent.EventCompactionEnd:
 		a.flushBurstLocked()
 		a.appendLocked(origin, eventKindLabel(ev.Kind), ev, TraceExtra{Text: ev.Info})
+	case agent.EventContextInjected:
+		a.flushBurstLocked()
+		a.appendLocked(origin, "context", ev, TraceExtra{Text: ev.ContextText})
 	case agent.EventThinkingDelta:
 		a.bufferDeltaLocked(origin, "thinking", ev.TextDelta)
 		return
@@ -451,6 +499,11 @@ func (a *TraceAdapter) originForEventLocked(ev agent.Event) (traceOrigin, bool) 
 	}
 	if a.sessionID == "" {
 		return traceOrigin{}, false
+	}
+	if ev.Kind == agent.EventContextInjected {
+		// An out-of-band hook may add context while no query is running. Attach
+		// it to the last known turn without opening a new human-input boundary.
+		return traceOrigin{sessionID: a.sessionID, turn: a.store.CurrentTurn(a.sessionID)}, true
 	}
 	return traceOrigin{sessionID: a.sessionID, turn: a.ensureTurnLocked(a.sessionID)}, true
 }
@@ -616,19 +669,28 @@ type TraceExtra struct {
 }
 
 func (a *TraceAdapter) appendLocked(origin traceOrigin, kind string, ev agent.Event, x TraceExtra) {
+	text := security.RedactSubprocessText(x.Text)
+	// Keep complete human inputs and model-visible context envelopes. Other
+	// diagnostic rows retain the existing compact trace representation.
+	if kind != "user" && kind != "context" {
+		text = truncateTrace(text, 2000)
+	}
 	te := &session.TraceEvent{
 		SessionID:               origin.sessionID,
 		Turn:                    origin.turn,
 		Kind:                    kind,
 		ToolName:                x.ToolName,
 		ToolUseID:               x.ToolUseID,
-		Text:                    truncateTrace(x.Text, 2000),
+		Text:                    text,
 		IsError:                 x.IsError,
 		ElapsedMs:               x.ElapsedMs,
 		ParentID:                x.ParentID,
 		TraceInvocationID:       origin.invocationID,
 		TraceParentInvocationID: ev.TraceParentInvocationID,
 		TraceCallID:             ev.TraceCallID,
+	}
+	if kind == "context" {
+		te.Source = agent.NormalizeContextSource(ev.Source)
 	}
 	if origin.subAgent != "" && x.ParentID == "" {
 		te.SubAgentOf = origin.subAgent
@@ -689,7 +751,7 @@ func (a *TraceAdapter) flushBurstLocked() {
 		SessionID:         sid,
 		Turn:              turn,
 		Kind:              kind,
-		Text:              truncateTrace(text, 2000),
+		Text:              truncateTrace(security.RedactSubprocessText(text), 2000),
 		SubAgentOf:        subAgentOf,
 		TraceInvocationID: invocationID,
 	}); err != nil {

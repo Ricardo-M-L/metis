@@ -292,6 +292,14 @@ func TestAwaitedBackgroundWaitFlushesCollectedNotificationOnCancellation(t *test
 	}
 	select {
 	case event := <-out:
+		if event.Kind != EventContextInjected || event.Source != "job" || !strings.Contains(event.ContextText, "bg_unrelated_b") {
+			t.Fatalf("context event = %#v", event)
+		}
+	default:
+		t.Fatal("missing injected context on cancellation")
+	}
+	select {
+	case event := <-out:
 		if event.Kind != EventInfo || !strings.Contains(event.Info, "notification(s) injected") {
 			t.Fatalf("injection event = %#v", event)
 		}

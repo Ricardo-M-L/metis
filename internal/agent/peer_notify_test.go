@@ -102,7 +102,7 @@ func TestInjectPeerMessages_MultipleMessagesCollapse(t *testing.T) {
 func TestInjectPeerMessagesPreservesChildTraceOrigin(t *testing.T) {
 	ch := make(chan PeerMessage, 1)
 	ch <- PeerMessage{From: "alice", Body: "done", Sent: time.Now()}
-	out := make(chan Event, 1)
+	out := make(chan Event, 2)
 	l := &Loop{PeerInbox: ch}
 	ctx := WithParentToolUseID(context.Background(), "agent-public-id")
 	ctx = WithTraceInvocationID(ctx, "agent-internal-id")

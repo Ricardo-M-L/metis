@@ -19,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/computeruse"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -85,6 +86,9 @@ type REPL struct {
 	DirAdd    func(path string, persist bool) error
 	DirRemove func(path string) error
 	DirList   func() []string
+	// ComputerUse shares the process-owned component and server lifecycle with
+	// every other surface. Nil means management is unavailable in this REPL.
+	ComputerUse func(context.Context, string) (computeruse.Status, error)
 	// BeginMCPLaunch mirrors ExternalHooks.BeginMCPLaunch for the plain REPL and
 	// captures permission-generation ownership before a slow explicit launch.
 	BeginMCPLaunch func(lifecycle context.Context) *MCPLaunchTicket
@@ -589,6 +593,7 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 		} else {
 			r.Loop.AppendUser(text)
 		}
+		runtime.RecordUserInput(r.SessionID, []llm.ContentBlock{{Type: "text", Text: visibleInput}})
 		if err := r.persistTail(); err != nil {
 			fmt.Fprintln(r.out, r.Styles.Err.Render(err.Error()))
 		}

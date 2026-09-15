@@ -36,6 +36,21 @@ func wrapPlatform(cmd *exec.Cmd, req platformRequest) error {
 		return diagnostic.Err
 	}
 	profile := buildDarwinProfile(req.cwd, req.tempDir, req.home, req.metisHome, req.network)
+	appGrantsProfile, err := computerUseDarwinAppGrantsProfile(req.home, req.computerUseAppGrants)
+	if err != nil {
+		return err
+	}
+	profile += appGrantsProfile
+	if req.computerUseInputOwnership {
+		// metis-cu deliberately uses one host-wide inode, independent of the
+		// manager's private TMPDIR. Native ownership opens it read-only, creates
+		// it once and sets mode 0644; it never writes data or unlinks the inode.
+		// Keep both fixed macOS aliases literal. Resolving this file's symlinks
+		// here would let an existing link widen the granted path.
+		profile += `(allow file-write-create file-write-mode
+  (literal "/private/tmp/metis-cu-input-v1.lock")
+  (literal "/tmp/metis-cu-input-v1.lock"))` + "\n"
+	}
 	originalArgv := append([]string(nil), cmd.Args...)
 	if len(originalArgv) == 0 {
 		originalArgv = []string{cmd.Path}
@@ -55,6 +70,17 @@ func buildDarwinProfile(cwd, tempDir, home, metisHome string, network NetworkPol
 		pattern = strings.ReplaceAll(pattern, `"`, `\"`)
 		return `#"` + pattern + `"`
 	}
+	writableSubpath := func(root string) string {
+		grantsDir := filepath.Join(home, ".metis-cu")
+		if home != "" && (pathWithinRoot(root, grantsDir) || pathWithinRoot(grantsDir, root)) {
+			// App approvals are not ordinary workspace state. Exclude the whole
+			// subtree from broad grants, even when cwd is HOME: only the managed
+			// profile may add back directory creation and the two exact files.
+			// Other directory writes (rename, unlink, mode, metadata) stay denied.
+			return fmt.Sprintf(`(allow file-write* (require-all (subpath %s) (require-not (subpath %s))))`, quote(root), quote(grantsDir))
+		}
+		return fmt.Sprintf(`(allow file-write* (subpath %s))`, quote(root))
+	}
 
 	rules := []string{
 		`(version 1)`,
@@ -66,8 +92,8 @@ func buildDarwinProfile(cwd, tempDir, home, metisHome string, network NetworkPol
 		`(allow sysctl-read)`,
 		`(allow iokit-open)`,
 		`(allow file-read*)`,
-		fmt.Sprintf(`(allow file-write* (subpath %s))`, quote(cwd)),
-		fmt.Sprintf(`(allow file-write* (subpath %s))`, quote(tempDir)),
+		writableSubpath(cwd),
+		writableSubpath(tempDir),
 		`(allow file-write* (literal "/dev/null"))`,
 		`(allow file-write* (literal "/dev/stdout"))`,
 		`(allow file-write* (literal "/dev/stderr"))`,

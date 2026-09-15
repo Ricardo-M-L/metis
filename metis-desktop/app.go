@@ -312,7 +312,8 @@ func (a *App) startWebUIAttempt(binary string) (string, error) {
 	logs := &processLogBuffer{}
 	cmd := exec.Command(binary, "desktop", "--web", "--port", strconv.Itoa(port))
 	cmd.Dir = a.workDir
-	cmd.Env = append(os.Environ(), "METIS_DESKTOP_FRAME_TOKEN="+frameToken)
+	hostExecutable, _ := os.Executable()
+	cmd.Env = append(computerUseBundleEnvironment(os.Environ(), hostExecutable), "METIS_DESKTOP_FRAME_TOKEN="+frameToken)
 	cmd.Stdout = logs
 	cmd.Stderr = logs
 	if err := cmd.Start(); err != nil {

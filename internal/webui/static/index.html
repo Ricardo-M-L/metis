@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="vendor/katex/katex.min.css?v=__BUILD__">
 <link rel="stylesheet" href="style.css?v=__BUILD__">
 <link rel="stylesheet" href="artifacts.css?v=__BUILD__">
+<link rel="stylesheet" href="session_files.css?v=__BUILD__">
 </head>
 <body>
 <div class="app details-closed">
@@ -79,6 +80,7 @@
       <button class="view-tab artifact-tab" id="tabArtifacts" type="button" aria-controls="artifactsPanel" onclick="openArtifactsPanel()">
         <span>Artifacts</span><span class="artifact-tab-count" id="artifactTabCount" hidden>0</span>
       </button>
+      <button class="view-tab" type="button" aria-controls="sessionFilePanel" onclick="openSessionFiles()">文件 <span id="sessionFileCount">0</span></button>
     </div>
 
     <div class="chat-area" id="chatArea">
@@ -203,6 +205,36 @@
     <div class="session-statsbar" id="sessionStatsbar" style="display:none"></div>
   </main>
 
+  <aside id="sessionFilePanel" class="session-file-panel" hidden aria-label="会话文件预览" onkeydown="sessionFilePanelKeydown(event)">
+    <div id="sessionFileResize" class="sf-resize" role="separator" tabindex="0" aria-label="调整文件预览宽度" aria-orientation="vertical" aria-valuemin="340" aria-valuenow="600" aria-valuemax="1200" onpointerdown="startSessionFileResize(event)" onkeydown="sessionFileResizeKeydown(event)"></div>
+    <header class="session-file-header">
+      <span id="sessionFileTitle" class="sf-sr-only">会话文件</span>
+      <div id="sessionFileTabs" class="sf-tabs" role="tablist" aria-label="已打开文件"></div>
+      <button id="sessionFileAdd" class="sf-icon-button" type="button" title="打开会话文件" aria-label="打开会话文件" aria-expanded="false" aria-controls="sessionFilePicker" onclick="toggleSessionFilePicker()"><span class="sf-icon sf-icon-plus" aria-hidden="true"></span></button>
+      <div class="sf-header-spacer"></div>
+      <button id="sessionFileMaximize" class="sf-icon-button" type="button" title="最大化文件预览" aria-label="最大化文件预览" aria-pressed="false" onclick="toggleSessionFileMaximize()"><span class="sf-icon sf-icon-maximize-2" aria-hidden="true"></span></button>
+      <button id="sessionFileClose" class="sf-icon-button" type="button" title="收起文件预览" aria-label="收起文件预览" onclick="closeSessionFile()"><span class="sf-icon sf-icon-panel-right-close" aria-hidden="true"></span></button>
+    </header>
+    <div class="sf-toolbar">
+      <div id="sessionFilePath" class="session-file-path"></div>
+      <div class="sf-toolbar-actions">
+        <span id="sessionFileLanguage" class="sf-language"></span>
+        <button id="sessionFileMode" class="sf-text-button" type="button" hidden onclick="toggleSessionFileMode()">源码</button>
+        <button id="sessionFileWrap" class="sf-icon-button" type="button" hidden title="自动换行" aria-label="自动换行" aria-pressed="false" onclick="toggleSessionFileWrap()"><span class="sf-icon sf-icon-wrap-text" aria-hidden="true"></span></button>
+        <button id="sessionFileRefresh" class="sf-icon-button" type="button" disabled title="重新读取文件" aria-label="重新读取文件" onclick="refreshSessionFile()"><span class="sf-icon sf-icon-refresh-cw" aria-hidden="true"></span></button>
+        <button id="sessionFileCopy" class="sf-icon-button" type="button" disabled title="复制文件内容" aria-label="复制文件内容" onclick="copySessionFileContent()"><span class="sf-icon sf-icon-copy" aria-hidden="true"></span></button>
+      </div>
+    </div>
+    <div id="sessionFileCodeHeader" class="sf-code-header" hidden><span id="sessionFileCodeLanguage"></span><span class="sf-readonly">只读</span></div>
+    <div id="sessionFilePicker" class="sf-picker" hidden>
+      <label class="sf-picker-search"><span class="sf-icon sf-icon-search" aria-hidden="true"></span><input id="sessionFileSearch" type="search" placeholder="搜索会话文件…" aria-label="搜索会话文件" oninput="renderSessionFileList()"></label>
+      <div id="sessionFileList" class="session-file-list"></div>
+      <p id="sessionFileListStatus" class="sf-list-status" role="status"></p>
+    </div>
+    <div id="sessionFileContent" class="session-file-content" role="tabpanel" aria-label="文件内容" tabindex="0"></div>
+    <div id="sessionFileActionStatus" class="sf-action-status" role="status"></div>
+  </aside>
+
   <!-- Details column (DSH parity): structured inspection of the selected
        tool row in the chat flow. -->
   <div class="details-col" id="detailsCol">
@@ -294,6 +326,10 @@
         <span class="settings-item-icon">&#129513;</span>
         <span data-i18n="plugins">Plugins</span>
       </button>
+      <button type="button" class="settings-item" id="settingsComputerUseBtn" onclick="showSettingsTab('computer-use', this)">
+        <span class="settings-item-icon" aria-hidden="true">&#128421;</span>
+        <span data-i18n="computerUse">电脑操作</span>
+      </button>
       <button type="button" class="settings-item" id="settingsRoutingBtn" onclick="showSettingsTab('routing', this)">
         <span class="settings-item-icon">&#8644;</span>
         <span data-i18n="smartRouting">Smart Routing</span>
@@ -312,6 +348,9 @@
 <script src="sessions.js?v=__BUILD__"></script>
 <script src="chat.js?v=__BUILD__"></script>
 <script src="artifacts.js?v=__BUILD__"></script>
+<script src="vendor/prism/prism.min.js?v=__BUILD__"></script>
+<script src="session_file_render.js?v=__BUILD__"></script>
+<script src="session_files.js?v=__BUILD__"></script>
 <script src="trace.js?v=__BUILD__"></script>
 </body>
 </html>

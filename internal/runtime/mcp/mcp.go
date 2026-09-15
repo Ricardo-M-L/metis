@@ -164,11 +164,12 @@ func resolveAuthHeaders(ctx context.Context, e ServerEntry) (map[string]string, 
 // LaunchServer auto-detects from whichever pair is populated, so
 // existing stdio-only registries continue to load unchanged.
 type ServerEntry struct {
-	Name    string            `toml:"name"`
-	Command string            `toml:"command,omitempty"`
-	Args    []string          `toml:"args,omitempty"`
-	URL     string            `toml:"url,omitempty"`     // HTTP endpoint
-	Headers map[string]string `toml:"headers,omitempty"` // optional HTTP auth
+	managedComputerUse bool              // runtime-only provenance; never decoded from TOML
+	Name               string            `toml:"name"`
+	Command            string            `toml:"command,omitempty"`
+	Args               []string          `toml:"args,omitempty"`
+	URL                string            `toml:"url,omitempty"`     // HTTP endpoint
+	Headers            map[string]string `toml:"headers,omitempty"` // optional HTTP auth
 	// Auth selects an authentication strategy for an HTTP server. "oauth"
 	// runs the OAuth 2.0 (PKCE) flow against the server's discovered
 	// endpoints and attaches the resulting Bearer token; the token is
@@ -480,6 +481,10 @@ func LaunchServerWithSandbox(ctx context.Context, reg *Registry, name string, re
 	if err != nil {
 		return nil, err
 	}
+	expanded, err = prepareManagedComputerUseEntry(ctx, expanded)
+	if err != nil {
+		return nil, err
+	}
 	// Windows-on-npx footgun: spawning `npx some-mcp` directly fails
 	// on Windows with "exec: \"npx\": file does not exist" because npx
 	// is a .cmd batch wrapper, not an executable. Surfacing this here
@@ -524,6 +529,9 @@ func LaunchServerWithSandbox(ctx context.Context, reg *Registry, name string, re
 		return nil, err
 	}
 	// Per-server tool allow/deny lists (Codex parity). Without this,
+	if expanded.managedComputerUse {
+		srv.MarkManagedComputerUse()
+	}
 	// metis-cu's 24-tool surface lands in EVERY prompt even when the
 	// user only wanted screenshot+click — wasting ~3 KB of tokens
 	// turn after turn.
@@ -534,6 +542,9 @@ func LaunchServerWithSandbox(ctx context.Context, reg *Registry, name string, re
 }
 
 func stdioLaunchEnvAndProfile(entry ServerEntry) ([]string, mcpsdk.StdioSandboxProfile) {
+	if entry.managedComputerUse {
+		return envSliceFromMap(entry.Env), mcpsdk.StdioSandboxProfileManagedComputerUse
+	}
 	env, computerUse := maybeInjectCUEnv(entry.Name, entry.Command, entry.Env)
 	profile := mcpsdk.StdioSandboxProfileGeneric
 	if computerUse {
@@ -690,6 +701,11 @@ func launchOneMCPLazy(ctx context.Context, entry ServerEntry, registry *tools.Re
 }
 
 func launchOneMCPLazyWithSandbox(ctx context.Context, entry ServerEntry, registry *tools.Registry, mode LazyMode, manager *sandbox.Manager) (*mcptools.Server, error) {
+	// A helper upgrade changes its actual executable and schema. Validate and
+	// handshake managed components instead of publishing a stale generic cache.
+	if entry.Command == ManagedComputerUseCommand {
+		return LaunchServerWithSandbox(ctx, &Registry{Servers: []ServerEntry{entry}}, entry.Name, registry, manager)
+	}
 	if err := validateServerName(entry.Name); err != nil {
 		return nil, err
 	}

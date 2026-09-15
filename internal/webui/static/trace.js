@@ -25,6 +25,7 @@ const TRACE_REDACTED_THINKING_PLACEHOLDER = 'Reasoning redacted by provider';
 // DSH kind palette: tag label, tag color class, timeline lane.
 const KIND_META = {
   user:               { label: 'USER',       cls: 'k-user',      lane: 0 },
+  context:            { label: 'CONTEXT',    cls: 'k-context',   lane: 0 },
   thinking:           { label: 'THINK',      cls: 'k-thinking',  lane: 1 },
   thinking_redacted:  { label: 'THINK',      cls: 'k-thinking',  lane: 1 },
   text:               { label: 'ASSISTANT',  cls: 'k-assistant', lane: 1 },
@@ -289,6 +290,7 @@ function buildTraceRows(events) {
       turn: ev.turn || 0,
       seq: ev.sequence,
       ts: ev.ts,
+      source: ev.source || '',
       elapsedMs: ev.elapsedMs || 0,
       isError: !!ev.isError,
       depth: ev.depth || 0,
@@ -455,7 +457,7 @@ function spanKindOf(r) {
   if (r.isError) return 'model';
   const m = metaOf(r.kind);
   if (r.kind === 'user') return 'user';
-  if (r.kind === 'context_warn' || r.kind === 'context_compacted') return 'context';
+  if (r.kind === 'context' || r.kind === 'context_warn' || r.kind === 'context_compacted') return 'context';
   if (m.lane === 2) return 'tool';
   return 'model';
 }
@@ -696,7 +698,7 @@ function renderTraceInspector() {
   const meta = metaOf(r.kind);
   const tabs = inspectorTabsFor(r);
   if (!tabs.some(t => t[0] === traceTab)) traceTab = tabs[0][0];
-  const location = `Turn ${r.turn}${r.toolName ? ' \u00B7 ' + r.toolName : ''}`;
+  const location = `Turn ${r.turn}${r.source ? ' \u00B7 ' + r.source : ''}${r.toolName ? ' \u00B7 ' + r.toolName : ''}`;
   const title = isToolRow(r)
     ? `<span class="tt-kind ${meta.cls}"><span class="k-label">${r.toolName ? 'TOOL' : meta.label}</span></span>`
     : `<span class="tt-kind ${meta.cls}"><span class="k-label">${meta.label}</span></span>`;
@@ -753,6 +755,8 @@ function inspectorBody(r, tab) {
     let html = `<dl class="tt-overview">`;
     html += kvRow('Status', `<span class="${state === 'error' ? 'err' : ''}">${statusLabel(state)}</span>`);
     html += kvRow('Turn', String(r.turn));
+    if (r.source) html += kvRow('Source', escHtml(r.source));
+    if (r.source && r.source.startsWith('history-reconstructed')) html += kvRow('Record', 'Recovered from saved history; original timestamp unavailable');
     html += kvRow('Started', fmtTimestamp(r.ts));
     html += kvRow('Duration', r.elapsedMs ? fmtMs(r.elapsedMs) : '\u2014');
     html += kvRow('Sequence', '#' + r.seq);

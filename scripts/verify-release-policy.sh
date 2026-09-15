@@ -18,6 +18,8 @@ cli_workflow=$repo_root/.github/workflows/release-cli-publish.yml
 cli_registry=$repo_root/.github/cli-only-releases.json
 release_contract=$repo_root/scripts/release_contract.py
 package_script=$repo_root/scripts/package-macos-signed.sh
+computer_use_builder=$repo_root/scripts/build-computer-use-release.py
+computer_use_validator=$repo_root/scripts/validate-computer-use-helper.py
 
 provider_token_pattern='[0-9a-fA-F]{32}\.[A-Za-z0-9_-]{16,}'
 provider_token_exclude=':(exclude)scripts/verify-release-policy.sh'
@@ -51,6 +53,8 @@ esac
 [ -f "$release_contract" ] || fail "missing release contract verifier"
 [ -f "$package_script" ] || fail "missing package-macos-signed.sh"
 [ -x "$package_script" ] || fail "package-macos-signed.sh is not executable"
+[ -f "$computer_use_builder" ] || fail "missing Computer Use release builder"
+[ -f "$computer_use_validator" ] || fail "missing Computer Use protocol validator"
 
 grep -Fq 'credentials_rel=.private/apple/teamid.txt' "$package_script" || \
 	fail "macOS packaging does not use the private signing sentinel"
@@ -106,7 +110,12 @@ if grep -Fq 'Notarization skipped' "$package_script"; then
 fi
 
 grep -q 'Stage immutable release draft' "$stage_workflow" || fail "tag workflow does not stage a draft"
-grep -q 'expected=16' "$stage_workflow" || fail "draft inventory is not the 16 non-macOS assets"
+grep -q 'prepare-computer-use:' "$stage_workflow" || fail "tag workflow does not build the pinned Computer Use helper"
+grep -q 'build-computer-use-release.py' "$stage_workflow" || fail "tag workflow does not generate the Computer Use catalog"
+grep -q 'validate-computer-use-helper.py' "$stage_workflow" || fail "tag workflow does not validate the managed Computer Use protocol"
+grep -q 'metis-computer-use-' "$stage_workflow" || fail "tag workflow does not transfer the Computer Use artifact"
+grep -q 'metis-cu-darwin-arm64.tar.gz' "$stage_workflow" || fail "tag workflow does not stage the arm64 Computer Use asset"
+grep -q 'expected=20' "$stage_workflow" || fail "draft inventory is not the 20 non-macOS assets"
 grep -q 'metis-desktop-linux-amd64-' "$stage_workflow" || fail "Linux Desktop asset is not staged"
 grep -q 'metis-desktop-windows-amd64-' "$stage_workflow" || fail "Windows Desktop asset is not staged"
 grep -Fq '[System.IO.File]::WriteAllText' "$stage_workflow" || \
@@ -121,7 +130,7 @@ fi
 
 grep -q 'types: \[published\]' "$verify_workflow" || fail "published-release verification trigger is missing"
 grep -q 'workflow_dispatch:' "$verify_workflow" || fail "published-release manual recheck trigger is missing"
-grep -q 'exactly the 20 immutable assets' "$verify_workflow" || fail "published inventory guard is missing"
+grep -q 'exactly the 24 immutable assets' "$verify_workflow" || fail "published inventory guard is missing"
 grep -Fq "sed 's/\\r\$//'" "$verify_workflow" || fail "checksum verification is not CRLF-safe"
 grep -q 'Authority=Developer ID Application:' "$verify_workflow" || fail "Developer ID verification is missing"
 grep -q 'xcrun stapler validate' "$verify_workflow" || fail "staple verification is missing"
@@ -171,5 +180,7 @@ python3 "$release_contract" plan --tag v0.0.0 --registry "$cli_registry" >/dev/n
 	fail "invalid trusted CLI-only registry"
 python3 -B -m unittest discover -s "$script_dir" -p 'test_release_contract.py' || \
 	fail "release contract regression tests failed"
+python3 -B -m unittest discover -s "$script_dir" -p 'test_validate_computer_use_helper.py' || \
+	fail "Computer Use protocol validator regression tests failed"
 
 printf '%s\n' 'verify-release-policy: immutable full-stable/CLI-only draft and published-release gates verified'

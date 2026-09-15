@@ -146,12 +146,16 @@ func (r *runtime) beginExplicitMCPLaunch(parent context.Context) *explicitMCPLau
 // epoch mismatch means a safer permission mode already cancelled that launch;
 // consume and close the late result so callers never fallback-publish it.
 func (r *runtime) adoptMCPServerAtEpoch(server *mcptools.Server, discovered []tools.Tool, explicit bool, epoch uint64) bool {
+	return r.adoptMCPServerAtGeneration(server, discovered, explicit, epoch, nil)
+}
+
+func (r *runtime) adoptMCPServerAtGeneration(server *mcptools.Server, discovered []tools.Tool, explicit bool, epoch uint64, cuGeneration *uint64) bool {
 	if r == nil || server == nil {
 		return false
 	}
 	name := server.Name()
 	r.mcpServersMu.Lock()
-	if r.mcpClosing || epoch != r.mcpLaunchEpoch {
+	if r.mcpClosing || epoch != r.mcpLaunchEpoch || (name == mcp.ReservedComputerUseName && (r.computerUseStopped || (cuGeneration != nil && *cuGeneration != r.computerUseGeneration))) {
 		r.mcpServersMu.Unlock()
 		_ = server.Close()
 		// true means the ownership callback consumed the server. Returning

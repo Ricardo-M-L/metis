@@ -930,57 +930,53 @@ publishing service.
 
 Companion binary [`metis-cu`](https://github.com/Ricardo-M-L/metis-cu)
 exposes desktop-control tools (screenshot / mouse / keyboard /
-clipboard / window) over the standard MCP stdio transport. The tool
-names and parameter shapes mirror Anthropic's `mcp__computer-use__*`
-namespace exactly, so prompts and traces written for Claude Code's
-built-in computer-use server work without translation.
+clipboard / window) over MCP stdio. METIS manages its installation,
+compatibility, lifecycle, and built-in `computer-use` skill. Always use the
+connected tools' actual schemas; other products' tools are not drop-in APIs.
 
-Install + register:
+Inspect and enable:
 
 ```sh
-# Install the binary (Go 1.24+, cgo required for the host platform)
-git clone https://github.com/Ricardo-M-L/metis-cu && cd metis-cu
-make install                # writes ~/go/bin/metis-cu + ~/.local/bin/metis-cu
-
-# Register with metis (one liner — writes ~/.metis/mcp.toml + hot-loads)
-metis chat
-> /cu enable
-cu: enabled — computer-use; binary=/Users/.../go/bin/metis-cu
+metis cu status --json
+metis cu enable             # prepares startup in subsequent sessions
+# In an existing CLI session:
+/cu enable                  # installs if needed and connects now
+/cu stop                    # disconnects now, preserves startup preference
+/cu disable                 # disconnects now and disables future startup
 ```
 
-Then in chat the tools appear as `mcp__computer-use__screenshot`,
-`mcp__computer-use__left_click`, etc. — fully discoverable to the LLM.
+Desktop provides the same live controls under **Settings → Computer Use**,
+including separate installation, connection, and native permission states.
+`metis cu status` never captures the screen or starts the MCP server.
 
-Slash commands:
+**Distribution status:** the pinned official release catalog is not populated
+yet. Until verified release artifacts are published and pinned, automatic
+installation reports an unavailable release instead of downloading an
+unverified binary. Developers can explicitly select a locally built helper:
 
-| Command | Effect |
-|---|---|
-| `/cu enable` | Add `metis-cu` to `mcp.toml`, hot-load tools into the live session |
-| `/cu disable` | Remove the entry; tools persist this session, gone after restart |
-| `/cu status` | Report whether enabled, where the binary lives |
+```sh
+metis cu install --from /absolute/path/to/metis-cu
+```
 
-### Tier-based safety gate
+Local builds are labeled experimental. The manager verifies protocol and
+lifecycle capabilities, not the provenance of user-selected code. Existing
+custom MCP entries are not silently replaced. See
+[setup, lifecycle, and validation](docs/computer-use.md).
 
-`metis-cu` classifies the frontmost app into one of three tiers and
-refuses input the LLM shouldn't be sending:
+### Permissions and limits
 
-| Tier | Allowed | Apps (defaults) |
-|---|---|---|
-| `read` | screenshot, read_clipboard | browsers (Chrome / Safari / Firefox / Edge / Brave) |
-| `click` | + left_click, mouse_move, scroll | terminals + IDEs (iTerm2 / VS Code / Cursor / GoLand / IntelliJ) |
-| `full` | + key, type, write_clipboard, … | everything else |
+Installation does not grant macOS Accessibility or Screen Recording access.
+The permission buttons open System Settings; the user grants access there.
+Application-level access checks remain separate. Existing app grants may persist
+in `~/.metis-cu/granted.json`; stopping the helper does not revoke those grants.
+Managed launches do not implicitly grant terminal full access.
 
-Override via the in-tool `request_access` call — approvals persist to
-`~/.metis-cu/granted.json` so the same approval survives MCP server
-restarts.
-
-### Platforms
-
-`metis-cu` ships full implementations for **macOS** (CGEvent +
-osascript), **Linux X11/XWayland** (XTEST + xdotool), and **Windows**
-(SendInput + user32 GetForegroundWindow). All three are tested by the
-metis-cu repo's CI matrix; native Wayland (no XWayland) is the only
-known gap.
+The helper serializes input and owns a machine-wide lease: only one helper can
+run at a time. Stop cancels queued work and waits for a cleanup acknowledgement
+before disconnecting. If the deadline expires, the host closes the process and
+reports unconfirmed cleanup. Native OS calls cannot always be interrupted.
+This integration's native build validation currently targets macOS arm64;
+other-platform source support is not a claim of completed native testing.
 
 ## ACP server (Zed / IDE integration)
 

@@ -26,6 +26,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
 // QueuePriority enumerates the three priorities. Smaller value =
@@ -66,25 +68,32 @@ func (p QueuePriority) effective() QueuePriority {
 	return p
 }
 
-// queuedItem is one queued mid-turn input. Text holds the raw user
-// input verbatim (already trimmed by submit handler). Priority steers
+// queuedItem is one queued mid-turn input. Text holds the submitted prompt
+// verbatim (already trimmed by submit handler). Human identifies manual input;
+// scheduled work carries the same provider text without a USER trace. Priority steers
 // dequeue order; QueuedAt is a monotonic seq from Model.queueClock,
 // used as a deterministic tiebreaker within a priority bucket.
 type queuedItem struct {
 	Text     string
 	Priority QueuePriority
 	QueuedAt uint64
+	Human    bool // scheduled prompts must not become USER trace anchors
 }
 
-// enqueueQueuedItem appends one item to the model's queue, stamping
-// QueuedAt from the monotonic clock. Centralised here so the clock
-// can't be skipped by a caller that forgets to increment.
+// enqueueQueuedItem appends human input to the model's queue. Automatic
+// callers must use enqueueQueuedItemWithOrigin with human=false. Both paths
+// stamp QueuedAt from the same monotonic clock.
 func (m *Model) enqueueQueuedItem(text string, prio QueuePriority) {
+	m.enqueueQueuedItemWithOrigin(text, prio, true)
+}
+
+func (m *Model) enqueueQueuedItemWithOrigin(text string, prio QueuePriority, human bool) {
 	m.queueClock++
 	m.queuedPrompts = append(m.queuedPrompts, queuedItem{
 		Text:     text,
 		Priority: prio,
 		QueuedAt: m.queueClock,
+		Human:    human,
 	})
 }
 
@@ -112,6 +121,10 @@ func (m *Model) enqueueQueuedItem(text string, prio QueuePriority) {
 //
 // Mutates m.queuedPrompts — caller doesn't need to slice.
 func (m *Model) drainNextQueuedBatch() (string, int) {
+	// Keep the provider batch unchanged while retaining its explicitly human
+	// subset for tracing. An empty non-nil slice identifies an automatic batch.
+	m.queuePendingInput = make([]llm.ContentBlock, 0)
+	m.queuePendingContext = nil
 	if len(m.queuedPrompts) == 0 {
 		return "", 0
 	}
@@ -138,6 +151,11 @@ func (m *Model) drainNextQueuedBatch() (string, int) {
 		if isSlashItem(it.Text) {
 			// Drop just this one item, leave the rest in queue.
 			text := it.Text
+			if it.Human {
+				m.queuePendingInput = append(m.queuePendingInput, llm.ContentBlock{Type: "text", Text: it.Text})
+			} else {
+				m.queuePendingContext = append(m.queuePendingContext, it.Text)
+			}
 			m.queuedPrompts = append(m.queuedPrompts[:i], m.queuedPrompts[i+1:]...)
 			return text, 1
 		}
@@ -156,6 +174,11 @@ func (m *Model) drainNextQueuedBatch() (string, int) {
 		// user mixes) stays in the queue for next tick.
 		if it.Priority.effective() == best && !isSlashItem(it.Text) {
 			batch = append(batch, it.Text)
+			if it.Human {
+				m.queuePendingInput = append(m.queuePendingInput, llm.ContentBlock{Type: "text", Text: it.Text})
+			} else {
+				m.queuePendingContext = append(m.queuePendingContext, it.Text)
+			}
 		} else {
 			kept = append(kept, it)
 		}

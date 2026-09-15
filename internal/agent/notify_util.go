@@ -7,6 +7,7 @@ package agent
 // logic lives in exactly one place.
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -37,13 +38,17 @@ func drainChan[T any](ch <-chan T) []T {
 // goroutine while the TUI may concurrently call History() /
 // TokenEstimate() (both take l.mu), so the append must be guarded —
 // an unlocked append races the slice header against those readers.
-func (l *Loop) appendInjectedMessage(text string) {
+func (l *Loop) appendInjectedMessage(ctx context.Context, out chan<- Event, source, text string) {
 	l.mu.Lock()
 	l.Messages = append(l.Messages, llm.Message{
 		Role:    llm.RoleUser,
 		Content: []llm.ContentBlock{{Type: "text", Text: text}},
 	})
 	l.mu.Unlock()
+	// Emit after releasing the history lock: synchronous trace observers may
+	// inspect History. The provider retains the original text and Synthetic
+	// semantics; emit applies presentation redaction only to the event copy.
+	emit(ctx, out, Event{Kind: EventContextInjected, Source: source, ContextText: text})
 }
 
 // HumanizeDuration formats elapsed wall-clock time concisely:

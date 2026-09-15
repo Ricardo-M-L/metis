@@ -21,7 +21,7 @@ does not publish Desktop. This document keeps its original filename for links.
 - Publication explicitly sends `make_latest=false`. GitHub does not expose that
   field on release GET responses, so verification separately checks latest before
   and after publication. Never infer this setting from a release title/body.
-- Unregistered releases retain the **20-asset stable contract** and the existing
+- Unregistered releases retain the **24-asset stable contract** and the existing
   Developer ID, notarization, stapling, and Gatekeeper verification. CLI-only
   registration does not waive those requirements for full CLI+Desktop releases.
 - Only drafts may be rebuilt/replaced. Once public, CLI-only releases are

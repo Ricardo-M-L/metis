@@ -80,7 +80,7 @@ const DESKTOP_I18N = {
     chat: 'Chat', trajectory: 'Trajectory', welcome: 'From idea to done', preview: 'METIS Desktop', sessionLog: 'Session log',
     composerPlaceholder: 'Describe what you want to build', jumpLatest: 'Jump to latest', details: 'Details', detailsPlaceholder: 'Select a tool row to inspect details',
     backToApp: 'Back to app', searchSettings: 'Search settings…', personal: 'Personal', general: 'General', appearance: 'Appearance',
-    modelProviders: 'Model Providers', agentPresets: 'Agent Presets', plugins: 'Plugins', smartRouting: 'Smart Routing', configuration: 'Configuration'
+    modelProviders: 'Model Providers', agentPresets: 'Agent Presets', plugins: 'Plugins', computerUse: 'Computer Use', smartRouting: 'Smart Routing', configuration: 'Configuration'
   },
   'zh-CN': {
     newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置', checkUpdates: '检查更新',
@@ -89,7 +89,7 @@ const DESKTOP_I18N = {
     chat: '对话', trajectory: '轨迹', welcome: '从想法，到完成', preview: 'METIS Desktop', sessionLog: '会话日志',
     composerPlaceholder: '描述你想要构建的内容', jumpLatest: '回到最新', details: '详情', detailsPlaceholder: '点击消息流中的工具行查看详情',
     backToApp: '返回应用', searchSettings: '搜索设置…', personal: '个人', general: '通用', appearance: '外观',
-    modelProviders: '模型提供商', agentPresets: '代理预设', plugins: '插件', smartRouting: '智能路由', configuration: '配置'
+    modelProviders: '模型提供商', agentPresets: '代理预设', plugins: '插件', computerUse: '电脑操作', smartRouting: '智能路由', configuration: '配置'
   }
 };
 
@@ -573,4 +573,133 @@ function onWindowResize() {
   const app = document.querySelector('.app');
   if (!app) return;
   applyLayout();
+}
+
+// Computer Use settings only read status on entry. Installation, launch and
+// opening operating-system settings require a named button action.
+let computerUseStatus = null;
+let computerUseBusy = false;
+let computerUseError = '';
+let computerUsePendingAction = '';
+let computerUseOperationID = 0;
+
+function renderComputerUseTab() {
+  return `<h2>${uiText('Computer Use', '电脑操作')}</h2>
+    <section class="settings-section computer-use-settings">
+      <p class="settings-section-desc">${uiText('Let Metis use the screen, mouse and keyboard on this computer. Installation, a running connection and operating-system permissions are shown separately.', '让 Metis 使用这台电脑的屏幕、鼠标和键盘。下方分别显示安装状态、运行连接和操作系统权限。')}</p>
+      <div id="computerUsePanel" aria-live="polite">${computerUseMarkup()}</div>
+    </section>`;
+}
+
+function computerUsePermissionLabel(value) {
+  const labels = {
+    granted: uiText('Granted', '已授权'),
+    denied: uiText('Not granted', '未授权'),
+    notGranted: uiText('Not granted', '未授权'),
+    'not-granted': uiText('Not granted', '未授权'),
+    'not-determined': uiText('Not yet authorized', '尚未授权'),
+    unknown: uiText('Unknown', '未知'),
+    unsupported: uiText('Unsupported', '不支持'),
+    unavailable: uiText('Unavailable', '不可用'),
+    'not-required': uiText('Not required', '无需授权')
+  };
+  return labels[value] || value || uiText('Unknown — refresh after installing', '未知，请安装后刷新');
+}
+
+function computerUseMarkup() {
+  const status = computerUseStatus;
+  const description = status && status.description || {};
+  const permissions = description.permissions || {};
+  const disabled = computerUseBusy ? ' disabled' : '';
+  const canInterruptEnable = computerUsePendingAction === 'enable';
+  const canStop = canInterruptEnable || (!computerUseBusy && status && status.running);
+  const row = (label, value) => `<div class="settings-card-row"><span class="settings-card-label">${escHtml(label)}</span><span class="computer-use-value">${escHtml(value)}</span></div>`;
+  const source = status && status.source === 'local' ? uiText('Local build (experimental)', '本地构建（实验性）')
+    : status && status.source === 'official' ? uiText('Official component', '官方组件')
+    : uiText('Not installed', '未安装');
+  const installation = status ? (status.installed ? uiText('Installed', '已安装') : uiText('Not installed', '未安装')) : uiText('Unknown', '未知');
+  const state = status ? (status.enabled ? uiText('Enabled', '已启用') : uiText('Disabled', '已停用')) : uiText('Unknown', '未知');
+  const connection = status ? (status.running ? uiText('Running', '运行中') : uiText('Stopped', '已停止')) : uiText('Unknown', '未知');
+  const permissionRow = (label, key, action) => `<div class="settings-card-row"><div><div class="settings-card-label">${escHtml(label)}</div><div class="settings-card-desc">${escHtml(computerUsePermissionLabel(permissions[key]))}</div></div>${description.platform === 'darwin' ? `<button type="button" class="computer-use-button" onclick="computerUseAction('${action}')"${disabled}>${uiText('Open System Settings', '打开系统设置')}</button>` : ''}</div>`;
+  return `<div class="computer-use-status" role="status">${computerUseBusy ? uiText('Working…', '正在处理…') : ''}</div>
+    ${computerUseError ? `<p class="computer-use-error" role="alert">${escHtml(computerUseError)}</p>` : ''}
+    ${computerUseError && status ? `<p class="settings-section-desc">${uiText('Last known status. Refresh to check again.', '以下为上次获取的状态，请刷新确认。')}</p>` : ''}
+    <div class="settings-card">
+      ${row(uiText('Installation', '安装'), installation)}
+      ${row(uiText('Computer Use', '电脑操作'), state)}
+      ${row(uiText('Connection', '连接'), connection)}
+      ${row(uiText('Version', '版本'), status && status.version || '—')}
+      ${row(uiText('Source', '来源'), status ? source : '—')}
+    </div>
+    ${status && status.message ? `<p class="computer-use-note">${escHtml(status.message)}</p>` : ''}
+    <div class="computer-use-actions">
+      <button type="button" class="computer-use-button" onclick="loadComputerUse()"${disabled}>${uiText('Refresh', '刷新')}</button>
+      <button type="button" class="computer-use-button primary" onclick="computerUseAction('enable')"${disabled}${!status || status.running ? ' disabled' : ''}>${status && status.installed ? uiText('Enable', '启用') : uiText('Install & enable', '安装并启用')}</button>
+      <button type="button" class="computer-use-button" onclick="computerUseAction('stop')"${canStop ? '' : ' disabled'}>${uiText('Stop', '停止')}</button>
+      <button type="button" class="computer-use-button" onclick="computerUseAction('disable')"${disabled}${!status || !status.enabled ? ' disabled' : ''}>${uiText('Disable', '停用')}</button>
+    </div>
+    <h3 class="settings-section-title">${uiText('Operating-system permissions', '操作系统权限')}</h3>
+    <p class="settings-section-desc">${uiText('Installing or enabling Computer Use does not grant these permissions. Open System Settings, grant access yourself, then refresh. An installed component may still be unable to see or control your screen.', '安装或启用电脑操作不会授予这些权限。请打开系统设置，自行授权后刷新。组件已安装时，仍可能无法查看或控制屏幕。')}</p>
+    <div class="settings-card">
+      ${permissionRow(uiText('Accessibility', '辅助功能'), 'accessibility', 'permissions-accessibility')}
+      ${permissionRow(uiText('Screen Recording', '屏幕录制'), 'screenRecording', 'permissions-screen-recording')}
+    </div>
+    ${status && status.path ? `<details class="computer-use-location"><summary>${uiText('Component location', '组件位置')}</summary><code>${escHtml(status.path)}</code></details>` : ''}`;
+}
+
+function paintComputerUse() {
+  const panel = document.getElementById('computerUsePanel');
+  if (!panel) return;
+  panel.setAttribute('aria-busy', String(computerUseBusy));
+  panel.innerHTML = computerUseMarkup();
+}
+
+async function loadComputerUse() {
+  if (computerUseBusy) return;
+  const operationID = ++computerUseOperationID;
+  computerUseBusy = true;
+  computerUsePendingAction = 'status';
+  computerUseError = '';
+  paintComputerUse();
+  try {
+    const response = await fetch('/api/computer-use', {cache: 'no-store'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || uiText('Unable to read Computer Use status.', '无法读取电脑操作状态。'));
+    if (operationID === computerUseOperationID) computerUseStatus = data;
+  } catch (error) {
+    if (operationID === computerUseOperationID) computerUseError = error.message || String(error);
+  } finally {
+    if (operationID === computerUseOperationID) {
+      computerUseBusy = false;
+      computerUsePendingAction = '';
+      paintComputerUse();
+    }
+  }
+}
+
+async function computerUseAction(action) {
+  if (!['enable', 'stop', 'disable', 'permissions-accessibility', 'permissions-screen-recording'].includes(action)) return;
+  const interruptsEnable = action === 'stop' && computerUsePendingAction === 'enable';
+  if (computerUseBusy && !interruptsEnable) return;
+  // Stop cancels the runtime's installation/launch ticket. Its response owns
+  // the UI even if the earlier enable request resolves or rejects afterward.
+  const operationID = ++computerUseOperationID;
+  computerUseBusy = true;
+  computerUsePendingAction = action;
+  computerUseError = '';
+  paintComputerUse();
+  try {
+    const response = await fetch('/api/computer-use', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action})});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || uiText('Computer Use action failed.', '电脑操作请求失败。'));
+    if (operationID === computerUseOperationID) computerUseStatus = data;
+  } catch (error) {
+    if (operationID === computerUseOperationID) computerUseError = error.message || String(error);
+  } finally {
+    if (operationID === computerUseOperationID) {
+      computerUseBusy = false;
+      computerUsePendingAction = '';
+      paintComputerUse();
+    }
+  }
 }

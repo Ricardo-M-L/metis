@@ -74,6 +74,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		SetPermissionMode: func(mode permission.Mode) error {
 			return applyRuntimePermissionMode(rt, mode)
 		},
+		ComputerUse: rt.computerUseAction,
 		PreflightPermissionMode: func(mode permission.Mode, prePlan string) error {
 			return rtpkg.PreflightRestoredPermissionState(rt.sandbox, mode, prePlan)
 		},

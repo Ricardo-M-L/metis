@@ -267,6 +267,13 @@ func (m *Model) handleLocalThinkingDisplay(text string) bool {
 }
 
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
+	return m.handleSubmitWithUserInput(nil, nil)
+}
+
+// A queued batch may contain scheduled work alongside human input. Nil means
+// an ordinary editor submission; a non-nil slice carries only the human parts
+// of a queued batch (and is empty when the whole batch was automatic).
+func (m *Model) handleSubmitWithUserInput(userInputBlocks []llm.ContentBlock, cronInput []string) (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
 		return m, nil
@@ -276,6 +283,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// so `/expo` + Enter while a turn was closing was treated as literal
 	// model input and queued instead of invoking `/export`.
 	text = m.promotePaletteSelection(text)
+	// Keep the human invocation before command templates, directory hints and
+	// referenced-session context add provider-facing text below.
+	if userInputBlocks == nil {
+		userInputBlocks = []llm.ContentBlock{{Type: "text", Text: text}}
+	}
 	// Most prompts have identical provider-facing and transcript-facing text.
 	// /review is the exception: the model needs a long internal review frame,
 	// while the user should see only the command they submitted.
@@ -524,11 +536,13 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 						m.queuePromptAfterCancellation(raw, QueuePriorityNext)
 						return m, nil
 					}
-					if !m.loop.SteerInject(display) {
+					if !m.loop.SteerInjectWithAccepted(display, func() {
+						runtime.RecordUserInput(m.sessionID, userInputBlocks)
+					}) {
 						// LoopDone may be racing this Enter: the TUI still says
 						// turnActive for one render tick after the loop atomically
 						// closes steering. Preserve the input as a next-turn item.
-						m.enqueueQueuedItem(display, QueuePriorityNext)
+						m.enqueueQueuedItem(raw, QueuePriorityNext)
 						m.messages = append(m.messages, Message{
 							Role:      "info",
 							Content:   "(current turn was already closing — queued for the next turn)",
@@ -552,7 +566,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 					// while turnActive remains true for handlers such as /bg.
 					m.dispatchingMidTurnCommand = true
 					defer func() { m.dispatchingMidTurnCommand = false }()
-					return m.handleSubmit()
+					return m.handleSubmitWithUserInput(userInputBlocks, cronInput)
 				}
 			}
 		}
@@ -565,7 +579,9 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			m.queuePromptAfterCancellation(raw, QueuePriorityNext)
 			return m, nil
 		}
-		if !m.loop.SteerInject(raw) {
+		if !m.loop.SteerInjectWithAccepted(raw, func() {
+			runtime.RecordUserInput(m.sessionID, userInputBlocks)
+		}) {
 			m.enqueueQueuedItem(raw, QueuePriorityNext)
 			m.messages = append(m.messages, Message{
 				Role:      "info",
@@ -1216,7 +1232,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 				}
 				m.input.SetValue(lastUser)
 				m.messages = append(m.messages, Message{Role: "info", Content: "(retrying last response)", Timestamp: time.Now()})
-				return m.handleSubmit()
+				return m.handleSubmitWithUserInput(userInputBlocks, cronInput)
 			}
 		case slash.SignalLoop:
 			// /loop — autopilot scheduling not yet implemented in the
@@ -1370,6 +1386,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 			}
 		}
 		m.loop.AppendUserBlocks(blocks)
+		// Record the submitted attachments with the original human text. Text
+		// blocks here also contain generated hints and digests, so only carry
+		// attachment blocks into the human-input trace.
+		if len(userInputBlocks) > 0 {
+			for _, block := range blocks {
+				if block.Type == "image" || block.Type == "document" {
+					userInputBlocks = append(userInputBlocks, block)
+				}
+			}
+		}
 		for _, e := range errs {
 			m.messages = append(m.messages, Message{
 				Role: "warning", Content: "image: " + e, Timestamp: time.Now(),
@@ -1389,6 +1415,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		})
 	} else {
 		m.loop.AppendUser(llmTextRewritten)
+	}
+	runtime.RecordUserInput(m.sessionID, userInputBlocks)
+	for _, text := range cronInput {
+		runtime.RecordContextInput(m.sessionID, "cron", text)
 	}
 	// Persist through a durable history cursor. This records the initial
 	// prompt now, then persistTail at turn end records every assistant/tool

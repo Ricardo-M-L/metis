@@ -85,6 +85,13 @@ type Request struct {
 	// does not accept auto-allow, because prompt policy is runtime state rather
 	// than a per-process property.
 	MinimumMode Mode
+	// ComputerUseInputOwnership permits the verified Computer Use helper's
+	// fixed machine-wide input lease on macOS. Only trusted runtime assembly
+	// sets this capability; it accepts no configuration-supplied file path.
+	ComputerUseInputOwnership bool
+	// ComputerUseAppGrants permits only the verified helper's fixed per-user
+	// app-approval files on macOS; it cannot supply an alternate state path.
+	ComputerUseAppGrants bool
 }
 
 // Options configures a Manager.
@@ -539,6 +546,8 @@ func (m *Manager) Wrap(cmd *exec.Cmd, req Request) (*exec.Cmd, error) {
 		tempDir:                     tempDir,
 		managerOwnedCwd:             pathWithinRoot(tempDir, cwd),
 		credentialIsolationRequired: m.credentialIsolationRequired,
+		computerUseInputOwnership:   req.ComputerUseInputOwnership,
+		computerUseAppGrants:        req.ComputerUseAppGrants,
 		network:                     network,
 		home:                        home,
 		metisHome:                   metisHome,
@@ -747,6 +756,8 @@ type platformRequest struct {
 	// ordinary permissions sandbox. Linux may need a stricter cwd fallback
 	// when bubblewrap cannot mask a protected path that does not yet exist.
 	credentialIsolationRequired bool
+	computerUseInputOwnership   bool
+	computerUseAppGrants        bool
 	network                     NetworkPolicy
 	home                        string
 	metisHome                   string

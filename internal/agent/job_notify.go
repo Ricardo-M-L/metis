@@ -76,7 +76,7 @@ func (l *Loop) injectJobNotificationBatchWithOutputs(
 	if len(notifs) == 0 {
 		return
 	}
-	l.appendInjectedMessage(formatJobNotificationsWithOutputs(notifs, outputs))
+	l.appendInjectedMessage(ctx, out, "job", formatJobNotificationsWithOutputs(notifs, outputs))
 	// Surface to the TUI too so the user sees the same notification
 	// banner the model is reacting to (helps explain why the model
 	// suddenly says "I see job bg_xxx finished, ...").

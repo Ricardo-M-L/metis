@@ -147,8 +147,9 @@ func ExpandServerEntry(e ServerEntry) (ServerEntry, error) {
 	return expanded, nil
 }
 
-// maybeInjectCUEnv returns the environment and dedicated launch capability for
-// Metis's reserved Computer Use server. Both the reserved name and pinned bare
+// maybeInjectCUEnv returns legacy environment compatibility for Metis's
+// reserved Computer Use server, never managed-component provenance or input
+// ownership permission. Both the reserved name and pinned bare
 // command must match exactly: an ordinary MCP named by the user cannot gain
 // desktop access merely by naming its executable metis-cu, and an arbitrary
 // path whose basename is metis-cu is not trusted as the built-in binary.

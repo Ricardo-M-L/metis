@@ -34,7 +34,7 @@ func (l *Loop) injectPeerMessages(ctx context.Context, out chan<- Event) {
 	if len(msgs) == 0 {
 		return
 	}
-	l.appendInjectedMessage(formatPeerMessages(msgs))
+	l.appendInjectedMessage(ctx, out, "peer", formatPeerMessages(msgs))
 	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[peer messaging] %d message(s) delivered", len(msgs)),

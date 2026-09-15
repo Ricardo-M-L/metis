@@ -66,6 +66,10 @@ export function SendMessage(arg1, arg2, arg3) {
   return window['go']['main']['App']['SendMessage'](arg1, arg2, arg3);
 }
 
+export function SetNativeTheme(arg1) {
+  return window['go']['main']['App']['SetNativeTheme'](arg1);
+}
+
 export function StartWebUI() {
   return window['go']['main']['App']['StartWebUI']();
 }

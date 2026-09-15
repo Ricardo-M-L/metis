@@ -167,12 +167,16 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdSessions(args[1:])
 	case "artifact", "artifacts":
 		return cmdArtifacts(args[1:])
+	case "files":
+		return cmdSessionFiles(args[1:])
 	case "stats":
 		return cmdStats(ctx, args[1:])
 	case "skills":
 		return cmdSkills(args[1:])
 	case "desktop":
 		return cmdDesktop(ctx, args[1:])
+	case "cu":
+		return cmdComputerUse(ctx, args[1:])
 	case "acp":
 		return cmdACP(ctx, args[1:])
 	case "mcp-serve":
@@ -247,11 +251,11 @@ func dispatch(ctx context.Context, args []string) error {
 func findEarlySubcommand(args []string, lookahead int) (int, bool) {
 	verbs := map[string]bool{
 		"chat": true, "run": true, "config": true, "tools": true,
-		"models": true, "sessions": true, "artifact": true, "artifacts": true, "stats": true, "skills": true,
+		"models": true, "sessions": true, "artifact": true, "artifacts": true, "files": true, "stats": true, "skills": true,
 		"acp": true, "daemon": true, "ps": true, "logs": true,
 		"kill": true, "attach": true, "coordinator": true, "cron": true,
 		"auth": true, "login": true, "logout": true, "plugin": true, "plugins": true, "audit": true,
-		"desktop": true, "diag": true, "eval": true, "update": true, "version": true,
+		"desktop": true, "cu": true, "diag": true, "eval": true, "update": true, "version": true,
 		"dirs": true, "projects": true, "help": true,
 	}
 	if lookahead > len(args) {
@@ -371,11 +375,13 @@ Usage:
   metis sessions export <id>      Print a session's JSONL to stdout
 	  metis sessions import [--id ID] Read JSONL from stdin and create a new session
 	  metis artifacts <list|show|create|update|export|delete>  Manage durable local HTML artifacts
+	  metis files <list|show> --session ID  List or preview session-generated text files
   metis stats           Summarize local token and session usage
   metis skills list     List built-in skills library
   metis skills install <name>  Install a built-in skill
   metis skills curator <status|run|list-archived|restore|pin|unpin>  Manage agent-created skills
   metis desktop [--web] [--port PORT]  Launch native desktop (or legacy browser UI)
+  metis cu <status|install|enable|disable>  Manage Computer Use; OS authorization remains separate
   metis acp [--addr ADDR]  Run as Agent Client Protocol server (default: stdio)
   metis mcp-serve [--mode MODE]  Run as MCP server (stdio); register with: claude mcp add metis -- metis mcp-serve
   metis daemon [--poll DURATION] Run the file-queue daemon
@@ -421,9 +427,13 @@ Env:
 // --- runtime wiring shared between chat and run ---
 
 type runtime struct {
-	cfg      *config.Config
-	provider llm.Provider
-	registry *tools.Registry
+	computerUseMu         sync.Mutex // serialize config commits, never held for downloads
+	computerUseGeneration uint64     // guarded by mcpServersMu
+	computerUseStopped    bool       // fences late startup/enable publication
+	computerUseCancel     context.CancelFunc
+	cfg                   *config.Config
+	provider              llm.Provider
+	registry              *tools.Registry
 	// slashRegistry is installed by buildSlash. It is retained so a
 	// permission-boundary revocation can remove MCP prompt closures that point
 	// at clients just closed alongside the model-facing tool namespace.
@@ -725,6 +735,7 @@ func (r *runtime) releaseSessionWork() {
 	if r == nil {
 		return
 	}
+	r.endComputerUseTurn()
 	// MCP remains permission-listener-owned and is intentionally not touched by
 	// this helper. Cron and monitors stop before agent producers, matching the
 	// fullAccess revocation order.
@@ -1955,6 +1966,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		permissionMode:                gate.Mode(),
 	}
 	installRuntimePermissionListener(rt)
+	loop.OnRunFinished = rt.endComputerUseTurn
 
 	// Phase 2 MCP launch — kicked off only after `rt` is fully built so
 	// the goroutine can reach into rt.mcpServers / rt.mcpServersMu. Bare
@@ -2369,6 +2381,7 @@ func cmdChat(ctx context.Context, args []string) error {
 			Sandbox:                 rt.sandbox,
 			ProviderConfigLoader:    providerConfigLoader,
 			BeginMCPLaunch:          beginExplicitMCP,
+			ComputerUse:             rt.computerUseAction,
 			ReloadCatalog: func() (string, error) {
 				skillCount := 0
 				if rt.registry != nil {
@@ -2401,6 +2414,7 @@ func cmdChat(ctx context.Context, args []string) error {
 	repl.ConfigureProviderSwitch(rt.cfg, rt.providerName)
 	repl.ConfigureSandbox(rt.sandbox)
 	repl.BeginMCPLaunch = beginExplicitMCP
+	repl.ComputerUse = rt.computerUseAction
 	repl.DirAdd = rt.allowedDirs.Add
 	repl.DirRemove = rt.allowedDirs.Remove
 	repl.DirList = rt.allowedDirs.All
@@ -2547,6 +2561,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 		// The first producer checkpoint fsyncs this corresponding position.
 		checkpoint.MarkPrompt(llmPrompt, prompt)
 	}
+	rtpkg.RecordUserInput(rt.sessionID, []llm.ContentBlock{{Type: "text", Text: prompt}})
 	_ = rtpkg.AppendHistory(rtpkg.HistoryEntry{
 		SessionID: rt.sessionID, Input: prompt, Source: "run",
 	})
@@ -3530,6 +3545,7 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 		rt.loop.Reset()
 	}
 	rt.loop.AppendUser(job.Prompt)
+	rtpkg.RecordContextInput(rt.sessionID, "cron", job.Prompt)
 
 	// Silent-fire audit channel — opened once per fire when Silent is
 	// set. All event handling below mirrors a copy to this writer; the

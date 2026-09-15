@@ -1,148 +1,168 @@
 package tui
 
-// Unit tests for /cu (computer-use) slash command. We exercise the
-// pure-Go bits — mcp.toml round-trip + status reporting + PATH
-// lookup — without actually spawning metis-cu (the live-load branch
-// is gated on a non-nil REPL.Loop, so passing nil takes the
-// persistence-only path that's safe to run in CI).
-
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
-	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
+	"github.com/Ricardo-M-L/metis/internal/computeruse"
 )
 
-// withTempCuEnv routes ~/.metis at a t.TempDir() and stages a fake
-// metis-cu binary into a fresh PATH entry. Returns the binary's path
-// for assertions; cleanup is via t.Cleanup registered in t.Setenv.
-func withTempCuEnv(t *testing.T) string {
-	t.Helper()
+func TestCU_ManagedActions(t *testing.T) {
+	for _, test := range []struct{ args, action string }{
+		{"", "status"}, {" status ", "status"}, {"install", "install"},
+		{"enable", "enable"}, {"on", "enable"}, {"disable", "disable"},
+		{"off", "disable"}, {"stop", "stop"},
+		{"permissions-accessibility", "permissions-accessibility"},
+		{"permissions-screen-recording", "permissions-screen-recording"},
+	} {
+		t.Run(test.args, func(t *testing.T) {
+			calls := 0
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := &REPL{ctx: ctx, ComputerUse: func(gotCtx context.Context, action string) (computeruse.Status, error) {
+				calls++
+				if gotCtx != ctx || action != test.action {
+					t.Fatalf("callback got context=%v action=%q, want shared context and %q", gotCtx, action, test.action)
+				}
+				return computeruse.Status{Installed: true, Enabled: true, Running: true}, nil
+			}}
+			if got := cmdCU(r, test.args); got != "cu: installed; enabled; running" {
+				t.Fatalf("unexpected status: %q", got)
+			}
+			if calls != 1 {
+				t.Fatalf("callback calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestCU_NoManagerDoesNotAdoptUnmanagedBinaryOrChangeConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	binDir := filepath.Join(home, "bin")
+	configDir := filepath.Join(home, ".metis")
+	for _, dir := range []string{binDir, configDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := "metis-cu"
 	if runtime.GOOS == "windows" {
-		t.Setenv("USERPROFILE", home)
+		name += ".exe"
 	}
-
-	binDir := filepath.Join(home, "fakebin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("mkdir fakebin: %v", err)
+	// An unmanaged executable exists on PATH, but no command may launch or
+	// persist it. Its invalid body also prevents a real GUI process in tests.
+	if err := os.WriteFile(filepath.Join(binDir, name), []byte("unmanaged fixture"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	binName := cuBinaryName
-	if runtime.GOOS == "windows" {
-		binName += ".exe"
+	t.Setenv("PATH", binDir)
+	configPath := filepath.Join(configDir, "mcp.toml")
+	before := []byte("[[servers]]\nname = \"computer-use\"\ncommand = \"metis-cu\"\n")
+	if err := os.WriteFile(configPath, before, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	binPath := filepath.Join(binDir, binName)
-	// Tiny shell script body — never executed (we only LookPath it).
-	if err := os.WriteFile(binPath, []byte("#!/bin/sh\necho fake metis-cu\n"), 0o755); err != nil {
-		t.Fatalf("write fake bin: %v", err)
+	for _, repl := range []*REPL{nil, {}} {
+		for _, action := range []string{"", "status", "install", "enable", "disable", "stop", "permissions-accessibility", "permissions-screen-recording"} {
+			if got := cmdCU(repl, action); !strings.Contains(got, "unavailable") {
+				t.Errorf("%q without manager: %q", action, got)
+			}
+		}
 	}
-
-	// Prepend the fake-bin dir to PATH so exec.LookPath picks it up.
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	return binPath
-}
-
-// TestCU_StatusBeforeEnable — the bare /cu (no args) case before any
-// configuration. Should report "not enabled" + locate the binary.
-func TestCU_StatusBeforeEnable(t *testing.T) {
-	withTempCuEnv(t)
-	out := cmdCU(nil, "")
-	if !strings.Contains(out, "not enabled") {
-		t.Errorf("status before enable should say 'not enabled'; got: %q", out)
+	after, err := os.ReadFile(configPath)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("unmanaged config changed: %q, %v", after, err)
 	}
-	if !strings.Contains(out, "fakebin") {
-		t.Errorf("status should report the binary path under fakebin/; got: %q", out)
+	entries, err := os.ReadDir(configDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("unexpected configuration files: %v, %v", entries, err)
 	}
 }
 
-// TestCU_EnableThenStatus — /cu enable persists, /cu status reflects.
-func TestCU_EnableThenStatus(t *testing.T) {
-	withTempCuEnv(t)
-
-	// Enable. Pass nil REPL → persistence-only branch (no spawn).
-	out := cmdCU(nil, "enable")
-	if !strings.Contains(out, "enabled in mcp.toml") {
-		t.Errorf("enable should confirm mcp.toml write; got: %q", out)
-	}
-
-	// Verify mcp.toml on disk.
-	mcpPath := mcp.Path()
-	data, err := os.ReadFile(mcpPath)
-	if err != nil {
-		t.Fatalf("read mcp.toml: %v", err)
-	}
-	if !strings.Contains(string(data), `name = "computer-use"`) {
-		t.Errorf("mcp.toml missing computer-use entry; got:\n%s", data)
-	}
-	if !strings.Contains(string(data), `command = "metis-cu"`) {
-		t.Errorf("mcp.toml missing metis-cu command; got:\n%s", data)
-	}
-
-	// Status should now report "enabled".
-	out = cmdCU(nil, "status")
-	if !strings.Contains(out, "enabled") || strings.Contains(out, "not enabled") {
-		t.Errorf("status after enable should be 'enabled', not 'not enabled'; got: %q", out)
+func TestCU_RejectsExtraArgumentsWithoutCallback(t *testing.T) {
+	r := &REPL{ComputerUse: func(context.Context, string) (computeruse.Status, error) {
+		t.Fatal("invalid command reached manager")
+		return computeruse.Status{}, nil
+	}}
+	for _, args := range []string{"enable /tmp/metis-cu", "install --from /tmp/metis-cu", "status extra", "stop all", "explode", "help", "--help"} {
+		if got := cmdCU(r, args); !strings.Contains(got, cuUsage) {
+			t.Errorf("%q should show usage, got %q", args, got)
+		}
 	}
 }
 
-// TestCU_Disable — /cu disable removes the entry.
-func TestCU_Disable(t *testing.T) {
-	withTempCuEnv(t)
-	cmdCU(nil, "enable")
-
-	out := cmdCU(nil, "disable")
-	if !strings.Contains(out, "disabled") {
-		t.Errorf("disable should confirm; got: %q", out)
+func TestCU_CallbackErrorAndCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := &REPL{ctx: ctx, ComputerUse: func(got context.Context, _ string) (computeruse.Status, error) {
+		return computeruse.Status{Running: true}, got.Err()
+	}}
+	if got := cmdCU(r, "enable"); got != "cu: context canceled" {
+		t.Fatalf("cancellation was lost or success reported: %q", got)
 	}
-
-	// Disabling again should report not-enabled, not error.
-	out2 := cmdCU(nil, "disable")
-	if !strings.Contains(out2, "not enabled") {
-		t.Errorf("second disable should say 'not enabled'; got: %q", out2)
-	}
-}
-
-// TestCU_EnableNoBinary — /cu enable with no metis-cu in PATH should
-// surface a friendly install hint rather than silently writing the
-// mcp.toml (the user would otherwise spawn a broken subprocess at
-// next metis startup).
-func TestCU_EnableNoBinary(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	if runtime.GOOS == "windows" {
-		t.Setenv("USERPROFILE", t.TempDir())
-	}
-	t.Setenv("PATH", t.TempDir()) // PATH with no metis-cu
-
-	out := cmdCU(nil, "enable")
-	if !strings.Contains(out, "not in PATH") {
-		t.Errorf("enable without binary should mention 'not in PATH'; got: %q", out)
-	}
-	// Must NOT have written mcp.toml.
-	if _, err := os.Stat(mcp.Path()); err == nil {
-		t.Errorf("enable without binary must not write mcp.toml")
+	r = &REPL{ComputerUse: func(ctx context.Context, _ string) (computeruse.Status, error) {
+		if ctx == nil {
+			t.Fatal("callback received nil context")
+		}
+		return computeruse.Status{}, errors.New("component checksum mismatch")
+	}}
+	if got := cmdCU(r, "install"); got != "cu: component checksum mismatch" {
+		t.Fatalf("manager error not surfaced: %q", got)
 	}
 }
 
-// TestCU_UnknownSubcommand — gracefully reports usage instead of
-// silently no-op'ing.
-func TestCU_UnknownSubcommand(t *testing.T) {
-	withTempCuEnv(t)
-	out := cmdCU(nil, "explode")
-	if !strings.Contains(out, "unknown") {
-		t.Errorf("unknown subcommand should be flagged; got: %q", out)
+func TestCU_StatusDistinguishesReadinessAndPermissions(t *testing.T) {
+	status := computeruse.Status{
+		Installed: true, Enabled: true, Running: false,
+		Path: "/managed/metis-cu", Version: "1.2.3", Source: "local",
+		Message: "Screen Recording permission is required",
+		Description: &computeruse.Description{Permissions: map[string]string{
+			"screen_recording": "denied", "accessibility": "granted",
+		}},
+	}
+	got := formatComputerUseStatus(status)
+	for _, expected := range []string{"cu: installed; enabled; stopped", "version: 1.2.3", "source: local", "binary: /managed/metis-cu", "accessibility: granted", "screen_recording: denied", status.Message} {
+		if !strings.Contains(got, expected) {
+			t.Errorf("status missing %q: %q", expected, got)
+		}
+	}
+	if strings.Index(got, "accessibility:") > strings.Index(got, "screen_recording:") {
+		t.Fatalf("permission order is not deterministic: %q", got)
+	}
+	if got := formatComputerUseStatus(computeruse.Status{}); got != "cu: not installed; disabled; stopped" {
+		t.Fatalf("empty state: %q", got)
 	}
 }
 
-// TestCU_ReEnableIdempotent — enabling twice is a no-error replace.
-func TestCU_ReEnableIdempotent(t *testing.T) {
-	withTempCuEnv(t)
-	cmdCU(nil, "enable")
-	out := cmdCU(nil, "enable")
-	if !strings.Contains(out, "re-enabled") && !strings.Contains(out, "enabled") {
-		t.Errorf("re-enable should succeed (re-enabled or enabled); got: %q", out)
+func TestCU_TUIBridgeUsesSharedManager(t *testing.T) {
+	calls := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &Model{ctx: ctx, ext: ExternalHooks{ComputerUse: func(got context.Context, action string) (computeruse.Status, error) {
+		calls++
+		if got != ctx || action != "stop" {
+			t.Fatalf("bridge callback context/action mismatch: %v %q", got, action)
+		}
+		return computeruse.Status{Installed: true}, nil
+	}}}
+	if got := cmdCU(m.asREPL(), "stop"); got != "cu: installed; disabled; stopped" || calls != 1 {
+		t.Fatalf("bridge did not delegate: %q calls=%d", got, calls)
+	}
+}
+
+func TestCU_CommandCatalogShowsManagedActions(t *testing.T) {
+	command := BuildREPLCommands().Get("cu")
+	if command == nil || command.Handler == nil {
+		t.Fatal("Computer Use command is not registered")
+	}
+	for _, action := range []string{"status", "install", "enable", "disable", "stop", "permissions-accessibility", "permissions-screen-recording"} {
+		if !strings.Contains(command.Description, action) {
+			t.Errorf("Computer Use help missing %q: %q", action, command.Description)
+		}
 	}
 }

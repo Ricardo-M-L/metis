@@ -226,7 +226,7 @@ func BuildREPLCommands() *REPLCommandRegistry {
 
 	// === MCP ===
 	r.Register(REPLCommand{Name: "mcp", Description: "MCP ops: list | add | remove | start | login | enable | disable | edit | test | logs | reload", Handler: cmdMCP})
-	r.Register(REPLCommand{Name: "cu", Description: "computer-use (metis-cu) ops: enable | disable | status", Handler: cmdCU})
+	r.Register(REPLCommand{Name: "cu", Description: "Computer Use: status | install | enable | disable | stop | permissions-accessibility | permissions-screen-recording", ArgumentHint: "[action]", Category: "tools", Handler: cmdCU})
 
 	// === Session ===
 	r.Register(REPLCommand{Name: "session", Description: "show or control the local read-only sharing session", ArgumentHint: "[status|start|stop]", Category: "session", Handler: cmdSessionShare})

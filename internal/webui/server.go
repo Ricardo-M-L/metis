@@ -28,6 +28,7 @@ import (
 	transcriptpkg "github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/artifact"
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
+	"github.com/Ricardo-M-L/metis/internal/computeruse"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/desktop"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
@@ -121,6 +122,7 @@ type Server struct {
 	openWorkspace           func(path string) error
 	openPath                func(path string) error
 	clipboardFiles          func() ([]desktop.ClipboardFile, error)
+	computerUse             func(context.Context, string) (computeruse.Status, error)
 	plugins                 *rtpkg.PluginRegistry
 	pluginMarket            *pluginmarket.Manager
 	artifactStore           *artifact.Store
@@ -311,6 +313,9 @@ type RuntimeBindings struct {
 	OpenWorkspace func(path string) error
 	// OpenPath reveals a local directory in the platform file manager.
 	OpenPath func(path string) error
+	// ComputerUse delegates fixed management actions to the shared runtime.
+	// The browser never supplies executable paths or helper download URLs.
+	ComputerUse func(context.Context, string) (computeruse.Status, error)
 	// ShutdownToken and Shutdown are set only by the native Desktop shell.
 	// Browser mode intentionally leaves them empty so a normal WebUI process
 	// cannot be terminated through HTTP.
@@ -372,6 +377,7 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		shutdownToken:           binding.ShutdownToken,
 		shutdown:                binding.Shutdown,
 		clipboardFiles:          desktop.ClipboardFiles,
+		computerUse:             binding.ComputerUse,
 		plugins:                 binding.Plugins,
 		pluginMarket:            pluginmarket.NewManager(),
 		traceAdapter:            binding.TraceAdapter,
@@ -526,10 +532,13 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/sessions/activate", s.handleSessionActivate)
 	mux.HandleFunc("/api/sessions/", s.handleSession)
 	mux.HandleFunc("/api/artifacts", s.handleArtifacts)
+	mux.HandleFunc("/api/session-files", s.handleSessionFiles)
+	mux.HandleFunc("/api/session-files/content", s.handleSessionFileContent)
 	mux.HandleFunc("/api/artifacts/", s.handleArtifact)
 	mux.HandleFunc("/api/turns", s.handleTurn)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/computer-use", s.handleComputerUse)
 	mux.HandleFunc("/api/commands/session", s.handleSessionCommand)
 	mux.HandleFunc("/api/compact", s.handleCompact)
 	mux.HandleFunc("/api/goals", s.handleGoals)
@@ -1522,12 +1531,12 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	// Trajectory anchor: USER row + per-turn TTFT (first assistant text
 	// minus this timestamp). No-op when tracing is disabled.
-	rtpkg.RecordUserMessage(body.SessionID, input)
 	user := llm.Message{Role: llm.RoleUser}
 	if input != "" {
 		user.Content = append(user.Content, llm.ContentBlock{Type: "text", Text: input})
 	}
 	user.Content = append(user.Content, imgBlocks...)
+	rtpkg.RecordUserInput(body.SessionID, user.Content)
 	if len(imgBlocks) > 0 {
 		modelBlocks := make([]llm.ContentBlock, 0, len(user.Content))
 		if modelInput != "" {
@@ -2888,20 +2897,27 @@ func traceFromHistory(s *Server, sid string) []session.TracedNode {
 	var nodes []session.TracedNode
 	turn := 0
 	seq := int64(0)
-	ts := time.Now()
 	add := func(depth int, ev session.TraceEvent) {
 		seq++
 		ev.Sequence = seq
 		ev.Turn = turn
-		if ev.TS.IsZero() {
-			ev.TS = ts
+		if ev.Source == "" {
+			ev.Source = "history-reconstructed"
 		}
 		ev.SessionID = sid
 		nodes = append(nodes, session.TracedNode{Event: ev, Depth: depth})
 	}
 	for _, msg := range messages {
-		if msg.Role == llm.RoleUser {
+		if input := historyTraceUserInput(msg); input != "" {
 			turn++
+			add(0, session.TraceEvent{Kind: "user", Text: input})
+		}
+		if source, text := historyTraceContext(msg); text != "" {
+			kind := "context"
+			if source == "steer" {
+				kind = "user"
+			}
+			add(0, session.TraceEvent{Kind: kind, Text: text, Source: "history-reconstructed/" + source})
 		}
 		for _, block := range msg.Content {
 			switch block.Type {
@@ -2921,11 +2937,12 @@ func traceFromHistory(s *Server, sid string) []session.TracedNode {
 				if strings.TrimSpace(block.Text) == "" {
 					continue
 				}
-				kind := "text"
 				if msg.Role == llm.RoleUser {
-					kind = "user"
+					// Human/context input was emitted once above; tool results
+					// do not open a fresh human turn.
+					continue
 				}
-				add(0, session.TraceEvent{Kind: kind, Text: block.Text})
+				add(0, session.TraceEvent{Kind: "text", Text: block.Text})
 			case "tool_use":
 				input, _ := json.Marshal(block.ToolInput)
 				add(0, session.TraceEvent{
@@ -3291,11 +3308,12 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "no turn in progress")
 		return
 	}
-	if !s.loop.SteerInject(body.Input) {
+	if !s.loop.SteerInjectWithAccepted(body.Input, func() {
+		rtpkg.RecordUserMessage(body.SessionID, "[steer] "+body.Input)
+	}) {
 		writeError(w, http.StatusConflict, "turn no longer accepts steering")
 		return
 	}
-	rtpkg.RecordUserMessage(body.SessionID, "[steer] "+body.Input)
 	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "sessionId": body.SessionID})
 }
 
@@ -3792,6 +3810,7 @@ type traceEventView struct {
 	ToolUseID string `json:"toolUseID,omitempty"`
 	ParentID  string `json:"parentID,omitempty"`
 	Text      string `json:"text,omitempty"`
+	Source    string `json:"source,omitempty"`
 	IsError   bool   `json:"isError,omitempty"`
 	ElapsedMs int64  `json:"elapsedMs,omitempty"`
 	Depth     int    `json:"depth"`
@@ -4185,6 +4204,14 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 			turnMetrics = append(turnMetrics, byTurn[turn])
 		}
 	}
+	// Keep statistics tied to recorded timestamps. Display-only reconstructed
+	// inputs have no sending time and must never change duration or TTFT.
+	measuredNodes := nodes
+	if source == "live" && s.store != nil {
+		if _, messages, err := s.store.Load(sid); err == nil {
+			nodes = restoreMissingTraceUserInputs(sid, nodes, messages)
+		}
+	}
 	pageEnd := len(nodes)
 	if cursorEnd >= 0 {
 		if cursorEnd > len(nodes) {
@@ -4195,24 +4222,26 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 	}
 	pageStart := max(0, pageEnd-limit)
 	events := make([]traceEventView, 0, len(nodes))
-	stats := traceStats{DurationMs: activeTraceDuration(nodes)}
+	stats := traceStats{DurationMs: activeTraceDuration(measuredNodes)}
 	turnFirst := make(map[int]time.Time)
 	turnFirstToken := make(map[int]time.Time)
 	for _, n := range nodes {
 		ev := n.Event
-		if t, ok := turnFirst[ev.Turn]; !ok || ev.TS.Before(t) {
-			turnFirst[ev.Turn] = ev.TS
-		}
-		if ev.Kind == "text" || ev.Kind == "thinking" {
-			if t, ok := turnFirstToken[ev.Turn]; !ok || ev.TS.Before(t) {
-				turnFirstToken[ev.Turn] = ev.TS
+		if !ev.TS.IsZero() {
+			if t, ok := turnFirst[ev.Turn]; !ok || ev.TS.Before(t) {
+				turnFirst[ev.Turn] = ev.TS
+			}
+			if ev.Kind == "text" || ev.Kind == "thinking" {
+				if t, ok := turnFirstToken[ev.Turn]; !ok || ev.TS.Before(t) {
+					turnFirstToken[ev.Turn] = ev.TS
+				}
 			}
 		}
 		if ev.Turn > stats.Turns {
 			stats.Turns = ev.Turn
 		}
 		switch ev.Kind {
-		case "text", "thinking", "thinking_redacted", "user":
+		case "text", "thinking", "thinking_redacted", "user", "context":
 			stats.Steps++
 		case "tool_start":
 			stats.ToolCalls++
@@ -4235,17 +4264,18 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 			Kind:      ev.Kind,
 			Turn:      ev.Turn,
 			Sequence:  ev.Sequence,
-			TS:        ev.TS.Format(time.RFC3339),
+			TS:        traceDisplayTimestamp(ev.TS),
 			ToolName:  ev.ToolName,
 			ToolUseID: ev.ToolUseID,
 			ParentID:  ev.ParentID,
 			Text:      redactTraceText(ev.Text),
+			Source:    ev.Source,
 			IsError:   ev.IsError,
 			ElapsedMs: ev.ElapsedMs,
 			Depth:     n.Depth,
 		})
 	}
-	stats.ToolMs = activeTraceToolDuration(nodes)
+	stats.ToolMs = activeTraceToolDuration(measuredNodes)
 	// The final per-turn map already de-duplicates live and persisted
 	// message metrics by turn, so summing it cannot count the same provider
 	// call twice. The larger cumulative value wins when one source is only a

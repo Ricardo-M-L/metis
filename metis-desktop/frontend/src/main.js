@@ -5,6 +5,7 @@ import {
   ChooseWorkspaceDirectory,
   GetUpdateStatus,
   InstallUpdateAndRestart,
+  SetNativeTheme,
   StartWebUI,
 } from '../wailsjs/go/main/App.js';
 
@@ -19,6 +20,10 @@ window.addEventListener('load', async () => {
       'choose-workspace': () => ChooseWorkspaceDirectory(),
       'check-update': () => GetUpdateStatus(),
       'install-update': () => InstallUpdateAndRestart(),
+      'set-theme': payload => {
+        const theme = String(payload && payload.theme || 'auto');
+        return SetNativeTheme(theme);
+      },
     };
     window.addEventListener('message', async event => {
       const request = event.data || {};

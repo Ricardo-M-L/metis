@@ -28,6 +28,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/computeruse"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -142,6 +143,8 @@ type ExternalHooks struct {
 	DirAdd    func(path string, persist bool) error
 	DirRemove func(path string) error
 	DirList   func() []string
+	// ComputerUse manages the same component/server as CLI and desktop controls.
+	ComputerUse func(context.Context, string) (computeruse.Status, error)
 	// BtwAsk fires a single-turn LLM call with no tools and no history
 	// write. Returns the assistant text, or an error. Implementation
 	// expected to share the parent's prompt cache.
@@ -493,6 +496,12 @@ type Model struct {
 	// that across two updates avoids re-entrant runTurnAsync issues
 	// where finalizeTurn is mid-cleanup.
 	queuePending bool
+	// queuePendingInput retains only human input when a batch also contains
+	// scheduled prompts. Empty non-nil means the whole batch is automatic.
+	queuePendingInput []llm.ContentBlock
+	// queuePendingContext holds scheduled inputs from the same batch until
+	// submission succeeds, when they become CONTEXT rows rather than USER rows.
+	queuePendingContext []string
 
 	// expandedToolID is the A1 ctrl+O mechanism: the **single** tool
 	// event currently expanded. Empty string means "nothing expanded"

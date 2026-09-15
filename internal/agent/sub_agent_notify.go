@@ -32,7 +32,7 @@ func (l *Loop) injectSubAgentNotifications(ctx context.Context, out chan<- Event
 	if len(notifs) == 0 {
 		return
 	}
-	l.appendInjectedMessage(formatSubAgentNotifications(notifs))
+	l.appendInjectedMessage(ctx, out, "subagent", formatSubAgentNotifications(notifs))
 	emit(ctx, out, Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("[sub-agent idle] %d background sub-agent(s) finished", len(notifs)),
