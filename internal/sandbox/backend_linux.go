@@ -375,6 +375,15 @@ func prepareLinuxMetisView(req platformRequest) (linuxMetisView, error) {
 				_ = os.RemoveAll(viewDir)
 				return linuxMetisView{}, fmt.Errorf("sandbox: scaffold isolated executable path: %w", err)
 			}
+			placeholder, err := os.OpenFile(filepath.Join(viewDir, rel), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o500)
+			if err != nil {
+				_ = os.RemoveAll(viewDir)
+				return linuxMetisView{}, fmt.Errorf("sandbox: scaffold isolated executable mountpoint: %w", err)
+			}
+			if err := placeholder.Close(); err != nil {
+				_ = os.RemoveAll(viewDir)
+				return linuxMetisView{}, fmt.Errorf("sandbox: close isolated executable mountpoint: %w", err)
+			}
 			seen[executablePath] = struct{}{}
 			view.restoreExecutables = append(view.restoreExecutables, executablePath)
 		}

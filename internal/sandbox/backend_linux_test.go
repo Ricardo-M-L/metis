@@ -476,6 +476,7 @@ func TestLinuxSyntheticMetisViewRestoresExecutableUnderMetisRoot(t *testing.T) {
 	}
 	viewPrefix := manager.TempDir() + string(filepath.Separator) + ".stdio-mcp-metis-"
 	rootMaskIndex := -1
+	rootMaskSource := ""
 	executableRestoreIndex := -1
 	for i := 0; i+2 < len(wrapper.Args); i++ {
 		if wrapper.Args[i] != "--ro-bind" {
@@ -484,6 +485,7 @@ func TestLinuxSyntheticMetisViewRestoresExecutableUnderMetisRoot(t *testing.T) {
 		source, destination := wrapper.Args[i+1], wrapper.Args[i+2]
 		if destination == metisHome && strings.HasPrefix(source, viewPrefix) {
 			rootMaskIndex = i
+			rootMaskSource = source
 		}
 		if source == helper && destination == helper {
 			executableRestoreIndex = i
@@ -494,6 +496,13 @@ func TestLinuxSyntheticMetisViewRestoresExecutableUnderMetisRoot(t *testing.T) {
 	}
 	if executableRestoreIndex <= rootMaskIndex {
 		t.Fatalf("Metis-managed executable was not restored after root mask: mask=%d restore=%d argv=%v", rootMaskIndex, executableRestoreIndex, wrapper.Args)
+	}
+	rel, err := filepath.Rel(metisHome, helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(rootMaskSource, rel)); err != nil || info.IsDir() {
+		t.Fatalf("synthetic executable mountpoint missing: info=%v err=%v", info, err)
 	}
 }
 
