@@ -551,6 +551,7 @@ func (m *Manager) Wrap(cmd *exec.Cmd, req Request) (*exec.Cmd, error) {
 		network:                     network,
 		home:                        home,
 		metisHome:                   metisHome,
+		executablePath:              cmd.Path,
 	}); err != nil {
 		return nil, err
 	}
@@ -761,6 +762,7 @@ type platformRequest struct {
 	network                     NetworkPolicy
 	home                        string
 	metisHome                   string
+	executablePath              string
 
 	blockedUnixSockets []string // Linux network=block hardening; ignored elsewhere
 }

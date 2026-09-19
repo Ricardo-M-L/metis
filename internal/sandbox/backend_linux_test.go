@@ -449,6 +449,54 @@ func TestLinuxCredentialIsolationUsesSyntheticMetisView(t *testing.T) {
 	}
 }
 
+func TestLinuxSyntheticMetisViewRestoresExecutableUnderMetisRoot(t *testing.T) {
+	installFakeBubblewrap(t)
+	home := t.TempDir()
+	metisHome := filepath.Join(home, ".metis")
+	helperDir := filepath.Join(metisHome, "components", "computer-use", "versions", "local-fixture")
+	if err := os.MkdirAll(helperDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(helperDir, "metis-cu")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithOptions(Options{
+		Mode: string(ModePermissions), TempRoot: t.TempDir(), MetisHome: metisHome,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	command := exec.Command(helper)
+	command.Env = []string{linuxSandboxProfileEnvKey + "=" + linuxStdioMCPSandboxProfile}
+	wrapper, err := manager.Wrap(command, Request{Cwd: manager.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewPrefix := manager.TempDir() + string(filepath.Separator) + ".stdio-mcp-metis-"
+	rootMaskIndex := -1
+	executableRestoreIndex := -1
+	for i := 0; i+2 < len(wrapper.Args); i++ {
+		if wrapper.Args[i] != "--ro-bind" {
+			continue
+		}
+		source, destination := wrapper.Args[i+1], wrapper.Args[i+2]
+		if destination == metisHome && strings.HasPrefix(source, viewPrefix) {
+			rootMaskIndex = i
+		}
+		if source == helper && destination == helper {
+			executableRestoreIndex = i
+		}
+	}
+	if rootMaskIndex < 0 {
+		t.Fatalf("stdio MCP profile has no synthetic root mask: %v", wrapper.Args)
+	}
+	if executableRestoreIndex <= rootMaskIndex {
+		t.Fatalf("Metis-managed executable was not restored after root mask: mask=%d restore=%d argv=%v", rootMaskIndex, executableRestoreIndex, wrapper.Args)
+	}
+}
+
 func TestLinuxSyntheticMetisViewRejectsUnsafeCredentialCwds(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

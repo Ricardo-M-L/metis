@@ -23,6 +23,7 @@ const (
 type linuxMetisView struct {
 	dir                string
 	roots              []string
+	restoreExecutables []string
 	restoreCwd         bool
 	maskDesktopSession bool
 }
@@ -148,6 +149,9 @@ func buildLinuxArgsWithMetisView(req platformRequest, originalArgv []string, met
 					args = append(args, "--ro-bind", metisView.dir, root)
 				}
 			}
+		}
+		for _, path := range metisView.restoreExecutables {
+			args = append(args, "--ro-bind", path, path)
 		}
 	}
 	// A network namespace blocks IP traffic but not path-based AF_UNIX
@@ -348,6 +352,32 @@ func prepareLinuxMetisView(req platformRequest) (linuxMetisView, error) {
 			return linuxMetisView{}, fmt.Errorf("sandbox: scaffold isolated working directory: %w", err)
 		}
 		view.restoreCwd = true
+	}
+	if req.executablePath != "" && filepath.IsAbs(req.executablePath) {
+		executablePath := filepath.Clean(req.executablePath)
+		seen := map[string]struct{}{}
+		for _, root := range roots {
+			if !linuxPathWithin(root, executablePath) {
+				continue
+			}
+			privateDir := filepath.Join(root, metisCredentialDirectoryName)
+			if linuxPathWithin(privateDir, executablePath) {
+				return linuxMetisView{}, fmt.Errorf("%w: executable %q is inside private credential directory %q", ErrUnsafeCwd, executablePath, privateDir)
+			}
+			if _, ok := seen[executablePath]; ok {
+				continue
+			}
+			rel, relErr := filepath.Rel(root, executablePath)
+			if relErr != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Join(viewDir, filepath.Dir(rel)), 0o700); err != nil {
+				_ = os.RemoveAll(viewDir)
+				return linuxMetisView{}, fmt.Errorf("sandbox: scaffold isolated executable path: %w", err)
+			}
+			seen[executablePath] = struct{}{}
+			view.restoreExecutables = append(view.restoreExecutables, executablePath)
+		}
 	}
 	return view, nil
 }
