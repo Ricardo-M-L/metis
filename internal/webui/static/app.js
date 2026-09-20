@@ -13,6 +13,8 @@ let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSo
 let lastStatusSnapshot = null;
 let statusRequestGeneration = 0;
 let subAgentDetailState = { agentId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0 };
+let subAgentDetailStream = null;
+let subAgentDetailStreamGeneration = 0;
 
 // The browser UI lives in a loopback iframe inside the Wails shell. This
 // narrow request bridge intentionally exposes three named native actions;
@@ -332,10 +334,11 @@ function renderStatusSnapshot(d) {
     const pop = document.getElementById('statusPopover');
     if (pop && pop.style.display !== 'none') renderStatusPopover();
     const trackedAgent = typeof subAgentDetailState !== 'undefined' ? subAgentDetailState.agentId : '';
-    // The roster retains a finished teammate briefly. Refresh an open detail
-    // dialog even after it disappears from /api/status, so live output turns
-    // into its final result instead of staying visually "running" forever.
-    if (trackedAgent) refreshSubAgentDetails();
+    // EventSource owns an open detail dialog. Keep fetch only as the fallback
+    // for runtimes that do not implement EventSource; otherwise status polling
+    // would fight the dedicated stream and make text arrive in three-second
+    // batches instead of as it is produced.
+    if (trackedAgent && !subAgentDetailStream && !(window && window.EventSource)) refreshSubAgentDetails();
     if (d.workspace) {
       const pn = document.getElementById('wsGroupName');
       if (pn) pn.textContent = d.workspace;
@@ -503,7 +506,7 @@ function openSubAgentDetails(agentID, trigger) {
   renderSubAgentDetails();
   const dialog = overlay.querySelector('.subagent-detail-dialog');
   requestAnimationFrame(() => dialog && dialog.focus());
-  refreshSubAgentDetails();
+  startSubAgentDetailStream(agentID);
 }
 
 function closeSubAgentDetails() {
@@ -516,7 +519,90 @@ function closeSubAgentDetails() {
   subAgentDetailState.loading = false;
   subAgentDetailState.error = '';
   subAgentDetailState.requestGeneration++;
+  stopSubAgentDetailStream();
   if (trigger && typeof trigger.focus === 'function') trigger.focus();
+}
+
+function stopSubAgentDetailStream() {
+  subAgentDetailStreamGeneration++;
+  if (subAgentDetailStream) {
+    subAgentDetailStream.close();
+    subAgentDetailStream = null;
+  }
+}
+
+function subAgentStreamIsCurrent(agentID, generation, source) {
+  return subAgentDetailState.agentId === agentID &&
+    subAgentDetailStreamGeneration === generation &&
+    subAgentDetailStream === source;
+}
+
+function subAgentStreamPayload(event) {
+  try { return JSON.parse(event.data); } catch (_) { return null; }
+}
+
+function applySubAgentStreamSnapshot(agentID, generation, source, payload) {
+  if (!subAgentStreamIsCurrent(agentID, generation, source) || !payload || !payload.agent) return;
+  const next = payload.agent;
+  if (next.agentId && String(next.agentId) !== agentID) return;
+  subAgentDetailState.data = next;
+  subAgentDetailState.loading = false;
+  subAgentDetailState.error = '';
+  renderSubAgentDetails();
+}
+
+function applySubAgentStreamDelta(agentID, generation, source, payload) {
+  if (!subAgentStreamIsCurrent(agentID, generation, source) || !payload) return;
+  const current = subAgentDetailState.data || { agentId: agentID, output: '' };
+  const next = Object.assign({}, current, payload);
+  delete next.delta;
+  next.output = String(current.output || '') + String(payload.delta || '');
+  subAgentDetailState.data = next;
+  subAgentDetailState.loading = false;
+  subAgentDetailState.error = '';
+  renderSubAgentDetails();
+}
+
+// A dedicated SSE stream gives a child its own output lane. It is deliberately
+// separate from /api/events: child prose must never be appended to the parent
+// assistant message just because both runs happen at the same time.
+function startSubAgentDetailStream(agentID) {
+  stopSubAgentDetailStream();
+  if (!window || !window.EventSource) {
+    refreshSubAgentDetails();
+    return;
+  }
+  const generation = ++subAgentDetailStreamGeneration;
+  subAgentDetailState.loading = !subAgentDetailState.data;
+  renderSubAgentDetails();
+  const source = new window.EventSource('/api/subagents/' + encodeURIComponent(agentID) + '/events');
+  subAgentDetailStream = source;
+  source.addEventListener('snapshot', event => {
+    applySubAgentStreamSnapshot(agentID, generation, source, subAgentStreamPayload(event));
+  });
+  source.addEventListener('delta', event => {
+    applySubAgentStreamDelta(agentID, generation, source, subAgentStreamPayload(event));
+  });
+  source.addEventListener('terminal', event => {
+    applySubAgentStreamSnapshot(agentID, generation, source, subAgentStreamPayload(event));
+    if (subAgentStreamIsCurrent(agentID, generation, source)) stopSubAgentDetailStream();
+  });
+  source.addEventListener('gone', () => {
+    if (!subAgentStreamIsCurrent(agentID, generation, source)) return;
+    subAgentDetailState.loading = false;
+    subAgentDetailState.error = subAgentText('This sub-agent is no longer retained.', '这个子代理已不再保留。');
+    renderSubAgentDetails();
+    stopSubAgentDetailStream();
+  });
+  source.addEventListener('error', () => {
+    // EventSource reconnects itself. Only surface a failure when the initial
+    // snapshot never arrived; a brief local-server restart should not erase
+    // output that is already visible in the dialog.
+    if (!subAgentStreamIsCurrent(agentID, generation, source) || subAgentDetailState.data) return;
+    subAgentDetailState.loading = false;
+    subAgentDetailState.error = subAgentText('Live connection is reconnecting…', '实时连接正在重连…');
+    renderSubAgentDetails();
+  });
 }
 
 async function refreshSubAgentDetails() {

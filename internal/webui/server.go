@@ -3269,6 +3269,31 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // large answer.
 const subAgentDetailOutputLimit = 160_000
 
+// subAgentDetailStreamInterval is deliberately short enough that a child
+// model's text feels live in Desktop, while keeping the snapshot-only roster
+// API cheap. The browser holds one SSE connection while a detail dialog is
+// open; it does not repeatedly poll the detail endpoint.
+const subAgentDetailStreamInterval = 120 * time.Millisecond
+
+// subAgentDetailView is shared by the one-shot detail endpoint and its live
+// SSE companion. Keeping this view detached from Teammate means the browser
+// never holds a pointer to mutable roster state.
+type subAgentDetailView struct {
+	Name            string    `json:"name"`
+	AgentID         string    `json:"agentId"`
+	Status          string    `json:"status"`
+	Background      bool      `json:"background"`
+	StartedAt       time.Time `json:"startedAt"`
+	EndedAt         time.Time `json:"endedAt"`
+	ElapsedMS       int64     `json:"elapsedMs"`
+	Output          string    `json:"output"`
+	OutputTruncated bool      `json:"outputTruncated"`
+	Result          string    `json:"result"`
+	ResultTruncated bool      `json:"resultTruncated"`
+	StopHint        string    `json:"stopHint"`
+	ExitError       string    `json:"exitError"`
+}
+
 func trimSubAgentDetailOutput(value string) (string, bool) {
 	runes := []rune(value)
 	if len(runes) <= subAgentDetailOutputLimit {
@@ -3279,10 +3304,10 @@ func trimSubAgentDetailOutput(value string) (string, bool) {
 	return string(runes[:half]) + marker + string(runes[len(runes)-half:]), true
 }
 
-// handleSubAgentDetail is the Desktop-only read surface behind a clickable
-// sub-agent row. It deliberately reads the Roster snapshot rather than a
-// transient event stream: callers get the current partial text while an agent
-// is running and the retained final text after it has finished.
+// handleSubAgentDetail serves both the one-shot detail view and the nested
+// /events SSE stream. The latter keeps a detail dialog live without sending
+// child deltas into the parent chat lane, where they would interleave with the
+// main agent's answer.
 func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -3290,19 +3315,36 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentID := strings.TrimPrefix(r.URL.Path, "/api/subagents/")
+	path := strings.TrimPrefix(r.URL.Path, "/api/subagents/")
+	stream := strings.HasSuffix(path, "/events")
+	if stream {
+		path = strings.TrimSuffix(path, "/events")
+	}
+	agentID := path
 	if agentID == "" || agentID != strings.TrimSpace(agentID) || len(agentID) > 128 || strings.ContainsAny(agentID, "/\\") {
 		writeError(w, http.StatusBadRequest, "invalid sub-agent id")
 		return
 	}
-	if s.roster == nil {
+	if stream {
+		s.handleSubAgentEvents(w, r, agentID)
+		return
+	}
+
+	view, ok := s.subAgentDetailView(agentID)
+	if !ok {
 		writeError(w, http.StatusNotFound, "sub-agent not found")
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent": view})
+}
+
+func (s *Server) subAgentDetailView(agentID string) (subAgentDetailView, bool) {
+	if s == nil || s.roster == nil {
+		return subAgentDetailView{}, false
+	}
 	teammate, ok := s.roster.LookupByAgentID(agentID)
 	if !ok || teammate == nil {
-		writeError(w, http.StatusNotFound, "sub-agent not found")
-		return
+		return subAgentDetailView{}, false
 	}
 
 	snap := teammate.Snapshot()
@@ -3319,21 +3361,137 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 	if snap.ExitErr != nil {
 		exitError = snap.ExitErr.Error()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"agent": map[string]any{
-		"name":            snap.Name,
-		"agentId":         snap.AgentID,
-		"status":          snap.Status.String(),
-		"background":      snap.Background,
-		"startedAt":       snap.Started,
-		"endedAt":         snap.EndTime,
-		"elapsedMs":       elapsed.Milliseconds(),
-		"output":          output,
-		"outputTruncated": outputTruncated,
-		"result":          result,
-		"resultTruncated": resultTruncated,
-		"stopHint":        snap.StopHint,
-		"exitError":       exitError,
-	}})
+	return subAgentDetailView{
+		Name:            snap.Name,
+		AgentID:         snap.AgentID,
+		Status:          snap.Status.String(),
+		Background:      snap.Background,
+		StartedAt:       snap.Started,
+		EndedAt:         snap.EndTime,
+		ElapsedMS:       elapsed.Milliseconds(),
+		Output:          output,
+		OutputTruncated: outputTruncated,
+		Result:          result,
+		ResultTruncated: resultTruncated,
+		StopHint:        snap.StopHint,
+		ExitError:       exitError,
+	}, true
+}
+
+// handleSubAgentEvents emits a snapshot followed by output deltas over SSE.
+// Child EventTextDelta values intentionally do not enter the parent chat's
+// SSE lane: that would splice a sub-agent's prose into the main agent reply.
+// This dedicated lane gives the detail dialog the same incremental feel while
+// preserving that separation.
+func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, agentID string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	current, ok := s.subAgentDetailView(agentID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "sub-agent not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	if !writeSubAgentSSE(w, "snapshot", map[string]any{"agent": current}) {
+		return
+	}
+	if current.Status != agent.StatusRunning.String() {
+		_ = writeSubAgentSSE(w, "terminal", map[string]any{"agent": current})
+		flusher.Flush()
+		return
+	}
+	flusher.Flush()
+
+	ticker := time.NewTicker(subAgentDetailStreamInterval)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		case <-ticker.C:
+			next, found := s.subAgentDetailView(agentID)
+			if !found {
+				// Finished teammates normally live in the roster's bounded
+				// retained set. If it has already rolled over, terminate the
+				// dialog rather than reconnecting forever with stale output.
+				_ = writeSubAgentSSE(w, "gone", map[string]any{"agentId": agentID})
+				flusher.Flush()
+				return
+			}
+			if next.Status != agent.StatusRunning.String() {
+				_ = writeSubAgentSSE(w, "terminal", map[string]any{"agent": next})
+				flusher.Flush()
+				return
+			}
+			if next.Output == current.Output && next.OutputTruncated == current.OutputTruncated {
+				current = next
+				continue
+			}
+
+			// Preserve a bounded browser document. Once the retained output
+			// itself becomes a head/tail preview, send that preview once and
+			// wait for the terminal snapshot instead of retransmitting 160 KiB
+			// for every later token.
+			if current.OutputTruncated && next.OutputTruncated {
+				current = next
+				continue
+			}
+			if !current.OutputTruncated && !next.OutputTruncated && strings.HasPrefix(next.Output, current.Output) {
+				delta := strings.TrimPrefix(next.Output, current.Output)
+				if delta != "" {
+					if !writeSubAgentSSE(w, "delta", subAgentDeltaPayload(next, delta)) {
+						return
+					}
+					flusher.Flush()
+				}
+			} else {
+				if !writeSubAgentSSE(w, "snapshot", map[string]any{"agent": next}) {
+					return
+				}
+				flusher.Flush()
+			}
+			current = next
+		}
+	}
+}
+
+func subAgentDeltaPayload(view subAgentDetailView, delta string) map[string]any {
+	return map[string]any{
+		"agentId":         view.AgentID,
+		"name":            view.Name,
+		"status":          view.Status,
+		"background":      view.Background,
+		"startedAt":       view.StartedAt,
+		"endedAt":         view.EndedAt,
+		"elapsedMs":       view.ElapsedMS,
+		"delta":           delta,
+		"outputTruncated": view.OutputTruncated,
+		"result":          view.Result,
+		"resultTruncated": view.ResultTruncated,
+		"stopHint":        view.StopHint,
+		"exitError":       view.ExitError,
+	}
+}
+
+func writeSubAgentSSE(w http.ResponseWriter, event string, payload any) bool {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	return err == nil
 }
 
 func executionStrategyForStatus(planItems, subAgents, namedAgents int) string {

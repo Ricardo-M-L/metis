@@ -1,7 +1,9 @@
 package webui
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -100,6 +102,117 @@ func TestSubAgentDetailOutputBoundPreservesHeadAndTail(t *testing.T) {
 	}
 }
 
+func TestSubAgentDetailStreamEmitsSnapshotDeltaAndTerminal(t *testing.T) {
+	_, store := testServer(t)
+	roster := agent.NewRoster(2)
+	teammate := &agent.Teammate{
+		Name:       "transport",
+		AgentID:    "agt-transport",
+		Background: true,
+		Started:    time.Now().Add(-time.Second),
+	}
+	teammate.AppendText("initial ")
+	if err := roster.Register(teammate); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer("127.0.0.1:0", nil, store, RuntimeBindings{Roster: roster})
+	httpServer := httptest.NewServer(server.handler())
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpServer.URL+"/api/subagents/agt-transport/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("stream Content-Type = %q", got)
+	}
+	reader := bufio.NewReader(resp.Body)
+
+	event, payload := nextSubAgentSSE(t, reader)
+	if event != "snapshot" {
+		t.Fatalf("first event = %q, want snapshot", event)
+	}
+	view, _ := payload["agent"].(map[string]any)
+	if got := view["output"]; got != "initial " {
+		t.Fatalf("snapshot output = %#v", got)
+	}
+
+	teammate.AppendText("live text")
+	event, payload = nextSubAgentSSE(t, reader)
+	if event != "delta" || payload["delta"] != "live text" {
+		t.Fatalf("live SSE = %q %#v, want delta", event, payload)
+	}
+
+	teammate.Finish(agent.StatusCompleted, "initial live text", nil, "end_turn")
+	event, payload = nextSubAgentSSE(t, reader)
+	if event != "terminal" {
+		t.Fatalf("terminal event = %q, want terminal", event)
+	}
+	view, _ = payload["agent"].(map[string]any)
+	if got := view["status"]; got != "completed" {
+		t.Fatalf("terminal status = %#v", got)
+	}
+	if got := view["result"]; got != "initial live text" {
+		t.Fatalf("terminal result = %#v", got)
+	}
+}
+
+func nextSubAgentSSE(t *testing.T, reader *bufio.Reader) (string, map[string]any) {
+	t.Helper()
+	type received struct {
+		event   string
+		payload map[string]any
+		err     error
+	}
+	result := make(chan received, 1)
+	go func() {
+		var event string
+		var data string
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				result <- received{err: err}
+				return
+			}
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+			if line == "" {
+				if event == "" || data == "" {
+					continue
+				}
+				payload := map[string]any{}
+				if err := json.Unmarshal([]byte(data), &payload); err != nil {
+					result <- received{err: err}
+					return
+				}
+				result <- received{event: event, payload: payload}
+				return
+			}
+			if strings.HasPrefix(line, "event: ") {
+				event = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data += strings.TrimPrefix(line, "data: ")
+			}
+		}
+	}()
+	select {
+	case received := <-result:
+		if received.err != nil {
+			t.Fatalf("read sub-agent SSE: %v", received.err)
+		}
+		return received.event, received.payload
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for sub-agent SSE")
+	}
+	return "", nil
+}
+
 func TestDesktopSubAgentPanelLivesInHeaderAndLoadsOutput(t *testing.T) {
 	index, err := staticFS.ReadFile("static/index.html")
 	if err != nil {
@@ -130,6 +243,11 @@ func TestDesktopSubAgentPanelLivesInHeaderAndLoadsOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	js := string(source)
+	for _, want := range []string{"new window.EventSource('/api/subagents/'", "addEventListener('delta'", "subAgentDetailStream"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("sub-agent live stream wiring missing %q", want)
+		}
+	}
 	start := strings.Index(js, "function closeStatusPopover()")
 	endOffset := -1
 	if start >= 0 {
@@ -167,6 +285,7 @@ const overlay = byId.get('subAgentDetailOverlay'); overlay.dialog = new Element(
 const c = {
   console, Promise, Map, Set, encodeURIComponent, requestAnimationFrame: fn => fn(),
   subAgentDetailState:{agentId:'',trigger:null,data:null,loading:false,error:'',requestGeneration:0},
+  subAgentDetailStream:null, subAgentDetailStreamGeneration:0,
   document:{documentElement:{lang:'zh-CN'}, body:new Element(), getElementById:id=>byId.get(id)||null, createElement:()=>new Element(), addEventListener(){}},
   uiText:(en,zh)=>zh, escHtml:v=>String(v),
   fetch:async url=>({ok:true,json:async()=>({agent:{name:'transport',agentId:'agt-transport',status:'running',background:true,elapsedMs:2400,output:'正在读取 transport.go'}})}),
