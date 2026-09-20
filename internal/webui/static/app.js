@@ -109,6 +109,7 @@ function applyLanguage(value) {
   applyLayout();
   if (typeof syncApprovalChip === 'function') syncApprovalChip(approvalMode);
   if (lastStatusSnapshot) renderStatusSnapshot(lastStatusSnapshot);
+  if (typeof renderSessions === 'function') renderSessions();
 }
 
 function presetDisplayName(id) {

@@ -241,19 +241,50 @@ func (a *Anthropic) SupportsVision() bool {
 }
 
 func (a *Anthropic) VisionCapability() provider.VisionCapability {
-	return VisionCapabilityForModel(a.Model)
+	return VisionCapabilityForRoute(a.CatalogProvider, a.Model)
 }
 
 // SupportsVisionModel is the key-free capability lookup used by UI model
 // pickers before a provider client has been constructed.
+//
+// Provider-blind: when the caller knows which route it is describing, prefer
+// VisionCapabilityForRoute.
 func SupportsVisionModel(model string) bool {
 	return VisionCapabilityForModel(model) == provider.VisionSupported
 }
 
+// VisionCapabilityForModel is the provider-blind entry point for callers that
+// have no route information at all.
 func VisionCapabilityForModel(model string) provider.VisionCapability {
-	// Tier 1 — models.dev. Explicit catalog facts outrank broad family
-	// fallbacks; missing metadata continues to the offline table.
-	if cli := catalog.Default(); cli != nil {
+	return VisionCapabilityForRoute("", model)
+}
+
+// VisionCapabilityForRoute resolves vision support for one concrete route.
+// catalogProvider is the models.dev provider id for that route
+// (Anthropic.CatalogProvider); "" means unknown and falls through to the
+// provider-agnostic lookup.
+//
+// Same ladder as the OpenAI transport: vendor facts → the exact catalog route
+// (authoritative, so a text-only gateway never inherits a sibling's image
+// support) → the provider-agnostic fact, which requires unanimity → the
+// offline family table.
+func VisionCapabilityForRoute(catalogProvider, model string) provider.VisionCapability {
+	return visionCapabilityForRouteWithCatalog(catalogProvider, model, catalog.Default())
+}
+
+func visionCapabilityForRouteWithCatalog(catalogProvider, model string, cli *catalog.Client) provider.VisionCapability {
+	normalizedProvider := strings.ToLower(strings.TrimSpace(catalogProvider))
+	if cli != nil {
+		// Tier 1 — the route actually in use.
+		if normalizedProvider != "" {
+			if supported, found := cli.LookupVisionByRoute(normalizedProvider, model); found {
+				if supported {
+					return provider.VisionSupported
+				}
+				return provider.VisionUnsupported
+			}
+		}
+		// Tier 2 — provider-agnostic, and only when every route agrees.
 		if supported, found := cli.LookupVisionByModelID(model); found {
 			if supported {
 				return provider.VisionSupported
@@ -262,7 +293,7 @@ func VisionCapabilityForModel(model string) provider.VisionCapability {
 		}
 	}
 
-	// Tier 2 — explicit provider/model facts (cold-cache safe).
+	// Tier 3 — explicit provider/model facts (cold-cache safe).
 	m := strings.ToLower(strings.TrimSpace(model))
 	// Bedrock wraps Anthropic model IDs as either
 	// `anthropic.claude-*` or `<geo>.anthropic.claude-*` (for example

@@ -32,6 +32,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/projectcoord"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
@@ -386,8 +387,8 @@ Usage:
   metis mcp-serve [--mode MODE]  Run as MCP server (stdio); register with: claude mcp add metis -- metis mcp-serve
   metis daemon [--poll DURATION] Run the file-queue daemon
   metis ps|logs|kill|attach      Inspect and control managed processes
-  metis coordinator <dispatch|worker>  Use the filesystem coordinator MVP
-  metis cron <list|add|rm|pause|resume|run|start|audit>  Manage scheduled prompts
+  metis coordinator <create|list|status|add|run|claim|complete|fail|recover|dispatch|worker>  Coordinate durable project work
+  metis cron <list|add|rm|pause|resume|run|start|history|audit>  Manage scheduled prompts
   metis login [provider] [--method api-key|oauth]  Sign in to an LLM provider
   metis logout <provider> [provider...]             Remove stored provider credentials
   metis auth <login|logout|list|oauth|keys>  Manage credentials (legacy login alias supported)
@@ -947,8 +948,11 @@ type cliFlags struct {
 	// name shown in /sessions) or sugar over existing surfaces (a /batch
 	// shortcut, a tmux launcher).
 	sessionName string // --name <text>: human-friendly session label
-	agentTeams  bool   // explicit alias for coordinator/team-lead mode
-	tmuxOn      bool   // reserved compatibility flag; currently no runtime effect
+	// Internal cron invocation: keep the daemon's durable store identity when
+	// a job runs in a bound workspace with a different project configuration.
+	cronSessionDir string
+	agentTeams     bool // explicit alias for coordinator/team-lead mode
+	tmuxOn         bool // reserved compatibility flag; currently no runtime effect
 
 	// coordinator — Phase G.8 (2026-05-12). Flips the main loop into
 	// team-lead mode: tool palette narrows to orchestration tools and
@@ -1183,6 +1187,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	cfg, loaded, snap, err := config.LoadWithSnapshot()
 	if err != nil {
 		return nil, err
+	}
+	if flags.cronSessionDir != "" {
+		cfg.Session.Dir = flags.cronSessionDir
 	}
 	projectTrusted := currentWorkspaceTrusted()
 	if err := config.ApplyProviderPolicyForWorkspace(cfg, projectTrusted); err != nil {
@@ -1694,6 +1701,19 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Monitors:        monitorReg,
 		ConfigSnapshot:  snap,
 		Roster:          subAgentRoster,
+		ProjectWorkspaceResolver: func() string {
+			// A Desktop session switch does not mutate process-wide cwd: doing
+			// so would race active jobs and other windows. Resolve the current
+			// session header lazily instead, so durable project coordination is
+			// bound to the same workspace the active loop is actually using.
+			if sessionID := rtpkg.CurrentSessionID(); sessionID != "" && store != nil {
+				if header, _, err := store.LoadHeader(sessionID); err == nil && header != nil && strings.TrimSpace(header.WorkDir) != "" {
+					return header.WorkDir
+				}
+			}
+			cwd, _ := os.Getwd()
+			return cwd
+		},
 	})
 
 	// G.8 — coordinator mode installs a durable allowlist. It removes
@@ -3178,13 +3198,16 @@ func cmdAudit() error {
 
 func cmdCron(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: metis cron <list|add|rm|pause|resume|run|start|audit|allow|denied>")
+		return errors.New("usage: metis cron <list|add|rm|pause|resume|run|start|history|audit|allow|denied>")
 	}
 	cfg, _, err := config.Load()
 	if err != nil {
 		return err
 	}
-	cronRoot := filepath.Join(cfg.Session.Dir, "cron")
+	cronRoot, err := filepath.Abs(filepath.Join(cfg.Session.Dir, "cron"))
+	if err != nil {
+		return err
+	}
 	svc, err := agent.NewCronService(cronRoot)
 	if err != nil {
 		return err
@@ -3203,7 +3226,7 @@ func cmdCron(ctx context.Context, args []string) error {
 		if len(rest) == 0 {
 			return errors.New("rm: missing id")
 		}
-		return svc.Remove(rest[0])
+		return agent.WithCronJobIdle(svc.Root(), rest[0], func() error { return svc.Remove(rest[0]) })
 	case "pause":
 		if len(rest) == 0 {
 			return errors.New("pause: missing id")
@@ -3222,6 +3245,8 @@ func cmdCron(ctx context.Context, args []string) error {
 		return cmdCronStart(ctx, svc)
 	case "audit":
 		return cmdCronAudit(svc, rest)
+	case "history":
+		return cmdCronHistory(svc, rest)
 	case "allow":
 		return cmdCronAllow(svc, cronRoot, rest)
 	case "denied":
@@ -3434,43 +3459,19 @@ func cmdCronAdd(svc *agent.CronService, args []string) error {
 }
 
 func cmdCronRun(ctx context.Context, svc *agent.CronService, args []string) error {
-	if len(args) == 0 {
-		return errors.New("cron run: missing id")
-	}
-	job, err := advanceManualCronRun(svc, args[0])
-	if err != nil {
-		return fmt.Errorf("cron run %s: %w", args[0], err)
-	}
-	// Force ModeDefault regardless of cfg.Permission.Mode — see cmdCronStart
-	// for the full rationale: a cron fire is governed by its allow-list,
-	// not the operator's ambient mode. The execution admission check applies
-	// before CanUse; ModeDefault then preserves ordinary tool-level denials and
-	// ASK handling for calls that passed pre-authorization.
-	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeDefault)})
+	id, runID, err := parseCronRunArgs(args)
 	if err != nil {
 		return err
 	}
-	defer rt.Cleanup()
-	// Manual `metis cron run <id>` is one-shot — there's no daemon
-	// holding cross-fire history, so we hand it empty maps and the
-	// per-mode logic falls through to "isolated"-equivalent for any
-	// SessionMode value (no prior history to load).
-	return executeCronJob(ctx, rt, job,
+	job, ok := svc.Get(id)
+	if !ok {
+		return fmt.Errorf("cron run: job not found: %s", id)
+	}
+	return runRecordedCronJob(ctx, svc, job, runID, "manual",
 		map[string][]llm.Message{}, map[string][]llm.Message{})
 }
 
 func cmdCronStart(ctx context.Context, svc *agent.CronService) error {
-	// Force ModeDefault regardless of cfg.Permission.Mode. A durable cron
-	// fire's permission model is its pre-authorization allow-list
-	// (enforced by executeCronJob's context-scoped admission callback via
-	// EvaluateCronPermission), NOT the operator's ambient interactive mode.
-	// Admission covers even MCP/tools that return ALLOW without consulting the
-	// Gate; ModeDefault keeps subsequent tool-level ASK/DENY behavior strict.
-	rt, err := setupRuntime(ctx, &cliFlags{mode: string(permission.ModeDefault)})
-	if err != nil {
-		return err
-	}
-	defer rt.Cleanup()
 	// Per-mode in-memory history stores. Cron jobs with SessionMode set
 	// to "persistent" or "main" need their conversation to survive
 	// across firings of the same job, so we cache message slices keyed
@@ -3484,7 +3485,7 @@ func cmdCronStart(ctx context.Context, svc *agent.CronService) error {
 	mainHist := map[string][]llm.Message{}
 	onFire := func(j *agent.CronJob) error {
 		fmt.Fprintf(os.Stderr, "[cron] firing %s (%s, mode=%s)\n", j.ID, j.Name, sessionModeOrDefault(j))
-		err := executeCronJob(ctx, rt, j, persistentHist, mainHist)
+		err := runRecordedCronJob(ctx, svc, j, "", "scheduled", persistentHist, mainHist)
 		return reportCronFireError(os.Stderr, j, err)
 	}
 	svc.Start(ctx, onFire)
@@ -3529,7 +3530,7 @@ func cronDenialFromPermissionEvent(ev agent.Event, reason string) agent.CronDeni
 }
 
 func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
-	persistentHist, mainHist map[string][]llm.Message) error {
+	persistentHist, mainHist map[string][]llm.Message) (resultErr error) {
 
 	// 1. Pick the right starting history per SessionMode.
 	switch sessionModeOrDefault(job) {
@@ -3544,7 +3545,20 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	default: // isolated
 		rt.loop.Reset()
 	}
+	// Each fire has a fresh saved session. Carry the selected history into it
+	// before appending this prompt, then keep incremental checkpoints through
+	// success, provider failure, cancellation, and compaction.
+	checkpoint := newHeadlessCheckpoint(rt.loop, rt.store, rt.sessionID)
+	if rt.store != nil {
+		if err := rt.store.ReplaceHistoryAndMark(rt.sessionID, rt.loop.History(), &checkpoint.cursor); err != nil {
+			return err
+		}
+	}
+	defer func() { resultErr = errors.Join(resultErr, checkpoint.Save()) }()
 	rt.loop.AppendUser(job.Prompt)
+	if err := checkpoint.Save(); err != nil {
+		return err
+	}
 	rtpkg.RecordContextInput(rt.sessionID, "cron", job.Prompt)
 
 	// Silent-fire audit channel — opened once per fire when Silent is
@@ -3943,6 +3957,13 @@ func buildListingRegistry(cfg *config.Config, allowFlag, denyFlag string) *tools
 	reg := tools.NewRegistry()
 	builtin.Register(reg, cfg, gate)
 	reg.Register(builtin.NewAgent(gate, nil, reg, "", ""))
+	if workspace, err := os.Getwd(); err == nil {
+		reg.Register(builtin.NewProjectCoordinator(
+			gate,
+			projectcoord.NewStore(filepath.Join(config.Home(), "project-coordinator")),
+			workspace,
+		))
+	}
 	reg.Register(builtin.NewFork(gate, nil, reg))
 	tmpRoster := agent.NewRoster(0, 0)
 	builtin.AttachSubAgentTools(reg, gate, tmpRoster)

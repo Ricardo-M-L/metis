@@ -131,11 +131,62 @@ func modelChoiceKey(c screen.ModelChoice) string {
 	return strings.ToLower(c.Provider) + "\x00" + strings.ToLower(c.ID)
 }
 
+// modelChoiceCatalogProvider resolves the models.dev provider id that the live
+// provider for this choice will report as CatalogProvider. It mirrors
+// internal/runtime/provider.go: a custom profile defaults to its own profile
+// key when the config doesn't name a catalog provider, and the built-in
+// anthropic/openai entries map to their catalog ids. Codex choices return ""
+// because their ids resolve through openai.vendorVisionCapability before any
+// catalog lookup.
+func modelChoiceCatalogProvider(cfg *config.Config, c screen.ModelChoice) string {
+	if cfg == nil {
+		return ""
+	}
+	switch c.Provider {
+	case "anthropic":
+		// Mirror runtime.BuildProvider exactly: an explicit catalog_provider
+		// wins, otherwise only a native origin claims the vendor route.
+		if cp := strings.ToLower(strings.TrimSpace(cfg.Provider.Anthropic.CatalogProvider)); cp != "" {
+			return cp
+		}
+		if runtime.IsAnthropicOrigin(cfg.Provider.Anthropic.BaseURL) {
+			return "anthropic"
+		}
+		return ""
+	case "openai":
+		if cp := strings.ToLower(strings.TrimSpace(cfg.Provider.OpenAI.CatalogProvider)); cp != "" {
+			return cp
+		}
+		if runtime.IsOpenAIOrigin(cfg.Provider.OpenAI.BaseURL) {
+			return "openai"
+		}
+		return ""
+	case "openai-codex", "gemini", "google":
+		// Codex ids resolve through openai.vendorVisionCapability before any
+		// catalog lookup; the native Gemini adapter rejects images outright.
+		return ""
+	}
+	raw, ok := cfg.Provider.Custom[c.Provider]
+	if !ok {
+		return ""
+	}
+	if cp := strings.ToLower(strings.TrimSpace(raw.CatalogProvider)); cp != "" {
+		return cp
+	}
+	return strings.ToLower(strings.TrimSpace(c.Provider))
+}
+
 func modelChoiceVisionCapability(cfg *config.Config, c screen.ModelChoice) pubprovider.VisionCapability {
 	if cfg == nil || c.ID == "" {
 		return pubprovider.VisionUnsupported
 	}
 	transport := ""
+	// catalogProvider mirrors runtime.BuildProvider's CatalogProvider so the
+	// picker resolves the same models.dev route the live vision gate will use.
+	// Without it the picker borrows the answer from whichever sibling gateway
+	// re-publishes the same wire id (deepseek-v4-flash is image-capable on some
+	// routes and text-only on others).
+	catalogProvider := modelChoiceCatalogProvider(cfg, c)
 	switch c.Provider {
 	case "anthropic":
 		transport = "anthropic_messages"
@@ -170,9 +221,9 @@ func modelChoiceVisionCapability(cfg *config.Config, c screen.ModelChoice) pubpr
 
 	switch transport {
 	case "openai_chat", "openai_responses", "openai_codex_responses", "azure_openai":
-		return openai.VisionCapabilityForModel(c.ID)
+		return openai.VisionCapabilityForRoute(catalogProvider, c.ID)
 	case "anthropic_messages", "bedrock_anthropic", "vertex_anthropic":
-		return anthropic.VisionCapabilityForModel(c.ID)
+		return anthropic.VisionCapabilityForRoute(catalogProvider, c.ID)
 	default:
 		return pubprovider.VisionUnsupported
 	}

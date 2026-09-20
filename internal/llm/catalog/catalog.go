@@ -275,16 +275,47 @@ func (c *Client) loadFromDisk() (Catalog, error) {
 	return cat, nil
 }
 
-// LookupVisionByModelID reports whether the given model accepts image
-// input, per the models.dev catalog's modalities.input array. Returns
-// (supported, found) — found=false when the model isn't in the catalog
-// (caller should fall back to a heuristic, e.g. a prefix whitelist, or
-// default to false).
+// LookupVisionByRoute returns the models.dev fact for one exact
+// catalog provider/model pair. Prefer this over
+// LookupVisionByModelID whenever the caller knows which route it is
+// actually talking to: the same wire id is re-published by many
+// gateways with different modalities, so a provider-blind answer can
+// describe a route the user is not on.
 //
-// Synchronous + read-only — same safety profile as
-// LookupContextWindowByModelID. Never makes a network request; the
-// caller is responsible for triggering Get() at startup so the cache
-// is warm by the time this is called from a hot path.
+// Synchronous + read-only — never makes a network request; the caller
+// is responsible for triggering Get() at startup so the cache is warm.
+func (c *Client) LookupVisionByRoute(providerID, modelID string) (bool, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || providerID == "" || modelID == "" {
+		return false, false
+	}
+	p, ok := c.cached[providerID]
+	if !ok {
+		return false, false
+	}
+	m, ok := p.Models[modelID]
+	if !ok {
+		return false, false
+	}
+	return m.SupportsImage(), true
+}
+
+// LookupVisionByModelID is the provider-agnostic compatibility
+// fallback. It succeeds only when every catalog route that publishes
+// the model agrees on image support. Conflicting routes are ambiguous
+// and return ok=false so the caller can fall through to family
+// heuristics (or stay tri-state Unknown) instead of guessing a
+// provider or depending on Go map iteration order.
+//
+// The earlier "any route that declares image wins" rule was
+// deterministic but unsound in the unsafe direction: for ids like
+// deepseek-v4-flash (image-capable on a few routes, text-only on the
+// large majority) it reported VisionSupported, so images were shipped
+// to a text-only endpoint and burned the turn on a 400. Mirrors
+// LookupContextWindowByModelID, which has always required unanimity.
+//
+// Synchronous + read-only. Never makes a network request.
 func (c *Client) LookupVisionByModelID(modelID string) (bool, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -292,18 +323,21 @@ func (c *Client) LookupVisionByModelID(modelID string) (bool, bool) {
 		return false, false
 	}
 	found := false
+	supported := false
 	for _, p := range c.cached {
-		if m, ok := p.Models[modelID]; ok {
-			found = true
-			// The same wire id can be re-published by multiple gateways. Image
-			// support is usable if any catalog route declares it; returning the
-			// first map hit made the answer nondeterministic across processes.
-			if m.SupportsImage() {
-				return true, true
-			}
+		m, ok := p.Models[modelID]
+		if !ok {
+			continue
+		}
+		if !found {
+			found, supported = true, m.SupportsImage()
+			continue
+		}
+		if m.SupportsImage() != supported {
+			return false, false
 		}
 	}
-	return false, found
+	return supported, found
 }
 
 // LookupReasoningByModelID reports whether catalog metadata marks a model as

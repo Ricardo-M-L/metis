@@ -166,7 +166,45 @@ func TestModel_Lookup(t *testing.T) {
 	}
 }
 
-func TestLookupVisionByModelIDAggregatesDuplicateRoutesDeterministically(t *testing.T) {
+// TestLookupVisionByModelIDRequiresUnanimousRoutes: the provider-agnostic
+// fallback must not pick a winner among conflicting routes. The previous
+// "any supporting route wins" rule was deterministic but unsound in the
+// unsafe direction — for deepseek-v4-flash (image on 3 routes, text-only on
+// 25) it reported supported and shipped image parts to text-only gateways.
+// Ambiguity now stays a miss so the caller falls through to family heuristics
+// or tri-state Unknown. Mirrors LookupContextWindowByModelID.
+func TestLookupVisionByModelIDRequiresUnanimousRoutes(t *testing.T) {
+	const duplicateFixture = `{
+	  "text-route": {"models": {"shared-model": {"modalities": {"input": ["text"]}}}},
+	  "vision-route": {"models": {"shared-model": {"modalities": {"input": ["text", "image"]}}}},
+	  "agree-vision": {"models": {"unanimous-vision": {"modalities": {"input": ["text", "image"]}}}},
+	  "agree-text": {"models": {"unanimous-text": {"modalities": {"input": ["text"]}}}}
+}`
+	srv := newServer(t, duplicateFixture)
+	defer srv.Close()
+	c := newClientFor(t, srv.URL)
+	if _, err := c.Get(context.Background()); err != nil {
+		t.Fatalf("warm Get: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if supported, found := c.LookupVisionByModelID("shared-model"); found || supported {
+			t.Fatalf("lookup %d = supported=%v found=%v, want ambiguous routes to miss", i, supported, found)
+		}
+	}
+	if supported, found := c.LookupVisionByModelID("unanimous-vision"); !found || !supported {
+		t.Fatalf("unanimous vision = supported=%v found=%v, want true/true", supported, found)
+	}
+	if supported, found := c.LookupVisionByModelID("unanimous-text"); !found || supported {
+		t.Fatalf("unanimous text = supported=%v found=%v, want false/true", supported, found)
+	}
+	if supported, found := c.LookupVisionByModelID("missing"); found || supported {
+		t.Fatalf("missing lookup = supported=%v found=%v", supported, found)
+	}
+}
+
+// TestLookupVisionByRouteIsAuthoritative: the exact route fact wins even when
+// a sibling gateway publishes a conflicting one for the same wire id.
+func TestLookupVisionByRouteIsAuthoritative(t *testing.T) {
 	const duplicateFixture = `{
 	  "text-route": {"models": {"shared-model": {"modalities": {"input": ["text"]}}}},
 	  "vision-route": {"models": {"shared-model": {"modalities": {"input": ["text", "image"]}}}}
@@ -177,13 +215,20 @@ func TestLookupVisionByModelIDAggregatesDuplicateRoutesDeterministically(t *test
 	if _, err := c.Get(context.Background()); err != nil {
 		t.Fatalf("warm Get: %v", err)
 	}
-	for i := 0; i < 100; i++ {
-		if supported, found := c.LookupVisionByModelID("shared-model"); !found || !supported {
-			t.Fatalf("lookup %d = supported=%v found=%v, want any supporting route to win", i, supported, found)
-		}
+	if supported, found := c.LookupVisionByRoute("text-route", "shared-model"); !found || supported {
+		t.Fatalf("text-route = supported=%v found=%v, want false/true", supported, found)
 	}
-	if supported, found := c.LookupVisionByModelID("missing"); found || supported {
-		t.Fatalf("missing lookup = supported=%v found=%v", supported, found)
+	if supported, found := c.LookupVisionByRoute("vision-route", "shared-model"); !found || !supported {
+		t.Fatalf("vision-route = supported=%v found=%v, want true/true", supported, found)
+	}
+	if _, found := c.LookupVisionByRoute("no-such-provider", "shared-model"); found {
+		t.Fatal("unknown provider must miss, not guess")
+	}
+	if _, found := c.LookupVisionByRoute("text-route", "missing"); found {
+		t.Fatal("unknown model must miss")
+	}
+	if _, found := c.LookupVisionByRoute("", "shared-model"); found {
+		t.Fatal("empty provider id must miss")
 	}
 }
 

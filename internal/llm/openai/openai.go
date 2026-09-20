@@ -296,57 +296,119 @@ func (o *OpenAI) SupportsVision() bool {
 }
 
 func (o *OpenAI) VisionCapability() provider.VisionCapability {
-	return VisionCapabilityForModel(o.Model)
+	return VisionCapabilityForRoute(o.CatalogProvider, o.Model)
 }
 
 // SupportsVisionModel exposes the same catalog-first capability decision for
 // configured-profile pickers that need to filter candidates before building a
 // live provider. It performs no request and requires no API key.
+//
+// Provider-blind: when the caller knows which route it is describing
+// (config profile id / CatalogProvider), prefer VisionCapabilityForRoute so
+// the answer is not borrowed from a sibling gateway that re-publishes the same
+// wire id with different modalities.
 func SupportsVisionModel(model string) bool {
 	return VisionCapabilityForModel(model) == provider.VisionSupported
 }
 
-// VisionCapabilityForModel distinguishes an explicit text-only catalog entry
-// from a model the local catalog simply does not know. Image submission gates
-// only reject the former; unknown custom gateways get a chance to let their
-// own API make the authoritative decision.
+// VisionCapabilityForModel is the provider-blind entry point, used by callers
+// that have no route information at all.
 func VisionCapabilityForModel(model string) provider.VisionCapability {
+	return VisionCapabilityForRoute("", model)
+}
+
+// VisionCapabilityForRoute resolves vision support for one concrete route.
+// catalogProvider is the models.dev provider id for that route
+// (OpenAI.CatalogProvider); "" means unknown and falls through to the
+// provider-agnostic lookup.
+//
+// Ladder:
+//  1. vendor/model-specific facts (codex routing, live-confirmed ids)
+//  2. the exact catalog route — authoritative, so a text-only gateway never
+//     inherits image support from a sibling that publishes the same wire id
+//  3. the provider-agnostic catalog fact, which requires unanimity
+//  4. the offline family table
+func VisionCapabilityForRoute(catalogProvider, model string) provider.VisionCapability {
 	m := strings.ToLower(strings.TrimSpace(model))
-	if capability, ok := codexModelVisionCapability(m); ok {
+	if capability, ok := vendorVisionCapability(m); ok {
 		return capability
 	}
+	// Lazy by construction: catalog.Default() is evaluated as an argument here,
+	// so it must sit AFTER the vendor short-circuits. Pinning the catalog
+	// singleton for a codex-model call defeats METIS_CATALOG_DISABLE in tests
+	// (TestMaxContextTokens_VendorPublishedDefaults) and warms a catalog the
+	// caller never asked for.
+	return visionCapabilityForRouteWithCatalog(catalogProvider, model, catalog.Default())
+}
 
-	// Vendor-confirmed exact ids take precedence over the shared catalog.
+// vendorVisionCapability covers model-specific facts that outrank the shared
+// catalog: codex routing ids, and vendor ids that models.dev does not carry.
+// Idempotent and cheap, so both the wrapper and the explicit-client helper can
+// call it without coordination.
+func vendorVisionCapability(normalizedModel string) (provider.VisionCapability, bool) {
+	if capability, ok := codexModelVisionCapability(normalizedModel); ok {
+		return capability, true
+	}
 	// SenseNova's authenticated /models metadata declares text+image input for
 	// this model, while models.dev does not currently carry the vendor entry.
 	// Keeping this exact (rather than a broad sensenova-* prefix) avoids
 	// accidentally sending images to text-only siblings.
-	if m == "sensenova-6.8-flash-lite" {
-		return provider.VisionSupported
+	if normalizedModel == "sensenova-6.8-flash-lite" {
+		return provider.VisionSupported, true
 	}
-	return visionCapabilityWithCatalog(model, m, catalog.Default())
+	return provider.VisionUnknown, false
 }
 
-func visionCapabilityWithCatalog(model, normalized string, cli *catalog.Client) provider.VisionCapability {
-	// Tier 1 — models.dev. A positive or negative catalog fact is stronger
-	// than broad family heuristics below. A miss falls through to the offline
-	// compatibility table.
+func visionCapabilityForRouteWithCatalog(catalogProvider, model string, cli *catalog.Client) provider.VisionCapability {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if capability, ok := vendorVisionCapability(m); ok {
+		return capability
+	}
+
 	if cli != nil {
-		if supported, found := cli.LookupVisionByModelID(model); found {
-			if supported {
-				return provider.VisionSupported
+		// Tier 1 — the route actually in use.
+		if cp := strings.ToLower(strings.TrimSpace(catalogProvider)); cp != "" {
+			if supported, found := cli.LookupVisionByRoute(cp, model); found {
+				return visionCapabilityFromCatalogFact(supported)
 			}
-			return provider.VisionUnsupported
+		}
+		// Tier 2 — provider-agnostic, and only when every route agrees.
+		if supported, found := cli.LookupVisionByModelID(model); found {
+			return visionCapabilityFromCatalogFact(supported)
 		}
 	}
-	return fallbackVisionCapability(normalized)
+	return fallbackVisionCapability(m)
+}
+
+func visionCapabilityFromCatalogFact(supported bool) provider.VisionCapability {
+	if supported {
+		return provider.VisionSupported
+	}
+	return provider.VisionUnsupported
 }
 
 // fallbackVisionCapability contains only deterministic cold-cache heuristics.
 // Keeping it separate lets unit tests exercise this table without depending
 // on a user's mutable ~/.metis catalog or a background network refresh.
+//
+// Maintenance rule: a wrong VisionSupported is strictly worse than a miss.
+// A miss degrades to Unknown, which still lets the upstream API adjudicate;
+// a false Supported ships image_url parts to a text-only endpoint and burns
+// the turn on a 400. Only add ids here that were verified live or that the
+// catalog reports unanimously, and prefer the narrowest prefix that is
+// actually true for the whole family (glm-5.1 and the bare kimi-k2
+// generation were both corrected on 2026-09-18 after the catalog
+// contradicted the old broad entries).
 func fallbackVisionCapability(m string) provider.VisionCapability {
-	// Tier 2 — cold-cache/offline family facts.
+	// o3-mini is the text-only member of the o3 line (models.dev: text-only on
+	// six of seven routes). It has to be excluded before the family switch
+	// below, because that switch evaluates the vision-supported group first and
+	// a broad "o3" prefix would otherwise claim vision, shipping image_url
+	// parts to a text-only endpoint.
+	if strings.HasPrefix(m, "o3-mini") {
+		return provider.VisionUnsupported
+	}
+	// Cold-cache/offline family facts — last resort, after every catalog tier.
 	switch {
 	// OpenAI native lineage.
 	case strings.HasPrefix(m, "gpt-4o"),
@@ -360,12 +422,20 @@ func fallbackVisionCapability(m string) provider.VisionCapability {
 		return provider.VisionSupported
 	// Chinese OSS families (fallback only — prefer catalog above).
 	case strings.HasPrefix(m, "deepseek-vl"),
-		strings.HasPrefix(m, "kimi-k2"),
+		// Kimi's k2 line splits: the bare k2 / k2-thinking / k2-turbo
+		// generation is text-only, while k2.5+ carry image input. A broad
+		// "kimi-k2" prefix here claimed vision for the text-only generation
+		// too; the text-only group below now carries the kimi-k2 catch-all.
+		strings.HasPrefix(m, "kimi-k2.5"),
+		strings.HasPrefix(m, "kimi-k2.6"),
+		strings.HasPrefix(m, "kimi-k2.7"),
+		strings.HasPrefix(m, "kimi-k2-5"),
+		strings.HasPrefix(m, "kimi-k2-6"),
+		strings.HasPrefix(m, "kimi-k2-7"),
 		strings.HasPrefix(m, "kimi-k3"),
 		strings.HasPrefix(m, "kimi-latest"),
 		strings.HasPrefix(m, "kimi-vl"),
 		strings.HasPrefix(m, "moonshot-v1-vision"),
-		strings.HasPrefix(m, "glm-5.1"),
 		strings.HasPrefix(m, "glm-5v"),
 		strings.HasPrefix(m, "glm-4.6v"),
 		strings.HasPrefix(m, "glm-4.5v"),
@@ -389,6 +459,11 @@ func fallbackVisionCapability(m string) provider.VisionCapability {
 		strings.HasPrefix(m, "deepseek-reasoner"),
 		strings.HasPrefix(m, "ark-code"),
 		strings.HasPrefix(m, "kimi-k1.5"),
+		// Catch-all for the bare kimi-k2 generation (kimi-k2,
+		// kimi-k2-thinking, kimi-k2-turbo-preview, kimi-k2-instruct-fast).
+		// Reached only after the k2.5+/k3 vision prefixes above missed.
+		strings.HasPrefix(m, "kimi-k2"),
+		strings.HasPrefix(m, "glm-5.1"),
 		strings.HasPrefix(m, "glm-5.2"),
 		strings.HasPrefix(m, "glm-5.3"),
 		strings.HasPrefix(m, "glm-4-flash"),

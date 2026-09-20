@@ -213,10 +213,15 @@ automatically opens `/batch` or enables another runtime mode.
 Two coordinator surfaces are distinct:
 
 - `--coordinator` / `METIS_COORDINATOR_MODE=1` adds a team-lead system overlay
-  and filters the current loop's tool palette to orchestration/read tools.
-- `metis coordinator dispatch|worker` is a separate filesystem-mailbox MVP.
-  The dispatch command currently sends one task and waits; workers poll and
-  execute tasks. It is not a full multi-phase fleet scheduler.
+  and filters the current loop's tool palette to orchestration/read tools. Its
+  `ProjectCoordinator` tool persists project runs, dependencies, worker claims,
+  evidence, and failure recovery across sessions.
+- `metis coordinator create|list|status|add|run|claim|complete|fail|recover`
+  is the durable CLI surface over the same workspace-bound graph. It starts
+  with a research → synthesis → implementation → verification scaffold, lets a
+  coordinator expand parallel work deliberately, and expires abandoned worker
+  claims instead of leaving work permanently running. `dispatch|worker` remains
+  available as the older mailbox transport for compatibility.
 
 ### Cron and daemon processes
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/execution"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -218,6 +219,11 @@ type Agent struct {
 	// schema generation never has to probe profiles one-by-one. nil preserves
 	// compatibility for headless embedders that do not expose a catalog.
 	profileNames func() []string
+	// executionMemory persists deterministic workspace constraints discovered
+	// while resolving Agent isolation. It is optional for embedders, but the
+	// normal runtime wires a durable store so a recoverable environment rule is
+	// retained across turns and restarts.
+	executionMemory execution.Memory
 }
 
 // effectiveMaxDepth returns the cap to enforce — instance override
@@ -342,6 +348,14 @@ func (a Agent) WithProfileNames(names func() []string) Agent {
 	return a
 }
 
+// WithExecutionMemory attaches durable workspace-capability memory to Agent.
+// A nil memory keeps immediate preflight and recovery working but omits the
+// cross-turn record, which is useful for lightweight test/embedded callers.
+func (a Agent) WithExecutionMemory(memory execution.Memory) Agent {
+	a.executionMemory = memory
+	return a
+}
+
 func (Agent) Name() string { return "Agent" }
 
 // ShortDescription — see Bash.ShortDescription for the rationale.
@@ -428,8 +442,8 @@ Plan first (cold scout), then fan out — the 4 impl agents are independent so t
   - Back-compat: if you pass ` + "`name=\"explore\"`" + ` without ` + "`subagent_type`" + `, it's still treated as ` + "`subagent_type=\"explore\"`" + `. Explicit subagent_type is preferred — name should be a label like "alice", not a role like "explore".
 
 Other knobs:
-  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Use ` + "`isolation: \"none\"`" + ` to run directly in cwd; this explicit value lets strict Responses clients recover when worktree isolation is unavailable. Refused if you're already inside a linked worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
-  - ` + "`cwd`" + ` runs the sub-agent in a specific directory. With ` + "`isolation: \"worktree\"`" + `, cwd selects the source Git repository; for a non-Git task, use ` + "`isolation: \"none\"`" + ` and keep cwd. After an isolation error, change the arguments instead of retrying the same call.
+  - ` + "`isolation: \"worktree\"`" + ` gives the sub-agent its own git worktree under ~/.metis/worktrees/ — useful for risky experiments that shouldn't touch the parent's checkout. Auto-cleaned on exit. Use ` + "`isolation: \"none\"`" + ` to run directly in cwd. If a requested worktree has a valid non-Git cwd, METIS records that environment constraint and automatically continues once in the same cwd with ` + "`isolation: \"none\"`" + `. Refused if you're already inside a linked worktree (no nesting), and unavailable while the parent is in Plan because setup changes git metadata.
+  - ` + "`cwd`" + ` runs the sub-agent in a specific directory. With ` + "`isolation: \"worktree\"`" + `, cwd selects the source Git repository. Keep cwd explicit whenever the task belongs to a particular project; METIS reports the effective execution mode in the tool result.
   - ` + "`run_in_background: true`" + ` → returns job_id immediately, poll via SubAgentOutput, terminate via SubAgentStop.
   - ` + "`permission_mode`" + ` overrides the gate just for this sub-agent (e.g. constrain a worker to "plan" while the parent stays in "default"). A Plan parent may only inherit Plan or explicitly request "plan"; approving a plan starts a fresh implementation turn instead of upgrading an already-running child. A fullAccess parent must omit this field (inherit fullAccess) or explicitly keep fullAccess: its disabled process sandbox and parent-bound tool instances cannot safely enforce a lower child mode.
   - ` + "`allowed_tools`" + ` / ` + "`disallowed_tools`" + ` narrow the sub-agent's tool view; combine with the profile's filters as INTERSECTION (allow) + UNION (deny).`
@@ -462,7 +476,7 @@ func (a Agent) InputSchema() map[string]any {
 			"isolation": map[string]any{
 				"type":        "string",
 				"enum":        []string{"none", "worktree"},
-				"description": "Isolation mode. Use `none` to run directly in cwd (also the recovery value when cwd is outside Git), or `worktree` to spawn in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). If `cwd` is also supplied, it selects the source Git repository. Worktree mode refuses when the source is already inside a linked worktree (no nesting) or when the parent is in Plan mode (worktree setup changes git metadata).",
+				"description": "Isolation mode. Use `none` to run directly in cwd, or `worktree` to spawn in an isolated git worktree under ~/.metis/worktrees/. The sub-agent's tools see the worktree as cwd, so file writes don't touch the parent's checkout. Worktree is auto-cleaned when the sub-agent exits (or when parent ctx cancels). If `cwd` is also supplied, it selects the source Git repository. When that cwd is a valid non-Git directory, METIS records the constraint and automatically continues once with direct execution in the same cwd; the tool result exposes the recovery. Worktree mode refuses when the source is already inside a linked worktree (no nesting) or when the parent is in Plan mode (worktree setup changes git metadata).",
 			},
 			"cwd": map[string]any{
 				"type":        "string",
@@ -604,7 +618,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		isolation = ""
 	}
 	cwdArg, _ := in["cwd"].(string)
-	subCwd, worktreeInfo, isoErr := a.resolveIsolation(isolation, cwdArg)
+	subCwd, worktreeInfo, recovery, isoErr := a.resolveIsolationWithRecovery(isolation, cwdArg)
 	if isoErr != nil {
 		return &tools.Result{Output: isoErr.Error(), IsError: true}, nil
 	}
@@ -1160,7 +1174,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// this child; Execute's guards close the transcript, unregister the roster
 	// entry, and join private resources synchronously.
 	if err := childCtx.Err(); err != nil {
-		return wrapTimeoutErr(err, timeout), nil
+		return decorateAgentExecutionRecovery(wrapTimeoutErr(err, timeout), recovery), nil
 	}
 
 	// Signal only after every validation/setup step succeeded and immediately
@@ -1169,7 +1183,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// as soon as the parent tool_result arrives.
 	agent.TraceInvocationStarted(ctx)
 	if runInBackground {
-		return a.executeBackground(
+		result, err := a.executeBackground(
 			sub,
 			childCtx,
 			finalize,
@@ -1186,10 +1200,217 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 				transcriptCleanupOwnedByExecute = false
 			},
 		)
+		return decorateAgentExecutionRecovery(result, recovery), err
 	}
 	runnerCleanupOwnedByExecute = false
 	transcriptCleanupOwnedByExecute = false
-	return a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
+	result, err := a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
+	return decorateAgentExecutionRecovery(result, recovery), err
+}
+
+// agentIsolationIssue is a classified execution-environment constraint. Only
+// constraints with AutoRecover set are normalized automatically; every other
+// failure remains visible to the caller so METIS never turns an ambiguous
+// isolation request into a silent write in a different place.
+type agentIsolationIssue struct {
+	Code        execution.FailureCode
+	SourceDir   string
+	Summary     string
+	Suggestion  string
+	AutoRecover bool
+}
+
+func (e *agentIsolationIssue) Error() string {
+	if e == nil {
+		return "agent isolation failed"
+	}
+	switch e.Code {
+	case execution.FailureWorktreeRequiresGit:
+		return fmt.Sprintf(
+			"worktree isolation requires an existing Git repository at or above cwd=%q. "+
+				"METIS can continue in that same directory with isolation=\"none\"; choose a cwd inside a Git repository when a separate worktree is required.",
+			e.SourceDir,
+		)
+	case execution.FailureNestedWorktree:
+		return fmt.Sprintf(
+			"refusing to nest worktree: source is already inside a linked worktree at %s. "+
+				"Choose the repository's main checkout when a new isolated worktree is required.",
+			e.SourceDir,
+		)
+	default:
+		return e.Summary
+	}
+}
+
+func (e *agentIsolationIssue) failure() execution.Failure {
+	if e == nil {
+		return execution.Failure{}
+	}
+	return execution.Failure{
+		Code:            e.Code,
+		Summary:         e.Summary,
+		SuggestedAction: e.Suggestion,
+		AutoRecovered:   e.AutoRecover,
+	}
+}
+
+// agentExecutionRecovery is attached to the final tool result after a safe
+// normalization. It makes the recovery visible in the transcript and trace,
+// instead of hiding a changed execution mode behind a successful child run.
+type agentExecutionRecovery struct {
+	SourceDir  string
+	Failure    execution.Failure
+	Persisted  bool
+	Remembered bool
+}
+
+// resolveIsolationWithRecovery runs the existing strict preflight, records
+// known environment constraints, and performs exactly one safe fallback.
+// Today that fallback is deliberately narrow: a Git worktree cannot exist in
+// a non-Git directory, so retaining cwd and switching to direct execution is
+// unambiguous. Missing directories, unsupported modes, nested worktrees, and
+// worktree-creation failures are never guessed around.
+func (a Agent) resolveIsolationWithRecovery(isolation, cwdArg string) (string, *worktreepkg.Info, *agentExecutionRecovery, error) {
+	// Worktree mode gets a deterministic environment preflight before any
+	// worktree creation attempt. This is both cheaper than asking the model to
+	// parse a Git error and protects against repeating a known-invalid setup.
+	if isolation == "worktree" {
+		sourceDir, sourceErr := worktreeSourceDir(cwdArg)
+		if sourceErr != nil {
+			return "", nil, nil, sourceErr
+		}
+		rememberedNonGit := false
+		if a.executionMemory != nil {
+			if previous, found, loadErr := a.executionMemory.Load(sourceDir); loadErr == nil && found && previous.LastFailure != nil {
+				rememberedNonGit = previous.LastFailure.Code == execution.FailureWorktreeRequiresGit && previous.LastFailure.AutoRecovered
+			}
+		}
+		if profile, probeErr := execution.Probe(sourceDir); probeErr == nil {
+			if !profile.IsGitRepository {
+				issue := &agentIsolationIssue{
+					Code:        execution.FailureWorktreeRequiresGit,
+					SourceDir:   sourceDir,
+					Summary:     "Git worktree isolation is unavailable because this workspace is not a Git repository.",
+					Suggestion:  "Use direct execution with the same working directory.",
+					AutoRecover: true,
+				}
+				recovery := a.rememberIsolationIssue(issue, &profile)
+				recovery.Remembered = rememberedNonGit
+				return sourceDir, nil, recovery, nil
+			}
+			if profile.IsLinkedWorktree {
+				issue := &agentIsolationIssue{
+					Code:        execution.FailureNestedWorktree,
+					SourceDir:   sourceDir,
+					Summary:     "The selected source directory is already a linked Git worktree.",
+					Suggestion:  "Choose the repository's main checkout before requesting a new worktree.",
+					AutoRecover: false,
+				}
+				_ = a.rememberIsolationIssue(issue, &profile)
+				return "", nil, nil, issue
+			}
+		}
+	}
+
+	subCwd, worktreeInfo, err := a.resolveIsolation(isolation, cwdArg)
+	if err == nil {
+		return subCwd, worktreeInfo, nil, nil
+	}
+	var issue *agentIsolationIssue
+	if !errors.As(err, &issue) {
+		return "", nil, nil, err
+	}
+
+	recovery := a.rememberIsolationIssue(issue, nil)
+	if !issue.AutoRecover {
+		return "", nil, nil, err
+	}
+	return issue.SourceDir, nil, recovery, nil
+}
+
+func (a Agent) rememberIsolationIssue(issue *agentIsolationIssue, observed *execution.Profile) *agentExecutionRecovery {
+	recovery := &agentExecutionRecovery{}
+	if issue == nil {
+		return recovery
+	}
+	recovery.SourceDir = issue.SourceDir
+	recovery.Failure = issue.failure()
+	if a.executionMemory == nil {
+		return recovery
+	}
+	profile := execution.Profile{}
+	if observed != nil {
+		profile = *observed
+	} else {
+		var probeErr error
+		profile, probeErr = execution.Probe(issue.SourceDir)
+		if probeErr != nil {
+			return recovery
+		}
+	}
+	if recordErr := a.executionMemory.Record(profile, recovery.Failure); recordErr == nil {
+		recovery.Persisted = true
+	}
+	return recovery
+}
+
+func decorateAgentExecutionRecovery(result *tools.Result, recovery *agentExecutionRecovery) *tools.Result {
+	if result == nil || recovery == nil {
+		return result
+	}
+	if result.Presentation == nil {
+		result.Presentation = make(map[string]any)
+	}
+	result.Presentation["execution_environment"] = map[string]any{
+		"workspace":           recovery.SourceDir,
+		"failure_code":        string(recovery.Failure.Code),
+		"requested_isolation": "worktree",
+		"effective_isolation": "none",
+		"auto_recovered":      true,
+		"recovery_remembered": recovery.Persisted,
+		"recovery_reused":     recovery.Remembered,
+		"suggested_action":    recovery.Failure.SuggestedAction,
+	}
+	notice := "Execution environment recovered: " + recovery.Failure.Summary +
+		" METIS continued once in the same working directory with direct execution (isolation=\"none\")."
+	if recovery.Persisted {
+		notice += " This workspace rule was saved for future Agent dispatches."
+	}
+	if strings.TrimSpace(result.Output) == "" {
+		result.Output = notice
+	} else {
+		result.Output = notice + "\n\n" + result.Output
+	}
+	return result
+}
+
+func validateAgentCwd(cwdArg string) error {
+	if cwdArg == "" {
+		return nil
+	}
+	if !strings.HasPrefix(cwdArg, "/") {
+		return fmt.Errorf("cwd=%q must be an absolute path", cwdArg)
+	}
+	if fi, err := os.Stat(cwdArg); err != nil {
+		return fmt.Errorf("cwd=%q: %w", cwdArg, err)
+	} else if !fi.IsDir() {
+		return fmt.Errorf("cwd=%q is not a directory", cwdArg)
+	}
+	return nil
+}
+
+func worktreeSourceDir(cwdArg string) (string, error) {
+	if err := validateAgentCwd(cwdArg); err != nil {
+		return "", err
+	}
+	if cwdArg != "" {
+		return cwdArg, nil
+	}
+	sourceDir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get cwd for worktree isolation: %w", err)
+	}
+	return sourceDir, nil
 }
 
 // resolveIsolation handles the `isolation` + `cwd` schema fields
@@ -1214,36 +1435,37 @@ func (a Agent) resolveIsolation(isolation, cwdArg string) (string, *worktreepkg.
 	if isolation != "" && isolation != "worktree" {
 		return "", nil, fmt.Errorf("isolation=%q not supported; only \"none\" and \"worktree\" are recognized", isolation)
 	}
-	if cwdArg != "" {
-		if !strings.HasPrefix(cwdArg, "/") {
-			return "", nil, fmt.Errorf("cwd=%q must be an absolute path", cwdArg)
-		}
-		if fi, err := os.Stat(cwdArg); err != nil {
-			return "", nil, fmt.Errorf("cwd=%q: %w", cwdArg, err)
-		} else if !fi.IsDir() {
-			return "", nil, fmt.Errorf("cwd=%q is not a directory", cwdArg)
-		}
+	if err := validateAgentCwd(cwdArg); err != nil {
+		return "", nil, err
 	}
 	if isolation == "worktree" {
 		// Refuse nesting — `metis -W feat1` already put us inside a
 		// worktree; an Agent({isolation:"worktree"}) here would
 		// create a worktree-of-a-worktree which neither git nor our
 		// cleanup story handles cleanly.
-		sourceDir := cwdArg
-		if sourceDir == "" {
-			var err error
-			sourceDir, err = os.Getwd()
-			if err != nil {
-				return "", nil, fmt.Errorf("get cwd for worktree isolation: %w", err)
-			}
+		sourceDir, sourceErr := worktreeSourceDir(cwdArg)
+		if sourceErr != nil {
+			return "", nil, sourceErr
 		}
 		if worktreepkg.InsideWorktree(sourceDir) {
-			return "", nil, fmt.Errorf("refusing to nest worktree: source is already inside a linked worktree at %s", sourceDir)
+			return "", nil, &agentIsolationIssue{
+				Code:        execution.FailureNestedWorktree,
+				SourceDir:   sourceDir,
+				Summary:     "The selected source directory is already a linked Git worktree.",
+				Suggestion:  "Choose the repository's main checkout before requesting a new worktree.",
+				AutoRecover: false,
+			}
 		}
 		info, err := worktreepkg.SpawnFrom(sourceDir, "") // auto-slug
 		if err != nil {
 			if errors.Is(err, worktreepkg.ErrNotGitRepository) {
-				return "", nil, fmt.Errorf("worktree isolation requires an existing Git repository at or above cwd=%q. Retry Agent with cwd=%q and isolation=\"none\", or choose a cwd inside an existing Git repository. Do not repeat the same isolation request", sourceDir, sourceDir)
+				return "", nil, &agentIsolationIssue{
+					Code:        execution.FailureWorktreeRequiresGit,
+					SourceDir:   sourceDir,
+					Summary:     "Git worktree isolation is unavailable because this workspace is not a Git repository.",
+					Suggestion:  "Use direct execution with the same working directory.",
+					AutoRecover: true,
+				}
 			}
 			return "", nil, fmt.Errorf("worktree spawn: %w", err)
 		}

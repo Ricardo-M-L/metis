@@ -123,6 +123,7 @@ type Server struct {
 	openPath                func(path string) error
 	clipboardFiles          func() ([]desktop.ClipboardFile, error)
 	computerUse             func(context.Context, string) (computeruse.Status, error)
+	automations             *automationManager
 	plugins                 *rtpkg.PluginRegistry
 	pluginMarket            *pluginmarket.Manager
 	artifactStore           *artifact.Store
@@ -316,6 +317,7 @@ type RuntimeBindings struct {
 	// ComputerUse delegates fixed management actions to the shared runtime.
 	// The browser never supplies executable paths or helper download URLs.
 	ComputerUse func(context.Context, string) (computeruse.Status, error)
+	Automations *AutomationOptions
 	// ShutdownToken and Shutdown are set only by the native Desktop shell.
 	// Browser mode intentionally leaves them empty so a normal WebUI process
 	// cannot be terminated through HTTP.
@@ -382,6 +384,9 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		pluginMarket:            pluginmarket.NewManager(),
 		traceAdapter:            binding.TraceAdapter,
 		traceStore:              binding.TraceStore,
+	}
+	if binding.Automations != nil {
+		server.automations = newAutomationManager(*binding.Automations)
 	}
 	var initialSessionCommit func()
 	var initialSessionSwitchErr error
@@ -528,6 +533,8 @@ func (s *Server) handler() http.Handler {
 		}
 		staticHandler.ServeHTTP(w, r)
 	})
+	mux.HandleFunc("/api/automations", s.handleAutomations)
+	mux.HandleFunc("/api/automations/", s.handleAutomations)
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/sessions/activate", s.handleSessionActivate)
 	mux.HandleFunc("/api/sessions/", s.handleSession)
@@ -636,6 +643,8 @@ func (s *Server) handleDesktopShutdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	s.automations.startConfigured()
+	defer s.automations.close()
 	server := &http.Server{Addr: s.addr, Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second}
 	return runHTTPServer(ctx, server, 5*time.Second, func() {
 		s.beginClosing()
@@ -2251,6 +2260,7 @@ func (s *Server) persistDesktopCloseWithTimeouts(timeouts desktopCloseTimeouts) 
 		return nil
 	}
 	s.desktopCloseOnce.Do(func() {
+		s.automations.close()
 		var closeErr error
 		s.cancelMu.Lock()
 		s.closing = true

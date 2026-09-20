@@ -88,6 +88,55 @@ func TestModelChoiceUnknownVisionCapabilityRemainsCandidate(t *testing.T) {
 	}
 }
 
+// TestModelChoiceCatalogProviderMirrorsRuntime pins the 2026-09-18 route
+// resolution: the picker must describe the same models.dev route that
+// runtime.BuildProvider hands to the live vision gate, otherwise the picker
+// can advertise image support the sending path will not honor.
+func TestModelChoiceCatalogProviderMirrorsRuntime(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Provider.Custom = map[string]config.ProviderRaw{
+		"deepseek":  {Transport: "openai_chat", Model: "deepseek-flash"},
+		"sensenova": {Transport: "openai_chat", Model: "deepseek-v4-flash"},
+		"BigModel":  {Transport: "anthropic_messages", Model: "glm-5.3", CatalogProvider: "ZhipuAI"},
+	}
+	cases := []struct {
+		provider string
+		want     string
+	}{
+		{"deepseek", "deepseek"},   // profile key is the default route
+		{"sensenova", "sensenova"}, // same wire id, different route
+		{"BigModel", "zhipuai"},    // explicit catalog_provider wins, lowercased
+		{"openai", "openai"},
+		{"anthropic", "anthropic"},
+		{"openai-codex", ""}, // vendor facts resolve before any catalog lookup
+		{"not-configured", ""},
+	}
+	for _, tt := range cases {
+		got := modelChoiceCatalogProvider(cfg, screen.ModelChoice{Provider: tt.provider, ID: "some-model"})
+		if got != tt.want {
+			t.Errorf("modelChoiceCatalogProvider(%q) = %q, want %q", tt.provider, got, tt.want)
+		}
+	}
+
+	// Built-in openai/anthropic blocks must mirror runtime.BuildProvider too:
+	// an explicit catalog_provider wins, an empty base_url claims the vendor
+	// route, and a non-native origin claims nothing at all.
+	explicit := &config.Config{}
+	explicit.Provider.OpenAI.CatalogProvider = "My-Gateway"
+	explicit.Provider.OpenAI.BaseURL = "https://proxy.internal/v1"
+	if got := modelChoiceCatalogProvider(explicit, screen.ModelChoice{Provider: "openai", ID: "gpt-4o"}); got != "my-gateway" {
+		t.Errorf("explicit catalog_provider = %q, want my-gateway", got)
+	}
+	if got := modelChoiceCatalogProvider(&config.Config{}, screen.ModelChoice{Provider: "openai", ID: "gpt-4o"}); got != "openai" {
+		t.Errorf("empty base_url should default to the openai route, got %q", got)
+	}
+	rerouted := &config.Config{}
+	rerouted.Provider.Anthropic.BaseURL = "https://token.sensenova.cn/v1"
+	if got := modelChoiceCatalogProvider(rerouted, screen.ModelChoice{Provider: "anthropic", ID: "glm-5.3"}); got != "" {
+		t.Errorf("non-native anthropic origin should claim no route, got %q", got)
+	}
+}
+
 func TestSubmitImageToUnknownCapabilityProviderIsAttempted(t *testing.T) {
 	m := newSlashTestModel(t)
 	m.loop.Provider = unknownVisionFakeProvider{Provider: fakeProvider{}}

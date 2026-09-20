@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -63,6 +64,14 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	defer cancelServer()
 	shutdownToken := strings.TrimSpace(os.Getenv("METIS_DESKTOP_FRAME_TOKEN"))
 	workspaceTrusted := currentWorkspaceTrusted()
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("desktop: locate scheduler executable: %w", err)
+	}
+	workDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("desktop: determine scheduler workspace: %w", err)
+	}
 	bindings := webui.RuntimeBindings{
 		InitialSessionID:        rt.sessionID,
 		ProviderName:            rt.providerName,
@@ -99,6 +108,12 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		Roster:               rt.subAgentRoster,
 		TraceAdapter:         rtpkg.CurrentTraceAdapter(),
 		TraceStore:           rtpkg.CurrentTraceStore(),
+		Automations: &webui.AutomationOptions{
+			Root:       filepath.Join(rt.cfg.Session.Dir, "cron"),
+			Executable: executable,
+			WorkDir:    workDir,
+			Model:      rt.model,
+		},
 	}
 	// A regular `metis desktop --web` browser session has no frame token and
 	// therefore no HTTP shutdown capability. The native shell supplies a fresh

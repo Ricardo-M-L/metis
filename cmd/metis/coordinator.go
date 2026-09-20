@@ -10,7 +10,12 @@ import (
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 )
 
-// cmdCoordinator: launches a coordinator run. Two roles:
+// cmdCoordinator exposes both the original mailbox transport and the durable
+// project coordinator. The mailbox commands remain intact for scripts that
+// already use them; new project commands persist a dependency graph under
+// ~/.metis/project-coordinator/ and recover stale worker claims.
+//
+// Mailbox roles:
 //
 //	metis coordinator dispatch <runID> <prompt>   (coordinator: write tasks, wait)
 //	metis coordinator worker <runID>              (worker: poll, run, post)
@@ -20,6 +25,30 @@ import (
 // 4-phase pattern (research → synth → impl → verify) is left to the
 // coordinator-side prompt; the framework provides the mailbox transport.
 func cmdCoordinator(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		fmt.Print(coordinatorHelp)
+		return nil
+	}
+	switch args[0] {
+	case "create":
+		return cmdProjectCoordinatorCreate(args[1:])
+	case "list":
+		return cmdProjectCoordinatorList(args[1:])
+	case "status":
+		return cmdProjectCoordinatorStatus(args[1:])
+	case "add":
+		return cmdProjectCoordinatorAdd(args[1:])
+	case "claim":
+		return cmdProjectCoordinatorClaim(args[1:])
+	case "complete":
+		return cmdProjectCoordinatorComplete(args[1:])
+	case "fail":
+		return cmdProjectCoordinatorFail(args[1:])
+	case "recover":
+		return cmdProjectCoordinatorRecover(args[1:])
+	case "run":
+		return cmdProjectCoordinatorRun(ctx, args[1:])
+	}
 	if len(args) < 2 {
 		fmt.Print(coordinatorHelp)
 		return nil
@@ -107,7 +136,20 @@ func runOneShotForCoordinator(ctx context.Context, rt *runtime, prompt string) (
 	return runHeadlessOneShot(ctx, rt, prompt, "metis coordinator worker task")
 }
 
-const coordinatorHelp = `metis coordinator — minimum-viable multi-agent orchestration
+const coordinatorHelp = `metis coordinator — durable project coordination + mailbox compatibility
+
+Durable project workflow:
+  metis coordinator create --goal "<goal>" [--cwd DIR]
+  metis coordinator list [--cwd DIR] [--json]
+  metis coordinator status <runID> [--cwd DIR] [--json]
+  metis coordinator add <runID> --subject "<title>" --prompt "<work>" [--phase implementation] [--depends-on id,id] [--cwd DIR]
+  metis coordinator run <runID> [--cwd DIR] [--worker NAME] [--max-items N|--until-idle]
+  metis coordinator claim <runID> --worker NAME [--cwd DIR] [--prompt]
+  metis coordinator complete <runID> <itemID> [--worker NAME] [--output TEXT] [--cwd DIR]
+  metis coordinator fail <runID> <itemID> --summary "<reason>" [--code CODE] [--worker NAME] [--cwd DIR]
+  metis coordinator recover <runID> <itemID> [--note TEXT] [--force] [--cwd DIR]
+
+` + `Mailbox compatibility:
 
 Usage:
   metis coordinator dispatch <runID> <prompt>   # send a task, wait for reply

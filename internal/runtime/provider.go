@@ -68,6 +68,15 @@ func isOpenAIOrigin(baseURL string) bool {
 	return host == "api.openai.com" || strings.HasSuffix(host, ".openai.com")
 }
 
+// IsOpenAIOrigin / IsAnthropicOrigin expose the origin checks above to
+// non-runtime callers that must mirror BuildProvider's CatalogProvider
+// resolution. The model pickers in internal/tui use them so the capability
+// they advertise matches the route the live vision gate will resolve.
+func IsOpenAIOrigin(baseURL string) bool { return isOpenAIOrigin(baseURL) }
+
+// IsAnthropicOrigin mirrors IsOpenAIOrigin for the Anthropic transport.
+func IsAnthropicOrigin(baseURL string) bool { return isAnthropicOrigin(baseURL) }
+
 // ProviderBuild is the result of constructing an LLM provider client.
 // `Model` is the resolved model id (after applying flag overrides + cfg
 // defaults). Callers downstream — agent loop, compactor, builtin Agent —

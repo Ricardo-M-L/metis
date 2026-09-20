@@ -177,11 +177,18 @@ async function chooseEffort(value) {
 // event also reveals the id assigned to a brand-new session before its POST
 // resolves, so sidebar navigation can safely background it.
 function sameSession(d) {
-  if (turnRunning && d && d.session && !runningSessionId) {
-    runningSessionId = d.session;
+  const eventSessionId = String(d && d.session || '');
+  if (!eventSessionId) return true;
+  const pendingSessionId = pendingForegroundRequest && pendingForegroundRequest.sessionId;
+  const matchesPending = !!pendingForegroundRequest && (!pendingSessionId || pendingSessionId === eventSessionId);
+  if (turnRunning && !runningSessionId && matchesPending) {
+    runningSessionId = eventSessionId;
     renderSessions();
   }
-  return !(d && d.session && currentSessionId && d.session !== currentSessionId);
+  if (currentSessionId) return eventSessionId === currentSessionId;
+  // A blank composer has no transcript owner. Only the outstanding first
+  // foreground request may claim a server-assigned session from its events.
+  return matchesPending && (!runningSessionId || runningSessionId === eventSessionId);
 }
 
 let thinkingEl = null;
@@ -737,7 +744,16 @@ function syncTurnControls() {
     stopBtn.style.display = turnRunning ? '' : 'none';
     stopBtn.disabled = stopRequestPending;
     stopBtn.classList.toggle('stopping', stopRequestPending);
-    stopBtn.title = stopRequestPending ? 'Stopping the running turn…' : 'Stop the running turn';
+    const background = runningSessionId && runningSessionId !== currentSessionId;
+    const runningSession = typeof sessions !== 'undefined' && sessions.find(session => session.id === runningSessionId);
+    const runningTitle = runningSession && runningSession.title || runningSessionId;
+    const label = background
+      ? (stopRequestPending
+        ? uiText(`Stopping other running session: ${runningTitle}…`, `正在停止其他会话：${runningTitle}…`)
+        : uiText(`Stop other running session: ${runningTitle}`, `停止正在运行的其他会话：${runningTitle}`))
+      : (stopRequestPending ? uiText('Stopping current turn…', '正在停止当前轮次…') : uiText('Stop current turn', '停止当前轮次'));
+    stopBtn.title = label;
+    stopBtn.setAttribute('aria-label', label);
   }
 }
 
@@ -1510,6 +1526,7 @@ function newChat() {
   }
   if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();
   currentSessionId = null;
+  if (typeof resetTraceForSession === 'function') resetTraceForSession();
   if (typeof resetSessionFiles === 'function') resetSessionFiles();
   if (typeof resetArtifactsForSession === 'function') resetArtifactsForSession();
   queuedTurns = [];
@@ -1532,6 +1549,7 @@ function newChat() {
   if (bar) { bar.style.display = 'none'; bar.textContent = ''; }
   renderSessions();
   updateEmptyLayout();
+  if (window.metisNavigation) window.metisNavigation.recordSession(null);
 }
 
 // The POST resolves when the turn completes; while it is in flight the
@@ -2063,25 +2081,26 @@ async function runTurnItem(item) {
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
     if (!currentSessionId || currentSessionId === turnSessionId) {
       currentSessionId = resolvedTurnSessionId;
+      if (!turnSessionId && window.metisNavigation) window.metisNavigation.recordSession(resolvedTurnSessionId, { replace: true });
     }
-    const viewingTurn = currentSessionId === resolvedTurnSessionId;
-    if (viewingTurn && typeof loadSessionFiles === 'function') void loadSessionFiles(resolvedTurnSessionId);
-    if (viewingTurn && typeof loadArtifactsForSession === 'function') {
+    const viewingTurn = () => currentSessionId === resolvedTurnSessionId;
+    if (viewingTurn() && typeof loadSessionFiles === 'function') void loadSessionFiles(resolvedTurnSessionId);
+    if (viewingTurn() && typeof loadArtifactsForSession === 'function') {
       await loadArtifactsForSession(resolvedTurnSessionId, { rebuildCards: true, silent: true });
     }
     // If the SSE stream rendered nothing this turn (e.g. a text-less reply),
     // fall back to the returned text only while still viewing this session.
     let historySynced = false;
-    if (viewingTurn && runningTurnNeedsHistorySync) {
+    if (viewingTurn() && runningTurnNeedsHistorySync) {
       if (continuationUnchanged()) {
         historySynced = await syncViewedSessionHistory(resolvedTurnSessionId, continuationUnchanged);
         if (historySynced && continuationUnchanged()) runningTurnNeedsHistorySync = false;
       }
     }
-    if (viewingTurn && continuationUnchanged() && !historySynced && !streamedTextThisTurn && data.text) {
+    if (viewingTurn() && continuationUnchanged() && !historySynced && !streamedTextThisTurn && data.text) {
       addMessage('assistant', data.text);
     }
-    if (viewingTurn && data.stopped) showToast('Turn stopped');
+    if (viewingTurn() && data.stopped) showToast('Turn stopped');
     await loadSessions();
     turnSucceeded = true;
   } catch (e) {
@@ -3560,8 +3579,12 @@ function settingDescription(s) {
 let settingsTab = 'general';
 let themeMedia = null;
 
-async function openSettings() {
-  document.getElementById('settingsOverlay').classList.add('visible');
+async function openSettings(tab = settingsTab, fromNavigation = false) {
+  if (!fromNavigation && window.metisNavigation) {
+    return window.metisNavigation.navigate({ page: 'settings', tab });
+  }
+  document.getElementById('settingsOverlay').hidden = false;
+  showSettingsTab(tab, null, true);
   if (!settingsCache) {
     try {
       const res = await fetch('/api/settings');
@@ -3573,19 +3596,28 @@ async function openSettings() {
       showToast('Failed to load settings: ' + e.message);
     }
   }
-  renderSettingsTab();
+  // The fetch may complete after navigating to another page or settings tab.
+  if (!document.getElementById('settingsOverlay').hidden && settingsTab === tab) renderSettingsTab();
 }
 
 function closeSettings(e) {
   if (!e || e.target === document.getElementById('settingsOverlay')) {
-    document.getElementById('settingsOverlay').classList.remove('visible');
+    if (window.metisNavigation) window.metisNavigation.closeSettings();
+    else document.getElementById('settingsOverlay').hidden = true;
   }
 }
 
-function showSettingsTab(tab, el) {
+function showSettingsTab(tab, el, fromNavigation = false) {
+  if (!fromNavigation && window.metisNavigation) {
+    return window.metisNavigation.navigate({ page: 'settings', tab });
+  }
   settingsTab = tab;
-  document.querySelectorAll('.settings-item').forEach(i => i.classList.remove('active'));
-  if (el) el.classList.add('active');
+  document.querySelectorAll('.settings-item').forEach(item => {
+    const active = item.dataset.settingsTab === tab;
+    item.classList.toggle('active', active);
+    if (active) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+  });
   const content = document.getElementById('settingsContent');
   if (content) content.scrollTop = 0;
   renderSettingsTab();

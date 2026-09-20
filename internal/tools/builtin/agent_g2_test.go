@@ -22,6 +22,11 @@ package builtin
 //   5. **Backward compat**: no `isolation` and no `cwd` → no behavior
 //      change, sub-agent inherits parent cwd, no worktree spawn.
 //
+//   6. **Recoverable environment constraints**: a non-Git workspace cannot
+//      create a worktree, so METIS records the reason and runs the child once
+//      directly in that same workspace instead of asking the model to repeat
+//      a known-invalid dispatch.
+//
 import (
 	"context"
 	"os"
@@ -29,6 +34,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/execution"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -59,9 +65,11 @@ func TestAgentExecute_IsolationWithCwdUsesThatRepository(t *testing.T) {
 	}
 }
 
-func TestAgentExecute_WorktreeOutsideGitExplainsHowToRecover(t *testing.T) {
+func TestAgentExecute_WorktreeOutsideGitRecoversAndRemembers(t *testing.T) {
 	nonRepo := t.TempDir()
-	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system")
+	store := execution.NewStore(filepath.Join(t.TempDir(), "environment-profiles"))
+	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system").
+		WithExecutionMemory(store)
 	res, err := tool.Execute(context.Background(), map[string]any{
 		"prompt":    "x",
 		"isolation": "worktree",
@@ -70,13 +78,49 @@ func TestAgentExecute_WorktreeOutsideGitExplainsHowToRecover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute err: %v", err)
 	}
-	if !res.IsError {
-		t.Fatalf("non-git worktree request must fail: %+v", res)
+	if res.IsError {
+		t.Fatalf("non-git worktree request should recover to direct execution: %+v", res)
 	}
-	for _, want := range []string{"existing Git repository", `isolation="none"`, "Do not repeat"} {
+	for _, want := range []string{"Execution environment recovered", `isolation="none"`, "sub-agent done"} {
 		if !strings.Contains(res.Output, want) {
-			t.Errorf("recovery error missing %q: %s", want, res.Output)
+			t.Errorf("recovery result missing %q: %s", want, res.Output)
 		}
+	}
+	presentation, ok := res.Presentation["execution_environment"].(map[string]any)
+	if !ok || presentation["failure_code"] != string(execution.FailureWorktreeRequiresGit) || presentation["effective_isolation"] != "none" || presentation["auto_recovered"] != true {
+		t.Fatalf("execution recovery presentation = %#v", res.Presentation)
+	}
+	if presentation["recovery_remembered"] != true {
+		t.Fatalf("recovery should persist its environment rule: %#v", presentation)
+	}
+	profile, found, loadErr := store.Load(nonRepo)
+	if loadErr != nil || !found || profile.LastFailure == nil {
+		t.Fatalf("remembered profile = %+v, found=%v, err=%v", profile, found, loadErr)
+	}
+	if profile.LastFailure.Code != execution.FailureWorktreeRequiresGit || !profile.LastFailure.AutoRecovered {
+		t.Fatalf("remembered failure = %+v", profile.LastFailure)
+	}
+
+	// A fresh Agent instance simulates the next turn / next Desktop session.
+	// It must consult the durable rule and keep the same bounded fallback,
+	// rather than re-surfacing the old worktree setup failure to the model.
+	again := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system").
+		WithExecutionMemory(store)
+	second, secondErr := again.Execute(context.Background(), map[string]any{
+		"prompt":    "x",
+		"isolation": "worktree",
+		"cwd":       nonRepo,
+	})
+	if secondErr != nil || second == nil || second.IsError {
+		t.Fatalf("remembered recovery result = %+v, err=%v", second, secondErr)
+	}
+	secondPresentation, _ := second.Presentation["execution_environment"].(map[string]any)
+	if secondPresentation["recovery_reused"] != true {
+		t.Fatalf("second invocation did not reuse durable recovery: %#v", second.Presentation)
+	}
+	profile, found, loadErr = store.Load(nonRepo)
+	if loadErr != nil || !found || profile.LastFailure == nil || profile.LastFailure.Occurrences != 2 {
+		t.Fatalf("remembered occurrence count = %+v, found=%v, err=%v", profile, found, loadErr)
 	}
 }
 

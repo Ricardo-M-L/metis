@@ -10,6 +10,8 @@ const artifactState = {
   artifacts: [],
   loading: false,
   requestSequence: 0,
+  sessionGeneration: 0,
+  previewSequence: 0,
   active: null,
   activeVersion: 0,
   previewURL: '',
@@ -105,6 +107,7 @@ function artifactByID(id) {
 function upsertArtifact(item) {
   const normalized = normalizeArtifact(item);
   if (!normalized) return null;
+  if (normalized.sessionId && normalized.sessionId !== String(currentSessionId || '')) return null;
   const index = artifactState.artifacts.findIndex(candidate => candidate.id === normalized.id);
   if (index < 0) artifactState.artifacts.unshift(normalized);
   else artifactState.artifacts[index] = Object.assign({}, artifactState.artifacts[index], normalized);
@@ -113,11 +116,14 @@ function upsertArtifact(item) {
   return index < 0 ? artifactState.artifacts[0] : artifactState.artifacts[index];
 }
 
-function artifactAPIPath(id, action, version) {
+function artifactAPIPath(id, action, version, sessionId) {
+  const owner = String(sessionId || '').trim();
+  if (!owner) throw new Error('Open the artifact session before accessing its content');
   const base = '/api/artifacts/' + encodeURIComponent(String(id || ''));
   const suffix = action ? '/' + action : '';
-  const query = artifactNumber(version, 0) > 0 ? '?version=' + encodeURIComponent(String(version)) : '';
-  return base + suffix + query;
+  const query = ['sessionId=' + encodeURIComponent(owner)];
+  if (artifactNumber(version, 0) > 0) query.push('version=' + encodeURIComponent(String(version)));
+  return base + suffix + '?' + query.join('&');
 }
 
 function safeArtifactURL(value) {
@@ -292,11 +298,17 @@ function updateArtifactTabCount() {
 
 async function loadArtifactsForSession(sessionId, options = {}) {
   const normalizedSession = String(sessionId || '');
+  if (normalizedSession !== String(currentSessionId || '')) return [];
   const sequence = ++artifactState.requestSequence;
+  const generation = artifactState.sessionGeneration;
+  const isLatest = () => sequence === artifactState.requestSequence &&
+    generation === artifactState.sessionGeneration && normalizedSession === String(currentSessionId || '');
+  if (artifactState.sessionId !== normalizedSession) artifactState.artifacts = [];
   artifactState.sessionId = normalizedSession;
   artifactState.loading = !!normalizedSession;
   const loading = document.getElementById('artifactsLoading');
   if (loading) loading.hidden = !artifactState.loading;
+  renderArtifactGallery();
   if (!normalizedSession) {
     artifactState.artifacts = [];
     artifactState.loading = false;
@@ -310,18 +322,18 @@ async function loadArtifactsForSession(sessionId, options = {}) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'artifacts: ' + res.status);
-    if (sequence !== artifactState.requestSequence || normalizedSession !== String(currentSessionId || '')) return [];
+    if (!isLatest()) return [];
     artifactState.artifacts = artifactListPayload(data);
     if (options.rebuildCards) syncArtifactChatCards(artifactState.artifacts);
     return artifactState.artifacts;
   } catch (error) {
-    if (sequence === artifactState.requestSequence) {
+    if (isLatest()) {
       artifactState.artifacts = [];
       if (!options.silent) showToast('Unable to load artifacts: ' + error.message);
     }
     return [];
   } finally {
-    if (sequence === artifactState.requestSequence) {
+    if (isLatest()) {
       artifactState.loading = false;
       if (loading) loading.hidden = true;
       renderArtifactGallery();
@@ -339,6 +351,10 @@ async function refreshArtifacts() {
 
 function resetArtifactsForSession() {
   artifactState.requestSequence++;
+  artifactState.sessionGeneration++;
+  closeArtifactPreview({ navigation: false });
+  const deleteOverlay = document.getElementById('artifactDeleteOverlay');
+  if (deleteOverlay) deleteOverlay.hidden = true;
   artifactState.sessionId = '';
   artifactState.artifacts = [];
   artifactState.loading = false;
@@ -360,6 +376,7 @@ function openArtifactsPanel() {
   document.getElementById('tabChat').classList.remove('active');
   document.getElementById('tabTrace').classList.remove('active');
   document.getElementById('tabArtifacts').classList.add('active');
+  if (window.metisNavigation) window.metisNavigation.recordView('artifacts');
   if (artifactState.sessionId !== String(currentSessionId || '')) {
     loadArtifactsForSession(currentSessionId, { rebuildCards: true });
   } else {
@@ -376,31 +393,48 @@ function leaveArtifactsPanel() {
   if (tab) tab.classList.remove('active');
 }
 
-async function fetchArtifactDetail(id) {
-  const existing = artifactByID(id);
+async function fetchArtifactDetail(id, shouldApply = () => true) {
+  const sessionId = String(currentSessionId || '');
+  const generation = artifactState.sessionGeneration;
+  const isCurrent = () => generation === artifactState.sessionGeneration &&
+    sessionId === String(currentSessionId || '') && shouldApply();
+  const cached = artifactByID(id);
+  const existing = cached && (!cached.sessionId || cached.sessionId === sessionId) ? cached : null;
   try {
-    const res = await fetch(artifactAPIPath(id, '', 0), { headers: { Accept: 'application/json' } });
+    const res = await fetch(artifactAPIPath(id, '', 0, sessionId), { headers: { Accept: 'application/json' } });
     const data = await res.json().catch(() => ({}));
+    if (!isCurrent()) return null;
     if (!res.ok) throw new Error(data.error || 'artifact: ' + res.status);
     const raw = artifactValue(data, ['artifact', 'data', 'Artifact'], data);
-    return upsertArtifact(raw) || existing;
+    const item = normalizeArtifact(raw);
+    if (item && item.sessionId && item.sessionId !== sessionId) return null;
+    return upsertArtifact(item) || existing;
   } catch (error) {
+    if (!isCurrent()) return null;
     if (existing) return existing;
     throw error;
   }
 }
 
 async function previewArtifactByID(id, version) {
+  const sequence = ++artifactState.previewSequence;
+  const generation = artifactState.sessionGeneration;
+  const sessionId = String(currentSessionId || '');
+  const isCurrent = () => sequence === artifactState.previewSequence && generation === artifactState.sessionGeneration &&
+    sessionId === String(currentSessionId || '');
   artifactState.restoreFocus = document.activeElement;
   try {
-    const item = await fetchArtifactDetail(id);
+    const item = await fetchArtifactDetail(id, isCurrent);
+    if (!isCurrent()) return;
     if (!item) throw new Error('Artifact not found');
     artifactState.active = item;
     artifactState.activeVersion = artifactNumber(version, item.currentVersion) || item.currentVersion;
     openArtifactPreviewShell(item);
-    await loadArtifactPreviewURL(item, artifactState.activeVersion);
+    const selectedVersion = artifactState.activeVersion;
+    window.metisNavigation?.recordArtifact(item.id, selectedVersion);
+    await loadArtifactPreviewURL(item, selectedVersion);
   } catch (error) {
-    showToast('Unable to open artifact: ' + error.message);
+    if (isCurrent()) showToast('Unable to open artifact: ' + error.message);
   }
 }
 
@@ -426,7 +460,7 @@ function openArtifactPreviewShell(item) {
 }
 
 async function resolveArtifactPreviewURL(item, version) {
-  const endpoint = artifactAPIPath(item.id, 'preview', version);
+  const endpoint = artifactAPIPath(item.id, 'preview', version, item.sessionId || currentSessionId);
   const res = await fetch(endpoint, { headers: { Accept: 'application/json' } });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -449,35 +483,54 @@ async function resolveArtifactPreviewURL(item, version) {
 }
 
 async function loadArtifactPreviewURL(item, version) {
+  const sequence = ++artifactState.previewSequence;
+  const generation = artifactState.sessionGeneration;
+  const sessionId = String(currentSessionId || '');
+  const isCurrent = () => sequence === artifactState.previewSequence && generation === artifactState.sessionGeneration &&
+    sessionId === String(currentSessionId || '') && (!item.sessionId || item.sessionId === sessionId) &&
+    artifactState.active?.id === item.id && artifactState.activeVersion === version;
+  if (!isCurrent()) return false;
   const frame = document.getElementById('artifactPreviewFrame');
   const state = document.getElementById('artifactPreviewState');
   const meta = document.getElementById('artifactPreviewMeta');
-  if (!frame || !state) return;
+  if (!frame || !state) return false;
+  artifactState.previewURL = '';
+  frame.onload = null;
   frame.removeAttribute('src');
   state.hidden = false;
   state.textContent = 'Preparing preview…';
+  if (meta) meta.textContent = artifactVersionLabel(item, version);
   try {
     const safe = await resolveArtifactPreviewURL(item, version);
-    if (!artifactState.active || artifactState.active.id !== item.id || artifactState.activeVersion !== version) return;
+    if (!isCurrent()) return false;
     artifactState.previewURL = safe;
-    frame.onload = () => { state.hidden = true; };
+    frame.onload = () => { if (isCurrent()) state.hidden = true; };
     frame.src = safe;
     if (meta) meta.textContent = artifactVersionLabel(item, version);
+    return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     artifactState.previewURL = '';
     state.hidden = false;
     state.textContent = 'Preview unavailable: ' + error.message;
+    return false;
   }
 }
 
 async function selectArtifactVersion(value) {
   if (!artifactState.active) return;
   const version = artifactNumber(value, artifactState.active.currentVersion);
+  const item = artifactState.active;
+  if (item.sessionId && item.sessionId !== String(currentSessionId || '')) return;
+  if (!item.versions.some(candidate => candidate.number === version)) return;
   artifactState.activeVersion = version;
-  await loadArtifactPreviewURL(artifactState.active, version);
+  window.metisNavigation?.recordArtifact(item.id, version);
+  await loadArtifactPreviewURL(item, version);
 }
 
-function closeArtifactPreview() {
+function closeArtifactPreview(options = {}) {
+  if (options.navigation !== false && window.metisNavigation?.closeArtifact()) return;
+  artifactState.previewSequence++;
   const overlay = document.getElementById('artifactPreviewOverlay');
   const frame = document.getElementById('artifactPreviewFrame');
   if (overlay) overlay.hidden = true;
@@ -512,7 +565,7 @@ function triggerArtifactDownload(path, filename) {
 function downloadActiveArtifact() {
   if (!artifactState.active) return;
   triggerArtifactDownload(
-    artifactAPIPath(artifactState.active.id, 'download', artifactState.activeVersion),
+    artifactAPIPath(artifactState.active.id, 'download', artifactState.activeVersion, artifactState.active.sessionId || currentSessionId),
     artifactState.active.title.replace(/[^a-z0-9._-]+/gi, '-') + '-v' + artifactState.activeVersion + '.html'
   );
 }
@@ -520,20 +573,30 @@ function downloadActiveArtifact() {
 function exportActiveArtifact() {
   if (!artifactState.active) return;
   triggerArtifactDownload(
-    artifactAPIPath(artifactState.active.id, 'export', artifactState.activeVersion),
+    artifactAPIPath(artifactState.active.id, 'export', artifactState.activeVersion, artifactState.active.sessionId || currentSessionId),
     artifactState.active.title.replace(/[^a-z0-9._-]+/gi, '-') + '.zip'
   );
 }
 
 async function openActiveArtifactExternally() {
   if (!artifactState.active) return;
+  const item = artifactState.active;
+  const version = artifactState.activeVersion;
+  const sequence = artifactState.previewSequence;
+  const generation = artifactState.sessionGeneration;
+  const sessionId = String(currentSessionId || '');
+  const isCurrent = () => sequence === artifactState.previewSequence && generation === artifactState.sessionGeneration &&
+    sessionId === String(currentSessionId || '') && (!item.sessionId || item.sessionId === sessionId) &&
+    artifactState.active?.id === item.id && artifactState.activeVersion === version;
+  if (!isCurrent()) return;
   try {
-    const safe = artifactState.previewURL || await resolveArtifactPreviewURL(artifactState.active, artifactState.activeVersion);
+    const safe = artifactState.previewURL || await resolveArtifactPreviewURL(item, version);
+    if (!isCurrent()) return;
     if (!safeArtifactURL(safe)) throw new Error('unsafe preview URL');
     const opened = window.open(safe, '_blank', 'noopener,noreferrer');
     if (!opened) showToast('Allow pop-ups to open this artifact externally');
   } catch (error) {
-    showToast('Unable to open artifact externally: ' + error.message);
+    if (isCurrent()) showToast('Unable to open artifact externally: ' + error.message);
   }
 }
 
@@ -558,6 +621,11 @@ function cancelArtifactDeletion() {
 async function confirmArtifactDeletion() {
   if (!artifactState.active || artifactState.deletePending) return;
   const id = artifactState.active.id;
+  const sequence = artifactState.previewSequence;
+  const generation = artifactState.sessionGeneration;
+  const sessionId = String(currentSessionId || '');
+  const isCurrent = () => sequence === artifactState.previewSequence && generation === artifactState.sessionGeneration &&
+    sessionId === String(currentSessionId || '') && artifactState.active?.id === id;
   artifactState.deletePending = true;
   const confirmButton = document.getElementById('artifactDeleteConfirm');
   if (confirmButton) {
@@ -565,8 +633,9 @@ async function confirmArtifactDeletion() {
     confirmButton.textContent = 'Deleting…';
   }
   try {
-    const res = await fetch(artifactAPIPath(id, '', 0), { method: 'DELETE', headers: { Accept: 'application/json' } });
+    const res = await fetch(artifactAPIPath(id, '', 0, sessionId), { method: 'DELETE', headers: { Accept: 'application/json' } });
     const data = await res.json().catch(() => ({}));
+    if (!isCurrent()) return;
     if (!res.ok) throw new Error(data.error || 'delete: ' + res.status);
     document.querySelectorAll('.artifact-card[data-artifact-id="' + CSS.escape(id) + '"]').forEach(card => card.remove());
     artifactState.artifacts = artifactState.artifacts.filter(item => item.id !== id);
@@ -576,7 +645,7 @@ async function confirmArtifactDeletion() {
     updateArtifactTabCount();
     showToast('Artifact and all saved versions deleted');
   } catch (error) {
-    showToast('Unable to delete artifact: ' + error.message);
+    if (isCurrent()) showToast('Unable to delete artifact: ' + error.message);
   } finally {
     artifactState.deletePending = false;
     if (confirmButton) {

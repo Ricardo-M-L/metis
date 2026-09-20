@@ -20,6 +20,7 @@ let traceNextCursor = '';
 let traceTotalEvents = 0;
 let traceLoadingOlder = false;
 let traceLoadGeneration = 0;
+let traceSessionId = '';
 const TRACE_REDACTED_THINKING_PLACEHOLDER = 'Reasoning redacted by provider';
 
 // DSH kind palette: tag label, tag color class, timeline lane.
@@ -57,6 +58,7 @@ function switchView(view) {
     leaveArtifactsPanel();
   }
   currentView = view;
+  if (window.metisNavigation) window.metisNavigation.recordView(view);
   document.getElementById('tabChat').classList.toggle('active', view === 'chat');
   document.getElementById('tabTrace').classList.toggle('active', view === 'trace');
   const artifactsTab = document.getElementById('tabArtifacts');
@@ -76,6 +78,28 @@ function switchView(view) {
 function invalidateTraceLoads() {
   traceLoadGeneration++;
   traceLoadingOlder = false;
+}
+
+function resetTraceForSession() {
+  invalidateTraceLoads();
+  traceSessionId = String(currentSessionId || '');
+  traceEvents = [];
+  traceRows = [];
+  traceNextCursor = '';
+  traceTotalEvents = 0;
+  traceSelectedIdx = -1;
+  traceSelectedReq = -1;
+  traceTab = 'summary';
+  traceTurnsFolded = false;
+  traceCallsFolded = false;
+  traceFoldedTurns = new Set();
+  traceFoldedAssistants = new Set();
+  const body = document.getElementById('traceBody');
+  const track = document.getElementById('traceTrack');
+  if (body) body.innerHTML = '';
+  if (track) track.innerHTML = '';
+  closeTraceInspector(false);
+  if (body && track && document.getElementById('btnFoldTurns') && document.getElementById('btnFoldCalls')) renderTrace();
 }
 
 function fmtMs(ms) {
@@ -404,8 +428,10 @@ function mergeTraceEvents(older, current) {
 }
 
 async function loadTrace(loadOlder = false, sessionId = currentSessionId, shouldApply = () => true) {
-  if (loadOlder && (!traceNextCursor || traceLoadingOlder)) return;
   const requestedSessionId = String(sessionId || '');
+  if (!shouldApply() || requestedSessionId !== String(currentSessionId || '')) return;
+  if (traceSessionId !== requestedSessionId) resetTraceForSession();
+  if (loadOlder && (!traceNextCursor || traceLoadingOlder)) return;
   const generation = loadOlder ? traceLoadGeneration : ++traceLoadGeneration;
   const requestedCursor = loadOlder ? traceNextCursor : '';
   const isLatest = () => generation === traceLoadGeneration &&
@@ -413,6 +439,9 @@ async function loadTrace(loadOlder = false, sessionId = currentSessionId, should
   const body = document.getElementById('traceBody');
   const track = document.getElementById('traceTrack');
   traceLoadingOlder = loadOlder;
+  if (!loadOlder && !traceRows.length && body) {
+    body.innerHTML = '<tr><td colspan="2"><div class="tt-empty">Loading trajectory…</div></td></tr>';
+  }
   try {
     const params = new URLSearchParams({ limit: '500' });
     if (requestedSessionId) params.set('sessionId', requestedSessionId);
@@ -427,6 +456,7 @@ async function loadTrace(loadOlder = false, sessionId = currentSessionId, should
       traceTotalEvents = 0;
     }
     if (!data.enabled) {
+      resetTraceForSession();
       track.innerHTML = '';
       body.innerHTML = '<tr><td colspan="2"><div class="tt-empty">Session tracing is not enabled for this process.</div></td></tr>';
       closeTraceInspector(false);
@@ -443,6 +473,7 @@ async function loadTrace(loadOlder = false, sessionId = currentSessionId, should
     renderTrace();
   } catch (e) {
     if (!isLatest()) return;
+    if (!loadOlder) resetTraceForSession();
     track.innerHTML = '';
     body.innerHTML = '<tr><td colspan="2"><div class="tt-empty">Failed to load trajectory: ' + escHtml(e.message) + '</div></td></tr>';
     closeTraceInspector(false);

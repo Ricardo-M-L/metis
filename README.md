@@ -720,6 +720,11 @@ Agent({prompt: "continue", resume_from: "agt-d3a91b07"})
 # Team-lead mode: the main loop becomes an orchestrator
 METIS_COORDINATOR_MODE=1 metis chat
 # or: metis --coordinator chat
+
+# Durable project graph: survives a session switch or worker restart
+metis coordinator create --goal "Ship the migration" --cwd /absolute/project/path
+metis coordinator run <project-run-id> --cwd /absolute/project/path --until-idle
+metis coordinator status <project-run-id> --cwd /absolute/project/path
 ```
 
 Eight bundled agent profiles ship via `//go:embed`: `explore`, `plan`,
@@ -746,6 +751,11 @@ Cross-cutting:
   with `<memory_consolidation_done>` notifications back to the LLM
 - Panic recovery + ctx-aware drain on sub-agent abort so a buggy
   child can't pin the parent turn
+- `ProjectCoordinator` uses a workspace-bound dependency graph rather than a
+  session-only checklist: claims have leases, direct prerequisite evidence is
+  passed to the next worker, failures retain stable reasons, and only known
+  environment recovery rules are retried within a bounded attempt budget.
+  See [`docs/project-coordinator.md`](docs/project-coordinator.md).
 
 ## Subdirectory hints + SKILL.md inline shell (claude-code parity)
 

@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,11 +12,58 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/channels"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/execution"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/projectcoord"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 )
+
+type recordingEnvironmentMemory struct {
+	records []execution.Failure
+}
+
+func (m *recordingEnvironmentMemory) Load(string) (execution.Profile, bool, error) {
+	return execution.Profile{}, false, nil
+}
+
+func (m *recordingEnvironmentMemory) Record(_ execution.Profile, failure execution.Failure) error {
+	m.records = append(m.records, failure)
+	return nil
+}
+
+type environmentRecoveryProvider struct{}
+
+func (environmentRecoveryProvider) Name() string          { return "environment-test" }
+func (environmentRecoveryProvider) MaxContextTokens() int { return 100_000 }
+func (environmentRecoveryProvider) ModelID() string       { return "environment-test" }
+func (environmentRecoveryProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return &llm.Response{}, nil
+}
+func (environmentRecoveryProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	return &environmentRecoveryStream{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: "done"},
+		{Type: "message_delta", StopReason: "end_turn", OutputTokens: 1},
+		{Type: "message_stop"},
+	}}, nil
+}
+
+type environmentRecoveryStream struct {
+	events []llm.StreamEvent
+	idx    int
+}
+
+func (s *environmentRecoveryStream) Recv() (llm.StreamEvent, error) {
+	if s.idx >= len(s.events) {
+		return llm.StreamEvent{}, io.EOF
+	}
+	event := s.events[s.idx]
+	s.idx++
+	return event, nil
+}
+func (*environmentRecoveryStream) Close() error { return nil }
 
 func TestBuildToolRegistry_RegistersBuiltinsAndAgentAndSendMessage(t *testing.T) {
 	cfg := &config.Config{}
@@ -70,6 +119,64 @@ func TestBuildToolRegistry_AgentToolHasModelAndSystem(t *testing.T) {
 	}
 	if agent.Description() == "" {
 		t.Error("Agent tool description should be non-empty")
+	}
+}
+
+func TestBuildToolRegistryWiresEnvironmentRecoveryIntoAgent(t *testing.T) {
+	memory := &recordingEnvironmentMemory{}
+	reg := BuildToolRegistry(ToolRegistryOptions{
+		Cfg:               &config.Config{},
+		Gate:              permission.New(permission.ModeBypass),
+		Provider:          environmentRecoveryProvider{},
+		Model:             "environment-test",
+		System:            "sys",
+		ChannelRegistry:   channels.NewRegistry(),
+		EnvironmentMemory: memory,
+	})
+	raw, ok := reg.Get("Agent")
+	if !ok {
+		t.Fatal("Agent tool should be registered")
+	}
+	agentTool, ok := raw.(builtin.Agent)
+	if !ok {
+		t.Fatalf("Agent tool type = %T", raw)
+	}
+	result, err := agentTool.Execute(context.Background(), map[string]any{
+		"prompt":    "run directly when worktree is unavailable",
+		"isolation": "worktree",
+		"cwd":       t.TempDir(),
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("recovered Agent result = %+v, err=%v", result, err)
+	}
+	if len(memory.records) != 1 || memory.records[0].Code != execution.FailureWorktreeRequiresGit || !memory.records[0].AutoRecovered {
+		t.Fatalf("environment memory records = %+v", memory.records)
+	}
+}
+
+func TestBuildToolRegistryRegistersDurableProjectCoordinator(t *testing.T) {
+	workspace := t.TempDir()
+	reg := BuildToolRegistry(ToolRegistryOptions{
+		Cfg:                     &config.Config{},
+		Gate:                    permission.New(permission.ModeBypass),
+		Provider:                &stubProvider{maxCtx: 100_000},
+		Model:                   "test-model",
+		System:                  "test-system",
+		ChannelRegistry:         channels.NewRegistry(),
+		ProjectCoordinatorStore: projectcoord.NewStore(filepath.Join(t.TempDir(), "projects")),
+		ProjectWorkspace:        workspace,
+	})
+	raw, ok := reg.Get("ProjectCoordinator")
+	if !ok {
+		t.Fatal("durable ProjectCoordinator tool should be registered")
+	}
+	tool, ok := raw.(builtin.ProjectCoordinator)
+	if !ok {
+		t.Fatalf("ProjectCoordinator type = %T", raw)
+	}
+	result, err := tool.Execute(context.Background(), map[string]any{"action": "create", "goal": "Build a durable project"})
+	if err != nil || result == nil || !strings.Contains(result.Output, `"run"`) {
+		t.Fatalf("ProjectCoordinator create = %+v, err=%v", result, err)
 	}
 }
 

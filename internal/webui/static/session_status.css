@@ -1,0 +1,149 @@
+/* METIS Channel Marks: familiar state glyphs inside one compact visual language. */
+.session-item-status {
+  --session-status-tone: var(--fg-dim);
+  --session-status-frame: rgba(156, 169, 187, 0.48);
+  position: relative;
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  margin: 0 2px 0 0;
+  flex: 0 0 18px;
+  align-items: center;
+  justify-content: center;
+  color: var(--session-status-tone);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  cursor: help;
+  isolation: isolate;
+}
+
+.session-item-status::before,
+.session-item-status::after {
+  content: none;
+}
+
+.session-item-status > svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  overflow: visible;
+}
+
+.session-channel-frame {
+  stroke: var(--session-status-frame);
+  opacity: 0.86;
+}
+
+.session-channel-accent,
+.session-status-glyph {
+  stroke: currentColor;
+}
+
+.session-channel-accent {
+  stroke-width: 1.55;
+}
+
+.session-status-glyph {
+  stroke-width: 1.35;
+}
+
+.session-glyph-fill {
+  fill: currentColor;
+  stroke: none;
+}
+
+.session-item-status.idle,
+.session-item-status.archived,
+.session-item-status.unknown {
+  --session-status-tone: #97a2b3;
+}
+
+.session-item-status.loading,
+.session-item-status.running,
+.session-item-status.delegating,
+.session-item-status.plan {
+  --session-status-tone: #5a9cff;
+}
+
+.session-item-status.waiting {
+  --session-status-tone: #efb44d;
+}
+
+.session-item-status.approval {
+  --session-status-tone: #f58b4d;
+}
+
+.session-item-status.done {
+  --session-status-tone: #52cc88;
+}
+
+.session-item-status.stopped,
+.session-item-status.interrupted {
+  --session-status-tone: #a485ec;
+}
+
+.session-item-status.failed {
+  --session-status-tone: #ee6e73;
+}
+
+.session-item-status.loading .session-working-glyph,
+.session-item-status.running .session-working-glyph,
+.session-item-status.delegating .session-working-glyph {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sessionChannelSpin 1.15s linear infinite;
+}
+
+@keyframes sessionChannelSpin {
+  to { transform: rotate(360deg); }
+}
+
+.session-status-tooltip {
+  position: absolute;
+  z-index: 220;
+  top: 50%;
+  left: 23px;
+  width: max-content;
+  max-width: 230px;
+  padding: 5px 7px;
+  border: 1px solid var(--border-mid);
+  border-radius: 6px;
+  background: var(--surface-3);
+  box-shadow: var(--shadow-pop);
+  color: var(--fg-strong);
+  font: 11.5px/1.35 var(--font-ui);
+  letter-spacing: 0.01em;
+  pointer-events: none;
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  transform: translate(-3px, -50%);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms step-end;
+}
+
+.session-item-status:hover .session-status-tooltip,
+.session-item-status:focus-visible .session-status-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(0, -50%);
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.session-item.active .session-channel-frame,
+.session-item:hover .session-channel-frame {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-item-status.loading .session-working-glyph,
+  .session-item-status.running .session-working-glyph,
+  .session-item-status.delegating .session-working-glyph {
+    animation: none;
+  }
+
+  .session-status-tooltip {
+    transition: none;
+  }
+}

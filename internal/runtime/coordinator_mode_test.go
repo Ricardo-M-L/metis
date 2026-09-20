@@ -104,7 +104,7 @@ func TestCoordinatorToolFilter_OnDropsMutations(t *testing.T) {
 	t.Setenv(CoordinatorExtraToolsEnvVar, "")
 	in := []string{
 		"Edit", "Write", "Bash", "TodoWrite", "NotebookEdit",
-		"Agent", "Fork", "SubAgentList", "Read", "Grep",
+		"Agent", "Fork", "SubAgentList", "Read", "Grep", "ProjectCoordinator",
 		"TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
 	}
 	got := CoordinatorToolFilter(in)
@@ -114,7 +114,7 @@ func TestCoordinatorToolFilter_OnDropsMutations(t *testing.T) {
 	}
 	// Should keep:
 	for _, want := range []string{
-		"Agent", "Fork", "SubAgentList", "Read", "Grep",
+		"Agent", "Fork", "SubAgentList", "Read", "Grep", "ProjectCoordinator",
 		"TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
 	} {
 		if !gotSet[want] {

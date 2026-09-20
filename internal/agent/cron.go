@@ -67,17 +67,19 @@ type CronSchedule struct {
 // agent from accidentally invoking expensive tools (Agent sub-spawn,
 // WebFetch loops) without disabling them globally.
 type CronJob struct {
-	ID            string       `json:"id"`
-	Name          string       `json:"name"`
-	Prompt        string       `json:"prompt"`
-	Schedule      CronSchedule `json:"schedule"`
-	Enabled       bool         `json:"enabled"`
-	Paused        bool         `json:"paused"`
-	Repeat        int          `json:"repeat,omitempty"` // 0 = infinite
-	Skills        []string     `json:"skills,omitempty"`
-	SessionMode   string       `json:"session_mode,omitempty"`
-	SessionRef    string       `json:"session_ref,omitempty"`
-	DisabledTools []string     `json:"disabled_tools,omitempty"`
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Prompt      string       `json:"prompt"`
+	Schedule    CronSchedule `json:"schedule"`
+	Enabled     bool         `json:"enabled"`
+	Paused      bool         `json:"paused"`
+	Repeat      int          `json:"repeat,omitempty"` // 0 = infinite
+	Skills      []string     `json:"skills,omitempty"`
+	SessionMode string       `json:"session_mode,omitempty"`
+	SessionRef  string       `json:"session_ref,omitempty"`
+	// WorkDir binds durable Desktop jobs to their creation workspace; empty preserves legacy CLI cwd behavior.
+	WorkDir       string   `json:"work_dir,omitempty"`
+	DisabledTools []string `json:"disabled_tools,omitempty"`
 	// AllowTools is the per-job pre-authorization allow-list — claude-code's
 	// "always allow" rules adapted for UNATTENDED fires. A cron daemon has
 	// no human to answer a mid-fire permission prompt, so the decision is

@@ -1,0 +1,105 @@
+/* Pages share one shell. Inactive content remains mounted, including the
+   conversation/composer and their ongoing stream state. */
+.navigation-header {
+  display: flex;
+  flex: 0 0 44px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border-faint);
+  color: var(--fg-mid);
+  background: var(--bg);
+  order: -10;
+}
+.navigation-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.navigation-button svg { width: 16px; height: 16px; }
+.navigation-button:hover:not(:disabled) { color: var(--fg-strong); background: var(--surface-2); }
+.navigation-button:disabled { opacity: .3; cursor: default; }
+.navigation-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.navigation-title { margin-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.navigation-header[aria-busy='true'] .navigation-title { opacity: .6; }
+.main[data-page='session'].empty > .navigation-header { position: absolute; top: 0; left: 0; right: 0; height: 44px; }
+.app-page[hidden] { display: none !important; }
+.main[data-page]:not([data-page='session']) { justify-content: flex-start; }
+.main[data-page]:not([data-page='session']) > :not(.navigation-header):not(.app-page) { display: none !important; }
+.app[data-page]:not([data-page='session']) > .details-col,
+.app[data-page]:not([data-page='session']) > #detailsHandle,
+.app[data-page]:not([data-page='session']) > .session-file-panel { display: none !important; }
+.app[data-page='settings'] > .sidebar,
+.app[data-page='settings'] > #sidebarHandle { display: none !important; }
+.app-page { flex: 1 1 auto; min-width: 0; min-height: 0; }
+.settings-page { display: flex; overflow: hidden; background: var(--bg); }
+.settings-page .settings-panel {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: var(--bg);
+}
+.settings-page .settings-sidebar { background: var(--surface-1); }
+.settings-page .settings-content { min-width: 0; }
+.settings-page .settings-back { width: 100%; text-align: left; border: 0; background: transparent; }
+.main > .artifact-preview-overlay.app-page {
+  position: relative;
+  inset: auto;
+  z-index: auto;
+  padding: 0;
+  background: var(--bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  align-items: stretch;
+  justify-content: stretch;
+}
+.main > .app-page .artifact-preview-shell {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.sb-schedules {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 6px 10px;
+  margin: 0 0 6px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--fg-mid);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.sb-schedules svg { width: 16px; height: 16px; flex: 0 0 16px; }
+.sb-schedules:hover, .sb-schedules.active, .sb-settings.active { color: var(--fg-strong); background: var(--surface-2); }
+.sb-schedules:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.app.sb-rail .sb-schedules { justify-content: center; width: 36px; margin: 0 auto 6px; padding: 6px; }
+.app.sb-rail .sb-schedules span { display: none; }
+@media (max-width: 760px) {
+  .navigation-header { padding: 0 10px; }
+  .settings-page .settings-panel { flex-direction: column; }
+  .settings-page .settings-sidebar { width: 100%; min-width: 0; max-height: 190px; flex: 0 0 auto; border-right: 0; border-bottom: 1px solid var(--border-faint); }
+}

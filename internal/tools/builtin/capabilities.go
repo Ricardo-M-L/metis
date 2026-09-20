@@ -86,6 +86,13 @@ func (TaskCreate) IsReadOnly(map[string]any) bool { return false }
 func (TaskUpdate) IsReadOnly(map[string]any) bool { return false }
 func (TaskStop) IsReadOnly(map[string]any) bool   { return false }
 
+// ProjectCoordinator has read-only inspection actions, but creating a graph
+// or changing a claim/result persists durable project state.
+func (ProjectCoordinator) IsReadOnly(in map[string]any) bool {
+	action, _ := in["action"].(string)
+	return action == "list" || action == "status"
+}
+
 // Memory writes user-facing memory entries. Mutating but recoverable
 // (the file content stays on disk, no rm).
 func (Memory) IsReadOnly(map[string]any) bool { return false }

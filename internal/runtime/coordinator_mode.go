@@ -113,11 +113,15 @@ const defaultCoordinatorOverlay = `You are the team lead in a multi-agent workfl
 Your job is to PLAN and DISPATCH work to sub-agents (via the Agent
 and Fork tools), then SYNTHESIZE their results — not to do the
 hands-on edits yourself. Use Read/Grep/Glob only to gather enough
-context to delegate well. Use TaskCreate / TaskUpdate to assign and
-track structured work, TaskGet / TaskList to inspect it, TaskOutput
-to retain progress and results, and TaskStop to retire cancelled
-work. Use SubAgentList / SubAgentOutput to monitor execution and
-MessageTeammate to coordinate.
+context to delegate well. Start durable, cross-session work with
+ProjectCoordinator: create a run, add dependency-aware work, claim
+an item before dispatching a worker, then record its concrete result
+or failure. The tool carries workspace capability rules and safely
+requeues only known recoverable failures. Use TaskCreate / TaskUpdate
+for short-lived session-local notes, TaskGet / TaskList to inspect
+them, TaskOutput to retain progress and results, and TaskStop to
+retire cancelled work. Use SubAgentList / SubAgentOutput to monitor
+execution and MessageTeammate to coordinate.
 
 Hands-on tools (Edit, Write, Bash, TodoWrite) are unavailable in this
 mode by design. If a task needs code changes, spawn a sub-agent and
@@ -131,7 +135,8 @@ determines the team's output — not how much code the lead writes.`
 //
 //   - Orchestration: Agent, Fork, SendMessage, MessageTeammate,
 //     ScheduleWakeup
-//   - Structured work: TaskCreate, TaskGet, TaskList, TaskUpdate,
+//   - Durable project coordination: ProjectCoordinator
+//   - Structured session work: TaskCreate, TaskGet, TaskList, TaskUpdate,
 //     TaskOutput, TaskStop
 //   - Sub-agent monitoring: SubAgentList, SubAgentOutput, SubAgentStop
 //   - Read-only context-gathering: Read, Grep, Glob, LS
@@ -144,28 +149,29 @@ determines the team's output — not how much code the lead writes.`
 // teammate-level concern). Users who legitimately need a tool back
 // can add it via METIS_COORDINATOR_EXTRA_TOOLS.
 var coordinatorAllowedTools = map[string]struct{}{
-	"Agent":           {},
-	"Fork":            {},
-	"SendMessage":     {},
-	"MessageTeammate": {},
-	"ScheduleWakeup":  {},
-	"TaskCreate":      {},
-	"TaskGet":         {},
-	"TaskList":        {},
-	"TaskUpdate":      {},
-	"TaskOutput":      {},
-	"TaskStop":        {},
-	"SubAgentList":    {},
-	"SubAgentOutput":  {},
-	"SubAgentStop":    {},
-	"Read":            {},
-	"Grep":            {},
-	"Glob":            {},
-	"LS":              {},
-	"MetisInfo":       {},
-	"WebFetch":        {},
-	"WebSearch":       {},
-	"Memory":          {},
+	"Agent":              {},
+	"Fork":               {},
+	"SendMessage":        {},
+	"MessageTeammate":    {},
+	"ScheduleWakeup":     {},
+	"ProjectCoordinator": {},
+	"TaskCreate":         {},
+	"TaskGet":            {},
+	"TaskList":           {},
+	"TaskUpdate":         {},
+	"TaskOutput":         {},
+	"TaskStop":           {},
+	"SubAgentList":       {},
+	"SubAgentOutput":     {},
+	"SubAgentStop":       {},
+	"Read":               {},
+	"Grep":               {},
+	"Glob":               {},
+	"LS":                 {},
+	"MetisInfo":          {},
+	"WebFetch":           {},
+	"WebSearch":          {},
+	"Memory":             {},
 }
 
 // CoordinatorToolFilter returns the set of tool names that should

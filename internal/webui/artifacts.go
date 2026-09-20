@@ -275,9 +275,26 @@ func (s *Server) artifactSession(w http.ResponseWriter, r *http.Request) (string
 		writeError(w, http.StatusBadRequest, "invalid session id")
 		return "", false
 	}
-	if active != "" && requested != active {
-		writeError(w, http.StatusConflict, "activate the session before accessing its artifacts")
-		return "", false
+	if requested != active {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if active != "" {
+				writeError(w, http.StatusConflict, "activate the session before modifying its artifacts")
+				return "", false
+			}
+		} else {
+			// Browsing saved artifacts must not activate a session or rebind the
+			// running loop's workspace. Content comes only from the artifact
+			// store, which separately checks each manifest's session ownership.
+			if s.store == nil {
+				writeError(w, http.StatusNotFound, "session not found")
+				return "", false
+			}
+			header, _, err := s.store.LoadHeader(requested)
+			if err != nil || header == nil || header.ID != requested {
+				writeError(w, http.StatusNotFound, "session not found")
+				return "", false
+			}
+		}
 	}
 	return requested, true
 }
@@ -448,7 +465,7 @@ func writeArtifactError(w http.ResponseWriter, err error) {
 	case errors.Is(err, artifact.ErrNotFound):
 		writeError(w, http.StatusNotFound, "artifact not found")
 	case errors.Is(err, artifact.ErrOwnerMismatch):
-		writeError(w, http.StatusForbidden, "artifact does not belong to the active session")
+		writeError(w, http.StatusForbidden, "artifact does not belong to the requested session")
 	case errors.Is(err, artifact.ErrInvalidID), errors.Is(err, artifact.ErrInvalidSession), errors.Is(err, artifact.ErrInvalidPath):
 		writeError(w, http.StatusBadRequest, "invalid artifact request")
 	case errors.Is(err, artifact.ErrUnsafeFile):

@@ -10,10 +10,12 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/channels"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/execution"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/projectcoord"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -84,6 +86,26 @@ type ToolRegistryOptions struct {
 	// build time. When nil, Agent/Fork run uncapped and untracked —
 	// fine for tests but not production.
 	Roster *agent.Roster
+
+	// EnvironmentMemory persists deterministic workspace capability failures
+	// discovered by Agent preflight. Nil uses a private sibling of the session
+	// store when that store is configured; lightweight embedders can leave both
+	// empty and still get immediate, non-durable recovery.
+	EnvironmentMemory execution.Memory
+
+	// ProjectCoordinatorStore owns durable, project-scoped work graphs. When
+	// omitted, the normal session runtime creates a private sibling under
+	// ~/.metis/project-coordinator and shares EnvironmentMemory with it so a
+	// new worker sees the same execution recovery rule as Agent.
+	ProjectCoordinatorStore *projectcoord.Store
+	// ProjectWorkspace is the default workspace exposed to the LLM-facing
+	// ProjectCoordinator tool. A sub-agent's context cwd still takes priority.
+	// Empty resolves to the process working directory at registry construction.
+	ProjectWorkspace string
+	// ProjectWorkspaceResolver is evaluated at ProjectCoordinator call time.
+	// Desktop uses it to follow the active session header without rebuilding the
+	// whole tool registry on every session switch.
+	ProjectWorkspaceResolver func() string
 }
 
 // BuildToolRegistry constructs the per-session tools.Registry, registers
@@ -110,6 +132,32 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// G.1's run_in_background path through the bash job pool's
 	// notification channel.
 	agentTool := builtin.NewAgentWithMinimal(opts.Gate, opts.Provider, reg, opts.Model, opts.System, opts.MinimalSystem)
+	environmentMemory := opts.EnvironmentMemory
+	if environmentMemory == nil && opts.Cfg != nil && opts.Cfg.Session.Dir != "" {
+		environmentMemory = execution.NewStore(filepath.Join(filepath.Dir(opts.Cfg.Session.Dir), "execution"))
+	}
+	if environmentMemory != nil {
+		agentTool = agentTool.WithExecutionMemory(environmentMemory)
+	}
+	projectStore := opts.ProjectCoordinatorStore
+	if projectStore == nil && opts.Cfg != nil && opts.Cfg.Session.Dir != "" {
+		home := filepath.Dir(opts.Cfg.Session.Dir)
+		projectStore = projectcoord.NewStore(
+			filepath.Join(home, "project-coordinator"),
+			projectcoord.WithExecutionMemory(environmentMemory),
+		)
+	}
+	if projectStore != nil {
+		workspace := opts.ProjectWorkspace
+		if workspace == "" {
+			workspace, _ = os.Getwd()
+		}
+		projectTool := builtin.NewProjectCoordinator(opts.Gate, projectStore, workspace)
+		if opts.ProjectWorkspaceResolver != nil {
+			projectTool = projectTool.WithWorkspaceResolver(opts.ProjectWorkspaceResolver)
+		}
+		reg.Register(projectTool)
+	}
 	if opts.Roster != nil {
 		agentTool = agentTool.WithRoster(opts.Roster)
 	}

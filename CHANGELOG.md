@@ -7,6 +7,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- Durable project coordination: `metis coordinator create|list|status|add|run|claim|complete|fail|recover` now stores a workspace-bound dependency graph with worker leases, bounded recovery, result evidence, and a compact event trail. The same `ProjectCoordinator` tool is available to coordinator-mode agents, so project state survives session switches and Desktop/CLI restarts.
+
+### Changed
+
+- Agent now records deterministic workspace capability failures and recovers a
+  non-Git `isolation: "worktree"` request once by retaining its explicit
+  `cwd` and using direct execution. The recovery is persisted under the
+  METIS session root and shown in the tool trace; nested worktrees and other
+  ambiguous failures remain blocked with an actionable explanation.
+
 ## [0.4.59] - 2026-09-12
 
 Prepared as a full CLI and Desktop release. Publication requires the complete

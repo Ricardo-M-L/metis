@@ -84,6 +84,36 @@ same explicit flow for the published amd64 binary. Windows release discovery is
 shown but automatic activation is disabled until a signed hand-off helper can
 replace the running executable safely.
 
+## Navigation and scheduled tasks
+
+Settings and scheduled tasks are pages inside the main window. Use the back
+and forward buttons, `Alt+Left` / `Alt+Right`, `Cmd+[` / `Cmd+]` on macOS, or mouse side buttons to move
+through previously visited pages. Opening settings does not stop an active
+conversation. Conversation, trajectory, artifact and file views belong to the
+selected session; results from an earlier selection must not replace the
+currently selected session.
+
+The **Scheduled tasks** page manages the existing durable Metis cron jobs. It
+provides search, creation and editing, pause/resume, manual execution, deletion,
+and per-run results. Schedules support intervals, cron expressions and one-time
+execution, with an explicit time zone. A run has its own identifier and records
+its start, finish, outcome and associated conversation when one was created.
+Tasks created in Desktop retain that application's workspace directory for
+later runs, including runs started by a different Desktop instance. Older CLI
+jobs without a saved workspace retain their existing launch-directory behavior.
+
+Scheduled execution is off until explicitly enabled in the page. This setting
+is remembered for future Desktop launches. The scheduler runs in the local
+backend, so closing the task page does not stop it; quitting Desktop does.
+This does not install a system service or guarantee execution while the
+computer is asleep. An independently started `metis cron start` process remains
+independent of the Desktop scheduler switch.
+
+Unattended runs use the job's tool allow-list and Metis cron permission checks.
+They do not inherit an interactive conversation's bypass permission mode.
+Pausing or deleting a schedule prevents future scheduled runs; inspect an
+already running job's status separately.
+
 ## Development
 
 Build the CLI first and give Wails an absolute path to it:
@@ -108,7 +138,7 @@ before compiling the application.
 From the repository root:
 
 ```sh
-go test ./internal/desktop ./cmd/metis
+go test ./internal/webui ./internal/desktop ./cmd/metis
 (
   cd metis-desktop
   go test ./...

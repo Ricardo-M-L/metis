@@ -7,19 +7,23 @@ let openWorkspaceMenuBtn = null;
 let sessionsNextCursor = '';
 let sessionsTotal = 0;
 let sessionsLoading = false;
+let sessionsLoadGeneration = 0;
 let sessionSearchTimer = null;
 let sessionDeleteDialog = null;
 let sessionRenameDialog = null;
 let workspaceRenameDialog = null;
 let workspaceRemoveDialog = null;
 let resumeSessionGeneration = 0;
+let pendingSessionId = null;
 let sessionStatsGeneration = 0;
 let removedWorkspaceIDs = new Set();
 
 function invalidateSessionAsyncLoads() {
   resumeSessionGeneration++;
   sessionStatsGeneration++;
+  pendingSessionId = null;
   if (typeof invalidateTraceLoads === 'function') invalidateTraceLoads();
+  if (typeof renderSessions === 'function') renderSessions();
 }
 
 async function loadWorkspaces() {
@@ -410,7 +414,10 @@ document.addEventListener('click', e => {
 });
 
 async function loadSessions(append) {
-	if (sessionsLoading) return;
+	if (sessionsLoading && append) return;
+	const generation = ++sessionsLoadGeneration;
+	const requestedFilter = sessionFilter;
+	const requestedArchived = showArchivedSessions;
 	sessionsLoading = true;
   try {
 	const params = new URLSearchParams({ limit: '50' });
@@ -421,6 +428,7 @@ async function loadSessions(append) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`sessions: ${res.status}`);
     const data = await res.json();
+	if (generation !== sessionsLoadGeneration || requestedFilter !== sessionFilter || requestedArchived !== showArchivedSessions) return;
 	const page = data.sessions || [];
 	if (append) {
 	  const merged = new Map(sessions.map(s => [s.id, s]));
@@ -433,8 +441,9 @@ async function loadSessions(append) {
 	sessionsTotal = Number(data.total) || sessions.length;
 	renderSessions();
   } catch (e) {
+    if (generation !== sessionsLoadGeneration || requestedFilter !== sessionFilter || requestedArchived !== showArchivedSessions) return;
     document.getElementById('sessionList').innerHTML = '<div style="padding:12px;color:var(--red);font-size:13px;">Unable to load sessions</div>';
-	} finally { sessionsLoading = false; }
+	} finally { if (generation === sessionsLoadGeneration) sessionsLoading = false; }
 }
 
 async function loadMoreSessions() {
@@ -1010,30 +1019,57 @@ function renderWorkspaceHeader(ws, count, index) {
 }
 
 function sessionState(s) {
-  if (s.archived || showArchivedSessions) return { name: 'archived', label: 'Archived' };
-  if (typeof turnRunning !== 'undefined' && turnRunning && runningSessionId && s.id === runningSessionId) {
-    return { name: 'running', label: s.id === currentSessionId ? 'Running' : 'Running in background' };
+  const sessionStateInfo = (name, label) => ({ name, label, tooltip: label });
+  if (pendingSessionId === s.id) return sessionStateInfo('loading', uiText('Opening session', '正在打开会话'));
+  if (s.archived || showArchivedSessions) return sessionStateInfo('archived', uiText('Archived', '已归档'));
+  const selected = s.id === currentSessionId;
+  if (selected && typeof pendingAsk !== 'undefined' && pendingAsk) return sessionStateInfo('waiting', uiText('Waiting for your answer', '等待你的回答'));
+  if (selected && document.querySelector('.perm-card:not(.approved):not(.denied)')) return sessionStateInfo('approval', uiText('Waiting for approval', '等待确认'));
+  if (typeof turnRunning !== 'undefined' && turnRunning && (s.id === runningSessionId || selected && !runningSessionId)) {
+    if (selected && lastStatusSnapshot && Number(lastStatusSnapshot.subAgents) > 0) return sessionStateInfo('delegating', uiText('Sub-agents running', '子代理运行中'));
+    return selected
+      ? sessionStateInfo('running', uiText('Running', '运行中'))
+      : sessionStateInfo('running', uiText('Running in background', '后台运行中'));
   }
-  if (s.id !== currentSessionId) {
-    if (s.status === 'running') return { name: 'running', label: 'Interrupted while running' };
-    if (s.status === 'failed') return { name: 'failed', label: 'Last turn failed' };
-    if (s.status === 'stopped') return { name: 'stopped', label: 'Last turn stopped' };
-    if (s.mode === 'plan') return { name: 'plan', label: s.status === 'completed' ? 'Plan session completed' : 'Plan session' };
-    if (s.status === 'completed') return { name: 'done', label: 'Completed' };
-    return { name: 'done', label: 'Idle' };
-  }
-  if (typeof pendingAsk !== 'undefined' && pendingAsk) return { name: 'waiting', label: 'Waiting for your answer' };
-  if (document.querySelector('.perm-card:not(.approved):not(.denied)')) return { name: 'approval', label: 'Waiting for approval' };
-  if (typeof turnRunning !== 'undefined' && turnRunning && (!runningSessionId || s.id === runningSessionId)) {
-    if (lastStatusSnapshot && Number(lastStatusSnapshot.subAgents) > 0) return { name: 'delegating', label: 'Sub-agents running' };
-    return { name: 'running', label: 'Running' };
-  }
-  if (s.status === 'running') return { name: 'running', label: 'Interrupted while running' };
-  if (s.status === 'failed') return { name: 'failed', label: 'Last turn failed' };
-  if (s.status === 'stopped') return { name: 'stopped', label: 'Last turn stopped' };
-  if (s.mode === 'plan') return { name: 'plan', label: 'Plan session' };
-  if (s.status === 'completed') return { name: 'done', label: 'Completed' };
-  return { name: 'done', label: 'Idle' };
+  if (s.status === 'running') return sessionStateInfo('interrupted', uiText('Interrupted while running', '上次运行已中断'));
+  if (s.status === 'failed') return sessionStateInfo('failed', uiText('Last turn failed', '上一轮失败'));
+  if (s.status === 'stopped') return sessionStateInfo('stopped', uiText('Last turn stopped', '上一轮已停止'));
+  if (s.mode === 'plan') return s.status === 'completed'
+    ? sessionStateInfo('plan', uiText('Plan session completed', '计划已完成'))
+    : sessionStateInfo('plan', uiText('Plan session', '计划会话'));
+  if (s.status === 'completed') return sessionStateInfo('done', uiText('Completed', '已完成'));
+  if (s.status && s.status !== 'idle') return sessionStateInfo('unknown', uiText('Unknown state', '状态未知'));
+  return sessionStateInfo('idle', uiText('Idle', '空闲'));
+}
+
+function sessionStatusIcon(state) {
+  // The shared open-corner channel gives the sidebar a METIS visual language;
+  // familiar inner glyphs keep every state readable at the 18px list scale.
+  const icons = {
+    idle: '<path class="session-glyph-fill" d="M10.25 3.15a4.95 4.95 0 1 0 2.62 8.96A4.58 4.58 0 0 1 10.25 3.15Z"/>',
+    loading: '<g class="session-working-glyph"><path d="M8 3.05a4.95 4.95 0 1 1-4.1 2.18"/><path d="M3.05 6.25v-2.1h2.1"/></g>',
+    running: '<g class="session-working-glyph"><path d="M8 3.05a4.95 4.95 0 1 1-4.1 2.18"/><path d="M3.05 6.25v-2.1h2.1"/></g>',
+    delegating: '<g class="session-working-glyph"><path d="M8 3.05a4.95 4.95 0 1 1-4.1 2.18"/><path d="M3.05 6.25v-2.1h2.1"/></g>',
+    waiting: '<path d="M3.1 4.2h9.8v6.05H8.1l-2.55 1.85v-1.85H3.1z"/><path class="session-glyph-fill" d="M5.65 7.2a.7.7 0 1 0 0 .01m2.35-.01a.7.7 0 1 0 0 .01m2.35-.01a.7.7 0 1 0 0 .01"/>',
+    approval: '<path d="M5.05 8.2V5.1a.82.82 0 0 1 1.64 0v1.82V3.8a.82.82 0 0 1 1.64 0v3.12V4.45a.82.82 0 0 1 1.64 0v3.08l.78-.48a1 1 0 0 1 1.37.3.93.93 0 0 1-.22 1.26l-1.72 1.47a3.7 3.7 0 0 1-2.42.9H7.6a2.55 2.55 0 0 1-2.55-2.78Z"/><path class="session-glyph-fill" d="M12.45 3.08a.7.7 0 1 0 0 .01"/>',
+    done: '<path d="m4.1 8.25 2.35 2.3 5.45-5.15"/>',
+    stopped: '<path d="M5.45 4.35v7.3M10.55 4.35v7.3"/>',
+    interrupted: '<path d="M5.45 4.35v7.3M10.55 4.35v7.3"/>',
+    failed: '<path d="m8 2.85 5.15 5.15L8 13.15 2.85 8Z"/><path d="M8 5.6v3M8 10.55v.1"/>',
+    plan: '<path d="m10.9 5.1-1.4 4.4-4.4 1.4 1.4-4.4z"/><path d="M5.05 10.95 3.8 12.2M10.95 5.05 12.2 3.8"/>',
+    archived: '<path d="M3.35 5.3h9.3v7.05h-9.3z"/><path d="M2.8 3.65h10.4v1.7H2.8zM6.25 8.4h3.5"/>',
+    unknown: '<path d="m8 2.85 5.15 5.15L8 13.15 2.85 8Z"/><path d="M6.65 6.35a1.45 1.45 0 1 1 2.25 1.2c-.72.5-.9.78-.9 1.35M8 10.65v.1"/>',
+  };
+  const icon = icons[state.name] || icons.unknown;
+  const tooltip = state.tooltip || state.label;
+  return `<span class="session-item-status ${state.name}" role="img" aria-label="${escAttr(tooltip)}" title="${escAttr(tooltip)}">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path class="session-channel-frame" d="M5.25 1.5H3.8A2.3 2.3 0 0 0 1.5 3.8v1.45M10.75 1.5h1.45a2.3 2.3 0 0 1 2.3 2.3v1.45M1.5 10.75v1.45a2.3 2.3 0 0 0 2.3 2.3h1.45M14.5 10.75v1.45a2.3 2.3 0 0 1-2.3 2.3h-1.45"/>
+      <path class="session-channel-accent" d="M3.8 1.5h1.45M14.5 10.75v1.45a2.3 2.3 0 0 1-2.3 2.3h-1.45"/>
+      <g class="session-status-glyph">${icon}</g>
+    </svg>
+    <span class="session-status-tooltip" aria-hidden="true">${escHtml(tooltip)}</span>
+  </span>`;
 }
 
 function sessionItemKeydown(e, id) {
@@ -1046,10 +1082,10 @@ function sessionItemKeydown(e, id) {
 function renderSessionItem(s) {
   const time = relativeTime(s.updatedAt || s.createdAt);
   const state = sessionState(s);
-		const detail = `data-detail-title="${escAttr(s.title || 'Untitled')}" data-detail-path="${escAttr(s.workDir || '')}" data-detail-model="${escAttr(s.model || '')}" data-detail-meta="${escAttr([s.status || 'idle', s.preset || 'standard', s.mode || '', s.effort || 'default effort', new Date(s.updatedAt || s.createdAt).toLocaleString()].filter(Boolean).join(' · '))}"`;
+		const detail = `data-detail-title="${escAttr(s.title || 'Untitled')}" data-detail-path="${escAttr(s.workDir || '')}" data-detail-model="${escAttr(s.model || '')}" data-detail-meta="${escAttr([state.label, s.preset || 'standard', s.mode || '', s.effort || 'default effort', new Date(s.updatedAt || s.createdAt).toLocaleString()].filter(Boolean).join(' · '))}"`;
   if (showArchivedSessions) {
-	return `<div class="session-item archived" ${detail} tabindex="0">
-      <span class="session-item-status archived" title="Archived" aria-label="Archived"></span>
+	return `<div class="session-item archived" ${detail} role="group" aria-label="${escAttr(s.title || 'Untitled')} — ${escAttr(state.label)}" tabindex="0">
+      ${sessionStatusIcon(state)}
       <span class="session-item-name">${escHtml(s.title)}</span>
       <span class="session-item-time">${time}</span>
     <button class="session-more" aria-label="Session actions for ${escAttr(s.title)}" aria-haspopup="menu" aria-expanded="false" onclick="event.stopPropagation();toggleSessionMenu(this)">&#8943;</button>
@@ -1060,8 +1096,8 @@ function renderSessionItem(s) {
       </div>
     </div>`;
   }
-  return `<div class="session-item${s.id === currentSessionId ? ' active' : ''}" role="button" tabindex="0" aria-label="Open session ${escAttr(s.title)}" ${detail} data-state="${state.name}" onclick="resumeSession('${escOnclick(s.id)}')" onkeydown="sessionItemKeydown(event,'${escOnclick(s.id)}')">
-    <span class="session-item-status ${state.name}" title="${escAttr(state.label)}" aria-label="${escAttr(state.label)}"></span>
+  return `<div class="session-item${s.id === currentSessionId ? ' active' : ''}" role="button" tabindex="0" aria-label="Open session ${escAttr(s.title)} — ${escAttr(state.label)}" ${detail} data-state="${state.name}" onclick="resumeSession('${escOnclick(s.id)}')" onkeydown="sessionItemKeydown(event,'${escOnclick(s.id)}')">
+    ${sessionStatusIcon(state)}
     <span class="session-item-name">${escHtml(s.title)}</span>
     <span class="session-item-time">${time}</span>
     <button class="session-more" aria-label="Session actions for ${escAttr(s.title)}" aria-haspopup="menu" aria-expanded="false" onclick="event.stopPropagation();toggleSessionMenu(this)">&#8943;</button>
@@ -1086,6 +1122,7 @@ function renderSessions() {
   }
   const visibleWorkspaceIDs = workspaces.length ? new Set(workspaces.map(w => w.id)) : null;
   const sorted = sortSessionItems(sessions.filter(s => {
+    if (!!s.archived !== showArchivedSessions) return false;
     if (s.workspaceId && removedWorkspaceIDs.has(s.workspaceId)) return false;
     if (visibleWorkspaceIDs && s.workspaceId && !visibleWorkspaceIDs.has(s.workspaceId)) return false;
     return sessionMatches(s);
@@ -1177,11 +1214,10 @@ function toggleSessionsExpand() {
 async function resumeSession(id) {
   const generation = ++resumeSessionGeneration;
   const isLatest = () => generation === resumeSessionGeneration;
+  pendingSessionId = id;
+  renderSessions();
   try {
     let viewOnly = typeof turnRunning !== 'undefined' && turnRunning;
-    if (viewOnly && id !== currentSessionId && currentSessionId === runningSessionId) {
-      detachRunningTurnView();
-    }
     let endpoint = viewOnly
       ? '/api/sessions/' + encodeURIComponent(id)
       : '/api/sessions/activate';
@@ -1199,7 +1235,6 @@ async function resumeSession(id) {
       if (conflict.turnRunning) {
         const active = String(conflict.runningSessionId || currentSessionId || '');
         if (typeof setTurnRunning === 'function') setTurnRunning(true, active);
-        if (currentSessionId === active) detachRunningTurnView();
         viewOnly = true;
         endpoint = '/api/sessions/' + encodeURIComponent(id);
         options = { method: 'GET' };
@@ -1210,7 +1245,20 @@ async function resumeSession(id) {
     if (!res.ok) throw new Error(`resume: ${res.status}`);
     const data = await res.json();
     if (!isLatest()) return;
+    // Direct links (for example, automation runs) may target a saved session
+    // outside the current list page. Cache only its verified server metadata.
+    if (data.session && data.session.id === id && !sessions.some(session => session.id === id)) {
+      sessions = [data.session, ...sessions];
+    }
+    if (id !== currentSessionId && typeof detachRunningTurnView === 'function') detachRunningTurnView();
     currentSessionId = id;
+    pendingSessionId = null;
+    if (typeof syncTurnControls === 'function') syncTurnControls();
+    // Commit the selected row with its transcript. Auxiliary trace, artifact,
+    // and configuration requests must not keep the old row highlighted.
+    renderSessions();
+    if (typeof resetTraceForSession === 'function') resetTraceForSession();
+    if (typeof resetArtifactsForSession === 'function') resetArtifactsForSession();
     if (typeof resetSessionFiles === 'function') resetSessionFiles();
     if (typeof renderQueuedTurns === 'function') renderQueuedTurns();
     if (currentView === 'trace') loadTrace(false, id, isLatest);
@@ -1218,6 +1266,7 @@ async function resumeSession(id) {
     messages = [];
     streamedTextThisTurn = false;
     renderHistoryMessages(data.messages);
+    if (window.metisNavigation) window.metisNavigation.recordSession(id);
     await restoreCompactionHistory(id, isLatest);
     if (!isLatest()) return;
     if (typeof loadArtifactsForSession === 'function') {
@@ -1237,7 +1286,14 @@ async function resumeSession(id) {
     if (!turnRunning && queuedTurns.length && (!queuedSessionId || queuedSessionId === currentSessionId)) {
       setTimeout(drainQueuedTurns, 0);
     }
+    return true;
   } catch (e) {
     if (isLatest()) showError('Unable to resume this session.');
+    return false;
+  } finally {
+    if (isLatest()) {
+      pendingSessionId = null;
+      renderSessions();
+    }
   }
 }

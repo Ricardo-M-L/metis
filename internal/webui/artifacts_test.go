@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/artifact"
+	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
 func TestSanitizeArtifactHTMLMakesStaticDocument(t *testing.T) {
@@ -191,7 +192,10 @@ func TestArtifactAPIListsPreviewsDownloadsExportsAndDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, _ := testServer(t)
+	server, sessionStore := testServer(t)
+	if err := sessionStore.WriteHeaderFull(session.Header{ID: "session-b", WorkDir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
 	server.artifactStore = store
 	server.activeSessionID = "session-a"
 	handler := server.handler()
@@ -211,9 +215,9 @@ func TestArtifactAPIListsPreviewsDownloadsExportsAndDeletes(t *testing.T) {
 	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"current_version":2`) {
 		t.Fatalf("detail = %d %s", detail.Code, detail.Body.String())
 	}
-	conflict := do(http.MethodGet, "/api/artifacts?sessionId=session-b")
-	if conflict.Code != http.StatusConflict {
-		t.Fatalf("inactive-session list = %d, want 409", conflict.Code)
+	historical := do(http.MethodGet, "/api/artifacts?sessionId=session-b")
+	if historical.Code != http.StatusOK || !strings.Contains(historical.Body.String(), foreign.ID) || strings.Contains(historical.Body.String(), created.ID) {
+		t.Fatalf("saved-session list = %d %s", historical.Code, historical.Body.String())
 	}
 	forbidden := do(http.MethodGet, "/api/artifacts/"+foreign.ID)
 	if forbidden.Code != http.StatusForbidden {
@@ -272,5 +276,146 @@ func TestArtifactAPIListsPreviewsDownloadsExportsAndDeletes(t *testing.T) {
 	}
 	if _, err := store.Get("session-a", updated.ID); !errors.Is(err, artifact.ErrNotFound) {
 		t.Fatalf("artifact survived DELETE: %v", err)
+	}
+}
+
+func TestArtifactReadSavedSessionWhileAnotherTurnRuns(t *testing.T) {
+	server, sessions := testServer(t)
+	workspaceA, workspaceB := t.TempDir(), t.TempDir()
+	for _, header := range []session.Header{
+		{ID: "saved-a", WorkDir: workspaceA, Status: "completed"},
+		{ID: "running-b", WorkDir: workspaceB, Status: "running"},
+	} {
+		if err := sessions.WriteHeaderFull(header); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := artifact.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create("saved-a", "Saved A report", "<h1>Only A</h1>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.Create("running-b", "Running B report", "<h1>Only B</h1>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := store.Create("missing-session", "Orphan", "<p>not a saved session</p>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.artifactStore = store
+	server.activeSessionID, server.activeWorkDir = "running-b", workspaceB
+	server.runningSession, server.turnDone = "running-b", make(chan struct{})
+	server.runMu.Lock() // A running turn owns activation, as in the native client.
+	defer server.runMu.Unlock()
+	handler := server.handler()
+	do := func(method, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(method, path, nil))
+		return rr
+	}
+	for _, path := range []string{
+		"/api/artifacts?sessionId=saved-a",
+		"/api/artifacts/" + created.ID + "?sessionId=saved-a",
+		"/api/artifacts/" + created.ID + "/download?sessionId=saved-a",
+		"/api/artifacts/" + created.ID + "/export?sessionId=saved-a",
+		"/api/artifacts/" + created.ID + "/preview?sessionId=saved-a",
+	} {
+		response := do(http.MethodGet, path)
+		if response.Code != http.StatusOK {
+			t.Fatalf("read saved A during running B: %s = %d: %s", path, response.Code, response.Body.String())
+		}
+		if strings.Contains(path, "/download?") && (!strings.Contains(response.Body.String(), "Only A") || strings.Contains(response.Body.String(), "Only B")) {
+			t.Fatalf("saved artifact download used the running workspace: %s", response.Body.String())
+		}
+		if strings.HasPrefix(path, "/api/artifacts?") && (!strings.Contains(response.Body.String(), created.ID) || strings.Contains(response.Body.String(), other.ID)) {
+			t.Fatalf("saved artifact list leaked another session: %s", response.Body.String())
+		}
+		if strings.Contains(path, "/preview?") {
+			var payload struct {
+				URL string `json:"url"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			preview, err := (&http.Client{Timeout: time.Second}).Get(payload.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, readErr := io.ReadAll(preview.Body)
+			_ = preview.Body.Close()
+			if readErr != nil || preview.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("Only A")) || bytes.Contains(body, []byte("Only B")) {
+				t.Fatalf("saved artifact preview = %d %q, err=%v", preview.StatusCode, body, readErr)
+			}
+		}
+	}
+	if got := do(http.MethodHead, "/api/artifacts/"+created.ID+"/download?sessionId=saved-a"); got.Code != http.StatusOK || got.Body.Len() != 0 {
+		t.Fatalf("HEAD saved artifact: %d %s", got.Code, got.Body.String())
+	}
+	for _, path := range []string{
+		"/api/artifacts/" + other.ID + "?sessionId=saved-a",
+		"/api/artifacts/" + other.ID + "/download?sessionId=saved-a",
+	} {
+		if got := do(http.MethodGet, path); got.Code != http.StatusForbidden {
+			t.Fatalf("foreign artifact owner check: %s = %d", path, got.Code)
+		}
+	}
+	for _, path := range []string{"/api/artifacts?sessionId=missing-session", "/api/artifacts/" + orphan.ID + "?sessionId=missing-session"} {
+		if got := do(http.MethodGet, path); got.Code != http.StatusNotFound {
+			t.Fatalf("unsaved session read: %s = %d", path, got.Code)
+		}
+	}
+	if got := do(http.MethodDelete, "/api/artifacts/"+created.ID+"?sessionId=saved-a"); got.Code != http.StatusConflict {
+		t.Fatalf("inactive delete = %d, want unchanged 409", got.Code)
+	}
+	if _, err := store.Get("saved-a", created.ID); err != nil {
+		t.Fatalf("read-only artifact disappeared: %v", err)
+	}
+	t.Run("shared browser routes saved session ownership", func(t *testing.T) {
+		if _, err := store.Update("saved-a", created.ID, "", "<h1>Only A v2</h1>"); err != nil {
+			t.Fatal(err)
+		}
+		httpServer := httptest.NewServer(handler)
+		defer httpServer.Close()
+		config, err := json.Marshal(map[string]string{"origin": httpServer.URL, "artifactID": created.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runSelectionRaceBrowserHarness(t, "static/artifacts.js", "const config = "+string(config)+`;
+const assert=require('node:assert/strict'), vm=require('node:vm');
+const source=require('node:fs').readFileSync(0,'utf8'), requests=[], downloads=[], opened=[], toasts=[];
+function element(){return {hidden:true,textContent:'',children:[],style:{},classList:{add(){},remove(){},toggle(){}},replaceChildren(){this.children=[];},appendChild(item){this.children.push(item);},removeAttribute(name){delete this[name];},setAttribute(){},focus(){},querySelector(){return null;}};}
+const nodes=Object.fromEntries(['artifactPreviewOverlay','artifactPreviewFrame','artifactPreviewState','artifactPreviewMeta','artifactPreviewTitle','artifactVersionSelect','artifactDeleteOverlay','artifactDeleteConfirm'].map(id=>[id,element()]));
+const c={currentSessionId:'saved-a',URL,URLSearchParams,CSS:{escape:value=>value},AbortController,console,
+ window:{location:{href:config.origin+'/',origin:config.origin},open:url=>{opened.push(url);return {}; }},
+ document:{activeElement:null,body:{classList:{add(){},remove(){}}},getElementById:id=>nodes[id]||null,querySelector:()=>null,querySelectorAll:()=>[],createElement:()=>element(),addEventListener(){}},
+ requestAnimationFrame:fn=>fn(),showToast:message=>toasts.push(message),
+ fetch:async(path,options)=>{const url=new URL(path,config.origin);const response=await fetch(url,options);requests.push({path:url.pathname,session:url.searchParams.get('sessionId'),version:url.searchParams.get('version'),status:response.status,method:options?.method||'GET'});return response;}};
+vm.createContext(c);vm.runInContext(source,c);
+const state=()=>vm.runInContext('artifactState',c);
+(async()=>{
+ await c.loadArtifactsForSession('saved-a');assert.equal(state().artifacts[0].id,config.artifactID);
+ await c.previewArtifactByID(config.artifactID);
+ assert.equal(requests.find(request=>request.path==='/api/artifacts/'+config.artifactID)?.status,200,'detail must explicitly request saved A instead of falling back to its cache after owner mismatch');
+ assert(state().previewURL,'saved A preview must open while B owns the running loop: '+nodes.artifactPreviewState.textContent);
+ assert.equal(nodes.artifactPreviewTitle.textContent,'Saved A report');
+ let preview=await fetch(state().previewURL);assert.match(await preview.text(),/Only A v2/);
+ await c.selectArtifactVersion(1);preview=await fetch(state().previewURL);assert.match(await preview.text(),/Only A/);
+ c.triggerArtifactDownload=path=>downloads.push(path);c.downloadActiveArtifact();c.exportActiveArtifact();
+ for(const path of downloads){const response=await c.fetch(path);assert.equal(response.status,200,'download/export must retain saved session ownership');}
+ state().previewURL='';await c.openActiveArtifactExternally();assert.equal(opened.length,1);assert.equal((await fetch(opened[0])).status,200);
+ await c.confirmArtifactDeletion();assert.equal(requests.at(-1).status,409,'background browsing must not acquire mutation rights');
+ assert.equal(state().active?.id,config.artifactID,'rejected delete must preserve the preview');
+ for(const request of requests){assert.equal(request.session,'saved-a','artifact request omitted viewed session: '+request.path);}
+ assert(!toasts.some(message=>/Unable to (load|open)/.test(message)),JSON.stringify(toasts));
+})().catch(error=>{console.error(error);process.exitCode=1;});
+`)
+	})
+	if server.activeSessionID != "running-b" || server.activeWorkDir != workspaceB || server.runningSession != "running-b" || server.turnDone == nil {
+		t.Fatal("read-only artifacts changed running session or workspace")
 	}
 }

@@ -27,13 +27,14 @@ their outputs into the final answer the user sees.
    - What context the teammate needs (be explicit — paste relevant
      file:line or describe the area).
    - What "done" looks like (return format, must-include facts).
-   Record the resulting plan with `TaskCreate`, including the intended
-   owner. Then use `TaskUpdate` with `addBlocks` / `addBlockedBy` to record
-   dependencies. Use `TaskGet` or `TaskList` whenever you need to recover
-   the authoritative state instead of reconstructing it from conversation
-   history.
-3. **Dispatch.** Mark each task `in_progress` with `TaskUpdate`, then
-   spawn its teammate with `Agent({ name, prompt, ... })`.
+   Start a durable project run with `ProjectCoordinator({action:"create"})`.
+   Add the focused work and dependencies with `action:"add_work"`. Use
+   `ProjectCoordinator({action:"status"})` whenever you need authoritative
+   state after a session switch, restart, or worker failure. `TaskCreate`
+   remains useful only for a short-lived checklist inside this one chat.
+3. **Dispatch.** Atomically reserve each ready node with
+   `ProjectCoordinator({action:"claim_next", worker:"<name>"})`, then pass
+   its returned `worker_prompt` to `Agent({ name, prompt, ... })`.
    For independent work, use `run_in_background: true` so multiple
    teammates work concurrently. Start with 2-4 at once and use waves for
    larger plans; after a provider 429/TPM error, reduce the next wave.
@@ -42,11 +43,13 @@ their outputs into the final answer the user sees.
 4. **Monitor.** Use `SubAgentList` to see who's running,
    `SubAgentOutput` for mid-flight progress. Use `MessageTeammate` to
    send updated instructions or coordinate two named teammates. Persist
-   material progress and returned evidence with `TaskOutput`; use
-   `TaskStop` for work that is deliberately cancelled rather than done.
-5. **Close and synthesize.** Use `TaskUpdate` to mark verified work
-   `completed`, and check `TaskList` for pending or blocked work before
-   claiming completion. When all sub-agents return, write the final
+   material progress and returned evidence with `ProjectCoordinator` action
+   `complete`, or action `fail` with a concrete stable failure reason. The
+   durable graph automatically reclaims expired worker leases and only
+   retries known environment recovery rules once; do not hide other failures.
+5. **Close and synthesize.** Check `ProjectCoordinator` action `status` for
+   ready, running, blocked, or failed work before claiming completion. When
+   all sub-agents return, write the final
    user-facing reply yourself. Pull the most important findings up
    to the top; drop teammate boilerplate.
 
@@ -76,8 +79,10 @@ their outputs into the final answer the user sees.
 
 - **Orchestration**: `Agent`, `Fork`, `SendMessage`, `MessageTeammate`,
   `SubAgentList`, `SubAgentOutput`, `SubAgentStop`, `ScheduleWakeup`
+- **Durable project coordination**: `ProjectCoordinator` (project graph,
+  dependencies, worker claims, persisted evidence, failure recovery)
 - **Structured work tracking**: `TaskCreate`, `TaskGet`, `TaskList`,
-  `TaskUpdate`, `TaskOutput`, `TaskStop`
+  `TaskUpdate`, `TaskOutput`, `TaskStop` (current-session notes only)
 - **Read-only context**: `Read`, `Grep`, `Glob`, `LS`
 - **Diagnostics**: `MetisInfo`, `WebFetch`, `WebSearch`, `Memory`
 
