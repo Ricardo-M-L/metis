@@ -12,6 +12,7 @@ let currentSessionId = null;
 let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN' };
 let lastStatusSnapshot = null;
 let statusRequestGeneration = 0;
+let subAgentDetailState = { agentId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0 };
 
 // The browser UI lives in a loopback iframe inside the Wails shell. This
 // narrow request bridge intentionally exposes three named native actions;
@@ -52,6 +53,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initChatScroll();
   updateEmptyLayout();
   initLayout(); // DSH AppFrame parity: resizable sidebar/details + auto-collapse
+  initSubAgentDetails();
   fetch('/api/config').then(r => r.json()).then(c => {
     if (c && c.model) {
       cfgModel = c.model;
@@ -109,6 +111,7 @@ function applyLanguage(value) {
   applyLayout();
   if (typeof syncApprovalChip === 'function') syncApprovalChip(approvalMode);
   if (lastStatusSnapshot) renderStatusSnapshot(lastStatusSnapshot);
+  if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId) renderSubAgentDetails();
   if (typeof renderSessions === 'function') renderSessions();
 }
 
@@ -294,8 +297,9 @@ function showToast(msg) {
   el._hideTimer = setTimeout(() => el.classList.remove('show'), 6000);
 }
 
-// Live task progress chip ("N sub-agents ~ M background tasks"),
-// polled every 3s like the harness GUI status bar.
+// Live task progress is kept in the conversation header, next to the view
+// tabs. The earlier bottom-of-composer pill made live work look detached from
+// the conversation it belongs to and only exposed non-interactive names.
 async function pollStatus(shouldApply = () => true) {
   const generation = ++statusRequestGeneration;
   try {
@@ -317,11 +321,21 @@ function renderStatusSnapshot(d) {
     const n = d.subAgents || 0, m = d.backgroundTasks || 0;
     if (n === 0 && m === 0) {
       chip.style.display = 'none';
+      closeStatusPopover();
     } else {
       chip.style.display = '';
-      chip.textContent = n + ' ' + dict.subAgents + ' ~ ' + m + ' ' + dict.backgroundTasks;
+      chip.innerHTML = `<svg class="agent-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.4" cy="5.2" r="2.1"/><circle cx="11.3" cy="6.4" r="1.65"/><path d="M1.9 13c.35-2.25 1.6-3.45 3.5-3.45S8.55 10.75 8.9 13M9.2 12.8c.23-1.55 1.08-2.38 2.45-2.38 1.32 0 2.1.76 2.38 2.18"/></svg><span>${n} ${escHtml(dict.subAgents)}</span><span class="agent-status-divider" aria-hidden="true"></span><span>${m} ${escHtml(dict.backgroundTasks)}</span>`;
+      const title = subAgentText('View sub-agent activity', '查看子代理活动');
+      chip.title = title;
+      chip.setAttribute('aria-label', title + ': ' + n + ' ' + dict.subAgents + ', ' + m + ' ' + dict.backgroundTasks);
     }
-    if (document.getElementById('statusPopover').style.display !== 'none') renderStatusPopover();
+    const pop = document.getElementById('statusPopover');
+    if (pop && pop.style.display !== 'none') renderStatusPopover();
+    const trackedAgent = typeof subAgentDetailState !== 'undefined' ? subAgentDetailState.agentId : '';
+    // The roster retains a finished teammate briefly. Refresh an open detail
+    // dialog even after it disappears from /api/status, so live output turns
+    // into its final result instead of staying visually "running" forever.
+    if (trackedAgent) refreshSubAgentDetails();
     if (d.workspace) {
       const pn = document.getElementById('wsGroupName');
       if (pn) pn.textContent = d.workspace;
@@ -387,36 +401,233 @@ function toggleStatusPopover(e) {
   if (e) e.stopPropagation();
   const pop = document.getElementById('statusPopover');
   const chip = document.getElementById('statusChip');
+  if (!pop || !chip) return;
   const open = pop.style.display === 'none';
   pop.style.display = open ? 'block' : 'none';
   chip.setAttribute('aria-expanded', open ? 'true' : 'false');
   if (open) renderStatusPopover();
 }
 
+function closeStatusPopover() {
+  const pop = document.getElementById('statusPopover');
+  const chip = document.getElementById('statusChip');
+  if (!pop || !chip) return;
+  pop.style.display = 'none';
+  chip.setAttribute('aria-expanded', 'false');
+}
+
+function subAgentText(en, zh) {
+  return typeof uiText === 'function'
+    ? uiText(en, zh)
+    : (document.documentElement.lang === 'en' ? en : zh);
+}
+
+function subAgentStatusClass(status) {
+  return ['running', 'completed', 'failed', 'killed'].includes(status) ? status : 'unknown';
+}
+
+function subAgentStatusLabel(status) {
+  const labels = {
+    running: subAgentText('Running', '运行中'),
+    completed: subAgentText('Completed', '已完成'),
+    failed: subAgentText('Failed', '失败'),
+    killed: subAgentText('Stopped', '已停止'),
+  };
+  return labels[status] || subAgentText('Unknown', '未知');
+}
+
 function renderStatusPopover() {
   const pop = document.getElementById('statusPopover');
+  if (!pop) return;
   const d = lastStatusSnapshot || {};
   const agents = Array.isArray(d.agents) ? d.agents : [];
   const jobs = Array.isArray(d.jobs) ? d.jobs : [];
   const rows = [];
   if (agents.length) {
-    rows.push('<div class="status-popover-label">Sub-agents</div>');
-    agents.forEach(a => rows.push('<div class="status-popover-row"><span class="status-dot ' + escAttr(a.status || '') + '"></span><span>' + escHtml(a.name || a.agentId || 'agent') + '</span><small>' + escHtml(a.status || '') + '</small></div>'));
+    rows.push('<div class="status-popover-label">' + escHtml(subAgentText('Sub-agents', '子代理')) + '</div>');
+    agents.forEach(a => {
+      const agentID = String(a.agentId || '');
+      const canOpen = !!agentID;
+      rows.push('<button type="button" class="status-popover-row status-agent-row"' +
+        (canOpen ? ' data-subagent-id="' + escAttr(agentID) + '"' : ' disabled') +
+        (canOpen ? ' title="' + escAttr(subAgentText('Open sub-agent details', '查看子代理详情')) + '"' : '') + '>' +
+        '<span class="status-dot ' + subAgentStatusClass(a.status || '') + '"></span>' +
+        '<span class="status-agent-name"><strong>' + escHtml(a.name || a.agentId || 'agent') + '</strong><small>' + escHtml(subAgentText('Open live output', '打开实时输出')) + '</small></span>' +
+        '<span class="status-agent-state">' + escHtml(subAgentStatusLabel(a.status || '')) + '</span>' +
+      '</button>');
+    });
   }
   if (jobs.length) {
-    rows.push('<div class="status-popover-label">Background tasks</div>');
-    jobs.forEach(j => rows.push('<div class="status-popover-row"><span class="status-dot ' + escAttr(j.status || '') + '"></span><span>' + escHtml(j.description || j.id || 'task') + '</span><small>' + escHtml(j.status || '') + '</small></div>'));
+    rows.push('<div class="status-popover-label">' + escHtml(subAgentText('Background tasks', '后台任务')) + '</div>');
+    jobs.forEach(j => rows.push('<div class="status-popover-row"><span class="status-dot ' + subAgentStatusClass(j.status || '') + '"></span><span>' + escHtml(j.description || j.id || 'task') + '</span><small>' + escHtml(subAgentStatusLabel(j.status || '')) + '</small></div>'));
   }
-  pop.innerHTML = rows.join('') || '<div class="status-popover-empty">No active agents or tasks</div>';
+  pop.innerHTML = rows.join('') || '<div class="status-popover-empty">' + escHtml(subAgentText('No active agents or tasks', '没有正在运行的子代理或后台任务')) + '</div>';
+  pop.querySelectorAll('[data-subagent-id]').forEach(row => row.addEventListener('click', () => openSubAgentDetails(row.dataset.subagentId, row)));
 }
 
 document.addEventListener('click', e => {
   const pop = document.getElementById('statusPopover');
   const chip = document.getElementById('statusChip');
-  if (!pop || pop.style.display === 'none' || pop.contains(e.target) || chip.contains(e.target)) return;
-  pop.style.display = 'none';
-  chip.setAttribute('aria-expanded', 'false');
+  if (!pop || !chip || pop.style.display === 'none' || pop.contains(e.target) || chip.contains(e.target)) return;
+  closeStatusPopover();
 });
+
+function initSubAgentDetails() {
+  const overlay = document.getElementById('subAgentDetailOverlay');
+  if (!overlay) return;
+  overlay.addEventListener('click', event => {
+    if (event.target === overlay) closeSubAgentDetails();
+  });
+  overlay.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeSubAgentDetails();
+    }
+  });
+}
+
+function openSubAgentDetails(agentID, trigger) {
+  agentID = String(agentID || '').trim();
+  if (!agentID) return;
+  const sameAgent = subAgentDetailState.agentId === agentID;
+  subAgentDetailState.agentId = agentID;
+  subAgentDetailState.trigger = trigger || document.getElementById('statusChip');
+  subAgentDetailState.error = '';
+  subAgentDetailState.loading = false;
+  if (!sameAgent) subAgentDetailState.data = null;
+  const overlay = document.getElementById('subAgentDetailOverlay');
+  if (!overlay) return;
+  overlay.hidden = false;
+  document.body.classList.add('subagent-detail-open');
+  closeStatusPopover();
+  renderSubAgentDetails();
+  const dialog = overlay.querySelector('.subagent-detail-dialog');
+  requestAnimationFrame(() => dialog && dialog.focus());
+  refreshSubAgentDetails();
+}
+
+function closeSubAgentDetails() {
+  const overlay = document.getElementById('subAgentDetailOverlay');
+  if (overlay) overlay.hidden = true;
+  document.body.classList.remove('subagent-detail-open');
+  const trigger = subAgentDetailState.trigger;
+  subAgentDetailState.agentId = '';
+  subAgentDetailState.trigger = null;
+  subAgentDetailState.loading = false;
+  subAgentDetailState.error = '';
+  subAgentDetailState.requestGeneration++;
+  if (trigger && typeof trigger.focus === 'function') trigger.focus();
+}
+
+async function refreshSubAgentDetails() {
+  const agentID = subAgentDetailState.agentId;
+  if (!agentID || subAgentDetailState.loading && subAgentDetailState.requestGeneration > 0) return;
+  const generation = ++subAgentDetailState.requestGeneration;
+  subAgentDetailState.loading = true;
+  renderSubAgentDetails();
+  try {
+    const response = await fetch('/api/subagents/' + encodeURIComponent(agentID), { cache: 'no-store' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || subAgentText('Unable to load sub-agent details.', '无法读取子代理详情。'));
+    if (subAgentDetailState.agentId !== agentID || subAgentDetailState.requestGeneration !== generation) return;
+    subAgentDetailState.data = payload.agent || null;
+    subAgentDetailState.error = '';
+  } catch (error) {
+    if (subAgentDetailState.agentId !== agentID || subAgentDetailState.requestGeneration !== generation) return;
+    subAgentDetailState.error = error && error.message || subAgentText('Unable to load sub-agent details.', '无法读取子代理详情。');
+  } finally {
+    if (subAgentDetailState.agentId === agentID && subAgentDetailState.requestGeneration === generation) {
+      subAgentDetailState.loading = false;
+      renderSubAgentDetails();
+    }
+  }
+}
+
+function subAgentElapsedLabel(milliseconds) {
+  const total = Math.max(0, Math.floor((Number(milliseconds) || 0) / 1000));
+  if (total < 60) return total + subAgentText('s', '秒');
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes + subAgentText('m ', '分') + seconds + subAgentText('s', '秒');
+}
+
+function renderSubAgentDetails() {
+  const overlay = document.getElementById('subAgentDetailOverlay');
+  const title = document.getElementById('subAgentDetailTitle');
+  const subtitle = document.getElementById('subAgentDetailDescription');
+  const body = document.getElementById('subAgentDetailBody');
+  if (!overlay || overlay.hidden || !title || !subtitle || !body) return;
+  const state = subAgentDetailState;
+  body.setAttribute('aria-busy', state.loading ? 'true' : 'false');
+  if (state.loading && !state.data) {
+    title.textContent = subAgentText('Sub-agent details', '子代理详情');
+    subtitle.textContent = subAgentText('Loading live activity…', '正在读取实时活动…');
+    body.innerHTML = '<div class="subagent-detail-loading"><span class="subagent-detail-spinner" aria-hidden="true"></span>' + escHtml(subAgentText('Reading the current output…', '正在读取当前输出…')) + '</div>';
+    return;
+  }
+  if (!state.data) {
+    title.textContent = subAgentText('Sub-agent details', '子代理详情');
+    subtitle.textContent = state.error || subAgentText('This sub-agent is no longer retained.', '这个子代理已不再保留。');
+    body.innerHTML = '<div class="subagent-detail-error" role="alert">' + escHtml(subtitle.textContent) + '</div>';
+    return;
+  }
+
+  const agent = state.data;
+  const status = subAgentStatusClass(String(agent.status || ''));
+  const statusLabel = subAgentStatusLabel(status);
+  title.textContent = agent.name || agent.agentId || subAgentText('Sub-agent', '子代理');
+  subtitle.textContent = statusLabel + ' · ' + subAgentElapsedLabel(agent.elapsedMs);
+  const mode = agent.background ? subAgentText('Background', '后台执行') : subAgentText('Foreground', '前台执行');
+  body.innerHTML = '<div class="subagent-detail-summary">' +
+    '<span class="status-dot ' + status + '"></span><strong>' + escHtml(statusLabel) + '</strong>' +
+    '<span class="subagent-detail-mode">' + escHtml(mode) + '</span>' +
+    '</div><dl class="subagent-detail-meta">' +
+      '<div><dt>' + escHtml(subAgentText('Agent ID', '代理 ID')) + '</dt><dd><code>' + escHtml(agent.agentId || '—') + '</code></dd></div>' +
+      '<div><dt>' + escHtml(subAgentText('Elapsed', '已运行')) + '</dt><dd>' + escHtml(subAgentElapsedLabel(agent.elapsedMs)) + '</dd></div>' +
+      (agent.stopHint ? '<div><dt>' + escHtml(subAgentText('Stop reason', '停止原因')) + '</dt><dd>' + escHtml(agent.stopHint) + '</dd></div>' : '') +
+    '</dl>';
+
+  const appendOutput = (heading, value, extraClass) => {
+    const section = document.createElement('section');
+    section.className = 'subagent-detail-output' + (extraClass ? ' ' + extraClass : '');
+    const h3 = document.createElement('h3');
+    h3.textContent = heading;
+    const pre = document.createElement('pre');
+    pre.textContent = value;
+    section.append(h3, pre);
+    body.appendChild(section);
+  };
+  const output = String(agent.output || '');
+  if (output) appendOutput(subAgentText('Live output', '实时输出'), output);
+  else {
+    const waiting = document.createElement('div');
+    waiting.className = 'subagent-detail-empty-output';
+    waiting.textContent = status === 'running'
+      ? subAgentText('No text output yet. The sub-agent may still be inspecting files or using tools.', '暂时还没有文字输出。子代理可能仍在读取文件或调用工具。')
+      : subAgentText('This sub-agent did not produce text output.', '这个子代理没有产生文字输出。');
+    body.appendChild(waiting);
+  }
+  if (agent.outputTruncated) {
+    const note = document.createElement('p');
+    note.className = 'subagent-detail-note';
+    note.textContent = subAgentText('The middle of this unusually large output is omitted here.', '这段输出过长，中间部分未在此展示。');
+    body.appendChild(note);
+  }
+  if (agent.result && agent.result !== agent.output) appendOutput(subAgentText('Final result', '最终结果'), String(agent.result));
+  if (agent.exitError) {
+    const error = document.createElement('div');
+    error.className = 'subagent-detail-error';
+    error.setAttribute('role', 'alert');
+    error.textContent = subAgentText('Error: ', '错误：') + agent.exitError;
+    body.appendChild(error);
+  }
+  if (state.error) {
+    const stale = document.createElement('p');
+    stale.className = 'subagent-detail-note';
+    stale.textContent = state.error;
+    body.appendChild(stale);
+  }
+}
 
 // ============================================================
 // Layout — resizable / collapsible columns (DSH AppFrame parity).

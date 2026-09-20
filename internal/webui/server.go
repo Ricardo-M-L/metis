@@ -572,6 +572,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/routing", s.handleRouting)
 	mux.HandleFunc("/api/trace", s.handleTrace)
 	mux.HandleFunc("/api/trace/export", s.handleTraceExport)
+	mux.HandleFunc("/api/subagents/", s.handleSubAgentDetail)
 	mux.HandleFunc("/api/export", s.handleExport)
 	mux.HandleFunc("/api/exports/open", s.handleExportsOpen)
 	mux.HandleFunc("/api/permission", s.handlePermission)
@@ -3259,6 +3260,80 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"executionStrategy": executionStrategy,
 		"build":             s.buildVersion,
 	})
+}
+
+// subAgentDetailOutputLimit keeps a single local UI detail request from
+// accidentally turning a long-running sub-agent transcript into an unbounded
+// browser response. The retained head and tail make both the original task
+// and the latest conclusion visible when a provider produces an unusually
+// large answer.
+const subAgentDetailOutputLimit = 160_000
+
+func trimSubAgentDetailOutput(value string) (string, bool) {
+	runes := []rune(value)
+	if len(runes) <= subAgentDetailOutputLimit {
+		return value, false
+	}
+	marker := "\n\n… METIS truncated this sub-agent output …\n\n"
+	half := (subAgentDetailOutputLimit - len([]rune(marker))) / 2
+	return string(runes[:half]) + marker + string(runes[len(runes)-half:]), true
+}
+
+// handleSubAgentDetail is the Desktop-only read surface behind a clickable
+// sub-agent row. It deliberately reads the Roster snapshot rather than a
+// transient event stream: callers get the current partial text while an agent
+// is running and the retained final text after it has finished.
+func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	agentID := strings.TrimPrefix(r.URL.Path, "/api/subagents/")
+	if agentID == "" || agentID != strings.TrimSpace(agentID) || len(agentID) > 128 || strings.ContainsAny(agentID, "/\\") {
+		writeError(w, http.StatusBadRequest, "invalid sub-agent id")
+		return
+	}
+	if s.roster == nil {
+		writeError(w, http.StatusNotFound, "sub-agent not found")
+		return
+	}
+	teammate, ok := s.roster.LookupByAgentID(agentID)
+	if !ok || teammate == nil {
+		writeError(w, http.StatusNotFound, "sub-agent not found")
+		return
+	}
+
+	snap := teammate.Snapshot()
+	output, outputTruncated := trimSubAgentDetailOutput(snap.Output)
+	result, resultTruncated := trimSubAgentDetailOutput(snap.Result)
+	elapsed := time.Since(snap.Started)
+	if !snap.EndTime.IsZero() {
+		elapsed = snap.EndTime.Sub(snap.Started)
+	}
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	exitError := ""
+	if snap.ExitErr != nil {
+		exitError = snap.ExitErr.Error()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent": map[string]any{
+		"name":            snap.Name,
+		"agentId":         snap.AgentID,
+		"status":          snap.Status.String(),
+		"background":      snap.Background,
+		"startedAt":       snap.Started,
+		"endedAt":         snap.EndTime,
+		"elapsedMs":       elapsed.Milliseconds(),
+		"output":          output,
+		"outputTruncated": outputTruncated,
+		"result":          result,
+		"resultTruncated": resultTruncated,
+		"stopHint":        snap.StopHint,
+		"exitError":       exitError,
+	}})
 }
 
 func executionStrategyForStatus(planItems, subAgents, namedAgents int) string {

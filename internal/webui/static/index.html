@@ -97,6 +97,10 @@
         <span>Artifacts</span><span class="artifact-tab-count" id="artifactTabCount" hidden>0</span>
       </button>
       <button class="view-tab" type="button" aria-controls="sessionFilePanel" onclick="openSessionFiles()">文件 <span id="sessionFileCount">0</span></button>
+      <div class="agent-status-anchor" id="agentStatusAnchor">
+        <button class="agent-status-trigger" id="statusChip" type="button" style="display:none" aria-label="Agent status details" aria-controls="statusPopover" aria-expanded="false" onclick="toggleStatusPopover(event)"></button>
+        <div class="status-popover" id="statusPopover" style="display:none" aria-label="Agent and background task details"></div>
+      </div>
     </div>
 
     <div class="chat-area" id="chatArea">
@@ -158,8 +162,6 @@
     </section>
 
     <div class="status-row">
-      <button class="top-chip status-chip" id="statusChip" type="button" style="display:none" aria-label="Agent status details" aria-expanded="false" onclick="toggleStatusPopover(event)"></button>
-      <div class="status-popover" id="statusPopover" style="display:none" aria-label="Agent and background task details"></div>
       <button class="jump-latest" id="jumpLatestBtn" type="button" hidden onclick="resumeAutoScroll()" data-i18n-label="jumpLatest" data-i18n-title="jumpLatest" aria-label="Jump to latest" title="Jump to latest">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
         <span data-i18n="jumpLatest">回到最新</span>
@@ -219,6 +221,22 @@
       </div>
     </div>
     <div class="session-statsbar" id="sessionStatsbar" style="display:none"></div>
+
+    <div class="subagent-detail-overlay" id="subAgentDetailOverlay" hidden>
+      <section class="subagent-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="subAgentDetailTitle" aria-describedby="subAgentDetailDescription" tabindex="-1">
+        <header class="subagent-detail-head">
+          <div>
+            <p class="subagent-detail-eyebrow" id="subAgentDetailEyebrow">SUB-AGENT</p>
+            <h2 id="subAgentDetailTitle">子代理详情</h2>
+            <p id="subAgentDetailDescription" class="subagent-detail-subtitle">正在读取子代理状态…</p>
+          </div>
+          <button class="subagent-detail-close" id="subAgentDetailClose" type="button" aria-label="关闭" title="关闭" onclick="closeSubAgentDetails()">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+          </button>
+        </header>
+        <div class="subagent-detail-body" id="subAgentDetailBody" aria-live="polite" aria-busy="false"></div>
+      </section>
+    </div>
 
 <!-- Settings stays mounted as a page inside the main window. -->
 <section class="settings-page app-page" id="settingsOverlay" aria-label="Settings" data-i18n-label="settings" hidden>
