@@ -119,10 +119,11 @@ assert.equal(calls.at(-1).options.method,'DELETE'); assert.equal(state.deletion,
 `},
 		{"run history isolates task and opens real session route", `
 ready(); state.selectedId='task/1';
-server=async()=>response({runs:[{id:'run/1',jobId:'task/1',status:'failed',startedAt:'2030-01-02T01:00:00Z',error:'<script>bad()</script>',sessionId:'session/42'}]});
+server=async url=>url.endsWith('/runs') ? response({runs:[{id:'run/1',jobId:'task/1',status:'failed',startedAt:'2030-01-02T01:00:00Z',error:'<script>bad()</script>',sessionId:'session/42'}]}) : response({id:'run/1',status:'failed',output:'<img src=x onerror=bad()>',sessionId:'session/42'});
 await c.loadAutomationRuns('task/1'); assert.match(get('#automationRuns').innerHTML,/&lt;script/);
 assert.match(get('#automationRuns').innerHTML,/打开会话/);
-server=async()=>response({id:'run/1',status:'failed',output:'<img src=x onerror=bad()>'});
+assert.match(get('#automationLatestResult').innerHTML,/最新执行结果/);
+assert.match(get('#automationLatestResult').innerHTML,/&lt;img/); assert.doesNotMatch(get('#automationLatestResult').innerHTML,/<img/);
 await c.loadAutomationRun('run/1'); assert.equal(calls.at(-1).url,'/api/automations/task%2F1/runs/run%2F1');
 assert.match(get('#automationRunOutput').innerHTML,/&lt;img/); assert.doesNotMatch(get('#automationRunOutput').innerHTML,/<img/);
 const opening=click('open-session','session/42');
@@ -186,7 +187,7 @@ let sessionRefreshes=0;
 let calls=[],server=async()=>response({automations:[],scheduler:{available:true}}),navigated=null;
 const c={document,console,Intl,Date,AbortController,Set,resumeSessionGeneration:0,loadSessions:async()=>{sessionRefreshes++;},uiText:(en,zh)=>document.documentElement.lang==='en'?en:zh,
  fetch:async(url,options)=>{calls.push({url,options});return server(url,options);},
- setInterval:()=>1,clearInterval(){},window:{metisNavigation:{navigate:async route=>{navigated=route;return true;}}}};
+ setInterval:()=>1,clearInterval(){},setTimeout:()=>1,clearTimeout(){},window:{metisNavigation:{navigate:async route=>{navigated=route;return true;}}}};
 vm.createContext(c);vm.runInContext(source,c);
 const state=vm.runInContext('automationState',c);
 const response=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=>data});

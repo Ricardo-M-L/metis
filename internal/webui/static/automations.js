@@ -1,9 +1,9 @@
 // Scheduled-task workspace. All task state comes from the persistent HTTP API.
 const automationState = {
   active: false, loaded: false, loading: false, jobs: [], scheduler: {}, workspace: '', model: '', modelSource: '',
-  query: '', filter: 'all', selectedId: '', runs: [], run: null, error: '', runsError: '',
-  generation: 0, runsGeneration: 0, detailGeneration: 0, sessionGeneration: 0, controller: null, runsController: null,
-  timer: null, pending: new Set(), editor: null, deletion: null,
+  query: '', filter: 'all', selectedId: '', runs: [], run: null, latestRun: null, latestRunError: '', error: '', runsError: '',
+  generation: 0, runsGeneration: 0, detailGeneration: 0, latestGeneration: 0, sessionGeneration: 0, controller: null, runsController: null,
+  timer: null, runRefreshTimer: null, pending: new Set(), editor: null, deletion: null,
 };
 
 function automationText(en, zh) { return typeof uiText === 'function' ? uiText(en, zh) : zh; }
@@ -84,10 +84,13 @@ function hideAutomationsPage() {
   automationState.generation++;
   automationState.runsGeneration++;
   automationState.detailGeneration++;
+  automationState.latestGeneration++;
   automationState.controller?.abort();
   automationState.runsController?.abort();
   clearInterval(automationState.timer);
+  clearTimeout(automationState.runRefreshTimer);
   automationState.timer = null;
+  automationState.runRefreshTimer = null;
   automationState.loading = false;
   closeAutomationEditor(true);
   closeAutomationDelete(true);
@@ -113,6 +116,11 @@ async function loadAutomations(background = false) {
       automationState.selectedId = '';
       automationState.runs = [];
       automationState.run = null;
+      automationState.latestRun = null;
+      automationState.latestRunError = '';
+      automationState.latestGeneration++;
+      clearTimeout(automationState.runRefreshTimer);
+      automationState.runRefreshTimer = null;
     }
     if (automationState.selectedId) void loadAutomationRuns(automationState.selectedId, background);
   } catch (error) {
@@ -170,7 +178,8 @@ function renderAutomationDetail() {
   const busy = automationState.pending.has(job.id);
   const paused = job.paused || !job.enabled;
   const status = automationStatus(job);
-  panel.innerHTML = '<div class="automation-detail-head"><div><span class="automation-eyebrow">'+automationText('TASK DETAILS','任务详情')+'</span><h2>'+automationEscape(job.name)+'</h2></div>'+automationButton('close-detail',automationText('Close','收起'))+'</div><div class="automation-detail-actions">'+automationButton('run',automationText(job.running ? 'Running…' : 'Run now',job.running ? '运行中…' : '立即运行'),{id:job.id,icon:'play',disabled:busy || job.running || !automationState.scheduler.available})+automationButton('toggle',paused ? automationText('Resume','恢复') : automationText('Pause','暂停'),{id:job.id,icon:paused ? 'play' : 'pause',disabled:busy})+automationButton('edit',automationText('Edit','编辑'),{id:job.id,icon:'edit',disabled:busy})+'</div><dl class="automation-metadata"><div><dt>'+automationText('Status','状态')+'</dt><dd>'+status.label+'</dd></div><div><dt>'+automationText('Schedule','运行计划')+'</dt><dd>'+automationEscape(automationScheduleLabel(job.schedule))+'</dd></div><div><dt>'+automationText('Time zone','时区')+'</dt><dd>'+automationEscape(job.schedule?.timezone || automationText('Server local time','服务器本地时间'))+'</dd></div><div><dt>'+automationText('Next run','下次运行')+'</dt><dd>'+automationEscape(job.enabled && !job.paused ? automationFormatTime(job.nextRunAt,job.schedule?.timezone) : '—')+'</dd></div><div><dt>'+automationText('Last run','上次运行')+'</dt><dd>'+automationEscape(automationFormatTime(job.lastRunAt,job.schedule?.timezone))+'</dd></div><div><dt>'+automationText('Run count','累计运行')+'</dt><dd>'+Number(job.runCount || 0)+(job.repeat ? '<br><span class="automation-muted">'+automationText('Automatic scheduling stops after '+Number(job.repeat)+' total runs. Run now can still add runs.','累计达到 '+Number(job.repeat)+' 次后停止自动调度；立即运行仍可额外执行。')+'</span>' : '')+'</dd></div><div><dt>'+automationText('Workspace','工作区')+'</dt><dd class="automation-path">'+automationEscape(job?.workDir || automationState.workspace || '—')+'</dd></div><div><dt>'+automationText('Model','模型')+'</dt><dd>'+automationEscape(automationModelLabel(job))+'</dd></div></dl><section class="automation-prompt-section"><h3>'+automationText('Instructions','任务指令')+'</h3><p>'+automationEscape(job.prompt)+'</p></section><details class="automation-access"><summary>'+automationText('Tool permissions','工具权限')+'</summary><p>'+automationText('Pre-authorized','预授权')+'：'+automationEscape((job.allowTools || []).join(', ') || automationText('None','无'))+'</p><p>'+automationText('Disabled','禁用')+'：'+automationEscape((job.disabledTools || []).join(', ') || automationText('None','无'))+'</p></details>'+(job.lastError ? '<div class="automation-inline-error" role="status">'+automationEscape(job.lastError)+'</div>' : '')+'<section class="automation-runs"><h3>'+automationText('Run history','运行记录')+'</h3><div id="automationRuns"></div></section><div class="automation-detail-footer">'+automationButton('delete',automationText('Delete task','删除任务'),{id:job.id,icon:'trash',danger:true,disabled:busy})+'</div>';
+  panel.innerHTML = '<div class="automation-detail-head"><div><span class="automation-eyebrow">'+automationText('TASK DETAILS','任务详情')+'</span><h2>'+automationEscape(job.name)+'</h2></div>'+automationButton('close-detail',automationText('Close','收起'))+'</div><div class="automation-detail-actions">'+automationButton('run',automationText(job.running ? 'Running…' : 'Run now',job.running ? '运行中…' : '立即运行'),{id:job.id,icon:'play',disabled:busy || job.running || !automationState.scheduler.available})+automationButton('toggle',paused ? automationText('Resume','恢复') : automationText('Pause','暂停'),{id:job.id,icon:paused ? 'play' : 'pause',disabled:busy})+automationButton('edit',automationText('Edit','编辑'),{id:job.id,icon:'edit',disabled:busy})+'</div><div id="automationLatestResult"></div><dl class="automation-metadata"><div><dt>'+automationText('Status','状态')+'</dt><dd>'+status.label+'</dd></div><div><dt>'+automationText('Schedule','运行计划')+'</dt><dd>'+automationEscape(automationScheduleLabel(job.schedule))+'</dd></div><div><dt>'+automationText('Time zone','时区')+'</dt><dd>'+automationEscape(job.schedule?.timezone || automationText('Server local time','服务器本地时间'))+'</dd></div><div><dt>'+automationText('Next run','下次运行')+'</dt><dd>'+automationEscape(job.enabled && !job.paused ? automationFormatTime(job.nextRunAt,job.schedule?.timezone) : '—')+'</dd></div><div><dt>'+automationText('Last run','上次运行')+'</dt><dd>'+automationEscape(automationFormatTime(job.lastRunAt,job.schedule?.timezone))+'</dd></div><div><dt>'+automationText('Run count','累计运行')+'</dt><dd>'+Number(job.runCount || 0)+(job.repeat ? '<br><span class="automation-muted">'+automationText('Automatic scheduling stops after '+Number(job.repeat)+' total runs. Run now can still add runs.','累计达到 '+Number(job.repeat)+' 次后停止自动调度；立即运行仍可额外执行。')+'</span>' : '')+'</dd></div><div><dt>'+automationText('Workspace','工作区')+'</dt><dd class="automation-path">'+automationEscape(job?.workDir || automationState.workspace || '—')+'</dd></div><div><dt>'+automationText('Model','模型')+'</dt><dd>'+automationEscape(automationModelLabel(job))+'</dd></div></dl><section class="automation-prompt-section"><h3>'+automationText('Instructions','任务指令')+'</h3><p>'+automationEscape(job.prompt)+'</p></section><details class="automation-access"><summary>'+automationText('Tool permissions','工具权限')+'</summary><p>'+automationText('Pre-authorized','预授权')+'：'+automationEscape((job.allowTools || []).join(', ') || automationText('None','无'))+'</p><p>'+automationText('Disabled','禁用')+'：'+automationEscape((job.disabledTools || []).join(', ') || automationText('None','无'))+'</p></details>'+(job.lastError ? '<div class="automation-inline-error" role="status">'+automationEscape(job.lastError)+'</div>' : '')+'<section class="automation-runs"><h3>'+automationText('Run history','运行记录')+'</h3><div id="automationRuns"></div></section><div class="automation-detail-footer">'+automationButton('delete',automationText('Delete task','删除任务'),{id:job.id,icon:'trash',danger:true,disabled:busy})+'</div>';
+  renderAutomationLatestResult();
   renderAutomationRuns();
 }
 async function loadAutomationRuns(id, background = false) {
@@ -179,16 +188,77 @@ async function loadAutomationRuns(id, background = false) {
   const controller = new AbortController();
   automationState.runsController = controller;
   if (!background) { automationState.runsError = ''; renderAutomationRuns(true); }
+  let latestRunID = '';
   try {
     const data = await automationRequest('/'+encodeURIComponent(id)+'/runs', {signal:controller.signal});
     if (generation !== automationState.runsGeneration || id !== automationState.selectedId || !automationState.active) return;
     automationState.runs = Array.isArray(data.runs) ? data.runs : [];
     automationState.runsError = '';
+    const latest = automationState.runs[0];
+    if (!latest) {
+      automationState.latestGeneration++;
+      automationState.latestRun = null;
+      automationState.latestRunError = '';
+    } else if (!automationState.latestRun || automationState.latestRun.id !== latest.id || latest.status === 'running' || automationState.latestRun.status === 'running') {
+      latestRunID = latest.id;
+    }
   } catch (error) {
     if (controller.signal.aborted || generation !== automationState.runsGeneration || id !== automationState.selectedId || !automationState.active) return;
     automationState.runsError = error.message;
   }
-  if (generation === automationState.runsGeneration) renderAutomationRuns();
+  if (generation !== automationState.runsGeneration || id !== automationState.selectedId || !automationState.active) return;
+  renderAutomationRuns();
+  renderAutomationLatestResult();
+  if (latestRunID) await loadAutomationLatestRun(id, latestRunID);
+  scheduleAutomationRunRefresh(id);
+}
+
+function automationRunResultText(run) {
+  return run?.error || run?.output || run?.summary || automationText('No text output was recorded for this run.','本次运行没有记录文本输出。');
+}
+
+function renderAutomationLatestResult() {
+  const target = automationRoot()?.querySelector('#automationLatestResult');
+  if (!target) return;
+  const job = automationState.jobs.find(item => item.id === automationState.selectedId);
+  const run = automationState.latestRun;
+  if (!run) {
+    target.innerHTML = '<section class="automation-latest-result is-empty"><div class="automation-result-head"><h3>'+automationText('Latest execution result','最新执行结果')+'</h3><span>'+automationText('No completed run','暂无结果')+'</span></div><p>'+automationText('The final answer or failure reason will appear here after the task runs.','任务运行后，最终回答或失败原因会直接显示在这里。')+'</p></section>';
+    return;
+  }
+  const status = automationRunLabel(run.status);
+  const result = run.loading ? automationText('Loading the complete result…','正在读取完整结果…') : automationState.latestRunError ? automationText('Could not load the complete result: ','无法读取完整结果：')+automationState.latestRunError : run.status === 'running' ? automationText('This task is still running. Its result will appear here automatically when it finishes.','任务仍在运行中，完成后结果会自动显示在这里。') : automationRunResultText(run);
+  const completedAt = run.finishedAt || run.startedAt;
+  target.innerHTML = '<section class="automation-latest-result is-'+automationEscape(run.status || 'unknown')+'"><div class="automation-result-head"><div><h3>'+automationText('Latest execution result','最新执行结果')+'</h3><p>'+automationEscape(automationFormatTime(completedAt,job?.schedule?.timezone))+'</p></div><span class="automation-result-status">'+automationEscape(status)+'</span></div><pre'+(run.error ? ' class="is-error"' : '')+'>'+automationEscape(result)+'</pre>'+(run.sessionId ? '<div class="automation-result-actions">'+automationButton('open-session',automationText('Open conversation','打开会话'),{id:run.sessionId,icon:'arrow'})+'</div>' : '')+'</section>';
+}
+
+async function loadAutomationLatestRun(jobID, runID) {
+  const generation = ++automationState.latestGeneration;
+  const summary = automationState.runs.find(run => run.id === runID) || {id:runID};
+  automationState.latestRun = {...summary, loading:true};
+  automationState.latestRunError = '';
+  renderAutomationLatestResult();
+  try {
+    const run = await automationRequest('/'+encodeURIComponent(jobID)+'/runs/'+encodeURIComponent(runID));
+    if (generation !== automationState.latestGeneration || jobID !== automationState.selectedId || !automationState.active) return;
+    automationState.latestRun = run;
+  } catch (error) {
+    if (generation !== automationState.latestGeneration || jobID !== automationState.selectedId || !automationState.active) return;
+    automationState.latestRun = summary;
+    automationState.latestRunError = error.message;
+  }
+  if (generation === automationState.latestGeneration && jobID === automationState.selectedId && automationState.active) renderAutomationLatestResult();
+}
+
+function scheduleAutomationRunRefresh(jobID) {
+  clearTimeout(automationState.runRefreshTimer);
+  automationState.runRefreshTimer = null;
+  const latest = automationState.runs[0];
+  if (!automationState.active || jobID !== automationState.selectedId || latest?.status !== 'running') return;
+  automationState.runRefreshTimer = setTimeout(() => {
+    automationState.runRefreshTimer = null;
+    if (automationState.active && automationState.selectedId === jobID) void loadAutomations(true);
+  }, 2500);
 }
 function renderAutomationRuns(loading = false) {
   const target = automationRoot()?.querySelector('#automationRuns');
@@ -222,7 +292,7 @@ function renderAutomationRunOutput() {
 async function automationMutation(key, operation) {
   if (automationState.pending.has(key)) return false;
   automationState.pending.add(key); automationState.error = ''; renderAutomations();
-  try { await operation(); if (automationState.active) await loadAutomations(true); return true; }
+  try { const result = await operation(); if (automationState.active) await loadAutomations(true); return result; }
   catch (error) { automationState.error = error.message; return false; }
   finally { automationState.pending.delete(key); renderAutomations(); }
 }
@@ -238,11 +308,11 @@ async function automationPageClick(event) {
     case 'refresh': await loadAutomations(); break;
     case 'filter': automationState.filter = id; renderAutomations(); break;
     case 'clear-search': automationState.query = ''; automationState.filter = 'all'; automationRoot().querySelector('#automationSearch').value = ''; renderAutomations(); break;
-    case 'select': automationState.selectedId = id; automationState.runs = []; automationState.run = null; automationState.detailGeneration++; renderAutomations(); await loadAutomationRuns(id); break;
-    case 'close-detail': automationState.selectedId = ''; automationState.runsGeneration++; automationState.detailGeneration++; automationState.runsController?.abort(); renderAutomations(); break;
+    case 'select': clearTimeout(automationState.runRefreshTimer); automationState.runRefreshTimer = null; automationState.selectedId = id; automationState.runs = []; automationState.run = null; automationState.latestRun = null; automationState.latestRunError = ''; automationState.detailGeneration++; automationState.latestGeneration++; renderAutomations(); await loadAutomationRuns(id); break;
+    case 'close-detail': automationState.selectedId = ''; automationState.runsGeneration++; automationState.detailGeneration++; automationState.latestGeneration++; automationState.runsController?.abort(); clearTimeout(automationState.runRefreshTimer); automationState.runRefreshTimer = null; renderAutomations(); break;
     case 'refresh-runs': await loadAutomationRuns(automationState.selectedId); break;
     case 'run-detail': await loadAutomationRun(id); break;
-    case 'run': if (job) await automationMutation(id, () => automationRequest('/'+encodeURIComponent(id)+'/run', {method:'POST'})); break;
+    case 'run': if (job) { const accepted = await automationMutation(id, () => automationRequest('/'+encodeURIComponent(id)+'/run', {method:'POST'})); if (accepted?.runId && automationState.active && automationState.selectedId === id) { automationState.latestGeneration++; automationState.latestRun = {id:accepted.runId, jobId:id, trigger:'manual', status:'running', startedAt:new Date().toISOString()}; automationState.latestRunError = ''; renderAutomationLatestResult(); await loadAutomationRuns(id, true); } } break;
     case 'toggle': if (job) await automationMutation(id, () => automationRequest('/'+encodeURIComponent(id), {method:'PATCH',body:JSON.stringify(job.paused || !job.enabled ? {paused:false,enabled:true} : {paused:true})})); break;
     case 'scheduler': await automationMutation('scheduler', () => automationRequest('/scheduler', {method:'PATCH',body:JSON.stringify({enabled:!automationState.scheduler.enabled})})); break;
     case 'delete': if (job) openAutomationDelete(job,button); break;

@@ -51,6 +51,19 @@
 .automation-detail-head h2 { font-size: 18px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
 .automation-detail-head > button { border: 0; padding: 4px 0 4px 8px; min-height: 28px; color: var(--fg-dim); }
 .automation-detail-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 18px 0 22px; }
+.automation-latest-result { margin: 0 0 22px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.automation-latest-result.is-running { border-color: color-mix(in srgb, var(--accent) 46%, var(--border)); }
+.automation-latest-result.is-failed { border-color: color-mix(in srgb, var(--error) 42%, var(--border)); }
+.automation-result-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.automation-result-head h3 { margin: 0; color: var(--fg-strong); font-size: 12px; font-weight: 600; }
+.automation-result-head p, .automation-latest-result.is-empty > p { margin-top: 5px; color: var(--fg-faint); font-size: 11px; line-height: 1.6; }
+.automation-result-head > span { flex: 0 0 auto; color: var(--fg-faint); font-size: 11px; line-height: 1.6; }
+.automation-result-status { color: var(--fg-body) !important; }
+.automation-latest-result.is-failed .automation-result-status { color: var(--error) !important; }
+.automation-latest-result pre { max-height: 230px; overflow: auto; margin-top: 12px; padding: 11px 12px; border-radius: 7px; background: var(--bg); color: var(--fg-mid); white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); font-size: 11px; line-height: 1.7; }
+.automation-latest-result pre.is-error { color: var(--error); }
+.automation-result-actions { margin-top: 11px; }
+.automation-result-actions .automation-button { min-height: 30px; padding: 5px 8px; font-size: 11px; }
 .automation-metadata { display: grid; gap: 11px; margin-bottom: 24px; font-size: 12px; }
 .automation-metadata > div { display: grid; grid-template-columns: 74px minmax(0,1fr); gap: 12px; line-height: 1.5; }
 .automation-metadata dt { color: var(--fg-faint); }
