@@ -199,10 +199,11 @@
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>
             </button>
             <input id="attachmentInput" class="visually-hidden" type="file" accept="image/*" multiple onchange="onAttachmentFiles(this.files);this.value=''">
-            <button class="input-chip" id="approvalBtn" type="button" title="Cycle permission mode" aria-label="Permission mode: Default" onclick="toggleApproval()">
+            <button class="input-chip approval-chip" id="approvalBtn" type="button" title="Choose permission mode" aria-label="Permission mode: Default" aria-haspopup="menu" aria-expanded="false" aria-controls="approvalMenu" onclick="toggleApproval(event)">
               <span id="approvalLabel">Default</span>
-              <span aria-hidden="true">&#9662;</span>
+              <span class="approval-chip-chevron" aria-hidden="true">&#9662;</span>
             </button>
+            <div class="approval-menu" id="approvalMenu" role="menu" aria-label="Permission mode" style="display:none"></div>
             <textarea class="input-field" id="inputField" placeholder="&#25551;&#36848;&#20320;&#24819;&#35201;&#26500;&#24314;&#30340;&#20869;&#23481;" data-i18n-placeholder="composerPlaceholder" rows="1" onkeydown="handleKeydown(event)" oninput="onComposerInput(this)" aria-controls="commandMenu" aria-autocomplete="list"></textarea>
             <span class="input-chip model-chip" onclick="toggleModelMenu()">
               <span id="modelName">5.4</span>

@@ -2714,6 +2714,7 @@ let commandSelection = 0;
 let commandTotalMatches = 0;
 let composerActionDialog = null;
 let fullAccessConfirmDialog = null;
+let approvalMenuOpen = false;
 
 function composerActionIcon(action) {
   const paths = {
@@ -3531,11 +3532,107 @@ async function switchModel(provider, model) {
   }
 }
 
-async function toggleApproval() {
-  const modes = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions', 'fullAccess'];
-  const next = modes[(modes.indexOf(approvalMode) + 1) % modes.length];
-  await setPermissionMode(next);
+const APPROVAL_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions', 'fullAccess'];
+
+function approvalMenuItems() {
+  const menu = document.getElementById('approvalMenu');
+  return menu ? Array.from(menu.querySelectorAll('.approval-menu-option')) : [];
 }
+
+function paintApprovalMenu() {
+  const menu = document.getElementById('approvalMenu');
+  if (!menu) return;
+  const labels = document.documentElement.lang === 'zh-CN' ? PERMISSION_LABELS_ZH : PERMISSION_LABELS;
+  const descs = document.documentElement.lang === 'zh-CN' ? PERMISSION_DESCS_ZH : PERMISSION_DESCS;
+  menu.innerHTML = '<div class="approval-menu-title">' + escHtml(uiText('Permission mode', '\u6743\u9650\u6a21\u5f0f')) + '</div>' + APPROVAL_MODES.map(mode => {
+    const selected = approvalMode === mode;
+    return '<button type="button" class="approval-menu-option' + (selected ? ' selected' : '') + '" role="menuitemradio" aria-checked="' + (selected ? 'true' : 'false') + '" data-approval-mode="' + mode + '">' +
+      '<span class="approval-menu-check" aria-hidden="true">' + (selected ? '&#10003;' : '') + '</span><span class="approval-menu-copy"><strong>' + escHtml(labels[mode]) + '</strong><small>' + escHtml(descs[mode]) + '</small></span></button>';
+  }).join('');
+  menu.querySelectorAll('.approval-menu-option').forEach(option => {
+    option.addEventListener('click', async () => {
+      const mode = option.dataset.approvalMode;
+      const trigger = document.getElementById('approvalBtn');
+      closeApprovalMenu(false);
+      await setPermissionMode(mode, trigger);
+    });
+  });
+}
+
+function closeApprovalMenu(restoreFocus) {
+  const menu = document.getElementById('approvalMenu');
+  const button = document.getElementById('approvalBtn');
+  approvalMenuOpen = false;
+  if (menu) menu.style.display = 'none';
+  if (button) {
+    button.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) button.focus();
+  }
+}
+
+function toggleApproval(event) {
+  if (event) event.preventDefault();
+  const menu = document.getElementById('approvalMenu');
+  const button = document.getElementById('approvalBtn');
+  if (!menu || !button) return;
+  if (approvalMenuOpen) {
+    closeApprovalMenu(false);
+    return;
+  }
+  closeComposerAddMenu(false);
+  const modelMenu = document.getElementById('modelMenu');
+  if (modelMenu) modelMenu.style.display = 'none';
+  modelMenuOpen = false;
+  const effortMenu = document.getElementById('effortMenu');
+  if (effortMenu) effortMenu.style.display = 'none';
+  const effortButton = document.getElementById('effortBtn');
+  if (effortButton) effortButton.setAttribute('aria-expanded', 'false');
+  paintApprovalMenu();
+  menu.style.display = 'block';
+  approvalMenuOpen = true;
+  button.setAttribute('aria-expanded', 'true');
+  requestAnimationFrame(() => {
+    const selected = menu.querySelector('.approval-menu-option.selected');
+    (selected || menu.querySelector('.approval-menu-option'))?.focus();
+  });
+}
+
+document.addEventListener('pointerdown', event => {
+  const menu = document.getElementById('approvalMenu');
+  const button = document.getElementById('approvalBtn');
+  if (!approvalMenuOpen || !menu || menu.contains(event.target) || button && button.contains(event.target)) return;
+  closeApprovalMenu(false);
+});
+
+document.addEventListener('keydown', event => {
+  const menu = document.getElementById('approvalMenu');
+  const button = document.getElementById('approvalBtn');
+  if (!menu || !button) return;
+  if (!approvalMenuOpen && event.target === button && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+    event.preventDefault();
+    toggleApproval();
+    return;
+  }
+  if (!approvalMenuOpen || !menu.contains(event.target)) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeApprovalMenu(true);
+    return;
+  }
+  const items = approvalMenuItems();
+  if (!items.length) return;
+  let next = -1;
+  if (event.key === 'Home') next = 0;
+  if (event.key === 'End') next = items.length - 1;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    const current = items.indexOf(document.activeElement);
+    const delta = event.key === 'ArrowDown' ? 1 : -1;
+    next = (current + delta + items.length) % items.length;
+  }
+  if (next < 0) return;
+  event.preventDefault();
+  items[next].focus();
+});
 
 // --- Settings ---
 // The settings panel is backed by the same config file the TUI /config
@@ -3779,6 +3876,7 @@ function syncApprovalChip(mode) {
     btn.setAttribute('aria-label', uiText('Permission mode: ', '权限模式：') + label);
     btn.title = descs[valid] || label;
   }
+  if (approvalMenuOpen) paintApprovalMenu();
 }
 const THEME_LABELS = {
   auto: 'Auto', dark: 'Dark', light: 'Light',

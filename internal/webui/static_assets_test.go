@@ -44,7 +44,7 @@ func TestStaticAssetsServed(t *testing.T) {
 	scriptChecks := map[string][]string{
 		"app.js":       {"escHtml", "escAttr", "DOMContentLoaded", "detectProject", "contextMeter", "initDesktopPreferences", "renderStatusPopover", "renderStatusSnapshot", "openRailSearch", "applyLanguage", "data-i18n-label", "data-i18n-title", "syncApprovalChip(approvalMode)", "requestNative", "checkDesktopUpdate", "openDesktopUpdateDialog", "installDesktopUpdate", "paintDesktopUpdateProgress", "start-install-update", "get-update-progress", "update-progress-fill", "From idea to done", "从想法，到完成", "METIS Desktop"},
 		"sessions.js":  {"loadSessions", "loadMoreSessions", "renderSessions", "resumeSession", "archiveSession", "restoreSession", "openSessionDeleteDialog", "confirmSessionDeletion", "closeSessionDeleteDialog", `role="alertdialog"`, "requestAnimationFrame(() => cancel.focus())", "method: 'DELETE'", "setSessionPreference", "workspaceLabel", "sessionItemKeydown", "loadWorkspaces", "addWorkspace", "requestNative('choose-workspace')", "openWorkspace", "renameWorkspace", "removeWorkspace", "moveWorkspace", "moveSession", "showSessionDetail", "Plan session completed"},
-		"chat.js":      {"connectEvents", "acceptLiveEvent", "sendMessage", "handleTextDelta", "showReconnectBanner", "endStreamingMessage", "openAttachmentPicker", "initAttachmentDrop", "pasteClipboardFilePaths", "pasteAllClipboardFilePaths", "/api/clipboard/files", "selectionStart", "COMPOSER_COMMANDS", "COMPOSER_ADD_ACTIONS", "toggleComposerAddMenu", "getBoundingClientRect().top - 12", "runComposerAddAction", "openComposerActionDialog", "/api/compact", "/api/goals", "/api/feedback", "submitBusyInput", "drainQueuedTurns", "filterSettings", "loadProviders", "saveCustomProvider", "deleteProvider", "validateProvider", "probeProvider", "loadEffort", "loadPresets", "loadPlugins", "loadPluginCatalog", "refreshPluginCatalog", "installPlugin", "removePlugin", "openPluginActionDialog", "pluginEcosystemGrid", "choosePluginEcosystem", "renderPluginEcosystems", "Ecosystem compatibility", "生态兼容层", "/api/plugins/catalog", "/api/plugins/install", "/api/plugins/remove", "loadRouting", "chooseLanguage", "ROUTING_ZH", "appendThinkingRow", "thinkRowKeydown", "REDACTED_THINKING_PLACEHOLDER", "MESSAGE_ACTION_ICONS", "messageActionsMarkup", "restoreHistoryMessageMetadata", "turnMetrics", "msg-metrics"},
+		"chat.js":      {"connectEvents", "acceptLiveEvent", "sendMessage", "handleTextDelta", "showReconnectBanner", "endStreamingMessage", "openAttachmentPicker", "initAttachmentDrop", "pasteClipboardFilePaths", "pasteAllClipboardFilePaths", "/api/clipboard/files", "selectionStart", "COMPOSER_COMMANDS", "COMPOSER_ADD_ACTIONS", "toggleComposerAddMenu", "getBoundingClientRect().top - 12", "runComposerAddAction", "openComposerActionDialog", "toggleApproval", "paintApprovalMenu", "closeApprovalMenu", "menuitemradio", "permission.mode", "/api/compact", "/api/goals", "/api/feedback", "submitBusyInput", "drainQueuedTurns", "filterSettings", "loadProviders", "saveCustomProvider", "deleteProvider", "validateProvider", "probeProvider", "loadEffort", "loadPresets", "loadPlugins", "loadPluginCatalog", "refreshPluginCatalog", "installPlugin", "removePlugin", "openPluginActionDialog", "pluginEcosystemGrid", "choosePluginEcosystem", "renderPluginEcosystems", "Ecosystem compatibility", "生态兼容层", "/api/plugins/catalog", "/api/plugins/install", "/api/plugins/remove", "loadRouting", "chooseLanguage", "ROUTING_ZH", "appendThinkingRow", "thinkRowKeydown", "REDACTED_THINKING_PLACEHOLDER", "MESSAGE_ACTION_ICONS", "messageActionsMarkup", "restoreHistoryMessageMetadata", "turnMetrics", "msg-metrics"},
 		"trace.js":     {"loadTrace", "renderTrace", "switchView", "selectTraceRow", "renderTraceInspector", "toggleFoldTurns", "partialArgs", "mergeTraceEvents", "traceNextCursor", "closeTraceInspector(false)", "thinking_redacted", "k-thinking"},
 		"artifacts.js": {"renderArtifactPresentation", "loadArtifactsForSession", "openArtifactsPanel", "previewArtifactByID", "safeArtifactURL", "confirmArtifactDeletion", "/api/artifacts"},
 	}
@@ -106,7 +106,7 @@ func TestStaticAssetsServed(t *testing.T) {
 		"viewTabs", "tabTrace", "tabArtifacts", "artifactsPanel", "artifactPreviewFrame", "tracePanel", "traceSearch",
 		"btnFoldTurns", "btnFoldCalls", "traceTimeline", "traceInspector",
 		"archivedSessionsBtn", "sessionViewBtn", "sessionViewMenu", "attachmentInput", "contextMeter", "Session log",
-		"statusPopover", "commandMenu", "composerAddMenu", "attachmentBtn", "queuedTurns", "details-closed", "workspaceAddBtn", "desktopUpdateBtn", "Model Providers", "Agent Presets", "Plugins", "Smart Routing", "effortBtn", "data-i18n", "data-i18n-label", "data-i18n-title",
+		"statusPopover", "commandMenu", "composerAddMenu", "attachmentBtn", "approvalBtn", "approvalMenu", "queuedTurns", "details-closed", "workspaceAddBtn", "desktopUpdateBtn", "Model Providers", "Agent Presets", "Plugins", "Smart Routing", "effortBtn", "data-i18n", "data-i18n-label", "data-i18n-title",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("index missing %q", want)
@@ -149,6 +149,50 @@ func TestDesktopModelMenuRefreshesAuthenticatedCatalogEveryOpen(t *testing.T) {
 	} {
 		if !strings.Contains(menu, want) {
 			t.Fatalf("Desktop model refresh missing %q", want)
+		}
+	}
+}
+
+func TestDesktopPermissionChipOpensAnAccessibleMenu(t *testing.T) {
+	js, err := staticFS.ReadFile("static/chat.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(js)
+	start := strings.Index(body, "const APPROVAL_MODES =")
+	endOffset := -1
+	if start >= 0 {
+		endOffset = strings.Index(body[start:], "\n// --- Settings ---")
+	}
+	if start < 0 || endOffset <= 0 {
+		t.Fatal("cannot isolate Desktop permission-menu implementation")
+	}
+	menu := body[start : start+endOffset]
+	for _, want := range []string{
+		"function paintApprovalMenu()",
+		"role=\"menuitemradio\"",
+		"aria-checked=\"",
+		"function closeApprovalMenu(restoreFocus)",
+		"document.addEventListener('pointerdown'",
+		"event.key === 'Escape'",
+		"event.key === 'ArrowDown'",
+		"event.key === 'Home'",
+	} {
+		if !strings.Contains(menu, want) {
+			t.Fatalf("Desktop permission menu missing %q", want)
+		}
+	}
+	if strings.Contains(menu, "modes.indexOf(approvalMode)") {
+		t.Fatal("Desktop permission chip still cycles through modes instead of opening a menu")
+	}
+
+	index, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`id="approvalBtn"`, `aria-haspopup="menu"`, `aria-controls="approvalMenu"`, `id="approvalMenu"`, `role="menu"`} {
+		if !strings.Contains(string(index), want) {
+			t.Fatalf("Desktop permission menu markup missing %q", want)
 		}
 	}
 }
