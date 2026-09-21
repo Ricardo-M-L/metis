@@ -6099,6 +6099,44 @@ button.settings-item {
 .update-version-row svg { width: 15px; height: 15px; color: var(--fg-faint); }
 .update-version-row strong { color: var(--fg-strong); font-weight: 650; }
 .update-dialog-copy .update-safety { color: var(--fg-dim); font-size: 11.5px; }
+.update-progress {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--border-faint);
+  border-radius: 11px;
+  background: var(--bg-inset);
+}
+.update-progress[hidden] { display: none; }
+.update-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--fg-mid);
+  font-size: 12px;
+  font-weight: 600;
+}
+.update-progress-value { color: var(--fg-strong); font-variant-numeric: tabular-nums; }
+.update-progress-track {
+  height: 7px;
+  margin-top: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04);
+}
+.update-progress-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 48%, transparent);
+  transition: width .22s ease-out;
+}
+.update-progress[data-phase="restarting"] .update-progress-fill { background: linear-gradient(90deg, #58b987, #7ad5a7); }
+.update-progress[data-phase="failed"] .update-progress-fill { background: var(--error); }
+.update-progress-meta { margin: 8px 0 0; color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
 .update-dialog-copy .update-error { margin-top: 10px; color: var(--error); }
 .update-dialog-actions {
   grid-column: 1 / -1;

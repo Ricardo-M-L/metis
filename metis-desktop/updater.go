@@ -43,6 +43,31 @@ type DesktopUpdateStatus struct {
 	Message        string `json:"message,omitempty"`
 }
 
+// DesktopUpdateProgress is a small, presentation-safe snapshot of an
+// in-progress native update. Percent is monotonic from 0 to 100; the download
+// phase additionally exposes the actual received and expected byte counts so
+// the Desktop can render a real progress bar instead of an indefinite spinner.
+type DesktopUpdateProgress struct {
+	Phase           string `json:"phase"`
+	Message         string `json:"message"`
+	Percent         int    `json:"percent"`
+	DownloadedBytes int64  `json:"downloadedBytes,omitempty"`
+	TotalBytes      int64  `json:"totalBytes,omitempty"`
+	Done            bool   `json:"done,omitempty"`
+	Failed          bool   `json:"failed,omitempty"`
+	Error           string `json:"error,omitempty"`
+}
+
+type desktopUpdateReporter func(DesktopUpdateProgress)
+
+func reportDesktopUpdateProgress(report desktopUpdateReporter, progress DesktopUpdateProgress) {
+	if report == nil {
+		return
+	}
+	progress.Percent = max(0, min(100, progress.Percent))
+	report(progress)
+}
+
 type desktopUpdater struct {
 	webBase  string
 	repo     string
@@ -110,6 +135,15 @@ func (u desktopUpdater) Check(ctx context.Context, current string) (DesktopUpdat
 }
 
 func (u desktopUpdater) Install(ctx context.Context, current, appPath string) (DesktopUpdateStatus, error) {
+	return u.install(ctx, current, appPath, nil)
+}
+
+func (u desktopUpdater) InstallWithProgress(ctx context.Context, current, appPath string, report desktopUpdateReporter) (DesktopUpdateStatus, error) {
+	return u.install(ctx, current, appPath, report)
+}
+
+func (u desktopUpdater) install(ctx context.Context, current, appPath string, report desktopUpdateReporter) (DesktopUpdateStatus, error) {
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "checking", Message: "Checking the release…", Percent: 4})
 	status, err := u.Check(ctx, current)
 	if err != nil {
 		return status, err
@@ -144,9 +178,23 @@ func (u desktopUpdater) Install(ctx context.Context, current, appPath string) (D
 	}
 
 	archivePath := filepath.Join(stageRoot, assetName)
-	if err := u.download(ctx, assetBase+url.PathEscape(assetName), archivePath, desktopUpdateMaxArchive); err != nil {
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "downloading", Message: "Downloading METIS Desktop…", Percent: 10})
+	if err := u.downloadWithProgress(ctx, assetBase+url.PathEscape(assetName), archivePath, desktopUpdateMaxArchive, func(downloaded, total int64) {
+		percent := 10
+		if total > 0 {
+			percent += int(downloaded * 64 / total)
+		}
+		reportDesktopUpdateProgress(report, DesktopUpdateProgress{
+			Phase:           "downloading",
+			Message:         "Downloading METIS Desktop…",
+			Percent:         percent,
+			DownloadedBytes: downloaded,
+			TotalBytes:      total,
+		})
+	}); err != nil {
 		return status, fmt.Errorf("download Desktop update: %w", err)
 	}
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "checksum", Message: "Verifying SHA-256…", Percent: 76})
 	wantSum, err := u.downloadChecksum(ctx, assetBase+url.PathEscape(assetName+".sha256"), assetName)
 	if err != nil {
 		return status, fmt.Errorf("download Desktop checksum: %w", err)
@@ -159,6 +207,7 @@ func (u desktopUpdater) Install(ctx context.Context, current, appPath string) (D
 		return status, fmt.Errorf("Desktop update checksum mismatch: got %s want %s", gotSum, wantSum)
 	}
 
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "extracting", Message: "Preparing the new application…", Percent: 84})
 	extractRoot := filepath.Join(stageRoot, "extract")
 	if err := os.Mkdir(extractRoot, 0o700); err != nil {
 		return status, err
@@ -171,9 +220,11 @@ func (u desktopUpdater) Install(ctx context.Context, current, appPath string) (D
 	if validator == nil {
 		validator = func(path, version string) error { return validateDesktopCandidate(path, version, u.goos) }
 	}
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "verifying", Message: "Verifying the application…", Percent: 91})
 	if err := validator(candidate, status.LatestVersion); err != nil {
 		return status, fmt.Errorf("verify Desktop update: %w", err)
 	}
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "installing", Message: "Installing the verified application…", Percent: 97})
 	if err := activateDesktopCandidate(candidate, appPath, u.goos); err != nil {
 		return status, err
 	}
@@ -220,6 +271,10 @@ func (u desktopUpdater) httpClient() *http.Client {
 }
 
 func (u desktopUpdater) download(ctx context.Context, rawURL, path string, max int64) error {
+	return u.downloadWithProgress(ctx, rawURL, path, max, nil)
+}
+
+func (u desktopUpdater) downloadWithProgress(ctx context.Context, rawURL, path string, max int64, progress func(downloaded, total int64)) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
@@ -240,7 +295,45 @@ func (u desktopUpdater) download(ctx context.Context, rawURL, path string, max i
 	if err != nil {
 		return err
 	}
-	n, copyErr := io.Copy(f, io.LimitReader(resp.Body, max+1))
+	total := resp.ContentLength
+	if total < 0 {
+		total = 0
+	}
+	if progress != nil {
+		progress(0, total)
+	}
+
+	reader := io.LimitReader(resp.Body, max+1)
+	buffer := make([]byte, 64<<10)
+	var n int64
+	var copyErr error
+	lastReport := time.Now()
+	for {
+		read, readErr := reader.Read(buffer)
+		if read > 0 {
+			written, writeErr := f.Write(buffer[:read])
+			n += int64(written)
+			if writeErr != nil {
+				copyErr = writeErr
+				break
+			}
+			if written != read {
+				copyErr = io.ErrShortWrite
+				break
+			}
+			if progress != nil && (total > 0 && n == total || time.Since(lastReport) >= 120*time.Millisecond) {
+				progress(n, total)
+				lastReport = time.Now()
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			copyErr = readErr
+			break
+		}
+	}
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(path)
@@ -253,6 +346,9 @@ func (u desktopUpdater) download(ctx context.Context, rawURL, path string, max i
 	if n > max {
 		_ = os.Remove(path)
 		return fmt.Errorf("asset exceeds %d bytes", max)
+	}
+	if progress != nil {
+		progress(n, total)
 	}
 	return nil
 }

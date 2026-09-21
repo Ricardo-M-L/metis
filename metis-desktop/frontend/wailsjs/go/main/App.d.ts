@@ -20,9 +20,13 @@ export function GetSettings():Promise<string>;
 
 export function GetUpdateStatus():Promise<main.DesktopUpdateStatus>;
 
+export function GetUpdateProgress():Promise<main.DesktopUpdateProgress>;
+
 export function GetVersion():Promise<string>;
 
 export function InstallUpdateAndRestart():Promise<main.DesktopUpdateStatus>;
+
+export function StartInstallUpdateAndRestart():Promise<main.DesktopUpdateProgress>;
 
 export function PauseScheduledTask(arg1:string):Promise<void>;
 

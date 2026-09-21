@@ -38,12 +38,20 @@ export function GetUpdateStatus() {
   return window['go']['main']['App']['GetUpdateStatus']();
 }
 
+export function GetUpdateProgress() {
+  return window['go']['main']['App']['GetUpdateProgress']();
+}
+
 export function GetVersion() {
   return window['go']['main']['App']['GetVersion']();
 }
 
 export function InstallUpdateAndRestart() {
   return window['go']['main']['App']['InstallUpdateAndRestart']();
+}
+
+export function StartInstallUpdateAndRestart() {
+  return window['go']['main']['App']['StartInstallUpdateAndRestart']();
 }
 
 export function PauseScheduledTask(arg1) {

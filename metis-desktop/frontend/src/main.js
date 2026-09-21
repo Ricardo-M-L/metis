@@ -3,9 +3,11 @@
 // client and browser build continue to share one UI codebase.
 import {
   ChooseWorkspaceDirectory,
+  GetUpdateProgress,
   GetUpdateStatus,
   InstallUpdateAndRestart,
   SetNativeTheme,
+  StartInstallUpdateAndRestart,
   StartWebUI,
 } from '../wailsjs/go/main/App.js';
 
@@ -20,6 +22,8 @@ window.addEventListener('load', async () => {
       'choose-workspace': () => ChooseWorkspaceDirectory(),
       'check-update': () => GetUpdateStatus(),
       'install-update': () => InstallUpdateAndRestart(),
+      'start-install-update': () => StartInstallUpdateAndRestart(),
+      'get-update-progress': () => GetUpdateProgress(),
       'set-theme': payload => {
         const theme = String(payload && payload.theme || 'auto');
         return SetNativeTheme(theme);

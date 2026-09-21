@@ -30,17 +30,20 @@ type App struct {
 	metisBin string
 	sendMu   sync.Mutex
 
-	findMetis            func() (string, error)
-	runMetis             func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
-	chooseWorkspace      func(context.Context, string) (string, error)
-	checkDesktopUpdate   func(context.Context, string) (DesktopUpdateStatus, error)
-	installDesktopUpdate func(context.Context, string, string) (DesktopUpdateStatus, error)
-	desktopPath          func() (string, error)
-	restartDesktop       func(path, workspace, metisBin string) error
-	resolveUpdatedMetis  func(current string) (string, error)
-	scheduleRestart      func(func())
-	quit                 func(context.Context)
-	updateMu             sync.Mutex
+	findMetis                        func() (string, error)
+	runMetis                         func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
+	chooseWorkspace                  func(context.Context, string) (string, error)
+	checkDesktopUpdate               func(context.Context, string) (DesktopUpdateStatus, error)
+	installDesktopUpdate             func(context.Context, string, string) (DesktopUpdateStatus, error)
+	installDesktopUpdateWithProgress func(context.Context, string, string, desktopUpdateReporter) (DesktopUpdateStatus, error)
+	desktopPath                      func() (string, error)
+	restartDesktop                   func(path, workspace, metisBin string) error
+	resolveUpdatedMetis              func(current string) (string, error)
+	scheduleRestart                  func(func())
+	quit                             func(context.Context)
+	updateMu                         sync.Mutex
+	updateProgress                   DesktopUpdateProgress
+	updateRunning                    bool
 
 	// webuiCmd is the in-process-browser backend child (metis desktop
 	// --web). The native window embeds it behind a tokenised frame URL; the
@@ -65,11 +68,12 @@ func NewApp() *App {
 				CanCreateDirectories: true,
 			})
 		},
-		checkDesktopUpdate:   updater.Check,
-		installDesktopUpdate: updater.Install,
-		desktopPath:          currentDesktopPath,
-		restartDesktop:       restartDesktopProcess,
-		resolveUpdatedMetis:  resolveStableMetisBinary,
+		checkDesktopUpdate:               updater.Check,
+		installDesktopUpdate:             updater.Install,
+		installDesktopUpdateWithProgress: updater.InstallWithProgress,
+		desktopPath:                      currentDesktopPath,
+		restartDesktop:                   restartDesktopProcess,
+		resolveUpdatedMetis:              resolveStableMetisBinary,
 		scheduleRestart: func(fn func()) {
 			go func() {
 				time.Sleep(350 * time.Millisecond)
@@ -425,7 +429,7 @@ func freePort() (int, error) {
 }
 
 func (a *App) GetVersion() string {
-	return "0.4.68"
+	return "0.4.69"
 }
 
 // ChooseWorkspaceDirectory is the native half of the iframe bridge. The web
@@ -469,14 +473,84 @@ func (a *App) GetUpdateStatus() (DesktopUpdateStatus, error) {
 	return a.checkDesktopUpdate(ctx, a.GetVersion())
 }
 
-// InstallUpdateAndRestart updates the CLI first (the CLI serves the shared
-// Desktop UI), then installs the verified native bundle and starts the new
-// bundle with the same workspace. Nothing runs unless the WebView's explicit
-// update confirmation calls this method.
-func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
+// StartInstallUpdateAndRestart begins the explicitly approved update without
+// holding the WebView call open. The renderer polls GetUpdateProgress while the
+// native process downloads, verifies and replaces the bundle.
+func (a *App) StartInstallUpdateAndRestart() (DesktopUpdateProgress, error) {
+	if err := a.beginDesktopUpdate(); err != nil {
+		return DesktopUpdateProgress{}, err
+	}
+	go func() {
+		_, err := a.installUpdateAndRestart(a.publishDesktopUpdateProgress)
+		if err != nil {
+			a.publishDesktopUpdateProgress(DesktopUpdateProgress{
+				Phase:   "failed",
+				Message: "Update failed",
+				Percent: a.currentDesktopUpdateProgress().Percent,
+				Done:    true,
+				Failed:  true,
+				Error:   err.Error(),
+			})
+		}
+		a.finishDesktopUpdate()
+	}()
+	return a.currentDesktopUpdateProgress(), nil
+}
+
+// GetUpdateProgress returns the latest in-memory snapshot. It never starts an
+// update and contains no paths or release URLs, so it is safe for the WebView
+// bridge to poll.
+func (a *App) GetUpdateProgress() DesktopUpdateProgress {
+	return a.currentDesktopUpdateProgress()
+}
+
+func (a *App) beginDesktopUpdate() error {
 	a.updateMu.Lock()
 	defer a.updateMu.Unlock()
+	if a.updateRunning {
+		return errors.New("a Desktop update is already in progress")
+	}
+	a.updateRunning = true
+	a.updateProgress = DesktopUpdateProgress{Phase: "preparing", Message: "Preparing the update…", Percent: 1}
+	return nil
+}
 
+func (a *App) finishDesktopUpdate() {
+	a.updateMu.Lock()
+	a.updateRunning = false
+	a.updateMu.Unlock()
+}
+
+func (a *App) publishDesktopUpdateProgress(progress DesktopUpdateProgress) {
+	progress.Percent = max(0, min(100, progress.Percent))
+	a.updateMu.Lock()
+	a.updateProgress = progress
+	a.updateMu.Unlock()
+}
+
+func (a *App) currentDesktopUpdateProgress() DesktopUpdateProgress {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+	return a.updateProgress
+}
+
+// InstallUpdateAndRestart retains the synchronous Wails binding used by older
+// Desktop shells. New renderers call StartInstallUpdateAndRestart and poll the
+// progress snapshot instead.
+func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
+	if err := a.beginDesktopUpdate(); err != nil {
+		return DesktopUpdateStatus{}, err
+	}
+	defer a.finishDesktopUpdate()
+	return a.installUpdateAndRestart(a.publishDesktopUpdateProgress)
+}
+
+// installUpdateAndRestart updates the CLI first (the CLI serves the shared
+// Desktop UI), then installs the verified native bundle and starts the new
+// bundle with the same workspace. The caller is responsible for update
+// admission; report is intentionally optional for legacy callers.
+func (a *App) installUpdateAndRestart(report desktopUpdateReporter) (DesktopUpdateStatus, error) {
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "checking", Message: "Checking for updates…", Percent: 3})
 	status, err := a.GetUpdateStatus()
 	if err != nil {
 		return status, err
@@ -495,6 +569,7 @@ func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
 	if base == nil {
 		base = context.Background()
 	}
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "cli", Message: "Updating the METIS CLI…", Percent: 7})
 	cliCtx, cliCancel := context.WithTimeout(base, 10*time.Minute)
 	stdout, stderr, err := a.runMetis(cliCtx, binary, []string{"update"}, a.workDir)
 	cliCancel()
@@ -514,7 +589,7 @@ func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
 			return status, fmt.Errorf("resolve updated Metis CLI: %w", err)
 		}
 	}
-	if a.desktopPath == nil || a.installDesktopUpdate == nil {
+	if a.desktopPath == nil || (a.installDesktopUpdate == nil && a.installDesktopUpdateWithProgress == nil) {
 		return status, errors.New("native Desktop updater is unavailable")
 	}
 	appPath, err := a.desktopPath()
@@ -522,7 +597,11 @@ func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
 		return status, err
 	}
 	installCtx, installCancel := context.WithTimeout(base, 10*time.Minute)
-	status, err = a.installDesktopUpdate(installCtx, a.GetVersion(), appPath)
+	if a.installDesktopUpdateWithProgress != nil {
+		status, err = a.installDesktopUpdateWithProgress(installCtx, a.GetVersion(), appPath, report)
+	} else {
+		status, err = a.installDesktopUpdate(installCtx, a.GetVersion(), appPath)
+	}
 	installCancel()
 	if err != nil {
 		return status, err
@@ -534,6 +613,7 @@ func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
 		return status, fmt.Errorf("restart updated Desktop: %w", err)
 	}
 	status.Restarting = true
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "restarting", Message: "Restarting METIS…", Percent: 100, Done: true})
 	a.scheduleRestart(func() { a.quit(base) })
 	return status, nil
 }

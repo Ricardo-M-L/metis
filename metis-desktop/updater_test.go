@@ -199,9 +199,41 @@ func TestDesktopUpdaterDownloadsVerifiesAndAtomicallyReplacesBundle(t *testing.T
 	if err != nil || !status.Available || !status.CanUpdate || status.LatestVersion != "1.2.0" {
 		t.Fatalf("Check() = %+v, %v", status, err)
 	}
-	status, err = updater.Install(context.Background(), "1.0.0", appPath)
+	var progress []DesktopUpdateProgress
+	status, err = updater.InstallWithProgress(context.Background(), "1.0.0", appPath, func(snapshot DesktopUpdateProgress) {
+		progress = append(progress, snapshot)
+	})
 	if err != nil || !status.Installed {
 		t.Fatalf("Install() = %+v, %v", status, err)
+	}
+	for _, phase := range []string{"checking", "downloading", "checksum", "extracting", "verifying", "installing"} {
+		found := false
+		for _, snapshot := range progress {
+			if snapshot.Phase == phase {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("update progress = %#v, missing %q phase", progress, phase)
+		}
+	}
+	last := 0
+	for _, snapshot := range progress {
+		if snapshot.Percent < last {
+			t.Fatalf("update progress moved backward: %#v", progress)
+		}
+		last = snapshot.Percent
+	}
+	var downloadComplete *DesktopUpdateProgress
+	for i := range progress {
+		if progress[i].Phase == "downloading" && progress[i].DownloadedBytes == int64(len(archive)) {
+			downloadComplete = &progress[i]
+			break
+		}
+	}
+	if downloadComplete == nil || downloadComplete.TotalBytes != int64(len(archive)) {
+		t.Fatalf("download completion snapshot = %#v, want received and total bytes %d", downloadComplete, len(archive))
 	}
 	newData, err := os.ReadFile(filepath.Join(appPath, "Contents", "MacOS", "metis-desktop"))
 	if err != nil || string(newData) != "new-build" {

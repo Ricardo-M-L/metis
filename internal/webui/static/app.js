@@ -162,6 +162,70 @@ let desktopUpdateStatus = null;
 let desktopUpdateChecking = false;
 let desktopUpdateDialog = null;
 
+function desktopUpdatePhaseText(phase) {
+  const zh = {
+    preparing: '正在准备更新…',
+    checking: '正在检查发布版本…',
+    cli: '正在更新 METIS CLI…',
+    downloading: '正在下载 Desktop…',
+    checksum: '正在校验 SHA-256…',
+    extracting: '正在准备新应用…',
+    verifying: '正在验证应用…',
+    installing: '正在替换当前应用…',
+    restarting: '正在重启 METIS…',
+    failed: '更新失败',
+  };
+  const en = {
+    preparing: 'Preparing update…',
+    checking: 'Checking the release…',
+    cli: 'Updating the METIS CLI…',
+    downloading: 'Downloading Desktop…',
+    checksum: 'Verifying SHA-256…',
+    extracting: 'Preparing the new app…',
+    verifying: 'Verifying the app…',
+    installing: 'Installing the verified app…',
+    restarting: 'Restarting METIS…',
+    failed: 'Update failed',
+  };
+  const dictionary = (desktopPreferences.language || '').startsWith('zh') ? zh : en;
+  return dictionary[phase] || uiText('Updating METIS…', '正在更新 METIS…');
+}
+
+function formatDesktopUpdateBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return bytes + ' B';
+  const units = ['KB', 'MB', 'GB'];
+  let size = bytes / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) { size /= 1024; index++; }
+  return (size >= 10 ? size.toFixed(0) : size.toFixed(1)) + ' ' + units[index];
+}
+
+function paintDesktopUpdateProgress(state, progress) {
+  if (!state || desktopUpdateDialog !== state) return;
+  const panel = state.overlay.querySelector('.update-progress');
+  if (!panel) return;
+  const percent = Math.max(0, Math.min(100, Number(progress && progress.percent) || 0));
+  const phase = progress && progress.phase || 'preparing';
+  const bar = panel.querySelector('.update-progress-fill');
+  const label = panel.querySelector('.update-progress-label');
+  const value = panel.querySelector('.update-progress-value');
+  const meta = panel.querySelector('.update-progress-meta');
+  panel.hidden = false;
+  panel.dataset.phase = phase;
+  label.textContent = desktopUpdatePhaseText(phase);
+  value.textContent = percent + '%';
+  bar.style.width = percent + '%';
+  panel.querySelector('[role="progressbar"]').setAttribute('aria-valuenow', String(percent));
+  if (phase === 'downloading' && Number(progress.totalBytes) > 0) {
+    meta.textContent = formatDesktopUpdateBytes(progress.downloadedBytes) + ' / ' + formatDesktopUpdateBytes(progress.totalBytes);
+  } else if (phase === 'restarting') {
+    meta.textContent = uiText('The updated app will open automatically.', '新版本将自动打开。');
+  } else {
+    meta.textContent = uiText('Your current app stays unchanged until verification succeeds.', '验证成功前，当前应用不会被替换。');
+  }
+}
+
 function paintDesktopUpdateButton() {
   const button = document.getElementById('desktopUpdateBtn');
   if (!button) return;
@@ -216,6 +280,11 @@ async function openDesktopUpdateDialog() {
       <p id="updateDialogDescription">${escHtml(status.message || '')}</p>
       <div class="update-version-row"><span>${uiText('Current', '当前')} ${escHtml(status.currentVersion || '-')}</span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 8h10M9 4l4 4-4 4"/></svg><strong>${escHtml(status.latestVersion || status.currentVersion || '-')}</strong></div>
       <p class="update-safety">${uiText('The release archive, SHA-256 checksum, and candidate app are verified before replacement. Nothing changes until you choose Update and restart.', '替换应用前会验证发布归档、SHA-256 校验值和候选应用。只有点击“更新并重启”才会修改当前版本。')}</p>
+      <section class="update-progress" hidden aria-live="polite" aria-label="${uiText('Update progress', '更新进度')}">
+        <div class="update-progress-head"><span class="update-progress-label"></span><strong class="update-progress-value">0%</strong></div>
+        <div class="update-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="update-progress-fill"></span></div>
+        <p class="update-progress-meta"></p>
+      </section>
       <p class="update-error" role="alert" hidden></p>
     </div>
     <div class="update-dialog-actions"><button type="button" class="update-later">${available ? uiText('Later', '稍后') : uiText('Close', '关闭')}</button>${available ? `<button type="button" class="update-confirm" ${canUpdate ? '' : 'disabled'}>${uiText('Update and restart', '更新并重启')}</button>` : ''}</div>
@@ -250,10 +319,20 @@ async function installDesktopUpdate() {
   const error = state.overlay.querySelector('.update-error');
   confirm.disabled = true;
   later.disabled = true;
-  confirm.textContent = uiText('Downloading and verifying…', '正在下载并验证…');
+  confirm.textContent = uiText('Updating…', '正在更新…');
+  paintDesktopUpdateProgress(state, { phase: 'preparing', percent: 1 });
   try {
-    desktopUpdateStatus = await requestNative('install-update', {}, 15 * 60 * 1000);
-    confirm.textContent = uiText('Restarting…', '正在重启…');
+    await requestNative('start-install-update');
+    while (desktopUpdateDialog === state && state.pending) {
+      const progress = await requestNative('get-update-progress', {}, 20000);
+      paintDesktopUpdateProgress(state, progress);
+      if (progress && progress.failed) throw new Error(progress.error || uiText('Update failed.', '更新失败。'));
+      if (progress && progress.done) {
+        confirm.textContent = uiText('Restarting…', '正在重启…');
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 220));
+    }
   } catch (err) {
     state.pending = false;
     confirm.disabled = false;

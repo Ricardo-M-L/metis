@@ -40,6 +40,32 @@ export namespace main {
 	        this.message = source["message"];
 	    }
 	}
+	export class DesktopUpdateProgress {
+	    phase: string;
+	    message: string;
+	    percent: number;
+	    downloadedBytes?: number;
+	    totalBytes?: number;
+	    done?: boolean;
+	    failed?: boolean;
+	    error?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopUpdateProgress(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.phase = source["phase"];
+	        this.message = source["message"];
+	        this.percent = source["percent"];
+	        this.downloadedBytes = source["downloadedBytes"];
+	        this.totalBytes = source["totalBytes"];
+	        this.done = source["done"];
+	        this.failed = source["failed"];
+	        this.error = source["error"];
+	    }
+	}
 	export class MessageResponse {
 	    text: string;
 	    threadId: string;

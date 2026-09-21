@@ -1006,6 +1006,70 @@ func TestInstallUpdateAndRestartUpdatesCLIThenDesktop(t *testing.T) {
 	}
 }
 
+func TestStartInstallUpdateAndRestartPublishesLiveProgress(t *testing.T) {
+	workDir := t.TempDir()
+	releaseInstall := make(chan struct{})
+	installStarted := make(chan struct{})
+	app := &App{
+		ctx:      context.Background(),
+		workDir:  workDir,
+		metisBin: "/fake/bin/metis",
+		findMetis: func() (string, error) {
+			return "/fake/bin/metis", nil
+		},
+		runMetis: func(_ context.Context, _ string, _ []string, _ string) (string, string, error) {
+			return "updated", "", nil
+		},
+		checkDesktopUpdate: func(_ context.Context, current string) (DesktopUpdateStatus, error) {
+			return DesktopUpdateStatus{CurrentVersion: current, LatestVersion: "9.9.9", Available: true, CanUpdate: true}, nil
+		},
+		installDesktopUpdateWithProgress: func(_ context.Context, current, _ string, report desktopUpdateReporter) (DesktopUpdateStatus, error) {
+			report(DesktopUpdateProgress{Phase: "downloading", Message: "Downloading METIS Desktop…", Percent: 42, DownloadedBytes: 42, TotalBytes: 100})
+			close(installStarted)
+			<-releaseInstall
+			return DesktopUpdateStatus{CurrentVersion: current, LatestVersion: "9.9.9", Installed: true}, nil
+		},
+		desktopPath:         func() (string, error) { return filepath.Join(workDir, "METIS.app"), nil },
+		restartDesktop:      func(string, string, string) error { return nil },
+		resolveUpdatedMetis: func(current string) (string, error) { return current, nil },
+		scheduleRestart:     func(func()) {},
+		quit:                func(context.Context) {},
+	}
+
+	if _, err := app.StartInstallUpdateAndRestart(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-installStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background update did not reach the native download")
+	}
+	progress := app.GetUpdateProgress()
+	if progress.Phase != "downloading" || progress.Percent != 42 || progress.DownloadedBytes != 42 || progress.TotalBytes != 100 {
+		t.Fatalf("live update progress = %+v, want native download snapshot", progress)
+	}
+	if _, err := app.StartInstallUpdateAndRestart(); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("concurrent StartInstallUpdateAndRestart() error = %v", err)
+	}
+
+	close(releaseInstall)
+	deadline := time.After(2 * time.Second)
+	for {
+		progress = app.GetUpdateProgress()
+		if progress.Done {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("final update progress = %+v, want restarting completion", progress)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if progress.Phase != "restarting" || progress.Percent != 100 || progress.Failed {
+		t.Fatalf("final update progress = %+v, want successful restart", progress)
+	}
+}
+
 func TestResolveStableMetisBinaryRebindsManagedVersionPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix managed layout regression")
