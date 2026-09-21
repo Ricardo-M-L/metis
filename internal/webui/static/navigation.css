@@ -93,11 +93,25 @@
   text-align: left;
   cursor: pointer;
 }
+.sidebar-primary-actions {
+  display: grid;
+  gap: 2px;
+  margin: 0 2px 8px;
+}
+.sidebar-primary-actions .new-session-btn,
+.sidebar-primary-actions .sb-schedules {
+  width: 100%;
+  margin: 0;
+}
+.sidebar-primary-actions .sb-schedules { min-height: 32px; }
 .sb-schedules svg { width: 16px; height: 16px; flex: 0 0 16px; }
 .sb-schedules:hover, .sb-schedules.active, .sb-settings.active { color: var(--fg-strong); background: var(--surface-2); }
 .sb-schedules:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .app.sb-rail .sb-schedules { justify-content: center; width: 36px; margin: 0 auto 6px; padding: 6px; }
 .app.sb-rail .sb-schedules span { display: none; }
+.app.sb-rail .sidebar-primary-actions { margin: 0 0 8px; }
+.app.sb-rail .sidebar-primary-actions .new-session-btn,
+.app.sb-rail .sidebar-primary-actions .sb-schedules { width: 36px; margin: 0 auto; }
 @media (max-width: 760px) {
   .navigation-header { padding: 0 10px; }
   .settings-page .settings-panel { flex-direction: column; }

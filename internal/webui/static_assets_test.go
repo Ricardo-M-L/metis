@@ -197,6 +197,32 @@ func TestDesktopPermissionChipOpensAnAccessibleMenu(t *testing.T) {
 	}
 }
 
+func TestDesktopSchedulesNavLivesWithPrimarySidebarActions(t *testing.T) {
+	index, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(index)
+	primaryStart := strings.Index(body, `class="sidebar-primary-actions"`)
+	schedules := strings.Index(body, `id="schedulesNav"`)
+	sessions := strings.Index(body, `id="sessionList"`)
+	footer := strings.Index(body, `class="sb-footer-actions"`)
+	if primaryStart < 0 || schedules < 0 || sessions < 0 || footer < 0 {
+		t.Fatalf("sidebar primary navigation markup is incomplete")
+	}
+	primaryEnd := strings.Index(body[primaryStart:], `</div>`)
+	if primaryEnd < 0 {
+		t.Fatal("sidebar primary navigation is not closed")
+	}
+	primaryEnd += primaryStart
+	if schedules < primaryStart || schedules > primaryEnd {
+		t.Fatal("scheduled tasks must be grouped with the primary sidebar actions")
+	}
+	if schedules > sessions || schedules > footer {
+		t.Fatal("scheduled tasks must appear before the workspace session list and footer")
+	}
+}
+
 func TestDesktopChromeOmitsRetiredBrandAndSessionMetadata(t *testing.T) {
 	s, _ := testServer(t)
 	get := func(path string) string {
