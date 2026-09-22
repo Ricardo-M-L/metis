@@ -51,6 +51,53 @@ func NewTurnCoordinator(maxParallel int) *TurnCoordinator {
 	}
 }
 
+// SetMaxParallel resizes the admission budget without disturbing leases that
+// are already running. A larger value immediately wakes eligible queued
+// workspaces; a smaller value takes effect as existing leases finish.
+func (c *TurnCoordinator) SetMaxParallel(maxParallel int) {
+	if c == nil || maxParallel < 1 {
+		return
+	}
+	c.mu.Lock()
+	if !c.closed {
+		c.maxParallel = maxParallel
+		c.dispatchLocked()
+	}
+	c.mu.Unlock()
+}
+
+// ResizeWhenIdle changes the scheduler only if no turn currently owns a
+// workspace lease. The callback runs while admission remains locked, so a
+// companion resource budget can change atomically before another root worker
+// observes the new ceiling.
+func (c *TurnCoordinator) ResizeWhenIdle(maxParallel int, apply func()) bool {
+	if c == nil || maxParallel < 1 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.running != 0 {
+		return false
+	}
+	c.maxParallel = maxParallel
+	if apply != nil {
+		apply()
+	}
+	c.dispatchLocked()
+	return true
+}
+
+// MaxParallel returns the current admission ceiling. It is primarily useful
+// for health reporting and focused scheduler regression tests.
+func (c *TurnCoordinator) MaxParallel() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maxParallel
+}
+
 // Acquire waits until both a global slot and an exclusive workspace writer
 // lease are available. Queued turns from other workspaces are allowed to pass
 // a blocked same-workspace turn, so one busy repository cannot idle the whole

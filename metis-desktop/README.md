@@ -22,7 +22,7 @@ Building both the root CLI and the desktop application requires:
 
 `METIS_HOME` controls the Metis data directory used by both processes. It
 defaults to `~/.metis`; desktop settings are stored in
-`$METIS_HOME/desktop-settings.json`.
+`$METIS_HOME/desktop-preferences.json`.
 
 ## Build and run from the repository
 
@@ -71,17 +71,20 @@ the browser-only build receives neither capability.
 ## Foreground concurrency
 
 Desktop runs unattended sessions (`dontAsk`, `bypassPermissions`, or
-`fullAccess`) in isolated Metis worker processes. The default admits six root
+`fullAccess`) in isolated Metis worker processes. The default admits eight root
 turns from different workspaces concurrently. A single workspace has one writer
 lease, so two conversations cannot concurrently change the same checkout. Child
-agents share the remaining permits in a twelve-agent total budget, with a
+agents share the remaining permits in a sixteen-agent total budget, with a
 maximum of four children from any one root session.
 
-Set `METIS_DESKTOP_MAX_PARALLEL_TURNS` to an integer from `1` through `8` to
-tune root-turn concurrency; the aggregate root-plus-child budget remains
-twelve. Image turns and sessions that can ask for an approval use the existing
-interactive runtime and remain serialized so permission cards and the selected
-workspace cannot cross conversations.
+Open **Settings → General → Foreground workspace concurrency** to choose `1`
+through `12`. The choice persists in `METIS_HOME/desktop-preferences.json` and
+is used on the next native launch; when no isolated task is active it also takes
+effect for new turns immediately. `METIS_DESKTOP_MAX_PARALLEL_TURNS` remains an
+environment override for automation and development. The aggregate root-plus-
+child budget remains sixteen. Image turns and sessions that can ask for an
+approval use the existing interactive runtime and remain serialized so
+permission cards and the selected workspace cannot cross conversations.
 
 ## In-app updates
 

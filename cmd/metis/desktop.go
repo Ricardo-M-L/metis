@@ -17,7 +17,7 @@ import (
 
 var launchNativeDesktop = desktop.LaunchApp
 
-const desktopTotalAgentSlots = 12
+const desktopTotalAgentSlots = 16
 
 // cmdDesktop implements `metis desktop`. The native Wails client is the
 // default; the old browser UI remains available behind --web for development
@@ -46,14 +46,21 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	}
 
 	flags := &cliFlags{autoMemoryStartup: autoMemoryStartupDesktop}
-	presetName := "standard"
-	if prefs, prefErr := webui.LoadDesktopLaunchPreferences(); prefErr != nil {
+	prefs := webui.DesktopLaunchPreferences{
+		DefaultPreset:       "standard",
+		RootTurnParallelism: webui.DefaultDesktopRootTurnParallelism,
+	}
+	presetName := prefs.DefaultPreset
+	if loaded, prefErr := webui.LoadDesktopLaunchPreferences(); prefErr != nil {
 		fmt.Fprintf(os.Stderr, "metis desktop: preferences: %v (using Standard preset)\n", prefErr)
-	} else if prefs.DefaultPreset != "" {
-		presetName = prefs.DefaultPreset
-		if presetName != "standard" {
-			flags.agentProfile = presetName
+	} else {
+		prefs = loaded
+		if prefs.DefaultPreset != "" {
+			presetName = prefs.DefaultPreset
 		}
+	}
+	if presetName != "standard" {
+		flags.agentProfile = presetName
 	}
 	rt, err := setupRuntime(ctx, flags)
 	if err != nil {
@@ -74,7 +81,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("desktop: determine scheduler workspace: %w", err)
 	}
-	turnParallelism := desktopWorkerParallelism(os.Getenv)
+	turnParallelism := desktopWorkerParallelism(os.Getenv, prefs.RootTurnParallelism)
 	// Lock files are owned by this Desktop backend and inherited only by its
 	// isolated turn workers. OS advisory locks release on a worker crash; the
 	// directory itself is removed once the Desktop server exits.
@@ -129,11 +136,13 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		// scheduler reserves a fixed total budget for roots and child agents,
 		// while still serializing writes in one exact workspace.
 		IsolatedTurns: &webui.IsolatedTurnOptions{
-			Executable:          executable,
-			MaxParallel:         turnParallelism,
-			SubagentSlotDir:     subagentSlotDir,
-			MaxSubagentSlots:    desktopChildAgentSlots(turnParallelism),
-			MaxSubagentsPerRoot: 4,
+			Executable:                 executable,
+			MaxParallel:                turnParallelism,
+			MaxConfigurableParallelism: webui.MaxDesktopRootTurnParallelism,
+			MaxTotalAgentSlots:         desktopTotalAgentSlots,
+			SubagentSlotDir:            subagentSlotDir,
+			MaxSubagentSlots:           desktopChildAgentSlots(turnParallelism),
+			MaxSubagentsPerRoot:        4,
 		},
 	}
 	// A regular `metis desktop --web` browser session has no frame token and
@@ -150,8 +159,11 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	return srv.Run(serverCtx)
 }
 
-func desktopWorkerParallelism(getenv func(string) string) int {
-	const defaultParallelism = 6
+func desktopWorkerParallelism(getenv func(string) string, saved int) int {
+	defaultParallelism := webui.DefaultDesktopRootTurnParallelism
+	if saved >= 1 && saved <= webui.MaxDesktopRootTurnParallelism {
+		defaultParallelism = saved
+	}
 	if getenv == nil {
 		return defaultParallelism
 	}
@@ -160,8 +172,8 @@ func desktopWorkerParallelism(getenv func(string) string) int {
 		return defaultParallelism
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < 1 || n > 8 {
-		fmt.Fprintf(os.Stderr, "metis desktop: ignoring METIS_DESKTOP_MAX_PARALLEL_TURNS=%q (want 1..8)\n", raw)
+	if err != nil || n < 1 || n > webui.MaxDesktopRootTurnParallelism {
+		fmt.Fprintf(os.Stderr, "metis desktop: ignoring METIS_DESKTOP_MAX_PARALLEL_TURNS=%q (want 1..%d)\n", raw, webui.MaxDesktopRootTurnParallelism)
 		return defaultParallelism
 	}
 	return n
@@ -169,16 +181,17 @@ func desktopWorkerParallelism(getenv func(string) string) int {
 
 // desktopChildAgentSlots keeps the aggregate root + child agent budget fixed
 // even when an advanced user raises or lowers the foreground worker setting.
-// The default is six roots plus six child permits. A per-root roster cap still
+// The default is eight roots plus eight child permits. A per-root roster cap still
 // prevents one session from consuming the shared child pool.
 func desktopChildAgentSlots(rootSlots int) int {
 	if rootSlots < 1 {
 		rootSlots = 1
 	}
-	if rootSlots >= desktopTotalAgentSlots {
+	childSlots := desktopTotalAgentSlots - rootSlots
+	if childSlots < 1 {
 		return 1
 	}
-	return desktopTotalAgentSlots - rootSlots
+	return childSlots
 }
 
 type desktopOptions struct {

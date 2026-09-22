@@ -58,12 +58,27 @@ func TestDesktopChildAgentSlotsKeepsAggregateBudget(t *testing.T) {
 	for _, tc := range []struct {
 		roots, want int
 	}{
-		{roots: 1, want: 11},
-		{roots: 6, want: 6},
-		{roots: 8, want: 4},
+		{roots: 1, want: 15},
+		{roots: 8, want: 8},
+		{roots: 12, want: 4},
 	} {
 		if got := desktopChildAgentSlots(tc.roots); got != tc.want {
 			t.Fatalf("desktopChildAgentSlots(%d) = %d, want %d", tc.roots, got, tc.want)
 		}
+	}
+}
+
+func TestDesktopWorkerParallelismUsesSavedPreferenceAndEnvironmentOverride(t *testing.T) {
+	if got := desktopWorkerParallelism(nil, 12); got != 12 {
+		t.Fatalf("saved parallelism = %d, want 12", got)
+	}
+	if got := desktopWorkerParallelism(func(string) string { return "" }, 0); got != 8 {
+		t.Fatalf("default parallelism = %d, want 8", got)
+	}
+	if got := desktopWorkerParallelism(func(string) string { return "3" }, 12); got != 3 {
+		t.Fatalf("environment override = %d, want 3", got)
+	}
+	if got := desktopWorkerParallelism(func(string) string { return "99" }, 12); got != 12 {
+		t.Fatalf("invalid environment override = %d, want saved value 12", got)
 	}
 }

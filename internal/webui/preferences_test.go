@@ -12,6 +12,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -28,7 +29,7 @@ func TestDesktopPreferencesPersistAcrossServers(t *testing.T) {
 
 	rr = httptest.NewRecorder()
 	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/preferences",
-		bytes.NewBufferString(`{"busyEnter":"send","sidebarView":"flat","sidebarSort":"manual","sessionOrder":["s2","s1"],"defaultPreset":"plan","language":"en"}`)))
+		bytes.NewBufferString(`{"busyEnter":"send","sidebarView":"flat","sidebarSort":"manual","sessionOrder":["s2","s1"],"defaultPreset":"plan","language":"en","rootTurnParallelism":12}`)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("save: %d %s", rr.Code, rr.Body.String())
 	}
@@ -47,7 +48,7 @@ func TestDesktopPreferencesPersistAcrossServers(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.BusyEnter != "send" || got.SidebarView != "flat" || got.SidebarSort != "manual" || got.DefaultPreset != "plan" || got.Language != "en" || len(got.SessionOrder) != 2 {
+	if got.BusyEnter != "send" || got.SidebarView != "flat" || got.SidebarSort != "manual" || got.DefaultPreset != "plan" || got.Language != "en" || got.RootTurnParallelism != 12 || len(got.SessionOrder) != 2 {
 		t.Fatalf("round trip = %+v", got)
 	}
 }
@@ -66,6 +67,79 @@ func TestDesktopPreferencesRejectInvalidValueWithoutOverwrite(t *testing.T) {
 	if !bytes.Contains(rr.Body.Bytes(), []byte(`"busyEnter":"queue"`)) {
 		t.Fatalf("invalid write changed defaults: %s", rr.Body.String())
 	}
+}
+
+func TestDesktopPreferencesRejectInvalidParallelismWithoutOverwrite(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/preferences",
+		bytes.NewBufferString(`{"rootTurnParallelism":13}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid parallelism status = %d: %s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/preferences", nil))
+	var got desktopPreferences
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.RootTurnParallelism != DefaultDesktopRootTurnParallelism {
+		t.Fatalf("invalid parallelism changed defaults: %+v", got)
+	}
+}
+
+type resizablePreferenceRunner struct {
+	slots int
+}
+
+func (r *resizablePreferenceRunner) Eligible(*session.Header) bool { return true }
+
+func (r *resizablePreferenceRunner) Run(context.Context, IsolatedTurnRequest) (IsolatedTurnResult, error) {
+	return IsolatedTurnResult{}, nil
+}
+
+func (r *resizablePreferenceRunner) SetMaxSubagentSlots(slots int) { r.slots = slots }
+
+func TestDesktopPreferencesApplyParallelismWhenIdle(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	runner := &resizablePreferenceRunner{}
+	s, _ := testServer(t)
+	s.isolatedRunner = runner
+	s.turnCoordinator = NewTurnCoordinator(8)
+	s.maxTurnParallelism = MaxDesktopRootTurnParallelism
+	s.maxTotalAgentSlots = 16
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/preferences",
+		bytes.NewBufferString(`{"rootTurnParallelism":12}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("save parallelism: %d %s", rr.Code, rr.Body.String())
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"parallelismApplied":true`)) {
+		t.Fatalf("parallelism response = %s", rr.Body.String())
+	}
+	if got := s.turnCoordinator.MaxParallel(); got != 12 {
+		t.Fatalf("server max parallel = %d, want 12", got)
+	}
+	if runner.slots != 4 {
+		t.Fatalf("child agent slots = %d, want 4", runner.slots)
+	}
+
+	lease, err := s.turnCoordinator.Acquire(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/preferences",
+		bytes.NewBufferString(`{"rootTurnParallelism":10}`)))
+	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"parallelismApplied":false`)) {
+		t.Fatalf("active parallelism response = %d %s", rr.Code, rr.Body.String())
+	}
+	if got := s.turnCoordinator.MaxParallel(); got != 12 || runner.slots != 4 {
+		t.Fatalf("live work should defer resize: parallel=%d slots=%d", got, runner.slots)
+	}
+	lease.Release()
 }
 
 func TestDesktopPreferencesRejectDuplicateManualOrder(t *testing.T) {

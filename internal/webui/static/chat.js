@@ -3899,8 +3899,9 @@ const THEME_DESCS_ZH = {
 };
 
 function renderGeneralTab() {
-  const parts = [];
-  parts.push(renderBusyEnterPreference());
+	const parts = [];
+	parts.push(renderDesktopParallelismPreference());
+	parts.push(renderBusyEnterPreference());
   const perm = settingByKey('permission.mode');
   if (perm) parts.push(renderEnumSetting(perm,
     document.documentElement.lang === 'zh-CN' ? PERMISSION_LABELS_ZH : PERMISSION_LABELS,
@@ -3912,6 +3913,30 @@ function renderGeneralTab() {
   const loop = settingByKey('loop_detection.disabled');
   if (loop) parts.push(renderBoolSetting(loop));
   return parts.join('');
+}
+
+function renderDesktopParallelismPreference() {
+  const value = Number(desktopPreferences.rootTurnParallelism) || 8;
+  return `<div class="settings-section">
+    <div class="settings-section-title">${uiText('Foreground workspace concurrency', '前台工作区并发数')}</div>
+    <div class="settings-section-desc">${uiText('How many independent workspaces may run at once. The default is 8; the same workspace always runs one writer at a time. Choose 1–12. Changes apply to new tasks immediately when no task is running; otherwise restart Desktop after current tasks finish.', '允许多少个独立工作区同时运行。默认 8；同一工作区始终只有一个写入任务。可设 1–12。没有任务运行时，修改会立即用于新任务；否则请等待当前任务结束后重启 Desktop。')}</div>
+    <div class="settings-card"><div class="settings-card-row"><div><div class="settings-card-label">${uiText('Parallel conversations', '并发会话')}</div><div class="settings-card-desc">${uiText('High-performance mode shares a 16-agent root and child budget.', '高性能模式在根会话和子代理间共享 16 个代理槽位。')}</div></div><input type="number" min="1" max="12" step="1" class="settings-number" value="${escAttr(String(value))}" aria-label="${escAttr(uiText('Foreground workspace concurrency', '前台工作区并发数'))}" onchange="saveDesktopParallelism(this)"></div></div>
+  </div>`;
+}
+
+async function saveDesktopParallelism(input) {
+  const value = Number(input && input.value);
+  if (!Number.isInteger(value) || value < 1 || value > 12) {
+    showToast(uiText('Concurrency must be an integer from 1 to 12.', '并发数必须是 1 到 12 的整数。'));
+    renderSettingsTab();
+    return;
+  }
+  const result = await saveDesktopPreference('rootTurnParallelism', value);
+  if (!result) return;
+  renderSettingsTab();
+  showToast(result.parallelismApplied === false
+    ? uiText('Concurrency saved. Restart Desktop after active tasks finish to apply it safely.', '并发数已保存。请等待当前任务结束后重启 Desktop 以安全生效。')
+    : uiText('Concurrency saved. New workspace tasks use it now.', '并发数已保存，新的工作区任务已使用该设置。'));
 }
 
 function renderBusyEnterPreference() {

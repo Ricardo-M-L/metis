@@ -22,10 +22,23 @@ type desktopPreferences struct {
 	SessionOrder  []string `json:"sessionOrder"`  // stable ids, manual mode
 	DefaultPreset string   `json:"defaultPreset"` // standard | agent profile name
 	Language      string   `json:"language"`      // auto | en | zh-CN
+	// RootTurnParallelism limits simultaneously-running top-level turns in
+	// different workspaces. A workspace itself remains exclusive so agents do
+	// not concurrently edit one checkout.
+	RootTurnParallelism int `json:"rootTurnParallelism"`
 }
 
+const (
+	// DefaultDesktopRootTurnParallelism is deliberately higher than the old
+	// conservative six-worker Desktop setting. Eight separate workspaces keep
+	// a modern desktop busy without making the default child-agent budget too
+	// small.
+	DefaultDesktopRootTurnParallelism = 8
+	MaxDesktopRootTurnParallelism     = 12
+)
+
 func defaultDesktopPreferences() desktopPreferences {
-	return desktopPreferences{BusyEnter: "queue", SidebarView: "grouped", SidebarSort: "recent", DefaultPreset: "standard", Language: "zh-CN"}
+	return desktopPreferences{BusyEnter: "queue", SidebarView: "grouped", SidebarSort: "recent", DefaultPreset: "standard", Language: "zh-CN", RootTurnParallelism: DefaultDesktopRootTurnParallelism}
 }
 
 var desktopPresetName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -53,6 +66,12 @@ func loadDesktopPreferences() (desktopPreferences, error) {
 	if prefs.Language == "" {
 		prefs.Language = "zh-CN"
 	}
+	// Files written before Desktop exposed controlled foreground concurrency
+	// omit this field. Migrate them in memory rather than treating a safe old
+	// preference file as corrupt.
+	if prefs.RootTurnParallelism == 0 {
+		prefs.RootTurnParallelism = DefaultDesktopRootTurnParallelism
+	}
 	if !validDesktopPreferences(prefs) {
 		return defaultDesktopPreferences(), errors.New("invalid desktop preferences")
 	}
@@ -75,6 +94,9 @@ func validDesktopPreferences(p desktopPreferences) bool {
 	if p.Language != "auto" && p.Language != "en" && p.Language != "zh-CN" {
 		return false
 	}
+	if p.RootTurnParallelism < 1 || p.RootTurnParallelism > MaxDesktopRootTurnParallelism {
+		return false
+	}
 	seen := make(map[string]struct{}, len(p.SessionOrder))
 	for _, id := range p.SessionOrder {
 		if id == "" || len(id) > 128 {
@@ -92,12 +114,13 @@ func validDesktopPreferences(p desktopPreferences) bool {
 // layer uses this before setupRuntime so an Agent preset can shape the system
 // prompt and tool registry atomically rather than being half-applied live.
 type DesktopLaunchPreferences struct {
-	DefaultPreset string
+	DefaultPreset       string
+	RootTurnParallelism int
 }
 
 func LoadDesktopLaunchPreferences() (DesktopLaunchPreferences, error) {
 	prefs, err := loadDesktopPreferences()
-	return DesktopLaunchPreferences{DefaultPreset: prefs.DefaultPreset}, err
+	return DesktopLaunchPreferences{DefaultPreset: prefs.DefaultPreset, RootTurnParallelism: prefs.RootTurnParallelism}, err
 }
 
 func saveDesktopPreferences(prefs desktopPreferences) (err error) {
@@ -152,18 +175,19 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, prefs)
 	case http.MethodPost:
 		var body struct {
-			BusyEnter     *string   `json:"busyEnter"`
-			SidebarView   *string   `json:"sidebarView"`
-			SidebarSort   *string   `json:"sidebarSort"`
-			SessionOrder  *[]string `json:"sessionOrder"`
-			DefaultPreset *string   `json:"defaultPreset"`
-			Language      *string   `json:"language"`
+			BusyEnter           *string   `json:"busyEnter"`
+			SidebarView         *string   `json:"sidebarView"`
+			SidebarSort         *string   `json:"sidebarSort"`
+			SessionOrder        *[]string `json:"sessionOrder"`
+			DefaultPreset       *string   `json:"defaultPreset"`
+			Language            *string   `json:"language"`
+			RootTurnParallelism *int      `json:"rootTurnParallelism"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid body")
 			return
 		}
-		if body.BusyEnter == nil && body.SidebarView == nil && body.SidebarSort == nil && body.SessionOrder == nil && body.DefaultPreset == nil && body.Language == nil {
+		if body.BusyEnter == nil && body.SidebarView == nil && body.SidebarSort == nil && body.SessionOrder == nil && body.DefaultPreset == nil && body.Language == nil && body.RootTurnParallelism == nil {
 			writeError(w, http.StatusBadRequest, "no changes")
 			return
 		}
@@ -185,6 +209,9 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 		if body.Language != nil {
 			prefs.Language = *body.Language
 		}
+		if body.RootTurnParallelism != nil {
+			prefs.RootTurnParallelism = *body.RootTurnParallelism
+		}
 		if err := saveDesktopPreferences(prefs); err != nil {
 			if !validDesktopPreferences(prefs) {
 				writeError(w, http.StatusBadRequest, err.Error())
@@ -193,7 +220,15 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		writeJSON(w, http.StatusOK, prefs)
+		var parallelismApplied *bool
+		if body.RootTurnParallelism != nil {
+			applied := s.applyDesktopTurnParallelism(*body.RootTurnParallelism)
+			parallelismApplied = &applied
+		}
+		writeJSON(w, http.StatusOK, struct {
+			desktopPreferences
+			ParallelismApplied *bool `json:"parallelismApplied,omitempty"`
+		}{desktopPreferences: prefs, ParallelismApplied: parallelismApplied})
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")

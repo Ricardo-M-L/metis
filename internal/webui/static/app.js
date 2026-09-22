@@ -9,7 +9,7 @@ let sessions = [];
 let workspaces = [];
 let activeWorkspaceId = '';
 let currentSessionId = null;
-let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN' };
+let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN', rootTurnParallelism: 8 };
 let lastStatusSnapshot = null;
 let statusRequestGeneration = 0;
 let subAgentDetailState = { agentId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0 };
@@ -138,7 +138,7 @@ async function saveDesktopPreferencesPatch(patch) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'preferences: ' + res.status);
     desktopPreferences = Object.assign({}, desktopPreferences, data);
-    return true;
+    return data;
   } catch (e) {
 	desktopPreferences = previous;
     showToast('Preference save failed: ' + e.message);

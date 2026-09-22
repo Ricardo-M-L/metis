@@ -47,8 +47,13 @@ type IsolatedTurnRunner interface {
 // IsolatedTurnOptions configures the Desktop high-performance worker pool.
 // Executable must be the absolute path of the currently-running metis binary.
 type IsolatedTurnOptions struct {
-	Executable          string
-	MaxParallel         int
+	Executable  string
+	MaxParallel int
+	// MaxConfigurableParallelism is the highest user-selectable foreground
+	// worker count. Zero keeps reduced embedders read-only.
+	MaxConfigurableParallelism int
+	// MaxTotalAgentSlots keeps root and child workers under one Desktop budget.
+	MaxTotalAgentSlots  int
 	SubagentSlotDir     string
 	MaxSubagentSlots    int
 	MaxSubagentsPerRoot int
@@ -57,9 +62,31 @@ type IsolatedTurnOptions struct {
 type processIsolatedTurnRunner struct {
 	executable          string
 	subagentSlotDir     string
+	limitsMu            sync.RWMutex
 	maxSubagentSlots    int
 	maxSubagentsPerRoot int
 	command             func(string, ...string) *exec.Cmd
+}
+
+// SetMaxSubagentSlots updates the permit count inherited by subsequently
+// launched root workers. Existing workers keep the environment they started
+// with, which is why Server only resizes while no isolated turn is active.
+func (r *processIsolatedTurnRunner) SetMaxSubagentSlots(slots int) {
+	if r == nil || slots < 1 {
+		return
+	}
+	r.limitsMu.Lock()
+	r.maxSubagentSlots = slots
+	r.limitsMu.Unlock()
+}
+
+func (r *processIsolatedTurnRunner) subagentLimits() (int, int) {
+	if r == nil {
+		return 0, 0
+	}
+	r.limitsMu.RLock()
+	defer r.limitsMu.RUnlock()
+	return r.maxSubagentSlots, r.maxSubagentsPerRoot
 }
 
 func newProcessIsolatedTurnRunner(options IsolatedTurnOptions) (IsolatedTurnRunner, error) {
@@ -117,9 +144,10 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 		"METIS_DESKTOP_ISOLATED_WORKER": "1",
 	}
 	if r.subagentSlotDir != "" {
+		maxSubagentSlots, maxSubagentsPerRoot := r.subagentLimits()
 		env["METIS_DESKTOP_SUBAGENT_SLOT_DIR"] = r.subagentSlotDir
-		env["METIS_DESKTOP_SUBAGENT_SLOTS"] = strconv.Itoa(r.maxSubagentSlots)
-		env["METIS_DESKTOP_SUBAGENT_CAP"] = strconv.Itoa(r.maxSubagentsPerRoot)
+		env["METIS_DESKTOP_SUBAGENT_SLOTS"] = strconv.Itoa(maxSubagentSlots)
+		env["METIS_DESKTOP_SUBAGENT_CAP"] = strconv.Itoa(maxSubagentsPerRoot)
 	}
 	cmd.Env = withIsolatedWorkerEnv(os.Environ(), env)
 	jobs.ApplyProcessGroup(cmd)

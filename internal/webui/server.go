@@ -62,15 +62,17 @@ type Server struct {
 	// turnCoordinator covers both legacy in-process turns and isolated worker
 	// turns. runMu remains for the one process-owned Loop; the coordinator is
 	// what lets independent workspaces make progress concurrently.
-	turnCoordinator *TurnCoordinator
-	isolatedRunner  IsolatedTurnRunner
-	workerTurnsMu   sync.Mutex
-	workerTurns     map[string]*isolatedActiveTurn
-	hub             *eventHub
-	prefsMu         sync.Mutex
-	workspacesMu    sync.Mutex
-	providersMu     sync.Mutex
-	effortMu        sync.Mutex
+	turnCoordinator    *TurnCoordinator
+	isolatedRunner     IsolatedTurnRunner
+	maxTurnParallelism int
+	maxTotalAgentSlots int
+	workerTurnsMu      sync.Mutex
+	workerTurns        map[string]*isolatedActiveTurn
+	hub                *eventHub
+	prefsMu            sync.Mutex
+	workspacesMu       sync.Mutex
+	providersMu        sync.Mutex
+	effortMu           sync.Mutex
 
 	// cancelMu guards the identity, cancel func, and completion signal for the
 	// in-flight turn. Keeping the session identity separate from the session
@@ -409,6 +411,8 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 	}
 	if binding.IsolatedTurns != nil {
 		server.turnCoordinator = NewTurnCoordinator(binding.IsolatedTurns.MaxParallel)
+		server.maxTurnParallelism = binding.IsolatedTurns.MaxConfigurableParallelism
+		server.maxTotalAgentSlots = binding.IsolatedTurns.MaxTotalAgentSlots
 		if server.isolatedRunner == nil {
 			if runner, err := newProcessIsolatedTurnRunner(*binding.IsolatedTurns); err != nil {
 				log.Printf("desktop isolated turns disabled: %v", err)
@@ -499,6 +503,31 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		server.traceAdapter.SetResolvedEventObserver(server.observeResolvedTraceEvent)
 	}
 	return server
+}
+
+type subagentSlotResizer interface {
+	SetMaxSubagentSlots(int)
+}
+
+// applyDesktopTurnParallelism resizes new foreground worker admission only
+// while no turn holds a workspace lease. That keeps the shared child-slot
+// files and root ceiling one budget rather than changing one half beneath a
+// live worker. The saved preference remains valid and will apply on restart
+// when a task is in flight.
+func (s *Server) applyDesktopTurnParallelism(rootSlots int) bool {
+	if s == nil || s.turnCoordinator == nil || s.isolatedRunner == nil || s.maxTurnParallelism < 1 || s.maxTotalAgentSlots < 2 {
+		return false
+	}
+	if rootSlots < 1 || rootSlots > s.maxTurnParallelism || rootSlots >= s.maxTotalAgentSlots {
+		return false
+	}
+	resizer, ok := s.isolatedRunner.(subagentSlotResizer)
+	if !ok {
+		return false
+	}
+	return s.turnCoordinator.ResizeWhenIdle(rootSlots, func() {
+		resizer.SetMaxSubagentSlots(s.maxTotalAgentSlots - rootSlots)
+	})
 }
 
 func (s *Server) observeResolvedTraceEvent(resolved rtpkg.ResolvedTraceEvent) {
