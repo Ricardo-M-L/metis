@@ -735,7 +735,18 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			AgentID:    agentID,
 			Background: runInBackground,
 		}
+		// Isolated Desktop workers share a small cross-process child-agent
+		// pool. Acquire before publishing into the local roster so a queued
+		// global permit never consumes this session's local capacity.
+		releaseDesktopSlot, err := agent.AcquireDesktopSubagentSlot(ctx)
+		if err != nil {
+			return &tools.Result{
+				Output:  fmt.Sprintf("sub-agent is waiting for Desktop capacity: %v", err),
+				IsError: true,
+			}, nil
+		}
 		if err := a.roster.Register(teammate); err != nil {
+			releaseDesktopSlot()
 			if errors.Is(err, agent.ErrCapacityExceeded) {
 				// Split pools: the error came from whichever pool
 				// matches this teammate's kind. Report THAT pool's
@@ -770,6 +781,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			}
 			return &tools.Result{Output: err.Error(), IsError: true}, nil
 		}
+		teammate.SetResourceRelease(releaseDesktopSlot)
 		rosterCleanupOwnedByExecute = true
 	}
 

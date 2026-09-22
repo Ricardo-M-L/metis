@@ -53,3 +53,17 @@ func TestCmdDesktopDefaultsToNativeWorkspace(t *testing.T) {
 		t.Fatalf("native workspace = %q, want absolute cwd", got)
 	}
 }
+
+func TestDesktopChildAgentSlotsKeepsAggregateBudget(t *testing.T) {
+	for _, tc := range []struct {
+		roots, want int
+	}{
+		{roots: 1, want: 11},
+		{roots: 6, want: 6},
+		{roots: 8, want: 4},
+	} {
+		if got := desktopChildAgentSlots(tc.roots); got != tc.want {
+			t.Fatalf("desktopChildAgentSlots(%d) = %d, want %d", tc.roots, got, tc.want)
+		}
+	}
+}

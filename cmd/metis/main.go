@@ -1875,6 +1875,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Monitors:              monitorReg,
 		MaxBudgetUSD:          flags.maxBudgetUSD,
 	})
+	applyDesktopWorkerMemoryPolicy(loop, os.Getenv)
 
 	// METIS_SIMPLE / --simple → use the curated short tool descriptions
 	// matched 1:1 with the simple-mode system prompt: short prompt +

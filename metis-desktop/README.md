@@ -68,6 +68,21 @@ server and displays it in an embedded frame. The shell keeps a deliberately
 narrow native bridge for the system folder picker and explicit in-app updates;
 the browser-only build receives neither capability.
 
+## Foreground concurrency
+
+Desktop runs unattended sessions (`dontAsk`, `bypassPermissions`, or
+`fullAccess`) in isolated Metis worker processes. The default admits six root
+turns from different workspaces concurrently. A single workspace has one writer
+lease, so two conversations cannot concurrently change the same checkout. Child
+agents share the remaining permits in a twelve-agent total budget, with a
+maximum of four children from any one root session.
+
+Set `METIS_DESKTOP_MAX_PARALLEL_TURNS` to an integer from `1` through `8` to
+tune root-turn concurrency; the aggregate root-plus-child budget remains
+twelve. Image turns and sessions that can ask for an approval use the existing
+interactive runtime and remain serialized so permission cards and the selected
+workspace cannot cross conversations.
+
 ## In-app updates
 
 The update icon beside Settings performs a read-only release check. Merely

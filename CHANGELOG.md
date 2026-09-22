@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Desktop now schedules unattended foreground turns in isolated Metis worker
+  processes. Up to six sessions in different workspaces can run concurrently;
+  sessions sharing one workspace retain an exclusive writer lease. The native
+  profile also applies a cross-process child-agent budget, keeping roots and
+  sub-agents within a twelve-agent total ceiling.
 - Durable project coordination: `metis coordinator create|list|status|add|run|claim|complete|fail|recover` now stores a workspace-bound dependency graph with worker leases, bounded recovery, result evidence, and a compact event trail. The same `ProjectCoordinator` tool is available to coordinator-mode agents, so project state survives session switches and Desktop/CLI restarts.
 
 ### Changed

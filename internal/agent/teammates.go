@@ -163,6 +163,10 @@ type Teammate struct {
 	// Memory repository binding.
 	done     chan struct{}
 	doneOnce sync.Once
+	// resourceRelease returns a Desktop-wide child-agent permit when the
+	// runner unwinds. It is nil for ordinary CLI use and is called only from
+	// signalDone, which already has exactly-once lifecycle semantics.
+	resourceRelease func()
 
 	// Name is what callers pass via `Agent({name: ...})`. Anonymous
 	// sub-agents get an auto-generated `_anon-<8hex>` prefix so the
@@ -255,6 +259,19 @@ func (t *Teammate) SetCancel(cancel func()) {
 	if requested && cancel != nil {
 		cancel()
 	}
+}
+
+// SetResourceRelease installs an optional external resource lease release.
+// Desktop workers use it for their shared cross-process child-agent pool;
+// ordinary callers leave it nil. It must be installed before the runner is
+// started, which is guaranteed by Agent.Execute's registration path.
+func (t *Teammate) SetResourceRelease(release func()) {
+	if t == nil || release == nil {
+		return
+	}
+	t.mu.Lock()
+	t.resourceRelease = release
+	t.mu.Unlock()
 }
 
 // RequestCancel records an authoritative cancellation request and invokes the
@@ -676,7 +693,16 @@ func (t *Teammate) signalDone() {
 	if t == nil || t.done == nil {
 		return
 	}
-	t.doneOnce.Do(func() { close(t.done) })
+	t.doneOnce.Do(func() {
+		t.mu.Lock()
+		release := t.resourceRelease
+		t.resourceRelease = nil
+		t.mu.Unlock()
+		if release != nil {
+			release()
+		}
+		close(t.done)
+	})
 }
 
 // Count returns the number of currently-registered teammates.

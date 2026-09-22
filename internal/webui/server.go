@@ -55,15 +55,22 @@ var staticFS embed.FS
 // Server owns one agent loop. Turns are serialized because Loop contains the
 // active transcript and is not safe for simultaneous conversations.
 type Server struct {
-	addr         string
-	loop         *agent.Loop
-	store        *session.Store
-	runMu        sync.Mutex
-	hub          *eventHub
-	prefsMu      sync.Mutex
-	workspacesMu sync.Mutex
-	providersMu  sync.Mutex
-	effortMu     sync.Mutex
+	addr  string
+	loop  *agent.Loop
+	store *session.Store
+	runMu sync.Mutex
+	// turnCoordinator covers both legacy in-process turns and isolated worker
+	// turns. runMu remains for the one process-owned Loop; the coordinator is
+	// what lets independent workspaces make progress concurrently.
+	turnCoordinator *TurnCoordinator
+	isolatedRunner  IsolatedTurnRunner
+	workerTurnsMu   sync.Mutex
+	workerTurns     map[string]*isolatedActiveTurn
+	hub             *eventHub
+	prefsMu         sync.Mutex
+	workspacesMu    sync.Mutex
+	providersMu     sync.Mutex
+	effortMu        sync.Mutex
 
 	// cancelMu guards the identity, cancel func, and completion signal for the
 	// in-flight turn. Keeping the session identity separate from the session
@@ -159,6 +166,11 @@ type permissionPending struct {
 // askPending is one unresolved AskUser question from the model.
 type askPending struct {
 	reply chan string
+}
+
+type isolatedActiveTurn struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type hubEvent struct {
@@ -332,6 +344,13 @@ type RuntimeBindings struct {
 	// Roster exposes the live sub-agent registry so the status bar can
 	// show "N sub-agents ~ M background tasks" like the harness GUI.
 	Roster *agent.Roster
+	// IsolatedTurns enables the bounded per-turn worker pool used by native
+	// Desktop. Its absolute executable is invoked with `run --resume`, which
+	// gives each running session an independent provider/tool/runtime process.
+	IsolatedTurns *IsolatedTurnOptions
+	// IsolatedRunner is primarily for embedders and tests. When provided it
+	// takes precedence over IsolatedTurns' process implementation.
+	IsolatedRunner IsolatedTurnRunner
 }
 
 func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...RuntimeBindings) *Server {
@@ -351,6 +370,9 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		addr:                    addr,
 		loop:                    loop,
 		store:                   store,
+		turnCoordinator:         NewTurnCoordinator(1),
+		isolatedRunner:          binding.IsolatedRunner,
+		workerTurns:             make(map[string]*isolatedActiveTurn),
 		hub:                     newEventHub(),
 		pendingPerms:            make(map[string]*permissionPending),
 		buildVersion:            strconv.FormatInt(time.Now().UnixNano(), 36),
@@ -384,6 +406,16 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		pluginMarket:            pluginmarket.NewManager(),
 		traceAdapter:            binding.TraceAdapter,
 		traceStore:              binding.TraceStore,
+	}
+	if binding.IsolatedTurns != nil {
+		server.turnCoordinator = NewTurnCoordinator(binding.IsolatedTurns.MaxParallel)
+		if server.isolatedRunner == nil {
+			if runner, err := newProcessIsolatedTurnRunner(*binding.IsolatedTurns); err != nil {
+				log.Printf("desktop isolated turns disabled: %v", err)
+			} else {
+				server.isolatedRunner = runner
+			}
+		}
 	}
 	if binding.Automations != nil {
 		server.automations = newAutomationManager(*binding.Automations)
@@ -1112,6 +1144,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 // session first crosses to a fresh empty session; this keeps every global
 // session router valid and prevents a late write from recreating the old data.
 func (s *Server) handleSessionDelete(w http.ResponseWriter, id string) {
+	s.workerTurnsMu.Lock()
+	_, isolatedRunning := s.workerTurns[id]
+	s.workerTurnsMu.Unlock()
+	if isolatedRunning {
+		writeError(w, http.StatusConflict, "a turn is running; stop it before deleting this session")
+		return
+	}
 	if !s.runMu.TryLock() {
 		writeError(w, http.StatusConflict, "a turn is running; stop it before deleting sessions")
 		return
@@ -1443,8 +1482,112 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid session id")
 		return
 	}
-	s.runMu.Lock()
-	defer s.runMu.Unlock()
+	// Reduced embedders do not install an isolated runner. Preserve their
+	// established runMu-before-session-allocation ordering, including the
+	// shutdown guarantee that a queued request cannot create a ghost session.
+	legacyPrelocked := s.isolatedRunner == nil
+	if legacyPrelocked {
+		s.runMu.Lock()
+		defer s.runMu.Unlock()
+	}
+	// A new session has no header from which to obtain a workspace. Reserve its
+	// fresh-workspace lease before writing anything durable: a queued request
+	// that loses to Desktop shutdown must not leave a ghost transcript behind.
+	var lease *TurnLease
+	if body.SessionID == "" {
+		s.stateMu.RLock()
+		workDir := s.freshWorkDir
+		providerName := s.freshProviderName
+		model := s.freshModel
+		system := s.freshSystem
+		systemKind := s.freshSystemPromptKind
+		mode := s.freshPermissionMode
+		preset := s.freshPreset
+		s.stateMu.RUnlock()
+		s.cancelMu.Lock()
+		closing := s.closing
+		s.cancelMu.Unlock()
+		if closing {
+			writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
+			return
+		}
+		var err error
+		lease, err = s.turnCoordinator.Acquire(r.Context(), workDir)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				writeError(w, http.StatusRequestTimeout, "turn cancelled while waiting for a workspace slot")
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		s.cancelMu.Lock()
+		closing = s.closing
+		s.cancelMu.Unlock()
+		if closing {
+			lease.Release()
+			writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
+			return
+		}
+		// The lease is now owned by this request, and is released below with
+		// existing-session leases through one common defer.
+		defer lease.Release()
+		body.SessionID = s.store.NewSessionID()
+		if err := s.store.WriteHeaderFull(session.Header{
+			ID:               body.SessionID,
+			Provider:         providerName,
+			Model:            model,
+			System:           system,
+			SystemPromptKind: systemKind,
+			WorkDir:          workDir,
+			Mode:             string(mode),
+			Effort:           effortHeaderValue(s.loop.EffortValue()),
+			Preset:           preset,
+			Status:           "idle",
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create session")
+			return
+		}
+	}
+
+	t0 := time.Now()
+	hdr, history, err := s.store.Load(body.SessionID)
+	if err != nil || hdr == nil {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	loadMs := time.Since(t0).Milliseconds()
+	turnWorkDir := strings.TrimSpace(hdr.WorkDir)
+	if turnWorkDir == "" {
+		s.stateMu.RLock()
+		turnWorkDir = s.freshWorkDir
+		s.stateMu.RUnlock()
+	}
+	if lease == nil {
+		lease, err = s.turnCoordinator.Acquire(r.Context(), turnWorkDir)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				writeError(w, http.StatusRequestTimeout, "turn cancelled while waiting for a workspace slot")
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	}
+	defer lease.Release()
+
+	// Image inputs and approval-driven permission modes retain the mature
+	// in-process path. Fully unattended sessions run in a fresh metis process
+	// and may therefore proceed alongside sessions in other workspaces.
+	if len(imgBlocks) == 0 && s.isolatedRunner != nil && s.isolatedRunner.Eligible(hdr) {
+		s.handleIsolatedTurn(w, r, body.SessionID, body.Input, turnWorkDir)
+		return
+	}
+
+	if !legacyPrelocked {
+		s.runMu.Lock()
+		defer s.runMu.Unlock()
+	}
 	// Reserve the foreground-turn slot atomically with the closing check.
 	// Shutdown holds the same cancelMu while setting closing and snapshotting
 	// this handle, so it cannot miss a turn between preflight and registration.
@@ -1473,37 +1616,15 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		close(turnDone)
 		cancel()
 	}()
-	if body.SessionID == "" {
-		body.SessionID = s.store.NewSessionID()
-		s.cancelMu.Lock()
-		if s.turnDone == turnDone {
-			s.runningSession = body.SessionID
-		}
-		s.cancelMu.Unlock()
-		cwd, _ := os.Getwd()
-		if err := s.store.WriteHeaderFull(session.Header{
-			ID:               body.SessionID,
-			Provider:         s.freshProviderName,
-			Model:            s.freshModel,
-			System:           s.freshSystem,
-			SystemPromptKind: s.freshSystemPromptKind,
-			WorkDir:          cwd,
-			Mode:             string(s.freshPermissionMode),
-			Effort:           effortHeaderValue(s.loop.EffortValue()),
-			Preset:           s.freshPreset,
-			Status:           "idle",
-		}); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to create session")
-			return
-		}
-	}
-	t0 := time.Now()
-	hdr, history, err := s.store.Load(body.SessionID)
-	if err != nil {
+	// Reload after acquiring runMu: another Metis process may have appended to
+	// this session while this request was waiting for its workspace lease.
+	t0 = time.Now()
+	hdr, history, err = s.store.Load(body.SessionID)
+	if err != nil || hdr == nil {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	loadMs := time.Since(t0).Milliseconds()
+	loadMs += time.Since(t0).Milliseconds()
 	t0 = time.Now()
 	if err := s.activateSession(body.SessionID, hdr, history); err != nil {
 		writeError(w, http.StatusConflict, "failed to activate session: "+err.Error())
@@ -1524,7 +1645,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	// Desktop process launch directory. Snapshot it once for this serialized
 	// turn so a later read-only navigation cannot alter an in-flight tool.
 	s.stateMu.RLock()
-	turnWorkDir := s.activeWorkDir
+	turnWorkDir = s.activeWorkDir
 	s.stateMu.RUnlock()
 	turnCtx = agent.WithCwd(turnCtx, turnWorkDir)
 	activateMs := time.Since(t0).Milliseconds()
@@ -1581,6 +1702,104 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		s.armBackgroundContinuation(turnCtx, body.SessionID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text})
+}
+
+// handleIsolatedTurn runs a non-interactive-permission session in its own
+// metis process. The separate process gives its Loop, provider, tool registry,
+// cwd scope, task routers and memory binding private ownership; this is the
+// safety boundary that makes Desktop parallelism possible.
+func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sessionID, input, workDir string) {
+	if s == nil || s.isolatedRunner == nil || s.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "isolated turn runtime unavailable")
+		return
+	}
+	turnCtx, cancel := context.WithCancel(r.Context())
+	done := make(chan struct{})
+	s.cancelMu.Lock()
+	if s.closing {
+		s.cancelMu.Unlock()
+		cancel()
+		writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
+		return
+	}
+	s.cancelMu.Unlock()
+	s.workerTurnsMu.Lock()
+	if _, exists := s.workerTurns[sessionID]; exists {
+		s.workerTurnsMu.Unlock()
+		cancel()
+		writeError(w, http.StatusConflict, "this session already has a running turn")
+		return
+	}
+	s.workerTurns[sessionID] = &isolatedActiveTurn{cancel: cancel, done: done}
+	s.workerTurnsMu.Unlock()
+	defer func() {
+		s.workerTurnsMu.Lock()
+		delete(s.workerTurns, sessionID)
+		s.workerTurnsMu.Unlock()
+		close(done)
+		cancel()
+	}()
+
+	if err := s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "running"}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to mark isolated turn running")
+		return
+	}
+	// The history's first user message is persisted by `metis run`; retain the
+	// title behavior of the in-process path without adding a duplicate prompt.
+	if _, history, err := s.store.Load(sessionID); err == nil && len(history) == 0 {
+		title := []rune(strings.TrimSpace(input))
+		if len(title) > 60 {
+			title = title[:60]
+		}
+		if len(title) > 0 {
+			_ = s.store.SetTitle(sessionID, string(title))
+		}
+	}
+
+	result, err := s.isolatedRunner.Run(turnCtx, IsolatedTurnRequest{
+		SessionID: sessionID,
+		WorkDir:   workDir,
+		Input:     input,
+		OnText: func(delta string) {
+			s.hub.publish(sessionID, agent.Event{Kind: agent.EventTextDelta, TextDelta: delta})
+		},
+	})
+	if errors.Is(err, context.Canceled) || result.Stopped {
+		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "stopped"})
+		writeJSON(w, http.StatusOK, map[string]any{"sessionId": sessionID, "text": result.Text, "stopped": true})
+		return
+	}
+	if err != nil {
+		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "failed"})
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "completed"})
+	// CLI output is streamed directly. Prefer the durable transcript if a
+	// provider used a response format whose stdout is intentionally suppressed.
+	if result.Text == "" {
+		if _, history, loadErr := s.store.Load(sessionID); loadErr == nil {
+			result.Text = latestAssistantText(history)
+		}
+	}
+	s.hub.publish(sessionID, agent.Event{Kind: agent.EventLoopDone, StopReason: "completed"})
+	writeJSON(w, http.StatusOK, map[string]any{"sessionId": sessionID, "text": result.Text})
+}
+
+func latestAssistantText(history []llm.Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role != llm.RoleAssistant {
+			continue
+		}
+		var text strings.Builder
+		for _, block := range history[i].Content {
+			if block.Type == "text" {
+				text.WriteString(block.Text)
+			}
+		}
+		return text.String()
+	}
+	return ""
 }
 
 // runAndPersistTurn is shared by explicit prompts and background-job resumptions.
@@ -2263,6 +2482,26 @@ func (s *Server) persistDesktopCloseWithTimeouts(timeouts desktopCloseTimeouts) 
 	s.desktopCloseOnce.Do(func() {
 		s.automations.close()
 		var closeErr error
+		if s.turnCoordinator != nil {
+			s.turnCoordinator.Close()
+		}
+		// Stop every isolated worker before waiting for the legacy in-process
+		// loop. They are separate OS process groups, so their cancellation does
+		// not depend on the active Desktop Loop or its permission state.
+		s.workerTurnsMu.Lock()
+		workers := make([]*isolatedActiveTurn, 0, len(s.workerTurns))
+		for _, worker := range s.workerTurns {
+			workers = append(workers, worker)
+		}
+		s.workerTurnsMu.Unlock()
+		for _, worker := range workers {
+			worker.cancel()
+		}
+		for _, worker := range workers {
+			if !waitForTurnShutdown(worker.done, timeouts.turn) {
+				closeErr = errors.Join(closeErr, fmt.Errorf("isolated turn did not stop within %s", timeouts.turn))
+			}
+		}
 		s.cancelMu.Lock()
 		s.closing = true
 		s.stopBackgroundContinuationLocked()
@@ -2335,6 +2574,9 @@ func waitForTurnShutdown(done <-chan struct{}, grace time.Duration) bool {
 func (s *Server) beginClosing() {
 	if s == nil {
 		return
+	}
+	if s.turnCoordinator != nil {
+		s.turnCoordinator.Close()
 	}
 	s.cancelMu.Lock()
 	s.closing = true
@@ -3240,6 +3482,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	runningSessionID := s.runningSession
 	turnRunning := s.turnDone != nil && runningSessionID != ""
 	s.cancelMu.Unlock()
+	s.workerTurnsMu.Lock()
+	workerSessions := make([]string, 0, len(s.workerTurns))
+	for id := range s.workerTurns {
+		workerSessions = append(workerSessions, id)
+	}
+	s.workerTurnsMu.Unlock()
+	if !turnRunning && len(workerSessions) > 0 {
+		turnRunning = true
+		runningSessionID = workerSessions[0]
+	}
 	s.stateMu.RLock()
 	activeSessionID := s.activeSessionID
 	s.stateMu.RUnlock()
@@ -3254,7 +3506,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"toolCount": len(toolNames), "tools": toolNames,
 		"contextUsed": contextUsed, "contextWindow": contextWindow, "compactThreshold": compactThreshold,
 		"compactAtTokens": compactAtTokens,
-		"turnRunning":     turnRunning, "runningSessionId": runningSessionID,
+		"turnRunning":     turnRunning, "runningSessionId": runningSessionID, "isolatedTurnSessions": workerSessions,
 		"activeSessionId":   activeSessionID,
 		"planItems":         planItems,
 		"executionStrategy": executionStrategy,
@@ -3582,6 +3834,34 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid session id")
 			return
 		}
+	}
+
+	// A high-performance worker has its own cancellation and done channel.
+	// The composer normally supplies its session id; without one we only stop a
+	// worker when it is unambiguous, never an arbitrary parallel conversation.
+	s.workerTurnsMu.Lock()
+	workerID := body.SessionID
+	worker := s.workerTurns[workerID]
+	if worker == nil && workerID == "" && len(s.workerTurns) == 1 {
+		for id, candidate := range s.workerTurns {
+			workerID, worker = id, candidate
+		}
+	}
+	workerCount := len(s.workerTurns)
+	s.workerTurnsMu.Unlock()
+	if worker != nil {
+		worker.cancel()
+		select {
+		case <-worker.done:
+			writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": workerID})
+		case <-time.After(2 * time.Second):
+			writeJSON(w, http.StatusAccepted, map[string]any{"stopping": true, "sessionId": workerID})
+		}
+		return
+	}
+	if body.SessionID == "" && workerCount > 1 {
+		writeError(w, http.StatusConflict, "multiple turns are running; specify sessionId")
+		return
 	}
 
 	s.cancelMu.Lock()
