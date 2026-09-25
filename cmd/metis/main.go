@@ -316,7 +316,7 @@ func earlyGlobalFlagTakesValue(name string) bool {
 
 func earlyGlobalBoolFlag(name string) bool {
 	switch name {
-	case "--no-markdown", "--no-stream", "--streamlined", "-c", "--continue",
+	case "--no-markdown", "--no-stream", "--streamlined", "--desktop-worker", "-c", "--continue",
 		"--tui", "--no-auth-wizard", "--fast", "-W", "-d", "--debug", "--bare",
 		"--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox",
 		"--coordinator", "--agent-teams", "--tmux", "--auto-memory", "--cache",
@@ -873,29 +873,30 @@ const (
 )
 
 type cliFlags struct {
-	model        string
-	provider     string
-	modelSet     bool // true when --model/-m was present, even with an empty value
-	providerSet  bool // true when --provider/-p was present, even with an empty value
-	mode         string
-	noMarkdown   bool
-	noStream     bool // reserved compatibility flag; currently no runtime effect
-	streamlined  bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
-	maxIter      int
-	maxBudgetUSD float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
-	system       string
-	systemSet    bool // true when --system was present, even with an empty value
-	resumeID     string
-	newSessionID string // internal/native-client hook: choose ID for a fresh run
-	cont         bool   // -c / --continue: pick up the most recently modified session
-	useTUI       bool
-	noAuthWizard bool   // skip the first-run wizard (CI / scripted use)
-	effort       string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
-	fast         bool   // collapse one turn: effort=low + halved max_tokens
-	addDirs      stringList
-	agentProfile string // --agent=NAME — load .metis/agents/<name>.md
-	worktree     string // --worktree=slug — spin up git worktree with explicit slug
-	worktreeOn   bool   // -W — spin up worktree with auto slug
+	model         string
+	provider      string
+	modelSet      bool // true when --model/-m was present, even with an empty value
+	providerSet   bool // true when --provider/-p was present, even with an empty value
+	mode          string
+	noMarkdown    bool
+	noStream      bool // reserved compatibility flag; currently no runtime effect
+	streamlined   bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
+	desktopWorker bool // private native Desktop JSONL event/reply transport
+	maxIter       int
+	maxBudgetUSD  float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
+	system        string
+	systemSet     bool // true when --system was present, even with an empty value
+	resumeID      string
+	newSessionID  string // internal/native-client hook: choose ID for a fresh run
+	cont          bool   // -c / --continue: pick up the most recently modified session
+	useTUI        bool
+	noAuthWizard  bool   // skip the first-run wizard (CI / scripted use)
+	effort        string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
+	fast          bool   // collapse one turn: effort=low + halved max_tokens
+	addDirs       stringList
+	agentProfile  string // --agent=NAME — load .metis/agents/<name>.md
+	worktree      string // --worktree=slug — spin up git worktree with explicit slug
+	worktreeOn    bool   // -W — spin up worktree with auto slug
 
 	// --debug / -d: write a verbose trace to ~/.metis/debug.log alongside
 	// METIS_DEBUG=1's stderr output. Doesn't change visible behavior; just
@@ -1082,6 +1083,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.noMarkdown, "no-markdown", false, "disable markdown rendering")
 	f.BoolVar(&out.noStream, "no-stream", false, "reserved compatibility flag (currently no runtime effect)")
 	f.BoolVar(&out.streamlined, "streamlined", false, "distillation-resistant output: drop thinking, collapse tool calls into cumulative summaries (per-call override of [ui] streamlined_output)")
+	f.BoolVar(&out.desktopWorker, "desktop-worker", false, "internal Desktop worker event transport")
 	f.IntVar(&out.maxIter, "max-iter", 0, "max tool iterations per turn")
 	f.Float64Var(&out.maxBudgetUSD, "max-budget-usd", 0, "stop the session once cumulative LLM spend reaches this many USD (0 = unlimited)")
 	f.StringVar(&out.system, "system", "", "override system prompt")
@@ -2451,6 +2453,26 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	var worker *desktopWorkerBridge
+	if flags.desktopWorker {
+		if flags.preflightOnly || flags.dumpPrompt || flags.outputSchema != "" || flags.pickResume || flags.useTUI {
+			return errors.New("desktop worker does not support interactive selection, preflight, prompt dumps, or output schemas")
+		}
+		flags.noAuthWizard = true
+		flags.runCache = false
+		workerInput, inputErr := desktopWorkerInput()
+		if inputErr != nil {
+			return inputErr
+		}
+		worker = newDesktopWorkerBridge(ctx, workerInput, os.Stdout)
+		ctx = worker.ctx
+		defer func() {
+			// Registered before runtime/checkpoint defers: completion and exit
+			// cannot precede durable history and process-owned resource cleanup.
+			worker.Close()
+			returnErr = errors.Join(returnErr, worker.Err())
+		}()
+	}
 	if len(rest) == 0 && !flags.preflightOnly {
 		return errors.New("run: prompt is required")
 	}
@@ -2490,7 +2512,15 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	defer rt.Cleanup()
+	if worker != nil {
+		worker.setSteerHandler(func(input string) bool {
+			return rt.loop.SteerInjectWithAccepted(input, func() { rtpkg.RecordUserMessage(rt.sessionID, "[steer] "+input) })
+		})
+		stopStatus := worker.startStatus(rt.subAgentRoster, rt.loop.Jobs)
+		defer stopStatus(rt.Cleanup)
+	} else {
+		defer rt.Cleanup()
+	}
 
 	// CACHE-D: response cache lookup BEFORE we touch the API. Hit →
 	// print cached text and return early; saves the full round-trip
@@ -2504,7 +2534,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 		return json.NewEncoder(os.Stdout).Encode(runPreflightReport(rt, verificationConfig))
 	}
 	cacheTTL := rtpkg.ParseRunCacheTTL(flags.runCacheTTL)
-	cacheRequested := flags.runCache || os.Getenv("METIS_RUN_CACHE") == "1"
+	cacheRequested := worker == nil && (flags.runCache || os.Getenv("METIS_RUN_CACHE") == "1")
 	if verificationConfig != nil && cacheRequested {
 		fmt.Fprintln(os.Stderr, "[cache] disabled with machine verification (current-source evidence cannot be replayed)")
 		cacheRequested = false
@@ -2544,9 +2574,12 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	// LLM-facing message. Preserve the transcript-stored prompt as the
 	// raw text so session JSONL / history.jsonl stay clean.
 	llmPrompt := prompt
+	if worker != nil {
+		llmPrompt = slash.ExpandBatchInput(prompt)
+	}
 	if cwd, err := os.Getwd(); err == nil {
 		if hints := rtpkg.CollectSubdirHints(prompt, cwd, nil); hints != "" {
-			llmPrompt = hints + "\n\n" + prompt
+			llmPrompt = hints + "\n\n" + llmPrompt
 		}
 	}
 	// --output-schema: load the schema up front (a typo'd path errors
@@ -2590,6 +2623,11 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
+		if worker != nil {
+			done <- runDesktopWorkerTurns(ctx, rt.loop, rt.subAgentRoster, rt.sessionID, events, checkpoint.Save)
+			close(events)
+			return
+		}
 		done <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
 			return rt.loop.Run(turnCtx, events)
 		})
@@ -2712,6 +2750,11 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	var eventErr error
 	terminalMetricsWritten := false
 	for ev := range events {
+		if worker != nil {
+			if bridgeErr := worker.emit(ev); bridgeErr != nil && eventErr == nil {
+				eventErr = bridgeErr
+			}
+		}
 		switch ev.Kind {
 		case agent.EventTextDelta:
 			if streamlined {
@@ -2719,7 +2762,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 			}
 			if schemaEnforcer != nil {
 				schemaTextBuf.WriteString(ev.TextDelta)
-			} else {
+			} else if worker == nil {
 				fmt.Print(ev.TextDelta)
 			}
 			if cacheKey != "" {
@@ -2748,9 +2791,15 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 				fmt.Fprintf(os.Stderr, "[tool error] %s\n", truncStderr(ev.ToolResult.Output, 300))
 			}
 		case agent.EventPermissionRequest:
+			if worker != nil {
+				continue
+			}
 			ev.PermissionReply <- agent.PermissionDecisionDeny
 			fmt.Fprintf(os.Stderr, "[permission] denied (non-interactive); use chat for interactive prompts\n")
 		case agent.EventAskUser:
+			if worker != nil {
+				continue
+			}
 			// Headless / metis run path: there's no user to answer the
 			// model's question. Send an empty string back to dismiss
 			// the prompt — the AskUser tool surfaces that as an
@@ -2842,7 +2891,9 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 			if streamlined {
 				flushAccum() // emit any trailing tool counts
 			}
-			fmt.Println()
+			if worker == nil {
+				fmt.Println()
+			}
 			// Per-turn JSONL flush for --metrics-log. StopReason on the
 			// final turn comes from the loop ("end_turn", "no_tool_calls",
 			// "diminishing_returns", "halted_by_hook", etc.); falls back
@@ -3531,7 +3582,11 @@ func cronDenialFromPermissionEvent(ev agent.Event, reason string) agent.CronDeni
 }
 
 func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
-	persistentHist, mainHist map[string][]llm.Message) (resultErr error) {
+	persistentHist, mainHist map[string][]llm.Message, activeRun ...*agent.CronRun) (resultErr error) {
+	var progress *cronProgressRecorder
+	if len(activeRun) > 0 {
+		progress = &cronProgressRecorder{run: activeRun[0]}
+	}
 
 	// 1. Pick the right starting history per SessionMode.
 	switch sessionModeOrDefault(job) {
@@ -3645,6 +3700,7 @@ func executeCronJob(ctx context.Context, rt *runtime, job *agent.CronJob,
 	var eventErr error
 
 	for ev := range events {
+		progress.observe(ev)
 		switch ev.Kind {
 		case agent.EventTextDelta:
 			if !job.Silent {

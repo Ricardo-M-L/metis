@@ -181,7 +181,15 @@
       initialRoute: { page: 'session', sessionId: activeSession(), view: activeView() },
       start: invalidateSelection,
       recorded: showPage,
-      changed(route, state) { if (!state.pending) showPage(route); chrome(route, state); },
+      changed(route, state) {
+        if (!state.pending) {
+          showPage(route);
+          if (typeof watchAutomationSession === 'function' && route.page === 'session' && route.sessionId) {
+            queueMicrotask(() => watchAutomationSession(route.sessionId));
+          } else if (typeof stopAutomationSessionWatch === 'function') stopAutomationSessionWatch();
+        }
+        chrome(route, state);
+      },
       restore(route) {
         // Session activation commits before optional artifact loading. If the
         // target artifact is gone, retain the session that actually loaded;

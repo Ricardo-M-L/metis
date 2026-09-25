@@ -51,6 +51,19 @@ func (s *Server) handleSessionCommand(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.runMu.Unlock()
 
+	header, _, err := s.store.Load(body.SessionID)
+	if err != nil || header == nil {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	lease, acquired := s.turnCoordinator.TryAcquire(header.WorkDir)
+	if !acquired {
+		writeError(w, http.StatusConflict, "workspace is busy; stop its running turn before editing history")
+		return
+	}
+	defer lease.Release()
+	// A worker may have finished between the initial header lookup and lease
+	// acquisition. Reload after admission so an edit never restores stale data.
 	header, history, err := s.store.Load(body.SessionID)
 	if err != nil || header == nil {
 		writeError(w, http.StatusNotFound, "session not found")
@@ -188,8 +201,19 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.runMu.Unlock()
 
+	header, _, err := s.store.Load(body.SessionID)
+	if err != nil || header == nil {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	lease, acquired := s.turnCoordinator.TryAcquire(header.WorkDir)
+	if !acquired {
+		writeError(w, http.StatusConflict, "workspace is busy; stop its running turn before compacting history")
+		return
+	}
+	defer lease.Release()
 	header, history, err := s.store.Load(body.SessionID)
-	if err != nil {
+	if err != nil || header == nil {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}

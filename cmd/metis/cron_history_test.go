@@ -87,8 +87,21 @@ func TestExecuteCronJobSavesActualConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := &agent.CronJob{ID: "saved", Prompt: "check status", Silent: true}
-	if err := executeCronJob(context.Background(), rt, job, map[string][]llm.Message{}, map[string][]llm.Message{}); err != nil {
+	root := t.TempDir()
+	run, err := agent.BeginCronRun(root, job.ID, "visible-run", "manual")
+	if err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = run.Finish("cancelled", "", "", nil) })
+	if err := run.SetSessionID(rt.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := executeCronJob(context.Background(), rt, job, map[string][]llm.Message{}, map[string][]llm.Message{}, run); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := agent.ReadCronRun(root, job.ID, "visible-run")
+	if err != nil || progress.Status != "running" || !strings.Contains(progress.LiveText, "done") || len(progress.Activity) == 0 {
+		t.Fatalf("live progress unavailable before terminal record: %+v, %v", progress, err)
 	}
 	_, history, err := store.Load(rt.sessionID)
 	if err != nil || len(history) < 2 {
@@ -99,6 +112,13 @@ func TestExecuteCronJobSavesActualConversation(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(store.Dir, rt.sessionID+".jsonl")); err != nil {
 		t.Fatal(err)
+	}
+	if err := run.Finish("succeeded", "done", "done", nil); err != nil {
+		t.Fatal(err)
+	}
+	final, err := agent.ReadCronRun(root, job.ID, "visible-run")
+	if err != nil || final.Status != "succeeded" || final.LiveText != "" || final.Output != "done" {
+		t.Fatalf("terminal result=%+v, %v", final, err)
 	}
 }
 

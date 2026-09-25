@@ -480,7 +480,7 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	_, _ = io.CopyN(io.Discard, resp.Body, 4096)
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		writeError(w, http.StatusBadGateway, "provider metadata probe returned "+resp.Status)
 		return
 	}

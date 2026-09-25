@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode"
 
 	"charm.land/glamour/v2"
 	"charm.land/glamour/v2/ansi"
@@ -104,37 +105,48 @@ func renderMessage(msg Message, width int, expand bool) string {
 	}
 	switch msg.Role {
 	case "user":
-		// User prompt opens a new turn — leading blank above and
-		// trailing blank below so the eye lands on the whole turn
-		// as a discrete block.
-		//
-		// Wrap to the chat surface width (image #21 feedback
-		// 2026-05-20: a 200-cell path + CJK overflowed past the
-		// right edge without wrapping because we passed the whole
-		// content through styleUser.Render as one line). xansi.Wrap
-		// preserves SGR sequences AND counts cells correctly for
-		// CJK (uniseg-based grapheme width), so we wrap to a body
-		// width that mirrors the assistant-body math: `width - 4`
-		// (2 left indent + 2 right safety). Breakpoints " /-_."
-		// let paths split at slashes and underscores too, not just
-		// spaces — readable for the Unix-path-heavy prompts metis
-		// users tend to type.
-		bodyW := width - 4
-		if bodyW < 20 {
-			bodyW = 20
+		// Submitted prompts occupy a softly shaded band. Claude Code's
+		// compact vertical rhythm keeps the fill on content rows only;
+		// Codex's extra shaded rows would make short turns too tall.
+		// Pad every physical row so the fill survives wrapping and
+		// viewport scrolling, with one column left for auto-wrap safety.
+		if width <= 0 {
+			width = 80
 		}
-		wrapped := xansi.Wrap(msg.Content, bodyW, " /-_.")
-		lines := strings.Split(wrapped, "\n")
+		margin, cardW, prefix := "  ", width-3, " › "
+		if cardW < 5 {
+			margin, cardW, prefix = "", width, ""
+		}
+		bodyW := cardW - xansi.StringWidth(prefix) - 1
+		if bodyW < 1 {
+			bodyW = 1
+		}
+		// History is display-only: pasted SGR/OSC/control bytes must not
+		// override the card fill or move the terminal cursor.
+		display := strings.ReplaceAll(xansi.Strip(msg.Content), "\t", "    ")
+		display = strings.Map(func(r rune) rune {
+			if r != '\n' && unicode.IsControl(r) {
+				return -1
+			}
+			return r
+		}, display)
+		display = strings.TrimRight(display, "\n")
+		lines := strings.Split(xansi.Wrap(display, bodyW, " /-_."), "\n")
 		s.WriteString("\n")
 		for i, ln := range lines {
-			if i == 0 {
-				s.WriteString(styleUser.Render("  " + glyphPrompt + " " + ln))
-			} else {
-				// Continuation rows: keep the 4-cell indent (2
-				// margin + glyph + space) but drop the glyph so
-				// the eye reads it as the same turn.
-				s.WriteString(styleUser.Render("    " + ln))
+			s.WriteString(margin)
+			if prefix != "" {
+				if i == 0 {
+					s.WriteString(styleUserCardMarker.Render(prefix))
+				} else {
+					s.WriteString(styleUserCard.Render(strings.Repeat(" ", xansi.StringWidth(prefix))))
+				}
 			}
+			pad := cardW - xansi.StringWidth(prefix) - xansi.StringWidth(ln)
+			if pad < 0 {
+				pad = 0
+			}
+			s.WriteString(styleUserCard.Render(ln + strings.Repeat(" ", pad)))
 			s.WriteString("\n")
 		}
 		// Pasted-image attachments: claude-code prints one indented

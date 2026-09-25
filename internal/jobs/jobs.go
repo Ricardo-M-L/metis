@@ -77,9 +77,12 @@ type Job struct {
 	Command     string // raw shell line as the model wrote it
 	Description string // ≤80-char one-liner derived from Command, for JobList
 	Status      Status
-	StartTime   time.Time
-	EndTime     time.Time // zero until terminal
-	ExitCode    int       // -1 until exited
+	// notificationPublished closes the terminal-status/publication gap for
+	// one-shot Desktop workers deciding whether background work is quiescent.
+	notificationPublished bool
+	StartTime             time.Time
+	EndTime               time.Time // zero until terminal
+	ExitCode              int       // -1 until exited
 
 	OutputPath string // absolute path to ~/.metis/jobs/<id>.out
 
@@ -262,6 +265,22 @@ func (r *Registry) HasPendingNotifications() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.notify) > 0
+}
+
+// HasPendingWork includes the short interval after a process becomes terminal
+// but before its completion is published. Callers must leave Notify to Loop.
+func (r *Registry) HasPendingWork() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, job := range r.jobs {
+		if job.Status == StatusRunning || !job.notificationPublished {
+			return true
+		}
+	}
+	return false
 }
 
 // home resolves the metis data root. Mirrors internal/auth's home()
@@ -688,10 +707,13 @@ func (r *Registry) startTrackedTreeWatch(start stagedTreeWatchStart) {
 // wins the race is drained by Reset, while one that loses observes the new
 // generation and is discarded.
 func (r *Registry) publish(generation uint64, notif Notification) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if generation != r.generation {
 		return
+	}
+	if job := r.jobs[notif.JobID]; job != nil {
+		job.notificationPublished = true
 	}
 	// Non-blocking publish: if no one drains, drop. This keeps a runaway
 	// "job spam" from deadlocking the wait goroutine. The model can still

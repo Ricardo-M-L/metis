@@ -126,7 +126,7 @@ func runRecordedCronJob(ctx context.Context, svc *agent.CronService, job *agent.
 	if err := run.SetSessionID(rt.sessionID); err != nil {
 		return err
 	}
-	return executeCronJob(ctx, rt, job, persistentHist, mainHist)
+	return executeCronJob(ctx, rt, job, persistentHist, mainHist, run)
 }
 
 func cronFinalOutput(history []llm.Message) string {

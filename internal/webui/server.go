@@ -31,6 +31,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/computeruse"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/desktop"
+	"github.com/Ricardo-M-L/metis/internal/desktopipc"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/openai"
@@ -46,7 +47,6 @@ import (
 	metisversion "github.com/Ricardo-M-L/metis/internal/version"
 	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
 	pubsess "github.com/Ricardo-M-L/metis/pkg/session"
-	"github.com/google/uuid"
 )
 
 //go:embed static/*
@@ -68,6 +68,7 @@ type Server struct {
 	maxTotalAgentSlots int
 	workerTurnsMu      sync.Mutex
 	workerTurns        map[string]*isolatedActiveTurn
+	workerSnapshots    map[string]isolatedWorkerSnapshot
 	hub                *eventHub
 	prefsMu            sync.Mutex
 	workspacesMu       sync.Mutex
@@ -161,18 +162,25 @@ type Server struct {
 // ignore the live stream of a turn running in session B.
 // permissionPending is one unresolved tool-approval request.
 type permissionPending struct {
-	reply chan agent.PermissionDecision
-	tool  string
+	reply   chan agent.PermissionDecision
+	tool    string
+	session string
+	event   agent.Event
+	done    chan struct{}
 }
 
 // askPending is one unresolved AskUser question from the model.
 type askPending struct {
-	reply chan string
+	reply   chan string
+	session string
+	event   agent.Event
+	done    chan struct{}
 }
 
 type isolatedActiveTurn struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	steer  chan IsolatedSteerRequest
 }
 
 type hubEvent struct {
@@ -620,6 +628,8 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/providers/default", s.handleProviderDefault)
 	mux.HandleFunc("/api/providers/validate", s.handleProviderValidate)
 	mux.HandleFunc("/api/providers/probe", s.handleProviderProbe)
+	mux.HandleFunc("/api/providers/models", s.handleProviderModels)
+	mux.HandleFunc("/api/providers/model", s.handleProviderModelSelect)
 	mux.HandleFunc("/api/effort", s.handleEffort)
 	mux.HandleFunc("/api/presets", s.handlePresets)
 	mux.HandleFunc("/api/presets/default", s.handlePresetDefault)
@@ -636,6 +646,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/subagents/", s.handleSubAgentDetail)
 	mux.HandleFunc("/api/export", s.handleExport)
 	mux.HandleFunc("/api/exports/open", s.handleExportsOpen)
+	mux.HandleFunc("/api/interactions", s.handleInteractions)
 	mux.HandleFunc("/api/permission", s.handlePermission)
 	mux.HandleFunc("/api/ask", s.handleAsk)
 	mux.HandleFunc("/api/fork", s.handleFork)
@@ -807,6 +818,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 	eventName := eventKindName(he.ev.Kind)
+	if he.extra["kind"] == "interaction_resolved" {
+		eventName = "interaction_resolved"
+	}
 	payload := map[string]any{
 		"kind":      eventName,
 		"session":   he.session,
@@ -1104,7 +1118,14 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": items[cursor:end], "nextCursor": nextCursor, "total": len(items)})
 	case http.MethodPost:
-		model := s.freshModel
+		s.stateMu.RLock()
+		header := session.Header{
+			Provider: s.freshProviderName, Model: s.freshModel, System: s.freshSystem,
+			SystemPromptKind: s.freshSystemPromptKind, WorkDir: s.freshWorkDir,
+			Mode: string(s.freshPermissionMode), Preset: s.freshPreset, Status: "idle",
+		}
+		s.stateMu.RUnlock()
+		model := header.Model
 		var body struct {
 			Model string `json:"model"`
 		}
@@ -1116,20 +1137,22 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		id := s.store.NewSessionID()
 		createdAt := time.Now()
-		cwd, _ := os.Getwd()
-		if err := s.store.WriteHeaderFull(session.Header{
-			ID:               id,
-			CreatedAt:        createdAt,
-			Provider:         s.freshProviderName,
-			Model:            model,
-			System:           s.freshSystem,
-			SystemPromptKind: s.freshSystemPromptKind,
-			WorkDir:          cwd,
-			Mode:             string(s.freshPermissionMode),
-			Effort:           effortHeaderValue(s.loop.EffortValue()),
-			Preset:           s.freshPreset,
-			Status:           "idle",
-		}); err != nil {
+		header.ID, header.CreatedAt, header.Model = id, createdAt, model
+		if header.WorkDir == "" {
+			header.WorkDir, _ = os.Getwd()
+		}
+		if s.loop != nil {
+			header.Effort = effortHeaderValue(s.loop.EffortValue())
+		}
+		s.cancelMu.Lock()
+		if s.closing {
+			s.cancelMu.Unlock()
+			writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
+			return
+		}
+		err := s.store.WriteHeaderFull(header)
+		s.cancelMu.Unlock()
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create session")
 			return
 		}
@@ -1191,6 +1214,19 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, id string) {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
+
+	workDir := hdr.WorkDir
+	if workDir == "" {
+		s.stateMu.RLock()
+		workDir = s.freshWorkDir
+		s.stateMu.RUnlock()
+	}
+	lease, admitted := s.turnCoordinator.TryAcquire(workDir)
+	if !admitted {
+		writeError(w, http.StatusConflict, "a turn is running; stop it before deleting this session")
+		return
+	}
+	defer lease.Release()
 
 	s.stateMu.RLock()
 	isActive := s.activeSessionID == id
@@ -1605,9 +1641,9 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lease.Release()
 
-	// Image inputs and approval-driven permission modes retain the mature
-	// in-process path. Fully unattended sessions run in a fresh metis process
-	// and may therefore proceed alongside sessions in other workspaces.
+	// Image inputs currently retain the in-process path. Text turns in every
+	// valid permission mode use a fresh process; interactive replies are routed
+	// through that worker's private channel without changing its permission policy.
 	if len(imgBlocks) == 0 && s.isolatedRunner != nil && s.isolatedRunner.Eligible(hdr) {
 		s.handleIsolatedTurn(w, r, body.SessionID, body.Input, turnWorkDir)
 		return
@@ -1733,7 +1769,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text})
 }
 
-// handleIsolatedTurn runs a non-interactive-permission session in its own
+// handleIsolatedTurn runs a session with its original permission policy in its own
 // metis process. The separate process gives its Loop, provider, tool registry,
 // cwd scope, task routers and memory binding private ownership; this is the
 // safety boundary that makes Desktop parallelism possible.
@@ -1744,6 +1780,7 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 	}
 	turnCtx, cancel := context.WithCancel(r.Context())
 	done := make(chan struct{})
+	steer := make(chan IsolatedSteerRequest)
 	s.cancelMu.Lock()
 	if s.closing {
 		s.cancelMu.Unlock()
@@ -1751,17 +1788,19 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
 		return
 	}
-	s.cancelMu.Unlock()
 	s.workerTurnsMu.Lock()
 	if _, exists := s.workerTurns[sessionID]; exists {
 		s.workerTurnsMu.Unlock()
+		s.cancelMu.Unlock()
 		cancel()
 		writeError(w, http.StatusConflict, "this session already has a running turn")
 		return
 	}
-	s.workerTurns[sessionID] = &isolatedActiveTurn{cancel: cancel, done: done}
+	s.workerTurns[sessionID] = &isolatedActiveTurn{cancel: cancel, done: done, steer: steer}
 	s.workerTurnsMu.Unlock()
+	s.cancelMu.Unlock()
 	defer func() {
+		s.cancelSessionInteractions(sessionID)
 		s.workerTurnsMu.Lock()
 		delete(s.workerTurns, sessionID)
 		s.workerTurnsMu.Unlock()
@@ -1789,17 +1828,26 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		SessionID: sessionID,
 		WorkDir:   workDir,
 		Input:     input,
+		Steer:     steer,
+		OnStatus:  func(status desktopipc.Status) { s.setWorkerSnapshot(sessionID, status) },
+		OnEvent: func(ev agent.Event) {
+			if !s.publishInteraction(turnCtx, sessionID, ev) && ev.Kind != agent.EventLoopDone {
+				s.hub.publish(sessionID, ev)
+			}
+		},
 		OnText: func(delta string) {
 			s.hub.publish(sessionID, agent.Event{Kind: agent.EventTextDelta, TextDelta: delta})
 		},
 	})
 	if errors.Is(err, context.Canceled) || result.Stopped {
 		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "stopped"})
+		s.hub.publish(sessionID, agent.Event{Kind: agent.EventLoopDone, StopReason: "stopped"})
 		writeJSON(w, http.StatusOK, map[string]any{"sessionId": sessionID, "text": result.Text, "stopped": true})
 		return
 	}
 	if err != nil {
 		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "failed"})
+		s.hub.publish(sessionID, agent.Event{Kind: agent.EventError, Err: err})
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -1811,7 +1859,11 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 			result.Text = latestAssistantText(history)
 		}
 	}
-	s.hub.publish(sessionID, agent.Event{Kind: agent.EventLoopDone, StopReason: "completed"})
+	terminal := agent.Event{Kind: agent.EventLoopDone, StopReason: "completed"}
+	if result.Done != nil {
+		terminal = *result.Done
+	}
+	s.hub.publish(sessionID, terminal)
 	writeJSON(w, http.StatusOK, map[string]any{"sessionId": sessionID, "text": result.Text})
 }
 
@@ -1835,6 +1887,7 @@ func latestAssistantText(history []llm.Message) string {
 // The caller owns runMu and the registered cancellation slot. A resumption does
 // not invent a user message; Loop remains the sole job-notification consumer.
 func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, messageMetric session.MessageMetric) (string, error, int, bool) {
+	defer s.cancelSessionInteractions(sessionID)
 	// The user-facing prompt written above can intentionally differ from the
 	// loop-only message (for example a synthetic plan reminder). Anchor the
 	// durable cursor to the live boundary so the normal append path preserves
@@ -1905,47 +1958,8 @@ func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, me
 			if agent.IsIncompleteStopReason(ev.StopReason) {
 				incompleteReason = ev.StopReason
 			}
-		case agent.EventPermissionRequest:
-			if ev.PermissionReply != nil {
-				id := uuid.NewString()
-				pending := &permissionPending{reply: ev.PermissionReply, tool: ev.PermissionTool}
-				s.permMu.Lock()
-				if len(s.pendingPerms) >= 32 {
-					// Safety valve: never let an abandoned browser accumulate
-					// unbounded in-flight approvals.
-					pending.reply <- agent.PermissionDecisionDeny
-					s.permMu.Unlock()
-					break
-				}
-				s.pendingPerms[id] = pending
-				s.permMu.Unlock()
-				// Broadcast the approval card; the reply arrives via /api/permission.
-				s.hub.publish(sessionID, ev, map[string]any{"permId": id})
-				go func() {
-					time.Sleep(120 * time.Second)
-					s.permMu.Lock()
-					cur, ok := s.pendingPerms[id]
-					if ok {
-						delete(s.pendingPerms, id)
-					}
-					s.permMu.Unlock()
-					if ok {
-						cur.reply <- agent.PermissionDecisionDeny // timeout = deny
-					}
-				}()
-			}
-		case agent.EventAskUser:
-			if ev.AskUserReply != nil {
-				id := uuid.NewString()
-				s.askMu.Lock()
-				s.pendingAsks[id] = &askPending{reply: ev.AskUserReply}
-				s.askMu.Unlock()
-				s.hub.publish(sessionID, ev, map[string]any{"askId": id})
-				go func() {
-					time.Sleep(120 * time.Second)
-					s.timeoutAsk(id)
-				}()
-			}
+		case agent.EventPermissionRequest, agent.EventAskUser:
+			s.publishInteraction(turnCtx, sessionID, ev)
 		}
 	}
 	runErr := <-done
@@ -2006,19 +2020,7 @@ func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, me
 // desktopModelInput keeps the user's compact /batch command in durable
 // history while giving the shared Loop the same orchestration contract as the
 // CLI/TUI command. Ordinary prompts are byte-for-byte unchanged.
-func desktopModelInput(input string) string {
-	trimmed := strings.TrimSpace(input)
-	const command = "/batch"
-	if len(trimmed) <= len(command) || !strings.EqualFold(trimmed[:len(command)], command) ||
-		!unicode.IsSpace(rune(trimmed[len(command)])) {
-		return input
-	}
-	task := strings.TrimSpace(trimmed[len(command):])
-	if task == "" {
-		return input
-	}
-	return slash.BatchPrompt(task)
-}
+func desktopModelInput(input string) string { return slash.ExpandBatchInput(input) }
 
 func displayTurnCount(history []llm.Message) int {
 	turns := 0
@@ -2509,6 +2511,7 @@ func (s *Server) persistDesktopCloseWithTimeouts(timeouts desktopCloseTimeouts) 
 		return nil
 	}
 	s.desktopCloseOnce.Do(func() {
+		s.beginClosing()
 		s.automations.close()
 		var closeErr error
 		if s.turnCoordinator != nil {
@@ -2800,77 +2803,6 @@ func truncateSSE(text string, n int) string {
 		return text
 	}
 	return string(runes[:n]) + "...(truncated)"
-}
-
-// handlePermission resolves one queued tool-approval card from the browser.
-func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var body struct {
-		ID      string `json:"id"`
-		Approve bool   `json:"approve"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
-		writeError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	s.permMu.Lock()
-	pending, ok := s.pendingPerms[body.ID]
-	if ok {
-		delete(s.pendingPerms, body.ID)
-	}
-	s.permMu.Unlock()
-	if !ok {
-		writeError(w, http.StatusNotFound, "permission request expired or already resolved")
-		return
-	}
-	decision := agent.PermissionDecisionDeny
-	if body.Approve {
-		decision = agent.PermissionDecisionAllow
-	}
-	pending.reply <- decision
-	writeJSON(w, http.StatusOK, map[string]any{"resolved": true})
-}
-
-func (s *Server) takePendingAsk(id string) (*askPending, bool) {
-	s.askMu.Lock()
-	defer s.askMu.Unlock()
-	pending, ok := s.pendingAsks[id]
-	if ok {
-		delete(s.pendingAsks, id)
-	}
-	return pending, ok
-}
-
-func (s *Server) timeoutAsk(id string) {
-	if pending, ok := s.takePendingAsk(id); ok {
-		pending.reply <- "" // timeout: empty fallback
-	}
-}
-
-// handleAsk resolves one queued AskUser question with the user's answer.
-func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var body struct {
-		ID     string `json:"id"`
-		Answer string `json:"answer"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
-		writeError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	pending, ok := s.takePendingAsk(body.ID)
-	if !ok {
-		writeError(w, http.StatusNotFound, "question expired or already answered")
-		return
-	}
-	pending.reply <- body.Answer
-	writeJSON(w, http.StatusOK, map[string]any{"resolved": true})
 }
 
 // handleRename updates a session title from the sidebar action menu.
@@ -3517,13 +3449,31 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		workerSessions = append(workerSessions, id)
 	}
 	s.workerTurnsMu.Unlock()
+	sort.Strings(workerSessions)
+	s.stateMu.RLock()
+	activeSessionID := s.activeSessionID
+	s.stateMu.RUnlock()
 	if !turnRunning && len(workerSessions) > 0 {
 		turnRunning = true
 		runningSessionID = workerSessions[0]
 	}
-	s.stateMu.RLock()
-	activeSessionID := s.activeSessionID
-	s.stateMu.RUnlock()
+	for _, id := range workerSessions {
+		if id == activeSessionID {
+			runningSessionID = id
+			break
+		}
+	}
+	if status, ok := s.workerSnapshot(activeSessionID); ok {
+		subAgents, namedAgents, backgroundTasks = status.SubAgents, status.NamedAgents, status.BackgroundTasks
+		agentDetails = make([]map[string]any, 0, len(status.Agents))
+		for _, item := range status.Agents {
+			agentDetails = append(agentDetails, map[string]any{"name": item.Name, "agentId": item.AgentID, "status": item.Status, "background": item.Background, "startedAt": item.StartedAt})
+		}
+		jobDetails = make([]map[string]any, 0, len(status.Jobs))
+		for _, item := range status.Jobs {
+			jobDetails = append(jobDetails, map[string]any{"id": item.ID, "description": item.Description, "status": item.Status, "startedAt": item.StartedAt})
+		}
+	}
 	planItems := []tasks.Item(nil)
 	if activeSessionID != "" {
 		planItems, _ = tasks.PlanningItems(activeSessionID)
@@ -3536,10 +3486,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"contextUsed": contextUsed, "contextWindow": contextWindow, "compactThreshold": compactThreshold,
 		"compactAtTokens": compactAtTokens,
 		"turnRunning":     turnRunning, "runningSessionId": runningSessionID, "isolatedTurnSessions": workerSessions,
-		"activeSessionId":   activeSessionID,
-		"planItems":         planItems,
-		"executionStrategy": executionStrategy,
-		"build":             s.buildVersion,
+		"isolatedTurnsEnabled": s.isolatedRunner != nil,
+		"activeSessionId":      activeSessionID,
+		"planItems":            planItems,
+		"executionStrategy":    executionStrategy,
+		"build":                s.buildVersion,
 	})
 }
 
@@ -3620,6 +3571,9 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) subAgentDetailView(agentID string) (subAgentDetailView, bool) {
+	if view, ok := s.workerSubAgentDetail(agentID); ok {
+		return view, true
+	}
 	if s == nil || s.roster == nil {
 		return subAgentDetailView{}, false
 	}
@@ -3825,6 +3779,32 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "session is not the active turn")
 		return
 	}
+	s.workerTurnsMu.Lock()
+	worker := s.workerTurns[body.SessionID]
+	s.workerTurnsMu.Unlock()
+	if worker != nil {
+		request := IsolatedSteerRequest{Input: body.Input, Reply: make(chan bool, 1)}
+		select {
+		case worker.steer <- request:
+		case <-worker.done:
+			writeError(w, http.StatusConflict, "turn no longer accepts steering")
+			return
+		case <-r.Context().Done():
+			return
+		}
+		select {
+		case accepted := <-request.Reply:
+			if !accepted {
+				writeError(w, http.StatusConflict, "turn no longer accepts steering")
+				return
+			}
+			writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "sessionId": body.SessionID})
+		case <-worker.done:
+			writeError(w, http.StatusConflict, "turn no longer accepts steering")
+		case <-r.Context().Done():
+		}
+		return
+	}
 	s.cancelMu.Lock()
 	running := s.cancelTurn != nil
 	s.cancelMu.Unlock()
@@ -3880,6 +3860,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	s.workerTurnsMu.Unlock()
 	if worker != nil {
 		worker.cancel()
+		s.cancelSessionInteractions(workerID)
 		select {
 		case <-worker.done:
 			writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": workerID})
@@ -3920,7 +3901,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	cancel()
 	s.stopBackgroundContinuationLocked()
 	s.cancelMu.Unlock()
-	s.cancelPendingInteractions()
+	s.cancelSessionInteractions(runningSession)
 	if done != nil {
 		select {
 		case <-done:
@@ -3932,33 +3913,6 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": runningSession})
-}
-
-// cancelPendingInteractions releases approval and AskUser waits immediately.
-// Context cancellation alone cannot finish a loop that is blocked waiting for
-// one of these browser replies, which made the old stop button appear broken.
-func (s *Server) cancelPendingInteractions() {
-	s.permMu.Lock()
-	permissions := s.pendingPerms
-	s.pendingPerms = make(map[string]*permissionPending)
-	s.permMu.Unlock()
-	for _, pending := range permissions {
-		select {
-		case pending.reply <- agent.PermissionDecisionDeny:
-		default:
-		}
-	}
-
-	s.askMu.Lock()
-	asks := s.pendingAsks
-	s.pendingAsks = make(map[string]*askPending)
-	s.askMu.Unlock()
-	for _, pending := range asks {
-		select {
-		case pending.reply <- "":
-		default:
-		}
-	}
 }
 
 // handleExport writes the session transcript as a glyph-led txt export,
@@ -4248,6 +4202,19 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer s.runMu.Unlock()
+		s.stateMu.RLock()
+		workDir := s.activeWorkDir
+		if workDir == "" {
+			workDir = s.freshWorkDir
+		}
+		s.stateMu.RUnlock()
+		lease, admitted := s.turnCoordinator.TryAcquire(workDir)
+		if !admitted {
+			writeError(w, http.StatusConflict, "cannot change permission mode while a turn is running; stop the current turn first")
+			return
+		}
+		defer lease.Release()
+
 	}
 	var settings []config.UserSetting
 	for _, c := range body.Changes {
@@ -4295,10 +4262,22 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		permissionApplied = true
 	}
+	if permissionApplied && s.store != nil {
+		if err := s.persistActiveSessionState(); err != nil {
+			_ = rtpkg.RestorePermissionModeState(previousPermissionState, s.applyPermissionMode)
+			writeError(w, http.StatusInternalServerError, "permission mode unchanged: "+err.Error())
+			return
+		}
+	}
+
 	if _, err := config.SaveUserSettingsAndLoad(settings); err != nil {
 		var rollbackErr error
 		if permissionApplied {
 			rollbackErr = rtpkg.RestorePermissionModeState(previousPermissionState, s.applyPermissionMode)
+			if s.store != nil {
+				rollbackErr = errors.Join(rollbackErr, s.persistActiveSessionState())
+			}
+
 		}
 		message := err.Error()
 		if rollbackErr != nil {
@@ -4307,6 +4286,12 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, message)
 		return
 	}
+	if permissionApplied {
+		s.stateMu.Lock()
+		s.freshPermissionMode = s.loop.Gate.Mode()
+		s.stateMu.Unlock()
+	}
+
 	var live, restart []string
 	for _, c := range body.Changes {
 		switch c.Key {

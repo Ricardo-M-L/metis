@@ -121,6 +121,7 @@ assert.equal(calls.at(-1).options.method,'DELETE'); assert.equal(state.deletion,
 ready(); state.selectedId='task/1';
 server=async url=>url.endsWith('/runs') ? response({runs:[{id:'run/1',jobId:'task/1',status:'failed',startedAt:'2030-01-02T01:00:00Z',error:'<script>bad()</script>',sessionId:'session/42'}]}) : response({id:'run/1',status:'failed',output:'<img src=x onerror=bad()>',sessionId:'session/42'});
 await c.loadAutomationRuns('task/1'); assert.match(get('#automationRuns').innerHTML,/&lt;script/);
+assert.equal(vm.runInContext('automationSessionRuns.get("session/42").runId',c),'run/1','sidebar navigation can discover the run after loading task history');
 assert.match(get('#automationRuns').innerHTML,/打开会话/);
 assert.match(get('#automationLatestResult').innerHTML,/最新执行结果/);
 assert.match(get('#automationLatestResult').innerHTML,/&lt;img/); assert.doesNotMatch(get('#automationLatestResult').innerHTML,/<img/);

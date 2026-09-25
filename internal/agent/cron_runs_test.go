@@ -23,6 +23,12 @@ func TestCronRunsLifecyclePrivacyAndAdmission(t *testing.T) {
 	if err := run.SetSessionID("real-session"); err != nil {
 		t.Fatal(err)
 	}
+	if err := run.SetProgress("working on the answer", []CronRunActivity{{Kind: "tool_start", Tool: "Read"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.SetProgress(strings.Repeat("进", 7000)+"最终片段", []CronRunActivity{{Kind: "tool_start", Tool: "Read"}}); err != nil {
+		t.Fatal(err)
+	}
 	if running, err := CronJobRunning(root, "job"); err != nil || !running {
 		t.Fatalf("running=%v err=%v", running, err)
 	}
@@ -34,9 +40,13 @@ func TestCronRunsLifecyclePrivacyAndAdmission(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		r, err := ReadCronRun(root, "job", "first")
-		if err != nil || r.Status != "running" {
+		if err != nil || r.Status != "running" || len(r.LiveText) > 16*1024 || !strings.HasSuffix(r.LiveText, "最终片段") || len(r.Activity) != 1 {
 			t.Fatalf("live record=%+v %v", r, err)
 		}
+	}
+	listed, err := ListCronRuns(root, "job", 10)
+	if err != nil || len(listed) == 0 || listed[0].LiveText != "" || len(listed[0].Activity) != 0 {
+		t.Fatalf("list exposed large progress=%+v, %v", listed, err)
 	}
 	skipped, err := ReadCronRun(root, "job", "second")
 	if err != nil || skipped.Status != "skipped" || skipped.FinishedAt == nil {
@@ -50,7 +60,7 @@ func TestCronRunsLifecyclePrivacyAndAdmission(t *testing.T) {
 	if err != nil || r.Status != "succeeded" || r.SessionID != "real-session" || r.FinishedAt == nil {
 		t.Fatalf("result=%+v %v", r, err)
 	}
-	if strings.Contains(r.Output+r.Summary, "cron-secret-sentinel") || len(r.Output) > CronRunOutputLimit || !strings.HasSuffix(r.Output, "[truncated]") {
+	if strings.Contains(r.Output+r.Summary, "cron-secret-sentinel") || len(r.Output) > CronRunOutputLimit || !strings.HasSuffix(r.Output, "[truncated]") || r.LiveText != "" {
 		t.Fatal("output is not bounded/redacted")
 	}
 	if running, err := CronJobRunning(root, "job"); err != nil || running {

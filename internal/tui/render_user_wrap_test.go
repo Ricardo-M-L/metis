@@ -4,22 +4,28 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/charmbracelet/x/ansi"
 )
 
 // TestRenderMessage_UserShortLineRendersOneRow — sanity baseline:
 // a short prompt should still render as a single body row (no wrap).
 func TestRenderMessage_UserShortLineRendersOneRow(t *testing.T) {
-	msg := Message{Role: "user", Content: "hello world"}
+	msg := Message{Role: "user", Content: "hello world\n"}
 	out := renderMessage(msg, 80, false)
 	plain := ansi.Strip(out)
-	body := strings.TrimSpace(plain)
-	rows := strings.Split(body, "\n")
+	rows := strings.Split(strings.Trim(plain, "\n"), "\n")
 	if len(rows) != 1 {
 		t.Errorf("short prompt should render as 1 body row; got %d: %q", len(rows), rows)
 	}
-	if !strings.Contains(rows[0], "hello world") {
+	if len(rows) == 1 && !strings.Contains(rows[0], "hello world") {
 		t.Errorf("body missing content: %q", rows[0])
+	}
+	if len(rows) == 1 && ansi.StringWidth(rows[0]) != 79 {
+		t.Errorf("shaded row should fill the chat width with one safety column: got %d", ansi.StringWidth(rows[0]))
+	}
+	if !strings.Contains(out, ";48;") {
+		t.Errorf("submitted prompt lacks background fill: %q", out)
 	}
 }
 
@@ -44,25 +50,48 @@ func TestRenderMessage_UserLongPathWrapsAtWidth(t *testing.T) {
 	if len(rows) < 2 {
 		t.Fatalf("expected >1 wrapped row for a 200+ cell prompt at width %d; got %d row(s): %q", width, len(rows), rows)
 	}
-	// Every row's measured cell width must fit inside the budget
-	// (width - 4 = body, plus the 4-cell prefix on row 0 or 4-cell
-	// indent on continuation rows). Allow +1 slack for trailing
-	// soft-wrap padding.
+	// Every shaded row ends one cell before the terminal edge.
 	for i, row := range rows {
-		if w := ansi.StringWidth(row); w > width+1 {
-			t.Errorf("row %d width %d exceeds terminal width %d: %q", i, w, width, row)
+		if w := ansi.StringWidth(row); w != width-1 {
+			t.Errorf("row %d width %d, want %d: %q", i, w, width-1, row)
 		}
 	}
-	// Prompt glyph (❯) must appear EXACTLY on row 0 — continuation
+	// Prompt glyph (›) must appear EXACTLY on row 0 — continuation
 	// rows should NOT repeat it (would look like multiple prompts).
 	first := rows[0]
-	if !strings.Contains(first, "❯") {
+	if !strings.Contains(first, "›") {
 		t.Errorf("row 0 missing prompt glyph; got %q", first)
 	}
 	for i, row := range rows[1:] {
-		if strings.Contains(row, "❯") {
+		if strings.Contains(row, "›") {
 			t.Errorf("continuation row %d shouldn't carry prompt glyph: %q", i+1, row)
 		}
+	}
+}
+
+func TestRenderMessage_UserCardThemesAndControlBytes(t *testing.T) {
+	original := themes.Current().Name
+	defer themes.SwitchTheme(original)
+
+	themes.SwitchTheme("dark")
+	msg := Message{Role: "user", Content: "hello\x1b[0m\x1b]8;;https://example.com\x1b\\ world\x1b]8;;\x1b\\\x07"}
+	dark := renderMessage(msg, 24, false)
+	cache := newRenderCache(8, 100)
+	cache.PutMessage(msg, 24, false, dark)
+	if strings.Contains(dark, "https://example.com") || strings.Contains(dark, "\x07") {
+		t.Errorf("terminal control bytes leaked into prompt card: %q", dark)
+	}
+	if plain := ansi.Strip(dark); !strings.Contains(plain, "hello world") {
+		t.Errorf("visible message text was lost: %q", plain)
+	}
+
+	themes.SwitchTheme("light")
+	if _, ok := cache.GetMessage(msg, 24, false); ok {
+		t.Fatal("theme switch reused the old prompt-card colors")
+	}
+	light := renderMessage(msg, 24, false)
+	if dark == light {
+		t.Fatal("dark and light prompt cards should use different palette colors")
 	}
 }
 

@@ -388,6 +388,7 @@ async function pollStatus(shouldApply = () => true) {
     if (!res.ok) return;
     const d = await res.json();
     if (generation !== statusRequestGeneration || !shouldApply()) return;
+    d.requestGeneration = generation;
     lastStatusSnapshot = d;
     renderStatusSnapshot(d);
     if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d);
@@ -468,8 +469,17 @@ function renderStatusSnapshot(d) {
       }
     }
     if (typeof setTurnRunning === 'function') {
+      if (typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()) {
+        syncTrackedRunningState(d);
+        return;
+      }
       const statusRunning = !!d.turnRunning;
-      const statusSession = String(d.runningSessionId || '');
+      const workerSessions = Array.isArray(d.isolatedTurnSessions) ? d.isolatedTurnSessions.map(String) : [];
+      const liveSessions = new Set(workerSessions);
+      if (d.turnRunning && d.runningSessionId) liveSessions.add(String(d.runningSessionId));
+      const statusSession = liveSessions.has(String(currentSessionId || '')) ? String(currentSessionId)
+        : liveSessions.has(String(runningSessionId || '')) ? String(runningSessionId)
+        : Array.from(liveSessions).sort()[0] || '';
       if (statusRunning !== turnRunning || (statusRunning && statusSession && statusSession !== runningSessionId)) {
         setTurnRunning(statusRunning, statusSession);
       }

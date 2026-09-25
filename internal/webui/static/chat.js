@@ -54,6 +54,14 @@ function onLive(type, handler) {
   });
 }
 
+// Approval events must be retained even while their conversation is offscreen.
+function onInteraction(type, handler) {
+  eventSource.addEventListener(type, e => {
+    if (!acceptLiveEvent(e)) return;
+    try { handler(JSON.parse(e.data)); } catch (_) {}
+  });
+}
+
 function connectEvents() {
   if (eventSource) { eventSource.close(); eventSource = null; }
   if (!window.EventSource) return;
@@ -62,6 +70,7 @@ function connectEvents() {
 
   eventSource.addEventListener('ready', e => {
     hideReconnectBanner();
+    void restorePendingInteractions(currentSessionId);
     try { if (JSON.parse(e.data).replayReset) showToast('Live event history expired. The saved session will refresh after the turn.'); } catch (_) {}
   });
   onLive('text_delta', handleTextDelta);
@@ -75,9 +84,10 @@ function connectEvents() {
   onLive('compaction_start', handleCompactionStart);
   onLive('compaction_progress', handleCompactionProgress);
   onLive('compaction_end', handleCompactionEnd);
-  onLive('ask_user', handleAskUser);
+  onInteraction('ask_user', handleAskUser);
   onLive('redacted_thinking', () => handleRedactedThinking());
-  onLive('permission_request', handlePermissionRequest);
+  onInteraction('permission_request', handlePermissionRequest);
+  onInteraction('interaction_resolved', handleInteractionResolved);
   onLive('turn_end', endStreamingMessage);
   // Runtime ownership is global even when the running session is offscreen.
   // Only transcript rendering is filtered by the currently viewed session.
@@ -98,11 +108,13 @@ function connectEvents() {
 
 function handleBackgroundContinuation(d) {
   if (d.backgroundContinuation === 'started') {
+    if (typeof liveBackgroundSessions !== 'undefined') liveBackgroundSessions.add(d.session);
     backgroundContinuationGeneration++;
     backgroundContinuationGenerations.set(d.session, (backgroundContinuationGenerations.get(d.session) || 0) + 1);
     if (sameSession(d)) beginUserTurn();
     setTurnRunning(true, d.session);
   } else if (d.backgroundContinuation === 'finished') {
+    if (typeof liveBackgroundSessions !== 'undefined') liveBackgroundSessions.delete(d.session);
     if (sameSession(d)) finishUserTurn();
     if (!runningSessionId || runningSessionId === d.session) {
       const pendingSession = pendingForegroundRequest && pendingForegroundRequest.sessionId;
@@ -116,7 +128,9 @@ function handleBackgroundContinuation(d) {
     if (sameSession(d)) loadSessionStatsbar();
     if (d.succeeded && queuedTurns.length && !drainingQueuedTurns) setTimeout(drainQueuedTurns, 0);
   }
+  if (typeof syncTrackedRunningState === 'function') syncTrackedRunningState();
 }
+
 
 async function loadEffort(shouldApply = () => true) {
   const generation = ++effortRequestGeneration;
@@ -468,62 +482,139 @@ function restoreTodoPlanFromHistory(history) {
 }
 
 let pendingAsk = null;
+const pendingInteractions = new Map();
+const resolvedInteractionIDs = new Set();
+let interactionRevision = 0;
+let interactionSnapshotGeneration = 0;
 
-// Model's mid-turn question (DSH PendingSteering parity): right-aligned
-// pending bubble + the composer flips into answer mode.
+function interactionKey(d) {
+  return d && (d.permId ? 'permission:' + d.permId : d.askId ? 'ask:' + d.askId : '');
+}
+
+function rememberInteraction(d) {
+  const key = interactionKey(d);
+  if (!key || resolvedInteractionIDs.has(key)) return null;
+  const previous = pendingInteractions.get(key);
+  const interaction = { ...d, session: String(d.session || currentSessionId || ''), revision: ++interactionRevision };
+  pendingInteractions.set(key, previous ? { ...previous, ...interaction } : interaction);
+  return pendingInteractions.get(key);
+}
+
+function interactionCard(kind, id) {
+  const attribute = kind === 'ask' ? 'data-ask' : 'data-perm';
+  return Array.from(document.querySelectorAll('[' + attribute + ']')).find(card => card.getAttribute(attribute) === id) || null;
+}
+
+function visibleInteraction(d) {
+  return sameSession(d);
+}
+
+function syncPendingAsk() {
+  const ask = Array.from(pendingInteractions.values()).find(d => d.askId && visibleInteraction(d));
+  pendingAsk = ask ? { ...ask, id: ask.askId } : null;
+  const input = document.getElementById('inputField');
+  if (input) input.placeholder = pendingAsk
+    ? (pendingAsk.allowFreeform ? uiText('Answer the question…', '回复模型的问题…') : uiText('Choose an option', '选择一个选项'))
+    : uiText('Describe what you want to build', '描述你想要构建的内容');
+}
+
+function forgetInteraction(d, removeCard = true) {
+  const key = interactionKey(d);
+  if (!key) return;
+  pendingInteractions.delete(key);
+  resolvedInteractionIDs.add(key);
+  if (resolvedInteractionIDs.size > 4096) resolvedInteractionIDs.delete(resolvedInteractionIDs.values().next().value);
+  interactionRevision++;
+  if (removeCard) {
+    const card = interactionCard(d.askId ? 'ask' : 'permission', d.askId || d.permId);
+    if (card) card.remove();
+  }
+  syncPendingAsk();
+  renderSessions();
+}
+
+function handleInteractionResolved(d) {
+  forgetInteraction(d);
+}
+
+async function restorePendingInteractions(sessionId = currentSessionId, shouldApply = () => true) {
+  const requestedSessionId = String(sessionId || '');
+  const generation = ++interactionSnapshotGeneration;
+  const revision = interactionRevision;
+  if (!requestedSessionId) { syncPendingAsk(); return; }
+  try {
+    const res = await fetch('/api/interactions?sessionId=' + encodeURIComponent(requestedSessionId));
+    if (!res.ok) return;
+    const data = await res.json();
+    if (generation !== interactionSnapshotGeneration || !shouldApply() || requestedSessionId !== String(currentSessionId || '')) return;
+    const interactions = [...(data.permissions || []), ...(data.asks || [])].filter(d => String(d.session || '') === requestedSessionId);
+    const snapshotKeys = new Set(interactions.map(interactionKey));
+    for (const [key, pending] of pendingInteractions) {
+      // A newer SSE event can race this response. Only reconcile state that
+      // already existed when the snapshot request began.
+      if (pending.session === requestedSessionId && pending.revision <= revision && !snapshotKeys.has(key)) forgetInteraction(pending);
+    }
+    for (const interaction of interactions) {
+      if (interaction.permId) handlePermissionRequest(interaction);
+      else if (interaction.askId) handleAskUser(interaction);
+    }
+    syncPendingAsk();
+  } catch (_) { /* A reconnect or later session selection retries the snapshot. */ }
+}
+
+// Each question owns its buttons. The composer answers the oldest unresolved
+// visible question, while an option button answers its own card.
 function handleAskUser(d) {
+  const ask = rememberInteraction(d);
+  if (!ask) return;
+  if (!visibleInteraction(ask)) { renderSessions(); return; }
+  if (interactionCard('ask', ask.askId)) { syncPendingAsk(); return; }
   const area = document.getElementById('chatArea');
-  pendingAsk = { id: d.askId, question: d.question || '', options: d.options || [], allowFreeform: !!d.allowFreeform };
-  const optsHtml = (pendingAsk.options || []).map(o =>
+  const optsHtml = (ask.options || []).map(o =>
     `<button class="ask-option" onclick="answerAskOption(this)">${escHtml(o)}</button>`).join('');
   area.insertAdjacentHTML('beforeend', `
-    <div class="message message-user ask-pending">
+    <div class="message message-user ask-pending" data-ask="${escAttr(ask.askId)}" data-session="${escAttr(ask.session)}">
       <div class="message-bubble">
-        <div class="ask-question">${escHtml(pendingAsk.question)}</div>
+        <div class="ask-question">${escHtml(ask.question || '')}</div>
         ${optsHtml ? '<div class="ask-options">' + optsHtml + '</div>' : ''}
         <div class="ask-answer"></div>
       </div>
     </div>`);
-  const input = document.getElementById('inputField');
-  input.placeholder = pendingAsk.allowFreeform ? '\u56DE\u590D\u6A21\u578B\u7684\u95EE\u9898\u2026' : '\u9009\u62E9\u4E00\u4E2A\u9009\u9879';
-  document.getElementById('inputField').focus();
+  syncPendingAsk();
   renderSessions();
   autoScroll();
 }
 
 function answerAskOption(btn) {
   const card = btn.closest('.ask-pending');
-  if (card) card.querySelectorAll('.ask-option').forEach(b => b.disabled = true);
-  submitAskAnswer(btn.textContent);
+  if (!card) return;
+  void submitAskAnswer(btn.textContent, card.getAttribute('data-ask'));
 }
 
-async function submitAskAnswer(answer) {
-  const ask = pendingAsk;
+async function submitAskAnswer(answer, askId) {
+  const ask = askId ? pendingInteractions.get('ask:' + askId) : pendingAsk;
   if (!ask) return;
-  const card = document.querySelector('.ask-pending');
+  const id = ask.askId || ask.id;
+  const card = interactionCard('ask', id);
   if (card) card.querySelectorAll('.ask-option').forEach(b => b.disabled = true);
   try {
     const res = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: ask.id, answer: answer })
+      body: JSON.stringify({ id: id, sessionId: ask.session, answer: answer })
     });
     if (!res.ok) throw new Error('ask: ' + res.status);
-    pendingAsk = null;
-    if (card) {
+    forgetInteraction({ askId: id, session: ask.session }, false);
+    if (card && card.isConnected) {
       const a = card.querySelector('.ask-answer');
       if (a) a.textContent = answer;
       card.classList.remove('ask-pending');
       card.classList.add('ask-answered');
     }
-    renderSessions();
   } catch (e) {
-    // Keep the question pending so the user can retry; re-enable options.
-    if (card) card.querySelectorAll('.ask-option').forEach(b => b.disabled = false);
+    if (card && card.isConnected) card.querySelectorAll('.ask-option').forEach(b => b.disabled = false);
     showToast('Failed to answer: ' + e.message);
   }
-  const input = document.getElementById('inputField');
-  input.placeholder = '\u63CF\u8FF0\u4F60\u60F3\u8981\u6784\u5EFA\u7684\u5185\u5BB9';
 }
 
 let turnStartMs = 0;
@@ -736,22 +827,126 @@ function handleTextDelta(d) {
   autoScroll();
 }
 
+const foregroundRequests = new Map();
+const completedForegroundSessions = new Map();
+const liveBackgroundSessions = new Set();
+const pendingStopSessions = new Set();
+const sessionQueues = new Map();
+let draftSessionCreation = null;
+
+function parallelTurnsEnabled() {
+  return !!(lastStatusSnapshot && lastStatusSnapshot.isolatedTurnsEnabled);
+}
+
+function trackedRunningSessions(snapshot = lastStatusSnapshot) {
+  const live = new Set(snapshot && Array.isArray(snapshot.isolatedTurnSessions) ? snapshot.isolatedTurnSessions.map(String) : []);
+  if (snapshot && snapshot.turnRunning && snapshot.runningSessionId) live.add(String(snapshot.runningSessionId));
+  for (const [id, generation] of completedForegroundSessions) {
+    if (!live.has(id) && Number(snapshot && snapshot.requestGeneration) > generation) completedForegroundSessions.delete(id);
+    live.delete(id);
+  }
+  for (const id of foregroundRequests.keys()) if (id) live.add(id);
+  for (const id of liveBackgroundSessions) live.add(id);
+  return live;
+}
+
+function isViewedTurnRunning() {
+  if (!parallelTurnsEnabled()) return turnRunning;
+  return !!(currentSessionId && trackedRunningSessions().has(String(currentSessionId)));
+}
+
+function syncTrackedRunningState(snapshot = lastStatusSnapshot) {
+  if (!parallelTurnsEnabled()) return;
+  const live = trackedRunningSessions(snapshot);
+  const selected = String(currentSessionId || '');
+  const target = live.has(selected) ? selected : live.has(String(runningSessionId || ''))
+    ? String(runningSessionId) : Array.from(live).sort()[0] || '';
+  pendingForegroundRequest = foregroundRequests.get(selected) || null;
+  setTurnRunning(live.size > 0, target);
+}
+
+function rememberForegroundRequest(request) {
+  if (!parallelTurnsEnabled() || !request.sessionId) return;
+  completedForegroundSessions.delete(request.sessionId);
+  foregroundRequests.set(request.sessionId, request);
+}
+
+function finishForegroundRequest(request) {
+  if (!parallelTurnsEnabled() || !request.sessionId) return;
+  if (foregroundRequests.get(request.sessionId) === request) {
+    foregroundRequests.delete(request.sessionId);
+    completedForegroundSessions.set(request.sessionId, typeof statusRequestGeneration === 'number' ? statusRequestGeneration : 0);
+  }
+}
+
+function saveSessionQueue() {
+  const id = String(queuedSessionId || currentSessionId || '');
+  const state = sessionQueues.get(id) || {};
+  Object.assign(state, { items: queuedTurns, draining: drainingQueuedTurns, pending: queuedTurnPendingItem });
+  sessionQueues.set(id, state);
+  return state;
+}
+
+function restoreSessionQueue(sessionId) {
+  const state = sessionQueues.get(String(sessionId || '')) || { items: [], draining: false, pending: null };
+  queuedTurns = state.items;
+  queuedSessionId = queuedTurns.length ? sessionId : null;
+  drainingQueuedTurns = !!state.draining;
+  queuedTurnPendingItem = state.pending;
+  queuedTurnMenuIndex = -1;
+}
+
+// Allocate an ID before listening for the first token. With concurrent turns,
+// an unrelated worker's event must never claim a blank composer as its own.
+async function prepareDraftSession() {
+  if (currentSessionId || !parallelTurnsEnabled()) return true;
+  const generation = resumeSessionGeneration;
+  if (!draftSessionCreation || draftSessionCreation.generation !== generation) {
+    const promise = fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(async res => {
+        const data = await res.json();
+        if (!res.ok || !data.id) throw new Error(data.error || 'Unable to create session');
+        return data;
+      });
+    draftSessionCreation = { generation, promise };
+  }
+  const creation = draftSessionCreation;
+  try {
+    const data = await creation.promise;
+    if (generation !== resumeSessionGeneration) return false;
+    if (currentSessionId && currentSessionId !== data.id) return false;
+    currentSessionId = data.id;
+    if (!sessions.some(session => session.id === data.id)) sessions = [data, ...sessions];
+    if (window.metisNavigation) window.metisNavigation.recordSession(data.id, { replace: true });
+    renderSessions();
+    return true;
+  } catch (error) {
+    showToast(error.message);
+    return false;
+  } finally {
+    if (draftSessionCreation === creation) draftSessionCreation = null;
+  }
+}
+
 function syncTurnControls() {
+  const visibleRunning = typeof isViewedTurnRunning === 'function' ? isViewedTurnRunning() : turnRunning;
+  const visibleStopping = typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()
+    ? pendingStopSessions.has(String(currentSessionId || '')) : stopRequestPending;
   const sendBtn = document.getElementById('sendBtn');
   const stopBtn = document.getElementById('stopBtn');
-  if (sendBtn) sendBtn.style.display = turnRunning ? 'none' : '';
+  if (sendBtn) sendBtn.style.display = visibleRunning ? 'none' : '';
   if (stopBtn) {
-    stopBtn.style.display = turnRunning ? '' : 'none';
-    stopBtn.disabled = stopRequestPending;
-    stopBtn.classList.toggle('stopping', stopRequestPending);
+    stopBtn.style.display = visibleRunning ? '' : 'none';
+    stopBtn.disabled = visibleStopping;
+    stopBtn.classList.toggle('stopping', visibleStopping);
     const background = runningSessionId && runningSessionId !== currentSessionId;
     const runningSession = typeof sessions !== 'undefined' && sessions.find(session => session.id === runningSessionId);
     const runningTitle = runningSession && runningSession.title || runningSessionId;
     const label = background
-      ? (stopRequestPending
+      ? (visibleStopping
         ? uiText(`Stopping other running session: ${runningTitle}…`, `正在停止其他会话：${runningTitle}…`)
         : uiText(`Stop other running session: ${runningTitle}`, `停止正在运行的其他会话：${runningTitle}`))
-      : (stopRequestPending ? uiText('Stopping current turn…', '正在停止当前轮次…') : uiText('Stop current turn', '停止当前轮次'));
+      : (visibleStopping ? uiText('Stopping current turn…', '正在停止当前轮次…') : uiText('Stop current turn', '停止当前轮次'));
     stopBtn.title = label;
     stopBtn.setAttribute('aria-label', label);
   }
@@ -775,6 +970,10 @@ function setTurnRunning(running, sessionId) {
 // agent turn remains alive and tracked by runningSessionId; only its old live
 // rendering pointers are discarded so completion cannot write into session B.
 function detachRunningTurnView() {
+  interactionSnapshotGeneration++;
+  saveSessionQueue();
+  const request = foregroundRequests.get(String(currentSessionId || ''));
+  if (request) request.needsHistorySync = true;
   if (turnRunning && currentSessionId && currentSessionId === runningSessionId) {
     runningTurnNeedsHistorySync = true;
   }
@@ -794,7 +993,15 @@ function detachRunningTurnView() {
 }
 
 async function stopTurn() {
-  if (!turnRunning || stopRequestPending) return;
+  if (!turnRunning) return;
+  if (!parallelTurnsEnabled() && stopRequestPending) return;
+  if (parallelTurnsEnabled()) {
+    if (!isViewedTurnRunning()) return;
+    runningSessionId = currentSessionId;
+  }
+  const stoppedSessionId = runningSessionId;
+  if (pendingStopSessions.has(String(stoppedSessionId || ''))) return;
+  pendingStopSessions.add(String(stoppedSessionId || ''));
   stopRequestPending = true;
   syncTurnControls();
   try {
@@ -804,8 +1011,15 @@ async function stopTurn() {
       body: JSON.stringify({ sessionId: runningSessionId })
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'stop: ' + res.status);
+    if (!res.ok) {
+      const request = foregroundRequests.get(String(stoppedSessionId || ''));
+      if (res.status === 409 && request && request.controller) request.controller.abort();
+      else throw new Error(data.error || 'stop: ' + res.status);
+    }
     if (data.stopping) showToast('Stopping the running turn…');
+    const stoppedQueue = sessionQueues.get(String(stoppedSessionId || ''));
+    if (stoppedQueue) { stoppedQueue.items.length = 0; stoppedQueue.pending = null; }
+    if (parallelTurnsEnabled() && currentSessionId !== stoppedSessionId) return;
     const dropped = queuedTurns.length;
     queuedTurns = [];
     queuedSessionId = null;
@@ -815,10 +1029,9 @@ async function stopTurn() {
   } catch (e) {
     showToast('Stop failed: ' + e.message);
   } finally {
-    if (turnRunning) {
-      stopRequestPending = false;
-      syncTurnControls();
-    }
+    pendingStopSessions.delete(String(stoppedSessionId || ''));
+    stopRequestPending = parallelTurnsEnabled() ? pendingStopSessions.has(String(currentSessionId || '')) : false;
+    syncTurnControls();
   }
 }
 
@@ -889,6 +1102,7 @@ function beginUserTurn() {
 // new chat, and SSE reconnect so nothing from a previous session leaks
 // into the next (timer, pending question, tool details, thinking row).
 function resetTurnState() {
+  interactionSnapshotGeneration++;
   clearTodoPlan();
   runningTurnIncompleteReason = '';
   compactionInFlight = false;
@@ -1405,11 +1619,16 @@ function copySearchCard(btn) {
 
 // Permission approval card (DSH human-in-the-loop parity).
 function handlePermissionRequest(d) {
+  const interaction = rememberInteraction(d);
+  if (!interaction) return;
+  if (!visibleInteraction(interaction)) { renderSessions(); return; }
+  if (interactionCard('permission', interaction.permId)) return;
+  d = interaction;
   const area = document.getElementById('chatArea');
   const id = d.permId || '';
   if (!id) return;
   area.insertAdjacentHTML('beforeend', `
-    <div class="perm-card" data-perm="${escAttr(id)}" data-tool="${escAttr(d.tool || 'tool')}">
+    <div class="perm-card" data-perm="${escAttr(id)}" data-session="${escAttr(d.session)}" data-tool="${escAttr(d.tool || 'tool')}">
       <span class="tool-icon running">&#128274;</span>
       <div class="tool-body">
         <div class="tool-name">${escHtml(d.tool || 'tool')} needs approval</div>
@@ -1426,14 +1645,16 @@ function handlePermissionRequest(d) {
 
 async function resolvePermission(id, approve, btn) {
   const card = btn.closest('.perm-card');
+  const sessionId = card && card.getAttribute('data-session');
   try {
     const res = await fetch('/api/permission', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id, approve: approve })
+      body: JSON.stringify({ id: id, sessionId: sessionId, approve: approve })
     });
     if (!res.ok) throw new Error('permission: ' + res.status);
-    if (card) {
+    forgetInteraction({ permId: id, session: sessionId }, false);
+    if (card && card.isConnected) {
       card.classList.add(approve ? 'approved' : 'denied');
       const tool = card.getAttribute('data-tool') || 'tool';
       const name = card.querySelector('.tool-name');
@@ -1520,10 +1741,11 @@ function resumeAutoScroll() {
 
 // --- Chat ---
 function newChat() {
-  if (turnRunning) {
+  if (turnRunning && !parallelTurnsEnabled()) {
     showToast('Stop the current turn before starting a new session');
     return;
   }
+  saveSessionQueue();
   if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();
   currentSessionId = null;
   if (typeof resetTraceForSession === 'function') resetTraceForSession();
@@ -1535,6 +1757,7 @@ function newChat() {
   queuedTurnPendingItem = null;
   renderQueuedTurns();
   resetTurnState();
+  syncTrackedRunningState();
   messages = [];
   followOutput = true;
   updateScrollFollowUI();
@@ -1744,25 +1967,26 @@ async function sendMessage(busyBehavior) {
     return;
   }
 
-  if (turnRunning && runningSessionId && currentSessionId !== runningSessionId) {
+  if (turnRunning && runningSessionId && currentSessionId !== runningSessionId && !parallelTurnsEnabled()) {
     showToast('Another session is still running. Return to it or stop it before sending.');
     return;
   }
 
-  if (!turnRunning && await executeComposerCommand(text)) {
+  if (!isViewedTurnRunning() && await executeComposerCommand(text)) {
     input.value = '';
     autoResize(input);
     closeCommandMenu();
     return;
   }
 
+  if (!currentSessionId && !await prepareDraftSession()) return;
   const item = { text: text, images: attachments.slice() };
   input.value = '';
   autoResize(input);
   attachments = [];
   renderAttachments();
 
-  if (turnRunning) {
+  if (isViewedTurnRunning()) {
     await submitBusyInput(item, busyBehavior || desktopPreferences.busyEnter || 'queue');
     return;
   }
@@ -1770,17 +1994,17 @@ async function sendMessage(busyBehavior) {
 }
 
 async function submitBusyInput(item, behavior) {
+  const targetSessionId = currentSessionId || runningSessionId;
   if (behavior === 'send' && item.images.length === 0) {
     try {
       const res = await fetch('/api/steer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: currentSessionId, input: item.text })
+        body: JSON.stringify({ sessionId: targetSessionId, input: item.text })
       });
       const data = await res.json();
       if (res.ok) {
-        currentSessionId = data.sessionId || currentSessionId;
-        addMessage('user', item.text);
+        if (currentSessionId === targetSessionId) addMessage('user', item.text);
         showToast('Sent to the current turn');
         await loadSessions();
         return;
@@ -1793,7 +2017,13 @@ async function submitBusyInput(item, behavior) {
   } else if (behavior === 'send' && item.images.length) {
     showToast('Image follow-ups are queued for the next turn');
   }
-  if (!queuedSessionId) queuedSessionId = runningSessionId || currentSessionId;
+  if (currentSessionId !== targetSessionId) {
+    const state = sessionQueues.get(String(targetSessionId || '')) || { items: [], draining: false, pending: null };
+    state.items.push(item);
+    sessionQueues.set(String(targetSessionId || ''), state);
+    return;
+  }
+  if (!queuedSessionId) queuedSessionId = targetSessionId;
   queuedTurns.push(item);
   renderQueuedTurns();
 }
@@ -1818,6 +2048,7 @@ function queuedTurnCanSteer(item) {
 }
 
 function renderQueuedTurns() {
+  if (typeof saveSessionQueue === 'function') saveSessionQueue();
   const wrap = document.getElementById('queuedTurns');
   if (!wrap) return;
   const visibleForSession = !queuedSessionId || !currentSessionId || queuedSessionId === currentSessionId;
@@ -1935,6 +2166,8 @@ async function steerQueuedTurn(event, index) {
   if (!item || queuedTurnPendingItem || !queuedTurnCanSteer(item) || !targetSessionId) return;
   queuedTurnPendingItem = item;
   queuedTurnMenuIndex = -1;
+  const ownedQueue = queuedTurns;
+  const queueState = typeof saveSessionQueue === 'function' ? saveSessionQueue() : null;
   renderQueuedTurns();
   try {
     const res = await fetch('/api/steer', {
@@ -1944,16 +2177,17 @@ async function steerQueuedTurn(event, index) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'steer: ' + res.status);
-    const liveIndex = queuedTurns.indexOf(item);
-    if (liveIndex >= 0) queuedTurns.splice(liveIndex, 1);
-    if (!queuedTurns.length) queuedSessionId = null;
+    const liveIndex = ownedQueue.indexOf(item);
+    if (liveIndex >= 0) ownedQueue.splice(liveIndex, 1);
+    if (queuedTurns === ownedQueue && !queuedTurns.length) queuedSessionId = null;
     if (currentSessionId === targetSessionId) addMessage('user', item.text);
     showToast(uiText('Sent to the current turn', '已发送给当前任务'));
     await loadSessions();
   } catch (error) {
     showToast(uiText('Unable to steer; the message remains queued: ', '调整方向失败，消息仍在队列中：') + error.message);
   } finally {
-    queuedTurnPendingItem = null;
+    if (queueState) queueState.pending = null;
+    if (queuedTurnPendingItem === item) queuedTurnPendingItem = null;
     renderQueuedTurns();
   }
 }
@@ -1965,6 +2199,8 @@ async function openQueuedTurnInSideChat(event, index) {
   if (!item || queuedTurnPendingItem || !sourceSessionId) return;
   queuedTurnPendingItem = item;
   queuedTurnMenuIndex = -1;
+  const ownedQueue = queuedTurns;
+  const queueState = typeof saveSessionQueue === 'function' ? saveSessionQueue() : null;
   renderQueuedTurns();
   try {
     const res = await fetch('/api/fork', {
@@ -1977,9 +2213,9 @@ async function openQueuedTurnInSideChat(event, index) {
     await loadSessions();
     await resumeSession(data.sessionId);
     if (currentSessionId !== data.sessionId) throw new Error(uiText('the branched session did not open', '分支会话未能打开'));
-    const liveIndex = queuedTurns.indexOf(item);
-    if (liveIndex >= 0) queuedTurns.splice(liveIndex, 1);
-    if (!queuedTurns.length) queuedSessionId = null;
+    const liveIndex = ownedQueue.indexOf(item);
+    if (liveIndex >= 0) ownedQueue.splice(liveIndex, 1);
+    if (queuedTurns === ownedQueue && !queuedTurns.length) queuedSessionId = null;
     const input = document.getElementById('inputField');
     if (input) {
       input.value = item.text || '';
@@ -1993,7 +2229,8 @@ async function openQueuedTurnInSideChat(event, index) {
   } catch (error) {
     showToast(uiText('Unable to open side chat: ', '无法打开侧边会话：') + error.message);
   } finally {
-    queuedTurnPendingItem = null;
+    if (queueState) queueState.pending = null;
+    if (queuedTurnPendingItem === item) queuedTurnPendingItem = null;
     renderQueuedTurns();
   }
 }
@@ -2010,20 +2247,25 @@ document.addEventListener('keydown', event => {
 });
 
 async function drainQueuedTurns() {
-  if (turnRunning || drainingQueuedTurns || pendingAsk || !queuedTurns.length) return;
+  if (isViewedTurnRunning() || drainingQueuedTurns || pendingAsk || !queuedTurns.length) return;
   if (queuedSessionId && currentSessionId !== queuedSessionId) return;
+  const owner = currentSessionId;
   drainingQueuedTurns = true;
   queuedTurnMenuIndex = -1;
   const item = queuedTurns.shift();
+  const queue = saveSessionQueue();
   renderQueuedTurns();
   let succeeded = false;
   try {
     succeeded = await runTurnItem(item);
   } finally {
-    drainingQueuedTurns = false;
-    if (!queuedTurns.length) queuedSessionId = null;
-    else if (succeeded && currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
-    else if (!succeeded) showToast('Queued messages paused after an incomplete or failed turn');
+    queue.draining = false;
+    if (currentSessionId === owner) {
+      drainingQueuedTurns = false;
+      if (!queuedTurns.length) queuedSessionId = null;
+      else if (succeeded) setTimeout(drainQueuedTurns, 0);
+    }
+    if (!succeeded) showToast('Queued messages paused after an incomplete or failed turn');
   }
 }
 
@@ -2051,7 +2293,8 @@ async function runTurnItem(item) {
   const turnSessionId = currentSessionId;
   const continuationGenerationAtSubmit = turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration;
   const continuationUnchanged = () => continuationGenerationAtSubmit === (turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration);
-  const foregroundRequest = { sessionId: turnSessionId };
+  const foregroundRequest = { sessionId: turnSessionId, needsHistorySync: false, controller: typeof AbortController === 'function' ? new AbortController() : null };
+  if (typeof rememberForegroundRequest === 'function') rememberForegroundRequest(foregroundRequest);
   pendingForegroundRequest = foregroundRequest;
   let resolvedTurnSessionId = turnSessionId;
   let turnSucceeded = false;
@@ -2071,15 +2314,16 @@ async function runTurnItem(item) {
     const res = await fetch('/api/turns', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({sessionId: turnSessionId, input: text, images: images})
+      body: JSON.stringify({sessionId: turnSessionId, input: text, images: images}),
+      signal: foregroundRequest.controller && foregroundRequest.controller.signal
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
-    if (continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
+    if (currentSessionId === turnSessionId && continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
     resolvedTurnSessionId = data.sessionId || turnSessionId;
     foregroundRequest.sessionId = resolvedTurnSessionId;
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
-    if (!currentSessionId || currentSessionId === turnSessionId) {
+    if (currentSessionId === turnSessionId) {
       currentSessionId = resolvedTurnSessionId;
       if (!turnSessionId && window.metisNavigation) window.metisNavigation.recordSession(resolvedTurnSessionId, { replace: true });
     }
@@ -2091,7 +2335,7 @@ async function runTurnItem(item) {
     // If the SSE stream rendered nothing this turn (e.g. a text-less reply),
     // fall back to the returned text only while still viewing this session.
     let historySynced = false;
-    if (viewingTurn() && runningTurnNeedsHistorySync) {
+    if (viewingTurn() && (foregroundRequest.needsHistorySync || runningTurnNeedsHistorySync)) {
       if (continuationUnchanged()) {
         historySynced = await syncViewedSessionHistory(resolvedTurnSessionId, continuationUnchanged);
         if (historySynced && continuationUnchanged()) runningTurnNeedsHistorySync = false;
@@ -2105,24 +2349,27 @@ async function runTurnItem(item) {
     turnSucceeded = true;
   } catch (e) {
     const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
-    if (viewingTurn) showError(e.message || 'The request failed.');
+    if (e && e.name === 'AbortError') { if (viewingTurn) showToast('Turn stopped'); }
+    else if (viewingTurn) showError(e.message || 'The request failed.');
     else showToast('Background turn failed: ' + (e.message || 'request failed'));
   } finally {
     // A background completion can start a newer turn before this older POST
     // response reaches the browser. Its SSE lifecycle now owns the controls.
     const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
+    if (typeof finishForegroundRequest === 'function') finishForegroundRequest(foregroundRequest);
     if (pendingForegroundRequest === foregroundRequest) pendingForegroundRequest = null;
     if (continuationUnchanged()) {
       if (viewingTurn) finishUserTurn();
-      setTurnRunning(false);
-      runningTurnNeedsHistorySync = false;
+      if (typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()) syncTrackedRunningState();
+      else setTurnRunning(false);
+      if (viewingTurn) runningTurnNeedsHistorySync = false;
     }
     updateSendBtn();
     loadSessionStatsbar();
-    if (turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
+    if (viewingTurn && turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
       if (!queuedSessionId || currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
       else showToast('Queued messages are waiting in the completed session');
-    } else if (!turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
+    } else if (viewingTurn && !turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
       showToast('Queued messages paused after an incomplete or failed turn');
     }
   }
@@ -3393,10 +3640,22 @@ async function confirmComposerAction(event) {
   state.pending = true;
   const buttons = state.overlay.querySelectorAll('button');
   buttons.forEach(button => { button.disabled = true; });
+  const confirmButton = state.kind === 'provider-probe' ? state.overlay.querySelector('.composer-action-confirm') : null;
+  if (confirmButton) confirmButton.textContent = uiText('Testing…', '正在测试…');
   let ok = false;
   if (state.kind === 'goal') ok = await createComposerGoal(value, state.overlay.querySelector('#composerActionPriority').value);
   else if (state.kind === 'feedback') ok = await recordComposerFeedback(value, state.messageIndex, state.sessionId);
-  else if (state.kind === 'provider-probe') ok = await runProviderProbe(state.providerId);
+  else if (state.kind === 'provider-probe') {
+    try {
+      ok = await runProviderProbe(state.providerId);
+    } catch (e) {
+      const message = uiText('Connection test failed: ', '连接测试失败：') + providerErrorText(e.message);
+      error.hidden = false;
+      error.textContent = message;
+      setProviderResult(state.providerId, message, 'error');
+      ok = null;
+    }
+  }
   else {
     const selected = state.overlay.querySelector('input[name="composerPermission"]:checked');
     ok = await setPermissionMode(selected ? selected.value : approvalMode);
@@ -3404,6 +3663,7 @@ async function confirmComposerAction(event) {
   if (ok === null) {
     state.pending = false;
     buttons.forEach(button => { button.disabled = false; });
+    if (confirmButton) confirmButton.textContent = uiText('Test connection', '测试连接');
     return;
   }
   if (ok) {
@@ -3640,6 +3900,7 @@ document.addEventListener('keydown', event => {
 // validated changes through config.SaveUserSettingsAndLoad.
 let settingsCache = null;
 let providersCache = null;
+const providerDiscoveryCache = new Map();
 let presetsCache = null;
 let pluginsCache = null;
 let pluginCatalogCache = { ecosystems: [], marketplaces: [], plugins: [], needsSync: false };
@@ -4015,7 +4276,8 @@ function renderProvidersTab() {
         <option value="gemini_native">Gemini Native</option>
       </select></label>
       <label>Base URL<input id="providerBaseUrl" required type="url" placeholder="https://api.example.com/v1" autocomplete="url"></label>
-      <label>${uiText('Model', '模型')}<input id="providerModel" required placeholder="model-id" autocomplete="off"></label>
+      <div class="provider-model-field"><label for="providerModel">${uiText('Model', '模型')}</label><span class="provider-model-input"><input id="providerModel" required placeholder="model-id" autocomplete="off"><button type="button" onclick="fetchProviderModels('', 'form', this)">${uiText('Fetch available models', '获取可用模型')}</button></span></div>
+      <div id="providerFormDiscovery" class="provider-discovery" hidden></div>
       <label>${uiText('API key (optional)', 'API 密钥（可选）')}<input id="providerApiKey" type="password" autocomplete="new-password" placeholder="${uiText('Leave blank only when the endpoint is unchanged', '仅当端点未变更时可留空保留密钥')}"></label>
       <label class="provider-clear"><input id="providerClearCredential" type="checkbox"> ${uiText('Remove the saved credential', '移除已保存的凭据')}</label>
       <div class="provider-form-actions"><button type="button" onclick="hideProviderForm()">${uiText('Cancel', '取消')}</button><button type="submit" class="primary">${uiText('Save provider', '保存提供商')}</button></div>
@@ -4041,7 +4303,7 @@ function paintProviders() {
   const providers = providersCache || [];
   list.innerHTML = providers.map(p => {
     const oauth = p.credentialKind === 'oauth';
-    const probeable = p.credentialKind === 'api_key';
+    const probeable = p.credentialKind === 'api_key' && providerFormSupportsTransport(p.transport);
     const editableCustom = p.custom && providerFormSupportsTransport(p.transport);
     const credentialLabel = p.credentialConfigured
       ? (oauth ? uiText('OAuth connected', 'OAuth 已登录') : uiText('Credential set', '已配置凭据'))
@@ -4050,10 +4312,12 @@ function paintProviders() {
       ? `<div class="provider-url">${uiText('Run', '请运行')} <code>${escHtml(p.setupCommand)}</code></div>`
       : '';
     const probeButton = probeable ? `<button type="button" onclick="probeProvider('${escOnclick(p.id)}', this)">${uiText('Test connection', '测试连接')}</button>` : '';
+    const modelsButton = (probeable || p.id === 'openai-codex')
+      ? `<button type="button" onclick="fetchProviderModels('${escOnclick(p.id)}', 'card', this)">${uiText('Fetch available models', '获取可用模型')}</button>` : '';
     const editButton = !p.custom ? '' : editableCustom
       ? `<button type="button" onclick="editProvider('${escOnclick(p.id)}')">${uiText('Edit', '编辑')}</button>`
       : `<button type="button" disabled title="${uiText('This cloud provider must be edited in config.toml', '此云提供商需要在 config.toml 中编辑')}">${uiText('Edit in config', '在配置中编辑')}</button>`;
-    return `<div class="provider-card">
+    return `<div class="provider-card" data-provider-id="${escAttr(p.id)}">
     <div class="provider-main"><div class="provider-title">${escHtml(p.id)}${p.default ? ' <span class="provider-badge">' + uiText('Default', '默认') + '</span>' : ''}</div>
       <div class="provider-meta">${escHtml(p.transport || uiText('unknown', '未知'))} · ${escHtml(p.model || uiText('model not set', '未设置模型'))}</div>
       <div class="provider-url">${escHtml(p.baseUrl || uiText('Default endpoint', '默认端点'))}</div>
@@ -4064,8 +4328,11 @@ function paintProviders() {
       <button type="button" onclick="setDefaultProvider('${escOnclick(p.id)}')"${p.default ? ' disabled' : ''}>${uiText('Set default', '设为默认')}</button>
       <button type="button" onclick="validateProvider('${escOnclick(p.id)}')">${uiText('Validate', '验证')}</button>
       ${probeButton}
+      ${modelsButton}
       ${editButton}${p.custom ? `<button type="button" class="danger" onclick="deleteProvider('${escOnclick(p.id)}')"${p.default ? ' disabled title="' + uiText('Select another default first', '请先选择其他默认项') + '"' : ''}>${uiText('Delete', '删除')}</button>` : ''}
     </div>
+    <div id="providerResult-${escAttr(p.id)}" class="provider-result" role="status" hidden></div>
+    <div id="providerDiscovery-${escAttr(p.id)}" class="provider-discovery" hidden></div>
   </div>`;
   }).join('') || '<div class="provider-empty">' + uiText('No providers configured', '未配置提供商') + '</div>';
   const search = document.querySelector('.settings-search');
@@ -4089,6 +4356,8 @@ function showProviderForm(provider) {
   document.getElementById('providerModel').value = provider ? provider.model : '';
   document.getElementById('providerApiKey').value = '';
   document.getElementById('providerClearCredential').checked = false;
+  const discovered = document.getElementById('providerFormDiscovery');
+  if (discovered) discovered.hidden = true;
   document.getElementById('providerId').focus();
 }
 
@@ -4142,14 +4411,34 @@ async function setDefaultProvider(id) {
 }
 
 async function validateProvider(id) {
+  setProviderResult(id, uiText('Checking local configuration…', '正在检查本地配置…'), 'pending');
   try {
     const res = await fetch('/api/providers/validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'validate: ' + res.status);
-    showToast(uiText('Provider configuration is valid; no model request was sent', '提供商配置有效；未发送模型请求'));
+    setProviderResult(id, uiText('Configuration is valid. No network or model request was sent.', '配置有效；未访问网络，也未发送模型请求。'), 'success');
   } catch (e) {
-    showToast(uiText('Provider validation failed: ', '提供商验证失败：') + e.message);
+    setProviderResult(id, uiText('Validation failed: ', '验证失败：') + providerErrorText(e.message), 'error');
   }
+}
+
+function providerErrorText(message) {
+  const known = {
+    'credential is not configured': uiText('No credential is configured. Add an API key or sign in first.', '尚未配置凭据，请先添加 API 密钥或登录。'),
+    'Codex OAuth is not connected': uiText('Sign in to Codex first with metis login openai-codex.', '请先运行 metis login openai-codex 登录。'),
+  };
+  if (/HTTP (401|403)\b/.test(message)) return uiText('The endpoint rejected this credential (HTTP 401/403). Check the API key and model-list permissions.', '接口拒绝了凭据（HTTP 401/403），请检查 API 密钥及模型列表权限。');
+  if (/HTTP 404\b/.test(message)) return uiText('This endpoint has no model-list API (HTTP 404). Enter the model ID manually or check the base URL.', '此端点没有模型列表接口（HTTP 404），请检查 API 地址或手动填写模型 ID。');
+  return known[message] || message;
+}
+
+function setProviderResult(id, message, kind) {
+  const element = document.getElementById('providerResult-' + id);
+  if (!element) return;
+  element.hidden = false;
+  element.className = 'provider-result ' + (kind || 'info');
+  element.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+  element.textContent = message;
 }
 
 function probeProvider(id, trigger) {
@@ -4157,15 +4446,96 @@ function probeProvider(id, trigger) {
 }
 
 async function runProviderProbe(id) {
+  const res = await fetch('/api/providers/probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, confirm: true }) });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'connection probe: ' + res.status);
+  setProviderResult(id, uiText('Metadata endpoint is reachable. No model request was sent.', '元数据接口可访问；未发送模型请求。'), 'success');
+  return true;
+}
+
+async function fetchProviderModels(id, origin, trigger) {
+  const form = origin === 'form';
+  const panel = document.getElementById(form ? 'providerFormDiscovery' : 'providerDiscovery-' + id);
+  if (!panel) return;
+  panel.classList.remove('error');
+  const payload = form ? {
+    id: document.getElementById('providerId').value.trim(),
+    transport: document.getElementById('providerTransport').value,
+    baseUrl: document.getElementById('providerBaseUrl').value.trim(),
+    apiKey: document.getElementById('providerApiKey').value,
+    clearCredential: document.getElementById('providerClearCredential').checked,
+  } : { id };
+  panel.hidden = false;
+  panel.textContent = uiText('Fetching models…', '正在获取模型…');
+  if (trigger) trigger.disabled = true;
   try {
-    const res = await fetch('/api/providers/probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, confirm: true }) });
+    const res = await fetch('/api/providers/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'connection probe: ' + res.status);
-    showToast(uiText('Provider metadata endpoint is reachable; no model request was sent', '提供商元数据接口可访问；未发送模型请求'));
-    return true;
+    if (!res.ok) throw new Error(data.error || 'fetch models: ' + res.status);
+    const models = Array.isArray(data.models) ? data.models.filter(m => m && typeof m.id === 'string') : [];
+    if (!models.length) {
+      panel.textContent = uiText('The endpoint returned no models. Enter a model ID manually.', '接口未返回模型，请手动填写模型 ID。');
+      return;
+    }
+    const key = origin + ':' + (id || 'draft');
+    providerDiscoveryCache.set(key, models);
+    panel.dataset.pickerKey = key;
+    panel.dataset.providerId = id;
+    panel.dataset.origin = origin;
+    const source = data.source === 'local_catalog'
+      ? uiText('Built-in Codex catalog; account availability may differ.', '内置 Codex 模型目录；账户实际可用范围可能不同。')
+      : uiText('Advertised by this provider. Select a model to configure it.', '由此提供商返回；选择模型即可填写或保存配置。');
+    panel.innerHTML = `<div class="provider-discovery-head"><strong>${uiText('Available models', '可用模型')} · ${models.length}</strong><span>${escHtml(source)}</span></div>
+      <input type="search" class="provider-discovery-search" placeholder="${escAttr(uiText('Search models…', '搜索模型…'))}" aria-label="${escAttr(uiText('Search available models', '搜索可用模型'))}" oninput="filterProviderModels(this)">
+      <div class="provider-discovery-list"></div>`;
+    renderProviderModelCandidates(panel, '');
   } catch (e) {
-    showToast(uiText('Connection test failed: ', '连接测试失败：') + e.message);
-    return null;
+    panel.classList.add('error');
+    panel.textContent = uiText('Could not fetch models: ', '获取模型失败：') + providerErrorText(e.message);
+  } finally {
+    if (trigger) trigger.disabled = false;
+  }
+}
+
+function filterProviderModels(input) {
+  const panel = input && input.closest('.provider-discovery');
+  if (panel) renderProviderModelCandidates(panel, input.value);
+}
+
+function renderProviderModelCandidates(panel, query) {
+  const models = providerDiscoveryCache.get(panel.dataset.pickerKey) || [];
+  const needle = String(query || '').trim().toLowerCase();
+  const matched = needle ? models.filter(m => m.id.toLowerCase().includes(needle) || String(m.name || '').toLowerCase().includes(needle)) : models;
+  const list = panel.querySelector('.provider-discovery-list');
+  if (!list) return;
+  list.innerHTML = matched.slice(0, 100).map(m => `<button type="button" class="provider-model-choice" data-model-id="${escAttr(m.id)}" onclick="selectDiscoveredProviderModel(this)"><strong>${escHtml(m.id)}</strong>${m.name && m.name !== m.id ? `<span>${escHtml(m.name)}</span>` : ''}</button>`).join('')
+    || `<div class="provider-empty">${uiText('No matching models', '没有匹配的模型')}</div>`;
+  if (matched.length > 100) list.insertAdjacentHTML('beforeend', `<div class="provider-empty">${uiText('Showing the first 100 matches. Refine the search to see more.', '仅显示前 100 个结果，请继续缩小搜索范围。')}</div>`);
+}
+
+async function selectDiscoveredProviderModel(button) {
+  const panel = button.closest('.provider-discovery');
+  if (!panel) return;
+  const model = button.dataset.modelId;
+  if (panel.dataset.origin === 'form') {
+    const input = document.getElementById('providerModel');
+    input.value = model;
+    panel.hidden = true;
+    input.focus();
+    return;
+  }
+  const id = panel.dataset.providerId;
+  button.disabled = true;
+  setProviderResult(id, uiText('Saving selected model…', '正在保存所选模型…'), 'pending');
+  try {
+    const res = await fetch('/api/providers/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, model }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'save model: ' + res.status);
+    await loadProviders();
+    setProviderResult(id, uiText('Saved ', '已保存 ') + model + uiText('. Restart Desktop to use it as this provider’s default model.', '。重启 Desktop 后将作为此提供商的默认模型。'), 'success');
+  } catch (e) {
+    setProviderResult(id, uiText('Could not save model: ', '保存模型失败：') + providerErrorText(e.message), 'error');
+    button.disabled = false;
   }
 }
 

@@ -30,7 +30,8 @@ type Theme struct {
 	Name string
 
 	// Backgrounds
-	BgSecondary color.Color // panel highlight
+	BgSecondary   color.Color // panel highlight
+	BgUserMessage color.Color // submitted prompt in the transcript
 
 	// Text tiers (4 layers of tonality)
 	TextPrimary   color.Color // body text
@@ -57,9 +58,10 @@ type Theme struct {
 // Tuned for dark terminals (iTerm2, default macOS Terminal.app dark,
 // WezTerm dark variants).
 var darkTheme = Theme{
-	Name:        "dark",
-	BgSecondary: lipgloss.Color("#16213e"),
-	TextPrimary: lipgloss.Color("#e8e8e8"),
+	Name:          "dark",
+	BgSecondary:   lipgloss.Color("#16213e"),
+	BgUserMessage: lipgloss.Color("#36383b"),
+	TextPrimary:   lipgloss.Color("#e8e8e8"),
 	// Two-tier muted ladder. Earlier metis had Muted at #606060 which
 	// rendered near-invisible on most dark terminals — image #19/#20
 	// user report. Bumped to #787878 (≈ claude-code's "inactive" tier
@@ -89,6 +91,7 @@ var darkTheme = Theme{
 var lightTheme = Theme{
 	Name:          "light",
 	BgSecondary:   lipgloss.Color("#e6e6f0"),
+	BgUserMessage: lipgloss.Color("#eeeeee"),
 	TextPrimary:   lipgloss.Color("#1a1a1a"),
 	TextSecondary: lipgloss.Color("#555555"),
 	TextMuted:     lipgloss.Color("#909090"),
@@ -110,6 +113,7 @@ var lightTheme = Theme{
 var darkDaltonizedTheme = Theme{
 	Name:          "dark-daltonized",
 	BgSecondary:   lipgloss.Color("#16213e"),
+	BgUserMessage: lipgloss.Color("#36383b"),
 	TextPrimary:   lipgloss.Color("#e8e8e8"),
 	TextSecondary: lipgloss.Color("#a0a0a0"),
 	TextMuted:     lipgloss.Color("#787878"),
@@ -130,6 +134,7 @@ var darkDaltonizedTheme = Theme{
 var nordTheme = Theme{
 	Name:          "nord",
 	BgSecondary:   lipgloss.Color("#2e3440"),
+	BgUserMessage: lipgloss.Color("#3b4252"),
 	TextPrimary:   lipgloss.Color("#eceff4"),
 	TextSecondary: lipgloss.Color("#d8dee9"),
 	TextMuted:     lipgloss.Color("#868f9c"),
@@ -149,6 +154,7 @@ var nordTheme = Theme{
 var solarizedDarkTheme = Theme{
 	Name:          "solarized-dark",
 	BgSecondary:   lipgloss.Color("#073642"),
+	BgUserMessage: lipgloss.Color("#254b54"),
 	TextPrimary:   lipgloss.Color("#eee8d5"),
 	TextSecondary: lipgloss.Color("#b58900"),
 	TextMuted:     lipgloss.Color("#6c71c4"),

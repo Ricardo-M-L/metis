@@ -39,6 +39,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/zeebo/xxh3"
 )
 
@@ -52,16 +53,15 @@ const cacheHashThreshold = 4096
 // messageKey identifies a cached renderMessage(msg, width, expand)
 // output.
 //
-// Only role + content + width + expand are consulted: renderMessage
-// doesn't read any other field of Message (Timestamp / ToolName /
-// ToolError don't affect the rendered glyph for the roles we cache
-// here). The expand bit invalidates the cache when Ctrl+O toggles —
-// folded vs. unfolded thinking renders different output.
+// Role, content, width, expansion, and theme identify rendered output.
+// A theme switch must repaint history, including submitted prompt cards.
+// Timestamp / ToolName / ToolError do not affect the glyphs cached here.
 type messageKey struct {
 	role     string
 	contentK string // raw content if short, "h:len:xxh3hex" if long
 	width    int
 	expand   bool
+	theme    string
 }
 
 // toolKey identifies a cached renderToolEvent(te, expand) output.
@@ -78,6 +78,7 @@ type toolKey struct {
 	outputK string // mixed string/hash like contentK
 	isError bool
 	expand  bool
+	theme   string
 }
 
 // renderCache is the per-Model cache. Concurrent-safe so future
@@ -155,7 +156,7 @@ func (c *renderCache) GetMessage(m Message, width int, expand bool) (string, boo
 	if c == nil {
 		return "", false
 	}
-	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand}
+	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand, theme: themes.Current().Name}
 	c.mu.RLock()
 	s, ok := c.msg[k]
 	c.mu.RUnlock()
@@ -175,7 +176,7 @@ func (c *renderCache) PutMessage(m Message, width int, expand bool, rendered str
 	if c == nil {
 		return
 	}
-	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand}
+	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand, theme: themes.Current().Name}
 	c.mu.Lock()
 	c.msg[k] = rendered
 	c.mu.Unlock()
@@ -199,6 +200,7 @@ func (c *renderCache) GetTool(te ToolEvent, expand bool, width int) (string, boo
 		outputK: contentCacheKey(te.Output),
 		isError: te.IsError,
 		expand:  expand,
+		theme:   themes.Current().Name,
 	}
 	_ = width // reserved for future renderToolEvent signature growth
 	c.mu.RLock()
@@ -227,6 +229,7 @@ func (c *renderCache) PutTool(te ToolEvent, expand bool, width int, rendered str
 		outputK: contentCacheKey(te.Output),
 		isError: te.IsError,
 		expand:  expand,
+		theme:   themes.Current().Name,
 	}
 	_ = width
 	c.mu.Lock()

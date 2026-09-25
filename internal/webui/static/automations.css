@@ -134,3 +134,19 @@
   .automation-dialog footer { padding: 14px 18px; }
 }
 @media (prefers-reduced-motion: reduce) { .automation-task-row { transition: none; } }
+
+.automation-live-run {
+  width: min(100%, 760px);
+  margin: 16px auto 24px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--fg-body);
+}
+.automation-live-head { display: flex; align-items: center; gap: 9px; font-size: 13px; }
+.automation-live-head > span:last-child { margin-left: auto; color: var(--fg-dim); }
+.automation-live-indicator { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-dim); }
+.automation-live-run.is-running .automation-live-indicator { background: var(--accent); animation: statusPulse 1.4s ease-in-out infinite; }
+.automation-live-run.is-error .automation-live-indicator { background: var(--error); }
+.automation-live-run pre { margin-top: 12px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; color: var(--fg-mid); }

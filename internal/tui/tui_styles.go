@@ -30,17 +30,19 @@ var (
 	accentCyan    color.Color
 
 	// Pre-built styles. Renderers call these directly.
-	styleText     lipgloss.Style
-	styleDim      lipgloss.Style
-	styleMuted    lipgloss.Style
-	styleAccent   lipgloss.Style
-	styleUser     lipgloss.Style
-	styleAsst     lipgloss.Style
-	styleToolName lipgloss.Style
-	styleErr      lipgloss.Style
-	styleSuccess  lipgloss.Style // green ✓ for success role
-	styleWarn     lipgloss.Style // orange ⚠ for warning role
-	styleSelected lipgloss.Style
+	styleText           lipgloss.Style
+	styleDim            lipgloss.Style
+	styleMuted          lipgloss.Style
+	styleAccent         lipgloss.Style
+	styleUser           lipgloss.Style
+	styleUserCard       lipgloss.Style
+	styleUserCardMarker lipgloss.Style
+	styleAsst           lipgloss.Style
+	styleToolName       lipgloss.Style
+	styleErr            lipgloss.Style
+	styleSuccess        lipgloss.Style // green ✓ for success role
+	styleWarn           lipgloss.Style // orange ⚠ for warning role
+	styleSelected       lipgloss.Style
 )
 
 // initStyles binds the package-level style vars to whatever
@@ -63,6 +65,8 @@ func initStyles() {
 	styleMuted = lipgloss.NewStyle().Foreground(textMuted)
 	styleAccent = lipgloss.NewStyle().Foreground(accentBlue)
 	styleUser = lipgloss.NewStyle().Foreground(accentCyan).Bold(true)
+	styleUserCard = lipgloss.NewStyle().Foreground(textPrimary).Background(t.BgUserMessage)
+	styleUserCardMarker = lipgloss.NewStyle().Foreground(textSecondary).Background(t.BgUserMessage)
 	styleAsst = lipgloss.NewStyle().Foreground(accentGreen)
 	styleToolName = lipgloss.NewStyle().Foreground(accentOrange).Bold(true)
 	styleErr = lipgloss.NewStyle().Foreground(accentRed).Bold(true)

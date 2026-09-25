@@ -15,7 +15,7 @@ function automationIcon(name) {
   return '<svg class="automation-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="'+(paths[name] || paths.clock)+'"/></svg>';
 }
 function automationButton(action, label, options = {}) {
-  return '<button type="button" class="automation-button '+(options.primary ? 'is-primary ' : '')+(options.danger ? 'is-danger ' : '')+'" data-automation-action="'+action+'"'+(options.id ? ' data-id="'+automationEscape(options.id)+'"' : '')+(options.disabled ? ' disabled' : '')+'>'+(options.icon ? automationIcon(options.icon) : '')+'<span>'+automationEscape(label)+'</span></button>';
+  return '<button type="button" class="automation-button '+(options.primary ? 'is-primary ' : '')+(options.danger ? 'is-danger ' : '')+'" data-automation-action="'+action+'"'+(options.id ? ' data-id="'+automationEscape(options.id)+'"' : '')+(options.jobId ? ' data-job-id="'+automationEscape(options.jobId)+'"' : '')+(options.runId ? ' data-run-id="'+automationEscape(options.runId)+'"' : '')+(options.disabled ? ' disabled' : '')+'>'+(options.icon ? automationIcon(options.icon) : '')+'<span>'+automationEscape(label)+'</span></button>';
 }
 function automationFormatTime(value, timezone) {
   if (!value || String(value).startsWith('0001-')) return '—';
@@ -193,6 +193,9 @@ async function loadAutomationRuns(id, background = false) {
     const data = await automationRequest('/'+encodeURIComponent(id)+'/runs', {signal:controller.signal});
     if (generation !== automationState.runsGeneration || id !== automationState.selectedId || !automationState.active) return;
     automationState.runs = Array.isArray(data.runs) ? data.runs : [];
+    automationState.runs.forEach(run => {
+      if (run.sessionId) automationSessionRuns.set(run.sessionId, {jobId:run.jobId || id,runId:run.id});
+    });
     automationState.runsError = '';
     const latest = automationState.runs[0];
     if (!latest) {
@@ -216,6 +219,15 @@ async function loadAutomationRuns(id, background = false) {
 function automationRunResultText(run) {
   return run?.error || run?.output || run?.summary || automationText('No text output was recorded for this run.','本次运行没有记录文本输出。');
 }
+function automationRunningText(run) {
+  const latest = (run?.activity || []).slice(-4).map(item => {
+    const label = item.kind === 'tool_start' ? automationText('Running','执行中')
+      : item.kind === 'tool_failed' ? automationText('Failed','失败') : automationText('Finished','已完成');
+    return label + ' · ' + (item.tool || automationText('Tool','工具'));
+  });
+  return [latest.join('\n'), run?.liveText || ''].filter(Boolean).join('\n\n')
+    || automationText('Task started. Waiting for the first response…','任务已启动，正在等待首次响应…');
+}
 
 function renderAutomationLatestResult() {
   const target = automationRoot()?.querySelector('#automationLatestResult');
@@ -227,9 +239,9 @@ function renderAutomationLatestResult() {
     return;
   }
   const status = automationRunLabel(run.status);
-  const result = run.loading ? automationText('Loading the complete result…','正在读取完整结果…') : automationState.latestRunError ? automationText('Could not load the complete result: ','无法读取完整结果：')+automationState.latestRunError : run.status === 'running' ? automationText('This task is still running. Its result will appear here automatically when it finishes.','任务仍在运行中，完成后结果会自动显示在这里。') : automationRunResultText(run);
+  const result = run.loading ? automationText('Loading the complete result…','正在读取完整结果…') : automationState.latestRunError ? automationText('Could not load the complete result: ','无法读取完整结果：')+automationState.latestRunError : run.status === 'running' ? automationRunningText(run) : automationRunResultText(run);
   const completedAt = run.finishedAt || run.startedAt;
-  target.innerHTML = '<section class="automation-latest-result is-'+automationEscape(run.status || 'unknown')+'"><div class="automation-result-head"><div><h3>'+automationText('Latest execution result','最新执行结果')+'</h3><p>'+automationEscape(automationFormatTime(completedAt,job?.schedule?.timezone))+'</p></div><span class="automation-result-status">'+automationEscape(status)+'</span></div><pre'+(run.error ? ' class="is-error"' : '')+'>'+automationEscape(result)+'</pre>'+(run.sessionId ? '<div class="automation-result-actions">'+automationButton('open-session',automationText('Open conversation','打开会话'),{id:run.sessionId,icon:'arrow'})+'</div>' : '')+'</section>';
+  target.innerHTML = '<section class="automation-latest-result is-'+automationEscape(run.status || 'unknown')+'"><div class="automation-result-head"><div><h3>'+automationText('Latest execution result','最新执行结果')+'</h3><p>'+automationEscape(automationFormatTime(completedAt,job?.schedule?.timezone))+'</p></div><span class="automation-result-status">'+automationEscape(status)+'</span></div><pre'+(run.error ? ' class="is-error"' : '')+'>'+automationEscape(result)+'</pre>'+(run.sessionId ? '<div class="automation-result-actions">'+automationButton('open-session',automationText('Open conversation','打开会话'),{id:run.sessionId,jobId:run.jobId || automationState.selectedId,runId:run.id,icon:'arrow'})+'</div>' : '')+'</section>';
 }
 
 async function loadAutomationLatestRun(jobID, runID) {
@@ -265,7 +277,7 @@ function renderAutomationRuns(loading = false) {
   if (!target) return;
   if (automationState.runsError) { target.innerHTML = '<p class="automation-error-text" role="alert">'+automationEscape(automationState.runsError)+'</p>'+automationButton('refresh-runs',automationText('Retry','重试')); return; }
   if (!automationState.runs.length) { target.innerHTML = '<p class="automation-muted">'+automationText(loading ? 'Loading run history…' : 'No runs yet. Scheduled and manual runs will appear here.',loading ? '正在加载运行记录…' : '还没有运行记录。定时或手动运行后，结果会显示在这里。')+'</p>'; return; }
-  target.innerHTML = automationState.runs.map(run => '<div class="automation-run-row"><button type="button" data-automation-action="run-detail" data-id="'+automationEscape(run.id)+'"><span class="automation-run-line"><strong>'+automationEscape(automationRunLabel(run.status))+'</strong><time>'+automationEscape(automationFormatTime(run.startedAt))+'</time></span><span class="automation-muted">'+automationText(run.trigger === 'manual' ? 'Manual run' : 'Scheduled run',run.trigger === 'manual' ? '手动运行' : '定时运行')+'</span>'+(run.error || run.summary ? '<span class="automation-run-summary'+(run.error ? ' is-error' : '')+'">'+automationEscape(run.error || run.summary)+'</span>' : '')+'</button>'+(run.sessionId ? automationButton('open-session',automationText('Open conversation','打开会话'),{id:run.sessionId,icon:'arrow'}) : '')+'</div>').join('')+'<div id="automationRunOutput"></div>';
+  target.innerHTML = automationState.runs.map(run => '<div class="automation-run-row"><button type="button" data-automation-action="run-detail" data-id="'+automationEscape(run.id)+'"><span class="automation-run-line"><strong>'+automationEscape(automationRunLabel(run.status))+'</strong><time>'+automationEscape(automationFormatTime(run.startedAt))+'</time></span><span class="automation-muted">'+automationText(run.trigger === 'manual' ? 'Manual run' : 'Scheduled run',run.trigger === 'manual' ? '手动运行' : '定时运行')+'</span>'+(run.error || run.summary ? '<span class="automation-run-summary'+(run.error ? ' is-error' : '')+'">'+automationEscape(run.error || run.summary)+'</span>' : '')+'</button>'+(run.sessionId ? automationButton('open-session',automationText('Open conversation','打开会话'),{id:run.sessionId,jobId:run.jobId || automationState.selectedId,runId:run.id,icon:'arrow'}) : '')+'</div>').join('')+'<div id="automationRunOutput"></div>';
   renderAutomationRunOutput();
 }
 async function loadAutomationRun(id) {
@@ -287,7 +299,7 @@ function renderAutomationRunOutput() {
   const target = automationRoot()?.querySelector('#automationRunOutput');
   if (!target) return;
   const run = automationState.run;
-  target.innerHTML = !run ? '' : '<section class="automation-run-output"><h4>'+automationText('Run output','运行输出')+'</h4>'+(run.loading ? '<p>'+automationText('Loading…','正在加载…')+'</p>' : '<pre>'+automationEscape(run.error || run.output || run.summary || automationText('No text output was recorded.','本次运行没有记录文本输出。'))+'</pre>')+'</section>';
+  target.innerHTML = !run ? '' : '<section class="automation-run-output"><h4>'+automationText('Run output','运行输出')+'</h4>'+(run.loading ? '<p>'+automationText('Loading…','正在加载…')+'</p>' : '<pre>'+automationEscape(run.status === 'running' ? automationRunningText(run) : automationRunResultText(run))+'</pre>')+'</section>';
 }
 async function automationMutation(key, operation) {
   if (automationState.pending.has(key)) return false;
@@ -316,11 +328,11 @@ async function automationPageClick(event) {
     case 'toggle': if (job) await automationMutation(id, () => automationRequest('/'+encodeURIComponent(id), {method:'PATCH',body:JSON.stringify(job.paused || !job.enabled ? {paused:false,enabled:true} : {paused:true})})); break;
     case 'scheduler': await automationMutation('scheduler', () => automationRequest('/scheduler', {method:'PATCH',body:JSON.stringify({enabled:!automationState.scheduler.enabled})})); break;
     case 'delete': if (job) openAutomationDelete(job,button); break;
-    case 'open-session': await openAutomationRunSession(id); break;
+    case 'open-session': await openAutomationRunSession(id, button.dataset.jobId, button.dataset.runId); break;
   }
 }
 
-async function openAutomationRunSession(sessionId) {
+async function openAutomationRunSession(sessionId, runJobId, runId) {
   const navigation = window.metisNavigation;
   if (!navigation || typeof loadSessions !== 'function') {
     automationState.error = automationText('Conversation navigation is unavailable. Reload the app and try again.','会话导航暂不可用，请重新加载后重试。');
@@ -342,11 +354,79 @@ async function openAutomationRunSession(sessionId) {
     // saved titles and sidebar rows before committing the destination route.
     await loadSessions(false);
     if (!isLatest()) return false;
-    return await navigation.navigate({page:'session',sessionId,view:'chat'});
+    if (runJobId && runId) automationSessionRuns.set(sessionId, {jobId:runJobId,runId});
+    const opened = await navigation.navigate({page:'session',sessionId,view:'chat'});
+    if (opened) watchAutomationSession(sessionId);
+    return opened;
   } catch (error) {
     if (isLatest()) { automationState.error = error.message; renderAutomations(); }
     return false;
   }
+}
+
+// Cron turns run in a separate CLI process, so they do not emit the Desktop's
+// foreground SSE events. Their durable run record is the live progress source.
+const automationSessionRuns = new Map();
+let automationSessionWatch = null;
+
+function stopAutomationSessionWatch() {
+  if (automationSessionWatch?.timer) clearTimeout(automationSessionWatch.timer);
+  automationSessionWatch = null;
+}
+
+function automationSessionCard(run, sessionId) {
+  const area = document.getElementById('chatArea');
+  if (!area || currentSessionId !== sessionId) return;
+  let card = area.querySelector('.automation-live-run');
+  if (!card) {
+    area.insertAdjacentHTML('beforeend', '<section class="automation-live-run" role="status" aria-live="polite"></section>');
+    card = area.querySelector('.automation-live-run');
+  }
+  const running = run.status === 'running';
+  const label = automationRunLabel(run.status);
+  const body = running ? automationRunningText(run)
+    : run.error || automationText('The task ended without a text answer. Check its run record for details.','任务已结束，但没有文字回答。请查看运行记录了解详情。');
+  card.classList.toggle('is-running', running);
+  card.classList.toggle('is-error', !running && run.status !== 'succeeded');
+  card.innerHTML = '<div class="automation-live-head"><span class="automation-live-indicator" aria-hidden="true"></span><strong>'
+    +automationText('Scheduled task','定时任务')+'</strong><span>'+automationEscape(label)+'</span></div><pre>'
+    +automationEscape(body)+'</pre>';
+  if (typeof autoScroll === 'function') autoScroll();
+}
+
+function watchAutomationSession(sessionId) {
+  const target = automationSessionRuns.get(sessionId);
+  if (!target || currentSessionId !== sessionId) { stopAutomationSessionWatch(); return; }
+  if (automationSessionWatch?.sessionId === sessionId && automationSessionWatch.runId === target.runId) return;
+  stopAutomationSessionWatch();
+  const watch = {sessionId, ...target, timer:null};
+  automationSessionWatch = watch;
+  const current = () => automationSessionWatch === watch && currentSessionId === sessionId;
+  const again = delay => { if (current()) watch.timer = setTimeout(poll, delay); };
+  async function poll() {
+    if (!current()) return;
+    try {
+      const run = await automationRequest('/'+encodeURIComponent(watch.jobId)+'/runs/'+encodeURIComponent(watch.runId));
+      if (!current()) return;
+      if (run.status === 'running') {
+        automationSessionCard(run, sessionId);
+        again(document.visibilityState === 'hidden' ? 3000 : 900);
+        return;
+      }
+      // Finish follows the CLI's final session checkpoint. Reload the saved
+      // conversation once instead of leaving the initial prompt-only view.
+      const synced = await syncViewedSessionHistory(sessionId, current);
+      if (!current()) return;
+      if (!synced) { again(1800); return; }
+      if (run.status !== 'succeeded' || !run.output) automationSessionCard(run, sessionId);
+      stopAutomationSessionWatch();
+    } catch (error) {
+      if (!current()) return;
+      automationSessionCard({status:'running',liveText:automationText('Waiting for run updates: ','等待运行状态更新：')+error.message},sessionId);
+      again(2500);
+    }
+  }
+  void poll();
 }
 
 function automationValidTimezone(timezone) {

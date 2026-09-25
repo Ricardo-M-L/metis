@@ -187,3 +187,76 @@ func TestTurnCoordinatorCancellationRemovesWaiter(t *testing.T) {
 	}
 	lease.Release()
 }
+
+func TestTurnCoordinatorTryAcquireSharesAtomicWorkspaceOwnership(t *testing.T) {
+	c := NewTurnCoordinator(8)
+	workspace := t.TempDir()
+	const attempts = 16
+	start := make(chan struct{})
+	results := make(chan *TurnLease, attempts)
+	var group sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			lease, _ := c.TryAcquire(workspace)
+			results <- lease
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	var winner *TurnLease
+	for lease := range results {
+		if lease == nil {
+			continue
+		}
+		defer lease.Release()
+		if winner != nil {
+			t.Fatal("concurrent TryAcquire granted multiple same-workspace writers")
+		}
+		winner = lease
+	}
+	if winner == nil {
+		t.Fatal("no caller obtained the free workspace")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if lease, err := c.Acquire(ctx, workspace); !errors.Is(err, context.DeadlineExceeded) {
+		lease.Release()
+		t.Fatalf("Acquire bypassed TryAcquire lease: %v", err)
+	}
+	winner.Release()
+	lease, err := c.Acquire(context.Background(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if unexpected, ok := c.TryAcquire(workspace); ok {
+		unexpected.Release()
+		t.Fatal("TryAcquire bypassed Acquire lease")
+	}
+}
+
+func TestTurnCoordinatorTryAcquireHonorsCapacityAndClose(t *testing.T) {
+	c := NewTurnCoordinator(1)
+	first, ok := c.TryAcquire(t.TempDir())
+	if !ok {
+		t.Fatal("free coordinator rejected lease")
+	}
+	defer first.Release()
+	if lease, ok := c.TryAcquire(t.TempDir()); ok {
+		lease.Release()
+		t.Fatal("TryAcquire exceeded the global capacity")
+	}
+	first.Release()
+	c.Close()
+	if lease, ok := c.TryAcquire(t.TempDir()); ok {
+		lease.Release()
+		t.Fatal("closed coordinator admitted a mutation")
+	}
+	if lease, ok := (*TurnCoordinator)(nil).TryAcquire("none"); ok || lease != nil {
+		t.Fatal("nil coordinator admitted a mutation")
+	}
+}

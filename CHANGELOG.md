@@ -7,6 +7,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.76] - 2026-09-26
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization; their checksums, bundle metadata, architecture,
+launch behavior, and shared runtime are verified independently.
+
 ### Added
 
 - Desktop now schedules unattended foreground turns in isolated Metis worker
@@ -17,6 +23,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   sixteen-agent root-and-child budget and safely defers a live resize until
   isolated tasks finish.
 - Durable project coordination: `metis coordinator create|list|status|add|run|claim|complete|fail|recover` now stores a workspace-bound dependency graph with worker leases, bounded recovery, result evidence, and a compact event trail. The same `ProjectCoordinator` tool is available to coordinator-mode agents, so project state survives session switches and Desktop/CLI restarts.
+- Desktop now discovers available models from a configured provider and can
+  save a selected model. Provider validation and connection-test actions return
+  visible results.
+- Scheduled-task detail and conversation views show bounded live output and
+  tool activity while a run is executing, then refresh the saved final answer.
 
 ### Changed
 
@@ -25,6 +36,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `cwd` and using direct execution. The recovery is persisted under the
   METIS session root and shown in the tool trace; nested worktrees and other
   ambiguous failures remain blocked with an actionable explanation.
+- Desktop keeps simultaneous conversation streams and permission/question cards
+  associated with their owning sessions while the user switches views.
+- Refine the CLI input and message-card layout around the new compact METIS
+  terminal mark.
 
 ## [0.4.75] - 2026-09-25
 

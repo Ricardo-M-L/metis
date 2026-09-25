@@ -153,7 +153,11 @@ func TestDesktopDefaultForegroundConcurrencyRunsEightWorkerProcesses(t *testing.
 	t.Setenv("METIS_TEST_WORKER_STARTED", started)
 	t.Setenv("METIS_TEST_WORKER_RELEASE", release)
 	fixture := filepath.Join(fixtureDir, "metis-worker-fixture")
-	if err := os.WriteFile(fixture, []byte("#!/bin/sh\nprintf x >> \"$METIS_TEST_WORKER_STARTED\"\nwhile [ ! -f \"$METIS_TEST_WORKER_RELEASE\" ]; do sleep 0.02; done\nprintf 'worker complete'\n"), 0o700); err != nil {
+	if err := os.WriteFile(fixture, []byte(`#!/bin/sh
+printf x >> "$METIS_TEST_WORKER_STARTED"
+while [ ! -f "$METIS_TEST_WORKER_RELEASE" ]; do sleep 0.02; done
+printf '%s\n' '{"version":1,"type":"event","event":{"kind":0,"textDelta":"worker complete"}}' '{"version":1,"type":"event","event":{"kind":5}}'
+`), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	slotDir := t.TempDir()
@@ -214,15 +218,13 @@ func TestDesktopDefaultForegroundConcurrencyRunsEightWorkerProcesses(t *testing.
 
 func TestProcessIsolatedTurnRunnerEligibility(t *testing.T) {
 	runner := &processIsolatedTurnRunner{executable: "/metis"}
-	for _, mode := range []permission.Mode{permission.ModeDontAsk, permission.ModeBypassPermissions, permission.ModeFullAccess} {
+	for _, mode := range []permission.Mode{permission.ModeDontAsk, permission.ModeBypassPermissions, permission.ModeFullAccess, permission.ModeAsk, permission.ModeAcceptEdits, permission.ModePlan} {
 		if !runner.Eligible(&session.Header{Mode: string(mode)}) {
 			t.Fatalf("mode %q should use an isolated worker", mode)
 		}
 	}
-	for _, mode := range []permission.Mode{permission.ModeAsk, permission.ModeAcceptEdits, permission.ModePlan} {
-		if runner.Eligible(&session.Header{Mode: string(mode)}) {
-			t.Fatalf("approval-driven mode %q should remain in-process", mode)
-		}
+	if runner.Eligible(&session.Header{Mode: "invalid-permission-mode"}) {
+		t.Fatal("invalid permission mode should not be eligible")
 	}
 	if runner.Eligible(nil) {
 		t.Fatal("nil header should not be eligible")
@@ -235,7 +237,9 @@ func TestProcessIsolatedTurnRunnerStreamsChildOutput(t *testing.T) {
 	}
 	workdir := t.TempDir()
 	script := filepath.Join(workdir, "metis-fixture")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'first ' \nprintf 'second'\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+printf '%s\n' '{"version":1,"type":"event","event":{"kind":0,"textDelta":"first "}}' '{"version":1,"type":"event","event":{"kind":0,"textDelta":"second"}}' '{"version":1,"type":"event","event":{"kind":5}}'
+`), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	runner, err := newProcessIsolatedTurnRunner(IsolatedTurnOptions{Executable: script})
@@ -268,7 +272,10 @@ func TestProcessIsolatedTurnRunnerResizesChildAgentBudget(t *testing.T) {
 	}
 	workdir := t.TempDir()
 	script := filepath.Join(workdir, "metis-fixture")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' \"$METIS_DESKTOP_SUBAGENT_SLOTS\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+printf '{"version":1,"type":"event","event":{"kind":0,"textDelta":"%s"}}\n' "$METIS_DESKTOP_SUBAGENT_SLOTS"
+printf '%s\n' '{"version":1,"type":"event","event":{"kind":5}}'
+`), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	runner, err := newProcessIsolatedTurnRunner(IsolatedTurnOptions{

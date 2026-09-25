@@ -16,7 +16,7 @@ func TestDetachedRunningSessionReconcilesAuthoritativeHistory(t *testing.T) {
 		"function detachRunningTurnView()",
 		"runningTurnNeedsHistorySync = true;",
 		"async function syncViewedSessionHistory(sessionId, shouldApply = () => true)",
-		"if (viewingTurn() && runningTurnNeedsHistorySync)",
+		"if (viewingTurn() && (foregroundRequest.needsHistorySync || runningTurnNeedsHistorySync))",
 		"await syncViewedSessionHistory(resolvedTurnSessionId, continuationUnchanged)",
 		"if (currentSessionId !== sessionId || !shouldApply()) return false;",
 	} {

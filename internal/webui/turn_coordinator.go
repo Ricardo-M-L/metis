@@ -98,6 +98,33 @@ func (c *TurnCoordinator) MaxParallel() int {
 	return c.maxParallel
 }
 
+// TryAcquire atomically reserves the same workspace ownership as Acquire, but
+// never queues. History edits and runtime-setting changes use it to reject a
+// busy workspace rather than race a worker that does not hold the parent lock.
+func (c *TurnCoordinator) TryAcquire(workspace string) (*TurnLease, bool) {
+	if c == nil {
+		return nil, false
+	}
+	workspace = canonicalTurnWorkspace(workspace)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, false
+	}
+	// Existing queued turns keep their admission order. In particular, a UI
+	// mutation cannot repeatedly steal a slot from a waiting turn.
+	c.dispatchLocked()
+	if c.running >= c.maxParallel {
+		return nil, false
+	}
+	if _, busy := c.workspaces[workspace]; busy {
+		return nil, false
+	}
+	c.running++
+	c.workspaces[workspace] = struct{}{}
+	return &TurnLease{coordinator: c, workspace: workspace}, true
+}
+
 // Acquire waits until both a global slot and an exclusive workspace writer
 // lease are available. Queued turns from other workspaces are allowed to pass
 // a blocked same-workspace turn, so one busy repository cannot idle the whole

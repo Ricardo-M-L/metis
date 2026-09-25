@@ -39,6 +39,16 @@ type CronRunRecord struct {
 	Summary    string     `json:"summary,omitempty"`
 	Error      string     `json:"error,omitempty"`
 	Output     string     `json:"output,omitempty"`
+	// LiveText and Activity are presentation-only progress for a running fire.
+	// The final answer remains Output and the durable conversation remains the
+	// session referenced by SessionID.
+	LiveText string            `json:"liveText,omitempty"`
+	Activity []CronRunActivity `json:"activity,omitempty"`
+}
+
+type CronRunActivity struct {
+	Kind string `json:"kind"`
+	Tool string `json:"tool,omitempty"`
 }
 
 // CronRun holds an OS execution lock until its terminal record is committed.
@@ -177,6 +187,25 @@ func (r *CronRun) SetSessionID(id string) error {
 	return withCronRunRecords(r.dir, func() error { return writeCronRunLocked(r.dir, r.record) })
 }
 
+// SetProgress publishes a bounded, redacted snapshot while the CLI is still
+// running. Readers can inspect it without consuming the model's event stream.
+func (r *CronRun) SetProgress(text string, activity []CronRunActivity) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lock == nil {
+		return errors.New("cron run already finished")
+	}
+	r.record.LiveText = boundedCronLiveText(text, 16*1024)
+	if len(activity) > 64 {
+		activity = activity[len(activity)-64:]
+	}
+	r.record.Activity = make([]CronRunActivity, len(activity))
+	for i, item := range activity {
+		r.record.Activity[i] = CronRunActivity{Kind: item.Kind, Tool: boundedCronText(item.Tool, 160)}
+	}
+	return withCronRunRecords(r.dir, func() error { return writeCronRunLocked(r.dir, r.record) })
+}
+
 // Finish also releases ownership when persistence fails; readers can then
 // correctly classify the last durable running record as interrupted.
 func (r *CronRun) Finish(status, summary, output string, runErr error) error {
@@ -193,6 +222,7 @@ func (r *CronRun) Finish(status, summary, output string, runErr error) error {
 	r.record.Status, r.record.FinishedAt = status, &now
 	r.record.Summary = boundedCronText(summary, 2048)
 	r.record.Output = boundedCronText(output, CronRunOutputLimit)
+	r.record.LiveText = ""
 	if runErr != nil {
 		r.record.Error = boundedCronText(runErr.Error(), 4096)
 	}
@@ -214,6 +244,19 @@ func boundedCronText(s string, limit int) string {
 		s = s[:len(s)-1]
 	}
 	return s + "\n[truncated]"
+}
+
+func boundedCronLiveText(s string, limit int) string {
+	s = security.RedactSubprocessText(s)
+	if len(s) <= limit {
+		return s
+	}
+	const prefix = "…\n"
+	s = s[len(s)-(limit-len(prefix)):]
+	for !utf8.ValidString(s) {
+		s = s[1:]
+	}
+	return prefix + s
 }
 
 func writeCronRunLocked(dir string, record CronRunRecord) error {
@@ -391,6 +434,8 @@ func ListCronRuns(root, jobID string, limit int) ([]CronRunRecord, error) {
 		// Long output belongs to the detail route, not every list refresh.
 		for i := range records {
 			records[i].Output = ""
+			records[i].LiveText = ""
+			records[i].Activity = nil
 		}
 		return err
 	})

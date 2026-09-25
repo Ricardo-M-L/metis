@@ -1023,9 +1023,17 @@ function sessionState(s) {
   if (pendingSessionId === s.id) return sessionStateInfo('loading', uiText('Opening session', '正在打开会话'));
   if (s.archived || showArchivedSessions) return sessionStateInfo('archived', uiText('Archived', '已归档'));
   const selected = s.id === currentSessionId;
+  if (typeof pendingInteractions !== 'undefined') {
+    const interactions = Array.from(pendingInteractions.values()).filter(d => d.session === s.id);
+    if (interactions.some(d => d.askId)) return sessionStateInfo('waiting', uiText('Waiting for your answer', '等待你的回答'));
+    if (interactions.some(d => d.permId)) return sessionStateInfo('approval', uiText('Waiting for approval', '等待确认'));
+  }
   if (selected && typeof pendingAsk !== 'undefined' && pendingAsk) return sessionStateInfo('waiting', uiText('Waiting for your answer', '等待你的回答'));
   if (selected && document.querySelector('.perm-card:not(.approved):not(.denied)')) return sessionStateInfo('approval', uiText('Waiting for approval', '等待确认'));
-  if (typeof turnRunning !== 'undefined' && turnRunning && (s.id === runningSessionId || selected && !runningSessionId)) {
+  const isolatedRunning = typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()
+    ? trackedRunningSessions().has(s.id)
+    : lastStatusSnapshot && Array.isArray(lastStatusSnapshot.isolatedTurnSessions) && lastStatusSnapshot.isolatedTurnSessions.includes(s.id);
+  if (isolatedRunning || typeof turnRunning !== 'undefined' && turnRunning && (s.id === runningSessionId || selected && !runningSessionId)) {
     if (selected && lastStatusSnapshot && Number(lastStatusSnapshot.subAgents) > 0) return sessionStateInfo('delegating', uiText('Sub-agents running', '子代理运行中'));
     return selected
       ? sessionStateInfo('running', uiText('Running', '运行中'))
@@ -1252,6 +1260,8 @@ async function resumeSession(id) {
     }
     if (id !== currentSessionId && typeof detachRunningTurnView === 'function') detachRunningTurnView();
     currentSessionId = id;
+    if (typeof restoreSessionQueue === 'function') restoreSessionQueue(id);
+    if (typeof syncTrackedRunningState === 'function') syncTrackedRunningState();
     pendingSessionId = null;
     if (typeof syncTurnControls === 'function') syncTurnControls();
     // Commit the selected row with its transcript. Auxiliary trace, artifact,
@@ -1266,6 +1276,10 @@ async function resumeSession(id) {
     messages = [];
     streamedTextThisTurn = false;
     renderHistoryMessages(data.messages);
+    if (typeof restorePendingInteractions === 'function') {
+      await restorePendingInteractions(id, isLatest);
+      if (!isLatest()) return;
+    }
     if (window.metisNavigation) window.metisNavigation.recordSession(id);
     await restoreCompactionHistory(id, isLatest);
     if (!isLatest()) return;
@@ -1283,7 +1297,8 @@ async function resumeSession(id) {
     }
     if (typeof syncTurnControls === 'function') syncTurnControls();
     renderSessions();
-    if (!turnRunning && queuedTurns.length && (!queuedSessionId || queuedSessionId === currentSessionId)) {
+    const selectedRunning = typeof isViewedTurnRunning === 'function' ? isViewedTurnRunning() : turnRunning;
+    if (!selectedRunning && queuedTurns.length && (!queuedSessionId || queuedSessionId === currentSessionId)) {
       setTimeout(drainQueuedTurns, 0);
     }
     return true;
